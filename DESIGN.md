@@ -2,7 +2,7 @@
 
 Status: approved 2026-10-28. Research inputs: `/home/user/Projects/.always-on/research/{openclaw,hermes-and-peers,practices-and-channels,pi-rust-integration}.md`.
 
-Decisions made: iMessage through a Mac running BlueBubbles; one `main` session shared by all channels; Zephyr runs as its own Linux account (§4.4); repo `yansigit/zephyr`, private. Wherever this file says `rpi-gateway`, `gateway` or `gw-*`, read `zephyr`.
+Decisions made: iMessage through a Mac running BlueBubbles; one `main` session shared by all channels; Zephyr runs in one Docker container (§4.4); repo `yansigit/zephyr`, private. Wherever this file says `rpi-gateway`, `gateway` or `gw-*`, read `zephyr`.
 
 ## 1. Goals and constraints
 
@@ -98,14 +98,14 @@ Upstream analysis (`research/pi-rust-integration.md` §7) compared three options
 
 There are no per-call prompts. These hard limits hold every time:
 
-1. **Its own Linux account, `zephyr`.** The daemon and every child run as that user, under a systemd user service with linger. The Linux account is the boundary, so there is no bwrap layer. The agent can work anywhere it has permission:
-   - Read-write: all of `/home/zephyr`, which holds its workspace, memory, sessions and its own rpi agent dir with its own credentials.
-   - Read-write on `/home/user/Projects` through a shared group plus a default ACL. Revoke it by removing the ACL.
-   - No sudo. **Not in the `docker` group**, because docker access is root-equivalent and `user` has it.
-   - Your `~/.ssh`, `~/.rpi`, `~/.pi`, browser profiles and secrets are unreadable (mode 700 on `/home/user`).
-   - Network: unrestricted.
+1. **One Docker container, `zephyr`** (`deploy/run.sh`). The daemon and every child run inside it, as your uid, so files it creates are yours and no ACLs are needed. The agent can work anywhere it is mounted:
+   - Read-write: `~/.zephyr` (seen as `/zephyr`), which holds its state, memory, sessions and its own rpi agent dir with its own credentials.
+   - Read-write: `$PROJECTS` at the same path as on the host. Secrets inside it (`.parity-env.sh`, `.parity-lanes/archive`, every `.env*` outside `node_modules`) are covered with empty mounts.
+   - Nothing else of your home: `~/.ssh`, `~/.rpi`, `~/.pi` and browser profiles are not mounted. No docker socket.
+   - Network: host networking, so the attach port on 127.0.0.1 and the Tailscale webhook address work unchanged.
+   - `--restart unless-stopped` replaces the systemd unit; `--init` reaps children and forwards SIGTERM.
 
-   Docker was the alternative. It adds root inside the container, but then reaching your projects and Tailscale needs bind mounts and host networking, which removes most of the isolation. A container per job remains a later option for untrusted work.
+   This replaced an earlier dedicated Linux account: ACLs over 2.2M files were slow to apply and, on eCryptfs, unreliable to remove.
 2. **Policy plugin `gw-policy`** (cdylib, published `rpi-plugin-sdk`, loaded with `--extension`). Its `ToolCall` veto blocks:
    - destructive patterns, as in Hermes's hardline list: `rm -rf /`, `mkfs`, `dd of=/dev/`, fork bombs, `curl | sh`
    - writes outside the granted roots
@@ -119,7 +119,7 @@ There are no per-call prompts. These hard limits hold every time:
    - `/stop` from any owner channel aborts the run.
    - `/pause` stops all dispatch and scheduling until `/resume`.
    - `rpi-gateway pause` does the same from a shell.
-   - `systemctl --user stop rpi-gateway` is the hard stop.
+   - `docker stop zephyr` is the hard stop.
 6. **Audit.** Every tool call, policy veto, inbound and outbound message goes to SQLite. A daily digest is optional.
 
 ### 4.5 Scheduler and proactivity
@@ -162,7 +162,7 @@ New repo `yansigit/zephyr` (private), local at `/home/user/Projects/zephyr`, a R
 ```
 crates/zephyr/          daemon: router, session manager, store, scheduler, auth keeper, adapters, attach server
 crates/zephyr-policy/   cdylib rpi plugin: tool-call veto, audit, schedule tool, untrusted-content tagging
-deploy/                 zephyr.service, account setup script, zephyr.toml.example
+deploy/                 Dockerfile, run.sh, zephyr.toml.example
 ```
 
 Dependencies: tokio, serde_json, rusqlite (bundled), serenity, reqwest, sd-notify, croner, and `rpi-plugin-sdk` (crates.io, same minor as the pinned `rpi`). Reusing `rpi-extcore`, which already spawns RPC children, gets evaluated in M0. We use it only if it fits without patches.
@@ -173,7 +173,7 @@ Dependencies: tokio, serde_json, rusqlite (bundled), serenity, reqwest, sd-notif
 |---|---|---|
 | M0 | Daemon skeleton: store, session manager (spawn, respawn, resume), systemd unit, `status`/`doctor`, `chat` line client | `kill -9` of the child or gateway mid-run loses no message, and the run resumes or is reported |
 | M1 | TUI attach shim for stock `rpi --connect` | You attach, see history, chat, detach, and the agent keeps running |
-| M2 | `zephyr` account setup plus `zephyr-policy` (veto, audit, budgets, kill switch) | Each blocklist case is vetoed in tests. As `zephyr`, reading `/home/user/.ssh` fails even through `bash` |
+| M2 | Container setup plus `zephyr-policy` (veto, audit, budgets, kill switch) | Each blocklist case is vetoed in tests. In the container, `/home/user/.ssh` and masked secrets are unreadable even through `bash` |
 | M3 | Discord adapter, outbox | DM round trip. Duplicate delivery is dropped by nonce. Non-owners are ignored |
 | M4 | Scheduler, memory, AuthKeeper | Jobs survive restart under the ledger rules. An OAuth token is refreshed with no failed request |
 | M5 | iMessage via BlueBubbles | Round trip from your phone (needs the Mac) |
@@ -183,4 +183,4 @@ Each milestone gets a failing test first and runs in its own worktree. Lanes wit
 ## 7. Open items
 
 - The name collides with the Zephyr RTOS (a Linux Foundation project). That doesn't matter for a private repo, but check it before using Zephyr as a public brand.
-- Creating the `zephyr` account needs sudo. `deploy/setup-account.sh` holds the commands, and you run them yourself.
+- The container runs as your uid, so it can read anything mounted that you can. Only the listed secret paths are masked.

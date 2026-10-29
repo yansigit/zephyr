@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Removes Zephyr completely: service, account (with /home/zephyr: state, memory, credentials) and every
-# ACL setup-account.sh added. Run once with sudo: sudo bash deploy/uninstall.sh
+# One-time cleanup of the old account install (Zephyr now runs in Docker, see run.sh): removes the
+# zephyr account, /home/zephyr and every ACL the old setup-account.sh added. sudo bash deploy/remove-account.sh
 # Keep a copy of Zephyr's memory first if you want it: sudo cp -a /home/zephyr/agent/memory ~/zephyr-memory
 set -euo pipefail
 OWNER="${SUDO_USER:?run via sudo}"

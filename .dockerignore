@@ -1,0 +1,3 @@
+*
+!target/release/zephyr
+!target/release/libzephyr_policy.so

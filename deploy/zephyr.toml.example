@@ -1,9 +1,9 @@
-# ~/agent/zephyr.toml (or $ZEPHYR_CONFIG)
-rpi = "/home/zephyr/rpi/current/bin/rpi"   # pinned rpi 0.12.x; check with `zephyr doctor`
-home = "/home/zephyr/agent"                # state.db, sessions/, zephyr.sock; the child's cwd
-agent_dir = "/home/zephyr/.rpi/agent"      # RPI_CODING_AGENT_DIR: models.json and credentials
+# ~/.zephyr/zephyr.toml, seen as /zephyr/zephyr.toml in the container (deploy/run.sh writes it)
+rpi = "/usr/local/bin/rpi"   # pinned rpi 0.12.x; check with `zephyr doctor`
+home = "/zephyr"                      # state.db, sessions/, zephyr.sock; the child's cwd
+agent_dir = "/zephyr/.rpi/agent"      # RPI_CODING_AGENT_DIR: models.json and credentials
 model = "anthropic/claude-sonnet-5"
-# policy_plugin = "/home/zephyr/lib/libzephyr_policy.so"   # refuse prompts unless it loads
+# policy_plugin = "/usr/local/lib/libzephyr_policy.so"   # refuse prompts unless it loads
 # timezone = "Asia/Seoul"   # IANA zone for /job cron schedules; default: the system time zone
 
 # Optional DM-only Discord adapter. Remove this table to run chat-only.
@@ -32,4 +32,4 @@ chat = ["1000"]   # uids allowed on the unix socket
 # Listens on 127.0.0.1 only. Detaching (client exit, stop_session) never stops the agent.
 # [attach]
 # port = 7790
-# token_file = "/home/zephyr/agent/tui.token"   # mode 0600; or token_env = "ZEPHYR_TUI_TOKEN"
+# token_file = "/zephyr/tui.token"   # mode 0600; or token_env = "ZEPHYR_TUI_TOKEN"
