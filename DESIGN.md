@@ -72,10 +72,10 @@ Upstream analysis (`research/pi-rust-integration.md` §7) compared three options
 2. **Policy check.** The router rejects any sender not on the owner allowlist; the message is logged and gets no reply. Otherwise it marks the row `dispatched` and sends `prompt` (or `queue_message`) with a client tag stored in the row.
 3. **Reply.** On `agent_settled`, the router takes the final assistant text of that turn. It writes `outbox(inbox_id, channel, text, client_id, status='pending')` first, then sends.
    - The client id is Discord's `nonce` with `enforce_nonce`, or the BlueBubbles `tempGuid`, so the platform drops a retried duplicate.
-   - Sends are retried with backoff for up to 1 h, then the row becomes `failed` and the failure is surfaced on the TUI.
+   - Sends are retried only while the platform still dedupes the client id: 5 min on Discord, 1 h elsewhere. Then the row becomes `failed` and the failure is surfaced on the TUI. Client ids are at most 20 chars (Discord's nonce limit is 25).
 4. **After a crash:**
    - **Gateway crash.** On start, `dispatched` rows whose text is already in the session (checked with `get_messages`) are not sent again. Rows whose text is missing are re-sent once.
-   - **Child crash.** Respawn it with `--session-id`. If `get_state` shows a pending resume, call `resume_pending`; rpi allows at most 3 attempts. After that, the gateway tells you in the originating channel.
+   - **Child crash.** Respawn it with `--session-id`. If `get_messages` reports `pendingResume` (rpi 0.12 does not put it in `get_state`), call `resume_pending`; rpi allows at most 3 attempts. After that, the gateway tells you in the originating channel.
    - **Power loss.** rpi doesn't fsync its session log, so the last few entries can be lost. The inbox survives, because SQLite does fsync, and step 4's check re-sends anything missing. Optional upstream PR: fsync on session appends.
 
 ### 4.3 Channels
