@@ -42,6 +42,11 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     if let Some(discord) = &cfg.discord {
         channels.push(AnyChannel::Discord(Discord::new(discord)?));
     }
+    if let Some(imessage) = &cfg.imessage {
+        channels.push(AnyChannel::IMessage(zephyr::imessage::IMessage::new(
+            imessage,
+        )?));
+    }
     let shutdown = async {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("SIGTERM handler");

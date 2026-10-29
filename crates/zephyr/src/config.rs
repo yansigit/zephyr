@@ -21,6 +21,8 @@ pub struct Config {
     pub policy_plugin: Option<PathBuf>,
     /// The Discord adapter. Its owner list is `owners.discord`. Absent means no Discord.
     pub discord: Option<crate::discord::Config>,
+    /// The BlueBubbles iMessage adapter. Its owner list is `owners.imessage` (handles). Absent means no iMessage.
+    pub imessage: Option<crate::imessage::Config>,
     /// Owner allowlist per channel name. Senders not listed are dropped.
     #[serde(default)]
     pub owners: HashMap<String, Vec<String>>,
@@ -91,6 +93,11 @@ mod tests {
             model = "anthropic/claude-sonnet-5"
             [discord]
             token_env = "ZEPHYR_DISCORD_TOKEN"
+            [imessage]
+            listen = "100.64.0.1:7791"
+            server_url = "http://100.64.0.2:1234"
+            password_env = "ZEPHYR_BB_PASSWORD"
+            secret_env = "ZEPHYR_BB_SECRET"
             [owners]
             chat = ["1000"]
             discord = ["2000"]
@@ -102,6 +109,7 @@ mod tests {
         assert!(cfg.is_owner("discord", "2000"));
         assert!(!cfg.is_owner("discord", "1000"));
         assert_eq!(cfg.discord.unwrap().token_env, "ZEPHYR_DISCORD_TOKEN");
+        assert_eq!(cfg.imessage.unwrap().lookback_hours, 24);
         assert!(toml::from_str::<Config>("rpi='a'\nhome='b'\ntypo=1").is_err());
     }
 }

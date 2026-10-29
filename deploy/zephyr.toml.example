@@ -9,9 +9,18 @@ model = "anthropic/claude-sonnet-5"
 # [discord]
 # token_env = "ZEPHYR_DISCORD_TOKEN"   # env var holding the bot token; the token never goes in this file
 
+# Optional iMessage via BlueBubbles on your Mac (DESIGN §4.3). Register the webhook in BlueBubbles as
+# http://<listen>/?secret=<secret>. Messages from the last lookback_hours are re-read at start.
+# [imessage]
+# listen = "100.x.y.z:7791"               # this host's Tailscale IP; 0.0.0.0 is refused
+# server_url = "http://100.a.b.c:1234"     # the Mac's BlueBubbles server
+# password_env = "ZEPHYR_BB_PASSWORD"
+# secret_env = "ZEPHYR_BB_SECRET"
+
 [owners]
 chat = ["1000"]   # uids allowed on the unix socket
 # discord = ["123456789012345678"]   # Discord user ids allowed to DM the agent
+# imessage = ["+15551234567", "you@icloud.com"]   # iMessage handles allowed to message the agent
 
 # Attach the stock TUI to the live session: RPI_SERVER_TOKEN=... rpi --connect 127.0.0.1:7790
 # Listens on 127.0.0.1 only. Detaching (client exit, stop_session) never stops the agent.
