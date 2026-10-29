@@ -4,7 +4,7 @@ use crate::channel::Inbound;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// An inbox row the router still has to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +45,15 @@ pub fn client_id(inbox_id: i64) -> String {
 /// The dedupe key for a job run's delivery: `j<run id>`, at most 20 chars, and `interrupt_running_runs` builds the same in SQL.
 pub fn job_client_id(run_id: i64) -> String {
     format!("j{run_id}")
+}
+
+/// A pooled account's cooldown (DESIGN §4.9). `level` counts backoffs without a reset time
+/// since the account last finished a turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cooldown {
+    pub until: i64,
+    pub reason: String,
+    pub level: i64,
 }
 
 /// A scheduled job (DESIGN §4.5). Output goes to `channel`/`recipient`.
@@ -152,6 +161,24 @@ impl Store {
                     ended_at INTEGER,
                     output TEXT);
                  PRAGMA user_version = 3;
+                 COMMIT;",
+            )?;
+        }
+        if version < 4 {
+            db.execute_batch(
+                "BEGIN;
+                 CREATE TABLE account_cooldown(
+                    name TEXT PRIMARY KEY,
+                    until INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    level INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE account_spend(
+                    day TEXT NOT NULL,
+                    account TEXT NOT NULL,
+                    tokens INTEGER NOT NULL,
+                    cost_usd REAL NOT NULL,
+                    PRIMARY KEY(day, account));
+                 PRAGMA user_version = 4;
                  COMMIT;",
             )?;
         }
@@ -532,6 +559,65 @@ impl Store {
         Ok(n)
     }
 
+    pub fn cooldowns(&self) -> rusqlite::Result<std::collections::HashMap<String, Cooldown>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT name, until, reason, level FROM account_cooldown")?;
+        let rows = stmt.query_map([], |r| {
+            let c = Cooldown {
+                until: r.get(1)?,
+                reason: r.get(2)?,
+                level: r.get(3)?,
+            };
+            Ok((r.get(0)?, c))
+        })?;
+        rows.collect()
+    }
+
+    pub fn set_cooldown(&self, name: &str, c: &Cooldown) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO account_cooldown(name, until, reason, level) VALUES (?1, ?2, ?3, ?4)",
+            params![name, c.until, c.reason, c.level],
+        )?;
+        Ok(())
+    }
+
+    /// The account finished a turn: its backoff starts over.
+    pub fn clear_cooldown(&self, name: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "DELETE FROM account_cooldown WHERE name = ?1",
+            params![name],
+        )?;
+        Ok(())
+    }
+
+    /// Per-account usage, for display only; budgets count the day's total.
+    pub fn add_account_spend(
+        &self,
+        account: &str,
+        (tokens, cost): (i64, f64),
+    ) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO account_spend(day, account, tokens, cost_usd) VALUES (date('now'), ?1, ?2, ?3)
+             ON CONFLICT(day, account) DO UPDATE SET tokens = tokens + excluded.tokens,
+                                                     cost_usd = cost_usd + excluded.cost_usd",
+            params![account, tokens, cost],
+        )?;
+        Ok(())
+    }
+
+    pub fn account_spend(&self, day: &str, account: &str) -> rusqlite::Result<(i64, f64)> {
+        let t = self
+            .db
+            .query_row(
+                "SELECT tokens, cost_usd FROM account_spend WHERE day = ?1 AND account = ?2",
+                params![day, account],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(t.unwrap_or_default())
+    }
+
     /// `(table, status, count)` for `zephyr status`.
     pub fn counts(&self) -> rusqlite::Result<Vec<(String, String, i64)>> {
         let mut stmt = self.db.prepare(
@@ -624,6 +710,29 @@ mod tests {
     }
 
     #[test]
+    fn cooldowns_and_account_spend_survive_reopen() {
+        let dir = crate::test_dir("store-cooldown");
+        let path = dir.join("state.db");
+        let store = Store::open(&path).unwrap();
+        let c = Cooldown {
+            until: 100,
+            reason: "rate_limited".into(),
+            level: 2,
+        };
+        store.set_cooldown("a", &c).unwrap();
+        store.add_account_spend("a", (10, 0.5)).unwrap();
+        store.add_account_spend("a", (5, 0.25)).unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.cooldowns().unwrap()["a"], c);
+        let day = store.today().unwrap();
+        assert_eq!(store.account_spend(&day, "a").unwrap(), (15, 0.75));
+        assert_eq!(store.account_spend(&day, "b").unwrap(), (0, 0.0));
+        store.clear_cooldown("a").unwrap();
+        assert!(store.cooldowns().unwrap().is_empty());
+    }
+
+    #[test]
     fn notices_go_to_the_newest_owner_message() {
         let dir = crate::test_dir("store-notify");
         let mut store = Store::open(&dir.join("state.db")).unwrap();
@@ -656,9 +765,10 @@ mod tests {
         for (version, undo) in [
             (
                 1,
-                "DROP TABLE meta; DROP TABLE spend; DROP TABLE runs; DROP TABLE jobs;",
+                "DROP TABLE meta; DROP TABLE spend; DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend;",
             ),
-            (2, "DROP TABLE runs; DROP TABLE jobs;"),
+            (2, "DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend;"),
+            (3, "DROP TABLE account_cooldown; DROP TABLE account_spend;"),
         ] {
             let dir = crate::test_dir(&format!("store-v{version}"));
             let path = dir.join("state.db");
@@ -674,6 +784,7 @@ mod tests {
                 store.add_job("j", "* * * * *", "p", "chat", "o").unwrap(),
                 1
             );
+            store.clear_cooldown("a").unwrap();
             let now: i64 = store
                 .db
                 .pragma_query_value(None, "user_version", |r| r.get(0))

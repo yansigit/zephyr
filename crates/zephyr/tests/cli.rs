@@ -207,3 +207,29 @@ fn doctor_warns_when_agent_dir_has_extensions() {
     std::fs::write(agent.join("extensions/librpi_providers.so"), "").unwrap();
     assert!(run().contains(warning));
 }
+
+#[test]
+fn status_lists_each_pooled_account() {
+    let (home, cfg) = setup(
+        "status-pool",
+        "[[account]]\nname = 'a'\nmodel = 'anthropic/m'\n[[account]]\nname = 'b'\nmodel = 'openai-codex/m'\n",
+    );
+    std::fs::create_dir_all(home.join("accounts/a")).unwrap();
+    std::fs::write(
+        home.join("accounts/a/auth.json"),
+        r#"{"anthropic": {"type": "oauth", "access": "SECRET"}}"#,
+    )
+    .unwrap();
+    let out = zephyr(&cfg, &["status"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = stdout(&out);
+    assert!(
+        text.contains("account a (anthropic/m): ready; today 0 tokens"),
+        "{text}"
+    );
+    assert!(
+        text.contains("account b (openai-codex/m): needs login"),
+        "{text}"
+    );
+    assert!(!text.contains("SECRET"));
+}

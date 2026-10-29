@@ -8,6 +8,7 @@ pub mod config;
 pub mod discord;
 pub mod imessage;
 pub mod memory;
+pub mod pool;
 pub mod router;
 pub mod rpc;
 pub mod scheduler;

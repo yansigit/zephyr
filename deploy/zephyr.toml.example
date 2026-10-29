@@ -19,6 +19,16 @@ model = "anthropic/claude-sonnet-5"
 # password_env = "ZEPHYR_BB_PASSWORD"
 # secret_env = "ZEPHYR_BB_SECRET"
 
+# Account pool (DESIGN §4.9), in failover order; replaces `model` when present. Each account's
+# credentials live in <home>/accounts/<name>/ (its own RPI_CODING_AGENT_DIR); models.json and
+# settings.json are linked from agent_dir. A rate-limited account cools down and the next one takes over.
+# [[account]]
+# name = "codex-main"
+# model = "openai-codex/gpt-5.5"
+# [[account]]
+# name = "claude-max"
+# model = "claude-code/claude-opus-5-5"
+
 # OAuth refresh until upstream PR #144 lands (DESIGN §4.7). Defaults shown.
 # [auth]
 # enabled = true

@@ -1,7 +1,7 @@
 //! Drives one `rpi --mode rpc` child: JSONL on stdio, frames as in upstream
 //! `crates/rpi-cli/src/rpc/protocol.rs` and `modes.rs` (v0.12.0).
 
-use crate::config::Config;
+use crate::config::{Account, Config};
 use anyhow::{anyhow, bail, Context};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -45,8 +45,22 @@ pub struct Child {
 }
 
 impl Child {
+    /// A child on `agent_dir` and `model`.
     pub async fn spawn(cfg: &Config, session_id: &str) -> anyhow::Result<Self> {
+        Self::spawn_as(cfg, session_id, None).await
+    }
+
+    /// A child on a pooled account: its own dir as `RPI_CODING_AGENT_DIR`, and its model.
+    pub async fn spawn_as(
+        cfg: &Config,
+        session_id: &str,
+        account: Option<&Account>,
+    ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(cfg.session_dir())?;
+        let (model, agent_dir) = match account {
+            Some(a) => (Some(&a.model), Some(crate::pool::prepare(cfg, a)?)),
+            None => (cfg.model.as_ref(), cfg.agent_dir.clone()),
+        };
         // rpi reads the context files (AGENTS.md) once, at start, so regenerate them first.
         crate::memory::prepare(&cfg.home)?;
         let mut cmd = Command::new(&cfg.rpi);
@@ -57,7 +71,7 @@ impl Child {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true);
-        if let Some(model) = &cfg.model {
+        if let Some(model) = model {
             cmd.args(["--model", model]);
         }
         if let Some(plugin) = &cfg.policy_plugin {
@@ -66,7 +80,7 @@ impl Child {
         for ext in &cfg.extensions {
             cmd.arg("--extension").arg(ext);
         }
-        if let Some(dir) = &cfg.agent_dir {
+        if let Some(dir) = &agent_dir {
             cmd.env("RPI_CODING_AGENT_DIR", dir);
         }
         let mut process = cmd

@@ -137,6 +137,9 @@ async fn status(cfg: &Config) -> anyhow::Result<()> {
         limit(budget.daily_tokens),
         limit(budget.daily_cost_usd)
     );
+    for line in zephyr::pool::status(cfg, &store, zephyr::now())? {
+        println!("{line}");
+    }
     for (table, status, n) in store.counts()? {
         println!("{table:<7} {status:<11} {n}");
     }

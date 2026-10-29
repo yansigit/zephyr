@@ -148,7 +148,23 @@ async fn execute(cfg: &Config, store: &mut Store, run: &JobRun) -> (&'static str
         run.job.id, run.job.name, run.id
     );
     let session = format!("job-{}-{}", run.job.id, run.id);
-    let mut child = match Child::spawn(cfg, &session).await {
+    // A job runs on the first account not cooling down. It does not fail over.
+    let account = if cfg.accounts.is_empty() {
+        None
+    } else {
+        let cooling = store.cooldowns().unwrap_or_default();
+        match crate::pool::pick(&cfg.accounts, &cooling, crate::now()) {
+            Ok(a) => Some(a),
+            Err(until) => {
+                let why = format!(
+                    "every account is rate-limited until {}",
+                    crate::pool::iso(until)
+                );
+                return ("failed", format!("{label} could not start: {why}"), false);
+            }
+        }
+    };
+    let mut child = match Child::spawn_as(cfg, &session, account).await {
         Ok(child) => child,
         Err(e) => return ("failed", format!("{label} could not start: {e:#}"), false),
     };
@@ -178,6 +194,9 @@ async fn execute(cfg: &Config, store: &mut Store, run: &JobRun) -> (&'static str
                 stats["totalTokens"].as_i64().unwrap_or(0),
                 stats["costTotal"].as_f64().unwrap_or(0.0),
             );
+            if let Some(a) = account {
+                let _ = store.add_account_spend(&a.name, used);
+            }
             store.charge(cfg.budget.as_ref(), used).unwrap_or_else(|e| {
                 eprintln!("zephyr: recording job spend failed: {e}");
                 false

@@ -65,6 +65,10 @@ fn setup(name: &str, auth: Option<Value>, extra: &str) -> (Config, PathBuf, Path
 
 fn start(name: &str, auth: Option<Value>, extra: &str) -> Gateway {
     let (cfg, home, agent) = setup(name, auth, extra);
+    run(cfg, home, agent)
+}
+
+fn run(cfg: Config, home: PathBuf, agent: PathBuf) -> Gateway {
     let (feed, rx) = tokio::sync::mpsc::channel(4);
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(async move {
@@ -260,5 +264,30 @@ async fn disabled_means_the_child_is_never_asked() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(of_type(&gw.home, "get_auth_status").is_empty());
     assert!(refreshes(&gw.home).is_empty());
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn every_pooled_account_is_refreshed_with_its_own_dir() {
+    let accounts = "[[account]]\nname = 'a'\nmodel = 'anthropic/m'\n[[account]]\nname = 'b'\nmodel = 'openai-codex/m'\n";
+    let (cfg, home, agent) = setup("pool", None, accounts);
+    let soon = |provider: &str| json!({provider: {"type": "oauth", "access": "old", "refresh": "r", "expires": now() + 60}});
+    for (name, provider) in [("a", "anthropic"), ("b", "openai-codex")] {
+        let dir = home.join("accounts").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("auth.json"), soon(provider).to_string()).unwrap();
+    }
+    let gw = run(cfg, home.clone(), agent);
+    wait(|| refreshes(&home).len() >= 2).await;
+    let mut providers: Vec<_> = refreshes(&home)
+        .iter()
+        .map(|r| r["provider"].as_str().unwrap().to_string())
+        .collect();
+    providers.sort();
+    assert_eq!(providers, ["anthropic", "openai-codex"]);
+    for (name, provider) in [("a", "anthropic"), ("b", "openai-codex")] {
+        let dir = home.join("accounts").join(name);
+        assert!(stored(&dir, provider)["expires"].as_i64().unwrap() > now() + 15 * 60);
+    }
     gw.shutdown().await;
 }

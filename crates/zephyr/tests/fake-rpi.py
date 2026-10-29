@@ -9,6 +9,9 @@ reports: {"totalTokens": n, "costTotal": x}, cumulative like rpi's.
 Auth: the OAuth store is $RPI_CODING_AGENT_DIR/auth.json. `get_auth_status` lists its oauth
 entries. `auth refresh --provider P` (the CLI, not the RPC) gives P a fresh expiry, and records
 an "auth-refresh" line in ./log.jsonl (an `oauth_fail` file in the home makes it fail).
+Accounts: each start logs {"type": "start", "agentDir", "model"} to ./log.jsonl. A
+`rate_limited` file in $RPI_CODING_AGENT_DIR holds an error text: every prompt then ends with
+that error (stopReason "error", settle outcome "failed"), as a rate-limited provider does.
 A prompt containing WRITE_MEMORY first writes memory/MEMORY.md under the home.
 argv.json holds the argv of the latest start.
 A prompt containing `[hang]` never settles until `abort`; one that starts with `say: `
@@ -41,6 +44,9 @@ path = os.path.join(session_dir, opt("--session-id") + ".json")
 extension = opt("--extension")
 open(os.path.join(home, "pid"), "w").write(str(os.getpid()))
 json.dump(args, open(os.path.join(home, "argv.json"), "w"))  # the flags this child was started with
+open(os.path.join(home, "log.jsonl"), "a").write(json.dumps(
+    {"type": "start", "agentDir": os.environ.get("RPI_CODING_AGENT_DIR"), "model": opt("--model"),
+     "sessionId": opt("--session-id")}) + "\n")
 
 def load():
     try:
@@ -70,6 +76,19 @@ def auth_store():
     p = os.path.join(d, "auth.json") if d else None
     if not p or not os.path.exists(p): return {}
     return json.load(open(p))
+
+def rate_limit():
+    d = os.environ.get("RPI_CODING_AGENT_DIR")
+    p = os.path.join(d, "rate_limited") if d else None
+    return open(p).read() if p and os.path.exists(p) else None
+
+def fail(s, error):
+    msg = {"kind": "assistant", "role": "assistant", "content": [], "stopReason": "error",
+           "errorMessage": error, "timestamp": 0}
+    s["messages"].append(msg); s["pending"] = False; save(s)
+    out({"type": "message_end", "message": msg})
+    out({"type": "agent_settled", "runId": "r", "outcome": "failed", "aborted": False,
+         "error": error, "summary": None, "pendingResume": False})
 
 def finish(s, text, outcome="completed"):
     msg = assistant(text)
@@ -114,6 +133,8 @@ for line in sys.stdin:
                      "error": None, "summary": None, "pendingResume": False})
                 break
             continue
+        if rate_limit() is not None:
+            fail(s, rate_limit()); continue
         if "[hang]" in cmd["message"]:
             hanging = True; continue
         if cmd["message"].startswith("say: "):

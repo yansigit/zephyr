@@ -1,7 +1,7 @@
 //! Inbound → inbox → `main` child → outbox → channel, with crash recovery (DESIGN §4.2).
 
 use crate::channel::{Channel, Inbound, Outbound};
-use crate::config::{Config, BUDGET_NOTICE};
+use crate::config::{Account, Config, BUDGET_NOTICE};
 use crate::rpc::{message_text, Child, MAIN_SESSION};
 use crate::store::{InboxRow, Store};
 use serde_json::{json, Value};
@@ -54,7 +54,8 @@ pub async fn run<C: Channel>(
         attaches,
         jobs: &jobs,
         auth_at: Instant::now(),
-        restart_for_auth: false,
+        restart: false,
+        account: None,
     };
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
@@ -83,8 +84,10 @@ struct Router<'a> {
     jobs: &'a crate::scheduler::Wake,
     /// The next AuthKeeper check (DESIGN §4.7).
     auth_at: Instant,
-    /// A refresh needs the child restarted; done once it is idle.
-    restart_for_auth: bool,
+    /// A refresh or a failover needs the child restarted; done once it is idle.
+    restart: bool,
+    /// The pooled account the child runs on (DESIGN §4.9). `None` without a pool.
+    account: Option<&'a Account>,
 }
 
 async fn next_event(child: &mut Option<Child>) -> Option<Value> {
@@ -94,7 +97,7 @@ async fn next_event(child: &mut Option<Child>) -> Option<Value> {
     }
 }
 
-impl Router<'_> {
+impl<'a> Router<'a> {
     async fn main<C: Channel>(
         &mut self,
         mut rx: mpsc::Receiver<Inbound>,
@@ -113,7 +116,7 @@ impl Router<'_> {
                 Some(m) = rx.recv() => self.inbound(m).await,
                 Some(req) = self.attaches.recv() => self.attach(req).await,
                 _ = self.jobs.outbox.notified() => {} // a job's output: flush below
-                _ = tokio::time::sleep_until(self.auth_at), if self.child.is_some() && self.cfg.auth.enabled => {
+                _ = tokio::time::sleep_until(self.auth_at), if (self.child.is_some() || !self.cfg.accounts.is_empty()) && self.cfg.auth.enabled => {
                     self.auth_check().await
                 }
                 ev = next_event(&mut self.child) => match self.tapped(ev) {
@@ -150,18 +153,48 @@ impl Router<'_> {
     }
 
     async fn spawn(&mut self) {
-        match Child::spawn(self.cfg, MAIN_SESSION).await {
+        let account = match self.pick() {
+            Ok(account) => account,
+            Err(until) => {
+                // Every account is cooling down: rows wait in the inbox until the first reset.
+                eprintln!(
+                    "zephyr: every account is rate-limited until {}",
+                    crate::pool::iso(until)
+                );
+                let wait = Duration::from_secs((until - now()).max(1) as u64);
+                self.respawn_at = Instant::now() + wait;
+                return;
+            }
+        };
+        match Child::spawn_as(self.cfg, MAIN_SESSION, account).await {
             Ok(child) => {
                 eprintln!("zephyr: rpi child {:?} ready", child.pid());
+                if let Some(a) = account {
+                    eprintln!("zephyr: on account {} ({})", a.name, a.model);
+                }
                 self.child = Some(child);
+                self.account = account;
                 self.busy = false;
-                log(self.reconcile(None).await);
+                log(self.reconcile(None, false).await);
             }
             Err(e) => {
                 eprintln!("zephyr: spawning rpi failed: {e:#}");
                 self.schedule_respawn();
             }
         }
+    }
+
+    /// The account for the next child: `Ok(None)` without a pool, `Err(until)` when every
+    /// account is cooling down.
+    fn pick(&self) -> Result<Option<&'a Account>, i64> {
+        if self.cfg.accounts.is_empty() {
+            return Ok(None);
+        }
+        let cooling = self.store.cooldowns().unwrap_or_else(|e| {
+            eprintln!("zephyr: reading cooldowns failed: {e}");
+            Default::default()
+        });
+        crate::pool::pick(&self.cfg.accounts, &cooling, now()).map(Some)
     }
 
     async fn child_exited(&mut self) {
@@ -229,7 +262,7 @@ impl Router<'_> {
             log(self.store.reply(&row, reply, "done").map_err(Into::into));
             // A run in progress settles first; its settle reconciles and dispatches.
             if cmd == "/resume" && !self.busy {
-                log(self.reconcile(None).await);
+                log(self.reconcile(None, false).await);
             }
             return;
         }
@@ -273,6 +306,9 @@ impl Router<'_> {
             total
         };
         self.store.set_last_stats(total)?;
+        if let Some(a) = self.account {
+            self.store.add_account_spend(&a.name, delta)?;
+        }
         Ok(self.store.charge(self.cfg.budget.as_ref(), delta)?)
     }
 
@@ -313,7 +349,22 @@ impl Router<'_> {
             ),
             None => "[zephyr] the run ended without a reply".into(),
         };
-        log(self.reconcile(Some(fallback)).await);
+        let limited = self
+            .account
+            .zip(ev["error"].as_str())
+            .and_then(|(a, e)| crate::pool::rate_limit(e).map(|resets| (a, e, resets)));
+        match limited {
+            Some((account, error, resets_at)) => {
+                log(self.fail_over(account, error, resets_at).await)
+            }
+            None => {
+                if let (Some(a), "completed") = (self.account, ev["outcome"].as_str().unwrap_or(""))
+                {
+                    log(self.store.clear_cooldown(&a.name).map_err(Into::into));
+                }
+                log(self.reconcile(Some(fallback), false).await);
+            }
+        }
         if crossed {
             log(self
                 .store
@@ -323,37 +374,75 @@ impl Router<'_> {
         self.restart_if_idle().await;
     }
 
+    /// The turn hit `account`'s rate limit: cool it down, put the turn's unanswered rows back,
+    /// tell the owner, and restart on the next account (or wait for the first reset). The new
+    /// child continues the same session, and the rows are sent again as prompts.
+    async fn fail_over(
+        &mut self,
+        account: &Account,
+        error: &str,
+        resets_at: Option<i64>,
+    ) -> anyhow::Result<()> {
+        let now = now();
+        let until = crate::pool::cool_down(&self.store, &account.name, error, resets_at, now)?;
+        let rows = self.store.inbox_with_status("dispatched")?;
+        self.reconcile(None, true).await?;
+        let text = match crate::pool::pick(&self.cfg.accounts, &self.store.cooldowns()?, now) {
+            Ok(next) => format!(
+                "[zephyr] account {} is rate-limited until {}; switched to {}",
+                account.name,
+                crate::pool::iso(until),
+                next.name
+            ),
+            Err(at) => format!(
+                "[zephyr] every account is rate-limited; messages wait in the inbox until {}",
+                crate::pool::iso(at)
+            ),
+        };
+        eprintln!("zephyr: {text}");
+        match rows.first() {
+            Some(row) => self.store.notify(&row.channel, &row.sender, &text)?,
+            None => self.store.notify_last_owner(&text)?,
+        }
+        self.restart = true;
+        Ok(())
+    }
+
     /// Refreshes near-expiry OAuth credentials, then restarts the child once it is idle.
     async fn auth_check(&mut self) {
         let every = Duration::from_secs_f64((self.cfg.auth.refresh_minutes * 60.0).max(1.0));
         self.auth_at = Instant::now() + every;
-        let Some(child) = self.child.as_mut() else {
-            return;
-        };
-        match crate::auth_keeper::refresh(child, self.cfg, crate::auth_keeper::now_secs()).await {
-            Ok(refreshed) => self.restart_for_auth |= refreshed,
-            Err(e) => eprintln!("zephyr: auth check failed: {e:#}"),
+        let now = crate::auth_keeper::now_secs();
+        if !self.cfg.accounts.is_empty() {
+            self.restart |= crate::auth_keeper::refresh_accounts(self.cfg, self.account, now).await;
+        } else if let Some(child) = self.child.as_mut() {
+            match crate::auth_keeper::refresh(child, self.cfg, now).await {
+                Ok(refreshed) => self.restart |= refreshed,
+                Err(e) => eprintln!("zephyr: auth check failed: {e:#}"),
+            }
         }
         self.restart_if_idle().await;
     }
 
-    /// rpi binds credentials when a session starts, so a refreshed token needs a fresh child.
+    /// rpi binds credentials and the model when a session starts, so a refreshed token or a
+    /// failover needs a fresh child.
     async fn restart_if_idle(&mut self) {
-        if !self.restart_for_auth || self.busy {
+        if !self.restart || self.busy {
             return;
         }
-        self.restart_for_auth = false;
+        self.restart = false;
         if let Some(child) = self.child.take() {
             child.stop().await;
+            eprintln!("zephyr: restarting rpi");
         }
-        eprintln!("zephyr: restarting rpi to bind the refreshed credential");
         self.respawn_at = Instant::now();
     }
 
     /// Matches `dispatched` rows against the session: replies to the ones rpi has
     /// answered, resumes an interrupted run, and re-sends rows rpi never got (once).
     /// Runs after every settle and after every (re)spawn, so it is also crash recovery.
-    async fn reconcile(&mut self, fallback: Option<String>) -> anyhow::Result<()> {
+    /// `requeue` (a failover) puts unanswered rows back to `new` and dispatches nothing.
+    async fn reconcile(&mut self, fallback: Option<String>, requeue: bool) -> anyhow::Result<()> {
         let snap = self.call(json!({"type": "get_messages"})).await?;
         let rows = self.store.inbox_with_status("dispatched")?;
         if snap["pendingResume"] == true {
@@ -399,6 +488,7 @@ impl Router<'_> {
         for row in rows {
             match replies.get(&tagged(&row)) {
                 Some(Some(reply)) => self.store.reply(&row, reply, "done")?,
+                Some(None) if requeue => self.store.set_status(row.id, "new")?,
                 Some(None) => {
                     let text = fallback
                         .as_deref()
@@ -419,6 +509,9 @@ impl Router<'_> {
             } else {
                 self.store.set_status(row.id, "new")?;
             }
+        }
+        if requeue {
+            return Ok(());
         }
         self.dispatch_new().await
     }
@@ -480,7 +573,7 @@ impl Router<'_> {
             match tokio::time::timeout_at(deadline, next_event(&mut self.child)).await {
                 Ok(Some(ev)) if ev["type"] == "agent_settled" => {
                     self.busy = false;
-                    log(self.reconcile(None).await);
+                    log(self.reconcile(None, false).await);
                 }
                 Ok(Some(_)) => {}
                 _ => break, // child gone or out of time: recovery picks it up next start

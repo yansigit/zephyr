@@ -167,3 +167,107 @@ async fn real_rpi_round_trip_and_kill_mid_run() {
     let _ = stop.send(());
     task.await.unwrap().unwrap();
 }
+
+/// Answers every request with HTTP 429 and counts them.
+async fn rate_limited_provider(hits: Arc<std::sync::atomic::AtomicUsize>) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            hits.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = vec![0; 1 << 16];
+                let _ = sock.read(&mut buf).await;
+                let body =
+                    r#"{"error":{"message":"Rate limit reached","type":"rate_limit_error"}}"#;
+                let resp = format!("HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test]
+#[ignore = "needs the pinned rpi binary"]
+async fn real_rpi_fails_over_to_the_next_account() {
+    if !std::path::Path::new(RPI).exists() {
+        eprintln!("skipping: {RPI} is not installed");
+        return;
+    }
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let limited = rate_limited_provider(hits.clone()).await;
+    let ok = stub_provider(Arc::new(AtomicBool::new(false))).await;
+    let home = std::env::temp_dir().join(format!(
+        "zephyr-real-pool-{}-{}",
+        std::process::id(),
+        zephyr::unix_millis()
+    ));
+    let agent = home.join("rpi-agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    let provider = |port: u16| {
+        format!(
+            r#"{{"api":"openai-completions","baseUrl":"http://127.0.0.1:{port}/v1","apiKey":"not-a-key","models":[{{"id":"m","name":"M"}}]}}"#
+        )
+    };
+    std::fs::write(
+        agent.join("models.json"),
+        format!(
+            r#"{{"providers":{{"pa":{},"pb":{}}}}}"#,
+            provider(limited),
+            provider(ok)
+        ),
+    )
+    .unwrap();
+    let cfg: Config = toml::from_str(&format!(
+        "rpi = {RPI:?}\nhome = {home:?}\nagent_dir = {agent:?}\n[owners]\nchat = [\"owner\"]\n[[account]]\nname = \"a\"\nmodel = \"pa/m\"\n[[account]]\nname = \"b\"\nmodel = \"pb/m\"\n"
+    ))
+    .unwrap();
+
+    let (feed, rx) = mpsc::channel(4);
+    let channel = Arc::new(TestChannel {
+        feed: tokio::sync::Mutex::new(rx),
+        sent: Mutex::default(),
+    });
+    let (stop, stopped) = oneshot::channel::<()>();
+    let ch = channel.clone();
+    let task = tokio::spawn(async move {
+        zephyr::router::run(&cfg, std::slice::from_ref(&*ch), async {
+            let _ = stopped.await;
+        })
+        .await
+    });
+    feed.send(Inbound {
+        channel: "chat".into(),
+        platform_msg_id: "m1".into(),
+        sender: "owner".into(),
+        text: "ping".into(),
+    })
+    .await
+    .unwrap();
+    for _ in 0..600 {
+        if channel.sent.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let sent: Vec<String> = channel
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(
+        sent[0].starts_with("[zephyr] account a is rate-limited until "),
+        "{sent:?}"
+    );
+    assert_eq!(sent[1], "pong");
+    // The shared settings.json caps rpi's own retries at one.
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    let _ = stop.send(());
+    task.await.unwrap().unwrap();
+}

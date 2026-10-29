@@ -113,6 +113,50 @@ pub async fn refresh(child: &mut Child, cfg: &Config, now: i64) -> anyhow::Resul
     Ok(refreshed)
 }
 
+/// Pool mode: each account's own dir, for its model's provider. Needs no child, so accounts
+/// that are cooling down stay fresh. Returns true when `current`'s credential was refreshed.
+pub async fn refresh_accounts(
+    cfg: &Config,
+    current: Option<&crate::config::Account>,
+    now: i64,
+) -> bool {
+    let mut restart = false;
+    for account in &cfg.accounts {
+        let dir = match std::path::absolute(cfg.account_dir(account)) {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!("zephyr: account {}: {e}", account.name);
+                continue;
+            }
+        };
+        let provider = account.provider();
+        let expires = match oauth_expiries(&dir) {
+            Ok(e) => e.get(provider).copied().unwrap_or(0),
+            Err(e) => {
+                eprintln!("zephyr: account {}: {e:#}", account.name);
+                continue;
+            }
+        };
+        if expires == 0 || expires - now > EXPIRY_WINDOW_SECS {
+            continue;
+        }
+        match run_refresh(cfg, &dir, provider).await {
+            Ok(()) => {
+                eprintln!(
+                    "zephyr: refreshed the {provider} OAuth credential of account {}",
+                    account.name
+                );
+                restart |= current.is_some_and(|c| c.name == account.name);
+            }
+            Err(e) => eprintln!(
+                "zephyr: account {} {provider} OAuth refresh failed: {e:#}",
+                account.name
+            ),
+        }
+    }
+    restart
+}
+
 /// `rpi auth refresh --provider <id>`, with the child's agent dir and cwd. Its output is not
 /// logged, since it can echo credential details.
 async fn run_refresh(cfg: &Config, agent_dir: &Path, provider: &str) -> anyhow::Result<()> {

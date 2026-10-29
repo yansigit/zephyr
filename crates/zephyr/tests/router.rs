@@ -779,3 +779,167 @@ async fn a_job_under_the_budget_records_its_spend() {
     assert_eq!(gw.wait_replies(4).await[3], "echo: [chat #3] hi");
     gw.shutdown().await;
 }
+
+/// Two pooled accounts, `a` then `b`, on providers `pa` and `pb`.
+fn pooled(home: &Path) -> Config {
+    let mut cfg = config(home);
+    cfg.accounts = [("a", "pa/m"), ("b", "pb/m")]
+        .map(|(name, model)| zephyr::config::Account {
+            name: name.into(),
+            model: model.into(),
+        })
+        .into();
+    cfg
+}
+
+/// Makes every prompt on `account` end with `error`, as a rate-limited provider does.
+fn rate_limit(home: &Path, account: &str, error: &str) {
+    let dir = home.join("accounts").join(account);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("rate_limited"), error).unwrap();
+}
+
+fn cooldowns(home: &Path) -> HashMap<String, zephyr::store::Cooldown> {
+    Store::open(&home.join("state.db"))
+        .unwrap()
+        .cooldowns()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_rate_limited_account_fails_over_to_the_next_on_the_same_session() {
+    let home = home("failover");
+    let reset = zephyr::now() + 3600;
+    rate_limit(&home, "a", &format!("rate_limited; resets_at={reset}"));
+    let gw = start(pooled(&home));
+    gw.say("m1", "owner", "hi").await;
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        replies[0].starts_with("[zephyr] account a is rate-limited until ")
+            && replies[0].ends_with("; switched to b"),
+        "{replies:?}"
+    );
+    assert_eq!(replies[1], "echo: [chat #1] hi");
+
+    let starts = log(&home, "start");
+    let dirs: Vec<_> = starts.iter().map(|s| s["agentDir"].clone()).collect();
+    let accounts = home.join("accounts");
+    assert_eq!(
+        dirs,
+        [
+            accounts.join("a").display().to_string(),
+            accounts.join("b").display().to_string()
+        ]
+    );
+    let models: Vec<_> = starts.iter().map(|s| s["model"].clone()).collect();
+    assert_eq!(models, ["pa/m", "pb/m"]);
+    assert!(starts.iter().all(|s| s["sessionId"] == "main"));
+    let prompts = log(&home, "prompt");
+    assert_eq!(prompts.len(), 2);
+    assert_eq!(prompts[1]["message"], "[chat #1] hi", "the turn is re-run");
+    // `resets_at` is honoured.
+    assert_eq!(cooldowns(&home)["a"].until, reset);
+    gw.shutdown().await;
+
+    // The cooldown is in the store, so a restart goes straight to b.
+    let gw = start(pooled(&home));
+    gw.say("m2", "owner", "again").await;
+    assert_eq!(gw.wait_replies(1).await, ["echo: [chat #2] again"]);
+    let starts = log(&home, "start");
+    assert_eq!(starts.len(), 3);
+    assert_eq!(starts[2]["model"], "pb/m");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn without_a_reset_time_the_text_fallback_backs_off() {
+    let home = home("failover-regex");
+    rate_limit(&home, "a", "HTTP 429: Too Many Requests");
+    let gw = start(pooled(&home));
+    gw.say("m1", "owner", "hi").await;
+    assert_eq!(gw.wait_replies(2).await[1], "echo: [chat #1] hi");
+    let c = &cooldowns(&home)["a"];
+    let wait = c.until - zephyr::now();
+    assert!((14 * 60..=15 * 60).contains(&wait), "{wait}");
+    assert_eq!(c.level, 1);
+    assert!(c.reason.contains("429"));
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_ordinary_error_does_not_fail_over() {
+    let home = home("failover-other-error");
+    rate_limit(&home, "a", "invalid request: bad tool schema");
+    let gw = start(pooled(&home));
+    gw.say("m1", "owner", "hi").await;
+    assert_eq!(
+        gw.wait_replies(1).await,
+        ["[zephyr] run failed: invalid request: bad tool schema"]
+    );
+    assert_eq!(log(&home, "start").len(), 1);
+    assert!(cooldowns(&home).is_empty());
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn every_account_cooling_holds_the_inbox_until_the_earliest_reset() {
+    let home = home("failover-all");
+    let reset = zephyr::now() + 3;
+    rate_limit(&home, "a", &format!("rate_limited; resets_at={reset}"));
+    rate_limit(
+        &home,
+        "b",
+        &format!("rate_limited; resets_at={}", reset + 60),
+    );
+    let gw = start(pooled(&home));
+    gw.say("m1", "owner", "hi").await;
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        replies[1].starts_with("[zephyr] every account is rate-limited"),
+        "{replies:?}"
+    );
+    assert_eq!(inbox_status(&home, "new"), 1, "the message waits");
+    std::fs::remove_file(home.join("accounts/a/rate_limited")).unwrap();
+    gw.say("m2", "owner", "later").await;
+
+    // At a's reset the gateway starts on a again and runs what waited.
+    let replies = gw.wait_replies(4).await;
+    assert_eq!(
+        replies[2..],
+        ["echo: [chat #1] hi", "echo: [chat #2] later"]
+    );
+    assert!(zephyr::now() >= reset);
+    let starts = log(&home, "start");
+    assert_eq!(starts.last().unwrap()["model"], "pa/m");
+    assert!(
+        !cooldowns(&home).contains_key("a"),
+        "a success clears a's backoff"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn account_dirs_share_models_and_settings_and_rpi_retries_once() {
+    let home = home("account-dirs");
+    let agent = home.join("agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(agent.join("models.json"), "{}").unwrap();
+    std::fs::write(
+        agent.join("settings.json"),
+        r#"{"theme": "dark", "retry": {"maxRetries": 10}}"#,
+    )
+    .unwrap();
+    let gw = start(pooled(&home));
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_replies(1).await;
+    gw.shutdown().await;
+    let dir = home.join("accounts/a");
+    for f in ["models.json", "settings.json"] {
+        assert_eq!(std::fs::read_link(dir.join(f)).unwrap(), agent.join(f));
+    }
+    let settings: Value =
+        serde_json::from_str(&std::fs::read_to_string(agent.join("settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(settings["retry"]["maxRetries"], 1);
+    assert_eq!(settings["theme"], "dark");
+}
