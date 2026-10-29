@@ -23,7 +23,11 @@ fn setup(name: &str, extra: &str) -> (PathBuf, PathBuf) {
     let cfg = dir.join("zephyr.toml");
     std::fs::write(
         &cfg,
-        format!("rpi = {fake:?}\nhome = {:?}\n{extra}", home.display()),
+        format!(
+            "rpi = {fake:?}\nhome = {:?}\nagent_dir = {:?}\n{extra}",
+            home.display(),
+            dir.join("agent").display()
+        ),
     )
     .unwrap();
     (home, cfg)

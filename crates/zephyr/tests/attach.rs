@@ -58,9 +58,10 @@ fn start(name: &str) -> Gateway {
         .unwrap()
         .port();
     let cfg: Config = toml::from_str(&format!(
-        "rpi = {:?}\nhome = {:?}\n[owners]\nchat = [\"owner\"]\n[attach]\nport = {port}\ntoken_file = {token:?}\n",
+        "rpi = {:?}\nhome = {:?}\nagent_dir = {:?}\n[owners]\nchat = [\"owner\"]\n[attach]\nport = {port}\ntoken_file = {token:?}\n",
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-rpi.py"),
-        home
+        home,
+        home.join("agent"),
     ))
     .unwrap();
     let (chat, rx) = mpsc::channel(16);

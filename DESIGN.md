@@ -136,11 +136,13 @@ There are no per-call prompts. These hard limits hold every time:
 
 - `~/agent/memory/{USER.md, MEMORY.md, notes/YYYY-MM-DD.md}`, kept in a git repo.
 - These are loaded as context files when a session starts, using rpi's existing context-file loading. This is the frozen snapshot, which keeps the prompt cache warm. The agent edits them with normal file tools inside the sandbox.
-- The gateway commits after each run that changed them. `/memory undo` runs `git revert`.
+- The gateway commits after each run that changed them. `/memory undo` runs `git revert`. It never reverts the first (seed) commit. rpi skips `AGENTS.md` for a cwd that `trust.json` marks `false`, so `zephyr doctor` checks for that.
 
 ### 4.7 Auth and providers
 
-- **Until upstream PR #144 is merged**, the AuthKeeper checks `get_auth_status` every 10 minutes. When a token has under 15 minutes left, it sends the RPC `oauth` refresh (or runs `rpi auth refresh <provider>`). If the child is idle, it then calls `set_model` again so the new token binds. Once #144 is released, this timer is removed.
+- **Until upstream PR #144 is merged**, the AuthKeeper calls `get_auth_status` on the child every `[auth] refresh_minutes` (default 10; `enabled`, default true). For each OAuth provider with a stored credential that expires within 15 minutes (or has expired), it runs `rpi auth refresh --provider <id>` as a subprocess, with the child's `RPI_CODING_AGENT_DIR` and cwd. It does not use the `oauth` RPC: upstream `rpi-cli/src/auth.rs` `run_refresh` passes the stored `{access, refresh, expires_at}` to the plugin, while the RPC handler (`modes.rs` `rpc_oauth`) forwards only the request's `input`, so it would not give the plugin the refresh token. Expiry is read from `<agent_dir>/auth.json`, field `expires` only, because `get_auth_status` has no expiry. Tokens are never read into a struct or logged.
+  - Then the child must restart to bind the new token. Upstream builds each provider's request auth once, at session start (`rpi-runtime/src/provider/binding.rs:6`, `RequestAuth`). `set_model` only swaps the model descriptor (`rpi-harness/src/agent_harness.rs:5146`), so it keeps the old token and is not used. The child is restarted when idle; if a run is in progress, the restart waits for its settle.
+  - Once #144 is released, this timer is removed.
 - Failover: an ordered model list in `gateway.toml`. After repeated `retry_scheduled` errors or an auth error, the gateway calls `set_model` with the next model and tells you once.
 
 ### 4.8 Operations

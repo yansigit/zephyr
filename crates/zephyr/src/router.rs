@@ -57,6 +57,8 @@ pub async fn run<C: Channel>(
         tap: broadcast::channel(1024).0,
         attaches,
         jobs: &jobs,
+        auth_at: Instant::now(),
+        restart_for_auth: false,
     };
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
@@ -83,6 +85,10 @@ struct Router<'a> {
     attaches: mpsc::Receiver<crate::attach::AttachRequest>,
     /// Shared with the scheduler, which runs jobs beside `main`.
     jobs: &'a crate::scheduler::Wake,
+    /// The next AuthKeeper check (DESIGN §4.7).
+    auth_at: Instant,
+    /// A refresh needs the child restarted; done once it is idle.
+    restart_for_auth: bool,
 }
 
 async fn next_event(child: &mut Option<Child>) -> Option<Value> {
@@ -111,6 +117,9 @@ impl Router<'_> {
                 Some(m) = rx.recv() => self.inbound(m).await,
                 Some(req) = self.attaches.recv() => self.attach(req).await,
                 _ = self.jobs.outbox.notified() => {} // a job's output: flush below
+                _ = tokio::time::sleep_until(self.auth_at), if self.child.is_some() && self.cfg.auth.enabled => {
+                    self.auth_check().await
+                }
                 ev = next_event(&mut self.child) => match self.tapped(ev) {
                     Some(ev) if ev["type"] == "agent_settled" => self.settled(&ev).await,
                     Some(_) => continue,
@@ -186,6 +195,17 @@ impl Router<'_> {
                 m.sender, m.channel
             );
             log(self.store.set_status(id, "dropped").map_err(Into::into));
+            return;
+        }
+        if let Some(reply) = crate::memory::command(&self.cfg.home, m.text.trim()) {
+            let row = InboxRow {
+                id,
+                channel: m.channel,
+                sender: m.sender,
+                text: m.text,
+                tries: 0,
+            };
+            log(self.store.reply(&row, &reply, "done").map_err(Into::into));
             return;
         }
         if let Some(reply) = crate::scheduler::command(&mut self.store, self.cfg, &m) {
@@ -297,6 +317,7 @@ impl Router<'_> {
     async fn settled(&mut self, ev: &Value) {
         self.busy = false;
         self.backoff = FIRST_BACKOFF;
+        log(crate::memory::commit_if_changed(&self.cfg.home).map(drop));
         let crossed = self.record_spend().await.unwrap_or_else(|e| {
             eprintln!("zephyr: recording spend failed: {e:#}");
             false
@@ -315,6 +336,34 @@ impl Router<'_> {
                 .notify_last_owner(BUDGET_NOTICE)
                 .map_err(Into::into));
         }
+        self.restart_if_idle().await;
+    }
+
+    /// Refreshes near-expiry OAuth credentials, then restarts the child once it is idle.
+    async fn auth_check(&mut self) {
+        let every = Duration::from_secs_f64((self.cfg.auth.refresh_minutes * 60.0).max(1.0));
+        self.auth_at = Instant::now() + every;
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        match crate::auth_keeper::refresh(child, self.cfg, crate::auth_keeper::now_secs()).await {
+            Ok(refreshed) => self.restart_for_auth |= refreshed,
+            Err(e) => eprintln!("zephyr: auth check failed: {e:#}"),
+        }
+        self.restart_if_idle().await;
+    }
+
+    /// rpi binds credentials when a session starts, so a refreshed token needs a fresh child.
+    async fn restart_if_idle(&mut self) {
+        if !self.restart_for_auth || self.busy {
+            return;
+        }
+        self.restart_for_auth = false;
+        if let Some(child) = self.child.take() {
+            child.stop().await;
+        }
+        eprintln!("zephyr: restarting rpi to bind the refreshed credential");
+        self.respawn_at = Instant::now();
     }
 
     /// Matches `dispatched` rows against the session: replies to the ones rpi has
