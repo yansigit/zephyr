@@ -10,6 +10,7 @@ StartLimitIntervalSec=10min
 Type=notify
 ExecStart=%h/bin/zephyr run
 Environment=ZEPHYR_CONFIG=%h/agent/zephyr.toml
+EnvironmentFile=-%h/agent/secrets.env
 WatchdogSec=60
 Restart=on-failure
 RestartSec=5
