@@ -12,8 +12,21 @@ loginctl enable-linger zephyr
 
 # Shared Projects access: rwX now and for new files. Revoke with: setfacl -R -x u:zephyr "$PROJECTS"
 setfacl --modify u:zephyr:x "/home/$OWNER"          # traverse only, cannot list $HOME
-# One pass sets both the access and the default ACL; this walks every file, so large build dirs take minutes.
-setfacl -R --modify u:zephyr:rwX,d:u:zephyr:rwX "$PROJECTS"
+# Sets the ACL on every dir and file with a progress line. Symlinks are skipped (as setfacl -R does),
+# so a link pointing outside Projects never widens access.
+apply() {  # $1 find -type, $2 ACL spec, $3 label
+  local total done=0 n
+  total=$(find "$PROJECTS" -type "$1" -printf . | wc -c)
+  find "$PROJECTS" -type "$1" -print0 \
+    | SPEC="$2" xargs -0 -r -n 5000 sh -c 'setfacl --modify "$SPEC" -- "$@"; echo $#' sh \
+    | while read -r n; do
+        done=$((done + n))
+        printf '\r%s: %d / %d (%d%%)' "$3" "$done" "$total" $((done * 100 / (total ? total : 1)))
+      done
+  echo
+}
+apply d "u:zephyr:rwX,d:u:zephyr:rwX" "directories"
+apply f "u:zephyr:rwX" "files"
 # Secrets inside Projects stay owner-only. Add paths here as needed.
 DENY=("$PROJECTS/.parity-env.sh" "$PROJECTS/.parity-lanes/archive")
 while IFS= read -r -d '' f; do DENY+=("$f"); done < <(find "$PROJECTS" -name '.env*' -not -path '*/node_modules/*' -print0)
