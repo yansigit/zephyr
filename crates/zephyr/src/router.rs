@@ -44,6 +44,7 @@ pub async fn run<C: Channel>(
     std::fs::create_dir_all(&cfg.home)?;
     let (tx, rx) = mpsc::channel(64);
     let (attach_tx, attaches) = mpsc::channel(4);
+    let jobs = crate::scheduler::Wake::default();
     let mut router = Router {
         cfg,
         store: Store::open(&cfg.db_path())?,
@@ -55,11 +56,13 @@ pub async fn run<C: Channel>(
         unrouted: HashSet::new(),
         tap: broadcast::channel(1024).0,
         attaches,
+        jobs: &jobs,
     };
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
         r = runs => r.map(drop),
         r = crate::attach::serve(cfg, tx, attach_tx) => r,
+        r = crate::scheduler::run(cfg, &jobs) => r,
         r = router.main(rx, channels, shutdown) => r,
     }
 }
@@ -78,6 +81,8 @@ struct Router<'a> {
     /// Every child event, for attached clients.
     tap: broadcast::Sender<Value>,
     attaches: mpsc::Receiver<crate::attach::AttachRequest>,
+    /// Shared with the scheduler, which runs jobs beside `main`.
+    jobs: &'a crate::scheduler::Wake,
 }
 
 async fn next_event(child: &mut Option<Child>) -> Option<Value> {
@@ -105,6 +110,7 @@ impl Router<'_> {
                 }
                 Some(m) = rx.recv() => self.inbound(m).await,
                 Some(req) = self.attaches.recv() => self.attach(req).await,
+                _ = self.jobs.outbox.notified() => {} // a job's output: flush below
                 ev = next_event(&mut self.child) => match self.tapped(ev) {
                     Some(ev) if ev["type"] == "agent_settled" => self.settled(&ev).await,
                     Some(_) => continue,
@@ -180,6 +186,18 @@ impl Router<'_> {
                 m.sender, m.channel
             );
             log(self.store.set_status(id, "dropped").map_err(Into::into));
+            return;
+        }
+        if let Some(reply) = crate::scheduler::command(&mut self.store, self.cfg, &m) {
+            let row = InboxRow {
+                id,
+                channel: m.channel,
+                sender: m.sender,
+                text: m.text,
+                tries: 0,
+            };
+            log(self.store.reply(&row, &reply, "done").map_err(Into::into));
+            self.jobs.runs.notify_one();
             return;
         }
         let cmd = m.text.trim().to_string();
