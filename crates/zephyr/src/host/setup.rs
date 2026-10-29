@@ -204,6 +204,17 @@ pub fn login_cmd(h: &Host, mut a: Args) -> anyhow::Result<()> {
     }
 }
 
+/// The env var a key provider's login can be preset from; OAuth providers have none.
+fn key_env(provider: &str) -> Option<&'static str> {
+    match provider {
+        "claude-code" => Some("CLAUDE_CODE_OAUTH_TOKEN"),
+        "opencode-go" => Some("OPENCODE_API_KEY"),
+        "cursor" => Some("CURSOR_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        _ => None,
+    }
+}
+
 /// Signs an account in through rpi in the container, records it in `[[account]]`, then tests it.
 fn login(
     h: &Host,
@@ -227,23 +238,24 @@ fn login(
     let exts = conf::extension_args(&doc);
     let exts: Vec<&str> = exts.iter().map(String::as_str).collect();
 
-    if provider == "claude-code" {
-        // A token already in the environment (scripts, tests) skips the sign-in and the prompt.
-        let token = match std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty())
-        {
-            Some(t) => t,
-            None => {
-                println!(
-                    "Sign in with your Claude subscription. Copy the token it prints at the end."
-                );
-                run(&mut h.exec(&["-it"], &[], &[CLAUDE_CLI, "setup-token"]))?;
+    // A key already in the environment (scripts, tests) skips the sign-in and the prompt.
+    let preset = key_env(provider)
+        .and_then(|k| std::env::var(k).ok())
+        .filter(|t| !t.is_empty());
+    let token = match preset {
+        Some(t) => Some(t),
+        None if provider == "claude-code" => {
+            println!("Sign in with your Claude subscription. Copy the token it prints at the end.");
+            run(&mut h.exec(&["-it"], &[], &[CLAUDE_CLI, "setup-token"]))?;
+            Some(
                 Password::new()
                     .with_prompt("Paste the token (hidden)")
-                    .interact()?
-            }
-        };
+                    .interact()?,
+            )
+        }
+        None => None,
+    };
+    if let Some(token) = token {
         // rpi reads keys from a terminal, so `script` gives it one. The pty echoes the key back,
         // so the output is dropped; `auth check` tells whether it was stored.
         let login = rpi(&exts, &["auth", "login", "--provider", provider]).join(" ");
