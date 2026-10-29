@@ -1,0 +1,19 @@
+{
+  "type": "new-message",
+  "data": {
+    "originalROWID": 1236,
+    "guid": "CCCC-5555-6666",
+    "text": "lunch?",
+    "handle": { "originalROWID": 9, "address": "+15559999999", "service": "iMessage" },
+    "handleId": 9,
+    "error": 0,
+    "dateCreated": 1798000002000,
+    "isFromMe": false,
+    "itemType": 0,
+    "associatedMessageGuid": null,
+    "associatedMessageType": "0",
+    "chats": [
+      { "originalROWID": 4, "guid": "iMessage;+;chat000000000000000001", "style": 43, "chatIdentifier": "chat000000000000000001", "isArchived": false, "displayName": "Friends" }
+    ]
+  }
+}

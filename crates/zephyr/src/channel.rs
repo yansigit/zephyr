@@ -32,6 +32,7 @@ pub trait Channel: Send + Sync {
 pub enum AnyChannel {
     Chat(crate::chat::ChatChannel),
     Discord(crate::discord::Discord),
+    IMessage(crate::imessage::IMessage),
 }
 
 impl Channel for AnyChannel {
@@ -39,18 +40,21 @@ impl Channel for AnyChannel {
         match self {
             Self::Chat(c) => c.name(),
             Self::Discord(c) => c.name(),
+            Self::IMessage(c) => c.name(),
         }
     }
     async fn run(&self, tx: tokio::sync::mpsc::Sender<Inbound>) -> anyhow::Result<()> {
         match self {
             Self::Chat(c) => c.run(tx).await,
             Self::Discord(c) => c.run(tx).await,
+            Self::IMessage(c) => c.run(tx).await,
         }
     }
     async fn send(&self, msg: &Outbound) -> anyhow::Result<()> {
         match self {
             Self::Chat(c) => c.send(msg).await,
             Self::Discord(c) => c.send(msg).await,
+            Self::IMessage(c) => c.send(msg).await,
         }
     }
 }

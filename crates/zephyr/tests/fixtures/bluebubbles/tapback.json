@@ -1,0 +1,19 @@
+{
+  "type": "new-message",
+  "data": {
+    "originalROWID": 1237,
+    "guid": "DDDD-7777-8888",
+    "text": "Loved “hello from my phone”",
+    "handle": { "originalROWID": 7, "address": "+15551234567", "service": "iMessage" },
+    "handleId": 7,
+    "error": 0,
+    "dateCreated": 1798000003000,
+    "isFromMe": false,
+    "itemType": 0,
+    "associatedMessageGuid": "p:0/AAAA-1111-2222",
+    "associatedMessageType": "love",
+    "chats": [
+      { "originalROWID": 3, "guid": "iMessage;-;+15551234567", "style": 45, "chatIdentifier": "+15551234567", "isArchived": false, "displayName": "" }
+    ]
+  }
+}

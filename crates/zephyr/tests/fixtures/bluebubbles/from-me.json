@@ -1,0 +1,20 @@
+{
+  "type": "new-message",
+  "data": {
+    "originalROWID": 1235,
+    "guid": "BBBB-3333-4444",
+    "tempGuid": "reply-1",
+    "text": "reply sent by zephyr",
+    "handle": null,
+    "handleId": 0,
+    "error": 0,
+    "dateCreated": 1798000001000,
+    "isFromMe": true,
+    "itemType": 0,
+    "associatedMessageGuid": null,
+    "associatedMessageType": "0",
+    "chats": [
+      { "originalROWID": 3, "guid": "iMessage;-;+15551234567", "style": 45, "chatIdentifier": "+15551234567", "isArchived": false, "displayName": "" }
+    ]
+  }
+}
