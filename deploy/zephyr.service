@@ -1,0 +1,21 @@
+# systemd user unit (DESIGN §4.8). Install as the zephyr account:
+#   install -Dm644 zephyr.service ~/.config/systemd/user/zephyr.service
+#   systemctl --user daemon-reload && systemctl --user enable --now zephyr
+[Unit]
+Description=Zephyr agent gateway
+StartLimitBurst=5
+StartLimitIntervalSec=10min
+
+[Service]
+Type=notify
+ExecStart=%h/bin/zephyr run
+Environment=ZEPHYR_CONFIG=%h/agent/zephyr.toml
+WatchdogSec=60
+Restart=on-failure
+RestartSec=5
+# SIGTERM to zephyr only, so it can drain the rpi child; anything left is killed after 30 s.
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
