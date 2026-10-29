@@ -17,10 +17,10 @@ pub const PROVIDERS: [(&str, &str); 6] = [
     ("anthropic", "Anthropic API key"),
 ];
 
-/// The Claude Code CLI bundled with the Agent SDK in the image, run with node.
-/// shortcut: the path the rpi-claude-agent stage is expected to produce; adjust once that lane reports it.
+/// The Claude Code executable bundled with the Agent SDK in the image (rpi-claude-agent's stage.sh).
+/// shortcut: the linux-x64 package only; an arm64 image needs `claude-agent-sdk-linux-arm64`.
 pub const CLAUDE_CLI: &str =
-    "/opt/zephyr/ext/rpi-claude-agent/runtime/node_modules/@anthropic-ai/claude-agent-sdk/cli.js";
+    "/opt/zephyr/ext/rpi-claude-agent/runtime/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude";
 
 fn provider_of(model: &str) -> &str {
     model.split('/').next().unwrap_or_default()
@@ -238,7 +238,7 @@ fn login(
                 println!(
                     "Sign in with your Claude subscription. Copy the token it prints at the end."
                 );
-                run(&mut h.exec(&["-it"], &[], &["node", CLAUDE_CLI, "setup-token"]))?;
+                run(&mut h.exec(&["-it"], &[], &[CLAUDE_CLI, "setup-token"]))?;
                 Password::new()
                     .with_prompt("Paste the token (hidden)")
                     .interact()?

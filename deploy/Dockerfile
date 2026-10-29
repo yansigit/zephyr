@@ -61,12 +61,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp /src/rpi-package/target/release/librpi_providers.so /out/ext/
 
 # rpi-cursor-lite and rpi-claude-agent: each package's stage.sh builds its cdylib and worker and
-# copies the lockfile-pinned node_modules (npm ci --ignore-scripts first, with the lockfiles' hashes).
+# installs the lockfile-pinned node_modules (npm ci --ignore-scripts, checked against the lockfiles' hashes).
 FROM toolchain AS plugins
 COPY --from=provider-plugins / /src/plugins
 WORKDIR /src/plugins
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/root/.npm \
-    for d in packages/rpi-cursor-sdk/worker packages/rpi-cursor-sdk/runtime packages/rpi-claude-agent/worker; do \
+    for d in packages/rpi-cursor-sdk/worker packages/rpi-cursor-sdk/runtime; do \
       [ ! -f "$d/package-lock.json" ] || (cd "$d" && npm ci --ignore-scripts --no-audit --no-fund); \
     done \
     && packages/rpi-cursor-lite/scripts/stage.sh /out/ext/rpi-cursor-lite \
