@@ -7,7 +7,10 @@ version.workspace = true
 publish = false
 
 [dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+rusqlite.workspace = true
+sd-notify.workspace = true
+toml.workspace = true
