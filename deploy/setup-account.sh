@@ -14,7 +14,10 @@ loginctl enable-linger zephyr
 setfacl --modify u:zephyr:x "/home/$OWNER"          # traverse only, cannot list $HOME
 setfacl -R --modify u:zephyr:rwX "$PROJECTS"
 setfacl -R --modify d:u:zephyr:rwX "$PROJECTS"
-for p in .ssh .rpi .pi .gnupg .config .local .mozilla; do
-  [ -e "/home/$OWNER/$p" ] && setfacl -R -x u:zephyr "/home/$OWNER/$p" 2>/dev/null || true
+# Secrets inside Projects stay owner-only. Add paths here as needed.
+DENY=("$PROJECTS/.parity-env.sh" "$PROJECTS/.parity-lanes/archive")
+while IFS= read -r -d '' f; do DENY+=("$f"); done < <(find "$PROJECTS" -name '.env*' -not -path '*/node_modules/*' -print0)
+for p in "${DENY[@]}"; do
+  [ -e "$p" ] && setfacl -R -x u:zephyr "$p" && { [ -d "$p" ] && setfacl -R -x d:u:zephyr "$p" || true; }
 done
 echo "zephyr account ready; linger on; Projects shared at $PROJECTS"
