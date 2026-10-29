@@ -19,6 +19,8 @@ pub struct Config {
     /// child that does not list the `zephyr-policy` command (rpi skips a plugin that fails
     /// to load) is refused and gets no prompts.
     pub policy_plugin: Option<PathBuf>,
+    /// The Discord adapter. Its owner list is `owners.discord`. Absent means no Discord.
+    pub discord: Option<crate::discord::Config>,
     /// Owner allowlist per channel name. Senders not listed are dropped.
     #[serde(default)]
     pub owners: HashMap<String, Vec<String>>,
@@ -71,14 +73,19 @@ mod tests {
             rpi = "/opt/rpi"
             home = "/home/zephyr/agent"
             model = "anthropic/claude-sonnet-5"
+            [discord]
+            token_env = "ZEPHYR_DISCORD_TOKEN"
             [owners]
             chat = ["1000"]
+            discord = ["2000"]
             "#,
         )
         .unwrap();
         assert!(cfg.is_owner("chat", "1000"));
         assert!(!cfg.is_owner("chat", "1001"));
+        assert!(cfg.is_owner("discord", "2000"));
         assert!(!cfg.is_owner("discord", "1000"));
+        assert_eq!(cfg.discord.unwrap().token_env, "ZEPHYR_DISCORD_TOKEN");
         assert!(toml::from_str::<Config>("rpi='a'\nhome='b'\ntypo=1").is_err());
     }
 }

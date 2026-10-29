@@ -1914,22 +1914,14 @@ name = "zephyr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-util",
  "rusqlite",
  "sd-notify",
  "serde",
  "serde_json",
- "tokio",
- "toml",
-]
-
-[[package]]
-name = "zephyr-discord"
-version = "0.1.0"
-dependencies = [
- "anyhow",
  "serenity",
  "tokio",
- "zephyr",
+ "toml",
 ]
 
 [[package]]

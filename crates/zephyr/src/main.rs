@@ -1,6 +1,8 @@
 use std::process::ExitCode;
+use zephyr::channel::AnyChannel;
 use zephyr::chat::{self, ChatChannel};
 use zephyr::config::Config;
+use zephyr::discord::Discord;
 use zephyr::rpc::{Child, USED_COMMANDS};
 use zephyr::store::Store;
 
@@ -36,7 +38,10 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cfg: Config) -> anyhow::Result<()> {
-    let channel = ChatChannel::new(cfg.socket_path());
+    let mut channels = vec![AnyChannel::Chat(ChatChannel::new(cfg.socket_path()))];
+    if let Some(discord) = &cfg.discord {
+        channels.push(AnyChannel::Discord(Discord::new(discord)?));
+    }
     let shutdown = async {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("SIGTERM handler");
@@ -46,7 +51,7 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         }
         eprintln!("zephyr: shutting down");
     };
-    zephyr::router::run(&cfg, &channel, shutdown).await
+    zephyr::router::run(&cfg, &channels, shutdown).await
 }
 
 async fn status(cfg: &Config) -> anyhow::Result<()> {

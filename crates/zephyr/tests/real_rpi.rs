@@ -113,7 +113,7 @@ async fn real_rpi_round_trip_and_kill_mid_run() {
     let (stop, stopped) = oneshot::channel::<()>();
     let ch = channel.clone();
     let task = tokio::spawn(async move {
-        zephyr::router::run(&cfg, &*ch, async {
+        zephyr::router::run(&cfg, std::slice::from_ref(&*ch), async {
             let _ = stopped.await;
         })
         .await

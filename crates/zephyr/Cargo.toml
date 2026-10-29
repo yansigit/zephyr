@@ -14,3 +14,5 @@ anyhow.workspace = true
 rusqlite.workspace = true
 sd-notify.workspace = true
 toml.workspace = true
+futures-util.workspace = true
+serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "model", "http", "rustls_backend"] }

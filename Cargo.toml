@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/zephyr", "crates/zephyr-policy", "crates/zephyr-discord"]
+members = ["crates/zephyr", "crates/zephyr-policy"]
 resolver = "2"
 
 [workspace.package]
@@ -16,3 +16,4 @@ anyhow = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 sd-notify = "0.4"
 toml = "0.9"
+futures-util = "0.3"

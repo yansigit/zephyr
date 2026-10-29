@@ -1,6 +1,8 @@
 //! Discord channel adapter for Zephyr: DMs only. See DESIGN.md section 4.3.
 
+use crate::channel::{Channel, Inbound, Outbound};
 use anyhow::Context as _;
+use serde::Deserialize;
 use serenity::async_trait;
 use serenity::builder::CreateMessage;
 use serenity::client::{Client, Context, EventHandler};
@@ -9,14 +11,14 @@ use serenity::model::channel::{Message, Nonce};
 use serenity::model::gateway::GatewayIntents;
 use serenity::model::id::UserId;
 use tokio::sync::mpsc;
-use zephyr::channel::{Channel, Inbound, Outbound};
 
 /// Discord's per-message content limit.
 pub const MAX_CONTENT: usize = 2000;
 /// Discord's `nonce` limit: "up to 25 characters" (Create Message, REST docs).
 pub const MAX_NONCE: usize = 25;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Name of the env var that holds the bot token. The token is never stored here or logged.
     pub token_env: String,
