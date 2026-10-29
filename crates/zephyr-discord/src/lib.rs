@@ -20,8 +20,6 @@ pub const MAX_NONCE: usize = 25;
 pub struct Config {
     /// Name of the env var that holds the bot token. The token is never stored here or logged.
     pub token_env: String,
-    /// Discord user id of the owner. The router enforces it; this adapter does not filter on it.
-    pub owner_id: u64,
 }
 
 pub struct Discord {
@@ -256,7 +254,6 @@ mod tests {
     fn new_errors_without_leaking_the_token() {
         let cfg = Config {
             token_env: "ZEPHYR_DISCORD_TEST_UNSET_VAR".into(),
-            owner_id: 1,
         };
         let err = Discord::new(&cfg).err().expect("missing env var must fail");
         assert!(err.to_string().contains("ZEPHYR_DISCORD_TEST_UNSET_VAR"));
