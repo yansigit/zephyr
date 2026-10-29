@@ -44,6 +44,10 @@ fn job_timeout() -> std::time::Duration {
     crate::scheduler::JOB_TIMEOUT
 }
 
+/// Sent once, when a budget limit is crossed.
+pub const BUDGET_NOTICE: &str =
+    "[zephyr] daily budget reached: paused until the next UTC day or /resume";
+
 /// `[budget]`: counted per UTC day. Crossing a limit pauses the gateway until the next UTC day or `/resume`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]

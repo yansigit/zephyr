@@ -340,6 +340,11 @@ impl Store {
         let Some((channel, recipient)) = last else {
             return Ok(());
         };
+        self.notify(&channel, &recipient, text)
+    }
+
+    /// Writes a notice to `channel`/`recipient`.
+    pub fn notify(&self, channel: &str, recipient: &str, text: &str) -> rusqlite::Result<()> {
         // No inbox row to key on, so the client id is `b<outbox id>`. Replies are `z<base36>`.
         self.db.execute(
             "INSERT INTO outbox(channel, recipient, client_id, text)
@@ -347,6 +352,29 @@ impl Store {
             params![channel, recipient, text],
         )?;
         Ok(())
+    }
+
+    /// Adds a session's new usage to today's spend. Returns true when this charge crossed
+    /// a budget limit, and pauses the gateway for the rest of the UTC day. Shared by `main`
+    /// settles and job runs; the caller sends `BUDGET_NOTICE`.
+    pub fn charge(
+        &self,
+        budget: Option<&crate::config::Budget>,
+        (tokens, cost): (i64, f64),
+    ) -> rusqlite::Result<bool> {
+        let day = self.today()?;
+        let (total_tokens, total_cost) = self.add_spend(&day, tokens, cost)?;
+        let Some(budget) = budget else {
+            return Ok(false);
+        };
+        // Only the charge that crosses a limit pauses; after `/resume` the override holds for the day.
+        let crossed = budget.exceeded(total_tokens, total_cost)
+            && !budget.exceeded(total_tokens - tokens, total_cost - cost);
+        if !crossed || self.pause_reason()?.is_some() {
+            return Ok(false);
+        }
+        self.set_paused(Some(&format!("budget:{day}")))?;
+        Ok(true)
     }
 
     pub fn add_job(

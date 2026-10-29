@@ -1,7 +1,7 @@
 //! Inbound → inbox → `main` child → outbox → channel, with crash recovery (DESIGN §4.2).
 
 use crate::channel::{Channel, Inbound, Outbound};
-use crate::config::Config;
+use crate::config::{Config, BUDGET_NOTICE};
 use crate::rpc::{message_text, Child, MAIN_SESSION};
 use crate::store::{InboxRow, Store};
 use serde_json::{json, Value};
@@ -20,10 +20,6 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 pub fn tagged(row: &InboxRow) -> String {
     format!("[{} #{}] {}", row.channel, row.id, row.text)
 }
-
-/// Sent once, when a budget limit is crossed.
-const BUDGET_NOTICE: &str =
-    "[zephyr] daily budget reached: paused until the next UTC day or /resume";
 
 /// How long a reply may be retried: only as long as the platform still dedupes the client id.
 fn retry_window(channel: &str) -> i64 {
@@ -277,19 +273,7 @@ impl Router<'_> {
             total
         };
         self.store.set_last_stats(total)?;
-        let day = self.store.today()?;
-        let (tokens, cost) = self.store.add_spend(&day, delta.0, delta.1)?;
-        let Some(budget) = &self.cfg.budget else {
-            return Ok(false);
-        };
-        // Only the settle that crosses a limit pauses; after `/resume` the override holds for the day.
-        let crossed =
-            budget.exceeded(tokens, cost) && !budget.exceeded(tokens - delta.0, cost - delta.1);
-        if !crossed || self.store.pause_reason()?.is_some() {
-            return Ok(false);
-        }
-        self.store.set_paused(Some(&format!("budget:{day}")))?;
-        Ok(true)
+        Ok(self.store.charge(self.cfg.budget.as_ref(), delta)?)
     }
 
     /// Sends every `new` row: `prompt` when idle, rpi's own `queue_message` when busy.

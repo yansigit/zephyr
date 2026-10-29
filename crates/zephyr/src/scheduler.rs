@@ -3,7 +3,7 @@
 //! paused nothing is claimed or started, and a running job is aborted.
 
 use crate::channel::Inbound;
-use crate::config::Config;
+use crate::config::{Config, BUDGET_NOTICE};
 use crate::rpc::{message_text, Child};
 use crate::store::{JobRun, Store};
 use croner::parser::{CronParser, Seconds, Year};
@@ -116,14 +116,20 @@ pub async fn run(cfg: &Config, wake: &Wake) -> anyhow::Result<()> {
                     break;
                 }
             };
-            let (status, output) = execute(cfg, &mut store, &run).await;
+            let (status, output, crossed) = execute(cfg, &mut store, &run).await;
             // The run's memory edits are committed as main's settle would commit them.
             log_err(crate::memory::commit_if_changed(&cfg.home));
             let delivery = (output.trim() != SILENT).then_some(output.as_str());
-            match store.finish_run(&run, status, &output, delivery, crate::now()) {
-                Ok(()) => wake.outbox.notify_one(),
-                Err(e) => eprintln!("zephyr: recording job run {} failed: {e}", run.id),
+            if let Err(e) = store.finish_run(&run, status, &output, delivery, crate::now()) {
+                eprintln!("zephyr: recording job run {} failed: {e}", run.id);
             }
+            if crossed {
+                let (channel, recipient) = (&run.job.channel, &run.job.recipient);
+                if let Err(e) = store.notify(channel, recipient, BUDGET_NOTICE) {
+                    eprintln!("zephyr: budget notice failed: {e}");
+                }
+            }
+            wake.outbox.notify_one();
         }
     }
 }
@@ -134,9 +140,9 @@ fn log_err(r: anyhow::Result<bool>) {
     }
 }
 
-/// One prompt in a fresh child, bounded by `cfg.job_timeout` and aborted by a pause.
-/// Returns `(status, output)`.
-async fn execute(cfg: &Config, store: &mut Store, run: &JobRun) -> (&'static str, String) {
+/// One prompt in a fresh child, bounded by `cfg.job_timeout` and aborted by a pause. The
+/// run's usage is charged to today's budget. Returns `(status, output, crossed the budget)`.
+async fn execute(cfg: &Config, store: &mut Store, run: &JobRun) -> (&'static str, String, bool) {
     let label = format!(
         "[zephyr] job #{} ({}) run {}",
         run.job.id, run.job.name, run.id
@@ -144,7 +150,7 @@ async fn execute(cfg: &Config, store: &mut Store, run: &JobRun) -> (&'static str
     let session = format!("job-{}-{}", run.job.id, run.id);
     let mut child = match Child::spawn(cfg, &session).await {
         Ok(child) => child,
-        Err(e) => return ("failed", format!("{label} could not start: {e:#}")),
+        Err(e) => return ("failed", format!("{label} could not start: {e:#}"), false),
     };
     let limit = cfg.job_timeout;
     let ended = tokio::select! {
@@ -164,8 +170,26 @@ async fn execute(cfg: &Config, store: &mut Store, run: &JobRun) -> (&'static str
             ("failed", format!("{label} was aborted{why}"))
         }
     };
+    // A fresh session, so its totals are this run's usage.
+    let stats = child.call(json!({"type": "get_stats"}));
+    let crossed = match tokio::time::timeout(Duration::from_secs(5), stats).await {
+        Ok(Ok(stats)) => {
+            let used = (
+                stats["totalTokens"].as_i64().unwrap_or(0),
+                stats["costTotal"].as_f64().unwrap_or(0.0),
+            );
+            store.charge(cfg.budget.as_ref(), used).unwrap_or_else(|e| {
+                eprintln!("zephyr: recording job spend failed: {e}");
+                false
+            })
+        }
+        _ => {
+            eprintln!("zephyr: no get_stats from {label}; its spend is not counted");
+            false
+        }
+    };
     child.stop().await;
-    out
+    (out.0, out.1, crossed)
 }
 
 /// Sends the prompt and waits for the run to settle. The inner result is the final
