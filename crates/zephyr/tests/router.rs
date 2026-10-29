@@ -718,3 +718,64 @@ async fn a_job_run_commits_its_memory_edits() {
     assert!(memory.contains("remembered: say: WRITE_MEMORY nightly note"));
     gw.shutdown().await;
 }
+
+fn spend_today(home: &Path) -> (i64, f64) {
+    let store = Store::open(&home.join("state.db")).unwrap();
+    store.spend(&store.today().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn a_job_over_the_budget_pauses_everything() {
+    let home = home("job-budget-over");
+    let mut cfg = config(&home);
+    cfg.budget = Some(toml::from_str("daily_tokens = 100").unwrap());
+    // The job's fresh session reports 120 tokens.
+    std::fs::write(home.join("stats.json"), r#"{"totalTokens": 120}"#).unwrap();
+    let gw = start(cfg);
+    gw.say(
+        "m1",
+        "owner",
+        &format!("/job add big | {NEVER} | say: done"),
+    )
+    .await;
+    gw.say("m2", "owner", "/job run 1").await;
+    let replies = gw.wait_replies(4).await;
+    assert_eq!(replies[2..], ["done", BUDGET_NOTICE]);
+    assert_eq!(spend_today(&home).0, 120);
+
+    gw.say("m3", "owner", "held").await;
+    assert_eq!(gw.wait_replies(4).await.len(), 4);
+    assert_eq!(
+        log(&home, "prompt").len(),
+        1,
+        "main gets nothing while paused"
+    );
+    assert_eq!(inbox_status(&home, "new"), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_job_under_the_budget_records_its_spend() {
+    let home = home("job-budget-under");
+    let mut cfg = config(&home);
+    cfg.budget = Some(toml::from_str("daily_tokens = 100").unwrap());
+    std::fs::write(
+        home.join("stats.json"),
+        r#"{"totalTokens": 40, "costTotal": 0.5}"#,
+    )
+    .unwrap();
+    let gw = start(cfg);
+    gw.say(
+        "m1",
+        "owner",
+        &format!("/job add small | {NEVER} | say: done"),
+    )
+    .await;
+    gw.say("m2", "owner", "/job run 1").await;
+    assert_eq!(gw.wait_replies(3).await[2], "done");
+    assert_eq!(spend_today(&home), (40, 0.5));
+    assert_eq!(log(&home, "get_stats").len(), 1);
+    gw.say("m3", "owner", "hi").await;
+    assert_eq!(gw.wait_replies(4).await[3], "echo: [chat #3] hi");
+    gw.shutdown().await;
+}
