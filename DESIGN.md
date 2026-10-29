@@ -98,12 +98,12 @@ Upstream analysis (`research/pi-rust-integration.md` §7) compared three options
 
 There are no per-call prompts. These hard limits hold every time:
 
-1. **One Docker container, `zephyr`** (`deploy/run.sh`). The daemon and every child run inside it, as your uid, so files it creates are yours and no ACLs are needed. The agent can work anywhere it is mounted:
+1. **One Docker container, `zephyr`** (`zephyr up`, set up by `zephyr init`). The daemon and every child run inside it, as your uid, so files it creates are yours and no ACLs are needed. The agent can work anywhere it is mounted:
    - Read-write: `~/.zephyr` (seen as `/zephyr`), which holds its state, memory, sessions and its own rpi agent dir with its own credentials.
    - Read-write: `$PROJECTS` at the same path as on the host. Secrets inside it (`.parity-env.sh`, `.parity-lanes/archive`, every `.env*` outside `node_modules`) are covered with empty mounts.
    - Nothing else of your home: `~/.ssh`, `~/.rpi`, `~/.pi` and browser profiles are not mounted. No docker socket.
    - Network: host networking, so the attach port on 127.0.0.1 and the Tailscale webhook address work unchanged.
-   - Providers come only from the image: `deploy/run.sh` stages `librpi_providers.so` and `rpi-cursor-lite/` into `/opt/zephyr/ext/`, and `zephyr.toml` loads them with `extensions`. Do not `rpi install rpi-providers` into `~/.zephyr`. A package installed there loads twice (`zephyr doctor` warns).
+   - Providers come only from the image: `deploy/Dockerfile` builds `librpi_providers.so`, `rpi-cursor-lite/` and `rpi-claude-agent/` into `/opt/zephyr/ext/`, and `zephyr.toml` loads them with `extensions`. Do not `rpi install rpi-providers` into `~/.zephyr`. A package installed there loads twice (`zephyr doctor` warns).
    - `--restart unless-stopped` replaces the systemd unit; `--init` reaps children and forwards SIGTERM.
 
    This replaced an earlier dedicated Linux account: ACLs over 2.2M files were slow to apply and, on eCryptfs, unreliable to remove.
@@ -177,7 +177,7 @@ New repo `yansigit/zephyr` (private), local at `/home/user/Projects/zephyr`, a R
 ```
 crates/zephyr/          daemon: router, session manager, store, scheduler, auth keeper, adapters, attach server
 crates/zephyr-policy/   cdylib rpi plugin: tool-call veto, audit, schedule tool, untrusted-content tagging
-deploy/                 Dockerfile, run.sh, zephyr.toml.example
+deploy/                 Dockerfile, zephyr.toml.example (host commands: crates/zephyr/src/host/)
 ```
 
 Dependencies: tokio, serde_json, rusqlite (bundled), serenity, reqwest, sd-notify, croner, and `rpi-plugin-sdk` (crates.io, same minor as the pinned `rpi`). Reusing `rpi-extcore`, which already spawns RPC children, gets evaluated in M0. We use it only if it fits without patches.
