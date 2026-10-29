@@ -11,12 +11,14 @@
 
 pub mod policy;
 
+use std::ffi::c_void;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rpi_plugin_sdk::{
-    event_handler, export_plugin, EventTag, EVENT_HANDLER_ABORT, EVENT_HANDLER_CONTINUE,
+    event_handler, export_plugin, EventTag, StbString, StbStringRef, EVENT_HANDLER_ABORT,
+    EVENT_HANDLER_CONTINUE,
 };
 use serde_json::Value;
 
@@ -47,11 +49,40 @@ event_handler! {
     }
 }
 
+/// `/zephyr-policy`: the load beacon. The gateway calls `get_commands` to see it.
+extern "C" fn status_command(
+    _args: StbStringRef,
+    out: *mut StbString,
+    _user_data: *mut c_void,
+) -> i32 {
+    rpi_plugin_sdk::guard_or(1, || {
+        if out.is_null() {
+            return 1;
+        }
+        let text = r#"{"kind":"message","text":"zephyr-policy active"}"#;
+        // SAFETY: the host passes a writable out slot and frees the string it receives.
+        unsafe { *out = StbString::from_string(text.to_string()) };
+        0
+    })
+}
+
 export_plugin!(|api| {
     let Some(register) = api.register_event_handler else {
         return -1;
     };
-    register(EventTag::ToolCall, on_tool_call, std::ptr::null_mut())
+    let status = register(EventTag::ToolCall, on_tool_call, std::ptr::null_mut());
+    if status != 0 {
+        return status;
+    }
+    // The veto is required; the beacon is optional on hosts without command slots.
+    if let Some(register_command) = api.register_command {
+        return register_command(
+            StbStringRef::from_str("zephyr-policy"),
+            StbStringRef::from_str("Show whether the zephyr policy plugin is active"),
+            status_command,
+        );
+    }
+    0
 });
 
 /// Append one JSON line for a tool call. A write failure is reported on
@@ -118,19 +149,26 @@ fn redact(value: Value) -> Value {
     }
 }
 
-/// Redacts `NAME=value` words and the word after a `--secret-flag`, in command text.
+/// Redacts `NAME=value` words, the word after a `--secret-flag`, and the token
+/// after `Bearer`, in command text. `Bearer` may also be a plain word (fail-closed).
 fn redact_words(text: &str) -> String {
-    let mut after_flag = false;
+    let mut redact_next = false;
     text.split(' ')
         .map(|word| {
-            let redact_this = std::mem::take(&mut after_flag);
+            let redact_this = std::mem::take(&mut redact_next);
             if let Some((name, _)) = word.split_once('=') {
                 if is_secret_name(name) {
                     return format!("{name}={}", REDACTED);
                 }
             }
             if word.starts_with('-') && is_secret_name(word) {
-                after_flag = true;
+                redact_next = true;
+            }
+            if word
+                .trim_matches(|c: char| !c.is_ascii_alphabetic())
+                .eq_ignore_ascii_case("bearer")
+            {
+                redact_next = true;
             }
             if redact_this && !word.is_empty() {
                 REDACTED.to_string()
@@ -162,7 +200,7 @@ fn truncate(mut text: String, limit: usize) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpi_plugin_sdk::{StablePluginEvent, StbString, StbStringRef};
+    use rpi_plugin_sdk::StablePluginEvent;
     use serde_json::json;
 
     fn borrowed(text: &str) -> StbString {
@@ -207,6 +245,28 @@ mod tests {
         assert!(!args.contains("\"p\""), "{args}");
         assert!(args.contains("GITHUB_TOKEN=[REDACTED]"), "{args}");
         assert!(args.contains("\"path\":\"a\""), "{args}");
+    }
+
+    #[test]
+    fn redacts_bearer_tokens_in_command_text() {
+        let (args, _) = summarize(
+            r#"{"command":"curl -H 'Authorization: Bearer sk-live-123' https://x && echo Bearer tok-456"}"#,
+        );
+        assert!(!args.contains("sk-live-123"), "{args}");
+        assert!(!args.contains("tok-456"), "{args}");
+        assert!(args.contains("Bearer [REDACTED]"), "{args}");
+    }
+
+    #[test]
+    fn status_command_returns_message_json() {
+        let mut out = StbString::empty();
+        let rc = status_command(StbStringRef::empty(), &mut out, std::ptr::null_mut());
+        assert_eq!(rc, 0);
+        let text = unsafe { out.to_string_lossy() };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["kind"], "message");
+        assert_eq!(value["text"], "zephyr-policy active");
+        unsafe { out.free_with(Some(rpi_plugin_sdk::callbacks::free_string)) };
     }
 
     #[test]

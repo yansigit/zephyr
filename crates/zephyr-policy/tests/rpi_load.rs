@@ -205,3 +205,96 @@ fn rpi_loads_plugin_and_vetoes_write_into_ssh() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Runs `rpi --mode rpc`, asks for `get_commands`, and returns the command names.
+fn rpc_command_names(extension: Option<&Path>) -> Vec<String> {
+    let root = scratch(if extension.is_some() {
+        "rpc-on"
+    } else {
+        "rpc-off"
+    });
+    let home = root.join("home");
+    let agent = root.join("agent");
+    let sessions = root.join("sessions");
+    for dir in [&home, &agent, &sessions] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let mut args: Vec<String> = [
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-haiku-4-5",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--local-only",
+        "--no-session",
+        "--session-dir",
+    ]
+    .map(String::from)
+    .to_vec();
+    args.push(sessions.to_string_lossy().into_owned());
+    if let Some(lib) = extension {
+        args.push("--extension".into());
+        args.push(lib.to_string_lossy().into_owned());
+    }
+    args.extend(["--mode".into(), "rpc".into()]);
+
+    let mut child = Command::new(RPI)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &home)
+        .env("RPI_CODING_AGENT_DIR", &agent)
+        .env("ANTHROPIC_API_KEY", "test-key-not-real")
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rpi");
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        // get_commands needs no model; the base URL points at a closed port anyway.
+        stdin
+            .write_all(b"{\"id\":\"1\",\"type\":\"get_commands\"}\n")
+            .unwrap();
+    }
+    let output = child.wait_with_output().expect("wait rpi");
+    let _ = std::fs::remove_dir_all(&root);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let response = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["type"] == "response" && v["command"] == "get_commands")
+        .unwrap_or_else(|| {
+            panic!(
+                "no get_commands response; stdout: {stdout}\nstderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    response["data"]["commands"]
+        .as_array()
+        .expect("commands array")
+        .iter()
+        .filter_map(|c| c["name"].as_str().map(String::from))
+        .collect()
+}
+
+#[test]
+#[ignore = "needs the pinned rpi binary; run with --ignored"]
+fn rpc_lists_status_command_only_when_plugin_is_loaded() {
+    if !Path::new(RPI).exists() {
+        eprintln!("SKIP: {RPI} not installed");
+        return;
+    }
+    let lib = common::build_cdylib();
+    let with = rpc_command_names(Some(&lib));
+    assert!(
+        with.iter().any(|n| n == "zephyr-policy"),
+        "zephyr-policy missing with --extension: {with:?}"
+    );
+    let without = rpc_command_names(None);
+    assert!(
+        !without.iter().any(|n| n == "zephyr-policy"),
+        "zephyr-policy listed without --extension: {without:?}"
+    );
+}
