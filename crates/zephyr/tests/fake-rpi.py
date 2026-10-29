@@ -3,7 +3,8 @@
 
 State lives next to --session-dir (the zephyr home): log.jsonl records every command,
 pid holds the current pid, and a `hang` file makes the next prompt commit its user
-message, mark the run resumable, and stop answering (the test then kills -9 it).
+message, mark the run resumable, and stop answering (the test then kills -9 it); a
+`slow` file makes every prompt take a second.
 The session is <session-dir>/<session-id>.json: {"messages": [...], "pending": bool}.
 """
 import json, os, sys, time
@@ -42,6 +43,7 @@ def assistant(text):
 def finish(s, text):
     msg = assistant(text)
     s["messages"].append(msg); s["pending"] = False; save(s)
+    out({"type": "message_start", "message": msg})
     out({"type": "message_end", "message": msg})
     out({"type": "agent_settled", "runId": "r", "outcome": "completed", "aborted": False,
          "error": None, "summary": None, "pendingResume": False})
@@ -60,6 +62,9 @@ for line in sys.stdin:
     if kind == "prompt":
         respond(cmd, {"accepted": True})
         s["messages"].append(user(cmd["message"])); save(s)
+        out({"type": "message_start", "message": user(cmd["message"])})
+        out({"type": "message_end", "message": user(cmd["message"])})
+        if os.path.exists(os.path.join(home, "slow")): time.sleep(1)
         if os.path.exists(os.path.join(home, "hang")):
             os.remove(os.path.join(home, "hang"))
             s["pending"] = True; save(s)

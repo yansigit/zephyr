@@ -24,6 +24,19 @@ pub struct Config {
     /// Owner allowlist per channel name. Senders not listed are dropped.
     #[serde(default)]
     pub owners: HashMap<String, Vec<String>>,
+    /// The `rpi --connect` attach listener (DESIGN §4.3). Off when absent.
+    pub attach: Option<Attach>,
+}
+
+/// `[attach]`: listens on 127.0.0.1 only. The token comes from exactly one of the two sources.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Attach {
+    pub port: u16,
+    /// Name of an env var holding the token.
+    pub token_env: Option<String>,
+    /// A file holding the token; must not be readable by group or others.
+    pub token_file: Option<PathBuf>,
 }
 
 impl Config {
@@ -44,9 +57,12 @@ impl Config {
     }
 
     pub fn is_owner(&self, channel: &str, sender: &str) -> bool {
-        self.owners
-            .get(channel)
-            .is_some_and(|list| list.iter().any(|o| o == sender))
+        // The attach token already proved the sender is the owner.
+        channel == crate::attach::CHANNEL
+            || self
+                .owners
+                .get(channel)
+                .is_some_and(|list| list.iter().any(|o| o == sender))
     }
 
     pub fn db_path(&self) -> PathBuf {
