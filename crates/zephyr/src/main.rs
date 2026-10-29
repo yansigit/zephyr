@@ -20,8 +20,22 @@ const USAGE: &str = "usage: zephyr <run|status|doctor|chat|pause|resume>  (confi
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cmd = std::env::args().nth(1).unwrap_or_default();
-    let result = match Config::load(&Config::default_path()) {
+    let mut args = std::env::args().skip(1);
+    let cmd = args.next().unwrap_or_default();
+    let host = !zephyr::host::in_container();
+    if host && zephyr::host::is_command(&cmd) {
+        return finish(zephyr::host::main(&cmd, args.collect()));
+    }
+    if host && cmd != "run" {
+        eprintln!("{}", zephyr::host::USAGE);
+        return ExitCode::from(2);
+    }
+    // The daemon and the commands run beside it read secrets.env themselves (no --env-file).
+    let cfg = Config::load(&Config::default_path()).and_then(|cfg| {
+        zephyr::dotenv::load(&cfg.home.join("secrets.env"))?;
+        Ok(cfg)
+    });
+    let result = match cfg {
         Err(e) if cmd != "-h" && cmd != "--help" => Err(e),
         cfg => match (cmd.as_str(), cfg) {
             ("run", Ok(cfg)) => run(cfg).await,
@@ -36,6 +50,10 @@ async fn main() -> ExitCode {
             }
         },
     };
+    finish(result)
+}
+
+fn finish(result: anyhow::Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

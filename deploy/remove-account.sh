@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time cleanup of the old account install (Zephyr now runs in Docker, see run.sh): removes the
+# One-time cleanup of the old account install (Zephyr now runs in Docker, see `zephyr init`): removes the
 # zephyr account, /home/zephyr and every ACL the old setup-account.sh added. sudo bash deploy/remove-account.sh
 # Keep a copy of Zephyr's memory first if you want it: sudo cp -a /home/zephyr/agent/memory ~/zephyr-memory
 set -euo pipefail

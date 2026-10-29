@@ -15,6 +15,8 @@ libc = "0.2"
 rusqlite.workspace = true
 sd-notify.workspace = true
 toml.workspace = true
+toml_edit = "0.25"
+dialoguer = { version = "0.12", default-features = false, features = ["password"] }
 futures-util.workspace = true
 serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "model", "http", "rustls_backend"] }
 hyper = { version = "1", features = ["server", "http1"] }

@@ -207,3 +207,35 @@ fn doctor_warns_when_agent_dir_has_extensions() {
     std::fs::write(agent.join("extensions/librpi_providers.so"), "").unwrap();
     assert!(run().contains(warning));
 }
+
+#[test]
+fn secrets_env_in_home_is_loaded_without_overriding_the_environment() {
+    let (home, cfg) = setup(
+        "dotenv",
+        "[discord]\ntoken_env = \"ZEPHYR_CLI_DOTENV_TOKEN\"\n",
+    );
+    let label = "env ZEPHYR_CLI_DOTENV_TOKEN is set";
+    assert!(stdout(&zephyr(&cfg, &["doctor"])).contains(&format!("FAIL {label}")));
+    std::fs::write(
+        home.join("secrets.env"),
+        "# x\nZEPHYR_CLI_DOTENV_TOKEN=\"tok-sekret\"\n",
+    )
+    .unwrap();
+    let out = zephyr(&cfg, &["doctor"]);
+    assert!(
+        stdout(&out).contains(&format!("ok   {label}")),
+        "{}",
+        stdout(&out)
+    );
+    assert!(!stdout(&out).contains("tok-sekret"));
+    let out = Command::new(env!("CARGO_BIN_EXE_zephyr"))
+        .arg("doctor")
+        .env("ZEPHYR_CONFIG", &cfg)
+        .env("ZEPHYR_CLI_DOTENV_TOKEN", "")
+        .output()
+        .unwrap();
+    assert!(
+        stdout(&out).contains(&format!("FAIL {label}")),
+        "a set variable wins"
+    );
+}

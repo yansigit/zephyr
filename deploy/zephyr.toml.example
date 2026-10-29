@@ -1,15 +1,15 @@
-# ~/.zephyr/zephyr.toml, seen as /zephyr/zephyr.toml in the container (deploy/run.sh writes it)
+# ~/.zephyr/zephyr.toml, seen as /zephyr/zephyr.toml in the container (`zephyr init` writes it; edit with `zephyr config set`)
 rpi = "/usr/local/bin/rpi"   # pinned rpi 0.12.x; check with `zephyr doctor`
 home = "/zephyr"                      # state.db, sessions/, zephyr.sock; the child's cwd
 agent_dir = "/zephyr/.rpi/agent"      # RPI_CODING_AGENT_DIR: models.json and credentials
 model = "anthropic/claude-sonnet-5"
 # policy_plugin = "/usr/local/lib/libzephyr_policy.so"   # refuse prompts unless it loads
-# extensions = ["/opt/zephyr/ext/librpi_providers.so", "/opt/zephyr/ext/rpi-cursor-lite/librpi_cursor_lite.so"]   # baked in by run.sh; each loads with --extension after policy_plugin
+# extensions = ["/opt/zephyr/ext/librpi_providers.so", "/opt/zephyr/ext/rpi-cursor-lite/librpi_cursor_lite.so", "/opt/zephyr/ext/rpi-claude-agent/librpi_claude_agent.so"]   # baked into the image; each loads with --extension after policy_plugin
 # timezone = "Asia/Seoul"   # IANA zone for /job cron schedules; default: the system time zone
 
 # Optional DM-only Discord adapter. Remove this table to run chat-only.
 # [discord]
-# token_env = "ZEPHYR_DISCORD_TOKEN"   # env var holding the bot token; the token never goes in this file
+# token_env = "ZEPHYR_DISCORD_TOKEN"   # env var holding the bot token, set in ~/.zephyr/secrets.env (`zephyr channel add discord`)
 
 # Optional iMessage via BlueBubbles on your Mac (DESIGN §4.3). Register the webhook in BlueBubbles as
 # http://<listen>/?secret=<secret>. Messages from the last lookback_hours are re-read at start.

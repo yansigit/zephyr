@@ -1,3 +1,4 @@
 *
-!target/release/zephyr
-!target/release/libzephyr_policy.so
+!Cargo.toml
+!Cargo.lock
+!crates

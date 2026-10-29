@@ -6,6 +6,8 @@ pub mod channel;
 pub mod chat;
 pub mod config;
 pub mod discord;
+pub mod dotenv;
+pub mod host;
 pub mod imessage;
 pub mod memory;
 pub mod router;
