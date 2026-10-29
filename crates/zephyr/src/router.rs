@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::rpc::{message_text, Child, MAIN_SESSION};
 use crate::store::{InboxRow, Store};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -29,10 +29,10 @@ fn retry_window(channel: &str) -> i64 {
     }
 }
 
-/// Runs the gateway until `shutdown` resolves, then drains.
+/// Runs the gateway until `shutdown` resolves, then drains. Every channel feeds one main session.
 pub async fn run<C: Channel>(
     cfg: &Config,
-    channel: &C,
+    channels: &[C],
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(&cfg.home)?;
@@ -44,11 +44,13 @@ pub async fn run<C: Channel>(
         resumes: 0,
         backoff: FIRST_BACKOFF,
         respawn_at: Instant::now(),
+        unrouted: HashSet::new(),
     };
     let (tx, rx) = mpsc::channel(64);
+    let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
-        r = channel.run(tx) => r,
-        r = router.main(rx, channel, shutdown) => r,
+        r = runs => r.map(drop),
+        r = router.main(rx, channels, shutdown) => r,
     }
 }
 
@@ -61,6 +63,8 @@ struct Router<'a> {
     resumes: u32,
     backoff: Duration,
     respawn_at: Instant,
+    /// Outbox channels with no configured adapter, so each is logged once.
+    unrouted: HashSet<String>,
 }
 
 async fn next_event(child: &mut Option<Child>) -> Option<Value> {
@@ -74,7 +78,7 @@ impl Router<'_> {
     async fn main<C: Channel>(
         &mut self,
         mut rx: mpsc::Receiver<Inbound>,
-        channel: &C,
+        channels: &[C],
         shutdown: impl Future<Output = ()>,
     ) -> anyhow::Result<()> {
         tokio::pin!(shutdown);
@@ -96,9 +100,9 @@ impl Router<'_> {
                     let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
                 }
             }
-            self.flush(channel).await;
+            self.flush(channels).await;
         }
-        self.drain(channel).await;
+        self.drain(channels).await;
         Ok(())
     }
 
@@ -269,12 +273,21 @@ impl Router<'_> {
         self.dispatch_new().await
     }
 
-    async fn flush<C: Channel>(&mut self, channel: &C) {
+    async fn flush<C: Channel>(&mut self, channels: &[C]) {
         let rows = match self.store.pending_outbox() {
             Ok(rows) => rows,
             Err(e) => return eprintln!("zephyr: outbox read failed: {e}"),
         };
-        for row in rows.into_iter().filter(|r| r.channel == channel.name()) {
+        for row in rows {
+            let Some(channel) = channels.iter().find(|c| c.name() == row.channel) else {
+                if self.unrouted.insert(row.channel.clone()) {
+                    eprintln!(
+                        "zephyr: no {} channel is configured; its replies stay pending",
+                        row.channel
+                    );
+                }
+                continue;
+            };
             let msg = Outbound {
                 channel: row.channel.clone(),
                 recipient: row.recipient,
@@ -300,7 +313,7 @@ impl Router<'_> {
     }
 
     /// SIGTERM: stop intake, let a running turn settle, flush, then stop the child.
-    async fn drain<C: Channel>(&mut self, channel: &C) {
+    async fn drain<C: Channel>(&mut self, channels: &[C]) {
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
         let deadline = Instant::now() + Duration::from_secs(20);
         while self.busy {
@@ -313,7 +326,7 @@ impl Router<'_> {
                 _ => break, // child gone or out of time: recovery picks it up next start
             }
         }
-        self.flush(channel).await;
+        self.flush(channels).await;
         if let Some(child) = self.child.take() {
             child.stop().await;
         }

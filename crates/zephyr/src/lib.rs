@@ -3,6 +3,7 @@
 pub mod channel;
 pub mod chat;
 pub mod config;
+pub mod discord;
 pub mod router;
 pub mod rpc;
 pub mod store;

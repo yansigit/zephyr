@@ -1,24 +1,28 @@
 //! Router and recovery against a scripted fake `rpi` (tests/fake-rpi.py).
 
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use zephyr::channel::{Channel, Inbound, Outbound};
 use zephyr::config::Config;
-use zephyr::store::{InboxRow, Store};
+use zephyr::store::{client_id, InboxRow, Store};
+
+/// Each delivered reply, and whether its outbox row was already committed as pending.
+type Sent = Arc<Mutex<Vec<(Outbound, bool)>>>;
 
 struct TestChannel {
+    name: &'static str,
     feed: tokio::sync::Mutex<mpsc::Receiver<Inbound>>,
     db: PathBuf,
-    /// Each delivered reply, and whether its outbox row was already committed as pending.
-    sent: Mutex<Vec<(Outbound, bool)>>,
+    sent: Sent,
 }
 
 impl Channel for TestChannel {
     fn name(&self) -> &str {
-        "chat"
+        self.name
     }
     async fn run(&self, tx: mpsc::Sender<Inbound>) -> anyhow::Result<()> {
         let mut feed = self.feed.lock().await;
@@ -41,8 +45,8 @@ impl Channel for TestChannel {
 }
 
 struct Gateway {
-    feed: mpsc::Sender<Inbound>,
-    channel: Arc<TestChannel>,
+    feeds: HashMap<&'static str, mpsc::Sender<Inbound>>,
+    sent: HashMap<&'static str, Sent>,
     stop: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
@@ -59,31 +63,40 @@ fn home(name: &str) -> PathBuf {
 
 fn config(home: &Path) -> Config {
     toml::from_str(&format!(
-        "rpi = {:?}\nhome = {:?}\n[owners]\nchat = [\"owner\"]\n",
+        "rpi = {:?}\nhome = {:?}\n[owners]\nchat = [\"owner\"]\ndiscord = [\"downer\"]\n",
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-rpi.py"),
         home
     ))
     .unwrap()
 }
 
+/// A gateway with a `chat` and a `discord` test channel, both feeding one router.
 fn start(cfg: Config) -> Gateway {
-    let (feed, rx) = mpsc::channel(16);
-    let channel = Arc::new(TestChannel {
-        feed: tokio::sync::Mutex::new(rx),
-        db: cfg.db_path(),
-        sent: Mutex::default(),
-    });
+    let mut feeds = HashMap::new();
+    let mut sent = HashMap::new();
+    let mut channels = Vec::new();
+    for name in ["chat", "discord"] {
+        let (feed, rx) = mpsc::channel(16);
+        let s = Sent::default();
+        feeds.insert(name, feed);
+        sent.insert(name, s.clone());
+        channels.push(TestChannel {
+            name,
+            feed: tokio::sync::Mutex::new(rx),
+            db: cfg.db_path(),
+            sent: s,
+        });
+    }
     let (stop, stopped) = oneshot::channel::<()>();
-    let ch = channel.clone();
     let task = tokio::spawn(async move {
-        zephyr::router::run(&cfg, &*ch, async {
+        zephyr::router::run(&cfg, &channels, async {
             let _ = stopped.await;
         })
         .await
     });
     Gateway {
-        feed,
-        channel,
+        feeds,
+        sent,
         stop: Some(stop),
         task,
     }
@@ -91,26 +104,35 @@ fn start(cfg: Config) -> Gateway {
 
 impl Gateway {
     async fn say(&self, id: &str, sender: &str, text: &str) {
+        self.say_on("chat", id, sender, text).await;
+    }
+    async fn say_on(&self, channel: &str, id: &str, sender: &str, text: &str) {
         let m = Inbound {
-            channel: "chat".into(),
+            channel: channel.into(),
             platform_msg_id: id.into(),
             sender: sender.into(),
             text: text.into(),
         };
-        self.feed.send(m).await.unwrap();
+        self.feeds[channel].send(m).await.unwrap();
     }
-    fn replies(&self) -> Vec<String> {
-        let sent = self.channel.sent.lock().unwrap();
+    fn replies_on(&self, channel: &str) -> Vec<String> {
+        let sent = self.sent[channel].lock().unwrap();
         assert!(
             sent.iter().all(|(_, pending)| *pending),
             "sent before the outbox row was written"
         );
         sent.iter().map(|(m, _)| m.text.clone()).collect()
     }
-    async fn wait_replies(&self, n: usize) -> Vec<String> {
-        wait(|| self.replies().len() >= n).await;
+    fn replies(&self) -> Vec<String> {
+        self.replies_on("chat")
+    }
+    async fn wait_replies_on(&self, channel: &str, n: usize) -> Vec<String> {
+        wait(|| self.replies_on(channel).len() >= n).await;
         tokio::time::sleep(Duration::from_millis(300)).await; // nothing extra trickles in
-        self.replies()
+        self.replies_on(channel)
+    }
+    async fn wait_replies(&self, n: usize) -> Vec<String> {
+        self.wait_replies_on("chat", n).await
     }
     async fn shutdown(mut self) {
         let _ = self.stop.take().unwrap().send(());
@@ -273,4 +295,77 @@ async fn a_child_without_the_policy_beacon_gets_no_prompts() {
     let gw = start(cfg);
     assert_eq!(gw.wait_replies(1).await, ["echo: [chat #1] hi"]);
     gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn replies_go_back_on_the_channel_they_came_from() {
+    let home = home("two-channels");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "from chat").await;
+    assert_eq!(gw.wait_replies(1).await, ["echo: [chat #1] from chat"]);
+    gw.say_on("discord", "d1", "downer", "from discord").await;
+    assert_eq!(
+        gw.wait_replies_on("discord", 1).await,
+        ["echo: [discord #2] from discord"]
+    );
+    assert_eq!(gw.replies(), ["echo: [chat #1] from chat"]);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn both_channels_feed_one_main_session() {
+    let home = home("one-session");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "from chat").await;
+    gw.wait_replies(1).await;
+    gw.say_on("discord", "d1", "downer", "from discord").await;
+    gw.wait_replies_on("discord", 1).await;
+    gw.shutdown().await;
+
+    let session: Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join("sessions/main.json")).unwrap())
+            .unwrap();
+    let users: Vec<_> = session["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["kind"] == "user")
+        .map(|m| m["content"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(users, ["[chat #1] from chat", "[discord #2] from discord"]);
+}
+
+#[tokio::test]
+async fn outbox_rows_for_unconfigured_channels_stay_pending() {
+    let home = home("unconfigured");
+    let cfg = config(&home);
+    let mut store = Store::open(&cfg.db_path()).unwrap();
+    let id = store
+        .insert_inbox(&Inbound {
+            channel: "imessage".into(),
+            platform_msg_id: "x".into(),
+            sender: "owner".into(),
+            text: "hi".into(),
+        })
+        .unwrap()
+        .unwrap();
+    let row = InboxRow {
+        id,
+        channel: "imessage".into(),
+        sender: "owner".into(),
+        text: "hi".into(),
+        tries: 0,
+    };
+    store.reply(&row, "stranded", "done").unwrap();
+    drop(store);
+
+    let gw = start(cfg);
+    gw.say("m1", "owner", "hi").await;
+    assert_eq!(gw.wait_replies(1).await, ["echo: [chat #2] hi"]);
+    gw.shutdown().await;
+    let store = Store::open(&home.join("state.db")).unwrap();
+    assert_eq!(
+        store.outbox_status(&client_id(id)).unwrap().as_deref(),
+        Some("pending")
+    );
 }

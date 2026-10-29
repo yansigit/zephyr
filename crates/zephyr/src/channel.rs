@@ -27,3 +27,30 @@ pub trait Channel: Send + Sync {
     async fn run(&self, tx: tokio::sync::mpsc::Sender<Inbound>) -> anyhow::Result<()>;
     async fn send(&self, msg: &Outbound) -> anyhow::Result<()>;
 }
+
+/// The adapters `zephyr run` can build. `Channel` is not dyn-compatible, so this enum is the list's element type.
+pub enum AnyChannel {
+    Chat(crate::chat::ChatChannel),
+    Discord(crate::discord::Discord),
+}
+
+impl Channel for AnyChannel {
+    fn name(&self) -> &str {
+        match self {
+            Self::Chat(c) => c.name(),
+            Self::Discord(c) => c.name(),
+        }
+    }
+    async fn run(&self, tx: tokio::sync::mpsc::Sender<Inbound>) -> anyhow::Result<()> {
+        match self {
+            Self::Chat(c) => c.run(tx).await,
+            Self::Discord(c) => c.run(tx).await,
+        }
+    }
+    async fn send(&self, msg: &Outbound) -> anyhow::Result<()> {
+        match self {
+            Self::Chat(c) => c.send(msg).await,
+            Self::Discord(c) => c.send(msg).await,
+        }
+    }
+}

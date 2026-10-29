@@ -5,5 +5,10 @@ agent_dir = "/home/zephyr/.rpi/agent"      # RPI_CODING_AGENT_DIR: models.json a
 model = "anthropic/claude-sonnet-5"
 # policy_plugin = "/home/zephyr/lib/libzephyr_policy.so"   # refuse prompts unless it loads
 
+# Optional DM-only Discord adapter. Remove this table to run chat-only.
+# [discord]
+# token_env = "ZEPHYR_DISCORD_TOKEN"   # env var holding the bot token; the token never goes in this file
+
 [owners]
 chat = ["1000"]   # uids allowed on the unix socket
+# discord = ["123456789012345678"]   # Discord user ids allowed to DM the agent
