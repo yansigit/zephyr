@@ -35,6 +35,9 @@ pub struct Config {
     /// Wall clock cap for one job run. Not configurable; tests shorten it.
     #[serde(skip, default = "job_timeout")]
     pub job_timeout: std::time::Duration,
+    /// OAuth refresh (DESIGN §4.7). Defaults apply when the table is absent.
+    #[serde(default)]
+    pub auth: crate::auth_keeper::AuthConfig,
 }
 
 fn job_timeout() -> std::time::Duration {
@@ -147,5 +150,20 @@ mod tests {
         assert!(b.exceeded(0, 2.5));
         assert!(!Budget::default().exceeded(i64::MAX, f64::MAX));
         assert!(toml::from_str::<Budget>("daily_token = 1").is_err());
+    }
+
+    #[test]
+    fn auth_table_defaults_and_overrides() {
+        let base = "rpi = 'a'\nhome = 'b'\n";
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert!(cfg.auth.enabled);
+        assert_eq!(cfg.auth.refresh_minutes, 10.0);
+        let cfg: Config = toml::from_str(&format!(
+            "{base}[auth]\nrefresh_minutes = 3\nenabled = false\n"
+        ))
+        .unwrap();
+        assert!(!cfg.auth.enabled);
+        assert_eq!(cfg.auth.refresh_minutes, 3.0);
+        assert!(toml::from_str::<Config>(&format!("{base}[auth]\ntypo = 1\n")).is_err());
     }
 }

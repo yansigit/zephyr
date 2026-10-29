@@ -28,6 +28,7 @@ pub const USED_COMMANDS: &[&str] = &[
     "get_messages",
     "get_stats",
     "resume_pending",
+    "get_auth_status",
     "stop",
 ];
 
@@ -46,6 +47,8 @@ pub struct Child {
 impl Child {
     pub async fn spawn(cfg: &Config, session_id: &str) -> anyhow::Result<Self> {
         std::fs::create_dir_all(cfg.session_dir())?;
+        // rpi reads the context files (AGENTS.md) once, at start, so regenerate them first.
+        crate::memory::prepare(&cfg.home)?;
         let mut cmd = Command::new(&cfg.rpi);
         cmd.args(["--mode", "rpc", "--session-id", session_id, "--session-dir"])
             .arg(cfg.session_dir())

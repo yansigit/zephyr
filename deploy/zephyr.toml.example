@@ -18,6 +18,11 @@ model = "anthropic/claude-sonnet-5"
 # password_env = "ZEPHYR_BB_PASSWORD"
 # secret_env = "ZEPHYR_BB_SECRET"
 
+# OAuth refresh until upstream PR #144 lands (DESIGN §4.7). Defaults shown.
+# [auth]
+# enabled = true
+# refresh_minutes = 10
+
 [owners]
 chat = ["1000"]   # uids allowed on the unix socket
 # discord = ["123456789012345678"]   # Discord user ids allowed to DM the agent

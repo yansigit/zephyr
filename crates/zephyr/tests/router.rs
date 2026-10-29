@@ -63,9 +63,10 @@ fn home(name: &str) -> PathBuf {
 
 fn config(home: &Path) -> Config {
     toml::from_str(&format!(
-        "rpi = {:?}\nhome = {:?}\n[owners]\nchat = [\"owner\"]\ndiscord = [\"downer\"]\n",
+        "rpi = {:?}\nhome = {:?}\nagent_dir = {:?}\n[owners]\nchat = [\"owner\"]\ndiscord = [\"downer\"]\n",
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-rpi.py"),
-        home
+        home,
+        home.join("agent"),
     ))
     .unwrap()
 }
@@ -648,5 +649,72 @@ async fn a_paused_scheduler_claims_nothing_and_catches_up_once_on_resume() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(run_status(&home, "completed"), 2, "one catch-up run");
     assert_eq!(gw.wait_replies(2).await, ["[zephyr] resumed", "caught up"]);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn memory_commits_after_a_run_and_the_owner_can_undo_it() {
+    let home = home("memory");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "WRITE_MEMORY likes tea").await;
+    gw.wait_replies(1).await;
+    let memory = std::fs::read_to_string(home.join("memory/MEMORY.md")).unwrap();
+    assert!(memory.contains("remembered: "), "the run wrote memory");
+    let log = std::process::Command::new("git")
+        .arg("-C")
+        .arg(home.join("memory"))
+        .args(["log", "--format=%s"])
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&log.stdout).to_string();
+    assert!(
+        log.lines().next().unwrap().starts_with("memory: "),
+        "got {log}"
+    );
+
+    gw.say("m2", "owner", "/memory log").await;
+    assert!(gw.wait_replies(2).await[1].contains("memory: "));
+
+    gw.say("m3", "owner", "/memory undo").await;
+    let replies = gw.wait_replies(3).await;
+    assert!(
+        replies[2].starts_with("[zephyr] undid "),
+        "got {}",
+        replies[2]
+    );
+    let memory = std::fs::read_to_string(home.join("memory/MEMORY.md")).unwrap();
+    assert!(
+        !memory.contains("remembered: "),
+        "the undo reverted the run's edit"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_job_run_commits_its_memory_edits() {
+    let home = home("job-memory");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        &format!("/job add mem | {NEVER} | say: WRITE_MEMORY nightly note"),
+    )
+    .await;
+    gw.say("m2", "owner", "/job run 1").await;
+    wait(|| run_status(&home, "completed") == 1).await;
+    // The commit lands before the run is marked completed, so it is there now.
+    let git = std::process::Command::new("git")
+        .arg("-C")
+        .arg(home.join("memory"))
+        .args(["log", "--format=%s"])
+        .output()
+        .unwrap();
+    let git = String::from_utf8_lossy(&git.stdout).to_string();
+    assert!(
+        git.lines().next().unwrap().starts_with("memory: "),
+        "got {git}"
+    );
+    let memory = std::fs::read_to_string(home.join("memory/MEMORY.md")).unwrap();
+    assert!(memory.contains("remembered: say: WRITE_MEMORY nightly note"));
     gw.shutdown().await;
 }

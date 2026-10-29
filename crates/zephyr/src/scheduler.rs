@@ -117,12 +117,20 @@ pub async fn run(cfg: &Config, wake: &Wake) -> anyhow::Result<()> {
                 }
             };
             let (status, output) = execute(cfg, &mut store, &run).await;
+            // The run's memory edits are committed as main's settle would commit them.
+            log_err(crate::memory::commit_if_changed(&cfg.home));
             let delivery = (output.trim() != SILENT).then_some(output.as_str());
             match store.finish_run(&run, status, &output, delivery, crate::now()) {
                 Ok(()) => wake.outbox.notify_one(),
                 Err(e) => eprintln!("zephyr: recording job run {} failed: {e}", run.id),
             }
         }
+    }
+}
+
+fn log_err(r: anyhow::Result<bool>) {
+    if let Err(e) = r {
+        eprintln!("zephyr: memory commit failed: {e:#}");
     }
 }
 
