@@ -12,8 +12,8 @@ loginctl enable-linger zephyr
 
 # Shared Projects access: rwX now and for new files. Revoke with: setfacl -R -x u:zephyr "$PROJECTS"
 setfacl --modify u:zephyr:x "/home/$OWNER"          # traverse only, cannot list $HOME
-setfacl -R --modify u:zephyr:rwX "$PROJECTS"
-setfacl -R --modify d:u:zephyr:rwX "$PROJECTS"
+# One pass sets both the access and the default ACL; this walks every file, so large build dirs take minutes.
+setfacl -R --modify u:zephyr:rwX,d:u:zephyr:rwX "$PROJECTS"
 # Secrets inside Projects stay owner-only. Add paths here as needed.
 DENY=("$PROJECTS/.parity-env.sh" "$PROJECTS/.parity-lanes/archive")
 while IFS= read -r -d '' f; do DENY+=("$f"); done < <(find "$PROJECTS" -name '.env*' -not -path '*/node_modules/*' -print0)
