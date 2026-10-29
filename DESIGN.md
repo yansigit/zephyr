@@ -103,6 +103,7 @@ There are no per-call prompts. These hard limits hold every time:
    - Read-write: `$PROJECTS` at the same path as on the host. Secrets inside it (`.parity-env.sh`, `.parity-lanes/archive`, every `.env*` outside `node_modules`) are covered with empty mounts.
    - Nothing else of your home: `~/.ssh`, `~/.rpi`, `~/.pi` and browser profiles are not mounted. No docker socket.
    - Network: host networking, so the attach port on 127.0.0.1 and the Tailscale webhook address work unchanged.
+   - Providers come only from the image: `deploy/run.sh` stages `librpi_providers.so` and `rpi-cursor-lite/` into `/opt/zephyr/ext/`, and `zephyr.toml` loads them with `extensions`. Do not `rpi install rpi-providers` into `~/.zephyr`. A package installed there loads twice (`zephyr doctor` warns).
    - `--restart unless-stopped` replaces the systemd unit; `--init` reaps children and forwards SIGTERM.
 
    This replaced an earlier dedicated Linux account: ACLs over 2.2M files were slow to apply and, on eCryptfs, unreliable to remove.

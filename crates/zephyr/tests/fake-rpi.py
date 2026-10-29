@@ -10,6 +10,7 @@ Auth: the OAuth store is $RPI_CODING_AGENT_DIR/auth.json. `get_auth_status` list
 entries. `auth refresh --provider P` (the CLI, not the RPC) gives P a fresh expiry, and records
 an "auth-refresh" line in ./log.jsonl (an `oauth_fail` file in the home makes it fail).
 A prompt containing WRITE_MEMORY first writes memory/MEMORY.md under the home.
+argv.json holds the argv of the latest start.
 A prompt containing `[hang]` never settles until `abort`; one that starts with `say: `
 replies with the rest.
 The session is <session-dir>/<session-id>.json: {"messages": [...], "pending": bool}.
@@ -39,6 +40,7 @@ home = os.path.dirname(os.path.abspath(session_dir))
 path = os.path.join(session_dir, opt("--session-id") + ".json")
 extension = opt("--extension")
 open(os.path.join(home, "pid"), "w").write(str(os.getpid()))
+json.dump(args, open(os.path.join(home, "argv.json"), "w"))  # the flags this child was started with
 
 def load():
     try:

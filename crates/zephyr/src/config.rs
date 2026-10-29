@@ -19,6 +19,9 @@ pub struct Config {
     /// child that does not list the `zephyr-policy` command (rpi skips a plugin that fails
     /// to load) is refused and gets no prompts.
     pub policy_plugin: Option<PathBuf>,
+    /// More extensions for every child, each passed as `--extension` after `policy_plugin`.
+    #[serde(default)]
+    pub extensions: Vec<PathBuf>,
     /// The Discord adapter. Its owner list is `owners.discord`. Absent means no Discord.
     pub discord: Option<crate::discord::Config>,
     /// The BlueBubbles iMessage adapter. Its owner list is `owners.imessage` (handles). Absent means no iMessage.
@@ -169,5 +172,23 @@ mod tests {
         assert!(!cfg.auth.enabled);
         assert_eq!(cfg.auth.refresh_minutes, 3.0);
         assert!(toml::from_str::<Config>(&format!("{base}[auth]\ntypo = 1\n")).is_err());
+    }
+
+    #[test]
+    fn extensions_default_empty_and_parse_in_order() {
+        let base = "rpi = 'a'\nhome = 'b'\n";
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert!(cfg.extensions.is_empty());
+        let cfg: Config = toml::from_str(&format!(
+            "{base}extensions = ['/opt/zephyr/ext/librpi_providers.so', '/opt/zephyr/ext/rpi-cursor-lite/librpi_cursor_lite.so']\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.extensions,
+            [
+                PathBuf::from("/opt/zephyr/ext/librpi_providers.so"),
+                PathBuf::from("/opt/zephyr/ext/rpi-cursor-lite/librpi_cursor_lite.so"),
+            ]
+        );
     }
 }

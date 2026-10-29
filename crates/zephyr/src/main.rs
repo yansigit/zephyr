@@ -233,6 +233,14 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
         ),
         context_ok,
     );
+    // A warning, not a failure: providers come from the image (DESIGN §4.4).
+    let ext_dir = zephyr::auth_keeper::agent_dir(cfg).join("extensions");
+    if std::fs::read_dir(&ext_dir).is_ok_and(|mut d| d.next().is_some()) {
+        println!(
+            "warn {} is not empty: providers come from the image; packages installed into agent_dir load twice",
+            ext_dir.display()
+        );
+    }
     if !ok {
         anyhow::bail!("doctor found problems");
     }

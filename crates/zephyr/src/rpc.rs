@@ -63,6 +63,9 @@ impl Child {
         if let Some(plugin) = &cfg.policy_plugin {
             cmd.arg("--extension").arg(plugin);
         }
+        for ext in &cfg.extensions {
+            cmd.arg("--extension").arg(ext);
+        }
         if let Some(dir) = &cfg.agent_dir {
             cmd.env("RPI_CODING_AGENT_DIR", dir);
         }
@@ -180,5 +183,45 @@ pub fn message_text(msg: &Value) -> String {
             .filter_map(|b| b["text"].as_str())
             .collect(),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn extensions_follow_the_policy_plugin_in_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "zephyr-rpc-ext-{}-{}",
+            std::process::id(),
+            crate::unix_millis()
+        ));
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let (policy, a, b) = (dir.join("policy.so"), dir.join("a.so"), dir.join("b.so"));
+        for f in [&policy, &a, &b] {
+            std::fs::write(f, "").unwrap();
+        }
+        let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-rpi.py");
+        let cfg: Config = toml::from_str(&format!(
+            "rpi = {fake:?}\nhome = {:?}\npolicy_plugin = {:?}\nextensions = [{:?}, {:?}]\n",
+            home.display(),
+            policy.display(),
+            a.display(),
+            b.display(),
+        ))
+        .unwrap();
+        Child::spawn(&cfg, "argv").await.unwrap().stop().await;
+
+        let argv: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(home.join("argv.json")).unwrap())
+                .unwrap();
+        let at = argv.iter().position(|x| x == "--extension").unwrap();
+        let want: Vec<String> = [&policy, &a, &b]
+            .iter()
+            .flat_map(|p| ["--extension".to_string(), p.display().to_string()])
+            .collect();
+        assert_eq!(argv[at..], want[..]);
     }
 }

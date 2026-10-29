@@ -194,3 +194,16 @@ token_file = "{}"
         "{request}"
     );
 }
+
+#[test]
+fn doctor_warns_when_agent_dir_has_extensions() {
+    let warning = "providers come from the image; packages installed into agent_dir load twice";
+    let (_, cfg) = setup("doctor-ext", "");
+    let agent = cfg.parent().unwrap().join("agent");
+    let run = || stdout(&zephyr(&cfg, &["doctor"]));
+    assert!(!run().contains(warning));
+    std::fs::create_dir_all(agent.join("extensions")).unwrap();
+    assert!(!run().contains(warning), "an empty extensions dir is fine");
+    std::fs::write(agent.join("extensions/librpi_providers.so"), "").unwrap();
+    assert!(run().contains(warning));
+}
