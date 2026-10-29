@@ -16,3 +16,9 @@ sd-notify.workspace = true
 toml.workspace = true
 futures-util.workspace = true
 serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "model", "http", "rustls_backend"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+subtle = "2"
+url = "2"
