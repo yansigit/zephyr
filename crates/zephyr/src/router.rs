@@ -21,6 +21,10 @@ pub fn tagged(row: &InboxRow) -> String {
     format!("[{} #{}] {}", row.channel, row.id, row.text)
 }
 
+/// Sent once, when a budget limit is crossed.
+const BUDGET_NOTICE: &str =
+    "[zephyr] daily budget reached: paused until the next UTC day or /resume";
+
 /// How long a reply may be retried: only as long as the platform still dedupes the client id.
 fn retry_window(channel: &str) -> i64 {
     match channel {
@@ -178,9 +182,9 @@ impl Router<'_> {
             log(self.store.set_status(id, "dropped").map_err(Into::into));
             return;
         }
-        if m.text.trim() == "/stop" {
-            let r = self.call(json!({"type": "abort"})).await.map(drop);
-            log(r);
+        let cmd = m.text.trim().to_string();
+        if matches!(cmd.as_str(), "/stop" | "/pause" | "/resume") {
+            let reply = self.control(&cmd).await;
             let row = InboxRow {
                 id,
                 channel: m.channel,
@@ -188,19 +192,73 @@ impl Router<'_> {
                 text: m.text,
                 tries: 0,
             };
-            log(self
-                .store
-                .reply(&row, "[zephyr] stopped", "done")
-                .map_err(Into::into));
+            log(self.store.reply(&row, reply, "done").map_err(Into::into));
+            // A run in progress settles first; its settle reconciles and dispatches.
+            if cmd == "/resume" && !self.busy {
+                log(self.reconcile(None).await);
+            }
             return;
         }
         log(self.dispatch_new().await);
     }
 
+    /// The kill switch (DESIGN §4.4), run outside the queue. Returns the reply text.
+    async fn control(&mut self, cmd: &str) -> &'static str {
+        match cmd {
+            "/pause" => {
+                log(self.store.set_paused(Some("user")).map_err(Into::into));
+                if self.busy {
+                    log(self.call(json!({"type": "abort"})).await.map(drop));
+                }
+                "[zephyr] paused: messages wait in the inbox until /resume"
+            }
+            "/resume" => {
+                log(self.store.set_paused(None).map_err(Into::into));
+                "[zephyr] resumed"
+            }
+            _ => {
+                log(self.call(json!({"type": "abort"})).await.map(drop));
+                "[zephyr] stopped"
+            }
+        }
+    }
+
+    /// Adds what rpi used since the last settle to today's spend. Returns true when this
+    /// settle crossed a budget limit, and pauses the gateway for the rest of the UTC day.
+    async fn record_spend(&mut self) -> anyhow::Result<bool> {
+        let stats = self.call(json!({"type": "get_stats"})).await?;
+        let total = (
+            stats["totalTokens"].as_i64().unwrap_or(0),
+            stats["costTotal"].as_f64().unwrap_or(0.0),
+        );
+        let last = self.store.last_stats()?;
+        // rpi's totals are per session: a drop means a fresh session, so the whole total is new.
+        let delta = if total.0 >= last.0 {
+            (total.0 - last.0, total.1 - last.1)
+        } else {
+            total
+        };
+        self.store.set_last_stats(total)?;
+        let day = self.store.today()?;
+        let (tokens, cost) = self.store.add_spend(&day, delta.0, delta.1)?;
+        let Some(budget) = &self.cfg.budget else {
+            return Ok(false);
+        };
+        // Only the settle that crosses a limit pauses; after `/resume` the override holds for the day.
+        let crossed =
+            budget.exceeded(tokens, cost) && !budget.exceeded(tokens - delta.0, cost - delta.1);
+        if !crossed || self.store.pause_reason()?.is_some() {
+            return Ok(false);
+        }
+        self.store.set_paused(Some(&format!("budget:{day}")))?;
+        Ok(true)
+    }
+
     /// Sends every `new` row: `prompt` when idle, rpi's own `queue_message` when busy.
     async fn dispatch_new(&mut self) -> anyhow::Result<()> {
-        if self.child.is_none() {
-            return Ok(()); // rows stay `new` until the child is back
+        // Rows stay `new` while the child is down or the gateway is paused.
+        if self.child.is_none() || self.store.pause_reason()?.is_some() {
+            return Ok(());
         }
         for row in self.store.inbox_with_status("new")? {
             // Durable before the child sees it, so recovery knows to look for it.
@@ -221,6 +279,10 @@ impl Router<'_> {
     async fn settled(&mut self, ev: &Value) {
         self.busy = false;
         self.backoff = FIRST_BACKOFF;
+        let crossed = self.record_spend().await.unwrap_or_else(|e| {
+            eprintln!("zephyr: recording spend failed: {e:#}");
+            false
+        });
         let fallback = match ev["error"].as_str() {
             Some(e) => format!(
                 "[zephyr] run {}: {e}",
@@ -229,6 +291,12 @@ impl Router<'_> {
             None => "[zephyr] the run ended without a reply".into(),
         };
         log(self.reconcile(Some(fallback)).await);
+        if crossed {
+            log(self
+                .store
+                .notify_last_owner(BUDGET_NOTICE)
+                .map_err(Into::into));
+        }
     }
 
     /// Matches `dispatched` rows against the session: replies to the ones rpi has
@@ -238,6 +306,9 @@ impl Router<'_> {
         let snap = self.call(json!({"type": "get_messages"})).await?;
         let rows = self.store.inbox_with_status("dispatched")?;
         if snap["pendingResume"] == true {
+            if self.store.pause_reason()?.is_some() {
+                return Ok(()); // `/resume` continues the interrupted run
+            }
             if self.resumes < MAX_RESUMES {
                 self.resumes += 1;
                 self.call(json!({"type": "resume_pending"})).await?;

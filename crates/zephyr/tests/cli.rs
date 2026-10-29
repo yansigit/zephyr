@@ -1,0 +1,192 @@
+//! The `zephyr` binary against the scripted fake child (tests/fake-rpi.py).
+
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+const PAUSED: &str = "[zephyr] paused: messages wait in the inbox until /resume";
+
+/// A fresh directory with `home/` (the state dir) and a `zephyr.toml` next to it.
+fn setup(name: &str, extra: &str) -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "zephyr-cli-{name}-{}-{}",
+        std::process::id(),
+        zephyr::unix_millis()
+    ));
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-rpi.py");
+    let cfg = dir.join("zephyr.toml");
+    std::fs::write(
+        &cfg,
+        format!("rpi = {fake:?}\nhome = {:?}\n{extra}", home.display()),
+    )
+    .unwrap();
+    (home, cfg)
+}
+
+fn zephyr(cfg: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_zephyr"))
+        .args(args)
+        .env("ZEPHYR_CONFIG", cfg)
+        .output()
+        .unwrap()
+}
+
+/// A running `zephyr run`, killed on drop.
+struct Daemon(Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn daemon(cfg: &Path, home: &Path) -> Daemon {
+    let child = Command::new(env!("CARGO_BIN_EXE_zephyr"))
+        .arg("run")
+        .env("ZEPHYR_CONFIG", cfg)
+        .spawn()
+        .unwrap();
+    let sock = home.join("zephyr.sock");
+    let start = Instant::now();
+    while !sock.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "daemon never listened"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Daemon(child)
+}
+
+fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn a_second_run_on_the_same_home_is_refused() {
+    let (home, cfg) = setup("lock", "");
+    let _first = daemon(&cfg, &home);
+    let second = zephyr(&cfg, &["run"]);
+    assert!(!second.status.success());
+    let err = String::from_utf8_lossy(&second.stderr);
+    assert!(err.contains("another zephyr is running"), "{err}");
+}
+
+#[test]
+fn pause_and_resume_work_with_a_daemon_and_without_one() {
+    let (home, cfg) = setup("pause", "");
+    // The test runs as the owner: the chat socket sees this uid as the sender.
+    let uid = std::fs::metadata(&home).unwrap().uid();
+    std::fs::write(
+        &cfg,
+        format!(
+            "{}[owners]\nchat = [\"{uid}\"]\n",
+            std::fs::read_to_string(&cfg).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let running = daemon(&cfg, &home);
+    assert_eq!(stdout(&zephyr(&cfg, &["pause"])), PAUSED);
+    assert!(stdout(&zephyr(&cfg, &["status"])).contains("paused: yes (user)"));
+    assert_eq!(stdout(&zephyr(&cfg, &["resume"])), "[zephyr] resumed");
+    assert!(stdout(&zephyr(&cfg, &["status"])).contains("paused: no"));
+    drop(running);
+
+    // With no daemon, the store carries the flag to the next start.
+    assert!(zephyr(&cfg, &["pause"]).status.success());
+    assert!(stdout(&zephyr(&cfg, &["status"])).contains("paused: yes (user)"));
+    assert!(zephyr(&cfg, &["resume"]).status.success());
+    assert!(stdout(&zephyr(&cfg, &["status"])).contains("paused: no"));
+}
+
+#[test]
+fn doctor_reports_presence_and_never_values() {
+    // A stand-in BlueBubbles that answers the ping and records the request line.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (seen_tx, seen) = mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = sock.read(&mut buf).unwrap();
+        let line = String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let _ = seen_tx.send(line);
+        let _ =
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    });
+
+    // mode 0644, so doctor must report it
+    let token = std::env::temp_dir().join(format!("zephyr-cli-token-{}", std::process::id()));
+    std::fs::write(&token, "not-a-real-token").unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (_, cfg) = setup(
+        "doctor",
+        &format!(
+            r#"[discord]
+token_env = "ZEPHYR_TEST_DISCORD_TOKEN_UNSET"
+[imessage]
+listen = "127.0.0.1:0"
+server_url = "http://127.0.0.1:{port}"
+password_env = "ZEPHYR_TEST_BB_PASSWORD"
+secret_env = "ZEPHYR_TEST_BB_SECRET"
+[attach]
+port = 0
+token_file = "{}"
+"#,
+            token.display()
+        ),
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_zephyr"))
+        .arg("doctor")
+        .env("ZEPHYR_CONFIG", &cfg)
+        .env_remove("ZEPHYR_TEST_DISCORD_TOKEN_UNSET")
+        .env("ZEPHYR_TEST_BB_PASSWORD", "pw-sekret-123")
+        .env("ZEPHYR_TEST_BB_SECRET", "sec-sekret-456")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+
+    assert!(
+        text.contains("FAIL env ZEPHYR_TEST_DISCORD_TOKEN_UNSET is set (discord token)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("ok   env ZEPHYR_TEST_BB_PASSWORD is set (imessage password)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("ok   env ZEPHYR_TEST_BB_SECRET is set (imessage webhook secret)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("ok   BlueBubbles answers GET /api/v1/ping"),
+        "{text}"
+    );
+    assert!(
+        text.contains("FAIL") && text.contains("is not readable by group or others"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("pw-sekret-123") && !text.contains("sec-sekret-456"),
+        "a secret was printed"
+    );
+    let request = seen
+        .recv_timeout(Duration::from_secs(10))
+        .expect("no ping was sent");
+    assert!(
+        request.starts_with("GET /api/v1/ping?password="),
+        "{request}"
+    );
+}

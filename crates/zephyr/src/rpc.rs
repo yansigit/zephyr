@@ -26,6 +26,7 @@ pub const USED_COMMANDS: &[&str] = &[
     "abort",
     "get_state",
     "get_messages",
+    "get_stats",
     "resume_pending",
     "stop",
 ];
