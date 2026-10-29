@@ -25,7 +25,7 @@ apply() {  # $1 find -type, $2 ACL spec, $3 label
       done
   echo
 }
-apply d "u:zephyr:rwX,d:u:zephyr:rwX" "directories"
+apply d "u:zephyr:rwX,d:u:zephyr:rwX,d:u:$OWNER:rwX" "directories"   # owner keeps rw on files zephyr creates
 apply f "u:zephyr:rwX" "files"
 # Secrets inside Projects stay owner-only. Add paths here as needed.
 DENY=("$PROJECTS/.parity-env.sh" "$PROJECTS/.parity-lanes/archive")
@@ -33,4 +33,6 @@ while IFS= read -r -d '' f; do DENY+=("$f"); done < <(find "$PROJECTS" -name '.e
 for p in "${DENY[@]}"; do
   [ -e "$p" ] && setfacl -R -x u:zephyr "$p" && { [ -d "$p" ] && setfacl -R -x d:u:zephyr "$p" || true; }
 done
+# eCryptfs keeps a stale cached ACL after removal until the inode is evicted; force a reload.
+sync; echo 2 > /proc/sys/vm/drop_caches
 echo "zephyr account ready; linger on; Projects shared at $PROJECTS"
