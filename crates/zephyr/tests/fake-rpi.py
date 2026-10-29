@@ -4,12 +4,15 @@
 State lives next to --session-dir (the zephyr home): log.jsonl records every command,
 pid holds the current pid, and a `hang` file makes the next prompt commit its user
 message, mark the run resumable, and stop answering (the test then kills -9 it); a
-`slow` file makes every prompt take a second.
+`slow` file makes every prompt take a second. `stats.json` (if present) is what `get_stats`
+reports: {"totalTokens": n, "costTotal": x}, cumulative like rpi's.
 The session is <session-dir>/<session-id>.json: {"messages": [...], "pending": bool}.
 """
 import json, os, sys, time
 
 args = sys.argv[1:]
+if "--version" in args:
+    print("rpi 0.12.0"); sys.exit(0)
 opt = lambda name: args[args.index(name) + 1] if name in args else None
 session_dir = opt("--session-dir")
 home = os.path.dirname(os.path.abspath(session_dir))
@@ -49,7 +52,7 @@ def finish(s, text):
          "error": None, "summary": None, "pendingResume": False})
 
 out({"type": "ready", "protocol": "rpi", "piCompatibilityTarget": "1.2.0",
-     "supportedCommands": ["get_state", "get_commands", "get_messages", "queue_message", "clear_queue",
+     "supportedCommands": ["get_state", "get_commands", "get_messages", "get_stats", "queue_message", "clear_queue",
                            "prompt", "resume_pending", "abort", "ping", "stop"],
      "supportedEvents": ["session_entry_committed"],
      "semantics": {"promptResponse": "accepted", "settlementEvent": "agent_settled", "agentEndIsTerminal": False},
@@ -68,7 +71,17 @@ for line in sys.stdin:
         if os.path.exists(os.path.join(home, "hang")):
             os.remove(os.path.join(home, "hang"))
             s["pending"] = True; save(s)
-            time.sleep(3600)
+            # Stay busy until aborted, then settle with no reply, as a cancelled run does.
+            for line in sys.stdin:
+                c = json.loads(line)
+                open(os.path.join(home, "log.jsonl"), "a").write(line)
+                if c["type"] != "abort":
+                    respond(c, error="busy"); continue
+                respond(c, {"aborted": True}); s["pending"] = False; save(s)
+                out({"type": "agent_settled", "runId": "r", "outcome": "aborted", "aborted": True,
+                     "error": None, "summary": None, "pendingResume": False})
+                break
+            continue
         finish(s, "echo: " + cmd["message"])
     elif kind == "resume_pending":
         if not s["pending"]:
@@ -87,6 +100,11 @@ for line in sys.stdin:
         respond(cmd, {"cleared": len(queue), "steering": [], "followUp": queue}); queue = []
     elif kind == "abort":
         respond(cmd, {"aborted": True})
+    elif kind == "get_stats":
+        stats = {"totalTokens": 0, "costTotal": 0.0}
+        if os.path.exists(os.path.join(home, "stats.json")):
+            stats.update(json.load(open(os.path.join(home, "stats.json"))))
+        respond(cmd, stats)
     elif kind == "get_state":
         respond(cmd, {"sessionId": opt("--session-id"), "activeOperation": None})
     elif kind == "stop":

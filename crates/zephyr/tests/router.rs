@@ -369,3 +369,109 @@ async fn outbox_rows_for_unconfigured_channels_stay_pending() {
         Some("pending")
     );
 }
+
+const PAUSED: &str = "[zephyr] paused: messages wait in the inbox until /resume";
+const BUDGET_NOTICE: &str =
+    "[zephyr] daily budget reached: paused until the next UTC day or /resume";
+
+#[tokio::test]
+async fn pause_aborts_the_run_and_holds_new_messages_until_resume() {
+    let home = home("pause");
+    std::fs::write(home.join("hang"), "").unwrap();
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "long job").await;
+    wait(|| !home.join("hang").exists()).await; // mid-run
+    gw.say("m2", "owner", "/pause").await;
+    gw.wait_replies(2).await; // the pause notice, then the aborted run's fallback reply
+    assert_eq!(log(&home, "abort").len(), 1);
+
+    gw.say("m3", "owner", "held").await;
+    assert_eq!(gw.wait_replies(2).await.len(), 2);
+    assert_eq!(
+        log(&home, "prompt").len(),
+        1,
+        "nothing is dispatched while paused"
+    );
+    assert_eq!(inbox_status(&home, "new"), 1);
+
+    gw.say("m4", "owner", "/resume").await;
+    assert_eq!(
+        gw.wait_replies(4).await,
+        [
+            PAUSED,
+            "[zephyr] the run ended without a reply",
+            "[zephyr] resumed",
+            "echo: [chat #3] held"
+        ]
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_pause_survives_restart() {
+    let home = home("pause-restart");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "/pause").await;
+    assert_eq!(gw.wait_replies(1).await, [PAUSED]);
+    gw.shutdown().await;
+
+    let gw = start(config(&home));
+    gw.say("m2", "owner", "hi").await;
+    assert!(gw.wait_replies(0).await.is_empty());
+    assert!(log(&home, "prompt").is_empty());
+    assert_eq!(inbox_status(&home, "new"), 1);
+    gw.say("m3", "owner", "/resume").await;
+    assert_eq!(
+        gw.wait_replies(2).await,
+        ["[zephyr] resumed", "echo: [chat #2] hi"]
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn budget_pauses_at_the_limit_and_holds_until_resume() {
+    let home = home("budget");
+    let mut cfg = config(&home);
+    cfg.budget = Some(toml::from_str("daily_tokens = 100").unwrap());
+    std::fs::write(home.join("stats.json"), r#"{"totalTokens": 60}"#).unwrap();
+    let gw = start(cfg.clone());
+    gw.say("m1", "owner", "small").await;
+    assert_eq!(gw.wait_replies(1).await, ["echo: [chat #1] small"]);
+
+    // rpi's totals are cumulative: this run adds 60 tokens, taking today to 120.
+    std::fs::write(home.join("stats.json"), r#"{"totalTokens": 120}"#).unwrap();
+    gw.say("m2", "owner", "big").await;
+    assert_eq!(
+        gw.wait_replies(3).await,
+        [
+            "echo: [chat #1] small",
+            "echo: [chat #2] big",
+            BUDGET_NOTICE
+        ]
+    );
+
+    gw.say("m3", "owner", "held").await;
+    assert_eq!(gw.wait_replies(3).await.len(), 3);
+    assert_eq!(log(&home, "prompt").len(), 2);
+    gw.shutdown().await;
+
+    // The pause is in the store, so a restart keeps it.
+    let gw = start(cfg);
+    gw.say("m4", "owner", "also held").await;
+    assert!(gw.wait_replies(0).await.is_empty());
+    assert_eq!(log(&home, "prompt").len(), 2);
+    assert_eq!(inbox_status(&home, "new"), 2);
+
+    // `/resume` overrides the limit for the day: the backlog runs, and no second notice follows.
+    gw.say("m5", "owner", "/resume").await;
+    assert_eq!(
+        gw.wait_replies(3).await,
+        [
+            "[zephyr] resumed",
+            "echo: [chat #3] held",
+            "echo: [chat #4] also held"
+        ]
+    );
+    assert_eq!(log(&home, "prompt").len(), 4);
+    gw.shutdown().await;
+}

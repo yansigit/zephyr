@@ -28,6 +28,23 @@ pub struct Config {
     pub owners: HashMap<String, Vec<String>>,
     /// The `rpi --connect` attach listener (DESIGN §4.3). Off when absent.
     pub attach: Option<Attach>,
+    /// Daily limits on rpi's reported usage (DESIGN §4.4). Off when absent.
+    pub budget: Option<Budget>,
+}
+
+/// `[budget]`: counted per UTC day. Crossing a limit pauses the gateway until the next UTC day or `/resume`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Budget {
+    pub daily_tokens: Option<i64>,
+    pub daily_cost_usd: Option<f64>,
+}
+
+impl Budget {
+    pub fn exceeded(&self, tokens: i64, cost: f64) -> bool {
+        self.daily_tokens.is_some_and(|t| tokens >= t)
+            || self.daily_cost_usd.is_some_and(|c| cost >= c)
+    }
 }
 
 /// `[attach]`: listens on 127.0.0.1 only. The token comes from exactly one of the two sources.
@@ -111,5 +128,15 @@ mod tests {
         assert_eq!(cfg.discord.unwrap().token_env, "ZEPHYR_DISCORD_TOKEN");
         assert_eq!(cfg.imessage.unwrap().lookback_hours, 24);
         assert!(toml::from_str::<Config>("rpi='a'\nhome='b'\ntypo=1").is_err());
+    }
+
+    #[test]
+    fn budget_is_over_when_either_limit_is_reached() {
+        let b: Budget = toml::from_str("daily_tokens = 100\ndaily_cost_usd = 2.5").unwrap();
+        assert!(!b.exceeded(99, 2.49));
+        assert!(b.exceeded(100, 0.0));
+        assert!(b.exceeded(0, 2.5));
+        assert!(!Budget::default().exceeded(i64::MAX, f64::MAX));
+        assert!(toml::from_str::<Budget>("daily_token = 1").is_err());
     }
 }

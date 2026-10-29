@@ -4,7 +4,7 @@ use crate::channel::Inbound;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// An inbox row the router still has to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +75,13 @@ impl Store {
                     status TEXT NOT NULL DEFAULT 'pending', -- pending|sent|failed
                     created_at INTEGER NOT NULL DEFAULT (unixepoch()));
                  PRAGMA user_version = 1;",
+            )?;
+        }
+        if version < 2 {
+            db.execute_batch(
+                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE spend(day TEXT PRIMARY KEY, tokens INTEGER NOT NULL, cost_usd REAL NOT NULL);
+                 PRAGMA user_version = 2;",
             )?;
         } else if version != SCHEMA_VERSION {
             return Err(rusqlite::Error::InvalidParameterName(format!(
@@ -178,6 +185,103 @@ impl Store {
             .optional()
     }
 
+    /// `user` after `/pause`, `budget:<day>` after a budget trip. Either way the pause ends with `/resume`.
+    /// A budget pause ends at the next UTC day (SQLite's `date('now')` is UTC).
+    pub fn pause_reason(&self) -> rusqlite::Result<Option<String>> {
+        self.db
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'paused'
+                 AND (value = 'user' OR value = 'budget:' || date('now'))",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// `None` clears the pause.
+    pub fn set_paused(&self, reason: Option<&str>) -> rusqlite::Result<()> {
+        match reason {
+            Some(r) => self.db.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('paused', ?1)",
+                params![r],
+            ),
+            None => self.db.execute("DELETE FROM meta WHERE key = 'paused'", []),
+        }?;
+        Ok(())
+    }
+
+    /// The UTC day, as `YYYY-MM-DD`.
+    pub fn today(&self) -> rusqlite::Result<String> {
+        self.db.query_row("SELECT date('now')", [], |r| r.get(0))
+    }
+
+    /// rpi's session totals at the last settle, so each settle adds only its own usage.
+    pub fn last_stats(&self) -> rusqlite::Result<(i64, f64)> {
+        let v: Option<String> = self
+            .db
+            .query_row("SELECT value FROM meta WHERE key = 'stats'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(v.and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn set_last_stats(&self, (tokens, cost): (i64, f64)) -> rusqlite::Result<()> {
+        let v = serde_json::json!([tokens, cost]).to_string();
+        self.db.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('stats', ?1)",
+            params![v],
+        )?;
+        Ok(())
+    }
+
+    /// Adds usage to the day's total and returns the new total.
+    pub fn add_spend(&self, day: &str, tokens: i64, cost: f64) -> rusqlite::Result<(i64, f64)> {
+        self.db.execute(
+            "INSERT INTO spend(day, tokens, cost_usd) VALUES (?1, ?2, ?3)
+             ON CONFLICT(day) DO UPDATE SET tokens = tokens + excluded.tokens,
+                                            cost_usd = cost_usd + excluded.cost_usd",
+            params![day, tokens, cost],
+        )?;
+        self.spend(day)
+    }
+
+    pub fn spend(&self, day: &str) -> rusqlite::Result<(i64, f64)> {
+        let t = self
+            .db
+            .query_row(
+                "SELECT tokens, cost_usd FROM spend WHERE day = ?1",
+                params![day],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(t.unwrap_or_default())
+    }
+
+    /// Writes a notice to the channel and recipient of the newest owner message, if any.
+    pub fn notify_last_owner(&self, text: &str) -> rusqlite::Result<()> {
+        let last: Option<(String, String)> = self
+            .db
+            .query_row(
+                "SELECT channel, sender FROM inbox WHERE status IN ('done', 'dispatched')
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((channel, recipient)) = last else {
+            return Ok(());
+        };
+        // No inbox row to key on, so the client id is `b<outbox id>`. Replies are `z<base36>`.
+        self.db.execute(
+            "INSERT INTO outbox(channel, recipient, client_id, text)
+             VALUES (?1, ?2, 'b' || (SELECT coalesce(max(id), 0) + 1 FROM outbox), ?3)",
+            params![channel, recipient, text],
+        )?;
+        Ok(())
+    }
+
     /// `(table, status, count)` for `zephyr status`.
     pub fn counts(&self) -> rusqlite::Result<Vec<(String, String, i64)>> {
         let mut stmt = self.db.prepare(
@@ -233,6 +337,80 @@ mod tests {
         assert_eq!(client_id(0), "z0");
         assert_eq!(client_id(36), "z10");
         assert!(client_id(i64::MAX).len() <= 20);
+    }
+
+    #[test]
+    fn pause_survives_reopen_and_budget_pause_expires_by_day() {
+        let dir = crate::test_dir("store-pause");
+        let path = dir.join("state.db");
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.pause_reason().unwrap(), None);
+        store.set_paused(Some("user")).unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.pause_reason().unwrap().as_deref(), Some("user"));
+        store.set_paused(Some("budget:2000-01-01")).unwrap();
+        assert_eq!(
+            store.pause_reason().unwrap(),
+            None,
+            "a past day's budget pause has ended"
+        );
+        store.set_paused(None).unwrap();
+        assert_eq!(store.pause_reason().unwrap(), None);
+    }
+
+    #[test]
+    fn spend_and_stats_accumulate() {
+        let dir = crate::test_dir("store-spend");
+        let store = Store::open(&dir.join("state.db")).unwrap();
+        let day = store.today().unwrap();
+        assert_eq!(store.last_stats().unwrap(), (0, 0.0));
+        store.set_last_stats((40, 0.5)).unwrap();
+        assert_eq!(store.last_stats().unwrap(), (40, 0.5));
+        assert_eq!(store.add_spend(&day, 10, 0.25).unwrap(), (10, 0.25));
+        assert_eq!(store.add_spend(&day, 5, 0.25).unwrap(), (15, 0.5));
+        assert_eq!(store.spend("2000-01-01").unwrap(), (0, 0.0));
+    }
+
+    #[test]
+    fn notices_go_to_the_newest_owner_message() {
+        let dir = crate::test_dir("store-notify");
+        let mut store = Store::open(&dir.join("state.db")).unwrap();
+        store.notify_last_owner("nobody yet").unwrap();
+        assert!(store.pending_outbox().unwrap().is_empty());
+        store.insert_inbox(&msg("a")).unwrap();
+        let row = store.inbox_with_status("new").unwrap().remove(0);
+        store.reply(&row, "answer", "done").unwrap();
+        store.notify_last_owner("first notice").unwrap();
+        store.notify_last_owner("second notice").unwrap();
+        let out = store.pending_outbox().unwrap();
+        let texts: Vec<_> = out
+            .iter()
+            .map(|o| (o.channel.as_str(), o.recipient.as_str(), o.text.as_str()))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                ("chat", "1000", "answer"),
+                ("chat", "1000", "first notice"),
+                ("chat", "1000", "second notice")
+            ]
+        );
+        assert_ne!(out[1].client_id, out[2].client_id);
+    }
+
+    #[test]
+    fn a_v1_database_gains_the_new_tables() {
+        let dir = crate::test_dir("store-v1");
+        let path = dir.join("state.db");
+        Store::open(&path).unwrap().insert_inbox(&msg("a")).unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("DROP TABLE meta; DROP TABLE spend; PRAGMA user_version = 1;")
+            .unwrap();
+        drop(db);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.inbox_with_status("new").unwrap().len(), 1);
+        store.set_paused(Some("user")).unwrap();
     }
 
     #[test]
