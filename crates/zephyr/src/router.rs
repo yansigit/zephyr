@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::Instant;
 
 /// rpi's own cap (`MAX_RESUME_ATTEMPTS`); after that we tell the sender.
@@ -36,6 +36,8 @@ pub async fn run<C: Channel>(
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(&cfg.home)?;
+    let (tx, rx) = mpsc::channel(64);
+    let (attach_tx, attaches) = mpsc::channel(4);
     let mut router = Router {
         cfg,
         store: Store::open(&cfg.db_path())?,
@@ -45,11 +47,13 @@ pub async fn run<C: Channel>(
         backoff: FIRST_BACKOFF,
         respawn_at: Instant::now(),
         unrouted: HashSet::new(),
+        tap: broadcast::channel(1024).0,
+        attaches,
     };
-    let (tx, rx) = mpsc::channel(64);
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
         r = runs => r.map(drop),
+        r = crate::attach::serve(cfg, tx, attach_tx) => r,
         r = router.main(rx, channels, shutdown) => r,
     }
 }
@@ -65,6 +69,9 @@ struct Router<'a> {
     respawn_at: Instant,
     /// Outbox channels with no configured adapter, so each is logged once.
     unrouted: HashSet<String>,
+    /// Every child event, for attached clients.
+    tap: broadcast::Sender<Value>,
+    attaches: mpsc::Receiver<crate::attach::AttachRequest>,
 }
 
 async fn next_event(child: &mut Option<Child>) -> Option<Value> {
@@ -91,7 +98,8 @@ impl Router<'_> {
                     self.spawn().await;
                 }
                 Some(m) = rx.recv() => self.inbound(m).await,
-                ev = next_event(&mut self.child) => match ev {
+                Some(req) = self.attaches.recv() => self.attach(req).await,
+                ev = next_event(&mut self.child) => match self.tapped(ev) {
                     Some(ev) if ev["type"] == "agent_settled" => self.settled(&ev).await,
                     Some(_) => continue,
                     None => self.child_exited().await,
@@ -104,6 +112,24 @@ impl Router<'_> {
         }
         self.drain(channels).await;
         Ok(())
+    }
+
+    fn tapped(&self, ev: Option<Value>) -> Option<Value> {
+        if let Some(ev) = &ev {
+            let _ = self.tap.send(ev.clone()); // no receivers is fine
+        }
+        ev
+    }
+
+    /// History and the live stream start at the same point: events the child sends during
+    /// `get_messages` are still queued and reach the new receiver.
+    async fn attach(&mut self, req: crate::attach::AttachRequest) {
+        let history = self.call(json!({"type": "get_messages"})).await;
+        let history = history.unwrap_or_else(|e| {
+            eprintln!("zephyr: no history for attach: {e:#}");
+            Value::Null
+        });
+        let _ = req.send((history, self.tap.subscribe()));
     }
 
     async fn spawn(&mut self) {
@@ -278,7 +304,17 @@ impl Router<'_> {
             Ok(rows) => rows,
             Err(e) => return eprintln!("zephyr: outbox read failed: {e}"),
         };
-        for row in rows {
+        // An attached client saw the reply live; a later attach sees it in the history.
+        for row in rows.iter().filter(|r| r.channel == crate::attach::CHANNEL) {
+            log(self
+                .store
+                .set_outbox_status(row.id, "sent")
+                .map_err(Into::into));
+        }
+        for row in rows
+            .into_iter()
+            .filter(|r| r.channel != crate::attach::CHANNEL)
+        {
             let Some(channel) = channels.iter().find(|c| c.name() == row.channel) else {
                 if self.unrouted.insert(row.channel.clone()) {
                     eprintln!(
