@@ -6,6 +6,8 @@ pid holds the current pid, and a `hang` file makes the next prompt commit its us
 message, mark the run resumable, and stop answering (the test then kills -9 it); a
 `slow` file makes every prompt take a second. `stats.json` (if present) is what `get_stats`
 reports: {"totalTokens": n, "costTotal": x}, cumulative like rpi's.
+A prompt containing `[hang]` never settles until `abort`; one that starts with `say: `
+replies with the rest.
 The session is <session-dir>/<session-id>.json: {"messages": [...], "pending": bool}.
 """
 import json, os, sys, time
@@ -43,12 +45,12 @@ def user(text): return {"kind": "user", "role": "user", "content": text, "timest
 def assistant(text):
     return {"kind": "assistant", "role": "assistant", "content": [{"type": "text", "text": text}], "stopReason": "stop", "timestamp": 0}
 
-def finish(s, text):
+def finish(s, text, outcome="completed"):
     msg = assistant(text)
     s["messages"].append(msg); s["pending"] = False; save(s)
     out({"type": "message_start", "message": msg})
     out({"type": "message_end", "message": msg})
-    out({"type": "agent_settled", "runId": "r", "outcome": "completed", "aborted": False,
+    out({"type": "agent_settled", "runId": "r", "outcome": outcome, "aborted": outcome == "aborted",
          "error": None, "summary": None, "pendingResume": False})
 
 out({"type": "ready", "protocol": "rpi", "piCompatibilityTarget": "1.2.0",
@@ -58,6 +60,7 @@ out({"type": "ready", "protocol": "rpi", "piCompatibilityTarget": "1.2.0",
      "semantics": {"promptResponse": "accepted", "settlementEvent": "agent_settled", "agentEndIsTerminal": False},
      "limits": {"frameBytes": 1048576, "maxConcurrentPrompts": 1}, "parityComplete": False})
 queue = []
+hanging = False
 for line in sys.stdin:
     cmd = json.loads(line)
     open(os.path.join(home, "log.jsonl"), "a").write(line)
@@ -82,6 +85,10 @@ for line in sys.stdin:
                      "error": None, "summary": None, "pendingResume": False})
                 break
             continue
+        if "[hang]" in cmd["message"]:
+            hanging = True; continue
+        if cmd["message"].startswith("say: "):
+            finish(s, cmd["message"][5:]); continue
         finish(s, "echo: " + cmd["message"])
     elif kind == "resume_pending":
         if not s["pending"]:
@@ -100,6 +107,8 @@ for line in sys.stdin:
         respond(cmd, {"cleared": len(queue), "steering": [], "followUp": queue}); queue = []
     elif kind == "abort":
         respond(cmd, {"aborted": True})
+        if hanging:
+            hanging = False; finish(s, "", "aborted")
     elif kind == "get_stats":
         stats = {"totalTokens": 0, "costTotal": 0.0}
         if os.path.exists(os.path.join(home, "stats.json")):

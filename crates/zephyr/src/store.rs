@@ -1,10 +1,10 @@
-//! Durable inbox and outbox (DESIGN §4.2). SQLite in WAL mode with `synchronous=FULL`.
+//! Durable inbox and outbox (DESIGN §4.2), jobs and runs (§4.5). SQLite in WAL mode with `synchronous=FULL`.
 
 use crate::channel::Inbound;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// An inbox row the router still has to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +42,43 @@ pub fn client_id(inbox_id: i64) -> String {
     format!("z{}", String::from_utf8(digits).unwrap())
 }
 
+/// The dedupe key for a job run's delivery: `j<run id>`, at most 20 chars, and `interrupt_running_runs` builds the same in SQL.
+pub fn job_client_id(run_id: i64) -> String {
+    format!("j{run_id}")
+}
+
+/// A scheduled job (DESIGN §4.5). Output goes to `channel`/`recipient`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Job {
+    pub id: i64,
+    pub name: String,
+    pub schedule: String,
+    pub prompt: String,
+    pub channel: String,
+    pub recipient: String,
+}
+
+/// A run taken off the queue, with what it needs from its job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRun {
+    pub id: i64,
+    pub job: Job,
+}
+
+const JOB_COLUMNS: &str =
+    "jobs.id, jobs.name, jobs.schedule, jobs.prompt, jobs.channel, jobs.recipient";
+
+fn job_row(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Job> {
+    Ok(Job {
+        id: r.get(at)?,
+        name: r.get(at + 1)?,
+        schedule: r.get(at + 2)?,
+        prompt: r.get(at + 3)?,
+        channel: r.get(at + 4)?,
+        recipient: r.get(at + 5)?,
+    })
+}
+
 pub struct Store {
     db: Connection,
 }
@@ -53,9 +90,16 @@ impl Store {
         db.pragma_update(None, "synchronous", "FULL")?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version == 0 {
+        if version > SCHEMA_VERSION {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "state.db schema version {version}, this build knows {SCHEMA_VERSION}"
+            )));
+        }
+        // Each step runs in order from any older version, in its own transaction.
+        if version < 1 {
             db.execute_batch(
-                "CREATE TABLE inbox(
+                "BEGIN;
+                 CREATE TABLE inbox(
                     id INTEGER PRIMARY KEY,
                     channel TEXT NOT NULL,
                     platform_msg_id TEXT NOT NULL,
@@ -74,19 +118,42 @@ impl Store {
                     text TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending', -- pending|sent|failed
                     created_at INTEGER NOT NULL DEFAULT (unixepoch()));
-                 PRAGMA user_version = 1;",
+                 PRAGMA user_version = 1;
+                 COMMIT;",
             )?;
         }
         if version < 2 {
             db.execute_batch(
-                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                "BEGIN;
+                 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
                  CREATE TABLE spend(day TEXT PRIMARY KEY, tokens INTEGER NOT NULL, cost_usd REAL NOT NULL);
-                 PRAGMA user_version = 2;",
+                 PRAGMA user_version = 2;
+                 COMMIT;",
             )?;
-        } else if version != SCHEMA_VERSION {
-            return Err(rusqlite::Error::InvalidParameterName(format!(
-                "state.db schema version {version}, this build knows {SCHEMA_VERSION}"
-            )));
+        }
+        if version < 3 {
+            db.execute_batch(
+                "BEGIN;
+                 CREATE TABLE jobs(
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    schedule TEXT NOT NULL, -- five-field cron or RFC3339 time
+                    prompt TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    recipient TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch()));
+                 CREATE TABLE runs(
+                    id INTEGER PRIMARY KEY,
+                    job_id INTEGER NOT NULL REFERENCES jobs(id),
+                    due_at INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'claimed', -- claimed|running|completed|failed|unknown
+                    started_at INTEGER,
+                    ended_at INTEGER,
+                    output TEXT);
+                 PRAGMA user_version = 3;
+                 COMMIT;",
+            )?;
         }
         Ok(Self { db })
     }
@@ -282,11 +349,167 @@ impl Store {
         Ok(())
     }
 
+    pub fn add_job(
+        &self,
+        name: &str,
+        schedule: &str,
+        prompt: &str,
+        channel: &str,
+        recipient: &str,
+    ) -> rusqlite::Result<i64> {
+        self.db.execute(
+            "INSERT INTO jobs(name, schedule, prompt, channel, recipient) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, schedule, prompt, channel, recipient],
+        )?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    pub fn jobs(&self) -> rusqlite::Result<Vec<Job>> {
+        let mut stmt = self
+            .db
+            .prepare(&format!("SELECT {JOB_COLUMNS} FROM jobs ORDER BY id"))?;
+        let rows = stmt.query_map([], |r| job_row(r, 0))?;
+        rows.collect()
+    }
+
+    /// Deletes the job and its runs that have not started. Returns whether it existed.
+    pub fn remove_job(&mut self, id: i64) -> rusqlite::Result<bool> {
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "DELETE FROM runs WHERE job_id = ?1 AND status = 'claimed'",
+            params![id],
+        )?;
+        let n = tx.execute("DELETE FROM jobs WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(n == 1)
+    }
+
+    /// Queues a run now (`/job run`). `None` when there is no such job.
+    pub fn queue_run(&self, job_id: i64, now: i64) -> rusqlite::Result<Option<i64>> {
+        let n = self.db.execute(
+            "INSERT INTO runs(job_id, due_at) SELECT id, ?2 FROM jobs WHERE id = ?1",
+            params![job_id, now],
+        )?;
+        Ok((n == 1).then(|| self.db.last_insert_rowid()))
+    }
+
+    /// Claims at most one run per enabled job whose next time after its last run (or its
+    /// creation) has passed. The run is due `now`, so every other missed time is skipped.
+    /// `BEGIN IMMEDIATE` takes the write lock first, so a concurrent tick sees the claim.
+    pub fn claim_due(
+        &mut self,
+        now: i64,
+        next_after: impl Fn(&str, i64) -> Option<i64>,
+    ) -> rusqlite::Result<Vec<i64>> {
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let due: Vec<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, schedule, coalesce((SELECT max(due_at) FROM runs WHERE job_id = jobs.id), created_at)
+                 FROM jobs WHERE enabled = 1",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|(_, schedule, last)| next_after(schedule, *last).is_some_and(|t| t <= now))
+                .map(|(id, _, _)| id)
+                .collect()
+        };
+        let mut runs = Vec::new();
+        for job in due {
+            tx.execute(
+                "INSERT INTO runs(job_id, due_at) VALUES (?1, ?2)",
+                params![job, now],
+            )?;
+            runs.push(tx.last_insert_rowid());
+        }
+        tx.commit()?;
+        Ok(runs)
+    }
+
+    /// Takes the oldest claimed run and marks it running.
+    pub fn start_next_run(&self, now: i64) -> rusqlite::Result<Option<JobRun>> {
+        let run = self
+            .db
+            .query_row(
+                &format!(
+                    "SELECT runs.id, {JOB_COLUMNS} FROM runs JOIN jobs ON jobs.id = runs.job_id
+                     WHERE runs.status = 'claimed' ORDER BY runs.id LIMIT 1"
+                ),
+                [],
+                |r| {
+                    Ok(JobRun {
+                        id: r.get(0)?,
+                        job: job_row(r, 1)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(run) = &run {
+            self.db.execute(
+                "UPDATE runs SET status = 'running', started_at = ?2 WHERE id = ?1",
+                params![run.id, now],
+            )?;
+        }
+        Ok(run)
+    }
+
+    /// Closes the run and queues `delivery` (if any) to the job's channel, in one transaction.
+    pub fn finish_run(
+        &mut self,
+        run: &JobRun,
+        status: &str,
+        output: &str,
+        delivery: Option<&str>,
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "UPDATE runs SET status = ?2, output = ?3, ended_at = ?4 WHERE id = ?1",
+            params![run.id, status, output, now],
+        )?;
+        if let Some(text) = delivery {
+            tx.execute(
+                "INSERT OR IGNORE INTO outbox(channel, recipient, client_id, text) VALUES (?1, ?2, ?3, ?4)",
+                params![run.job.channel, run.job.recipient, job_client_id(run.id), text],
+            )?;
+        }
+        tx.commit()
+    }
+
+    /// Startup: runs left `running` by a dead gateway become `unknown` and are reported,
+    /// never retried. Returns how many.
+    pub fn interrupt_running_runs(&mut self, now: i64) -> rusqlite::Result<usize> {
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO outbox(channel, recipient, client_id, text)
+             SELECT jobs.channel, jobs.recipient, 'j' || runs.id,
+                    '[zephyr] job #' || jobs.id || ' (' || jobs.name || ') run ' || runs.id
+                    || ' was interrupted by a restart; it will not be retried'
+             FROM runs JOIN jobs ON jobs.id = runs.job_id WHERE runs.status = 'running'",
+            [],
+        )?;
+        let n = tx.execute(
+            "UPDATE runs SET status = 'unknown', ended_at = ?1 WHERE status = 'running'",
+            params![now],
+        )?;
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// `(table, status, count)` for `zephyr status`.
     pub fn counts(&self) -> rusqlite::Result<Vec<(String, String, i64)>> {
         let mut stmt = self.db.prepare(
             "SELECT 'inbox', status, count(*) FROM inbox GROUP BY status
-             UNION ALL SELECT 'outbox', status, count(*) FROM outbox GROUP BY status",
+             UNION ALL SELECT 'outbox', status, count(*) FROM outbox GROUP BY status
+             UNION ALL SELECT 'runs', status, count(*) FROM runs GROUP BY status",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         rows.collect()
@@ -400,17 +623,43 @@ mod tests {
     }
 
     #[test]
-    fn a_v1_database_gains_the_new_tables() {
-        let dir = crate::test_dir("store-v1");
+    fn older_databases_migrate_in_order_and_keep_their_rows() {
+        // Each case undoes the steps after `version`, as a db made by that build would look.
+        for (version, undo) in [
+            (
+                1,
+                "DROP TABLE meta; DROP TABLE spend; DROP TABLE runs; DROP TABLE jobs;",
+            ),
+            (2, "DROP TABLE runs; DROP TABLE jobs;"),
+        ] {
+            let dir = crate::test_dir(&format!("store-v{version}"));
+            let path = dir.join("state.db");
+            Store::open(&path).unwrap().insert_inbox(&msg("a")).unwrap();
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(&format!("{undo} PRAGMA user_version = {version};"))
+                .unwrap();
+            drop(db);
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.inbox_with_status("new").unwrap().len(), 1);
+            store.set_paused(Some("user")).unwrap();
+            assert_eq!(
+                store.add_job("j", "* * * * *", "p", "chat", "o").unwrap(),
+                1
+            );
+            let now: i64 = store
+                .db
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap();
+            assert_eq!(now, SCHEMA_VERSION);
+        }
+        let dir = crate::test_dir("store-newer");
         let path = dir.join("state.db");
-        Store::open(&path).unwrap().insert_inbox(&msg("a")).unwrap();
-        let db = Connection::open(&path).unwrap();
-        db.execute_batch("DROP TABLE meta; DROP TABLE spend; PRAGMA user_version = 1;")
+        drop(Store::open(&path).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .unwrap();
-        drop(db);
-        let store = Store::open(&path).unwrap();
-        assert_eq!(store.inbox_with_status("new").unwrap().len(), 1);
-        store.set_paused(Some("user")).unwrap();
+        assert!(Store::open(&path).is_err(), "a newer schema is refused");
     }
 
     #[test]

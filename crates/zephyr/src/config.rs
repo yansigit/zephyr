@@ -30,6 +30,15 @@ pub struct Config {
     pub attach: Option<Attach>,
     /// Daily limits on rpi's reported usage (DESIGN §4.4). Off when absent.
     pub budget: Option<Budget>,
+    /// IANA time zone for job cron schedules, e.g. `Asia/Seoul`. Default: the system's.
+    pub timezone: Option<String>,
+    /// Wall clock cap for one job run. Not configurable; tests shorten it.
+    #[serde(skip, default = "job_timeout")]
+    pub job_timeout: std::time::Duration,
+}
+
+fn job_timeout() -> std::time::Duration {
+    crate::scheduler::JOB_TIMEOUT
 }
 
 /// `[budget]`: counted per UTC day. Crossing a limit pauses the gateway until the next UTC day or `/resume`.

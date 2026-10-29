@@ -475,3 +475,178 @@ async fn budget_pauses_at_the_limit_and_holds_until_resume() {
     assert_eq!(log(&home, "prompt").len(), 4);
     gw.shutdown().await;
 }
+
+fn run_status(home: &Path, status: &str) -> i64 {
+    let counts = Store::open(&home.join("state.db"))
+        .unwrap()
+        .counts()
+        .unwrap();
+    counts
+        .iter()
+        .find(|(t, s, _)| t == "runs" && s == status)
+        .map_or(0, |c| c.2)
+}
+
+/// A schedule that will not fire during a test, so only `/job run` starts runs.
+const NEVER: &str = "0 0 1 1 *";
+
+#[tokio::test]
+async fn job_output_is_delivered_unless_silent() {
+    let home = home("job-deliver");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        &format!("/job add hi | {NEVER} | say: hello"),
+    )
+    .await;
+    gw.say(
+        "m2",
+        "owner",
+        &format!("/job add quiet | {NEVER} | say:  [SILENT] "),
+    )
+    .await;
+    gw.say("m3", "owner", "/job run 1").await;
+    gw.say("m4", "owner", "/job run 2").await;
+    wait(|| run_status(&home, "completed") == 2).await;
+    let replies = gw.wait_replies(5).await;
+    assert_eq!(replies.len(), 5, "{replies:?}");
+    assert!(replies[0].starts_with("[zephyr] job #1 (hi) added"));
+    assert_eq!(
+        replies[2..4],
+        [
+            "[zephyr] job #1 queued as run 1",
+            "[zephyr] job #2 queued as run 2"
+        ]
+    );
+    assert_eq!(replies[4], "hello");
+    assert!(gw.replies_on("discord").is_empty());
+    let prompts = log(&home, "prompt");
+    assert_eq!(prompts.len(), 2, "no /job command reaches the agent");
+    assert!(home.join("sessions/job-1-1.json").exists());
+    assert!(home.join("sessions/job-2-2.json").exists());
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_running_job_does_not_delay_main() {
+    let home = home("job-beside-main");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        &format!("/job add slow | {NEVER} | [hang] forever"),
+    )
+    .await;
+    gw.say("m2", "owner", "/job run 1").await;
+    wait(|| !log(&home, "prompt").is_empty()).await; // the job child is mid-run
+    let t = std::time::Instant::now();
+    gw.say("m3", "owner", "hi").await;
+    wait(|| gw.replies().iter().any(|r| r == "echo: [chat #3] hi")).await;
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    assert_eq!(run_status(&home, "running"), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_job_run_past_its_time_limit_is_aborted() {
+    let home = home("job-timeout");
+    let mut cfg = config(&home);
+    cfg.job_timeout = Duration::from_millis(500);
+    let gw = start(cfg);
+    gw.say(
+        "m1",
+        "owner",
+        &format!("/job add slow | {NEVER} | [hang] forever"),
+    )
+    .await;
+    gw.say("m2", "owner", "/job run 1").await;
+    let replies = gw.wait_replies(3).await;
+    assert_eq!(
+        replies[2],
+        "[zephyr] job #1 (slow) run 1 was aborted after 500ms"
+    );
+    assert_eq!(run_status(&home, "failed"), 1);
+    assert_eq!(log(&home, "abort").len(), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_run_cut_off_by_a_restart_is_reported_not_retried() {
+    let home = home("job-unknown");
+    let cfg = config(&home);
+    let store = Store::open(&cfg.db_path()).unwrap();
+    store
+        .add_job("nightly", NEVER, "say: hi", "chat", "owner")
+        .unwrap();
+    store.queue_run(1, zephyr::now()).unwrap();
+    store.start_next_run(zephyr::now()).unwrap().unwrap(); // `running` when the gateway died
+    drop(store);
+
+    let gw = start(cfg);
+    assert_eq!(
+        gw.wait_replies(1).await,
+        ["[zephyr] job #1 (nightly) run 1 was interrupted by a restart; it will not be retried"]
+    );
+    assert!(log(&home, "prompt").is_empty());
+    assert_eq!(run_status(&home, "unknown"), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn pause_aborts_a_running_job() {
+    let home = home("job-pause");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        &format!("/job add slow | {NEVER} | [hang] forever"),
+    )
+    .await;
+    gw.say("m2", "owner", "/job run 1").await;
+    wait(|| !log(&home, "prompt").is_empty()).await; // the job child is mid-run
+    gw.say("m3", "owner", "/pause").await;
+    wait(|| run_status(&home, "failed") == 1).await;
+    let replies = gw.wait_replies(4).await;
+    assert!(replies.iter().any(|r| r == PAUSED), "{replies:?}");
+    assert!(replies
+        .iter()
+        .any(|r| r == "[zephyr] job #1 (slow) run 1 was aborted: paused"));
+    assert_eq!(
+        log(&home, "abort").len(),
+        1,
+        "only the job child was aborted"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_paused_scheduler_claims_nothing_and_catches_up_once_on_resume() {
+    let home = home("job-resume");
+    let cfg = config(&home);
+    let mut store = Store::open(&cfg.db_path()).unwrap();
+    store
+        .add_job("tick", "* * * * *", "say: caught up", "chat", "owner")
+        .unwrap();
+    // Last ran an hour ago, so sixty minutes of runs are missed.
+    store.queue_run(1, zephyr::now() - 3600).unwrap();
+    let run = store.start_next_run(zephyr::now()).unwrap().unwrap();
+    store
+        .finish_run(&run, "completed", "old", None, zephyr::now())
+        .unwrap();
+    // A budget trip pauses the same way `/pause` does.
+    let today = store.today().unwrap();
+    store.set_paused(Some(&format!("budget:{today}"))).unwrap();
+    drop(store);
+
+    let gw = start(cfg);
+    tokio::time::sleep(Duration::from_millis(1500)).await; // first tick and a pause poll
+    assert!(log(&home, "prompt").is_empty());
+    assert_eq!(run_status(&home, "claimed"), 0);
+    gw.say("m1", "owner", "/resume").await;
+    wait(|| run_status(&home, "completed") == 2).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(run_status(&home, "completed"), 2, "one catch-up run");
+    assert_eq!(gw.wait_replies(2).await, ["[zephyr] resumed", "caught up"]);
+    gw.shutdown().await;
+}

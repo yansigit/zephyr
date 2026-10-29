@@ -8,6 +8,7 @@ pub mod discord;
 pub mod imessage;
 pub mod router;
 pub mod rpc;
+pub mod scheduler;
 pub mod store;
 
 pub fn unix_millis() -> u128 {
@@ -15,6 +16,10 @@ pub fn unix_millis() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+pub fn now() -> i64 {
+    (unix_millis() / 1000) as i64
 }
 
 #[cfg(test)]
