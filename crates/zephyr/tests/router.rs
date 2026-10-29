@@ -943,3 +943,27 @@ async fn account_dirs_share_models_and_settings_and_rpi_retries_once() {
     assert_eq!(settings["retry"]["maxRetries"], 1);
     assert_eq!(settings["theme"], "dark");
 }
+
+#[tokio::test]
+async fn a_rate_limited_job_retries_on_the_next_account() {
+    let home = home("job-failover");
+    let reset = zephyr::now() + 3600;
+    rate_limit(&home, "a", &format!("rate_limited; resets_at={reset}"));
+    let gw = start(pooled(&home));
+    gw.say(
+        "m1",
+        "owner",
+        &format!("/job add hi | {NEVER} | say: hello"),
+    )
+    .await;
+    gw.say("m2", "owner", "/job run 1").await;
+    wait(|| run_status(&home, "completed") == 1).await;
+    let replies = gw.wait_replies(3).await;
+    assert_eq!(replies[2], "hello", "{replies:?}");
+    assert_eq!(cooldowns(&home)["a"].until, reset);
+    assert!(
+        home.join("sessions/job-1-1-1.json").exists(),
+        "a fresh session on b"
+    );
+    gw.shutdown().await;
+}

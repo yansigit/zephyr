@@ -47,6 +47,8 @@ json.dump(args, open(os.path.join(home, "argv.json"), "w"))  # the flags this ch
 open(os.path.join(home, "log.jsonl"), "a").write(json.dumps(
     {"type": "start", "agentDir": os.environ.get("RPI_CODING_AGENT_DIR"), "model": opt("--model"),
      "sessionId": opt("--session-id")}) + "\n")
+if os.path.isdir(os.environ.get("RPI_CODING_AGENT_DIR") or ""):  # which account started, for tests whose home is temporary
+    open(os.path.join(os.environ["RPI_CODING_AGENT_DIR"], "starts.log"), "a").write("%s\n" % opt("--model"))
 
 def load():
     try:

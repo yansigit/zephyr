@@ -265,3 +265,16 @@ fn secrets_env_in_home_is_loaded_without_overriding_the_environment() {
         "a set variable wins"
     );
 }
+
+#[test]
+fn doctor_probes_as_the_first_pooled_account() {
+    let (home, cfg) = setup(
+        "doctor-pool",
+        "[[account]]\nname = 'a'\nmodel = 'anthropic/m'\n[[account]]\nname = 'b'\nmodel = 'openai-codex/m'\n",
+    );
+    let first = home.join("accounts/a");
+    std::fs::create_dir_all(&first).unwrap();
+    zephyr(&cfg, &["doctor"]);
+    let starts = std::fs::read_to_string(first.join("starts.log")).unwrap_or_default();
+    assert_eq!(starts, "anthropic/m\n");
+}

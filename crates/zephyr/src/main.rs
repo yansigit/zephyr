@@ -182,6 +182,12 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     // A throwaway home so doctor never touches the live `main` session.
     let mut probe = cfg.clone();
     probe.home = std::env::temp_dir().join(format!("zephyr-doctor-{}", std::process::id()));
+    // In pool mode, probe as the first account: the top-level model and agent_dir are unused.
+    if let Some(first) = cfg.accounts.first() {
+        probe.agent_dir = Some(cfg.account_dir(first));
+        probe.model = Some(first.model.clone());
+        probe.accounts.clear();
+    }
     std::fs::create_dir_all(&probe.home)?;
     let child = Child::spawn(&probe, "doctor").await;
     let commands_ok = match child {

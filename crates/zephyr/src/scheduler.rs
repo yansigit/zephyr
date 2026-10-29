@@ -147,24 +147,58 @@ async fn execute(cfg: &Config, store: &mut Store, run: &JobRun) -> (&'static str
         "[zephyr] job #{} ({}) run {}",
         run.job.id, run.job.name, run.id
     );
-    let session = format!("job-{}-{}", run.job.id, run.id);
-    // A job runs on the first account not cooling down. It does not fail over.
-    let account = if cfg.accounts.is_empty() {
-        None
-    } else {
-        let cooling = store.cooldowns().unwrap_or_default();
-        match crate::pool::pick(&cfg.accounts, &cooling, crate::now()) {
-            Ok(a) => Some(a),
-            Err(until) => {
-                let why = format!(
-                    "every account is rate-limited until {}",
-                    crate::pool::iso(until)
-                );
-                return ("failed", format!("{label} could not start: {why}"), false);
+    // A job runs on the first account not cooling down. A rate-limited attempt cools that
+    // account and retries on the next one, in a fresh session; each account is tried once.
+    let mut crossed = false;
+    for attempt in 0.. {
+        let session = match attempt {
+            0 => format!("job-{}-{}", run.job.id, run.id),
+            n => format!("job-{}-{}-{n}", run.job.id, run.id),
+        };
+        let account = if cfg.accounts.is_empty() {
+            None
+        } else {
+            let cooling = store.cooldowns().unwrap_or_default();
+            match crate::pool::pick(&cfg.accounts, &cooling, crate::now()) {
+                Ok(a) => Some(a),
+                Err(until) => {
+                    let why = format!(
+                        "every account is rate-limited until {}",
+                        crate::pool::iso(until)
+                    );
+                    return ("failed", format!("{label} could not start: {why}"), crossed);
+                }
             }
+        };
+        let (status, text, over) = attempt_once(cfg, store, run, &label, &session, account).await;
+        crossed |= over;
+        let limited = (status == "failed")
+            .then(|| crate::pool::rate_limit(&text))
+            .flatten();
+        let (Some(a), Some(resets_at)) = (account, limited) else {
+            return (status, text, crossed);
+        };
+        if let Err(e) = crate::pool::cool_down(store, &a.name, &text, resets_at, crate::now()) {
+            eprintln!("zephyr: recording a cooldown failed: {e}");
+            return (status, text, crossed);
         }
-    };
-    let mut child = match Child::spawn_as(cfg, &session, account).await {
+        if attempt + 1 >= cfg.accounts.len() {
+            return (status, text, crossed);
+        }
+    }
+    unreachable!("the attempt loop always returns")
+}
+
+/// One attempt of a job run on `account`, in its own fresh child.
+async fn attempt_once(
+    cfg: &Config,
+    store: &mut Store,
+    run: &JobRun,
+    label: &str,
+    session: &str,
+    account: Option<&crate::config::Account>,
+) -> (&'static str, String, bool) {
+    let mut child = match Child::spawn_as(cfg, session, account).await {
         Ok(child) => child,
         Err(e) => return ("failed", format!("{label} could not start: {e:#}"), false),
     };
