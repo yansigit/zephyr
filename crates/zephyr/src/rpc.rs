@@ -198,7 +198,6 @@ impl Child {
     }
 }
 
-/// The text of a wire message: a plain string, or the `text` blocks of a content list.
 /// What one run did that zephyr answers for, read from its events.
 #[derive(Debug, Default)]
 pub struct Tally {
@@ -243,6 +242,7 @@ impl Tally {
     }
 }
 
+/// The text of a wire message: a plain string, or the `text` blocks of a content list.
 pub fn message_text(msg: &Value) -> String {
     match &msg["content"] {
         Value::String(s) => s.clone(),
