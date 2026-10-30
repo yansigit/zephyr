@@ -79,6 +79,12 @@ example to test beside a live install.
   For the same reason rpi skills are off, only the image's extensions load, and a `SYSTEM.md`, `APPEND_SYSTEM.md`, `CLAUDE.md` or
   extra `AGENTS*.md` the agent writes is renamed `*.ignored-by-zephyr` before the next start.
 
+## Limits
+
+`[budget]` in `zephyr.toml`, all optional: `daily_tokens` and `daily_cost_usd` pause the gateway
+for the rest of the UTC day (`/resume` overrides); `run_turns` and `run_minutes` stop one run that
+goes on too long, and you are told why. A job run also stops after 30 minutes.
+
 ## Standing rules
 
 `/rule never push to main` adds a rule the agent sees first in every session, above its memory,

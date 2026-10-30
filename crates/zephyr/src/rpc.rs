@@ -209,6 +209,8 @@ pub struct Tally {
     pub used: (i64, f64),
     /// Bash commands that sent data off the machine (`zephyr_policy::policy::outbound`).
     pub outbound: Vec<String>,
+    /// Model turns taken (`turn_end`), for `budget.run_turns`.
+    pub turns: u32,
 }
 
 impl Tally {
@@ -217,6 +219,9 @@ impl Tally {
         if ev["type"] == "message_end" && m["role"] == "assistant" {
             self.used.0 += m["usage"]["totalTokens"].as_i64().unwrap_or(0);
             self.used.1 += m["usage"]["cost"]["total"].as_f64().unwrap_or(0.0);
+        }
+        if ev["type"] == "turn_end" {
+            self.turns += 1;
         }
         // From rpi, not from anything the agent writes, so the agent cannot hide a send.
         if ev["type"] == "tool_execution_start" && ev["toolName"] == "bash" {

@@ -368,6 +368,38 @@ async fn a_shutdown_mid_run_still_reports_and_charges_the_run() {
 }
 
 #[tokio::test]
+async fn a_run_past_its_turn_cap_is_stopped_and_the_owner_told() {
+    let home = home("run-turns");
+    let mut cfg = config(&home);
+    cfg.budget = Some(toml::from_str("run_turns = 3").unwrap());
+    let gw = start(cfg);
+    gw.say("m1", "owner", "[turns 5] loop").await;
+    assert_eq!(
+        gw.wait_replies(2).await,
+        [
+            "[zephyr] the run ended without a reply",
+            "[zephyr] stopped the run after 3 turns (budget.run_turns)"
+        ]
+    );
+    assert_eq!(log(&home, "abort").len(), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_run_past_its_time_cap_is_stopped() {
+    let home = home("run-minutes");
+    let mut cfg = config(&home);
+    cfg.budget = Some(toml::from_str("run_minutes = 0.01").unwrap()); // 0.6 s
+    let gw = start(cfg);
+    gw.say("m1", "owner", "[hang] forever").await;
+    assert_eq!(
+        gw.wait_replies(2).await[1],
+        "[zephyr] stopped the run after 0.01 minutes (budget.run_minutes)"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn both_channels_feed_one_main_session() {
     let home = home("one-session");
     let gw = start(config(&home));
@@ -599,6 +631,27 @@ async fn a_running_job_does_not_delay_main() {
     wait(|| gw.replies().iter().any(|r| r == "echo: [chat #3] hi")).await;
     assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
     assert_eq!(run_status(&home, "running"), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_job_run_past_its_turn_cap_is_stopped() {
+    let home = home("job-turns");
+    let mut cfg = config(&home);
+    cfg.budget = Some(toml::from_str("run_turns = 2").unwrap());
+    let gw = start(cfg);
+    gw.say(
+        "m1",
+        "owner",
+        &format!("/job add loop | {NEVER} | [turns 5] go"),
+    )
+    .await;
+    gw.say("m2", "owner", "/job run 1").await;
+    assert_eq!(
+        gw.wait_replies(3).await[2],
+        "[zephyr] job #1 (loop) run 1 failed: stopped after 2 turns (budget.run_turns)"
+    );
+    assert_eq!(log(&home, "abort").len(), 1);
     gw.shutdown().await;
 }
 

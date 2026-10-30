@@ -65,18 +65,33 @@ fn job_timeout() -> std::time::Duration {
 pub const BUDGET_NOTICE: &str =
     "[zephyr] daily budget reached: paused until the next UTC day or /resume";
 
-/// `[budget]`: counted per UTC day. Crossing a limit pauses the gateway until the next UTC day or `/resume`.
+/// `[budget]`: the daily limits are counted per UTC day; crossing one pauses the gateway until
+/// the next UTC day or `/resume`. The run limits stop one run (DESIGN §4.4).
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {
     pub daily_tokens: Option<i64>,
     pub daily_cost_usd: Option<f64>,
+    /// Model turns one run may take, main session or job.
+    pub run_turns: Option<u32>,
+    /// Minutes one main-session run may take. Jobs have their own cap (`JOB_TIMEOUT`).
+    pub run_minutes: Option<f64>,
 }
 
 impl Budget {
     pub fn exceeded(&self, tokens: i64, cost: f64) -> bool {
         self.daily_tokens.is_some_and(|t| tokens >= t)
             || self.daily_cost_usd.is_some_and(|c| cost >= c)
+    }
+
+    /// Why a run that has taken `turns` turns in `elapsed` must stop, if it must.
+    pub fn run_over(&self, turns: u32, elapsed: std::time::Duration) -> Option<String> {
+        if let Some(max) = self.run_turns.filter(|max| turns >= *max) {
+            return Some(format!("{max} turns (budget.run_turns)"));
+        }
+        self.run_minutes
+            .filter(|max| elapsed.as_secs_f64() >= max * 60.0)
+            .map(|max| format!("{max} minutes (budget.run_minutes)"))
     }
 }
 
@@ -230,6 +245,22 @@ mod tests {
         assert_eq!(cfg.discord.unwrap().token_env, "ZEPHYR_DISCORD_TOKEN");
         assert_eq!(cfg.imessage.unwrap().lookback_hours, 24);
         assert!(toml::from_str::<Config>("rpi='a'\nhome='b'\ntypo=1").is_err());
+    }
+
+    #[test]
+    fn a_run_is_over_at_either_run_limit() {
+        use std::time::Duration;
+        let b: Budget = toml::from_str("run_turns = 3\nrun_minutes = 1.5").unwrap();
+        assert_eq!(b.run_over(2, Duration::from_secs(89)), None);
+        assert_eq!(
+            b.run_over(3, Duration::ZERO).unwrap(),
+            "3 turns (budget.run_turns)"
+        );
+        assert_eq!(
+            b.run_over(0, Duration::from_secs(90)).unwrap(),
+            "1.5 minutes (budget.run_minutes)"
+        );
+        assert_eq!(Budget::default().run_over(1000, Duration::MAX), None);
     }
 
     #[test]

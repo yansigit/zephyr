@@ -82,6 +82,8 @@ pub async fn run<C: Channel>(
         restart: false,
         account: None,
         tally: Default::default(),
+        run_start: None,
+        cut: None,
     };
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
@@ -138,6 +140,10 @@ struct Router<'a> {
     restart: bool,
     /// Usage and outbound commands since the last settle.
     tally: crate::rpc::Tally,
+    /// When the current run started, for `budget.run_minutes`.
+    run_start: Option<Instant>,
+    /// Why the current run was stopped by a run limit; told to the owner at its settle.
+    cut: Option<String>,
     /// The pooled account the child runs on (DESIGN §4.9). `None` without a pool.
     account: Option<Account>,
 }
@@ -174,11 +180,15 @@ impl<'a> Router<'a> {
                 }
                 ev = next_event(&mut self.child) => match self.tapped(ev) {
                     Some(ev) if ev["type"] == "agent_settled" => self.settled(&ev).await,
-                    Some(_) => continue,
+                    Some(_) => {
+                        self.cap_run().await;
+                        continue;
+                    }
                     None => self.child_exited().await,
                 },
                 _ = tick.tick() => {
                     let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
+                    self.cap_run().await;
                     if self.cfg.path.is_some() && edits(&self.cfg) != self.edits {
                         let text = self.reload().await;
                         eprintln!("zephyr: zephyr.toml or secrets.env changed: {text}");
@@ -287,6 +297,8 @@ impl<'a> Router<'a> {
         eprintln!("zephyr: rpi child exited; respawning in {:?}", self.backoff);
         self.child = None;
         self.busy = false;
+        self.run_start = None;
+        self.cut = None;
         self.schedule_respawn();
     }
 
@@ -348,6 +360,20 @@ impl<'a> Router<'a> {
         }
     }
 
+    /// Stops the run once it passes `budget.run_turns` or `run_minutes` (DESIGN §4.4).
+    async fn cap_run(&mut self) {
+        let (Some(start), None, Some(budget)) = (self.run_start, &self.cut, &self.cfg.budget)
+        else {
+            return;
+        };
+        let Some(why) = budget.run_over(self.tally.turns, start.elapsed()) else {
+            return;
+        };
+        eprintln!("zephyr: stopping the run after {why}");
+        self.cut = Some(why);
+        log(self.call(json!({"type": "abort"})).await.map(drop));
+    }
+
     /// The kill switch (DESIGN §4.4), run outside the queue. Returns the reply text.
     async fn control(&mut self, cmd: &str) -> &'static str {
         match cmd {
@@ -395,6 +421,7 @@ impl<'a> Router<'a> {
                 self.call(json!({"type": "prompt", "message": text}))
                     .await?;
                 self.busy = true;
+                self.run_start = Some(Instant::now());
             }
         }
         Ok(())
@@ -402,6 +429,11 @@ impl<'a> Router<'a> {
 
     async fn settled(&mut self, ev: &Value) {
         self.busy = false;
+        self.run_start = None;
+        let cut = self
+            .cut
+            .take()
+            .map(|why| format!("[zephyr] stopped the run after {why}"));
         // Before reconcile dispatches the next row, so that row runs on the new model.
         self.apply_model().await;
         self.backoff = FIRST_BACKOFF;
@@ -441,7 +473,7 @@ impl<'a> Router<'a> {
             }
         }
         // After the reply, so the owner reads what was sent out next to what it was for.
-        for notice in [tally.alert(), memory].into_iter().flatten() {
+        for notice in [cut, tally.alert(), memory].into_iter().flatten() {
             log(self.store.notify_last_owner(&notice).map_err(Into::into));
         }
         if crossed {
@@ -696,6 +728,7 @@ impl<'a> Router<'a> {
                 self.resumes += 1;
                 self.call(json!({"type": "resume_pending"})).await?;
                 self.busy = true;
+                self.run_start = Some(Instant::now());
                 return Ok(());
             }
             for row in &rows {
