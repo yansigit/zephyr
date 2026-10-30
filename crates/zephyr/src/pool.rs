@@ -144,6 +144,20 @@ pub fn iso(secs: i64) -> String {
     jiff::Timestamp::from_second(secs).map_or(secs.to_string(), |t| t.to_string())
 }
 
+/// `ready`, `cooling` (with its cooldown) or `needs login`.
+pub fn state<'a>(
+    cfg: &Config,
+    cooling: &'a HashMap<String, Cooldown>,
+    a: &Account,
+    now: i64,
+) -> (&'static str, Option<&'a Cooldown>) {
+    match cooling.get(&a.name) {
+        Some(c) if c.until > now => ("cooling", Some(c)),
+        _ if !logged_in(&cfg.account_dir(a), a.provider()) => ("needs login", None),
+        _ => ("ready", None),
+    }
+}
+
 /// One line per account for `zephyr status`: ready, cooling, or needs login, and today's usage.
 pub fn status(cfg: &Config, store: &Store, now: i64) -> anyhow::Result<Vec<String>> {
     let cooling = store.cooldowns()?;
@@ -151,12 +165,9 @@ pub fn status(cfg: &Config, store: &Store, now: i64) -> anyhow::Result<Vec<Strin
     cfg.accounts
         .iter()
         .map(|a| {
-            let state = match cooling.get(&a.name) {
-                Some(c) if c.until > now => {
-                    format!("cooling until {} ({})", iso(c.until), c.reason)
-                }
-                _ if !logged_in(&cfg.account_dir(a), a.provider()) => "needs login".into(),
-                _ => "ready".into(),
+            let state = match state(cfg, &cooling, a, now) {
+                (_, Some(c)) => format!("cooling until {} ({})", iso(c.until), c.reason),
+                (state, None) => state.into(),
             };
             let (tokens, cost) = store.account_spend(&day, &a.name)?;
             Ok(format!(
