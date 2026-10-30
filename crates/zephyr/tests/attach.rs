@@ -389,8 +389,24 @@ async fn zephyr_hello_returns_the_snapshot() {
             "queue": [],
             "failed_replies": 0,
             "run": {"busy": false, "since_unix_ms": null, "origin": null, "current_tool": null, "tools_done": 0},
+            // No auth.json in the account's dir.
+            "accounts": [{"name": "a", "model": "fake/m1", "state": "needs login", "until_unix": null}],
+            "jobs": [],
         })
     );
+
+    // Jobs come by their next run.
+    gw.say("j1", "/job add later | 2999-01-01T00:00:00Z | hi")
+        .await;
+    gw.say("j2", "/job add sooner | 0 8 * * * | hi").await;
+    wait(|| gw.count("outbox", "sent") == 3).await;
+    let snap = c.call("zephyr.hello", json!({})).await["result"].clone();
+    let jobs = snap["jobs"].as_array().unwrap();
+    let names: Vec<_> = jobs.iter().map(|j| j["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["sooner", "later"], "{snap}");
+    assert_eq!(jobs[0]["id"], 2);
+    assert!(jobs[0]["next_unix"].as_i64().unwrap() > zephyr::now());
+    assert_eq!(jobs[1]["next_unix"], 32_472_144_000i64);
 
     // A paused gateway holds new rows in the queue, previewed without the tag.
     gw.say("m2", "/pause").await;
@@ -403,6 +419,37 @@ async fn zephyr_hello_returns_the_snapshot() {
     assert_eq!(queue[0]["channel"], "chat");
     assert_eq!(queue[0]["preview"], format!("{}…", "long ".repeat(12)));
     assert!(queue[0]["since_unix"].as_i64().unwrap() > 0);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn zephyr_models_lists_each_accounts_models() {
+    let pool = "[[account]]\nname = \"a\"\nmodel = \"fake/m1\"\n[[account]]\nname = \"b\"\nmodel = \"other/m3\"\n";
+    let gw = start_with("models", pool);
+    let mut c = Client::connect(gw.port).await;
+    let early = c.call("zephyr.models", json!({})).await;
+    assert_eq!(early["error"]["code"], -32001, "{early}");
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    // fake-rpi lists fake/m1, fake/m2 and other/m3: each account gets its provider's.
+    let got = c.call("zephyr.models", json!({})).await["result"].clone();
+    assert_eq!(
+        got,
+        json!({"accounts": [
+            {"name": "a", "model": "fake/m1", "models": ["fake/m1", "fake/m2"]},
+            {"name": "b", "model": "other/m3", "models": ["other/m3"]},
+        ]})
+    );
+    gw.shutdown().await;
+
+    // Without a pool: one unnamed entry with everything rpi lists.
+    let gw = start("models-solo");
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    let got = c.call("zephyr.models", json!({})).await["result"].clone();
+    assert_eq!(
+        got,
+        json!({"accounts": [{"name": null, "model": null, "models": ["fake/m1", "fake/m2", "other/m3"]}]})
+    );
     gw.shutdown().await;
 }
 

@@ -47,6 +47,8 @@ pub struct View {
     called_at: HashMap<String, i64>,
     expanded: bool,
     hide_thinking: bool,
+    /// The notice just shown, so the same one is not shown twice in a row.
+    last_notice: Option<String>,
 }
 
 impl View {
@@ -63,6 +65,7 @@ impl View {
             called_at: HashMap::new(),
             expanded: false,
             hide_thinking: false,
+            last_notice: None,
         }
     }
 
@@ -75,6 +78,7 @@ impl View {
         self.assistants.clear();
         self.cards.clear();
         self.called_at.clear();
+        self.last_notice = None;
         let users: Vec<usize> = (0..messages.len())
             .filter(|&i| kind(&messages[i]) == "user")
             .collect();
@@ -136,8 +140,13 @@ impl View {
 
     /// A dim one-line notice, e.g. `· reconnected`.
     pub fn notice(&mut self, text: &str) {
+        // `/stop` both aborts the message (`stopped`) and replies `[zephyr] stopped`.
+        if self.last_notice.as_deref() == Some(text) {
+            return;
+        }
         let line = self.p.muted.fg(&format!("{} {text}", glyph("·")));
         self.push(Kind::Note, Arc::new(Line(line)), None);
+        self.last_notice = Some(text.to_string());
     }
 
     pub fn error(&mut self, text: &str) {
@@ -146,8 +155,13 @@ impl View {
         self.push(Kind::Note, Arc::new(Line(line)), None);
     }
 
-    /// A `zephyr_reply`: a reply to the TUI that the agent's stream does not show.
+    /// A `zephyr_reply`: a reply to the TUI that the agent's stream does not show. A one-line
+    /// `[zephyr] …` (`stopped`, `paused`, `now on a/b`) is a notice; anything longer a card.
     pub fn reply(&mut self, command: Option<&str>, text: &str) {
+        let text = text.trim_end();
+        if let Some(line) = text.strip_prefix("[zephyr] ").filter(|t| !t.contains('\n')) {
+            return self.notice(line);
+        }
         let title = command.unwrap_or("zephyr").to_string();
         let card = SystemCard {
             title,
@@ -189,6 +203,7 @@ impl View {
     /// Adds an item with the transcript's one spacing rule: a blank row before each item,
     /// except a tool card right under its assistant text or another card.
     fn push(&mut self, kind: Kind, item: Arc<dyn Component>, mark: Option<String>) {
+        self.last_notice = None;
         let tight = kind == Kind::Card && matches!(self.last, Kind::Text | Kind::Card);
         if self.last != Kind::None && !tight {
             self.root.add_child(Arc::new(Line(String::new())));
@@ -715,6 +730,22 @@ mod tests {
         let got = text(&v, 40);
         assert!(got.starts_with("   ↑ earlier history"), "{got}");
         assert!(!got.contains(" q2\n") && got.contains(" q3\n"), "{got}");
+    }
+
+    #[test]
+    fn one_line_zephyr_replies_are_notices() {
+        let mut v = view();
+        v.reply(Some("/stop"), "[zephyr] stopped");
+        v.notice("stopped");
+        v.reply(Some("/model a/b"), "[zephyr] now on a/b\n");
+        v.reply(
+            Some("/pause"),
+            "[zephyr] paused: messages wait in the inbox until /resume",
+        );
+        assert_eq!(
+            text(&v, 70),
+            "   · stopped\n\n   · now on a/b\n\n   · paused: messages wait in the inbox until /resume"
+        );
     }
 
     #[test]

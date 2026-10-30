@@ -45,7 +45,31 @@ pub struct Snapshot {
     pub queue: Vec<Waiting>,
     pub failed_replies: i64,
     pub run: Run,
+    /// The `[[account]]` pool, in order; empty without one.
+    pub accounts: Vec<AccountState>,
+    /// The soonest scheduled job runs, soonest first.
+    pub jobs: Vec<NextJob>,
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AccountState {
+    pub name: String,
+    pub model: String,
+    /// `ready` | `cooling` | `needs login`
+    pub state: String,
+    /// When a rate-limit cooldown ends.
+    pub until_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NextJob {
+    pub id: i64,
+    pub name: String,
+    pub next_unix: i64,
+}
+
+/// At most this many jobs in `Snapshot.jobs`.
+const NEXT_JOBS: usize = 5;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ChannelState {
@@ -142,6 +166,7 @@ pub async fn run<C: Channel>(
     let (cfg_tx, cfg_rx) = watch::channel(shared.clone());
     let (snap, snap_rx) = watch::channel(Snapshot::default());
     let activity_rx = snap_rx.clone();
+    let attach_cfgs = cfg_rx.clone();
     let mut router = Router {
         cfg: shared,
         cfg_tx,
@@ -171,7 +196,7 @@ pub async fn run<C: Channel>(
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
         r = runs => r.map(|_| Exit::Shutdown),
-        r = crate::attach::serve(cfg, tx, attach_tx, snap_rx) => r.map(|()| Exit::Shutdown),
+        r = crate::attach::serve(cfg, tx, attach_tx, snap_rx, attach_cfgs) => r.map(|()| Exit::Shutdown),
         r = crate::scheduler::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),
         r = show_activity(channels, activity_rx) => r.map(|()| Exit::Shutdown),
         r = router.main(rx, channels, shutdown) => r,
@@ -399,6 +424,7 @@ impl<'a> Router<'a> {
             let day = self.store.today()?;
             let (tokens, cost) = self.store.spend(&day)?;
             let budget = self.cfg.budget.clone().unwrap_or_default();
+            let (now, cooling) = (crate::now(), self.store.cooldowns()?);
             let mut channels: Vec<_> = self
                 .names
                 .iter()
@@ -441,6 +467,33 @@ impl<'a> Router<'a> {
                     .collect(),
                 failed_replies: self.store.outbox_failed()?,
                 run: self.snap.borrow().run.clone(),
+                accounts: (self.cfg.accounts.iter())
+                    .map(|a| {
+                        let (state, c) = crate::pool::state(&self.cfg, &cooling, a, now);
+                        AccountState {
+                            name: a.name.clone(),
+                            model: a.model.clone(),
+                            state: state.into(),
+                            until_unix: c.map(|c| c.until),
+                        }
+                    })
+                    .collect(),
+                jobs: {
+                    let tz = crate::scheduler::zone(&self.cfg)?;
+                    let mut jobs: Vec<NextJob> = (self.store.jobs()?.into_iter())
+                        .filter_map(|j| {
+                            let next_unix = crate::scheduler::next_after(&j.schedule, now, &tz)?;
+                            Some(NextJob {
+                                id: j.id,
+                                name: j.name,
+                                next_unix,
+                            })
+                        })
+                        .collect();
+                    jobs.sort_by_key(|j| j.next_unix);
+                    jobs.truncate(NEXT_JOBS);
+                    jobs
+                },
             })
         })();
         match built {
@@ -1108,6 +1161,39 @@ impl<'a> Router<'a> {
 /// Whether `rpi --list-models`, signed in as `account`, lists `model`. A listing that fails
 /// says nothing, so it counts as yes. The running child lists only its own sign-in's models.
 async fn lists(cfg: &Config, account: Option<&Account>, model: &str) -> bool {
+    listed(cfg, account)
+        .await
+        .is_none_or(|models| models.iter().any(|m| m == model))
+}
+
+/// `zephyr.models`: each pooled account with its model and the models rpi lists on its
+/// provider; without a pool, one unnamed entry with all of them (DESIGN §4.3.1).
+pub async fn models(cfg: &Config) -> Value {
+    let accounts: Vec<Option<&Account>> = match cfg.accounts.is_empty() {
+        true => vec![None],
+        false => cfg.accounts.iter().map(Some).collect(),
+    };
+    let lists = futures_util::future::join_all(accounts.iter().map(|a| listed(cfg, *a))).await;
+    let entries: Vec<Value> = accounts
+        .iter()
+        .zip(lists)
+        .map(|(a, listed)| {
+            let model = a.map(|a| a.model.clone()).or_else(|| cfg.model.clone());
+            let mut models: Vec<String> = (listed.unwrap_or_default().into_iter())
+                .filter(|m| a.is_none_or(|a| m.split('/').next() == Some(a.provider())))
+                .collect();
+            if let Some(m) = model.as_ref().filter(|m| !models.contains(m)) {
+                models.insert(0, m.clone());
+            }
+            json!({"name": a.map(|a| &a.name), "model": model, "models": models})
+        })
+        .collect();
+    json!({"accounts": entries})
+}
+
+/// The `provider/model` ids rpi lists for `account` (rpi's agent dir without a pool), or
+/// `None` when rpi could not say.
+async fn listed(cfg: &Config, account: Option<&Account>) -> Option<Vec<String>> {
     let dir = match account {
         Some(a) => crate::pool::prepare(cfg, a).ok(),
         None => Some(crate::auth_keeper::agent_dir(cfg)),
@@ -1124,19 +1210,16 @@ async fn lists(cfg: &Config, account: Option<&Account>, model: &str) -> bool {
         cmd.env("RPI_CODING_AGENT_DIR", dir);
     }
     let out = tokio::time::timeout(Duration::from_secs(30), cmd.output()).await;
-    let Ok(Ok(out)) = out.map_err(drop) else {
-        return true;
-    };
-    if !out.status.success() {
-        return true;
-    }
-    String::from_utf8_lossy(&out.stdout)
+    let out = out.ok()?.ok().filter(|o| o.status.success())?;
+    let listed = String::from_utf8_lossy(&out.stdout)
         .lines()
         .skip(1)
-        .any(|l| {
+        .filter_map(|l| {
             let mut cols = l.split_whitespace();
-            matches!((cols.next(), cols.next()), (Some(p), Some(m)) if format!("{p}/{m}") == model)
+            Some(format!("{}/{}", cols.next()?, cols.next()?))
         })
+        .collect();
+    Some(listed)
 }
 
 /// The account a child on `cfg` would run on: `Ok(None)` without a pool, `Err(until)` when

@@ -6,7 +6,8 @@
 //! {sessionId}`, then `send {sessionId, command}` per prompt and `stop_session` on exit, and
 //! renders `{"method":"event","params":{"subscriptionId","event":<--mode rpc line>}}`.
 //! Here prompts go through the inbox as channel `tui`, and `stop_session` only detaches.
-//! `zephyr.hello` and `zephyr.subscribe` are Zephyr's own additions (DESIGN §4.3.1).
+//! `zephyr.hello`, `zephyr.subscribe` and `zephyr.models` are Zephyr's own additions
+//! (DESIGN §4.3.1).
 
 use crate::channel::Inbound;
 use crate::config::{Attach, Config};
@@ -61,6 +62,7 @@ pub async fn serve(
     inbound: mpsc::Sender<Inbound>,
     router: mpsc::Sender<AttachRequest>,
     snap: watch::Receiver<Snapshot>,
+    cfgs: watch::Receiver<Arc<Config>>,
 ) -> anyhow::Result<()> {
     let Some(a) = &cfg.attach else {
         return std::future::pending().await;
@@ -76,6 +78,7 @@ pub async fn serve(
                 let conn = Conn {
                     token: token.clone(),
                     snap: snap.clone(),
+                    cfgs: cfgs.clone(),
                     inbound: inbound.clone(),
                     router: router.clone(),
                     authed: false,
@@ -92,6 +95,8 @@ pub async fn serve(
 struct Conn {
     token: Arc<str>,
     snap: watch::Receiver<Snapshot>,
+    /// The live config, for `zephyr.models`.
+    cfgs: watch::Receiver<Arc<Config>>,
     inbound: mpsc::Sender<Inbound>,
     router: mpsc::Sender<AttachRequest>,
     authed: bool,
@@ -182,6 +187,10 @@ impl Conn {
             "zephyr.hello" => {
                 let snap = serde_json::to_value(&*self.snap.borrow()).unwrap_or_default();
                 (vec![ok(id, snap)], false)
+            }
+            "zephyr.models" => {
+                let cfg = self.cfgs.borrow().clone();
+                (vec![ok(id, crate::router::models(&cfg).await)], false)
             }
             "send" => self.send(id, &params["command"]).await,
             _ => (vec![error(id, -32601, "method not found")], false),

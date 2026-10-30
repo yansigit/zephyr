@@ -4,17 +4,20 @@
 
 mod chrome;
 mod conn;
+mod overlays;
 mod theme;
 mod view;
 
 use crate::config::Config;
 use anyhow::Context;
 use chrome::{Link, Region, Retry, State};
-use conn::Msg;
+use conn::{Ask, Msg};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use overlays::{Action, Kind, Overlay};
 use rpi_tui::{
-    Component, Container, Editor, EditorOptions, EditorStyle, Focusable, ProcessTerminal,
-    ScrollView, StackChild, StackEntry, TuiAltScreen, VStack, TUI,
+    Component, Container, Editor, EditorOptions, EditorStyle, Focusable, OverlayAnchor,
+    OverlayMargin, OverlayOptions, ProcessTerminal, ScrollView, StackChild, StackEntry,
+    TuiAltScreen, VStack, TUI,
 };
 use serde_json::Value;
 use std::any::Any;
@@ -52,7 +55,12 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
             draw,
         })
     };
-    let mut view = view::View::new(palette, tz);
+    let panel: Arc<dyn Component> = Arc::new(Panel {
+        state: state.clone(),
+        p: palette,
+        tz: tz.clone(),
+    });
+    let mut view = view::View::new(palette, tz.clone());
     let document = Arc::new(Container::new());
     document.add_child(view.root.clone());
     document.add_child(Arc::new(rpi_tui::Spacer::new(1)));
@@ -81,6 +89,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
         ),
         StackChild::Entry(StackEntry::new(region(chrome::run_line))),
         StackChild::Entry(StackEntry::new(region(chrome::queue_strip))),
+        StackChild::Entry(StackEntry::new(region(overlays::completions))),
         StackChild::Entry(StackEntry::new(input).shrink(0).min_size(3)),
         StackChild::Entry(StackEntry::new(region(chrome::footer))),
     ]);
@@ -129,6 +138,8 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ctrl_c_at = 0;
     let mut was_up = false;
+    // The composer text whose autocomplete Esc dismissed.
+    let mut dismissed: Option<String> = None;
     let outcome: anyhow::Result<()> = loop {
         tokio::select! {
             msg = msgs.recv() => {
@@ -146,10 +157,16 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         }
                         was_up = true;
                         for text in s.unsent.drain(..) {
-                            let _ = prompt_tx.send(text);
+                            let _ = prompt_tx.send(Ask::Prompt(text));
                         }
                     }
                     Msg::Event(ev) => event(&mut s, &mut view, &ev),
+                    Msg::Models(list) => {
+                        if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Model) {
+                            o.models = Some(list);
+                            o.placed = false;
+                        }
+                    }
                     Msg::Down(why) if was_up => s.link = Link::Down { why },
                     Msg::Down(why) => s.link = Link::Connecting(Some(why)),
                     Msg::Fatal(e) => break Err(anyhow::anyhow!(e)),
@@ -168,13 +185,83 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                             _ => {}
                         }
                     }
-                    Event::Paste(text) => editor.handle_paste(&text),
+                    Event::Paste(text) if state.lock().unwrap().overlay.is_none() => {
+                        editor.handle_paste(&text)
+                    }
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         let now = crate::unix_millis() as i64;
-                        let busy = state.lock().unwrap().snapshot.run.busy;
-                        let empty = editor.get_text().is_empty();
+                        let (busy, panel_open, completing) = {
+                            let s = state.lock().unwrap();
+                            (s.snapshot.run.busy, s.overlay.is_some(), s.complete.is_some())
+                        };
+                        let text = editor.get_text();
+                        let empty = text.is_empty();
+                        let plain = key.modifiers.is_empty();
+                        let mut s = state.lock().unwrap();
                         match key {
                             k if ctrl(&k, 'd') && empty => break Ok(()),
+                            k if panel_open => {
+                                let snap = s.snapshot.clone();
+                                let o = s.overlay.as_mut().expect("open");
+                                let kind = o.kind;
+                                let action = if ctrl(&k, 'c') {
+                                    Action::Close
+                                } else {
+                                    let rows = overlays::rows(o, &snap, &palette, &tz, now);
+                                    overlays::key(o, k, &rows)
+                                };
+                                match action {
+                                    Action::None => {}
+                                    Action::Close => close(&tui, &editor, &mut s),
+                                    Action::Pick(cmd) => {
+                                        close(&tui, &editor, &mut s);
+                                        match kind {
+                                            Kind::Model => send(&mut s, &prompt_tx, cmd),
+                                            _ => editor.set_text(&cmd),
+                                        }
+                                    }
+                                }
+                            }
+                            KeyEvent {
+                                code: KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Enter | KeyCode::Esc,
+                                ..
+                            } if completing && plain => {
+                                let c = s.complete.as_mut().expect("completing");
+                                let n = c.items.len();
+                                let insert = overlays::insert(overlays::COMMANDS[c.items[c.selected]].1);
+                                // Still typing the command name, not its arguments.
+                                let partial = insert.starts_with(&text) && insert != text;
+                                match key.code {
+                                    KeyCode::Up => c.selected = (c.selected + n - 1) % n,
+                                    KeyCode::Down => c.selected = (c.selected + 1) % n,
+                                    KeyCode::Esc => {
+                                        s.complete = None;
+                                        dismissed = Some(text.clone());
+                                    }
+                                    KeyCode::Tab if partial => editor.set_text(insert),
+                                    KeyCode::Tab => {}
+                                    // Enter takes the choice, and runs it when it needs no argument.
+                                    _ if partial && insert.ends_with(' ') => editor.set_text(insert),
+                                    _ => {
+                                        if partial {
+                                            editor.set_text(insert);
+                                        }
+                                        drop(s);
+                                        editor.handle_key(key);
+                                    }
+                                }
+                            }
+                            k if ctrl(&k, 'l') => {
+                                open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Model)
+                            }
+                            k if ctrl(&k, 's') => {
+                                open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Status)
+                            }
+                            KeyEvent { code: KeyCode::Char('?'), modifiers, .. }
+                                if empty && !modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Help)
+                            }
                             k if ctrl(&k, 'c') => {
                                 if !empty {
                                     editor.clear();
@@ -182,7 +269,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                     break Ok(());
                                 } else {
                                     let hint = "press ^C again to detach".to_string();
-                                    state.lock().unwrap().hint = Some((hint, now + DOUBLE_PRESS_MS));
+                                    s.hint = Some((hint, now + DOUBLE_PRESS_MS));
                                 }
                                 ctrl_c_at = now;
                             }
@@ -193,10 +280,9 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                 view.toggle_thinking();
                             }
                             KeyEvent { code: KeyCode::Esc, .. } if busy => {
-                                let mut s = state.lock().unwrap();
                                 if !s.stopping && s.link == Link::Up {
                                     s.stopping = true;
-                                    let _ = prompt_tx.send("/stop".into());
+                                    let _ = prompt_tx.send(Ask::Prompt("/stop".into()));
                                 }
                             }
                             KeyEvent { code: KeyCode::PageUp, modifiers: KeyModifiers::NONE, .. } => {
@@ -206,24 +292,26 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                 tui.scroll_by(page())
                             }
                             k => {
+                                drop(s);
                                 editor.handle_key(k);
                             }
                         }
                     }
                     _ => {}
                 }
+                complete(&mut state.lock().unwrap(), &editor.get_text(), &mut dismissed);
                 tui.request_render(false);
             }
             text = submits.recv() => {
                 let Some(text) = text else { break Ok(()) };
-                let text = text.trim().to_string();
-                if !text.is_empty() {
-                    let mut s = state.lock().unwrap();
-                    if s.link == Link::Up {
-                        let _ = prompt_tx.send(text);
-                    } else {
-                        s.unsent.push(text);
-                    }
+                let mut s = state.lock().unwrap();
+                // These open a panel here instead of a reply card.
+                match text.trim() {
+                    "" => {}
+                    "/help" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Help),
+                    "/status" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Status),
+                    "/model" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Model),
+                    text => send(&mut s, &prompt_tx, text.to_string()),
                 }
                 tui.request_render(false);
             }
@@ -282,6 +370,68 @@ fn event(s: &mut State, view: &mut view::View, ev: &Value) {
     }
 }
 
+/// Sends a prompt now, or keeps it for the next connection.
+fn send(s: &mut State, asks: &mpsc::UnboundedSender<Ask>, text: String) {
+    if s.link == Link::Up {
+        let _ = asks.send(Ask::Prompt(text));
+    } else {
+        s.unsent.push(text);
+    }
+}
+
+/// Opens a panel over the bottom of the screen, between the header and the footer.
+fn open(
+    tui: &TuiAltScreen,
+    panel: &Arc<dyn Component>,
+    editor: &Editor,
+    s: &mut State,
+    asks: &mpsc::UnboundedSender<Ask>,
+    kind: Kind,
+) {
+    close(tui, editor, s);
+    // An unfocused editor draws no cursor marker under the panel (the panel has its own),
+    // which would shift the composited row.
+    editor.set_focused(false);
+    s.overlay = Some(Overlay::new(kind));
+    s.complete = None;
+    if kind == Kind::Model {
+        let _ = asks.send(Ask::Models);
+    }
+    let margin = OverlayMargin {
+        top: 2,
+        right: 1,
+        bottom: 1,
+        left: 1,
+    };
+    let options = OverlayOptions {
+        anchor: OverlayAnchor::BottomLeft,
+        margin: Some(margin),
+        ..Default::default()
+    };
+    tui.show_overlay(panel.clone(), Some(options));
+}
+
+fn close(tui: &TuiAltScreen, editor: &Editor, s: &mut State) {
+    if s.overlay.take().is_some() {
+        tui.hide_overlay();
+    }
+    editor.set_focused(true);
+}
+
+/// Keeps slash autocomplete in step with the composer's text.
+fn complete(s: &mut State, text: &str, dismissed: &mut Option<String>) {
+    if s.overlay.is_some() || dismissed.as_deref() == Some(text) {
+        s.complete = None;
+        return;
+    }
+    *dismissed = None;
+    let items = overlays::matches(text);
+    let selected = (s.complete.as_ref())
+        .filter(|c| c.items == items)
+        .map_or(0, |c| c.selected);
+    s.complete = (!items.is_empty()).then_some(overlays::Complete { items, selected });
+}
+
 fn ctrl(key: &KeyEvent, ch: char) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(ch)
 }
@@ -292,7 +442,34 @@ fn page() -> i32 {
     (rows as i32 / 2).max(1)
 }
 
-/// The editor in a rounded box: upstream's editor draws only top and bottom rules.
+/// The open panel, drawn from the shared state as an overlay.
+struct Panel {
+    state: Arc<Mutex<State>>,
+    p: theme::Palette,
+    tz: jiff::tz::TimeZone,
+}
+
+impl Component for Panel {
+    fn render(&self, width: usize) -> Vec<String> {
+        let rows = crossterm::terminal::size().map_or(24, |(_, h)| h as usize);
+        let now = crate::unix_millis() as i64;
+        let mut s = self.state.lock().unwrap();
+        let snap = s.snapshot.clone();
+        let Some(o) = s.overlay.as_mut() else {
+            return vec![];
+        };
+        let list = overlays::rows(o, &snap, &self.p, &self.tz, now);
+        // Below the header's two rows, above the footer.
+        overlays::render(o, &list, &self.p, width, rows.saturating_sub(3))
+    }
+    fn invalidate(&self) {}
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// The editor in a rounded box, inside the same one-column gutter as everything else:
+/// upstream's editor draws only top and bottom rules.
 struct InputBox {
     editor: Arc<Editor>,
     border: rpi_tui::theme::Color,
@@ -300,6 +477,7 @@ struct InputBox {
 
 impl Component for InputBox {
     fn render(&self, width: usize) -> Vec<String> {
+        let width = width.saturating_sub(2);
         let inner = width.saturating_sub(4).max(1);
         let rows = self.editor.render(inner);
         let rows = &rows[1..rows.len().saturating_sub(1).max(1)];
@@ -311,13 +489,13 @@ impl Component for InputBox {
         };
         let h = theme::glyph("─").repeat(width.saturating_sub(2));
         let b = |s: &str| self.border.fg(s);
-        let mut lines = vec![b(&format!("{tl}{h}{tr}"))];
+        let mut lines = vec![format!(" {}", b(&format!("{tl}{h}{tr}")))];
         for row in rows {
             let shown = rpi_tui::visible_width(&row.replace(rpi_tui::CURSOR_MARKER, ""));
             let pad = inner.saturating_sub(shown);
-            lines.push(format!("{} {row}{} {}", b(v), " ".repeat(pad), b(v)));
+            lines.push(format!(" {} {row}{} {}", b(v), " ".repeat(pad), b(v)));
         }
-        lines.push(b(&format!("{bl}{h}{br}")));
+        lines.push(format!(" {}", b(&format!("{bl}{h}{br}"))));
         lines
     }
     fn invalidate(&self) {}

@@ -18,7 +18,7 @@
 
  ~ running bash for imessage - 12s - 1 tool                         esc to stop
  queued (1) - discord: "are you around later?"
-+------------------------------------------------------------------------------+
-| Message zephyr                                                               |
-+------------------------------------------------------------------------------+
-  esc stop - enter queue - ^O tools - ^D detach    today 41.2k tok - $0.38 / $5
+ +----------------------------------------------------------------------------+
+ | Message zephyr                                                             |
+ +----------------------------------------------------------------------------+
+  esc stop - enter queue - ^L model - ^D detach    today 41.2k tok - $0.38 / $5

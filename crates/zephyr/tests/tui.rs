@@ -63,7 +63,7 @@ fn snapshot(scene: &str) -> Value {
     let now = zephyr::unix_millis() as i64;
     let (busy, paused, cost, failed) = match scene {
         "paused" => (false, json!("user"), 4.2, 1),
-        "down" => (false, Value::Null, 0.38, 0),
+        "down" | "idle" => (false, Value::Null, 0.38, 0),
         _ => (true, Value::Null, 0.38, 0),
     };
     let run = if busy {
@@ -81,14 +81,34 @@ fn snapshot(scene: &str) -> Value {
         "queue": if busy { json!([{"channel": "discord", "preview": "are you around later?", "since_unix": now / 1000 - 30}]) } else { json!([]) },
         "failed_replies": failed,
         "run": run,
+        // Fixed times far ahead, so the panel reads the same on any day.
+        "accounts": [
+            {"name": "claude-code-1", "model": "claude-code/claude-opus-5-5", "state": "ready", "until_unix": null},
+            {"name": "codex-2", "model": "openai/gpt-6-astra", "state": "cooling", "until_unix": COOL_UNTIL},
+        ],
+        "jobs": [
+            {"id": 3, "name": "renew domain", "next_unix": COOL_UNTIL + 3_600},
+            {"id": 1, "name": "daily-brief", "next_unix": COOL_UNTIL + 86_400},
+        ],
     })
+}
+
+/// 2030-03-01 09:00 UTC.
+const COOL_UNTIL: i64 = 1_898_586_000;
+
+fn models() -> Value {
+    json!({"accounts": [
+        {"name": "claude-code-1", "model": "claude-code/claude-opus-5-5",
+         "models": ["claude-code/claude-opus-5-5", "claude-code/claude-sonnet-5", "claude-code/claude-haiku-4-5"]},
+        {"name": "codex-2", "model": "openai/gpt-6-astra", "models": ["openai/gpt-6-astra", "openai/gpt-6-mini"]},
+    ]})
 }
 
 /// The live events after `ready` and the first status.
 fn live(scene: &str) -> Vec<Value> {
     let mut events = vec![json!({"type": "zephyr_reply", "command": "/status",
         "text": "agent: claude-code-1 on claude-code/claude-opus-5-5\nchannels: discord connected, imessage connected\ntoday: 41.2k tokens, $0.38 of $5"})];
-    if scene == "paused" || scene == "down" {
+    if matches!(scene, "paused" | "down" | "idle") {
         return events;
     }
     events.extend([
@@ -141,6 +161,7 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
                     "zephyr.subscribe" => {
                         json!({"subscriptionId": 1, "sessionId": "main", "status": "subscribed", "messages": history()})
                     }
+                    "zephyr.models" => models(),
                     "send" => {
                         let text = req["params"]["command"]["content"]
                             .as_str()
@@ -152,6 +173,20 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
                 };
                 let ok = json!({"jsonrpc": "2.0", "id": id, "result": result});
                 write.write_all(frame(ok).as_bytes()).await.unwrap();
+                // What the router answers to the commands the tests send.
+                let text = req["params"]["command"]["content"]
+                    .as_str()
+                    .unwrap_or_default();
+                let reply = match text {
+                    "/stop" => Some("[zephyr] stopped".to_string()),
+                    t if t.starts_with("/model ") => Some(format!("[zephyr] now on {}", &t[7..])),
+                    _ => None,
+                };
+                if let Some(reply) = reply {
+                    let ev = json!({"type": "zephyr_reply", "command": text, "text": reply});
+                    let ev = json!({"jsonrpc": "2.0", "method": "event", "params": {"subscriptionId": 1, "event": ev}});
+                    write.write_all(frame(ev).as_bytes()).await.unwrap();
+                }
                 if req["method"] == "zephyr.subscribe" {
                     let mut events = vec![
                         json!({"type": "ready"}),
@@ -380,13 +415,14 @@ fn tmux_missing() -> bool {
     missing
 }
 
-/// Starts `zephyr tui` for `scene` and returns the plain and escaped screens once `ready` shows.
+/// Starts `zephyr tui` for `scene`, presses `keys` once `ready` shows, and returns the plain
+/// and escaped screens once `shown` shows.
 async fn shoot(
     scene: &'static str,
     cols: u16,
     rows: u16,
     theme: &str,
-    ready: &str,
+    (ready, keys, shown): (&str, &[&str], &str),
 ) -> (String, String) {
     let screen = Screen::start(scene, cols, rows, theme).await;
     screen.wait_for(ready).await;
@@ -394,6 +430,8 @@ async fn shoot(
         // A draft typed while away stays in the box.
         screen.keys(&["=half-typed draft"]);
     }
+    screen.keys(keys);
+    screen.wait_for(shown).await;
     // One more frame for anything that arrived with the marker.
     tokio::time::sleep(Duration::from_millis(400)).await;
     (screen.tmux.capture(false), screen.tmux.capture(true))
@@ -411,6 +449,9 @@ async fn keys_send_stop_expand_warn_and_detach() {
     screen.keys(&["Escape"]);
     assert_eq!(screen.next_sent().await, "/stop");
     screen.wait_for("stopping…").await;
+    // The router's `[zephyr] stopped` is a notice, not a card.
+    let stopped = screen.wait_for("· stopped").await;
+    assert!(!stopped.contains("─ /stop"), "{stopped}");
     screen.keys(&["C-o"]);
     let expanded = screen.wait_for("▾ bash").await;
     assert!(expanded.contains("▾ read"), "{expanded}");
@@ -425,6 +466,43 @@ async fn keys_send_stop_expand_warn_and_detach() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn panels_pick_a_model_list_commands_and_close() {
+    if tmux_missing() {
+        return;
+    }
+    let mut screen = Screen::start("idle", 80, 24, "dark").await;
+    screen.wait_for("^L model").await;
+    // ^L: the picker starts on the current model; typing filters; Enter sends the pick.
+    screen.keys(&["C-l"]);
+    let picker = screen.wait_for("claude-sonnet-5").await;
+    assert!(picker.contains("› ● claude-opus-5-5"), "{picker}");
+    assert!(picker.contains("esc close"), "{picker}");
+    screen.keys(&["=mini", "Enter"]);
+    assert_eq!(screen.next_sent().await, "/model openai/gpt-6-mini");
+    let after = screen.wait_for("· now on openai/gpt-6-mini").await;
+    assert!(!after.contains("╭─ model"), "{after}");
+    // `?` on an empty composer: help, grouped; Esc closes it.
+    screen.keys(&["?"]);
+    let help = screen.wait_for("╭─ commands").await;
+    assert!(help.contains("Chat") && help.contains("/new"), "{help}");
+    screen.keys(&["Escape"]);
+    // Slash autocomplete: `/sta` then Enter runs /status, which opens the panel here.
+    screen.keys(&["=/sta"]);
+    let menu = screen.wait_for("agent, accounts, channels").await;
+    assert!(menu.contains("tab complete"), "{menu}");
+    screen.keys(&["Enter"]);
+    let status = screen.wait_for("╭─ status").await;
+    assert!(status.contains("cooling until 1 Mar 09:00"), "{status}");
+    assert!(status.contains("renew domain"), "{status}");
+    screen.keys(&["Escape"]);
+    // ^S opens it too; ^C closes like Esc; then a plain message still goes out.
+    screen.keys(&["C-s"]);
+    screen.wait_for("╭─ status").await;
+    screen.keys(&["C-c", "=hi", "Enter"]);
+    assert_eq!(screen.next_sent().await, "hi");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn screens_match_the_goldens() {
     if tmux_missing() {
         return;
@@ -432,21 +510,75 @@ async fn screens_match_the_goldens() {
     let update = std::env::var_os("ZEPHYR_UPDATE_SCREENS").is_some();
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/screens");
     std::fs::create_dir_all(&dir).unwrap();
-    let shots: [(&'static str, u16, u16, &str, &str); 10] = [
-        ("busy", 80, 24, "dark", "esc to stop"),
-        ("busy", 80, 24, "light", "esc to stop"),
-        ("busy", 140, 40, "dark", "esc to stop"),
-        ("busy", 140, 40, "light", "esc to stop"),
-        ("retry", 80, 24, "dark", "retry 2/10"),
-        ("paused", 80, 24, "dark", "paused:"),
-        ("down", 80, 24, "dark", "reconnecting"),
-        ("connecting", 80, 24, "light", "not answering"),
-        ("busy", 80, 24, "ascii", "esc to stop"),
-        ("busy", 80, 24, "nocolor", "esc to stop"),
+    let busy = ("esc to stop", &[][..], "esc to stop");
+    let model = ("^L model", &["C-l"][..], "claude-sonnet-5");
+    let status = ("^L model", &["C-s"][..], "╭─ status");
+    let help = ("^L model", &["?"][..], "╭─ commands");
+    let complete = ("^L model", &["=/"][..], "tab complete");
+    // (golden name, scene, size, theme, (ready, keys, shown))
+    #[allow(clippy::type_complexity)]
+    let shots: [(&str, &'static str, u16, u16, &str, (&str, &[&str], &str)); 22] = [
+        ("busy", "busy", 80, 24, "dark", busy),
+        ("busy", "busy", 80, 24, "light", busy),
+        ("busy", "busy", 140, 40, "dark", busy),
+        ("busy", "busy", 140, 40, "light", busy),
+        (
+            "retry",
+            "retry",
+            80,
+            24,
+            "dark",
+            ("retry 2/10", &[], "retry 2/10"),
+        ),
+        (
+            "paused",
+            "paused",
+            80,
+            24,
+            "dark",
+            ("paused:", &[], "paused:"),
+        ),
+        (
+            "down",
+            "down",
+            80,
+            24,
+            "dark",
+            ("reconnecting", &[], "draft"),
+        ),
+        (
+            "connecting",
+            "connecting",
+            80,
+            24,
+            "light",
+            ("not answering", &[], "not answering"),
+        ),
+        ("busy", "busy", 80, 24, "ascii", busy),
+        ("busy", "busy", 80, 24, "nocolor", busy),
+        ("model", "idle", 80, 24, "dark", model),
+        ("model", "idle", 80, 24, "light", model),
+        ("model", "idle", 140, 40, "dark", model),
+        ("status", "idle", 80, 24, "dark", status),
+        ("status", "idle", 80, 24, "light", status),
+        ("status", "idle", 140, 40, "dark", status),
+        ("help", "idle", 80, 24, "dark", help),
+        ("help", "idle", 80, 24, "light", help),
+        ("help", "idle", 140, 40, "dark", help),
+        ("complete", "idle", 80, 24, "dark", complete),
+        (
+            "model",
+            "idle",
+            80,
+            24,
+            "ascii",
+            ("^L model", &["C-l"], "claude-sonnet-5"),
+        ),
+        ("status", "idle", 80, 24, "nocolor", status),
     ];
     let mut failures = vec![];
-    for (scene, cols, rows, theme, ready) in shots {
-        let (plain, escaped) = shoot(scene, cols, rows, theme, ready).await;
+    for (name, scene, cols, rows, theme, steps) in shots {
+        let (plain, escaped) = shoot(scene, cols, rows, theme, steps).await;
         // The palette follows COLORFGBG: the accent's exact RGB is in the escapes.
         match theme {
             "light" => assert!(
@@ -462,7 +594,7 @@ async fn screens_match_the_goldens() {
         if theme == "ascii" {
             assert!(plain.is_ascii(), "non-ASCII under LANG=C:\n{plain}");
         }
-        let name = format!("{scene}-{cols}x{rows}-{theme}");
+        let name = format!("{name}-{cols}x{rows}-{theme}");
         let golden = dir.join(format!("{name}.txt"));
         if update {
             std::fs::write(&golden, &plain).unwrap();
