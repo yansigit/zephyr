@@ -33,6 +33,7 @@ pub fn untag(text: &str) -> Option<(&str, i64, &str)> {
 
 /// What attached clients see of the daemon: `zephyr.hello` and `zephyr_status` (DESIGN §4.3.1).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Snapshot {
     pub version: String,
     pub session: String,
@@ -52,6 +53,7 @@ pub struct Snapshot {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AccountState {
     pub name: String,
     pub model: String,
@@ -62,6 +64,7 @@ pub struct AccountState {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NextJob {
     pub id: i64,
     pub name: String,
@@ -72,6 +75,7 @@ pub struct NextJob {
 const NEXT_JOBS: usize = 5;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ChannelState {
     pub name: String,
     /// `connected` | `off` | `reconnecting`
@@ -79,6 +83,7 @@ pub struct ChannelState {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Spend {
     pub tokens: i64,
     pub cost: f64,
@@ -88,6 +93,7 @@ pub struct Spend {
 
 /// An inbox row waiting to be dispatched.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Waiting {
     pub channel: String,
     pub preview: String,
@@ -96,6 +102,7 @@ pub struct Waiting {
 
 /// The `main` run, from the child's events.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Run {
     pub busy: bool,
     pub since_unix_ms: Option<i64>,
@@ -106,6 +113,7 @@ pub struct Run {
 
 /// The user message a run is serving: its inbox row.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Origin {
     pub channel: String,
     pub id: i64,

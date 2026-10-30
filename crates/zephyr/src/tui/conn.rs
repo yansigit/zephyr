@@ -13,42 +13,9 @@ use tokio::sync::mpsc;
 const MIN_DELAY: Duration = Duration::from_millis(500);
 const MAX_DELAY: Duration = Duration::from_secs(5);
 
-/// `zephyr.hello`'s result and every `zephyr_status` event.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(default)]
-pub struct Snapshot {
-    pub version: String,
-    pub session: String,
-    pub account: Option<String>,
-    pub model: Option<String>,
-    pub thinking: Option<String>,
-    pub paused: Option<String>,
-    pub channels: Vec<ChannelState>,
-    pub spend: Spend,
-    pub queue: Vec<Queued>,
-    pub failed_replies: i64,
-    pub run: Run,
-    pub accounts: Vec<AccountState>,
-    pub jobs: Vec<NextJob>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(default)]
-pub struct AccountState {
-    pub name: String,
-    pub model: String,
-    /// `ready`, `cooling` or `needs login`.
-    pub state: String,
-    pub until_unix: Option<i64>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(default)]
-pub struct NextJob {
-    pub id: i64,
-    pub name: String,
-    pub next_unix: i64,
-}
+/// `zephyr.hello`'s result and every `zephyr_status` event: the daemon's own types, since the
+/// TUI always runs from the daemon's binary.
+pub use crate::router::{AccountState, Snapshot};
 
 /// One entry of `zephyr.models`: an account (unnamed without a pool) and what it can run.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -66,47 +33,6 @@ pub enum Ask {
     Prompt(String),
     /// `zephyr.models`, answered with [`Msg::Models`].
     Models,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(default)]
-pub struct ChannelState {
-    pub name: String,
-    /// `connected`, `off` or `reconnecting`.
-    pub state: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(default)]
-pub struct Spend {
-    pub tokens: i64,
-    pub cost: f64,
-    pub daily_tokens_limit: Option<i64>,
-    pub daily_cost_limit: Option<f64>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(default)]
-pub struct Queued {
-    pub channel: String,
-    pub preview: String,
-    pub since_unix: i64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(default)]
-pub struct Run {
-    pub busy: bool,
-    pub since_unix_ms: Option<i64>,
-    pub origin: Option<Origin>,
-    pub current_tool: Option<String>,
-    pub tools_done: u64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(default)]
-pub struct Origin {
-    pub channel: String,
 }
 
 /// What the client tells the UI.

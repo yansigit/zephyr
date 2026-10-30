@@ -652,9 +652,9 @@ pub fn completions(s: &State, p: &Palette, width: usize, _now: i64) -> Vec<Strin
 
 #[cfg(test)]
 mod tests {
-    use super::super::conn::{AccountState, NextJob};
     use super::super::theme::DARK;
     use super::*;
+    use crate::router::{AccountState, NextJob};
     use crossterm::event::KeyEvent;
 
     /// 2026-10-30 14:02 UTC, in milliseconds.

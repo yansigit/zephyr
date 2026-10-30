@@ -455,9 +455,9 @@ pub fn short_model(id: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::super::conn::{ChannelState, Origin, Queued, Run, Spend};
     use super::super::theme::DARK;
     use super::*;
+    use crate::router::{ChannelState, Origin, Run, Spend, Waiting};
 
     const NOW: i64 = 1_793_368_920_000;
 
@@ -559,6 +559,7 @@ mod tests {
             since_unix_ms: Some(NOW - 12_400),
             origin: Some(Origin {
                 channel: "discord".into(),
+                ..Default::default()
             }),
             current_tool: Some("bash".into()),
             tools_done: 2,
@@ -573,6 +574,7 @@ mod tests {
         s.snapshot.run.current_tool = None;
         s.snapshot.run.origin = Some(Origin {
             channel: "tui".into(),
+            ..Default::default()
         });
         s.snapshot.run.since_unix_ms = Some(NOW - 64_000);
         assert!(
@@ -599,7 +601,7 @@ mod tests {
     fn queue_strip_shows_two_rows_then_a_count() {
         let mut s = up();
         assert!(queue_strip(&s, &DARK, 80, NOW).is_empty());
-        let q = |channel: &str, preview: &str| Queued {
+        let q = |channel: &str, preview: &str| Waiting {
             channel: channel.into(),
             preview: preview.into(),
             since_unix: 0,
