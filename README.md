@@ -76,7 +76,7 @@ example to test beside a live install.
   reaches the agent's context only after `/memory ok` (if it changed after you were sent the diff,
   you are shown the new one first); `/memory undo` drops it, `/memory diff` shows
   it again, `/memory log` lists commits. A web page cannot plant a lasting "preference" without you.
-  For the same reason rpi skills are off, and a `SYSTEM.md`, `APPEND_SYSTEM.md`, `CLAUDE.md` or
+  For the same reason rpi skills are off, only the image's extensions load, and a `SYSTEM.md`, `APPEND_SYSTEM.md`, `CLAUDE.md` or
   extra `AGENTS*.md` the agent writes is renamed `*.ignored-by-zephyr` before the next start.
 
 ## Standing rules

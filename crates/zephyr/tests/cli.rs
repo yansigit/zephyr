@@ -197,7 +197,7 @@ token_file = "{}"
 
 #[test]
 fn doctor_warns_when_agent_dir_has_extensions() {
-    let warning = "providers come from the image; packages installed into agent_dir load twice";
+    let warning = "rpi children ignore it (--local-only); providers come from the image";
     let (_, cfg) = setup("doctor-ext", "");
     let agent = cfg.parent().unwrap().join("agent");
     let run = || stdout(&zephyr(&cfg, &["doctor"]));

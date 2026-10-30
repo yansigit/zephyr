@@ -73,8 +73,9 @@ impl Child {
         let mut cmd = Command::new(&cfg.rpi);
         crate::agent::cmd(cmd.as_std_mut());
         // AGENTS.md is the agent's only standing instruction (memory::prepare): no skills it
-        // could plant, and a trust.json it wrote can't switch AGENTS.md off.
-        cmd.args(["--mode", "rpc", "--approve", "--no-skills"])
+        // could plant, and a trust.json it wrote can't switch AGENTS.md off. `--local-only`
+        // loads only the `--extension` files below, none from a dir or setting the agent can write.
+        cmd.args(["--mode", "rpc", "--approve", "--no-skills", "--local-only"])
             .args(["--session-id", session_id, "--session-dir"])
             .arg(cfg.session_dir())
             // rpi files sessions under a per-cwd folder, so the cwd must never change.
@@ -286,7 +287,7 @@ mod tests {
         let argv: Vec<String> =
             serde_json::from_str(&std::fs::read_to_string(home.join("argv.json")).unwrap())
                 .unwrap();
-        for flag in ["--approve", "--no-skills"] {
+        for flag in ["--approve", "--no-skills", "--local-only"] {
             assert!(argv.contains(&flag.to_string()), "{flag} in {argv:?}");
         }
         let at = argv.iter().position(|x| x == "--extension").unwrap();
