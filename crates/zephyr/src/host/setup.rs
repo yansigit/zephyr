@@ -515,6 +515,9 @@ fn channel_add(h: &Host, kind: &str) -> anyhow::Result<()> {
 }
 
 const TOKEN_PREFIX: &[u8] = b"sk-ant-oat01-";
+/// The screen may redraw the next line by moving the cursor, so the length is what ends a token.
+/// shortcut: every token seen so far is 108 bytes; a new format shows as a failed test call.
+const TOKEN_LEN: usize = 108;
 
 /// Replaces each character of a Claude token in terminal output with `*` and keeps the token.
 /// The terminal may wrap it, so escapes and single line breaks inside it pass through; a blank
@@ -560,6 +563,7 @@ impl TokenMask {
                         self.breaks = 0;
                         if let Some(t) = &mut self.token {
                             t.push(c);
+                            self.masking = t.len() < TOKEN_LEN;
                         }
                         b'*'
                     }
@@ -637,6 +641,14 @@ mod tests {
             shown.starts_with("x s") && shown.ends_with(" Store"),
             "{shown}"
         );
+    }
+
+    #[test]
+    fn a_full_length_token_ends_where_the_screen_moves_on() {
+        let token = format!("sk-ant-oat01-{}AA", "x".repeat(super::TOKEN_LEN - 15));
+        let (shown, kept) = run(&[&format!("{token}\x1b[2B\x1b[2GStore\x1b[8Gthis")]);
+        assert_eq!(kept, Some(token));
+        assert!(shown.ends_with("\x1b[2B\x1b[2GStore\x1b[8Gthis"), "{shown}");
     }
 
     #[test]
