@@ -18,6 +18,10 @@ use tokio::time::Instant;
 const MAX_RESUMES: u32 = 3;
 const FIRST_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// A channel send that takes longer fails, and that channel is skipped for `STUCK_PAUSE`, so
+/// one stuck channel can't hold up the router or the other channels.
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+const STUCK_PAUSE: Duration = Duration::from_secs(30);
 
 /// The prompt text for a row. The `#id` tag is what recovery looks for in `get_messages`.
 pub fn tagged(row: &InboxRow) -> String {
@@ -190,6 +194,7 @@ pub async fn run<C: Channel>(
         backoff: FIRST_BACKOFF,
         respawn_at: Instant::now(),
         unrouted: HashSet::new(),
+        stuck: HashMap::new(),
         tap: broadcast::channel(1024).0,
         attaches,
         jobs: &jobs,
@@ -304,6 +309,8 @@ struct Router<'a> {
     respawn_at: Instant,
     /// Outbox channels with no configured adapter, so each is logged once.
     unrouted: HashSet<String>,
+    /// Channels whose last send timed out, and when to try them again.
+    stuck: HashMap<String, Instant>,
     /// Every child event, for attached clients.
     tap: broadcast::Sender<Value>,
     attaches: mpsc::Receiver<crate::attach::AttachRequest>,
@@ -518,7 +525,7 @@ impl<'a> Router<'a> {
                     "zephyr: every account is rate-limited until {}",
                     crate::pool::iso(until)
                 );
-                let wait = Duration::from_secs((until - now()).max(1) as u64);
+                let wait = Duration::from_secs((until - crate::now()).max(1) as u64);
                 self.respawn_at = Instant::now() + wait;
                 return;
             }
@@ -599,64 +606,40 @@ impl<'a> Router<'a> {
             log(self.store.set_status(id, "dropped").map_err(Into::into));
             return;
         }
-        let memory = crate::memory::command(&self.cfg.home, self.cfg.state_dir(), m.text.trim());
-        if let Some((reply, rules_changed)) = memory {
-            let row = InboxRow {
-                id,
-                channel: m.channel,
-                sender: m.sender,
-                text: m.text,
-                tries: 0,
-            };
-            log(self.store.reply(&row, &reply, "done").map_err(Into::into));
+        let text = m.text.trim();
+        let reply = if let Some((reply, rules_changed)) =
+            crate::memory::command(&self.cfg.home, self.cfg.state_dir(), text)
+        {
             // rpi reads AGENTS.md once, at start: a fresh child on the same session loads the rules.
-            if rules_changed {
-                self.restart = true;
-                self.restart_if_idle().await;
-            }
-            return;
-        }
-        if let Some(reply) = crate::scheduler::command(&mut self.store, &self.cfg, &m) {
-            let row = InboxRow {
-                id,
-                channel: m.channel,
-                sender: m.sender,
-                text: m.text,
-                tries: 0,
-            };
-            log(self.store.reply(&row, &reply, "done").map_err(Into::into));
+            self.restart |= rules_changed;
+            reply
+        } else if let Some(reply) = crate::scheduler::command(&mut self.store, &self.cfg, &m) {
             self.jobs.runs.notify_one();
-            return;
+            reply
+        } else if let Some(reply) = self.command(text).await {
+            reply
+        } else if matches!(text, "/stop" | "/pause" | "/resume") {
+            self.control(text).await.into()
+        } else {
+            return log(self.dispatch_new().await);
+        };
+        let resume = text == "/resume";
+        let row = InboxRow {
+            id,
+            channel: m.channel,
+            sender: m.sender,
+            text: m.text,
+            tries: 0,
+        };
+        log(self.store.reply(&row, &reply, "done").map_err(Into::into));
+        if row.channel == crate::attach::CHANNEL {
+            self.show(&reply, Some(row.text.trim()));
         }
-        if let Some(reply) = self.command(m.text.trim()).await {
-            let row = InboxRow {
-                id,
-                channel: m.channel,
-                sender: m.sender,
-                text: m.text,
-                tries: 0,
-            };
-            log(self.store.reply(&row, &reply, "done").map_err(Into::into));
-            return;
+        self.restart_if_idle().await;
+        // A run in progress settles first; its settle reconciles and dispatches.
+        if resume && !self.busy {
+            log(self.reconcile(None, false).await);
         }
-        let cmd = m.text.trim().to_string();
-        if matches!(cmd.as_str(), "/stop" | "/pause" | "/resume") {
-            let reply = self.control(&cmd).await;
-            let row = InboxRow {
-                id,
-                channel: m.channel,
-                sender: m.sender,
-                text: m.text,
-                tries: 0,
-            };
-            log(self.store.reply(&row, reply, "done").map_err(Into::into));
-            // A run in progress settles first; its settle reconciles and dispatches.
-            if cmd == "/resume" && !self.busy {
-                log(self.reconcile(None, false).await);
-            }
-            return;
-        }
-        log(self.dispatch_new().await);
     }
 
     /// The kill switch (DESIGN §4.4), run outside the queue. Returns the reply text.
@@ -793,7 +776,7 @@ impl<'a> Router<'a> {
         error: &str,
         resets_at: Option<i64>,
     ) -> anyhow::Result<()> {
-        let now = now();
+        let now = crate::now();
         let until = crate::pool::cool_down(&self.store, &account.name, error, resets_at, now)?;
         let rows = self.store.inbox_with_status("dispatched")?;
         self.reconcile(None, true).await?;
@@ -985,7 +968,7 @@ impl<'a> Router<'a> {
     async fn auth_check(&mut self) {
         let every = Duration::from_secs_f64((self.cfg.auth.refresh_minutes * 60.0).max(1.0));
         self.auth_at = Instant::now() + every;
-        let now = crate::auth_keeper::now_secs();
+        let now = crate::now();
         if !self.cfg.accounts.is_empty() {
             self.restart |=
                 crate::auth_keeper::refresh_accounts(&self.cfg, self.account.as_ref(), now).await;
@@ -1095,14 +1078,19 @@ impl<'a> Router<'a> {
             Ok(rows) => rows,
             Err(e) => return eprintln!("zephyr: outbox read failed: {e}"),
         };
-        // An attached client saw the agent's reply live; a later attach sees it in the history.
-        // Command replies, notices and `[zephyr]` fallbacks are not in the stream, so they go
-        // on the tap (stock clients drop the unknown event type).
+        // An attached client saw the agent's replies live (a later attach sees them in the
+        // history), and command replies when they were made: both are `z…` rows. Notices and
+        // job output go to the clients attached now, or wait for the next one; so do the
+        // router's own `[zephyr]` answers to a turn (a failed or empty run), which no agent
+        // event carries.
         for row in rows.iter().filter(|r| r.channel == crate::attach::CHANNEL) {
-            let command = (row.prompt.as_deref().map(str::trim)).filter(|p| p.starts_with('/'));
-            if command.is_some() || row.prompt.is_none() || row.text.starts_with("[zephyr]") {
-                let reply = json!({"type": "zephyr_reply", "text": row.text, "command": command});
-                let _ = self.tap.send(reply);
+            let command =
+                (row.prompt.as_deref().map(str::trim)).is_some_and(|p| p.starts_with('/'));
+            if !row.client_id.starts_with('z') || (!command && row.text.starts_with("[zephyr]")) {
+                if self.tap.receiver_count() == 0 {
+                    continue;
+                }
+                self.show(&row.text, None);
             }
             log(self
                 .store
@@ -1113,6 +1101,13 @@ impl<'a> Router<'a> {
             .into_iter()
             .filter(|r| r.channel != crate::attach::CHANNEL)
         {
+            if self
+                .stuck
+                .get(&row.channel)
+                .is_some_and(|t| Instant::now() < *t)
+            {
+                continue;
+            }
             let Some(channel) = channels.iter().find(|c| c.name() == row.channel) else {
                 if self.unrouted.insert(row.channel.clone()) {
                     eprintln!(
@@ -1128,9 +1123,18 @@ impl<'a> Router<'a> {
                 client_id: row.client_id,
                 text: row.text,
             };
-            let status = match channel.send(&msg).await {
+            let sent = match tokio::time::timeout(SEND_TIMEOUT, channel.send(&msg)).await {
+                Ok(sent) => sent,
+                Err(_) => {
+                    eprintln!("zephyr: {} send timed out; trying again later", row.channel);
+                    self.stuck
+                        .insert(row.channel.clone(), Instant::now() + STUCK_PAUSE);
+                    Err(anyhow::anyhow!("timed out"))
+                }
+            };
+            let status = match sent {
                 Ok(()) => "sent",
-                Err(e) if now() - row.created_at > retry_window(&row.channel) => {
+                Err(e) if crate::now() - row.created_at > retry_window(&row.channel) => {
                     eprintln!(
                         "zephyr: reply {} to {} failed for good: {e:#}",
                         row.id, row.channel
@@ -1146,18 +1150,33 @@ impl<'a> Router<'a> {
         }
     }
 
+    /// Shows `text`, the router's own (a command reply, a notice), to attached clients:
+    /// `attach` draws it for stock clients as an assistant message, the TUI as a reply card.
+    fn show(&self, text: &str, command: Option<&str>) {
+        let reply = json!({"type": "zephyr_reply", "text": text, "command": command});
+        let _ = self.tap.send(reply); // no receivers is fine
+    }
+
     /// SIGTERM: stop intake, let a running turn settle, flush, then stop the child.
     async fn drain<C: Channel>(&mut self, channels: &[C]) {
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
         let deadline = Instant::now() + Duration::from_secs(20);
         while self.busy {
             match tokio::time::timeout_at(deadline, next_event(&mut self.child)).await {
-                Ok(Some(ev)) if ev["type"] == "agent_settled" => {
-                    self.busy = false;
-                    log(self.reconcile(None, false).await);
-                }
-                Ok(Some(_)) => {}
+                // As in `main`, so the run's spend and outbound list are booked.
+                Ok(Some(ev)) => match self.tapped(Some(ev)) {
+                    Some(ev) if ev["type"] == "agent_settled" => self.settled(&ev).await,
+                    _ => {}
+                },
                 _ => break, // child gone or out of time: recovery picks it up next start
+            }
+        }
+        if self.busy {
+            // Cut off: book what the run did so far.
+            let tally = std::mem::take(&mut self.tally);
+            log(self.record_spend(tally.used).map(drop));
+            if let Some(alert) = tally.alert() {
+                log(self.store.notify_last_owner(&alert).map_err(Into::into));
             }
         }
         self.flush(channels).await;
@@ -1248,20 +1267,13 @@ fn pick_in(cfg: &Config, store: &Store) -> Result<Option<Account>, i64> {
         eprintln!("zephyr: reading cooldowns failed: {e}");
         Default::default()
     });
-    crate::pool::pick(&cfg.accounts, &cooling, now()).map(|a| Some(a.clone()))
+    crate::pool::pick(&cfg.accounts, &cooling, crate::now()).map(|a| Some(a.clone()))
 }
 
 fn log(r: anyhow::Result<()>) {
     if let Err(e) = r {
         eprintln!("zephyr: {e:#}");
     }
-}
-
-fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
 }
 
 #[cfg(test)]

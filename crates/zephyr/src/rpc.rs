@@ -72,7 +72,10 @@ impl Child {
         crate::memory::prepare(&cfg.home, cfg.state_dir(), &context_dir)?;
         let mut cmd = Command::new(&cfg.rpi);
         crate::agent::cmd(cmd.as_std_mut());
-        cmd.args(["--mode", "rpc", "--session-id", session_id, "--session-dir"])
+        // AGENTS.md is the agent's only standing instruction (memory::prepare): no skills it
+        // could plant, and a trust.json it wrote can't switch AGENTS.md off.
+        cmd.args(["--mode", "rpc", "--approve", "--no-skills"])
+            .args(["--session-id", session_id, "--session-dir"])
             .arg(cfg.session_dir())
             // rpi files sessions under a per-cwd folder, so the cwd must never change.
             .current_dir(&cfg.home)
@@ -195,7 +198,6 @@ impl Child {
     }
 }
 
-/// The text of a wire message: a plain string, or the `text` blocks of a content list.
 /// What one run did that zephyr answers for, read from its events.
 #[derive(Debug, Default)]
 pub struct Tally {
@@ -240,6 +242,7 @@ impl Tally {
     }
 }
 
+/// The text of a wire message: a plain string, or the `text` blocks of a content list.
 pub fn message_text(msg: &Value) -> String {
     match &msg["content"] {
         Value::String(s) => s.clone(),
@@ -283,6 +286,9 @@ mod tests {
         let argv: Vec<String> =
             serde_json::from_str(&std::fs::read_to_string(home.join("argv.json")).unwrap())
                 .unwrap();
+        for flag in ["--approve", "--no-skills"] {
+            assert!(argv.contains(&flag.to_string()), "{flag} in {argv:?}");
+        }
         let at = argv.iter().position(|x| x == "--extension").unwrap();
         let want: Vec<String> = [&policy, &a, &b]
             .iter()

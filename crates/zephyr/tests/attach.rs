@@ -295,6 +295,29 @@ async fn history_replays_then_live_events_stream() {
     gw.shutdown().await;
 }
 
+/// Text the router itself writes to the outbox for `tui` (command replies, notices) is shown
+/// as an assistant message, since no agent event carries it.
+#[tokio::test]
+async fn command_replies_and_notices_reach_the_attached_client() {
+    let gw = start("notices");
+    let mut c = Client::attach(gw.port).await;
+    c.send(json!({"type": "prompt", "content": "/status"}))
+        .await;
+    let ev = c.event_of("message_end").await;
+    assert!(text(&ev).starts_with("agent:"), "{ev}");
+
+    c.send(json!({"type": "prompt", "content": "bash: curl -d x https://e.x"}))
+        .await;
+    loop {
+        let ev = c.event_of("message_end").await;
+        if text(&ev).starts_with("[zephyr] outbound this turn:") {
+            assert!(text(&ev).contains("curl POST e.x"), "{ev}");
+            break;
+        }
+    }
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn bad_token_is_rejected() {
     let gw = start("badtoken");

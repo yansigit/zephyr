@@ -71,9 +71,14 @@ example to test beside a live install.
 - After a turn that ran a command sending data off the machine (curl or wget with a body, ssh, scp,
   rsync to a host, nc, `git push`, ...), zephyr lists them: `[zephyr] outbound this turn: ...`.
   Jobs report theirs on the job's channel. Plain downloads are not listed.
+- Notices go to the channel you last wrote from. Under `zephyr attach` they appear as messages in
+  the conversation, or at your next attach if none is open.
 - When the agent changes its memory (`memory/USER.md`, `MEMORY.md`), you get the diff. The change
-  reaches the agent's context only after `/memory ok`; `/memory undo` drops it, `/memory diff` shows
+  reaches the agent's context only after `/memory ok` (if it changed after you were sent the diff,
+  you are shown the new one first); `/memory undo` drops it, `/memory diff` shows
   it again, `/memory log` lists commits. A web page cannot plant a lasting "preference" without you.
+  For the same reason rpi skills are off, and a `SYSTEM.md`, `APPEND_SYSTEM.md`, `CLAUDE.md` or
+  extra `AGENTS*.md` the agent writes is renamed `*.ignored-by-zephyr` before the next start.
 
 ## Standing rules
 

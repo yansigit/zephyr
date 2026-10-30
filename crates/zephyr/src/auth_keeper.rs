@@ -177,7 +177,3 @@ async fn run_refresh(cfg: &Config, agent_dir: &Path, provider: &str) -> anyhow::
     }
     Ok(())
 }
-
-pub fn now_secs() -> i64 {
-    (crate::unix_millis() / 1000) as i64
-}

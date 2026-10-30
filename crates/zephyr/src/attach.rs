@@ -326,6 +326,10 @@ fn live(ev: Value) -> Vec<Value> {
     if ev["type"] == "response" {
         return vec![]; // answers to the router's own commands
     }
+    if ev["type"] == "zephyr_reply" {
+        let m = json!({"role": "assistant", "content": [{"type": "text", "text": ev["text"]}]});
+        return shown(&m).into_iter().map(event).collect();
+    }
     if role(m) != Some("user") {
         return vec![event(ev)];
     }
