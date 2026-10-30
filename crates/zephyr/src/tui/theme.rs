@@ -14,6 +14,8 @@ pub struct Palette {
     /// Rules and separators only: below text contrast by design.
     pub dim: Color,
     pub surface: Color,
+    /// The band behind your messages: plainly off the background, text still 4.5:1 on it.
+    pub user_bg: Color,
     pub border: Color,
     pub border_muted: Color,
     pub success: Color,
@@ -26,7 +28,7 @@ pub struct Palette {
     /// The header's cloud and the eyes drawn on it: a graphic, so 3:1 against the background.
     pub cloud: Color,
     pub cloud_eyes: Color,
-    /// Bubble borders and labels per channel; the terminal and `chat` use `accent`.
+    /// The bar and label of a message per channel; the terminal and `chat` use `accent`.
     pub discord: Color,
     pub imessage: Color,
     /// Jobs and any other channel.
@@ -44,6 +46,7 @@ pub const DARK: Palette = Palette {
     muted: rgb(0x8A94A6),
     dim: rgb(0x5C6675),
     surface: rgb(0x1A2230),
+    user_bg: rgb(0x283040),
     border: rgb(0x2C3848),
     border_muted: rgb(0x222B38),
     success: rgb(0x7FD1A8),
@@ -67,6 +70,7 @@ pub const LIGHT: Palette = Palette {
     muted: rgb(0x56606E),
     dim: rgb(0x8C96A3),
     surface: rgb(0xEDF3F7),
+    user_bg: rgb(0xE2E6EB),
     border: rgb(0xC9D3DD),
     border_muted: rgb(0xDDE4EA),
     success: rgb(0x22774B),
@@ -90,6 +94,7 @@ pub const PLAIN: Palette = Palette {
     muted: Color::Default,
     dim: Color::Default,
     surface: Color::Default,
+    user_bg: Color::Default,
     border: Color::Default,
     border_muted: Color::Default,
     success: Color::Default,
@@ -107,7 +112,7 @@ pub const PLAIN: Palette = Palette {
 };
 
 impl Palette {
-    /// The colour that marks `channel`'s bubbles.
+    /// The colour that marks `channel`'s messages.
     pub fn channel(&self, channel: &str) -> Color {
         match channel {
             "discord" => self.discord,
@@ -191,7 +196,7 @@ pub fn glyph(unicode: &'static str) -> &'static str {
         "…" => "...",
         "⏎" => "enter",
         "⇧" => "shift+",
-        "›" => ">",
+        "›" | "▌" => ">",
         "“" | "”" => "\"",
         _ => unicode,
     }
@@ -296,9 +301,23 @@ mod tests {
                 let ratio = contrast(c, bg);
                 assert!(ratio >= 4.5, "{name} {token}: {ratio:.2}:1");
             }
-            // User bubbles sit on the surface colour.
-            let ratio = contrast(p.text, p.surface);
-            assert!(ratio >= 4.5, "{name} text on surface: {ratio:.2}:1");
+            // Your messages sit on the user band: their text and channel labels.
+            for (token, c) in [
+                ("text", p.text),
+                ("accent", p.accent),
+                ("discord", p.discord),
+                ("imessage", p.imessage),
+                ("other", p.other),
+            ] {
+                let ratio = contrast(c, p.user_bg);
+                assert!(ratio >= 4.5, "{name} {token} on user_bg: {ratio:.2}:1");
+            }
+            // The band itself is plainly visible, unlike the surface tint.
+            let ratio = contrast(p.user_bg, bg);
+            assert!(
+                ratio >= 1.2,
+                "{name} user_bg on the background: {ratio:.2}:1"
+            );
             // The mascot is a graphic: 3:1 for the cloud on the background and the eyes on it.
             for (what, ratio) in [
                 ("cloud", contrast(p.cloud, bg)),

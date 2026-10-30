@@ -1,15 +1,15 @@
   ▄▟██▙▗▄▖                                                               v0.1.0
-▗   ●   ● ▙ ≈   [1mzephyr[0m · main · claude-code-1 › claude-opus-5-5
-▝█████████▛ ≈≋  discord ●  imessage ●  chat ○      today 41.2k tok · $0.38 / $5
+▗   ●   ● ▙≈    [1mzephyr[0m · main · claude-code-1 › claude-opus-5-5
+▝█████████▛≈≋   discord ●  imessage ●  chat ○      today 41.2k tok · $0.38 / $5
  ──────────────────────────────────────────────────────────────────────────────
-   │ agent: claude-code-1 on claude-code/claude-opus-5-5                      │
-   │ channels: discord connected, imessage connected                          │
-   │ today: 41.2k tokens, $0.38 of $5                                         │
-   ╰──────────────────────────────────────────────────────────────────────────╯
+ [1m≋[0m Three files: the image recipe, the launcher, and a one-time cleanup script.
 
-   ╭─ [1mimessage[0m · 14:08 ───────────────────────────────────────────────────────╮
-   │ why did the nightly backup fail?                                         │
-   ╰──────────────────────────────────────────────────────────────────────────╯
+   [1m/status[0m
+   │ agent: claude-code-1 on claude-code/claude-opus-5-5
+   │ channels: discord connected, imessage connected
+   │ today: 41.2k tokens, $0.38 of $5
+
+ ▌ why did the nightly backup fail?                           [1mimessage[0m · 14:08
 
  [1m≋[0m Checking the backup log first.
    ▸ [1m2 tools[0m  running bash                                               ● 0.5s

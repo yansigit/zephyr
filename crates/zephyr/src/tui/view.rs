@@ -207,14 +207,19 @@ impl View {
     }
 
     /// Adds an item with the transcript's one spacing rule: a blank row before each item,
-    /// except a tool card right under its assistant text or another card.
+    /// except a tool card right under its assistant text or another card. A user turn's band
+    /// spans the gutter, so it is not put in one.
     fn push(&mut self, kind: Kind, item: Arc<dyn Component>, mark: Option<String>) {
         self.last_notice = None;
         let tight = kind == Kind::Card && matches!(self.last, Kind::Text | Kind::Card);
         if self.last != Kind::None && !tight {
             self.root.add_child(Arc::new(Line(String::new())));
         }
-        self.root.add_child(Arc::new(Gutter { mark, item }));
+        if kind == Kind::User {
+            self.root.add_child(item);
+        } else {
+            self.root.add_child(Arc::new(Gutter { mark, item }));
+        }
         self.last = kind;
     }
 
@@ -223,6 +228,7 @@ impl View {
             .as_str()
             .map(str::to_string)
             .unwrap_or_else(|| crate::rpc::message_text(m));
+        let text = clean(&text);
         let channel = m["origin"]["channel"].as_str().unwrap_or("tui");
         let who = if channel == crate::attach::CHANNEL {
             "you"
@@ -241,7 +247,7 @@ impl View {
                 self.push(Kind::Note, Arc::new(Rule { label, p: self.p }), None);
             }
         }
-        let turn = Bubble {
+        let turn = UserTurn {
             who: who.to_string(),
             when: when.map(|t| t.strftime("%H:%M").to_string()),
             color: self.p.channel(channel),
@@ -436,12 +442,9 @@ impl Component for Gutter {
     }
 }
 
-/// Below this width a bubble takes the whole row.
-const BUBBLE_FULL_BELOW: usize = 86;
-
-/// A user turn: a rounded bubble on the right, its channel and time in the top edge, in the
-/// channel's colour; full width on narrow screens.
-struct Bubble {
+/// A user turn: a shaded band across the transcript, a bar in the channel's colour down its
+/// left edge, and the channel and time at the right of its first row while they fit.
+struct UserTurn {
     who: String,
     when: Option<String>,
     color: Color,
@@ -449,64 +452,43 @@ struct Bubble {
     p: Palette,
 }
 
-impl Component for Bubble {
+impl Component for UserTurn {
     fn render(&self, width: usize) -> Vec<String> {
         let (p, c) = (&self.p, self.color);
         let label = match &self.when {
-            Some(t) => format!(
-                "{} {} {}",
-                c.fg(&bold(&self.who)),
-                p.muted.fg(glyph("·")),
-                p.muted.fg(t)
-            ),
-            None => c.fg(&bold(&self.who)),
+            Some(t) => format!("{} {} {t}", bold(&self.who), glyph("·")),
+            None => bold(&self.who),
         };
-        // The top edge is the label and six columns of frame.
-        let label = truncate_to_width(&label, width.saturating_sub(6).max(1), glyph("…"));
         let label_w = visible_width(&label);
-        let full = width < BUBBLE_FULL_BELOW;
-        let max = if full {
-            width
-        } else {
-            (width * 7 / 10).max(label_w + 6)
+        // A column outside the band on each side; inside, the bar, a space, the text, a space.
+        let room = width.saturating_sub(5).max(1);
+        // The label shares the first row while it takes at most half of it; else it is dropped.
+        let beside = label_w + 2 <= room / 2;
+        let first_room = if beside { room - label_w - 2 } else { room };
+        // wrap_words' first line is a prefix of the text; the rest wraps at the full width.
+        let first = wrap_words(&self.text, first_room).swap_remove(0);
+        let rest = self.text[first.len()..].trim_start_matches([' ', '\r']);
+        let rest = rest.strip_prefix('\n').unwrap_or(rest);
+        let mut lines = vec![first];
+        if !rest.is_empty() {
+            lines.extend(wrap_words(rest, room));
         }
-        .min(width);
-        // "│ " text " │", so four columns of frame around the text.
-        let lines = wrap_words(&self.text, max.saturating_sub(4).max(1));
-        let inner = if full {
-            width.saturating_sub(4)
-        } else {
-            lines
-                .iter()
-                .map(|l| visible_width(l))
-                .max()
-                .unwrap_or(0)
-                .max(label_w + 2)
-        };
-        let outer = inner + 4;
-        let indent = " ".repeat(width.saturating_sub(outer));
-        let (h, v) = (glyph("─"), glyph("│"));
-        let top_fill = h.repeat(outer.saturating_sub(label_w + 5));
-        let mut rows = vec![format!(
-            "{indent}{}{label}{}",
-            c.fg(&format!("{}{h} ", glyph("╭"))),
-            c.fg(&format!(" {top_fill}{}", glyph("╮")))
-        )];
-        for line in &lines {
-            let pad = " ".repeat(inner.saturating_sub(visible_width(line)));
-            let body = p.surface.bg(&format!(" {}{pad} ", p.text.fg(line)));
-            rows.push(format!("{indent}{}{body}{}", c.fg(v), c.fg(v)));
-        }
-        rows.push(format!(
-            "{indent}{}",
-            c.fg(&format!(
-                "{}{}{}",
-                glyph("╰"),
-                h.repeat(outer - 2),
-                glyph("╯")
-            ))
-        ));
-        rows
+        let bar = c.fg(glyph("▌"));
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let label = if i == 0 && beside { &label } else { "" };
+                let pad = room.saturating_sub(visible_width(line) + visible_width(label));
+                let band = format!(
+                    "{bar} {}{}{} ",
+                    p.text.fg(line),
+                    " ".repeat(pad),
+                    c.fg(label)
+                );
+                truncate_to_width(&format!(" {}", p.user_bg.bg(&band)), width, "")
+            })
+            .collect()
     }
     fn invalidate(&self) {}
     fn as_any(&self) -> &dyn Any {
@@ -1012,7 +994,8 @@ impl Component for ToolGroup {
     }
 }
 
-/// A reply from zephyr itself (`/status`, `/model`, job output), boxed and titled.
+/// A reply from zephyr itself (`/status`, `/model`, job output): its title, then its lines on
+/// a dim rule.
 struct SystemCard {
     title: String,
     text: String,
@@ -1022,36 +1005,16 @@ struct SystemCard {
 impl Component for SystemCard {
     fn render(&self, width: usize) -> Vec<String> {
         let p = &self.p;
-        let inner = width.saturating_sub(4).max(1);
-        let h = glyph("─");
-        let (tl, tr, bl, br, v) = if glyph("─") == "─" {
-            ("╭", "╮", "╰", "╯", "│")
-        } else {
-            ("+", "+", "+", "+", "|")
-        };
-        let title = format!(" {} ", self.title);
-        let fill = width.saturating_sub(visible_width(&title) + 3);
-        let mut lines = vec![format!(
-            "{}{}{}",
-            p.dim.fg(&format!("{tl}{h}")),
-            p.muted.fg(&bold(&title)),
-            p.dim.fg(&format!("{}{tr}", h.repeat(fill)))
-        )];
+        let title = truncate_to_width(&self.title, width, glyph("…"));
+        let mut lines = vec![p.muted.fg(&bold(&title))];
         // Replies are plain lines (`/status` output), not markdown.
-        let body = self.text.lines().flat_map(|l| wrap_words(l, inner));
+        let body = self
+            .text
+            .lines()
+            .flat_map(|l| wrap_words(l, width.saturating_sub(2).max(1)));
         for row in body {
-            let row = p.text.fg(&row);
-            let pad = inner.saturating_sub(visible_width(&row));
-            lines.push(format!(
-                "{} {}{} {}",
-                p.dim.fg(v),
-                row,
-                " ".repeat(pad),
-                p.dim.fg(v)
-            ));
+            lines.push(format!("{} {}", p.dim.fg(glyph("│")), p.text.fg(&row)));
         }
-        let bottom = format!("{bl}{}{br}", h.repeat(width.saturating_sub(2)));
-        lines.push(p.dim.fg(&bottom));
         lines
     }
     fn invalidate(&self) {}
@@ -1107,23 +1070,18 @@ mod tests {
     }
 
     #[test]
-    fn history_maps_to_bubbles_tool_groups_and_gutter_marks() {
+    fn history_maps_to_bands_tool_groups_and_gutter_marks() {
         let mut v = view();
         v.replay(&history());
-        // Below 90 columns a bubble takes the whole row.
         let got = text(&v, 80);
         let want = "   ───────────────────────────── Fri 30 Oct 2026 ─────────────────────────────
 
-   ╭─ discord · 14:02 ────────────────────────────────────────────────────────╮
-   │ remind me to renew the domain on friday                                  │
-   ╰──────────────────────────────────────────────────────────────────────────╯
+ ▌ remind me to renew the domain on friday                     discord · 14:02
 
  ≋ Done. I scheduled it for Fri 09:00.
    ▸ schedule  renew domain                                              ✓ 0.2s
 
-   ╭─ you · 14:05 ────────────────────────────────────────────────────────────╮
-   │ what's in deploy?                                                        │
-   ╰──────────────────────────────────────────────────────────────────────────╯
+ ▌ what's in deploy?                                               you · 14:05
 
    ▸ 2 tools  bash, read                                                 ✗ 0.4s
    ╰ ▸ read  deploy/missing                                              ✗ 0.3s
@@ -1131,9 +1089,7 @@ mod tests {
 
  ≋ Two files.
 
-   ╭─ cron · 14:05 ───────────────────────────────────────────────────────────╮
-   │ daily brief                                                              │
-   ╰──────────────────────────────────────────────────────────────────────────╯";
+ ▌ daily brief                                                    cron · 14:05";
         assert_eq!(got, want, "\n{got}");
         assert!(!got.contains("[discord #7]") && !got.contains("[tui #"));
     }
@@ -1173,8 +1129,10 @@ mod tests {
         assert!(!v.running());
         v.apply(&json!({"type": "agent_settled", "error": "rate limited; resets later"}));
         let got = text(&v, 60);
-        assert!(got.starts_with("   ╭─ imessage ─"), "{got}");
-        assert!(got.contains("   │ ping "), "{got}");
+        assert!(
+            got.starts_with(" ▌ ping ") && got.contains(" imessage\n\n"),
+            "{got}"
+        );
         assert_eq!(got.matches("Checking").count(), 1, "{got}");
         assert!(
             got.contains(" ≋ Checking the logs.\n   ▸ bash  tail log"),
@@ -1197,37 +1155,74 @@ mod tests {
         assert!(!got.contains(" q2 ") && got.contains(" q3 "), "{got}");
     }
 
+    fn turn(who: &str, text: &str) -> UserTurn {
+        UserTurn {
+            who: who.into(),
+            when: Some("14:02".into()),
+            color: super::super::theme::DARK.discord,
+            text: text.into(),
+            p: super::super::theme::DARK,
+        }
+    }
+
+    fn plain(rows: &[String]) -> Vec<String> {
+        rows.iter().map(|l| rpi_tui::strip_ansi(l)).collect()
+    }
+
     #[test]
-    fn wide_screens_put_bubbles_on_the_right_and_wrap_them_at_words() {
-        let mut v = view();
+    fn user_turns_are_bands_wrapped_at_words_with_the_label_beside() {
         let long =
             "please check whether the nightly backup finished and tell me which files changed";
-        v.replay(&[json!({"kind": "user", "text": long, "origin": {"channel": "tui", "id": 1}})]);
-        let rows: Vec<String> = v
-            .root
-            .render(120)
-            .iter()
-            .map(|l| rpi_tui::strip_ansi(l))
-            .collect();
-        // At most 70% of the row, flush right, one column from the edge (the gutter's).
-        let top = &rows[0];
-        assert!(
-            top.starts_with(&" ".repeat(30)) && top.trim_end().ends_with('╮'),
-            "{top:?}"
-        );
-        assert_eq!(rpi_tui::visible_width(top.trim_end()), 119);
-        let body: Vec<&str> = rows[1..rows.len() - 1]
-            .iter()
-            .map(|r| r.trim().trim_matches('│').trim())
-            .collect();
+        let rows = turn("discord", long).render(60);
+        // A rectangle one column in from each edge; continuations hang under the text.
         assert_eq!(
-            body,
+            plain(&rows),
             [
-                "please check whether the nightly backup finished and tell me which files",
-                "changed"
-            ],
-            "{rows:#?}"
+                " ▌ please check whether the nightly        discord · 14:02 ",
+                " ▌ backup finished and tell me which files changed         ",
+            ]
         );
+        assert!(
+            rows.iter().all(|r| r.contains("\x1b[48;2;40;48;64m")),
+            "{rows:?}"
+        );
+        // Too narrow to share a row, the label goes; the bar still marks the turn.
+        assert_eq!(
+            plain(&turn("discord", "hi there").render(30)),
+            [" ▌ hi there                  "]
+        );
+        // Lines the user broke stay broken.
+        assert_eq!(
+            plain(&turn("you", "one\n\ntwo").render(40)),
+            [
+                " ▌ one                     you · 14:02 ",
+                " ▌                                     ",
+                " ▌ two                                 "
+            ]
+        );
+    }
+
+    #[test]
+    fn user_turns_never_overflow() {
+        let texts = [
+            "hi",
+            "",
+            "한국어 단어 줄바꿈 한국어 단어 줄바꿈",
+            &"x".repeat(300),
+        ];
+        for who in ["discord", &"y".repeat(90)] {
+            for text in texts {
+                for w in 1..=200 {
+                    for row in turn(who, text).render(w) {
+                        assert!(visible_width(&row) <= w, "{w}: {row:?}");
+                    }
+                }
+            }
+        }
+        // Wide characters wrap whole and the band stays square.
+        let rows = plain(&turn("discord", "한국어 단어 줄바꿈 한국어 단어 줄바꿈").render(40));
+        assert!(rows.iter().all(|r| visible_width(r) == 39), "{rows:#?}");
+        assert!(rows[0].ends_with("discord · 14:02 "), "{rows:#?}");
     }
 
     #[test]
@@ -1353,32 +1348,6 @@ mod tests {
         }
         // A wide first character at width 1 does not panic.
         assert_eq!(wrap_words("한국어", 1), ["한", "국", "어"]);
-        // A bubble's top edge fits even when its label does not.
-        let b = Bubble {
-            who: "discord".into(),
-            when: Some("14:02".into()),
-            color: super::super::theme::DARK.discord,
-            text: "hi".into(),
-            p: super::super::theme::DARK,
-        };
-        let long = Bubble {
-            who: "x".repeat(90),
-            ..b
-        };
-        for w in 86..106 {
-            for row in long.render(w) {
-                assert!(visible_width(&row) <= w, "{w}: {row:?}");
-            }
-        }
-        let b = Bubble {
-            who: "discord".into(),
-            ..long
-        };
-        for w in [8, 12, 18] {
-            for row in b.render(w) {
-                assert!(visible_width(&row) <= w, "{w}: {row:?}");
-            }
-        }
     }
 
     #[test]
@@ -1438,9 +1407,6 @@ mod tests {
         let mut v = view();
         v.reply(Some("/status"), "agent: work on a/b");
         let got = text(&v, 40);
-        assert_eq!(
-            got,
-            "   ╭─ /status ────────────────────────╮\n   │ agent: work on a/b               │\n   ╰──────────────────────────────────╯"
-        );
+        assert_eq!(got, "   /status\n   │ agent: work on a/b");
     }
 }

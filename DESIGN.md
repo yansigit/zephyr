@@ -168,10 +168,11 @@ A slash command goes in as `send {"sessionId": "main", "command": {"type": "prom
     - The cloud's face is the agent's state: eyes ahead when idle, looking downwind with an animated trail while a run goes, closed with a `z` when paused or connecting, `× ×` when the link is down, a reply failed or the budget is spent.
     - Below 60 columns the header is one row without it, and spend moves to the footer.
   - **Transcript**:
-    - Your messages are right-aligned bubbles in the channel's colour, with the channel and local time in the top edge; below 90 columns they take the whole row.
+    - Your messages are full-width shaded bands (`user_bg`) with a bar in the channel's colour down the left edge (`>` without UTF-8) and the channel and local time at the right of the first row, dropped when it would take over half the row.
     - `≋` marks assistant text. rpi-tui's markdown wraps by character, so Zephyr draws each reply once unwrapped and wraps its prose at words, with list items hanging under their text. Code, rules and tables keep upstream's layout.
     - A turn's tool calls fold into one line (`▸ 3 tools  bash, read ×2 … ✓ 4.1s`) with any failure under it; Ctrl+O opens them as a tree.
-    - Replies come as cards, and notices as dim lines.
+    - Replies come as cards: a dim title, then the lines on a dim `│` rule, no box. Notices are dim lines.
+    - One blank row between blocks; none at the top. Marks (`▌`, `≋`) sit in the gutter; text, tool rows and cards line up two columns in.
   - Then the run line, the queue strip, slash autocomplete, the input box, and a footer of key hints.
   - Everything sits in a one-column gutter.
   - Times are in `timezone` from zephyr.toml, else the host's zone, which `zephyr attach` passes in.
