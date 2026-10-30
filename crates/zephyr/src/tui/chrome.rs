@@ -2,6 +2,7 @@
 //! function of [`State`] and the clock, drawn by a [`Region`] component.
 
 use super::conn::Snapshot;
+use super::overlays::{Complete, Kind, Overlay};
 use super::theme::{glyph, Palette};
 use rpi_tui::{bold, truncate_to_width, visible_width, Component};
 use std::any::Any;
@@ -38,6 +39,10 @@ pub struct State {
     pub unsent: Vec<String>,
     /// A one-off footer hint (`^C again to detach`), until this time.
     pub hint: Option<(String, i64)>,
+    /// The open panel: model picker, status or help.
+    pub overlay: Option<Overlay>,
+    /// Slash autocomplete for the composer's text.
+    pub complete: Option<Complete>,
 }
 
 impl Default for State {
@@ -49,6 +54,8 @@ impl Default for State {
             stopping: false,
             unsent: vec![],
             hint: None,
+            overlay: None,
+            complete: None,
         }
     }
 }
@@ -305,23 +312,49 @@ pub fn queue_strip(s: &State, p: &Palette, width: usize, _now: i64) -> Vec<Strin
 pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
     let key = |k: &str, what: &str| format!("{} {}", p.text.fg(k), p.muted.fg(what));
     let enter = glyph("⏎");
+    let arrows = glyph("↑↓");
     // (hint, rank): when the row is short, the highest rank goes first.
-    let mut hints = if s.snapshot.run.busy && s.link == Link::Up {
-        vec![
+    let mut hints = match (&s.overlay, &s.complete) {
+        (Some(o), _) => {
+            let (choose, pick) = match o.kind {
+                Kind::Model => ("choose", Some("switch")),
+                Kind::Help => ("choose", Some("insert")),
+                Kind::Status => ("scroll", None),
+            };
+            let mut hints = vec![(key(arrows, choose), 2)];
+            hints.extend(pick.map(|pick| (key(enter, pick), 1)));
+            if o.kind != Kind::Status {
+                hints.push((p.muted.fg("type to filter"), 3));
+            }
+            hints.push((key("esc", "close"), 0));
+            hints
+        }
+        (None, Some(_)) => vec![
+            (key(arrows, "choose"), 2),
+            (key("tab", "complete"), 1),
+            (key(enter, "run"), 3),
+            (key("esc", "dismiss"), 0),
+        ],
+        _ if s.snapshot.run.busy && s.link == Link::Up => vec![
             (key("esc", "stop"), 0),
             (key(enter, "queue"), 2),
-            (key("^O", "tools"), 3),
-            (key("^T", "thinking"), 4),
+            (key("^L", "model"), 3),
+            (key("/", "commands"), 4),
+            (key("^S", "status"), 5),
+            (key("^O", "tools"), 6),
+            (key("^T", "thinking"), 7),
             (key("^D", "detach"), 1),
-        ]
-    } else {
-        vec![
+        ],
+        _ => vec![
             (key(enter, "send"), 0),
-            (key(&format!("{}{enter}", glyph("⇧")), "newline"), 2),
-            (key("^O", "tools"), 3),
-            (key("^T", "thinking"), 4),
+            (key(&format!("{}{enter}", glyph("⇧")), "newline"), 4),
+            (key("^L", "model"), 2),
+            (key("/", "commands"), 3),
+            (key("^S", "status"), 5),
+            (key("^O", "tools"), 6),
+            (key("^T", "thinking"), 7),
             (key("^D", "detach"), 1),
-        ]
+        ],
     };
     if let Some((hint, until)) = &s.hint {
         if now < *until {
@@ -329,7 +362,6 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
         }
     }
 
-    let spend = &s.snapshot.spend;
     let mut right = vec![];
     if s.snapshot.failed_replies > 0 {
         let n = s.snapshot.failed_replies;
@@ -337,34 +369,7 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
         right.push(p.error.fg(&format!("{} {n} failed {what}", glyph("✗"))));
     }
     if s.link == Link::Up {
-        let mut tokens = format!("today {}", tokens_text(spend.tokens));
-        if let Some(l) = spend.daily_tokens_limit {
-            tokens.push_str(&format!(" / {}", tokens_text(l)));
-        }
-        tokens.push_str(" tok");
-        let mut cost = money(spend.cost);
-        if let Some(l) = spend.daily_cost_limit {
-            cost.push_str(&format!(" / {}", money(l)));
-        }
-        let used = [
-            spend
-                .daily_tokens_limit
-                .map(|l| spend.tokens as f64 / l.max(1) as f64),
-            spend
-                .daily_cost_limit
-                .map(|l| spend.cost / l.max(f64::EPSILON)),
-        ]
-        .into_iter()
-        .flatten()
-        .fold(0.0, f64::max);
-        let color = if used >= 1.0 {
-            p.error
-        } else if used >= 0.8 {
-            p.warning
-        } else {
-            p.muted
-        };
-        right.push(color.fg(&format!("{tokens} {} {cost}", glyph("·"))));
+        right.push(spend(&s.snapshot, p));
     }
     let right = format!("{} ", right.join("   "));
     loop {
@@ -376,6 +381,39 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
         let last = (0..hints.len()).max_by_key(|&i| hints[i].1).unwrap_or(0);
         hints.remove(last);
     }
+}
+
+/// `today 41.2k tok · $0.38 / $5`, in the warning colour from 80% of a limit, error from 100%.
+pub fn spend(snap: &Snapshot, p: &Palette) -> String {
+    let spend = &snap.spend;
+    let mut tokens = format!("today {}", tokens_text(spend.tokens));
+    if let Some(l) = spend.daily_tokens_limit {
+        tokens.push_str(&format!(" / {}", tokens_text(l)));
+    }
+    tokens.push_str(" tok");
+    let mut cost = money(spend.cost);
+    if let Some(l) = spend.daily_cost_limit {
+        cost.push_str(&format!(" / {}", money(l)));
+    }
+    let used = [
+        spend
+            .daily_tokens_limit
+            .map(|l| spend.tokens as f64 / l.max(1) as f64),
+        spend
+            .daily_cost_limit
+            .map(|l| spend.cost / l.max(f64::EPSILON)),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(0.0, f64::max);
+    let color = if used >= 1.0 {
+        p.error
+    } else if used >= 0.8 {
+        p.warning
+    } else {
+        p.muted
+    };
+    color.fg(&format!("{tokens} {} {cost}", glyph("·")))
 }
 
 /// The wind glyph cycle, about 6 frames a second.
@@ -408,7 +446,7 @@ fn money(v: f64) -> String {
 }
 
 /// `provider/model` → `model`.
-fn short_model(id: &str) -> &str {
+pub fn short_model(id: &str) -> &str {
     id.rsplit('/')
         .next()
         .filter(|m| !m.is_empty())
@@ -585,7 +623,9 @@ mod tests {
         let mut s = up();
         let f = plain(footer(&s, &DARK, 120, NOW)).remove(0);
         assert!(
-            f.starts_with("  ⏎ send · ⇧⏎ newline · ^O tools · ^T thinking · ^D detach"),
+            f.starts_with(
+                "  ⏎ send · ⇧⏎ newline · ^L model · / commands · ^S status · ^O tools · ^D detach  "
+            ),
             "{f}"
         );
         assert!(f.ends_with("today 41.2k tok · $0.38 / $5 "), "{f}");
@@ -607,5 +647,36 @@ mod tests {
         assert!(plain(footer(&s, &DARK, 120, NOW))[0].contains("✗ 2 failed replies"));
         s.hint = Some(("press ^C again to detach".into(), NOW + 1));
         assert!(plain(footer(&s, &DARK, 120, NOW))[0].starts_with("  press ^C again to detach"));
+    }
+
+    #[test]
+    fn footer_hints_follow_the_open_panel() {
+        let mut s = up();
+        let left = |s: &State, w| plain(footer(s, &DARK, w, NOW))[0].clone();
+        s.overlay = Some(Overlay::new(Kind::Model));
+        let f = left(&s, 120);
+        assert!(
+            f.starts_with("  ↑↓ choose · ⏎ switch · type to filter · esc close  "),
+            "{f}"
+        );
+        assert!(
+            left(&s, 60).starts_with("  ⏎ switch · esc close  "),
+            "{}",
+            left(&s, 60)
+        );
+        s.overlay = Some(Overlay::new(Kind::Status));
+        assert!(left(&s, 120).starts_with("  ↑↓ scroll · esc close  "));
+        s.overlay = Some(Overlay::new(Kind::Help));
+        assert!(left(&s, 120).starts_with("  ↑↓ choose · ⏎ insert · type to filter · esc close"));
+        s.overlay = None;
+        s.complete = Some(Complete {
+            items: vec![0],
+            selected: 0,
+        });
+        let f = left(&s, 120);
+        assert!(
+            f.starts_with("  ↑↓ choose · tab complete · ⏎ run · esc dismiss  "),
+            "{f}"
+        );
     }
 }

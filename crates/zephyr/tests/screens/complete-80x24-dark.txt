@@ -1,0 +1,24 @@
+ ≋ zephyr   main · claude-code-1 › claude-opus-5-5        discord ●  imessage ●
+ ──────────────────────────────────────────────────────────────────────────────
+
+   ▸ bash  ls ~/Projects/zephyr/deploy                                   ✓ 0.1s
+
+ ≋ Three files: the image recipe, the launcher, and a one-time cleanup script.
+
+   ╭─ /status ────────────────────────────────────────────────────────────────╮
+   │ agent: claude-code-1 on claude-code/claude-opus-5-5                      │
+   │ channels: discord connected, imessage connected                          │
+   │ today: 41.2k tokens, $0.38 of $5                                         │
+   ╰──────────────────────────────────────────────────────────────────────────╯
+
+
+ › /new                     start a fresh conversation; memory and rules carry …
+   /help                    this list
+   /stop                    stop the current reply
+   /model                   pick a model
+   /model <provider/model>  switch the model after the current reply
+   /memory diff             the memory change waiting for you
+ ╭────────────────────────────────────────────────────────────────────────────╮
+ │ /                                                                          │
+ ╰────────────────────────────────────────────────────────────────────────────╯
+  ↑↓ choose · tab complete · ⏎ run · esc dismiss   today 41.2k tok · $0.38 / $5

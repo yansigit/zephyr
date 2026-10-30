@@ -124,7 +124,15 @@ Zephyr's own TUI uses the same port, token and framing (one JSON-RPC 2.0 object 
     "origin": {"channel": "discord", "id": 42, "sender": "1234"},  // object | null: the user message being served (inbox row id)
     "current_tool": "bash",          // string | null: between tool_execution_start and _end
     "tools_done": 3                  // integer: tool_execution_end count this run
-  }
+  },
+  "accounts": [                      // the [[account]] pool in order; [] without one
+    {"name": "work", "model": "anthropic/claude-x",
+     "state": "cooling",             // "ready" | "cooling" | "needs login"
+     "until_unix": 1793322000}       // integer | null: when a cooldown ends
+  ],
+  "jobs": [                          // the 5 soonest scheduled runs, soonest first
+    {"id": 3, "name": "renew domain", "next_unix": 1793350800}
+  ]
 }
 ```
 
@@ -144,7 +152,22 @@ Then events follow, in order:
 3. Every live child event (the `--mode rpc` line: `agent_start`, `message_update`, `tool_execution_start`, `agent_settled`, ...), except `response` lines. User messages in `message_start`/`message_end` get `origin` and `text` as above. Unlike `subscribe`, nothing is quoted or hidden: the client's own turns come back too.
 4. `{"type": "zephyr_reply", "text": "agent: account work on ...", "command": "/status"}`: a reply to the `tui` channel that the agent's stream does not show: answers to commands (`/status`, `/model`, `/reload`, `/stop`, `/pause`, `/resume`, `/memory ...`, `/job ...`; `command` is the command text), notices and job output (`command` null), and `[zephyr] ...` fallbacks for a run that ended without a reply (`command` null). An ordinary agent reply is not repeated. Stock `subscribe` connections get this event too and ignore it.
 
+**`zephyr.models {}`** → `{"accounts": [{"name": "work", "model": "anthropic/claude-x", "models": ["anthropic/claude-x", "anthropic/claude-y"]}]}`: each pooled account, its model, and the models `rpi --list-models` lists on that account's provider (run with the account's agent dir). Without a pool there is one entry with `name` null, the top-level `model`, and everything rpi lists. When rpi cannot list, `models` holds just the account's model. It runs rpi once per account, so a client asks only when it shows the list (the TUI's model picker).
+
 A slash command goes in as `send {"sessionId": "main", "command": {"type": "prompt", "content": "/status"}}`, as with the stock client.
+
+#### 4.3.2 The TUI client (`zephyr tui`)
+
+`zephyr attach` runs `zephyr tui` in the container: a client of the methods above, built from rpi-tui components (`crates/zephyr/src/tui/`).
+
+- **Layout**, top to bottom: header (wordmark, session, `account › model`, channel dots, pause badge), transcript (origin chips on user turns, `≋` assistant text, one-line tool cards, reply cards, dim notices), run line, queue strip, slash autocomplete, the input box, and a footer of key hints with today's spend. Everything sits in a one-column gutter.
+- **Keys**: Enter sends; Shift+Enter or Ctrl+J is a newline; Esc stops the run; Ctrl+L model picker; Ctrl+S status; `?` on an empty input, help; Ctrl+O tool output; Ctrl+T thinking; PgUp/PgDn scroll; Ctrl+C clears (twice to detach); Ctrl+D detaches.
+- **Panels** open over the bottom of the screen, between header and footer. Esc closes; arrows and PgUp/PgDn move; typing filters the lists; the footer shows the panel's keys.
+  - *Model picker* (Ctrl+L, `/model`): `zephyr.models` grouped by account, the model in use marked `●`. A pick sends `/model provider/model`; the reply shows as a notice.
+  - *Status* (Ctrl+S, `/status`): agent and run, the account pool with cooldowns, channels, pause, spend against the limits, failed replies, the next jobs. All from the snapshot.
+  - *Help* (`/help`, `?`): every command, grouped Chat, Agent, Memory, Schedule and Gateway. Enter puts the command in the input.
+- **Autocomplete**: typing `/` lists the matching commands with one line each. Up/Down choose, Tab completes, Enter runs a command that needs no argument.
+- `/help`, `/status` and `/model` with no argument open their panel and send nothing. A one-line `[zephyr] …` reply (`stopped`, `paused`, `now on …`) is a dim notice; a longer reply is a titled card.
 - **Discord.** serenity, DMs from your user id only, so the privileged message-content intent may be unnecessary. Messages from guilds are ignored in v1.
   - While a run for you is going, the DM shows typing (serenity's `Typing`, refreshed every 7 s; Discord's typing lasts 10 s). If it is still going after `[discord] progress_after_secs` (default 20), one note is posted, `≋ working · 0:24 · bash, read ×3`, edited at most every 5 s and deleted on `Stop` or before the reply's first chunk. `progress = false` turns the note off; typing stays.
   - The note is not an outbox row: never retried or deduped. A failed post, edit or delete is logged once per run and ignored. The router drives this through `Channel::activity(to, Activity::{Start, Progress, Stop})`, a no-op for other channels.

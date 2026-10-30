@@ -143,6 +143,7 @@ pub fn glyph(unicode: &'static str) -> &'static str {
         "◐" => "o",
         "⏸" => "||",
         "↑" => "^",
+        "↑↓" => "up/down",
         "·" => "-",
         "─" => "-",
         "…" => "...",

@@ -28,6 +28,44 @@ pub struct Snapshot {
     pub queue: Vec<Queued>,
     pub failed_replies: i64,
     pub run: Run,
+    pub accounts: Vec<AccountState>,
+    pub jobs: Vec<NextJob>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct AccountState {
+    pub name: String,
+    pub model: String,
+    /// `ready`, `cooling` or `needs login`.
+    pub state: String,
+    pub until_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct NextJob {
+    pub id: i64,
+    pub name: String,
+    pub next_unix: i64,
+}
+
+/// One entry of `zephyr.models`: an account (unnamed without a pool) and what it can run.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct AccountModels {
+    pub name: Option<String>,
+    pub model: Option<String>,
+    pub models: Vec<String>,
+}
+
+/// What the UI asks of the daemon.
+#[derive(Debug)]
+pub enum Ask {
+    /// `send {type: "prompt"}`: a message or a slash command.
+    Prompt(String),
+    /// `zephyr.models`, answered with [`Msg::Models`].
+    Models,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -81,6 +119,8 @@ pub enum Msg {
     },
     /// One live event (`params.event`).
     Event(Value),
+    /// The `zephyr.models` answer; empty from a daemon without it.
+    Models(Vec<AccountModels>),
     /// The connection is gone or was refused; it retries.
     Down(String),
     /// Retrying would not help: a wrong token, or a daemon without `zephyr.hello`.
@@ -105,12 +145,12 @@ impl From<std::io::Error> for Fail {
     }
 }
 
-/// Runs until `prompts` closes. Each prompt goes out as `send {type: "prompt"}`.
+/// Runs until `asks` closes. Each prompt goes out as `send {type: "prompt"}`.
 pub async fn run(
     addr: String,
     token: String,
     out: mpsc::UnboundedSender<Msg>,
-    mut prompts: mpsc::UnboundedReceiver<String>,
+    mut prompts: mpsc::UnboundedReceiver<Ask>,
 ) {
     let mut delay = MIN_DELAY;
     // A prompt whose write failed goes out first on the next connection.
@@ -136,7 +176,7 @@ async fn session(
     addr: &str,
     token: &str,
     out: &mpsc::UnboundedSender<Msg>,
-    prompts: &mut mpsc::UnboundedReceiver<String>,
+    prompts: &mut mpsc::UnboundedReceiver<Ask>,
     carry: &mut Option<String>,
     delay: &mut Duration,
 ) -> Result<(), Fail> {
@@ -175,19 +215,31 @@ async fn session(
     if let Some(text) = carry.take() {
         rpc.prompt(&text, carry).await?;
     }
+    // The pending `zephyr.models` request; a lost connection drops it.
+    let mut models = None;
     loop {
         tokio::select! {
             line = rpc.lines.next_line() => {
                 let Some(line) = line? else {
                     return Err(Fail::Down("zephyr closed the connection".into()));
                 };
-                let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-                if v["method"] == "event" && out.send(Msg::Event(v["params"]["event"].clone())).is_err() {
+                let Ok(mut v) = serde_json::from_str::<Value>(&line) else { continue };
+                let msg = if v["method"] == "event" {
+                    Msg::Event(v["params"]["event"].take())
+                } else if models.is_some() && v["id"].as_u64() == models {
+                    models = None;
+                    let list = v["result"]["accounts"].take();
+                    Msg::Models(serde_json::from_value(list).unwrap_or_default())
+                } else {
+                    continue;
+                };
+                if out.send(msg).is_err() {
                     return Ok(());
                 }
             }
-            text = prompts.recv() => match text {
-                Some(text) => rpc.prompt(&text, carry).await?,
+            ask = prompts.recv() => match ask {
+                Some(Ask::Prompt(text)) => rpc.prompt(&text, carry).await?,
+                Some(Ask::Models) => models = Some(rpc.request("zephyr.models", json!({})).await?),
                 None => return Ok(()),
             },
         }
@@ -322,7 +374,7 @@ mod tests {
         assert_eq!(messages[0]["text"], "hi");
         assert!(matches!(rx.recv().await, Some(Msg::Event(e)) if e["type"] == "ready"));
         assert!(matches!(rx.recv().await, Some(Msg::Down(_))));
-        ptx.send("typed while away".into()).unwrap();
+        ptx.send(Ask::Prompt("typed while away".into())).unwrap();
         let Some(Msg::Up { snapshot, .. }) = rx.recv().await else {
             panic!("no second Up")
         };
@@ -331,6 +383,40 @@ mod tests {
         assert_eq!(req["method"], "send");
         assert_eq!(req["params"]["command"]["type"], "prompt");
         assert_eq!(req["params"]["command"]["content"], "typed while away");
+    }
+
+    #[tokio::test]
+    async fn models_are_asked_for_and_answered() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (r, mut w) = s.into_split();
+            let mut lines = BufReader::new(r).lines();
+            handshake(&mut lines, &mut w, "tok", "a/one").await.unwrap();
+            let req: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(req["method"], "zephyr.models");
+            // An event first: the answer is matched by id, not by order.
+            let ev = json!({"jsonrpc": "2.0", "method": "event", "params": {"subscriptionId": 1, "event": {"type": "ready"}}});
+            let answer = json!({"jsonrpc": "2.0", "id": req["id"], "result": {"accounts": [
+                {"name": "work", "model": "a/one", "models": ["a/one", "a/two"]}]}});
+            w.write_all(format!("{ev}\n{answer}\n").as_bytes())
+                .await
+                .unwrap();
+            lines.next_line().await.ok();
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (ptx, prx) = mpsc::unbounded_channel();
+        tokio::spawn(run(addr, "tok".into(), tx, prx));
+        assert!(matches!(rx.recv().await, Some(Msg::Up { .. })));
+        ptx.send(Ask::Models).unwrap();
+        assert!(matches!(rx.recv().await, Some(Msg::Event(e)) if e["type"] == "ready"));
+        let Some(Msg::Models(list)) = rx.recv().await else {
+            panic!("no models")
+        };
+        assert_eq!(list[0].name.as_deref(), Some("work"));
+        assert_eq!(list[0].models, ["a/one", "a/two"]);
     }
 
     #[tokio::test]

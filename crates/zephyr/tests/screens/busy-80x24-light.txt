@@ -16,9 +16,9 @@
      EACCES: permission denied, open '/var/log/backup.log'
    ▸ bash  journalctl -u backup --since today                            ● 0.5s
 
- ≈ running bash for imessage · 12s · 1 tool                         esc to stop
+ ≋ running bash for imessage · 12s · 1 tool                         esc to stop
  queued (1) · discord: “are you around later?”
-╭──────────────────────────────────────────────────────────────────────────────╮
-│ Message zephyr                                                               │
-╰──────────────────────────────────────────────────────────────────────────────╯
-  esc stop · ⏎ queue · ^O tools · ^D detach        today 41.2k tok · $0.38 / $5
+ ╭────────────────────────────────────────────────────────────────────────────╮
+ │ Message zephyr                                                             │
+ ╰────────────────────────────────────────────────────────────────────────────╯
+  esc stop · ⏎ queue · ^L model · ^D detach        today 41.2k tok · $0.38 / $5
