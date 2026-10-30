@@ -140,7 +140,7 @@ When idle, `run` is `{"busy": false, "since_unix_ms": null, "origin": null, "cur
 
 Then events follow, in order:
 1. `{"type": "ready"}`
-2. `{"type": "zephyr_status", "snapshot": <Snapshot>}` at once, then again each time the snapshot changes (never twice with the same value).
+2. `{"type": "zephyr_status", "snapshot": <Snapshot>}` at once, then again each time the snapshot changes (never twice with the same value). It is a `watch`: each event carries the latest whole snapshot, and quick intermediate values (a tool that starts and ends between two reads) may be skipped. Its order relative to the child events in 3 is not fixed.
 3. Every live child event (the `--mode rpc` line: `agent_start`, `message_update`, `tool_execution_start`, `agent_settled`, ...), except `response` lines. User messages in `message_start`/`message_end` get `origin` and `text` as above. Unlike `subscribe`, nothing is quoted or hidden: the client's own turns come back too.
 4. `{"type": "zephyr_reply", "text": "agent: account work on ...", "command": "/status"}`: a reply to the `tui` channel that the agent's stream does not show: answers to commands (`/status`, `/model`, `/reload`, `/stop`, `/pause`, `/resume`, `/memory ...`, `/job ...`; `command` is the command text), notices and job output (`command` null), and `[zephyr] ...` fallbacks for a run that ended without a reply (`command` null). An ordinary agent reply is not repeated. Stock `subscribe` connections get this event too and ignore it.
 
