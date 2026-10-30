@@ -813,6 +813,7 @@ async fn lists(cfg: &Config, account: Option<&Account>, model: &str) -> bool {
         None => Some(crate::auth_keeper::agent_dir(cfg)),
     };
     let mut cmd = tokio::process::Command::new(&cfg.rpi);
+    crate::agent::cmd(cmd.as_std_mut());
     cmd.arg("--list-models")
         .current_dir(&cfg.home)
         .kill_on_drop(true);

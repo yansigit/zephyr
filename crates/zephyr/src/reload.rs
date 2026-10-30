@@ -30,6 +30,7 @@ pub fn diff(old: &Config, new: &Config, active: Option<&Account>, next: Option<&
         || old.discord != new.discord
         || old.imessage != new.imessage
         || old.attach != new.attach
+        || old.agent != new.agent
     {
         return Plan::Reexec;
     }
@@ -165,6 +166,11 @@ mod tests {
             same(&cfg(&format!(
                 "{POOL}[attach]\nport = 7\ntoken_env = 'T'\n"
             ))),
+            Plan::Reexec
+        );
+        // What the agent's processes may see is fixed at start.
+        assert_eq!(
+            same(&cfg(&format!("{POOL}[agent]\nenv = ['K']\n"))),
             Plan::Reexec
         );
         // Without a pool, the top-level model.

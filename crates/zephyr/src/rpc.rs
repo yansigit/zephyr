@@ -64,6 +64,7 @@ impl Child {
         // rpi reads the context files (AGENTS.md) once, at start, so regenerate them first.
         crate::memory::prepare(&cfg.home)?;
         let mut cmd = Command::new(&cfg.rpi);
+        crate::agent::cmd(cmd.as_std_mut());
         cmd.args(["--mode", "rpc", "--session-id", session_id, "--session-dir"])
             .arg(cfg.session_dir())
             // rpi files sessions under a per-cwd folder, so the cwd must never change.

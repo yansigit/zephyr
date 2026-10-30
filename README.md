@@ -70,6 +70,9 @@ example to test beside a live install.
   memory, `accounts/<name>/auth.json`.
 - `~/.zephyr/secrets.env` (0600): `KEY=value` lines, such as bot tokens. The daemon reads it at start
   and again after a change, and a variable already set in its environment wins.
+  The agent never sees them: they are removed from rpi's environment and every other process
+  zephyr starts for it. To give the agent one (an API key a provider reads, say), list its name in
+  `[agent] env = ["NAME"]`.
 - `~/.zephyr/tui.token` (0600): the `zephyr attach` token.
 - `~/.zephyr/host.toml`: the projects folder, used only on the host.
 

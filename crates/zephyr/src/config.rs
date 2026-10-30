@@ -42,6 +42,9 @@ pub struct Config {
     /// Wall clock cap for one job run. Not configurable; tests shorten it.
     #[serde(skip, default = "job_timeout")]
     pub job_timeout: std::time::Duration,
+    /// `[agent]`: what the agent's processes get (DESIGN §4.4).
+    #[serde(default)]
+    pub agent: Agent,
     /// OAuth refresh (DESIGN §4.7). Defaults apply when the table is absent.
     #[serde(default)]
     pub auth: crate::auth_keeper::AuthConfig,
@@ -71,6 +74,16 @@ impl Budget {
         self.daily_tokens.is_some_and(|t| tokens >= t)
             || self.daily_cost_usd.is_some_and(|c| cost >= c)
     }
+}
+
+/// `[agent]`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Agent {
+    /// secrets.env variables the agent's processes may see, e.g. an API key a provider reads
+    /// from the environment. Every other secrets.env variable is removed from them.
+    #[serde(default)]
+    pub env: Vec<String>,
 }
 
 /// One `[[account]]`. Its credentials live in `<home>/accounts/<name>/`.
@@ -126,6 +139,11 @@ impl Config {
             }
             if a.provider().is_empty() || !a.model.contains('/') {
                 anyhow::bail!("account {:?}: model must be <provider>/<model>", a.name);
+            }
+        }
+        for name in &self.agent.env {
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                anyhow::bail!("agent.env {name:?}: use a variable name (letters, digits, '_')");
             }
         }
         crate::scheduler::zone(self)?;
@@ -259,6 +277,11 @@ mod tests {
         }
         let mut cfg = pool(&["a"]);
         cfg.accounts[0].model = "no-provider".into();
+        assert!(cfg.validate().is_err());
+        let mut cfg = pool(&["a"]);
+        cfg.agent.env = vec!["OK_1".into()];
+        cfg.validate().unwrap();
+        cfg.agent.env = vec!["NOT-A-NAME".into()];
         assert!(cfg.validate().is_err());
         assert!(toml::from_str::<Config>(&format!(
             "{base}[[account]]\nname = 'a'\nmodel = 'p/m'\ntypo = 1\n"

@@ -148,7 +148,7 @@ pub fn context_trusted(home: &Path, agent_dir: &Path) -> anyhow::Result<bool> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = Command::new("git")
+    let out = crate::agent::cmd(&mut Command::new("git"))
         .arg("-C")
         .arg(dir)
         .args(args)

@@ -160,10 +160,11 @@ pub async fn refresh_accounts(
 /// `rpi auth refresh --provider <id>`, with the child's agent dir and cwd. Its output is not
 /// logged, since it can echo credential details.
 async fn run_refresh(cfg: &Config, agent_dir: &Path, provider: &str) -> anyhow::Result<()> {
+    let mut cmd = tokio::process::Command::new(&cfg.rpi);
+    crate::agent::cmd(cmd.as_std_mut());
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        tokio::process::Command::new(&cfg.rpi)
-            .args(["auth", "refresh", "--provider", provider])
+        cmd.args(["auth", "refresh", "--provider", provider])
             .env("RPI_CODING_AGENT_DIR", agent_dir)
             .current_dir(&cfg.home)
             .output(),

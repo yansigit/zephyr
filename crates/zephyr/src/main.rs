@@ -34,6 +34,7 @@ async fn main() -> ExitCode {
     let mut from_file = Vec::new();
     let cfg = Config::load(&Config::default_path()).and_then(|cfg| {
         from_file = zephyr::dotenv::load(&cfg.home.join("secrets.env"))?;
+        zephyr::agent::init(&from_file, &cfg.agent.env);
         Ok(cfg)
     });
     let result = match cfg {
@@ -91,6 +92,7 @@ fn lock_home(home: &Path) -> anyhow::Result<std::fs::File> {
 
 /// `from_file`: the variables secrets.env set, dropped before a re-exec so it reads them anew.
 async fn run(cfg: Config, from_file: &[String]) -> anyhow::Result<()> {
+    zephyr::agent::undumpable();
     let _lock = lock_home(&cfg.home)?;
     let mut channels = vec![AnyChannel::Chat(ChatChannel::new(cfg.socket_path()))];
     if let Some(discord) = &cfg.discord {
@@ -167,7 +169,7 @@ async fn status(cfg: &Config) -> anyhow::Result<()> {
 }
 
 async fn doctor(cfg: &Config) -> anyhow::Result<()> {
-    let out = std::process::Command::new(&cfg.rpi)
+    let out = zephyr::agent::cmd(&mut std::process::Command::new(&cfg.rpi))
         .arg("--version")
         .output()?;
     let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
