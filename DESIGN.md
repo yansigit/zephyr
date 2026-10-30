@@ -112,6 +112,7 @@ There are no per-call prompts. These hard limits hold every time:
    - writes outside the granted roots
    - `git push --force`
    - package installs outside the workspace venv/node dirs
+   - credential files (`auth.json`, `.credentials.json`, `secrets.env`), `/proc/*/environ`, `.ssh/` and `.git/hooks/`, named in any tool's path or any bash word. A hook in a project would run as the owner, on the host, at their next commit. This is a name check, so a glob or an encoded name gets past it: the boundary is the agent's environment and uid (item 1), not this list.
 
    It logs every call to the audit table.
 3. **Untrusted content.** Text from iMessage, Discord, web fetches and files is wrapped as data in the prompt (`<untrusted source=…>`). The policy plugin also blocks outbound sends to any address other than the owner's channels, which limits what a prompt injection can exfiltrate.

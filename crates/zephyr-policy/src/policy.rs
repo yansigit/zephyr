@@ -13,6 +13,11 @@
 //!
 //! shortcut: no `find -exec`, `sudo -u root rm`, `bash script.sh` body or
 //! `<(curl ..)` coverage; the Linux account boundary (§4.4 item 1) is the backstop.
+//!
+//! Credential files and `/proc/*/environ` are refused by name in any tool's path and in any
+//! bash word (`sensitive`). shortcut: a glob, a variable or an encoded name gets past it, and a
+//! directory search (`grep`/`find` on a folder) can still reach them; the daemon's own secrets
+//! are kept from the agent by uid and environment, not by this check.
 
 use serde_json::Value;
 
@@ -39,8 +44,30 @@ pub fn check(tool: &str, args: &Value) -> Decision {
                 None => Decision::Deny("file tool call has no path"),
             }
         }
-        _ => Decision::Allow,
+        _ => ["path", "file_path", "glob"]
+            .iter()
+            .filter_map(|k| args.get(*k).and_then(Value::as_str))
+            .find_map(sensitive)
+            .map_or(Decision::Allow, Decision::Deny),
     }
+}
+
+/// Files no tool may touch: credentials, another process's environment, ssh keys, and git
+/// hooks (a hook in a project runs as the owner, on the host, at their next commit).
+fn sensitive(path: &str) -> Option<&'static str> {
+    let parts: Vec<&str> = path.split('/').collect();
+    if let Some(&("auth.json" | ".credentials.json" | "secrets.env")) = parts.last() {
+        return Some("a credential file");
+    }
+    for w in parts.windows(2) {
+        match w {
+            [".git", "hooks"] => return Some("a git hook"),
+            [".ssh", _] => return Some("an ssh key or config"),
+            [_, "environ"] if parts.contains(&"proc") => return Some("a process's environment"),
+            _ => {}
+        }
+    }
+    None
 }
 
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh"];
@@ -69,6 +96,9 @@ fn check_bash(command: &str) -> Decision {
     let stages = stages(command);
     for (i, stage) in stages.iter().enumerate() {
         if let Some(reason) = check_redirects(&stage.words) {
+            return Decision::Deny(reason);
+        }
+        if let Some(reason) = stage.words.iter().find_map(|w| sensitive(w)) {
             return Decision::Deny(reason);
         }
         let Some(words) = command_words(&stage.words) else {
@@ -263,7 +293,7 @@ fn check_path(raw: &str) -> Decision {
     } else if parts.len() > 1 && parts[..parts.len() - 1].contains(&"archive") {
         Some("write under an archive directory")
     } else {
-        None
+        sensitive(&parts.join("/"))
     };
     denied.map_or(Decision::Allow, Decision::Deny)
 }
@@ -415,6 +445,22 @@ mod tests {
             ("write", json!({ "content": "no path" })),
             bash("rm -rf /tmp/x; rm -rf /"),
             ("bash", json!({})),
+            bash("cat /zephyr/accounts/a/auth.json"),
+            bash("base64 < ~/.zephyr/secrets.env"),
+            bash("cp claude-code/.credentials.json /tmp/x"),
+            bash("tr '\\0' '\\n' < /proc/1/environ"),
+            bash("cat /proc/self/environ"),
+            bash("printf '#!/bin/sh' > proj/.git/hooks/pre-commit"),
+            bash("ln -s /tmp/h .git/hooks/post-checkout"),
+            ("read", json!({ "path": "/zephyr/accounts/a/auth.json" })),
+            ("read", json!({ "path": "/proc/12/environ" })),
+            ("read", json!({ "file_path": "~/.ssh/id_ed25519" })),
+            (
+                "grep",
+                json!({ "pattern": "x", "path": ".", "glob": "secrets.env" }),
+            ),
+            file("write", "proj/.git/hooks/pre-push"),
+            file("edit", "/zephyr/accounts/a/auth.json"),
         ];
         let allow: Vec<(&str, Value)> = vec![
             bash("rm -rf ./build"),
@@ -448,6 +494,13 @@ mod tests {
             file("edit", "~/memory/MEMORY.md"),
             file("write", "/home/user/Projects/x/../y.txt"),
             ("read", json!({ "path": "/etc/hosts" })),
+            ("read", json!({ "path": "src/auth.rs" })),
+            ("read", json!({ "path": "docs/environ.md" })),
+            ("grep", json!({ "pattern": "auth.json", "path": "src" })),
+            bash("grep -rn auth src"),
+            bash("cat .git/HEAD"),
+            bash("ls /proc/1"),
+            file("write", "src/auth.json.rs"),
             ("some_other_tool", json!({ "command": "rm -rf /" })),
         ];
         assert!(deny.len() >= 30 && allow.len() >= 30, "table too small");
