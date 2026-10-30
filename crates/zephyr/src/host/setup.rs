@@ -247,7 +247,7 @@ fn login(
         Some(t) => Some(t),
         None if provider == "claude-code" => {
             println!("Sign in with your Claude subscription.");
-            // `script` keeps a transcript to read the token from; a wide pty keeps it on one line.
+            // `script` keeps a transcript to read the token from.
             let log = "/tmp/zephyr-setup-token";
             let signed = run(&mut h.exec(
                 &["-it"],
@@ -255,16 +255,14 @@ fn login(
                 &[
                     "sh",
                     "-c",
-                    &format!(
-                        "umask 077; script -qec 'stty cols 1000; {CLAUDE_CLI} setup-token' {log}"
-                    ),
+                    &format!("umask 077; script -qec '{CLAUDE_CLI} setup-token' {log}"),
                 ],
             ));
             let text =
                 output(&mut h.exec(&[], &[], &["sh", "-c", &format!("cat {log}; rm -f {log}")]));
             signed?;
             match text.ok().as_deref().and_then(setup_token) {
-                Some(t) => Some(t.to_string()),
+                Some(t) => Some(t),
                 None => Some(
                     Password::new()
                         .with_prompt("Paste the token it printed (hidden)")
@@ -507,14 +505,32 @@ fn channel_add(h: &Host, kind: &str) -> anyhow::Result<()> {
     h.data.save(&doc)
 }
 
-/// The token `claude setup-token` printed, from its transcript.
-fn setup_token(transcript: &str) -> Option<&str> {
+/// The token `claude setup-token` printed, from its transcript. The terminal may wrap it, so
+/// escapes and line breaks up to the "Store" line after it are dropped; anything else fails.
+fn setup_token(transcript: &str) -> Option<String> {
     let start = transcript.rfind("sk-ant-oat01-")?;
     let rest = &transcript[start..];
-    let end = rest
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-        .unwrap_or(rest.len());
-    Some(&rest[..end])
+    let rest = &rest[..rest.find("Store").unwrap_or(rest.len())];
+    let mut token = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // CSI escape: ESC [ params, ended by a byte in @..~
+            '\x1b' => {
+                if chars.next() == Some('[') {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+            }
+            c if c.is_whitespace() => {}
+            c if c.is_ascii_alphanumeric() || c == '-' || c == '_' => token.push(c),
+            _ => return None,
+        }
+    }
+    (token.len() > "sk-ant-oat01-".len()).then_some(token)
 }
 
 #[cfg(test)]
@@ -523,8 +539,17 @@ mod tests {
 
     #[test]
     fn reads_the_token_from_the_setup_token_transcript() {
-        let t = "\x1b[1m Your OAuth token (valid for 1 year):\x1b[22m\r\n\r\n sk-ant-oat01-Ab_c-9\x1b[0m\r\n Store";
-        assert_eq!(setup_token(t), Some("sk-ant-oat01-Ab_c-9"));
+        let t = "\x1b[1m Your OAuth token (valid for 1 year):\x1b[22m\r\n\r\n sk-ant-oat01-Ab_c-9\x1b[0m\r\n\r\n Store";
+        assert_eq!(setup_token(t).as_deref(), Some("sk-ant-oat01-Ab_c-9"));
+        let wrapped = " sk-ant-oat01-Ab_c\r\n-9xy\x1b[39m\r\n\r\n Store this token";
+        assert_eq!(
+            setup_token(wrapped).as_deref(),
+            Some("sk-ant-oat01-Ab_c-9xy")
+        );
+        assert_eq!(
+            setup_token("sk-ant-oat01-ab\r\n Use this: <x>\r\n Store"),
+            None
+        );
         assert_eq!(setup_token("Login cancelled\r\n"), None);
     }
 }
