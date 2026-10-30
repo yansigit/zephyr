@@ -250,13 +250,20 @@ fn normalize(screen: &str) -> String {
     screen
         .lines()
         .map(|l| {
-            // The mascot's wind trail (columns 11-14) blows while a run goes.
+            // The mascot's breath (columns 11-13) blows while a run goes.
             let chars: Vec<char> = l.chars().collect();
-            let l = &match chars.get(11..15) {
-                Some(trail) if trail.iter().any(|c| matches!(c, '≈' | '≋' | '~')) => {
+            let l = &match chars.get(11..14) {
+                Some(trail) if trail.iter().any(|c| matches!(c, '∼' | '≈' | '≋' | '~')) => {
                     let mut c = chars.clone();
-                    c.splice(11..15, "~~~~".chars());
+                    c.splice(11..14, "~~~".chars());
                     c.into_iter().collect()
+                }
+                _ => l.to_string(),
+            };
+            // The "down" server drops each reconnect: EOF or a reset by timing, so the reason varies.
+            let l = &match l.find("reconnecting…  ") {
+                Some(i) if l.contains("your draft is kept") => {
+                    format!("{}reconnecting… your draft is kept", &l[..i])
                 }
                 _ => l.to_string(),
             };

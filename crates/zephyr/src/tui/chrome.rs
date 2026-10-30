@@ -103,14 +103,14 @@ fn dotted(parts: &[String], p: &Palette) -> String {
 
 /// Below this width the header is one row, without the mascot.
 const MASCOT_MIN_WIDTH: usize = 60;
-/// The mascot's columns: an 11-column cloud, a 4-column wind trail and a space.
+/// The mascot's columns: an 11-column cloud, a 3-column breath and a 2-column gap.
 const MASCOT_WIDTH: usize = 16;
 
 /// How the mascot looks: what zephyr is doing, at a glance.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Mood {
     Idle,
-    /// A run is going: the eyes look downwind and the trail blows.
+    /// A run is going: the face looks downwind and the cloud blows.
     Working,
     /// Paused, or not connected yet.
     Asleep,
@@ -140,71 +140,87 @@ impl Mood {
 
 /// Zephyr's mascot, a small cloud puffing the west wind: three rows of [`MASCOT_WIDTH`] columns.
 pub fn mascot(mood: Mood, p: &Palette, now: i64) -> [String; 3] {
-    let eyes = match mood {
-        Mood::Idle => "  ●   ●  ",
-        Mood::Working => "   ●   ● ",
-        Mood::Asleep => "  ━   ━  ",
-        Mood::Troubled => "  ×   ×  ",
+    let (eye, mouth) = match mood {
+        Mood::Idle => ("•", "◡"),
+        Mood::Working => ("•", "o"),
+        Mood::Asleep => ("─", "◡"),
+        Mood::Troubled => ("×", "~"),
     };
-    // Three frames, about two a second: the wind leaves the cloud.
-    let frame = (now / 400).rem_euclid(3) as usize;
-    let (gust, trail) = match mood {
-        Mood::Working => (
-            ["≈   ", " ≈  ", "  ≈ "][frame],
-            ["≈≋  ", " ≈≋ ", "  ≈≋"][frame],
-        ),
-        Mood::Idle => ("≈   ", "    "),
-        Mood::Asleep | Mood::Troubled => ("    ", "    "),
+    // Three frames, about two a second: the breath grows out of the cloud's side.
+    let breath = match mood {
+        Mood::Idle => "∼",
+        Mood::Working => ["∼", "≈∼", "≋≈∼"][(now / 400).rem_euclid(3) as usize],
+        Mood::Asleep | Mood::Troubled => "",
     };
-    let zz = p.muted.fg(if mood == Mood::Asleep {
-        " z   "
+    let unicode = super::theme::unicode();
+    let breath = if unicode {
+        breath
     } else {
-        "     "
-    });
-    let wind = if mood == Mood::Working {
-        p.accent
-    } else {
-        p.dim
+        &"~~~"[..breath.chars().count()]
     };
-    let eye_color = if mood == Mood::Troubled {
-        p.error
-    } else {
-        p.cloud_eyes
+    let breath = match mood {
+        Mood::Working => p.accent,
+        _ => p.dim,
+    }
+    .fg(&format!("{breath:<5}"));
+    let mark = match mood {
+        Mood::Asleep => p.muted.fg(" z   "),
+        Mood::Troubled => p.error.fg(" !   "),
+        _ => " ".repeat(5),
     };
-    if !super::theme::unicode() {
-        let ascii = |t: &str| {
-            t.replace('●', "o")
-                .replace('×', "x")
-                .replace('━', "-")
-                .replace(['≈', '≋'], "~")
-        };
+    let cloud = |s: &str| p.cloud.fg(s);
+    if !unicode {
+        let mouth = if mood == Mood::Working { "O" } else { mouth };
+        let face = format!(" .({eye} {mouth} {eye})-.")
+            .replace('•', "o")
+            .replace('◡', "u")
+            .replace('─', "-")
+            .replace('×', "x");
         return [
-            format!("{}{zz}", p.cloud.fg("  .-. .--. ")),
-            format!(
-                "{}{} ",
-                p.cloud.fg(&format!("({})", ascii(eyes))),
-                wind.fg(&ascii(gust))
-            ),
-            format!("{}{} ", p.cloud.fg(" `-------' "), wind.fg(&ascii(trail))),
+            format!("{}{mark}", cloud("   .--.    ")),
+            format!("{}{breath}", cloud(&face)),
+            format!("{}     ", cloud("(_________)")),
         ];
     }
-    // A big puff and a small one on top, the face across the middle, a rounded base: drawn
-    // in quarter blocks, two pixels to a column.
-    let face = p.cloud.bg(&eye_color.fg(eyes));
-    [
-        format!("{}{zz}", p.cloud.fg("  ▄▟██▙▗▄▖ ")),
+    // A big puff and a small one on top, rounded below, drawn in quarter blocks. Working, the
+    // face looks downwind, a column to the right.
+    let at = 2 + usize::from(mood == Mood::Working);
+    let solid = |n: usize| "█".repeat(n);
+    // Inverse video keeps the cloud solid behind the face under NO_COLOR.
+    let on_cloud = |g: &str, ink: rpi_tui::theme::Color| {
         format!(
-            "{}{face}{}{} ",
-            p.cloud.fg("▗"),
-            p.cloud.fg("▙"),
-            wind.fg(gust)
+            "{}{}{}\x1b[0m",
+            p.cloud.to_fg(),
+            ink.to_bg(),
+            rpi_tui::ansi::inverse(g)
+        )
+    };
+    let (eye, mouth) = (on_cloud(eye, p.cloud_eyes), on_cloud(mouth, p.cloud_eyes));
+    let cheek = if mood == Mood::Troubled || p.cloud_blush == p.cloud {
+        cloud("█")
+    } else {
+        on_cloud("▀", p.cloud_blush)
+    };
+    let one = cloud("█");
+    [
+        format!("{}{mark}", cloud(" ▄▟███▖▄▄▖ ")),
+        format!(
+            "{}{eye}{one}{mouth}{one}{eye}{}{breath}",
+            cloud(&format!("▟{}", solid(at - 1))),
+            cloud(&solid(6 - at))
         ),
-        format!("{}{} ", p.cloud.fg("▝█████████▛"), wind.fg(trail)),
+        format!(
+            "{}{cheek}{}{cheek}{}     ",
+            cloud(&format!("▀{}", solid(at - 2))),
+            cloud(&solid(5)),
+            cloud(&format!("{}▀", solid(4 - at)))
+        ),
     ]
 }
 
-/// The cloud beside three rows: `zephyr · main · account › model`, the channels with today's
-/// spend, then a rule. Narrower than [`MASCOT_MIN_WIDTH`], one row without the cloud.
+/// The cloud beside three rows: `zephyr v0.1.0` with the pause badge, `session · account ›
+/// model`, then the channels with today's spend; then a rule. Narrower than
+/// [`MASCOT_MIN_WIDTH`], one row without the cloud.
 pub fn header(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
     if width < MASCOT_MIN_WIDTH {
         return compact_header(s, p, width);
@@ -215,13 +231,21 @@ pub fn header(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
     } else {
         &snap.session
     };
-    let mut title = vec![p.accent.fg(&bold("zephyr")), p.text.fg(session)];
-    title.push(match &s.link {
-        Link::Connecting(_) => p.muted.fg(&format!("connecting{}", glyph("…"))),
-        Link::Down { .. } => p.warning.fg(&format!("reconnecting{}", glyph("…"))),
-        Link::Up => account_model(snap, p),
-    });
-    let title = dotted(&title, p);
+    let mut name = p.accent.fg(&bold("zephyr"));
+    if !snap.version.is_empty() {
+        name.push_str(&p.dim.fg(&format!(" v{}", snap.version)));
+    }
+    let title = dotted(
+        &[
+            p.text.fg(session),
+            match &s.link {
+                Link::Connecting(_) => p.muted.fg(&format!("connecting{}", glyph("…"))),
+                Link::Down { .. } => p.warning.fg(&format!("reconnecting{}", glyph("…"))),
+                Link::Up => account_model(snap, p),
+            },
+        ],
+        p,
+    );
     let paused = paused_badge(s, p).unwrap_or_default();
     let mut channels = channel_dots(s, p);
     let mut right: Vec<String> = failed(s, p).into_iter().collect();
@@ -242,16 +266,11 @@ pub fn header(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
             None => drop(right.pop()),
         }
     };
-    let version = if snap.version.is_empty() {
-        String::new()
-    } else {
-        p.dim.fg(&format!("v{} ", snap.version))
-    };
     let [m0, m1, m2] = mascot(Mood::of(s), p, now);
     let rule = format!(" {} ", glyph("─").repeat(width.saturating_sub(2)));
     vec![
-        format!("{m0}{}", spread("", &version, text)),
-        format!("{m1}{}", spread(&title, &format!("{paused} "), text)),
+        format!("{m0}{}", spread(&name, &format!("{paused} "), text)),
+        format!("{m1}{}", spread(&title, "", text)),
         format!("{m2}{status}"),
         p.dim.fg(&rule),
     ]
@@ -356,7 +375,8 @@ fn compact_header(s: &State, p: &Palette, width: usize) -> Vec<String> {
     vec![top, p.dim.fg(&rule)]
 }
 
-/// The one-row status line: what zephyr is doing now. Blank when idle and connected.
+/// The one-row status line: what zephyr is doing now. No row when idle and connected, so the
+/// transcript's own spacer is the one blank row above the input.
 pub fn run_line(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
     let run = &s.snapshot.run;
     let (left, right) = match &s.link {
@@ -431,7 +451,7 @@ pub fn run_line(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
                     String::new(),
                 )
             } else {
-                (String::new(), String::new())
+                return vec![];
             }
         }
     };
@@ -677,13 +697,13 @@ mod tests {
         for row in &wide {
             assert_eq!(rpi_tui::visible_width(row), 120, "{row:?}");
         }
-        assert_eq!(&wide[0][..], format!("  ▄▟██▙▗▄▖ {}", " ".repeat(109)));
-        assert!(
-            wide[1].starts_with("▗  ●   ●  ▙≈    zephyr · main · claude-code-1 › claude-opus-5-5"),
-            "{wide:?}"
+        assert_eq!(wide[0].trim_end(), " ▄▟███▖▄▄▖      zephyr");
+        assert_eq!(
+            wide[1].trim_end(),
+            "▟█•█◡█•████∼    main · claude-code-1 › claude-opus-5-5"
         );
         assert!(
-            wide[2].starts_with("▝█████████▛     discord ●  imessage ◐  chat ○"),
+            wide[2].starts_with("▀▀█████▀██▀     discord ●  imessage ◐  chat ○"),
             "{wide:?}"
         );
         assert!(
@@ -708,17 +728,19 @@ mod tests {
 
         let mut paused = up();
         paused.snapshot.paused = Some("user".into());
+        paused.snapshot.version = "0.1.0".into();
         let h = plain(header(&paused, &DARK, 80, NOW));
-        assert!(h[1].trim_end().ends_with("⏸ paused"), "{h:?}");
-        assert!(h[0].contains("z"), "an asleep cloud: {h:?}");
+        assert!(h[0].starts_with(" ▄▟███▖▄▄▖  z   zephyr v0.1.0 "), "{h:?}");
+        assert!(h[0].trim_end().ends_with("⏸ paused"), "{h:?}");
+        assert!(h[1].starts_with("▟█─█◡█─████"), "an asleep cloud: {h:?}");
 
         let mut down = up();
         down.link = Link::Down {
             why: "refused".into(),
         };
         let h = plain(header(&down, &DARK, 80, NOW));
-        assert!(h[1].contains("zephyr · main · reconnecting…"), "{h:?}");
-        assert!(h[1].contains("×   ×"), "{h:?}");
+        assert!(h[1].contains("     main · reconnecting…"), "{h:?}");
+        assert!(h[1].starts_with("▟█×█~█×████ "), "{h:?}");
         assert!(
             !h[2].contains("discord"),
             "stale channel dots are hidden: {h:?}"
@@ -749,15 +771,15 @@ mod tests {
     fn the_cloud_shows_the_mood_and_blows_while_working() {
         let face = |s: &State, now| plain(mascot(Mood::of(s), &DARK, now).to_vec())[1].clone();
         let mut s = up();
-        assert_eq!(face(&s, NOW), "▗  ●   ●  ▙≈    ");
+        assert_eq!(face(&s, NOW), "▟█•█◡█•████∼    ");
         s.snapshot.run.busy = true;
         let frames: Vec<String> = (0..3).map(|k| face(&s, k * 400)).collect();
         assert_eq!(
             frames,
-            ["▗   ●   ● ▙≈    ", "▗   ●   ● ▙ ≈   ", "▗   ●   ● ▙  ≈  "]
+            ["▟██•█o█•███∼    ", "▟██•█o█•███≈∼   ", "▟██•█o█•███≋≈∼  "]
         );
         s.snapshot.failed_replies = 1;
-        assert!(face(&s, NOW).contains("×   ×"));
+        assert_eq!(face(&s, NOW), "▟█×█~█×████     ");
         for mood in [Mood::Idle, Mood::Working, Mood::Asleep, Mood::Troubled] {
             for row in mascot(mood, &DARK, NOW) {
                 assert_eq!(
@@ -771,7 +793,7 @@ mod tests {
 
     #[test]
     fn run_line_tells_every_state() {
-        let line = |s: &State| plain(run_line(s, &DARK, 80, NOW)).remove(0);
+        let line = |s: &State| plain(run_line(s, &DARK, 80, NOW)).concat();
         let mut s = State::default();
         assert!(line(&s).contains("connecting to zephyr…"));
         s.link = Link::Connecting(Some("zephyr is not answering yet".into()));
@@ -786,7 +808,7 @@ mod tests {
         );
 
         let mut s = up();
-        assert_eq!(line(&s).trim(), "", "idle is blank");
+        assert!(run_line(&s, &DARK, 80, NOW).is_empty(), "idle takes no row");
         s.snapshot.paused = Some("user".into());
         assert!(line(&s).contains("⏸ paused: new messages wait until /resume"));
         s.snapshot.paused = None;

@@ -451,16 +451,18 @@ struct Panel {
 
 impl Component for Panel {
     fn render(&self, width: usize) -> Vec<String> {
-        let rows = crossterm::terminal::size().map_or(24, |(_, h)| h as usize);
+        let (cols, rows) =
+            crossterm::terminal::size().map_or((80, 24), |(w, h)| (w as usize, h as usize));
         let now = crate::unix_millis() as i64;
         let mut s = self.state.lock().unwrap();
+        // Below the header, above the footer: a panel taller than that scrolls instead.
+        let height = rows.saturating_sub(chrome::header(&s, &self.p, cols, now).len() + 1);
         let snap = s.snapshot.clone();
         let Some(o) = s.overlay.as_mut() else {
             return vec![];
         };
         let list = overlays::rows(o, &snap, &self.p, &self.tz, now);
-        // Below the header's two rows, above the footer.
-        overlays::render(o, &list, &self.p, width, rows.saturating_sub(3))
+        overlays::render(o, &list, &self.p, width, height)
     }
     fn invalidate(&self) {}
     fn as_any(&self) -> &dyn Any {
