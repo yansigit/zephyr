@@ -1043,7 +1043,7 @@ async fn unknown_models_and_bad_edits_change_nothing() {
     let home = home("model-bad");
     let gw = start(on_file(&home, ""));
     gw.say("m1", "owner", "hi").await;
-    gw.wait_replies(1).await; // the child is up, so rpi checks the model
+    gw.wait_replies(1).await;
     gw.say("m2", "owner", "/model fake/nope").await;
     gw.say("m3", "owner", "/model third/x").await;
     gw.wait_replies(3).await;
@@ -1052,7 +1052,10 @@ async fn unknown_models_and_bad_edits_change_nothing() {
     gw.say("m5", "owner", "still there?").await;
     let replies = gw.wait_replies(5).await;
     assert_eq!(replies[1], "[zephyr] rpi has no model fake/nope");
-    assert_eq!(replies[2], "[zephyr] rpi has no model third/x");
+    assert_eq!(
+        replies[2],
+        "[zephyr] model not changed: no account is signed in to third; run `zephyr login third`"
+    );
     assert!(
         replies[3].starts_with("[zephyr] zephyr.toml not applied: "),
         "{replies:?}"

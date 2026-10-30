@@ -179,7 +179,7 @@ There are no per-call prompts. These hard limits hold every time:
   - `extensions`, `policy_plugin`, `agent_dir`, the active account changing (the pool would now pick another), a model on another provider, or a newer `auth.json` for the active account (a re-login): **restart the child** when idle, as the AuthKeeper does, on the same session.
   - The active account's model on the same provider: **`set_model`** when idle (before reconcile sends the next row). rpi checks it against its catalogue; the sign-in stays the same, so the bound credentials (§4.7) are still right. A refusal is told to the owner.
   - Anything else (budget, owners, time zone, `[auth]`, the pool order): read where it is used.
-- **`/model PROVIDER/MODEL`** checks the model with `get_available_models`, sets it on the active account if that is on the provider, else on the first account that is, moved to the front, writes `zephyr.toml` (atomically, comments kept), then reloads. `/status` adds the agent's account and model to what `zephyr status` prints.
+- **`/model PROVIDER/MODEL`** sets it on the active account if that is on the provider, else on the first account that is, moved to the front; checks that `rpi --list-models`, signed in as that account, lists it (the running child lists only its own sign-in's models); writes `zephyr.toml` (atomically, comments kept), then reloads. `/status` adds the agent's account and model to what `zephyr status` prints.
 
 ## 5. Repo layout
 

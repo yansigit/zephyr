@@ -523,30 +523,28 @@ impl<'a> Router<'a> {
         lines.join("\n")
     }
 
-    /// `/model PROVIDER/MODEL`: checks rpi knows the model, writes it to `zephyr.toml` on the
-    /// account for that provider (`reload::set_model`), then reloads.
+    /// `/model PROVIDER/MODEL`: sets it on the account for that provider in `zephyr.toml`
+    /// (`reload::set_model`), checks that account's rpi lists it, saves, then reloads.
     async fn switch_model(&mut self, model: &str) -> String {
         let Some(path) = self.cfg.path.clone() else {
             return "[zephyr] no zephyr.toml to change".into();
         };
-        if let Ok(list) = self.call(json!({"type": "get_available_models"})).await {
-            let known = list["models"].as_array().into_iter().flatten().any(|m| {
-                format!(
-                    "{}/{}",
-                    m["provider"].as_str().unwrap_or(""),
-                    m["id"].as_str().unwrap_or("")
-                ) == model
-            });
-            if !known {
-                return format!("[zephyr] rpi has no model {model}");
-            }
-        }
         let active = self.account.as_ref().map(|a| a.name.clone());
-        let saved = crate::host::conf::load(&path).and_then(|mut doc| {
+        let doc = match crate::host::conf::load(&path).and_then(|mut doc| {
             crate::reload::set_model(&mut doc, active.as_deref(), model)?;
-            crate::host::conf::save(&path, &doc)
-        });
-        match saved {
+            Ok(doc)
+        }) {
+            Ok(doc) => doc,
+            Err(e) => return format!("[zephyr] model not changed: {e:#}"),
+        };
+        let target = crate::host::conf::accounts(&doc)
+            .into_iter()
+            .find(|(_, m)| m == model)
+            .and_then(|(name, _)| self.cfg.accounts.iter().find(|a| a.name == name).cloned());
+        if !lists(&self.cfg.clone(), target.as_ref(), model).await {
+            return format!("[zephyr] rpi has no model {model}");
+        }
+        match crate::host::conf::save(&path, &doc) {
             Ok(()) => self.reload().await,
             Err(e) => format!("[zephyr] model not changed: {e:#}"),
         }
@@ -810,6 +808,39 @@ impl<'a> Router<'a> {
             None => anyhow::bail!("rpi child is not running"),
         }
     }
+}
+
+/// Whether `rpi --list-models`, signed in as `account`, lists `model`. A listing that fails
+/// says nothing, so it counts as yes. The running child lists only its own sign-in's models.
+async fn lists(cfg: &Config, account: Option<&Account>, model: &str) -> bool {
+    let dir = match account {
+        Some(a) => crate::pool::prepare(cfg, a).ok(),
+        None => Some(crate::auth_keeper::agent_dir(cfg)),
+    };
+    let mut cmd = tokio::process::Command::new(&cfg.rpi);
+    cmd.arg("--list-models")
+        .current_dir(&cfg.home)
+        .kill_on_drop(true);
+    for ext in &cfg.extensions {
+        cmd.arg("--extension").arg(ext);
+    }
+    if let Some(dir) = dir {
+        cmd.env("RPI_CODING_AGENT_DIR", dir);
+    }
+    let out = tokio::time::timeout(Duration::from_secs(30), cmd.output()).await;
+    let Ok(Ok(out)) = out.map_err(drop) else {
+        return true;
+    };
+    if !out.status.success() {
+        return true;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .skip(1)
+        .any(|l| {
+            let mut cols = l.split_whitespace();
+            matches!((cols.next(), cols.next()), (Some(p), Some(m)) if format!("{p}/{m}") == model)
+        })
 }
 
 /// The account a child on `cfg` would run on: `Ok(None)` without a pool, `Err(until)` when

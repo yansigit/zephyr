@@ -29,6 +29,7 @@ pub const USED_COMMANDS: &[&str] = &[
     "get_stats",
     "resume_pending",
     "get_auth_status",
+    "set_model",
     "stop",
 ];
 
