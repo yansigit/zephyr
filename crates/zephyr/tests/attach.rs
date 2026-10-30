@@ -533,6 +533,38 @@ async fn status_until(c: &mut Client, done: impl Fn(&Value) -> bool) -> Value {
     }
 }
 
+/// rpi sends no event for a prompt, so the router reports each user turn itself: once, even when
+/// `/stop` clears rpi's queue and the router sends a queued message again.
+#[tokio::test]
+async fn each_user_turn_is_shown_once_even_when_sent_again() {
+    let gw = start("requeue");
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    c.call("zephyr.subscribe", json!({})).await;
+    gw.say("m1", "[hang] first").await;
+    wait(|| gw.log("prompt").len() == 1).await;
+    gw.say("m2", "second").await;
+    wait(|| gw.log("queue_message").len() == 1).await;
+    gw.say("m3", "/stop").await;
+    let mut turns = Vec::new();
+    loop {
+        let ev = c.event().await;
+        if ev["type"] == "message_end" && ev["message"]["role"] == "user" {
+            turns.push(ev["message"]["text"].as_str().unwrap().to_string());
+        }
+        if ev["type"] == "message_end" && text(&ev) == "echo: [chat #2] second" {
+            break;
+        }
+    }
+    assert_eq!(
+        gw.log("prompt").len(),
+        2,
+        "second is sent again after the stop"
+    );
+    assert_eq!(turns, ["[hang] first", "second"]);
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn zephyr_subscribe_replays_raw_history_and_streams_status_and_replies() {
     let gw = start("zsub");

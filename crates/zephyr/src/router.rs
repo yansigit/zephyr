@@ -205,6 +205,7 @@ pub async fn run<C: Channel>(
         snap,
         names: channels.iter().map(|c| c.name().to_string()).collect(),
         thinking: None,
+        shown: 0,
         run_start: None,
         cut: None,
     };
@@ -336,6 +337,9 @@ struct Router<'a> {
     names: Vec<String>,
     /// rpi's thinking level, read from `get_state` when the child starts.
     thinking: Option<String>,
+    /// The last inbox row whose user turn went to attached clients. Rows go out in id order,
+    /// so one sent again (after `/stop` cleared rpi's queue, or a fail-over) is not shown twice.
+    shown: i64,
 }
 
 async fn next_event(child: &mut Option<Child>) -> Option<Value> {
@@ -725,11 +729,14 @@ impl<'a> Router<'a> {
 
     /// rpi 0.12 sends no message events for a prompt it accepts, so the router reports the user
     /// turn itself: on the tap for attached clients and, when it starts a run, as its origin.
-    fn user_turn(&self, row: &InboxRow, text: &str, starts_run: bool) {
-        let m = json!({"role": "user", "kind": "user", "content": [{"type": "text", "text": text}],
-                       "timestamp": crate::unix_millis() as i64});
-        for kind in ["message_start", "message_end"] {
-            let _ = self.tap.send(json!({"type": kind, "message": m}));
+    fn user_turn(&mut self, row: &InboxRow, text: &str, starts_run: bool) {
+        if row.id > self.shown {
+            self.shown = row.id;
+            let m = json!({"role": "user", "kind": "user", "content": [{"type": "text", "text": text}],
+                           "timestamp": crate::unix_millis() as i64});
+            for kind in ["message_start", "message_end"] {
+                let _ = self.tap.send(json!({"type": kind, "message": m}));
+            }
         }
         if starts_run {
             let origin = Origin {
