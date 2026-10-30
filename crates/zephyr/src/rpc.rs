@@ -26,7 +26,6 @@ pub const USED_COMMANDS: &[&str] = &[
     "abort",
     "get_state",
     "get_messages",
-    "get_stats",
     "resume_pending",
     "get_auth_status",
     "set_model",
@@ -189,6 +188,18 @@ impl Child {
 }
 
 /// The text of a wire message: a plain string, or the `text` blocks of a content list.
+/// What an assistant `message_end` event used: `(totalTokens, cost.total)`. rpi's `get_stats`
+/// sums only usage that extensions record, never the replies' own, so spend is summed from these.
+pub fn usage(ev: &Value) -> Option<(i64, f64)> {
+    let m = &ev["message"];
+    (ev["type"] == "message_end" && m["role"] == "assistant").then(|| {
+        (
+            m["usage"]["totalTokens"].as_i64().unwrap_or(0),
+            m["usage"]["cost"]["total"].as_f64().unwrap_or(0.0),
+        )
+    })
+}
+
 pub fn message_text(msg: &Value) -> String {
     match &msg["content"] {
         Value::String(s) => s.clone(),

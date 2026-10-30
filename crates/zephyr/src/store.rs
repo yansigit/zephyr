@@ -309,27 +309,6 @@ impl Store {
         self.db.query_row("SELECT date('now')", [], |r| r.get(0))
     }
 
-    /// rpi's session totals at the last settle, so each settle adds only its own usage.
-    pub fn last_stats(&self) -> rusqlite::Result<(i64, f64)> {
-        let v: Option<String> = self
-            .db
-            .query_row("SELECT value FROM meta WHERE key = 'stats'", [], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        Ok(v.and_then(|v| serde_json::from_str(&v).ok())
-            .unwrap_or_default())
-    }
-
-    pub fn set_last_stats(&self, (tokens, cost): (i64, f64)) -> rusqlite::Result<()> {
-        let v = serde_json::json!([tokens, cost]).to_string();
-        self.db.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES ('stats', ?1)",
-            params![v],
-        )?;
-        Ok(())
-    }
-
     /// Adds usage to the day's total and returns the new total.
     pub fn add_spend(&self, day: &str, tokens: i64, cost: f64) -> rusqlite::Result<(i64, f64)> {
         self.db.execute(
@@ -697,13 +676,10 @@ mod tests {
     }
 
     #[test]
-    fn spend_and_stats_accumulate() {
+    fn spend_accumulates() {
         let dir = crate::test_dir("store-spend");
         let store = Store::open(&dir.join("state.db")).unwrap();
         let day = store.today().unwrap();
-        assert_eq!(store.last_stats().unwrap(), (0, 0.0));
-        store.set_last_stats((40, 0.5)).unwrap();
-        assert_eq!(store.last_stats().unwrap(), (40, 0.5));
         assert_eq!(store.add_spend(&day, 10, 0.25).unwrap(), (10, 0.25));
         assert_eq!(store.add_spend(&day, 5, 0.25).unwrap(), (15, 0.5));
         assert_eq!(store.spend("2000-01-01").unwrap(), (0, 0.0));

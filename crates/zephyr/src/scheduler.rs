@@ -215,8 +215,9 @@ async fn attempt_once(
         Err(e) => return ("failed", format!("{label} could not start: {e:#}"), false),
     };
     let limit = cfg.job_timeout;
+    let mut used = (0, 0.0);
     let ended = tokio::select! {
-        r = tokio::time::timeout(limit, prompt(&mut child, &run.job.prompt)) => Some(r),
+        r = tokio::time::timeout(limit, prompt(&mut child, &run.job.prompt, &mut used)) => Some(r),
         _ = until_paused(store) => None,
     };
     let out = match ended {
@@ -232,41 +233,36 @@ async fn attempt_once(
             ("failed", format!("{label} was aborted{why}"))
         }
     };
-    // A fresh session, so its totals are this run's usage.
-    let stats = child.call(json!({"type": "get_stats"}));
-    let crossed = match tokio::time::timeout(Duration::from_secs(5), stats).await {
-        Ok(Ok(stats)) => {
-            let used = (
-                stats["totalTokens"].as_i64().unwrap_or(0),
-                stats["costTotal"].as_f64().unwrap_or(0.0),
-            );
-            if let Some(a) = account {
-                let _ = store.add_account_spend(&a.name, used);
-            }
-            store.charge(cfg.budget.as_ref(), used).unwrap_or_else(|e| {
-                eprintln!("zephyr: recording job spend failed: {e}");
-                false
-            })
-        }
-        _ => {
-            eprintln!("zephyr: no get_stats from {label}; its spend is not counted");
-            false
-        }
-    };
+    if let Some(a) = account {
+        let _ = store.add_account_spend(&a.name, used);
+    }
+    let crossed = store.charge(cfg.budget.as_ref(), used).unwrap_or_else(|e| {
+        eprintln!("zephyr: recording job spend failed: {e}");
+        false
+    });
     child.stop().await;
     (out.0, out.1, crossed)
 }
 
-/// Sends the prompt and waits for the run to settle. The inner result is the final
-/// assistant text, or why the run ended without one.
-async fn prompt(child: &mut Child, text: &str) -> anyhow::Result<anyhow::Result<String>> {
+/// Sends the prompt and waits for the run to settle, adding the replies' usage to `used`. The
+/// inner result is the final assistant text, or why the run ended without one.
+async fn prompt(
+    child: &mut Child,
+    text: &str,
+    used: &mut (i64, f64),
+) -> anyhow::Result<anyhow::Result<String>> {
     child
         .call(json!({"type": "prompt", "message": text}))
         .await?;
     let settled = loop {
         match child.events.recv().await {
             Some(ev) if ev["type"] == "agent_settled" => break ev,
-            Some(_) => {}
+            Some(ev) => {
+                if let Some((tokens, cost)) = crate::rpc::usage(&ev) {
+                    used.0 += tokens;
+                    used.1 += cost;
+                }
+            }
             None => anyhow::bail!("rpi exited mid-run"),
         }
     };

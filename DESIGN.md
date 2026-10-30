@@ -115,7 +115,7 @@ There are no per-call prompts. These hard limits hold every time:
 
    It logs every call to the audit table.
 3. **Untrusted content.** Text from iMessage, Discord, web fetches and files is wrapped as data in the prompt (`<untrusted source=…>`). The policy plugin also blocks outbound sends to any address other than the owner's channels, which limits what a prompt injection can exfiltrate.
-4. **Budgets.** Daily token and cost limits, plus a per-run cap of 60 turns and 30 minutes, taken from `get_stats`. When a limit is hit, the gateway aborts the run and notifies you.
+4. **Budgets.** Daily token and cost limits, summed from the `usage` on each assistant `message_end` event. rpi 0.12.0's `get_stats` totals count only usage that extensions record, never the replies' own, so they stay at 0. When a limit is hit, the gateway pauses and notifies you. (A per-run cap of turns and minutes was planned but is not built.)
 5. **Kill switch.**
    - `/stop` from any owner channel aborts the run.
    - `/pause` stops all dispatch and scheduling until `/resume`.

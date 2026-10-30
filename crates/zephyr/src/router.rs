@@ -75,6 +75,7 @@ pub async fn run<C: Channel>(
         auth_at: Instant::now(),
         restart: false,
         account: None,
+        used: (0, 0.0),
     };
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
@@ -129,6 +130,8 @@ struct Router<'a> {
     auth_at: Instant,
     /// A refresh or a failover needs the child restarted; done once it is idle.
     restart: bool,
+    /// Tokens and cost of the replies since the last settle (`rpc::usage`).
+    used: (i64, f64),
     /// The pooled account the child runs on (DESIGN §4.9). `None` without a pool.
     account: Option<Account>,
 }
@@ -187,9 +190,13 @@ impl<'a> Router<'a> {
         Ok(exit)
     }
 
-    fn tapped(&self, ev: Option<Value>) -> Option<Value> {
+    fn tapped(&mut self, ev: Option<Value>) -> Option<Value> {
         if let Some(ev) = &ev {
             let _ = self.tap.send(ev.clone()); // no receivers is fine
+            if let Some((tokens, cost)) = crate::rpc::usage(ev) {
+                self.used.0 += tokens;
+                self.used.1 += cost;
+            }
         }
         ev
     }
@@ -358,26 +365,14 @@ impl<'a> Router<'a> {
         }
     }
 
-    /// Adds what rpi used since the last settle to today's spend. Returns true when this
-    /// settle crossed a budget limit, and pauses the gateway for the rest of the UTC day.
-    async fn record_spend(&mut self) -> anyhow::Result<bool> {
-        let stats = self.call(json!({"type": "get_stats"})).await?;
-        let total = (
-            stats["totalTokens"].as_i64().unwrap_or(0),
-            stats["costTotal"].as_f64().unwrap_or(0.0),
-        );
-        let last = self.store.last_stats()?;
-        // rpi's totals are per session: a drop means a fresh session, so the whole total is new.
-        let delta = if total.0 >= last.0 {
-            (total.0 - last.0, total.1 - last.1)
-        } else {
-            total
-        };
-        self.store.set_last_stats(total)?;
+    /// Adds what the replies used since the last settle to today's spend. Returns true when
+    /// this settle crossed a budget limit, and pauses the gateway for the rest of the UTC day.
+    fn record_spend(&mut self) -> anyhow::Result<bool> {
+        let used = std::mem::take(&mut self.used);
         if let Some(a) = &self.account {
-            self.store.add_account_spend(&a.name, delta)?;
+            self.store.add_account_spend(&a.name, used)?;
         }
-        Ok(self.store.charge(self.cfg.budget.as_ref(), delta)?)
+        Ok(self.store.charge(self.cfg.budget.as_ref(), used)?)
     }
 
     /// Sends every `new` row: `prompt` when idle, rpi's own `queue_message` when busy.
@@ -408,7 +403,7 @@ impl<'a> Router<'a> {
         self.apply_model().await;
         self.backoff = FIRST_BACKOFF;
         log(crate::memory::commit_if_changed(&self.cfg.home).map(drop));
-        let crossed = self.record_spend().await.unwrap_or_else(|e| {
+        let crossed = self.record_spend().unwrap_or_else(|e| {
             eprintln!("zephyr: recording spend failed: {e:#}");
             false
         });
