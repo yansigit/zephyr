@@ -292,6 +292,27 @@ impl Store {
             .optional()
     }
 
+    /// The main session's id: `main` until `/new` starts another.
+    pub fn main_session(&self) -> rusqlite::Result<String> {
+        let id: Option<String> = self
+            .db
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'main_session'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(id.unwrap_or_else(|| crate::rpc::MAIN_SESSION.into()))
+    }
+
+    pub fn set_main_session(&self, id: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('main_session', ?1)",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     /// `None` clears the pause.
     pub fn set_paused(&self, reason: Option<&str>) -> rusqlite::Result<()> {
         match reason {

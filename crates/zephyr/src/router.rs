@@ -223,7 +223,11 @@ impl<'a> Router<'a> {
                 return;
             }
         };
-        match Child::spawn_as(&self.cfg, MAIN_SESSION, account.as_ref()).await {
+        let session = self.store.main_session().unwrap_or_else(|e| {
+            eprintln!("zephyr: reading the main session id failed: {e}");
+            MAIN_SESSION.into()
+        });
+        match Child::spawn_as(&self.cfg, &session, account.as_ref()).await {
             Ok(child) => {
                 eprintln!("zephyr: rpi child {:?} ready", child.pid());
                 if let Some(a) = &account {
@@ -484,8 +488,27 @@ impl<'a> Router<'a> {
             ("/status", "") => self.status(),
             ("/model", "") => self.models(),
             ("/model", model) => self.switch_model(model).await,
+            ("/new", "") => self.new_session().await,
             _ => return None,
         })
+    }
+
+    /// `/new`: a fresh main session from the next message. The old one stays on disk; memory
+    /// and the rules carry over, since they are files. Long sessions are easier to steer
+    /// (ClawSafety Table 3), so the owner can cut one off.
+    async fn new_session(&mut self) -> String {
+        let id = format!("{MAIN_SESSION}-{}", crate::now());
+        if let Err(e) = self.store.set_main_session(&id) {
+            return format!("[zephyr] no new conversation: {e}");
+        }
+        self.restart = true;
+        let when = if self.busy {
+            "after the current reply"
+        } else {
+            "from the next message"
+        };
+        self.restart_if_idle().await;
+        format!("[zephyr] new conversation {when}; memory and rules are kept")
     }
 
     fn status(&self) -> String {

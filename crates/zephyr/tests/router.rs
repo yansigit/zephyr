@@ -754,6 +754,40 @@ async fn a_job_that_sends_data_out_is_reported_on_its_channel() {
     gw.shutdown().await;
 }
 
+#[tokio::test]
+async fn new_starts_a_fresh_main_session_and_keeps_it_across_restarts() {
+    let home = home("new-session");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "hi").await;
+    assert_eq!(gw.wait_replies(1).await, ["echo: [chat #1] hi"]);
+    gw.say("m2", "owner", "/new").await;
+    assert_eq!(
+        gw.wait_replies(2).await[1],
+        "[zephyr] new conversation from the next message; memory and rules are kept"
+    );
+    gw.say("m3", "owner", "again").await;
+    assert_eq!(gw.wait_replies(3).await[2], "echo: [chat #3] again");
+    let sessions: Vec<String> = log(&home, "start")
+        .iter()
+        .map(|s| s["sessionId"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(sessions[0], "main");
+    let fresh = sessions.last().unwrap();
+    assert!(fresh.starts_with("main-"), "{sessions:?}");
+    // The new session holds only what came after /new.
+    let path = home.join("sessions").join(format!("{fresh}.json"));
+    let held: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(held["messages"][0]["content"], "[chat #3] again");
+    gw.shutdown().await;
+
+    let gw = start(config(&home));
+    gw.say("m4", "owner", "later").await;
+    assert_eq!(gw.wait_replies(1).await, ["echo: [chat #4] later"]);
+    let last = log(&home, "start").last().unwrap()["sessionId"].clone();
+    assert_eq!(last.as_str(), Some(fresh.as_str()));
+    gw.shutdown().await;
+}
+
 fn spend_today(home: &Path) -> (i64, f64) {
     let store = Store::open(&home.join("state.db")).unwrap();
     store.spend(&store.today().unwrap()).unwrap()

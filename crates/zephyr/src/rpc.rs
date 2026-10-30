@@ -11,7 +11,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
 
-/// The session every channel shares (DESIGN §4.1).
+/// The session every channel shares (DESIGN §4.1), until `/new` starts `main-<unix secs>`
+/// (`Store::main_session`). Attach always shows this name.
 pub const MAIN_SESSION: &str = "main";
 
 /// The slash command the policy plugin registers as proof that it loaded.

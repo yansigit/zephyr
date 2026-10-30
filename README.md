@@ -55,11 +55,12 @@ Changes apply by themselves; nothing needs `zephyr restart`. The commands above,
 | Budget, owners, time zone, `[auth]`, the pool order | at once |
 | The model, on the same provider | at once, or after the reply in progress (rpi's `set_model`) |
 | A model on another provider, the active account, extensions, a re-login | the agent restarts after the reply in progress; the conversation carries on |
-| Discord, iMessage, `[attach]`, a secret | the daemon restarts itself in place once idle; waiting messages are kept |
+| Discord, iMessage, `[attach]`, `[agent]`, a secret | the daemon restarts itself in place once idle; waiting messages are kept |
 
 A file that does not load is not applied, and the daemon keeps its current settings. From any
 channel: `/model` shows the models, `/model PROVIDER/MODEL` switches (to the account on that
-provider), `/status` shows the agent's account and model, and `/reload` re-reads the files.
+provider), `/status` shows the agent's account and model, `/reload` re-reads the files, and `/new`
+starts a fresh conversation (memory and rules carry over; the old one stays in `sessions/`).
 
 `ZEPHYR_CONTAINER` (default `zephyr`) and `ZEPHYR_IMAGE` choose another container or image, for
 example to test beside a live install.

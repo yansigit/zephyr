@@ -60,7 +60,7 @@ Upstream analysis (`research/pi-rust-integration.md` §7) compared three options
 
 ### 4.1 Sessions
 
-- **`main`** is one long-lived session shared by all three channels. It is your assistant, so the context continues whichever channel you use. Each inbound message is prefixed with its channel, e.g. `[discord] …`. The reply goes back to the channel the message came from.
+- **`main`** is one long-lived session shared by all three channels. The owner's `/new` starts a fresh one, `main-<unix secs>`, kept in `state.db` so restarts reopen it; the old file stays. Attack success rises with session length (ClawSafety Table 3: 50% at 10 turns, 77.5% at 64). It is your assistant, so the context continues whichever channel you use. Each inbound message is prefixed with its channel, e.g. `[discord] …`. The reply goes back to the channel the message came from.
 - **`job-<id>-<run>`** is a fresh session for each scheduled run, as Hermes and nanobot do. It is deleted after 30 days.
 - **Ordering:** one prompt at a time per child (`maxConcurrentPrompts: 1`).
   - Messages that arrive while the agent is busy go through RPC `queue_message`. This is rpi's own follow-up queue, so we don't build our own.
