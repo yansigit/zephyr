@@ -6,18 +6,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use zephyr::channel::{Channel, Inbound, Outbound};
+use zephyr::channel::{Activity, Channel, Inbound, Outbound};
 use zephyr::config::Config;
 use zephyr::store::{client_id, InboxRow, Store};
 
 /// Each delivered reply, and whether its outbox row was already committed as pending.
 type Sent = Arc<Mutex<Vec<(Outbound, bool)>>>;
+/// Each activity shown, as `<kind> <recipient>`.
+type Acts = Arc<Mutex<Vec<String>>>;
 
 struct TestChannel {
     name: &'static str,
     feed: tokio::sync::Mutex<mpsc::Receiver<Inbound>>,
     db: PathBuf,
     sent: Sent,
+    acts: Acts,
 }
 
 impl Channel for TestChannel {
@@ -42,11 +45,21 @@ impl Channel for TestChannel {
             .push((msg.clone(), pending.as_deref() == Some("pending")));
         Ok(())
     }
+    async fn activity(&self, to: &str, a: &Activity) -> anyhow::Result<()> {
+        let kind = match a {
+            Activity::Start => "start",
+            Activity::Progress { .. } => "progress",
+            Activity::Stop => "stop",
+        };
+        self.acts.lock().unwrap().push(format!("{kind} {to}"));
+        Ok(())
+    }
 }
 
 struct Gateway {
     feeds: HashMap<&'static str, mpsc::Sender<Inbound>>,
     sent: HashMap<&'static str, Sent>,
+    acts: HashMap<&'static str, Acts>,
     stop: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<anyhow::Result<zephyr::router::Exit>>,
 }
@@ -75,17 +88,21 @@ fn config(home: &Path) -> Config {
 fn start(cfg: Config) -> Gateway {
     let mut feeds = HashMap::new();
     let mut sent = HashMap::new();
+    let mut acts = HashMap::new();
     let mut channels = Vec::new();
     for name in ["chat", "discord"] {
         let (feed, rx) = mpsc::channel(16);
         let s = Sent::default();
         feeds.insert(name, feed);
         sent.insert(name, s.clone());
+        let a = Acts::default();
+        acts.insert(name, a.clone());
         channels.push(TestChannel {
             name,
             feed: tokio::sync::Mutex::new(rx),
             db: cfg.db_path(),
             sent: s,
+            acts: a,
         });
     }
     let (stop, stopped) = oneshot::channel::<()>();
@@ -98,6 +115,7 @@ fn start(cfg: Config) -> Gateway {
     Gateway {
         feeds,
         sent,
+        acts,
         stop: Some(stop),
         task,
     }
@@ -1205,4 +1223,23 @@ async fn a_channel_change_ends_the_run_for_a_reexec_once_idle() {
         .unwrap()
         .unwrap();
     assert_eq!(exit, zephyr::router::Exit::Reexec);
+}
+
+// Multi-threaded, as the daemon runs: here the child's events reach the router while the test sleeps.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_shows_activity_on_the_channel_it_serves() {
+    let home = home("activity");
+    let gw = start(config(&home));
+    // The tool runs until `tool_wait` goes, so the run can't be coalesced away.
+    std::fs::write(home.join("tool_wait"), "").unwrap();
+    gw.say_on("discord", "d1", "downer", "[tool] look around")
+        .await;
+    let acts = |c: &str| gw.acts[c].lock().unwrap().clone();
+    wait(|| acts("discord").iter().any(|a| a == "progress downer")).await;
+    assert_eq!(acts("discord")[0], "start downer");
+    std::fs::remove_file(home.join("tool_wait")).unwrap();
+    gw.wait_replies_on("discord", 1).await;
+    wait(|| acts("discord").last().map(String::as_str) == Some("stop downer")).await;
+    assert!(acts("chat").is_empty(), "only the serving channel shows it");
+    gw.shutdown().await;
 }

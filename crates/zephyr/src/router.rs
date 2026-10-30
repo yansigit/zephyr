@@ -1,6 +1,6 @@
 //! Inbound → inbox → `main` child → outbox → channel, with crash recovery (DESIGN §4.2).
 
-use crate::channel::{Channel, Inbound, Outbound};
+use crate::channel::{Activity, Channel, Inbound, Outbound};
 use crate::config::{Account, Config, BUDGET_NOTICE};
 use crate::rpc::{message_text, Child, MAIN_SESSION};
 use crate::store::{InboxRow, Store};
@@ -141,6 +141,7 @@ pub async fn run<C: Channel>(
     let shared = Arc::new(cfg.clone());
     let (cfg_tx, cfg_rx) = watch::channel(shared.clone());
     let (snap, snap_rx) = watch::channel(Snapshot::default());
+    let activity_rx = snap_rx.clone();
     let mut router = Router {
         cfg: shared,
         cfg_tx,
@@ -172,8 +173,71 @@ pub async fn run<C: Channel>(
         r = runs => r.map(|_| Exit::Shutdown),
         r = crate::attach::serve(cfg, tx, attach_tx, snap_rx) => r.map(|()| Exit::Shutdown),
         r = crate::scheduler::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),
+        r = show_activity(channels, activity_rx) => r.map(|()| Exit::Shutdown),
         r = router.main(rx, channels, shutdown) => r,
     }
+}
+
+/// Shows the run on the channel it serves (typing, a progress note), from `Snapshot.run`.
+/// A watch may skip states; diffing what it shows keeps Start and Stop paired anyway.
+async fn show_activity<C: Channel>(
+    channels: &[C],
+    mut rx: watch::Receiver<Snapshot>,
+) -> anyhow::Result<()> {
+    let (mut prev, mut tools) = (Run::default(), Vec::new());
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            r = rx.changed() => if r.is_err() { return std::future::pending().await },
+            _ = tick.tick() => {}
+        }
+        let next = rx.borrow_and_update().run.clone();
+        let now = crate::unix_millis() as i64;
+        for (o, a) in activities(&prev, &next, &mut tools, now) {
+            if let Some(c) = channels.iter().find(|c| c.name() == o.channel) {
+                if let Err(e) = c.activity(&o.sender, &a).await {
+                    eprintln!("zephyr: {} activity failed: {e:#}", o.channel);
+                }
+            }
+        }
+        prev = next;
+    }
+}
+
+/// What to show when the run goes from `prev` to `next`; `tools` collects the run's tool names.
+/// While busy every call repeats Start before Progress: a mid-run notice ends a channel's typing,
+/// and Start is a no-op while it is still up.
+fn activities(
+    prev: &Run,
+    next: &Run,
+    tools: &mut Vec<String>,
+    now_ms: i64,
+) -> Vec<(Origin, Activity)> {
+    let mut out = Vec::new();
+    if prev.origin != next.origin {
+        out.extend(prev.origin.clone().map(|o| (o, Activity::Stop)));
+        tools.clear();
+    }
+    let (true, Some(o)) = (next.busy, &next.origin) else {
+        return out;
+    };
+    let same = prev.origin == next.origin;
+    if let Some(t) = &next.current_tool {
+        if !same || prev.current_tool.as_ref() != Some(t) || prev.tools_done != next.tools_done {
+            tools.push(t.clone());
+        }
+    }
+    let since = next.since_unix_ms.unwrap_or(now_ms);
+    out.push((o.clone(), Activity::Start));
+    out.push((
+        o.clone(),
+        Activity::Progress {
+            elapsed: Duration::from_millis(now_ms.saturating_sub(since).max(0) as u64),
+            tools: tools.clone(),
+            current: next.current_tool.clone(),
+        },
+    ));
+    out
 }
 
 /// The mtimes a hand edit changes: `zephyr.toml` and `secrets.env`.
@@ -1104,6 +1168,65 @@ fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn origin(channel: &str) -> Origin {
+        Origin {
+            channel: channel.into(),
+            id: 1,
+            sender: "u".into(),
+        }
+    }
+
+    fn busy(o: &Origin, tool: Option<&str>, done: u32) -> Run {
+        Run {
+            busy: true,
+            since_unix_ms: Some(1_000),
+            origin: Some(o.clone()),
+            current_tool: tool.map(Into::into),
+            tools_done: done,
+        }
+    }
+
+    #[test]
+    fn activities_follow_the_run() {
+        let (d, i) = (origin("discord"), origin("imessage"));
+        let mut tools = Vec::new();
+        let progress = |tools: &[&str], current: Option<&str>| Activity::Progress {
+            elapsed: Duration::from_secs(2),
+            tools: tools.iter().map(|t| t.to_string()).collect(),
+            current: current.map(Into::into),
+        };
+        // Idle stays quiet, even on a tick.
+        assert!(activities(&Run::default(), &Run::default(), &mut tools, 3_000).is_empty());
+        // A run starts: Start, then a Progress tick (each tick repeats Start, which channels ignore while up).
+        let a = busy(&d, None, 0);
+        assert_eq!(
+            activities(&Run::default(), &a, &mut tools, 3_000),
+            vec![
+                (d.clone(), Activity::Start),
+                (d.clone(), progress(&[], None))
+            ]
+        );
+        // Tools are collected in order, the same tool twice counts twice.
+        let b = busy(&d, Some("bash"), 0);
+        let c = busy(&d, Some("bash"), 1);
+        activities(&a, &b, &mut tools, 3_000);
+        assert_eq!(
+            activities(&b, &c, &mut tools, 3_000)[1],
+            (d.clone(), progress(&["bash", "bash"], Some("bash")))
+        );
+        // The next run serves another channel: the old one stops, the new one starts afresh.
+        let e = busy(&i, None, 0);
+        let out = activities(&c, &e, &mut tools, 3_000);
+        assert_eq!(out[0], (d.clone(), Activity::Stop));
+        assert_eq!(out[1], (i.clone(), Activity::Start));
+        assert_eq!(out[2], (i.clone(), progress(&[], None)));
+        // Settle clears the run.
+        assert_eq!(
+            activities(&e, &Run::default(), &mut tools, 3_000),
+            vec![(i, Activity::Stop)]
+        );
+    }
 
     #[test]
     fn untag_reverses_tagged() {
