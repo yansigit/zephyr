@@ -267,7 +267,7 @@ impl View {
             self.assistants.push(a.clone());
             self.current = Some(a.clone());
             let mark = self.p.accent.fg(&bold(glyph("≋")));
-            self.push(Kind::Text, a, Some(mark));
+            self.push(Kind::Text, Arc::new(Prose::new(a)), Some(mark));
         }
         if let Some(a) = &self.current {
             a.update_blocks(&blocks);
@@ -510,6 +510,237 @@ impl Component for Bubble {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Wide enough that upstream wraps no prose: the logical lines of a reply.
+const UNWRAPPED: usize = 4096;
+
+/// An assistant reply wrapped at words. rpi-tui's markdown wraps by character, splitting words at
+/// the edge; this draws the reply once unwrapped and wraps its prose itself, with list items
+/// hanging under their text. Blocks drawn to the full width (code, rules) and tables keep
+/// upstream's layout, as does any reply whose two drawings do not line up block for block.
+struct Prose {
+    inner: Arc<AssistantMessageComponent>,
+    cache: Mutex<Option<Drawn>>,
+}
+
+/// `(width, upstream's lines, ours)` from the last render.
+type Drawn = (usize, Vec<String>, Vec<String>);
+
+impl Prose {
+    fn new(inner: Arc<AssistantMessageComponent>) -> Self {
+        Prose {
+            inner,
+            cache: Mutex::new(None),
+        }
+    }
+}
+
+impl Component for Prose {
+    fn render(&self, width: usize) -> Vec<String> {
+        let narrow = self.inner.render(width);
+        let mut cache = self.cache.lock().unwrap();
+        if let Some((w, n, ours)) = cache.as_ref() {
+            if *w == width && *n == narrow {
+                return ours.clone();
+            }
+        }
+        let ours = reflow(&narrow, &self.inner.render(UNWRAPPED), width);
+        *cache = Some((width, narrow, ours.clone()));
+        ours
+    }
+    fn invalidate(&self) {
+        self.inner.invalidate();
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Upstream's `narrow` drawing, with each prose block replaced by its `wide` (unwrapped) lines
+/// wrapped at words.
+fn reflow(narrow: &[String], wide: &[String], width: usize) -> Vec<String> {
+    let blocks = |lines: &[String]| -> Vec<Vec<String>> {
+        lines
+            .split(|l| l.is_empty())
+            .map(<[String]>::to_vec)
+            .collect()
+    };
+    let (n, w) = (blocks(narrow), blocks(wide));
+    if n.len() != w.len() {
+        return narrow.to_vec();
+    }
+    let prose = |block: &[String]| {
+        block.iter().all(|l| {
+            let plain = rpi_tui::strip_ansi(l);
+            visible_width(&plain) < UNWRAPPED - 1 && !plain.contains(['│', '┃', '┌', '├'])
+        })
+    };
+    let mut out = vec![];
+    for (i, (n, w)) in n.into_iter().zip(w).enumerate() {
+        if i > 0 {
+            out.push(String::new());
+        }
+        if prose(&w) {
+            out.extend(w.iter().flat_map(|l| wrap_ansi(l.trim_end(), width)));
+        } else {
+            out.extend(n);
+        }
+    }
+    out
+}
+
+/// Wraps one styled line at words. Continuations hang under the text: past the leading
+/// spaces, and past a list marker (`•`, `-`, `1.`) when there is one. Styles carry over.
+fn wrap_ansi(line: &str, width: usize) -> Vec<String> {
+    let plain = rpi_tui::strip_ansi(line);
+    if visible_width(&plain) <= width {
+        return vec![line.to_string()];
+    }
+    // Plain leading spaces only: inline code's padding space comes after its colour.
+    let lead = line.len() - line.trim_start_matches(' ').len();
+    let marker = plain[lead..].split_once(' ').map_or(0, |(m, _)| {
+        let numbered = m.len() > 1
+            && m.strip_suffix('.')
+                .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()));
+        match matches!(m, "•" | "◦" | "▪" | "-" | "*") || numbered {
+            true => visible_width(m) + 1,
+            false => 0,
+        }
+    });
+    let hang = (visible_width(&plain[..lead]) + marker).min(width / 2);
+
+    // Words and runs of spaces, each with the escapes inside it.
+    let mut parts: Vec<(String, usize, bool)> = vec![];
+    for (text, escape) in tokens(line) {
+        let space = text == " ";
+        match parts.last_mut() {
+            Some(last) if escape || (last.2 == space && (last.1 > 0 || !space)) => {
+                last.0.push_str(&text);
+                last.1 += if escape { 0 } else { visible_width(&text) };
+            }
+            _ if escape => parts.push((text, 0, false)),
+            _ => parts.push((text.clone(), visible_width(&text), space)),
+        }
+    }
+
+    let mut lines = vec![];
+    let mut cur = String::new();
+    let mut used = 0;
+    let mut style: Vec<String> = vec![];
+    let mut gap: Option<(String, usize)> = None;
+    let add = |cur: &mut String, text: &str, style: &mut Vec<String>| {
+        cur.push_str(text);
+        for (t, escape) in tokens(text) {
+            match t.strip_prefix("\x1b[").and_then(|t| t.strip_suffix('m')) {
+                Some("" | "0") => style.clear(),
+                Some(_) if escape => style.push(t),
+                _ => {}
+            }
+        }
+    };
+    let escapes = |t: &str| {
+        tokens(t)
+            .into_iter()
+            .filter(|(_, e)| *e)
+            .map(|(t, _)| t)
+            .collect::<String>()
+    };
+    for (text, w, space) in parts {
+        if space {
+            gap = Some((text, w));
+            continue;
+        }
+        let room = if lines.is_empty() {
+            width
+        } else {
+            width - hang
+        };
+        let spacing = gap.as_ref().map_or(0, |g| g.1);
+        if used > 0 && used + spacing + w > room {
+            // Break at the space: its escapes stay, its blanks go.
+            if let Some((g, _)) = gap.take() {
+                add(&mut cur, &escapes(&g), &mut style);
+            }
+            if !style.is_empty() {
+                cur.push_str("\x1b[0m");
+            }
+            lines.push(std::mem::take(&mut cur));
+            cur = format!("{}{}", " ".repeat(hang), style.concat());
+            used = 0;
+        } else if let Some((g, gw)) = gap.take() {
+            add(&mut cur, &g, &mut style);
+            used += gw;
+        }
+        let room = if lines.is_empty() {
+            width
+        } else {
+            width - hang
+        };
+        if used == 0 && w > room {
+            // A word wider than a line is split where it must be.
+            let pieces = rpi_tui::wrap_text_with_ansi(&text, room.max(1));
+            let last = pieces.len().saturating_sub(1);
+            for (k, piece) in pieces.into_iter().enumerate() {
+                cur.push_str(&piece);
+                used = visible_width(&piece);
+                if k < last {
+                    lines.push(std::mem::take(&mut cur) + "\x1b[0m");
+                    cur = " ".repeat(hang);
+                }
+            }
+            add(&mut String::new(), &text, &mut style);
+            continue;
+        }
+        add(&mut cur, &text, &mut style);
+        used += w;
+    }
+    if let Some((g, _)) = gap {
+        cur.push_str(&escapes(&g));
+    }
+    lines.push(cur);
+    lines
+}
+
+/// A styled line as `(text, is_escape)`: each visible character on its own, each escape
+/// sequence (CSI, or OSC and the like up to BEL or ST) whole.
+fn tokens(line: &str) -> Vec<(String, bool)> {
+    let mut out = vec![];
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push((c.to_string(), false));
+            continue;
+        }
+        let mut seq = String::from(c);
+        match chars.next() {
+            Some('[') => {
+                seq.push('[');
+                for e in chars.by_ref() {
+                    seq.push(e);
+                    if ('@'..='~').contains(&e) {
+                        break;
+                    }
+                }
+            }
+            Some(k) => {
+                seq.push(k);
+                while let Some(e) = chars.next() {
+                    seq.push(e);
+                    if e == '\x07' {
+                        break;
+                    }
+                    if e == '\x1b' && chars.peek() == Some(&'\\') {
+                        seq.extend(chars.next());
+                        break;
+                    }
+                }
+            }
+            None => {}
+        }
+        out.push((seq, true));
+    }
+    out
 }
 
 /// Wraps plain text at word boundaries; a word longer than `width` is split. A line that fits
@@ -999,6 +1230,94 @@ mod tests {
             wrap_words("한국어 단어 줄바꿈", 7),
             ["한국어", "단어", "줄바꿈"]
         );
+    }
+
+    /// The reply as the transcript draws it, plain, without the gutter.
+    fn prose(text: &str, width: usize) -> Vec<String> {
+        let a = Arc::new(AssistantMessageComponent::new(AssistantMessageOptions {
+            output_pad: 0,
+            ..Default::default()
+        }));
+        a.update_blocks(&[AssistantBlock::Text(text.into())]);
+        let lines = Prose::new(a).render(width);
+        for l in &lines {
+            assert!(visible_width(l) <= width, "{l:?} is wider than {width}");
+        }
+        lines
+            .iter()
+            .map(|l| rpi_tui::strip_ansi(l).trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn replies_wrap_at_words_with_lists_hanging_and_code_kept() {
+        let text = "I can read files in `/zephyr`, run bash commands (including network requests like curl), and look up documentation.\n\n- **read**: reads text and image files and also some other things that are long\n- second item\n\n```\nlet x = \"a very long line of code that will certainly need to wrap somewhere\";\n```";
+        let got = prose(text, 40);
+        assert_eq!(
+            got[..4],
+            [
+                "I can read files in  /zephyr , run bash",
+                "commands (including network requests",
+                "like curl), and look up documentation.",
+                ""
+            ],
+            "{got:#?}"
+        );
+        assert_eq!(
+            got[4..8],
+            [
+                "  • read: reads text and image files and",
+                "    also some other things that are long",
+                "  • second item",
+                ""
+            ],
+            "{got:#?}"
+        );
+        // Code keeps upstream's layout: its own background, wrapped where it must be.
+        assert!(
+            got[8].contains("let x = \"a very long line of code"),
+            "{got:#?}"
+        );
+    }
+
+    #[test]
+    fn a_style_broken_across_lines_carries_on() {
+        let lines = wrap_ansi("say \x1b[1mthis bold phrase\x1b[22m done", 12);
+        let plain: Vec<String> = lines.iter().map(|l| rpi_tui::strip_ansi(l)).collect();
+        assert_eq!(plain, ["say this", "bold phrase", "done"]);
+        assert!(lines[0].ends_with("\x1b[0m"), "{lines:?}");
+        assert!(lines[1].starts_with("\x1b[1mbold"), "{lines:?}");
+        // The styles so far are replayed, so bold that ended stays ended.
+        assert!(lines[2].ends_with("\x1b[22mdone"), "{lines:?}");
+        // Inline code's padding is not an indent.
+        let code: Vec<String> = wrap_ansi("\x1b[48;5;236m /exit \x1b[49m came through as text", 14)
+            .iter()
+            .map(|l| rpi_tui::strip_ansi(l))
+            .collect();
+        assert_eq!(code, [" /exit  came", "through as", "text"]);
+        // A list item hangs under its text; a word wider than the line is split.
+        let item: Vec<String> = wrap_ansi("  • one two three", 10)
+            .iter()
+            .map(|l| rpi_tui::strip_ansi(l))
+            .collect();
+        assert_eq!(item, ["  • one", "    two", "    three"]);
+        let long: Vec<String> = wrap_ansi("a abcdefghijkl", 6)
+            .iter()
+            .map(|l| rpi_tui::strip_ansi(l))
+            .collect();
+        assert_eq!(long, ["a", "abcdef", "ghijkl"]);
+    }
+
+    #[test]
+    fn a_reply_without_long_lines_is_drawn_as_upstream_draws_it() {
+        let a = Arc::new(AssistantMessageComponent::new(AssistantMessageOptions {
+            output_pad: 0,
+            ..Default::default()
+        }));
+        a.update_blocks(&[AssistantBlock::Text(
+            "short **bold** and `code`\n\n| a | b |\n|---|---|\n| 1 | 2 |".into(),
+        )]);
+        assert_eq!(Prose::new(a.clone()).render(60), a.render(60));
     }
 
     #[test]

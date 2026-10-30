@@ -169,7 +169,7 @@ A slash command goes in as `send {"sessionId": "main", "command": {"type": "prom
     - Below 60 columns the header is one row without it, and spend moves to the footer.
   - **Transcript**:
     - Your messages are right-aligned bubbles in the channel's colour, with the channel and local time in the top edge; below 90 columns they take the whole row.
-    - `≋` marks assistant text.
+    - `≋` marks assistant text. rpi-tui's markdown wraps by character, so Zephyr draws each reply once unwrapped and wraps its prose at words, with list items hanging under their text. Code, rules and tables keep upstream's layout.
     - A turn's tool calls fold into one line (`▸ 3 tools  bash, read ×2 … ✓ 4.1s`) with any failure under it; Ctrl+O opens them as a tree.
     - Replies come as cards, and notices as dim lines.
   - Then the run line, the queue strip, slash autocomplete, the input box, and a footer of key hints.
