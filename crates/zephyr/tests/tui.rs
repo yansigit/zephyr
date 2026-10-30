@@ -249,11 +249,14 @@ fn config(dir: &Path, port: u16) -> PathBuf {
 fn normalize(screen: &str) -> String {
     screen
         .lines()
-        .map(|l| {
-            // The mascot's breath (columns 11-13) blows while a run goes.
+        .enumerate()
+        .map(|(row, l)| {
+            // The mascot's breath (columns 11-13 of the header's three rows) blows while a run goes.
             let chars: Vec<char> = l.chars().collect();
             let l = &match chars.get(11..14) {
-                Some(trail) if trail.iter().any(|c| matches!(c, '∼' | '≈' | '≋' | '~')) => {
+                Some(trail)
+                    if row < 3 && trail.iter().any(|c| matches!(c, '∼' | '≈' | '≋' | '~')) =>
+                {
                     let mut c = chars.clone();
                     c.splice(11..14, "~~~".chars());
                     c.into_iter().collect()

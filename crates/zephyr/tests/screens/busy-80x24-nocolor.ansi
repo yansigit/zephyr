@@ -1,7 +1,8 @@
  ▄▟███▖▄▄▖      [1mzephyr[0m v0.1.0
-▟██[7m•[0m█[7mo[0m█[7m•[0m███∼    main · claude-code-1 › claude-opus-5-5
+▟██[7m•[0m█[7mo[0m█[7m•[0m███≋≈∼  main · claude-code-1 › claude-opus-5-5
 ▀█████████▀     discord ●  imessage ●  chat ○      today 41.2k tok · $0.38 / $5
  ──────────────────────────────────────────────────────────────────────────────
+
  [1m≋[0m Three files: the image recipe, the launcher, and a one-time cleanup script.
 
    [1m/status[0m
@@ -15,8 +16,7 @@
    ▸ [1m2 tools[0m  running bash                                               ● 0.5s
    ╰ ▸ [1mread[0m  /var/log/backup.log                                         ✗ 0.0s
        EACCES: permission denied, open '/var/log/backup.log'
-
- ≋ running bash for imessage · 12s · 1 tool                         esc to stop
+ ∼ running bash for imessage · 12s · 1 tool                         esc to stop
  queued (1) · discord: “are you around later?”
  ╭────────────────────────────────────────────────────────────────────────────╮
  │ [2mMessage zephyr[0m                                                             │

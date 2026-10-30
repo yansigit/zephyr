@@ -375,8 +375,8 @@ fn compact_header(s: &State, p: &Palette, width: usize) -> Vec<String> {
     vec![top, p.dim.fg(&rule)]
 }
 
-/// The one-row status line: what zephyr is doing now. No row when idle and connected, so the
-/// transcript's own spacer is the one blank row above the input.
+/// The one-row status line: what zephyr is doing now. Blank when idle and connected, so it is
+/// the one blank row above the input.
 pub fn run_line(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
     let run = &s.snapshot.run;
     let (left, right) = match &s.link {
@@ -451,7 +451,8 @@ pub fn run_line(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
                     String::new(),
                 )
             } else {
-                return vec![];
+                // Kept, so the transcript does not jump a row as runs start and end.
+                (String::new(), String::new())
             }
         }
     };
@@ -808,7 +809,9 @@ mod tests {
         );
 
         let mut s = up();
-        assert!(run_line(&s, &DARK, 80, NOW).is_empty(), "idle takes no row");
+        // Idle keeps its row blank, so the transcript stays put when a run starts.
+        assert_eq!(line(&s).trim(), "");
+        let idle_rows = run_line(&s, &DARK, 80, NOW).len();
         s.snapshot.paused = Some("user".into());
         assert!(line(&s).contains("⏸ paused: new messages wait until /resume"));
         s.snapshot.paused = None;
@@ -822,6 +825,7 @@ mod tests {
             current_tool: Some("bash".into()),
             tools_done: 2,
         };
+        assert_eq!(run_line(&s, &DARK, 80, NOW).len(), idle_rows);
         let l = line(&s);
         assert!(
             l.contains(" running bash for discord · 12s · 2 tools"),

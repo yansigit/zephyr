@@ -15,9 +15,8 @@ use conn::{Ask, Msg};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use overlays::{Action, Kind, Overlay};
 use rpi_tui::{
-    Component, Container, Editor, EditorOptions, EditorStyle, Focusable, OverlayAnchor,
-    OverlayMargin, OverlayOptions, ProcessTerminal, ScrollView, StackChild, StackEntry,
-    TuiAltScreen, VStack, TUI,
+    Component, Editor, EditorOptions, EditorStyle, Focusable, OverlayAnchor, OverlayMargin,
+    OverlayOptions, ProcessTerminal, ScrollView, StackChild, StackEntry, TuiAltScreen, VStack, TUI,
 };
 use serde_json::Value;
 use std::any::Any;
@@ -61,10 +60,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
         tz: tz.clone(),
     });
     let mut view = view::View::new(palette, tz.clone());
-    let document = Arc::new(Container::new());
-    document.add_child(view.root.clone());
-    document.add_child(Arc::new(rpi_tui::Spacer::new(1)));
-    let scroll = Arc::new(ScrollView::primary(document));
+    let scroll = Arc::new(ScrollView::primary(view.root.clone()));
     let editor = Arc::new(Editor::new(
         EditorOptions {
             padding_x: 0,

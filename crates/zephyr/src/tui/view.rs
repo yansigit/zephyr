@@ -455,19 +455,30 @@ struct UserTurn {
 impl Component for UserTurn {
     fn render(&self, width: usize) -> Vec<String> {
         let (p, c) = (&self.p, self.color);
-        let label = match &self.when {
-            Some(t) => format!("{} {} {t}", bold(&self.who), glyph("·")),
-            None => bold(&self.who),
-        };
-        let label_w = visible_width(&label);
         // A column outside the band on each side; inside, the bar, a space, the text, a space.
         let room = width.saturating_sub(5).max(1);
-        // The label shares the first row while it takes at most half of it; else it is dropped.
-        let beside = label_w + 2 <= room / 2;
+        // The label takes at most half the first row: the time goes first, then the channel is
+        // cut short, and only when not even three columns are left is it dropped.
+        let max = (room / 2).saturating_sub(2);
+        let tail = self.when.as_ref().map(|t| format!(" {} {t}", glyph("·")));
+        let (name, tail) = match tail {
+            Some(t) if visible_width(&self.who) + visible_width(&t) <= max => (self.who.clone(), t),
+            _ if visible_width(&self.who) <= max => (self.who.clone(), String::new()),
+            _ if max >= 3 => (truncate_to_width(&self.who, max, glyph("…")), String::new()),
+            _ => (String::new(), String::new()),
+        };
+        let beside = !name.is_empty();
+        let label = if beside {
+            format!("{}{tail}", bold(&name))
+        } else {
+            name
+        };
+        let label_w = visible_width(&label);
         let first_room = if beside { room - label_w - 2 } else { room };
         // wrap_words' first line is a prefix of the text; the rest wraps at the full width.
         let first = wrap_words(&self.text, first_room).swap_remove(0);
-        let rest = self.text[first.len()..].trim_start_matches([' ', '\r']);
+        let rest =
+            self.text[first.len()..].trim_start_matches(|c: char| c.is_whitespace() && c != '\n');
         let rest = rest.strip_prefix('\n').unwrap_or(rest);
         let mut lines = vec![first];
         if !rest.is_empty() {
@@ -486,7 +497,13 @@ impl Component for UserTurn {
                     " ".repeat(pad),
                     c.fg(label)
                 );
-                truncate_to_width(&format!(" {}", p.user_bg.bg(&band)), width, "")
+                let row = format!(" {}", p.user_bg.bg(&band));
+                // Only a band wider than the screen (a few columns, or a wide character in one)
+                // is cut: truncate_to_width measures emoji sequences wider than the layout does.
+                match visible_width(&row) > width {
+                    true => truncate_to_width(&row, width, ""),
+                    false => row,
+                }
             })
             .collect()
     }
@@ -1186,11 +1203,6 @@ mod tests {
             rows.iter().all(|r| r.contains("\x1b[48;2;40;48;64m")),
             "{rows:?}"
         );
-        // Too narrow to share a row, the label goes; the bar still marks the turn.
-        assert_eq!(
-            plain(&turn("discord", "hi there").render(30)),
-            [" ▌ hi there                  "]
-        );
         // Lines the user broke stay broken.
         assert_eq!(
             plain(&turn("you", "one\n\ntwo").render(40)),
@@ -1204,17 +1216,40 @@ mod tests {
 
     #[test]
     fn user_turns_never_overflow() {
+        let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
+        let emoji = format!("👍🏽 family {family} flags 🇰🇷🇯🇵 ok");
+        let families = format!("{}end", format!("{family} ").repeat(12));
         let texts = [
             "hi",
             "",
             "한국어 단어 줄바꿈 한국어 단어 줄바꿈",
             &"x".repeat(300),
+            &emoji,
+            &families,
         ];
         for who in ["discord", &"y".repeat(90)] {
             for text in texts {
+                let want: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
                 for w in 1..=200 {
-                    for row in turn(who, text).render(w) {
-                        assert!(visible_width(&row) <= w, "{w}: {row:?}");
+                    let rows = turn(who, text).render(w);
+                    for row in &rows {
+                        assert!(visible_width(row) <= w, "{w}: {row:?}");
+                        // A square band, unless a wide character cannot fit a one-column line.
+                        if w >= 7 {
+                            assert_eq!(visible_width(row), w - 1, "{w}: {row:?}");
+                        }
+                    }
+                    if w < 7 {
+                        continue;
+                    }
+                    let rows = plain(&rows);
+                    if who == "discord" && w >= 40 {
+                        assert!(rows[0].ends_with("discord · 14:02 "), "{w}: {rows:#?}");
+                    }
+                    // Every character of the text reaches a row, in order.
+                    let mut got = rows.iter().flat_map(|r| r.chars());
+                    for c in &want {
+                        assert!(got.any(|g| g == *c), "{w}: {c:?} lost from {rows:#?}");
                     }
                 }
             }
@@ -1223,6 +1258,20 @@ mod tests {
         let rows = plain(&turn("discord", "한국어 단어 줄바꿈 한국어 단어 줄바꿈").render(40));
         assert!(rows.iter().all(|r| visible_width(r) == 39), "{rows:#?}");
         assert!(rows[0].ends_with("discord · 14:02 "), "{rows:#?}");
+    }
+
+    #[test]
+    fn narrow_bands_drop_the_time_then_shorten_the_channel() {
+        let first = |w| plain(&turn("discord", "hi").render(w)).swap_remove(0);
+        assert!(first(40).ends_with(" discord · 14:02 "), "{:?}", first(40));
+        assert!(first(30).ends_with(" discord "), "{:?}", first(30));
+        assert!(first(16).ends_with(" di… "), "{:?}", first(16));
+        assert_eq!(first(12), " ▌ hi      ");
+        // Space that is not a line break is trimmed after a wrap, so no blank row appears.
+        for text in ["hello\u{a0}\nworld", "hi\u{3000}\nthere"] {
+            let rows = plain(&turn("discord", text).render(40));
+            assert_eq!(rows.len(), 2, "{rows:#?}");
+        }
     }
 
     #[test]

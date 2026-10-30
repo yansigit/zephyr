@@ -168,7 +168,7 @@ A slash command goes in as `send {"sessionId": "main", "command": {"type": "prom
     - The cloud's face is the agent's state: smiling with a faint breeze at its side when idle; looking downwind with an `o` mouth and a growing breath while a run goes; eyes closed with a `z` when paused or connecting; `×` eyes and a red `!` when the link is down, a reply failed or the budget is spent. Under `NO_COLOR` the face is drawn in inverse video, so the cloud stays whole; without UTF-8 it is an ASCII cloud.
     - Below 60 columns the header is one row without it, and spend moves to the footer.
   - **Transcript**:
-    - Your messages are full-width shaded bands (`user_bg`) with a bar in the channel's colour down the left edge (`>` without UTF-8) and the channel and local time at the right of the first row, dropped when it would take over half the row.
+    - Your messages are full-width shaded bands (`user_bg`) with a bar in the channel's colour down the left edge (`>` without UTF-8) and the channel and local time at the right of the first row, in at most half of it: on a narrow screen the time goes first, then the channel is cut short with `…`, and it is dropped only when not even three columns are left.
     - `≋` marks assistant text. rpi-tui's markdown wraps by character, so Zephyr draws each reply once unwrapped and wraps its prose at words, with list items hanging under their text. Code, rules and tables keep upstream's layout.
     - A turn's tool calls fold into one line (`▸ 3 tools  bash, read ×2 … ✓ 4.1s`) with any failure under it; Ctrl+O opens them as a tree.
     - Replies come as cards: a dim title, then the lines on a dim `│` rule, no box. Notices are dim lines.
@@ -177,7 +177,7 @@ A slash command goes in as `send {"sessionId": "main", "command": {"type": "prom
   - Everything sits in a one-column gutter.
   - Times are in `timezone` from zephyr.toml, else the host's zone, which `zephyr attach` passes in.
 - **Keys**: Enter sends; Shift+Enter or Ctrl+J is a newline; Esc stops the run; Ctrl+L model picker; Ctrl+S status; `?` on an empty input, help; Ctrl+O tool output; Ctrl+T thinking; PgUp/PgDn scroll; Ctrl+C clears (twice to detach); Ctrl+D detaches.
-- **Panels** open over the bottom of the screen, between header and footer, and never cover the header: a list taller than the room scrolls. Esc closes; arrows and PgUp/PgDn move; typing filters the lists; the footer shows the panel's keys.
+- **Panels** open over the bottom of the screen, between header and footer, and from 9 rows up never cover the header: a list taller than the room scrolls. Esc closes; arrows and PgUp/PgDn move; typing filters the lists; the footer shows the panel's keys.
   - *Model picker* (Ctrl+L, `/model`): `zephyr.models` grouped by account, the model in use marked `●`. A pick sends `/model provider/model`; the reply shows as a notice.
   - *Status* (Ctrl+S, `/status`): agent and run, the account pool with cooldowns, channels, pause, spend against the limits, failed replies, the next jobs. All from the snapshot.
   - *Help* (`/help`, `?`): every command, grouped Chat, Agent, Memory, Schedule and Gateway. Enter puts the command in the input.
