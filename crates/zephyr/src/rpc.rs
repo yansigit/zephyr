@@ -170,10 +170,12 @@ impl Child {
         line.push(b'\n');
         self.stdin.write_all(&line).await?;
         self.stdin.flush().await?;
-        let resp = tokio::time::timeout(Duration::from_secs(60), rx)
-            .await
-            .map_err(|_| anyhow!("{} timed out", cmd["type"]))?
-            .map_err(|_| anyhow!("rpi exited during {}", cmd["type"]))?;
+        let Ok(resp) = tokio::time::timeout(Duration::from_secs(60), rx).await else {
+            // A late answer then finds no waiter and goes out as an event, which the router ignores.
+            self.pending.lock().unwrap().remove(&id);
+            bail!("{} timed out", cmd["type"]);
+        };
+        let resp = resp.map_err(|_| anyhow!("rpi exited during {}", cmd["type"]))?;
         if resp["success"] == true {
             Ok(resp["data"].clone())
         } else {
