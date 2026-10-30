@@ -250,6 +250,16 @@ fn normalize(screen: &str) -> String {
     screen
         .lines()
         .map(|l| {
+            // The mascot's wind trail (columns 11-14) blows while a run goes.
+            let chars: Vec<char> = l.chars().collect();
+            let l = &match chars.get(11..15) {
+                Some(trail) if trail.iter().any(|c| matches!(c, '≈' | '≋' | '~')) => {
+                    let mut c = chars.clone();
+                    c.splice(11..15, "~~~~".chars());
+                    c.into_iter().collect()
+                }
+                _ => l.to_string(),
+            };
             let live = ["esc to stop", "retry ", "● ", "✗ "];
             if !live.iter().any(|m| l.contains(m)) {
                 return l.trim_end().to_string();

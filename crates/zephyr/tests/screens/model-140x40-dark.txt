@@ -1,15 +1,19 @@
- ≋ zephyr   main · claude-code-1 › claude-opus-5-5                                                            discord ●  imessage ●  chat ○
+  ▄▟██▙▗▄▖                                                                                                                           v0.1.0
+▗  ●   ●  ▙≈    zephyr · main · claude-code-1 › claude-opus-5-5
+▝█████████▛     discord ●  imessage ●  chat ○                                                                  today 41.2k tok · $0.38 / $5
  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
    ─────────────────────────────────────────────────────────── Fri 30 Oct 2026 ───────────────────────────────────────────────────────────
 
-    discord · 14:02
-    remind me to renew the domain on friday
+                                                                                                ╭─ discord · 14:02 ───────────────────────╮
+                                                                                                │ remind me to renew the domain on friday │
+                                                                                                ╰─────────────────────────────────────────╯
 
  ≋ Done. I scheduled renew kimchigoose.com for Fri 09:00 KST.
    ▸ schedule  add "renew domain" fri 09:00                                                                                          ✓ 0.2s
 
-    you · 14:05
-    what's in ~/Projects/zephyr/deploy?
+                                                                                                    ╭─ you · 14:05 ───────────────────────╮
+                                                                                                    │ what's in ~/Projects/zephyr/deploy? │
+                                                                                                    ╰─────────────────────────────────────╯
 
    ▸ bash  ls ~/Projects/zephyr/deploy                                                                                               ✓ 0.1s
 
@@ -23,10 +27,6 @@
 
 
 
-
-
-
-
  ╭─ model ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │ › type to filter                                                                                                                       │
  │ claude-code-1  in use                                                                                                                  │
@@ -37,4 +37,4 @@
  │      gpt-6-astra                                                                                                                       │
  │      gpt-6-mini                                                                                                                        │
  ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-  ↑↓ choose · ⏎ switch · type to filter · esc close                                                            today 41.2k tok · $0.38 / $5
+  ↑↓ choose · ⏎ switch · type to filter · esc close

@@ -163,7 +163,18 @@ A slash command goes in as `send {"sessionId": "main", "command": {"type": "prom
 
 `zephyr attach` runs `zephyr tui` in the container: a client of the methods above, built from rpi-tui components (`crates/zephyr/src/tui/`).
 
-- **Layout**, top to bottom: header (wordmark, session, `account › model`, channel dots, pause badge), transcript (origin chips on user turns, `≋` assistant text, one-line tool cards, reply cards, dim notices), run line, queue strip, slash autocomplete, the input box, and a footer of key hints with today's spend. Everything sits in a one-column gutter.
+- **Layout**, top to bottom:
+  - **Header**: the mascot, a small cloud puffing the west wind, beside `zephyr · session · account › model` (with the pause badge), then the channel dots and today's spend (failed replies too).
+    - The cloud's face is the agent's state: eyes ahead when idle, looking downwind with an animated trail while a run goes, closed with a `z` when paused or connecting, `× ×` when the link is down, a reply failed or the budget is spent.
+    - Below 60 columns the header is one row without it, and spend moves to the footer.
+  - **Transcript**:
+    - Your messages are right-aligned bubbles in the channel's colour, with the channel and local time in the top edge; below 90 columns they take the whole row.
+    - `≋` marks assistant text.
+    - A turn's tool calls fold into one line (`▸ 3 tools  bash, read ×2 … ✓ 4.1s`) with any failure under it; Ctrl+O opens them as a tree.
+    - Replies come as cards, and notices as dim lines.
+  - Then the run line, the queue strip, slash autocomplete, the input box, and a footer of key hints.
+  - Everything sits in a one-column gutter.
+  - Times are in `timezone` from zephyr.toml, else the host's zone, which `zephyr attach` passes in.
 - **Keys**: Enter sends; Shift+Enter or Ctrl+J is a newline; Esc stops the run; Ctrl+L model picker; Ctrl+S status; `?` on an empty input, help; Ctrl+O tool output; Ctrl+T thinking; PgUp/PgDn scroll; Ctrl+C clears (twice to detach); Ctrl+D detaches.
 - **Panels** open over the bottom of the screen, between header and footer. Esc closes; arrows and PgUp/PgDn move; typing filters the lists; the footer shows the panel's keys.
   - *Model picker* (Ctrl+L, `/model`): `zephyr.models` grouped by account, the model in use marked `●`. A pick sends `/model provider/model`; the reply shows as a notice.

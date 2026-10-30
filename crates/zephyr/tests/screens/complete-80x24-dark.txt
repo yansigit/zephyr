@@ -1,7 +1,7 @@
- ≋ zephyr   main · claude-code-1 › claude-opus-5-5        discord ●  imessage ●
+  ▄▟██▙▗▄▖                                                               v0.1.0
+▗  ●   ●  ▙≈    zephyr · main · claude-code-1 › claude-opus-5-5
+▝█████████▛     discord ●  imessage ●  chat ○      today 41.2k tok · $0.38 / $5
  ──────────────────────────────────────────────────────────────────────────────
-
-   ▸ bash  ls ~/Projects/zephyr/deploy                                   ✓ 0.1s
 
  ≋ Three files: the image recipe, the launcher, and a one-time cleanup script.
 
@@ -21,4 +21,4 @@
  ╭────────────────────────────────────────────────────────────────────────────╮
  │ /                                                                          │
  ╰────────────────────────────────────────────────────────────────────────────╯
-  ↑↓ choose · tab complete · ⏎ run · esc dismiss   today 41.2k tok · $0.38 / $5
+  ↑↓ choose · tab complete · ⏎ run · esc dismiss

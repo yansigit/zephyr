@@ -7,9 +7,10 @@
 
 use super::chrome::spread;
 use super::theme::{glyph, Palette};
+use rpi_tui::theme::Color;
 use rpi_tui::{
     bold, truncate_to_width, visible_width, wrap_text_with_ansi, AssistantBlock,
-    AssistantMessageComponent, AssistantMessageOptions, Component, Container, Markdown,
+    AssistantMessageComponent, AssistantMessageOptions, Component, Container,
 };
 use serde_json::Value;
 use std::any::Any;
@@ -43,6 +44,8 @@ pub struct View {
     current: Option<Arc<AssistantMessageComponent>>,
     assistants: Vec<Arc<AssistantMessageComponent>>,
     cards: HashMap<String, Arc<ToolCard>>,
+    /// The group the next tool card joins: the tools since the last text or turn.
+    group: Option<Arc<ToolGroup>>,
     /// The timestamp of the assistant message that made each call, for history durations.
     called_at: HashMap<String, i64>,
     expanded: bool,
@@ -62,6 +65,7 @@ impl View {
             current: None,
             assistants: vec![],
             cards: HashMap::new(),
+            group: None,
             called_at: HashMap::new(),
             expanded: false,
             hide_thinking: false,
@@ -77,6 +81,7 @@ impl View {
         self.current = None;
         self.assistants.clear();
         self.cards.clear();
+        self.group = None;
         self.called_at.clear();
         self.last_notice = None;
         let users: Vec<usize> = (0..messages.len())
@@ -236,13 +241,11 @@ impl View {
                 self.push(Kind::Note, Arc::new(Rule { label, p: self.p }), None);
             }
         }
-        let chip = match &when {
-            Some(t) => format!("{who} {} {}", glyph("·"), t.strftime("%H:%M")),
-            None => who.to_string(),
-        };
-        let turn = UserTurn {
-            chip,
-            text: Markdown::new(text, 0, 0),
+        let turn = Bubble {
+            who: who.to_string(),
+            when: when.map(|t| t.strftime("%H:%M").to_string()),
+            color: self.p.channel(channel),
+            text,
             p: self.p,
         };
         self.push(Kind::User, Arc::new(turn), None);
@@ -316,7 +319,17 @@ impl View {
             }),
         });
         self.cards.insert(id.to_string(), card.clone());
-        self.push(Kind::Card, card.clone(), None);
+        match self.group.as_ref().filter(|_| self.last == Kind::Card) {
+            Some(group) => group.cards.lock().unwrap().push(card.clone()),
+            None => {
+                let group = Arc::new(ToolGroup {
+                    p: self.p,
+                    cards: Mutex::new(vec![card.clone()]),
+                });
+                self.group = Some(group.clone());
+                self.push(Kind::Card, group, None);
+            }
+        }
         card
     }
 
@@ -423,28 +436,117 @@ impl Component for Gutter {
     }
 }
 
-/// The origin chip over the text, on the surface colour.
-struct UserTurn {
-    chip: String,
-    text: Markdown,
+/// Below this width a bubble takes the whole row.
+const BUBBLE_FULL_BELOW: usize = 86;
+
+/// A user turn: a rounded bubble on the right, its channel and time in the top edge, in the
+/// channel's colour; full width on narrow screens.
+struct Bubble {
+    who: String,
+    when: Option<String>,
+    color: Color,
+    text: String,
     p: Palette,
 }
 
-impl Component for UserTurn {
+impl Component for Bubble {
     fn render(&self, width: usize) -> Vec<String> {
-        let bg = self.p.surface;
-        let body = self.text.render(width.saturating_sub(2).max(1));
-        std::iter::once(self.p.muted.fg(&self.chip))
-            .chain(body)
-            .map(|l| rpi_tui::apply_background_to_line(&format!(" {l}"), width, |s| bg.bg(s)))
-            .collect()
+        let (p, c) = (&self.p, self.color);
+        let label = match &self.when {
+            Some(t) => format!(
+                "{} {} {}",
+                c.fg(&bold(&self.who)),
+                p.muted.fg(glyph("·")),
+                p.muted.fg(t)
+            ),
+            None => c.fg(&bold(&self.who)),
+        };
+        let label_w = visible_width(&label);
+        let full = width < BUBBLE_FULL_BELOW;
+        let max = if full {
+            width
+        } else {
+            (width * 7 / 10).max(label_w + 6)
+        }
+        .min(width);
+        // "│ " text " │", so four columns of frame around the text.
+        let lines = wrap_words(&self.text, max.saturating_sub(4).max(1));
+        let inner = if full {
+            width.saturating_sub(4)
+        } else {
+            lines
+                .iter()
+                .map(|l| visible_width(l))
+                .max()
+                .unwrap_or(0)
+                .max(label_w + 2)
+        };
+        let outer = inner + 4;
+        let indent = " ".repeat(width.saturating_sub(outer));
+        let (h, v) = (glyph("─"), glyph("│"));
+        let top_fill = h.repeat(outer.saturating_sub(label_w + 5));
+        let mut rows = vec![format!(
+            "{indent}{}{label}{}",
+            c.fg(&format!("{}{h} ", glyph("╭"))),
+            c.fg(&format!(" {top_fill}{}", glyph("╮")))
+        )];
+        for line in &lines {
+            let pad = " ".repeat(inner.saturating_sub(visible_width(line)));
+            let body = p.surface.bg(&format!(" {}{pad} ", p.text.fg(line)));
+            rows.push(format!("{indent}{}{body}{}", c.fg(v), c.fg(v)));
+        }
+        rows.push(format!(
+            "{indent}{}",
+            c.fg(&format!(
+                "{}{}{}",
+                glyph("╰"),
+                h.repeat(outer - 2),
+                glyph("╯")
+            ))
+        ));
+        rows
     }
-    fn invalidate(&self) {
-        self.text.invalidate();
-    }
+    fn invalidate(&self) {}
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Wraps plain text at word boundaries; a word longer than `width` is split. A line that fits
+/// is kept as it is, spacing included, so aligned columns (`/status`) stay aligned.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = vec![];
+    for line in text.lines() {
+        let mut rest = line.trim_end();
+        if visible_width(rest) <= width {
+            out.push(rest.to_string());
+            continue;
+        }
+        while visible_width(rest) > width {
+            // The widest prefix that fits, then back to its last space.
+            let mut fit = 0;
+            for (i, ch) in rest.char_indices() {
+                if visible_width(&rest[..i + ch.len_utf8()]) > width {
+                    break;
+                }
+                fit = i + ch.len_utf8();
+            }
+            let cut = rest[..fit]
+                .rfind(' ')
+                .filter(|&i| i > 0)
+                .unwrap_or(fit.max(1));
+            out.push(rest[..cut].trim_end().to_string());
+            rest = rest[cut..].trim_start();
+        }
+        if !rest.is_empty() {
+            out.push(rest.to_string());
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 /// One pre-styled row.
@@ -566,6 +668,103 @@ impl Component for ToolCard {
     }
 }
 
+/// The tool calls between two texts. One call is its card; more fold into one line
+/// (`▸ 3 tools  bash, read ×2 ……… ✓ 4.1s`) with any failure under it, and `^O` opens them as a
+/// tree of cards.
+struct ToolGroup {
+    p: Palette,
+    cards: Mutex<Vec<Arc<ToolCard>>>,
+}
+
+impl Component for ToolGroup {
+    fn render(&self, width: usize) -> Vec<String> {
+        let cards = self.cards.lock().unwrap();
+        if cards.len() == 1 {
+            return cards[0].render(width);
+        }
+        let p = &self.p;
+        let states: Vec<_> = cards.iter().map(|c| c.state.lock().unwrap()).collect();
+        let expanded = states.iter().any(|s| s.expanded);
+        let mut names: Vec<(&str, usize)> = vec![];
+        for s in &states {
+            match names.iter_mut().find(|(n, _)| *n == s.name) {
+                Some((_, k)) => *k += 1,
+                None => names.push((&s.name, 1)),
+            }
+        }
+        let names = names
+            .iter()
+            .map(|(n, k)| {
+                if *k > 1 {
+                    format!("{n} ×{k}")
+                } else {
+                    n.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let running = states
+            .iter()
+            .find(|s| s.done.is_none() && s.started.is_some());
+        let took: Duration = states
+            .iter()
+            .filter_map(|s| s.took.or(s.started.map(|t| t.elapsed())))
+            .sum();
+        let mark = if states.iter().any(|s| s.done.is_none()) {
+            p.accent.fg(glyph("●"))
+        } else if states.iter().any(|s| s.done == Some(false)) {
+            p.error.fg(glyph("✗"))
+        } else {
+            p.success.fg(glyph("✓"))
+        };
+        let what = match running {
+            Some(r) => format!("running {}", r.name),
+            None => names,
+        };
+        let left = format!(
+            "{} {}  {}",
+            p.muted.fg(glyph(if expanded { "▾" } else { "▸" })),
+            p.text.fg(&bold(&format!("{} tools", states.len()))),
+            p.muted.fg(&what)
+        );
+        let mut lines = vec![spread(
+            &left,
+            &format!("{mark} {}", p.muted.fg(&elapsed(took))),
+            width,
+        )];
+        let failed: Vec<usize> = (0..states.len())
+            .filter(|&i| states[i].done == Some(false))
+            .collect();
+        drop(states);
+        let shown: Vec<usize> = if expanded {
+            (0..cards.len()).collect()
+        } else {
+            failed
+        };
+        for (n, &i) in shown.iter().enumerate() {
+            let last = n + 1 == shown.len();
+            let (first, more) = if last {
+                (glyph("╰"), " ")
+            } else {
+                (glyph("├"), glyph("│"))
+            };
+            for (j, row) in cards[i]
+                .render(width.saturating_sub(2).max(1))
+                .into_iter()
+                .enumerate()
+            {
+                let lead = if j == 0 { first } else { more };
+                lines.push(format!("{} {row}", p.dim.fg(lead)));
+            }
+        }
+        lines
+    }
+    fn invalidate(&self) {}
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// A reply from zephyr itself (`/status`, `/model`, job output), boxed and titled.
 struct SystemCard {
     title: String,
@@ -592,10 +791,7 @@ impl Component for SystemCard {
             p.dim.fg(&format!("{}{tr}", h.repeat(fill)))
         )];
         // Replies are plain lines (`/status` output), not markdown.
-        let body = self
-            .text
-            .lines()
-            .flat_map(|l| wrap_text_with_ansi(l, inner));
+        let body = self.text.lines().flat_map(|l| wrap_words(l, inner));
         for row in body {
             let row = p.text.fg(&row);
             let pad = inner.saturating_sub(visible_width(&row));
@@ -664,29 +860,33 @@ mod tests {
     }
 
     #[test]
-    fn history_maps_to_origin_chips_cards_and_gutter_marks() {
+    fn history_maps_to_bubbles_tool_groups_and_gutter_marks() {
         let mut v = view();
         v.replay(&history());
+        // Below 90 columns a bubble takes the whole row.
         let got = text(&v, 80);
         let want = "   ───────────────────────────── Fri 30 Oct 2026 ─────────────────────────────
 
-    discord · 14:02
-    remind me to renew the domain on friday
+   ╭─ discord · 14:02 ────────────────────────────────────────────────────────╮
+   │ remind me to renew the domain on friday                                  │
+   ╰──────────────────────────────────────────────────────────────────────────╯
 
  ≋ Done. I scheduled it for Fri 09:00.
    ▸ schedule  renew domain                                              ✓ 0.2s
 
-    you · 14:05
-    what's in deploy?
+   ╭─ you · 14:05 ────────────────────────────────────────────────────────────╮
+   │ what's in deploy?                                                        │
+   ╰──────────────────────────────────────────────────────────────────────────╯
 
-   ▸ bash  ls deploy                                                     ✓ 0.1s
-   ▸ read  deploy/missing                                                ✗ 0.3s
-     ENOENT: no such file
+   ▸ 2 tools  bash, read                                                 ✗ 0.4s
+   ╰ ▸ read  deploy/missing                                              ✗ 0.3s
+       ENOENT: no such file
 
  ≋ Two files.
 
-    cron · 14:05
-    daily brief";
+   ╭─ cron · 14:05 ───────────────────────────────────────────────────────────╮
+   │ daily brief                                                              │
+   ╰──────────────────────────────────────────────────────────────────────────╯";
         assert_eq!(got, want, "\n{got}");
         assert!(!got.contains("[discord #7]") && !got.contains("[tui #"));
     }
@@ -697,9 +897,13 @@ mod tests {
         v.replay(&history());
         assert!(v.toggle_expanded());
         let got = text(&v, 80);
-        assert!(got.contains("▾ bash  ls deploy"), "{got}");
-        assert!(got.contains("     Dockerfile\n     run.sh"), "{got}");
-        assert!(got.contains("     more detail"), "{got}");
+        assert!(got.contains("   ▾ 2 tools  bash, read"), "{got}");
+        assert!(got.contains("   ├ ▾ bash  ls deploy"), "{got}");
+        assert!(
+            got.contains("   │   Dockerfile\n   │   run.sh\n   ╰ ▾ read  deploy/missing"),
+            "{got}"
+        );
+        assert!(got.contains("\n       more detail"), "{got}");
     }
 
     #[test]
@@ -722,7 +926,8 @@ mod tests {
         assert!(!v.running());
         v.apply(&json!({"type": "agent_settled", "error": "rate limited; resets later"}));
         let got = text(&v, 60);
-        assert!(got.starts_with("    imessage\n"), "{got}");
+        assert!(got.starts_with("   ╭─ imessage ─"), "{got}");
+        assert!(got.contains("   │ ping "), "{got}");
         assert_eq!(got.matches("Checking").count(), 1, "{got}");
         assert!(
             got.contains(" ≋ Checking the logs.\n   ▸ bash  tail log"),
@@ -742,7 +947,58 @@ mod tests {
         v.replay(&msgs);
         let got = text(&v, 40);
         assert!(got.starts_with("   ↑ earlier history"), "{got}");
-        assert!(!got.contains(" q2\n") && got.contains(" q3\n"), "{got}");
+        assert!(!got.contains(" q2 ") && got.contains(" q3 "), "{got}");
+    }
+
+    #[test]
+    fn wide_screens_put_bubbles_on_the_right_and_wrap_them_at_words() {
+        let mut v = view();
+        let long =
+            "please check whether the nightly backup finished and tell me which files changed";
+        v.replay(&[json!({"kind": "user", "text": long, "origin": {"channel": "tui", "id": 1}})]);
+        let rows: Vec<String> = v
+            .root
+            .render(120)
+            .iter()
+            .map(|l| rpi_tui::strip_ansi(l))
+            .collect();
+        // At most 70% of the row, flush right, one column from the edge (the gutter's).
+        let top = &rows[0];
+        assert!(
+            top.starts_with(&" ".repeat(30)) && top.trim_end().ends_with('╮'),
+            "{top:?}"
+        );
+        assert_eq!(rpi_tui::visible_width(top.trim_end()), 119);
+        let body: Vec<&str> = rows[1..rows.len() - 1]
+            .iter()
+            .map(|r| r.trim().trim_matches('│').trim())
+            .collect();
+        assert_eq!(
+            body,
+            [
+                "please check whether the nightly backup finished and tell me which files",
+                "changed"
+            ],
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn words_wrap_whole_and_fitting_lines_keep_their_spacing() {
+        assert_eq!(
+            wrap_words("aaa bbb ccc ddd approves it", 14),
+            ["aaa bbb ccc", "ddd approves", "it"]
+        );
+        assert_eq!(
+            wrap_words("agent:   work   on a/b", 40),
+            ["agent:   work   on a/b"]
+        );
+        assert_eq!(wrap_words("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        assert_eq!(wrap_words("", 10), [""]);
+        assert_eq!(
+            wrap_words("한국어 단어 줄바꿈", 7),
+            ["한국어", "단어", "줄바꿈"]
+        );
     }
 
     #[test]

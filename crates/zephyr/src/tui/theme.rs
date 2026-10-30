@@ -23,6 +23,14 @@ pub struct Palette {
     pub md_heading: Color,
     pub md_code: Color,
     pub md_link: Color,
+    /// The header's cloud and the eyes drawn on it: a graphic, so 3:1 against the background.
+    pub cloud: Color,
+    pub cloud_eyes: Color,
+    /// Bubble borders and labels per channel; the terminal and `chat` use `accent`.
+    pub discord: Color,
+    pub imessage: Color,
+    /// Jobs and any other channel.
+    pub other: Color,
 }
 
 const fn rgb(hex: u32) -> Color {
@@ -45,6 +53,11 @@ pub const DARK: Palette = Palette {
     md_heading: rgb(0x9AD8F0),
     md_code: rgb(0xF0C987),
     md_link: rgb(0x5EC8E5),
+    cloud: rgb(0xDCEAF2),
+    cloud_eyes: rgb(0x14202B),
+    discord: rgb(0xB4A6FF),
+    imessage: rgb(0x6CB6FF),
+    other: rgb(0xD9B38C),
 };
 
 /// On a background near #ffffff.
@@ -63,6 +76,11 @@ pub const LIGHT: Palette = Palette {
     md_heading: rgb(0x0B6F91),
     md_code: rgb(0x8A4B00),
     md_link: rgb(0x0B6F91),
+    cloud: rgb(0x4F93B5),
+    cloud_eyes: rgb(0xFFFFFF),
+    discord: rgb(0x5B45C9),
+    imessage: rgb(0x0B62B8),
+    other: rgb(0x7A5230),
 };
 
 /// `NO_COLOR`: every token is the terminal's default; bold and italic still mark structure.
@@ -81,7 +99,24 @@ pub const PLAIN: Palette = Palette {
     md_heading: Color::Default,
     md_code: Color::Default,
     md_link: Color::Default,
+    cloud: Color::Default,
+    cloud_eyes: Color::Default,
+    discord: Color::Default,
+    imessage: Color::Default,
+    other: Color::Default,
 };
+
+impl Palette {
+    /// The colour that marks `channel`'s bubbles.
+    pub fn channel(&self, channel: &str) -> Color {
+        match channel {
+            "discord" => self.discord,
+            "imessage" => self.imessage,
+            "tui" | "chat" => self.accent,
+            _ => self.other,
+        }
+    }
+}
 
 static UNICODE: AtomicBool = AtomicBool::new(true);
 
@@ -127,6 +162,11 @@ fn utf8_locale(locale: Option<&str>) -> bool {
     })
 }
 
+/// Whether the locale is UTF-8, so block and box glyphs can be drawn.
+pub fn unicode() -> bool {
+    UNICODE.load(Ordering::Relaxed)
+}
+
 /// A glyph, or its ASCII stand-in when the locale is not UTF-8.
 pub fn glyph(unicode: &'static str) -> &'static str {
     if UNICODE.load(Ordering::Relaxed) {
@@ -146,6 +186,8 @@ pub fn glyph(unicode: &'static str) -> &'static str {
         "↑↓" => "up/down",
         "·" => "-",
         "─" => "-",
+        "╭" | "╮" | "╰" | "╯" => "+",
+        "│" | "├" => "|",
         "…" => "...",
         "⏎" => "enter",
         "⇧" => "shift+",
@@ -247,13 +289,23 @@ mod tests {
                 ("md_heading", p.md_heading),
                 ("md_code", p.md_code),
                 ("md_link", p.md_link),
+                ("discord", p.discord),
+                ("imessage", p.imessage),
+                ("other", p.other),
             ] {
                 let ratio = contrast(c, bg);
                 assert!(ratio >= 4.5, "{name} {token}: {ratio:.2}:1");
             }
-            // User turns sit on the surface colour.
+            // User bubbles sit on the surface colour.
             let ratio = contrast(p.text, p.surface);
             assert!(ratio >= 4.5, "{name} text on surface: {ratio:.2}:1");
+            // The mascot is a graphic: 3:1 for the cloud on the background and the eyes on it.
+            for (what, ratio) in [
+                ("cloud", contrast(p.cloud, bg)),
+                ("eyes", contrast(p.cloud_eyes, p.cloud)),
+            ] {
+                assert!(ratio >= 3.0, "{name} {what}: {ratio:.2}:1");
+            }
         }
     }
 

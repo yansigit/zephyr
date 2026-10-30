@@ -1,24 +1,24 @@
- ≋ zephyr   main · claude-code-1 › claude-opus-5-5        discord ●  imessage ●
+  ▄▟██▙▗▄▖                                                               v0.1.0
+▗   ●   ● ▙≈    zephyr · main · claude-code-1 › claude-opus-5-5
+▝█████████▛≈≋   discord ●  imessage ●  chat ○      today 41.2k tok · $0.38 / $5
  ──────────────────────────────────────────────────────────────────────────────
- ≋ Three files: the image recipe, the launcher, and a one-time cleanup script.
-
-   ╭─ /status ────────────────────────────────────────────────────────────────╮
    │ agent: claude-code-1 on claude-code/claude-opus-5-5                      │
    │ channels: discord connected, imessage connected                          │
    │ today: 41.2k tokens, $0.38 of $5                                         │
    ╰──────────────────────────────────────────────────────────────────────────╯
 
-    imessage · 14:08
-    why did the nightly backup fail?
+   ╭─ imessage · 14:08 ───────────────────────────────────────────────────────╮
+   │ why did the nightly backup fail?                                         │
+   ╰──────────────────────────────────────────────────────────────────────────╯
 
  ≋ Checking the backup log first.
-   ▸ read  /var/log/backup.log                                           ✗ 0.0s
-     EACCES: permission denied, open '/var/log/backup.log'
-   ▸ bash  journalctl -u backup --since today                            ● 0.5s
+   ▸ 2 tools  running bash                                               ● 0.5s
+   ╰ ▸ read  /var/log/backup.log                                         ✗ 0.0s
+       EACCES: permission denied, open '/var/log/backup.log'
 
  ≋ running bash for imessage · 12s · 1 tool                         esc to stop
  queued (1) · discord: “are you around later?”
  ╭────────────────────────────────────────────────────────────────────────────╮
  │ Message zephyr                                                             │
  ╰────────────────────────────────────────────────────────────────────────────╯
-  esc stop · ⏎ queue · ^L model · ^D detach        today 41.2k tok · $0.38 / $5
+  esc stop · ⏎ queue · ^O tools · ^L model · ^S status · ^D detach

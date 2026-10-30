@@ -615,6 +615,15 @@ fn lifecycle_commands_build_the_expected_docker_calls() {
     for var in ["RPI_SERVER_TOKEN", "TERM", "COLORFGBG", "NO_COLOR", "LANG"] {
         assert!(tui.windows(2).any(|w| w == ["-e", var]), "{var} in {tui:?}");
     }
+    // The container runs on UTC, so the host's zone goes along for the TUI's times.
+    let tz = env.zephyr_env(&["attach"], &[("TZ", "Europe/Berlin")]);
+    assert!(tz.status.success());
+    let calls = env.calls();
+    let tui = find(&calls, &["docker", "exec", "-it"]);
+    assert!(
+        tui.windows(2).any(|w| w == ["-e", "TZ=Europe/Berlin"]),
+        "{tui:?}"
+    );
     assert!(!format!("{calls:?}").contains(token.trim()));
 
     env.ok(&["attach", "--stock"]);

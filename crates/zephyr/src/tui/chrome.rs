@@ -101,8 +101,215 @@ fn dotted(parts: &[String], p: &Palette) -> String {
     parts.join(&p.muted.fg(&format!(" {} ", glyph("·"))))
 }
 
+/// Below this width the header is one row, without the mascot.
+const MASCOT_MIN_WIDTH: usize = 60;
+/// The mascot's columns: an 11-column cloud, a 4-column wind trail and a space.
+const MASCOT_WIDTH: usize = 16;
+
+/// How the mascot looks: what zephyr is doing, at a glance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Mood {
+    Idle,
+    /// A run is going: the eyes look downwind and the trail blows.
+    Working,
+    /// Paused, or not connected yet.
+    Asleep,
+    /// The connection is down, a reply failed, or the budget is spent.
+    Troubled,
+}
+
+impl Mood {
+    pub fn of(s: &State) -> Mood {
+        let spent = s
+            .snapshot
+            .paused
+            .as_deref()
+            .is_some_and(|p| p.starts_with("budget"));
+        match &s.link {
+            Link::Down { .. } => Mood::Troubled,
+            Link::Connecting(_) => Mood::Asleep,
+            Link::Up if spent || s.snapshot.failed_replies > 0 || s.retry.is_some() => {
+                Mood::Troubled
+            }
+            Link::Up if s.snapshot.run.busy => Mood::Working,
+            Link::Up if s.snapshot.paused.is_some() => Mood::Asleep,
+            Link::Up => Mood::Idle,
+        }
+    }
+}
+
+/// Zephyr's mascot, a small cloud puffing the west wind: three rows of [`MASCOT_WIDTH`] columns.
+pub fn mascot(mood: Mood, p: &Palette, now: i64) -> [String; 3] {
+    let eyes = match mood {
+        Mood::Idle => "  ●   ●  ",
+        Mood::Working => "   ●   ● ",
+        Mood::Asleep => "  ━   ━  ",
+        Mood::Troubled => "  ×   ×  ",
+    };
+    // Three frames, about two a second: the wind leaves the cloud.
+    let frame = (now / 400).rem_euclid(3) as usize;
+    let (gust, trail) = match mood {
+        Mood::Working => (
+            ["≈   ", " ≈  ", "  ≈ "][frame],
+            ["≈≋  ", " ≈≋ ", "  ≈≋"][frame],
+        ),
+        Mood::Idle => ("≈   ", "    "),
+        Mood::Asleep | Mood::Troubled => ("    ", "    "),
+    };
+    let zz = p.muted.fg(if mood == Mood::Asleep {
+        " z   "
+    } else {
+        "     "
+    });
+    let wind = if mood == Mood::Working {
+        p.accent
+    } else {
+        p.dim
+    };
+    let eye_color = if mood == Mood::Troubled {
+        p.error
+    } else {
+        p.cloud_eyes
+    };
+    if !super::theme::unicode() {
+        let ascii = |t: &str| {
+            t.replace('●', "o")
+                .replace('×', "x")
+                .replace('━', "-")
+                .replace(['≈', '≋'], "~")
+        };
+        return [
+            format!("{}{zz}", p.cloud.fg("  .-. .--. ")),
+            format!(
+                "{}{} ",
+                p.cloud.fg(&format!("({})", ascii(eyes))),
+                wind.fg(&ascii(gust))
+            ),
+            format!("{}{} ", p.cloud.fg(" `-------' "), wind.fg(&ascii(trail))),
+        ];
+    }
+    // A big puff and a small one on top, the face across the middle, a rounded base: drawn
+    // in quarter blocks, two pixels to a column.
+    let face = p.cloud.bg(&eye_color.fg(eyes));
+    [
+        format!("{}{zz}", p.cloud.fg("  ▄▟██▙▗▄▖ ")),
+        format!(
+            "{}{face}{}{} ",
+            p.cloud.fg("▗"),
+            p.cloud.fg("▙"),
+            wind.fg(gust)
+        ),
+        format!("{}{} ", p.cloud.fg("▝█████████▛"), wind.fg(trail)),
+    ]
+}
+
+/// The cloud beside three rows: `zephyr · main · account › model`, the channels with today's
+/// spend, then a rule. Narrower than [`MASCOT_MIN_WIDTH`], one row without the cloud.
+pub fn header(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
+    if width < MASCOT_MIN_WIDTH {
+        return compact_header(s, p, width);
+    }
+    let snap = &s.snapshot;
+    let session = if snap.session.is_empty() {
+        "main"
+    } else {
+        &snap.session
+    };
+    let mut title = vec![p.accent.fg(&bold("zephyr")), p.text.fg(session)];
+    title.push(match &s.link {
+        Link::Connecting(_) => p.muted.fg(&format!("connecting{}", glyph("…"))),
+        Link::Down { .. } => p.warning.fg(&format!("reconnecting{}", glyph("…"))),
+        Link::Up => account_model(snap, p),
+    });
+    let title = dotted(&title, p);
+    let paused = paused_badge(s, p).unwrap_or_default();
+    let mut channels = channel_dots(s, p);
+    let mut right: Vec<String> = failed(s, p).into_iter().collect();
+    if s.link == Link::Up {
+        right.push(spend(snap, p));
+    }
+    let right = right.join("   ");
+    let text = width - MASCOT_WIDTH;
+    // The channels drop off from the last; spend and failures stay.
+    let status = loop {
+        let left = channels.join("  ");
+        if channels.is_empty() || visible_width(&left) + visible_width(&right) + 3 <= text {
+            break spread(&left, &format!("{right} "), text);
+        }
+        channels.pop();
+    };
+    let version = if snap.version.is_empty() {
+        String::new()
+    } else {
+        p.dim.fg(&format!("v{} ", snap.version))
+    };
+    let [m0, m1, m2] = mascot(Mood::of(s), p, now);
+    let rule = format!(" {} ", glyph("─").repeat(width.saturating_sub(2)));
+    vec![
+        format!("{m0}{}", spread("", &version, text)),
+        format!("{m1}{}", spread(&title, &format!("{paused} "), text)),
+        format!("{m2}{status}"),
+        p.dim.fg(&rule),
+    ]
+}
+
+/// `✗ 2 failed replies`, when the outbox has any.
+fn failed(s: &State, p: &Palette) -> Option<String> {
+    let n = s.snapshot.failed_replies;
+    let what = if n == 1 { "reply" } else { "replies" };
+    (n > 0).then(|| p.error.fg(&format!("{} {n} failed {what}", glyph("✗"))))
+}
+
+/// `account › model`, or the model alone without a pool.
+fn account_model(snap: &Snapshot, p: &Palette) -> String {
+    let model = snap
+        .model
+        .as_deref()
+        .map(short_model)
+        .unwrap_or("default model");
+    match &snap.account {
+        Some(a) => format!(
+            "{} {} {}",
+            p.text.fg(a),
+            p.muted.fg(glyph("›")),
+            p.text.fg(model)
+        ),
+        None => p.text.fg(model),
+    }
+}
+
+/// `⏸ paused`, or `⏸ paused (budget)`, while the gateway holds new messages.
+fn paused_badge(s: &State, p: &Palette) -> Option<String> {
+    let why = s.snapshot.paused.as_ref().filter(|_| s.link == Link::Up)?;
+    let label = if why.starts_with("budget") {
+        "paused (budget)"
+    } else {
+        "paused"
+    };
+    Some(p.warning.fg(&format!("{} {label}", glyph("⏸"))))
+}
+
+/// `discord ●` per channel adapter; none while not connected.
+fn channel_dots(s: &State, p: &Palette) -> Vec<String> {
+    if s.link != Link::Up {
+        return vec![];
+    }
+    s.snapshot
+        .channels
+        .iter()
+        .map(|c| {
+            let (g, color) = match c.state.as_str() {
+                "connected" => ("●", p.success),
+                "reconnecting" => ("◐", p.warning),
+                _ => ("○", p.muted),
+            };
+            format!("{} {}", p.muted.fg(&c.name), color.fg(glyph(g)))
+        })
+        .collect()
+}
+
 /// ` ≋ zephyr   main · account › model          ⏸ paused   discord ●  imessage ○`, then a rule.
-pub fn header(s: &State, p: &Palette, width: usize, _now: i64) -> Vec<String> {
+fn compact_header(s: &State, p: &Palette, width: usize) -> Vec<String> {
     let snap = &s.snapshot;
     let session = if snap.session.is_empty() {
         "main"
@@ -117,53 +324,12 @@ pub fn header(s: &State, p: &Palette, width: usize, _now: i64) -> Vec<String> {
     let where_ = match &s.link {
         Link::Connecting(_) => p.muted.fg(&format!("connecting{}", glyph("…"))),
         Link::Down { .. } => p.warning.fg(&format!("reconnecting{}", glyph("…"))),
-        Link::Up => {
-            let model = snap
-                .model
-                .as_deref()
-                .map(short_model)
-                .unwrap_or("default model");
-            match &snap.account {
-                Some(a) => format!(
-                    "{} {} {}",
-                    p.text.fg(a),
-                    p.muted.fg(glyph("›")),
-                    p.text.fg(model)
-                ),
-                None => p.text.fg(model),
-            }
-        }
+        Link::Up => account_model(snap, p),
     };
     left.push_str(&p.muted.fg(&format!(" {} ", glyph("·"))));
     left.push_str(&where_);
-
-    let paused = snap
-        .paused
-        .as_ref()
-        .filter(|_| s.link == Link::Up)
-        .map(|why| {
-            let label = if why.starts_with("budget") {
-                "paused (budget)"
-            } else {
-                "paused"
-            };
-            p.warning.fg(&format!("{} {label}", glyph("⏸")))
-        });
-    let mut channels: Vec<String> = snap
-        .channels
-        .iter()
-        .map(|c| {
-            let (g, color) = match c.state.as_str() {
-                "connected" => ("●", p.success),
-                "reconnecting" => ("◐", p.warning),
-                _ => ("○", p.muted),
-            };
-            format!("{} {}", p.muted.fg(&c.name), color.fg(glyph(g)))
-        })
-        .collect();
-    if s.link != Link::Up {
-        channels.clear();
-    }
+    let paused = paused_badge(s, p);
+    let mut channels = channel_dots(s, p);
     // The right side drops off first, the last channel first; the pause badge stays.
     let right = loop {
         let right = paused
@@ -308,7 +474,8 @@ pub fn queue_strip(s: &State, p: &Palette, width: usize, _now: i64) -> Vec<Strin
         .collect()
 }
 
-/// Key hints on the left, today's spend on the right. Hints drop off from the end first.
+/// Key hints, dropping off from the end first. Today's spend and failed replies are in the
+/// header, so here only when the header is the compact one.
 pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
     let key = |k: &str, what: &str| format!("{} {}", p.text.fg(k), p.muted.fg(what));
     let enter = glyph("⏎");
@@ -338,21 +505,19 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
         _ if s.snapshot.run.busy && s.link == Link::Up => vec![
             (key("esc", "stop"), 0),
             (key(enter, "queue"), 2),
-            (key("^L", "model"), 3),
-            (key("/", "commands"), 4),
+            (key("^O", "tools"), 3),
+            (key("^L", "model"), 4),
             (key("^S", "status"), 5),
-            (key("^O", "tools"), 6),
-            (key("^T", "thinking"), 7),
             (key("^D", "detach"), 1),
         ],
         _ => vec![
             (key(enter, "send"), 0),
             (key(&format!("{}{enter}", glyph("⇧")), "newline"), 4),
-            (key("^L", "model"), 2),
-            (key("/", "commands"), 3),
+            (key("/", "commands"), 2),
+            (key("^L", "model"), 3),
             (key("^S", "status"), 5),
             (key("^O", "tools"), 6),
-            (key("^T", "thinking"), 7),
+            (key("?", "help"), 7),
             (key("^D", "detach"), 1),
         ],
     };
@@ -363,13 +528,11 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
     }
 
     let mut right = vec![];
-    if s.snapshot.failed_replies > 0 {
-        let n = s.snapshot.failed_replies;
-        let what = if n == 1 { "reply" } else { "replies" };
-        right.push(p.error.fg(&format!("{} {n} failed {what}", glyph("✗"))));
-    }
-    if s.link == Link::Up {
-        right.push(spend(&s.snapshot, p));
+    if width < MASCOT_MIN_WIDTH {
+        right.extend(failed(s, p));
+        if s.link == Link::Up {
+            right.push(spend(&s.snapshot, p));
+        }
     }
     let right = format!("{} ", right.join("   "));
     loop {
@@ -497,40 +660,83 @@ mod tests {
     }
 
     #[test]
-    fn header_shows_the_model_and_drops_channels_when_narrow() {
+    fn header_puts_the_cloud_beside_model_channels_and_spend() {
         let s = up();
         let wide = plain(header(&s, &DARK, 120, NOW));
+        assert_eq!(wide.len(), 4, "{wide:?}");
+        for row in &wide {
+            assert_eq!(rpi_tui::visible_width(row), 120, "{row:?}");
+        }
+        assert_eq!(&wide[0][..], format!("  ▄▟██▙▗▄▖ {}", " ".repeat(109)));
         assert!(
-            wide[0].starts_with(" ≋ zephyr   main · claude-code-1 › claude-opus-5-5 "),
+            wide[1].starts_with("▗  ●   ●  ▙≈    zephyr · main · claude-code-1 › claude-opus-5-5"),
             "{wide:?}"
         );
         assert!(
-            wide[0].ends_with("discord ●  imessage ◐  chat ○ "),
+            wide[2].starts_with("▝█████████▛     discord ●  imessage ◐  chat ○"),
             "{wide:?}"
         );
-        assert_eq!(rpi_tui::visible_width(&wide[0]), 120);
-        assert!(wide[1].trim().chars().all(|c| c == '─'));
-        let narrow = plain(header(&s, &DARK, 80, NOW));
-        assert!(narrow[0].ends_with("discord ●  imessage ◐ "), "{narrow:?}");
-        assert!(narrow[0].contains("claude-opus-5-5"), "{narrow:?}");
-        let tiny = plain(header(&s, &DARK, 60, NOW));
-        assert!(!tiny[0].contains("discord"), "{tiny:?}");
+        assert!(
+            wide[2].ends_with("today 41.2k tok · $0.38 / $5 "),
+            "{wide:?}"
+        );
+        assert!(wide[3].trim().chars().all(|c| c == '─'));
+        // Channels drop off from the last; spend stays.
+        let narrow = plain(header(&s, &DARK, 70, NOW));
+        assert!(
+            narrow[2].contains("discord ●") && !narrow[2].contains("chat ○"),
+            "{narrow:?}"
+        );
+        assert!(narrow[2].ends_with("$0.38 / $5 "), "{narrow:?}");
+        // Narrower than the cloud allows: the one-row header.
+        let tiny = plain(header(&s, &DARK, 59, NOW));
+        assert_eq!(tiny.len(), 2, "{tiny:?}");
+        assert!(
+            tiny[0].starts_with(" ≋ zephyr   main · claude-code-1"),
+            "{tiny:?}"
+        );
 
         let mut paused = up();
         paused.snapshot.paused = Some("user".into());
-        let narrow = plain(header(&paused, &DARK, 80, NOW));
-        assert!(narrow[0].ends_with("⏸ paused   discord ● "), "{narrow:?}");
+        let h = plain(header(&paused, &DARK, 80, NOW));
+        assert!(h[1].trim_end().ends_with("⏸ paused"), "{h:?}");
+        assert!(h[0].contains("z"), "an asleep cloud: {h:?}");
 
         let mut down = up();
         down.link = Link::Down {
             why: "refused".into(),
         };
         let h = plain(header(&down, &DARK, 80, NOW));
-        assert!(h[0].contains("main · reconnecting…"), "{h:?}");
+        assert!(h[1].contains("zephyr · main · reconnecting…"), "{h:?}");
+        assert!(h[1].contains("×   ×"), "{h:?}");
         assert!(
-            !h[0].contains("discord"),
+            !h[2].contains("discord"),
             "stale channel dots are hidden: {h:?}"
         );
+    }
+
+    #[test]
+    fn the_cloud_shows_the_mood_and_blows_while_working() {
+        let face = |s: &State, now| plain(mascot(Mood::of(s), &DARK, now).to_vec())[1].clone();
+        let mut s = up();
+        assert_eq!(face(&s, NOW), "▗  ●   ●  ▙≈    ");
+        s.snapshot.run.busy = true;
+        let frames: Vec<String> = (0..3).map(|k| face(&s, k * 400)).collect();
+        assert_eq!(
+            frames,
+            ["▗   ●   ● ▙≈    ", "▗   ●   ● ▙ ≈   ", "▗   ●   ● ▙  ≈  "]
+        );
+        s.snapshot.failed_replies = 1;
+        assert!(face(&s, NOW).contains("×   ×"));
+        for mood in [Mood::Idle, Mood::Working, Mood::Asleep, Mood::Troubled] {
+            for row in mascot(mood, &DARK, NOW) {
+                assert_eq!(
+                    rpi_tui::visible_width(&row),
+                    MASCOT_WIDTH,
+                    "{mood:?} {row:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -621,32 +827,33 @@ mod tests {
     }
 
     #[test]
-    fn footer_colours_spend_and_drops_hints_when_narrow() {
+    fn footer_keeps_to_hints_and_spend_is_coloured_by_the_budget() {
         let mut s = up();
         let f = plain(footer(&s, &DARK, 120, NOW)).remove(0);
         assert!(
             f.starts_with(
-                "  ⏎ send · ⇧⏎ newline · ^L model · / commands · ^S status · ^O tools · ^D detach  "
+                "  ⏎ send · ⇧⏎ newline · / commands · ^L model · ^S status · ^O tools · ? help · ^D detach"
             ),
             "{f}"
         );
-        assert!(f.ends_with("today 41.2k tok · $0.38 / $5 "), "{f}");
-        let narrow = plain(footer(&s, &DARK, 60, NOW)).remove(0);
+        assert!(!f.contains("today"), "spend is in the header: {f}");
+        // With the one-row header, spend comes back here and hints make room.
+        let narrow = plain(footer(&s, &DARK, 59, NOW)).remove(0);
         assert!(
             narrow.ends_with("today 41.2k tok · $0.38 / $5 "),
             "{narrow}"
         );
         assert!(narrow.starts_with("  ⏎ send · ^D detach  "), "{narrow}");
-        assert_eq!(rpi_tui::visible_width(&narrow), 60);
+        assert_eq!(rpi_tui::visible_width(&narrow), 59);
 
-        let colour = |s: &State| footer(s, &DARK, 120, NOW).remove(0);
+        let colour = |s: &State| spend(&s.snapshot, &DARK);
         assert!(colour(&s).contains(&DARK.muted.to_fg()));
         s.snapshot.spend.cost = 4.2;
-        assert!(colour(&s).contains(&format!("{}today", DARK.warning.to_fg())));
+        assert!(colour(&s).starts_with(&DARK.warning.to_fg()));
         s.snapshot.spend.cost = 5.0;
-        assert!(colour(&s).contains(&format!("{}today", DARK.error.to_fg())));
+        assert!(colour(&s).starts_with(&DARK.error.to_fg()));
         s.snapshot.failed_replies = 2;
-        assert!(plain(footer(&s, &DARK, 120, NOW))[0].contains("✗ 2 failed replies"));
+        assert!(plain(header(&s, &DARK, 120, NOW))[2].contains("✗ 2 failed replies"));
         s.hint = Some(("press ^C again to detach".into(), NOW + 1));
         assert!(plain(footer(&s, &DARK, 120, NOW))[0].starts_with("  press ^C again to detach"));
     }
@@ -662,9 +869,9 @@ mod tests {
             "{f}"
         );
         assert!(
-            left(&s, 60).starts_with("  ⏎ switch · esc close  "),
+            left(&s, 59).starts_with("  ⏎ switch · esc close  "),
             "{}",
-            left(&s, 60)
+            left(&s, 59)
         );
         s.overlay = Some(Overlay::new(Kind::Status));
         assert!(left(&s, 120).starts_with("  ↑↓ scroll · esc close  "));

@@ -1,11 +1,11 @@
- ≋ zephyr   main · reconnecting…
+  ▄▟██▙▗▄▖                                                               v0.1.0
+▗  ×   ×  ▙     zephyr · main · reconnecting…
+▝█████████▛
  ──────────────────────────────────────────────────────────────────────────────
 
- ≋ Done. I scheduled renew kimchigoose.com for Fri 09:00 KST.
-   ▸ schedule  add "renew domain" fri 09:00                              ✓ 0.2s
-
-    you · 14:05
-    what's in ~/Projects/zephyr/deploy?
+   ╭─ you · 14:05 ────────────────────────────────────────────────────────────╮
+   │ what's in ~/Projects/zephyr/deploy?                                      │
+   ╰──────────────────────────────────────────────────────────────────────────╯
 
    ▸ bash  ls ~/Projects/zephyr/deploy                                   ✓ 0.1s
 
@@ -21,4 +21,4 @@
  ╭────────────────────────────────────────────────────────────────────────────╮
  │ half-typed draft                                                           │
  ╰────────────────────────────────────────────────────────────────────────────╯
-  ⏎ send · ⇧⏎ newline · ^L model · / commands · ^S status · ^D detach
+  ⏎ send · ⇧⏎ newline · / commands · ^L model · ^S status · ^D detach

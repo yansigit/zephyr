@@ -347,7 +347,13 @@ impl Host {
             ] {
                 flags.extend(["-e", var]);
             }
-            self.exec(&flags, &[("HOME", "/tmp")], &["zephyr", "tui"])
+            // The container runs on UTC; the TUI shows times in this machine's zone.
+            let tz = std::env::var("TZ")
+                .ok()
+                .filter(|t| !t.is_empty())
+                .or_else(|| jiff::tz::TimeZone::system().iana_name().map(String::from))
+                .unwrap_or_else(|| "UTC".into());
+            self.exec(&flags, &[("HOME", "/tmp"), ("TZ", &tz)], &["zephyr", "tui"])
         };
         let ran = run(cmd.env("RPI_SERVER_TOKEN", &token));
         if ran.is_err() && !stock && std::io::stdout().is_terminal() {

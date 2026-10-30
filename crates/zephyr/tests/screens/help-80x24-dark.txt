@@ -1,6 +1,6 @@
- ≋ zephyr   main · claude-code-1 › claude-opus-5-5        discord ●  imessage ●
- ──────────────────────────────────────────────────────────────────────────────
- ╭─ commands ─────────────────────────────────────────────────────────────────╮
+  ▄▟██▙▗▄▖                                                               v0.1.0
+▗  ●   ●  ▙≈    zephyr · main · claude-code-1 › claude-opus-5-5
+▝╭─ commands ─────────────────────────────────────────────────────────────────╮
  │ › type to filter                                                           │
  │ Chat                                                                       │
  │  › /new                     start a fresh conversation; memory and rules … │
@@ -21,4 +21,4 @@
  │    /job list                the scheduled jobs                             │
  │    /job add <name> | <cron or time> | <prompt>  schedule a prompt          │
  ╰─────────────────────────────────────────────────────────────── 1-18 of 25 ─╯
-  ↑↓ choose · ⏎ insert · esc close                 today 41.2k tok · $0.38 / $5
+  ↑↓ choose · ⏎ insert · type to filter · esc close
