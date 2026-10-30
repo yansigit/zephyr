@@ -228,15 +228,19 @@ pub fn header(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
     if s.link == Link::Up {
         right.push(spend(snap, p));
     }
-    let right = right.join("   ");
     let text = width - MASCOT_WIDTH;
-    // The channels drop off from the last; spend and failures stay.
+    // The channels drop off from the last, then spend; failed replies stay.
     let status = loop {
-        let left = channels.join("  ");
-        if channels.is_empty() || visible_width(&left) + visible_width(&right) + 3 <= text {
-            break spread(&left, &format!("{right} "), text);
+        let (left, r) = (channels.join("  "), right.join("   "));
+        if visible_width(&left) + visible_width(&r) + 3 <= text
+            || (channels.is_empty() && right.len() <= 1)
+        {
+            break spread(&left, &format!("{r} "), text);
         }
-        channels.pop();
+        match channels.pop() {
+            Some(_) => {}
+            None => drop(right.pop()),
+        }
     };
     let version = if snap.version.is_empty() {
         String::new()
@@ -713,6 +717,21 @@ mod tests {
             !h[2].contains("discord"),
             "stale channel dots are hidden: {h:?}"
         );
+    }
+
+    #[test]
+    fn failed_replies_stay_visible_when_the_header_is_tight() {
+        let mut s = up();
+        s.snapshot.failed_replies = 2;
+        for w in 60..70 {
+            let h = plain(header(&s, &DARK, w, NOW));
+            let f = plain(footer(&s, &DARK, w, NOW));
+            assert!(
+                h[2].contains("2 failed replies") || f[0].contains("2 failed replies"),
+                "{w}: {h:?} {f:?}"
+            );
+            assert_eq!(rpi_tui::visible_width(&h[2]), w);
+        }
     }
 
     #[test]

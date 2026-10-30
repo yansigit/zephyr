@@ -461,6 +461,7 @@ impl Component for Bubble {
             ),
             None => c.fg(&bold(&self.who)),
         };
+        let label = truncate_to_width(&label, width.saturating_sub(5).max(1), glyph("…"));
         let label_w = visible_width(&label);
         let full = width < BUBBLE_FULL_BELOW;
         let max = if full {
@@ -539,6 +540,10 @@ impl Prose {
 impl Component for Prose {
     fn render(&self, width: usize) -> Vec<String> {
         let narrow = self.inner.render(width);
+        // Nothing reached the edge, so nothing was wrapped.
+        if narrow.iter().all(|l| visible_width(l) + 1 < width) {
+            return narrow;
+        }
         let mut cache = self.cache.lock().unwrap();
         if let Some((w, n, ours)) = cache.as_ref() {
             if *w == width && *n == narrow {
@@ -573,7 +578,8 @@ fn reflow(narrow: &[String], wide: &[String], width: usize) -> Vec<String> {
     let prose = |block: &[String]| {
         block.iter().all(|l| {
             let plain = rpi_tui::strip_ansi(l);
-            visible_width(&plain) < UNWRAPPED - 1 && !plain.contains(['│', '┃', '┌', '├'])
+            let rule = plain.contains('─') && plain.trim().chars().all(|c| c == '─');
+            visible_width(&plain) < UNWRAPPED - 1 && !rule && !plain.contains(['│', '┃', '┌', '├'])
         })
     };
     let mut out = vec![];
@@ -677,9 +683,11 @@ fn wrap_ansi(line: &str, width: usize) -> Vec<String> {
         } else {
             width - hang
         };
-        if used == 0 && w > room {
-            // A word wider than a line is split where it must be.
-            let pieces = rpi_tui::wrap_text_with_ansi(&text, room.max(1));
+        if w > room.saturating_sub(used) {
+            // Only at a line's start (else it broke above): a word wider than the line is split
+            // where it must be, after any leading spaces.
+            let room = room.saturating_sub(used).min(width - hang).max(1);
+            let pieces = rpi_tui::wrap_text_with_ansi(&text, room);
             let last = pieces.len().saturating_sub(1);
             for (k, piece) in pieces.into_iter().enumerate() {
                 cur.push_str(&piece);
@@ -766,7 +774,10 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
             let cut = rest[..fit]
                 .rfind(' ')
                 .filter(|&i| i > 0)
-                .unwrap_or(fit.max(1));
+                .unwrap_or(match fit {
+                    0 => rest.chars().next().map_or(1, char::len_utf8),
+                    fit => fit,
+                });
             out.push(rest[..cut].trim_end().to_string());
             rest = rest[cut..].trim_start();
         }
@@ -1306,6 +1317,41 @@ mod tests {
             .map(|l| rpi_tui::strip_ansi(l))
             .collect();
         assert_eq!(long, ["a", "abcdef", "ghijkl"]);
+    }
+
+    #[test]
+    fn review_edge_cases_stay_inside_the_width() {
+        // A rule is one row, not a word split in two.
+        let rule = prose("above\n\n---\n\nbelow", 76);
+        assert_eq!(
+            rule.iter().filter(|l| l.starts_with('─')).count(),
+            1,
+            "{rule:#?}"
+        );
+        // A long token after leading spaces is split, not left overflowing.
+        for l in wrap_ansi("    abcdefghijklmnopqrst", 10) {
+            assert!(visible_width(&l) <= 10, "{l:?}");
+        }
+        let item = prose(
+            "- item one\n\n  https://example.com/a/very/long/path/that/overflows/the/line",
+            30,
+        );
+        assert!(item.iter().any(|l| l.contains("https://")), "{item:#?}");
+        // A wide first character at width 1 does not panic.
+        assert_eq!(wrap_words("한국어", 1), ["한", "국", "어"]);
+        // A bubble's top edge fits even when its label does not.
+        let b = Bubble {
+            who: "discord".into(),
+            when: Some("14:02".into()),
+            color: super::super::theme::DARK.discord,
+            text: "hi".into(),
+            p: super::super::theme::DARK,
+        };
+        for w in [8, 12, 18] {
+            for row in b.render(w) {
+                assert!(visible_width(&row) <= w, "{w}: {row:?}");
+            }
+        }
     }
 
     #[test]
