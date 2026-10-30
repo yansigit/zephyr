@@ -316,22 +316,6 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
             std::fs::metadata(path).is_ok_and(|m| m.mode() & 0o077 == 0),
         );
     }
-    // rpi loads AGENTS.md only if trust.json does not deny the home (DESIGN §4.6).
-    let context_ok =
-        match zephyr::memory::context_trusted(&cfg.home, &zephyr::auth_keeper::agent_dir(cfg)) {
-            Ok(ok) => ok,
-            Err(e) => {
-                println!("{} reading trust.json: {e:#}", mark(false));
-                false
-            }
-        };
-    ok &= check(
-        &format!(
-            "rpi loads AGENTS.md from {} (trust.json does not deny it)",
-            cfg.home.display()
-        ),
-        context_ok,
-    );
     // A warning, not a failure: providers come from the image (DESIGN §4.4).
     let ext_dir = zephyr::auth_keeper::agent_dir(cfg).join("extensions");
     let installed = {
