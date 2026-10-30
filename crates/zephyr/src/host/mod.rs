@@ -642,15 +642,25 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
             h.need_running()?;
             h.apply()
         }
-        // On a terminal, `chat` is the TUI; pipes and scripts keep the line client.
-        "chat" if h.interactive => {
+        // On a terminal, `chat` is the TUI; pipes, scripts and a config without the attach port
+        // keep the line client.
+        "chat"
+            if h.interactive
+                && h.data
+                    .load()
+                    .is_ok_and(|d| conf::get(&d, "attach.port").is_some()) =>
+        {
             a.rest()?;
             h.attach(false)
         }
         "chat" | "pause" | "resume" => {
             a.rest()?;
             h.need_running()?;
-            let flags: &[&str] = if cmd == "chat" { &["-i"] } else { &[] };
+            let flags: &[&str] = match (cmd, h.interactive) {
+                ("chat", true) => &["-it"],
+                ("chat", false) => &["-i"],
+                _ => &[],
+            };
             run(&mut h.exec(flags, &[], &["zephyr", cmd]))
         }
         "attach" => {

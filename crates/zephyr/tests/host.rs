@@ -627,6 +627,56 @@ fn lifecycle_commands_build_the_expected_docker_calls() {
     assert!(!env.daemon().exists());
 }
 
+/// On a terminal `chat` opens the TUI, which needs the attach port; without `[attach]` it keeps
+/// the line client.
+#[test]
+fn chat_on_a_terminal_falls_back_to_the_line_client_without_attach() {
+    if Command::new("script").arg("--version").output().is_err() {
+        return eprintln!("skipped: no script(1) to give zephyr a terminal");
+    }
+    let env = Env::new("chat-tty");
+    env.init(&["--no-start"]);
+    let chat_on_a_tty = || {
+        let path = format!(
+            "{}:{}",
+            env.dir.join("bin").display(),
+            std::env::var("PATH").unwrap()
+        );
+        let out = Command::new("script")
+            .args([
+                "-qec",
+                &format!("{} chat", env!("CARGO_BIN_EXE_zephyr")),
+                "/dev/null",
+            ])
+            .env_clear()
+            .env("PATH", path)
+            .env("HOME", &env.home)
+            .env("SHIM_DIR", &env.dir)
+            .env("ZEPHYR_CONTAINER", CONTAINER)
+            .env("ZEPHYR_IMAGE", "zephyr-lanetest")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", stdout(&out));
+        env.calls()
+    };
+    let calls = chat_on_a_tty();
+    let tui = find(&calls, &["docker", "exec", "-it"]);
+    assert!(tui.ends_with(&["zephyr".into(), "tui".into()]), "{tui:?}");
+
+    let cfg = env.daemon().join("zephyr.toml");
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    let start = text.find("[attach]").unwrap();
+    let end = text[start + 1..]
+        .find("\n[")
+        .map_or(text.len(), |i| start + 1 + i);
+    std::fs::write(&cfg, format!("{}{}", &text[..start], &text[end..])).unwrap();
+    find(
+        &chat_on_a_tty(),
+        &["docker", "exec", "-it", CONTAINER, "zephyr", "chat"],
+    );
+}
+
 #[test]
 fn up_moves_an_old_layout_out_of_the_agents_home_once() {
     let env = Env::new("migrate");
