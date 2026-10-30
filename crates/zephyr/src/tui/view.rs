@@ -158,6 +158,7 @@ impl View {
     /// A `zephyr_reply`: a reply to the TUI that the agent's stream does not show. A one-line
     /// `[zephyr] …` (`stopped`, `paused`, `now on a/b`) is a notice; anything longer a card.
     pub fn reply(&mut self, command: Option<&str>, text: &str) {
+        let text = clean(text);
         let text = text.trim_end();
         if let Some(line) = text.strip_prefix("[zephyr] ").filter(|t| !t.contains('\n')) {
             return self.notice(line);
@@ -329,8 +330,20 @@ impl View {
         s.started = None;
         s.took = took;
         s.done = Some(result["isError"] != true);
-        s.output = crate::rpc::message_text(result);
+        s.output = clean(&crate::rpc::message_text(result));
     }
+}
+
+/// Text from tools and jobs, safe to draw: no escape sequences, `\r` or tabs, which would
+/// shift the layout or reach the terminal. As upstream `tool_execution::normalized_output_lines`.
+fn clean(text: &str) -> String {
+    let text = rpi_tui::strip_ansi(text)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let text = text.replace('\t', "    ");
+    text.chars()
+        .filter(|&c| c == '\n' || !c.is_control())
+        .collect()
 }
 
 fn kind(m: &Value) -> &str {
@@ -746,6 +759,30 @@ mod tests {
             text(&v, 70),
             "   · stopped\n\n   · now on a/b\n\n   · paused: messages wait in the inbox until /resume"
         );
+    }
+
+    #[test]
+    fn tool_output_and_replies_are_cleaned_of_control_characters() {
+        let dirty = "a\tb\rc\x1b[31mred\x1b[0m\x1b]52;c;eA==\x07\x08end";
+        let mut v = view();
+        v.replay(&[
+            json!({"kind": "assistant", "role": "assistant", "content": [
+                {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": "cat x"}}]}),
+            json!({"kind": "tool_result", "role": "toolResult", "toolCallId": "c1", "toolName": "bash",
+                   "content": [{"type": "text", "text": dirty}], "isError": false}),
+        ]);
+        v.toggle_expanded();
+        v.reply(Some("/job"), dirty);
+        let rows = v.root.render(40);
+        for row in &rows {
+            assert!(visible_width(row) <= 40, "{row:?}");
+            let plain = rpi_tui::strip_ansi(row);
+            assert!(!plain.chars().any(|c| c.is_control()), "{row:?}");
+            assert!(!row.contains("\x1b]"), "{row:?}");
+        }
+        let got = text(&v, 40);
+        assert!(got.contains("     a    b\n     credend"), "{got}");
+        assert!(got.contains("│ a    b"), "{got}");
     }
 
     #[test]
