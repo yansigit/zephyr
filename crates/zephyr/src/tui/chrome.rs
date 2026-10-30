@@ -192,11 +192,15 @@ impl Sprite {
 /// Wind leaving the cloud's side, a cell a frame; only single-width, unambiguous glyphs.
 const WIND: [&str; 6] = ["≋  ", "~≋ ", "-~≋", "∙-~", " ∙-", "  ∙"];
 
+fn blinking(tick: i64) -> bool {
+    matches!(tick.rem_euclid(90), 0 | 30 | 45 | 47 | 75)
+}
+
 /// The idle face over a 15 s loop: blinks at 0, 5 and 12.5 s, a double blink at 7.5 s, and a
 /// two-second glance downwind at 10 s.
 fn idle_face(g: &mut Sprite, tick: i64, ink: Ink) {
     match tick.rem_euclid(90) {
-        0 | 30 | 45 | 47 | 75 => g.face("- ᴗ -", 3, ink, None),
+        _ if blinking(tick) => g.face("- ᴗ -", 3, ink, None),
         60..72 => g.face("o ᴗ o", 4, ink, None),
         _ => g.face("o ᴗ o", 3, ink, None),
     }
@@ -238,7 +242,7 @@ pub fn mascot(mood: Mood, p: &Palette, now: i64) -> [String; 3] {
             let ink = (p.cloud_asleep, false);
             g.body(ink, 0);
             g.face(
-                if (tick / 9) % 2 == 1 {
+                if (tick / 9).rem_euclid(2) == 1 {
                     "- ˳ -"
                 } else {
                     "- ₒ -"
@@ -320,7 +324,7 @@ fn ascii_mascot(mood: Mood, tick: i64) -> [String; 3] {
         Mood::Troubled => return [format!("{top}!"), " ( o n o ) ".into(), bottom.into()],
         Mood::Greet(_) if tick < 11 => " ( ^ u ^ ) ".into(),
         Mood::Done(_) if tick < 6 => " ( ^ u ^ ) ".into(),
-        _ if matches!(tick.rem_euclid(90), 0 | 30 | 45 | 47 | 75) => " ( - u - ) ".into(),
+        _ if blinking(tick) => " ( - u - ) ".into(),
         _ => " ( o u o ) ".into(),
     };
     [top.into(), mid, bottom.into()]

@@ -352,10 +352,11 @@ fn event(s: &mut State, view: &mut view::View, ev: &Value) {
             let was_busy = s.snapshot.run.busy;
             s.snapshot = serde_json::from_value(ev["snapshot"].clone()).unwrap_or_default();
             if !s.snapshot.run.busy {
-                s.stopping = false;
-                if was_busy {
+                // A run the user stopped gets no cheer.
+                if was_busy && !s.stopping {
                     s.finished = Some(crate::unix_millis() as i64);
                 }
+                s.stopping = false;
             }
         }
         "zephyr_reply" => view.reply(
@@ -585,5 +586,19 @@ mod tests {
         assert!(super::osc11(dark).unwrap().is_dark());
         assert!(super::osc11("\x1b[?62c").is_none());
         assert!(!super::da1_done(b"\x1b]11;rgb:0/0/0\x07"));
+    }
+
+    #[test]
+    fn only_a_run_that_ends_by_itself_is_cheered() {
+        let status = |busy: bool| serde_json::json!({"type": "zephyr_status", "snapshot": {"run": {"busy": busy}}});
+        let mut view = super::view::View::new(super::theme::DARK, jiff::tz::TimeZone::UTC);
+        for stopped in [false, true] {
+            let mut s = super::chrome::State::default();
+            super::event(&mut s, &mut view, &status(true));
+            s.stopping = stopped;
+            super::event(&mut s, &mut view, &status(false));
+            assert_eq!(s.finished.is_some(), !stopped);
+            assert!(!s.stopping);
+        }
     }
 }

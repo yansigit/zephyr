@@ -253,6 +253,8 @@ fn normalize(screen: &str) -> String {
         .map(|(row, l)| {
             // The mascot (the header's first 14 columns) moves with the clock and greets on
             // connecting; chrome.rs tests its frames. Masking keeps its width checked.
+            // shortcut: masks rows 0-2 at any width; a golden under 60 columns (no mascot) would
+            // hide header text here, so narrow the mask by width before adding one.
             let l = &if row < 3 {
                 "#".repeat(14) + &l.chars().skip(14).collect::<String>()
             } else {
