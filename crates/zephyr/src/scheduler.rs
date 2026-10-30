@@ -218,9 +218,10 @@ async fn attempt_once(
         Err(e) => return ("failed", format!("{label} could not start: {e:#}"), false),
     };
     let limit = cfg.job_timeout;
+    let max_turns = cfg.budget.as_ref().and_then(|b| b.run_turns);
     let mut tally = crate::rpc::Tally::default();
     let ended = tokio::select! {
-        r = tokio::time::timeout(limit, prompt(&mut child, &run.job.prompt, &mut tally)) => Some(r),
+        r = tokio::time::timeout(limit, prompt(&mut child, &run.job.prompt, &mut tally, max_turns)) => Some(r),
         _ = until_paused(store) => None,
     };
     let out = match ended {
@@ -254,23 +255,37 @@ async fn attempt_once(
     (out.0, out.1, crossed)
 }
 
-/// Sends the prompt and waits for the run to settle, counting its events into `tally`. The
-/// inner result is the final assistant text, or why the run ended without one.
+/// Sends the prompt and waits for the run to settle, counting its events into `tally`, and
+/// aborts it at `max_turns`. The inner result is the final assistant text, or why the run
+/// ended without one.
 async fn prompt(
     child: &mut Child,
     text: &str,
     tally: &mut crate::rpc::Tally,
+    max_turns: Option<u32>,
 ) -> anyhow::Result<anyhow::Result<String>> {
     child
         .call(json!({"type": "prompt", "message": text}))
         .await?;
+    let mut cut = None;
     let settled = loop {
         match child.events.recv().await {
             Some(ev) if ev["type"] == "agent_settled" => break ev,
-            Some(ev) => tally.add(&ev),
+            Some(ev) => {
+                tally.add(&ev);
+                if cut.is_none() && max_turns.is_some_and(|max| tally.turns >= max) {
+                    cut = max_turns;
+                    child.call(json!({"type": "abort"})).await?;
+                }
+            }
             None => anyhow::bail!("rpi exited mid-run"),
         }
     };
+    if let Some(max) = cut {
+        return Ok(Err(anyhow::anyhow!(
+            "stopped after {max} turns (budget.run_turns)"
+        )));
+    }
     let snap = child.call(json!({"type": "get_messages"})).await?;
     let reply = snap["messages"]
         .as_array()

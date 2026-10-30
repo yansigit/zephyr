@@ -334,7 +334,7 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     };
     if installed {
         println!(
-            "warn {} is not empty: providers come from the image; packages installed into agent_dir load twice",
+            "warn {} is not empty: rpi children ignore it (--local-only); providers come from the image",
             ext_dir.display()
         );
     }

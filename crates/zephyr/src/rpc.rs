@@ -73,8 +73,9 @@ impl Child {
         let mut cmd = Command::new(&cfg.rpi);
         crate::agent::cmd(cmd.as_std_mut());
         // AGENTS.md is the agent's only standing instruction (memory::prepare): no skills it
-        // could plant, and a trust.json it wrote can't switch AGENTS.md off.
-        cmd.args(["--mode", "rpc", "--approve", "--no-skills"])
+        // could plant, and a trust.json it wrote can't switch AGENTS.md off. `--local-only`
+        // loads only the `--extension` files below, none from a dir or setting the agent can write.
+        cmd.args(["--mode", "rpc", "--approve", "--no-skills", "--local-only"])
             .args(["--session-id", session_id, "--session-dir"])
             .arg(cfg.session_dir())
             // rpi files sessions under a per-cwd folder, so the cwd must never change.
@@ -169,10 +170,12 @@ impl Child {
         line.push(b'\n');
         self.stdin.write_all(&line).await?;
         self.stdin.flush().await?;
-        let resp = tokio::time::timeout(Duration::from_secs(60), rx)
-            .await
-            .map_err(|_| anyhow!("{} timed out", cmd["type"]))?
-            .map_err(|_| anyhow!("rpi exited during {}", cmd["type"]))?;
+        let Ok(resp) = tokio::time::timeout(Duration::from_secs(60), rx).await else {
+            // A late answer then finds no waiter and goes out as an event, which the router ignores.
+            self.pending.lock().unwrap().remove(&id);
+            bail!("{} timed out", cmd["type"]);
+        };
+        let resp = resp.map_err(|_| anyhow!("rpi exited during {}", cmd["type"]))?;
         if resp["success"] == true {
             Ok(resp["data"].clone())
         } else {
@@ -206,6 +209,8 @@ pub struct Tally {
     pub used: (i64, f64),
     /// Bash commands that sent data off the machine (`zephyr_policy::policy::outbound`).
     pub outbound: Vec<String>,
+    /// Model turns taken (`turn_end`), for `budget.run_turns`.
+    pub turns: u32,
 }
 
 impl Tally {
@@ -214,6 +219,9 @@ impl Tally {
         if ev["type"] == "message_end" && m["role"] == "assistant" {
             self.used.0 += m["usage"]["totalTokens"].as_i64().unwrap_or(0);
             self.used.1 += m["usage"]["cost"]["total"].as_f64().unwrap_or(0.0);
+        }
+        if ev["type"] == "turn_end" {
+            self.turns += 1;
         }
         // From rpi, not from anything the agent writes, so the agent cannot hide a send.
         if ev["type"] == "tool_execution_start" && ev["toolName"] == "bash" {
@@ -286,7 +294,7 @@ mod tests {
         let argv: Vec<String> =
             serde_json::from_str(&std::fs::read_to_string(home.join("argv.json")).unwrap())
                 .unwrap();
-        for flag in ["--approve", "--no-skills"] {
+        for flag in ["--approve", "--no-skills", "--local-only"] {
             assert!(argv.contains(&flag.to_string()), "{flag} in {argv:?}");
         }
         let at = argv.iter().position(|x| x == "--extension").unwrap();

@@ -20,6 +20,7 @@ Each prompt and resume starts with `agent_start` and ends with `agent_end`, then
 `bash` tool call (assistant toolCall, tool_execution_start, tool_execution_end, toolResult); while a
 `tool_wait` file exists in the home, the tool keeps running.
 `get_state` reports thinkingLevel "medium".
+A prompt containing `[turns N]` reports N `turn_end` events, then waits for `abort` as `[hang]` does.
 A prompt containing `[hang]` never settles until `abort`; one that starts with `say: `
 replies with the rest; `model?` replies with the current model.
 Models: `--list-models` (held while a `list_wait` file exists in the home) prints fake/m1, fake/m2 and other/m3, the catalogue `set_model` accepts
@@ -27,7 +28,7 @@ Models: `--list-models` (held while a `list_wait` file exists in the home) print
 `set_model` switches to one of them and errors on anything else.
 The session is <session-dir>/<session-id>.json: {"messages": [...], "pending": bool}.
 """
-import json, os, sys, time
+import json, os, re, sys, time
 
 args = sys.argv[1:]
 if "--version" in args:
@@ -180,6 +181,11 @@ for line in sys.stdin:
             continue
         if rate_limit() is not None:
             fail(s, rate_limit()); continue
+        turns = re.search(r"\[turns (\d+)\]", cmd["message"])
+        if turns:
+            for _ in range(int(turns.group(1))):
+                out({"type": "turn_end"})
+            hanging = True; continue
         if "[hang]" in cmd["message"]:
             hanging = True; continue
         if "bash: " in cmd["message"]:

@@ -255,7 +255,7 @@ typing = true
 
 #[test]
 fn doctor_warns_when_agent_dir_has_extensions() {
-    let warning = "providers come from the image; packages installed into agent_dir load twice";
+    let warning = "rpi children ignore it (--local-only); providers come from the image";
     let (_, cfg) = setup("doctor-ext", "");
     let agent = cfg.parent().unwrap().join("agent");
     let run = || stdout(&zephyr(&cfg, &["doctor"]));
@@ -444,5 +444,53 @@ fn a_changed_secret_reexecs_the_daemon_in_place() {
     });
     let second = zephyr(&cfg, &["run"]);
     assert!(String::from_utf8_lossy(&second.stderr).contains("another zephyr is running"));
+    drop(running);
+}
+
+#[test]
+fn a_reexec_waits_for_the_running_reply() {
+    let (home, cfg) = setup("reexec-busy", "[agent]\nenv = [\"ZEPHYR_CLI_RELOAD\"]\n");
+    let uid = std::fs::metadata(&home).unwrap().uid();
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(&cfg, format!("{text}[owners]\nchat = [\"{uid}\"]\n")).unwrap();
+    std::fs::write(home.join("secrets.env"), "ZEPHYR_CLI_RELOAD=one\n").unwrap();
+    std::fs::write(home.join("slow"), "3").unwrap();
+    let running = daemon(&cfg, &home);
+    wait_for("the child has the secret", || {
+        child_env(&home).contains("ZEPHYR_CLI_RELOAD=one")
+    });
+    let mut chat = std::os::unix::net::UnixStream::connect(home.join("zephyr.sock")).unwrap();
+    chat.set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    writeln!(chat, r#"{{"id": "busy-1", "text": "say: finished"}}"#).unwrap();
+    let prompts = || {
+        std::fs::read_to_string(home.join("log.jsonl"))
+            .unwrap_or_default()
+            .matches(r#""type":"prompt""#)
+            .count()
+    };
+    wait_for("the run started", || prompts() == 1);
+
+    std::fs::write(home.join("secrets.env"), "ZEPHYR_CLI_RELOAD=two\n").unwrap();
+    assert_eq!(
+        stdout(&zephyr(&cfg, &["reload"])),
+        "[zephyr] restarting zephyr's channels after the current reply"
+    );
+    // Still taking messages: one sent now is answered before the re-exec too.
+    writeln!(chat, r#"{{"id": "busy-2", "text": "and this"}}"#).unwrap();
+    // Both replies come on this connection, so the old process sent them before it exec'd.
+    // (The `reload` answer comes here too: chat writes to every connection of the uid.)
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(&chat));
+    for want in ["finished", "and this"] {
+        let reply = lines.find(|l| l.as_ref().map_or(true, |l| l.contains(want)));
+        assert!(
+            reply.is_some_and(|l| l.is_ok()),
+            "no reply to {want:?} before the re-exec"
+        );
+    }
+    wait_for("no re-exec", || {
+        child_env(&home).contains("ZEPHYR_CLI_RELOAD=two")
+    });
+    assert_eq!(prompts(), 2, "each message went to rpi once");
     drop(running);
 }

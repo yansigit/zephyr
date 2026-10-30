@@ -62,13 +62,16 @@ fn start_with(name: &str, extra: &str) -> Gateway {
         .local_addr()
         .unwrap()
         .port();
-    let cfg: Config = toml::from_str(&format!(
-        "rpi = {:?}\nhome = {:?}\nagent_dir = {:?}\n[owners]\nchat = [\"owner\"]\n[attach]\nport = {port}\ntoken_file = {token:?}\n{extra}",
+    // On a file, so `/model` has a zephyr.toml to change.
+    let path = home.join("zephyr.toml");
+    std::fs::write(&path, format!(
+        "rpi = {:?}\nhome = {:?}\nagent_dir = {:?}\nmodel = \"fake/m1\"\n[owners]\nchat = [\"owner\"]\n[attach]\nport = {port}\ntoken_file = {token:?}\n{extra}",
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-rpi.py"),
         home,
         home.join("agent"),
     ))
     .unwrap();
+    let cfg = Config::load(&path).unwrap();
     let (chat, rx) = mpsc::channel(16);
     let (stop, stopped) = oneshot::channel::<()>();
     let task = tokio::spawn(async move {
@@ -295,6 +298,23 @@ async fn history_replays_then_live_events_stream() {
     gw.shutdown().await;
 }
 
+#[tokio::test]
+async fn get_state_reports_the_model_the_agent_is_on_now() {
+    let gw = start("model");
+    let mut c = Client::attach(gw.port).await;
+    let model = async |c: &mut Client, id: i64| {
+        c.send(json!({"type": "get_state", "id": id})).await;
+        c.event_of("response").await["result"]["model"].clone()
+    };
+    assert_eq!(model(&mut c, 1).await, "fake/m1");
+    c.send(json!({"type": "prompt", "content": "/model fake/m2"}))
+        .await;
+    let ev = c.event_of("message_end").await;
+    assert_eq!(text(&ev), "[zephyr] now on fake/m2");
+    assert_eq!(model(&mut c, 2).await, "fake/m2");
+    gw.shutdown().await;
+}
+
 /// Text the router itself writes to the outbox for `tui` (command replies, notices) is shown
 /// as an assistant message, since no agent event carries it.
 #[tokio::test]
@@ -471,7 +491,7 @@ async fn zephyr_models_lists_each_accounts_models() {
     let got = c.call("zephyr.models", json!({})).await["result"].clone();
     assert_eq!(
         got,
-        json!({"accounts": [{"name": null, "model": null, "models": ["fake/m1", "fake/m2", "other/m3"]}]})
+        json!({"accounts": [{"name": null, "model": "fake/m1", "models": ["fake/m1", "fake/m2", "other/m3"]}]})
     );
     gw.shutdown().await;
 }

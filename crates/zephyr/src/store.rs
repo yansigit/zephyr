@@ -393,10 +393,12 @@ impl Store {
 
     /// Writes a notice to `channel`/`recipient`.
     pub fn notify(&self, channel: &str, recipient: &str, text: &str) -> rusqlite::Result<()> {
-        // No inbox row to key on, so the client id is `b<outbox id>`. Replies are `z<base36>`.
+        // No inbox row to key on, so the client id is `b` and 16 random hex digits: unique
+        // without reading the table, which the router and the scheduler write at once.
+        // Replies are `z<base36>`.
         self.db.execute(
             "INSERT INTO outbox(channel, recipient, client_id, text)
-             VALUES (?1, ?2, 'b' || (SELECT coalesce(max(id), 0) + 1 FROM outbox), ?3)",
+             VALUES (?1, ?2, 'b' || lower(hex(randomblob(8))), ?3)",
             params![channel, recipient, text],
         )?;
         Ok(())
@@ -775,6 +777,10 @@ mod tests {
             ]
         );
         assert_ne!(out[1].client_id, out[2].client_id);
+        // Short enough for Discord's 25-char nonce with a `-<chunk>` suffix.
+        assert!(out[1..]
+            .iter()
+            .all(|o| o.client_id.starts_with('b') && o.client_id.len() == 17));
     }
 
     #[test]

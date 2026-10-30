@@ -86,6 +86,7 @@ Upstream analysis (`research/pi-rust-integration.md` §7) compared three options
   - `start_session` returns `main`.
   - `subscribe` replays history from `get_messages`, then streams live events.
   - The client's `stop_session` only detaches.
+  - `get_state` reports the model the agent is on now (the active account's, or `model`), so the client's footer follows `/model` and failover.
   - What the router writes itself for `tui` (command replies, notices such as the outbound list and memory diffs, job output) has no agent event, so it is sent to attached clients as an assistant message. With no client attached, notices and job output wait in the outbox for the next attach.
   - Unverified: these details come from reading the code, not from a test run. Fallback: a ~150-line `rpi-gateway chat` line client over the same socket.
   - A follow-up upstream PR could add `--connect --session <id>`.
@@ -207,7 +208,7 @@ There are no per-call prompts. These hard limits hold every time:
 
    It logs every call to the audit table.
 3. **Untrusted content and what leaves.** Text the agent reads is not wrapped in `<untrusted>` tags: the plugin cannot rewrite tool output, and wrapping only lowered attack success from 57.7% to 41.7% in AgentDojo (Table 5). Nothing outbound is blocked either; an egress allowlist did not lower attack success in ClawSafety (NemoClaw, 45.8% vs 40%), because most leaks went into normal replies. Instead the owner sees what left: the daemon reads each bash `tool_execution_start` from rpi's event stream (which the agent cannot forge) and, after the turn, lists every command that sent data off the machine (`zephyr_policy::policy::outbound`: curl/wget with a body or a non-GET method, ssh, scp, sftp, rsync to a host, nc, socat, telnet, `git push`). Plain GETs are not listed, though a URL can carry data too (CaMeL §7).
-4. **Budgets.** Daily token and cost limits, summed from the `usage` on each assistant `message_end` event. rpi 0.12.0's `get_stats` totals count only usage that extensions record, never the replies' own, so they stay at 0. When a limit is hit, the gateway pauses and notifies you. (A per-run cap of turns and minutes was planned but is not built.)
+4. **Budgets.** Daily token and cost limits, summed from the `usage` on each assistant `message_end` event. rpi 0.12.0's `get_stats` totals count only usage that extensions record, never the replies' own, so they stay at 0. When a limit is hit, the gateway pauses and notifies you. Per run, `[budget] run_turns` (model turns, counted from `turn_end`) and `run_minutes` stop a main-session run with `abort` and tell the owner `[zephyr] stopped the run after …` once it settles; jobs get `run_turns` too, and their fixed 30-minute cap (`JOB_TIMEOUT`) instead of `run_minutes`. Both are off unless set.
 5. **Kill switch.**
    - `/stop` from any owner channel aborts the run.
    - `/pause` stops all dispatch and scheduling until `/resume`.
@@ -234,7 +235,7 @@ There are no per-call prompts. These hard limits hold every time:
 
   Why a human gate rather than a scanner: an agent that writes its own memory saved a fabricated "preference" from one web page up to 99.8% of the time, which then steered 68–80% of later actions (Sleeper Memory Poisoning, arXiv 2605.15338, Tables 1–2, App. I); pattern and LLM-trust filters let poisoned entries through (arXiv 2601.05504 §8.2).
 - rpi 0.12.0 loads the first of `AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD` from the agent dir and from each dir up from the cwd, so an agent that wrote `AGENTS.override.md` or `CLAUDE.md` in `/zephyr`, or `AGENTS.md` in its agent dir, would get around both rules and approval. It also reads `SYSTEM.md` (which replaces its own system prompt) and `APPEND_SYSTEM.md` from `/zephyr/.rpi/` and from the agent dir. Before each start the daemon renames any of those to `<name>.ignored-by-zephyr` and logs it.
-- Two more sources are closed on the child's command line. `--no-skills`: skill descriptions go into every prompt, and the agent can write skills under `/zephyr/.rpi/skills` or its agent dir. `--approve`: rpi skips `AGENTS.md` for a cwd that `trust.json` marks `false`, and the agent can write that file too.
+- Two more sources are closed on the child's command line. `--no-skills`: skill descriptions go into every prompt, and the agent can write skills under `/zephyr/.rpi/skills` or its agent dir. `--approve`: rpi skips `AGENTS.md` for a cwd that `trust.json` marks `false`, and the agent can write that file too. `--local-only`: rpi otherwise also loads extensions from `/zephyr/.rpi/extensions`, the agent dir's `extensions/`, project packages and the `extensionDirs` setting, all writable by the agent; an extension can rewrite the system prompt (`before_agent_start`) or shadow a provider, and it loads before the policy plugin. With the flag only the `--extension` files zephyr passes (the policy plugin and the image's providers) load.
 - `<state>` is root's in the container (§4.4), so the agent can change neither the rules nor the approved copies.
 
 ### 4.7 Auth and providers
@@ -310,5 +311,4 @@ Each milestone gets a failing test first and runs in its own worktree. Lanes wit
 - The name collides with the Zephyr RTOS (a Linux Foundation project). That doesn't matter for a private repo, but check it before using Zephyr as a public brand.
 - The agent runs as your uid, so it can read anything mounted that you can. Only the listed secret paths are masked.
 - The agent can read the provider credentials rpi itself needs (`accounts/*/auth.json`, the Claude config) and the conversation (`sessions/`); the policy plugin's name check is the only thing in the way, and it can be bypassed.
-- rpi loads extensions from `/zephyr/.rpi/extensions` and the agent dir, which the agent can write. One it plants runs as the agent, so it gains no rights the agent's bash lacks, but it lasts across restarts and could get around the policy plugin's checks.
 - A plain GET can carry data out in its URL; outbound alerts list only commands that send a body or use another method (§4.4 item 3).
