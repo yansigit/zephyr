@@ -214,11 +214,8 @@ fn commit_locked(home: &Path) -> anyhow::Result<bool> {
         return Ok(false);
     }
     git(&dir, &["add", "-A"])?;
-    let now = (crate::unix_millis() / 1000) as u64;
-    git(
-        &dir,
-        &["commit", "-q", "-m", &format!("{PREFIX}{}", iso_utc(now))],
-    )?;
+    let when = crate::pool::iso(crate::now());
+    git(&dir, &["commit", "-q", "-m", &format!("{PREFIX}{when}")])?;
     Ok(true)
 }
 
@@ -465,27 +462,6 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// `YYYY-MM-DDTHH:MM:SSZ` for a Unix time, without a date crate (Hinnant's civil_from_days).
-fn iso_utc(secs: u64) -> String {
-    let days = secs as i64 / 86_400;
-    let rem = secs % 86_400;
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        rem % 3600 / 60,
-        rem % 60
-    )
 }
 
 #[cfg(test)]
@@ -746,12 +722,5 @@ mod tests {
             "nothing was reverted past the seed"
         );
         assert!(dir(&home).join(USER).exists());
-    }
-
-    #[test]
-    fn formats_utc_timestamps() {
-        assert_eq!(iso_utc(0), "1970-01-01T00:00:00Z");
-        assert_eq!(iso_utc(1_700_000_000), "2023-11-14T22:13:20Z");
-        assert_eq!(iso_utc(951_782_400), "2000-02-29T00:00:00Z", "leap day");
     }
 }

@@ -220,7 +220,7 @@ impl<'a> Router<'a> {
                     "zephyr: every account is rate-limited until {}",
                     crate::pool::iso(until)
                 );
-                let wait = Duration::from_secs((until - now()).max(1) as u64);
+                let wait = Duration::from_secs((until - crate::now()).max(1) as u64);
                 self.respawn_at = Instant::now() + wait;
                 return;
             }
@@ -446,7 +446,7 @@ impl<'a> Router<'a> {
         error: &str,
         resets_at: Option<i64>,
     ) -> anyhow::Result<()> {
-        let now = now();
+        let now = crate::now();
         let until = crate::pool::cool_down(&self.store, &account.name, error, resets_at, now)?;
         let rows = self.store.inbox_with_status("dispatched")?;
         self.reconcile(None, true).await?;
@@ -638,7 +638,7 @@ impl<'a> Router<'a> {
     async fn auth_check(&mut self) {
         let every = Duration::from_secs_f64((self.cfg.auth.refresh_minutes * 60.0).max(1.0));
         self.auth_at = Instant::now() + every;
-        let now = crate::auth_keeper::now_secs();
+        let now = crate::now();
         if !self.cfg.accounts.is_empty() {
             self.restart |=
                 crate::auth_keeper::refresh_accounts(&self.cfg, self.account.as_ref(), now).await;
@@ -800,7 +800,7 @@ impl<'a> Router<'a> {
             };
             let status = match sent {
                 Ok(()) => "sent",
-                Err(e) if now() - row.created_at > retry_window(&row.channel) => {
+                Err(e) if crate::now() - row.created_at > retry_window(&row.channel) => {
                     eprintln!(
                         "zephyr: reply {} to {} failed for good: {e:#}",
                         row.id, row.channel
@@ -904,18 +904,11 @@ fn pick_in(cfg: &Config, store: &Store) -> Result<Option<Account>, i64> {
         eprintln!("zephyr: reading cooldowns failed: {e}");
         Default::default()
     });
-    crate::pool::pick(&cfg.accounts, &cooling, now()).map(|a| Some(a.clone()))
+    crate::pool::pick(&cfg.accounts, &cooling, crate::now()).map(|a| Some(a.clone()))
 }
 
 fn log(r: anyhow::Result<()>) {
     if let Err(e) = r {
         eprintln!("zephyr: {e:#}");
     }
-}
-
-fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
 }
