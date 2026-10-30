@@ -84,6 +84,7 @@ pub async fn serve(
                     authed: false,
                     live: None,
                     zephyr: false,
+                    models: None,
                 };
                 tokio::spawn(conn.run(stream));
             }
@@ -103,6 +104,9 @@ struct Conn {
     live: Option<broadcast::Receiver<Value>>,
     /// Subscribed with `zephyr.subscribe`: raw events plus `zephyr_status`.
     zephyr: bool,
+    /// A `zephyr.models` answer being built: `(id, result)`. It runs rpi once per account, so
+    /// it is off the loop, which keeps streaming meanwhile.
+    models: Option<tokio::task::JoinHandle<(Value, Value)>>,
 }
 
 /// What to do after a request: write these frames, then maybe hang up.
@@ -128,6 +132,13 @@ impl Conn {
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
                 },
+                done = async { self.models.as_mut().expect("pending").await }, if self.models.is_some() => {
+                    self.models = None;
+                    match done {
+                        Ok((id, result)) => (vec![ok(&id, result)], false),
+                        Err(_) => (vec![], false), // a panic in the listing; the client asks again
+                    }
+                }
                 changed = self.snap.changed(), if self.zephyr => match changed {
                     Ok(()) => (vec![self.status()], false),
                     Err(_) => return, // the router is gone
@@ -189,8 +200,13 @@ impl Conn {
                 (vec![ok(id, snap)], false)
             }
             "zephyr.models" => {
-                let cfg = self.cfgs.borrow().clone();
-                (vec![ok(id, crate::router::models(&cfg).await)], false)
+                let (cfg, id) = (self.cfgs.borrow().clone(), id.clone());
+                // A newer ask replaces one still pending.
+                let task = tokio::spawn(async move { (id, crate::router::models(&cfg).await) });
+                if let Some(old) = self.models.replace(task) {
+                    old.abort();
+                }
+                (vec![], false)
             }
             "send" => self.send(id, &params["command"]).await,
             _ => (vec![error(id, -32601, "method not found")], false),

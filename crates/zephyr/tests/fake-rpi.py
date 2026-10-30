@@ -22,7 +22,7 @@ Each prompt and resume starts with `agent_start` and ends with `agent_end`, then
 `get_state` reports thinkingLevel "medium".
 A prompt containing `[hang]` never settles until `abort`; one that starts with `say: `
 replies with the rest; `model?` replies with the current model.
-Models: `--list-models` prints fake/m1, fake/m2 and other/m3, the catalogue `set_model` accepts
+Models: `--list-models` (held while a `list_wait` file exists in the home) prints fake/m1, fake/m2 and other/m3, the catalogue `set_model` accepts
 (plus the started model);
 `set_model` switches to one of them and errors on anything else.
 The session is <session-dir>/<session-id>.json: {"messages": [...], "pending": bool}.
@@ -34,6 +34,8 @@ if "--version" in args:
     print("rpi 0.12.0"); sys.exit(0)
 CATALOG = ["fake/m1", "fake/m2", "other/m3"]
 if "--list-models" in args:
+    while os.path.exists("list_wait"):  # cwd is the home
+        time.sleep(0.05)
     print("provider  model  context")
     for m in CATALOG:
         print("%s  %s  1M" % tuple(m.split("/", 1)))

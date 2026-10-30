@@ -453,6 +453,33 @@ async fn zephyr_models_lists_each_accounts_models() {
     gw.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_slow_model_listing_does_not_hold_up_the_connection() {
+    let gw = start("models-slow");
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    std::fs::write(gw.home.join("list_wait"), "").unwrap();
+    let req = json!({"jsonrpc": "2.0", "id": 99, "method": "zephyr.models", "params": {}});
+    c.write
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    let pong = c.call("ping", json!({})).await;
+    assert_eq!(pong["result"]["type"], "pong", "{pong}");
+    std::fs::remove_file(gw.home.join("list_wait")).unwrap();
+    let models = loop {
+        let v = c.read().await.expect("connection closed");
+        if v["id"] == 99 {
+            break v;
+        }
+    };
+    assert_eq!(
+        models["result"]["accounts"][0]["models"][0], "fake/m1",
+        "{models}"
+    );
+    gw.shutdown().await;
+}
+
 /// The next `zephyr_status` snapshot that `done` accepts.
 async fn status_until(c: &mut Client, done: impl Fn(&Value) -> bool) -> Value {
     loop {
