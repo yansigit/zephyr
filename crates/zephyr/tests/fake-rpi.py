@@ -14,6 +14,10 @@ Accounts: each start logs {"type": "start", "agentDir", "model"} to ./log.jsonl.
 that error (stopReason "error", settle outcome "failed"), as a rate-limited provider does.
 A prompt containing WRITE_MEMORY first writes memory/MEMORY.md under the home.
 argv.json holds the argv of the latest start.
+Each prompt and resume starts with `agent_start` and ends with `agent_end`, then `agent_settled`. A prompt containing `[tool]` first runs one fake
+`bash` tool call (assistant toolCall, tool_execution_start, tool_execution_end, toolResult); while a
+`tool_wait` file exists in the home, the tool keeps running.
+`get_state` reports thinkingLevel "medium".
 A prompt containing `[hang]` never settles until `abort`; one that starts with `say: `
 replies with the rest; `model?` replies with the current model.
 Models: `--list-models` prints fake/m1, fake/m2 and other/m3, the catalogue `set_model` accepts
@@ -98,6 +102,7 @@ def fail(s, error):
            "errorMessage": error, "timestamp": 0}
     s["messages"].append(msg); s["pending"] = False; save(s)
     out({"type": "message_end", "message": msg})
+    out({"type": "agent_end", "messageCount": 0, "messages": []})
     out({"type": "agent_settled", "runId": "r", "outcome": "failed", "aborted": False,
          "error": error, "summary": None, "pendingResume": False})
 
@@ -106,8 +111,24 @@ def finish(s, text, outcome="completed"):
     s["messages"].append(msg); s["pending"] = False; save(s)
     out({"type": "message_start", "message": msg})
     out({"type": "message_end", "message": msg})
+    out({"type": "agent_end", "messageCount": 0, "messages": []})
     out({"type": "agent_settled", "runId": "r", "outcome": outcome, "aborted": outcome == "aborted",
          "error": None, "summary": None, "pendingResume": False})
+
+def run_tool(s):
+    call = {"kind": "assistant", "role": "assistant", "stopReason": "toolUse", "timestamp": 0,
+            "content": [{"type": "toolCall", "id": "t1", "name": "bash", "arguments": {"command": "true"}}]}
+    result = {"kind": "toolResult", "role": "toolResult", "toolCallId": "t1", "toolName": "bash",
+              "content": [{"type": "text", "text": "ok"}], "isError": False, "timestamp": 0}
+    s["messages"].append(call); save(s)
+    out({"type": "message_start", "message": call}); out({"type": "message_end", "message": call})
+    out({"type": "tool_execution_start", "toolCallId": "t1", "toolName": "bash", "args": {"command": "true"}})
+    while os.path.exists(os.path.join(home, "tool_wait")):
+        time.sleep(0.05)
+    out({"type": "tool_execution_end", "toolCallId": "t1", "toolName": "bash", "isError": False,
+         "result": {"content": result["content"]}})
+    s["messages"].append(result); save(s)
+    out({"type": "message_start", "message": result}); out({"type": "message_end", "message": result})
 
 out({"type": "ready", "protocol": "rpi", "piCompatibilityTarget": "1.2.0",
      "supportedCommands": ["get_state", "get_commands", "get_messages", "get_stats", "queue_message", "clear_queue",
@@ -125,6 +146,7 @@ for line in sys.stdin:
     kind, s = cmd["type"], load()
     if kind == "prompt":
         respond(cmd, {"accepted": True})
+        out({"type": "agent_start"})
         s["messages"].append(user(cmd["message"])); save(s)
         if "WRITE_MEMORY" in cmd["message"]:
             open(os.path.join(home, "memory", "MEMORY.md"), "a").write("remembered: " + cmd["message"] + "\n")
@@ -142,6 +164,7 @@ for line in sys.stdin:
                 if c["type"] != "abort":
                     respond(c, error="busy"); continue
                 respond(c, {"aborted": True}); s["pending"] = False; save(s)
+                out({"type": "agent_end", "messageCount": 0, "messages": []})
                 out({"type": "agent_settled", "runId": "r", "outcome": "aborted", "aborted": True,
                      "error": None, "summary": None, "pendingResume": False})
                 break
@@ -150,6 +173,8 @@ for line in sys.stdin:
             fail(s, rate_limit()); continue
         if "[hang]" in cmd["message"]:
             hanging = True; continue
+        if "[tool]" in cmd["message"]:
+            run_tool(s)
         if cmd["message"].endswith("model?"):
             finish(s, "model: %s" % model); continue
         if cmd["message"].startswith("say: "):
@@ -159,6 +184,7 @@ for line in sys.stdin:
         if not s["pending"]:
             respond(cmd, {"resumed": False}); continue
         respond(cmd, {"accepted": True})
+        out({"type": "agent_start"})
         last = [m for m in s["messages"] if m["kind"] == "user"][-1]
         finish(s, "resumed: " + last["content"])
     elif kind == "get_messages":
@@ -191,7 +217,7 @@ for line in sys.stdin:
         else:
             respond(cmd, error="unknown model: %s" % cmd.get("modelId"))
     elif kind == "get_state":
-        respond(cmd, {"sessionId": opt("--session-id"), "activeOperation": None})
+        respond(cmd, {"sessionId": opt("--session-id"), "activeOperation": None, "thinkingLevel": "medium"})
     elif kind == "stop":
         respond(cmd, {"stopped": True}); break
     else:

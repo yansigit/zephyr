@@ -4,6 +4,7 @@ use crate::channel::{Channel, Inbound, Outbound};
 use crate::config::{Account, Config, BUDGET_NOTICE};
 use crate::rpc::{message_text, Child, MAIN_SESSION};
 use crate::store::{InboxRow, Store};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -22,6 +23,92 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// The prompt text for a row. The `#id` tag is what recovery looks for in `get_messages`.
 pub fn tagged(row: &InboxRow) -> String {
     format!("[{} #{}] {}", row.channel, row.id, row.text)
+}
+
+/// The reverse of `tagged`: `(channel, inbox id, text)`, or `None` for untagged text.
+pub fn untag(text: &str) -> Option<(&str, i64, &str)> {
+    let (channel, rest) = text.strip_prefix('[')?.split_once(" #")?;
+    let (id, body) = rest.split_once("] ")?;
+    Some((channel, id.parse().ok()?, body))
+}
+
+/// What attached clients see of the daemon: `zephyr.hello` and `zephyr_status` (DESIGN §4.3.1).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub version: String,
+    pub session: String,
+    pub account: Option<String>,
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+    pub paused: Option<String>,
+    pub channels: Vec<ChannelState>,
+    pub spend: Spend,
+    pub queue: Vec<Waiting>,
+    pub failed_replies: i64,
+    pub run: Run,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChannelState {
+    pub name: String,
+    /// `connected` | `off` | `reconnecting`
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Spend {
+    pub tokens: i64,
+    pub cost: f64,
+    pub daily_tokens_limit: Option<i64>,
+    pub daily_cost_limit: Option<f64>,
+}
+
+/// An inbox row waiting to be dispatched.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Waiting {
+    pub channel: String,
+    pub preview: String,
+    pub since_unix: i64,
+}
+
+/// The `main` run, from the child's events.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Run {
+    pub busy: bool,
+    pub since_unix_ms: Option<i64>,
+    pub origin: Option<Origin>,
+    pub current_tool: Option<String>,
+    pub tools_done: u32,
+}
+
+/// The user message a run is serving: its inbox row.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Origin {
+    pub channel: String,
+    pub id: i64,
+    pub sender: String,
+}
+
+/// Applies `f` to the snapshot and wakes receivers only if that changed it.
+fn update(tx: &watch::Sender<Snapshot>, f: impl FnOnce(&mut Snapshot)) -> bool {
+    tx.send_if_modified(|cur| {
+        let mut next = cur.clone();
+        f(&mut next);
+        let changed = next != *cur;
+        if changed {
+            *cur = next;
+        }
+        changed
+    })
+}
+
+/// Whitespace folded, at most 60 chars, `…` when cut.
+fn preview(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(60) {
+        Some((i, _)) => format!("{}…", &flat[..i]),
+        None => flat,
+    }
 }
 
 /// How long a reply may be retried: only as long as the platform still dedupes the client id.
@@ -54,6 +141,7 @@ pub async fn run<C: Channel>(
     let jobs = crate::scheduler::Wake::default();
     let shared = Arc::new(cfg.clone());
     let (cfg_tx, cfg_rx) = watch::channel(shared.clone());
+    let (snap, snap_rx) = watch::channel(Snapshot::default());
     let mut router = Router {
         cfg: shared,
         cfg_tx,
@@ -75,11 +163,14 @@ pub async fn run<C: Channel>(
         auth_at: Instant::now(),
         restart: false,
         account: None,
+        snap,
+        names: channels.iter().map(|c| c.name().to_string()).collect(),
+        thinking: None,
     };
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
         r = runs => r.map(|_| Exit::Shutdown),
-        r = crate::attach::serve(cfg, tx, attach_tx) => r.map(|()| Exit::Shutdown),
+        r = crate::attach::serve(cfg, tx, attach_tx, snap_rx) => r.map(|()| Exit::Shutdown),
         r = crate::scheduler::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),
         r = router.main(rx, channels, shutdown) => r,
     }
@@ -131,6 +222,12 @@ struct Router<'a> {
     restart: bool,
     /// The pooled account the child runs on (DESIGN §4.9). `None` without a pool.
     account: Option<Account>,
+    /// What attached clients see; `publish` refreshes it, `tapped` keeps `run` current.
+    snap: watch::Sender<Snapshot>,
+    /// The channel adapters this daemon runs.
+    names: Vec<String>,
+    /// rpi's thinking level, read from `get_state` when the child starts.
+    thinking: Option<String>,
 }
 
 async fn next_event(child: &mut Option<Child>) -> Option<Value> {
@@ -151,6 +248,7 @@ impl<'a> Router<'a> {
         let mut exit = Exit::Shutdown;
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
         let mut tick = tokio::time::interval(Duration::from_secs(5));
+        self.publish();
         loop {
             tokio::select! {
                 _ = &mut shutdown => break,
@@ -177,6 +275,7 @@ impl<'a> Router<'a> {
                 }
             }
             self.flush(channels).await;
+            self.publish();
             if self.reexec && !self.busy && !self.jobs.running.load(Ordering::SeqCst) {
                 eprintln!("zephyr: restarting itself to apply the new settings");
                 exit = Exit::Reexec;
@@ -190,8 +289,101 @@ impl<'a> Router<'a> {
     fn tapped(&self, ev: Option<Value>) -> Option<Value> {
         if let Some(ev) = &ev {
             let _ = self.tap.send(ev.clone()); // no receivers is fine
+            self.track(ev);
         }
         ev
+    }
+
+    /// Keeps `Snapshot.run` in step with the child's run events. Cheap: no store reads
+    /// except one per user message.
+    fn track(&self, ev: &Value) {
+        let m = &ev["message"];
+        match ev["type"].as_str().unwrap_or_default() {
+            "agent_start" => update(&self.snap, |s| {
+                s.run = Run {
+                    busy: true,
+                    since_unix_ms: Some(crate::unix_millis() as i64),
+                    ..Run::default()
+                }
+            }),
+            "message_start" if m["role"] == "user" || m["kind"] == "user" => {
+                let text = message_text(m);
+                let origin = untag(&text).and_then(|(channel, id, _)| {
+                    let sender = self.store.sender(id).ok().flatten()?;
+                    Some(Origin {
+                        channel: channel.into(),
+                        id,
+                        sender,
+                    })
+                });
+                update(&self.snap, |s| s.run.origin = origin)
+            }
+            "tool_execution_start" => update(&self.snap, |s| {
+                s.run.current_tool = ev["toolName"].as_str().map(Into::into)
+            }),
+            "tool_execution_end" => update(&self.snap, |s| {
+                s.run.current_tool = None;
+                s.run.tools_done += 1;
+            }),
+            "agent_settled" => update(&self.snap, |s| s.run = Run::default()),
+            _ => false,
+        };
+    }
+
+    /// Rebuilds the snapshot from the store and config, keeping `run`. Pushed only on change.
+    fn publish(&self) {
+        let built = (|| -> anyhow::Result<Snapshot> {
+            let day = self.store.today()?;
+            let (tokens, cost) = self.store.spend(&day)?;
+            let budget = self.cfg.budget.clone().unwrap_or_default();
+            let mut channels: Vec<_> = self
+                .names
+                .iter()
+                .map(|n| (n.as_str(), "connected"))
+                .collect();
+            for known in ["chat", "discord", "imessage"] {
+                if !self.names.iter().any(|n| n == known) {
+                    channels.push((known, "off"));
+                }
+            }
+            // shortcut: adapters report no connection state, so a running one counts as
+            // connected; add `reconnecting` once they do.
+            Ok(Snapshot {
+                version: env!("CARGO_PKG_VERSION").into(),
+                session: MAIN_SESSION.into(),
+                account: self.account.as_ref().map(|a| a.name.clone()),
+                model: (self.account.as_ref().map(|a| a.model.clone()))
+                    .or_else(|| self.cfg.model.clone()),
+                thinking: self.thinking.clone(),
+                paused: self.store.pause_reason()?,
+                channels: channels
+                    .into_iter()
+                    .map(|(name, state)| ChannelState {
+                        name: name.into(),
+                        state: state.into(),
+                    })
+                    .collect(),
+                spend: Spend {
+                    tokens,
+                    cost,
+                    daily_tokens_limit: budget.daily_tokens,
+                    daily_cost_limit: budget.daily_cost_usd,
+                },
+                queue: (self.store.waiting()?.into_iter())
+                    .map(|(channel, text, since_unix)| Waiting {
+                        channel,
+                        preview: preview(&text),
+                        since_unix,
+                    })
+                    .collect(),
+                failed_replies: self.store.outbox_failed()?,
+                run: self.snap.borrow().run.clone(),
+            })
+        })();
+        match built {
+            Ok(new) => drop(update(&self.snap, |s| *s = new)),
+            Err(e) => eprintln!("zephyr: snapshot failed: {e:#}"),
+        }
     }
 
     /// History and the live stream start at the same point: events the child sends during
@@ -230,6 +422,10 @@ impl<'a> Router<'a> {
                 self.pending_model = None;
                 self.auth_stamp = crate::reload::stamp(&self.auth_file());
                 self.busy = false;
+                let state = self.call(json!({"type": "get_state"})).await;
+                self.thinking = state
+                    .ok()
+                    .and_then(|s| s["thinkingLevel"].as_str().map(Into::into));
                 log(self.reconcile(None, false).await);
             }
             Err(e) => {
@@ -258,6 +454,7 @@ impl<'a> Router<'a> {
         eprintln!("zephyr: rpi child exited; respawning in {:?}", self.backoff);
         self.child = None;
         self.busy = false;
+        update(&self.snap, |s| s.run = Run::default());
         self.schedule_respawn();
     }
 
@@ -738,8 +935,15 @@ impl<'a> Router<'a> {
             Ok(rows) => rows,
             Err(e) => return eprintln!("zephyr: outbox read failed: {e}"),
         };
-        // An attached client saw the reply live; a later attach sees it in the history.
+        // An attached client saw the agent's reply live; a later attach sees it in the history.
+        // Command replies, notices and `[zephyr]` fallbacks are not in the stream, so they go
+        // on the tap (stock clients drop the unknown event type).
         for row in rows.iter().filter(|r| r.channel == crate::attach::CHANNEL) {
+            let command = (row.prompt.as_deref().map(str::trim)).filter(|p| p.starts_with('/'));
+            if command.is_some() || row.prompt.is_none() || row.text.starts_with("[zephyr]") {
+                let reply = json!({"type": "zephyr_reply", "text": row.text, "command": command});
+                let _ = self.tap.send(reply);
+            }
             log(self
                 .store
                 .set_outbox_status(row.id, "sent")
@@ -867,4 +1071,49 @@ fn now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn untag_reverses_tagged() {
+        let row = |text: &str| InboxRow {
+            id: 42,
+            channel: "discord".into(),
+            sender: "s".into(),
+            text: text.into(),
+            tries: 0,
+        };
+        for text in ["hi", "", "[a #1] nested\nlines"] {
+            assert_eq!(
+                untag(&tagged(&row(text))),
+                Some(("discord", 42, text)),
+                "{text:?}"
+            );
+        }
+        assert_eq!(untag("plain text"), None);
+        assert_eq!(untag("[chat #x] not a number"), None);
+    }
+
+    #[test]
+    fn a_snapshot_is_pushed_only_when_it_changes() {
+        let (tx, mut rx) = watch::channel(Snapshot::default());
+        rx.mark_unchanged();
+        assert!(!update(&tx, |s| s.run.tools_done = 0));
+        assert!(!rx.has_changed().unwrap());
+        assert!(update(&tx, |s| s.run.tools_done = 1));
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().run.tools_done, 1);
+        assert!(!update(&tx, |s| s.run.tools_done = 1));
+        assert!(!rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn previews_fold_whitespace_and_cut_at_60_chars() {
+        assert_eq!(preview("a\n\n b"), "a b");
+        assert_eq!(preview(&"é".repeat(61)), format!("{}…", "é".repeat(60)));
+        assert_eq!(preview(&"é".repeat(60)), "é".repeat(60));
+    }
 }
