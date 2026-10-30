@@ -20,12 +20,30 @@ pub struct Outbound {
     pub text: String,
 }
 
+/// What the agent is doing for a recipient, so a channel can show it (typing, a progress note).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Activity {
+    Start,
+    /// `tools` holds tool names in call order; `current` is the one running now, if any.
+    Progress {
+        elapsed: std::time::Duration,
+        tools: Vec<String>,
+        current: Option<String>,
+    },
+    Stop,
+}
+
 /// A chat adapter. `run` pushes inbound messages into `tx` until the adapter stops.
 #[allow(async_fn_in_trait)]
 pub trait Channel: Send + Sync {
     fn name(&self) -> &str;
     async fn run(&self, tx: tokio::sync::mpsc::Sender<Inbound>) -> anyhow::Result<()>;
     async fn send(&self, msg: &Outbound) -> anyhow::Result<()>;
+    /// Shows `a` to `to`, the id `send` uses as `recipient`. Best effort; the default shows nothing.
+    async fn activity(&self, to: &str, a: &Activity) -> anyhow::Result<()> {
+        let _ = (to, a);
+        Ok(())
+    }
 }
 
 /// The adapters `zephyr run` can build. `Channel` is not dyn-compatible, so this enum is the list's element type.
@@ -55,6 +73,47 @@ impl Channel for AnyChannel {
             Self::Chat(c) => c.send(msg).await,
             Self::Discord(c) => c.send(msg).await,
             Self::IMessage(c) => c.send(msg).await,
+        }
+    }
+    async fn activity(&self, to: &str, a: &Activity) -> anyhow::Result<()> {
+        match self {
+            Self::Chat(c) => c.activity(to, a).await,
+            Self::Discord(c) => c.activity(to, a).await,
+            Self::IMessage(c) => c.activity(to, a).await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Plain;
+
+    impl Channel for Plain {
+        fn name(&self) -> &str {
+            "plain"
+        }
+        async fn run(&self, _tx: tokio::sync::mpsc::Sender<Inbound>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send(&self, _msg: &Outbound) -> anyhow::Result<()> {
+            anyhow::bail!("unused")
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_defaults_to_a_no_op() {
+        for a in [
+            Activity::Start,
+            Activity::Progress {
+                elapsed: std::time::Duration::from_secs(3),
+                tools: vec!["bash".into()],
+                current: Some("bash".into()),
+            },
+            Activity::Stop,
+        ] {
+            Plain.activity("anyone", &a).await.unwrap();
         }
     }
 }

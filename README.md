@@ -38,7 +38,7 @@ zephyr login openai-codex --account codex-main
 | `zephyr login <provider> [--account NAME]` | Sign in an account, then make a small test call (`--no-verify` skips it) |
 | `zephyr accounts [list \| order NAME.. \| remove NAME]` | The failover pool |
 | `zephyr model [--account NAME] [PROVIDER/MODEL]` | An account's model (or the default without accounts); with no model, pick from `rpi --list-models` |
-| `zephyr channel add discord\|imessage` | Channel settings; secrets are asked for hidden |
+| `zephyr channel add discord\|imessage` | Channel settings; secrets are asked for hidden. Discord shows typing while the agent works, and a progress note after 20 s (`discord.progress`, `discord.progress_after_secs`) |
 | `zephyr config get\|set KEY [VALUE]` | Edit `zephyr.toml` (comments are kept; invalid keys are refused) |
 | `zephyr chat` / `attach` | Line chat, or the stock rpi TUI attached to the live session |
 | `zephyr pause` / `resume` | Stop and restart dispatch (`/pause` and `/resume` from any channel do the same) |

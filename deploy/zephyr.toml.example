@@ -10,6 +10,8 @@ model = "anthropic/claude-sonnet-5"
 # Optional DM-only Discord adapter. Remove this table to run chat-only.
 # [discord]
 # token_env = "ZEPHYR_DISCORD_TOKEN"   # env var holding the bot token, set in ~/.zephyr/secrets.env (`zephyr channel add discord`)
+# progress = true            # post a "≋ working · 0:24 · bash" note while a run is long; typing shows either way
+# progress_after_secs = 20   # how long a run goes before the note is posted
 
 # Optional iMessage via BlueBubbles on your Mac (DESIGN §4.3). Register the webhook in BlueBubbles as
 # http://<listen>/?secret=<secret>. Messages from the last lookback_hours are re-read at start.

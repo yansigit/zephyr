@@ -88,6 +88,8 @@ Upstream analysis (`research/pi-rust-integration.md` §7) compared three options
   - Unverified: these details come from reading the code, not from a test run. Fallback: a ~150-line `rpi-gateway chat` line client over the same socket.
   - A follow-up upstream PR could add `--connect --session <id>`.
 - **Discord.** serenity, DMs from your user id only, so the privileged message-content intent may be unnecessary. Messages from guilds are ignored in v1.
+  - While a run for you is going, the DM shows typing (serenity's `Typing`, refreshed every 7 s; Discord's typing lasts 10 s). If it is still going after `[discord] progress_after_secs` (default 20), one note is posted, `≋ working · 0:24 · bash, read ×3`, edited at most every 5 s and deleted on `Stop` or before the reply's first chunk. `progress = false` turns the note off; typing stays.
+  - The note is not an outbox row: never retried or deduped. A failed post, edit or delete is logged once per run and ignored. The router drives this through `Channel::activity(to, Activity::{Start, Progress, Stop})`, a no-op for other channels.
 - **iMessage.**
   - Needs an always-on Mac (any Apple Silicon or recent Intel) signed in to your Apple ID, running BlueBubbles Server, joined to the same Tailscale network.
   - Inbound arrives as a BlueBubbles webhook to the gateway's tailnet-only listener, with a shared secret, and is checked against your handle.
