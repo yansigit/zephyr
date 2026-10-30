@@ -196,6 +196,64 @@ token_file = "{}"
 }
 
 #[test]
+fn doctor_warns_when_typing_needs_the_private_api() {
+    // A stand-in BlueBubbles: the ping answers 200, and server info reports the Private API off.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut sock in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            let line = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = if line.starts_with("GET /api/v1/server/info") {
+                r#"{"status":200,"message":"Success","data":{"private_api":false}}"#
+            } else {
+                ""
+            };
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+
+    let (_, cfg) = setup(
+        "doctor-typing",
+        &format!(
+            r#"[imessage]
+listen = "127.0.0.1:0"
+server_url = "http://127.0.0.1:{port}"
+password_env = "ZEPHYR_TEST_BB_PASSWORD"
+secret_env = "ZEPHYR_TEST_BB_SECRET"
+typing = true
+"#
+        ),
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_zephyr"))
+        .arg("doctor")
+        .env("ZEPHYR_CONFIG", &cfg)
+        .env("ZEPHYR_TEST_BB_PASSWORD", "pw-sekret-123")
+        .env("ZEPHYR_TEST_BB_SECRET", "sec-sekret-456")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+
+    assert!(
+        text.contains(
+            "warn iMessage typing needs the BlueBubbles Private API; enable it on the Mac or set [imessage] typing = false"
+        ),
+        "{text}"
+    );
+    assert!(
+        !text.contains("pw-sekret-123") && !text.contains("sec-sekret-456"),
+        "a secret was printed"
+    );
+}
+
+#[test]
 fn doctor_warns_when_agent_dir_has_extensions() {
     let warning = "providers come from the image; packages installed into agent_dir load twice";
     let (_, cfg) = setup("doctor-ext", "");

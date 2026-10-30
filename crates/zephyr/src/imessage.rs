@@ -13,12 +13,16 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 
 /// Chat style 43 is a group chat (BlueBubbles `Chat.isGroup`). v1 ignores them, as Discord guilds are ignored.
 const GROUP_STYLE: i64 = 43;
@@ -28,6 +32,8 @@ const MAX_BODY: usize = 64 * 1024;
 const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// Wait before retrying a failed backfill, e.g. while the Mac is asleep.
 const BACKFILL_RETRY: Duration = Duration::from_secs(30);
+/// How often an active typing indicator is sent again, so it stays up while the reply is worked on.
+const TYPING_REFRESH: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Config {
@@ -48,6 +54,9 @@ pub struct Config {
     /// Most messages re-read at start. BlueBubbles rejects a query limit above 1000.
     #[serde(default = "default_backfill_limit")]
     pub backfill_limit: u32,
+    /// Show a typing indicator while a reply is worked on. Needs the BlueBubbles Private API on the Mac.
+    #[serde(default)]
+    pub typing: bool,
 }
 
 fn default_lookback_hours() -> u64 {
@@ -58,6 +67,7 @@ fn default_backfill_limit() -> u32 {
     200
 }
 
+#[derive(Clone)]
 pub struct IMessage {
     listen: SocketAddr,
     server_url: String,
@@ -66,6 +76,12 @@ pub struct IMessage {
     lookback: Duration,
     backfill_limit: u32,
     http: reqwest::Client,
+    typing: bool,
+    /// The refresh task for each recipient whose indicator is on. Clones share it, so any clone can stop it.
+    typing_tasks: Arc<Mutex<HashMap<String, AbortHandle>>>,
+    /// Set by the first typing error of the run, so later ones are not logged.
+    typing_warned: Arc<AtomicBool>,
+    typing_refresh: Duration,
 }
 
 /// Refuses an unspecified bind address unless the operator said so.
@@ -270,8 +286,100 @@ impl IMessage {
             lookback: Duration::from_secs(cfg.lookback_hours * 3600),
             backfill_limit: cfg.backfill_limit,
             http: reqwest::Client::builder().timeout(SEND_TIMEOUT).build()?,
+            typing: cfg.typing,
+            typing_tasks: Default::default(),
+            typing_warned: Default::default(),
+            typing_refresh: TYPING_REFRESH,
         })
     }
+
+    /// Sets the typing indicator in the one-to-one chat with `to`. A no-op unless `[imessage] typing = true`.
+    /// While on, it is re-sent every `TYPING_REFRESH` until it is set off or a reply goes to `to`.
+    /// Errors are scrubbed. Callers ignore them, so typing never fails a reply.
+    pub async fn set_typing(&self, to: &str, on: bool) -> anyhow::Result<()> {
+        if !self.typing {
+            return Ok(());
+        }
+        if !on {
+            return self.stop_typing(to).await;
+        }
+        // Registered before the first send, so a stop that arrives meanwhile still finds the refresh.
+        self.keep_refreshing(to);
+        self.typing_request(Method::POST, to)
+            .await
+            .map_err(|e| self.typing_error(e))
+    }
+
+    /// Whether the Mac's BlueBubbles Private API is on, which typing needs. Reads `data.private_api`.
+    pub async fn private_api_on(&self) -> anyhow::Result<bool> {
+        let body = self
+            .request(Method::GET, "/api/v1/server/info", None)
+            .await?;
+        let info: serde_json::Value = serde_json::from_slice(&body)?;
+        Ok(info["data"]["private_api"].as_bool() == Some(true))
+    }
+
+    /// Starts the refresh for `to`, unless one is running already.
+    fn keep_refreshing(&self, to: &str) {
+        let mut tasks = self.typing_tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if tasks.contains_key(to) {
+            return;
+        }
+        let (me, chat) = (self.clone(), to.to_string());
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(me.typing_refresh).await;
+                if let Err(e) = me.typing_request(Method::POST, &chat).await {
+                    me.typing_error(e);
+                }
+            }
+        });
+        tasks.insert(to.to_string(), task.abort_handle());
+    }
+
+    /// Ends the refresh for `to` and clears its indicator. Nothing is sent if none was on.
+    async fn stop_typing(&self, to: &str) -> anyhow::Result<()> {
+        let Some(task) = self.take_refresh(to) else {
+            return Ok(());
+        };
+        task.abort();
+        self.typing_request(Method::DELETE, to)
+            .await
+            .map_err(|e| self.typing_error(e))
+    }
+
+    fn take_refresh(&self, to: &str) -> Option<AbortHandle> {
+        self.typing_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(to)
+    }
+
+    async fn typing_request(&self, method: Method, to: &str) -> anyhow::Result<()> {
+        self.request(method, &typing_path(&chat_guid(to)), None)
+            .await
+            .map(drop)
+    }
+
+    /// Logs the run's first typing error, already scrubbed. Later ones are dropped, so a dead Private API cannot flood the log.
+    fn typing_error(&self, e: anyhow::Error) -> anyhow::Error {
+        if !self.typing_warned.swap(true, Ordering::Relaxed) {
+            eprintln!("zephyr: imessage typing failed, later typing errors are not logged: {e:#}");
+        }
+        e
+    }
+}
+
+/// The chat GUID of the one-to-one iMessage chat with `handle`.
+fn chat_guid(handle: &str) -> String {
+    format!("iMessage;-;{handle}")
+}
+
+/// The typing route for a chat. The GUID is one percent-encoded path segment, which the server decodes.
+fn typing_path(chat_guid: &str) -> String {
+    // shortcut: byte_serialize writes a space as '+', which no iMessage handle contains.
+    let guid: String = url::form_urlencoded::byte_serialize(chat_guid.as_bytes()).collect();
+    format!("/api/v1/chat/{guid}/typing")
 }
 
 impl Channel for IMessage {
@@ -305,9 +413,11 @@ impl Channel for IMessage {
     }
 
     async fn send(&self, msg: &Outbound) -> anyhow::Result<()> {
+        // The indicator clears before the reply, so it never outlasts it. A failure here does not block the reply.
+        let _ = self.set_typing(&msg.recipient, false).await;
         let body = serde_json::json!({
             // One-to-one iMessage chat. BlueBubbles maps the `iMessage` prefix to `any` on macOS Tahoe.
-            "chatGuid": format!("iMessage;-;{}", msg.recipient),
+            "chatGuid": chat_guid(&msg.recipient),
             "message": msg.text,
             "method": "apple-script",
             "tempGuid": msg.client_id,
@@ -318,13 +428,26 @@ impl Channel for IMessage {
 
 impl IMessage {
     /// POSTs JSON to `path` with the password as a query param, and returns the response body.
-    /// Every error is scrubbed of the password, which is in the URL.
     async fn post(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
-        let res = self
+        self.request(Method::POST, path, Some(body)).await
+    }
+
+    /// Sends `method` to `path` with the password as a query param, and returns the response body.
+    /// Every error is scrubbed of the password, which is in the URL.
+    async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut req = self
             .http
-            .post(format!("{}{path}", self.server_url))
-            .query(&[("password", &self.password)])
-            .json(body)
+            .request(method, format!("{}{path}", self.server_url))
+            .query(&[("password", &self.password)]);
+        if let Some(body) = body {
+            req = req.json(body);
+        }
+        let res = req
             .send()
             .await
             .map_err(|e| self.scrub("sending to BlueBubbles failed", e))?;
@@ -446,11 +569,11 @@ mod tests {
         );
     }
 
-    /// Captures each request's path and query, and body, then answers with `reply`.
+    /// Captures each request's `METHOD path?query` and body, then answers with `reply`.
     async fn stub(status: u16, reply: &'static str) -> (String, mpsc::Receiver<(String, String)>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (cap_tx, cap_rx) = mpsc::channel(8);
+        let (cap_tx, cap_rx) = mpsc::channel(64);
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -461,7 +584,7 @@ mod tests {
                     let svc = service_fn(move |req: Request<Incoming>| {
                         let cap_tx = cap_tx.clone();
                         async move {
-                            let uri = req.uri().to_string();
+                            let uri = format!("{} {}", req.method(), req.uri());
                             let body = req.into_body().collect().await.unwrap().to_bytes();
                             let _ = cap_tx
                                 .send((uri, String::from_utf8_lossy(&body).into()))
@@ -492,7 +615,19 @@ mod tests {
             lookback: Duration::from_secs(24 * 3600),
             backfill_limit: 200,
             http: reqwest::Client::new(),
+            typing: false,
+            typing_tasks: Default::default(),
+            typing_warned: Default::default(),
+            typing_refresh: TYPING_REFRESH,
         }
+    }
+
+    /// The next request a `stub` saw. Fails the test instead of hanging when none arrives.
+    async fn next(cap: &mut mpsc::Receiver<(String, String)>) -> (String, String) {
+        tokio::time::timeout(Duration::from_secs(5), cap.recv())
+            .await
+            .expect("no request arrived")
+            .expect("stub closed")
     }
 
     fn leak(s: String) -> &'static str {
@@ -543,7 +678,7 @@ mod tests {
         backfill(&adapter(base), &tx).await.unwrap();
 
         let (uri, body) = cap.recv().await.unwrap();
-        assert_eq!(uri, "/api/v1/message/query?password=pw-hunter2");
+        assert_eq!(uri, "POST /api/v1/message/query?password=pw-hunter2");
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["sort"], "DESC");
         assert_eq!(json["limit"], 200);
@@ -592,7 +727,7 @@ mod tests {
         let (base, mut cap) = stub(200, r#"{"status":200,"message":"Message sent!"}"#).await;
         adapter(base).send(&outbound()).await.unwrap();
         let (uri, body) = cap.recv().await.unwrap();
-        assert_eq!(uri, "/api/v1/message/text?password=pw-hunter2");
+        assert_eq!(uri, "POST /api/v1/message/text?password=pw-hunter2");
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["chatGuid"], "iMessage;-;+15551234567");
         assert_eq!(json["message"], "hi there");
@@ -622,5 +757,141 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(!err.contains("pw-hunter2"), "{err}");
+    }
+
+    #[test]
+    fn chat_guid_and_typing_path_address_a_dm_by_handle() {
+        assert_eq!(chat_guid("+15551234567"), "iMessage;-;+15551234567");
+        // One percent-encoded path segment. koa-router decodes it, so the server sees the raw GUID.
+        assert_eq!(
+            typing_path(&chat_guid("+15551234567")),
+            "/api/v1/chat/iMessage%3B-%3B%2B15551234567/typing"
+        );
+    }
+
+    #[test]
+    fn typing_is_off_by_default() {
+        let base = r#"
+            listen = "127.0.0.1:8787"
+            server_url = "http://127.0.0.1:1234"
+            password_env = "P"
+            secret_env = "S"
+        "#;
+        assert!(!toml::from_str::<Config>(base).unwrap().typing);
+        let on: Config = toml::from_str(&format!("{base}\ntyping = true")).unwrap();
+        assert!(on.typing);
+    }
+
+    #[tokio::test]
+    async fn typing_is_a_noop_when_off() {
+        let (base, mut cap) = stub(200, "{}").await;
+        let im = adapter(base);
+        im.set_typing("+15551234567", true).await.unwrap();
+        im.set_typing("+15551234567", false).await.unwrap();
+        assert!(
+            cap.try_recv().is_err(),
+            "typing off must not call BlueBubbles"
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_stops_typing_before_it_is_sent() {
+        let (base, mut cap) = stub(200, r#"{"status":200,"message":"ok"}"#).await;
+        let im = IMessage {
+            typing: true,
+            ..adapter(base)
+        };
+        im.set_typing("+15551234567", true).await.unwrap();
+        im.send(&outbound()).await.unwrap();
+
+        let (start, _) = next(&mut cap).await;
+        let (stop, _) = next(&mut cap).await;
+        let (reply, _) = next(&mut cap).await;
+        assert_eq!(
+            start,
+            "POST /api/v1/chat/iMessage%3B-%3B%2B15551234567/typing?password=pw-hunter2"
+        );
+        assert_eq!(
+            stop,
+            "DELETE /api/v1/chat/iMessage%3B-%3B%2B15551234567/typing?password=pw-hunter2"
+        );
+        assert_eq!(reply, "POST /api/v1/message/text?password=pw-hunter2");
+    }
+
+    #[tokio::test]
+    async fn typing_is_refreshed_until_it_is_stopped() {
+        let (base, mut cap) = stub(200, "{}").await;
+        let im = IMessage {
+            typing: true,
+            typing_refresh: Duration::from_millis(20),
+            ..adapter(base)
+        };
+        im.set_typing("+15551234567", true).await.unwrap();
+        for _ in 0..3 {
+            assert!(next(&mut cap).await.0.starts_with("POST /api/v1/chat/"));
+        }
+        im.set_typing("+15551234567", false).await.unwrap();
+
+        // Whatever was queued before the stop is drained. The DELETE must be the last request.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut after = Vec::new();
+        while let Ok((req, _)) = cap.try_recv() {
+            after.push(req);
+        }
+        assert!(
+            after.last().is_some_and(|r| r.starts_with("DELETE ")),
+            "{after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn typing_errors_never_contain_the_password() {
+        // The server echoes the password back in its error body.
+        let (base, _cap) = stub(500, r#"{"error":"bad pw-hunter2"}"#).await;
+        let im = IMessage {
+            typing: true,
+            ..adapter(base)
+        };
+        let err = im
+            .set_typing("+15551234567", true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("500"), "{err}");
+        assert!(!err.contains("pw-hunter2"), "{err}");
+        let err = im
+            .set_typing("+15551234567", false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("pw-hunter2"), "{err}");
+
+        // A dead port: reqwest's error text includes the URL, which carries the password.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let im = IMessage {
+            typing: true,
+            ..adapter(format!("http://127.0.0.1:{port}"))
+        };
+        let err = im
+            .set_typing("+15551234567", true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("pw-hunter2"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn private_api_is_read_from_server_info() {
+        let on = r#"{"status":200,"message":"Success","data":{"private_api":true}}"#;
+        let (base, mut cap) = stub(200, on).await;
+        assert!(adapter(base).private_api_on().await.unwrap());
+        let (req, _) = next(&mut cap).await;
+        assert_eq!(req, "GET /api/v1/server/info?password=pw-hunter2");
+
+        let off = r#"{"status":200,"message":"Success","data":{"private_api":false}}"#;
+        let (base, _cap) = stub(200, off).await;
+        assert!(!adapter(base).private_api_on().await.unwrap());
     }
 }
