@@ -315,6 +315,9 @@ impl<'a> Router<'a> {
             tries: 0,
         };
         log(self.store.reply(&row, &reply, "done").map_err(Into::into));
+        if row.channel == crate::attach::CHANNEL {
+            self.show(&reply);
+        }
         self.restart_if_idle().await;
         // A run in progress settles first; its settle reconciles and dispatches.
         if resume && !self.busy {
@@ -738,8 +741,16 @@ impl<'a> Router<'a> {
             Ok(rows) => rows,
             Err(e) => return eprintln!("zephyr: outbox read failed: {e}"),
         };
-        // An attached client saw the reply live; a later attach sees it in the history.
+        // An attached client saw the agent's replies live (a later attach sees them in the
+        // history), and command replies when they were made: both are `z…` rows. Notices and
+        // job output go to the clients attached now, or wait for the next one.
         for row in rows.iter().filter(|r| r.channel == crate::attach::CHANNEL) {
+            if !row.client_id.starts_with('z') {
+                if self.tap.receiver_count() == 0 {
+                    continue;
+                }
+                self.show(&row.text);
+            }
             log(self
                 .store
                 .set_outbox_status(row.id, "sent")
@@ -779,6 +790,14 @@ impl<'a> Router<'a> {
                 .store
                 .set_outbox_status(row.id, status)
                 .map_err(Into::into));
+        }
+    }
+
+    /// Shows `text` to attached clients as an assistant message, as `attach` draws history.
+    fn show(&self, text: &str) {
+        let m = json!({"role": "assistant", "content": [{"type": "text", "text": text}]});
+        for kind in ["message_start", "message_end"] {
+            let _ = self.tap.send(json!({"type": kind, "message": m})); // no receivers is fine
         }
     }
 
