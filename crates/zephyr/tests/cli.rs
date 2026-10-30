@@ -353,8 +353,71 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
 }
 
 #[test]
+fn file_reads_and_replaces_only_the_daemons_files() {
+    let (_, cfg) = setup("file", "");
+    let dir = cfg.parent().unwrap();
+    let put = |name: &str, text: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_zephyr"))
+            .args(["__file", "put", name])
+            .env("ZEPHYR_CONFIG", &cfg)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+        child.wait().unwrap()
+    };
+    assert!(put("secrets.env", "A=1\n").success());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("secrets.env")).unwrap(),
+        "A=1\n"
+    );
+    let mode = std::fs::metadata(dir.join("secrets.env")).unwrap().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert_eq!(
+        stdout(&zephyr(&cfg, &["__file", "get", "secrets.env"])),
+        "A=1"
+    );
+    assert_eq!(
+        zephyr(&cfg, &["__file", "get", "host.toml"]).status.code(),
+        Some(3)
+    );
+    // Nothing outside the list, and no paths.
+    assert!(!put("state.db", "x").success());
+    assert!(!zephyr(&cfg, &["__file", "get", "../zephyr.toml"])
+        .status
+        .success());
+}
+
+#[test]
+fn the_agent_sees_no_secret_unless_agent_env_passes_it() {
+    let (home, cfg) = setup("hidden", "[agent]\nenv = [\"ZEPHYR_CLI_PASSED\"]\n");
+    std::fs::write(
+        home.join("secrets.env"),
+        "ZEPHYR_CLI_HIDDEN=one\nZEPHYR_CLI_PASSED=two\n",
+    )
+    .unwrap();
+    let running = daemon(&cfg, &home);
+    wait_for("the child starts", || child_env(&home).contains("PATH="));
+    let env = child_env(&home);
+    assert!(
+        !env.contains("ZEPHYR_CLI_HIDDEN"),
+        "a secret reached the agent"
+    );
+    assert!(env.contains("ZEPHYR_CLI_PASSED=two"));
+    // The daemon holds every secret; the agent's uid cannot read its environment.
+    let err = std::fs::read(format!("/proc/{}/environ", running.0.id())).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+}
+
+#[test]
 fn a_changed_secret_reexecs_the_daemon_in_place() {
-    let (home, cfg) = setup("reexec", "");
+    // `[agent] env` lets this one through, so the child shows which value the daemon read.
+    let (home, cfg) = setup("reexec", "[agent]\nenv = [\"ZEPHYR_CLI_RELOAD\"]\n");
     let uid = std::fs::metadata(&home).unwrap().uid();
     let text = std::fs::read_to_string(&cfg).unwrap();
     std::fs::write(&cfg, format!("{text}[owners]\nchat = [\"{uid}\"]\n")).unwrap();
@@ -365,10 +428,9 @@ fn a_changed_secret_reexecs_the_daemon_in_place() {
     });
 
     std::fs::write(home.join("secrets.env"), "ZEPHYR_CLI_RELOAD=two\n").unwrap();
-    assert_eq!(
-        stdout(&zephyr(&cfg, &["reload"])),
-        "[zephyr] restarting zephyr's channels now"
-    );
+    // The daemon's 5 s tick may see the edit first, so only the outcome is checked here;
+    // tests/router.rs checks the reply text.
+    zephyr(&cfg, &["reload"]);
     // The same process, exec'd anew, reads the new value and starts a new child with it.
     wait_for("no re-exec", || {
         child_env(&home).contains("ZEPHYR_CLI_RELOAD=two")

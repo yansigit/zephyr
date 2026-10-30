@@ -9,8 +9,12 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     /// The pinned `rpi` binary.
     pub rpi: PathBuf,
-    /// State dir: `state.db`, `sessions/`, `zephyr.sock`. Also the child's cwd.
+    /// The agent's home and the child's cwd: `sessions/`, `memory/`, `accounts/`, `AGENTS.md`.
     pub home: PathBuf,
+    /// The daemon's own files: `state.db`, `secrets.env`, `zephyr.sock`, `zephyr.lock`.
+    /// Default: `home`. In the container `/var/lib/zephyr`, which the agent cannot enter
+    /// (DESIGN §4.4).
+    pub state: Option<PathBuf>,
     /// rpi agent dir (`RPI_CODING_AGENT_DIR`): its models, credentials and settings.
     pub agent_dir: Option<PathBuf>,
     /// `--model` for the child, e.g. `anthropic/claude-sonnet-5`. Unused when `[[account]]` is set.
@@ -42,6 +46,9 @@ pub struct Config {
     /// Wall clock cap for one job run. Not configurable; tests shorten it.
     #[serde(skip, default = "job_timeout")]
     pub job_timeout: std::time::Duration,
+    /// `[agent]`: what the agent's processes get (DESIGN §4.4).
+    #[serde(default)]
+    pub agent: Agent,
     /// OAuth refresh (DESIGN §4.7). Defaults apply when the table is absent.
     #[serde(default)]
     pub auth: crate::auth_keeper::AuthConfig,
@@ -71,6 +78,16 @@ impl Budget {
         self.daily_tokens.is_some_and(|t| tokens >= t)
             || self.daily_cost_usd.is_some_and(|c| cost >= c)
     }
+}
+
+/// `[agent]`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Agent {
+    /// secrets.env variables the agent's processes may see, e.g. an API key a provider reads
+    /// from the environment. Every other secrets.env variable is removed from them.
+    #[serde(default)]
+    pub env: Vec<String>,
 }
 
 /// One `[[account]]`. Its credentials live in `<home>/accounts/<name>/`.
@@ -128,6 +145,11 @@ impl Config {
                 anyhow::bail!("account {:?}: model must be <provider>/<model>", a.name);
             }
         }
+        for name in &self.agent.env {
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                anyhow::bail!("agent.env {name:?}: use a variable name (letters, digits, '_')");
+            }
+        }
         crate::scheduler::zone(self)?;
         Ok(())
     }
@@ -156,8 +178,16 @@ impl Config {
                 .is_some_and(|list| list.iter().any(|o| o == sender))
     }
 
+    pub fn state_dir(&self) -> &Path {
+        self.state.as_deref().unwrap_or(&self.home)
+    }
+
     pub fn db_path(&self) -> PathBuf {
-        self.home.join("state.db")
+        self.state_dir().join("state.db")
+    }
+
+    pub fn secrets_path(&self) -> PathBuf {
+        self.state_dir().join("secrets.env")
     }
 
     pub fn session_dir(&self) -> PathBuf {
@@ -165,7 +195,7 @@ impl Config {
     }
 
     pub fn socket_path(&self) -> PathBuf {
-        self.home.join("zephyr.sock")
+        self.state_dir().join("zephyr.sock")
     }
 }
 
@@ -259,6 +289,11 @@ mod tests {
         }
         let mut cfg = pool(&["a"]);
         cfg.accounts[0].model = "no-provider".into();
+        assert!(cfg.validate().is_err());
+        let mut cfg = pool(&["a"]);
+        cfg.agent.env = vec!["OK_1".into()];
+        cfg.validate().unwrap();
+        cfg.agent.env = vec!["NOT-A-NAME".into()];
         assert!(cfg.validate().is_err());
         assert!(toml::from_str::<Config>(&format!(
             "{base}[[account]]\nname = 'a'\nmodel = 'p/m'\ntypo = 1\n"

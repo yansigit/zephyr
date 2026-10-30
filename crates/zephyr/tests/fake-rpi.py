@@ -4,8 +4,9 @@
 State lives next to --session-dir (the zephyr home): log.jsonl records every command,
 pid holds the current pid, and a `hang` file makes the next prompt commit its user
 message, mark the run resumable, and stop answering (the test then kills -9 it); a
-`slow` file holds the seconds each prompt takes. `stats.json` (if present) is what `get_stats`
-reports: {"totalTokens": n, "costTotal": x}, cumulative like rpi's.
+`slow` file holds the seconds each prompt takes. `usage.json` (if present) is the usage each
+reply carries: {"totalTokens": n, "costTotal": x}, sent as message.usage.{totalTokens,cost.total}.
+`get_stats` always reports 0, as rpi 0.12.0 does for replies.
 Auth: the OAuth store is $RPI_CODING_AGENT_DIR/auth.json. `get_auth_status` lists its oauth
 entries. `auth refresh --provider P` (the CLI, not the RPC) gives P a fresh expiry, and records
 an "auth-refresh" line in ./log.jsonl (an `oauth_fail` file in the home makes it fail).
@@ -14,6 +15,7 @@ Accounts: each start logs {"type": "start", "agentDir", "model"} to ./log.jsonl.
 that error (stopReason "error", settle outcome "failed"), as a rate-limited provider does.
 A prompt containing WRITE_MEMORY first writes memory/MEMORY.md under the home.
 argv.json holds the argv of the latest start.
+A prompt containing `bash: CMD` first reports a bash tool call running CMD (tool_execution_start).
 A prompt containing `[hang]` never settles until `abort`; one that starts with `say: `
 replies with the rest; `model?` replies with the current model.
 Models: `--list-models` prints fake/m1, fake/m2 and other/m3, the catalogue `set_model` accepts
@@ -80,7 +82,12 @@ def respond(cmd, data=None, error=None):
 
 def user(text): return {"kind": "user", "role": "user", "content": text, "timestamp": 0}
 def assistant(text):
-    return {"kind": "assistant", "role": "assistant", "content": [{"type": "text", "text": text}], "stopReason": "stop", "timestamp": 0}
+    msg = {"kind": "assistant", "role": "assistant", "content": [{"type": "text", "text": text}], "stopReason": "stop", "timestamp": 0}
+    p = os.path.join(home, "usage.json")
+    if os.path.exists(p):
+        u = json.load(open(p))
+        msg["usage"] = {"totalTokens": u.get("totalTokens", 0), "cost": {"total": u.get("costTotal", 0.0)}}
+    return msg
 
 def auth_store():
     d = os.environ.get("RPI_CODING_AGENT_DIR")
@@ -150,6 +157,10 @@ for line in sys.stdin:
             fail(s, rate_limit()); continue
         if "[hang]" in cmd["message"]:
             hanging = True; continue
+        if "bash: " in cmd["message"]:
+            out({"type": "tool_execution_start", "toolCallId": "t1", "toolName": "bash",
+                 "args": {"command": cmd["message"].split("bash: ", 1)[1]}})
+            finish(s, "ran"); continue
         if cmd["message"].endswith("model?"):
             finish(s, "model: %s" % model); continue
         if cmd["message"].startswith("say: "):
@@ -180,10 +191,7 @@ for line in sys.stdin:
         if hanging:
             hanging = False; finish(s, "", "aborted")
     elif kind == "get_stats":
-        stats = {"totalTokens": 0, "costTotal": 0.0}
-        if os.path.exists(os.path.join(home, "stats.json")):
-            stats.update(json.load(open(os.path.join(home, "stats.json"))))
-        respond(cmd, stats)
+        respond(cmd, {"totalTokens": 0, "costTotal": 0.0})
     elif kind == "set_model":
         want = "%s/%s" % (cmd.get("provider"), cmd.get("modelId"))
         if want in catalog:

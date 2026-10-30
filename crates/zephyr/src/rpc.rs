@@ -11,7 +11,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
 
-/// The session every channel shares (DESIGN §4.1).
+/// The session every channel shares (DESIGN §4.1), until `/new` starts `main-<unix secs>`
+/// (`Store::main_session`). Attach always shows this name.
 pub const MAIN_SESSION: &str = "main";
 
 /// The slash command the policy plugin registers as proof that it loaded.
@@ -26,7 +27,6 @@ pub const USED_COMMANDS: &[&str] = &[
     "abort",
     "get_state",
     "get_messages",
-    "get_stats",
     "resume_pending",
     "get_auth_status",
     "set_model",
@@ -57,14 +57,21 @@ impl Child {
         session_id: &str,
         account: Option<&Account>,
     ) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(cfg.session_dir())?;
+        {
+            let _fs = crate::agent::fs();
+            std::fs::create_dir_all(cfg.session_dir())?;
+        }
         let (model, agent_dir) = match account {
             Some(a) => (Some(&a.model), Some(crate::pool::prepare(cfg, a)?)),
             None => (cfg.model.as_ref(), cfg.agent_dir.clone()),
         };
         // rpi reads the context files (AGENTS.md) once, at start, so regenerate them first.
-        crate::memory::prepare(&cfg.home)?;
+        let context_dir = agent_dir
+            .clone()
+            .unwrap_or_else(|| crate::auth_keeper::agent_dir(cfg));
+        crate::memory::prepare(&cfg.home, cfg.state_dir(), &context_dir)?;
         let mut cmd = Command::new(&cfg.rpi);
+        crate::agent::cmd(cmd.as_std_mut());
         cmd.args(["--mode", "rpc", "--session-id", session_id, "--session-dir"])
             .arg(cfg.session_dir())
             // rpi files sessions under a per-cwd folder, so the cwd must never change.
@@ -189,6 +196,50 @@ impl Child {
 }
 
 /// The text of a wire message: a plain string, or the `text` blocks of a content list.
+/// What one run did that zephyr answers for, read from its events.
+#[derive(Debug, Default)]
+pub struct Tally {
+    /// Tokens and cost of the replies. rpi's `get_stats` sums only usage that extensions
+    /// record, never the replies' own, so spend is summed from each assistant `message_end`.
+    pub used: (i64, f64),
+    /// Bash commands that sent data off the machine (`zephyr_policy::policy::outbound`).
+    pub outbound: Vec<String>,
+}
+
+impl Tally {
+    pub fn add(&mut self, ev: &Value) {
+        let m = &ev["message"];
+        if ev["type"] == "message_end" && m["role"] == "assistant" {
+            self.used.0 += m["usage"]["totalTokens"].as_i64().unwrap_or(0);
+            self.used.1 += m["usage"]["cost"]["total"].as_f64().unwrap_or(0.0);
+        }
+        // From rpi, not from anything the agent writes, so the agent cannot hide a send.
+        if ev["type"] == "tool_execution_start" && ev["toolName"] == "bash" {
+            if let Some(command) = ev["args"]["command"].as_str() {
+                self.outbound
+                    .extend(zephyr_policy::policy::outbound(command));
+            }
+        }
+    }
+
+    /// The owner's notice of what the run sent out, if it sent anything.
+    pub fn alert(&self) -> Option<String> {
+        const SHOWN: usize = 10;
+        if self.outbound.is_empty() {
+            return None;
+        }
+        let mut text = String::from("[zephyr] outbound this turn:");
+        for line in self.outbound.iter().take(SHOWN) {
+            text.push_str("\n- ");
+            text.push_str(line);
+        }
+        if self.outbound.len() > SHOWN {
+            text.push_str(&format!("\n(+{} more)", self.outbound.len() - SHOWN));
+        }
+        Some(text)
+    }
+}
+
 pub fn message_text(msg: &Value) -> String {
     match &msg["content"] {
         Value::String(s) => s.clone(),

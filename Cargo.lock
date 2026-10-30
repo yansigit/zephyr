@@ -2234,6 +2234,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "url",
+ "zephyr-policy",
 ]
 
 [[package]]

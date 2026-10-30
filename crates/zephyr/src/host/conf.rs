@@ -1,5 +1,6 @@
-//! The files under `~/.zephyr`: `zephyr.toml` edited with toml_edit (comments survive),
-//! `secrets.env` and `tui.token` (mode 0600), and `host.toml` (host-only settings).
+//! The files under `~/.zephyr` (the agent's home) and `~/.zephyr-daemon` (the daemon's own):
+//! `zephyr.toml` edited with toml_edit (comments survive), `secrets.env` and `tui.token`, and
+//! `host.toml` (host-only settings), all mode 0600.
 
 use anyhow::{bail, Context};
 use std::io::Write;
@@ -14,28 +15,105 @@ pub const EXTENSIONS: [&str; 3] = [
     "/opt/zephyr/ext/rpi-claude-agent/librpi_claude_agent.so",
 ];
 
+/// The daemon's files, which `__file` may read and write. In the container they live in
+/// `/var/lib/zephyr` (on the host `~/.zephyr-daemon`), which only root can enter.
+pub const DAEMON_FILES: [&str; 4] = ["zephyr.toml", "secrets.env", "tui.token", "host.toml"];
+
+/// Replaces `path` whole with `text`, mode 0600: written beside it, then renamed over it, so a
+/// reader (the daemon's 5 s reload check) never sees half a file.
+pub fn replace_private(path: &Path, text: &str) -> anyhow::Result<()> {
+    let name = path.file_name().context("no file name")?.to_string_lossy();
+    let tmp = path.with_file_name(format!(".{name}.tmp"));
+    write_private(&tmp, text)
+        .and_then(|()| Ok(std::fs::rename(&tmp, path)?))
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// Where `~/.zephyr-daemon` is mounted in the container.
+pub const DAEMON_MOUNT: &str = "/var/lib/zephyr";
+
 pub struct Data {
+    /// `~/.zephyr`: the agent's home, `/zephyr` in the container (sessions, memory, accounts).
     pub dir: PathBuf,
+    /// `~/.zephyr-daemon`: the daemon's files (`DAEMON_FILES`, `state.db`), `DAEMON_MOUNT` in the
+    /// container. Root's once `zephyr up` has run, so this user then reaches them through
+    /// `zephyr __file` in the container (DESIGN §4.4).
+    pub daemon: PathBuf,
+    pub container: String,
+    pub image: String,
 }
 
 impl Data {
-    pub fn config(&self) -> PathBuf {
-        self.dir.join("zephyr.toml")
-    }
-    pub fn secrets(&self) -> PathBuf {
-        self.dir.join("secrets.env")
-    }
-    pub fn token(&self) -> PathBuf {
-        self.dir.join("tui.token")
-    }
-    pub fn host(&self) -> PathBuf {
-        self.dir.join("host.toml")
-    }
     pub fn account(&self, name: &str) -> PathBuf {
         self.dir.join("accounts").join(name)
     }
 
-    /// Creates what is missing: the dir (0700), `zephyr.toml`, `tui.token`, `secrets.env`, the agent dir.
+    /// Whether this user can reach the daemon's files itself: before the first `zephyr up`.
+    pub fn direct(&self) -> bool {
+        !matches!(std::fs::read_dir(&self.daemon), Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
+    }
+
+    /// A daemon file's text. `NotFound` when there is none.
+    pub fn read(&self, name: &str) -> std::io::Result<String> {
+        if self.direct() {
+            return std::fs::read_to_string(self.daemon.join(name));
+        }
+        let out = self
+            .via("get", name)
+            .stdin(std::process::Stdio::null())
+            .output()?;
+        match out.status.code() {
+            Some(0) => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+            Some(3) => Err(std::io::ErrorKind::NotFound.into()),
+            _ => Err(std::io::Error::other(format!(
+                "reading {name} in the container: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))),
+        }
+    }
+
+    /// Replaces a daemon file whole, mode 0600.
+    pub fn write(&self, name: &str, text: &str) -> anyhow::Result<()> {
+        if self.direct() {
+            std::fs::create_dir_all(&self.daemon)?;
+            std::fs::set_permissions(&self.daemon, std::fs::Permissions::from_mode(0o700))?;
+            return replace_private(&self.daemon.join(name), text);
+        }
+        let mut child = self
+            .via("put", name)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .context("running docker")?;
+        child
+            .stdin
+            .take()
+            .context("stdin")?
+            .write_all(text.as_bytes())?;
+        if !child.wait()?.success() {
+            bail!("writing {name} in the container failed");
+        }
+        Ok(())
+    }
+
+    /// `zephyr __file OP NAME` as root in the container, or in a throwaway one when it is not
+    /// running: root without capabilities, which reaches only root's own files.
+    fn via(&self, op: &str, name: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new("docker");
+        if super::state(&self.container).as_deref() == Some("running") {
+            cmd.args(["exec", "-i", "-u", "0", &self.container]);
+        } else {
+            let mount = format!("type=bind,src={},dst={DAEMON_MOUNT}", self.daemon.display());
+            let config = format!("ZEPHYR_CONFIG={DAEMON_MOUNT}/zephyr.toml");
+            cmd.args(["run", "--rm", "-i", "-u", "0", "--cap-drop", "ALL"])
+                .args(["--security-opt", "no-new-privileges", "--network", "none"])
+                .args(["--mount", &mount, "-e", &config, &self.image]);
+        }
+        cmd.args(["zephyr", "__file", op, name]);
+        cmd
+    }
+
+    /// Creates what is missing: the agent's dirs (0700), and the daemon's `zephyr.toml`,
+    /// `tui.token` and `secrets.env`.
     pub fn ensure_layout(&self) -> anyhow::Result<()> {
         for dir in [
             &self.dir,
@@ -45,15 +123,17 @@ impl Data {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
-        if !self.config().exists() {
-            std::fs::write(self.config(), default_config(unsafe { libc::getuid() }))?;
+        let missing =
+            |name| matches!(self.read(name), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        if missing("zephyr.toml") {
+            self.write("zephyr.toml", &default_config())?;
         }
-        if !self.token().exists() {
-            write_private(&self.token(), &random_hex(24)?)?;
+        if missing("tui.token") {
+            self.write("tui.token", &random_hex(24)?)?;
         }
-        if !self.secrets().exists() {
-            write_private(
-                &self.secrets(),
+        if missing("secrets.env") {
+            self.write(
+                "secrets.env",
                 "# KEY=value lines; zephyr picks up a change by itself\n",
             )?;
         }
@@ -61,38 +141,57 @@ impl Data {
     }
 
     pub fn load(&self) -> anyhow::Result<DocumentMut> {
-        load(&self.config())
+        let text = self
+            .read("zephyr.toml")
+            .context("reading zephyr.toml (run `zephyr init` first)")?;
+        text.parse().context("parsing zephyr.toml")
     }
 
     pub fn save(&self, doc: &DocumentMut) -> anyhow::Result<()> {
-        save(&self.config(), doc)
+        self.write("zephyr.toml", &doc.to_string())
+    }
+
+    /// The `zephyr attach` token.
+    pub fn token(&self) -> anyhow::Result<String> {
+        Ok(self.read("tui.token")?.trim().to_string())
+    }
+
+    /// Sets `key` in `secrets.env`, replacing its line or appending one.
+    pub fn set_secret(&self, key: &str, secret: &str) -> anyhow::Result<()> {
+        let text = match self.read("secrets.env") {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            r => r?,
+        };
+        self.write("secrets.env", &with_secret(&text, key, secret)?)
     }
 
     /// `projects` from `host.toml`.
     pub fn projects(&self) -> anyhow::Result<Option<PathBuf>> {
-        if !self.host().exists() {
-            return Ok(None);
-        }
-        Ok(get(&load(&self.host())?, "projects").map(PathBuf::from))
+        Ok(self.host_get("projects")?.map(PathBuf::from))
+    }
+
+    /// A key of `host.toml`, e.g. `memory` (the container's `--memory` limit).
+    pub fn host_get(&self, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.host_doc()?.and_then(|doc| get(&doc, key)))
     }
 
     pub fn set_projects(&self, path: &Path) -> anyhow::Result<()> {
-        let mut doc = if self.host().exists() {
-            load(&self.host())?
-        } else {
-            DocumentMut::new()
-        };
+        let mut doc = self.host_doc()?.unwrap_or_default();
         doc["projects"] = value(path.display().to_string());
-        Ok(std::fs::write(self.host(), doc.to_string())?)
+        self.write("host.toml", &doc.to_string())
+    }
+
+    fn host_doc(&self) -> anyhow::Result<Option<DocumentMut>> {
+        match self.read("host.toml") {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            r => Ok(Some(r?.parse().context("parsing host.toml")?)),
+        }
     }
 }
 
 /// Whole or not at all: the running daemon reloads the file when its mtime changes.
 pub fn save(path: &Path, doc: &DocumentMut) -> anyhow::Result<()> {
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, doc.to_string())
-        .and_then(|()| std::fs::rename(&tmp, path))
-        .with_context(|| format!("writing {}", path.display()))
+    replace_private(path, &doc.to_string())
 }
 
 pub fn load(path: &Path) -> anyhow::Result<DocumentMut> {
@@ -102,23 +201,26 @@ pub fn load(path: &Path) -> anyhow::Result<DocumentMut> {
         .with_context(|| format!("parsing {}", path.display()))
 }
 
-fn default_config(uid: u32) -> String {
+/// `owners.chat` is root: the host's `zephyr chat` runs as root in the container, and the agent's
+/// uid cannot reach the socket at all.
+fn default_config() -> String {
     let ext = EXTENSIONS.map(|e| format!("\"{e}\"")).join(", ");
     format!(
-        r#"# Zephyr's config, seen as /zephyr/zephyr.toml in the container. Edit with `zephyr config set`.
+        r#"# Zephyr's config, seen as {DAEMON_MOUNT}/zephyr.toml in the container. Edit with `zephyr config set`.
 rpi = "/usr/local/bin/rpi"
 home = "/zephyr"
+state = "{DAEMON_MOUNT}"
 agent_dir = "/zephyr/.rpi/agent"
 policy_plugin = "/usr/local/lib/libzephyr_policy.so"
 extensions = [{ext}]
 # model = "provider/model-id"   # `zephyr model` picks one
 
 [owners]
-chat = ["{uid}"]
+chat = ["0"]
 
 [attach]
 port = 7790
-token_file = "/zephyr/tui.token"
+token_file = "{DAEMON_MOUNT}/tui.token"
 "#
     )
 }
@@ -142,12 +244,11 @@ pub fn random_hex(bytes: usize) -> anyhow::Result<String> {
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Sets `key` in a dotenv file, replacing its line or appending one. The file stays 0600.
-pub fn set_secret(path: &Path, key: &str, secret: &str) -> anyhow::Result<()> {
+/// `text` (a dotenv file) with `key` set, its line replaced or one appended.
+pub fn with_secret(text: &str, key: &str, secret: &str) -> anyhow::Result<String> {
     if secret.contains(['\n', '\r']) {
         bail!("{key}: the value must be one line");
     }
-    let text = std::fs::read_to_string(path).unwrap_or_default();
     let line = format!("{key}={secret}");
     let mut lines: Vec<&str> = text.lines().collect();
     match lines
@@ -157,7 +258,7 @@ pub fn set_secret(path: &Path, key: &str, secret: &str) -> anyhow::Result<()> {
         Some(i) => lines[i] = &line,
         None => lines.push(&line),
     }
-    write_private(path, &(lines.join("\n") + "\n"))
+    Ok(lines.join("\n") + "\n")
 }
 
 /// A dotted key, e.g. `attach.port`, as a display string (strings without quotes, string lists comma separated).
@@ -384,10 +485,11 @@ model = "p/m"
 
     #[test]
     fn default_config_parses_as_zephyr_config() {
-        let cfg: crate::config::Config = toml::from_str(&default_config(1000)).unwrap();
+        let cfg: crate::config::Config = toml::from_str(&default_config()).unwrap();
         assert_eq!(cfg.extensions.len(), EXTENSIONS.len());
-        assert!(cfg.is_owner("chat", "1000"));
-        let doc: DocumentMut = default_config(1000).parse().unwrap();
+        assert!(cfg.is_owner("chat", "0"));
+        assert_eq!(cfg.state_dir(), Path::new(DAEMON_MOUNT));
+        let doc: DocumentMut = default_config().parse().unwrap();
         assert_eq!(extension_args(&doc).len(), 2 * EXTENSIONS.len());
     }
 
@@ -405,19 +507,23 @@ model = "p/m"
     }
 
     #[test]
-    fn secrets_file_is_private_and_lines_are_replaced() {
-        let dir = crate::test_dir("secrets");
+    fn secret_lines_are_replaced_or_appended() {
+        let text = with_secret("# keep\nA=1\n", "B", "two").unwrap();
+        let text = with_secret(&text, "A", "3").unwrap();
+        assert_eq!(text, "# keep\nA=3\nB=two\n");
+        assert!(with_secret(&text, "C", "a\nD=b").is_err());
+    }
+
+    #[test]
+    fn daemon_files_are_replaced_whole_and_private() {
+        let dir = crate::test_dir("replace");
         let path = dir.join("secrets.env");
-        std::fs::write(&path, "# keep\nA=1\n").unwrap();
+        std::fs::write(&path, "old").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        set_secret(&path, "B", "two").unwrap();
-        set_secret(&path, "A", "3").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "# keep\nA=3\nB=two\n"
-        );
+        replace_private(&path, "new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-        assert!(set_secret(&path, "C", "a\nD=b").is_err());
+        assert!(!dir.join(".secrets.env.tmp").exists());
     }
 }

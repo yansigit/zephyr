@@ -81,6 +81,7 @@ pub fn pick<'a>(
 /// `models.json` and `settings.json`, and returns it as an absolute path, as rpi requires.
 pub fn prepare(cfg: &Config, account: &Account) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
+    let _fs = crate::agent::fs();
     let shared = crate::auth_keeper::agent_dir(cfg);
     let dir = std::path::absolute(cfg.account_dir(account))?;
     std::fs::DirBuilder::new()
@@ -131,6 +132,7 @@ fn limit_retries(path: &Path) -> anyhow::Result<()> {
 
 /// Whether the account's `auth.json` has an entry for its provider. Only keys are read.
 fn logged_in(dir: &Path, provider: &str) -> bool {
+    let _fs = crate::agent::fs();
     std::fs::read_to_string(dir.join("auth.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<HashMap<String, serde::de::IgnoredAny>>(&t).ok())

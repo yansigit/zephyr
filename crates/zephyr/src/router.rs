@@ -7,7 +7,6 @@ use crate::store::{InboxRow, Store};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -48,7 +47,7 @@ pub async fn run<C: Channel>(
     channels: &[C],
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<Exit> {
-    std::fs::create_dir_all(&cfg.home)?;
+    std::fs::create_dir_all(cfg.state_dir())?;
     let (tx, rx) = mpsc::channel(64);
     let (attach_tx, attaches) = mpsc::channel(4);
     let jobs = crate::scheduler::Wake::default();
@@ -58,7 +57,7 @@ pub async fn run<C: Channel>(
         cfg: shared,
         cfg_tx,
         edits: edits(cfg),
-        secrets: crate::dotenv::read(&secrets_path(cfg)).unwrap_or_default(),
+        secrets: crate::dotenv::read(&cfg.secrets_path()).unwrap_or_default(),
         pending_model: None,
         reexec: false,
         auth_stamp: None,
@@ -75,6 +74,7 @@ pub async fn run<C: Channel>(
         auth_at: Instant::now(),
         restart: false,
         account: None,
+        tally: Default::default(),
     };
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
@@ -85,16 +85,12 @@ pub async fn run<C: Channel>(
     }
 }
 
-fn secrets_path(cfg: &Config) -> PathBuf {
-    cfg.home.join("secrets.env")
-}
-
 /// The mtimes a hand edit changes: `zephyr.toml` and `secrets.env`.
 type Edits = (Option<SystemTime>, Option<SystemTime>);
 
 fn edits(cfg: &Config) -> Edits {
     let config = cfg.path.as_deref().and_then(crate::reload::stamp);
-    (config, crate::reload::stamp(&secrets_path(cfg)))
+    (config, crate::reload::stamp(&cfg.secrets_path()))
 }
 
 struct Router<'a> {
@@ -129,6 +125,8 @@ struct Router<'a> {
     auth_at: Instant,
     /// A refresh or a failover needs the child restarted; done once it is idle.
     restart: bool,
+    /// Usage and outbound commands since the last settle.
+    tally: crate::rpc::Tally,
     /// The pooled account the child runs on (DESIGN §4.9). `None` without a pool.
     account: Option<Account>,
 }
@@ -187,9 +185,10 @@ impl<'a> Router<'a> {
         Ok(exit)
     }
 
-    fn tapped(&self, ev: Option<Value>) -> Option<Value> {
+    fn tapped(&mut self, ev: Option<Value>) -> Option<Value> {
         if let Some(ev) = &ev {
             let _ = self.tap.send(ev.clone()); // no receivers is fine
+            self.tally.add(ev);
         }
         ev
     }
@@ -219,7 +218,11 @@ impl<'a> Router<'a> {
                 return;
             }
         };
-        match Child::spawn_as(&self.cfg, MAIN_SESSION, account.as_ref()).await {
+        let session = self.store.main_session().unwrap_or_else(|e| {
+            eprintln!("zephyr: reading the main session id failed: {e}");
+            MAIN_SESSION.into()
+        });
+        match Child::spawn_as(&self.cfg, &session, account.as_ref()).await {
             Ok(child) => {
                 eprintln!("zephyr: rpi child {:?} ready", child.pid());
                 if let Some(a) = &account {
@@ -228,7 +231,7 @@ impl<'a> Router<'a> {
                 self.child = Some(child);
                 self.account = account;
                 self.pending_model = None;
-                self.auth_stamp = crate::reload::stamp(&self.auth_file());
+                self.auth_stamp = self.auth_mtime();
                 self.busy = false;
                 log(self.reconcile(None, false).await);
             }
@@ -246,12 +249,15 @@ impl<'a> Router<'a> {
     }
 
     /// `auth.json` of the child's account, or of the agent dir without a pool.
-    fn auth_file(&self) -> PathBuf {
-        match &self.account {
+    /// When the child's `auth.json` last changed; a newer one is a re-login.
+    fn auth_mtime(&self) -> Option<SystemTime> {
+        let file = match &self.account {
             Some(a) => self.cfg.account_dir(a),
             None => crate::auth_keeper::agent_dir(&self.cfg),
         }
-        .join("auth.json")
+        .join("auth.json");
+        let _fs = crate::agent::fs();
+        crate::reload::stamp(&file)
     }
 
     async fn child_exited(&mut self) {
@@ -283,7 +289,8 @@ impl<'a> Router<'a> {
             log(self.store.set_status(id, "dropped").map_err(Into::into));
             return;
         }
-        if let Some(reply) = crate::memory::command(&self.cfg.home, m.text.trim()) {
+        let memory = crate::memory::command(&self.cfg.home, self.cfg.state_dir(), m.text.trim());
+        if let Some((reply, rules_changed)) = memory {
             let row = InboxRow {
                 id,
                 channel: m.channel,
@@ -292,6 +299,11 @@ impl<'a> Router<'a> {
                 tries: 0,
             };
             log(self.store.reply(&row, &reply, "done").map_err(Into::into));
+            // rpi reads AGENTS.md once, at start: a fresh child on the same session loads the rules.
+            if rules_changed {
+                self.restart = true;
+                self.restart_if_idle().await;
+            }
             return;
         }
         if let Some(reply) = crate::scheduler::command(&mut self.store, &self.cfg, &m) {
@@ -358,26 +370,13 @@ impl<'a> Router<'a> {
         }
     }
 
-    /// Adds what rpi used since the last settle to today's spend. Returns true when this
-    /// settle crossed a budget limit, and pauses the gateway for the rest of the UTC day.
-    async fn record_spend(&mut self) -> anyhow::Result<bool> {
-        let stats = self.call(json!({"type": "get_stats"})).await?;
-        let total = (
-            stats["totalTokens"].as_i64().unwrap_or(0),
-            stats["costTotal"].as_f64().unwrap_or(0.0),
-        );
-        let last = self.store.last_stats()?;
-        // rpi's totals are per session: a drop means a fresh session, so the whole total is new.
-        let delta = if total.0 >= last.0 {
-            (total.0 - last.0, total.1 - last.1)
-        } else {
-            total
-        };
-        self.store.set_last_stats(total)?;
+    /// Adds what the replies used since the last settle to today's spend. Returns true when
+    /// this settle crossed a budget limit, and pauses the gateway for the rest of the UTC day.
+    fn record_spend(&mut self, used: (i64, f64)) -> anyhow::Result<bool> {
         if let Some(a) = &self.account {
-            self.store.add_account_spend(&a.name, delta)?;
+            self.store.add_account_spend(&a.name, used)?;
         }
-        Ok(self.store.charge(self.cfg.budget.as_ref(), delta)?)
+        Ok(self.store.charge(self.cfg.budget.as_ref(), used)?)
     }
 
     /// Sends every `new` row: `prompt` when idle, rpi's own `queue_message` when busy.
@@ -407,8 +406,13 @@ impl<'a> Router<'a> {
         // Before reconcile dispatches the next row, so that row runs on the new model.
         self.apply_model().await;
         self.backoff = FIRST_BACKOFF;
-        log(crate::memory::commit_if_changed(&self.cfg.home).map(drop));
-        let crossed = self.record_spend().await.unwrap_or_else(|e| {
+        let memory = crate::memory::commit_if_changed(&self.cfg.home, self.cfg.state_dir())
+            .unwrap_or_else(|e| {
+                eprintln!("zephyr: memory commit failed: {e:#}");
+                None
+            });
+        let tally = std::mem::take(&mut self.tally);
+        let crossed = self.record_spend(tally.used).unwrap_or_else(|e| {
             eprintln!("zephyr: recording spend failed: {e:#}");
             false
         });
@@ -436,6 +440,10 @@ impl<'a> Router<'a> {
                 }
                 log(self.reconcile(Some(fallback), false).await);
             }
+        }
+        // After the reply, so the owner reads what was sent out next to what it was for.
+        for notice in [tally.alert(), memory].into_iter().flatten() {
+            log(self.store.notify_last_owner(&notice).map_err(Into::into));
         }
         if crossed {
             log(self
@@ -488,8 +496,27 @@ impl<'a> Router<'a> {
             ("/status", "") => self.status(),
             ("/model", "") => self.models(),
             ("/model", model) => self.switch_model(model).await,
+            ("/new", "") => self.new_session().await,
             _ => return None,
         })
+    }
+
+    /// `/new`: a fresh main session from the next message. The old one stays on disk; memory
+    /// and the rules carry over, since they are files. Long sessions are easier to steer
+    /// (ClawSafety Table 3), so the owner can cut one off.
+    async fn new_session(&mut self) -> String {
+        let id = format!("{MAIN_SESSION}-{}", crate::now());
+        if let Err(e) = self.store.set_main_session(&id) {
+            return format!("[zephyr] no new conversation: {e}");
+        }
+        self.restart = true;
+        let when = if self.busy {
+            "after the current reply"
+        } else {
+            "from the next message"
+        };
+        self.restart_if_idle().await;
+        format!("[zephyr] new conversation {when}; memory and rules are kept")
     }
 
     fn status(&self) -> String {
@@ -562,13 +589,13 @@ impl<'a> Router<'a> {
             Ok(new) => new,
             Err(e) => return format!("[zephyr] zephyr.toml not applied: {e:#}"),
         };
-        let secrets = crate::dotenv::read(&secrets_path(&new)).unwrap_or_default();
+        let secrets = crate::dotenv::read(&new.secrets_path()).unwrap_or_default();
         let next = pick_in(&new, &self.store).ok().flatten();
         let mut plan = crate::reload::diff(&self.cfg, &new, self.account.as_ref(), next.as_ref());
         if secrets != self.secrets {
             plan = Plan::Reexec;
         } else if self.child.is_some()
-            && crate::reload::stamp(&self.auth_file()) != self.auth_stamp
+            && self.auth_mtime() != self.auth_stamp
             && !matches!(plan, Plan::Reexec)
         {
             plan = Plan::RestartChild; // a re-login: rpi reads credentials at start
@@ -818,6 +845,7 @@ async fn lists(cfg: &Config, account: Option<&Account>, model: &str) -> bool {
         None => Some(crate::auth_keeper::agent_dir(cfg)),
     };
     let mut cmd = tokio::process::Command::new(&cfg.rpi);
+    crate::agent::cmd(cmd.as_std_mut());
     cmd.arg("--list-models")
         .current_dir(&cfg.home)
         .kill_on_drop(true);

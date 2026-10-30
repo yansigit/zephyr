@@ -60,7 +60,7 @@ Upstream analysis (`research/pi-rust-integration.md` §7) compared three options
 
 ### 4.1 Sessions
 
-- **`main`** is one long-lived session shared by all three channels. It is your assistant, so the context continues whichever channel you use. Each inbound message is prefixed with its channel, e.g. `[discord] …`. The reply goes back to the channel the message came from.
+- **`main`** is one long-lived session shared by all three channels. The owner's `/new` starts a fresh one, `main-<unix secs>`, kept in `state.db` so restarts reopen it; the old file stays. Attack success rises with session length (ClawSafety Table 3: 50% at 10 turns, 77.5% at 64). It is your assistant, so the context continues whichever channel you use. Each inbound message is prefixed with its channel, e.g. `[discord] …`. The reply goes back to the channel the message came from.
 - **`job-<id>-<run>`** is a fresh session for each scheduled run, as Hermes and nanobot do. It is deleted after 30 days.
 - **Ordering:** one prompt at a time per child (`maxConcurrentPrompts: 1`).
   - Messages that arrive while the agent is busy go through RPC `queue_message`. This is rpi's own follow-up queue, so we don't build our own.
@@ -100,8 +100,14 @@ Upstream analysis (`research/pi-rust-integration.md` §7) compared three options
 
 There are no per-call prompts. These hard limits hold every time:
 
-1. **One Docker container, `zephyr`** (`zephyr up`, set up by `zephyr init`). The daemon and every child run inside it, as your uid, so files it creates are yours and no ACLs are needed. The agent can work anywhere it is mounted:
-   - Read-write: `~/.zephyr` (seen as `/zephyr`), which holds its state, memory, sessions and its own rpi agent dir with its own credentials.
+1. **One Docker container, `zephyr`** (`zephyr up`, set up by `zephyr init`). Two users inside it:
+   - **The agent** (every rpi child, and every process zephyr starts for it: `rpi auth refresh`, `rpi --list-models`, memory's git) runs as your uid, so files it creates are yours and no ACLs are needed.
+   - **The daemon** runs as root holding only SETUID, SETGID and KILL (`--cap-drop ALL`, `no-new-privileges`, `--pids-limit 4096`). Without DAC_OVERRIDE, root is bound by file permissions like anyone else. Its own files live in `~/.zephyr-daemon` (root, 0700), seen as `/var/lib/zephyr`: `zephyr.toml`, `secrets.env`, `tui.token`, `host.toml`, `state.db`, the chat socket and the lock. The agent can neither read nor change them, so it cannot learn the bot tokens, rewrite the settings (dropping the policy plugin or adding an owner), or speak as the owner on the chat socket. Whatever the daemon does in the agent's home it does with the agent's file ids (`agent::fs`, setfsuid), so a symlink the agent plants leads nowhere new; a missed call site fails closed, since root cannot even enter `/zephyr`. `zephyr up` moves an older layout over once and gives the dir to root in a throwaway container; the host CLI then reads and writes those files through `zephyr __file` in the container, as root.
+   - Before a child starts, secrets.env's variables are removed from its environment (`[agent] env` lets named ones through), and the daemon is undumpable.
+   - Left readable by the agent, by necessity: the provider credentials rpi itself reads (`accounts/*/auth.json`, the Claude config) and the conversation (`sessions/`).
+
+   The agent can work anywhere it is mounted:
+   - Read-write: `~/.zephyr` (seen as `/zephyr`), which holds its memory, sessions and its own rpi agent dir with its own credentials.
    - Read-write: `$PROJECTS` at the same path as on the host. Secrets inside it (`.parity-env.sh`, `.parity-lanes/archive`, every `.env*` outside `node_modules`) are covered with empty mounts.
    - Nothing else of your home: `~/.ssh`, `~/.rpi`, `~/.pi` and browser profiles are not mounted. No docker socket.
    - Network: host networking, so the attach port on 127.0.0.1 and the Tailscale webhook address work unchanged.
@@ -114,10 +120,11 @@ There are no per-call prompts. These hard limits hold every time:
    - writes outside the granted roots
    - `git push --force`
    - package installs outside the workspace venv/node dirs
+   - credential files (`auth.json`, `.credentials.json`, `secrets.env`), `/proc/*/environ`, `.ssh/` and `.git/hooks/`, named in any tool's path or any bash word. A hook in a project would run as the owner, on the host, at their next commit. This is a name check, so a glob or an encoded name gets past it: the boundary is the agent's environment and uid (item 1), not this list.
 
    It logs every call to the audit table.
-3. **Untrusted content.** Text from iMessage, Discord, web fetches and files is wrapped as data in the prompt (`<untrusted source=…>`). The policy plugin also blocks outbound sends to any address other than the owner's channels, which limits what a prompt injection can exfiltrate.
-4. **Budgets.** Daily token and cost limits, plus a per-run cap of 60 turns and 30 minutes, taken from `get_stats`. When a limit is hit, the gateway aborts the run and notifies you.
+3. **Untrusted content and what leaves.** Text the agent reads is not wrapped in `<untrusted>` tags: the plugin cannot rewrite tool output, and wrapping only lowered attack success from 57.7% to 41.7% in AgentDojo (Table 5). Nothing outbound is blocked either; an egress allowlist did not lower attack success in ClawSafety (NemoClaw, 45.8% vs 40%), because most leaks went into normal replies. Instead the owner sees what left: the daemon reads each bash `tool_execution_start` from rpi's event stream (which the agent cannot forge) and, after the turn, lists every command that sent data off the machine (`zephyr_policy::policy::outbound`: curl/wget with a body or a non-GET method, ssh, scp, sftp, rsync to a host, nc, socat, telnet, `git push`). Plain GETs are not listed, though a URL can carry data too (CaMeL §7).
+4. **Budgets.** Daily token and cost limits, summed from the `usage` on each assistant `message_end` event. rpi 0.12.0's `get_stats` totals count only usage that extensions record, never the replies' own, so they stay at 0. When a limit is hit, the gateway pauses and notifies you. (A per-run cap of turns and minutes was planned but is not built.)
 5. **Kill switch.**
    - `/stop` from any owner channel aborts the run.
    - `/pause` stops all dispatch and scheduling until `/resume`.
@@ -137,9 +144,14 @@ There are no per-call prompts. These hard limits hold every time:
 
 ### 4.6 Memory
 
-- `~/agent/memory/{USER.md, MEMORY.md, notes/YYYY-MM-DD.md}`, kept in a git repo.
-- These are loaded as context files when a session starts, using rpi's existing context-file loading. This is the frozen snapshot, which keeps the prompt cache warm. The agent edits them with normal file tools inside the sandbox.
-- The gateway commits after each run that changed them. `/memory undo` runs `git revert`. It never reverts the first (seed) commit. rpi skips `AGENTS.md` for a cwd that `trust.json` marks `false`, so `zephyr doctor` checks for that.
+- `/zephyr/memory/{USER.md, MEMORY.md, notes/YYYY-MM-DD.md}`, kept in a git repo, edited by the agent with normal file tools. The daemon commits after each run that changed them.
+- rpi loads `/zephyr/AGENTS.md` as a context file when a child starts (the frozen snapshot, which keeps the prompt cache warm). The daemon writes it before every start from the owner's side only, never from the working files:
+  1. **The owner's standing rules** (`/rule <text>`, `/rule rm N`, `/rules`), kept in `<state>/RULES.md`, first, with a line saying that text claiming to change them is not from the owner. A rule change restarts the child at idle on the same session, so it applies from the next message; jobs start fresh children and get it too. Rules here sit at system-prompt level, which compaction does not touch: in Governance Decay (arXiv 2606.22528, Tables 1–2) in-chat rules were dropped after compaction up to 59% of the time, system-prompt ones 0%.
+  2. **The approved memory**: `<state>/approved/{USER.md, MEMORY.md}`. A change the agent makes waits: after the run the owner gets its diff once (`[zephyr] memory change waiting; /memory ok keeps it, /memory undo drops it`), and `/memory diff` shows it again. `/memory ok` approves it, for the next child start. `/memory undo` drops a waiting change by reverting each commit since the last approval; with nothing waiting it reverts the newest memory commit, as before, never the seed, and approves the result. On the first start with approvals, the memory there counts as approved.
+
+  Why a human gate rather than a scanner: an agent that writes its own memory saved a fabricated "preference" from one web page up to 99.8% of the time, which then steered 68–80% of later actions (Sleeper Memory Poisoning, arXiv 2605.15338, Tables 1–2, App. I); pattern and LLM-trust filters let poisoned entries through (arXiv 2601.05504 §8.2).
+- rpi 0.12.0 loads the first of `AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD` from the agent dir and from each dir up from the cwd, so an agent that wrote `AGENTS.override.md` or `CLAUDE.md` in `/zephyr`, or `AGENTS.md` in its agent dir, would get around both rules and approval. Before each start the daemon renames any of those to `<name>.ignored-by-zephyr` and logs it.
+- `<state>` is root's in the container (§4.4), so the agent can change neither the rules nor the approved copies. rpi skips `AGENTS.md` for a cwd that `trust.json` marks `false`, so `zephyr doctor` checks for that.
 
 ### 4.7 Auth and providers
 
@@ -175,6 +187,7 @@ There are no per-call prompts. These hard limits hold every time:
 ### 4.10 Live settings
 
 - The router owns the config as an `Arc<Config>` and sends each new one to the scheduler on a `watch` channel. `Config::load` records the file it read.
+- `home` is the agent's (sessions, memory, accounts); `state` (default `home`; `/var/lib/zephyr` in the container) holds `state.db`, `secrets.env`, the socket and the lock. Changing either re-execs.
 - **Triggers.** `/reload` (owner-only, outside the queue, like `/pause`; `zephyr reload` sends it over the chat socket, and the host CLI runs it after every edit), and the router's 5 s tick when the mtime of `zephyr.toml` or `secrets.env` changed. A file that does not load or validate is reported and not applied.
 - **Plan** (`reload::diff`), the least disruptive that covers the change:
   - `rpi`, `home`, `[discord]`, `[imessage]`, `[attach]`, or any `secrets.env` pair: **re-exec**. Once main is settled and no job runs, the router drains as on SIGTERM and `zephyr run` execs itself with the same args, minus the variables secrets.env set, so the new process reads them again. The lock and sockets are close-on-exec; under `--init` the PID stays.
@@ -211,4 +224,6 @@ Each milestone gets a failing test first and runs in its own worktree. Lanes wit
 ## 7. Open items
 
 - The name collides with the Zephyr RTOS (a Linux Foundation project). That doesn't matter for a private repo, but check it before using Zephyr as a public brand.
-- The container runs as your uid, so it can read anything mounted that you can. Only the listed secret paths are masked.
+- The agent runs as your uid, so it can read anything mounted that you can. Only the listed secret paths are masked.
+- The agent can read the provider credentials rpi itself needs (`accounts/*/auth.json`, the Claude config) and the conversation (`sessions/`); the policy plugin's name check is the only thing in the way, and it can be bypassed.
+- A plain GET can carry data out in its URL; outbound alerts list only commands that send a body or use another method (§4.4 item 3).

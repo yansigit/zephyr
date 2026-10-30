@@ -12,12 +12,17 @@ const CLAUDE_TOKEN: &str = "sk-ant-oat01-FAKE-CLAUDE-TOKEN";
 const DOCKER: &str = r#"#!/bin/bash
 log="$SHIM_DIR/calls.log"
 (IFS=$'\x1f'; echo "docker$IFS$*") >> "$log"
+# `zephyr __file` in the container serves the daemon's files from $SHIM_DIR/files.
+case " $* " in
+  *" __file get "*) f="$SHIM_DIR/files/${@: -1}"; [ -f "$f" ] || exit 3; cat "$f"; exit 0 ;;
+  *" __file put "*) mkdir -p "$SHIM_DIR/files"; cat > "$SHIM_DIR/files/${@: -1}"; exit 0 ;;
+esac
 [ -n "$GH_TOKEN" ] && echo "GH_TOKEN set" >> "$SHIM_DIR/env.log"
 case "$1" in
   inspect) echo "${SHIM_STATE:-running}"; exit 0 ;;
   image) exit "${SHIM_IMAGE_MISSING:-0}" ;;
   exec)
-    [ "$2" = "-i" ] && cat >> "$SHIM_DIR/stdin.log"
+    case " $* " in *" -i "*) cat >> "$SHIM_DIR/stdin.log" ;; esac
     case " $* " in
       *" --list-models "*) printf 'provider model context\nanthropic claude-sonnet-5 200K\nopenai-codex gpt-5.5 400K\nopenai-codex gpt-5.4 400K\n' ;;
       *" auth check "*) echo '{"ready":true,"provider":"claude-code","source":"auth.json"}' ;;
@@ -121,8 +126,14 @@ impl Env {
         self.home.join(".zephyr")
     }
 
+    /// The daemon's own files (DESIGN §4.4). Root's in real use; this user's here, since the
+    /// shim's chown does nothing.
+    fn daemon(&self) -> PathBuf {
+        self.home.join(".zephyr-daemon")
+    }
+
     fn config(&self) -> String {
-        std::fs::read_to_string(self.data().join("zephyr.toml")).unwrap()
+        std::fs::read_to_string(self.daemon().join("zephyr.toml")).unwrap()
     }
 
     fn init(&self, extra: &[&str]) {
@@ -144,6 +155,25 @@ fn find<'a>(calls: &'a [Vec<String>], prefix: &[&str]) -> &'a Vec<String> {
         .unwrap_or_else(|| panic!("no call {prefix:?} in {calls:#?}"))
 }
 
+/// This user's `uid:gid`, the agent's in the container: the owner of a file it just made.
+fn ids() -> String {
+    let probe = std::env::temp_dir().join(format!("zephyr-host-ids-{}", std::process::id()));
+    std::fs::write(&probe, "").unwrap();
+    let me = std::fs::metadata(&probe).unwrap();
+    let _ = std::fs::remove_file(&probe);
+    format!("{}:{}", me.uid(), me.gid())
+}
+
+/// A `docker exec` as the agent (this user, in its home) whose argv starts with `rest`.
+fn find_agent<'a>(calls: &'a [Vec<String>], rest: &[&str]) -> &'a Vec<String> {
+    let ids = ids();
+    let prefix: Vec<&str> = ["docker", "exec", "-u", &ids, "-w", "/zephyr"]
+        .into_iter()
+        .chain(rest.iter().copied())
+        .collect();
+    find(calls, &prefix)
+}
+
 fn mode(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().mode() & 0o777
 }
@@ -159,13 +189,18 @@ fn init_non_interactive_builds_the_layout_and_starts_the_container() {
         "--model",
         "anthropic/claude-sonnet-5",
     ]);
-    let data = env.data();
+    let (data, daemon) = (env.data(), env.daemon());
     assert_eq!(mode(&data), 0o700);
-    assert_eq!(mode(&data.join("secrets.env")), 0o600);
-    assert_eq!(mode(&data.join("tui.token")), 0o600);
+    assert_eq!(mode(&daemon), 0o700);
+    assert_eq!(mode(&daemon.join("secrets.env")), 0o600);
+    assert_eq!(mode(&daemon.join("tui.token")), 0o600);
+    assert!(
+        !data.join("zephyr.toml").exists(),
+        "the agent's home holds no daemon file"
+    );
     assert!(data.join("accounts").is_dir() && data.join(".rpi/agent").is_dir());
     let projects = env.projects.canonicalize().unwrap().display().to_string();
-    assert!(std::fs::read_to_string(data.join("host.toml"))
+    assert!(std::fs::read_to_string(daemon.join("host.toml"))
         .unwrap()
         .contains(&projects));
 
@@ -192,28 +227,47 @@ fn init_non_interactive_builds_the_layout_and_starts_the_container() {
     find(&calls, &["docker", "rm", "-f", CONTAINER]);
     let run = find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
     let uid = std::fs::metadata(&env.home).unwrap().uid();
-    assert!(
-        run.iter().any(|a| a.starts_with(&format!("{uid}:"))),
-        "{run:?}"
-    );
+    // Root without file overrides runs the daemon; the agent gets this user's ids.
+    assert!(run.windows(2).any(|w| w == ["--user", "0:0"]), "{run:?}");
+    assert!(run.contains(&format!("ZEPHYR_AGENT_UID={uid}")), "{run:?}");
     assert!(run.contains(&format!("type=bind,src={},dst=/zephyr", data.display())));
+    assert!(run.contains(&format!(
+        "type=bind,src={},dst=/var/lib/zephyr",
+        daemon.display()
+    )));
+    assert!(run.contains(&"ZEPHYR_CONFIG=/var/lib/zephyr/zephyr.toml".to_string()));
     assert!(run.contains(&format!("type=bind,src={projects},dst={projects}")));
     assert!(run.contains(&format!(
         "type=bind,src=/dev/null,dst={projects}/app/.env,readonly"
     )));
     assert!(!run.iter().any(|a| a.contains("node_modules")), "{run:?}");
     assert!(!run.iter().any(|a| a.contains("env-file")), "{run:?}");
+    for pair in [
+        ["--cap-drop", "ALL"],
+        ["--cap-add", "SETUID"],
+        ["--cap-add", "SETGID"],
+        ["--cap-add", "KILL"],
+        ["--security-opt", "no-new-privileges"],
+        ["--pids-limit", "4096"],
+        ["-w", "/"],
+    ] {
+        assert!(run.windows(2).any(|w| w == pair), "{pair:?} in {run:?}");
+    }
+    assert!(
+        !run.iter().any(|a| a == "--memory"),
+        "no memory cap unless set"
+    );
     assert_eq!(run.last().unwrap(), "zephyr-lanetest");
     find(&calls, &["docker", "exec", CONTAINER, "zephyr", "doctor"]);
 
     // Re-running keeps what is there, comments included.
-    let path = data.join("zephyr.toml");
+    let path = daemon.join("zephyr.toml");
     std::fs::write(&path, format!("# mine\n{}", env.config())).unwrap();
-    let token = std::fs::read_to_string(data.join("tui.token")).unwrap();
+    let token = std::fs::read_to_string(daemon.join("tui.token")).unwrap();
     env.init(&["--no-start", "--provider", "anthropic"]);
     assert!(env.config().starts_with("# mine\n"));
     assert_eq!(
-        std::fs::read_to_string(data.join("tui.token")).unwrap(),
+        std::fs::read_to_string(daemon.join("tui.token")).unwrap(),
         token
     );
     let cfg: toml::Value = toml::from_str(&env.config()).unwrap();
@@ -271,6 +325,24 @@ fn up_build_passes_the_gh_token_as_a_secret_only() {
 }
 
 #[test]
+fn up_caps_memory_only_when_host_toml_sets_it() {
+    let env = Env::new("memory");
+    env.init(&["--no-start"]);
+    let host = env.daemon().join("host.toml");
+    let text = std::fs::read_to_string(&host).unwrap();
+    std::fs::write(&host, format!("{text}memory = \"6g\"\n")).unwrap();
+    let out = env.zephyr(&["up"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = env.calls();
+    let run = find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
+    assert!(run.windows(2).any(|w| w == ["--memory", "6g"]), "{run:?}");
+}
+
+#[test]
 fn login_feeds_secrets_on_stdin_and_records_the_account() {
     let env = Env::new("login");
     env.init(&["--no-start"]);
@@ -297,26 +369,13 @@ fn login_feeds_secrets_on_stdin_and_records_the_account() {
     );
     let calls = env.calls();
     let acct = "RPI_CODING_AGENT_DIR=/zephyr/accounts/claude-main";
-    let login = find(
-        &calls,
-        &[
-            "docker", "exec", "-i", "-e", acct, CONTAINER, "script", "-qec",
-        ],
-    );
+    let login = find_agent(&calls, &["-i", "-e", acct, CONTAINER, "script", "-qec"]);
     assert!(
-        login[8].starts_with("rpi auth login --provider claude-code --extension /opt/zephyr/ext/"),
+        login[12].starts_with("rpi auth login --provider claude-code --extension /opt/zephyr/ext/"),
         "{login:?}"
     );
-    find(
-        &calls,
-        &[
-            "docker", "exec", "-e", acct, CONTAINER, "rpi", "auth", "check",
-        ],
-    );
-    let verify = find(
-        &calls,
-        &["docker", "exec", "-e", acct, CONTAINER, "rpi", "-p"],
-    );
+    find_agent(&calls, &["-e", acct, CONTAINER, "rpi", "auth", "check"]);
+    let verify = find_agent(&calls, &["-e", acct, CONTAINER, "rpi", "-p"]);
     assert!(verify
         .windows(2)
         .any(|w| w == ["--model", "claude-code/claude-sonnet-5"]));
@@ -336,11 +395,9 @@ fn login_feeds_secrets_on_stdin_and_records_the_account() {
     // OAuth providers run rpi's own login on a terminal; with no --model the first listed one is used.
     env.ok(&["login", "openai-codex", "--no-verify"]);
     let calls = env.calls();
-    let login = find(
+    let login = find_agent(
         &calls,
         &[
-            "docker",
-            "exec",
             "-it",
             "-e",
             "RPI_CODING_AGENT_DIR=/zephyr/accounts/openai-codex-1",
@@ -438,16 +495,9 @@ fn accounts_model_and_config_edit_the_toml() {
         cfg["account"][0]["model"].as_str(),
         Some("openai-codex/gpt-5.5")
     );
-    find(
+    find_agent(
         &env.calls(),
-        &[
-            "docker",
-            "exec",
-            CONTAINER,
-            "rpi",
-            "--list-models",
-            "--extension",
-        ],
+        &[CONTAINER, "rpi", "--list-models", "--extension"],
     );
 }
 
@@ -525,7 +575,7 @@ fn lifecycle_commands_build_the_expected_docker_calls() {
         .ok(&["status"])
         .contains(&format!("container {CONTAINER}: running")));
 
-    let token = std::fs::read_to_string(env.data().join("tui.token")).unwrap();
+    let token = std::fs::read_to_string(env.daemon().join("tui.token")).unwrap();
     env.ok(&["attach"]);
     let calls = env.calls();
     find(
@@ -536,6 +586,10 @@ fn lifecycle_commands_build_the_expected_docker_calls() {
             "-it",
             "-e",
             "RPI_SERVER_TOKEN",
+            "-e",
+            "HOME=/tmp",
+            "-e",
+            "RPI_CODING_AGENT_DIR=/tmp/zephyr-attach",
             CONTAINER,
             "rpi",
             "--connect",
@@ -556,13 +610,105 @@ fn lifecycle_commands_build_the_expected_docker_calls() {
     assert!(env.data().exists());
     env.ok(&["uninstall", "--yes"]);
     assert!(!env.data().exists());
+    assert!(!env.daemon().exists());
+}
+
+#[test]
+fn up_moves_an_old_layout_out_of_the_agents_home_once() {
+    let env = Env::new("migrate");
+    env.init(&["--no-start"]);
+    // The layout before the split: every file in ~/.zephyr, the chat owner this uid.
+    let (data, daemon) = (env.data(), env.daemon());
+    let uid = std::fs::metadata(&env.home).unwrap().uid();
+    let old = env
+        .config()
+        .replace(
+            "[owners]\nchat = [\"0\"]",
+            &format!("[owners]\nchat = [\"{uid}\"]"),
+        )
+        .replace("/var/lib/zephyr/tui.token", "/zephyr/tui.token")
+        .replace("state = \"/var/lib/zephyr\"\n", "");
+    for name in ["secrets.env", "tui.token", "host.toml"] {
+        std::fs::rename(daemon.join(name), data.join(name)).unwrap();
+    }
+    std::fs::remove_file(daemon.join("zephyr.toml")).unwrap();
+    std::fs::remove_dir(&daemon).unwrap();
+    std::fs::write(data.join("zephyr.toml"), &old).unwrap();
+    std::fs::write(data.join("state.db"), "db").unwrap();
+    std::fs::write(data.join("zephyr.lock"), "").unwrap();
+
+    env.ok(&["up"]);
+    for name in [
+        "zephyr.toml",
+        "secrets.env",
+        "tui.token",
+        "host.toml",
+        "state.db",
+    ] {
+        assert!(
+            daemon.join(name).exists() && !data.join(name).exists(),
+            "{name}"
+        );
+    }
+    assert!(!data.join("zephyr.lock").exists());
+    let cfg: toml::Value = toml::from_str(&env.config()).unwrap();
+    assert_eq!(cfg["state"].as_str(), Some("/var/lib/zephyr"));
+    assert_eq!(
+        cfg["attach"]["token_file"].as_str(),
+        Some("/var/lib/zephyr/tui.token")
+    );
+    assert_eq!(
+        cfg["owners"]["chat"].as_array().unwrap(),
+        &[toml::Value::from("0")]
+    );
+    let calls = env.calls();
+    let chown = find(&calls, &["docker", "run", "--rm", "--user", "0"]);
+    assert_eq!(chown.last().unwrap(), "chown -R 0:0 /d && chmod 700 /d");
+    find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
+}
+
+#[test]
+fn settings_reach_roots_files_through_the_container() {
+    let env = Env::new("remote");
+    env.init(&["--no-start"]);
+    // As after `zephyr up`: the files are root's, so this user cannot open the dir.
+    let files = env.dir.join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    for name in ["zephyr.toml", "secrets.env", "tui.token", "host.toml"] {
+        std::fs::rename(env.daemon().join(name), files.join(name)).unwrap();
+    }
+    std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    env.ok(&["config", "set", "budget.daily_tokens", "5"]);
+    let calls = env.calls();
+    let get = ["zephyr", "__file", "get", "zephyr.toml"];
+    let put = ["zephyr", "__file", "put", "zephyr.toml"];
+    let root = ["docker", "exec", "-i", "-u", "0", CONTAINER];
+    find(&calls, &[&root[..], &get[..]].concat());
+    find(&calls, &[&root[..], &put[..]].concat());
+    let text = std::fs::read_to_string(files.join("zephyr.toml")).unwrap();
+    assert!(text.contains("daily_tokens = 5"), "{text}");
+
+    // Stopped: a throwaway root container with no capabilities and no network.
+    let out = env.zephyr_env(
+        &["config", "get", "budget.daily_tokens"],
+        &[("SHIM_STATE", "exited")],
+    );
+    assert_eq!(stdout(&out).trim(), "5");
+    let calls = env.calls();
+    let run = find(&calls, &["docker", "run", "--rm", "-i", "-u", "0"]);
+    for pair in [["--cap-drop", "ALL"], ["--network", "none"]] {
+        assert!(run.windows(2).any(|w| w == pair), "{pair:?} in {run:?}");
+    }
+    assert!(run.ends_with(&get.map(String::from)), "{run:?}");
+    std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 #[test]
 fn doctor_fix_repairs_modes() {
     let env = Env::new("doctor");
     env.init(&["--no-start"]);
-    let secrets = env.data().join("secrets.env");
+    let secrets = env.daemon().join("secrets.env");
     std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o644)).unwrap();
     let out = env.zephyr(&["doctor"]);
     assert!(!out.status.success());

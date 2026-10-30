@@ -1,5 +1,6 @@
 //! Zephyr: an always-on agent gateway over upstream `rpi --mode rpc`. See DESIGN.md.
 
+pub mod agent;
 pub mod attach;
 pub mod auth_keeper;
 pub mod channel;

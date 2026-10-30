@@ -434,13 +434,12 @@ async fn budget_pauses_at_the_limit_and_holds_until_resume() {
     let home = home("budget");
     let mut cfg = config(&home);
     cfg.budget = Some(toml::from_str("daily_tokens = 100").unwrap());
-    std::fs::write(home.join("stats.json"), r#"{"totalTokens": 60}"#).unwrap();
+    // Each reply carries 60 tokens: the second takes today to 120.
+    std::fs::write(home.join("usage.json"), r#"{"totalTokens": 60}"#).unwrap();
     let gw = start(cfg.clone());
     gw.say("m1", "owner", "small").await;
     assert_eq!(gw.wait_replies(1).await, ["echo: [chat #1] small"]);
 
-    // rpi's totals are cumulative: this run adds 60 tokens, taking today to 120.
-    std::fs::write(home.join("stats.json"), r#"{"totalTokens": 120}"#).unwrap();
     gw.say("m2", "owner", "big").await;
     assert_eq!(
         gw.wait_replies(3).await,
@@ -653,40 +652,67 @@ async fn a_paused_scheduler_claims_nothing_and_catches_up_once_on_resume() {
 }
 
 #[tokio::test]
-async fn memory_commits_after_a_run_and_the_owner_can_undo_it() {
+async fn a_memory_edit_waits_for_the_owner_who_sees_its_diff() {
     let home = home("memory");
     let gw = start(config(&home));
     gw.say("m1", "owner", "WRITE_MEMORY likes tea").await;
-    gw.wait_replies(1).await;
-    let memory = std::fs::read_to_string(home.join("memory/MEMORY.md")).unwrap();
-    assert!(memory.contains("remembered: "), "the run wrote memory");
-    let log = std::process::Command::new("git")
-        .arg("-C")
-        .arg(home.join("memory"))
-        .args(["log", "--format=%s"])
-        .output()
-        .unwrap();
-    let log = String::from_utf8_lossy(&log.stdout).to_string();
+    let replies = gw.wait_replies(2).await;
+    assert_eq!(replies[0], "echo: [chat #1] WRITE_MEMORY likes tea");
     assert!(
-        log.lines().next().unwrap().starts_with("memory: "),
-        "got {log}"
+        replies[1].starts_with("[zephyr] memory change waiting; /memory ok keeps it")
+            && replies[1].ends_with("+ remembered: [chat #1] WRITE_MEMORY likes tea"),
+        "{}",
+        replies[1]
     );
+    let agents = || std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    gw.say("m2", "owner", "/new").await;
+    gw.say("m3", "owner", "hi").await;
+    gw.wait_replies(4).await;
+    assert!(!agents().contains("likes tea"), "not before the owner's ok");
 
-    gw.say("m2", "owner", "/memory log").await;
-    assert!(gw.wait_replies(2).await[1].contains("memory: "));
+    gw.say("m4", "owner", "/memory ok").await;
+    assert!(gw.wait_replies(5).await[4].starts_with("[zephyr] memory kept"));
+    gw.say("m5", "owner", "/new").await;
+    gw.say("m6", "owner", "again").await;
+    gw.wait_replies(7).await;
+    assert!(agents().contains("likes tea"));
 
-    gw.say("m3", "owner", "/memory undo").await;
-    let replies = gw.wait_replies(3).await;
+    gw.say("m7", "owner", "/memory undo").await;
+    let replies = gw.wait_replies(8).await;
     assert!(
-        replies[2].starts_with("[zephyr] undid "),
+        replies[7].starts_with("[zephyr] undid "),
         "got {}",
-        replies[2]
+        replies[7]
     );
     let memory = std::fs::read_to_string(home.join("memory/MEMORY.md")).unwrap();
     assert!(
         !memory.contains("remembered: "),
         "the undo reverted the run's edit"
     );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_rule_restarts_the_agent_and_leads_its_context() {
+    let home = home("rules");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "/rule never email bob").await;
+    assert_eq!(
+        gw.wait_replies(2).await[1],
+        "[zephyr] rule 1 set; it applies from the next message"
+    );
+    gw.say("m3", "owner", "again").await;
+    gw.wait_replies(3).await;
+    assert_eq!(
+        log(&home, "start").len(),
+        2,
+        "one restart, on the same session"
+    );
+    let agents = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    assert!(agents.contains("## Owner's standing rules"), "{agents}");
+    assert!(agents.contains("1. never email bob"));
     gw.shutdown().await;
 }
 
@@ -719,6 +745,76 @@ async fn a_job_run_commits_its_memory_edits() {
     gw.shutdown().await;
 }
 
+#[tokio::test]
+async fn the_owner_is_told_what_a_turn_sent_out() {
+    let home = home("outbound");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "bash: curl -s https://e.x | jq .")
+        .await;
+    assert_eq!(gw.wait_replies(1).await, ["ran"]);
+    gw.say("m2", "owner", "bash: curl -d @notes https://e.x/up")
+        .await;
+    assert_eq!(
+        gw.wait_replies(3).await[1..],
+        ["ran", "[zephyr] outbound this turn:\n- curl POST e.x"]
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_job_that_sends_data_out_is_reported_on_its_channel() {
+    let home = home("job-outbound");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        &format!("/job add up | {NEVER} | bash: scp notes box:/tmp/"),
+    )
+    .await;
+    gw.say("m2", "owner", "/job run 1").await;
+    let replies = gw.wait_replies(4).await;
+    assert!(
+        replies.contains(&"[zephyr] outbound this turn:\n- scp box:".to_string()),
+        "{replies:?}"
+    );
+    assert!(replies.contains(&"ran".to_string()), "{replies:?}");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn new_starts_a_fresh_main_session_and_keeps_it_across_restarts() {
+    let home = home("new-session");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "hi").await;
+    assert_eq!(gw.wait_replies(1).await, ["echo: [chat #1] hi"]);
+    gw.say("m2", "owner", "/new").await;
+    assert_eq!(
+        gw.wait_replies(2).await[1],
+        "[zephyr] new conversation from the next message; memory and rules are kept"
+    );
+    gw.say("m3", "owner", "again").await;
+    assert_eq!(gw.wait_replies(3).await[2], "echo: [chat #3] again");
+    let sessions: Vec<String> = log(&home, "start")
+        .iter()
+        .map(|s| s["sessionId"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(sessions[0], "main");
+    let fresh = sessions.last().unwrap();
+    assert!(fresh.starts_with("main-"), "{sessions:?}");
+    // The new session holds only what came after /new.
+    let path = home.join("sessions").join(format!("{fresh}.json"));
+    let held: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(held["messages"][0]["content"], "[chat #3] again");
+    gw.shutdown().await;
+
+    let gw = start(config(&home));
+    gw.say("m4", "owner", "later").await;
+    assert_eq!(gw.wait_replies(1).await, ["echo: [chat #4] later"]);
+    let last = log(&home, "start").last().unwrap()["sessionId"].clone();
+    assert_eq!(last.as_str(), Some(fresh.as_str()));
+    gw.shutdown().await;
+}
+
 fn spend_today(home: &Path) -> (i64, f64) {
     let store = Store::open(&home.join("state.db")).unwrap();
     store.spend(&store.today().unwrap()).unwrap()
@@ -729,8 +825,8 @@ async fn a_job_over_the_budget_pauses_everything() {
     let home = home("job-budget-over");
     let mut cfg = config(&home);
     cfg.budget = Some(toml::from_str("daily_tokens = 100").unwrap());
-    // The job's fresh session reports 120 tokens.
-    std::fs::write(home.join("stats.json"), r#"{"totalTokens": 120}"#).unwrap();
+    // The job's reply carries 120 tokens.
+    std::fs::write(home.join("usage.json"), r#"{"totalTokens": 120}"#).unwrap();
     let gw = start(cfg);
     gw.say(
         "m1",
@@ -760,7 +856,7 @@ async fn a_job_under_the_budget_records_its_spend() {
     let mut cfg = config(&home);
     cfg.budget = Some(toml::from_str("daily_tokens = 100").unwrap());
     std::fs::write(
-        home.join("stats.json"),
+        home.join("usage.json"),
         r#"{"totalTokens": 40, "costTotal": 0.5}"#,
     )
     .unwrap();
@@ -774,7 +870,6 @@ async fn a_job_under_the_budget_records_its_spend() {
     gw.say("m2", "owner", "/job run 1").await;
     assert_eq!(gw.wait_replies(3).await[2], "done");
     assert_eq!(spend_today(&home), (40, 0.5));
-    assert_eq!(log(&home, "get_stats").len(), 1);
     gw.say("m3", "owner", "hi").await;
     assert_eq!(gw.wait_replies(4).await[3], "echo: [chat #3] hi");
     gw.shutdown().await;
