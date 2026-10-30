@@ -4,7 +4,7 @@
 //! registered URL's query string, because BlueBubbles sends no custom headers.
 //! Outbound: `POST /api/v1/message/text` with the server password as a query param.
 
-use crate::channel::{Channel, Inbound, Outbound};
+use crate::channel::{Activity, Channel, Inbound, Outbound};
 use anyhow::Context as _;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
@@ -303,20 +303,19 @@ impl IMessage {
         if !on {
             return self.stop_typing(to).await;
         }
-        // Registered before the first send, so a stop that arrives meanwhile still finds the refresh.
+        // The first send runs inside the refresh task, so a stop aborts it even while it is in flight.
         self.keep_refreshing(to);
-        self.typing_request(Method::POST, to)
-            .await
-            .map_err(|e| self.typing_error(e))
+        Ok(())
     }
 
-    /// Whether the Mac's BlueBubbles Private API is on, which typing needs. Reads `data.private_api`.
+    /// Whether typing can work: the Mac's BlueBubbles Private API is on and its helper is connected.
     pub async fn private_api_on(&self) -> anyhow::Result<bool> {
         let body = self
             .request(Method::GET, "/api/v1/server/info", None)
             .await?;
         let info: serde_json::Value = serde_json::from_slice(&body)?;
-        Ok(info["data"]["private_api"].as_bool() == Some(true))
+        let on = |key: &str| info["data"][key].as_bool() == Some(true);
+        Ok(on("private_api") && on("helper_connected"))
     }
 
     /// Starts the refresh for `to`, unless one is running already.
@@ -328,10 +327,10 @@ impl IMessage {
         let (me, chat) = (self.clone(), to.to_string());
         let task = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(me.typing_refresh).await;
                 if let Err(e) = me.typing_request(Method::POST, &chat).await {
                     me.typing_error(e);
                 }
+                tokio::time::sleep(me.typing_refresh).await;
             }
         });
         tasks.insert(to.to_string(), task.abort_handle());
@@ -423,6 +422,15 @@ impl Channel for IMessage {
             "tempGuid": msg.client_id,
         });
         self.post("/api/v1/message/text", &body).await.map(drop)
+    }
+
+    /// Typing on Start, cleared on Stop. Progress shows nothing: the refresh task keeps typing up.
+    async fn activity(&self, to: &str, a: &Activity) -> anyhow::Result<()> {
+        match a {
+            Activity::Start => self.set_typing(to, true).await,
+            Activity::Stop => self.set_typing(to, false).await,
+            Activity::Progress { .. } => Ok(()),
+        }
     }
 }
 
@@ -802,9 +810,8 @@ mod tests {
             ..adapter(base)
         };
         im.set_typing("+15551234567", true).await.unwrap();
-        im.send(&outbound()).await.unwrap();
-
         let (start, _) = next(&mut cap).await;
+        im.send(&outbound()).await.unwrap();
         let (stop, _) = next(&mut cap).await;
         let (reply, _) = next(&mut cap).await;
         assert_eq!(
@@ -853,11 +860,12 @@ mod tests {
             ..adapter(base)
         };
         let err = im
-            .set_typing("+15551234567", true)
+            .typing_request(Method::POST, "+15551234567")
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("500"), "{err}");
+        im.set_typing("+15551234567", true).await.unwrap();
         assert!(!err.contains("pw-hunter2"), "{err}");
         let err = im
             .set_typing("+15551234567", false)
@@ -875,7 +883,7 @@ mod tests {
             ..adapter(format!("http://127.0.0.1:{port}"))
         };
         let err = im
-            .set_typing("+15551234567", true)
+            .typing_request(Method::POST, "+15551234567")
             .await
             .unwrap_err()
             .to_string();
@@ -884,7 +892,7 @@ mod tests {
 
     #[tokio::test]
     async fn private_api_is_read_from_server_info() {
-        let on = r#"{"status":200,"message":"Success","data":{"private_api":true}}"#;
+        let on = r#"{"status":200,"message":"Success","data":{"private_api":true,"helper_connected":true}}"#;
         let (base, mut cap) = stub(200, on).await;
         assert!(adapter(base).private_api_on().await.unwrap());
         let (req, _) = next(&mut cap).await;
@@ -892,6 +900,10 @@ mod tests {
 
         let off = r#"{"status":200,"message":"Success","data":{"private_api":false}}"#;
         let (base, _cap) = stub(200, off).await;
+        assert!(!adapter(base).private_api_on().await.unwrap());
+
+        let no_helper = r#"{"status":200,"message":"Success","data":{"private_api":true,"helper_connected":false}}"#;
+        let (base, _cap) = stub(200, no_helper).await;
         assert!(!adapter(base).private_api_on().await.unwrap());
     }
 }

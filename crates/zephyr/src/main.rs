@@ -238,8 +238,8 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
         if im.typing {
             let on = async { zephyr::imessage::IMessage::new(im)?.private_api_on().await }.await;
             match on {
-                Ok(true) => println!("ok   BlueBubbles Private API is on (iMessage typing)"),
-                Ok(false) => println!("warn iMessage typing needs the BlueBubbles Private API; enable it on the Mac or set [imessage] typing = false"),
+                Ok(true) => println!("ok   BlueBubbles Private API and helper are on (iMessage typing)"),
+                Ok(false) => println!("warn iMessage typing needs the BlueBubbles Private API with its helper connected; enable it on the Mac or set [imessage] typing = false"),
                 Err(e) => println!("warn could not read BlueBubbles server info for iMessage typing: {e:#}"),
             }
         }

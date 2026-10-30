@@ -243,7 +243,7 @@ typing = true
 
     assert!(
         text.contains(
-            "warn iMessage typing needs the BlueBubbles Private API; enable it on the Mac or set [imessage] typing = false"
+            "warn iMessage typing needs the BlueBubbles Private API with its helper connected; enable it on the Mac or set [imessage] typing = false"
         ),
         "{text}"
     );
