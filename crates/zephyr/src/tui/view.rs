@@ -461,7 +461,8 @@ impl Component for Bubble {
             ),
             None => c.fg(&bold(&self.who)),
         };
-        let label = truncate_to_width(&label, width.saturating_sub(5).max(1), glyph("…"));
+        // The top edge is the label and six columns of frame.
+        let label = truncate_to_width(&label, width.saturating_sub(6).max(1), glyph("…"));
         let label_w = visible_width(&label);
         let full = width < BUBBLE_FULL_BELOW;
         let max = if full {
@@ -615,6 +616,10 @@ fn wrap_ansi(line: &str, width: usize) -> Vec<String> {
         }
     });
     let hang = (visible_width(&plain[..lead]) + marker).min(width / 2);
+    // An indent deeper than the hang shrinks to it, so the first line has the room of the rest.
+    let line = &line[(visible_width(&plain[..lead]) + marker)
+        .saturating_sub(hang)
+        .min(lead)..];
 
     // Words and runs of spaces, each with the escapes inside it.
     let mut parts: Vec<(String, usize, bool)> = vec![];
@@ -1337,6 +1342,15 @@ mod tests {
             30,
         );
         assert!(item.iter().any(|l| l.contains("https://")), "{item:#?}");
+        // An indent deeper than half the line shrinks to the hang, so words keep whole.
+        let deep: Vec<String> = wrap_ansi("          ex", 11)
+            .iter()
+            .map(|l| rpi_tui::strip_ansi(l))
+            .collect();
+        assert_eq!(deep, ["     ex"]);
+        for l in wrap_ansi("          loyha", 9) {
+            assert!(visible_width(&l) <= 9, "{l:?}");
+        }
         // A wide first character at width 1 does not panic.
         assert_eq!(wrap_words("한국어", 1), ["한", "국", "어"]);
         // A bubble's top edge fits even when its label does not.
@@ -1346,6 +1360,19 @@ mod tests {
             color: super::super::theme::DARK.discord,
             text: "hi".into(),
             p: super::super::theme::DARK,
+        };
+        let long = Bubble {
+            who: "x".repeat(90),
+            ..b
+        };
+        for w in 86..106 {
+            for row in long.render(w) {
+                assert!(visible_width(&row) <= w, "{w}: {row:?}");
+            }
+        }
+        let b = Bubble {
+            who: "discord".into(),
+            ..long
         };
         for w in [8, 12, 18] {
             for row in b.render(w) {

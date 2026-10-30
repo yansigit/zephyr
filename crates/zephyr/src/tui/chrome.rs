@@ -538,15 +538,21 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
             right.push(spend(&s.snapshot, p));
         }
     }
-    let right = format!("{} ", right.join("   "));
+    // Hints drop off first, then spend; failed replies stay.
     loop {
         let shown: Vec<String> = hints.iter().map(|(h, _)| h.clone()).collect();
         let left = format!("  {}", dotted(&shown, p));
-        if hints.len() <= 1 || visible_width(&left) + visible_width(&right) + 2 <= width {
-            return vec![spread(&left, &right, width)];
+        let r = format!("{} ", right.join("   "));
+        let fits = visible_width(&left) + visible_width(&r) + 2 <= width;
+        if fits || (hints.len() <= 1 && right.len() <= 1) {
+            return vec![spread(&left, &r, width)];
         }
-        let last = (0..hints.len()).max_by_key(|&i| hints[i].1).unwrap_or(0);
-        hints.remove(last);
+        if hints.len() > 1 {
+            let last = (0..hints.len()).max_by_key(|&i| hints[i].1).unwrap_or(0);
+            hints.remove(last);
+        } else {
+            right.pop();
+        }
     }
 }
 
@@ -731,6 +737,11 @@ mod tests {
                 "{w}: {h:?} {f:?}"
             );
             assert_eq!(rpi_tui::visible_width(&h[2]), w);
+        }
+        // With the one-row header the footer keeps them, before spend.
+        for w in 30..60 {
+            let f = plain(footer(&s, &DARK, w, NOW));
+            assert!(f[0].contains("2 failed replies"), "{w}: {f:?}");
         }
     }
 
