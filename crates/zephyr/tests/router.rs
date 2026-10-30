@@ -718,6 +718,42 @@ async fn a_job_run_commits_its_memory_edits() {
     gw.shutdown().await;
 }
 
+#[tokio::test]
+async fn the_owner_is_told_what_a_turn_sent_out() {
+    let home = home("outbound");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "bash: curl -s https://e.x | jq .")
+        .await;
+    assert_eq!(gw.wait_replies(1).await, ["ran"]);
+    gw.say("m2", "owner", "bash: curl -d @notes https://e.x/up")
+        .await;
+    assert_eq!(
+        gw.wait_replies(3).await[1..],
+        ["ran", "[zephyr] outbound this turn:\n- curl POST e.x"]
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_job_that_sends_data_out_is_reported_on_its_channel() {
+    let home = home("job-outbound");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        &format!("/job add up | {NEVER} | bash: scp notes box:/tmp/"),
+    )
+    .await;
+    gw.say("m2", "owner", "/job run 1").await;
+    let replies = gw.wait_replies(4).await;
+    assert!(
+        replies.contains(&"[zephyr] outbound this turn:\n- scp box:".to_string()),
+        "{replies:?}"
+    );
+    assert!(replies.contains(&"ran".to_string()), "{replies:?}");
+    gw.shutdown().await;
+}
+
 fn spend_today(home: &Path) -> (i64, f64) {
     let store = Store::open(&home.join("state.db")).unwrap();
     store.spend(&store.today().unwrap()).unwrap()

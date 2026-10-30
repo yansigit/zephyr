@@ -15,6 +15,7 @@ Accounts: each start logs {"type": "start", "agentDir", "model"} to ./log.jsonl.
 that error (stopReason "error", settle outcome "failed"), as a rate-limited provider does.
 A prompt containing WRITE_MEMORY first writes memory/MEMORY.md under the home.
 argv.json holds the argv of the latest start.
+A prompt containing `bash: CMD` first reports a bash tool call running CMD (tool_execution_start).
 A prompt containing `[hang]` never settles until `abort`; one that starts with `say: `
 replies with the rest; `model?` replies with the current model.
 Models: `--list-models` prints fake/m1, fake/m2 and other/m3, the catalogue `set_model` accepts
@@ -156,6 +157,10 @@ for line in sys.stdin:
             fail(s, rate_limit()); continue
         if "[hang]" in cmd["message"]:
             hanging = True; continue
+        if "bash: " in cmd["message"]:
+            out({"type": "tool_execution_start", "toolCallId": "t1", "toolName": "bash",
+                 "args": {"command": cmd["message"].split("bash: ", 1)[1]}})
+            finish(s, "ran"); continue
         if cmd["message"].endswith("model?"):
             finish(s, "model: %s" % model); continue
         if cmd["message"].startswith("say: "):

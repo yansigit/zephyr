@@ -75,7 +75,7 @@ pub async fn run<C: Channel>(
         auth_at: Instant::now(),
         restart: false,
         account: None,
-        used: (0, 0.0),
+        tally: Default::default(),
     };
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
@@ -130,8 +130,8 @@ struct Router<'a> {
     auth_at: Instant,
     /// A refresh or a failover needs the child restarted; done once it is idle.
     restart: bool,
-    /// Tokens and cost of the replies since the last settle (`rpc::usage`).
-    used: (i64, f64),
+    /// Usage and outbound commands since the last settle.
+    tally: crate::rpc::Tally,
     /// The pooled account the child runs on (DESIGN §4.9). `None` without a pool.
     account: Option<Account>,
 }
@@ -193,10 +193,7 @@ impl<'a> Router<'a> {
     fn tapped(&mut self, ev: Option<Value>) -> Option<Value> {
         if let Some(ev) = &ev {
             let _ = self.tap.send(ev.clone()); // no receivers is fine
-            if let Some((tokens, cost)) = crate::rpc::usage(ev) {
-                self.used.0 += tokens;
-                self.used.1 += cost;
-            }
+            self.tally.add(ev);
         }
         ev
     }
@@ -367,8 +364,7 @@ impl<'a> Router<'a> {
 
     /// Adds what the replies used since the last settle to today's spend. Returns true when
     /// this settle crossed a budget limit, and pauses the gateway for the rest of the UTC day.
-    fn record_spend(&mut self) -> anyhow::Result<bool> {
-        let used = std::mem::take(&mut self.used);
+    fn record_spend(&mut self, used: (i64, f64)) -> anyhow::Result<bool> {
         if let Some(a) = &self.account {
             self.store.add_account_spend(&a.name, used)?;
         }
@@ -403,7 +399,8 @@ impl<'a> Router<'a> {
         self.apply_model().await;
         self.backoff = FIRST_BACKOFF;
         log(crate::memory::commit_if_changed(&self.cfg.home).map(drop));
-        let crossed = self.record_spend().unwrap_or_else(|e| {
+        let tally = std::mem::take(&mut self.tally);
+        let crossed = self.record_spend(tally.used).unwrap_or_else(|e| {
             eprintln!("zephyr: recording spend failed: {e:#}");
             false
         });
@@ -431,6 +428,10 @@ impl<'a> Router<'a> {
                 }
                 log(self.reconcile(Some(fallback), false).await);
             }
+        }
+        // After the reply, so the owner reads what was sent out next to what it was for.
+        if let Some(alert) = tally.alert() {
+            log(self.store.notify_last_owner(&alert).map_err(Into::into));
         }
         if crossed {
             log(self

@@ -64,6 +64,12 @@ provider), `/status` shows the agent's account and model, and `/reload` re-reads
 `ZEPHYR_CONTAINER` (default `zephyr`) and `ZEPHYR_IMAGE` choose another container or image, for
 example to test beside a live install.
 
+## What you are told
+
+- After a turn that ran a command sending data off the machine (curl or wget with a body, ssh, scp,
+  rsync to a host, nc, `git push`, ...), zephyr lists them: `[zephyr] outbound this turn: ...`.
+  Jobs report theirs on the job's channel. Plain downloads are not listed.
+
 ## Where things live
 
 - `~/.zephyr/` (mode 0700), seen as `/zephyr` in the container: `zephyr.toml`, `state.db`, sessions,

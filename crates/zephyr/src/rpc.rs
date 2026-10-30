@@ -189,16 +189,48 @@ impl Child {
 }
 
 /// The text of a wire message: a plain string, or the `text` blocks of a content list.
-/// What an assistant `message_end` event used: `(totalTokens, cost.total)`. rpi's `get_stats`
-/// sums only usage that extensions record, never the replies' own, so spend is summed from these.
-pub fn usage(ev: &Value) -> Option<(i64, f64)> {
-    let m = &ev["message"];
-    (ev["type"] == "message_end" && m["role"] == "assistant").then(|| {
-        (
-            m["usage"]["totalTokens"].as_i64().unwrap_or(0),
-            m["usage"]["cost"]["total"].as_f64().unwrap_or(0.0),
-        )
-    })
+/// What one run did that zephyr answers for, read from its events.
+#[derive(Debug, Default)]
+pub struct Tally {
+    /// Tokens and cost of the replies. rpi's `get_stats` sums only usage that extensions
+    /// record, never the replies' own, so spend is summed from each assistant `message_end`.
+    pub used: (i64, f64),
+    /// Bash commands that sent data off the machine (`zephyr_policy::policy::outbound`).
+    pub outbound: Vec<String>,
+}
+
+impl Tally {
+    pub fn add(&mut self, ev: &Value) {
+        let m = &ev["message"];
+        if ev["type"] == "message_end" && m["role"] == "assistant" {
+            self.used.0 += m["usage"]["totalTokens"].as_i64().unwrap_or(0);
+            self.used.1 += m["usage"]["cost"]["total"].as_f64().unwrap_or(0.0);
+        }
+        // From rpi, not from anything the agent writes, so the agent cannot hide a send.
+        if ev["type"] == "tool_execution_start" && ev["toolName"] == "bash" {
+            if let Some(command) = ev["args"]["command"].as_str() {
+                self.outbound
+                    .extend(zephyr_policy::policy::outbound(command));
+            }
+        }
+    }
+
+    /// The owner's notice of what the run sent out, if it sent anything.
+    pub fn alert(&self) -> Option<String> {
+        const SHOWN: usize = 10;
+        if self.outbound.is_empty() {
+            return None;
+        }
+        let mut text = String::from("[zephyr] outbound this turn:");
+        for line in self.outbound.iter().take(SHOWN) {
+            text.push_str("\n- ");
+            text.push_str(line);
+        }
+        if self.outbound.len() > SHOWN {
+            text.push_str(&format!("\n(+{} more)", self.outbound.len() - SHOWN));
+        }
+        Some(text)
+    }
 }
 
 pub fn message_text(msg: &Value) -> String {
