@@ -6,9 +6,11 @@
 //! {sessionId}`, then `send {sessionId, command}` per prompt and `stop_session` on exit, and
 //! renders `{"method":"event","params":{"subscriptionId","event":<--mode rpc line>}}`.
 //! Here prompts go through the inbox as channel `tui`, and `stop_session` only detaches.
+//! `zephyr.hello` and `zephyr.subscribe` are Zephyr's own additions (DESIGN §4.3.1).
 
 use crate::channel::Inbound;
 use crate::config::{Attach, Config};
+use crate::router::{untag, Snapshot};
 use crate::rpc::{message_text, MAIN_SESSION};
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
@@ -18,7 +20,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 /// The inbox channel name for messages typed in an attached client.
 pub const CHANNEL: &str = "tui";
@@ -58,6 +60,7 @@ pub async fn serve(
     cfg: &Config,
     inbound: mpsc::Sender<Inbound>,
     router: mpsc::Sender<AttachRequest>,
+    snap: watch::Receiver<Snapshot>,
 ) -> anyhow::Result<()> {
     let Some(a) = &cfg.attach else {
         return std::future::pending().await;
@@ -72,11 +75,12 @@ pub async fn serve(
             Ok((stream, _)) => {
                 let conn = Conn {
                     token: token.clone(),
-                    model: cfg.model.clone(),
+                    snap: snap.clone(),
                     inbound: inbound.clone(),
                     router: router.clone(),
                     authed: false,
                     live: None,
+                    zephyr: false,
                 };
                 tokio::spawn(conn.run(stream));
             }
@@ -87,11 +91,13 @@ pub async fn serve(
 
 struct Conn {
     token: Arc<str>,
-    model: Option<String>,
+    snap: watch::Receiver<Snapshot>,
     inbound: mpsc::Sender<Inbound>,
     router: mpsc::Sender<AttachRequest>,
     authed: bool,
     live: Option<broadcast::Receiver<Value>>,
+    /// Subscribed with `zephyr.subscribe`: raw events plus `zephyr_status`.
+    zephyr: bool,
 }
 
 /// What to do after a request: write these frames, then maybe hang up.
@@ -109,12 +115,17 @@ impl Conn {
                     None => return, // client gone; the run carries on
                 },
                 ev = next_live(&mut self.live) => match ev {
+                    Ok(ev) if self.zephyr => (raw(ev).into_iter().map(event).collect(), false),
                     Ok(ev) => (live(ev), false),
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         eprintln!("zephyr: attach client lagged, {n} events skipped");
                         (vec![], false)
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
+                },
+                changed = self.snap.changed(), if self.zephyr => match changed {
+                    Ok(()) => (vec![self.status()], false),
+                    Err(_) => return, // the router is gone
                 },
             };
             for frame in frames {
@@ -167,6 +178,11 @@ impl Conn {
                 false,
             ),
             "subscribe" => self.subscribe(id).await,
+            "zephyr.subscribe" => self.zephyr_subscribe(id).await,
+            "zephyr.hello" => {
+                let snap = serde_json::to_value(&*self.snap.borrow()).unwrap_or_default();
+                (vec![ok(id, snap)], false)
+            }
             "send" => self.send(id, &params["command"]).await,
             _ => (vec![error(id, -32601, "method not found")], false),
         }
@@ -174,14 +190,10 @@ impl Conn {
 
     /// Replays the session from `get_messages`, then streams live events.
     async fn subscribe(&mut self, id: &Value) -> Reply {
-        let (tx, rx) = oneshot::channel();
-        if self.router.send(tx).await.is_err() {
-            return (vec![error(id, -32000, "gateway is shutting down")], true);
-        }
-        let Ok((history, live)) = rx.await else {
-            return (vec![error(id, -32000, "gateway is shutting down")], true);
+        let history = match self.history().await {
+            Ok(history) => history,
+            Err(e) => return (vec![error(id, -32000, e)], true),
         };
-        self.live = Some(live);
         let result =
             json!({"subscriptionId": SUB_ID, "sessionId": MAIN_SESSION, "status": "subscribed"});
         let mut frames = vec![ok(id, result), event(json!({"type": "ready"}))];
@@ -191,14 +203,59 @@ impl Conn {
         (frames, false)
     }
 
+    /// Like `subscribe`, but the history is raw and comes in the result, and live events are
+    /// passed on unquoted, with `zephyr_status` on every snapshot change.
+    async fn zephyr_subscribe(&mut self, id: &Value) -> Reply {
+        let mut history = match self.history().await {
+            Ok(history) => history,
+            Err(e) => return (vec![error(id, -32000, e)], true),
+        };
+        self.zephyr = true;
+        // `[]` when the router could not read the history.
+        let mut messages = (history.get_mut("messages").map(Value::take)).unwrap_or(json!([]));
+        messages
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+            .for_each(annotate);
+        let result = json!({"subscriptionId": SUB_ID, "sessionId": MAIN_SESSION, "status": "subscribed", "messages": messages});
+        let frames = vec![
+            ok(id, result),
+            event(json!({"type": "ready"})),
+            self.status(),
+        ];
+        (frames, false)
+    }
+
+    /// The `get_messages` result, and the live stream from that point on.
+    async fn history(&mut self) -> Result<Value, &'static str> {
+        let (tx, rx) = oneshot::channel();
+        self.router
+            .send(tx)
+            .await
+            .map_err(|_| "gateway is shutting down")?;
+        let (history, live) = rx.await.map_err(|_| "gateway is shutting down")?;
+        self.live = Some(live);
+        Ok(history)
+    }
+
+    /// A `zephyr_status` event with the current snapshot, marked seen.
+    fn status(&mut self) -> Value {
+        let snap = serde_json::to_value(&*self.snap.borrow_and_update()).unwrap_or_default();
+        event(json!({"type": "zephyr_status", "snapshot": snap}))
+    }
+
     /// Maps the client's `--mode rpc` command onto the gateway.
     async fn send(&mut self, id: &Value, cmd: &Value) -> Reply {
         let text = match cmd["type"].as_str() {
             Some("prompt") => cmd["content"].as_str().unwrap_or_default(),
             Some("abort") => "/stop",
             Some("get_state") => {
-                let state =
-                    json!({"sessionId": MAIN_SESSION, "model": self.model, "activeTools": []});
+                let (model, thinking) = {
+                    let s = self.snap.borrow();
+                    (s.model.clone(), s.thinking.clone())
+                };
+                let state = json!({"sessionId": MAIN_SESSION, "model": model, "thinkingLevel": thinking, "activeTools": []});
                 return (
                     vec![ok(id, json!({})), event(response(cmd, Ok(state)))],
                     false,
@@ -255,13 +312,46 @@ fn live(ev: Value) -> Vec<Value> {
     shown(m).into_iter().map(event).collect()
 }
 
+/// A live child event for a `zephyr.subscribe` client: unchanged but annotated, minus the
+/// answers to the router's own commands.
+fn raw(mut ev: Value) -> Option<Value> {
+    if ev["type"] == "response" {
+        return None;
+    }
+    if let Some(m) = ev.get_mut("message") {
+        annotate(m);
+    }
+    Some(ev)
+}
+
+/// Adds `origin: {channel, id}` (null when untagged) and the untagged `text` to a user message.
+fn annotate(m: &mut Value) {
+    if role(m) != Some("user") {
+        return;
+    }
+    let text = message_text(m);
+    let (origin, body) = match untag(&text) {
+        Some((channel, id, body)) => (json!({"channel": channel, "id": id}), body),
+        None => (Value::Null, text.as_str()),
+    };
+    let body = body.to_string();
+    if let Some(m) = m.as_object_mut() {
+        m.insert("origin".into(), origin);
+        m.insert("text".into(), body.into());
+    }
+}
+
 /// `message_start`/`message_end` for a session message as the stock client draws it. It
-/// renders assistant messages only, so a user turn becomes a quoted assistant block.
+/// renders assistant messages only, so a user turn becomes an assistant block `**channel** · text`.
 fn shown(m: &Value) -> Vec<Value> {
     let m = match role(m) {
         Some("assistant") => m.clone(),
         Some("user") => {
-            let quoted = format!("> {}", message_text(m));
+            let text = message_text(m);
+            let quoted = match untag(&text) {
+                Some((channel, _, body)) => format!("**{channel}** · {body}"),
+                None => format!("> {text}"),
+            };
             json!({"role": "assistant", "content": [{"type": "text", "text": quoted}]})
         }
         _ => return vec![],

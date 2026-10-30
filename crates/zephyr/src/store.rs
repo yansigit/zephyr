@@ -25,6 +25,8 @@ pub struct OutboxRow {
     pub client_id: String,
     pub text: String,
     pub created_at: i64,
+    /// The inbox text this answers; `None` for a notice or a job's output.
+    pub prompt: Option<String>,
 }
 
 /// The platform dedupe key for a reply: at most 20 ASCII chars, so Discord's 25-char
@@ -245,8 +247,9 @@ impl Store {
 
     pub fn pending_outbox(&self) -> rusqlite::Result<Vec<OutboxRow>> {
         let mut stmt = self.db.prepare(
-            "SELECT id, channel, recipient, client_id, text, created_at FROM outbox
-             WHERE status = 'pending' ORDER BY id",
+            "SELECT id, channel, recipient, client_id, text, created_at,
+                    (SELECT text FROM inbox WHERE inbox.id = outbox.inbox_id)
+             FROM outbox WHERE status = 'pending' ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(OutboxRow {
@@ -256,9 +259,37 @@ impl Store {
                 client_id: r.get(3)?,
                 text: r.get(4)?,
                 created_at: r.get(5)?,
+                prompt: r.get(6)?,
             })
         })?;
         rows.collect()
+    }
+
+    /// `(channel, text, created_at)` of each inbox row waiting to be dispatched, oldest first.
+    pub fn waiting(&self) -> rusqlite::Result<Vec<(String, String, i64)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT channel, text, created_at FROM inbox WHERE status = 'new' ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect()
+    }
+
+    pub fn sender(&self, inbox_id: i64) -> rusqlite::Result<Option<String>> {
+        self.db
+            .query_row(
+                "SELECT sender FROM inbox WHERE id = ?1",
+                params![inbox_id],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    pub fn outbox_failed(&self) -> rusqlite::Result<i64> {
+        self.db.query_row(
+            "SELECT count(*) FROM outbox WHERE status = 'failed'",
+            [],
+            |r| r.get(0),
+        )
     }
 
     pub fn set_outbox_status(&self, id: i64, status: &str) -> rusqlite::Result<()> {

@@ -43,6 +43,11 @@ struct Gateway {
 }
 
 fn start(name: &str) -> Gateway {
+    start_with(name, "")
+}
+
+/// `extra` is appended to the config, after `[attach]`.
+fn start_with(name: &str, extra: &str) -> Gateway {
     let home = std::env::temp_dir().join(format!(
         "zephyr-attach-{name}-{}-{}",
         std::process::id(),
@@ -58,7 +63,7 @@ fn start(name: &str) -> Gateway {
         .unwrap()
         .port();
     let cfg: Config = toml::from_str(&format!(
-        "rpi = {:?}\nhome = {:?}\nagent_dir = {:?}\n[owners]\nchat = [\"owner\"]\n[attach]\nport = {port}\ntoken_file = {token:?}\n",
+        "rpi = {:?}\nhome = {:?}\nagent_dir = {:?}\n[owners]\nchat = [\"owner\"]\n[attach]\nport = {port}\ntoken_file = {token:?}\n{extra}",
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-rpi.py"),
         home,
         home.join("agent"),
@@ -244,8 +249,8 @@ async fn history_replays_then_live_events_stream() {
     assert_eq!(
         replay,
         [
-            pair("message_start", "> [chat #1] earlier"),
-            pair("message_end", "> [chat #1] earlier"),
+            pair("message_start", "**chat** · earlier"),
+            pair("message_end", "**chat** · earlier"),
             pair("message_start", "echo: [chat #1] earlier"),
             pair("message_end", "echo: [chat #1] earlier"),
         ]
@@ -266,7 +271,7 @@ async fn history_replays_then_live_events_stream() {
     gw.say("m2", "from discord").await;
     assert_eq!(
         text(&c.event_of("message_end").await),
-        "> [chat #3] from discord"
+        "**chat** · from discord"
     );
     assert_eq!(
         text(&c.event_of("message_end").await),
@@ -338,6 +343,147 @@ async fn detaching_never_stops_the_run() {
         seen.push(text(&c.event().await));
     }
     assert_eq!(seen[3], "echo: [tui #1] long job");
+    gw.shutdown().await;
+}
+
+const POOL: &str = "[[account]]\nname = \"a\"\nmodel = \"fake/m1\"\n";
+
+#[tokio::test]
+async fn stock_get_state_reports_the_live_account_model() {
+    let gw = start_with("state", POOL);
+    gw.say("m1", "earlier").await;
+    wait(|| gw.count("outbox", "sent") == 1).await; // the child is up and read its state
+    let mut c = Client::attach(gw.port).await;
+    c.send(json!({"type": "get_state", "id": 1})).await;
+    let state = c.event_of("response").await;
+    assert_eq!(state["result"]["model"], "fake/m1", "{state}");
+    assert_eq!(state["result"]["thinkingLevel"], "medium", "{state}");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn zephyr_hello_returns_the_snapshot() {
+    let gw = start_with("hello", POOL);
+    let mut c = Client::connect(gw.port).await;
+    let early = c.call("zephyr.hello", json!({})).await;
+    assert_eq!(early["error"]["code"], -32001, "{early}");
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    gw.say("m1", "earlier").await;
+    wait(|| gw.count("outbox", "sent") == 1).await;
+    let snap = c.call("zephyr.hello", json!({})).await["result"].clone();
+    assert_eq!(
+        snap,
+        json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "session": "main",
+            "account": "a",
+            "model": "fake/m1",
+            "thinking": "medium",
+            "paused": null,
+            "channels": [
+                {"name": "chat", "state": "connected"},
+                {"name": "discord", "state": "off"},
+                {"name": "imessage", "state": "off"},
+            ],
+            "spend": {"tokens": 0, "cost": 0.0, "daily_tokens_limit": null, "daily_cost_limit": null},
+            "queue": [],
+            "failed_replies": 0,
+            "run": {"busy": false, "since_unix_ms": null, "origin": null, "current_tool": null, "tools_done": 0},
+        })
+    );
+
+    // A paused gateway holds new rows in the queue, previewed without the tag.
+    gw.say("m2", "/pause").await;
+    gw.say("m3", &"long ".repeat(20)).await;
+    wait(|| gw.count("inbox", "new") == 1).await;
+    let snap = c.call("zephyr.hello", json!({})).await["result"].clone();
+    assert_eq!(snap["paused"], "user");
+    let queue = snap["queue"].as_array().unwrap();
+    assert_eq!(queue.len(), 1, "{snap}");
+    assert_eq!(queue[0]["channel"], "chat");
+    assert_eq!(queue[0]["preview"], format!("{}…", "long ".repeat(12)));
+    assert!(queue[0]["since_unix"].as_i64().unwrap() > 0);
+    gw.shutdown().await;
+}
+
+/// The next `zephyr_status` snapshot that `done` accepts.
+async fn status_until(c: &mut Client, done: impl Fn(&Value) -> bool) -> Value {
+    loop {
+        let ev = c.event_of("zephyr_status").await;
+        if done(&ev["snapshot"]) {
+            return ev["snapshot"].clone();
+        }
+    }
+}
+
+#[tokio::test]
+async fn zephyr_subscribe_replays_raw_history_and_streams_status_and_replies() {
+    let gw = start("zsub");
+    gw.say("m1", "[tool] earlier").await;
+    wait(|| gw.count("outbox", "sent") == 1).await;
+
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    let sub = c.call("zephyr.subscribe", json!({})).await;
+    assert_eq!(sub["result"]["subscriptionId"], 1, "{sub}");
+    assert_eq!(sub["result"]["status"], "subscribed", "{sub}");
+    // Raw messages: the tool call and its result are kept; user turns carry their origin.
+    let messages = sub["result"]["messages"].as_array().unwrap();
+    let roles: Vec<_> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["user", "assistant", "toolResult", "assistant"]);
+    assert_eq!(messages[0]["origin"], json!({"channel": "chat", "id": 1}));
+    assert_eq!(messages[0]["text"], "[tool] earlier");
+    assert_eq!(messages[0]["content"], "[chat #1] [tool] earlier");
+    assert_eq!(messages[1]["content"][0]["type"], "toolCall");
+    assert!(messages[1].get("origin").is_none());
+    assert_eq!(c.event().await["type"], "ready");
+    let first = c.event_of("zephyr_status").await;
+    assert_eq!(first["snapshot"]["session"], "main");
+
+    // A live run: its own user turn comes back annotated, and the run state follows the tool.
+    // The tool runs until `tool_wait` goes, so its state can't be coalesced away.
+    std::fs::write(gw.home.join("tool_wait"), "").unwrap();
+    c.send(json!({"type": "prompt", "content": "[tool] now", "id": 1}))
+        .await;
+    // Either can come first: the status is whatever the router had seen by then.
+    let (mut user, mut running) = (Value::Null, Value::Null);
+    while user.is_null() || running.is_null() {
+        let ev = c.event().await;
+        if ev["type"] == "message_end" && ev["message"]["role"] == "user" {
+            user = ev;
+        } else if ev["type"] == "zephyr_status" && ev["snapshot"]["run"]["current_tool"] == "bash" {
+            running = ev["snapshot"].clone();
+        }
+    }
+    assert_eq!(
+        user["message"]["origin"],
+        json!({"channel": "tui", "id": 2})
+    );
+    assert_eq!(user["message"]["text"], "[tool] now");
+    assert_eq!(running["run"]["busy"], true);
+    assert_eq!(
+        running["run"]["origin"],
+        json!({"channel": "tui", "id": 2, "sender": "token"})
+    );
+    assert!(running["run"]["since_unix_ms"].as_i64().unwrap() > 0);
+    std::fs::remove_file(gw.home.join("tool_wait")).unwrap();
+    let done = status_until(&mut c, |s| s["run"]["tools_done"] == 1).await;
+    assert_eq!(done["run"]["current_tool"], Value::Null);
+    status_until(&mut c, |s| s["run"]["busy"] == false).await;
+
+    // The agent's reply is not repeated; a command's reply is.
+    wait(|| gw.count("outbox", "sent") == 2).await;
+    c.send(json!({"type": "prompt", "content": "/status", "id": 2}))
+        .await;
+    let reply = c.event_of("zephyr_reply").await;
+    assert_eq!(reply["command"], "/status", "{reply}");
+    assert!(
+        reply["text"].as_str().unwrap().starts_with("agent: on "),
+        "{reply}"
+    );
     gw.shutdown().await;
 }
 
