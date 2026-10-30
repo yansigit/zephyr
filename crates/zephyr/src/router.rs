@@ -289,64 +289,37 @@ impl<'a> Router<'a> {
             log(self.store.set_status(id, "dropped").map_err(Into::into));
             return;
         }
-        let memory = crate::memory::command(&self.cfg.home, self.cfg.state_dir(), m.text.trim());
-        if let Some((reply, rules_changed)) = memory {
-            let row = InboxRow {
-                id,
-                channel: m.channel,
-                sender: m.sender,
-                text: m.text,
-                tries: 0,
-            };
-            log(self.store.reply(&row, &reply, "done").map_err(Into::into));
+        let text = m.text.trim();
+        let reply = if let Some((reply, rules_changed)) =
+            crate::memory::command(&self.cfg.home, self.cfg.state_dir(), text)
+        {
             // rpi reads AGENTS.md once, at start: a fresh child on the same session loads the rules.
-            if rules_changed {
-                self.restart = true;
-                self.restart_if_idle().await;
-            }
-            return;
-        }
-        if let Some(reply) = crate::scheduler::command(&mut self.store, &self.cfg, &m) {
-            let row = InboxRow {
-                id,
-                channel: m.channel,
-                sender: m.sender,
-                text: m.text,
-                tries: 0,
-            };
-            log(self.store.reply(&row, &reply, "done").map_err(Into::into));
+            self.restart |= rules_changed;
+            reply
+        } else if let Some(reply) = crate::scheduler::command(&mut self.store, &self.cfg, &m) {
             self.jobs.runs.notify_one();
-            return;
+            reply
+        } else if let Some(reply) = self.command(text).await {
+            reply
+        } else if matches!(text, "/stop" | "/pause" | "/resume") {
+            self.control(text).await.into()
+        } else {
+            return log(self.dispatch_new().await);
+        };
+        let resume = text == "/resume";
+        let row = InboxRow {
+            id,
+            channel: m.channel,
+            sender: m.sender,
+            text: m.text,
+            tries: 0,
+        };
+        log(self.store.reply(&row, &reply, "done").map_err(Into::into));
+        self.restart_if_idle().await;
+        // A run in progress settles first; its settle reconciles and dispatches.
+        if resume && !self.busy {
+            log(self.reconcile(None, false).await);
         }
-        if let Some(reply) = self.command(m.text.trim()).await {
-            let row = InboxRow {
-                id,
-                channel: m.channel,
-                sender: m.sender,
-                text: m.text,
-                tries: 0,
-            };
-            log(self.store.reply(&row, &reply, "done").map_err(Into::into));
-            return;
-        }
-        let cmd = m.text.trim().to_string();
-        if matches!(cmd.as_str(), "/stop" | "/pause" | "/resume") {
-            let reply = self.control(&cmd).await;
-            let row = InboxRow {
-                id,
-                channel: m.channel,
-                sender: m.sender,
-                text: m.text,
-                tries: 0,
-            };
-            log(self.store.reply(&row, reply, "done").map_err(Into::into));
-            // A run in progress settles first; its settle reconciles and dispatches.
-            if cmd == "/resume" && !self.busy {
-                log(self.reconcile(None, false).await);
-            }
-            return;
-        }
-        log(self.dispatch_new().await);
     }
 
     /// The kill switch (DESIGN §4.4), run outside the queue. Returns the reply text.
