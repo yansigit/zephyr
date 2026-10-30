@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 /// The inbox channel name for messages typed in an attached client.
 pub const CHANNEL: &str = "tui";
@@ -58,6 +58,7 @@ pub async fn serve(
     cfg: &Config,
     inbound: mpsc::Sender<Inbound>,
     router: mpsc::Sender<AttachRequest>,
+    model: watch::Receiver<Option<String>>,
 ) -> anyhow::Result<()> {
     let Some(a) = &cfg.attach else {
         return std::future::pending().await;
@@ -72,7 +73,7 @@ pub async fn serve(
             Ok((stream, _)) => {
                 let conn = Conn {
                     token: token.clone(),
-                    model: cfg.model.clone(),
+                    model: model.clone(),
                     inbound: inbound.clone(),
                     router: router.clone(),
                     authed: false,
@@ -87,7 +88,8 @@ pub async fn serve(
 
 struct Conn {
     token: Arc<str>,
-    model: Option<String>,
+    /// The model the agent is on now (the router keeps it current).
+    model: watch::Receiver<Option<String>>,
     inbound: mpsc::Sender<Inbound>,
     router: mpsc::Sender<AttachRequest>,
     authed: bool,
@@ -197,8 +199,7 @@ impl Conn {
             Some("prompt") => cmd["content"].as_str().unwrap_or_default(),
             Some("abort") => "/stop",
             Some("get_state") => {
-                let state =
-                    json!({"sessionId": MAIN_SESSION, "model": self.model, "activeTools": []});
+                let state = json!({"sessionId": MAIN_SESSION, "model": *self.model.borrow(), "activeTools": []});
                 return (
                     vec![ok(id, json!({})), event(response(cmd, Ok(state)))],
                     false,

@@ -57,9 +57,11 @@ pub async fn run<C: Channel>(
     let jobs = crate::scheduler::Wake::default();
     let shared = Arc::new(cfg.clone());
     let (cfg_tx, cfg_rx) = watch::channel(shared.clone());
+    let (model_tx, model_rx) = watch::channel(cfg.model.clone());
     let mut router = Router {
         cfg: shared,
         cfg_tx,
+        model_tx,
         edits: edits(cfg),
         secrets: crate::dotenv::read(&cfg.secrets_path()).unwrap_or_default(),
         pending_model: None,
@@ -84,7 +86,7 @@ pub async fn run<C: Channel>(
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
         r = runs => r.map(|_| Exit::Shutdown),
-        r = crate::attach::serve(cfg, tx, attach_tx) => r.map(|()| Exit::Shutdown),
+        r = crate::attach::serve(cfg, tx, attach_tx, model_rx) => r.map(|()| Exit::Shutdown),
         r = crate::scheduler::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),
         r = router.main(rx, channels, shutdown) => r,
     }
@@ -102,6 +104,8 @@ struct Router<'a> {
     /// The live config; `reload` swaps it and sends it to the scheduler.
     cfg: Arc<Config>,
     cfg_tx: watch::Sender<Arc<Config>>,
+    /// The model the agent is on, for attached clients' `get_state`.
+    model_tx: watch::Sender<Option<String>>,
     /// Config file mtimes as of the last reload, so a hand edit is applied once.
     edits: Edits,
     /// `secrets.env` as this process loaded it; a change needs a re-exec.
@@ -182,6 +186,18 @@ impl<'a> Router<'a> {
                 }
             }
             self.flush(channels).await;
+            let model = self
+                .account
+                .as_ref()
+                .map(|a| &a.model)
+                .or(self.cfg.model.as_ref());
+            self.model_tx.send_if_modified(|m| {
+                if m.as_ref() == model {
+                    return false;
+                }
+                *m = model.cloned();
+                true
+            });
             if self.reexec && !self.busy && !self.jobs.running.load(Ordering::SeqCst) {
                 eprintln!("zephyr: restarting itself to apply the new settings");
                 exit = Exit::Reexec;

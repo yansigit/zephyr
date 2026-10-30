@@ -86,6 +86,7 @@ Upstream analysis (`research/pi-rust-integration.md` §7) compared three options
   - `start_session` returns `main`.
   - `subscribe` replays history from `get_messages`, then streams live events.
   - The client's `stop_session` only detaches.
+  - `get_state` reports the model the agent is on now (the active account's, or `model`), so the client's footer follows `/model` and failover.
   - What the router writes itself for `tui` (command replies, notices such as the outbound list and memory diffs, job output) has no agent event, so it is sent to attached clients as an assistant message. With no client attached, notices and job output wait in the outbox for the next attach.
   - Unverified: these details come from reading the code, not from a test run. Fallback: a ~150-line `rpi-gateway chat` line client over the same socket.
   - A follow-up upstream PR could add `--connect --session <id>`.
