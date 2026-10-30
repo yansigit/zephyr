@@ -23,9 +23,11 @@ pub struct Palette {
     pub md_heading: Color,
     pub md_code: Color,
     pub md_link: Color,
-    /// The header's cloud and the eyes drawn on it: a graphic, so 3:1 against the background.
+    /// The header's cloud and the face drawn on it: a graphic, so 3:1 against the background.
     pub cloud: Color,
     pub cloud_eyes: Color,
+    /// The cloud's cheeks: decorative, so only kept apart from the cloud.
+    pub cloud_blush: Color,
     /// Bubble borders and labels per channel; the terminal and `chat` use `accent`.
     pub discord: Color,
     pub imessage: Color,
@@ -55,6 +57,7 @@ pub const DARK: Palette = Palette {
     md_link: rgb(0x5EC8E5),
     cloud: rgb(0xDCEAF2),
     cloud_eyes: rgb(0x14202B),
+    cloud_blush: rgb(0xF28AA5),
     discord: rgb(0xB4A6FF),
     imessage: rgb(0x6CB6FF),
     other: rgb(0xD9B38C),
@@ -77,7 +80,8 @@ pub const LIGHT: Palette = Palette {
     md_code: rgb(0x8A4B00),
     md_link: rgb(0x0B6F91),
     cloud: rgb(0x4F93B5),
-    cloud_eyes: rgb(0xFFFFFF),
+    cloud_eyes: rgb(0x14202B),
+    cloud_blush: rgb(0xFFC2D1),
     discord: rgb(0x5B45C9),
     imessage: rgb(0x0B62B8),
     other: rgb(0x7A5230),
@@ -101,6 +105,7 @@ pub const PLAIN: Palette = Palette {
     md_link: Color::Default,
     cloud: Color::Default,
     cloud_eyes: Color::Default,
+    cloud_blush: Color::Default,
     discord: Color::Default,
     imessage: Color::Default,
     other: Color::Default,
@@ -299,13 +304,15 @@ mod tests {
             // User bubbles sit on the surface colour.
             let ratio = contrast(p.text, p.surface);
             assert!(ratio >= 4.5, "{name} text on surface: {ratio:.2}:1");
-            // The mascot is a graphic: 3:1 for the cloud on the background and the eyes on it.
+            // The mascot is a graphic: 3:1 for the cloud on the background and the face on it.
             for (what, ratio) in [
                 ("cloud", contrast(p.cloud, bg)),
                 ("eyes", contrast(p.cloud_eyes, p.cloud)),
             ] {
                 assert!(ratio >= 3.0, "{name} {what}: {ratio:.2}:1");
             }
+            let ratio = contrast(p.cloud_blush, p.cloud);
+            assert!(ratio >= 1.5, "{name} blush: {ratio:.2}:1");
         }
     }
 

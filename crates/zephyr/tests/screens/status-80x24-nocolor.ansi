@@ -1,13 +1,13 @@
-  ▄▟██▙▗▄▖                                                               v0.1.0
-▗  ●   ●  ▙≈    [1mzephyr[0m · main · claude-code-1 › claude-opus-5-5
-▝█████████▛     discord ●  imessage ●  chat ○      today 41.2k tok · $0.38 / $5
+ ▄▟███▖▄▄▖      [1mzephyr[0m v0.1.0
+▟█[7m•[0m█[7m◡[0m█[7m•[0m████∼    main · claude-code-1 › claude-opus-5-5
+▀█████████▀     discord ●  imessage ●  chat ○      today 41.2k tok · $0.38 / $5
  ──────────────────────────────────────────────────────────────────────────────
+   ▸ [1mschedule[0m  add "renew domain" fri 09:00                              ✓ 0.2s
 
    ╭─ [1myou[0m · 14:05 ────────────────────────────────────────────────────────────╮
    │ what's in ~/Projects/zephyr/deploy?                                      │
    ╰──────────────────────────────────────────────────────────────────────────╯
 
-   ▸ [1mbash[0m  ls ~/Projects/zephyr/deploy                                   ✓ 0.1s
  ╭─[1m status [0m───────────────────────────────────────────────────────────────────╮
  │ agent     claude-code-1 › claude-opus-5-5 · thinking medium                │
  │           idle                                                             │

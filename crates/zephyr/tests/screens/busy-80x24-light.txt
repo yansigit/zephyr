@@ -1,6 +1,6 @@
-  ▄▟██▙▗▄▖                                                               v0.1.0
-▗   ●   ● ▙ ≈   zephyr · main · claude-code-1 › claude-opus-5-5
-▝█████████▛ ≈≋  discord ●  imessage ●  chat ○      today 41.2k tok · $0.38 / $5
+ ▄▟███▖▄▄▖      zephyr v0.1.0
+▟██•█o█•███≋≈∼  main · claude-code-1 › claude-opus-5-5
+▀█▀█████▀█▀     discord ●  imessage ●  chat ○      today 41.2k tok · $0.38 / $5
  ──────────────────────────────────────────────────────────────────────────────
    │ agent: claude-code-1 on claude-code/claude-opus-5-5                      │
    │ channels: discord connected, imessage connected                          │
@@ -16,7 +16,7 @@
    ╰ ▸ read  /var/log/backup.log                                         ✗ 0.0s
        EACCES: permission denied, open '/var/log/backup.log'
 
- ≋ running bash for imessage · 12s · 1 tool                         esc to stop
+ ≈ running bash for imessage · 12s · 1 tool                         esc to stop
  queued (1) · discord: “are you around later?”
  ╭────────────────────────────────────────────────────────────────────────────╮
  │ Message zephyr                                                             │
