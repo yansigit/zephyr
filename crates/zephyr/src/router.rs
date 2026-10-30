@@ -390,30 +390,18 @@ impl<'a> Router<'a> {
         ev
     }
 
-    /// Keeps `Snapshot.run` in step with the child's run events. Cheap: no store reads
-    /// except one per user message.
+    /// Keeps `Snapshot.run` in step with the child's run events. The origin comes from
+    /// `user_turn`, set before the run starts.
     fn track(&self, ev: &Value) {
-        let m = &ev["message"];
         match ev["type"].as_str().unwrap_or_default() {
             "agent_start" => update(&self.snap, |s| {
                 s.run = Run {
                     busy: true,
                     since_unix_ms: Some(crate::unix_millis() as i64),
+                    origin: s.run.origin.take(),
                     ..Run::default()
                 }
             }),
-            "message_start" if m["role"] == "user" || m["kind"] == "user" => {
-                let text = message_text(m);
-                let origin = untag(&text).and_then(|(channel, id, _)| {
-                    let sender = self.store.sender(id).ok().flatten()?;
-                    Some(Origin {
-                        channel: channel.into(),
-                        id,
-                        sender,
-                    })
-                });
-                update(&self.snap, |s| s.run.origin = origin)
-            }
             "tool_execution_start" => update(&self.snap, |s| {
                 s.run.current_tool = ev["toolName"].as_str().map(Into::into)
             }),
@@ -714,13 +702,33 @@ impl<'a> Router<'a> {
             if self.busy {
                 self.call(json!({"type": "queue_message", "message": text}))
                     .await?;
+                self.user_turn(&row, &text, false);
             } else {
                 self.call(json!({"type": "prompt", "message": text}))
                     .await?;
                 self.busy = true;
+                self.user_turn(&row, &text, true);
             }
         }
         Ok(())
+    }
+
+    /// rpi 0.12 sends no message events for a prompt it accepts, so the router reports the user
+    /// turn itself: on the tap for attached clients and, when it starts a run, as its origin.
+    fn user_turn(&self, row: &InboxRow, text: &str, starts_run: bool) {
+        let m = json!({"role": "user", "kind": "user", "content": [{"type": "text", "text": text}],
+                       "timestamp": crate::unix_millis() as i64});
+        for kind in ["message_start", "message_end"] {
+            let _ = self.tap.send(json!({"type": kind, "message": m}));
+        }
+        if starts_run {
+            let origin = Origin {
+                channel: row.channel.clone(),
+                id: row.id,
+                sender: row.sender.clone(),
+            };
+            update(&self.snap, |s| s.run.origin = Some(origin));
+        }
     }
 
     async fn settled(&mut self, ev: &Value) {

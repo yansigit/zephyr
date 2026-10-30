@@ -274,16 +274,6 @@ impl Store {
         rows.collect()
     }
 
-    pub fn sender(&self, inbox_id: i64) -> rusqlite::Result<Option<String>> {
-        self.db
-            .query_row(
-                "SELECT sender FROM inbox WHERE id = ?1",
-                params![inbox_id],
-                |r| r.get(0),
-            )
-            .optional()
-    }
-
     pub fn outbox_failed(&self) -> rusqlite::Result<i64> {
         self.db.query_row(
             "SELECT count(*) FROM outbox WHERE status = 'failed'",

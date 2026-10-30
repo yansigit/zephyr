@@ -159,8 +159,8 @@ for line in sys.stdin:
         s["messages"].append(user(cmd["message"])); save(s)
         if "WRITE_MEMORY" in cmd["message"]:
             open(os.path.join(home, "memory", "MEMORY.md"), "a").write("remembered: " + cmd["message"] + "\n")
-        out({"type": "message_start", "message": user(cmd["message"])})
-        out({"type": "message_end", "message": user(cmd["message"])})
+        # As rpi 0.12: the prompt is committed, but no message events carry it.
+        out({"type": "session_entry_committed", "entryId": "u", "entryType": "message", "customType": None, "lane": "main"})
         if os.path.exists(os.path.join(home, "slow")):
             time.sleep(float(open(os.path.join(home, "slow")).read() or 1))
         if os.path.exists(os.path.join(home, "hang")):
