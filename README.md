@@ -37,7 +37,7 @@ zephyr login openai-codex --account codex-main
 | `zephyr status` / `logs [-f]` / `doctor [--fix]` | Container and daemon state, logs, checks (and repairs) |
 | `zephyr login <provider> [--account NAME]` | Sign in an account, then make a small test call (`--no-verify` skips it) |
 | `zephyr accounts [list \| order NAME.. \| remove NAME]` | The failover pool |
-| `zephyr model [PROVIDER/MODEL]` | The default model; with no argument, pick from `rpi --list-models` |
+| `zephyr model [--account NAME] [PROVIDER/MODEL]` | An account's model (or the default without accounts); with no model, pick from `rpi --list-models` |
 | `zephyr channel add discord\|imessage` | Channel settings; secrets are asked for hidden |
 | `zephyr config get\|set KEY [VALUE]` | Edit `zephyr.toml` (comments are kept; invalid keys are refused) |
 | `zephyr chat` / `attach` | Line chat, or the stock rpi TUI attached to the live session |

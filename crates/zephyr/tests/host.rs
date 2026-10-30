@@ -401,23 +401,37 @@ fn accounts_model_and_config_edit_the_toml() {
         cfg.find("name = \"b\"").unwrap() < cfg.find("name = \"a\"").unwrap(),
         "{cfg}"
     );
+    // Several accounts: `model` needs --account and a model of that account's provider.
+    assert!(!env
+        .zephyr(&["model", "openai-codex/gpt-5.4"])
+        .status
+        .success());
+    assert!(!env
+        .zephyr(&["model", "--account", "a", "openai-codex/gpt-5.4"])
+        .status
+        .success());
+    env.ok(&["model", "--account", "b", "openai-codex/gpt-5.4"]);
+    assert!(env.config().contains("model = \"openai-codex/gpt-5.4\""));
+
     env.ok(&["accounts", "remove", "a"]);
     assert!(!env.data().join("accounts/a").exists());
     assert!(!env.config().contains("name = \"a\""));
 
     // One account left: `model` sets it and the default.
-    env.ok(&["model", "openai-codex/gpt-5.4"]);
+    env.ok(&["model", "openai-codex/gpt-5.5"]);
     let cfg: toml::Value = toml::from_str(&env.config()).unwrap();
-    assert_eq!(cfg["model"].as_str(), Some("openai-codex/gpt-5.4"));
+    assert_eq!(cfg["model"].as_str(), Some("openai-codex/gpt-5.5"));
     assert_eq!(
         cfg["account"][0]["model"].as_str(),
-        Some("openai-codex/gpt-5.4")
+        Some("openai-codex/gpt-5.5")
     );
+    // The picker offers only the account's provider: the first codex model, not the first listed.
+    env.ok(&["model", "openai-codex/gpt-5.4"]);
     env.ok(&["model"]);
-    assert!(
-        env.config()
-            .contains("model = \"anthropic/claude-sonnet-5\""),
-        "first listed model"
+    let cfg: toml::Value = toml::from_str(&env.config()).unwrap();
+    assert_eq!(
+        cfg["account"][0]["model"].as_str(),
+        Some("openai-codex/gpt-5.5")
     );
     find(
         &env.calls(),

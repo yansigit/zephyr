@@ -15,7 +15,7 @@ pub const USAGE: &str = "usage: zephyr <command>
   up [--build] | down | restart | logs [-f] | status | upgrade
   login <provider> [--account NAME] [--model P/M] [--no-verify]
   accounts [list | order NAME.. | remove NAME]
-  model [PROVIDER/MODEL]
+  model [--account NAME] [PROVIDER/MODEL]
   channel add discord|imessage
   config get|set KEY [VALUE]
   chat | attach | pause | resume

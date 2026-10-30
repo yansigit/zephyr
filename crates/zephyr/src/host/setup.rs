@@ -429,26 +429,56 @@ pub fn accounts(h: &Host, a: Args) -> anyhow::Result<()> {
 }
 
 /// Sets the default model, and the only account's model when there is exactly one.
-pub fn model(h: &Host, a: Args) -> anyhow::Result<()> {
+pub fn model(h: &Host, mut a: Args) -> anyhow::Result<()> {
+    let account = a.value("--account")?;
     let rest = a.rest()?;
     let mut doc = h.data.load()?;
+    let accounts = conf::accounts(&doc);
+    // In pool mode each account has its own model; the top-level one is unused.
+    let account = match (account, &accounts[..]) {
+        (Some(name), _) => Some(
+            accounts
+                .iter()
+                .find(|(n, _)| *n == name)
+                .with_context(|| format!("no account {name}; see `zephyr accounts list`"))?
+                .clone(),
+        ),
+        (None, [one]) => Some(one.clone()),
+        (None, []) => None,
+        (None, _) => bail!("several accounts: zephyr model --account NAME [PROVIDER/MODEL]"),
+    };
+    let provider = account.as_ref().map(|(_, m)| provider_of(m).to_string());
     let model = match &rest[..] {
         [m] if m.contains('/') => m.clone(),
         [] => {
             h.need_running()?;
             let exts = conf::extension_args(&doc);
             let exts: Vec<&str> = exts.iter().map(String::as_str).collect();
-            pick_model(h, &exts, None)?
+            pick_model(h, &exts, provider.as_deref())?
         }
-        _ => bail!("usage: zephyr model [PROVIDER/MODEL]"),
+        _ => bail!("usage: zephyr model [--account NAME] [PROVIDER/MODEL]"),
     };
-    conf::set(&mut doc, "model", &model)?;
-    if let [(name, _)] = &conf::accounts(&doc)[..] {
-        conf::upsert_account(&mut doc, &name.clone(), &model);
+    match account {
+        Some((name, _)) => {
+            // The account's sign-in belongs to one provider.
+            if provider.as_deref() != Some(provider_of(&model)) {
+                bail!(
+                    "{name} is signed in to {}; pick one of its models",
+                    provider.unwrap_or_default()
+                );
+            }
+            conf::upsert_account(&mut doc, &name, &model);
+            if accounts.len() == 1 {
+                conf::set(&mut doc, "model", &model)?;
+            }
+            println!("account {name}: {model}; `zephyr restart` to apply");
+        }
+        None => {
+            conf::set(&mut doc, "model", &model)?;
+            println!("model {model}; `zephyr restart` to apply");
+        }
     }
-    h.data.save(&doc)?;
-    println!("model {model}; `zephyr restart` to apply");
-    Ok(())
+    h.data.save(&doc)
 }
 
 pub fn channel(h: &Host, a: Args) -> anyhow::Result<()> {
