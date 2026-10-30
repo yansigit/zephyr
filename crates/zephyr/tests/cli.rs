@@ -295,6 +295,47 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
 }
 
 #[test]
+fn file_reads_and_replaces_only_the_daemons_files() {
+    let (_, cfg) = setup("file", "");
+    let dir = cfg.parent().unwrap();
+    let put = |name: &str, text: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_zephyr"))
+            .args(["__file", "put", name])
+            .env("ZEPHYR_CONFIG", &cfg)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+        child.wait().unwrap()
+    };
+    assert!(put("secrets.env", "A=1\n").success());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("secrets.env")).unwrap(),
+        "A=1\n"
+    );
+    let mode = std::fs::metadata(dir.join("secrets.env")).unwrap().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert_eq!(
+        stdout(&zephyr(&cfg, &["__file", "get", "secrets.env"])),
+        "A=1"
+    );
+    assert_eq!(
+        zephyr(&cfg, &["__file", "get", "host.toml"]).status.code(),
+        Some(3)
+    );
+    // Nothing outside the list, and no paths.
+    assert!(!put("state.db", "x").success());
+    assert!(!zephyr(&cfg, &["__file", "get", "../zephyr.toml"])
+        .status
+        .success());
+}
+
+#[test]
 fn the_agent_sees_no_secret_unless_agent_env_passes_it() {
     let (home, cfg) = setup("hidden", "[agent]\nenv = [\"ZEPHYR_CLI_PASSED\"]\n");
     std::fs::write(

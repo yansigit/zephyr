@@ -5,8 +5,9 @@ pub mod conf;
 mod setup;
 
 use anyhow::{bail, Context};
-use conf::Data;
+use conf::{Data, DAEMON_FILES, DAEMON_MOUNT};
 use std::io::{IsTerminal, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -74,9 +75,28 @@ impl Host {
             }),
             data: Data {
                 dir: home().join(".zephyr"),
+                daemon: home().join(".zephyr-daemon"),
+                container: env("ZEPHYR_CONTAINER").unwrap_or_else(|| "zephyr".into()),
+                image: env("ZEPHYR_IMAGE").unwrap_or_else(|| {
+                    format!("ghcr.io/yansigit/zephyr:{}", env!("CARGO_PKG_VERSION"))
+                }),
             },
             interactive: std::io::stdin().is_terminal(),
         }
+    }
+
+    /// `docker exec` as the agent (this user's uid, in its home): rpi sign-ins and model lists,
+    /// whose files must stay the agent's. Plain `exec` runs as root, the daemon's side.
+    pub(crate) fn exec_agent(
+        &self,
+        flags: &[&str],
+        env: &[(&str, &str)],
+        argv: &[&str],
+    ) -> Command {
+        let ids = agent_ids();
+        let user = format!("{}:{}", ids.0, ids.1);
+        let flags = [&["-u", user.as_str(), "-w", "/zephyr"], flags].concat();
+        self.exec(&flags, env, argv)
     }
 
     /// `docker exec [flags] [-e K=V].. <container> argv..`
@@ -90,15 +110,8 @@ impl Host {
         cmd
     }
 
-    /// The container's state (`running`, `exited`, ...), or None when it does not exist.
     fn state(&self) -> Option<String> {
-        let out = docker(&["inspect", "-f", "{{.State.Status}}", &self.container])
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        state(&self.container)
     }
 
     fn running(&self) -> bool {
@@ -169,14 +182,19 @@ impl Host {
     }
 
     /// Recreates the container from the image. Secrets come from secrets.env, read by the daemon.
+    /// The daemon runs as root holding only SETUID, SETGID and KILL; the agent runs as this
+    /// user, and cannot reach the daemon's files in `~/.zephyr-daemon` (DESIGN §4.4).
     fn up(&self) -> anyhow::Result<()> {
+        // The old container goes first: it holds the files the migration moves.
+        let _ = quiet(docker(&["rm", "-f", &self.container]));
+        self.migrate()?;
         let projects = self
             .data
             .projects()?
             .context("no projects dir: run `zephyr init`")?;
-        let _ = quiet(docker(&["rm", "-f", &self.container]));
-        let ids = unsafe { (libc::getuid(), libc::getgid()) };
+        let ids = agent_ids();
         let data = self.data.dir.display();
+        let daemon = self.data.daemon.display();
         let projects = projects.display();
         let mut cmd = docker(&["run", "-d", "--name", &self.container, "--init"]);
         cmd.args([
@@ -187,18 +205,31 @@ impl Host {
             "--network",
             "host",
         ])
-        // The agent runs here: no capabilities, no setuid escalation, and no fork bomb (DESIGN §4.4).
-        .args(["--cap-drop", "ALL", "--security-opt", "no-new-privileges"])
-        .args(["--pids-limit", "4096"])
-        .args(["--user", &format!("{}:{}", ids.0, ids.1)])
+        // No file overrides, no setuid escalation, and no fork bomb.
+        .args([
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "SETUID",
+            "--cap-add",
+            "SETGID",
+        ])
+        .args(["--cap-add", "KILL", "--security-opt", "no-new-privileges"])
+        .args(["--pids-limit", "4096", "--user", "0:0"])
         .args([
             "-e",
             "HOME=/zephyr",
             "-e",
-            "ZEPHYR_CONFIG=/zephyr/zephyr.toml",
+            &format!("ZEPHYR_CONFIG={DAEMON_MOUNT}/zephyr.toml"),
         ])
         .args(["-e", "RPI_CODING_AGENT_DIR=/zephyr/.rpi/agent"])
+        .args(["-e", &format!("ZEPHYR_AGENT_UID={}", ids.0)])
+        .args(["-e", &format!("ZEPHYR_AGENT_GID={}", ids.1)])
         .args(["--mount", &format!("type=bind,src={data},dst=/zephyr")])
+        .args([
+            "--mount",
+            &format!("type=bind,src={daemon},dst={DAEMON_MOUNT}"),
+        ])
         .args([
             "--mount",
             &format!("type=bind,src={projects},dst={projects}"),
@@ -211,33 +242,118 @@ impl Host {
                 .into_iter()
                 .flatten(),
         )
-        .args(["-w", "/zephyr", &self.image])
+        // Root cannot enter the agent's 0700 home; the daemon starts each child there as the agent.
+        .args(["-w", "/", &self.image])
         .stdout(Stdio::null());
         run(&mut cmd)?;
         println!("started {}. Logs: zephyr logs -f", self.container);
         Ok(())
     }
 
+    /// Once, before the first start with a split: the daemon's files leave the agent's home for
+    /// `~/.zephyr-daemon`, and that dir becomes root's. A no-op once it is root's.
+    fn migrate(&self) -> anyhow::Result<()> {
+        if !self.data.direct() {
+            return Ok(());
+        }
+        let (dir, daemon) = (&self.data.dir, &self.data.daemon);
+        std::fs::create_dir_all(daemon)?;
+        let names = DAEMON_FILES
+            .iter()
+            .chain(&["state.db", "state.db-wal", "state.db-shm"]);
+        for name in names {
+            let (old, new) = (dir.join(name), daemon.join(name));
+            if old.exists() && !new.exists() {
+                std::fs::rename(&old, &new)
+                    .with_context(|| format!("moving {} to {}", old.display(), new.display()))?;
+            }
+        }
+        for stale in ["zephyr.lock", "zephyr.sock"] {
+            let _ = std::fs::remove_file(dir.join(stale));
+        }
+        let mut doc = self.data.load()?;
+        if conf::get(&doc, "state").is_none() {
+            conf::set(&mut doc, "state", &format!("{DAEMON_MOUNT:?}"))?;
+        }
+        if conf::get(&doc, "attach.token_file").as_deref() == Some("/zephyr/tui.token") {
+            conf::set(
+                &mut doc,
+                "attach.token_file",
+                &format!("\"{DAEMON_MOUNT}/tui.token\""),
+            )?;
+        }
+        // The host's `zephyr chat` now runs as root; this uid is the agent's.
+        let uid = agent_ids().0.to_string();
+        if let Some(chat) = doc["owners"]["chat"].as_array_mut() {
+            chat.retain(|v| v.as_str() != Some(uid.as_str()));
+            if !chat.iter().any(|v| v.as_str() == Some("0")) {
+                chat.push("0");
+            }
+        }
+        self.data.save(&doc)?;
+        // The only step that needs root: chown in a throwaway container.
+        let mount = format!("type=bind,src={},dst=/d", daemon.display());
+        run(&mut docker(&[
+            "run",
+            "--rm",
+            "--user",
+            "0",
+            "--network",
+            "none",
+            "--entrypoint",
+            "sh",
+            "--mount",
+            &mount,
+            &self.image,
+            "-c",
+            "chown -R 0:0 /d && chmod 700 /d",
+        ]))
+        .context("giving ~/.zephyr-daemon to root")?;
+        println!(
+            "moved zephyr's own files to {} (root's now)",
+            daemon.display()
+        );
+        Ok(())
+    }
+
     fn doctor(&self, fix: bool) -> anyhow::Result<()> {
         let mut ok = check("docker answers", quiet(docker(&["version"])));
         let dir = &self.data.dir;
+        let daemon = &self.data.daemon;
         if fix {
             self.data.ensure_layout()?;
-            for p in [self.data.secrets(), self.data.token()] {
-                conf::write_private(&p, &std::fs::read_to_string(&p)?)?;
+            if self.data.direct() {
+                // Rewriting a file makes it 0600 and its dir 0700.
+                for name in DAEMON_FILES {
+                    if let Ok(text) = self.data.read(name) {
+                        self.data.write(name, &text)?;
+                    }
+                }
             }
         }
         ok &= check(
             &format!("{} exists and is private", dir.display()),
             private(dir),
         );
-        for p in [self.data.secrets(), self.data.token()] {
-            ok &= check(&format!("{} is private (0600)", p.display()), private(&p));
-        }
-        ok &= check(
-            &format!("{} parses", self.data.config().display()),
-            self.data.load().is_ok(),
-        );
+        ok &= if self.data.direct() {
+            // Before the first `zephyr up` with a split: the files are still this user's.
+            ["secrets.env", "tui.token"].iter().fold(
+                check(
+                    &format!("{} is private (root's after `zephyr up`)", daemon.display()),
+                    private(daemon),
+                ),
+                |ok, name| {
+                    let path = daemon.join(name);
+                    check(&format!("{} is private", path.display()), private(&path)) && ok
+                },
+            )
+        } else {
+            check(
+                &format!("{} is root's and private", daemon.display()),
+                std::fs::metadata(daemon).is_ok_and(|m| m.uid() == 0 && m.mode() & 0o077 == 0),
+            )
+        };
+        ok &= check("zephyr.toml parses", self.data.load().is_ok());
         if fix && !self.running() && self.data.projects()?.is_some() {
             self.ensure_image(false, false)?;
             self.up()?;
@@ -258,6 +374,23 @@ impl Host {
         }
         Ok(())
     }
+}
+
+/// The container's state (`running`, `exited`, ...), or None when it does not exist.
+pub(crate) fn state(container: &str) -> Option<String> {
+    let out = docker(&["inspect", "-f", "{{.State.Status}}", container])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// This user's uid and gid: the agent's in the container.
+fn agent_ids() -> (u32, u32) {
+    // SAFETY: getuid and getgid have no arguments and cannot fail.
+    unsafe { (libc::getuid(), libc::getgid()) }
 }
 
 fn home() -> PathBuf {
@@ -484,15 +617,20 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
             h.need_running()?;
             let doc = h.data.load()?;
             let port = conf::get(&doc, "attach.port").context("no [attach] port in zephyr.toml")?;
-            let token = std::fs::read_to_string(h.data.token())?;
-            // `-e NAME` without a value: docker copies it from this process's environment.
+            let token = h.data.token()?;
+            // `-e NAME` without a value: docker copies it from this process's environment. As root,
+            // so the agent's uid cannot read the token from the client's environment; root cannot
+            // enter the agent's home, so the client keeps its own files in /tmp.
             let mut cmd = h.exec(
                 &["-it", "-e", "RPI_SERVER_TOKEN"],
-                &[],
+                &[
+                    ("HOME", "/tmp"),
+                    ("RPI_CODING_AGENT_DIR", "/tmp/zephyr-attach"),
+                ],
                 &["rpi", "--connect"],
             );
             cmd.arg(format!("127.0.0.1:{port}"))
-                .env("RPI_SERVER_TOKEN", token.trim());
+                .env("RPI_SERVER_TOKEN", &token);
             run(&mut cmd)
         }
         "config" => {
@@ -526,7 +664,7 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
             let keep = a.flag("--keep-data");
             let yes = a.flag("--yes");
             a.rest()?;
-            let dir = h.data.dir.display().to_string();
+            let dir = format!("{} and {}", h.data.dir.display(), h.data.daemon.display());
             let confirmed = keep
                 || yes
                 || (h.interactive
@@ -538,15 +676,44 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                 bail!("not deleting {dir}: pass --keep-data or --yes");
             }
             let _ = quiet(docker(&["rm", "-f", &h.container]));
+            if !keep && !h.data.direct() {
+                // The daemon's files are root's: give them back while the image is still here.
+                let ids = agent_ids();
+                let mount = format!("type=bind,src={},dst=/d", h.data.daemon.display());
+                let chown = format!("chown -R {}:{} /d", ids.0, ids.1);
+                run(&mut docker(&[
+                    "run",
+                    "--rm",
+                    "--user",
+                    "0",
+                    "--network",
+                    "none",
+                    "--entrypoint",
+                    "sh",
+                    "--mount",
+                    &mount,
+                    &h.image,
+                    "-c",
+                    &chown,
+                ]))
+                .with_context(|| {
+                    format!(
+                        "taking {} back from root failed; remove it with sudo rm -rf",
+                        h.data.daemon.display()
+                    )
+                })?;
+            }
             let _ = quiet(docker(&["rmi", &h.image]));
             if !keep {
-                std::fs::remove_dir_all(&h.data.dir).or_else(|e| {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        Ok(())
-                    } else {
-                        Err(e)
-                    }
-                })?;
+                for d in [&h.data.dir, &h.data.daemon] {
+                    std::fs::remove_dir_all(d).or_else(|e| {
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            Ok(())
+                        } else {
+                            Err(e)
+                        }
+                    })?;
+                }
             }
             println!(
                 "removed {} and its image{}",

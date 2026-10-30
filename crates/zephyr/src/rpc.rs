@@ -57,7 +57,10 @@ impl Child {
         session_id: &str,
         account: Option<&Account>,
     ) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(cfg.session_dir())?;
+        {
+            let _fs = crate::agent::fs();
+            std::fs::create_dir_all(cfg.session_dir())?;
+        }
         let (model, agent_dir) = match account {
             Some(a) => (Some(&a.model), Some(crate::pool::prepare(cfg, a)?)),
             None => (cfg.model.as_ref(), cfg.agent_dir.clone()),

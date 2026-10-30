@@ -26,6 +26,7 @@ pub fn dir(home: &Path) -> PathBuf {
 /// and commits whatever changed (the seed files, on first start).
 pub fn prepare(home: &Path) -> anyhow::Result<()> {
     let _guard = lock();
+    let _fs = crate::agent::fs();
     let dir = dir(home);
     std::fs::create_dir_all(dir.join("notes"))?;
     for name in [USER, MEMORY] {
@@ -54,6 +55,7 @@ pub fn prepare(home: &Path) -> anyhow::Result<()> {
 /// Commits every change in the memory dir as `memory: <utc time>`. Returns false when clean.
 pub fn commit_if_changed(home: &Path) -> anyhow::Result<bool> {
     let _guard = lock();
+    let _fs = crate::agent::fs();
     commit_locked(home)
 }
 
@@ -74,6 +76,7 @@ fn commit_locked(home: &Path) -> anyhow::Result<bool> {
 /// The owner's `/memory` commands. `None` for any other text. The reply is always text.
 pub fn command(home: &Path, text: &str) -> Option<String> {
     let _guard = lock();
+    let _fs = crate::agent::fs();
     let text = text.trim();
     if text != "/memory" && !text.starts_with("/memory ") {
         return None;
@@ -134,6 +137,7 @@ fn undo(home: &Path) -> anyhow::Result<String> {
 /// record `false` for it. `session.rs` skips context files for an untrusted cwd, and a missing
 /// decision counts as trusted (`config.rs` `project_trust_decision`, `session.rs` `resolve_project_trust`).
 pub fn context_trusted(home: &Path, agent_dir: &Path) -> anyhow::Result<bool> {
+    let _fs = crate::agent::fs();
     let text = match std::fs::read_to_string(agent_dir.join("trust.json")) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),

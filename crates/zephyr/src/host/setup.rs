@@ -251,7 +251,7 @@ fn login(
             println!("Sign in with your Claude subscription.");
             // The token passes through `TokenMask` on its way to the terminal, so it is never shown.
             let mut child = h
-                .exec(&["-it"], &[], &[CLAUDE_CLI, "setup-token"])
+                .exec_agent(&["-it"], &[], &[CLAUDE_CLI, "setup-token"])
                 .stdout(Stdio::piped())
                 .spawn()
                 .context("running claude setup-token")?;
@@ -287,10 +287,10 @@ fn login(
         // so the output is dropped; `auth check` tells whether it was stored.
         let login = rpi(&exts, &["auth", "login", "--provider", provider]).join(" ");
         feed(
-            &mut h.exec(&["-i"], &env, &["script", "-qec", &login, "/dev/null"]),
+            &mut h.exec_agent(&["-i"], &env, &["script", "-qec", &login, "/dev/null"]),
             token.trim(),
         )?;
-        let check = output(&mut h.exec(
+        let check = output(&mut h.exec_agent(
             &[],
             &env,
             &rpi(&exts, &["auth", "check", "--json", "--provider", provider]),
@@ -299,7 +299,7 @@ fn login(
             bail!("the token was not stored for {name}");
         }
     } else {
-        run(&mut h.exec(
+        run(&mut h.exec_agent(
             &["-it"],
             &env,
             &rpi(&exts, &["auth", "login", "--provider", provider]),
@@ -319,7 +319,7 @@ fn login(
     println!("account {name}: {model}");
     if verify {
         let out = h
-            .exec(
+            .exec_agent(
                 &[],
                 &env,
                 &rpi(
@@ -361,7 +361,7 @@ fn rpi<'a>(exts: &[&'a str], argv: &[&'a str]) -> Vec<&'a str> {
 /// Models from `rpi --list-models` in the container, as `provider/model`.
 fn list_models(h: &Host, exts: &[&str], provider: Option<&str>) -> anyhow::Result<Vec<String>> {
     let argv = [&["rpi", "--list-models"], exts].concat();
-    let text = output(&mut h.exec(&[], &[], &argv))?;
+    let text = output(&mut h.exec_agent(&[], &[], &argv))?;
     Ok(text
         .lines()
         .skip(1)
@@ -506,10 +506,9 @@ fn channel_add(h: &Host, kind: &str) -> anyhow::Result<()> {
         }
         Ok(input.interact_text()?)
     };
-    let secrets = h.data.secrets();
     let hidden = |prompt: &str, env: &str| -> anyhow::Result<()> {
         let v = Password::new().with_prompt(prompt).interact()?;
-        conf::set_secret(&secrets, env, v.trim())
+        h.data.set_secret(env, v.trim())
     };
     let list = |v: &str| {
         let items: Vec<String> = v.split(',').map(|s| format!("{:?}", s.trim())).collect();
@@ -531,15 +530,16 @@ fn channel_add(h: &Host, kind: &str) -> anyhow::Result<()> {
         let server = ask("BlueBubbles server URL", "imessage.server_url")?;
         let owners = ask("Your iMessage handles, comma separated", "owners.imessage")?;
         hidden("BlueBubbles server password (hidden)", "ZEPHYR_BB_PASSWORD")?;
-        conf::set_secret(&secrets, "ZEPHYR_BB_SECRET", &conf::random_hex(24)?)?;
+        h.data
+            .set_secret("ZEPHYR_BB_SECRET", &conf::random_hex(24)?)?;
         conf::set(&mut doc, "imessage.listen", &format!("{listen:?}"))?;
         conf::set(&mut doc, "imessage.server_url", &format!("{server:?}"))?;
         conf::set(&mut doc, "imessage.password_env", "ZEPHYR_BB_PASSWORD")?;
         conf::set(&mut doc, "imessage.secret_env", "ZEPHYR_BB_SECRET")?;
         conf::set(&mut doc, "owners.imessage", &list(&owners))?;
         println!(
-            "Register the BlueBubbles webhook http://{listen}/?secret=<ZEPHYR_BB_SECRET from {}>",
-            secrets.display()
+            "Register the BlueBubbles webhook http://{listen}/?secret=<ZEPHYR_BB_SECRET from {}/secrets.env, readable with sudo>",
+            h.data.daemon.display()
         );
     }
     h.data.save(&doc)

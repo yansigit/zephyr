@@ -63,6 +63,7 @@ struct StoredExpiry {
 /// Expiry (Unix seconds, 0 = unknown) of each stored OAuth credential. Empty if there is no file.
 /// `get_auth_status` has no expiry field, so the file is the only source.
 fn oauth_expiries(agent_dir: &Path) -> anyhow::Result<HashMap<String, i64>> {
+    let _fs = crate::agent::fs();
     let path = agent_dir.join("auth.json");
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,

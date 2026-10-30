@@ -20,6 +20,10 @@ const USAGE: &str = "usage: zephyr <run|status|doctor|chat|pause|resume|reload> 
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if let Err(e) = zephyr::agent::init_ids() {
+        eprintln!("zephyr: {e:#}");
+        return ExitCode::FAILURE;
+    }
     let mut args = std::env::args().skip(1);
     let cmd = args.next().unwrap_or_default();
     let host = !zephyr::host::in_container();
@@ -30,10 +34,13 @@ async fn main() -> ExitCode {
         eprintln!("{}", zephyr::host::USAGE);
         return ExitCode::from(2);
     }
+    if cmd == "__file" {
+        return file_cmd(&args.collect::<Vec<_>>());
+    }
     // The daemon and the commands run beside it read secrets.env themselves (no --env-file).
     let mut from_file = Vec::new();
     let cfg = Config::load(&Config::default_path()).and_then(|cfg| {
-        from_file = zephyr::dotenv::load(&cfg.home.join("secrets.env"))?;
+        from_file = zephyr::dotenv::load(&cfg.secrets_path())?;
         zephyr::agent::init(&from_file, &cfg.agent.env);
         Ok(cfg)
     });
@@ -52,6 +59,36 @@ async fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         },
+    };
+    finish(result)
+}
+
+/// `zephyr __file get|put NAME`: how the host CLI reads and writes the daemon's files once they
+/// belong to root (`host::conf::Data`). `put` takes the text on stdin and replaces the file
+/// whole, mode 0600. `get` of a missing file prints nothing and exits 3.
+fn file_cmd(args: &[String]) -> ExitCode {
+    let path = Config::default_path();
+    let dir = path.parent().unwrap_or(Path::new("/"));
+    let result = match args {
+        [op, name] if zephyr::host::conf::DAEMON_FILES.contains(&name.as_str()) => {
+            let file = dir.join(name);
+            match op.as_str() {
+                "get" => match std::fs::read(&file) {
+                    Err(e) if e.kind() == ErrorKind::NotFound => return ExitCode::from(3),
+                    r => r
+                        .and_then(|text| std::io::Write::write_all(&mut std::io::stdout(), &text))
+                        .map_err(Into::into),
+                },
+                "put" => {
+                    let mut text = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|_| zephyr::host::conf::replace_private(&file, &text))
+                }
+                _ => Err(anyhow::anyhow!("usage: zephyr __file get|put NAME")),
+            }
+        }
+        _ => Err(anyhow::anyhow!("usage: zephyr __file get|put NAME")),
     };
     finish(result)
 }
@@ -93,7 +130,13 @@ fn lock_home(home: &Path) -> anyhow::Result<std::fs::File> {
 /// `from_file`: the variables secrets.env set, dropped before a re-exec so it reads them anew.
 async fn run(cfg: Config, from_file: &[String]) -> anyhow::Result<()> {
     zephyr::agent::undumpable();
-    let _lock = lock_home(&cfg.home)?;
+    // SAFETY: getuid has no arguments and cannot fail.
+    if unsafe { libc::getuid() } == 0 && zephyr::agent::ids().is_none() {
+        anyhow::bail!(
+            "refusing to run as root without ZEPHYR_AGENT_UID and ZEPHYR_AGENT_GID: the agent would run as root"
+        );
+    }
+    let _lock = lock_home(cfg.state_dir())?;
     let mut channels = vec![AnyChannel::Chat(ChatChannel::new(cfg.socket_path()))];
     if let Some(discord) = &cfg.discord {
         channels.push(AnyChannel::Discord(Discord::new(discord)?));
@@ -168,6 +211,17 @@ async fn status(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether this process holds CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH or CAP_FOWNER (bits 1-3 of
+/// `CapEff`), any of which would let the daemon into the agent's files and the agent's uid into ours.
+fn overrides_files() -> bool {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+        .is_none_or(|caps| caps & 0b1110 != 0)
+}
+
 async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     let out = zephyr::agent::cmd(&mut std::process::Command::new(&cfg.rpi))
         .arg("--version")
@@ -179,6 +233,18 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
         mark(version_ok)
     );
 
+    // In the container: root holding no file overrides, and the agent on its own uid (DESIGN §4.4).
+    // SAFETY: getuid has no arguments and cannot fail.
+    let split_ok = unsafe { libc::getuid() } != 0 || {
+        let ok = zephyr::agent::ids().is_some() && !overrides_files();
+        let who = zephyr::agent::ids().map_or("no uid".into(), |(u, g)| format!("{u}:{g}"));
+        println!(
+            "{} the agent runs as {who} and the daemon cannot override file permissions",
+            mark(ok)
+        );
+        ok
+    };
+
     // A throwaway home so doctor never touches the live `main` session.
     let mut probe = cfg.clone();
     probe.home = std::env::temp_dir().join(format!("zephyr-doctor-{}", std::process::id()));
@@ -188,7 +254,10 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
         probe.model = Some(first.model.clone());
         probe.accounts.clear();
     }
-    std::fs::create_dir_all(&probe.home)?;
+    {
+        let _fs = zephyr::agent::fs();
+        std::fs::create_dir_all(&probe.home)?;
+    }
     let child = Child::spawn(&probe, "doctor").await;
     let commands_ok = match child {
         Ok(child) => {
@@ -219,10 +288,13 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
             false
         }
     };
-    let _ = std::fs::remove_dir_all(&probe.home);
+    {
+        let _fs = zephyr::agent::fs();
+        let _ = std::fs::remove_dir_all(&probe.home);
+    }
 
     // Names and presence only: a secret's value is never printed.
-    let mut ok = version_ok && commands_ok;
+    let mut ok = version_ok && split_ok && commands_ok;
     if let Some(d) = &cfg.discord {
         let label = format!("env {} is set (discord token)", d.token_env);
         ok &= check(&label, env_set(&d.token_env));
@@ -262,7 +334,11 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     );
     // A warning, not a failure: providers come from the image (DESIGN §4.4).
     let ext_dir = zephyr::auth_keeper::agent_dir(cfg).join("extensions");
-    if std::fs::read_dir(&ext_dir).is_ok_and(|mut d| d.next().is_some()) {
+    let installed = {
+        let _fs = zephyr::agent::fs();
+        std::fs::read_dir(&ext_dir).is_ok_and(|mut d| d.next().is_some())
+    };
+    if installed {
         println!(
             "warn {} is not empty: providers come from the image; packages installed into agent_dir load twice",
             ext_dir.display()

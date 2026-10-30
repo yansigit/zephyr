@@ -9,8 +9,12 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     /// The pinned `rpi` binary.
     pub rpi: PathBuf,
-    /// State dir: `state.db`, `sessions/`, `zephyr.sock`. Also the child's cwd.
+    /// The agent's home and the child's cwd: `sessions/`, `memory/`, `accounts/`, `AGENTS.md`.
     pub home: PathBuf,
+    /// The daemon's own files: `state.db`, `secrets.env`, `zephyr.sock`, `zephyr.lock`.
+    /// Default: `home`. In the container `/var/lib/zephyr`, which the agent cannot enter
+    /// (DESIGN §4.4).
+    pub state: Option<PathBuf>,
     /// rpi agent dir (`RPI_CODING_AGENT_DIR`): its models, credentials and settings.
     pub agent_dir: Option<PathBuf>,
     /// `--model` for the child, e.g. `anthropic/claude-sonnet-5`. Unused when `[[account]]` is set.
@@ -174,8 +178,16 @@ impl Config {
                 .is_some_and(|list| list.iter().any(|o| o == sender))
     }
 
+    pub fn state_dir(&self) -> &Path {
+        self.state.as_deref().unwrap_or(&self.home)
+    }
+
     pub fn db_path(&self) -> PathBuf {
-        self.home.join("state.db")
+        self.state_dir().join("state.db")
+    }
+
+    pub fn secrets_path(&self) -> PathBuf {
+        self.state_dir().join("secrets.env")
     }
 
     pub fn session_dir(&self) -> PathBuf {
@@ -183,7 +195,7 @@ impl Config {
     }
 
     pub fn socket_path(&self) -> PathBuf {
-        self.home.join("zephyr.sock")
+        self.state_dir().join("zephyr.sock")
     }
 }
 

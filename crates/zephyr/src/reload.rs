@@ -27,6 +27,7 @@ pub enum Plan {
 pub fn diff(old: &Config, new: &Config, active: Option<&Account>, next: Option<&Account>) -> Plan {
     if old.rpi != new.rpi
         || old.home != new.home
+        || old.state != new.state
         || old.discord != new.discord
         || old.imessage != new.imessage
         || old.attach != new.attach

@@ -7,7 +7,6 @@ use crate::store::{InboxRow, Store};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -48,7 +47,7 @@ pub async fn run<C: Channel>(
     channels: &[C],
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<Exit> {
-    std::fs::create_dir_all(&cfg.home)?;
+    std::fs::create_dir_all(cfg.state_dir())?;
     let (tx, rx) = mpsc::channel(64);
     let (attach_tx, attaches) = mpsc::channel(4);
     let jobs = crate::scheduler::Wake::default();
@@ -58,7 +57,7 @@ pub async fn run<C: Channel>(
         cfg: shared,
         cfg_tx,
         edits: edits(cfg),
-        secrets: crate::dotenv::read(&secrets_path(cfg)).unwrap_or_default(),
+        secrets: crate::dotenv::read(&cfg.secrets_path()).unwrap_or_default(),
         pending_model: None,
         reexec: false,
         auth_stamp: None,
@@ -86,16 +85,12 @@ pub async fn run<C: Channel>(
     }
 }
 
-fn secrets_path(cfg: &Config) -> PathBuf {
-    cfg.home.join("secrets.env")
-}
-
 /// The mtimes a hand edit changes: `zephyr.toml` and `secrets.env`.
 type Edits = (Option<SystemTime>, Option<SystemTime>);
 
 fn edits(cfg: &Config) -> Edits {
     let config = cfg.path.as_deref().and_then(crate::reload::stamp);
-    (config, crate::reload::stamp(&secrets_path(cfg)))
+    (config, crate::reload::stamp(&cfg.secrets_path()))
 }
 
 struct Router<'a> {
@@ -236,7 +231,7 @@ impl<'a> Router<'a> {
                 self.child = Some(child);
                 self.account = account;
                 self.pending_model = None;
-                self.auth_stamp = crate::reload::stamp(&self.auth_file());
+                self.auth_stamp = self.auth_mtime();
                 self.busy = false;
                 log(self.reconcile(None, false).await);
             }
@@ -254,12 +249,15 @@ impl<'a> Router<'a> {
     }
 
     /// `auth.json` of the child's account, or of the agent dir without a pool.
-    fn auth_file(&self) -> PathBuf {
-        match &self.account {
+    /// When the child's `auth.json` last changed; a newer one is a re-login.
+    fn auth_mtime(&self) -> Option<SystemTime> {
+        let file = match &self.account {
             Some(a) => self.cfg.account_dir(a),
             None => crate::auth_keeper::agent_dir(&self.cfg),
         }
-        .join("auth.json")
+        .join("auth.json");
+        let _fs = crate::agent::fs();
+        crate::reload::stamp(&file)
     }
 
     async fn child_exited(&mut self) {
@@ -581,13 +579,13 @@ impl<'a> Router<'a> {
             Ok(new) => new,
             Err(e) => return format!("[zephyr] zephyr.toml not applied: {e:#}"),
         };
-        let secrets = crate::dotenv::read(&secrets_path(&new)).unwrap_or_default();
+        let secrets = crate::dotenv::read(&new.secrets_path()).unwrap_or_default();
         let next = pick_in(&new, &self.store).ok().flatten();
         let mut plan = crate::reload::diff(&self.cfg, &new, self.account.as_ref(), next.as_ref());
         if secrets != self.secrets {
             plan = Plan::Reexec;
         } else if self.child.is_some()
-            && crate::reload::stamp(&self.auth_file()) != self.auth_stamp
+            && self.auth_mtime() != self.auth_stamp
             && !matches!(plan, Plan::Reexec)
         {
             plan = Plan::RestartChild; // a re-login: rpi reads credentials at start

@@ -98,8 +98,14 @@ Upstream analysis (`research/pi-rust-integration.md` §7) compared three options
 
 There are no per-call prompts. These hard limits hold every time:
 
-1. **One Docker container, `zephyr`** (`zephyr up`, set up by `zephyr init`). The daemon and every child run inside it, as your uid, so files it creates are yours and no ACLs are needed. The agent can work anywhere it is mounted:
-   - Read-write: `~/.zephyr` (seen as `/zephyr`), which holds its state, memory, sessions and its own rpi agent dir with its own credentials.
+1. **One Docker container, `zephyr`** (`zephyr up`, set up by `zephyr init`). Two users inside it:
+   - **The agent** (every rpi child, and every process zephyr starts for it: `rpi auth refresh`, `rpi --list-models`, memory's git) runs as your uid, so files it creates are yours and no ACLs are needed.
+   - **The daemon** runs as root holding only SETUID, SETGID and KILL (`--cap-drop ALL`, `no-new-privileges`, `--pids-limit 4096`). Without DAC_OVERRIDE, root is bound by file permissions like anyone else. Its own files live in `~/.zephyr-daemon` (root, 0700), seen as `/var/lib/zephyr`: `zephyr.toml`, `secrets.env`, `tui.token`, `host.toml`, `state.db`, the chat socket and the lock. The agent can neither read nor change them, so it cannot learn the bot tokens, rewrite the settings (dropping the policy plugin or adding an owner), or speak as the owner on the chat socket. Whatever the daemon does in the agent's home it does with the agent's file ids (`agent::fs`, setfsuid), so a symlink the agent plants leads nowhere new; a missed call site fails closed, since root cannot even enter `/zephyr`. `zephyr up` moves an older layout over once and gives the dir to root in a throwaway container; the host CLI then reads and writes those files through `zephyr __file` in the container, as root.
+   - Before a child starts, secrets.env's variables are removed from its environment (`[agent] env` lets named ones through), and the daemon is undumpable.
+   - Left readable by the agent, by necessity: the provider credentials rpi itself reads (`accounts/*/auth.json`, the Claude config) and the conversation (`sessions/`).
+
+   The agent can work anywhere it is mounted:
+   - Read-write: `~/.zephyr` (seen as `/zephyr`), which holds its memory, sessions and its own rpi agent dir with its own credentials.
    - Read-write: `$PROJECTS` at the same path as on the host. Secrets inside it (`.parity-env.sh`, `.parity-lanes/archive`, every `.env*` outside `node_modules`) are covered with empty mounts.
    - Nothing else of your home: `~/.ssh`, `~/.rpi`, `~/.pi` and browser profiles are not mounted. No docker socket.
    - Network: host networking, so the attach port on 127.0.0.1 and the Tailscale webhook address work unchanged.
@@ -174,6 +180,7 @@ There are no per-call prompts. These hard limits hold every time:
 ### 4.10 Live settings
 
 - The router owns the config as an `Arc<Config>` and sends each new one to the scheduler on a `watch` channel. `Config::load` records the file it read.
+- `home` is the agent's (sessions, memory, accounts); `state` (default `home`; `/var/lib/zephyr` in the container) holds `state.db`, `secrets.env`, the socket and the lock. Changing either re-execs.
 - **Triggers.** `/reload` (owner-only, outside the queue, like `/pause`; `zephyr reload` sends it over the chat socket, and the host CLI runs it after every edit), and the router's 5 s tick when the mtime of `zephyr.toml` or `secrets.env` changed. A file that does not load or validate is reported and not applied.
 - **Plan** (`reload::diff`), the least disruptive that covers the change:
   - `rpi`, `home`, `[discord]`, `[imessage]`, `[attach]`, or any `secrets.env` pair: **re-exec**. Once main is settled and no job runs, the router drains as on SIGTERM and `zephyr run` execs itself with the same args, minus the variables secrets.env set, so the new process reads them again. The lock and sockets are close-on-exec; under `--init` the PID stays.
