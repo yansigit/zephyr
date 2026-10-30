@@ -251,17 +251,12 @@ fn normalize(screen: &str) -> String {
         .lines()
         .enumerate()
         .map(|(row, l)| {
-            // The mascot's breath (columns 11-13 of the header's three rows) blows while a run goes.
-            let chars: Vec<char> = l.chars().collect();
-            let l = &match chars.get(11..14) {
-                Some(trail)
-                    if row < 3 && trail.iter().any(|c| matches!(c, '∼' | '≈' | '≋' | '~')) =>
-                {
-                    let mut c = chars.clone();
-                    c.splice(11..14, "~~~".chars());
-                    c.into_iter().collect()
-                }
-                _ => l.to_string(),
+            // The mascot (the header's first 14 columns) moves with the clock and greets on
+            // connecting; chrome.rs tests its frames. Masking keeps its width checked.
+            let l = &if row < 3 {
+                "#".repeat(14) + &l.chars().skip(14).collect::<String>()
+            } else {
+                l.to_string()
             };
             // The "down" server drops each reconnect: EOF or a reset by timing, so the reason varies.
             let l = &match l.find("reconnecting…  ") {

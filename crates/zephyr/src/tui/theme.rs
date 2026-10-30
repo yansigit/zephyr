@@ -25,10 +25,11 @@ pub struct Palette {
     pub md_heading: Color,
     pub md_code: Color,
     pub md_link: Color,
-    /// The header's cloud and the face drawn on it: a graphic, so 3:1 against the background.
+    /// The header's cloud outline: a graphic, so 3:1 against the background.
     pub cloud: Color,
-    pub cloud_eyes: Color,
-    /// The cloud's cheeks: decorative, so only kept apart from the cloud.
+    /// The cloud asleep: dimmer than `cloud`, still 3:1 (`dim` falls just short on white).
+    pub cloud_asleep: Color,
+    /// The cloud's cheeks, beside its face: 3:1 too, so they do not fade into a light screen.
     pub cloud_blush: Color,
     /// The bar and label of a message per channel; the terminal and `chat` use `accent`.
     pub discord: Color,
@@ -59,7 +60,7 @@ pub const DARK: Palette = Palette {
     md_code: rgb(0xF0C987),
     md_link: rgb(0x5EC8E5),
     cloud: rgb(0xDCEAF2),
-    cloud_eyes: rgb(0x14202B),
+    cloud_asleep: rgb(0x5C6675),
     cloud_blush: rgb(0xF28AA5),
     discord: rgb(0xB4A6FF),
     imessage: rgb(0x6CB6FF),
@@ -84,8 +85,8 @@ pub const LIGHT: Palette = Palette {
     md_code: rgb(0x8A4B00),
     md_link: rgb(0x0B6F91),
     cloud: rgb(0x4F93B5),
-    cloud_eyes: rgb(0x14202B),
-    cloud_blush: rgb(0xFFC2D1),
+    cloud_asleep: rgb(0x808A97),
+    cloud_blush: rgb(0xE0447A),
     discord: rgb(0x5B45C9),
     imessage: rgb(0x0B62B8),
     other: rgb(0x7A5230),
@@ -109,7 +110,7 @@ pub const PLAIN: Palette = Palette {
     md_code: Color::Default,
     md_link: Color::Default,
     cloud: Color::Default,
-    cloud_eyes: Color::Default,
+    cloud_asleep: Color::Default,
     cloud_blush: Color::Default,
     discord: Color::Default,
     imessage: Color::Default,
@@ -323,15 +324,16 @@ mod tests {
                 ratio >= 1.2,
                 "{name} user_bg on the background: {ratio:.2}:1"
             );
-            // The mascot is a graphic: 3:1 for the cloud on the background and the face on it.
-            for (what, ratio) in [
-                ("cloud", contrast(p.cloud, bg)),
-                ("eyes", contrast(p.cloud_eyes, p.cloud)),
+            // The mascot is line art on the background, its face in `text`: 3:1 for every
+            // part, asleep and cheeks included.
+            for (what, c) in [
+                ("cloud", p.cloud),
+                ("cloud_asleep", p.cloud_asleep),
+                ("cloud_blush", p.cloud_blush),
             ] {
+                let ratio = contrast(c, bg);
                 assert!(ratio >= 3.0, "{name} {what}: {ratio:.2}:1");
             }
-            let ratio = contrast(p.cloud_blush, p.cloud);
-            assert!(ratio >= 1.5, "{name} blush: {ratio:.2}:1");
         }
     }
 

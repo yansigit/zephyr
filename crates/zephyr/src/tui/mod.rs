@@ -137,6 +137,8 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_millis(166));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ctrl_c_at = 0;
+    // The mascot frame on screen: a tick redraws when it changes, idle blinks included.
+    let mut face = [String::new(), String::new(), String::new()];
     let mut was_up = false;
     // The composer text whose autocomplete Esc dismissed.
     let mut dismissed: Option<String> = None;
@@ -147,6 +149,9 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                 let mut s = state.lock().unwrap();
                 match msg {
                     Msg::Up { snapshot, messages } => {
+                        if !was_up {
+                            s.greeted = Some(crate::unix_millis() as i64);
+                        }
                         s.link = Link::Up;
                         s.snapshot = *snapshot;
                         s.retry = None;
@@ -323,7 +328,10 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                 if hint_over {
                     s.hint = None;
                 }
-                if hint_over || s.animated() || view.running() {
+                let frame = chrome::mascot(chrome::Mood::of(&s, now), &palette, now);
+                let new_face = frame != face;
+                face = frame;
+                if hint_over || new_face || s.animated() || view.running() {
                     tui.request_render(false);
                 }
             }
@@ -341,9 +349,13 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
 fn event(s: &mut State, view: &mut view::View, ev: &Value) {
     match ev["type"].as_str().unwrap_or_default() {
         "zephyr_status" => {
+            let was_busy = s.snapshot.run.busy;
             s.snapshot = serde_json::from_value(ev["snapshot"].clone()).unwrap_or_default();
             if !s.snapshot.run.busy {
                 s.stopping = false;
+                if was_busy {
+                    s.finished = Some(crate::unix_millis() as i64);
+                }
             }
         }
         "zephyr_reply" => view.reply(

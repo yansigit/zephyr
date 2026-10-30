@@ -43,6 +43,10 @@ pub struct State {
     pub overlay: Option<Overlay>,
     /// Slash autocomplete for the composer's text.
     pub complete: Option<Complete>,
+    /// When the link first came up and when the last run finished (unix ms): the mascot's
+    /// one-shots play from them.
+    pub greeted: Option<i64>,
+    pub finished: Option<i64>,
 }
 
 impl Default for State {
@@ -56,6 +60,8 @@ impl Default for State {
             hint: None,
             overlay: None,
             complete: None,
+            greeted: None,
+            finished: None,
         }
     }
 }
@@ -103,119 +109,221 @@ fn dotted(parts: &[String], p: &Palette) -> String {
 
 /// Below this width the header is one row, without the mascot.
 const MASCOT_MIN_WIDTH: usize = 60;
-/// The mascot's columns: an 11-column cloud, a 3-column breath and a 2-column gap.
+/// The mascot's columns: an 11-column cloud, 3 for its wind or marks, and a 2-column gap.
 const MASCOT_WIDTH: usize = 16;
+/// One mascot frame: six a second, the TUI's redraw.
+const FRAME_MS: i64 = 166;
+/// How long the one-shots play: the hello on connecting, the cheer when a run ends.
+const GREET_MS: i64 = 2_000;
+const DONE_MS: i64 = 1_000;
 
 /// How the mascot looks: what zephyr is doing, at a glance.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Mood {
     Idle,
-    /// A run is going: the face looks downwind and the cloud blows.
+    /// A run is going: the cloud leans into its wind and blows.
     Working,
     /// Paused, or not connected yet.
     Asleep,
     /// The connection is down, a reply failed, or the budget is spent.
     Troubled,
+    /// Since this time (unix ms), on first connecting: the outline draws itself, then a hello.
+    Greet(i64),
+    /// Since this time, when a run has just finished: a happy face and a spark.
+    Done(i64),
 }
 
 impl Mood {
-    pub fn of(s: &State) -> Mood {
+    pub fn of(s: &State, now: i64) -> Mood {
         let spent = s
             .snapshot
             .paused
             .as_deref()
             .is_some_and(|p| p.starts_with("budget"));
+        let playing = |at: Option<i64>, ms: i64| at.filter(|t| (0..ms).contains(&(now - t)));
         match &s.link {
             Link::Down { .. } => Mood::Troubled,
             Link::Connecting(_) => Mood::Asleep,
             Link::Up if spent || s.snapshot.failed_replies > 0 || s.retry.is_some() => {
                 Mood::Troubled
             }
-            Link::Up if s.snapshot.run.busy => Mood::Working,
-            Link::Up if s.snapshot.paused.is_some() => Mood::Asleep,
-            Link::Up => Mood::Idle,
+            Link::Up if s.snapshot.paused.is_some() && !s.snapshot.run.busy => Mood::Asleep,
+            Link::Up => match (playing(s.finished, DONE_MS), playing(s.greeted, GREET_MS)) {
+                (Some(t), _) => Mood::Done(t),
+                (_, Some(t)) => Mood::Greet(t),
+                _ if s.snapshot.run.busy => Mood::Working,
+                _ => Mood::Idle,
+            },
         }
     }
 }
 
-/// Zephyr's mascot, a small cloud puffing the west wind: three rows of [`MASCOT_WIDTH`] columns.
+/// A glyph's colour and whether it is bold.
+type Ink = (rpi_tui::theme::Color, bool);
+
+/// The mascot's 14 cells by 3 rows; `None` is blank.
+struct Sprite([[Option<(char, Ink)>; 14]; 3]);
+
+impl Sprite {
+    fn put(&mut self, row: usize, col: usize, text: &str, ink: Ink) {
+        for (i, ch) in text.chars().enumerate().filter(|(_, ch)| *ch != ' ') {
+            self.0[row][col + i] = Some((ch, ink));
+        }
+    }
+
+    /// The outline, columns 0-10; `lean` shifts its top a cell downwind.
+    fn body(&mut self, ink: Ink, lean: usize) {
+        self.put(0, lean, "  .◠◠.◠◠.", ink);
+        self.put(1, 0, "(", ink);
+        self.put(1, 10, ")", ink);
+        self.put(2, 0, " `-.___.-'", ink);
+    }
+
+    /// `face` (eye, mouth, eye) with the left eye at column `at`, cheeks just outside.
+    fn face(&mut self, face: &str, at: usize, ink: Ink, cheeks: Option<Ink>) {
+        self.put(1, at, face, ink);
+        if let Some(cheek) = cheeks {
+            self.put(1, at - 1, "◦", cheek);
+            self.put(1, at + 5, "◦", cheek);
+        }
+    }
+}
+
+/// Wind leaving the cloud's side, a cell a frame; only single-width, unambiguous glyphs.
+const WIND: [&str; 6] = ["≋  ", "~≋ ", "-~≋", "∙-~", " ∙-", "  ∙"];
+
+/// The idle face over a 15 s loop: blinks at 0, 5 and 12.5 s, a double blink at 7.5 s, and a
+/// two-second glance downwind at 10 s.
+fn idle_face(g: &mut Sprite, tick: i64, ink: Ink) {
+    match tick.rem_euclid(90) {
+        0 | 30 | 45 | 47 | 75 => g.face("- ᴗ -", 3, ink, None),
+        60..72 => g.face("o ᴗ o", 4, ink, None),
+        _ => g.face("o ᴗ o", 3, ink, None),
+    }
+}
+
+/// Zephyr's mascot, a line-art cloud that puffs the west wind: three rows of [`MASCOT_WIDTH`]
+/// columns, a pure function of the mood and the clock. Moods differ by glyphs, not only colour.
 pub fn mascot(mood: Mood, p: &Palette, now: i64) -> [String; 3] {
-    let (eye, mouth) = match mood {
-        Mood::Idle => ("•", "◡"),
-        Mood::Working => ("•", "o"),
-        Mood::Asleep => ("─", "◡"),
-        Mood::Troubled => ("×", "~"),
+    // Loops run on the wall clock; one-shots from their start.
+    let tick = match mood {
+        Mood::Greet(t) | Mood::Done(t) => (now - t).div_euclid(FRAME_MS),
+        _ => now.div_euclid(FRAME_MS),
     };
-    // Three frames, about two a second: the breath grows out of the cloud's side.
-    let breath = match mood {
-        Mood::Idle => "∼",
-        Mood::Working => ["∼", "≈∼", "≋≈∼"][(now / 400).rem_euclid(3) as usize],
-        Mood::Asleep | Mood::Troubled => "",
-    };
-    let unicode = super::theme::unicode();
-    let breath = if unicode {
-        breath
-    } else {
-        &"~~~"[..breath.chars().count()]
-    };
-    let breath = match mood {
-        Mood::Working => p.accent,
-        _ => p.dim,
+    if !super::theme::unicode() {
+        let ink = if mood == Mood::Asleep {
+            p.cloud_asleep
+        } else {
+            p.cloud
+        };
+        return ascii_mascot(mood, tick).map(|l| ink.fg(&format!("{l:<MASCOT_WIDTH$}")));
     }
-    .fg(&format!("{breath:<5}"));
-    let mark = match mood {
-        Mood::Asleep => p.muted.fg(" z   "),
-        Mood::Troubled => p.error.fg(" !   "),
-        _ => " ".repeat(5),
-    };
-    let cloud = |s: &str| p.cloud.fg(s);
-    if !unicode {
-        let mouth = if mood == Mood::Working { "O" } else { mouth };
-        let face = format!(" .({eye} {mouth} {eye})-.")
-            .replace('•', "o")
-            .replace('◡', "u")
-            .replace('─', "-")
-            .replace('×', "x");
-        return [
-            format!("{}{mark}", cloud("   .--.    ")),
-            format!("{}{breath}", cloud(&face)),
-            format!("{}     ", cloud("(_________)")),
-        ];
+    let (cloud, text, dim) = ((p.cloud, true), (p.text, false), (p.dim, false));
+    let (accent, cheeks) = ((p.accent, false), Some((p.cloud_blush, true)));
+    let mut g = Sprite([[None; 14]; 3]);
+    match mood {
+        Mood::Idle => {
+            g.body(cloud, 0);
+            idle_face(&mut g, tick, text);
+        }
+        Mood::Working => {
+            // One gust a second: a big "o" as it leaves, a fainter one trailing below.
+            let at = tick.rem_euclid(6) as usize;
+            g.body(cloud, 1);
+            g.face(if at < 2 { "> o <" } else { "> ₒ <" }, 3, text, None);
+            g.put(1, 11, WIND[at], accent);
+            g.put(2, 11, &WIND[(at + 3) % 6].replace('≋', "~"), dim);
+        }
+        Mood::Asleep => {
+            let ink = (p.cloud_asleep, false);
+            g.body(ink, 0);
+            g.face(
+                if (tick / 9) % 2 == 1 {
+                    "- ˳ -"
+                } else {
+                    "- ₒ -"
+                },
+                3,
+                text,
+                None,
+            );
+            // A z a second, growing and drifting up.
+            g.put(1, 11, "ᶻ", ink);
+            g.put(
+                0,
+                12,
+                ["", "z", "zZ"][(tick / 6).rem_euclid(3) as usize],
+                ink,
+            );
+        }
+        Mood::Troubled => {
+            g.body(cloud, 0);
+            let flinch = matches!(tick.rem_euclid(12), 6 | 8);
+            g.face("ᵒ ᴖ ᵒ", 3 - usize::from(flinch), text, None);
+            g.put(0, 11, "!", (p.error, false));
+            g.put(2, 11, ". .", dim);
+        }
+        Mood::Greet(_) => {
+            // From half drawn, the outline finishes left to right, then a hello and a wink.
+            g.body(cloud, 0);
+            let drawn = (6 + 2 * tick).clamp(0, 11) as usize;
+            for row in &mut g.0 {
+                row[drawn..11].fill(None);
+            }
+            match tick {
+                3..11 => {
+                    let wink = tick >= 6 && tick % 4 >= 2;
+                    g.face(if wink { "^ ᴗ -" } else { "^ ᴗ ^" }, 3, text, cheeks);
+                    let puff = ["~", "≋~", " ≋~", "  ≋"][((tick - 3) / 2).min(3) as usize];
+                    g.put(1, 11, puff, accent);
+                }
+                11.. => idle_face(&mut g, 1, text),
+                _ => {}
+            }
+        }
+        Mood::Done(_) => {
+            g.body(cloud, 0);
+            if tick < 6 {
+                g.face("^ ᴗ ^", 3, text, cheeks);
+                let up = (tick / 2).clamp(0, 2) as usize;
+                g.put(2 - up, 11 + up, "⋆", (p.warning, false));
+            } else {
+                idle_face(&mut g, 1, text);
+            }
+        }
     }
-    // A big puff and a small one on top, rounded below, drawn in quarter blocks. Working, the
-    // face looks downwind, a column to the right.
-    let at = 2 + usize::from(mood == Mood::Working);
-    let solid = |n: usize| "█".repeat(n);
-    // Inverse video keeps the cloud solid behind the face under NO_COLOR.
-    let on_cloud = |g: &str, ink: rpi_tui::theme::Color| {
-        format!(
-            "{}{}{}\x1b[0m",
-            p.cloud.to_fg(),
-            ink.to_bg(),
-            rpi_tui::ansi::inverse(g)
-        )
+    g.0.map(|row| {
+        let mut line: String = (row.iter())
+            .map(|cell| match cell {
+                Some((ch, (color, true))) => color.fg(&bold(&ch.to_string())),
+                Some((ch, (color, false))) => color.fg(&ch.to_string()),
+                None => " ".into(),
+            })
+            .collect();
+        line.push_str("  ");
+        line
+    })
+}
+
+/// The mascot without UTF-8: the same cloud and moods in ASCII, 11 columns and its marks.
+fn ascii_mascot(mood: Mood, tick: i64) -> [String; 3] {
+    let (top, bottom) = ("  .--.--.  ", " `-.___.-' ");
+    let mid = match mood {
+        Mood::Working => {
+            let wind = ["~  ", "~~ ", "~~~", " ~~", "  ~", "   "][tick.rem_euclid(6) as usize];
+            format!(" ( > o < ) {wind}")
+        }
+        Mood::Asleep => {
+            let z = ["", " z", " zZ"][(tick / 6).rem_euclid(3) as usize];
+            return [format!("{top}{z}"), " ( - o - ) ".into(), bottom.into()];
+        }
+        Mood::Troubled => return [format!("{top}!"), " ( o n o ) ".into(), bottom.into()],
+        Mood::Greet(_) if tick < 11 => " ( ^ u ^ ) ".into(),
+        Mood::Done(_) if tick < 6 => " ( ^ u ^ ) ".into(),
+        _ if matches!(tick.rem_euclid(90), 0 | 30 | 45 | 47 | 75) => " ( - u - ) ".into(),
+        _ => " ( o u o ) ".into(),
     };
-    let (eye, mouth) = (on_cloud(eye, p.cloud_eyes), on_cloud(mouth, p.cloud_eyes));
-    let cheek = if mood == Mood::Troubled || p.cloud_blush == p.cloud {
-        cloud("█")
-    } else {
-        on_cloud("▀", p.cloud_blush)
-    };
-    let one = cloud("█");
-    [
-        format!("{}{mark}", cloud(" ▄▟███▖▄▄▖ ")),
-        format!(
-            "{}{eye}{one}{mouth}{one}{eye}{}{breath}",
-            cloud(&format!("▟{}", solid(at - 1))),
-            cloud(&solid(6 - at))
-        ),
-        format!(
-            "{}{cheek}{}{cheek}{}     ",
-            cloud(&format!("▀{}", solid(at - 2))),
-            cloud(&solid(5)),
-            cloud(&format!("{}▀", solid(4 - at)))
-        ),
-    ]
+    [top.into(), mid, bottom.into()]
 }
 
 /// The cloud beside three rows: `zephyr v0.1.0` with the pause badge, `session · account ›
@@ -266,7 +374,7 @@ pub fn header(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
             None => drop(right.pop()),
         }
     };
-    let [m0, m1, m2] = mascot(Mood::of(s), p, now);
+    let [m0, m1, m2] = mascot(Mood::of(s, now), p, now);
     let rule = format!(" {} ", glyph("─").repeat(width.saturating_sub(2)));
     vec![
         format!("{m0}{}", spread(&name, &format!("{paused} "), text)),
@@ -648,7 +756,7 @@ pub fn short_model(id: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::super::theme::DARK;
+    use super::super::theme::{DARK, PLAIN};
     use super::*;
     use crate::router::{ChannelState, Origin, Run, Spend, Waiting};
 
@@ -697,13 +805,13 @@ mod tests {
         for row in &wide {
             assert_eq!(rpi_tui::visible_width(row), 120, "{row:?}");
         }
-        assert_eq!(wide[0].trim_end(), " ▄▟███▖▄▄▖      zephyr");
+        assert_eq!(wide[0].trim_end(), "  .◠◠.◠◠.       zephyr");
         assert_eq!(
             wide[1].trim_end(),
-            "▟█•█◡█•████∼    main · claude-code-1 › claude-opus-5-5"
+            "(  o ᴗ o  )     main · claude-code-1 › claude-opus-5-5"
         );
         assert!(
-            wide[2].starts_with("▀▀█████▀██▀     discord ●  imessage ◐  chat ○"),
+            wide[2].starts_with(" `-.___.-'      discord ●  imessage ◐  chat ○"),
             "{wide:?}"
         );
         assert!(
@@ -730,9 +838,9 @@ mod tests {
         paused.snapshot.paused = Some("user".into());
         paused.snapshot.version = "0.1.0".into();
         let h = plain(header(&paused, &DARK, 80, NOW));
-        assert!(h[0].starts_with(" ▄▟███▖▄▄▖  z   zephyr v0.1.0 "), "{h:?}");
+        assert!(h[0].starts_with("  .◠◠.◠◠.   z   zephyr v0.1.0 "), "{h:?}");
         assert!(h[0].trim_end().ends_with("⏸ paused"), "{h:?}");
-        assert!(h[1].starts_with("▟█─█◡█─████"), "an asleep cloud: {h:?}");
+        assert!(h[1].starts_with("(  - ˳ -  )ᶻ"), "an asleep cloud: {h:?}");
 
         let mut down = up();
         down.link = Link::Down {
@@ -740,7 +848,7 @@ mod tests {
         };
         let h = plain(header(&down, &DARK, 80, NOW));
         assert!(h[1].contains("     main · reconnecting…"), "{h:?}");
-        assert!(h[1].starts_with("▟█×█~█×████ "), "{h:?}");
+        assert!(h[1].starts_with("(  ᵒ ᴖ ᵒ  ) "), "{h:?}");
         assert!(
             !h[2].contains("discord"),
             "stale channel dots are hidden: {h:?}"
@@ -768,25 +876,126 @@ mod tests {
     }
 
     #[test]
-    fn the_cloud_shows_the_mood_and_blows_while_working() {
-        let face = |s: &State, now| plain(mascot(Mood::of(s), &DARK, now).to_vec())[1].clone();
+    fn the_cloud_shows_the_mood_and_plays_its_one_shots() {
+        // Frames as the design prototype draws them (mascot-lab designs/b_glyphs.py).
+        let at = |tick: i64| tick * FRAME_MS;
+        for (mood, now, want) in [
+            (
+                Mood::Idle,
+                at(28),
+                ["  .◠◠.◠◠.", "(  o ᴗ o  )", " `-.___.-'"],
+            ),
+            (
+                Mood::Idle,
+                at(90),
+                ["  .◠◠.◠◠.", "(  - ᴗ -  )", " `-.___.-'"],
+            ),
+            (
+                Mood::Idle,
+                at(60),
+                ["  .◠◠.◠◠.", "(   o ᴗ o )", " `-.___.-'"],
+            ),
+            (
+                Mood::Working,
+                at(0),
+                ["   .◠◠.◠◠.", "(  > o <  )≋", " `-.___.-' ∙-~"],
+            ),
+            (
+                Mood::Working,
+                at(4),
+                ["   .◠◠.◠◠.", "(  > ₒ <  ) ∙-", " `-.___.-' ~~"],
+            ),
+            (
+                Mood::Asleep,
+                at(12),
+                ["  .◠◠.◠◠.   zZ", "(  - ˳ -  )ᶻ", " `-.___.-'"],
+            ),
+            (
+                Mood::Troubled,
+                at(6),
+                ["  .◠◠.◠◠.  !", "( ᵒ ᴖ ᵒ   )", " `-.___.-' . ."],
+            ),
+            (Mood::Greet(0), at(0), ["  .◠◠.", "(", " `-.__"]),
+            (
+                Mood::Greet(0),
+                at(6),
+                ["  .◠◠.◠◠.", "( ◦^ ᴗ -◦ )≋~", " `-.___.-'"],
+            ),
+            (
+                Mood::Done(0),
+                at(4),
+                ["  .◠◠.◠◠.    ⋆", "( ◦^ ᴗ ^◦ )", " `-.___.-'"],
+            ),
+        ] {
+            let got = plain(mascot(mood, &DARK, now).to_vec());
+            let want = want.map(|w| format!("{w:<MASCOT_WIDTH$}"));
+            assert_eq!(got, want, "{mood:?} at {now}");
+        }
+        // Under NO_COLOR the moods still differ, by their glyphs.
+        let moods = [Mood::Idle, Mood::Working, Mood::Asleep, Mood::Troubled];
+        let frames: Vec<_> = (moods.iter())
+            .map(|m| plain(mascot(*m, &PLAIN, NOW).to_vec()))
+            .collect();
+        for (i, f) in frames.iter().enumerate() {
+            assert!(
+                !frames[..i].contains(f),
+                "{:?} looks like another mood",
+                moods[i]
+            );
+        }
+
         let mut s = up();
-        assert_eq!(face(&s, NOW), "▟█•█◡█•████∼    ");
+        assert_eq!(Mood::of(&s, NOW), Mood::Idle);
+        s.greeted = Some(NOW - 500);
+        assert_eq!(Mood::of(&s, NOW), Mood::Greet(NOW - 500));
+        assert_eq!(Mood::of(&s, NOW + GREET_MS), Mood::Idle);
         s.snapshot.run.busy = true;
-        let frames: Vec<String> = (0..3).map(|k| face(&s, k * 400)).collect();
-        assert_eq!(
-            frames,
-            ["▟██•█o█•███∼    ", "▟██•█o█•███≈∼   ", "▟██•█o█•███≋≈∼  "]
-        );
+        assert_eq!(Mood::of(&s, NOW), Mood::Greet(NOW - 500));
+        assert_eq!(Mood::of(&s, NOW + GREET_MS), Mood::Working);
+        s.snapshot.run.busy = false;
+        s.finished = Some(NOW);
+        assert_eq!(Mood::of(&s, NOW + 500), Mood::Done(NOW));
+        assert_eq!(Mood::of(&s, NOW + GREET_MS), Mood::Idle);
+        // Trouble and sleep beat the one-shots.
+        s.snapshot.paused = Some("user".into());
+        assert_eq!(Mood::of(&s, NOW + 500), Mood::Asleep);
         s.snapshot.failed_replies = 1;
-        assert_eq!(face(&s, NOW), "▟█×█~█×████     ");
-        for mood in [Mood::Idle, Mood::Working, Mood::Asleep, Mood::Troubled] {
-            for row in mascot(mood, &DARK, NOW) {
-                assert_eq!(
-                    rpi_tui::visible_width(&row),
-                    MASCOT_WIDTH,
-                    "{mood:?} {row:?}"
-                );
+        assert_eq!(Mood::of(&s, NOW + 500), Mood::Troubled);
+    }
+
+    #[test]
+    fn every_mascot_frame_is_three_rows_of_single_width_glyphs() {
+        use unicode_width::UnicodeWidthChar;
+        let moods = [
+            Mood::Idle,
+            Mood::Working,
+            Mood::Asleep,
+            Mood::Troubled,
+            Mood::Greet(0),
+            Mood::Done(0),
+        ];
+        // 90 frames: the idle loop, and past the end of each one-shot.
+        for mood in moods {
+            for tick in 0..90 {
+                let rows = plain(mascot(mood, &DARK, tick * FRAME_MS).to_vec());
+                assert_eq!(rows.len(), 3);
+                for row in &rows {
+                    assert_eq!(visible_width(row), MASCOT_WIDTH, "{mood:?} {tick}: {row:?}");
+                    for ch in row.chars() {
+                        // Ambiguous glyphs are two columns in CJK terminals.
+                        assert!(
+                            ch.width() == Some(1) && ch.width_cjk() == Some(1),
+                            "{mood:?} {tick}: {ch:?} is wide or ambiguous"
+                        );
+                        assert_eq!(visible_width(&ch.to_string()), 1, "{ch:?}");
+                    }
+                }
+                for row in ascii_mascot(mood, tick) {
+                    assert!(
+                        row.is_ascii() && row.len() <= 14,
+                        "{mood:?} {tick}: {row:?}"
+                    );
+                }
             }
         }
     }
