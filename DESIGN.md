@@ -227,4 +227,5 @@ Each milestone gets a failing test first and runs in its own worktree. Lanes wit
 - The name collides with the Zephyr RTOS (a Linux Foundation project). That doesn't matter for a private repo, but check it before using Zephyr as a public brand.
 - The agent runs as your uid, so it can read anything mounted that you can. Only the listed secret paths are masked.
 - The agent can read the provider credentials rpi itself needs (`accounts/*/auth.json`, the Claude config) and the conversation (`sessions/`); the policy plugin's name check is the only thing in the way, and it can be bypassed.
+- rpi loads extensions from `/zephyr/.rpi/extensions` and the agent dir, which the agent can write. One it plants runs as the agent, so it gains no rights the agent's bash lacks, but it lasts across restarts and could get around the policy plugin's checks.
 - A plain GET can carry data out in its URL; outbound alerts list only commands that send a body or use another method (§4.4 item 3).
