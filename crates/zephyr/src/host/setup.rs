@@ -201,7 +201,8 @@ pub fn login_cmd(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let model = a.value("--model")?;
     let verify = !a.flag("--no-verify");
     match &a.rest()?[..] {
-        [provider] => login(h, provider, account, model, verify),
+        // A new account joins the pool; a re-login gives the agent fresh credentials.
+        [provider] => login(h, provider, account, model, verify).and_then(|()| h.apply()),
         _ => bail!("usage: zephyr login <provider> [--account NAME] [--model P/M] [--no-verify]"),
     }
 }
@@ -424,8 +425,7 @@ pub fn accounts(h: &Host, a: Args) -> anyhow::Result<()> {
         _ => bail!("usage: zephyr accounts [list | order NAME.. | remove NAME]"),
     }
     h.data.save(&doc)?;
-    println!("saved; `zephyr restart` to apply");
-    Ok(())
+    h.apply()
 }
 
 /// Sets the default model, and the only account's model when there is exactly one.
@@ -471,21 +471,22 @@ pub fn model(h: &Host, mut a: Args) -> anyhow::Result<()> {
             if accounts.len() == 1 {
                 conf::set(&mut doc, "model", &model)?;
             }
-            println!("account {name}: {model}; `zephyr restart` to apply");
+            println!("account {name}: {model}");
         }
         None => {
             conf::set(&mut doc, "model", &model)?;
-            println!("model {model}; `zephyr restart` to apply");
+            println!("model {model}");
         }
     }
-    h.data.save(&doc)
+    h.data.save(&doc)?;
+    h.apply()
 }
 
 pub fn channel(h: &Host, a: Args) -> anyhow::Result<()> {
     match &a.rest()?[..] {
         [add, kind] if add == "add" && (kind == "discord" || kind == "imessage") => {
             channel_add(h, kind)?;
-            run(&mut super::docker(&["restart", &h.container]))?;
+            h.apply()?;
             run(&mut h.exec(&[], &[], &["zephyr", "doctor"]))
         }
         _ => bail!("usage: zephyr channel add discord|imessage"),

@@ -30,7 +30,7 @@ impl Channel for Feed {
 struct Gateway {
     feed: tokio::sync::mpsc::Sender<Inbound>,
     stop: tokio::sync::oneshot::Sender<()>,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    task: tokio::task::JoinHandle<anyhow::Result<zephyr::router::Exit>>,
     home: PathBuf,
     agent: PathBuf,
 }

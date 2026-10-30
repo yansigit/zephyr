@@ -7,8 +7,11 @@ use crate::store::{InboxRow, Store};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::Instant;
 
 /// rpi's own cap (`MAX_RESUME_ATTEMPTS`); after that we tell the sender.
@@ -31,18 +34,34 @@ fn retry_window(channel: &str) -> i64 {
     }
 }
 
+/// Why `run` returned.
+#[derive(Debug, PartialEq)]
+pub enum Exit {
+    Shutdown,
+    /// A reload changed what only a fresh daemon picks up; the caller execs itself.
+    Reexec,
+}
+
 /// Runs the gateway until `shutdown` resolves, then drains. Every channel feeds one main session.
 pub async fn run<C: Channel>(
     cfg: &Config,
     channels: &[C],
     shutdown: impl Future<Output = ()>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Exit> {
     std::fs::create_dir_all(&cfg.home)?;
     let (tx, rx) = mpsc::channel(64);
     let (attach_tx, attaches) = mpsc::channel(4);
     let jobs = crate::scheduler::Wake::default();
+    let shared = Arc::new(cfg.clone());
+    let (cfg_tx, cfg_rx) = watch::channel(shared.clone());
     let mut router = Router {
-        cfg,
+        cfg: shared,
+        cfg_tx,
+        edits: edits(cfg),
+        secrets: crate::dotenv::read(&secrets_path(cfg)).unwrap_or_default(),
+        pending_model: None,
+        reexec: false,
+        auth_stamp: None,
         store: Store::open(&cfg.db_path())?,
         child: None,
         busy: false,
@@ -59,15 +78,39 @@ pub async fn run<C: Channel>(
     };
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
-        r = runs => r.map(drop),
-        r = crate::attach::serve(cfg, tx, attach_tx) => r,
-        r = crate::scheduler::run(cfg, &jobs) => r,
+        r = runs => r.map(|_| Exit::Shutdown),
+        r = crate::attach::serve(cfg, tx, attach_tx) => r.map(|()| Exit::Shutdown),
+        r = crate::scheduler::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),
         r = router.main(rx, channels, shutdown) => r,
     }
 }
 
+fn secrets_path(cfg: &Config) -> PathBuf {
+    cfg.home.join("secrets.env")
+}
+
+/// The mtimes a hand edit changes: `zephyr.toml` and `secrets.env`.
+type Edits = (Option<SystemTime>, Option<SystemTime>);
+
+fn edits(cfg: &Config) -> Edits {
+    let config = cfg.path.as_deref().and_then(crate::reload::stamp);
+    (config, crate::reload::stamp(&secrets_path(cfg)))
+}
+
 struct Router<'a> {
-    cfg: &'a Config,
+    /// The live config; `reload` swaps it and sends it to the scheduler.
+    cfg: Arc<Config>,
+    cfg_tx: watch::Sender<Arc<Config>>,
+    /// Config file mtimes as of the last reload, so a hand edit is applied once.
+    edits: Edits,
+    /// `secrets.env` as this process loaded it; a change needs a re-exec.
+    secrets: Vec<(String, String)>,
+    /// A same-provider model switch, sent with `set_model` once the child is idle.
+    pending_model: Option<String>,
+    /// Exit with `Exit::Reexec` once main and the jobs are idle.
+    reexec: bool,
+    /// The child's `auth.json` mtime at spawn; a newer one (a re-login) restarts the child.
+    auth_stamp: Option<SystemTime>,
     store: Store,
     child: Option<Child>,
     /// A prompt or resume is running in the child.
@@ -87,7 +130,7 @@ struct Router<'a> {
     /// A refresh or a failover needs the child restarted; done once it is idle.
     restart: bool,
     /// The pooled account the child runs on (DESIGN §4.9). `None` without a pool.
-    account: Option<&'a Account>,
+    account: Option<Account>,
 }
 
 async fn next_event(child: &mut Option<Child>) -> Option<Value> {
@@ -103,8 +146,9 @@ impl<'a> Router<'a> {
         mut rx: mpsc::Receiver<Inbound>,
         channels: &[C],
         shutdown: impl Future<Output = ()>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Exit> {
         tokio::pin!(shutdown);
+        let mut exit = Exit::Shutdown;
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         loop {
@@ -126,12 +170,21 @@ impl<'a> Router<'a> {
                 },
                 _ = tick.tick() => {
                     let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
+                    if self.cfg.path.is_some() && edits(&self.cfg) != self.edits {
+                        let text = self.reload().await;
+                        eprintln!("zephyr: zephyr.toml or secrets.env changed: {text}");
+                    }
                 }
             }
             self.flush(channels).await;
+            if self.reexec && !self.busy && !self.jobs.running.load(Ordering::SeqCst) {
+                eprintln!("zephyr: restarting itself to apply the new settings");
+                exit = Exit::Reexec;
+                break;
+            }
         }
         self.drain(channels).await;
-        Ok(())
+        Ok(exit)
     }
 
     fn tapped(&self, ev: Option<Value>) -> Option<Value> {
@@ -166,14 +219,16 @@ impl<'a> Router<'a> {
                 return;
             }
         };
-        match Child::spawn_as(self.cfg, MAIN_SESSION, account).await {
+        match Child::spawn_as(&self.cfg, MAIN_SESSION, account.as_ref()).await {
             Ok(child) => {
                 eprintln!("zephyr: rpi child {:?} ready", child.pid());
-                if let Some(a) = account {
+                if let Some(a) = &account {
                     eprintln!("zephyr: on account {} ({})", a.name, a.model);
                 }
                 self.child = Some(child);
                 self.account = account;
+                self.pending_model = None;
+                self.auth_stamp = crate::reload::stamp(&self.auth_file());
                 self.busy = false;
                 log(self.reconcile(None, false).await);
             }
@@ -186,15 +241,17 @@ impl<'a> Router<'a> {
 
     /// The account for the next child: `Ok(None)` without a pool, `Err(until)` when every
     /// account is cooling down.
-    fn pick(&self) -> Result<Option<&'a Account>, i64> {
-        if self.cfg.accounts.is_empty() {
-            return Ok(None);
+    fn pick(&self) -> Result<Option<Account>, i64> {
+        pick_in(&self.cfg, &self.store)
+    }
+
+    /// `auth.json` of the child's account, or of the agent dir without a pool.
+    fn auth_file(&self) -> PathBuf {
+        match &self.account {
+            Some(a) => self.cfg.account_dir(a),
+            None => crate::auth_keeper::agent_dir(&self.cfg),
         }
-        let cooling = self.store.cooldowns().unwrap_or_else(|e| {
-            eprintln!("zephyr: reading cooldowns failed: {e}");
-            Default::default()
-        });
-        crate::pool::pick(&self.cfg.accounts, &cooling, now()).map(Some)
+        .join("auth.json")
     }
 
     async fn child_exited(&mut self) {
@@ -237,7 +294,7 @@ impl<'a> Router<'a> {
             log(self.store.reply(&row, &reply, "done").map_err(Into::into));
             return;
         }
-        if let Some(reply) = crate::scheduler::command(&mut self.store, self.cfg, &m) {
+        if let Some(reply) = crate::scheduler::command(&mut self.store, &self.cfg, &m) {
             let row = InboxRow {
                 id,
                 channel: m.channel,
@@ -247,6 +304,17 @@ impl<'a> Router<'a> {
             };
             log(self.store.reply(&row, &reply, "done").map_err(Into::into));
             self.jobs.runs.notify_one();
+            return;
+        }
+        if let Some(reply) = self.command(m.text.trim()).await {
+            let row = InboxRow {
+                id,
+                channel: m.channel,
+                sender: m.sender,
+                text: m.text,
+                tries: 0,
+            };
+            log(self.store.reply(&row, &reply, "done").map_err(Into::into));
             return;
         }
         let cmd = m.text.trim().to_string();
@@ -306,7 +374,7 @@ impl<'a> Router<'a> {
             total
         };
         self.store.set_last_stats(total)?;
-        if let Some(a) = self.account {
+        if let Some(a) = &self.account {
             self.store.add_account_spend(&a.name, delta)?;
         }
         Ok(self.store.charge(self.cfg.budget.as_ref(), delta)?)
@@ -336,6 +404,8 @@ impl<'a> Router<'a> {
 
     async fn settled(&mut self, ev: &Value) {
         self.busy = false;
+        // Before reconcile dispatches the next row, so that row runs on the new model.
+        self.apply_model().await;
         self.backoff = FIRST_BACKOFF;
         log(crate::memory::commit_if_changed(&self.cfg.home).map(drop));
         let crossed = self.record_spend().await.unwrap_or_else(|e| {
@@ -351,14 +421,16 @@ impl<'a> Router<'a> {
         };
         let limited = self
             .account
+            .clone()
             .zip(ev["error"].as_str())
             .and_then(|(a, e)| crate::pool::rate_limit(e).map(|resets| (a, e, resets)));
         match limited {
             Some((account, error, resets_at)) => {
-                log(self.fail_over(account, error, resets_at).await)
+                log(self.fail_over(&account, error, resets_at).await)
             }
             None => {
-                if let (Some(a), "completed") = (self.account, ev["outcome"].as_str().unwrap_or(""))
+                if let (Some(a), "completed") =
+                    (&self.account, ev["outcome"].as_str().unwrap_or(""))
                 {
                     log(self.store.clear_cooldown(&a.name).map_err(Into::into));
                 }
@@ -408,15 +480,162 @@ impl<'a> Router<'a> {
         Ok(())
     }
 
+    /// `/reload`, `/status` and `/model`, run outside the queue. `None` for anything else.
+    async fn command(&mut self, text: &str) -> Option<String> {
+        let (cmd, arg) = text.split_once(' ').unwrap_or((text, ""));
+        Some(match (cmd, arg.trim()) {
+            ("/reload", "") => self.reload().await,
+            ("/status", "") => self.status(),
+            ("/model", "") => self.models(),
+            ("/model", model) => self.switch_model(model).await,
+            _ => return None,
+        })
+    }
+
+    fn status(&self) -> String {
+        let agent = match (&self.child, &self.account, &self.cfg.model) {
+            (None, _, _) => "agent: not running".to_string(),
+            (Some(_), Some(a), _) => format!("agent: account {} on {}", a.name, a.model),
+            (Some(_), None, model) => {
+                format!(
+                    "agent: on {}",
+                    model.as_deref().unwrap_or("rpi's default model")
+                )
+            }
+        };
+        let rest = crate::reload::status_lines(&self.cfg, &self.store)
+            .unwrap_or_else(|e| vec![format!("status failed: {e:#}")]);
+        std::iter::once(agent)
+            .chain(rest)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn models(&self) -> String {
+        let mut lines = vec![self.status().lines().next().unwrap_or_default().to_string()];
+        lines.extend(
+            self.cfg
+                .accounts
+                .iter()
+                .map(|a| format!("account {}: {}", a.name, a.model)),
+        );
+        lines.push("/model PROVIDER/MODEL switches; it applies after the current reply".into());
+        lines.join("\n")
+    }
+
+    /// `/model PROVIDER/MODEL`: checks rpi knows the model, writes it to `zephyr.toml` on the
+    /// account for that provider (`reload::set_model`), then reloads.
+    async fn switch_model(&mut self, model: &str) -> String {
+        let Some(path) = self.cfg.path.clone() else {
+            return "[zephyr] no zephyr.toml to change".into();
+        };
+        if let Ok(list) = self.call(json!({"type": "get_available_models"})).await {
+            let known = list["models"].as_array().into_iter().flatten().any(|m| {
+                format!(
+                    "{}/{}",
+                    m["provider"].as_str().unwrap_or(""),
+                    m["id"].as_str().unwrap_or("")
+                ) == model
+            });
+            if !known {
+                return format!("[zephyr] rpi has no model {model}");
+            }
+        }
+        let active = self.account.as_ref().map(|a| a.name.clone());
+        let saved = crate::host::conf::load(&path).and_then(|mut doc| {
+            crate::reload::set_model(&mut doc, active.as_deref(), model)?;
+            crate::host::conf::save(&path, &doc)
+        });
+        match saved {
+            Ok(()) => self.reload().await,
+            Err(e) => format!("[zephyr] model not changed: {e:#}"),
+        }
+    }
+
+    /// Reads `zephyr.toml` and `secrets.env` again and applies what changed (`reload::diff`).
+    /// A file that does not load leaves everything as it was. Returns the reply text.
+    async fn reload(&mut self) -> String {
+        use crate::reload::Plan;
+        let Some(path) = self.cfg.path.clone() else {
+            return "[zephyr] no zephyr.toml to reload".into();
+        };
+        self.edits = edits(&self.cfg);
+        let new = match Config::load(&path) {
+            Ok(new) => new,
+            Err(e) => return format!("[zephyr] zephyr.toml not applied: {e:#}"),
+        };
+        let secrets = crate::dotenv::read(&secrets_path(&new)).unwrap_or_default();
+        let next = pick_in(&new, &self.store).ok().flatten();
+        let mut plan = crate::reload::diff(&self.cfg, &new, self.account.as_ref(), next.as_ref());
+        if secrets != self.secrets {
+            plan = Plan::Reexec;
+        } else if self.child.is_some()
+            && crate::reload::stamp(&self.auth_file()) != self.auth_stamp
+            && !matches!(plan, Plan::Reexec)
+        {
+            plan = Plan::RestartChild; // a re-login: rpi reads credentials at start
+        }
+        let new = Arc::new(new);
+        self.cfg = new.clone();
+        let _ = self.cfg_tx.send(new);
+        let after = if self.busy {
+            "after the current reply"
+        } else {
+            "now"
+        };
+        match plan {
+            Plan::Same => "[zephyr] nothing changed".into(),
+            Plan::Live => {
+                self.account = next.or(self.account.take());
+                "[zephyr] applied".into()
+            }
+            Plan::SetModel(model) => {
+                self.account = next;
+                self.pending_model = Some(model.clone());
+                if self.busy {
+                    return format!("[zephyr] switching to {model} {after}");
+                }
+                match self.apply_model().await {
+                    None => format!("[zephyr] now on {model}"),
+                    Some(e) => e,
+                }
+            }
+            Plan::RestartChild => {
+                self.restart = true;
+                self.restart_if_idle().await;
+                let on = next.map_or(String::new(), |a| format!(" on {} ({})", a.name, a.model));
+                format!("[zephyr] restarting the agent{on} {after}; the conversation carries on")
+            }
+            Plan::Reexec => {
+                self.reexec = true;
+                format!("[zephyr] restarting zephyr's channels {after}")
+            }
+        }
+    }
+
+    /// Sends a pending `set_model`. A refusal goes to the owner, and the error text is returned.
+    async fn apply_model(&mut self) -> Option<String> {
+        let model = self.pending_model.take()?;
+        self.child.as_ref()?; // a child that is down starts on the new model anyway
+        let (provider, id) = model.split_once('/')?;
+        let cmd = json!({"type": "set_model", "provider": provider, "modelId": id});
+        let e = self.call(cmd).await.err()?;
+        let text = format!("[zephyr] rpi refused {model}: {e:#}");
+        eprintln!("zephyr: {text}");
+        log(self.store.notify_last_owner(&text).map_err(Into::into));
+        Some(text)
+    }
+
     /// Refreshes near-expiry OAuth credentials, then restarts the child once it is idle.
     async fn auth_check(&mut self) {
         let every = Duration::from_secs_f64((self.cfg.auth.refresh_minutes * 60.0).max(1.0));
         self.auth_at = Instant::now() + every;
         let now = crate::auth_keeper::now_secs();
         if !self.cfg.accounts.is_empty() {
-            self.restart |= crate::auth_keeper::refresh_accounts(self.cfg, self.account, now).await;
+            self.restart |=
+                crate::auth_keeper::refresh_accounts(&self.cfg, self.account.as_ref(), now).await;
         } else if let Some(child) = self.child.as_mut() {
-            match crate::auth_keeper::refresh(child, self.cfg, now).await {
+            match crate::auth_keeper::refresh(child, &self.cfg, now).await {
                 Ok(refreshed) => self.restart |= refreshed,
                 Err(e) => eprintln!("zephyr: auth check failed: {e:#}"),
             }
@@ -591,6 +810,19 @@ impl<'a> Router<'a> {
             None => anyhow::bail!("rpi child is not running"),
         }
     }
+}
+
+/// The account a child on `cfg` would run on: `Ok(None)` without a pool, `Err(until)` when
+/// every account is cooling down.
+fn pick_in(cfg: &Config, store: &Store) -> Result<Option<Account>, i64> {
+    if cfg.accounts.is_empty() {
+        return Ok(None);
+    }
+    let cooling = store.cooldowns().unwrap_or_else(|e| {
+        eprintln!("zephyr: reading cooldowns failed: {e}");
+        Default::default()
+    });
+    crate::pool::pick(&cfg.accounts, &cooling, now()).map(|a| Some(a.clone()))
 }
 
 fn log(r: anyhow::Result<()>) {

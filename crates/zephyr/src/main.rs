@@ -16,7 +16,7 @@ use zephyr::store::Store;
 /// The rpi minor this build speaks (DESIGN §3).
 const RPI_PIN: &str = "rpi 0.12.";
 
-const USAGE: &str = "usage: zephyr <run|status|doctor|chat|pause|resume>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
+const USAGE: &str = "usage: zephyr <run|status|doctor|chat|pause|resume|reload>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -31,19 +31,21 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     // The daemon and the commands run beside it read secrets.env themselves (no --env-file).
+    let mut from_file = Vec::new();
     let cfg = Config::load(&Config::default_path()).and_then(|cfg| {
-        zephyr::dotenv::load(&cfg.home.join("secrets.env"))?;
+        from_file = zephyr::dotenv::load(&cfg.home.join("secrets.env"))?;
         Ok(cfg)
     });
     let result = match cfg {
         Err(e) if cmd != "-h" && cmd != "--help" => Err(e),
         cfg => match (cmd.as_str(), cfg) {
-            ("run", Ok(cfg)) => run(cfg).await,
+            ("run", Ok(cfg)) => run(cfg, &from_file).await,
             ("status", Ok(cfg)) => status(&cfg).await,
             ("doctor", Ok(cfg)) => doctor(&cfg).await,
             ("chat", Ok(cfg)) => chat::client(&cfg.socket_path()).await,
             ("pause", Ok(cfg)) => control(&cfg, "/pause").await,
             ("resume", Ok(cfg)) => control(&cfg, "/resume").await,
+            ("reload", Ok(cfg)) => control(&cfg, "/reload").await,
             _ => {
                 eprintln!("{USAGE}");
                 return ExitCode::from(2);
@@ -87,7 +89,8 @@ fn lock_home(home: &Path) -> anyhow::Result<std::fs::File> {
     Ok(file)
 }
 
-async fn run(cfg: Config) -> anyhow::Result<()> {
+/// `from_file`: the variables secrets.env set, dropped before a re-exec so it reads them anew.
+async fn run(cfg: Config, from_file: &[String]) -> anyhow::Result<()> {
     let _lock = lock_home(&cfg.home)?;
     let mut channels = vec![AnyChannel::Chat(ChatChannel::new(cfg.socket_path()))];
     if let Some(discord) = &cfg.discord {
@@ -107,7 +110,19 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         }
         eprintln!("zephyr: shutting down");
     };
-    zephyr::router::run(&cfg, &channels, shutdown).await
+    let exit = zephyr::router::run(&cfg, &channels, shutdown).await?;
+    drop(channels);
+    if exit == zephyr::router::Exit::Reexec {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new(std::env::current_exe()?);
+        cmd.args(std::env::args_os().skip(1));
+        for key in from_file {
+            cmd.env_remove(key);
+        }
+        // Only returns on failure. The lock and every socket are close-on-exec.
+        return Err(cmd.exec().into());
+    }
+    Ok(())
 }
 
 /// `zephyr pause` / `resume`: through the running daemon's chat socket, so a run in progress is
@@ -142,30 +157,13 @@ async fn status(cfg: &Config) -> anyhow::Result<()> {
         .is_ok();
     println!("daemon: {}", if up { "running" } else { "not reachable" });
     let store = Store::open(&cfg.db_path())?;
-    let paused = store.pause_reason()?;
-    println!(
-        "paused: {}",
-        paused.map_or("no".into(), |r| format!("yes ({r})"))
-    );
-    let day = store.today()?;
-    let (tokens, cost) = store.spend(&day)?;
-    let budget = cfg.budget.clone().unwrap_or_default();
-    println!(
-        "spend:  {day} UTC: {tokens} tokens (limit {}), ${cost:.4} (limit {})",
-        limit(budget.daily_tokens),
-        limit(budget.daily_cost_usd)
-    );
-    for line in zephyr::pool::status(cfg, &store, zephyr::now())? {
+    for line in zephyr::reload::status_lines(cfg, &store)? {
         println!("{line}");
     }
     for (table, status, n) in store.counts()? {
         println!("{table:<7} {status:<11} {n}");
     }
     Ok(())
-}
-
-fn limit<T: std::fmt::Display>(v: Option<T>) -> String {
-    v.map_or("none".into(), |v| v.to_string())
 }
 
 async fn doctor(cfg: &Config) -> anyhow::Result<()> {

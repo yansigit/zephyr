@@ -9,8 +9,10 @@ use crate::store::{JobRun, Store};
 use croner::parser::{CronParser, Seconds, Year};
 use jiff::{tz::TimeZone, Timestamp};
 use serde_json::json;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 
 const TICK: Duration = Duration::from_secs(30);
 /// How often the pause flag (set by `/pause` or a budget trip, in the store) is read.
@@ -28,6 +30,8 @@ pub struct Wake {
     pub runs: Notify,
     /// The scheduler wrote to the outbox.
     pub outbox: Notify,
+    /// A job run is in progress, so the daemon does not re-exec under it.
+    pub running: AtomicBool,
 }
 
 /// `cfg.timezone`, else the system's.
@@ -83,8 +87,10 @@ fn parse_cron(schedule: &str) -> Result<croner::Cron, String> {
 }
 
 /// Runs until an error opening the store; per-run errors are logged and the loop goes on.
-pub async fn run(cfg: &Config, wake: &Wake) -> anyhow::Result<()> {
-    let tz = zone(cfg)?;
+/// `cfgs` carries each reloaded config; a run started before a reload finishes on the old one.
+pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow::Result<()> {
+    let mut cfg = cfgs.borrow_and_update().clone();
+    let mut tz = zone(&cfg)?;
     let mut store = Store::open(&cfg.db_path())?;
     if store.interrupt_running_runs(crate::now())? > 0 {
         wake.outbox.notify_one();
@@ -98,6 +104,10 @@ pub async fn run(cfg: &Config, wake: &Wake) -> anyhow::Result<()> {
             _ = wake.runs.notified() => true,
             _ = poll.tick() => false,
         };
+        if cfgs.has_changed().unwrap_or(false) {
+            cfg = cfgs.borrow_and_update().clone();
+            tz = zone(&cfg)?; // checked by Config::validate
+        }
         let now_paused = paused(&store);
         // A resume works through what waited without waiting for the next tick.
         let resumed = std::mem::replace(&mut was_paused, now_paused) && !now_paused;
@@ -116,7 +126,9 @@ pub async fn run(cfg: &Config, wake: &Wake) -> anyhow::Result<()> {
                     break;
                 }
             };
-            let (status, output, crossed) = execute(cfg, &mut store, &run).await;
+            wake.running.store(true, Ordering::SeqCst);
+            let (status, output, crossed) = execute(&cfg, &mut store, &run).await;
+            wake.running.store(false, Ordering::SeqCst);
             // The run's memory edits are committed as main's settle would commit them.
             log_err(crate::memory::commit_if_changed(&cfg.home));
             let delivery = (output.trim() != SILENT).then_some(output.as_str());

@@ -39,7 +39,7 @@ struct Gateway {
     port: u16,
     chat: mpsc::Sender<Inbound>,
     stop: oneshot::Sender<()>,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    task: tokio::task::JoinHandle<anyhow::Result<zephyr::router::Exit>>,
 }
 
 fn start(name: &str) -> Gateway {

@@ -170,6 +170,17 @@ There are no per-call prompts. These hard limits hold every time:
 - **Budget.** Daily totals are unchanged and count every account. Each settle's usage is also added to `account_spend(day, account)`, shown by `zephyr status`.
 - **`zephyr status`** prints one line per account: `ready`, `cooling until <time> (<reason>)`, or `needs login` when the account's `auth.json` has no key for its provider (only the keys are read). An API key given by environment variable shows as `needs login`.
 
+### 4.10 Live settings
+
+- The router owns the config as an `Arc<Config>` and sends each new one to the scheduler on a `watch` channel. `Config::load` records the file it read.
+- **Triggers.** `/reload` (owner-only, outside the queue, like `/pause`; `zephyr reload` sends it over the chat socket, and the host CLI runs it after every edit), and the router's 5 s tick when the mtime of `zephyr.toml` or `secrets.env` changed. A file that does not load or validate is reported and not applied.
+- **Plan** (`reload::diff`), the least disruptive that covers the change:
+  - `rpi`, `home`, `[discord]`, `[imessage]`, `[attach]`, or any `secrets.env` pair: **re-exec**. Once main is settled and no job runs, the router drains as on SIGTERM and `zephyr run` execs itself with the same args, minus the variables secrets.env set, so the new process reads them again. The lock and sockets are close-on-exec; under `--init` the PID stays.
+  - `extensions`, `policy_plugin`, `agent_dir`, the active account changing (the pool would now pick another), a model on another provider, or a newer `auth.json` for the active account (a re-login): **restart the child** when idle, as the AuthKeeper does, on the same session.
+  - The active account's model on the same provider: **`set_model`** when idle (before reconcile sends the next row). rpi checks it against its catalogue; the sign-in stays the same, so the bound credentials (§4.7) are still right. A refusal is told to the owner.
+  - Anything else (budget, owners, time zone, `[auth]`, the pool order): read where it is used.
+- **`/model PROVIDER/MODEL`** checks the model with `get_available_models`, sets it on the active account if that is on the provider, else on the first account that is, moved to the front, writes `zephyr.toml` (atomically, comments kept), then reloads. `/status` adds the agent's account and model to what `zephyr status` prints.
+
 ## 5. Repo layout
 
 New repo `yansigit/zephyr` (private), local at `/home/user/Projects/zephyr`, a Rust workspace:

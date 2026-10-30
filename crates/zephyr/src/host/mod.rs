@@ -18,12 +18,12 @@ pub const USAGE: &str = "usage: zephyr <command>
   model [--account NAME] [PROVIDER/MODEL]
   channel add discord|imessage
   config get|set KEY [VALUE]
-  chat | attach | pause | resume
+  chat | attach | pause | resume | reload
   doctor [--fix]
   uninstall [--keep-data] [--yes]
 env: ZEPHYR_CONTAINER (default zephyr), ZEPHYR_IMAGE, ZEPHYR_SRC (for --build); data in ~/.zephyr";
 
-const COMMANDS: [&str; 18] = [
+const COMMANDS: [&str; 19] = [
     "init",
     "up",
     "down",
@@ -42,6 +42,7 @@ const COMMANDS: [&str; 18] = [
     "uninstall",
     "pause",
     "resume",
+    "reload",
 ];
 
 /// The image sets ZEPHYR_IN_CONTAINER. ZEPHYR_CONFIG (set in the image and by tests) also points
@@ -156,6 +157,15 @@ impl Host {
                 .env("GH_TOKEN", token);
         }
         run(cmd.arg(&src))
+    }
+
+    /// Has the running daemon reload its settings, and prints what it did with them.
+    pub(crate) fn apply(&self) -> anyhow::Result<()> {
+        if !self.running() {
+            println!("saved; applies when zephyr starts (`zephyr up`)");
+            return Ok(());
+        }
+        run(&mut self.exec(&[], &[], &["zephyr", "reload"]))
     }
 
     /// Recreates the container from the image. Secrets come from secrets.env, read by the daemon.
@@ -448,6 +458,11 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
             a.rest()?;
             h.doctor(fix)
         }
+        "reload" => {
+            a.rest()?;
+            h.need_running()?;
+            h.apply()
+        }
         "chat" | "pause" | "resume" => {
             a.rest()?;
             h.need_running()?;
@@ -482,12 +497,16 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                 }
                 ["set", key, value] => {
                     conf::set(&mut doc, key, value)?;
-                    // Refuse what the daemon would refuse at start (its config denies unknown keys).
-                    toml::from_str::<crate::config::Config>(&doc.to_string()).with_context(
-                        || format!("{key} = {value} would make the config invalid"),
-                    )?;
+                    // Refuse what the daemon would refuse (unknown keys, a bad time zone).
+                    toml::from_str::<crate::config::Config>(&doc.to_string())
+                        .map_err(anyhow::Error::from)
+                        .and_then(|c| c.validate())
+                        .with_context(|| {
+                            format!("{key} = {value} would make the config invalid")
+                        })?;
                     h.data.save(&doc)?;
-                    println!("set {key}; `zephyr restart` to apply");
+                    println!("set {key}");
+                    h.apply()?;
                 }
                 _ => bail!("usage: zephyr config get KEY | config set KEY VALUE"),
             }

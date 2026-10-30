@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 const EXPIRY_WINDOW_SECS: i64 = 15 * 60;
 
 /// `[auth]`. Absent means the defaults: enabled, checked every 10 minutes.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AuthConfig {
     pub enabled: bool,

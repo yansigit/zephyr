@@ -48,7 +48,7 @@ struct Gateway {
     feeds: HashMap<&'static str, mpsc::Sender<Inbound>>,
     sent: HashMap<&'static str, Sent>,
     stop: Option<oneshot::Sender<()>>,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    task: tokio::task::JoinHandle<anyhow::Result<zephyr::router::Exit>>,
 }
 
 fn home(name: &str) -> PathBuf {
@@ -966,4 +966,145 @@ async fn a_rate_limited_job_retries_on_the_next_account() {
         "a fresh session on b"
     );
     gw.shutdown().await;
+}
+
+/// A config loaded from `<home>/zephyr.toml`, so reloads have a file to read: accounts `a`
+/// (`fake/m1`) then `b` (`other/m3`), both models in the fake rpi's catalogue.
+fn on_file(home: &Path, extra: &str) -> Config {
+    let path = home.join("zephyr.toml");
+    std::fs::write(&path, file_text(home, extra)).unwrap();
+    Config::load(&path).unwrap()
+}
+
+fn file_text(home: &Path, extra: &str) -> String {
+    format!(
+        "rpi = {:?}\nhome = {:?}\n{extra}\n[owners]\nchat = [\"owner\"]\n\
+         [[account]]\nname = \"a\"\nmodel = \"fake/m1\"\n[[account]]\nname = \"b\"\nmodel = \"other/m3\"\n",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-rpi.py"),
+        home,
+    )
+}
+
+fn accounts_in_file(home: &Path) -> Vec<(String, String)> {
+    let cfg = Config::load(&home.join("zephyr.toml")).unwrap();
+    cfg.accounts
+        .into_iter()
+        .map(|a| (a.name, a.model))
+        .collect()
+}
+
+#[tokio::test]
+async fn model_switches_after_the_current_reply_without_a_restart() {
+    let home = home("model-same");
+    std::fs::write(home.join("slow"), "1").unwrap();
+    let gw = start(on_file(&home, ""));
+    gw.say("m1", "owner", "long").await;
+    wait(|| !log(&home, "prompt").is_empty()).await; // mid-run
+    gw.say("m2", "owner", "/model fake/m2").await;
+    gw.say("m3", "owner", "model?").await;
+    assert_eq!(
+        gw.wait_replies(3).await,
+        [
+            "[zephyr] switching to fake/m2 after the current reply",
+            "echo: [chat #1] long",
+            "model: fake/m2"
+        ]
+    );
+    assert_eq!(log(&home, "start").len(), 1, "no restart");
+    assert_eq!(log(&home, "abort").len(), 0, "the reply was not cut off");
+    assert_eq!(log(&home, "set_model").len(), 1);
+    assert_eq!(accounts_in_file(&home)[0], ("a".into(), "fake/m2".into()));
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn model_on_another_provider_restarts_on_that_account_and_keeps_the_session() {
+    let home = home("model-other");
+    let gw = start(on_file(&home, ""));
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "/model other/m3").await;
+    gw.say("m3", "owner", "model?").await;
+    let replies = gw.wait_replies(3).await;
+    assert_eq!(
+        replies[1],
+        "[zephyr] restarting the agent on b (other/m3) now; the conversation carries on"
+    );
+    assert_eq!(replies[2], "model: other/m3");
+    let starts = log(&home, "start");
+    assert_eq!(starts.len(), 2);
+    assert!(starts.iter().all(|s| s["sessionId"] == "main"));
+    assert_eq!(accounts_in_file(&home)[0].0, "b", "b moved to the front");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn unknown_models_and_bad_edits_change_nothing() {
+    let home = home("model-bad");
+    let gw = start(on_file(&home, ""));
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_replies(1).await; // the child is up, so rpi checks the model
+    gw.say("m2", "owner", "/model fake/nope").await;
+    gw.say("m3", "owner", "/model third/x").await;
+    gw.wait_replies(3).await;
+    std::fs::write(home.join("zephyr.toml"), "rpi = [").unwrap();
+    gw.say("m4", "owner", "/reload").await;
+    gw.say("m5", "owner", "still there?").await;
+    let replies = gw.wait_replies(5).await;
+    assert_eq!(replies[1], "[zephyr] rpi has no model fake/nope");
+    assert_eq!(replies[2], "[zephyr] rpi has no model third/x");
+    assert!(
+        replies[3].starts_with("[zephyr] zephyr.toml not applied: "),
+        "{replies:?}"
+    );
+    assert_eq!(replies[4], "echo: [chat #5] still there?");
+    assert_eq!(log(&home, "start").len(), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn hand_edits_apply_live_on_the_next_tick() {
+    let home = home("hand-edit");
+    let gw = start(on_file(&home, ""));
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_replies(1).await;
+    std::fs::write(
+        home.join("zephyr.toml"),
+        file_text(&home, "[budget]\ndaily_tokens = 5"),
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(6)).await; // the 5 s tick
+    gw.say("m2", "owner", "/status").await;
+    let status = gw.wait_replies(2).await.remove(1);
+    assert!(status.contains("(limit 5)"), "{status}");
+    assert!(
+        status.starts_with("agent: account a on fake/m1"),
+        "{status}"
+    );
+    assert_eq!(log(&home, "start").len(), 1, "no restart");
+    gw.say("m3", "owner", "/reload").await;
+    assert_eq!(gw.wait_replies(3).await[2], "[zephyr] nothing changed");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_channel_change_ends_the_run_for_a_reexec_once_idle() {
+    let home = home("reexec");
+    let gw = start(on_file(&home, ""));
+    std::fs::write(
+        home.join("zephyr.toml"),
+        file_text(&home, "[discord]\ntoken_env = \"ZEPHYR_T\""),
+    )
+    .unwrap();
+    gw.say("m1", "owner", "/reload").await;
+    assert_eq!(
+        gw.wait_replies(1).await,
+        ["[zephyr] restarting zephyr's channels now"]
+    );
+    let exit = tokio::time::timeout(Duration::from_secs(10), gw.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(exit, zephyr::router::Exit::Reexec);
 }

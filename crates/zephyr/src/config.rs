@@ -4,7 +4,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// The pinned `rpi` binary.
@@ -45,6 +45,9 @@ pub struct Config {
     /// OAuth refresh (DESIGN §4.7). Defaults apply when the table is absent.
     #[serde(default)]
     pub auth: crate::auth_keeper::AuthConfig,
+    /// The file this was loaded from, which a reload reads again. `None` when built in memory.
+    #[serde(skip)]
+    pub path: Option<PathBuf>,
 }
 
 fn job_timeout() -> std::time::Duration {
@@ -56,7 +59,7 @@ pub const BUDGET_NOTICE: &str =
     "[zephyr] daily budget reached: paused until the next UTC day or /resume";
 
 /// `[budget]`: counted per UTC day. Crossing a limit pauses the gateway until the next UTC day or `/resume`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {
     pub daily_tokens: Option<i64>,
@@ -71,7 +74,7 @@ impl Budget {
 }
 
 /// One `[[account]]`. Its credentials live in `<home>/accounts/<name>/`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Account {
     pub name: String,
@@ -86,7 +89,7 @@ impl Account {
 }
 
 /// `[attach]`: listens on 127.0.0.1 only. The token comes from exactly one of the two sources.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Attach {
     pub port: u16,
@@ -100,8 +103,9 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-        let cfg: Self = toml::from_str(&text)?;
+        let mut cfg: Self = toml::from_str(&text)?;
         cfg.validate()?;
+        cfg.path = Some(path.to_path_buf());
         Ok(cfg)
     }
 
@@ -124,6 +128,7 @@ impl Config {
                 anyhow::bail!("account {:?}: model must be <provider>/<model>", a.name);
             }
         }
+        crate::scheduler::zone(self)?;
         Ok(())
     }
 

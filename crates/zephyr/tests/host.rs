@@ -410,8 +410,13 @@ fn accounts_model_and_config_edit_the_toml() {
         .zephyr(&["model", "--account", "a", "openai-codex/gpt-5.4"])
         .status
         .success());
+    env.calls();
     env.ok(&["model", "--account", "b", "openai-codex/gpt-5.4"]);
     assert!(env.config().contains("model = \"openai-codex/gpt-5.4\""));
+    find(
+        &env.calls(),
+        &["docker", "exec", CONTAINER, "zephyr", "reload"],
+    );
 
     env.ok(&["accounts", "remove", "a"]);
     assert!(!env.data().join("accounts/a").exists());
@@ -458,7 +463,30 @@ fn config_get_and_set_check_the_daemon_schema() {
     );
     env.ok(&["config", "set", "timezone", "Asia/Seoul"]);
     assert_eq!(env.ok(&["config", "get", "timezone"]).trim(), "Asia/Seoul");
+    // A running daemon reloads; a stopped one picks the file up when it starts.
+    env.calls();
+    env.ok(&["config", "set", "budget.daily_tokens", "6000"]);
+    find(
+        &env.calls(),
+        &["docker", "exec", CONTAINER, "zephyr", "reload"],
+    );
+    let out = env.zephyr_env(
+        &["config", "set", "budget.daily_tokens", "7000"],
+        &[("SHIM_STATE", "exited")],
+    );
+    assert!(
+        stdout(&out).contains("applies when zephyr starts"),
+        "{out:?}"
+    );
+    assert!(!env
+        .calls()
+        .iter()
+        .any(|c| c.contains(&"reload".to_string())));
     let before = env.config();
+    assert!(!env
+        .zephyr(&["config", "set", "timezone", "Mars/Olympus"])
+        .status
+        .success());
     assert!(!env.zephyr(&["config", "set", "typo", "1"]).status.success());
     assert_eq!(env.config(), before, "a refused set writes nothing");
     assert!(

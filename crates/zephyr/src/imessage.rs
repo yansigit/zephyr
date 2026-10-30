@@ -29,7 +29,7 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// Wait before retrying a failed backfill, e.g. while the Mac is asleep.
 const BACKFILL_RETRY: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Config {
     /// Webhook listener address. Intended to be this host's Tailscale IP, so the Mac can reach it.
     pub listen: SocketAddr,

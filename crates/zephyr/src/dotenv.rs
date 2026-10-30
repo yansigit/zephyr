@@ -1,4 +1,4 @@
-//! `<home>/secrets.env`: read by the daemon at startup, so a key change needs only a restart.
+//! `<home>/secrets.env`: read by the daemon at startup. A change re-execs the daemon (see `reload`).
 
 use std::path::Path;
 
@@ -22,19 +22,28 @@ pub fn parse(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Sets each variable from `path` that is not already set. A missing file is not an error.
-pub fn load(path: &Path) -> anyhow::Result<()> {
-    let text = match std::fs::read_to_string(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        r => r.map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?,
-    };
-    for (key, value) in parse(&text) {
+/// The pairs in `path`; none when there is no file.
+pub fn read(path: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    match std::fs::read_to_string(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        r => Ok(parse(&r.map_err(|e| {
+            anyhow::anyhow!("reading {}: {e}", path.display())
+        })?)),
+    }
+}
+
+/// Sets each variable from `path` that is not already set, and returns the names it set.
+/// A missing file is not an error.
+pub fn load(path: &Path) -> anyhow::Result<Vec<String>> {
+    let mut set = Vec::new();
+    for (key, value) in read(path)? {
         if std::env::var_os(&key).is_none() {
             // Runs before any task reads the environment.
-            std::env::set_var(key, value);
+            std::env::set_var(&key, value);
+            set.push(key);
         }
     }
-    Ok(())
+    Ok(set)
 }
 
 #[cfg(test)]
@@ -72,7 +81,7 @@ mod tests {
         )
         .unwrap();
         std::env::set_var("ZEPHYR_DOTENV_T1", "from-env");
-        load(&path).unwrap();
+        assert_eq!(load(&path).unwrap(), ["ZEPHYR_DOTENV_T2"]);
         assert_eq!(std::env::var("ZEPHYR_DOTENV_T1").unwrap(), "from-env");
         assert_eq!(std::env::var("ZEPHYR_DOTENV_T2").unwrap(), "from-file");
         load(&dir.join("missing.env")).unwrap();

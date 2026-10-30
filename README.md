@@ -42,17 +42,34 @@ zephyr login openai-codex --account codex-main
 | `zephyr config get\|set KEY [VALUE]` | Edit `zephyr.toml` (comments are kept; invalid keys are refused) |
 | `zephyr chat` / `attach` | Line chat, or the stock rpi TUI attached to the live session |
 | `zephyr pause` / `resume` | Stop and restart dispatch (`/pause` and `/resume` from any channel do the same) |
+| `zephyr reload` | Apply hand edits now instead of within 5 s (`/reload` from any channel) |
 | `zephyr uninstall [--keep-data]` | Remove the container and image, and `~/.zephyr` unless kept |
 
-Settings that change the daemon apply after `zephyr restart`. `ZEPHYR_CONTAINER` (default `zephyr`)
-and `ZEPHYR_IMAGE` choose another container or image, for example to test beside a live install.
+## Changing settings
+
+Changes apply by themselves; nothing needs `zephyr restart`. The commands above, and hand edits to
+`zephyr.toml` or `secrets.env` (seen within 5 s), go to the running daemon, which says what it did:
+
+| Change | Applies |
+|---|---|
+| Budget, owners, time zone, `[auth]`, the pool order | at once |
+| The model, on the same provider | at once, or after the reply in progress (rpi's `set_model`) |
+| A model on another provider, the active account, extensions, a re-login | the agent restarts after the reply in progress; the conversation carries on |
+| Discord, iMessage, `[attach]`, a secret | the daemon restarts itself in place once idle; waiting messages are kept |
+
+A file that does not load is not applied, and the daemon keeps its current settings. From any
+channel: `/model` shows the models, `/model PROVIDER/MODEL` switches (to the account on that
+provider), `/status` shows the agent's account and model, and `/reload` re-reads the files.
+
+`ZEPHYR_CONTAINER` (default `zephyr`) and `ZEPHYR_IMAGE` choose another container or image, for
+example to test beside a live install.
 
 ## Where things live
 
 - `~/.zephyr/` (mode 0700), seen as `/zephyr` in the container: `zephyr.toml`, `state.db`, sessions,
   memory, `accounts/<name>/auth.json`.
-- `~/.zephyr/secrets.env` (0600): `KEY=value` lines, such as bot tokens. The daemon reads it at start,
-  and a variable already set in its environment wins.
+- `~/.zephyr/secrets.env` (0600): `KEY=value` lines, such as bot tokens. The daemon reads it at start
+  and again after a change, and a variable already set in its environment wins.
 - `~/.zephyr/tui.token` (0600): the `zephyr attach` token.
 - `~/.zephyr/host.toml`: the projects folder, used only on the host.
 

@@ -54,7 +54,7 @@ impl Data {
         if !self.secrets().exists() {
             write_private(
                 &self.secrets(),
-                "# KEY=value lines, read by zephyr at start: `zephyr restart` after editing\n",
+                "# KEY=value lines; zephyr picks up a change by itself\n",
             )?;
         }
         Ok(())
@@ -65,8 +65,7 @@ impl Data {
     }
 
     pub fn save(&self, doc: &DocumentMut) -> anyhow::Result<()> {
-        std::fs::write(self.config(), doc.to_string())
-            .with_context(|| format!("writing {}", self.config().display()))
+        save(&self.config(), doc)
     }
 
     /// `projects` from `host.toml`.
@@ -88,7 +87,15 @@ impl Data {
     }
 }
 
-fn load(path: &Path) -> anyhow::Result<DocumentMut> {
+/// Whole or not at all: the running daemon reloads the file when its mtime changes.
+pub fn save(path: &Path, doc: &DocumentMut) -> anyhow::Result<()> {
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, doc.to_string())
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+pub fn load(path: &Path) -> anyhow::Result<DocumentMut> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading {} (run `zephyr init` first)", path.display()))?;
     text.parse()

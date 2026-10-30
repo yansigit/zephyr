@@ -17,7 +17,7 @@ pub const MAX_CONTENT: usize = 2000;
 /// Discord's `nonce` limit: "up to 25 characters" (Create Message, REST docs).
 pub const MAX_NONCE: usize = 25;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Name of the env var that holds the bot token. The token is never stored here or logged.

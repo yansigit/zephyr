@@ -15,7 +15,9 @@ that error (stopReason "error", settle outcome "failed"), as a rate-limited prov
 A prompt containing WRITE_MEMORY first writes memory/MEMORY.md under the home.
 argv.json holds the argv of the latest start.
 A prompt containing `[hang]` never settles until `abort`; one that starts with `say: `
-replies with the rest.
+replies with the rest; `model?` replies with the current model.
+Models: `get_available_models` lists the started model plus fake/m1, fake/m2 and other/m3;
+`set_model` switches to one of them and errors on anything else.
 The session is <session-dir>/<session-id>.json: {"messages": [...], "pending": bool}.
 """
 import json, os, sys, time
@@ -108,6 +110,8 @@ out({"type": "ready", "protocol": "rpi", "piCompatibilityTarget": "1.2.0",
      "limits": {"frameBytes": 1048576, "maxConcurrentPrompts": 1}, "parityComplete": False})
 queue = []
 hanging = False
+model = opt("--model")
+catalog = {"fake/m1", "fake/m2", "other/m3"} | ({model} if model else set())
 for line in sys.stdin:
     cmd = json.loads(line)
     open(os.path.join(home, "log.jsonl"), "a").write(line)
@@ -139,6 +143,8 @@ for line in sys.stdin:
             fail(s, rate_limit()); continue
         if "[hang]" in cmd["message"]:
             hanging = True; continue
+        if cmd["message"].endswith("model?"):
+            finish(s, "model: %s" % model); continue
         if cmd["message"].startswith("say: "):
             finish(s, cmd["message"][5:]); continue
         finish(s, "echo: " + cmd["message"])
@@ -171,6 +177,14 @@ for line in sys.stdin:
         if os.path.exists(os.path.join(home, "stats.json")):
             stats.update(json.load(open(os.path.join(home, "stats.json"))))
         respond(cmd, stats)
+    elif kind == "get_available_models":
+        respond(cmd, {"models": [{"provider": m.split("/", 1)[0], "id": m.split("/", 1)[1]} for m in sorted(catalog)]})
+    elif kind == "set_model":
+        want = "%s/%s" % (cmd.get("provider"), cmd.get("modelId"))
+        if want in catalog:
+            model = want; respond(cmd, {"modelId": cmd.get("modelId"), "provider": cmd.get("provider")})
+        else:
+            respond(cmd, error="unknown model: %s" % cmd.get("modelId"))
     elif kind == "get_state":
         respond(cmd, {"sessionId": opt("--session-id"), "activeOperation": None})
     elif kind == "stop":

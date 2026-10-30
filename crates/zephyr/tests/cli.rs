@@ -278,3 +278,51 @@ fn doctor_probes_as_the_first_pooled_account() {
     let starts = std::fs::read_to_string(first.join("starts.log")).unwrap_or_default();
     assert_eq!(starts, "anthropic/m\n");
 }
+
+/// The environment of the rpi child the daemon started (fake-rpi writes `<home>/pid`).
+fn child_env(home: &Path) -> String {
+    let pid = std::fs::read_to_string(home.join("pid")).unwrap_or_default();
+    String::from_utf8_lossy(&std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default())
+        .replace('\0', "\n")
+}
+
+fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !done() {
+        assert!(start.elapsed() < Duration::from_secs(10), "{what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_changed_secret_reexecs_the_daemon_in_place() {
+    let (home, cfg) = setup("reexec", "");
+    let uid = std::fs::metadata(&home).unwrap().uid();
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(&cfg, format!("{text}[owners]\nchat = [\"{uid}\"]\n")).unwrap();
+    std::fs::write(home.join("secrets.env"), "ZEPHYR_CLI_RELOAD=one\n").unwrap();
+    let mut running = daemon(&cfg, &home);
+    wait_for("the child has the secret", || {
+        child_env(&home).contains("ZEPHYR_CLI_RELOAD=one")
+    });
+
+    std::fs::write(home.join("secrets.env"), "ZEPHYR_CLI_RELOAD=two\n").unwrap();
+    assert_eq!(
+        stdout(&zephyr(&cfg, &["reload"])),
+        "[zephyr] restarting zephyr's channels now"
+    );
+    // The same process, exec'd anew, reads the new value and starts a new child with it.
+    wait_for("no re-exec", || {
+        child_env(&home).contains("ZEPHYR_CLI_RELOAD=two")
+    });
+    assert!(
+        running.0.try_wait().unwrap().is_none(),
+        "the daemon process lives on"
+    );
+    wait_for("the socket serves again", || {
+        stdout(&zephyr(&cfg, &["pause"])) == PAUSED
+    });
+    let second = zephyr(&cfg, &["run"]);
+    assert!(String::from_utf8_lossy(&second.stderr).contains("another zephyr is running"));
+    drop(running);
+}

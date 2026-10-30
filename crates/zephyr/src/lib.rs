@@ -11,6 +11,7 @@ pub mod host;
 pub mod imessage;
 pub mod memory;
 pub mod pool;
+pub mod reload;
 pub mod router;
 pub mod rpc;
 pub mod scheduler;
