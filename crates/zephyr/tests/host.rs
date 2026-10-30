@@ -26,6 +26,7 @@ case "$1" in
     case " $* " in
       *" --list-models "*) printf 'provider model context\nanthropic claude-sonnet-5 200K\nopenai-codex gpt-5.5 400K\nopenai-codex gpt-5.4 400K\n' ;;
       *" auth check "*) echo '{"ready":true,"provider":"claude-code","source":"auth.json"}' ;;
+      *" zephyr tui "*) exit "${SHIM_TUI_EXIT:-0}" ;;
     esac ;;
 esac
 exit 0
@@ -100,6 +101,32 @@ impl Env {
             .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
             .unwrap();
         out
+    }
+
+    /// `zephyr <args>` with a terminal as stdin and stdout, through script(1). Its output is
+    /// what the terminal received.
+    fn on_a_tty(&self, args: &str, env: &[(&str, &str)]) -> Output {
+        let path = format!(
+            "{}:{}",
+            self.dir.join("bin").display(),
+            std::env::var("PATH").unwrap()
+        );
+        Command::new("script")
+            .args([
+                "-qec",
+                &format!("{} {args}", env!("CARGO_BIN_EXE_zephyr")),
+                "/dev/null",
+            ])
+            .env_clear()
+            .env("PATH", path)
+            .env("HOME", &self.home)
+            .env("SHIM_DIR", &self.dir)
+            .env("ZEPHYR_CONTAINER", CONTAINER)
+            .env("ZEPHYR_IMAGE", "zephyr-lanetest")
+            .envs(env.iter().copied())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
     }
 
     fn ok(&self, args: &[&str]) -> String {
@@ -637,26 +664,7 @@ fn chat_on_a_terminal_falls_back_to_the_line_client_without_attach() {
     let env = Env::new("chat-tty");
     env.init(&["--no-start"]);
     let chat_on_a_tty = || {
-        let path = format!(
-            "{}:{}",
-            env.dir.join("bin").display(),
-            std::env::var("PATH").unwrap()
-        );
-        let out = Command::new("script")
-            .args([
-                "-qec",
-                &format!("{} chat", env!("CARGO_BIN_EXE_zephyr")),
-                "/dev/null",
-            ])
-            .env_clear()
-            .env("PATH", path)
-            .env("HOME", &env.home)
-            .env("SHIM_DIR", &env.dir)
-            .env("ZEPHYR_CONTAINER", CONTAINER)
-            .env("ZEPHYR_IMAGE", "zephyr-lanetest")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap();
+        let out = env.on_a_tty("chat", &[]);
         assert!(out.status.success(), "{}", stdout(&out));
         env.calls()
     };
@@ -675,6 +683,27 @@ fn chat_on_a_terminal_falls_back_to_the_line_client_without_attach() {
         &chat_on_a_tty(),
         &["docker", "exec", "-it", CONTAINER, "zephyr", "chat"],
     );
+}
+
+/// A `zephyr tui` killed with its container cannot undo its terminal modes; the host does.
+#[test]
+fn a_killed_tui_leaves_the_terminal_usable() {
+    if Command::new("script").arg("--version").output().is_err() {
+        return eprintln!("skipped: no script(1) to give zephyr a terminal");
+    }
+    let env = Env::new("tui-killed");
+    env.init(&["--no-start"]);
+    let out = env.on_a_tty("attach", &[("SHIM_TUI_EXIT", "137")]);
+    let seen = stdout(&out);
+    assert!(!out.status.success());
+    for mode in ["\x1b[?1049l", "\x1b[?1000l", "\x1b[?2004l", "\x1b[?25h"] {
+        assert!(seen.contains(mode), "{mode:?} not reset: {seen:?}");
+    }
+    assert!(seen.contains("zephyr attach"), "{seen:?}");
+    // A clean detach leaves the terminal to the TUI, which restored it itself.
+    let out = env.on_a_tty("attach", &[]);
+    assert!(out.status.success());
+    assert!(!stdout(&out).contains("\x1b[?1049l"));
 }
 
 #[test]

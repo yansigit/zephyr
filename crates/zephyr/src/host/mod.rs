@@ -349,7 +349,17 @@ impl Host {
             }
             self.exec(&flags, &[("HOME", "/tmp")], &["zephyr", "tui"])
         };
-        run(cmd.env("RPI_SERVER_TOKEN", &token))
+        let ran = run(cmd.env("RPI_SERVER_TOKEN", &token));
+        if ran.is_err() && !stock && std::io::stdout().is_terminal() {
+            // A `zephyr tui` killed with its container cannot undo its terminal modes: the
+            // alternate screen, mouse, bracketed paste, synchronized output, kitty keys, no wrap.
+            print!("\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?2004l\x1b[?2026l\x1b[<u\x1b[?7h\x1b[?25h\x1b[?1049l");
+            let _ = std::io::stdout().flush();
+        }
+        if stock {
+            return ran;
+        }
+        ran.context("zephyr tui stopped; if the container restarted, `zephyr attach` again")
     }
 
     fn doctor(&self, fix: bool) -> anyhow::Result<()> {
