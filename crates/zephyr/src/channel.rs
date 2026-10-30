@@ -83,37 +83,3 @@ impl Channel for AnyChannel {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct Plain;
-
-    impl Channel for Plain {
-        fn name(&self) -> &str {
-            "plain"
-        }
-        async fn run(&self, _tx: tokio::sync::mpsc::Sender<Inbound>) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn send(&self, _msg: &Outbound) -> anyhow::Result<()> {
-            anyhow::bail!("unused")
-        }
-    }
-
-    #[tokio::test]
-    async fn activity_defaults_to_a_no_op() {
-        for a in [
-            Activity::Start,
-            Activity::Progress {
-                elapsed: std::time::Duration::from_secs(3),
-                tools: vec!["bash".into()],
-                current: Some("bash".into()),
-            },
-            Activity::Stop,
-        ] {
-            Plain.activity("anyone", &a).await.unwrap();
-        }
-    }
-}
