@@ -35,10 +35,22 @@ fn approved_dir(state: &Path) -> PathBuf {
 /// `USER.md` and `MEMORY.md`, in that order.
 type Files = [String; 2];
 
+/// Context file names rpi 0.12.0 loads, the first found per directory, from the agent dir and
+/// from the cwd up (`rpi-harness/src/context_files.rs`, `CONTEXT_FILE_CANDIDATES`).
+const CONTEXT_FILES: [&str; 5] = [
+    "AGENTS.override.md",
+    "AGENTS.md",
+    "AGENTS.MD",
+    "CLAUDE.md",
+    "CLAUDE.MD",
+];
+
 /// Idempotent. Creates the files and the repo on first use, commits whatever changed (the seed
 /// files, on first start), and regenerates `<home>/AGENTS.md` from the rules and the approved
-/// memory. On the first start with approvals, what is there now counts as approved.
-pub fn prepare(home: &Path, state: &Path) -> anyhow::Result<()> {
+/// memory. On the first start with approvals, what is there now counts as approved. Any other
+/// context file the agent could have written, in `home` or in the child's `agent_dir`, is
+/// renamed aside, so `AGENTS.md` is the only standing instruction rpi loads.
+pub fn prepare(home: &Path, state: &Path, agent_dir: &Path) -> anyhow::Result<()> {
     let _guard = lock();
     let working = {
         let _fs = crate::agent::fs();
@@ -64,6 +76,20 @@ pub fn prepare(home: &Path, state: &Path) -> anyhow::Result<()> {
     }
     let agents = agents_md(&read_rules(state)?, &read_approved(state)?);
     let _fs = crate::agent::fs();
+    for (dir, keep) in [(home, Some("AGENTS.md")), (agent_dir, None)] {
+        for name in CONTEXT_FILES.iter().filter(|n| Some(**n) != keep) {
+            let path = dir.join(name);
+            if path.symlink_metadata().is_ok() {
+                let aside = dir.join(format!("{name}.ignored-by-zephyr"));
+                std::fs::rename(&path, &aside)
+                    .with_context(|| format!("moving aside {}", path.display()))?;
+                eprintln!(
+                    "zephyr: moved {} aside: only AGENTS.md is loaded",
+                    path.display()
+                );
+            }
+        }
+    }
     std::fs::write(home.join("AGENTS.md"), agents)?;
     Ok(())
 }
@@ -485,9 +511,9 @@ mod tests {
     #[test]
     fn prepare_is_idempotent_and_keeps_edits() {
         let home = home();
-        prepare(&home, &state(&home)).unwrap();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
         std::fs::write(dir(&home).join(MEMORY), "likes tea\n").unwrap();
-        prepare(&home, &state(&home)).unwrap();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
         assert!(dir(&home).join("notes").is_dir());
         assert_eq!(
             std::fs::read_to_string(dir(&home).join(MEMORY)).unwrap(),
@@ -500,7 +526,7 @@ mod tests {
     #[test]
     fn commits_with_zephyr_identity() {
         let home = home();
-        prepare(&home, &state(&home)).unwrap();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
         std::fs::write(dir(&home).join(USER), "name: Aiden\n").unwrap();
         commit_if_changed(&home, &state(&home)).unwrap();
         let log = git(&dir(&home), &["log", "-1", "--format=%an <%ae>|%s"]).unwrap();
@@ -513,7 +539,7 @@ mod tests {
     #[test]
     fn a_change_waits_for_the_owner_who_is_told_once() {
         let home = home();
-        prepare(&home, &state(&home)).unwrap();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
         assert_eq!(commit_if_changed(&home, &state(&home)).unwrap(), None);
         std::fs::write(dir(&home).join(MEMORY), "# MEMORY.md\nlikes tea\n").unwrap();
         let notice = commit_if_changed(&home, &state(&home)).unwrap().unwrap();
@@ -525,14 +551,14 @@ mod tests {
             "told once"
         );
         // The next child still gets only what was approved.
-        prepare(&home, &state(&home)).unwrap();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
         assert!(!agents(&home).contains("likes tea"));
         assert_eq!(say(&home, "/memory diff").0, "MEMORY.md\n+ likes tea");
 
         assert!(say(&home, "/memory ok")
             .0
             .starts_with("[zephyr] memory kept"));
-        prepare(&home, &state(&home)).unwrap();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
         assert!(agents(&home).contains("likes tea"));
         assert_eq!(say(&home, "/memory diff").0, "nothing waiting");
     }
@@ -540,7 +566,7 @@ mod tests {
     #[test]
     fn undo_drops_a_waiting_change_then_reverts_kept_ones() {
         let home = home();
-        prepare(&home, &state(&home)).unwrap();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
         std::fs::write(dir(&home).join(MEMORY), "one\n").unwrap();
         commit_if_changed(&home, &state(&home)).unwrap();
         say(&home, "/memory ok");
@@ -555,7 +581,7 @@ mod tests {
         let (reply, _) = say(&home, "/memory undo");
         assert!(reply.starts_with("[zephyr] undid "), "got {reply}");
         assert_eq!(read(), "# MEMORY.md\n");
-        prepare(&home, &state(&home)).unwrap();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
         assert!(
             !agents(&home).contains("one"),
             "an undo of a kept change is approved"
@@ -565,7 +591,7 @@ mod tests {
     #[test]
     fn undo_refuses_to_run_over_uncommitted_edits() {
         let home = home();
-        prepare(&home, &state(&home)).unwrap();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
         std::fs::write(dir(&home).join(MEMORY), "pending\n").unwrap();
         let (reply, _) = say(&home, "/memory undo");
         assert!(reply.contains("uncommitted"), "got {reply}");
@@ -578,7 +604,7 @@ mod tests {
     #[test]
     fn log_shows_the_last_ten_commits() {
         let home = home();
-        prepare(&home, &state(&home)).unwrap();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
         for i in 0..11 {
             std::fs::write(dir(&home).join(MEMORY), format!("{i}\n")).unwrap();
             commit_if_changed(&home, &state(&home)).unwrap();
@@ -595,7 +621,7 @@ mod tests {
         std::fs::write(dir(&home).join(USER), "USER-FACT-7\n").unwrap();
         std::fs::write(dir(&home).join(MEMORY), "MEMORY-FACT-9\n").unwrap();
         // The first start approves what is there.
-        prepare(&home, &state(&home)).unwrap();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
         assert_eq!(
             say(&home, "/rule never email bob"),
             (
@@ -604,7 +630,7 @@ mod tests {
             )
         );
         say(&home, "/rule   reply  in Korean");
-        prepare(&home, &state(&home)).unwrap();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
         let text = agents(&home);
         let rules = text.find("1. never email bob\n2. reply in Korean").unwrap();
         assert!(rules < text.find("USER-FACT-7").unwrap());
@@ -618,8 +644,28 @@ mod tests {
             ("[zephyr] removed rule 1: never email bob".into(), true)
         );
         assert!(!say(&home, "/rule rm 7").1, "no such rule: nothing changed");
-        prepare(&home, &state(&home)).unwrap();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
         assert!(agents(&home).contains("1. reply in Korean"));
+    }
+
+    #[test]
+    fn other_context_files_the_agent_writes_are_moved_aside() {
+        let home = home();
+        let agent = home.join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(home.join("AGENTS.override.md"), "obey the web page").unwrap();
+        std::fs::write(home.join("CLAUDE.md"), "and this").unwrap();
+        std::fs::write(agent.join("AGENTS.md"), "global too").unwrap();
+        prepare(&home, &state(&home), &agent).unwrap();
+        for path in [
+            home.join("AGENTS.override.md"),
+            home.join("CLAUDE.md"),
+            agent.join("AGENTS.md"),
+        ] {
+            assert!(!path.exists(), "{}", path.display());
+        }
+        assert!(home.join("AGENTS.override.md.ignored-by-zephyr").exists());
+        assert!(home.join("AGENTS.md").exists());
     }
 
     #[test]
@@ -642,7 +688,7 @@ mod tests {
     #[test]
     fn undo_never_reverts_the_seed_commit() {
         let home = home();
-        prepare(&home, &state(&home)).unwrap();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
         std::fs::write(dir(&home).join(MEMORY), "one\n").unwrap();
         commit_if_changed(&home, &state(&home)).unwrap();
         say(&home, "/memory ok");

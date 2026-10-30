@@ -66,7 +66,10 @@ impl Child {
             None => (cfg.model.as_ref(), cfg.agent_dir.clone()),
         };
         // rpi reads the context files (AGENTS.md) once, at start, so regenerate them first.
-        crate::memory::prepare(&cfg.home, cfg.state_dir())?;
+        let context_dir = agent_dir
+            .clone()
+            .unwrap_or_else(|| crate::auth_keeper::agent_dir(cfg));
+        crate::memory::prepare(&cfg.home, cfg.state_dir(), &context_dir)?;
         let mut cmd = Command::new(&cfg.rpi);
         crate::agent::cmd(cmd.as_std_mut());
         cmd.args(["--mode", "rpc", "--session-id", session_id, "--session-dir"])
