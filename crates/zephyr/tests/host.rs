@@ -203,6 +203,17 @@ fn init_non_interactive_builds_the_layout_and_starts_the_container() {
     )));
     assert!(!run.iter().any(|a| a.contains("node_modules")), "{run:?}");
     assert!(!run.iter().any(|a| a.contains("env-file")), "{run:?}");
+    for pair in [
+        ["--cap-drop", "ALL"],
+        ["--security-opt", "no-new-privileges"],
+        ["--pids-limit", "4096"],
+    ] {
+        assert!(run.windows(2).any(|w| w == pair), "{pair:?} in {run:?}");
+    }
+    assert!(
+        !run.iter().any(|a| a == "--memory"),
+        "no memory cap unless set"
+    );
     assert_eq!(run.last().unwrap(), "zephyr-lanetest");
     find(&calls, &["docker", "exec", CONTAINER, "zephyr", "doctor"]);
 
@@ -268,6 +279,24 @@ fn up_build_passes_the_gh_token_as_a_secret_only() {
         !calls.iter().any(|c| c[1] == "build"),
         "pull succeeded, so no build"
     );
+}
+
+#[test]
+fn up_caps_memory_only_when_host_toml_sets_it() {
+    let env = Env::new("memory");
+    env.init(&["--no-start"]);
+    let host = env.home.join(".zephyr/host.toml");
+    let text = std::fs::read_to_string(&host).unwrap();
+    std::fs::write(&host, format!("{text}memory = \"6g\"\n")).unwrap();
+    let out = env.zephyr(&["up"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = env.calls();
+    let run = find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
+    assert!(run.windows(2).any(|w| w == ["--memory", "6g"]), "{run:?}");
 }
 
 #[test]

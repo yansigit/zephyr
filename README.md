@@ -74,7 +74,9 @@ example to test beside a live install.
   zephyr starts for it. To give the agent one (an API key a provider reads, say), list its name in
   `[agent] env = ["NAME"]`.
 - `~/.zephyr/tui.token` (0600): the `zephyr attach` token.
-- `~/.zephyr/host.toml`: the projects folder, used only on the host.
+- `~/.zephyr/host.toml`: the projects folder, and optionally `memory = "8g"` to cap the container's
+  memory. Used only on the host, at `zephyr up`. The container runs with no capabilities,
+  `no-new-privileges` and at most 4096 processes.
 
 ## Claude subscription
 

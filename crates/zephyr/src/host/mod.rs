@@ -187,6 +187,9 @@ impl Host {
             "--network",
             "host",
         ])
+        // The agent runs here: no capabilities, no setuid escalation, and no fork bomb (DESIGN §4.4).
+        .args(["--cap-drop", "ALL", "--security-opt", "no-new-privileges"])
+        .args(["--pids-limit", "4096"])
         .args(["--user", &format!("{}:{}", ids.0, ids.1)])
         .args([
             "-e",
@@ -201,6 +204,13 @@ impl Host {
             &format!("type=bind,src={projects},dst={projects}"),
         ])
         .args(masks(&projects.to_string())?)
+        .args(
+            self.data
+                .host_get("memory")?
+                .map(|m| ["--memory".to_string(), m])
+                .into_iter()
+                .flatten(),
+        )
         .args(["-w", "/zephyr", &self.image])
         .stdout(Stdio::null());
         run(&mut cmd)?;

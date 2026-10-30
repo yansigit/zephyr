@@ -70,10 +70,15 @@ impl Data {
 
     /// `projects` from `host.toml`.
     pub fn projects(&self) -> anyhow::Result<Option<PathBuf>> {
+        Ok(self.host_get("projects")?.map(PathBuf::from))
+    }
+
+    /// A key of `host.toml`, e.g. `memory` (the container's `--memory` limit).
+    pub fn host_get(&self, key: &str) -> anyhow::Result<Option<String>> {
         if !self.host().exists() {
             return Ok(None);
         }
-        Ok(get(&load(&self.host())?, "projects").map(PathBuf::from))
+        Ok(get(&load(&self.host())?, key))
     }
 
     pub fn set_projects(&self, path: &Path) -> anyhow::Result<()> {
