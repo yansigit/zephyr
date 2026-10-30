@@ -281,6 +281,20 @@ pub fn order_accounts(doc: &mut DocumentMut, names: &[String]) -> anyhow::Result
     Ok(())
 }
 
+/// Adds the image's extensions a config lacks (one written before they were baked in).
+pub fn add_image_extensions(doc: &mut DocumentMut) {
+    let list = doc
+        .entry("extensions")
+        .or_insert_with(|| value(toml_edit::Array::new()));
+    if let Some(list) = list.as_array_mut() {
+        for e in EXTENSIONS {
+            if !list.iter().any(|v| v.as_str() == Some(e)) {
+                list.push(e);
+            }
+        }
+    }
+}
+
 /// `--extension <path>` for each configured extension, for rpi calls in the container.
 pub fn extension_args(doc: &DocumentMut) -> Vec<String> {
     doc.get("extensions")
@@ -368,6 +382,19 @@ model = "p/m"
         assert!(cfg.is_owner("chat", "1000"));
         let doc: DocumentMut = default_config(1000).parse().unwrap();
         assert_eq!(extension_args(&doc).len(), 2 * EXTENSIONS.len());
+    }
+
+    #[test]
+    fn old_configs_gain_the_image_extensions_once() {
+        let mut doc: DocumentMut =
+            "rpi = \"/usr/local/bin/rpi\"\nhome = \"/zephyr\"\n[owners]\nchat = [\"1\"]\n"
+                .parse()
+                .unwrap();
+        add_image_extensions(&mut doc);
+        add_image_extensions(&mut doc);
+        assert_eq!(extension_args(&doc).len(), 2 * EXTENSIONS.len());
+        let cfg: crate::config::Config = toml::from_str(&doc.to_string()).unwrap();
+        assert_eq!(cfg.extensions.len(), EXTENSIONS.len());
     }
 
     #[test]

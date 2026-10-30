@@ -62,6 +62,7 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
     h.data.set_projects(&projects.canonicalize()?)?;
 
     let mut doc = h.data.load()?;
+    conf::add_image_extensions(&mut doc);
     for spec in &account_flags {
         let (name, model) = spec
             .split_once('=')
