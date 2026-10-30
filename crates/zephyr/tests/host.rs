@@ -507,9 +507,10 @@ fn lifecycle_commands_build_the_expected_docker_calls() {
             &["status"],
             &["docker", "exec", CONTAINER, "zephyr", "status"],
         ),
+        // Not a terminal (stdin is null here): line mode, without a tty.
         (
             &["chat"],
-            &["docker", "exec", "-it", CONTAINER, "zephyr", "chat"],
+            &["docker", "exec", "-i", CONTAINER, "zephyr", "chat"],
         ),
         (
             &["pause"],
@@ -527,6 +528,19 @@ fn lifecycle_commands_build_the_expected_docker_calls() {
 
     let token = std::fs::read_to_string(env.data().join("tui.token")).unwrap();
     env.ok(&["attach"]);
+    let calls = env.calls();
+    let tui = find(&calls, &["docker", "exec", "-it"]);
+    assert!(
+        tui.ends_with(&[CONTAINER.into(), "zephyr".into(), "tui".into()]),
+        "{tui:?}"
+    );
+    // The token goes by name only; the display variables follow, so the theme sees the terminal.
+    for var in ["RPI_SERVER_TOKEN", "TERM", "COLORFGBG", "NO_COLOR", "LANG"] {
+        assert!(tui.windows(2).any(|w| w == ["-e", var]), "{var} in {tui:?}");
+    }
+    assert!(!format!("{calls:?}").contains(token.trim()));
+
+    env.ok(&["attach", "--stock"]);
     let calls = env.calls();
     find(
         &calls,

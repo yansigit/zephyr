@@ -18,7 +18,7 @@ pub const USAGE: &str = "usage: zephyr <command>
   model [--account NAME] [PROVIDER/MODEL]
   channel add discord|imessage
   config get|set KEY [VALUE]
-  chat | attach | pause | resume | reload
+  chat | attach [--stock] | pause | resume | reload
   doctor [--fix]
   uninstall [--keep-data] [--yes]
 env: ZEPHYR_CONTAINER (default zephyr), ZEPHYR_IMAGE, ZEPHYR_SRC (for --build); data in ~/.zephyr";
@@ -206,6 +206,36 @@ impl Host {
         run(&mut cmd)?;
         println!("started {}. Logs: zephyr logs -f", self.container);
         Ok(())
+    }
+
+    /// `zephyr tui` in the container, or with `stock` the stock `rpi --connect` client.
+    fn attach(&self, stock: bool) -> anyhow::Result<()> {
+        self.need_running()?;
+        let token = std::fs::read_to_string(self.data.token())?;
+        // `-e NAME` without a value: docker copies it from this process's environment, when set.
+        let mut flags = vec!["-it", "-e", "RPI_SERVER_TOKEN"];
+        let mut cmd = if stock {
+            let doc = self.data.load()?;
+            let port = conf::get(&doc, "attach.port").context("no [attach] port in zephyr.toml")?;
+            let mut cmd = self.exec(&flags, &[], &["rpi", "--connect"]);
+            cmd.arg(format!("127.0.0.1:{port}"));
+            cmd
+        } else {
+            // What the TUI reads to pick its colours and glyphs.
+            for var in [
+                "TERM",
+                "COLORTERM",
+                "COLORFGBG",
+                "NO_COLOR",
+                "LANG",
+                "LC_ALL",
+                "LC_CTYPE",
+            ] {
+                flags.extend(["-e", var]);
+            }
+            self.exec(&flags, &[], &["zephyr", "tui"])
+        };
+        run(cmd.env("RPI_SERVER_TOKEN", token.trim()))
     }
 
     fn doctor(&self, fix: bool) -> anyhow::Result<()> {
@@ -463,27 +493,21 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
             h.need_running()?;
             h.apply()
         }
+        // On a terminal, `chat` is the TUI; pipes and scripts keep the line client.
+        "chat" if h.interactive => {
+            a.rest()?;
+            h.attach(false)
+        }
         "chat" | "pause" | "resume" => {
             a.rest()?;
             h.need_running()?;
-            let flags: &[&str] = if cmd == "chat" { &["-it"] } else { &[] };
+            let flags: &[&str] = if cmd == "chat" { &["-i"] } else { &[] };
             run(&mut h.exec(flags, &[], &["zephyr", cmd]))
         }
         "attach" => {
+            let stock = a.flag("--stock");
             a.rest()?;
-            h.need_running()?;
-            let doc = h.data.load()?;
-            let port = conf::get(&doc, "attach.port").context("no [attach] port in zephyr.toml")?;
-            let token = std::fs::read_to_string(h.data.token())?;
-            // `-e NAME` without a value: docker copies it from this process's environment.
-            let mut cmd = h.exec(
-                &["-it", "-e", "RPI_SERVER_TOKEN"],
-                &[],
-                &["rpi", "--connect"],
-            );
-            cmd.arg(format!("127.0.0.1:{port}"))
-                .env("RPI_SERVER_TOKEN", token.trim());
-            run(&mut cmd)
+            h.attach(stock)
         }
         "config" => {
             let rest = a.rest()?;

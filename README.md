@@ -1,7 +1,7 @@
 # Zephyr
 
 An always-on personal agent gateway over upstream `rpi --mode rpc`, running in one Docker container.
-It talks to you through a terminal chat, the stock rpi TUI, Discord and iMessage. See [DESIGN.md](DESIGN.md).
+It talks to you through its own terminal UI (or the stock rpi TUI), a line chat, Discord and iMessage. See [DESIGN.md](DESIGN.md).
 
 ## Quick start
 
@@ -40,7 +40,8 @@ zephyr login openai-codex --account codex-main
 | `zephyr model [--account NAME] [PROVIDER/MODEL]` | An account's model (or the default without accounts); with no model, pick from `rpi --list-models` |
 | `zephyr channel add discord\|imessage` | Channel settings; secrets are asked for hidden |
 | `zephyr config get\|set KEY [VALUE]` | Edit `zephyr.toml` (comments are kept; invalid keys are refused) |
-| `zephyr chat` / `attach` | Line chat, or the stock rpi TUI attached to the live session |
+| `zephyr attach [--stock]` | Zephyr's terminal UI on the live session: history, tool calls, what the agent is doing, the queue and today's spend; `^D` detaches and the agent keeps running. `--stock` runs the stock `rpi --connect` client instead |
+| `zephyr chat` | The same UI on a terminal; a line client (`< reply` per line) when piped or scripted |
 | `zephyr pause` / `resume` | Stop and restart dispatch (`/pause` and `/resume` from any channel do the same) |
 | `zephyr reload` | Apply hand edits now instead of within 5 s (`/reload` from any channel) |
 | `zephyr uninstall [--keep-data]` | Remove the container and image, and `~/.zephyr` unless kept |
