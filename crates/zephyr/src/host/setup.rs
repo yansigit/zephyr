@@ -3,6 +3,7 @@
 use super::{conf, feed, home, output, run, Args, Host, USAGE};
 use anyhow::{bail, Context};
 use dialoguer::{Confirm, Input, MultiSelect, Password, Select, Sort};
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -247,21 +248,29 @@ fn login(
         Some(t) => Some(t),
         None if provider == "claude-code" => {
             println!("Sign in with your Claude subscription.");
-            // `script` keeps a transcript to read the token from.
-            let log = "/tmp/zephyr-setup-token";
-            let signed = run(&mut h.exec(
-                &["-it"],
-                &[],
-                &[
-                    "sh",
-                    "-c",
-                    &format!("umask 077; script -qec '{CLAUDE_CLI} setup-token' {log}"),
-                ],
-            ));
-            let text =
-                output(&mut h.exec(&[], &[], &["sh", "-c", &format!("cat {log}; rm -f {log}")]));
-            signed?;
-            match text.ok().as_deref().and_then(setup_token) {
+            // The token passes through `TokenMask` on its way to the terminal, so it is never shown.
+            let mut child = h
+                .exec(&["-it"], &[], &[CLAUDE_CLI, "setup-token"])
+                .stdout(Stdio::piped())
+                .spawn()
+                .context("running claude setup-token")?;
+            let mut out = child.stdout.take().context("stdout")?;
+            let mut mask = TokenMask::default();
+            let mut buf = [0u8; 4096];
+            let mut term = std::io::stdout();
+            loop {
+                let n = std::io::Read::read(&mut out, &mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                term.write_all(&mask.feed(&buf[..n]))?;
+                term.flush()?;
+            }
+            term.write_all(&mask.rest())?;
+            if !child.wait()?.success() {
+                bail!("claude setup-token failed");
+            }
+            match mask.token() {
                 Some(t) => Some(t),
                 None => Some(
                     Password::new()
@@ -505,51 +514,136 @@ fn channel_add(h: &Host, kind: &str) -> anyhow::Result<()> {
     h.data.save(&doc)
 }
 
-/// The token `claude setup-token` printed, from its transcript. The terminal may wrap it, so
-/// escapes and line breaks up to the "Store" line after it are dropped; anything else fails.
-fn setup_token(transcript: &str) -> Option<String> {
-    let start = transcript.rfind("sk-ant-oat01-")?;
-    let rest = &transcript[start..];
-    let rest = &rest[..rest.find("Store").unwrap_or(rest.len())];
-    let mut token = String::new();
-    let mut chars = rest.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            // CSI escape: ESC [ params, ended by a byte in @..~
-            '\x1b' => {
-                if chars.next() == Some('[') {
-                    for c in chars.by_ref() {
-                        if ('@'..='~').contains(&c) {
-                            break;
-                        }
+const TOKEN_PREFIX: &[u8] = b"sk-ant-oat01-";
+
+/// Replaces each character of a Claude token in terminal output with `*` and keeps the token.
+/// The terminal may wrap it, so escapes and single line breaks inside it pass through; a blank
+/// line or any other character ends it.
+#[derive(Default)]
+struct TokenMask {
+    /// Bytes matching the start of TOKEN_PREFIX, held until they match or not.
+    held: Vec<u8>,
+    token: Option<Vec<u8>>,
+    /// In a token: line breaks since its last character, and the escape-sequence state.
+    masking: bool,
+    breaks: u8,
+    escape: u8,
+}
+
+impl TokenMask {
+    fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(chunk.len());
+        for &b in chunk {
+            if self.masking {
+                out.push(match (self.escape, b) {
+                    (1, _) => {
+                        self.escape = if b == b'[' { 2 } else { 0 };
+                        b
                     }
+                    (2, _) => {
+                        if (0x40..=0x7e).contains(&b) {
+                            self.escape = 0;
+                        }
+                        b
+                    }
+                    (_, 0x1b) => {
+                        self.escape = 1;
+                        b
+                    }
+                    (_, b'\n') => {
+                        self.breaks += 1;
+                        self.masking = self.breaks < 2;
+                        b
+                    }
+                    (_, b' ' | b'\r' | b'\t') => b,
+                    (_, c) if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' => {
+                        self.breaks = 0;
+                        if let Some(t) = &mut self.token {
+                            t.push(c);
+                        }
+                        b'*'
+                    }
+                    _ => {
+                        self.masking = false;
+                        b
+                    }
+                });
+                continue;
+            }
+            self.held.push(b);
+            if self.held == TOKEN_PREFIX {
+                out.append(&mut self.held);
+                self.token = Some(TOKEN_PREFIX.to_vec());
+                (self.masking, self.breaks, self.escape) = (true, 0, 0);
+            } else if !TOKEN_PREFIX.starts_with(&self.held) {
+                // 's' starts the prefix and appears nowhere else in it, so only `b` can restart it.
+                let last = self.held.pop();
+                out.append(&mut self.held);
+                if last == Some(TOKEN_PREFIX[0]) {
+                    self.held.push(TOKEN_PREFIX[0]);
+                } else {
+                    out.extend(last);
                 }
             }
-            c if c.is_whitespace() => {}
-            c if c.is_ascii_alphanumeric() || c == '-' || c == '_' => token.push(c),
-            _ => return None,
         }
+        out
     }
-    (token.len() > "sk-ant-oat01-".len()).then_some(token)
+
+    /// Bytes still held at the end of the output.
+    fn rest(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.held)
+    }
+
+    /// The last token seen, if it has more than the prefix.
+    fn token(&self) -> Option<String> {
+        let t = self
+            .token
+            .as_ref()
+            .filter(|t| t.len() > TOKEN_PREFIX.len())?;
+        String::from_utf8(t.clone()).ok()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::setup_token;
+    use super::TokenMask;
+
+    fn run(chunks: &[&str]) -> (String, Option<String>) {
+        let mut m = TokenMask::default();
+        let mut shown: Vec<u8> = chunks.iter().flat_map(|c| m.feed(c.as_bytes())).collect();
+        shown.extend(m.rest());
+        (String::from_utf8(shown).unwrap(), m.token())
+    }
 
     #[test]
-    fn reads_the_token_from_the_setup_token_transcript() {
-        let t = "\x1b[1m Your OAuth token (valid for 1 year):\x1b[22m\r\n\r\n sk-ant-oat01-Ab_c-9\x1b[0m\r\n\r\n Store";
-        assert_eq!(setup_token(t).as_deref(), Some("sk-ant-oat01-Ab_c-9"));
-        let wrapped = " sk-ant-oat01-Ab_c\r\n-9xy\x1b[39m\r\n\r\n Store this token";
-        assert_eq!(
-            setup_token(wrapped).as_deref(),
-            Some("sk-ant-oat01-Ab_c-9xy")
+    fn hides_the_token_and_keeps_it() {
+        let (shown, token) = run(&[
+            "\x1b[1m Your OAuth token:\x1b[22m\r\n\r\n sk-ant-oat01-Ab_c-9\x1b[0m\r\n\r\n Store this",
+        ]);
+        assert_eq!(token.as_deref(), Some("sk-ant-oat01-Ab_c-9"));
+        assert_eq!(shown, "\x1b[1m Your OAuth token:\x1b[22m\r\n\r\n sk-ant-oat01-******\x1b[0m\r\n\r\n Store this");
+    }
+
+    #[test]
+    fn a_wrapped_token_split_across_reads_is_hidden_whole() {
+        let (shown, token) = run(&[
+            "x ssk-ant-o",
+            "at01-Ab_c\r\n",
+            " -9xy\x1b[39m\r\n\r\n Store",
+        ]);
+        assert_eq!(token.as_deref(), Some("sk-ant-oat01-Ab_c-9xy"));
+        assert!(!shown.contains("Ab") && !shown.contains("9xy"), "{shown}");
+        assert!(
+            shown.starts_with("x s") && shown.ends_with(" Store"),
+            "{shown}"
         );
+    }
+
+    #[test]
+    fn output_without_a_token_passes_through() {
         assert_eq!(
-            setup_token("sk-ant-oat01-ab\r\n Use this: <x>\r\n Store"),
-            None
+            run(&["Login cancelled\r\n"]),
+            ("Login cancelled\r\n".into(), None)
         );
-        assert_eq!(setup_token("Login cancelled\r\n"), None);
     }
 }
