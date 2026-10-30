@@ -246,7 +246,7 @@ fn init_non_interactive_builds_the_layout_and_starts_the_container() {
             ("anthropic-1", "anthropic/claude-sonnet-5")
         ]
     );
-    assert_eq!(cfg["extensions"].as_array().unwrap().len(), 3);
+    assert_eq!(cfg["extensions"].as_array().unwrap().len(), 4);
 
     let calls = env.calls();
     find(&calls, &["docker", "version"]);

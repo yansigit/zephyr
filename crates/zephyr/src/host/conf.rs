@@ -8,9 +8,11 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
 
-/// Provider extensions baked into the image (deploy/Dockerfile).
-pub const EXTENSIONS: [&str; 3] = [
+/// Extensions baked into the image (deploy/Dockerfile): the providers, the MCP adapter's tools, and
+/// the two packages' cdylibs. This is also the order `zephyr.toml` lists them in.
+pub const EXTENSIONS: [&str; 4] = [
     "/opt/zephyr/ext/librpi_providers.so",
+    "/opt/zephyr/ext/librpi_mcp_adapter.so",
     "/opt/zephyr/ext/rpi-cursor-lite/librpi_cursor_lite.so",
     "/opt/zephyr/ext/rpi-claude-agent/librpi_claude_agent.so",
 ];
@@ -389,17 +391,38 @@ pub fn order_accounts(doc: &mut DocumentMut, names: &[String]) -> anyhow::Result
     Ok(())
 }
 
-/// Adds the image's extensions a config lacks (one written before they were baked in).
+/// Adds the image's extensions a config lacks (one written before they were baked in), keeping the
+/// list in `EXTENSIONS` order so an upgraded config matches a fresh one.
 pub fn add_image_extensions(doc: &mut DocumentMut) {
     let list = doc
         .entry("extensions")
         .or_insert_with(|| value(toml_edit::Array::new()));
-    if let Some(list) = list.as_array_mut() {
-        for e in EXTENSIONS {
-            if !list.iter().any(|v| v.as_str() == Some(e)) {
-                list.push(e);
-            }
+    let Some(list) = list.as_array_mut() else {
+        return;
+    };
+    if EXTENSIONS
+        .iter()
+        .all(|e| list.iter().any(|v| v.as_str() == Some(e)))
+    {
+        return;
+    }
+    let mut entries: Vec<toml_edit::Value> = list.iter().cloned().collect();
+    for e in EXTENSIONS {
+        if !entries.iter().any(|v| v.as_str() == Some(e)) {
+            entries.push(toml_edit::Value::from(e));
         }
+    }
+    // Stable: the image's paths sort into EXTENSIONS order, any the owner added keep their order
+    // after them.
+    let rank = |v: &toml_edit::Value| {
+        v.as_str()
+            .and_then(|s| EXTENSIONS.iter().position(|e| *e == s))
+            .unwrap_or(EXTENSIONS.len())
+    };
+    entries.sort_by_key(rank);
+    list.clear();
+    for v in entries {
+        list.push(v);
     }
 }
 
@@ -504,6 +527,22 @@ model = "p/m"
         assert_eq!(extension_args(&doc).len(), 2 * EXTENSIONS.len());
         let cfg: crate::config::Config = toml::from_str(&doc.to_string()).unwrap();
         assert_eq!(cfg.extensions.len(), EXTENSIONS.len());
+    }
+
+    #[test]
+    fn image_extensions_are_added_in_canonical_order() {
+        let mut doc: DocumentMut = format!(
+            "extensions = [\"{}\", \"{}\", \"/opt/mine.so\"]\n",
+            EXTENSIONS[2], EXTENSIONS[0]
+        )
+        .parse()
+        .unwrap();
+        add_image_extensions(&mut doc);
+        let list = doc.get("extensions").and_then(Item::as_array).unwrap();
+        let paths: Vec<_> = list.iter().filter_map(|v| v.as_str()).collect();
+        let mut want: Vec<&str> = EXTENSIONS.to_vec();
+        want.push("/opt/mine.so");
+        assert_eq!(paths, want);
     }
 
     #[test]

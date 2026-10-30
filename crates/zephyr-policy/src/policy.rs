@@ -44,6 +44,15 @@ pub fn check(tool: &str, args: &Value) -> Decision {
                 None => Decision::Deny("file tool call has no path"),
             }
         }
+        // MCP: a server spec's `configPath` can point at a credential file, so the adapter's tools
+        // get the same name check as any other path (a server may also pass one as a resource).
+        "mcp_list" | "mcp_call" | "mcp_resource" | "mcp_request" => {
+            ["configPath", "path", "file_path", "glob"]
+                .iter()
+                .filter_map(|k| args.get(*k).and_then(Value::as_str))
+                .find_map(sensitive)
+                .map_or(Decision::Allow, Decision::Deny)
+        }
         _ => ["path", "file_path", "glob"]
             .iter()
             .filter_map(|k| args.get(*k).and_then(Value::as_str))
@@ -612,6 +621,19 @@ mod tests {
             ),
             file("write", "proj/.git/hooks/pre-push"),
             file("edit", "/zephyr/accounts/a/auth.json"),
+            (
+                "mcp_list",
+                json!({ "configPath": "/zephyr/accounts/a/auth.json" }),
+            ),
+            (
+                "mcp_call",
+                json!({ "server": "s", "tool": "t", "configPath": "/home/zephyr/secrets.env" }),
+            ),
+            (
+                "mcp_resource",
+                json!({ "server": "s", "configPath": "/home/zephyr/.ssh/id_ed25519" }),
+            ),
+            ("mcp_request", json!({ "path": "/proc/self/environ" })),
         ];
         let allow: Vec<(&str, Value)> = vec![
             bash("rm -rf ./build"),
@@ -653,6 +675,19 @@ mod tests {
             bash("ls /proc/1"),
             file("write", "src/auth.json.rs"),
             ("some_other_tool", json!({ "command": "rm -rf /" })),
+            ("mcp_list", json!({})),
+            (
+                "mcp_call",
+                json!({ "server": "github", "tool": "search", "configPath": "/etc/rpi/mcp.json" }),
+            ),
+            (
+                "mcp_resource",
+                json!({ "server": "files", "uri": "mem://notes" }),
+            ),
+            (
+                "mcp_request",
+                json!({ "server": "x", "configPath": "src/mcp.json" }),
+            ),
         ];
         assert!(deny.len() >= 30 && allow.len() >= 30, "table too small");
         for (tool, args) in deny {

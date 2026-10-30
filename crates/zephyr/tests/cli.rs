@@ -267,6 +267,33 @@ fn doctor_warns_when_agent_dir_has_extensions() {
 }
 
 #[test]
+fn doctor_warns_when_an_extension_path_is_missing() {
+    let (_, cfg) = setup("doctor-missing-ext", "");
+    let dir = cfg.parent().unwrap();
+    let here = dir.join("libzephyr_policy.so");
+    std::fs::write(&here, "").unwrap();
+    let gone = dir.join("librpi_mcp_adapter.so");
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str(&format!(
+        "policy_plugin = {here:?}\nextensions = [{gone:?}]\n"
+    ));
+    std::fs::write(&cfg, text).unwrap();
+
+    let text = stdout(&zephyr(&cfg, &["doctor"]));
+    assert!(
+        text.contains(&format!(
+            "warn {} does not exist: no child can load it",
+            gone.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        !text.contains(&format!("warn {}", here.display())),
+        "{text}"
+    );
+}
+
+#[test]
 fn status_lists_each_pooled_account() {
     let (home, cfg) = setup(
         "status-pool",
