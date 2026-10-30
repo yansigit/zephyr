@@ -289,7 +289,8 @@ impl<'a> Router<'a> {
             log(self.store.set_status(id, "dropped").map_err(Into::into));
             return;
         }
-        if let Some(reply) = crate::memory::command(&self.cfg.home, m.text.trim()) {
+        let memory = crate::memory::command(&self.cfg.home, self.cfg.state_dir(), m.text.trim());
+        if let Some((reply, rules_changed)) = memory {
             let row = InboxRow {
                 id,
                 channel: m.channel,
@@ -298,6 +299,11 @@ impl<'a> Router<'a> {
                 tries: 0,
             };
             log(self.store.reply(&row, &reply, "done").map_err(Into::into));
+            // rpi reads AGENTS.md once, at start: a fresh child on the same session loads the rules.
+            if rules_changed {
+                self.restart = true;
+                self.restart_if_idle().await;
+            }
             return;
         }
         if let Some(reply) = crate::scheduler::command(&mut self.store, &self.cfg, &m) {
@@ -400,7 +406,11 @@ impl<'a> Router<'a> {
         // Before reconcile dispatches the next row, so that row runs on the new model.
         self.apply_model().await;
         self.backoff = FIRST_BACKOFF;
-        log(crate::memory::commit_if_changed(&self.cfg.home).map(drop));
+        let memory = crate::memory::commit_if_changed(&self.cfg.home, self.cfg.state_dir())
+            .unwrap_or_else(|e| {
+                eprintln!("zephyr: memory commit failed: {e:#}");
+                None
+            });
         let tally = std::mem::take(&mut self.tally);
         let crossed = self.record_spend(tally.used).unwrap_or_else(|e| {
             eprintln!("zephyr: recording spend failed: {e:#}");
@@ -432,8 +442,8 @@ impl<'a> Router<'a> {
             }
         }
         // After the reply, so the owner reads what was sent out next to what it was for.
-        if let Some(alert) = tally.alert() {
-            log(self.store.notify_last_owner(&alert).map_err(Into::into));
+        for notice in [tally.alert(), memory].into_iter().flatten() {
+            log(self.store.notify_last_owner(&notice).map_err(Into::into));
         }
         if crossed {
             log(self

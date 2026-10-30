@@ -652,40 +652,67 @@ async fn a_paused_scheduler_claims_nothing_and_catches_up_once_on_resume() {
 }
 
 #[tokio::test]
-async fn memory_commits_after_a_run_and_the_owner_can_undo_it() {
+async fn a_memory_edit_waits_for_the_owner_who_sees_its_diff() {
     let home = home("memory");
     let gw = start(config(&home));
     gw.say("m1", "owner", "WRITE_MEMORY likes tea").await;
-    gw.wait_replies(1).await;
-    let memory = std::fs::read_to_string(home.join("memory/MEMORY.md")).unwrap();
-    assert!(memory.contains("remembered: "), "the run wrote memory");
-    let log = std::process::Command::new("git")
-        .arg("-C")
-        .arg(home.join("memory"))
-        .args(["log", "--format=%s"])
-        .output()
-        .unwrap();
-    let log = String::from_utf8_lossy(&log.stdout).to_string();
+    let replies = gw.wait_replies(2).await;
+    assert_eq!(replies[0], "echo: [chat #1] WRITE_MEMORY likes tea");
     assert!(
-        log.lines().next().unwrap().starts_with("memory: "),
-        "got {log}"
+        replies[1].starts_with("[zephyr] memory change waiting; /memory ok keeps it")
+            && replies[1].ends_with("+ remembered: [chat #1] WRITE_MEMORY likes tea"),
+        "{}",
+        replies[1]
     );
+    let agents = || std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    gw.say("m2", "owner", "/new").await;
+    gw.say("m3", "owner", "hi").await;
+    gw.wait_replies(4).await;
+    assert!(!agents().contains("likes tea"), "not before the owner's ok");
 
-    gw.say("m2", "owner", "/memory log").await;
-    assert!(gw.wait_replies(2).await[1].contains("memory: "));
+    gw.say("m4", "owner", "/memory ok").await;
+    assert!(gw.wait_replies(5).await[4].starts_with("[zephyr] memory kept"));
+    gw.say("m5", "owner", "/new").await;
+    gw.say("m6", "owner", "again").await;
+    gw.wait_replies(7).await;
+    assert!(agents().contains("likes tea"));
 
-    gw.say("m3", "owner", "/memory undo").await;
-    let replies = gw.wait_replies(3).await;
+    gw.say("m7", "owner", "/memory undo").await;
+    let replies = gw.wait_replies(8).await;
     assert!(
-        replies[2].starts_with("[zephyr] undid "),
+        replies[7].starts_with("[zephyr] undid "),
         "got {}",
-        replies[2]
+        replies[7]
     );
     let memory = std::fs::read_to_string(home.join("memory/MEMORY.md")).unwrap();
     assert!(
         !memory.contains("remembered: "),
         "the undo reverted the run's edit"
     );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_rule_restarts_the_agent_and_leads_its_context() {
+    let home = home("rules");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "/rule never email bob").await;
+    assert_eq!(
+        gw.wait_replies(2).await[1],
+        "[zephyr] rule 1 set; it applies from the next message"
+    );
+    gw.say("m3", "owner", "again").await;
+    gw.wait_replies(3).await;
+    assert_eq!(
+        log(&home, "start").len(),
+        2,
+        "one restart, on the same session"
+    );
+    let agents = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    assert!(agents.contains("## Owner's standing rules"), "{agents}");
+    assert!(agents.contains("1. never email bob"));
     gw.shutdown().await;
 }
 

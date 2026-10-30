@@ -70,6 +70,16 @@ example to test beside a live install.
 - After a turn that ran a command sending data off the machine (curl or wget with a body, ssh, scp,
   rsync to a host, nc, `git push`, ...), zephyr lists them: `[zephyr] outbound this turn: ...`.
   Jobs report theirs on the job's channel. Plain downloads are not listed.
+- When the agent changes its memory (`memory/USER.md`, `MEMORY.md`), you get the diff. The change
+  reaches the agent's context only after `/memory ok`; `/memory undo` drops it, `/memory diff` shows
+  it again, `/memory log` lists commits. A web page cannot plant a lasting "preference" without you.
+
+## Standing rules
+
+`/rule never push to main` adds a rule the agent sees first in every session, above its memory,
+from the next message on. `/rules` lists them, `/rule rm 2` removes one. Rules live with the
+daemon, out of the agent's reach, and do not fade when a long conversation is summarised the way
+instructions given in chat can. `/new` starts a fresh conversation; rules and memory carry over.
 
 ## Where things live
 

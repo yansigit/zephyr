@@ -130,10 +130,19 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
             let (status, output, crossed) = execute(&cfg, &mut store, &run).await;
             wake.running.store(false, Ordering::SeqCst);
             // The run's memory edits are committed as main's settle would commit them.
-            log_err(crate::memory::commit_if_changed(&cfg.home));
+            let memory = crate::memory::commit_if_changed(&cfg.home, cfg.state_dir())
+                .unwrap_or_else(|e| {
+                    eprintln!("zephyr: memory commit failed: {e:#}");
+                    None
+                });
             let delivery = (output.trim() != SILENT).then_some(output.as_str());
             if let Err(e) = store.finish_run(&run, status, &output, delivery, crate::now()) {
                 eprintln!("zephyr: recording job run {} failed: {e}", run.id);
+            }
+            if let Some(notice) = memory {
+                if let Err(e) = store.notify(&run.job.channel, &run.job.recipient, &notice) {
+                    eprintln!("zephyr: memory notice failed: {e}");
+                }
             }
             if crossed {
                 let (channel, recipient) = (&run.job.channel, &run.job.recipient);
@@ -143,12 +152,6 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
             }
             wake.outbox.notify_one();
         }
-    }
-}
-
-fn log_err(r: anyhow::Result<bool>) {
-    if let Err(e) = r {
-        eprintln!("zephyr: memory commit failed: {e:#}");
     }
 }
 

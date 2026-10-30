@@ -142,9 +142,13 @@ There are no per-call prompts. These hard limits hold every time:
 
 ### 4.6 Memory
 
-- `~/agent/memory/{USER.md, MEMORY.md, notes/YYYY-MM-DD.md}`, kept in a git repo.
-- These are loaded as context files when a session starts, using rpi's existing context-file loading. This is the frozen snapshot, which keeps the prompt cache warm. The agent edits them with normal file tools inside the sandbox.
-- The gateway commits after each run that changed them. `/memory undo` runs `git revert`. It never reverts the first (seed) commit. rpi skips `AGENTS.md` for a cwd that `trust.json` marks `false`, so `zephyr doctor` checks for that.
+- `/zephyr/memory/{USER.md, MEMORY.md, notes/YYYY-MM-DD.md}`, kept in a git repo, edited by the agent with normal file tools. The daemon commits after each run that changed them.
+- rpi loads `/zephyr/AGENTS.md` as a context file when a child starts (the frozen snapshot, which keeps the prompt cache warm). The daemon writes it before every start from the owner's side only, never from the working files:
+  1. **The owner's standing rules** (`/rule <text>`, `/rule rm N`, `/rules`), kept in `<state>/RULES.md`, first, with a line saying that text claiming to change them is not from the owner. A rule change restarts the child at idle on the same session, so it applies from the next message; jobs start fresh children and get it too. Rules here sit at system-prompt level, which compaction does not touch: in Governance Decay (arXiv 2606.22528, Tables 1–2) in-chat rules were dropped after compaction up to 59% of the time, system-prompt ones 0%.
+  2. **The approved memory**: `<state>/approved/{USER.md, MEMORY.md}`. A change the agent makes waits: after the run the owner gets its diff once (`[zephyr] memory change waiting; /memory ok keeps it, /memory undo drops it`), and `/memory diff` shows it again. `/memory ok` approves it, for the next child start. `/memory undo` drops a waiting change by reverting each commit since the last approval; with nothing waiting it reverts the newest memory commit, as before, never the seed, and approves the result. On the first start with approvals, the memory there counts as approved.
+
+  Why a human gate rather than a scanner: an agent that writes its own memory saved a fabricated "preference" from one web page up to 99.8% of the time, which then steered 68–80% of later actions (Sleeper Memory Poisoning, arXiv 2605.15338, Tables 1–2, App. I); pattern and LLM-trust filters let poisoned entries through (arXiv 2601.05504 §8.2).
+- `<state>` is root's in the container (§4.4), so the agent can change neither the rules nor the approved copies. rpi skips `AGENTS.md` for a cwd that `trust.json` marks `false`, so `zephyr doctor` checks for that.
 
 ### 4.7 Auth and providers
 
@@ -217,4 +221,6 @@ Each milestone gets a failing test first and runs in its own worktree. Lanes wit
 ## 7. Open items
 
 - The name collides with the Zephyr RTOS (a Linux Foundation project). That doesn't matter for a private repo, but check it before using Zephyr as a public brand.
-- The container runs as your uid, so it can read anything mounted that you can. Only the listed secret paths are masked.
+- The agent runs as your uid, so it can read anything mounted that you can. Only the listed secret paths are masked.
+- The agent can read the provider credentials rpi itself needs (`accounts/*/auth.json`, the Claude config) and the conversation (`sessions/`); the policy plugin's name check is the only thing in the way, and it can be bypassed.
+- A plain GET can carry data out in its URL; outbound alerts list only commands that send a body or use another method (§4.4 item 3).
