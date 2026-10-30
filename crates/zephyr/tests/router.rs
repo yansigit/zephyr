@@ -1225,11 +1225,13 @@ async fn a_channel_change_ends_the_run_for_a_reexec_once_idle() {
     assert_eq!(exit, zephyr::router::Exit::Reexec);
 }
 
-// Multi-threaded, as the daemon runs: here the child's events reach the router while the test sleeps.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn a_run_shows_activity_on_the_channel_it_serves() {
     let home = home("activity");
-    let gw = start(config(&home));
+    let mut cfg = config(&home);
+    // The fake child answers nothing while its tool runs; an auth check's call would stall the router.
+    cfg.auth.enabled = false;
+    let gw = start(cfg);
     // The tool runs until `tool_wait` goes, so the run can't be coalesced away.
     std::fs::write(home.join("tool_wait"), "").unwrap();
     gw.say_on("discord", "d1", "downer", "[tool] look around")
