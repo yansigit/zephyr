@@ -246,13 +246,31 @@ fn login(
     let token = match preset {
         Some(t) => Some(t),
         None if provider == "claude-code" => {
-            println!("Sign in with your Claude subscription. Copy the token it prints at the end.");
-            run(&mut h.exec(&["-it"], &[], &[CLAUDE_CLI, "setup-token"]))?;
-            Some(
-                Password::new()
-                    .with_prompt("Paste the token (hidden)")
-                    .interact()?,
-            )
+            println!("Sign in with your Claude subscription.");
+            // `script` keeps a transcript to read the token from; a wide pty keeps it on one line.
+            let log = "/tmp/zephyr-setup-token";
+            let signed = run(&mut h.exec(
+                &["-it"],
+                &[],
+                &[
+                    "sh",
+                    "-c",
+                    &format!(
+                        "umask 077; script -qec 'stty cols 1000; {CLAUDE_CLI} setup-token' {log}"
+                    ),
+                ],
+            ));
+            let text =
+                output(&mut h.exec(&[], &[], &["sh", "-c", &format!("cat {log}; rm -f {log}")]));
+            signed?;
+            match text.ok().as_deref().and_then(setup_token) {
+                Some(t) => Some(t.to_string()),
+                None => Some(
+                    Password::new()
+                        .with_prompt("Paste the token it printed (hidden)")
+                        .interact()?,
+                ),
+            }
         }
         None => None,
     };
@@ -487,4 +505,26 @@ fn channel_add(h: &Host, kind: &str) -> anyhow::Result<()> {
         );
     }
     h.data.save(&doc)
+}
+
+/// The token `claude setup-token` printed, from its transcript.
+fn setup_token(transcript: &str) -> Option<&str> {
+    let start = transcript.rfind("sk-ant-oat01-")?;
+    let rest = &transcript[start..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::setup_token;
+
+    #[test]
+    fn reads_the_token_from_the_setup_token_transcript() {
+        let t = "\x1b[1m Your OAuth token (valid for 1 year):\x1b[22m\r\n\r\n sk-ant-oat01-Ab_c-9\x1b[0m\r\n Store";
+        assert_eq!(setup_token(t), Some("sk-ant-oat01-Ab_c-9"));
+        assert_eq!(setup_token("Login cancelled\r\n"), None);
+    }
 }
