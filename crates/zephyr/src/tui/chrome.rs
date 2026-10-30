@@ -375,8 +375,7 @@ fn compact_header(s: &State, p: &Palette, width: usize) -> Vec<String> {
     vec![top, p.dim.fg(&rule)]
 }
 
-/// The one-row status line: what zephyr is doing now. Blank when idle and connected, so it is
-/// the one blank row above the input.
+/// The one-row status line: what zephyr is doing now, `≋ ready` when idle. Always one row.
 pub fn run_line(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
     let run = &s.snapshot.run;
     let (left, right) = match &s.link {
@@ -451,8 +450,8 @@ pub fn run_line(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
                     String::new(),
                 )
             } else {
-                // Kept, so the transcript does not jump a row as runs start and end.
-                (String::new(), String::new())
+                // The row is kept, so the transcript does not jump as runs start and end.
+                (p.muted.fg(&format!("{} ready", glyph("≋"))), String::new())
             }
         }
     };
@@ -809,8 +808,8 @@ mod tests {
         );
 
         let mut s = up();
-        // Idle keeps its row blank, so the transcript stays put when a run starts.
-        assert_eq!(line(&s).trim(), "");
+        // Idle keeps its row, so the transcript stays put when a run starts.
+        assert_eq!(line(&s).trim(), "≋ ready");
         let idle_rows = run_line(&s, &DARK, 80, NOW).len();
         s.snapshot.paused = Some("user".into());
         assert!(line(&s).contains("⏸ paused: new messages wait until /resume"));

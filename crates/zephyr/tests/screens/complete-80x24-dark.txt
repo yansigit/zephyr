@@ -2,7 +2,6 @@
 ▟█•█◡█•████∼    main · claude-code-1 › claude-opus-5-5
 ▀▀█████▀██▀     discord ●  imessage ●  chat ○      today 41.2k tok · $0.38 / $5
  ──────────────────────────────────────────────────────────────────────────────
-
    ▸ bash  ls ~/Projects/zephyr/deploy                                   ✓ 0.1s
 
  ≋ Three files: the image recipe, the launcher, and a one-time cleanup script.
@@ -12,6 +11,7 @@
    │ channels: discord connected, imessage connected
    │ today: 41.2k tokens, $0.38 of $5
 
+ ≋ ready
  › /new                     start a fresh conversation; memory and rules carry …
    /help                    this list
    /stop                    stop the current reply

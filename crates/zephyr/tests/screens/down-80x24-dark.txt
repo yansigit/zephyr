@@ -2,7 +2,6 @@
 ▟█×█~█×████     main · reconnecting…
 ▀█████████▀
  ──────────────────────────────────────────────────────────────────────────────
- ▌ remind me to renew the domain on friday                     discord · 14:02
 
  ≋ Done. I scheduled renew kimchigoose.com for Fri 09:00 KST.
    ▸ schedule  add "renew domain" fri 09:00                              ✓ 0.2s
@@ -17,6 +16,7 @@
    │ agent: claude-code-1 on claude-code/claude-opus-5-5
    │ channels: discord connected, imessage connected
    │ today: 41.2k tokens, $0.38 of $5
+
  ◐ reconnecting…  zephyr closed the connection               your draft is kept
  ╭────────────────────────────────────────────────────────────────────────────╮
  │ half-typed draft                                                           │
