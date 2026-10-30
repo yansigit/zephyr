@@ -16,7 +16,7 @@ use zephyr::store::Store;
 /// The rpi minor this build speaks (DESIGN §3).
 const RPI_PIN: &str = "rpi 0.12.";
 
-const USAGE: &str = "usage: zephyr <run|status|doctor|chat|pause|resume|reload>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
+const USAGE: &str = "usage: zephyr <run|status|doctor|chat|tui|pause|resume|reload>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -43,6 +43,7 @@ async fn main() -> ExitCode {
             ("status", Ok(cfg)) => status(&cfg).await,
             ("doctor", Ok(cfg)) => doctor(&cfg).await,
             ("chat", Ok(cfg)) => chat::client(&cfg.socket_path()).await,
+            ("tui", Ok(cfg)) => zephyr::tui::run(&cfg).await,
             ("pause", Ok(cfg)) => control(&cfg, "/pause").await,
             ("resume", Ok(cfg)) => control(&cfg, "/resume").await,
             ("reload", Ok(cfg)) => control(&cfg, "/reload").await,
