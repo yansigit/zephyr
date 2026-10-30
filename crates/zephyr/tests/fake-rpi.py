@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""A scripted stand-in for `rpi --mode rpc` (v0.12.0 frame shapes, see rpc.rs).
+"""A scripted stand-in for `rpi --mode rpc` (v0.14.0 frame shapes, see rpc.rs).
 
 State lives next to --session-dir (the zephyr home): log.jsonl records every command,
 pid holds the current pid, and a `hang` file makes the next prompt commit its user
 message, mark the run resumable, and stop answering (the test then kills -9 it); a
 `slow` file holds the seconds each prompt takes. `usage.json` (if present) is the usage each
 reply carries: {"totalTokens": n, "costTotal": x}, sent as message.usage.{totalTokens,cost.total}.
-`get_stats` always reports 0, as rpi 0.12.0 does for replies.
+`get_stats` always reports 0, as rpi 0.14.0 does for replies.
 Auth: the OAuth store is $RPI_CODING_AGENT_DIR/auth.json. `get_auth_status` lists its oauth
 entries. `auth refresh --provider P` (the CLI, not the RPC) gives P a fresh expiry, and records
 an "auth-refresh" line in ./log.jsonl (an `oauth_fail` file in the home makes it fail).
@@ -16,12 +16,18 @@ that error (stopReason "error", settle outcome "failed"), as a rate-limited prov
 A prompt containing WRITE_MEMORY first writes memory/MEMORY.md under the home.
 argv.json holds the argv of the latest start.
 A prompt containing `bash: CMD` first reports a bash tool call running CMD (tool_execution_start).
-Each prompt and resume starts with `agent_start` and ends with `agent_end`, then `agent_settled`. A prompt containing `[tool]` first runs one fake
+Each prompt and resume answers `accepted`, commits the user entry (`session_entry_committed`, as
+0.14 does before `agent_start`), starts with `agent_start` and ends with `agent_end`, then
+`agent_settled`. A failing turn (`rate_limited`) reports the assistant message (stopReason
+"error") with `message_start`/`message_end`/`turn_end` first, and settles with outcome "failed"
+and that `errorMessage` as `agent_settled.error`. A prompt containing `[tool]` first runs one fake
 `bash` tool call (assistant toolCall, tool_execution_start, tool_execution_end, toolResult); while a
 `tool_wait` file exists in the home, the tool keeps running.
 `get_state` reports thinkingLevel "medium".
 A prompt containing `[turns N]` reports N `turn_end` events, then waits for `abort` as `[hang]` does.
-A prompt containing `[hang]` never settles until `abort`; one that starts with `say: `
+A prompt containing `[hang]` never settles until `abort`, which records an aborted assistant
+message (stopReason "aborted", `errorMessage` "abort error: Request aborted") and settles with
+outcome "aborted"; one that starts with `say: `
 replies with the rest; `model?` replies with the current model.
 Models: `--list-models` (held while a `list_wait` file exists in the home) prints fake/m1, fake/m2 and other/m3, the catalogue `set_model` accepts
 (plus the started model);
@@ -32,7 +38,7 @@ import json, os, re, sys, time
 
 args = sys.argv[1:]
 if "--version" in args:
-    print("rpi 0.12.0"); sys.exit(0)
+    print("rpi 0.14.0"); sys.exit(0)
 CATALOG = ["fake/m1", "fake/m2", "other/m3"]
 if "--list-models" in args:
     while os.path.exists("list_wait"):  # cwd is the home
@@ -111,7 +117,10 @@ def fail(s, error):
     msg = {"kind": "assistant", "role": "assistant", "content": [], "stopReason": "error",
            "errorMessage": error, "timestamp": 0}
     s["messages"].append(msg); s["pending"] = False; save(s)
+    out({"type": "message_start", "message": msg})
     out({"type": "message_end", "message": msg})
+    out({"type": "turn_end", "message": msg, "toolResultCount": 0})
+    out({"type": "session_entry_committed", "entryId": "e", "entryType": "message", "customType": None, "lane": "main"})
     out({"type": "agent_end", "messageCount": 0, "messages": []})
     out({"type": "agent_settled", "runId": "r", "outcome": "failed", "aborted": False,
          "error": error, "summary": None, "pendingResume": False})
@@ -156,12 +165,12 @@ for line in sys.stdin:
     kind, s = cmd["type"], load()
     if kind == "prompt":
         respond(cmd, {"accepted": True})
-        out({"type": "agent_start"})
         s["messages"].append(user(cmd["message"])); save(s)
         if "WRITE_MEMORY" in cmd["message"]:
             open(os.path.join(home, "memory", "MEMORY.md"), "a").write("remembered: " + cmd["message"] + "\n")
-        # As rpi 0.12: the prompt is committed, but no message events carry it.
+        # As rpi 0.14: the prompt is committed (before agent_start), but no message events carry it.
         out({"type": "session_entry_committed", "entryId": "u", "entryType": "message", "customType": None, "lane": "main"})
+        out({"type": "agent_start"})
         if os.path.exists(os.path.join(home, "slow")):
             time.sleep(float(open(os.path.join(home, "slow")).read() or 1))
         if os.path.exists(os.path.join(home, "hang")):
@@ -172,8 +181,16 @@ for line in sys.stdin:
                 c = json.loads(line)
                 open(os.path.join(home, "log.jsonl"), "a").write(line)
                 if c["type"] != "abort":
-                    respond(c, error="busy"); continue
-                respond(c, {"aborted": True}); s["pending"] = False; save(s)
+                    respond(c, error="a run is already active"); continue
+                respond(c, {"aborted": True}); s["pending"] = False
+                # As rpi 0.14: a cancelled run still records an aborted assistant message.
+                msg = {"kind": "assistant", "role": "assistant", "content": [], "stopReason": "aborted",
+                       "errorMessage": "abort error: Request aborted", "timestamp": 0}
+                s["messages"].append(msg); save(s)
+                out({"type": "message_start", "message": msg})
+                out({"type": "message_end", "message": msg})
+                out({"type": "turn_end", "message": msg, "toolResultCount": 0})
+                out({"type": "session_entry_committed", "entryId": "e", "entryType": "message", "customType": None, "lane": "main"})
                 out({"type": "agent_end", "messageCount": 0, "messages": []})
                 out({"type": "agent_settled", "runId": "r", "outcome": "aborted", "aborted": True,
                      "error": None, "summary": None, "pendingResume": False})

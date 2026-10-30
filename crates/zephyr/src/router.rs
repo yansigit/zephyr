@@ -727,7 +727,7 @@ impl<'a> Router<'a> {
         Ok(())
     }
 
-    /// rpi 0.12 sends no message events for a prompt it accepts, so the router reports the user
+    /// rpi 0.14 sends no message events for a prompt it accepts, so the router reports the user
     /// turn itself: on the tap for attached clients and, when it starts a run, as its origin.
     fn user_turn(&mut self, row: &InboxRow, text: &str, starts_run: bool) {
         if row.id > self.shown {

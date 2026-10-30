@@ -4,17 +4,18 @@
 # The gh_token secret (from `gh auth token`) is only needed while a source repo is private; it is
 # mounted for the clone steps and never stored in a layer.
 #
-# The provider branches are set by build args. Until a branch is pushed, point the build at a local
-# checkout instead, which replaces the clone stage of the same name:
+# The provider sources are pinned to commit SHAs on main by the build args below. To build against
+# working trees instead, point the build at local checkouts, which replace the clone stage of the
+# same name:
 #   --build-context rpi-package=../rpi-package--codex --build-context provider-plugins=../rpi-provider-plugins--claude
 
-ARG RPI_VERSION=0.12.0
-ARG RPI_SHA256_AMD64=e091b849d678e961c95abc924fec68ad6079a658eb54ca33b6fdcd2e9aa09229
-ARG RPI_SHA256_ARM64=d8fb531c46d280acd61e4a58e824f1e0e9d996b4535838d7df812c89da9fec2a
+ARG RPI_VERSION=0.14.0
+ARG RPI_SHA256_AMD64=4c0bfc4919fa5ff3ca385a2a0a23e8d006dbb4c1b8dc07901f00821f9d07b1b9
+ARG RPI_SHA256_ARM64=fe129676eab7e6b0c01b090d4e7a92a6ba48942af0e039dc8230663589c76ac4
 ARG RPI_PACKAGE_REPO=https://github.com/yansigit/rpi-package.git
-ARG RPI_PACKAGE_REF=feat/providers-openai-codex
+ARG RPI_PACKAGE_REF=cabdb15fdfb4ff166d4fad0b140e67a59ed7d704 # main as of 2026-10-30
 ARG PLUGINS_REPO=https://github.com/yansigit/rpi-provider-plugins.git
-ARG PLUGINS_REF=feat/claude-agent-sdk
+ARG PLUGINS_REF=33e3cbb0bc5f410dfa4df3626ea930a666b90bac # main as of 2026-10-30
 
 # Rust plus node 24 (the plugin stage scripts use both). Bookworm's glibc (2.36) is older than
 # the final image's (2.39), so what is built here runs there.
@@ -47,18 +48,19 @@ RUN --mount=type=secret,id=gh_token fetch "$PLUGINS_REPO" "$PLUGINS_REF"
 FROM scratch AS provider-plugins
 COPY --from=provider-plugins-git /src /
 
-# zephyr, zephyr-policy and librpi_providers.so.
+# zephyr, zephyr-policy, librpi_providers.so and librpi_mcp_adapter.so.
 FROM toolchain AS rust
 COPY Cargo.toml Cargo.lock /src/zephyr/
 COPY crates /src/zephyr/crates
 COPY --from=rpi-package / /src/rpi-package
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cd /src/zephyr && cargo build --release --locked -p zephyr -p zephyr-policy \
-    && cd /src/rpi-package && cargo build --release --locked -p rpi-providers \
+    && cd /src/rpi-package && cargo build --release --locked -p rpi-providers -p rpi-mcp-adapter \
     && mkdir -p /out/bin /out/lib /out/ext \
     && cp /src/zephyr/target/release/zephyr /out/bin/ \
     && cp /src/zephyr/target/release/libzephyr_policy.so /out/lib/ \
-    && cp /src/rpi-package/target/release/librpi_providers.so /out/ext/
+    && cp /src/rpi-package/target/release/librpi_providers.so /out/ext/ \
+    && cp /src/rpi-package/target/release/librpi_mcp_adapter.so /out/ext/
 
 # rpi-cursor-lite and rpi-claude-agent: each package's stage.sh builds its cdylib and worker and
 # installs the lockfile-pinned node_modules (npm ci --ignore-scripts, checked against the lockfiles' hashes).

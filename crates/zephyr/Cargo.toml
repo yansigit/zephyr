@@ -29,7 +29,7 @@ url = "2"
 croner = { version = "4", default-features = false, features = ["jiff"] }
 jiff = "0.2"
 # Pinned with the rpi binary (DESIGN §3); bump the two together.
-rpi-tui = "=0.12.0"
+rpi-tui = "=0.14.0"
 crossterm = { version = "0.27", features = ["bracketed-paste"] }
 
 [dev-dependencies]

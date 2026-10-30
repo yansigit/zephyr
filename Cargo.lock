@@ -1330,18 +1330,18 @@ dependencies = [
 
 [[package]]
 name = "rpi-plugin-sdk"
-version = "0.12.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6d27415ca0a573e072ff5942f1c687da7e5974f7fd44a6a8b09d19b99493d66"
+checksum = "a2bb7e260aa80a8a541a1d7fc467b5fb51ef0e820fc5e1f6f8323ee601d07d86"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "rpi-tui"
-version = "0.12.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cae2f102d8a7638056c172a639e4ced97f83bfab8d365f2b095ff889a7f3c2a5"
+checksum = "6ca242376753086d1f32b54af7feb08ef60de1a4a1100c89f751406409cdf478"
 dependencies = [
  "base64 0.22.1",
  "crossterm",

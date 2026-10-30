@@ -14,7 +14,7 @@ use zephyr::rpc::{Child, USED_COMMANDS};
 use zephyr::store::Store;
 
 /// The rpi minor this build speaks (DESIGN §3).
-const RPI_PIN: &str = "rpi 0.12.";
+const RPI_PIN: &str = "rpi 0.14.";
 
 const USAGE: &str = "usage: zephyr <run|status|doctor|chat|tui|pause|resume|reload>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
 
@@ -325,6 +325,16 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
             &label,
             std::fs::metadata(path).is_ok_and(|m| m.mode() & 0o077 == 0),
         );
+    }
+    // Warnings, not failures: a path that is not there means the CLI and the image are out of
+    // step, and the child would still start (rpi skips an extension it cannot load).
+    for path in cfg.policy_plugin.iter().chain(&cfg.extensions) {
+        if !path.exists() {
+            println!(
+                "warn {} does not exist: no child can load it (the CLI and the image are out of step)",
+                path.display()
+            );
+        }
     }
     // A warning, not a failure: providers come from the image (DESIGN §4.4).
     let ext_dir = zephyr::auth_keeper::agent_dir(cfg).join("extensions");
