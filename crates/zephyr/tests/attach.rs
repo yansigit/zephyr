@@ -42,6 +42,20 @@ struct Gateway {
     task: tokio::task::JoinHandle<anyhow::Result<zephyr::router::Exit>>,
 }
 
+/// A port for a gateway's attach listener, below the kernel's ephemeral range (32768 up), so a
+/// `bind(0)` elsewhere cannot take it before the router binds it. Each test process has its own
+/// block of 30, by pid.
+fn free_port() -> u16 {
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let block = 20_000 + (std::process::id() % 400) as u16 * 30;
+    loop {
+        let port = block + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 30;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}
+
 fn start(name: &str) -> Gateway {
     start_with(name, "")
 }
@@ -57,11 +71,7 @@ fn start_with(name: &str, extra: &str) -> Gateway {
     let token = home.join("tui.token");
     std::fs::write(&token, format!("{TOKEN}\n")).unwrap();
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = free_port();
     // On a file, so `/model` has a zephyr.toml to change.
     let path = home.join("zephyr.toml");
     std::fs::write(&path, format!(
