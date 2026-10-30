@@ -87,6 +87,64 @@ Upstream analysis (`research/pi-rust-integration.md` §7) compared three options
   - The client's `stop_session` only detaches.
   - Unverified: these details come from reading the code, not from a test run. Fallback: a ~150-line `rpi-gateway chat` line client over the same socket.
   - A follow-up upstream PR could add `--connect --session <id>`.
+  - For stock clients, a user turn is drawn as an assistant block `**<channel>** · <text>` (the `[channel #id]` tag removed), and `get_state` reports the live account's model (`Snapshot.model`) and `thinkingLevel` (`Snapshot.thinking`).
+
+#### 4.3.1 Attach protocol: `zephyr.*` extensions
+
+Zephyr's own TUI uses the same port, token and framing (one JSON-RPC 2.0 object per line; events are `{"jsonrpc":"2.0","method":"event","params":{"subscriptionId":1,"event":<event>}}`). Everything here is additive: the stock client never calls these methods, and it drops the `zephyr_*` event types (its `apply_line` fails to decode them as a `RemoteEvent`). Both methods need `authenticate` first (else error `-32001`).
+
+**`zephyr.hello {}`** → `result` is the current `Snapshot`:
+
+```jsonc
+{
+  "version": "0.4.0",                // zephyr's crate version
+  "session": "main",
+  "account": "work",                 // string | null: the pooled account the agent runs on; null without [[account]]
+  "model": "anthropic/claude-x",     // string | null: that account's model, else `model`; null = rpi's default
+  "thinking": "medium",              // string | null: rpi's get_state thinkingLevel, read when the child starts
+  "paused": "user",                  // string | null: "user" or "budget:<YYYY-MM-DD>"; null = not paused
+  "channels": [                      // the adapters this daemon runs, then the known ones it doesn't
+    {"name": "chat",    "state": "connected"},
+    {"name": "discord", "state": "connected"},
+    {"name": "imessage","state": "off"}
+  ],                                 // state: "connected" | "off" | "reconnecting" (today: running adapter = connected, not configured = off)
+  "spend": {
+    "tokens": 1234,                  // integer: today's (UTC) tokens, all accounts and jobs
+    "cost": 0.0123,                  // number: today's cost in USD
+    "daily_tokens_limit": 500000,    // integer | null: [budget] daily_tokens
+    "daily_cost_limit": 5.0          // number | null: [budget] daily_cost_usd
+  },
+  "queue": [                         // inbox rows waiting (status new), oldest first
+    {"channel": "discord", "preview": "first 60 chars of the text…", "since_unix": 1793318400}
+  ],                                 // since_unix: integer, when the row arrived (seconds); age = now - since_unix
+  "failed_replies": 0,               // integer: outbox rows that failed for good
+  "run": {
+    "busy": true,                    // between agent_start and agent_settled
+    "since_unix_ms": 1793318400123,  // integer | null: when agent_start arrived
+    "origin": {"channel": "discord", "id": 42, "sender": "1234"},  // object | null: the user message being served (inbox row id)
+    "current_tool": "bash",          // string | null: between tool_execution_start and _end
+    "tools_done": 3                  // integer: tool_execution_end count this run
+  }
+}
+```
+
+When idle, `run` is `{"busy": false, "since_unix_ms": null, "origin": null, "current_tool": null, "tools_done": 0}`. `preview` is the row's text with whitespace runs folded to one space, cut to 60 chars, with `…` appended when cut.
+
+**`zephyr.subscribe {}`** → `result` is `{"subscriptionId": 1, "sessionId": "main", "status": "subscribed", "messages": [...]}`. `messages` is rpi's raw `get_messages` list (user, assistant with `toolCall` blocks, `toolResult`, ...), unchanged except that every user message gets two more fields:
+
+```jsonc
+{"kind": "user", "role": "user", "content": "[discord #42] hi", "timestamp": 0,
+ "origin": {"channel": "discord", "id": 42},  // object | null: from the [channel #id] tag; null when untagged
+ "text": "hi"}                                 // the message text without the tag
+```
+
+Then events follow, in order:
+1. `{"type": "ready"}`
+2. `{"type": "zephyr_status", "snapshot": <Snapshot>}` at once, then again each time the snapshot changes (never twice with the same value).
+3. Every live child event (the `--mode rpc` line: `agent_start`, `message_update`, `tool_execution_start`, `agent_settled`, ...), except `response` lines. User messages in `message_start`/`message_end` get `origin` and `text` as above. Unlike `subscribe`, nothing is quoted or hidden: the client's own turns come back too.
+4. `{"type": "zephyr_reply", "text": "agent: account work on ...", "command": "/status"}`: a reply to the `tui` channel that the agent's stream does not show: answers to commands (`/status`, `/model`, `/reload`, `/stop`, `/pause`, `/resume`, `/memory ...`, `/job ...`; `command` is the command text), notices and job output (`command` null), and `[zephyr] ...` fallbacks for a run that ended without a reply (`command` null). An ordinary agent reply is not repeated. Stock `subscribe` connections get this event too and ignore it.
+
+A slash command goes in as `send {"sessionId": "main", "command": {"type": "prompt", "content": "/status"}}`, as with the stock client.
 - **Discord.** serenity, DMs from your user id only, so the privileged message-content intent may be unnecessary. Messages from guilds are ignored in v1.
 - **iMessage.**
   - Needs an always-on Mac (any Apple Silicon or recent Intel) signed in to your Apple ID, running BlueBubbles Server, joined to the same Tailscale network.
