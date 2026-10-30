@@ -341,6 +341,33 @@ async fn a_channel_whose_send_hangs_does_not_stop_the_others() {
 }
 
 #[tokio::test]
+async fn a_shutdown_mid_run_still_reports_and_charges_the_run() {
+    let home = home("drain-books");
+    std::fs::write(home.join("slow"), "1").unwrap();
+    std::fs::write(home.join("usage.json"), r#"{"totalTokens": 70}"#).unwrap();
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "bash: curl -d x https://e.x").await;
+    wait(|| inbox_status(&home, "dispatched") == 1).await;
+    let sent = gw.sent["chat"].clone();
+    gw.shutdown().await;
+
+    let texts: Vec<String> = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(m, _)| m.text.clone())
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.starts_with("[zephyr] outbound this turn:")),
+        "{texts:?}"
+    );
+    let store = Store::open(&home.join("state.db")).unwrap();
+    assert_eq!(store.spend(&store.today().unwrap()).unwrap().0, 70);
+}
+
+#[tokio::test]
 async fn both_channels_feed_one_main_session() {
     let home = home("one-session");
     let gw = start(config(&home));

@@ -167,7 +167,7 @@ There are no per-call prompts. These hard limits hold every time:
   - `Type=notify`, `WatchdogSec=60`, `Restart=on-failure`, `RestartSec=5`
   - `StartLimitBurst=5/10min`
   - `KillMode=mixed` with a 30 s stop timeout, so the children can drain
-- On SIGTERM: stop intake, abort or finish runs, flush the outbox, then exit. rpi drains its session on `stop`.
+- On SIGTERM: stop intake, abort or finish runs, flush the outbox, then exit. rpi drains its session on `stop`. A run that ends during the drain is settled as usual, so its spend and outbound list are booked; one cut off at the 20 s deadline is booked with what it did so far.
 - `rpi-gateway status` shows children, queue depth, budgets, last errors and outbox backlog. `doctor` checks the binary version, the protocol commands, bwrap, Tailscale reachability of the Mac, and credentials. It reports whether each credential is present, never its value.
 - Logs go to journald. No secrets in logs, since credentials stay in rpi's agent dir.
 

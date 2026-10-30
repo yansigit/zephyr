@@ -830,12 +830,20 @@ impl<'a> Router<'a> {
         let deadline = Instant::now() + Duration::from_secs(20);
         while self.busy {
             match tokio::time::timeout_at(deadline, next_event(&mut self.child)).await {
-                Ok(Some(ev)) if ev["type"] == "agent_settled" => {
-                    self.busy = false;
-                    log(self.reconcile(None, false).await);
-                }
-                Ok(Some(_)) => {}
+                // As in `main`, so the run's spend and outbound list are booked.
+                Ok(Some(ev)) => match self.tapped(Some(ev)) {
+                    Some(ev) if ev["type"] == "agent_settled" => self.settled(&ev).await,
+                    _ => {}
+                },
                 _ => break, // child gone or out of time: recovery picks it up next start
+            }
+        }
+        if self.busy {
+            // Cut off: book what the run did so far.
+            let tally = std::mem::take(&mut self.tally);
+            log(self.record_spend(tally.used).map(drop));
+            if let Some(alert) = tally.alert() {
+                log(self.store.notify_last_owner(&alert).map_err(Into::into));
             }
         }
         self.flush(channels).await;
