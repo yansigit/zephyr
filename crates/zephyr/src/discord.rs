@@ -1,16 +1,19 @@
 //! Discord channel adapter for Zephyr: DMs only. See DESIGN.md section 4.3.
 
-use crate::channel::{Channel, Inbound, Outbound};
+use crate::channel::{Activity, Channel, Inbound, Outbound};
 use anyhow::Context as _;
 use serde::Deserialize;
 use serenity::async_trait;
-use serenity::builder::CreateMessage;
+use serenity::builder::{CreateMessage, EditMessage};
 use serenity::client::{Client, Context, EventHandler};
-use serenity::http::Http;
+use serenity::http::{Http, Typing};
 use serenity::model::channel::{Message, Nonce};
 use serenity::model::gateway::GatewayIntents;
-use serenity::model::id::UserId;
-use tokio::sync::mpsc;
+use serenity::model::id::{ChannelId, MessageId, UserId};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, Mutex};
 
 /// Discord's per-message content limit.
 pub const MAX_CONTENT: usize = 2000;
@@ -22,19 +25,138 @@ pub const MAX_NONCE: usize = 25;
 pub struct Config {
     /// Name of the env var that holds the bot token. The token is never stored here or logged.
     pub token_env: String,
+    /// Post a progress note while a run is still going after `progress_after_secs`.
+    #[serde(default = "yes")]
+    pub progress: bool,
+    #[serde(default = "default_progress_after_secs")]
+    pub progress_after_secs: u64,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn default_progress_after_secs() -> u64 {
+    20
+}
+
+/// The progress note is edited at most this often.
+pub const PROGRESS_EVERY: Duration = Duration::from_secs(5);
+/// Longest progress note; a longer tool list is cut with an ellipsis.
+pub const MAX_PROGRESS: usize = 120;
+
+/// The progress note, e.g. `≋ working · 0:24 · bash, read ×3`: tools in order of first use,
+/// repeats collapsed.
+pub fn progress_text(elapsed: Duration, tools: &[String]) -> String {
+    let s = elapsed.as_secs();
+    let mut text = format!("≋ working · {}:{:02}", s / 60, s % 60);
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for t in tools {
+        match counts.iter_mut().find(|(name, _)| name == t) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((t, 1)),
+        }
+    }
+    for (i, (name, n)) in counts.iter().enumerate() {
+        text += if i == 0 { " · " } else { ", " };
+        text += name;
+        if *n > 1 {
+            text += &format!(" ×{n}");
+        }
+    }
+    if text.chars().count() > MAX_PROGRESS {
+        text = text.chars().take(MAX_PROGRESS - 1).chain(['…']).collect();
+    }
+    text
+}
+
+/// What a `Progress` tick does to the progress note.
+#[derive(Debug, PartialEq)]
+pub enum Step {
+    Wait,
+    Post,
+    Edit(MessageId),
+}
+
+/// One run's progress note. A failed post is not retried and failures are logged once.
+#[derive(Debug, Default)]
+pub struct Progress {
+    tried: bool,
+    msg: Option<MessageId>,
+    at: Option<Instant>,
+    warned: bool,
+}
+
+impl Progress {
+    /// The step for a tick at `now`, `elapsed` into the run. `after` is `None` when progress is off.
+    pub fn step(&mut self, after: Option<Duration>, elapsed: Duration, now: Instant) -> Step {
+        match self.msg {
+            None if !self.tried && after.is_some_and(|a| elapsed >= a) => {
+                self.tried = true;
+                self.at = Some(now);
+                Step::Post
+            }
+            Some(id)
+                if self
+                    .at
+                    .is_none_or(|t| now.duration_since(t) >= PROGRESS_EVERY) =>
+            {
+                self.at = Some(now);
+                Step::Edit(id)
+            }
+            _ => Step::Wait,
+        }
+    }
+
+    fn warn(&mut self, what: &str, e: &serenity::Error) {
+        if !std::mem::replace(&mut self.warned, true) {
+            eprintln!("zephyr: discord progress {what} failed: {e}");
+        }
+    }
+}
+
+/// A recipient's run in progress: typing refreshes until `_typing` is dropped.
+struct Run {
+    dm: ChannelId,
+    _typing: Typing,
+    progress: Progress,
 }
 
 pub struct Discord {
     token: String,
-    http: Http,
+    http: Arc<Http>,
+    /// `None` when `progress = false`.
+    progress_after: Option<Duration>,
+    /// Keyed by Discord user id. A tokio mutex: `send` waits for an in-flight progress post, so it deletes it.
+    runs: Mutex<HashMap<u64, Run>>,
 }
 
 impl Discord {
     pub fn new(cfg: &Config) -> anyhow::Result<Self> {
         let token = std::env::var(&cfg.token_env)
             .with_context(|| format!("env var {} is not set", cfg.token_env))?;
-        let http = Http::new(&token);
-        Ok(Self { token, http })
+        let http = Arc::new(Http::new(&token));
+        let progress_after = cfg
+            .progress
+            .then(|| Duration::from_secs(cfg.progress_after_secs));
+        Ok(Self {
+            token,
+            http,
+            progress_after,
+            runs: Mutex::default(),
+        })
+    }
+
+    /// Ends `user`'s run: stops typing and deletes the progress note.
+    async fn finish(&self, user: u64) {
+        let Some(mut run) = self.runs.lock().await.remove(&user) else {
+            return;
+        };
+        if let Some(id) = run.progress.msg {
+            if let Err(e) = run.dm.delete_message(&self.http, id).await {
+                run.progress.warn("delete", &e);
+            }
+        }
     }
 }
 
@@ -146,6 +268,8 @@ impl Channel for Discord {
             .enumerate()
             .map(|(i, text)| Ok((nonce(&msg.client_id, i)?, text)))
             .collect::<anyhow::Result<Vec<_>>>()?;
+        // The progress note goes before the reply, so it never sits below it.
+        self.finish(user).await;
         let dm = UserId::new(user).create_dm_channel(&self.http).await?;
         for (nonce, text) in parts {
             let builder = CreateMessage::new()
@@ -153,6 +277,63 @@ impl Channel for Discord {
                 .nonce(Nonce::String(nonce))
                 .enforce_nonce(true);
             dm.send_message(&self.http, builder).await?;
+        }
+        Ok(())
+    }
+
+    async fn activity(&self, to: &str, a: &Activity) -> anyhow::Result<()> {
+        let Ok(user) = to.parse::<u64>() else {
+            eprintln!("zephyr: discord activity for {to:?}, which is not a user id");
+            return Ok(());
+        };
+        match a {
+            Activity::Start => {
+                let mut runs = self.runs.lock().await;
+                if runs.contains_key(&user) {
+                    return Ok(());
+                }
+                // Logged once per run: without a run, Progress and Stop do nothing.
+                let dm = match UserId::new(user).create_dm_channel(&self.http).await {
+                    Ok(dm) => dm.id,
+                    Err(e) => {
+                        eprintln!("zephyr: discord activity: no DM with {user}: {e}");
+                        return Ok(());
+                    }
+                };
+                let run = Run {
+                    dm,
+                    _typing: dm.start_typing(&self.http),
+                    progress: Progress::default(),
+                };
+                runs.insert(user, run);
+            }
+            Activity::Progress { elapsed, tools, .. } => {
+                let mut runs = self.runs.lock().await;
+                let Some(run) = runs.get_mut(&user) else {
+                    return Ok(());
+                };
+                let step = run
+                    .progress
+                    .step(self.progress_after, *elapsed, Instant::now());
+                let text = || progress_text(*elapsed, tools);
+                match step {
+                    Step::Wait => {}
+                    Step::Post => {
+                        let msg = CreateMessage::new().content(text());
+                        match run.dm.send_message(&self.http, msg).await {
+                            Ok(m) => run.progress.msg = Some(m.id),
+                            Err(e) => run.progress.warn("post", &e),
+                        }
+                    }
+                    Step::Edit(id) => {
+                        let msg = EditMessage::new().content(text());
+                        if let Err(e) = run.dm.edit_message(&self.http, id, msg).await {
+                            run.progress.warn("edit", &e);
+                        }
+                    }
+                }
+            }
+            Activity::Stop => self.finish(user).await,
         }
         Ok(())
     }
@@ -256,8 +437,91 @@ mod tests {
     fn new_errors_without_leaking_the_token() {
         let cfg = Config {
             token_env: "ZEPHYR_DISCORD_TEST_UNSET_VAR".into(),
+            progress: true,
+            progress_after_secs: 20,
         };
         let err = Discord::new(&cfg).err().expect("missing env var must fail");
         assert!(err.to_string().contains("ZEPHYR_DISCORD_TEST_UNSET_VAR"));
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn progress_text_collapses_repeats_in_first_use_order() {
+        let tools = names(&["bash", "read", "read", "bash", "read"]);
+        assert_eq!(
+            progress_text(Duration::from_secs(24), &tools),
+            "≋ working · 0:24 · bash ×2, read ×3"
+        );
+        assert_eq!(
+            progress_text(
+                Duration::from_secs(24),
+                &names(&["bash", "read", "read", "read"])
+            ),
+            "≋ working · 0:24 · bash, read ×3"
+        );
+        assert_eq!(
+            progress_text(Duration::from_millis(125_900), &[]),
+            "≋ working · 2:05"
+        );
+    }
+
+    #[test]
+    fn progress_text_is_capped() {
+        let tools: Vec<String> = (0..100).map(|i| format!("tool{i}")).collect();
+        let text = progress_text(Duration::from_secs(5), &tools);
+        assert_eq!(text.chars().count(), MAX_PROGRESS);
+        assert!(text.starts_with("≋ working · 0:05 · tool0, tool1"));
+        assert!(text.ends_with('…'));
+    }
+
+    #[test]
+    fn progress_posts_once_after_the_threshold_then_edits_at_most_every_5s() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let after = Some(Duration::from_secs(20));
+        let mut p = Progress::default();
+        assert_eq!(p.step(after, Duration::from_secs(19), at(19)), Step::Wait);
+        assert_eq!(p.step(after, Duration::from_secs(20), at(20)), Step::Post);
+        p.msg = Some(MessageId::new(7));
+        assert_eq!(p.step(after, Duration::from_secs(21), at(21)), Step::Wait);
+        assert_eq!(p.step(after, Duration::from_secs(24), at(24)), Step::Wait);
+        assert_eq!(
+            p.step(after, Duration::from_secs(25), at(25)),
+            Step::Edit(MessageId::new(7))
+        );
+        assert_eq!(p.step(after, Duration::from_secs(29), at(29)), Step::Wait);
+        assert_eq!(
+            p.step(after, Duration::from_secs(31), at(31)),
+            Step::Edit(MessageId::new(7))
+        );
+    }
+
+    #[test]
+    fn progress_failed_post_is_not_retried_and_off_never_posts() {
+        let now = Instant::now();
+        let after = Some(Duration::from_secs(20));
+        let mut p = Progress::default();
+        assert_eq!(p.step(after, Duration::from_secs(20), now), Step::Post);
+        // The post failed, so no message id was recorded.
+        for s in 21..60 {
+            let t = now + Duration::from_secs(s);
+            assert_eq!(p.step(after, Duration::from_secs(s), t), Step::Wait);
+        }
+        let mut off = Progress::default();
+        assert_eq!(off.step(None, Duration::from_secs(3600), now), Step::Wait);
+    }
+
+    #[test]
+    fn config_progress_defaults_and_overrides() {
+        let cfg: Config = toml::from_str("token_env = 'T'").unwrap();
+        assert!(cfg.progress);
+        assert_eq!(cfg.progress_after_secs, 20);
+        let cfg: Config =
+            toml::from_str("token_env = 'T'\nprogress = false\nprogress_after_secs = 5").unwrap();
+        assert!(!cfg.progress);
+        assert_eq!(cfg.progress_after_secs, 5);
     }
 }
