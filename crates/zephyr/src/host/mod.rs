@@ -19,7 +19,7 @@ pub const USAGE: &str = "usage: zephyr <command>
   model [--account NAME] [PROVIDER/MODEL]
   channel add discord|imessage
   config get|set KEY [VALUE]
-  chat | attach | pause | resume | reload
+  chat | attach [--stock] | pause | resume | reload
   doctor [--fix]
   uninstall [--keep-data] [--yes]
 env: ZEPHYR_CONTAINER (default zephyr), ZEPHYR_IMAGE, ZEPHYR_SRC (for --build); data in ~/.zephyr";
@@ -316,6 +316,42 @@ impl Host {
         Ok(())
     }
 
+    /// `zephyr tui` in the container, or with `stock` the stock `rpi --connect` client.
+    fn attach(&self, stock: bool) -> anyhow::Result<()> {
+        self.need_running()?;
+        let token = self.data.token()?;
+        // `-e NAME` without a value: docker copies it from this process's environment, when set.
+        let mut flags = vec!["-it", "-e", "RPI_SERVER_TOKEN"];
+        let mut cmd = if stock {
+            let doc = self.data.load()?;
+            let port = conf::get(&doc, "attach.port").context("no [attach] port in zephyr.toml")?;
+            // As root, so the agent's uid cannot read the token from the client's environment; root
+            // cannot enter the agent's home, so the client keeps its own files in /tmp.
+            let env = [
+                ("HOME", "/tmp"),
+                ("RPI_CODING_AGENT_DIR", "/tmp/zephyr-attach"),
+            ];
+            let mut cmd = self.exec(&flags, &env, &["rpi", "--connect"]);
+            cmd.arg(format!("127.0.0.1:{port}"));
+            cmd
+        } else {
+            // What the TUI reads to pick its colours and glyphs.
+            for var in [
+                "TERM",
+                "COLORTERM",
+                "COLORFGBG",
+                "NO_COLOR",
+                "LANG",
+                "LC_ALL",
+                "LC_CTYPE",
+            ] {
+                flags.extend(["-e", var]);
+            }
+            self.exec(&flags, &[("HOME", "/tmp")], &["zephyr", "tui"])
+        };
+        run(cmd.env("RPI_SERVER_TOKEN", &token))
+    }
+
     fn doctor(&self, fix: bool) -> anyhow::Result<()> {
         let mut ok = check("docker answers", quiet(docker(&["version"])));
         let dir = &self.data.dir;
@@ -606,32 +642,21 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
             h.need_running()?;
             h.apply()
         }
+        // On a terminal, `chat` is the TUI; pipes and scripts keep the line client.
+        "chat" if h.interactive => {
+            a.rest()?;
+            h.attach(false)
+        }
         "chat" | "pause" | "resume" => {
             a.rest()?;
             h.need_running()?;
-            let flags: &[&str] = if cmd == "chat" { &["-it"] } else { &[] };
+            let flags: &[&str] = if cmd == "chat" { &["-i"] } else { &[] };
             run(&mut h.exec(flags, &[], &["zephyr", cmd]))
         }
         "attach" => {
+            let stock = a.flag("--stock");
             a.rest()?;
-            h.need_running()?;
-            let doc = h.data.load()?;
-            let port = conf::get(&doc, "attach.port").context("no [attach] port in zephyr.toml")?;
-            let token = h.data.token()?;
-            // `-e NAME` without a value: docker copies it from this process's environment. As root,
-            // so the agent's uid cannot read the token from the client's environment; root cannot
-            // enter the agent's home, so the client keeps its own files in /tmp.
-            let mut cmd = h.exec(
-                &["-it", "-e", "RPI_SERVER_TOKEN"],
-                &[
-                    ("HOME", "/tmp"),
-                    ("RPI_CODING_AGENT_DIR", "/tmp/zephyr-attach"),
-                ],
-                &["rpi", "--connect"],
-            );
-            cmd.arg(format!("127.0.0.1:{port}"))
-                .env("RPI_SERVER_TOKEN", &token);
-            run(&mut cmd)
+            h.attach(stock)
         }
         "config" => {
             let rest = a.rest()?;

@@ -17,6 +17,7 @@ pub mod router;
 pub mod rpc;
 pub mod scheduler;
 pub mod store;
+pub mod tui;
 
 pub fn unix_millis() -> u128 {
     std::time::SystemTime::now()
