@@ -13,6 +13,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, Mutex};
 
 pub const NAME: &str = "chat";
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 type Conns = Arc<Mutex<HashMap<u64, (String, OwnedWriteHalf)>>>;
 
@@ -75,15 +76,25 @@ impl Channel for ChatChannel {
     }
 
     /// Writes to every open connection of the recipient uid; errors when none is open
-    /// so the outbox keeps the reply for the next connection.
+    /// so the outbox keeps the reply for the next connection. A connection that does not take
+    /// the line within `WRITE_TIMEOUT` (a client that stopped reading) is dropped.
     async fn send(&self, msg: &Outbound) -> anyhow::Result<()> {
         let mut line = serde_json::to_vec(&json!({"id": msg.client_id, "text": msg.text}))?;
         line.push(b'\n');
         let mut delivered = false;
-        for (uid, w) in self.conns.lock().await.values_mut() {
-            if *uid == msg.recipient && w.write_all(&line).await.is_ok() {
-                delivered = true;
+        let mut conns = self.conns.lock().await;
+        let mut dead = Vec::new();
+        for (id, (_, w)) in conns
+            .iter_mut()
+            .filter(|(_, (uid, _))| *uid == msg.recipient)
+        {
+            match tokio::time::timeout(WRITE_TIMEOUT, w.write_all(&line)).await {
+                Ok(Ok(())) => delivered = true,
+                _ => dead.push(*id),
             }
+        }
+        for id in dead {
+            conns.remove(&id);
         }
         if !delivered {
             bail!("no chat client connected for {}", msg.recipient);
@@ -117,4 +128,40 @@ pub async fn client(path: &Path) -> anyhow::Result<()> {
         write.write_all(&line).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_client_that_stops_reading_is_dropped() {
+        let dir = crate::test_dir("chat-stuck");
+        let chat = Arc::new(ChatChannel::new(dir.join("chat.sock")));
+        let (tx, _rx) = mpsc::channel(1);
+        let server = chat.clone();
+        tokio::spawn(async move { server.run(tx).await });
+        let client = loop {
+            match UnixStream::connect(dir.join("chat.sock")).await {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        };
+        while chat.conns.lock().await.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let msg = Outbound {
+            channel: NAME.into(),
+            recipient: unsafe { libc::getuid() }.to_string(),
+            client_id: "z1".into(),
+            text: "x".repeat(4 << 20), // more than the socket buffers hold
+        };
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(5), chat.send(&msg)).await;
+        assert!(sent.expect("send returned").is_err(), "nothing was read");
+        assert!(
+            chat.conns.lock().await.is_empty(),
+            "the stuck client was dropped"
+        );
+        drop(client);
+    }
 }

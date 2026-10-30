@@ -73,6 +73,7 @@ Upstream analysis (`research/pi-rust-integration.md` §7) compared three options
 3. **Reply.** On `agent_settled`, the router takes the final assistant text of that turn. It writes `outbox(inbox_id, channel, text, client_id, status='pending')` first, then sends.
    - The client id is Discord's `nonce` with `enforce_nonce`, or the BlueBubbles `tempGuid`, so the platform drops a retried duplicate.
    - Sends are retried only while the platform still dedupes the client id: 5 min on Discord, 1 h elsewhere. Then the row becomes `failed` and the failure is surfaced on the TUI. Client ids are at most 20 chars (Discord's nonce limit is 25).
+   - A send that takes over 10 s counts as failed, and that channel is skipped for 30 s, so one stuck channel (a chat client that stopped reading, a hung HTTP call) cannot hold up the router or the other channels. The chat channel also drops a connection that does not take a line within 2 s.
 4. **After a crash:**
    - **Gateway crash.** On start, `dispatched` rows whose text is already in the session (checked with `get_messages`) are not sent again. Rows whose text is missing are re-sent once.
    - **Child crash.** Respawn it with `--session-id`. If `get_messages` reports `pendingResume` (rpi 0.12 does not put it in `get_state`), call `resume_pending`; rpi allows at most 3 attempts. After that, the gateway tells you in the originating channel.

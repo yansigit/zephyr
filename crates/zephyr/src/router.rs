@@ -17,6 +17,10 @@ use tokio::time::Instant;
 const MAX_RESUMES: u32 = 3;
 const FIRST_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// A channel send that takes longer fails, and that channel is skipped for `STUCK_PAUSE`, so
+/// one stuck channel can't hold up the router or the other channels.
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+const STUCK_PAUSE: Duration = Duration::from_secs(30);
 
 /// The prompt text for a row. The `#id` tag is what recovery looks for in `get_messages`.
 pub fn tagged(row: &InboxRow) -> String {
@@ -68,6 +72,7 @@ pub async fn run<C: Channel>(
         backoff: FIRST_BACKOFF,
         respawn_at: Instant::now(),
         unrouted: HashSet::new(),
+        stuck: HashMap::new(),
         tap: broadcast::channel(1024).0,
         attaches,
         jobs: &jobs,
@@ -116,6 +121,8 @@ struct Router<'a> {
     respawn_at: Instant,
     /// Outbox channels with no configured adapter, so each is logged once.
     unrouted: HashSet<String>,
+    /// Channels whose last send timed out, and when to try them again.
+    stuck: HashMap<String, Instant>,
     /// Every child event, for attached clients.
     tap: broadcast::Sender<Value>,
     attaches: mpsc::Receiver<crate::attach::AttachRequest>,
@@ -760,6 +767,13 @@ impl<'a> Router<'a> {
             .into_iter()
             .filter(|r| r.channel != crate::attach::CHANNEL)
         {
+            if self
+                .stuck
+                .get(&row.channel)
+                .is_some_and(|t| Instant::now() < *t)
+            {
+                continue;
+            }
             let Some(channel) = channels.iter().find(|c| c.name() == row.channel) else {
                 if self.unrouted.insert(row.channel.clone()) {
                     eprintln!(
@@ -775,7 +789,16 @@ impl<'a> Router<'a> {
                 client_id: row.client_id,
                 text: row.text,
             };
-            let status = match channel.send(&msg).await {
+            let sent = match tokio::time::timeout(SEND_TIMEOUT, channel.send(&msg)).await {
+                Ok(sent) => sent,
+                Err(_) => {
+                    eprintln!("zephyr: {} send timed out; trying again later", row.channel);
+                    self.stuck
+                        .insert(row.channel.clone(), Instant::now() + STUCK_PAUSE);
+                    Err(anyhow::anyhow!("timed out"))
+                }
+            };
+            let status = match sent {
                 Ok(()) => "sent",
                 Err(e) if now() - row.created_at > retry_window(&row.channel) => {
                     eprintln!(

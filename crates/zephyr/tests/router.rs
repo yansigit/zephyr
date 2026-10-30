@@ -32,6 +32,14 @@ impl Channel for TestChannel {
         std::future::pending().await
     }
     async fn send(&self, msg: &Outbound) -> anyhow::Result<()> {
+        // A `stall-<name>` file in the home makes this channel's sends hang, like a stuck client.
+        if self
+            .db
+            .with_file_name(format!("stall-{}", self.name))
+            .exists()
+        {
+            std::future::pending::<()>().await;
+        }
         let pending = Store::open(&self.db)
             .unwrap()
             .outbox_status(&msg.client_id)
@@ -310,6 +318,25 @@ async fn replies_go_back_on_the_channel_they_came_from() {
         ["echo: [discord #2] from discord"]
     );
     assert_eq!(gw.replies(), ["echo: [chat #1] from chat"]);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_channel_whose_send_hangs_does_not_stop_the_others() {
+    let home = home("stalled-channel");
+    std::fs::write(home.join("stall-discord"), "").unwrap();
+    let gw = start(config(&home));
+    gw.say_on("discord", "d1", "downer", "into the void").await;
+    wait(|| inbox_status(&home, "done") == 1).await;
+    gw.say("m1", "owner", "still here?").await;
+    for _ in 0..300 {
+        if !gw.replies().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(gw.replies(), ["echo: [chat #2] still here?"]);
+    std::fs::remove_file(home.join("stall-discord")).unwrap();
     gw.shutdown().await;
 }
 
