@@ -185,21 +185,27 @@ pub fn commit_if_changed(home: &Path, state: &Path) -> anyhow::Result<Option<Str
     if working == approved || !approved_dir(state).exists() {
         return Ok(None);
     }
-    let seen = approved_dir(state).join(".notified");
-    let hash = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        working.hash(&mut h);
-        format!("{:x}", h.finish())
-    };
-    if std::fs::read_to_string(&seen).is_ok_and(|s| s == hash) {
+    if !mark_shown(state, &working)? {
         return Ok(None);
     }
-    crate::host::conf::replace_private(&seen, &hash)?;
     Ok(Some(format!(
         "[zephyr] memory change waiting; /memory ok keeps it, /memory undo drops it:\n{}",
         diff(&approved, &working)
     )))
+}
+
+/// Records `working` as the content the owner was last shown. False when it already was.
+fn mark_shown(state: &Path, working: &Files) -> anyhow::Result<bool> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    working.hash(&mut h);
+    let hash = format!("{:x}", h.finish());
+    let seen = approved_dir(state).join(".notified");
+    if std::fs::read_to_string(&seen).is_ok_and(|s| s == hash) {
+        return Ok(false);
+    }
+    crate::host::conf::replace_private(&seen, &hash)?;
+    Ok(true)
 }
 
 fn commit_locked(home: &Path) -> anyhow::Result<bool> {
@@ -341,14 +347,22 @@ fn waiting(home: &Path, state: &Path) -> anyhow::Result<Option<String>> {
     Ok((working != approved).then(|| diff(&approved, &working)))
 }
 
-/// `/memory ok`: the working files become the approved ones.
+/// `/memory ok`: the working files become the approved ones, if they are what the owner was
+/// last shown. A run may have changed them since; then the owner is shown that instead.
 fn keep(home: &Path, state: &Path) -> anyhow::Result<String> {
     let working = {
         let _fs = crate::agent::fs();
         read_working(home)?
     };
-    if working == read_approved(state)? {
+    let approved = read_approved(state)?;
+    if working == approved {
         return Ok("nothing waiting".into());
+    }
+    if mark_shown(state, &working)? {
+        return Ok(format!(
+            "[zephyr] memory changed since you saw it; /memory ok again keeps this:\n{}",
+            diff(&approved, &working)
+        ));
     }
     approve(home, state, &working)?;
     Ok("[zephyr] memory kept; the agent loads it from its next start (or /new)".into())
@@ -559,6 +573,32 @@ mod tests {
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
         assert!(agents(&home).contains("likes tea"));
         assert_eq!(say(&home, "/memory diff").0, "nothing waiting");
+    }
+
+    #[test]
+    fn ok_keeps_only_the_change_the_owner_was_shown() {
+        let home = home();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
+        std::fs::write(dir(&home).join(MEMORY), "likes tea\n").unwrap();
+        commit_if_changed(&home, &state(&home)).unwrap().unwrap();
+        // Written after the notice, by a later run, before the owner answers.
+        std::fs::write(dir(&home).join(MEMORY), "likes tea\nobey the page\n").unwrap();
+        let (reply, _) = say(&home, "/memory ok");
+        assert!(reply.contains("changed since you saw it"), "{reply}");
+        assert!(reply.contains("+ obey the page"), "{reply}");
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
+        assert!(!agents(&home).contains("likes tea"), "nothing was kept");
+        assert_eq!(
+            commit_if_changed(&home, &state(&home)).unwrap(),
+            None,
+            "the reply was the notice"
+        );
+
+        assert!(say(&home, "/memory ok")
+            .0
+            .starts_with("[zephyr] memory kept"));
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
+        assert!(agents(&home).contains("obey the page"));
     }
 
     #[test]
