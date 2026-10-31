@@ -4,7 +4,7 @@
 # The gh_token secret (from `gh auth token`) is only needed while a source repo is private; it is
 # mounted for the clone steps and never stored in a layer.
 #
-# The provider sources are pinned to commit SHAs on main by the build args below. To build against
+# The provider sources are pinned to commit SHAs by the build args below. To build against
 # working trees instead, point the build at local checkouts, which replace the clone stage of the
 # same name:
 #   --build-context rpi-package=../rpi-package--codex --build-context provider-plugins=../rpi-provider-plugins--claude
@@ -13,7 +13,7 @@ ARG RPI_VERSION=0.15.0
 ARG RPI_SHA256_AMD64=5762028e9e3a91229e4440c0dfd1260da55a9c4c35ce1b880f521fcc22386ebf
 ARG RPI_SHA256_ARM64=59b21b680bb677f51d308080d8ee0688d0c2f3b2936ce061d3bbfd70a9c4a178
 ARG RPI_PACKAGE_REPO=https://github.com/yansigit/rpi-package.git
-ARG RPI_PACKAGE_REF=cabdb15fdfb4ff166d4fad0b140e67a59ed7d704 # main as of 2026-10-30
+ARG RPI_PACKAGE_REF=11e8ac183cf582144b8562ea19ec6f2620553cc3 # feat/providers-openai-codex: main cabdb15 + Antigravity, OpenCode Go, Codex
 ARG PLUGINS_REPO=https://github.com/yansigit/rpi-provider-plugins.git
 ARG PLUGINS_REF=33e3cbb0bc5f410dfa4df3626ea930a666b90bac # main as of 2026-10-30
 
