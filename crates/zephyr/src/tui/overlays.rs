@@ -3,8 +3,9 @@
 //! the keys here while one is open.
 
 use super::chrome::{short_model, spend, State};
-use super::conn::{AccountModels, Snapshot};
+use super::conn::{AccountModels, Login, LoginStatus, Provider, Snapshot};
 use super::theme::{glyph, Palette};
+use super::view::clean;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rpi_tui::{bold, truncate_to_width, visible_width, CURSOR_MARKER};
 
@@ -56,6 +57,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "/status",
         "agent, accounts, channels, spend and jobs",
     ),
+    (
+        "Gateway",
+        "/login",
+        "sign in to a provider and add its account",
+    ),
     ("Gateway", "/pause", "hold new messages until /resume"),
     ("Gateway", "/resume", "answer what waited"),
     ("Gateway", "/reload", "apply zephyr.toml and secrets.env"),
@@ -71,6 +77,114 @@ pub enum Kind {
     Model,
     Status,
     Help,
+    /// Provider sign-in: the list, then the sign-in running.
+    Login,
+}
+
+/// `Kind::Login`'s own state: what the daemon offers to sign in to, and the sign-in running.
+#[derive(Clone, Default)]
+pub struct SignIn {
+    /// `zephyr.login_providers`' answer. `None` until it came, then possibly empty: an older
+    /// daemon does not know the method, and says so with an error the UI cannot show here.
+    pub providers: Option<Vec<Provider>>,
+    /// The sign-in `zephyr.login_start` opened, while it runs.
+    pub session: Option<Login>,
+    /// The provider whose `login_start` the panel is waiting for. Only one start is ever
+    /// outstanding, so a second Enter cannot open a sign-in the panel has nowhere to show.
+    pub requested: Option<String>,
+    /// Its latest `zephyr.login_poll` answer.
+    pub status: Option<LoginStatus>,
+    /// Why the last sign-in here ended without the daemon's saying so — it stopped answering
+    /// the polls. Said above the list, where the user is looking, rather than in the
+    /// transcript, since the panel is what was frozen.
+    pub problem: Option<String>,
+    /// The token typed at a `need_input` prompt. Drawn one bullet per character, cleared the
+    /// moment it is sent, and never shown, logged or stored anywhere else.
+    typed: String,
+}
+
+impl SignIn {
+    /// The running sign-in's id: `None` when none was started, or the last one ended. It runs
+    /// from `login_start`'s answer until a poll says `done` or `failed` — the first polls carry
+    /// no status yet, so the session alone decides.
+    pub fn running(&self) -> Option<&str> {
+        self.session.as_ref().map(|s| s.id.as_str())
+    }
+
+    /// Whether the daemon waits for a token from the keyboard.
+    pub fn needs_input(&self) -> bool {
+        self.running().is_some()
+            && self
+                .status
+                .as_ref()
+                .is_some_and(|s| s.phase == "need_input")
+    }
+
+    /// Asks the daemon to sign this provider in, unless one already runs or its start is still
+    /// unanswered. `true` when the request should go out.
+    pub fn ask(&mut self, provider: &str) -> bool {
+        if self.running().is_some() || self.requested.is_some() {
+            return false;
+        }
+        self.reset();
+        self.requested = Some(provider.to_string());
+        true
+    }
+
+    /// Takes on the sign-in `login_start` answered with. `false` for one this panel did not
+    /// ask for: a stale start (the panel was closed and reopened) must not attach itself to
+    /// the sign-in on screen now. The caller cancels that one with the daemon, since nothing
+    /// here would ever poll or drop it.
+    pub fn adopt(&mut self, login: &Login) -> bool {
+        if self.requested.as_deref() != Some(login.provider.as_str()) || self.running().is_some() {
+            return false;
+        }
+        self.requested = None;
+        self.session = Some(login.clone());
+        self.status = None;
+        true
+    }
+
+    /// Forgets the sign-in and goes back to the provider list.
+    pub fn reset(&mut self) {
+        self.session = None;
+        self.requested = None;
+        self.status = None;
+        self.problem = None;
+        self.typed.clear();
+    }
+
+    fn type_char(&mut self, c: char) {
+        self.typed.push(c);
+    }
+
+    fn backspace(&mut self) {
+        self.typed.pop();
+    }
+
+    /// Takes the typed token: the caller sends it, and the buffer is empty from then on.
+    fn take(&mut self) -> String {
+        std::mem::take(&mut self.typed)
+    }
+
+    /// The masked value: one bullet per character, so onlookers learn only its length.
+    fn masked(&self) -> String {
+        glyph("•").repeat(self.typed.chars().count())
+    }
+}
+
+impl std::fmt::Debug for SignIn {
+    /// The typed token is never printed, not even by `{:?}`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignIn")
+            .field("providers", &self.providers)
+            .field("session", &self.session)
+            .field("requested", &self.requested)
+            .field("status", &self.status)
+            .field("problem", &self.problem)
+            .field("typed", &self.typed.chars().count())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +197,8 @@ pub struct Overlay {
     pub models: Option<Vec<AccountModels>>,
     /// The selection starts on the current model; set again when the models arrive.
     pub placed: bool,
+    /// The login picker's own state.
+    pub login: SignIn,
     /// The first row shown and how many fit, from the last frame.
     top: usize,
     page: usize,
@@ -96,6 +212,7 @@ impl Overlay {
             selected: 0,
             models: None,
             placed: false,
+            login: SignIn::default(),
             top: 0,
             page: 1,
         }
@@ -109,6 +226,12 @@ pub enum Action {
     Close,
     /// The model picker's `/model …` to send, or help's command for the composer.
     Pick(String),
+    /// Start this provider's sign-in (its id, from the login picker).
+    Login(String),
+    /// The token typed at a `need_input` prompt, to write to the login process.
+    Input(String),
+    /// Give up on this sign-in and close the panel.
+    Cancel(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,16 +249,19 @@ pub enum Row {
     Line(String),
 }
 
-/// The panel's rows for `snap`, filtered by the query. `now` is in milliseconds.
+/// The panel's rows for `snap`, filtered by the query. `now` is in milliseconds; `width` is
+/// what the panel has, so a URL too long for one row can be broken instead of cut.
 pub fn rows(
     o: &Overlay,
     snap: &Snapshot,
     p: &Palette,
     tz: &jiff::tz::TimeZone,
     now: i64,
+    width: usize,
 ) -> Vec<Row> {
     let groups = match o.kind {
         Kind::Status => return status_rows(snap, p, tz, now),
+        Kind::Login => return login_rows(o, p, width),
         Kind::Help => help_groups(),
         Kind::Model => model_groups(o, snap, tz, now),
     };
@@ -420,6 +546,239 @@ fn status_rows(snap: &Snapshot, p: &Palette, tz: &jiff::tz::TimeZone, now: i64) 
     out
 }
 
+/// How many of the sign-in's last output lines the running panel shows.
+const LAST_OUTPUT: usize = 6;
+/// The fewest characters of a URL worth putting on a row of their own, beside the label's
+/// indent: narrower than this, the row is the head of the URL, clearly cut.
+const URL_MIN: usize = 12;
+
+/// The login picker's rows: the providers until a sign-in starts, then that sign-in.
+fn login_rows(o: &Overlay, p: &Palette, width: usize) -> Vec<Row> {
+    match o.login.running() {
+        Some(_) => running_rows(o, p, width),
+        None => provider_rows(o, p),
+    }
+}
+
+/// One row per provider the daemon can sign in to, filtered like the other pickers.
+/// A sign-in was started and the daemon has not answered yet, so there is no session to draw:
+/// the list stays, with the reason a sign-in the panel was showing is gone above it.
+fn provider_rows(o: &Overlay, p: &Palette) -> Vec<Row> {
+    let mut out = Vec::new();
+    // The user is looking at this panel, so this is where a sign-in that ended without the
+    // daemon's saying so is said: there is no reply card for a poll that never came.
+    if let Some(problem) = &o.login.problem {
+        out.push(Row::Line(p.error.fg(problem)));
+    }
+    let Some(list) = &o.login.providers else {
+        out.push(Row::Line(
+            p.muted.fg(&format!("listing providers{}", glyph("…"))),
+        ));
+        return out;
+    };
+    if list.is_empty() {
+        // A daemon without `zephyr.login_providers` answers it with an error, which the UI
+        // cannot show here: say what still works instead of showing an empty panel.
+        out.push(Row::Line(p.muted.fg(
+            "this daemon cannot sign anyone in; upgrade it, or run `zephyr login`",
+        )));
+        return out;
+    }
+    let words: Vec<String> = o.query.split_whitespace().map(str::to_lowercase).collect();
+    out.push(Row::Head(
+        "sign in".into(),
+        "a new account joins the pool".into(),
+    ));
+    let mut found = false;
+    for pr in list {
+        let hay = format!("{} {} {}", pr.id, pr.label, pr.how()).to_lowercase();
+        if !words.iter().all(|w| hay.contains(w.as_str())) {
+            continue;
+        }
+        found = true;
+        out.push(Row::Item {
+            pick: pr.id.clone(),
+            label: pr.label.clone(),
+            note: pr.how().to_string(),
+            current: false,
+        });
+    }
+    if !found {
+        // The heading would otherwise be all there is, which reads as "no providers".
+        out.push(Row::Line(p.muted.fg("nothing matches")));
+    }
+    out
+}
+
+/// A sign-in in flight: which provider and account, where to go, what it printed, and — at a
+/// `need_input` prompt — the masked row the token is typed into.
+fn running_rows(o: &Overlay, p: &Palette, width: usize) -> Vec<Row> {
+    let Some(session) = &o.login.session else {
+        return Vec::new();
+    };
+    let status = o.login.status.clone().unwrap_or_default();
+    let label = o
+        .login
+        .providers
+        .iter()
+        .flatten()
+        .find(|pr| pr.id == session.provider)
+        .map(|pr| pr.label.clone())
+        .unwrap_or_else(|| session.provider.clone());
+    let field = |name: &str, value: String| format!("{}{value}", p.muted.fg(&format!("{name:<9}")));
+    let mut out = vec![Row::Line(field("provider", p.text.fg(&label)))];
+    let account = session
+        .account
+        .clone()
+        .unwrap_or_else(|| "the next free name".into());
+    out.push(Row::Line(field("account", p.muted.fg(&account))));
+    if let Some(url) = status.url.as_deref().filter(|u| !u.is_empty()) {
+        // Plain text: the terminal may make a link clickable on its own, and a URL cut at the
+        // panel edge cannot be copied back together, so it is broken by hand instead. The
+        // chunks are measured against what a row of this panel can hold — the border and its
+        // padding are drawn around the row — because a chunk wider than that is cut by the
+        // renderer, losing characters with no sign that anything is missing.
+        let room = width.saturating_sub(4);
+        // The label's column when it leaves room for a whole chunk, the bare two-space
+        // continuation indent otherwise: a narrow panel keeps whole chunks, not a label.
+        let indent = if room >= 9 + URL_MIN { 9 } else { 2 };
+        let per = room.saturating_sub(indent);
+        if per >= URL_MIN {
+            for (i, chunk) in url.chars().collect::<Vec<_>>().chunks(per).enumerate() {
+                let text: String = chunk.iter().collect();
+                let row = if i == 0 && indent == 9 {
+                    field("url", p.accent.fg(&text))
+                } else {
+                    format!("{}{}", " ".repeat(indent), p.accent.fg(&text))
+                };
+                out.push(Row::Line(row));
+            }
+        } else {
+            // Too narrow to break into whole chunks: the head of the URL, cut where a row
+            // ends, says more than a first chunk the panel would cut anyway.
+            let label = if room >= 9 + 4 { 9 } else { 0 };
+            let text = truncate_to_width(url, room.saturating_sub(label), glyph("…"));
+            out.push(Row::Line(if label > 0 {
+                field("url", p.accent.fg(&text))
+            } else {
+                p.accent.fg(&text)
+            }));
+        }
+    }
+    out.push(Row::Line(p.text.fg(phase_text(&status))));
+    // The last few lines the provider printed: enough to see a prompt or a complaint. The child
+    // is a pty, so a progress bar arrives as `\r` redraws and its control bytes would move the
+    // terminal's cursor inside a drawn row; the transcript's own cleaning makes them safe.
+    let tail = status.lines.len().saturating_sub(LAST_OUTPUT);
+    for line in &status.lines[tail..] {
+        out.push(Row::Line(p.muted.fg(&format!("  {}", one_line(line)))));
+    }
+    if o.login.needs_input() {
+        out.push(Row::Line(String::new()));
+        out.push(Row::Line(
+            p.muted.fg("paste the code here, then press enter"),
+        ));
+        // One bullet per character: the token itself is never drawn, so it cannot end up in
+        // a terminal scrollback or a screenshot.
+        out.push(Row::Line(format!(
+            "{} {}{CURSOR_MARKER}",
+            p.accent.fg(glyph("›")),
+            p.text.fg(&o.login.masked())
+        )));
+    }
+    out
+}
+
+/// One line of the sign-in's output as a panel row can hold it: cleaned like the transcript's
+/// text, then only the last redraw, since a row is one line and a pty's `\r` means "overwrite".
+fn one_line(text: &str) -> String {
+    let text = clean(text);
+    let last = text.rsplit('\n').find(|last| !last.is_empty());
+    last.unwrap_or_default().to_string()
+}
+
+/// What the sign-in is waiting for, in one line. `done` and `failed` are drawn on the tick
+/// before the panel closes, so they must not claim to be waiting for anything.
+fn phase_text(status: &LoginStatus) -> &'static str {
+    match status.phase.as_str() {
+        "need_input" => "waiting for the code it asks for",
+        "done" => "signed in",
+        "failed" => "the sign-in failed",
+        _ => "waiting for you to finish in the browser",
+    }
+}
+
+/// The login picker's keys: pick a provider, then type the token it asks for. Everything else
+/// scrolls, because a sign-in's output is the only thing to read while it runs.
+fn login_key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
+    if k.code == KeyCode::Esc {
+        return match o.login.running() {
+            Some(id) => Action::Cancel(id.to_string()),
+            None => Action::Close,
+        };
+    }
+    if o.login.needs_input() {
+        // The keyboard belongs to the token: no filtering, no selection, no picker under it.
+        return match k.code {
+            KeyCode::Enter => match o.login.take() {
+                text if text.trim().is_empty() => Action::None,
+                text => Action::Input(text),
+            },
+            KeyCode::Backspace => {
+                o.login.backspace();
+                Action::None
+            }
+            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                o.login.type_char(c);
+                Action::None
+            }
+            _ => Action::None,
+        };
+    }
+    let picks = picks(rows);
+    let last = picks.len().saturating_sub(1);
+    let scrolling = picks.is_empty();
+    match k.code {
+        KeyCode::Enter if !scrolling => {
+            let Some(&i) = picks.get(o.selected) else {
+                return Action::None;
+            };
+            let Row::Item { pick, .. } = &rows[i] else {
+                return Action::None;
+            };
+            return Action::Login(pick.clone());
+        }
+        KeyCode::Up if scrolling => o.top = o.top.saturating_sub(1),
+        KeyCode::Down if scrolling => o.top += 1,
+        KeyCode::PageUp if scrolling => o.top = o.top.saturating_sub(o.page.max(1)),
+        KeyCode::PageDown if scrolling => o.top += o.page.max(1),
+        KeyCode::Up => o.selected = o.selected.saturating_sub(1),
+        KeyCode::Down => o.selected = (o.selected + 1).min(last),
+        KeyCode::Home => o.selected = 0,
+        KeyCode::End => o.selected = last,
+        KeyCode::Backspace if !scrolling => {
+            o.query.pop();
+            o.selected = 0;
+        }
+        KeyCode::Char(c) if !scrolling && !k.modifiers.contains(KeyModifiers::CONTROL) => {
+            o.query.push(c);
+            o.selected = 0;
+        }
+        _ => {}
+    }
+    Action::None
+}
+
+/// Whether the panel draws the filter line: every panel that lists something, and the login
+/// picker only until its sign-in starts — the token goes where the filter was.
+fn lists(o: &Overlay) -> bool {
+    match o.kind {
+        Kind::Status => false,
+        Kind::Login => o.login.running().is_none(),
+        Kind::Model | Kind::Help => true,
+    }
+}
+
 /// The positions of the pickable rows.
 fn picks(rows: &[Row]) -> Vec<usize> {
     (0..rows.len())
@@ -429,6 +788,9 @@ fn picks(rows: &[Row]) -> Vec<usize> {
 
 /// Moves the selection, scrolls, filters, or picks.
 pub fn key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
+    if o.kind == Kind::Login {
+        return login_key(o, k, rows);
+    }
     let picks = picks(rows);
     let last = picks.len().saturating_sub(1);
     let page = o.page.max(1);
@@ -486,6 +848,7 @@ pub fn render(
         Kind::Model => " model ",
         Kind::Status => " status ",
         Kind::Help => " commands ",
+        Kind::Login => " sign in ",
     };
     let fill = width.saturating_sub(visible_width(title) + 3);
     let mut lines = vec![format!(
@@ -501,7 +864,7 @@ pub fn render(
         let body = if bg { p.surface.bg(&body) } else { body };
         format!("{} {body} {}", p.dim.fg(v), p.dim.fg(v))
     };
-    if o.kind != Kind::Status {
+    if lists(o) {
         let prompt = p.accent.fg(glyph("›"));
         let filter = match o.query.is_empty() {
             true => format!("{prompt} {CURSOR_MARKER}{}", p.muted.fg("type to filter")),
@@ -718,12 +1081,25 @@ mod tests {
     }
 
     fn list(o: &Overlay, s: &Snapshot) -> Vec<Row> {
-        rows(o, s, &DARK, &jiff::tz::TimeZone::UTC, NOW)
+        rows(o, s, &DARK, &jiff::tz::TimeZone::UTC, NOW, 80)
     }
 
     fn draw(o: &mut Overlay, s: &Snapshot, width: usize, height: usize) -> Vec<String> {
         let rows = list(o, s);
         plain(&render(o, &rows, &DARK, width, height))
+    }
+
+    /// The panel's plain lines at another width, for the wrapping test.
+    fn lines_at(o: &Overlay, s: &Snapshot, width: usize) -> Vec<String> {
+        let rows = rows(o, s, &DARK, &jiff::tz::TimeZone::UTC, NOW, width);
+        let lines: Vec<String> = rows
+            .into_iter()
+            .filter_map(|r| match r {
+                Row::Line(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        plain(&lines)
     }
 
     fn hit(o: &mut Overlay, s: &Snapshot, code: KeyCode) -> Action {
@@ -793,7 +1169,7 @@ mod tests {
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(got.len(), 8);
         assert_eq!(got[2], format!("│ Chat{}│", " ".repeat(73)));
-        assert!(got[7].ends_with(" 1-5 of 25 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 1-5 of 26 ─╯"), "{got:?}");
         for _ in 0..6 {
             key(&mut o, press(KeyCode::Down), &rows);
         }
@@ -803,7 +1179,7 @@ mod tests {
             got[6],
             "│  › /memory ok               let the agent see the waiting change             │"
         );
-        assert!(got[7].ends_with(" 6-10 of 25 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 6-10 of 26 ─╯"), "{got:?}");
         key(&mut o, press(KeyCode::Down), &rows);
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),
@@ -926,5 +1302,315 @@ mod tests {
                 "   /rule rm <n>  remove rule n",
             ]
         );
+    }
+
+    /// Two of the providers the daemon offers, in its order.
+    fn providers() -> Vec<Provider> {
+        vec![
+            Provider {
+                id: "opencode-go".into(),
+                label: "OpenCode Go".into(),
+                kind: "key".into(),
+            },
+            Provider {
+                id: "claude-code".into(),
+                label: "Claude (Agent SDK)".into(),
+                kind: "setup_token".into(),
+            },
+        ]
+    }
+
+    fn claude_login() -> Login {
+        Login {
+            id: "l1".into(),
+            provider: "claude-code".into(),
+            account: None,
+            kind: "setup_token".into(),
+        }
+    }
+
+    fn waiting(phase: &str) -> LoginStatus {
+        LoginStatus {
+            phase: phase.into(),
+            url: Some("https://claude.ai/oauth/authorize?code=x".into()),
+            lines: vec!["Paste code here if prompted >".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_login_picker_lists_what_the_daemon_offers_to_sign_in_to() {
+        let s = Snapshot::default();
+        let mut o = Overlay::new(Kind::Login);
+        // Before zephyr.login_providers answers.
+        let early = draw(&mut o, &s, 62, 12);
+        assert!(early[2].contains("listing providers"), "{early:?}");
+        o.login.providers = Some(providers());
+        let got = draw(&mut o, &s, 62, 12);
+        assert!(
+            got[2].starts_with("│ sign in  a new account joins the pool"),
+            "{got:?}"
+        );
+        // The provider's id starts it; the note says what signing in takes.
+        assert!(got[3].contains("OpenCode Go"), "{got:?}");
+        assert!(got[3].contains("paste an API key"), "{got:?}");
+        assert!(got[4].contains("Claude (Agent SDK)"), "{got:?}");
+        assert!(got[4].contains("paste a setup-token code"), "{got:?}");
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Enter),
+            Action::Login("opencode-go".into())
+        );
+        hit(&mut o, &s, KeyCode::Down);
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Enter),
+            Action::Login("claude-code".into())
+        );
+        // The filter reads the note too, so "setup" finds the provider that asks for a code.
+        for c in "setup".chars() {
+            hit(&mut o, &s, KeyCode::Char(c));
+        }
+        let got = draw(&mut o, &s, 62, 12);
+        assert!(got[3].contains("Claude (Agent SDK)"), "{got:?}");
+        assert!(!got.iter().any(|l| l.contains("OpenCode")), "{got:?}");
+        for _ in 0..5 {
+            hit(&mut o, &s, KeyCode::Backspace);
+        }
+        for c in "zzz".chars() {
+            hit(&mut o, &s, KeyCode::Char(c));
+        }
+        let got = draw(&mut o, &s, 62, 12);
+        assert!(got[3].contains("nothing matches"), "{got:?}");
+        // Esc on the list closes the panel; there is no sign-in to give up on yet.
+        assert_eq!(hit(&mut o, &s, KeyCode::Esc), Action::Close);
+    }
+
+    #[test]
+    fn a_running_login_shows_its_url_and_masks_the_token_it_asks_for() {
+        let s = Snapshot::default();
+        let mut o = Overlay::new(Kind::Login);
+        o.login.providers = Some(providers());
+        o.login.session = Some(claude_login());
+        // login_start's answer arrives before the first poll: no status yet, still running.
+        assert_eq!(o.login.running(), Some("l1"));
+        let early = draw(&mut o, &s, 80, 20);
+        assert!(
+            early
+                .iter()
+                .any(|l| l.contains("waiting for you to finish in the browser")),
+            "{early:?}"
+        );
+        o.login.status = Some(waiting("need_input"));
+        let got = draw(&mut o, &s, 80, 20);
+        // No filter line while it runs: the keyboard belongs to the token now.
+        assert!(got[1].contains("provider"), "{got:?}");
+        assert!(got[1].contains("Claude (Agent SDK)"), "{got:?}");
+        assert!(got[2].contains("account"), "{got:?}");
+        assert!(
+            got.iter()
+                .any(|l| l.contains("https://claude.ai/oauth/authorize?code=x")),
+            "{got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|l| l.contains("waiting for the code it asks for")),
+            "{got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|l| l.contains("Paste code here if prompted")),
+            "{got:?}"
+        );
+        // One bullet per character: the token itself is drawn nowhere.
+        for c in "sk-ant-oat".chars() {
+            hit(&mut o, &s, KeyCode::Char(c));
+        }
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got.iter().any(|l| l.contains(&glyph("•").repeat(10))),
+            "{got:?}"
+        );
+        assert!(!got.iter().any(|l| l.contains("sk-ant")), "{got:?}");
+        // Enter takes it once, and the panel forgets it in the same breath.
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Enter),
+            Action::Input("sk-ant-oat".into())
+        );
+        assert_eq!(o.login.masked(), "");
+        assert!(!format!("{o:?}").contains("sk-ant"), "{o:?}");
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(!got.iter().any(|l| l.contains(glyph("•"))), "{got:?}");
+        // A second Enter sends nothing rather than an empty line.
+        assert_eq!(hit(&mut o, &s, KeyCode::Enter), Action::None);
+        // Esc gives the sign-in up, and the panel goes with it: mod.rs sends the cancel and
+        // closes, rather than dropping back to a list behind a login that is already gone.
+        assert_eq!(hit(&mut o, &s, KeyCode::Esc), Action::Cancel("l1".into()));
+    }
+
+    #[test]
+    fn a_control_byte_from_the_login_process_never_lands_in_a_row() {
+        let s = Snapshot::default();
+        let mut o = Overlay::new(Kind::Login);
+        o.login.session = Some(claude_login());
+        // A pty redraws its progress bar with `\r`, and so may send other control bytes.
+        o.login.status = Some(LoginStatus {
+            phase: "waiting".into(),
+            lines: vec!["10%\r20%\u{7}\u{1b}[31mx".into(), "tab\there".into()],
+            ..Default::default()
+        });
+        let text: Vec<String> = (list(&o, &s).into_iter())
+            .filter_map(|r| match r {
+                Row::Line(t) => Some(rpi_tui::strip_ansi(&t)),
+                _ => None,
+            })
+            .collect();
+        // The last redraw of the bar is what it said last, and nothing else from it.
+        assert!(text.iter().any(|l| l.contains("  20%x")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("tab    here")), "{text:?}");
+        assert!(
+            !text
+                .iter()
+                .any(|l| l.contains('\r') || l.contains('\u{7}') || l.contains("10%")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn a_finished_or_failed_snapshot_never_claims_to_be_waiting() {
+        let s = Snapshot::default();
+        let mut o = Overlay::new(Kind::Login);
+        o.login.session = Some(claude_login());
+        for (phase, said) in [("failed", "the sign-in failed"), ("done", "signed in")] {
+            o.login.status = Some(LoginStatus {
+                phase: phase.into(),
+                ..Default::default()
+            });
+            let got = draw(&mut o, &s, 80, 20);
+            assert!(got.iter().any(|l| l.contains(said)), "{got:?}");
+            assert!(!got.iter().any(|l| l.contains("browser")), "{got:?}");
+        }
+    }
+
+    #[test]
+    fn a_browser_login_has_no_token_row_and_the_list_says_when_it_cannot_sign_in() {
+        let s = Snapshot::default();
+        let mut o = Overlay::new(Kind::Login);
+        o.login.session = Some(Login {
+            id: "l2".into(),
+            provider: "opencode-go".into(),
+            account: Some("go-2".into()),
+            kind: "oauth".into(),
+        });
+        o.login.status = Some(waiting("waiting"));
+        let got = draw(&mut o, &s, 80, 20);
+        // The provider is named by id when the list never arrived.
+        assert!(got[1].contains("opencode-go"), "{got:?}");
+        // The daemon's account name, not "the next free name", once it has one.
+        assert!(got[2].contains("go-2"), "{got:?}");
+        assert!(!got.iter().any(|l| l.contains(glyph("•"))), "{got:?}");
+        assert_eq!(hit(&mut o, &s, KeyCode::Char('x')), Action::None);
+
+        // A daemon without the method answers an error, which leaves an empty list.
+        let mut o = Overlay::new(Kind::Login);
+        o.login.providers = Some(Vec::new());
+        let got = draw(&mut o, &s, 80, 12);
+        assert!(got[2].contains("cannot sign anyone in"), "{got:?}");
+        assert_eq!(hit(&mut o, &s, KeyCode::Enter), Action::None);
+    }
+
+    #[test]
+    fn a_start_is_adopted_only_by_the_panel_that_asked_and_only_once() {
+        let mut o = Overlay::new(Kind::Login);
+        o.login.providers = Some(providers());
+        assert!(o.login.ask("claude-code"));
+        // A second Enter while the first start is unanswered opens nothing: one start at a
+        // time, so an answer can only be the one the panel is waiting for.
+        assert!(!o.login.ask("opencode-go"));
+        // A start nobody asked for — an answer to a sign-in from before the panel was
+        // reopened — is not attached to this panel: `take_start` cancels it with the daemon
+        // instead, because nothing here would poll it.
+        let mut other = claude_login();
+        other.provider = "opencode-go".into();
+        assert!(!o.login.adopt(&other));
+        assert_eq!(o.login.running(), None);
+        assert!(o.login.adopt(&claude_login()));
+        assert_eq!(o.login.running(), Some("l1"));
+        // One sign-in runs at a time, and the start that made it is spent.
+        assert!(!o.login.ask("opencode-go"));
+        assert!(!o.login.adopt(&claude_login()));
+        // Ending it goes back to the list, ready for the next one.
+        o.login.reset();
+        assert_eq!(o.login.running(), None);
+        assert!(o.login.ask("opencode-go"));
+    }
+
+    #[test]
+    fn a_sign_in_the_gateway_stopped_answering_says_so_where_the_user_is_looking() {
+        let s = Snapshot::default();
+        let mut o = Overlay::new(Kind::Login);
+        o.login.providers = Some(providers());
+        o.login.problem = Some("the gateway stopped answering; try /login again".into());
+        let got = draw(&mut o, &s, 62, 14);
+        assert!(got[2].contains("the gateway stopped answering"), "{got:?}");
+        // The list is still there, so signing in again is one Enter away.
+        assert!(got[4].contains("OpenCode Go"), "{got:?}");
+        // Picking up another sign-in clears it: it was about the one that ended.
+        assert!(o.login.ask("claude-code"));
+        let got = draw(&mut o, &s, 62, 14);
+        assert!(
+            !got.iter().any(|l| l.contains("stopped answering")),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_panel_keeps_every_character_of_the_url_it_shows() {
+        let s = Snapshot::default();
+        let mut o = Overlay::new(Kind::Login);
+        o.login.session = Some(claude_login());
+        let url = "https://claude.ai/oauth/authorize?code=abcdefghijklmnop&state=0123456789";
+        o.login.status = Some(LoginStatus {
+            phase: "waiting".into(),
+            url: Some(url.into()),
+            ..Default::default()
+        });
+        // The URL's rows, put back together, and the widest of them: a chunk the panel had to
+        // cut would lose characters with nothing to show for it.
+        let gather = |got: &[String]| {
+            let (mut joined, mut widest, mut inside) = (String::new(), 0, false);
+            for line in got {
+                let body = line.trim_start();
+                let part = match body.strip_prefix("url") {
+                    Some(rest) => {
+                        inside = true;
+                        rest.trim_start()
+                    }
+                    // A panel too narrow for the label opens the URL under a bare indent.
+                    None if !inside && body.starts_with("http") => {
+                        inside = true;
+                        body
+                    }
+                    None if inside && !body.is_empty() && !body.contains(' ') => body,
+                    None => continue,
+                };
+                joined.push_str(part);
+                widest = widest.max(visible_width(line));
+            }
+            (joined, widest)
+        };
+        for width in [20, 25, 28, 40, 62] {
+            let got = lines_at(&o, &s, width);
+            let (joined, widest) = gather(&got);
+            assert_eq!(joined, url, "width {width}: {got:?}");
+            assert!(widest <= width - 4, "width {width}: {got:?}");
+        }
+        // Too narrow for a whole chunk: the head of the URL, cut, rather than a row the
+        // renderer cuts mid-way with no sign of it.
+        let got = lines_at(&o, &s, 14);
+        let head = got
+            .iter()
+            .find(|l| l.contains("https"))
+            .unwrap_or_else(|| panic!("no URL row: {got:?}"));
+        assert!(visible_width(head) <= 10, "{got:?}");
+        assert!(head.contains(glyph("…")), "{got:?}");
     }
 }

@@ -483,7 +483,8 @@ async fn zephyr_models_lists_each_accounts_models() {
     let early = c.call("zephyr.models", json!({})).await;
     assert_eq!(early["error"]["code"], -32001, "{early}");
     c.call("authenticate", json!({"token": TOKEN})).await;
-    // fake-rpi lists fake/m1, fake/m2 and other/m3: each account gets its provider's.
+    // fake-rpi lists fake/m1, fake/m2, other/m3 and opencode-go/alpha: each account gets its
+    // provider's.
     let got = c.call("zephyr.models", json!({})).await["result"].clone();
     assert_eq!(
         got,
@@ -501,8 +502,123 @@ async fn zephyr_models_lists_each_accounts_models() {
     let got = c.call("zephyr.models", json!({})).await["result"].clone();
     assert_eq!(
         got,
-        json!({"accounts": [{"name": null, "model": "fake/m1", "models": ["fake/m1", "fake/m2", "other/m3"]}]})
+        json!({"accounts": [{"name": null, "model": "fake/m1", "models": ["fake/m1", "fake/m2", "other/m3", "opencode-go/alpha"]}]})
     );
+    gw.shutdown().await;
+}
+
+/// The `zephyr.login_*` methods (DESIGN §4.3.1): the provider table, the `-32602` an unknown
+/// provider and a pasted token in the account's place get, one browser sign-in's
+/// start → poll → cancel (and the dead handle after it), and the `-32001` a connection that has
+/// not authenticated gets.
+#[tokio::test]
+async fn zephyr_login_methods_report_providers_refuse_bad_input_and_cancel() {
+    // A pasted credential where the account name goes: the refusal must not repeat it.
+    const PASTED: &str = "sk-ant-api03-9f4a2c7b8e1d6f0a3c5b7e2d";
+    let gw = start("login");
+    // An OAuth provider with a URL to print: the child waits there for the browser to come back
+    // (`login_go`), which this test never writes — it cancels before the sign-in can finish.
+    std::fs::write(gw.home.join("login_url"), "").unwrap();
+
+    let mut c = Client::connect(gw.port).await;
+    let early = c.call("zephyr.login_providers", json!({})).await;
+    assert_eq!(early["error"]["code"], -32001, "{early}");
+    c.call("authenticate", json!({"token": TOKEN})).await;
+
+    // 1. The provider table: six rows with an id, a label and a kind that says what finishing
+    //    the sign-in takes, and antigravity among them as a browser sign-in.
+    let got = c.call("zephyr.login_providers", json!({})).await;
+    assert!(got.get("result").is_some(), "{got}");
+    let providers = got["result"]["providers"].as_array().expect("a list");
+    assert_eq!(providers.len(), 6, "{got}");
+    for p in providers {
+        for field in ["id", "label", "kind"] {
+            assert!(
+                p[field].as_str().is_some_and(|s| !s.is_empty()),
+                "{field} missing from {p}"
+            );
+        }
+        assert!(
+            matches!(p["kind"].as_str(), Some("oauth" | "key" | "setup_token")),
+            "{p}"
+        );
+    }
+    let kinds: Vec<(&str, &str)> = providers
+        .iter()
+        .map(|p| (p["id"].as_str().unwrap(), p["kind"].as_str().unwrap()))
+        .collect();
+    assert!(
+        kinds.contains(&("antigravity", "oauth")),
+        "no oauth antigravity: {kinds:?}"
+    );
+
+    // 2. Two `-32602`s that need no child: an unknown provider, and a token pasted where the
+    //    account name goes. Neither reply repeats the token back.
+    let unknown = c
+        .call("zephyr.login_start", json!({"provider": "nope"}))
+        .await;
+    assert_eq!(unknown["error"]["code"], -32602, "{unknown}");
+    let token = c
+        .call(
+            "zephyr.login_start",
+            json!({"provider": "antigravity", "account": PASTED, "model": "antigravity/gemini-3"}),
+        )
+        .await;
+    assert_eq!(token["error"]["code"], -32602, "{token}");
+    assert!(
+        !token.to_string().contains(PASTED),
+        "the pasted token came back in the error: {token}"
+    );
+
+    // 3. One browser sign-in: start, poll, cancel — and after the cancel the id is a dead handle.
+    let started = c
+        .call("zephyr.login_start", json!({"provider": "antigravity"}))
+        .await;
+    assert!(started.get("result").is_some(), "{started}");
+    let login = &started["result"];
+    let id = login["loginId"].as_str().expect("a loginId").to_string();
+    assert_eq!(login["provider"], "antigravity", "{login}");
+    // No pool in this home: the first free name for the provider.
+    assert_eq!(login["account"], "antigravity-1", "{login}");
+    assert_eq!(login["kind"], "oauth", "{login}");
+    // The URL follows a moment after the child starts, so poll until it is there. Every answer
+    // carries one of the four phases a client may see (`recording` stays internal).
+    let mut polled = Value::Null;
+    for _ in 0..100 {
+        let reply = c.call("zephyr.login_poll", json!({"loginId": id})).await;
+        assert!(reply.get("result").is_some(), "{reply}");
+        polled = reply["result"].clone();
+        assert!(
+            matches!(
+                polled["phase"].as_str(),
+                Some("waiting" | "need_input" | "done" | "failed")
+            ),
+            "{polled}"
+        );
+        if polled["url"].is_string() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(polled["phase"], "waiting", "{polled}");
+    assert_eq!(polled["url"], "https://example.test/login/antigravity");
+    assert_eq!(polled["account"], "antigravity-1", "{polled}");
+
+    let cancelled = c.call("zephyr.login_cancel", json!({"loginId": id})).await;
+    assert_eq!(cancelled["result"], json!({}), "{cancelled}");
+    // The login is gone from the registry: cancelling it again, polling it and typing into it are
+    // all unknown ids, so nothing can be answered over a sign-in that already ended.
+    let again = c.call("zephyr.login_cancel", json!({"loginId": id})).await;
+    assert_eq!(again["error"]["code"], -32602, "{again}");
+    assert_eq!(again["error"]["message"], "unknown login", "{again}");
+    let after = c.call("zephyr.login_poll", json!({"loginId": id})).await;
+    assert_eq!(after["error"]["code"], -32602, "{after}");
+    let typed = c
+        .call("zephyr.login_input", json!({"loginId": id, "text": PASTED}))
+        .await;
+    assert_eq!(typed["error"]["code"], -32602, "{typed}");
+    assert!(!typed.to_string().contains(PASTED), "{typed}");
+
     gw.shutdown().await;
 }
 

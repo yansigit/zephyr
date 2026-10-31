@@ -22,10 +22,13 @@ pub const EXTENSIONS: [&str; 4] = [
 pub const DAEMON_FILES: [&str; 4] = ["zephyr.toml", "secrets.env", "tui.token", "host.toml"];
 
 /// Replaces `path` whole with `text`, mode 0600: written beside it, then renamed over it, so a
-/// reader (the daemon's 5 s reload check) never sees half a file.
+/// reader (the daemon's 5 s reload check) never sees half a file. The temp name is unique per
+/// write, so two writers cannot rename the file one of them is still filling.
 pub fn replace_private(path: &Path, text: &str) -> anyhow::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let name = path.file_name().context("no file name")?.to_string_lossy();
-    let tmp = path.with_file_name(format!(".{name}.tmp"));
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(".{name}.{}-{seq}.tmp", std::process::id()));
     write_private(&tmp, text)
         .and_then(|()| Ok(std::fs::rename(&tmp, path)?))
         .with_context(|| format!("writing {}", path.display()))
@@ -194,6 +197,21 @@ impl Data {
 /// Whole or not at all: the running daemon reloads the file when its mtime changes.
 pub fn save(path: &Path, doc: &DocumentMut) -> anyhow::Result<()> {
     replace_private(path, &doc.to_string())
+}
+
+/// A read-modify-write of `zephyr.toml`, one writer at a time: the daemon writes it from `/model`
+/// and from a `/login` that records an account, and two of those interleaved would keep only the
+/// later row. The lock is per process; the host CLI edits the same file from outside, which the
+/// 5 s reload picks up (the temp file it writes is unique, so neither ever reads half a file).
+pub fn update<F>(path: &Path, f: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut DocumentMut) -> anyhow::Result<()>,
+{
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut doc = load(path)?;
+    f(&mut doc)?;
+    save(path, &doc)
 }
 
 pub fn load(path: &Path) -> anyhow::Result<DocumentMut> {

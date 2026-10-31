@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod attach;
+pub mod auth;
 pub mod auth_keeper;
 pub mod channel;
 pub mod chat;

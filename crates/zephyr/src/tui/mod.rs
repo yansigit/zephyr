@@ -11,7 +11,7 @@ mod view;
 use crate::config::Config;
 use anyhow::Context;
 use chrome::{Link, Region, Retry, State};
-use conn::{Ask, Msg};
+use conn::{Ask, Login, Msg};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use overlays::{Action, Kind, Overlay};
 use rpi_tui::{
@@ -29,6 +29,19 @@ use tokio::sync::mpsc;
 
 /// Two Ctrl+C within this window detach.
 const DOUBLE_PRESS_MS: i64 = 1500;
+
+/// How often the running sign-in is asked about: often enough to feel live, and only while
+/// one runs, so an idle TUI sends nothing.
+const LOGIN_POLL_MS: i64 = 500;
+
+/// How long the sign-in may go without an answered poll before the panel gives up on it. A
+/// lost answer used to wedge the panel: it stopped asking, showed a phase that had stopped
+/// being true, and never timed out.
+const LOGIN_SILENCE_MS: i64 = 30_000;
+
+/// What the panel says when it gives up, above the provider list, which is where the user is
+/// looking: a sign-in that ended has no reply card in the transcript to explain itself.
+const GIVE_UP: &str = "the gateway stopped answering; try /login again";
 
 pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     let a = cfg
@@ -142,6 +155,8 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     let mut was_up = false;
     // The composer text whose autocomplete Esc dismissed.
     let mut dismissed: Option<String> = None;
+    // When the running sign-in was last polled, and when the daemon last answered.
+    let mut poll = Poller::default();
     let outcome: anyhow::Result<()> = loop {
         tokio::select! {
             msg = msgs.recv() => {
@@ -172,7 +187,84 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                             o.placed = false;
                         }
                     }
-                    Msg::Down(why) if was_up => s.link = Link::Down { why },
+                    Msg::Providers(list) => {
+                        if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Login) {
+                            o.login.providers = Some(list);
+                            o.placed = false;
+                        }
+                    }
+                    Msg::LoginStarted(login) => {
+                        take_start(&mut s, &prompt_tx, &login, &mut poll);
+                    }
+                    Msg::Login(login_id, status) => {
+                        let now = crate::unix_millis() as i64;
+                        let mut ended = None;
+                        let mut mine = false;
+                        let open = s.overlay.as_mut().filter(|o| o.kind == Kind::Login);
+                        // The answer is read only if it is about the sign-in on screen: one
+                        // for a login the panel has given up on (cancelled, restarted, or
+                        // answered slowly) says nothing about the one running now.
+                        if let Some(o) = open
+                            .filter(|o| o.login.running() == Some(login_id.as_str()))
+                        {
+                            mine = true;
+                            ended = match status.phase.as_str() {
+                                // `done` and `failed` end it; every other phase keeps polling.
+                                "done" => Some(Ok((status.account.clone(), status.model.clone()))),
+                                "failed" => Some(Err(status.error.clone().unwrap_or_default())),
+                                _ => None,
+                            };
+                            o.login.status = Some(*status);
+                        }
+                        if mine {
+                            poll.answered(&s, now);
+                        }
+                        if let Some(ended) = ended {
+                            close(&tui, &editor, &mut s);
+                            match ended {
+                                Ok((account, model)) => {
+                                    let mut said = String::from("signed in");
+                                    if let Some(account) = account {
+                                        said.push_str(&format!(" as {account}"));
+                                    }
+                                    if let Some(model) = model {
+                                        said.push_str(&format!(" ({model})"));
+                                    }
+                                    view.notice(&said);
+                                }
+                                Err(error) if error.is_empty() => view.error("the sign-in failed"),
+                                Err(error) => view.error(&error),
+                            }
+                        }
+                    }
+                    Msg::LoginGone(login_id) => {
+                        // The daemon answered `unknown login`: the login was dropped by its idle
+                        // deadline, or refused by the eight-pending cap, so there is nothing
+                        // left to poll, type into or cancel. The panel ends without a word —
+                        // the user asked to stop or typed into nothing — and only a daemon that
+                        // stops answering at all is worth `GIVE_UP`.
+                        if login_gone(&s, &login_id, &mut poll) {
+                            close(&tui, &editor, &mut s);
+                        }
+                    }
+                    Msg::LoginError(e) => {
+                        // Starting was refused (already signed in, unknown provider), the
+                        // daemon lost the login, or it refused the token just typed: the panel
+                        // cannot carry on, so say it in the transcript, where it stays readable.
+                        if login_over(&s) {
+                            close(&tui, &editor, &mut s);
+                            // The panel is gone, so the poll that was counting for it goes too:
+                            // a lost answer must not wedge the next sign-in.
+                            poll.forget();
+                            view.error(&e);
+                        }
+                    }
+                    Msg::Down(why) if was_up => {
+                        // The answer to a poll in flight is lost with the connection; the sign-in
+                        // is asked about again once the link is back, not waited on.
+                        poll.forget();
+                        s.link = Link::Down { why };
+                    }
                     Msg::Down(why) => s.link = Link::Connecting(Some(why)),
                     Msg::Fatal(e) => break Err(anyhow::anyhow!(e)),
                 }
@@ -209,10 +301,17 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                 let snap = s.snapshot.clone();
                                 let o = s.overlay.as_mut().expect("open");
                                 let kind = o.kind;
+                                let cols = crossterm::terminal::size().map_or(80, |(w, _)| w as usize);
+                                let rows = overlays::rows(o, &snap, &palette, &tz, now, cols);
+                                let running = o.login.running().map(str::to_string);
                                 let action = if ctrl(&k, 'c') {
-                                    Action::Close
+                                    match running {
+                                        // Ctrl+C gives up on the sign-in, not just on the panel:
+                                        // leaving a login process waiting for nothing helps no one.
+                                        Some(id) if kind == Kind::Login => Action::Cancel(id),
+                                        _ => Action::Close,
+                                    }
                                 } else {
-                                    let rows = overlays::rows(o, &snap, &palette, &tz, now);
                                     overlays::key(o, k, &rows)
                                 };
                                 match action {
@@ -224,6 +323,15 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                             Kind::Model => send(&mut s, &prompt_tx, cmd),
                                             _ => editor.set_text(&cmd),
                                         }
+                                    }
+                                    Action::Login(id) => start(&mut s, &prompt_tx, id),
+                                    Action::Input(text) => send_token(&mut s, &prompt_tx, text),
+                                    Action::Cancel(id) => {
+                                        // Esc gives up on the sign-in with the panel: the cancel
+                                        // tells the daemon to kill its child, and closing leaves
+                                        // no prompt behind waiting for a token.
+                                        let _ = prompt_tx.send(Ask::LoginCancel { login_id: id });
+                                        close(&tui, &editor, &mut s);
                                     }
                                 }
                             }
@@ -316,6 +424,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                     "/help" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Help),
                     "/status" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Status),
                     "/model" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Model),
+                    "/login" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Login),
                     text => send(&mut s, &prompt_tx, text.to_string()),
                 }
                 tui.request_render(false);
@@ -327,6 +436,13 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                 let hint_over = s.hint.as_ref().is_some_and(|(_, until)| now >= *until);
                 if hint_over {
                     s.hint = None;
+                }
+                match login_poll(&s, now, &mut poll) {
+                    Poll::Ask(login_id) => {
+                        let _ = prompt_tx.send(Ask::LoginPoll { login_id });
+                    }
+                    Poll::Silent(login_id) => give_up(&mut s, &prompt_tx, &login_id, &mut poll),
+                    Poll::Idle => {}
                 }
                 let frame = chrome::mascot(chrome::Mood::of(&s, now), &palette, now);
                 let new_face = frame != face;
@@ -392,6 +508,182 @@ fn send(s: &mut State, asks: &mpsc::UnboundedSender<Ask>, text: String) {
     }
 }
 
+/// The login picker's Enter: ask the daemon to sign in to that provider. One sign-in at a time,
+/// because the panel shows one: a second would have nowhere to go.
+fn start(s: &mut State, asks: &mpsc::UnboundedSender<Ask>, provider: String) {
+    let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Login) else {
+        return;
+    };
+    // A sign-in already running, or a start still unanswered, means the panel is taken: the
+    // second request would open a login with nowhere to be shown.
+    if !o.login.ask(&provider) {
+        return;
+    }
+    let _ = asks.send(Ask::LoginStart {
+        provider,
+        account: None,
+        model: None,
+    });
+}
+
+/// Takes on the sign-in `zephyr.login_start` answered with, or cancels it. Only the start this
+/// panel asked for is taken on, and only while none is running: a stale answer for a sign-in
+/// from before the panel was reopened must not attach itself to what is on screen now. A start
+/// with no panel left to show it is cancelled here — nothing polls it, nothing ever cancels it,
+/// and it would hold one of the daemon's sixteen login slots until it finished on its own.
+/// Silent on purpose: no notice and no error, the sign-in simply did not happen.
+fn take_start(
+    s: &mut State,
+    asks: &mpsc::UnboundedSender<Ask>,
+    login: &Login,
+    poll: &mut Poller,
+) -> bool {
+    let open = s.overlay.as_mut().filter(|o| o.kind == Kind::Login);
+    let adopted = open.is_some_and(|o| o.login.adopt(login));
+    if adopted {
+        // A fresh sign-in: asked about at once, and timed from here.
+        poll.follow(s, crate::unix_millis() as i64);
+        return true;
+    }
+    // A panel that is still waiting on a start of its own is not waiting on this one, so only
+    // the request this answer belongs to is spent.
+    if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Login) {
+        if o.login.requested.as_deref() == Some(login.provider.as_str()) {
+            o.login.requested = None;
+        }
+    }
+    let _ = asks.send(Ask::LoginCancel {
+        login_id: login.id.clone(),
+    });
+    false
+}
+
+/// Whether the daemon saying this login is gone (`-32602` `unknown login`) ends the panel on
+/// screen, and so whether the caller has to close it. An answer about a login the panel no
+/// longer runs says nothing about the one it does. The poll of the login that goes is dropped
+/// with it: nothing will answer it again, and the next sign-in starts from the clock.
+fn login_gone(s: &State, login_id: &str, poll: &mut Poller) -> bool {
+    let showing = s
+        .overlay
+        .as_ref()
+        .filter(|o| o.kind == Kind::Login)
+        .is_some_and(|o| o.login.running() == Some(login_id));
+    if showing {
+        poll.forget();
+    }
+    showing
+}
+
+/// The token typed at a `need_input` prompt. The panel cleared it when the key was taken, so
+/// this is the only copy.
+fn send_token(s: &mut State, asks: &mpsc::UnboundedSender<Ask>, text: String) {
+    let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Login) else {
+        return;
+    };
+    let Some(login_id) = o.login.running().map(str::to_string) else {
+        return;
+    };
+    let _ = asks.send(Ask::LoginInput { login_id, text });
+}
+
+/// What the tick should do about the sign-in on screen.
+enum Poll {
+    /// Ask the daemon about this login: the last ask is due for an answer, or never got one.
+    Ask(String),
+    /// It has not answered a poll for half a minute: the sign-in is over as far as the panel
+    /// is concerned, and it says so instead of waiting on a login that will never move again.
+    Silent(String),
+    /// Nothing is due: no panel, no running sign-in, or the last poll is not answered yet.
+    Idle,
+}
+
+/// The poll the panel has outstanding: which login it is for, when the last ask went out, and
+/// when the daemon last answered one. Both clocks restart with the login, so a late answer for
+/// a login the panel gave up on can neither hold the next sign-in back nor age it.
+#[derive(Default)]
+struct Poller {
+    login_id: Option<String>,
+    sent: i64,
+    answered: i64,
+}
+
+impl Poller {
+    /// Follows the panel: a closed panel or a sign-in that ended forgets the poll, and a new
+    /// one is polled at once rather than after the last sign-in's clock ran out.
+    fn follow(&mut self, s: &State, now: i64) {
+        let running = s
+            .overlay
+            .as_ref()
+            .filter(|o| o.kind == Kind::Login)
+            .and_then(|o| o.login.running());
+        match running {
+            Some(id) if self.login_id.as_deref() == Some(id) => {}
+            Some(id) => {
+                self.login_id = Some(id.to_string());
+                self.sent = now - LOGIN_POLL_MS;
+                self.answered = now;
+            }
+            None => self.login_id = None,
+        }
+    }
+
+    /// Notes an answered poll for the running sign-in, which is what keeps it from being given
+    /// up on. Only called for an answer about the login this poller is following.
+    fn answered(&mut self, s: &State, now: i64) {
+        self.follow(s, now);
+        if self.login_id.is_some() {
+            self.answered = now;
+        }
+    }
+
+    /// Closes the window on the poll: the answer it waits for will never be read.
+    fn forget(&mut self) {
+        self.login_id = None;
+    }
+}
+
+/// What the tick should do about the running sign-in, given the clock: ask again every half
+/// second, and stop asking once it has gone unanswered for half a minute.
+fn login_poll(s: &State, now: i64, poll: &mut Poller) -> Poll {
+    poll.follow(s, now);
+    let Some(login_id) = poll.login_id.clone() else {
+        return Poll::Idle;
+    };
+    if now - poll.answered >= LOGIN_SILENCE_MS {
+        return Poll::Silent(login_id);
+    }
+    if now - poll.sent < LOGIN_POLL_MS {
+        return Poll::Idle;
+    }
+    poll.sent = now;
+    Poll::Ask(login_id)
+}
+
+/// A sign-in the daemon stopped answering: the panel goes back to the provider list with the
+/// reason on it, and the daemon is asked to drop the login the panel has given up on. Nothing
+/// would read it again, and the daemon may be holding a child process for it.
+fn give_up(s: &mut State, asks: &mpsc::UnboundedSender<Ask>, login_id: &str, poll: &mut Poller) {
+    let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Login) else {
+        return;
+    };
+    if o.login.running() != Some(login_id) {
+        return;
+    }
+    o.login.reset();
+    o.login.problem = Some(GIVE_UP.to_string());
+    poll.forget();
+    let _ = asks.send(Ask::LoginCancel {
+        login_id: login_id.to_string(),
+    });
+}
+
+/// Whether a `LoginError` takes the panel down. Any open sign-in panel does, and above all a
+/// `need_input` prompt: the typed token was taken from the buffer when it was sent, so the panel
+/// would wait for a code that can never arrive once the daemon has lost the login.
+fn login_over(s: &State) -> bool {
+    s.overlay.as_ref().is_some_and(|o| o.kind == Kind::Login)
+}
+
 /// Opens a panel over the bottom of the screen, between the header and the footer.
 fn open(
     tui: &TuiAltScreen,
@@ -407,8 +699,14 @@ fn open(
     editor.set_focused(false);
     s.overlay = Some(Overlay::new(kind));
     s.complete = None;
-    if kind == Kind::Model {
-        let _ = asks.send(Ask::Models);
+    match kind {
+        Kind::Model => {
+            let _ = asks.send(Ask::Models);
+        }
+        Kind::Login => {
+            let _ = asks.send(Ask::LoginProviders);
+        }
+        Kind::Status | Kind::Help => {}
     }
     let margin = OverlayMargin {
         top: 2,
@@ -474,7 +772,7 @@ impl Component for Panel {
         let Some(o) = s.overlay.as_mut() else {
             return vec![];
         };
-        let list = overlays::rows(o, &snap, &self.p, &self.tz, now);
+        let list = overlays::rows(o, &snap, &self.p, &self.tz, now, width);
         overlays::render(o, &list, &self.p, width, height)
     }
     fn invalidate(&self) {}
@@ -586,6 +884,276 @@ mod tests {
         assert!(super::osc11(dark).unwrap().is_dark());
         assert!(super::osc11("\x1b[?62c").is_none());
         assert!(!super::da1_done(b"\x1b]11;rgb:0/0/0\x07"));
+    }
+
+    #[test]
+    fn only_an_open_sign_in_is_polled_and_no_faster_than_the_interval() {
+        let mut s = super::chrome::State::default();
+        let mut poll = super::Poller::default();
+        assert!(matches!(
+            super::login_poll(&s, 1000, &mut poll),
+            super::Poll::Idle
+        ));
+        let mut o = super::overlays::Overlay::new(super::overlays::Kind::Login);
+        o.login.session = Some(super::conn::Login {
+            id: "l1".into(),
+            provider: "claude-code".into(),
+            account: None,
+            kind: "setup_token".into(),
+        });
+        s.overlay = Some(o);
+        assert!(matches!(
+            super::login_poll(&s, 1000, &mut poll),
+            super::Poll::Ask(id) if id == "l1"
+        ));
+        // Nothing more until half a second has gone by.
+        assert!(matches!(
+            super::login_poll(&s, 1100, &mut poll),
+            super::Poll::Idle
+        ));
+        assert!(matches!(
+            super::login_poll(&s, 1000 + super::LOGIN_POLL_MS, &mut poll),
+            super::Poll::Ask(id) if id == "l1"
+        ));
+        // A closed panel stops asking, whatever the clock says.
+        s.overlay = None;
+        assert!(matches!(
+            super::login_poll(&s, 9999, &mut poll),
+            super::Poll::Idle
+        ));
+        // Reopened on the same login, it is asked about at once: the ask that went out for the
+        // panel that was closed does not hold it back for another interval.
+        s.overlay = Some(super::overlays::Overlay::new(super::overlays::Kind::Login));
+        if let Some(o) = s.overlay.as_mut() {
+            o.login.session = Some(super::conn::Login {
+                id: "l1".into(),
+                ..Default::default()
+            });
+        }
+        assert!(matches!(
+            super::login_poll(&s, 9999, &mut poll),
+            super::Poll::Ask(id) if id == "l1"
+        ));
+    }
+
+    #[test]
+    fn a_sign_in_the_daemon_stops_answering_is_given_up_on() {
+        let state = |id: &str| {
+            let mut s = super::chrome::State::default();
+            let mut o = super::overlays::Overlay::new(super::overlays::Kind::Login);
+            o.login.session = Some(super::conn::Login {
+                id: id.into(),
+                provider: "claude-code".into(),
+                ..Default::default()
+            });
+            s.overlay = Some(o);
+            s
+        };
+        let s = state("l1");
+        let mut poll = super::Poller::default();
+        assert!(matches!(
+            super::login_poll(&s, 1000, &mut poll),
+            super::Poll::Ask(_)
+        ));
+        // One answer, then silence: the panel keeps asking, so a lost answer is retried.
+        poll.answered(&s, 1500);
+        assert!(matches!(
+            super::login_poll(&s, 2000, &mut poll),
+            super::Poll::Ask(_)
+        ));
+        // ... and after half a minute of it, the sign-in is over rather than frozen: a lost
+        // answer used to leave the panel polling nothing and showing a stale phase forever.
+        let quiet = 1500 + super::LOGIN_SILENCE_MS;
+        assert!(matches!(
+            super::login_poll(&s, quiet, &mut poll),
+            super::Poll::Silent(id) if id == "l1"
+        ));
+        // Another panel opening on another login starts its own clock: a poll that stopped
+        // being answered for the last one cannot age this one.
+        let s = state("l2");
+        assert!(matches!(
+            super::login_poll(&s, quiet + 60_000, &mut poll),
+            super::Poll::Ask(id) if id == "l2"
+        ));
+    }
+
+    #[test]
+    fn giving_up_says_so_on_the_list_and_cancels_the_login() {
+        let mut s = super::chrome::State::default();
+        let mut o = super::overlays::Overlay::new(super::overlays::Kind::Login);
+        o.login.session = Some(super::conn::Login {
+            id: "l1".into(),
+            ..Default::default()
+        });
+        s.overlay = Some(o);
+        let (asks, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut poll = super::Poller::default();
+        super::login_poll(&s, 1000, &mut poll);
+        super::give_up(&mut s, &asks, "l1", &mut poll);
+        let o = s.overlay.as_ref().expect("the list stays");
+        assert_eq!(o.login.running(), None);
+        assert_eq!(o.login.problem.as_deref(), Some(super::GIVE_UP));
+        // The daemon's copy is asked to stop: nothing will read it again.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(super::Ask::LoginCancel { login_id }) if login_id == "l1"
+        ));
+        // And the poll for it is gone, so the next sign-in starts from the clock.
+        assert!(matches!(
+            super::login_poll(&s, 9999, &mut poll),
+            super::Poll::Idle
+        ));
+        // A give-up for a login the panel is no longer running is a no-op.
+        super::give_up(&mut s, &asks, "l1", &mut poll);
+        assert_eq!(
+            s.overlay.as_ref().unwrap().login.problem.as_deref(),
+            Some(super::GIVE_UP)
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_login_error_takes_the_panel_down_even_mid_token() {
+        let mut s = super::chrome::State::default();
+        assert!(!super::login_over(&s));
+        let mut o = super::overlays::Overlay::new(super::overlays::Kind::Login);
+        o.login.session = Some(super::conn::Login {
+            id: "l1".into(),
+            ..Default::default()
+        });
+        o.login.status = Some(super::conn::LoginStatus {
+            phase: "need_input".into(),
+            ..Default::default()
+        });
+        assert!(o.login.needs_input());
+        s.overlay = Some(o);
+        // The token was taken and the daemon refused it: the prompt must not be left waiting.
+        assert!(super::login_over(&s));
+        // Another panel is not a sign-in, so an error about one does not close it.
+        s.overlay = Some(super::overlays::Overlay::new(super::overlays::Kind::Status));
+        assert!(!super::login_over(&s));
+    }
+
+    /// The panel a sign-in is started from, as `/login` opens it.
+    fn login_panel() -> super::overlays::Overlay {
+        super::overlays::Overlay::new(super::overlays::Kind::Login)
+    }
+
+    /// Esc can close the panel between `login_start` going out and its answer coming back. The
+    /// answer then has no panel to adopt it, and nothing on the tick would ever poll or drop it:
+    /// the login would run in the daemon to the end, holding one of its sixteen slots.
+    #[tokio::test]
+    async fn a_start_whose_panel_closed_first_is_cancelled_rather_than_orphaned() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (r, mut w) = s.into_split();
+            let mut lines = BufReader::new(r).lines();
+            super::conn::handshake(&mut lines, &mut w, "tok", "a/one")
+                .await
+                .unwrap();
+            let start: serde_json::Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let answer = serde_json::json!({"jsonrpc": "2.0", "id": start["id"], "result": {
+                "loginId": "l1", "provider": "claude-code", "account": null, "kind": "setup_token"}});
+            w.write_all(format!("{answer}\n").as_bytes()).await.unwrap();
+            // The panel is gone by now, so the next frame is this login's cancel, not a poll.
+            let next: serde_json::Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            (start, next)
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (asks, prx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(super::conn::run(addr, "tok".into(), tx, prx));
+        assert!(matches!(rx.recv().await, Some(super::Msg::Up { .. })));
+
+        let mut s = super::chrome::State {
+            overlay: Some(login_panel()),
+            ..Default::default()
+        };
+        super::start(&mut s, &asks, "claude-code".into());
+        let Some(super::Msg::LoginStarted(login)) = rx.recv().await else {
+            panic!("no start answer")
+        };
+        // Esc while the start was in flight: `close` drops the overlay, and the answer is
+        // turned away where the message is routed.
+        s.overlay = None;
+        let mut poll = super::Poller::default();
+        assert!(!super::take_start(&mut s, &asks, &login, &mut poll));
+        // Silent to the user: the panel is not reopened and says nothing.
+        assert!(s.overlay.is_none());
+
+        let (start, next) = server.await.unwrap();
+        assert_eq!(start["method"], "zephyr.login_start");
+        assert_eq!(start["params"]["provider"], "claude-code");
+        assert_eq!(next["method"], "zephyr.login_cancel");
+        assert_eq!(next["params"]["loginId"], "l1");
+    }
+
+    /// `unknown login` (a login the daemon dropped, or never started) is not the daemon going
+    /// quiet: the panel ends on it without a word. `GIVE_UP` stays for the half minute of
+    /// silence, where the sign-in may still be running and there is something to say.
+    #[tokio::test]
+    async fn an_unknown_login_ends_the_panel_without_a_word() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (r, mut w) = s.into_split();
+            let mut lines = BufReader::new(r).lines();
+            super::conn::handshake(&mut lines, &mut w, "tok", "a/one")
+                .await
+                .unwrap();
+            let req: serde_json::Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let answer = serde_json::json!({"jsonrpc": "2.0", "id": req["id"],
+                "error": {"code": -32602, "message": "unknown login"}});
+            w.write_all(format!("{answer}\n").as_bytes()).await.unwrap();
+            lines.next_line().await.ok();
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ptx, prx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(super::conn::run(addr, "tok".into(), tx, prx));
+        assert!(matches!(rx.recv().await, Some(super::Msg::Up { .. })));
+
+        let mut s = super::chrome::State::default();
+        let mut o = login_panel();
+        o.login.session = Some(super::conn::Login {
+            id: "l1".into(),
+            provider: "claude-code".into(),
+            ..Default::default()
+        });
+        s.overlay = Some(o);
+        ptx.send(super::Ask::LoginPoll {
+            login_id: "l1".into(),
+        })
+        .unwrap();
+        let Some(super::Msg::LoginGone(login_id)) = rx.recv().await else {
+            panic!("no poll answer")
+        };
+        assert_eq!(login_id, "l1");
+        let mut poll = super::Poller::default();
+        assert!(matches!(
+            super::login_poll(&s, 1000, &mut poll),
+            super::Poll::Ask(id) if id == "l1"
+        ));
+        // The panel showing that login ends, and the poll with it: nothing will answer it.
+        assert!(super::login_gone(&s, &login_id, &mut poll));
+        assert!(poll.login_id.is_none());
+        // Quietly: no reason on the panel, and none of the give-up text.
+        let o = s.overlay.as_ref().expect("the caller closes it");
+        assert_eq!(o.login.problem, None);
+        // A late answer about a login the panel no longer runs says nothing about the one it
+        // does: that panel stays up, and its poll stays followed.
+        if let Some(o) = s.overlay.as_mut() {
+            o.login.session.as_mut().unwrap().id = "l2".into();
+        }
+        assert!(!super::login_gone(&s, &login_id, &mut poll));
+        assert_eq!(s.overlay.as_ref().unwrap().login.running(), Some("l2"));
+        assert_eq!(s.overlay.as_ref().unwrap().login.problem, None);
     }
 
     #[test]

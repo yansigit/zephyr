@@ -8,15 +8,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 
-/// Provider ids as `rpi auth login --provider` takes them, with menu labels.
-pub const PROVIDERS: [(&str, &str); 6] = [
-    ("opencode-go", "OpenCode Go"),
-    ("antigravity", "Antigravity"),
-    ("openai-codex", "ChatGPT/Codex"),
-    ("claude-code", "Claude (Agent SDK)"),
-    ("cursor", "Cursor (chat only)"),
-    ("anthropic", "Anthropic API key"),
-];
+/// Provider ids as `rpi auth login --provider` takes them, with menu labels. They live with the
+/// login registry (`crate::auth`), which the live gateway's `zephyr.login_providers` reports.
+pub use crate::auth::PROVIDERS;
 
 /// The Claude Code executable bundled with the Agent SDK in the image (rpi-claude-agent's stage.sh).
 /// shortcut: the linux-x64 package only; an arm64 image needs `claude-agent-sdk-linux-arm64`.
@@ -123,16 +117,16 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
         .collect();
     let defaults: Vec<bool> = PROVIDERS
         .iter()
-        .map(|(id, _)| have.iter().any(|p| p == id))
+        .map(|p| have.iter().any(|id| id == p.id))
         .collect();
-    let labels: Vec<&str> = PROVIDERS.iter().map(|(_, l)| *l).collect();
+    let labels: Vec<&str> = PROVIDERS.iter().map(|p| p.label).collect();
     let chosen = MultiSelect::new()
         .with_prompt("Providers (space to select, enter to confirm)")
         .items(&labels)
         .defaults(&defaults)
         .interact()?;
     for i in chosen {
-        let id = PROVIDERS[i].0;
+        let id = PROVIDERS[i].id;
         let mut add = !have.iter().any(|p| p == id);
         loop {
             if add {
@@ -141,7 +135,7 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
                 }
             }
             add = Confirm::new()
-                .with_prompt(format!("Add another {} account?", PROVIDERS[i].1))
+                .with_prompt(format!("Add another {} account?", PROVIDERS[i].label))
                 .default(false)
                 .interact()?;
             if !add {
@@ -180,8 +174,8 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
 }
 
 fn known_provider(id: &str) -> anyhow::Result<()> {
-    if !PROVIDERS.iter().any(|(p, _)| *p == id) {
-        let ids: Vec<_> = PROVIDERS.iter().map(|(p, _)| *p).collect();
+    if crate::auth::provider(id).is_none() {
+        let ids: Vec<_> = PROVIDERS.iter().map(|p| p.id).collect();
         bail!("unknown provider {id}: one of {}", ids.join(", "));
     }
     Ok(())
@@ -189,11 +183,7 @@ fn known_provider(id: &str) -> anyhow::Result<()> {
 
 /// `<provider>-<n>` with the smallest free n.
 fn next_name(doc: &toml_edit::DocumentMut, provider: &str) -> String {
-    let taken: Vec<String> = conf::accounts(doc).into_iter().map(|(n, _)| n).collect();
-    (1..)
-        .map(|n| format!("{provider}-{n}"))
-        .find(|n| !taken.contains(n))
-        .expect("a free name")
+    crate::auth::next_name(doc, provider)
 }
 
 pub fn login_cmd(h: &Host, mut a: Args) -> anyhow::Result<()> {

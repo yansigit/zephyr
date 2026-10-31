@@ -78,6 +78,10 @@ pub struct NextJob {
 /// At most this many jobs in `Snapshot.jobs`.
 const NEXT_JOBS: usize = 5;
 
+/// At most this many `/login` sign-ins wait for their URL at once: one whose URL is never posted
+/// can never be finished, so a further `/login` is refused rather than dropping one.
+const PENDING_LOGINS: usize = 8;
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChannelState {
@@ -187,6 +191,8 @@ pub async fn run<C: Channel>(
         pending_model: None,
         reexec: false,
         auth_stamp: None,
+        logins: Vec::new(),
+        starting: Vec::new(),
         store: Store::open(&cfg.db_path())?,
         child: None,
         busy: false,
@@ -289,6 +295,27 @@ fn edits(cfg: &Config) -> Edits {
     (config, crate::reload::stamp(&cfg.secrets_path()))
 }
 
+/// A `/login` the tick still has to announce. rpi prints the URL a second or two after the child
+/// starts, and waiting for it in the loop that reads the child would stop it from reading events,
+/// capping a run or flushing a channel, so the tick posts the notice instead. `from` is the
+/// channel and sender that asked: an attached client is reached by `show` alone.
+struct Login {
+    id: String,
+    provider: &'static str,
+    from: Option<(String, String)>,
+}
+
+/// A `/login` whose `crate::auth::start` is still running. Before it spawns anything, rpi may be
+/// asked for its models, which takes seconds; that wait belongs to a task of its own, because the
+/// loop that reads the child also owns a run's events, the 5 s tick, `cap_run`, the re-exec gate
+/// and the child's stdout pump. The tick drains what has finished and posts its account, or why
+/// it failed; `from` is the channel and sender that asked, so the notice is addressed to them.
+struct Starting {
+    provider: &'static str,
+    from: Option<(String, String)>,
+    task: tokio::task::JoinHandle<anyhow::Result<crate::auth::Start>>,
+}
+
 struct Router<'a> {
     /// The live config; `reload` swaps it and sends it to the scheduler.
     cfg: Arc<Config>,
@@ -303,6 +330,10 @@ struct Router<'a> {
     reexec: bool,
     /// The child's `auth.json` mtime at spawn; a newer one (a re-login) restarts the child.
     auth_stamp: Option<SystemTime>,
+    /// Sign-ins `/login` started whose URL is not out yet.
+    logins: Vec<Login>,
+    /// `/login` starts still running: the tick drains them, so this loop never waits on rpi.
+    starting: Vec<Starting>,
     store: Store,
     child: Option<Child>,
     /// A prompt or resume is running in the child.
@@ -384,6 +415,8 @@ impl<'a> Router<'a> {
                 _ = tick.tick() => {
                     let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
                     self.cap_run().await;
+                    self.login_starts().await;
+                    self.login_notices();
                     if self.cfg.path.is_some() && edits(&self.cfg) != self.edits {
                         let text = self.reload().await;
                         eprintln!("zephyr: zephyr.toml or secrets.env changed: {text}");
@@ -632,7 +665,7 @@ impl<'a> Router<'a> {
         } else if let Some(reply) = crate::scheduler::command(&mut self.store, &self.cfg, &m) {
             self.jobs.runs.notify_one();
             reply
-        } else if let Some(reply) = self.command(text).await {
+        } else if let Some(reply) = self.command(text, (&m.channel, &m.sender)).await {
             reply
         } else if matches!(text, "/stop" | "/pause" | "/resume") {
             self.control(text).await.into()
@@ -841,7 +874,7 @@ impl<'a> Router<'a> {
     }
 
     /// `/reload`, `/status` and `/model`, run outside the queue. `None` for anything else.
-    async fn command(&mut self, text: &str) -> Option<String> {
+    async fn command(&mut self, text: &str, from: (&str, &str)) -> Option<String> {
         let (cmd, arg) = text.split_once(' ').unwrap_or((text, ""));
         Some(match (cmd, arg.trim()) {
             ("/reload", "") => self.reload().await,
@@ -849,8 +882,285 @@ impl<'a> Router<'a> {
             ("/model", "") => self.models(),
             ("/model", model) => self.switch_model(model).await,
             ("/new", "") => self.new_session().await,
+            ("/login", arg) => self.login(arg, from).await,
             _ => return None,
         })
+    }
+
+    /// `/login [PROVIDER [ACCOUNT [MODEL]]]`: signs a provider in from the live gateway, with the
+    /// same child `zephyr login` starts on the host (`crate::auth`). Nothing restarts here: a new
+    /// `auth.json` for the account the child runs on is a restart-on-idle (`Plan::RestartChild`),
+    /// and an account added to the pool only changes the pool.
+    ///
+    /// This runs on the loop that reads the child, which also owns the 5 s tick, `cap_run`, the
+    /// re-exec gate and the child's stdout pump, so it never waits on rpi: `auth::start` can
+    /// spend 20 s on a model listing, so it goes to a task of its own and the tick posts what it
+    /// found (`login_starts`). Refusals that need no subprocess are settled here, at once.
+    ///
+    /// `/login cancel [ID|PROVIDER]` is the way back out: a chat has no other handle on a sign-in
+    /// whose URL was never posted, and the pending cap refuses a ninth rather than drop one.
+    async fn login(&mut self, arg: &str, from: (&str, &str)) -> String {
+        let ids = || -> String {
+            crate::auth::PROVIDERS
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if arg.is_empty() {
+            return format!(
+                "[zephyr] /login PROVIDER [ACCOUNT] [MODEL]\nproviders: {}\n\
+                 /login cancel [ID|PROVIDER] stops a sign-in, so a refused one can be retried.\n\
+                 A provider that takes a key or a setup token is signed in on the host: \
+                 `zephyr login PROVIDER`. Never paste a token here.",
+                ids()
+            );
+        }
+        // `cancel` is not a provider id, so nothing is shadowed.
+        let (verb, rest) = arg.split_once(' ').unwrap_or((arg, ""));
+        if verb == "cancel" {
+            return self.login_cancel(rest).await;
+        }
+        let mut words = arg.split_whitespace();
+        let provider = words.next().unwrap_or_default();
+        let account = words.next().map(str::to_string);
+        let model = words.next().map(str::to_string);
+        if let Some(extra) = words.next() {
+            return format!("[zephyr] unexpected {extra:?}: /login PROVIDER [ACCOUNT] [MODEL]");
+        }
+        // Both checks are free — a table lookup, no child — so a refusal costs no login to
+        // start and then cancel.
+        let Some(p) = crate::auth::provider(provider) else {
+            return format!("[zephyr] unknown provider {provider}; one of {}.", ids());
+        };
+        if p.kind != crate::auth::Kind::Oauth {
+            // A chat is not a place to type a key: the other end is another vendor.
+            return format!(
+                "[zephyr] {provider} takes {}: run `zephyr login {provider}` on the host. \
+                 Never paste a token here.",
+                match p.kind {
+                    crate::auth::Kind::Key => "an API key",
+                    _ => "a setup token",
+                }
+            );
+        }
+        // A login whose URL is never posted can never be finished, and a live sign-in is never
+        // dropped to make room: refuse instead, so the channel user is not left waiting forever.
+        if self.logins.len() + self.starting.len() >= PENDING_LOGINS {
+            return format!(
+                "[zephyr] {PENDING_LOGINS} sign-ins are waiting for their URL; finish one or \
+                 `/login cancel`"
+            );
+        }
+        let cfg = self.cfg.clone();
+        let (wanted, model_arg) = (account.clone(), model.clone());
+        let wanted_provider = provider.to_string();
+        let task = tokio::spawn(async move {
+            crate::auth::start(&cfg, &wanted_provider, wanted, model_arg).await
+        });
+        self.starting.push(Starting {
+            provider: p.id,
+            from: Some((from.0.to_string(), from.1.to_string())),
+            task,
+        });
+        // Never a name rpi has not given us: the account is resolved inside `start` (the first
+        // free `<provider>-<n>`, a whole `zephyr.toml` read away), so the reply names one only
+        // when the command did, and the tick posts the line that has the real one.
+        match &account {
+            Some(name) => {
+                format!("[zephyr] signing in to {provider} as {name}; the URL follows here.")
+            }
+            None => format!("[zephyr] signing in to {provider}; the URL follows here."),
+        }
+    }
+
+    /// `/login cancel [ID|PROVIDER]`: stops sign-ins this daemon holds, so a chat that abandoned
+    /// one can start another — nothing else a channel can send reaches them. With an `ID`, that
+    /// login; with a `PROVIDER` id, the ones waiting for that provider (the notices still to be
+    /// posted and the starts still resolving); with neither, every login the daemon holds, the
+    /// attached TUI's included. A start that has not resolved has no id to have been told, so it
+    /// is aborted and named by its provider. A login that already recorded its account is
+    /// refused by `auth::cancel` and stays `done`: its row is in the file.
+    async fn login_cancel(&mut self, what: &str) -> String {
+        let what = what.trim();
+        let provider = crate::auth::provider(what).map(|p| p.id);
+        let mut lines = Vec::new();
+        if what.is_empty() || provider.is_some() {
+            let starting = std::mem::take(&mut self.starting);
+            for Starting {
+                provider: p,
+                from,
+                task,
+            } in starting
+            {
+                if !what.is_empty() && provider != Some(p) {
+                    self.starting.push(Starting {
+                        provider: p,
+                        from,
+                        task,
+                    });
+                    continue;
+                }
+                if !task.is_finished() {
+                    task.abort();
+                    lines.push(format!(
+                        "[zephyr] cancelled the sign-in to {p}; it had not resolved yet"
+                    ));
+                    continue;
+                }
+                // Resolved since the last tick: it registered a login nobody has an id for yet,
+                // and a failed start left nothing to stop.
+                if let Ok(Ok(start)) = task.await {
+                    if crate::auth::cancel(&start.login_id) {
+                        lines.push(format!(
+                            "[zephyr] cancelled the sign-in to {p} as {}",
+                            start.account
+                        ));
+                    }
+                }
+            }
+        }
+        let ids: Vec<String> = match provider {
+            // Only `/login` knows a login's provider for as long as it waits, so the ids of the
+            // ones it already announced are gone with the notice; `auth::logins` has them all.
+            // But only this router's own logins are cancelled: the registry is process-wide,
+            // and another daemon (or an attached TUI's `zephyr.login_*`) may hold a login with
+            // the same provider. A bare cancel takes every login this router started.
+            Some(p) => self
+                .logins
+                .iter()
+                .filter(|l| l.provider == p)
+                .map(|l| l.id.clone())
+                .collect(),
+            None if what.is_empty() => self.logins.iter().map(|l| l.id.clone()).collect(),
+            // An id names one login; only this router's own ids are honoured, so one channel
+            // cannot stop another daemon's (or an attached TUI's) sign-in by guessing its id.
+            None => vec![what.to_string()]
+                .into_iter()
+                .filter(|id| self.logins.iter().any(|l| &l.id == id))
+                .collect(),
+        };
+        for id in ids {
+            let provider = self.logins.iter().find(|l| l.id == id).map(|l| l.provider);
+            // Read before the cancel: `cancel` takes the entry out of the registry.
+            let account = crate::auth::poll(&id)
+                .and_then(|l| l["account"].as_str().map(str::to_string))
+                .filter(|a| !a.is_empty());
+            // `false`: already `done` or unknown, and a `done` login stays `done`.
+            if !crate::auth::cancel(&id) {
+                continue;
+            }
+            self.logins.retain(|l| l.id != id);
+            lines.push(match (provider, account) {
+                (Some(p), Some(a)) => format!("[zephyr] cancelled the sign-in to {p} as {a}"),
+                (Some(p), None) => format!("[zephyr] cancelled the sign-in to {p}"),
+                (None, Some(a)) => format!("[zephyr] cancelled the sign-in as {a}"),
+                (None, None) => "[zephyr] cancelled a sign-in".to_string(),
+            });
+        }
+        if lines.is_empty() {
+            return "[zephyr] no sign-in to cancel".into();
+        }
+        lines.join("\n")
+    }
+
+    /// Drains the `/login` starts that have finished: the account and model they resolved, or why
+    /// they failed, as a notice. On the 5 s tick, since the start runs in its own task.
+    async fn login_starts(&mut self) {
+        let starting = std::mem::take(&mut self.starting);
+        for Starting {
+            provider,
+            from,
+            task,
+        } in starting
+        {
+            if !task.is_finished() {
+                self.starting.push(Starting {
+                    provider,
+                    from,
+                    task,
+                });
+                continue;
+            }
+            let text = match task.await {
+                Ok(Ok(start)) => {
+                    // Registered in `crate::auth`, so `login_notices` follows it for its URL.
+                    self.logins.push(Login {
+                        id: start.login_id,
+                        provider: start.provider,
+                        from: from.clone(),
+                    });
+                    format!(
+                        "[zephyr] signing in to {} as {}{}",
+                        start.provider,
+                        start.account,
+                        match start.model.as_str() {
+                            "" => String::new(),
+                            model => format!(" ({model})"),
+                        }
+                    )
+                }
+                // `start` checks the cheap things first — an unknown provider, no `zephyr.toml`
+                // to record the account in, the registry's own cap — before it spawns anything.
+                Ok(Err(e)) => format!("[zephyr] signing in to {provider} failed: {e:#}"),
+                Err(e) => format!("[zephyr] signing in to {provider} failed: {e}"),
+            };
+            self.login_notice(&text, &from);
+        }
+    }
+
+    /// Posts what each `/login` sign-in has to say — the URL, a failure, or the account once it
+    /// is recorded — and forgets it. On the 5 s config tick, so nothing here waits on a login and
+    /// a login that died without a word is dropped by the registry and forgotten with it.
+    fn login_notices(&mut self) {
+        let logins = std::mem::take(&mut self.logins);
+        for Login { id, provider, from } in logins {
+            let Some(login) = crate::auth::poll(&id) else {
+                continue; // finished long ago, or evicted: nothing left to say
+            };
+            let phase = login["phase"].as_str().unwrap_or_default();
+            let text = match phase {
+                "done" => format!(
+                    "[zephyr] signed in to {provider} as {}{}",
+                    login["account"].as_str().unwrap_or_default(),
+                    match login["model"].as_str() {
+                        Some(model) => format!(" ({model})"),
+                        None => String::new(),
+                    }
+                ),
+                "failed" => format!(
+                    "[zephyr] signing in to {provider} failed: {}",
+                    login["error"].as_str().unwrap_or("no reason given")
+                ),
+                _ => match login["url"].as_str() {
+                    Some(url) => format!(
+                        "[zephyr] sign in to {provider} as {} at {url}",
+                        login["account"].as_str().unwrap_or_default()
+                    ),
+                    None => {
+                        // Still waiting for the URL.
+                        self.logins.push(Login { id, provider, from });
+                        continue;
+                    }
+                },
+            };
+            self.login_notice(&text, &from);
+        }
+    }
+
+    /// One `/login` notice, in both places a `/login` can come from: an attached client sees it
+    /// live, and the channel that asked gets it as an outbox row. The row is addressed to that
+    /// sender, not to whoever spoke last in the inbox: a second owner must not see the first
+    /// one's sign-in URL. Both writes, neither waits.
+    fn login_notice(&self, text: &str, from: &Option<(String, String)>) {
+        self.show(text, None);
+        let Some((channel, recipient)) = from else {
+            return;
+        };
+        if channel == crate::attach::CHANNEL {
+            return; // that sender is the attached client `show` has just reached
+        }
+        let _ = self.store.notify(channel, recipient, text);
     }
 
     /// `/new`: a fresh main session from the next message. The old one stays on disk; memory
@@ -904,29 +1214,53 @@ impl<'a> Router<'a> {
 
     /// `/model PROVIDER/MODEL`: sets it on the account for that provider in `zephyr.toml`
     /// (`reload::set_model`), checks that account's rpi lists it, saves, then reloads.
+    ///
+    /// `set_model` derives the account from the file it writes, so the check names the derivation
+    /// on the file as it is now, and the write re-derives: a `/login` that records an account in
+    /// between must not make the write land on an account no rpi was asked about, so it writes
+    /// nothing and the new pool goes through the check first.
     async fn switch_model(&mut self, model: &str) -> String {
         let Some(path) = self.cfg.path.clone() else {
             return "[zephyr] no zephyr.toml to change".into();
         };
         let active = self.account.as_ref().map(|a| a.name.clone());
-        let doc = match crate::host::conf::load(&path).and_then(|mut doc| {
-            crate::reload::set_model(&mut doc, active.as_deref(), model)?;
-            Ok(doc)
-        }) {
-            Ok(doc) => doc,
-            Err(e) => return format!("[zephyr] model not changed: {e:#}"),
-        };
-        let target = crate::host::conf::accounts(&doc)
-            .into_iter()
-            .find(|(_, m)| m == model)
-            .and_then(|(name, _)| self.cfg.accounts.iter().find(|a| a.name == name).cloned());
-        if !lists(&self.cfg.clone(), target.as_ref(), model).await {
-            return format!("[zephyr] rpi has no model {model}");
+        for _ in 0..3 {
+            let derived = crate::host::conf::load(&path).and_then(|mut doc| {
+                crate::reload::set_model(&mut doc, active.as_deref(), model)?;
+                Ok(model_account(&doc, model))
+            });
+            let name = match derived {
+                Ok(name) => name,
+                Err(e) => return format!("[zephyr] model not changed: {e:#}"),
+            };
+            let target = name.clone().map(|name| Account {
+                name,
+                model: model.to_string(),
+            });
+            if !lists(&self.cfg.clone(), target.as_ref(), model).await {
+                return format!("[zephyr] rpi has no model {model}");
+            }
+            // The check and the write must name the same account: the closure that writes
+            // re-derives, and a pool that moved under the check leaves the file untouched.
+            let mut moved = false;
+            let saved = crate::host::conf::update(&path, |doc| {
+                crate::reload::set_model(doc, active.as_deref(), model)?;
+                if model_account(doc, model) != name {
+                    moved = true;
+                    anyhow::bail!("the account pool changed while rpi listed the model");
+                }
+                Ok(())
+            });
+            if moved {
+                continue;
+            }
+            return match saved {
+                Ok(()) => self.reload().await,
+                Err(e) => format!("[zephyr] model not changed: {e:#}"),
+            };
         }
-        match crate::host::conf::save(&path, &doc) {
-            Ok(()) => self.reload().await,
-            Err(e) => format!("[zephyr] model not changed: {e:#}"),
-        }
+        "[zephyr] model not changed: the account pool kept changing while rpi listed the model"
+            .into()
     }
 
     /// Reads `zephyr.toml` and `secrets.env` again and applies what changed (`reload::diff`).
@@ -1231,6 +1565,15 @@ impl<'a> Router<'a> {
             None => anyhow::bail!("rpi child is not running"),
         }
     }
+}
+
+/// The account `reload::set_model` names for `model` in `doc`, read back out of the document it
+/// just wrote: the write's own derivation, so a check and a write talk about one account.
+fn model_account(doc: &toml_edit::DocumentMut, model: &str) -> Option<String> {
+    crate::host::conf::accounts(doc)
+        .into_iter()
+        .find(|(_, m)| m == model)
+        .map(|(name, _)| name)
 }
 
 /// Whether `rpi --list-models`, signed in as `account`, lists `model`. A listing that fails

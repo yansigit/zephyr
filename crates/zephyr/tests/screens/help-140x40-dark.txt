@@ -8,7 +8,6 @@
 
  ≋ Done. I scheduled renew kimchigoose.com for Fri 09:00 KST.
    ▸ schedule  add "renew domain" fri 09:00                                                                                          ✓ 0.2s
-
  ╭─ commands ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │ › type to filter                                                                                                                       │
  │ Chat                                                                                                                                   │
@@ -33,6 +32,7 @@
  │    /job rm <id>             remove a job                                                                                               │
  │ Gateway                                                                                                                                │
  │    /status                  agent, accounts, channels, spend and jobs                                                                  │
+ │    /login                   sign in to a provider and add its account                                                                  │
  │    /pause                   hold new messages until /resume                                                                            │
  │    /resume                  answer what waited                                                                                         │
  │    /reload                  apply zephyr.toml and secrets.env                                                                          │

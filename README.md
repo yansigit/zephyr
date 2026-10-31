@@ -46,6 +46,16 @@ zephyr login openai-codex --account codex-main
 | `zephyr reload` | Apply hand edits now instead of within 5 s (`/reload` from any channel) |
 | `zephyr uninstall [--keep-data]` | Remove the container and image, and `~/.zephyr` unless kept |
 
+Sign in from the running gateway too, with no re-exec afterwards. In `zephyr attach`, `/login`
+lists the providers and Enter starts the one you pick: an OAuth provider (Antigravity,
+ChatGPT/Codex) prints a URL to open in a browser on your machine; nothing else is needed. The
+others ask for a key or a token, which is typed masked, goes to the sign-in once and is never
+shown or kept. From any channel, `/login PROVIDER [ACCOUNT] [MODEL]` can start a sign-in too, but
+only an OAuth one: a `key` or a token provider is refused there, so use `zephyr login` on the host,
+or the attach panel. `/login cancel [ID|PROVIDER]` stops a sign-in you have given up on, so its slot
+in the eight that may wait at once is free again. The account joins the pool at once; `/model`
+selects it.
+
 ## Changing settings
 
 Changes apply by themselves; nothing needs `zephyr restart`. The commands above, and hand edits to
@@ -62,6 +72,11 @@ A file that does not load is not applied, and the daemon keeps its current setti
 channel: `/model` shows the models, `/model PROVIDER/MODEL` switches (to the account on that
 provider), `/status` shows the agent's account and model, `/reload` re-reads the files, and `/new`
 starts a fresh conversation (memory and rules carry over; the old one stays in `sessions/`).
+`/login` signs an account in from here: `/login` lists the provider ids, `/login PROVIDER [ACCOUNT]
+[MODEL]` starts an OAuth sign-in and needs no re-exec (a key or a token is refused — it is typed in
+`zephyr attach`, which masks it), and `/login cancel [ID|PROVIDER]` stops the ones you gave up on.
+The first account of an empty install does restart the agent once, when idle: there is nothing for
+it to start on until that account exists.
 
 `ZEPHYR_CONTAINER` (default `zephyr`) and `ZEPHYR_IMAGE` choose another container or image, for
 example to test beside a live install.

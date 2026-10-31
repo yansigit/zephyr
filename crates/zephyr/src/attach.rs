@@ -8,7 +8,10 @@
 //! exit, and renders `{"method":"event","params":{"subscriptionId","event":<--mode rpc line>}}`.
 //! Here prompts go through the inbox as channel `tui`, and `stop_session` only detaches.
 //! `zephyr.hello`, `zephyr.subscribe` and `zephyr.models` are Zephyr's own additions
-//! (DESIGN §4.3.1).
+//! (DESIGN §4.3.1), as are `zephyr.login_providers`/`_start`/`_poll`/`_input`/`_cancel`, which
+//! sign a provider in on the live gateway (`crate::auth`). `zephyr.login_start` answers once rpi's
+//! child has started, not at once: rpi may be asked for a model first, so the `loginId` can take a
+//! few seconds, and the sign-in URL follows on the daemon's 5 s tick rather than in the reply.
 
 use crate::channel::Inbound;
 use crate::config::{Attach, Config};
@@ -86,6 +89,7 @@ pub async fn serve(
                     live: None,
                     zephyr: false,
                     models: None,
+                    late: mpsc::channel(4),
                 };
                 tokio::spawn(conn.run(stream));
             }
@@ -108,6 +112,10 @@ struct Conn {
     /// A `zephyr.models` answer being built: `(id, result)`. It runs rpi once per account, so
     /// it is off the loop, which keeps streaming meanwhile.
     models: Option<tokio::task::JoinHandle<(Value, Value)>>,
+    /// Answers from work this conn spawned and cannot wait on in the loop — `zephyr.login_start`
+    /// asks rpi for its models — as frames to write. The sender lives with the conn, so a task
+    /// may outlive one reply without ending the connection.
+    late: (mpsc::Sender<Reply>, mpsc::Receiver<Reply>),
 }
 
 /// What to do after a request: write these frames, then maybe hang up.
@@ -140,6 +148,10 @@ impl Conn {
                         Err(_) => (vec![], false), // a panic in the listing; the client asks again
                     }
                 }
+                reply = self.late.1.recv() => match reply {
+                    Some(reply) => reply,
+                    None => return, // unreachable: this conn holds the sender
+                },
                 changed = self.snap.changed(), if self.zephyr => match changed {
                     Ok(()) => (vec![self.status()], false),
                     Err(_) => return, // the router is gone
@@ -210,6 +222,71 @@ impl Conn {
                 (vec![], false)
             }
             "send" => self.send(id, &params["command"]).await,
+            "zephyr.login_providers" => (vec![ok(id, crate::auth::providers())], false),
+            "zephyr.login_start" => {
+                let (cfg, provider) = (
+                    self.cfgs.borrow().clone(),
+                    params["provider"].as_str().unwrap_or_default().to_string(),
+                );
+                let (account, model) = (
+                    params["account"].as_str().map(str::to_string),
+                    params["model"].as_str().map(str::to_string),
+                );
+                let (asked, late) = (json!(id), self.late.0.clone());
+                // Loading the config and asking rpi for its models is not quick, so this loop —
+                // the one that streams events — does not wait: the answer goes back over `late`,
+                // as `zephyr.models` does, once the login's child has started. A provider
+                // `auth::start` does not know still answers `-32602` here.
+                tokio::spawn(async move {
+                    let started = crate::auth::start(&cfg, &provider, account, model).await;
+                    let (reply, login) = match started {
+                        Ok(start) => (
+                            (vec![ok(&asked, start.to_json())], false),
+                            Some(start.login_id),
+                        ),
+                        Err(e) => (
+                            (vec![error(&asked, -32602, &format!("{e:#}"))], false),
+                            None,
+                        ),
+                    };
+                    // Nobody left to answer: the connection is gone. No client ever learned this
+                    // login's id, so it could never be polled, typed into or cancelled, and a
+                    // live `script` and rpi would sit in `waiting` for the daemon's life. Stop
+                    // it there; the cancel records nothing and logs nothing about credentials.
+                    // A client that walks away from a login without closing the connection is
+                    // not this code's business: it can still cancel by id.
+                    if late.send(reply).await.is_err() {
+                        if let Some(login) = login {
+                            crate::auth::cancel(&login);
+                        }
+                    }
+                });
+                (vec![], false)
+            }
+            "zephyr.login_poll" => {
+                match crate::auth::poll(params["loginId"].as_str().unwrap_or_default()) {
+                    Some(login) => (vec![ok(id, login)], false),
+                    None => (vec![error(id, -32602, "unknown login")], false),
+                }
+            }
+            "zephyr.login_input" => {
+                let (login, text) = (
+                    params["loginId"].as_str().unwrap_or_default(),
+                    params["text"].as_str().unwrap_or_default(),
+                );
+                if !crate::auth::input(login, text) {
+                    return (vec![error(id, -32602, "unknown login")], false);
+                }
+                (vec![ok(id, json!({}))], false)
+            }
+            "zephyr.login_cancel" => {
+                // `false`: already finished, or evicted — the client asked to cancel nothing.
+                if crate::auth::cancel(params["loginId"].as_str().unwrap_or_default()) {
+                    (vec![ok(id, json!({}))], false)
+                } else {
+                    (vec![error(id, -32602, "unknown login")], false)
+                }
+            }
             _ => (vec![error(id, -32601, "method not found")], false),
         }
     }

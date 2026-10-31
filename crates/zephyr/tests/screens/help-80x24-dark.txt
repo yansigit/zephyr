@@ -20,5 +20,5 @@
  │    /rule <text>             add a rule the agent reads first               │
  │    /rule rm <n>             remove rule n                                  │
  │ Schedule                                                                   │
- ╰─────────────────────────────────────────────────────────────── 1-16 of 25 ─╯
+ ╰─────────────────────────────────────────────────────────────── 1-16 of 26 ─╯
   ↑↓ choose · ⏎ insert · type to filter · esc close

@@ -355,7 +355,8 @@ impl View {
 
 /// Text from tools and jobs, safe to draw: no escape sequences, `\r` or tabs, which would
 /// shift the layout or reach the terminal. As upstream `tool_execution::normalized_output_lines`.
-fn clean(text: &str) -> String {
+/// The sign-in panel's own output goes through it too, since a pty redraws with `\r`.
+pub(super) fn clean(text: &str) -> String {
     let text = rpi_tui::strip_ansi(text)
         .replace("\r\n", "\n")
         .replace('\r', "\n");

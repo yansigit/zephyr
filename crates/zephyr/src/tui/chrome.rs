@@ -623,13 +623,31 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
                 Kind::Model => ("choose", Some("switch")),
                 Kind::Help => ("choose", Some("insert")),
                 Kind::Status => ("scroll", None),
+                // Once the sign-in runs there is nothing to choose, and the token goes in Enter.
+                Kind::Login => match o.login.running() {
+                    Some(_) => ("scroll", None),
+                    None => ("choose", Some("sign in")),
+                },
             };
             let mut hints = vec![(key(arrows, choose), 2)];
             hints.extend(pick.map(|pick| (key(enter, pick), 1)));
-            if o.kind != Kind::Status {
+            if o.kind == Kind::Login && o.login.needs_input() {
+                hints.clear();
+                hints.push((key(enter, "send the code"), 1));
+            } else if o.kind != Kind::Status {
                 hints.push((p.muted.fg("type to filter"), 3));
             }
-            hints.push((key("esc", "close"), 0));
+            hints.push((
+                key(
+                    "esc",
+                    match o.kind {
+                        // A running sign-in is given up on, not just closed.
+                        Kind::Login if o.login.running().is_some() => "cancel",
+                        _ => "close",
+                    },
+                ),
+                0,
+            ));
             hints
         }
         (None, Some(_)) => vec![
@@ -760,6 +778,7 @@ pub fn short_model(id: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use super::super::conn;
     use super::super::theme::{DARK, PLAIN};
     use super::*;
     use crate::router::{ChannelState, Origin, Run, Spend, Waiting};
@@ -1145,6 +1164,30 @@ mod tests {
         assert!(left(&s, 120).starts_with("  ↑↓ scroll · esc close  "));
         s.overlay = Some(Overlay::new(Kind::Help));
         assert!(left(&s, 120).starts_with("  ↑↓ choose · ⏎ insert · type to filter · esc close"));
+        // The sign-in picker closes; a sign-in already running is given up on.
+        s.overlay = Some(Overlay::new(Kind::Login));
+        assert!(
+            left(&s, 120).starts_with("  ↑↓ choose · ⏎ sign in · type to filter · esc close"),
+            "{}",
+            left(&s, 120)
+        );
+        if let Some(o) = s.overlay.as_mut() {
+            o.login.session = Some(conn::Login {
+                id: "l1".into(),
+                provider: "claude-code".into(),
+                account: None,
+                kind: "setup_token".into(),
+            });
+            o.login.status = Some(conn::LoginStatus {
+                phase: "need_input".into(),
+                ..Default::default()
+            });
+        }
+        assert!(
+            left(&s, 120).starts_with("  ⏎ send the code · esc cancel"),
+            "{}",
+            left(&s, 120)
+        );
         s.overlay = None;
         s.complete = Some(Complete {
             items: vec![0],

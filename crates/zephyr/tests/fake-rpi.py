@@ -10,6 +10,10 @@ reply carries: {"totalTokens": n, "costTotal": x}, sent as message.usage.{totalT
 Auth: the OAuth store is $RPI_CODING_AGENT_DIR/auth.json. `get_auth_status` lists its oauth
 entries. `auth refresh --provider P` (the CLI, not the RPC) gives P a fresh expiry, and records
 an "auth-refresh" line in ./log.jsonl (an `oauth_fail` file in the home makes it fail).
+`auth login --provider P` records an "auth-login" line and stores {"type": "oauth"} for P: with a
+`login_url` file in the home it prints a sign-in URL and waits for a `login_go` file (the browser
+coming back), otherwise it prompts and reads one stdin line; a `login_fail` file makes it fail.
+`auth check --json --provider P` prints {"ready": true} iff P is stored.
 Accounts: each start logs {"type": "start", "agentDir", "model"} to ./log.jsonl. A
 `rate_limited` file in $RPI_CODING_AGENT_DIR holds an error text: every prompt then ends with
 that error (stopReason "error", settle outcome "failed"), as a rate-limited provider does.
@@ -29,7 +33,7 @@ A prompt containing `[hang]` never settles until `abort`, which records an abort
 message (stopReason "aborted", `errorMessage` "abort error: Request aborted") and settles with
 outcome "aborted"; one that starts with `say: `
 replies with the rest; `model?` replies with the current model.
-Models: `--list-models` (held while a `list_wait` file exists in the home) prints fake/m1, fake/m2 and other/m3, the catalogue `set_model` accepts
+Models: `--list-models` (held while a `list_wait` file exists in the home) prints fake/m1, fake/m2, other/m3 and opencode-go/alpha, the catalogue `set_model` accepts
 (plus the started model);
 `set_model` switches to one of them and errors on anything else.
 The session is <session-dir>/<session-id>.json: {"messages": [...], "pending": bool}.
@@ -39,7 +43,7 @@ import json, os, re, sys, time
 args = sys.argv[1:]
 if "--version" in args:
     print("rpi 0.14.0"); sys.exit(0)
-CATALOG = ["fake/m1", "fake/m2", "other/m3"]
+CATALOG = ["fake/m1", "fake/m2", "other/m3", "opencode-go/alpha"]
 if "--list-models" in args:
     while os.path.exists("list_wait"):  # cwd is the home
         time.sleep(0.05)
@@ -48,17 +52,44 @@ if "--list-models" in args:
         print("%s  %s  1M" % tuple(m.split("/", 1)))
     sys.exit(0)
 if args[:1] == ["auth"]:
-    # `rpi auth refresh --provider P`, run in the home as cwd.
+    # The CLI half of auth: `refresh` (the keeper), `login` and `check` (crate::auth), in the home
+    # as cwd. `login` is run under `script`, so its stdout is a pty.
     provider = args[args.index("--provider") + 1]
     home = os.getcwd()
-    open(os.path.join(home, "log.jsonl"), "a").write(json.dumps({"type": "auth-refresh", "provider": provider}) + "\n")
     d = os.environ.get("RPI_CODING_AGENT_DIR")
-    store = json.load(open(os.path.join(d, "auth.json"))) if d and os.path.exists(os.path.join(d, "auth.json")) else {}
+    store_path = os.path.join(d, "auth.json") if d else None
+    store = json.load(open(store_path)) if store_path and os.path.exists(store_path) else {}
+    if args[1:2] == ["login"]:
+        open(os.path.join(home, "log.jsonl"), "a").write(json.dumps({"type": "auth-login", "provider": provider}) + "\n")
+        if os.path.exists(os.path.join(home, "login_fail")):
+            print("error: sign-in failed", file=sys.stderr); sys.exit(1)
+        if os.path.exists(os.path.join(home, "login_url")):
+            # An OAuth provider: print the URL and finish when the browser does (a test drops
+            # `login_go` in the home, as the browser coming back would).
+            print("To sign in, open this URL in a browser:\r\n\r\n\x1b[36mhttps://example.test/login/%s\x1b[0m\r\n" % provider)
+            sys.stdout.flush()
+            while not os.path.exists(os.path.join(home, "login_go")):
+                time.sleep(0.05)
+        else:
+            # A key or a setup token: paste it at the prompt.
+            print("Paste the %s credential for \"%s\":" % (provider, provider)); sys.stdout.flush()
+            if not sys.stdin.readline().strip():
+                print("error: no credential given", file=sys.stderr); sys.exit(1)
+        store[provider] = {"type": "oauth"}
+        json.dump(store, open(store_path, "w"))
+        print("Signed in to \"%s\"." % provider)
+        sys.exit(0)
+    if args[1:2] == ["check"]:
+        # `rpi auth check --json --provider P`: is the credential stored?
+        print(json.dumps({"provider": provider, "ready": provider in store}))
+        sys.exit(0)
+    # `rpi auth refresh --provider P`.
+    open(os.path.join(home, "log.jsonl"), "a").write(json.dumps({"type": "auth-refresh", "provider": provider}) + "\n")
     if os.path.exists(os.path.join(home, "oauth_fail")) or store.get(provider, {}).get("type") != "oauth":
         print("error: OAuth refresh failed", file=sys.stderr); sys.exit(1)
     store[provider]["expires"] = int(time.time()) + 3600
     store[provider]["access"] = "fresh-" + str(os.getpid())
-    json.dump(store, open(os.path.join(d, "auth.json"), "w"))
+    json.dump(store, open(store_path, "w"))
     print("OAuth credentials refreshed for \"%s\"." % provider)
     sys.exit(0)
 opt = lambda name: args[args.index(name) + 1] if name in args else None
