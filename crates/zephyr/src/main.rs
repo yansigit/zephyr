@@ -14,7 +14,7 @@ use zephyr::rpc::{Child, USED_COMMANDS};
 use zephyr::store::Store;
 
 /// The rpi minor this build speaks (DESIGN §3).
-const RPI_PIN: &str = "rpi 0.14.";
+const RPI_PIN: &str = "rpi 0.15.";
 
 const USAGE: &str = "usage: zephyr <run|status|doctor|chat|tui|pause|resume|reload>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
 

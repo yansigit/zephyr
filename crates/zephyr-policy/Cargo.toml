@@ -10,6 +10,6 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rpi-plugin-sdk = "=0.14.0"
+rpi-plugin-sdk = "=0.15.0"
 serde.workspace = true
 serde_json.workspace = true

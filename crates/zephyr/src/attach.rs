@@ -1,7 +1,7 @@
 //! Lets stock `rpi --connect 127.0.0.1:<port>` attach to the live `main` session (DESIGN §4.3).
 //!
 //! Wire shape, from upstream `crates/rpi-cli/src/remote/client.rs` and `session_driver.rs`
-//! (identical in v0.12.0 and v0.14.0): one JSON-RPC 2.0 object per line. The client calls
+//! (identical in v0.12.0 to v0.15.0): one JSON-RPC 2.0 object per line. The client calls
 //! `authenticate {token}` (only when it has a token), `start_session {}`, `subscribe
 //! {sessionId}`, then a `send {sessionId, command:{type:"get_state"}}`, one `send
 //! {sessionId, command}` per prompt (the text is the command's `content`) and `stop_session` on

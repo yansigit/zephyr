@@ -1,4 +1,4 @@
-//! `rpi --connect` attach (src/attach.rs), spoken frame by frame as the stock 0.14.0
+//! `rpi --connect` attach (src/attach.rs), spoken frame by frame as the stock 0.15.0
 //! client does, against the scripted fake child (tests/fake-rpi.py).
 
 use serde_json::{json, Value};
@@ -785,9 +785,9 @@ fn token_file_must_be_private() {
 /// The pinned stock client, typed into through a pty (its TUI needs a terminal; with piped
 /// stdin it only handshakes and exits). Needs python3 and the binary; no model is called.
 #[tokio::test]
-#[ignore = "drives the real rpi 0.14.0 --connect client"]
+#[ignore = "drives the real rpi 0.15.0 --connect client"]
 async fn stock_rpi_connect_attaches_chats_and_detaches() {
-    let rpi = Path::new("/home/user/Projects/.always-on/rpi-0.14.0/bin/rpi");
+    let rpi = Path::new("/home/user/Projects/.always-on/rpi-0.15.0/bin/rpi");
     if !rpi.exists() {
         eprintln!("skipped: {} is absent", rpi.display());
         return;

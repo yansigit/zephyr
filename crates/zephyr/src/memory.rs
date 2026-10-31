@@ -35,7 +35,7 @@ fn approved_dir(state: &Path) -> PathBuf {
 /// `USER.md` and `MEMORY.md`, in that order.
 type Files = [String; 2];
 
-/// Context file names rpi 0.14.0 loads, the first found per directory, from the agent dir and
+/// Context file names rpi 0.15.0 loads, the first found per directory, from the agent dir and
 /// from the cwd up (`rpi-harness/src/context_files.rs`, `CONTEXT_FILE_CANDIDATES`).
 const CONTEXT_FILES: [&str; 5] = [
     "AGENTS.override.md",
@@ -44,7 +44,7 @@ const CONTEXT_FILES: [&str; 5] = [
     "CLAUDE.md",
     "CLAUDE.MD",
 ];
-/// System prompt files rpi 0.14.0 reads from `<cwd>/.rpi/` and the agent dir
+/// System prompt files rpi 0.15.0 reads from `<cwd>/.rpi/` and the agent dir
 /// (`rpi-cli/src/resource_dirs.rs`). `SYSTEM.md` replaces rpi's own prompt.
 const PROMPT_FILES: [&str; 2] = ["SYSTEM.md", "APPEND_SYSTEM.md"];
 

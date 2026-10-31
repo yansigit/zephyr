@@ -1,5 +1,5 @@
 //! Drives one `rpi --mode rpc` child: JSONL on stdio, frames as in upstream
-//! `crates/rpi-cli/src/rpc/protocol.rs` and `modes.rs` (v0.14.0).
+//! `crates/rpi-cli/src/rpc/protocol.rs` and `modes.rs` (v0.15.0).
 
 use crate::config::{Account, Config};
 use anyhow::{anyhow, bail, Context};
@@ -75,7 +75,9 @@ impl Child {
         // AGENTS.md is the agent's only standing instruction (memory::prepare): no skills it
         // could plant, and a trust.json it wrote can't switch AGENTS.md off. `--local-only`
         // loads only the `--extension` files below, none from a dir or setting the agent can write.
+        // rpi 0.15 defaults to compact deltas; the TUI streams from each update's `message`.
         cmd.args(["--mode", "rpc", "--approve", "--no-skills", "--local-only"])
+            .args(["--rpc-message-updates", "snapshot"])
             .args(["--session-id", session_id, "--session-dir"])
             .arg(cfg.session_dir())
             // rpi files sessions under a per-cwd folder, so the cwd must never change.
@@ -294,7 +296,7 @@ mod tests {
         let argv: Vec<String> =
             serde_json::from_str(&std::fs::read_to_string(home.join("argv.json")).unwrap())
                 .unwrap();
-        for flag in ["--approve", "--no-skills", "--local-only"] {
+        for flag in ["--approve", "--no-skills", "--local-only", "snapshot"] {
             assert!(argv.contains(&flag.to_string()), "{flag} in {argv:?}");
         }
         let at = argv.iter().position(|x| x == "--extension").unwrap();

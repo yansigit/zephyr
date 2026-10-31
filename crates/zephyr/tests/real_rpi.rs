@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 use zephyr::channel::{Channel, Inbound, Outbound};
 use zephyr::config::Config;
 
-const RPI: &str = "/home/user/Projects/.always-on/rpi-0.14.0/bin/rpi";
+const RPI: &str = "/home/user/Projects/.always-on/rpi-0.15.0/bin/rpi";
 
 struct TestChannel {
     feed: tokio::sync::Mutex<mpsc::Receiver<Inbound>>,
