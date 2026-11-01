@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/zephyr", "crates/zephyr-policy"]
+members = ["crates/zephyr", "crates/zephyr-cursor", "crates/zephyr-policy"]
 resolver = "2"
 
 [workspace.package]

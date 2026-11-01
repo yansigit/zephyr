@@ -18,8 +18,8 @@ starts the container, signs in the providers you pick, sets the failover order a
 then runs `zephyr doctor`.
 
 Providers: OpenCode Go, Antigravity, ChatGPT/Codex, Claude (through the Claude Agent SDK), Cursor
-(chat only) and the Anthropic API key. Each sign-in is an account under `~/.zephyr/accounts/<name>/`,
-listed in `[[account]]` in `~/.zephyr-daemon/zephyr.toml`; when one account is rate limited, the next takes over.
+(through its agent service, tools included) and the Anthropic API key. Each sign-in is an account
+under `~/.zephyr/accounts/<name>/`, listed in `[[account]]` in `~/.zephyr-daemon/zephyr.toml`; when one account is rate limited, the next takes over.
 
 Without prompts:
 
@@ -137,8 +137,9 @@ using a subscription unattended; check that your use fits them.
 ## Building the image
 
 `zephyr up --build` builds `deploy/Dockerfile` from pinned sources: this repo, `rpi-providers` from
-`yansigit/rpi-package`, `rpi-cursor-lite` and `rpi-claude-agent` from `yansigit/rpi-provider-plugins`,
-and the upstream `rpi` 0.15.0 release (sha256 checked). Your `gh auth token` goes in as the BuildKit
+`yansigit/rpi-package`, the Cursor provider from `crates/zephyr-cursor`, `rpi-claude-agent` from
+`yansigit/rpi-provider-plugins`, and the upstream `rpi` 0.15.0 release (sha256 checked). Your `gh
+auth token` goes in as the BuildKit
 secret `gh_token`, which is never stored in a layer. The provider sources are pinned to commit SHAs
 by the build args (`RPI_PACKAGE_REF`, `PLUGINS_REF`); local checkouts can stand in for them with
 `--build-context rpi-package=<dir> --build-context provider-plugins=<dir>` (see the Dockerfile).

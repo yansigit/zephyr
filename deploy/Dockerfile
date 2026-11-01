@@ -48,31 +48,29 @@ RUN --mount=type=secret,id=gh_token fetch "$PLUGINS_REPO" "$PLUGINS_REF"
 FROM scratch AS provider-plugins
 COPY --from=provider-plugins-git /src /
 
-# zephyr, zephyr-policy, librpi_providers.so and librpi_mcp_adapter.so.
+# zephyr, zephyr-policy, zephyr-cursor, librpi_providers.so and librpi_mcp_adapter.so.
 FROM toolchain AS rust
 COPY Cargo.toml Cargo.lock /src/zephyr/
 COPY crates /src/zephyr/crates
 COPY --from=rpi-package / /src/rpi-package
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    cd /src/zephyr && cargo build --release --locked -p zephyr -p zephyr-policy \
+    cd /src/zephyr && cargo build --release --locked -p zephyr -p zephyr-policy -p zephyr-cursor \
     && cd /src/rpi-package && cargo build --release --locked -p rpi-providers -p rpi-mcp-adapter \
     && mkdir -p /out/bin /out/lib /out/ext \
     && cp /src/zephyr/target/release/zephyr /out/bin/ \
     && cp /src/zephyr/target/release/libzephyr_policy.so /out/lib/ \
+    && cp /src/zephyr/target/release/libzephyr_cursor.so /out/ext/ \
     && cp /src/rpi-package/target/release/librpi_providers.so /out/ext/ \
     && cp /src/rpi-package/target/release/librpi_mcp_adapter.so /out/ext/
 
-# rpi-cursor-lite and rpi-claude-agent: each package's stage.sh builds its cdylib and worker and
-# installs the lockfile-pinned node_modules (npm ci --ignore-scripts, checked against the lockfiles' hashes).
+# rpi-claude-agent: its stage.sh builds the cdylib and worker and installs the lockfile-pinned
+# node_modules (npm ci --ignore-scripts, checked against the lockfiles' hashes). Cursor is not a
+# staged package any more: crates/zephyr-cursor builds libzephyr_cursor.so in the rust stage.
 FROM toolchain AS plugins
 COPY --from=provider-plugins / /src/plugins
 WORKDIR /src/plugins
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/root/.npm \
-    for d in packages/rpi-cursor-sdk/worker packages/rpi-cursor-sdk/runtime; do \
-      [ ! -f "$d/package-lock.json" ] || (cd "$d" && npm ci --ignore-scripts --no-audit --no-fund); \
-    done \
-    && packages/rpi-cursor-lite/scripts/stage.sh /out/ext/rpi-cursor-lite \
-    && packages/rpi-claude-agent/scripts/stage.sh /out/ext/rpi-claude-agent
+    packages/rpi-claude-agent/scripts/stage.sh /out/ext/rpi-claude-agent
 
 # The pinned upstream rpi release, checked against its published sha256.
 FROM ubuntu:24.04 AS rpi

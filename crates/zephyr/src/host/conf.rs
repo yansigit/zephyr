@@ -13,9 +13,12 @@ use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
 pub const EXTENSIONS: [&str; 4] = [
     "/opt/zephyr/ext/librpi_providers.so",
     "/opt/zephyr/ext/librpi_mcp_adapter.so",
-    "/opt/zephyr/ext/rpi-cursor-lite/librpi_cursor_lite.so",
+    "/opt/zephyr/ext/libzephyr_cursor.so",
     "/opt/zephyr/ext/rpi-claude-agent/librpi_claude_agent.so",
 ];
+
+/// Image extensions a newer image no longer ships; `add_image_extensions` drops them.
+const RETIRED_EXTENSIONS: [&str; 1] = ["/opt/zephyr/ext/rpi-cursor-lite/librpi_cursor_lite.so"];
 
 /// The daemon's files, which `__file` may read and write. In the container they live in
 /// `/var/lib/zephyr` (on the host `~/.zephyr-daemon`), which only root can enter.
@@ -427,7 +430,8 @@ pub fn order_accounts(doc: &mut DocumentMut, names: &[String]) -> anyhow::Result
 /// Adds to `doc` (zephyr.toml) the image's extensions not offered before, keeping the list in
 /// `EXTENSIONS` order so an upgraded config matches a fresh one, and records every image extension
 /// as offered in `host` (host.toml's `offered_extensions`): one the owner removes stays removed.
-/// Without a record yet, what the config lists counts as offered. True when `doc` changed.
+/// Without a record yet, what the config lists counts as offered. Retired image extensions are
+/// dropped. True when `doc` changed.
 pub fn add_image_extensions(doc: &mut DocumentMut, host: &mut DocumentMut) -> bool {
     let strings = |item: Option<&Item>| -> Vec<String> {
         item.and_then(Item::as_array)
@@ -454,13 +458,16 @@ pub fn add_image_extensions(doc: &mut DocumentMut, host: &mut DocumentMut) -> bo
     let Some(list) = list.as_array_mut() else {
         return false;
     };
-    let mut entries: Vec<toml_edit::Value> = list.iter().cloned().collect();
+    let retired =
+        |v: &toml_edit::Value| v.as_str().is_some_and(|s| RETIRED_EXTENSIONS.contains(&s));
+    let mut entries: Vec<toml_edit::Value> = list.iter().filter(|v| !retired(v)).cloned().collect();
+    let dropped = entries.len() != list.len();
     for e in new {
         if !entries.iter().any(|v| v.as_str() == Some(e)) {
             entries.push(toml_edit::Value::from(e));
         }
     }
-    if entries.len() == list.len() {
+    if !dropped && entries.len() == list.len() {
         return false;
     }
     // Stable: the image's paths sort into EXTENSIONS order, any the owner added keep their order
@@ -580,6 +587,22 @@ model = "p/m"
         assert_eq!(extension_args(&doc).len(), 2 * EXTENSIONS.len());
         let cfg: crate::config::Config = toml::from_str(&doc.to_string()).unwrap();
         assert_eq!(cfg.extensions.len(), EXTENSIONS.len());
+    }
+
+    #[test]
+    fn retired_image_extensions_are_dropped() {
+        let mut doc: DocumentMut = format!(
+            "extensions = [\"{}\", \"/opt/mine.so\"]\n",
+            RETIRED_EXTENSIONS[0]
+        )
+        .parse()
+        .unwrap();
+        assert!(add_image_extensions(&mut doc, &mut DocumentMut::new()));
+        let list = doc.get("extensions").and_then(Item::as_array).unwrap();
+        let paths: Vec<_> = list.iter().filter_map(|v| v.as_str()).collect();
+        let mut want: Vec<&str> = EXTENSIONS.to_vec();
+        want.push("/opt/mine.so");
+        assert_eq!(paths, want);
     }
 
     #[test]

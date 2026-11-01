@@ -4,7 +4,7 @@ home = "/zephyr"                      # state.db, sessions/, zephyr.sock; the ch
 agent_dir = "/zephyr/.rpi/agent"      # RPI_CODING_AGENT_DIR: models.json and credentials
 model = "anthropic/claude-sonnet-5"
 # policy_plugin = "/usr/local/lib/libzephyr_policy.so"   # refuse prompts unless it loads
-# extensions = ["/opt/zephyr/ext/librpi_providers.so", "/opt/zephyr/ext/librpi_mcp_adapter.so", "/opt/zephyr/ext/rpi-cursor-lite/librpi_cursor_lite.so", "/opt/zephyr/ext/rpi-claude-agent/librpi_claude_agent.so"]   # baked into the image; each loads with --extension after policy_plugin
+# extensions = ["/opt/zephyr/ext/librpi_providers.so", "/opt/zephyr/ext/librpi_mcp_adapter.so", "/opt/zephyr/ext/libzephyr_cursor.so", "/opt/zephyr/ext/rpi-claude-agent/librpi_claude_agent.so"]   # baked into the image; each loads with --extension after policy_plugin
 # timezone = "Asia/Seoul"   # IANA zone for /job cron schedules; default: the system time zone
 
 # Optional DM-only Discord adapter. Remove this table to run chat-only.

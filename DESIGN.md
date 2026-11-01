@@ -227,7 +227,7 @@ There are no per-call prompts. These hard limits hold every time:
    - Read-write: `$PROJECTS` at the same path as on the host. Secrets inside it (`.parity-env.sh`, `.parity-lanes/archive`, every `.env*` outside `node_modules`) are covered with empty mounts.
    - Nothing else of your home: `~/.ssh`, `~/.rpi`, `~/.pi` and browser profiles are not mounted. No docker socket.
    - Network: host networking, so the attach port on 127.0.0.1 and the Tailscale webhook address work unchanged.
-   - Providers come only from the image: `deploy/Dockerfile` builds `librpi_providers.so`, `rpi-cursor-lite/` and `rpi-claude-agent/` into `/opt/zephyr/ext/`, and `zephyr.toml` loads them with `extensions`. Do not `rpi install rpi-providers` into `~/.zephyr`. A package installed there loads twice (`zephyr doctor` warns).
+   - Providers come only from the image: `deploy/Dockerfile` builds `librpi_providers.so`, `libzephyr_cursor.so` (this repo, §4.7.2) and `rpi-claude-agent/` into `/opt/zephyr/ext/`, and `zephyr.toml` loads them with `extensions`. Do not `rpi install rpi-providers` into `~/.zephyr`. A package installed there loads twice (`zephyr doctor` warns).
    - `--restart unless-stopped` replaces the systemd unit; `--init` reaps children and forwards SIGTERM.
 
    This replaced an earlier dedicated Linux account: ACLs over 2.2M files were slow to apply and, on eCryptfs, unreliable to remove.
@@ -290,6 +290,34 @@ There are no per-call prompts. These hard limits hold every time:
 - **Why nothing re-execs.** No daemon-level setting changed, so the plan is not §4.10's re-exec: the `[[account]]` row is read where it is used, and the router's 5 s config tick loads the new file. A login into the account the child is already running on leaves a newer `auth.json` than the child's stamp, which is exactly the re-login branch of §4.10: the router restarts the child on the same session (`--session-id main`) when idle, never mid-turn. A brand-new account is not a re-exec, but it is not always free of a restart either: `reload::diff` answers `(None, Some(_))` with `Plan::RestartChild`, so the first account of an empty install — `/login` into a gateway with no `[[account]]` — does restart the child, once, when it is idle. With a pool already there the child starts on the new account the first time the pool picks it, by `/model`, the TUI's model picker (§4.3.2) or a failover (§4.9), and that pick is what restarts it then.
 - A login runs as the agent's uid in the agent's home, like every child (§4.4); the registry and the `zephyr.toml` edit are the daemon's.
 
+#### 4.7.2 The Cursor provider
+
+The `cursor` provider is this repo's own rpi plugin, `crates/zephyr-cursor` (`libzephyr_cursor.so`),
+not a staged package. It registers through `rpi-plugin-sdk`'s streaming-provider bridge, and its
+manifest lists the models it serves (rpi 0.14's manifest has no `replaceCatalog`). It talks to Cursor's agent service
+directly (Connect over HTTP/2, protobuf), because the package it replaced (`rpi-cursor-lite`) kept
+the request text-only: a Cursor model reached through it could never call a tool, which is all the
+old `Cursor (chat only)` label admitted.
+
+- **One `Run` per turn.** Every request carries the whole conversation as `root_prompt_messages_json`
+  blobs rebuilt from rpi's own history (§4.1's messages), plus this turn's user text (or a fixed
+  continuation prompt when the history ends on a tool result). The provider keeps no server-side
+  session, so a child restart or a failover (§4.9) costs only the replay.
+- **The turn ends at the first tool call.** `mcpArgs` becomes rpi's `toolcall_end` with stop reason
+  `toolUse`, the stream is closed, and rpi runs the tool and asks again with the result in the
+  history. No tool result travels back into Cursor's stream, so nothing has to stay alive between
+  turns, and the loop is the same one every other provider uses.
+- **Tools are the only tools.** They are advertised as Cursor MCP tools named `zephyr_<tool>`
+  (request context and `mcpTools` both), and the request sets `x-cursor-agent-allowed-tools:
+  mcp_tool_call`, which removes Cursor's own registry. A native tool request that still arrives is
+  answered with an error result rather than left hanging.
+- **Credentials.** rpi resolves the account's key into `opts.api_key` (§4.7: `[[account]]`, `auth.json`);
+  `CURSOR_API_KEY` is the env door for an operator-supplied key. The key is exchanged for a
+  short-lived bearer token (`/auth/exchange_user_api_key`, refreshed at `/auth/refresh`) held in the
+  child's memory for the life of that child. Nothing is written, logged or echoed, and a failed
+  exchange's error names the endpoint and status only — the same rule as every other credential
+  (§4.7.1).
+
 ### 4.8 Operations
 
 - systemd user unit:
@@ -333,6 +361,7 @@ New repo `yansigit/zephyr` (private), local at `/home/user/Projects/zephyr`, a R
 ```
 crates/zephyr/          daemon: router, session manager, store, scheduler, auth keeper, adapters, attach server
 crates/zephyr-policy/   cdylib rpi plugin: tool-call veto, audit, schedule tool, untrusted-content tagging
+crates/zephyr-cursor/   cdylib rpi plugin: the Cursor agent-service provider, tools over MCP (§4.7.2)
 deploy/                 Dockerfile, zephyr.toml.example (host commands: crates/zephyr/src/host/)
 ```
 

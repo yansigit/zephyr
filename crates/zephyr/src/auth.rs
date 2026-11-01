@@ -78,7 +78,7 @@ pub const PROVIDERS: [Provider; 6] = [
     },
     Provider {
         id: "cursor",
-        label: "Cursor (chat only)",
+        label: "Cursor",
         kind: Kind::Key,
     },
     Provider {

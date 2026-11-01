@@ -338,14 +338,14 @@ mod tests {
         let cfg: Config = toml::from_str(base).unwrap();
         assert!(cfg.extensions.is_empty());
         let cfg: Config = toml::from_str(&format!(
-            "{base}extensions = ['/opt/zephyr/ext/librpi_providers.so', '/opt/zephyr/ext/rpi-cursor-lite/librpi_cursor_lite.so']\n"
+            "{base}extensions = ['/opt/zephyr/ext/librpi_providers.so', '/opt/zephyr/ext/libzephyr_cursor.so']\n"
         ))
         .unwrap();
         assert_eq!(
             cfg.extensions,
             [
                 PathBuf::from("/opt/zephyr/ext/librpi_providers.so"),
-                PathBuf::from("/opt/zephyr/ext/rpi-cursor-lite/librpi_cursor_lite.so"),
+                PathBuf::from("/opt/zephyr/ext/libzephyr_cursor.so"),
             ]
         );
     }
