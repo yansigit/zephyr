@@ -1,0 +1,80 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+Zephyr is an always-on personal agent gateway over upstream `rpi --mode rpc`, running in one Docker
+container, reachable from a terminal chat, the stock rpi TUI, Discord and iMessage. DESIGN.md is the
+spec (section numbers like "§4.9" in code comments refer to it); README.md is the user-facing
+command reference. Keep both in step with behaviour changes.
+
+## Commands
+
+```sh
+cargo build                                   # workspace: crates/zephyr, crates/zephyr-policy
+cargo test                                    # all non-ignored tests; needs python3 (tests/fake-rpi.py)
+cargo test -p zephyr --test router            # one integration test file
+cargo test -p zephyr --test router some_name  # one test by name filter
+cargo clippy --all-targets && cargo fmt
+
+# Ignored tests need the pinned real binary at /home/user/Projects/.always-on/rpi-0.15.0/bin/rpi
+cargo test -p zephyr --test real_rpi -- --ignored
+cargo test -p zephyr-policy --test rpi_load -- --ignored
+cargo test -p zephyr --test attach -- --ignored   # drives real `rpi --connect` via tests/drive-connect.py
+
+cargo install --path crates/zephyr && zephyr up --build   # build deploy/Dockerfile and run it locally
+```
+
+`ZEPHYR_CONTAINER` / `ZEPHYR_IMAGE` point the host CLI at another container or image, to test beside a
+live install. Pushing a `v*` tag publishes `ghcr.io/yansigit/zephyr:<version>` (`.github/workflows/image.yml`).
+
+## Architecture
+
+**One binary, two roles.** `crates/zephyr/src/main.rs` checks `host::in_container()` (true when
+`ZEPHYR_IN_CONTAINER` or `ZEPHYR_CONFIG` is set, or `/.dockerenv` exists). On the host it runs the
+setup/ops CLI in `src/host/` (`init`, `up`, `login`, `accounts`, `model`, `config`, ...), which mostly
+shells into the container. In the container it runs the daemon (`run`) and the commands beside it
+(`status`, `doctor`, `chat`, `pause`/`resume`/`reload`, which talk to the daemon over its chat socket).
+`tests/cli.rs` sets `ZEPHYR_CONFIG` to exercise the container role; `tests/host.rs` covers the host role.
+
+**Daemon data flow** (DESIGN §4.1–4.2):
+- Channels (`chat`, `discord`, `imessage`, behind the `Channel` trait / `AnyChannel` in `channel.rs`)
+  write inbound messages to the SQLite inbox (`store.rs`, deduplicated by platform id) before acking.
+- `router.rs` owns everything after that: owner allowlist, dispatching rows into the one shared `main`
+  session as `prompt`/`queue_message` with a `[channel #id]` tag, reading `agent_settled`, writing
+  the outbox (client id = Discord nonce / BlueBubbles tempGuid), budgets, `/stop` `/pause` `/model`
+  `/reload`, and crash reconcile (re-send rows whose text isn't in `get_messages`).
+- `rpc.rs` `Child` wraps one `rpi --mode rpc` child (JSONL). `USED_COMMANDS` must stay a subset of
+  rpi's `ready.supportedCommands`; `doctor` checks it. rpi is pinned to 0.15.x (`RPI_PIN` in
+  main.rs, `deploy/Dockerfile`, and `rpi-plugin-sdk = "=0.15.0"` in zephyr-policy).
+- `pool.rs`: `[[account]]` failover. Each account gets its own `RPI_CODING_AGENT_DIR` under
+  `<home>/accounts/<name>/`; rate-limit detection reads `agent_settled.error`; cooldowns live in `state.db`.
+- `auth_keeper.rs`: refreshes expiring OAuth tokens via `rpi auth refresh` subprocess (not the
+  `oauth` RPC). A new token only binds after a child restart, done when idle.
+- `reload.rs`: live settings. `diff` returns the least disruptive `Plan`: read-in-place, `set_model`,
+  restart the child (same session), or re-exec the daemon. Config edits go through `toml_edit` to keep comments.
+- `scheduler.rs` (cron jobs, run ledger: interrupted runs become `unknown`, never auto-retried),
+  `memory.rs` (git-committed memory files), `attach.rs` (rpi remote JSON-RPC shim so stock
+  `rpi --connect` attaches to `main`).
+- The agent's tools (DESIGN §4.11): the browser, Camoufox and the X desktop are CLIs in the image,
+  run through `bash`. `desktop.rs` keeps Xvfb up when `ZEPHYR_DESKTOP` is set. `send_file` and
+  `schedule` are registered by zephyr-policy (`tools.rs`), collected from the event stream in
+  `rpc::Tally`, and carried out at settle by `tools.rs` here.
+
+Child restarts never happen mid-turn: auth refresh, failover and reload all wait for the settle.
+
+**`crates/zephyr-policy`** is a cdylib rpi plugin loaded with `--extension`. Its `ToolCall` handler
+vetoes hardline commands (`policy.rs` `check`) and appends audit lines to `$ZEPHYR_AUDIT_LOG`. It fails
+closed: any non-`Allow`, malformed event or panic blocks the call.
+
+**Tests** (`crates/zephyr/tests/`) run the daemon against `fake-rpi.py`, a scripted stand-in for rpi
+0.15.0 frames. Its behaviour is driven by marker files in the zephyr home (`hang`, `slow`,
+`stats.json`, `oauth_fail`, ...) and it logs every command to `log.jsonl`; read its docstring before
+adding a test. When rpi's frame shapes matter, update fake-rpi.py to match the real binary.
+
+## Conventions
+
+- Commits: conventional prefix with scope, then a plain-English sentence about the behaviour, e.g.
+  `fix(model): check a model with the target account's rpi --list-models`. Authored as the user, no trailers.
+- Never read tokens into structs or log them; status/doctor report only whether a credential is present.
+- Providers come only from the image (`/opt/zephyr/ext/`, loaded via `extensions`); don't install rpi
+  packages into `~/.zephyr`.

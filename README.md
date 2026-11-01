@@ -85,7 +85,9 @@ example to test beside a live install.
 
 - After a turn that ran a command sending data off the machine (curl or wget with a body, ssh, scp,
   rsync to a host, nc, `git push`, ...), zephyr lists them: `[zephyr] outbound this turn: ...`.
-  Jobs report theirs on the job's channel. Plain downloads are not listed.
+  Jobs report theirs on the job's channel. Plain downloads are not listed. In the agent's browser,
+  typing, uploading and running script on a page count (`agent-browser fill`, `type`, `keyboard`,
+  `upload`, `eval`); plain browsing does not.
 - Notices go to the channel you last wrote from. Under `zephyr attach` they appear as messages in
   the conversation, or at your next attach if none is open.
 - When the agent changes its memory (`memory/USER.md`, `MEMORY.md`), you get the diff. The change
@@ -107,6 +109,38 @@ goes on too long, and you are told why. A job run also stops after 30 minutes.
 from the next message on. `/rules` lists them, `/rule rm 2` removes one. Rules live with the
 daemon, out of the agent's reach, and do not fade when a long conversation is summarised the way
 instructions given in chat can. `/new` starts a fresh conversation; rules and memory carry over.
+
+## The agent's browser and desktop
+
+The image gives the agent a browser and a screen of its own (DESIGN §4.11):
+
+- **Browser.** fingerprint-chromium (ungoogled-chromium with fingerprint patches; Playwright's
+  Chromium on arm64), driven by the `agent-browser` CLI. Its profile is `~/.zephyr/browser`, kept
+  across restarts. It is the agent's, never yours, and holds only the sign-ins you give it (below).
+  A site that still blocks it gets Camoufox, a stealth Firefox, which keeps no sign-ins.
+- **Python.** A read-only environment first on the agent's PATH (`/opt/zephyr/py`: requests,
+  beautifulsoup4, pandas, pypdf, pillow, Camoufox), locked in `deploy/python/uv.lock`, plus `uv` for
+  anything else (`uv run --with`, or a venv of its own; uv's cache lives in `~/.zephyr/.cache/uv`).
+  To add a package for every run, edit `deploy/python/pyproject.toml`, run `uv lock` there, and
+  rebuild.
+- **Desktop.** An Xvfb screen (1920x1080) with openbox, where the browser runs. The agent sees it
+  through screenshots and drives it with `xdotool`.
+- **GPU.** When Docker has the NVIDIA runtime, `zephyr up` passes the GPU in, so the browser's
+  WebGL is the real card instead of software rendering, which bot checks notice.
+- **Watching it, or signing it into a site.** Nothing listens by default. To look, start a one-shot
+  VNC server on 127.0.0.1:5900 and connect a VNC viewer; it exits when you disconnect:
+
+  ```sh
+  docker exec -it -u "$(id -u)" zephyr x11vnc -storepasswd /zephyr/.vnc-passwd   # once
+  docker exec -d -u "$(id -u)" zephyr x11vnc -display :99 -localhost -once -rfbauth /zephyr/.vnc-passwd
+  ```
+
+- **Files and jobs.** The agent's `send_file` tool sends you a file (up to 10 MB: a screenshot, a
+  PDF) with its reply. Its `schedule` tool only proposes a job: you are shown it, and it runs after
+  `/job ok N` (`/job rm N` drops it; `/job list` marks the ones waiting).
+
+A site's terms may forbid automated use; a site that catches the agent can flag the account it is
+signed in as.
 
 ## Where things live
 
