@@ -354,9 +354,12 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
                 vec!["-display", display.as_str()],
             ),
         ] {
-            let out = zephyr::agent::cmd(&mut std::process::Command::new(program))
-                .args(args)
-                .output();
+            let mut cmd = std::process::Command::new(program);
+            // The desktop takes only clients holding its cookie, as the agent's own do.
+            if let Some(auth) = zephyr::desktop::xauthority() {
+                cmd.env("XAUTHORITY", auth);
+            }
+            let out = zephyr::agent::cmd(&mut cmd).args(args).output();
             match out {
                 Ok(o) if o.status.success() => println!("ok   {what} works"),
                 _ => println!("warn {what} does not run ({program})"),
