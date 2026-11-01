@@ -30,7 +30,9 @@ and that `errorMessage` as `agent_settled.error`. A prompt containing `[tool]` f
 one such call of tool NAME with those (flat) args, succeeding, before the reply.
 A `gateway` call plays the policy plugin: it waits up to 5 s for the daemon's answer in
 $ZEPHYR_GATEWAY_DIR/<call id>, consumes it, makes it the tool result, and the reply gets a
-`gateway: <answer>` line per call. A command off the plugin's list is refused at once
+`gateway: <answer>` line per call. It classifies as `zephyr_policy::tools::gateway_kind` does: a
+read (GATEWAY_COMMANDS) and a proposable action (/model P/M, /new, /switch ID, /pause, /reload)
+both wait for the daemon; anything else is refused at once
 ("tool error: ... is not available to the agent"), with no wait. While it waits it answers the commands that need no run
 (as rpi does) and keeps the rest for after; an `abort` ends it with "Operation aborted", and the
 run settles "aborted" with no reply.
@@ -53,6 +55,15 @@ if "--version" in args:
 CATALOG = ["fake/m1", "fake/m2", "other/m3", "opencode-go/alpha"]
 # zephyr_policy::tools::GATEWAY_COMMANDS
 GATEWAY_COMMANDS = ["/status", "/model", "/switch", "/rules", "/memory diff", "/memory log", "/job list"]
+def gateway_kind(c):
+    """zephyr_policy::tools::gateway_kind: "read", "propose" or None."""
+    if c in GATEWAY_COMMANDS:
+        return "read"
+    cmd, _, arg = c.partition(" ")
+    word = arg != "" and all(33 <= ord(ch) <= 126 for ch in arg)
+    ok = {"/new": c == cmd, "/pause": c == cmd, "/reload": c == cmd, "/switch": word,
+          "/model": word and re.fullmatch(r"[^/]+/.+", arg) is not None}.get(cmd, False)
+    return "propose" if ok else None
 if "--list-models" in args:
     while os.path.exists("list_wait"):  # cwd is the home
         time.sleep(0.05)
@@ -217,7 +228,7 @@ def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
     while os.path.exists(os.path.join(home, "tool_wait")):
         time.sleep(0.05)
     aborted = False
-    if name == "gateway" and args.get("command", "").strip() not in GATEWAY_COMMANDS:
+    if name == "gateway" and gateway_kind(args.get("command", "").strip()) is None:
         # As the plugin: refused in the child, with no wait (rpi still reports the start).
         result["isError"] = True
         result["content"] = [{"type": "text", "text": "tool error: %s is not available to the agent"

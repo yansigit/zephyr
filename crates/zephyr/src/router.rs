@@ -450,14 +450,21 @@ impl<'a> Router<'a> {
         ev
     }
 
-    /// The output of a read-only command the agent ran with `gateway` (DESIGN §4.11), checked
-    /// again here: the plugin's list is the agent's side of the boundary, this is the daemon's.
-    /// Each is the same text the owner would get; none restarts or queues anything mid-turn.
-    /// `None`, and nothing run, for a command off the list.
+    /// The answer to a command the agent sent with `gateway` (DESIGN §4.11), checked again here:
+    /// the plugin's check is the agent's side of the boundary, this is the daemon's. A read is
+    /// the same text the owner would get; none restarts or queues anything mid-turn. An action is
+    /// only stored, for the owner's `/ok`. `None`, and nothing run, for anything else.
     fn gateway_reply(&self, command: &str) -> Option<String> {
-        if !zephyr_policy::tools::GATEWAY_COMMANDS.contains(&command) {
-            eprintln!("zephyr: gateway {command:?} is not on the list; not run");
-            return None;
+        use zephyr_policy::tools::Gateway;
+        match zephyr_policy::tools::gateway_kind(command) {
+            None => {
+                eprintln!("zephyr: gateway {command:?} is not on the list; not run");
+                return None;
+            }
+            Some(Gateway::Propose) => {
+                return Some(crate::tools::propose_command(&self.store, command))
+            }
+            Some(Gateway::Read) => {}
         }
         Some(match command {
             "/status" => self.status(),
@@ -681,8 +688,15 @@ impl<'a> Router<'a> {
             log(self.store.set_status(id, "dropped").map_err(Into::into));
             return;
         }
-        let text = m.text.trim();
-        let reply = if let Some((reply, rules_changed)) =
+        let decided = crate::tools::decide(&self.store, m.text.trim());
+        // An approved proposal runs exactly as if the owner had typed it.
+        let text = match &decided {
+            Some(Ok(command)) => command.as_str(),
+            _ => m.text.trim(),
+        };
+        let reply = if let Some(Err(reply)) = &decided {
+            reply.clone()
+        } else if let Some((reply, rules_changed)) =
             crate::memory::command(&self.cfg.home, self.cfg.state_dir(), text)
         {
             // rpi reads AGENTS.md once, at start: a fresh child on the same session loads the rules.

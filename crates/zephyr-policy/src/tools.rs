@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 /// Discord's upload limit for a bot in a server without boosts, and so the cap for every channel.
 pub const MAX_FILE: u64 = 10 * 1024 * 1024;
 
-/// The slash commands the agent may run through `gateway`: read-only ones only. The owner's
-/// approvals (`/memory ok`, `/job ok`, `/rule`, `/login`, `/resume`) stay out, so injected text
-/// cannot approve itself (DESIGN §4.5, §4.6). The daemon checks this list again.
+/// The read-only slash commands the agent may run through `gateway`. The owner's approvals
+/// (`/memory ok`, `/job ok`, `/rule`, `/login`, `/resume`, `/ok`) stay out, so injected text
+/// cannot approve itself (DESIGN §4.5, §4.6). The daemon checks [`gateway_kind`] again.
 pub const GATEWAY_COMMANDS: &[&str] = &[
     "/status",
     "/model",
@@ -29,6 +29,38 @@ pub const GATEWAY_COMMANDS: &[&str] = &[
     "/memory log",
     "/job list",
 ];
+
+/// What a `gateway` command is to the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gateway {
+    /// Runs at once and returns its output.
+    Read,
+    /// An action the daemon only stores, until the owner's `/ok N` runs it.
+    Propose,
+}
+
+/// `Some` for a command the agent may send through `gateway`, in these exact shapes only:
+/// [`GATEWAY_COMMANDS`] are read; `/model PROVIDER/MODEL`, `/new`, `/switch ID`, `/pause` and
+/// `/reload` are proposed. Approvals, and `/stop`, are neither. The argument is one printable
+/// ASCII word, so the owner's approval notice shows exactly what would run.
+pub fn gateway_kind(command: &str) -> Option<Gateway> {
+    if GATEWAY_COMMANDS.contains(&command) {
+        return Some(Gateway::Read);
+    }
+    let (cmd, arg) = command.split_once(' ').unwrap_or((command, ""));
+    let word = !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_graphic());
+    let ok = match cmd {
+        "/new" | "/pause" | "/reload" => command == cmd,
+        "/switch" => word,
+        "/model" => {
+            word && arg
+                .split_once('/')
+                .is_some_and(|(p, m)| !p.is_empty() && !m.is_empty())
+        }
+        _ => false,
+    };
+    ok.then_some(Gateway::Propose)
+}
 
 /// Where the daemon drops each `gateway` answer, as `<dir>/<tool call id>`.
 pub const GATEWAY_DIR_ENV: &str = "ZEPHYR_GATEWAY_DIR";
@@ -73,18 +105,21 @@ pub const TOOLS: [(&str, &str, &str, ToolExecuteFn); 3] = [
          model, channels, spend), /model (the models you can switch to), /switch (saved \
          conversations), /rules (the owner's standing rules), /memory diff (a memory change \
          waiting for the owner), /memory log (recent memory commits), /job list (scheduled jobs). \
-         Anything that changes settings or approves something is the owner's to type.",
+         Or propose one of these actions for the owner: /model PROVIDER/MODEL, /new, /switch ID, \
+         /pause, /reload. A proposal runs only after the owner approves it with /ok; approving \
+         anything is always the owner's to type.",
         r#"{"type":"object","properties":{"command":{"type":"string","description":"The command, exactly as listed, e.g. /status"}},"required":["command"]}"#,
         gateway_execute,
     ),
 ];
 
-/// `gateway`'s check: the command must be on [`GATEWAY_COMMANDS`], exactly.
+/// `gateway`'s check: the command must have a [`gateway_kind`].
 pub fn gateway(params: &Value) -> Result<String, String> {
     let command = text(params, "command")?.trim();
-    if !GATEWAY_COMMANDS.contains(&command) {
+    if gateway_kind(command).is_none() {
         return Err(format!(
-            "{command} is not available to the agent; it can run {}",
+            "{command} is not available to the agent; it can run {}, and propose \
+             /model PROVIDER/MODEL, /new, /switch ID, /pause or /reload",
             GATEWAY_COMMANDS.join(", ")
         ));
     }
@@ -337,6 +372,55 @@ mod tests {
         for bad in ["", "../x", "a/b", "a.b"] {
             assert_eq!(gateway_file(dir, bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn gateway_reads_proposes_or_refuses() {
+        for read in GATEWAY_COMMANDS {
+            assert_eq!(gateway_kind(read), Some(Gateway::Read), "{read}");
+        }
+        for action in [
+            "/model fake/m2",
+            "/new",
+            "/switch 1a2b",
+            "/pause",
+            "/reload",
+        ] {
+            assert_eq!(gateway_kind(action), Some(Gateway::Propose), "{action}");
+        }
+        for never in [
+            "/memory ok",
+            "/memory undo",
+            "/job ok 1",
+            "/job rm 1",
+            "/job add a | b | c",
+            "/job run 1",
+            "/rule x",
+            "/rule rm 1",
+            "/login",
+            "/login anthropic",
+            "/resume",
+            "/ok 1",
+            "/no 1",
+            "/stop",
+            "/new x",
+            "/new ",
+            "/pause now",
+            "/model fake",
+            "/model /m2",
+            "/model fake/ m2",
+            "/model fake/m2 x",
+            "/model fake/m\u{202e}2",
+            "/switch ",
+            "/switch a b",
+            "hello",
+        ] {
+            assert_eq!(gateway_kind(never), None, "{never}");
+        }
+        assert_eq!(
+            gateway(&json!({ "command": "/model fake/m2" })).unwrap(),
+            "/model fake/m2"
+        );
     }
 
     #[test]

@@ -151,6 +151,47 @@ fn propose(
     Ok(())
 }
 
+/// Stores an action the agent proposed through `gateway` and asks the owner, on the channel the
+/// run answers. Returns the tool's answer. Nothing runs until `/ok`.
+pub fn propose_command(store: &Store, command: &str) -> String {
+    let asked = store.propose_command(command).and_then(|id| {
+        let ask = format!(
+            "[zephyr] the agent asks to run {command} (#{id}); /ok {id} runs it, /no {id} drops it"
+        );
+        store.notify_last_owner(&ask).map(|()| id)
+    });
+    match asked {
+        Ok(id) => format!("proposed as #{id}; it runs only if the owner approves with /ok {id}"),
+        Err(e) => format!("[zephyr] proposing {command} failed: {e}"),
+    }
+}
+
+/// The owner's `/ok N` or `/no N`. `Some(Ok(command))` is the approved command, for the router to
+/// run as the owner's own; `Some(Err(reply))` is the whole answer; `None` for any other text.
+pub fn decide(store: &Store, text: &str) -> Option<Result<String, String>> {
+    let (verb, n) = text.split_once(' ').unwrap_or((text, ""));
+    let status = match verb {
+        "/ok" => "done",
+        "/no" => "dropped",
+        _ => return None,
+    };
+    let n = n.trim();
+    let Ok(id) = n.trim_start_matches('#').parse::<i64>() else {
+        return Some(Err(format!(
+            "[zephyr] {verb} takes a proposal number, e.g. {verb} 3"
+        )));
+    };
+    Some(match store.settle_proposal(id, status) {
+        Ok(Some(command)) if status == "done" => Ok(command),
+        Ok(Some(command)) => Err(format!("[zephyr] dropped #{id} ({command})")),
+        Ok(None) => Err(format!(
+            "[zephyr] no proposal #{id} is waiting: it was never made, is already handled, or is \
+             older than 24 h"
+        )),
+        Err(e) => Err(format!("[zephyr] reading proposal #{id} failed: {e}")),
+    })
+}
+
 /// Drops a sent (or given up) file's copy: its whole per-file dir under `<state>/files`.
 pub fn discard(copy: &str) {
     let dir = Path::new(copy).parent();
