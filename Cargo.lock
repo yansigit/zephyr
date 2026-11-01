@@ -3036,7 +3036,7 @@ dependencies = [
 
 [[package]]
 name = "zephyr"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "croner",
@@ -3066,7 +3066,7 @@ dependencies = [
 
 [[package]]
 name = "zephyr-cursor"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3091,7 +3091,7 @@ dependencies = [
 
 [[package]]
 name = "zephyr-policy"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "rpi-plugin-sdk",
  "serde",
