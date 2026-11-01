@@ -213,7 +213,7 @@ async fn attempt_once(
     session: &str,
     account: Option<&crate::config::Account>,
 ) -> (&'static str, String, bool) {
-    let mut child = match Child::spawn_as(cfg, session, account).await {
+    let mut child = match Child::spawn_as(cfg, Some(session), account).await {
         Ok(child) => child,
         Err(e) => return ("failed", format!("{label} could not start: {e:#}"), false),
     };
@@ -244,23 +244,32 @@ async fn attempt_once(
     }
     let to = (run.job.channel.clone(), run.job.recipient.clone());
     crate::tools::apply(store, cfg, &tally.requests, Some(to));
-    if let Some(a) = account {
-        let _ = store.add_account_spend(&a.name, tally.used);
-    }
-    let crossed = store
-        .charge(cfg.budget.as_ref(), tally.used)
-        .unwrap_or_else(|e| {
-            eprintln!("zephyr: recording job spend failed: {e}");
-            false
-        });
+    let crossed = book(store, cfg, account, tally.used);
     child.stop().await;
     (out.0, out.1, crossed)
+}
+
+/// Adds a side run's usage (a job's, a `/btw`'s) to today's spend and `account`'s. Returns true
+/// when it crossed a budget limit; the caller sends `BUDGET_NOTICE`.
+pub(crate) fn book(
+    store: &Store,
+    cfg: &Config,
+    account: Option<&crate::config::Account>,
+    used: (i64, f64),
+) -> bool {
+    if let Some(a) = account {
+        let _ = store.add_account_spend(&a.name, used);
+    }
+    store.charge(cfg.budget.as_ref(), used).unwrap_or_else(|e| {
+        eprintln!("zephyr: recording spend failed: {e}");
+        false
+    })
 }
 
 /// Sends the prompt and waits for the run to settle, counting its events into `tally`, and
 /// aborts it at `max_turns`. The inner result is the final assistant text, or why the run
 /// ended without one.
-async fn prompt(
+pub(crate) async fn prompt(
     cfg: &Config,
     child: &mut Child,
     text: &str,

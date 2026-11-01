@@ -73,6 +73,8 @@ channel: `/model` shows the models, `/model PROVIDER/MODEL` switches (to the acc
 provider), `/status` shows the agent's account and model, `/reload` re-reads the files, and `/new`
 starts a fresh conversation (memory and rules carry over; the old one stays in `sessions/`), and
 `/switch` lists the earlier ones and `/switch ID` goes back to one.
+`/btw QUESTION` asks a side question about the conversation, even mid-reply: a throwaway agent with
+no tools answers it as `[btw] …` from a copy of the conversation, which is left as is.
 `/login` signs an account in from here: `/login` lists the provider ids, `/login PROVIDER [ACCOUNT]
 [MODEL]` starts an OAuth sign-in and needs no re-exec (a key or a token is refused — it is typed in
 `zephyr attach`, which masks it), and `/login cancel [ID|PROVIDER]` stops the ones you gave up on.
