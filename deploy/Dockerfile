@@ -15,7 +15,7 @@ ARG RPI_SHA256_ARM64=59b21b680bb677f51d308080d8ee0688d0c2f3b2936ce061d3bbfd70a9c
 ARG RPI_PACKAGE_REPO=https://github.com/yansigit/rpi-package.git
 ARG RPI_PACKAGE_REF=11e8ac183cf582144b8562ea19ec6f2620553cc3 # feat/providers-openai-codex: main cabdb15 + Antigravity, OpenCode Go, Codex
 ARG PLUGINS_REPO=https://github.com/yansigit/rpi-provider-plugins.git
-ARG PLUGINS_REF=33e3cbb0bc5f410dfa4df3626ea930a666b90bac # main as of 2026-10-30
+ARG PLUGINS_REF=9e8abac4ace5bc02cda5d6586b59eed12252cade # main as of 2026-10-31: claude-agent on Claude Code's own prompt and sessions
 
 # Rust plus node 24 (the plugin stage scripts use both). Bookworm's glibc (2.36) is older than
 # the final image's (2.39), so what is built here runs there.
