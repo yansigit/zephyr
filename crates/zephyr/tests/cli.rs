@@ -61,7 +61,7 @@ fn daemon(cfg: &Path, home: &Path) -> Daemon {
     let start = Instant::now();
     while !sock.exists() {
         assert!(
-            start.elapsed() < Duration::from_secs(10),
+            start.elapsed() < Duration::from_secs(30),
             "daemon never listened"
         );
         std::thread::sleep(Duration::from_millis(50));
@@ -371,10 +371,12 @@ fn child_env(home: &Path) -> String {
         .replace('\0', "\n")
 }
 
+/// Polls `done` until it holds. The deadline is generous: a whole-suite run (many daemons and
+/// fake children at once) can take far longer than one test alone, and waiting costs nothing.
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     let start = Instant::now();
     while !done() {
-        assert!(start.elapsed() < Duration::from_secs(10), "{what}");
+        assert!(start.elapsed() < Duration::from_secs(30), "{what}");
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -475,6 +477,54 @@ fn a_changed_secret_reexecs_the_daemon_in_place() {
 }
 
 #[test]
+fn a_background_command_outlives_a_reexec_and_reports() {
+    let (home, cfg) = setup("reexec-proc", "[agent]\nenv = [\"ZEPHYR_CLI_RELOAD\"]\n");
+    let uid = std::fs::metadata(&home).unwrap().uid();
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(&cfg, format!("{text}[owners]\nchat = [\"{uid}\"]\n")).unwrap();
+    std::fs::write(home.join("secrets.env"), "ZEPHYR_CLI_RELOAD=one\n").unwrap();
+    let running = daemon(&cfg, &home);
+    wait_for("the child has the secret", || {
+        child_env(&home).contains("ZEPHYR_CLI_RELOAD=one")
+    });
+    let mut chat = std::os::unix::net::UnixStream::connect(home.join("zephyr.sock")).unwrap();
+    writeln!(
+        chat,
+        r#"{{"id": "p-1", "text": "[call exec {{\"command\": \"sleep 4; echo survived\", \"background\": true}}] go"}}"#
+    )
+    .unwrap();
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(&chat));
+    let moved = lines.find(|l| {
+        l.as_ref()
+            .map_or(true, |l| l.contains("Moved to the background"))
+    });
+    assert!(
+        moved.is_some_and(|l| l.is_ok()),
+        "the command was not backgrounded"
+    );
+
+    std::fs::write(home.join("secrets.env"), "ZEPHYR_CLI_RELOAD=two\n").unwrap();
+    stdout(&zephyr(&cfg, &["reload"]));
+    wait_for("the re-exec", || {
+        child_env(&home).contains("ZEPHYR_CLI_RELOAD=two")
+    });
+    // The old process's socket closed on exec; a reply sent meanwhile waits for this one.
+    let chat = std::os::unix::net::UnixStream::connect(home.join("zephyr.sock")).unwrap();
+    chat.set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(&chat));
+    let report = lines.find(|l| {
+        l.as_ref()
+            .map_or(true, |l| l.contains("process #1 exited 0"))
+    });
+    assert!(
+        report.is_some_and(|l| l.is_ok_and(|l| l.contains("survived"))),
+        "the adopted command did not report after the re-exec"
+    );
+    drop(running);
+}
+
+#[test]
 fn a_reexec_waits_for_the_running_reply() {
     let (home, cfg) = setup("reexec-busy", "[agent]\nenv = [\"ZEPHYR_CLI_RELOAD\"]\n");
     let uid = std::fs::metadata(&home).unwrap().uid();
@@ -487,7 +537,7 @@ fn a_reexec_waits_for_the_running_reply() {
         child_env(&home).contains("ZEPHYR_CLI_RELOAD=one")
     });
     let mut chat = std::os::unix::net::UnixStream::connect(home.join("zephyr.sock")).unwrap();
-    chat.set_read_timeout(Some(Duration::from_secs(15)))
+    chat.set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
     writeln!(chat, r#"{{"id": "busy-1", "text": "say: finished"}}"#).unwrap();
     let prompts = || {
@@ -520,4 +570,105 @@ fn a_reexec_waits_for_the_running_reply() {
     });
     assert_eq!(prompts(), 2, "each message went to rpi once");
     drop(running);
+}
+
+/// `zephyr supervise`, as the image runs it; stopped on drop with SIGTERM, which it passes on.
+struct Supervisor(Child);
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        // SAFETY: a plain syscall to our own child.
+        unsafe { libc::kill(self.0.id() as i32, libc::SIGTERM) };
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(20) {
+            if let Ok(Some(_)) = self.0.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The processes `pid` started that are still its children.
+fn children(pid: u32) -> Vec<i32> {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|p| p.parse().ok())
+        .collect()
+}
+
+#[test]
+fn a_background_command_outlives_a_daemon_crash_under_supervise() {
+    let (home, cfg) = setup("supervise", "");
+    let uid = std::fs::metadata(&home).unwrap().uid();
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(&cfg, format!("{text}[owners]\nchat = [\"{uid}\"]\n")).unwrap();
+    let mut sup = Supervisor(
+        Command::new(env!("CARGO_BIN_EXE_zephyr"))
+            .arg("supervise")
+            .env("ZEPHYR_CONFIG", &cfg)
+            .spawn()
+            .unwrap(),
+    );
+    let sup_pid = sup.0.id();
+    let daemon_pid = || children(sup_pid).first().copied();
+    wait_for("the daemon came up", || {
+        daemon_pid().is_some() && home.join("zephyr.sock").exists()
+    });
+    let first = daemon_pid().unwrap();
+    let mut chat = std::os::unix::net::UnixStream::connect(home.join("zephyr.sock")).unwrap();
+    writeln!(
+        chat,
+        r#"{{"id": "p-1", "text": "[call exec {{\"command\": \"sleep 8; echo survived-crash\", \"background\": true}}] go"}}"#
+    )
+    .unwrap();
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(&chat));
+    let moved = lines.find(|l| {
+        l.as_ref()
+            .map_or(true, |l| l.contains("Moved to the background"))
+    });
+    assert!(
+        moved.is_some_and(|l| l.is_ok()),
+        "the command was not backgrounded"
+    );
+
+    // SAFETY: a plain syscall to the daemon this test's supervisor started.
+    unsafe { libc::kill(first, libc::SIGKILL) };
+    wait_for("the supervisor started the daemon again", || {
+        daemon_pid().is_some_and(|p| p != first)
+    });
+    assert!(
+        sup.0.try_wait().unwrap().is_none(),
+        "the supervisor itself stays up"
+    );
+    let start = Instant::now();
+    let chat = loop {
+        // The new daemon listens once it is up; until then the old socket refuses.
+        match std::os::unix::net::UnixStream::connect(home.join("zephyr.sock")) {
+            Ok(c) => break c,
+            Err(_) if start.elapsed() < Duration::from_secs(30) => {
+                std::thread::sleep(Duration::from_millis(100))
+            }
+            Err(e) => panic!("the new daemon never listened: {e}"),
+        }
+    };
+    chat.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    writeln!(&chat, r#"{{"id": "p-2", "text": "/process list"}}"#).unwrap();
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(&chat));
+    let listed = lines.find(|l| l.as_ref().map_or(true, |l| l.contains("processes:")));
+    assert!(
+        listed.is_some_and(|l| l.is_ok_and(|l| l.contains("#1 running"))),
+        "the command was not adopted after the crash"
+    );
+    // Not the new daemon's child: its exit code comes from the wrapper's record.
+    let report = lines.find(|l| l.as_ref().map_or(true, |l| l.contains("process #1 exited")));
+    let report = report.and_then(|l| l.ok()).unwrap_or_default();
+    assert!(
+        report.contains("process #1 exited 0") && report.contains("survived-crash"),
+        "{report}"
+    );
 }

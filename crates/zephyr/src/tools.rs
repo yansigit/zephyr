@@ -1,7 +1,7 @@
-//! The daemon's half of the agent's `send_file`, `schedule` and `gateway` tools (DESIGN §4.11).
+//! The daemon's half of the agent's `send_file`, `schedule`, `gateway` and `task` tools (DESIGN §4.11, §4.12).
 //! The policy plugin registers them and checks their arguments in the child. `send_file` and
 //! `schedule` calls reach the daemon in the run's tally, read from rpi's event stream, and are
-//! carried out here when it settles; a `gateway` call is answered as soon as it starts.
+//! carried out here when it settles; a `gateway` or `task` call is answered as soon as it starts.
 
 use crate::config::Config;
 use crate::store::Store;
@@ -27,7 +27,16 @@ pub fn gateway_call(ev: &Value) -> Option<(&str, &str)> {
     Some((id, ev["args"]["command"].as_str().unwrap_or("").trim()))
 }
 
-/// Hands `text` to the waiting `gateway` call `call_id`: written as the agent, then renamed into
+/// `(tool call id, args)` when `ev` starts a `task` call (DESIGN §4.12). It waits for its
+/// answer the way a `gateway` call does; the args are checked again by whoever answers.
+pub fn task_call(ev: &Value) -> Option<(&str, &Value)> {
+    if ev["type"] != "tool_execution_start" || ev["toolName"] != "task" {
+        return None;
+    }
+    Some((ev["toolCallId"].as_str()?, &ev["args"]))
+}
+
+/// Hands `text` to the waiting `gateway` or `task` call `call_id`: written as the agent, then renamed into
 /// place so the plugin never reads half of it.
 pub fn answer_gateway(cfg: &Config, call_id: &str, text: &str) {
     let Some(path) = zephyr_policy::tools::gateway_file(&gateway_dir(cfg), call_id) else {

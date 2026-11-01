@@ -17,7 +17,7 @@
    /switch <id>     go back to one
    /btw <question>  ask a side question; the conversation is left as is
    /help            this list
-   /stop            stop the current reply
+   /stop            stop the current reply and every task
  ╭────────────────────────────────────────────────────────────────────────────╮
  │ /                                                                          │
  ╰────────────────────────────────────────────────────────────────────────────╯

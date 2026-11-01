@@ -53,13 +53,24 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   `oauth` RPC). A new token only binds after a child restart, done when idle.
 - `reload.rs`: live settings. `diff` returns the least disruptive `Plan`: read-in-place, `set_model`,
   restart the child (same session), or re-exec the daemon. Config edits go through `toml_edit` to keep comments.
-- `scheduler.rs` (cron jobs, run ledger: interrupted runs become `unknown`, never auto-retried),
+- `scheduler.rs` (cron jobs, run ledger: interrupted runs become `unknown`, never auto-retried;
+  `execute` is the unattended-run path jobs and tasks share), `tasks.rs` (background tasks the agent
+  starts with its `task` tool, DESIGN §4.12: at most 2 at once, and the report goes back to `main` as
+  an inbox row), `procs.rs` (main's `exec`/`process` tools, DESIGN §4.13: commands run as the agent
+  and move to the background when a message for `main` arrives; main's child runs with
+  `--exclude-tools bash`; a re-exec re-adopts them by pidfd and kernel start time, never a reused
+  pid; after a daemon crash, `supervise.rs` (the image's `CMD`, between tini and `zephyr run`)
+  starts the daemon again and exit codes come from `.procs/<id>.exit`). `retention.rs` deletes job/task
+  sessions and process logs older than 30 days. Tasks interrupted by a crash or re-exec resume in their session (`scheduler::resume`, at most
+  3 times), and runs with no rpi event for `stall_limit` are aborted. Mid-run messages are steered in (`queue_message` `deliverAs: steer`,
+  DESIGN §4.1),
   `memory.rs` (git-committed memory files), `attach.rs` (rpi remote JSON-RPC shim so stock
   `rpi --connect` attaches to `main`).
 - The agent's tools (DESIGN §4.11): the browser, Camoufox and the X desktop are CLIs in the image,
-  run through `bash`. `desktop.rs` keeps Xvfb up when `ZEPHYR_DESKTOP` is set. `send_file` and
-  `schedule` are registered by zephyr-policy (`tools.rs`), collected from the event stream in
-  `rpc::Tally`, and carried out at settle by `tools.rs` here.
+  run through `bash`. `desktop.rs` keeps Xvfb up when `ZEPHYR_DESKTOP` is set. `send_file`,
+  `schedule`, `gateway` and `task` are registered by zephyr-policy (`tools.rs`). The first two are
+  collected from the event stream in `rpc::Tally` and carried out at settle by `tools.rs` here;
+  `gateway` and `task` are answered mid-turn through a file.
 
 Child restarts never happen mid-turn: auth refresh, failover and reload all wait for the settle.
 

@@ -16,7 +16,7 @@ use zephyr::store::Store;
 /// The rpi minor this build speaks (DESIGN §3).
 const RPI_PIN: &str = "rpi 0.15.";
 
-const USAGE: &str = "usage: zephyr <run|status|doctor|chat|tui|pause|resume|reload>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
+const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|resume|reload>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -36,6 +36,10 @@ async fn main() -> ExitCode {
     }
     if cmd == "__file" {
         return file_cmd(&args.collect::<Vec<_>>());
+    }
+    // Before the config: it only starts `zephyr run`, which reads it (and secrets.env) itself.
+    if cmd == "supervise" {
+        return zephyr::supervise::main().await;
     }
     // The daemon and the commands run beside it read secrets.env themselves (no --env-file).
     let mut from_file = Vec::new();
@@ -160,7 +164,9 @@ async fn run(cfg: Config, from_file: &[String]) -> anyhow::Result<()> {
     drop(channels);
     if exit == zephyr::router::Exit::Reexec {
         use std::os::unix::process::CommandExt;
-        let mut cmd = std::process::Command::new(std::env::current_exe()?);
+        // The running binary itself, even if its file was replaced since (a rebuild, a reinstall):
+        // `current_exe()` would then name a deleted path and the exec fail with ENOENT.
+        let mut cmd = std::process::Command::new("/proc/self/exe");
         cmd.args(std::env::args_os().skip(1));
         for key in from_file {
             cmd.env_remove(key);

@@ -115,14 +115,14 @@ fn read_request(stream: &mut std::net::TcpStream) -> String {
 }
 
 fn serve(listener: TcpListener, requests: Arc<AtomicUsize>) {
-    serve_turns(listener, requests, tool_turn(), Default::default());
+    serve_turns(listener, requests, vec![tool_turn()], Default::default());
 }
 
-/// Answers the first request with `first`, every later one with text; keeps each request.
+/// Answers the requests in order with `turns`, every later one with text; keeps each request.
 fn serve_turns(
     listener: TcpListener,
     requests: Arc<AtomicUsize>,
-    first: String,
+    turns: Vec<String>,
     seen: Arc<std::sync::Mutex<Vec<String>>>,
 ) {
     for stream in listener.incoming() {
@@ -130,11 +130,10 @@ fn serve_turns(
             return;
         };
         seen.lock().unwrap().push(read_request(&mut stream));
-        let turn = if requests.fetch_add(1, Ordering::SeqCst) == 0 {
-            first.clone()
-        } else {
-            text_turn()
-        };
+        let turn = turns
+            .get(requests.fetch_add(1, Ordering::SeqCst))
+            .cloned()
+            .unwrap_or_else(text_turn);
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{turn}"
         );
@@ -317,8 +316,8 @@ fn rpc_lists_status_command_only_when_plugin_is_loaded() {
     );
 }
 
-/// `rpi --mode rpc` with the plugin, whose model calls `gateway {"command": "/status"}` as
-/// `toolu_gw` first; the test plays the daemon.
+/// `rpi --mode rpc` with the plugin, whose model makes the calls in `turns`, in order; the test
+/// plays the daemon.
 struct GatewayRpi {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
@@ -329,7 +328,12 @@ struct GatewayRpi {
 }
 
 impl GatewayRpi {
-    fn start(name: &str) -> Self {
+    fn start(name: &str, turns: Vec<String>) -> Self {
+        Self::start_with(name, turns, false)
+    }
+
+    /// `main` starts it as zephyr starts the main child: `exec`/`process`, no `bash`.
+    fn start_with(name: &str, turns: Vec<String>, main: bool) -> Self {
         use std::io::BufRead;
         let lib = common::build_cdylib();
         let root = scratch(name);
@@ -347,11 +351,15 @@ impl GatewayRpi {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         std::thread::spawn({
             let seen = seen.clone();
-            let first = call_turn("toolu_gw", "gateway", "{\"command\":\"/status\"}");
-            move || serve_turns(listener, Default::default(), first, seen)
+            move || serve_turns(listener, Default::default(), turns, seen)
         });
-        let mut child = Command::new(RPI)
-            .env_clear()
+        let mut cmd = Command::new(RPI);
+        cmd.env_clear();
+        if main {
+            cmd.env("ZEPHYR_EXEC", "1")
+                .args(["--exclude-tools", "bash"]);
+        }
+        let mut child = cmd
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &home)
             .env("RPI_CODING_AGENT_DIR", &agent)
@@ -415,12 +423,12 @@ impl GatewayRpi {
         self.stdin.write_all(b"\n").unwrap();
     }
 
-    /// Sends the prompt and returns once the `gateway` call has started.
-    fn until_gateway_call(&mut self) {
+    /// Sends the prompt and returns once the `tool` call `id` has started.
+    fn until_call(&mut self, tool: &str, id: &str) {
         self.send(r#"{"id":"1","type":"prompt","message":"status?"}"#);
         let start = self.next(|v| v["type"] == "tool_execution_start");
-        assert_eq!(start["toolName"], "gateway", "{start}");
-        assert_eq!(start["toolCallId"], "toolu_gw", "{start}");
+        assert_eq!(start["toolName"], tool, "{start}");
+        assert_eq!(start["toolCallId"], id, "{start}");
     }
 }
 
@@ -442,8 +450,9 @@ fn rpi_waits_for_a_gateway_answer_mid_turn() {
         eprintln!("SKIP: {RPI} not installed");
         return;
     }
-    let mut rpi = GatewayRpi::start("gateway");
-    rpi.until_gateway_call();
+    let first = call_turn("toolu_gw", "gateway", "{\"command\":\"/status\"}");
+    let mut rpi = GatewayRpi::start("gateway", vec![first]);
+    rpi.until_call("gateway", "toolu_gw");
     // While the call waits, rpi still answers commands (the router makes some mid-run).
     rpi.send(r#"{"id":"2","type":"get_state"}"#);
     let state = rpi.next(|v| v["command"] == "get_state" || v["type"] == "tool_execution_end");
@@ -468,6 +477,51 @@ fn rpi_waits_for_a_gateway_answer_mid_turn() {
     );
 }
 
+/// In the main child, `exec` and `process` replace rpi's `bash`, and an `exec` waits for the
+/// daemon past `gateway`'s 10 s: until its command ends or yields.
+#[test]
+#[ignore = "needs the pinned rpi binary; run with --ignored"]
+fn the_main_child_runs_commands_through_exec_and_waits_for_them() {
+    if !Path::new(RPI).exists() {
+        eprintln!("SKIP: {RPI} not installed");
+        return;
+    }
+    let first = call_turn("toolu_exec", "exec", "{\"command\":\"make\"}");
+    let mut rpi = GatewayRpi::start_with("exec", vec![first], true);
+    rpi.until_call("exec", "toolu_exec");
+    std::thread::sleep(std::time::Duration::from_secs(11));
+    std::fs::write(rpi.gw.join("toolu_exec"), "exited 0\nbuilt").unwrap();
+    let end = rpi.next(|v| v["type"] == "tool_execution_end");
+    assert_ne!(end["isError"], true, "{end}");
+    assert!(end.to_string().contains("exited 0"), "{end}");
+    rpi.next(|v| v["type"] == "agent_settled");
+    let seen = rpi.seen.lock().unwrap().clone();
+    let tools = |name: &str| seen[0].contains(&format!("\"name\":\"{name}\""));
+    assert!(tools("exec") && tools("process"), "{}", seen[0]);
+    assert!(!tools("bash"), "rpi's bash is excluded: {}", seen[0]);
+    assert!(
+        seen[1].contains("built"),
+        "the answer reached the model: {}",
+        seen[1]
+    );
+}
+
+/// Outside the main child (jobs, tasks), rpi keeps its `bash` and there is no `exec`.
+#[test]
+#[ignore = "needs the pinned rpi binary; run with --ignored"]
+fn other_children_keep_bash_and_get_no_exec() {
+    if !Path::new(RPI).exists() {
+        eprintln!("SKIP: {RPI} not installed");
+        return;
+    }
+    let mut rpi = GatewayRpi::start("no-exec", vec![text_turn()]);
+    rpi.send(r#"{"id":"1","type":"prompt","message":"hi"}"#);
+    rpi.next(|v| v["type"] == "agent_settled");
+    let seen = rpi.seen.lock().unwrap().clone();
+    assert!(seen[0].contains("\"name\":\"bash\""), "{}", seen[0]);
+    assert!(!seen[0].contains("\"name\":\"exec\""), "{}", seen[0]);
+}
+
 /// `/stop` (an `abort`) ends a waiting `gateway` call at once, not after its 10 s wait.
 #[test]
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
@@ -476,8 +530,9 @@ fn an_abort_ends_a_waiting_gateway_call() {
         eprintln!("SKIP: {RPI} not installed");
         return;
     }
-    let mut rpi = GatewayRpi::start("gateway-abort");
-    rpi.until_gateway_call();
+    let first = call_turn("toolu_gw", "gateway", "{\"command\":\"/status\"}");
+    let mut rpi = GatewayRpi::start("gateway-abort", vec![first]);
+    rpi.until_call("gateway", "toolu_gw");
     let asked = std::time::Instant::now();
     rpi.send(r#"{"id":"2","type":"abort"}"#);
     let end = rpi.next(|v| v["type"] == "tool_execution_end");
@@ -494,5 +549,62 @@ fn an_abort_ends_a_waiting_gateway_call() {
         rpi.seen.lock().unwrap().len(),
         1,
         "the run went on after the abort"
+    );
+}
+
+/// `task` waits like `gateway`: the model lists tasks as `toolu_task`, and the test answers it
+/// mid-turn. The model's next call, `task {"action": "stop"}` with no `id`, is invalid and must
+/// fail at once, not after the 10 s wait.
+#[test]
+#[ignore = "needs the pinned rpi binary; run with --ignored"]
+fn rpi_waits_for_a_task_answer_mid_turn() {
+    if !Path::new(RPI).exists() {
+        eprintln!("SKIP: {RPI} not installed");
+        return;
+    }
+    let list = call_turn("toolu_task", "task", "{\"action\":\"list\"}");
+    let stop = call_turn("toolu_stop", "task", "{\"action\":\"stop\"}");
+    let mut rpi = GatewayRpi::start("task", vec![list, stop]);
+    rpi.until_call("task", "toolu_task");
+    // While the call waits, rpi still answers commands (the router makes some mid-run).
+    rpi.send(r#"{"id":"2","type":"get_state"}"#);
+    let state = rpi.next(|v| v["command"] == "get_state" || v["type"] == "tool_execution_end");
+    assert_eq!(
+        state["type"], "response",
+        "rpi ended the call before the answer: {state}"
+    );
+    std::fs::write(rpi.gw.join("toolu_task"), "task 1: running").unwrap();
+    let end = rpi.next(|v| v["type"] == "tool_execution_end");
+    assert_ne!(end["isError"], true, "{end}");
+    assert!(
+        end["result"].to_string().contains("task 1: running"),
+        "the answer is not in the tool result: {end}"
+    );
+    let start = rpi.next(|v| v["type"] == "tool_execution_start");
+    assert_eq!(start["toolCallId"], "toolu_stop", "{start}");
+    let asked = std::time::Instant::now();
+    let end = rpi.next(|v| v["type"] == "tool_execution_end");
+    let took = asked.elapsed();
+    assert_eq!(end["isError"], true, "{end}");
+    // The plugin's own refusal, not some other failure.
+    assert!(
+        end.to_string().contains("stop needs the task's `id`"),
+        "{end}"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "the invalid stop waited: {took:?}"
+    );
+    rpi.next(|v| v["type"] == "agent_settled");
+    let seen = rpi.seen.lock().unwrap().clone();
+    assert!(seen.len() >= 2, "no second model request");
+    assert!(
+        seen[1].contains("task 1: running"),
+        "the answer did not reach the model: {}",
+        seen[1]
+    );
+    assert!(
+        !rpi.gw.join("toolu_task").exists(),
+        "the answer file is consumed"
     );
 }
