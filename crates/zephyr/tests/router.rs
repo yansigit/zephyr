@@ -47,10 +47,16 @@ impl Channel for TestChannel {
             .unwrap()
             .outbox_status(&msg.client_id)
             .unwrap();
+        // An attachment shows as its contents, read now: the copy must exist while it is sent.
+        let mut msg = msg.clone();
+        if let Some(file) = &msg.attachment {
+            let body = std::fs::read_to_string(file).unwrap_or_else(|_| "missing".into());
+            msg.text = format!("{} <{body}>", msg.text).trim_start().into();
+        }
         self.sent
             .lock()
             .unwrap()
-            .push((msg.clone(), pending.as_deref() == Some("pending")));
+            .push((msg, pending.as_deref() == Some("pending")));
         Ok(())
     }
     async fn activity(&self, to: &str, a: &Activity) -> anyhow::Result<()> {
@@ -1350,5 +1356,87 @@ async fn a_run_shows_activity_on_the_channel_it_serves() {
     gw.wait_replies_on("discord", 1).await;
     wait(|| acts("discord").last().map(String::as_str) == Some("stop downer")).await;
     assert!(acts("chat").is_empty(), "only the serving channel shows it");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_file_goes_to_the_owner_after_the_reply_and_its_copy_is_dropped() {
+    let home = home("send-file");
+    std::fs::write(home.join("shot.png"), "PNG").unwrap();
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        r#"look [call send_file {"path": "shot.png", "caption": "the page"}]"#,
+    )
+    .await;
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        replies[0].starts_with("echo: [chat #1] look"),
+        "{replies:?}"
+    );
+    assert_eq!(replies[1], "the page <PNG>");
+    let copy = gw.sent["chat"].lock().unwrap()[1]
+        .0
+        .attachment
+        .clone()
+        .unwrap();
+    assert!(copy.ends_with("shot.png") && copy.starts_with(home.join("files")));
+    wait(|| !copy.exists()).await;
+    std::fs::write(home.join("shot.png"), "changed").unwrap();
+
+    // A missing file or a credential is not sent; the owner is told why.
+    gw.say(
+        "m2",
+        "owner",
+        r#"[call send_file {"path": "gone.png"}] [call send_file {"path": "accounts/a/auth.json"}]"#,
+    )
+    .await;
+    let replies = gw.wait_replies(5).await;
+    assert!(
+        replies[3].starts_with("[zephyr] the agent's send_file failed: opening gone.png"),
+        "{replies:?}"
+    );
+    assert!(replies[4].contains("is a credential file"), "{replies:?}");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_job_the_agent_proposes_waits_for_the_owners_ok() {
+    let home = home("propose-job");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call schedule {"name": "stretch", "schedule": "0 9 * * *", "prompt": "say: stretch"}] remind me"#,
+    )
+    .await;
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        replies[1]
+            .starts_with("[zephyr] the agent proposed job #1 (stretch, 0 9 * * *, first run ")
+            && replies[1].ends_with("/job ok 1 turns it on; /job rm 1 drops it"),
+        "{replies:?}"
+    );
+    let jobs = || Store::open(&home.join("state.db")).unwrap().jobs().unwrap();
+    assert!(!jobs()[0].enabled, "off until the owner says so");
+    gw.say("m2", "owner", "/job list").await;
+    assert!(gw.wait_replies(3).await[2].ends_with("| waiting for /job ok"));
+    gw.say("m3", "owner", "/job ok 1").await;
+    assert_eq!(gw.wait_replies(4).await[3], "[zephyr] job #1 is on");
+    assert!(jobs()[0].enabled);
+
+    gw.say(
+        "m4",
+        "owner",
+        r#"[call schedule {"name": "x", "schedule": "every day", "prompt": "p"}]"#,
+    )
+    .await;
+    let replies = gw.wait_replies(6).await;
+    assert!(
+        replies[5].starts_with("[zephyr] the agent's schedule failed: bad schedule \"every day\""),
+        "{replies:?}"
+    );
+    assert_eq!(jobs().len(), 1);
     gw.shutdown().await;
 }

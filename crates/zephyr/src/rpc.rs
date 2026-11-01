@@ -97,6 +97,9 @@ impl Child {
         if let Some(dir) = &agent_dir {
             cmd.env("RPI_CODING_AGENT_DIR", dir);
         }
+        if let Some(display) = crate::desktop::ensure() {
+            cmd.env("DISPLAY", display);
+        }
         let mut process = cmd
             .spawn()
             .with_context(|| format!("spawning {}", cfg.rpi.display()))?;
@@ -213,6 +216,11 @@ pub struct Tally {
     pub outbound: Vec<String>,
     /// Model turns taken (`turn_end`), for `budget.run_turns`.
     pub turns: u32,
+    /// `send_file` and `schedule` calls that succeeded, as `(tool, args)`: the daemon carries
+    /// them out when the run settles (`crate::tools`, DESIGN §4.11).
+    pub requests: Vec<(String, Value)>,
+    /// Those calls between their start and end, by tool call id.
+    started: std::collections::HashMap<String, (String, Value)>,
 }
 
 impl Tally {
@@ -224,6 +232,18 @@ impl Tally {
         }
         if ev["type"] == "turn_end" {
             self.turns += 1;
+        }
+        if let (Some(id), Some(tool @ ("send_file" | "schedule"))) =
+            (ev["toolCallId"].as_str(), ev["toolName"].as_str())
+        {
+            if ev["type"] == "tool_execution_start" {
+                self.started
+                    .insert(id.into(), (tool.into(), ev["args"].clone()));
+            }
+            if ev["type"] == "tool_execution_end" {
+                let call = self.started.remove(id);
+                self.requests.extend(call.filter(|_| ev["isError"] != true));
+            }
         }
         // From rpi, not from anything the agent writes, so the agent cannot hide a send.
         if ev["type"] == "tool_execution_start" && ev["toolName"] == "bash" {
@@ -268,6 +288,33 @@ pub fn message_text(msg: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tally_keeps_only_daemon_tool_calls_that_succeeded() {
+        let mut tally = Tally::default();
+        let ev = |kind: &str, id: &str, tool: &str, error: bool| {
+            serde_json::json!({"type": kind, "toolCallId": id, "toolName": tool,
+                               "args": {"path": id}, "isError": error})
+        };
+        for (id, tool, error) in [
+            ("a", "send_file", false),
+            ("b", "send_file", true),
+            ("c", "read", false),
+        ] {
+            tally.add(&ev("tool_execution_start", id, tool, false));
+            tally.add(&ev("tool_execution_end", id, tool, error));
+        }
+        tally.add(&ev(
+            "tool_execution_end",
+            "never-started",
+            "schedule",
+            false,
+        ));
+        assert_eq!(
+            tally.requests,
+            [("send_file".to_string(), serde_json::json!({"path": "a"}))]
+        );
+    }
 
     #[tokio::test]
     async fn extensions_follow_the_policy_plugin_in_order() {

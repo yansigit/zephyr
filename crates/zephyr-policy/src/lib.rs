@@ -10,6 +10,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod policy;
+pub mod tools;
 
 use std::ffi::c_void;
 use std::io::Write;
@@ -73,6 +74,24 @@ export_plugin!(|api| {
     let status = register(EventTag::ToolCall, on_tool_call, std::ptr::null_mut());
     if status != 0 {
         return status;
+    }
+    // Optional, like the beacon: a host that cannot take them still gets the veto.
+    if let Some(register_tool) = api.register_tool {
+        for (name, description, parameters, execute) in tools::TOOLS {
+            let schema = tools::schema(name, description, parameters);
+            let free = rpi_plugin_sdk::callbacks::free_string;
+            if register_tool(
+                &schema,
+                execute,
+                tools::poll,
+                tools::cancel,
+                tools::destroy,
+                free,
+            ) != 0
+            {
+                eprintln!("zephyr-policy: the host refused the {name} tool");
+            }
+        }
     }
     // The veto is required; the beacon is optional on hosts without command slots.
     if let Some(register_command) = api.register_command {

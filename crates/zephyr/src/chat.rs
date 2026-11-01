@@ -79,7 +79,12 @@ impl Channel for ChatChannel {
     /// so the outbox keeps the reply for the next connection. A connection that does not take
     /// the line within `WRITE_TIMEOUT` (a client that stopped reading) is dropped.
     async fn send(&self, msg: &Outbound) -> anyhow::Result<()> {
-        let mut line = serde_json::to_vec(&json!({"id": msg.client_id, "text": msg.text}))?;
+        // A terminal cannot show a file: it gets the file's name.
+        let text = match msg.attachment.as_deref().and_then(Path::file_name) {
+            Some(name) => format!("{}\n[file] {}", msg.text, name.to_string_lossy()),
+            None => msg.text.clone(),
+        };
+        let mut line = serde_json::to_vec(&json!({"id": msg.client_id, "text": text}))?;
         line.push(b'\n');
         let mut delivered = false;
         let mut conns = self.conns.lock().await;
@@ -155,6 +160,7 @@ mod tests {
             recipient: unsafe { libc::getuid() }.to_string(),
             client_id: "z1".into(),
             text: "x".repeat(4 << 20), // more than the socket buffers hold
+            attachment: None,
         };
         let sent = tokio::time::timeout(std::time::Duration::from_secs(5), chat.send(&msg)).await;
         assert!(sent.expect("send returned").is_err(), "nothing was read");

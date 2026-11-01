@@ -1,0 +1,15 @@
+# The agent's Python (DESIGN §4.11): installed read-only at /opt/zephyr/py and first on its PATH.
+# The agent adds packages per script with `uv run --with`, or makes its own venv with `uv venv`.
+# After an edit, run `uv lock` here and commit uv.lock.
+[project]
+name = "zephyr-agent-python"
+version = "0"
+requires-python = "==3.12.*" # ubuntu 24.04's python3, which the venv links to
+dependencies = [
+    "camoufox==0.5.8",
+    "requests",
+    "beautifulsoup4",
+    "pandas",
+    "pypdf",
+    "pillow",
+]

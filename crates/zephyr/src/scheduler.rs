@@ -21,7 +21,7 @@ const PAUSE_POLL: Duration = Duration::from_secs(1);
 pub const JOB_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// A run whose whole reply is this is not delivered.
 const SILENT: &str = "[SILENT]";
-const USAGE: &str = "[zephyr] usage: /job add <name> | <cron or RFC3339 time> | <prompt>, /job list, /job rm <id>, /job run <id>";
+const USAGE: &str = "[zephyr] usage: /job add <name> | <cron or RFC3339 time> | <prompt>, /job list, /job ok <id>, /job rm <id>, /job run <id>";
 
 /// Wakeups between the router and the scheduler.
 #[derive(Default)]
@@ -242,6 +242,8 @@ async fn attempt_once(
             eprintln!("zephyr: outbound notice failed: {e}");
         }
     }
+    let to = (run.job.channel.clone(), run.job.recipient.clone());
+    crate::tools::apply(store, cfg, &tally.requests, Some(to));
     if let Some(a) = account {
         let _ = store.add_account_spend(&a.name, tally.used);
     }
@@ -321,6 +323,10 @@ pub fn command(store: &mut Store, cfg: &Config, m: &Inbound) -> Option<String> {
             Err(e) => Ok(format!("[zephyr] {e:#}")),
         },
         ("list", _) if arg.is_empty() => list(store),
+        ("ok", Ok(id)) => store.enable_job(id).map(|found| match found {
+            true => format!("[zephyr] job #{id} is on"),
+            false => format!("[zephyr] no job #{id}"),
+        }),
         ("rm", Ok(id)) => store.remove_job(id).map(|found| match found {
             true => format!("[zephyr] job #{id} removed"),
             false => format!("[zephyr] no job #{id}"),
@@ -342,20 +348,28 @@ fn add(store: &Store, tz: &TimeZone, m: &Inbound, arg: &str) -> rusqlite::Result
     if name.is_empty() || prompt.is_empty() {
         return Ok(USAGE.into());
     }
+    let next = match check(schedule, tz) {
+        Ok(next) => next,
+        Err(e) => return Ok(format!("[zephyr] {e}")),
+    };
+    let id = store.add_job(name, schedule, prompt, &m.channel, &m.sender)?;
+    Ok(format!(
+        "[zephyr] job #{id} ({name}) added; next run {next}"
+    ))
+}
+
+/// Checks `schedule` (five-field cron or an RFC 3339 time) and returns its next run, in `tz`.
+pub fn check(schedule: &str, tz: &TimeZone) -> Result<String, String> {
     if schedule.parse::<Timestamp>().is_err() {
         if let Err(e) = parse_cron(schedule) {
-            return Ok(format!("[zephyr] bad schedule {schedule:?}: {e}"));
+            return Err(format!("bad schedule {schedule:?}: {e}"));
         }
     }
     let Some(next) = next_after(schedule, crate::now(), tz) else {
-        return Ok(format!("[zephyr] {schedule} is in the past"));
+        return Err(format!("{schedule} is in the past"));
     };
-    let id = store.add_job(name, schedule, prompt, &m.channel, &m.sender)?;
     let next = Timestamp::from_second(next).map(|t| t.to_zoned(tz.clone()).to_string());
-    Ok(format!(
-        "[zephyr] job #{id} ({name}) added; next run {}",
-        next.unwrap_or_default()
-    ))
+    Ok(next.unwrap_or_default())
 }
 
 fn list(store: &Store) -> rusqlite::Result<String> {
@@ -367,8 +381,17 @@ fn list(store: &Store) -> rusqlite::Result<String> {
         .iter()
         .map(|j| {
             format!(
-                "#{} {} | {} | {} | to {}",
-                j.id, j.name, j.schedule, j.prompt, j.channel
+                "#{} {} | {} | {} | to {}{}",
+                j.id,
+                j.name,
+                j.schedule,
+                j.prompt,
+                j.channel,
+                if j.enabled {
+                    ""
+                } else {
+                    " | waiting for /job ok"
+                }
             )
         })
         .collect();

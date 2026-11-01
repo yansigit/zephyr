@@ -7,6 +7,7 @@ pub mod auth_keeper;
 pub mod channel;
 pub mod chat;
 pub mod config;
+pub mod desktop;
 pub mod discord;
 pub mod dotenv;
 pub mod host;
@@ -18,6 +19,7 @@ pub mod router;
 pub mod rpc;
 pub mod scheduler;
 pub mod store;
+pub mod tools;
 pub mod tui;
 
 pub fn unix_millis() -> u128 {

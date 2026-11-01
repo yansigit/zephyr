@@ -26,7 +26,8 @@ Each prompt and resume answers `accepted`, commits the user entry (`session_entr
 "error") with `message_start`/`message_end`/`turn_end` first, and settles with outcome "failed"
 and that `errorMessage` as `agent_settled.error`. A prompt containing `[tool]` first runs one fake
 `bash` tool call (assistant toolCall, tool_execution_start, tool_execution_end, toolResult); while a
-`tool_wait` file exists in the home, the tool keeps running.
+`tool_wait` file exists in the home, the tool keeps running. Each `[call NAME {JSON}]` in a prompt runs
+one such call of tool NAME with those (flat) args, succeeding, before the reply.
 `get_state` reports thinkingLevel "medium".
 A prompt containing `[turns N]` reports N `turn_end` events, then waits for `abort` as `[hang]` does.
 A prompt containing `[hang]` never settles until `abort`, which records an aborted assistant
@@ -165,17 +166,17 @@ def finish(s, text, outcome="completed"):
     out({"type": "agent_settled", "runId": "r", "outcome": outcome, "aborted": outcome == "aborted",
          "error": None, "summary": None, "pendingResume": False})
 
-def run_tool(s):
+def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
     call = {"kind": "assistant", "role": "assistant", "stopReason": "toolUse", "timestamp": 0,
-            "content": [{"type": "toolCall", "id": "t1", "name": "bash", "arguments": {"command": "true"}}]}
-    result = {"kind": "toolResult", "role": "toolResult", "toolCallId": "t1", "toolName": "bash",
+            "content": [{"type": "toolCall", "id": cid, "name": name, "arguments": args}]}
+    result = {"kind": "toolResult", "role": "toolResult", "toolCallId": cid, "toolName": name,
               "content": [{"type": "text", "text": "ok"}], "isError": False, "timestamp": 0}
     s["messages"].append(call); save(s)
     out({"type": "message_start", "message": call}); out({"type": "message_end", "message": call})
-    out({"type": "tool_execution_start", "toolCallId": "t1", "toolName": "bash", "args": {"command": "true"}})
+    out({"type": "tool_execution_start", "toolCallId": cid, "toolName": name, "args": args})
     while os.path.exists(os.path.join(home, "tool_wait")):
         time.sleep(0.05)
-    out({"type": "tool_execution_end", "toolCallId": "t1", "toolName": "bash", "isError": False,
+    out({"type": "tool_execution_end", "toolCallId": cid, "toolName": name, "isError": False,
          "result": {"content": result["content"]}})
     s["messages"].append(result); save(s)
     out({"type": "message_start", "message": result}); out({"type": "message_end", "message": result})
@@ -242,6 +243,8 @@ for line in sys.stdin:
             finish(s, "ran"); continue
         if "[tool]" in cmd["message"]:
             run_tool(s)
+        for i, (name, args) in enumerate(re.findall(r"\[call (\w+) (\{[^{}]*\})\]", cmd["message"])):
+            run_tool(s, name, json.loads(args), "c%d" % i)
         if cmd["message"].endswith("model?"):
             finish(s, "model: %s" % model); continue
         if cmd["message"].startswith("say: "):

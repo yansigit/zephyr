@@ -826,6 +826,12 @@ impl<'a> Router<'a> {
                 log(self.reconcile(Some(fallback), false).await);
             }
         }
+        // The agent's files and proposed jobs, after the reply they belong to.
+        let to = self.store.last_owner().unwrap_or_else(|e| {
+            eprintln!("zephyr: reading the last owner failed: {e}");
+            None
+        });
+        crate::tools::apply(&self.store, &self.cfg, &tally.requests, to);
         // After the reply, so the owner reads what was sent out next to what it was for.
         for notice in [cut, tally.alert(), memory].into_iter().flatten() {
             log(self.store.notify_last_owner(&notice).map_err(Into::into));
@@ -1496,6 +1502,7 @@ impl<'a> Router<'a> {
                 recipient: row.recipient,
                 client_id: row.client_id,
                 text: row.text,
+                attachment: row.attachment.clone().map(Into::into),
             };
             let sent = match tokio::time::timeout(SEND_TIMEOUT, channel.send(&msg)).await {
                 Ok(sent) => sent,
@@ -1521,6 +1528,9 @@ impl<'a> Router<'a> {
                 .store
                 .set_outbox_status(row.id, status)
                 .map_err(Into::into));
+            if let Some(file) = &row.attachment {
+                crate::tools::discard(file);
+            }
         }
     }
 
@@ -1549,6 +1559,8 @@ impl<'a> Router<'a> {
             // Cut off: book what the run did so far.
             let tally = std::mem::take(&mut self.tally);
             log(self.record_spend(tally.used).map(drop));
+            let to = self.store.last_owner().ok().flatten();
+            crate::tools::apply(&self.store, &self.cfg, &tally.requests, to);
             if let Some(alert) = tally.alert() {
                 log(self.store.notify_last_owner(&alert).map_err(Into::into));
             }

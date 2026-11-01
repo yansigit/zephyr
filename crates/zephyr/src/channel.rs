@@ -18,6 +18,9 @@ pub struct Outbound {
     pub recipient: String,
     pub client_id: String,
     pub text: String,
+    /// A file to send with `text` (the agent's `send_file`, DESIGN §4.11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<std::path::PathBuf>,
 }
 
 /// What the agent is doing for a recipient, so a channel can show it (typing, a progress note).

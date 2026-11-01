@@ -4,7 +4,7 @@ use crate::channel::Inbound;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// An inbox row the router still has to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +27,8 @@ pub struct OutboxRow {
     pub created_at: i64,
     /// The inbox text this answers; `None` for a notice or a job's output.
     pub prompt: Option<String>,
+    /// A file to send with `text` (the agent's `send_file`), a copy owned by the daemon.
+    pub attachment: Option<String>,
 }
 
 /// The platform dedupe key for a reply: at most 20 ASCII chars, so Discord's 25-char
@@ -67,6 +69,8 @@ pub struct Job {
     pub prompt: String,
     pub channel: String,
     pub recipient: String,
+    /// False while a job the agent proposed waits for the owner's `/job ok` (§4.5).
+    pub enabled: bool,
 }
 
 /// A run taken off the queue, with what it needs from its job.
@@ -77,7 +81,7 @@ pub struct JobRun {
 }
 
 const JOB_COLUMNS: &str =
-    "jobs.id, jobs.name, jobs.schedule, jobs.prompt, jobs.channel, jobs.recipient";
+    "jobs.id, jobs.name, jobs.schedule, jobs.prompt, jobs.channel, jobs.recipient, jobs.enabled";
 
 fn job_row(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Job> {
     Ok(Job {
@@ -87,6 +91,7 @@ fn job_row(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Job> {
         prompt: r.get(at + 3)?,
         channel: r.get(at + 4)?,
         recipient: r.get(at + 5)?,
+        enabled: r.get(at + 6)?,
     })
 }
 
@@ -184,6 +189,14 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if version < 5 {
+            db.execute_batch(
+                "BEGIN;
+                 ALTER TABLE outbox ADD COLUMN attachment TEXT;
+                 PRAGMA user_version = 5;
+                 COMMIT;",
+            )?;
+        }
         Ok(Self { db })
     }
 
@@ -248,7 +261,7 @@ impl Store {
     pub fn pending_outbox(&self) -> rusqlite::Result<Vec<OutboxRow>> {
         let mut stmt = self.db.prepare(
             "SELECT id, channel, recipient, client_id, text, created_at,
-                    (SELECT text FROM inbox WHERE inbox.id = outbox.inbox_id)
+                    (SELECT text FROM inbox WHERE inbox.id = outbox.inbox_id), attachment
              FROM outbox WHERE status = 'pending' ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -260,6 +273,7 @@ impl Store {
                 text: r.get(4)?,
                 created_at: r.get(5)?,
                 prompt: r.get(6)?,
+                attachment: r.get(7)?,
             })
         })?;
         rows.collect()
@@ -376,30 +390,44 @@ impl Store {
 
     /// Writes a notice to the channel and recipient of the newest owner message, if any.
     pub fn notify_last_owner(&self, text: &str) -> rusqlite::Result<()> {
-        let last: Option<(String, String)> = self
-            .db
+        let Some((channel, recipient)) = self.last_owner()? else {
+            return Ok(());
+        };
+        self.notify(&channel, &recipient, text)
+    }
+
+    /// `(channel, sender)` of the newest message the agent took up: who the main session answers.
+    pub fn last_owner(&self) -> rusqlite::Result<Option<(String, String)>> {
+        self.db
             .query_row(
                 "SELECT channel, sender FROM inbox WHERE status IN ('done', 'dispatched')
                  ORDER BY id DESC LIMIT 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()?;
-        let Some((channel, recipient)) = last else {
-            return Ok(());
-        };
-        self.notify(&channel, &recipient, text)
+            .optional()
     }
 
     /// Writes a notice to `channel`/`recipient`.
     pub fn notify(&self, channel: &str, recipient: &str, text: &str) -> rusqlite::Result<()> {
+        self.notify_file(channel, recipient, text, None)
+    }
+
+    /// Writes a notice to `channel`/`recipient`, with a file to send along, if any.
+    pub fn notify_file(
+        &self,
+        channel: &str,
+        recipient: &str,
+        text: &str,
+        attachment: Option<&str>,
+    ) -> rusqlite::Result<()> {
         // No inbox row to key on, so the client id is `b` and 16 random hex digits: unique
         // without reading the table, which the router and the scheduler write at once.
         // Replies are `z<base36>`.
         self.db.execute(
-            "INSERT INTO outbox(channel, recipient, client_id, text)
-             VALUES (?1, ?2, 'b' || lower(hex(randomblob(8))), ?3)",
-            params![channel, recipient, text],
+            "INSERT INTO outbox(channel, recipient, client_id, text, attachment)
+             VALUES (?1, ?2, 'b' || lower(hex(randomblob(8))), ?3, ?4)",
+            params![channel, recipient, text, attachment],
         )?;
         Ok(())
     }
@@ -440,6 +468,31 @@ impl Store {
             params![name, schedule, prompt, channel, recipient],
         )?;
         Ok(self.db.last_insert_rowid())
+    }
+
+    /// Adds a job the agent proposed: off until the owner's `/job ok` (§4.5).
+    pub fn propose_job(
+        &self,
+        name: &str,
+        schedule: &str,
+        prompt: &str,
+        channel: &str,
+        recipient: &str,
+    ) -> rusqlite::Result<i64> {
+        self.db.execute(
+            "INSERT INTO jobs(name, schedule, prompt, channel, recipient, enabled)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            params![name, schedule, prompt, channel, recipient],
+        )?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    /// Turns a job on. Returns whether it exists.
+    pub fn enable_job(&self, id: i64) -> rusqlite::Result<bool> {
+        let n = self
+            .db
+            .execute("UPDATE jobs SET enabled = 1 WHERE id = ?1", params![id])?;
+        Ok(n == 1)
     }
 
     pub fn jobs(&self) -> rusqlite::Result<Vec<Job>> {
@@ -789,10 +842,11 @@ mod tests {
         for (version, undo) in [
             (
                 1,
-                "DROP TABLE meta; DROP TABLE spend; DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend;",
+                "DROP TABLE meta; DROP TABLE spend; DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment;",
             ),
-            (2, "DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend;"),
-            (3, "DROP TABLE account_cooldown; DROP TABLE account_spend;"),
+            (2, "DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment;"),
+            (3, "DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment;"),
+            (4, "ALTER TABLE outbox DROP COLUMN attachment;"),
         ] {
             let dir = crate::test_dir(&format!("store-v{version}"));
             let path = dir.join("state.db");
@@ -809,6 +863,8 @@ mod tests {
                 1
             );
             store.clear_cooldown("a").unwrap();
+            store.notify_file("chat", "o", "", Some("/f")).unwrap();
+            assert_eq!(store.pending_outbox().unwrap()[0].attachment.as_deref(), Some("/f"));
             let now: i64 = store
                 .db
                 .pragma_query_value(None, "user_version", |r| r.get(0))
