@@ -810,37 +810,58 @@ fn settings_reach_roots_files_through_the_container() {
 fn up_and_upgrade_add_the_images_new_extensions_through_the_container() {
     let env = Env::new("up-ext");
     env.init(&["--no-start"]);
-    // A config written before the MCP adapter shipped, in root's dir as after the first `up`.
+    // A config written before the MCP adapter shipped and before host.toml recorded what was
+    // offered, in root's dir as after the first `up`.
     let adapter = "\"/opt/zephyr/ext/librpi_mcp_adapter.so\"";
     let files = env.dir.join("files");
     std::fs::create_dir_all(&files).unwrap();
     for name in ["zephyr.toml", "secrets.env", "tui.token", "host.toml"] {
         std::fs::rename(env.daemon().join(name), files.join(name)).unwrap();
     }
-    let toml = files.join("zephyr.toml");
-    let old = std::fs::read_to_string(&toml)
-        .unwrap()
-        .replace(&format!("{adapter}, "), "");
-    assert!(!old.contains(adapter));
+    let (toml, host) = (files.join("zephyr.toml"), files.join("host.toml"));
+    let read = |p: &Path| std::fs::read_to_string(p).unwrap();
+    let full = read(&toml);
+    let without = full.replace(&format!("{adapter}, "), "");
+    assert!(!without.contains(adapter));
+    let record = read(&host);
+    assert!(record.contains(adapter), "{record}");
+    let unrecorded: String = record
+        .lines()
+        .filter(|l| !l.starts_with("offered_extensions"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&host, &unrecorded).unwrap();
+    std::fs::write(&toml, &without).unwrap();
     std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o000)).unwrap();
 
     let put = ["zephyr", "__file", "put", "zephyr.toml"];
+    let wrote = |calls: &[Vec<String>]| calls.iter().any(|c| c.ends_with(&put.map(String::from)));
+    // No record yet: what the config lists counts as offered, so the adapter is new to it.
+    env.ok(&["up"]);
+    assert_eq!(read(&toml), full);
+    assert!(read(&host).contains(adapter));
+    let calls = env.calls();
+    let root = ["docker", "exec", "-i", "-u", "0", CONTAINER];
+    find(&calls, &[&root[..], &put[..]].concat());
+
+    // The owner removes it: it stays removed, and the file is left alone.
+    std::fs::write(&toml, &without).unwrap();
     for cmd in ["up", "upgrade"] {
-        std::fs::write(&toml, &old).unwrap();
         env.ok(&[cmd]);
-        let text = std::fs::read_to_string(&toml).unwrap();
-        assert!(text.contains(adapter), "{cmd}: {text}");
-        let calls = env.calls();
-        let root = ["docker", "exec", "-i", "-u", "0", CONTAINER];
-        find(&calls, &[&root[..], &put[..]].concat());
-        // Nothing to add: the file is left alone.
-        env.ok(&[cmd]);
-        let calls = env.calls();
-        assert!(
-            !calls.iter().any(|c| c.ends_with(&put.map(String::from))),
-            "{cmd}"
-        );
+        assert_eq!(read(&toml), without, "{cmd}");
+        assert!(!wrote(&env.calls()), "{cmd}");
     }
+
+    // An image that ships it newly (the record lacks it) adds it once, then respects a removal.
+    let older = record.replace(&format!("{adapter}, "), "");
+    assert_ne!(older, record);
+    std::fs::write(&host, &older).unwrap();
+    env.ok(&["upgrade"]);
+    assert_eq!(read(&toml), full);
+    assert!(read(&host).contains(adapter));
+    std::fs::write(&toml, &without).unwrap();
+    env.ok(&["up"]);
+    assert_eq!(read(&toml), without);
     std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 

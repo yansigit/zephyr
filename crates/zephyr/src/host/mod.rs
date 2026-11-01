@@ -192,10 +192,8 @@ impl Host {
             .data
             .projects()?
             .context("no projects dir: run `zephyr init`")?;
-        // As `init` does: a config older than the image lacks the extensions it now ships.
-        let mut doc = self.data.load()?;
-        if conf::add_image_extensions(&mut doc) {
-            self.data.save(&doc)?;
+        // As `init` does: the extensions the image ships since this config was written.
+        if self.data.add_image_extensions(&mut self.data.load()?)? {
             println!("added the image's new extensions to zephyr.toml");
         }
         let ids = agent_ids();

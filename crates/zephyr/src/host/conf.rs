@@ -186,6 +186,21 @@ impl Data {
         self.write("host.toml", &doc.to_string())
     }
 
+    /// `add_image_extensions` on `doc`, saved: zephyr.toml when it changed, then the record in
+    /// host.toml, so an extension is never marked offered without having been added.
+    pub fn add_image_extensions(&self, doc: &mut DocumentMut) -> anyhow::Result<bool> {
+        let mut host = self.host_doc()?.unwrap_or_default();
+        let before = host.to_string();
+        let added = add_image_extensions(doc, &mut host);
+        if added {
+            self.save(doc)?;
+        }
+        if host.to_string() != before {
+            self.write("host.toml", &host.to_string())?;
+        }
+        Ok(added)
+    }
+
     fn host_doc(&self) -> anyhow::Result<Option<DocumentMut>> {
         match self.read("host.toml") {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -409,27 +424,44 @@ pub fn order_accounts(doc: &mut DocumentMut, names: &[String]) -> anyhow::Result
     Ok(())
 }
 
-/// Adds the image's extensions a config lacks (one written before they were baked in), keeping the
-/// list in `EXTENSIONS` order so an upgraded config matches a fresh one. True when it added any.
-/// It cannot tell an extension the owner removed from one never listed, so it adds both back.
-pub fn add_image_extensions(doc: &mut DocumentMut) -> bool {
+/// Adds to `doc` (zephyr.toml) the image's extensions not offered before, keeping the list in
+/// `EXTENSIONS` order so an upgraded config matches a fresh one, and records every image extension
+/// as offered in `host` (host.toml's `offered_extensions`): one the owner removes stays removed.
+/// Without a record yet, what the config lists counts as offered. True when `doc` changed.
+pub fn add_image_extensions(doc: &mut DocumentMut, host: &mut DocumentMut) -> bool {
+    let strings = |item: Option<&Item>| -> Vec<String> {
+        item.and_then(Item::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    };
+    let mut offered = match host.get("offered_extensions") {
+        Some(item) => strings(Some(item)),
+        None => strings(doc.get("extensions")),
+    };
+    let new: Vec<&str> = EXTENSIONS
+        .into_iter()
+        .filter(|e| !offered.iter().any(|o| o == e))
+        .collect();
+    offered.extend(new.iter().map(|e| e.to_string()));
+    if strings(host.get("offered_extensions")) != offered {
+        host["offered_extensions"] = value(offered.iter().collect::<toml_edit::Array>());
+    }
     let list = doc
         .entry("extensions")
         .or_insert_with(|| value(toml_edit::Array::new()));
     let Some(list) = list.as_array_mut() else {
         return false;
     };
-    if EXTENSIONS
-        .iter()
-        .all(|e| list.iter().any(|v| v.as_str() == Some(e)))
-    {
-        return false;
-    }
     let mut entries: Vec<toml_edit::Value> = list.iter().cloned().collect();
-    for e in EXTENSIONS {
+    for e in new {
         if !entries.iter().any(|v| v.as_str() == Some(e)) {
             entries.push(toml_edit::Value::from(e));
         }
+    }
+    if entries.len() == list.len() {
+        return false;
     }
     // Stable: the image's paths sort into EXTENSIONS order, any the owner added keep their order
     // after them.
@@ -542,8 +574,9 @@ model = "p/m"
             "rpi = \"/usr/local/bin/rpi\"\nhome = \"/zephyr\"\n[owners]\nchat = [\"1\"]\n"
                 .parse()
                 .unwrap();
-        assert!(add_image_extensions(&mut doc));
-        assert!(!add_image_extensions(&mut doc));
+        let mut host = DocumentMut::new();
+        assert!(add_image_extensions(&mut doc, &mut host));
+        assert!(!add_image_extensions(&mut doc, &mut host));
         assert_eq!(extension_args(&doc).len(), 2 * EXTENSIONS.len());
         let cfg: crate::config::Config = toml::from_str(&doc.to_string()).unwrap();
         assert_eq!(cfg.extensions.len(), EXTENSIONS.len());
@@ -557,7 +590,7 @@ model = "p/m"
         )
         .parse()
         .unwrap();
-        add_image_extensions(&mut doc);
+        add_image_extensions(&mut doc, &mut DocumentMut::new());
         let list = doc.get("extensions").and_then(Item::as_array).unwrap();
         let paths: Vec<_> = list.iter().filter_map(|v| v.as_str()).collect();
         let mut want: Vec<&str> = EXTENSIONS.to_vec();
