@@ -133,7 +133,9 @@ impl Host {
         if !refresh && quiet(docker(&["image", "inspect", &self.image])) {
             return Ok(());
         }
-        if quiet(docker(&["pull", &self.image])) {
+        // Docker draws its own progress; the image is several GB the first time.
+        println!("pulling {}", self.image);
+        if shown(docker(&["pull", &self.image])) {
             return Ok(());
         }
         if let (Some(token), Some(user)) = (
@@ -141,8 +143,9 @@ impl Host {
             gh(&["api", "user", "--jq", ".login"]),
         ) {
             let registry = self.image.split('/').next().unwrap_or("ghcr.io");
+            println!("logging in to {registry} as {user} (gh) and pulling again");
             let mut login = docker(&["login", registry, "-u", &user, "--password-stdin"]);
-            if feed(&mut login, &token).is_ok() && quiet(docker(&["pull", &self.image])) {
+            if feed(&mut login, &token).is_ok() && shown(docker(&["pull", &self.image])) {
                 return Ok(());
             }
         }
@@ -270,8 +273,57 @@ impl Host {
         .args(["-w", "/", &self.image])
         .stdout(Stdio::null());
         run(&mut cmd)?;
-        println!("started {}. Logs: zephyr logs -f", self.container);
-        Ok(())
+        self.wait_ready()
+    }
+
+    /// Waits until the daemon answers on its socket (`zephyr status`), so "ready" means a message
+    /// sent now is taken. Starting it (rpi, the providers, the desktop) takes a few seconds.
+    fn wait_ready(&self) -> anyhow::Result<()> {
+        const LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+        const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let tty = std::io::stdout().is_terminal();
+        let start = std::time::Instant::now();
+        if !tty {
+            println!("started {}; waiting for its daemon", self.container);
+        }
+        while start.elapsed() < LIMIT {
+            let status = self
+                .exec(&[], &[], &["zephyr", "status"])
+                .stderr(Stdio::null())
+                .output();
+            if status.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("daemon: running"))
+            {
+                if tty {
+                    print!("\r\x1b[2K");
+                }
+                let secs = start.elapsed().as_secs();
+                println!(
+                    "{} is ready ({secs}s). Logs: zephyr logs -f",
+                    self.container
+                );
+                return Ok(());
+            }
+            if tty {
+                let frame = FRAMES[(start.elapsed().as_millis() / 100 % 10) as usize];
+                let secs = start.elapsed().as_secs();
+                print!("\r{frame} starting {} ({secs}s)", self.container);
+                let _ = std::io::stdout().flush();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        if tty {
+            println!();
+        }
+        eprintln!(
+            "{}'s daemon did not answer within {}s; its last log lines:",
+            self.container,
+            LIMIT.as_secs()
+        );
+        let _ = docker(&["logs", "--tail", "20", &self.container]).status();
+        bail!(
+            "{} started, but its daemon is not answering",
+            self.container
+        )
     }
 
     /// Once, before the first start with a split: the daemon's files leave the agent's home for
@@ -514,6 +566,11 @@ fn run(cmd: &mut Command) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// True when the command succeeds; its output goes to the terminal (docker's progress bars).
+fn shown(mut cmd: Command) -> bool {
+    cmd.status().is_ok_and(|s| s.success())
+}
+
 /// True when the command succeeds; its output is dropped.
 fn quiet(mut cmd: Command) -> bool {
     cmd.stdout(Stdio::null())
@@ -665,7 +722,8 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
         }
         "restart" => {
             a.rest()?;
-            run(&mut docker(&["restart", &h.container]))
+            run(docker(&["restart", &h.container]).stdout(Stdio::null()))?;
+            h.wait_ready()
         }
         "logs" => {
             let follow = a.flag("-f") | a.flag("--follow");

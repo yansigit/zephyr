@@ -308,6 +308,7 @@ fn login(
     h.data.save(&doc)?;
     println!("account {name}: {model}");
     if verify {
+        println!("checking {name} with a test call...");
         let out = h
             .exec_agent(
                 &[],
@@ -366,6 +367,7 @@ fn list_models(h: &Host, exts: &[&str], provider: Option<&str>) -> anyhow::Resul
 }
 
 fn pick_model(h: &Host, exts: &[&str], provider: Option<&str>) -> anyhow::Result<String> {
+    println!("loading the models...");
     let models = list_models(h, exts, provider)?;
     if models.is_empty() {
         bail!(
