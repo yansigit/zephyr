@@ -361,6 +361,7 @@ impl Output {
             arguments: args,
             thought_signature: None,
             namespace: None,
+            recorded: None,
         });
     }
 

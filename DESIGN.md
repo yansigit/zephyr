@@ -294,10 +294,10 @@ There are no per-call prompts. These hard limits hold every time:
 
 The `cursor` provider is this repo's own rpi plugin, `crates/zephyr-cursor` (`libzephyr_cursor.so`),
 not a staged package. It registers through `rpi-plugin-sdk`'s streaming-provider bridge, and its
-manifest lists the models it serves (rpi 0.14's manifest has no `replaceCatalog`). It talks to
-Cursor's agent service directly (Connect over HTTP/2, protobuf), because the package it replaced
-(`rpi-cursor-lite`) kept the request text-only: a Cursor model reached through it could never call a
-tool, which is all the old `Cursor (chat only)` label admitted.
+manifest lists the models it serves. It talks to Cursor's agent service directly (Connect over
+HTTP/2, protobuf), because the package it replaced (`rpi-cursor-lite`) kept the request text-only: a
+Cursor model reached through it could never call a tool, which is all the old `Cursor (chat only)`
+label admitted.
 
 - **One `Run` per turn.** Every request carries the whole conversation as `root_prompt_messages_json`
   blobs rebuilt from rpi's own history (§4.1's messages), plus this turn's user text (or a fixed
