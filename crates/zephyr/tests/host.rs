@@ -27,6 +27,7 @@ case "$1" in
     case " $* " in
       *" --list-models "*) printf 'provider model context\nanthropic claude-sonnet-5 200K\nopenai-codex gpt-5.5 400K\nopenai-codex gpt-5.4 400K\n' ;;
       *" auth check "*) echo '{"ready":true,"provider":"claude-code","source":"auth.json"}' ;;
+      *" zephyr status "*) echo "daemon: ${SHIM_DAEMON:-running}" ;;
       *" zephyr tui "*) exit "${SHIM_TUI_EXIT:-0}" ;;
     esac ;;
 esac
@@ -360,8 +361,13 @@ fn up_build_passes_the_gh_token_as_a_secret_only() {
     // A missing image is pulled; a failed pull logs in with gh's token on stdin.
     let out = env.zephyr_env(&["up"], &[("SHIM_IMAGE_MISSING", "1")]);
     assert!(out.status.success());
+    let text = stdout(&out);
+    assert!(text.contains("pulling zephyr-lanetest"), "{text}");
+    // `up` returns once the daemon answers, not when the container merely exists.
+    assert!(text.contains(&format!("{CONTAINER} is ready")), "{text}");
     let calls = env.calls();
     find(&calls, &["docker", "pull", "zephyr-lanetest"]);
+    find(&calls, &["docker", "exec", CONTAINER, "zephyr", "status"]);
     assert!(
         !calls.iter().any(|c| c[1] == "build"),
         "pull succeeded, so no build"
