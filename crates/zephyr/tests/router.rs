@@ -1571,3 +1571,102 @@ async fn a_job_gets_no_gateway() {
     );
     gw.shutdown().await;
 }
+
+fn main_session(home: &Path) -> String {
+    std::fs::read_to_string(home.join("sessions").join("main.json")).unwrap_or_default()
+}
+
+#[tokio::test]
+async fn btw_answers_from_a_snapshot_and_leaves_main_as_is() {
+    let home = home("btw");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "hi").await;
+    assert_eq!(gw.wait_replies(1).await, ["echo: [chat #1] hi"]);
+    let before = main_session(&home);
+    std::fs::write(home.join("usage.json"), r#"{"totalTokens": 40}"#).unwrap();
+
+    gw.say("m2", "owner", "/btw what did I say?").await;
+    let replies = gw.wait_replies(2).await;
+    let store = Store::open(&home.join("state.db")).unwrap();
+    assert_eq!(
+        store.spend(&store.today().unwrap()).unwrap().0,
+        40,
+        "booked"
+    );
+    std::fs::remove_file(home.join("usage.json")).unwrap();
+    let answer = &replies[1];
+    assert!(
+        answer.starts_with("[btw] echo: You are answering a side question"),
+        "{answer}"
+    );
+    assert!(
+        answer.contains("user: hi\n\nassistant: echo: [chat #1] hi"),
+        "{answer}"
+    );
+    assert!(answer.ends_with("Question: what did I say?"), "{answer}");
+    assert_eq!(main_session(&home), before, "main's session is left as is");
+    // A throwaway child: no session, no tools; main is not restarted.
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(home.join("argv.json")).unwrap()).unwrap();
+    for flag in [
+        "--no-session",
+        "--no-tools",
+        "--approve",
+        "--no-skills",
+        "--local-only",
+    ] {
+        assert!(argv.contains(&flag.to_string()), "{flag} in {argv:?}");
+    }
+    assert!(!argv.contains(&"--session-id".to_string()), "{argv:?}");
+    let starts = log(&home, "start");
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    assert_eq!(starts[1]["noSession"], true);
+    assert_eq!(starts[1]["noTools"], true);
+
+    gw.say("m3", "owner", "/btw").await;
+    assert!(gw.wait_replies(3).await[2].starts_with("[zephyr] usage: /btw <question>"));
+
+    // One at a time.
+    std::fs::write(home.join("slow"), "1").unwrap();
+    gw.say("m4", "owner", "/btw one").await;
+    gw.say("m5", "owner", "/btw two").await;
+    let replies = gw.wait_replies(5).await;
+    assert_eq!(replies[3], "[zephyr] a /btw is already running");
+    assert!(replies[4].starts_with("[btw] "), "{replies:?}");
+    assert!(replies[4].ends_with("Question: one"), "{replies:?}");
+    std::fs::remove_file(home.join("slow")).unwrap();
+
+    // The conversation goes on without the side questions in it.
+    gw.say("m6", "owner", "again").await;
+    assert_eq!(gw.wait_replies(6).await[5], "echo: [chat #6] again");
+    assert!(!main_session(&home).contains("/btw"));
+    assert!(!main_session(&home).contains("side question"));
+    gw.shutdown().await;
+    assert_eq!(inbox_status(&home, "dispatched"), 0);
+}
+
+#[tokio::test]
+async fn btw_answers_while_main_is_busy_without_disturbing_the_run() {
+    let home = home("btw-busy");
+    let gw = start(config(&home));
+    std::fs::write(home.join("tool_wait"), "").unwrap();
+    gw.say("m1", "owner", "[tool] look around").await;
+    wait(|| main_session(&home).contains("toolCall")).await; // main is mid-run, in its tool
+    let before = main_session(&home);
+
+    gw.say("m2", "owner", "/btw what are you doing?").await;
+    let replies = gw.wait_replies(1).await;
+    assert!(replies[0].starts_with("[btw] "), "{replies:?}");
+    assert!(
+        replies[0].contains("user: [tool] look around\n\n[tool: bash]"),
+        "{replies:?}"
+    );
+    assert_eq!(main_session(&home), before, "the run is left as is");
+
+    std::fs::remove_file(home.join("tool_wait")).unwrap();
+    let replies = gw.wait_replies(2).await;
+    assert_eq!(replies[1], "echo: [chat #1] [tool] look around");
+    assert!(log(&home, "abort").is_empty());
+    assert!(log(&home, "queue_message").is_empty());
+    gw.shutdown().await;
+}

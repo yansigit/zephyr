@@ -8,6 +8,7 @@
  │  › /new                     start a fresh conversation; memory and rules … │
  │    /switch                  list earlier conversations                     │
  │    /switch <id>             go back to one                                 │
+ │    /btw <question>          ask a side question; the conversation is left… │
  │    /help                    this list                                      │
  │ Agent                                                                      │
  │    /stop                    stop the current reply                         │
@@ -19,6 +20,5 @@
  │    /memory undo             drop the waiting change, else the last one     │
  │    /memory log              the last 10 memory commits                     │
  │    /rules                   your standing rules                            │
- │    /rule <text>             add a rule the agent reads first               │
- ╰─────────────────────────────────────────────────────────────── 1-16 of 28 ─╯
+ ╰─────────────────────────────────────────────────────────────── 1-16 of 29 ─╯
   ↑↓ choose · ⏎ insert · type to filter · esc close

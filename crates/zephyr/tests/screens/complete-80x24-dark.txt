@@ -12,12 +12,12 @@
    │ today: 41.2k tokens, $0.38 of $5
 
  ≋ ready
- › /new          start a fresh conversation; memory and rules carry over
-   /switch       list earlier conversations
-   /switch <id>  go back to one
-   /help         this list
-   /stop         stop the current reply
-   /model        pick a model
+ › /new             start a fresh conversation; memory and rules carry over
+   /switch          list earlier conversations
+   /switch <id>     go back to one
+   /btw <question>  ask a side question; the conversation is left as is
+   /help            this list
+   /stop            stop the current reply
  ╭────────────────────────────────────────────────────────────────────────────╮
  │ /                                                                          │
  ╰────────────────────────────────────────────────────────────────────────────╯

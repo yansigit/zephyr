@@ -5,13 +5,13 @@
    ─────────────────────────────────────────────────────────── Fri 30 Oct 2026 ───────────────────────────────────────────────────────────
 
  ▌ remind me to renew the domain on friday                                                                                 discord · 14:02
-
  ╭─ commands ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │ › type to filter                                                                                                                       │
  │ Chat                                                                                                                                   │
  │  › /new                     start a fresh conversation; memory and rules carry over                                                    │
  │    /switch                  list earlier conversations                                                                                 │
  │    /switch <id>             go back to one                                                                                             │
+ │    /btw <question>          ask a side question; the conversation is left as is                                                        │
  │    /help                    this list                                                                                                  │
  │ Agent                                                                                                                                  │
  │    /stop                    stop the current reply                                                                                     │
