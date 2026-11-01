@@ -71,7 +71,8 @@ Changes apply by themselves; nothing needs `zephyr restart`. The commands above,
 A file that does not load is not applied, and the daemon keeps its current settings. From any
 channel: `/model` shows the models, `/model PROVIDER/MODEL` switches (to the account on that
 provider), `/status` shows the agent's account and model, `/reload` re-reads the files, and `/new`
-starts a fresh conversation (memory and rules carry over; the old one stays in `sessions/`).
+starts a fresh conversation (memory and rules carry over; the old one stays in `sessions/`), and
+`/switch` lists the earlier ones and `/switch ID` goes back to one.
 `/login` signs an account in from here: `/login` lists the provider ids, `/login PROVIDER [ACCOUNT]
 [MODEL]` starts an OAuth sign-in and needs no re-exec (a key or a token is refused — it is typed in
 `zephyr attach`, which masks it), and `/login cancel [ID|PROVIDER]` stops the ones you gave up on.
@@ -108,7 +109,7 @@ goes on too long, and you are told why. A job run also stops after 30 minutes.
 `/rule never push to main` adds a rule the agent sees first in every session, above its memory,
 from the next message on. `/rules` lists them, `/rule rm 2` removes one. Rules live with the
 daemon, out of the agent's reach, and do not fade when a long conversation is summarised the way
-instructions given in chat can. `/new` starts a fresh conversation; rules and memory carry over.
+instructions given in chat can. `/new` starts a fresh conversation; rules and memory carry over, and `/switch` goes back to an earlier one.
 
 ## The agent's browser and desktop
 
@@ -138,6 +139,10 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
 - **Files and jobs.** The agent's `send_file` tool sends you a file (up to 10 MB: a screenshot, a
   PDF) with its reply. Its `schedule` tool only proposes a job: you are shown it, and it runs after
   `/job ok N` (`/job rm N` drops it; `/job list` marks the ones waiting).
+- **Read-only commands.** The agent's `gateway` tool runs `/status`, `/model`, `/switch`, `/rules`,
+  `/memory diff`, `/memory log` or `/job list` and reads the output in the same turn. It cannot run
+  anything that approves or changes something (`/memory ok`, `/job ok`, `/rule`, `/model X`, ...);
+  those stay yours. In a scheduled job it gets no answer.
 
 A site's terms may forbid automated use; a site that catches the agent can flag the account it is
 signed in as.

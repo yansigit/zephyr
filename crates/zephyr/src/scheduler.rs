@@ -221,7 +221,7 @@ async fn attempt_once(
     let max_turns = cfg.budget.as_ref().and_then(|b| b.run_turns);
     let mut tally = crate::rpc::Tally::default();
     let ended = tokio::select! {
-        r = tokio::time::timeout(limit, prompt(&mut child, &run.job.prompt, &mut tally, max_turns)) => Some(r),
+        r = tokio::time::timeout(limit, prompt(cfg, &mut child, &run.job.prompt, &mut tally, max_turns)) => Some(r),
         _ = until_paused(store) => None,
     };
     let out = match ended {
@@ -261,6 +261,7 @@ async fn attempt_once(
 /// aborts it at `max_turns`. The inner result is the final assistant text, or why the run
 /// ended without one.
 async fn prompt(
+    cfg: &Config,
     child: &mut Child,
     text: &str,
     tally: &mut crate::rpc::Tally,
@@ -275,6 +276,13 @@ async fn prompt(
             Some(ev) if ev["type"] == "agent_settled" => break ev,
             Some(ev) => {
                 tally.add(&ev);
+                // A job is not the owner's conversation; answered at once so it does not wait.
+                // Off the list, the plugin has refused the call already and nothing waits.
+                if let Some((id, command)) = crate::tools::gateway_call(&ev) {
+                    if zephyr_policy::tools::GATEWAY_COMMANDS.contains(&command) {
+                        crate::tools::answer_gateway(cfg, id, "not available in scheduled runs");
+                    }
+                }
                 if cut.is_none() && max_turns.is_some_and(|max| tally.turns >= max) {
                     cut = max_turns;
                     child.call(json!({"type": "abort"})).await?;
@@ -372,7 +380,7 @@ pub fn check(schedule: &str, tz: &TimeZone) -> Result<String, String> {
     Ok(next.unwrap_or_default())
 }
 
-fn list(store: &Store) -> rusqlite::Result<String> {
+pub(crate) fn list(store: &Store) -> rusqlite::Result<String> {
     let jobs = store.jobs()?;
     if jobs.is_empty() {
         return Ok("[zephyr] no jobs".into());

@@ -440,8 +440,34 @@ impl<'a> Router<'a> {
             let _ = self.tap.send(ev.clone()); // no receivers is fine
             self.tally.add(ev);
             self.track(ev);
+            if let Some((id, command)) = crate::tools::gateway_call(ev) {
+                // Off the list, the plugin has already refused the call: nobody waits for it.
+                if let Some(text) = self.gateway_reply(command) {
+                    crate::tools::answer_gateway(&self.cfg, id, &text);
+                }
+            }
         }
         ev
+    }
+
+    /// The output of a read-only command the agent ran with `gateway` (DESIGN §4.11), checked
+    /// again here: the plugin's list is the agent's side of the boundary, this is the daemon's.
+    /// Each is the same text the owner would get; none restarts or queues anything mid-turn.
+    /// `None`, and nothing run, for a command off the list.
+    fn gateway_reply(&self, command: &str) -> Option<String> {
+        if !zephyr_policy::tools::GATEWAY_COMMANDS.contains(&command) {
+            eprintln!("zephyr: gateway {command:?} is not on the list; not run");
+            return None;
+        }
+        Some(match command {
+            "/status" => self.status(),
+            "/model" => self.models(),
+            "/switch" => self.list_sessions(),
+            "/job list" => crate::scheduler::list(&self.store)
+                .unwrap_or_else(|e| format!("[zephyr] listing jobs failed: {e}")),
+            memory => crate::memory::command(&self.cfg.home, self.cfg.state_dir(), memory)
+                .map_or_else(String::new, |(reply, _)| reply),
+        })
     }
 
     /// Keeps `Snapshot.run` in step with the child's run events. The origin comes from
@@ -888,6 +914,8 @@ impl<'a> Router<'a> {
             ("/model", "") => self.models(),
             ("/model", model) => self.switch_model(model).await,
             ("/new", "") => self.new_session().await,
+            ("/switch", "") => self.list_sessions(),
+            ("/switch", id) => self.switch(id).await,
             ("/login", arg) => self.login(arg, from).await,
             _ => return None,
         })
@@ -1174,9 +1202,16 @@ impl<'a> Router<'a> {
     /// (ClawSafety Table 3), so the owner can cut one off.
     async fn new_session(&mut self) -> String {
         let id = format!("{MAIN_SESSION}-{}", crate::now());
-        if let Err(e) = self.store.set_main_session(&id) {
-            return format!("[zephyr] no new conversation: {e}");
+        match self.switch_main(&id).await {
+            Ok(when) => format!("[zephyr] new conversation {when}; memory and rules are kept"),
+            Err(e) => format!("[zephyr] no new conversation: {e}"),
         }
+    }
+
+    /// Points `main` at `id` and restarts the child on it once idle, never mid-turn.
+    /// Returns when that happens, for the reply.
+    async fn switch_main(&mut self, id: &str) -> rusqlite::Result<&'static str> {
+        self.store.set_main_session(id)?;
         self.restart = true;
         let when = if self.busy {
             "after the current reply"
@@ -1184,7 +1219,38 @@ impl<'a> Router<'a> {
             "from the next message"
         };
         self.restart_if_idle().await;
-        format!("[zephyr] new conversation {when}; memory and rules are kept")
+        Ok(when)
+    }
+
+    /// `/switch`: the saved conversations, newest first, the current one marked.
+    fn list_sessions(&self) -> String {
+        let current = self.store.main_session().unwrap_or_default();
+        let mut lines = vec!["[zephyr] conversations (/switch <id> goes back):".to_string()];
+        for (id, at) in crate::rpc::saved_sessions(&self.cfg.session_dir())
+            .into_iter()
+            .take(10)
+        {
+            let mark = if id == current { "*" } else { " " };
+            let now = if id == current { "  (current)" } else { "" };
+            lines.push(format!("{mark} {id}  {}{now}", crate::pool::iso(at)));
+        }
+        lines.join("\n")
+    }
+
+    /// `/switch <id>`: back to a conversation `/new` left on disk. Only ids found there, since
+    /// the id goes to rpi as `--session-id`.
+    async fn switch(&mut self, id: &str) -> String {
+        if self.store.main_session().is_ok_and(|c| c == id) {
+            return format!("[zephyr] already on {id}");
+        }
+        let saved = crate::rpc::saved_sessions(&self.cfg.session_dir());
+        if !saved.iter().any(|(s, _)| s == id) {
+            return format!("[zephyr] no conversation {id}; /switch lists them");
+        }
+        match self.switch_main(id).await {
+            Ok(when) => format!("[zephyr] back to {id} {when}"),
+            Err(e) => format!("[zephyr] could not switch to {id}: {e}"),
+        }
     }
 
     fn status(&self) -> String {

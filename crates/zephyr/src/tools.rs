@@ -1,15 +1,62 @@
-//! The daemon's half of the agent's `send_file` and `schedule` tools (DESIGN §4.11). The policy
-//! plugin registers them and checks their arguments in the child. Their calls reach the daemon
-//! in the run's tally, read from rpi's event stream, and are carried out here when it settles.
+//! The daemon's half of the agent's `send_file`, `schedule` and `gateway` tools (DESIGN §4.11).
+//! The policy plugin registers them and checks their arguments in the child. `send_file` and
+//! `schedule` calls reach the daemon in the run's tally, read from rpi's event stream, and are
+//! carried out here when it settles; a `gateway` call is answered as soon as it starts.
 
 use crate::config::Config;
 use crate::store::Store;
 use anyhow::{bail, Context};
 use serde_json::Value;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use zephyr_policy::tools::MAX_FILE;
+
+/// Where the child's `gateway` tool waits for its answers (`ZEPHYR_GATEWAY_DIR`).
+pub fn gateway_dir(cfg: &Config) -> PathBuf {
+    cfg.home.join(".gateway")
+}
+
+/// `(tool call id, command)` when `ev` starts a `gateway` call. From rpi's event stream, so
+/// the agent cannot fake one; the command is still checked by whoever answers.
+pub fn gateway_call(ev: &Value) -> Option<(&str, &str)> {
+    if ev["type"] != "tool_execution_start" || ev["toolName"] != "gateway" {
+        return None;
+    }
+    let id = ev["toolCallId"].as_str()?;
+    Some((id, ev["args"]["command"].as_str().unwrap_or("").trim()))
+}
+
+/// Hands `text` to the waiting `gateway` call `call_id`: written as the agent, then renamed into
+/// place so the plugin never reads half of it.
+pub fn answer_gateway(cfg: &Config, call_id: &str, text: &str) {
+    let Some(path) = zephyr_policy::tools::gateway_file(&gateway_dir(cfg), call_id) else {
+        return eprintln!("zephyr: gateway call id {call_id:?} is not a plain name; not answered");
+    };
+    // The id has no '.', so this never collides with another call's answer.
+    let tmp = path.with_extension("tmp");
+    let _fs = crate::agent::fs();
+    if let Err(e) = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path)) {
+        eprintln!("zephyr: answering gateway call {call_id}: {e}");
+    }
+    sweep(&gateway_dir(cfg), GATEWAY_STALE);
+}
+
+/// Far past the plugin's 10 s wait: an answer this old was written after its call gave up.
+const GATEWAY_STALE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Removes the files in `dir` older than `age`, so late answers do not pile up.
+fn sweep(dir: &Path, age: std::time::Duration) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().is_ok_and(|e| e > age));
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
 
 /// Carries out a run's requests for `to`, the `(channel, recipient)` it answers: a file goes to
 /// the outbox, a proposed job waits for `/job ok`. A failure is told to `to`.
@@ -111,5 +158,32 @@ pub fn discard(copy: &str) {
         dir.filter(|d| d.parent().and_then(Path::file_name) == Some("files".as_ref()))
     {
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sweep_drops_only_stale_answers() {
+        let dir = std::env::temp_dir().join(format!(
+            "zephyr-gw-sweep-{}-{}",
+            std::process::id(),
+            crate::unix_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (old, new) = (dir.join("c1"), dir.join("c2"));
+        std::fs::write(&old, "late").unwrap();
+        std::fs::write(&new, "fresh").unwrap();
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(hour_ago)
+            .unwrap();
+        super::sweep(&dir, super::GATEWAY_STALE);
+        assert!(!old.exists(), "a late answer is dropped");
+        assert!(new.exists(), "a waiting call's answer stays");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

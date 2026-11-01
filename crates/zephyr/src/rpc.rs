@@ -15,6 +15,54 @@ use tokio::sync::{mpsc, oneshot};
 /// (`Store::main_session`). Attach always shows this name.
 pub const MAIN_SESSION: &str = "main";
 
+/// The main sessions on disk, newest first, as (id, mtime in unix secs). rpi 0.15 files them as
+/// `<dir>/<cwd folder>/<ISO>_<id>.jsonl`, fake-rpi as `<dir>/<id>.json`. Only `main` and the
+/// `main-<secs>` ids `/new` makes count, so `/switch` never hands rpi a job's or a stray name.
+pub fn saved_sessions(dir: &std::path::Path) -> Vec<(String, i64)> {
+    let entries = |d: &std::path::Path| {
+        std::fs::read_dir(d)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect::<Vec<_>>()
+    };
+    let mut found: HashMap<String, i64> = HashMap::new();
+    for e in entries(dir) {
+        let files = if e.path().is_dir() {
+            entries(&e.path())
+        } else {
+            vec![e]
+        };
+        for f in files {
+            let name = f.file_name().to_string_lossy().into_owned();
+            let Some(stem) = name
+                .strip_suffix(".jsonl")
+                .or_else(|| name.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let id = stem.rsplit_once('_').map_or(stem, |(_, id)| id);
+            let numbered = id
+                .strip_prefix("main-")
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+            if id != MAIN_SESSION && !numbered {
+                continue;
+            }
+            let mtime = f
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs() as i64);
+            let at = found.entry(id.to_string()).or_insert(mtime);
+            *at = (*at).max(mtime);
+        }
+    }
+    let mut list: Vec<_> = found.into_iter().collect();
+    list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    list
+}
+
 /// The slash command the policy plugin registers as proof that it loaded.
 pub const POLICY_BEACON: &str = "zephyr-policy";
 
@@ -60,6 +108,7 @@ impl Child {
         {
             let _fs = crate::agent::fs();
             std::fs::create_dir_all(cfg.session_dir())?;
+            std::fs::create_dir_all(crate::tools::gateway_dir(cfg))?;
         }
         let (model, agent_dir) = match account {
             Some(a) => (Some(&a.model), Some(crate::pool::prepare(cfg, a)?)),
@@ -97,6 +146,10 @@ impl Child {
         if let Some(dir) = &agent_dir {
             cmd.env("RPI_CODING_AGENT_DIR", dir);
         }
+        cmd.env(
+            zephyr_policy::tools::GATEWAY_DIR_ENV,
+            crate::tools::gateway_dir(cfg),
+        );
         if let Some(display) = crate::desktop::ensure() {
             cmd.env("DISPLAY", display);
         }
@@ -314,6 +367,32 @@ mod tests {
             tally.requests,
             [("send_file".to_string(), serde_json::json!({"path": "a"}))]
         );
+    }
+
+    #[test]
+    fn saved_sessions_reads_both_layouts_and_only_main_ids() {
+        let dir = std::env::temp_dir().join(format!(
+            "zephyr-rpc-sessions-{}-{}",
+            std::process::id(),
+            crate::unix_millis()
+        ));
+        let real = dir.join("--zephyr--");
+        std::fs::create_dir_all(&real).unwrap();
+        for f in [
+            "2026-10-30T03-32-24-353Z_main.jsonl",
+            "2026-10-30T03-32-24-353Z_main.jsonl.lock",
+            "2026-11-01T05-30-57-396Z_main-1793511057.jsonl",
+            "2026-11-01T06-00-00-000Z_job-3-7.jsonl",
+            "2026-11-01T06-00-00-000Z_main-x.jsonl",
+        ] {
+            std::fs::write(real.join(f), "").unwrap();
+        }
+        std::fs::write(dir.join("main-42.json"), "").unwrap();
+        let mut ids: Vec<String> = saved_sessions(&dir).into_iter().map(|s| s.0).collect();
+        ids.sort();
+        assert_eq!(ids, ["main", "main-1793511057", "main-42"]);
+        assert!(saved_sessions(&dir.join("missing")).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

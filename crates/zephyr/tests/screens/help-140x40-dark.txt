@@ -6,12 +6,12 @@
 
  ▌ remind me to renew the domain on friday                                                                                 discord · 14:02
 
- ≋ Done. I scheduled renew kimchigoose.com for Fri 09:00 KST.
-   ▸ schedule  add "renew domain" fri 09:00                                                                                          ✓ 0.2s
  ╭─ commands ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │ › type to filter                                                                                                                       │
  │ Chat                                                                                                                                   │
  │  › /new                     start a fresh conversation; memory and rules carry over                                                    │
+ │    /switch                  list earlier conversations                                                                                 │
+ │    /switch <id>             go back to one                                                                                             │
  │    /help                    this list                                                                                                  │
  │ Agent                                                                                                                                  │
  │    /stop                    stop the current reply                                                                                     │

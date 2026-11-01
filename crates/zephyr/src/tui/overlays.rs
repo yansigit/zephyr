@@ -17,6 +17,8 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "/new",
         "start a fresh conversation; memory and rules carry over",
     ),
+    ("Chat", "/switch", "list earlier conversations"),
+    ("Chat", "/switch <id>", "go back to one"),
     ("Chat", "/help", "this list"),
     ("Agent", "/stop", "stop the current reply"),
     ("Agent", "/model", "pick a model"),
@@ -1169,17 +1171,17 @@ mod tests {
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(got.len(), 8);
         assert_eq!(got[2], format!("│ Chat{}│", " ".repeat(73)));
-        assert!(got[7].ends_with(" 1-5 of 26 ─╯"), "{got:?}");
-        for _ in 0..6 {
+        assert!(got[7].ends_with(" 1-5 of 28 ─╯"), "{got:?}");
+        for _ in 0..8 {
             key(&mut o, press(KeyCode::Down), &rows);
         }
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
-        // The seventh command is /memory ok; the window follows it down.
+        // The ninth command is /memory ok; the window follows it down.
         assert_eq!(
             got[6],
             "│  › /memory ok               let the agent see the waiting change             │"
         );
-        assert!(got[7].ends_with(" 6-10 of 26 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 8-12 of 28 ─╯"), "{got:?}");
         key(&mut o, press(KeyCode::Down), &rows);
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),
