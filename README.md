@@ -122,7 +122,7 @@ instructions given in chat can. `/new` starts a fresh conversation; rules and me
     them: they are removed from rpi's environment and every other process zephyr starts for it. To
     give the agent one (an API key a provider reads, say), list its name in `[agent] env = ["NAME"]`.
   - `tui.token`: the `zephyr attach` token.
-  - `host.toml`: the projects folder, optionally `memory = "8g"` to cap the container's memory, and `offered_extensions`: the image extensions `init`, `up` and `upgrade` have already added to `zephyr.toml`, so one you remove stays removed.
+  - `host.toml`: the projects folder, optionally `memory = "8g"` to cap the container's memory, and `offered_extensions`: the image extensions `init`, `up` and `upgrade` have already added to `zephyr.toml`, so one you remove stays removed. The first `up` after upgrading to a zephyr that keeps this record adds once any image extension removed earlier, or every one if the config lists none; after that, a removal sticks.
     Used only on the host, at `zephyr up`.
   - `state.db`: inbox, outbox, jobs, spend.
 

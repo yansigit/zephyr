@@ -15,7 +15,7 @@ log="$SHIM_DIR/calls.log"
 # `zephyr __file` in the container serves the daemon's files from $SHIM_DIR/files.
 case " $* " in
   *" __file get "*) f="$SHIM_DIR/files/${@: -1}"; [ -f "$f" ] || exit 3; cat "$f"; exit 0 ;;
-  *" __file put "*) mkdir -p "$SHIM_DIR/files"; cat > "$SHIM_DIR/files/${@: -1}"; exit 0 ;;
+  *" __file put "*) [ -n "$SHIM_PUT_FAIL" ] && exit 1; mkdir -p "$SHIM_DIR/files"; cat > "$SHIM_DIR/files/${@: -1}"; exit 0 ;;
 esac
 [ -n "$GH_TOKEN" ] && echo "GH_TOKEN set" >> "$SHIM_DIR/env.log"
 case "$1" in
@@ -834,20 +834,39 @@ fn up_and_upgrade_add_the_images_new_extensions_through_the_container() {
     std::fs::write(&toml, &without).unwrap();
     std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o000)).unwrap();
 
-    let put = ["zephyr", "__file", "put", "zephyr.toml"];
-    let wrote = |calls: &[Vec<String>]| calls.iter().any(|c| c.ends_with(&put.map(String::from)));
+    // `up` removes the container first, so the files go through a throwaway root container.
+    let up = |cmd: &str, extra: &[(&str, &str)]| {
+        let env_vars = [&[("SHIM_STATE", "exited")][..], extra].concat();
+        let out = env.zephyr_env(&[cmd], &env_vars);
+        assert!(
+            out.status.success(),
+            "{cmd}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    let put = |name: &str| ["zephyr", "__file", "put", name].map(String::from);
+    let throwaway = |calls: &[Vec<String>], name: &str| {
+        calls.iter().any(|c| {
+            c.starts_with(&["docker", "run", "--rm", "-i", "-u", "0"].map(String::from))
+                && c.windows(2).any(|w| w == ["--cap-drop", "ALL"])
+                && c.ends_with(&put(name))
+        })
+    };
+    let wrote = |calls: &[Vec<String>]| calls.iter().any(|c| c.ends_with(&put("zephyr.toml")));
+
     // No record yet: what the config lists counts as offered, so the adapter is new to it.
-    env.ok(&["up"]);
+    up("up", &[]);
     assert_eq!(read(&toml), full);
     assert!(read(&host).contains(adapter));
     let calls = env.calls();
-    let root = ["docker", "exec", "-i", "-u", "0", CONTAINER];
-    find(&calls, &[&root[..], &put[..]].concat());
+    assert!(throwaway(&calls, "zephyr.toml"), "{calls:#?}");
+    assert!(throwaway(&calls, "host.toml"), "{calls:#?}");
 
     // The owner removes it: it stays removed, and the file is left alone.
     std::fs::write(&toml, &without).unwrap();
     for cmd in ["up", "upgrade"] {
-        env.ok(&[cmd]);
+        up(cmd, &[]);
         assert_eq!(read(&toml), without, "{cmd}");
         assert!(!wrote(&env.calls()), "{cmd}");
     }
@@ -856,12 +875,26 @@ fn up_and_upgrade_add_the_images_new_extensions_through_the_container() {
     let older = record.replace(&format!("{adapter}, "), "");
     assert_ne!(older, record);
     std::fs::write(&host, &older).unwrap();
-    env.ok(&["upgrade"]);
+    up("upgrade", &[]);
     assert_eq!(read(&toml), full);
     assert!(read(&host).contains(adapter));
+    let calls = env.calls();
+    assert!(throwaway(&calls, "zephyr.toml") && throwaway(&calls, "host.toml"));
     std::fs::write(&toml, &without).unwrap();
-    env.ok(&["up"]);
+    up("up", &[]);
     assert_eq!(read(&toml), without);
+
+    // A failed write only warns: the container still starts.
+    std::fs::write(&host, &older).unwrap();
+    env.calls();
+    let out = up("up", &[("SHIM_PUT_FAIL", "1")]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("could not add the image's new extensions"),
+        "{err}"
+    );
+    assert_eq!(read(&toml), without);
+    find(&env.calls(), &["docker", "run", "-d", "--name", CONTAINER]);
     std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 

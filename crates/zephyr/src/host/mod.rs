@@ -193,8 +193,17 @@ impl Host {
             .projects()?
             .context("no projects dir: run `zephyr init`")?;
         // As `init` does: the extensions the image ships since this config was written.
-        if self.data.add_image_extensions(&mut self.data.load()?)? {
-            println!("added the image's new extensions to zephyr.toml");
+        // A convenience only: the old container is already gone, so a failure must not stop the start.
+        match self
+            .data
+            .load()
+            .and_then(|mut doc| self.data.add_image_extensions(&mut doc))
+        {
+            Ok(true) => println!("added the image's new extensions to zephyr.toml"),
+            Ok(false) => {}
+            Err(e) => eprintln!(
+                "warning: could not add the image's new extensions: {e:#}; run `zephyr init` later"
+            ),
         }
         let ids = agent_ids();
         let data = self.data.dir.display();
