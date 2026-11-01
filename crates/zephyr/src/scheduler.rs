@@ -507,7 +507,8 @@ mod tests {
     fn missed_runs_catch_up_once() {
         let mut s = store("job-catch-up");
         s.add_job("a", "*/5 * * * *", "p", "chat", "o").unwrap();
-        let back = crate::now() + 3 * 24 * 3600; // three days of missed runs
+        // Three days of missed runs, on a slot: one second before a slot, the next one is due.
+        let back = (crate::now() + 3 * 24 * 3600) / 300 * 300;
         assert_eq!(s.claim_due(back, utc).unwrap().len(), 1);
         assert!(s.claim_due(back + 1, utc).unwrap().is_empty());
         assert_eq!(s.claim_due(back + 301, utc).unwrap().len(), 1);
