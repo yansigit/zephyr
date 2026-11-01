@@ -5,16 +5,18 @@
 use crate::channel::Inbound;
 use crate::config::{Config, BUDGET_NOTICE};
 use crate::rpc::{message_text, Child};
-use crate::store::{JobRun, Store};
+use crate::store::Store;
 use croner::parser::{CronParser, Seconds, Year};
 use jiff::{tz::TimeZone, Timestamp};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify};
 
 const TICK: Duration = Duration::from_secs(30);
+/// How often background work's old leftovers are swept (`retention`).
+const SWEEP_EVERY: Duration = Duration::from_secs(3600);
 /// How often the pause flag (set by `/pause` or a budget trip, in the store) is read.
 const PAUSE_POLL: Duration = Duration::from_secs(1);
 /// The DESIGN §4.4 per-run wall clock cap; `Config::job_timeout` defaults to it.
@@ -32,7 +34,34 @@ pub struct Wake {
     pub outbox: Notify,
     /// A job run is in progress, so the daemon does not re-exec under it.
     pub running: AtomicBool,
+    /// A task was queued or asked to stop (DESIGN §4.12).
+    pub tasks: Notify,
+    /// A task wrote its report to the inbox: the router dispatches it.
+    pub inbox: Notify,
 }
+
+/// One unattended prompt in a fresh child: a job run or a background task.
+pub struct Spec<'a> {
+    pub prompt: &'a str,
+    /// `[zephyr] job #1 (name) run 2`: how failures name the run.
+    pub label: String,
+    /// The first attempt's session id; a retry on another account adds `-<n>`.
+    pub session: String,
+    /// The `(channel, recipient)` its `send_file`, `schedule` and notices go to.
+    pub to: (String, String),
+    /// What its `gateway` and `task` calls get: neither belongs to an unattended run.
+    pub refuse: &'static str,
+    /// The task whose stop flag also ends it.
+    pub task: Option<i64>,
+    /// Reopen `session` and carry on (DESIGN §4.12) instead of sending `prompt` to a fresh one.
+    pub resume: bool,
+}
+
+/// What a run resumed after a restart is told (OpenClaw's restart-recovery wording): rpi
+/// records a tool call cut mid-flight as of unknown outcome, so the model checks before redoing.
+pub const RESUME_NOTE: &str = "Zephyr restarted while you were working. Check the current \
+    state of anything that was in progress (files, processes, tasks, external actions) before \
+    repeating it, then continue.";
 
 /// `cfg.timezone`, else the system's.
 pub fn zone(cfg: &Config) -> anyhow::Result<TimeZone> {
@@ -66,11 +95,16 @@ fn paused(store: &Store) -> bool {
         .is_some()
 }
 
-async fn until_paused(store: &mut Store) {
+/// Waits until the gateway is paused (`": paused"`) or `task`'s stop flag is set (`""`).
+async fn until_cut(store: &mut Store, task: Option<i64>) -> &'static str {
     loop {
         tokio::time::sleep(PAUSE_POLL).await;
         if paused(store) {
-            return;
+            return ": paused";
+        }
+        // Fails closed like the pause flag: an unreadable flag stops the task.
+        if task.is_some_and(|id| store.stop_requested(id).unwrap_or(true)) {
+            return "";
         }
     }
 }
@@ -98,6 +132,7 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
     let mut tick = tokio::time::interval(TICK);
     let mut poll = tokio::time::interval(PAUSE_POLL);
     let mut was_paused = false;
+    let mut swept: Option<Instant> = None;
     loop {
         let woke = tokio::select! {
             _ = tick.tick() => true,
@@ -107,6 +142,17 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
         if cfgs.has_changed().unwrap_or(false) {
             cfg = cfgs.borrow_and_update().clone();
             tz = zone(&cfg)?; // checked by Config::validate
+        }
+        // Hourly, from the first tick on: leftovers older than 30 days (DESIGN §4.1).
+        if woke && swept.is_none_or(|t| t.elapsed() >= SWEEP_EVERY) {
+            swept = Some(Instant::now());
+            match crate::retention::sweep(&cfg, &store, crate::retention::AGE) {
+                Ok(0) => {}
+                Ok(n) => {
+                    eprintln!("zephyr: removed {n} files of background work older than 30 days")
+                }
+                Err(e) => eprintln!("zephyr: sweeping old background files failed: {e}"),
+            }
         }
         let now_paused = paused(&store);
         // A resume works through what waited without waiting for the next tick.
@@ -127,7 +173,19 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
                 }
             };
             wake.running.store(true, Ordering::SeqCst);
-            let (status, output, crossed) = execute(&cfg, &mut store, &run).await;
+            let spec = Spec {
+                prompt: &run.job.prompt,
+                label: format!(
+                    "[zephyr] job #{} ({}) run {}",
+                    run.job.id, run.job.name, run.id
+                ),
+                session: format!("job-{}-{}", run.job.id, run.id),
+                to: (run.job.channel.clone(), run.job.recipient.clone()),
+                refuse: "not available in scheduled runs",
+                task: None,
+                resume: false,
+            };
+            let (status, output, crossed) = execute(&cfg, &mut store, &spec).await;
             wake.running.store(false, Ordering::SeqCst);
             // The run's memory edits are committed as main's settle would commit them.
             let memory = crate::memory::commit_if_changed(&cfg.home, cfg.state_dir())
@@ -155,20 +213,22 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
     }
 }
 
-/// One prompt in a fresh child, bounded by `cfg.job_timeout` and aborted by a pause. The
-/// run's usage is charged to today's budget. Returns `(status, output, crossed the budget)`.
-async fn execute(cfg: &Config, store: &mut Store, run: &JobRun) -> (&'static str, String, bool) {
-    let label = format!(
-        "[zephyr] job #{} ({}) run {}",
-        run.job.id, run.job.name, run.id
-    );
+/// One prompt in a fresh child, bounded by `cfg.job_timeout` and aborted by a pause (or, for a
+/// task, its stop flag). The run's usage is charged to today's budget. Returns `(status,
+/// output, crossed the budget)`; status is `completed`, `failed` or `stopped`.
+pub async fn execute(
+    cfg: &Config,
+    store: &mut Store,
+    spec: &Spec<'_>,
+) -> (&'static str, String, bool) {
+    let label = &spec.label;
     // A job runs on the first account not cooling down. A rate-limited attempt cools that
     // account and retries on the next one, in a fresh session; each account is tried once.
     let mut crossed = false;
     for attempt in 0.. {
         let session = match attempt {
-            0 => format!("job-{}-{}", run.job.id, run.id),
-            n => format!("job-{}-{}-{n}", run.job.id, run.id),
+            0 => spec.session.clone(),
+            n => format!("{}-{n}", spec.session),
         };
         let account = if cfg.accounts.is_empty() {
             None
@@ -185,7 +245,9 @@ async fn execute(cfg: &Config, store: &mut Store, run: &JobRun) -> (&'static str
                 }
             }
         };
-        let (status, text, over) = attempt_once(cfg, store, run, &label, &session, account).await;
+        // Only the first attempt reopens the stored session; a failover starts fresh.
+        let resume = spec.resume && attempt == 0;
+        let (status, text, over) = attempt_once(cfg, store, spec, &session, account, resume).await;
         crossed |= over;
         let limited = (status == "failed")
             .then(|| crate::pool::rate_limit(&text))
@@ -204,15 +266,22 @@ async fn execute(cfg: &Config, store: &mut Store, run: &JobRun) -> (&'static str
     unreachable!("the attempt loop always returns")
 }
 
-/// One attempt of a job run on `account`, in its own fresh child.
+/// One attempt of a run on `account`, in its own fresh child.
 async fn attempt_once(
     cfg: &Config,
     store: &mut Store,
-    run: &JobRun,
-    label: &str,
+    spec: &Spec<'_>,
     session: &str,
     account: Option<&crate::config::Account>,
+    resume: bool,
 ) -> (&'static str, String, bool) {
+    let label = &spec.label;
+    if let Some(id) = spec.task {
+        // Recorded first, so a restart during this attempt resumes this session.
+        if let Err(e) = store.set_task_session(id, session) {
+            eprintln!("zephyr: recording task #{id}'s session failed: {e}");
+        }
+    }
     let mut child = match Child::spawn_as(cfg, Some(session), account).await {
         Ok(child) => child,
         Err(e) => return ("failed", format!("{label} could not start: {e:#}"), false),
@@ -221,32 +290,77 @@ async fn attempt_once(
     let max_turns = cfg.budget.as_ref().and_then(|b| b.run_turns);
     let mut tally = crate::rpc::Tally::default();
     let ended = tokio::select! {
-        r = tokio::time::timeout(limit, prompt(cfg, &mut child, &run.job.prompt, &mut tally, max_turns)) => Some(r),
-        _ = until_paused(store) => None,
+        r = tokio::time::timeout(limit, start(cfg, &mut child, spec, resume, &mut tally, max_turns)) => Ok(r),
+        why = until_cut(store, spec.task) => Err(why),
     };
-    let out = match ended {
-        Some(Ok(Ok(Ok(text)))) => ("completed", text),
-        Some(Ok(Ok(Err(why)) | Err(why))) => ("failed", format!("{label} failed: {why:#}")),
+    // `cut_short`: stopped, paused, timed out or stalled, so it may have done some of the work.
+    let (status, text, cut_short) = match ended {
+        Ok(Ok(Ok(Ok(text)))) => ("completed", text, false),
+        Ok(Ok(Ok(Err(why)))) => {
+            let stalled = why.to_string().starts_with("stalled");
+            ("failed", format!("{label} failed: {why:#}"), stalled)
+        }
+        Ok(Ok(Err(why))) => ("failed", format!("{label} failed: {why:#}"), false),
         cut => {
             let abort = child.call(json!({"type": "abort"}));
             let _ = tokio::time::timeout(Duration::from_secs(5), abort).await;
-            let why = match cut {
-                Some(_) => format!(" after {limit:?}"),
-                None => ": paused".into(),
-            };
-            ("failed", format!("{label} was aborted{why}"))
+            match cut {
+                Err("") => ("stopped", format!("{label} was stopped"), true),
+                Err(why) => ("failed", format!("{label} was aborted{why}"), true),
+                Ok(_) => (
+                    "failed",
+                    format!("{label} was aborted after {limit:?}"),
+                    true,
+                ),
+            }
         }
     };
+    // As Hermes's interrupted children do: the report keeps what the run had got to.
+    let out = match cut_short {
+        true => match last_words(&mut child).await {
+            Some(words) => (
+                status,
+                format!("{text}\nIts last message before that:\n{words}"),
+            ),
+            None => (status, text),
+        },
+        false => (status, text),
+    };
     if let Some(alert) = tally.alert() {
-        if let Err(e) = store.notify(&run.job.channel, &run.job.recipient, &alert) {
+        if let Err(e) = store.notify(&spec.to.0, &spec.to.1, &alert) {
             eprintln!("zephyr: outbound notice failed: {e}");
         }
     }
-    let to = (run.job.channel.clone(), run.job.recipient.clone());
-    crate::tools::apply(store, cfg, &tally.requests, Some(to));
+    crate::tools::apply(store, cfg, &tally.requests, Some(spec.to.clone()));
     let crossed = book(store, cfg, account, tally.used);
     child.stop().await;
     (out.0, out.1, crossed)
+}
+
+/// The most a cut-short run's last message adds to its report, as `tasks::MAX_REPORT` is for a
+/// whole report.
+const LAST_WORDS: usize = 8 * 1024;
+
+/// The run's last assistant text with something in it, cut to `LAST_WORDS` on a char boundary.
+/// `None` when it wrote nothing, or the child cannot say within 5 s (a stalled one may not).
+async fn last_words(child: &mut Child) -> Option<String> {
+    let snap = child.call(json!({"type": "get_messages"}));
+    let snap = tokio::time::timeout(Duration::from_secs(5), snap)
+        .await
+        .ok()?
+        .ok()?;
+    let text = snap["messages"]
+        .as_array()?
+        .iter()
+        .rev()
+        .filter(|m| m["kind"] == "assistant")
+        .map(message_text)
+        .find(|t| !t.trim().is_empty())?;
+    let end = (0..=LAST_WORDS.min(text.len()))
+        .rev()
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(0);
+    Some(text[..end].to_string())
 }
 
 /// Adds a side run's usage (a job's, a `/btw`'s) to today's spend and `account`'s. Returns true
@@ -266,32 +380,105 @@ pub(crate) fn book(
     })
 }
 
-/// Sends the prompt and waits for the run to settle, counting its events into `tally`, and
-/// aborts it at `max_turns`. The inner result is the final assistant text, or why the run
-/// ended without one.
+/// A run's first move: a fresh prompt, or a resume in the session it ran in.
+async fn start(
+    cfg: &Config,
+    child: &mut Child,
+    spec: &Spec<'_>,
+    resume_it: bool,
+    tally: &mut crate::rpc::Tally,
+    max_turns: Option<u32>,
+) -> anyhow::Result<anyhow::Result<String>> {
+    match resume_it {
+        true => resume(cfg, child, spec, tally, max_turns).await,
+        false => prompt(cfg, child, spec.prompt, spec.refuse, tally, max_turns).await,
+    }
+}
+
+/// Carries on a run a restart cut (DESIGN §4.12), with rpi's session as the checkpoint, as
+/// Absurd's durable-agent pattern does: a pending run resumes where it stopped; one whose last
+/// message is the agent's had finished, so that is the reply; anything else is told to go on.
+async fn resume(
+    cfg: &Config,
+    child: &mut Child,
+    spec: &Spec<'_>,
+    tally: &mut crate::rpc::Tally,
+    max_turns: Option<u32>,
+) -> anyhow::Result<anyhow::Result<String>> {
+    let snap = child.call(json!({"type": "get_messages"})).await?;
+    if snap["pendingResume"] == true {
+        child.call(json!({"type": "resume_pending"})).await?;
+        // Delivered at the resumed run's next step.
+        let note = json!({"type": "queue_message", "message": RESUME_NOTE, "deliverAs": "steer"});
+        child.call(note).await?;
+        return follow(cfg, child, spec.refuse, tally, max_turns).await;
+    }
+    let messages = snap["messages"].as_array().cloned().unwrap_or_default();
+    let Some(last) = messages.last() else {
+        // Cut before the prompt was committed: start it now.
+        return prompt(cfg, child, spec.prompt, spec.refuse, tally, max_turns).await;
+    };
+    let text = message_text(last);
+    if last["kind"] == "assistant" && !text.is_empty() {
+        return Ok(Ok(text));
+    }
+    prompt(cfg, child, RESUME_NOTE, spec.refuse, tally, max_turns).await
+}
+
+/// Sends the prompt and waits for the run to settle (`follow`).
 pub(crate) async fn prompt(
     cfg: &Config,
     child: &mut Child,
     text: &str,
+    refuse: &str,
     tally: &mut crate::rpc::Tally,
     max_turns: Option<u32>,
 ) -> anyhow::Result<anyhow::Result<String>> {
     child
         .call(json!({"type": "prompt", "message": text}))
         .await?;
+    follow(cfg, child, refuse, tally, max_turns).await
+}
+
+/// Waits for the run to settle, counting its events into `tally`, and aborts it at `max_turns`
+/// or when it stalls: no event for `cfg.stall_limit`, twice that while a tool runs, since rpi
+/// reports nothing between a silent command's start and end (DESIGN §4.4). The inner result is
+/// the final assistant text, or why the run ended without one.
+async fn follow(
+    cfg: &Config,
+    child: &mut Child,
+    refuse: &str,
+    tally: &mut crate::rpc::Tally,
+    max_turns: Option<u32>,
+) -> anyhow::Result<anyhow::Result<String>> {
     let mut cut = None;
+    let mut in_tool = 0usize;
     let settled = loop {
-        match child.events.recv().await {
+        let limit = cfg.stall_limit * if in_tool > 0 { 2 } else { 1 };
+        let Ok(ev) = tokio::time::timeout(limit, child.events.recv()).await else {
+            let _ = child.call(json!({"type": "abort"})).await;
+            return Ok(Err(anyhow::anyhow!("stalled: no progress for {limit:?}")));
+        };
+        match ev {
             Some(ev) if ev["type"] == "agent_settled" => break ev,
             Some(ev) => {
                 tally.add(&ev);
-                // A job is not the owner's conversation; answered at once so it does not wait.
-                // Off the list, the plugin has refused the call already and nothing waits. A
+                match ev["type"].as_str() {
+                    Some("tool_execution_start") => in_tool += 1,
+                    Some("tool_execution_end") => in_tool = in_tool.saturating_sub(1),
+                    _ => {}
+                }
+                // A job or task is not the owner's conversation; answered at once so it does not
+                // wait. Off the list, the plugin has refused the call already and nothing waits. A
                 // proposal is not stored either: no one is there to approve it.
                 if let Some((id, command)) = crate::tools::gateway_call(&ev) {
                     if zephyr_policy::tools::gateway_kind(command).is_some() {
-                        crate::tools::answer_gateway(cfg, id, "not available in scheduled runs");
+                        crate::tools::answer_gateway(cfg, id, refuse);
                     }
+                }
+                // Tasks stay one level deep: a task cannot start, list or stop tasks.
+                if let Some((id, _)) = crate::tools::task_call(&ev) {
+                    crate::tools::answer_gateway(cfg, id, refuse);
                 }
                 if cut.is_none() && max_turns.is_some_and(|max| tally.turns >= max) {
                     cut = max_turns;

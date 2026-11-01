@@ -160,4 +160,6 @@ ENV PATH=/opt/zephyr/py/bin:$PATH \
     AGENT_BROWSER_PROFILE=/zephyr/browser \
     AGENT_BROWSER_HEADED=1 \
     AGENT_BROWSER_ARGS=--no-sandbox,--disable-dev-shm-usage,--use-angle=vulkan,--enable-features=Vulkan,--ignore-gpu-blocklist
-CMD ["zephyr", "run"]
+# `docker run --init` makes docker-init PID 1; supervise starts `zephyr run` again if it crashes,
+# so the agent's background commands (kept and reaped by PID 1) outlive a daemon crash.
+CMD ["zephyr", "supervise"]

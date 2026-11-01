@@ -28,6 +28,30 @@ pub fn tagged(row: &InboxRow) -> String {
     format!("[{} #{}] {}", row.channel, row.id, row.text)
 }
 
+/// What a row steered into a running turn says (DESIGN §4.1): its tagged text, and a note so
+/// the model answers it and carries on, instead of taking it for a new request and stopping.
+pub fn steered(row: &InboxRow) -> String {
+    format!(
+        "{}\n\n(This arrived while you were working on the request above: answer it in a line or \
+         two, then carry on with that work.)",
+        tagged(row)
+    )
+}
+
+/// What a row says when it goes again because its run stopped after answering a steered
+/// message. `NO_REPLY` (dropped, never sent) lets a model that had finished say so.
+pub fn continued(row: &InboxRow) -> String {
+    format!(
+        "{}\n\n(The work on this request stopped after you answered a message that came in \
+         meanwhile. If it is not finished, carry on with it. If you already answered it in full, \
+         reply with exactly {NO_REPLY}.)",
+        tagged(row)
+    )
+}
+
+/// The reply a continued row gives when it had nothing left to say; it is not sent.
+pub const NO_REPLY: &str = "NO_REPLY";
+
 /// The reverse of `tagged`: `(channel, inbox id, text)`, or `None` for untagged text.
 pub fn untag(text: &str) -> Option<(&str, i64, &str)> {
     let (channel, rest) = text.strip_prefix('[')?.split_once(" #")?;
@@ -175,6 +199,8 @@ pub async fn run<C: Channel>(
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<Exit> {
     std::fs::create_dir_all(cfg.state_dir())?;
+    // Before main or a task resumes: a crashed daemon's children would hold their sessions open.
+    crate::rpc::kill_leftovers(&cfg.rpi, &cfg.session_dir());
     let (tx, rx) = mpsc::channel(64);
     let (attach_tx, attaches) = mpsc::channel(4);
     let jobs = crate::scheduler::Wake::default();
@@ -213,14 +239,26 @@ pub async fn run<C: Channel>(
         names: channels.iter().map(|c| c.name().to_string()).collect(),
         thinking: None,
         shown: 0,
+        steered: Vec::new(),
+        steered_texts: HashSet::new(),
+        steer_sent: Vec::new(),
+        steer_replied: false,
+        run_completed: false,
         run_start: None,
+        last_event: Instant::now(),
+        note_pending: false,
         cut: None,
+        procs: Default::default(),
     };
+    // Commands a re-exec handed over alive are adopted; the rest a dead gateway left running
+    // are reported, never re-run (DESIGN §4.13).
+    router.procs.adopt(&router.cfg, &mut router.store)?;
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
         r = runs => r.map(|_| Exit::Shutdown),
         r = crate::attach::serve(cfg, tx, attach_tx, snap_rx, attach_cfgs) => r.map(|()| Exit::Shutdown),
-        r = crate::scheduler::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),
+        r = crate::scheduler::run(cfg_rx.clone(), &jobs) => r.map(|()| Exit::Shutdown),
+        r = crate::tasks::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),
         r = show_activity(channels, activity_rx) => r.map(|()| Exit::Shutdown),
         r = router.main(rx, channels, shutdown) => r,
     }
@@ -361,8 +399,15 @@ struct Router<'a> {
     tally: crate::rpc::Tally,
     /// When the current run started, for `budget.run_minutes`.
     run_start: Option<Instant>,
+    /// When the child last said anything, for stall detection (`cap_run`).
+    last_event: Instant,
+    /// `RESUME_NOTE` was steered into a resumed run and not delivered yet: taken back at the
+    /// settle, so it never reaches the next run (DESIGN §4.2).
+    note_pending: bool,
     /// Why the current run was stopped by a run limit; told to the owner at its settle.
     cut: Option<String>,
+    /// The main agent's `exec` commands (DESIGN §4.13).
+    procs: crate::procs::Procs,
     /// The pooled account the child runs on (DESIGN §4.9). `None` without a pool.
     account: Option<Account>,
     /// What attached clients see; `publish` refreshes it, `tapped` keeps `run` current.
@@ -374,6 +419,18 @@ struct Router<'a> {
     /// The last inbox row whose user turn went to attached clients. Rows go out in id order,
     /// so one sent again (after `/stop` cleared rpi's queue, or a fail-over) is not shown twice.
     shown: i64,
+    /// Messages steered into the running turn (DESIGN §4.1), oldest first, each with whether
+    /// rpi has delivered it yet. The agent's first text after a delivered one answers it.
+    steered: Vec<(InboxRow, bool)>,
+    /// This run's steered texts, so `reconcile` keeps the run's last text for the turn that
+    /// started it, and the replies already sent for them, so none goes out twice.
+    steered_texts: HashSet<String>,
+    steer_sent: Vec<String>,
+    /// A steered message was answered mid-run: flush now, not at the settle.
+    steer_replied: bool,
+    /// The run that just settled ended `completed`: only such a run's rows may be continued.
+    /// Set by `settled` for the one `reconcile` that follows; never after an abort or a failure.
+    run_completed: bool,
 }
 
 async fn next_event(child: &mut Option<Child>) -> Option<Value> {
@@ -411,6 +468,16 @@ impl<'a> Router<'a> {
                     }
                     self.btw = None;
                 }
+                // A report for main (a task's, a background command's): a command still in the
+                // turn moves to the background so the turn can read it.
+                _ = self.jobs.inbox.notified() => {
+                    self.procs.yield_all();
+                    log(self.dispatch_new().await)
+                }
+                _ = self.procs.reported.notified() => {
+                    self.procs.yield_all();
+                    log(self.dispatch_new().await)
+                }
                 _ = tokio::time::sleep_until(self.auth_at), if (self.child.is_some() || !self.cfg.accounts.is_empty()) && self.cfg.auth.enabled => {
                     self.auth_check().await
                 }
@@ -418,7 +485,10 @@ impl<'a> Router<'a> {
                     Some(ev) if ev["type"] == "agent_settled" => self.settled(&ev).await,
                     Some(_) => {
                         self.cap_run().await;
-                        continue;
+                        // A steered message's reply goes out now, not at the settle.
+                        if !std::mem::take(&mut self.steer_replied) {
+                            continue;
+                        }
                     }
                     None => self.child_exited().await,
                 },
@@ -435,15 +505,17 @@ impl<'a> Router<'a> {
             }
             self.flush(channels).await;
             self.publish();
-            if self.reexec
-                && !self.busy
-                && self.btw.is_none()
-                && !self.jobs.running.load(Ordering::SeqCst)
-            {
+            // Tasks are not waited for: they resume after the re-exec (DESIGN §4.12).
+            let background = self.jobs.running.load(Ordering::SeqCst);
+            if self.reexec && !self.busy && self.btw.is_none() && !background {
                 eprintln!("zephyr: restarting itself to apply the new settings");
                 exit = Exit::Reexec;
                 break;
             }
+        }
+        // A re-exec keeps the pid, so its commands stay our children: the new image adopts them.
+        if exit != Exit::Reexec {
+            self.procs.stop_all();
         }
         self.drain(channels).await;
         Ok(exit)
@@ -452,16 +524,81 @@ impl<'a> Router<'a> {
     fn tapped(&mut self, ev: Option<Value>) -> Option<Value> {
         if let Some(ev) = &ev {
             let _ = self.tap.send(ev.clone()); // no receivers is fine
+            self.last_event = Instant::now();
             self.tally.add(ev);
             self.track(ev);
+            self.steer_event(ev);
             if let Some((id, command)) = crate::tools::gateway_call(ev) {
                 // Off the list, the plugin has already refused the call: nobody waits for it.
                 if let Some(text) = self.gateway_reply(command) {
                     crate::tools::answer_gateway(&self.cfg, id, &text);
                 }
             }
+            if let Some((id, args)) = crate::procs::call(ev, "exec") {
+                // Refused by the plugin's check or its veto: the call waits for nothing.
+                let vetoed = matches!(
+                    zephyr_policy::policy::check("exec", args),
+                    zephyr_policy::policy::Decision::Deny(_)
+                );
+                if let (Ok(call), false) = (zephyr_policy::tools::exec_call(args), vetoed) {
+                    match self.origin() {
+                        Some(to) => self.procs.start(&self.cfg, &self.store, id, call, to),
+                        None => crate::tools::answer_gateway(&self.cfg, id, "no owner; not run"),
+                    }
+                }
+            }
+            if let Some((id, args)) = crate::procs::call(ev, "process") {
+                if let Ok(action) = zephyr_policy::tools::process_action(args) {
+                    let text = self.procs.reply(&self.cfg, &self.store, action);
+                    crate::tools::answer_gateway(&self.cfg, id, &text);
+                }
+            }
+            if let Some((id, args)) = crate::tools::task_call(ev) {
+                // A call the plugin refused waits for nothing, so it gets no answer.
+                if let Ok(action) = zephyr_policy::tools::task_action(args) {
+                    let text = self.task_reply(action);
+                    crate::tools::answer_gateway(&self.cfg, id, &text);
+                }
+            }
         }
         ev
+    }
+
+    /// `(channel, sender)` of the message this run serves: where a task or command reports.
+    fn origin(&self) -> Option<(String, String)> {
+        match self.snap.borrow().run.origin.clone() {
+            Some(o) => Some((o.channel, o.sender)),
+            None => self.store.last_owner().ok().flatten(),
+        }
+    }
+
+    /// The agent's `task` call (DESIGN §4.12), answered mid-turn. A started task reports back
+    /// to the channel and sender this run serves.
+    fn task_reply(&mut self, action: zephyr_policy::tools::TaskAction) -> String {
+        use zephyr_policy::tools::TaskAction;
+        match action {
+            TaskAction::Start(goal) => {
+                let Some((channel, sender)) = self.origin() else {
+                    return "no owner to report to; not started".into();
+                };
+                match self.store.add_task(&goal, &channel, &sender) {
+                    Ok(Some(id)) => {
+                        self.jobs.tasks.notify_one();
+                        format!(
+                            "task #{id} started; its report comes back to you as a message when \
+                             it ends. Tell the owner it is under way and end your turn."
+                        )
+                    }
+                    Ok(None) => format!(
+                        "not started: {} tasks are queued or running; stop one or wait",
+                        crate::store::MAX_OPEN_TASKS
+                    ),
+                    Err(e) => format!("not started: {e}"),
+                }
+            }
+            TaskAction::List => crate::tasks::list(&self.store),
+            TaskAction::Stop(id) => crate::tasks::stop(&mut self.store, self.jobs, Some(id)),
+        }
     }
 
     /// The answer to a command the agent sent with `gateway` (DESIGN §4.11), checked again here:
@@ -513,6 +650,64 @@ impl<'a> Router<'a> {
             "agent_settled" => update(&self.snap, |s| s.run = Run::default()),
             _ => false,
         };
+    }
+
+    /// Follows steered messages through the run: rpi's user message marks one delivered, and
+    /// the agent's next text answers it at once instead of at the settle.
+    fn steer_event(&mut self, ev: &Value) {
+        if ev["type"] != "message_end" {
+            return;
+        }
+        let m = &ev["message"];
+        let text = message_text(m);
+        if m["role"] == "user" && text == crate::scheduler::RESUME_NOTE {
+            self.note_pending = false;
+        }
+        if self.steered.is_empty() {
+            return;
+        }
+        match m["role"].as_str() {
+            Some("user") => {
+                let pending = self.steered.iter_mut();
+                if let Some(s) = pending
+                    .filter(|(_, done)| !done)
+                    .find(|(r, _)| steered(r) == text)
+                {
+                    s.1 = true;
+                }
+            }
+            Some("assistant") if !text.is_empty() => {
+                if let Some(i) = self.steered.iter().position(|(_, delivered)| *delivered) {
+                    let (row, _) = self.steered.remove(i);
+                    log(self.store.reply(&row, &text, "done").map_err(Into::into));
+                    self.steer_sent.push(text);
+                    self.steer_replied = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A restart loses the steer state: rebuilt from the store (`inbox.sent_as`), so the run's
+    /// own row is not given a steered answer again (DESIGN §4.1). A no-op while it is held.
+    fn restore_steers(&mut self) -> anyhow::Result<()> {
+        if !self.steered_texts.is_empty() {
+            return Ok(());
+        }
+        for (row, reply) in self.store.steered_into_run()? {
+            self.steered_texts.insert(steered(&row));
+            match reply {
+                Some(reply) => self.steer_sent.push(reply),
+                None => self.steered.push((row, false)),
+            }
+        }
+        Ok(())
+    }
+
+    fn forget_steers(&mut self) {
+        self.steered.clear();
+        self.steered_texts.clear();
+        self.steer_sent.clear();
     }
 
     /// Rebuilds the snapshot from the store and config, keeping `run`. Pushed only on change.
@@ -724,6 +919,8 @@ impl<'a> Router<'a> {
         } else if matches!(text, "/stop" | "/pause" | "/resume") {
             self.control(text).await.into()
         } else {
+            // The owner spoke: a command still in the turn moves to the background (DESIGN §4.13).
+            self.procs.yield_all();
             return log(self.dispatch_new().await);
         };
         let resume = text == "/resume";
@@ -752,16 +949,34 @@ impl<'a> Router<'a> {
 
     /// Stops the run once it passes `budget.run_turns` or `run_minutes` (DESIGN §4.4).
     async fn cap_run(&mut self) {
-        let (Some(start), None, Some(budget)) = (self.run_start, &self.cut, &self.cfg.budget)
-        else {
+        let (Some(start), None) = (self.run_start, &self.cut) else {
             return;
         };
-        let Some(why) = budget.run_over(self.tally.turns, start.elapsed()) else {
+        let budget = self.cfg.budget.as_ref();
+        let over = budget.and_then(|b| b.run_over(self.tally.turns, start.elapsed()));
+        let over = over.map(|why| format!("[zephyr] stopped the run after {why}"));
+        let Some(notice) = over.or_else(|| self.stalled(start)) else {
             return;
         };
-        eprintln!("zephyr: stopping the run after {why}");
-        self.cut = Some(why);
+        eprintln!("zephyr: {notice}");
+        self.cut = Some(notice);
         log(self.call(json!({"type": "abort"})).await.map(drop));
+    }
+
+    /// The owner's notice when the run counts as stuck: no rpi event for `cfg.stall_limit`, twice
+    /// that while a tool runs, since rpi reports nothing between a silent command's start and
+    /// end (DESIGN §4.4).
+    fn stalled(&self, run_start: Instant) -> Option<String> {
+        let in_tool = self.snap.borrow().run.current_tool.is_some();
+        let limit = self.cfg.stall_limit * if in_tool { 2 } else { 1 };
+        // The run's start counts as progress: the last event may predate it by hours.
+        (self.last_event.max(run_start).elapsed() >= limit).then(|| {
+            let took = match limit.as_secs() / 60 {
+                0 => format!("{} s", limit.as_secs()),
+                m => format!("{m} min"),
+            };
+            format!("[zephyr] stopped a run that made no progress for {took}")
+        })
     }
 
     /// The kill switch (DESIGN §4.4), run outside the queue. Returns the reply text.
@@ -772,6 +987,7 @@ impl<'a> Router<'a> {
                 if self.busy {
                     log(self.call(json!({"type": "abort"})).await.map(drop));
                 }
+                self.procs.stop_all();
                 "[zephyr] paused: messages wait in the inbox until /resume"
             }
             "/resume" => {
@@ -780,6 +996,9 @@ impl<'a> Router<'a> {
             }
             _ => {
                 log(self.call(json!({"type": "abort"})).await.map(drop));
+                // Background tasks too (DESIGN §4.12); each still reports back as stopped.
+                crate::tasks::stop(&mut self.store, self.jobs, None);
+                self.procs.stop_all();
                 "[zephyr] stopped"
             }
         }
@@ -794,20 +1013,33 @@ impl<'a> Router<'a> {
         Ok(self.store.charge(self.cfg.budget.as_ref(), used)?)
     }
 
-    /// Sends every `new` row: `prompt` when idle, rpi's own `queue_message` when busy.
+    /// Sends every `new` row: `prompt` when idle; when busy, steered into the running turn,
+    /// which rpi delivers after the current tool as a user message of its own.
     async fn dispatch_new(&mut self) -> anyhow::Result<()> {
         // Rows stay `new` while the child is down or the gateway is paused.
         if self.child.is_none() || self.store.pause_reason()?.is_some() {
             return Ok(());
         }
         for row in self.store.inbox_with_status("new")? {
-            // Durable before the child sees it, so recovery knows to look for it.
-            self.store.mark_dispatched(row.id)?;
-            let text = tagged(&row);
+            let again = self.store.sent_as(row.id)?.as_deref() == Some("continue");
+            let sent_as = match (self.busy, again) {
+                (true, _) => "steer",
+                (false, true) => "continue",
+                (false, false) => "prompt",
+            };
+            // Durable before the child sees it, so recovery knows to look for it, and how.
+            self.store.mark_dispatched_as(row.id, sent_as)?;
+            let text = match again {
+                true => continued(&row),
+                false => tagged(&row),
+            };
             if self.busy {
-                self.call(json!({"type": "queue_message", "message": text}))
-                    .await?;
-                self.user_turn(&row, &text, false);
+                let text = steered(&row);
+                let steer = json!({"type": "queue_message", "message": text, "deliverAs": "steer"});
+                self.call(steer).await?;
+                // No user turn on the tap: rpi's own user message shows it when delivered.
+                self.steered_texts.insert(text);
+                self.steered.push((row, false));
             } else {
                 self.call(json!({"type": "prompt", "message": text}))
                     .await?;
@@ -843,10 +1075,7 @@ impl<'a> Router<'a> {
     async fn settled(&mut self, ev: &Value) {
         self.busy = false;
         self.run_start = None;
-        let cut = self
-            .cut
-            .take()
-            .map(|why| format!("[zephyr] stopped the run after {why}"));
+        let cut = self.cut.take();
         // Before reconcile dispatches the next row, so that row runs on the new model.
         self.apply_model().await;
         self.backoff = FIRST_BACKOFF;
@@ -882,6 +1111,7 @@ impl<'a> Router<'a> {
                 {
                     log(self.store.clear_cooldown(&a.name).map_err(Into::into));
                 }
+                self.run_completed = ev["outcome"] == "completed" && cut.is_none();
                 log(self.reconcile(Some(fallback), false).await);
             }
         }
@@ -952,6 +1182,23 @@ impl<'a> Router<'a> {
             ("/login", arg) => self.login(arg, from).await,
             ("/btw", "") => crate::btw::USAGE.into(),
             ("/btw", question) => self.btw(question, from).await,
+            ("/process", arg) => {
+                use zephyr_policy::tools::ProcessAction;
+                let action = match arg.split_once(' ').unwrap_or((arg, "")) {
+                    ("list", "") => Some(ProcessAction::List),
+                    ("stop", id) => id.trim().parse().ok().map(ProcessAction::Stop),
+                    _ => None,
+                };
+                match action {
+                    Some(a) => self.procs.reply(&self.cfg, &self.store, a),
+                    None => "[zephyr] usage: /process list, /process stop <id>".into(),
+                }
+            }
+            ("/task", "list") => crate::tasks::list(&self.store),
+            ("/task", arg) => match arg.strip_prefix("stop").map(str::trim).map(str::parse) {
+                Some(Ok(id)) => crate::tasks::stop(&mut self.store, self.jobs, Some(id)),
+                _ => "[zephyr] usage: /task list, /task stop <id>".into(),
+            },
             _ => return None,
         })
     }
@@ -1522,6 +1769,7 @@ impl<'a> Router<'a> {
     /// Runs after every settle and after every (re)spawn, so it is also crash recovery.
     /// `requeue` (a failover) puts unanswered rows back to `new` and dispatches nothing.
     async fn reconcile(&mut self, fallback: Option<String>, requeue: bool) -> anyhow::Result<()> {
+        self.restore_steers()?;
         let snap = self.call(json!({"type": "get_messages"})).await?;
         let rows = self.store.inbox_with_status("dispatched")?;
         if snap["pendingResume"] == true {
@@ -1531,6 +1779,11 @@ impl<'a> Router<'a> {
             if self.resumes < MAX_RESUMES {
                 self.resumes += 1;
                 self.call(json!({"type": "resume_pending"})).await?;
+                // Delivered at the resumed run's next step; `reconcile` never takes it for a row.
+                let note = crate::scheduler::RESUME_NOTE;
+                let note = json!({"type": "queue_message", "message": note, "deliverAs": "steer"});
+                self.call(note).await?;
+                self.note_pending = true;
                 self.busy = true;
                 self.run_start = Some(Instant::now());
                 return Ok(());
@@ -1540,6 +1793,7 @@ impl<'a> Router<'a> {
                 self.store.reply(row, text, "failed")?;
             }
             self.resumes = 0;
+            self.forget_steers();
             return Ok(());
         }
         self.resumes = 0;
@@ -1552,7 +1806,13 @@ impl<'a> Router<'a> {
                 Some("user") => {
                     let text = message_text(m);
                     replies.insert(text.clone(), None);
-                    current = Some(text);
+                    // A steered message is answered on its own (`steer_event`); the run's last
+                    // text still belongs to the turn that started it.
+                    // Nor is the resume note (E4) anyone's message.
+                    if !self.steered_texts.contains(&text) && text != crate::scheduler::RESUME_NOTE
+                    {
+                        current = Some(text);
+                    }
                 }
                 Some("assistant") => {
                     let text = message_text(m);
@@ -1565,9 +1825,30 @@ impl<'a> Router<'a> {
         }
 
         let mut missing = Vec::new();
+        // A model can answer a steered message and stop, leaving the run's own request without
+        // an answer: that row goes once more, so the work carries on (DESIGN §4.1).
+        let steers = !self.steered_texts.is_empty() && std::mem::take(&mut self.run_completed);
         for row in rows {
-            match replies.get(&tagged(&row)) {
+            // The form it was last sent in first: history holds its earlier forms too.
+            let reply = replies
+                .get(&continued(&row))
+                .or_else(|| replies.get(&steered(&row)))
+                .or_else(|| replies.get(&tagged(&row)));
+            match reply {
+                Some(Some(reply)) if reply.trim() == NO_REPLY => {
+                    self.store.set_status(row.id, "done")?
+                }
+                Some(Some(reply)) if self.steer_sent.contains(reply) && row.tries < 2 => {
+                    self.store.requeue_as_continue(row.id)?
+                }
+                // Already sent to a steered message: once is enough.
+                Some(Some(reply)) if self.steer_sent.contains(reply) => {
+                    self.store.set_status(row.id, "done")?
+                }
                 Some(Some(reply)) => self.store.reply(&row, reply, "done")?,
+                Some(None) if steers && !requeue && row.tries < 2 => {
+                    self.store.requeue_as_continue(row.id)?
+                }
                 Some(None) if requeue => self.store.set_status(row.id, "new")?,
                 Some(None) => {
                     let text = fallback
@@ -1578,8 +1859,9 @@ impl<'a> Router<'a> {
                 None => missing.push(row),
             }
         }
-        if !missing.is_empty() {
-            // A follow-up queued as the run ended stays in rpi's queue; take it back.
+        // A follow-up queued as the run ended stays in rpi's queue, and so does a resume note
+        // the resumed run never reached: take them back, or the note opens the next run.
+        if !missing.is_empty() || std::mem::take(&mut self.note_pending) {
             self.call(json!({"type": "clear_queue"})).await?;
         }
         for row in missing {
@@ -1590,6 +1872,7 @@ impl<'a> Router<'a> {
                 self.store.set_status(row.id, "new")?;
             }
         }
+        self.forget_steers();
         if requeue {
             return Ok(());
         }

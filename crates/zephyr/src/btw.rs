@@ -111,7 +111,14 @@ async fn ask(
     tally: &mut Tally,
 ) -> anyhow::Result<String> {
     let mut child = Child::spawn_as(cfg, None, account).await?;
-    let ran = crate::scheduler::prompt(cfg, &mut child, prompt, tally, None);
+    let ran = crate::scheduler::prompt(
+        cfg,
+        &mut child,
+        prompt,
+        "not available in scheduled runs",
+        tally,
+        None,
+    );
     let answer = match tokio::time::timeout(TIMEOUT, ran).await {
         Ok(Ok(answer)) => answer,
         Ok(Err(e)) => Err(e),

@@ -260,6 +260,11 @@ async fn gateway_killed_mid_run_resumes_after_restart() {
     let gw = start(config(&home));
     assert_eq!(gw.wait_replies(1).await, ["resumed: [chat #1] long job"]);
     assert_eq!(log(&home, "prompt").len(), 1);
+    // The resumed run is told to check what was in progress before redoing it.
+    let steers = log(&home, "queue_message");
+    assert_eq!(steers.len(), 1, "{steers:?}");
+    assert_eq!(steers[0]["message"], zephyr::scheduler::RESUME_NOTE);
+    assert_eq!(steers[0]["deliverAs"], "steer");
     gw.shutdown().await;
 }
 
@@ -1766,5 +1771,731 @@ async fn btw_answers_while_main_is_busy_without_disturbing_the_run() {
     assert_eq!(replies[1], "echo: [chat #1] [tool] look around");
     assert!(log(&home, "abort").is_empty());
     assert!(log(&home, "queue_message").is_empty());
+    gw.shutdown().await;
+}
+
+fn task_status(home: &Path, status: &str) -> i64 {
+    let counts = Store::open(&home.join("state.db"))
+        .unwrap()
+        .counts()
+        .unwrap();
+    counts
+        .iter()
+        .find(|(t, s, _)| t == "tasks" && s == status)
+        .map_or(0, |c| c.2)
+}
+
+/// The newest prompt any fake child got, once there are `n`.
+async fn last_prompt(home: &Path, n: usize) -> String {
+    wait(|| log(home, "prompt").len() >= n).await;
+    log(home, "prompt").last().unwrap()["message"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The newest prompt any fake child got that holds `needle`.
+fn prompt_with(home: &Path, needle: &str) -> Option<String> {
+    log(home, "prompt")
+        .iter()
+        .rev()
+        .filter_map(|p| p["message"].as_str())
+        .find(|m| m.contains(needle))
+        .map(str::to_string)
+}
+
+/// Task reports written to the inbox for main.
+fn inbox_reports(home: &Path) -> usize {
+    let store = Store::open(&home.join("state.db")).unwrap();
+    ["new", "dispatched", "done"]
+        .iter()
+        .flat_map(|s| store.inbox_with_status(s).unwrap())
+        .filter(|r| r.text.starts_with("[task #"))
+        .count()
+}
+
+/// A task goal that hangs the task's child: `\u005b` is `[`, so the main prompt carrying the
+/// call never contains `[hang]` itself and answers at once.
+const HANGING_GOAL: &str = r"wait \u005bhang]";
+
+#[tokio::test]
+async fn a_task_runs_beside_main_and_the_agent_stops_it() {
+    let home = home("task-stop");
+    let gw = start(config(&home));
+    let start = format!(r#"[call task {{"action": "start", "goal": "{HANGING_GOAL}"}}] on it"#);
+    gw.say("m1", "owner", &start).await;
+    let first = gw.wait_replies(1).await[0].clone();
+    assert!(first.contains("\ntask: task #1 started"), "{first}");
+    wait(|| task_status(&home, "running") == 1).await;
+    // The chat is not blocked by the task.
+    gw.say("m2", "owner", "hi").await;
+    assert_eq!(gw.wait_replies(2).await[1], "echo: [chat #2] hi");
+    gw.say("m3", "owner", r#"[call task {"action": "list"}]"#)
+        .await;
+    let list = gw.wait_replies(3).await[2].clone();
+    assert!(
+        list.contains("#1 running (0 min ago): wait [hang]"),
+        "{list}"
+    );
+    // "cancel that": the agent stops it with the same tool.
+    gw.say("m4", "owner", r#"[call task {"action": "stop", "id": 1}]"#)
+        .await;
+    let stop = gw.wait_replies(4).await[3].clone();
+    assert!(stop.contains("\ntask: [zephyr] stopping task #1"), "{stop}");
+    wait(|| task_status(&home, "stopped") == 1).await;
+    // The report comes back to main as a message on the task's channel. (Main's answer is not
+    // checked: the report quotes the goal, and its `[hang]` hangs the fake.)
+    wait(|| prompt_with(&home, "[task #1 stopped;").is_some()).await;
+    let report = prompt_with(&home, "[task #1 stopped;").unwrap();
+    assert!(
+        report.starts_with("[chat #5] [task #1 stopped; a background agent's report, not the owner's words] goal: wait [hang]"),
+        "{report}"
+    );
+    assert!(
+        report.ends_with("\n> [zephyr] task #1 was stopped"),
+        "{report}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_finished_task_reports_on_the_channel_that_started_it() {
+    let home = home("task-done");
+    let gw = start(config(&home));
+    gw.say_on(
+        "discord",
+        "m1",
+        "downer",
+        r#"[call task {"action": "start", "goal": "find the price"}] ok"#,
+    )
+    .await;
+    let replies = gw.wait_replies_on("discord", 2).await;
+    assert!(
+        replies[0].contains("\ntask: task #1 started"),
+        "{replies:?}"
+    );
+    // The child's last message (the fake echoes its prompt) is the report main reads.
+    assert!(
+        replies[1].starts_with("echo: [discord #2] [task #1 finished; a background agent's report"),
+        "{replies:?}"
+    );
+    assert!(
+        replies[1].contains("\n> echo: You are a background task")
+            && replies[1].ends_with("\n> Goal: find the price"),
+        "{replies:?}"
+    );
+    assert!(gw.replies_on("chat").is_empty());
+    assert_eq!(task_status(&home, "completed"), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_tasks_run_at_once_and_owner_stop_ends_them_all() {
+    let home = home("task-owner-stop");
+    let gw = start(config(&home));
+    let call = format!(r#"[call task {{"action": "start", "goal": "{HANGING_GOAL}"}}]"#);
+    gw.say("m1", "owner", &format!("{call} {call} {call}"))
+        .await;
+    gw.wait_replies(1).await;
+    wait(|| task_status(&home, "running") == 2 && task_status(&home, "queued") == 1).await;
+    gw.say("m2", "owner", "/task list").await;
+    let list = gw.wait_replies(2).await[1].clone();
+    assert!(list.contains("#3 queued"), "{list}");
+    gw.say("m3", "owner", "/stop").await;
+    assert_eq!(gw.wait_replies(3).await[2], "[zephyr] stopped");
+    wait(|| task_status(&home, "stopped") == 3).await;
+    // The two that ran report back; the queued one never started, so it has nothing to say.
+    wait(|| inbox_reports(&home) == 2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(inbox_reports(&home), 2);
+    gw.say("m4", "owner", "/task stop 9").await;
+    assert_eq!(
+        gw.wait_replies(4).await[3],
+        "[zephyr] task #9 is not queued or running"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_task_cut_between_steps_carries_on_with_the_resume_note() {
+    let home = home("task-restart");
+    let gw = start(config(&home));
+    let start_call = format!(r#"[call task {{"action": "start", "goal": "{HANGING_GOAL}"}}]"#);
+    gw.say("m1", "owner", &start_call).await;
+    gw.wait_replies(1).await;
+    wait(|| task_prompts(&home) == 1).await;
+    gw.shutdown().await;
+    // Nothing for rpi to resume: its session ends at the prompt. The task is told to go on.
+    let gw = start(config(&home));
+    wait(|| task_status(&home, "completed") == 1).await;
+    assert!(log(&home, "resume_pending").is_empty());
+    let prompts = log(&home, "prompt");
+    assert!(
+        prompts
+            .iter()
+            .any(|p| p["message"] == zephyr::scheduler::RESUME_NOTE),
+        "{prompts:?}"
+    );
+    wait(|| inbox_reports(&home) == 1).await;
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let report = ["new", "dispatched", "done"]
+        .iter()
+        .flat_map(|st| store.inbox_with_status(st).unwrap())
+        .find(|r| r.text.starts_with("[task #"))
+        .unwrap()
+        .text;
+    assert!(
+        report.starts_with("[task #1 finished;")
+            && report.ends_with("> echo: Zephyr restarted while you were working. Check the current state of anything that was in progress (files, processes, tasks, external actions) before repeating it, then continue."),
+        "{report}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_task_cannot_start_tasks_or_use_gateway() {
+    let home = home("task-nested");
+    let gw = start(config(&home));
+    // `\u007b` and `\u007d` are braces: the calls only appear once the goal is decoded.
+    let goal = r#"\u005bcall task \u007b\"action\": \"list\"\u007d] \u005bcall gateway \u007b\"command\": \"/status\"\u007d]"#;
+    gw.say(
+        "m1",
+        "owner",
+        &format!(r#"[call task {{"action": "start", "goal": "{goal}"}}]"#),
+    )
+    .await;
+    let report = gw.wait_replies(2).await[1].clone();
+    assert!(
+        report.contains(
+            "\n> task: not available in background tasks\n> gateway: not available in background tasks"
+        ),
+        "{report}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn pause_aborts_a_running_task() {
+    let home = home("task-pause");
+    let gw = start(config(&home));
+    let call = format!(r#"[call task {{"action": "start", "goal": "{HANGING_GOAL}"}}]"#);
+    gw.say("m1", "owner", &call).await;
+    gw.wait_replies(1).await;
+    wait(|| task_status(&home, "running") == 1).await;
+    gw.say("m2", "owner", "/pause").await;
+    wait(|| task_status(&home, "failed") == 1).await;
+    let report = last_prompt(&home, 1).await;
+    let rows = Store::open(&home.join("state.db"))
+        .unwrap()
+        .inbox_with_status("new")
+        .unwrap();
+    // Paused, so the report waits in the inbox for /resume like any message.
+    assert!(
+        rows.iter()
+            .any(|r| r.text.ends_with("\n> [zephyr] task #1 was aborted: paused")),
+        "{rows:?} {report}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_message_sent_mid_tool_is_steered_in_and_answered_before_the_run_ends() {
+    let home = home("steer");
+    let gw = start(config(&home));
+    std::fs::write(home.join("tool_wait"), "").unwrap();
+    gw.say("m1", "owner", "[tool] look around").await;
+    wait(|| main_session(&home).contains("toolCall")).await; // main is mid-run, in its tool
+    gw.say("m2", "owner", "what are you doing?").await;
+    wait(|| !log(&home, "queue_message").is_empty()).await;
+    assert_eq!(log(&home, "queue_message")[0]["deliverAs"], "steer");
+    std::fs::remove_file(home.join("tool_wait")).unwrap();
+    // m2 was answered inside the run, so its reply goes out before the run's own. It went in
+    // with the note that tells the model to answer it and carry on.
+    let m2 = InboxRow {
+        id: 2,
+        channel: "chat".into(),
+        sender: "owner".into(),
+        text: "what are you doing?".into(),
+        tries: 1,
+    };
+    assert_eq!(
+        gw.wait_replies(2).await,
+        [
+            format!("echo: {}", zephyr::router::steered(&m2)),
+            "echo: [chat #1] [tool] look around".to_string()
+        ]
+    );
+    assert!(
+        log(&home, "clear_queue").is_empty(),
+        "delivered, nothing taken back"
+    );
+    assert_eq!(log(&home, "prompt").len(), 1, "no run of its own");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_one_text_after_a_steer_goes_out_once() {
+    let home = home("steer-once");
+    let gw = start(config(&home));
+    std::fs::write(home.join("tool_wait"), "").unwrap();
+    gw.say("m1", "owner", "[tool] look around").await;
+    wait(|| main_session(&home).contains("toolCall")).await;
+    // `[quiet]`: the fake writes nothing for it, so the run's final text is the only answer.
+    gw.say("m2", "owner", "[quiet] thanks").await;
+    wait(|| !log(&home, "queue_message").is_empty()).await;
+    std::fs::remove_file(home.join("tool_wait")).unwrap();
+    wait(|| inbox_status(&home, "done") == 2 && log(&home, "prompt").len() == 2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The run's own row cannot tell "one text for both" from "answered the steer and stopped",
+    // so it goes once more as a continuation; a model that had finished answers NO_REPLY,
+    // which is not sent.
+    assert_eq!(gw.replies(), ["echo: [chat #1] [tool] look around"]);
+    let again = log(&home, "prompt")[1]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(again.contains("reply with exactly NO_REPLY"), "{again}");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_run_that_stops_at_a_steered_answer_carries_on_with_its_own_request() {
+    let home = home("steer-stop");
+    let gw = start(config(&home));
+    std::fs::write(home.join("tool_wait"), "").unwrap();
+    // As Haiku did live: it answered the steered question and ended, the research unfinished.
+    gw.say(
+        "m1",
+        "owner",
+        "[stop-after-steer] [unfinished] [tool] research",
+    )
+    .await;
+    wait(|| main_session(&home).contains("toolCall")).await;
+    gw.say("m2", "owner", "what is 3+5?").await;
+    wait(|| !log(&home, "queue_message").is_empty()).await;
+    std::fs::remove_file(home.join("tool_wait")).unwrap();
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        replies[0].starts_with("echo: [chat #2] what is 3+5?"),
+        "{replies:?}"
+    );
+    // The research was not closed silently: it went again and got its own answer.
+    assert!(
+        replies[1].starts_with("echo: [chat #1] [stop-after-steer] [unfinished] [tool] research"),
+        "{replies:?}"
+    );
+    assert!(replies[1].contains("carry on with it"), "{replies:?}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(gw.replies().len(), 2, "each message answered once");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_steer_racing_the_end_of_a_run_is_taken_back_and_sent_again() {
+    let home = home("steer-race");
+    // The fake reads nothing while it is slow, so the steer lands after the run has ended.
+    std::fs::write(home.join("slow"), "1").unwrap();
+    let mut cfg = config(&home);
+    // The auth check's `get_auth_status` would wait out the slow run (the fake reads nothing
+    // then; real rpi answers mid-run) and hold "second" until the run had ended.
+    cfg.auth.enabled = false;
+    let gw = start(cfg);
+    gw.say("m1", "owner", "first").await;
+    wait(|| !log(&home, "prompt").is_empty()).await;
+    gw.say("m2", "owner", "second").await;
+    assert_eq!(
+        gw.wait_replies(2).await,
+        ["echo: [chat #1] first", "echo: [chat #2] second"]
+    );
+    assert_eq!(log(&home, "queue_message")[0]["deliverAs"], "steer");
+    assert_eq!(
+        log(&home, "clear_queue").len(),
+        1,
+        "the late steer is taken back"
+    );
+    assert_eq!(
+        log(&home, "prompt").len(),
+        2,
+        "and sent again as a prompt, once"
+    );
+    gw.shutdown().await;
+}
+
+fn proc_status(home: &Path, status: &str) -> i64 {
+    let counts = Store::open(&home.join("state.db"))
+        .unwrap()
+        .counts()
+        .unwrap();
+    counts
+        .iter()
+        .find(|(t, s, _)| t == "procs" && s == status)
+        .map_or(0, |c| c.2)
+}
+
+#[tokio::test]
+async fn exec_answers_in_the_turn_when_its_command_ends() {
+    let home = home("exec-quick");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call exec {"command": "echo hi; exit 3"}] run it"#,
+    )
+    .await;
+    let reply = gw.wait_replies(1).await[0].clone();
+    assert!(reply.ends_with("\nexec: exited 3\nhi"), "{reply}");
+    assert_eq!(proc_status(&home, "exited"), 1);
+    // It ended in the turn, so the model has its output: no report comes after.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(gw.replies().len(), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_owner_message_moves_a_running_command_to_the_background() {
+    let home = home("exec-yield");
+    let gw = start(config(&home));
+    let call = r#"[call exec {"command": "sleep 2; echo done"}] go"#;
+    gw.say("m1", "owner", call).await;
+    wait(|| proc_status(&home, "running") == 1).await;
+    gw.say("m2", "owner", "hi").await;
+    let replies = gw.wait_replies(2).await;
+    let has = |r: &[String], s: &str| r.iter().any(|x| x.contains(s));
+    assert!(
+        has(
+            &replies,
+            "\nexec: Moved to the background (a message for you arrived)"
+        ),
+        "{replies:?}"
+    );
+    assert!(
+        has(&replies, "echo: [chat #2] hi"),
+        "answered while it runs: {replies:?}"
+    );
+    // Its end comes back to main as a quoted report.
+    let replies = gw.wait_replies(3).await;
+    let report = replies
+        .iter()
+        .find(|r| r.contains("[process #1 exited 0 after"));
+    assert!(
+        report.is_some_and(|r| r.ends_with("\n> done")),
+        "{replies:?}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn background_commands_report_when_stopped_by_the_agent_or_the_owner() {
+    let home = home("exec-stop");
+    let gw = start(config(&home));
+    let call = r#"[call exec {"command": "sleep 30", "background": true}]"#;
+    gw.say("m1", "owner", &format!("{call} {call}")).await;
+    let first = gw.wait_replies(1).await[0].clone();
+    assert!(
+        first.contains("exec: Moved to the background (you asked for the background)"),
+        "{first}"
+    );
+    assert_eq!(proc_status(&home, "running"), 2);
+    gw.say("m2", "owner", "/process list").await;
+    assert!(gw.wait_replies(2).await[1].contains("#1 running"));
+    gw.say(
+        "m3",
+        "owner",
+        r#"[call process {"action": "stop", "id": 1}]"#,
+    )
+    .await;
+    wait(|| proc_status(&home, "stopped") == 1).await;
+    gw.say("m4", "owner", "/stop").await;
+    wait(|| proc_status(&home, "stopped") == 2).await;
+    // The process answer, /stop's, and one report per stopped command (order varies).
+    let replies = gw.wait_replies(6).await;
+    let count = |s: &str| replies.iter().filter(|r| r.contains(s)).count();
+    assert_eq!(
+        count("process: [zephyr] stopping process #1"),
+        1,
+        "{replies:?}"
+    );
+    assert_eq!(count("was stopped after"), 2, "{replies:?}");
+    gw.say("m5", "owner", "/process stop 1").await;
+    let last = gw.wait_replies(7).await;
+    assert!(
+        last.contains(&"[zephyr] process #1 is not running".to_string()),
+        "{last:?}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_backstop_moves_a_long_command_to_the_background() {
+    let home = home("exec-backstop");
+    let mut cfg = config(&home);
+    cfg.exec_backstop = Duration::from_secs(1);
+    let gw = start(cfg);
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call exec {"command": "sleep 3; echo late"}]"#,
+    )
+    .await;
+    let first = gw.wait_replies(1).await[0].clone();
+    assert!(
+        first.contains("Moved to the background (it ran past 1s)"),
+        "{first}"
+    );
+    let report = gw.wait_replies(2).await[1].clone();
+    assert!(report.ends_with("\n> late"), "{report}");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_crash_after_a_steered_answer_still_gives_the_run_its_own_reply() {
+    let home = home("steer-crash");
+    std::fs::write(home.join("tool_wait"), "").unwrap();
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "[pend-after-steer] [tool] look around")
+        .await;
+    wait(|| main_session(&home).contains("toolCall")).await;
+    gw.say("m2", "owner", "what are you doing?").await;
+    wait(|| !log(&home, "queue_message").is_empty()).await;
+    std::fs::remove_file(home.join("tool_wait")).unwrap();
+    // m2 is answered mid-run; then the gateway dies before the run settles.
+    wait(|| gw.replies().len() == 1).await;
+    assert!(gw.replies()[0].starts_with("echo: [chat #2] what are you doing?"));
+    gw.task.abort(); // like kill -9
+    let _ = gw.task.await;
+
+    // The steer state comes back from the store: m1 gets the resumed run's text, not the
+    // fallback, and m2 is not answered again.
+    let gw = start(config(&home));
+    let replies = gw.wait_replies(1).await;
+    assert!(replies[0].starts_with("resumed: "), "{replies:?}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(gw.replies().len(), 1, "{:?}", gw.replies());
+    assert_eq!(inbox_status(&home, "done"), 2);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_continuation_waiting_at_a_restart_still_goes_as_one() {
+    let home = home("continue-restart");
+    let cfg = config(&home);
+    let store = Store::open(&cfg.db_path()).unwrap();
+    let id = store
+        .insert_inbox(&Inbound {
+            channel: "chat".into(),
+            platform_msg_id: "m1".into(),
+            sender: "owner".into(),
+            text: "[unfinished] research".into(),
+        })
+        .unwrap()
+        .unwrap();
+    // As `reconcile` leaves a row whose run stopped at a steered answer.
+    store.requeue_as_continue(id).unwrap();
+    drop(store);
+    let gw = start(cfg);
+    let reply = gw.wait_replies(1).await[0].clone();
+    assert!(
+        reply.starts_with("echo: [chat #1] [unfinished] research"),
+        "{reply}"
+    );
+    assert!(reply.contains("carry on with it"), "{reply}");
+    gw.shutdown().await;
+}
+
+/// Prompts a fake child got that started or resumed a background task.
+fn task_prompts(home: &Path) -> usize {
+    log(home, "prompt")
+        .iter()
+        .filter(|p| {
+            let m = p["message"].as_str().unwrap_or("");
+            // `starts_with`: main's prompt for the report quotes the brief too.
+            m.starts_with("You are a background task") || m == zephyr::scheduler::RESUME_NOTE
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn a_task_a_restart_cut_resumes_in_its_session() {
+    let home = home("task-resume");
+    let gw = start(config(&home));
+    // As HANGING_GOAL, but the fake marks the task's session resumable, as a crash leaves it.
+    let goal = HANGING_GOAL.replace("hang]", "hang-pending]");
+    let call = format!(r#"[call task {{"action": "start", "goal": "{goal}"}}]"#);
+    gw.say("m1", "owner", &call).await;
+    gw.wait_replies(1).await;
+    wait(|| task_prompts(&home) == 1).await;
+    gw.task.abort(); // like kill -9: the task's child goes with it, its row stays `running`
+    let _ = gw.task.await;
+
+    let gw = start(config(&home));
+    wait(|| task_status(&home, "completed") == 1).await;
+    assert_eq!(log(&home, "resume_pending").len(), 1);
+    assert_eq!(task_prompts(&home), 1, "resumed, not started again");
+    let note = log(&home, "queue_message");
+    assert!(
+        note.iter()
+            .any(|q| q["message"] == zephyr::scheduler::RESUME_NOTE && q["deliverAs"] == "steer"),
+        "{note:?}"
+    );
+    let task = Store::open(&home.join("state.db"))
+        .unwrap()
+        .tasks(1)
+        .unwrap()[0]
+        .clone();
+    assert_eq!((task.resumes, task.session.as_deref()), (1, Some("task-1")));
+    wait(|| inbox_reports(&home) == 1).await;
+    // Main's prompt for the report, not just the newest prompt so far (under load it comes later).
+    wait(|| prompt_with(&home, "[task #1 finished;").is_some()).await;
+    let report = prompt_with(&home, "[task #1 finished;").unwrap();
+    assert!(
+        report.contains("> resumed: You are a background task"),
+        "{report}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_task_that_finished_before_the_restart_reports_without_running_again() {
+    let home = home("task-finished-unreported");
+    let cfg = config(&home);
+    {
+        let store = Store::open(&cfg.db_path()).unwrap();
+        store.add_task("count the files", "chat", "owner").unwrap();
+        store.start_next_task(1).unwrap().unwrap();
+        store.set_task_session(1, "task-1").unwrap();
+    }
+    // Its session already ends with the agent's answer: the gateway died before the report.
+    std::fs::create_dir_all(home.join("sessions")).unwrap();
+    let session = serde_json::json!({"pending": false, "messages": [
+        {"kind": "user", "role": "user", "content": "You are a background task …", "timestamp": 0},
+        {"kind": "assistant", "role": "assistant", "stopReason": "stop", "timestamp": 0,
+         "content": [{"type": "text", "text": "there are 3 files"}]}
+    ]});
+    std::fs::write(home.join("sessions/task-1.json"), session.to_string()).unwrap();
+    let gw = start(cfg);
+    wait(|| task_status(&home, "completed") == 1).await;
+    wait(|| prompt_with(&home, "[task #1 finished;").is_some()).await;
+    let report = prompt_with(&home, "[task #1 finished;").unwrap();
+    assert!(report.ends_with("> there are 3 files"), "{report}");
+    assert_eq!(task_prompts(&home), 0, "no model call for the task");
+    assert!(log(&home, "resume_pending").is_empty());
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_task_that_stalls_is_aborted() {
+    let home = home("task-stall");
+    let mut cfg = config(&home);
+    cfg.stall_limit = Duration::from_secs(1);
+    let gw = start(cfg);
+    let call = format!(r#"[call task {{"action": "start", "goal": "{HANGING_GOAL}"}}]"#);
+    gw.say("m1", "owner", &call).await;
+    wait(|| task_status(&home, "failed") == 1).await;
+    wait(|| prompt_with(&home, "[task #1 failed;").is_some()).await;
+    let report = prompt_with(&home, "[task #1 failed;").unwrap();
+    assert!(
+        report.contains("> [zephyr] task #1 failed: stalled: no progress for 1s"),
+        "{report}"
+    );
+    assert!(!log(&home, "abort").is_empty());
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_main_run_that_stalls_is_stopped_and_the_owner_told() {
+    let home = home("main-stall");
+    let mut cfg = config(&home);
+    cfg.stall_limit = Duration::from_secs(1);
+    let gw = start(cfg);
+    gw.say("m1", "owner", "[hang] think hard").await;
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        replies
+            .iter()
+            .any(|r| r == "[zephyr] stopped a run that made no progress for 1 s"),
+        "{replies:?}"
+    );
+    assert_eq!(log(&home, "abort").len(), 1);
+    gw.shutdown().await;
+}
+
+/// A task goal line that writes `progress: halfway` first (see HANGING_GOAL for the escape).
+const PROGRESS: &str = r"\u005bprogress]";
+
+#[tokio::test]
+async fn a_stopped_task_reports_what_it_had_got_to() {
+    let home = home("task-partial");
+    let gw = start(config(&home));
+    let goal = format!("{PROGRESS} {HANGING_GOAL}");
+    let call = format!(r#"[call task {{"action": "start", "goal": "{goal}"}}]"#);
+    gw.say("m1", "owner", &call).await;
+    gw.wait_replies(1).await;
+    wait(|| task_status(&home, "running") == 1).await;
+    gw.say("m2", "owner", "/task stop 1").await;
+    wait(|| task_status(&home, "stopped") == 1 && inbox_reports(&home) == 1).await;
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let report = ["new", "dispatched", "done"]
+        .iter()
+        .flat_map(|st| store.inbox_with_status(st).unwrap())
+        .find(|r| r.text.starts_with("[task #1 stopped"))
+        .unwrap();
+    // As Hermes's interrupted children: the report keeps what the run had got to.
+    assert!(
+        report.text.ends_with(
+            "> [zephyr] task #1 was stopped\n> Its last message before that:\n> progress: halfway"
+        ),
+        "{}",
+        report.text
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_resume_note_the_run_never_reached_does_not_open_the_next_run() {
+    let home = home("note-leftover");
+    std::fs::write(home.join("hang"), "").unwrap();
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "long job").await;
+    wait(|| !home.join("hang").exists()).await;
+    gw.task.abort(); // like kill -9
+    let _ = gw.task.await;
+    // The fake's resume settles before any step, so the note steered after it is never reached.
+    let gw = start(config(&home));
+    assert_eq!(gw.wait_replies(1).await, ["resumed: [chat #1] long job"]);
+    wait(|| !log(&home, "clear_queue").is_empty()).await; // taken back at the settle
+    gw.say("m2", "owner", "next").await;
+    assert_eq!(gw.wait_replies(2).await[1], "echo: [chat #2] next");
+    assert!(
+        !main_session(&home).contains("Zephyr restarted while you were working"),
+        "the note did not open the next run"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_steer_the_resumed_run_never_reached_is_sent_again_once() {
+    let home = home("note-steer");
+    std::fs::write(home.join("hang"), "").unwrap();
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "long job").await;
+    wait(|| !home.join("hang").exists()).await;
+    gw.task.abort();
+    let _ = gw.task.await;
+    // The resumed run stays open: the note and then the owner's steer are both held.
+    std::fs::write(home.join("resume_wait"), "").unwrap();
+    let gw = start(config(&home));
+    wait(|| log(&home, "queue_message").len() == 1).await;
+    gw.say("m2", "owner", "next").await;
+    wait(|| log(&home, "queue_message").len() == 2).await;
+    std::fs::remove_file(home.join("resume_wait")).unwrap();
+    // Neither was delivered: the queue is cleared and the steer goes again, as a prompt.
+    assert_eq!(
+        gw.wait_replies(2).await,
+        ["resumed: [chat #1] long job", "echo: [chat #2] next"]
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(gw.replies().len(), 2, "each message answered once");
+    assert!(!log(&home, "clear_queue").is_empty());
+    assert!(!main_session(&home).contains("Zephyr restarted while you were working"));
     gw.shutdown().await;
 }

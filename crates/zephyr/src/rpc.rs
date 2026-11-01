@@ -18,6 +18,78 @@ pub const MAIN_SESSION: &str = "main";
 /// The main sessions on disk, newest first, as (id, mtime in unix secs). rpi 0.15 files them as
 /// `<dir>/<cwd folder>/<ISO>_<id>.jsonl`, fake-rpi as `<dir>/<id>.json`. Only `main` and the
 /// `main-<secs>` ids `/new` makes count, so `/switch` never hands rpi a job's or a stray name.
+/// Ends the rpi children a crashed daemon left behind (DESIGN §4.4): `zephyr supervise` starts a
+/// new daemon in the same container, and an old child still holds its session open, so the new
+/// one could not resume it. Their pipes to the old daemon are gone, so they have no work left.
+/// Matched exactly: this `rpi` binary, `--mode rpc`, this `--session-dir`, and the agent's uid
+/// (ours without one). A group is killed only when the process leads it (children since this
+/// change do); one from an older build shares the supervisor's group, so only it is killed.
+/// Returns how many. Called before anything is spawned, so none of these are ours.
+pub fn kill_leftovers(rpi: &std::path::Path, session_dir: &std::path::Path) -> usize {
+    let uid = crate::agent::ids().map_or_else(|| unsafe { libc::getuid() }, |(u, _)| u);
+    let (rpi, dir) = (rpi.to_string_lossy(), session_dir.to_string_lossy());
+    let me = std::process::id();
+    let mut killed = 0;
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let args: Vec<String> = raw
+            .split(|b| *b == 0)
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        // argv[0] is the binary, or argv[1] when it is a script run through its interpreter.
+        let ours = args.iter().take(2).any(|a| *a == rpi)
+            && args.windows(2).any(|w| w[0] == "--mode" && w[1] == "rpc")
+            && args
+                .windows(2)
+                .any(|w| w[0] == "--session-dir" && w[1] == dir);
+        if !ours || proc_uid(pid) != Some(uid) {
+            continue;
+        }
+        let pid = pid as i32;
+        let target = if proc_pgid(pid) == Some(pid) {
+            -pid
+        } else {
+            pid
+        };
+        // SAFETY: a plain syscall; the target was matched just above.
+        if unsafe { libc::kill(target, libc::SIGKILL) } == 0 {
+            killed += 1;
+        }
+    }
+    if killed > 0 {
+        eprintln!("zephyr: ended {killed} rpi process(es) a previous daemon left behind");
+    }
+    killed
+}
+
+fn proc_uid(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let line = status.lines().find(|l| l.starts_with("Uid:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Field 5 of `/proc/<pid>/stat`, read after the command name's last `)`.
+fn proc_pgid(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat[stat.rfind(')')? + 1..]
+        .split_whitespace()
+        .nth(2)?
+        .parse()
+        .ok()
+}
+
 pub fn saved_sessions(dir: &std::path::Path) -> Vec<(String, i64)> {
     let entries = |d: &std::path::Path| {
         std::fs::read_dir(d)
@@ -133,12 +205,24 @@ impl Child {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true);
+        // Its own process group, so a daemon that finds it left over from a crash can end it and
+        // what it started (the provider's runtime) together: `kill_leftovers`.
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.as_std_mut().process_group(0);
+        }
         match session_id {
             Some(id) => cmd
                 .args(["--session-id", id, "--session-dir"])
                 .arg(cfg.session_dir()),
             None => cmd.args(["--no-session", "--no-tools"]),
         };
+        // The main session (`main`, `main-<secs>`) runs commands through zephyr's `exec`, which can
+        // move to the background when the owner speaks (DESIGN §4.13); jobs and tasks keep `bash`.
+        if session_id.is_some_and(|id| id == MAIN_SESSION || id.starts_with("main-")) {
+            cmd.args(["--exclude-tools", "bash"])
+                .env(zephyr_policy::tools::EXEC_ENV, "1");
+        }
         if let Some(model) = model {
             cmd.args(["--model", model]);
         }
@@ -157,6 +241,10 @@ impl Child {
         );
         if let Some(display) = crate::desktop::ensure() {
             cmd.env("DISPLAY", display);
+            // The desktop takes only clients holding its cookie (`desktop` module docs).
+            if let Some(auth) = crate::desktop::xauthority() {
+                cmd.env("XAUTHORITY", auth);
+            }
         }
         let mut process = cmd
             .spawn()
@@ -304,7 +392,8 @@ impl Tally {
             }
         }
         // From rpi, not from anything the agent writes, so the agent cannot hide a send.
-        if ev["type"] == "tool_execution_start" && ev["toolName"] == "bash" {
+        let shell = matches!(ev["toolName"].as_str(), Some("bash" | "exec"));
+        if ev["type"] == "tool_execution_start" && shell {
             if let Some(command) = ev["args"]["command"].as_str() {
                 self.outbound
                     .extend(zephyr_policy::policy::outbound(command));
@@ -346,6 +435,39 @@ pub fn message_text(msg: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_crashed_daemons_rpi_is_ended_and_no_other() {
+        use std::os::unix::process::CommandExt;
+        let fake = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-rpi.py"));
+        let dir = crate::test_dir("rpc-leftovers");
+        let (ours, other) = (dir.join("sessions"), dir.join("elsewhere"));
+        let spawn = |sessions: &std::path::Path| {
+            std::process::Command::new(fake)
+                .args(["--mode", "rpc", "--session-id", "main", "--session-dir"])
+                .arg(sessions)
+                .env("ZEPHYR_HOME_FOR_FAKE", &dir)
+                .current_dir(&dir)
+                .stdin(std::process::Stdio::piped()) // held open: it waits on it like a real child
+                .stdout(std::process::Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap()
+        };
+        let (mut left, mut kept) = (spawn(&ours), spawn(&other));
+        std::thread::sleep(Duration::from_millis(300)); // past the interpreter's exec
+        assert_eq!(kill_leftovers(fake, &ours), 1);
+        let status = left.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(
+            kept.try_wait().unwrap().is_none(),
+            "another session dir is not ours"
+        );
+        assert_eq!(kill_leftovers(fake, &dir.join("none")), 0);
+        let _ = kept.kill();
+        let _ = kept.wait();
+    }
 
     #[test]
     fn tally_keeps_only_daemon_tool_calls_that_succeeded() {

@@ -46,6 +46,15 @@ pub struct Config {
     /// Wall clock cap for one job run. Not configurable; tests shorten it.
     #[serde(skip, default = "job_timeout")]
     pub job_timeout: std::time::Duration,
+    /// How long an `exec` holds the agent's turn before it moves to the background (DESIGN
+    /// §4.13). Not configurable; tests shorten it.
+    #[serde(skip, default = "exec_backstop")]
+    pub exec_backstop: std::time::Duration,
+    /// A run with no rpi event for this long is stuck and aborted (DESIGN §4.4); twice this while
+    /// a tool runs, since rpi reports nothing between a silent command's start and end. Not
+    /// configurable; tests shorten it.
+    #[serde(skip, default = "stall_limit")]
+    pub stall_limit: std::time::Duration,
     /// `[agent]`: what the agent's processes get (DESIGN §4.4).
     #[serde(default)]
     pub agent: Agent,
@@ -59,6 +68,14 @@ pub struct Config {
 
 fn job_timeout() -> std::time::Duration {
     crate::scheduler::JOB_TIMEOUT
+}
+
+fn exec_backstop() -> std::time::Duration {
+    std::time::Duration::from_secs(10 * 60)
+}
+
+fn stall_limit() -> std::time::Duration {
+    std::time::Duration::from_secs(10 * 60)
 }
 
 /// Sent once, when a budget limit is crossed.

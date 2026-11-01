@@ -135,7 +135,7 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
 
   ```sh
   docker exec -it -u "$(id -u)" zephyr x11vnc -storepasswd /zephyr/.vnc-passwd   # once
-  docker exec -d -u "$(id -u)" zephyr x11vnc -display :99 -localhost -once -rfbauth /zephyr/.vnc-passwd
+  docker exec -d -u "$(id -u)" zephyr x11vnc -display :99 -auth /zephyr/.zephyr-xauthority -localhost -once -rfbauth /zephyr/.vnc-passwd
   ```
 
 - **Files and jobs.** The agent's `send_file` tool sends you a file (up to 10 MB: a screenshot, a
@@ -148,6 +148,23 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   drops it (a proposal lapses after 24 hours). Approvals (`/ok`, `/memory ok`, `/job ok`, `/rule`,
   `/login`, `/resume`) and `/stop` are never proposable, so text the agent read cannot approve
   itself. In a scheduled job it gets no answer and proposes nothing.
+- **Background tasks.** You can keep talking while the agent works. It hands anything that takes
+  more than a minute to a task (its `task` tool): a fresh session running beside the conversation,
+  at most 2 at once. The agent answers right away, and when the task ends its report comes back to
+  the agent, which tells you. Ask it to cancel, or use `/task list` and `/task stop N`. `/stop`
+  stops the reply and every task. A task cut off by a restart or a settings reload picks up where
+  it left off in its own session, told to check what was in progress before repeating anything (at
+  most 3 times; then it is reported as unfinished).
+- **Talking to it while it works.** A message you send mid-run reaches the agent after the step
+  it is on, and its answer comes back right away, not when the whole job is done. The agent runs
+  commands through its own `exec` tool: when you send a message during a long command (or after
+  10 minutes, or for a server it starts), the command moves to the background without being
+  stopped, the agent answers you, and you get its result as a message when it exits.
+  `/process list` and `/process stop N` show and stop them; `/stop` stops them too. A settings
+  reload or a daemon crash keeps them running (the daemon is started again inside the container);
+  a container restart ends them, and they are reported. A stopped task reports how far it got.
+  Old job and task sessions and process logs are deleted after 30 days. A run that makes
+  no progress for 10 minutes (20 inside a command) is stopped and you are told.
 
 A site's terms may forbid automated use; a site that catches the agent can flag the account it is
 signed in as.

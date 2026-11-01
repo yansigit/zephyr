@@ -15,11 +15,15 @@ pub mod host;
 pub mod imessage;
 pub mod memory;
 pub mod pool;
+pub mod procs;
 pub mod reload;
+pub mod retention;
 pub mod router;
 pub mod rpc;
 pub mod scheduler;
 pub mod store;
+pub mod supervise;
+pub mod tasks;
 pub mod tools;
 pub mod tui;
 

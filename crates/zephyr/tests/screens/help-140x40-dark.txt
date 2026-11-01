@@ -2,7 +2,6 @@
 (               main · claude-code-1 › claude-opus-5-5
  `-.___.-'      discord ●  imessage ●  chat ○                                                                  today 41.2k tok · $0.38 / $5
  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-   ─────────────────────────────────────────────────────────── Fri 30 Oct 2026 ───────────────────────────────────────────────────────────
  ╭─ commands ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
  │ › type to filter                                                                                                                       │
  │ Chat                                                                                                                                   │
@@ -12,7 +11,11 @@
  │    /btw <question>          ask a side question; the conversation is left as is                                                        │
  │    /help                    this list                                                                                                  │
  │ Agent                                                                                                                                  │
- │    /stop                    stop the current reply                                                                                     │
+ │    /stop                    stop the current reply and every task                                                                      │
+ │    /task list               the agent's background tasks                                                                               │
+ │    /task stop <id>          stop one task                                                                                              │
+ │    /process list            commands running in the background                                                                         │
+ │    /process stop <id>       stop one command                                                                                           │
  │    /model                   pick a model                                                                                               │
  │    /model <provider/model>  switch the model after the current reply                                                                   │
  │    /ok <n>                  run the agent's proposal n                                                                                 │
@@ -33,8 +36,5 @@
  │ Gateway                                                                                                                                │
  │    /status                  agent, accounts, channels, spend and jobs                                                                  │
  │    /login                   sign in to a provider and add its account                                                                  │
- │    /pause                   hold new messages until /resume                                                                            │
- │    /resume                  answer what waited                                                                                         │
- │    /reload                  apply zephyr.toml and secrets.env                                                                          │
- ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 1-32 of 35 ─╯
   ↑↓ choose · ⏎ insert · type to filter · esc close

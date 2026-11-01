@@ -40,9 +40,28 @@ read (GATEWAY_COMMANDS) and a proposable action (/model P/M, /new, /switch ID, /
 both wait for the daemon; anything else is refused at once
 ("tool error: ... is not available to the agent"), with no wait. While it waits it answers the commands that need no run
 (as rpi does) and keeps the rest for after; an `abort` ends it with "Operation aborted", and the
-run settles "aborted" with no reply.
+run settles "aborted" with no reply. A `task` call waits for its answer the same way (reply line
+`task: <answer>`); one the plugin would refuse (an action other than start with a goal, list, or
+stop with an id) gets "tool error: bad task call" at once. `exec` and `process` calls wait the same
+way (up to 30 s for `exec`, whose answer comes when its command ends or yields); an `exec` with an
+empty command gets "tool error: `command` is empty" at once.
+`queue_message` with `deliverAs: "steer"` is held (answering `queue: "steer"`) and delivered, as rpi
+0.15 does, after the running tool's result: `turn_start`, the user message's `message_start`/
+`message_end` (role and kind `user`), then the fake's answer `echo: <text>` (none when the text
+holds `[quiet]`), before the run carries on to its own reply. A prompt holding `[stop-after-steer]`
+ends right after answering a steer, with no text of its own (as a model that only answers the
+steered message does). One holding `[pend-after-steer]` stops right after answering a steer, its
+run left pending (as a crash would leave it) until `resume_pending`. The router's continuation of such a request (its text asks for exactly
+NO_REPLY when finished) is answered `NO_REPLY`, unless the request holds `[unfinished]`. One sent while idle waits for the
+next prompt. A plain `queue_message` is a follow-up: never run, only cleared by `clear_queue`, which
+empties both.
 `get_state` reports thinkingLevel "medium".
 A prompt containing `[turns N]` reports N `turn_end` events, then waits for `abort` as `[hang]` does.
+A prompt containing `[hang-pending]` hangs as `[hang]` does and marks the session resumable, as a
+run cut mid-flight leaves it (`resume_pending` then answers `resumed: <last user text>`; while a
+`resume_wait` file exists it first stays open, taking commands, so a steer sent then is held).
+A prompt containing `[progress]` first writes an assistant message `progress: halfway`, so a run
+cut later has partial work to report.
 A prompt containing `[hang]` never settles until `abort`, which records an aborted assistant
 message (stopReason "aborted", `errorMessage` "abort error: Request aborted") and settles with
 outcome "aborted"; one that starts with `say: `
@@ -200,7 +219,7 @@ def finish(s, text, outcome="completed"):
 
 def quick(cmd, s):
     """Answers a command that needs no run (also while a gateway call waits); False otherwise."""
-    global queue, model
+    global queue, steering, model
     kind = cmd["type"]
     if kind == "get_messages":
         respond(cmd, {"messages": s["messages"], "total": len(s["messages"]), "pendingResume": s["pending"]})
@@ -212,10 +231,13 @@ def quick(cmd, s):
         respond(cmd, {"providers": [{"provider": p, "ready": True, "source": "oauth", "status": "ready",
                                      "oauth": True, "oauthAvailable": True}
                                     for p, c in store.items() if c.get("type") == "oauth"]})
+    elif kind == "queue_message" and cmd.get("deliverAs") == "steer":
+        steering.append(cmd["message"]); respond(cmd, {"accepted": True, "entryId": "q", "queue": "steer"})
     elif kind == "queue_message":
         queue.append(cmd["message"]); respond(cmd, {"accepted": True, "entryId": "q", "queue": "followUp"})
     elif kind == "clear_queue":
-        respond(cmd, {"cleared": len(queue), "steering": [], "followUp": queue}); queue = []
+        respond(cmd, {"cleared": len(queue) + len(steering), "steering": steering, "followUp": queue})
+        queue, steering = [], []
     elif kind == "get_stats":
         respond(cmd, {"totalTokens": 0, "costTotal": 0.0})
     elif kind == "set_model":
@@ -229,6 +251,18 @@ def quick(cmd, s):
     else:
         return False
     return True
+
+def deliver_steering(s):
+    """As rpi: each steered message becomes a user message of its own at the next turn, and the
+    fake answers it `echo: <text>` (unless it holds `[quiet]`) before the run carries on."""
+    global steering, steered_this_run
+    steered_this_run = steered_this_run or bool(steering)
+    for text in steering:
+        out({"type": "turn_start"})
+        for m in [user(text)] + ([] if "[quiet]" in text else [assistant("echo: " + text)]):
+            s["messages"].append(m); save(s)
+            out({"type": "message_start", "message": m}); out({"type": "message_end", "message": m})
+    steering = []
 
 def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
     call = {"kind": "assistant", "role": "assistant", "stopReason": "toolUse", "timestamp": 0,
@@ -255,10 +289,19 @@ def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
         result["isError"] = True
         result["content"] = [{"type": "text", "text": "tool error: %s is not available to the agent"
                               % args.get("command", "").strip()}]
-    elif name == "gateway":
+    elif name == "task" and not ((args.get("action") == "start" and str(args.get("goal", "")).strip())
+                                 or args.get("action") == "list"
+                                 or (args.get("action") == "stop" and isinstance(args.get("id"), int))):
+        result["isError"] = True
+        result["content"] = [{"type": "text", "text": "tool error: bad task call"}]
+    elif name == "exec" and not str(args.get("command", "")).strip():
+        result["isError"] = True
+        result["content"] = [{"type": "text", "text": "tool error: `command` is empty"}]
+    elif name in ("gateway", "task", "exec", "process"):
         answer = os.path.join(os.environ.get("ZEPHYR_GATEWAY_DIR", ""), cid)
         text = "the gateway did not answer"
-        deadline = time.time() + 5
+        # An exec answers when its command ends or yields, so it may take a while.
+        deadline = time.time() + (30 if name == "exec" else 5)
         while time.time() < deadline:
             if os.path.exists(answer):
                 text = open(answer).read(); os.remove(answer); break
@@ -278,6 +321,8 @@ def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
          "result": {"content": result["content"]}})
     s["messages"].append(result); save(s)
     out({"type": "message_start", "message": result}); out({"type": "message_end", "message": result})
+    if not aborted:
+        deliver_steering(s)
     return None if aborted else result["content"][0]["text"]
 
 out({"type": "ready", "protocol": "rpi", "piCompatibilityTarget": "1.2.0",
@@ -287,6 +332,8 @@ out({"type": "ready", "protocol": "rpi", "piCompatibilityTarget": "1.2.0",
      "semantics": {"promptResponse": "accepted", "settlementEvent": "agent_settled", "agentEndIsTerminal": False},
      "limits": {"frameBytes": 1048576, "maxConcurrentPrompts": 1}, "parityComplete": False})
 queue = []
+steering = []  # queue_message with deliverAs "steer": delivered after the running tool
+steered_this_run = False
 hanging = False
 calls = 0
 model = opt("--model")
@@ -312,6 +359,8 @@ for line in iter(next_line, None):
         # As rpi 0.15: the prompt is committed (before agent_start), but no message events carry it.
         out({"type": "session_entry_committed", "entryId": "u", "entryType": "message", "customType": None, "lane": "main"})
         out({"type": "agent_start"})
+        steered_this_run = False
+        deliver_steering(s)  # as rpi: one steered while idle waits for the next run
         if os.path.exists(os.path.join(home, "slow")):
             time.sleep(float(open(os.path.join(home, "slow")).read() or 1))
         if os.path.exists(os.path.join(home, "hang")):
@@ -339,10 +388,19 @@ for line in iter(next_line, None):
             continue
         if rate_limit() is not None:
             fail(s, rate_limit()); continue
+        if "[progress]" in cmd["message"]:
+            # A note of its own before the rest, so a run cut later has partial work.
+            m = assistant("progress: halfway")
+            s["messages"].append(m); save(s)
+            out({"type": "message_start", "message": m}); out({"type": "message_end", "message": m})
         turns = re.search(r"\[turns (\d+)\]", cmd["message"])
         if turns:
             for _ in range(int(turns.group(1))):
                 out({"type": "turn_end"})
+            hanging = True; continue
+        if "[hang-pending]" in cmd["message"]:
+            # As a run cut mid-flight: resumable after a restart (`resume_pending`).
+            s["pending"] = True; save(s)
             hanging = True; continue
         if "[hang]" in cmd["message"]:
             hanging = True; continue
@@ -352,26 +410,45 @@ for line in iter(next_line, None):
             finish(s, "ran"); continue
         if "[tool]" in cmd["message"] and tools:
             run_tool(s)
+        if "[pend-after-steer]" in cmd["message"] and steered_this_run:
+            # A crash point: the steer was answered, the run never settles until resumed.
+            s["pending"] = True; save(s)
+            hanging = True; continue
         answers, text = [], ""
         for name, args in re.findall(r"\[call (\w+) (\{[^{}]*\})\]", cmd["message"]) if tools else []:
             calls += 1  # a fresh id per call, as a model would
             text = run_tool(s, name, json.loads(args), "c%d" % calls)
             if text is None:
                 break
-            if name == "gateway":
-                answers.append("\ngateway: " + text)
+            if name in ("gateway", "task", "exec", "process"):
+                answers.append("\n%s: %s" % (name, text))
         if text is None:
             finish(s, "", "aborted"); continue
         if cmd["message"].endswith("model?"):
             finish(s, "model: %s" % model); continue
         if cmd["message"].startswith("say: "):
             finish(s, cmd["message"][5:]); continue
+        if "[stop-after-steer]" in cmd["message"] and steered_this_run:
+            finish(s, ""); continue
+        if "reply with exactly NO_REPLY" in cmd["message"] and "[unfinished]" not in cmd["message"]:
+            finish(s, "NO_REPLY"); continue
         finish(s, "echo: " + cmd["message"] + "".join(answers))
     elif kind == "resume_pending":
         if not s["pending"]:
             respond(cmd, {"resumed": False}); continue
         respond(cmd, {"accepted": True})
         out({"type": "agent_start"})
+        # While `resume_wait` exists the resumed run stays open, taking commands (a steer is held).
+        while os.path.exists(os.path.join(home, "resume_wait")):
+            try:
+                line = lines.get(timeout=0.05)
+            except queues.Empty:
+                continue
+            if line is None:
+                break
+            open(os.path.join(home, "log.jsonl"), "a").write(line)
+            if not quick(json.loads(line), s):
+                deferred.append(line)
         last = [m for m in s["messages"] if m["kind"] == "user"][-1]
         finish(s, "resumed: " + last["content"])
     elif quick(cmd, s):

@@ -30,7 +30,8 @@ pub enum Decision {
 /// Decide one tool call from its name and JSON arguments.
 pub fn check(tool: &str, args: &Value) -> Decision {
     match tool {
-        "bash" => match args.get("command").and_then(Value::as_str) {
+        // `exec` is the main child's `bash` (DESIGN §4.13): the same veto.
+        "bash" | "exec" => match args.get("command").and_then(Value::as_str) {
             Some(command) => check_bash(command),
             None => Decision::Deny("bash call has no command string"),
         },
@@ -571,6 +572,15 @@ mod tests {
 
     fn file(tool: &'static str, path: &str) -> (&'static str, Value) {
         (tool, json!({ "path": path, "content": "x" }))
+    }
+
+    #[test]
+    fn exec_is_vetoed_as_bash_is() {
+        for command in ["rm -rf /", "cat ~/.ssh/id_rsa", "ls -la"] {
+            let args = json!({ "command": command });
+            assert_eq!(check("exec", &args), check("bash", &args), "{command}");
+        }
+        assert!(matches!(check("exec", &json!({})), Decision::Deny(_)));
     }
 
     #[test]
