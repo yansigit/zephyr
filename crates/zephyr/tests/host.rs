@@ -807,6 +807,44 @@ fn settings_reach_roots_files_through_the_container() {
 }
 
 #[test]
+fn up_and_upgrade_add_the_images_new_extensions_through_the_container() {
+    let env = Env::new("up-ext");
+    env.init(&["--no-start"]);
+    // A config written before the MCP adapter shipped, in root's dir as after the first `up`.
+    let adapter = "\"/opt/zephyr/ext/librpi_mcp_adapter.so\"";
+    let files = env.dir.join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    for name in ["zephyr.toml", "secrets.env", "tui.token", "host.toml"] {
+        std::fs::rename(env.daemon().join(name), files.join(name)).unwrap();
+    }
+    let toml = files.join("zephyr.toml");
+    let old = std::fs::read_to_string(&toml)
+        .unwrap()
+        .replace(&format!("{adapter}, "), "");
+    assert!(!old.contains(adapter));
+    std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let put = ["zephyr", "__file", "put", "zephyr.toml"];
+    for cmd in ["up", "upgrade"] {
+        std::fs::write(&toml, &old).unwrap();
+        env.ok(&[cmd]);
+        let text = std::fs::read_to_string(&toml).unwrap();
+        assert!(text.contains(adapter), "{cmd}: {text}");
+        let calls = env.calls();
+        let root = ["docker", "exec", "-i", "-u", "0", CONTAINER];
+        find(&calls, &[&root[..], &put[..]].concat());
+        // Nothing to add: the file is left alone.
+        env.ok(&[cmd]);
+        let calls = env.calls();
+        assert!(
+            !calls.iter().any(|c| c.ends_with(&put.map(String::from))),
+            "{cmd}"
+        );
+    }
+    std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
 fn doctor_fix_repairs_modes() {
     let env = Env::new("doctor");
     env.init(&["--no-start"]);

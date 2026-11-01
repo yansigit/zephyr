@@ -410,19 +410,20 @@ pub fn order_accounts(doc: &mut DocumentMut, names: &[String]) -> anyhow::Result
 }
 
 /// Adds the image's extensions a config lacks (one written before they were baked in), keeping the
-/// list in `EXTENSIONS` order so an upgraded config matches a fresh one.
-pub fn add_image_extensions(doc: &mut DocumentMut) {
+/// list in `EXTENSIONS` order so an upgraded config matches a fresh one. True when it added any.
+/// It cannot tell an extension the owner removed from one never listed, so it adds both back.
+pub fn add_image_extensions(doc: &mut DocumentMut) -> bool {
     let list = doc
         .entry("extensions")
         .or_insert_with(|| value(toml_edit::Array::new()));
     let Some(list) = list.as_array_mut() else {
-        return;
+        return false;
     };
     if EXTENSIONS
         .iter()
         .all(|e| list.iter().any(|v| v.as_str() == Some(e)))
     {
-        return;
+        return false;
     }
     let mut entries: Vec<toml_edit::Value> = list.iter().cloned().collect();
     for e in EXTENSIONS {
@@ -442,6 +443,7 @@ pub fn add_image_extensions(doc: &mut DocumentMut) {
     for v in entries {
         list.push(v);
     }
+    true
 }
 
 /// `--extension <path>` for each configured extension, for rpi calls in the container.
@@ -540,8 +542,8 @@ model = "p/m"
             "rpi = \"/usr/local/bin/rpi\"\nhome = \"/zephyr\"\n[owners]\nchat = [\"1\"]\n"
                 .parse()
                 .unwrap();
-        add_image_extensions(&mut doc);
-        add_image_extensions(&mut doc);
+        assert!(add_image_extensions(&mut doc));
+        assert!(!add_image_extensions(&mut doc));
         assert_eq!(extension_args(&doc).len(), 2 * EXTENSIONS.len());
         let cfg: crate::config::Config = toml::from_str(&doc.to_string()).unwrap();
         assert_eq!(cfg.extensions.len(), EXTENSIONS.len());
