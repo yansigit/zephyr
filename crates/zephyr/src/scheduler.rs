@@ -277,9 +277,10 @@ async fn prompt(
             Some(ev) => {
                 tally.add(&ev);
                 // A job is not the owner's conversation; answered at once so it does not wait.
-                // Off the list, the plugin has refused the call already and nothing waits.
+                // Off the list, the plugin has refused the call already and nothing waits. A
+                // proposal is not stored either: no one is there to approve it.
                 if let Some((id, command)) = crate::tools::gateway_call(&ev) {
-                    if zephyr_policy::tools::GATEWAY_COMMANDS.contains(&command) {
+                    if zephyr_policy::tools::gateway_kind(command).is_some() {
                         crate::tools::answer_gateway(cfg, id, "not available in scheduled runs");
                     }
                 }

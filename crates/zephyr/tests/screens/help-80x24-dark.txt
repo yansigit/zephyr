@@ -13,12 +13,12 @@
  │    /stop                    stop the current reply                         │
  │    /model                   pick a model                                   │
  │    /model <provider/model>  switch the model after the current reply       │
+ │    /ok <n>                  run the agent's proposal n                     │
+ │    /no <n>                  drop the agent's proposal n                    │
  │ Memory                                                                     │
  │    /memory diff             the memory change waiting for you              │
  │    /memory ok               let the agent see the waiting change           │
  │    /memory undo             drop the waiting change, else the last one     │
  │    /memory log              the last 10 memory commits                     │
- │    /rules                   your standing rules                            │
- │    /rule <text>             add a rule the agent reads first               │
- ╰─────────────────────────────────────────────────────────────── 1-16 of 28 ─╯
+ ╰─────────────────────────────────────────────────────────────── 1-16 of 30 ─╯
   ↑↓ choose · ⏎ insert · type to filter · esc close

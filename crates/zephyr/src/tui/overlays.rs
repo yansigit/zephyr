@@ -27,6 +27,8 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "/model <provider/model>",
         "switch the model after the current reply",
     ),
+    ("Agent", "/ok <n>", "run the agent's proposal n"),
+    ("Agent", "/no <n>", "drop the agent's proposal n"),
     (
         "Memory",
         "/memory diff",
@@ -1171,17 +1173,17 @@ mod tests {
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(got.len(), 8);
         assert_eq!(got[2], format!("│ Chat{}│", " ".repeat(73)));
-        assert!(got[7].ends_with(" 1-5 of 28 ─╯"), "{got:?}");
-        for _ in 0..8 {
+        assert!(got[7].ends_with(" 1-5 of 30 ─╯"), "{got:?}");
+        for _ in 0..10 {
             key(&mut o, press(KeyCode::Down), &rows);
         }
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
-        // The ninth command is /memory ok; the window follows it down.
+        // The eleventh command is /memory ok; the window follows it down.
         assert_eq!(
             got[6],
             "│  › /memory ok               let the agent see the waiting change             │"
         );
-        assert!(got[7].ends_with(" 8-12 of 28 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 10-14 of 30 ─╯"), "{got:?}");
         key(&mut o, press(KeyCode::Down), &rows);
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),

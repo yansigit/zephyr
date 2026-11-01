@@ -1571,3 +1571,101 @@ async fn a_job_gets_no_gateway() {
     );
     gw.shutdown().await;
 }
+
+const NO_PROPOSAL: &str = "[zephyr] no proposal #1 is waiting";
+
+#[tokio::test]
+async fn the_agent_proposes_a_model_and_only_the_owners_ok_switches_it() {
+    let home = home("gateway-propose");
+    let gw = start(on_file(&home, ""));
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call gateway {"command": "/model fake/m2"}] try m2"#,
+    )
+    .await;
+    let replies = gw.wait_replies(2).await;
+    assert_eq!(
+        replies[0],
+        "[zephyr] the agent asks to run /model fake/m2 (#1); /ok 1 runs it, /no 1 drops it"
+    );
+    assert!(
+        replies[1]
+            .ends_with("\ngateway: proposed as #1; it runs only if the owner approves with /ok 1"),
+        "{replies:?}"
+    );
+    assert!(log(&home, "set_model").is_empty(), "nothing ran yet");
+    gw.say("m2", "owner", "/ok 1").await;
+    gw.say("m3", "owner", "model?").await;
+    let replies = gw.wait_replies(4).await;
+    // The owner's own `/model fake/m2` reply, from the same code path.
+    assert_eq!(replies[2..], ["[zephyr] now on fake/m2", "model: fake/m2"]);
+    assert_eq!(log(&home, "set_model").len(), 1);
+    gw.say("m4", "owner", "/ok 1").await;
+    let again = gw.wait_replies(5).await[4].clone();
+    assert!(again.starts_with(NO_PROPOSAL), "{again}");
+    assert_eq!(log(&home, "set_model").len(), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn no_drops_a_proposal() {
+    let home = home("gateway-no");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", r#"[call gateway {"command": "/pause"}] hi"#)
+        .await;
+    gw.wait_replies(2).await;
+    gw.say("m2", "owner", "/no 1").await;
+    gw.say("m3", "owner", "/ok 1").await;
+    let replies = gw.wait_replies(4).await;
+    assert_eq!(replies[2], "[zephyr] dropped #1 (/pause)");
+    assert!(replies[3].starts_with(NO_PROPOSAL), "{replies:?}");
+    gw.say("m4", "owner", "still here?").await;
+    assert_eq!(gw.wait_replies(5).await[4], "echo: [chat #4] still here?");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn approvals_are_never_proposed() {
+    let home = home("gateway-no-approve");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call gateway {"command": "/login"}] [call gateway {"command": "/ok 1"}]"#,
+    )
+    .await;
+    let replies = gw.wait_replies(1).await;
+    assert_eq!(replies.len(), 1, "no notice: {replies:?}");
+    for refused in ["/login", "/ok 1"] {
+        let line = format!("\ngateway: tool error: {refused} is not available to the agent");
+        assert!(replies[0].contains(&line), "{replies:?}");
+    }
+    gw.say("m2", "owner", "/ok 1").await;
+    let none = gw.wait_replies(2).await[1].clone();
+    assert!(none.starts_with(NO_PROPOSAL), "nothing stored: {none}");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_job_cannot_propose() {
+    let home = home("gateway-job-propose");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        &format!(r#"/job add gw | {NEVER} | [call gateway {{"command": "/new"}}] check"#),
+    )
+    .await;
+    gw.say("m2", "owner", "/job run 1").await;
+    wait(|| run_status(&home, "completed") == 1).await;
+    let replies = gw.wait_replies(3).await;
+    assert!(
+        replies[2].ends_with("\ngateway: not available in scheduled runs"),
+        "{replies:?}"
+    );
+    gw.say("m3", "owner", "/ok 1").await;
+    let none = gw.wait_replies(4).await[3].clone();
+    assert!(none.starts_with(NO_PROPOSAL), "nothing stored: {none}");
+    gw.shutdown().await;
+}

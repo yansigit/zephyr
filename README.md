@@ -139,10 +139,13 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
 - **Files and jobs.** The agent's `send_file` tool sends you a file (up to 10 MB: a screenshot, a
   PDF) with its reply. Its `schedule` tool only proposes a job: you are shown it, and it runs after
   `/job ok N` (`/job rm N` drops it; `/job list` marks the ones waiting).
-- **Read-only commands.** The agent's `gateway` tool runs `/status`, `/model`, `/switch`, `/rules`,
-  `/memory diff`, `/memory log` or `/job list` and reads the output in the same turn. It cannot run
-  anything that approves or changes something (`/memory ok`, `/job ok`, `/rule`, `/model X`, ...);
-  those stay yours. In a scheduled job it gets no answer.
+- **Commands.** The agent's `gateway` tool runs `/status`, `/model`, `/switch`, `/rules`,
+  `/memory diff`, `/memory log` or `/job list` and reads the output in the same turn. It can only
+  propose `/model PROVIDER/MODEL`, `/new`, `/switch ID`, `/pause` or `/reload`: you are asked
+  (`the agent asks to run /new (#3)`), `/ok 3` runs it exactly as if you had typed it, and `/no 3`
+  drops it (a proposal lapses after 24 hours). Approvals (`/ok`, `/memory ok`, `/job ok`, `/rule`,
+  `/login`, `/resume`) and `/stop` are never proposable, so text the agent read cannot approve
+  itself. In a scheduled job it gets no answer and proposes nothing.
 
 A site's terms may forbid automated use; a site that catches the agent can flag the account it is
 signed in as.
