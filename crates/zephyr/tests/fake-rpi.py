@@ -28,6 +28,12 @@ and that `errorMessage` as `agent_settled.error`. A prompt containing `[tool]` f
 `bash` tool call (assistant toolCall, tool_execution_start, tool_execution_end, toolResult); while a
 `tool_wait` file exists in the home, the tool keeps running. Each `[call NAME {JSON}]` in a prompt runs
 one such call of tool NAME with those (flat) args, succeeding, before the reply.
+A `gateway` call plays the policy plugin: it waits up to 5 s for the daemon's answer in
+$ZEPHYR_GATEWAY_DIR/<call id>, consumes it, makes it the tool result, and the reply gets a
+`gateway: <answer>` line per call. A command off the plugin's list is refused at once
+("tool error: ... is not available to the agent"), with no wait. While it waits it answers the commands that need no run
+(as rpi does) and keeps the rest for after; an `abort` ends it with "Operation aborted", and the
+run settles "aborted" with no reply.
 `get_state` reports thinkingLevel "medium".
 A prompt containing `[turns N]` reports N `turn_end` events, then waits for `abort` as `[hang]` does.
 A prompt containing `[hang]` never settles until `abort`, which records an aborted assistant
@@ -39,12 +45,14 @@ Models: `--list-models` (held while a `list_wait` file exists in the home) print
 `set_model` switches to one of them and errors on anything else.
 The session is <session-dir>/<session-id>.json: {"messages": [...], "pending": bool}.
 """
-import json, os, re, sys, time
+import json, os, queue as queues, re, sys, threading, time
 
 args = sys.argv[1:]
 if "--version" in args:
     print("rpi 0.15.0"); sys.exit(0)
 CATALOG = ["fake/m1", "fake/m2", "other/m3", "opencode-go/alpha"]
+# zephyr_policy::tools::GATEWAY_COMMANDS
+GATEWAY_COMMANDS = ["/status", "/model", "/switch", "/rules", "/memory diff", "/memory log", "/job list"]
 if "--list-models" in args:
     while os.path.exists("list_wait"):  # cwd is the home
         time.sleep(0.05)
@@ -166,6 +174,38 @@ def finish(s, text, outcome="completed"):
     out({"type": "agent_settled", "runId": "r", "outcome": outcome, "aborted": outcome == "aborted",
          "error": None, "summary": None, "pendingResume": False})
 
+def quick(cmd, s):
+    """Answers a command that needs no run (also while a gateway call waits); False otherwise."""
+    global queue, model
+    kind = cmd["type"]
+    if kind == "get_messages":
+        respond(cmd, {"messages": s["messages"], "total": len(s["messages"]), "pendingResume": s["pending"]})
+    elif kind == "get_commands":
+        names = ["zephyr-policy"] if extension and os.path.exists(extension) else []
+        respond(cmd, {"commands": [{"name": n, "description": ""} for n in names]})
+    elif kind == "get_auth_status":
+        store = auth_store()
+        respond(cmd, {"providers": [{"provider": p, "ready": True, "source": "oauth", "status": "ready",
+                                     "oauth": True, "oauthAvailable": True}
+                                    for p, c in store.items() if c.get("type") == "oauth"]})
+    elif kind == "queue_message":
+        queue.append(cmd["message"]); respond(cmd, {"accepted": True, "entryId": "q", "queue": "followUp"})
+    elif kind == "clear_queue":
+        respond(cmd, {"cleared": len(queue), "steering": [], "followUp": queue}); queue = []
+    elif kind == "get_stats":
+        respond(cmd, {"totalTokens": 0, "costTotal": 0.0})
+    elif kind == "set_model":
+        want = "%s/%s" % (cmd.get("provider"), cmd.get("modelId"))
+        if want in catalog:
+            model = want; respond(cmd, {"modelId": cmd.get("modelId"), "provider": cmd.get("provider")})
+        else:
+            respond(cmd, error="unknown model: %s" % cmd.get("modelId"))
+    elif kind == "get_state":
+        respond(cmd, {"sessionId": opt("--session-id"), "activeOperation": None, "thinkingLevel": "medium"})
+    else:
+        return False
+    return True
+
 def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
     call = {"kind": "assistant", "role": "assistant", "stopReason": "toolUse", "timestamp": 0,
             "content": [{"type": "toolCall", "id": cid, "name": name, "arguments": args}]}
@@ -176,10 +216,36 @@ def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
     out({"type": "tool_execution_start", "toolCallId": cid, "toolName": name, "args": args})
     while os.path.exists(os.path.join(home, "tool_wait")):
         time.sleep(0.05)
-    out({"type": "tool_execution_end", "toolCallId": cid, "toolName": name, "isError": False,
+    aborted = False
+    if name == "gateway" and args.get("command", "").strip() not in GATEWAY_COMMANDS:
+        # As the plugin: refused in the child, with no wait (rpi still reports the start).
+        result["isError"] = True
+        result["content"] = [{"type": "text", "text": "tool error: %s is not available to the agent"
+                              % args.get("command", "").strip()}]
+    elif name == "gateway":
+        answer = os.path.join(os.environ.get("ZEPHYR_GATEWAY_DIR", ""), cid)
+        text = "the gateway did not answer"
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if os.path.exists(answer):
+                text = open(answer).read(); os.remove(answer); break
+            # As rpi: commands keep being answered while the call waits, and an abort ends it.
+            try:
+                line = lines.get(timeout=0.05)
+            except queues.Empty:
+                continue
+            c = json.loads(line)
+            open(os.path.join(home, "log.jsonl"), "a").write(line)
+            if c["type"] == "abort":
+                respond(c, {"aborted": True}); text = "Operation aborted"; result["isError"] = aborted = True; break
+            if not quick(c, s):
+                deferred.append(line)
+        result["content"] = [{"type": "text", "text": text}]
+    out({"type": "tool_execution_end", "toolCallId": cid, "toolName": name, "isError": result["isError"],
          "result": {"content": result["content"]}})
     s["messages"].append(result); save(s)
     out({"type": "message_start", "message": result}); out({"type": "message_end", "message": result})
+    return None if aborted else result["content"][0]["text"]
 
 out({"type": "ready", "protocol": "rpi", "piCompatibilityTarget": "1.2.0",
      "supportedCommands": ["get_state", "get_commands", "get_messages", "get_stats", "queue_message", "clear_queue",
@@ -189,9 +255,19 @@ out({"type": "ready", "protocol": "rpi", "piCompatibilityTarget": "1.2.0",
      "limits": {"frameBytes": 1048576, "maxConcurrentPrompts": 1}, "parityComplete": False})
 queue = []
 hanging = False
+calls = 0
 model = opt("--model")
 catalog = set(CATALOG) | ({model} if model else set())
-for line in sys.stdin:
+lines = queues.Queue()  # stdin, read on a thread; None at EOF
+deferred = []  # commands a waiting gateway call left for the main loop
+def read_stdin():
+    for l in sys.stdin:
+        lines.put(l)
+    lines.put(None)
+threading.Thread(target=read_stdin, daemon=True).start()
+def next_line():
+    return deferred.pop(0) if deferred else lines.get()
+for line in iter(next_line, None):
     cmd = json.loads(line)
     open(os.path.join(home, "log.jsonl"), "a").write(line)
     kind, s = cmd["type"], load()
@@ -209,7 +285,7 @@ for line in sys.stdin:
             os.remove(os.path.join(home, "hang"))
             s["pending"] = True; save(s)
             # Stay busy until aborted, then settle with no reply, as a cancelled run does.
-            for line in sys.stdin:
+            for line in iter(next_line, None):
                 c = json.loads(line)
                 open(os.path.join(home, "log.jsonl"), "a").write(line)
                 if c["type"] != "abort":
@@ -243,13 +319,21 @@ for line in sys.stdin:
             finish(s, "ran"); continue
         if "[tool]" in cmd["message"]:
             run_tool(s)
-        for i, (name, args) in enumerate(re.findall(r"\[call (\w+) (\{[^{}]*\})\]", cmd["message"])):
-            run_tool(s, name, json.loads(args), "c%d" % i)
+        answers, text = [], ""
+        for name, args in re.findall(r"\[call (\w+) (\{[^{}]*\})\]", cmd["message"]):
+            calls += 1  # a fresh id per call, as a model would
+            text = run_tool(s, name, json.loads(args), "c%d" % calls)
+            if text is None:
+                break
+            if name == "gateway":
+                answers.append("\ngateway: " + text)
+        if text is None:
+            finish(s, "", "aborted"); continue
         if cmd["message"].endswith("model?"):
             finish(s, "model: %s" % model); continue
         if cmd["message"].startswith("say: "):
             finish(s, cmd["message"][5:]); continue
-        finish(s, "echo: " + cmd["message"])
+        finish(s, "echo: " + cmd["message"] + "".join(answers))
     elif kind == "resume_pending":
         if not s["pending"]:
             respond(cmd, {"resumed": False}); continue
@@ -257,34 +341,12 @@ for line in sys.stdin:
         out({"type": "agent_start"})
         last = [m for m in s["messages"] if m["kind"] == "user"][-1]
         finish(s, "resumed: " + last["content"])
-    elif kind == "get_messages":
-        respond(cmd, {"messages": s["messages"], "total": len(s["messages"]), "pendingResume": s["pending"]})
-    elif kind == "get_commands":
-        names = ["zephyr-policy"] if extension and os.path.exists(extension) else []
-        respond(cmd, {"commands": [{"name": n, "description": ""} for n in names]})
-    elif kind == "get_auth_status":
-        store = auth_store()
-        respond(cmd, {"providers": [{"provider": p, "ready": True, "source": "oauth", "status": "ready",
-                                     "oauth": True, "oauthAvailable": True}
-                                    for p, c in store.items() if c.get("type") == "oauth"]})
-    elif kind == "queue_message":
-        queue.append(cmd["message"]); respond(cmd, {"accepted": True, "entryId": "q", "queue": "followUp"})
-    elif kind == "clear_queue":
-        respond(cmd, {"cleared": len(queue), "steering": [], "followUp": queue}); queue = []
+    elif quick(cmd, s):
+        pass
     elif kind == "abort":
         respond(cmd, {"aborted": True})
         if hanging:
             hanging = False; finish(s, "", "aborted")
-    elif kind == "get_stats":
-        respond(cmd, {"totalTokens": 0, "costTotal": 0.0})
-    elif kind == "set_model":
-        want = "%s/%s" % (cmd.get("provider"), cmd.get("modelId"))
-        if want in catalog:
-            model = want; respond(cmd, {"modelId": cmd.get("modelId"), "provider": cmd.get("provider")})
-        else:
-            respond(cmd, error="unknown model: %s" % cmd.get("modelId"))
-    elif kind == "get_state":
-        respond(cmd, {"sessionId": opt("--session-id"), "activeOperation": None, "thinkingLevel": "medium"})
     elif kind == "stop":
         respond(cmd, {"stopped": True}); break
     else:

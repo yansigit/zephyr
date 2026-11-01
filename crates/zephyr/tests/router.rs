@@ -946,6 +946,63 @@ async fn new_starts_a_fresh_main_session_and_keeps_it_across_restarts() {
     gw.shutdown().await;
 }
 
+#[tokio::test]
+async fn switch_goes_back_to_an_earlier_conversation_and_keeps_it() {
+    let home = home("switch");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "/new").await;
+    gw.say("m3", "owner", "again").await;
+    gw.wait_replies(3).await;
+    let fresh = log(&home, "start").last().unwrap()["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    gw.say("m4", "owner", "/switch").await;
+    let list = gw.wait_replies(4).await[3].clone();
+    assert!(list.starts_with("[zephyr] conversations"), "{list}");
+    assert!(
+        list.contains(&format!("* {fresh}  ")) && list.contains("(current)"),
+        "{list}"
+    );
+    assert!(list.contains("\n  main  "), "{list}");
+
+    gw.say("m5", "owner", "/switch nope").await;
+    assert_eq!(
+        gw.wait_replies(5).await[4],
+        "[zephyr] no conversation nope; /switch lists them"
+    );
+    gw.say("m6", "owner", "/switch main").await;
+    assert_eq!(
+        gw.wait_replies(6).await[5],
+        "[zephyr] back to main from the next message"
+    );
+    gw.say("m7", "owner", "back").await;
+    assert_eq!(gw.wait_replies(7).await[6], "echo: [chat #7] back");
+    assert_eq!(log(&home, "start").last().unwrap()["sessionId"], "main");
+    let held: Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join("sessions/main.json")).unwrap())
+            .unwrap();
+    let texts: Vec<&str> = held["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .collect();
+    assert_eq!(texts, ["[chat #1] hi", "[chat #7] back"]);
+    gw.say("m8", "owner", "/switch main").await;
+    assert_eq!(gw.wait_replies(8).await[7], "[zephyr] already on main");
+    gw.shutdown().await;
+
+    let gw = start(config(&home));
+    gw.say("m9", "owner", "later").await;
+    gw.wait_replies(1).await;
+    assert_eq!(log(&home, "start").last().unwrap()["sessionId"], "main");
+    gw.shutdown().await;
+}
+
 fn spend_today(home: &Path) -> (i64, f64) {
     let store = Store::open(&home.join("state.db")).unwrap();
     store.spend(&store.today().unwrap()).unwrap()
@@ -1438,5 +1495,79 @@ async fn a_job_the_agent_proposes_waits_for_the_owners_ok() {
         "{replies:?}"
     );
     assert_eq!(jobs().len(), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_agent_reads_status_through_gateway_within_its_turn() {
+    let home = home("gateway");
+    let gw = start(config(&home));
+    // The very first run: the router's start-up calls are answered while the call waits.
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call gateway {"command": "/status"}] how are you?"#,
+    )
+    .await;
+    let reply = gw.wait_replies(1).await[0].clone();
+    // The daemon's answer came back as the tool result, so the same turn could use it.
+    assert!(reply.contains("\ngateway: agent: on "), "{reply}");
+    assert_eq!(
+        std::fs::read_dir(home.join(".gateway")).unwrap().count(),
+        0,
+        "the answer was consumed"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn gateway_never_approves_for_the_owner() {
+    let home = home("gateway-approve");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "WRITE_MEMORY likes tea").await;
+    gw.wait_replies(2).await; // the reply and the "memory change waiting" notice
+    gw.say(
+        "m2",
+        "owner",
+        r#"[call gateway {"command": "/memory ok"}] [call gateway {"command": "/memory diff"}]"#,
+    )
+    .await;
+    let reply = gw.wait_replies(3).await[2].clone();
+    assert!(
+        reply.contains("\ngateway: tool error: /memory ok is not available to the agent"),
+        "{reply}"
+    );
+    assert!(
+        reply.contains("remembered: [chat #1] WRITE_MEMORY likes tea"),
+        "{reply}"
+    );
+    gw.say("m3", "owner", "/memory diff").await;
+    let diff = gw.wait_replies(4).await[3].clone();
+    assert!(
+        diff.contains("likes tea"),
+        "still waiting for the owner: {diff}"
+    );
+    // Only the listed call got an answer, and it was consumed: none is left for the refused one.
+    assert_eq!(std::fs::read_dir(home.join(".gateway")).unwrap().count(), 0);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_job_gets_no_gateway() {
+    let home = home("gateway-job");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        &format!(r#"/job add gw | {NEVER} | [call gateway {{"command": "/status"}}] check"#),
+    )
+    .await;
+    gw.say("m2", "owner", "/job run 1").await;
+    wait(|| run_status(&home, "completed") == 1).await;
+    let replies = gw.wait_replies(3).await;
+    assert!(
+        replies[2].ends_with("\ngateway: not available in scheduled runs"),
+        "{replies:?}"
+    );
     gw.shutdown().await;
 }

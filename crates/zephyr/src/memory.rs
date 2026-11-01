@@ -146,6 +146,9 @@ Besides your file and shell tools, this container gives you:
   are answering.
 - **schedule** proposes a job: a five-field cron expression or an RFC 3339 time, and a prompt. It
   runs only after the owner approves it with `/job ok`.
+- **gateway** runs a read-only Zephyr command and returns its output in your turn:
+  `/status`, `/model`, `/switch`, `/rules`, `/memory diff`, `/memory log`, `/job list`. Approving,
+  changing settings and switching conversations stay with the owner: ask them to type it.
 
 "#;
 

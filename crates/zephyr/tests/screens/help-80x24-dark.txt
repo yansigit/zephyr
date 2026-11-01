@@ -6,6 +6,8 @@
  │ › type to filter                                                           │
  │ Chat                                                                       │
  │  › /new                     start a fresh conversation; memory and rules … │
+ │    /switch                  list earlier conversations                     │
+ │    /switch <id>             go back to one                                 │
  │    /help                    this list                                      │
  │ Agent                                                                      │
  │    /stop                    stop the current reply                         │
@@ -18,7 +20,5 @@
  │    /memory log              the last 10 memory commits                     │
  │    /rules                   your standing rules                            │
  │    /rule <text>             add a rule the agent reads first               │
- │    /rule rm <n>             remove rule n                                  │
- │ Schedule                                                                   │
- ╰─────────────────────────────────────────────────────────────── 1-16 of 26 ─╯
+ ╰─────────────────────────────────────────────────────────────── 1-16 of 28 ─╯
   ↑↓ choose · ⏎ insert · type to filter · esc close

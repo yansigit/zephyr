@@ -1,6 +1,7 @@
-//! Tools whose work the daemon does (DESIGN §4.11): `send_file` and `schedule`. Here they only
-//! check their arguments and answer at once. The daemon reads each call from rpi's event stream,
-//! which the agent cannot write, and acts on it when the turn settles.
+//! Tools whose work the daemon does (DESIGN §4.11): `send_file`, `schedule` and `gateway`. The
+//! first two only check their arguments here and answer at once; the daemon reads each call from
+//! rpi's event stream, which the agent cannot write, and acts on it when the turn settles.
+//! `gateway` waits instead: the daemon answers it from the same stream mid-turn, through a file.
 
 use rpi_plugin_sdk::handles::ToolHandles;
 use rpi_plugin_sdk::{
@@ -9,15 +10,47 @@ use rpi_plugin_sdk::{
 };
 use serde_json::{json, Value};
 use std::ffi::c_void;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 /// Discord's upload limit for a bot in a server without boosts, and so the cap for every channel.
 pub const MAX_FILE: u64 = 10 * 1024 * 1024;
 
-/// Each call's answer, made in `execute` and handed over by the first `poll`.
-static HANDLES: ToolHandles<Option<Result<String, String>>> = ToolHandles::new();
+/// The slash commands the agent may run through `gateway`: read-only ones only. The owner's
+/// approvals (`/memory ok`, `/job ok`, `/rule`, `/login`, `/resume`) stay out, so injected text
+/// cannot approve itself (DESIGN §4.5, §4.6). The daemon checks this list again.
+pub const GATEWAY_COMMANDS: &[&str] = &[
+    "/status",
+    "/model",
+    "/switch",
+    "/rules",
+    "/memory diff",
+    "/memory log",
+    "/job list",
+];
 
-pub const TOOLS: [(&str, &str, &str, ToolExecuteFn); 2] = [
+/// Where the daemon drops each `gateway` answer, as `<dir>/<tool call id>`.
+pub const GATEWAY_DIR_ENV: &str = "ZEPHYR_GATEWAY_DIR";
+
+/// How long a `gateway` call waits for the daemon.
+const GATEWAY_WAIT: Duration = Duration::from_secs(10);
+
+/// A tool call's state between `execute` and its last `poll`.
+enum Step {
+    /// Made in `execute`, handed over by the first `poll`.
+    Answer(Result<String, String>),
+    /// A `gateway` call waiting for the daemon's file.
+    Waiting {
+        path: PathBuf,
+        deadline: Instant,
+    },
+    Finished,
+}
+
+static HANDLES: ToolHandles<Step> = ToolHandles::new();
+
+pub const TOOLS: [(&str, &str, &str, ToolExecuteFn); 3] = [
     (
         "send_file",
         "Send a file of up to 10 MB (a screenshot, a PDF) to the owner, on the channel you are \
@@ -34,7 +67,39 @@ pub const TOOLS: [(&str, &str, &str, ToolExecuteFn); 2] = [
         r#"{"type":"object","properties":{"name":{"type":"string"},"schedule":{"type":"string"},"prompt":{"type":"string"}},"required":["name","schedule","prompt"]}"#,
         schedule_execute,
     ),
+    (
+        "gateway",
+        "Run one of Zephyr's read-only slash commands and get its output: /status (account, \
+         model, channels, spend), /model (the models you can switch to), /switch (saved \
+         conversations), /rules (the owner's standing rules), /memory diff (a memory change \
+         waiting for the owner), /memory log (recent memory commits), /job list (scheduled jobs). \
+         Anything that changes settings or approves something is the owner's to type.",
+        r#"{"type":"object","properties":{"command":{"type":"string","description":"The command, exactly as listed, e.g. /status"}},"required":["command"]}"#,
+        gateway_execute,
+    ),
 ];
+
+/// `gateway`'s check: the command must be on [`GATEWAY_COMMANDS`], exactly.
+pub fn gateway(params: &Value) -> Result<String, String> {
+    let command = text(params, "command")?.trim();
+    if !GATEWAY_COMMANDS.contains(&command) {
+        return Err(format!(
+            "{command} is not available to the agent; it can run {}",
+            GATEWAY_COMMANDS.join(", ")
+        ));
+    }
+    Ok(command.into())
+}
+
+/// The answer file for a call, or `None` when the id could not be a plain file name.
+pub fn gateway_file(dir: &Path, call_id: &str) -> Option<PathBuf> {
+    let plain = !call_id.is_empty()
+        && call_id.len() <= 128
+        && call_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    plain.then(|| dir.join(call_id))
+}
 
 pub fn schema(name: &str, description: &str, parameters: &str) -> StableToolSchema {
     StableToolSchema {
@@ -97,6 +162,51 @@ extern "C" fn schedule_execute(
     execute(params, free, schedule)
 }
 
+extern "C" fn gateway_execute(
+    call_id: StbStringRef,
+    params: StbString,
+    free: Option<FreeStringFn>,
+) -> StepHandle {
+    // SAFETY: the host lends the id for this call only; it is copied out before returning.
+    let id = std::panic::catch_unwind(|| unsafe { call_id.as_str() }.to_string());
+    // SAFETY: as in `execute`.
+    let raw = unsafe { params.to_string_lossy() };
+    unsafe { params.free_with(free) };
+    let dir = std::env::var_os(GATEWAY_DIR_ENV).filter(|d| !d.is_empty());
+    HANDLES.insert(gateway_step(
+        &raw,
+        id.ok().as_deref(),
+        dir.map(PathBuf::from),
+    ))
+}
+
+/// What a `gateway` call does: wait for the daemon's answer, or fail at once.
+fn gateway_step(raw: &str, call_id: Option<&str>, dir: Option<PathBuf>) -> Step {
+    let checked = std::panic::catch_unwind(|| {
+        serde_json::from_str::<Value>(raw)
+            .map_err(|e| format!("invalid parameters: {e}"))
+            .and_then(|p| gateway(&p))
+    })
+    .unwrap_or_else(|_| Err("the tool panicked".into()));
+    if let Err(e) = checked {
+        return Step::Answer(Err(e));
+    }
+    let Some(dir) = dir else {
+        return Step::Answer(Err("gateway is only available inside Zephyr".into()));
+    };
+    match call_id.and_then(|id| gateway_file(&dir, id)) {
+        Some(path) => Step::Waiting {
+            path,
+            deadline: Instant::now() + GATEWAY_WAIT,
+        },
+        None => Step::Answer(Err("unusable tool call id".into())),
+    }
+}
+
+fn result(text: &str) -> String {
+    json!({ "content": [{ "type": "text", "text": text }] }).to_string()
+}
+
 fn execute(
     params: StbString,
     free: Option<FreeStringFn>,
@@ -109,20 +219,38 @@ fn execute(
         serde_json::from_str::<Value>(&raw)
             .map_err(|e| format!("invalid parameters: {e}"))
             .and_then(|p| check(&p))
-            .map(|t| json!({ "content": [{ "type": "text", "text": t }] }).to_string())
+            .map(|t| result(&t))
     })
     .unwrap_or_else(|_| Err("the tool panicked".into()));
-    HANDLES.insert(Some(answer))
+    HANDLES.insert(Step::Answer(answer))
 }
 
 pub extern "C" fn poll(handle: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> StepResult {
-    let answer = HANDLES.get(handle).and_then(|entry| entry.lock().take());
-    match answer {
-        Some(Ok(result)) => StepResult::done(StbString::from_string(result)),
-        Some(Err(message)) => StepResult::err(StbString::from_string(message)),
-        None => StepResult::err(StbString::from_string(
-            "invalid or finished tool handle".into(),
-        )),
+    let err = |m: &str| StepResult::err(StbString::from_string(m.into()));
+    let Some(entry) = HANDLES.get(handle) else {
+        return err("invalid or finished tool handle");
+    };
+    let mut state = entry.lock();
+    match std::mem::replace(&mut *state, Step::Finished) {
+        Step::Answer(Ok(result)) => StepResult::done(StbString::from_string(result)),
+        Step::Answer(Err(message)) => StepResult::err(StbString::from_string(message)),
+        Step::Finished => err("invalid or finished tool handle"),
+        Step::Waiting { .. } if entry.cancelled.load(Ordering::SeqCst) => err("cancelled"),
+        Step::Waiting { path, deadline } => match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let _ = std::fs::remove_file(&path);
+                StepResult::done(StbString::from_string(result(&text)))
+            }
+            Err(_) if Instant::now() >= deadline => err("the gateway did not answer"),
+            Err(_) => {
+                *state = Step::Waiting { path, deadline };
+                drop(state);
+                // shortcut: the host's driver calls poll in a loop, so a short sleep keeps it from
+                // spinning; use a wake-up if the SDK grows one.
+                std::thread::sleep(Duration::from_millis(20));
+                StepResult::pending(StbString::from_string(String::new()))
+            }
+        },
     }
 }
 
@@ -178,5 +306,75 @@ mod tests {
         assert!(matches!(again.tag, rpi_plugin_sdk::StepResultTag::Err));
         destroy(handle);
         destroy(handle);
+    }
+
+    fn tag(handle: StepHandle) -> rpi_plugin_sdk::StepResultTag {
+        poll(handle, None, std::ptr::null_mut()).tag
+    }
+
+    #[test]
+    fn gateway_takes_only_the_listed_read_only_commands() {
+        assert_eq!(
+            gateway(&json!({ "command": " /status " })).unwrap(),
+            "/status"
+        );
+        for bad in [
+            "/memory ok",
+            "/job ok 1",
+            "/rule x",
+            "/login",
+            "/resume",
+            "/status x",
+        ] {
+            assert!(gateway(&json!({ "command": bad })).is_err(), "{bad}");
+        }
+        assert!(gateway(&json!({})).is_err());
+        let dir = Path::new("/d");
+        assert_eq!(
+            gateway_file(dir, "toolu_01-a"),
+            Some(dir.join("toolu_01-a"))
+        );
+        for bad in ["", "../x", "a/b", "a.b"] {
+            assert_eq!(gateway_file(dir, bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn gateway_waits_for_the_daemons_file() {
+        use rpi_plugin_sdk::StepResultTag::{Done, Err, Pending};
+        let dir = std::env::temp_dir().join(format!("zephyr-gw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cmd = r#"{"command":"/status"}"#;
+
+        let refused = HANDLES.insert(gateway_step(
+            r#"{"command":"/memory ok"}"#,
+            Some("c0"),
+            Some(dir.clone()),
+        ));
+        assert!(matches!(tag(refused), Err));
+        let outside = HANDLES.insert(gateway_step(cmd, Some("c0"), None));
+        assert!(matches!(tag(outside), Err));
+
+        let h = HANDLES.insert(gateway_step(cmd, Some("c1"), Some(dir.clone())));
+        assert!(matches!(tag(h), Pending));
+        std::fs::write(dir.join("c1"), "agent: on m").unwrap();
+        let done = poll(h, None, std::ptr::null_mut());
+        assert!(matches!(done.tag, Done));
+        // SAFETY: tag is Done.
+        let text = unsafe { done.payload.done.result.to_string_lossy() };
+        assert!(text.contains("agent: on m"), "{text}");
+        assert!(!dir.join("c1").exists(), "the answer file is consumed");
+        assert!(matches!(tag(h), Err), "answers once");
+
+        let cancelled = HANDLES.insert(gateway_step(cmd, Some("c2"), Some(dir.clone())));
+        cancel(cancelled);
+        assert!(matches!(tag(cancelled), Err));
+
+        let late = HANDLES.insert(Step::Waiting {
+            path: dir.join("c3"),
+            deadline: Instant::now(),
+        });
+        assert!(matches!(tag(late), Err));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
