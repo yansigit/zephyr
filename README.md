@@ -178,3 +178,19 @@ provider sources are pinned to commit SHAs by the build args (`RPI_PACKAGE_REF`,
 local checkouts can stand in for them with `--build-context rpi-package=<dir> --build-context
 provider-plugins=<dir>` (see the Dockerfile).
 Pushing a `v*` tag publishes `ghcr.io/yansigit/zephyr:<version>` (`.github/workflows/image.yml`).
+
+## Releasing
+
+From a clean `main` that matches `origin/main`, after the change is merged:
+
+```sh
+deploy/release.sh 0.2.1   # the image changed: publish it and upgrade the live install
+deploy/release.sh --cli   # only the host CLI changed: reinstall it, publish nothing
+```
+
+The script stops at the first problem. It runs fmt, clippy and the tests, sets the version in
+`Cargo.toml` (the CLI pulls `ghcr.io/yansigit/zephyr:<version>`), commits and tags `v<version>`,
+pushes, and waits for the image workflow. Then it installs the CLI into `~/.cargo/bin` (from the
+clean tree, so nothing uncommitted ships), waits until no message, reply or job is in flight, backs
+up `state.db` to `~/.zephyr-daemon/state.db.<old version>.bak` (migrations only go forward), and
+runs `zephyr upgrade`. To go back to an older image, restore that backup first.

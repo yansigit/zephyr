@@ -22,6 +22,7 @@ cargo test -p zephyr-policy --test rpi_load -- --ignored
 cargo test -p zephyr --test attach -- --ignored   # drives real `rpi --connect` via tests/drive-connect.py
 
 cargo install --path crates/zephyr && zephyr up --build   # build deploy/Dockerfile and run it locally
+deploy/release.sh 0.2.1 | --cli                           # release from a clean main (README "Releasing")
 ```
 
 `ZEPHYR_CONTAINER` / `ZEPHYR_IMAGE` point the host CLI at another container or image, to test beside a
