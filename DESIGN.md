@@ -229,6 +229,8 @@ There are no per-call prompts. These hard limits hold every time:
    - Network: host networking, so the attach port on 127.0.0.1 and the Tailscale webhook address work unchanged.
    - Providers come only from the image: `deploy/Dockerfile` builds `librpi_providers.so`, `libzephyr_cursor.so` (this repo, §4.7.2) and `rpi-claude-agent/` into `/opt/zephyr/ext/`, and `zephyr.toml` loads them with `extensions`. Do not `rpi install rpi-providers` into `~/.zephyr`. A package installed there loads twice (`zephyr doctor` warns).
    - `--restart unless-stopped` replaces the systemd unit; `--init` reaps children and forwards SIGTERM.
+   - The GPU, when Docker has the NVIDIA runtime: `--gpus all` with `NVIDIA_DRIVER_CAPABILITIES=graphics,utility`, for the browser's WebGL (§4.11). The agent keeps no supplementary groups (`agent::init_ids`), so it reaches the card only through the world-writable `/dev/nvidia*`, which is all Vulkan needs.
+   - Chromium's own sandbox cannot start under `--cap-drop ALL` and `no-new-privileges`, so the browser runs with `--no-sandbox`: the container is its sandbox, as it is for every other process the agent starts.
 
    This replaced an earlier dedicated Linux account: ACLs over 2.2M files were slow to apply and, on eCryptfs, unreliable to remove.
 2. **Policy plugin `gw-policy`** (cdylib, published `rpi-plugin-sdk`, loaded with `--extension`). Its `ToolCall` veto blocks:
@@ -250,7 +252,7 @@ There are no per-call prompts. These hard limits hold every time:
 
 ### 4.5 Scheduler and proactivity
 
-- Jobs live in `state.db` (cron expression or one-shot time, prompt, granted dirs, delivery channel). Create them with `/job add …` or let the agent use a `schedule` tool from `gw-policy`. Prompts are checked by the same policy.
+- Jobs live in `state.db` (cron expression or one-shot time, prompt, granted dirs, delivery channel). Create them with `/job add …`. The agent's `schedule` tool (§4.11) only proposes one: it is stored with `enabled = 0`, the owner is shown its schedule and prompt, and it runs after `/job ok N` (`/job rm N` drops it). A job is a standing instruction, so it gets the same human gate as memory (§4.6): an injected page cannot leave one behind.
 - A tick every 30 s claims due runs in a transaction:
   - `runs(claimed → running → completed|failed|unknown)`
   - On restart, `running` becomes `unknown` and is reported, never retried automatically.
@@ -268,6 +270,7 @@ There are no per-call prompts. These hard limits hold every time:
   Why a human gate rather than a scanner: an agent that writes its own memory saved a fabricated "preference" from one web page up to 99.8% of the time, which then steered 68–80% of later actions (Sleeper Memory Poisoning, arXiv 2605.15338, Tables 1–2, App. I); pattern and LLM-trust filters let poisoned entries through (arXiv 2601.05504 §8.2).
 - rpi 0.15.0 loads the first of `AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD` from the agent dir and from each dir up from the cwd, so an agent that wrote `AGENTS.override.md` or `CLAUDE.md` in `/zephyr`, or `AGENTS.md` in its agent dir, would get around both rules and approval. It also reads `SYSTEM.md` (which replaces its own system prompt) and `APPEND_SYSTEM.md` from `/zephyr/.rpi/` and from the agent dir. Before each start the daemon renames any of those to `<name>.ignored-by-zephyr` and logs it.
 - Two more sources are closed on the child's command line. `--no-skills`: skill descriptions go into every prompt, and the agent can write skills under `/zephyr/.rpi/skills` or its agent dir. `--approve`: rpi skips `AGENTS.md` for a cwd that `trust.json` marks `false`, and the agent can write that file too. `--local-only`: rpi otherwise also loads extensions from `/zephyr/.rpi/extensions`, the agent dir's `extensions/`, project packages and the `extensionDirs` setting, all writable by the agent; an extension can rewrite the system prompt (`before_agent_start`) or shadow a provider, and it loads before the policy plugin. With the flag only the `--extension` files zephyr passes (the policy plugin and the image's providers) load. The image also ships `rpi-mcp-adapter` (`librpi_mcp_adapter.so`), which is loaded by default: its `mcp_list`/`mcp_call`/`mcp_resource`/`mcp_request` calls are audit-logged like any other, and the policy plugin denies a `configPath` (or path) that names a credential file, so MCP cannot read `auth.json`, `secrets.env` or an ssh key.
+- Between the rules and the memory, `AGENTS.md` carries a fixed `## Tools` block: how to use the browser, the desktop, `send_file` and `schedule` (§4.11). It is compiled into the daemon, so the agent cannot change it either.
 - `<state>` is root's in the container (§4.4), so the agent can change neither the rules nor the approved copies.
 
 ### 4.7 Auth and providers
@@ -362,13 +365,27 @@ label admitted.
   - Anything else (budget, owners, time zone, `[auth]`, the pool order): read where it is used.
 - **`/model PROVIDER/MODEL`** sets it on the active account if that is on the provider, else on the first account that is, moved to the front; checks that `rpi --list-models`, signed in as that account, lists it (the running child lists only its own sign-in's models); writes `zephyr.toml` (atomically, comments kept), then reloads. `/status` adds the agent's account and model to what `zephyr status` prints.
 
+### 4.11 Tools
+
+The image adds tools to rpi's own (`read`, `bash`, `edit`, `write`, ...). The agent learns them from a fixed `## Tools` block that `memory::agents_md` writes into `AGENTS.md`, between the rules and the memory (skills are off, §4.6).
+
+- **CLIs through `bash`**, so the policy veto, the audit log and the outbound list (§4.4) see them with no new code:
+  - **Browser:** `agent-browser` (vercel-labs, a Rust CLI: snapshots with refs, `click @e3`, `fill`, `screenshot`) drives **fingerprint-chromium** (ungoogled-chromium with fingerprint patches; release tarball pinned by sha256; Playwright's Chromium on arm64, which it does not build). The image's `ENV` sets the binary, the profile `/zephyr/browser` (persistent, the agent's own; the owner signs it into sites by hand), headed mode, and `--no-sandbox,--disable-dev-shm-usage,--use-angle=vulkan,--enable-features=Vulkan,--ignore-gpu-blocklist`. Vulkan reaches the GPU both headless and on Xvfb; `gl-egl` falls back to llvmpipe on Xvfb. Docker's 64 MB `/dev/shm` is enough with `--disable-dev-shm-usage`. Checked 2026-11-01: 0 failed checks on bot.sannysoft.com, the Cloudflare check at nowsecure.nl passed, WebGL `ANGLE (NVIDIA, Vulkan ...)`.
+  - **Python:** `deploy/python` (`pyproject.toml` and `uv.lock`) is installed with `uv sync --frozen` into `/opt/zephyr/py`, a venv on the image's python3.12, read-only and first on `PATH`: requests, beautifulsoup4, pandas, pypdf, pillow and Camoufox. The image also has `uv` (pinned by digest), so the agent adds a package per script with `uv run --with`, or makes a venv of its own; uv's cache is in its home. The venv has no pip, so nothing installs into the shared environment.
+  - **Fallback browser:** Camoufox (anti-detect Firefox, in that environment), from Python through `camoufox-python`. Firefox has no CDP, so agent-browser cannot drive it. It spoofs Linux only (`os="linux"`, matching the real GPU), so the image drops its macOS- and Windows-only fonts. It runs headed: headless it has no WebGL. What a Camoufox script submits is not in the outbound list, so the Tools block says to submit through agent-browser.
+  - **Desktop:** with `ZEPHYR_DESKTOP` set (the image sets `:99`), `desktop::ensure` starts `Xvfb` and `openbox` as the agent before each child starts, restarting them if they died, and the child gets `DISPLAY`. The agent uses `xdotool` and `import -window root`, then `read`s the PNG. Nothing listens; the owner can start `x11vnc -localhost -once` with `docker exec` (README).
+  - `policy::outbound` lists `agent-browser fill|type|keyboard|upload|eval`; navigating is a plain GET and is not listed.
+- **Tools the daemon carries out**, registered by `zephyr-policy` (`tools.rs`, `register_tool`). In the child they only check their arguments and answer at once. The router (and the scheduler, for job runs) reads each successful call from rpi's event stream into the run's `Tally` (`tool_execution_start` args, kept on a `tool_execution_end` without `isError`), which the agent cannot forge, and `crate::tools::apply` acts on it when the run settles:
+  - `send_file {path, caption?}`: at most 10 MB (Discord's bot limit). The policy veto's name check covers `path`. The daemon reads the file as the agent (`agent::fs`), copies it to `<state>/files/<id>/<name>`, and queues an outbox row with that `attachment` (schema v5) to the channel the run answers. Discord adds it to the last chunk, BlueBubbles gets `POST /api/v1/message/attachment` (multipart, `tempGuid` `<client id>-f`), and the chat line client shows `[file] <name>`. The copy is deleted once the row is sent or given up. Shortcut: the file is read at settle, so one the agent deletes before then is reported missing.
+  - `schedule {name, schedule, prompt}`: checked with `scheduler::check` and stored off (§4.5); a bad schedule is told to the owner.
+
 ## 5. Repo layout
 
 New repo `yansigit/zephyr` (private), local at `/home/user/Projects/zephyr`, a Rust workspace:
 
 ```
 crates/zephyr/          daemon: router, session manager, store, scheduler, auth keeper, adapters, attach server
-crates/zephyr-policy/   cdylib rpi plugin: tool-call veto, audit, schedule tool, untrusted-content tagging
+crates/zephyr-policy/   cdylib rpi plugin: tool-call veto, audit, the send_file and schedule tools (§4.11)
 crates/zephyr-cursor/   cdylib rpi plugin: the Cursor agent-service provider, tools over MCP (§4.7.2)
 deploy/                 Dockerfile, zephyr.toml.example (host commands: crates/zephyr/src/host/)
 ```
