@@ -4,7 +4,7 @@ use crate::channel::Inbound;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// An inbox row the router still has to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +194,18 @@ impl Store {
                 "BEGIN;
                  ALTER TABLE outbox ADD COLUMN attachment TEXT;
                  PRAGMA user_version = 5;
+                 COMMIT;",
+            )?;
+        }
+        if version < 6 {
+            db.execute_batch(
+                "BEGIN;
+                 CREATE TABLE proposals(
+                    id INTEGER PRIMARY KEY,
+                    command TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending', -- pending|done|dropped
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch()));
+                 PRAGMA user_version = 6;
                  COMMIT;",
             )?;
         }
@@ -485,6 +497,29 @@ impl Store {
             params![name, schedule, prompt, channel, recipient],
         )?;
         Ok(self.db.last_insert_rowid())
+    }
+
+    /// Stores a command the agent proposed through `gateway` (DESIGN §4.11), for `/ok` or `/no`.
+    pub fn propose_command(&self, command: &str) -> rusqlite::Result<i64> {
+        self.db.execute(
+            "INSERT INTO proposals(command) VALUES (?1)",
+            params![command],
+        )?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    /// Settles proposal `id` as `status` (`done` or `dropped`), once, within 24 h of it being
+    /// made. Returns its command, or `None` when there is no such proposal waiting.
+    pub fn settle_proposal(&self, id: i64, status: &str) -> rusqlite::Result<Option<String>> {
+        self.db
+            .query_row(
+                "UPDATE proposals SET status = ?2
+                 WHERE id = ?1 AND status = 'pending' AND created_at > unixepoch() - 86400
+                 RETURNING command",
+                params![id, status],
+                |r| r.get(0),
+            )
+            .optional()
     }
 
     /// Turns a job on. Returns whether it exists.
@@ -842,11 +877,12 @@ mod tests {
         for (version, undo) in [
             (
                 1,
-                "DROP TABLE meta; DROP TABLE spend; DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment;",
+                "DROP TABLE meta; DROP TABLE spend; DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals;",
             ),
-            (2, "DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment;"),
-            (3, "DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment;"),
-            (4, "ALTER TABLE outbox DROP COLUMN attachment;"),
+            (2, "DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals;"),
+            (3, "DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals;"),
+            (4, "ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals;"),
+            (5, "DROP TABLE proposals;"),
         ] {
             let dir = crate::test_dir(&format!("store-v{version}"));
             let path = dir.join("state.db");
@@ -865,6 +901,7 @@ mod tests {
             store.clear_cooldown("a").unwrap();
             store.notify_file("chat", "o", "", Some("/f")).unwrap();
             assert_eq!(store.pending_outbox().unwrap()[0].attachment.as_deref(), Some("/f"));
+            assert_eq!(store.propose_command("/new").unwrap(), 1);
             let now: i64 = store
                 .db
                 .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -879,6 +916,40 @@ mod tests {
             .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .unwrap();
         assert!(Store::open(&path).is_err(), "a newer schema is refused");
+    }
+
+    #[test]
+    fn a_proposal_settles_once_within_a_day() {
+        let dir = crate::test_dir("store-proposal");
+        let store = Store::open(&dir.join("state.db")).unwrap();
+        let (a, b, old) = (
+            store.propose_command("/new").unwrap(),
+            store.propose_command("/pause").unwrap(),
+            store.propose_command("/reload").unwrap(),
+        );
+        store
+            .db
+            .execute(
+                "UPDATE proposals SET created_at = unixepoch() - 86401 WHERE id = ?1",
+                [old],
+            )
+            .unwrap();
+        assert_eq!(
+            store.settle_proposal(a, "done").unwrap().as_deref(),
+            Some("/new")
+        );
+        assert_eq!(store.settle_proposal(a, "done").unwrap(), None, "once");
+        assert_eq!(
+            store.settle_proposal(b, "dropped").unwrap().as_deref(),
+            Some("/pause")
+        );
+        assert_eq!(
+            store.settle_proposal(b, "done").unwrap(),
+            None,
+            "dropped stays dropped"
+        );
+        assert_eq!(store.settle_proposal(old, "done").unwrap(), None, "too old");
+        assert_eq!(store.settle_proposal(99, "done").unwrap(), None);
     }
 
     #[test]

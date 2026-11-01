@@ -34,13 +34,15 @@ impl Channel for TestChannel {
 }
 
 /// Streams "pong" for every chat completion; holds the request open while `hang` is set.
-async fn stub_provider(hang: Arc<AtomicBool>) -> u16 {
+/// Each request (head and body) is kept in `seen`.
+async fn stub_provider(hang: Arc<AtomicBool>, seen: Arc<Mutex<Vec<String>>>) -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         loop {
             let (mut sock, _) = listener.accept().await.unwrap();
             let hang = hang.swap(false, Ordering::SeqCst);
+            let seen = seen.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0; 1 << 20];
                 let mut got = Vec::new();
@@ -62,6 +64,9 @@ async fn stub_provider(hang: Arc<AtomicBool>) -> u16 {
                         break;
                     }
                 }
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&got).into_owned());
                 if hang {
                     tokio::time::sleep(Duration::from_secs(3600)).await;
                 }
@@ -87,7 +92,7 @@ async fn real_rpi_round_trip_and_kill_mid_run() {
         return;
     }
     let hang = Arc::new(AtomicBool::new(false));
-    let port = stub_provider(hang.clone()).await;
+    let port = stub_provider(hang.clone(), Default::default()).await;
     let home = std::env::temp_dir().join(format!(
         "zephyr-real-{}-{}",
         std::process::id(),
@@ -198,7 +203,7 @@ async fn real_rpi_fails_over_to_the_next_account() {
     }
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let limited = rate_limited_provider(hits.clone()).await;
-    let ok = stub_provider(Arc::new(AtomicBool::new(false))).await;
+    let ok = stub_provider(Arc::new(AtomicBool::new(false)), Default::default()).await;
     let home = std::env::temp_dir().join(format!(
         "zephyr-real-pool-{}-{}",
         std::process::id(),
@@ -268,6 +273,139 @@ async fn real_rpi_fails_over_to_the_next_account() {
     // The shared settings.json caps rpi's own retries at one.
     assert_eq!(hits.load(Ordering::SeqCst), 2);
 
+    let _ = stop.send(());
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs the pinned rpi binary"]
+async fn real_rpi_btw_runs_with_no_tools_and_no_session_mid_run() {
+    if !std::path::Path::new(RPI).exists() {
+        eprintln!("skipping: {RPI} is not installed");
+        return;
+    }
+    let (hang, seen) = (Arc::new(AtomicBool::new(false)), Arc::default());
+    let port = stub_provider(hang.clone(), Arc::clone(&seen)).await;
+    let home = std::env::temp_dir().join(format!(
+        "zephyr-real-btw-{}-{}",
+        std::process::id(),
+        zephyr::unix_millis()
+    ));
+    let agent = home.join("rpi-agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(
+        agent.join("models.json"),
+        format!(r#"{{"providers":{{"stub":{{"api":"openai-completions","baseUrl":"http://127.0.0.1:{port}/v1","apiKey":"not-a-key","models":[{{"id":"m","name":"M"}}]}}}}}}"#),
+    )
+    .unwrap();
+    // The policy plugin, when this checkout has built it: the btw child must still load it.
+    let plugin = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/debug/libzephyr_policy.so"
+    );
+    let plugin = match std::path::Path::new(plugin).exists() {
+        true => format!("policy_plugin = {plugin:?}\n"),
+        false => String::new(),
+    };
+    let cfg: Config = toml::from_str(&format!(
+        "rpi = {RPI:?}\nhome = {home:?}\nagent_dir = {agent:?}\nmodel = \"stub/m\"\n{plugin}[owners]\nchat = [\"owner\"]\n"
+    ))
+    .unwrap();
+
+    let (feed, rx) = mpsc::channel(4);
+    let channel = Arc::new(TestChannel {
+        feed: tokio::sync::Mutex::new(rx),
+        sent: Mutex::default(),
+    });
+    let (stop, stopped) = oneshot::channel::<()>();
+    let ch = channel.clone();
+    let task = tokio::spawn(async move {
+        zephyr::router::run(&cfg, std::slice::from_ref(&*ch), async {
+            let _ = stopped.await;
+        })
+        .await
+    });
+    let say = |id: &str, text: &str| Inbound {
+        channel: "chat".into(),
+        platform_msg_id: id.into(),
+        sender: "owner".into(),
+        text: text.into(),
+    };
+    let replies = |n: usize| {
+        let channel = channel.clone();
+        async move {
+            for _ in 0..400 {
+                if channel.sent.lock().unwrap().len() >= n {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            channel
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|m| m.text.clone())
+                .collect::<Vec<_>>()
+        }
+    };
+    // Every session file under the home, by name.
+    let sessions = || -> Vec<String> {
+        let (mut found, mut dirs) = (Vec::new(), vec![home.clone()]);
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if e.path().is_dir() {
+                    dirs.push(e.path());
+                } else if name.contains(".jsonl") {
+                    found.push(name);
+                }
+            }
+        }
+        found.sort();
+        found
+    };
+
+    feed.send(say("m1", "ping")).await.unwrap();
+    assert_eq!(replies(1).await, ["pong"]);
+    let before = sessions();
+    assert!(
+        before.iter().any(|f| f.ends_with("_main.jsonl")),
+        "{before:?}"
+    );
+
+    // Main is mid-run (the provider holds its request open) when the side question comes.
+    hang.store(true, Ordering::SeqCst);
+    feed.send(say("m2", "again")).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    feed.send(say("m3", "/btw what did I say?")).await.unwrap();
+    assert_eq!(replies(2).await, ["pong", "[btw] pong"]);
+    assert_eq!(sessions(), before, "the btw child wrote no session file");
+
+    let bodies: Vec<String> = seen.lock().unwrap().clone();
+    let body = |r: &str| -> serde_json::Value {
+        serde_json::from_str(r.split_once("\r\n\r\n").unwrap().1).unwrap()
+    };
+    let btw: Vec<&String> = bodies
+        .iter()
+        .filter(|r| r.contains("side question"))
+        .collect();
+    assert_eq!(btw.len(), 1, "{bodies:?}");
+    let btw = body(btw[0]);
+    assert!(
+        btw["tools"].as_array().is_none_or(|t| t.is_empty()),
+        "{btw}"
+    );
+    let text = btw.to_string();
+    assert!(text.contains("user: ping"), "{text}");
+    assert!(text.contains("assistant: pong"), "{text}");
+    assert!(text.contains("user: again"), "read mid-run: {text}");
+    assert!(body(&bodies[0])["tools"]
+        .as_array()
+        .is_some_and(|t| !t.is_empty()));
+
+    feed.send(say("m4", "/stop")).await.unwrap();
+    replies(3).await;
     let _ = stop.send(());
     task.await.unwrap().unwrap();
 }

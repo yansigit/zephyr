@@ -4,6 +4,7 @@ pub mod agent;
 pub mod attach;
 pub mod auth;
 pub mod auth_keeper;
+pub mod btw;
 pub mod channel;
 pub mod chat;
 pub mod config;

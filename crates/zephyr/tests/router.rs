@@ -1571,3 +1571,200 @@ async fn a_job_gets_no_gateway() {
     );
     gw.shutdown().await;
 }
+
+const NO_PROPOSAL: &str = "[zephyr] no proposal #1 is waiting";
+
+#[tokio::test]
+async fn the_agent_proposes_a_model_and_only_the_owners_ok_switches_it() {
+    let home = home("gateway-propose");
+    let gw = start(on_file(&home, ""));
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call gateway {"command": "/model fake/m2"}] try m2"#,
+    )
+    .await;
+    let replies = gw.wait_replies(2).await;
+    assert_eq!(
+        replies[0],
+        "[zephyr] the agent asks to run /model fake/m2 (#1); /ok 1 runs it, /no 1 drops it"
+    );
+    assert!(
+        replies[1]
+            .ends_with("\ngateway: proposed as #1; it runs only if the owner approves with /ok 1"),
+        "{replies:?}"
+    );
+    assert!(log(&home, "set_model").is_empty(), "nothing ran yet");
+    gw.say("m2", "owner", "/ok 1").await;
+    gw.say("m3", "owner", "model?").await;
+    let replies = gw.wait_replies(4).await;
+    // The owner's own `/model fake/m2` reply, from the same code path.
+    assert_eq!(replies[2..], ["[zephyr] now on fake/m2", "model: fake/m2"]);
+    assert_eq!(log(&home, "set_model").len(), 1);
+    gw.say("m4", "owner", "/ok 1").await;
+    let again = gw.wait_replies(5).await[4].clone();
+    assert!(again.starts_with(NO_PROPOSAL), "{again}");
+    assert_eq!(log(&home, "set_model").len(), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn no_drops_a_proposal() {
+    let home = home("gateway-no");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", r#"[call gateway {"command": "/pause"}] hi"#)
+        .await;
+    gw.wait_replies(2).await;
+    gw.say("m2", "owner", "/no 1").await;
+    gw.say("m3", "owner", "/ok 1").await;
+    let replies = gw.wait_replies(4).await;
+    assert_eq!(replies[2], "[zephyr] dropped #1 (/pause)");
+    assert!(replies[3].starts_with(NO_PROPOSAL), "{replies:?}");
+    gw.say("m4", "owner", "still here?").await;
+    assert_eq!(gw.wait_replies(5).await[4], "echo: [chat #4] still here?");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn approvals_are_never_proposed() {
+    let home = home("gateway-no-approve");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call gateway {"command": "/login"}] [call gateway {"command": "/ok 1"}]"#,
+    )
+    .await;
+    let replies = gw.wait_replies(1).await;
+    assert_eq!(replies.len(), 1, "no notice: {replies:?}");
+    for refused in ["/login", "/ok 1"] {
+        let line = format!("\ngateway: tool error: {refused} is not available to the agent");
+        assert!(replies[0].contains(&line), "{replies:?}");
+    }
+    gw.say("m2", "owner", "/ok 1").await;
+    let none = gw.wait_replies(2).await[1].clone();
+    assert!(none.starts_with(NO_PROPOSAL), "nothing stored: {none}");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_job_cannot_propose() {
+    let home = home("gateway-job-propose");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        &format!(r#"/job add gw | {NEVER} | [call gateway {{"command": "/new"}}] check"#),
+    )
+    .await;
+    gw.say("m2", "owner", "/job run 1").await;
+    wait(|| run_status(&home, "completed") == 1).await;
+    let replies = gw.wait_replies(3).await;
+    assert!(
+        replies[2].ends_with("\ngateway: not available in scheduled runs"),
+        "{replies:?}"
+    );
+    gw.say("m3", "owner", "/ok 1").await;
+    let none = gw.wait_replies(4).await[3].clone();
+    assert!(none.starts_with(NO_PROPOSAL), "nothing stored: {none}");
+    gw.shutdown().await;
+}
+
+fn main_session(home: &Path) -> String {
+    std::fs::read_to_string(home.join("sessions").join("main.json")).unwrap_or_default()
+}
+
+#[tokio::test]
+async fn btw_answers_from_a_snapshot_and_leaves_main_as_is() {
+    let home = home("btw");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "hi").await;
+    assert_eq!(gw.wait_replies(1).await, ["echo: [chat #1] hi"]);
+    let before = main_session(&home);
+    std::fs::write(home.join("usage.json"), r#"{"totalTokens": 40}"#).unwrap();
+
+    gw.say("m2", "owner", "/btw what did I say?").await;
+    let replies = gw.wait_replies(2).await;
+    let store = Store::open(&home.join("state.db")).unwrap();
+    assert_eq!(
+        store.spend(&store.today().unwrap()).unwrap().0,
+        40,
+        "booked"
+    );
+    std::fs::remove_file(home.join("usage.json")).unwrap();
+    let answer = &replies[1];
+    assert!(
+        answer.starts_with("[btw] echo: You are answering a side question"),
+        "{answer}"
+    );
+    assert!(
+        answer.contains("user: hi\n\nassistant: echo: [chat #1] hi"),
+        "{answer}"
+    );
+    assert!(answer.ends_with("Question: what did I say?"), "{answer}");
+    assert_eq!(main_session(&home), before, "main's session is left as is");
+    // A throwaway child: no session, no tools; main is not restarted.
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(home.join("argv.json")).unwrap()).unwrap();
+    for flag in [
+        "--no-session",
+        "--no-tools",
+        "--approve",
+        "--no-skills",
+        "--local-only",
+    ] {
+        assert!(argv.contains(&flag.to_string()), "{flag} in {argv:?}");
+    }
+    assert!(!argv.contains(&"--session-id".to_string()), "{argv:?}");
+    let starts = log(&home, "start");
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    assert_eq!(starts[1]["noSession"], true);
+    assert_eq!(starts[1]["noTools"], true);
+
+    gw.say("m3", "owner", "/btw").await;
+    assert!(gw.wait_replies(3).await[2].starts_with("[zephyr] usage: /btw <question>"));
+
+    // One at a time.
+    std::fs::write(home.join("slow"), "1").unwrap();
+    gw.say("m4", "owner", "/btw one").await;
+    gw.say("m5", "owner", "/btw two").await;
+    let replies = gw.wait_replies(5).await;
+    assert_eq!(replies[3], "[zephyr] a /btw is already running");
+    assert!(replies[4].starts_with("[btw] "), "{replies:?}");
+    assert!(replies[4].ends_with("Question: one"), "{replies:?}");
+    std::fs::remove_file(home.join("slow")).unwrap();
+
+    // The conversation goes on without the side questions in it.
+    gw.say("m6", "owner", "again").await;
+    assert_eq!(gw.wait_replies(6).await[5], "echo: [chat #6] again");
+    assert!(!main_session(&home).contains("/btw"));
+    assert!(!main_session(&home).contains("side question"));
+    gw.shutdown().await;
+    assert_eq!(inbox_status(&home, "dispatched"), 0);
+}
+
+#[tokio::test]
+async fn btw_answers_while_main_is_busy_without_disturbing_the_run() {
+    let home = home("btw-busy");
+    let gw = start(config(&home));
+    std::fs::write(home.join("tool_wait"), "").unwrap();
+    gw.say("m1", "owner", "[tool] look around").await;
+    wait(|| main_session(&home).contains("toolCall")).await; // main is mid-run, in its tool
+    let before = main_session(&home);
+
+    gw.say("m2", "owner", "/btw what are you doing?").await;
+    let replies = gw.wait_replies(1).await;
+    assert!(replies[0].starts_with("[btw] "), "{replies:?}");
+    assert!(
+        replies[0].contains("user: [tool] look around\n\n[tool: bash]"),
+        "{replies:?}"
+    );
+    assert_eq!(main_session(&home), before, "the run is left as is");
+
+    std::fs::remove_file(home.join("tool_wait")).unwrap();
+    let replies = gw.wait_replies(2).await;
+    assert_eq!(replies[1], "echo: [chat #1] [tool] look around");
+    assert!(log(&home, "abort").is_empty());
+    assert!(log(&home, "queue_message").is_empty());
+    gw.shutdown().await;
+}

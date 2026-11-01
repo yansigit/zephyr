@@ -20,17 +20,24 @@ that error (stopReason "error", settle outcome "failed"), as a rate-limited prov
 A prompt containing WRITE_MEMORY first writes memory/MEMORY.md under the home.
 argv.json holds the argv of the latest start.
 A prompt containing `bash: CMD` first reports a bash tool call running CMD (tool_execution_start).
+With `--no-tools` (a /btw child) none of the tool markers below (`bash: `, `[tool]`, `[call ...]`)
+runs anything, so its prompt is echoed whole; with `--no-session` there is no session file (the
+session lives in memory), the home is the cwd, and `pid` is left to main's child. The start line in
+log.jsonl records `noSession` and `noTools`.
 Each prompt and resume answers `accepted`, commits the user entry (`session_entry_committed`, as
 0.15 does before `agent_start`), starts with `agent_start` and ends with `agent_end`, then
 `agent_settled`. A failing turn (`rate_limited`) reports the assistant message (stopReason
 "error") with `message_start`/`message_end`/`turn_end` first, and settles with outcome "failed"
 and that `errorMessage` as `agent_settled.error`. A prompt containing `[tool]` first runs one fake
 `bash` tool call (assistant toolCall, tool_execution_start, tool_execution_end, toolResult); while a
-`tool_wait` file exists in the home, the tool keeps running. Each `[call NAME {JSON}]` in a prompt runs
+`tool_wait` file exists in the home, the tool keeps running, and (as rpi does) the commands that need
+no run (`get_messages`, `queue_message`, ...) are answered meanwhile, the rest after. Each `[call NAME {JSON}]` in a prompt runs
 one such call of tool NAME with those (flat) args, succeeding, before the reply.
 A `gateway` call plays the policy plugin: it waits up to 5 s for the daemon's answer in
 $ZEPHYR_GATEWAY_DIR/<call id>, consumes it, makes it the tool result, and the reply gets a
-`gateway: <answer>` line per call. A command off the plugin's list is refused at once
+`gateway: <answer>` line per call. It classifies as `zephyr_policy::tools::gateway_kind` does: a
+read (GATEWAY_COMMANDS) and a proposable action (/model P/M, /new, /switch ID, /pause, /reload)
+both wait for the daemon; anything else is refused at once
 ("tool error: ... is not available to the agent"), with no wait. While it waits it answers the commands that need no run
 (as rpi does) and keeps the rest for after; an `abort` ends it with "Operation aborted", and the
 run settles "aborted" with no reply.
@@ -53,6 +60,15 @@ if "--version" in args:
 CATALOG = ["fake/m1", "fake/m2", "other/m3", "opencode-go/alpha"]
 # zephyr_policy::tools::GATEWAY_COMMANDS
 GATEWAY_COMMANDS = ["/status", "/model", "/switch", "/rules", "/memory diff", "/memory log", "/job list"]
+def gateway_kind(c):
+    """zephyr_policy::tools::gateway_kind: "read", "propose" or None."""
+    if c in GATEWAY_COMMANDS:
+        return "read"
+    cmd, _, arg = c.partition(" ")
+    word = arg != "" and all(33 <= ord(ch) <= 126 for ch in arg)
+    ok = {"/new": c == cmd, "/pause": c == cmd, "/reload": c == cmd, "/switch": word,
+          "/model": word and re.fullmatch(r"[^/]+/.+", arg) is not None}.get(cmd, False)
+    return "propose" if ok else None
 if "--list-models" in args:
     while os.path.exists("list_wait"):  # cwd is the home
         time.sleep(0.05)
@@ -103,24 +119,32 @@ if args[:1] == ["auth"]:
     sys.exit(0)
 opt = lambda name: args[args.index(name) + 1] if name in args else None
 session_dir = opt("--session-dir")
-home = os.path.dirname(os.path.abspath(session_dir))
-path = os.path.join(session_dir, opt("--session-id") + ".json")
+ephemeral = "--no-session" in args  # a /btw child: no session file, and the cwd is the home
+tools = "--no-tools" not in args
+home = os.getcwd() if ephemeral else os.path.dirname(os.path.abspath(session_dir))
+path = None if ephemeral else os.path.join(session_dir, opt("--session-id") + ".json")
+memory = {"messages": [], "pending": False}  # the session while ephemeral
 extension = opt("--extension")
-open(os.path.join(home, "pid"), "w").write(str(os.getpid()))
+if not ephemeral:  # `pid` is main's, for the tests that kill it
+    open(os.path.join(home, "pid"), "w").write(str(os.getpid()))
 json.dump(args, open(os.path.join(home, "argv.json"), "w"))  # the flags this child was started with
 open(os.path.join(home, "log.jsonl"), "a").write(json.dumps(
     {"type": "start", "agentDir": os.environ.get("RPI_CODING_AGENT_DIR"), "model": opt("--model"),
-     "sessionId": opt("--session-id")}) + "\n")
+     "sessionId": opt("--session-id"), "noSession": ephemeral, "noTools": not tools}) + "\n")
 if os.path.isdir(os.environ.get("RPI_CODING_AGENT_DIR") or ""):  # which account started, for tests whose home is temporary
     open(os.path.join(os.environ["RPI_CODING_AGENT_DIR"], "starts.log"), "a").write("%s\n" % opt("--model"))
 
 def load():
+    if ephemeral:
+        return memory
     try:
         return json.load(open(path))
     except FileNotFoundError:
         return {"messages": [], "pending": False}
 
 def save(s):
+    if ephemeral:
+        return
     json.dump(s, open(path + ".tmp", "w")); os.replace(path + ".tmp", path)
 
 def out(v):
@@ -215,9 +239,18 @@ def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
     out({"type": "message_start", "message": call}); out({"type": "message_end", "message": call})
     out({"type": "tool_execution_start", "toolCallId": cid, "toolName": name, "args": args})
     while os.path.exists(os.path.join(home, "tool_wait")):
-        time.sleep(0.05)
+        # As rpi: commands that need no run are answered while the tool runs; the rest wait.
+        try:
+            line = lines.get(timeout=0.05)
+        except queues.Empty:
+            continue
+        if line is None:
+            lines.put(None); time.sleep(0.05); continue
+        open(os.path.join(home, "log.jsonl"), "a").write(line)
+        if not quick(json.loads(line), s):
+            deferred.append(line)
     aborted = False
-    if name == "gateway" and args.get("command", "").strip() not in GATEWAY_COMMANDS:
+    if name == "gateway" and gateway_kind(args.get("command", "").strip()) is None:
         # As the plugin: refused in the child, with no wait (rpi still reports the start).
         result["isError"] = True
         result["content"] = [{"type": "text", "text": "tool error: %s is not available to the agent"
@@ -313,14 +346,14 @@ for line in iter(next_line, None):
             hanging = True; continue
         if "[hang]" in cmd["message"]:
             hanging = True; continue
-        if "bash: " in cmd["message"]:
+        if "bash: " in cmd["message"] and tools:
             out({"type": "tool_execution_start", "toolCallId": "t1", "toolName": "bash",
                  "args": {"command": cmd["message"].split("bash: ", 1)[1]}})
             finish(s, "ran"); continue
-        if "[tool]" in cmd["message"]:
+        if "[tool]" in cmd["message"] and tools:
             run_tool(s)
         answers, text = [], ""
-        for name, args in re.findall(r"\[call (\w+) (\{[^{}]*\})\]", cmd["message"]):
+        for name, args in re.findall(r"\[call (\w+) (\{[^{}]*\})\]", cmd["message"]) if tools else []:
             calls += 1  # a fresh id per call, as a model would
             text = run_tool(s, name, json.loads(args), "c%d" % calls)
             if text is None:

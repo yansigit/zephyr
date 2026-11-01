@@ -96,13 +96,14 @@ pub struct Child {
 impl Child {
     /// A child on `agent_dir` and `model`.
     pub async fn spawn(cfg: &Config, session_id: &str) -> anyhow::Result<Self> {
-        Self::spawn_as(cfg, session_id, None).await
+        Self::spawn_as(cfg, Some(session_id), None).await
     }
 
     /// A child on a pooled account: its own dir as `RPI_CODING_AGENT_DIR`, and its model.
+    /// With no `session_id` it is a `/btw` child (`crate::btw`): no session file, no tools.
     pub async fn spawn_as(
         cfg: &Config,
-        session_id: &str,
+        session_id: Option<&str>,
         account: Option<&Account>,
     ) -> anyhow::Result<Self> {
         {
@@ -127,13 +128,17 @@ impl Child {
         // rpi 0.15 defaults to compact deltas; the TUI streams from each update's `message`.
         cmd.args(["--mode", "rpc", "--approve", "--no-skills", "--local-only"])
             .args(["--rpc-message-updates", "snapshot"])
-            .args(["--session-id", session_id, "--session-dir"])
-            .arg(cfg.session_dir())
             // rpi files sessions under a per-cwd folder, so the cwd must never change.
             .current_dir(&cfg.home)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true);
+        match session_id {
+            Some(id) => cmd
+                .args(["--session-id", id, "--session-dir"])
+                .arg(cfg.session_dir()),
+            None => cmd.args(["--no-session", "--no-tools"]),
+        };
         if let Some(model) = model {
             cmd.args(["--model", model]);
         }

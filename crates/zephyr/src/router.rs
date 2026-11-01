@@ -193,6 +193,7 @@ pub async fn run<C: Channel>(
         auth_stamp: None,
         logins: Vec::new(),
         starting: Vec::new(),
+        btw: None,
         store: Store::open(&cfg.db_path())?,
         child: None,
         busy: false,
@@ -334,6 +335,8 @@ struct Router<'a> {
     logins: Vec<Login>,
     /// `/login` starts still running: the tick drains them, so this loop never waits on rpi.
     starting: Vec<Starting>,
+    /// The `/btw` side question being answered (`crate::btw::run`), one at a time.
+    btw: Option<tokio::task::JoinHandle<()>>,
     store: Store,
     child: Option<Child>,
     /// A prompt or resume is running in the child.
@@ -401,6 +404,13 @@ impl<'a> Router<'a> {
                 Some(m) = rx.recv() => self.inbound(m).await,
                 Some(req) = self.attaches.recv() => self.attach(req).await,
                 _ = self.jobs.outbox.notified() => {} // a job's output: flush below
+                // The `/btw` answer is in the outbox: flush below.
+                r = async { self.btw.as_mut().expect("guarded").await }, if self.btw.is_some() => {
+                    if let Err(e) = r {
+                        eprintln!("zephyr: /btw failed: {e}");
+                    }
+                    self.btw = None;
+                }
                 _ = tokio::time::sleep_until(self.auth_at), if (self.child.is_some() || !self.cfg.accounts.is_empty()) && self.cfg.auth.enabled => {
                     self.auth_check().await
                 }
@@ -425,7 +435,11 @@ impl<'a> Router<'a> {
             }
             self.flush(channels).await;
             self.publish();
-            if self.reexec && !self.busy && !self.jobs.running.load(Ordering::SeqCst) {
+            if self.reexec
+                && !self.busy
+                && self.btw.is_none()
+                && !self.jobs.running.load(Ordering::SeqCst)
+            {
                 eprintln!("zephyr: restarting itself to apply the new settings");
                 exit = Exit::Reexec;
                 break;
@@ -450,14 +464,21 @@ impl<'a> Router<'a> {
         ev
     }
 
-    /// The output of a read-only command the agent ran with `gateway` (DESIGN §4.11), checked
-    /// again here: the plugin's list is the agent's side of the boundary, this is the daemon's.
-    /// Each is the same text the owner would get; none restarts or queues anything mid-turn.
-    /// `None`, and nothing run, for a command off the list.
+    /// The answer to a command the agent sent with `gateway` (DESIGN §4.11), checked again here:
+    /// the plugin's check is the agent's side of the boundary, this is the daemon's. A read is
+    /// the same text the owner would get; none restarts or queues anything mid-turn. An action is
+    /// only stored, for the owner's `/ok`. `None`, and nothing run, for anything else.
     fn gateway_reply(&self, command: &str) -> Option<String> {
-        if !zephyr_policy::tools::GATEWAY_COMMANDS.contains(&command) {
-            eprintln!("zephyr: gateway {command:?} is not on the list; not run");
-            return None;
+        use zephyr_policy::tools::Gateway;
+        match zephyr_policy::tools::gateway_kind(command) {
+            None => {
+                eprintln!("zephyr: gateway {command:?} is not on the list; not run");
+                return None;
+            }
+            Some(Gateway::Propose) => {
+                return Some(crate::tools::propose_command(&self.store, command))
+            }
+            Some(Gateway::Read) => {}
         }
         Some(match command {
             "/status" => self.status(),
@@ -607,7 +628,7 @@ impl<'a> Router<'a> {
             eprintln!("zephyr: reading the main session id failed: {e}");
             MAIN_SESSION.into()
         });
-        match Child::spawn_as(&self.cfg, &session, account.as_ref()).await {
+        match Child::spawn_as(&self.cfg, Some(&session), account.as_ref()).await {
             Ok(child) => {
                 eprintln!("zephyr: rpi child {:?} ready", child.pid());
                 if let Some(a) = &account {
@@ -681,8 +702,15 @@ impl<'a> Router<'a> {
             log(self.store.set_status(id, "dropped").map_err(Into::into));
             return;
         }
-        let text = m.text.trim();
-        let reply = if let Some((reply, rules_changed)) =
+        let decided = crate::tools::decide(&self.store, m.text.trim());
+        // An approved proposal runs exactly as if the owner had typed it.
+        let text = match &decided {
+            Some(Ok(command)) => command.as_str(),
+            _ => m.text.trim(),
+        };
+        let reply = if let Some(Err(reply)) = &decided {
+            reply.clone()
+        } else if let Some((reply, rules_changed)) =
             crate::memory::command(&self.cfg.home, self.cfg.state_dir(), text)
         {
             // rpi reads AGENTS.md once, at start: a fresh child on the same session loads the rules.
@@ -706,8 +734,13 @@ impl<'a> Router<'a> {
             text: m.text,
             tries: 0,
         };
-        log(self.store.reply(&row, &reply, "done").map_err(Into::into));
-        if row.channel == crate::attach::CHANNEL {
+        if reply.is_empty() {
+            // A `/btw` whose answer its task posts.
+            log(self.store.set_status(id, "done").map_err(Into::into));
+        } else {
+            log(self.store.reply(&row, &reply, "done").map_err(Into::into));
+        }
+        if row.channel == crate::attach::CHANNEL && !reply.is_empty() {
             self.show(&reply, Some(row.text.trim()));
         }
         self.restart_if_idle().await;
@@ -917,8 +950,52 @@ impl<'a> Router<'a> {
             ("/switch", "") => self.list_sessions(),
             ("/switch", id) => self.switch(id).await,
             ("/login", arg) => self.login(arg, from).await,
+            ("/btw", "") => crate::btw::USAGE.into(),
+            ("/btw", question) => self.btw(question, from).await,
             _ => return None,
         })
+    }
+
+    /// `/btw <question>`: reads `main`'s messages (rpi answers `get_messages` mid-run too) and
+    /// hands the question to a task of its own (`crate::btw::run`) on the main child's account,
+    /// so nothing here waits on it and `main`'s session, queue and run are untouched. Returns ""
+    /// when the task will answer.
+    async fn btw(&mut self, question: &str, from: (&str, &str)) -> String {
+        if self.btw.is_some() {
+            return "[zephyr] a /btw is already running".into();
+        }
+        if self.store.pause_reason().map_or(true, |p| p.is_some()) {
+            return "[zephyr] paused: /btw waits for /resume".into();
+        }
+        let account = match (&self.account, self.pick()) {
+            (Some(a), _) => Some(a.clone()),
+            (None, Ok(a)) => a,
+            (None, Err(until)) => {
+                let until = crate::pool::iso(until);
+                return format!(
+                    "[zephyr] /btw failed: every account is rate-limited until {until}"
+                );
+            }
+        };
+        let transcript = match self.child {
+            Some(_) => match self.call(json!({"type": "get_messages"})).await {
+                Ok(snap) => Some(crate::btw::transcript(&snap)),
+                Err(e) => {
+                    eprintln!("zephyr: /btw could not read main: {e:#}");
+                    None
+                }
+            },
+            None => None,
+        };
+        let prompt = crate::btw::prompt(transcript, question);
+        let to = (from.0.to_string(), from.1.to_string());
+        self.btw = Some(tokio::spawn(crate::btw::run(
+            self.cfg.clone(),
+            account,
+            prompt,
+            to,
+        )));
+        String::new()
     }
 
     /// `/login [PROVIDER [ACCOUNT [MODEL]]]`: signs a provider in from the live gateway, with the
