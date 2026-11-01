@@ -293,6 +293,8 @@ pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// Connection + response-headers deadline.
 pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// `x-cursor-agent-allowed-tools`: `ToolCall` oneof names, comma-joined.
+pub const ALLOWED_TOOLS: &str = "mcp_tool_call,get_mcp_tools_tool_call";
 /// Outbound frames buffered before `Session::send` applies backpressure.
 const OUTBOUND_QUEUE: usize = 32;
 /// How long `close` waits for the half-close and the connection to flush before detaching them.
@@ -393,8 +395,9 @@ fn build_request(target: &Target, config: &SessionConfig) -> anyhow::Result<Requ
         .header("x-cursor-client-version", wire::CLIENT_VERSION)
         .header("x-request-id", request_id)
         // Removes Cursor's built-in tool registry: without it the model calls Cursor's own tools,
-        // which this process cannot execute.
-        .header("x-cursor-agent-allowed-tools", "mcp_tool_call")
+        // which this process cannot execute. The MCP catalog lookup is required and Cursor serves
+        // it itself (live: "Required tool GET_MCP_TOOLS not found"; value from oh-my-pi).
+        .header("x-cursor-agent-allowed-tools", ALLOWED_TOOLS)
         .header("x-session-id", session_id)
         .body(())
         .context("failed to build the agent request")

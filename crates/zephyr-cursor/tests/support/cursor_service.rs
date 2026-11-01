@@ -28,6 +28,8 @@ pub struct Observed {
     pub replies: usize,
     /// Tool names from the client's `RequestContext` reply.
     pub context_tools: Vec<String>,
+    /// Tool names from each `mcp_state_exec_result` reply, one entry per turn that sent one.
+    pub mcp_state_tools: Vec<Vec<String>>,
     pub headers: BTreeMap<String, String>,
     pub errors: Vec<String>,
 }
@@ -40,6 +42,13 @@ pub struct RunShape {
     pub action: Option<String>,
     pub conversation_id: String,
 }
+
+/// The id of the turn-0 tool call: an OpenAI-style composite with a newline, which the client must
+/// replay verbatim in the next turn's history.
+pub const CALL_ID: &str = "call-1\nfc_2";
+/// `ExecServerMessage.id` / `.exec_id` of the mcp_state request.
+const MCP_STATE_ID: u64 = 3;
+const MCP_STATE_EXEC_ID: &str = "exec-mcp-state";
 
 pub struct Service {
     pub port: u16,
@@ -191,6 +200,19 @@ impl Turn {
             (1, 2) => self.run_request(body).await?,
             // AgentClientMessage.exec_client_message
             (2, 2) => {
+                // The tools the run request advertised: every reply that lists tools must carry
+                // back exactly these, or the model would be offered tools the client cannot run.
+                let wanted = self
+                    .observed
+                    .lock()
+                    .unwrap()
+                    .runs
+                    .last()
+                    .map(|run| run.tools.clone())
+                    .unwrap_or_default();
+                if let Some(result) = field(body, 36, 2) {
+                    self.mcp_state_reply(body, result, &wanted);
+                }
                 let tools = field(body, 10, 2)
                     .and_then(|result| field(result, 1, 2))
                     .and_then(|success| field(success, 1, 2))
@@ -200,16 +222,6 @@ impl Turn {
                             .collect::<Vec<_>>()
                     });
                 if let Some(tools) = &tools {
-                    // The reply must carry back the tools the run request advertised, or the model
-                    // would be offered tools the client cannot run.
-                    let wanted = self
-                        .observed
-                        .lock()
-                        .unwrap()
-                        .runs
-                        .last()
-                        .map(|run| run.tools.clone())
-                        .unwrap_or_default();
                     if tools != &wanted {
                         self.observed
                             .lock()
@@ -223,7 +235,10 @@ impl Turn {
                 if let Some(tools) = tools {
                     observed.context_tools = tools;
                 }
-                if !has_field(body, 10, 2) && !has_field(body, 11, 2) {
+                if ![10, 11, 36]
+                    .iter()
+                    .any(|member| has_field(body, *member, 2))
+                {
                     observed
                         .errors
                         .push("exec client message without a result".into());
@@ -241,9 +256,60 @@ impl Turn {
                     None => observed.errors.push("blob reply without blob_data".into()),
                 }
             }
+            // AgentClientMessage.exec_client_control_message: this script only sends requests the
+            // client knows, so a throw means it failed to recognise one.
+            (5, 2) => self
+                .observed
+                .lock()
+                .unwrap()
+                .errors
+                .push(format!("unexpected exec control message {body:?}")),
             _ => {}
         }
         Ok(())
+    }
+
+    /// Checks an `ExecClientMessage{id, exec_id, mcp_state_exec_result = 36}` answer to the request
+    /// [`Turn::run_request`] sends: one `zephyr` server, connected, listing the advertised tools.
+    fn mcp_state_reply(&mut self, exec: &[u8], result: &[u8], wanted: &[String]) {
+        let id = field(exec, 1, 0)
+            .and_then(|raw| read_varint(raw, 0))
+            .map(|(id, _)| id);
+        // McpStateExecResult.success = 1 -> McpStateSuccess.servers = 1 (repeated).
+        let servers: Vec<&[u8]> = field(result, 1, 2)
+            .map(|success| repeated(success, 1, 2).collect())
+            .unwrap_or_default();
+        let mut observed = self.observed.lock().unwrap();
+        observed.replies += 1;
+        if id != Some(MCP_STATE_ID) || text(exec, 15).as_deref() != Some(MCP_STATE_EXEC_ID) {
+            observed.errors.push(format!(
+                "mcp_state reply for id {id:?} / {:?}",
+                text(exec, 15)
+            ));
+        }
+        let [server] = servers.as_slice() else {
+            observed
+                .errors
+                .push(format!("mcp_state reply with {} servers", servers.len()));
+            return;
+        };
+        // McpStateServer: server_name = 1, server_identifier = 2, tools = 5, status = 7.
+        let identity = (text(server, 1), text(server, 2), text(server, 7));
+        let zephyr = Some("zephyr".to_string());
+        if identity != (zephyr.clone(), zephyr, Some("connected".to_string())) {
+            observed
+                .errors
+                .push(format!("mcp_state server {identity:?}"));
+        }
+        let tools: Vec<String> = repeated(server, 5, 2)
+            .filter_map(|tool| text(tool, 1))
+            .collect();
+        if tools != wanted {
+            observed
+                .errors
+                .push(format!("mcp_state tools {tools:?} != {wanted:?}"));
+        }
+        observed.mcp_state_tools.push(tools);
     }
 
     async fn run_request(&mut self, body: &[u8]) -> anyhow::Result<()> {
@@ -272,6 +338,9 @@ impl Turn {
         // 1. The framing handshake: it must come before any content, and its reply must carry the
         //    tools the client wants to expose.
         self.server_message(&exec_server_field(1, "", 10, &[]))?;
+        // 1a. As the live service does, ask for the client's MCP state (mcp_state_exec_args = 36,
+        //     empty): Cursor's GetDynamicTools/CallDynamicTool are served from the reply.
+        self.server_message(&exec_server_field(MCP_STATE_ID, MCP_STATE_EXEC_ID, 36, &[]))?;
         // 1b. The real service reads the replayed history back by id; ask for every blob.
         let blob_ids: Vec<Vec<u8>> = repeated(state, 1, 2).map(<[u8]>::to_vec).collect();
         for (index, blob_id) in blob_ids.iter().enumerate() {
@@ -295,7 +364,7 @@ impl Turn {
                 2,
                 "exec-1",
                 11,
-                &mcp_args("zephyr_bash", "zephyr", "bash", "call-1", &args),
+                &mcp_args("zephyr_bash", "zephyr", "bash", CALL_ID, &args),
             ))?;
         } else {
             self.server_message(&turn_ended())?;

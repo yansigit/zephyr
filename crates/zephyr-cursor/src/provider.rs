@@ -150,6 +150,19 @@ impl Turn {
                     );
                     session.send(reply).await?;
                 }
+                wire::ServerBody::McpState => {
+                    let reply = wire::encode_mcp_state_result(
+                        message.id,
+                        &message.exec_id,
+                        &self.prepared.tools,
+                    );
+                    session.send(reply).await?;
+                }
+                wire::ServerBody::UnknownExec { member } => {
+                    session
+                        .send(wire::encode_exec_throw(message.id, member))
+                        .await?;
+                }
                 wire::ServerBody::RejectExec { kind } => {
                     let reply = wire::encode_exec_rejection(message.id, &message.exec_id, &kind);
                     session.send(reply).await?;

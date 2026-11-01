@@ -6,7 +6,7 @@
 //! replaces it with a streaming provider that
 //!
 //! 1. advertises the host's tools as Cursor MCP tools (`x-cursor-agent-allowed-tools:
-//!    mcp_tool_call` also removes Cursor's own built-in tool registry, so the model has nothing to
+//!    mcp_tool_call,get_mcp_tools_tool_call` also removes Cursor's own built-in tool registry, so the model has nothing to
 //!    call but our tools),
 //! 2. translates Cursor's `InteractionUpdate`/`ExecServerMessage` stream into rpi's
 //!    `AssistantMessageEvent`s, answering the framing handshakes (`requestContext`, KV blobs) on

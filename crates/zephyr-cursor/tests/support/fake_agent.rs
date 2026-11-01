@@ -302,7 +302,10 @@ fn check_headers(expect: &ExpectHeaders, parts: &http::request::Parts) -> Result
         ("user-agent", "connect-es/1.6.1"),
         ("x-ghost-mode", "true"),
         ("x-cursor-client-type", "cli"),
-        ("x-cursor-agent-allowed-tools", "mcp_tool_call"),
+        (
+            "x-cursor-agent-allowed-tools",
+            "mcp_tool_call,get_mcp_tools_tool_call",
+        ),
     ] {
         match header(name) {
             Some(got) if got == want => {}

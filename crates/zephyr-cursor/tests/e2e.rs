@@ -125,7 +125,7 @@ fn rpi_runs_a_tool_through_the_cursor_provider() {
             .headers
             .get("x-cursor-agent-allowed-tools")
             .map(String::as_str),
-        Some("mcp_tool_call"),
+        Some("mcp_tool_call,get_mcp_tools_tool_call"),
         "Cursor's own tools must be off: {:?}",
         observed.headers
     );
@@ -176,6 +176,35 @@ fn rpi_runs_a_tool_through_the_cursor_provider() {
         "{:?}",
         observed.context_tools
     );
+    // The service asks for the client's MCP state on every turn; each answer lists our tools.
+    assert_eq!(
+        observed.mcp_state_tools.len(),
+        2,
+        "an mcp_state reply per turn: {:?}",
+        observed.mcp_state_tools
+    );
+    for tools in &observed.mcp_state_tools {
+        assert!(tools.iter().any(|tool| tool == "zephyr_bash"), "{tools:?}");
+    }
+    // The composite call id comes back verbatim (newline and all) in both the replayed tool call
+    // and its result, never in the `zcx_` form rpi carried it in.
+    let raw_id = serde_json::to_string(cursor_service::CALL_ID).expect("json string");
+    let carrying: Vec<&String> = observed
+        .blobs
+        .iter()
+        .filter(|blob| blob.contains(&raw_id))
+        .collect();
+    assert!(
+        carrying.iter().any(|blob| blob.contains("tool-call"))
+            && carrying.iter().any(|blob| blob.contains("tool-result")),
+        "the raw call id {raw_id} should be in the tool-call and tool-result blobs: {:?}",
+        observed.blobs
+    );
+    assert!(
+        !observed.blobs.iter().any(|blob| blob.contains("zcx_")),
+        "{:?}",
+        observed.blobs
+    );
     assert_eq!(
         ran.as_deref().map(str::trim),
         Some("hi"),
@@ -222,6 +251,13 @@ fn run(command: &mut Command) -> std::process::Output {
 fn built_plugin() -> PathBuf {
     let exe = std::env::current_exe().expect("test binary path");
     let profile = exe.parent().and_then(Path::parent).expect("target dir");
+    // `cargo test` builds the rlib, not the cdylib: build it here so rpi never loads a stale one.
+    let status = Command::new(env!("CARGO"))
+        .args(["build", "-p", "zephyr-cursor"])
+        .env("CARGO_TARGET_DIR", profile.parent().expect("target root"))
+        .status()
+        .expect("run cargo build");
+    assert!(status.success(), "cargo build -p zephyr-cursor failed");
     profile.join("libzephyr_cursor.so")
 }
 

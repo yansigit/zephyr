@@ -294,10 +294,10 @@ There are no per-call prompts. These hard limits hold every time:
 
 The `cursor` provider is this repo's own rpi plugin, `crates/zephyr-cursor` (`libzephyr_cursor.so`),
 not a staged package. It registers through `rpi-plugin-sdk`'s streaming-provider bridge, and its
-manifest lists the models it serves (rpi 0.14's manifest has no `replaceCatalog`). It talks to Cursor's agent service
-directly (Connect over HTTP/2, protobuf), because the package it replaced (`rpi-cursor-lite`) kept
-the request text-only: a Cursor model reached through it could never call a tool, which is all the
-old `Cursor (chat only)` label admitted.
+manifest lists the models it serves (rpi 0.14's manifest has no `replaceCatalog`). It talks to
+Cursor's agent service directly (Connect over HTTP/2, protobuf), because the package it replaced
+(`rpi-cursor-lite`) kept the request text-only: a Cursor model reached through it could never call a
+tool, which is all the old `Cursor (chat only)` label admitted.
 
 - **One `Run` per turn.** Every request carries the whole conversation as `root_prompt_messages_json`
   blobs rebuilt from rpi's own history (§4.1's messages), plus this turn's user text (or a fixed
@@ -307,10 +307,18 @@ old `Cursor (chat only)` label admitted.
   `toolUse`, the stream is closed, and rpi runs the tool and asks again with the result in the
   history. No tool result travels back into Cursor's stream, so nothing has to stay alive between
   turns, and the loop is the same one every other provider uses.
-- **Tools are the only tools.** They are advertised as Cursor MCP tools named `zephyr_<tool>`
-  (request context and `mcpTools` both), and the request sets `x-cursor-agent-allowed-tools:
-  mcp_tool_call`, which removes Cursor's own registry. A native tool request that still arrives is
-  answered with an error result rather than left hanging.
+- **Tools are the only tools.** The request sets `x-cursor-agent-allowed-tools:
+  mcp_tool_call,get_mcp_tools_tool_call`, which removes Cursor's own registry (the service refuses a
+  run without its catalog lookup). Our tools go out as MCP tools named `zephyr_<tool>` (request
+  context and `mcpTools`), but the model does not see them by name: it gets two meta-tools,
+  `GetDynamicTools` (catalog lookup) and `CallDynamicTool`. Cursor builds the catalog by sending the
+  client an `mcp_state` exec request (`ExecServerMessage` member 36), answered with every rpi tool as
+  one connected MCP server named `zephyr`. Expect a lookup round trip before the first call. A native
+  tool request that still arrives is answered with an error result on its own member, rather than
+  left hanging.
+- **Unknown exec requests get a throw.** An exec member the provider has no shape for is answered
+  with an `ExecClientThrow` (`UNSUPPORTED_EXEC_REQUEST`), not ignored: an unanswered request stalls
+  the turn forever while the server keeps heartbeating.
 - **Credentials.** rpi resolves the account's key into `opts.api_key` (§4.7: `[[account]]`, `auth.json`);
   `CURSOR_API_KEY` is the env door for an operator-supplied key. The key is exchanged for a
   short-lived bearer token (`/auth/exchange_user_api_key`, refreshed at `/auth/refresh`) held in the

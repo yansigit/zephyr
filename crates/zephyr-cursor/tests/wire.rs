@@ -10,9 +10,9 @@ use serde_json::{json, Value};
 use zephyr_cursor::models;
 use zephyr_cursor::wire::{
     connect_frame, decode_server_message, decode_value, encode_client_heartbeat,
-    encode_exec_rejection, encode_kv_get_blob_result, encode_kv_set_blob_ack,
-    encode_request_context_result, encode_run_request, encode_value, safe_call_id, Action, McpTool,
-    RunRequest, ServerBody, MAX_VALUE_DEPTH,
+    encode_exec_rejection, encode_exec_throw, encode_kv_get_blob_result, encode_kv_set_blob_ack,
+    encode_mcp_state_result, encode_request_context_result, encode_run_request, encode_value,
+    raw_call_id, safe_call_id, Action, McpTool, RunRequest, ServerBody, MAX_VALUE_DEPTH,
 };
 
 // --- an independent protobuf reader ---------------------------------------
@@ -211,8 +211,15 @@ fn frames_are_a_flag_then_a_big_endian_length() {
 }
 
 #[test]
-fn call_ids_keep_only_the_schema_charset() {
-    assert_eq!(safe_call_id("call-1\nfc_2"), "call-1_fc_2");
+fn unsafe_call_ids_are_hex_encoded_and_reversible() {
+    // OpenAI's composite `call_…\nfc_…` must come back verbatim in the replayed history, so it is
+    // encoded rather than flattened.
+    assert_eq!(safe_call_id("call-1\nfc_2"), "zcx_63616c6c2d310a66635f32");
+    assert_eq!(raw_call_id("zcx_63616c6c2d310a66635f32"), "call-1\nfc_2");
+    assert_eq!(safe_call_id("tool_1-a"), "tool_1-a");
+    assert_eq!(raw_call_id("tool_1-a"), "tool_1-a");
+    // A raw id that already looks encoded is encoded again, so it still round-trips.
+    assert_eq!(raw_call_id(&safe_call_id("zcx_41")), "zcx_41");
 }
 
 // --- google.protobuf.Value ------------------------------------------------
@@ -830,10 +837,11 @@ fn unknown_envelopes_and_members_are_ignored() {
         decode_server_message(&ld(9, b"whatever")).body,
         ServerBody::Ignored
     );
-    // ExecServerMessage.subagent_args = 28 is a native call this crate has no result shape for.
+    // ExecServerMessage.subagent_args = 28 is a native call this crate has no result shape for. It
+    // still needs an answer (a throw), or the server waits on it forever.
     assert_eq!(
         decode_server_message(&exec_message(28, b"")).body,
-        ServerBody::Ignored
+        ServerBody::UnknownExec { member: 28 }
     );
     // InteractionUpdate.tool_call_started = 2 is engine bookkeeping, not a body we surface.
     assert_eq!(
@@ -841,6 +849,96 @@ fn unknown_envelopes_and_members_are_ignored() {
         ServerBody::Ignored
     );
     assert_eq!(decode_server_message(&[]).body, ServerBody::Ignored);
+}
+
+#[test]
+fn span_context_alone_is_not_an_exec_request() {
+    // ExecServerMessage.span_context = 19 sits beside the oneof: with no member there is nothing
+    // to answer, so it must not become an UnknownExec throw.
+    let frame = ld(2, &concat(&[varint(1, 4), ld(19, &text_field(1, "trace"))]));
+    let message = decode_server_message(&frame);
+    assert_eq!(message.id, 4);
+    assert_eq!(message.body, ServerBody::Ignored);
+}
+
+#[test]
+fn the_live_mcp_state_request_decodes() {
+    // An AgentServerMessage payload captured from the real service: exec_server_message = 2
+    // {id = 1, span_context = 19 {...}, field 3 = 0, mcp_state_exec_args = 36 {}, field 55 = 0}.
+    let hex = "124108019a01360a2065366562363430613431643961326533643361643438653931383336663931341210333538356465373761386366336533311800a20200b80300";
+    let frame: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex"))
+        .collect();
+    let message = decode_server_message(&frame);
+    assert_eq!(message.id, 1);
+    assert_eq!(message.body, ServerBody::McpState);
+}
+
+#[test]
+fn the_mcp_state_reply_lists_our_tools_as_one_connected_server() {
+    let tools = vec![
+        tool("zephyr_read", "read", json!({"type": "object"})),
+        tool(
+            "zephyr_bash",
+            "bash",
+            json!({"type": "object", "properties": {}}),
+        ),
+    ];
+    let reply = encode_mcp_state_result(4, "exec-4", &tools);
+    let top = walk(&reply);
+    assert_eq!(numbers(&top), vec![2]); // AgentClientMessage.exec_client_message = 2
+    let exec = walk(ld_at(&top, 2));
+    assert_eq!(numbers(&exec), vec![1, 15, 36]);
+    assert_eq!(varint_at(&exec, 1), 4); // ExecClientMessage.id = 1
+    assert_eq!(text(ld_at(&exec, 15)), "exec-4"); // .exec_id = 15
+
+    // .mcp_state_exec_result = 36 -> McpStateExecResult.success = 1 -> McpStateSuccess.servers = 1.
+    let result = walk(ld_at(&exec, 36));
+    assert_eq!(numbers(&result), vec![1]);
+    let success = walk(ld_at(&result, 1));
+    assert_eq!(numbers(&success), vec![1]);
+    let server = walk(ld_at(&success, 1));
+
+    // McpStateServer: server_name = 1, server_identifier = 2, tools = 5 (repeated), status = 7.
+    assert_eq!(numbers(&server), vec![1, 2, 5, 5, 7]);
+    assert_eq!(text(ld_at(&server, 1)), "zephyr");
+    assert_eq!(text(ld_at(&server, 2)), "zephyr");
+    assert_eq!(text(ld_at(&server, 7)), "connected");
+
+    // McpToolDefinition: name = 1, description = 2, input_schema = 3 (a Value),
+    // provider_identifier = 4, tool_name = 5, input_schema_json = 6.
+    let definitions = occurrences(&server, 5);
+    assert_eq!(definitions.len(), 2);
+    for (entry, source) in definitions.iter().zip(&tools) {
+        let definition = walk(entry);
+        assert_eq!(numbers(&definition), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(text(ld_at(&definition, 1)), source.name);
+        assert_eq!(text(ld_at(&definition, 2)), source.description);
+        assert_eq!(decode_value(ld_at(&definition, 3)), source.input_schema);
+        assert_eq!(text(ld_at(&definition, 4)), "zephyr");
+        assert_eq!(text(ld_at(&definition, 5)), source.tool_name);
+        assert_eq!(
+            serde_json::from_str::<Value>(text(ld_at(&definition, 6))).expect("schema json"),
+            source.input_schema
+        );
+    }
+}
+
+#[test]
+fn an_unknown_exec_request_is_answered_with_a_throw() {
+    let reply = encode_exec_throw(9, 28);
+    // AgentClientMessage.exec_client_control_message = 5 -> ExecClientControlMessage.throw = 2.
+    let top = walk(&reply);
+    assert_eq!(numbers(&top), vec![5]);
+    let control = walk(ld_at(&top, 5));
+    assert_eq!(numbers(&control), vec![2]);
+    // ExecClientThrow: id = 1, error = 2, error_code = 4.
+    let throw = walk(ld_at(&control, 2));
+    assert_eq!(numbers(&throw), vec![1, 2, 4]);
+    assert_eq!(varint_at(&throw, 1), 9);
+    assert_eq!(text(ld_at(&throw, 2)), "unsupported exec request field 28");
+    assert_eq!(text(ld_at(&throw, 4)), "UNSUPPORTED_EXEC_REQUEST");
 }
 
 #[test]

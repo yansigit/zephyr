@@ -105,7 +105,7 @@ pub fn prepare(ctx: &Context) -> Prepared {
                         }
                         Content::ToolCall(call) => parts.push(json!({
                             "type": "tool-call",
-                            "toolCallId": call.id,
+                            "toolCallId": wire::raw_call_id(&call.id),
                             "toolName": call.name,
                             "args": call.arguments,
                         })),
@@ -123,11 +123,11 @@ pub fn prepare(ctx: &Context) -> Prepared {
                 // the history, and dropping the entry would replay an orphaned call.
                 let mut entry = json!({
                     "role": "tool",
-                    "id": result.tool_call_id,
+                    "id": wire::raw_call_id(&result.tool_call_id),
                     "content": [{
                         "type": "tool-result",
                         "toolName": result.tool_name,
-                        "toolCallId": result.tool_call_id,
+                        "toolCallId": wire::raw_call_id(&result.tool_call_id),
                         "result": Content::text_only(&result.content, "\n"),
                     }],
                 });

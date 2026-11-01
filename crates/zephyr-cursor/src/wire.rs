@@ -90,6 +90,14 @@ pub enum ServerBody {
     RejectExec {
         kind: String,
     },
+    /// `mcp_state_exec_args`: the service asks which MCP servers the client has; its
+    /// `GetDynamicTools` meta-tool is answered from our reply, not from the request context.
+    McpState,
+    /// An exec member this crate has no shape for. Answered with an `ExecClientThrow`: a request
+    /// left unanswered stalls the turn forever (the server keeps heartbeating).
+    UnknownExec {
+        member: u64,
+    },
     Ignored,
 }
 
@@ -538,6 +546,46 @@ pub fn encode_exec_rejection(id: u32, exec_id: &str, kind: &str) -> Vec<u8> {
     field_ld(2, &exec)
 }
 
+/// `ExecClientMessage{id, exec_id, mcp_state_exec_result{success{servers: [{zephyr, tools}]}}}`:
+/// all our tools as one connected MCP server.
+// Adapted from RoderAI/roder (MIT), proto_exec_mcp.rs
+pub fn encode_mcp_state_result(id: u32, exec_id: &str, tools: &[McpTool]) -> Vec<u8> {
+    // McpStateServer: server_name = 1, server_identifier = 2, tools = 5, status = 7.
+    let mut server = field_str(1, TOOL_PROVIDER);
+    server.extend_from_slice(&field_str(2, TOOL_PROVIDER));
+    for tool in tools {
+        server.extend_from_slice(&field_ld(5, &encode_tool_definition(tool)));
+    }
+    server.extend_from_slice(&field_str(7, "connected"));
+    // McpStateExecResult.success = 1 -> McpStateSuccess.servers = 1.
+    let result = field_ld(1, &field_ld(1, &server));
+
+    let mut exec = Vec::new();
+    if id != 0 {
+        exec.extend_from_slice(&field_varint(1, u64::from(id)));
+    }
+    if !exec_id.is_empty() {
+        exec.extend_from_slice(&field_str(15, exec_id));
+    }
+    exec.extend_from_slice(&field_ld(36, &result)); // ExecClientMessage.mcp_state_exec_result = 36
+    field_ld(2, &exec)
+}
+
+/// `AgentClientMessage{exec_client_control_message{throw{id, error, error_code}}}`: the schema's
+/// failure channel for an exec request this crate cannot answer on its own member.
+// Adapted from RoderAI/roder (MIT), proto_exec_results.rs
+pub fn encode_exec_throw(id: u32, member: u64) -> Vec<u8> {
+    // ExecClientThrow: id = 1, error = 2, error_code = 4.
+    let mut throw = field_varint(1, u64::from(id));
+    throw.extend_from_slice(&field_str(
+        2,
+        &format!("unsupported exec request field {member}"),
+    ));
+    throw.extend_from_slice(&field_str(4, "UNSUPPORTED_EXEC_REQUEST"));
+    // ExecClientControlMessage.throw = 2; AgentClientMessage.exec_client_control_message = 5.
+    field_ld(5, &field_ld(2, &throw))
+}
+
 /// `(ExecClientMessage oneof member, <kind>_result body)` for one native tool. The member number is
 /// the same on the request and the response; the inner case is whichever one carries an error.
 fn rejection_payload(kind: &str, reason: &str) -> (u64, Vec<u8>) {
@@ -662,12 +710,16 @@ fn decode_exec_server_message(bytes: &[u8], message: &mut ServerMsg) {
             // request_context_args = 10: the handshake that carries our tools.
             (10, 2) => message.body = ServerBody::RequestContext,
             (11, 2) => message.body = decode_mcp_args(field.data),
+            (36, 2) => message.body = ServerBody::McpState,
+            // span_context = 19 and machine_id = 57 sit beside the oneof, not in it.
+            (19 | 57, _) => {}
             (member, 2) => {
-                if let Some(kind) = native_exec_kind(member) {
-                    message.body = ServerBody::RejectExec {
+                message.body = match native_exec_kind(member) {
+                    Some(kind) => ServerBody::RejectExec {
                         kind: kind.to_string(),
-                    };
-                }
+                    },
+                    None => ServerBody::UnknownExec { member },
+                };
             }
             _ => {}
         }
@@ -676,8 +728,8 @@ fn decode_exec_server_message(bytes: &[u8], message: &mut ServerMsg) {
 
 /// The native tools this provider answers (with a refusal): the `ExecServerMessage` oneof member
 /// numbers that [`encode_exec_rejection`] has a matching `<kind>_result` for. Members without one
-/// (hooks, subagents, allowlist prechecks, MCP state) decode to [`ServerBody::Ignored`] rather than
-/// to a reply on the wrong oneof member.
+/// (hooks, subagents, allowlist prechecks) decode to [`ServerBody::UnknownExec`] and are answered
+/// with a throw rather than a reply on the wrong oneof member.
 fn native_exec_kind(member: u64) -> Option<&'static str> {
     Some(match member {
         2 => "shell",
@@ -818,17 +870,36 @@ pub fn connect_frame(payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Tool call ids must match `[A-Za-z0-9_-]` (some engines return newline-joined composites).
+/// Prefix of an id that [`safe_call_id`] had to encode.
+const ENCODED_ID: &str = "zcx_";
+
+/// Tool call ids must match `[A-Za-z0-9_-]`, but some engines return composites Cursor wants back
+/// verbatim (OpenAI's `call_…\nfc_…`): an unsafe id becomes `zcx_<hex>`, which [`raw_call_id`]
+/// reverses when the history is replayed.
 pub fn safe_call_id(raw: &str) -> String {
-    raw.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    let safe = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    if raw.chars().all(safe) && !raw.starts_with(ENCODED_ID) {
+        return raw.to_string();
+    }
+    let hex: String = raw.bytes().map(|b| format!("{b:02x}")).collect();
+    format!("{ENCODED_ID}{hex}")
+}
+
+/// The id Cursor issued for a call, from the one rpi carries (inverse of [`safe_call_id`]).
+pub fn raw_call_id(id: &str) -> String {
+    let decoded = id.strip_prefix(ENCODED_ID).and_then(|hex| {
+        let bytes = hex.as_bytes();
+        (bytes.len() % 2 == 0)
+            .then(|| {
+                bytes
+                    .chunks(2)
+                    .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+                    .collect::<Option<Vec<u8>>>()
+            })
+            .flatten()
+            .and_then(|raw| String::from_utf8(raw).ok())
+    });
+    decoded.unwrap_or_else(|| id.to_string())
 }
 
 #[cfg(test)]
@@ -842,6 +913,13 @@ mod tests {
 
     #[test]
     fn call_ids_are_restricted_to_the_schema_charset() {
-        assert_eq!(safe_call_id("call-1\nfc_2"), "call-1_fc_2");
+        for raw in ["call-1\nfc_2", "tool_1-a", "zcx_41", ""] {
+            let safe = safe_call_id(raw);
+            assert!(safe
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+            assert_eq!(raw_call_id(&safe), raw);
+        }
+        assert_eq!(safe_call_id("tool_1-a"), "tool_1-a");
     }
 }
