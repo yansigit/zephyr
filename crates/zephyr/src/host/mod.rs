@@ -255,6 +255,17 @@ impl Host {
                 .into_iter()
                 .flatten(),
         )
+        // The agent's browser renders WebGL on the GPU; without one it is SwiftShader (§4.11).
+        .args(if nvidia_runtime() {
+            &[
+                "--gpus",
+                "all",
+                "-e",
+                "NVIDIA_DRIVER_CAPABILITIES=graphics,utility",
+            ][..]
+        } else {
+            &[]
+        })
         // Root cannot enter the agent's 0700 home; the daemon starts each child there as the agent.
         .args(["-w", "/", &self.image])
         .stdout(Stdio::null());
@@ -466,6 +477,22 @@ fn docker(args: &[&str]) -> Command {
     let mut cmd = Command::new("docker");
     cmd.args(args);
     cmd
+}
+
+/// Whether Docker has the NVIDIA runtime (nvidia-container-toolkit), so `--gpus` works.
+fn nvidia_runtime() -> bool {
+    docker(&[
+        "info",
+        "--format",
+        "{{range $k, $v := .Runtimes}}{{$k}} {{end}}",
+    ])
+    .stderr(Stdio::null())
+    .output()
+    .is_ok_and(|o| {
+        String::from_utf8_lossy(&o.stdout)
+            .split_whitespace()
+            .any(|r| r == "nvidia")
+    })
 }
 
 fn run(cmd: &mut Command) -> anyhow::Result<()> {

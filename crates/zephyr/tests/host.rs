@@ -20,6 +20,7 @@ esac
 [ -n "$GH_TOKEN" ] && echo "GH_TOKEN set" >> "$SHIM_DIR/env.log"
 case "$1" in
   inspect) echo "${SHIM_STATE:-running}"; exit 0 ;;
+  info) echo "${SHIM_RUNTIMES:-io.containerd.runc.v2 runc}"; exit 0 ;;
   image) exit "${SHIM_IMAGE_MISSING:-0}" ;;
   exec)
     case " $* " in *" -i "*) cat >> "$SHIM_DIR/stdin.log" ;; esac
@@ -284,8 +285,24 @@ fn init_non_interactive_builds_the_layout_and_starts_the_container() {
         !run.iter().any(|a| a == "--memory"),
         "no memory cap unless set"
     );
+    assert!(
+        !run.iter().any(|a| a == "--gpus"),
+        "no GPU without its runtime"
+    );
     assert_eq!(run.last().unwrap(), "zephyr-lanetest");
     find(&calls, &["docker", "exec", CONTAINER, "zephyr", "doctor"]);
+
+    // With the NVIDIA runtime the GPU goes in, for the browser's WebGL.
+    let out = env.zephyr_env(&["up"], &[("SHIM_RUNTIMES", "nvidia runc")]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = env.calls();
+    let run = find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
+    assert!(run.windows(2).any(|w| w == ["--gpus", "all"]), "{run:?}");
+    assert!(run.contains(&"NVIDIA_DRIVER_CAPABILITIES=graphics,utility".to_string()));
 
     // Re-running keeps what is there, comments included.
     let path = daemon.join("zephyr.toml");

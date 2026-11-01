@@ -311,7 +311,7 @@ impl IMessage {
     /// Whether typing can work: the Mac's BlueBubbles Private API is on and its helper is connected.
     pub async fn private_api_on(&self) -> anyhow::Result<bool> {
         let body = self
-            .request(Method::GET, "/api/v1/server/info", None)
+            .request(Method::GET, "/api/v1/server/info", Payload::None)
             .await?;
         let info: serde_json::Value = serde_json::from_slice(&body)?;
         let on = |key: &str| info["data"][key].as_bool() == Some(true);
@@ -355,7 +355,7 @@ impl IMessage {
     }
 
     async fn typing_request(&self, method: Method, to: &str) -> anyhow::Result<()> {
-        self.request(method, &typing_path(&chat_guid(to)), None)
+        self.request(method, &typing_path(&chat_guid(to)), Payload::None)
             .await
             .map(drop)
     }
@@ -421,7 +421,33 @@ impl Channel for IMessage {
             "method": "apple-script",
             "tempGuid": msg.client_id,
         });
-        self.post("/api/v1/message/text", &body).await.map(drop)
+        if !msg.text.is_empty() || msg.attachment.is_none() {
+            self.post("/api/v1/message/text", &body).await?;
+        }
+        if let Some(path) = &msg.attachment {
+            let name = path
+                .file_name()
+                .map_or("file".into(), |n| n.to_string_lossy().into_owned());
+            let file = tokio::fs::read(path)
+                .await
+                .context("reading the file to send")?;
+            let form = reqwest::multipart::Form::new()
+                .text("chatGuid", chat_guid(&msg.recipient))
+                .text("tempGuid", format!("{}-f", msg.client_id))
+                .text("name", name.clone())
+                .text("method", "apple-script")
+                .part(
+                    "attachment",
+                    reqwest::multipart::Part::bytes(file).file_name(name),
+                );
+            self.request(
+                Method::POST,
+                "/api/v1/message/attachment",
+                Payload::Form(form),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Typing on Start, cleared on Stop. Progress shows nothing: the refresh task keeps typing up.
@@ -434,10 +460,18 @@ impl Channel for IMessage {
     }
 }
 
+/// What a BlueBubbles request carries.
+enum Payload<'a> {
+    None,
+    Json(&'a serde_json::Value),
+    /// An attachment upload.
+    Form(reqwest::multipart::Form),
+}
+
 impl IMessage {
     /// POSTs JSON to `path` with the password as a query param, and returns the response body.
     async fn post(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
-        self.request(Method::POST, path, Some(body)).await
+        self.request(Method::POST, path, Payload::Json(body)).await
     }
 
     /// Sends `method` to `path` with the password as a query param, and returns the response body.
@@ -446,15 +480,17 @@ impl IMessage {
         &self,
         method: Method,
         path: &str,
-        body: Option<&serde_json::Value>,
+        body: Payload<'_>,
     ) -> anyhow::Result<Vec<u8>> {
-        let mut req = self
+        let req = self
             .http
             .request(method, format!("{}{path}", self.server_url))
             .query(&[("password", &self.password)]);
-        if let Some(body) = body {
-            req = req.json(body);
-        }
+        let req = match body {
+            Payload::None => req,
+            Payload::Json(body) => req.json(body),
+            Payload::Form(form) => req.multipart(form),
+        };
         let res = req
             .send()
             .await
@@ -727,6 +763,7 @@ mod tests {
             recipient: "+15551234567".into(),
             client_id: "client-1".into(),
             text: "hi there".into(),
+            attachment: None,
         }
     }
 

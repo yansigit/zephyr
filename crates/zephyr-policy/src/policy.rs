@@ -210,6 +210,11 @@ pub fn outbound(command: &str) -> Vec<String> {
                 let remote = args[p + 1..].iter().find(|a| !a.starts_with('-'));
                 format!("git push {}", remote.map_or("", |r| r.as_str()))
             }),
+            // What types into or runs on a page can send it; navigating is a plain GET.
+            "agent-browser" => args
+                .iter()
+                .find(|a| ["fill", "type", "keyboard", "upload", "eval"].contains(&a.as_str()))
+                .map(|sub| format!("agent-browser {sub}")),
             _ => None,
         };
         if let Some(label) = label {
@@ -533,6 +538,20 @@ mod tests {
             (
                 "sudo curl --data-binary @f https://e.x",
                 vec!["curl POST e.x"],
+            ),
+            (
+                "agent-browser fill @e3 'me@x.io'",
+                vec!["agent-browser fill"],
+            ),
+            (
+                "agent-browser --session s upload @e1 a.pdf",
+                vec!["agent-browser upload"],
+            ),
+            ("agent-browser eval 'fetch(u)'", vec!["agent-browser eval"]),
+            ("agent-browser open https://e.x/fill", vec![]),
+            (
+                "agent-browser click @e3 && agent-browser snapshot -i",
+                vec![],
             ),
             ("curl -s https://e.x | jq .", vec![]),
             ("curl -X GET https://e.x", vec![]),

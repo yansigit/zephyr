@@ -4,7 +4,7 @@ use crate::channel::{Activity, Channel, Inbound, Outbound};
 use anyhow::Context as _;
 use serde::Deserialize;
 use serenity::async_trait;
-use serenity::builder::{CreateMessage, EditMessage};
+use serenity::builder::{CreateAttachment, CreateMessage, EditMessage};
 use serenity::client::{Client, Context, EventHandler};
 use serenity::http::{Http, Typing};
 use serenity::model::channel::{Message, Nonce};
@@ -263,19 +263,33 @@ impl Channel for Discord {
             .parse()
             .context("recipient is not a Discord user id")?;
         // Build every nonce before the first send, so a bad client id cannot leave a half-sent reply.
-        let parts = chunks(&msg.text, MAX_CONTENT)
+        let mut parts = chunks(&msg.text, MAX_CONTENT)
             .into_iter()
             .enumerate()
             .map(|(i, text)| Ok((nonce(&msg.client_id, i)?, text)))
             .collect::<anyhow::Result<Vec<_>>>()?;
+        // The file rides on the last message; a file without text gets a message of its own.
+        let mut file = match &msg.attachment {
+            Some(path) => Some(CreateAttachment::path(path).await?),
+            None => None,
+        };
+        if parts.is_empty() && file.is_some() {
+            parts.push((nonce(&msg.client_id, 0)?, String::new()));
+        }
+        let last = parts.len().saturating_sub(1);
         // The progress note goes before the reply, so it never sits below it.
         self.finish(user).await;
         let dm = UserId::new(user).create_dm_channel(&self.http).await?;
-        for (nonce, text) in parts {
-            let builder = CreateMessage::new()
+        for (i, (nonce, text)) in parts.into_iter().enumerate() {
+            let mut builder = CreateMessage::new()
                 .content(text)
                 .nonce(Nonce::String(nonce))
                 .enforce_nonce(true);
+            if i == last {
+                if let Some(file) = file.take() {
+                    builder = builder.add_file(file);
+                }
+            }
             dm.send_message(&self.http, builder).await?;
         }
         Ok(())

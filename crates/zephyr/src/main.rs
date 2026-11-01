@@ -336,6 +336,30 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
             );
         }
     }
+    // Warnings, not failures: the browser and desktop are extras the image brings (DESIGN §4.11).
+    if let Ok(display) = std::env::var("ZEPHYR_DESKTOP") {
+        let chrome = std::env::var("AGENT_BROWSER_EXECUTABLE_PATH").unwrap_or_default();
+        for (what, program, args) in [
+            ("agent-browser", "agent-browser", vec!["--version"]),
+            ("the agent's Chromium", chrome.as_str(), vec!["--version"]),
+            (
+                "the desktop",
+                "xdpyinfo",
+                vec!["-display", display.as_str()],
+            ),
+        ] {
+            let out = zephyr::agent::cmd(&mut std::process::Command::new(program))
+                .args(args)
+                .output();
+            match out {
+                Ok(o) if o.status.success() => println!("ok   {what} works"),
+                _ => println!("warn {what} does not run ({program})"),
+            }
+        }
+        if !Path::new("/dev/nvidia0").exists() {
+            println!("warn no GPU in the container: the browser's WebGL is software (SwiftShader)");
+        }
+    }
     // A warning, not a failure: providers come from the image (DESIGN §4.4).
     let ext_dir = zephyr::auth_keeper::agent_dir(cfg).join("extensions");
     let installed = {
