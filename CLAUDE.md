@@ -66,6 +66,14 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   DESIGN §4.1),
   `memory.rs` (git-committed memory files), `attach.rs` (rpi remote JSON-RPC shim so stock
   `rpi --connect` attaches to `main`).
+- `drafts.rs` (DESIGN §4.6): skills and connectors the agent drafts under `skills/drafts/` and
+  `connectors/drafts/`, shown to the owner once after each run (`scan`) and approved with
+  `/skill ok` / `/mcp ok` only if unchanged since shown. Approved skills are a root-owned git repo in
+  `<state>/skills`; connectors are `[[mcp]]` in `zephyr.toml`. `drafts::prepare` (called by
+  `spawn_as` in place of `memory::prepare`, which it runs first) publishes them as the agent to
+  `<home>/.approved/` (`mcp.json` with `${NAME}` secrets filled in) and adds `## Skills` and
+  `## Connectors` to AGENTS.md. zephyr-policy's `check_mcp` lets MCP calls use only that file
+  (`ZEPHYR_MCP_CONFIG`), byte-identical to what it read at load.
 - The agent's tools (DESIGN §4.11): the browser, Camoufox and the X desktop are CLIs in the image,
   run through `bash`. `desktop.rs` keeps Xvfb up when `ZEPHYR_DESKTOP` is set. `send_file`,
   `schedule`, `gateway` and `task` are registered by zephyr-policy (`tools.rs`). The first two are

@@ -2499,3 +2499,73 @@ async fn a_steer_the_resumed_run_never_reached_is_sent_again_once() {
     assert!(!main_session(&home).contains("Zephyr restarted while you were working"));
     gw.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_skill_draft_reaches_the_agent_only_after_the_owners_ok() {
+    let home = home("skill");
+    let gw = start(config(&home));
+    let draft = home.join("skills/drafts/tea");
+    std::fs::create_dir_all(&draft).unwrap();
+    std::fs::write(
+        draft.join("SKILL.md"),
+        "---\nname: tea\ndescription: Use when brewing tea.\n---\nBoil water.\n",
+    )
+    .unwrap();
+    gw.say("m1", "owner", "hi").await;
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        replies[1].starts_with("[zephyr] the agent drafted a new skill tea; /skill ok tea"),
+        "{}",
+        replies[1]
+    );
+    let agents = || std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    assert!(!agents().contains("**tea**"));
+
+    gw.say("m2", "owner", "/skill ok tea").await;
+    assert!(gw.wait_replies(3).await[2].starts_with("[zephyr] skill tea approved"));
+    gw.say("m3", "owner", "again").await;
+    gw.wait_replies(4).await;
+    assert_eq!(log(&home, "start").len(), 2, "one restart, to load it");
+    assert!(
+        agents().contains("- **tea**: Use when brewing tea."),
+        "{}",
+        agents()
+    );
+    assert!(home.join(".approved/skills/tea/SKILL.md").exists());
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_approved_connector_restarts_the_agent_with_its_file() {
+    let home = home("mcp");
+    let gw = start(on_file(&home, ""));
+    let drafts = home.join("connectors/drafts");
+    std::fs::create_dir_all(&drafts).unwrap();
+    std::fs::write(
+        drafts.join("docs.json"),
+        r#"{"command": "python3", "args": ["/zephyr/docs-mcp.py"]}"#,
+    )
+    .unwrap();
+    gw.say("m1", "owner", "hi").await;
+    assert!(gw.wait_replies(2).await[1].contains("/mcp ok docs"));
+    gw.say("m2", "owner", "/mcp ok docs").await;
+    let reply = gw.wait_replies(3).await[2].clone();
+    assert!(
+        reply.starts_with(
+            "[zephyr] connector docs added to zephyr.toml\n[zephyr] restarting the agent"
+        ),
+        "{reply}"
+    );
+    gw.say("m3", "owner", "again").await;
+    gw.wait_replies(4).await;
+    assert_eq!(log(&home, "start").len(), 2);
+    let agents = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    assert!(
+        agents.contains("- **docs**: local, runs `python3`"),
+        "{agents}"
+    );
+    let file: Value =
+        serde_json::from_slice(&std::fs::read(home.join(".approved/mcp.json")).unwrap()).unwrap();
+    assert_eq!(file["mcpServers"]["docs"]["command"], "python3");
+    gw.shutdown().await;
+}

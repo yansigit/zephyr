@@ -88,6 +88,9 @@ async fn one(cfg: Arc<Config>, task: Task, wake: &Wake) {
         Ok(None) => {}
         Err(e) => eprintln!("zephyr: memory commit failed: {e:#}"),
     }
+    for notice in crate::drafts::scan(&cfg) {
+        log(store.notify(channel, recipient, &notice));
+    }
     log(store.finish_task(&task, status, &report, crate::now()));
     if crossed {
         log(store.notify(channel, recipient, BUDGET_NOTICE));

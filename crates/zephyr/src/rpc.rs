@@ -191,7 +191,8 @@ impl Child {
         let context_dir = agent_dir
             .clone()
             .unwrap_or_else(|| crate::auth_keeper::agent_dir(cfg));
-        crate::memory::prepare(&cfg.home, cfg.state_dir(), &context_dir)?;
+        // memory::prepare, then the approved skills and connectors (DESIGN §4.6).
+        crate::drafts::prepare(cfg, &context_dir)?;
         let mut cmd = Command::new(&cfg.rpi);
         crate::agent::cmd(cmd.as_std_mut());
         // AGENTS.md is the agent's only standing instruction (memory::prepare): no skills it
@@ -238,6 +239,11 @@ impl Child {
         cmd.env(
             zephyr_policy::tools::GATEWAY_DIR_ENV,
             crate::tools::gateway_dir(cfg),
+        );
+        // The only MCP config the policy plugin lets the adapter's tools use (DESIGN §4.6).
+        cmd.env(
+            zephyr_policy::policy::MCP_CONFIG_ENV,
+            crate::drafts::mcp_path(&cfg.home),
         );
         if let Some(display) = crate::desktop::ensure() {
             cmd.env("DISPLAY", display);

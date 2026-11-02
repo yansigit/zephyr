@@ -62,6 +62,41 @@ pub fn check(tool: &str, args: &Value) -> Decision {
     }
 }
 
+/// Names the connectors file the daemon wrote for this child (DESIGN §4.6).
+pub const MCP_CONFIG_ENV: &str = "ZEPHYR_MCP_CONFIG";
+
+/// The MCP adapter's tools, which `check_mcp` gates after `check`.
+pub fn is_mcp(tool: &str) -> bool {
+    matches!(
+        tool,
+        "mcp_list" | "mcp_call" | "mcp_resource" | "mcp_request"
+    )
+}
+
+/// The connector gate: an MCP call may use only the connectors file the daemon wrote, unchanged
+/// since this child loaded the plugin, so a config the agent writes (a server command is a lasting
+/// hook) or a server it names by `url` never runs. `approved` is that file's path and bytes as read
+/// at load, `None` when there are no connectors; `read` reads it again now.
+pub fn check_mcp(
+    args: &Value,
+    approved: Option<(&str, &[u8])>,
+    read: impl FnOnce(&str) -> Option<Vec<u8>>,
+) -> Decision {
+    let Some((path, bytes)) = approved else {
+        return Decision::Deny("no connectors are set up");
+    };
+    if args.get("url").is_some() {
+        return Decision::Deny("an MCP server named by url");
+    }
+    if args.get("configPath").and_then(Value::as_str) != Some(path) {
+        return Decision::Deny("an MCP config other than the approved connectors");
+    }
+    if read(path).as_deref() != Some(bytes) {
+        return Decision::Deny("the connectors file changed since this session started");
+    }
+    Decision::Allow
+}
+
 /// Files no tool may touch: credentials, another process's environment, ssh keys, and git
 /// hooks (a hook in a project runs as the owner, on the host, at their next commit).
 fn sensitive(path: &str) -> Option<&'static str> {
@@ -581,6 +616,40 @@ mod tests {
             assert_eq!(check("exec", &args), check("bash", &args), "{command}");
         }
         assert!(matches!(check("exec", &json!({})), Decision::Deny(_)));
+    }
+
+    #[test]
+    fn mcp_uses_only_the_unchanged_approved_file() {
+        let path = "/zephyr/.approved/mcp.json";
+        let bytes = br#"{"mcpServers":{}}"#.as_slice();
+        let same = |_: &str| Some(bytes.to_vec());
+        let gate = |args: Value| check_mcp(&args, Some((path, bytes)), same);
+        let call = json!({ "configPath": path, "server": "docs", "tool": "t" });
+        assert_eq!(gate(call.clone()), Decision::Allow);
+        assert_eq!(gate(json!({ "configPath": path })), Decision::Allow);
+        for denied in [
+            json!({ "configPath": "/tmp/mine.json", "server": "x" }),
+            json!({ "configPath": ".approved/mcp.json", "server": "x" }),
+            json!({ "url": "https://evil/mcp" }),
+            json!({ "configPath": path, "url": "https://evil/mcp" }),
+            json!({ "server": "docs" }),
+        ] {
+            assert!(
+                matches!(gate(denied.clone()), Decision::Deny(_)),
+                "{denied}"
+            );
+        }
+        let edited = |_: &str| Some(b"{}".to_vec());
+        assert!(matches!(
+            check_mcp(&call, Some((path, bytes)), edited),
+            Decision::Deny(_)
+        ));
+        assert!(matches!(
+            check_mcp(&call, Some((path, bytes)), |_| None),
+            Decision::Deny(_)
+        ));
+        assert!(matches!(check_mcp(&call, None, same), Decision::Deny(_)));
+        assert!(is_mcp("mcp_request") && !is_mcp("mcp"));
     }
 
     #[test]

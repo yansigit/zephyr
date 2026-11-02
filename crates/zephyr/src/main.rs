@@ -16,7 +16,7 @@ use zephyr::store::Store;
 /// The rpi minor this build speaks (DESIGN §3).
 const RPI_PIN: &str = "rpi 0.15.";
 
-const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|resume|reload>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
+const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|resume|reload|skill>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -59,6 +59,7 @@ async fn main() -> ExitCode {
             ("pause", Ok(cfg)) => control(&cfg, "/pause").await,
             ("resume", Ok(cfg)) => control(&cfg, "/resume").await,
             ("reload", Ok(cfg)) => control(&cfg, "/reload").await,
+            ("skill", Ok(cfg)) => skill(&cfg, &args.collect::<Vec<_>>()).await,
             _ => {
                 eprintln!("{USAGE}");
                 return ExitCode::from(2);
@@ -177,24 +178,64 @@ async fn run(cfg: Config, from_file: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The running daemon's reply to `text`, sent as the owner over its chat socket. `None` when no
+/// daemon listens.
+async fn ask(cfg: &Config, text: &str) -> anyhow::Result<Option<String>> {
+    let Ok(stream) = tokio::net::UnixStream::connect(cfg.socket_path()).await else {
+        return Ok(None);
+    };
+    let (read, mut write) = stream.into_split();
+    let id = format!("cli-{}-{}", std::process::id(), zephyr::unix_millis());
+    let mut line = serde_json::to_vec(&json!({"id": id, "text": text}))?;
+    line.push(b'\n');
+    write.write_all(&line).await?;
+    let mut lines = BufReader::new(read).lines();
+    // The reply comes back on this connection; no reply means this uid is not an owner.
+    let reply = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("no reply from zephyr within 10s; is this user in owners.chat?")
+        })??;
+    let v: serde_json::Value = serde_json::from_str(reply.as_deref().unwrap_or("null"))?;
+    Ok(Some(v["text"].as_str().unwrap_or_default().to_string()))
+}
+
+/// `zephyr skill list | rm NAME | add NAME` in the container, run by the host's `zephyr skill`
+/// (DESIGN §4.6). `add` takes the skill folder as a tar on stdin and unpacks it into the daemon's
+/// `<state>/incoming/NAME`, out of the agent's reach, for `/skill add` to check and approve.
+async fn skill(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
+    let text = match args {
+        [list] if list == "list" => "/skills".to_string(),
+        [rm, name] if rm == "rm" => format!("/skill rm {name}"),
+        [add, name] if add == "add" && zephyr::drafts::valid_name(name) => {
+            let dir = zephyr::drafts::incoming(cfg.state_dir(), name);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir)?;
+            let status = std::process::Command::new("tar")
+                .args(["-x", "--no-same-owner", "--no-same-permissions", "-C"])
+                .arg(&dir)
+                .status()?;
+            if !status.success() {
+                anyhow::bail!("unpacking the skill failed ({status})");
+            }
+            format!("/skill add {name}")
+        }
+        _ => anyhow::bail!("usage: zephyr skill list | rm NAME | add NAME (a tar on stdin)"),
+    };
+    let reply = match ask(cfg, &text).await? {
+        Some(reply) => reply,
+        // No daemon: the next child start reads `<state>/skills` anyway.
+        None => zephyr::drafts::command(cfg, &text).map_or_else(String::new, |(r, _)| r),
+    };
+    println!("{reply}");
+    Ok(())
+}
+
 /// `zephyr pause` / `resume`: through the running daemon's chat socket, so a run in progress is
 /// aborted. With no daemon, the store carries the flag to the next start.
 async fn control(cfg: &Config, text: &str) -> anyhow::Result<()> {
-    if let Ok(stream) = tokio::net::UnixStream::connect(cfg.socket_path()).await {
-        let (read, mut write) = stream.into_split();
-        let id = format!("cli-{}-{}", std::process::id(), zephyr::unix_millis());
-        let mut line = serde_json::to_vec(&json!({"id": id, "text": text}))?;
-        line.push(b'\n');
-        write.write_all(&line).await?;
-        let mut lines = BufReader::new(read).lines();
-        // The reply comes back on this connection; no reply means this uid is not an owner.
-        let reply = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!("no reply from zephyr within 10s; is this user in owners.chat?")
-            })??;
-        let v: serde_json::Value = serde_json::from_str(reply.as_deref().unwrap_or("null"))?;
-        println!("{}", v["text"].as_str().unwrap_or_default());
+    if let Some(reply) = ask(cfg, text).await? {
+        println!("{reply}");
     } else {
         let store = Store::open(&cfg.db_path())?;
         store.set_paused((text == "/pause").then_some("user"))?;
@@ -367,6 +408,17 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
         }
         if !Path::new("/dev/nvidia0").exists() {
             println!("warn no GPU in the container: the browser's WebGL is software (SwiftShader)");
+        }
+    }
+    // Warnings, not failures: such a connector is left out, and the rest work (DESIGN §4.6).
+    for m in &cfg.mcp {
+        let missing = zephyr::drafts::missing_secrets(cfg, m);
+        if !missing.is_empty() {
+            println!(
+                "warn connector {} is left out: secrets.env does not set {}",
+                m.name,
+                missing.join(", ")
+            );
         }
     }
     // A warning, not a failure: providers come from the image (DESIGN §4.4).

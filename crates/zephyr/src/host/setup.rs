@@ -485,6 +485,130 @@ pub fn channel(h: &Host, a: Args) -> anyhow::Result<()> {
     }
 }
 
+/// `zephyr skill add DIR | list | rm NAME`, carried out by the container's `zephyr skill`
+/// (DESIGN §4.6). `add` checks the folder as an approval would, then sends it over as a tar; the
+/// owner adding it is the approval.
+pub fn skill(h: &Host, a: Args) -> anyhow::Result<()> {
+    let rest = a.rest()?;
+    h.need_running()?;
+    match &rest[..] {
+        [add, dir] if add == "add" => {
+            let dir = std::path::Path::new(dir).canonicalize()?;
+            let name = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .context("the folder has no name")?
+                .to_string();
+            crate::drafts::read_skill(&dir, &name)
+                .with_context(|| format!("{} is not a skill zephyr takes", dir.display()))?;
+            let mut tar = std::process::Command::new("tar")
+                .arg("-C")
+                .arg(&dir)
+                .args(["-cf", "-", "."])
+                .stdout(Stdio::piped())
+                .spawn()
+                .context("running tar")?;
+            let archive = tar.stdout.take().context("tar's output")?;
+            run(h
+                .exec(&["-i"], &[], &["zephyr", "skill", "add", &name])
+                .stdin(archive))?;
+            if !tar.wait()?.success() {
+                bail!("tar failed");
+            }
+            Ok(())
+        }
+        [list] if list == "list" => run(&mut h.exec(&[], &[], &["zephyr", "skill", "list"])),
+        [rm, name] if rm == "rm" => run(&mut h.exec(&[], &[], &["zephyr", "skill", "rm", name])),
+        _ => bail!("usage: zephyr skill add DIR | list | rm NAME"),
+    }
+}
+
+/// `zephyr mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. | list |
+/// rm NAME`: the `[[mcp]]` connectors in zephyr.toml (DESIGN §4.6). Each `--secret` is asked for
+/// hidden and goes to secrets.env, for the `${NAME}` it fills in. `add NAME --secret K` alone sets
+/// a secret for a connector that is already there.
+pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
+    use crate::config::{Config, Mcp};
+    // After `--` comes the server's own command line, options and all.
+    let command = match a.0.iter().position(|x| x == "--") {
+        Some(i) => a.0.split_off(i).split_off(1),
+        None => Vec::new(),
+    };
+    let url = a.value("--url")?;
+    let headers = a.values("--header")?;
+    let secrets = a.values("--secret")?;
+    let rest = a.rest()?;
+    let mut doc = h.data.load()?;
+    let parse = |doc: &toml_edit::DocumentMut| -> anyhow::Result<Config> {
+        let cfg: Config = toml::from_str(&doc.to_string())?;
+        cfg.validate()?;
+        Ok(cfg)
+    };
+    let usage = "usage: zephyr mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. | list | rm NAME";
+    match &rest[..] {
+        [list] if list == "list" => {
+            for m in parse(&doc)?.mcp {
+                println!("{}: {}", m.name, m.url.or(m.command).unwrap_or_default());
+            }
+            return Ok(());
+        }
+        [rm, name] if rm == "rm" => {
+            if !conf::remove_mcp(&mut doc, name) {
+                bail!("no connector named {name}");
+            }
+        }
+        [add, name] if add == "add" => {
+            let headers = headers
+                .iter()
+                .map(|h| {
+                    h.split_once('=')
+                        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                        .with_context(|| format!("--header {h}: write it as K=V"))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            let m = match (url, command.split_first()) {
+                (Some(_), Some(_)) => bail!("give --url or a command after --, not both"),
+                (Some(url), None) => Mcp {
+                    name: name.clone(),
+                    url: Some(url),
+                    headers,
+                    ..Mcp::default()
+                },
+                (None, Some((cmd, args))) if headers.is_empty() => Mcp {
+                    name: name.clone(),
+                    command: Some(cmd.clone()),
+                    args: args.to_vec(),
+                    ..Mcp::default()
+                },
+                (None, Some(_)) => bail!("--header goes with --url"),
+                (None, None) => parse(&doc)?
+                    .mcp
+                    .into_iter()
+                    .find(|m| m.name == *name)
+                    .with_context(|| format!("no connector named {name}\n{usage}"))?,
+            };
+            conf::upsert_mcp(&mut doc, &m)?;
+        }
+        _ => bail!("{usage}"),
+    }
+    parse(&doc)?;
+    if !secrets.is_empty() && !h.interactive {
+        bail!("--secret asks for the value: run it in a terminal");
+    }
+    for key in &secrets {
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            bail!("--secret {key:?}: use a variable name (letters, digits, '_')");
+        }
+        let value = Password::new()
+            .with_prompt(format!("{key} (hidden)"))
+            .interact()?;
+        h.data.set_secret(key, value.trim())?;
+    }
+    h.data.save(&doc)?;
+    println!("saved {}", rest.join(" "));
+    h.apply()
+}
+
 /// Asks for the channel's settings; secrets go to secrets.env at hidden prompts.
 fn channel_add(h: &Host, kind: &str) -> anyhow::Result<()> {
     if !h.interactive {
