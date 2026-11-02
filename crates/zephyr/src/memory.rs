@@ -150,6 +150,9 @@ Besides your file and shell tools, this container gives you:
   `/status`, `/model`, `/switch`, `/rules`, `/memory diff`, `/memory log`, `/job list`. It can
   also propose `/model PROVIDER/MODEL`, `/new`, `/switch ID`, `/pause` or `/reload`: the owner is
   asked, and it runs only after their `/ok N`. Approving anything stays with the owner.
+- **recall** searches earlier conversations, including ones from before `/new`: `query` finds the
+  messages with every word in them, and `session` with `around` (an entry id from a hit) reads
+  the messages around one.
 
 "#;
 
@@ -702,6 +705,9 @@ mod tests {
         let rules = text.find("1. never email bob\n2. reply in Korean").unwrap();
         let tools = text.find("## Tools").unwrap();
         assert!(rules < tools && tools < text.find("USER-FACT-7").unwrap());
+        assert!(text.contains(
+            "**recall** searches earlier conversations, including ones from before `/new`"
+        ));
         assert!(text.contains("MEMORY-FACT-9"));
         assert_eq!(
             say(&home, "/rules").0,

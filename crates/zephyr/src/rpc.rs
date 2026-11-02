@@ -239,6 +239,8 @@ impl Child {
             zephyr_policy::tools::GATEWAY_DIR_ENV,
             crate::tools::gateway_dir(cfg),
         );
+        // `recall` reads the session files itself (DESIGN §4.11).
+        cmd.env(zephyr_policy::tools::SESSIONS_DIR_ENV, cfg.session_dir());
         if let Some(display) = crate::desktop::ensure() {
             cmd.env("DISPLAY", display);
             // The desktop takes only clients holding its cookie (`desktop` module docs).

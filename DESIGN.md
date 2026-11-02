@@ -397,6 +397,8 @@ The image adds tools to rpi's own (`read`, `bash`, `edit`, `write`, ...). The ag
   - The router answers when the call's `tool_execution_start` reaches `tapped`, so in the main loop and while draining: it checks the list again (rpi reports the start of a call the plugin refused too; that one gets no answer and nothing runs), runs the same function the owner's command runs, and writes the text as the agent, then renames it into place. Each answer also sweeps files there older than a minute: an answer that came after its call gave up. A job's child gets `not available in scheduled runs`. rpi 0.15.0 keeps reading commands while the call waits (`rpi_load` checks `get_state` mid-call).
   - The agent can write `.gateway/` too, so it can fake an answer to its own call; that fools only itself, as every answer is read-only and a proposal is stored from rpi's event stream, not from the file.
 
+- **`recall {query}`, or `{session, around, include?}`**, answered in the plugin (`tools.rs`) with no daemon round trip. It reads the rpi session files under `$ZEPHYR_SESSIONS_DIR`, which `rpc::spawn_as` sets in every child, so jobs and tasks have it too. Only user and assistant text counts: no records, tool results or non-text blocks. `query` finds the messages with every word in them, case-insensitively: at most 10, ranked by occurrences then recency, each with its session, ISO time, role, entry id and a 200-character excerpt around the first hit. `session` with `around` (an entry id from a hit) returns the 5 messages either side, each cut to 2000 characters and 12000 in all, the entry itself kept. Job and task sessions (`job-*`, `task-*`) are left out unless `include` is `"all"`, for `around` too. An unknown session, an unknown entry or no match is an error the agent sees. Shortcut: a linear scan of every session file; a SQLite FTS5 index once `sessions/` grows past about 200 MB.
+
 ### 4.12 Background tasks
 
 The owner should be able to talk to the agent while it works. rpi runs one prompt at a time and 0.15 cannot steer a running one (§4.1), so the agent hands long work to a child of its own and keeps its turns short, as Hermes's `delegate_task` and OpenClaw's `sessions_spawn` do. We copy Hermes: the result comes back into the main session as a new turn, delivered durably, and a task cut off by a crash is `unknown`, never retried, the same rule as job runs (§4.5).
@@ -448,7 +450,7 @@ New repo `yansigit/zephyr` (private), local at `/home/user/Projects/zephyr`, a R
 
 ```
 crates/zephyr/          daemon: router, session manager, store, scheduler, auth keeper, adapters, attach server
-crates/zephyr-policy/   cdylib rpi plugin: tool-call veto, audit, the send_file, schedule, gateway, task, exec and process tools (§4.11–§4.13)
+crates/zephyr-policy/   cdylib rpi plugin: tool-call veto, audit, the send_file, schedule, gateway, task, recall, exec and process tools (§4.11–§4.13)
 crates/zephyr-cursor/   cdylib rpi plugin: the Cursor agent-service provider, tools over MCP (§4.7.2)
 deploy/                 Dockerfile, zephyr.toml.example (host commands: crates/zephyr/src/host/)
 ```
