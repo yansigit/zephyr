@@ -1223,17 +1223,17 @@ mod tests {
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(got.len(), 8);
         assert_eq!(got[2], format!("│ Chat{}│", " ".repeat(73)));
-        assert!(got[7].ends_with(" 1-5 of 35 ─╯"), "{got:?}");
-        for _ in 0..15 {
+        assert!(got[7].ends_with(" 1-5 of 48 ─╯"), "{got:?}");
+        for _ in 0..21 {
             key(&mut o, press(KeyCode::Down), &rows);
         }
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
-        // The sixteenth command is /memory ok; the window follows it down.
+        // The twenty-second command is /memory ok; the window follows it down.
         assert_eq!(
             got[6],
-            "│  › /memory ok               let the agent see the waiting change             │"
+            "│  › /memory ok                  let the agent see the waiting change          │"
         );
-        assert!(got[7].ends_with(" 15-19 of 35 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 21-25 of 48 ─╯"), "{got:?}");
         key(&mut o, press(KeyCode::Down), &rows);
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),
@@ -1268,7 +1268,7 @@ mod tests {
         assert_eq!(picks, ["/new", "/rules", "/rule ", "/rule rm "]);
     }
 
-    /// The memory and job commands in the list are the ones those modules answer.
+    /// The memory, skill, connector and job commands in the list are the ones those modules answer.
     #[test]
     fn listed_commands_are_the_ones_zephyr_answers() {
         let dir = crate::test_dir("tui-commands");
@@ -1280,7 +1280,10 @@ mod tests {
                 .replace("<id>", "1")
                 .replace("<text>", "x");
             let answered = match *group {
-                "Memory" => crate::memory::command(&dir, &dir, &text).is_some(),
+                "Memory" => {
+                    crate::memory::command(&dir, &dir, &text).is_some()
+                        || crate::drafts::command(&cfg, &text).is_some()
+                }
                 "Schedule" => {
                     let m = crate::channel::Inbound {
                         channel: "tui".into(),
