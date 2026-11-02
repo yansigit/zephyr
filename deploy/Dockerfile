@@ -61,7 +61,8 @@ FROM toolchain AS rust
 COPY Cargo.toml Cargo.lock /src/zephyr/
 COPY crates /src/zephyr/crates
 COPY --from=rpi-package / /src/rpi-package
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+# sharing=locked: the rust and plugins stages run at once and would unpack the same crate into this cache together.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cd /src/zephyr && cargo build --release --locked -p zephyr -p zephyr-policy -p zephyr-cursor \
     && cd /src/rpi-package && cargo build --release --locked -p rpi-providers -p rpi-mcp-adapter \
     && mkdir -p /out/bin /out/lib /out/ext \
@@ -77,7 +78,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM toolchain AS plugins
 COPY --from=provider-plugins / /src/plugins
 WORKDIR /src/plugins
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/root/.npm \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked --mount=type=cache,target=/root/.npm \
     packages/rpi-claude-agent/scripts/stage.sh /out/ext/rpi-claude-agent
 
 # The pinned upstream rpi release, checked against its published sha256.
