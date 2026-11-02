@@ -971,7 +971,9 @@ fn version_names_the_cli_and_the_running_container() {
     );
     let older = stdout(&env.zephyr_env(&["-V"], &[("SHIM_VERSION", "0.0.1")]));
     assert!(
-        older.ends_with(": 0.0.1 (`zephyr upgrade` moves it to this CLI's version)\n"),
+        older.ends_with(
+            ": 0.0.1 (not this CLI's; `zephyr upgrade` brings both to the newest release)\n"
+        ),
         "{older}"
     );
     // An image without --version is named by its image instead.

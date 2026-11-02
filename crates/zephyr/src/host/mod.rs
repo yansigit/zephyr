@@ -73,7 +73,7 @@ pub fn container_version() {
     let hint = if theirs == env!("CARGO_PKG_VERSION") {
         ""
     } else {
-        " (`zephyr upgrade` moves it to this CLI's version)"
+        " (not this CLI's; `zephyr upgrade` brings both to the newest release)"
     };
     println!("container {}: {theirs}{hint}", h.container);
 }
