@@ -30,9 +30,11 @@ const USAGE: &str = "[zephyr] usage: /rollback, /rollback diff <n>, /rollback <n
 const OFF: &str = "[zephyr] /rollback is off: this container was started without \
     ZEPHYR_PROJECTS; recreate it with `zephyr up`";
 
-/// One snapshot at a time: the router and background runs take them side by side.
-static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// One snapshot at a time per store: the router and background runs take them side by side.
+type Lock = std::sync::Arc<tokio::sync::Mutex<()>>;
+static LOCKS: std::sync::Mutex<Vec<(PathBuf, Lock)>> = std::sync::Mutex::new(Vec::new());
 
+#[derive(Clone)]
 pub struct Checkpoints {
     store: PathBuf,
     projects: PathBuf,
@@ -89,21 +91,44 @@ impl Checkpoints {
         }
     }
 
+    /// The store's lock.
+    fn lock(&self) -> Lock {
+        let mut locks = LOCKS.lock().unwrap();
+        if let Some((_, l)) = locks.iter().find(|(p, _)| *p == self.store) {
+            return l.clone();
+        }
+        let l = Lock::default();
+        locks.push((self.store.clone(), l.clone()));
+        l
+    }
+
     pub fn of(cfg: &Config) -> Option<Self> {
         cfg.projects.as_deref().map(|p| Self::new(&cfg.home, p))
     }
 
-    /// Commits every project that changed since its last checkpoint, killing git after `limit`.
+    /// Commits every project that changed since its last checkpoint, waiting at most `limit`. A
+    /// snapshot still going then (the first one over a big folder) finishes in the background
+    /// rather than being killed, so the next one only has to look at what changed since.
     /// Returns the projects committed.
     pub async fn snapshot(&self, why: &str, limit: Duration) -> anyhow::Result<Vec<String>> {
-        let work = async {
-            let _one = LOCK.lock().await;
-            self.snap(why).await
+        let Ok(one) =
+            tokio::time::timeout(limit.min(Duration::from_secs(1)), self.lock().lock_owned()).await
+        else {
+            bail!("the previous snapshot is still running");
         };
-        // Dropping the work kills its git (`kill_on_drop`); the next snapshot clears its locks.
-        tokio::time::timeout(limit, work)
-            .await
-            .map_err(|_| anyhow!("timed out after {} s, git was stopped", limit.as_secs()))?
+        let (cp, why) = (self.clone(), why.to_string());
+        let work = tokio::spawn(async move {
+            let _one = one;
+            cp.snap(&why).await
+        });
+        match tokio::time::timeout(limit, work).await {
+            Ok(done) => done?,
+            Err(_) => bail!(
+                "still running after {} s; it finishes in the background and may hold this \
+                 run's first changes",
+                limit.as_secs()
+            ),
+        }
     }
 
     /// Runs `work` holding the store, for at most `LIMIT`.
@@ -112,7 +137,7 @@ impl Checkpoints {
         work: impl std::future::Future<Output = anyhow::Result<String>>,
     ) -> anyhow::Result<String> {
         let work = async {
-            let _one = LOCK.lock().await;
+            let _one = self.lock().lock_owned().await;
             work.await
         };
         tokio::time::timeout(LIMIT, work)
@@ -218,12 +243,15 @@ impl Checkpoints {
             .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
             .filter_map(|e| e.file_name().into_string().ok())
             .filter(|n| named(n))
+            // Only repos: a folder without .git has no .gitignore either, and is often data (a
+            // game world, model weights) far too big to copy at every run.
+            .filter(|n| self.projects.join(n).join(".git").exists())
             .collect();
         names.sort();
         names
     }
 
-    /// Locks a killed git left behind. Only called holding `LOCK`, so none is live.
+    /// Locks a killed git left behind. Only called holding the store's lock, so none is live.
     fn clear_locks(&self, project: &str) {
         let _fs = crate::agent::fs();
         let index = self.store.join(format!("index-{project}.lock"));
@@ -398,7 +426,7 @@ impl Checkpoints {
     /// after a checkpoint of how they are now, so `/rollback 1` undoes it. Files ignored by the
     /// store or a project's `.gitignore` are left alone.
     async fn restore(&self, n: usize, only: Option<&str>) -> anyhow::Result<String> {
-        let _one = tokio::time::timeout(LIMIT, LOCK.lock())
+        let _one = tokio::time::timeout(LIMIT, self.lock().lock_owned())
             .await
             .map_err(|_| anyhow!("a checkpoint is being taken; try again"))?;
         // N names a checkpoint as listed before the one taken below.
@@ -469,7 +497,7 @@ impl Checkpoints {
     /// (no file is stored again), then git drops the rest. Skipped while a snapshot runs.
     /// Returns how many checkpoints went.
     pub fn prune(&self, keep: usize) -> anyhow::Result<usize> {
-        let Ok(_one) = LOCK.try_lock() else {
+        let Ok(_one) = self.lock().try_lock_owned() else {
             return Ok(0);
         };
         if !self.started() {
@@ -588,7 +616,7 @@ mod tests {
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = crate::test_dir(&format!("checkpoint-{n}"));
         let projects = dir.join("projects");
-        std::fs::create_dir_all(projects.join("app")).unwrap();
+        std::fs::create_dir_all(projects.join("app/.git")).unwrap();
         std::fs::create_dir_all(projects.join(".hidden")).unwrap();
         (Checkpoints::new(&dir, &projects), projects.join("app"))
     }
@@ -694,7 +722,7 @@ mod tests {
     async fn one_project_rolls_back_alone_and_a_deleted_one_comes_back() {
         let (cp, app) = setup();
         let web = app.parent().unwrap().join("web");
-        std::fs::create_dir_all(&web).unwrap();
+        std::fs::create_dir_all(web.join(".git")).unwrap();
         std::fs::write(app.join("a"), "1").unwrap();
         std::fs::write(web.join("w"), "1").unwrap();
         cp.snapshot("before: x", LIMIT).await.unwrap();
@@ -737,20 +765,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_timeout_kills_git_and_the_next_snapshot_works() {
+    async fn a_slow_snapshot_finishes_in_the_background() {
         let (cp, app) = setup();
         std::fs::write(app.join("a"), "1").unwrap();
         let e = cp
             .snapshot("before: x", Duration::from_millis(1))
             .await
             .unwrap_err();
-        assert!(e.to_string().contains("timed out"), "{e:#}");
-        // A killed git can leave its locks behind.
-        cp.init().unwrap();
+        assert!(e.to_string().contains("background"), "{e:#}");
+        while cp.lock().try_lock_owned().is_err() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // It was committed, not killed: the next one finds nothing new.
+        assert!(cp.snapshot("before: y", LIMIT).await.unwrap().is_empty());
+        assert!(say(&cp, "").await.contains("\"x\""));
+        // A git killed by a daemon crash can leave its locks behind.
         std::fs::write(cp.store.join("index-app.lock"), "").unwrap();
-        std::fs::create_dir_all(cp.store.join("refs/zephyr")).unwrap();
         std::fs::write(cp.store.join("refs/zephyr/app.lock"), "").unwrap();
-        assert_eq!(cp.snapshot("before: y", LIMIT).await.unwrap(), ["app"]);
+        std::fs::write(app.join("a"), "2").unwrap();
+        assert_eq!(cp.snapshot("before: z", LIMIT).await.unwrap(), ["app"]);
+    }
+
+    #[tokio::test]
+    async fn folders_that_are_not_repos_are_left_out() {
+        let (cp, app) = setup();
+        let data = app.parent().unwrap().join("world");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("region.dat"), "big").unwrap();
+        std::fs::write(app.join("a"), "1").unwrap();
+        assert_eq!(cp.snapshot("before: x", LIMIT).await.unwrap(), ["app"]);
     }
 
     #[tokio::test]

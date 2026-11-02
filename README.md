@@ -185,7 +185,7 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
 - **Earlier conversations.** The agent can search what was said before `/new` with its `recall`
   tool, and read around a hit. Task and scheduled job runs are left out unless it asks for them.
 - **Undoing file changes.** Before each run (a message, a task, a job) zephyr takes a checkpoint of
-  every folder in your projects folder that changed since the last one (`node_modules/`,
+  every git repo in your projects folder that changed since the last one (folders without `.git` are left out) (`node_modules/`,
   `target/`, `.venv/`, `dist/`, `build/`, `*.log`, `.env*` and what a project's `.gitignore`
   ignores are skipped). `/rollback` lists the newest 10, `/rollback diff N` shows what changed
   since checkpoint N, and `/rollback N [PROJECT]` puts the files back as they were then: changed

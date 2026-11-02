@@ -2758,7 +2758,7 @@ async fn undo_retry_and_compact_wait_for_the_run() {
 async fn a_rollback_waits_until_nothing_runs_then_restores_the_projects() {
     let home = home("rollback");
     let app = home.join("projects/app");
-    std::fs::create_dir_all(&app).unwrap();
+    std::fs::create_dir_all(app.join(".git")).unwrap();
     std::fs::write(app.join("a.txt"), "before").unwrap();
     let mut cfg = config(&home);
     cfg.projects = Some(home.join("projects"));
