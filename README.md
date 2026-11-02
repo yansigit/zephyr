@@ -165,6 +165,8 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   a container restart ends them, and they are reported. A stopped task reports how far it got.
   Old job and task sessions and process logs are deleted after 30 days. A run that makes
   no progress for 10 minutes (20 inside a command) is stopped and you are told.
+- **Earlier conversations.** The agent can search what was said before `/new` with its `recall`
+  tool, and read around a hit. Task and scheduled job runs are left out unless it asks for them.
 
 A site's terms may forbid automated use; a site that catches the agent can flag the account it is
 signed in as.

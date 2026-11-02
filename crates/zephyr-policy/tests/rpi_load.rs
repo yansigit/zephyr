@@ -519,6 +519,7 @@ fn other_children_keep_bash_and_get_no_exec() {
     rpi.next(|v| v["type"] == "agent_settled");
     let seen = rpi.seen.lock().unwrap().clone();
     assert!(seen[0].contains("\"name\":\"bash\""), "{}", seen[0]);
+    assert!(seen[0].contains("\"name\":\"recall\""), "{}", seen[0]);
     assert!(!seen[0].contains("\"name\":\"exec\""), "{}", seen[0]);
 }
 

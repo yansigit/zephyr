@@ -68,9 +68,10 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   `rpi --connect` attaches to `main`).
 - The agent's tools (DESIGN §4.11): the browser, Camoufox and the X desktop are CLIs in the image,
   run through `bash`. `desktop.rs` keeps Xvfb up when `ZEPHYR_DESKTOP` is set. `send_file`,
-  `schedule`, `gateway` and `task` are registered by zephyr-policy (`tools.rs`). The first two are
-  collected from the event stream in `rpc::Tally` and carried out at settle by `tools.rs` here;
-  `gateway` and `task` are answered mid-turn through a file.
+  `schedule`, `gateway`, `task` and `recall` are registered by zephyr-policy (`tools.rs`). The first
+  two are collected from the event stream in `rpc::Tally` and carried out at settle by `tools.rs`
+  here; `gateway` and `task` are answered mid-turn through a file, and `recall` reads the session
+  files itself (`ZEPHYR_SESSIONS_DIR`).
 
 Child restarts never happen mid-turn: auth refresh, failover and reload all wait for the settle.
 
