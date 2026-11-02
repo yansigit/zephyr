@@ -222,6 +222,13 @@ pub async fn execute(
     spec: &Spec<'_>,
 ) -> (&'static str, String, bool) {
     let label = &spec.label;
+    // The projects as they were before this run (DESIGN §4.14); a resumed run has one.
+    if !spec.resume {
+        let goal = spec.prompt.strip_prefix(crate::tasks::BRIEF);
+        let what = label.strip_prefix("[zephyr] ").unwrap_or(label);
+        let text = format!("{what}: {}", goal.unwrap_or(spec.prompt));
+        crate::checkpoint::before(cfg, &text).await;
+    }
     // A job runs on the first account not cooling down. A rate-limited attempt cools that
     // account and retries on the next one, in a fresh session; each account is tried once.
     let mut crossed = false;

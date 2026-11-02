@@ -2753,3 +2753,43 @@ async fn undo_retry_and_compact_wait_for_the_run() {
     gw.wait_replies(5).await;
     gw.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_rollback_waits_until_nothing_runs_then_restores_the_projects() {
+    let home = home("rollback");
+    let app = home.join("projects/app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join("a.txt"), "before").unwrap();
+    let mut cfg = config(&home);
+    cfg.projects = Some(home.join("projects"));
+    std::fs::write(home.join("hang"), "").unwrap();
+    let gw = start(cfg);
+    gw.say("m1", "owner", "long job").await;
+    wait(|| !home.join("hang").exists()).await; // mid-run, with its checkpoint taken
+    std::fs::write(app.join("a.txt"), "the run's edit").unwrap();
+
+    gw.say("m2", "owner", "/rollback").await;
+    let list = gw.wait_replies(1).await.remove(0);
+    assert!(
+        list.contains(", before \"long job\", app (1 files changed since)"),
+        "{list}"
+    );
+    gw.say("m3", "owner", "/rollback 1").await;
+    assert_eq!(
+        gw.wait_replies(2).await[1],
+        "[zephyr] not rolled back: a run still running; /stop them first"
+    );
+    let a = || std::fs::read_to_string(app.join("a.txt")).unwrap();
+    assert_eq!(a(), "the run's edit");
+
+    gw.say("m4", "owner", "/stop").await;
+    gw.wait_replies(4).await; // the stop notice, then the aborted run's fallback reply
+    gw.say("m5", "owner", "/rollback 1").await;
+    let reply = gw.wait_replies(5).await.remove(4);
+    assert!(
+        reply.starts_with("[zephyr] rolled back app to #1"),
+        "{reply}"
+    );
+    assert_eq!(a(), "before");
+    gw.shutdown().await;
+}

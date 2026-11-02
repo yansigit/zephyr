@@ -37,6 +37,14 @@ pub fn sweep(cfg: &Config, store: &Store, age: Duration) -> rusqlite::Result<usi
         id.is_some_and(|id| !tasks.contains(&id))
     });
     gone += remove_old(&cfg.home.join("inbox"), age, inbox_file);
+    // The projects' checkpoints: the newest 50 of each (DESIGN §4.14).
+    if let Some(cp) = crate::checkpoint::Checkpoints::of(cfg) {
+        match cp.prune(crate::checkpoint::KEEP) {
+            Ok(0) => {}
+            Ok(n) => eprintln!("zephyr: pruned {n} old checkpoints of the projects"),
+            Err(e) => eprintln!("zephyr: pruning checkpoints failed: {e:#}"),
+        }
+    }
     Ok(gone)
 }
 

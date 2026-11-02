@@ -7,6 +7,7 @@ pub mod auth_keeper;
 pub mod btw;
 pub mod channel;
 pub mod chat;
+pub mod checkpoint;
 pub mod config;
 pub mod desktop;
 pub mod discord;
