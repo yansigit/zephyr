@@ -249,6 +249,7 @@ pub async fn run<C: Channel>(
         note_pending: false,
         cut: None,
         procs: Default::default(),
+        compacting: None,
     };
     // Commands a re-exec handed over alive are adopted; the rest a dead gateway left running
     // are reported, never re-run (DESIGN §4.13).
@@ -431,7 +432,12 @@ struct Router<'a> {
     /// The run that just settled ended `completed`: only such a run's rows may be continued.
     /// Set by `settled` for the one `reconcile` that follows; never after an abort or a failure.
     run_completed: bool,
+    /// A `/compact` is running: `(channel, sender)` of who asked, told its summary at the settle.
+    compacting: Option<(String, String)>,
 }
+
+/// The reply to `/undo`, `/retry` and `/compact` while a run is going: they need the agent idle.
+const BUSY: &str = "[zephyr] the agent is busy: wait for its reply, or /stop it first";
 
 async fn next_event(child: &mut Option<Child>) -> Option<Value> {
     match child {
@@ -872,6 +878,10 @@ impl<'a> Router<'a> {
         update(&self.snap, |s| s.run = Run::default());
         self.run_start = None;
         self.cut = None;
+        if let Some((channel, to)) = self.compacting.take() {
+            let text = "[zephyr] /compact was cut off: the agent restarted";
+            log(self.store.notify(&channel, &to, text).map_err(Into::into));
+        }
         self.schedule_respawn();
     }
 
@@ -952,6 +962,9 @@ impl<'a> Router<'a> {
         let (Some(start), None) = (self.run_start, &self.cut) else {
             return;
         };
+        if self.guard_run().await {
+            return;
+        }
         let budget = self.cfg.budget.as_ref();
         let over = budget.and_then(|b| b.run_over(self.tally.turns, start.elapsed()));
         let over = over.map(|why| format!("[zephyr] stopped the run after {why}"));
@@ -1076,6 +1089,7 @@ impl<'a> Router<'a> {
         self.busy = false;
         self.run_start = None;
         let cut = self.cut.take();
+        self.compacted(ev);
         // Before reconcile dispatches the next row, so that row runs on the new model.
         self.apply_model().await;
         self.backoff = FIRST_BACKOFF;
@@ -1199,6 +1213,15 @@ impl<'a> Router<'a> {
                 Some(Ok(id)) => crate::tasks::stop(&mut self.store, self.jobs, Some(id)),
                 _ => "[zephyr] usage: /task list, /task stop <id>".into(),
             },
+            ("/undo", "") => match self.undo_last().await {
+                Ok(_) => "[zephyr] undone: the agent no longer sees your last message or its \
+                          reply; files it changed stay changed (see /rollback)"
+                    .into(),
+                Err(reply) => reply,
+            },
+            ("/retry", "") => self.retry().await,
+            ("/compact", instructions) => self.compact(instructions, from).await,
+            ("/usage", days) => self.usage(days),
             _ => return None,
         })
     }
@@ -2002,6 +2025,172 @@ impl<'a> Router<'a> {
             Some(c) => c.call(cmd).await,
             None => anyhow::bail!("rpi child is not running"),
         }
+    }
+
+    /// The repeated-failure guard (DESIGN §4.4): at `GUARD_STEER` identical failures in a row a
+    /// note is steered in, at `GUARD_STOP` the run is stopped. True when it stopped the run.
+    async fn guard_run(&mut self) -> bool {
+        match self.tally.guard() {
+            Some(crate::rpc::Guard::Steer(note)) => {
+                eprintln!("zephyr: {note}");
+                let steer = json!({"type": "queue_message", "message": note, "deliverAs": "steer"});
+                log(self.call(steer).await.map(drop));
+                // Not the owner's message: `reconcile` never takes it for the run's request.
+                self.steered_texts.insert(note);
+                // A run that ends before reaching it would leave it to open the next run: the
+                // settle takes it back, as it does the resume note.
+                self.note_pending = true;
+                false
+            }
+            Some(crate::rpc::Guard::Stop(why)) => {
+                let notice = format!("[zephyr] stopped a run that {why}");
+                eprintln!("zephyr: {notice}");
+                self.cut = Some(notice);
+                log(self.call(json!({"type": "abort"})).await.map(drop));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `/undo` (DESIGN §4.1), idle only: takes the last exchange out of the agent's context.
+    /// rpi's `navigate` puts the session leaf on its target, which stays, so the target is the
+    /// entry just before the run's own message (none: the root, an empty context). The run's
+    /// rows become `undone`, so recovery never sends them again. Returns the run's own row, or
+    /// the reply saying why nothing was undone.
+    async fn undo_last(&mut self) -> Result<InboxRow, String> {
+        if self.busy {
+            return Err(BUSY.into());
+        }
+        let failed = |e: &dyn std::fmt::Display| format!("[zephyr] /undo failed: {e:#}");
+        let row = match self.store.last_run() {
+            Ok(Some(row)) => row,
+            Ok(None) => return Err("[zephyr] nothing to undo".into()),
+            Err(e) => return Err(failed(&e)),
+        };
+        let snap = (self.call(json!({"type": "get_messages"})).await).map_err(|e| failed(&e))?;
+        let messages = snap["messages"].as_array().map_or(&[][..], Vec::as_slice);
+        // Its first form: a continuation goes again under the same row, after it.
+        let text = tagged(&row);
+        let Some(at) =
+            (messages.iter()).rposition(|m| m["kind"] == "user" && message_text(m) == text)
+        else {
+            return Err(
+                "[zephyr] nothing to undo: your last message is no longer in the \
+                        conversation (a /compact or /new since?)"
+                    .into(),
+            );
+        };
+        let mut navigate = json!({"type": "navigate"});
+        if let Some(id) = messages[..at]
+            .iter()
+            .rev()
+            .find_map(|m| m["entryId"].as_str())
+        {
+            navigate["targetId"] = json!(id);
+        }
+        let moved = self.call(navigate).await.map_err(|e| failed(&e))?;
+        if moved["outcome"] != "completed" {
+            return Err(failed(&format!("rpi answered {moved}")));
+        }
+        self.store.mark_undone(row.id).map_err(|e| failed(&e))?;
+        Ok(row)
+    }
+
+    /// `/retry`: `/undo`, then the same text again as a new row on the same channel and sender,
+    /// platform id `retry-<row>-<n>`, dispatched like any message.
+    async fn retry(&mut self) -> String {
+        let row = match self.undo_last().await {
+            Ok(row) => row,
+            Err(reply) => return reply,
+        };
+        let mut n = 1;
+        let id = loop {
+            let again = Inbound {
+                channel: row.channel.clone(),
+                platform_msg_id: format!("retry-{}-{n}", row.id),
+                sender: row.sender.clone(),
+                text: row.text.clone(),
+            };
+            match self.store.insert_inbox(&again) {
+                Ok(Some(id)) => break id,
+                Ok(None) => n += 1,
+                Err(e) => return format!("[zephyr] undone, but not sent again: {e}"),
+            }
+        };
+        // Dispatched from the loop, as a task's report is: this `/retry` row is still `new`.
+        self.jobs.inbox.notify_one();
+        format!("[zephyr] undone; sending your last message again as #{id}")
+    }
+
+    /// `/compact [instructions]`, idle only: rpi summarises the conversation in a run of its own,
+    /// and its settle (`compacted`) tells the asker the summary. Returns "" when it will.
+    async fn compact(&mut self, instructions: &str, from: (&str, &str)) -> String {
+        if self.busy {
+            return BUSY.into();
+        }
+        let mut cmd = json!({"type": "compact"});
+        if !instructions.is_empty() {
+            cmd["customInstructions"] = json!(instructions);
+        }
+        if let Err(e) = self.call(cmd).await {
+            return format!("[zephyr] /compact failed: {e:#}");
+        }
+        self.busy = true;
+        self.run_start = Some(Instant::now());
+        self.compacting = Some((from.0.into(), from.1.into()));
+        String::new()
+    }
+
+    /// At a settle: the summary of a `/compact`, to whoever asked for it.
+    fn compacted(&mut self, ev: &Value) {
+        let Some((channel, to)) = self.compacting.take() else {
+            return;
+        };
+        let text = match (ev["outcome"].as_str(), ev["summary"].as_str()) {
+            (Some("compacted"), Some(summary)) => format!("[zephyr] {summary}"),
+            (Some("compacted"), None) => "[zephyr] compacted".into(),
+            (outcome, _) => format!(
+                "[zephyr] /compact {}: {}",
+                outcome.unwrap_or("ended"),
+                ev["error"].as_str().unwrap_or("no reason given")
+            ),
+        };
+        log(self.store.notify(&channel, &to, &text).map_err(Into::into));
+    }
+
+    /// `/usage [days]` (default 7): spend per UTC day, newest first, with each account's share.
+    fn usage(&self, days: &str) -> String {
+        let days = match days {
+            "" => 7,
+            days => match days.parse::<u32>() {
+                Ok(n @ 1..=366) => n,
+                _ => return "[zephyr] usage: /usage [days], 1 to 366 (default 7)".into(),
+            },
+        };
+        let (totals, accounts) = match self.store.usage(days) {
+            Ok(usage) => usage,
+            Err(e) => return format!("[zephyr] /usage failed: {e}"),
+        };
+        let plural = if days == 1 { "" } else { "s" };
+        let mut lines = vec![format!(
+            "[zephyr] usage over the last {days} day{plural} (UTC):"
+        )];
+        if totals.is_empty() {
+            lines.push("nothing spent".into());
+        }
+        let (mut tokens, mut cost) = (0, 0.0);
+        for (day, t, c) in &totals {
+            lines.push(format!("{day}: {t} tokens, ${c:.4}"));
+            for (_, account, t, c) in accounts.iter().filter(|a| &a.0 == day) {
+                lines.push(format!("  {account}: {t} tokens, ${c:.4}"));
+            }
+            (tokens, cost) = (tokens + t, cost + c);
+        }
+        if totals.len() > 1 {
+            lines.push(format!("total: {tokens} tokens, ${cost:.4}"));
+        }
+        lines.join("\n")
     }
 }
 

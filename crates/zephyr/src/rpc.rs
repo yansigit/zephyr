@@ -151,6 +151,8 @@ pub const USED_COMMANDS: &[&str] = &[
     "get_auth_status",
     "set_model",
     "stop",
+    "compact",
+    "navigate",
 ];
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
@@ -367,7 +369,34 @@ pub struct Tally {
     pub requests: Vec<(String, Value)>,
     /// Those calls between their start and end, by tool call id.
     started: std::collections::HashMap<String, (String, Value)>,
+    /// Every tool call between its start and end, as `(tool, its args)`, for the guard.
+    calls: std::collections::HashMap<String, (String, String)>,
+    /// The same call failing with the same error, in a row (DESIGN §4.4).
+    streak: Streak,
 }
+
+/// Identical failures in a row: the call (tool and args), the error's first line, how many,
+/// and the count the guard last acted on.
+#[derive(Debug, Default)]
+struct Streak {
+    call: (String, String),
+    error: String,
+    count: u32,
+    acted: u32,
+}
+
+/// What the repeated-failure guard asks of a run (DESIGN §4.4).
+#[derive(Debug, PartialEq)]
+pub enum Guard {
+    /// Steer this note into the run.
+    Steer(String),
+    /// Stop the run; the text says why.
+    Stop(String),
+}
+
+/// Identical failures in a row before the guard steers a note in, and before it stops the run.
+pub const GUARD_STEER: u32 = 3;
+pub const GUARD_STOP: u32 = 5;
 
 impl Tally {
     pub fn add(&mut self, ev: &Value) {
@@ -391,6 +420,7 @@ impl Tally {
                 self.requests.extend(call.filter(|_| ev["isError"] != true));
             }
         }
+        self.follow_failures(ev);
         // From rpi, not from anything the agent writes, so the agent cannot hide a send.
         let shell = matches!(ev["toolName"].as_str(), Some("bash" | "exec"));
         if ev["type"] == "tool_execution_start" && shell {
@@ -398,6 +428,61 @@ impl Tally {
                 self.outbound
                     .extend(zephyr_policy::policy::outbound(command));
             }
+        }
+    }
+
+    /// Keys each tool result on its tool, args and the error's first line: the same failure
+    /// lengthens the streak, any other result ends it.
+    fn follow_failures(&mut self, ev: &Value) {
+        let (Some(id), Some(tool)) = (ev["toolCallId"].as_str(), ev["toolName"].as_str()) else {
+            return;
+        };
+        if ev["type"] == "tool_execution_start" {
+            let args = ev["args"].to_string();
+            self.calls.insert(id.into(), (tool.into(), args));
+            return;
+        }
+        if ev["type"] != "tool_execution_end" {
+            return;
+        }
+        let call = (self.calls.remove(id)).unwrap_or_else(|| (tool.into(), String::new()));
+        if ev["isError"] != true {
+            self.streak = Streak::default();
+            return;
+        }
+        let text = message_text(&ev["result"]);
+        let error = text.lines().next().unwrap_or_default().trim().to_string();
+        if self.streak.count > 0 && self.streak.call == call && self.streak.error == error {
+            self.streak.count += 1;
+        } else {
+            self.streak = Streak {
+                call,
+                error,
+                count: 1,
+                acted: 0,
+            };
+        }
+    }
+
+    /// What the repeated-failure guard asks for now, at most once per failure: a note at
+    /// `GUARD_STEER` identical failures in a row, a stop at `GUARD_STOP`.
+    pub fn guard(&mut self) -> Option<Guard> {
+        let s = &mut self.streak;
+        if s.count == s.acted {
+            return None;
+        }
+        s.acted = s.count;
+        let tool = &s.call.0;
+        match s.count {
+            GUARD_STEER => Some(Guard::Steer(format!(
+                "[zephyr] {tool} failed {GUARD_STEER} times in a row with the same error ({}). \
+                 Don't retry it unchanged: change approach, or stop and tell the owner.",
+                s.error
+            ))),
+            n if n >= GUARD_STOP => Some(Guard::Stop(format!(
+                "repeated a failing {tool} call {GUARD_STOP} times"
+            ))),
+            _ => None,
         }
     }
 
@@ -493,6 +578,49 @@ mod tests {
         assert_eq!(
             tally.requests,
             [("send_file".to_string(), serde_json::json!({"path": "a"}))]
+        );
+    }
+
+    #[test]
+    fn the_guard_counts_only_the_same_failure_in_a_row() {
+        let mut tally = Tally::default();
+        let mut n = 0;
+        let mut call = |tally: &mut Tally, path: &str, error: Option<&str>| {
+            n += 1;
+            let id = format!("c{n}");
+            tally.add(
+                &serde_json::json!({"type": "tool_execution_start", "toolCallId": id,
+                                          "toolName": "read", "args": {"path": path}}),
+            );
+            tally.add(
+                &serde_json::json!({"type": "tool_execution_end", "toolCallId": id,
+                "toolName": "read", "isError": error.is_some(),
+                "result": {"content": [{"type": "text", "text": error.unwrap_or("ok")}]}}),
+            );
+            tally.guard()
+        };
+        let missing = Some("no such file\nat line 2");
+        // Two, then a success, then another path: neither streak reaches 3.
+        assert_eq!(call(&mut tally, "a", missing), None);
+        assert_eq!(call(&mut tally, "a", missing), None);
+        assert_eq!(call(&mut tally, "a", None), None);
+        assert_eq!(call(&mut tally, "a", missing), None);
+        assert_eq!(call(&mut tally, "b", missing), None);
+        assert_eq!(call(&mut tally, "b", Some("denied")), None);
+        assert_eq!(call(&mut tally, "b", Some("denied")), None);
+        let Some(Guard::Steer(note)) = call(&mut tally, "b", Some("denied")) else {
+            panic!("no note at 3");
+        };
+        assert_eq!(
+            note,
+            "[zephyr] read failed 3 times in a row with the same error (denied). Don't retry it \
+             unchanged: change approach, or stop and tell the owner."
+        );
+        assert_eq!(tally.guard(), None, "acted on once");
+        assert_eq!(call(&mut tally, "b", Some("denied")), None);
+        assert_eq!(
+            call(&mut tally, "b", Some("denied")),
+            Some(Guard::Stop("repeated a failing read call 5 times".into()))
         );
     }
 

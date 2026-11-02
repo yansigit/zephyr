@@ -452,6 +452,7 @@ async fn follow(
     max_turns: Option<u32>,
 ) -> anyhow::Result<anyhow::Result<String>> {
     let mut cut = None;
+    let mut guarded: Option<String> = None;
     let mut in_tool = 0usize;
     let settled = loop {
         let limit = cfg.stall_limit * if in_tool > 0 { 2 } else { 1 };
@@ -484,6 +485,19 @@ async fn follow(
                     cut = max_turns;
                     child.call(json!({"type": "abort"})).await?;
                 }
+                // The repeated-failure guard, as for main (DESIGN §4.4).
+                match tally.guard() {
+                    Some(crate::rpc::Guard::Steer(note)) => {
+                        let steer =
+                            json!({"type": "queue_message", "message": note, "deliverAs": "steer"});
+                        let _ = child.call(steer).await;
+                    }
+                    Some(crate::rpc::Guard::Stop(why)) if guarded.is_none() => {
+                        guarded = Some(why);
+                        child.call(json!({"type": "abort"})).await?;
+                    }
+                    _ => {}
+                }
             }
             None => anyhow::bail!("rpi exited mid-run"),
         }
@@ -492,6 +506,9 @@ async fn follow(
         return Ok(Err(anyhow::anyhow!(
             "stopped after {max} turns (budget.run_turns)"
         )));
+    }
+    if let Some(why) = guarded {
+        return Ok(Err(anyhow::anyhow!("stopped: {why}")));
     }
     let snap = child.call(json!({"type": "get_messages"})).await?;
     let reply = snap["messages"]

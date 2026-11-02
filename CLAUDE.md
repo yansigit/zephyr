@@ -73,6 +73,10 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   `gateway` and `task` are answered mid-turn through a file.
 
 Child restarts never happen mid-turn: auth refresh, failover and reload all wait for the settle.
+`/undo`, `/retry` and `/compact` (router, DESIGN §4.1) need the child idle too: `navigate` moves the
+session leaf, `compact` is a run of its own that settles `compacted`, and undone rows get inbox status
+`undone`. `rpc::Tally` also runs the repeated-failure guard (DESIGN §4.4) for main (`cap_run`) and
+for tasks and jobs (`scheduler::follow`).
 
 **`crates/zephyr-policy`** is a cdylib rpi plugin loaded with `--extension`. Its `ToolCall` handler
 vetoes hardline commands (`policy.rs` `check`) and appends audit lines to `$ZEPHYR_AUDIT_LOG`. It fails

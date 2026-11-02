@@ -75,6 +75,11 @@ starts a fresh conversation (memory and rules carry over; the old one stays in `
 `/switch` lists the earlier ones and `/switch ID` goes back to one.
 `/btw QUESTION` asks a side question about the conversation, even mid-reply: a throwaway agent with
 no tools answers it as `[btw] …` from a copy of the conversation, which is left as is.
+`/undo` takes your last message and its reply out of the agent's context (files it changed stay
+changed; another `/undo` goes one further back), `/retry` does that and sends the message again,
+and `/compact [INSTRUCTIONS]` has rpi summarise the conversation so far to make room and tells you
+how much it kept. These three wait for the agent to finish (or `/stop` it). `/usage [DAYS]` lists
+the spend per day and per account over the last 7 days, or `DAYS`.
 `/login` signs an account in from here: `/login` lists the provider ids, `/login PROVIDER [ACCOUNT]
 [MODEL]` starts an OAuth sign-in and needs no re-exec (a key or a token is refused — it is typed in
 `zephyr attach`, which masks it), and `/login cancel [ID|PROVIDER]` stops the ones you gave up on.
@@ -91,6 +96,9 @@ example to test beside a live install.
   Jobs report theirs on the job's channel. Plain downloads are not listed. In the agent's browser,
   typing, uploading and running script on a page count (`agent-browser fill`, `type`, `keyboard`,
   `upload`, `eval`); plain browsing does not.
+- When the agent repeats a tool call that keeps failing the same way, zephyr tells it after 3 tries
+  to change approach, and after 5 stops the run: `[zephyr] stopped a run that repeated a failing …
+  call 5 times`. Jobs and background tasks end `failed` the same way.
 - Notices go to the channel you last wrote from. Under `zephyr attach` they appear as messages in
   the conversation, or at your next attach if none is open.
 - When the agent changes its memory (`memory/USER.md`, `MEMORY.md`), you get the diff. The change
