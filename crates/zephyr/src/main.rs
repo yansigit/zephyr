@@ -20,6 +20,14 @@ const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|r
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let first = std::env::args().nth(1).unwrap_or_default();
+    if first == "--version" || first == "-V" {
+        println!("zephyr {}", env!("CARGO_PKG_VERSION"));
+        if !zephyr::host::in_container() {
+            zephyr::host::container_version();
+        }
+        return ExitCode::SUCCESS;
+    }
     if let Err(e) = zephyr::agent::init_ids() {
         eprintln!("zephyr: {e:#}");
         return ExitCode::FAILURE;
@@ -248,6 +256,7 @@ async fn status(cfg: &Config) -> anyhow::Result<()> {
     let up = tokio::net::UnixStream::connect(cfg.socket_path())
         .await
         .is_ok();
+    println!("version: {}", env!("CARGO_PKG_VERSION"));
     println!("daemon: {}", if up { "running" } else { "not reachable" });
     let store = Store::open(&cfg.db_path())?;
     for line in zephyr::reload::status_lines(cfg, &store)? {

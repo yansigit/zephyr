@@ -28,6 +28,7 @@ case "$1" in
       *" --list-models "*) printf 'provider model context\nanthropic claude-sonnet-5 200K\nopenai-codex gpt-5.5 400K\nopenai-codex gpt-5.4 400K\n' ;;
       *" auth check "*) echo '{"ready":true,"provider":"claude-code","source":"auth.json"}' ;;
       *" zephyr status "*) echo "daemon: ${SHIM_DAEMON:-running}" ;;
+      *" zephyr --version "*) [ -n "$SHIM_VERSION" ] || exit 2; echo "zephyr $SHIM_VERSION" ;;
       *" zephyr tui "*) exit "${SHIM_TUI_EXIT:-0}" ;;
     esac ;;
 esac
@@ -932,4 +933,26 @@ fn doctor_fix_repairs_modes() {
     assert!(stdout(&out).contains(&format!("FAIL {} is private", secrets.display())));
     env.ok(&["doctor", "--fix"]);
     assert_eq!(mode(&secrets), 0o600);
+}
+
+#[test]
+fn version_names_the_cli_and_the_running_container() {
+    let env = Env::new("version");
+    let me = env!("CARGO_PKG_VERSION");
+    let out = env.zephyr_env(&["--version"], &[("SHIM_VERSION", me)]);
+    assert!(out.status.success());
+    assert_eq!(
+        stdout(&out),
+        format!("zephyr {me}\ncontainer {CONTAINER}: {me}\n")
+    );
+    let older = stdout(&env.zephyr_env(&["-V"], &[("SHIM_VERSION", "0.0.1")]));
+    assert!(
+        older.ends_with(": 0.0.1 (`zephyr upgrade` moves it to this CLI's version)\n"),
+        "{older}"
+    );
+    // An image without --version is named by its image instead.
+    let old = stdout(&env.zephyr(&["--version"]));
+    assert_eq!(old.lines().count(), 2, "{old}");
+    let stopped = env.zephyr_env(&["--version"], &[("SHIM_STATE", "exited")]);
+    assert_eq!(stdout(&stopped), format!("zephyr {me}\n"));
 }

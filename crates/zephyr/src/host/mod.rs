@@ -11,7 +11,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-pub const USAGE: &str = "usage: zephyr <command>
+pub const USAGE: &str = "usage: zephyr <command>   (zephyr --version: this CLI's and the container's)
   init [--non-interactive --projects DIR --provider ID.. --account NAME=PROVIDER/MODEL.. --model P/M --no-start]
   up [--build] | down | restart | logs [-f] | status | upgrade
   login <provider> [--account NAME] [--model P/M] [--no-verify]
@@ -56,6 +56,42 @@ pub fn in_container() -> bool {
     std::env::var_os("ZEPHYR_IN_CONTAINER").is_some()
         || std::env::var_os("ZEPHYR_CONFIG").is_some()
         || std::path::Path::new("/.dockerenv").exists()
+}
+
+/// After `zephyr --version` on the host: the container's own version, which differs from this CLI's
+/// after a `cargo install` without `zephyr upgrade`.
+pub fn container_version() {
+    let h = Host::from_env();
+    if !h.running() {
+        return;
+    }
+    let out = h.exec(&[], &[], &["zephyr", "--version"]).output();
+    let theirs = match out {
+        Ok(o) if o.status.success() && !o.stdout.is_empty() => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .trim_start_matches("zephyr ")
+            .to_string(),
+        // Images before 0.3.1 have no --version: the published image's tag, else the image's name.
+        _ => output(&mut docker(&[
+            "inspect",
+            "-f",
+            "{{.Config.Image}}",
+            &h.container,
+        ]))
+        .map(|s| {
+            let s = s.trim();
+            s.strip_prefix("ghcr.io/yansigit/zephyr:")
+                .unwrap_or(s)
+                .to_string()
+        })
+        .unwrap_or_else(|_| "unknown".into()),
+    };
+    let hint = if theirs == env!("CARGO_PKG_VERSION") {
+        ""
+    } else {
+        " (`zephyr upgrade` moves it to this CLI's version)"
+    };
+    println!("container {}: {theirs}{hint}", h.container);
 }
 
 pub fn is_command(cmd: &str) -> bool {
