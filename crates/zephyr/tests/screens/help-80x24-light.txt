@@ -5,20 +5,20 @@
  ╭─ commands ─────────────────────────────────────────────────────────────────╮
  │ › type to filter                                                           │
  │ Chat                                                                       │
- │  › /new                     start a fresh conversation; memory and rules … │
- │    /switch                  list earlier conversations                     │
- │    /switch <id>             go back to one                                 │
- │    /btw <question>          ask a side question; the conversation is left… │
- │    /help                    this list                                      │
+ │  › /new                        start a fresh conversation; memory and rul… │
+ │    /switch                     list earlier conversations                  │
+ │    /switch <id>                go back to one                              │
+ │    /btw <question>             ask a side question; the conversation is l… │
+ │    /undo                       take back your last message and its reply   │
+ │    /retry                      take it back and send it again              │
+ │    /compact [instructions]     summarise the conversation to free context  │
+ │    /help                       this list                                   │
  │ Agent                                                                      │
- │    /stop                    stop the current reply and every task          │
- │    /task list               the agent's background tasks                   │
- │    /task stop <id>          stop one task                                  │
- │    /process list            commands running in the background             │
- │    /process stop <id>       stop one command                               │
- │    /model                   pick a model                                   │
- │    /model <provider/model>  switch the model after the current reply       │
- │    /ok <n>                  run the agent's proposal n                     │
- │    /no <n>                  drop the agent's proposal n                    │
- ╰─────────────────────────────────────────────────────────────── 1-16 of 35 ─╯
+ │    /stop                       stop the current reply and every task       │
+ │    /task list                  the agent's background tasks                │
+ │    /task stop <id>             stop one task                               │
+ │    /process list               commands running in the background          │
+ │    /process stop <id>          stop one command                            │
+ │    /model                      pick a model                                │
+ ╰─────────────────────────────────────────────────────────────── 1-16 of 48 ─╯
   ↑↓ choose · ⏎ insert · type to filter · esc close
