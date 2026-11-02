@@ -47,6 +47,11 @@ pub trait Channel: Send + Sync {
         let _ = (to, a);
         Ok(())
     }
+    /// Hands over the router's live config, once before `run`: an adapter that fetches files
+    /// reads the owner list from it (`inbox`). The default ignores it.
+    fn live(&self, cfg: tokio::sync::watch::Receiver<std::sync::Arc<crate::config::Config>>) {
+        let _ = cfg;
+    }
 }
 
 /// The adapters `zephyr run` can build. `Channel` is not dyn-compatible, so this enum is the list's element type.
@@ -83,6 +88,13 @@ impl Channel for AnyChannel {
             Self::Chat(c) => c.activity(to, a).await,
             Self::Discord(c) => c.activity(to, a).await,
             Self::IMessage(c) => c.activity(to, a).await,
+        }
+    }
+    fn live(&self, cfg: tokio::sync::watch::Receiver<std::sync::Arc<crate::config::Config>>) {
+        match self {
+            Self::Chat(c) => c.live(cfg),
+            Self::Discord(c) => c.live(cfg),
+            Self::IMessage(c) => c.live(cfg),
         }
     }
 }

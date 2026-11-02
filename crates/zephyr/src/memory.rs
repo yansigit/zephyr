@@ -153,6 +153,8 @@ Besides your file and shell tools, this container gives you:
 - **recall** searches earlier conversations, including ones from before `/new`: `query` finds the
   messages with every word in them, and `session` with `around` (an entry id from a hit) reads
   the messages around one.
+- **Files the owner sends** on Discord or iMessage are saved under `/zephyr/inbox/`; the message
+  names each one. `read` an image to see it.
 
 "#;
 

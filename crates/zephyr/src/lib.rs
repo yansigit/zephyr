@@ -13,6 +13,7 @@ pub mod discord;
 pub mod dotenv;
 pub mod host;
 pub mod imessage;
+pub mod inbox;
 pub mod memory;
 pub mod pool;
 pub mod procs;

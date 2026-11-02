@@ -1,0 +1,52 @@
+{
+  "type": 0,
+  "tts": false,
+  "timestamp": "2026-10-31T09:12:44.118000+00:00",
+  "pinned": false,
+  "nonce": "1433712345678901248",
+  "mentions": [],
+  "mention_roles": [],
+  "mention_everyone": false,
+  "id": "1433712346123456789",
+  "flags": 0,
+  "embeds": [],
+  "edited_timestamp": null,
+  "content": "",
+  "components": [],
+  "channel_type": 1,
+  "channel_id": "1290011122233344455",
+  "author": {
+    "username": "owner",
+    "public_flags": 0,
+    "id": "2000",
+    "global_name": "Owner",
+    "discriminator": "0",
+    "clan": null,
+    "avatar_decoration_data": null,
+    "avatar": null
+  },
+  "attachments": [
+    {
+      "width": 640,
+      "url": "{BASE}/attachments/1290011122233344455/1433712345999/screenshot.png?ex=672a1b2c&is=6728c9ac&hm=0f1e2d",
+      "size": 245760,
+      "proxy_url": "https://media.discordapp.net/attachments/1290011122233344455/1433712345999/screenshot.png",
+      "placeholder_version": 1,
+      "placeholder": "abcdefg",
+      "id": "1433712345999",
+      "height": 480,
+      "filename": "screenshot.png",
+      "content_type": "image/png",
+      "content_scan_version": 0
+    },
+    {
+      "url": "{BASE}/attachments/1290011122233344455/1433712346000/scan.pdf?ex=672a1b2c&is=6728c9ac&hm=1a2b3c",
+      "size": 31457280,
+      "proxy_url": "https://media.discordapp.net/attachments/1290011122233344455/1433712346000/scan.pdf",
+      "id": "1433712346000",
+      "filename": "scan.pdf",
+      "content_type": "application/pdf",
+      "content_scan_version": 0
+    }
+  ]
+}
