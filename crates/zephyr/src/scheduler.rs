@@ -202,6 +202,12 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
                     eprintln!("zephyr: memory notice failed: {e}");
                 }
             }
+            // Skill and connector drafts the run wrote (DESIGN §4.6).
+            for notice in crate::drafts::scan(&cfg) {
+                if let Err(e) = store.notify(&run.job.channel, &run.job.recipient, &notice) {
+                    eprintln!("zephyr: draft notice failed: {e}");
+                }
+            }
             if crossed {
                 let (channel, recipient) = (&run.job.channel, &run.job.recipient);
                 if let Err(e) = store.notify(channel, recipient, BUDGET_NOTICE) {

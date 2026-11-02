@@ -18,13 +18,15 @@ pub const USAGE: &str = "usage: zephyr <command>
   accounts [list | order NAME.. | remove NAME]
   model [--account NAME] [PROVIDER/MODEL]
   channel add discord|imessage
+  skill add DIR | list | rm NAME
+  mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. | list | rm NAME
   config get|set KEY [VALUE]
   chat | attach [--stock] | pause | resume | reload
   doctor [--fix]
   uninstall [--keep-data] [--yes]
 env: ZEPHYR_CONTAINER (default zephyr), ZEPHYR_IMAGE, ZEPHYR_SRC (for --build); data in ~/.zephyr";
 
-const COMMANDS: [&str; 19] = [
+const COMMANDS: [&str; 21] = [
     "init",
     "up",
     "down",
@@ -44,6 +46,8 @@ const COMMANDS: [&str; 19] = [
     "pause",
     "resume",
     "reload",
+    "skill",
+    "mcp",
 ];
 
 /// The image sets ZEPHYR_IN_CONTAINER. ZEPHYR_CONFIG (set in the image and by tests) also points
@@ -877,6 +881,8 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
         "accounts" => setup::accounts(&h, a),
         "model" => setup::model(&h, a),
         "channel" => setup::channel(&h, a),
+        "skill" => setup::skill(&h, a),
+        "mcp" => setup::mcp(&h, a),
         _ => bail!("{USAGE}"),
     }
 }

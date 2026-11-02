@@ -1,7 +1,7 @@
 //! `zephyr.toml`: where rpi lives, where state lives, and who may talk to the agent.
 
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -61,6 +61,9 @@ pub struct Config {
     /// OAuth refresh (DESIGN §4.7). Defaults apply when the table is absent.
     #[serde(default)]
     pub auth: crate::auth_keeper::AuthConfig,
+    /// `[[mcp]]`: the connectors (MCP servers) the agent may call (DESIGN §4.6).
+    #[serde(default, rename = "mcp")]
+    pub mcp: Vec<Mcp>,
     /// The file this was loaded from, which a reload reads again. `None` when built in memory.
     #[serde(skip)]
     pub path: Option<PathBuf>,
@@ -147,6 +150,49 @@ impl Account {
     }
 }
 
+/// One `[[mcp]]`: an MCP server, run by `rpi-mcp-adapter` from the file `drafts::prepare` writes.
+/// Either `url` (and `headers`) or `command` (and `args`, `cwd`). Any string value may say
+/// `${NAME}` for a secrets.env key.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mcp {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Seconds per call; the adapter's default is 60.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl Mcp {
+    /// A name the adapter takes and a folder could hold, and exactly one of `url` or `command`.
+    pub fn check(&self) -> anyhow::Result<()> {
+        if !crate::drafts::valid_name(&self.name) {
+            anyhow::bail!(
+                "connector name {:?}: use 1-64 lowercase letters, digits or '-'",
+                self.name
+            );
+        }
+        let blank = |v: &Option<String>| v.as_deref().is_none_or(|s| s.trim().is_empty());
+        if blank(&self.url) == blank(&self.command) {
+            anyhow::bail!("connector {:?}: set either url or command", self.name);
+        }
+        Ok(())
+    }
+}
+
 /// `[attach]`: listens on 127.0.0.1 only. The token comes from exactly one of the two sources.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -190,6 +236,13 @@ impl Config {
         for name in &self.agent.env {
             if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 anyhow::bail!("agent.env {name:?}: use a variable name (letters, digits, '_')");
+            }
+        }
+        let mut names = std::collections::HashSet::new();
+        for m in &self.mcp {
+            m.check()?;
+            if !names.insert(&m.name) {
+                anyhow::bail!("connector name {:?} is used twice", m.name);
             }
         }
         crate::scheduler::zone(self)?;

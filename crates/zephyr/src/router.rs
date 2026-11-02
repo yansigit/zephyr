@@ -1146,6 +1146,10 @@ impl<'a> Router<'a> {
         for notice in [cut, tally.alert(), memory].into_iter().flatten() {
             log(self.store.notify_last_owner(&notice).map_err(Into::into));
         }
+        // Skill and connector drafts the run wrote, each shown once (DESIGN §4.6).
+        for notice in crate::drafts::scan(&self.cfg) {
+            log(self.store.notify_last_owner(&notice).map_err(Into::into));
+        }
         if crossed {
             log(self
                 .store
@@ -1232,6 +1236,20 @@ impl<'a> Router<'a> {
             ("/rollback", arg) => {
                 let busy = self.rollback_busy();
                 crate::checkpoint::command(&self.cfg, arg, busy.as_deref()).await
+            }
+            // Skills and connectors the agent drafted (DESIGN §4.6).
+            ("/skills" | "/skill" | "/mcp", _) => {
+                use crate::drafts::After;
+                let (reply, after) = crate::drafts::command(&self.cfg, text)?;
+                match after {
+                    After::Nothing => reply,
+                    // rpi reads AGENTS.md once, at start.
+                    After::Restart => {
+                        self.restart = true;
+                        reply
+                    }
+                    After::Reload => format!("{reply}\n{}", self.reload().await),
+                }
             }
             _ => return None,
         })

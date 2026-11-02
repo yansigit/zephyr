@@ -12,6 +12,7 @@ pub mod config;
 pub mod desktop;
 pub mod discord;
 pub mod dotenv;
+pub mod drafts;
 pub mod host;
 pub mod imessage;
 pub mod inbox;

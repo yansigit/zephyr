@@ -39,6 +39,8 @@ zephyr login openai-codex --account codex-main
 | `zephyr accounts [list \| order NAME.. \| remove NAME]` | The failover pool |
 | `zephyr model [--account NAME] [PROVIDER/MODEL]` | An account's model (or the default without accounts); with no model, pick from `rpi --list-models` |
 | `zephyr channel add discord\|imessage` | Channel settings; secrets are asked for hidden. Discord shows typing while the agent works, and a progress note after 20 s (`discord.progress`, `discord.progress_after_secs`) |
+| `zephyr skill add DIR \| list \| rm NAME` | Skills the agent may use (see [Skills and connectors](#skills-and-connectors)); one you add is approved at once |
+| `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}` |
 | `zephyr config get\|set KEY [VALUE]` | Edit `zephyr.toml` (comments are kept; invalid keys are refused) |
 | `zephyr attach [--stock]` | Zephyr's terminal UI on the live session: history, tool calls, what the agent is doing, the queue and today's spend; `^D` detaches and the agent keeps running. `--stock` runs the stock `rpi --connect` client instead |
 | `zephyr chat` | The same UI on a terminal; a line client (`< reply` per line) when piped or scripted |
@@ -65,7 +67,7 @@ Changes apply by themselves; nothing needs `zephyr restart`. The commands above,
 |---|---|
 | Budget, owners, time zone, `[auth]`, the pool order | at once |
 | The model, on the same provider | at once, or after the reply in progress (rpi's `set_model`) |
-| A model on another provider, the active account, extensions, a re-login | the agent restarts after the reply in progress; the conversation carries on |
+| A model on another provider, the active account, extensions, connectors (`[[mcp]]`), a re-login | the agent restarts after the reply in progress; the conversation carries on |
 | Discord, iMessage, `[attach]`, `[agent]`, a secret | the daemon restarts itself in place once idle; waiting messages are kept |
 
 A file that does not load is not applied, and the daemon keeps its current settings. From any
@@ -107,6 +109,36 @@ example to test beside a live install.
   it again, `/memory log` lists commits. A web page cannot plant a lasting "preference" without you.
   For the same reason rpi skills are off, only the image's extensions load, and a `SYSTEM.md`, `APPEND_SYSTEM.md`, `CLAUDE.md` or
   extra `AGENTS*.md` the agent writes is renamed `*.ignored-by-zephyr` before the next start.
+- When the agent drafts a skill or a connector, you get its diff the same way (below).
+
+## Skills and connectors
+
+**Skills** are how-tos the agent keeps: a folder with a `SKILL.md` (the agentskills.io format
+Claude, Hermes and OpenClaw use: YAML frontmatter with `name` and a one-line `description`, then
+the steps) and any files beside it. After a task that took many steps, the agent may draft one in
+`skills/drafts/<name>/`; you are sent it once, and it is used only after `/skill ok NAME`. If it
+changed after you were sent it, you are shown the new version first. The agent then sees each
+approved skill's name and description, and reads the rest when a task calls for it.
+`/skills` lists approved skills and drafts waiting; `/skill no NAME` drops a draft, `/skill diff
+NAME` shows it, `/skill rm NAME` removes an approved skill, and `/skill undo NAME` takes back the
+last change to it (again to go further back). On the host, `zephyr skill add DIR` adds a skill
+folder of yours, approved at once (at most 32 files and 256 KB, regular files only).
+
+**Connectors** are MCP servers the agent may call. Add one on the host:
+
+```sh
+zephyr mcp add docs --url https://example.com/mcp --header 'Authorization=Bearer ${DOCS_TOKEN}' --secret DOCS_TOKEN
+zephyr mcp add files -- npx -y @modelcontextprotocol/server-filesystem /zephyr/projects
+```
+
+This writes an `[[mcp]]` table to `zephyr.toml` (`name`, then `url` and `headers`, or `command`,
+`args` and `cwd`; also `env`, `timeout`, `enabled`), and the agent restarts after the reply in
+progress. `${NAME}` is filled in from `secrets.env`; a connector whose secret is missing is left
+out, and `zephyr doctor` and `/mcp` say so. The agent may also propose one in
+`connectors/drafts/<name>.json`: `/mcp ok NAME` adds it, `/mcp no NAME` drops it, `/mcp rm NAME`
+removes a connector, and `/mcp` lists them. The agent can use only these connectors: an MCP config
+it writes itself, or a server named by URL, is refused. A connector runs as the agent, so the
+agent can read its token.
 
 ## Sending the agent files
 
