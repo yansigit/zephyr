@@ -1220,6 +1220,64 @@ impl Store {
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         rows.collect()
     }
+
+    /// The row that started the newest answered run of `main`, for `/undo` (DESIGN §4.1):
+    /// the newest `done` row sent as a prompt or a continuation.
+    pub fn last_run(&self) -> rusqlite::Result<Option<InboxRow>> {
+        self.db
+            .query_row(
+                "SELECT id, channel, sender, text, tries FROM inbox
+                 WHERE status = 'done' AND sent_as IN ('prompt', 'continue')
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| {
+                    Ok(InboxRow {
+                        id: r.get(0)?,
+                        channel: r.get(1)?,
+                        sender: r.get(2)?,
+                        text: r.get(3)?,
+                        tries: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Marks the run `origin` started as `undone`: that row and the rows steered into it. An
+    /// `undone` row is never `dispatched` again, so recovery never sends it back to rpi.
+    pub fn mark_undone(&self, origin: i64) -> rusqlite::Result<usize> {
+        self.db.execute(
+            "UPDATE inbox SET status = 'undone'
+             WHERE id = ?1 OR (id > ?1 AND sent_as = 'steer' AND status IN ('done', 'dispatched'))",
+            params![origin],
+        )
+    }
+
+    /// Spend over the last `days` UTC days (today included), newest first: each day's total,
+    /// and each account's share of it, `(day, account, tokens, cost)`. Days with none are left out.
+    #[allow(clippy::type_complexity)]
+    pub fn usage(
+        &self,
+        days: u32,
+    ) -> rusqlite::Result<(Vec<(String, i64, f64)>, Vec<(String, String, i64, f64)>)> {
+        let since = format!("-{} days", days.saturating_sub(1));
+        let mut stmt = self.db.prepare(
+            "SELECT day, tokens, cost_usd FROM spend WHERE day >= date('now', ?1) ORDER BY day DESC",
+        )?;
+        let totals = stmt
+            .query_map(params![since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut stmt = self.db.prepare(
+            "SELECT day, account, tokens, cost_usd FROM account_spend WHERE day >= date('now', ?1)
+             ORDER BY day DESC, account",
+        )?;
+        let accounts = stmt
+            .query_map(params![since], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((totals, accounts))
+    }
 }
 
 #[cfg(test)]
