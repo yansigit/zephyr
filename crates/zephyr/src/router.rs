@@ -253,6 +253,9 @@ pub async fn run<C: Channel>(
     // Commands a re-exec handed over alive are adopted; the rest a dead gateway left running
     // are reported, never re-run (DESIGN §4.13).
     router.procs.adopt(&router.cfg, &mut router.store)?;
+    for c in channels {
+        c.live(cfg_rx.clone()); // owners for file downloads, kept current by reload
+    }
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
         r = runs => r.map(|_| Exit::Shutdown),

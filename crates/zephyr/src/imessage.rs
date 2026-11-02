@@ -82,6 +82,8 @@ pub struct IMessage {
     /// Set by the first typing error of the run, so later ones are not logged.
     typing_warned: Arc<AtomicBool>,
     typing_refresh: Duration,
+    /// Owners and home, for saving the files an owner sends (`inbox`).
+    live: crate::inbox::Live,
 }
 
 /// Refuses an unspecified bind address unless the operator said so.
@@ -127,6 +129,17 @@ struct Message {
     chats: Option<Vec<Chat>>,
     associated_message_guid: Option<String>,
     item_type: Option<i64>,
+    attachments: Option<Vec<Attachment>>,
+}
+
+/// A file on a message, fetched from `/api/v1/attachment/{guid}/download`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Attachment {
+    guid: String,
+    mime_type: Option<String>,
+    transfer_name: Option<String>,
+    total_bytes: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -139,8 +152,8 @@ struct Chat {
     style: Option<i64>,
 }
 
-/// Maps a BlueBubbles webhook body to an inbound row. `Ok(None)` means a valid event we ignore.
-pub fn to_inbound(body: &[u8]) -> anyhow::Result<Option<Inbound>> {
+/// Maps a BlueBubbles webhook body to an inbound row and its files. `Ok(None)` means a valid event we ignore.
+fn to_inbound(body: &[u8]) -> anyhow::Result<Option<(Inbound, Vec<Attachment>)>> {
     let event: Event = serde_json::from_slice(body)?;
     if event.kind != "new-message" {
         return Ok(None);
@@ -149,7 +162,7 @@ pub fn to_inbound(body: &[u8]) -> anyhow::Result<Option<Inbound>> {
 }
 
 /// The filter shared by webhooks and backfill. `None` means a message we ignore.
-fn message_to_inbound(m: Message) -> Option<Inbound> {
+fn message_to_inbound(m: Message) -> Option<(Inbound, Vec<Attachment>)> {
     let group = m
         .chats
         .as_deref()
@@ -164,15 +177,19 @@ fn message_to_inbound(m: Message) -> Option<Inbound> {
     if m.is_from_me || group || tapback || m.item_type.unwrap_or(0) != 0 {
         return None;
     }
-    let (Some(handle), Some(text)) = (m.handle, m.text.filter(|t| !t.is_empty())) else {
+    let files = m.attachments.unwrap_or_default();
+    // iMessage holds each attachment's place in the text with U+FFFC.
+    let text = m.text.unwrap_or_default().replace('\u{fffc}', "");
+    let (Some(handle), false) = (m.handle, text.is_empty() && files.is_empty()) else {
         return None;
     };
-    Some(Inbound {
+    let inbound = Inbound {
         channel: "imessage".into(),
         platform_msg_id: m.guid,
         sender: handle.address,
         text,
-    })
+    };
+    Some((inbound, files))
 }
 
 /// Queues messages from the last `lookback` that a webhook may have missed. The router dedupes on guid.
@@ -182,7 +199,7 @@ async fn backfill(this: &IMessage, tx: &mpsc::Sender<Inbound>) -> anyhow::Result
         "after": since,
         "sort": "DESC",
         "limit": this.backfill_limit,
-        "with": ["chats"],
+        "with": ["chats", "attachment"],
     });
     let page: Page = serde_json::from_slice(&this.post("/api/v1/message/query", &body).await?)?;
     // The query is newest first. Queue oldest first so the session sees messages in order.
@@ -191,8 +208,12 @@ async fn backfill(this: &IMessage, tx: &mpsc::Sender<Inbound>) -> anyhow::Result
         let Ok(m) = serde_json::from_value::<Message>(raw) else {
             continue;
         };
-        if let Some(inbound) = message_to_inbound(m) {
-            if tx.send(inbound).await.is_err() {
+        if let Some((inbound, files)) = message_to_inbound(m) {
+            if tx
+                .send(this.with_files(inbound, files).await)
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -207,11 +228,7 @@ fn status(code: StatusCode) -> Response<Full<Bytes>> {
 }
 
 /// Handles one webhook request. The secret is checked before the body is read.
-async fn webhook(
-    req: Request<Incoming>,
-    tx: mpsc::Sender<Inbound>,
-    secret: String,
-) -> Response<Full<Bytes>> {
+async fn webhook(req: Request<Incoming>, queue: Queue, secret: String) -> Response<Full<Bytes>> {
     if req.method() != Method::POST {
         return status(StatusCode::METHOD_NOT_ALLOWED);
     }
@@ -227,9 +244,9 @@ async fn webhook(
         return status(StatusCode::BAD_REQUEST);
     };
     match to_inbound(&body.to_bytes()) {
-        Ok(Some(inbound)) => {
+        Ok(Some(row)) => {
             // A closed queue means run() is returning. BlueBubbles does not retry a webhook.
-            let sent = tx.send(inbound).await.is_ok();
+            let sent = queue.send(row).is_ok();
             status(if sent {
                 StatusCode::OK
             } else {
@@ -241,19 +258,38 @@ async fn webhook(
     }
 }
 
-/// Accepts webhooks on `listener` until the process ends.
-async fn serve(listener: TcpListener, tx: mpsc::Sender<Inbound>, secret: String) {
+/// Webhook rows waiting for their files, in arrival order.
+type Queue = mpsc::UnboundedSender<(Inbound, Vec<Attachment>)>;
+
+/// Accepts webhooks on `listener` until the process ends. One worker saves each row's files and
+/// passes the rows on in arrival order, so a caption sent after a photo stays after it. The
+/// webhook is answered once its row is queued: BlueBubbles gives up on one after 15 s and never
+/// retries it, and the files can take longer. A crash meanwhile is covered by backfill.
+async fn serve(listener: TcpListener, tx: mpsc::Sender<Inbound>, this: IMessage) {
+    let (queue, mut rows) = mpsc::unbounded_channel();
+    let secret = this.secret.clone();
+    tokio::spawn(async move {
+        while let Some((inbound, files)) = rows.recv().await {
+            if tx
+                .send(this.with_files(inbound, files).await)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             // shortcut: a persistent accept error (e.g. out of fds) retries every 100 ms with no backoff.
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
-        let (tx, secret) = (tx.clone(), secret.clone());
+        let (queue, secret) = (queue.clone(), secret.clone());
         tokio::spawn(async move {
             let svc = service_fn(move |req| {
-                let (tx, secret) = (tx.clone(), secret.clone());
-                async move { Ok::<_, Infallible>(webhook(req, tx, secret).await) }
+                let (queue, secret) = (queue.clone(), secret.clone());
+                async move { Ok::<_, Infallible>(webhook(req, queue, secret).await) }
             });
             // shortcut: no connection cap or header timeout. The listener is tailnet-only and the secret is checked before the body is read. Add both if it is ever exposed.
             let _ = http1::Builder::new()
@@ -290,7 +326,24 @@ impl IMessage {
             typing_tasks: Default::default(),
             typing_warned: Default::default(),
             typing_refresh: TYPING_REFRESH,
+            live: Default::default(),
         })
+    }
+
+    /// `inbound` with its files saved (an owner's only) and listed in its text.
+    async fn with_files(&self, mut inbound: Inbound, files: Vec<Attachment>) -> Inbound {
+        let files = files.into_iter().map(|a| {
+            let guid: String = url::form_urlencoded::byte_serialize(a.guid.as_bytes()).collect();
+            let url = format!("{}/api/v1/attachment/{guid}/download", self.server_url);
+            crate::inbox::File {
+                name: a.transfer_name.unwrap_or_else(|| "file".into()),
+                mime: a.mime_type,
+                size: a.total_bytes.unwrap_or(0),
+                req: self.http.get(url).query(&[("password", &self.password)]),
+            }
+        });
+        crate::inbox::append(&self.live, &mut inbound, files.collect()).await;
+        inbound
     }
 
     /// Sets the typing indicator in the one-to-one chat with `to`. A no-op unless `[imessage] typing = true`.
@@ -404,7 +457,7 @@ impl Channel for IMessage {
             }
         };
         tokio::select! {
-            _ = serve(listener, tx.clone(), self.secret.clone()) => {}
+            _ = serve(listener, tx.clone(), self.clone()) => {}
             _ = backfill_loop => {}
             _ = tx.closed() => {}
         }
@@ -448,6 +501,10 @@ impl Channel for IMessage {
             .await?;
         }
         Ok(())
+    }
+
+    fn live(&self, cfg: tokio::sync::watch::Receiver<Arc<crate::config::Config>>) {
+        let _ = self.live.set(cfg);
     }
 
     /// Typing on Start, cleared on Stop. Progress shows nothing: the refresh task keeps typing up.
@@ -529,7 +586,8 @@ mod tests {
 
     #[test]
     fn maps_new_message_to_inbound() {
-        let got = to_inbound(NEW.as_bytes()).unwrap().unwrap();
+        let (got, files) = to_inbound(NEW.as_bytes()).unwrap().unwrap();
+        assert!(files.is_empty());
         assert_eq!(
             got,
             Inbound {
@@ -581,7 +639,11 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = mpsc::channel(8);
-        tokio::spawn(serve(listener, tx, secret.to_string()));
+        let this = IMessage {
+            secret: secret.into(),
+            ..adapter(String::new())
+        };
+        tokio::spawn(serve(listener, tx, this));
         (format!("http://{addr}"), rx)
     }
 
@@ -630,9 +692,18 @@ mod tests {
                         async move {
                             let uri = format!("{} {}", req.method(), req.uri());
                             let body = req.into_body().collect().await.unwrap().to_bytes();
+                            let file = uri.starts_with("GET /api/v1/attachment/");
                             let _ = cap_tx
                                 .send((uri, String::from_utf8_lossy(&body).into()))
                                 .await;
+                            if file {
+                                // BlueBubbles serves a HEIC photo converted to JPEG, slowly.
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                return Ok(Response::builder()
+                                    .header("content-type", "image/jpeg")
+                                    .body(Full::new(Bytes::from_static(b"jpeg!")))
+                                    .unwrap());
+                            }
                             Ok::<_, std::convert::Infallible>(
                                 Response::builder()
                                     .status(status)
@@ -663,6 +734,7 @@ mod tests {
             typing_tasks: Default::default(),
             typing_warned: Default::default(),
             typing_refresh: TYPING_REFRESH,
+            live: Default::default(),
         }
     }
 
@@ -726,7 +798,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["sort"], "DESC");
         assert_eq!(json["limit"], 200);
-        assert_eq!(json["with"], serde_json::json!(["chats"]));
+        assert_eq!(json["with"], serde_json::json!(["chats", "attachment"]));
         let day = 24 * 3600 * 1000;
         let after = json["after"].as_u64().unwrap();
         assert!(before - day <= after && after <= crate::unix_millis() as u64 - day);
@@ -942,5 +1014,178 @@ mod tests {
         let no_helper = r#"{"status":200,"message":"Success","data":{"private_api":true,"helper_connected":false}}"#;
         let (base, _cap) = stub(200, no_helper).await;
         assert!(!adapter(base).private_api_on().await.unwrap());
+    }
+
+    const WITH_FILE: &str =
+        include_str!("../tests/fixtures/bluebubbles/new-message-attachment.json");
+    const OWNER: &str = "imessage = ['+15551234567']";
+
+    #[test]
+    fn a_message_that_is_only_a_file_is_kept() {
+        let (got, files) = to_inbound(WITH_FILE.as_bytes()).unwrap().unwrap();
+        assert_eq!(got.text, "", "U+FFFC placeholders are dropped");
+        assert_eq!(files.len(), 1);
+        let no_files = WITH_FILE.replace("\"attachments\": [", "\"x\": [");
+        assert!(to_inbound(no_files.as_bytes()).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn webhook_saves_an_owners_file_before_queueing() {
+        let home = crate::test_dir("imessage-webhook-file");
+        let (bb, mut cap) = stub(200, "{}").await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let this = IMessage {
+            live: crate::inbox::tests::live(&home, OWNER),
+            ..adapter(bb)
+        };
+        tokio::spawn(serve(listener, tx, this));
+        let res = reqwest::Client::new()
+            .post(format!("http://{addr}/hook?secret=s3cret"))
+            .body(WITH_FILE)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let path = home.join("inbox/imessage-CCCC-3333-4444-1.jpg");
+        assert_eq!(
+            got.text,
+            format!(
+                "[attached image: {} (IMG_4521.HEIC, image/jpeg, 1 KB); open it with read]",
+                path.display()
+            )
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"jpeg!");
+        assert_eq!(
+            next(&mut cap).await.0,
+            "GET /api/v1/attachment/AT-0001-HEIC/download?password=pw-hunter2"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caption_sent_after_a_photo_stays_after_it() {
+        let home = crate::test_dir("imessage-order");
+        let (bb, _cap) = stub(200, "{}").await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let this = IMessage {
+            live: crate::inbox::tests::live(&home, OWNER),
+            ..adapter(bb)
+        };
+        tokio::spawn(serve(listener, tx, this));
+        let client = reqwest::Client::new();
+        for body in [WITH_FILE, NEW] {
+            let url = format!("http://{addr}/hook?secret=s3cret");
+            let res = client.post(url).body(body).send().await.unwrap();
+            assert_eq!(res.status(), 200);
+        }
+        assert_eq!(rx.recv().await.unwrap().platform_msg_id, "CCCC-3333-4444");
+        assert_eq!(rx.recv().await.unwrap().platform_msg_id, "AAAA-1111-2222");
+    }
+
+    /// A query reply holding the recorded file message from `sender`.
+    fn backfill_reply(sender: &str) -> &'static str {
+        let mut data = message_data(WITH_FILE, "CCCC-3333-4444");
+        data["handle"]["address"] = sender.into();
+        leak(serde_json::json!({ "status": 200, "data": [data] }).to_string())
+    }
+
+    #[tokio::test]
+    async fn backfill_saves_an_owners_file() {
+        let home = crate::test_dir("imessage-backfill-file");
+        let (bb, mut cap) = stub(200, backfill_reply("+15551234567")).await;
+        let im = IMessage {
+            live: crate::inbox::tests::live(&home, OWNER),
+            ..adapter(bb)
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        backfill(&im, &tx).await.unwrap();
+        let got = rx.recv().await.unwrap();
+        assert!(
+            got.text.contains("imessage-CCCC-3333-4444-1.jpg"),
+            "{}",
+            got.text
+        );
+        assert!(next(&mut cap)
+            .await
+            .0
+            .starts_with("POST /api/v1/message/query"));
+        assert!(next(&mut cap)
+            .await
+            .0
+            .starts_with("GET /api/v1/attachment/AT-0001-HEIC/download"));
+    }
+
+    #[tokio::test]
+    async fn backfill_never_fetches_a_strangers_file() {
+        let home = crate::test_dir("imessage-stranger");
+        let (bb, mut cap) = stub(200, backfill_reply("+15550000000")).await;
+        let im = IMessage {
+            live: crate::inbox::tests::live(&home, OWNER),
+            ..adapter(bb)
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        backfill(&im, &tx).await.unwrap();
+        let got = rx.recv().await.unwrap();
+        assert_eq!(
+            got.text,
+            "[attached file: IMG_4521.HEIC (image/heic, 1.7 MB, not downloaded)]"
+        );
+        assert!(next(&mut cap)
+            .await
+            .0
+            .starts_with("POST /api/v1/message/query"));
+        assert!(cap.try_recv().is_err(), "nothing is downloaded");
+        assert!(!home.join("inbox").exists());
+    }
+
+    #[tokio::test]
+    async fn only_ten_files_of_25_mb_or_less_are_fetched() {
+        let home = crate::test_dir("imessage-limits");
+        let (bb, mut cap) = stub(200, "{}").await;
+        let im = IMessage {
+            live: crate::inbox::tests::live(&home, OWNER),
+            ..adapter(bb)
+        };
+        let mut event: serde_json::Value = serde_json::from_str(WITH_FILE).unwrap();
+        let one = event["data"]["attachments"][0].clone();
+        let files: Vec<_> = (1..=12)
+            .map(|i| {
+                let mut a = one.clone();
+                a["guid"] = format!("AT-{i}").into();
+                if i == 2 {
+                    a["totalBytes"] = (crate::inbox::MAX_BYTES + 1).into();
+                }
+                a
+            })
+            .collect();
+        event["data"]["attachments"] = files.into();
+        let (inbound, files) = to_inbound(event.to_string().as_bytes()).unwrap().unwrap();
+        let got = im.with_files(inbound, files).await;
+        let lines: Vec<&str> = got.text.lines().collect();
+        assert_eq!(lines.len(), 12);
+        assert!(
+            lines[1].ends_with("(image/heic, 25.0 MB, too large, not downloaded)]"),
+            "{}",
+            lines[1]
+        );
+        for line in &lines[10..] {
+            assert!(line.ends_with("over 10 files, not downloaded)]"), "{line}");
+        }
+        let mut fetched = Vec::new();
+        while let Ok((req, _)) = cap.try_recv() {
+            fetched.push(req.split('/').nth(4).unwrap().to_string());
+        }
+        let want: Vec<String> = [1, 3, 4, 5, 6, 7, 8, 9, 10]
+            .iter()
+            .map(|i| format!("AT-{i}"))
+            .collect();
+        assert_eq!(fetched, want);
     }
 }

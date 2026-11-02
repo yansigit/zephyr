@@ -129,6 +129,10 @@ pub struct Discord {
     progress_after: Option<Duration>,
     /// Keyed by Discord user id. A tokio mutex: `send` waits for an in-flight progress post, so it deletes it.
     runs: Mutex<HashMap<u64, Run>>,
+    /// Owners and home, for saving the files an owner sends (`inbox`).
+    live: crate::inbox::Live,
+    /// Fetches attachments from Discord's CDN.
+    files: reqwest::Client,
 }
 
 impl Discord {
@@ -144,6 +148,10 @@ impl Discord {
             http,
             progress_after,
             runs: Mutex::default(),
+            live: Default::default(),
+            files: reqwest::Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()?,
         })
     }
 
@@ -201,14 +209,16 @@ pub fn nonce(client_id: &str, index: usize) -> anyhow::Result<String> {
 }
 
 /// Maps a gateway message to an inbound row. Pure so the filter rules can be tested without a gateway.
+/// A message with files but no text is kept: its attachment lines become the text.
 pub fn to_inbound(
     is_dm: bool,
     author_is_bot: bool,
     msg_id: u64,
     author_id: u64,
     text: &str,
+    has_files: bool,
 ) -> Option<Inbound> {
-    if !is_dm || author_is_bot || text.is_empty() {
+    if !is_dm || author_is_bot || (text.is_empty() && !has_files) {
         return None;
     }
     Some(Inbound {
@@ -221,19 +231,40 @@ pub fn to_inbound(
 
 struct Handler {
     tx: mpsc::Sender<Inbound>,
+    live: crate::inbox::Live,
+    files: reqwest::Client,
+    /// Held while a message's files are fetched, so the next message (a caption sent after a
+    /// photo) queues behind it. serenity runs each event on a task of its own.
+    order: Mutex<()>,
 }
 
-#[async_trait]
-impl EventHandler for Handler {
-    async fn message(&self, _ctx: Context, msg: Message) {
-        let inbound = to_inbound(
+impl Handler {
+    /// The row for `msg`, its attachments saved (an owner's only) and listed in its text.
+    async fn inbound(&self, msg: &Message) -> Option<Inbound> {
+        let mut inbound = to_inbound(
             msg.guild_id.is_none(),
             msg.author.bot,
             msg.id.get(),
             msg.author.id.get(),
             &msg.content,
-        );
-        if let Some(inbound) = inbound {
+            !msg.attachments.is_empty(),
+        )?;
+        let files = msg.attachments.iter().map(|a| crate::inbox::File {
+            name: a.filename.clone(),
+            mime: a.content_type.clone(),
+            size: a.size.into(),
+            req: self.files.get(&a.url),
+        });
+        crate::inbox::append(&self.live, &mut inbound, files.collect()).await;
+        Some(inbound)
+    }
+}
+
+#[async_trait]
+impl EventHandler for Handler {
+    async fn message(&self, _ctx: Context, msg: Message) {
+        let _order = self.order.lock().await;
+        if let Some(inbound) = self.inbound(&msg).await {
             // A closed receiver means run() is returning; the error comes from there.
             let _ = self.tx.send(inbound).await;
         }
@@ -248,7 +279,12 @@ impl Channel for Discord {
     async fn run(&self, tx: mpsc::Sender<Inbound>) -> anyhow::Result<()> {
         // DIRECT_MESSAGES only. DM content arrives without MESSAGE_CONTENT (privileged).
         let mut client = Client::builder(&self.token, GatewayIntents::DIRECT_MESSAGES)
-            .event_handler(Handler { tx: tx.clone() })
+            .event_handler(Handler {
+                tx: tx.clone(),
+                live: self.live.clone(),
+                files: self.files.clone(),
+                order: Mutex::default(),
+            })
             .await?;
         tokio::select! {
             r = client.start() => r?,
@@ -293,6 +329,10 @@ impl Channel for Discord {
             dm.send_message(&self.http, builder).await?;
         }
         Ok(())
+    }
+
+    fn live(&self, cfg: tokio::sync::watch::Receiver<Arc<crate::config::Config>>) {
+        let _ = self.live.set(cfg);
     }
 
     async fn activity(&self, to: &str, a: &Activity) -> anyhow::Result<()> {
@@ -428,7 +468,7 @@ mod tests {
 
     #[test]
     fn to_inbound_maps_a_dm() {
-        let got = to_inbound(true, false, 111, 222, "hi").unwrap();
+        let got = to_inbound(true, false, 111, 222, "hi", false).unwrap();
         assert_eq!(
             got,
             Inbound {
@@ -442,9 +482,9 @@ mod tests {
 
     #[test]
     fn to_inbound_drops_guild_bot_and_empty_messages() {
-        assert!(to_inbound(false, false, 1, 2, "guild").is_none());
-        assert!(to_inbound(true, true, 1, 2, "bot or own message").is_none());
-        assert!(to_inbound(true, false, 1, 2, "").is_none());
+        assert!(to_inbound(false, false, 1, 2, "guild", false).is_none());
+        assert!(to_inbound(true, true, 1, 2, "bot or own message", false).is_none());
+        assert!(to_inbound(true, false, 1, 2, "", false).is_none());
     }
 
     #[test]
@@ -537,5 +577,61 @@ mod tests {
             toml::from_str("token_env = 'T'\nprogress = false\nprogress_after_secs = 5").unwrap();
         assert!(!cfg.progress);
         assert_eq!(cfg.progress_after_secs, 5);
+    }
+
+    const DM_FILES: &str = include_str!("../tests/fixtures/discord/dm-attachments.json");
+
+    /// The recorded DM (no text, a png and a 30 MB pdf) with its file URLs on `base`.
+    fn dm_with_files(base: &str) -> Message {
+        serde_json::from_str(&DM_FILES.replace("{BASE}", base)).unwrap()
+    }
+
+    fn handler(live: crate::inbox::Live) -> Handler {
+        Handler {
+            tx: mpsc::channel(1).0,
+            live,
+            files: reqwest::Client::new(),
+            order: Mutex::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_owners_files_are_saved_and_listed_even_without_text() {
+        let home = crate::test_dir("discord-files");
+        let (base, mut seen) = crate::inbox::tests::file_stub(200, "image/png", b"png!").await;
+        let live = crate::inbox::tests::live(&home, "discord = ['2000']");
+        let got = handler(live)
+            .inbound(&dm_with_files(&base))
+            .await
+            .expect("a message that is only files is kept");
+        let png = home.join("inbox/discord-1433712346123456789-1.png");
+        assert_eq!(
+            got.text,
+            format!(
+                "[attached image: {} (screenshot.png, image/png, 1 KB); open it with read]\n\
+                 [attached file: scan.pdf (application/pdf, 30.0 MB, too large, not downloaded)]",
+                png.display()
+            )
+        );
+        assert_eq!(std::fs::read(&png).unwrap(), b"png!");
+        assert!(seen.recv().await.unwrap().contains("/screenshot.png?ex="));
+        assert!(seen.try_recv().is_err(), "the pdf is over 25 MB");
+    }
+
+    #[tokio::test]
+    async fn a_strangers_files_are_never_fetched() {
+        let home = crate::test_dir("discord-stranger");
+        let (base, mut seen) = crate::inbox::tests::file_stub(200, "image/png", b"png!").await;
+        for live in [
+            crate::inbox::tests::live(&home, "discord = ['9999']"),
+            crate::inbox::Live::default(), // before the router hands the config over
+        ] {
+            let got = handler(live).inbound(&dm_with_files(&base)).await.unwrap();
+            assert!(got
+                .text
+                .contains("screenshot.png (image/png, 240 KB, not downloaded)"));
+        }
+        assert!(seen.try_recv().is_err());
+        assert!(!home.join("inbox").exists());
     }
 }

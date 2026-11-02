@@ -150,6 +150,8 @@ Besides your file and shell tools, this container gives you:
   `/status`, `/model`, `/switch`, `/rules`, `/memory diff`, `/memory log`, `/job list`. It can
   also propose `/model PROVIDER/MODEL`, `/new`, `/switch ID`, `/pause` or `/reload`: the owner is
   asked, and it runs only after their `/ok N`. Approving anything stays with the owner.
+- **Files the owner sends** on Discord or iMessage are saved under `/zephyr/inbox/`; the message
+  names each one. `read` an image to see it.
 
 "#;
 

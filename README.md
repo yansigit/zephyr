@@ -100,6 +100,15 @@ example to test beside a live install.
   For the same reason rpi skills are off, only the image's extensions load, and a `SYSTEM.md`, `APPEND_SYSTEM.md`, `CLAUDE.md` or
   extra `AGENTS*.md` the agent writes is renamed `*.ignored-by-zephyr` before the next start.
 
+## Sending the agent files
+
+Images and files you send on Discord or iMessage are saved for the agent in `~/.zephyr/inbox/`
+(`/zephyr/inbox/` in the container), and your message tells it each file's path; it opens images
+with `read`. A message with only a photo works. Up to 10 files a message, 25 MB each: anything
+beyond is listed but not downloaded. Only owners' files are downloaded. iPhone photos arrive as
+JPEG (BlueBubbles converts HEIC). A voice note is saved as a file; nothing transcribes it. Files
+are deleted after 30 days.
+
 ## Limits
 
 `[budget]` in `zephyr.toml`, all optional: `daily_tokens` and `daily_cost_usd` pause the gateway

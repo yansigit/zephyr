@@ -66,6 +66,10 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   DESIGN §4.1),
   `memory.rs` (git-committed memory files), `attach.rs` (rpi remote JSON-RPC shim so stock
   `rpi --connect` attaches to `main`).
+- `inbox.rs`: files the owner sends on Discord or iMessage (DESIGN §4.3). The adapter saves them as
+  the agent into `<home>/inbox/` before the row goes to the router and appends a
+  `[attached image: <path> ...]` line per file to its text; owners come from the router's live
+  config (`Channel::live`), so a stranger's files are never fetched. 10 files, 25 MB each.
 - The agent's tools (DESIGN §4.11): the browser, Camoufox and the X desktop are CLIs in the image,
   run through `bash`. `desktop.rs` keeps Xvfb up when `ZEPHYR_DESKTOP` is set. `send_file`,
   `schedule`, `gateway` and `task` are registered by zephyr-policy (`tools.rs`). The first two are
