@@ -956,3 +956,77 @@ fn version_names_the_cli_and_the_running_container() {
     let stopped = env.zephyr_env(&["--version"], &[("SHIM_STATE", "exited")]);
     assert_eq!(stdout(&stopped), format!("zephyr {me}\n"));
 }
+
+#[test]
+fn channel_list_and_remove_edit_the_toml_and_secrets() {
+    let env = Env::new("channel");
+    env.init(&["--no-start"]);
+    assert_eq!(env.ok(&["channel", "list"]), "chat     owners: 0\n");
+
+    // Both channels, as `channel add` leaves them; the owners go in through `config set`.
+    env.ok(&["config", "set", "owners.discord", "[\"1234\"]"]);
+    env.ok(&["config", "set", "discord.token_env", "ZEPHYR_DISCORD_TOKEN"]);
+    env.ok(&["config", "set", "owners.imessage", "[\"+15550100\"]"]);
+    let mut cfg = env.config();
+    cfg.push_str(
+        "\n[imessage]\nlisten = \"100.64.0.1:8080\"\nserver_url = \"http://100.64.0.2:1234\"\n\
+         password_env = \"ZEPHYR_BB_PASSWORD\"\nsecret_env = \"ZEPHYR_BB_SECRET\"\n",
+    );
+    std::fs::write(env.daemon().join("zephyr.toml"), cfg).unwrap();
+    let secrets = env.daemon().join("secrets.env");
+    std::fs::write(
+        &secrets,
+        "ZEPHYR_DISCORD_TOKEN=d\nZEPHYR_BB_PASSWORD=pw\nZEPHYR_BB_SECRET=s\nOTHER=keep\n",
+    )
+    .unwrap();
+    assert_eq!(
+        env.ok(&["channel", "list"]),
+        "chat     owners: 0\ndiscord  owners: 1234\nimessage owners: +15550100\n"
+    );
+
+    env.calls();
+    env.ok(&["channel", "remove", "discord"]);
+    find(
+        &env.calls(),
+        &["docker", "exec", CONTAINER, "zephyr", "reload"],
+    );
+    let text = env.config();
+    let cfg: toml::Value = toml::from_str(&text).unwrap();
+    assert!(cfg.get("discord").is_none(), "{text}");
+    assert!(cfg["owners"].get("discord").is_none(), "{text}");
+    assert_eq!(cfg["owners"]["imessage"][0].as_str(), Some("+15550100"));
+    assert!(text.contains("# Zephyr's config"), "{text}");
+    assert_eq!(cfg["attach"]["port"].as_integer(), Some(7790));
+    let left = std::fs::read_to_string(&secrets).unwrap();
+    assert_eq!(
+        left,
+        "ZEPHYR_BB_PASSWORD=pw\nZEPHYR_BB_SECRET=s\nOTHER=keep\n"
+    );
+
+    let again = env.zephyr(&["channel", "remove", "discord"]);
+    assert!(!again.status.success());
+    assert!(String::from_utf8_lossy(&again.stderr).contains("discord is not configured"));
+
+    env.ok(&["channel", "remove", "imessage"]);
+    let cfg: toml::Value = toml::from_str(&env.config()).unwrap();
+    assert!(cfg.get("imessage").is_none() && cfg["owners"].get("imessage").is_none());
+    assert_eq!(std::fs::read_to_string(&secrets).unwrap(), "OTHER=keep\n");
+    assert_eq!(env.ok(&["channel", "list"]), "chat     owners: 0\n");
+}
+
+#[test]
+fn help_prints_usage_on_stdout_and_exits_0() {
+    let env = Env::new("help");
+    for arg in ["--help", "-h", "help"] {
+        let out = env.zephyr(&[arg]);
+        assert!(out.status.success(), "{arg}");
+        assert_eq!(stdout(&out), format!("{}\n", zephyr::host::USAGE), "{arg}");
+    }
+    let cases: [&[&str]; 2] = [&["bogus"], &[]];
+    for args in cases {
+        let out = env.zephyr(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).starts_with("usage: zephyr <command>"));
+    }
+}

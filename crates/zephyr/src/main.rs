@@ -38,6 +38,10 @@ async fn main() -> ExitCode {
     if host && zephyr::host::is_command(&cmd) {
         return finish(zephyr::host::main(&cmd, args.collect()));
     }
+    if host && matches!(cmd.as_str(), "-h" | "--help" | "help") {
+        println!("{}", zephyr::host::USAGE);
+        return ExitCode::SUCCESS;
+    }
     if host && cmd != "run" {
         eprintln!("{}", zephyr::host::USAGE);
         return ExitCode::from(2);

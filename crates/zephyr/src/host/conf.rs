@@ -173,6 +173,15 @@ impl Data {
         self.write("secrets.env", &with_secret(&text, key, secret)?)
     }
 
+    /// Removes `key` from `secrets.env`; nothing to do when there is no such file.
+    pub fn unset_secret(&self, key: &str) -> anyhow::Result<()> {
+        let text = match self.read("secrets.env") {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            r => r?,
+        };
+        self.write("secrets.env", &without_secret(&text, key))
+    }
+
     /// `projects` from `host.toml`.
     pub fn projects(&self) -> anyhow::Result<Option<PathBuf>> {
         Ok(self.host_get("projects")?.map(PathBuf::from))
@@ -297,6 +306,15 @@ pub fn with_secret(text: &str, key: &str, secret: &str) -> anyhow::Result<String
         None => lines.push(&line),
     }
     Ok(lines.join("\n") + "\n")
+}
+
+/// `text` (a dotenv file) without the `key` line; the other lines stay as they are.
+pub fn without_secret(text: &str, key: &str) -> String {
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| l.split_once('=').is_none_or(|(k, _)| k.trim() != key))
+        .collect();
+    kept.join("\n") + "\n"
 }
 
 /// A dotted key, e.g. `attach.port`, as a display string (strings without quotes, string lists comma separated).
@@ -424,6 +442,14 @@ pub fn upsert_mcp(doc: &mut DocumentMut, m: &crate::config::Mcp) -> anyhow::Resu
         None => list.push(table),
     }
     Ok(())
+}
+
+/// Removes the `[kind]` channel table and its `owners.kind`; false when there is no such table.
+pub fn remove_channel(doc: &mut DocumentMut, kind: &str) -> bool {
+    if let Some(owners) = doc.get_mut("owners").and_then(Item::as_table_like_mut) {
+        owners.remove(kind);
+    }
+    doc.remove(kind).is_some()
 }
 
 /// Removes the named `[[mcp]]` connector; false when there is none.
