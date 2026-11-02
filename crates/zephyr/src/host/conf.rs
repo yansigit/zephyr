@@ -400,6 +400,42 @@ pub fn remove_account(doc: &mut DocumentMut, name: &str) -> bool {
     before != list.len()
 }
 
+/// Adds the `[[mcp]]` connector, or replaces the one with its name. Maps are written inline.
+pub fn upsert_mcp(doc: &mut DocumentMut, m: &crate::config::Mcp) -> anyhow::Result<()> {
+    let parsed: DocumentMut = toml::to_string(m)?.parse()?;
+    let mut table = Table::new();
+    for (k, item) in parsed.iter() {
+        let item = match item.as_table() {
+            Some(t) => Item::Value(toml_edit::Value::InlineTable(t.clone().into_inline_table())),
+            None => item.clone(),
+        };
+        table.insert(k, item);
+    }
+    let list = doc
+        .entry("mcp")
+        .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()))
+        .as_array_of_tables_mut()
+        .context("mcp in zephyr.toml is not a list of [[mcp]] tables")?;
+    let found = list
+        .iter()
+        .position(|t| t.get("name").and_then(Item::as_str) == Some(m.name.as_str()));
+    match found {
+        Some(i) => *list.get_mut(i).expect("found") = table,
+        None => list.push(table),
+    }
+    Ok(())
+}
+
+/// Removes the named `[[mcp]]` connector; false when there is none.
+pub fn remove_mcp(doc: &mut DocumentMut, name: &str) -> bool {
+    let Some(list) = doc.get_mut("mcp").and_then(Item::as_array_of_tables_mut) else {
+        return false;
+    };
+    let before = list.len();
+    list.retain(|t| t.get("name").and_then(Item::as_str) != Some(name));
+    before != list.len()
+}
+
 /// Puts the accounts in the order given, which must name each account exactly once.
 pub fn order_accounts(doc: &mut DocumentMut, names: &[String]) -> anyhow::Result<()> {
     let mut have: Vec<String> = accounts(doc).into_iter().map(|(n, _)| n).collect();

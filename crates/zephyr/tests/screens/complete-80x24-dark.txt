@@ -16,8 +16,8 @@
    /switch          list earlier conversations
    /switch <id>     go back to one
    /btw <question>  ask a side question; the conversation is left as is
-   /help            this list
-   /stop            stop the current reply and every task
+   /undo            take back your last message and its reply
+   /retry           take it back and send it again
  ╭────────────────────────────────────────────────────────────────────────────╮
  │ /                                                                          │
  ╰────────────────────────────────────────────────────────────────────────────╯

@@ -15,6 +15,7 @@ pub mod tools;
 use std::ffi::c_void;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rpi_plugin_sdk::{
@@ -38,7 +39,12 @@ event_handler! {
             return EVENT_HANDLER_ABORT;
         };
         let decision = match serde_json::from_str::<Value>(&call.params) {
-            Ok(args) => check(&call.tool_name, &args),
+            Ok(args) => match check(&call.tool_name, &args) {
+                Decision::Allow if policy::is_mcp(&call.tool_name) => {
+                    policy::check_mcp(&args, connectors(), |p| std::fs::read(p).ok())
+                }
+                d => d,
+            },
             Err(_) => Decision::Deny("tool arguments are not valid JSON"),
         };
         let log = std::env::var_os(AUDIT_ENV).filter(|p| !p.is_empty()).map(PathBuf::from);
@@ -48,6 +54,21 @@ event_handler! {
             Decision::Deny(_) => EVENT_HANDLER_ABORT,
         }
     }
+}
+
+/// The connectors file (`$ZEPHYR_MCP_CONFIG`) and its bytes, read once, when the plugin loads:
+/// the only MCP config this child may use (`policy::check_mcp`). `None` when there is none.
+static CONNECTORS: OnceLock<Option<(String, Vec<u8>)>> = OnceLock::new();
+
+fn connectors() -> Option<(&'static str, &'static [u8])> {
+    CONNECTORS
+        .get_or_init(|| {
+            let path = std::env::var(policy::MCP_CONFIG_ENV).ok()?;
+            let bytes = std::fs::read(&path).ok()?;
+            Some((path, bytes))
+        })
+        .as_ref()
+        .map(|(p, b)| (p.as_str(), b.as_slice()))
 }
 
 /// `/zephyr-policy`: the load beacon. The gateway calls `get_commands` to see it.
@@ -68,6 +89,7 @@ extern "C" fn status_command(
 }
 
 export_plugin!(|api| {
+    connectors(); // now, before the agent could edit the file
     let Some(register) = api.register_event_handler else {
         return -1;
     };
@@ -256,6 +278,11 @@ mod tests {
             EVENT_HANDLER_CONTINUE
         );
         assert_eq!(handler_return("bash", "not json"), EVENT_HANDLER_ABORT);
+        // No connectors file in this process: every MCP call is refused.
+        assert_eq!(
+            handler_return("mcp_list", r#"{"configPath":"/x/mcp.json"}"#),
+            EVENT_HANDLER_ABORT
+        );
     }
 
     #[test]

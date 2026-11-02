@@ -19,7 +19,7 @@ const MAX_REPORT: usize = 8 * 1024;
 const TICK: Duration = Duration::from_secs(5);
 
 /// What the child is told before the goal: it works alone and its last message is the report.
-const BRIEF: &str = "You are a background task the main agent started. Nobody reads your \
+pub const BRIEF: &str = "You are a background task the main agent started. Nobody reads your \
 messages while you work, and nobody can answer a question, so do the work on your own. When \
 you finish, your last message is handed to the main agent as your report: say what you did, \
 what you found, and anything left undone.\n\nGoal: ";
@@ -87,6 +87,9 @@ async fn one(cfg: Arc<Config>, task: Task, wake: &Wake) {
         Ok(Some(notice)) => log(store.notify(channel, recipient, &notice)),
         Ok(None) => {}
         Err(e) => eprintln!("zephyr: memory commit failed: {e:#}"),
+    }
+    for notice in crate::drafts::scan(&cfg) {
+        log(store.notify(channel, recipient, &notice));
     }
     log(store.finish_task(&task, status, &report, crate::now()));
     if crossed {

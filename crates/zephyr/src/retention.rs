@@ -36,6 +36,15 @@ pub fn sweep(cfg: &Config, store: &Store, age: Duration) -> rusqlite::Result<usi
         let id = name.strip_suffix(".md").and_then(|n| n.parse::<i64>().ok());
         id.is_some_and(|id| !tasks.contains(&id))
     });
+    gone += remove_old(&cfg.home.join("inbox"), age, inbox_file);
+    // The projects' checkpoints: the newest 50 of each (DESIGN §4.14).
+    if let Some(cp) = crate::checkpoint::Checkpoints::of(cfg) {
+        match cp.prune(crate::checkpoint::KEEP) {
+            Ok(0) => {}
+            Ok(n) => eprintln!("zephyr: pruned {n} old checkpoints of the projects"),
+            Err(e) => eprintln!("zephyr: pruning checkpoints failed: {e:#}"),
+        }
+    }
     Ok(gone)
 }
 
@@ -51,6 +60,18 @@ fn proc_of(name: &str) -> Option<i64> {
     matches!(ext, "log" | "exit" | "exit.tmp")
         .then(|| id.parse().ok())
         .flatten()
+}
+
+/// A file the owner sent (`inbox.rs`): `<channel>-<id>-<n>.<ext>`, or a `.<stem>.part` left by a
+/// crash mid-write.
+fn inbox_file(name: &str) -> bool {
+    let stem = match name.strip_prefix('.') {
+        Some(n) => n.strip_suffix(".part"),
+        None => name.rsplit_once('.').map(|(stem, _)| stem),
+    };
+    let rest = stem.and_then(|s| s.strip_prefix("discord-").or(s.strip_prefix("imessage-")));
+    rest.and_then(|r| r.rsplit_once('-'))
+        .is_some_and(|(id, n)| !id.is_empty() && n.parse::<u8>().is_ok())
 }
 
 fn subdirs(dir: &Path) -> Vec<PathBuf> {
@@ -154,5 +175,40 @@ mod tests {
         assert_eq!(proc_of("12.log"), Some(12));
         assert_eq!(proc_of("12.md"), None);
         assert_eq!(proc_of("x.log"), None);
+    }
+
+    #[test]
+    fn old_inbox_files_go() {
+        let home = crate::test_dir("retention-inbox");
+        let cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = {home:?}\n")).unwrap();
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let dir = home.join("inbox");
+        std::fs::create_dir_all(&dir).unwrap();
+        let month_ago = std::time::SystemTime::now() - AGE - Duration::from_secs(86400);
+        let file = |name: &str, old: bool| {
+            let path = dir.join(name);
+            std::fs::write(&path, "x").unwrap();
+            if old {
+                let f = std::fs::File::options().write(true).open(&path).unwrap();
+                f.set_modified(month_ago).unwrap();
+            }
+            path
+        };
+        let gone = [
+            file("discord-1433712346123456789-1.png", true),
+            file("imessage-CCCC-3333-4444-10.jpg", true),
+            file(".imessage-CCCC-3333-4444-2.part", true),
+        ];
+        let kept = [
+            file("discord-1-1.png", false), // fresh
+            file("notes.txt", true),        // the agent's own
+            file("discord-x.png", true),
+        ];
+        std::os::unix::fs::symlink("/etc/hostname", dir.join("discord-2-1.png")).unwrap();
+        assert_eq!(sweep(&cfg, &store, AGE).unwrap(), gone.len());
+        assert!(gone.iter().all(|p| !p.exists()));
+        assert!(kept.iter().all(|p| p.exists()));
+        assert!(dir.join("discord-2-1.png").symlink_metadata().is_ok());
     }
 }

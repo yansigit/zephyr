@@ -39,6 +39,8 @@ zephyr login openai-codex --account codex-main
 | `zephyr accounts [list \| order NAME.. \| remove NAME]` | The failover pool |
 | `zephyr model [--account NAME] [PROVIDER/MODEL]` | An account's model (or the default without accounts); with no model, pick from `rpi --list-models` |
 | `zephyr channel add discord\|imessage` | Channel settings; secrets are asked for hidden. Discord shows typing while the agent works, and a progress note after 20 s (`discord.progress`, `discord.progress_after_secs`) |
+| `zephyr skill add DIR \| list \| rm NAME` | Skills the agent may use (see [Skills and connectors](#skills-and-connectors)); one you add is approved at once |
+| `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}` |
 | `zephyr config get\|set KEY [VALUE]` | Edit `zephyr.toml` (comments are kept; invalid keys are refused) |
 | `zephyr attach [--stock]` | Zephyr's terminal UI on the live session: history, tool calls, what the agent is doing, the queue and today's spend; `^D` detaches and the agent keeps running. `--stock` runs the stock `rpi --connect` client instead |
 | `zephyr chat` | The same UI on a terminal; a line client (`< reply` per line) when piped or scripted |
@@ -65,7 +67,7 @@ Changes apply by themselves; nothing needs `zephyr restart`. The commands above,
 |---|---|
 | Budget, owners, time zone, `[auth]`, the pool order | at once |
 | The model, on the same provider | at once, or after the reply in progress (rpi's `set_model`) |
-| A model on another provider, the active account, extensions, a re-login | the agent restarts after the reply in progress; the conversation carries on |
+| A model on another provider, the active account, extensions, connectors (`[[mcp]]`), a re-login | the agent restarts after the reply in progress; the conversation carries on |
 | Discord, iMessage, `[attach]`, `[agent]`, a secret | the daemon restarts itself in place once idle; waiting messages are kept |
 
 A file that does not load is not applied, and the daemon keeps its current settings. From any
@@ -75,6 +77,11 @@ starts a fresh conversation (memory and rules carry over; the old one stays in `
 `/switch` lists the earlier ones and `/switch ID` goes back to one.
 `/btw QUESTION` asks a side question about the conversation, even mid-reply: a throwaway agent with
 no tools answers it as `[btw] …` from a copy of the conversation, which is left as is.
+`/undo` takes your last message and its reply out of the agent's context (files it changed stay
+changed; another `/undo` goes one further back), `/retry` does that and sends the message again,
+and `/compact [INSTRUCTIONS]` has rpi summarise the conversation so far to make room and tells you
+how much it kept. These three wait for the agent to finish (or `/stop` it). `/usage [DAYS]` lists
+the spend per day and per account over the last 7 days, or `DAYS`.
 `/login` signs an account in from here: `/login` lists the provider ids, `/login PROVIDER [ACCOUNT]
 [MODEL]` starts an OAuth sign-in and needs no re-exec (a key or a token is refused — it is typed in
 `zephyr attach`, which masks it), and `/login cancel [ID|PROVIDER]` stops the ones you gave up on.
@@ -91,6 +98,9 @@ example to test beside a live install.
   Jobs report theirs on the job's channel. Plain downloads are not listed. In the agent's browser,
   typing, uploading and running script on a page count (`agent-browser fill`, `type`, `keyboard`,
   `upload`, `eval`); plain browsing does not.
+- When the agent repeats a tool call that keeps failing the same way, zephyr tells it after 3 tries
+  to change approach, and after 5 stops the run: `[zephyr] stopped a run that repeated a failing …
+  call 5 times`. Jobs and background tasks end `failed` the same way.
 - Notices go to the channel you last wrote from. Under `zephyr attach` they appear as messages in
   the conversation, or at your next attach if none is open.
 - When the agent changes its memory (`memory/USER.md`, `MEMORY.md`), you get the diff. The change
@@ -99,6 +109,45 @@ example to test beside a live install.
   it again, `/memory log` lists commits. A web page cannot plant a lasting "preference" without you.
   For the same reason rpi skills are off, only the image's extensions load, and a `SYSTEM.md`, `APPEND_SYSTEM.md`, `CLAUDE.md` or
   extra `AGENTS*.md` the agent writes is renamed `*.ignored-by-zephyr` before the next start.
+- When the agent drafts a skill or a connector, you get its diff the same way (below).
+
+## Skills and connectors
+
+**Skills** are how-tos the agent keeps: a folder with a `SKILL.md` (the agentskills.io format
+Claude, Hermes and OpenClaw use: YAML frontmatter with `name` and a one-line `description`, then
+the steps) and any files beside it. After a task that took many steps, the agent may draft one in
+`skills/drafts/<name>/`; you are sent it once, and it is used only after `/skill ok NAME`. If it
+changed after you were sent it, you are shown the new version first. The agent then sees each
+approved skill's name and description, and reads the rest when a task calls for it.
+`/skills` lists approved skills and drafts waiting; `/skill no NAME` drops a draft, `/skill diff
+NAME` shows it, `/skill rm NAME` removes an approved skill, and `/skill undo NAME` takes back the
+last change to it (again to go further back). On the host, `zephyr skill add DIR` adds a skill
+folder of yours, approved at once (at most 32 files and 256 KB, regular files only).
+
+**Connectors** are MCP servers the agent may call. Add one on the host:
+
+```sh
+zephyr mcp add docs --url https://example.com/mcp --header 'Authorization=Bearer ${DOCS_TOKEN}' --secret DOCS_TOKEN
+zephyr mcp add files -- npx -y @modelcontextprotocol/server-filesystem /zephyr/projects
+```
+
+This writes an `[[mcp]]` table to `zephyr.toml` (`name`, then `url` and `headers`, or `command`,
+`args` and `cwd`; also `env`, `timeout`, `enabled`), and the agent restarts after the reply in
+progress. `${NAME}` is filled in from `secrets.env`; a connector whose secret is missing is left
+out, and `zephyr doctor` and `/mcp` say so. The agent may also propose one in
+`connectors/drafts/<name>.json`: `/mcp ok NAME` adds it, `/mcp no NAME` drops it, `/mcp rm NAME`
+removes a connector, and `/mcp` lists them. The agent can use only these connectors: an MCP config
+it writes itself, or a server named by URL, is refused. A connector runs as the agent, so the
+agent can read its token.
+
+## Sending the agent files
+
+Images and files you send on Discord or iMessage are saved for the agent in `~/.zephyr/inbox/`
+(`/zephyr/inbox/` in the container), and your message tells it each file's path; it opens images
+with `read`. A message with only a photo works. Up to 10 files a message, 25 MB each: anything
+beyond is listed but not downloaded. Only owners' files are downloaded. iPhone photos arrive as
+JPEG (BlueBubbles converts HEIC). A voice note is saved as a file; nothing transcribes it. Files
+are deleted after 30 days.
 
 ## Limits
 
@@ -165,6 +214,18 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   a container restart ends them, and they are reported. A stopped task reports how far it got.
   Old job and task sessions and process logs are deleted after 30 days. A run that makes
   no progress for 10 minutes (20 inside a command) is stopped and you are told.
+- **Earlier conversations.** The agent can search what was said before `/new` with its `recall`
+  tool, and read around a hit. Task and scheduled job runs are left out unless it asks for them.
+- **Undoing file changes.** Before each run (a message, a task, a job) zephyr takes a checkpoint of
+  every git repo in your projects folder that changed since the last one (folders without `.git` are left out) (`node_modules/`,
+  `target/`, `.venv/`, `dist/`, `build/`, `*.log`, `.env*` and what a project's `.gitignore`
+  ignores are skipped). `/rollback` lists the newest 10, `/rollback diff N` shows what changed
+  since checkpoint N, and `/rollback N [PROJECT]` puts the files back as they were then: changed
+  and deleted files return, new ones are removed, ignored ones are left alone. It is refused while
+  the agent, a task or an `exec` command is running (`/stop` them first), and it takes a checkpoint
+  first, so `/rollback 1` undoes it. The newest 50 per project are kept, in `~/.zephyr/.checkpoints`;
+  the agent can reach them, so this is an undo, not a guard. A container from before this needs
+  `zephyr up` once.
 
 A site's terms may forbid automated use; a site that catches the agent can flag the account it is
 signed in as.

@@ -18,13 +18,15 @@ pub const USAGE: &str = "usage: zephyr <command>
   accounts [list | order NAME.. | remove NAME]
   model [--account NAME] [PROVIDER/MODEL]
   channel add discord|imessage
+  skill add DIR | list | rm NAME
+  mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. | list | rm NAME
   config get|set KEY [VALUE]
   chat | attach [--stock] | pause | resume | reload
   doctor [--fix]
   uninstall [--keep-data] [--yes]
 env: ZEPHYR_CONTAINER (default zephyr), ZEPHYR_IMAGE, ZEPHYR_SRC (for --build); data in ~/.zephyr";
 
-const COMMANDS: [&str; 19] = [
+const COMMANDS: [&str; 21] = [
     "init",
     "up",
     "down",
@@ -44,6 +46,8 @@ const COMMANDS: [&str; 19] = [
     "pause",
     "resume",
     "reload",
+    "skill",
+    "mcp",
 ];
 
 /// The image sets ZEPHYR_IN_CONTAINER. ZEPHYR_CONFIG (set in the image and by tests) also points
@@ -241,6 +245,8 @@ impl Host {
         .args(["-e", "RPI_CODING_AGENT_DIR=/zephyr/.rpi/agent"])
         .args(["-e", &format!("ZEPHYR_AGENT_UID={}", ids.0)])
         .args(["-e", &format!("ZEPHYR_AGENT_GID={}", ids.1)])
+        // Turns on `/rollback`'s checkpoints of the projects folder (DESIGN §4.14).
+        .args(["-e", &format!("ZEPHYR_PROJECTS={projects}")])
         .args(["--mount", &format!("type=bind,src={data},dst=/zephyr")])
         .args([
             "--mount",
@@ -875,6 +881,8 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
         "accounts" => setup::accounts(&h, a),
         "model" => setup::model(&h, a),
         "channel" => setup::channel(&h, a),
+        "skill" => setup::skill(&h, a),
+        "mcp" => setup::mcp(&h, a),
         _ => bail!("{USAGE}"),
     }
 }

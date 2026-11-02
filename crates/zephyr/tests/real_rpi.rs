@@ -409,3 +409,114 @@ async fn real_rpi_btw_runs_with_no_tools_and_no_session_mid_run() {
     let _ = stop.send(());
     task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+#[ignore = "needs the pinned rpi binary"]
+async fn real_rpi_undo_retry_and_compact() {
+    if !std::path::Path::new(RPI).exists() {
+        eprintln!("skipping: {RPI} is not installed");
+        return;
+    }
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let port = stub_provider(Arc::default(), Arc::clone(&seen)).await;
+    let home = std::env::temp_dir().join(format!(
+        "zephyr-real-undo-{}-{}",
+        std::process::id(),
+        zephyr::unix_millis()
+    ));
+    let agent = home.join("rpi-agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(
+        agent.join("models.json"),
+        format!(r#"{{"providers":{{"stub":{{"api":"openai-completions","baseUrl":"http://127.0.0.1:{port}/v1","apiKey":"not-a-key","models":[{{"id":"m","name":"M"}}]}}}}}}"#),
+    )
+    .unwrap();
+    let cfg: Config = toml::from_str(&format!(
+        "rpi = {RPI:?}\nhome = {home:?}\nagent_dir = {agent:?}\nmodel = \"stub/m\"\n[owners]\nchat = [\"owner\"]\n"
+    ))
+    .unwrap();
+    // Every command zephyr sends is one this rpi supports (`doctor` checks the same).
+    let probe = zephyr::rpc::Child::spawn(&cfg, "probe").await.unwrap();
+    let supported = probe.ready["supportedCommands"].as_array().unwrap().clone();
+    for c in zephyr::rpc::USED_COMMANDS {
+        assert!(supported.iter().any(|s| s == c), "{c} not in {supported:?}");
+    }
+    probe.stop().await;
+
+    let (feed, rx) = mpsc::channel(4);
+    let channel = Arc::new(TestChannel {
+        feed: tokio::sync::Mutex::new(rx),
+        sent: Mutex::default(),
+    });
+    let (stop, stopped) = oneshot::channel::<()>();
+    let ch = channel.clone();
+    let task = tokio::spawn(async move {
+        zephyr::router::run(&cfg, std::slice::from_ref(&*ch), async {
+            let _ = stopped.await;
+        })
+        .await
+    });
+    let say = |id: &str, text: &str| Inbound {
+        channel: "chat".into(),
+        platform_msg_id: id.into(),
+        sender: "owner".into(),
+        text: text.into(),
+    };
+    let replies = |n: usize| {
+        let channel = channel.clone();
+        async move {
+            for _ in 0..400 {
+                if channel.sent.lock().unwrap().len() >= n {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let sent = channel.sent.lock().unwrap();
+            sent.iter().map(|m| m.text.clone()).collect::<Vec<_>>()
+        }
+    };
+    // The newest request the provider got.
+    let last_request = || seen.lock().unwrap().last().cloned().unwrap_or_default();
+
+    feed.send(say("m1", "ping")).await.unwrap();
+    replies(1).await;
+    feed.send(say("m2", "again")).await.unwrap();
+    replies(2).await;
+    feed.send(say("m3", "/undo")).await.unwrap();
+    let undone = replies(3).await[2].clone();
+    assert!(undone.starts_with("[zephyr] undone:"), "{undone}");
+    // The model no longer sees the undone exchange; the one before it stays.
+    feed.send(say("m4", "third")).await.unwrap();
+    assert_eq!(replies(4).await[3], "pong");
+    let request = last_request();
+    assert!(request.contains("[chat #1] ping"), "{request}");
+    assert!(!request.contains("[chat #2] again"), "{request}");
+
+    feed.send(say("m5", "/retry")).await.unwrap();
+    let sent = replies(6).await;
+    assert_eq!(
+        sent[4..],
+        [
+            "[zephyr] undone; sending your last message again as #6",
+            "pong"
+        ]
+    );
+    let request = last_request();
+    assert!(request.contains("[chat #6] third"), "{request}");
+    assert!(!request.contains("[chat #4] third"), "{request}");
+
+    feed.send(say("m6", "/compact keep it short"))
+        .await
+        .unwrap();
+    let summary = replies(7).await[6].clone();
+    assert!(
+        summary.starts_with("[zephyr] Conversation compacted"),
+        "{summary}"
+    );
+    assert!(last_request().contains("keep it short"));
+    feed.send(say("m7", "after")).await.unwrap();
+    assert_eq!(replies(8).await[7], "pong");
+
+    let _ = stop.send(());
+    task.await.unwrap().unwrap();
+}

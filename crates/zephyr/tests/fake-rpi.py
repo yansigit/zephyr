@@ -70,6 +70,13 @@ Models: `--list-models` (held while a `list_wait` file exists in the home) print
 (plus the started model);
 `set_model` switches to one of them and errors on anything else.
 The session is <session-dir>/<session-id>.json: {"messages": [...], "pending": bool}.
+`get_messages` gives each message an `entryId`, `m<index>` (its place on the current path).
+`navigate {targetId}` (idle) puts the leaf on that entry, dropping everything after it, and
+answers {"outcome": "completed", "leafId": ...}; with no `targetId` it empties the context (the root).
+`compact` (idle, optional `customInstructions`) answers `accepted`, replaces the messages with
+one `compactionSummary`, and settles with outcome "compacted" and a `summary`, as rpi 0.15 does.
+While a `tool_fail` file exists in the home, every tool call other than gateway/task/exec/process
+ends with `isError` and the error `tool error: <the file's text>`.
 """
 import json, os, queue as queues, re, sys, threading, time
 
@@ -222,7 +229,8 @@ def quick(cmd, s):
     global queue, steering, model
     kind = cmd["type"]
     if kind == "get_messages":
-        respond(cmd, {"messages": s["messages"], "total": len(s["messages"]), "pendingResume": s["pending"]})
+        entries = [dict(m, entryId="m%d" % i) for i, m in enumerate(s["messages"])]
+        respond(cmd, {"messages": entries, "total": len(s["messages"]), "pendingResume": s["pending"]})
     elif kind == "get_commands":
         names = ["zephyr-policy"] if extension and os.path.exists(extension) else []
         respond(cmd, {"commands": [{"name": n, "description": ""} for n in names]})
@@ -297,6 +305,9 @@ def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
     elif name == "exec" and not str(args.get("command", "")).strip():
         result["isError"] = True
         result["content"] = [{"type": "text", "text": "tool error: `command` is empty"}]
+    elif os.path.exists(os.path.join(home, "tool_fail")) and name not in ("gateway", "task", "exec", "process"):
+        result["isError"] = True
+        result["content"] = [{"type": "text", "text": "tool error: " + open(os.path.join(home, "tool_fail")).read()}]
     elif name in ("gateway", "task", "exec", "process"):
         answer = os.path.join(os.environ.get("ZEPHYR_GATEWAY_DIR", ""), cid)
         text = "the gateway did not answer"
@@ -327,7 +338,8 @@ def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
 
 out({"type": "ready", "protocol": "rpi", "piCompatibilityTarget": "1.2.0",
      "supportedCommands": ["get_state", "get_commands", "get_messages", "get_stats", "queue_message", "clear_queue",
-                           "prompt", "resume_pending", "abort", "ping", "stop", "get_auth_status", "set_model"],
+                           "prompt", "resume_pending", "abort", "ping", "stop", "get_auth_status", "set_model",
+                           "compact", "navigate"],
      "supportedEvents": ["session_entry_committed"],
      "semantics": {"promptResponse": "accepted", "settlementEvent": "agent_settled", "agentEndIsTerminal": False},
      "limits": {"frameBytes": 1048576, "maxConcurrentPrompts": 1}, "parityComplete": False})
@@ -451,6 +463,26 @@ for line in iter(next_line, None):
                 deferred.append(line)
         last = [m for m in s["messages"] if m["kind"] == "user"][-1]
         finish(s, "resumed: " + last["content"])
+    elif kind == "navigate":
+        target = cmd.get("targetId")
+        if target is None:
+            s["messages"] = []
+        elif re.fullmatch(r"m\d+", target) and int(target[1:]) < len(s["messages"]):
+            s["messages"] = s["messages"][:int(target[1:]) + 1]
+        else:
+            respond(cmd, error="unknown entry: %s" % target); continue
+        save(s)
+        respond(cmd, {"outcome": "completed", "leafId": target})
+    elif kind == "compact":
+        respond(cmd, {"accepted": True})
+        before = sum(len(json.dumps(m["content"])) for m in s["messages"])
+        s["messages"] = [{"kind": "compactionSummary", "role": "compactionSummary", "timestamp": 0,
+                          "content": [{"type": "text", "text": "summary"}]}]
+        save(s)
+        out({"type": "session_entry_committed", "entryId": "c", "entryType": "compaction", "customType": None, "lane": "main"})
+        out({"type": "agent_settled", "runId": "r", "outcome": "compacted", "aborted": False, "error": None,
+             "summary": "Conversation compacted · %d tokens before, 0 messages kept." % before,
+             "pendingResume": False})
     elif quick(cmd, s):
         pass
     elif kind == "abort":

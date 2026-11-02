@@ -64,15 +64,35 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   sessions and process logs older than 30 days. Tasks interrupted by a crash or re-exec resume in their session (`scheduler::resume`, at most
   3 times), and runs with no rpi event for `stall_limit` are aborted. Mid-run messages are steered in (`queue_message` `deliverAs: steer`,
   DESIGN §4.1),
-  `memory.rs` (git-committed memory files), `attach.rs` (rpi remote JSON-RPC shim so stock
+  `memory.rs` (git-committed memory files), `checkpoint.rs` (DESIGN §4.14: snapshots of the
+  projects folder, `$ZEPHYR_PROJECTS`, into the agent's shadow-git store `<home>/.checkpoints`
+  before each prompt/continue, task and job, at most 10 s; `/rollback` lists, diffs and restores;
+  pruned to 50 per project by `retention.rs`), `attach.rs` (rpi remote JSON-RPC shim so stock
   `rpi --connect` attaches to `main`).
+- `inbox.rs`: files the owner sends on Discord or iMessage (DESIGN §4.3). The adapter saves them as
+  the agent into `<home>/inbox/` before the row goes to the router and appends a
+  `[attached image: <path> ...]` line per file to its text; owners come from the router's live
+  config (`Channel::live`), so a stranger's files are never fetched. 10 files, 25 MB each.
+- `drafts.rs` (DESIGN §4.6): skills and connectors the agent drafts under `skills/drafts/` and
+  `connectors/drafts/`, shown to the owner once after each run (`scan`) and approved with
+  `/skill ok` / `/mcp ok` only if unchanged since shown. Approved skills are a root-owned git repo in
+  `<state>/skills`; connectors are `[[mcp]]` in `zephyr.toml`. `drafts::prepare` (called by
+  `spawn_as` in place of `memory::prepare`, which it runs first) publishes them as the agent to
+  `<home>/.approved/` (`mcp.json` with `${NAME}` secrets filled in) and adds `## Skills` and
+  `## Connectors` to AGENTS.md. zephyr-policy's `check_mcp` lets MCP calls use only that file
+  (`ZEPHYR_MCP_CONFIG`), byte-identical to what it read at load.
 - The agent's tools (DESIGN §4.11): the browser, Camoufox and the X desktop are CLIs in the image,
   run through `bash`. `desktop.rs` keeps Xvfb up when `ZEPHYR_DESKTOP` is set. `send_file`,
-  `schedule`, `gateway` and `task` are registered by zephyr-policy (`tools.rs`). The first two are
-  collected from the event stream in `rpc::Tally` and carried out at settle by `tools.rs` here;
-  `gateway` and `task` are answered mid-turn through a file.
+  `schedule`, `gateway`, `task` and `recall` are registered by zephyr-policy (`tools.rs`). The first
+  two are collected from the event stream in `rpc::Tally` and carried out at settle by `tools.rs`
+  here; `gateway` and `task` are answered mid-turn through a file, and `recall` reads the session
+  files itself (`ZEPHYR_SESSIONS_DIR`).
 
 Child restarts never happen mid-turn: auth refresh, failover and reload all wait for the settle.
+`/undo`, `/retry` and `/compact` (router, DESIGN §4.1) need the child idle too: `navigate` moves the
+session leaf, `compact` is a run of its own that settles `compacted`, and undone rows get inbox status
+`undone`. `rpc::Tally` also runs the repeated-failure guard (DESIGN §4.4) for main (`cap_run`) and
+for tasks and jobs (`scheduler::follow`).
 
 **`crates/zephyr-policy`** is a cdylib rpi plugin loaded with `--extension`. Its `ToolCall` handler
 vetoes hardline commands (`policy.rs` `check`) and appends audit lines to `$ZEPHYR_AUDIT_LOG`. It fails

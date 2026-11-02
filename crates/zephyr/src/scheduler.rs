@@ -202,6 +202,12 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
                     eprintln!("zephyr: memory notice failed: {e}");
                 }
             }
+            // Skill and connector drafts the run wrote (DESIGN §4.6).
+            for notice in crate::drafts::scan(&cfg) {
+                if let Err(e) = store.notify(&run.job.channel, &run.job.recipient, &notice) {
+                    eprintln!("zephyr: draft notice failed: {e}");
+                }
+            }
             if crossed {
                 let (channel, recipient) = (&run.job.channel, &run.job.recipient);
                 if let Err(e) = store.notify(channel, recipient, BUDGET_NOTICE) {
@@ -222,6 +228,13 @@ pub async fn execute(
     spec: &Spec<'_>,
 ) -> (&'static str, String, bool) {
     let label = &spec.label;
+    // The projects as they were before this run (DESIGN §4.14); a resumed run has one.
+    if !spec.resume {
+        let goal = spec.prompt.strip_prefix(crate::tasks::BRIEF);
+        let what = label.strip_prefix("[zephyr] ").unwrap_or(label);
+        let text = format!("{what}: {}", goal.unwrap_or(spec.prompt));
+        crate::checkpoint::before(cfg, &text).await;
+    }
     // A job runs on the first account not cooling down. A rate-limited attempt cools that
     // account and retries on the next one, in a fresh session; each account is tried once.
     let mut crossed = false;
@@ -452,6 +465,7 @@ async fn follow(
     max_turns: Option<u32>,
 ) -> anyhow::Result<anyhow::Result<String>> {
     let mut cut = None;
+    let mut guarded: Option<String> = None;
     let mut in_tool = 0usize;
     let settled = loop {
         let limit = cfg.stall_limit * if in_tool > 0 { 2 } else { 1 };
@@ -484,6 +498,19 @@ async fn follow(
                     cut = max_turns;
                     child.call(json!({"type": "abort"})).await?;
                 }
+                // The repeated-failure guard, as for main (DESIGN §4.4).
+                match tally.guard() {
+                    Some(crate::rpc::Guard::Steer(note)) => {
+                        let steer =
+                            json!({"type": "queue_message", "message": note, "deliverAs": "steer"});
+                        let _ = child.call(steer).await;
+                    }
+                    Some(crate::rpc::Guard::Stop(why)) if guarded.is_none() => {
+                        guarded = Some(why);
+                        child.call(json!({"type": "abort"})).await?;
+                    }
+                    _ => {}
+                }
             }
             None => anyhow::bail!("rpi exited mid-run"),
         }
@@ -492,6 +519,9 @@ async fn follow(
         return Ok(Err(anyhow::anyhow!(
             "stopped after {max} turns (budget.run_turns)"
         )));
+    }
+    if let Some(why) = guarded {
+        return Ok(Err(anyhow::anyhow!("stopped: {why}")));
     }
     let snap = child.call(json!({"type": "get_messages"})).await?;
     let reply = snap["messages"]

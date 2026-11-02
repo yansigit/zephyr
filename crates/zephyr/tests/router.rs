@@ -2499,3 +2499,367 @@ async fn a_steer_the_resumed_run_never_reached_is_sent_again_once() {
     assert!(!main_session(&home).contains("Zephyr restarted while you were working"));
     gw.shutdown().await;
 }
+
+/// Five identical failing `read` calls, under a `tool_fail` file.
+const FAILING_CALLS: &str = r#"[call read {"path": "x"}] [call read {"path": "x"}] [call read {"path": "x"}] [call read {"path": "x"}] [call read {"path": "x"}] go"#;
+const GUARD_NOTE: &str = "[zephyr] read failed 3 times in a row with the same error (tool error: \
+                          no such file: x). Don't retry it unchanged: change approach, or stop \
+                          and tell the owner.";
+
+#[tokio::test]
+async fn the_same_failure_is_steered_at_three_and_stopped_at_five() {
+    let home = home("guard");
+    std::fs::write(home.join("tool_fail"), "no such file: x").unwrap();
+    let gw = start(config(&home));
+    gw.say("m1", "owner", FAILING_CALLS).await;
+    let replies = gw.wait_replies(2).await;
+    assert_eq!(
+        replies[1],
+        "[zephyr] stopped a run that repeated a failing read call 5 times"
+    );
+    let steers = log(&home, "queue_message");
+    assert_eq!(steers.len(), 1, "{steers:?}");
+    assert_eq!(steers[0]["message"], GUARD_NOTE);
+    assert_eq!(steers[0]["deliverAs"], "steer");
+    assert_eq!(log(&home, "abort").len(), 1);
+    // A note the run never reached is taken back, so it cannot open the next run.
+    assert!(!log(&home, "clear_queue").is_empty());
+    std::fs::remove_file(home.join("tool_fail")).unwrap();
+    gw.say("m2", "owner", "hi").await;
+    assert_eq!(gw.wait_replies(3).await[2], "echo: [chat #2] hi");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_job_repeating_a_failing_call_is_stopped() {
+    let home = home("guard-job");
+    std::fs::write(home.join("tool_fail"), "no such file: x").unwrap();
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        &format!("/job add loop | {NEVER} | {FAILING_CALLS}"),
+    )
+    .await;
+    gw.say("m2", "owner", "/job run 1").await;
+    assert_eq!(
+        gw.wait_replies(3).await[2],
+        "[zephyr] job #1 (loop) run 1 failed: stopped: repeated a failing read call 5 times"
+    );
+    let steers = log(&home, "queue_message");
+    assert_eq!(steers.len(), 1, "{steers:?}");
+    assert_eq!(steers[0]["message"], GUARD_NOTE);
+    assert_eq!(log(&home, "abort").len(), 1);
+    gw.shutdown().await;
+}
+
+const UNDONE: &str = "[zephyr] undone: the agent no longer sees your last message or its reply; \
+                      files it changed stay changed (see /rollback)";
+
+/// The main session's messages, as the fake keeps them.
+fn messages(home: &Path) -> Vec<Value> {
+    let session: Value = serde_json::from_str(&main_session(home)).unwrap();
+    session["messages"].as_array().unwrap().clone()
+}
+
+/// The text of each message in the main session.
+fn texts(home: &Path) -> Vec<String> {
+    messages(home)
+        .iter()
+        .map(zephyr::rpc::message_text)
+        .collect()
+}
+
+#[tokio::test]
+async fn undo_takes_the_last_exchange_and_its_steers_out_of_the_context() {
+    let home = home("undo");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "one").await;
+    gw.wait_replies(1).await;
+    // The second run has a steered message in it: both rows are undone together.
+    std::fs::write(home.join("tool_wait"), "").unwrap();
+    gw.say("m2", "owner", "[tool] look around").await;
+    wait(|| main_session(&home).contains("toolCall")).await;
+    gw.say("m3", "owner", "what are you doing?").await;
+    wait(|| !log(&home, "queue_message").is_empty()).await;
+    std::fs::remove_file(home.join("tool_wait")).unwrap();
+    gw.wait_replies(3).await;
+
+    gw.say("m4", "owner", "/undo").await;
+    assert_eq!(gw.wait_replies(4).await[3], UNDONE);
+    // The leaf goes on the entry before the run's own message: "one", which stays.
+    assert_eq!(log(&home, "navigate")[0]["targetId"], "m1");
+    assert_eq!(inbox_status(&home, "undone"), 2);
+    assert_eq!(texts(&home), ["[chat #1] one", "echo: [chat #1] one"]);
+
+    // The first message has nothing before it: the root, an empty context.
+    gw.say("m5", "owner", "/undo").await;
+    assert_eq!(gw.wait_replies(5).await[4], UNDONE);
+    assert!(log(&home, "navigate")[1].get("targetId").is_none());
+    assert!(messages(&home).is_empty());
+    assert_eq!(inbox_status(&home, "undone"), 3);
+    gw.say("m6", "owner", "/undo").await;
+    assert_eq!(gw.wait_replies(6).await[5], "[zephyr] nothing to undo");
+
+    // The next message carries on from there.
+    gw.say("m7", "owner", "fresh").await;
+    assert_eq!(gw.wait_replies(7).await[6], "echo: [chat #7] fresh");
+    assert_eq!(log(&home, "prompt").len(), 3);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_gateway_crash_after_undo_sends_nothing_again() {
+    let home = home("undo-crash");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "one").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "/undo").await;
+    assert_eq!(gw.wait_replies(2).await, ["echo: [chat #1] one", UNDONE]);
+    gw.task.abort();
+    let _ = gw.task.await;
+
+    let gw = start(config(&home));
+    gw.say("m3", "owner", "two").await;
+    assert_eq!(gw.wait_replies(1).await, ["echo: [chat #3] two"]);
+    assert_eq!(
+        log(&home, "prompt").len(),
+        2,
+        "the undone row never went again"
+    );
+    assert_eq!(inbox_status(&home, "undone"), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn retry_undoes_and_sends_the_same_text_once() {
+    let home = home("retry");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "one").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "/retry").await;
+    assert_eq!(
+        gw.wait_replies(3).await,
+        [
+            "echo: [chat #1] one",
+            "[zephyr] undone; sending your last message again as #3",
+            "echo: [chat #3] one"
+        ]
+    );
+    let prompts = log(&home, "prompt");
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    assert_eq!(prompts[1]["message"], "[chat #3] one");
+    assert_eq!(texts(&home), ["[chat #3] one", "echo: [chat #3] one"]);
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    let row: (String, String, String) = db
+        .query_row(
+            "SELECT platform_msg_id, sender, status FROM inbox WHERE id = 3",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row, ("retry-1-1".into(), "owner".into(), "done".into()));
+    assert_eq!(inbox_status(&home, "undone"), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn compact_replies_with_rpis_summary() {
+    let home = home("compact");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "one").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "/compact keep the names").await;
+    let summary = gw.wait_replies(2).await[1].clone();
+    assert!(
+        summary.starts_with("[zephyr] Conversation compacted · ")
+            && summary.ends_with(" tokens before, 0 messages kept."),
+        "{summary}"
+    );
+    assert_eq!(
+        log(&home, "compact")[0]["customInstructions"],
+        "keep the names"
+    );
+    gw.say("m3", "owner", "/compact").await;
+    gw.wait_replies(3).await;
+    assert!(log(&home, "compact")[1].get("customInstructions").is_none());
+    // Idle again afterwards.
+    gw.say("m4", "owner", "two").await;
+    assert_eq!(gw.wait_replies(4).await[3], "echo: [chat #4] two");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn usage_lists_each_day_and_account() {
+    let home = home("usage");
+    let cfg = config(&home);
+    let store = Store::open(&cfg.db_path()).unwrap();
+    let db = rusqlite::Connection::open(cfg.db_path()).unwrap();
+    let (today, yesterday, old): (String, String, String) = db
+        .query_row(
+            "SELECT date('now'), date('now', '-1 day'), date('now', '-30 days')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    store.add_spend(&today, 100, 0.5).unwrap();
+    store.add_spend(&yesterday, 7, 0.01).unwrap();
+    store.add_spend(&old, 999, 9.0).unwrap();
+    store.add_account_spend("a", (60, 0.3)).unwrap();
+    store.add_account_spend("b", (40, 0.2)).unwrap();
+    drop(store);
+    let gw = start(cfg);
+    gw.say("m1", "owner", "/usage").await;
+    gw.say("m2", "owner", "/usage 1").await;
+    gw.say("m3", "owner", "/usage soon").await;
+    let replies = gw.wait_replies(3).await;
+    assert_eq!(
+        replies[0],
+        format!(
+            "[zephyr] usage over the last 7 days (UTC):\n{today}: 100 tokens, $0.5000\n  \
+             a: 60 tokens, $0.3000\n  b: 40 tokens, $0.2000\n{yesterday}: 7 tokens, $0.0100\n\
+             total: 107 tokens, $0.5100"
+        )
+    );
+    assert_eq!(
+        replies[1],
+        format!(
+            "[zephyr] usage over the last 1 day (UTC):\n{today}: 100 tokens, $0.5000\n  \
+             a: 60 tokens, $0.3000\n  b: 40 tokens, $0.2000"
+        )
+    );
+    assert_eq!(
+        replies[2],
+        "[zephyr] usage: /usage [days], 1 to 366 (default 7)"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn undo_retry_and_compact_wait_for_the_run() {
+    let home = home("undo-busy");
+    std::fs::write(home.join("hang"), "").unwrap();
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "long job").await;
+    wait(|| !home.join("hang").exists()).await;
+    for (id, command) in [("m2", "/undo"), ("m3", "/retry"), ("m4", "/compact")] {
+        gw.say(id, "owner", command).await;
+    }
+    let busy = "[zephyr] the agent is busy: wait for its reply, or /stop it first";
+    assert_eq!(gw.wait_replies(3).await, [busy, busy, busy]);
+    assert!(log(&home, "navigate").is_empty());
+    assert!(log(&home, "compact").is_empty());
+    gw.say("m5", "owner", "/stop").await;
+    gw.wait_replies(5).await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_rollback_waits_until_nothing_runs_then_restores_the_projects() {
+    let home = home("rollback");
+    let app = home.join("projects/app");
+    std::fs::create_dir_all(app.join(".git")).unwrap();
+    std::fs::write(app.join("a.txt"), "before").unwrap();
+    let mut cfg = config(&home);
+    cfg.projects = Some(home.join("projects"));
+    std::fs::write(home.join("hang"), "").unwrap();
+    let gw = start(cfg);
+    gw.say("m1", "owner", "long job").await;
+    wait(|| !home.join("hang").exists()).await; // mid-run, with its checkpoint taken
+    std::fs::write(app.join("a.txt"), "the run's edit").unwrap();
+
+    gw.say("m2", "owner", "/rollback").await;
+    let list = gw.wait_replies(1).await.remove(0);
+    assert!(
+        list.contains(", before \"long job\", app (1 files changed since)"),
+        "{list}"
+    );
+    gw.say("m3", "owner", "/rollback 1").await;
+    assert_eq!(
+        gw.wait_replies(2).await[1],
+        "[zephyr] not rolled back: a run still running; /stop them first"
+    );
+    let a = || std::fs::read_to_string(app.join("a.txt")).unwrap();
+    assert_eq!(a(), "the run's edit");
+
+    gw.say("m4", "owner", "/stop").await;
+    gw.wait_replies(4).await; // the stop notice, then the aborted run's fallback reply
+    gw.say("m5", "owner", "/rollback 1").await;
+    let reply = gw.wait_replies(5).await.remove(4);
+    assert!(
+        reply.starts_with("[zephyr] rolled back app to #1"),
+        "{reply}"
+    );
+    assert_eq!(a(), "before");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_skill_draft_reaches_the_agent_only_after_the_owners_ok() {
+    let home = home("skill");
+    let gw = start(config(&home));
+    let draft = home.join("skills/drafts/tea");
+    std::fs::create_dir_all(&draft).unwrap();
+    std::fs::write(
+        draft.join("SKILL.md"),
+        "---\nname: tea\ndescription: Use when brewing tea.\n---\nBoil water.\n",
+    )
+    .unwrap();
+    gw.say("m1", "owner", "hi").await;
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        replies[1].starts_with("[zephyr] the agent drafted a new skill tea; /skill ok tea"),
+        "{}",
+        replies[1]
+    );
+    let agents = || std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    assert!(!agents().contains("**tea**"));
+
+    gw.say("m2", "owner", "/skill ok tea").await;
+    assert!(gw.wait_replies(3).await[2].starts_with("[zephyr] skill tea approved"));
+    gw.say("m3", "owner", "again").await;
+    gw.wait_replies(4).await;
+    assert_eq!(log(&home, "start").len(), 2, "one restart, to load it");
+    assert!(
+        agents().contains("- **tea**: Use when brewing tea."),
+        "{}",
+        agents()
+    );
+    assert!(home.join(".approved/skills/tea/SKILL.md").exists());
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_approved_connector_restarts_the_agent_with_its_file() {
+    let home = home("mcp");
+    let gw = start(on_file(&home, ""));
+    let drafts = home.join("connectors/drafts");
+    std::fs::create_dir_all(&drafts).unwrap();
+    std::fs::write(
+        drafts.join("docs.json"),
+        r#"{"command": "python3", "args": ["/zephyr/docs-mcp.py"]}"#,
+    )
+    .unwrap();
+    gw.say("m1", "owner", "hi").await;
+    assert!(gw.wait_replies(2).await[1].contains("/mcp ok docs"));
+    gw.say("m2", "owner", "/mcp ok docs").await;
+    let reply = gw.wait_replies(3).await[2].clone();
+    assert!(
+        reply.starts_with(
+            "[zephyr] connector docs added to zephyr.toml\n[zephyr] restarting the agent"
+        ),
+        "{reply}"
+    );
+    gw.say("m3", "owner", "again").await;
+    gw.wait_replies(4).await;
+    assert_eq!(log(&home, "start").len(), 2);
+    let agents = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    assert!(
+        agents.contains("- **docs**: local, runs `python3`"),
+        "{agents}"
+    );
+    let file: Value =
+        serde_json::from_slice(&std::fs::read(home.join(".approved/mcp.json")).unwrap()).unwrap();
+    assert_eq!(file["mcpServers"]["docs"]["command"], "python3");
+    gw.shutdown().await;
+}

@@ -38,6 +38,7 @@ pub fn diff(old: &Config, new: &Config, active: Option<&Account>, next: Option<&
     if old.extensions != new.extensions
         || old.policy_plugin != new.policy_plugin
         || old.agent_dir != new.agent_dir
+        || old.mcp != new.mcp
     {
         return Plan::RestartChild;
     }
@@ -168,6 +169,13 @@ mod tests {
                 "{POOL}[attach]\nport = 7\ntoken_env = 'T'\n"
             ))),
             Plan::Reexec
+        );
+        // A child writes the connectors file and the plugin reads it once, at start.
+        assert_eq!(
+            same(&cfg(&format!(
+                "{POOL}[[mcp]]\nname = 'd'\nurl = 'http://x'\n"
+            ))),
+            Plan::RestartChild
         );
         // What the agent's processes may see is fixed at start.
         assert_eq!(
