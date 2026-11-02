@@ -23,10 +23,11 @@ cargo test -p zephyr --test attach -- --ignored   # drives real `rpi --connect` 
 
 cargo install --path crates/zephyr && zephyr up --build   # build deploy/Dockerfile and run it locally
 deploy/release.sh 0.2.1 | --cli                           # release from a clean main (README "Releasing")
+deploy/runner/start.sh up|down                            # self-hosted fallback runner (README "Releasing")
 ```
 
 `ZEPHYR_CONTAINER` / `ZEPHYR_IMAGE` point the host CLI at another container or image, to test beside a
-live install. Pushing a `v*` tag publishes `ghcr.io/yansigit/zephyr:<version>` (`.github/workflows/image.yml`).
+live install. Pushing a `v*` tag publishes `ghcr.io/yansigit/zephyr:<version>` and `:latest` (`.github/workflows/image.yml`).
 
 ## Architecture
 
