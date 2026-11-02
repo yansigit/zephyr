@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-command release (README "Releasing"), run from a clean, pushed `main`:
-#   deploy/release.sh 0.2.1   bump, tag, wait for ghcr, install the CLI, back up state.db, upgrade
+#   deploy/release.sh 0.2.1   bump, tag, wait for ghcr, install the CLI, upgrade
 #   deploy/release.sh --cli   a host-only change: test and install the CLI, nothing published
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -46,7 +46,9 @@ if [ -n "$version" ]; then
     sleep 5
   done
   [ -n "$run" ] || die "no image workflow run started for $tag"
-  gh run watch "$run" --exit-status >/dev/null || die "the image workflow failed: gh run view $run --log-failed"
+  gh run watch "$run" --exit-status >/dev/null || die "the image workflow failed: gh run view $run --log-failed
+  if GitHub's runners are out of minutes: gh variable set ZEPHYR_RUNNER --body zephyr-local && gh run rerun $run
+  once the image is published, finish by hand: cargo install --locked --path crates/zephyr && zephyr upgrade"
 fi
 
 step "installing the CLI"
@@ -57,15 +59,6 @@ first=$(command -v zephyr)
 
 step "upgrading the live install"
 zephyr=$HOME/.cargo/bin/zephyr
-# Never mid-turn: wait while a message, a reply or a job is in flight.
-while "$zephyr" status | grep -qE '^(inbox +(new|dispatched)|outbox +pending|runs +(claimed|running)) '; do
-  echo "the agent is busy; waiting..."
-  sleep 10
-done
-# Schema migrations only go forward: keep the old state.db, copied consistently by the daemon's side.
-backup=/var/lib/zephyr/state.db.$current.bak
-docker exec "${ZEPHYR_CONTAINER:-zephyr}" /usr/bin/python3 -c \
-  "import sqlite3; sqlite3.connect('/var/lib/zephyr/state.db').backup(sqlite3.connect('$backup'))"
-echo "state.db backed up to ~/.zephyr-daemon/${backup##*/}"
-"$zephyr" upgrade
+# It waits until the agent is idle and backs up state.db first; the version need not be :latest yet.
+"$zephyr" upgrade "$version"
 echo "done: $tag is published and running"

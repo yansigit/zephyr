@@ -12,6 +12,12 @@ cargo install --path crates/zephyr   # the same binary runs on the host and in t
 zephyr init                          # the wizard; safe to run again, it offers the current values
 ```
 
+Install without Rust (Linux x86_64; while the package is private, `docker login ghcr.io` first):
+
+```sh
+docker run --rm --entrypoint cat ghcr.io/yansigit/zephyr:latest /usr/local/bin/zephyr > ~/.local/bin/zephyr && chmod +x ~/.local/bin/zephyr
+```
+
 `zephyr init` checks Docker, asks for the projects folder the agent may work in, pulls the image
 (`docker login ghcr.io` with your `gh` token when needed; it builds locally when it cannot pull),
 starts the container, signs in the providers you pick, sets the failover order and the channels,
@@ -33,7 +39,8 @@ zephyr login openai-codex --account codex-main
 
 | Command | What it does |
 |---|---|
-| `zephyr up [--build]` / `down` / `restart` / `upgrade` | Start (building the image locally with `--build`), stop, restart, pull the new image and restart |
+| `zephyr up [--build]` / `down` / `restart` | Start (building the image locally with `--build`), stop, restart |
+| `zephyr upgrade [VERSION]` | Move to the newest release (updating this CLI from the image first), once the agent is idle, after backing up `state.db` to `~/.zephyr-daemon/state.db.<old version>.bak`. With an older VERSION, go back to it by restoring that version's backup |
 | `zephyr status` / `logs [-f]` / `doctor [--fix]` | Container and daemon state, logs, checks (and repairs) |
 | `zephyr --version` | This CLI's version and the running container's, with a hint when they differ |
 | `zephyr login <provider> [--account NAME]` | Sign in an account, then make a small test call (`--no-verify` skips it) |
@@ -280,6 +287,7 @@ deploy/release.sh --cli   # only the host CLI changed: reinstall it, publish not
 The script stops at the first problem. It runs fmt, clippy and the tests, sets the version in
 `Cargo.toml` (the CLI pulls `ghcr.io/yansigit/zephyr:<version>`), commits and tags `v<version>`,
 pushes, and waits for the image workflow. Then it installs the CLI into `~/.cargo/bin` (from the
-clean tree, so nothing uncommitted ships), waits until no message, reply or job is in flight, backs
-up `state.db` to `~/.zephyr-daemon/state.db.<old version>.bak` (migrations only go forward), and
-runs `zephyr upgrade`. To go back to an older image, restore that backup first.
+clean tree, so nothing uncommitted ships) and runs `zephyr upgrade <version>`, which waits until no
+message, reply or job is in flight and backs up `state.db` to
+`~/.zephyr-daemon/state.db.<old version>.bak` (migrations only go forward). `zephyr upgrade <older
+version>` goes back, restoring that version's backup.
