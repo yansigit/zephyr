@@ -64,7 +64,10 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   sessions and process logs older than 30 days. Tasks interrupted by a crash or re-exec resume in their session (`scheduler::resume`, at most
   3 times), and runs with no rpi event for `stall_limit` are aborted. Mid-run messages are steered in (`queue_message` `deliverAs: steer`,
   DESIGN §4.1),
-  `memory.rs` (git-committed memory files), `attach.rs` (rpi remote JSON-RPC shim so stock
+  `memory.rs` (git-committed memory files), `checkpoint.rs` (DESIGN §4.14: snapshots of the
+  projects folder, `$ZEPHYR_PROJECTS`, into the agent's shadow-git store `<home>/.checkpoints`
+  before each prompt/continue, task and job, at most 10 s; `/rollback` lists, diffs and restores;
+  pruned to 50 per project by `retention.rs`), `attach.rs` (rpi remote JSON-RPC shim so stock
   `rpi --connect` attaches to `main`).
 - The agent's tools (DESIGN §4.11): the browser, Camoufox and the X desktop are CLIs in the image,
   run through `bash`. `desktop.rs` keeps Xvfb up when `ZEPHYR_DESKTOP` is set. `send_file`,

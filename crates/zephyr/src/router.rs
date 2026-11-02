@@ -166,7 +166,7 @@ fn update(tx: &watch::Sender<Snapshot>, f: impl FnOnce(&mut Snapshot)) -> bool {
 }
 
 /// Whitespace folded, at most 60 chars, `…` when cut.
-fn preview(text: &str) -> String {
+pub(crate) fn preview(text: &str) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     match flat.char_indices().nth(60) {
         Some((i, _)) => format!("{}…", &flat[..i]),
@@ -1027,6 +1027,10 @@ impl<'a> Router<'a> {
                 (false, true) => "continue",
                 (false, false) => "prompt",
             };
+            // The projects as they were before this run (DESIGN §4.14); a steer's run has one.
+            if !self.busy {
+                crate::checkpoint::before(&self.cfg, &row.text).await;
+            }
             // Durable before the child sees it, so recovery knows to look for it, and how.
             self.store.mark_dispatched_as(row.id, sent_as)?;
             let text = match again {
@@ -1199,8 +1203,29 @@ impl<'a> Router<'a> {
                 Some(Ok(id)) => crate::tasks::stop(&mut self.store, self.jobs, Some(id)),
                 _ => "[zephyr] usage: /task list, /task stop <id>".into(),
             },
+            ("/rollback", arg) => {
+                let busy = self.rollback_busy();
+                crate::checkpoint::command(&self.cfg, arg, busy.as_deref()).await
+            }
             _ => return None,
         })
+    }
+
+    /// What a `/rollback N` waits for: anything that may still be writing to the projects.
+    /// A store error counts as busy.
+    fn rollback_busy(&self) -> Option<String> {
+        let tasks = self.store.tasks(0).map_or(true, |t| !t.is_empty());
+        let procs = self.store.running_procs().map_or(true, |p| !p.is_empty());
+        let what: Vec<&str> = [
+            (self.busy, "a run"),
+            (self.jobs.running.load(Ordering::SeqCst), "a job run"),
+            (tasks, "a background task"),
+            (procs, "an exec process"),
+        ]
+        .into_iter()
+        .filter_map(|(on, what)| on.then_some(what))
+        .collect();
+        (!what.is_empty()).then(|| format!("{} still running", what.join(", ")))
     }
 
     /// `/btw <question>`: reads `main`'s messages (rpi answers `get_messages` mid-run too) and

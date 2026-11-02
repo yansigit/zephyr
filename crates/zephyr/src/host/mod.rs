@@ -241,6 +241,8 @@ impl Host {
         .args(["-e", "RPI_CODING_AGENT_DIR=/zephyr/.rpi/agent"])
         .args(["-e", &format!("ZEPHYR_AGENT_UID={}", ids.0)])
         .args(["-e", &format!("ZEPHYR_AGENT_GID={}", ids.1)])
+        // Turns on `/rollback`'s checkpoints of the projects folder (DESIGN §4.14).
+        .args(["-e", &format!("ZEPHYR_PROJECTS={projects}")])
         .args(["--mount", &format!("type=bind,src={data},dst=/zephyr")])
         .args([
             "--mount",

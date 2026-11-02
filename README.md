@@ -165,6 +165,16 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   a container restart ends them, and they are reported. A stopped task reports how far it got.
   Old job and task sessions and process logs are deleted after 30 days. A run that makes
   no progress for 10 minutes (20 inside a command) is stopped and you are told.
+- **Undoing file changes.** Before each run (a message, a task, a job) zephyr takes a checkpoint of
+  every folder in your projects folder that changed since the last one (`node_modules/`,
+  `target/`, `.venv/`, `dist/`, `build/`, `*.log`, `.env*` and what a project's `.gitignore`
+  ignores are skipped). `/rollback` lists the newest 10, `/rollback diff N` shows what changed
+  since checkpoint N, and `/rollback N [PROJECT]` puts the files back as they were then: changed
+  and deleted files return, new ones are removed, ignored ones are left alone. It is refused while
+  the agent, a task or an `exec` command is running (`/stop` them first), and it takes a checkpoint
+  first, so `/rollback 1` undoes it. The newest 50 per project are kept, in `~/.zephyr/.checkpoints`;
+  the agent can reach them, so this is an undo, not a guard. A container from before this needs
+  `zephyr up` once.
 
 A site's terms may forbid automated use; a site that catches the agent can flag the account it is
 signed in as.

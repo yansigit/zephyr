@@ -64,6 +64,10 @@ pub struct Config {
     /// The file this was loaded from, which a reload reads again. `None` when built in memory.
     #[serde(skip)]
     pub path: Option<PathBuf>,
+    /// The projects folder `/rollback` checkpoints (DESIGN §4.14): `$ZEPHYR_PROJECTS`, which
+    /// `zephyr up` sets. `None` turns checkpoints off. Not configurable; tests set it.
+    #[serde(skip, default = "projects")]
+    pub projects: Option<PathBuf>,
 }
 
 fn job_timeout() -> std::time::Duration {
@@ -76,6 +80,12 @@ fn exec_backstop() -> std::time::Duration {
 
 fn stall_limit() -> std::time::Duration {
     std::time::Duration::from_secs(10 * 60)
+}
+
+fn projects() -> Option<PathBuf> {
+    std::env::var_os("ZEPHYR_PROJECTS")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Sent once, when a budget limit is crossed.
