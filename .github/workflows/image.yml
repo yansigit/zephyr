@@ -1,32 +1,53 @@
-# Publishes ghcr.io/yansigit/zephyr:<version> for each v* tag; `zephyr init` and `zephyr upgrade` pull it.
+# Publishes ghcr.io/yansigit/zephyr:<version> and :latest for each v* tag; `zephyr init` and
+# `zephyr upgrade` pull it. A manual run (`gh workflow run image.yml --ref <branch>`) builds :dev
+# without pushing anything.
 # Secret PROVIDER_REPOS_TOKEN: a fine-grained token with contents:read on yansigit/rpi-package and
 # yansigit/rpi-provider-plugins, passed to the build as the gh_token secret. It is only needed while
 # one of them is private; the build works without it when both are public.
+# Variable ZEPHYR_RUNNER: unset runs on GitHub-hosted ubuntu-24.04; `zephyr-local` runs on the
+# fallback runner from deploy/runner/start.sh, which builds on its zephyr-buildkitd (README "Releasing").
 name: image
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 permissions:
   contents: read
   packages: write
 jobs:
   image:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.ZEPHYR_RUNNER || 'ubuntu-24.04' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - id: v
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+        run: |
+          case $GITHUB_REF in refs/tags/v*) v=${GITHUB_REF_NAME#v} ;; *) v=dev ;; esac
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - if: vars.ZEPHYR_RUNNER == ''
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - if: vars.ZEPHYR_RUNNER != ''
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver: remote
+          endpoint: tcp://zephyr-buildkitd:1234
+      # No daemon needed: when `docker login` can't reach one, the CLI logs in client-side and still
+      # writes ~/.docker/config.json, which buildx hands to the remote BuildKit for the push.
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: deploy/Dockerfile
-          push: true
-          tags: ghcr.io/yansigit/zephyr:${{ steps.v.outputs.version }}
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          # :latest only from a tag push, so a manual run on an old tag can't move it back.
+          tags: |
+            ghcr.io/yansigit/zephyr:${{ steps.v.outputs.version }}
+            ${{ github.event_name == 'push' && 'ghcr.io/yansigit/zephyr:latest' || '' }}
+          # The local runner's BuildKit keeps its own cache volume; shipping it through gha would only add uploads.
+          cache-from: ${{ vars.ZEPHYR_RUNNER == '' && 'type=gha' || '' }}
+          cache-to: ${{ vars.ZEPHYR_RUNNER == '' && 'type=gha,mode=max' || '' }}
           secrets: |
             gh_token=${{ secrets.PROVIDER_REPOS_TOKEN }}

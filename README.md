@@ -283,3 +283,11 @@ pushes, and waits for the image workflow. Then it installs the CLI into `~/.carg
 clean tree, so nothing uncommitted ships), waits until no message, reply or job is in flight, backs
 up `state.db` to `~/.zephyr-daemon/state.db.<old version>.bak` (migrations only go forward), and
 runs `zephyr upgrade`. To go back to an older image, restore that backup first.
+
+The image workflow tags `:<version>` and `:latest` and runs on GitHub-hosted runners. When the
+Actions minutes run out, start the fallback runner on this machine once with
+`deploy/runner/start.sh up`, then `gh variable set ZEPHYR_RUNNER --body zephyr-local` and
+`gh run rerun <id>`; `gh variable delete ZEPHYR_RUNNER` switches back, and
+`deploy/runner/start.sh down` removes it. The runner and its rootless BuildKit sit on their own
+Docker network with no Docker socket and no access to the host's files or localhost.
+`gh workflow run image.yml --ref <branch>` builds a test image (`:dev`) without pushing it.
