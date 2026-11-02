@@ -22,12 +22,25 @@ case "$1" in
   inspect) echo "${SHIM_STATE:-running}"; exit 0 ;;
   info) echo "${SHIM_RUNTIMES:-io.containerd.runc.v2 runc}"; exit 0 ;;
   image) exit "${SHIM_IMAGE_MISSING:-0}" ;;
+  pull) exit "${SHIM_PULL_FAIL:-0}" ;;
+  run)
+    case " $* " in
+      *" --entrypoint zephyr "*) echo "zephyr $SHIM_LATEST" ;;
+      # The image's CLI: names its image's tag, and logs how it was run.
+      *" --entrypoint cat "*) printf '#!/bin/bash\n[ "$1" = --version ] && { echo "zephyr %s"; exit; }\necho "$@" >> "%s/exec.log"\n' "${5##*:}" "$SHIM_DIR" ;;
+      *" --entrypoint python3 "*)
+        case "${@: -1}" in
+          *"sys.exit(not os.path.exists"*) [ -n "$SHIM_HAS_BAK" ]; exit ;;
+          *".backup("*) exit "${SHIM_PY_FAIL:-0}" ;;
+        esac ;;
+    esac ;;
   exec)
     case " $* " in *" -i "*) cat >> "$SHIM_DIR/stdin.log" ;; esac
     case " $* " in
       *" --list-models "*) printf 'provider model context\nanthropic claude-sonnet-5 200K\nopenai-codex gpt-5.5 400K\nopenai-codex gpt-5.4 400K\n' ;;
       *" auth check "*) echo '{"ready":true,"provider":"claude-code","source":"auth.json"}' ;;
       *" zephyr status "*) echo "daemon: ${SHIM_DAEMON:-running}" ;;
+      *" zephyr --version "*) [ -n "$SHIM_VERSION" ] || exit 2; echo "zephyr $SHIM_VERSION" ;;
       *" zephyr tui "*) exit "${SHIM_TUI_EXIT:-0}" ;;
     esac ;;
 esac
@@ -78,12 +91,24 @@ impl Env {
     }
 
     fn zephyr_env(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        self.run_cli(Path::new(env!("CARGO_BIN_EXE_zephyr")), args, env)
+    }
+
+    /// A copy of the CLI, for `zephyr upgrade` to replace instead of target/debug/zephyr.
+    fn cli_copy(&self) -> PathBuf {
+        let cli = self.dir.join("cli/zephyr");
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::copy(env!("CARGO_BIN_EXE_zephyr"), &cli).unwrap();
+        cli
+    }
+
+    fn run_cli(&self, cli: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
         let path = format!(
             "{}:{}",
             self.dir.join("bin").display(),
             std::env::var("PATH").unwrap()
         );
-        let out = Command::new(env!("CARGO_BIN_EXE_zephyr"))
+        let out = Command::new(cli)
             .args(args)
             .env_clear()
             .env("PATH", path)
@@ -932,4 +957,258 @@ fn doctor_fix_repairs_modes() {
     assert!(stdout(&out).contains(&format!("FAIL {} is private", secrets.display())));
     env.ok(&["doctor", "--fix"]);
     assert_eq!(mode(&secrets), 0o600);
+}
+
+#[test]
+fn version_names_the_cli_and_the_running_container() {
+    let env = Env::new("version");
+    let me = env!("CARGO_PKG_VERSION");
+    let out = env.zephyr_env(&["--version"], &[("SHIM_VERSION", me)]);
+    assert!(out.status.success());
+    assert_eq!(
+        stdout(&out),
+        format!("zephyr {me}\ncontainer {CONTAINER}: {me}\n")
+    );
+    let older = stdout(&env.zephyr_env(&["-V"], &[("SHIM_VERSION", "0.0.1")]));
+    assert!(
+        older.ends_with(
+            ": 0.0.1 (not this CLI's; `zephyr upgrade` brings both to the newest release)\n"
+        ),
+        "{older}"
+    );
+    // An image without --version is named by its image instead.
+    let old = stdout(&env.zephyr(&["--version"]));
+    assert_eq!(old.lines().count(), 2, "{old}");
+    let stopped = env.zephyr_env(&["--version"], &[("SHIM_STATE", "exited")]);
+    assert_eq!(stdout(&stopped), format!("zephyr {me}\n"));
+}
+
+#[test]
+fn channel_list_and_remove_edit_the_toml_and_secrets() {
+    let env = Env::new("channel");
+    env.init(&["--no-start"]);
+    assert_eq!(env.ok(&["channel", "list"]), "chat     owners: 0\n");
+
+    // Both channels, as `channel add` leaves them; the owners go in through `config set`.
+    env.ok(&["config", "set", "owners.discord", "[\"1234\"]"]);
+    env.ok(&["config", "set", "discord.token_env", "ZEPHYR_DISCORD_TOKEN"]);
+    env.ok(&["config", "set", "owners.imessage", "[\"+15550100\"]"]);
+    let mut cfg = env.config();
+    cfg.push_str(
+        "\n[imessage]\nlisten = \"100.64.0.1:8080\"\nserver_url = \"http://100.64.0.2:1234\"\n\
+         password_env = \"ZEPHYR_BB_PASSWORD\"\nsecret_env = \"ZEPHYR_BB_SECRET\"\n",
+    );
+    std::fs::write(env.daemon().join("zephyr.toml"), cfg).unwrap();
+    let secrets = env.daemon().join("secrets.env");
+    std::fs::write(
+        &secrets,
+        "ZEPHYR_DISCORD_TOKEN=d\nZEPHYR_BB_PASSWORD=pw\nZEPHYR_BB_SECRET=s\nOTHER=keep\n",
+    )
+    .unwrap();
+    assert_eq!(
+        env.ok(&["channel", "list"]),
+        "chat     owners: 0\ndiscord  owners: 1234\nimessage owners: +15550100\n"
+    );
+
+    env.calls();
+    env.ok(&["channel", "remove", "discord"]);
+    find(
+        &env.calls(),
+        &["docker", "exec", CONTAINER, "zephyr", "reload"],
+    );
+    let text = env.config();
+    let cfg: toml::Value = toml::from_str(&text).unwrap();
+    assert!(cfg.get("discord").is_none(), "{text}");
+    assert!(cfg["owners"].get("discord").is_none(), "{text}");
+    assert_eq!(cfg["owners"]["imessage"][0].as_str(), Some("+15550100"));
+    assert!(text.contains("# Zephyr's config"), "{text}");
+    assert_eq!(cfg["attach"]["port"].as_integer(), Some(7790));
+    let left = std::fs::read_to_string(&secrets).unwrap();
+    assert_eq!(
+        left,
+        "ZEPHYR_BB_PASSWORD=pw\nZEPHYR_BB_SECRET=s\nOTHER=keep\n"
+    );
+
+    let again = env.zephyr(&["channel", "remove", "discord"]);
+    assert!(!again.status.success());
+    assert!(String::from_utf8_lossy(&again.stderr).contains("discord is not configured"));
+
+    env.ok(&["channel", "remove", "imessage"]);
+    let cfg: toml::Value = toml::from_str(&env.config()).unwrap();
+    assert!(cfg.get("imessage").is_none() && cfg["owners"].get("imessage").is_none());
+    assert_eq!(std::fs::read_to_string(&secrets).unwrap(), "OTHER=keep\n");
+    assert_eq!(env.ok(&["channel", "list"]), "chat     owners: 0\n");
+}
+
+#[test]
+fn help_prints_usage_on_stdout_and_exits_0() {
+    let env = Env::new("help");
+    for arg in ["--help", "-h", "help"] {
+        let out = env.zephyr(&[arg]);
+        assert!(out.status.success(), "{arg}");
+        assert_eq!(stdout(&out), format!("{}\n", zephyr::host::USAGE), "{arg}");
+    }
+    let cases: [&[&str]; 2] = [&["bogus"], &[]];
+    for args in cases {
+        let out = env.zephyr(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).starts_with("usage: zephyr <command>"));
+    }
+}
+
+/// Where the first call starting with `prefix` and containing `has` is, if any.
+fn at(calls: &[Vec<String>], prefix: &[&str], has: &str) -> Option<usize> {
+    calls.iter().position(|c| {
+        c.len() >= prefix.len() && c[..prefix.len()] == *prefix && c.iter().any(|a| a.contains(has))
+    })
+}
+
+const PY: &[&str] = &["docker", "run", "--rm", "--user", "0"];
+const RM: &[&str] = &["docker", "rm", "-f"];
+const RUN: &[&str] = &["docker", "run", "-d"];
+
+#[test]
+fn upgrade_replaces_the_cli_from_the_newer_image_first() {
+    let env = Env::new("upgrade-cli");
+    let me = env!("CARGO_PKG_VERSION");
+    let cli = env.cli_copy();
+    let vars = [
+        ("ZEPHYR_IMAGE", ""),
+        ("SHIM_LATEST", "99.0.0"),
+        ("SHIM_VERSION", me),
+    ];
+    let out = env.run_cli(&cli, &["upgrade"], &vars);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout(&out).contains(&format!("zephyr CLI: {me} -> 99.0.0")));
+    // The image's CLI took this one's place and finishes the upgrade.
+    assert_eq!(read(&env.dir.join("exec.log")), "upgrade 99.0.0\n");
+    assert!(read(&cli).contains("exec.log"));
+    let calls = env.calls();
+    find(
+        &calls,
+        &["docker", "pull", "ghcr.io/yansigit/zephyr:latest"],
+    );
+    find(
+        &calls,
+        &[
+            "docker",
+            "run",
+            "--rm",
+            "--entrypoint",
+            "cat",
+            "ghcr.io/yansigit/zephyr:99.0.0",
+        ],
+    );
+    assert_eq!(at(&calls, RM, ""), None, "{calls:#?}");
+
+    // A CLI it cannot replace names the command that does it by hand; nothing else changes.
+    let cli = env.cli_copy();
+    let dir = cli.parent().unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let out = env.run_cli(&cli, &["upgrade"], &vars);
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!(
+            "docker run --rm --entrypoint cat ghcr.io/yansigit/zephyr:99.0.0 /usr/local/bin/zephyr > {}",
+            cli.display()
+        )),
+        "{err}"
+    );
+    assert_eq!(at(&env.calls(), RM, ""), None);
+
+    // No `latest` to read: an error, never a local build.
+    let out = env.run_cli(&cli, &["upgrade"], &[vars[0], ("SHIM_PULL_FAIL", "1")]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("could not pull ghcr.io/yansigit/zephyr:latest"));
+    assert_eq!(at(&env.calls(), &["docker", "build"], ""), None);
+    assert!(!env.zephyr(&["upgrade", "v1.2"]).status.success());
+}
+
+#[test]
+fn upgrade_waits_backs_up_and_goes_back_only_with_a_backup() {
+    let env = Env::new("upgrade-db");
+    env.init(&["--no-start"]);
+    let me = env!("CARGO_PKG_VERSION");
+    let upgrade = |vars: &[(&str, &str)]| {
+        let vars = [&[("ZEPHYR_IMAGE", "")][..], vars].concat();
+        let out = env.zephyr_env(&["upgrade", me], &vars);
+        (out, env.calls())
+    };
+
+    // Already there: nothing restarts.
+    let (out, calls) = upgrade(&[("SHIM_VERSION", me)]);
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), format!("already on {me}\n"));
+    assert_eq!(at(&calls, RM, ""), None);
+
+    // Forward: state.db is backed up under the running version before the container goes.
+    let (out, calls) = upgrade(&[("SHIM_VERSION", "0.0.1")]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let backup = at(&calls, PY, "connect('/var/lib/zephyr/state.db.0.0.1.bak')").expect("backup");
+    assert!(backup < at(&calls, RM, "").unwrap() && backup < at(&calls, RUN, "").unwrap());
+    assert!(stdout(&out).contains(&format!(
+        "state.db backed up to {}",
+        env.daemon().join("state.db.0.0.1.bak").display()
+    )));
+    find(
+        &calls,
+        &["docker", "pull", &format!("ghcr.io/yansigit/zephyr:{me}")],
+    );
+
+    // A failed backup stops it.
+    let (out, calls) = upgrade(&[("SHIM_VERSION", "0.0.1"), ("SHIM_PY_FAIL", "1")]);
+    assert!(!out.status.success());
+    assert_eq!(at(&calls, RM, ""), None);
+
+    // Going back needs that version's backup.
+    let (out, calls) = upgrade(&[("SHIM_VERSION", "99.0.0")]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!("no backup from {me} (state.db.{me}.bak)")),
+        "{err}"
+    );
+    assert_eq!(at(&calls, RM, ""), None);
+    let (out, calls) = upgrade(&[("SHIM_VERSION", "99.0.0"), ("SHIM_HAS_BAK", "1")]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let backup = at(&calls, PY, "connect('/var/lib/zephyr/state.db.99.0.0.bak')").expect("backup");
+    let rm = at(&calls, RM, "").unwrap();
+    let restore = at(&calls, PY, &format!("shutil.copy(d + 'state.db.{me}.bak'")).expect("restore");
+    let run = at(&calls, RUN, "").unwrap();
+    assert!(backup < rm && rm < restore && restore < run, "{calls:#?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("changes since that backup are lost"));
+
+    // A named image keeps its own: no CLI from it, but the backup still comes first.
+    let out = env.zephyr(&["upgrade"]);
+    assert!(out.status.success());
+    let calls = env.calls();
+    assert_eq!(
+        at(
+            &calls,
+            &["docker", "run", "--rm", "--entrypoint", "cat"],
+            ""
+        ),
+        None
+    );
+    assert!(at(&calls, PY, ".backup").unwrap() < at(&calls, RUN, "").unwrap());
+}
+
+fn read(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap()
 }

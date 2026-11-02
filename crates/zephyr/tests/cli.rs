@@ -102,6 +102,12 @@ fn pause_and_resume_work_with_a_daemon_and_without_one() {
     assert!(stdout(&zephyr(&cfg, &["status"])).contains("paused: yes (user)"));
     assert_eq!(stdout(&zephyr(&cfg, &["resume"])), "[zephyr] resumed");
     assert!(stdout(&zephyr(&cfg, &["status"])).contains("paused: no"));
+    let me = env!("CARGO_PKG_VERSION");
+    assert!(stdout(&zephyr(&cfg, &["status"])).starts_with(&format!("version: {me}\n")));
+    assert_eq!(
+        stdout(&zephyr(&cfg, &["--version"])),
+        format!("zephyr {me}")
+    );
     drop(running);
 
     // With no daemon, the store carries the flag to the next start.

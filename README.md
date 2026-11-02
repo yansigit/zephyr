@@ -12,6 +12,12 @@ cargo install --path crates/zephyr   # the same binary runs on the host and in t
 zephyr init                          # the wizard; safe to run again, it offers the current values
 ```
 
+Install without Rust (Linux x86_64; while the package is private, `docker login ghcr.io` first):
+
+```sh
+docker run --rm --entrypoint cat ghcr.io/yansigit/zephyr:latest /usr/local/bin/zephyr > ~/.local/bin/zephyr && chmod +x ~/.local/bin/zephyr
+```
+
 `zephyr init` checks Docker, asks for the projects folder the agent may work in, pulls the image
 (`docker login ghcr.io` with your `gh` token when needed; it builds locally when it cannot pull),
 starts the container, signs in the providers you pick, sets the failover order and the channels,
@@ -33,12 +39,14 @@ zephyr login openai-codex --account codex-main
 
 | Command | What it does |
 |---|---|
-| `zephyr up [--build]` / `down` / `restart` / `upgrade` | Start (building the image locally with `--build`), stop, restart, pull the new image and restart |
+| `zephyr up [--build]` / `down` / `restart` | Start (building the image locally with `--build`), stop, restart |
+| `zephyr upgrade [VERSION]` | Move to the newest release (updating this CLI from the image first), once the agent is idle, after backing up `state.db` to `~/.zephyr-daemon/state.db.<old version>.bak`. With an older VERSION, go back to it by restoring that version's backup |
 | `zephyr status` / `logs [-f]` / `doctor [--fix]` | Container and daemon state, logs, checks (and repairs) |
+| `zephyr --version` | This CLI's version and the running container's, with a hint when they differ |
 | `zephyr login <provider> [--account NAME]` | Sign in an account, then make a small test call (`--no-verify` skips it) |
 | `zephyr accounts [list \| order NAME.. \| remove NAME]` | The failover pool |
 | `zephyr model [--account NAME] [PROVIDER/MODEL]` | An account's model (or the default without accounts); with no model, pick from `rpi --list-models` |
-| `zephyr channel add discord\|imessage` | Channel settings; secrets are asked for hidden. Discord shows typing while the agent works, and a progress note after 20 s (`discord.progress`, `discord.progress_after_secs`) |
+| `zephyr channel add\|remove discord\|imessage \| list` | Channel settings (secrets are asked for hidden); `remove` drops the channel, its owners and secrets, `list` shows them. Discord shows typing while the agent works, and a progress note after 20 s (`discord.progress`, `discord.progress_after_secs`) |
 | `zephyr skill add DIR \| list \| rm NAME` | Skills the agent may use (see [Skills and connectors](#skills-and-connectors)); one you add is approved at once |
 | `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}` |
 | `zephyr config get\|set KEY [VALUE]` | Edit `zephyr.toml` (comments are kept; invalid keys are refused) |
@@ -279,6 +287,16 @@ deploy/release.sh --cli   # only the host CLI changed: reinstall it, publish not
 The script stops at the first problem. It runs fmt, clippy and the tests, sets the version in
 `Cargo.toml` (the CLI pulls `ghcr.io/yansigit/zephyr:<version>`), commits and tags `v<version>`,
 pushes, and waits for the image workflow. Then it installs the CLI into `~/.cargo/bin` (from the
-clean tree, so nothing uncommitted ships), waits until no message, reply or job is in flight, backs
-up `state.db` to `~/.zephyr-daemon/state.db.<old version>.bak` (migrations only go forward), and
-runs `zephyr upgrade`. To go back to an older image, restore that backup first.
+clean tree, so nothing uncommitted ships) and runs `zephyr upgrade <version>`, which waits until no
+message, reply or job is in flight and backs up `state.db` to
+`~/.zephyr-daemon/state.db.<old version>.bak` (migrations only go forward). `zephyr upgrade <older
+version>` goes back, restoring that version's backup.
+
+The image workflow tags `:<version>` and `:latest` and runs on GitHub-hosted runners. When the
+Actions minutes run out, start the fallback runner on this machine once with
+`deploy/runner/start.sh up`, then `gh variable set ZEPHYR_RUNNER --body zephyr-local` and
+`gh run rerun <id>`; `gh variable delete ZEPHYR_RUNNER` switches back, and
+`deploy/runner/start.sh down` removes it. The runner and its rootless BuildKit sit on their own
+Docker network with no Docker socket, no access to the host's files and no route to its
+localhost; services the host serves on all interfaces (SSH, ComfyUI, ...) are still reachable.
+`gh workflow run image.yml --ref <branch>` builds a test image (`:dev`) without pushing it.

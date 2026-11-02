@@ -7,17 +7,18 @@ mod setup;
 use anyhow::{bail, Context};
 use conf::{Data, DAEMON_FILES, DAEMON_MOUNT};
 use std::io::{IsTerminal, Write};
-use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-pub const USAGE: &str = "usage: zephyr <command>
+pub const USAGE: &str = "usage: zephyr <command>   (zephyr --version: this CLI's and the container's)
   init [--non-interactive --projects DIR --provider ID.. --account NAME=PROVIDER/MODEL.. --model P/M --no-start]
-  up [--build] | down | restart | logs [-f] | status | upgrade
+  up [--build] | down | restart | logs [-f] | status | upgrade [VERSION]
   login <provider> [--account NAME] [--model P/M] [--no-verify]
   accounts [list | order NAME.. | remove NAME]
   model [--account NAME] [PROVIDER/MODEL]
-  channel add discord|imessage
+  channel add|remove discord|imessage | list
   skill add DIR | list | rm NAME
   mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. | list | rm NAME
   config get|set KEY [VALUE]
@@ -25,6 +26,9 @@ pub const USAGE: &str = "usage: zephyr <command>
   doctor [--fix]
   uninstall [--keep-data] [--yes]
 env: ZEPHYR_CONTAINER (default zephyr), ZEPHYR_IMAGE, ZEPHYR_SRC (for --build); data in ~/.zephyr";
+
+/// The published image, tagged with the version (and `latest`, the newest release).
+const REPO: &str = "ghcr.io/yansigit/zephyr:";
 
 const COMMANDS: [&str; 21] = [
     "init",
@@ -58,6 +62,45 @@ pub fn in_container() -> bool {
         || std::path::Path::new("/.dockerenv").exists()
 }
 
+/// After `zephyr --version` on the host: the container's own version, which differs from this CLI's
+/// after a `cargo install` without `zephyr upgrade`.
+pub fn container_version() {
+    let h = Host::from_env();
+    if !h.running() {
+        return;
+    }
+    let theirs = running_version(&h).unwrap_or_else(|| "unknown".into());
+    let hint = if theirs == env!("CARGO_PKG_VERSION") {
+        ""
+    } else {
+        " (not this CLI's; `zephyr upgrade` brings both to the newest release)"
+    };
+    println!("container {}: {theirs}{hint}", h.container);
+}
+
+/// The container's version: its `zephyr --version` when running, else its image's tag (a stopped
+/// container's too); None without a container.
+fn running_version(h: &Host) -> Option<String> {
+    if h.running() {
+        match h.exec(&[], &[], &["zephyr", "--version"]).output() {
+            Ok(o) if o.status.success() && !o.stdout.is_empty() => {
+                let text = String::from_utf8_lossy(&o.stdout);
+                return Some(text.trim().trim_start_matches("zephyr ").to_string());
+            }
+            _ => {}
+        }
+    }
+    // Images before 0.3.1 have no --version: the published image's tag, else the image's name.
+    let out = docker(&["inspect", "-f", "{{.Config.Image}}", &h.container])
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let image = String::from_utf8_lossy(&out.stdout);
+    let image = image.trim();
+    Some(image.strip_prefix(REPO).unwrap_or(image).to_string())
+}
+
 pub fn is_command(cmd: &str) -> bool {
     COMMANDS.contains(&cmd)
 }
@@ -74,16 +117,14 @@ impl Host {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         Host {
             container: env("ZEPHYR_CONTAINER").unwrap_or_else(|| "zephyr".into()),
-            image: env("ZEPHYR_IMAGE").unwrap_or_else(|| {
-                format!("ghcr.io/yansigit/zephyr:{}", env!("CARGO_PKG_VERSION"))
-            }),
+            image: env("ZEPHYR_IMAGE")
+                .unwrap_or_else(|| format!("{REPO}{}", env!("CARGO_PKG_VERSION"))),
             data: Data {
                 dir: home().join(".zephyr"),
                 daemon: home().join(".zephyr-daemon"),
                 container: env("ZEPHYR_CONTAINER").unwrap_or_else(|| "zephyr".into()),
-                image: env("ZEPHYR_IMAGE").unwrap_or_else(|| {
-                    format!("ghcr.io/yansigit/zephyr:{}", env!("CARGO_PKG_VERSION"))
-                }),
+                image: env("ZEPHYR_IMAGE")
+                    .unwrap_or_else(|| format!("{REPO}{}", env!("CARGO_PKG_VERSION"))),
             },
             interactive: std::io::stdin().is_terminal(),
         }
@@ -137,21 +178,8 @@ impl Host {
         if !refresh && quiet(docker(&["image", "inspect", &self.image])) {
             return Ok(());
         }
-        // Docker draws its own progress; the image is several GB the first time.
-        println!("pulling {}", self.image);
-        if shown(docker(&["pull", &self.image])) {
+        if pull(&self.image) {
             return Ok(());
-        }
-        if let (Some(token), Some(user)) = (
-            gh(&["auth", "token"]),
-            gh(&["api", "user", "--jq", ".login"]),
-        ) {
-            let registry = self.image.split('/').next().unwrap_or("ghcr.io");
-            println!("logging in to {registry} as {user} (gh) and pulling again");
-            let mut login = docker(&["login", registry, "-u", &user, "--password-stdin"]);
-            if feed(&mut login, &token).is_ok() && shown(docker(&["pull", &self.image])) {
-                return Ok(());
-            }
         }
         println!("could not pull {}; building it locally", self.image);
         self.build()
@@ -508,6 +536,218 @@ impl Host {
         }
         Ok(())
     }
+
+    /// `zephyr upgrade [VERSION]`: the newest release, or VERSION. This CLI is replaced first, so
+    /// the CLI that starts the container always matches its image.
+    fn upgrade(mut self, version: Option<&str>) -> anyhow::Result<()> {
+        const ME: &str = env!("CARGO_PKG_VERSION");
+        if std::env::var("ZEPHYR_IMAGE").is_ok_and(|v| !v.is_empty()) {
+            // A named image (a local build, a test install): no versions to compare.
+            self.ensure_image(false, true)?;
+            self.settle(running_version(&self).as_deref())?;
+            return self.up();
+        }
+        let target = match version {
+            Some(v) if semver(v).is_some() => v.to_string(),
+            Some(v) => bail!("{v} is not a version (x.y.z)"),
+            None => latest()?,
+        };
+        let running = running_version(&self);
+        if target == ME && self.running() && running.as_deref() == Some(target.as_str()) {
+            println!("already on {target}");
+            return Ok(());
+        }
+        self.image = format!("{REPO}{target}");
+        self.data.image = self.image.clone();
+        // A local build is this source tree's version, so only for this CLI's own.
+        if target == ME {
+            self.ensure_image(false, true)?;
+        } else if !pull(&self.image) {
+            bail!("could not pull {}", self.image);
+        }
+        let back = matches!(
+            (running.as_deref().and_then(semver), semver(&target)),
+            (Some(r), Some(t)) if t < r
+        );
+        let bak = format!("state.db.{target}.bak");
+        let exists =
+            format!("import os, sys; sys.exit(not os.path.exists('{DAEMON_MOUNT}/{bak}'))");
+        if back && !quiet(self.daemon_py(&exists)) {
+            bail!("no backup from {target} ({bak}); its schema may not read this state.db");
+        }
+        // Fetched and checked before anything changes.
+        let cli = (target != ME)
+            .then(|| fetch_cli(&self.image, &target))
+            .transpose()?;
+        // A newer CLI waits and backs up itself; an older one may not know how to go back.
+        if cli.is_none() || back {
+            self.settle(running.as_deref())?;
+        }
+        if back {
+            let _ = quiet(docker(&["rm", "-f", &self.container]));
+            // The WAL belongs to the newer state.db, which is backed up now.
+            let restore = format!(
+                "import os, shutil; d = '{DAEMON_MOUNT}/'; \
+                 [os.remove(d + f) for f in ('state.db-wal', 'state.db-shm') if os.path.exists(d + f)]; \
+                 shutil.copy(d + '{bak}', d + 'state.db')"
+            );
+            run(&mut self.daemon_py(&restore)).context("restoring state.db")?;
+            eprintln!("warning: state.db is back to {bak}; changes since that backup are lost");
+        }
+        let Some((new, exe)) = cli else {
+            return self.up();
+        };
+        std::fs::rename(&new, &exe).with_context(|| format!("replacing {}", exe.display()))?;
+        println!("zephyr CLI: {ME} -> {target}");
+        let err = Command::new(&exe).args(["upgrade", &target]).exec();
+        Err(err).with_context(|| format!("running {}", exe.display()))
+    }
+
+    /// Waits until no message, reply or job is in flight, then backs up state.db as
+    /// `state.db.<running>.bak` (migrations only go forward). A failed backup stops the upgrade;
+    /// only a first install, without state.db, goes on without one.
+    fn settle(&self, running: Option<&str>) -> anyhow::Result<()> {
+        while self.running() {
+            let status = self
+                .exec(&[], &[], &["zephyr", "status"])
+                .stderr(Stdio::null())
+                .output();
+            if !status.is_ok_and(|o| busy(&String::from_utf8_lossy(&o.stdout))) {
+                break;
+            }
+            println!("the agent is busy; waiting...");
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
+        if !self.data.daemon.exists() {
+            return Ok(());
+        }
+        // Without a container to name it (after `zephyr down`), a name going back never picks.
+        let name = match running.filter(|v| semver(v).is_some()) {
+            Some(v) => format!("state.db.{v}.bak"),
+            None => "state.db.bak".into(),
+        };
+        let script = format!(
+            "import os, sqlite3, sys; \
+             os.path.exists('{DAEMON_MOUNT}/state.db') or sys.exit(3); \
+             bak = sqlite3.connect('{DAEMON_MOUNT}/{name}'); \
+             sqlite3.connect('{DAEMON_MOUNT}/state.db').backup(bak); \
+             bak.close()"
+        );
+        match self.daemon_py(&script).status()?.code() {
+            Some(0) => println!(
+                "state.db backed up to {}",
+                self.data.daemon.join(&name).display()
+            ),
+            Some(3) => {}
+            _ => bail!("backing up state.db failed; not upgrading"),
+        }
+        Ok(())
+    }
+
+    /// python3 from the image, as root, on the daemon's dir, which this user cannot read.
+    fn daemon_py(&self, script: &str) -> Command {
+        let daemon = self.data.daemon.display();
+        let mount = format!("type=bind,src={daemon},dst={DAEMON_MOUNT}");
+        docker(&[
+            "run",
+            "--rm",
+            "--user",
+            "0",
+            "--network",
+            "none",
+            "--entrypoint",
+            "python3",
+            "--mount",
+            &mount,
+            &self.image,
+            "-c",
+            script,
+        ])
+    }
+}
+
+/// The newest release's version, as `latest` itself reports it.
+fn latest() -> anyhow::Result<String> {
+    let image = format!("{REPO}latest");
+    if !pull(&image) {
+        bail!("could not pull {image}: `docker login ghcr.io`, or name the version (zephyr upgrade X.Y.Z)");
+    }
+    let out = output(&mut docker(&[
+        "run",
+        "--rm",
+        "--entrypoint",
+        "zephyr",
+        &image,
+        "--version",
+    ]))?;
+    let version = out.trim().trim_start_matches("zephyr ");
+    semver(version).with_context(|| format!("{image} reports {out:?}, not a version"))?;
+    Ok(version.to_string())
+}
+
+/// `x.y.z` as numbers, so 0.10.0 comes after 0.9.0.
+fn semver(v: &str) -> Option<(u64, u64, u64)> {
+    let n = v
+        .split('.')
+        .map(|p| {
+            p.parse()
+                .ok()
+                .filter(|_| p.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .collect::<Option<Vec<u64>>>()?;
+    match n[..] {
+        [a, b, c] => Some((a, b, c)),
+        _ => None,
+    }
+}
+
+/// `zephyr status` shows a message, a reply or a job in flight.
+fn busy(status: &str) -> bool {
+    status.lines().any(|l| {
+        let mut w = l.split_whitespace();
+        matches!(
+            (w.next(), w.next()),
+            (Some("inbox"), Some("new" | "dispatched"))
+                | (Some("outbox"), Some("pending"))
+                | (Some("runs"), Some("claimed" | "running"))
+        )
+    })
+}
+
+/// The CLI in `image`, written beside this one and checked to be `target`: (new file, this CLI).
+fn fetch_cli(image: &str, target: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let exe = std::env::current_exe()?;
+    let new = exe.with_file_name(format!(".zephyr-{target}.new"));
+    let file = std::fs::File::create(&new).with_context(|| {
+        format!(
+            "cannot write beside {0}; install the CLI by hand: \
+             docker run --rm --entrypoint cat {image} /usr/local/bin/zephyr > {0} && chmod 755 {0}",
+            exe.display()
+        )
+    })?;
+    let checked = (|| {
+        run(docker(&[
+            "run",
+            "--rm",
+            "--entrypoint",
+            "cat",
+            image,
+            "/usr/local/bin/zephyr",
+        ])
+        .stdout(file))?;
+        std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755))?;
+        let out = output(Command::new(&new).arg("--version"))?;
+        let said = out.lines().next().unwrap_or_default();
+        if said != format!("zephyr {target}") {
+            bail!("the CLI in {image} says {said:?}, not zephyr {target}");
+        }
+        Ok(())
+    })();
+    if let Err(e) = checked {
+        let _ = std::fs::remove_file(&new);
+        return Err(e);
+    }
+    Ok((new, exe))
 }
 
 /// The container's state (`running`, `exited`, ...), or None when it does not exist.
@@ -570,6 +810,25 @@ fn run(cmd: &mut Command) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// `docker pull`, logging in to the image's registry with `gh` and trying again when it fails.
+fn pull(image: &str) -> bool {
+    // Docker draws its own progress; the image is several GB the first time.
+    println!("pulling {image}");
+    if shown(docker(&["pull", image])) {
+        return true;
+    }
+    if let (Some(token), Some(user)) = (
+        gh(&["auth", "token"]),
+        gh(&["api", "user", "--jq", ".login"]),
+    ) {
+        let registry = image.split('/').next().unwrap_or("ghcr.io");
+        println!("logging in to {registry} as {user} (gh) and pulling again");
+        let mut login = docker(&["login", registry, "-u", &user, "--password-stdin"]);
+        return feed(&mut login, &token).is_ok() && shown(docker(&["pull", image]));
+    }
+    false
 }
 
 /// True when the command succeeds; its output goes to the terminal (docker's progress bars).
@@ -662,7 +921,7 @@ fn masks(projects: &str) -> anyhow::Result<Vec<String>> {
     Ok(args)
 }
 
-fn private(path: &std::path::Path) -> bool {
+fn private(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| std::os::unix::fs::MetadataExt::mode(&m) & 0o077 == 0)
 }
 
@@ -716,11 +975,11 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
             h.ensure_image(build, false)?;
             h.up()
         }
-        "upgrade" => {
-            a.rest()?;
-            h.ensure_image(false, true)?;
-            h.up()
-        }
+        "upgrade" => match &a.rest()?[..] {
+            [] => h.upgrade(None),
+            [v] => h.upgrade(Some(v)),
+            _ => bail!("{USAGE}"),
+        },
         "down" => {
             a.rest()?;
             run(&mut docker(&["stop", &h.container]))?;
@@ -884,5 +1143,31 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
         "skill" => setup::skill(&h, a),
         "mcp" => setup::mcp(&h, a),
         _ => bail!("{USAGE}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn busy_reads_zephyr_status() {
+        let idle = "daemon: running\ninbox   done        12\noutbox  sent        3\nruns    ok          2\n";
+        assert!(!busy(idle));
+        for line in [
+            "inbox   new         1",
+            "outbox  pending     2",
+            "runs    running     1",
+        ] {
+            assert!(busy(&format!("{idle}{line}\n")), "{line}");
+        }
+    }
+
+    #[test]
+    fn versions_compare_as_numbers() {
+        assert!(semver("0.10.0") > semver("0.9.3"));
+        for bad in ["v1.2.3", "1.2", "1.2.3.4", "1.+2.3", "latest", ""] {
+            assert_eq!(semver(bad), None, "{bad}");
+        }
     }
 }

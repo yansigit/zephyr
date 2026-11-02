@@ -164,6 +164,15 @@ mod tests {
             same(&cfg(&format!("{POOL}[discord]\ntoken_env = 'T'\n"))),
             Plan::Reexec
         );
+        // Removing a channel's table is the same change the other way round: the adapter stops.
+        let im = "[imessage]\nlisten = '100.64.0.1:8080'\nserver_url = 'http://x'\npassword_env = 'P'\nsecret_env = 'S'\n";
+        for gone in [
+            format!("{POOL}[discord]\ntoken_env = 'T'\n"),
+            format!("{POOL}{im}"),
+        ] {
+            let with = cfg(&gone);
+            assert_eq!(diff(&with, &old, first(&with), first(&old)), Plan::Reexec);
+        }
         assert_eq!(
             same(&cfg(&format!(
                 "{POOL}[attach]\nport = 7\ntoken_env = 'T'\n"

@@ -481,8 +481,45 @@ pub fn channel(h: &Host, a: Args) -> anyhow::Result<()> {
             h.apply()?;
             run(&mut h.exec(&[], &[], &["zephyr", "doctor"]))
         }
-        _ => bail!("usage: zephyr channel add discord|imessage"),
+        [rm, kind] if rm == "remove" && (kind == "discord" || kind == "imessage") => {
+            channel_remove(h, kind)
+        }
+        [list] if list == "list" => channel_list(h),
+        _ => bail!("usage: zephyr channel add|remove discord|imessage | list"),
     }
+}
+
+/// `chat`, then each configured channel, with its owners.
+fn channel_list(h: &Host) -> anyhow::Result<()> {
+    let doc = h.data.load()?;
+    for kind in ["chat", "discord", "imessage"] {
+        if kind == "chat" || doc.get(kind).is_some() {
+            let owners = conf::get(&doc, &format!("owners.{kind}")).unwrap_or_default();
+            println!("{kind:<9}owners: {owners}");
+        }
+    }
+    Ok(())
+}
+
+/// Removes a channel's table, its owners and the secrets `channel_add` wrote for it.
+fn channel_remove(h: &Host, kind: &str) -> anyhow::Result<()> {
+    let mut doc = h.data.load()?;
+    if !conf::remove_channel(&mut doc, kind) {
+        bail!("{kind} is not configured");
+    }
+    // Config first: a daemon reloading between the writes must not see a secret gone while its
+    // channel is still configured.
+    h.data.save(&doc)?;
+    let secrets: &[&str] = if kind == "discord" {
+        &["ZEPHYR_DISCORD_TOKEN"]
+    } else {
+        &["ZEPHYR_BB_PASSWORD", "ZEPHYR_BB_SECRET"]
+    };
+    for key in secrets {
+        h.data.unset_secret(key)?;
+    }
+    println!("removed {kind}");
+    h.apply()
 }
 
 /// `zephyr skill add DIR | list | rm NAME`, carried out by the container's `zephyr skill`
