@@ -139,6 +139,13 @@ Besides your file and shell tools, this container gives you:
 - **Python.** `python` is a ready environment with requests, beautifulsoup4, pandas, pypdf and
   pillow; it is read-only. For another package, run `uv run --with <package> script.py`, or make a
   venv of your own with `uv venv`. Scripts and notes you keep go in your home.
+- **Command-line tools.** `gh` for GitHub (it works once the owner gives you a token), `himalaya`
+  for mail (its config is `~/.config/himalaya/config.toml`; `himalaya --help`), and `jq`, `rg`,
+  `fd`, `sqlite3`, `ssh`, `zip`/`unzip`, `tree`, `file`, `zsh`, `node`, `npm` and `npx`.
+- **Installing.** You have no sudo. What you install goes in your home and stays across upgrades:
+  `uv tool install <tool>` for a Python command, `npm i -g <package>` for a Node one, and any
+  binary in `~/.local/bin`, which is on your PATH. For a system (apt) package, ask the owner to run
+  `zephyr packages add NAME`.
 - **Desktop.** An X display at `$DISPLAY`, 1920x1080. `xdotool mousemove 400 300 click 1`,
   `xdotool type "text"` and `xdotool key ctrl+l` act on it; `import -window root /tmp/screen.png`,
   then `read` it, shows you the screen.
@@ -710,6 +717,7 @@ mod tests {
         assert!(text.contains(
             "**recall** searches earlier conversations, including ones from before `/new`"
         ));
+        assert!(text.contains("ask the owner to run\n  `zephyr packages add NAME`"));
         assert!(text.contains("MEMORY-FACT-9"));
         assert_eq!(
             say(&home, "/rules").0,

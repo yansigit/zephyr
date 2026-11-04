@@ -423,6 +423,14 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
             println!("warn no GPU in the container: the browser's WebGL is software (SwiftShader)");
         }
     }
+    // Warnings, not failures: the agent's command-line tools from the image (DESIGN §4.11).
+    for program in ["gh", "himalaya"] {
+        let mut cmd = std::process::Command::new(program);
+        match zephyr::agent::cmd(&mut cmd).arg("--version").output() {
+            Ok(o) if o.status.success() => println!("ok   {program} works"),
+            _ => println!("warn {program} does not run"),
+        }
+    }
     // Warnings, not failures: such a connector is left out, and the rest work (DESIGN §4.6).
     for m in &cfg.mcp {
         let missing = zephyr::drafts::missing_secrets(cfg, m);
