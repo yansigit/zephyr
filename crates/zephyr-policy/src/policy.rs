@@ -260,25 +260,35 @@ pub fn outbound(command: &str) -> Vec<String> {
     found
 }
 
-/// The programs `command` runs, by name: the command word of every stage (after prefixes such as
-/// `env`, `sudo` or `xargs`, flags and `VAR=value`), and of every `sh -c`/`eval` script inside it,
-/// once each, in order. A vault token is handed only to a command whose programs the owner allowed
-/// it for (DESIGN §4.15). `cd` is left out: it runs nothing and reads no variable.
+/// The programs `command` runs, by name: the command word of every stage, the programs in front
+/// of it that run it (`env`, `xargs`, `timeout`, ...), and those of every `sh -c`/`eval` script
+/// inside it, once each, in order. A vault token is handed only to a command whose programs the
+/// owner allowed it for (DESIGN §4.15). `cd` is left out: it runs nothing and reads no variable.
 pub fn programs(command: &str) -> Vec<String> {
+    const RUNNERS: &[&str] = &[
+        "sudo", "doas", "env", "nohup", "nice", "time", "timeout", "xargs", "stdbuf",
+    ];
     let mut found: Vec<String> = Vec::new();
+    let mut add = |p: &str| {
+        if p != "cd" && !found.iter().any(|f| f == p) {
+            found.push(p.to_string());
+        }
+    };
     for stage in stages(command) {
-        let Some(words) = command_words(&stage.words) else {
+        let words = command_words(&stage.words).unwrap_or_default();
+        let before = &stage.words[..stage.words.len() - words.len()];
+        before
+            .iter()
+            .map(|w| basename(w))
+            .filter(|w| RUNNERS.contains(w))
+            .for_each(&mut add);
+        let Some(first) = words.first() else {
             continue;
         };
-        let name = basename(&words[0]);
-        let mut add = |p: String| {
-            if p != "cd" && !found.contains(&p) {
-                found.push(p);
-            }
-        };
-        add(name.to_string());
+        let name = basename(first);
+        add(name);
         if let Some(script) = nested(name, &words[1..]) {
-            programs(&script).into_iter().for_each(add);
+            programs(&script).iter().for_each(|p| add(p));
         }
     }
     found
@@ -580,7 +590,7 @@ mod tests {
         assert_eq!(programs("FOO=1 a && gh x | jq ."), ["a", "gh", "jq"]);
         assert_eq!(
             programs("cd repo; sudo -E /usr/bin/gh pr list $(git rev-parse HEAD)"),
-            ["gh", "git"]
+            ["sudo", "gh", "git"]
         );
         assert_eq!(
             programs("bash -c 'curl x | gh api -'"),
@@ -588,6 +598,11 @@ mod tests {
         );
         assert_eq!(programs("gh a; gh b"), ["gh"]);
         assert!(programs("cd /tmp").is_empty());
+        assert_eq!(programs("env | grep GH"), ["env", "grep"]);
+        assert_eq!(
+            programs("timeout 5 xargs -n1 gh"),
+            ["timeout", "xargs", "gh"]
+        );
     }
 
     #[test]
