@@ -21,6 +21,7 @@ pub const USAGE: &str = "usage: zephyr <command>   (zephyr --version: this CLI's
   channel add|remove discord|imessage | list
   skill add DIR | list | rm NAME
   mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. | list | rm NAME
+  vault list | add login NAME --site URL [--user U] [--totp] | add token NAME | edit NAME | rm NAME | revoke NAME [PROGRAM]
   config get|set KEY [VALUE]
   chat | attach [--stock] | pause | resume | reload
   doctor [--fix]
@@ -30,7 +31,7 @@ env: ZEPHYR_CONTAINER (default zephyr), ZEPHYR_IMAGE, ZEPHYR_SRC (for --build); 
 /// The published image, tagged with the version (and `latest`, the newest release).
 const REPO: &str = "ghcr.io/yansigit/zephyr:";
 
-const COMMANDS: [&str; 21] = [
+const COMMANDS: [&str; 22] = [
     "init",
     "up",
     "down",
@@ -52,6 +53,7 @@ const COMMANDS: [&str; 21] = [
     "reload",
     "skill",
     "mcp",
+    "vault",
 ];
 
 /// The image sets ZEPHYR_IN_CONTAINER. ZEPHYR_CONFIG (set in the image and by tests) also points
@@ -1142,6 +1144,7 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
         "channel" => setup::channel(&h, a),
         "skill" => setup::skill(&h, a),
         "mcp" => setup::mcp(&h, a),
+        "vault" => setup::vault(&h, a),
         _ => bail!("{USAGE}"),
     }
 }

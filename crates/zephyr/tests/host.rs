@@ -103,12 +103,28 @@ impl Env {
     }
 
     fn run_cli(&self, cli: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+        self.run_input(cli, args, env, None)
+    }
+
+    /// `zephyr <args>` with `input` on its stdin (not a terminal).
+    fn zephyr_input(&self, args: &[&str], input: &str) -> Output {
+        let cli = Path::new(env!("CARGO_BIN_EXE_zephyr"));
+        self.run_input(cli, args, &[], Some(input))
+    }
+
+    fn run_input(
+        &self,
+        cli: &Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+        input: Option<&str>,
+    ) -> Output {
         let path = format!(
             "{}:{}",
             self.dir.join("bin").display(),
             std::env::var("PATH").unwrap()
         );
-        let out = Command::new(cli)
+        let mut child = Command::new(cli)
             .args(args)
             .env_clear()
             .env("PATH", path)
@@ -117,9 +133,19 @@ impl Env {
             .env("ZEPHYR_CONTAINER", CONTAINER)
             .env("ZEPHYR_IMAGE", "zephyr-lanetest")
             .envs(env.iter().copied())
-            .stdin(std::process::Stdio::null())
-            .output()
+            .stdin(match input {
+                Some(_) => std::process::Stdio::piped(),
+                None => std::process::Stdio::null(),
+            })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
+        if let Some(input) = input {
+            let mut stdin = child.stdin.take().unwrap();
+            std::io::Write::write_all(&mut stdin, input.as_bytes()).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
         let text = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
         std::fs::OpenOptions::new()
             .create(true)
@@ -1211,4 +1237,88 @@ fn upgrade_waits_backs_up_and_goes_back_only_with_a_backup() {
 
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap()
+}
+
+#[test]
+fn vault_add_list_and_rm_reach_roots_file_and_never_put_a_value_in_argv() {
+    const PASSWORD: &str = "hunter2-host-s3cret";
+    const TOKEN: &str = "ghp_host_token_0123";
+    let env = Env::new("vault");
+    env.init(&["--no-start"]);
+    // As after `zephyr up`: the daemon's files are root's, reached through `zephyr __file`.
+    let files = env.dir.join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    for name in ["zephyr.toml", "secrets.env", "tui.token", "host.toml"] {
+        std::fs::rename(env.daemon().join(name), files.join(name)).unwrap();
+    }
+    std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let add = [
+        "vault",
+        "add",
+        "login",
+        "github",
+        "--site",
+        "https://github.com",
+        "--user",
+        "aiden",
+        "--totp",
+    ];
+    let out = env.zephyr_input(&add, &format!("{PASSWORD}\nJBSWY3DPEHPK3PXP\n"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = env.zephyr_input(
+        &["vault", "add", "token", "GH_TOKEN"],
+        &format!("{TOKEN}\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let list = env.ok(&["vault", "list"]);
+    assert!(
+        list.contains("login github: aiden on https://github.com, with a one-time code"),
+        "{list}"
+    );
+    assert!(
+        list.contains("token GH_TOKEN: not allowed for any program yet"),
+        "{list}"
+    );
+
+    let calls = env.calls();
+    let root = ["docker", "exec", "-i", "-u", "0", CONTAINER];
+    for op in ["get", "put"] {
+        find(
+            &calls,
+            &[&root[..], &["zephyr", "__file", op, "vault.toml"]].concat(),
+        );
+    }
+    let saved = std::fs::read_to_string(files.join("vault.toml")).unwrap();
+    assert!(saved.contains(PASSWORD) && saved.contains(TOKEN));
+    let output = std::fs::read_to_string(env.dir.join("output.log")).unwrap();
+    for value in [PASSWORD, TOKEN, "JBSWY3DPEHPK3PXP"] {
+        assert!(!format!("{calls:?}").contains(value), "{value} in argv");
+        assert!(!output.contains(value), "{value} printed");
+    }
+
+    // A value never goes in an argument, and a bad one names only the problem.
+    assert!(!env
+        .zephyr(&["vault", "add", "token", "GH_TOKEN", TOKEN])
+        .status
+        .success());
+    let out = env.zephyr_input(&["vault", "add", "token", "lower"], "v\n");
+    assert!(!out.status.success());
+
+    env.ok(&["vault", "rm", "github"]);
+    let saved = std::fs::read_to_string(files.join("vault.toml")).unwrap();
+    assert!(
+        !saved.contains("github") && saved.contains("GH_TOKEN"),
+        "{saved}"
+    );
+    assert!(!env.zephyr(&["vault", "rm", "github"]).status.success());
+    std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o700)).unwrap();
 }
