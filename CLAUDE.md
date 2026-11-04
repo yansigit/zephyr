@@ -70,6 +70,10 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   before each prompt/continue, task and job, at most 10 s; `/rollback` lists, diffs and restores;
   pruned to 50 per project by `retention.rs`), `attach.rs` (rpi remote JSON-RPC shim so stock
   `rpi --connect` attaches to `main`).
+- `vault.rs` (DESIGN §4.15): owner-saved logins and tokens in `<state>/vault.toml` (root, 0600,
+  read fresh on each use). Main's `vault` tool lists, requests and fills (`agent-browser`, only on
+  the login's own origin); `exec`'s `secrets` sets tokens per command, its output scrubbed to
+  `[vault:NAME]`. Grants come only from the owner (`/vault grant`, or `/ok N` on a proposal).
 - `inbox.rs`: files the owner sends on Discord or iMessage (DESIGN §4.3). The adapter saves them as
   the agent into `<home>/inbox/` before the row goes to the router and appends a
   `[attached image: <path> ...]` line per file to its text; owners come from the router's live
