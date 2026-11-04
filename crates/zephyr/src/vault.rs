@@ -758,6 +758,15 @@ fn fields(
     if out.iter().any(|(_, sel, _)| sel.starts_with('-')) {
         return Err("not filled: a selector cannot start with '-'".into());
     }
+    // agent-browser reads `--x` as its own option wherever it stands, even after `--`, so such a
+    // value would be typed wrong; the owner fills that one by hand.
+    if let Some((label, _, _)) = out.iter().find(|(_, _, v)| v.starts_with("--")) {
+        return Err(format!(
+            "not filled: the saved {label} of {} starts with --, which agent-browser would read as \
+             an option; ask the owner to type it",
+            login.name
+        ));
+    }
     Ok(out)
 }
 
@@ -1070,5 +1079,11 @@ programs = ["gh"]
             ]
         );
         assert!(fields(&login, &[None, sel("--eval"), None], 0).is_err());
+        let dashed = Entry {
+            password: "--json".into(),
+            ..login.clone()
+        };
+        let err = fields(&dashed, &[None, sel("#p"), None], 0).unwrap_err();
+        assert!(err.contains("password") && !err.contains("--json"), "{err}");
     }
 }
