@@ -201,7 +201,16 @@ pub struct Vault {
 
 impl Vault {
     pub fn parse(text: &str) -> anyhow::Result<Vault> {
-        let doc: DocumentMut = text.parse().context("vault.toml is not valid TOML")?;
+        // Only the line: the parser's own message quotes the text around the error, a value maybe.
+        let doc: DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| {
+            let at = e.span().map_or(0, |s| s.start).min(text.len());
+            let line = text.as_bytes()[..at]
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count()
+                + 1;
+            anyhow::anyhow!("vault.toml is not valid TOML (line {line})")
+        })?;
         for key in ["login", "token"] {
             if doc
                 .get(key)
@@ -879,6 +888,9 @@ programs = ["gh"]
         ] {
             assert!(Vault::parse(bad).is_err(), "{bad}");
         }
+        let broken = Vault::parse("[[token]]\nname = \"A\"\nvalue = \"s3cret\" x\n");
+        let said = format!("{:#}", broken.err().unwrap());
+        assert_eq!(said, "vault.toml is not valid TOML (line 3)");
     }
 
     #[test]
