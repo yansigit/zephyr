@@ -707,6 +707,105 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
     h.apply()
 }
 
+/// `zephyr vault list | add login NAME --site URL [--user U] [--totp] | add token NAME |
+/// edit NAME [--site URL] [--user U] [--totp] | rm NAME | revoke NAME [PROGRAM]`: `vault.toml`,
+/// one of the daemon's files (DESIGN §4.15), which the daemon reads on every use. Values are
+/// asked at hidden prompts, or read one per line from stdin when it is not a terminal; never
+/// taken as arguments. Grants are only the owner's `/ok` or `/vault grant` in a chat. A save here
+/// is not told to the agent: the owner tells it.
+pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
+    use crate::vault::{Entry, Kind, Vault};
+    let site = a.value("--site")?;
+    let user = a.value("--user")?;
+    let totp = a.flag("--totp");
+    let rest = a.rest()?;
+    let usage = "usage: zephyr vault list | add login NAME --site URL [--user U] [--totp] | \
+                 add token NAME | edit NAME [--site URL] [--user U] [--totp] | rm NAME | \
+                 revoke NAME [PROGRAM]";
+    let text = match h.data.read(crate::vault::FILE) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        r => r?,
+    };
+    let mut vault = Vault::parse(&text)?;
+    let mut lines = std::io::stdin().lines();
+    let mut secret = |prompt: &str| -> anyhow::Result<String> {
+        if h.interactive {
+            let p = Password::new().with_prompt(format!("{prompt} (hidden)"));
+            return Ok(p.allow_empty_password(true).interact()?);
+        }
+        Ok(lines.next().transpose()?.unwrap_or_default())
+    };
+    let args: Vec<&str> = rest.iter().map(String::as_str).collect();
+    let said = match args[..] {
+        [] | ["list"] => {
+            let entries = vault.entries();
+            if entries.is_empty() {
+                println!("the vault is empty");
+            }
+            entries.iter().for_each(|e| println!("{}", e.line()));
+            return Ok(());
+        }
+        ["add", "login", name] => {
+            let site = site.with_context(|| format!("add login needs --site URL\n{usage}"))?;
+            let password = secret(&format!("password for {name}"))?;
+            let totp = match totp {
+                true => secret("TOTP seed (BASE32)")?,
+                false => String::new(),
+            };
+            vault.put(Entry {
+                kind: Kind::Login,
+                name: name.into(),
+                site,
+                username: user.unwrap_or_default(),
+                password,
+                totp,
+                ..Entry::default()
+            })?;
+            format!("saved the login {name}; the agent asks you before its first fill")
+        }
+        ["add", "token", name] => {
+            let value = secret(name)?;
+            vault.put(Entry {
+                kind: Kind::Token,
+                name: name.into(),
+                value,
+                ..Entry::default()
+            })?;
+            format!("saved the token {name}; the agent asks you before each new program uses it")
+        }
+        ["edit", name] => {
+            let mut e = vault
+                .get(name)
+                .with_context(|| format!("no entry named {name} in the vault"))?;
+            // An empty answer keeps what is saved.
+            match e.kind {
+                Kind::Login => {
+                    e.site = site.unwrap_or(e.site);
+                    e.username = user.unwrap_or(e.username);
+                    e.password = secret("new password, empty keeps it")?;
+                    e.totp = match totp {
+                        true => secret("new TOTP seed, empty keeps it")?,
+                        false => String::new(),
+                    };
+                }
+                Kind::Token => e.value = secret("new value, empty keeps it")?,
+            }
+            vault.put(e)?;
+            format!("saved {name}")
+        }
+        ["rm", name] => match vault.remove(name) {
+            true => format!("removed {name}"),
+            false => bail!("no entry named {name} in the vault"),
+        },
+        ["revoke", name] => vault.revoke(name, None)?,
+        ["revoke", name, program] => vault.revoke(name, Some(program))?,
+        _ => bail!("{usage}"),
+    };
+    h.data.write(crate::vault::FILE, &vault.to_string())?;
+    println!("{said}");
+    Ok(())
+}
+
 /// Asks for the channel's settings; secrets go to secrets.env at hidden prompts.
 fn channel_add(h: &Host, kind: &str) -> anyhow::Result<()> {
     if !h.interactive {

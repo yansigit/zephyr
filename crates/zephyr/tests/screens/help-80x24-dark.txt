@@ -20,5 +20,5 @@
  │    /quit                       leave (or /exit); zephyr keeps running      │
  │ Agent                                                                      │
  │    /stop                       stop the current reply and every task       │
- ╰─────────────────────────────────────────────────────────────── 1-16 of 53 ─╯
+ ╰─────────────────────────────────────────────────────────────── 1-16 of 59 ─╯
   ↑↓ choose · ⏎ insert · type to filter · esc close

@@ -9,7 +9,8 @@
 //! Here prompts go through the inbox as channel `tui`, and `stop_session` only detaches.
 //! `zephyr.hello`, `zephyr.subscribe` and `zephyr.models` are Zephyr's own additions
 //! (DESIGN §4.3.1), as are `zephyr.login_providers`/`_start`/`_poll`/`_input`/`_cancel`, which
-//! sign a provider in on the live gateway (`crate::auth`). `zephyr.login_start` answers once rpi's
+//! sign a provider in on the live gateway (`crate::auth`), and `zephyr.vault_list`/`_put`/`_rm`/
+//! `_revoke`, the owner's credential vault (`crate::vault`). `zephyr.login_start` answers once rpi's
 //! child has started, not at once: rpi may be asked for a model first, so the `loginId` can take a
 //! few seconds, and the sign-in URL follows on the daemon's 5 s tick rather than in the reply.
 
@@ -287,8 +288,59 @@ impl Conn {
                     (vec![error(id, -32602, "unknown login")], false)
                 }
             }
+            "zephyr.vault_list"
+            | "zephyr.vault_put"
+            | "zephyr.vault_rm"
+            | "zephyr.vault_revoke" => self.vault(id, method, params).await,
             _ => (vec![error(id, -32601, "method not found")], false),
         }
+    }
+
+    /// The owner's vault (DESIGN §4.15): every call answers with the entries as they are now,
+    /// never a value. `vault_put` takes the values, and they go nowhere but `vault.toml`: not into
+    /// an answer, a log or an error. A new entry is told to the agent as a message of its own, so
+    /// it can carry on with what it asked for.
+    async fn vault(&mut self, id: &Value, method: &str, params: &Value) -> Reply {
+        use crate::vault::{edit, Entry, Vault};
+        let path = crate::vault::path(&self.cfgs.borrow());
+        let name = params["name"].as_str().unwrap_or_default();
+        let done: anyhow::Result<Option<Entry>> = match method {
+            "zephyr.vault_put" => match serde_json::from_value::<Entry>(params.clone()) {
+                // Not serde's message: it can quote the value it did not like.
+                Err(_) => Err(anyhow::anyhow!("the entry is malformed")),
+                Ok(entry) => edit(&path, |v| v.put(entry.clone())).map(|new| new.then_some(entry)),
+            },
+            "zephyr.vault_rm" => edit(&path, |v| match v.remove(name) {
+                true => Ok(None),
+                false => bail!("no entry named {name} in the vault"),
+            }),
+            "zephyr.vault_revoke" => edit(&path, |v| {
+                v.revoke(name, params["program"].as_str()).map(|_| None)
+            }),
+            _ => Ok(None),
+        };
+        let listed = done.and_then(|added| Ok((Vault::load(&path)?, added)));
+        let (vault, added) = match listed {
+            Ok(v) => v,
+            Err(e) => return (vec![error(id, -32602, &format!("{e:#}"))], false),
+        };
+        if let Some(e) = added {
+            let kind = serde_json::to_value(e.kind).unwrap_or_default();
+            let text = format!(
+                "[zephyr] the owner saved the {} {} in the vault; you can use it now",
+                kind.as_str().unwrap_or_default(),
+                e.name
+            );
+            let m = Inbound {
+                channel: CHANNEL.into(),
+                platform_msg_id: next_msg_id(),
+                sender: "token".into(),
+                text,
+            };
+            let _ = self.inbound.send(m).await;
+        }
+        let entries: Vec<Value> = vault.entries().iter().map(Entry::public).collect();
+        (vec![ok(id, json!({ "entries": entries }))], false)
     }
 
     /// Replays the session from `get_messages`, then streams live events.

@@ -50,6 +50,7 @@ zephyr login openai-codex --account codex-main
 | `zephyr skill add DIR \| list \| rm NAME` | Skills the agent may use (see [Skills and connectors](#skills-and-connectors)); one you add is approved at once |
 | `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}` |
 | `zephyr packages add NAME.. \| rm NAME.. \| list` | Ubuntu (apt) packages for the agent, baked into a local image (`zephyr-local:<version>-<hash>`) on the release one; `up` and `upgrade` build it, and `add`/`rm` rebuild and recreate the container once the agent is idle |
+| `zephyr vault list \| add login NAME --site URL [--user U] [--totp] \| add token NAME \| edit NAME \| rm NAME \| revoke NAME [PROGRAM]` | Logins and tokens the agent uses by name (see [The vault](#the-vault)); values are asked for hidden, or read one per line from stdin when piped, never taken as arguments |
 | `zephyr config get\|set KEY [VALUE]` | Edit `zephyr.toml` (comments are kept; invalid keys are refused) |
 | `zephyr attach [--stock]` | Zephyr's terminal UI on the live session: history, tool calls, what the agent is doing, the queue and today's spend; `^D` detaches and the agent keeps running. `--stock` runs the stock `rpi --connect` client instead |
 | `zephyr shell [bash\|zsh]` | A login shell in the container as the agent, in its home (`/zephyr`) and on its desktop; needs a terminal |
@@ -193,7 +194,8 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
 
 - **Browser.** fingerprint-chromium (ungoogled-chromium with fingerprint patches; Playwright's
   Chromium on arm64), driven by the `agent-browser` CLI. Its profile is `~/.zephyr/browser`, kept
-  across restarts. It is the agent's, never yours, and holds only the sign-ins you give it (below).
+  across restarts. It is the agent's, never yours, and holds only the sign-ins you give it: through
+  [the vault](#the-vault), or by hand (below).
   A site that still blocks it gets Camoufox, a stealth Firefox, which keeps no sign-ins.
 - **Python.** A read-only environment first on the agent's PATH (`/opt/zephyr/py`: requests,
   beautifulsoup4, pandas, pypdf, pillow, Camoufox), locked in `deploy/python/uv.lock`, plus `uv` for
@@ -267,6 +269,73 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
 A site's terms may forbid automated use; a site that catches the agent can flag the account it is
 signed in as.
 
+## The vault
+
+Logins and tokens you save for the agent live in `vault.toml` in the daemon's own folder, where
+the agent cannot read them (DESIGN §4.15). The agent uses them by name and never sees a value:
+
+- **A login** (a website's username, password and, optionally, a TOTP seed for one-time codes).
+  The agent opens the login page and asks zephyr to fill it; zephyr types the values in only when
+  the page is on the login's own site (scheme, host and port exactly), so a look-alike page gets
+  nothing. The first fill of each login waits for your OK.
+- **A token** (an API token, a mail password). The agent runs a command with it (`exec` with
+  `secrets: ["NAME"]`), and the token is set as the environment variable `NAME` for that command
+  only. Each program a token is used with needs your OK once (`gh` for `GH_TOKEN`, say); after
+  that the same use runs without asking. Wherever the value shows up in what the command prints,
+  the agent gets `[vault:NAME]` instead.
+
+When the agent wants to use one, you are asked: `the agent asks to use the token GH_TOKEN with gh
+(#4); /ok 4 allows it from now on, /no 4 drops it`. When one is missing, the agent asks you to
+save it and names the exact command. Save and manage entries:
+
+- In `zephyr attach`, `/vault` opens a panel: `a` adds a login, `t` a token, `e` edits, `d`
+  deletes, `r` takes back what an entry is allowed for. `/vault add login NAME SITE` and
+  `/vault add token NAME` open the form filled in. Values are typed masked. A new entry saved
+  here is told to the agent, so it can carry on.
+- On the host, `zephyr vault add login github --site https://github.com --user me [--totp]`,
+  `zephyr vault add token GH_TOKEN`, `list`, `edit`, `rm` and `revoke NAME [PROGRAM]`. The agent
+  is not told of these: tell it.
+- From any channel, `/vault` lists the names, `/vault rm NAME` deletes one, and `/vault revoke
+  NAME [PROGRAM]` takes back a grant. A chat never takes a value: `/vault add` there is refused.
+  Never paste a password into a chat.
+
+Names: a login is lowercase (`github`, `my-bank`), a token is an environment variable name
+(`GH_TOKEN`). The vault is for the main conversation; background tasks and jobs cannot use it.
+The file is not encrypted (a passphrase would stop unattended restarts), and the daemon reads it
+on every use, so an edit needs no reload. `[agent] env` still works, but hands a secret to every
+command the agent runs; the vault is the better place for one.
+
+What it protects against: credentials stay out of chats, transcripts and the model's context in
+normal use; a login is filled only on its own site; and each new use needs your OK. What it does
+not: an agent set on misusing a value it was allowed to use can still read it (a filled field
+read back, its own command's log under `.procs/`, a program that prints its environment to a
+file). Grant a token only to programs you trust with it.
+
+**Mail.** There is no mail channel, but the agent can read and send mail with `himalaya`. Save the
+password as a token (`zephyr vault add token MAIL_PASSWORD`) and have the agent write
+`/zephyr/.config/himalaya/config.toml` with the password taken from the environment:
+
+```toml
+[accounts.me]
+default = true
+email = "me@example.com"
+backend.type = "imap"
+backend.host = "imap.example.com"
+backend.port = 993
+backend.login = "me@example.com"
+backend.auth.type = "password"
+backend.auth.cmd = "printenv MAIL_PASSWORD"
+message.send.backend.type = "smtp"
+message.send.backend.host = "smtp.example.com"
+message.send.backend.port = 465
+message.send.backend.login = "me@example.com"
+message.send.backend.auth.type = "password"
+message.send.backend.auth.cmd = "printenv MAIL_PASSWORD"
+```
+
+The first `himalaya` command run with `secrets: ["MAIL_PASSWORD"]` asks you to allow
+`MAIL_PASSWORD` for `himalaya`.
+
 ## Where things live
 
 - `~/.zephyr/` (mode 0700), seen as `/zephyr` in the container: the agent's home, with sessions,
@@ -281,6 +350,8 @@ signed in as.
     them: they are removed from rpi's environment and every other process zephyr starts for it. To
     give the agent one (an API key a provider reads, say), list its name in `[agent] env = ["NAME"]`.
   - `tui.token`: the `zephyr attach` token.
+  - `vault.toml` (0600): the [vault](#the-vault)'s logins and tokens, and what each may be used
+    for. `zephyr vault` edits it; comments you add by hand are kept.
   - `host.toml`: the projects folder, optionally `memory = "8g"` to cap the container's memory,
     `packages`: the apt packages `zephyr packages` bakes into the local image, and `offered_extensions`: the image extensions `init`, `up` and `upgrade` have already added to `zephyr.toml`, so one you remove stays removed. The first `up` after upgrading to a zephyr that keeps this record adds once any image extension removed earlier, or every one if the config lists none; after that, a removal sticks.
     Used only on the host, at `zephyr up`.

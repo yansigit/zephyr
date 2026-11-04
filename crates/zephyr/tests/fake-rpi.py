@@ -43,8 +43,8 @@ both wait for the daemon; anything else is refused at once
 run settles "aborted" with no reply. A `task` call waits for its answer the same way (reply line
 `task: <answer>`); one the plugin would refuse (an action other than start with a goal, list, or
 stop with an id) gets "tool error: bad task call" at once. `exec` and `process` calls wait the same
-way (up to 30 s for `exec`, whose answer comes when its command ends or yields); an `exec` with an
-empty command gets "tool error: `command` is empty" at once.
+way (up to 30 s for `exec`, whose answer comes when its command ends or yields), and so do `vault`
+calls; an `exec` with an empty command gets "tool error: `command` is empty" at once.
 `queue_message` with `deliverAs: "steer"` is held (answering `queue: "steer"`) and delivered, as rpi
 0.15 does, after the running tool's result: `turn_start`, the user message's `message_start`/
 `message_end` (role and kind `user`), then the fake's answer `echo: <text>` (none when the text
@@ -75,7 +75,7 @@ The session is <session-dir>/<session-id>.json: {"messages": [...], "pending": b
 answers {"outcome": "completed", "leafId": ...}; with no `targetId` it empties the context (the root).
 `compact` (idle, optional `customInstructions`) answers `accepted`, replaces the messages with
 one `compactionSummary`, and settles with outcome "compacted" and a `summary`, as rpi 0.15 does.
-While a `tool_fail` file exists in the home, every tool call other than gateway/task/exec/process
+While a `tool_fail` file exists in the home, every tool call other than gateway/task/exec/process/vault
 ends with `isError` and the error `tool error: <the file's text>`.
 """
 import json, os, queue as queues, re, sys, threading, time
@@ -305,10 +305,10 @@ def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
     elif name == "exec" and not str(args.get("command", "")).strip():
         result["isError"] = True
         result["content"] = [{"type": "text", "text": "tool error: `command` is empty"}]
-    elif os.path.exists(os.path.join(home, "tool_fail")) and name not in ("gateway", "task", "exec", "process"):
+    elif os.path.exists(os.path.join(home, "tool_fail")) and name not in ("gateway", "task", "exec", "process", "vault"):
         result["isError"] = True
         result["content"] = [{"type": "text", "text": "tool error: " + open(os.path.join(home, "tool_fail")).read()}]
-    elif name in ("gateway", "task", "exec", "process"):
+    elif name in ("gateway", "task", "exec", "process", "vault"):
         answer = os.path.join(os.environ.get("ZEPHYR_GATEWAY_DIR", ""), cid)
         text = "the gateway did not answer"
         # An exec answers when its command ends or yields, so it may take a while.
@@ -432,7 +432,7 @@ for line in iter(next_line, None):
             text = run_tool(s, name, json.loads(args), "c%d" % calls)
             if text is None:
                 break
-            if name in ("gateway", "task", "exec", "process"):
+            if name in ("gateway", "task", "exec", "process", "vault"):
                 answers.append("\n%s: %s" % (name, text))
         if text is None:
             finish(s, "", "aborted"); continue

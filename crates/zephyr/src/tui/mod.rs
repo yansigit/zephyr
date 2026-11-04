@@ -286,6 +286,18 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                             view.error(&e);
                         }
                     }
+                    Msg::Vault(list) => {
+                        if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Vault) {
+                            o.vault.entries = Some(list);
+                            o.vault.problem = None;
+                        }
+                    }
+                    Msg::VaultError(e) => {
+                        match s.overlay.as_mut().filter(|o| o.kind == Kind::Vault) {
+                            Some(o) => o.vault.problem = Some(e),
+                            None => view.error(&e),
+                        }
+                    }
                     Msg::Down(why) if was_up => {
                         // The answer to a poll in flight is lost with the connection; the sign-in
                         // is asked about again once the link is back, not waited on.
@@ -336,6 +348,11 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                     Event::Paste(text) if state.lock().unwrap().overlay.is_none() => {
                         editor.handle_paste(&text)
                     }
+                    Event::Paste(text) => {
+                        if let Some(o) = state.lock().unwrap().overlay.as_mut() {
+                            overlays::paste(o, &text);
+                        }
+                    }
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         let now = crate::unix_millis() as i64;
                         let walked = walk.take();
@@ -384,6 +401,15 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                         // no prompt behind waiting for a token.
                                         let _ = prompt_tx.send(Ask::LoginCancel { login_id: id });
                                         close(&tui, &editor, &mut s);
+                                    }
+                                    Action::VaultPut(entry) => {
+                                        let _ = prompt_tx.send(Ask::VaultPut(entry));
+                                    }
+                                    Action::VaultRm(name) => {
+                                        let _ = prompt_tx.send(Ask::VaultRm(name));
+                                    }
+                                    Action::VaultRevoke(name) => {
+                                        let _ = prompt_tx.send(Ask::VaultRevoke(name));
                                     }
                                 }
                             }
@@ -504,6 +530,22 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                     "/status" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Status),
                     "/model" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Model),
                     "/login" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Login),
+                    "/vault" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Vault),
+                    // A value is typed into the vault's form, never sent as a message.
+                    text if text.starts_with("/vault add") || text.starts_with("/vault edit") => {
+                        match overlays::Form::from_command(text) {
+                            Some(form) => {
+                                open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Vault);
+                                if let Some(o) = s.overlay.as_mut() {
+                                    o.vault.form = Some(form);
+                                }
+                            }
+                            None => view.error(
+                                "not sent: /vault add login NAME SITE or /vault add token NAME \
+                                 opens a form for the value; /vault edits a saved entry",
+                            ),
+                        }
+                    }
                     "/shell" | "/shell bash" | "/shell zsh" => {
                         drop(s);
                         let sh = if text.trim().ends_with("zsh") { "zsh" } else { "bash" };
@@ -873,6 +915,9 @@ fn open(
         }
         Kind::Login => {
             let _ = asks.send(Ask::LoginProviders);
+        }
+        Kind::Vault => {
+            let _ = asks.send(Ask::VaultList);
         }
         Kind::Status | Kind::Help => {}
     }

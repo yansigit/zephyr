@@ -3,7 +3,7 @@
 //! the keys here while one is open.
 
 use super::chrome::{short_model, spend, State};
-use super::conn::{AccountModels, Login, LoginStatus, Provider, Snapshot};
+use super::conn::{AccountModels, Login, LoginStatus, Provider, Snapshot, VaultEntry};
 use super::theme::{glyph, Palette};
 use super::view::clean;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -119,6 +119,27 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("Schedule", "/job run <id>", "run a job now"),
     ("Schedule", "/job rm <id>", "remove a job"),
     (
+        "Vault",
+        "/vault",
+        "saved logins and tokens: add, edit, delete",
+    ),
+    (
+        "Vault",
+        "/vault add login <name> <site>",
+        "save a login the agent can fill",
+    ),
+    (
+        "Vault",
+        "/vault add token <name>",
+        "save a token for the agent's commands",
+    ),
+    (
+        "Vault",
+        "/vault revoke <name> [program]",
+        "take back what the agent may use",
+    ),
+    ("Vault", "/vault rm <name>", "delete an entry"),
+    (
         "Gateway",
         "/status",
         "agent, accounts, channels, spend and jobs",
@@ -146,6 +167,139 @@ pub enum Kind {
     Help,
     /// Provider sign-in: the list, then the sign-in running.
     Login,
+    /// The credential vault: its entries, and a form to add or edit one (DESIGN §4.15).
+    Vault,
+}
+
+/// `Kind::Vault`'s own state.
+#[derive(Debug, Clone, Default)]
+pub struct VaultPanel {
+    /// The daemon's latest list; `None` until it came.
+    pub entries: Option<Vec<VaultEntry>>,
+    /// Why the last call was refused.
+    pub problem: Option<String>,
+    /// The entry being added or edited.
+    pub form: Option<Form>,
+    /// The entry `d` asked to delete, until `y` or any other key.
+    pub confirm: Option<String>,
+}
+
+/// The add/edit form. A secret field is drawn one bullet per character, handed over in the
+/// `vault_put` the moment the form is saved, and dropped with it: never shown, logged or kept.
+#[derive(Clone, PartialEq)]
+pub struct Form {
+    pub kind: crate::vault::Kind,
+    /// Editing a saved entry: its name stays, and an empty secret keeps the saved one.
+    pub editing: bool,
+    /// The field being typed into.
+    pub at: usize,
+    /// `(label, secret, text)` per field.
+    pub fields: Vec<(&'static str, bool, String)>,
+}
+
+impl std::fmt::Debug for Form {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let fields: Vec<String> = (self.fields.iter())
+            .map(|(label, secret, text)| match secret {
+                true => format!("{label}: {} chars", text.chars().count()),
+                false => format!("{label}: {text:?}"),
+            })
+            .collect();
+        f.debug_struct("Form")
+            .field("kind", &self.kind)
+            .field("editing", &self.editing)
+            .field("at", &self.at)
+            .field("fields", &fields)
+            .finish()
+    }
+}
+
+impl Form {
+    /// A blank form for `kind`, with what is known filled in: `[name, site, username]`.
+    pub fn new(kind: crate::vault::Kind, known: [&str; 3]) -> Form {
+        let [name, site, user] = known.map(String::from);
+        let fields = match kind {
+            crate::vault::Kind::Login => vec![
+                ("name", false, name),
+                ("site", false, site),
+                ("username", false, user),
+                ("password", true, String::new()),
+                ("totp seed", true, String::new()),
+            ],
+            crate::vault::Kind::Token => {
+                vec![("name", false, name), ("value", true, String::new())]
+            }
+        };
+        // The first field still to type.
+        let at = fields.iter().position(|f| f.2.is_empty()).unwrap_or(0);
+        Form {
+            kind,
+            editing: false,
+            at,
+            fields,
+        }
+    }
+
+    /// The form `/vault add login NAME SITE` or `/vault add token NAME` opens, filled in.
+    pub fn from_command(text: &str) -> Option<Form> {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        match words[..] {
+            ["/vault", "add", "login", ref rest @ ..] if rest.len() <= 2 => Some(Form::new(
+                crate::vault::Kind::Login,
+                [
+                    rest.first().copied().unwrap_or(""),
+                    rest.get(1).copied().unwrap_or(""),
+                    "",
+                ],
+            )),
+            ["/vault", "add", "token", ref rest @ ..] if rest.len() <= 1 => Some(Form::new(
+                crate::vault::Kind::Token,
+                [rest.first().copied().unwrap_or(""), "", ""],
+            )),
+            ["/vault", "add"] => Some(Form::new(crate::vault::Kind::Login, ["", "", ""])),
+            _ => None,
+        }
+    }
+
+    /// The form to edit `e`: everything but the secrets, which an empty field keeps.
+    fn edit(e: &VaultEntry) -> Form {
+        let kind = match e.kind.as_str() {
+            "token" => crate::vault::Kind::Token,
+            _ => crate::vault::Kind::Login,
+        };
+        let mut form = Form::new(kind, [&e.name, &e.site, &e.username]);
+        form.editing = true;
+        form.at = form.fields.iter().position(|f| f.1).unwrap_or(1);
+        form
+    }
+
+    fn get(&self, label: &str) -> String {
+        let field = self.fields.iter().find(|f| f.0 == label);
+        field.map(|f| f.2.trim().to_string()).unwrap_or_default()
+    }
+
+    /// The entry to save. Consumes the form, so the typed secrets go with it.
+    fn entry(self) -> crate::vault::Entry {
+        crate::vault::Entry {
+            kind: self.kind,
+            name: self.get("name"),
+            site: self.get("site"),
+            username: self.get("username"),
+            password: self.get("password"),
+            totp: self.get("totp seed"),
+            value: self.get("value"),
+            ..Default::default()
+        }
+    }
+
+    /// Typing goes to the field at the cursor; an entry's name is fixed while it is edited.
+    fn type_text(&mut self, text: &str) {
+        if self.editing && self.at == 0 {
+            return;
+        }
+        let one_line = text.replace(['\r', '\n'], "");
+        self.fields[self.at].2.push_str(&one_line);
+    }
 }
 
 /// `Kind::Login`'s own state: what the daemon offers to sign in to, and the sign-in running.
@@ -266,6 +420,8 @@ pub struct Overlay {
     pub placed: bool,
     /// The login picker's own state.
     pub login: SignIn,
+    /// The vault panel's own state.
+    pub vault: VaultPanel,
     /// The first row shown and how many fit, from the last frame.
     top: usize,
     page: usize,
@@ -280,6 +436,7 @@ impl Overlay {
             models: None,
             placed: false,
             login: SignIn::default(),
+            vault: VaultPanel::default(),
             top: 0,
             page: 1,
         }
@@ -299,6 +456,12 @@ pub enum Action {
     Input(String),
     /// Give up on this sign-in and close the panel.
     Cancel(String),
+    /// Save this vault entry.
+    VaultPut(Box<crate::vault::Entry>),
+    /// Delete this vault entry.
+    VaultRm(String),
+    /// Take back every grant of this vault entry.
+    VaultRevoke(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -329,6 +492,7 @@ pub fn rows(
     let groups = match o.kind {
         Kind::Status => return status_rows(snap, p, tz, now),
         Kind::Login => return login_rows(o, p, width),
+        Kind::Vault => return vault_rows(o, p),
         Kind::Help => help_groups(),
         Kind::Model => model_groups(o, snap, tz, now),
     };
@@ -775,6 +939,165 @@ fn phase_text(status: &LoginStatus) -> &'static str {
     }
 }
 
+/// The vault panel: its entries and what the keys do, or the form, or the delete question.
+fn vault_rows(o: &Overlay, p: &Palette) -> Vec<Row> {
+    let v = &o.vault;
+    let mut out = Vec::new();
+    if let Some(problem) = &v.problem {
+        out.push(Row::Line(p.error.fg(problem)));
+    }
+    if let Some(form) = &v.form {
+        let what = match form.kind {
+            crate::vault::Kind::Login => "login",
+            crate::vault::Kind::Token => "token",
+        };
+        let title = match form.editing {
+            true => format!("edit {what} {}", form.get("name")),
+            false => format!("add a {what}"),
+        };
+        out.push(Row::Head(title, String::new()));
+        for (i, (label, secret, text)) in form.fields.iter().enumerate() {
+            let shown = match secret {
+                true => glyph("•").repeat(text.chars().count()),
+                false => text.clone(),
+            };
+            let (mark, cursor) = match i == form.at {
+                true => (p.accent.fg(glyph("›")), CURSOR_MARKER),
+                false => (" ".into(), ""),
+            };
+            let label = p.muted.fg(&format!("{label:<10}"));
+            out.push(Row::Line(format!(
+                " {mark} {label}{}{cursor}",
+                p.text.fg(&shown)
+            )));
+        }
+        let keep = match form.editing {
+            true => "; an empty secret keeps the saved one",
+            false => "",
+        };
+        out.push(Row::Line(p.muted.fg(&format!(
+            "tab next field, enter on the last saves, esc back{keep}"
+        ))));
+        return out;
+    }
+    if let Some(name) = &v.confirm {
+        out.push(Row::Line(p.text.fg(&format!(
+            "delete {name}? y deletes it, any other key keeps it"
+        ))));
+        return out;
+    }
+    let Some(entries) = &v.entries else {
+        out.push(Row::Line(p.muted.fg(&format!("listing{}", glyph("…")))));
+        return out;
+    };
+    if entries.is_empty() {
+        out.push(Row::Line(p.muted.fg("nothing saved yet")));
+    }
+    for e in entries {
+        let note = match e.kind.as_str() {
+            "token" => match e.programs.as_slice() {
+                [] => "token, no program allowed yet".to_string(),
+                progs => format!("token, allowed for {}", progs.join(", ")),
+            },
+            _ => {
+                let user = match e.username.as_str() {
+                    "" => String::new(),
+                    u => format!("{u} on "),
+                };
+                let code = if e.totp { ", one-time code" } else { "" };
+                let grant = if e.granted {
+                    "filling allowed"
+                } else {
+                    "asks first"
+                };
+                format!("{user}{}{code}; {grant}", e.site)
+            }
+        };
+        out.push(Row::Item {
+            pick: e.name.clone(),
+            label: e.name.clone(),
+            note,
+            current: false,
+        });
+    }
+    out.push(Row::Line(p.muted.fg(
+        "a add login, t add token, e edit, d delete, r revoke grants, esc close",
+    )));
+    out
+}
+
+/// The vault panel's keys. The form takes every printable key while it is open.
+fn vault_key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
+    let v = &mut o.vault;
+    if let Some(form) = &mut v.form {
+        let last = form.fields.len() - 1;
+        match k.code {
+            KeyCode::Esc => v.form = None,
+            KeyCode::Tab | KeyCode::Down => form.at = (form.at + 1).min(last),
+            KeyCode::BackTab | KeyCode::Up => form.at = form.at.saturating_sub(1),
+            KeyCode::Enter if form.at < last => form.at += 1,
+            KeyCode::Enter => {
+                let form = v.form.take().expect("open");
+                v.problem = None;
+                return Action::VaultPut(Box::new(form.entry()));
+            }
+            KeyCode::Backspace if !(form.editing && form.at == 0) => {
+                form.fields[form.at].2.pop();
+            }
+            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                form.type_text(&c.to_string())
+            }
+            _ => {}
+        }
+        return Action::None;
+    }
+    if let Some(name) = v.confirm.take() {
+        return match k.code {
+            KeyCode::Char('y') => Action::VaultRm(name),
+            _ => Action::None,
+        };
+    }
+    let picks = picks(rows);
+    let chosen = picks.get(o.selected).map(|&i| &rows[i]);
+    let name = match chosen {
+        Some(Row::Item { pick, .. }) => Some(pick.clone()),
+        _ => None,
+    };
+    let entry = || {
+        let list = o.vault.entries.iter().flatten();
+        list.clone()
+            .find(|e| Some(&e.name) == name.as_ref())
+            .cloned()
+    };
+    match k.code {
+        KeyCode::Esc => return Action::Close,
+        KeyCode::Up => o.selected = o.selected.saturating_sub(1),
+        KeyCode::Down => o.selected = (o.selected + 1).min(picks.len().saturating_sub(1)),
+        KeyCode::Char('a') => {
+            o.vault.form = Some(Form::new(crate::vault::Kind::Login, ["", "", ""]))
+        }
+        KeyCode::Char('t') => {
+            o.vault.form = Some(Form::new(crate::vault::Kind::Token, ["", "", ""]))
+        }
+        KeyCode::Char('e') => o.vault.form = entry().as_ref().map(Form::edit),
+        KeyCode::Char('d') => o.vault.confirm = name,
+        KeyCode::Char('r') => {
+            if let Some(name) = name {
+                return Action::VaultRevoke(name);
+            }
+        }
+        _ => {}
+    }
+    Action::None
+}
+
+/// A paste into the vault form goes to the field at the cursor, as typing would.
+pub fn paste(o: &mut Overlay, text: &str) {
+    if let Some(form) = o.vault.form.as_mut().filter(|_| o.kind == Kind::Vault) {
+        form.type_text(text);
+    }
+}
+
 /// The login picker's keys: pick a provider, then type the token it asks for. Everything else
 /// scrolls, because a sign-in's output is the only thing to read while it runs.
 fn login_key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
@@ -840,7 +1163,7 @@ fn login_key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
 /// picker only until its sign-in starts — the token goes where the filter was.
 fn lists(o: &Overlay) -> bool {
     match o.kind {
-        Kind::Status => false,
+        Kind::Status | Kind::Vault => false,
         Kind::Login => o.login.running().is_none(),
         Kind::Model | Kind::Help => true,
     }
@@ -857,6 +1180,9 @@ fn picks(rows: &[Row]) -> Vec<usize> {
 pub fn key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
     if o.kind == Kind::Login {
         return login_key(o, k, rows);
+    }
+    if o.kind == Kind::Vault {
+        return vault_key(o, k, rows);
     }
     let picks = picks(rows);
     let last = picks.len().saturating_sub(1);
@@ -916,6 +1242,7 @@ pub fn render(
         Kind::Status => " status ",
         Kind::Help => " commands ",
         Kind::Login => " sign in ",
+        Kind::Vault => " vault ",
     };
     let fill = width.saturating_sub(visible_width(title) + 3);
     let mut lines = vec![format!(
@@ -948,7 +1275,11 @@ pub fn render(
         o.selected = current.unwrap_or(0);
         o.placed = o.models.is_some() || o.kind != Kind::Model;
     }
-    o.selected = o.selected.min(picks.len().saturating_sub(1));
+    // A view with nothing to pick (the vault's form or delete question) keeps the selection for
+    // the list it goes back to.
+    if !picks.is_empty() {
+        o.selected = o.selected.min(picks.len() - 1);
+    }
     let cap = height.saturating_sub(lines.len() + 1).max(1);
     o.page = cap;
     if let Some(&at) = picks.get(o.selected) {
@@ -1236,7 +1567,7 @@ mod tests {
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(got.len(), 8);
         assert_eq!(got[2], format!("│ Chat{}│", " ".repeat(73)));
-        assert!(got[7].ends_with(" 1-5 of 53 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 1-5 of 59 ─╯"), "{got:?}");
         for _ in 0..26 {
             key(&mut o, press(KeyCode::Down), &rows);
         }
@@ -1246,7 +1577,7 @@ mod tests {
             got[6],
             "│  › /memory ok                  let the agent see the waiting change          │"
         );
-        assert!(got[7].ends_with(" 26-30 of 53 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 26-30 of 59 ─╯"), "{got:?}");
         key(&mut o, press(KeyCode::Down), &rows);
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),
@@ -1268,7 +1599,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(heads, ["Chat", "Agent", "Memory", "Schedule", "Gateway"]);
+        assert_eq!(
+            heads,
+            ["Chat", "Agent", "Memory", "Schedule", "Vault", "Gateway"]
+        );
         let mut o = Overlay::new(Kind::Help);
         o.query = "rule".into();
         let picks: Vec<String> = (list(&o, &Snapshot::default()).into_iter())
@@ -1311,6 +1645,102 @@ mod tests {
             };
             assert!(answered, "{text}");
         }
+    }
+
+    #[test]
+    fn the_vault_panel_lists_entries_and_its_form_never_shows_a_secret() {
+        let s = Snapshot::default();
+        let mut o = Overlay::new(Kind::Vault);
+        assert!(draw(&mut o, &s, 80, 12)
+            .iter()
+            .any(|l| l.contains("listing")));
+        o.vault.entries = Some(vec![
+            VaultEntry {
+                kind: "login".into(),
+                name: "github".into(),
+                site: "https://github.com".into(),
+                username: "aiden".into(),
+                totp: true,
+                granted: true,
+                programs: vec![],
+            },
+            VaultEntry {
+                kind: "token".into(),
+                name: "GH_TOKEN".into(),
+                programs: vec!["gh".into()],
+                ..Default::default()
+            },
+        ]);
+        let got = draw(&mut o, &s, 90, 12);
+        assert!(
+            got.iter().any(|l| l
+                .contains("github    aiden on https://github.com, one-time code; filling allowed")),
+            "{got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|l| l.contains("GH_TOKEN  token, allowed for gh")),
+            "{got:?}"
+        );
+
+        // e edits the selected entry: its name is fixed, the cursor on the password.
+        assert_eq!(hit(&mut o, &s, KeyCode::Char('e')), Action::None);
+        let form = o.vault.form.clone().unwrap();
+        assert!(form.editing && form.fields[form.at].0 == "password");
+        for c in "hunter2".chars() {
+            hit(&mut o, &s, KeyCode::Char(c));
+        }
+        paste(&mut o, "!x");
+        let got = draw(&mut o, &s, 90, 12);
+        assert!(
+            got.iter().any(|l| l.contains("password  •••••••••")),
+            "{got:?}"
+        );
+        assert!(!got.join("\n").contains("hunter2"), "{got:?}");
+        assert!(!format!("{o:?}").contains("hunter2"));
+        hit(&mut o, &s, KeyCode::Tab);
+        let Action::VaultPut(entry) = hit(&mut o, &s, KeyCode::Enter) else {
+            panic!("no save");
+        };
+        assert_eq!(
+            (entry.name.as_str(), entry.password.as_str()),
+            ("github", "hunter2!x")
+        );
+        assert!(
+            o.vault.form.is_none(),
+            "the typed secret leaves with the save"
+        );
+
+        // d asks first; only y deletes. r revokes the selected entry's grants.
+        hit(&mut o, &s, KeyCode::Down);
+        assert_eq!(hit(&mut o, &s, KeyCode::Char('d')), Action::None);
+        assert!(draw(&mut o, &s, 90, 12)
+            .iter()
+            .any(|l| l.contains("delete GH_TOKEN?")));
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Char('y')),
+            Action::VaultRm("GH_TOKEN".into())
+        );
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Char('r')),
+            Action::VaultRevoke("GH_TOKEN".into())
+        );
+        assert_eq!(hit(&mut o, &s, KeyCode::Esc), Action::Close);
+    }
+
+    #[test]
+    fn vault_add_commands_open_a_filled_in_form() {
+        let f = Form::from_command("/vault add login github https://github.com").unwrap();
+        assert_eq!(f.get("name"), "github");
+        assert_eq!(f.get("site"), "https://github.com");
+        assert_eq!(f.fields[f.at].0, "username");
+        let t = Form::from_command("/vault add token GH_TOKEN").unwrap();
+        assert_eq!(
+            (t.kind, t.fields[t.at].0),
+            (crate::vault::Kind::Token, "value")
+        );
+        assert!(Form::from_command("/vault add token GH_TOKEN ghp_pasted").is_none());
+        assert!(Form::from_command("/vault rm x").is_none());
     }
 
     #[test]

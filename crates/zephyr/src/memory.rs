@@ -120,8 +120,8 @@ Besides your file and shell tools, this container gives you:
   Loop: `agent-browser open <url>`, then `agent-browser snapshot -i` (interactive elements with refs
   like `@e3`), then `click @e3`, `fill @e5 "text"`, `press Enter`, and snapshot again.
   `agent-browser screenshot /tmp/page.png`, then `read` the file, shows you the page.
-  `agent-browser --help` lists the rest. Any sign-ins in that profile were made by the owner: never
-  sign in, create an account or type a password yourself; ask the owner instead.
+  `agent-browser --help` lists the rest. Never create an account, and never type a password or a
+  one-time code yourself: sign in with the **vault** below.
 - **When a site blocks agent-browser** (a CAPTCHA wall, "verify you are human", access denied),
   retry once, then use Camoufox, a stealth Firefox, from a Python script run with
   `camoufox-python script.py`:
@@ -160,6 +160,15 @@ Besides your file and shell tools, this container gives you:
 - **recall** searches earlier conversations, including ones from before `/new`: `query` finds the
   messages with every word in them, and `session` with `around` (an entry id from a hit) reads
   the messages around one.
+- **vault** holds the owner's saved logins and tokens, used by name; you never see a value. It
+  is there in the main conversation only, not in background tasks or jobs. `vault list` shows what
+  is saved. To sign in, open the login page in agent-browser and `vault fill` the login with the
+  CSS selectors of its `user`, `password` and `totp` fields; it fills only on the login's own
+  site. For a command that needs a token, `exec` it with `secrets: ["NAME"]`: the token is set as
+  that environment variable for that command only (e.g. a himalaya config with
+  `auth.cmd = "printenv MAIL_PASSWORD"`). The first fill of a login, and each new program a token
+  is used with, wait for the owner's `/ok N`: tell them and end your turn. When a credential is
+  missing, `vault request` it. Never ask the owner to paste a password or token into the chat.
 - **Files the owner sends** on Discord or iMessage are saved under `/zephyr/inbox/`; the message
   names each one. `read` an image to see it.
 
@@ -718,6 +727,7 @@ mod tests {
             "**recall** searches earlier conversations, including ones from before `/new`"
         ));
         assert!(text.contains("ask the owner to run\n  `zephyr packages add NAME`"));
+        assert!(text.contains("`vault fill` the login") && !text.contains("ask the owner instead"));
         assert!(text.contains("MEMORY-FACT-9"));
         assert_eq!(
             say(&home, "/rules").0,

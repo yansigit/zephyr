@@ -354,6 +354,40 @@ fn himalaya_send(args: &[String]) -> bool {
             .any(|w| w == ["smtp", "raw"] || w == ["submission", "create"])
 }
 
+/// The programs `command` runs, by name: the command word of every stage, the programs in front
+/// of it that run it (`env`, `xargs`, `timeout`, ...), and those of every `sh -c`/`eval` script
+/// inside it, once each, in order. A vault token is handed only to a command whose programs the
+/// owner allowed it for (DESIGN §4.15). `cd` is left out: it runs nothing and reads no variable.
+pub fn programs(command: &str) -> Vec<String> {
+    const RUNNERS: &[&str] = &[
+        "sudo", "doas", "env", "nohup", "nice", "time", "timeout", "xargs", "stdbuf",
+    ];
+    let mut found: Vec<String> = Vec::new();
+    let mut add = |p: &str| {
+        if p != "cd" && !found.iter().any(|f| f == p) {
+            found.push(p.to_string());
+        }
+    };
+    for stage in stages(command) {
+        let words = command_words(&stage.words).unwrap_or_default();
+        let before = &stage.words[..stage.words.len() - words.len()];
+        before
+            .iter()
+            .map(|w| basename(w))
+            .filter(|w| RUNNERS.contains(w))
+            .for_each(&mut add);
+        let Some(first) = words.first() else {
+            continue;
+        };
+        let name = basename(first);
+        add(name);
+        if let Some(script) = nested(name, &words[1..]) {
+            programs(&script).iter().for_each(|p| add(p));
+        }
+    }
+    found
+}
+
 /// The method of a curl that sends a body or uses a method other than GET/HEAD.
 fn curl_method(args: &[String]) -> Option<String> {
     let mut method = None;
@@ -644,6 +678,26 @@ fn stages(command: &str) -> Vec<Stage> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn programs_are_the_command_words_of_every_stage() {
+        assert_eq!(programs("FOO=1 a && gh x | jq ."), ["a", "gh", "jq"]);
+        assert_eq!(
+            programs("cd repo; sudo -E /usr/bin/gh pr list $(git rev-parse HEAD)"),
+            ["sudo", "gh", "git"]
+        );
+        assert_eq!(
+            programs("bash -c 'curl x | gh api -'"),
+            ["bash", "curl", "gh"]
+        );
+        assert_eq!(programs("gh a; gh b"), ["gh"]);
+        assert!(programs("cd /tmp").is_empty());
+        assert_eq!(programs("env | grep GH"), ["env", "grep"]);
+        assert_eq!(
+            programs("timeout 5 xargs -n1 gh"),
+            ["timeout", "xargs", "gh"]
+        );
+    }
 
     #[test]
     fn outbound_names_what_sends_data_and_skips_plain_reads() {

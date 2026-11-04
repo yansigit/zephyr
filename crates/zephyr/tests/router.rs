@@ -2863,3 +2863,145 @@ async fn an_approved_connector_restarts_the_agent_with_its_file() {
     assert_eq!(file["mcpServers"]["docs"]["command"], "python3");
     gw.shutdown().await;
 }
+
+const VAULT: &str = r#"[[login]]
+name = "github"
+site = "https://github.com"
+username = "aiden"
+password = "hunter2-secret"
+
+[[token]]
+name = "GH_TOKEN"
+value = "ghp_vaulttoken42"
+programs = []
+"#;
+
+#[tokio::test]
+async fn the_agent_lists_the_vault_without_any_value() {
+    let home = home("vault-list");
+    std::fs::write(home.join("vault.toml"), VAULT).unwrap();
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call vault {"action": "list"}] what is saved"#,
+    )
+    .await;
+    let reply = gw.wait_replies(1).await[0].clone();
+    assert!(
+        reply.contains("vault: [zephyr] vault:\nlogin github: aiden on https://github.com"),
+        "{reply}"
+    );
+    assert!(
+        reply.contains("token GH_TOKEN: not allowed for any program yet"),
+        "{reply}"
+    );
+    assert!(
+        !reply.contains("hunter2") && !reply.contains("ghp_"),
+        "{reply}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_vault_use_waits_for_the_owners_ok_and_a_granted_token_comes_back_scrubbed() {
+    let home = home("vault-grant");
+    std::fs::write(home.join("vault.toml"), VAULT).unwrap();
+    let gw = start(config(&home));
+    let exec = r#"[call exec {"command": "printenv GH_TOKEN", "secrets": ["GH_TOKEN"]}]"#;
+    let fill = r##"[call vault {"action": "fill", "name": "github", "password": "#pw"}]"##;
+    gw.say("m1", "owner", &format!("{exec} {fill} go")).await;
+    let replies = gw.wait_replies(3).await;
+    assert_eq!(
+        replies[0],
+        "[zephyr] the agent asks to use the token GH_TOKEN with printenv (#1); /ok 1 allows it \
+         from now on, /no 1 drops it"
+    );
+    assert_eq!(
+        replies[1],
+        "[zephyr] the agent asks to fill the login github on https://github.com (#2); /ok 2 \
+         allows it from now on, /no 2 drops it"
+    );
+    assert!(
+        replies[2].contains(
+            "\nexec: not run: it needs the owner's OK to use GH_TOKEN with printenv (#1)"
+        ),
+        "{replies:?}"
+    );
+    assert!(
+        replies[2].contains(
+            "\nvault: not filled: the first fill of github needs the owner's OK, asked as #2"
+        ),
+        "{replies:?}"
+    );
+    assert_eq!(
+        proc_status(&home, "exited") + proc_status(&home, "running"),
+        0,
+        "nothing ran"
+    );
+
+    gw.say("m2", "owner", "/ok 1").await;
+    gw.say("m3", "owner", "/ok 2").await;
+    let replies = gw.wait_replies(5).await;
+    assert_eq!(
+        replies[3],
+        "[zephyr] the agent may now use GH_TOKEN with printenv"
+    );
+    assert_eq!(
+        replies[4],
+        "[zephyr] the agent may now fill the login github on https://github.com"
+    );
+    let saved = std::fs::read_to_string(home.join("vault.toml")).unwrap();
+    assert!(
+        saved.contains("programs = [\"printenv\"]") && saved.contains("granted = true"),
+        "{saved}"
+    );
+
+    gw.say("m4", "owner", &format!("{exec} again")).await;
+    let reply = gw.wait_replies(6).await[5].clone();
+    assert!(
+        reply.contains("\nexec: exited 0\n[vault:GH_TOKEN]"),
+        "{reply}"
+    );
+    // The value never reaches the model's context, nor any chat.
+    let session = std::fs::read_to_string(home.join("sessions/main.json")).unwrap_or_default();
+    assert!(!session.contains("ghp_vaulttoken42"));
+    assert!(!gw.replies().iter().any(|r| r.contains("ghp_vaulttoken42")));
+    // Another program is another use: asked again, and nothing runs.
+    let other = r#"[call exec {"command": "env | grep GH", "secrets": ["GH_TOKEN"]}]"#;
+    gw.say("m5", "owner", other).await;
+    let replies = gw.wait_replies(8).await;
+    assert!(replies[6].contains("with env, grep (#3)"), "{replies:?}");
+    assert_eq!(proc_status(&home, "exited"), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_vault_request_asks_the_owner_with_the_commands_that_save_it() {
+    let home = home("vault-request");
+    let gw = start(config(&home));
+    let call = r#"[call vault {"action": "request", "name": "github", "kind": "login", "site": "https://github.com/login", "why": "to open the PR"}]"#;
+    gw.say("m1", "owner", call).await;
+    let replies = gw.wait_replies(2).await;
+    assert_eq!(
+        replies[0],
+        "[zephyr] the agent asks you to save a login for https://github.com as github (to open \
+         the PR): /vault add login github https://github.com in zephyr attach, or `zephyr vault \
+         add login github --site https://github.com` on the host. Never paste it into the chat."
+    );
+    assert!(
+        replies[1].contains("\nvault: asked the owner to save it."),
+        "{replies:?}"
+    );
+    // The owner's chat commands: no values, ever.
+    gw.say("m2", "owner", "/vault add token GH_TOKEN ghp_x")
+        .await;
+    gw.say("m3", "owner", "/vault").await;
+    let replies = gw.wait_replies(4).await;
+    assert!(
+        replies[2].contains("values never go through a chat"),
+        "{replies:?}"
+    );
+    assert_eq!(replies[3], "[zephyr] the vault is empty");
+    gw.shutdown().await;
+}

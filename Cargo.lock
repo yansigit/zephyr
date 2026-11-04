@@ -3042,6 +3042,7 @@ dependencies = [
  "base64 0.22.1",
  "croner",
  "crossterm",
+ "data-encoding",
  "dialoguer",
  "futures-util",
  "http-body-util",

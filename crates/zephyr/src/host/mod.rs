@@ -22,6 +22,7 @@ pub const USAGE: &str = "usage: zephyr <command>   (zephyr --version: this CLI's
   skill add DIR | list | rm NAME
   mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. | list | rm NAME
   packages add NAME.. | rm NAME.. | list
+  vault list | add login NAME --site URL [--user U] [--totp] | add token NAME | edit NAME | rm NAME | revoke NAME [PROGRAM]
   config get|set KEY [VALUE]
   chat | attach [--stock] | shell [bash|zsh] | pause | resume | reload
   doctor [--fix]
@@ -34,7 +35,7 @@ const REPO: &str = "ghcr.io/yansigit/zephyr:";
 /// The image built from it with host.toml's apt `packages` (`zephyr packages`), never pushed.
 const LOCAL: &str = "zephyr-local:";
 
-const COMMANDS: [&str; 23] = [
+const COMMANDS: [&str; 24] = [
     "init",
     "up",
     "down",
@@ -58,6 +59,7 @@ const COMMANDS: [&str; 23] = [
     "skill",
     "mcp",
     "packages",
+    "vault",
 ];
 
 /// The image sets ZEPHYR_IN_CONTAINER. ZEPHYR_CONFIG (set in the image and by tests) also points
@@ -1233,6 +1235,7 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
         "skill" => setup::skill(&h, a),
         "mcp" => setup::mcp(&h, a),
         "packages" => setup::packages(&h, a),
+        "vault" => setup::vault(&h, a),
         _ => bail!("{USAGE}"),
     }
 }
