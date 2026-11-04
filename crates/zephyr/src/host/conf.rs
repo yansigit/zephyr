@@ -22,7 +22,13 @@ const RETIRED_EXTENSIONS: [&str; 1] = ["/opt/zephyr/ext/rpi-cursor-lite/librpi_c
 
 /// The daemon's files, which `__file` may read and write. In the container they live in
 /// `/var/lib/zephyr` (on the host `~/.zephyr-daemon`), which only root can enter.
-pub const DAEMON_FILES: [&str; 4] = ["zephyr.toml", "secrets.env", "tui.token", "host.toml"];
+pub const DAEMON_FILES: [&str; 5] = [
+    "zephyr.toml",
+    "secrets.env",
+    "tui.token",
+    "host.toml",
+    "vault.toml",
+];
 
 /// Replaces `path` whole with `text`, mode 0600: written beside it, then renamed over it, so a
 /// reader (the daemon's 5 s reload check) never sees half a file. The temp name is unique per
@@ -195,6 +201,28 @@ impl Data {
     pub fn set_projects(&self, path: &Path) -> anyhow::Result<()> {
         let mut doc = self.host_doc()?.unwrap_or_default();
         doc["projects"] = value(path.display().to_string());
+        self.write("host.toml", &doc.to_string())
+    }
+
+    /// `packages` from `host.toml`: the apt packages `zephyr packages` bakes into a local image.
+    pub fn packages(&self) -> anyhow::Result<Vec<String>> {
+        let doc = self.host_doc()?.unwrap_or_default();
+        Ok(doc
+            .get("packages")
+            .and_then(Item::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect())
+    }
+
+    pub fn set_packages(&self, packages: &[String]) -> anyhow::Result<()> {
+        let mut doc = self.host_doc()?.unwrap_or_default();
+        if packages.is_empty() {
+            doc.remove("packages");
+        } else {
+            doc["packages"] = value(packages.iter().collect::<toml_edit::Array>());
+        }
         self.write("host.toml", &doc.to_string())
     }
 

@@ -265,7 +265,15 @@ fn doctor_warns_when_agent_dir_has_extensions() {
     let (_, cfg) = setup("doctor-ext", "");
     let agent = cfg.parent().unwrap().join("agent");
     let run = || stdout(&zephyr(&cfg, &["doctor"]));
-    assert!(!run().contains(warning));
+    let text = run();
+    assert!(!text.contains(warning));
+    // The image's CLI tools are checked whether or not this machine has them.
+    assert!(
+        ["ok   gh works", "warn gh does not run"]
+            .iter()
+            .any(|l| text.contains(l)),
+        "{text}"
+    );
     std::fs::create_dir_all(agent.join("extensions")).unwrap();
     assert!(!run().contains(warning), "an empty extensions dir is fine");
     std::fs::write(agent.join("extensions/librpi_providers.so"), "").unwrap();

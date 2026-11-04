@@ -163,16 +163,19 @@ fn propose(
 /// Stores an action the agent proposed through `gateway` and asks the owner, on the channel the
 /// run answers. Returns the tool's answer. Nothing runs until `/ok`.
 pub fn propose_command(store: &Store, command: &str) -> String {
-    let asked = store.propose_command(command).and_then(|id| {
-        let ask = format!(
-            "[zephyr] the agent asks to run {command} (#{id}); /ok {id} runs it, /no {id} drops it"
-        );
-        store.notify_last_owner(&ask).map(|()| id)
-    });
-    match asked {
+    match ask_owner(store, command, &format!("to run {command}"), "runs it") {
         Ok(id) => format!("proposed as #{id}; it runs only if the owner approves with /ok {id}"),
         Err(e) => format!("[zephyr] proposing {command} failed: {e}"),
     }
+}
+
+/// Stores `command` for the owner's `/ok`, telling them what it is in plain words (`ask`, e.g.
+/// "to use the token GH_TOKEN with gh") and what `/ok` does (`ok`). Returns the proposal's number.
+pub fn ask_owner(store: &Store, command: &str, ask: &str, ok: &str) -> rusqlite::Result<i64> {
+    let id = store.propose_command(command)?;
+    let text = format!("[zephyr] the agent asks {ask} (#{id}); /ok {id} {ok}, /no {id} drops it");
+    store.notify_last_owner(&text)?;
+    Ok(id)
 }
 
 /// The owner's `/ok N` or `/no N`. `Some(Ok(command))` is the approved command, for the router to

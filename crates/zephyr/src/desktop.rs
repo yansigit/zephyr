@@ -15,7 +15,7 @@ use std::sync::Mutex;
 static RUNNING: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 
 /// The cookie file, in the agent's home: the agent's own clients read it through `XAUTHORITY`.
-const XAUTHORITY: &str = ".zephyr-xauthority";
+pub(crate) const XAUTHORITY: &str = ".zephyr-xauthority";
 const COOKIE_NAME: &[u8] = b"MIT-MAGIC-COOKIE-1";
 
 /// The display children should use, after starting (or restarting) what serves it. A server left

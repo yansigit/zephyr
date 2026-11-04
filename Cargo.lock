@@ -3039,8 +3039,10 @@ name = "zephyr"
 version = "0.3.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "croner",
  "crossterm",
+ "data-encoding",
  "dialoguer",
  "futures-util",
  "http-body-util",
@@ -3049,6 +3051,7 @@ dependencies = [
  "jiff",
  "libc",
  "reqwest",
+ "ring",
  "rpi-tui",
  "rusqlite",
  "sd-notify",

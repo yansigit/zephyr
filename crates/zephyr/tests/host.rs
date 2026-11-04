@@ -23,6 +23,8 @@ case "$1" in
   info) echo "${SHIM_RUNTIMES:-io.containerd.runc.v2 runc}"; exit 0 ;;
   image) exit "${SHIM_IMAGE_MISSING:-0}" ;;
   pull) exit "${SHIM_PULL_FAIL:-0}" ;;
+  # `docker build -t TAG -`: the Dockerfile on stdin goes to build.log.
+  build) [ "${@: -1}" = - ] && cat >> "$SHIM_DIR/build.log"; exit "${SHIM_BUILD_FAIL:-0}" ;;
   run)
     case " $* " in
       *" --entrypoint zephyr "*) echo "zephyr $SHIM_LATEST" ;;
@@ -103,12 +105,28 @@ impl Env {
     }
 
     fn run_cli(&self, cli: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+        self.run_input(cli, args, env, None)
+    }
+
+    /// `zephyr <args>` with `input` on its stdin (not a terminal).
+    fn zephyr_input(&self, args: &[&str], input: &str) -> Output {
+        let cli = Path::new(env!("CARGO_BIN_EXE_zephyr"));
+        self.run_input(cli, args, &[], Some(input))
+    }
+
+    fn run_input(
+        &self,
+        cli: &Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+        input: Option<&str>,
+    ) -> Output {
         let path = format!(
             "{}:{}",
             self.dir.join("bin").display(),
             std::env::var("PATH").unwrap()
         );
-        let out = Command::new(cli)
+        let mut child = Command::new(cli)
             .args(args)
             .env_clear()
             .env("PATH", path)
@@ -117,9 +135,19 @@ impl Env {
             .env("ZEPHYR_CONTAINER", CONTAINER)
             .env("ZEPHYR_IMAGE", "zephyr-lanetest")
             .envs(env.iter().copied())
-            .stdin(std::process::Stdio::null())
-            .output()
+            .stdin(match input {
+                Some(_) => std::process::Stdio::piped(),
+                None => std::process::Stdio::null(),
+            })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
+        if let Some(input) = input {
+            let mut stdin = child.stdin.take().unwrap();
+            std::io::Write::write_all(&mut stdin, input.as_bytes()).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
         let text = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
         std::fs::OpenOptions::new()
             .create(true)
@@ -415,6 +443,130 @@ fn up_caps_memory_only_when_host_toml_sets_it() {
     let calls = env.calls();
     let run = find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
     assert!(run.windows(2).any(|w| w == ["--memory", "6g"]), "{run:?}");
+}
+
+#[test]
+fn packages_build_a_local_image_that_up_and_upgrade_run() {
+    let env = Env::new("packages");
+    env.init(&["--no-start"]);
+    let host = env.daemon().join("host.toml");
+    assert_eq!(
+        env.ok(&["packages", "list"]),
+        "no packages (zephyr packages add NAME)\n"
+    );
+
+    // Names are checked before anything runs.
+    for bad in ["Foo", "x;id", "git-"] {
+        assert!(
+            !env.zephyr(&["packages", "add", bad]).status.success(),
+            "{bad}"
+        );
+    }
+    // A failed build saves nothing.
+    let out = env.zephyr_env(
+        &["packages", "add", "nosuchpkg"],
+        &[("SHIM_IMAGE_MISSING", "1"), ("SHIM_BUILD_FAIL", "1")],
+    );
+    assert!(!out.status.success());
+    assert!(!read(&host).contains("packages ="));
+    let _ = std::fs::remove_file(env.dir.join("build.log"));
+    env.calls();
+
+    // add: built from stdin on the image, saved sorted, and the running container recreated.
+    let out = env.zephyr_env(
+        &["packages", "add", "jq", "ffmpeg"],
+        &[("SHIM_IMAGE_MISSING", "1")],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        read(&host).contains(r#"packages = ["ffmpeg", "jq"]"#),
+        "{}",
+        read(&host)
+    );
+    assert_eq!(
+        read(&env.dir.join("build.log")),
+        "FROM zephyr-lanetest\nRUN apt-get update && apt-get install -y --no-install-recommends \
+         ffmpeg jq && rm -rf /var/lib/apt/lists/*\n"
+    );
+    let calls = env.calls();
+    let tag = find(&calls, &["docker", "build", "-t"])[3].clone();
+    assert!(tag.starts_with("zephyr-local:custom-"), "{tag}");
+    let build = at(&calls, &["docker", "build"], "").unwrap();
+    let run = at(&calls, RUN, "").unwrap();
+    assert!(build < run, "{calls:#?}");
+    assert_eq!(calls[run].last().unwrap(), &tag);
+    assert_eq!(env.ok(&["packages", "list"]), "ffmpeg\njq\n");
+    // Nothing new: no build, no restart.
+    env.ok(&["packages", "add", "jq"]);
+    assert_eq!(at(&env.calls(), RM, ""), None);
+
+    // up runs the local image, built only when missing.
+    env.ok(&["up"]);
+    let calls = env.calls();
+    assert_eq!(find(&calls, RUN).last().unwrap(), &tag);
+    assert_eq!(at(&calls, &["docker", "build"], ""), None);
+
+    // upgrade builds it on the new image before the container goes.
+    let me = env!("CARGO_PKG_VERSION");
+    let out = env.zephyr_env(
+        &["upgrade", me],
+        &[("ZEPHYR_IMAGE", ""), ("SHIM_VERSION", "0.0.1")],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = env.calls();
+    let release = format!("ghcr.io/yansigit/zephyr:{me}");
+    let build = at(&calls, &["docker", "build", "-t"], "zephyr-local:").expect("a build");
+    assert!(calls[build][3].starts_with(&format!("zephyr-local:{me}-")));
+    assert!(build < at(&calls, RM, "").unwrap(), "{calls:#?}");
+    assert_eq!(find(&calls, RUN).last().unwrap(), &calls[build][3]);
+    assert!(read(&env.dir.join("build.log")).contains(&format!("FROM {release}\n")));
+    // To a newer release too, before its CLI takes over.
+    let vars = [
+        ("ZEPHYR_IMAGE", ""),
+        ("SHIM_LATEST", "99.0.0"),
+        ("SHIM_VERSION", me),
+        ("SHIM_IMAGE_MISSING", "1"),
+    ];
+    assert!(env
+        .run_cli(&env.cli_copy(), &["upgrade"], &vars)
+        .status
+        .success());
+    let calls = env.calls();
+    let build = at(&calls, &["docker", "build", "-t"], "zephyr-local:99.0.0-").expect("a build");
+    assert!(
+        build
+            < at(
+                &calls,
+                &["docker", "run", "--rm", "--entrypoint", "cat"],
+                ""
+            )
+            .unwrap()
+    );
+
+    // rm of the last ones goes back to the plain image, with no build.
+    env.ok(&["packages", "rm", "ffmpeg", "jq"]);
+    assert!(!read(&host).contains("packages ="));
+    let calls = env.calls();
+    assert_eq!(at(&calls, &["docker", "build"], ""), None);
+    assert_eq!(find(&calls, RUN).last().unwrap(), "zephyr-lanetest");
+    assert!(!env.zephyr(&["packages", "rm", "jq"]).status.success());
+
+    // Stopped: saved, applied by the next `zephyr up`.
+    let out = env.zephyr_env(&["packages", "add", "jq"], &[("SHIM_STATE", "exited")]);
+    assert!(
+        stdout(&out).contains("applies when zephyr starts"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(at(&env.calls(), RUN, ""), None);
 }
 
 #[test]
@@ -740,6 +892,37 @@ fn chat_on_a_terminal_falls_back_to_the_line_client_without_attach() {
         &chat_on_a_tty(),
         &["docker", "exec", "-it", CONTAINER, "zephyr", "chat"],
     );
+}
+
+/// `zephyr shell` is a login shell as the agent, in its home, on the desktop; `zsh` picks zsh.
+#[test]
+fn shell_opens_a_login_shell_as_the_agent() {
+    let env = Env::new("shell");
+    env.init(&["--no-start"]);
+    env.calls();
+    let out = env.zephyr(&["shell"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("needs a terminal"));
+    if Command::new("script").arg("--version").output().is_err() {
+        return eprintln!("skipped: no script(1) to give zephyr a terminal");
+    }
+    for (args, sh) in [("shell", "bash"), ("shell zsh", "zsh")] {
+        let out = env.on_a_tty(args, &[]);
+        assert!(out.status.success(), "{}", stdout(&out));
+        let calls = env.calls();
+        let call = find_agent(&calls, &["-it", "-e", "TERM"]);
+        let tail = [
+            "-e",
+            "DISPLAY=:99",
+            "-e",
+            "XAUTHORITY=/zephyr/.zephyr-xauthority",
+            CONTAINER,
+            sh,
+            "-l",
+        ];
+        assert!(call.ends_with(&tail.map(String::from)), "{call:?}");
+    }
+    assert!(!env.zephyr(&["shell", "fish"]).status.success());
 }
 
 /// A `zephyr tui` killed with its container cannot undo its terminal modes; the host does.
@@ -1211,4 +1394,88 @@ fn upgrade_waits_backs_up_and_goes_back_only_with_a_backup() {
 
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap()
+}
+
+#[test]
+fn vault_add_list_and_rm_reach_roots_file_and_never_put_a_value_in_argv() {
+    const PASSWORD: &str = "hunter2-host-s3cret";
+    const TOKEN: &str = "ghp_host_token_0123";
+    let env = Env::new("vault");
+    env.init(&["--no-start"]);
+    // As after `zephyr up`: the daemon's files are root's, reached through `zephyr __file`.
+    let files = env.dir.join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    for name in ["zephyr.toml", "secrets.env", "tui.token", "host.toml"] {
+        std::fs::rename(env.daemon().join(name), files.join(name)).unwrap();
+    }
+    std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let add = [
+        "vault",
+        "add",
+        "login",
+        "github",
+        "--site",
+        "https://github.com",
+        "--user",
+        "aiden",
+        "--totp",
+    ];
+    let out = env.zephyr_input(&add, &format!("{PASSWORD}\nJBSWY3DPEHPK3PXP\n"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = env.zephyr_input(
+        &["vault", "add", "token", "GH_TOKEN"],
+        &format!("{TOKEN}\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let list = env.ok(&["vault", "list"]);
+    assert!(
+        list.contains("login github: aiden on https://github.com, with a one-time code"),
+        "{list}"
+    );
+    assert!(
+        list.contains("token GH_TOKEN: not allowed for any program yet"),
+        "{list}"
+    );
+
+    let calls = env.calls();
+    let root = ["docker", "exec", "-i", "-u", "0", CONTAINER];
+    for op in ["get", "put"] {
+        find(
+            &calls,
+            &[&root[..], &["zephyr", "__file", op, "vault.toml"]].concat(),
+        );
+    }
+    let saved = std::fs::read_to_string(files.join("vault.toml")).unwrap();
+    assert!(saved.contains(PASSWORD) && saved.contains(TOKEN));
+    let output = std::fs::read_to_string(env.dir.join("output.log")).unwrap();
+    for value in [PASSWORD, TOKEN, "JBSWY3DPEHPK3PXP"] {
+        assert!(!format!("{calls:?}").contains(value), "{value} in argv");
+        assert!(!output.contains(value), "{value} printed");
+    }
+
+    // A value never goes in an argument, and a bad one names only the problem.
+    assert!(!env
+        .zephyr(&["vault", "add", "token", "GH_TOKEN", TOKEN])
+        .status
+        .success());
+    let out = env.zephyr_input(&["vault", "add", "token", "lower"], "v\n");
+    assert!(!out.status.success());
+
+    env.ok(&["vault", "rm", "github"]);
+    let saved = std::fs::read_to_string(files.join("vault.toml")).unwrap();
+    assert!(
+        !saved.contains("github") && saved.contains("GH_TOKEN"),
+        "{saved}"
+    );
+    assert!(!env.zephyr(&["vault", "rm", "github"]).status.success());
+    std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o700)).unwrap();
 }

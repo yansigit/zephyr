@@ -49,12 +49,15 @@ zephyr login openai-codex --account codex-main
 | `zephyr channel add\|remove discord\|imessage \| list` | Channel settings (secrets are asked for hidden); `remove` drops the channel, its owners and secrets, `list` shows them. Discord shows typing while the agent works, and a progress note after 20 s (`discord.progress`, `discord.progress_after_secs`) |
 | `zephyr skill add DIR \| list \| rm NAME` | Skills the agent may use (see [Skills and connectors](#skills-and-connectors)); one you add is approved at once |
 | `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}` |
+| `zephyr packages add NAME.. \| rm NAME.. \| list` | Ubuntu (apt) packages for the agent, baked into a local image (`zephyr-local:<version>-<hash>`) on the release one; `up` and `upgrade` build it, and `add`/`rm` rebuild and recreate the container once the agent is idle |
+| `zephyr vault list \| add login NAME --site URL [--user U] [--totp] \| add token NAME \| edit NAME \| rm NAME \| revoke NAME [PROGRAM]` | Logins and tokens the agent uses by name (see [The vault](#the-vault)); values are asked for hidden, or read one per line from stdin when piped, never taken as arguments |
 | `zephyr config get\|set KEY [VALUE]` | Edit `zephyr.toml` (comments are kept; invalid keys are refused) |
 | `zephyr attach [--stock]` | Zephyr's terminal UI on the live session: history, tool calls, what the agent is doing, the queue and today's spend; `^D` detaches and the agent keeps running. `--stock` runs the stock `rpi --connect` client instead |
+| `zephyr shell [bash\|zsh]` | A login shell in the container as the agent, in its home (`/zephyr`) and on its desktop; needs a terminal |
 | `zephyr chat` | The same UI on a terminal; a line client (`< reply` per line) when piped or scripted |
 | `zephyr pause` / `resume` | Stop and restart dispatch (`/pause` and `/resume` from any channel do the same) |
 | `zephyr reload` | Apply hand edits now instead of within 5 s (`/reload` from any channel) |
-| `zephyr uninstall [--keep-data]` | Remove the container and image, and `~/.zephyr` unless kept |
+| `zephyr uninstall [--keep-data]` | Remove the container and its images (the local package ones too), and `~/.zephyr` unless kept |
 
 Sign in from the running gateway too, with no re-exec afterwards. In `zephyr attach`, `/login`
 lists the providers and Enter starts the one you pick: an OAuth provider (Antigravity,
@@ -65,6 +68,16 @@ only an OAuth one: a `key` or a token provider is refused there, so use `zephyr 
 or the attach panel. `/login cancel [ID|PROVIDER]` stops a sign-in you have given up on, so its slot
 in the eight that may wait at once is free again. The account joins the pool at once; `/model`
 selects it.
+
+Copying in `zephyr attach`: drag over any text and it is copied when you let go. Each code block in
+a reply carries a `#n` at its right edge; click the block to copy it, `/copy N` copies block N,
+`/copy` the whole last reply, and `^X` the newest block (press again for the one before; with a
+drag selection, `^X` copies that). What is copied is the block's source, without the wrapping or
+the indent. Copying goes through the terminal (OSC 52), so it reaches the clipboard of the machine
+you are typing on, even over ssh. It works in iTerm2, Ghostty, kitty, WezTerm and Alacritty, and
+inside tmux only with `set -g set-clipboard on`; macOS Terminal.app does not support it and copies
+nothing. Under `NO_COLOR` a click may not find the block; `/copy N` and `^X` still work. `/quit` or
+`/exit` leaves the UI like `^D`, and the agent keeps running.
 
 ## Changing settings
 
@@ -95,6 +108,11 @@ the spend per day and per account over the last 7 days, or `DAYS`.
 `zephyr attach`, which masks it), and `/login cancel [ID|PROVIDER]` stops the ones you gave up on.
 The first account of an empty install does restart the agent once, when idle: there is nothing for
 it to start on until that account exists.
+
+Two more in `zephyr attach` only: `!COMMAND` runs `bash -c COMMAND` as the agent in its home (60 s at
+most, the first 50 KB of output kept) and shows the output and exit code; it goes to the agent in
+front of your next message (not a `/` command), and Esc on an empty composer drops it instead.
+`/shell [zsh]` opens an interactive login shell as the agent in place of the UI; exit it to come back.
 
 `ZEPHYR_CONTAINER` (default `zephyr`) and `ZEPHYR_IMAGE` choose another container or image, for
 example to test beside a live install.
@@ -176,13 +194,26 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
 
 - **Browser.** fingerprint-chromium (ungoogled-chromium with fingerprint patches; Playwright's
   Chromium on arm64), driven by the `agent-browser` CLI. Its profile is `~/.zephyr/browser`, kept
-  across restarts. It is the agent's, never yours, and holds only the sign-ins you give it (below).
+  across restarts. It is the agent's, never yours, and holds only the sign-ins you give it: through
+  [the vault](#the-vault), or by hand (below).
   A site that still blocks it gets Camoufox, a stealth Firefox, which keeps no sign-ins.
 - **Python.** A read-only environment first on the agent's PATH (`/opt/zephyr/py`: requests,
   beautifulsoup4, pandas, pypdf, pillow, Camoufox), locked in `deploy/python/uv.lock`, plus `uv` for
   anything else (`uv run --with`, or a venv of its own; uv's cache lives in `~/.zephyr/.cache/uv`).
   To add a package for every run, edit `deploy/python/pyproject.toml`, run `uv lock` there, and
   rebuild.
+- **Command-line tools.** `gh` (GitHub, once you give the agent a token), `himalaya` (mail, below),
+  `jq`, `rg`, `fd`, `sqlite3`, `ssh`, `zip`/`unzip`, `tree`, `file`, `zsh`, and node with `npm` and
+  `npx`. Writes through `gh` (`pr create`, `issue comment`, `api -X POST`, ...) and mail
+  `himalaya` sends are in the turn's outbound list.
+- **Installing.** The agent has no sudo. What it installs lands in its home and survives upgrades:
+  `uv tool install`, `npm i -g` (`NPM_CONFIG_PREFIX` is `~/.zephyr/.local`) and any binary in
+  `~/.zephyr/.local/bin`, which is first on its PATH. An apt package needs you:
+  `zephyr packages add NAME`.
+- **Mail.** The agent reads and sends mail with `himalaya`, configured in
+  `/zephyr/.config/himalaya/config.toml` in its home (`~/.zephyr/.config/himalaya/config.toml` on
+  the host); the agent can write that file itself. Keep the password out of it: see Vault. There
+  is no mail channel: mail does not reach the agent by itself.
 - **Desktop.** An Xvfb screen (1920x1080) with openbox, where the browser runs. The agent sees it
   through screenshots and drives it with `xdotool`.
 - **GPU.** When Docker has the NVIDIA runtime, `zephyr up` passes the GPU in, so the browser's
@@ -238,6 +269,73 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
 A site's terms may forbid automated use; a site that catches the agent can flag the account it is
 signed in as.
 
+## The vault
+
+Logins and tokens you save for the agent live in `vault.toml` in the daemon's own folder, where
+the agent cannot read them (DESIGN §4.15). The agent uses them by name and never sees a value:
+
+- **A login** (a website's username, password and, optionally, a TOTP seed for one-time codes).
+  The agent opens the login page and asks zephyr to fill it; zephyr types the values in only when
+  the page is on the login's own site (scheme, host and port exactly), so a look-alike page gets
+  nothing. The first fill of each login waits for your OK.
+- **A token** (an API token, a mail password). The agent runs a command with it (`exec` with
+  `secrets: ["NAME"]`), and the token is set as the environment variable `NAME` for that command
+  only. Each program a token is used with needs your OK once (`gh` for `GH_TOKEN`, say); after
+  that the same use runs without asking. Wherever the value shows up in what the command prints,
+  the agent gets `[vault:NAME]` instead.
+
+When the agent wants to use one, you are asked: `the agent asks to use the token GH_TOKEN with gh
+(#4); /ok 4 allows it from now on, /no 4 drops it`. When one is missing, the agent asks you to
+save it and names the exact command. Save and manage entries:
+
+- In `zephyr attach`, `/vault` opens a panel: `a` adds a login, `t` a token, `e` edits, `d`
+  deletes, `r` takes back what an entry is allowed for. `/vault add login NAME SITE` and
+  `/vault add token NAME` open the form filled in. Values are typed masked. A new entry saved
+  here is told to the agent, so it can carry on.
+- On the host, `zephyr vault add login github --site https://github.com --user me [--totp]`,
+  `zephyr vault add token GH_TOKEN`, `list`, `edit`, `rm` and `revoke NAME [PROGRAM]`. The agent
+  is not told of these: tell it.
+- From any channel, `/vault` lists the names, `/vault rm NAME` deletes one, and `/vault revoke
+  NAME [PROGRAM]` takes back a grant. A chat never takes a value: `/vault add` there is refused.
+  Never paste a password into a chat.
+
+Names: a login is lowercase (`github`, `my-bank`), a token is an environment variable name
+(`GH_TOKEN`). The vault is for the main conversation; background tasks and jobs cannot use it.
+The file is not encrypted (a passphrase would stop unattended restarts), and the daemon reads it
+on every use, so an edit needs no reload. `[agent] env` still works, but hands a secret to every
+command the agent runs; the vault is the better place for one.
+
+What it protects against: credentials stay out of chats, transcripts and the model's context in
+normal use; a login is filled only on its own site; and each new use needs your OK. What it does
+not: an agent set on misusing a value it was allowed to use can still read it (a filled field
+read back, its own command's log under `.procs/`, a program that prints its environment to a
+file). Grant a token only to programs you trust with it.
+
+**Mail.** There is no mail channel, but the agent can read and send mail with `himalaya`. Save the
+password as a token (`zephyr vault add token MAIL_PASSWORD`) and have the agent write
+`/zephyr/.config/himalaya/config.toml` with the password taken from the environment:
+
+```toml
+[accounts.me]
+default = true
+email = "me@example.com"
+backend.type = "imap"
+backend.host = "imap.example.com"
+backend.port = 993
+backend.login = "me@example.com"
+backend.auth.type = "password"
+backend.auth.cmd = "printenv MAIL_PASSWORD"
+message.send.backend.type = "smtp"
+message.send.backend.host = "smtp.example.com"
+message.send.backend.port = 465
+message.send.backend.login = "me@example.com"
+message.send.backend.auth.type = "password"
+message.send.backend.auth.cmd = "printenv MAIL_PASSWORD"
+```
+
+The first `himalaya` command run with `secrets: ["MAIL_PASSWORD"]` asks you to allow
+`MAIL_PASSWORD` for `himalaya`.
+
 ## Where things live
 
 - `~/.zephyr/` (mode 0700), seen as `/zephyr` in the container: the agent's home, with sessions,
@@ -252,7 +350,10 @@ signed in as.
     them: they are removed from rpi's environment and every other process zephyr starts for it. To
     give the agent one (an API key a provider reads, say), list its name in `[agent] env = ["NAME"]`.
   - `tui.token`: the `zephyr attach` token.
-  - `host.toml`: the projects folder, optionally `memory = "8g"` to cap the container's memory, and `offered_extensions`: the image extensions `init`, `up` and `upgrade` have already added to `zephyr.toml`, so one you remove stays removed. The first `up` after upgrading to a zephyr that keeps this record adds once any image extension removed earlier, or every one if the config lists none; after that, a removal sticks.
+  - `vault.toml` (0600): the [vault](#the-vault)'s logins and tokens, and what each may be used
+    for. `zephyr vault` edits it; comments you add by hand are kept.
+  - `host.toml`: the projects folder, optionally `memory = "8g"` to cap the container's memory,
+    `packages`: the apt packages `zephyr packages` bakes into the local image, and `offered_extensions`: the image extensions `init`, `up` and `upgrade` have already added to `zephyr.toml`, so one you remove stays removed. The first `up` after upgrading to a zephyr that keeps this record adds once any image extension removed earlier, or every one if the config lists none; after that, a removal sticks.
     Used only on the host, at `zephyr up`.
   - `state.db`: inbox, outbox, jobs, spend.
 

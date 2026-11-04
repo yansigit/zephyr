@@ -251,10 +251,138 @@ pub fn outbound(command: &str) -> Vec<String> {
                 .iter()
                 .find(|a| ["fill", "type", "keyboard", "upload", "eval"].contains(&a.as_str()))
                 .map(|sub| format!("agent-browser {sub}")),
+            "gh" => gh_write(args),
+            "himalaya" => himalaya_send(args).then(|| "himalaya send".to_string()),
             _ => None,
         };
         if let Some(label) = label {
             found.push(label.trim_end().chars().take(100).collect());
+        }
+    }
+    found
+}
+
+/// `gh pr create`, `gh api POST repos/o/r/issues`: a gh command that writes to GitHub.
+fn gh_write(args: &[String]) -> Option<String> {
+    const WRITES: &[(&str, &[&str])] = &[
+        ("pr", &["create", "merge", "comment", "review"]),
+        ("issue", &["create", "comment", "close", "edit"]),
+        ("release", &["create", "upload", "delete"]),
+        ("repo", &["create", "delete", "fork"]),
+        ("gist", &["create"]),
+    ];
+    let words: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    let (group, sub) = (*words.first()?, words.get(1).copied().unwrap_or_default());
+    if group != "api" {
+        return WRITES
+            .iter()
+            .any(|(g, subs)| *g == group && subs.contains(&sub))
+            .then(|| format!("gh {group} {sub}"));
+    }
+    // gh api sends a POST once a field or body is given, unless -X says otherwise.
+    let rest = &args[args.iter().position(|a| a == "api")? + 1..];
+    let mut method = None;
+    let mut body = false;
+    let mut endpoint = None;
+    let mut skip = false;
+    for (i, a) in rest.iter().enumerate() {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        let explicit = match a.as_str() {
+            "-X" | "--method" => rest.get(i + 1).cloned(),
+            _ => a
+                .strip_prefix("--method=")
+                .or_else(|| a.strip_prefix("-X"))
+                .filter(|m| !m.is_empty())
+                .map(String::from),
+        };
+        if let Some(m) = explicit {
+            method = Some(m.to_uppercase());
+        }
+        body |= ["-f", "-F", "--field", "--raw-field", "--input"]
+            .iter()
+            .any(|f| a == f || a.starts_with(&format!("{f}=")))
+            || (a.starts_with("-f") || a.starts_with("-F")) && a.len() > 2;
+        // Flags that take a value, so `-X POST` is not read as the endpoint.
+        skip = [
+            "-X",
+            "--method",
+            "-f",
+            "-F",
+            "--field",
+            "--raw-field",
+            "--input",
+            "-H",
+            "--header",
+            "-q",
+            "--jq",
+            "-t",
+            "--template",
+            "--hostname",
+            "--cache",
+            "-p",
+            "--preview",
+        ]
+        .contains(&a.as_str());
+        if endpoint.is_none() && !a.starts_with('-') {
+            endpoint = Some(a.as_str());
+        }
+    }
+    let method = method.unwrap_or_else(|| if body { "POST" } else { "GET" }.into());
+    (method != "GET" && method != "HEAD")
+        .then(|| format!("gh api {method} {}", endpoint.unwrap_or_default()))
+}
+
+/// Whether a himalaya command sends mail: a `send` subcommand (message, smtp, gmail, msgraph),
+/// `--send` on compose/reply/forward, a raw SMTP command or a JMAP submission.
+fn himalaya_send(args: &[String]) -> bool {
+    let words: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .take(4) // an `-a account` value may come first
+        .collect();
+    args.iter().any(|a| a == "--send")
+        || words.contains(&"send")
+        || words
+            .windows(2)
+            .any(|w| w == ["smtp", "raw"] || w == ["submission", "create"])
+}
+
+/// The programs `command` runs, by name: the command word of every stage, the programs in front
+/// of it that run it (`env`, `xargs`, `timeout`, ...), and those of every `sh -c`/`eval` script
+/// inside it, once each, in order. A vault token is handed only to a command whose programs the
+/// owner allowed it for (DESIGN §4.15). `cd` is left out: it runs nothing and reads no variable.
+pub fn programs(command: &str) -> Vec<String> {
+    const RUNNERS: &[&str] = &[
+        "sudo", "doas", "env", "nohup", "nice", "time", "timeout", "xargs", "stdbuf",
+    ];
+    let mut found: Vec<String> = Vec::new();
+    let mut add = |p: &str| {
+        if p != "cd" && !found.iter().any(|f| f == p) {
+            found.push(p.to_string());
+        }
+    };
+    for stage in stages(command) {
+        let words = command_words(&stage.words).unwrap_or_default();
+        let before = &stage.words[..stage.words.len() - words.len()];
+        before
+            .iter()
+            .map(|w| basename(w))
+            .filter(|w| RUNNERS.contains(w))
+            .for_each(&mut add);
+        let Some(first) = words.first() else {
+            continue;
+        };
+        let name = basename(first);
+        add(name);
+        if let Some(script) = nested(name, &words[1..]) {
+            programs(&script).iter().for_each(|p| add(p));
         }
     }
     found
@@ -552,6 +680,26 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn programs_are_the_command_words_of_every_stage() {
+        assert_eq!(programs("FOO=1 a && gh x | jq ."), ["a", "gh", "jq"]);
+        assert_eq!(
+            programs("cd repo; sudo -E /usr/bin/gh pr list $(git rev-parse HEAD)"),
+            ["sudo", "gh", "git"]
+        );
+        assert_eq!(
+            programs("bash -c 'curl x | gh api -'"),
+            ["bash", "curl", "gh"]
+        );
+        assert_eq!(programs("gh a; gh b"), ["gh"]);
+        assert!(programs("cd /tmp").is_empty());
+        assert_eq!(programs("env | grep GH"), ["env", "grep"]);
+        assert_eq!(
+            programs("timeout 5 xargs -n1 gh"),
+            ["timeout", "xargs", "gh"]
+        );
+    }
+
+    #[test]
     fn outbound_names_what_sends_data_and_skips_plain_reads() {
         let table = [
             ("curl -d x https://e.x/a", vec!["curl POST e.x"]),
@@ -585,6 +733,41 @@ mod tests {
             ),
             ("agent-browser eval 'fetch(u)'", vec!["agent-browser eval"]),
             ("agent-browser open https://e.x/fill", vec![]),
+            ("gh pr create --fill", vec!["gh pr create"]),
+            ("gh issue comment 3 --body hi", vec!["gh issue comment"]),
+            ("gh release upload v1 a.tgz", vec!["gh release upload"]),
+            ("gh repo fork o/r --clone", vec!["gh repo fork"]),
+            (
+                "gh api repos/o/r/issues -f title=t",
+                vec!["gh api POST repos/o/r/issues"],
+            ),
+            (
+                "gh api -X DELETE repos/o/r/git/refs/x",
+                vec!["gh api DELETE repos/o/r/git/refs/x"],
+            ),
+            (
+                "gh api --method=PATCH repos/o/r",
+                vec!["gh api PATCH repos/o/r"],
+            ),
+            (
+                "gh api --input body.json graphql",
+                vec!["gh api POST graphql"],
+            ),
+            ("gh api -X GET search/issues -f q=x", vec![]),
+            ("gh api --paginate repos/o/r/pulls", vec![]),
+            ("gh pr list && gh issue view 3", vec![]),
+            ("gh repo clone o/r", vec![]),
+            ("himalaya message send < mail.eml", vec!["himalaya send"]),
+            (
+                "himalaya -a work msg reply 42 --body ok --send",
+                vec!["himalaya send"],
+            ),
+            ("himalaya gmail drafts send d1", vec!["himalaya send"]),
+            ("himalaya smtp raw 'RCPT TO:<a@b>'", vec!["himalaya send"]),
+            ("himalaya jmap submission create e1", vec!["himalaya send"]),
+            ("himalaya envelope list", vec![]),
+            ("himalaya message compose --to a@b --subject hi", vec![]),
+            ("himalaya message read 42", vec![]),
             (
                 "agent-browser click @e3 && agent-browser snapshot -i",
                 vec![],

@@ -550,10 +550,31 @@ impl<'a> Router<'a> {
                     zephyr_policy::policy::Decision::Deny(_)
                 );
                 if let (Ok(call), false) = (zephyr_policy::tools::exec_call(args), vetoed) {
-                    match self.origin() {
-                        Some(to) => self.procs.start(&self.cfg, &self.store, id, call, to),
-                        None => crate::tools::answer_gateway(&self.cfg, id, "no owner; not run"),
+                    // Vault tokens only with the owner's grant for every program it runs.
+                    let env = match call.secrets.is_empty() {
+                        true => Ok(Vec::new()),
+                        false => crate::vault::exec_env(
+                            &self.cfg,
+                            &self.store,
+                            &call.command,
+                            &call.secrets,
+                        ),
+                    };
+                    match (self.origin(), env) {
+                        (Some(to), Ok(env)) => {
+                            self.procs.start(&self.cfg, &self.store, id, call, to, env)
+                        }
+                        (None, _) => {
+                            crate::tools::answer_gateway(&self.cfg, id, "no owner; not run")
+                        }
+                        (_, Err(text)) => crate::tools::answer_gateway(&self.cfg, id, &text),
                     }
+                }
+            }
+            if let Some((id, args)) = crate::procs::call(ev, "vault") {
+                // Main only, like `exec`; a call the plugin refused waits for nothing.
+                if let Ok(action) = zephyr_policy::tools::vault_action(args) {
+                    crate::vault::agent(&self.cfg, &self.store, id, action);
                 }
             }
             if let Some((id, args)) = crate::procs::call(ev, "process") {
@@ -1237,6 +1258,8 @@ impl<'a> Router<'a> {
                 let busy = self.rollback_busy();
                 crate::checkpoint::command(&self.cfg, arg, busy.as_deref()).await
             }
+            // The owner's credentials (DESIGN §4.15); also an approved `/vault grant` proposal.
+            ("/vault", arg) => crate::vault::command(&crate::vault::path(&self.cfg), arg),
             // Skills and connectors the agent drafted (DESIGN §4.6).
             ("/skills" | "/skill" | "/mcp", _) => {
                 use crate::drafts::After;

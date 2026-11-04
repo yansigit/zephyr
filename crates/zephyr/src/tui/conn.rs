@@ -83,6 +83,21 @@ pub struct LoginStatus {
     pub error: Option<String>,
 }
 
+/// One entry of the vault as `zephyr.vault_*` lists it: never a value (DESIGN §4.15).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct VaultEntry {
+    /// `login` | `token`
+    pub kind: String,
+    pub name: String,
+    pub site: String,
+    pub username: String,
+    /// Whether a one-time code seed is saved.
+    pub totp: bool,
+    pub granted: bool,
+    pub programs: Vec<String>,
+}
+
 /// What the UI asks of the daemon.
 pub enum Ask {
     /// `send {type: "prompt"}`: a message or a slash command.
@@ -106,6 +121,14 @@ pub enum Ask {
     LoginInput { login_id: String, text: String },
     /// `zephyr.login_cancel`.
     LoginCancel { login_id: String },
+    /// `zephyr.vault_list`; this and the three below are answered with [`Msg::Vault`].
+    VaultList,
+    /// `zephyr.vault_put`: the entry, values and all, for `vault.toml` only.
+    VaultPut(Box<crate::vault::Entry>),
+    /// `zephyr.vault_rm`.
+    VaultRm(String),
+    /// `zephyr.vault_revoke`: every grant of the entry.
+    VaultRevoke(String),
 }
 
 impl std::fmt::Debug for Ask {
@@ -138,6 +161,11 @@ impl std::fmt::Debug for Ask {
                 .debug_struct("LoginCancel")
                 .field("login_id", login_id)
                 .finish(),
+            Ask::VaultList => f.write_str("VaultList"),
+            // `Entry`'s own Debug prints only the values' lengths.
+            Ask::VaultPut(entry) => f.debug_tuple("VaultPut").field(entry).finish(),
+            Ask::VaultRm(name) => f.debug_tuple("VaultRm").field(name).finish(),
+            Ask::VaultRevoke(name) => f.debug_tuple("VaultRevoke").field(name).finish(),
         }
     }
 }
@@ -167,6 +195,10 @@ pub enum Msg {
     /// there is nothing left to poll, type into or cancel. Carries the login it was about, so a
     /// late answer for a login the panel no longer runs says nothing about the one it does.
     LoginGone(String),
+    /// The vault's entries, after a `zephyr.vault_*` call.
+    Vault(Vec<VaultEntry>),
+    /// A vault call the daemon refused, and why.
+    VaultError(String),
     /// The connection is gone or was refused; it retries.
     Down(String),
     /// Retrying would not help: a wrong token, or a daemon without `zephyr.hello`.
@@ -333,6 +365,23 @@ async fn session(
                     let id = rpc.request("zephyr.login_cancel", json!({"loginId": login_id})).await?;
                     pending.insert(id, Pending::Quiet);
                 }
+                Some(Ask::VaultList) => {
+                    let id = rpc.request("zephyr.vault_list", json!({})).await?;
+                    pending.insert(id, Pending::Vault);
+                }
+                Some(Ask::VaultPut(entry)) => {
+                    let params = serde_json::to_value(&*entry).unwrap_or_default();
+                    let id = rpc.request("zephyr.vault_put", params).await?;
+                    pending.insert(id, Pending::Vault);
+                }
+                Some(Ask::VaultRm(name)) => {
+                    let id = rpc.request("zephyr.vault_rm", json!({"name": name})).await?;
+                    pending.insert(id, Pending::Vault);
+                }
+                Some(Ask::VaultRevoke(name)) => {
+                    let id = rpc.request("zephyr.vault_revoke", json!({"name": name})).await?;
+                    pending.insert(id, Pending::Vault);
+                }
                 None => return Ok(()),
             },
         }
@@ -354,6 +403,8 @@ enum Pending {
     },
     /// `login_cancel` answers `{}`: nothing to show either way.
     Quiet,
+    /// Any `zephyr.vault_*` call: the entries, or why not.
+    Vault,
 }
 
 /// An error answer to one of the login calls.
@@ -421,6 +472,12 @@ fn answer(what: Pending, mut v: Value) -> Option<Msg> {
             None => return None,
         },
         Pending::Quiet => return None,
+        Pending::Vault => match refusal {
+            Some(r) => Msg::VaultError(r.why),
+            None => {
+                Msg::Vault(serde_json::from_value(result["entries"].take()).unwrap_or_default())
+            }
+        },
     })
 }
 

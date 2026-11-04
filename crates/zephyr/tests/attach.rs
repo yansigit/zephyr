@@ -824,3 +824,55 @@ async fn stock_rpi_connect_attaches_chats_and_detaches() {
     wait(|| gw.count("inbox", "done") == 2).await;
     gw.shutdown().await;
 }
+
+#[tokio::test]
+async fn zephyr_vault_methods_save_list_and_remove_without_echoing_a_value() {
+    const PASSWORD: &str = "pw-attach-s3cret";
+    let gw = start("vault");
+    let mut c = Client::connect(gw.port).await;
+    let early = c.call("zephyr.vault_list", json!({})).await;
+    assert_eq!(early["error"]["code"], -32001, "{early}");
+    c.call("authenticate", json!({"token": TOKEN})).await;
+
+    let entry = json!({"kind": "login", "name": "github", "site": "https://github.com",
+                       "username": "aiden", "password": PASSWORD, "granted": true});
+    let put = c.call("zephyr.vault_put", entry).await;
+    let listed = c.call("zephyr.vault_list", json!({})).await;
+    for frame in [&put, &listed] {
+        let entries = frame["result"]["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 1, "{frame}");
+        assert_eq!(entries[0]["name"], "github");
+        assert_eq!(entries[0]["username"], "aiden");
+        assert_eq!(entries[0]["granted"], false, "only the owner's /ok grants");
+        assert!(!frame.to_string().contains(PASSWORD), "{frame}");
+    }
+    let saved = std::fs::read_to_string(gw.home.join("vault.toml")).unwrap();
+    assert!(saved.contains(PASSWORD));
+    // The agent hears of the new entry, by name only.
+    wait(|| {
+        gw.log("prompt").iter().any(|p| {
+            p["message"].as_str().is_some_and(|m| {
+                m.ends_with("the owner saved the login github in the vault; you can use it now")
+            })
+        })
+    })
+    .await;
+    assert!(!std::fs::read_to_string(gw.home.join("log.jsonl"))
+        .unwrap()
+        .contains(PASSWORD));
+
+    // A refusal names the problem, never the value.
+    let bad = json!({"kind": "token", "name": "lower", "value": PASSWORD});
+    let refused = c.call("zephyr.vault_put", bad).await;
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    assert!(!refused.to_string().contains(PASSWORD), "{refused}");
+    let odd = json!({"kind": "token", "name": "A", "value": PASSWORD, "granted": PASSWORD});
+    let refused = c.call("zephyr.vault_put", odd).await;
+    assert!(!refused.to_string().contains(PASSWORD), "{refused}");
+
+    let gone = c.call("zephyr.vault_rm", json!({"name": "github"})).await;
+    assert_eq!(gone["result"]["entries"], json!([]), "{gone}");
+    let again = c.call("zephyr.vault_rm", json!({"name": "github"})).await;
+    assert_eq!(again["error"]["code"], -32602, "{again}");
+    gw.shutdown().await;
+}
