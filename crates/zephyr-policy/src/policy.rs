@@ -251,6 +251,8 @@ pub fn outbound(command: &str) -> Vec<String> {
                 .iter()
                 .find(|a| ["fill", "type", "keyboard", "upload", "eval"].contains(&a.as_str()))
                 .map(|sub| format!("agent-browser {sub}")),
+            "gh" => gh_write(args),
+            "himalaya" => himalaya_send(args).then(|| "himalaya send".to_string()),
             _ => None,
         };
         if let Some(label) = label {
@@ -258,6 +260,98 @@ pub fn outbound(command: &str) -> Vec<String> {
         }
     }
     found
+}
+
+/// `gh pr create`, `gh api POST repos/o/r/issues`: a gh command that writes to GitHub.
+fn gh_write(args: &[String]) -> Option<String> {
+    const WRITES: &[(&str, &[&str])] = &[
+        ("pr", &["create", "merge", "comment", "review"]),
+        ("issue", &["create", "comment", "close", "edit"]),
+        ("release", &["create", "upload", "delete"]),
+        ("repo", &["create", "delete", "fork"]),
+        ("gist", &["create"]),
+    ];
+    let words: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    let (group, sub) = (*words.first()?, words.get(1).copied().unwrap_or_default());
+    if group != "api" {
+        return WRITES
+            .iter()
+            .any(|(g, subs)| *g == group && subs.contains(&sub))
+            .then(|| format!("gh {group} {sub}"));
+    }
+    // gh api sends a POST once a field or body is given, unless -X says otherwise.
+    let rest = &args[args.iter().position(|a| a == "api")? + 1..];
+    let mut method = None;
+    let mut body = false;
+    let mut endpoint = None;
+    let mut skip = false;
+    for (i, a) in rest.iter().enumerate() {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        let explicit = match a.as_str() {
+            "-X" | "--method" => rest.get(i + 1).cloned(),
+            _ => a
+                .strip_prefix("--method=")
+                .or_else(|| a.strip_prefix("-X"))
+                .filter(|m| !m.is_empty())
+                .map(String::from),
+        };
+        if let Some(m) = explicit {
+            method = Some(m.to_uppercase());
+        }
+        body |= ["-f", "-F", "--field", "--raw-field", "--input"]
+            .iter()
+            .any(|f| a == f || a.starts_with(&format!("{f}=")))
+            || (a.starts_with("-f") || a.starts_with("-F")) && a.len() > 2;
+        // Flags that take a value, so `-X POST` is not read as the endpoint.
+        skip = [
+            "-X",
+            "--method",
+            "-f",
+            "-F",
+            "--field",
+            "--raw-field",
+            "--input",
+            "-H",
+            "--header",
+            "-q",
+            "--jq",
+            "-t",
+            "--template",
+            "--hostname",
+            "--cache",
+            "-p",
+            "--preview",
+        ]
+        .contains(&a.as_str());
+        if endpoint.is_none() && !a.starts_with('-') {
+            endpoint = Some(a.as_str());
+        }
+    }
+    let method = method.unwrap_or_else(|| if body { "POST" } else { "GET" }.into());
+    (method != "GET" && method != "HEAD")
+        .then(|| format!("gh api {method} {}", endpoint.unwrap_or_default()))
+}
+
+/// Whether a himalaya command sends mail: a `send` subcommand (message, smtp, gmail, msgraph),
+/// `--send` on compose/reply/forward, a raw SMTP command or a JMAP submission.
+fn himalaya_send(args: &[String]) -> bool {
+    let words: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .take(4) // an `-a account` value may come first
+        .collect();
+    args.iter().any(|a| a == "--send")
+        || words.contains(&"send")
+        || words
+            .windows(2)
+            .any(|w| w == ["smtp", "raw"] || w == ["submission", "create"])
 }
 
 /// The method of a curl that sends a body or uses a method other than GET/HEAD.
@@ -585,6 +679,41 @@ mod tests {
             ),
             ("agent-browser eval 'fetch(u)'", vec!["agent-browser eval"]),
             ("agent-browser open https://e.x/fill", vec![]),
+            ("gh pr create --fill", vec!["gh pr create"]),
+            ("gh issue comment 3 --body hi", vec!["gh issue comment"]),
+            ("gh release upload v1 a.tgz", vec!["gh release upload"]),
+            ("gh repo fork o/r --clone", vec!["gh repo fork"]),
+            (
+                "gh api repos/o/r/issues -f title=t",
+                vec!["gh api POST repos/o/r/issues"],
+            ),
+            (
+                "gh api -X DELETE repos/o/r/git/refs/x",
+                vec!["gh api DELETE repos/o/r/git/refs/x"],
+            ),
+            (
+                "gh api --method=PATCH repos/o/r",
+                vec!["gh api PATCH repos/o/r"],
+            ),
+            (
+                "gh api --input body.json graphql",
+                vec!["gh api POST graphql"],
+            ),
+            ("gh api -X GET search/issues -f q=x", vec![]),
+            ("gh api --paginate repos/o/r/pulls", vec![]),
+            ("gh pr list && gh issue view 3", vec![]),
+            ("gh repo clone o/r", vec![]),
+            ("himalaya message send < mail.eml", vec!["himalaya send"]),
+            (
+                "himalaya -a work msg reply 42 --body ok --send",
+                vec!["himalaya send"],
+            ),
+            ("himalaya gmail drafts send d1", vec!["himalaya send"]),
+            ("himalaya smtp raw 'RCPT TO:<a@b>'", vec!["himalaya send"]),
+            ("himalaya jmap submission create e1", vec!["himalaya send"]),
+            ("himalaya envelope list", vec![]),
+            ("himalaya message compose --to a@b --subject hi", vec![]),
+            ("himalaya message read 42", vec![]),
             (
                 "agent-browser click @e3 && agent-browser snapshot -i",
                 vec![],
