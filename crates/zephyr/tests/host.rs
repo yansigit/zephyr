@@ -474,6 +474,9 @@ fn packages_build_a_local_image_that_up_and_upgrade_run() {
     assert!(build < run, "{calls:#?}");
     assert_eq!(calls[run].last().unwrap(), &tag);
     assert_eq!(env.ok(&["packages", "list"]), "ffmpeg\njq\n");
+    // Nothing new: no build, no restart.
+    env.ok(&["packages", "add", "jq"]);
+    assert_eq!(at(&env.calls(), RM, ""), None);
 
     // up runs the local image, built only when missing.
     env.ok(&["up"]);

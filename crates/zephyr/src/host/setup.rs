@@ -567,6 +567,7 @@ pub fn packages(h: &Host, a: Args) -> anyhow::Result<()> {
     const USE: &str = "usage: zephyr packages add NAME.. | rm NAME.. | list";
     let rest = a.rest()?;
     let mut list = h.data.packages()?;
+    let before = list.clone();
     let Some((op, names)) = rest.split_first() else {
         bail!(USE);
     };
@@ -599,6 +600,10 @@ pub fn packages(h: &Host, a: Args) -> anyhow::Result<()> {
         _ => bail!(USE),
     }
     list.sort();
+    if list == before {
+        println!("already there; nothing to do");
+        return Ok(());
+    }
     h.ensure_base(false, false)?;
     h.derive(&list, false)?;
     h.data.set_packages(&list)?;
