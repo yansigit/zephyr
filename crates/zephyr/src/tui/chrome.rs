@@ -623,6 +623,8 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
                 Kind::Model => ("choose", Some("switch")),
                 Kind::Help => ("choose", Some("insert")),
                 Kind::Status => ("scroll", None),
+                // The vault panel names its own keys on its last row.
+                Kind::Vault => ("choose", None),
                 // Once the sign-in runs there is nothing to choose, and the token goes in Enter.
                 Kind::Login => match o.login.running() {
                     Some(_) => ("scroll", None),
@@ -634,7 +636,7 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
             if o.kind == Kind::Login && o.login.needs_input() {
                 hints.clear();
                 hints.push((key(enter, "send the code"), 1));
-            } else if o.kind != Kind::Status {
+            } else if !matches!(o.kind, Kind::Status | Kind::Vault) {
                 hints.push((p.muted.fg("type to filter"), 3));
             }
             hints.push((
