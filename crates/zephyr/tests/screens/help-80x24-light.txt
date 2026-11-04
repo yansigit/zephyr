@@ -20,5 +20,5 @@
  │    /process list               commands running in the background          │
  │    /process stop <id>          stop one command                            │
  │    /model                      pick a model                                │
- ╰─────────────────────────────────────────────────────────────── 1-16 of 48 ─╯
+ ╰─────────────────────────────────────────────────────────────── 1-16 of 54 ─╯
   ↑↓ choose · ⏎ insert · type to filter · esc close

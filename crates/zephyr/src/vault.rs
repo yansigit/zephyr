@@ -504,7 +504,7 @@ fn seed(text: &str) -> anyhow::Result<Vec<u8>> {
         .filter(|c| !c.is_whitespace() && *c != '-' && *c != '=')
         .map(|c| c.to_ascii_uppercase())
         .collect();
-    while s.len() % 8 != 0 {
+    while !s.len().is_multiple_of(8) {
         s.push('=');
     }
     let key = data_encoding::BASE32
