@@ -41,7 +41,10 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "!<command>",
         "run it; the next message carries its output",
     ),
+    ("Chat", "/copy", "copy the last reply"),
+    ("Chat", "/copy <n>", "copy code block n, or click it"),
     ("Chat", "/help", "this list"),
+    ("Chat", "/quit", "leave (or /exit); zephyr keeps running"),
     ("Agent", "/stop", "stop the current reply and every task"),
     ("Agent", "/task list", "the agent's background tasks"),
     ("Agent", "/task stop <id>", "stop one task"),
@@ -1233,17 +1236,17 @@ mod tests {
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(got.len(), 8);
         assert_eq!(got[2], format!("│ Chat{}│", " ".repeat(73)));
-        assert!(got[7].ends_with(" 1-5 of 50 ─╯"), "{got:?}");
-        for _ in 0..23 {
+        assert!(got[7].ends_with(" 1-5 of 53 ─╯"), "{got:?}");
+        for _ in 0..26 {
             key(&mut o, press(KeyCode::Down), &rows);
         }
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
-        // The twenty-fourth command is /memory ok; the window follows it down.
+        // The twenty-seventh command is /memory ok; the window follows it down.
         assert_eq!(
             got[6],
             "│  › /memory ok                  let the agent see the waiting change          │"
         );
-        assert!(got[7].ends_with(" 23-27 of 50 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 26-30 of 53 ─╯"), "{got:?}");
         key(&mut o, press(KeyCode::Down), &rows);
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),

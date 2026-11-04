@@ -13,7 +13,9 @@ use crate::config::Config;
 use anyhow::Context;
 use chrome::{Link, Region, Retry, State};
 use conn::{Ask, Login, Msg};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use overlays::{Action, Kind, Overlay};
 use rpi_tui::{
     Component, Container, Editor, EditorOptions, EditorStyle, Focusable, OverlayAnchor,
@@ -43,6 +45,9 @@ const LOGIN_SILENCE_MS: i64 = 30_000;
 /// What the panel says when it gives up, above the provider list, which is where the user is
 /// looking: a sign-in that ended has no reply card in the transcript to explain itself.
 const GIVE_UP: &str = "the gateway stopped answering; try /login again";
+
+/// How long `copied …` stays in the footer.
+const COPIED_MS: i64 = 2000;
 
 pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     let a = cfg
@@ -79,6 +84,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     document.add_child(view.root.clone());
     document.add_child(Arc::new(rpi_tui::Spacer::new(1)));
     let scroll = Arc::new(ScrollView::primary(document));
+    let transcript = scroll.clone();
     let editor = Arc::new(Editor::new(
         EditorOptions {
             padding_x: 0,
@@ -174,6 +180,10 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     // `!cmd` results, shown and held for the owner's next message.
     let (ran_tx, mut rans) = mpsc::unbounded_channel::<shell::Ran>();
     let mut held: Vec<shell::Ran> = vec![];
+    // Where the left button went down, to tell a click from a drag.
+    let mut press = None;
+    // The code block the last ^X copied, so the next one copies the block before it.
+    let mut walk: Option<usize> = None;
     let outcome: anyhow::Result<()> = loop {
         tokio::select! {
             msg = msgs.recv() => {
@@ -292,18 +302,43 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                 let Some(input) = input else { break Ok(()) };
                 match input {
                     Event::Resize(..) => tui.note_resize(),
+                    // Selection as upstream's `interactive_tui` wires it: rpi-tui tracks and
+                    // highlights it, and a drag is copied when the button comes up.
                     Event::Mouse(m) if !tui.handle_scroll_to_end_indicator_mouse_event(&m) => {
                         match m.kind {
                             MouseEventKind::ScrollUp => tui.scroll_by(-3),
                             MouseEventKind::ScrollDown => tui.scroll_by(3),
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                tui.handle_selection_mouse_event(&m);
+                                press = Some((m.column, m.row));
+                                walk = None;
+                            }
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                tui.handle_selection_mouse_event(&m);
+                            }
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                tui.handle_selection_mouse_event(&m);
+                                let clicked = press.take() == Some((m.column, m.row));
+                                let mut s = state.lock().unwrap();
+                                if let Some(text) = tui.selection_text() {
+                                    copy(&tui, &mut s, &text, None);
+                                } else if clicked && s.overlay.is_none() {
+                                    let n = clicked_code(&transcript, &s, &palette, m.row);
+                                    if let Some((n, text)) = n.and_then(|n| Some((n, view.code(n)?))) {
+                                        copy(&tui, &mut s, text, Some(&format!("#{n}")));
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
+                    Event::Mouse(_) => tui.clear_selection(),
                     Event::Paste(text) if state.lock().unwrap().overlay.is_none() => {
                         editor.handle_paste(&text)
                     }
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         let now = crate::unix_millis() as i64;
+                        let walked = walk.take();
                         let (busy, panel_open, completing) = {
                             let s = state.lock().unwrap();
                             (s.snapshot.run.busy, s.overlay.is_some(), s.complete.is_some())
@@ -409,6 +444,22 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                             k if ctrl(&k, 't') => {
                                 view.toggle_thinking();
                             }
+                            // Upstream's copy key; a selection in the composer keeps it for cut.
+                            k if ctrl(&k, 'x') && !editor.has_selection() => {
+                                if let Some(text) = tui.selection_text() {
+                                    copy(&tui, &mut s, &text, None);
+                                } else {
+                                    // The newest block, then each press the one before it.
+                                    let n = walked.filter(|&n| n > 1).map_or(view.codes(), |n| n - 1);
+                                    match view.code(n) {
+                                        Some(text) => {
+                                            copy(&tui, &mut s, text, Some(&format!("#{n}")));
+                                            walk = Some(n);
+                                        }
+                                        None => s.hint = Some(("no code block to copy".into(), now + COPIED_MS)),
+                                    }
+                                }
+                            }
                             KeyEvent { code: KeyCode::Esc, .. } if busy => {
                                 if !s.stopping && s.link == Link::Up {
                                     s.stopping = true;
@@ -440,9 +491,15 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
             text = submits.recv() => {
                 let Some(text) = text else { break Ok(()) };
                 let mut s = state.lock().unwrap();
-                // These open a panel here instead of a reply card.
+                walk = None;
+                // These open a panel here instead of a reply card, or never leave the TUI.
                 match text.trim() {
                     "" => {}
+                    "/quit" | "/exit" => break Ok(()),
+                    t if t == "/copy" || t.starts_with("/copy ") => match to_copy(&view, &t[5..]) {
+                        Ok((text, what)) => copy(&tui, &mut s, &text, Some(&what)),
+                        Err(e) => s.hint = Some((e, crate::unix_millis() as i64 + COPIED_MS)),
+                    },
                     "/help" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Help),
                     "/status" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Status),
                     "/model" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Model),
@@ -570,6 +627,53 @@ fn send(s: &mut State, asks: &mpsc::UnboundedSender<Ask>, text: String) {
     } else {
         s.unsent.push(text);
     }
+}
+
+/// Puts text on the clipboard with OSC 52 and says so in the footer. A terminal without OSC 52
+/// (macOS Terminal.app, tmux without `set-clipboard on`) drops it without a word.
+fn copy(tui: &TuiAltScreen, s: &mut State, text: &str, what: Option<&str>) {
+    tui.terminal().write(&osc52(text));
+    tui.terminal().flush();
+    let lines = match text.lines().count() {
+        0 | 1 => "1 line".to_string(),
+        n => format!("{n} lines"),
+    };
+    let said = match what {
+        Some(what) => format!("copied {what} ({lines})"),
+        None => format!("copied {lines}"),
+    };
+    s.hint = Some((said, crate::unix_millis() as i64 + COPIED_MS));
+}
+
+fn osc52(text: &str) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text);
+    format!("\x1b]52;c;{b64}\x07")
+}
+
+/// What `/copy [n]` copies, and its name in the footer: the last reply, or code block `n`.
+fn to_copy(view: &view::View, arg: &str) -> Result<(String, String), String> {
+    match arg.trim() {
+        "" => (view.last_reply())
+            .map(|t| (t.to_string(), "the last reply".to_string()))
+            .ok_or_else(|| "no reply to copy yet".to_string()),
+        n => (n.trim_start_matches('#').parse().ok())
+            .and_then(|k| Some((view.code(k)?.to_string(), format!("#{k}"))))
+            .ok_or_else(|| format!("no code block {n}")),
+    }
+}
+
+/// The code block under a click on screen row `row`: the transcript row beneath it, below the
+/// header as `Panel::render` measures it.
+fn clicked_code(transcript: &ScrollView, s: &State, p: &theme::Palette, row: u16) -> Option<usize> {
+    let cols = crossterm::terminal::size().map_or(80, |(w, _)| w as usize);
+    let top = chrome::header(s, p, cols, crate::unix_millis() as i64).len();
+    let row = (row as usize)
+        .checked_sub(top)
+        .filter(|&r| r < transcript.viewport_height())?;
+    let snap = transcript.snapshot(cols)?;
+    let lines = snap.document.lines(0, snap.document.len());
+    view::code_at(&lines, snap.scroll_top + row)
 }
 
 /// The login picker's Enter: ask the daemon to sign in to that provider. One sign-in at a time,
@@ -1218,6 +1322,50 @@ mod tests {
         assert!(!super::login_gone(&s, &login_id, &mut poll));
         assert_eq!(s.overlay.as_ref().unwrap().login.running(), Some("l2"));
         assert_eq!(s.overlay.as_ref().unwrap().login.problem, None);
+    }
+
+    #[test]
+    fn copying_is_an_osc_52_with_the_text_in_base64() {
+        assert_eq!(super::osc52("hi\n"), "\x1b]52;c;aGkK\x07");
+        assert_eq!(super::osc52("한"), "\x1b]52;c;7ZWc\x07");
+    }
+
+    #[test]
+    fn copy_takes_the_last_reply_or_a_numbered_block() {
+        let mut view = super::view::View::new(super::theme::DARK, jiff::tz::TimeZone::UTC);
+        assert_eq!(
+            super::to_copy(&view, ""),
+            Err("no reply to copy yet".into())
+        );
+        let reply = |text: &str| {
+            serde_json::json!({"kind": "assistant", "role": "assistant",
+            "content": [{"type": "text", "text": text}]})
+        };
+        view.replay(&[
+            reply("one:\n\n```\nfirst\n```"),
+            reply("two:\n\n```sh\nsecond\nline\n```\n"),
+        ]);
+        assert_eq!(
+            super::to_copy(&view, ""),
+            Ok((
+                "two:\n\n```sh\nsecond\nline\n```".into(),
+                "the last reply".into()
+            ))
+        );
+        assert_eq!(
+            super::to_copy(&view, " 1"),
+            Ok(("first".into(), "#1".into()))
+        );
+        assert_eq!(
+            super::to_copy(&view, "#2"),
+            Ok(("second\nline".into(), "#2".into()))
+        );
+        for bad in ["3", "0", "x"] {
+            assert_eq!(
+                super::to_copy(&view, bad),
+                Err(format!("no code block {bad}"))
+            );
+        }
     }
 
     #[test]

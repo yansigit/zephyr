@@ -15,6 +15,7 @@ use rpi_tui::{
 use serde_json::Value;
 use std::any::Any;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -52,6 +53,12 @@ pub struct View {
     hide_thinking: bool,
     /// The notice just shown, so the same one is not shown twice in a row.
     last_notice: Option<String>,
+    /// Every fenced code block's source since the transcript was drawn; block `#n` is `codes[n - 1]`.
+    codes: Vec<String>,
+    /// The streamed reply's drawing, which labels its code blocks.
+    prose: Option<Arc<Prose>>,
+    /// The last reply's markdown, for `/copy`.
+    last_reply: Option<String>,
 }
 
 impl View {
@@ -70,6 +77,9 @@ impl View {
             expanded: false,
             hide_thinking: false,
             last_notice: None,
+            codes: vec![],
+            prose: None,
+            last_reply: None,
         }
     }
 
@@ -84,6 +94,9 @@ impl View {
         self.group = None;
         self.called_at.clear();
         self.last_notice = None;
+        self.codes.clear();
+        self.prose = None;
+        self.last_reply = None;
         let users: Vec<usize> = (0..messages.len())
             .filter(|&i| kind(&messages[i]) == "user")
             .collect();
@@ -200,10 +213,25 @@ impl View {
             .any(|c| c.state.lock().unwrap().started.is_some())
     }
 
+    /// Code block `#n`'s source.
+    pub fn code(&self, n: usize) -> Option<&str> {
+        self.codes.get(n.checked_sub(1)?).map(String::as_str)
+    }
+
+    /// How many code blocks there are, so the newest is `#codes()`.
+    pub fn codes(&self) -> usize {
+        self.codes.len()
+    }
+
+    pub fn last_reply(&self) -> Option<&str> {
+        self.last_reply.as_deref()
+    }
+
     fn settle(&mut self) {
         if let Some(a) = self.current.take() {
             a.set_streaming(false);
         }
+        self.prose = None;
     }
 
     /// Adds an item with the transcript's one spacing rule: a blank row before each item,
@@ -273,10 +301,28 @@ impl View {
             self.assistants.push(a.clone());
             self.current = Some(a.clone());
             let mark = self.p.accent.fg(&bold(glyph("≋")));
-            self.push(Kind::Text, Arc::new(Prose::new(a)), Some(mark));
+            let prose = Arc::new(Prose::new(a, self.codes.len()));
+            self.prose = Some(prose.clone());
+            self.push(Kind::Text, prose, Some(mark));
         }
         if let Some(a) = &self.current {
             a.update_blocks(&blocks);
+        }
+        if let Some(prose) = &self.prose {
+            // As rpi-tui draws them: each text block is its own markdown, trimmed.
+            let texts: Vec<&str> = (blocks.iter())
+                .filter_map(|b| match b {
+                    AssistantBlock::Text(t) if !t.trim().is_empty() => Some(t.trim()),
+                    _ => None,
+                })
+                .collect();
+            let found: Vec<String> = texts.iter().flat_map(|t| fences(t)).collect();
+            prose.count.store(found.len(), Ordering::Relaxed);
+            self.codes.truncate(prose.first);
+            self.codes.extend(found);
+            if !texts.is_empty() {
+                self.last_reply = Some(texts.join("\n\n"));
+            }
         }
         for call in m["content"].as_array().into_iter().flatten() {
             if call["type"] != "toolCall" {
@@ -524,22 +570,25 @@ const UNWRAPPED: usize = 4096;
 struct Prose {
     inner: Arc<AssistantMessageComponent>,
     cache: Mutex<Option<Drawn>>,
+    /// Its code blocks are `#first + 1` on, `count` of them.
+    first: usize,
+    count: AtomicUsize,
 }
 
 /// `(width, upstream's lines, ours)` from the last render.
 type Drawn = (usize, Vec<String>, Vec<String>);
 
 impl Prose {
-    fn new(inner: Arc<AssistantMessageComponent>) -> Self {
+    fn new(inner: Arc<AssistantMessageComponent>, first: usize) -> Self {
         Prose {
             inner,
             cache: Mutex::new(None),
+            first,
+            count: AtomicUsize::new(0),
         }
     }
-}
 
-impl Component for Prose {
-    fn render(&self, width: usize) -> Vec<String> {
+    fn draw(&self, width: usize) -> Vec<String> {
         let narrow = self.inner.render(width);
         // Nothing reached the edge, so nothing was wrapped.
         if narrow.iter().all(|l| visible_width(l) + 1 < width) {
@@ -555,12 +604,144 @@ impl Component for Prose {
         *cache = Some((width, narrow, ours.clone()));
         ours
     }
+}
+
+impl Component for Prose {
+    fn render(&self, width: usize) -> Vec<String> {
+        let count = self.count.load(Ordering::Relaxed);
+        label(self.draw(width), self.first, count)
+    }
     fn invalidate(&self) {
         self.inner.invalidate();
     }
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// The source of each fenced code block in one markdown text, as rpi-tui's `render_markdown`
+/// reads fences. An unclosed fence still streaming counts; mermaid does not, since it is drawn
+/// as a diagram rather than as code rows.
+fn fences(md: &str) -> Vec<String> {
+    let mut out = vec![];
+    // The open fence: its character, whether it is mermaid, its lines so far.
+    let mut open: Option<(char, bool, Vec<&str>)> = None;
+    for line in md.lines() {
+        let t = line.trim_start();
+        let fence = ['`', '~']
+            .into_iter()
+            .find(|&c| t.starts_with(&c.to_string().repeat(3)));
+        match (&mut open, fence) {
+            (None, Some(c)) => {
+                open = Some((c, t[3..].trim().eq_ignore_ascii_case("mermaid"), vec![]))
+            }
+            (Some((oc, ..)), Some(c)) if *oc == c => {
+                if let Some((_, false, body)) = open.take() {
+                    out.push(body.join("\n"));
+                }
+            }
+            (Some((.., body)), _) => body.push(line),
+            (None, None) => {}
+        }
+    }
+    if let Some((_, false, body)) = open {
+        out.push(body.join("\n"));
+    }
+    out
+}
+
+/// Whether a reply row is a fenced code row, as rpi-tui's `push_code_line` draws one: two spaces,
+/// then the code background unbroken to the edge. Inline code at the start of a line ends its
+/// background before the line does, and thinking rows start with their own style.
+fn code_row(row: &str) -> bool {
+    // Every reply row is tested on every frame; most fail here, before the theme is read.
+    if !row.starts_with("  \x1b[") {
+        return false;
+    }
+    let bg = rpi_tui::theme().colors.md_code_block_bg.to_bg();
+    let reset = "\x1b[0m";
+    let Some(rest) = (row.strip_prefix("  ")).and_then(|r| r.strip_prefix(bg.as_str())) else {
+        return false;
+    };
+    rest.strip_suffix(reset)
+        .is_some_and(|r| r.split(reset).skip(1).all(|part| part.starts_with(&bg)))
+}
+
+/// Writes a muted `#n` at the right edge of each code block's first row with room for it, keeping
+/// the row's width. Only when the code rows fall into as many runs as the reply has blocks: a
+/// reply drawn otherwise (blocks with no row between them, a fence read differently) gets no
+/// labels rather than wrong ones.
+fn label(mut lines: Vec<String>, first: usize, count: usize) -> Vec<String> {
+    let mut runs: Vec<std::ops::Range<usize>> = vec![];
+    for i in (0..lines.len()).filter(|&i| code_row(&lines[i])) {
+        match runs.last_mut() {
+            Some(r) if r.end == i => r.end += 1,
+            _ => runs.push(i..i + 1),
+        }
+    }
+    if runs.len() != count {
+        return lines;
+    }
+    let colors = rpi_tui::theme().colors;
+    for (k, run) in runs.into_iter().enumerate() {
+        let tag = format!("#{}", first + k + 1);
+        let room = " ".repeat(tag.len() + 2);
+        let Some(i) = run
+            .into_iter()
+            .find(|&i| rpi_tui::strip_ansi(&lines[i]).ends_with(&room))
+        else {
+            continue;
+        };
+        // The label takes the place of trailing spaces. Not `truncate_to_width`: it cuts the
+        // OSC 8 sequences in code rows open.
+        let mut toks = tokens(&lines[i]);
+        let mut cut = tag.len() + 1;
+        for t in toks.iter_mut().rev().filter(|t| !t.1) {
+            if cut == 0 {
+                break;
+            }
+            t.0.clear();
+            cut -= 1;
+        }
+        let tail = colors
+            .md_code_block_bg
+            .bg(&format!("{} ", colors.muted.fg(&tag)));
+        lines[i] = toks.into_iter().map(|t| t.0).collect::<String>() + &tail;
+    }
+    lines
+}
+
+/// The `n` of a row [`label`] wrote `#n` on.
+fn tag(row: &str) -> Option<usize> {
+    let plain = rpi_tui::strip_ansi(row);
+    let last = plain.strip_suffix(' ')?.rsplit(' ').next()?;
+    last.strip_prefix('#')?.parse().ok()
+}
+
+/// The code block transcript row `row` is in: the `#n` on its block's labelled row. Transcript
+/// rows are replies in a three-column [`Gutter`], so it is dropped first.
+pub(super) fn code_at(lines: &[String], row: usize) -> Option<usize> {
+    let code = |i: usize| lines.get(i).map(|l| ungutter(l)).filter(|l| code_row(l));
+    code(row)?;
+    let top = (0..row)
+        .rev()
+        .take_while(|&i| code(i).is_some())
+        .last()
+        .unwrap_or(row);
+    (top..).map_while(code).find_map(tag)
+}
+
+/// A transcript row without its gutter: the first three columns and the escapes among them.
+fn ungutter(line: &str) -> &str {
+    let (mut at, mut seen) = (0, 0);
+    for (text, escape) in tokens(line) {
+        if seen == 3 {
+            break;
+        }
+        at += text.len();
+        seen += usize::from(!escape);
+    }
+    &line[at..]
 }
 
 /// Upstream's `narrow` drawing, with each prose block replaced by its `wide` (unwrapped) lines
@@ -1300,7 +1481,7 @@ mod tests {
             ..Default::default()
         }));
         a.update_blocks(&[AssistantBlock::Text(text.into())]);
-        let lines = Prose::new(a).render(width);
+        let lines = Prose::new(a, 0).render(width);
         for l in &lines {
             assert!(visible_width(l) <= width, "{l:?} is wider than {width}");
         }
@@ -1409,7 +1590,91 @@ mod tests {
         a.update_blocks(&[AssistantBlock::Text(
             "short **bold** and `code`\n\n| a | b |\n|---|---|\n| 1 | 2 |".into(),
         )]);
-        assert_eq!(Prose::new(a.clone()).render(60), a.render(60));
+        assert_eq!(Prose::new(a.clone(), 0).render(60), a.render(60));
+    }
+
+    #[test]
+    fn fences_are_read_as_rpi_tui_reads_them() {
+        let md = "a\n```rust\nlet x = 1;\n\nlet y = 2;\n```\n~~~\n```inside```\n~~~\n```mermaid\nA-->B\n```\n  ```\nopen";
+        assert_eq!(
+            fences(md),
+            ["let x = 1;\n\nlet y = 2;", "```inside```", "open"]
+        );
+        assert!(fences("no code, `inline` only").is_empty());
+    }
+
+    /// Two replies holding three code blocks; the first line of #2 is too long for one row.
+    fn coded() -> View {
+        let long = "x".repeat(70);
+        let mut v = view();
+        v.replay(&[
+            json!({"kind": "assistant", "role": "assistant", "content": [
+                {"type": "text", "text": "Run:\n\n```sh\nls -la\n```"}]}),
+            json!({"kind": "assistant", "role": "assistant", "content": [
+                {"type": "text", "text": format!("Then:\n\n```\n{long}\nend\n```\n\nand\n\n```\ndone\n```")}]}),
+        ]);
+        v
+    }
+
+    #[test]
+    fn code_blocks_are_numbered_across_the_conversation_and_labelled() {
+        let v = coded();
+        assert_eq!(v.codes(), 3);
+        assert_eq!(v.code(1), Some("ls -la"));
+        assert_eq!(v.code(2), Some(format!("{}\nend", "x".repeat(70)).as_str()));
+        assert_eq!(v.code(3), Some("done"));
+        assert_eq!((v.code(0), v.code(4)), (None, None));
+        assert!(v.last_reply().unwrap().starts_with("Then:\n\n```\n"));
+        let rows = v.root.render(60);
+        let labelled: Vec<String> = (rows.iter())
+            .filter(|r| tag(r).is_some())
+            .map(|r| rpi_tui::strip_ansi(r))
+            .collect();
+        assert_eq!(labelled.len(), 3, "{rows:#?}");
+        assert!(labelled[0].contains(" ls -la ") && labelled[0].ends_with(" #1 "));
+        // #2's first row is full, so its label goes on the wrapped rest of that line.
+        assert!(labelled[1].contains(" xxx") && labelled[1].ends_with(" #2 "));
+        assert!(labelled[2].contains(" done ") && labelled[2].ends_with(" #3 "));
+        // A label keeps its row as wide as the other code rows.
+        let code: Vec<&String> = rows.iter().filter(|r| code_row(ungutter(r))).collect();
+        assert_eq!(code.len(), 5, "{rows:#?}");
+        assert!(code.iter().all(|r| visible_width(r) == 59), "{code:#?}");
+    }
+
+    #[test]
+    fn a_click_on_any_row_of_a_block_finds_its_number() {
+        let rows = coded().root.render(60);
+        let got: Vec<usize> = (0..rows.len()).filter_map(|i| code_at(&rows, i)).collect();
+        assert_eq!(got, [1, 2, 2, 2, 3], "{rows:#?}");
+        // The second row of #2 is its wrapped first line, above the label.
+        let i = rows.iter().position(|r| r.contains("xxxx")).unwrap();
+        assert_eq!(code_at(&rows, i), Some(2));
+        // Prose, blank rows and rows past the end are no block.
+        let prose = rows.iter().position(|r| r.contains("Then:")).unwrap();
+        assert_eq!(code_at(&rows, prose), None);
+        assert_eq!(code_at(&rows, prose + 1), None);
+        assert_eq!(code_at(&rows, rows.len()), None);
+    }
+
+    #[test]
+    fn blocks_drawn_unlike_their_source_get_no_labels() {
+        // Two fences with no row between them draw as one run of code rows.
+        let mut v = view();
+        v.replay(&[
+            json!({"kind": "assistant", "role": "assistant", "content": [
+            {"type": "text", "text": "```\na\n```\n```\nb\n```"}]}),
+        ]);
+        assert_eq!(v.codes(), 2);
+        let rows = v.root.render(40);
+        assert!(rows.iter().all(|r| tag(r).is_none()), "{rows:#?}");
+        // Inline code at the start of a line is not a code row.
+        let a = Arc::new(AssistantMessageComponent::new(AssistantMessageOptions {
+            output_pad: 0,
+            ..Default::default()
+        }));
+        a.update_blocks(&[AssistantBlock::Text("`cmd` runs it\n\n  `cmd`".into())]);
+        let rows = Prose::new(a, 0).render(40);
+        assert!(rows.iter().all(|r| !code_row(r)), "{rows:#?}");
     }
 
     #[test]
