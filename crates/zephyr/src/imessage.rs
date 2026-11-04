@@ -811,14 +811,8 @@ mod tests {
     async fn run_queues_backfill_and_keeps_listening() {
         let reply = serde_json::json!({ "status": 200, "data": [message_data(NEW, "AAAA-1")] });
         let (base, _cap) = stub(200, leak(reply.to_string())).await;
-        // Pick a free port for the listener. `run` binds it itself.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut adapter = adapter(base);
-        adapter.listen = format!("127.0.0.1:{port}").parse().unwrap();
+        // `run` binds 127.0.0.1:0 itself: a port picked here first could be taken by another test.
+        let adapter = adapter(base);
         let (tx, mut rx) = mpsc::channel(8);
         let task = tokio::spawn(async move { adapter.run(tx).await });
         let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
