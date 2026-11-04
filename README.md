@@ -66,6 +66,16 @@ or the attach panel. `/login cancel [ID|PROVIDER]` stops a sign-in you have give
 in the eight that may wait at once is free again. The account joins the pool at once; `/model`
 selects it.
 
+Copying in `zephyr attach`: drag over any text and it is copied when you let go. Each code block in
+a reply carries a `#n` at its right edge; click the block to copy it, `/copy N` copies block N,
+`/copy` the whole last reply, and `^X` the newest block (press again for the one before; with a
+drag selection, `^X` copies that). What is copied is the block's source, without the wrapping or
+the indent. Copying goes through the terminal (OSC 52), so it reaches the clipboard of the machine
+you are typing on, even over ssh. It works in iTerm2, Ghostty, kitty, WezTerm and Alacritty, and
+inside tmux only with `set -g set-clipboard on`; macOS Terminal.app does not support it and copies
+nothing. Under `NO_COLOR` a click may not find the block; `/copy N` and `^X` still work. `/quit` or
+`/exit` leaves the UI like `^D`, and the agent keeps running.
+
 ## Changing settings
 
 Changes apply by themselves; nothing needs `zephyr restart`. The commands above, and hand edits to
