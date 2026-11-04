@@ -654,6 +654,10 @@ fn fences(md: &str) -> Vec<String> {
 /// then the code background unbroken to the edge. Inline code at the start of a line ends its
 /// background before the line does, and thinking rows start with their own style.
 fn code_row(row: &str) -> bool {
+    // Every reply row is tested on every frame; most fail here, before the theme is read.
+    if !row.starts_with("  \x1b[") {
+        return false;
+    }
     let bg = rpi_tui::theme().colors.md_code_block_bg.to_bg();
     let reset = "\x1b[0m";
     let Some(rest) = (row.strip_prefix("  ")).and_then(|r| r.strip_prefix(bg.as_str())) else {
