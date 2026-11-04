@@ -20,6 +20,13 @@ jobs:
     # A hung build fails after an hour instead of burning GitHub's 6-hour limit in minutes.
     timeout-minutes: 60
     steps:
+      # GitHub's runners have ~14 GB free, too little for this image's build; their preinstalled
+      # SDKs free ~30 GB more. df shows the room in the log either way.
+      - if: vars.ZEPHYR_RUNNER == ''
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - id: v
         run: |
