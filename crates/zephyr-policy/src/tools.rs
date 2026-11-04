@@ -1,5 +1,5 @@
-//! Tools whose work the daemon does (DESIGN §4.11, §4.12): `send_file`, `schedule`, `gateway`
-//! and `task`. The first two only check their arguments here and answer at once; the daemon reads
+//! Tools whose work the daemon does (DESIGN §4.11, §4.12, §4.15): `send_file`, `schedule`,
+//! `gateway`, `task` and `vault`. The first two only check their arguments here and answer at once; the daemon reads
 //! each call from rpi's event stream, which the agent cannot write, and acts on it when the turn
 //! settles. `gateway` and `task` wait instead: the daemon answers them from the same stream
 //! mid-turn, through a file. `recall` needs no daemon: it reads the session files itself.
@@ -97,7 +97,7 @@ enum Step {
 
 static HANDLES: ToolHandles<Step> = ToolHandles::new();
 
-pub const TOOLS: [(&str, &str, &str, ToolExecuteFn); 7] = [
+pub const TOOLS: [(&str, &str, &str, ToolExecuteFn); 8] = [
     (
         "send_file",
         "Send a file of up to 10 MB (a screenshot, a PDF) to the owner, on the channel you are \
@@ -148,8 +148,11 @@ pub const TOOLS: [(&str, &str, &str, ToolExecuteFn); 7] = [
          background without being killed: you get its output so far, then a message when it \
          exits. Then tell the owner in one line and end your turn. Use `background: true` for \
          servers and watchers that should keep running. `timeout` is in seconds (default 1800, \
-         at most 7200); past it the command is killed.",
-        r#"{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","minimum":1,"maximum":7200},"background":{"type":"boolean"}},"required":["command"]}"#,
+         at most 7200); past it the command is killed. `secrets` names vault tokens (see `vault \
+         list`) to set as environment variables of the same name for this command only; the \
+         first time a token is used with a program the owner is asked, and the command does not \
+         run until they allow it. Values in the output come back as [vault:NAME].",
+        r#"{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","minimum":1,"maximum":7200},"background":{"type":"boolean"},"secrets":{"type":"array","items":{"type":"string"},"description":"Vault token names, e.g. [\"GH_TOKEN\"]"}},"required":["command"]}"#,
         exec_execute,
     ),
     (
@@ -159,6 +162,21 @@ pub const TOOLS: [(&str, &str, &str, ToolExecuteFn); 7] = [
          started), e.g. when the owner asks you to.",
         r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","log","stop"]},"id":{"type":"integer"}},"required":["action"]}"#,
         process_execute,
+    ),
+    (
+        "vault",
+        "The owner's saved credentials, used by name so you never see or type a value. `list` \
+         shows the saved logins (name, site, username) and tokens (name, the programs they are \
+         allowed for). `fill` types a login into the page open in agent-browser: give CSS \
+         selectors for any of `user`, `password` and `totp` (a one-time code made now); it fills \
+         only when the page is on the login's own site. The first fill of a login needs the \
+         owner's OK: then you are told so; tell the owner and end your turn. Tokens are used \
+         through `exec` with `secrets`. When a credential is missing, `request` it with a \
+         `name` (logins: lowercase like github; tokens: an env var name like GH_TOKEN), its \
+         `kind`, the `site` for a login, and `why`: the owner is asked to save it, and you get a \
+         message when they do. Never ask the owner to paste a password or token into the chat.",
+        r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","request","fill"]},"name":{"type":"string"},"kind":{"type":"string","enum":["login","token"]},"site":{"type":"string","description":"For request of a login: the site's address, e.g. https://github.com"},"why":{"type":"string"},"user":{"type":"string","description":"For fill: CSS selector of the username field"},"password":{"type":"string","description":"For fill: CSS selector of the password field"},"totp":{"type":"string","description":"For fill: CSS selector of the one-time code field"}},"required":["action"]}"#,
+        vault_execute,
     ),
     (
         "recall",
@@ -179,7 +197,12 @@ pub struct ExecCall {
     /// Seconds, at most [`MAX_EXEC_TIMEOUT`].
     pub timeout: Option<u64>,
     pub background: bool,
+    /// Vault token names to set in the command's environment (DESIGN §4.15). Names, never values.
+    pub secrets: Vec<String>,
 }
+
+/// The most vault tokens one `exec` takes.
+pub const MAX_SECRETS: usize = 8;
 
 /// `exec`'s check, in the plugin and again in the daemon. The hardline veto (`policy::check`)
 /// runs on it as on `bash`.
@@ -199,11 +222,97 @@ pub fn exec_call(params: &Value) -> Result<ExecCall, String> {
             }
         },
     };
+    let secrets = match &params["secrets"] {
+        Value::Null => Vec::new(),
+        Value::Array(names) if names.len() <= MAX_SECRETS => names
+            .iter()
+            .map(|n| match n.as_str() {
+                Some(n) if !n.trim().is_empty() => Ok(n.trim().to_string()),
+                _ => Err("`secrets` holds vault token names".to_string()),
+            })
+            .collect::<Result<_, _>>()?,
+        _ => {
+            return Err(format!(
+                "`secrets` is a list of at most {MAX_SECRETS} vault token names"
+            ))
+        }
+    };
     Ok(ExecCall {
         command: command.into(),
         timeout,
         background: params["background"].as_bool().unwrap_or(false),
+        secrets,
     })
+}
+
+/// A checked `vault` call (DESIGN §4.15). The daemon checks the names and the site again.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VaultAction {
+    List,
+    Request {
+        name: String,
+        /// `login` or `token`.
+        kind: String,
+        site: Option<String>,
+        why: String,
+    },
+    /// CSS selectors of the fields to fill; at least one is given.
+    Fill {
+        name: String,
+        user: Option<String>,
+        password: Option<String>,
+        totp: Option<String>,
+    },
+}
+
+/// `vault`'s check, in the plugin and again in the daemon before it acts.
+pub fn vault_action(params: &Value) -> Result<VaultAction, String> {
+    let word = |key: &str| -> Option<String> {
+        params[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    let name = || word("name").ok_or_else(|| "this action needs the entry's `name`".to_string());
+    match text(params, "action")? {
+        "list" => Ok(VaultAction::List),
+        "request" => {
+            let kind = word("kind").unwrap_or_default();
+            if kind != "login" && kind != "token" {
+                return Err("`kind` is login or token".into());
+            }
+            let site = word("site");
+            if kind == "login" && site.is_none() {
+                return Err("a login request needs the `site`".into());
+            }
+            Ok(VaultAction::Request {
+                name: name()?,
+                kind,
+                site,
+                why: word("why").unwrap_or_default(),
+            })
+        }
+        "fill" => {
+            let (user, password, totp) = (word("user"), word("password"), word("totp"));
+            if user.is_none() && password.is_none() && totp.is_none() {
+                return Err("give the CSS selector of at least one of user, password, totp".into());
+            }
+            Ok(VaultAction::Fill {
+                name: name()?,
+                user,
+                password,
+                totp,
+            })
+        }
+        other => Err(format!(
+            "unknown action {other:?}; use list, request or fill"
+        )),
+    }
+}
+
+fn vault(params: &Value) -> Result<String, String> {
+    vault_action(params).map(|_| String::new())
 }
 
 /// A checked `process` call.
@@ -715,6 +824,15 @@ extern "C" fn process_execute(
     waiting(call_id, params, free, process, GATEWAY_WAIT)
 }
 
+extern "C" fn vault_execute(
+    call_id: StbStringRef,
+    params: StbString,
+    free: Option<FreeStringFn>,
+) -> StepHandle {
+    // A fill starts the browser's commands: give it longer than a read.
+    waiting(call_id, params, free, vault, Duration::from_secs(90))
+}
+
 extern "C" fn recall_execute(
     _: StbStringRef,
     params: StbString,
@@ -965,7 +1083,35 @@ mod tests {
             Ok(ExecCall {
                 command: "make".into(),
                 timeout: Some(60),
-                background: true
+                background: true,
+                secrets: vec![],
+            })
+        );
+        let with = exec_call(&json!({ "command": "gh pr list", "secrets": ["GH_TOKEN"] }));
+        assert_eq!(with.unwrap().secrets, ["GH_TOKEN"]);
+        for bad in [
+            json!("GH_TOKEN"),
+            json!([1]),
+            json!([""]),
+            json!(vec!["A"; 9]),
+        ] {
+            assert!(exec_call(&json!({ "command": "ls", "secrets": bad })).is_err());
+        }
+        assert_eq!(
+            vault_action(&json!({ "action": "list" })),
+            Ok(VaultAction::List)
+        );
+        assert!(vault_action(&json!({ "action": "fill", "name": "github" })).is_err());
+        assert!(
+            vault_action(&json!({ "action": "request", "name": "x", "kind": "login" })).is_err()
+        );
+        assert_eq!(
+            vault_action(&json!({ "action": "fill", "name": "github", "password": "#pw" })),
+            Ok(VaultAction::Fill {
+                name: "github".into(),
+                user: None,
+                password: Some("#pw".into()),
+                totp: None
             })
         );
         let plain = exec_call(&json!({ "command": "ls" })).unwrap();

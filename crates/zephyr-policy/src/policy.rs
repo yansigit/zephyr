@@ -260,6 +260,30 @@ pub fn outbound(command: &str) -> Vec<String> {
     found
 }
 
+/// The programs `command` runs, by name: the command word of every stage (after prefixes such as
+/// `env`, `sudo` or `xargs`, flags and `VAR=value`), and of every `sh -c`/`eval` script inside it,
+/// once each, in order. A vault token is handed only to a command whose programs the owner allowed
+/// it for (DESIGN §4.15). `cd` is left out: it runs nothing and reads no variable.
+pub fn programs(command: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for stage in stages(command) {
+        let Some(words) = command_words(&stage.words) else {
+            continue;
+        };
+        let name = basename(&words[0]);
+        let mut add = |p: String| {
+            if p != "cd" && !found.contains(&p) {
+                found.push(p);
+            }
+        };
+        add(name.to_string());
+        if let Some(script) = nested(name, &words[1..]) {
+            programs(&script).into_iter().for_each(add);
+        }
+    }
+    found
+}
+
 /// The method of a curl that sends a body or uses a method other than GET/HEAD.
 fn curl_method(args: &[String]) -> Option<String> {
     let mut method = None;
@@ -550,6 +574,21 @@ fn stages(command: &str) -> Vec<Stage> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn programs_are_the_command_words_of_every_stage() {
+        assert_eq!(programs("FOO=1 a && gh x | jq ."), ["a", "gh", "jq"]);
+        assert_eq!(
+            programs("cd repo; sudo -E /usr/bin/gh pr list $(git rev-parse HEAD)"),
+            ["gh", "git"]
+        );
+        assert_eq!(
+            programs("bash -c 'curl x | gh api -'"),
+            ["bash", "curl", "gh"]
+        );
+        assert_eq!(programs("gh a; gh b"), ["gh"]);
+        assert!(programs("cd /tmp").is_empty());
+    }
 
     #[test]
     fn outbound_names_what_sends_data_and_skips_plain_reads() {

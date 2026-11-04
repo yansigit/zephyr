@@ -60,8 +60,9 @@ pub fn call<'a>(ev: &'a Value, tool: &str) -> Option<(&'a str, &'a Value)> {
 }
 
 impl Procs {
-    /// Starts main's `exec` call `call_id`, reporting to `to` (channel, sender). The call is
-    /// answered from the command's own task; a refusal is answered here.
+    /// Starts main's `exec` call `call_id`, reporting to `to` (channel, sender), with `env` (the
+    /// vault tokens it may use, DESIGN §4.15) set. The call is answered from the command's own
+    /// task; a refusal is answered here.
     pub fn start(
         &self,
         cfg: &Arc<Config>,
@@ -69,6 +70,7 @@ impl Procs {
         call_id: &str,
         call: ExecCall,
         to: (String, String),
+        env: Vec<(String, String)>,
     ) {
         let answer = |text: &str| crate::tools::answer_gateway(cfg, call_id, text);
         let p = match store.add_proc(&call.command, &to.0, &to.1) {
@@ -82,7 +84,7 @@ impl Procs {
             Err(e) => return answer(&format!("not started: {e}")),
         };
         let log = log_path(cfg, p.id);
-        let child = match spawn(cfg, &call.command, &log) {
+        let child = match spawn(cfg, &call.command, &log, env) {
             Ok(c) => c,
             Err(e) => {
                 let text = format!("could not start: {e:#}");
@@ -207,7 +209,7 @@ impl Procs {
             ProcessAction::List => list(store),
             ProcessAction::Stop(id) => self.stop(id),
             ProcessAction::Log(id) => match tail(&log_path(cfg, id), MAX_BYTES) {
-                Ok(t) => t.text(id),
+                Ok(t) => crate::vault::scrubbed(cfg, t.text(id)),
                 Err(e) => format!("[zephyr] no log for process #{id}: {e}"),
             },
         }
@@ -243,8 +245,13 @@ fn recorded_exit(log: &Path) -> Option<i32> {
 }
 
 /// The command through `WRAPPER`, as the agent, in its home, leading its own process group, with
-/// stdout and stderr in `log` and its exit code recorded next to it.
-fn spawn(cfg: &Config, command: &str, log: &Path) -> anyhow::Result<tokio::process::Child> {
+/// stdout and stderr in `log`, its exit code recorded next to it, and `env` set.
+fn spawn(
+    cfg: &Config,
+    command: &str,
+    log: &Path,
+    env: Vec<(String, String)>,
+) -> anyhow::Result<tokio::process::Child> {
     let exit = log.with_extension("exit");
     let file = {
         // As the agent: the log is the agent's file, and a symlink it planted leads nowhere new.
@@ -259,10 +266,18 @@ fn spawn(cfg: &Config, command: &str, log: &Path) -> anyhow::Result<tokio::proce
         .current_dir(&cfg.home)
         .stdin(std::process::Stdio::null())
         .stdout(file.try_clone()?)
-        .stderr(file);
+        .stderr(file)
+        .envs(env);
     // No kill_on_drop: a command outlives a re-exec of the daemon, which adopts it (`adopt`).
-    crate::agent::cmd(cmd.as_std_mut());
+    for_agent(cmd.as_std_mut());
     cmd.as_std_mut().process_group(0);
+    Ok(cmd.spawn()?)
+}
+
+/// Runs `cmd` as the agent (`agent::cmd`), on the desktop when there is one: what `exec` and the
+/// vault's browser commands share.
+pub fn for_agent(cmd: &mut std::process::Command) {
+    crate::agent::cmd(cmd);
     if let Some(display) = crate::desktop::ensure() {
         cmd.env("DISPLAY", display);
         // The desktop takes only clients holding its cookie (`desktop` module docs).
@@ -270,7 +285,6 @@ fn spawn(cfg: &Config, command: &str, log: &Path) -> anyhow::Result<tokio::proce
             cmd.env("XAUTHORITY", auth);
         }
     }
-    Ok(cmd.spawn()?)
 }
 
 /// How the turn's part of a command ended.
@@ -295,7 +309,7 @@ async fn run(
     let log = log_path(&cfg, p.id);
     let answer = |text: String| crate::tools::answer_gateway(&cfg, &call_id, &text);
     let output = |max| match tail(&log, max) {
-        Ok(t) => t.text(p.id),
+        Ok(t) => crate::vault::scrubbed(&cfg, t.text(p.id)),
         Err(e) => format!("[output unreadable: {e}]"),
     };
     let first = if background {
@@ -429,7 +443,7 @@ fn record(
 ) {
     let outcome = format!("{said} after {}", human(ran));
     let output = match tail(&log_path(cfg, p.id), REPORT_BYTES) {
-        Ok(t) => t.text(p.id),
+        Ok(t) => crate::vault::scrubbed(cfg, t.text(p.id)),
         Err(e) => format!("[output unreadable: {e}]"),
     };
     if let Err(e) = store.finish_proc(p, status, code, Some((&outcome, &output)), crate::now()) {

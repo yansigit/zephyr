@@ -26,6 +26,9 @@ http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart"] }
 subtle = "2"
 url = "2"
+# Already in the tree (rustls, serenity): TOTP for vault logins (DESIGN §4.15).
+ring = "0.17.14"
+data-encoding = "2.11.1"
 croner = { version = "4", default-features = false, features = ["jiff"] }
 jiff = "0.2"
 # Pinned with the rpi binary (DESIGN §3); bump the two together.

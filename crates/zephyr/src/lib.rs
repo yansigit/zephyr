@@ -29,6 +29,7 @@ pub mod supervise;
 pub mod tasks;
 pub mod tools;
 pub mod tui;
+pub mod vault;
 
 pub fn unix_millis() -> u128 {
     std::time::SystemTime::now()
