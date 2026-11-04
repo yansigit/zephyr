@@ -51,6 +51,7 @@ zephyr login openai-codex --account codex-main
 | `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}` |
 | `zephyr config get\|set KEY [VALUE]` | Edit `zephyr.toml` (comments are kept; invalid keys are refused) |
 | `zephyr attach [--stock]` | Zephyr's terminal UI on the live session: history, tool calls, what the agent is doing, the queue and today's spend; `^D` detaches and the agent keeps running. `--stock` runs the stock `rpi --connect` client instead |
+| `zephyr shell [bash\|zsh]` | A login shell in the container as the agent, in its home (`/zephyr`) and on its desktop; needs a terminal |
 | `zephyr chat` | The same UI on a terminal; a line client (`< reply` per line) when piped or scripted |
 | `zephyr pause` / `resume` | Stop and restart dispatch (`/pause` and `/resume` from any channel do the same) |
 | `zephyr reload` | Apply hand edits now instead of within 5 s (`/reload` from any channel) |
@@ -95,6 +96,11 @@ the spend per day and per account over the last 7 days, or `DAYS`.
 `zephyr attach`, which masks it), and `/login cancel [ID|PROVIDER]` stops the ones you gave up on.
 The first account of an empty install does restart the agent once, when idle: there is nothing for
 it to start on until that account exists.
+
+Two more in `zephyr attach` only: `!COMMAND` runs `bash -c COMMAND` as the agent in its home (60 s at
+most, the first 50 KB of output kept) and shows the output and exit code; it goes to the agent in
+front of your next message (not a `/` command), and Esc on an empty composer drops it instead.
+`/shell [zsh]` opens an interactive login shell as the agent in place of the UI; exit it to come back.
 
 `ZEPHYR_CONTAINER` (default `zephyr`) and `ZEPHYR_IMAGE` choose another container or image, for
 example to test beside a live install.

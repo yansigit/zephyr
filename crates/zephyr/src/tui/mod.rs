@@ -5,6 +5,7 @@
 mod chrome;
 mod conn;
 mod overlays;
+mod shell;
 mod theme;
 mod view;
 
@@ -125,10 +126,23 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     }));
     let (input_tx, mut inputs) = mpsc::unbounded_channel::<Event>();
     let stop = Arc::new(AtomicBool::new(false));
+    // While set, the reader leaves the terminal alone (`/shell` has it); `reading` is held around
+    // each poll and read, so taking it after setting `paused` waits out the one in flight.
+    let paused = Arc::new(AtomicBool::new(false));
+    let reading = Arc::new(Mutex::new(()));
     let reader = {
         let stop = stop.clone();
+        let (paused, reading) = (paused.clone(), reading.clone());
         tokio::task::spawn_blocking(move || {
             while !stop.load(Ordering::Relaxed) {
+                if paused.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                let _turn = reading.lock().unwrap();
+                if paused.load(Ordering::Relaxed) {
+                    continue;
+                }
                 match crossterm::event::poll(Duration::from_millis(50)) {
                     Ok(true) => {}
                     Ok(false) => continue,
@@ -157,6 +171,9 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     let mut dismissed: Option<String> = None;
     // When the running sign-in was last polled, and when the daemon last answered.
     let mut poll = Poller::default();
+    // `!cmd` results, shown and held for the owner's next message.
+    let (ran_tx, mut rans) = mpsc::unbounded_channel::<shell::Ran>();
+    let mut held: Vec<shell::Ran> = vec![];
     let outcome: anyhow::Result<()> = loop {
         tokio::select! {
             msg = msgs.recv() => {
@@ -398,6 +415,11 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                     let _ = prompt_tx.send(Ask::Prompt("/stop".into()));
                                 }
                             }
+                            KeyEvent { code: KeyCode::Esc, .. } if empty && !held.is_empty() => {
+                                held.clear();
+                                let until = now + DOUBLE_PRESS_MS;
+                                s.hint = Some(("dropped the command output".into(), until));
+                            }
                             KeyEvent { code: KeyCode::PageUp, modifiers: KeyModifiers::NONE, .. } => {
                                 tui.scroll_by(-page())
                             }
@@ -425,8 +447,50 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                     "/status" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Status),
                     "/model" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Model),
                     "/login" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Login),
-                    text => send(&mut s, &prompt_tx, text.to_string()),
+                    "/shell" | "/shell bash" | "/shell zsh" => {
+                        drop(s);
+                        let sh = if text.trim().ends_with("zsh") { "zsh" } else { "bash" };
+                        let (tui2, paused, reading, home) =
+                            (tui.clone(), paused.clone(), reading.clone(), cfg.home.clone());
+                        // Awaited, so nothing else here touches the screen until it is back.
+                        let ran = tokio::task::spawn_blocking(move || {
+                            paused.store(true, Ordering::Relaxed);
+                            let _turn = reading.lock().unwrap();
+                            tui2.suspend();
+                            let ran = shell::interactive(&home, sh);
+                            tui2.resume();
+                            paused.store(false, Ordering::Relaxed);
+                            ran
+                        })
+                        .await;
+                        tui.note_resize();
+                        match ran.map_err(std::io::Error::other).and_then(|r| r) {
+                            Ok(_) => view.notice(&format!("back from {sh}")),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                view.error(&format!("{sh} is not installed in the container"))
+                            }
+                            Err(e) => view.error(&format!("{sh}: {e}")),
+                        }
+                        tui.request_render(true);
+                    }
+                    text => match shell::bang(text) {
+                        Some(command) => {
+                            let (home, command, tx) = (cfg.home.clone(), command.to_string(), ran_tx.clone());
+                            tokio::task::spawn_blocking(move || {
+                                let _ = tx.send(shell::run(&home, &command, shell::LIMIT));
+                            });
+                        }
+                        // A `/` command is the gateway's, not a message: the output waits.
+                        None if text.starts_with('/') => send(&mut s, &prompt_tx, text.to_string()),
+                        None => send(&mut s, &prompt_tx, shell::prefix(&std::mem::take(&mut held), text)),
+                    },
                 }
+                tui.request_render(false);
+            }
+            Some(ran) = rans.recv() => {
+                let (title, body) = ran.card();
+                view.reply(Some(&title), &body);
+                held.push(ran);
                 tui.request_render(false);
             }
             _ = ticker.tick() => {

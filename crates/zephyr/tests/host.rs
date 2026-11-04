@@ -742,6 +742,37 @@ fn chat_on_a_terminal_falls_back_to_the_line_client_without_attach() {
     );
 }
 
+/// `zephyr shell` is a login shell as the agent, in its home, on the desktop; `zsh` picks zsh.
+#[test]
+fn shell_opens_a_login_shell_as_the_agent() {
+    let env = Env::new("shell");
+    env.init(&["--no-start"]);
+    env.calls();
+    let out = env.zephyr(&["shell"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("needs a terminal"));
+    if Command::new("script").arg("--version").output().is_err() {
+        return eprintln!("skipped: no script(1) to give zephyr a terminal");
+    }
+    for (args, sh) in [("shell", "bash"), ("shell zsh", "zsh")] {
+        let out = env.on_a_tty(args, &[]);
+        assert!(out.status.success(), "{}", stdout(&out));
+        let calls = env.calls();
+        let call = find_agent(&calls, &["-it", "-e", "TERM"]);
+        let tail = [
+            "-e",
+            "DISPLAY=:99",
+            "-e",
+            "XAUTHORITY=/zephyr/.zephyr-xauthority",
+            CONTAINER,
+            sh,
+            "-l",
+        ];
+        assert!(call.ends_with(&tail.map(String::from)), "{call:?}");
+    }
+    assert!(!env.zephyr(&["shell", "fish"]).status.success());
+}
+
 /// A `zephyr tui` killed with its container cannot undo its terminal modes; the host does.
 #[test]
 fn a_killed_tui_leaves_the_terminal_usable() {

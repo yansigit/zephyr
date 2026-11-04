@@ -31,6 +31,16 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "/compact [instructions]",
         "summarise the conversation to free context",
     ),
+    (
+        "Chat",
+        "/shell [zsh]",
+        "a shell in the container, as the agent",
+    ),
+    (
+        "Chat",
+        "!<command>",
+        "run it; the next message carries its output",
+    ),
     ("Chat", "/help", "this list"),
     ("Agent", "/stop", "stop the current reply and every task"),
     ("Agent", "/task list", "the agent's background tasks"),
@@ -123,7 +133,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 
 /// What goes in the composer for a command: up to its first argument.
 pub fn insert(usage: &str) -> &str {
-    usage.find('<').map_or(usage, |i| &usage[..i])
+    usage.find(['<', '[']).map_or(usage, |i| &usage[..i])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1223,17 +1233,17 @@ mod tests {
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(got.len(), 8);
         assert_eq!(got[2], format!("│ Chat{}│", " ".repeat(73)));
-        assert!(got[7].ends_with(" 1-5 of 48 ─╯"), "{got:?}");
-        for _ in 0..21 {
+        assert!(got[7].ends_with(" 1-5 of 50 ─╯"), "{got:?}");
+        for _ in 0..23 {
             key(&mut o, press(KeyCode::Down), &rows);
         }
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
-        // The twenty-second command is /memory ok; the window follows it down.
+        // The twenty-fourth command is /memory ok; the window follows it down.
         assert_eq!(
             got[6],
             "│  › /memory ok                  let the agent see the waiting change          │"
         );
-        assert!(got[7].ends_with(" 21-25 of 48 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 23-27 of 50 ─╯"), "{got:?}");
         key(&mut o, press(KeyCode::Down), &rows);
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),
@@ -1328,7 +1338,9 @@ mod tests {
     fn autocomplete_matches_commands_and_their_arguments() {
         let usages =
             |t: &str| -> Vec<&str> { matches(t).into_iter().map(|i| COMMANDS[i].1).collect() };
-        assert_eq!(usages("/").len(), COMMANDS.len());
+        // All but `!<command>`, which is not a slash command.
+        assert_eq!(usages("/").len(), COMMANDS.len() - 1);
+        assert!(usages("!").is_empty());
         assert_eq!(usages("/mo"), ["/model", "/model <provider/model>"]);
         assert_eq!(usages("/rule"), ["/rules", "/rule <text>", "/rule rm <n>"]);
         assert_eq!(usages("/rule never push"), ["/rule <text>"]);

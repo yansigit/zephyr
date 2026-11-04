@@ -12,6 +12,8 @@
  │    /undo                       take back your last message and its reply                                                               │
  │    /retry                      take it back and send it again                                                                          │
  │    /compact [instructions]     summarise the conversation to free context                                                              │
+ │    /shell [zsh]                a shell in the container, as the agent                                                                  │
+ │    !<command>                  run it; the next message carries its output                                                             │
  │    /help                       this list                                                                                               │
  │ Agent                                                                                                                                  │
  │    /stop                       stop the current reply and every task                                                                   │
@@ -34,7 +36,5 @@
  │    /skills                     approved skills and waiting drafts                                                                      │
  │    /skill ok <name>            approve the agent's skill draft                                                                         │
  │    /skill no <name>            drop a skill draft                                                                                      │
- │    /skill diff|rm|undo <name>  show, remove or revert a skill                                                                          │
- │    /mcp                        connectors and waiting drafts                                                                           │
- ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 1-32 of 48 ─╯
+ ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 1-32 of 50 ─╯
   ↑↓ choose · ⏎ insert · type to filter · esc close

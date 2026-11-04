@@ -22,7 +22,7 @@ pub const USAGE: &str = "usage: zephyr <command>   (zephyr --version: this CLI's
   skill add DIR | list | rm NAME
   mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. | list | rm NAME
   config get|set KEY [VALUE]
-  chat | attach [--stock] | pause | resume | reload
+  chat | attach [--stock] | shell [bash|zsh] | pause | resume | reload
   doctor [--fix]
   uninstall [--keep-data] [--yes]
 env: ZEPHYR_CONTAINER (default zephyr), ZEPHYR_IMAGE, ZEPHYR_SRC (for --build); data in ~/.zephyr";
@@ -30,7 +30,7 @@ env: ZEPHYR_CONTAINER (default zephyr), ZEPHYR_IMAGE, ZEPHYR_SRC (for --build); 
 /// The published image, tagged with the version (and `latest`, the newest release).
 const REPO: &str = "ghcr.io/yansigit/zephyr:";
 
-const COMMANDS: [&str; 21] = [
+const COMMANDS: [&str; 22] = [
     "init",
     "up",
     "down",
@@ -45,6 +45,7 @@ const COMMANDS: [&str; 21] = [
     "config",
     "chat",
     "attach",
+    "shell",
     "doctor",
     "uninstall",
     "pause",
@@ -153,6 +154,19 @@ impl Host {
         }
         cmd.arg(&self.container).args(argv);
         cmd
+    }
+
+    /// A login shell in the container as the agent, on the desktop when it runs.
+    fn shell(&self, shell: &str) -> anyhow::Result<()> {
+        if !self.interactive || !std::io::stdout().is_terminal() {
+            bail!("zephyr shell needs a terminal");
+        }
+        self.need_running()?;
+        let env = [
+            ("DISPLAY", ":99"),
+            ("XAUTHORITY", "/zephyr/.zephyr-xauthority"),
+        ];
+        run(&mut self.exec_agent(&["-it", "-e", "TERM"], &env, &[shell, "-l"]))
     }
 
     fn state(&self) -> Option<String> {
@@ -1047,6 +1061,11 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
             a.rest()?;
             h.attach(stock)
         }
+        "shell" => match &a.rest()?[..] {
+            [] => h.shell("bash"),
+            [s] if s == "bash" || s == "zsh" => h.shell(s),
+            _ => bail!("{USAGE}"),
+        },
         "config" => {
             let rest = a.rest()?;
             let mut doc = h.data.load()?;
