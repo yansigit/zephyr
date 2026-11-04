@@ -3049,6 +3049,7 @@ dependencies = [
  "jiff",
  "libc",
  "reqwest",
+ "ring",
  "rpi-tui",
  "rusqlite",
  "sd-notify",

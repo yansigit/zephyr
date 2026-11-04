@@ -198,6 +198,28 @@ impl Data {
         self.write("host.toml", &doc.to_string())
     }
 
+    /// `packages` from `host.toml`: the apt packages `zephyr packages` bakes into a local image.
+    pub fn packages(&self) -> anyhow::Result<Vec<String>> {
+        let doc = self.host_doc()?.unwrap_or_default();
+        Ok(doc
+            .get("packages")
+            .and_then(Item::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect())
+    }
+
+    pub fn set_packages(&self, packages: &[String]) -> anyhow::Result<()> {
+        let mut doc = self.host_doc()?.unwrap_or_default();
+        if packages.is_empty() {
+            doc.remove("packages");
+        } else {
+            doc["packages"] = value(packages.iter().collect::<toml_edit::Array>());
+        }
+        self.write("host.toml", &doc.to_string())
+    }
+
     /// `add_image_extensions` on `doc`, saved: zephyr.toml when it changed, then the record in
     /// host.toml, so an extension is never marked offered without having been added.
     pub fn add_image_extensions(&self, doc: &mut DocumentMut) -> anyhow::Result<bool> {

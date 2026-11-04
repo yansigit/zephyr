@@ -21,6 +21,7 @@ pub const USAGE: &str = "usage: zephyr <command>   (zephyr --version: this CLI's
   channel add|remove discord|imessage | list
   skill add DIR | list | rm NAME
   mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. | list | rm NAME
+  packages add NAME.. | rm NAME.. | list
   config get|set KEY [VALUE]
   chat | attach [--stock] | shell [bash|zsh] | pause | resume | reload
   doctor [--fix]
@@ -30,7 +31,10 @@ env: ZEPHYR_CONTAINER (default zephyr), ZEPHYR_IMAGE, ZEPHYR_SRC (for --build); 
 /// The published image, tagged with the version (and `latest`, the newest release).
 const REPO: &str = "ghcr.io/yansigit/zephyr:";
 
-const COMMANDS: [&str; 22] = [
+/// The image built from it with host.toml's apt `packages` (`zephyr packages`), never pushed.
+const LOCAL: &str = "zephyr-local:";
+
+const COMMANDS: [&str; 23] = [
     "init",
     "up",
     "down",
@@ -53,6 +57,7 @@ const COMMANDS: [&str; 22] = [
     "reload",
     "skill",
     "mcp",
+    "packages",
 ];
 
 /// The image sets ZEPHYR_IN_CONTAINER. ZEPHYR_CONFIG (set in the image and by tests) also points
@@ -99,7 +104,14 @@ fn running_version(h: &Host) -> Option<String> {
         .filter(|o| o.status.success())?;
     let image = String::from_utf8_lossy(&out.stdout);
     let image = image.trim();
-    Some(image.strip_prefix(REPO).unwrap_or(image).to_string())
+    let local = || image.strip_prefix(LOCAL)?.split('-').next();
+    Some(
+        image
+            .strip_prefix(REPO)
+            .or_else(local)
+            .unwrap_or(image)
+            .to_string(),
+    )
 }
 
 pub fn is_command(cmd: &str) -> bool {
@@ -185,7 +197,13 @@ impl Host {
     }
 
     /// Pulls the image, logging in to ghcr.io with `gh` when needed; builds it when that fails.
+    /// Then builds the local image with host.toml's packages on top, when there are any.
     fn ensure_image(&self, build: bool, refresh: bool) -> anyhow::Result<()> {
+        self.ensure_base(build, refresh)?;
+        self.derive(&self.data.packages()?, build || refresh)
+    }
+
+    fn ensure_base(&self, build: bool, refresh: bool) -> anyhow::Result<()> {
         if build {
             return self.build();
         }
@@ -197,6 +215,47 @@ impl Host {
         }
         println!("could not pull {}; building it locally", self.image);
         self.build()
+    }
+
+    /// The image the container runs: `self.image`, or with apt `packages` the local image built
+    /// from it (`local_image`).
+    fn run_image(&self) -> anyhow::Result<String> {
+        Ok(local_image(&self.image, &self.data.packages()?).unwrap_or_else(|| self.image.clone()))
+    }
+
+    /// Builds the local image of `packages` on `self.image` when it is missing, or always with
+    /// `force` (docker's layer cache makes that quick when neither changed).
+    /// The images run as root until the daemon drops to the agent, so apt-get needs no sudo.
+    fn derive(&self, packages: &[String], force: bool) -> anyhow::Result<()> {
+        let Some(tag) = local_image(&self.image, packages) else {
+            return Ok(());
+        };
+        if !force && quiet(docker(&["image", "inspect", &tag])) {
+            return Ok(());
+        }
+        println!("building {tag} with {}", packages.join(" "));
+        let dockerfile = format!(
+            "FROM {}\nRUN apt-get update && apt-get install -y --no-install-recommends {} \
+             && rm -rf /var/lib/apt/lists/*\n",
+            self.image,
+            packages.join(" ")
+        );
+        let mut child = docker(&["build", "-t", &tag, "-"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .context("running docker build")?;
+        child
+            .stdin
+            .take()
+            .context("stdin")?
+            .write_all(dockerfile.as_bytes())?;
+        if !child.wait()?.success() {
+            bail!(
+                "building {tag} failed: is each of {} an Ubuntu 24.04 apt package?",
+                packages.join(", ")
+            );
+        }
+        Ok(())
     }
 
     /// `docker build` from ZEPHYR_SRC (default: this source tree). The gh token goes in as a
@@ -254,6 +313,7 @@ impl Host {
                 "warning: could not add the image's new extensions: {e:#}; run `zephyr init` later"
             ),
         }
+        let image = self.run_image()?;
         let ids = agent_ids();
         let data = self.data.dir.display();
         let daemon = self.data.daemon.display();
@@ -318,7 +378,7 @@ impl Host {
             &[]
         })
         // Root cannot enter the agent's 0700 home; the daemon starts each child there as the agent.
-        .args(["-w", "/", &self.image])
+        .args(["-w", "/", &image])
         .stdout(Stdio::null());
         run(&mut cmd)?;
         self.wait_ready()
@@ -578,6 +638,9 @@ impl Host {
             self.ensure_image(false, true)?;
         } else if !pull(&self.image) {
             bail!("could not pull {}", self.image);
+        } else {
+            // While the old container still runs: the owner's packages on the new image.
+            self.derive(&self.data.packages()?, false)?;
         }
         let back = matches!(
             (running.as_deref().and_then(semver), semver(&target)),
@@ -1136,7 +1199,15 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                     )
                 })?;
             }
-            let _ = quiet(docker(&["rmi", &h.image]));
+            // Local package images first: each is built on a release image.
+            let locals = docker(&["image", "ls", "--format", "{{.Repository}}:{{.Tag}}"])
+                .arg(LOCAL.trim_end_matches(':'))
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
+            for image in locals.lines().chain([h.image.as_str()]) {
+                let _ = quiet(docker(&["rmi", image]));
+            }
             if !keep {
                 for d in [&h.data.dir, &h.data.daemon] {
                     std::fs::remove_dir_all(d).or_else(|e| {
@@ -1161,8 +1232,38 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
         "channel" => setup::channel(&h, a),
         "skill" => setup::skill(&h, a),
         "mcp" => setup::mcp(&h, a),
+        "packages" => setup::packages(&h, a),
         _ => bail!("{USAGE}"),
     }
+}
+
+/// `zephyr-local:<version>-<hash>` for apt `packages` on `base`, None without packages. The hash
+/// covers the base too, so two named images (`ZEPHYR_IMAGE`) never share a local image.
+fn local_image(base: &str, packages: &[String]) -> Option<String> {
+    if packages.is_empty() {
+        return None;
+    }
+    let mut sorted = packages.to_vec();
+    sorted.sort();
+    let text = format!("{base}\n{}", sorted.join("\n"));
+    let digest = ring::digest::digest(&ring::digest::SHA256, text.as_bytes());
+    let hash: String = digest.as_ref()[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let version = base.strip_prefix(REPO).unwrap_or("custom");
+    Some(format!("{LOCAL}{version}-{hash}"))
+}
+
+/// A Debian package name (`^[a-z0-9][a-z0-9+.-]+$`), checked before it reaches a shell. A
+/// trailing `-` is refused too: apt-get install reads `name-` as "remove name".
+fn package_name(name: &str) -> bool {
+    name.len() >= 2
+        && name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && !name.ends_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"+.-".contains(&b))
 }
 
 #[cfg(test)]
@@ -1180,6 +1281,30 @@ mod tests {
         ] {
             assert!(busy(&format!("{idle}{line}\n")), "{line}");
         }
+    }
+
+    #[test]
+    fn package_names_are_checked_and_name_a_stable_local_image() {
+        for good in ["ffmpeg", "g++", "libssl3t64", "python3.12-venv", "0ad"] {
+            assert!(package_name(good), "{good}");
+        }
+        for bad in [
+            "x", "Ffmpeg", "-y", "git-", "a b", "a;rm", "$(id)", "pkg=1.0", "",
+        ] {
+            assert!(!package_name(bad), "{bad}");
+        }
+        let list = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let base = format!("{REPO}0.4.0");
+        assert_eq!(local_image(&base, &[]), None);
+        let tag = local_image(&base, &list(&["jq", "ffmpeg"])).unwrap();
+        // Pinned: sha256("ghcr.io/yansigit/zephyr:0.4.0\nffmpeg\njq"), so it holds across builds.
+        assert_eq!(tag, "zephyr-local:0.4.0-90531f12");
+        assert_eq!(
+            local_image(&base, &list(&["ffmpeg", "jq"])),
+            Some(tag.clone())
+        );
+        let other = local_image("zephyr:dev", &list(&["ffmpeg", "jq"])).unwrap();
+        assert!(other.starts_with("zephyr-local:custom-") && other != tag);
     }
 
     #[test]

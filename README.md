@@ -49,13 +49,14 @@ zephyr login openai-codex --account codex-main
 | `zephyr channel add\|remove discord\|imessage \| list` | Channel settings (secrets are asked for hidden); `remove` drops the channel, its owners and secrets, `list` shows them. Discord shows typing while the agent works, and a progress note after 20 s (`discord.progress`, `discord.progress_after_secs`) |
 | `zephyr skill add DIR \| list \| rm NAME` | Skills the agent may use (see [Skills and connectors](#skills-and-connectors)); one you add is approved at once |
 | `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}` |
+| `zephyr packages add NAME.. \| rm NAME.. \| list` | Ubuntu (apt) packages for the agent, baked into a local image (`zephyr-local:<version>-<hash>`) on the release one; `up` and `upgrade` build it, and `add`/`rm` rebuild and recreate the container once the agent is idle |
 | `zephyr config get\|set KEY [VALUE]` | Edit `zephyr.toml` (comments are kept; invalid keys are refused) |
 | `zephyr attach [--stock]` | Zephyr's terminal UI on the live session: history, tool calls, what the agent is doing, the queue and today's spend; `^D` detaches and the agent keeps running. `--stock` runs the stock `rpi --connect` client instead |
 | `zephyr shell [bash\|zsh]` | A login shell in the container as the agent, in its home (`/zephyr`) and on its desktop; needs a terminal |
 | `zephyr chat` | The same UI on a terminal; a line client (`< reply` per line) when piped or scripted |
 | `zephyr pause` / `resume` | Stop and restart dispatch (`/pause` and `/resume` from any channel do the same) |
 | `zephyr reload` | Apply hand edits now instead of within 5 s (`/reload` from any channel) |
-| `zephyr uninstall [--keep-data]` | Remove the container and image, and `~/.zephyr` unless kept |
+| `zephyr uninstall [--keep-data]` | Remove the container and its images (the local package ones too), and `~/.zephyr` unless kept |
 
 Sign in from the running gateway too, with no re-exec afterwards. In `zephyr attach`, `/login`
 lists the providers and Enter starts the one you pick: an OAuth provider (Antigravity,
@@ -189,6 +190,18 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   anything else (`uv run --with`, or a venv of its own; uv's cache lives in `~/.zephyr/.cache/uv`).
   To add a package for every run, edit `deploy/python/pyproject.toml`, run `uv lock` there, and
   rebuild.
+- **Command-line tools.** `gh` (GitHub, once you give the agent a token), `himalaya` (mail, below),
+  `jq`, `rg`, `fd`, `sqlite3`, `ssh`, `zip`/`unzip`, `tree`, `file`, `zsh`, and node with `npm` and
+  `npx`. Writes through `gh` (`pr create`, `issue comment`, `api -X POST`, ...) and mail
+  `himalaya` sends are in the turn's outbound list.
+- **Installing.** The agent has no sudo. What it installs lands in its home and survives upgrades:
+  `uv tool install`, `npm i -g` (`NPM_CONFIG_PREFIX` is `~/.zephyr/.local`) and any binary in
+  `~/.zephyr/.local/bin`, which is first on its PATH. An apt package needs you:
+  `zephyr packages add NAME`.
+- **Mail.** The agent reads and sends mail with `himalaya`, configured in
+  `/zephyr/.config/himalaya/config.toml` in its home (`~/.zephyr/.config/himalaya/config.toml` on
+  the host); the agent can write that file itself. Keep the password out of it: see Vault. There
+  is no mail channel: mail does not reach the agent by itself.
 - **Desktop.** An Xvfb screen (1920x1080) with openbox, where the browser runs. The agent sees it
   through screenshots and drives it with `xdotool`.
 - **GPU.** When Docker has the NVIDIA runtime, `zephyr up` passes the GPU in, so the browser's
@@ -258,7 +271,8 @@ signed in as.
     them: they are removed from rpi's environment and every other process zephyr starts for it. To
     give the agent one (an API key a provider reads, say), list its name in `[agent] env = ["NAME"]`.
   - `tui.token`: the `zephyr attach` token.
-  - `host.toml`: the projects folder, optionally `memory = "8g"` to cap the container's memory, and `offered_extensions`: the image extensions `init`, `up` and `upgrade` have already added to `zephyr.toml`, so one you remove stays removed. The first `up` after upgrading to a zephyr that keeps this record adds once any image extension removed earlier, or every one if the config lists none; after that, a removal sticks.
+  - `host.toml`: the projects folder, optionally `memory = "8g"` to cap the container's memory,
+    `packages`: the apt packages `zephyr packages` bakes into the local image, and `offered_extensions`: the image extensions `init`, `up` and `upgrade` have already added to `zephyr.toml`, so one you remove stays removed. The first `up` after upgrading to a zephyr that keeps this record adds once any image extension removed earlier, or every one if the config lists none; after that, a removal sticks.
     Used only on the host, at `zephyr up`.
   - `state.db`: inbox, outbox, jobs, spend.
 
