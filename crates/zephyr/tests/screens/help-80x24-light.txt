@@ -12,13 +12,13 @@
  │    /undo                       take back your last message and its reply   │
  │    /retry                      take it back and send it again              │
  │    /compact [instructions]     summarise the conversation to free context  │
+ │    /copy                       copy the last reply                         │
+ │    /copy <n>                   copy code block n, or click it              │
  │    /help                       this list                                   │
+ │    /quit                       leave (or /exit); zephyr keeps running      │
  │ Agent                                                                      │
  │    /stop                       stop the current reply and every task       │
  │    /task list                  the agent's background tasks                │
  │    /task stop <id>             stop one task                               │
- │    /process list               commands running in the background          │
- │    /process stop <id>          stop one command                            │
- │    /model                      pick a model                                │
- ╰─────────────────────────────────────────────────────────────── 1-16 of 48 ─╯
+ ╰─────────────────────────────────────────────────────────────── 1-16 of 51 ─╯
   ↑↓ choose · ⏎ insert · type to filter · esc close
