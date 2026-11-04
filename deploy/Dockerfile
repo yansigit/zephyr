@@ -109,11 +109,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && d="gh_${GH_VERSION}_linux_$g" \
     && curl -fsSLo "/tmp/$d.tar.gz" "https://github.com/cli/cli/releases/download/v$GH_VERSION/$d.tar.gz" \
     && echo "$gs  /tmp/$d.tar.gz" | sha256sum -c - \
-    && tar -xzf "/tmp/$d.tar.gz" -C /usr/local/bin --strip-components 2 "$d/bin/gh" \
+    && tar -xzf "/tmp/$d.tar.gz" --no-same-owner -C /usr/local/bin --strip-components 2 "$d/bin/gh" \
     && f="himalaya.$h-linux.tgz" \
     && curl -fsSLo "/tmp/$f" "https://github.com/pimalaya/himalaya/releases/download/v$HIMALAYA_VERSION/$f" \
     && echo "$hs  /tmp/$f" | sha256sum -c - \
-    && tar -xzf "/tmp/$f" -C /usr/local/bin himalaya
+    && tar -xzf "/tmp/$f" --no-same-owner -C /usr/local/bin himalaya
 
 # The default browser and agent-browser, which drives it, both checked against pinned sha256s.
 FROM toolchain AS browser
