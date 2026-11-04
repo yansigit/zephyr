@@ -61,11 +61,13 @@ impl Ran {
 pub fn prefix(held: &[Ran], message: &str) -> String {
     let mut out = String::new();
     for r in held {
+        let output = r.output.trim_end();
+        // A fence longer than any backtick run in the output, so the output can't close it.
+        let longest = output.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+        let fence = "`".repeat(longest.max(2) + 1);
         out.push_str(&format!(
-            "[the owner ran `{}` ({}):\n```\n{}\n```]\n\n",
-            r.command,
-            r.how,
-            r.output.trim_end()
+            "[the owner ran `{}` ({}):\n{fence}\n{output}\n{fence}]\n\n",
+            r.command, r.how
         ));
     }
     out + message
@@ -200,6 +202,12 @@ mod tests {
              [the owner ran `false` (exit 1):\n```\n\n```]\n\nwhat now?"
         );
         assert_eq!(prefix(&[], "hi"), "hi");
+        let fenced = prefix(
+            &[ran("cat x.md", "```rust\nfn x() {}\n```", "exit 0")],
+            "ok",
+        );
+        assert!(fenced.starts_with("[the owner ran `cat x.md` (exit 0):\n````\n```rust"));
+        assert!(fenced.ends_with("```\n````]\n\nok"));
     }
 
     #[test]
