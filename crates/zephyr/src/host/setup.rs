@@ -560,6 +560,62 @@ pub fn skill(h: &Host, a: Args) -> anyhow::Result<()> {
     }
 }
 
+/// `zephyr packages add NAME.. | rm NAME.. | list`: apt packages for the agent, kept in host.toml
+/// and baked into a local image on the release one, which `up` and `upgrade` build and run. The
+/// image is built before the list is saved, so a name apt does not know changes nothing.
+pub fn packages(h: &Host, a: Args) -> anyhow::Result<()> {
+    const USE: &str = "usage: zephyr packages add NAME.. | rm NAME.. | list";
+    let rest = a.rest()?;
+    let mut list = h.data.packages()?;
+    let Some((op, names)) = rest.split_first() else {
+        bail!(USE);
+    };
+    match (op.as_str(), names.is_empty()) {
+        ("list", true) => {
+            if list.is_empty() {
+                println!("no packages (zephyr packages add NAME)");
+            }
+            for p in &list {
+                println!("{p}");
+            }
+            return Ok(());
+        }
+        ("add", false) => {
+            if let Some(bad) = names.iter().find(|n| !super::package_name(n)) {
+                bail!("{bad:?} is not an apt package name");
+            }
+            for n in names {
+                if !list.contains(n) {
+                    list.push(n.clone());
+                }
+            }
+        }
+        ("rm", false) => {
+            if let Some(gone) = names.iter().find(|n| !list.contains(n)) {
+                bail!("{gone} is not in the list (zephyr packages list)");
+            }
+            list.retain(|p| !names.contains(p));
+        }
+        _ => bail!(USE),
+    }
+    list.sort();
+    h.ensure_base(false, false)?;
+    h.derive(&list, false)?;
+    h.data.set_packages(&list)?;
+    if list.is_empty() {
+        println!("no packages: zephyr runs {} again", h.image);
+    } else {
+        println!("packages: {}", list.join(" "));
+    }
+    if !h.running() {
+        println!("saved; applies when zephyr starts (`zephyr up`)");
+        return Ok(());
+    }
+    // Recreated as an upgrade is: once nothing is in flight.
+    h.settle(super::running_version(h).as_deref())?;
+    h.up()
+}
+
 /// `zephyr mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. | list |
 /// rm NAME`: the `[[mcp]]` connectors in zephyr.toml (DESIGN §4.6). Each `--secret` is asked for
 /// hidden and goes to secrets.env, for the `${NAME}` it fills in. `add NAME --secret K` alone sets

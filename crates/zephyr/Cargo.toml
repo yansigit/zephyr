@@ -12,6 +12,8 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 libc = "0.2"
+# Already in the tree through rustls: names the local image by its packages (`zephyr packages`).
+ring = "0.17"
 zephyr-policy = { path = "../zephyr-policy" }
 rusqlite.workspace = true
 sd-notify.workspace = true
