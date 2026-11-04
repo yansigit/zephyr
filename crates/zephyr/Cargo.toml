@@ -12,6 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 libc = "0.2"
+base64 = "0.22"
 zephyr-policy = { path = "../zephyr-policy" }
 rusqlite.workspace = true
 sd-notify.workspace = true
