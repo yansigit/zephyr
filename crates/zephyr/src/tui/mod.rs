@@ -1769,4 +1769,212 @@ mod tests {
             assert!(!s.stopping);
         }
     }
+
+    /// A terminal that keeps what is written to it, for driving a real `TuiAltScreen`.
+    #[derive(Clone, Default)]
+    struct Fake(std::sync::Arc<std::sync::Mutex<String>>);
+
+    impl rpi_tui::Terminal for Fake {
+        fn info(&self) -> rpi_tui::TerminalInfo {
+            rpi_tui::TerminalInfo {
+                columns: 40,
+                rows: 6,
+                ..Default::default()
+            }
+        }
+        fn write(&self, data: &str) {
+            self.0.lock().unwrap().push_str(data);
+        }
+        fn hide_cursor(&self) {}
+        fn show_cursor(&self) {}
+        fn move_cursor(&self, _row: usize, _col: usize) {}
+        fn clear_screen(&self) {}
+        fn set_title(&self, title: &str) {
+            self.write(&format!("<title {title}>"));
+        }
+        fn enable_mouse(&self) {}
+        fn disable_mouse(&self) {}
+        fn enter_raw_mode(&self) {}
+        fn exit_raw_mode(&self) {}
+        fn refresh_size(&self) {}
+        fn start(
+            &self,
+            _on_input: Box<dyn Fn(rpi_tui::InputEvent) + Send + Sync>,
+            _on_resize: Box<dyn Fn() + Send + Sync>,
+        ) {
+        }
+        fn stop(&self) {}
+        fn is_tty(&self) -> bool {
+            true
+        }
+        fn set_progress(&self, _active: bool) {}
+        fn flush(&self) {}
+    }
+
+    /// A 40x6 screen that is all transcript, drawn with `rows`, and the transcript as placed.
+    fn screen(rows: &[&str]) -> (rpi_tui::TuiAltScreen, super::Placed, Fake) {
+        let doc = std::sync::Arc::new(rpi_tui::Container::new());
+        for r in rows {
+            doc.add_child(std::sync::Arc::new(rpi_tui::Text::new(*r, 0, 0)));
+        }
+        let scroll = std::sync::Arc::new(rpi_tui::ScrollView::primary(doc));
+        let root = rpi_tui::VStack::from_children(vec![rpi_tui::StackChild::Entry(
+            rpi_tui::StackEntry::new(scroll.clone()).basis(0).grow(1),
+        )]);
+        let fake = Fake::default();
+        let tui = rpi_tui::TuiAltScreen::new(Box::new(fake.clone()), false, None);
+        tui.set_layout_root(Some(std::sync::Arc::new(root)));
+        tui.start_readerless();
+        rpi_tui::TUI::request_render(&tui, true);
+        let snap = scroll.snapshot(40).expect("drawn");
+        let at = super::Placed {
+            header: 0,
+            height: scroll.viewport_height(),
+            top: snap.scroll_top,
+            lines: snap.document.lines(0, snap.document.len()),
+        };
+        (tui, at, fake)
+    }
+
+    #[test]
+    fn clicks_on_one_cell_count_up_to_three_within_the_window() {
+        let mut c = super::Clicks::default();
+        assert_eq!(c.down((5, 2), 1000), 1);
+        assert_eq!(c.down((5, 2), 1300), 2);
+        assert_eq!(c.down((5, 2), 1600), 3);
+        assert_eq!(c.down((5, 2), 1700), 1);
+        // Another cell, or too slow, starts again.
+        assert_eq!(c.down((6, 2), 1800), 1);
+        assert_eq!(c.down((6, 2), 1800 + super::CLICK_MS + 1), 1);
+    }
+
+    #[test]
+    fn words_and_rows_are_read_in_columns() {
+        let row = "   한글 ~/src/main.rs:12 ok";
+        // `한글` is two wide characters: columns 3 to 6.
+        assert_eq!(super::word_at(row, 5), Some((3, 6)));
+        assert_eq!(super::word_at(row, 10), Some((8, 23)));
+        assert_eq!(super::word_at(row, 7), None);
+        assert_eq!(super::word_at(row, 99), None);
+        assert_eq!(super::row_span(row), Some((3, 26)));
+        assert_eq!(super::row_span(" ▌ hi  "), Some((3, 4)));
+        assert_eq!(super::row_span("   "), None);
+    }
+
+    #[test]
+    fn double_triple_and_shift_clicks_select_through_rpi_tui() {
+        let (tui, at, _) = screen(&["   check the nightly backup", "   and the log"]);
+        let select = |anchor, cell, shift, n| {
+            tui.clear_selection();
+            let (from, to) = super::click_span(&at, anchor, cell, shift, n)?;
+            super::drag(&tui, from, to);
+            tui.selection_text()
+        };
+        assert_eq!(select(None, (24, 0), false, 2).as_deref(), Some("backup"));
+        assert_eq!(
+            select(None, (24, 0), false, 3).as_deref(),
+            Some("check the nightly backup")
+        );
+        // Shift+click runs from the last plain click to this one, across rows.
+        let anchor = Some((9, at.row(0).unwrap()));
+        assert_eq!(
+            select(anchor, (9, 1), true, 1).as_deref(),
+            Some("the nightly backup\n   and the")
+        );
+        // Without an anchor, or a single click, nothing is selected.
+        assert_eq!(select(None, (9, 1), true, 1), None);
+        assert_eq!(select(None, (9, 1), false, 1), None);
+        // A transcript row maps back to the screen, clamped to what is on it.
+        assert_eq!((at.screen(1), at.screen(99)), (1, at.height as u16 - 1));
+    }
+
+    #[test]
+    fn notifications_need_the_terminal_away_and_wait_ten_seconds() {
+        let mut a = super::Attention::default();
+        // No focus report yet: a terminal without them never notifies.
+        assert_eq!(a.ping("reply ready", 0), None);
+        a.away = true;
+        assert_eq!(
+            a.ping("reply ready", 1000).as_deref(),
+            Some("\x07\x1b]9;zephyr: reply ready\x07")
+        );
+        assert_eq!(a.ping("needs your OK", 1000 + super::NOTIFY_MS - 1), None);
+        assert!(a.ping("needs your OK", 1000 + super::NOTIFY_MS).is_some());
+        a.away = false;
+        assert_eq!(a.ping("reply ready", 99_000), None);
+    }
+
+    #[test]
+    fn settles_and_proposals_are_what_notify() {
+        let mut view = super::view::View::new(super::theme::DARK, jiff::tz::TimeZone::UTC);
+        let mut s = super::chrome::State::default();
+        let status = |busy: bool| serde_json::json!({"type": "zephyr_status", "snapshot": {"run": {"busy": busy}}});
+        assert_eq!(super::event(&mut s, &mut view, &status(true)), None);
+        assert_eq!(
+            super::event(&mut s, &mut view, &status(false)),
+            Some("reply ready")
+        );
+        let reply = |text: &str, command: Option<&str>| {
+            serde_json::json!({"type": "zephyr_reply", "text": text, "command": command})
+        };
+        let asks = "[zephyr] the agent asks to run /job run 3 (#4); /ok 4 runs it, /no 4 drops it";
+        assert_eq!(
+            super::event(&mut s, &mut view, &reply(asks, None)),
+            Some("needs your OK")
+        );
+        assert!(s.asking);
+        let memory = "[zephyr] memory change waiting; /memory ok keeps it, /memory undo drops it:\n+x";
+        assert!(super::event(&mut s, &mut view, &reply(memory, None)).is_some());
+        // An answer to a command typed here is not asking for anything.
+        let usage = "[zephyr] usage: /job ok <id>, /job rm <id>";
+        assert_eq!(
+            super::event(&mut s, &mut view, &reply(usage, Some("/job"))),
+            None
+        );
+    }
+
+    #[test]
+    fn the_title_and_progress_bar_follow_the_run() {
+        let (tui, _, fake) = screen(&["x"]);
+        let mut s = super::chrome::State::default();
+        let mut look = ("", false);
+        let written = || std::mem::take(&mut *fake.0.lock().unwrap());
+        written();
+        super::attend(&tui, &s, &mut look);
+        assert_eq!(written(), "<title ◇ zephyr>");
+        s.snapshot.run.busy = true;
+        super::attend(&tui, &s, &mut look);
+        assert_eq!(written(), format!("<title ✦ zephyr>{}", super::PROGRESS_ON));
+        // Nothing changed, nothing written.
+        super::attend(&tui, &s, &mut look);
+        assert_eq!(written(), "");
+        s.asking = true;
+        s.snapshot.run.busy = false;
+        super::attend(&tui, &s, &mut look);
+        assert_eq!(written(), format!("<title ✋ zephyr>{}", super::PROGRESS_OFF));
+    }
+
+    #[test]
+    fn search_keys_and_prompt_jumps() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
+        let k = |code, m| super::find_key(&KeyEvent::new(code, m));
+        assert_eq!(k(KeyCode::Char('a'), M::NONE), Some(super::Find::Type('a')));
+        assert_eq!(k(KeyCode::Char('A'), M::SHIFT), Some(super::Find::Type('A')));
+        assert_eq!(k(KeyCode::Enter, M::NONE), Some(super::Find::Older));
+        assert_eq!(k(KeyCode::Enter, M::SHIFT), Some(super::Find::Newer));
+        assert_eq!(k(KeyCode::Char('g'), M::CONTROL), Some(super::Find::Older));
+        assert_eq!(k(KeyCode::Char('G'), M::CONTROL | M::SHIFT), Some(super::Find::Newer));
+        assert_eq!(k(KeyCode::Char('g'), M::CONTROL | M::SHIFT), Some(super::Find::Newer));
+        assert_eq!(k(KeyCode::Esc, M::NONE), Some(super::Find::Close));
+        // Ctrl+F closes it through its own arm; Ctrl+C and the like keep their meaning.
+        assert_eq!(k(KeyCode::Char('f'), M::CONTROL), None);
+        assert_eq!(k(KeyCode::PageUp, M::NONE), None);
+
+        let prompts = [2, 10, 30];
+        assert_eq!(super::jump(&prompts, 20, true), Some(10));
+        assert_eq!(super::jump(&prompts, 10, true), Some(2));
+        assert_eq!(super::jump(&prompts, 2, true), None);
+        assert_eq!(super::jump(&prompts, 20, false), Some(30));
+        assert_eq!(super::jump(&prompts, 30, false), None);
+    }
 }

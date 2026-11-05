@@ -44,7 +44,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ),
     ("Chat", "/copy", "copy the last reply"),
     ("Chat", "/copy <n>", "copy code block n, or click it"),
-    ("Chat", "/focus", "hide tool calls and thinking; again shows them"),
+    ("Chat", "/focus", "hide tool calls and thinking, or show them"),
     ("Chat", "/help", "this list"),
     ("Chat", "/quit", "leave (or /exit); zephyr keeps running"),
     ("Agent", "/stop", "stop the current reply and every task"),

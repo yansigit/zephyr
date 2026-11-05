@@ -16,6 +16,7 @@
  │    !<command>                  run it; the next message carries its output                                                             │
  │    /copy                       copy the last reply                                                                                     │
  │    /copy <n>                   copy code block n, or click it                                                                          │
+ │    /focus                      hide tool calls and thinking, or show them                                                              │
  │    /help                       this list                                                                                               │
  │    /quit                       leave (or /exit); zephyr keeps running                                                                  │
  │ Agent                                                                                                                                  │
@@ -35,6 +36,5 @@
  │    /memory diff                the memory change waiting for you                                                                       │
  │    /memory ok                  let the agent see the waiting change                                                                    │
  │    /memory undo                drop the waiting change, else the last one                                                              │
- │    /memory log                 the last 10 memory commits                                                                              │
- ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 1-32 of 59 ─╯
+ ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 1-32 of 66 ─╯
   ↑↓ choose · ⏎ insert · type to filter · esc close
