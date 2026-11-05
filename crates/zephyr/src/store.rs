@@ -4,7 +4,7 @@ use crate::channel::Inbound;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 /// Queued and running tasks allowed at once (DESIGN §4.12); a start past this is refused.
 pub const MAX_OPEN_TASKS: i64 = 10;
@@ -116,9 +116,12 @@ pub struct Task {
     pub resumes: i64,
     /// Its latest attempt's rpi session, which a resume reopens.
     pub session: Option<String>,
+    /// The `provider/model` the agent asked it to run on; `None` is the pool's pick.
+    pub model: Option<String>,
 }
 
-const TASK_COLUMNS: &str = "id, goal, channel, recipient, status, created_at, resumes, session";
+const TASK_COLUMNS: &str =
+    "id, goal, channel, recipient, status, created_at, resumes, session, model";
 
 /// Restarts a task resumes through; the next one makes it `unknown`. As main's `MAX_RESUMES`.
 pub const MAX_TASK_RESUMES: i64 = 3;
@@ -133,6 +136,7 @@ fn task_row(r: &rusqlite::Row) -> rusqlite::Result<Task> {
         created_at: r.get(5)?,
         resumes: r.get(6)?,
         session: r.get(7)?,
+        model: r.get(8)?,
     })
 }
 
@@ -374,6 +378,15 @@ impl Store {
                 "BEGIN;
                  CREATE TABLE session_names(id TEXT PRIMARY KEY, name TEXT NOT NULL);
                  PRAGMA user_version = 11;
+                 COMMIT;",
+            )?;
+        }
+        if version < 12 {
+            // A task's own model (DESIGN §4.12).
+            db.execute_batch(
+                "BEGIN;
+                 ALTER TABLE tasks ADD COLUMN model TEXT;
+                 PRAGMA user_version = 12;
                  COMMIT;",
             )?;
         }
@@ -917,13 +930,14 @@ impl Store {
     pub fn add_task(
         &self,
         goal: &str,
+        model: Option<&str>,
         channel: &str,
         recipient: &str,
     ) -> rusqlite::Result<Option<i64>> {
         let n = self.db.execute(
-            "INSERT INTO tasks(goal, channel, recipient)
-             SELECT ?1, ?2, ?3 WHERE (SELECT count(*) FROM tasks WHERE status IN ('queued', 'running')) < ?4",
-            params![goal, channel, recipient, MAX_OPEN_TASKS],
+            "INSERT INTO tasks(goal, model, channel, recipient)
+             SELECT ?1, ?2, ?3, ?4 WHERE (SELECT count(*) FROM tasks WHERE status IN ('queued', 'running')) < ?5",
+            params![goal, model, channel, recipient, MAX_OPEN_TASKS],
         )?;
         Ok((n == 1).then(|| self.db.last_insert_rowid()))
     }
@@ -1149,7 +1163,7 @@ impl Store {
             .prepare(&format!(
                 "SELECT {TASK_COLUMNS}, stop FROM tasks WHERE status = 'running'"
             ))?
-            .query_map([], |r| Ok((task_row(r)?, r.get::<_, bool>(8)?)))?
+            .query_map([], |r| Ok((task_row(r)?, r.get::<_, bool>(9)?)))?
             .collect::<rusqlite::Result<_>>()?;
         let mut reports = 0;
         for (t, stop) in &cut {
@@ -1512,9 +1526,13 @@ mod tests {
         let dir = crate::test_dir("store-tasks");
         let mut store = Store::open(&dir.join("state.db")).unwrap();
         for n in 1..=MAX_OPEN_TASKS {
-            assert_eq!(store.add_task("g", "chat", "o").unwrap(), Some(n));
+            assert_eq!(store.add_task("g", None, "chat", "o").unwrap(), Some(n));
         }
-        assert_eq!(store.add_task("g", "chat", "o").unwrap(), None, "capped");
+        assert_eq!(
+            store.add_task("g", None, "chat", "o").unwrap(),
+            None,
+            "capped"
+        );
         let first = store.start_next_task(5).unwrap().unwrap();
         assert_eq!(first.id, 1);
         // A queued task stops at once; a running one is only flagged for its runner.
@@ -1560,7 +1578,7 @@ mod tests {
     fn a_task_resumes_through_three_restarts_then_ends_unknown() {
         let dir = crate::test_dir("store-task-resumes");
         let mut store = Store::open(&dir.join("state.db")).unwrap();
-        store.add_task("g", "chat", "o").unwrap();
+        store.add_task("g", None, "chat", "o").unwrap();
         for n in 1..=MAX_TASK_RESUMES {
             assert_eq!(store.start_next_task(n).unwrap().unwrap().resumes, n - 1);
             assert_eq!(store.requeue_interrupted_tasks(n).unwrap(), 0, "resume {n}");
@@ -1579,7 +1597,7 @@ mod tests {
         );
         assert!(rows[0].text.contains("after 3 resumes"), "{}", rows[0].text);
         // One being stopped as the gateway died ends stopped, not resumed.
-        store.add_task("g2", "chat", "o").unwrap();
+        store.add_task("g2", None, "chat", "o").unwrap();
         store.start_next_task(12).unwrap().unwrap();
         store.request_stop(Some(2), 13).unwrap();
         assert_eq!(store.requeue_interrupted_tasks(14).unwrap(), 1);
@@ -1639,10 +1657,11 @@ mod tests {
             (4, "ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE inbox DROP COLUMN deliver; DROP TABLE session_names;"),
             (5, "DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE inbox DROP COLUMN deliver; DROP TABLE session_names;"),
             (6, "DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE inbox DROP COLUMN deliver; DROP TABLE session_names;"),
-            (7, "DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE tasks DROP COLUMN resumes; ALTER TABLE tasks DROP COLUMN session; ALTER TABLE inbox DROP COLUMN deliver; DROP TABLE session_names;"),
-            (8, "ALTER TABLE tasks DROP COLUMN resumes; ALTER TABLE tasks DROP COLUMN session; ALTER TABLE procs DROP COLUMN pid; ALTER TABLE procs DROP COLUMN start_ticks; ALTER TABLE procs DROP COLUMN deadline; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE inbox DROP COLUMN deliver; DROP TABLE session_names;"),
-            (9, "ALTER TABLE inbox DROP COLUMN deliver; DROP TABLE session_names;"),
-            (10, "DROP TABLE session_names;"),
+            (7, "DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE tasks DROP COLUMN resumes; ALTER TABLE tasks DROP COLUMN session; ALTER TABLE inbox DROP COLUMN deliver; DROP TABLE session_names; ALTER TABLE tasks DROP COLUMN model;"),
+            (8, "ALTER TABLE tasks DROP COLUMN resumes; ALTER TABLE tasks DROP COLUMN session; ALTER TABLE procs DROP COLUMN pid; ALTER TABLE procs DROP COLUMN start_ticks; ALTER TABLE procs DROP COLUMN deadline; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE inbox DROP COLUMN deliver; DROP TABLE session_names; ALTER TABLE tasks DROP COLUMN model;"),
+            (9, "ALTER TABLE inbox DROP COLUMN deliver; DROP TABLE session_names; ALTER TABLE tasks DROP COLUMN model;"),
+            (10, "DROP TABLE session_names; ALTER TABLE tasks DROP COLUMN model;"),
+            (11, "ALTER TABLE tasks DROP COLUMN model;"),
         ] {
             let dir = crate::test_dir(&format!("store-v{version}"));
             let path = dir.join("state.db");
@@ -1662,7 +1681,8 @@ mod tests {
             store.notify_file("chat", "o", "", Some("/f")).unwrap();
             assert_eq!(store.pending_outbox().unwrap()[0].attachment.as_deref(), Some("/f"));
             assert_eq!(store.propose_command("/new").unwrap(), 1);
-            assert_eq!(store.add_task("g", "chat", "o").unwrap(), Some(1));
+            assert_eq!(store.add_task("g", Some("p/m"), "chat", "o").unwrap(), Some(1));
+            assert_eq!(store.tasks(0).unwrap()[0].model.as_deref(), Some("p/m"));
             assert_eq!(store.add_proc("ls", "chat", "o").unwrap().unwrap().id, 1);
             // The v9 and v10 columns, there whichever version the db came from.
             store

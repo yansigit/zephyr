@@ -111,7 +111,7 @@ mod tests {
         std::fs::create_dir_all(cfg.state_dir()).unwrap();
         let store = Store::open(&cfg.db_path()).unwrap();
         // Task 1 is still queued in session task-1; process 1 is still running.
-        assert_eq!(store.add_task("g", "chat", "o").unwrap(), Some(1));
+        assert_eq!(store.add_task("g", None, "chat", "o").unwrap(), Some(1));
         store.set_task_session(1, "task-1").unwrap();
         assert_eq!(store.add_proc("ls", "chat", "o").unwrap().unwrap().id, 1);
 

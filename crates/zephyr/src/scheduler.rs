@@ -55,6 +55,9 @@ pub struct Spec<'a> {
     pub task: Option<i64>,
     /// Reopen `session` and carry on (DESIGN §4.12) instead of sending `prompt` to a fresh one.
     pub resume: bool,
+    /// `provider/model` to run on instead of the account's own (a task's `model`, DESIGN
+    /// §4.12): only that provider's accounts are tried.
+    pub model: Option<&'a str>,
 }
 
 /// What a run resumed after a restart is told (OpenClaw's restart-recovery wording): rpi
@@ -184,6 +187,7 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
                 refuse: "not available in scheduled runs",
                 task: None,
                 resume: false,
+                model: None,
             };
             let (status, output, crossed) = execute(&cfg, &mut store, &spec).await;
             wake.running.store(false, Ordering::SeqCst);
@@ -235,6 +239,36 @@ pub async fn execute(
         let text = format!("{what}: {}", goal.unwrap_or(spec.prompt));
         crate::checkpoint::before(cfg, &text).await;
     }
+    // A requested model runs only on its provider's accounts, each as that model; with no pool
+    // it stands in for `cfg.model`.
+    let provider = spec.model.map(|m| m.split('/').next().unwrap_or_default());
+    let accounts: Vec<crate::config::Account> = match spec.model {
+        None => cfg.accounts.clone(),
+        Some(m) => cfg
+            .accounts
+            .iter()
+            .filter(|a| Some(a.provider()) == provider)
+            .map(|a| crate::config::Account {
+                name: a.name.clone(),
+                model: m.into(),
+            })
+            .collect(),
+    };
+    let own;
+    let cfg = match (spec.model, cfg.accounts.is_empty()) {
+        (Some(m), true) => {
+            own = Config {
+                model: Some(m.into()),
+                ..cfg.clone()
+            };
+            &own
+        }
+        (Some(_), false) if accounts.is_empty() => {
+            let why = format!("no account on {}", provider.unwrap_or_default());
+            return ("failed", format!("{label} could not start: {why}"), false);
+        }
+        _ => cfg,
+    };
     // A job runs on the first account not cooling down. A rate-limited attempt cools that
     // account and retries on the next one, in a fresh session; each account is tried once.
     let mut crossed = false;
@@ -243,15 +277,16 @@ pub async fn execute(
             0 => spec.session.clone(),
             n => format!("{}-{n}", spec.session),
         };
-        let account = if cfg.accounts.is_empty() {
+        let account = if accounts.is_empty() {
             None
         } else {
             let cooling = store.cooldowns().unwrap_or_default();
-            match crate::pool::pick(&cfg.accounts, &cooling, crate::now()) {
+            match crate::pool::pick(&accounts, &cooling, crate::now()) {
                 Ok(a) => Some(a),
                 Err(until) => {
+                    let which = provider.map_or(String::new(), |p| format!("{p} "));
                     let why = format!(
-                        "every account is rate-limited until {}",
+                        "every {which}account is rate-limited until {}",
                         crate::pool::iso(until)
                     );
                     return ("failed", format!("{label} could not start: {why}"), crossed);
@@ -272,7 +307,7 @@ pub async fn execute(
             eprintln!("zephyr: recording a cooldown failed: {e}");
             return (status, text, crossed);
         }
-        if attempt + 1 >= cfg.accounts.len() {
+        if attempt + 1 >= accounts.len() {
             return (status, text, crossed);
         }
     }

@@ -78,6 +78,7 @@ async fn one(cfg: Arc<Config>, task: Task, wake: &Wake) {
         refuse: "not available in background tasks",
         task: Some(task.id),
         resume,
+        model: task.model.as_deref(),
     };
     let (status, output, crossed) = execute(&cfg, &mut store, &spec).await;
     let report = cut(&cfg, task.id, &output);
@@ -140,7 +141,11 @@ pub fn list(store: &Store) -> String {
             let short: String = goal.chars().take(60).collect();
             let cut = if short.len() < goal.len() { "…" } else { "" };
             let age = (now - t.created_at).max(0) / 60;
-            format!("#{} {} ({age} min ago): {short}{cut}", t.id, t.status)
+            let on = t
+                .model
+                .as_ref()
+                .map_or(String::new(), |m| format!(" on {m}"));
+            format!("#{} {} ({age} min ago){on}: {short}{cut}", t.id, t.status)
         })
         .collect();
     format!("[zephyr] tasks:\n{}", lines.join("\n"))
