@@ -119,7 +119,7 @@ Changes apply by themselves; nothing needs `zephyr restart`. The commands above,
 
 | Change | Applies |
 |---|---|
-| Budget, owners, time zone, `[auth]`, the pool order | at once |
+| Budget, owners, time zone, `[auth]`, `[tasks]`, the pool order | at once |
 | The model, on the same provider | at once, or after the reply in progress (rpi's `set_model`) |
 | A model on another provider, the active account, extensions, connectors (`[[mcp]]`), a re-login | the agent restarts after the reply in progress; the conversation carries on |
 | Discord, iMessage, `[attach]`, `[agent]`, a secret | the daemon restarts itself in place once idle; waiting messages are kept |
@@ -280,7 +280,7 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   itself. In a scheduled job it gets no answer and proposes nothing.
 - **Background tasks.** You can keep talking while the agent works. It hands anything that takes
   more than a minute to a task (its `task` tool): a fresh session running beside the conversation,
-  at most 2 at once. The agent answers right away, and when the task ends its report comes back to
+  2 at once by default (`[tasks] parallel` in zephyr.toml, up to 8). The agent answers right away, and when the task ends its report comes back to
   the agent, which tells you. Ask it to cancel, or use `/task list` and `/task stop N`. `/stop`
   stops the reply and every task. A task cut off by a restart or a settings reload picks up where
   it left off in its own session, told to check what was in progress before repeating anything (at

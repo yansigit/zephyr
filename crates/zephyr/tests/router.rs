@@ -1961,6 +1961,23 @@ async fn two_tasks_run_at_once_and_owner_stop_ends_them_all() {
 }
 
 #[tokio::test]
+async fn tasks_parallel_sets_how_many_run_at_once() {
+    let home = home("task-parallel");
+    let mut cfg = config(&home);
+    cfg.tasks = Some(toml::from_str("parallel = 3").unwrap());
+    let gw = start(cfg);
+    let call = format!(r#"[call task {{"action": "start", "goal": "{HANGING_GOAL}"}}]"#);
+    gw.say("m1", "owner", &format!("{call} {call} {call} {call}"))
+        .await;
+    gw.wait_replies(1).await;
+    wait(|| task_status(&home, "running") == 3 && task_status(&home, "queued") == 1).await;
+    gw.say("m2", "owner", "/stop").await;
+    assert_eq!(gw.wait_replies(2).await[1], "[zephyr] stopped");
+    wait(|| task_status(&home, "stopped") == 4).await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_task_cut_between_steps_carries_on_with_the_resume_note() {
     let home = home("task-restart");
     let gw = start(config(&home));
