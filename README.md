@@ -95,13 +95,18 @@ A file that does not load is not applied, and the daemon keeps its current setti
 channel: `/model` shows the models, `/model PROVIDER/MODEL` switches (to the account on that
 provider), `/status` shows the agent's account and model, `/reload` re-reads the files, and `/new`
 starts a fresh conversation (memory and rules carry over; the old one stays in `sessions/`), and
-`/switch` lists the earlier ones and `/switch ID` goes back to one.
+`/switch` lists the earlier ones (with their names and first words) and `/switch ID` goes back to
+one. `/rename NAME` names the current one; `zephyr attach` shows the name in its header.
+`/fork` copies the conversation as it stands and carries on in the copy (the original stays, for
+`/switch`). `/export` writes the conversation as markdown to
+`<projects>/zephyr-exports/<session>-<YYYYmmdd-HHMM>.md`, owned by you on the host.
 `/btw QUESTION` asks a side question about the conversation, even mid-reply: a throwaway agent with
 no tools answers it as `[btw] …` from a copy of the conversation, which is left as is.
 `/undo` takes your last message and its reply out of the agent's context (files it changed stay
-changed; another `/undo` goes one further back), `/retry` does that and sends the message again,
-and `/compact [INSTRUCTIONS]` has rpi summarise the conversation so far to make room and tells you
-how much it kept. These three wait for the agent to finish (or `/stop` it). `/usage [DAYS]` lists
+changed, see `/rollback`; another `/undo` goes one further back), `/undo N` the last N (up to 20),
+`/retry` does that and sends the message again, and `/compact [INSTRUCTIONS]` has rpi summarise the
+conversation so far to make room and tells you how much it kept. These and `/fork` wait for the
+agent to finish (or `/stop` it). `/usage [DAYS]` lists
 the spend per day and per account over the last 7 days, or `DAYS`.
 `/login` signs an account in from here: `/login` lists the provider ids, `/login PROVIDER [ACCOUNT]
 [MODEL]` starts an OAuth sign-in and needs no re-exec (a key or a token is refused — it is typed in
@@ -109,10 +114,13 @@ the spend per day and per account over the last 7 days, or `DAYS`.
 The first account of an empty install does restart the agent once, when idle: there is nothing for
 it to start on until that account exists.
 
-Two more in `zephyr attach` only: `!COMMAND` runs `bash -c COMMAND` as the agent in its home (60 s at
+In `zephyr attach` only: `!COMMAND` runs `bash -c COMMAND` as the agent in its home (60 s at
 most, the first 50 KB of output kept) and shows the output and exit code; it goes to the agent in
 front of your next message (not a `/` command), and Esc on an empty composer drops it instead.
 `/shell [zsh]` opens an interactive login shell as the agent in place of the UI; exit it to come back.
+Esc twice on an empty composer, with the agent idle, opens a rewind list of your messages in this
+conversation, newest first: picking one sends `/undo N` back to before it and puts it in the
+composer to edit and send again.
 
 `ZEPHYR_CONTAINER` (default `zephyr`) and `ZEPHYR_IMAGE` choose another container or image, for
 example to test beside a live install.
