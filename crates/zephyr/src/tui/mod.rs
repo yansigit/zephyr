@@ -4,6 +4,8 @@
 
 mod chrome;
 mod conn;
+mod files;
+mod history;
 mod overlays;
 mod shell;
 mod theme;
@@ -184,6 +186,9 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     let mut press = None;
     // The code block the last ^X copied, so the next one copies the block before it.
     let mut walk: Option<usize> = None;
+    // What you sent, the draft ^C cleared, and the drafts Alt+S put aside.
+    let mut history = history::History::default();
+    let (home, projects) = (cfg.home.clone(), cfg.projects.clone());
     let outcome: anyhow::Result<()> = loop {
         tokio::select! {
             msg = msgs.recv() => {
@@ -193,7 +198,10 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                     Msg::Up { snapshot, messages } => {
                         if !was_up {
                             s.greeted = Some(crate::unix_millis() as i64);
+                            history.fill(&messages);
                         }
+                        // The names `/vault rm` and the like complete from.
+                        let _ = prompt_tx.send(Ask::VaultList);
                         s.link = Link::Up;
                         s.snapshot = *snapshot;
                         s.retry = None;
@@ -209,6 +217,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                     }
                     Msg::Event(ev) => event(&mut s, &mut view, &ev),
                     Msg::Models(list) => {
+                        s.models = list.clone();
                         if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Model) {
                             o.models = Some(list);
                             o.placed = false;
@@ -287,6 +296,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         }
                     }
                     Msg::Vault(list) => {
+                        s.vault = list.iter().map(|e| e.name.clone()).collect();
                         if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Vault) {
                             o.vault.entries = Some(list);
                             o.vault.problem = None;
@@ -346,7 +356,14 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                     }
                     Event::Mouse(_) => tui.clear_selection(),
                     Event::Paste(text) if state.lock().unwrap().overlay.is_none() => {
-                        editor.handle_paste(&text)
+                        match files::dragged(&text, &home, projects.as_deref()) {
+                            Some(Ok(reference)) => editor.insert(&reference),
+                            Some(Err(hint)) => {
+                                editor.handle_paste(&text);
+                                view.notice(&hint);
+                            }
+                            None => editor.handle_paste(&text),
+                        }
                     }
                     Event::Paste(text) => {
                         if let Some(o) = state.lock().unwrap().overlay.as_mut() {
@@ -390,6 +407,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                         close(&tui, &editor, &mut s);
                                         match kind {
                                             Kind::Model => send(&mut s, &prompt_tx, cmd),
+                                            Kind::History => recall(&editor, &cmd),
                                             _ => editor.set_text(&cmd),
                                         }
                                     }
@@ -419,9 +437,10 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                             } if completing && plain => {
                                 let c = s.complete.as_mut().expect("completing");
                                 let n = c.items.len();
-                                let insert = overlays::insert(overlays::COMMANDS[c.items[c.selected]].1);
-                                // Still typing the command name, not its arguments.
-                                let partial = insert.starts_with(&text) && insert != text;
+                                let choice = c.items[c.selected].clone();
+                                let before = before_cursor(&editor);
+                                // Something left to complete, not a command's arguments being typed.
+                                let partial = choice.insert != before;
                                 match key.code {
                                     KeyCode::Up => c.selected = (c.selected + n - 1) % n,
                                     KeyCode::Down => c.selected = (c.selected + 1) % n,
@@ -429,13 +448,15 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                         s.complete = None;
                                         dismissed = Some(text.clone());
                                     }
-                                    KeyCode::Tab if partial => editor.set_text(insert),
+                                    KeyCode::Tab if partial => take(&editor, &before, &choice.insert),
                                     KeyCode::Tab => {}
-                                    // Enter takes the choice, and runs it when it needs no argument.
-                                    _ if partial && insert.ends_with(' ') => editor.set_text(insert),
+                                    // Enter takes the choice, and runs it when it needs nothing more.
+                                    _ if partial && !choice.then_run => {
+                                        take(&editor, &before, &choice.insert)
+                                    }
                                     _ => {
                                         if partial {
-                                            editor.set_text(insert);
+                                            take(&editor, &before, &choice.insert);
                                         }
                                         drop(s);
                                         editor.handle_key(key);
@@ -455,6 +476,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                             }
                             k if ctrl(&k, 'c') => {
                                 if !empty {
+                                    history.cleared = Some(editor.get_expanded_text());
                                     editor.clear();
                                 } else if now - ctrl_c_at < DOUBLE_PRESS_MS {
                                     break Ok(());
@@ -497,6 +519,65 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                 let until = now + DOUBLE_PRESS_MS;
                                 s.hint = Some(("dropped the command output".into(), until));
                             }
+                            KeyEvent { code: KeyCode::Up, modifiers: KeyModifiers::NONE, .. }
+                                if editor.cursor_position().0 == 0 =>
+                            {
+                                match history.up(&editor.get_expanded_text()) {
+                                    Some(earlier) => recall(&editor, &earlier),
+                                    None => {
+                                        drop(s);
+                                        editor.handle_key(key);
+                                    }
+                                }
+                            }
+                            KeyEvent { code: KeyCode::Down, modifiers: KeyModifiers::NONE, .. }
+                                if editor.cursor_position().0 + 1 == editor.line_count() =>
+                            {
+                                match history.down(&editor.get_expanded_text()) {
+                                    Some(later) => recall(&editor, &later),
+                                    None => {
+                                        drop(s);
+                                        editor.handle_key(key);
+                                    }
+                                }
+                            }
+                            k if ctrl(&k, 'r') => {
+                                open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::History);
+                                if let Some(o) = s.overlay.as_mut() {
+                                    o.history = history.newest_first();
+                                }
+                            }
+                            KeyEvent { code: KeyCode::Char('s'), modifiers: KeyModifiers::ALT, .. } => {
+                                let said = match history.stash(&editor.get_expanded_text()) {
+                                    Some(back) if !back.is_empty() => {
+                                        recall(&editor, &back);
+                                        format!("{} more put aside", history.stashed())
+                                    }
+                                    Some(_) => {
+                                        editor.clear();
+                                        "put aside; alt+s on an empty box brings it back".into()
+                                    }
+                                    None => "nothing put aside".into(),
+                                };
+                                s.hint = Some((said, now + COPIED_MS));
+                            }
+                            k if ctrl(&k, 'g') => {
+                                drop(s);
+                                let edit = std::env::var("VISUAL")
+                                    .or_else(|_| std::env::var("EDITOR"))
+                                    .ok()
+                                    .filter(|e| !e.trim().is_empty())
+                                    .unwrap_or_else(|| "nano".into());
+                                let (home, draft, ed) = (home.clone(), editor.get_expanded_text(), edit.clone());
+                                let edited =
+                                    hand_over(&tui, &paused, &reading, move || shell::edit(&home, &ed, &draft)).await;
+                                match edited.map_err(std::io::Error::other).and_then(|r| r) {
+                                    Ok(Some(text)) => recall(&editor, &text),
+                                    Ok(None) => view.error(&format!("{edit} failed; the draft is as it was")),
+                                    Err(e) => view.error(&format!("{edit}: {e}")),
+                                }
+                                tui.request_render(true);
+                            }
                             KeyEvent { code: KeyCode::PageUp, modifiers: KeyModifiers::NONE, .. } => {
                                 tui.scroll_by(-page())
                             }
@@ -511,17 +592,29 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                     }
                     _ => {}
                 }
-                complete(&mut state.lock().unwrap(), &editor.get_text(), &mut dismissed);
+                let mut s = state.lock().unwrap();
+                complete(&mut s, &editor, view.codes(), &home, projects.as_deref(), &mut dismissed);
+                drop(s);
                 tui.request_render(false);
             }
             text = submits.recv() => {
                 let Some(text) = text else { break Ok(()) };
                 let mut s = state.lock().unwrap();
                 walk = None;
+                history.push(&text);
                 // These open a panel here instead of a reply card, or never leave the TUI.
                 match text.trim() {
                     "" => {}
                     "/quit" | "/exit" => break Ok(()),
+                    "/p" => view.reply(Some("/p"), &files::listing(&home)),
+                    // Into the composer, never sent: you read what a saved prompt says first.
+                    t if t.starts_with("/p ") => {
+                        let (name, args) = t[3..].trim_start().split_once(' ').unwrap_or((t[3..].trim(), ""));
+                        match files::prompt(&home, name, args) {
+                            Ok(text) => recall(&editor, &text),
+                            Err(e) => view.error(&e),
+                        }
+                    }
                     t if t == "/copy" || t.starts_with("/copy ") => match to_copy(&view, &t[5..]) {
                         Ok((text, what)) => copy(&tui, &mut s, &text, Some(&what)),
                         Err(e) => s.hint = Some((e, crate::unix_millis() as i64 + COPIED_MS)),
@@ -549,20 +642,8 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                     "/shell" | "/shell bash" | "/shell zsh" => {
                         drop(s);
                         let sh = if text.trim().ends_with("zsh") { "zsh" } else { "bash" };
-                        let (tui2, paused, reading, home) =
-                            (tui.clone(), paused.clone(), reading.clone(), cfg.home.clone());
-                        // Awaited, so nothing else here touches the screen until it is back.
-                        let ran = tokio::task::spawn_blocking(move || {
-                            paused.store(true, Ordering::Relaxed);
-                            let _turn = reading.lock().unwrap();
-                            tui2.suspend();
-                            let ran = shell::interactive(&home, sh);
-                            tui2.resume();
-                            paused.store(false, Ordering::Relaxed);
-                            ran
-                        })
-                        .await;
-                        tui.note_resize();
+                        let home = home.clone();
+                        let ran = hand_over(&tui, &paused, &reading, move || shell::interactive(&home, sh)).await;
                         match ran.map_err(std::io::Error::other).and_then(|r| r) {
                             Ok(_) => view.notice(&format!("back from {sh}")),
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -581,7 +662,10 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         }
                         // A `/` command is the gateway's, not a message: the output waits.
                         None if text.starts_with('/') => send(&mut s, &prompt_tx, text.to_string()),
-                        None => send(&mut s, &prompt_tx, shell::prefix(&std::mem::take(&mut held), text)),
+                        None => {
+                            let text = files::expand(text, &home, projects.as_deref());
+                            send(&mut s, &prompt_tx, shell::prefix(&std::mem::take(&mut held), &text))
+                        }
                     },
                 }
                 tui.request_render(false);
@@ -919,7 +1003,7 @@ fn open(
         Kind::Vault => {
             let _ = asks.send(Ask::VaultList);
         }
-        Kind::Status | Kind::Help => {}
+        Kind::Status | Kind::Help | Kind::History => {}
     }
     let margin = OverlayMargin {
         top: 2,
@@ -942,18 +1026,93 @@ fn close(tui: &TuiAltScreen, editor: &Editor, s: &mut State) {
     editor.set_focused(true);
 }
 
-/// Keeps slash autocomplete in step with the composer's text.
-fn complete(s: &mut State, text: &str, dismissed: &mut Option<String>) {
-    if s.overlay.is_some() || dismissed.as_deref() == Some(text) {
+/// Keeps autocomplete in step with the composer: a command still being named, else a command's
+/// argument, a saved prompt's name or an `@` file, else the usage of the command being typed.
+fn complete(
+    s: &mut State,
+    editor: &Editor,
+    codes: usize,
+    home: &std::path::Path,
+    projects: Option<&std::path::Path>,
+    dismissed: &mut Option<String>,
+) {
+    let text = editor.get_text();
+    if s.overlay.is_some() || dismissed.as_deref() == Some(text.as_str()) {
         s.complete = None;
         return;
     }
     *dismissed = None;
-    let items = overlays::matches(text);
+    let before = before_cursor(editor);
+    let slash = overlays::slash(&before);
+    let mut items = vec![];
+    if !slash.iter().any(|c| c.insert != before) {
+        items = overlays::args(&before, s, codes);
+        if items.is_empty() && before.starts_with("/p ") {
+            items = overlays::prompt_args(&before, &files::prompts(home));
+        }
+        if items.is_empty() {
+            items = files::complete(&before, home, projects);
+        }
+    }
+    if items.is_empty() {
+        items = slash;
+    }
     let selected = (s.complete.as_ref())
         .filter(|c| c.items == items)
         .map_or(0, |c| c.selected);
     s.complete = (!items.is_empty()).then_some(overlays::Complete { items, selected });
+}
+
+/// The composer's text up to the cursor (the editor's column is a byte offset).
+fn before_cursor(editor: &Editor) -> String {
+    let text = editor.get_text();
+    let (row, col) = editor.cursor_position();
+    let start: usize = text.split('\n').take(row).map(|l| l.len() + 1).sum();
+    text[..(start + col).min(text.len())].to_string()
+}
+
+/// Takes a completion: `before` becomes `insert` by editing only where they differ, so the text
+/// after the cursor, a folded paste and undo all stay.
+fn take(editor: &Editor, before: &str, insert: &str) {
+    let same = before
+        .chars()
+        .zip(insert.chars())
+        .take_while(|(a, b)| a == b);
+    let (chars, bytes) = same.fold((0, 0), |(n, b), (c, _)| (n + 1, b + c.len_utf8()));
+    for _ in chars..before.chars().count() {
+        editor.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    }
+    editor.insert(&insert[bytes..]);
+}
+
+/// Puts `text` in the composer with the cursor at its end.
+fn recall(editor: &Editor, text: &str) {
+    editor.set_text(text);
+    let last = text.rsplit('\n').next().unwrap_or_default();
+    editor.set_cursor(editor.line_count() - 1, last.len());
+}
+
+/// Hands the terminal to `run` (`/shell`, Ctrl+G) and takes it back: the input reader paused,
+/// the screen suspended. Awaited, so nothing else here touches the screen until it is back.
+async fn hand_over<T: Send + 'static>(
+    tui: &Arc<TuiAltScreen>,
+    paused: &Arc<AtomicBool>,
+    reading: &Arc<Mutex<()>>,
+    run: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    let (tui2, paused, reading) = (tui.clone(), paused.clone(), reading.clone());
+    let out = tokio::task::spawn_blocking(move || {
+        paused.store(true, Ordering::Relaxed);
+        let _turn = reading.lock().unwrap();
+        tui2.suspend();
+        let out = run();
+        tui2.resume();
+        paused.store(false, Ordering::Relaxed);
+        out
+    })
+    .await;
+    tui.note_resize();
+    out
 }
 
 fn ctrl(key: &KeyEvent, ch: char) -> bool {

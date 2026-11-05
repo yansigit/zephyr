@@ -1,7 +1,7 @@
 //! The screen around the transcript: header, run line, queue strip and footer. Each is a pure
 //! function of [`State`] and the clock, drawn by a [`Region`] component.
 
-use super::conn::Snapshot;
+use super::conn::{AccountModels, Snapshot};
 use super::overlays::{Complete, Kind, Overlay};
 use super::theme::{glyph, Palette};
 use rpi_tui::{bold, truncate_to_width, visible_width, Component};
@@ -47,6 +47,10 @@ pub struct State {
     /// one-shots play from them.
     pub greeted: Option<i64>,
     pub finished: Option<i64>,
+    /// The last `zephyr.models` answer, for completing `/model`.
+    pub models: Vec<AccountModels>,
+    /// The vault's entry names, for completing `/vault rm` and the like.
+    pub vault: Vec<String>,
 }
 
 impl Default for State {
@@ -62,6 +66,8 @@ impl Default for State {
             complete: None,
             greeted: None,
             finished: None,
+            models: vec![],
+            vault: vec![],
         }
     }
 }
@@ -621,7 +627,7 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
         (Some(o), _) => {
             let (choose, pick) = match o.kind {
                 Kind::Model => ("choose", Some("switch")),
-                Kind::Help => ("choose", Some("insert")),
+                Kind::Help | Kind::History => ("choose", Some("insert")),
                 Kind::Status => ("scroll", None),
                 // The vault panel names its own keys on its last row.
                 Kind::Vault => ("choose", None),
@@ -1192,7 +1198,7 @@ mod tests {
         );
         s.overlay = None;
         s.complete = Some(Complete {
-            items: vec![0],
+            items: super::super::overlays::slash("/new"),
             selected: 0,
         });
         let f = left(&s, 120);

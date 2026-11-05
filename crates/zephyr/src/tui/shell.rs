@@ -148,11 +148,38 @@ fn capture(mut cmd: Command, limit: Duration) -> std::io::Result<(String, String
 }
 
 /// An interactive `shell -l` as the agent on this terminal, until it exits. The caller has
-/// handed the terminal over (input reader paused, TUI suspended). Ctrl+C and Ctrl+\ in the
-/// shell reach the TUI too; it catches them with a handler that does nothing, rather than
-/// ignoring them, because an ignored signal stays ignored in the shell's children while a
-/// caught one goes back to the default at exec.
+/// handed the terminal over (input reader paused, TUI suspended).
 pub fn interactive(home: &Path, shell: &str) -> std::io::Result<std::process::ExitStatus> {
+    foreground(agent(home, shell, &["-l"]))
+}
+
+/// Ctrl+G: the draft in `editor` (`$VISUAL`, `$EDITOR`, a command line run by `sh`) as the agent,
+/// on this terminal, handed over as for [`interactive`]. The edited text, or `None` when the
+/// editor failed and the draft should stay. The file is the agent's and is gone afterwards.
+pub fn edit(home: &Path, editor: &str, draft: &str) -> std::io::Result<Option<String>> {
+    let dir = home.join(".cache");
+    let path = dir.join(format!("zephyr-edit-{}.md", std::process::id()));
+    {
+        let _fs = crate::agent::fs();
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(&path, draft)?;
+    }
+    let script = format!("{editor} \"$1\"");
+    let file = path.to_string_lossy();
+    let ran = foreground(agent(home, "sh", &["-c", &script, "sh", &file]));
+    let _fs = crate::agent::fs();
+    let edited = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    match ran?.success() {
+        true => Ok(Some(edited?.trim_end_matches('\n').to_string())),
+        false => Ok(None),
+    }
+}
+
+/// Runs `cmd` on the terminal until it exits. Ctrl+C and Ctrl+\ there reach the TUI too; it
+/// catches them with a handler that does nothing, rather than ignoring them, because an ignored
+/// signal stays ignored in the children while a caught one goes back to the default at exec.
+fn foreground(mut cmd: Command) -> std::io::Result<std::process::ExitStatus> {
     extern "C" fn nothing(_: libc::c_int) {}
     let handler = nothing as extern "C" fn(libc::c_int) as libc::sighandler_t;
     // SAFETY: installs a handler that touches nothing; the old ones are put back below.
@@ -162,7 +189,7 @@ pub fn interactive(home: &Path, shell: &str) -> std::io::Result<std::process::Ex
             libc::signal(libc::SIGQUIT, handler),
         ]
     };
-    let ran = agent(home, shell, &["-l"]).status();
+    let ran = cmd.status();
     unsafe {
         libc::signal(libc::SIGINT, old[0]);
         libc::signal(libc::SIGQUIT, old[1]);
@@ -246,6 +273,22 @@ mod tests {
             r.output.len()
         );
         assert_eq!(r.output.len(), CAP + "\n[output truncated at 50 KB]".len());
+    }
+
+    #[test]
+    fn ctrl_g_edits_the_draft_in_the_editor_and_a_failed_editor_keeps_it() {
+        let home = crate::test_dir("shell-edit");
+        let script = home.join("ed.sh");
+        std::fs::write(&script, "printf ' and more\\n' >> \"$1\"\n").unwrap();
+        let editor = format!("sh {}", script.display());
+        assert_eq!(
+            edit(&home, &editor, "the draft").unwrap().as_deref(),
+            Some("the draft and more")
+        );
+        assert_eq!(edit(&home, "false", "kept").unwrap(), None);
+        // The file goes either way.
+        let left = std::fs::read_dir(home.join(".cache")).unwrap().count();
+        assert_eq!(left, 0);
     }
 
     #[test]

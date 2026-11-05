@@ -16,9 +16,9 @@
  │    !<command>                  run it; the next message carries its output │
  │    /copy                       copy the last reply                         │
  │    /copy <n>                   copy code block n, or click it              │
+ │    /p                          your saved prompts, /zephyr/prompts/*.md    │
+ │    /p <name> [args]            put a saved prompt in the box, to send      │
  │    /help                       this list                                   │
  │    /quit                       leave (or /exit); zephyr keeps running      │
- │ Agent                                                                      │
- │    /stop                       stop the current reply and every task       │
- ╰─────────────────────────────────────────────────────────────── 1-16 of 59 ─╯
+ ╰─────────────────────────────────────────────────────────────── 1-16 of 67 ─╯
   ↑↓ choose · ⏎ insert · type to filter · esc close
