@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-const RPI: &str = "/home/user/Projects/.always-on/rpi-0.15.0/bin/rpi";
+const RPI: &str = "/home/user/Projects/.always-on/rpi-0.18.0/bin/rpi";
 
 fn sse(event: &str, data: Value) -> String {
     format!("event: {event}\ndata: {data}\n\n")

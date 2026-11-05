@@ -16,7 +16,7 @@ cargo test -p zephyr --test router            # one integration test file
 cargo test -p zephyr --test router some_name  # one test by name filter
 cargo clippy --all-targets && cargo fmt
 
-# Ignored tests need the pinned real binary at /home/user/Projects/.always-on/rpi-0.15.0/bin/rpi
+# Ignored tests need the pinned real binary at /home/user/Projects/.always-on/rpi-0.18.0/bin/rpi
 cargo test -p zephyr --test real_rpi -- --ignored
 cargo test -p zephyr-policy --test rpi_load -- --ignored
 cargo test -p zephyr --test attach -- --ignored   # drives real `rpi --connect` via tests/drive-connect.py

@@ -787,7 +787,7 @@ fn token_file_must_be_private() {
 #[tokio::test]
 #[ignore = "drives the real rpi 0.15.0 --connect client"]
 async fn stock_rpi_connect_attaches_chats_and_detaches() {
-    let rpi = Path::new("/home/user/Projects/.always-on/rpi-0.15.0/bin/rpi");
+    let rpi = Path::new("/home/user/Projects/.always-on/rpi-0.18.0/bin/rpi");
     if !rpi.exists() {
         eprintln!("skipped: {} is absent", rpi.display());
         return;
