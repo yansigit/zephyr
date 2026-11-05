@@ -98,6 +98,37 @@ pub struct VaultEntry {
     pub programs: Vec<String>,
 }
 
+impl VaultEntry {
+    /// The card shown once the owner saves this entry: what was saved and what it may do, never
+    /// a value. `updated`: the name was already in the vault, so the agent was not told.
+    pub fn saved(&self, updated: bool) -> String {
+        let verb = if updated { "updated" } else { "saved" };
+        let mut rows = vec![format!("{verb} the {} {}", self.kind, self.name)];
+        if self.kind == "login" {
+            rows.push(format!("site  {}", self.site));
+            if !self.username.is_empty() {
+                rows.push(format!("user  {}", self.username));
+            }
+            if self.totp {
+                rows.push("code  one-time codes from the saved seed".into());
+            }
+            rows.push(match self.granted {
+                true => "fill  allowed".into(),
+                false => "fill  the first one waits for your OK".into(),
+            });
+        } else {
+            rows.push(match self.programs.as_slice() {
+                [] => "use   each program needs your OK once".into(),
+                p => format!("use   allowed for {}", p.join(", ")),
+            });
+        }
+        if !updated {
+            rows.push("the agent was told it can use it now".into());
+        }
+        rows.join("\n")
+    }
+}
+
 /// A saved main session as `zephyr.sessions` lists it, newest first.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
@@ -1050,5 +1081,33 @@ mod tests {
         let (_ptx, prx) = mpsc::unbounded_channel();
         run(addr, "wrong".into(), tx, prx).await;
         assert!(matches!(rx.recv().await, Some(Msg::Fatal(e)) if e.contains("token was refused")));
+    }
+
+    #[test]
+    fn a_saved_vault_entry_card_says_what_it_may_do() {
+        let login = VaultEntry {
+            kind: "login".into(),
+            name: "github".into(),
+            site: "https://github.com".into(),
+            username: "me".into(),
+            totp: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            login.saved(false),
+            "saved the login github\nsite  https://github.com\nuser  me\n\
+             code  one-time codes from the saved seed\nfill  the first one waits for your OK\n\
+             the agent was told it can use it now"
+        );
+        let token = VaultEntry {
+            kind: "token".into(),
+            name: "GH_TOKEN".into(),
+            programs: vec!["gh".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            token.saved(true),
+            "updated the token GH_TOKEN\nuse   allowed for gh"
+        );
     }
 }

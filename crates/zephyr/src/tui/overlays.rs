@@ -16,7 +16,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     (
         "Chat",
         "/new",
-        "start a fresh conversation; memory and rules carry over",
+        "start a fresh conversation (or /clear); memory and rules carry over",
     ),
     ("Chat", "/switch", "list earlier conversations"),
     ("Chat", "/switch <id>", "go back to one"),

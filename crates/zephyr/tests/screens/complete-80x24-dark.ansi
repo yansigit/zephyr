@@ -12,8 +12,8 @@
    [38;2;92;102;117m│[39m [38;2;216;222;233mtoday: 41.2k tokens, $0.38 of $5[39m
 
  [38;2;138;148;166m≋ ready[39m
- [38;2;94;200;229m›[39m [1m[38;2;216;222;233m/new           [0m  [38;2;138;148;166mstart a fresh conversation; memory and rules carry over[39m
-   [38;2;216;222;233m/switch        [39m  [38;2;138;148;166mlist earlier conversations[39m
+ [38;2;94;200;229m›[39m [1m[38;2;216;222;233m/new           [0m  [38;2;138;148;166mstart a fresh conversation (or /clear); memory and rules ca…
+[39m   [38;2;216;222;233m/switch        [39m  [38;2;138;148;166mlist earlier conversations[39m
    [38;2;216;222;233m/switch <id>   [39m  [38;2;138;148;166mgo back to one[39m
    [38;2;216;222;233m/btw <question>[39m  [38;2;138;148;166mask a side question; the conversation is left as is[39m
    [38;2;216;222;233m/undo          [39m  [38;2;138;148;166mtake back your last message and its reply[39m
