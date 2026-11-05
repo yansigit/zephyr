@@ -5,7 +5,7 @@
 //! runs the tool itself; and the second turn replays the assistant's call and the tool result as
 //! history blobs, which the service can read back.
 //!
-//! Ignored, like zephyr's other real-binary tests: it needs `rpi` 0.15 at the pinned path (or
+//! Ignored, like zephyr's other real-binary tests: it needs `rpi` 0.18 at the pinned path (or
 //! `RPI_BIN`). No network: the service is a loopback HTTP/2 listener.
 //!
 //! ```sh

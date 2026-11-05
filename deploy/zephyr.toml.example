@@ -1,5 +1,5 @@
 # ~/.zephyr/zephyr.toml, seen as /zephyr/zephyr.toml in the container (`zephyr init` writes it; edit with `zephyr config set`)
-rpi = "/usr/local/bin/rpi"   # pinned rpi 0.15.x; check with `zephyr doctor`
+rpi = "/usr/local/bin/rpi"   # pinned rpi 0.18.x; check with `zephyr doctor`
 home = "/zephyr"                      # state.db, sessions/, zephyr.sock; the child's cwd
 agent_dir = "/zephyr/.rpi/agent"      # RPI_CODING_AGENT_DIR: models.json and credentials
 model = "anthropic/claude-sonnet-5"

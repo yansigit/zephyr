@@ -44,7 +44,7 @@ fn factory(_: &Model, _: &SimpleStreamOptions) -> Arc<dyn Provider> {
     Arc::new(provider::Cursor)
 }
 
-/// Declares this crate's catalog: rpi 0.15 takes each provider's models from the manifest
+/// Declares this crate's catalog: rpi 0.18 takes each provider's models from the manifest
 /// (`ProviderManifest { id, models, apiKeyEnv, requiresAuth }`, `deny_unknown_fields`, and every
 /// model's `provider` must equal `id`), and serves them with the streaming fn registered beside it.
 fn manifest() -> serde_json::Value {
