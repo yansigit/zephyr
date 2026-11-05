@@ -3,7 +3,7 @@
 //! the keys here while one is open.
 
 use super::chrome::{short_model, spend, State};
-use super::conn::{AccountModels, Login, LoginStatus, Provider, Snapshot, VaultEntry};
+use super::conn::{AccountModels, Login, LoginStatus, Provider, Snapshot, Turn, VaultEntry};
 use super::theme::{glyph, Palette};
 use super::view::clean;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -27,10 +27,22 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ),
     ("Chat", "/undo", "take back your last message and its reply"),
     ("Chat", "/retry", "take it back and send it again"),
+    ("Chat", "/undo <n>", "take back your last n, up to 20"),
     (
         "Chat",
         "/compact [instructions]",
         "summarise the conversation to free context",
+    ),
+    ("Chat", "/rename <name>", "name this conversation"),
+    (
+        "Chat",
+        "/fork",
+        "carry on in a copy; the original stays as is",
+    ),
+    (
+        "Chat",
+        "/export",
+        "save it as markdown in the projects folder",
     ),
     (
         "Chat",
@@ -216,6 +228,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "double-click",
         "copy the word; triple-click the row",
     ),
+    (
+        "Keys",
+        "Esc Esc",
+        "rewind: pick a message to take back and edit",
+    ),
 ];
 
 /// What goes in the composer for a command: up to its first argument.
@@ -234,6 +251,8 @@ pub enum Kind {
     Vault,
     /// Ctrl+R: what you sent, to put back in the composer.
     History,
+    /// Esc Esc: the exchanges `/undo N` counts, newest first; picking one takes it back.
+    Rewind,
 }
 
 /// `Kind::Vault`'s own state.
@@ -489,6 +508,8 @@ pub struct Overlay {
     pub vault: VaultPanel,
     /// `Kind::History`: what you sent, newest first.
     pub history: Vec<String>,
+    /// The `zephyr.turns` answer for the rewind picker, once it came.
+    pub turns: Option<Vec<Turn>>,
     /// The first row shown and how many fit, from the last frame.
     top: usize,
     page: usize,
@@ -505,6 +526,7 @@ impl Overlay {
             login: SignIn::default(),
             vault: VaultPanel::default(),
             history: vec![],
+            turns: None,
             top: 0,
             page: 1,
         }
@@ -564,6 +586,7 @@ pub fn rows(
         Kind::Help => help_groups(),
         Kind::History => return history_rows(o, p),
         Kind::Model => model_groups(o, snap, tz, now),
+        Kind::Rewind => rewind_groups(o),
     };
     let words: Vec<String> = o.query.split_whitespace().map(str::to_lowercase).collect();
     let mut out = vec![];
@@ -586,8 +609,15 @@ pub fn rows(
             out.extend(hit);
         }
     }
-    if out.is_empty() {
-        out.push(Row::Line(p.muted.fg("nothing matches")));
+    match (o.kind, &o.turns) {
+        (Kind::Rewind, None) => out.push(Row::Line(
+            p.muted.fg(&format!("listing your messages{}", glyph("…"))),
+        )),
+        (Kind::Rewind, Some(t)) if t.is_empty() => {
+            out.push(Row::Line(p.muted.fg("nothing to undo")))
+        }
+        _ if out.is_empty() => out.push(Row::Line(p.muted.fg("nothing matches"))),
+        _ => {}
     }
     if o.kind == Kind::Model && o.models.is_none() {
         out.push(Row::Line(
@@ -595,6 +625,29 @@ pub fn rows(
         ));
     }
     out
+}
+
+/// Each exchange, newest first: picking the k-th sends `/undo k`.
+fn rewind_groups(o: &Overlay) -> Vec<Group> {
+    let items = (o.turns.iter().flatten().enumerate())
+        .map(|(i, t)| Row::Item {
+            pick: format!("/undo {}", i + 1),
+            label: t.text.split_whitespace().collect::<Vec<_>>().join(" "),
+            note: match t.channel.as_str() {
+                crate::attach::CHANNEL => "you".into(),
+                channel => channel.into(),
+            },
+            current: false,
+        })
+        .collect();
+    let note = "takes it and everything after back; files stay changed (see /rollback)";
+    vec![("rewind to before".into(), note.into(), items)]
+}
+
+/// The message a rewind pick (`/undo k`) takes back, for the composer.
+pub fn rewound(o: &Overlay, pick: &str) -> Option<String> {
+    let k: usize = pick.strip_prefix("/undo ")?.parse().ok()?;
+    Some(o.turns.as_ref()?.get(k.checked_sub(1)?)?.text.clone())
 }
 
 type Group = (String, String, Vec<Row>);
@@ -1260,7 +1313,7 @@ fn lists(o: &Overlay) -> bool {
     match o.kind {
         Kind::Status | Kind::Vault => false,
         Kind::Login => o.login.running().is_none(),
-        Kind::Model | Kind::Help | Kind::History => true,
+        Kind::Model | Kind::Help | Kind::History | Kind::Rewind => true,
     }
 }
 
@@ -1339,6 +1392,7 @@ pub fn render(
         Kind::History => " history ",
         Kind::Login => " sign in ",
         Kind::Vault => " vault ",
+        Kind::Rewind => " rewind ",
     };
     let fill = width.saturating_sub(visible_width(title) + 3);
     let mut lines = vec![format!(
@@ -1531,14 +1585,19 @@ pub fn args(text: &str, s: &State, codes: usize) -> Vec<Choice> {
         "/vault rm" | "/vault edit" | "/vault revoke" => {
             s.vault.iter().map(|n| (n.clone(), String::new())).collect()
         }
-        // "/switch" goes here: its sessions, once the `zephyr.sessions` attach method lists them.
+        "/switch" => (s.sessions.iter())
+            .map(|x| (x.id.clone(), x.name.clone().unwrap_or_default()))
+            .collect(),
         _ => return vec![],
     };
     let mut seen = std::collections::HashSet::new();
     options.retain(|(value, _)| seen.insert(value.clone()));
     let partial = partial.to_lowercase();
     (options.into_iter())
-        .filter(|(value, _)| value.to_lowercase().contains(&partial))
+        // A `/rename` name or a job's finds its id too.
+        .filter(|(value, detail)| {
+            value.to_lowercase().contains(&partial) || detail.to_lowercase().contains(&partial)
+        })
         .map(|(value, detail)| Choice {
             insert: format!("{head} {value}"),
             label: value,
@@ -1752,17 +1811,17 @@ mod tests {
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(got.len(), 8);
         assert_eq!(got[2], format!("│ Chat{}│", " ".repeat(73)));
-        assert!(got[7].ends_with(" 1-5 of 78 ─╯"), "{got:?}");
-        for _ in 0..30 {
+        assert!(got[7].ends_with(" 1-5 of 83 ─╯"), "{got:?}");
+        for _ in 0..34 {
             key(&mut o, press(KeyCode::Down), &rows);
         }
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
-        // The thirty-first command is /memory ok; the window follows it down.
+        // The thirty-fifth command is /memory ok; the window follows it down.
         assert_eq!(
             got[6],
             "│  › /memory ok                  let the agent see the waiting change          │"
         );
-        assert!(got[7].ends_with(" 30-34 of 78 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 34-38 of 83 ─╯"), "{got:?}");
         key(&mut o, press(KeyCode::Down), &rows);
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),
@@ -1773,7 +1832,7 @@ mod tests {
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(
             got[6],
-            "│  › double-click                copy the word; triple-click the row           │"
+            "│  › Esc Esc                     rewind: pick a message to take back and edit  │"
         );
         // A key is not something to put in the composer.
         assert_eq!(
@@ -1815,6 +1874,46 @@ mod tests {
     }
 
     /// The memory, skill, connector and job commands in the list are the ones those modules answer.
+    #[test]
+    fn the_rewind_picker_lists_turns_newest_first_and_picks_undo_k() {
+        let s = Snapshot::default();
+        let mut o = Overlay::new(Kind::Rewind);
+        assert!(draw(&mut o, &s, 80, 12)[2].contains("listing your messages"));
+        o.turns = Some(vec![
+            Turn {
+                channel: "tui".into(),
+                text: "second\nline".into(),
+            },
+            Turn {
+                channel: "discord".into(),
+                text: "first".into(),
+            },
+        ]);
+        let got = draw(&mut o, &s, 60, 12);
+        assert_eq!(
+            got[0],
+            "╭─ rewind ─────────────────────────────────────────────────╮"
+        );
+        assert!(got[2].starts_with("│ rewind to before  takes it and everything after back;"));
+        assert_eq!(
+            got[3],
+            "│  › second line  you                                      │"
+        );
+        assert_eq!(
+            got[4],
+            "│    first        discord                                  │"
+        );
+        assert_eq!(hit(&mut o, &s, KeyCode::Down), Action::None);
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Enter),
+            Action::Pick("/undo 2".into())
+        );
+        assert_eq!(rewound(&o, "/undo 2").as_deref(), Some("first"));
+        assert_eq!(rewound(&o, "/undo 3"), None);
+        o.turns = Some(vec![]);
+        assert!(draw(&mut o, &s, 60, 12)[2].contains("nothing to undo"));
+    }
+
     #[test]
     fn listed_commands_are_the_ones_zephyr_answers() {
         let dir = crate::test_dir("tui-commands");
@@ -2058,6 +2157,27 @@ mod tests {
         assert_eq!(names, ["github", "gitlab"]);
         assert_eq!(got("/vault revoke npm", &s).len(), 1);
         assert!(args("/vault revoke npm x", &s, 3).is_empty());
+        s.sessions = vec![
+            super::super::conn::SessionInfo {
+                id: "main".into(),
+                name: None,
+                at: 1,
+            },
+            super::super::conn::SessionInfo {
+                id: "main-9".into(),
+                name: Some("taxes".into()),
+                at: 2,
+            },
+        ];
+        assert_eq!(
+            got("/switch main-", &s),
+            [one("main-9", "taxes", "/switch main-9")]
+        );
+        // A `/rename` name finds its session.
+        assert_eq!(
+            got("/switch tax", &s),
+            [one("main-9", "taxes", "/switch main-9")]
+        );
         assert!(args("/rule x", &s, 3).is_empty() && args("/model", &s, 3).is_empty());
         assert!(args("/model a\nb", &s, 3).is_empty());
         assert!(args("/copy 1", &s, 3).iter().all(|c| c.then_run));

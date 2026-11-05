@@ -62,6 +62,9 @@ pub struct State {
     pub focus: bool,
     /// An approval or proposal is waiting for the owner's OK: the window title says so.
     pub asking: bool,
+    /// The saved main sessions (`zephyr.sessions`), asked for on connect and after each
+    /// `/rename`, `/fork`, `/switch` and `/new` reply.
+    pub sessions: Vec<super::conn::SessionInfo>,
 }
 
 /// Ctrl+F over the transcript's rows as drawn.
@@ -148,6 +151,7 @@ impl Default for State {
             search: None,
             focus: false,
             asking: false,
+            sessions: vec![],
         }
     }
 }
@@ -711,6 +715,7 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
             let (choose, pick) = match o.kind {
                 Kind::Model => ("choose", Some("switch")),
                 Kind::Help | Kind::History => ("choose", Some("insert")),
+                Kind::Rewind => ("choose", Some("undo")),
                 Kind::Status => ("scroll", None),
                 // The vault panel names its own keys on its last row.
                 Kind::Vault => ("choose", None),

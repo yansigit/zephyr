@@ -59,6 +59,22 @@ pub fn untag(text: &str) -> Option<(&str, i64, &str)> {
     Some((channel, id.parse().ok()?, body))
 }
 
+/// Where each exchange `/undo N` counts starts in `messages` (`get_messages`), oldest first: a
+/// tagged user message, unless it follows a tool result (steered into the run, so part of its
+/// exchange) or repeats an earlier row (a continuation). The TUI's rewind picker lists the same.
+pub fn turns(messages: &[Value]) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::new();
+    (0..messages.len())
+        .filter(|&i| {
+            let m = &messages[i];
+            let steered = i > 0 && matches!(messages[i - 1]["kind"].as_str(), Some("toolResult"));
+            m["kind"] == "user"
+                && !steered
+                && untag(&message_text(m)).is_some_and(|(_, id, _)| seen.insert(id))
+        })
+        .collect()
+}
+
 /// What attached clients see of the daemon: `zephyr.hello` and `zephyr_status` (DESIGN §4.3.1).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -174,6 +190,41 @@ pub(crate) fn preview(text: &str) -> String {
         Some((i, _)) => format!("{}…", &flat[..i]),
         None => flat,
     }
+}
+
+/// `/export`'s markdown of `get_messages`: each user and assistant message's text under who
+/// said it, and a tool call as one line, its name and arguments.
+fn markdown(session: &str, messages: &[Value]) -> String {
+    let mut out = format!("# zephyr conversation {session}\n");
+    for m in messages {
+        match m["kind"].as_str() {
+            Some("user") => {
+                let text = message_text(m);
+                let (who, body) =
+                    untag(&text).map_or(("zephyr", text.as_str()), |(c, _, b)| (c, b));
+                out.push_str(&format!("\n## {who}\n\n{body}\n"));
+            }
+            Some("assistant") => {
+                let mut said = String::new();
+                for b in m["content"].as_array().into_iter().flatten() {
+                    match (b["type"].as_str(), b["text"].as_str()) {
+                        (Some("text"), Some(text)) => said.push_str(&format!("\n{text}\n")),
+                        (Some("toolCall"), _) => said.push_str(&format!(
+                            "\n- `{}` {}\n",
+                            b["name"].as_str().unwrap_or("tool"),
+                            preview(&b["arguments"].to_string())
+                        )),
+                        _ => {}
+                    }
+                }
+                if !said.is_empty() {
+                    out.push_str(&format!("\n## agent\n{said}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// How long a reply may be retried: only as long as the platform still dedupes the client id.
@@ -770,7 +821,11 @@ impl<'a> Router<'a> {
             // connected; add `reconnecting` once they do.
             Ok(Snapshot {
                 version: env!("CARGO_PKG_VERSION").into(),
-                session: MAIN_SESSION.into(),
+                // Its `/rename` name, which the TUI's header shows.
+                session: {
+                    let id = self.store.main_session()?;
+                    self.store.session_names()?.remove(&id).unwrap_or(id)
+                },
                 account: self.account.as_ref().map(|a| a.name.clone()),
                 model: (self.account.as_ref().map(|a| a.model.clone()))
                     .or_else(|| self.cfg.model.clone()),
@@ -1301,12 +1356,24 @@ impl<'a> Router<'a> {
                 Some(Ok(id)) => crate::tasks::stop(&mut self.store, self.jobs, Some(id)),
                 _ => "[zephyr] usage: /task list, /task stop <id>".into(),
             },
-            ("/undo", "") => match self.undo_last().await {
-                Ok(_) => "[zephyr] undone: the agent no longer sees your last message or its \
-                          reply; files it changed stay changed (see /rollback)"
-                    .into(),
-                Err(reply) => reply,
+            ("/undo", n) => match if n.is_empty() { Ok(1) } else { n.parse() } {
+                Ok(n @ 1..=20) => match self.undo(n).await {
+                    Ok(_) if n == 1 => "[zephyr] undone: the agent no longer sees your last \
+                                        message or its reply; files it changed stay changed \
+                                        (see /rollback)"
+                        .into(),
+                    Ok(_) => format!(
+                        "[zephyr] undone: the agent no longer sees your last {n} messages or \
+                         their replies; files it changed stay changed (see /rollback)"
+                    ),
+                    Err(reply) => reply,
+                },
+                _ => "[zephyr] usage: /undo [n], 1 to 20 (default 1)".into(),
             },
+            ("/rename", "") => "[zephyr] usage: /rename <name>".into(),
+            ("/rename", name) => self.rename(name),
+            ("/fork", "") => self.fork().await,
+            ("/export", "") => self.export().await,
             ("/retry", "") => self.retry().await,
             ("/compact", instructions) => self.compact(instructions, from).await,
             ("/usage", days) => self.usage(days),
@@ -1694,19 +1761,98 @@ impl<'a> Router<'a> {
         Ok(when)
     }
 
-    /// `/switch`: the saved conversations, newest first, the current one marked.
+    /// `/switch`: the saved conversations, newest first, the current one marked, each with its
+    /// `/rename` name and its first message's opening words.
     fn list_sessions(&self) -> String {
         let current = self.store.main_session().unwrap_or_default();
+        let names = self.store.session_names().unwrap_or_default();
+        let dir = self.cfg.session_dir();
         let mut lines = vec!["[zephyr] conversations (/switch <id> goes back):".to_string()];
-        for (id, at) in crate::rpc::saved_sessions(&self.cfg.session_dir())
-            .into_iter()
-            .take(10)
-        {
+        for (id, at) in crate::rpc::saved_sessions(&dir).into_iter().take(10) {
             let mark = if id == current { "*" } else { " " };
-            let now = if id == current { "  (current)" } else { "" };
-            lines.push(format!("{mark} {id}  {}{now}", crate::pool::iso(at)));
+            let mut line = format!("{mark} {id}  {}", crate::pool::iso(at));
+            if let Some(name) = names.get(&id) {
+                line.push_str(&format!("  \"{name}\""));
+            }
+            if let Some(words) = crate::rpc::opening(&dir, &id) {
+                line.push_str(&format!("  {words}"));
+            }
+            if id == current {
+                line.push_str("  (current)");
+            }
+            lines.push(line);
         }
         lines.join("\n")
+    }
+
+    /// `/rename <name>`: names the current conversation, for `/switch` and the TUI's header.
+    fn rename(&self, name: &str) -> String {
+        let name: String = name.chars().filter(|c| !c.is_control()).take(60).collect();
+        let named = (self.store.main_session())
+            .and_then(|id| self.store.set_session_name(&id, &name).map(|()| id));
+        match named {
+            Ok(id) => format!("[zephyr] {id} is now called \"{name}\""),
+            Err(e) => format!("[zephyr] /rename failed: {e}"),
+        }
+    }
+
+    /// `/fork`, idle only: copies the conversation as it stands (`rpc::copy_session`) to a new
+    /// `main-<secs>` and carries on in the copy, as `/switch` would; the original stays as it was.
+    async fn fork(&mut self) -> String {
+        if self.busy {
+            return BUSY.into();
+        }
+        let from = match self.store.main_session() {
+            Ok(id) => id,
+            Err(e) => return format!("[zephyr] /fork failed: {e}"),
+        };
+        let dir = self.cfg.session_dir();
+        let saved = crate::rpc::saved_sessions(&dir);
+        let to = (crate::now()..)
+            .map(|t| format!("{MAIN_SESSION}-{t}"))
+            .find(|id| !saved.iter().any(|(s, _)| s == id))
+            .expect("an unused second");
+        if let Err(e) = crate::rpc::copy_session(&dir, &from, &to) {
+            return format!("[zephyr] /fork failed: {e:#}");
+        }
+        match self.switch_main(&to).await {
+            Ok(_) => format!(
+                "[zephyr] forked {from} into {to}, where you are now; /switch {from} goes back"
+            ),
+            Err(e) => format!("[zephyr] forked {from} into {to}, but could not switch to it: {e}"),
+        }
+    }
+
+    /// `/export`: the conversation as markdown (`markdown`) in the projects folder, written as
+    /// the agent (`agent::fs`), so the file is the owner's on the host.
+    async fn export(&mut self) -> String {
+        let Some(projects) = self.cfg.projects.clone() else {
+            return "[zephyr] /export writes to the projects folder, and this container was \
+                    started without ZEPHYR_PROJECTS; recreate it with `zephyr up`"
+                .into();
+        };
+        let snap = match self.call(json!({"type": "get_messages"})).await {
+            Ok(snap) => snap,
+            Err(e) => return format!("[zephyr] /export failed: {e:#}"),
+        };
+        let messages = snap["messages"].as_array().map_or(&[][..], Vec::as_slice);
+        let session = self
+            .store
+            .main_session()
+            .unwrap_or_else(|_| MAIN_SESSION.into());
+        let tz = crate::scheduler::zone(&self.cfg).unwrap_or(jiff::tz::TimeZone::UTC);
+        let stamp = jiff::Timestamp::now().to_zoned(tz).strftime("%Y%m%d-%H%M");
+        let dir = projects.join("zephyr-exports");
+        let path = dir.join(format!("{session}-{stamp}.md"));
+        let written = {
+            let _fs = crate::agent::fs();
+            let text = markdown(&session, messages);
+            std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, text))
+        };
+        match written {
+            Ok(()) => format!("[zephyr] exported to {}", path.display()),
+            Err(e) => format!("[zephyr] /export failed: {e}"),
+        }
     }
 
     /// `/switch <id>`: back to a conversation `/new` left on disk. Only ids found there, since
@@ -2235,33 +2381,33 @@ impl<'a> Router<'a> {
         }
     }
 
-    /// `/undo` (DESIGN §4.1), idle only: takes the last exchange out of the agent's context.
-    /// rpi's `navigate` puts the session leaf on its target, which stays, so the target is the
-    /// entry just before the run's own message (none: the root, an empty context). The run's
-    /// rows become `undone`, so recovery never sends them again. Returns the run's own row, or
-    /// the reply saying why nothing was undone.
-    async fn undo_last(&mut self) -> Result<InboxRow, String> {
+    /// `/undo [n]` (DESIGN §4.1), idle only: takes the last `n` exchanges (`turns`) out of the
+    /// agent's context. rpi's `navigate` puts the session leaf on its target, which stays, so the
+    /// target is the entry just before the oldest one's message (none: the root, an empty
+    /// context). Every row in what was cut becomes `undone`, so recovery never sends it again.
+    /// Returns that oldest exchange's row, or the reply saying why nothing was undone.
+    async fn undo(&mut self, n: usize) -> Result<InboxRow, String> {
         if self.busy {
             return Err(BUSY.into());
         }
         let failed = |e: &dyn std::fmt::Display| format!("[zephyr] /undo failed: {e:#}");
-        let row = match self.store.last_run() {
-            Ok(Some(row)) => row,
-            Ok(None) => return Err("[zephyr] nothing to undo".into()),
-            Err(e) => return Err(failed(&e)),
-        };
         let snap = (self.call(json!({"type": "get_messages"})).await).map_err(|e| failed(&e))?;
         let messages = snap["messages"].as_array().map_or(&[][..], Vec::as_slice);
-        // Its first form: a continuation goes again under the same row, after it.
-        let text = tagged(&row);
-        let Some(at) =
-            (messages.iter()).rposition(|m| m["kind"] == "user" && message_text(m) == text)
-        else {
-            return Err(
-                "[zephyr] nothing to undo: your last message is no longer in the \
-                        conversation (a /compact or /new since?)"
-                    .into(),
-            );
+        let turns = turns(messages);
+        let Some(&at) = turns.len().checked_sub(n).map(|i| &turns[i]) else {
+            return Err(match turns.len() {
+                0 => "[zephyr] nothing to undo".into(),
+                k => format!("[zephyr] only {k} of your messages to undo"),
+            });
+        };
+        let rows: Vec<i64> = (messages[at..].iter())
+            .filter(|m| m["kind"] == "user")
+            .filter_map(|m| untag(&message_text(m)).map(|(_, id, _)| id))
+            .collect();
+        let row = match self.store.inbox_row(rows[0]) {
+            Ok(Some(row)) => row,
+            Ok(None) => return Err(failed(&format!("no inbox row #{}", rows[0]))),
+            Err(e) => return Err(failed(&e)),
         };
         let mut navigate = json!({"type": "navigate"});
         if let Some(id) = messages[..at]
@@ -2275,14 +2421,16 @@ impl<'a> Router<'a> {
         if moved["outcome"] != "completed" {
             return Err(failed(&format!("rpi answered {moved}")));
         }
-        self.store.mark_undone(row.id).map_err(|e| failed(&e))?;
+        for id in rows {
+            self.store.mark_undone(id).map_err(|e| failed(&e))?;
+        }
         Ok(row)
     }
 
     /// `/retry`: `/undo`, then the same text again as a new row on the same channel and sender,
     /// platform id `retry-<row>-<n>`, dispatched like any message.
     async fn retry(&mut self) -> String {
-        let row = match self.undo_last().await {
+        let row = match self.undo(1).await {
             Ok(row) => row,
             Err(reply) => return reply,
         };
@@ -2562,6 +2710,30 @@ mod tests {
         assert_eq!(rx.borrow_and_update().run.tools_done, 1);
         assert!(!update(&tx, |s| s.run.tools_done = 1));
         assert!(!rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn turns_skip_steers_continuations_and_untagged_notes() {
+        let user = |text: &str| json!({"kind": "user", "content": text});
+        let messages = [
+            user("[chat #1] one"),
+            json!({"kind": "assistant", "content": [{"type": "toolCall", "name": "bash"}]}),
+            json!({"kind": "toolResult", "content": "ok"}),
+            user("[tui #2] steered in"),
+            json!({"kind": "assistant", "content": [{"type": "text", "text": "done"}]}),
+            user("[chat #1] one\n\n(The work on this request stopped ...)"),
+            user(crate::scheduler::RESUME_NOTE),
+            user("[discord #3] two"),
+        ];
+        assert_eq!(turns(&messages), [0, 7]);
+        let md = markdown("main", &messages);
+        assert!(
+            md.starts_with("# zephyr conversation main\n\n## chat\n\none\n"),
+            "{md}"
+        );
+        assert!(md.contains("\n## agent\n\n- `bash` null\n"), "{md}");
+        assert!(md.contains("\n## tui\n\nsteered in\n\n## agent\n"), "{md}");
+        assert!(md.ends_with("\n## discord\n\ntwo\n"), "{md}");
     }
 
     #[test]

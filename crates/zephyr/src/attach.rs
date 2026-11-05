@@ -11,11 +11,12 @@
 //! `zephyr.hello`, `zephyr.subscribe` and `zephyr.models` are Zephyr's own additions
 //! (DESIGN §4.3.1), as are `zephyr.login_providers`/`_start`/`_poll`/`_input`/`_cancel`, which
 //! sign a provider in on the live gateway (`crate::auth`), and `zephyr.vault_list`/`_put`/`_rm`/
-//! `_revoke`, the owner's credential vault (`crate::vault`), and `zephyr.dequeue`, which takes
-//! back the `tui` messages still waiting (a `send` prompt with `followUp: true` waits for the
-//! settle). `zephyr.login_start` answers once rpi's child has started, not at once: rpi may be
-//! asked for a model first, so the `loginId` can take a few seconds, and the sign-in URL follows
-//! on the daemon's 5 s tick rather than in the reply.
+//! `_revoke`, the owner's credential vault (`crate::vault`), `zephyr.sessions`, the saved main
+//! sessions with their `/rename` names, and `zephyr.turns`, the exchanges `/undo N` counts, newest
+//! first, for the TUI's rewind picker, and `zephyr.dequeue`, which takes back the `tui` messages
+//! still waiting (a `send` prompt with `followUp: true` waits for the settle). `zephyr.login_start` answers once rpi's
+//! child has started, not at once: rpi may be asked for a model first, so the `loginId` can take a
+//! few seconds, and the sign-in URL follows on the daemon's 5 s tick rather than in the reply.
 
 use crate::channel::Inbound;
 use crate::config::{Attach, Config};
@@ -310,6 +311,36 @@ impl Conn {
             | "zephyr.vault_put"
             | "zephyr.vault_rm"
             | "zephyr.vault_revoke" => self.vault(id, method, params).await,
+            "zephyr.sessions" => {
+                let cfg = self.cfgs.borrow().clone();
+                let names = (crate::store::Store::open(&cfg.db_path()))
+                    .and_then(|s| s.session_names())
+                    .unwrap_or_default();
+                let sessions: Vec<Value> = (crate::rpc::saved_sessions(&cfg.session_dir()))
+                    .into_iter()
+                    .map(|(s, at)| json!({"name": names.get(&s), "id": s, "at": at}))
+                    .collect();
+                (vec![ok(id, json!({ "sessions": sessions }))], false)
+            }
+            "zephyr.turns" => {
+                // The router's own `get_messages`, so the picker counts what `/undo N` will.
+                let (tx, rx) = oneshot::channel();
+                let history = match self.router.send(AttachRequest::History(tx)).await {
+                    Ok(()) => rx.await.map(|(history, _)| history).unwrap_or_default(),
+                    Err(_) => Value::Null,
+                };
+                let messages = history["messages"]
+                    .as_array()
+                    .map_or(&[][..], Vec::as_slice);
+                let turns: Vec<Value> = (crate::router::turns(messages).into_iter().rev())
+                    .filter_map(|i| {
+                        let text = message_text(&messages[i]);
+                        let (channel, _, body) = untag(&text)?;
+                        Some(json!({"channel": channel, "text": body}))
+                    })
+                    .collect();
+                (vec![ok(id, json!({ "turns": turns }))], false)
+            }
             _ => (vec![error(id, -32601, "method not found")], false),
         }
     }

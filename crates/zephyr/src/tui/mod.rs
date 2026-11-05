@@ -35,6 +35,9 @@ use tokio::sync::mpsc;
 /// Two Ctrl+C within this window detach.
 const DOUBLE_PRESS_MS: i64 = 1500;
 
+/// Two Esc within this window, on an empty and idle composer, open the rewind picker.
+const REWIND_MS: i64 = 500;
+
 /// How often the running sign-in is asked about: often enough to feel live, and only while
 /// one runs, so an idle TUI sends nothing.
 const LOGIN_POLL_MS: i64 = 500;
@@ -194,6 +197,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_millis(166));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ctrl_c_at = 0;
+    let mut esc_at = 0;
     // The mascot frame on screen: a tick redraws when it changes, idle blinks included.
     let mut face = [String::new(), String::new(), String::new()];
     let mut was_up = false;
@@ -246,6 +250,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         for text in s.unsent.drain(..) {
                             let _ = prompt_tx.send(Ask::Prompt(text));
                         }
+                        let _ = prompt_tx.send(Ask::Sessions);
                     }
                     Msg::Event(ev) => {
                         let ping = event(&mut s, &mut view, &ev)
@@ -253,6 +258,21 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         if let Some(ping) = ping {
                             tui.terminal().write(&ping);
                             tui.terminal().flush();
+                        }
+                        // These change which sessions there are, or their names.
+                        let command = ev["command"].as_str().unwrap_or_default();
+                        let renamed = matches!(
+                            command.split_whitespace().next(),
+                            Some("/rename" | "/fork" | "/switch" | "/new")
+                        );
+                        if ev["type"] == "zephyr_reply" && renamed {
+                            let _ = prompt_tx.send(Ask::Sessions);
+                        }
+                    }
+                    Msg::Sessions(list) => s.sessions = list,
+                    Msg::Turns(list) => {
+                        if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Rewind) {
+                            o.turns = Some(list);
                         }
                     }
                     Msg::Models(list) => {
@@ -480,10 +500,16 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                     Action::None => {}
                                     Action::Close => close(&tui, &editor, &mut s),
                                     Action::Pick(cmd) => {
+                                        let back = s.overlay.as_ref().and_then(|o| overlays::rewound(o, &cmd));
                                         close(&tui, &editor, &mut s);
                                         match kind {
                                             Kind::Model => send(&mut s, &prompt_tx, cmd),
                                             Kind::History => recall(&editor, &cmd),
+                                            // The message taken back, to edit and send again.
+                                            Kind::Rewind => {
+                                                send(&mut s, &prompt_tx, cmd);
+                                                editor.set_text(&back.unwrap_or_default());
+                                            }
                                             _ if cmd.starts_with(['/', '!']) => editor.set_text(&cmd),
                                             _ => {}
                                         }
@@ -674,6 +700,14 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                     let _ = prompt_tx.send(Ask::Models);
                                 } else if let Some(m) = next_model(&s.snapshot, &s.models, back) {
                                     send(&mut s, &prompt_tx, format!("/model {m}"));
+                                }
+                            }
+                            KeyEvent { code: KeyCode::Esc, .. } if empty => {
+                                if now - esc_at < REWIND_MS {
+                                    esc_at = 0;
+                                    open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Rewind);
+                                } else {
+                                    esc_at = now;
                                 }
                             }
                             KeyEvent { code: KeyCode::PageUp, modifiers: KeyModifiers::NONE, .. } => {
@@ -1438,6 +1472,9 @@ fn open(
         }
         Kind::Vault => {
             let _ = asks.send(Ask::VaultList);
+        }
+        Kind::Rewind => {
+            let _ = asks.send(Ask::Turns);
         }
         Kind::Status | Kind::Help | Kind::History => {}
     }

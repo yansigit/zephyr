@@ -98,6 +98,26 @@ pub struct VaultEntry {
     pub programs: Vec<String>,
 }
 
+/// A saved main session as `zephyr.sessions` lists it, newest first.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct SessionInfo {
+    pub id: String,
+    /// Its `/rename` name.
+    pub name: Option<String>,
+    /// When it last changed, unix secs.
+    pub at: i64,
+}
+
+/// An exchange `/undo N` counts, as `zephyr.turns` lists them, newest first.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct Turn {
+    pub channel: String,
+    /// The message, untagged.
+    pub text: String,
+}
+
 /// What the UI asks of the daemon.
 pub enum Ask {
     /// `send {type: "prompt"}`: a message or a slash command.
@@ -133,6 +153,10 @@ pub enum Ask {
     VaultRm(String),
     /// `zephyr.vault_revoke`: every grant of the entry.
     VaultRevoke(String),
+    /// `zephyr.sessions`, answered with [`Msg::Sessions`].
+    Sessions,
+    /// `zephyr.turns`, answered with [`Msg::Turns`].
+    Turns,
 }
 
 impl std::fmt::Debug for Ask {
@@ -172,6 +196,8 @@ impl std::fmt::Debug for Ask {
             Ask::VaultPut(entry) => f.debug_tuple("VaultPut").field(entry).finish(),
             Ask::VaultRm(name) => f.debug_tuple("VaultRm").field(name).finish(),
             Ask::VaultRevoke(name) => f.debug_tuple("VaultRevoke").field(name).finish(),
+            Ask::Sessions => f.write_str("Sessions"),
+            Ask::Turns => f.write_str("Turns"),
         }
     }
 }
@@ -207,6 +233,10 @@ pub enum Msg {
     Dequeued(Vec<String>),
     /// A vault call the daemon refused, and why.
     VaultError(String),
+    /// The `zephyr.sessions` answer; empty from a daemon without it.
+    Sessions(Vec<SessionInfo>),
+    /// The `zephyr.turns` answer; empty from a daemon without it.
+    Turns(Vec<Turn>),
     /// The connection is gone or was refused; it retries.
     Down(String),
     /// Retrying would not help: a wrong token, or a daemon without `zephyr.hello`.
@@ -395,6 +425,14 @@ async fn session(
                     let id = rpc.request("zephyr.vault_revoke", json!({"name": name})).await?;
                     pending.insert(id, Pending::Vault);
                 }
+                Some(Ask::Sessions) => {
+                    let id = rpc.request("zephyr.sessions", json!({})).await?;
+                    pending.insert(id, Pending::Sessions);
+                }
+                Some(Ask::Turns) => {
+                    let id = rpc.request("zephyr.turns", json!({})).await?;
+                    pending.insert(id, Pending::Turns);
+                }
                 None => return Ok(()),
             },
         }
@@ -419,6 +457,8 @@ enum Pending {
     /// Any `zephyr.vault_*` call: the entries, or why not.
     Vault,
     Dequeue,
+    Sessions,
+    Turns,
 }
 
 /// An error answer to one of the login calls.
@@ -496,6 +536,12 @@ fn answer(what: Pending, mut v: Value) -> Option<Msg> {
                 Msg::Vault(serde_json::from_value(result["entries"].take()).unwrap_or_default())
             }
         },
+        Pending::Sessions => {
+            Msg::Sessions(serde_json::from_value(result["sessions"].take()).unwrap_or_default())
+        }
+        Pending::Turns => {
+            Msg::Turns(serde_json::from_value(result["turns"].take()).unwrap_or_default())
+        }
     })
 }
 

@@ -520,6 +520,26 @@ async fn real_rpi_undo_retry_and_compact() {
     // rpi starts at medium and offers off..high for this model.
     feed.send(say("m8", "/thinking next")).await.unwrap();
     assert_eq!(replies(9).await[8], "[zephyr] thinking high");
+    // rpi 0.18 has no `fork` command: zephyr copies the session, and the copy carries on.
+    feed.send(say("m9", "/fork")).await.unwrap();
+    let forked = replies(10).await[9].clone();
+    assert!(
+        forked.starts_with("[zephyr] forked main into main-"),
+        "{forked}"
+    );
+    feed.send(say("m10", "forked turn")).await.unwrap();
+    assert_eq!(replies(11).await[10], "pong");
+    let request = last_request();
+    assert!(request.contains("[chat #8] after"), "{request}");
+    assert!(request.contains("[chat #11] forked turn"), "{request}");
+    feed.send(say("m11", "/undo 2")).await.unwrap();
+    let undone = replies(12).await[11].clone();
+    assert!(undone.contains("your last 2 messages"), "{undone}");
+    feed.send(say("m12", "last")).await.unwrap();
+    assert_eq!(replies(13).await[12], "pong");
+    let request = last_request();
+    assert!(!request.contains("[chat #8] after"), "{request}");
+    assert!(!request.contains("[chat #11] forked turn"), "{request}");
 
     let _ = stop.send(());
     task.await.unwrap().unwrap();
