@@ -72,6 +72,28 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("Agent", "/stop", "stop the current reply and every task"),
     ("Agent", "/task list", "the agent's background tasks"),
     ("Agent", "/task stop <id>", "stop one task"),
+    ("Agent", "/task parallel <n>", "how many tasks run at once, 1-32"),
+    (
+        "Agent",
+        "/task model <model|default>",
+        "what tasks run on unless they name a model",
+    ),
+    (
+        "Agent",
+        "/subagent",
+        "your subagents, which the agent starts tasks as",
+    ),
+    (
+        "Agent",
+        "/subagent add <name> [model] <prompt>",
+        "add one; its prompt leads each of its tasks",
+    ),
+    (
+        "Agent",
+        "/subagent model <name> <model|default>",
+        "change its model",
+    ),
+    ("Agent", "/subagent rm <name>", "remove one"),
     (
         "Agent",
         "/process list",
@@ -1811,17 +1833,17 @@ mod tests {
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(got.len(), 8);
         assert_eq!(got[2], format!("│ Chat{}│", " ".repeat(73)));
-        assert!(got[7].ends_with(" 1-5 of 83 ─╯"), "{got:?}");
-        for _ in 0..34 {
+        assert!(got[7].ends_with(" 1-5 of 89 ─╯"), "{got:?}");
+        for _ in 0..40 {
             key(&mut o, press(KeyCode::Down), &rows);
         }
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
-        // The thirty-fifth command is /memory ok; the window follows it down.
+        // The forty-first command is /memory ok; the window follows it down.
         assert_eq!(
             got[6],
             "│  › /memory ok                  let the agent see the waiting change          │"
         );
-        assert!(got[7].ends_with(" 34-38 of 83 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 40-44 of 89 ─╯"), "{got:?}");
         key(&mut o, press(KeyCode::Down), &rows);
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),
