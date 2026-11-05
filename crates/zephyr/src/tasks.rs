@@ -1,6 +1,6 @@
 //! Background tasks (DESIGN §4.12). The main agent starts one with its `task` tool; it runs in a
-//! fresh `task-<id>` child beside `main`, at most [`Config::parallel_tasks`] at once, and its report comes
-//! back to the main session as an inbox row, so the main agent tells the owner. A task a restart
+//! fresh `task-<id>` child beside `main`, at most [`Config::parallel_tasks`] at once, and its
+//! report comes back to the main session as an inbox row, so the main agent tells the owner. A task a restart
 //! cut resumes in its rpi session, at most `store::MAX_TASK_RESUMES` times; then it is `unknown`.
 
 use crate::config::{Config, BUDGET_NOTICE};

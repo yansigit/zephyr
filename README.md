@@ -280,13 +280,13 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   itself. In a scheduled job it gets no answer and proposes nothing.
 - **Background tasks.** You can keep talking while the agent works. It hands anything that takes
   more than a minute to a task (its `task` tool): a fresh session running beside the conversation,
-  2 at once by default (`[tasks] parallel` in zephyr.toml, up to 8). The agent answers right away, and when the task ends its report comes back to
-  the agent, which tells you. Ask it to cancel, or use `/task list` and `/task stop N`. `/stop`
-  stops the reply and every task. A task cut off by a restart or a settings reload picks up where
-  it left off in its own session, told to check what was in progress before repeating anything (at
-  most 3 times; then it is reported as unfinished).
-  The agent can run a task on another model, e.g. a cheaper one for a simple lookup, of a provider
-  you have an account on; `/task list` shows which.
+  2 at once by default (`[tasks] parallel` in zephyr.toml, up to 8). The agent can run a task on
+  another model of a provider you have an account on, e.g. a cheaper one for a simple lookup;
+  `/task list` shows which. The agent answers right away, and when the task ends its report comes
+  back to the agent, which tells you. Ask it to cancel, or use `/task list` and `/task stop N`.
+  `/stop` stops the reply and every task. A task cut off by a restart or a settings reload picks up
+  where it left off in its own session, told to check what was in progress before repeating
+  anything (at most 3 times; then it is reported as unfinished).
 - **Talking to it while it works.** A message you send mid-run reaches the agent after the step
   it is on, and its answer comes back right away, not when the whole job is done. The agent runs
   commands through its own `exec` tool: when you send a message during a long command (or after

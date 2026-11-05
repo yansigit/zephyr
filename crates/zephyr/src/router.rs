@@ -671,7 +671,8 @@ impl<'a> Router<'a> {
                 let Some((channel, sender)) = self.origin() else {
                     return "no owner to report to; not started".into();
                 };
-                // shortcut: no rpi --list-models check mid-turn; an unknown model fails the task at start and its report says so, add a check if agents keep guessing wrong.
+                // shortcut: no rpi --list-models check mid-turn; an unknown model fails the task
+                // at start and its report says so. Add a check if agents keep guessing wrong.
                 if let Some(m) = &model {
                     let provider = m.split('/').next().unwrap_or_default();
                     let pool = &self.cfg.accounts;
