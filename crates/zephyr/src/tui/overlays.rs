@@ -44,7 +44,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ),
     ("Chat", "/copy", "copy the last reply"),
     ("Chat", "/copy <n>", "copy code block n, or click it"),
-    ("Chat", "/focus", "hide tool calls and thinking, or show them"),
+    (
+        "Chat",
+        "/focus",
+        "hide tool calls and thinking, or show them",
+    ),
     ("Chat", "/help", "this list"),
     ("Chat", "/quit", "leave (or /exit); zephyr keeps running"),
     ("Agent", "/stop", "stop the current reply and every task"),
@@ -161,9 +165,17 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "search the conversation; Enter older, Shift+Enter newer",
     ),
     ("Keys", "Ctrl+Up/Down", "jump between your messages"),
-    ("Keys", "Home/End", "top or bottom, when the composer is empty"),
+    (
+        "Keys",
+        "Home/End",
+        "top or bottom, when the composer is empty",
+    ),
     ("Keys", "Shift+click", "select from the last click and copy"),
-    ("Keys", "double-click", "copy the word; triple-click the row"),
+    (
+        "Keys",
+        "double-click",
+        "copy the word; triple-click the row",
+    ),
 ];
 
 /// What goes in the composer for a command: up to its first argument.

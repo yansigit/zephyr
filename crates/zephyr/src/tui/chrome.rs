@@ -71,7 +71,9 @@ impl Search {
     pub fn refresh(&mut self, lines: &[String]) {
         let q = self.query.to_lowercase();
         self.rows = (0..lines.len())
-            .filter(|&i| !q.is_empty() && rpi_tui::strip_ansi(&lines[i]).to_lowercase().contains(&q))
+            .filter(|&i| {
+                !q.is_empty() && rpi_tui::strip_ansi(&lines[i]).to_lowercase().contains(&q)
+            })
             .collect();
         self.at = self.rows.len().saturating_sub(1);
     }
@@ -82,7 +84,11 @@ impl Search {
         if n == 0 {
             return None;
         }
-        self.at = if older { (self.at + n - 1) % n } else { (self.at + 1) % n };
+        self.at = if older {
+            (self.at + n - 1) % n
+        } else {
+            (self.at + 1) % n
+        };
         self.current()
     }
 

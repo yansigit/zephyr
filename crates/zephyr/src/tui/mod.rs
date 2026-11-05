@@ -591,12 +591,18 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
             }
             text = submits.recv() => {
                 let Some(text) = text else { break Ok(()) };
+                // In a guard of its own: one borrowed on the way to `/shell` counts as held
+                // across its await, `drop` or not.
+                {
+                    let mut s = state.lock().unwrap();
+                    // shortcut: an OK given on another channel leaves the title waiting until the
+                    // owner types here; read it from the snapshot if the daemon ever reports
+                    // proposals.
+                    s.asking &= text.trim().is_empty();
+                    attend(&tui, &s, &mut look);
+                }
                 let mut s = state.lock().unwrap();
                 walk = None;
-                // shortcut: an OK given on another channel leaves the title waiting until the
-                // owner types here; read it from the snapshot if the daemon ever reports proposals.
-                s.asking &= text.trim().is_empty();
-                attend(&tui, &s, &mut look);
                 // These open a panel here instead of a reply card, or never leave the TUI.
                 match text.trim() {
                     "" => {}
@@ -702,8 +708,8 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     };
     stop.store(true, Ordering::Relaxed);
     let _ = reader.await;
-    focus_reports(&tui, false);
     tui.terminal().write(PROGRESS_OFF);
+    focus_reports(&tui, false);
     tui.stop(Default::default());
     outcome?;
     println!("detached — zephyr keeps running (zephyr attach to return)");
@@ -916,7 +922,7 @@ fn row_span(text: &str) -> Option<(usize, usize)> {
     let cells = cells(text);
     let mut text = cells.iter().filter(|c| c.0 >= 3 && !c.2.is_whitespace());
     let first = text.next()?;
-    let last = text.last().unwrap_or(first);
+    let last = text.next_back().unwrap_or(first);
     Some((first.0, last.0 + last.1.max(1) - 1))
 }
 
@@ -998,7 +1004,9 @@ fn search(
         Find::Newer => f.step(false),
         Find::Close => None,
     };
-    marked.row.store(row.unwrap_or(usize::MAX), Ordering::Relaxed);
+    marked
+        .row
+        .store(row.unwrap_or(usize::MAX), Ordering::Relaxed);
     if let (Some(row), Some(at)) = (row, at) {
         transcript.scroll_to(row.saturating_sub(at.height / 3));
     }
@@ -1914,16 +1922,15 @@ mod tests {
             super::event(&mut s, &mut view, &status(false)),
             Some("reply ready")
         );
-        let reply = |text: &str, command: Option<&str>| {
-            serde_json::json!({"type": "zephyr_reply", "text": text, "command": command})
-        };
+        let reply = |text: &str, command: Option<&str>| serde_json::json!({"type": "zephyr_reply", "text": text, "command": command});
         let asks = "[zephyr] the agent asks to run /job run 3 (#4); /ok 4 runs it, /no 4 drops it";
         assert_eq!(
             super::event(&mut s, &mut view, &reply(asks, None)),
             Some("needs your OK")
         );
         assert!(s.asking);
-        let memory = "[zephyr] memory change waiting; /memory ok keeps it, /memory undo drops it:\n+x";
+        let memory =
+            "[zephyr] memory change waiting; /memory ok keeps it, /memory undo drops it:\n+x";
         assert!(super::event(&mut s, &mut view, &reply(memory, None)).is_some());
         // An answer to a command typed here is not asking for anything.
         let usage = "[zephyr] usage: /job ok <id>, /job rm <id>";
@@ -1951,7 +1958,10 @@ mod tests {
         s.asking = true;
         s.snapshot.run.busy = false;
         super::attend(&tui, &s, &mut look);
-        assert_eq!(written(), format!("<title ✋ zephyr>{}", super::PROGRESS_OFF));
+        assert_eq!(
+            written(),
+            format!("<title ✋ zephyr>{}", super::PROGRESS_OFF)
+        );
     }
 
     #[test]
@@ -1959,12 +1969,21 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
         let k = |code, m| super::find_key(&KeyEvent::new(code, m));
         assert_eq!(k(KeyCode::Char('a'), M::NONE), Some(super::Find::Type('a')));
-        assert_eq!(k(KeyCode::Char('A'), M::SHIFT), Some(super::Find::Type('A')));
+        assert_eq!(
+            k(KeyCode::Char('A'), M::SHIFT),
+            Some(super::Find::Type('A'))
+        );
         assert_eq!(k(KeyCode::Enter, M::NONE), Some(super::Find::Older));
         assert_eq!(k(KeyCode::Enter, M::SHIFT), Some(super::Find::Newer));
         assert_eq!(k(KeyCode::Char('g'), M::CONTROL), Some(super::Find::Older));
-        assert_eq!(k(KeyCode::Char('G'), M::CONTROL | M::SHIFT), Some(super::Find::Newer));
-        assert_eq!(k(KeyCode::Char('g'), M::CONTROL | M::SHIFT), Some(super::Find::Newer));
+        assert_eq!(
+            k(KeyCode::Char('G'), M::CONTROL | M::SHIFT),
+            Some(super::Find::Newer)
+        );
+        assert_eq!(
+            k(KeyCode::Char('g'), M::CONTROL | M::SHIFT),
+            Some(super::Find::Newer)
+        );
         assert_eq!(k(KeyCode::Esc, M::NONE), Some(super::Find::Close));
         // Ctrl+F closes it through its own arm; Ctrl+C and the like keep their meaning.
         assert_eq!(k(KeyCode::Char('f'), M::CONTROL), None);

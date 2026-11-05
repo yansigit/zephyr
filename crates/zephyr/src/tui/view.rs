@@ -814,7 +814,10 @@ impl Component for Marked {
         let mut lines = self.inner.render(width);
         if let Some(line) = lines.get_mut(self.row.load(Ordering::Relaxed)) {
             // Each reset inside the row would end the reverse video, so it is turned back on.
-            *line = format!("\x1b[7m{}\x1b[27m", line.replace("\x1b[0m", "\x1b[0m\x1b[7m"));
+            *line = format!(
+                "\x1b[7m{}\x1b[27m",
+                line.replace("\x1b[0m", "\x1b[0m\x1b[7m")
+            );
         }
         lines
     }
@@ -1833,7 +1836,8 @@ mod tests {
     #[test]
     fn prompts_are_the_first_row_of_each_band() {
         let mut v = view();
-        let long = "please check whether the nightly backup finished and tell me which files changed";
+        let long =
+            "please check whether the nightly backup finished and tell me which files changed";
         v.replay(&[
             json!({"kind": "user", "content": long, "text": long, "origin": null}),
             json!({"kind": "assistant", "content": [{"type": "text", "text": "▌ not a band"}]}),
