@@ -81,21 +81,6 @@ nothing. Under `NO_COLOR` a click may not find the block; `/copy N` and `^X` sti
 it, a triple-click the row, and Shift+click copies from your last click to this one (some terminals,
 kitty and WezTerm among them, keep Shift+click for their own selection and never pass it on).
 
-Moving around in `zephyr attach`:
-
-| Key | What it does |
-|---|---|
-| `Ctrl+F` | Search the conversation: the newest match first, `Enter` or `Ctrl+G` the one above, `Shift+Enter` or `Ctrl+Shift+G` the one below, `Esc` closes |
-| `Ctrl+Up` / `Ctrl+Down` | Jump to your previous or next message |
-| `Home` / `End` | Top or bottom of the conversation, when the composer is empty |
-| `/focus` | Hide tool calls and thinking (again to show them); `focus` shows in the footer |
-
-The window title shows `◇` idle, `✦` working and `✋` when something waits for your OK, and the tab
-shows a progress bar while the agent works. When you are in another window and a reply finishes or
-an OK is asked for, the terminal gets a notification (`zephyr: reply ready` or `needs your OK`, at
-most one every 10 s). iTerm2, WezTerm, kitty, Ghostty and Windows Terminal show these; other
-terminals just ring the bell, or nothing.
-
 ## Typing and moving around
 
 In `zephyr attach` (`?` lists all of these):
@@ -108,15 +93,24 @@ In `zephyr attach` (`?` lists all of these):
 | `@path` | A file in the projects folder (`@~/x` in `/zephyr`, `@/x` as written); Tab completes. Sent as its full path, and an image (png, jpg, gif, webp) goes along for the agent to look at. Dragging a file from the projects folder onto the terminal types its `@path`; one from anywhere else can't be seen in the container |
 | `^G` | Edit the draft in `$VISUAL` or `$EDITOR` (`nano` by default); it comes back to the box, unsent |
 | `/p [name] [args]` | Saved prompts: `/p` lists them, `/p name args` puts one in the box to read and send, with `$ARGUMENTS` and `$1`..`$9` filled in. Each is a markdown file in `~/.zephyr/prompts/` (`/zephyr/prompts/` in the container), so you can ask the agent to write one |
+| `Enter` mid-reply | Steers your message into the running turn |
+| `Alt+Enter` | Holds the message until the reply ends, then sends it as a request of its own (when idle, the same as Enter) |
+| `Alt+Up` | Take back your messages that haven't reached the agent yet (held follow-ups, or ones waiting behind `/pause`) to edit; a steered one is already the agent's |
+| `Shift+Tab` | The next thinking level |
+| `Ctrl+P` | The next model of the account (`Ctrl+Shift+P` the one before, where the terminal tells them apart) |
+| `Esc` `Esc` | On an empty box: pick one of your messages to rewind to; it and everything after leave the agent's context (`/undo N`) and it comes back to the box to edit |
+| `Ctrl+F` | Search the conversation: the newest match first, `Enter` or `Ctrl+G` the one above, `Shift+Enter` or `Ctrl+Shift+G` the one below, `Esc` closes |
+| `Ctrl+Up` / `Ctrl+Down` | Jump to your previous or next message |
+| `Home` / `End` | Top or bottom of the conversation, when the composer is empty |
+| `/focus` | Hide tool calls and thinking (again to show them); `focus` shows in the footer |
 
-Drafts put aside are gone when you detach; the history starts again from the messages in the conversation.
-Mid-reply in `zephyr attach`, Enter steers your message into the running turn; Alt+Enter instead
-holds it until the reply ends and then sends it as a request of its own (when idle, both just
-send). Alt+Up takes back your messages that have not reached the agent yet (held follow-ups, or
-ones waiting behind `/pause`) and puts them in the input to edit; a steered one is already the
-agent's. Shift+Tab steps the thinking level, Ctrl+P the model (Ctrl+Shift+P back, where the
-terminal tells them apart), and the footer shows `ctx N%`, how full the model's context is after
-the last reply.
+Drafts put aside are gone when you detach; the history starts again from the messages in the conversation. The footer shows `ctx N%`, how full the model's context is after the last reply.
+
+The window title shows `◇` idle, `✦` working and `✋` when something waits for your OK, and the tab
+shows a progress bar while the agent works. When you are in another window and a reply finishes or
+an OK is asked for, the terminal gets a notification (`zephyr: reply ready` or `needs your OK`, at
+most one every 10 s). iTerm2, WezTerm, kitty, Ghostty and Windows Terminal show these; other
+terminals just ring the bell, or nothing.
 
 ## Changing settings
 
