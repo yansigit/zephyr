@@ -67,6 +67,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "/model <provider/model>",
         "switch the model after the current reply",
     ),
+    (
+        "Agent",
+        "/thinking [level|next]",
+        "how hard the model thinks; Shift+Tab cycles",
+    ),
     ("Agent", "/rollback", "file checkpoints of the projects"),
     (
         "Agent",
@@ -177,6 +182,18 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "a file in the projects folder (Tab completes); images go along",
     ),
     ("Keys", "Ctrl+G", "edit the draft in $EDITOR"),
+    (
+        "Keys",
+        "Alt+Enter",
+        "send after the current reply, not into it",
+    ),
+    ("Keys", "Alt+Up", "take back your messages still waiting"),
+    ("Keys", "Shift+Tab", "the next thinking level"),
+    (
+        "Keys",
+        "Ctrl+P",
+        "the next model; Ctrl+Shift+P the one before",
+    ),
 ];
 
 /// What goes in the composer for a command: up to its first argument.
@@ -1713,27 +1730,28 @@ mod tests {
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(got.len(), 8);
         assert_eq!(got[2], format!("│ Chat{}│", " ".repeat(73)));
-        assert!(got[7].ends_with(" 1-5 of 67 ─╯"), "{got:?}");
-        for _ in 0..28 {
+        assert!(got[7].ends_with(" 1-5 of 72 ─╯"), "{got:?}");
+        for _ in 0..29 {
             key(&mut o, press(KeyCode::Down), &rows);
         }
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
-        // The twenty-ninth command is /memory ok; the window follows it down.
+        // The thirtieth command is /memory ok; the window follows it down.
         assert_eq!(
             got[6],
             "│  › /memory ok                  let the agent see the waiting change          │"
         );
-        assert!(got[7].ends_with(" 28-32 of 67 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 29-33 of 72 ─╯"), "{got:?}");
         key(&mut o, press(KeyCode::Down), &rows);
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),
             Action::Pick("/memory undo".into())
         );
+        // The last row is a key, which puts nothing in the composer.
         key(&mut o, press(KeyCode::End), &rows);
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(
             got[6],
-            "│  › Ctrl+G                      edit the draft in $EDITOR                     │"
+            "│  › Ctrl+P                      the next model; Ctrl+Shift+P the one before   │"
         );
         // A key is not something to put in the composer.
         assert_eq!(
@@ -1745,7 +1763,7 @@ mod tests {
         }
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),
-            Action::Pick("/reload".into())
+            Action::Pick(String::new())
         );
     }
 

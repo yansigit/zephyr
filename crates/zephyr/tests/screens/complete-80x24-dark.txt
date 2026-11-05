@@ -1,5 +1,5 @@
   .◠◠.◠◠.       zephyr v0.1.0
-(               main · claude-code-1 › claude-opus-5-5
+(               main · claude-code-1 › claude-opus-5-5 · medium
  `-.___.-'      discord ●  imessage ●  chat ○      today 41.2k tok · $0.38 / $5
  ──────────────────────────────────────────────────────────────────────────────
    ▸ bash  ls ~/Projects/zephyr/deploy                                   ✓ 0.1s
@@ -21,4 +21,4 @@
  ╭────────────────────────────────────────────────────────────────────────────╮
  │ /                                                                          │
  ╰────────────────────────────────────────────────────────────────────────────╯
-  ↑↓ choose · tab complete · ⏎ run · esc dismiss
+  ↑↓ choose · tab complete · ⏎ run · esc dismiss                        ctx 42%

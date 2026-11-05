@@ -102,6 +102,10 @@ pub struct VaultEntry {
 pub enum Ask {
     /// `send {type: "prompt"}`: a message or a slash command.
     Prompt(String),
+    /// The same with `followUp: true`: it waits for the run to settle instead of steering in.
+    FollowUp(String),
+    /// `zephyr.dequeue`, answered with [`Msg::Dequeued`].
+    Dequeue,
     /// `zephyr.models`, answered with [`Msg::Models`].
     Models,
     /// `zephyr.login_providers`, answered with [`Msg::Providers`].
@@ -136,6 +140,8 @@ impl std::fmt::Debug for Ask {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Ask::Prompt(text) => f.debug_tuple("Prompt").field(text).finish(),
+            Ask::FollowUp(text) => f.debug_tuple("FollowUp").field(text).finish(),
+            Ask::Dequeue => f.write_str("Dequeue"),
             Ask::Models => f.write_str("Models"),
             Ask::LoginProviders => f.write_str("LoginProviders"),
             Ask::LoginStart {
@@ -197,6 +203,8 @@ pub enum Msg {
     LoginGone(String),
     /// The vault's entries, after a `zephyr.vault_*` call.
     Vault(Vec<VaultEntry>),
+    /// The messages `zephyr.dequeue` took back, oldest first.
+    Dequeued(Vec<String>),
     /// A vault call the daemon refused, and why.
     VaultError(String),
     /// The connection is gone or was refused; it retries.
@@ -255,7 +263,7 @@ async fn session(
     token: &str,
     out: &mpsc::UnboundedSender<Msg>,
     prompts: &mut mpsc::UnboundedReceiver<Ask>,
-    carry: &mut Option<String>,
+    carry: &mut Option<(String, bool)>,
     delay: &mut Duration,
 ) -> Result<(), Fail> {
     let (read, mut write) = TcpStream::connect(addr).await?.into_split();
@@ -290,8 +298,8 @@ async fn session(
     if out.send(Msg::Up { snapshot, messages }).is_err() {
         return Ok(());
     }
-    if let Some(text) = carry.take() {
-        rpc.prompt(&text, carry).await?;
+    if let Some((text, after)) = carry.take() {
+        rpc.prompt(&text, after, carry).await?;
     }
     // The requests whose answers the UI is waiting for, by JSON-RPC id: an event can arrive
     // before an answer, so answers are matched by id and never read in order. A lost
@@ -325,7 +333,12 @@ async fn session(
                 }
             }
             ask = prompts.recv() => match ask {
-                Some(Ask::Prompt(text)) => rpc.prompt(&text, carry).await?,
+                Some(Ask::Prompt(text)) => rpc.prompt(&text, false, carry).await?,
+                Some(Ask::FollowUp(text)) => rpc.prompt(&text, true, carry).await?,
+                Some(Ask::Dequeue) => {
+                    let id = rpc.request("zephyr.dequeue", json!({})).await?;
+                    pending.insert(id, Pending::Dequeue);
+                }
                 Some(Ask::Models) => {
                     let id = rpc.request("zephyr.models", json!({})).await?;
                     pending.insert(id, Pending::Models);
@@ -405,6 +418,7 @@ enum Pending {
     Quiet,
     /// Any `zephyr.vault_*` call: the entries, or why not.
     Vault,
+    Dequeue,
 }
 
 /// An error answer to one of the login calls.
@@ -472,6 +486,10 @@ fn answer(what: Pending, mut v: Value) -> Option<Msg> {
             None => return None,
         },
         Pending::Quiet => return None,
+        // A daemon without it answers an error: nothing was taken back.
+        Pending::Dequeue => {
+            Msg::Dequeued(serde_json::from_value(result["texts"].take()).unwrap_or_default())
+        }
         Pending::Vault => match refusal {
             Some(r) => Msg::VaultError(r.why),
             None => {
@@ -525,10 +543,16 @@ impl Rpc<'_> {
         }
     }
 
-    async fn prompt(&mut self, text: &str, carry: &mut Option<String>) -> Result<(), Fail> {
-        let params = json!({"sessionId": "main", "command": {"type": "prompt", "content": text}});
+    async fn prompt(
+        &mut self,
+        text: &str,
+        after: bool,
+        carry: &mut Option<(String, bool)>,
+    ) -> Result<(), Fail> {
+        let command = json!({"type": "prompt", "content": text, "followUp": after});
+        let params = json!({"sessionId": "main", "command": command});
         if let Err(e) = self.request("send", params).await {
-            *carry = Some(text.to_string());
+            *carry = Some((text.to_string(), after));
             return Err(e.into());
         }
         Ok(())

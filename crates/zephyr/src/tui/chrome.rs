@@ -4,6 +4,7 @@
 use super::conn::{AccountModels, Snapshot};
 use super::overlays::{Complete, Kind, Overlay};
 use super::theme::{glyph, Palette};
+use rpi_tui::theme::Color;
 use rpi_tui::{bold, truncate_to_width, visible_width, Component};
 use std::any::Any;
 use std::sync::{Arc, Mutex};
@@ -51,6 +52,10 @@ pub struct State {
     pub models: Vec<AccountModels>,
     /// The vault's entry names, for completing `/vault rm` and the like.
     pub vault: Vec<String>,
+    /// Tokens in the model's context after the last reply (its usage), for `ctx N%`.
+    /// shortcut: stale after /compact or /new until the next reply; ask rpi's `get_state`
+    /// `context.tokens` if that misleads.
+    pub context: Option<i64>,
 }
 
 impl Default for State {
@@ -68,6 +73,7 @@ impl Default for State {
             finished: None,
             models: vec![],
             vault: vec![],
+            context: None,
         }
     }
 }
@@ -408,14 +414,17 @@ fn account_model(snap: &Snapshot, p: &Palette) -> String {
         .as_deref()
         .map(short_model)
         .unwrap_or("default model");
+    let thinking = (snap.thinking.as_ref()).map_or(String::new(), |t| {
+        p.muted.fg(&format!(" {} {t}", glyph("·")))
+    });
     match &snap.account {
         Some(a) => format!(
-            "{} {} {}",
+            "{} {} {}{thinking}",
             p.text.fg(a),
             p.muted.fg(glyph("›")),
             p.text.fg(model)
         ),
-        None => p.text.fg(model),
+        None => format!("{}{thinking}", p.text.fg(model)),
     }
 }
 
@@ -692,9 +701,14 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
     let mut right = vec![];
     if width < MASCOT_MIN_WIDTH {
         right.extend(failed(s, p));
-        if s.link == Link::Up {
-            right.push(spend(&s.snapshot, p));
-        }
+    }
+    if let (Some(used), Some(window), Link::Up) = (s.context, s.snapshot.context_window, &s.link) {
+        let share = used as f64 / window.max(1) as f64;
+        let pct = format!("ctx {}%", (share * 100.0).round() as i64);
+        right.push(gauge(p, share).fg(&pct));
+    }
+    if width < MASCOT_MIN_WIDTH && s.link == Link::Up {
+        right.push(spend(&s.snapshot, p));
     }
     // Hints drop off first, then spend; failed replies stay.
     loop {
@@ -737,14 +751,18 @@ pub fn spend(snap: &Snapshot, p: &Palette) -> String {
     .into_iter()
     .flatten()
     .fold(0.0, f64::max);
-    let color = if used >= 1.0 {
+    gauge(p, used).fg(&format!("{tokens} {} {cost}", glyph("·")))
+}
+
+/// How full something is: the warning colour from 80%, error from 100%.
+fn gauge(p: &Palette, used: f64) -> Color {
+    if used >= 1.0 {
         p.error
     } else if used >= 0.8 {
         p.warning
     } else {
         p.muted
-    };
-    color.fg(&format!("{tokens} {} {cost}", glyph("·")))
+    }
 }
 
 /// The wind glyph cycle, about 6 frames a second.
@@ -1151,6 +1169,27 @@ mod tests {
         assert!(plain(header(&s, &DARK, 120, NOW))[2].contains("✗ 2 failed replies"));
         s.hint = Some(("press ^C again to detach".into(), NOW + 1));
         assert!(plain(footer(&s, &DARK, 120, NOW))[0].starts_with("  press ^C again to detach"));
+    }
+
+    #[test]
+    fn the_footer_shows_how_full_the_context_is_and_the_header_the_thinking_level() {
+        let mut s = up();
+        s.context = Some(84_000);
+        let f = plain(footer(&s, &DARK, 120, NOW)).remove(0);
+        assert!(!f.contains("ctx"), "no window known: {f}");
+        s.snapshot.context_window = Some(200_000);
+        let f = plain(footer(&s, &DARK, 120, NOW)).remove(0);
+        assert!(f.ends_with("ctx 42% "), "{f}");
+        let ctx = |s: &State| footer(s, &DARK, 120, NOW).remove(0);
+        assert!(ctx(&s).contains(&DARK.muted.fg("ctx 42%")));
+        s.context = Some(170_000);
+        assert!(ctx(&s).contains(&DARK.warning.fg("ctx 85%")));
+        s.snapshot.thinking = Some("high".into());
+        let h = plain(header(&s, &DARK, 120, NOW));
+        assert!(
+            h[1].contains("claude-code-1 › claude-opus-5-5 · high"),
+            "{h:?}"
+        );
     }
 
     #[test]

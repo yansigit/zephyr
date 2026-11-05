@@ -68,6 +68,8 @@ pub struct Snapshot {
     pub account: Option<String>,
     pub model: Option<String>,
     pub thinking: Option<String>,
+    /// The model's context window in tokens, from rpi's `get_state`; `None` when rpi does not know it.
+    pub context_window: Option<i64>,
     pub paused: Option<String>,
     pub channels: Vec<ChannelState>,
     pub spend: Spend,
@@ -238,6 +240,8 @@ pub async fn run<C: Channel>(
         snap,
         names: channels.iter().map(|c| c.name().to_string()).collect(),
         thinking: None,
+        context_window: None,
+        thinking_choice: None,
         shown: 0,
         steered: Vec::new(),
         steered_texts: HashSet::new(),
@@ -418,8 +422,13 @@ struct Router<'a> {
     snap: watch::Sender<Snapshot>,
     /// The channel adapters this daemon runs.
     names: Vec<String>,
-    /// rpi's thinking level, read from `get_state` when the child starts.
+    /// rpi's thinking level and context window, read from `get_state` (`read_state`).
     thinking: Option<String>,
+    context_window: Option<i64>,
+    /// The owner's `/thinking` choice: rpi keeps the level neither in the session nor its
+    /// settings, so each new child is set to it again.
+    /// shortcut: lost when the daemon restarts; save it in zephyr.toml if that matters.
+    thinking_choice: Option<String>,
     /// The last inbox row whose user turn went to attached clients. Rows go out in id order,
     /// so one sent again (after `/stop` cleared rpi's queue, or a fail-over) is not shown twice.
     shown: i64,
@@ -467,7 +476,7 @@ impl<'a> Router<'a> {
                 _ = tokio::time::sleep_until(self.respawn_at), if self.child.is_none() => {
                     self.spawn().await;
                 }
-                Some(m) = rx.recv() => self.inbound(m).await,
+                Some(m) = rx.recv() => self.inbound(m, false).await,
                 Some(req) = self.attaches.recv() => self.attach(req).await,
                 _ = self.jobs.outbox.notified() => {} // a job's output: flush below
                 // The `/btw` answer is in the outbox: flush below.
@@ -766,6 +775,7 @@ impl<'a> Router<'a> {
                 model: (self.account.as_ref().map(|a| a.model.clone()))
                     .or_else(|| self.cfg.model.clone()),
                 thinking: self.thinking.clone(),
+                context_window: self.context_window,
                 paused: self.store.pause_reason()?,
                 channels: channels
                     .into_iter()
@@ -827,12 +837,47 @@ impl<'a> Router<'a> {
     /// History and the live stream start at the same point: events the child sends during
     /// `get_messages` are still queued and reach the new receiver.
     async fn attach(&mut self, req: crate::attach::AttachRequest) {
-        let history = self.call(json!({"type": "get_messages"})).await;
-        let history = history.unwrap_or_else(|e| {
-            eprintln!("zephyr: no history for attach: {e:#}");
-            Value::Null
-        });
-        let _ = req.send((history, self.tap.subscribe()));
+        use crate::attach::AttachRequest;
+        match req {
+            AttachRequest::History(tx) => {
+                let history = self.call(json!({"type": "get_messages"})).await;
+                let history = history.unwrap_or_else(|e| {
+                    eprintln!("zephyr: no history for attach: {e:#}");
+                    Value::Null
+                });
+                let _ = tx.send((history, self.tap.subscribe()));
+            }
+            AttachRequest::FollowUp(m) => self.inbound(m, true).await,
+            AttachRequest::Dequeue(tx) => {
+                let _ = tx.send(self.dequeue().unwrap_or_else(|e| {
+                    eprintln!("zephyr: dequeue failed: {e}");
+                    vec![]
+                }));
+            }
+        }
+    }
+
+    /// `zephyr.dequeue` (DESIGN §4.1): the attached client's messages rpi has not been sent yet,
+    /// oldest first, withdrawn so the owner can edit them. Steered ones are already rpi's.
+    fn dequeue(&mut self) -> rusqlite::Result<Vec<String>> {
+        let mut texts = vec![];
+        for row in self.store.inbox_with_status("new")? {
+            if row.channel == crate::attach::CHANNEL && row.tries == 0 {
+                self.store.set_status(row.id, "withdrawn")?;
+                texts.push(row.text);
+            }
+        }
+        Ok(texts)
+    }
+
+    /// Reads the thinking level and context window from rpi's `get_state` (0 is unknown).
+    async fn read_state(&mut self) {
+        let state = self.call(json!({"type": "get_state"})).await.ok();
+        let state = state.as_ref();
+        self.thinking = state.and_then(|s| s["thinkingLevel"].as_str().map(Into::into));
+        self.context_window = state
+            .and_then(|s| s["context"]["window"].as_i64())
+            .filter(|&w| w > 0);
     }
 
     async fn spawn(&mut self) {
@@ -864,10 +909,12 @@ impl<'a> Router<'a> {
                 self.pending_model = None;
                 self.auth_stamp = self.auth_mtime();
                 self.busy = false;
-                let state = self.call(json!({"type": "get_state"})).await;
-                self.thinking = state
-                    .ok()
-                    .and_then(|s| s["thinkingLevel"].as_str().map(Into::into));
+                self.read_state().await;
+                if let Some(level) = self.thinking_choice.clone() {
+                    if self.thinking.as_ref() != Some(&level) {
+                        log(self.set_thinking(&level).await.map(drop));
+                    }
+                }
                 log(self.reconcile(None, false).await);
             }
             Err(e) => {
@@ -914,7 +961,8 @@ impl<'a> Router<'a> {
         self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
     }
 
-    async fn inbound(&mut self, m: Inbound) {
+    /// `after`: a follow-up, held until the run settles rather than steered into it.
+    async fn inbound(&mut self, m: Inbound, after: bool) {
         if m.text.trim().is_empty() {
             return; // attachment-only messages are not handled in v1
         }
@@ -923,6 +971,9 @@ impl<'a> Router<'a> {
             Ok(None) => return, // duplicate platform id
             Err(e) => return eprintln!("zephyr: inbox write failed: {e}"),
         };
+        if after {
+            log(self.store.deliver_after(id).map_err(Into::into));
+        }
         if !self.cfg.is_owner(&m.channel, &m.sender) {
             eprintln!(
                 "zephyr: dropped message {id} from unknown sender {:?} on {}",
@@ -1051,13 +1102,17 @@ impl<'a> Router<'a> {
     }
 
     /// Sends every `new` row: `prompt` when idle; when busy, steered into the running turn,
-    /// which rpi delivers after the current tool as a user message of its own.
+    /// which rpi delivers after the current tool as a user message of its own. A follow-up
+    /// waits for the settle, and each one then starts a run of its own, in order.
     async fn dispatch_new(&mut self) -> anyhow::Result<()> {
         // Rows stay `new` while the child is down or the gateway is paused.
         if self.child.is_none() || self.store.pause_reason()?.is_some() {
             return Ok(());
         }
         for row in self.store.inbox_with_status("new")? {
+            if self.busy && self.store.is_follow_up(row.id)? {
+                continue;
+            }
             let again = self.store.sent_as(row.id)?.as_deref() == Some("continue");
             let sent_as = match (self.busy, again) {
                 (true, _) => "steer",
@@ -1222,6 +1277,7 @@ impl<'a> Router<'a> {
             ("/status", "") => self.status(),
             ("/model", "") => self.models(),
             ("/model", model) => self.switch_model(model).await,
+            ("/thinking", level) => self.thinking_level(level).await,
             ("/new", "") => self.new_session().await,
             ("/switch", "") => self.list_sessions(),
             ("/switch", id) => self.switch(id).await,
@@ -1812,13 +1868,70 @@ impl<'a> Router<'a> {
         }
     }
 
+    /// `/thinking [level|next]`: how hard the model thinks, from the next request on. Without an
+    /// argument, the level and the ones this model offers.
+    async fn thinking_level(&mut self, arg: &str) -> String {
+        if self.child.is_none() {
+            return "[zephyr] the agent is not running".into();
+        }
+        let levels = match self
+            .call(json!({"type": "get_available_thinking_levels"}))
+            .await
+        {
+            Ok(v) => (v["levels"].as_array().into_iter().flatten())
+                .filter_map(|l| l.as_str().map(String::from))
+                .collect::<Vec<_>>(),
+            Err(e) => return format!("[zephyr] no thinking levels: {e:#}"),
+        };
+        let current = self.thinking.clone().unwrap_or_default();
+        let level = match arg {
+            "" => {
+                return format!(
+                    "[zephyr] thinking {current}; /thinking {} or next sets it",
+                    levels.join("|")
+                )
+            }
+            "next" => {
+                let at = levels.iter().position(|l| *l == current);
+                match levels.get(at.map_or(0, |i| (i + 1) % levels.len())) {
+                    Some(l) => l.clone(),
+                    None => return "[zephyr] this model has no thinking levels".into(),
+                }
+            }
+            l if levels.iter().any(|x| x == l) => l.to_string(),
+            l => {
+                return format!(
+                    "[zephyr] no thinking level {l}; one of {}",
+                    levels.join(", ")
+                )
+            }
+        };
+        match self.set_thinking(&level).await {
+            Ok(()) => {
+                self.thinking_choice = Some(level.clone());
+                format!("[zephyr] thinking {level}")
+            }
+            Err(e) => format!("[zephyr] rpi refused thinking {level}: {e:#}"),
+        }
+    }
+
+    async fn set_thinking(&mut self, level: &str) -> anyhow::Result<()> {
+        let set = json!({"type": "set_thinking_level", "level": level});
+        let v = self.call(set).await?;
+        self.thinking = Some(v["thinkingLevel"].as_str().unwrap_or(level).into());
+        Ok(())
+    }
+
     /// Sends a pending `set_model`. A refusal goes to the owner, and the error text is returned.
     async fn apply_model(&mut self) -> Option<String> {
         let model = self.pending_model.take()?;
         self.child.as_ref()?; // a child that is down starts on the new model anyway
         let (provider, id) = model.split_once('/')?;
         let cmd = json!({"type": "set_model", "provider": provider, "modelId": id});
-        let e = self.call(cmd).await.err()?;
+        let Err(e) = self.call(cmd).await else {
+            self.read_state().await; // the new model's context window
+            return None;
+        };
         let text = format!("[zephyr] rpi refused {model}: {e:#}");
         eprintln!("zephyr: {text}");
         log(self.store.notify_last_owner(&text).map_err(Into::into));

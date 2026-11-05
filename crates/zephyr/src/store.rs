@@ -4,7 +4,7 @@ use crate::channel::Inbound;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// Queued and running tasks allowed at once (DESIGN §4.12); a start past this is refused.
 pub const MAX_OPEN_TASKS: i64 = 10;
@@ -359,6 +359,15 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if version < 10 {
+            // A follow-up (DESIGN §4.1) waits for the run to settle instead of being steered in.
+            db.execute_batch(
+                "BEGIN;
+                 ALTER TABLE inbox ADD COLUMN deliver TEXT NOT NULL DEFAULT 'steer'; -- steer|after
+                 PRAGMA user_version = 10;
+                 COMMIT;",
+            )?;
+        }
         Ok(Self { db })
     }
 
@@ -369,6 +378,24 @@ impl Store {
             params![m.channel, m.platform_msg_id, m.sender, m.text],
         )?;
         Ok((n == 1).then(|| self.db.last_insert_rowid()))
+    }
+
+    /// Makes a `new` row a follow-up: it waits for the run to settle (DESIGN §4.1).
+    pub fn deliver_after(&self, id: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE inbox SET deliver = 'after' WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the row is a follow-up, never steered into a running turn.
+    pub fn is_follow_up(&self, id: i64) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT deliver = 'after' FROM inbox WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
     }
 
     pub fn set_status(&self, id: i64, status: &str) -> rusqlite::Result<()> {
@@ -1585,15 +1612,16 @@ mod tests {
         for (version, undo) in [
             (
                 1,
-                "DROP TABLE meta; DROP TABLE spend; DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as;",
+                "DROP TABLE meta; DROP TABLE spend; DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE inbox DROP COLUMN deliver;",
             ),
-            (2, "DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as;"),
-            (3, "DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as;"),
-            (4, "ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as;"),
-            (5, "DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as;"),
-            (6, "DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as;"),
-            (7, "DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE tasks DROP COLUMN resumes; ALTER TABLE tasks DROP COLUMN session;"),
-            (8, "ALTER TABLE tasks DROP COLUMN resumes; ALTER TABLE tasks DROP COLUMN session; ALTER TABLE procs DROP COLUMN pid; ALTER TABLE procs DROP COLUMN start_ticks; ALTER TABLE procs DROP COLUMN deadline; ALTER TABLE inbox DROP COLUMN sent_as;"),
+            (2, "DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE inbox DROP COLUMN deliver;"),
+            (3, "DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE inbox DROP COLUMN deliver;"),
+            (4, "ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE inbox DROP COLUMN deliver;"),
+            (5, "DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE inbox DROP COLUMN deliver;"),
+            (6, "DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE inbox DROP COLUMN deliver;"),
+            (7, "DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE tasks DROP COLUMN resumes; ALTER TABLE tasks DROP COLUMN session; ALTER TABLE inbox DROP COLUMN deliver;"),
+            (8, "ALTER TABLE tasks DROP COLUMN resumes; ALTER TABLE tasks DROP COLUMN session; ALTER TABLE procs DROP COLUMN pid; ALTER TABLE procs DROP COLUMN start_ticks; ALTER TABLE procs DROP COLUMN deadline; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE inbox DROP COLUMN deliver;"),
+            (9, "ALTER TABLE inbox DROP COLUMN deliver;"),
         ] {
             let dir = crate::test_dir(&format!("store-v{version}"));
             let path = dir.join("state.db");
@@ -1615,13 +1643,13 @@ mod tests {
             assert_eq!(store.propose_command("/new").unwrap(), 1);
             assert_eq!(store.add_task("g", "chat", "o").unwrap(), Some(1));
             assert_eq!(store.add_proc("ls", "chat", "o").unwrap().unwrap().id, 1);
-            // The v9 columns, there whichever version the db came from.
+            // The v9 and v10 columns, there whichever version the db came from.
             store
                 .db
                 .execute_batch(
                     "UPDATE tasks SET resumes = 1, session = 'task-1';
                      UPDATE procs SET pid = 1, start_ticks = 2;
-                     UPDATE inbox SET sent_as = 'prompt';",
+                     UPDATE inbox SET sent_as = 'prompt', deliver = 'after';",
                 )
                 .unwrap();
             let now: i64 = store

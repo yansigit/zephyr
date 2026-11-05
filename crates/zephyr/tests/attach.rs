@@ -432,6 +432,7 @@ async fn zephyr_hello_returns_the_snapshot() {
             "account": "a",
             "model": "fake/m1",
             "thinking": "medium",
+            "context_window": 200000,
             "paused": null,
             "channels": [
                 {"name": "chat", "state": "connected"},
@@ -874,5 +875,99 @@ async fn zephyr_vault_methods_save_list_and_remove_without_echoing_a_value() {
     assert_eq!(gone["result"]["entries"], json!([]), "{gone}");
     let again = c.call("zephyr.vault_rm", json!({"name": "github"})).await;
     assert_eq!(again["error"]["code"], -32602, "{again}");
+    gw.shutdown().await;
+}
+
+/// The prompts the fake child got, in order.
+fn prompts(gw: &Gateway) -> Vec<String> {
+    let log = gw.log("prompt");
+    log.iter()
+        .map(|p| p["message"].as_str().unwrap().into())
+        .collect()
+}
+
+/// Alt+Enter (DESIGN §4.1): a follow-up is not steered into the running turn; it starts a run of
+/// its own once that one settles. A plain message beside it still steers.
+#[tokio::test]
+async fn a_follow_up_waits_for_the_settle_and_then_runs() {
+    let gw = start("followup");
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    std::fs::write(gw.home.join("tool_wait"), "").unwrap();
+    gw.say("m1", "[tool] first").await;
+    wait(|| prompts(&gw).len() == 1).await;
+    let later = json!({"type": "prompt", "content": "later", "followUp": true});
+    assert_eq!(c.send(later).await["result"]["status"], "sent");
+    c.send(json!({"type": "prompt", "content": "now"})).await;
+    wait(|| gw.log("queue_message").len() == 1).await;
+    let steer = &gw.log("queue_message")[0];
+    let steered = steer["message"].as_str().unwrap();
+    assert!(steered.starts_with("[tui #3] now"), "{steer}");
+    assert_eq!(gw.count("inbox", "new"), 1, "the follow-up waits");
+    std::fs::remove_file(gw.home.join("tool_wait")).unwrap();
+    wait(|| prompts(&gw).len() == 2).await;
+    assert_eq!(prompts(&gw)[1], "[tui #2] later");
+    assert_eq!(gw.log("queue_message").len(), 1, "never steered");
+    gw.shutdown().await;
+}
+
+/// Alt+Up: `zephyr.dequeue` takes back the attached client's messages rpi has not been sent,
+/// oldest first; another channel's, and ones already sent, stay.
+#[tokio::test]
+async fn dequeue_withdraws_only_the_waiting_tui_messages() {
+    let gw = start("dequeue");
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    c.send(json!({"type": "prompt", "content": "answered"}))
+        .await;
+    wait(|| gw.count("outbox", "sent") == 1).await;
+    gw.say("m1", "/pause").await;
+    wait(|| gw.count("outbox", "sent") == 2).await;
+    c.send(json!({"type": "prompt", "content": "one"})).await;
+    let two = json!({"type": "prompt", "content": "two", "followUp": true});
+    c.send(two).await;
+    gw.say("m2", "from chat").await;
+    wait(|| gw.count("inbox", "new") == 3).await;
+    let got = c.call("zephyr.dequeue", json!({})).await;
+    assert_eq!(got["result"]["texts"], json!(["one", "two"]), "{got}");
+    assert_eq!(gw.count("inbox", "withdrawn"), 2);
+    assert_eq!(gw.count("inbox", "new"), 1);
+    let again = c.call("zephyr.dequeue", json!({})).await;
+    assert_eq!(again["result"]["texts"], json!([]), "{again}");
+    gw.say("m3", "/resume").await;
+    wait(|| prompts(&gw).len() == 2).await;
+    assert_eq!(prompts(&gw)[1], "[chat #5] from chat");
+    gw.shutdown().await;
+}
+
+/// `/thinking next` (Shift+Tab) moves to rpi's next level, the snapshot follows, and a new child
+/// is set to it again, since rpi keeps it nowhere. The snapshot has the model's context window.
+#[tokio::test]
+async fn thinking_next_cycles_the_level_and_survives_a_child_restart() {
+    let gw = start("thinking");
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    gw.say("m1", "hi").await;
+    wait(|| gw.count("outbox", "sent") == 1).await;
+    let snap = c.call("zephyr.hello", json!({})).await["result"].clone();
+    assert_eq!(snap["thinking"], "medium");
+    assert_eq!(snap["context_window"], 200000);
+    gw.say("m2", "/thinking next").await;
+    wait(|| gw.count("outbox", "sent") == 2).await;
+    assert_eq!(gw.log("set_thinking_level")[0]["level"], "high");
+    let snap = c.call("zephyr.hello", json!({})).await["result"].clone();
+    assert_eq!(snap["thinking"], "high");
+    gw.say("m3", "/thinking next").await;
+    wait(|| gw.count("outbox", "sent") == 3).await;
+    let set = gw.log("set_thinking_level");
+    assert_eq!(set[1]["level"], "off", "wraps around");
+    gw.say("m4", "/thinking turbo").await;
+    wait(|| gw.count("outbox", "sent") == 4).await;
+    let set = gw.log("set_thinking_level");
+    assert_eq!(set.len(), 2, "an unknown level is not sent");
+    // A rule restarts the child, which starts at rpi's default.
+    gw.say("m5", "/rule be brief").await;
+    wait(|| gw.log("set_thinking_level").len() == 3).await;
+    assert_eq!(gw.log("set_thinking_level")[2]["level"], "off");
     gw.shutdown().await;
 }

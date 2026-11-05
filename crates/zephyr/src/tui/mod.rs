@@ -128,9 +128,12 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     tui.start_render_scheduler();
     tui.start_readerless();
 
-    let (submit_tx, mut submits) = mpsc::unbounded_channel::<String>();
+    let (submit_tx, mut submits) = mpsc::unbounded_channel::<(String, bool)>();
+    // Set by Alt+Enter around the Enter it hands the editor: that submit is a follow-up.
+    let follow = Arc::new(AtomicBool::new(false));
+    let following = follow.clone();
     editor.on_submit(Arc::new(move |text: &str| {
-        let _ = submit_tx.send(text.to_string());
+        let _ = submit_tx.send((text.to_string(), following.swap(false, Ordering::Relaxed)));
     }));
     let (input_tx, mut inputs) = mpsc::unbounded_channel::<Event>();
     let stop = Arc::new(AtomicBool::new(false));
@@ -189,6 +192,10 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     // What you sent, the draft ^C cleared, and the drafts Alt+S put aside.
     let mut history = history::History::default();
     let (home, projects) = (cfg.home.clone(), cfg.projects.clone());
+    // The way a Ctrl+P waiting for `zephyr.models`' answer goes. It uses `s.models`, the last
+    // answer. shortcut: kept until the /model panel asks again, so a new /login account's list
+    // shows up there first; ask on every Ctrl+P if that bites.
+    let mut cycle: Option<bool> = None;
     let outcome: anyhow::Result<()> = loop {
         tokio::select! {
             msg = msgs.recv() => {
@@ -207,6 +214,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         s.retry = None;
                         s.stopping = false;
                         view.replay(&messages);
+                        s.context = messages.iter().rev().find_map(context_tokens);
                         if was_up {
                             view.notice("reconnected");
                         }
@@ -218,10 +226,30 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                     Msg::Event(ev) => event(&mut s, &mut view, &ev),
                     Msg::Models(list) => {
                         s.models = list.clone();
+                        if let Some(back) = cycle.take() {
+                            if let Some(m) = next_model(&s.snapshot, &list, back) {
+                                send(&mut s, &prompt_tx, format!("/model {m}"));
+                            }
+                        }
                         if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Model) {
-                            o.models = Some(list);
+                            o.models = Some(list.clone());
                             o.placed = false;
                         }
+                    }
+                    Msg::Dequeued(texts) => {
+                        let n = texts.len();
+                        let said = match n {
+                            0 => "nothing waiting to take back".to_string(),
+                            1 => "took back 1 waiting message".to_string(),
+                            n => format!("took back {n} waiting messages"),
+                        };
+                        if n > 0 {
+                            // Oldest first, ahead of whatever was being typed.
+                            let mut all = texts;
+                            all.extend(Some(editor.get_expanded_text()).filter(|d| !d.is_empty()));
+                            editor.set_text(&all.join("\n\n"));
+                        }
+                        s.hint = Some((said, crate::unix_millis() as i64 + COPIED_MS));
                     }
                     Msg::Providers(list) => {
                         if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Login) {
@@ -579,6 +607,30 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                 }
                                 tui.request_render(true);
                             }
+                            // A follow-up: it waits for the reply to end instead of steering in.
+                            KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::ALT, .. } => {
+                                drop(s);
+                                follow.store(true, Ordering::Relaxed);
+                                editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                                follow.store(false, Ordering::Relaxed);
+                            }
+                            KeyEvent { code: KeyCode::Up, modifiers: KeyModifiers::ALT, .. } if s.link == Link::Up => {
+                                let _ = prompt_tx.send(Ask::Dequeue);
+                            }
+                            KeyEvent { code: KeyCode::BackTab, .. } => {
+                                send(&mut s, &prompt_tx, "/thinking next".into())
+                            }
+                            KeyEvent { code: KeyCode::Char(c @ ('p' | 'P')), modifiers, .. }
+                                if modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                let back = c == 'P' || modifiers.contains(KeyModifiers::SHIFT);
+                                if s.models.is_empty() {
+                                    cycle = Some(back);
+                                    let _ = prompt_tx.send(Ask::Models);
+                                } else if let Some(m) = next_model(&s.snapshot, &s.models, back) {
+                                    send(&mut s, &prompt_tx, format!("/model {m}"));
+                                }
+                            }
                             KeyEvent { code: KeyCode::PageUp, modifiers: KeyModifiers::NONE, .. } => {
                                 tui.scroll_by(-page())
                             }
@@ -599,7 +651,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                 tui.request_render(false);
             }
             text = submits.recv() => {
-                let Some(text) = text else { break Ok(()) };
+                let Some((text, after)) = text else { break Ok(()) };
                 let mut s = state.lock().unwrap();
                 walk = None;
                 history.push(&text);
@@ -665,7 +717,13 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         None if text.starts_with('/') => send(&mut s, &prompt_tx, text.to_string()),
                         None => {
                             let text = files::expand(text, &home, projects.as_deref());
-                            send(&mut s, &prompt_tx, shell::prefix(&std::mem::take(&mut held), &text))
+                            let text = shell::prefix(&std::mem::take(&mut held), &text);
+                            // shortcut: offline, a follow-up waits as a plain message; keep the
+                            // flag in `unsent` if that matters.
+                            match after && s.link == Link::Up {
+                                true => drop(prompt_tx.send(Ask::FollowUp(text))),
+                                false => send(&mut s, &prompt_tx, text),
+                            }
                         }
                     },
                 }
@@ -742,9 +800,36 @@ fn event(s: &mut State, view: &mut view::View, ev: &Value) {
             if matches!(kind, "agent_settled" | "agent_end") {
                 s.stopping = false;
             }
+            if kind == "message_end" {
+                s.context = context_tokens(&ev["message"]).or(s.context);
+            }
             view.apply(ev);
         }
     }
+}
+
+/// The tokens in the model's context after an assistant message: its usage, which counts the
+/// whole request. `None` for other messages and for a reply that failed or was cut off.
+fn context_tokens(m: &Value) -> Option<i64> {
+    let u = &m["usage"];
+    let used: i64 = ["input", "cacheRead", "cacheWrite", "output"]
+        .iter()
+        .filter_map(|k| u[*k].as_i64())
+        .sum();
+    let failed = matches!(m["stopReason"].as_str(), Some("aborted" | "error"));
+    (m["role"] == "assistant" && used > 0 && !failed).then_some(used)
+}
+
+/// The model after (or, `back`, before) the current one in its account's list, for Ctrl+P.
+fn next_model(snap: &conn::Snapshot, list: &[conn::AccountModels], back: bool) -> Option<String> {
+    let models = &list.iter().find(|a| a.name == snap.account)?.models;
+    let n = models.len();
+    let next = match models.iter().position(|m| Some(m) == snap.model.as_ref()) {
+        Some(i) if back => (i + n - 1) % n,
+        Some(i) => (i + 1) % n,
+        None => 0,
+    };
+    models.get(next).cloned()
 }
 
 /// Sends a prompt now, or keeps it for the next connection.
@@ -1603,5 +1688,51 @@ mod tests {
             assert_eq!(s.finished.is_some(), !stopped);
             assert!(!s.stopping);
         }
+    }
+
+    #[test]
+    fn ctrl_p_walks_the_current_accounts_models_both_ways() {
+        let list = |name: Option<&str>, models: &[&str]| super::conn::AccountModels {
+            name: name.map(Into::into),
+            model: None,
+            models: models.iter().map(|m| m.to_string()).collect(),
+        };
+        let lists = [
+            list(Some("a"), &["x/1", "x/2", "x/3"]),
+            list(Some("b"), &["y/1"]),
+        ];
+        let mut snap = super::conn::Snapshot {
+            account: Some("a".into()),
+            model: Some("x/1".into()),
+            ..Default::default()
+        };
+        let next = |snap: &super::conn::Snapshot, back| super::next_model(snap, &lists, back);
+        assert_eq!(next(&snap, false).as_deref(), Some("x/2"));
+        assert_eq!(next(&snap, true).as_deref(), Some("x/3"), "wraps");
+        snap.model = Some("z/9".into());
+        assert_eq!(
+            next(&snap, false).as_deref(),
+            Some("x/1"),
+            "an unlisted model"
+        );
+        snap.account = Some("gone".into());
+        assert_eq!(next(&snap, false), None);
+    }
+
+    #[test]
+    fn the_context_is_the_last_good_replys_whole_request() {
+        let m = |role: &str, stop: &str| {
+            serde_json::json!({"role": role, "stopReason": stop,
+                "usage": {"input": 100, "cacheRead": 2000, "cacheWrite": 30, "output": 4, "totalTokens": 9}})
+        };
+        let mut view = super::view::View::new(super::theme::DARK, jiff::tz::TimeZone::UTC);
+        let mut s = super::chrome::State::default();
+        let end = |m| serde_json::json!({"type": "message_end", "message": m});
+        super::event(&mut s, &mut view, &end(m("assistant", "stop")));
+        assert_eq!(s.context, Some(2134));
+        // A user turn or a failed reply leaves it as it was.
+        super::event(&mut s, &mut view, &end(m("user", "")));
+        super::event(&mut s, &mut view, &end(m("assistant", "aborted")));
+        assert_eq!(s.context, Some(2134));
     }
 }

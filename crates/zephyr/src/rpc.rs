@@ -153,6 +153,8 @@ pub const USED_COMMANDS: &[&str] = &[
     "stop",
     "compact",
     "navigate",
+    "get_available_thinking_levels",
+    "set_thinking_level",
 ];
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;

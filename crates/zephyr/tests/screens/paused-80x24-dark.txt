@@ -1,5 +1,5 @@
   .◠◠.◠◠.  !    zephyr v0.1.0                                          ⏸ paused
-(  ᵒ ᴖ ᵒ  )     main · claude-code-1 › claude-opus-5-5
+(  ᵒ ᴖ ᵒ  )     main · claude-code-1 › claude-opus-5-5 · medium
  `-.___.-' . .  discord ●       ✗ 1 failed reply   today 41.2k tok · $4.20 / $5
  ──────────────────────────────────────────────────────────────────────────────
 
@@ -21,4 +21,4 @@
  ╭────────────────────────────────────────────────────────────────────────────╮
  │ Message zephyr                                                             │
  ╰────────────────────────────────────────────────────────────────────────────╯
-  ⏎ send · ⇧⏎ newline · / commands · ^L model · ^S status · ^D detach
+  ⏎ send · ⇧⏎ newline · / commands · ^L model · ^S status · ^D detach   ctx 42%

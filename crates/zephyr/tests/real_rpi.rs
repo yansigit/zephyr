@@ -517,6 +517,10 @@ async fn real_rpi_undo_retry_and_compact() {
     feed.send(say("m7", "after")).await.unwrap();
     assert_eq!(replies(8).await[7], "pong");
 
+    // rpi starts at medium and offers off..high for this model.
+    feed.send(say("m8", "/thinking next")).await.unwrap();
+    assert_eq!(replies(9).await[8], "[zephyr] thinking high");
+
     let _ = stop.send(());
     task.await.unwrap().unwrap();
 }
