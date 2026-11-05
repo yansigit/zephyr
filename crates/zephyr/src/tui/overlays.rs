@@ -72,7 +72,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("Agent", "/stop", "stop the current reply and every task"),
     ("Agent", "/task list", "the agent's background tasks"),
     ("Agent", "/task stop <id>", "stop one task"),
-    ("Agent", "/task parallel <n>", "how many tasks run at once, 1-32"),
+    (
+        "Agent",
+        "/task parallel <n>",
+        "how many tasks run at once, 1-32",
+    ),
     (
         "Agent",
         "/task model <model|default>",
