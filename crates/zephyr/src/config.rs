@@ -41,6 +41,8 @@ pub struct Config {
     pub attach: Option<Attach>,
     /// Daily limits on rpi's reported usage (DESIGN §4.4). Off when absent.
     pub budget: Option<Budget>,
+    /// `[tasks]`: how many background tasks run at once (DESIGN §4.12). Default 2 when absent.
+    pub tasks: Option<Tasks>,
     /// IANA time zone for job cron schedules, e.g. `Asia/Seoul`. Default: the system's.
     pub timezone: Option<String>,
     /// Wall clock cap for one job run. Not configurable; tests shorten it.
@@ -123,6 +125,19 @@ impl Budget {
             .filter(|max| elapsed.as_secs_f64() >= max * 60.0)
             .map(|max| format!("{max} minutes (budget.run_minutes)"))
     }
+}
+
+/// `[tasks]` (DESIGN §4.12).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tasks {
+    /// Tasks that run at once, 1 to 8; more wait queued (up to `store::MAX_OPEN_TASKS` in all).
+    #[serde(default = "default_parallel")]
+    pub parallel: usize,
+}
+
+fn default_parallel() -> usize {
+    2
 }
 
 /// `[agent]`.
@@ -238,6 +253,9 @@ impl Config {
                 anyhow::bail!("agent.env {name:?}: use a variable name (letters, digits, '_')");
             }
         }
+        if !(1..=8).contains(&self.parallel_tasks()) {
+            anyhow::bail!("[tasks] parallel must be 1 to 8");
+        }
         let mut names = std::collections::HashSet::new();
         for m in &self.mcp {
             m.check()?;
@@ -247,6 +265,13 @@ impl Config {
         }
         crate::scheduler::zone(self)?;
         Ok(())
+    }
+
+    /// Tasks that run at once; more wait queued (up to `store::MAX_OPEN_TASKS` in all).
+    pub fn parallel_tasks(&self) -> usize {
+        self.tasks
+            .as_ref()
+            .map_or_else(default_parallel, |t| t.parallel)
     }
 
     /// `<home>/accounts/<name>`: the account's `RPI_CODING_AGENT_DIR`.
@@ -351,6 +376,23 @@ mod tests {
         assert!(b.exceeded(0, 2.5));
         assert!(!Budget::default().exceeded(i64::MAX, f64::MAX));
         assert!(toml::from_str::<Budget>("daily_token = 1").is_err());
+    }
+
+    #[test]
+    fn tasks_parallel_defaults_to_two_and_is_one_to_eight() {
+        let base = "rpi = 'a'\nhome = 'b'\n";
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert_eq!(cfg.parallel_tasks(), 2);
+        cfg.validate().unwrap();
+        let with = |text: &str| -> Config { toml::from_str(&format!("{base}{text}")).unwrap() };
+        assert_eq!(with("[tasks]\n").parallel_tasks(), 2);
+        assert_eq!(with("[tasks]\nparallel = 4\n").parallel_tasks(), 4);
+        with("[tasks]\nparallel = 4\n").validate().unwrap();
+        for bad in ["0", "9"] {
+            let cfg = with(&format!("[tasks]\nparallel = {bad}\n"));
+            assert!(cfg.validate().is_err(), "{bad}");
+        }
+        assert!(toml::from_str::<Config>(&format!("{base}[tasks]\ntypo = 1\n")).is_err());
     }
 
     #[test]
