@@ -98,10 +98,34 @@ pub struct VaultEntry {
     pub programs: Vec<String>,
 }
 
+/// A saved main session as `zephyr.sessions` lists it, newest first.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct SessionInfo {
+    pub id: String,
+    /// Its `/rename` name.
+    pub name: Option<String>,
+    /// When it last changed, unix secs.
+    pub at: i64,
+}
+
+/// An exchange `/undo N` counts, as `zephyr.turns` lists them, newest first.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct Turn {
+    pub channel: String,
+    /// The message, untagged.
+    pub text: String,
+}
+
 /// What the UI asks of the daemon.
 pub enum Ask {
     /// `send {type: "prompt"}`: a message or a slash command.
     Prompt(String),
+    /// The same with `followUp: true`: it waits for the run to settle instead of steering in.
+    FollowUp(String),
+    /// `zephyr.dequeue`, answered with [`Msg::Dequeued`].
+    Dequeue,
     /// `zephyr.models`, answered with [`Msg::Models`].
     Models,
     /// `zephyr.login_providers`, answered with [`Msg::Providers`].
@@ -129,6 +153,10 @@ pub enum Ask {
     VaultRm(String),
     /// `zephyr.vault_revoke`: every grant of the entry.
     VaultRevoke(String),
+    /// `zephyr.sessions`, answered with [`Msg::Sessions`].
+    Sessions,
+    /// `zephyr.turns`, answered with [`Msg::Turns`].
+    Turns,
 }
 
 impl std::fmt::Debug for Ask {
@@ -136,6 +164,8 @@ impl std::fmt::Debug for Ask {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Ask::Prompt(text) => f.debug_tuple("Prompt").field(text).finish(),
+            Ask::FollowUp(text) => f.debug_tuple("FollowUp").field(text).finish(),
+            Ask::Dequeue => f.write_str("Dequeue"),
             Ask::Models => f.write_str("Models"),
             Ask::LoginProviders => f.write_str("LoginProviders"),
             Ask::LoginStart {
@@ -166,6 +196,8 @@ impl std::fmt::Debug for Ask {
             Ask::VaultPut(entry) => f.debug_tuple("VaultPut").field(entry).finish(),
             Ask::VaultRm(name) => f.debug_tuple("VaultRm").field(name).finish(),
             Ask::VaultRevoke(name) => f.debug_tuple("VaultRevoke").field(name).finish(),
+            Ask::Sessions => f.write_str("Sessions"),
+            Ask::Turns => f.write_str("Turns"),
         }
     }
 }
@@ -197,8 +229,14 @@ pub enum Msg {
     LoginGone(String),
     /// The vault's entries, after a `zephyr.vault_*` call.
     Vault(Vec<VaultEntry>),
+    /// The messages `zephyr.dequeue` took back, oldest first.
+    Dequeued(Vec<String>),
     /// A vault call the daemon refused, and why.
     VaultError(String),
+    /// The `zephyr.sessions` answer; empty from a daemon without it.
+    Sessions(Vec<SessionInfo>),
+    /// The `zephyr.turns` answer; empty from a daemon without it.
+    Turns(Vec<Turn>),
     /// The connection is gone or was refused; it retries.
     Down(String),
     /// Retrying would not help: a wrong token, or a daemon without `zephyr.hello`.
@@ -255,7 +293,7 @@ async fn session(
     token: &str,
     out: &mpsc::UnboundedSender<Msg>,
     prompts: &mut mpsc::UnboundedReceiver<Ask>,
-    carry: &mut Option<String>,
+    carry: &mut Option<(String, bool)>,
     delay: &mut Duration,
 ) -> Result<(), Fail> {
     let (read, mut write) = TcpStream::connect(addr).await?.into_split();
@@ -290,8 +328,8 @@ async fn session(
     if out.send(Msg::Up { snapshot, messages }).is_err() {
         return Ok(());
     }
-    if let Some(text) = carry.take() {
-        rpc.prompt(&text, carry).await?;
+    if let Some((text, after)) = carry.take() {
+        rpc.prompt(&text, after, carry).await?;
     }
     // The requests whose answers the UI is waiting for, by JSON-RPC id: an event can arrive
     // before an answer, so answers are matched by id and never read in order. A lost
@@ -325,7 +363,12 @@ async fn session(
                 }
             }
             ask = prompts.recv() => match ask {
-                Some(Ask::Prompt(text)) => rpc.prompt(&text, carry).await?,
+                Some(Ask::Prompt(text)) => rpc.prompt(&text, false, carry).await?,
+                Some(Ask::FollowUp(text)) => rpc.prompt(&text, true, carry).await?,
+                Some(Ask::Dequeue) => {
+                    let id = rpc.request("zephyr.dequeue", json!({})).await?;
+                    pending.insert(id, Pending::Dequeue);
+                }
                 Some(Ask::Models) => {
                     let id = rpc.request("zephyr.models", json!({})).await?;
                     pending.insert(id, Pending::Models);
@@ -382,6 +425,14 @@ async fn session(
                     let id = rpc.request("zephyr.vault_revoke", json!({"name": name})).await?;
                     pending.insert(id, Pending::Vault);
                 }
+                Some(Ask::Sessions) => {
+                    let id = rpc.request("zephyr.sessions", json!({})).await?;
+                    pending.insert(id, Pending::Sessions);
+                }
+                Some(Ask::Turns) => {
+                    let id = rpc.request("zephyr.turns", json!({})).await?;
+                    pending.insert(id, Pending::Turns);
+                }
                 None => return Ok(()),
             },
         }
@@ -405,6 +456,9 @@ enum Pending {
     Quiet,
     /// Any `zephyr.vault_*` call: the entries, or why not.
     Vault,
+    Dequeue,
+    Sessions,
+    Turns,
 }
 
 /// An error answer to one of the login calls.
@@ -472,12 +526,22 @@ fn answer(what: Pending, mut v: Value) -> Option<Msg> {
             None => return None,
         },
         Pending::Quiet => return None,
+        // A daemon without it answers an error: nothing was taken back.
+        Pending::Dequeue => {
+            Msg::Dequeued(serde_json::from_value(result["texts"].take()).unwrap_or_default())
+        }
         Pending::Vault => match refusal {
             Some(r) => Msg::VaultError(r.why),
             None => {
                 Msg::Vault(serde_json::from_value(result["entries"].take()).unwrap_or_default())
             }
         },
+        Pending::Sessions => {
+            Msg::Sessions(serde_json::from_value(result["sessions"].take()).unwrap_or_default())
+        }
+        Pending::Turns => {
+            Msg::Turns(serde_json::from_value(result["turns"].take()).unwrap_or_default())
+        }
     })
 }
 
@@ -525,10 +589,16 @@ impl Rpc<'_> {
         }
     }
 
-    async fn prompt(&mut self, text: &str, carry: &mut Option<String>) -> Result<(), Fail> {
-        let params = json!({"sessionId": "main", "command": {"type": "prompt", "content": text}});
+    async fn prompt(
+        &mut self,
+        text: &str,
+        after: bool,
+        carry: &mut Option<(String, bool)>,
+    ) -> Result<(), Fail> {
+        let command = json!({"type": "prompt", "content": text, "followUp": after});
+        let params = json!({"sessionId": "main", "command": command});
         if let Err(e) = self.request("send", params).await {
-            *carry = Some(text.to_string());
+            *carry = Some((text.to_string(), after));
             return Err(e.into());
         }
         Ok(())

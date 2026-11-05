@@ -18,7 +18,7 @@ pub const MAX_BYTES: u64 = 25 * 1024 * 1024;
 const TRIES: u32 = 3;
 const RETRY_AFTER: Duration = Duration::from_secs(2);
 /// The image types rpi's `read` shows the model.
-const IMAGES: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+pub(crate) const IMAGES: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 
 /// The router's live config, handed to the adapter once at start (`Channel::live`). Unset means
 /// no owners, so nothing is fetched.
@@ -63,18 +63,15 @@ pub async fn append(live: &Live, inbound: &mut Inbound, files: Vec<File>) {
                 match save(dir, &stem, &f).await {
                     Ok((path, mime, len)) => {
                         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                        let kind = kind(ext);
-                        let read = if kind == "image" {
-                            "; open it with read"
-                        } else {
-                            ""
-                        };
-                        format!(
-                            "[attached {kind}: {} ({}, {mime}, {}){read}]",
-                            path.display(),
-                            f.name,
-                            size(len)
-                        )
+                        match kind(ext) {
+                            "image" => attached_image_line(&path, &f.name, &mime, len),
+                            _ => format!(
+                                "[attached file: {} ({}, {mime}, {})]",
+                                path.display(),
+                                f.name,
+                                size(len)
+                            ),
+                        }
                     }
                     Err(e) => {
                         eprintln!("zephyr: {} attachment {}: {e:#}", inbound.channel, i + 1);
@@ -88,6 +85,15 @@ pub async fn append(live: &Live, inbound: &mut Inbound, files: Vec<File>) {
         }
         inbound.text += &line;
     }
+}
+
+/// The line that tells the model where an image is; the TUI's `@image` adds the same one.
+pub(crate) fn attached_image_line(path: &Path, name: &str, mime: &str, len: u64) -> String {
+    format!(
+        "[attached image: {} ({name}, {mime}, {}); open it with read]",
+        path.display(),
+        size(len)
+    )
 }
 
 fn kind(ext: &str) -> &'static str {

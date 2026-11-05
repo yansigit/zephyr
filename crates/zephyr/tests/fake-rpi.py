@@ -58,7 +58,9 @@ empties both, or by `abort`, which (as rpi 0.18 does, running or idle) takes bot
 answers them as `steer`/`followUp` lists of {text, images}. `agent_settled` carries `reclaimed`:
 null, or empty lists for a run the abort ended. Message events carry `messageId`, the message's
 `entryId`, and `turn_end` carries `pendingMessages`, the queued count.
-`get_state` reports thinkingLevel "medium".
+`get_state` reports `context.window` 200000 and the thinking level: "medium" until
+`set_thinking_level` sets one of `get_available_thinking_levels` (off..high, or xhigh); any other
+level is refused "invalid command payload", as rpi does.
 A prompt containing `[turns N]` reports N `turn_end` events, then waits for `abort` as `[hang]` does.
 A prompt containing `[hang-pending]` hangs as `[hang]` does and marks the session resumable, as a
 run cut mid-flight leaves it (`resume_pending` then answers `resumed: <last user text>`; while a
@@ -249,7 +251,7 @@ def finish(s, text, outcome="completed"):
 
 def quick(cmd, s):
     """Answers a command that needs no run (also while a gateway call waits); False otherwise."""
-    global queue, steering, model
+    global queue, steering, model, thinking
     kind = cmd["type"]
     if kind == "get_messages":
         entries = [dict(m, entryId="m%d" % i) for i, m in enumerate(s["messages"])]
@@ -278,7 +280,14 @@ def quick(cmd, s):
         else:
             respond(cmd, error="unknown model: %s" % cmd.get("modelId"))
     elif kind == "get_state":
-        respond(cmd, {"sessionId": opt("--session-id"), "activeOperation": None, "thinkingLevel": "medium"})
+        respond(cmd, {"sessionId": opt("--session-id"), "activeOperation": None, "thinkingLevel": thinking,
+                      "context": {"window": 200000}})
+    elif kind == "get_available_thinking_levels":
+        respond(cmd, {"levels": LEVELS})
+    elif kind == "set_thinking_level" and cmd.get("level") in LEVELS + ["xhigh"]:
+        thinking = cmd["level"]; respond(cmd, {"thinkingLevel": thinking})
+    elif kind == "set_thinking_level":
+        respond(cmd, error="invalid command payload")
     else:
         return False
     return True
@@ -359,7 +368,7 @@ def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
 out({"type": "ready", "protocol": "rpi", "piCompatibilityTarget": "1.2.0",
      "supportedCommands": ["get_state", "get_commands", "get_messages", "get_stats", "queue_message", "clear_queue",
                            "prompt", "resume_pending", "abort", "ping", "stop", "get_auth_status", "set_model",
-                           "compact", "navigate"],
+                           "compact", "navigate", "get_available_thinking_levels", "set_thinking_level"],
      "supportedEvents": ["session_entry_committed", "external_tool_request", "external_tool_request_closed",
                          "file_io_request", "file_io_request_closed"],
      "semantics": {"promptResponse": "accepted", "settlementEvent": "agent_settled", "agentEndIsTerminal": False,
@@ -371,6 +380,8 @@ steered_this_run = False
 hanging = False
 calls = 0
 model = opt("--model")
+LEVELS = ["off", "minimal", "low", "medium", "high"]
+thinking = "medium"
 catalog = set(CATALOG) | ({model} if model else set())
 lines = queues.Queue()  # stdin, read on a thread; None at EOF
 deferred = []  # commands a waiting gateway call left for the main loop

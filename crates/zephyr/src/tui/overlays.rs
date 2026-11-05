@@ -3,14 +3,15 @@
 //! the keys here while one is open.
 
 use super::chrome::{short_model, spend, State};
-use super::conn::{AccountModels, Login, LoginStatus, Provider, Snapshot, VaultEntry};
+use super::conn::{AccountModels, Login, LoginStatus, Provider, Snapshot, Turn, VaultEntry};
 use super::theme::{glyph, Palette};
 use super::view::clean;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rpi_tui::{bold, truncate_to_width, visible_width, CURSOR_MARKER};
 
 /// Every slash command zephyr answers: router.rs `command` and `control`, memory.rs
-/// `command` and scheduler.rs `command`, plus the TUI's own `/help`. (group, usage, what it does)
+/// `command` and scheduler.rs `command`, plus the TUI's own `/help` and `/p`, and the composer's
+/// keys. (group, usage, what it does)
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     (
         "Chat",
@@ -26,10 +27,22 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ),
     ("Chat", "/undo", "take back your last message and its reply"),
     ("Chat", "/retry", "take it back and send it again"),
+    ("Chat", "/undo <n>", "take back your last n, up to 20"),
     (
         "Chat",
         "/compact [instructions]",
         "summarise the conversation to free context",
+    ),
+    ("Chat", "/rename <name>", "name this conversation"),
+    (
+        "Chat",
+        "/fork",
+        "carry on in a copy; the original stays as is",
+    ),
+    (
+        "Chat",
+        "/export",
+        "save it as markdown in the projects folder",
     ),
     (
         "Chat",
@@ -43,6 +56,17 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ),
     ("Chat", "/copy", "copy the last reply"),
     ("Chat", "/copy <n>", "copy code block n, or click it"),
+    ("Chat", "/p", "your saved prompts, /zephyr/prompts/*.md"),
+    (
+        "Chat",
+        "/p <name> [args]",
+        "put a saved prompt in the box, to send",
+    ),
+    (
+        "Chat",
+        "/focus",
+        "hide tool calls and thinking, or show them",
+    ),
     ("Chat", "/help", "this list"),
     ("Chat", "/quit", "leave (or /exit); zephyr keeps running"),
     ("Agent", "/stop", "stop the current reply and every task"),
@@ -59,6 +83,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "Agent",
         "/model <provider/model>",
         "switch the model after the current reply",
+    ),
+    (
+        "Agent",
+        "/thinking [level|next]",
+        "how hard the model thinks; Shift+Tab cycles",
     ),
     ("Agent", "/rollback", "file checkpoints of the projects"),
     (
@@ -153,6 +182,57 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("Gateway", "/pause", "hold new messages until /resume"),
     ("Gateway", "/resume", "answer what waited"),
     ("Gateway", "/reload", "apply zephyr.toml and secrets.env"),
+    (
+        "Keys",
+        "Up / Down",
+        "your earlier messages; Up on an empty box first undoes ^C",
+    ),
+    ("Keys", "Ctrl+R", "search your earlier messages"),
+    (
+        "Keys",
+        "Alt+S",
+        "put the draft aside; on an empty box, bring it back",
+    ),
+    (
+        "Keys",
+        "@<path>",
+        "a file in the projects folder (Tab completes); images go along",
+    ),
+    ("Keys", "Ctrl+G", "edit the draft in $EDITOR"),
+    (
+        "Keys",
+        "Alt+Enter",
+        "send after the current reply, not into it",
+    ),
+    ("Keys", "Alt+Up", "take back your messages still waiting"),
+    ("Keys", "Shift+Tab", "the next thinking level"),
+    (
+        "Keys",
+        "Ctrl+P",
+        "the next model; Ctrl+Shift+P the one before",
+    ),
+    (
+        "Keys",
+        "Ctrl+F",
+        "search the conversation; Enter older, Shift+Enter newer",
+    ),
+    ("Keys", "Ctrl+Up/Down", "jump between your messages"),
+    (
+        "Keys",
+        "Home/End",
+        "top or bottom, when the composer is empty",
+    ),
+    ("Keys", "Shift+click", "select from the last click and copy"),
+    (
+        "Keys",
+        "double-click",
+        "copy the word; triple-click the row",
+    ),
+    (
+        "Keys",
+        "Esc Esc",
+        "rewind: pick a message to take back and edit",
+    ),
 ];
 
 /// What goes in the composer for a command: up to its first argument.
@@ -169,6 +249,10 @@ pub enum Kind {
     Login,
     /// The credential vault: its entries, and a form to add or edit one (DESIGN §4.15).
     Vault,
+    /// Ctrl+R: what you sent, to put back in the composer.
+    History,
+    /// Esc Esc: the exchanges `/undo N` counts, newest first; picking one takes it back.
+    Rewind,
 }
 
 /// `Kind::Vault`'s own state.
@@ -422,6 +506,10 @@ pub struct Overlay {
     pub login: SignIn,
     /// The vault panel's own state.
     pub vault: VaultPanel,
+    /// `Kind::History`: what you sent, newest first.
+    pub history: Vec<String>,
+    /// The `zephyr.turns` answer for the rewind picker, once it came.
+    pub turns: Option<Vec<Turn>>,
     /// The first row shown and how many fit, from the last frame.
     top: usize,
     page: usize,
@@ -437,6 +525,8 @@ impl Overlay {
             placed: false,
             login: SignIn::default(),
             vault: VaultPanel::default(),
+            history: vec![],
+            turns: None,
             top: 0,
             page: 1,
         }
@@ -494,7 +584,9 @@ pub fn rows(
         Kind::Login => return login_rows(o, p, width),
         Kind::Vault => return vault_rows(o, p),
         Kind::Help => help_groups(),
+        Kind::History => return history_rows(o, p),
         Kind::Model => model_groups(o, snap, tz, now),
+        Kind::Rewind => rewind_groups(o),
     };
     let words: Vec<String> = o.query.split_whitespace().map(str::to_lowercase).collect();
     let mut out = vec![];
@@ -517,8 +609,15 @@ pub fn rows(
             out.extend(hit);
         }
     }
-    if out.is_empty() {
-        out.push(Row::Line(p.muted.fg("nothing matches")));
+    match (o.kind, &o.turns) {
+        (Kind::Rewind, None) => out.push(Row::Line(
+            p.muted.fg(&format!("listing your messages{}", glyph("…"))),
+        )),
+        (Kind::Rewind, Some(t)) if t.is_empty() => {
+            out.push(Row::Line(p.muted.fg("nothing to undo")))
+        }
+        _ if out.is_empty() => out.push(Row::Line(p.muted.fg("nothing matches"))),
+        _ => {}
     }
     if o.kind == Kind::Model && o.models.is_none() {
         out.push(Row::Line(
@@ -528,7 +627,52 @@ pub fn rows(
     out
 }
 
+/// Each exchange, newest first: picking the k-th sends `/undo k`.
+fn rewind_groups(o: &Overlay) -> Vec<Group> {
+    let items = (o.turns.iter().flatten().enumerate())
+        .map(|(i, t)| Row::Item {
+            pick: format!("/undo {}", i + 1),
+            label: t.text.split_whitespace().collect::<Vec<_>>().join(" "),
+            note: match t.channel.as_str() {
+                crate::attach::CHANNEL => "you".into(),
+                channel => channel.into(),
+            },
+            current: false,
+        })
+        .collect();
+    let note = "takes it and everything after back; files stay changed (see /rollback)";
+    vec![("rewind to before".into(), note.into(), items)]
+}
+
+/// The message a rewind pick (`/undo k`) takes back, for the composer.
+pub fn rewound(o: &Overlay, pick: &str) -> Option<String> {
+    let k: usize = pick.strip_prefix("/undo ")?.parse().ok()?;
+    Some(o.turns.as_ref()?.get(k.checked_sub(1)?)?.text.clone())
+}
+
 type Group = (String, String, Vec<Row>);
+
+/// Ctrl+R's rows: every entry holding what was typed, one line each.
+fn history_rows(o: &Overlay, p: &Palette) -> Vec<Row> {
+    let query = o.query.to_lowercase();
+    let rows: Vec<Row> = (o.history.iter())
+        .filter(|e| e.to_lowercase().contains(&query))
+        .map(|e| Row::Item {
+            pick: e.clone(),
+            label: e
+                .lines()
+                .collect::<Vec<_>>()
+                .join(&format!(" {} ", glyph("⏎"))),
+            note: String::new(),
+            current: false,
+        })
+        .collect();
+    match (rows.is_empty(), o.history.is_empty()) {
+        (false, _) => rows,
+        (true, true) => vec![Row::Line(p.muted.fg("nothing sent yet"))],
+        (true, false) => vec![Row::Line(p.muted.fg("nothing matches"))],
+    }
+}
 
 fn help_groups() -> Vec<Group> {
     let mut groups: Vec<Group> = vec![];
@@ -537,7 +681,11 @@ fn help_groups() -> Vec<Group> {
             groups.push((group.to_string(), String::new(), vec![]));
         }
         let item = Row::Item {
-            pick: insert(usage).to_string(),
+            // A key is pressed, not typed into the composer.
+            pick: match *group {
+                "Keys" => String::new(),
+                _ => insert(usage).to_string(),
+            },
             label: usage.to_string(),
             note: what.to_string(),
             current: false,
@@ -1165,7 +1313,7 @@ fn lists(o: &Overlay) -> bool {
     match o.kind {
         Kind::Status | Kind::Vault => false,
         Kind::Login => o.login.running().is_none(),
-        Kind::Model | Kind::Help => true,
+        Kind::Model | Kind::Help | Kind::History | Kind::Rewind => true,
     }
 }
 
@@ -1241,8 +1389,10 @@ pub fn render(
         Kind::Model => " model ",
         Kind::Status => " status ",
         Kind::Help => " commands ",
+        Kind::History => " history ",
         Kind::Login => " sign in ",
         Kind::Vault => " vault ",
+        Kind::Rewind => " rewind ",
     };
     let fill = width.saturating_sub(visible_width(title) + 3);
     let mut lines = vec![format!(
@@ -1355,12 +1505,24 @@ fn column<'a>(labels: impl Iterator<Item = &'a str>) -> usize {
         .unwrap_or(0)
 }
 
-/// Slash autocomplete: the commands the composer's text could still become.
+/// Autocomplete above the composer: what the text up to the cursor could still become.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Complete {
-    /// Indexes into [`COMMANDS`].
-    pub items: Vec<usize>,
+    pub items: Vec<Choice>,
     pub selected: usize,
+}
+
+/// One autocomplete row, from any source: a command, an argument, a saved prompt or a file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Choice {
+    pub label: String,
+    pub detail: String,
+    /// The text up to the cursor once it is taken; what follows the cursor stays. Equal to
+    /// the text already typed when there is nothing to complete (a command's arguments).
+    pub insert: String,
+    /// Enter takes it and sends: a command that needs nothing more. Otherwise Enter only
+    /// takes it.
+    pub then_run: bool,
 }
 
 /// The commands `text` is the start of, or whose arguments it is typing.
@@ -1376,24 +1538,101 @@ pub fn matches(text: &str) -> Vec<usize> {
         .collect()
 }
 
+/// The slash commands as choices: one still being named completes to its name, one whose
+/// arguments are being typed shows its usage and leaves the text alone.
+pub fn slash(text: &str) -> Vec<Choice> {
+    (matches(text).into_iter())
+        .map(|i| {
+            let (_, usage, what) = COMMANDS[i];
+            let ins = insert(usage);
+            Choice {
+                label: usage.to_string(),
+                detail: what.to_string(),
+                insert: if ins.starts_with(text) { ins } else { text }.to_string(),
+                then_run: !ins.ends_with(' '),
+            }
+        })
+        .collect()
+}
+
+/// A command's argument, from what the TUI already holds; `codes` is how many code blocks the
+/// transcript has.
+pub fn args(text: &str, s: &State, codes: usize) -> Vec<Choice> {
+    let Some((head, partial)) = text.rsplit_once(' ').filter(|_| !text.contains('\n')) else {
+        return vec![];
+    };
+    let mut options: Vec<(String, String)> = match head {
+        "/model" => {
+            let named = |a: &AccountModels| a.name.clone().unwrap_or_default();
+            let mut models: Vec<(String, String)> = (s.models.iter())
+                .flat_map(|a| a.models.iter().map(move |m| (m.clone(), named(a))))
+                .collect();
+            // Until `zephyr.models` has answered, each account's own model.
+            if models.is_empty() {
+                models = (s.snapshot.accounts.iter())
+                    .map(|a| (a.model.clone(), a.name.clone()))
+                    .chain(s.snapshot.model.clone().map(|m| (m, String::new())))
+                    .collect();
+            }
+            models
+        }
+        "/copy" => (1..=codes)
+            .map(|n| (n.to_string(), String::new()))
+            .collect(),
+        "/job run" | "/job rm" => (s.snapshot.jobs.iter())
+            .map(|j| (j.id.to_string(), j.name.clone()))
+            .collect(),
+        "/vault rm" | "/vault edit" | "/vault revoke" => {
+            s.vault.iter().map(|n| (n.clone(), String::new())).collect()
+        }
+        "/switch" => (s.sessions.iter())
+            .map(|x| (x.id.clone(), x.name.clone().unwrap_or_default()))
+            .collect(),
+        _ => return vec![],
+    };
+    let mut seen = std::collections::HashSet::new();
+    options.retain(|(value, _)| seen.insert(value.clone()));
+    let partial = partial.to_lowercase();
+    (options.into_iter())
+        // A `/rename` name or a job's finds its id too.
+        .filter(|(value, detail)| {
+            value.to_lowercase().contains(&partial) || detail.to_lowercase().contains(&partial)
+        })
+        .map(|(value, detail)| Choice {
+            insert: format!("{head} {value}"),
+            label: value,
+            detail,
+            then_run: true,
+        })
+        .collect()
+}
+
+/// `/p <name>`: the saved prompts, `(name, first line)`, whose names start with what is typed.
+pub fn prompt_args(text: &str, prompts: &[(String, String)]) -> Vec<Choice> {
+    let Some(partial) = (text.strip_prefix("/p ")).filter(|p| !p.contains([' ', '\n'])) else {
+        return vec![];
+    };
+    (prompts.iter())
+        .filter(|(name, _)| name.starts_with(partial))
+        .map(|(name, first)| Choice {
+            label: name.clone(),
+            detail: first.clone(),
+            insert: format!("/p {name}"),
+            then_run: true,
+        })
+        .collect()
+}
+
 /// The rows above the composer: at most six, scrolled to the selection.
 pub fn completions(s: &State, p: &Palette, width: usize, _now: i64) -> Vec<String> {
     const ROWS: usize = 6;
     let Some(c) = &s.complete else { return vec![] };
     let top = (c.selected + 1).saturating_sub(ROWS);
-    let shown: Vec<(usize, usize)> = c
-        .items
-        .iter()
-        .copied()
-        .enumerate()
-        .skip(top)
-        .take(ROWS)
-        .collect();
-    let w = column(shown.iter().map(|&(_, i)| COMMANDS[i].1));
+    let shown: Vec<(usize, &Choice)> = c.items.iter().enumerate().skip(top).take(ROWS).collect();
+    let w = column(shown.iter().map(|(_, c)| c.label.as_str()));
     shown
         .into_iter()
-        .map(|(k, i)| {
-            let (_, usage, what) = COMMANDS[i];
+        .map(|(k, choice)| {
             let sel = k == c.selected;
             let mark = if sel {
                 p.accent.fg(glyph("›"))
@@ -1401,11 +1640,16 @@ pub fn completions(s: &State, p: &Palette, width: usize, _now: i64) -> Vec<Strin
                 " ".into()
             };
             let label = format!(
-                "{usage}{}",
-                " ".repeat(w.saturating_sub(visible_width(usage)))
+                "{}{}",
+                choice.label,
+                " ".repeat(w.saturating_sub(visible_width(&choice.label)))
             );
             let label = if sel { bold(&label) } else { label };
-            let row = format!(" {mark} {}  {}", p.text.fg(&label), p.muted.fg(what));
+            let row = format!(
+                " {mark} {}  {}",
+                p.text.fg(&label),
+                p.muted.fg(&choice.detail)
+            );
             truncate_to_width(&row, width, glyph("…"))
         })
         .collect()
@@ -1567,26 +1811,40 @@ mod tests {
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(got.len(), 8);
         assert_eq!(got[2], format!("│ Chat{}│", " ".repeat(73)));
-        assert!(got[7].ends_with(" 1-5 of 59 ─╯"), "{got:?}");
-        for _ in 0..26 {
+        assert!(got[7].ends_with(" 1-5 of 83 ─╯"), "{got:?}");
+        for _ in 0..34 {
             key(&mut o, press(KeyCode::Down), &rows);
         }
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
-        // The twenty-seventh command is /memory ok; the window follows it down.
+        // The thirty-fifth command is /memory ok; the window follows it down.
         assert_eq!(
             got[6],
             "│  › /memory ok                  let the agent see the waiting change          │"
         );
-        assert!(got[7].ends_with(" 26-30 of 59 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 34-38 of 83 ─╯"), "{got:?}");
         key(&mut o, press(KeyCode::Down), &rows);
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),
             Action::Pick("/memory undo".into())
         );
+        // The last row is a key, which puts nothing in the composer.
         key(&mut o, press(KeyCode::End), &rows);
+        let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
+        assert_eq!(
+            got[6],
+            "│  › Esc Esc                     rewind: pick a message to take back and edit  │"
+        );
+        // A key is not something to put in the composer.
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),
-            Action::Pick("/reload".into())
+            Action::Pick(String::new())
+        );
+        for _ in 0..5 {
+            key(&mut o, press(KeyCode::Up), &rows);
+        }
+        assert_eq!(
+            key(&mut o, press(KeyCode::Enter), &rows),
+            Action::Pick(String::new())
         );
     }
 
@@ -1601,7 +1859,7 @@ mod tests {
             .collect();
         assert_eq!(
             heads,
-            ["Chat", "Agent", "Memory", "Schedule", "Vault", "Gateway"]
+            ["Chat", "Agent", "Memory", "Schedule", "Vault", "Gateway", "Keys"]
         );
         let mut o = Overlay::new(Kind::Help);
         o.query = "rule".into();
@@ -1616,6 +1874,46 @@ mod tests {
     }
 
     /// The memory, skill, connector and job commands in the list are the ones those modules answer.
+    #[test]
+    fn the_rewind_picker_lists_turns_newest_first_and_picks_undo_k() {
+        let s = Snapshot::default();
+        let mut o = Overlay::new(Kind::Rewind);
+        assert!(draw(&mut o, &s, 80, 12)[2].contains("listing your messages"));
+        o.turns = Some(vec![
+            Turn {
+                channel: "tui".into(),
+                text: "second\nline".into(),
+            },
+            Turn {
+                channel: "discord".into(),
+                text: "first".into(),
+            },
+        ]);
+        let got = draw(&mut o, &s, 60, 12);
+        assert_eq!(
+            got[0],
+            "╭─ rewind ─────────────────────────────────────────────────╮"
+        );
+        assert!(got[2].starts_with("│ rewind to before  takes it and everything after back;"));
+        assert_eq!(
+            got[3],
+            "│  › second line  you                                      │"
+        );
+        assert_eq!(
+            got[4],
+            "│    first        discord                                  │"
+        );
+        assert_eq!(hit(&mut o, &s, KeyCode::Down), Action::None);
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Enter),
+            Action::Pick("/undo 2".into())
+        );
+        assert_eq!(rewound(&o, "/undo 2").as_deref(), Some("first"));
+        assert_eq!(rewound(&o, "/undo 3"), None);
+        o.turns = Some(vec![]);
+        assert!(draw(&mut o, &s, 60, 12)[2].contains("nothing to undo"));
+    }
+
     #[test]
     fn listed_commands_are_the_ones_zephyr_answers() {
         let dir = crate::test_dir("tui-commands");
@@ -1771,8 +2069,9 @@ mod tests {
     fn autocomplete_matches_commands_and_their_arguments() {
         let usages =
             |t: &str| -> Vec<&str> { matches(t).into_iter().map(|i| COMMANDS[i].1).collect() };
-        // All but `!<command>`, which is not a slash command.
-        assert_eq!(usages("/").len(), COMMANDS.len() - 1);
+        // All but `!<command>` and the keys, which are not slash commands.
+        let commands = COMMANDS.iter().filter(|c| c.1.starts_with('/')).count();
+        assert_eq!(usages("/").len(), commands);
         assert!(usages("!").is_empty());
         assert_eq!(usages("/mo"), ["/model", "/model <provider/model>"]);
         assert_eq!(usages("/rule"), ["/rules", "/rule <text>", "/rule rm <n>"]);
@@ -1787,7 +2086,7 @@ mod tests {
 
         let s = State {
             complete: Some(Complete {
-                items: matches("/rule"),
+                items: slash("/rule"),
                 selected: 1,
             }),
             ..Default::default()
@@ -1804,6 +2103,95 @@ mod tests {
                 "   /rule rm <n>  remove rule n",
             ]
         );
+        // Naming a command completes it; typing its arguments leaves the text alone.
+        let taken = |t: &str| -> Vec<(String, bool)> {
+            (slash(t).into_iter())
+                .map(|c| (c.insert, c.then_run))
+                .collect()
+        };
+        assert_eq!(
+            taken("/rule"),
+            [
+                ("/rules".into(), true),
+                ("/rule ".into(), false),
+                ("/rule rm ".into(), false)
+            ]
+        );
+        assert_eq!(taken("/rule x"), [("/rule x".into(), false)]);
+    }
+
+    #[test]
+    fn arguments_complete_from_what_the_tui_holds() {
+        let mut s = State {
+            snapshot: snap(),
+            vault: vec!["github".into(), "gitlab".into(), "npm".into()],
+            ..Default::default()
+        };
+        let got = |t: &str, s: &State| -> Vec<(String, String, String)> {
+            (args(t, s, 3).into_iter())
+                .map(|c| (c.label, c.detail, c.insert))
+                .collect()
+        };
+        let one = |l: &str, d: &str, i: &str| (l.to_string(), d.to_string(), i.to_string());
+        // Before `zephyr.models` answered: each account's model.
+        assert_eq!(
+            got("/model gpt", &s),
+            [one("openai/gpt-6", "spare", "/model openai/gpt-6")]
+        );
+        s.models = models();
+        assert_eq!(
+            got("/model SONN", &s),
+            [one(
+                "anthropic/claude-sonnet-5",
+                "work",
+                "/model anthropic/claude-sonnet-5"
+            )]
+        );
+        assert_eq!(got("/copy ", &s).len(), 3);
+        assert_eq!(
+            got("/job run ", &s),
+            [one("3", "renew domain", "/job run 3")]
+        );
+        assert_eq!(got("/job rm 4", &s), []);
+        let names: Vec<String> = got("/vault rm git", &s).into_iter().map(|c| c.0).collect();
+        assert_eq!(names, ["github", "gitlab"]);
+        assert_eq!(got("/vault revoke npm", &s).len(), 1);
+        assert!(args("/vault revoke npm x", &s, 3).is_empty());
+        s.sessions = vec![
+            super::super::conn::SessionInfo {
+                id: "main".into(),
+                name: None,
+                at: 1,
+            },
+            super::super::conn::SessionInfo {
+                id: "main-9".into(),
+                name: Some("taxes".into()),
+                at: 2,
+            },
+        ];
+        assert_eq!(
+            got("/switch main-", &s),
+            [one("main-9", "taxes", "/switch main-9")]
+        );
+        // A `/rename` name finds its session.
+        assert_eq!(
+            got("/switch tax", &s),
+            [one("main-9", "taxes", "/switch main-9")]
+        );
+        assert!(args("/rule x", &s, 3).is_empty() && args("/model", &s, 3).is_empty());
+        assert!(args("/model a\nb", &s, 3).is_empty());
+        assert!(args("/copy 1", &s, 3).iter().all(|c| c.then_run));
+
+        let saved = [
+            ("hi".to_string(), "Say hi".to_string()),
+            ("review".to_string(), "Review $1".to_string()),
+        ];
+        let p: Vec<(String, String)> = (prompt_args("/p r", &saved).into_iter())
+            .map(|c| (c.label, c.insert))
+            .collect();
+        assert_eq!(p, [("review".to_string(), "/p review".to_string())]);
+        assert_eq!(prompt_args("/p ", &saved).len(), 2);
+        assert!(prompt_args("/p review x", &saved).is_empty());
     }
 
     /// Two of the providers the daemon offers, in its order.

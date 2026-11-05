@@ -1,5 +1,5 @@
   .◠◠.◠◠.       zephyr v0.1.0
-(               main · claude-code-1 › claude-opus-5-5
+(               main · claude-code-1 › claude-opus-5-5 · medium
  `-.___.-'      discord ●  imessage ●  chat ○                                                                  today 41.2k tok · $0.38 / $5
  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  ╭─ commands ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
@@ -11,11 +11,18 @@
  │    /btw <question>             ask a side question; the conversation is left as is                                                     │
  │    /undo                       take back your last message and its reply                                                               │
  │    /retry                      take it back and send it again                                                                          │
+ │    /undo <n>                   take back your last n, up to 20                                                                         │
  │    /compact [instructions]     summarise the conversation to free context                                                              │
+ │    /rename <name>              name this conversation                                                                                  │
+ │    /fork                       carry on in a copy; the original stays as is                                                            │
+ │    /export                     save it as markdown in the projects folder                                                              │
  │    /shell [zsh]                a shell in the container, as the agent                                                                  │
  │    !<command>                  run it; the next message carries its output                                                             │
  │    /copy                       copy the last reply                                                                                     │
  │    /copy <n>                   copy code block n, or click it                                                                          │
+ │    /p                          your saved prompts, /zephyr/prompts/*.md                                                                │
+ │    /p <name> [args]            put a saved prompt in the box, to send                                                                  │
+ │    /focus                      hide tool calls and thinking, or show them                                                              │
  │    /help                       this list                                                                                               │
  │    /quit                       leave (or /exit); zephyr keeps running                                                                  │
  │ Agent                                                                                                                                  │
@@ -26,15 +33,8 @@
  │    /process stop <id>          stop one command                                                                                        │
  │    /model                      pick a model                                                                                            │
  │    /model <provider/model>     switch the model after the current reply                                                                │
+ │    /thinking [level|next]      how hard the model thinks; Shift+Tab cycles                                                             │
  │    /rollback                   file checkpoints of the projects                                                                        │
  │    /rollback diff <n>          what changed since checkpoint n                                                                         │
- │    /rollback <n> [project]     put the files back as at n                                                                              │
- │    /ok <n>                     run the agent's proposal n                                                                              │
- │    /no <n>                     drop the agent's proposal n                                                                             │
- │ Memory                                                                                                                                 │
- │    /memory diff                the memory change waiting for you                                                                       │
- │    /memory ok                  let the agent see the waiting change                                                                    │
- │    /memory undo                drop the waiting change, else the last one                                                              │
- │    /memory log                 the last 10 memory commits                                                                              │
- ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 1-32 of 59 ─╯
-  ↑↓ choose · ⏎ insert · type to filter · esc close
+ ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 1-32 of 83 ─╯
+  ↑↓ choose · ⏎ insert · type to filter · esc close                                                                                 ctx 42%

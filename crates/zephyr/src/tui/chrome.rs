@@ -1,9 +1,10 @@
 //! The screen around the transcript: header, run line, queue strip and footer. Each is a pure
 //! function of [`State`] and the clock, drawn by a [`Region`] component.
 
-use super::conn::Snapshot;
+use super::conn::{AccountModels, Snapshot};
 use super::overlays::{Complete, Kind, Overlay};
 use super::theme::{glyph, Palette};
+use rpi_tui::theme::Color;
 use rpi_tui::{bold, truncate_to_width, visible_width, Component};
 use std::any::Any;
 use std::sync::{Arc, Mutex};
@@ -47,6 +48,88 @@ pub struct State {
     /// one-shots play from them.
     pub greeted: Option<i64>,
     pub finished: Option<i64>,
+    /// The last `zephyr.models` answer, for completing `/model`.
+    pub models: Vec<AccountModels>,
+    /// The vault's entry names, for completing `/vault rm` and the like.
+    pub vault: Vec<String>,
+    /// Tokens in the model's context after the last reply (its usage), for `ctx N%`.
+    /// shortcut: stale after /compact or /new until the next reply; ask rpi's `get_state`
+    /// `context.tokens` if that misleads.
+    pub context: Option<i64>,
+    /// The Ctrl+F search bar, while open.
+    pub search: Option<Search>,
+    /// `/focus` is on: tool cards and thinking are hidden.
+    pub focus: bool,
+    /// An approval or proposal is waiting for the owner's OK: the window title says so.
+    pub asking: bool,
+    /// The saved main sessions (`zephyr.sessions`), asked for on connect and after each
+    /// `/rename`, `/fork`, `/switch` and `/new` reply.
+    pub sessions: Vec<super::conn::SessionInfo>,
+}
+
+/// Ctrl+F over the transcript's rows as drawn.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Search {
+    pub query: String,
+    /// The transcript rows with a match, top first.
+    pub rows: Vec<usize>,
+    /// The match shown, an index into `rows`.
+    pub at: usize,
+}
+
+impl Search {
+    /// Finds the query in `lines` again, case-insensitively, and shows the newest match: the
+    /// transcript is read from the bottom up.
+    pub fn refresh(&mut self, lines: &[String]) {
+        let q = self.query.to_lowercase();
+        self.rows = (0..lines.len())
+            .filter(|&i| {
+                !q.is_empty() && rpi_tui::strip_ansi(&lines[i]).to_lowercase().contains(&q)
+            })
+            .collect();
+        self.at = self.rows.len().saturating_sub(1);
+    }
+
+    /// Moves to the match above (`older`) or below, wrapping, and returns its row.
+    pub fn step(&mut self, older: bool) -> Option<usize> {
+        let n = self.rows.len();
+        if n == 0 {
+            return None;
+        }
+        self.at = if older {
+            (self.at + n - 1) % n
+        } else {
+            (self.at + 1) % n
+        };
+        self.current()
+    }
+
+    pub fn current(&self) -> Option<usize> {
+        self.rows.get(self.at).copied()
+    }
+}
+
+/// The window title: idle, working, or waiting for the owner's OK.
+pub fn title(s: &State) -> &'static str {
+    if s.asking {
+        "✋ zephyr"
+    } else if s.snapshot.run.busy {
+        "✦ zephyr"
+    } else {
+        "◇ zephyr"
+    }
+}
+
+/// The search bar above the run line, while Ctrl+F is open.
+pub fn search_bar(s: &State, p: &Palette, width: usize, _now: i64) -> Vec<String> {
+    let Some(f) = &s.search else { return vec![] };
+    let left = format!("  {} {}", p.accent.fg(&bold("find")), p.text.fg(&f.query));
+    let right = match f.rows.len() {
+        _ if f.query.is_empty() => String::new(),
+        0 => p.warning.fg("no match"),
+        n => p.muted.fg(&format!("{} of {n}", f.at + 1)),
+    };
+    vec![spread(&left, &format!("{right} "), width)]
 }
 
 impl Default for State {
@@ -62,6 +145,13 @@ impl Default for State {
             complete: None,
             greeted: None,
             finished: None,
+            models: vec![],
+            vault: vec![],
+            context: None,
+            search: None,
+            focus: false,
+            asking: false,
+            sessions: vec![],
         }
     }
 }
@@ -402,14 +492,17 @@ fn account_model(snap: &Snapshot, p: &Palette) -> String {
         .as_deref()
         .map(short_model)
         .unwrap_or("default model");
+    let thinking = (snap.thinking.as_ref()).map_or(String::new(), |t| {
+        p.muted.fg(&format!(" {} {t}", glyph("·")))
+    });
     match &snap.account {
         Some(a) => format!(
-            "{} {} {}",
+            "{} {} {}{thinking}",
             p.text.fg(a),
             p.muted.fg(glyph("›")),
             p.text.fg(model)
         ),
-        None => p.text.fg(model),
+        None => format!("{}{thinking}", p.text.fg(model)),
     }
 }
 
@@ -621,7 +714,8 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
         (Some(o), _) => {
             let (choose, pick) = match o.kind {
                 Kind::Model => ("choose", Some("switch")),
-                Kind::Help => ("choose", Some("insert")),
+                Kind::Help | Kind::History => ("choose", Some("insert")),
+                Kind::Rewind => ("choose", Some("undo")),
                 Kind::Status => ("scroll", None),
                 // The vault panel names its own keys on its last row.
                 Kind::Vault => ("choose", None),
@@ -652,6 +746,11 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
             ));
             hints
         }
+        (None, _) if s.search.is_some() => vec![
+            (key(enter, "older"), 0),
+            (key(&format!("{}{enter}", glyph("⇧")), "newer"), 1),
+            (key("esc", "close"), 2),
+        ],
         (None, Some(_)) => vec![
             (key(arrows, "choose"), 2),
             (key("tab", "complete"), 1),
@@ -682,13 +781,21 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
             hints = vec![(p.warning.fg(hint), 0)];
         }
     }
+    if s.focus {
+        hints.insert(0, (p.accent.fg("focus"), 0));
+    }
 
     let mut right = vec![];
     if width < MASCOT_MIN_WIDTH {
         right.extend(failed(s, p));
-        if s.link == Link::Up {
-            right.push(spend(&s.snapshot, p));
-        }
+    }
+    if let (Some(used), Some(window), Link::Up) = (s.context, s.snapshot.context_window, &s.link) {
+        let share = used as f64 / window.max(1) as f64;
+        let pct = format!("ctx {}%", (share * 100.0).round() as i64);
+        right.push(gauge(p, share).fg(&pct));
+    }
+    if width < MASCOT_MIN_WIDTH && s.link == Link::Up {
+        right.push(spend(&s.snapshot, p));
     }
     // Hints drop off first, then spend; failed replies stay.
     loop {
@@ -731,14 +838,18 @@ pub fn spend(snap: &Snapshot, p: &Palette) -> String {
     .into_iter()
     .flatten()
     .fold(0.0, f64::max);
-    let color = if used >= 1.0 {
+    gauge(p, used).fg(&format!("{tokens} {} {cost}", glyph("·")))
+}
+
+/// How full something is: the warning colour from 80%, error from 100%.
+fn gauge(p: &Palette, used: f64) -> Color {
+    if used >= 1.0 {
         p.error
     } else if used >= 0.8 {
         p.warning
     } else {
         p.muted
-    };
-    color.fg(&format!("{tokens} {} {cost}", glyph("·")))
+    }
 }
 
 /// The wind glyph cycle, about 6 frames a second.
@@ -1148,6 +1259,27 @@ mod tests {
     }
 
     #[test]
+    fn the_footer_shows_how_full_the_context_is_and_the_header_the_thinking_level() {
+        let mut s = up();
+        s.context = Some(84_000);
+        let f = plain(footer(&s, &DARK, 120, NOW)).remove(0);
+        assert!(!f.contains("ctx"), "no window known: {f}");
+        s.snapshot.context_window = Some(200_000);
+        let f = plain(footer(&s, &DARK, 120, NOW)).remove(0);
+        assert!(f.ends_with("ctx 42% "), "{f}");
+        let ctx = |s: &State| footer(s, &DARK, 120, NOW).remove(0);
+        assert!(ctx(&s).contains(&DARK.muted.fg("ctx 42%")));
+        s.context = Some(170_000);
+        assert!(ctx(&s).contains(&DARK.warning.fg("ctx 85%")));
+        s.snapshot.thinking = Some("high".into());
+        let h = plain(header(&s, &DARK, 120, NOW));
+        assert!(
+            h[1].contains("claude-code-1 › claude-opus-5-5 · high"),
+            "{h:?}"
+        );
+    }
+
+    #[test]
     fn footer_hints_follow_the_open_panel() {
         let mut s = up();
         let left = |s: &State, w| plain(footer(s, &DARK, w, NOW))[0].clone();
@@ -1192,7 +1324,7 @@ mod tests {
         );
         s.overlay = None;
         s.complete = Some(Complete {
-            items: vec![0],
+            items: super::super::overlays::slash("/new"),
             selected: 0,
         });
         let f = left(&s, 120);
@@ -1200,5 +1332,63 @@ mod tests {
             f.starts_with("  ↑↓ choose · tab complete · ⏎ run · esc dismiss  "),
             "{f}"
         );
+    }
+
+    #[test]
+    fn search_starts_at_the_newest_match_and_wraps_both_ways() {
+        let lines: Vec<String> = ["Backup ok", "x", "\x1b[1mbackup\x1b[0m failed", "BACKUP"]
+            .map(String::from)
+            .to_vec();
+        let mut f = Search {
+            query: "backup".into(),
+            ..Default::default()
+        };
+        f.refresh(&lines);
+        assert_eq!((f.rows.clone(), f.current()), (vec![0, 2, 3], Some(3)));
+        assert_eq!(f.step(true), Some(2));
+        assert_eq!(f.step(true), Some(0));
+        assert_eq!(f.step(true), Some(3));
+        assert_eq!(f.step(false), Some(0));
+        f.query.clear();
+        f.refresh(&lines);
+        assert_eq!((f.rows.len(), f.step(true)), (0, None));
+    }
+
+    #[test]
+    fn the_search_bar_counts_matches_and_the_footer_names_its_keys() {
+        let mut s = up();
+        assert!(search_bar(&s, &DARK, 40, NOW).is_empty());
+        s.search = Some(Search {
+            query: "backup".into(),
+            rows: vec![4, 9],
+            at: 1,
+        });
+        let bar = plain(search_bar(&s, &DARK, 40, NOW)).remove(0);
+        assert_eq!(bar, format!("  find backup{}2 of 2 ", " ".repeat(20)));
+        s.search.as_mut().unwrap().rows.clear();
+        assert!(plain(search_bar(&s, &DARK, 40, NOW))[0].ends_with("no match "));
+        let f = plain(footer(&s, &DARK, 80, NOW)).remove(0);
+        assert!(f.starts_with("  ⏎ older · ⇧⏎ newer · esc close"), "{f}");
+    }
+
+    #[test]
+    fn focus_shows_in_the_footer() {
+        let mut s = up();
+        s.focus = true;
+        let f = plain(footer(&s, &DARK, 120, NOW)).remove(0);
+        assert!(f.starts_with("  focus · ⏎ send"), "{f}");
+        // It outlasts the other hints when the row is short.
+        let narrow = plain(footer(&s, &DARK, 20, NOW)).remove(0);
+        assert!(narrow.starts_with("  focus"), "{narrow}");
+    }
+
+    #[test]
+    fn the_title_tells_idle_working_and_waiting() {
+        let mut s = up();
+        assert_eq!(title(&s), "◇ zephyr");
+        s.snapshot.run.busy = true;
+        assert_eq!(title(&s), "✦ zephyr");
+        s.asking = true;
+        assert_eq!(title(&s), "✋ zephyr");
     }
 }

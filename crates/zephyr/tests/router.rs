@@ -2664,6 +2664,140 @@ async fn retry_undoes_and_sends_the_same_text_once() {
 }
 
 #[tokio::test]
+async fn undo_n_takes_that_many_exchanges_back() {
+    let home = home("undo-n");
+    let gw = start(config(&home));
+    for (n, text) in ["one", "two", "three", "four"].iter().enumerate() {
+        gw.say(&format!("m{n}"), "owner", text).await;
+        gw.wait_replies(n + 1).await;
+    }
+    for (id, bad) in [("b1", "/undo 0"), ("b2", "/undo 21"), ("b3", "/undo x")] {
+        gw.say(id, "owner", bad).await;
+    }
+    let replies = gw.wait_replies(7).await;
+    assert!(replies[4..]
+        .iter()
+        .all(|r| r == "[zephyr] usage: /undo [n], 1 to 20 (default 1)"));
+    gw.say("m5", "owner", "/undo 3").await;
+    assert_eq!(
+        gw.wait_replies(8).await[7],
+        "[zephyr] undone: the agent no longer sees your last 3 messages or their replies; \
+         files it changed stay changed (see /rollback)"
+    );
+    // The leaf goes on the reply to "one": the three exchanges after it are gone.
+    assert_eq!(log(&home, "navigate")[0]["targetId"], "m1");
+    assert_eq!(texts(&home), ["[chat #1] one", "echo: [chat #1] one"]);
+    assert_eq!(inbox_status(&home, "undone"), 3);
+    gw.say("m6", "owner", "/undo 2").await;
+    assert_eq!(
+        gw.wait_replies(9).await[8],
+        "[zephyr] only 1 of your messages to undo"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn rename_names_the_conversation_in_switch() {
+    let home = home("rename");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "plan the trip to Busan in early May please")
+        .await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "/rename").await;
+    gw.say("m3", "owner", "/rename trip").await;
+    let replies = gw.wait_replies(3).await;
+    assert_eq!(replies[1], "[zephyr] usage: /rename <name>");
+    assert_eq!(replies[2], "[zephyr] main is now called \"trip\"");
+    gw.say("m4", "owner", "/switch").await;
+    let list = gw.wait_replies(4).await[3].clone();
+    assert!(
+        list.contains("* main  ")
+            && list.ends_with("  \"trip\"  plan the trip to Busan in…  (current)"),
+        "{list}"
+    );
+    let names = Store::open(&home.join("state.db"))
+        .unwrap()
+        .session_names()
+        .unwrap();
+    assert_eq!(names["main"], "trip");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn fork_carries_on_in_a_copy_and_leaves_the_original() {
+    let home = home("fork");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "one").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "/fork").await;
+    let reply = gw.wait_replies(2).await[1].clone();
+    let fork = reply
+        .strip_prefix("[zephyr] forked main into ")
+        .and_then(|r| r.strip_suffix(", where you are now; /switch main goes back"))
+        .unwrap_or_else(|| panic!("{reply}"))
+        .to_string();
+    assert!(fork.starts_with("main-"), "{fork}");
+    gw.say("m3", "owner", "two").await;
+    assert_eq!(gw.wait_replies(3).await[2], "echo: [chat #3] two");
+    assert_eq!(
+        log(&home, "start").last().unwrap()["sessionId"],
+        fork.as_str()
+    );
+    assert_eq!(texts(&home), ["[chat #1] one", "echo: [chat #1] one"]);
+    let held: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.join(format!("sessions/{fork}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(held["messages"].as_array().unwrap().len(), 4);
+    gw.say("m4", "owner", "/switch").await;
+    let list = gw.wait_replies(4).await[3].clone();
+    assert!(
+        list.contains(&format!("* {fork}  ")) && list.contains("\n  main  "),
+        "{list}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn export_writes_the_conversation_into_the_projects_folder() {
+    let home = home("export");
+    let mut cfg = config(&home);
+    cfg.projects = None;
+    let gw = start(cfg);
+    gw.say("m1", "owner", "/export").await;
+    assert!(gw.wait_replies(1).await[0].contains("started without ZEPHYR_PROJECTS"));
+    gw.shutdown().await;
+
+    let mut cfg = config(&home);
+    cfg.projects = Some(home.join("projects"));
+    std::fs::create_dir_all(home.join("projects")).unwrap();
+    let gw = start(cfg);
+    gw.say("m2", "owner", "[tool] look around").await;
+    gw.wait_replies(1).await;
+    gw.say("m3", "owner", "/export").await;
+    let reply = gw.wait_replies(2).await[1].clone();
+    let path = PathBuf::from(reply.strip_prefix("[zephyr] exported to ").unwrap());
+    assert_eq!(path.parent().unwrap(), home.join("projects/zephyr-exports"));
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        name.starts_with("main-") && name.ends_with(".md") && name.len() == 21,
+        "{name}"
+    );
+    let md = std::fs::read_to_string(&path).unwrap();
+    assert!(md.starts_with("# zephyr conversation main\n"), "{md}");
+    assert!(md.contains("\n## chat\n\n[tool] look around\n"), "{md}");
+    assert!(md.contains("\n- `bash` {\"command\":\"true\"}\n"), "{md}");
+    // Written as the agent: outside a container that is whoever runs the daemon.
+    use std::os::unix::fs::MetadataExt;
+    let (file, dir) = (
+        std::fs::metadata(&path).unwrap(),
+        std::fs::metadata(&home).unwrap(),
+    );
+    assert_eq!((file.uid(), file.gid()), (dir.uid(), dir.gid()));
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn compact_replies_with_rpis_summary() {
     let home = home("compact");
     let gw = start(config(&home));

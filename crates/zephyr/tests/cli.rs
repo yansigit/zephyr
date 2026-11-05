@@ -168,6 +168,11 @@ token_file = "{}"
         .unwrap();
     let text = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
 
+    // Every rpi command zephyr sends is one the fake child (like rpi 0.18) says it supports.
+    assert!(
+        text.contains("ok   ready.supportedCommands covers"),
+        "{text}"
+    );
     assert!(
         text.contains("FAIL env ZEPHYR_TEST_DISCORD_TOKEN_UNSET is set (discord token)"),
         "{text}"

@@ -11,7 +11,10 @@
 //! `zephyr.hello`, `zephyr.subscribe` and `zephyr.models` are Zephyr's own additions
 //! (DESIGN §4.3.1), as are `zephyr.login_providers`/`_start`/`_poll`/`_input`/`_cancel`, which
 //! sign a provider in on the live gateway (`crate::auth`), and `zephyr.vault_list`/`_put`/`_rm`/
-//! `_revoke`, the owner's credential vault (`crate::vault`). `zephyr.login_start` answers once rpi's
+//! `_revoke`, the owner's credential vault (`crate::vault`), `zephyr.sessions`, the saved main
+//! sessions with their `/rename` names, and `zephyr.turns`, the exchanges `/undo N` counts, newest
+//! first, for the TUI's rewind picker, and `zephyr.dequeue`, which takes back the `tui` messages
+//! still waiting (a `send` prompt with `followUp: true` waits for the settle). `zephyr.login_start` answers once rpi's
 //! child has started, not at once: rpi may be asked for a model first, so the `loginId` can take a
 //! few seconds, and the sign-in URL follows on the daemon's 5 s tick rather than in the reply.
 
@@ -36,8 +39,15 @@ const SUB_ID: u64 = 1;
 const MAX_LINE: u64 = 1 << 20;
 const UNAUTHORIZED: i64 = -32001;
 
-/// Asks the router for the session history plus a receiver for every child event after it.
-pub type AttachRequest = oneshot::Sender<(Value, broadcast::Receiver<Value>)>;
+/// What a connection asks of the router.
+pub enum AttachRequest {
+    /// The session history plus a receiver for every child event after it.
+    History(oneshot::Sender<(Value, broadcast::Receiver<Value>)>),
+    /// A prompt sent with `followUp: true`: held until the run settles (DESIGN §4.1).
+    FollowUp(Inbound),
+    /// `zephyr.dequeue`: the texts of this channel's messages still waiting, withdrawn.
+    Dequeue(oneshot::Sender<Vec<String>>),
+}
 
 /// Reads the attach token. Never log the result.
 pub fn token(a: &Attach) -> anyhow::Result<String> {
@@ -289,10 +299,48 @@ impl Conn {
                     (vec![error(id, -32602, "unknown login")], false)
                 }
             }
+            "zephyr.dequeue" => {
+                let (tx, rx) = oneshot::channel();
+                let asked = self.router.send(AttachRequest::Dequeue(tx)).await;
+                match (asked, rx.await) {
+                    (Ok(()), Ok(texts)) => (vec![ok(id, json!({ "texts": texts }))], false),
+                    _ => (vec![error(id, -32000, "gateway is shutting down")], true),
+                }
+            }
             "zephyr.vault_list"
             | "zephyr.vault_put"
             | "zephyr.vault_rm"
             | "zephyr.vault_revoke" => self.vault(id, method, params).await,
+            "zephyr.sessions" => {
+                let cfg = self.cfgs.borrow().clone();
+                let names = (crate::store::Store::open(&cfg.db_path()))
+                    .and_then(|s| s.session_names())
+                    .unwrap_or_default();
+                let sessions: Vec<Value> = (crate::rpc::saved_sessions(&cfg.session_dir()))
+                    .into_iter()
+                    .map(|(s, at)| json!({"name": names.get(&s), "id": s, "at": at}))
+                    .collect();
+                (vec![ok(id, json!({ "sessions": sessions }))], false)
+            }
+            "zephyr.turns" => {
+                // The router's own `get_messages`, so the picker counts what `/undo N` will.
+                let (tx, rx) = oneshot::channel();
+                let history = match self.router.send(AttachRequest::History(tx)).await {
+                    Ok(()) => rx.await.map(|(history, _)| history).unwrap_or_default(),
+                    Err(_) => Value::Null,
+                };
+                let messages = history["messages"]
+                    .as_array()
+                    .map_or(&[][..], Vec::as_slice);
+                let turns: Vec<Value> = (crate::router::turns(messages).into_iter().rev())
+                    .filter_map(|i| {
+                        let text = message_text(&messages[i]);
+                        let (channel, _, body) = untag(&text)?;
+                        Some(json!({"channel": channel, "text": body}))
+                    })
+                    .collect();
+                (vec![ok(id, json!({ "turns": turns }))], false)
+            }
             _ => (vec![error(id, -32601, "method not found")], false),
         }
     }
@@ -387,7 +435,7 @@ impl Conn {
     async fn history(&mut self) -> Result<Value, &'static str> {
         let (tx, rx) = oneshot::channel();
         self.router
-            .send(tx)
+            .send(AttachRequest::History(tx))
             .await
             .map_err(|_| "gateway is shutting down")?;
         let (history, live) = rx.await.map_err(|_| "gateway is shutting down")?;
@@ -432,7 +480,11 @@ impl Conn {
             sender: "token".into(),
             text: text.into(),
         };
-        if self.inbound.send(m).await.is_err() {
+        let sent = match cmd["followUp"] == true {
+            true => self.router.send(AttachRequest::FollowUp(m)).await.is_ok(),
+            false => self.inbound.send(m).await.is_ok(),
+        };
+        if !sent {
             return (vec![error(id, -32000, "gateway is shutting down")], true);
         }
         (

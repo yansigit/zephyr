@@ -77,7 +77,40 @@ the indent. Copying goes through the terminal (OSC 52), so it reaches the clipbo
 you are typing on, even over ssh. It works in iTerm2, Ghostty, kitty, WezTerm and Alacritty, and
 inside tmux only with `set -g set-clipboard on`; macOS Terminal.app does not support it and copies
 nothing. Under `NO_COLOR` a click may not find the block; `/copy N` and `^X` still work. `/quit` or
-`/exit` leaves the UI like `^D`, and the agent keeps running.
+`/exit` leaves the UI like `^D`, and the agent keeps running. A double-click copies the word under
+it, a triple-click the row, and Shift+click copies from your last click to this one (some terminals,
+kitty and WezTerm among them, keep Shift+click for their own selection and never pass it on).
+
+## Typing and moving around
+
+In `zephyr attach` (`?` lists all of these):
+
+| Key | What it does |
+|---|---|
+| `↑` / `↓` | Your earlier messages, from the top or bottom row of the box; editing one makes it your draft. `↑` on an empty box first brings back what `^C` cleared |
+| `^R` | Search your earlier messages; Enter puts one in the box, unsent |
+| `Alt+S` | Put the draft aside and clear the box; on an empty box, bring the last one back |
+| `@path` | A file in the projects folder (`@~/x` in `/zephyr`, `@/x` as written); Tab completes. Sent as its full path, and an image (png, jpg, gif, webp) goes along for the agent to look at. Dragging a file from the projects folder onto the terminal types its `@path`; one from anywhere else can't be seen in the container |
+| `^G` | Edit the draft in `$VISUAL` or `$EDITOR` (`nano` by default); it comes back to the box, unsent |
+| `/p [name] [args]` | Saved prompts: `/p` lists them, `/p name args` puts one in the box to read and send, with `$ARGUMENTS` and `$1`..`$9` filled in. Each is a markdown file in `~/.zephyr/prompts/` (`/zephyr/prompts/` in the container), so you can ask the agent to write one |
+| `Enter` mid-reply | Steers your message into the running turn |
+| `Alt+Enter` | Holds the message until the reply ends, then sends it as a request of its own (when idle, the same as Enter) |
+| `Alt+Up` | Take back your messages that haven't reached the agent yet (held follow-ups, or ones waiting behind `/pause`) to edit; a steered one is already the agent's |
+| `Shift+Tab` | The next thinking level |
+| `Ctrl+P` | The next model of the account (`Ctrl+Shift+P` the one before, where the terminal tells them apart) |
+| `Esc` `Esc` | On an empty box: pick one of your messages to rewind to; it and everything after leave the agent's context (`/undo N`) and it comes back to the box to edit |
+| `Ctrl+F` | Search the conversation: the newest match first, `Enter` or `Ctrl+G` the one above, `Shift+Enter` or `Ctrl+Shift+G` the one below, `Esc` closes |
+| `Ctrl+Up` / `Ctrl+Down` | Jump to your previous or next message |
+| `Home` / `End` | Top or bottom of the conversation, when the composer is empty |
+| `/focus` | Hide tool calls and thinking (again to show them); `focus` shows in the footer |
+
+Drafts put aside are gone when you detach; the history starts again from the messages in the conversation. The footer shows `ctx N%`, how full the model's context is after the last reply.
+
+The window title shows `◇` idle, `✦` working and `✋` when something waits for your OK, and the tab
+shows a progress bar while the agent works. When you are in another window and a reply finishes or
+an OK is asked for, the terminal gets a notification (`zephyr: reply ready` or `needs your OK`, at
+most one every 10 s). iTerm2, WezTerm, kitty, Ghostty and Windows Terminal show these; other
+terminals just ring the bell, or nothing.
 
 ## Changing settings
 
@@ -93,15 +126,21 @@ Changes apply by themselves; nothing needs `zephyr restart`. The commands above,
 
 A file that does not load is not applied, and the daemon keeps its current settings. From any
 channel: `/model` shows the models, `/model PROVIDER/MODEL` switches (to the account on that
-provider), `/status` shows the agent's account and model, `/reload` re-reads the files, and `/new`
+provider), `/thinking` shows how hard the model thinks and `/thinking LEVEL` or `/thinking next`
+changes it from the next request (kept until the daemon restarts), `/status` shows the agent's account and model, `/reload` re-reads the files, and `/new`
 starts a fresh conversation (memory and rules carry over; the old one stays in `sessions/`), and
-`/switch` lists the earlier ones and `/switch ID` goes back to one.
+`/switch` lists the earlier ones (with their names and first words) and `/switch ID` goes back to
+one. `/rename NAME` names the current one; `zephyr attach` shows the name in its header.
+`/fork` copies the conversation as it stands and carries on in the copy (the original stays, for
+`/switch`). `/export` writes the conversation as markdown to
+`<projects>/zephyr-exports/<session>-<YYYYmmdd-HHMM>.md`, owned by you on the host.
 `/btw QUESTION` asks a side question about the conversation, even mid-reply: a throwaway agent with
 no tools answers it as `[btw] …` from a copy of the conversation, which is left as is.
 `/undo` takes your last message and its reply out of the agent's context (files it changed stay
-changed; another `/undo` goes one further back), `/retry` does that and sends the message again,
-and `/compact [INSTRUCTIONS]` has rpi summarise the conversation so far to make room and tells you
-how much it kept. These three wait for the agent to finish (or `/stop` it). `/usage [DAYS]` lists
+changed, see `/rollback`; another `/undo` goes one further back), `/undo N` the last N (up to 20),
+`/retry` does that and sends the message again, and `/compact [INSTRUCTIONS]` has rpi summarise the
+conversation so far to make room and tells you how much it kept. These and `/fork` wait for the
+agent to finish (or `/stop` it). `/usage [DAYS]` lists
 the spend per day and per account over the last 7 days, or `DAYS`.
 `/login` signs an account in from here: `/login` lists the provider ids, `/login PROVIDER [ACCOUNT]
 [MODEL]` starts an OAuth sign-in and needs no re-exec (a key or a token is refused — it is typed in
@@ -109,10 +148,13 @@ the spend per day and per account over the last 7 days, or `DAYS`.
 The first account of an empty install does restart the agent once, when idle: there is nothing for
 it to start on until that account exists.
 
-Two more in `zephyr attach` only: `!COMMAND` runs `bash -c COMMAND` as the agent in its home (60 s at
+In `zephyr attach` only: `!COMMAND` runs `bash -c COMMAND` as the agent in its home (60 s at
 most, the first 50 KB of output kept) and shows the output and exit code; it goes to the agent in
 front of your next message (not a `/` command), and Esc on an empty composer drops it instead.
 `/shell [zsh]` opens an interactive login shell as the agent in place of the UI; exit it to come back.
+Esc twice on an empty composer, with the agent idle, opens a rewind list of your messages in this
+conversation, newest first: picking one sends `/undo N` back to before it and puts it in the
+composer to edit and send again.
 
 `ZEPHYR_CONTAINER` (default `zephyr`) and `ZEPHYR_IMAGE` choose another container or image, for
 example to test beside a live install.
