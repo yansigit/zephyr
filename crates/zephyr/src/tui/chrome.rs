@@ -47,6 +47,9 @@ pub struct State {
     /// one-shots play from them.
     pub greeted: Option<i64>,
     pub finished: Option<i64>,
+    /// The saved main sessions (`zephyr.sessions`), asked for on connect and after each
+    /// `/rename`, `/fork`, `/switch` and `/new` reply.
+    pub sessions: Vec<super::conn::SessionInfo>,
 }
 
 impl Default for State {
@@ -62,6 +65,7 @@ impl Default for State {
             complete: None,
             greeted: None,
             finished: None,
+            sessions: vec![],
         }
     }
 }
@@ -622,6 +626,7 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
             let (choose, pick) = match o.kind {
                 Kind::Model => ("choose", Some("switch")),
                 Kind::Help => ("choose", Some("insert")),
+                Kind::Rewind => ("choose", Some("undo")),
                 Kind::Status => ("scroll", None),
                 // The vault panel names its own keys on its last row.
                 Kind::Vault => ("choose", None),

@@ -162,6 +162,10 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
                         json!({"subscriptionId": 1, "sessionId": "main", "status": "subscribed", "messages": history()})
                     }
                     "zephyr.models" => models(),
+                    "zephyr.turns" => json!({"turns": [
+                        {"channel": "tui", "text": "what's in ~/Projects/zephyr/deploy?"},
+                        {"channel": "discord", "text": "remind me to renew the domain on friday"},
+                    ]}),
                     "send" => {
                         let text = req["params"]["command"]["content"]
                             .as_str()
@@ -180,6 +184,7 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
                 let reply = match text {
                     "/stop" => Some("[zephyr] stopped".to_string()),
                     t if t.starts_with("/model ") => Some(format!("[zephyr] now on {}", &t[7..])),
+                    t if t.starts_with("/undo") => Some("[zephyr] undone".to_string()),
                     _ => None,
                 };
                 if let Some(reply) = reply {
@@ -520,6 +525,31 @@ async fn panels_pick_a_model_list_commands_and_close() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn esc_esc_rewinds_to_a_picked_message() {
+    if tmux_missing() {
+        return;
+    }
+    let mut screen = Screen::start("idle", 80, 24, "dark").await;
+    screen.wait_for("^L model").await;
+    screen.keys(&["Escape", "Escape"]);
+    screen.wait_for("╭─ rewind").await;
+    let picker = screen.wait_for("renew the domain on friday  discord").await;
+    assert!(
+        picker.contains("› what's in ~/Projects/zephyr/deploy?  you"),
+        "{picker}"
+    );
+    // The pick takes it back and puts it in the composer to edit.
+    screen.keys(&["Enter"]);
+    assert_eq!(screen.next_sent().await, "/undo 1");
+    let after = screen.wait_for("· undone").await;
+    assert!(!after.contains("╭─ rewind"), "{after}");
+    assert!(
+        after.contains("│ what's in ~/Projects/zephyr/deploy?"),
+        "{after}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn screens_match_the_goldens() {
     if tmux_missing() {
         return;
@@ -534,7 +564,8 @@ async fn screens_match_the_goldens() {
     let complete = ("^L model", &["=/"][..], "tab complete");
     // (golden name, scene, size, theme, (ready, keys, shown))
     #[allow(clippy::type_complexity)]
-    let shots: [(&str, &'static str, u16, u16, &str, (&str, &[&str], &str)); 22] = [
+    let rewind = ("^L model", &["Escape", "Escape"][..], "friday  discord");
+    let shots: [(&str, &'static str, u16, u16, &str, (&str, &[&str], &str)); 23] = [
         ("busy", "busy", 80, 24, "dark", busy),
         ("busy", "busy", 80, 24, "light", busy),
         ("busy", "busy", 140, 40, "dark", busy),
@@ -583,6 +614,7 @@ async fn screens_match_the_goldens() {
         ("help", "idle", 80, 24, "light", help),
         ("help", "idle", 140, 40, "dark", help),
         ("complete", "idle", 80, 24, "dark", complete),
+        ("rewind", "idle", 80, 24, "dark", rewind),
         (
             "model",
             "idle",
