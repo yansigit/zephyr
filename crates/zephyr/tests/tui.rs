@@ -562,9 +562,9 @@ async fn screens_match_the_goldens() {
     let status = ("^L model", &["C-s"][..], "╭─ status");
     let help = ("^L model", &["?"][..], "╭─ commands");
     let complete = ("^L model", &["=/"][..], "tab complete");
+    let rewind = ("^L model", &["Escape", "Escape"][..], "friday  discord");
     // (golden name, scene, size, theme, (ready, keys, shown))
     #[allow(clippy::type_complexity)]
-    let rewind = ("^L model", &["Escape", "Escape"][..], "friday  discord");
     let shots: [(&str, &'static str, u16, u16, &str, (&str, &[&str], &str)); 23] = [
         ("busy", "busy", 80, 24, "dark", busy),
         ("busy", "busy", 80, 24, "light", busy),

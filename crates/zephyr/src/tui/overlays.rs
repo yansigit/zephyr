@@ -591,9 +591,10 @@ fn help_groups() -> Vec<Group> {
         }
         let item = Row::Item {
             // A key has nothing to type.
-            pick: (*group != "Keys")
-                .then(|| insert(usage).to_string())
-                .unwrap_or_default(),
+            pick: match *group {
+                "Keys" => String::new(),
+                _ => insert(usage).to_string(),
+            },
             label: usage.to_string(),
             note: what.to_string(),
             current: false,
