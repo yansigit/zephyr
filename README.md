@@ -79,6 +79,21 @@ inside tmux only with `set -g set-clipboard on`; macOS Terminal.app does not sup
 nothing. Under `NO_COLOR` a click may not find the block; `/copy N` and `^X` still work. `/quit` or
 `/exit` leaves the UI like `^D`, and the agent keeps running.
 
+## Typing and moving around
+
+In `zephyr attach` (`?` lists all of these):
+
+| Key | What it does |
+|---|---|
+| `↑` / `↓` | Your earlier messages, from the top or bottom row of the box; editing one makes it your draft. `↑` on an empty box first brings back what `^C` cleared |
+| `^R` | Search your earlier messages; Enter puts one in the box, unsent |
+| `Alt+S` | Put the draft aside and clear the box; on an empty box, bring the last one back |
+| `@path` | A file in the projects folder (`@~/x` in `/zephyr`, `@/x` as written); Tab completes. Sent as its full path, and an image (png, jpg, gif, webp) goes along for the agent to look at. Dragging a file from the projects folder onto the terminal types its `@path`; one from anywhere else can't be seen in the container |
+| `^G` | Edit the draft in `$VISUAL` or `$EDITOR` (`nano` by default); it comes back to the box, unsent |
+| `/p [name] [args]` | Saved prompts: `/p` lists them, `/p name args` puts one in the box to read and send, with `$ARGUMENTS` and `$1`..`$9` filled in. Each is a markdown file in `~/.zephyr/prompts/` (`/zephyr/prompts/` in the container), so you can ask the agent to write one |
+
+Drafts put aside are gone when you detach; the history starts again from the messages in the conversation.
+
 ## Changing settings
 
 Changes apply by themselves; nothing needs `zephyr restart`. The commands above, and hand edits to
