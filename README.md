@@ -79,6 +79,14 @@ inside tmux only with `set -g set-clipboard on`; macOS Terminal.app does not sup
 nothing. Under `NO_COLOR` a click may not find the block; `/copy N` and `^X` still work. `/quit` or
 `/exit` leaves the UI like `^D`, and the agent keeps running.
 
+Mid-reply in `zephyr attach`, Enter steers your message into the running turn; Alt+Enter instead
+holds it until the reply ends and then sends it as a request of its own (when idle, both just
+send). Alt+Up takes back your messages that have not reached the agent yet (held follow-ups, or
+ones waiting behind `/pause`) and puts them in the input to edit; a steered one is already the
+agent's. Shift+Tab steps the thinking level, Ctrl+P the model (Ctrl+Shift+P back, where the
+terminal tells them apart), and the footer shows `ctx N%`, how full the model's context is after
+the last reply.
+
 ## Changing settings
 
 Changes apply by themselves; nothing needs `zephyr restart`. The commands above, and hand edits to
@@ -93,7 +101,8 @@ Changes apply by themselves; nothing needs `zephyr restart`. The commands above,
 
 A file that does not load is not applied, and the daemon keeps its current settings. From any
 channel: `/model` shows the models, `/model PROVIDER/MODEL` switches (to the account on that
-provider), `/status` shows the agent's account and model, `/reload` re-reads the files, and `/new`
+provider), `/thinking` shows how hard the model thinks and `/thinking LEVEL` or `/thinking next`
+changes it from the next request (kept until the daemon restarts), `/status` shows the agent's account and model, `/reload` re-reads the files, and `/new`
 starts a fresh conversation (memory and rules carry over; the old one stays in `sessions/`), and
 `/switch` lists the earlier ones and `/switch ID` goes back to one.
 `/btw QUESTION` asks a side question about the conversation, even mid-reply: a throwaway agent with
