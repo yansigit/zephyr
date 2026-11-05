@@ -1,5 +1,5 @@
   .--.--.       zephyr v0.1.0
- ( ^ u ^ )      main - claude-code-1 > claude-opus-5-5
+ ( ^ u ^ )      main - claude-code-1 > claude-opus-5-5 - medium
  `-.___.-'      discord *  imessage *  chat o      today 41.2k tok - $0.38 / $5
  ------------------------------------------------------------------------------
 
@@ -21,4 +21,4 @@
  |      gpt-6-astra                                                           |
  |      gpt-6-mini                                                            |
  +----------------------------------------------------------------------------+
-  up/down choose - enter switch - type to filter - esc close
+  up/down choose - enter switch - type to filter - esc close            ctx 42%

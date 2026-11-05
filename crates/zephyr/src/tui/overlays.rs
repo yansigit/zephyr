@@ -60,6 +60,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "/model <provider/model>",
         "switch the model after the current reply",
     ),
+    (
+        "Agent",
+        "/thinking [level|next]",
+        "how hard the model thinks; Shift+Tab cycles",
+    ),
     ("Agent", "/rollback", "file checkpoints of the projects"),
     (
         "Agent",
@@ -153,6 +158,18 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("Gateway", "/pause", "hold new messages until /resume"),
     ("Gateway", "/resume", "answer what waited"),
     ("Gateway", "/reload", "apply zephyr.toml and secrets.env"),
+    (
+        "Keys",
+        "Alt+Enter",
+        "send after the current reply, not into it",
+    ),
+    ("Keys", "Alt+Up", "take back your messages still waiting"),
+    ("Keys", "Shift+Tab", "the next thinking level"),
+    (
+        "Keys",
+        "Ctrl+P",
+        "the next model; Ctrl+Shift+P the one before",
+    ),
 ];
 
 /// What goes in the composer for a command: up to its first argument.
@@ -537,7 +554,11 @@ fn help_groups() -> Vec<Group> {
             groups.push((group.to_string(), String::new(), vec![]));
         }
         let item = Row::Item {
-            pick: insert(usage).to_string(),
+            // A key is pressed, not typed.
+            pick: match *group {
+                "Keys" => String::new(),
+                _ => insert(usage).to_string(),
+            },
             label: usage.to_string(),
             note: what.to_string(),
             current: false,
@@ -1567,26 +1588,27 @@ mod tests {
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(got.len(), 8);
         assert_eq!(got[2], format!("│ Chat{}│", " ".repeat(73)));
-        assert!(got[7].ends_with(" 1-5 of 59 ─╯"), "{got:?}");
-        for _ in 0..26 {
+        assert!(got[7].ends_with(" 1-5 of 65 ─╯"), "{got:?}");
+        for _ in 0..27 {
             key(&mut o, press(KeyCode::Down), &rows);
         }
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
-        // The twenty-seventh command is /memory ok; the window follows it down.
+        // The twenty-eighth command is /memory ok; the window follows it down.
         assert_eq!(
             got[6],
             "│  › /memory ok                  let the agent see the waiting change          │"
         );
-        assert!(got[7].ends_with(" 26-30 of 59 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 27-31 of 65 ─╯"), "{got:?}");
         key(&mut o, press(KeyCode::Down), &rows);
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),
             Action::Pick("/memory undo".into())
         );
+        // The last row is a key, which puts nothing in the composer.
         key(&mut o, press(KeyCode::End), &rows);
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),
-            Action::Pick("/reload".into())
+            Action::Pick(String::new())
         );
     }
 
@@ -1601,7 +1623,7 @@ mod tests {
             .collect();
         assert_eq!(
             heads,
-            ["Chat", "Agent", "Memory", "Schedule", "Vault", "Gateway"]
+            ["Chat", "Agent", "Memory", "Schedule", "Vault", "Gateway", "Keys"]
         );
         let mut o = Overlay::new(Kind::Help);
         o.query = "rule".into();
@@ -1771,8 +1793,9 @@ mod tests {
     fn autocomplete_matches_commands_and_their_arguments() {
         let usages =
             |t: &str| -> Vec<&str> { matches(t).into_iter().map(|i| COMMANDS[i].1).collect() };
-        // All but `!<command>`, which is not a slash command.
-        assert_eq!(usages("/").len(), COMMANDS.len() - 1);
+        // All but `!<command>` and the keys, which are not slash commands.
+        let slash = COMMANDS.iter().filter(|c| c.1.starts_with('/')).count();
+        assert_eq!(usages("/").len(), slash);
         assert!(usages("!").is_empty());
         assert_eq!(usages("/mo"), ["/model", "/model <provider/model>"]);
         assert_eq!(usages("/rule"), ["/rules", "/rule <text>", "/rule rm <n>"]);

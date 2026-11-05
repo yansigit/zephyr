@@ -51,11 +51,10 @@ fn history() -> Vec<Value> {
             false,
             T + 181_100,
         ),
-        assistant(
-            T + 182_000,
-            json!([
-            {"type": "text", "text": "Three files: the image recipe, the launcher, and a one-time cleanup script."}]),
-        ),
+        // The footer's `ctx 42%` comes from this reply's usage.
+        json!({"kind": "assistant", "role": "assistant", "timestamp": T + 182_000,
+               "usage": {"input": 1_200, "cacheRead": 82_000, "cacheWrite": 400, "output": 400},
+               "content": [{"type": "text", "text": "Three files: the image recipe, the launcher, and a one-time cleanup script."}]}),
     ]
 }
 
@@ -74,7 +73,7 @@ fn snapshot(scene: &str) -> Value {
     };
     json!({
         "version": "0.1.0", "session": "main", "account": "claude-code-1", "model": "claude-code/claude-opus-5-5",
-        "thinking": "medium", "paused": paused,
+        "thinking": "medium", "context_window": 200_000, "paused": paused,
         "channels": [{"name": "discord", "state": "connected"}, {"name": "imessage", "state": "connected"},
                      {"name": "chat", "state": "off"}],
         "spend": {"tokens": 41_200, "cost": cost, "daily_tokens_limit": null, "daily_cost_limit": 5.0},
