@@ -77,7 +77,24 @@ the indent. Copying goes through the terminal (OSC 52), so it reaches the clipbo
 you are typing on, even over ssh. It works in iTerm2, Ghostty, kitty, WezTerm and Alacritty, and
 inside tmux only with `set -g set-clipboard on`; macOS Terminal.app does not support it and copies
 nothing. Under `NO_COLOR` a click may not find the block; `/copy N` and `^X` still work. `/quit` or
-`/exit` leaves the UI like `^D`, and the agent keeps running.
+`/exit` leaves the UI like `^D`, and the agent keeps running. A double-click copies the word under
+it, a triple-click the row, and Shift+click copies from your last click to this one (some terminals,
+kitty and WezTerm among them, keep Shift+click for their own selection and never pass it on).
+
+Moving around in `zephyr attach`:
+
+| Key | What it does |
+|---|---|
+| `Ctrl+F` | Search the conversation: the newest match first, `Enter` or `Ctrl+G` the one above, `Shift+Enter` or `Ctrl+Shift+G` the one below, `Esc` closes |
+| `Ctrl+Up` / `Ctrl+Down` | Jump to your previous or next message |
+| `Home` / `End` | Top or bottom of the conversation, when the composer is empty |
+| `/focus` | Hide tool calls and thinking (again to show them); `focus` shows in the footer |
+
+The window title shows `◇` idle, `✦` working and `✋` when something waits for your OK, and the tab
+shows a progress bar while the agent works. When you are in another window and a reply finishes or
+an OK is asked for, the terminal gets a notification (`zephyr: reply ready` or `needs your OK`, at
+most one every 10 s). iTerm2, WezTerm, kitty, Ghostty and Windows Terminal show these; other
+terminals just ring the bell, or nothing.
 
 ## Changing settings
 
