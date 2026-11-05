@@ -691,9 +691,11 @@ async fn screens_match_the_goldens() {
     let status = ("^L model", &["C-s"][..], "╭─ status");
     let help = ("^L model", &["?"][..], "╭─ commands");
     let complete = ("^L model", &["=/"][..], "tab complete");
+    let search = ("^L model", &["C-f", "=renew"][..], "3 of 3");
+    let focus = ("^L model", &["=/focus", "Enter"][..], "focus ·");
     // (golden name, scene, size, theme, (ready, keys, shown))
     #[allow(clippy::type_complexity)]
-    let shots: [(&str, &'static str, u16, u16, &str, (&str, &[&str], &str)); 24] = [
+    let shots: [(&str, &'static str, u16, u16, &str, (&str, &[&str], &str)); 26] = [
         ("busy", "busy", 80, 24, "dark", busy),
         ("busy", "busy", 80, 24, "light", busy),
         ("busy", "busy", 140, 40, "dark", busy),
@@ -742,6 +744,8 @@ async fn screens_match_the_goldens() {
         ("help", "idle", 80, 24, "light", help),
         ("help", "idle", 140, 40, "dark", help),
         ("complete", "idle", 80, 24, "dark", complete),
+        ("search", "idle", 80, 24, "dark", search),
+        ("focus", "idle", 80, 24, "dark", focus),
         (
             "files",
             "idle",

@@ -18,6 +18,7 @@
  │    /copy <n>                   copy code block n, or click it                                                                          │
  │    /p                          your saved prompts, /zephyr/prompts/*.md                                                                │
  │    /p <name> [args]            put a saved prompt in the box, to send                                                                  │
+ │    /focus                      hide tool calls and thinking, or show them                                                              │
  │    /help                       this list                                                                                               │
  │    /quit                       leave (or /exit); zephyr keeps running                                                                  │
  │ Agent                                                                                                                                  │
@@ -35,6 +36,5 @@
  │    /ok <n>                     run the agent's proposal n                                                                              │
  │    /no <n>                     drop the agent's proposal n                                                                             │
  │ Memory                                                                                                                                 │
- │    /memory diff                the memory change waiting for you                                                                       │
- ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 1-32 of 72 ─╯
+ ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 1-32 of 78 ─╯
   ↑↓ choose · ⏎ insert · type to filter · esc close                                                                                 ctx 42%

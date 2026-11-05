@@ -15,7 +15,7 @@ use rpi_tui::{
 use serde_json::Value;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -51,6 +51,8 @@ pub struct View {
     called_at: HashMap<String, i64>,
     expanded: bool,
     hide_thinking: bool,
+    /// `/focus`: tool cards and thinking hidden. Shared with each card's [`Hidden`].
+    focus: Arc<AtomicBool>,
     /// The notice just shown, so the same one is not shown twice in a row.
     last_notice: Option<String>,
     /// Every fenced code block's source since the transcript was drawn; block `#n` is `codes[n - 1]`.
@@ -76,6 +78,7 @@ impl View {
             called_at: HashMap::new(),
             expanded: false,
             hide_thinking: false,
+            focus: Arc::new(AtomicBool::new(false)),
             last_notice: None,
             codes: vec![],
             prose: None,
@@ -200,10 +203,25 @@ impl View {
 
     pub fn toggle_thinking(&mut self) -> bool {
         self.hide_thinking = !self.hide_thinking;
-        for a in &self.assistants {
-            a.set_hide_thinking(self.hide_thinking);
-        }
+        self.show_thinking();
         self.hide_thinking
+    }
+
+    /// `/focus`: hides tool cards and thinking, leaving the messages and the replies.
+    pub fn toggle_focus(&mut self) -> bool {
+        self.focus.fetch_xor(true, Ordering::Relaxed);
+        self.show_thinking();
+        self.focus.load(Ordering::Relaxed)
+    }
+
+    fn hiding_thinking(&self) -> bool {
+        self.hide_thinking || self.focus.load(Ordering::Relaxed)
+    }
+
+    fn show_thinking(&self) {
+        for a in &self.assistants {
+            a.set_hide_thinking(self.hiding_thinking());
+        }
     }
 
     /// Whether a tool card is running, so its timer needs frames.
@@ -240,13 +258,21 @@ impl View {
     fn push(&mut self, kind: Kind, item: Arc<dyn Component>, mark: Option<String>) {
         self.last_notice = None;
         let tight = kind == Kind::Card && matches!(self.last, Kind::Text | Kind::Card);
+        // A card goes with the blank row above it, so `/focus` leaves no gap where it was.
+        let add = |item: Arc<dyn Component>| match kind {
+            Kind::Card => self.root.add_child(Arc::new(Hidden {
+                when: self.focus.clone(),
+                item,
+            })),
+            _ => self.root.add_child(item),
+        };
         if self.last != Kind::None && !tight {
-            self.root.add_child(Arc::new(Line(String::new())));
+            add(Arc::new(Line(String::new())));
         }
         if kind == Kind::User {
-            self.root.add_child(item);
+            add(item);
         } else {
-            self.root.add_child(Arc::new(Gutter { mark, item }));
+            add(Arc::new(Gutter { mark, item }));
         }
         self.last = kind;
     }
@@ -296,7 +322,7 @@ impl View {
                 output_pad: 0,
                 ..Default::default()
             }));
-            a.set_hide_thinking(self.hide_thinking);
+            a.set_hide_thinking(self.hiding_thinking());
             a.set_streaming(!done);
             self.assistants.push(a.clone());
             self.current = Some(a.clone());
@@ -742,6 +768,65 @@ fn ungutter(line: &str) -> &str {
         seen += usize::from(!escape);
     }
     &line[at..]
+}
+
+/// The transcript rows where each user turn's band starts, top first: Ctrl+Up and Ctrl+Down
+/// jump between them. A band is the only item drawn outside the [`Gutter`], so its rows are
+/// the only ones that start with the bar.
+pub(super) fn prompts(lines: &[String]) -> Vec<usize> {
+    let bar = format!(" {} ", glyph("▌"));
+    let band = |i: usize| rpi_tui::strip_ansi(&lines[i]).starts_with(&bar);
+    (0..lines.len())
+        .filter(|&i| band(i) && (i == 0 || !band(i - 1)))
+        .collect()
+}
+
+/// An item drawn only while `when` is unset: a tool card under `/focus`.
+struct Hidden {
+    when: Arc<AtomicBool>,
+    item: Arc<dyn Component>,
+}
+
+impl Component for Hidden {
+    fn render(&self, width: usize) -> Vec<String> {
+        match self.when.load(Ordering::Relaxed) {
+            true => vec![],
+            false => self.item.render(width),
+        }
+    }
+    fn invalidate(&self) {
+        self.item.invalidate();
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// The transcript with one row in reverse video: the search's current match. `usize::MAX` is
+/// none.
+pub struct Marked {
+    pub inner: Arc<dyn Component>,
+    pub row: AtomicUsize,
+}
+
+impl Component for Marked {
+    fn render(&self, width: usize) -> Vec<String> {
+        let mut lines = self.inner.render(width);
+        if let Some(line) = lines.get_mut(self.row.load(Ordering::Relaxed)) {
+            // Each reset inside the row would end the reverse video, so it is turned back on.
+            *line = format!(
+                "\x1b[7m{}\x1b[27m",
+                line.replace("\x1b[0m", "\x1b[0m\x1b[7m")
+            );
+        }
+        lines
+    }
+    fn invalidate(&self) {
+        self.inner.invalidate();
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 /// Upstream's `narrow` drawing, with each prose block replaced by its `wide` (unwrapped) lines
@@ -1723,5 +1808,59 @@ mod tests {
         v.reply(Some("/status"), "agent: work on a/b");
         let got = text(&v, 40);
         assert_eq!(got, "   /status\n   │ agent: work on a/b");
+    }
+
+    #[test]
+    fn focus_hides_tool_cards_and_their_gaps() {
+        let mut v = view();
+        v.replay(&history());
+        assert!(v.toggle_focus());
+        let got = text(&v, 80);
+        let want = "   ───────────────────────────── Fri 30 Oct 2026 ─────────────────────────────
+
+ ▌ remind me to renew the domain on friday                     discord · 14:02
+
+ ≋ Done. I scheduled it for Fri 09:00.
+
+ ▌ what's in deploy?                                               you · 14:05
+
+ ≋ Two files.
+
+ ▌ daily brief                                                    cron · 14:05";
+        assert_eq!(got, want, "\n{got}");
+        // Off again, the transcript is as it was; cards added meanwhile show too.
+        assert!(!v.toggle_focus());
+        assert!(text(&v, 80).contains("▸ 2 tools  bash, read"));
+    }
+
+    #[test]
+    fn prompts_are_the_first_row_of_each_band() {
+        let mut v = view();
+        let long =
+            "please check whether the nightly backup finished and tell me which files changed";
+        v.replay(&[
+            json!({"kind": "user", "content": long, "text": long, "origin": null}),
+            json!({"kind": "assistant", "content": [{"type": "text", "text": "▌ not a band"}]}),
+            json!({"kind": "user", "content": "two", "text": "two", "origin": null}),
+        ]);
+        let lines = v.root.render(40);
+        let rows = prompts(&lines);
+        assert_eq!(rows.len(), 2, "{lines:?}");
+        // The long one wraps over three rows; the second band starts after the reply.
+        assert!(rpi_tui::strip_ansi(&lines[rows[0]]).contains("please"));
+        assert!(rpi_tui::strip_ansi(&lines[rows[1]]).contains("two"));
+        assert!(rows[1] > rows[0] + 3, "{rows:?}");
+    }
+
+    #[test]
+    fn the_marked_row_is_reversed_through_its_resets() {
+        let inner: Arc<dyn Component> = Arc::new(Line("a\x1b[1mb\x1b[0mc".into()));
+        let m = Marked {
+            inner,
+            row: AtomicUsize::new(usize::MAX),
+        };
+        assert_eq!(m.render(10), ["a\x1b[1mb\x1b[0mc"]);
+        m.row.store(0, Ordering::Relaxed);
+        assert_eq!(m.render(10), ["\x1b[7ma\x1b[1mb\x1b[0m\x1b[7mc\x1b[27m"]);
     }
 }

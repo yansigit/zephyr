@@ -50,6 +50,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "/p <name> [args]",
         "put a saved prompt in the box, to send",
     ),
+    (
+        "Chat",
+        "/focus",
+        "hide tool calls and thinking, or show them",
+    ),
     ("Chat", "/help", "this list"),
     ("Chat", "/quit", "leave (or /exit); zephyr keeps running"),
     ("Agent", "/stop", "stop the current reply and every task"),
@@ -193,6 +198,23 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "Keys",
         "Ctrl+P",
         "the next model; Ctrl+Shift+P the one before",
+    ),
+    (
+        "Keys",
+        "Ctrl+F",
+        "search the conversation; Enter older, Shift+Enter newer",
+    ),
+    ("Keys", "Ctrl+Up/Down", "jump between your messages"),
+    (
+        "Keys",
+        "Home/End",
+        "top or bottom, when the composer is empty",
+    ),
+    ("Keys", "Shift+click", "select from the last click and copy"),
+    (
+        "Keys",
+        "double-click",
+        "copy the word; triple-click the row",
     ),
 ];
 
@@ -1730,17 +1752,17 @@ mod tests {
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(got.len(), 8);
         assert_eq!(got[2], format!("│ Chat{}│", " ".repeat(73)));
-        assert!(got[7].ends_with(" 1-5 of 72 ─╯"), "{got:?}");
-        for _ in 0..29 {
+        assert!(got[7].ends_with(" 1-5 of 78 ─╯"), "{got:?}");
+        for _ in 0..30 {
             key(&mut o, press(KeyCode::Down), &rows);
         }
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
-        // The thirtieth command is /memory ok; the window follows it down.
+        // The thirty-first command is /memory ok; the window follows it down.
         assert_eq!(
             got[6],
             "│  › /memory ok                  let the agent see the waiting change          │"
         );
-        assert!(got[7].ends_with(" 29-33 of 72 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 30-34 of 78 ─╯"), "{got:?}");
         key(&mut o, press(KeyCode::Down), &rows);
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),
@@ -1751,7 +1773,7 @@ mod tests {
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(
             got[6],
-            "│  › Ctrl+P                      the next model; Ctrl+Shift+P the one before   │"
+            "│  › double-click                copy the word; triple-click the row           │"
         );
         // A key is not something to put in the composer.
         assert_eq!(

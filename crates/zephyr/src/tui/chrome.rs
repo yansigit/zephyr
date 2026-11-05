@@ -56,6 +56,77 @@ pub struct State {
     /// shortcut: stale after /compact or /new until the next reply; ask rpi's `get_state`
     /// `context.tokens` if that misleads.
     pub context: Option<i64>,
+    /// The Ctrl+F search bar, while open.
+    pub search: Option<Search>,
+    /// `/focus` is on: tool cards and thinking are hidden.
+    pub focus: bool,
+    /// An approval or proposal is waiting for the owner's OK: the window title says so.
+    pub asking: bool,
+}
+
+/// Ctrl+F over the transcript's rows as drawn.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Search {
+    pub query: String,
+    /// The transcript rows with a match, top first.
+    pub rows: Vec<usize>,
+    /// The match shown, an index into `rows`.
+    pub at: usize,
+}
+
+impl Search {
+    /// Finds the query in `lines` again, case-insensitively, and shows the newest match: the
+    /// transcript is read from the bottom up.
+    pub fn refresh(&mut self, lines: &[String]) {
+        let q = self.query.to_lowercase();
+        self.rows = (0..lines.len())
+            .filter(|&i| {
+                !q.is_empty() && rpi_tui::strip_ansi(&lines[i]).to_lowercase().contains(&q)
+            })
+            .collect();
+        self.at = self.rows.len().saturating_sub(1);
+    }
+
+    /// Moves to the match above (`older`) or below, wrapping, and returns its row.
+    pub fn step(&mut self, older: bool) -> Option<usize> {
+        let n = self.rows.len();
+        if n == 0 {
+            return None;
+        }
+        self.at = if older {
+            (self.at + n - 1) % n
+        } else {
+            (self.at + 1) % n
+        };
+        self.current()
+    }
+
+    pub fn current(&self) -> Option<usize> {
+        self.rows.get(self.at).copied()
+    }
+}
+
+/// The window title: idle, working, or waiting for the owner's OK.
+pub fn title(s: &State) -> &'static str {
+    if s.asking {
+        "✋ zephyr"
+    } else if s.snapshot.run.busy {
+        "✦ zephyr"
+    } else {
+        "◇ zephyr"
+    }
+}
+
+/// The search bar above the run line, while Ctrl+F is open.
+pub fn search_bar(s: &State, p: &Palette, width: usize, _now: i64) -> Vec<String> {
+    let Some(f) = &s.search else { return vec![] };
+    let left = format!("  {} {}", p.accent.fg(&bold("find")), p.text.fg(&f.query));
+    let right = match f.rows.len() {
+        _ if f.query.is_empty() => String::new(),
+        0 => p.warning.fg("no match"),
+        n => p.muted.fg(&format!("{} of {n}", f.at + 1)),
+    };
+    vec![spread(&left, &format!("{right} "), width)]
 }
 
 impl Default for State {
@@ -74,6 +145,9 @@ impl Default for State {
             models: vec![],
             vault: vec![],
             context: None,
+            search: None,
+            focus: false,
+            asking: false,
         }
     }
 }
@@ -667,6 +741,11 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
             ));
             hints
         }
+        (None, _) if s.search.is_some() => vec![
+            (key(enter, "older"), 0),
+            (key(&format!("{}{enter}", glyph("⇧")), "newer"), 1),
+            (key("esc", "close"), 2),
+        ],
         (None, Some(_)) => vec![
             (key(arrows, "choose"), 2),
             (key("tab", "complete"), 1),
@@ -696,6 +775,9 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
         if now < *until {
             hints = vec![(p.warning.fg(hint), 0)];
         }
+    }
+    if s.focus {
+        hints.insert(0, (p.accent.fg("focus"), 0));
     }
 
     let mut right = vec![];
@@ -1245,5 +1327,63 @@ mod tests {
             f.starts_with("  ↑↓ choose · tab complete · ⏎ run · esc dismiss  "),
             "{f}"
         );
+    }
+
+    #[test]
+    fn search_starts_at_the_newest_match_and_wraps_both_ways() {
+        let lines: Vec<String> = ["Backup ok", "x", "\x1b[1mbackup\x1b[0m failed", "BACKUP"]
+            .map(String::from)
+            .to_vec();
+        let mut f = Search {
+            query: "backup".into(),
+            ..Default::default()
+        };
+        f.refresh(&lines);
+        assert_eq!((f.rows.clone(), f.current()), (vec![0, 2, 3], Some(3)));
+        assert_eq!(f.step(true), Some(2));
+        assert_eq!(f.step(true), Some(0));
+        assert_eq!(f.step(true), Some(3));
+        assert_eq!(f.step(false), Some(0));
+        f.query.clear();
+        f.refresh(&lines);
+        assert_eq!((f.rows.len(), f.step(true)), (0, None));
+    }
+
+    #[test]
+    fn the_search_bar_counts_matches_and_the_footer_names_its_keys() {
+        let mut s = up();
+        assert!(search_bar(&s, &DARK, 40, NOW).is_empty());
+        s.search = Some(Search {
+            query: "backup".into(),
+            rows: vec![4, 9],
+            at: 1,
+        });
+        let bar = plain(search_bar(&s, &DARK, 40, NOW)).remove(0);
+        assert_eq!(bar, format!("  find backup{}2 of 2 ", " ".repeat(20)));
+        s.search.as_mut().unwrap().rows.clear();
+        assert!(plain(search_bar(&s, &DARK, 40, NOW))[0].ends_with("no match "));
+        let f = plain(footer(&s, &DARK, 80, NOW)).remove(0);
+        assert!(f.starts_with("  ⏎ older · ⇧⏎ newer · esc close"), "{f}");
+    }
+
+    #[test]
+    fn focus_shows_in_the_footer() {
+        let mut s = up();
+        s.focus = true;
+        let f = plain(footer(&s, &DARK, 120, NOW)).remove(0);
+        assert!(f.starts_with("  focus · ⏎ send"), "{f}");
+        // It outlasts the other hints when the row is short.
+        let narrow = plain(footer(&s, &DARK, 20, NOW)).remove(0);
+        assert!(narrow.starts_with("  focus"), "{narrow}");
+    }
+
+    #[test]
+    fn the_title_tells_idle_working_and_waiting() {
+        let mut s = up();
+        assert_eq!(title(&s), "◇ zephyr");
+        s.snapshot.run.busy = true;
+        assert_eq!(title(&s), "✦ zephyr");
+        s.asking = true;
+        assert_eq!(title(&s), "✋ zephyr");
     }
 }
