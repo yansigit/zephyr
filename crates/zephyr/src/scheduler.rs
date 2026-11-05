@@ -43,6 +43,8 @@ pub struct Wake {
 /// One unattended prompt in a fresh child: a job run or a background task.
 pub struct Spec<'a> {
     pub prompt: &'a str,
+    /// What the run is about, for its checkpoint's label: a job's prompt, a task's goal.
+    pub goal: &'a str,
     /// `[zephyr] job #1 (name) run 2`: how failures name the run.
     pub label: String,
     /// The first attempt's session id; a retry on another account adds `-<n>`.
@@ -178,6 +180,7 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
             wake.running.store(true, Ordering::SeqCst);
             let spec = Spec {
                 prompt: &run.job.prompt,
+                goal: &run.job.prompt,
                 label: format!(
                     "[zephyr] job #{} ({}) run {}",
                     run.job.id, run.job.name, run.id
@@ -234,9 +237,8 @@ pub async fn execute(
     let label = &spec.label;
     // The projects as they were before this run (DESIGN §4.14); a resumed run has one.
     if !spec.resume {
-        let goal = spec.prompt.strip_prefix(crate::tasks::BRIEF);
         let what = label.strip_prefix("[zephyr] ").unwrap_or(label);
-        let text = format!("{what}: {}", goal.unwrap_or(spec.prompt));
+        let text = format!("{what}: {}", spec.goal);
         crate::checkpoint::before(cfg, &text).await;
     }
     // A requested model runs only on its provider's accounts, each as that model; with no pool

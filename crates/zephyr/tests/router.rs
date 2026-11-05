@@ -1934,6 +1934,166 @@ async fn a_task_on_a_provider_with_no_account_is_refused() {
 }
 
 #[tokio::test]
+async fn a_task_runs_as_a_subagent_on_the_model_its_settings_resolve_to() {
+    let home = home("task-subagent");
+    let extra = "[tasks]\nmodel = \"fake/m2\"\n\
+                 [[subagent]]\nname = \"explorer\"\nmodel = \"other/m9\"\nprompt = \"You explore; you never edit files.\"\n\
+                 [[subagent]]\nname = \"plain\"\nprompt = \"Be brief.\"\n\
+                 [[subagent]]\nname = \"ghost\"\nmodel = \"nope/x\"\nprompt = \"Boo.\"\n";
+    let gw = start(on_file(&home, extra));
+    let call = |args: &str| format!(r#"[call task {{"action": "start", {args}}}]"#);
+    let calls = [
+        call(r#""goal": "look around", "subagent": "explorer""#),
+        call(r#""goal": "a", "subagent": "explorer", "model": "fake/m1""#),
+        call(r#""goal": "b", "subagent": "plain""#),
+        call(r#""goal": "c""#),
+        call(r#""goal": "d", "subagent": "nope""#),
+        call(r#""goal": "e", "subagent": "ghost""#),
+    ];
+    gw.say("m1", "owner", &calls.join(" ")).await;
+    // Main's reply to the calls may come after the reports the tasks steered in.
+    let ours = |r: &String| r.starts_with("echo: [chat #1]");
+    wait(|| gw.replies().iter().any(ours)).await;
+    let reply = gw.replies().into_iter().find(ours).unwrap();
+    for (id, line) in [
+        (1, "task: task #1 started"),
+        (2, "task: task #2 started"),
+        (3, "task: task #3 started"),
+        (4, "task: task #4 started"),
+        (
+            5,
+            "task: not started: no subagent nope; the subagents are explorer, plain, ghost",
+        ),
+        (
+            6,
+            "task: not started: no account on nope (subagent ghost's model in zephyr.toml); \
+             the accounts are a (fake/m1), b (other/m3)",
+        ),
+    ] {
+        assert!(reply.contains(&format!("\n{line}")), "call {id}: {reply}");
+    }
+    wait(|| task_status(&home, "completed") == 4).await;
+    // The agent's model, else the subagent's, else `[tasks] model`.
+    let list = zephyr::tasks::list(&Store::open(&home.join("state.db")).unwrap());
+    for line in [
+        "#1 completed (0 min ago) as explorer on other/m9: look around",
+        "#2 completed (0 min ago) as explorer on fake/m1: a",
+        "#3 completed (0 min ago) as plain on fake/m2: b",
+        "#4 completed (0 min ago) on fake/m2: c",
+    ] {
+        assert!(list.contains(line), "{list}");
+    }
+    let started = |session: &str| {
+        let starts = log(&home, "start");
+        let s = starts.iter().find(|s| s["sessionId"] == session).unwrap();
+        s["model"].as_str().unwrap().to_string()
+    };
+    assert_eq!(started("task-1"), "other/m9");
+    assert_eq!(started("task-2"), "fake/m1");
+    assert_eq!(started("task-3"), "fake/m2");
+    // The subagent's prompt sits between the brief and the goal.
+    let prompts = log(&home, "prompt");
+    let task_prompt = |goal: &str| {
+        let goal = format!("\n\nGoal: {goal}");
+        (prompts.iter())
+            .filter_map(|p| p["message"].as_str())
+            .find(|m| m.starts_with("You are a background task") && m.ends_with(&goal))
+            .unwrap()
+            .to_string()
+    };
+    assert!(
+        task_prompt("look around")
+            .ends_with("left undone.\n\nYou explore; you never edit files.\n\nGoal: look around"),
+        "{prompts:?}"
+    );
+    assert!(task_prompt("b").ends_with("left undone.\n\nBe brief.\n\nGoal: b"));
+    assert!(task_prompt("c").ends_with("left undone.\n\nGoal: c"));
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_owner_edits_subagents_and_task_settings_from_a_chat() {
+    let home = home("subagent-commands");
+    let gw = start(on_file(&home, ""));
+    let says = [
+        "/subagent",
+        "/subagent add explorer other/m3 You explore.\nNever edit.",
+        "/subagent add builder Build it.",
+        "/subagent add explorer Again.",
+        "/subagent model builder fake/m2",
+        "/subagent model builder nope/x",
+        "/subagent model builder fake/nope",
+        "/subagent prompt builder Build it well.",
+        "/task parallel 5",
+        "/task parallel 40",
+        "/task model other/m3",
+        "/subagent",
+        "/subagent rm explorer",
+        "/subagent rm explorer",
+        "/task model default",
+        "/subagent add",
+    ];
+    for (i, text) in says.iter().enumerate() {
+        gw.say(&format!("m{i}"), "owner", text).await;
+    }
+    let r = gw.wait_replies(says.len()).await;
+    assert_eq!(
+        r[0],
+        "[zephyr] no subagents\ntasks: 2 at once, on the account's own model"
+    );
+    assert!(
+        r[1].starts_with("[zephyr] added the subagent explorer\n[zephyr] restarting the agent"),
+        "{r:?}"
+    );
+    assert!(r[2].starts_with("[zephyr] added the subagent builder\n"));
+    assert!(
+        r[3].starts_with("[zephyr] there is a subagent named explorer already; change it"),
+        "{}",
+        r[3]
+    );
+    assert!(r[4].starts_with("[zephyr] subagent builder runs on fake/m2\n"));
+    assert_eq!(
+        r[5],
+        "[zephyr] not changed: no account is signed in to nope; run `zephyr login nope`"
+    );
+    assert_eq!(r[6], "[zephyr] rpi has no model fake/nope");
+    assert!(r[7].starts_with("[zephyr] changed the prompt of subagent builder\n"));
+    assert_eq!(r[8], "[zephyr] up to 5 tasks run at once\n[zephyr] applied");
+    assert_eq!(
+        r[9],
+        "[zephyr] not changed: [tasks] parallel must be 1 to 32"
+    );
+    assert_eq!(
+        r[10],
+        "[zephyr] tasks run on other/m3 unless they name a model\n[zephyr] applied"
+    );
+    assert_eq!(
+        r[11],
+        "[zephyr] explorer (other/m3): You explore.\nbuilder (fake/m2): Build it well.\n\
+         tasks: 5 at once, on other/m3"
+    );
+    assert!(r[12].starts_with("[zephyr] removed the subagent explorer\n"));
+    assert_eq!(r[13], "[zephyr] not changed: no subagent named explorer");
+    assert_eq!(
+        r[14],
+        "[zephyr] tasks run on the account's own model\n[zephyr] applied"
+    );
+    assert!(r[15].starts_with("[zephyr] usage: /subagent"), "{}", r[15]);
+    let cfg = Config::load(&home.join("zephyr.toml")).unwrap();
+    assert_eq!(cfg.parallel_tasks(), 5);
+    assert_eq!(cfg.task_model(), None);
+    assert_eq!(
+        cfg.subagents,
+        [zephyr::config::Subagent {
+            name: "builder".into(),
+            model: Some("fake/m2".into()),
+            prompt: "Build it well.".into(),
+        }]
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn two_tasks_run_at_once_and_owner_stop_ends_them_all() {
     let home = home("task-owner-stop");
     let gw = start(config(&home));
@@ -2421,7 +2581,7 @@ async fn a_task_that_finished_before_the_restart_reports_without_running_again()
     {
         let store = Store::open(&cfg.db_path()).unwrap();
         store
-            .add_task("count the files", None, "chat", "owner")
+            .add_task("count the files", None, None, "chat", "owner")
             .unwrap();
         store.start_next_task(1).unwrap().unwrap();
         store.set_task_session(1, "task-1").unwrap();

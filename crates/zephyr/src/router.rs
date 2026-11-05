@@ -667,30 +667,61 @@ impl<'a> Router<'a> {
     fn task_reply(&mut self, action: zephyr_policy::tools::TaskAction) -> String {
         use zephyr_policy::tools::TaskAction;
         match action {
-            TaskAction::Start { goal, model } => {
+            TaskAction::Start {
+                goal,
+                model,
+                subagent,
+            } => {
                 let Some((channel, sender)) = self.origin() else {
                     return "no owner to report to; not started".into();
                 };
+                let cfg = self.cfg.clone();
+                let sub = match subagent {
+                    None => None,
+                    Some(name) => match cfg.subagents.iter().find(|s| s.name == name) {
+                        Some(s) => Some(s),
+                        None => {
+                            let names: Vec<&str> =
+                                cfg.subagents.iter().map(|s| s.name.as_str()).collect();
+                            return match names.is_empty() {
+                                true => format!("not started: no subagent {name}; none are set up"),
+                                false => format!(
+                                    "not started: no subagent {name}; the subagents are {}",
+                                    names.join(", ")
+                                ),
+                            };
+                        }
+                    },
+                };
+                // The agent's model, else the subagent's, else `[tasks] model`, else the account's.
+                let from_sub = sub.and_then(|s| Some((s.model.as_deref()?, s.name.as_str())));
+                let (model, from) = match (model.as_deref(), from_sub, cfg.task_model()) {
+                    (Some(m), _, _) => (Some(m), String::new()),
+                    (None, Some((m, name)), _) => (
+                        Some(m),
+                        format!(" (subagent {name}'s model in zephyr.toml)"),
+                    ),
+                    (None, None, Some(m)) => (Some(m), " ([tasks] model in zephyr.toml)".into()),
+                    (None, None, None) => (None, String::new()),
+                };
                 // shortcut: no rpi --list-models check mid-turn; an unknown model fails the task
                 // at start and its report says so. Add a check if agents keep guessing wrong.
-                if let Some(m) = &model {
+                if let Some(m) = model {
                     let provider = m.split('/').next().unwrap_or_default();
-                    let pool = &self.cfg.accounts;
+                    let pool = &cfg.accounts;
                     if !pool.is_empty() && !pool.iter().any(|a| a.provider() == provider) {
                         let have: Vec<String> = pool
                             .iter()
                             .map(|a| format!("{} ({})", a.name, a.model))
                             .collect();
                         return format!(
-                            "not started: no account on {provider}; the accounts are {}",
+                            "not started: no account on {provider}{from}; the accounts are {}",
                             have.join(", ")
                         );
                     }
                 }
-                match self
-                    .store
-                    .add_task(&goal, model.as_deref(), &channel, &sender)
-                {
+                let sub = sub.map(|s| (s.name.as_str(), s.prompt.as_str()));
+                match self.store.add_task(&goal, model, sub, &channel, &sender) {
                     Ok(Some(id)) => {
                         self.jobs.tasks.notify_one();
                         format!(
@@ -1371,10 +1402,38 @@ impl<'a> Router<'a> {
                 }
             }
             ("/task", "list") => crate::tasks::list(&self.store),
-            ("/task", arg) => match arg.strip_prefix("stop").map(str::trim).map(str::parse) {
-                Some(Ok(id)) => crate::tasks::stop(&mut self.store, self.jobs, Some(id)),
-                _ => "[zephyr] usage: /task list, /task stop <id>".into(),
+            ("/task", arg) => match word(arg) {
+                ("stop", id) if id.parse::<i64>().is_ok() => {
+                    let id = id.parse().ok();
+                    crate::tasks::stop(&mut self.store, self.jobs, id)
+                }
+                ("parallel", n) if n.parse::<usize>().is_ok() => {
+                    let set = |doc: &mut toml_edit::DocumentMut| {
+                        crate::host::conf::set(doc, "tasks.parallel", n)
+                    };
+                    let done = format!("up to {n} tasks run at once");
+                    self.edit_tasks(None, set, done).await
+                }
+                ("model", m) if !m.is_empty() && word(m).1.is_empty() => {
+                    let set = |doc: &mut toml_edit::DocumentMut| match m {
+                        "default" => {
+                            let tasks = doc.get_mut("tasks").and_then(|t| t.as_table_like_mut());
+                            tasks.map(|t| t.remove("model"));
+                            Ok(())
+                        }
+                        m => crate::host::conf::set(doc, "tasks.model", &format!("{m:?}")),
+                    };
+                    let done = match m {
+                        "default" => "tasks run on the account's own model".into(),
+                        m => format!("tasks run on {m} unless they name a model"),
+                    };
+                    self.edit_tasks(Some(m), set, done).await
+                }
+                _ => "[zephyr] usage: /task list, /task stop <id>, /task parallel <1-32>, \
+                      /task model PROVIDER/MODEL|default"
+                    .into(),
             },
+            ("/subagent", arg) => self.subagent(arg).await,
             ("/undo", n) => match if n.is_empty() { Ok(1) } else { n.parse() } {
                 Ok(n @ 1..=20) => match self.undo(n).await {
                     Ok(_) if n == 1 => "[zephyr] undone: the agent no longer sees your last \
@@ -1418,6 +1477,98 @@ impl<'a> Router<'a> {
             }
             _ => return None,
         })
+    }
+
+    /// `/subagent [add|model|prompt|rm ...]`: the owner's named subagents (DESIGN §4.12). Never
+    /// through the agent's `gateway`: what a subagent is told is the owner's to write.
+    async fn subagent(&mut self, arg: &str) -> String {
+        use crate::host::conf::{remove_subagent, set_subagent};
+        type Doc = toml_edit::DocumentMut;
+        let (sub, rest) = word(arg);
+        let (name, rest) = word(rest);
+        let name = name.to_string();
+        match (sub, name.as_str(), rest) {
+            ("" | "list", "", "") => {
+                format!("[zephyr] {}", crate::tasks::settings(&self.cfg))
+            }
+            ("add", n, rest) if !n.is_empty() && !rest.is_empty() => {
+                // The second word is a model when it has a '/'; the rest is the prompt.
+                let (model, prompt) = match word(rest) {
+                    (m, prompt) if m.contains('/') => (Some(m), prompt),
+                    _ => (None, rest),
+                };
+                if self.cfg.subagents.iter().any(|s| s.name == name) {
+                    return format!(
+                        "[zephyr] there is a subagent named {name} already; change it with \
+                         /subagent model {name} ... or /subagent prompt {name} ..., or remove it \
+                         with /subagent rm {name}"
+                    );
+                }
+                let set = |doc: &mut Doc| set_subagent(doc, &name, true, model, Some(prompt));
+                let done = format!("added the subagent {name}");
+                self.edit_tasks(model, set, done).await
+            }
+            ("model", n, m) if !n.is_empty() && !m.is_empty() && word(m).1.is_empty() => {
+                let set = |doc: &mut Doc| set_subagent(doc, &name, false, Some(m), None);
+                let done = format!("subagent {name} runs on {m}");
+                self.edit_tasks(Some(m), set, done).await
+            }
+            ("prompt", n, prompt) if !n.is_empty() && !prompt.is_empty() => {
+                let set = |doc: &mut Doc| set_subagent(doc, &name, false, None, Some(prompt));
+                let done = format!("changed the prompt of subagent {name}");
+                self.edit_tasks(None, set, done).await
+            }
+            ("rm", n, "") if !n.is_empty() => {
+                let rm = |doc: &mut Doc| match remove_subagent(doc, &name) {
+                    true => Ok(()),
+                    false => Err(anyhow::anyhow!("no subagent named {name}")),
+                };
+                let done = format!("removed the subagent {name}");
+                self.edit_tasks(None, rm, done).await
+            }
+            _ => "[zephyr] usage: /subagent, /subagent add NAME [PROVIDER/MODEL] PROMPT, \
+                  /subagent model NAME PROVIDER/MODEL|default, /subagent prompt NAME PROMPT, \
+                  /subagent rm NAME"
+                .into(),
+        }
+    }
+
+    /// The owner's `/subagent` and `/task parallel|model` edits: checks `model` (unless
+    /// `default`) as `/model` does, saves `zephyr.toml` only if it still loads, then reloads.
+    async fn edit_tasks(
+        &mut self,
+        model: Option<&str>,
+        edit: impl FnOnce(&mut toml_edit::DocumentMut) -> anyhow::Result<()>,
+        done: String,
+    ) -> String {
+        let Some(path) = self.cfg.path.clone() else {
+            return "[zephyr] no zephyr.toml to change".into();
+        };
+        if let Some(m) = model.filter(|m| *m != "default") {
+            if !zephyr_policy::tools::model_shape(m) {
+                return format!("[zephyr] not changed: {m} is not PROVIDER/MODEL");
+            }
+            let provider = m.split('/').next().unwrap_or_default();
+            let cfg = self.cfg.clone();
+            let account = cfg.accounts.iter().find(|a| a.provider() == provider);
+            if !cfg.accounts.is_empty() && account.is_none() {
+                return format!(
+                    "[zephyr] not changed: no account is signed in to {provider}; run `zephyr \
+                     login {provider}`"
+                );
+            }
+            if !lists(&cfg, account, m).await {
+                return format!("[zephyr] rpi has no model {m}");
+            }
+        }
+        let saved = crate::host::conf::update(&path, |doc| {
+            edit(doc)?;
+            toml::from_str::<Config>(&doc.to_string())?.validate()
+        });
+        match saved {
+            Ok(()) => format!("[zephyr] {done}\n{}", self.reload().await),
+            Err(e) => format!("[zephyr] not changed: {e:#}"),
+        }
     }
 
     /// What a `/rollback N` waits for: anything that may still be writing to the projects.
@@ -2541,6 +2692,13 @@ impl<'a> Router<'a> {
         }
         lines.join("\n")
     }
+}
+
+/// The first word of `s` and the rest, both trimmed; a line break ends a word too.
+fn word(s: &str) -> (&str, &str) {
+    let s = s.trim();
+    s.split_once(char::is_whitespace)
+        .map_or((s, ""), |(w, rest)| (w, rest.trim()))
 }
 
 /// The account `reload::set_model` names for `model` in `doc`, read back out of the document it

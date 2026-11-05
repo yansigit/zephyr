@@ -472,6 +472,59 @@ pub fn upsert_mcp(doc: &mut DocumentMut, m: &crate::config::Mcp) -> anyhow::Resu
     Ok(())
 }
 
+/// Adds the `[[subagent]]` named `name` (`add`), or changes the one there. A `model` of
+/// `default` removes its model, so its tasks run on `[tasks] model` or the account's own.
+pub fn set_subagent(
+    doc: &mut DocumentMut,
+    name: &str,
+    add: bool,
+    model: Option<&str>,
+    prompt: Option<&str>,
+) -> anyhow::Result<()> {
+    let list = doc
+        .entry("subagent")
+        .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()))
+        .as_array_of_tables_mut()
+        .context("subagent in zephyr.toml is not a list of [[subagent]] tables")?;
+    let found = list
+        .iter()
+        .position(|t| t.get("name").and_then(Item::as_str) == Some(name));
+    let i = match (found, add) {
+        (Some(_), true) => bail!("there is a subagent named {name} already"),
+        (None, false) => bail!("no subagent named {name}"),
+        (Some(i), false) => i,
+        (None, true) => {
+            let mut t = Table::new();
+            t["name"] = value(name);
+            list.push(t);
+            list.len() - 1
+        }
+    };
+    let t = list.get_mut(i).expect("found or pushed");
+    match model {
+        Some("default") => drop(t.remove("model")),
+        Some(m) => t["model"] = value(m),
+        None => {}
+    }
+    if let Some(p) = prompt {
+        t["prompt"] = value(p);
+    }
+    Ok(())
+}
+
+/// Removes the named `[[subagent]]`; false when there is none.
+pub fn remove_subagent(doc: &mut DocumentMut, name: &str) -> bool {
+    let Some(list) = doc
+        .get_mut("subagent")
+        .and_then(Item::as_array_of_tables_mut)
+    else {
+        return false;
+    };
+    let before = list.len();
+    list.retain(|t| t.get("name").and_then(Item::as_str) != Some(name));
+    before != list.len()
+}
+
 /// Removes the `[kind]` channel table and its `owners.kind`; false when there is no such table.
 pub fn remove_channel(doc: &mut DocumentMut, kind: &str) -> bool {
     if let Some(owners) = doc.get_mut("owners").and_then(Item::as_table_like_mut) {

@@ -39,6 +39,7 @@ pub fn diff(old: &Config, new: &Config, active: Option<&Account>, next: Option<&
         || old.policy_plugin != new.policy_plugin
         || old.agent_dir != new.agent_dir
         || old.mcp != new.mcp
+        || old.subagents != new.subagents
     {
         return Plan::RestartChild;
     }

@@ -16,11 +16,12 @@ const MAX_REPORT: usize = 8 * 1024;
 /// How often queued tasks are looked at without a wake-up, e.g. after a `/resume`.
 const TICK: Duration = Duration::from_secs(5);
 
-/// What the child is told before the goal: it works alone and its last message is the report.
+/// What the child is told first: it works alone and its last message is the report. A
+/// subagent's prompt comes next, then `Goal: ` and the goal.
 pub const BRIEF: &str = "You are a background task the main agent started. Nobody reads your \
 messages while you work, and nobody can answer a question, so do the work on your own. When \
 you finish, your last message is handed to the main agent as your report: say what you did, \
-what you found, and anything left undone.\n\nGoal: ";
+what you found, and anything left undone.\n\n";
 
 /// Runs until an error opening the store; per-task errors are logged and the loop goes on.
 pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow::Result<()> {
@@ -62,11 +63,13 @@ async fn one(cfg: Arc<Config>, task: Task, wake: &Wake) {
         Ok(s) => s,
         Err(e) => return eprintln!("zephyr: task #{} could not open the store: {e}", task.id),
     };
-    let prompt = format!("{BRIEF}{}", task.goal);
+    let role = (task.preamble.as_ref()).map_or(String::new(), |p| format!("{p}\n\n"));
+    let prompt = format!("{BRIEF}{role}Goal: {}", task.goal);
     // A task a restart cut reopens the session it ran in.
     let resume = task.resumes > 0 && task.session.is_some();
     let spec = Spec {
         prompt: &prompt,
+        goal: &task.goal,
         label: format!("[zephyr] task #{}", task.id),
         session: match (&task.session, resume) {
             (Some(s), true) => s.clone(),
@@ -143,10 +146,36 @@ pub fn list(store: &Store) -> String {
                 .model
                 .as_ref()
                 .map_or(String::new(), |m| format!(" on {m}"));
-            format!("#{} {} ({age} min ago){on}: {short}{cut}", t.id, t.status)
+            let as_ = (t.subagent.as_ref()).map_or(String::new(), |s| format!(" as {s}"));
+            format!(
+                "#{} {} ({age} min ago){as_}{on}: {short}{cut}",
+                t.id, t.status
+            )
         })
         .collect();
     format!("[zephyr] tasks:\n{}", lines.join("\n"))
+}
+
+/// `/subagent` and `zephyr subagent list`: the owner's subagents, then the task settings.
+pub fn settings(cfg: &Config) -> String {
+    let mut lines: Vec<String> = cfg
+        .subagents
+        .iter()
+        .map(|s| {
+            let model = s.model.as_deref().unwrap_or("default");
+            let first = s.prompt.trim().lines().next().unwrap_or_default();
+            format!("{} ({model}): {first}", s.name)
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push("no subagents".into());
+    }
+    lines.push(format!(
+        "tasks: {} at once, on {}",
+        cfg.parallel_tasks(),
+        cfg.task_model().unwrap_or("the account's own model")
+    ));
+    lines.join("\n")
 }
 
 /// `/task stop <id>` and the agent's `task stop`; `None` stops every open task (`/stop`).

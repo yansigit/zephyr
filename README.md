@@ -51,7 +51,8 @@ zephyr login openai-codex --account codex-main
 | `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}` |
 | `zephyr packages add NAME.. \| rm NAME.. \| list` | Ubuntu (apt) packages for the agent, baked into a local image (`zephyr-local:<version>-<hash>`) on the release one; `up` and `upgrade` build it, and `add`/`rm` rebuild and recreate the container once the agent is idle |
 | `zephyr vault list \| add login NAME --site URL [--user U] [--totp] \| add token NAME \| edit NAME \| rm NAME \| revoke NAME [PROGRAM]` | Logins and tokens the agent uses by name (see [The vault](#the-vault)); values are asked for hidden, or read one per line from stdin when piped, never taken as arguments |
-| `zephyr config get\|set KEY [VALUE]` | Edit `zephyr.toml` (comments are kept; invalid keys are refused) |
+| `zephyr subagent list \| add NAME [--model P/M] [--prompt TEXT] \| edit NAME [--model P/M\|default] [--prompt TEXT] \| rm NAME` | The named subagents the agent starts background tasks as (see [Background tasks](#the-agents-browser-and-desktop)); without `--prompt`, the prompt is read from stdin when piped |
+| `zephyr config get\|set KEY [VALUE]` | Edit `zephyr.toml` (comments are kept; invalid keys are refused), e.g. `config set tasks.parallel 16` or `config set tasks.model PROVIDER/MODEL` |
 | `zephyr attach [--stock]` | Zephyr's terminal UI on the live session: history, tool calls, what the agent is doing, the queue and today's spend; `^D` detaches and the agent keeps running. `--stock` runs the stock `rpi --connect` client instead |
 | `zephyr shell [bash\|zsh]` | A login shell in the container as the agent, in its home (`/zephyr`) and on its desktop; needs a terminal |
 | `zephyr chat` | The same UI on a terminal; a line client (`< reply` per line) when piped or scripted |
@@ -121,7 +122,7 @@ Changes apply by themselves; nothing needs `zephyr restart`. The commands above,
 |---|---|
 | Budget, owners, time zone, `[auth]`, `[tasks]`, the pool order | at once |
 | The model, on the same provider | at once, or after the reply in progress (rpi's `set_model`) |
-| A model on another provider, the active account, extensions, connectors (`[[mcp]]`), a re-login | the agent restarts after the reply in progress; the conversation carries on |
+| A model on another provider, the active account, extensions, connectors (`[[mcp]]`), subagents (`[[subagent]]`), a re-login | the agent restarts after the reply in progress; the conversation carries on |
 | Discord, iMessage, `[attach]`, `[agent]`, a secret | the daemon restarts itself in place once idle; waiting messages are kept |
 
 A file that does not load is not applied, and the daemon keeps its current settings. From any
@@ -282,7 +283,29 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   more than a minute to a task (its `task` tool): a fresh session running beside the conversation,
   2 at once by default (`[tasks] parallel` in zephyr.toml, up to 32). The agent can run a task on
   another model of a provider you have an account on, e.g. a cheaper one for a simple lookup;
-  `/task list` shows which. The agent answers right away, and when the task ends its report comes
+  `/task list` shows which. `[tasks] model` sets what a task runs on when the agent names no model.
+  You can also name subagents for it to start tasks as, each a prompt that leads the task's brief
+  and, optionally, a model, e.g. `explorer` on `claude-code/claude-haiku-5-5` told it explores and
+  never edits, `implementer` on `opencode-go/deepseek-4.1-flash`:
+
+  ```toml
+  [tasks]
+  parallel = 16
+  model = "claude-code/claude-haiku-5-5"   # optional
+
+  [[subagent]]
+  name = "explorer"
+  model = "claude-code/claude-haiku-5-5"   # optional; else [tasks] model, else the account's
+  prompt = """You explore and report; you never edit files."""
+  ```
+
+  A task's model is the one the agent names, else its subagent's, else `[tasks] model`, else the
+  account's own. Only you set these: from any channel `/subagent` lists them,
+  `/subagent add NAME [PROVIDER/MODEL] PROMPT`, `/subagent model NAME PROVIDER/MODEL|default`,
+  `/subagent prompt NAME PROMPT` and `/subagent rm NAME` edit them, and `/task parallel N` and
+  `/task model PROVIDER/MODEL|default` set the defaults (`zephyr subagent` and `zephyr config set`
+  on the host). A model must be on a provider you have an account on, and rpi must list it. A task
+  keeps the subagent prompt it started with, even if you edit it. The agent answers right away, and when the task ends its report comes
   back to the agent, which tells you. Ask it to cancel, or use `/task list` and `/task stop N`.
   `/stop` stops the reply and every task. A task cut off by a restart or a settings reload picks up
   where it left off in its own session, told to check what was in progress before repeating

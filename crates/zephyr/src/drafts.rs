@@ -816,7 +816,7 @@ pub fn prepare(cfg: &Config, agent_dir: &Path) -> anyhow::Result<()> {
             ),
         }
     }
-    let section = sections(&cfg.home, &skills, &listed);
+    let section = sections(&cfg.home, &skills, &listed, &cfg.subagents);
     let _fs = crate::agent::fs();
     let dir = cfg.home.join(".approved/skills");
     match std::fs::remove_dir_all(&dir) {
@@ -851,8 +851,13 @@ fn insert(agents: &str, section: &str) -> String {
 }
 
 /// AGENTS.md's `## Skills` and `## Connectors`: the index (a skill's body is read when needed)
-/// and how to propose more.
-fn sections(home: &Path, skills: &BTreeMap<String, Files>, servers: &[&Mcp]) -> String {
+/// and how to propose more; then `## Subagents`, the owner's, when there are any.
+fn sections(
+    home: &Path,
+    skills: &BTreeMap<String, Files>,
+    servers: &[&Mcp],
+    subagents: &[crate::config::Subagent],
+) -> String {
     let h = home.display();
     let mut out = String::from(
         "## Skills\n\nSkills the owner approved. Before a task one of them covers, read its SKILL.md.\n\n",
@@ -900,6 +905,20 @@ fn sections(home: &Path, skills: &BTreeMap<String, Files>, servers: &[&Mcp]) -> 
          [...], \"env\": {{...}}}}`. Write a secret only as `${{NAME}}`, never its value: the owner \
          sets it. It is used only after the owner approves it with /mcp ok.\n\n"
     ));
+    if !subagents.is_empty() {
+        out.push_str(
+            "## Subagents\n\nHelpers the owner set up for background tasks. To start a task as \
+             one, pass its name as `subagent` to `task start`: its prompt goes before your goal, \
+             and its model is the task's unless you pass `model`. Only the owner adds or changes \
+             them.\n\n",
+        );
+        for s in subagents {
+            let model = s.model.as_deref().unwrap_or("default model");
+            let first = s.prompt.trim().lines().next().unwrap_or_default();
+            out.push_str(&format!("- **{}** ({model}): {first}\n", s.name));
+        }
+        out.push('\n');
+    }
     out
 }
 
@@ -992,6 +1011,26 @@ mod tests {
         assert!(!mcp_path(&cfg.home).exists());
         // Rewritten from scratch at each start: one copy of each.
         assert_eq!(agents(&cfg).matches("## Skills").count(), 1);
+        assert!(!text.contains("## Subagents"), "none are set up");
+    }
+
+    #[test]
+    fn subagents_are_listed_after_the_connectors() {
+        let cfg = cfg("[[subagent]]\nname = 'explorer'\nmodel = 'p/m'\nprompt = \"\"\"\n  You explore.\nNever edit.\"\"\"\n\
+             [[subagent]]\nname = 'builder'\nprompt = 'Build it.'\n");
+        let text = agents(&cfg);
+        let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("{s} in {text}"));
+        assert!(at("## Connectors") < at("## Subagents"));
+        assert!(at("## Subagents") < at("## Memory"));
+        assert!(
+            text.contains(
+                "- **explorer** (p/m): You explore.\n- **builder** (default model): Build it.\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("as `subagent` to `task start`"));
+        assert!(!text.contains("Never edit"), "the first line only");
+        assert_eq!(agents(&cfg).matches("## Subagents").count(), 1);
     }
 
     #[test]
