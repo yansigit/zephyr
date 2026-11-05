@@ -2421,7 +2421,7 @@ async fn a_task_that_finished_before_the_restart_reports_without_running_again()
     {
         let store = Store::open(&cfg.db_path()).unwrap();
         store
-            .add_task("count the files", None, "chat", "owner")
+            .add_task("count the files", None, None, "chat", "owner")
             .unwrap();
         store.start_next_task(1).unwrap().unwrap();
         store.set_task_session(1, "task-1").unwrap();

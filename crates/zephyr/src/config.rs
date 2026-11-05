@@ -43,6 +43,9 @@ pub struct Config {
     pub budget: Option<Budget>,
     /// `[tasks]`: how many background tasks run at once (DESIGN §4.12). Default 2 when absent.
     pub tasks: Option<Tasks>,
+    /// `[[subagent]]`: the owner's named helpers the agent starts tasks as (DESIGN §4.12).
+    #[serde(default, rename = "subagent")]
+    pub subagents: Vec<Subagent>,
     /// IANA time zone for job cron schedules, e.g. `Asia/Seoul`. Default: the system's.
     pub timezone: Option<String>,
     /// Wall clock cap for one job run. Not configurable; tests shorten it.
@@ -134,7 +137,23 @@ pub struct Tasks {
     /// Tasks that run at once, 1 to 32; more wait queued (up to `store::MAX_OPEN_TASKS` in all).
     #[serde(default = "default_parallel")]
     pub parallel: usize,
+    /// `provider/model` for a task that names none, nor a subagent with one; `None` is the
+    /// account's own model.
+    pub model: Option<String>,
 }
+
+/// One `[[subagent]]` (DESIGN §4.12): a task started as `name` gets `prompt` before its goal
+/// and runs on `model` unless the agent names one.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Subagent {
+    pub name: String,
+    pub model: Option<String>,
+    pub prompt: String,
+}
+
+/// The longest subagent prompt, as long as a task's goal may be.
+pub const MAX_SUBAGENT_PROMPT: usize = zephyr_policy::tools::MAX_GOAL;
 
 fn default_parallel() -> usize {
     2
@@ -256,6 +275,32 @@ impl Config {
         if !(1..=32).contains(&self.parallel_tasks()) {
             anyhow::bail!("[tasks] parallel must be 1 to 32");
         }
+        let shape = zephyr_policy::tools::model_shape;
+        if let Some(m) = self.task_model().filter(|m| !shape(m)) {
+            anyhow::bail!("[tasks] model {m:?}: use PROVIDER/MODEL");
+        }
+        let mut names = std::collections::HashSet::new();
+        for s in &self.subagents {
+            if !zephyr_policy::tools::subagent_name(&s.name) {
+                anyhow::bail!(
+                    "subagent name {:?}: use up to 32 lowercase letters, digits, '_' or '-', \
+                     starting with a letter or digit",
+                    s.name
+                );
+            }
+            if !names.insert(&s.name) {
+                anyhow::bail!("subagent name {:?} is used twice", s.name);
+            }
+            if s.prompt.trim().is_empty() || s.prompt.len() > MAX_SUBAGENT_PROMPT {
+                anyhow::bail!(
+                    "subagent {}: the prompt must be 1 to {MAX_SUBAGENT_PROMPT} bytes",
+                    s.name
+                );
+            }
+            if let Some(m) = s.model.as_deref().filter(|m| !shape(m)) {
+                anyhow::bail!("subagent {}: model {m:?}: use PROVIDER/MODEL", s.name);
+            }
+        }
         let mut names = std::collections::HashSet::new();
         for m in &self.mcp {
             m.check()?;
@@ -272,6 +317,11 @@ impl Config {
         self.tasks
             .as_ref()
             .map_or_else(default_parallel, |t| t.parallel)
+    }
+
+    /// `[tasks] model`: what a task runs on when neither it nor its subagent names a model.
+    pub fn task_model(&self) -> Option<&str> {
+        self.tasks.as_ref().and_then(|t| t.model.as_deref())
     }
 
     /// `<home>/accounts/<name>`: the account's `RPI_CODING_AGENT_DIR`.
@@ -393,6 +443,54 @@ mod tests {
             assert!(cfg.validate().is_err(), "{bad}");
         }
         assert!(toml::from_str::<Config>(&format!("{base}[tasks]\ntypo = 1\n")).is_err());
+    }
+
+    #[test]
+    fn subagents_and_the_task_model_are_checked() {
+        let base = "rpi = 'a'\nhome = 'b'\n";
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert!(cfg.subagents.is_empty() && cfg.task_model().is_none());
+        let with = |text: &str| -> Config { toml::from_str(&format!("{base}{text}")).unwrap() };
+        let cfg = with(
+            r#"[tasks]
+model = "claude-code/claude-haiku-5-5"
+[[subagent]]
+name = "explorer"
+model = "p/m"
+prompt = """You explore.
+No edits."""
+[[subagent]]
+name = "impl_2-x"
+prompt = "Build it."
+"#,
+        );
+        cfg.validate().unwrap();
+        assert_eq!(cfg.parallel_tasks(), 2);
+        assert_eq!(cfg.task_model(), Some("claude-code/claude-haiku-5-5"));
+        assert_eq!(cfg.subagents[0].prompt, "You explore.\nNo edits.");
+        assert_eq!(cfg.subagents[1].model, None);
+        let sub = |name: &str, model: &str, prompt: &str| {
+            format!("[[subagent]]\nname = {name:?}\n{model}prompt = {prompt:?}\n")
+        };
+        let long = "x".repeat(MAX_SUBAGENT_PROMPT + 1);
+        for bad in [
+            sub("Explorer", "", "p"),
+            sub("", "", "p"),
+            sub("-x", "", "p"),
+            sub(&"x".repeat(33), "", "p"),
+            sub("a", "", "p") + &sub("a", "", "q"),
+            sub("a", "", " \n "),
+            sub("a", "", &long),
+            sub("a", "model = 'gpt-5'\n", "p"),
+            sub("a", "model = 'p/m x'\n", "p"),
+            "[tasks]\nmodel = 'gpt-5'\n".into(),
+        ] {
+            assert!(with(&bad).validate().is_err(), "{bad}");
+        }
+        assert!(toml::from_str::<Config>(&format!(
+            "{base}[[subagent]]\nname = 'a'\nprompt = 'p'\ntypo = 1\n"
+        ))
+        .is_err());
     }
 
     #[test]
