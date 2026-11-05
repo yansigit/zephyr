@@ -773,6 +773,78 @@ fn config_get_and_set_check_the_daemon_schema() {
 }
 
 #[test]
+fn subagents_and_task_settings_edit_the_toml() {
+    let env = Env::new("subagent");
+    env.init(&["--no-start"]);
+    env.ok(&["config", "set", "tasks.parallel", "16"]);
+    env.ok(&[
+        "config",
+        "set",
+        "tasks.model",
+        "claude-code/claude-haiku-5-5",
+    ]);
+    assert!(!env
+        .zephyr(&["config", "set", "tasks.model", "haiku"])
+        .status
+        .success());
+    let add = [
+        "subagent",
+        "add",
+        "explorer",
+        "--model",
+        "claude-code/claude-haiku-5-5",
+        "--prompt",
+        "You explore and report; you never edit files.",
+    ];
+    env.ok(&add);
+    // Without --prompt, the prompt comes from stdin.
+    let out = env.zephyr_input(
+        &["subagent", "add", "implementer"],
+        "You implement.\nRun the tests.\n",
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        env.ok(&["subagent", "list"]),
+        "explorer (claude-code/claude-haiku-5-5): You explore and report; you never edit files.\n\
+         implementer (default): You implement.\n\
+         tasks: 16 at once, on claude-code/claude-haiku-5-5\n"
+    );
+    find(
+        &env.calls(),
+        &["docker", "exec", CONTAINER, "zephyr", "reload"],
+    );
+    env.ok(&[
+        "subagent",
+        "edit",
+        "implementer",
+        "--model",
+        "opencode-go/deepseek-4.1-flash",
+    ]);
+    env.ok(&["subagent", "edit", "explorer", "--model", "default"]);
+    let before = env.config();
+    for bad in [
+        &["subagent", "add", "explorer", "--prompt", "again"][..],
+        &["subagent", "add", "Bad", "--prompt", "p"],
+        &["subagent", "add", "x"],
+        &["subagent", "add", "x", "--model", "haiku", "--prompt", "p"],
+        &["subagent", "edit", "nope", "--prompt", "p"],
+        &["subagent", "edit", "explorer"],
+        &["subagent", "rm", "nope"],
+    ] {
+        assert!(!env.zephyr(bad).status.success(), "{bad:?}");
+    }
+    assert_eq!(env.config(), before, "a refused edit writes nothing");
+    env.ok(&["subagent", "rm", "explorer"]);
+    let config = env.config();
+    assert!(config.contains("[tasks]\nparallel = 16"), "{config}");
+    assert!(!config.contains("explorer"), "{config}");
+    assert!(
+        config.contains("name = \"implementer\"\nprompt = \"\"\"\nYou implement.\nRun the tests.\"\"\"\nmodel = \"opencode-go/deepseek-4.1-flash\""),
+        "{config}"
+    );
+}
+
+#[test]
 fn lifecycle_commands_build_the_expected_docker_calls() {
     let env = Env::new("life");
     env.init(&["--no-start"]);
