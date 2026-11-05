@@ -7,7 +7,7 @@ use std::path::Path;
 const SCHEMA_VERSION: i64 = 12;
 
 /// Queued and running tasks allowed at once (DESIGN §4.12); a start past this is refused.
-pub const MAX_OPEN_TASKS: i64 = 10;
+pub const MAX_OPEN_TASKS: i64 = 64;
 
 /// `exec` commands running at once (DESIGN §4.13); a start past this is refused.
 pub const MAX_RUNNING_PROCS: i64 = 8;
@@ -1569,8 +1569,8 @@ mod tests {
         assert_eq!(&ids[ids.len() - 2..], [(2, "stopped"), (1, "stopped")]);
         assert_eq!(
             store.request_stop(None, 12).unwrap(),
-            8,
-            "/stop: 7 queued + 1 running"
+            MAX_OPEN_TASKS as usize - 2,
+            "/stop: all but 1 and 2, which stopped already"
         );
     }
 
