@@ -11,10 +11,10 @@ mod view;
 
 use crate::config::Config;
 use anyhow::Context;
-use chrome::{Link, Region, Retry, State};
+use chrome::{Link, Region, Retry, Search, State};
 use conn::{Ask, Login, Msg};
 use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use overlays::{Action, Kind, Overlay};
 use rpi_tui::{
@@ -48,6 +48,17 @@ const GIVE_UP: &str = "the gateway stopped answering; try /login again";
 
 /// How long `copied …` stays in the footer.
 const COPIED_MS: i64 = 2000;
+
+/// Clicks on one cell this close together make a double or triple click.
+const CLICK_MS: i64 = 400;
+
+/// At most one notification in this long.
+const NOTIFY_MS: i64 = 10_000;
+
+/// OSC 9;4 state 3, the indeterminate tab progress bar, and state 0, none. rpi-tui's
+/// `set_progress` sends state 1, which ConEmu, Windows Terminal and Ghostty draw as a 0% bar.
+const PROGRESS_ON: &str = "\x1b]9;4;3\x07";
+const PROGRESS_OFF: &str = "\x1b]9;4;0\x07";
 
 pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     let a = cfg
@@ -83,7 +94,11 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     let document = Arc::new(Container::new());
     document.add_child(view.root.clone());
     document.add_child(Arc::new(rpi_tui::Spacer::new(1)));
-    let scroll = Arc::new(ScrollView::primary(document));
+    let marked = Arc::new(view::Marked {
+        inner: document,
+        row: usize::MAX.into(),
+    });
+    let scroll = Arc::new(ScrollView::primary(marked.clone()));
     let transcript = scroll.clone();
     let editor = Arc::new(Editor::new(
         EditorOptions {
@@ -107,6 +122,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                 .shrink(1)
                 .min_size(1),
         ),
+        StackChild::Entry(StackEntry::new(region(chrome::search_bar))),
         StackChild::Entry(StackEntry::new(region(chrome::run_line))),
         StackChild::Entry(StackEntry::new(region(chrome::queue_strip))),
         StackChild::Entry(StackEntry::new(region(overlays::completions))),
@@ -122,9 +138,12 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     tui.set_layout_root(Some(Arc::new(root)));
     tui.set_focus(Some(editor.clone()));
     editor.set_focused(true);
-    tui.set_title("zephyr");
     tui.start_render_scheduler();
     tui.start_readerless();
+    focus_reports(&tui, true);
+    // The title and progress bar on screen, set from the state after each change.
+    let mut look = ("", false);
+    attend(&tui, &state.lock().unwrap(), &mut look);
 
     let (submit_tx, mut submits) = mpsc::unbounded_channel::<String>();
     editor.on_submit(Arc::new(move |text: &str| {
@@ -180,8 +199,13 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     // `!cmd` results, shown and held for the owner's next message.
     let (ran_tx, mut rans) = mpsc::unbounded_channel::<shell::Ran>();
     let mut held: Vec<shell::Ran> = vec![];
-    // Where the left button went down, to tell a click from a drag.
-    let mut press = None;
+    // Where the left button went down, whether with Shift, and which click of a burst it was,
+    // to tell a click from a drag.
+    let mut press: Option<((u16, u16), bool, u8)> = None;
+    let mut clicks = Clicks::default();
+    // The last plain click, in transcript rows: Shift+click selects from here.
+    let mut anchor: Option<(u16, usize)> = None;
+    let mut attention = Attention::default();
     // The code block the last ^X copied, so the next one copies the block before it.
     let mut walk: Option<usize> = None;
     let outcome: anyhow::Result<()> = loop {
@@ -207,7 +231,14 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                             let _ = prompt_tx.send(Ask::Prompt(text));
                         }
                     }
-                    Msg::Event(ev) => event(&mut s, &mut view, &ev),
+                    Msg::Event(ev) => {
+                        let ping = event(&mut s, &mut view, &ev)
+                            .and_then(|what| attention.ping(what, crate::unix_millis() as i64));
+                        if let Some(ping) = ping {
+                            tui.terminal().write(&ping);
+                            tui.terminal().flush();
+                        }
+                    }
                     Msg::Models(list) => {
                         if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Model) {
                             o.models = Some(list);
@@ -307,6 +338,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                     Msg::Down(why) => s.link = Link::Connecting(Some(why)),
                     Msg::Fatal(e) => break Err(anyhow::anyhow!(e)),
                 }
+                attend(&tui, &s, &mut look);
                 drop(s);
                 tui.request_render(false);
             }
@@ -322,7 +354,9 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                             MouseEventKind::ScrollDown => tui.scroll_by(3),
                             MouseEventKind::Down(MouseButton::Left) => {
                                 tui.handle_selection_mouse_event(&m);
-                                press = Some((m.column, m.row));
+                                let cell = (m.column, m.row);
+                                let n = clicks.down(cell, crate::unix_millis() as i64);
+                                press = Some((cell, m.modifiers.contains(KeyModifiers::SHIFT), n));
                                 walk = None;
                             }
                             MouseEventKind::Drag(MouseButton::Left) => {
@@ -330,12 +364,22 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                             }
                             MouseEventKind::Up(MouseButton::Left) => {
                                 tui.handle_selection_mouse_event(&m);
-                                let clicked = press.take() == Some((m.column, m.row));
+                                let clicked = press.take().filter(|p| p.0 == (m.column, m.row));
                                 let mut s = state.lock().unwrap();
+                                let at = clicked
+                                    .filter(|_| s.overlay.is_none())
+                                    .and_then(|_| placed(&transcript, &s, &palette));
+                                if let (Some((cell, shift, n)), Some(at)) = (clicked, &at) {
+                                    if let Some((from, to)) = click_span(at, anchor, cell, shift, n) {
+                                        drag(&tui, from, to);
+                                    }
+                                }
                                 if let Some(text) = tui.selection_text() {
                                     copy(&tui, &mut s, &text, None);
-                                } else if clicked && s.overlay.is_none() {
-                                    let n = clicked_code(&transcript, &s, &palette, m.row);
+                                } else if let (Some((cell, ..)), Some(at)) = (clicked, at) {
+                                    let row = at.row(cell.1);
+                                    anchor = row.map(|r| (cell.0, r));
+                                    let n = row.and_then(|r| view::code_at(&at.lines, r));
                                     if let Some((n, text)) = n.and_then(|n| Some((n, view.code(n)?))) {
                                         copy(&tui, &mut s, text, Some(&format!("#{n}")));
                                     }
@@ -345,6 +389,8 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         }
                     }
                     Event::Mouse(_) => tui.clear_selection(),
+                    Event::FocusLost => attention.away = true,
+                    Event::FocusGained => attention.away = false,
                     Event::Paste(text) if state.lock().unwrap().overlay.is_none() => {
                         editor.handle_paste(&text)
                     }
@@ -364,6 +410,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         let empty = text.is_empty();
                         let plain = key.modifiers.is_empty();
                         let mut s = state.lock().unwrap();
+                        let find = s.search.as_ref().and_then(|_| find_key(&key));
                         match key {
                             k if ctrl(&k, 'd') && empty => break Ok(()),
                             k if panel_open => {
@@ -390,7 +437,8 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                         close(&tui, &editor, &mut s);
                                         match kind {
                                             Kind::Model => send(&mut s, &prompt_tx, cmd),
-                                            _ => editor.set_text(&cmd),
+                                            _ if cmd.starts_with(['/', '!']) => editor.set_text(&cmd),
+                                            _ => {}
                                         }
                                     }
                                     Action::Login(id) => start(&mut s, &prompt_tx, id),
@@ -413,6 +461,14 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                     }
                                 }
                             }
+                            _ if find.is_some() => {
+                                let key = find.expect("searching");
+                                search(&mut s, key, &transcript, &marked, &palette);
+                            }
+                            k if ctrl(&k, 'f') => match s.search.take() {
+                                Some(_) => marked.row.store(usize::MAX, Ordering::Relaxed),
+                                None => s.search = Some(Search::default()),
+                            },
                             KeyEvent {
                                 code: KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Enter | KeyCode::Esc,
                                 ..
@@ -503,6 +559,25 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                             KeyEvent { code: KeyCode::PageDown, modifiers: KeyModifiers::NONE, .. } => {
                                 tui.scroll_by(page())
                             }
+                            KeyEvent {
+                                code: code @ (KeyCode::Up | KeyCode::Down),
+                                modifiers: KeyModifiers::CONTROL,
+                                ..
+                            } => {
+                                let up = code == KeyCode::Up;
+                                let at = placed(&transcript, &s, &palette);
+                                match at.and_then(|at| jump(&view::prompts(&at.lines), at.top, up)) {
+                                    Some(row) => transcript.scroll_to(row),
+                                    None if !up => tui.scroll_to_bottom(),
+                                    None => {}
+                                }
+                            }
+                            KeyEvent { code: KeyCode::Home, modifiers: KeyModifiers::NONE, .. } if empty => {
+                                tui.scroll_to_top()
+                            }
+                            KeyEvent { code: KeyCode::End, modifiers: KeyModifiers::NONE, .. } if empty => {
+                                tui.scroll_to_bottom()
+                            }
                             k => {
                                 drop(s);
                                 editor.handle_key(k);
@@ -518,9 +593,14 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                 let Some(text) = text else { break Ok(()) };
                 let mut s = state.lock().unwrap();
                 walk = None;
+                // shortcut: an OK given on another channel leaves the title waiting until the
+                // owner types here; read it from the snapshot if the daemon ever reports proposals.
+                s.asking &= text.trim().is_empty();
+                attend(&tui, &s, &mut look);
                 // These open a panel here instead of a reply card, or never leave the TUI.
                 match text.trim() {
                     "" => {}
+                    "/focus" => s.focus = view.toggle_focus(),
                     "/quit" | "/exit" => break Ok(()),
                     t if t == "/copy" || t.starts_with("/copy ") => match to_copy(&view, &t[5..]) {
                         Ok((text, what)) => copy(&tui, &mut s, &text, Some(&what)),
@@ -555,14 +635,18 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         let ran = tokio::task::spawn_blocking(move || {
                             paused.store(true, Ordering::Relaxed);
                             let _turn = reading.lock().unwrap();
+                            focus_reports(&tui2, false);
                             tui2.suspend();
                             let ran = shell::interactive(&home, sh);
                             tui2.resume();
+                            focus_reports(&tui2, true);
                             paused.store(false, Ordering::Relaxed);
                             ran
                         })
                         .await;
                         tui.note_resize();
+                        // Back from the shell, the owner is looking.
+                        attention.away = false;
                         match ran.map_err(std::io::Error::other).and_then(|r| r) {
                             Ok(_) => view.notice(&format!("back from {sh}")),
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -618,14 +702,18 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     };
     stop.store(true, Ordering::Relaxed);
     let _ = reader.await;
+    focus_reports(&tui, false);
+    tui.terminal().write(PROGRESS_OFF);
     tui.stop(Default::default());
     outcome?;
     println!("detached — zephyr keeps running (zephyr attach to return)");
     Ok(())
 }
 
-/// Routes one live event: zephyr's own to the chrome, the agent's to the transcript.
-fn event(s: &mut State, view: &mut view::View, ev: &Value) {
+/// Routes one live event: zephyr's own to the chrome, the agent's to the transcript. Returns
+/// what to notify the owner of, if they are away: a reply ready, or something needing their OK.
+fn event(s: &mut State, view: &mut view::View, ev: &Value) -> Option<&'static str> {
+    let mut ping = None;
     match ev["type"].as_str().unwrap_or_default() {
         "zephyr_status" => {
             let was_busy = s.snapshot.run.busy;
@@ -634,14 +722,24 @@ fn event(s: &mut State, view: &mut view::View, ev: &Value) {
                 // A run the user stopped gets no cheer.
                 if was_busy && !s.stopping {
                     s.finished = Some(crate::unix_millis() as i64);
+                    ping = Some("reply ready");
                 }
                 s.stopping = false;
             }
         }
-        "zephyr_reply" => view.reply(
-            ev["command"].as_str(),
-            ev["text"].as_str().unwrap_or_default(),
-        ),
+        "zephyr_reply" => {
+            let text = ev["text"].as_str().unwrap_or_default();
+            // A notice, not an answer to a command typed here, naming the OK that approves it:
+            // `/ok 3`, `/job ok 3`, `/skill ok tea`, `/memory ok`.
+            if ev["command"].is_null()
+                && text.starts_with("[zephyr]")
+                && (text.contains("/ok ") || text.contains(" ok "))
+            {
+                s.asking = true;
+                ping = Some("needs your OK");
+            }
+            view.reply(ev["command"].as_str(), text)
+        }
         "retry_scheduled" => {
             s.retry = Some(Retry {
                 attempt: ev["attempt"].as_u64().unwrap_or(0),
@@ -660,6 +758,7 @@ fn event(s: &mut State, view: &mut view::View, ev: &Value) {
             view.apply(ev);
         }
     }
+    ping
 }
 
 /// Sends a prompt now, or keeps it for the next connection.
@@ -705,17 +804,261 @@ fn to_copy(view: &view::View, arg: &str) -> Result<(String, String), String> {
     }
 }
 
-/// The code block under a click on screen row `row`: the transcript row beneath it, below the
-/// header as `Panel::render` measures it.
-fn clicked_code(transcript: &ScrollView, s: &State, p: &theme::Palette, row: u16) -> Option<usize> {
+/// The transcript on screen: below the header as `Panel::render` measures it, its rows as last
+/// drawn. A click's code block, word and row, Shift+click's anchor, the search and the prompt
+/// jumps all read transcript rows through it.
+struct Placed {
+    /// The screen row of its first row.
+    header: usize,
+    /// How many rows of it are on screen.
+    height: usize,
+    /// The transcript row at its top.
+    top: usize,
+    lines: Vec<String>,
+}
+
+impl Placed {
+    /// The transcript row under screen row `row`.
+    fn row(&self, row: u16) -> Option<usize> {
+        let r = (row as usize)
+            .checked_sub(self.header)
+            .filter(|&r| r < self.height)?;
+        Some(self.top + r)
+    }
+
+    /// The screen row of transcript row `row`, or of the edge it is scrolled past.
+    fn screen(&self, row: usize) -> u16 {
+        let last = self.top + self.height.saturating_sub(1);
+        (self.header + row.clamp(self.top, last) - self.top) as u16
+    }
+}
+
+fn placed(transcript: &ScrollView, s: &State, p: &theme::Palette) -> Option<Placed> {
     let cols = crossterm::terminal::size().map_or(80, |(w, _)| w as usize);
-    let top = chrome::header(s, p, cols, crate::unix_millis() as i64).len();
-    let row = (row as usize)
-        .checked_sub(top)
-        .filter(|&r| r < transcript.viewport_height())?;
     let snap = transcript.snapshot(cols)?;
-    let lines = snap.document.lines(0, snap.document.len());
-    view::code_at(&lines, snap.scroll_top + row)
+    Some(Placed {
+        header: chrome::header(s, p, cols, crate::unix_millis() as i64).len(),
+        height: transcript.viewport_height(),
+        top: snap.scroll_top,
+        lines: snap.document.lines(0, snap.document.len()),
+    })
+}
+
+/// Counts clicks on one cell within [`CLICK_MS`] of each other: 1, 2, 3, then 1 again.
+#[derive(Default)]
+struct Clicks {
+    cell: (u16, u16),
+    at: i64,
+    n: u8,
+}
+
+impl Clicks {
+    fn down(&mut self, cell: (u16, u16), now: i64) -> u8 {
+        let again = self.n > 0 && cell == self.cell && now - self.at <= CLICK_MS;
+        self.n = if again { self.n % 3 + 1 } else { 1 };
+        (self.cell, self.at) = (cell, now);
+        self.n
+    }
+}
+
+/// What a click selects, as the screen cells a drag would run between: from the last plain
+/// click's anchor with Shift, the word under it on a second click, its row on a third. rpi-tui's
+/// selection has no Shift-extend or multi-click of its own.
+fn click_span(
+    at: &Placed,
+    anchor: Option<(u16, usize)>,
+    cell: (u16, u16),
+    shift: bool,
+    n: u8,
+) -> Option<((u16, u16), (u16, u16))> {
+    if let Some((col, row)) = anchor.filter(|_| shift) {
+        // shortcut: an anchor scrolled out of view starts at the edge row, not its own row;
+        // feed rpi-tui content coordinates if it ever takes them.
+        return Some(((col, at.screen(row)), cell));
+    }
+    let text = rpi_tui::strip_ansi(at.lines.get(at.row(cell.1)?)?);
+    let (first, last) = match n {
+        2 => word_at(&text, cell.0 as usize)?,
+        3 => row_span(&text)?,
+        _ => return None,
+    };
+    Some(((first as u16, cell.1), (last as u16, cell.1)))
+}
+
+/// Each character of a plain row with its first column and width.
+fn cells(text: &str) -> Vec<(usize, usize, char)> {
+    let mut col = 0;
+    let mut out = vec![];
+    for c in text.chars() {
+        let w = rpi_tui::visible_width(c.encode_utf8(&mut [0; 4]));
+        out.push((col, w, c));
+        col += w;
+    }
+    out
+}
+
+/// The first and last column of the word under column `col`: letters, digits and the
+/// characters of paths and addresses, as terminals pick a word.
+fn word_at(text: &str, col: usize) -> Option<(usize, usize)> {
+    let cells = cells(text);
+    let word = |i: usize| cells[i].2.is_alphanumeric() || "_-./~:@+".contains(cells[i].2);
+    let i = cells.iter().position(|c| (c.0..c.0 + c.1).contains(&col))?;
+    if !word(i) {
+        return None;
+    }
+    let first = (0..=i).rev().take_while(|&j| word(j)).last()?;
+    let last = (i..cells.len()).take_while(|&j| word(j)).last()?;
+    Some((cells[first].0, cells[last].0 + cells[last].1.max(1) - 1))
+}
+
+/// The first and last column of a row's text, past the gutter (or a band's bar).
+fn row_span(text: &str) -> Option<(usize, usize)> {
+    let cells = cells(text);
+    let mut text = cells.iter().filter(|c| c.0 >= 3 && !c.2.is_whitespace());
+    let first = text.next()?;
+    let last = text.last().unwrap_or(first);
+    Some((first.0, last.0 + last.1.max(1) - 1))
+}
+
+/// Feeds rpi-tui's selection a press at `from` dragged to `to`, as a mouse would, so what a
+/// Shift+click or a double or triple click selects is highlighted and read like a drag.
+fn drag(tui: &TuiAltScreen, from: (u16, u16), to: (u16, u16)) {
+    let at = |kind, (column, row): (u16, u16)| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    for ev in [
+        at(MouseEventKind::Down(MouseButton::Left), from),
+        at(MouseEventKind::Drag(MouseButton::Left), to),
+        at(MouseEventKind::Up(MouseButton::Left), to),
+    ] {
+        tui.handle_selection_mouse_event(&ev);
+    }
+}
+
+/// A key while the search bar is open.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Find {
+    Type(char),
+    Back,
+    Older,
+    Newer,
+    Close,
+}
+
+/// The search bar's keys; any other key does what it does without the bar.
+fn find_key(k: &KeyEvent) -> Option<Find> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+    Some(match k.code {
+        KeyCode::Esc => Find::Close,
+        KeyCode::Enter if shift => Find::Newer,
+        KeyCode::Enter => Find::Older,
+        // Ctrl+Shift+G comes as `G`, or as `g` with Shift, depending on the terminal.
+        KeyCode::Char('G') if ctrl => Find::Newer,
+        KeyCode::Char('g') if ctrl && shift => Find::Newer,
+        KeyCode::Char('g') if ctrl => Find::Older,
+        KeyCode::Backspace => Find::Back,
+        KeyCode::Char(c) if !ctrl && !k.modifiers.contains(KeyModifiers::ALT) => Find::Type(c),
+        _ => return None,
+    })
+}
+
+/// One search bar key: the query changes or the next match is picked, and the match is scrolled
+/// a third of the way down the transcript and marked. rpi-tui's `AltScreenSearch` has no way
+/// into the scroll view, so this searches the transcript's rows as drawn.
+fn search(
+    s: &mut State,
+    key: Find,
+    transcript: &ScrollView,
+    marked: &view::Marked,
+    p: &theme::Palette,
+) {
+    let at = placed(transcript, s, p);
+    let lines = at.as_ref().map_or(&[][..], |at| &at.lines[..]);
+    let Some(f) = s.search.as_mut().filter(|_| key != Find::Close) else {
+        s.search = None;
+        marked.row.store(usize::MAX, Ordering::Relaxed);
+        return;
+    };
+    let row = match key {
+        Find::Type(c) => {
+            f.query.push(c);
+            f.refresh(lines);
+            f.current()
+        }
+        Find::Back => {
+            f.query.pop();
+            f.refresh(lines);
+            f.current()
+        }
+        Find::Older => f.step(true),
+        Find::Newer => f.step(false),
+        Find::Close => None,
+    };
+    marked.row.store(row.unwrap_or(usize::MAX), Ordering::Relaxed);
+    if let (Some(row), Some(at)) = (row, at) {
+        transcript.scroll_to(row.saturating_sub(at.height / 3));
+    }
+}
+
+/// Ctrl+Up: the last user turn above the transcript's top row; Ctrl+Down: the first below it.
+fn jump(prompts: &[usize], top: usize, up: bool) -> Option<usize> {
+    match up {
+        true => prompts.iter().rev().find(|&&r| r < top),
+        false => prompts.iter().find(|&&r| r > top),
+    }
+    .copied()
+}
+
+/// The terminal's focus, from its focus reports, and when the last notification went out.
+#[derive(Default)]
+struct Attention {
+    /// The terminal said it lost focus. A terminal without focus reports never says so, and
+    /// never gets a notification.
+    away: bool,
+    sent: Option<i64>,
+}
+
+impl Attention {
+    /// A bell and an OSC 9 notification saying `what`, while the terminal is away and none went
+    /// out in the last [`NOTIFY_MS`].
+    fn ping(&mut self, what: &str, now: i64) -> Option<String> {
+        if !self.away || self.sent.is_some_and(|t| now - t < NOTIFY_MS) {
+            return None;
+        }
+        self.sent = Some(now);
+        Some(format!("\x07\x1b]9;zephyr: {what}\x07"))
+    }
+}
+
+/// Sets the window title and the tab's progress bar from the state, writing only what changed.
+fn attend(tui: &TuiAltScreen, s: &State, look: &mut (&'static str, bool)) {
+    let now = (chrome::title(s), s.snapshot.run.busy);
+    if now.0 != look.0 {
+        tui.set_title(now.0);
+    }
+    if now.1 != look.1 {
+        tui.terminal()
+            .write(if now.1 { PROGRESS_ON } else { PROGRESS_OFF });
+        tui.terminal().flush();
+    }
+    *look = now;
+}
+
+/// Turns the terminal's focus reports on or off: off on the way out and while `/shell` has the
+/// terminal, like the mouse.
+fn focus_reports(tui: &TuiAltScreen, on: bool) {
+    use crossterm::Command;
+    let mut seq = String::new();
+    let _ = match on {
+        true => crossterm::event::EnableFocusChange.write_ansi(&mut seq),
+        false => crossterm::event::DisableFocusChange.write_ansi(&mut seq),
+    };
+    tui.terminal().write(&seq);
+    tui.terminal().flush();
 }
 
 /// The login picker's Enter: ask the daemon to sign in to that provider. One sign-in at a time,

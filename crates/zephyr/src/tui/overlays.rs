@@ -10,7 +10,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rpi_tui::{bold, truncate_to_width, visible_width, CURSOR_MARKER};
 
 /// Every slash command zephyr answers: router.rs `command` and `control`, memory.rs
-/// `command` and scheduler.rs `command`, plus the TUI's own `/help`. (group, usage, what it does)
+/// `command` and scheduler.rs `command`, plus the TUI's own `/help`, then the TUI's keys, which help
+/// lists but does not insert. (group, usage, what it does)
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     (
         "Chat",
@@ -43,6 +44,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ),
     ("Chat", "/copy", "copy the last reply"),
     ("Chat", "/copy <n>", "copy code block n, or click it"),
+    ("Chat", "/focus", "hide tool calls and thinking; again shows them"),
     ("Chat", "/help", "this list"),
     ("Chat", "/quit", "leave (or /exit); zephyr keeps running"),
     ("Agent", "/stop", "stop the current reply and every task"),
@@ -153,6 +155,15 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("Gateway", "/pause", "hold new messages until /resume"),
     ("Gateway", "/resume", "answer what waited"),
     ("Gateway", "/reload", "apply zephyr.toml and secrets.env"),
+    (
+        "Keys",
+        "Ctrl+F",
+        "search the conversation; Enter older, Shift+Enter newer",
+    ),
+    ("Keys", "Ctrl+Up/Down", "jump between your messages"),
+    ("Keys", "Home/End", "top or bottom, when the composer is empty"),
+    ("Keys", "Shift+click", "select from the last click and copy"),
+    ("Keys", "double-click", "copy the word; triple-click the row"),
 ];
 
 /// What goes in the composer for a command: up to its first argument.
@@ -1567,26 +1578,27 @@ mod tests {
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(got.len(), 8);
         assert_eq!(got[2], format!("│ Chat{}│", " ".repeat(73)));
-        assert!(got[7].ends_with(" 1-5 of 59 ─╯"), "{got:?}");
-        for _ in 0..26 {
+        assert!(got[7].ends_with(" 1-5 of 66 ─╯"), "{got:?}");
+        for _ in 0..27 {
             key(&mut o, press(KeyCode::Down), &rows);
         }
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
-        // The twenty-seventh command is /memory ok; the window follows it down.
+        // The twenty-eighth command is /memory ok; the window follows it down.
         assert_eq!(
             got[6],
             "│  › /memory ok                  let the agent see the waiting change          │"
         );
-        assert!(got[7].ends_with(" 26-30 of 59 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 27-31 of 66 ─╯"), "{got:?}");
         key(&mut o, press(KeyCode::Down), &rows);
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),
             Action::Pick("/memory undo".into())
         );
+        // The keys come last; the TUI inserts none of them.
         key(&mut o, press(KeyCode::End), &rows);
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),
-            Action::Pick("/reload".into())
+            Action::Pick("double-click".into())
         );
     }
 
@@ -1601,7 +1613,7 @@ mod tests {
             .collect();
         assert_eq!(
             heads,
-            ["Chat", "Agent", "Memory", "Schedule", "Vault", "Gateway"]
+            ["Chat", "Agent", "Memory", "Schedule", "Vault", "Gateway", "Keys"]
         );
         let mut o = Overlay::new(Kind::Help);
         o.query = "rule".into();
@@ -1771,8 +1783,9 @@ mod tests {
     fn autocomplete_matches_commands_and_their_arguments() {
         let usages =
             |t: &str| -> Vec<&str> { matches(t).into_iter().map(|i| COMMANDS[i].1).collect() };
-        // All but `!<command>`, which is not a slash command.
-        assert_eq!(usages("/").len(), COMMANDS.len() - 1);
+        // All but `!<command>` and the keys, which are not slash commands.
+        let keys = COMMANDS.iter().filter(|c| c.0 == "Keys").count();
+        assert_eq!(usages("/").len(), COMMANDS.len() - 1 - keys);
         assert!(usages("!").is_empty());
         assert_eq!(usages("/mo"), ["/model", "/model <provider/model>"]);
         assert_eq!(usages("/rule"), ["/rules", "/rule <text>", "/rule rm <n>"]);
