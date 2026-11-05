@@ -16,7 +16,7 @@ cargo test -p zephyr --test router            # one integration test file
 cargo test -p zephyr --test router some_name  # one test by name filter
 cargo clippy --all-targets && cargo fmt
 
-# Ignored tests need the pinned real binary at /home/user/Projects/.always-on/rpi-0.15.0/bin/rpi
+# Ignored tests need the pinned real binary at /home/user/Projects/.always-on/rpi-0.18.0/bin/rpi
 cargo test -p zephyr --test real_rpi -- --ignored
 cargo test -p zephyr-policy --test rpi_load -- --ignored
 cargo test -p zephyr --test attach -- --ignored   # drives real `rpi --connect` via tests/drive-connect.py
@@ -46,8 +46,9 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   the outbox (client id = Discord nonce / BlueBubbles tempGuid), budgets, `/stop` `/pause` `/model`
   `/reload`, and crash reconcile (re-send rows whose text isn't in `get_messages`).
 - `rpc.rs` `Child` wraps one `rpi --mode rpc` child (JSONL). `USED_COMMANDS` must stay a subset of
-  rpi's `ready.supportedCommands`; `doctor` checks it. rpi is pinned to 0.15.x (`RPI_PIN` in
-  main.rs, `deploy/Dockerfile`, and `rpi-plugin-sdk = "=0.15.0"` in zephyr-policy).
+  rpi's `ready.supportedCommands`; `doctor` checks it. rpi is pinned to 0.18.x (`RPI_PIN` in
+  main.rs, `deploy/Dockerfile`, `rpi-plugin-sdk = "=0.18.0"` in zephyr-policy and zephyr-cursor,
+  and `rpi-tui = "=0.18.0"` in zephyr).
 - `pool.rs`: `[[account]]` failover. Each account gets its own `RPI_CODING_AGENT_DIR` under
   `<home>/accounts/<name>/`; rate-limit detection reads `agent_settled.error`; cooldowns live in `state.db`.
 - `auth_keeper.rs`: refreshes expiring OAuth tokens via `rpi auth refresh` subprocess (not the
@@ -104,7 +105,7 @@ vetoes hardline commands (`policy.rs` `check`) and appends audit lines to `$ZEPH
 closed: any non-`Allow`, malformed event or panic blocks the call.
 
 **Tests** (`crates/zephyr/tests/`) run the daemon against `fake-rpi.py`, a scripted stand-in for rpi
-0.15.0 frames. Its behaviour is driven by marker files in the zephyr home (`hang`, `slow`,
+0.18.0 frames. Its behaviour is driven by marker files in the zephyr home (`hang`, `slow`,
 `stats.json`, `oauth_fail`, ...) and it logs every command to `log.jsonl`; read its docstring before
 adding a test. When rpi's frame shapes matter, update fake-rpi.py to match the real binary.
 

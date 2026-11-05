@@ -1,1 +1,3 @@
 target/
+# rpi 0.18 leaves <cwd>/.rpi/.resource-lease where the ignored real-binary tests run it
+.rpi/

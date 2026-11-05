@@ -1,5 +1,5 @@
 //! Drives one `rpi --mode rpc` child: JSONL on stdio, frames as in upstream
-//! `crates/rpi-cli/src/rpc/protocol.rs` and `modes.rs` (v0.15.0).
+//! `crates/rpi-cli/src/rpc/protocol.rs` and `modes.rs` (v0.18.0).
 
 use crate::config::{Account, Config};
 use anyhow::{anyhow, bail, Context};
