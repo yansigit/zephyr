@@ -4,7 +4,7 @@ use crate::channel::Inbound;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 11;
 
 /// Queued and running tasks allowed at once (DESIGN §4.12); a start past this is refused.
 pub const MAX_OPEN_TASKS: i64 = 10;
@@ -356,6 +356,15 @@ impl Store {
                  ALTER TABLE procs ADD COLUMN deadline INTEGER; -- unix secs its timeout ends
                  ALTER TABLE inbox ADD COLUMN sent_as TEXT; -- prompt|steer|continue
                  PRAGMA user_version = 9;
+                 COMMIT;",
+            )?;
+        }
+        if version < 11 {
+            // `/rename` (DESIGN §4.1): the owner's names for main sessions, by session id.
+            db.execute_batch(
+                "BEGIN;
+                 CREATE TABLE session_names(id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                 PRAGMA user_version = 11;
                  COMMIT;",
             )?;
         }
@@ -1221,15 +1230,12 @@ impl Store {
         rows.collect()
     }
 
-    /// The row that started the newest answered run of `main`, for `/undo` (DESIGN §4.1):
-    /// the newest `done` row sent as a prompt or a continuation.
-    pub fn last_run(&self) -> rusqlite::Result<Option<InboxRow>> {
+    /// Inbox row `id`: the one `/retry` sends again (DESIGN §4.1).
+    pub fn inbox_row(&self, id: i64) -> rusqlite::Result<Option<InboxRow>> {
         self.db
             .query_row(
-                "SELECT id, channel, sender, text, tries FROM inbox
-                 WHERE status = 'done' AND sent_as IN ('prompt', 'continue')
-                 ORDER BY id DESC LIMIT 1",
-                [],
+                "SELECT id, channel, sender, text, tries FROM inbox WHERE id = ?1",
+                params![id],
                 |r| {
                     Ok(InboxRow {
                         id: r.get(0)?,
@@ -1243,14 +1249,28 @@ impl Store {
             .optional()
     }
 
-    /// Marks the run `origin` started as `undone`: that row and the rows steered into it. An
-    /// `undone` row is never `dispatched` again, so recovery never sends it back to rpi.
-    pub fn mark_undone(&self, origin: i64) -> rusqlite::Result<usize> {
+    /// Marks row `id` `undone`: `/undo` took it out of the context. An `undone` row is never
+    /// `dispatched` again, so recovery never sends it back to rpi.
+    pub fn mark_undone(&self, id: i64) -> rusqlite::Result<usize> {
         self.db.execute(
-            "UPDATE inbox SET status = 'undone'
-             WHERE id = ?1 OR (id > ?1 AND sent_as = 'steer' AND status IN ('done', 'dispatched'))",
-            params![origin],
+            "UPDATE inbox SET status = 'undone' WHERE id = ?1",
+            params![id],
         )
+    }
+
+    /// The owner's `/rename` names, by session id.
+    pub fn session_names(&self) -> rusqlite::Result<std::collections::HashMap<String, String>> {
+        let mut stmt = self.db.prepare("SELECT id, name FROM session_names")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    pub fn set_session_name(&self, id: &str, name: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO session_names(id, name) VALUES (?1, ?2)",
+            params![id, name],
+        )?;
+        Ok(())
     }
 
     /// Spend over the last `days` UTC days (today included), newest first: each day's total,
@@ -1585,15 +1605,16 @@ mod tests {
         for (version, undo) in [
             (
                 1,
-                "DROP TABLE meta; DROP TABLE spend; DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as;",
+                "DROP TABLE meta; DROP TABLE spend; DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; DROP TABLE session_names;",
             ),
-            (2, "DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as;"),
-            (3, "DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as;"),
-            (4, "ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as;"),
-            (5, "DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as;"),
-            (6, "DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as;"),
-            (7, "DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE tasks DROP COLUMN resumes; ALTER TABLE tasks DROP COLUMN session;"),
-            (8, "ALTER TABLE tasks DROP COLUMN resumes; ALTER TABLE tasks DROP COLUMN session; ALTER TABLE procs DROP COLUMN pid; ALTER TABLE procs DROP COLUMN start_ticks; ALTER TABLE procs DROP COLUMN deadline; ALTER TABLE inbox DROP COLUMN sent_as;"),
+            (2, "DROP TABLE runs; DROP TABLE jobs; DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; DROP TABLE session_names;"),
+            (3, "DROP TABLE account_cooldown; DROP TABLE account_spend; ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; DROP TABLE session_names;"),
+            (4, "ALTER TABLE outbox DROP COLUMN attachment; DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; DROP TABLE session_names;"),
+            (5, "DROP TABLE proposals; DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; DROP TABLE session_names;"),
+            (6, "DROP TABLE tasks; DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; DROP TABLE session_names;"),
+            (7, "DROP TABLE procs; ALTER TABLE inbox DROP COLUMN sent_as; ALTER TABLE tasks DROP COLUMN resumes; ALTER TABLE tasks DROP COLUMN session; DROP TABLE session_names;"),
+            (8, "ALTER TABLE tasks DROP COLUMN resumes; ALTER TABLE tasks DROP COLUMN session; ALTER TABLE procs DROP COLUMN pid; ALTER TABLE procs DROP COLUMN start_ticks; ALTER TABLE procs DROP COLUMN deadline; ALTER TABLE inbox DROP COLUMN sent_as; DROP TABLE session_names;"),
+            (9, "DROP TABLE session_names;"),
         ] {
             let dir = crate::test_dir(&format!("store-v{version}"));
             let path = dir.join("state.db");
@@ -1624,6 +1645,8 @@ mod tests {
                      UPDATE inbox SET sent_as = 'prompt';",
                 )
                 .unwrap();
+            store.set_session_name("main", "taxes").unwrap();
+            assert_eq!(store.session_names().unwrap()["main"], "taxes");
             let now: i64 = store
                 .db
                 .pragma_query_value(None, "user_version", |r| r.get(0))

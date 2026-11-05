@@ -876,3 +876,32 @@ async fn zephyr_vault_methods_save_list_and_remove_without_echoing_a_value() {
     assert_eq!(again["error"]["code"], -32602, "{again}");
     gw.shutdown().await;
 }
+
+#[tokio::test]
+async fn zephyr_sessions_and_turns_list_the_conversations_and_what_undo_counts() {
+    let gw = start("sessions");
+    let mut c = Client::connect(gw.port).await;
+    let early = c.call("zephyr.sessions", json!({})).await;
+    assert_eq!(early["error"]["code"], -32001, "{early}");
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    gw.say("m1", "one").await;
+    gw.say("m2", "two").await;
+    gw.say("m3", "/rename trip").await;
+    wait(|| gw.count("outbox", "sent") == 3).await;
+
+    let sessions = c.call("zephyr.sessions", json!({})).await["result"]["sessions"].clone();
+    assert_eq!(sessions.as_array().unwrap().len(), 1, "{sessions}");
+    assert_eq!(sessions[0]["id"], "main", "{sessions}");
+    assert_eq!(sessions[0]["name"], "trip", "{sessions}");
+    assert!(sessions[0]["at"].as_i64().unwrap() > 0, "{sessions}");
+    // Newest first, untagged: the k-th is what `/undo k` takes back to.
+    let turns = c.call("zephyr.turns", json!({})).await["result"]["turns"].clone();
+    assert_eq!(
+        turns,
+        json!([{"channel": "chat", "text": "two"}, {"channel": "chat", "text": "one"}])
+    );
+    // The header shows the name.
+    let snap = c.call("zephyr.hello", json!({})).await["result"].clone();
+    assert_eq!(snap["session"], "trip");
+    gw.shutdown().await;
+}

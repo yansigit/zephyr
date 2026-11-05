@@ -15,9 +15,6 @@ use tokio::sync::{mpsc, oneshot};
 /// (`Store::main_session`). Attach always shows this name.
 pub const MAIN_SESSION: &str = "main";
 
-/// The main sessions on disk, newest first, as (id, mtime in unix secs). rpi 0.15 files them as
-/// `<dir>/<cwd folder>/<ISO>_<id>.jsonl`, fake-rpi as `<dir>/<id>.json`. Only `main` and the
-/// `main-<secs>` ids `/new` makes count, so `/switch` never hands rpi a job's or a stray name.
 /// Ends the rpi children a crashed daemon left behind (DESIGN §4.4): `zephyr supervise` starts a
 /// new daemon in the same container, and an old child still holds its session open, so the new
 /// one could not resume it. Their pipes to the old daemon are gone, so they have no work left.
@@ -90,7 +87,105 @@ fn proc_pgid(pid: i32) -> Option<i32> {
         .ok()
 }
 
+/// The main sessions on disk, newest first, as (id, mtime in unix secs). rpi files them as
+/// `<dir>/<cwd folder>/<ISO>_<id>.jsonl`, fake-rpi as `<dir>/<id>.json`. Only `main` and the
+/// `main-<secs>` ids `/new` and `/fork` make count, so `/switch` never hands rpi a job's or a
+/// stray name.
 pub fn saved_sessions(dir: &std::path::Path) -> Vec<(String, i64)> {
+    let mut found: HashMap<String, i64> = HashMap::new();
+    for (id, _, mtime) in main_files(dir) {
+        let at = found.entry(id).or_insert(mtime);
+        *at = (*at).max(mtime);
+    }
+    let mut list: Vec<_> = found.into_iter().collect();
+    list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    list
+}
+
+/// Session `id`'s file: the newest, should there be several.
+fn session_file(dir: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
+    (main_files(dir).into_iter())
+        .filter(|f| f.0 == id)
+        .max_by_key(|f| f.2)
+        .map(|f| f.1)
+}
+
+/// The first words of session `id`'s first user message, untagged, for `/switch`.
+pub fn opening(dir: &std::path::Path, id: &str) -> Option<String> {
+    use std::io::BufRead;
+    let path = session_file(dir, id)?;
+    let _fs = crate::agent::fs();
+    let file = std::fs::File::open(&path).ok()?;
+    let text = if path.extension().is_some_and(|e| e == "jsonl") {
+        // rpi: one entry per line, so only the top of a long session is read.
+        (std::io::BufReader::new(file).lines().map_while(Result::ok)).find_map(|line| {
+            let v: Value = serde_json::from_str(&line).ok()?;
+            (v["message"]["kind"] == "user").then(|| message_text(&v["message"]))
+        })?
+    } else {
+        let v: Value = serde_json::from_reader(file).ok()?;
+        let first = v["messages"]
+            .as_array()?
+            .iter()
+            .find(|m| m["kind"] == "user");
+        message_text(first?)
+    };
+    let body = crate::router::untag(&text).map_or(text.as_str(), |(_, _, body)| body);
+    let words: Vec<&str> = body.split_whitespace().collect();
+    Some(match words.len() {
+        0..=6 => words.join(" "),
+        _ => format!("{}…", words[..6].join(" ")),
+    })
+}
+
+/// `/fork` (DESIGN §4.1): copies session `from` to the new id `to`, leaf and all, as the agent.
+/// rpi 0.18 has no `fork` command, and starts a copy only when the ids inside match its name:
+/// the `.jsonl` header line's `id` and its `.progress.jsonl` companion's `session_id`.
+/// fake-rpi's `<id>.json` holds no id.
+pub fn copy_session(dir: &std::path::Path, from: &str, to: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let src = session_file(dir, from).with_context(|| format!("no session file for {from}"))?;
+    let name = src.file_name().unwrap_or_default().to_string_lossy();
+    let ext = if name.ends_with(".jsonl") {
+        ".jsonl"
+    } else {
+        ".json"
+    };
+    let stamp = &name[..name.len() - ext.len() - from.len()];
+    let dst = src.with_file_name(format!("{stamp}{to}{ext}"));
+    let _fs = crate::agent::fs();
+    let renamed = |path: &std::path::Path, key: &str| -> anyhow::Result<String> {
+        let text = std::fs::read_to_string(path)?;
+        let (head, rest) = text.split_once('\n').unwrap_or((&text, ""));
+        let mut head: Value = serde_json::from_str(head)?;
+        if head.get(key).is_none() {
+            bail!("{} has no {key} to rename", path.display());
+        }
+        head[key] = json!(to);
+        Ok(format!("{head}\n{rest}"))
+    };
+    let create = |path: std::path::PathBuf, body: String| -> std::io::Result<()> {
+        let mut f = std::fs::File::create_new(path)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()
+    };
+    if ext == ".json" {
+        return Ok(create(dst, std::fs::read_to_string(&src)?)?);
+    }
+    // The companion first: a session file without one would be listed, and rpi refuse it.
+    let companion = |p: &std::path::Path| format!("{}.progress.jsonl", p.display());
+    let progress = std::path::PathBuf::from(companion(&src));
+    if progress.exists() {
+        create(companion(&dst).into(), renamed(&progress, "session_id")?)?;
+    }
+    create(dst, renamed(&src, "id")?)?;
+    Ok(())
+}
+
+/// The main session files on disk, as (id, path, mtime in unix secs).
+fn main_files(dir: &std::path::Path) -> Vec<(String, std::path::PathBuf, i64)> {
+    // The sessions are in the agent's home, which root cannot enter (DESIGN §4.4).
+    let _fs = crate::agent::fs();
     let entries = |d: &std::path::Path| {
         std::fs::read_dir(d)
             .into_iter()
@@ -98,7 +193,7 @@ pub fn saved_sessions(dir: &std::path::Path) -> Vec<(String, i64)> {
             .flatten()
             .collect::<Vec<_>>()
     };
-    let mut found: HashMap<String, i64> = HashMap::new();
+    let mut found = vec![];
     for e in entries(dir) {
         let files = if e.path().is_dir() {
             entries(&e.path())
@@ -126,13 +221,10 @@ pub fn saved_sessions(dir: &std::path::Path) -> Vec<(String, i64)> {
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |d| d.as_secs() as i64);
-            let at = found.entry(id.to_string()).or_insert(mtime);
-            *at = (*at).max(mtime);
+            found.push((id.to_string(), f.path(), mtime));
         }
     }
-    let mut list: Vec<_> = found.into_iter().collect();
-    list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    list
+    found
 }
 
 /// The slash command the policy plugin registers as proof that it loaded.
@@ -656,6 +748,57 @@ mod tests {
         assert_eq!(ids, ["main", "main-1793511057", "main-42"]);
         assert!(saved_sessions(&dir.join("missing")).is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_copied_session_names_its_new_id_inside_and_opens_with_the_first_words() {
+        let dir = crate::test_dir("rpc-fork");
+        let real = dir.join("--zephyr--");
+        std::fs::create_dir_all(&real).unwrap();
+        // rpi 0.18's layout, cut down: the header names the id, so does the companion.
+        let user = r#"{"kind":"entry","type":"message","message":{"kind":"user","role":"user","content":"[tui #3] book a table for four on friday night"}}"#;
+        let lane = r#"{"kind":"lane","lane":"main","leafId":"e1"}"#;
+        std::fs::write(
+            real.join("2026-11-05T04-22-58-894Z_main.jsonl"),
+            format!("{{\"kind\":\"header\",\"version\":4,\"id\":\"main\"}}\n{user}\n{lane}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            real.join("2026-11-05T04-22-58-894Z_main.jsonl.progress.jsonl"),
+            "{\"format\":\"assistant-progress-v1\",\"session_id\":\"main\",\"state\":{}}\n",
+        )
+        .unwrap();
+        copy_session(&dir, "main", "main-7").unwrap();
+        let copy = std::fs::read_to_string(real.join("2026-11-05T04-22-58-894Z_main-7.jsonl"));
+        let copy = copy.unwrap();
+        let mut lines = copy.lines();
+        let head: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(
+            (head["id"].as_str(), head["version"].as_i64()),
+            (Some("main-7"), Some(4))
+        );
+        assert_eq!(lines.collect::<Vec<_>>(), [user, lane]);
+        let progress = real.join("2026-11-05T04-22-58-894Z_main-7.jsonl.progress.jsonl");
+        let progress: Value =
+            serde_json::from_str(&std::fs::read_to_string(progress).unwrap()).unwrap();
+        assert_eq!(progress["session_id"], "main-7");
+        assert_eq!(
+            opening(&dir, "main-7").unwrap(),
+            "book a table for four on…"
+        );
+        assert!(
+            copy_session(&dir, "main", "main-7").is_err(),
+            "never over a session"
+        );
+        assert!(copy_session(&dir, "main-9", "main-10").is_err());
+        // fake-rpi's layout: the whole session in `<id>.json`.
+        std::fs::write(
+            dir.join("main-1.json"),
+            r#"{"messages":[{"kind":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        copy_session(&dir, "main-1", "main-2").unwrap();
+        assert_eq!(opening(&dir, "main-2").unwrap(), "hi");
     }
 
     #[tokio::test]
