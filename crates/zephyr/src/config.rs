@@ -131,7 +131,7 @@ impl Budget {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tasks {
-    /// Tasks that run at once, 1 to 8; more wait queued (up to `store::MAX_OPEN_TASKS` in all).
+    /// Tasks that run at once, 1 to 32; more wait queued (up to `store::MAX_OPEN_TASKS` in all).
     #[serde(default = "default_parallel")]
     pub parallel: usize,
 }
@@ -253,8 +253,8 @@ impl Config {
                 anyhow::bail!("agent.env {name:?}: use a variable name (letters, digits, '_')");
             }
         }
-        if !(1..=8).contains(&self.parallel_tasks()) {
-            anyhow::bail!("[tasks] parallel must be 1 to 8");
+        if !(1..=32).contains(&self.parallel_tasks()) {
+            anyhow::bail!("[tasks] parallel must be 1 to 32");
         }
         let mut names = std::collections::HashSet::new();
         for m in &self.mcp {
@@ -379,16 +379,16 @@ mod tests {
     }
 
     #[test]
-    fn tasks_parallel_defaults_to_two_and_is_one_to_eight() {
+    fn tasks_parallel_defaults_to_two_and_is_one_to_thirty_two() {
         let base = "rpi = 'a'\nhome = 'b'\n";
         let cfg: Config = toml::from_str(base).unwrap();
         assert_eq!(cfg.parallel_tasks(), 2);
         cfg.validate().unwrap();
         let with = |text: &str| -> Config { toml::from_str(&format!("{base}{text}")).unwrap() };
         assert_eq!(with("[tasks]\n").parallel_tasks(), 2);
-        assert_eq!(with("[tasks]\nparallel = 4\n").parallel_tasks(), 4);
+        assert_eq!(with("[tasks]\nparallel = 16\n").parallel_tasks(), 16);
         with("[tasks]\nparallel = 4\n").validate().unwrap();
-        for bad in ["0", "9"] {
+        for bad in ["0", "33"] {
             let cfg = with(&format!("[tasks]\nparallel = {bad}\n"));
             assert!(cfg.validate().is_err(), "{bad}");
         }

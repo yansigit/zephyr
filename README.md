@@ -280,7 +280,7 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   itself. In a scheduled job it gets no answer and proposes nothing.
 - **Background tasks.** You can keep talking while the agent works. It hands anything that takes
   more than a minute to a task (its `task` tool): a fresh session running beside the conversation,
-  2 at once by default (`[tasks] parallel` in zephyr.toml, up to 8). The agent can run a task on
+  2 at once by default (`[tasks] parallel` in zephyr.toml, up to 32). The agent can run a task on
   another model of a provider you have an account on, e.g. a cheaper one for a simple lookup;
   `/task list` shows which. The agent answers right away, and when the task ends its report comes
   back to the agent, which tells you. Ask it to cancel, or use `/task list` and `/task stop N`.
