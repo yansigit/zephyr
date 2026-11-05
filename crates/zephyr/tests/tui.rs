@@ -293,6 +293,84 @@ fn normalize(screen: &str) -> String {
         .join("\n")
 }
 
+/// A tiny PNG, for `@` references.
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// Each screen its own dir (config, token) and tmux server; the name is part of a unix socket
+/// path, so it stays short. The dir holds a projects folder for `@` and an editor for Ctrl+G
+/// that appends ` edited`.
+fn screen_dir() -> (String, PathBuf) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let name = format!(
+        "zt-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let dir = std::env::temp_dir().join(&name);
+    std::fs::create_dir_all(dir.join("projects/deploy")).unwrap();
+    std::fs::write(dir.join("projects/notes.md"), "x").unwrap();
+    std::fs::write(dir.join("projects/shot.png"), PNG).unwrap();
+    std::fs::write(dir.join("ed.sh"), "printf ' edited' >> \"$1\"\n").unwrap();
+    (name, dir)
+}
+
+/// `zephyr tui` on `cfg` in a new tmux server. `theme`: `dark` or `light` (by COLORFGBG),
+/// `ascii` (dark, C locale) or `nocolor`.
+fn tui_in_tmux(name: String, cfg: &Path, dir: &Path, cols: u16, rows: u16, theme: &str) -> Tmux {
+    let tmux = Tmux(name);
+    let command = format!(
+        "{} tui; echo zephyr exited $?; sleep 30",
+        env!("CARGO_BIN_EXE_zephyr")
+    );
+    let (cols, rows) = (cols.to_string(), rows.to_string());
+    let status = tmux
+        .cmd()
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            "screen",
+            "-x",
+            &cols,
+            "-y",
+            &rows,
+        ])
+        .args(["-e", &format!("ZEPHYR_CONFIG={}", cfg.display())])
+        .args(["-e", &format!("HOME={}", dir.display())])
+        .args([
+            "-e",
+            &format!("ZEPHYR_PROJECTS={}", dir.join("projects").display()),
+        ])
+        .args(["-e", &format!("EDITOR=sh {}", dir.join("ed.sh").display())])
+        .args(["-e", "VISUAL="])
+        .args([
+            "-e",
+            if theme == "light" {
+                "COLORFGBG=0;15"
+            } else {
+                "COLORFGBG=15;0"
+            },
+        ])
+        .args([
+            "-e",
+            if theme == "nocolor" {
+                "NO_COLOR=1"
+            } else {
+                "NO_COLOR="
+            },
+        ])
+        .args(["-e", "TERM=xterm-256color", "-e", "RPI_SERVER_TOKEN="])
+        .args(match theme {
+            "ascii" => ["-e", "LANG=C", "-e", "LC_ALL=C"],
+            _ => ["-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8"],
+        })
+        .arg(command)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    tmux
+}
+
 /// `zephyr tui` running in tmux against the fake server.
 struct Screen {
     tmux: Tmux,
@@ -304,16 +382,7 @@ struct Screen {
 impl Screen {
     /// `theme`: `dark` or `light` (by COLORFGBG), `ascii` (dark, C locale) or `nocolor`.
     async fn start(scene: &'static str, cols: u16, rows: u16, theme: &str) -> Screen {
-        // Each screen its own dir (config, token) and tmux server; the name is part of a
-        // unix socket path, so it stays short.
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let name = format!(
-            "zt-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let dir = std::env::temp_dir().join(&name);
-        std::fs::create_dir_all(&dir).unwrap();
+        let (name, dir) = screen_dir();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, sent) = mpsc::unbounded_channel();
@@ -323,51 +392,7 @@ impl Screen {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let cfg = config(&dir, port);
-        let tmux = Tmux(name);
-        let command = format!(
-            "{} tui; echo zephyr exited $?; sleep 30",
-            env!("CARGO_BIN_EXE_zephyr")
-        );
-        let (cols, rows) = (cols.to_string(), rows.to_string());
-        let status = tmux
-            .cmd()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                "screen",
-                "-x",
-                &cols,
-                "-y",
-                &rows,
-            ])
-            .args(["-e", &format!("ZEPHYR_CONFIG={}", cfg.display())])
-            .args(["-e", &format!("HOME={}", dir.display())])
-            .args([
-                "-e",
-                if theme == "light" {
-                    "COLORFGBG=0;15"
-                } else {
-                    "COLORFGBG=15;0"
-                },
-            ])
-            .args([
-                "-e",
-                if theme == "nocolor" {
-                    "NO_COLOR=1"
-                } else {
-                    "NO_COLOR="
-                },
-            ])
-            .args(["-e", "TERM=xterm-256color", "-e", "RPI_SERVER_TOKEN="])
-            .args(match theme {
-                "ascii" => ["-e", "LANG=C", "-e", "LC_ALL=C"],
-                _ => ["-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8"],
-            })
-            .arg(command)
-            .status()
-            .unwrap();
-        assert!(status.success());
+        let tmux = tui_in_tmux(name, &cfg, &dir, cols, rows, theme);
         Screen {
             tmux,
             dir,
@@ -520,6 +545,141 @@ async fn panels_pick_a_model_list_commands_and_close() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_composer_recalls_completes_stashes_and_edits() {
+    if tmux_missing() {
+        return;
+    }
+    let mut screen = Screen::start("idle", 80, 24, "dark").await;
+    let projects = screen.dir.join("projects");
+    std::fs::create_dir_all(screen.dir.join("prompts")).unwrap();
+    std::fs::write(screen.dir.join("prompts/hi.md"), "Say hi to $1\n").unwrap();
+    screen.wait_for("Three files").await;
+    // Up brings back your own message from the replayed conversation.
+    screen.keys(&["Up", "Enter"]);
+    assert_eq!(
+        screen.next_sent().await,
+        "what's in ~/Projects/zephyr/deploy?"
+    );
+    // `@` completes in the projects folder, and an image goes with its attachment line.
+    screen.keys(&["=look @sh", "Tab", "Enter"]);
+    let shot = projects.join("shot.png");
+    assert_eq!(
+        screen.next_sent().await,
+        format!(
+            "look @{0}\n[attached image: {0} (shot.png, image/png, 1 KB); open it with read]",
+            shot.display()
+        )
+    );
+    // ^C clears; Up on the empty box brings it back.
+    screen.keys(&["=half done", "C-c", "Up", "Enter"]);
+    assert_eq!(screen.next_sent().await, "half done");
+    // Alt+S puts a draft aside for another message, and brings it back.
+    screen.keys(&["=aside", "M-s", "=other", "Enter"]);
+    assert_eq!(screen.next_sent().await, "other");
+    screen.keys(&["M-s", "Enter"]);
+    assert_eq!(screen.next_sent().await, "aside");
+    // ^R finds an earlier message and puts it in the box, unsent.
+    screen.keys(&["C-r"]);
+    screen.wait_for("╭─ history").await;
+    screen.keys(&["=deploy", "Enter", "=!", "Enter"]);
+    assert_eq!(
+        screen.next_sent().await,
+        "what's in ~/Projects/zephyr/deploy?!"
+    );
+    // A saved prompt fills the box; Enter sends what you read.
+    screen.keys(&["=/p hi bob", "Enter"]);
+    screen.wait_for("Say hi to bob").await;
+    screen.keys(&["Enter"]);
+    assert_eq!(screen.next_sent().await, "Say hi to bob");
+    // ^G hands the draft to $EDITOR and takes back what it wrote.
+    screen.keys(&["=draft", "C-g"]);
+    screen.wait_for("draft edited").await;
+    screen.keys(&["Enter"]);
+    assert_eq!(screen.next_sent().await, "draft edited");
+}
+
+/// A channel that never says anything: the router runs as long as its channels do.
+struct Quiet;
+
+impl zephyr::channel::Channel for Quiet {
+    fn name(&self) -> &str {
+        "chat"
+    }
+    async fn run(&self, _: mpsc::Sender<zephyr::channel::Inbound>) -> anyhow::Result<()> {
+        std::future::pending().await
+    }
+    async fn send(&self, _: &zephyr::channel::Outbound) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// An `@image` typed in the TUI reaches the agent with the line a Discord photo gets: the real
+/// router and attach server, with fake-rpi as the child.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_image_reference_reaches_the_agent_with_its_attachment_line() {
+    if tmux_missing() {
+        return;
+    }
+    let (name, dir) = screen_dir();
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let cfg_path = config(&dir, port);
+    let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-rpi.py");
+    let toml = std::fs::read_to_string(&cfg_path)
+        .unwrap()
+        .replace("\"/nonexistent/rpi\"", &format!("{fake:?}"))
+        .replace(
+            "timezone",
+            &format!(
+                "agent_dir = {:?}\nmodel = \"fake/m1\"\ntimezone",
+                dir.join("agent")
+            ),
+        );
+    std::fs::write(&cfg_path, toml).unwrap();
+    let cfg = zephyr::config::Config::load(&cfg_path).unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let router = tokio::spawn(async move {
+        zephyr::router::run(&cfg, &[Quiet], async {
+            let _ = stopped.await;
+        })
+        .await
+    });
+    let screen = Screen {
+        tmux: tui_in_tmux(name, &cfg_path, &dir, 80, 24, "dark"),
+        dir: dir.clone(),
+        server: tokio::spawn(async {}),
+        sent: mpsc::unbounded_channel().1,
+    };
+    screen.wait_for("main · m1").await;
+    screen.keys(&["=what is in @shot.png", "Enter"]);
+    let shot = dir.join("projects/shot.png");
+    let want = format!(
+        "[tui #1] what is in @{0}\n[attached image: {0} (shot.png, image/png, 1 KB); open it with read]",
+        shot.display()
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let log = std::fs::read_to_string(dir.join("log.jsonl")).unwrap_or_default();
+        let prompts: Vec<Value> = (log.lines())
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|v| v["type"] == "prompt")
+            .collect();
+        if let Some(p) = prompts.first() {
+            assert_eq!(p["message"], want.as_str());
+            break;
+        }
+        assert!(!router.is_finished(), "the router stopped");
+        let shown = screen.tmux.capture(false);
+        assert!(Instant::now() < deadline, "no prompt:\n{log}\n{shown}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = stop.send(());
+    router.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn screens_match_the_goldens() {
     if tmux_missing() {
         return;
@@ -534,7 +694,7 @@ async fn screens_match_the_goldens() {
     let complete = ("^L model", &["=/"][..], "tab complete");
     // (golden name, scene, size, theme, (ready, keys, shown))
     #[allow(clippy::type_complexity)]
-    let shots: [(&str, &'static str, u16, u16, &str, (&str, &[&str], &str)); 22] = [
+    let shots: [(&str, &'static str, u16, u16, &str, (&str, &[&str], &str)); 24] = [
         ("busy", "busy", 80, 24, "dark", busy),
         ("busy", "busy", 80, 24, "light", busy),
         ("busy", "busy", 140, 40, "dark", busy),
@@ -583,6 +743,22 @@ async fn screens_match_the_goldens() {
         ("help", "idle", 80, 24, "light", help),
         ("help", "idle", 140, 40, "dark", help),
         ("complete", "idle", 80, 24, "dark", complete),
+        (
+            "files",
+            "idle",
+            80,
+            24,
+            "dark",
+            ("^L model", &["=look at @"], "tab complete"),
+        ),
+        (
+            "history",
+            "idle",
+            80,
+            24,
+            "dark",
+            ("^L model", &["C-r"], "╭─ history"),
+        ),
         (
             "model",
             "idle",

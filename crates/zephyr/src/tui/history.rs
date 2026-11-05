@@ -91,6 +91,12 @@ impl History {
         Some(text)
     }
 
+    /// Whether `current` is an entry Up or Down put there, so they keep walking even when it
+    /// is a command the autocomplete would take them for.
+    pub fn walking(&self, current: &str) -> bool {
+        self.walk.as_ref().is_some_and(|w| w.2 == current)
+    }
+
     /// An edit to a recalled entry makes it the draft: the walk is over.
     fn ended(&mut self, current: &str) {
         if self.walk.as_ref().is_some_and(|w| w.2 != current) {

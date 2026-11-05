@@ -62,11 +62,18 @@ fn resolve(partial: &str, home: &Path, projects: Option<&Path>) -> Option<PathBu
 }
 
 /// The `@` completions for the text up to the cursor: the entries of the folder typed so far
-/// whose names start with the rest, folders first.
+/// whose names start with the rest, folders first. None once it names a file: Enter sends.
 pub fn complete(before: &str, home: &Path, projects: Option<&Path>) -> Vec<Choice> {
     let Some(partial) = token(before) else {
         return vec![];
     };
+    let named = resolve(partial, home, projects).is_some_and(|p| {
+        let _fs = crate::agent::fs();
+        p.is_file()
+    });
+    if named {
+        return vec![];
+    }
     let (dir, prefix) = match partial.rfind('/') {
         Some(i) => partial.split_at(i + 1),
         None => ("", partial),
@@ -321,6 +328,8 @@ mod tests {
         assert_eq!(labels(complete("@my\\ dir/", &home, p)), ["shot one.png"]);
         assert_eq!(labels(complete("@~/n", &home, p)), ["notes/"]);
         assert!(complete("@/nonexistent/x", &home, p).is_empty());
+        // A whole file name is done: Enter sends rather than adding a space.
+        assert!(complete("@about.txt", &home, p).is_empty());
         assert!(complete("me@a", &home, p).is_empty());
         // No projects folder: only `~/` and absolute paths complete.
         assert!(complete("@a", &home, None).is_empty());

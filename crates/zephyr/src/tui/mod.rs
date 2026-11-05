@@ -434,7 +434,11 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                             KeyEvent {
                                 code: KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Enter | KeyCode::Esc,
                                 ..
-                            } if completing && plain => {
+                            } if completing
+                                && plain
+                                // A recalled `/command` keeps Up and Down for the history walk.
+                                && !(matches!(key.code, KeyCode::Up | KeyCode::Down) && history.walking(&text)) =>
+                            {
                                 let c = s.complete.as_mut().expect("completing");
                                 let n = c.items.len();
                                 let choice = c.items[c.selected].clone();
@@ -563,11 +567,8 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                             }
                             k if ctrl(&k, 'g') => {
                                 drop(s);
-                                let edit = std::env::var("VISUAL")
-                                    .or_else(|_| std::env::var("EDITOR"))
-                                    .ok()
-                                    .filter(|e| !e.trim().is_empty())
-                                    .unwrap_or_else(|| "nano".into());
+                                let set = |k: &str| std::env::var(k).ok().filter(|e| !e.trim().is_empty());
+                                let edit = set("VISUAL").or_else(|| set("EDITOR")).unwrap_or_else(|| "nano".into());
                                 let (home, draft, ed) = (home.clone(), editor.get_expanded_text(), edit.clone());
                                 let edited =
                                     hand_over(&tui, &paused, &reading, move || shell::edit(&home, &ed, &draft)).await;
@@ -1526,6 +1527,24 @@ mod tests {
         assert!(!super::login_gone(&s, &login_id, &mut poll));
         assert_eq!(s.overlay.as_ref().unwrap().login.running(), Some("l2"));
         assert_eq!(s.overlay.as_ref().unwrap().login.problem, None);
+    }
+
+    #[test]
+    fn a_completion_edits_only_up_to_the_cursor_and_leaves_it_after_the_insert() {
+        let editor = rpi_tui::Editor::simple();
+        super::recall(&editor, "see @ap and more\nsecond");
+        assert_eq!(editor.cursor_position(), (1, 6));
+        editor.set_cursor(0, "see @ap".len());
+        assert_eq!(super::before_cursor(&editor), "see @ap");
+        super::take(&editor, "see @ap", "see @app/");
+        assert_eq!(editor.get_text(), "see @app/ and more\nsecond");
+        assert_eq!(super::before_cursor(&editor), "see @app/");
+        // A case-insensitive match rewrites what was typed.
+        editor.set_text("/p R");
+        editor.set_cursor(0, 4);
+        super::take(&editor, "/p R", "/p review");
+        assert_eq!(editor.get_text(), "/p review");
+        assert_eq!(editor.cursor_position(), (0, 9));
     }
 
     #[test]
