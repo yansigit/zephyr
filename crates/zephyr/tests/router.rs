@@ -1890,6 +1890,50 @@ async fn a_finished_task_reports_on_the_channel_that_started_it() {
 }
 
 #[tokio::test]
+async fn a_task_with_a_model_runs_on_that_providers_account_as_that_model() {
+    let home = home("task-model");
+    let gw = start(on_file(&home, ""));
+    let call = r#"[call task {"action": "start", "goal": "look it up", "model": "other/m9"}]"#;
+    gw.say("m1", "owner", call).await;
+    assert!(gw.wait_replies(1).await[0].contains("\ntask: task #1 started"));
+    wait(|| task_status(&home, "completed") == 1).await;
+    let starts = std::fs::read_to_string(home.join("accounts/b/starts.log")).unwrap();
+    assert_eq!(
+        starts, "other/m9\n",
+        "account b (other/m3) ran it as other/m9"
+    );
+    let task = log(&home, "start")
+        .into_iter()
+        .find(|s| s["sessionId"] == "task-1")
+        .unwrap();
+    assert_eq!(task["model"], "other/m9");
+    let list = zephyr::tasks::list(&Store::open(&home.join("state.db")).unwrap());
+    assert!(
+        list.contains("#1 completed (0 min ago) on other/m9: look it up"),
+        "{list}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_task_on_a_provider_with_no_account_is_refused() {
+    let home = home("task-model-none");
+    let gw = start(on_file(&home, ""));
+    let call = r#"[call task {"action": "start", "goal": "g", "model": "nope/x"}]"#;
+    gw.say("m1", "owner", call).await;
+    let reply = gw.wait_replies(1).await[0].clone();
+    assert!(
+        reply.contains(
+            "\ntask: not started: no account on nope; the accounts are a (fake/m1), b (other/m3)"
+        ),
+        "{reply}"
+    );
+    let store = Store::open(&home.join("state.db")).unwrap();
+    assert!(store.tasks(5).unwrap().is_empty(), "nothing queued");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn two_tasks_run_at_once_and_owner_stop_ends_them_all() {
     let home = home("task-owner-stop");
     let gw = start(config(&home));
@@ -1913,6 +1957,23 @@ async fn two_tasks_run_at_once_and_owner_stop_ends_them_all() {
         gw.wait_replies(4).await[3],
         "[zephyr] task #9 is not queued or running"
     );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn tasks_parallel_sets_how_many_run_at_once() {
+    let home = home("task-parallel");
+    let mut cfg = config(&home);
+    cfg.tasks = Some(toml::from_str("parallel = 3").unwrap());
+    let gw = start(cfg);
+    let call = format!(r#"[call task {{"action": "start", "goal": "{HANGING_GOAL}"}}]"#);
+    gw.say("m1", "owner", &format!("{call} {call} {call} {call}"))
+        .await;
+    gw.wait_replies(1).await;
+    wait(|| task_status(&home, "running") == 3 && task_status(&home, "queued") == 1).await;
+    gw.say("m2", "owner", "/stop").await;
+    assert_eq!(gw.wait_replies(2).await[1], "[zephyr] stopped");
+    wait(|| task_status(&home, "stopped") == 4).await;
     gw.shutdown().await;
 }
 
@@ -2360,7 +2421,9 @@ async fn a_task_that_finished_before_the_restart_reports_without_running_again()
     let cfg = config(&home);
     {
         let store = Store::open(&cfg.db_path()).unwrap();
-        store.add_task("count the files", "chat", "owner").unwrap();
+        store
+            .add_task("count the files", None, "chat", "owner")
+            .unwrap();
         store.start_next_task(1).unwrap().unwrap();
         store.set_task_session(1, "task-1").unwrap();
     }

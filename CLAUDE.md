@@ -57,8 +57,8 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   restart the child (same session), or re-exec the daemon. Config edits go through `toml_edit` to keep comments.
 - `scheduler.rs` (cron jobs, run ledger: interrupted runs become `unknown`, never auto-retried;
   `execute` is the unattended-run path jobs and tasks share), `tasks.rs` (background tasks the agent
-  starts with its `task` tool, DESIGN §4.12: at most 2 at once, and the report goes back to `main` as
-  an inbox row), `procs.rs` (main's `exec`/`process` tools, DESIGN §4.13: commands run as the agent
+  starts with its `task` tool, DESIGN §4.12: at most `[tasks] parallel` at once, default 2, each
+  on a model it may name, and the report goes back to `main` as an inbox row), `procs.rs` (main's `exec`/`process` tools, DESIGN §4.13: commands run as the agent
   and move to the background when a message for `main` arrives; main's child runs with
   `--exclude-tools bash`; a re-exec re-adopts them by pidfd and kernel start time, never a reused
   pid; after a daemon crash, `supervise.rs` (the image's `CMD`, between tini and `zephyr run`)

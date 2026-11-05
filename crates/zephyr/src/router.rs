@@ -667,11 +667,30 @@ impl<'a> Router<'a> {
     fn task_reply(&mut self, action: zephyr_policy::tools::TaskAction) -> String {
         use zephyr_policy::tools::TaskAction;
         match action {
-            TaskAction::Start(goal) => {
+            TaskAction::Start { goal, model } => {
                 let Some((channel, sender)) = self.origin() else {
                     return "no owner to report to; not started".into();
                 };
-                match self.store.add_task(&goal, &channel, &sender) {
+                // shortcut: no rpi --list-models check mid-turn; an unknown model fails the task
+                // at start and its report says so. Add a check if agents keep guessing wrong.
+                if let Some(m) = &model {
+                    let provider = m.split('/').next().unwrap_or_default();
+                    let pool = &self.cfg.accounts;
+                    if !pool.is_empty() && !pool.iter().any(|a| a.provider() == provider) {
+                        let have: Vec<String> = pool
+                            .iter()
+                            .map(|a| format!("{} ({})", a.name, a.model))
+                            .collect();
+                        return format!(
+                            "not started: no account on {provider}; the accounts are {}",
+                            have.join(", ")
+                        );
+                    }
+                }
+                match self
+                    .store
+                    .add_task(&goal, model.as_deref(), &channel, &sender)
+                {
                     Ok(Some(id)) => {
                         self.jobs.tasks.notify_one();
                         format!(

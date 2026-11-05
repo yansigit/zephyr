@@ -1,6 +1,6 @@
 //! Background tasks (DESIGN §4.12). The main agent starts one with its `task` tool; it runs in a
-//! fresh `task-<id>` child beside `main`, at most [`MAX_RUNNING`] at once, and its report comes
-//! back to the main session as an inbox row, so the main agent tells the owner. A task a restart
+//! fresh `task-<id>` child beside `main`, at most [`Config::parallel_tasks`] at once, and its
+//! report comes back to the main session as an inbox row, so the main agent tells the owner. A task a restart
 //! cut resumes in its rpi session, at most `store::MAX_TASK_RESUMES` times; then it is `unknown`.
 
 use crate::config::{Config, BUDGET_NOTICE};
@@ -11,8 +11,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
-/// Tasks that run at once; more wait queued (up to `store::MAX_OPEN_TASKS` in all).
-pub const MAX_RUNNING: usize = 2;
 /// The most of a report that goes into the main session; the rest is left in a file.
 const MAX_REPORT: usize = 8 * 1024;
 /// How often queued tasks are looked at without a wake-up, e.g. after a `/resume`.
@@ -44,7 +42,7 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
             cfg = cfgs.borrow_and_update().clone();
         }
         // While paused nothing starts; the runner aborts what was running (scheduler::until_cut).
-        while running.len() < MAX_RUNNING && store.pause_reason().ok() == Some(None) {
+        while running.len() < cfg.parallel_tasks() && store.pause_reason().ok() == Some(None) {
             match store.start_next_task(crate::now()) {
                 Ok(Some(task)) => running.push(one(cfg.clone(), task, wake)),
                 Ok(None) => break,
@@ -78,6 +76,7 @@ async fn one(cfg: Arc<Config>, task: Task, wake: &Wake) {
         refuse: "not available in background tasks",
         task: Some(task.id),
         resume,
+        model: task.model.as_deref(),
     };
     let (status, output, crossed) = execute(&cfg, &mut store, &spec).await;
     let report = cut(&cfg, task.id, &output);
@@ -140,7 +139,11 @@ pub fn list(store: &Store) -> String {
             let short: String = goal.chars().take(60).collect();
             let cut = if short.len() < goal.len() { "…" } else { "" };
             let age = (now - t.created_at).max(0) / 60;
-            format!("#{} {} ({age} min ago): {short}{cut}", t.id, t.status)
+            let on = t
+                .model
+                .as_ref()
+                .map_or(String::new(), |m| format!(" on {m}"));
+            format!("#{} {} ({age} min ago){on}: {short}{cut}", t.id, t.status)
         })
         .collect();
     format!("[zephyr] tasks:\n{}", lines.join("\n"))
