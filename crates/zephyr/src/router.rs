@@ -1333,7 +1333,7 @@ impl<'a> Router<'a> {
             ("/model", "") => self.models(),
             ("/model", model) => self.switch_model(model).await,
             ("/thinking", level) => self.thinking_level(level).await,
-            ("/new", "") => self.new_session().await,
+            ("/new" | "/clear", "") => self.new_session().await,
             ("/switch", "") => self.list_sessions(),
             ("/switch", id) => self.switch(id).await,
             ("/login", arg) => self.login(arg, from).await,

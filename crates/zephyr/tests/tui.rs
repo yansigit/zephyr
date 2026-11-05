@@ -161,6 +161,12 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
                         json!({"subscriptionId": 1, "sessionId": "main", "status": "subscribed", "messages": history()})
                     }
                     "zephyr.models" => models(),
+                    "zephyr.vault_list" => json!({"entries": []}),
+                    // The daemon answers what anyone may see: never the value.
+                    "zephyr.vault_put" => json!({"entries": [{
+                        "kind": req["params"]["kind"], "name": req["params"]["name"],
+                        "granted": false, "programs": [],
+                    }]}),
                     "zephyr.turns" => json!({"turns": [
                         {"channel": "tui", "text": "what's in ~/Projects/zephyr/deploy?"},
                         {"channel": "discord", "text": "remind me to renew the domain on friday"},
@@ -706,6 +712,25 @@ async fn esc_esc_rewinds_to_a_picked_message() {
         after.contains("│ what's in ~/Projects/zephyr/deploy?"),
         "{after}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn saving_a_vault_entry_shows_its_card_without_the_value() {
+    if tmux_missing() {
+        return;
+    }
+    let screen = Screen::start("idle", 80, 24, "dark").await;
+    screen.wait_for("^L model").await;
+    screen.keys(&["=/vault add token GH_TOKEN", "Enter"]);
+    screen.wait_for("value").await;
+    screen.keys(&["=hunter2", "Enter"]);
+    let card = screen.wait_for("saved the token GH_TOKEN").await;
+    assert!(card.contains("each program needs your OK once"), "{card}");
+    assert!(
+        card.contains("the agent was told it can use it now"),
+        "{card}"
+    );
+    assert!(!card.contains("hunter2"), "{card}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

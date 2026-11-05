@@ -12,7 +12,7 @@
    │ today: 41.2k tokens, $0.38 of $5
 
  ≋ ready
- › /new             start a fresh conversation; memory and rules carry over
+ › /new             start a fresh conversation (or /clear); memory and rules ca…
    /switch          list earlier conversations
    /switch <id>     go back to one
    /btw <question>  ask a side question; the conversation is left as is

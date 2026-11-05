@@ -127,7 +127,7 @@ Changes apply by themselves; nothing needs `zephyr restart`. The commands above,
 A file that does not load is not applied, and the daemon keeps its current settings. From any
 channel: `/model` shows the models, `/model PROVIDER/MODEL` switches (to the account on that
 provider), `/thinking` shows how hard the model thinks and `/thinking LEVEL` or `/thinking next`
-changes it from the next request (kept until the daemon restarts), `/status` shows the agent's account and model, `/reload` re-reads the files, and `/new`
+changes it from the next request (kept until the daemon restarts), `/status` shows the agent's account and model, `/reload` re-reads the files, and `/new` (or `/clear`)
 starts a fresh conversation (memory and rules carry over; the old one stays in `sessions/`), and
 `/switch` lists the earlier ones (with their names and first words) and `/switch ID` goes back to
 one. `/rename NAME` names the current one; `zephyr attach` shows the name in its header.
@@ -332,8 +332,9 @@ save it and names the exact command. Save and manage entries:
 
 - In `zephyr attach`, `/vault` opens a panel: `a` adds a login, `t` a token, `e` edits, `d`
   deletes, `r` takes back what an entry is allowed for. `/vault add login NAME SITE` and
-  `/vault add token NAME` open the form filled in. Values are typed masked. A new entry saved
-  here is told to the agent, so it can carry on.
+  `/vault add token NAME` open the form filled in. Values are typed masked. Each save shows a
+  card of what was saved and what it may be used for, never the value. A new entry saved here is
+  told to the agent, so it can carry on.
 - On the host, `zephyr vault add login github --site https://github.com --user me [--totp]`,
   `zephyr vault add token GH_TOKEN`, `list`, `edit`, `rm` and `revoke NAME [PROGRAM]`. The agent
   is not told of these: tell it.

@@ -1,11 +1,11 @@
   .◠◠.◠◠.       zephyr v0.1.0
-( ◦^ ᴗ ^◦ )~    main · claude-code-1 › claude-opus-5-5 · medium
+(               main · claude-code-1 › claude-opus-5-5 · medium
  `-.___.-'      discord ●  imessage ●  chat ○      today 41.2k tok · $0.38 / $5
  ──────────────────────────────────────────────────────────────────────────────
  ╭─ commands ─────────────────────────────────────────────────────────────────╮
  │ › type to filter                                                           │
  │ Chat                                                                       │
- │  › /new                        start a fresh conversation; memory and rul… │
+ │  › /new                        start a fresh conversation (or /clear); me… │
  │    /switch                     list earlier conversations                  │
  │    /switch <id>                go back to one                              │
  │    /btw <question>             ask a side question; the conversation is l… │

@@ -224,6 +224,9 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     // answer. shortcut: kept until the /model panel asks again, so a new /login account's list
     // shows up there first; ask on every Ctrl+P if that bites.
     let mut cycle: Option<bool> = None;
+    // The vault entry just saved, and whether its name was already there: its card is shown
+    // when the daemon's answer lists it.
+    let mut saving: Option<(String, bool)> = None;
     let outcome: anyhow::Result<()> = loop {
         tokio::select! {
             msg = msgs.recv() => {
@@ -263,7 +266,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         let command = ev["command"].as_str().unwrap_or_default();
                         let renamed = matches!(
                             command.split_whitespace().next(),
-                            Some("/rename" | "/fork" | "/switch" | "/new")
+                            Some("/rename" | "/fork" | "/switch" | "/new" | "/clear")
                         );
                         if ev["type"] == "zephyr_reply" && renamed {
                             let _ = prompt_tx.send(Ask::Sessions);
@@ -375,6 +378,11 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         }
                     }
                     Msg::Vault(list) => {
+                        if let Some((name, updated)) = saving.take() {
+                            if let Some(e) = list.iter().find(|e| e.name == name) {
+                                view.reply(Some("/vault"), &e.saved(updated));
+                            }
+                        }
                         s.vault = list.iter().map(|e| e.name.clone()).collect();
                         if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Vault) {
                             o.vault.entries = Some(list);
@@ -382,6 +390,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         }
                     }
                     Msg::VaultError(e) => {
+                        saving = None;
                         match s.overlay.as_mut().filter(|o| o.kind == Kind::Vault) {
                             Some(o) => o.vault.problem = Some(e),
                             None => view.error(&e),
@@ -524,6 +533,8 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                         close(&tui, &editor, &mut s);
                                     }
                                     Action::VaultPut(entry) => {
+                                        let had = s.vault.contains(&entry.name);
+                                        saving = Some((entry.name.clone(), had));
                                         let _ = prompt_tx.send(Ask::VaultPut(entry));
                                     }
                                     Action::VaultRm(name) => {
