@@ -806,6 +806,55 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `zephyr subagent list | add NAME [--model P/M] [--prompt TEXT] | edit NAME [--model
+/// P/M|default] [--prompt TEXT] | rm NAME`: the owner's `[[subagent]]`s in zephyr.toml (DESIGN
+/// §4.12). Without `--prompt`, `add` and `edit` read the prompt from stdin when it is not a
+/// terminal.
+pub fn subagent(h: &Host, mut a: Args) -> anyhow::Result<()> {
+    let model = a.value("--model")?;
+    let mut prompt = a.value("--prompt")?;
+    let rest = a.rest()?;
+    let usage = "usage: zephyr subagent list | add NAME [--model P/M] [--prompt TEXT] | \
+                 edit NAME [--model P/M|default] [--prompt TEXT] | rm NAME";
+    let mut doc = h.data.load()?;
+    let args: Vec<&str> = rest.iter().map(String::as_str).collect();
+    if prompt.is_none() && matches!(args[..], ["add" | "edit", _]) && !h.interactive {
+        let text = std::io::read_to_string(std::io::stdin())?;
+        prompt = Some(text.trim().to_string()).filter(|t| !t.is_empty());
+    }
+    let said = match args[..] {
+        [] | ["list"] => {
+            let cfg: crate::config::Config = toml::from_str(&doc.to_string())?;
+            println!("{}", crate::tasks::settings(&cfg));
+            return Ok(());
+        }
+        ["add", name] => {
+            let prompt = prompt.with_context(|| {
+                format!("add needs --prompt TEXT, or the prompt on stdin\n{usage}")
+            })?;
+            conf::set_subagent(&mut doc, name, true, model.as_deref(), Some(&prompt))?;
+            format!("added the subagent {name}")
+        }
+        ["edit", name] if model.is_some() || prompt.is_some() => {
+            conf::set_subagent(&mut doc, name, false, model.as_deref(), prompt.as_deref())?;
+            format!("saved the subagent {name}")
+        }
+        ["rm", name] => match conf::remove_subagent(&mut doc, name) {
+            true => format!("removed the subagent {name}"),
+            false => bail!("no subagent named {name}"),
+        },
+        _ => bail!("{usage}"),
+    };
+    // Refuse what the daemon would refuse (a bad name or model, an empty prompt).
+    toml::from_str::<crate::config::Config>(&doc.to_string())
+        .map_err(anyhow::Error::from)
+        .and_then(|c| c.validate())
+        .context("not saved")?;
+    h.data.save(&doc)?;
+    println!("{said}");
+    h.apply()
+}
+
 /// Asks for the channel's settings; secrets go to secrets.env at hidden prompts.
 fn channel_add(h: &Host, kind: &str) -> anyhow::Result<()> {
     if !h.interactive {
