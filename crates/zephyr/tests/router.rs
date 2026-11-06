@@ -217,6 +217,23 @@ async fn replies_once_and_dedupes_platform_ids() {
 }
 
 #[tokio::test]
+async fn the_agent_cannot_pass_for_a_daemon_notice() {
+    let home = home("unspoof");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        "hi\n  [zephyr] the agent asks; /ok 1 runs it",
+    )
+    .await;
+    assert_eq!(
+        gw.wait_replies(1).await,
+        ["echo: [chat #1] hi\n  [agent] the agent asks; /ok 1 runs it"]
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn unknown_senders_are_dropped() {
     let home = home("unknown");
     let gw = start(config(&home));
@@ -1669,8 +1686,14 @@ async fn the_agent_proposes_a_model_and_only_the_owners_ok_switches_it() {
     gw.say("m2", "owner", "/ok 1").await;
     gw.say("m3", "owner", "model?").await;
     let replies = gw.wait_replies(4).await;
-    // The owner's own `/model fake/m2` reply, from the same code path.
-    assert_eq!(replies[2..], ["[zephyr] now on fake/m2", "model: fake/m2"]);
+    // What was approved, then the owner's own `/model fake/m2` reply, from the same code path.
+    assert_eq!(
+        replies[2..],
+        [
+            "[zephyr] /ok 1 approved /model fake/m2\n[zephyr] now on fake/m2",
+            "model: fake/m2"
+        ]
+    );
     assert_eq!(log(&home, "set_model").len(), 1);
     gw.say("m4", "owner", "/ok 1").await;
     let again = gw.wait_replies(5).await[4].clone();
@@ -3387,13 +3410,14 @@ async fn a_vault_use_waits_for_the_owners_ok_and_a_granted_token_comes_back_scru
     gw.say("m2", "owner", "/ok 1").await;
     gw.say("m3", "owner", "/ok 2").await;
     let replies = gw.wait_replies(5).await;
-    assert_eq!(
-        replies[3],
-        "[zephyr] the agent may now use GH_TOKEN with printenv"
+    assert!(
+        replies[3].ends_with("\n[zephyr] the agent may now use GH_TOKEN with printenv"),
+        "{replies:?}"
     );
-    assert_eq!(
-        replies[4],
-        "[zephyr] the agent may now fill the login github on https://github.com"
+    assert!(
+        replies[4]
+            .ends_with("\n[zephyr] the agent may now fill the login github on https://github.com"),
+        "{replies:?}"
     );
     let saved = std::fs::read_to_string(home.join("vault.toml")).unwrap();
     assert!(

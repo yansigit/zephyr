@@ -843,7 +843,10 @@ impl<'a> Router<'a> {
             Some("assistant") if !text.is_empty() => {
                 if let Some(i) = self.steered.iter().position(|(_, delivered)| *delivered) {
                     let (row, _) = self.steered.remove(i);
-                    log(self.store.reply(&row, &text, "done").map_err(Into::into));
+                    log(self
+                        .store
+                        .reply(&row, &unspoof(&text), "done")
+                        .map_err(Into::into));
                     self.steer_sent.push(text);
                     self.steer_replied = true;
                 }
@@ -1151,6 +1154,11 @@ impl<'a> Router<'a> {
             // The owner spoke: a command still in the turn moves to the background (DESIGN §4.13).
             self.procs.yield_all();
             return log(self.dispatch_new().await);
+        };
+        // What `/ok N` ran, in the daemon's words: the agent's request may have said otherwise.
+        let reply = match &decided {
+            Some(Ok(command)) => format!("[zephyr] {} approved {command}\n{reply}", m.text.trim()),
+            _ => reply,
         };
         let resume = text == "/resume";
         let row = InboxRow {
@@ -2425,7 +2433,7 @@ impl<'a> Router<'a> {
                 Some(Some(reply)) if self.steer_sent.contains(reply) => {
                     self.store.set_status(row.id, "done")?
                 }
-                Some(Some(reply)) => self.store.reply(&row, reply, "done")?,
+                Some(Some(reply)) => self.store.reply(&row, &unspoof(reply), "done")?,
                 Some(None) if steers && !requeue && row.tries < 2 => {
                     self.store.requeue_as_continue(row.id)?
                 }
@@ -2864,6 +2872,19 @@ fn pick_in(cfg: &Config, store: &Store) -> Result<Option<Account>, i64> {
         Default::default()
     });
     crate::pool::pick(&cfg.accounts, &cooling, crate::now()).map(|a| Some(a.clone()))
+}
+
+/// Agent text as it goes out: a line that starts `[zephyr]` is shown as `[agent]`, so the agent
+/// cannot pass for a daemon notice (to bait an `/ok`, say). Never applied to the daemon's own.
+fn unspoof(text: &str) -> String {
+    let lines = text.split('\n').map(|line| {
+        let body = line.trim_start();
+        match body.strip_prefix("[zephyr]") {
+            Some(rest) => format!("{}[agent]{rest}", &line[..line.len() - body.len()]),
+            None => line.to_string(),
+        }
+    });
+    lines.collect::<Vec<_>>().join("\n")
 }
 
 fn log(r: anyhow::Result<()>) {
