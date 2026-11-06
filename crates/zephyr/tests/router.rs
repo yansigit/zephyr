@@ -322,8 +322,16 @@ async fn a_child_without_the_policy_beacon_gets_no_prompts() {
     cfg.policy_plugin = Some(home.join("missing-policy.so"));
     let gw = start(cfg.clone());
     gw.say("m1", "owner", "hi").await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    assert!(gw.replies().is_empty());
+    // The third failed start in a row tells the owner, once.
+    let told = gw.wait_replies(1).await;
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(
+        told[0].starts_with("[zephyr] the agent cannot start: policy plugin did not load")
+            && told[0].ends_with("; messages wait"),
+        "{told:?}"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(gw.replies().len(), 1, "told once");
     assert!(log(&home, "prompt").is_empty());
     assert_eq!(inbox_status(&home, "new"), 1);
     gw.shutdown().await;

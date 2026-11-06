@@ -1030,6 +1030,7 @@ impl<'a> Router<'a> {
         match Child::spawn_as(&self.cfg, Some(&session), account.as_ref()).await {
             Ok(child) => {
                 eprintln!("zephyr: rpi child {:?} ready", child.pid());
+                self.spawn_failures = 0;
                 if let Some(a) = &account {
                     eprintln!("zephyr: on account {} ({})", a.name, a.model);
                 }
@@ -1048,6 +1049,17 @@ impl<'a> Router<'a> {
             }
             Err(e) => {
                 eprintln!("zephyr: spawning rpi failed: {e:#}");
+                self.spawn_failures += 1;
+                if self.spawn_failures == SPAWN_FAILURES {
+                    let text = format!("[zephyr] the agent cannot start: {e:#}; messages wait");
+                    // Whoever waits for an answer, else whoever had the last one.
+                    let waiting = self.store.inbox_with_status("new").ok();
+                    let told = match waiting.as_ref().and_then(|w| w.first()) {
+                        Some(row) => self.store.notify(&row.channel, &row.sender, &text),
+                        None => self.store.notify_last_owner(&text),
+                    };
+                    log(told.map_err(Into::into));
+                }
                 self.schedule_respawn();
             }
         }
