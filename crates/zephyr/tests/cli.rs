@@ -151,11 +151,11 @@ fn status_fails_without_a_daemon_or_with_a_stale_heartbeat() {
     let pid = running.0.id() as i32;
     // SAFETY: plain syscalls to our own child.
     unsafe { libc::kill(pid, libc::SIGSTOP) };
-    std::fs::write(&beat, format!("{}\n", zephyr::now() - 200)).unwrap();
+    std::fs::write(&beat, format!("{}\n", zephyr::now() - 400)).unwrap();
     let out = zephyr(&cfg, &["status"]);
     unsafe { libc::kill(pid, libc::SIGCONT) };
     assert!(!out.status.success(), "{out:?}");
-    assert!(stdout(&out).contains("heartbeat: 200s ago"), "{out:?}");
+    assert!(stdout(&out).contains("heartbeat: 400s ago"), "{out:?}");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("hung"),
         "{out:?}"

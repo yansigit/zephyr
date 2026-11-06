@@ -1097,7 +1097,6 @@ impl<'a> Router<'a> {
     async fn child_exited(&mut self) {
         eprintln!("zephyr: rpi child exited; respawning in {:?}", self.backoff);
         self.child = None;
-        self.procs.kill_strays();
         self.busy = false;
         update(&self.snap, |s| s.run = Run::default());
         self.run_start = None;
@@ -2363,7 +2362,6 @@ impl<'a> Router<'a> {
         if let Some(child) = self.child.take() {
             child.stop().await;
             eprintln!("zephyr: restarting rpi");
-            self.procs.kill_strays();
         }
         self.respawn_at = Instant::now();
     }

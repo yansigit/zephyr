@@ -33,8 +33,9 @@ pub struct Policy {
 
 /// The file in the state dir the router rewrites with the unix time on each tick.
 pub const HEARTBEAT: &str = "heartbeat";
-/// A heartbeat this old means the daemon hangs (`supervise`, `zephyr status`).
-pub const STALE: Duration = Duration::from_secs(120);
+/// A heartbeat this old means the daemon hangs (`supervise`, `zephyr status`). Well past the
+/// longest a tick may legitimately wait: an auth check is up to 60 s per account, one after another.
+pub const STALE: Duration = Duration::from_secs(300);
 
 /// Seconds since the daemon last wrote `path`; `None` when it is missing or unreadable.
 pub fn heartbeat_age(path: &Path) -> Option<u64> {

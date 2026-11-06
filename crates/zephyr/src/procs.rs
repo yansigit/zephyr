@@ -149,7 +149,8 @@ impl Procs {
         running.len()
     }
 
-    /// `/stop`, `/pause` and a main child restart: kills the agent's processes that nothing live
+    /// `/stop` and `/pause`, the owner asking for everything to stop (not a routine child restart,
+    /// which must leave a server the agent meant to keep alone): kills the agent's processes that nothing live
     /// accounts for, the ones that left their process group (`setsid`, a double fork) and so
     /// outlived the kill of their command or child. Spared: whatever descends from this daemon
     /// (the rpi children of main, tasks and jobs, the desktop it started, the commands it runs as
