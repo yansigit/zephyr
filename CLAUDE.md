@@ -15,6 +15,7 @@ cargo test                                    # all non-ignored tests; needs pyt
 cargo test -p zephyr --test router            # one integration test file
 cargo test -p zephyr --test router some_name  # one test by name filter
 cargo clippy --all-targets && cargo fmt
+cargo deny check advisories bans               # what CI's deny job runs
 
 # Ignored tests need the pinned real binary at /home/user/Projects/.always-on/rpi-0.18.0/bin/rpi
 cargo test -p zephyr --test real_rpi -- --ignored
@@ -64,8 +65,12 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   and move to the background when a message for `main` arrives; main's child runs with
   `--exclude-tools bash`; a re-exec re-adopts them by pidfd and kernel start time, never a reused
   pid; after a daemon crash, `supervise.rs` (the image's `CMD`, between tini and `zephyr run`)
-  starts the daemon again and exit codes come from `.procs/<id>.exit`). `retention.rs` deletes job/task
-  sessions and process logs older than 30 days. Tasks interrupted by a crash or re-exec resume in their session (`scheduler::resume`, at most
+  starts the daemon again and exit codes come from `.procs/<id>.exit`; it also restarts a daemon
+  whose `<state>/heartbeat`, written each router tick, is 300 s old). `/stop` and `/pause` also kill
+  the agent's processes that escaped their group (`Procs::kill_strays`). `retention.rs` deletes job/task
+  sessions and process logs older than 30 days, prunes state.db at 90 days, takes the daily backup
+  (`<state>/backups/`, 7 kept) and expires replies pending 7 days. `host/alert.rs` is the host-side
+  outage alert (`zephyr alert`, a systemd user timer posting to ntfy). Tasks interrupted by a crash or re-exec resume in their session (`scheduler::resume`, at most
   3 times), and runs with no rpi event for `stall_limit` are aborted. Mid-run messages are steered in (`queue_message` `deliverAs: steer`,
   DESIGN §4.1),
   `memory.rs` (git-committed memory files), `checkpoint.rs` (DESIGN §4.14: snapshots of the
@@ -112,8 +117,17 @@ optional log, off in production.
 
 **Tests** (`crates/zephyr/tests/`) run the daemon against `fake-rpi.py`, a scripted stand-in for rpi
 0.18.0 frames. Its behaviour is driven by marker files in the zephyr home (`hang`, `slow`, `wedge`,
-`refresh_hang`, `tool_sleep`, `stats.json`, `oauth_fail`, ...) and it logs every command to `log.jsonl`; read its docstring before
-adding a test. When rpi's frame shapes matter, update fake-rpi.py to match the real binary.
+`refresh_hang`, `tool_sleep`, `stray`, `stats.json`, `oauth_fail`, ...) and it logs every command to
+`log.jsonl`; read its docstring before adding a test. It writes rpi 0.18's real session layout
+(`--<cwd>--/<stamp>_<id>.jsonl` with `.lock` and `.progress.jsonl`; read sessions in tests through
+`session_file` / `session_messages`), refuses a second run while one is active, and gives tool calls
+ids unique across children. When rpi's frame shapes matter, update fake-rpi.py to match the real
+binary. `Config::tick` (the router's 5 s housekeeping tick) is a hidden field like `stall_limit`;
+tests that wait on it set 200 ms. Wait on events, not fixed sleeps, and don't assume the order of
+replies a slow machine can reorder (a task's report may be steered into main's running turn). CI
+(`.github/workflows/ci.yml`) runs fmt, clippy and the tests on Rust 1.95 and `cargo deny check
+advisories bans`; `ZEPHYR_REAL_RPI=1` makes the ignored real-rpi tests fail instead of skip when the
+binary is missing.
 
 ## Conventions
 
