@@ -12,12 +12,21 @@ use std::time::Duration;
 /// How old a leftover must be before it goes.
 pub const AGE: Duration = Duration::from_secs(30 * 24 * 3600);
 
+/// How old a settled row of state.db must be before it goes.
+const DB_AGE: Duration = Duration::from_secs(90 * 24 * 3600);
+
 /// One sweep, as the agent (whose files these are). Returns how many files went.
 pub fn sweep(cfg: &Config, store: &Store, age: Duration) -> rusqlite::Result<usize> {
     let open = store.tasks(0)?; // queued or running, a resume included
     let tasks: HashSet<i64> = open.iter().map(|t| t.id).collect();
     let sessions: HashSet<String> = open.iter().filter_map(|t| t.session.clone()).collect();
     let procs: HashSet<i64> = store.running_procs()?.iter().map(|r| r.0.id).collect();
+    // Settled messages, replies and audit lines in state.db (`Store::prune`), as root.
+    match store.prune(crate::now() - DB_AGE.as_secs() as i64) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("zephyr: pruned {n} state.db rows older than 90 days"),
+        Err(e) => eprintln!("zephyr: pruning state.db failed: {e}"),
+    }
     let _fs = crate::agent::fs();
     let dir = cfg.session_dir();
     let mut gone = 0;
@@ -160,6 +169,25 @@ mod tests {
         for p in &kept {
             assert!(p.exists(), "{} should stay", p.display());
         }
+    }
+
+    #[test]
+    fn the_sweep_prunes_state_db_past_ninety_days() {
+        let home = crate::test_dir("retention-db");
+        let cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = {home:?}\n")).unwrap();
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let store = Store::open(&cfg.db_path()).unwrap();
+        store.audit("main", "bash", "ls", "started").unwrap();
+        store.audit("main", "bash", "pwd", "started").unwrap();
+        let old = crate::now() - DB_AGE.as_secs() as i64 - 60;
+        rusqlite::Connection::open(cfg.db_path())
+            .unwrap()
+            .execute("UPDATE audit SET ts = ?1 WHERE args = 'ls'", [old])
+            .unwrap();
+        sweep(&cfg, &store, AGE).unwrap();
+        let rows = store.audit_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2, "pwd", "a fresh line stays");
     }
 
     #[test]

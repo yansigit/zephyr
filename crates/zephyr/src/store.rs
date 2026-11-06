@@ -4,7 +4,7 @@ use crate::channel::Inbound;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// Queued and running tasks allowed at once (DESIGN §4.12); a start past this is refused.
 pub const MAX_OPEN_TASKS: i64 = 64;
@@ -212,21 +212,23 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
-        let db = Connection::open(path)?;
-        db.pragma_update(None, "journal_mode", "WAL")?;
-        db.pragma_update(None, "synchronous", "FULL")?;
-        db.busy_timeout(std::time::Duration::from_secs(5))?;
+        let mut conn = Connection::open(path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // The version is read and every step run under one write lock, so two processes opening
+        // the store at once never both migrate it. Any error rolls the whole of it back.
+        let db = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version > SCHEMA_VERSION {
             return Err(rusqlite::Error::InvalidParameterName(format!(
                 "state.db schema version {version}, this build knows {SCHEMA_VERSION}"
             )));
         }
-        // Each step runs in order from any older version, in its own transaction.
+        // Each step runs in order from any older version.
         if version < 1 {
             db.execute_batch(
-                "BEGIN;
-                 CREATE TABLE inbox(
+                "CREATE TABLE inbox(
                     id INTEGER PRIMARY KEY,
                     channel TEXT NOT NULL,
                     platform_msg_id TEXT NOT NULL,
@@ -245,23 +247,19 @@ impl Store {
                     text TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending', -- pending|sent|failed
                     created_at INTEGER NOT NULL DEFAULT (unixepoch()));
-                 PRAGMA user_version = 1;
-                 COMMIT;",
+                 PRAGMA user_version = 1;",
             )?;
         }
         if version < 2 {
             db.execute_batch(
-                "BEGIN;
-                 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
                  CREATE TABLE spend(day TEXT PRIMARY KEY, tokens INTEGER NOT NULL, cost_usd REAL NOT NULL);
-                 PRAGMA user_version = 2;
-                 COMMIT;",
+                 PRAGMA user_version = 2;",
             )?;
         }
         if version < 3 {
             db.execute_batch(
-                "BEGIN;
-                 CREATE TABLE jobs(
+                "CREATE TABLE jobs(
                     id INTEGER PRIMARY KEY,
                     name TEXT NOT NULL,
                     schedule TEXT NOT NULL, -- five-field cron or RFC3339 time
@@ -278,14 +276,12 @@ impl Store {
                     started_at INTEGER,
                     ended_at INTEGER,
                     output TEXT);
-                 PRAGMA user_version = 3;
-                 COMMIT;",
+                 PRAGMA user_version = 3;",
             )?;
         }
         if version < 4 {
             db.execute_batch(
-                "BEGIN;
-                 CREATE TABLE account_cooldown(
+                "CREATE TABLE account_cooldown(
                     name TEXT PRIMARY KEY,
                     until INTEGER NOT NULL,
                     reason TEXT NOT NULL,
@@ -296,34 +292,28 @@ impl Store {
                     tokens INTEGER NOT NULL,
                     cost_usd REAL NOT NULL,
                     PRIMARY KEY(day, account));
-                 PRAGMA user_version = 4;
-                 COMMIT;",
+                 PRAGMA user_version = 4;",
             )?;
         }
         if version < 5 {
             db.execute_batch(
-                "BEGIN;
-                 ALTER TABLE outbox ADD COLUMN attachment TEXT;
-                 PRAGMA user_version = 5;
-                 COMMIT;",
+                "ALTER TABLE outbox ADD COLUMN attachment TEXT;
+                 PRAGMA user_version = 5;",
             )?;
         }
         if version < 6 {
             db.execute_batch(
-                "BEGIN;
-                 CREATE TABLE proposals(
+                "CREATE TABLE proposals(
                     id INTEGER PRIMARY KEY,
                     command TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending', -- pending|done|dropped
                     created_at INTEGER NOT NULL DEFAULT (unixepoch()));
-                 PRAGMA user_version = 6;
-                 COMMIT;",
+                 PRAGMA user_version = 6;",
             )?;
         }
         if version < 7 {
             db.execute_batch(
-                "BEGIN;
-                 CREATE TABLE tasks(
+                "CREATE TABLE tasks(
                     id INTEGER PRIMARY KEY,
                     goal TEXT NOT NULL,
                     channel TEXT NOT NULL,
@@ -334,14 +324,12 @@ impl Store {
                     started_at INTEGER,
                     ended_at INTEGER,
                     output TEXT);
-                 PRAGMA user_version = 7;
-                 COMMIT;",
+                 PRAGMA user_version = 7;",
             )?;
         }
         if version < 8 {
             db.execute_batch(
-                "BEGIN;
-                 CREATE TABLE procs(
+                "CREATE TABLE procs(
                     id INTEGER PRIMARY KEY,
                     command TEXT NOT NULL,
                     channel TEXT NOT NULL,
@@ -350,8 +338,7 @@ impl Store {
                     exit_code INTEGER,
                     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
                     ended_at INTEGER);
-                 PRAGMA user_version = 8;
-                 COMMIT;",
+                 PRAGMA user_version = 8;",
             )?;
         }
         if version < 9 {
@@ -359,55 +346,66 @@ impl Store {
             // is re-adopted only while its pid still has the start time it was spawned with, and
             // a row remembers how it was sent, so steering survives a crash.
             db.execute_batch(
-                "BEGIN;
-                 ALTER TABLE tasks ADD COLUMN resumes INTEGER NOT NULL DEFAULT 0;
+                "ALTER TABLE tasks ADD COLUMN resumes INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE tasks ADD COLUMN session TEXT;
                  ALTER TABLE procs ADD COLUMN pid INTEGER;
                  ALTER TABLE procs ADD COLUMN start_ticks INTEGER;
                  ALTER TABLE procs ADD COLUMN deadline INTEGER; -- unix secs its timeout ends
                  ALTER TABLE inbox ADD COLUMN sent_as TEXT; -- prompt|steer|continue
-                 PRAGMA user_version = 9;
-                 COMMIT;",
+                 PRAGMA user_version = 9;",
             )?;
         }
         if version < 10 {
             // A follow-up (DESIGN §4.1) waits for the run to settle instead of being steered in.
             db.execute_batch(
-                "BEGIN;
-                 ALTER TABLE inbox ADD COLUMN deliver TEXT NOT NULL DEFAULT 'steer'; -- steer|after
-                 PRAGMA user_version = 10;
-                 COMMIT;",
+                "ALTER TABLE inbox ADD COLUMN deliver TEXT NOT NULL DEFAULT 'steer'; -- steer|after
+                 PRAGMA user_version = 10;",
             )?;
         }
         if version < 11 {
             // `/rename` (DESIGN §4.1): the owner's names for main sessions, by session id.
             db.execute_batch(
-                "BEGIN;
-                 CREATE TABLE session_names(id TEXT PRIMARY KEY, name TEXT NOT NULL);
-                 PRAGMA user_version = 11;
-                 COMMIT;",
+                "CREATE TABLE session_names(id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                 PRAGMA user_version = 11;",
             )?;
         }
         if version < 12 {
             // A task's own model (DESIGN §4.12).
             db.execute_batch(
-                "BEGIN;
-                 ALTER TABLE tasks ADD COLUMN model TEXT;
-                 PRAGMA user_version = 12;
-                 COMMIT;",
+                "ALTER TABLE tasks ADD COLUMN model TEXT;
+                 PRAGMA user_version = 12;",
             )?;
         }
         if version < 13 {
             // The subagent a task runs as, with its prompt as it was at the start (DESIGN §4.12).
             db.execute_batch(
-                "BEGIN;
-                 ALTER TABLE tasks ADD COLUMN subagent TEXT;
+                "ALTER TABLE tasks ADD COLUMN subagent TEXT;
                  ALTER TABLE tasks ADD COLUMN preamble TEXT;
-                 PRAGMA user_version = 13;
-                 COMMIT;",
+                 PRAGMA user_version = 13;",
             )?;
         }
-        Ok(Self { db })
+        if version < 14 {
+            // The loop's status scans, by index (D10), and the daemon's own tool-call audit
+            // (DESIGN §4.4): root's, never the agent's to write.
+            db.execute_batch(
+                "CREATE INDEX inbox_status ON inbox(status);
+                 CREATE INDEX outbox_status ON outbox(status);
+                 CREATE INDEX tasks_status ON tasks(status);
+                 CREATE INDEX procs_status ON procs(status);
+                 CREATE INDEX runs_job_due ON runs(job_id, due_at);
+                 CREATE TABLE audit(
+                    id INTEGER PRIMARY KEY,
+                    ts INTEGER NOT NULL DEFAULT (unixepoch()),
+                    session TEXT NOT NULL,
+                    tool TEXT NOT NULL,
+                    args TEXT NOT NULL, -- a summary, vault values scrubbed
+                    outcome TEXT NOT NULL); -- started|error|refused
+                 CREATE INDEX audit_ts ON audit(ts);
+                 PRAGMA user_version = 14;",
+            )?;
+        }
+        db.commit()?;
+        Ok(Self { db: conn })
     }
 
     /// Commits the message. Returns `None` when `(channel, platform_msg_id)` was already seen.
@@ -807,12 +805,60 @@ impl Store {
             .optional()
     }
 
-    /// Turns a job on. Returns whether it exists.
+    /// Turns a job on. Returns whether it exists. A job turned on now counts from now, so a
+    /// proposal approved after its first due time waits for the next one.
     pub fn enable_job(&self, id: i64) -> rusqlite::Result<bool> {
-        let n = self
-            .db
-            .execute("UPDATE jobs SET enabled = 1 WHERE id = ?1", params![id])?;
+        let n = self.db.execute(
+            "UPDATE jobs SET created_at = iif(enabled, created_at, unixepoch()), enabled = 1
+             WHERE id = ?1",
+            params![id],
+        )?;
         Ok(n == 1)
+    }
+
+    /// One line of the daemon's tool-call audit (DESIGN §4.4).
+    pub fn audit(
+        &self,
+        session: &str,
+        tool: &str,
+        args: &str,
+        outcome: &str,
+    ) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO audit(session, tool, args, outcome) VALUES (?1, ?2, ?3, ?4)",
+            params![session, tool, args, outcome],
+        )?;
+        Ok(())
+    }
+
+    /// The audit, oldest first, as `(session, tool, args, outcome)`.
+    pub fn audit_rows(&self) -> rusqlite::Result<Vec<(String, String, String, String)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT session, tool, args, outcome FROM audit ORDER BY id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect()
+    }
+
+    /// Drops what is older than `before` (unix secs) and settled: sent or failed replies, and
+    /// audit lines. An inbox row is never deleted, only emptied of its text: its platform id
+    /// keeps dedupe working against any replay (an iMessage backfill reaches back as far as the
+    /// owner sets), and its id keeps reply ids (`client_id`) from ever being reused. Returns
+    /// how many rows went or were emptied.
+    pub fn prune(&self, before: i64) -> rusqlite::Result<usize> {
+        let emptied = self.db.execute(
+            "UPDATE inbox SET text = '' WHERE created_at < ?1 AND text != ''
+             AND status NOT IN ('new', 'dispatched')",
+            params![before],
+        )?;
+        let sent = self.db.execute(
+            "DELETE FROM outbox WHERE created_at < ?1 AND status != 'pending'",
+            params![before],
+        )?;
+        let audit = self
+            .db
+            .execute("DELETE FROM audit WHERE ts < ?1", params![before])?;
+        Ok(emptied + sent + audit)
     }
 
     pub fn jobs(&self) -> rusqlite::Result<Vec<Job>> {
@@ -977,7 +1023,8 @@ impl Store {
     /// The open tasks, oldest first, then up to `finished` of the newest that ended.
     pub fn tasks(&self, finished: i64) -> rusqlite::Result<Vec<Task>> {
         let mut stmt = self.db.prepare(&format!(
-            "SELECT {TASK_COLUMNS} FROM tasks WHERE status IN ('queued', 'running')
+            "SELECT * FROM (SELECT {TASK_COLUMNS} FROM tasks WHERE status IN ('queued', 'running')
+                            ORDER BY id)
              UNION ALL
              SELECT * FROM (SELECT {TASK_COLUMNS} FROM tasks WHERE status NOT IN ('queued', 'running')
                             ORDER BY id DESC LIMIT ?1)"
@@ -1687,7 +1734,9 @@ mod tests {
 
     #[test]
     fn older_databases_migrate_in_order_and_keep_their_rows() {
-        // Each case undoes the steps after `version`, as a db made by that build would look.
+        // Each case undoes the steps after `version`, as a db made by that build would look:
+        // v14's first, while the tables its indexes are on still exist.
+        const V14: &str = "DROP TABLE audit; DROP INDEX inbox_status; DROP INDEX outbox_status; DROP INDEX tasks_status; DROP INDEX procs_status; DROP INDEX runs_job_due;";
         for (version, undo) in [
             (
                 1,
@@ -1704,12 +1753,13 @@ mod tests {
             (10, "DROP TABLE session_names; ALTER TABLE tasks DROP COLUMN model; ALTER TABLE tasks DROP COLUMN subagent; ALTER TABLE tasks DROP COLUMN preamble;"),
             (11, "ALTER TABLE tasks DROP COLUMN model; ALTER TABLE tasks DROP COLUMN subagent; ALTER TABLE tasks DROP COLUMN preamble;"),
             (12, "ALTER TABLE tasks DROP COLUMN subagent; ALTER TABLE tasks DROP COLUMN preamble;"),
+            (13, ""),
         ] {
             let dir = crate::test_dir(&format!("store-v{version}"));
             let path = dir.join("state.db");
             Store::open(&path).unwrap().insert_inbox(&msg("a")).unwrap();
             let db = Connection::open(&path).unwrap();
-            db.execute_batch(&format!("{undo} PRAGMA user_version = {version};"))
+            db.execute_batch(&format!("{V14} {undo} PRAGMA user_version = {version};"))
                 .unwrap();
             drop(db);
             let store = Store::open(&path).unwrap();
@@ -1741,6 +1791,19 @@ mod tests {
                 .unwrap();
             store.set_session_name("main", "taxes").unwrap();
             assert_eq!(store.session_names().unwrap()["main"], "taxes");
+            // v14: the audit table and the status indexes.
+            store.audit("main", "bash", "ls", "started").unwrap();
+            assert_eq!(store.audit_rows().unwrap().len(), 1);
+            let indexes: i64 = store
+                .db
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name IN
+                     ('inbox_status', 'outbox_status', 'tasks_status', 'procs_status', 'runs_job_due')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(indexes, 5);
             let now: i64 = store
                 .db
                 .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -1755,6 +1818,81 @@ mod tests {
             .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .unwrap();
         assert!(Store::open(&path).is_err(), "a newer schema is refused");
+    }
+
+    #[test]
+    fn processes_opening_a_new_store_at_once_migrate_it_once() {
+        for n in 0..5 {
+            let path = crate::test_dir(&format!("store-race-{n}")).join("state.db");
+            let go = std::sync::Barrier::new(8);
+            std::thread::scope(|s| {
+                let opens: Vec<_> = (0..8)
+                    .map(|_| {
+                        s.spawn(|| {
+                            go.wait();
+                            Store::open(&path).map(drop)
+                        })
+                    })
+                    .collect();
+                for open in opens {
+                    open.join().unwrap().unwrap();
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn a_job_approved_after_its_first_due_time_waits_for_the_next() {
+        let dir = crate::test_dir("store-approve-late");
+        let mut store = Store::open(&dir.join("state.db")).unwrap();
+        let id = store.propose_job("j", "daily", "p", "chat", "o").unwrap();
+        // Proposed a day ago; daily, so first due 12 h ago.
+        let day = 86_400;
+        store
+            .db
+            .execute(
+                "UPDATE jobs SET created_at = unixepoch() - ?1",
+                params![day],
+            )
+            .unwrap();
+        assert!(store.enable_job(id).unwrap());
+        let next = |_: &str, after: i64| Some(after + day / 2);
+        assert!(store.claim_due(crate::now(), next).unwrap().is_empty());
+        // Approving it again does not push it back.
+        assert!(store.enable_job(id).unwrap());
+        let later = crate::now() + day;
+        assert_eq!(store.claim_due(later, next).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prune_empties_old_settled_messages_and_drops_old_replies_and_audit() {
+        let dir = crate::test_dir("store-prune");
+        let mut store = Store::open(&dir.join("state.db")).unwrap();
+        let (old, live) = (msg("old"), msg("live"));
+        let old_id = store.insert_inbox(&old).unwrap().unwrap();
+        store.insert_inbox(&live).unwrap().unwrap();
+        let row = store.inbox_row(old_id).unwrap().unwrap();
+        store.reply(&row, "answer", "done").unwrap();
+        let sent = store.pending_outbox().unwrap()[0].id;
+        store.set_outbox_status(sent, "sent").unwrap();
+        store.notify("chat", "o", "pending notice").unwrap();
+        store.audit("main", "bash", "ls", "started").unwrap();
+        store
+            .db
+            .execute_batch(
+                "UPDATE inbox SET created_at = 0; UPDATE outbox SET created_at = 0;
+                 UPDATE audit SET ts = 0;",
+            )
+            .unwrap();
+        assert_eq!(store.prune(1000).unwrap(), 3);
+        // The old row stays, emptied, so its platform id is still deduped.
+        assert_eq!(store.inbox_row(old_id).unwrap().unwrap().text, "");
+        assert_eq!(store.insert_inbox(&old).unwrap(), None);
+        // A row still to act on and a reply still to send are kept whole.
+        assert_eq!(store.inbox_with_status("new").unwrap()[0].text, live.text);
+        assert_eq!(store.pending_outbox().unwrap().len(), 1);
+        assert!(store.audit_rows().unwrap().is_empty());
+        assert_eq!(store.prune(1000).unwrap(), 0);
     }
 
     #[test]
