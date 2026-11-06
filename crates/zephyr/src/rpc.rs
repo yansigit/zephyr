@@ -341,7 +341,7 @@ impl Child {
         // The only MCP config the policy plugin lets the adapter's tools use (DESIGN §4.6).
         cmd.env(
             zephyr_policy::policy::MCP_CONFIG_ENV,
-            crate::drafts::mcp_path(&cfg.home),
+            crate::drafts::mcp_path(cfg),
         );
         if let Some(display) = crate::desktop::ensure() {
             cmd.env("DISPLAY", display);

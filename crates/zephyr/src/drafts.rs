@@ -837,17 +837,62 @@ pub fn missing_secrets(cfg: &Config, m: &Mcp) -> Vec<String> {
 }
 
 /// The connectors file each child gets (`ZEPHYR_MCP_CONFIG`), the only one the policy plugin
-/// lets the MCP adapter's tools use.
-pub fn mcp_path(home: &Path) -> PathBuf {
-    home.join(".approved/mcp.json")
+/// lets the MCP adapter's tools use. The daemon's, in `<state>-public/` beside `<state>` (which
+/// only root may enter), so the agent can read it but never rewrite it before a child loads it.
+pub fn mcp_path(cfg: &Config) -> PathBuf {
+    let state = cfg.state_dir();
+    let name = state
+        .file_name()
+        .map_or("zephyr".into(), |n| n.to_string_lossy());
+    state
+        .with_file_name(format!("{name}-public"))
+        .join("mcp.json")
+}
+
+/// Where the daemon puts AGENTS.md when the agent runs on a uid of its own: in the parent of its
+/// home (`/` in the container), root's, which rpi loads as it walks up from its working
+/// directory. `None` outside the container, where that parent is no one's to write.
+fn owner_agents_md(cfg: &Config) -> Option<PathBuf> {
+    crate::agent::ids()?;
+    Some(cfg.home.parent()?.join("AGENTS.md"))
+}
+
+/// What `<home>/AGENTS.md` says when the real one is root's (`owner_agents_md`).
+const AGENTS_STUB: &str = "# AGENTS.md\n\nZephyr writes your standing instructions to the \
+    AGENTS.md above this folder at each start; this file is rewritten then too.\n";
+
+/// Writes `text` to `path` as the daemon, readable by all (0644), in a folder only the daemon may
+/// write: what the agent may read but must not change.
+fn write_public(path: &Path, text: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    let dir = path.parent().context("no folder")?;
+    if !dir.exists() {
+        std::fs::DirBuilder::new().mode(0o755).create(dir)?;
+    }
+    let meta = dir.symlink_metadata()?;
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+        bail!("{} is not a folder only zephyr may write", dir.display());
+    }
+    let name = path.file_name().context("no file name")?.to_string_lossy();
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(&tmp)?;
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
+    std::io::Write::write_all(&mut file, text.as_bytes())?;
+    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
 }
 
 /// Before every child start, in place of `memory::prepare` (which it runs first): publishes the
-/// approved skills and connectors to `<home>/.approved/`, written as the agent, and lists them
-/// in AGENTS.md. An edit the agent makes there lasts until the next start.
+/// approved skills to `<home>/.approved/` as the agent (an edit it makes there lasts until the
+/// next start), and the connectors (`mcp_path`) and AGENTS.md (`owner_agents_md`) as the daemon.
 pub fn prepare(cfg: &Config, agent_dir: &Path) -> anyhow::Result<()> {
     let _guard = lock();
-    crate::memory::prepare(&cfg.home, cfg.state_dir(), agent_dir)?;
+    let agents_text = crate::memory::prepare(&cfg.home, cfg.state_dir(), agent_dir)?;
     let skills = approved_skills(cfg.state_dir());
     let secrets = secrets(cfg);
     let mut servers = serde_json::Map::new();
@@ -865,7 +910,20 @@ pub fn prepare(cfg: &Config, agent_dir: &Path) -> anyhow::Result<()> {
             ),
         }
     }
-    let section = sections(&cfg.home, &skills, &listed, &cfg.subagents);
+    let mcp = mcp_path(cfg);
+    let section = sections(&cfg.home, &mcp, &skills, &listed, &cfg.subagents);
+    if servers.is_empty() {
+        let _ = std::fs::remove_file(&mcp);
+    } else {
+        let text = serde_json::to_string_pretty(&serde_json::json!({ "mcpServers": servers }))?;
+        write_public(&mcp, &text)?;
+    }
+    // From memory's text, never the file it wrote: the agent may have changed that since.
+    let mut agents_text = insert(&agents_text, &section);
+    if let Some(path) = owner_agents_md(cfg) {
+        write_public(&path, &agents_text)?;
+        agents_text = AGENTS_STUB.into();
+    }
     let _fs = crate::agent::fs();
     let dir = cfg.home.join(".approved/skills");
     match std::fs::remove_dir_all(&dir) {
@@ -878,16 +936,7 @@ pub fn prepare(cfg: &Config, agent_dir: &Path) -> anyhow::Result<()> {
     for (name, files) in &skills {
         write_files(&dir.join(name), files)?;
     }
-    let mcp = mcp_path(&cfg.home);
-    if servers.is_empty() {
-        let _ = std::fs::remove_file(&mcp);
-    } else {
-        let text = serde_json::to_string_pretty(&serde_json::json!({ "mcpServers": servers }))?;
-        crate::host::conf::replace_private(&mcp, &text)?;
-    }
-    let agents = cfg.home.join("AGENTS.md");
-    let text = std::fs::read_to_string(&agents)?;
-    std::fs::write(&agents, insert(&text, &section))?;
+    std::fs::write(cfg.home.join("AGENTS.md"), agents_text)?;
     Ok(())
 }
 
@@ -903,6 +952,7 @@ fn insert(agents: &str, section: &str) -> String {
 /// and how to propose more; then `## Subagents`, the owner's, when there are any.
 fn sections(
     home: &Path,
+    mcp: &Path,
     skills: &BTreeMap<String, Files>,
     servers: &[&Mcp],
     subagents: &[crate::config::Subagent],
@@ -938,7 +988,7 @@ fn sections(
              name below lists its tools; `mcp_call` with the same two plus `tool` and `arguments` \
              calls one. `arguments` is a JSON object, not a string holding JSON; leave it out for a \
              tool with no parameters. Any other config path, or a `url`, is refused.\n\n",
-            mcp_path(home).display()
+            mcp.display()
         ));
         for m in servers {
             let what = match &m.command {
@@ -1057,7 +1107,7 @@ mod tests {
         assert!(at("## Skills") < at("## Connectors"));
         assert!(at("## Connectors") < at("## Memory"));
         assert!(text.contains("every mcp_* call is refused"));
-        assert!(!mcp_path(&cfg.home).exists());
+        assert!(!mcp_path(&cfg).exists());
         // Rewritten from scratch at each start: one copy of each.
         assert_eq!(agents(&cfg).matches("## Skills").count(), 1);
         assert!(!text.contains("## Subagents"), "none are set up");
@@ -1196,16 +1246,36 @@ mod tests {
         std::fs::create_dir_all(cfg.state_dir()).unwrap();
         std::fs::write(cfg.secrets_path(), "DOCS_TOKEN=t0k\n").unwrap();
         let text = agents(&cfg);
-        let file = mcp_path(&cfg.home);
+        let file = mcp_path(&cfg);
         let json: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!(
             json,
             serde_json::json!({"mcpServers": {"docs": {
                 "url": "https://x/mcp", "headers": {"Authorization": "Bearer t0k"}}}})
         );
+        // The daemon's, out of the agent's home: readable, never rewritable before a child loads it.
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert!(
+            file.ends_with("state-public/mcp.json"),
+            "{}",
+            file.display()
+        );
+        assert_eq!((mode(&file), mode(file.parent().unwrap())), (0o644, 0o755));
+        assert!(text.contains(&format!("`configPath` `{}`", file.display())));
+        assert!(!cfg.home.join(".approved/mcp.json").exists());
+        // A folder others may write is not the daemon's own: refused.
+        std::fs::set_permissions(
+            file.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        assert!(prepare(&cfg, &cfg.home.join("agent")).is_err());
+        std::fs::set_permissions(
+            file.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         assert!(text.contains("- **docs**: remote (HTTP)"), "{text}");
         assert!(
             !text.contains("**local**"),
@@ -1301,7 +1371,7 @@ mod tests {
         )
         .unwrap();
         agents(&cfg);
-        let text = std::fs::read_to_string(mcp_path(&cfg.home)).unwrap();
+        let text = std::fs::read_to_string(mcp_path(&cfg)).unwrap();
         assert!(
             text.contains("d0cs") && !text.contains("\"leak\""),
             "{text}"

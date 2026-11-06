@@ -3214,8 +3214,8 @@ async fn an_approved_connector_restarts_the_agent_with_its_file() {
         agents.contains("- **docs**: local, runs `python3`"),
         "{agents}"
     );
-    let file: Value =
-        serde_json::from_slice(&std::fs::read(home.join(".approved/mcp.json")).unwrap()).unwrap();
+    let path = zephyr::drafts::mcp_path(&on_file(&home, ""));
+    let file: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(file["mcpServers"]["docs"]["command"], "python3");
     gw.shutdown().await;
 }
