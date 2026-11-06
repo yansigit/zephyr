@@ -22,6 +22,13 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// one stuck channel can't hold up the router or the other channels.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const STUCK_PAUSE: Duration = Duration::from_secs(30);
+/// How long the router waits for rpi to answer an `abort`: the settle is what counts.
+const ABORT_WAIT: Duration = Duration::from_secs(5);
+/// A run cut this long ago (at most `stall_limit`) that never settled: the child is wedged and
+/// is killed, and the run resumes as after a crash.
+const WEDGED: Duration = Duration::from_secs(60);
+/// After this many failed starts in a row the owner is told the agent cannot start.
+const SPAWN_FAILURES: u32 = 3;
 
 /// The prompt text for a row. The `#id` tag is what recovery looks for in `get_messages`.
 pub fn tagged(row: &InboxRow) -> String {
@@ -303,6 +310,9 @@ pub async fn run<C: Channel>(
         last_event: Instant::now(),
         note_pending: false,
         cut: None,
+        cut_at: None,
+        spawn_failures: 0,
+        stopping: false,
         procs: Default::default(),
         compacting: None,
     };
@@ -465,6 +475,12 @@ struct Router<'a> {
     note_pending: bool,
     /// Why the current run was stopped by a run limit; told to the owner at its settle.
     cut: Option<String>,
+    /// When `cut` was set: a cut run that never settles is a wedged child (`cap_run`).
+    cut_at: Option<Instant>,
+    /// Failed child starts in a row, so the owner is told once (`SPAWN_FAILURES`).
+    spawn_failures: u32,
+    /// Draining for a shutdown: rows are written but never dispatched.
+    stopping: bool,
     /// The main agent's `exec` commands (DESIGN §4.13).
     procs: crate::procs::Procs,
     /// The pooled account the child runs on (DESIGN §4.9). `None` without a pool.
@@ -1054,6 +1070,7 @@ impl<'a> Router<'a> {
         update(&self.snap, |s| s.run = Run::default());
         self.run_start = None;
         self.cut = None;
+        self.cut_at = None;
         if let Some((channel, to)) = self.compacting.take() {
             let text = "[zephyr] /compact was cut off: the agent restarted";
             log(self.store.notify(&channel, &to, text).map_err(Into::into));
@@ -1139,9 +1156,17 @@ impl<'a> Router<'a> {
 
     /// Stops the run once it passes `budget.run_turns` or `run_minutes` (DESIGN §4.4).
     async fn cap_run(&mut self) {
-        let (Some(start), None) = (self.run_start, &self.cut) else {
+        let Some(start) = self.run_start else {
             return;
         };
+        if let Some(at) = self.cut_at {
+            if at.elapsed() >= WEDGED.min(self.cfg.stall_limit) {
+                eprintln!("zephyr: rpi never settled the stopped run; killing it");
+                self.child = None; // dropping it kills it
+                self.child_exited().await;
+            }
+            return;
+        }
         if self.guard_run().await {
             return;
         }
@@ -1153,7 +1178,16 @@ impl<'a> Router<'a> {
         };
         eprintln!("zephyr: {notice}");
         self.cut = Some(notice);
-        log(self.call(json!({"type": "abort"})).await.map(drop));
+        self.cut_at = Some(Instant::now());
+        self.abort().await;
+    }
+
+    /// Asks rpi to abort the run, waiting at most `ABORT_WAIT`: a wedged child never answers.
+    async fn abort(&mut self) {
+        match tokio::time::timeout(ABORT_WAIT, self.call(json!({"type": "abort"}))).await {
+            Ok(r) => log(r.map(drop)),
+            Err(_) => eprintln!("zephyr: rpi did not answer the abort"),
+        }
     }
 
     /// The owner's notice when the run counts as stuck: no rpi event for `cfg.stall_limit`, twice
@@ -1178,7 +1212,7 @@ impl<'a> Router<'a> {
             "/pause" => {
                 log(self.store.set_paused(Some("user")).map_err(Into::into));
                 if self.busy {
-                    log(self.call(json!({"type": "abort"})).await.map(drop));
+                    self.abort().await;
                 }
                 self.procs.stop_all();
                 "[zephyr] paused: messages wait in the inbox until /resume"
@@ -1188,7 +1222,7 @@ impl<'a> Router<'a> {
                 "[zephyr] resumed"
             }
             _ => {
-                log(self.call(json!({"type": "abort"})).await.map(drop));
+                self.abort().await;
                 // Background tasks too (DESIGN §4.12); each still reports back as stopped.
                 crate::tasks::stop(&mut self.store, self.jobs, None);
                 self.procs.stop_all();
@@ -1277,6 +1311,7 @@ impl<'a> Router<'a> {
         self.busy = false;
         self.run_start = None;
         let cut = self.cut.take();
+        self.cut_at = None;
         self.compacted(ev);
         // Before reconcile dispatches the next row, so that row runs on the new model.
         self.apply_model().await;
@@ -2544,7 +2579,8 @@ impl<'a> Router<'a> {
                 let notice = format!("[zephyr] stopped a run that {why}");
                 eprintln!("zephyr: {notice}");
                 self.cut = Some(notice);
-                log(self.call(json!({"type": "abort"})).await.map(drop));
+                self.cut_at = Some(Instant::now());
+                self.abort().await;
                 true
             }
             None => false,

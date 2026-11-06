@@ -2641,6 +2641,28 @@ async fn a_main_run_that_stalls_is_stopped_and_the_owner_told() {
     gw.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_wedged_child_that_never_settles_the_abort_is_killed_and_the_run_resumed() {
+    let home = home("wedge");
+    std::fs::write(home.join("wedge"), "").unwrap();
+    let mut cfg = config(&home);
+    cfg.stall_limit = Duration::from_secs(1);
+    // The auth check's own call would wait out its 60 s timeout on the wedged child.
+    cfg.auth.enabled = false;
+    let gw = start(cfg);
+    gw.say("m1", "owner", "long job").await;
+    // The stall shows at a 5 s tick, the abort goes unanswered for 5 s, then the kill.
+    for _ in 0..600 {
+        if !gw.replies().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(gw.replies(), ["resumed: [chat #1] long job"]);
+    assert_eq!(log(&home, "start").len(), 2, "a second child");
+    gw.shutdown().await;
+}
+
 /// A task goal line that writes `progress: halfway` first (see HANGING_GOAL for the escape).
 const PROGRESS: &str = r"\u005bprogress]";
 

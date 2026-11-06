@@ -423,9 +423,20 @@ impl Child {
         self.pending.lock().unwrap().insert(id, tx);
         let mut line = serde_json::to_vec(&cmd)?;
         line.push(b'\n');
-        self.stdin.write_all(&line).await?;
-        self.stdin.flush().await?;
-        let Ok(resp) = tokio::time::timeout(Duration::from_secs(60), rx).await else {
+        // The write is timed too: a child that stops reading fills its stdin pipe.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let write = async {
+            self.stdin.write_all(&line).await?;
+            self.stdin.flush().await
+        };
+        let Ok(written) = tokio::time::timeout_at(deadline, write).await else {
+            self.pending.lock().unwrap().remove(&id);
+            // A half-written line has broken the stream: end the child, whose exit the caller sees.
+            let _ = self.process.start_kill();
+            bail!("{} timed out: rpi is not reading its input", cmd["type"]);
+        };
+        written?;
+        let Ok(resp) = tokio::time::timeout_at(deadline, rx).await else {
             // A late answer then finds no waiter and goes out as an event, which the router ignores.
             self.pending.lock().unwrap().remove(&id);
             bail!("{} timed out", cmd["type"]);
