@@ -328,7 +328,7 @@ pub async fn run<C: Channel>(
         r = crate::attach::serve(cfg, tx, attach_tx, snap_rx, attach_cfgs) => r.map(|()| Exit::Shutdown),
         r = crate::scheduler::run(cfg_rx.clone(), &jobs) => r.map(|()| Exit::Shutdown),
         r = crate::tasks::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),
-        r = show_activity(channels, activity_rx) => r.map(|()| Exit::Shutdown),
+        r = show_activity(channels, activity_rx, cfg.tick) => r.map(|()| Exit::Shutdown),
         r = router.main(rx, channels, shutdown) => r,
     }
 }
@@ -338,9 +338,10 @@ pub async fn run<C: Channel>(
 async fn show_activity<C: Channel>(
     channels: &[C],
     mut rx: watch::Receiver<Snapshot>,
+    every: Duration,
 ) -> anyhow::Result<()> {
     let (mut prev, mut tools) = (Run::default(), Vec::new());
-    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    let mut tick = tokio::time::interval(every);
     loop {
         tokio::select! {
             r = rx.changed() => if r.is_err() { return std::future::pending().await },
@@ -535,7 +536,7 @@ impl<'a> Router<'a> {
         tokio::pin!(shutdown);
         let mut exit = Exit::Shutdown;
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
-        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        let mut tick = tokio::time::interval(self.cfg.tick);
         let paused = |store: &Store| store.pause_reason().ok().flatten().is_some();
         let mut was_paused = paused(&self.store);
         self.publish();
