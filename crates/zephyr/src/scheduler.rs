@@ -138,6 +138,7 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
     let mut poll = tokio::time::interval(PAUSE_POLL);
     let mut was_paused = false;
     let mut swept: Option<Instant> = None;
+    let mut sweeping: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         let woke = tokio::select! {
             _ = tick.tick() => true,
@@ -149,15 +150,22 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
             tz = zone(&cfg)?; // checked by Config::validate
         }
         // Hourly, from the first tick on: leftovers older than 30 days (DESIGN §4.1).
-        if woke && swept.is_none_or(|t| t.elapsed() >= SWEEP_EVERY) {
+        // On a blocking thread with its own connection, one at a time: it walks dirs and runs
+        // checkpoint git, which must never stall the daemon's one future.
+        let idle = sweeping.as_ref().is_none_or(|h| h.is_finished());
+        if woke && idle && swept.is_none_or(|t| t.elapsed() >= SWEEP_EVERY) {
             swept = Some(Instant::now());
-            match crate::retention::sweep(&cfg, &store, crate::retention::AGE) {
-                Ok(0) => {}
-                Ok(n) => {
-                    eprintln!("zephyr: removed {n} files of background work older than 30 days")
+            let cfg = cfg.clone();
+            sweeping = Some(tokio::task::spawn_blocking(move || {
+                let store = Store::open(&cfg.db_path());
+                match store.and_then(|s| crate::retention::sweep(&cfg, &s, crate::retention::AGE)) {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        eprintln!("zephyr: removed {n} files of background work older than 30 days")
+                    }
+                    Err(e) => eprintln!("zephyr: sweeping old background files failed: {e}"),
                 }
-                Err(e) => eprintln!("zephyr: sweeping old background files failed: {e}"),
-            }
+            }));
         }
         let now_paused = paused(&store);
         // A resume works through what waited without waiting for the next tick.
@@ -195,7 +203,8 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
             let (status, output, crossed) = execute(&cfg, &mut store, &spec).await;
             wake.running.store(false, Ordering::SeqCst);
             // The run's memory edits are committed as main's settle would commit them.
-            let memory = crate::memory::commit_if_changed(&cfg.home, cfg.state_dir())
+            let memory = crate::memory::commit(&cfg.home, cfg.state_dir())
+                .await
                 .unwrap_or_else(|e| {
                     eprintln!("zephyr: memory commit failed: {e:#}");
                     None
@@ -297,11 +306,12 @@ pub async fn execute(
         };
         // Only the first attempt reopens the stored session; a failover starts fresh.
         let resume = spec.resume && attempt == 0;
-        let (status, text, over) = attempt_once(cfg, store, spec, &session, account, resume).await;
+        let (status, text, over, error) =
+            attempt_once(cfg, store, spec, &session, account, resume).await;
         crossed |= over;
-        let limited = (status == "failed")
-            .then(|| crate::pool::rate_limit(&text))
-            .flatten();
+        // Only the run's own error: the label holds ids ("task #429") and a cut-short report
+        // holds the agent's words.
+        let limited = error.as_deref().and_then(crate::pool::rate_limit);
         let (Some(a), Some(resets_at)) = (account, limited) else {
             return (status, text, crossed);
         };
@@ -324,7 +334,7 @@ async fn attempt_once(
     session: &str,
     account: Option<&crate::config::Account>,
     resume: bool,
-) -> (&'static str, String, bool) {
+) -> (&'static str, String, bool, Option<String>) {
     let label = &spec.label;
     if let Some(id) = spec.task {
         // Recorded first, so a restart during this attempt resumes this session.
@@ -334,7 +344,14 @@ async fn attempt_once(
     }
     let mut child = match Child::spawn_as(cfg, Some(session), account).await {
         Ok(child) => child,
-        Err(e) => return ("failed", format!("{label} could not start: {e:#}"), false),
+        Err(e) => {
+            return (
+                "failed",
+                format!("{label} could not start: {e:#}"),
+                false,
+                None,
+            )
+        }
     };
     let limit = cfg.job_timeout;
     let max_turns = cfg.budget.as_ref().and_then(|b| b.run_turns);
@@ -344,13 +361,18 @@ async fn attempt_once(
         why = until_cut(store, spec.task) => Err(why),
     };
     // `cut_short`: stopped, paused, timed out or stalled, so it may have done some of the work.
+    let mut error = None;
     let (status, text, cut_short) = match ended {
         Ok(Ok(Ok(Ok(text)))) => ("completed", text, false),
         Ok(Ok(Ok(Err(why)))) => {
             let stalled = why.to_string().starts_with("stalled");
+            error = Some(format!("{why:#}"));
             ("failed", format!("{label} failed: {why:#}"), stalled)
         }
-        Ok(Ok(Err(why))) => ("failed", format!("{label} failed: {why:#}"), false),
+        Ok(Ok(Err(why))) => {
+            error = Some(format!("{why:#}"));
+            ("failed", format!("{label} failed: {why:#}"), false)
+        }
         cut => {
             let abort = child.call(json!({"type": "abort"}));
             let _ = tokio::time::timeout(Duration::from_secs(5), abort).await;
@@ -384,7 +406,7 @@ async fn attempt_once(
     crate::tools::apply(store, cfg, &tally.requests, Some(spec.to.clone()));
     let crossed = book(store, cfg, account, tally.used);
     child.stop().await;
-    (out.0, out.1, crossed)
+    (out.0, out.1, crossed, error)
 }
 
 /// The most a cut-short run's last message adds to its report, as `tasks::MAX_REPORT` is for a
@@ -468,11 +490,50 @@ async fn resume(
         // Cut before the prompt was committed: start it now.
         return prompt(cfg, child, spec.prompt, spec.refuse, tally, max_turns).await;
     };
-    let text = message_text(last);
-    if last["kind"] == "assistant" && !text.is_empty() {
+    if let Some(text) = final_reply(last) {
         return Ok(Ok(text));
     }
     prompt(cfg, child, RESUME_NOTE, spec.refuse, tally, max_turns).await
+}
+
+/// The text of `last` when it is a finished reply: the agent's, with text, and no tool call
+/// still waiting on its result.
+fn final_reply(last: &serde_json::Value) -> Option<String> {
+    let blocks = last["content"].as_array().into_iter().flatten();
+    let calling = blocks.clone().any(|b| b["type"] == "toolCall");
+    let text = message_text(last);
+    (last["kind"] == "assistant" && !calling && !text.is_empty()).then_some(text)
+}
+
+/// The most of a tool call's arguments an audit line keeps.
+const AUDIT_ARGS: usize = 500;
+
+/// Records a tool call's start (or the policy's refusal of it) and its failure in the audit
+/// (DESIGN §4.4), from rpi's own events, in root's store: the agent can write neither.
+/// Arguments are cut to `AUDIT_ARGS` and the vault's values scrubbed out.
+pub(crate) fn audit(store: &Store, cfg: &Config, session: &str, ev: &serde_json::Value) {
+    let Some(tool) = ev["toolName"].as_str() else {
+        return;
+    };
+    let (args, outcome) = match ev["type"].as_str() {
+        Some("tool_execution_start") => {
+            let refused = matches!(
+                zephyr_policy::policy::check(tool, &ev["args"]),
+                zephyr_policy::policy::Decision::Deny(_)
+            );
+            let outcome = if refused { "refused" } else { "started" };
+            (crate::vault::scrubbed(cfg, ev["args"].to_string()), outcome)
+        }
+        Some("tool_execution_end") if ev["isError"] == true => (String::new(), "error"),
+        _ => return,
+    };
+    let end = (0..=AUDIT_ARGS.min(args.len()))
+        .rev()
+        .find(|&i| args.is_char_boundary(i))
+        .unwrap_or(0);
+    if let Err(e) = store.audit(session, tool, &args[..end], outcome) {
+        eprintln!("zephyr: writing the audit failed: {e}");
+    }
 }
 
 /// Sends the prompt and waits for the run to settle (`follow`).
@@ -504,6 +565,8 @@ async fn follow(
     let mut cut = None;
     let mut guarded: Option<String> = None;
     let mut in_tool = 0usize;
+    // Its own connection: `follow` is not handed the run's store.
+    let audited = child.session.clone().zip(Store::open(&cfg.db_path()).ok());
     let settled = loop {
         let limit = cfg.stall_limit * if in_tool > 0 { 2 } else { 1 };
         let Ok(ev) = tokio::time::timeout(limit, child.events.recv()).await else {
@@ -514,6 +577,9 @@ async fn follow(
             Some(ev) if ev["type"] == "agent_settled" => break ev,
             Some(ev) => {
                 tally.add(&ev);
+                if let Some((session, store)) = &audited {
+                    audit(store, cfg, session, &ev);
+                }
                 match ev["type"].as_str() {
                     Some("tool_execution_start") => in_tool += 1,
                     Some("tool_execution_end") => in_tool = in_tool.saturating_sub(1),
@@ -676,6 +742,19 @@ mod tests {
 
     fn utc(schedule: &str, after: i64) -> Option<i64> {
         next_after(schedule, after, &TimeZone::UTC)
+    }
+
+    #[test]
+    fn a_reply_still_calling_a_tool_is_not_the_finished_report() {
+        let calling = json!({"kind": "assistant", "content": [
+            {"type": "text", "text": "Let me build it."},
+            {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": "make"}}
+        ]});
+        assert_eq!(final_reply(&calling), None);
+        let done = json!({"kind": "assistant", "content": [{"type": "text", "text": "Built."}]});
+        assert_eq!(final_reply(&done).as_deref(), Some("Built."));
+        let user = json!({"kind": "user", "content": "go"});
+        assert_eq!(final_reply(&user), None);
     }
 
     fn cfg(timezone: Option<&str>) -> Config {

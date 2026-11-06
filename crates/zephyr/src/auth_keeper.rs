@@ -164,10 +164,12 @@ async fn run_refresh(cfg: &Config, agent_dir: &Path, provider: &str) -> anyhow::
     let mut cmd = tokio::process::Command::new(&cfg.rpi);
     crate::agent::cmd(cmd.as_std_mut());
     let out = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(if cfg!(test) { 1 } else { 60 }),
         cmd.args(["auth", "refresh", "--provider", provider])
             .env("RPI_CODING_AGENT_DIR", agent_dir)
             .current_dir(&cfg.home)
+            // Timed out, it must not race the next refresh on a rotating refresh token.
+            .kill_on_drop(true)
             .output(),
     )
     .await
@@ -176,4 +178,31 @@ async fn run_refresh(cfg: &Config, agent_dir: &Path, provider: &str) -> anyhow::
         bail!("rpi auth refresh exited with {}", out.status);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_timed_out_refresh_is_killed() {
+        let home = crate::test_dir("auth-refresh-hang");
+        std::fs::write(home.join("refresh_hang"), "").unwrap();
+        let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-rpi.py");
+        let cfg: Config =
+            toml::from_str(&format!("rpi = {fake:?}\nhome = {:?}\n", home.display())).unwrap();
+        let err = run_refresh(&cfg, &home, "p").await.unwrap_err();
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+        let pid = std::fs::read_to_string(home.join("refresh_pid")).unwrap();
+        // Gone, or a zombie until tokio reaps it: either way no longer running.
+        let stat = format!("/proc/{pid}/stat");
+        for _ in 0..100 {
+            match std::fs::read_to_string(&stat) {
+                Ok(s) if !s.contains(") Z ") => {}
+                _ => return,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the refresh {pid} is still running");
+    }
 }

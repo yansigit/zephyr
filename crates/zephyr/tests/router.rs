@@ -1323,6 +1323,53 @@ async fn a_rate_limited_job_retries_on_the_next_account() {
     gw.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_message_rate_limited_on_five_accounts_gets_an_answer_not_a_sixth_try() {
+    let home = home("failover-cap");
+    let mut cfg = config(&home);
+    let reset = zephyr::now() + 3600;
+    cfg.accounts = (1..=6)
+        .map(|i| {
+            let name = format!("a{i}");
+            rate_limit(&home, &name, &format!("rate_limited; resets_at={reset}"));
+            zephyr::config::Account {
+                name,
+                model: format!("p{i}/m"),
+            }
+        })
+        .collect();
+    let gw = start(cfg);
+    gw.say("m1", "owner", "hi").await;
+    let answer = "[zephyr] the run ended without a reply".to_string();
+    wait(|| gw.replies().contains(&answer)).await;
+    assert_eq!(inbox_status(&home, "done"), 1);
+    assert_eq!(log(&home, "prompt").len(), 5);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_job_whose_label_holds_429_failing_otherwise_cools_no_account() {
+    let home = home("job-429-label");
+    rate_limit(&home, "a", "prompt is too long: 204290 tokens");
+    let gw = start(pooled(&home));
+    // The run's label is "[zephyr] job #1 (429) run 1", as a task's is "task #429".
+    gw.say("m1", "owner", &format!("/job add 429 | {NEVER} | say: hi"))
+        .await;
+    gw.say("m2", "owner", "/job run 1").await;
+    wait(|| run_status(&home, "failed") == 1).await;
+    assert!(cooldowns(&home).is_empty());
+    let models: Vec<_> = log(&home, "start")
+        .iter()
+        .map(|s| s["model"].clone())
+        .collect();
+    assert_eq!(
+        models,
+        ["pa/m", "pa/m"],
+        "main, then the job, not re-run on b"
+    );
+    gw.shutdown().await;
+}
+
 /// A config loaded from `<home>/zephyr.toml`, so reloads have a file to read: accounts `a`
 /// (`fake/m1`) then `b` (`other/m3`), both models in the fake rpi's catalogue.
 fn on_file(home: &Path, extra: &str) -> Config {
@@ -2830,6 +2877,40 @@ async fn a_steer_the_resumed_run_never_reached_is_sent_again_once() {
     assert_eq!(gw.replies().len(), 2, "each message answered once");
     assert!(!log(&home, "clear_queue").is_empty());
     assert!(!main_session(&home).contains("Zephyr restarted while you were working"));
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn every_tool_call_of_main_and_of_a_job_is_audited_in_the_store() {
+    let home = home("audit");
+    std::fs::write(home.join("tool_fail"), "nope").unwrap();
+    let gw = start(config(&home));
+    let calls = r#"[call read {"path": "notes.txt"}] [call write {"path": "a/.ssh/config"}] go"#;
+    gw.say("m1", "owner", calls).await;
+    gw.wait_replies(1).await;
+    std::fs::remove_file(home.join("tool_fail")).unwrap();
+    let job = r#"/job add j | 0 0 1 1 * | [call read {"path": "j.txt"}] done"#;
+    gw.say("m2", "owner", job).await;
+    gw.say("m3", "owner", "/job run 1").await;
+    wait(|| run_status(&home, "completed") == 1).await;
+    let rows = Store::open(&home.join("state.db"))
+        .unwrap()
+        .audit_rows()
+        .unwrap();
+    let rows: Vec<_> = rows
+        .iter()
+        .map(|(s, t, a, o)| (s.as_str(), t.as_str(), a.as_str(), o.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("main", "read", r#"{"path":"notes.txt"}"#, "started"),
+            ("main", "read", "", "error"),
+            ("main", "write", r#"{"path":"a/.ssh/config"}"#, "refused"),
+            ("main", "write", "", "error"),
+            ("job-1-1", "read", r#"{"path":"j.txt"}"#, "started"),
+        ]
+    );
     gw.shutdown().await;
 }
 

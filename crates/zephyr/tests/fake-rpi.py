@@ -10,7 +10,8 @@ reply carries: {"totalTokens": n, "costTotal": x}, sent as message.usage.{totalT
 `get_stats` always reports 0, as rpi does for replies.
 Auth: the OAuth store is $RPI_CODING_AGENT_DIR/auth.json. `get_auth_status` lists its oauth
 entries. `auth refresh --provider P` (the CLI, not the RPC) gives P a fresh expiry, and records
-an "auth-refresh" line in ./log.jsonl (an `oauth_fail` file in the home makes it fail).
+an "auth-refresh" line in ./log.jsonl (an `oauth_fail` file in the home makes it fail; a
+`refresh_hang` file makes it write its pid to `refresh_pid` in the home and hang).
 `auth login --provider P` records an "auth-login" line and stores {"type": "oauth"} for P: with a
 `login_url` file in the home it prints a sign-in URL and waits for a `login_go` file (the browser
 coming back), otherwise it prompts and reads one stdin line; a `login_fail` file makes it fail.
@@ -19,7 +20,8 @@ Accounts: each start logs {"type": "start", "agentDir", "model"} to ./log.jsonl.
 `rate_limited` file in $RPI_CODING_AGENT_DIR holds an error text: every prompt then ends with
 that error (stopReason "error", settle outcome "failed"), as a rate-limited provider does.
 A prompt containing WRITE_MEMORY first writes memory/MEMORY.md under the home.
-argv.json holds the argv of the latest start.
+argv.json holds the argv of the latest start. With a `tool_sleep` file in the home, each start
+leaves a `sleep 300` running in its process group, as a tool would, its pid in `tool_pid`.
 A prompt containing `bash: CMD` first reports a bash tool call running CMD (tool_execution_start).
 With `--no-tools` (a /btw child) none of the tool markers below (`bash: `, `[tool]`, `[call ...]`)
 runs anything, so its prompt is echoed whole; with `--no-session` there is no session file (the
@@ -142,6 +144,9 @@ if args[:1] == ["auth"]:
         sys.exit(0)
     # `rpi auth refresh --provider P`.
     open(os.path.join(home, "log.jsonl"), "a").write(json.dumps({"type": "auth-refresh", "provider": provider}) + "\n")
+    if os.path.exists(os.path.join(home, "refresh_hang")):
+        open(os.path.join(home, "refresh_pid"), "w").write(str(os.getpid()))
+        time.sleep(300)
     if os.path.exists(os.path.join(home, "oauth_fail")) or store.get(provider, {}).get("type") != "oauth":
         print("error: OAuth refresh failed", file=sys.stderr); sys.exit(1)
     store[provider]["expires"] = int(time.time()) + 3600
@@ -163,6 +168,9 @@ json.dump(args, open(os.path.join(home, "argv.json"), "w"))  # the flags this ch
 open(os.path.join(home, "log.jsonl"), "a").write(json.dumps(
     {"type": "start", "agentDir": os.environ.get("RPI_CODING_AGENT_DIR"), "model": opt("--model"),
      "sessionId": opt("--session-id"), "noSession": ephemeral, "noTools": not tools}) + "\n")
+if os.path.exists(os.path.join(home, "tool_sleep")):  # a tool left running in the child's group
+    import subprocess
+    open(os.path.join(home, "tool_pid"), "w").write(str(subprocess.Popen(["sleep", "300"]).pid))
 if os.path.isdir(os.environ.get("RPI_CODING_AGENT_DIR") or ""):  # which account started, for tests whose home is temporary
     open(os.path.join(os.environ["RPI_CODING_AGENT_DIR"], "starts.log"), "a").write("%s\n" % opt("--model"))
 

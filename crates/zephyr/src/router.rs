@@ -619,6 +619,9 @@ impl<'a> Router<'a> {
             let _ = self.tap.send(ev.clone()); // no receivers is fine
             self.last_event = Instant::now();
             self.tally.add(ev);
+            if let Some(session) = self.child.as_ref().and_then(|c| c.session.as_deref()) {
+                crate::scheduler::audit(&self.store, &self.cfg, session, ev);
+            }
             self.track(ev);
             self.steer_event(ev);
             if let Some((id, command)) = crate::tools::gateway_call(ev) {
@@ -1346,7 +1349,8 @@ impl<'a> Router<'a> {
         // Before reconcile dispatches the next row, so that row runs on the new model.
         self.apply_model().await;
         self.backoff = FIRST_BACKOFF;
-        let memory = crate::memory::commit_if_changed(&self.cfg.home, self.cfg.state_dir())
+        let memory = crate::memory::commit(&self.cfg.home, self.cfg.state_dir())
+            .await
             .unwrap_or_else(|e| {
                 eprintln!("zephyr: memory commit failed: {e:#}");
                 None
@@ -2437,7 +2441,8 @@ impl<'a> Router<'a> {
                 Some(None) if steers && !requeue && row.tries < 2 => {
                     self.store.requeue_as_continue(row.id)?
                 }
-                Some(None) if requeue => self.store.set_status(row.id, "new")?,
+                // A failover sends it again, but not forever.
+                Some(None) if requeue && row.tries < 5 => self.store.set_status(row.id, "new")?,
                 Some(None) => {
                     let text = fallback
                         .as_deref()
