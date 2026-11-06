@@ -217,7 +217,9 @@ pub fn backup_warning(cfg: &Config, now: std::time::SystemTime) -> Option<String
 
 /// The session id in rpi's `<timestamp>_<session id>.jsonl` (or its `.lock`).
 fn session_of(name: &str) -> Option<&str> {
+    // rpi's companions of a session file: its lock and its progress log.
     let name = name.strip_suffix(".lock").unwrap_or(name);
+    let name = name.strip_suffix(".progress.jsonl").unwrap_or(name);
     Some(name.strip_suffix(".jsonl")?.split_once('_')?.1)
 }
 
@@ -495,6 +497,11 @@ mod tests {
         assert_eq!(
             session_of("2026-01-01T00-00Z_task-3.jsonl.lock"),
             Some("task-3")
+        );
+        assert_eq!(
+            session_of("2026-01-01T00-00Z_task-3.jsonl.progress.jsonl"),
+            Some("task-3"),
+            "an open task's progress log is its session's"
         );
         assert_eq!(session_of("job-1-2.jsonl"), None);
         assert_eq!(session_of("x_task-3.json"), None);
