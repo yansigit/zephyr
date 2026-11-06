@@ -22,7 +22,9 @@ Accounts: each start logs {"type": "start", "agentDir", "model"} to ./log.jsonl.
 that error (stopReason "error", settle outcome "failed"), as a rate-limited provider does.
 A prompt containing WRITE_MEMORY first writes memory/MEMORY.md under the home.
 argv.json holds the argv of the latest start. With a `tool_sleep` file in the home, each start
-leaves a `sleep 300` running in its process group, as a tool would, its pid in `tool_pid`.
+leaves a `sleep 300` running in its process group, as a tool would, its pid in `tool_pid`. With a
+`stray` file, each start leaves a `setsid sleep 300` that escaped through a shell that exited (an
+orphan in its own session, as an agent's `setsid cmd &` is), its pid in `stray_pid`.
 A prompt containing `bash: CMD` first reports a bash tool call running CMD (tool_execution_start).
 With `--no-tools` (a /btw child) none of the tool markers below (`bash: `, `[tool]`, `[call ...]`)
 runs anything, so its prompt is echoed whole; with `--no-session` there is no session file (the
@@ -187,6 +189,10 @@ open(os.path.join(home, "log.jsonl"), "a").write(json.dumps(
 if os.path.exists(os.path.join(home, "tool_sleep")):  # a tool left running in the child's group
     import subprocess
     open(os.path.join(home, "tool_pid"), "w").write(str(subprocess.Popen(["sleep", "300"]).pid))
+if os.path.exists(os.path.join(home, "stray")):  # a process that escaped the child's group
+    import subprocess
+    subprocess.run(["sh", "-c", "setsid sleep 300 </dev/null >/dev/null 2>&1 & echo $! > stray_pid"],
+                   cwd=home, check=True)
 if os.path.isdir(os.environ.get("RPI_CODING_AGENT_DIR") or ""):  # which account started, for tests whose home is temporary
     open(os.path.join(os.environ["RPI_CODING_AGENT_DIR"], "starts.log"), "a").write("%s\n" % opt("--model"))
 

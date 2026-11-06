@@ -125,6 +125,179 @@ fn pause_and_resume_work_with_a_daemon_and_without_one() {
 }
 
 #[test]
+fn status_fails_without_a_daemon_or_with_a_stale_heartbeat() {
+    let (home, cfg) = setup("status-beat", "");
+    let out = zephyr(&cfg, &["status"]);
+    assert!(!out.status.success(), "no daemon: {out:?}");
+    assert!(stdout(&out).contains("heartbeat: none"), "{out:?}");
+
+    let running = daemon(&cfg, &home);
+    let beat = home.join("heartbeat");
+    let start = Instant::now();
+    while !beat.exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "no heartbeat");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = zephyr(&cfg, &["status"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = stdout(&out);
+    assert!(
+        text.contains("\ndaemon: running\nheartbeat: 0s ago\n")
+            || text.contains("\ndaemon: running\nheartbeat: 1s ago\n"),
+        "{text}"
+    );
+
+    // Frozen, it still accepts connections; only the heartbeat tells.
+    let pid = running.0.id() as i32;
+    // SAFETY: plain syscalls to our own child.
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    std::fs::write(&beat, format!("{}\n", zephyr::now() - 400)).unwrap();
+    let out = zephyr(&cfg, &["status"]);
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    assert!(!out.status.success(), "{out:?}");
+    assert!(stdout(&out).contains("heartbeat: 400s ago"), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("hung"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn status_shows_the_main_child_the_waiting_message_and_the_replies() {
+    let (home, cfg) = setup("status-ops", "");
+    let store = zephyr::store::Store::open(&home.join("state.db")).unwrap();
+    let m = zephyr::channel::Inbound {
+        channel: "chat".into(),
+        platform_msg_id: "1".into(),
+        sender: "owner".into(),
+        text: "hi".into(),
+    };
+    store.insert_inbox(&m).unwrap();
+    for text in ["one", "two", "three"] {
+        store.notify("chat", "owner", text).unwrap();
+    }
+    drop(store);
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    db.execute_batch(
+        "UPDATE inbox SET created_at = unixepoch() - 100;
+         UPDATE outbox SET created_at = unixepoch() - 50 WHERE text = 'one';
+         UPDATE outbox SET status = 'failed' WHERE text = 'three';",
+    )
+    .unwrap();
+    // What the router last wrote: the child down after 3 failed starts.
+    std::fs::write(home.join("heartbeat"), format!("{} 0 3\n", zephyr::now())).unwrap();
+    let text = stdout(&zephyr(&cfg, &["status"]));
+    for line in [
+        "main: down, 3 failed starts in a row",
+        "oldest new message: 100s ago",
+        "replies: 2 pending (oldest 50s ago), 1 failed",
+        "inbox   new         1",
+    ] {
+        assert!(text.contains(line), "{line}\n{text}");
+    }
+}
+
+/// Runs `zephyr run` under a subreaper (python) that names itself the daemon's stray scope, so
+/// what escapes the daemon's children lands there, and only there is swept. Kills the group on drop.
+struct Reaper(Child);
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        // SAFETY: a plain syscall to the group our own child leads.
+        unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+        let _ = self.0.wait();
+    }
+}
+
+const REAPER: &str = r#"
+import ctypes, os, subprocess, sys
+ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
+os.environ["ZEPHYR_STRAY_SCOPE"] = str(os.getpid())
+subprocess.Popen(sys.argv[1:])
+while True:  # reaps the daemon and the orphans it adopts
+    try:
+        os.wait()
+    except ChildProcessError:
+        break
+"#;
+
+fn alive(pid: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+        .is_ok_and(|s| !s[s.rfind(')').unwrap()..].starts_with(") Z"))
+}
+
+fn read_pid(path: &Path) -> String {
+    let start = Instant::now();
+    loop {
+        if let Ok(pid) = std::fs::read_to_string(path) {
+            if !pid.trim().is_empty() {
+                return pid;
+            }
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "no {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn stop_kills_the_agents_stray_processes_and_spares_the_live_child() {
+    let (home, cfg) = setup("strays", "");
+    let uid = std::fs::metadata(&home).unwrap().uid();
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(&cfg, format!("{text}[owners]\nchat = [\"{uid}\"]\n")).unwrap();
+    std::fs::write(home.join("stray"), "").unwrap();
+    std::fs::write(home.join("tool_sleep"), "").unwrap();
+    let mut cmd = Command::new("python3");
+    cmd.args(["-c", REAPER, env!("CARGO_BIN_EXE_zephyr"), "run"])
+        .env("ZEPHYR_CONFIG", &cfg);
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let _reaper = Reaper(cmd.spawn().unwrap());
+    let (stray, tool, child) = (
+        read_pid(&home.join("stray_pid")),
+        read_pid(&home.join("tool_pid")),
+        read_pid(&home.join("pid")),
+    );
+    assert!(alive(&stray), "the stray never ran");
+
+    let mut sock = None;
+    let start = Instant::now();
+    while sock.is_none() {
+        assert!(start.elapsed() < Duration::from_secs(10), "no chat socket");
+        sock = std::os::unix::net::UnixStream::connect(home.join("zephyr.sock")).ok();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut sock = sock.unwrap();
+    sock.write_all(b"{\"id\": \"s1\", \"text\": \"/stop\"}\n")
+        .unwrap();
+    let mut lines = std::io::BufReader::new(sock);
+    let reply = loop {
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut lines, &mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if v["re"] == "s1" {
+            break v["text"].as_str().unwrap().to_string();
+        }
+    };
+    assert_eq!(reply, "[zephyr] stopped, and 1 stray process");
+    let start = Instant::now();
+    while alive(&stray) {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the stray outlived /stop"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The live rpi child and what runs under it are its own to stop.
+    assert!(alive(&child) && alive(&tool));
+    // SAFETY: a plain syscall to the test's own leftover.
+    unsafe { libc::kill(tool.trim().parse().unwrap(), libc::SIGKILL) };
+}
+
+#[test]
 fn doctor_reports_presence_and_never_values() {
     // A stand-in BlueBubbles that answers the ping and records the request line.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -331,8 +504,9 @@ fn status_lists_each_pooled_account() {
         r#"{"anthropic": {"type": "oauth", "access": "SECRET"}}"#,
     )
     .unwrap();
+    // No daemon runs: status still prints, and fails.
     let out = zephyr(&cfg, &["status"]);
-    assert!(out.status.success(), "{out:?}");
+    assert!(!out.status.success(), "{out:?}");
     let text = stdout(&out);
     assert!(
         text.contains("account a (anthropic/m): ready; today 0 tokens"),

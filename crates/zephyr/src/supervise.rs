@@ -3,9 +3,12 @@
 //! container restarting, so the `exec` commands it started live on: orphaned, they are kept and
 //! reaped by PID 1, and the new daemon adopts them (`procs::Procs::adopt`). SIGTERM and SIGINT
 //! are passed to the daemon, and then nothing is restarted, so `docker stop` stays a clean stop.
+//! A daemon that hangs instead of crashing stops rewriting `<state>/heartbeat` (each router tick):
+//! once it is `stale`, its process group is killed and it is started again, as after a crash.
 
 use std::collections::VecDeque;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -20,6 +23,25 @@ pub struct Policy {
     /// `max_exits` crashes within `window`: give up, and let Docker's restart policy take over.
     pub window: Duration,
     pub max_exits: usize,
+    /// The daemon's heartbeat file; `None` checks nothing.
+    pub heartbeat: Option<PathBuf>,
+    /// How often it is checked, how long after a start it is first, and the age that is a hang.
+    pub check: Duration,
+    pub grace: Duration,
+    pub stale: Duration,
+}
+
+/// The file in the state dir the router rewrites with the unix time on each tick.
+pub const HEARTBEAT: &str = "heartbeat";
+/// A heartbeat this old means the daemon hangs (`supervise`, `zephyr status`). Well past the
+/// longest a tick may legitimately wait: an auth check is up to 60 s per account, one after another.
+pub const STALE: Duration = Duration::from_secs(300);
+
+/// Seconds since the daemon last wrote `path`; `None` when it is missing or unreadable.
+pub fn heartbeat_age(path: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let at: i64 = text.split_whitespace().next()?.parse().ok()?;
+    Some((crate::now() - at).max(0) as u64)
 }
 
 impl Default for Policy {
@@ -30,6 +52,10 @@ impl Default for Policy {
             healthy: Duration::from_secs(60),
             window: Duration::from_secs(120),
             max_exits: 5,
+            heartbeat: None,
+            check: Duration::from_secs(15),
+            grace: Duration::from_secs(120),
+            stale: STALE,
         }
     }
 }
@@ -55,11 +81,19 @@ pub async fn main() -> ExitCode {
             }
         });
     }
+    // Its own process group, so a hung one is killed with whatever it started in it.
     let daemon = || {
         let mut cmd = tokio::process::Command::new(std::env::current_exe()?);
+        cmd.as_std_mut().process_group(0);
         cmd.arg("run").spawn()
     };
-    ExitCode::from(run(&Policy::default(), daemon, rx).await)
+    // Read once: with no readable config the daemon fails at start anyway.
+    let config = crate::config::Config::load(&crate::config::Config::default_path());
+    let policy = Policy {
+        heartbeat: config.ok().map(|c| c.state_dir().join(HEARTBEAT)),
+        ..Policy::default()
+    };
+    ExitCode::from(run(&policy, daemon, rx).await)
 }
 
 /// Runs what `spawn` starts until a signal from `signals` ends it (passed on, never restarted)
@@ -80,7 +114,8 @@ pub async fn run(
             }
         };
         let started = Instant::now();
-        let mut stopping = false;
+        let (mut stopping, mut killed) = (false, false);
+        let mut check = tokio::time::interval(policy.check);
         let status = loop {
             tokio::select! {
                 s = child.wait() => break s,
@@ -90,6 +125,24 @@ pub async fn run(
                         // SAFETY: a plain syscall to our own child.
                         unsafe { libc::kill(pid as i32, sig) };
                     }
+                }
+                _ = check.tick(), if policy.heartbeat.is_some() && !stopping && !killed => {
+                    let age = policy.heartbeat.as_deref().and_then(heartbeat_age);
+                    let Some(age) = age.filter(|a| *a >= policy.stale.as_secs()) else {
+                        continue;
+                    };
+                    if started.elapsed() < policy.grace {
+                        continue;
+                    }
+                    eprintln!("zephyr: the daemon's heartbeat is {age}s old: it hangs; killing it");
+                    if let Some(pid) = child.id() {
+                        // SAFETY: plain syscalls to our own child's group, or to it alone when
+                        // it leads none.
+                        if unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } != 0 {
+                            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                        }
+                    }
+                    killed = true;
                 }
             }
         };
@@ -145,6 +198,7 @@ mod tests {
             healthy: Duration::from_secs(60),
             window: Duration::from_secs(60),
             max_exits: 3,
+            ..Policy::default()
         }
     }
 
@@ -160,9 +214,9 @@ mod tests {
         let script = script.to_string();
         (n, move || {
             starts.fetch_add(1, Ordering::SeqCst);
-            tokio::process::Command::new("sh")
-                .args(["-c", &script])
-                .spawn()
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.as_std_mut().process_group(0);
+            cmd.args(["-c", &script]).spawn()
         })
     }
 
@@ -233,5 +287,47 @@ mod tests {
             .expect("waited out the backoff");
         assert_eq!(code, 0, "asked to stop with nothing running");
         assert_eq!(n.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_daemon_whose_heartbeat_stops_is_killed_and_started_again() {
+        let dir = crate::test_dir("supervise-hung");
+        let (count, beat) = (dir.join("n"), dir.join(HEARTBEAT));
+        // Beats every 0.2 s; the first start freezes itself (SIGSTOP), as a hung daemon would.
+        let script = format!(
+            "n=$(cat {c} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {c}; \
+             while :; do date +%s > {b}; [ $n = 1 ] && kill -STOP $$; sleep 0.2; done",
+            c = count.display(),
+            b = beat.display()
+        );
+        let (n, spawn) = counted(&script);
+        let policy = Policy {
+            heartbeat: Some(beat),
+            check: Duration::from_millis(100),
+            grace: Duration::from_millis(500),
+            stale: Duration::from_secs(2),
+            ..quick()
+        };
+        let (tx, rx) = mpsc::channel(1);
+        let up = tokio::spawn(async move {
+            for _ in 0..300 {
+                if std::fs::read_to_string(&count).is_ok_and(|s| s.trim() == "2") {
+                    // Beating: it must be left alone for longer than `stale`.
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    return tx.send(libc::SIGTERM).await.is_ok();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            false
+        });
+        let code = tokio::time::timeout(Duration::from_secs(15), run(&policy, spawn, rx))
+            .await
+            .expect("supervise did not end on the signal");
+        assert!(
+            up.await.unwrap(),
+            "the frozen daemon was never started again"
+        );
+        assert_eq!(code, 128 + libc::SIGTERM as u8);
+        assert_eq!(n.load(Ordering::SeqCst), 2, "one kill, one restart");
     }
 }

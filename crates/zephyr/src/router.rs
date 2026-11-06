@@ -535,7 +535,6 @@ impl<'a> Router<'a> {
     ) -> anyhow::Result<Exit> {
         tokio::pin!(shutdown);
         let mut exit = Exit::Shutdown;
-        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
         let mut tick = tokio::time::interval(self.cfg.tick);
         let paused = |store: &Store| store.pause_reason().ok().flatten().is_some();
         let mut was_paused = paused(&self.store);
@@ -581,7 +580,12 @@ impl<'a> Router<'a> {
                     None => self.child_exited().await,
                 },
                 _ = tick.tick() => {
-                    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
+                    // Liveness for `zephyr supervise` and `zephyr status`: a plain overwrite of
+                    // `<unix time> <main child up: 0|1> <failed child starts in a row>`.
+                    let beat = self.cfg.state_dir().join(crate::supervise::HEARTBEAT);
+                    let up = self.child.is_some() as u8;
+                    let line = format!("{} {up} {}\n", crate::now(), self.spawn_failures);
+                    let _ = std::fs::write(beat, line);
                     self.cap_run().await;
                     self.login_starts().await;
                     self.login_notices();
@@ -1153,7 +1157,7 @@ impl<'a> Router<'a> {
         } else if let Some(reply) = self.command(text, (&m.channel, &m.sender)).await {
             reply
         } else if matches!(text, "/stop" | "/pause" | "/resume") {
-            self.control(text).await.into()
+            self.control(text).await
         } else {
             // The owner spoke: a command still in the turn moves to the background (DESIGN §4.13).
             self.procs.yield_all();
@@ -1241,8 +1245,8 @@ impl<'a> Router<'a> {
     }
 
     /// The kill switch (DESIGN §4.4), run outside the queue. Returns the reply text.
-    async fn control(&mut self, cmd: &str) -> &'static str {
-        match cmd {
+    async fn control(&mut self, cmd: &str) -> String {
+        let reply = match cmd {
             "/pause" => {
                 log(self.store.set_paused(Some("user")).map_err(Into::into));
                 if self.busy {
@@ -1253,7 +1257,7 @@ impl<'a> Router<'a> {
             }
             "/resume" => {
                 log(self.store.set_paused(None).map_err(Into::into));
-                "[zephyr] resumed"
+                return "[zephyr] resumed".into();
             }
             _ => {
                 self.abort().await;
@@ -1262,6 +1266,11 @@ impl<'a> Router<'a> {
                 self.procs.stop_all();
                 "[zephyr] stopped"
             }
+        };
+        match self.procs.kill_strays() {
+            0 => reply.into(),
+            1 => format!("{reply}, and 1 stray process"),
+            n => format!("{reply}, and {n} stray processes"),
         }
     }
 
@@ -2565,7 +2574,6 @@ impl<'a> Router<'a> {
     /// SIGTERM: let a running turn settle, flush, then stop the child. Nothing more is
     /// dispatched; messages that come in meanwhile get their rows, for the next start.
     async fn drain<C: Channel>(&mut self, channels: &[C], rx: &mut mpsc::Receiver<Inbound>) {
-        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
         self.stopping = true;
         let deadline = Instant::now() + Duration::from_secs(20);
         while self.busy {

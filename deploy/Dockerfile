@@ -199,4 +199,7 @@ ENV PATH=/opt/zephyr/py/bin:$PATH \
     AGENT_BROWSER_ARGS=--no-sandbox,--disable-dev-shm-usage,--use-angle=vulkan,--enable-features=Vulkan,--ignore-gpu-blocklist
 # `docker run --init` makes docker-init PID 1; supervise starts `zephyr run` again if it crashes,
 # so the agent's background commands (kept and reaped by PID 1) outlive a daemon crash.
+# `zephyr status` fails when the daemon does not answer or its heartbeat is over 120 s old. It
+# runs as the container's user (root) with its environment, as `docker exec zephyr zephyr status`.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=120s --retries=3 CMD ["/usr/local/bin/zephyr","status"]
 CMD ["/usr/local/bin/zephyr", "supervise"]
