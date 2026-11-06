@@ -53,8 +53,9 @@ const PROMPT_FILES: [&str; 2] = ["SYSTEM.md", "APPEND_SYSTEM.md"];
 /// memory. On the first start with approvals, what is there now counts as approved. Any other
 /// context or system prompt file the agent could have written, in `home` or in the child's
 /// `agent_dir`, is renamed aside, so `AGENTS.md` is the only standing instruction rpi loads.
-/// (Skills are off and trust is forced on the child's command line: `rpc.rs`.)
-pub fn prepare(home: &Path, state: &Path, agent_dir: &Path) -> anyhow::Result<()> {
+/// (Skills are off and trust is forced on the child's command line: `rpc.rs`.) Returns the text
+/// written, which the agent cannot have changed since.
+pub fn prepare(home: &Path, state: &Path, agent_dir: &Path) -> anyhow::Result<String> {
     let _guard = lock();
     let working = {
         let _fs = crate::agent::fs();
@@ -106,8 +107,8 @@ pub fn prepare(home: &Path, state: &Path, agent_dir: &Path) -> anyhow::Result<()
             }
         }
     }
-    std::fs::write(home.join("AGENTS.md"), agents)?;
-    Ok(())
+    std::fs::write(home.join("AGENTS.md"), &agents)?;
+    Ok(agents)
 }
 
 /// How to use what the image adds beyond rpi's own tools (DESIGN §4.11). Skills are off
@@ -270,10 +271,7 @@ pub fn commit_if_changed(home: &Path, state: &Path) -> anyhow::Result<Option<Str
 
 /// Records `working` as the content the owner was last shown. False when it already was.
 fn mark_shown(state: &Path, working: &Files) -> anyhow::Result<bool> {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    working.hash(&mut h);
-    let hash = format!("{:x}", h.finish());
+    let hash = crate::drafts::digest(working.iter().map(String::as_bytes));
     let seen = approved_dir(state).join(".notified");
     if std::fs::read_to_string(&seen).is_ok_and(|s| s == hash) {
         return Ok(false);

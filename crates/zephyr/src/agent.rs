@@ -47,17 +47,44 @@ pub fn ids() -> Option<(u32, u32)> {
     AGENT.get().copied().flatten()
 }
 
-/// Prepares `cmd` to run for the agent: without the hidden variables, and as the agent's uid.
+/// The `PATH` of every process run for the agent. Only these get `/zephyr/.local/bin`, where the
+/// agent installs its own tools: root's PATH (the image's) leaves it out, or the agent could plant
+/// a `git` or `zephyr` there for root to run.
+pub const AGENT_PATH: &str =
+    "/zephyr/.local/bin:/opt/zephyr/py/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Prepares `cmd` to run for the agent: without the hidden variables, on [`AGENT_PATH`], and as
+/// the agent's uid.
 pub fn cmd(cmd: &mut Command) -> &mut Command {
     use std::os::unix::process::CommandExt;
     for key in HIDDEN.get().into_iter().flatten() {
         cmd.env_remove(key);
     }
+    cmd.env("PATH", AGENT_PATH);
     if let Some((uid, gid)) = ids() {
         // std drops supplementary groups and changes directory after these.
         cmd.uid(uid).gid(gid);
     }
     cmd
+}
+
+/// The directories on `path` (a `PATH` value) that `uid`/`gid` could put a program into: one it
+/// owns or may write, or one under such a directory. On root's PATH, any of these lets the agent
+/// plant a program root runs (doctor checks it).
+pub fn writable_dirs(path: &str, uid: u32, gid: u32) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    let theirs = |m: &std::fs::Metadata| {
+        m.uid() == uid || m.mode() & 0o002 != 0 || (m.gid() == gid && m.mode() & 0o020 != 0)
+    };
+    path.split(':')
+        .filter(|d| {
+            std::path::Path::new(d)
+                .ancestors()
+                .filter_map(|a| std::fs::metadata(a).ok())
+                .any(|m| theirs(&m))
+        })
+        .map(String::from)
+        .collect()
 }
 
 /// While held, this thread's file access is the agent's (setfsuid/setfsgid), so what the
@@ -99,4 +126,31 @@ impl Drop for Fs {
 pub fn undumpable() {
     // SAFETY: PR_SET_DUMPABLE takes plain integer arguments and touches no memory of ours.
     unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_processes_get_the_agent_path() {
+        let mut sh = Command::new("sh");
+        sh.args(["-c", "printf %s \"$PATH\""]).env("PATH", "/x");
+        let out = cmd(&mut sh).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), AGENT_PATH);
+    }
+
+    #[test]
+    fn writable_dirs_finds_the_agents_own_and_what_lies_under_them() {
+        let dir = crate::test_dir("agent-path");
+        let sub = dir.join("bin");
+        std::fs::create_dir(&sub).unwrap();
+        // SAFETY: plain syscalls with no arguments.
+        let (me, group) = unsafe { (libc::getuid(), libc::getgid()) };
+        let path = format!("/usr/bin:{}", sub.display());
+        assert_eq!(writable_dirs(&path, me, group), [sub.display().to_string()]);
+        // Root's own dirs are no one else's.
+        assert!(writable_dirs("/usr/bin:/bin", me + 1, group + 1).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

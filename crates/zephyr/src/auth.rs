@@ -236,7 +236,7 @@ const GRAM_MIN: usize = 8;
 /// capping keeps the gram set of a long token to a few hundred entries.
 const GRAM_MAX: usize = 16;
 /// What a secret (or a span carrying part of one) becomes in the lines a caller reads.
-const REDACTED: &str = "[redacted]";
+pub(crate) const REDACTED: &str = "[redacted]";
 /// The longest account name: it becomes a directory under `accounts/` and a `[[account]]` row
 /// `zephyr status` prints, so a token pasted in its place is not a name.
 const MAX_ACCOUNT_NAME: usize = 32;
@@ -1126,7 +1126,7 @@ fn plain(line: &str) -> String {
 /// URL, and a short string that happens to be a prefix of a secret (a typed `http`) would otherwise
 /// hide the very line the user is waiting for. The run set is bounded — a few hundred characters
 /// of secret make a few hundred grams, and there are at most a handful of secrets.
-fn redact(line: &str, secrets: &[String]) -> String {
+pub(crate) fn redact(line: &str, secrets: &[String]) -> String {
     let mut text = line.to_string();
     for secret in secrets.iter().filter(|s| !s.is_empty()) {
         text = text.replace(secret.as_str(), REDACTED);

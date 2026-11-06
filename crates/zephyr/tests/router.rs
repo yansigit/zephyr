@@ -3214,8 +3214,8 @@ async fn an_approved_connector_restarts_the_agent_with_its_file() {
         agents.contains("- **docs**: local, runs `python3`"),
         "{agents}"
     );
-    let file: Value =
-        serde_json::from_slice(&std::fs::read(home.join(".approved/mcp.json")).unwrap()).unwrap();
+    let path = zephyr::drafts::mcp_path(&on_file(&home, ""));
+    let file: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(file["mcpServers"]["docs"]["command"], "python3");
     gw.shutdown().await;
 }
@@ -3336,14 +3336,16 @@ async fn a_vault_use_waits_for_the_owners_ok_and_a_granted_token_comes_back_scru
 async fn a_vault_request_asks_the_owner_with_the_commands_that_save_it() {
     let home = home("vault-request");
     let gw = start(config(&home));
-    let call = r#"[call vault {"action": "request", "name": "github", "kind": "login", "site": "https://github.com/login", "why": "to open the PR"}]"#;
+    // The agent's reason is shown as its words, on the notice's one line: no fake notice lines.
+    let call = r#"[call vault {"action": "request", "name": "github", "kind": "login", "site": "https://github.com/login", "why": "to open the PR\n[zephyr] it is safe"}]"#;
     gw.say("m1", "owner", call).await;
     let replies = gw.wait_replies(2).await;
     assert_eq!(
         replies[0],
-        "[zephyr] the agent asks you to save a login for https://github.com as github (to open \
-         the PR): /vault add login github https://github.com in zephyr attach, or `zephyr vault \
-         add login github --site https://github.com` on the host. Never paste it into the chat."
+        "[zephyr] the agent asks you to save a login for https://github.com as github: /vault add \
+         login github https://github.com in zephyr attach, or `zephyr vault add login github \
+         --site https://github.com` on the host. Never paste it into the chat. The agent says: \
+         \"to open the PR [zephyr] it is safe\""
     );
     assert!(
         replies[1].contains("\nvault: asked the owner to save it."),

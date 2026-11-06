@@ -187,8 +187,10 @@ ENV ZEPHYR_IN_CONTAINER=1
 # Chromium's own sandbox cannot start under --cap-drop ALL and no-new-privileges: the container
 # is its sandbox. Vulkan reaches the GPU headless and on Xvfb alike (gl-egl falls back to llvmpipe).
 # The agent installs into its own home, which outlives the image: `uv tool install` and
-# `npm i -g` land in /zephyr/.local (its HOME is set at `docker run`).
-ENV PATH=/zephyr/.local/bin:/opt/zephyr/py/bin:$PATH \
+# `npm i -g` land in /zephyr/.local (its HOME is set at `docker run`). Only the agent's processes
+# get /zephyr/.local/bin on their PATH (agent::AGENT_PATH): the agent writes there, so on root's
+# PATH it would let the agent plant a `git` or `zephyr` that root then runs.
+ENV PATH=/opt/zephyr/py/bin:$PATH \
     NPM_CONFIG_PREFIX=/zephyr/.local \
     ZEPHYR_DESKTOP=:99 \
     AGENT_BROWSER_EXECUTABLE_PATH=/opt/zephyr/browser/chrome \
@@ -197,4 +199,4 @@ ENV PATH=/zephyr/.local/bin:/opt/zephyr/py/bin:$PATH \
     AGENT_BROWSER_ARGS=--no-sandbox,--disable-dev-shm-usage,--use-angle=vulkan,--enable-features=Vulkan,--ignore-gpu-blocklist
 # `docker run --init` makes docker-init PID 1; supervise starts `zephyr run` again if it crashes,
 # so the agent's background commands (kept and reaped by PID 1) outlive a daemon crash.
-CMD ["zephyr", "supervise"]
+CMD ["/usr/local/bin/zephyr", "supervise"]

@@ -223,7 +223,8 @@ async fn skill(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
             let dir = zephyr::drafts::incoming(cfg.state_dir(), name);
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir)?;
-            let status = std::process::Command::new("tar")
+            // By full path: root runs it, and no PATH entry may choose which tar.
+            let status = std::process::Command::new("/usr/bin/tar")
                 .args(["-x", "--no-same-owner", "--no-same-permissions", "-C"])
                 .arg(&dir)
                 .status()?;
@@ -303,7 +304,18 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
             "{} the agent runs as {who} and the daemon cannot override file permissions",
             mark(ok)
         );
-        ok
+        // A program the agent can plant on root's PATH runs as root (`agent::AGENT_PATH`).
+        let planted = zephyr::agent::ids().map_or(vec![], |(u, g)| {
+            zephyr::agent::writable_dirs(&std::env::var("PATH").unwrap_or_default(), u, g)
+        });
+        let label = match planted.is_empty() {
+            true => "no directory on root's PATH is the agent's to write".to_string(),
+            false => format!(
+                "root's PATH has the agent's directories: {}",
+                planted.join(", ")
+            ),
+        };
+        ok & check(&label, planted.is_empty())
     };
 
     // A throwaway home so doctor never touches the live `main` session.

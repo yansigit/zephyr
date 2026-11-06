@@ -98,7 +98,8 @@ pub fn check_mcp(
 }
 
 /// Files no tool may touch: credentials, another process's environment, ssh keys, and git
-/// hooks (a hook in a project runs as the owner, on the host, at their next commit).
+/// hooks and config (a hook, or a program the config names, in a project runs as the owner, on
+/// the host, at their next commit).
 fn sensitive(path: &str) -> Option<&'static str> {
     let parts: Vec<&str> = path.split('/').collect();
     if let Some(&("auth.json" | ".credentials.json" | "secrets.env")) = parts.last() {
@@ -107,6 +108,7 @@ fn sensitive(path: &str) -> Option<&'static str> {
     for w in parts.windows(2) {
         match w {
             [".git", "hooks"] => return Some("a git hook"),
+            [".git", "config"] => return Some("a git config"),
             [".ssh", _] => return Some("an ssh key or config"),
             [_, "environ"] if parts.contains(&"proc") => return Some("a process's environment"),
             _ => {}
@@ -493,8 +495,46 @@ fn dangerous(name: &str, args: &[String]) -> Option<&'static str> {
             Some("power command")
         }
         "git" if force_push(args) => Some("forced git push"),
+        "git" if args.iter().any(|a| runs_program(a)) => {
+            Some("a git setting that runs a program (hooks, fsmonitor, ssh, a filter, ...)")
+        }
         _ => None,
     }
+}
+
+/// Whether a git word names a config key whose value git runs as a program, or that pulls in
+/// another config file: as `git config KEY`, `-c KEY=VALUE`, `--config KEY=VALUE` (clone writes it
+/// into the new repo) or `--config-env=KEY=VAR`. Kept in a project's config, such a program runs as
+/// the owner at their next git command. Key names are matched case-insensitively, as git does.
+fn runs_program(word: &str) -> bool {
+    const KEYS: &[&str] = &[
+        "core.hookspath",
+        "core.fsmonitor",
+        "core.sshcommand",
+        "core.pager",
+        "core.editor",
+        "core.askpass",
+        "diff.external",
+        "credential.helper",
+        "gpg.program",
+        "sequence.editor",
+        "include.path",
+    ];
+    word.split('=').any(|part| {
+        let key = part.trim().to_ascii_lowercase();
+        let dots: Vec<&str> = key.split('.').collect();
+        // `section.<name>.key`, so a file such as `filter.rs` or `src/diff.x.command` is not one.
+        let named = dots.len() >= 3
+            && matches!(
+                (dots[0], dots[dots.len() - 1]),
+                ("filter", "clean" | "smudge" | "process")
+                    | ("includeif", "path")
+                    | ("diff", "textconv" | "command")
+                    | ("merge", "driver")
+                    | ("gpg", "program")
+            );
+        named || KEYS.contains(&key.as_str())
+    })
 }
 
 fn is_disk(target: &str) -> bool {
@@ -915,6 +955,19 @@ mod tests {
                 json!({ "server": "s", "configPath": "/home/zephyr/.ssh/id_ed25519" }),
             ),
             ("mcp_request", json!({ "path": "/proc/self/environ" })),
+            bash("git config core.hooksPath /tmp/h"),
+            bash("git config --local CORE.FSMONITOR 'sh x'"),
+            bash("git config set core.sshCommand 'sh -c x'"),
+            bash("git -c core.hooksPath=/tmp/h commit -m x"),
+            bash("git --config-env=core.fsmonitor=X status"),
+            bash("git clone --config core.hooksPath=h https://x/r"),
+            bash("git config filter.lfs.smudge 'sh x'"),
+            bash("git config include.path ../evil.cfg"),
+            bash("git config includeIf.gitdir:/.path ../evil.cfg"),
+            bash("cd proj && git config diff.x.textconv ./run"),
+            bash("printf '[core]' >> proj/.git/config"),
+            bash("sed -i s/a/b/ .git/config"),
+            file("write", "proj/.git/config"),
         ];
         let allow: Vec<(&str, Value)> = vec![
             bash("rm -rf ./build"),
@@ -969,6 +1022,10 @@ mod tests {
                 "mcp_request",
                 json!({ "server": "x", "configPath": "src/mcp.json" }),
             ),
+            bash("git config user.name x"),
+            bash("git -c user.email=a@b commit -m 'core.hooksPath docs'"),
+            bash("git add filter.rs src/diff.command.md"),
+            bash("git config --get remote.origin.url"),
         ];
         assert!(deny.len() >= 30 && allow.len() >= 30, "table too small");
         for (tool, args) in deny {

@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
@@ -369,6 +369,45 @@ async fn bad_token_is_rejected() {
     assert!(sent.get("result").is_none(), "{sent}");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(gw.count("inbox", "new") + gw.count("inbox", "done"), 0);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn idle_connections_cannot_crowd_out_a_real_client() {
+    let gw = start("idle");
+    drop(Client::connect(gw.port).await); // the listener is up
+    let mut idle = Vec::new();
+    for _ in 0..40 {
+        idle.push(TcpStream::connect(("127.0.0.1", gw.port)).await.unwrap());
+    }
+    // Past the cap a connection is closed as it arrives; the rest once 10 s pass unauthenticated.
+    let started = std::time::Instant::now();
+    let mut c = loop {
+        assert!(started.elapsed() < Duration::from_secs(20), "never let in");
+        let mut c = Client::connect(gw.port).await;
+        let req = json!({"jsonrpc": "2.0", "id": 1, "method": "authenticate", "params": {"token": TOKEN}});
+        if c.write
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .is_ok()
+            && c.read()
+                .await
+                .is_some_and(|v| v["result"]["authenticated"] == true)
+        {
+            break c;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let started = c.call("start_session", json!({})).await;
+    assert_eq!(started["result"]["sessionId"], "main", "{started}");
+    for mut s in idle {
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), s.read(&mut buf)).await;
+        assert!(
+            matches!(read, Ok(Ok(0) | Err(_))),
+            "an idle socket is still open"
+        );
+    }
     gw.shutdown().await;
 }
 

@@ -28,6 +28,10 @@ use tokio::task::AbortHandle;
 const GROUP_STYLE: i64 = 43;
 /// Largest webhook body read. BlueBubbles caps the serialized new-message payload at 4000 bytes for webhooks.
 const MAX_BODY: usize = 64 * 1024;
+/// Webhook connections served at once; one more is closed as it arrives.
+const MAX_CONNS: usize = 32;
+/// How long a webhook connection has to send its request head.
+const HEAD_WAIT: Duration = Duration::from_secs(10);
 /// shortcut: a fixed 60 s guess for a send that waits on AppleScript; not measured, raise it if real sends time out.
 const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// Wait before retrying a failed backfill, e.g. while the Mac is asleep.
@@ -145,6 +149,9 @@ struct Attachment {
 #[derive(Deserialize)]
 struct Handle {
     address: String,
+    /// `iMessage` or `SMS`. An SMS sender number is trivial to spoof, so only iMessage counts;
+    /// every BlueBubbles message we have recorded names its service.
+    service: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -183,6 +190,9 @@ fn message_to_inbound(m: Message) -> Option<(Inbound, Vec<Attachment>)> {
     let (Some(handle), false) = (m.handle, text.is_empty() && files.is_empty()) else {
         return None;
     };
+    if handle.service.as_deref() != Some("iMessage") {
+        return None;
+    }
     let inbound = Inbound {
         channel: "imessage".into(),
         platform_msg_id: m.guid,
@@ -279,11 +289,17 @@ async fn serve(listener: TcpListener, tx: mpsc::Sender<Inbound>, this: IMessage)
             }
         }
     });
+    // Anything that reaches the port can connect (the agent too, under host networking): a cap,
+    // so idle sockets cannot use up the daemon's file descriptors, and `HEAD_WAIT` for the head.
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             // shortcut: a persistent accept error (e.g. out of fds) retries every 100 ms with no backoff.
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
+        };
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            continue; // dropped, so closed at once
         };
         let (queue, secret) = (queue.clone(), secret.clone());
         tokio::spawn(async move {
@@ -291,10 +307,14 @@ async fn serve(listener: TcpListener, tx: mpsc::Sender<Inbound>, this: IMessage)
                 let (queue, secret) = (queue.clone(), secret.clone());
                 async move { Ok::<_, Infallible>(webhook(req, queue, secret).await) }
             });
-            // shortcut: no connection cap or header timeout. The listener is tailnet-only and the secret is checked before the body is read. Add both if it is ever exposed.
+            // One request per connection, so the head deadline bounds an idle one too.
             let _ = http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(HEAD_WAIT)
+                .keep_alive(false)
                 .serve_connection(TokioIo::new(stream), svc)
                 .await;
+            drop(slot);
         });
     }
 }
@@ -616,6 +636,13 @@ mod tests {
             to_inbound(updated.as_bytes()).unwrap().is_none(),
             "updated-message"
         );
+        // An SMS, whose sender number anyone can spoof, or a handle naming no service.
+        let sms = NEW.replace(r#""service": "iMessage""#, r#""service": "SMS""#);
+        assert_ne!(sms, NEW);
+        assert!(to_inbound(sms.as_bytes()).unwrap().is_none(), "sms");
+        let bare = NEW.replace(r#", "service": "iMessage""#, "");
+        assert_ne!(bare, NEW);
+        assert!(to_inbound(bare.as_bytes()).unwrap().is_none(), "no service");
     }
 
     #[test]
@@ -659,6 +686,39 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), 200);
         assert_eq!(rx.recv().await.unwrap().platform_msg_id, "AAAA-1111-2222");
+    }
+
+    #[tokio::test]
+    async fn idle_connections_cannot_crowd_out_a_webhook() {
+        use tokio::io::AsyncReadExt;
+        let (base, mut rx) = spawn_webhook("s3cret").await;
+        let addr = base.trim_start_matches("http://").to_string();
+        let mut idle = Vec::new();
+        for _ in 0..40 {
+            idle.push(tokio::net::TcpStream::connect(&addr).await.unwrap());
+        }
+        // Past the cap a connection is closed as it arrives; the rest once 10 s pass with no head.
+        let started = std::time::Instant::now();
+        loop {
+            assert!(started.elapsed() < Duration::from_secs(20), "never let in");
+            let sent = reqwest::Client::new()
+                .post(format!("{base}/hook?secret=s3cret"))
+                .body(NEW)
+                .send()
+                .await;
+            if sent.is_ok_and(|r| r.status() == 200) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(rx.recv().await.unwrap().platform_msg_id, "AAAA-1111-2222");
+        for mut s in idle {
+            let read = tokio::time::timeout(Duration::from_secs(1), s.read(&mut [0u8; 64])).await;
+            assert!(
+                matches!(read, Ok(Ok(0) | Err(_))),
+                "an idle socket is still open"
+            );
+        }
     }
 
     #[tokio::test]

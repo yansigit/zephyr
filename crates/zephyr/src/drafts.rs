@@ -118,15 +118,27 @@ impl Content {
 /// A draft as read: its content, or why it cannot be approved.
 type Draft = Result<Content, String>;
 
+/// What an approval trusts to mean "unchanged since shown", so a hash no draft can be made to
+/// collide with. A fingerprint stored in the old form never matches: the draft is shown again.
 fn fingerprint(draft: &Draft) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
     match draft {
-        Ok(Content::Skill(files)) => files.hash(&mut h),
-        Ok(c) => c.render().hash(&mut h),
-        Err(e) => e.hash(&mut h),
+        Ok(Content::Skill(files)) => digest(
+            std::iter::once(&b"skill"[..])
+                .chain(files.iter().flat_map(|(p, b)| [p.as_bytes(), b.as_slice()])),
+        ),
+        Ok(c) => digest([&b"connector"[..], c.render().as_bytes()]),
+        Err(e) => digest([&b"error"[..], e.as_bytes()]),
     }
-    format!("{:x}", h.finish())
+}
+
+/// SHA-256 over `parts`, each prefixed by its length so no two lists of parts hash alike, as hex.
+pub(crate) fn digest<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> String {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    for part in parts {
+        ctx.update(&(part.len() as u64).to_be_bytes());
+        ctx.update(part);
+    }
+    data_encoding::HEXLOWER.encode(ctx.finish().as_ref())
 }
 
 /// A skill or connector name: 1 to 64 lowercase letters, digits or '-'. It becomes a folder or
@@ -177,6 +189,10 @@ fn walk(dir: &Path, prefix: &str, files: &mut Files, total: &mut usize) -> anyho
         } else {
             format!("{prefix}/{name}")
         };
+        // Root's git in the skills repo would read one as an embedded repo with its own config.
+        if name.eq_ignore_ascii_case(".git") {
+            bail!("{rel}: a skill cannot hold a .git");
+        }
         let kind = entry.path().symlink_metadata()?.file_type();
         if kind.is_dir() {
             walk(&entry.path(), &rel, files, total)?;
@@ -499,13 +515,12 @@ fn list(cfg: &Config, kind: Kind) -> anyhow::Result<String> {
             }
         }
         Kind::Connector => {
-            let secrets = secrets(cfg);
             for m in &cfg.mcp {
                 let what = match (&m.url, &m.command) {
                     (Some(url), _) => url.clone(),
                     (_, command) => command.clone().unwrap_or_default(),
                 };
-                let missing = filled(m, &secrets).err().unwrap_or_default();
+                let missing = missing(cfg, m);
                 let note = if missing.is_empty() {
                     String::new()
                 } else {
@@ -572,7 +587,7 @@ fn ok(cfg: &Config, kind: Kind, name: &str) -> anyhow::Result<(String, After)> {
         }
         Content::Connector(m) => {
             write_config(cfg, |doc| crate::host::conf::upsert_mcp(doc, &m))?;
-            let missing = filled(&m, &secrets(cfg)).err().unwrap_or_default();
+            let missing = missing(cfg, &m);
             let mut reply = format!("[zephyr] connector {name} added to zephyr.toml");
             if !missing.is_empty() {
                 reply += &format!(
@@ -710,8 +725,10 @@ fn write_files(dir: &Path, files: &Files) -> anyhow::Result<()> {
 }
 
 /// git as the daemon: `<state>/skills` is its own, never the agent's (memory's git is the agent's).
+/// By full path, so no PATH entry chooses which git root runs, and with no config or hook beyond
+/// its own repo's, which the daemon wrote.
 fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = Command::new("git")
+    let out = Command::new("/usr/bin/git")
         .arg("-C")
         .arg(dir)
         .args([
@@ -719,7 +736,13 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
             "user.name=Zephyr",
             "-c",
             "user.email=zephyr@localhost",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
         ])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .args(args)
         .output()
         .context("running git")?;
@@ -733,8 +756,34 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// secrets.env as a connector may use it: never zephyr's own (`ZEPHYR_*`) or a channel's, which
+/// would land in the agent-readable mcp.json and let the agent post as the owner.
 fn secrets(cfg: &Config) -> Vec<(String, String)> {
-    crate::dotenv::read(&cfg.secrets_path()).unwrap_or_default()
+    let mut all = crate::dotenv::read(&cfg.secrets_path()).unwrap_or_default();
+    all.retain(|(k, _)| !reserved(cfg, k));
+    all
+}
+
+fn reserved(cfg: &Config, name: &str) -> bool {
+    let channel = [
+        cfg.discord.as_ref().map(|d| &d.token_env),
+        cfg.imessage.as_ref().map(|i| &i.password_env),
+        cfg.imessage.as_ref().map(|i| &i.secret_env),
+        cfg.attach.as_ref().and_then(|a| a.token_env.as_ref()),
+    ];
+    name.starts_with("ZEPHYR_") || channel.into_iter().flatten().any(|k| k == name)
+}
+
+/// The secrets.env keys `m` needs that are not set, or are refused (`reserved`), saying which.
+fn missing(cfg: &Config, m: &Mcp) -> Vec<String> {
+    let missing = filled(m, &secrets(cfg)).err().unwrap_or_default();
+    missing
+        .into_iter()
+        .map(|k| match reserved(cfg, &k) {
+            true => format!("{k} (zephyr's own secret, never a connector's)"),
+            false => k,
+        })
+        .collect()
 }
 
 /// `m` in the adapter's `mcpServers` shape, each `${NAME}` filled in from secrets.env. `Err`
@@ -784,21 +833,66 @@ fn expand(text: &str, secrets: &[(String, String)], missing: &mut Vec<String>) -
 
 /// The secrets.env keys a connector needs that are not set; `doctor` warns about them.
 pub fn missing_secrets(cfg: &Config, m: &Mcp) -> Vec<String> {
-    filled(m, &secrets(cfg)).err().unwrap_or_default()
+    missing(cfg, m)
 }
 
 /// The connectors file each child gets (`ZEPHYR_MCP_CONFIG`), the only one the policy plugin
-/// lets the MCP adapter's tools use.
-pub fn mcp_path(home: &Path) -> PathBuf {
-    home.join(".approved/mcp.json")
+/// lets the MCP adapter's tools use. The daemon's, in `<state>-public/` beside `<state>` (which
+/// only root may enter), so the agent can read it but never rewrite it before a child loads it.
+pub fn mcp_path(cfg: &Config) -> PathBuf {
+    let state = cfg.state_dir();
+    let name = state
+        .file_name()
+        .map_or("zephyr".into(), |n| n.to_string_lossy());
+    state
+        .with_file_name(format!("{name}-public"))
+        .join("mcp.json")
+}
+
+/// Where the daemon puts AGENTS.md when the agent runs on a uid of its own: in the parent of its
+/// home (`/` in the container), root's, which rpi loads as it walks up from its working
+/// directory. `None` outside the container, where that parent is no one's to write.
+fn owner_agents_md(cfg: &Config) -> Option<PathBuf> {
+    crate::agent::ids()?;
+    Some(cfg.home.parent()?.join("AGENTS.md"))
+}
+
+/// What `<home>/AGENTS.md` says when the real one is root's (`owner_agents_md`).
+const AGENTS_STUB: &str = "# AGENTS.md\n\nZephyr writes your standing instructions to the \
+    AGENTS.md above this folder at each start; this file is rewritten then too.\n";
+
+/// Writes `text` to `path` as the daemon, readable by all (0644), in a folder only the daemon may
+/// write: what the agent may read but must not change.
+fn write_public(path: &Path, text: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    let dir = path.parent().context("no folder")?;
+    if !dir.exists() {
+        std::fs::DirBuilder::new().mode(0o755).create(dir)?;
+    }
+    let meta = dir.symlink_metadata()?;
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+        bail!("{} is not a folder only zephyr may write", dir.display());
+    }
+    let name = path.file_name().context("no file name")?.to_string_lossy();
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(&tmp)?;
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
+    std::io::Write::write_all(&mut file, text.as_bytes())?;
+    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
 }
 
 /// Before every child start, in place of `memory::prepare` (which it runs first): publishes the
-/// approved skills and connectors to `<home>/.approved/`, written as the agent, and lists them
-/// in AGENTS.md. An edit the agent makes there lasts until the next start.
+/// approved skills to `<home>/.approved/` as the agent (an edit it makes there lasts until the
+/// next start), and the connectors (`mcp_path`) and AGENTS.md (`owner_agents_md`) as the daemon.
 pub fn prepare(cfg: &Config, agent_dir: &Path) -> anyhow::Result<()> {
     let _guard = lock();
-    crate::memory::prepare(&cfg.home, cfg.state_dir(), agent_dir)?;
+    let agents_text = crate::memory::prepare(&cfg.home, cfg.state_dir(), agent_dir)?;
     let skills = approved_skills(cfg.state_dir());
     let secrets = secrets(cfg);
     let mut servers = serde_json::Map::new();
@@ -809,14 +903,27 @@ pub fn prepare(cfg: &Config, agent_dir: &Path) -> anyhow::Result<()> {
                 servers.insert(m.name.clone(), spec);
                 listed.push(m);
             }
-            Err(missing) => eprintln!(
+            Err(_) => eprintln!(
                 "zephyr: connector {} left out: secrets.env lacks {}",
                 m.name,
-                missing.join(", ")
+                missing(cfg, m).join(", ")
             ),
         }
     }
-    let section = sections(&cfg.home, &skills, &listed, &cfg.subagents);
+    let mcp = mcp_path(cfg);
+    let section = sections(&cfg.home, &mcp, &skills, &listed, &cfg.subagents);
+    if servers.is_empty() {
+        let _ = std::fs::remove_file(&mcp);
+    } else {
+        let text = serde_json::to_string_pretty(&serde_json::json!({ "mcpServers": servers }))?;
+        write_public(&mcp, &text)?;
+    }
+    // From memory's text, never the file it wrote: the agent may have changed that since.
+    let mut agents_text = insert(&agents_text, &section);
+    if let Some(path) = owner_agents_md(cfg) {
+        write_public(&path, &agents_text)?;
+        agents_text = AGENTS_STUB.into();
+    }
     let _fs = crate::agent::fs();
     let dir = cfg.home.join(".approved/skills");
     match std::fs::remove_dir_all(&dir) {
@@ -829,16 +936,7 @@ pub fn prepare(cfg: &Config, agent_dir: &Path) -> anyhow::Result<()> {
     for (name, files) in &skills {
         write_files(&dir.join(name), files)?;
     }
-    let mcp = mcp_path(&cfg.home);
-    if servers.is_empty() {
-        let _ = std::fs::remove_file(&mcp);
-    } else {
-        let text = serde_json::to_string_pretty(&serde_json::json!({ "mcpServers": servers }))?;
-        crate::host::conf::replace_private(&mcp, &text)?;
-    }
-    let agents = cfg.home.join("AGENTS.md");
-    let text = std::fs::read_to_string(&agents)?;
-    std::fs::write(&agents, insert(&text, &section))?;
+    std::fs::write(cfg.home.join("AGENTS.md"), agents_text)?;
     Ok(())
 }
 
@@ -854,6 +952,7 @@ fn insert(agents: &str, section: &str) -> String {
 /// and how to propose more; then `## Subagents`, the owner's, when there are any.
 fn sections(
     home: &Path,
+    mcp: &Path,
     skills: &BTreeMap<String, Files>,
     servers: &[&Mcp],
     subagents: &[crate::config::Subagent],
@@ -889,7 +988,7 @@ fn sections(
              name below lists its tools; `mcp_call` with the same two plus `tool` and `arguments` \
              calls one. `arguments` is a JSON object, not a string holding JSON; leave it out for a \
              tool with no parameters. Any other config path, or a `url`, is refused.\n\n",
-            mcp_path(home).display()
+            mcp.display()
         ));
         for m in servers {
             let what = match &m.command {
@@ -1008,7 +1107,7 @@ mod tests {
         assert!(at("## Skills") < at("## Connectors"));
         assert!(at("## Connectors") < at("## Memory"));
         assert!(text.contains("every mcp_* call is refused"));
-        assert!(!mcp_path(&cfg.home).exists());
+        assert!(!mcp_path(&cfg).exists());
         // Rewritten from scratch at each start: one copy of each.
         assert_eq!(agents(&cfg).matches("## Skills").count(), 1);
         assert!(!text.contains("## Subagents"), "none are set up");
@@ -1047,6 +1146,19 @@ mod tests {
         std::os::unix::fs::symlink("/etc/passwd", dir.join("link")).unwrap();
         assert!(refused(&dir, "ok-1").contains("symlink"));
         std::fs::remove_file(dir.join("link")).unwrap();
+
+        // An embedded repo, whose config root's git would obey, at any depth and in any case.
+        for git in [".git/config", "sub/.Git/config", ".git"] {
+            let path = dir.join(git);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "[core]\n\tfsmonitor = touch /tmp/pwned\n").unwrap();
+            assert!(
+                refused(&dir, "ok-1").contains("cannot hold a .git"),
+                "{git}"
+            );
+            let top = dir.join(git.split('/').next().unwrap());
+            let _ = std::fs::remove_dir_all(&top).or_else(|_| std::fs::remove_file(&top));
+        }
 
         for i in 0..MAX_FILES {
             std::fs::write(dir.join(format!("f{i}")), "x").unwrap();
@@ -1134,16 +1246,36 @@ mod tests {
         std::fs::create_dir_all(cfg.state_dir()).unwrap();
         std::fs::write(cfg.secrets_path(), "DOCS_TOKEN=t0k\n").unwrap();
         let text = agents(&cfg);
-        let file = mcp_path(&cfg.home);
+        let file = mcp_path(&cfg);
         let json: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!(
             json,
             serde_json::json!({"mcpServers": {"docs": {
                 "url": "https://x/mcp", "headers": {"Authorization": "Bearer t0k"}}}})
         );
+        // The daemon's, out of the agent's home: readable, never rewritable before a child loads it.
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert!(
+            file.ends_with("state-public/mcp.json"),
+            "{}",
+            file.display()
+        );
+        assert_eq!((mode(&file), mode(file.parent().unwrap())), (0o644, 0o755));
+        assert!(text.contains(&format!("`configPath` `{}`", file.display())));
+        assert!(!cfg.home.join(".approved/mcp.json").exists());
+        // A folder others may write is not the daemon's own: refused.
+        std::fs::set_permissions(
+            file.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        assert!(prepare(&cfg, &cfg.home.join("agent")).is_err());
+        std::fs::set_permissions(
+            file.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         assert!(text.contains("- **docs**: remote (HTTP)"), "{text}");
         assert!(
             !text.contains("**local**"),
@@ -1201,6 +1333,56 @@ mod tests {
         assert!(say(&gone, "/mcp rm files")
             .0
             .contains("no approved connector"));
+    }
+
+    #[test]
+    fn fingerprints_are_sha256_and_an_old_one_shows_the_draft_again() {
+        let one = |files: &[(&str, &str)]| {
+            let files = files
+                .iter()
+                .map(|(p, b)| (p.to_string(), b.as_bytes().to_vec()))
+                .collect();
+            fingerprint(&Ok(Content::Skill(files)))
+        };
+        let a = one(&[("SKILL.md", "ab"), ("x", "c")]);
+        assert_eq!(a.len(), 64, "{a}");
+        assert_ne!(a, one(&[("SKILL.md", "a"), ("bx", "c")]), "length-prefixed");
+        assert_ne!(a, one(&[("SKILL.md", "ab"), ("x", "d")]));
+
+        let cfg = cfg("");
+        skill(&cfg, "tea", "Boil water.");
+        let mut old = BTreeMap::new();
+        old.insert(key(Kind::Skill, "tea"), "9f3a1c0b2d4e5f60".to_string());
+        save_shown(cfg.state_dir(), &old).unwrap();
+        assert_eq!(scan(&cfg).len(), 1, "shown again");
+        assert!(say(&cfg, "/skill ok tea").0.contains("approved"));
+    }
+
+    #[test]
+    fn a_connector_never_gets_a_channel_secret() {
+        let cfg = cfg("[discord]\ntoken_env = 'DISCORD_BOT'\n\
+             [[mcp]]\nname = 'leak'\nurl = 'https://x/mcp'\n\
+             headers = { A = '${ZEPHYR_BB_PASSWORD}', B = '${DISCORD_BOT}' }\n\
+             [[mcp]]\nname = 'fine'\nurl = 'https://y/mcp'\nheaders = { A = '${DOCS}' }\n");
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        std::fs::write(
+            cfg.secrets_path(),
+            "ZEPHYR_BB_PASSWORD=bbpass1\nDISCORD_BOT=dtoken1\nDOCS=d0cs\n",
+        )
+        .unwrap();
+        agents(&cfg);
+        let text = std::fs::read_to_string(mcp_path(&cfg)).unwrap();
+        assert!(
+            text.contains("d0cs") && !text.contains("\"leak\""),
+            "{text}"
+        );
+        for value in ["bbpass1", "dtoken1"] {
+            assert!(!text.contains(value), "{text}");
+        }
+        let missing = missing_secrets(&cfg, &cfg.mcp[0]);
+        assert_eq!(missing.len(), 2, "{missing:?}");
+        assert!(missing.iter().all(|m| m.contains("never a connector's")));
+        assert!(say(&cfg, "/mcp").0.contains("DISCORD_BOT (zephyr's own"));
     }
 
     #[test]
