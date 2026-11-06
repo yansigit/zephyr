@@ -193,6 +193,81 @@ fn log(home: &Path, kind: &str) -> Vec<Value> {
         .collect()
 }
 
+/// Session `id`'s file as rpi 0.18 (and fake-rpi) lays it out, the child's cwd being `home`:
+/// `sessions/--<home, / as ->--/<stamp>_<id>.jsonl`. The newest, when there are several.
+fn session_file(home: &Path, id: &str) -> Option<PathBuf> {
+    let cwd = home
+        .display()
+        .to_string()
+        .trim_matches('/')
+        .replace('/', "-");
+    let dir = home.join("sessions").join(format!("--{cwd}--"));
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().ends_with(&format!("_{id}.jsonl")))
+        .collect();
+    found.sort();
+    found.pop()
+}
+
+/// The messages of session `id` on the path to its leaf, as `get_messages` gives them.
+fn session_messages(home: &Path, id: &str) -> Vec<Value> {
+    let text = std::fs::read_to_string(session_file(home, id).expect("a session file")).unwrap();
+    let (mut entries, mut leaf) = (HashMap::new(), Value::Null);
+    for v in text
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+    {
+        match v["kind"].as_str() {
+            Some("entry") => {
+                leaf = v["id"].clone();
+                entries.insert(v["id"].as_str().unwrap().to_string(), v);
+            }
+            Some("lane") => leaf = v["leafId"].clone(),
+            _ => {}
+        }
+    }
+    let mut path = Vec::new();
+    while let Some(e) = leaf.as_str().and_then(|id| entries.get(id)) {
+        path.push(e["message"].clone());
+        leaf = e["parentId"].clone();
+    }
+    path.reverse();
+    path
+}
+
+/// Writes session `id` holding `messages`, as rpi 0.18 would have left it.
+fn write_session(home: &Path, id: &str, messages: &[Value]) {
+    let cwd = home
+        .display()
+        .to_string()
+        .trim_matches('/')
+        .replace('/', "-");
+    let file = home
+        .join("sessions")
+        .join(format!("--{cwd}--"))
+        .join(format!("2026-11-01T00-00-00-000Z_{id}.jsonl"));
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let mut lines = vec![serde_json::json!({"kind": "header", "version": 4, "id": id})];
+    for (i, m) in messages.iter().enumerate() {
+        let parent = i.checked_sub(1).map(|p| format!("s{p}"));
+        lines.push(
+            serde_json::json!({"kind": "entry", "type": "message", "id": format!("s{i}"),
+            "parentId": parent, "message": m}),
+        );
+    }
+    let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    std::fs::write(&file, text).unwrap();
+    let progress = serde_json::json!({"format": "assistant-progress-v1", "session_id": id});
+    std::fs::write(
+        format!("{}.progress.jsonl", file.display()),
+        format!("{progress}\n"),
+    )
+    .unwrap();
+}
+
 fn inbox_status(home: &Path, status: &str) -> i64 {
     let counts = Store::open(&home.join("state.db"))
         .unwrap()
@@ -314,12 +389,14 @@ async fn restart_with_dispatched_rows_resends_only_what_the_session_lacks() {
         });
     }
     // Row b is already in the session, answered.
-    std::fs::create_dir_all(cfg.session_dir()).unwrap();
-    let session = serde_json::json!({"pending": false, "messages": [
-        {"kind": "user", "role": "user", "content": zephyr::router::tagged(&seeded[1])},
-        {"kind": "assistant", "role": "assistant", "content": [{"type": "text", "text": "b's answer"}]},
-    ]});
-    std::fs::write(cfg.session_dir().join("main.json"), session.to_string()).unwrap();
+    write_session(
+        &home,
+        "main",
+        &[
+            serde_json::json!({"kind": "user", "role": "user", "content": zephyr::router::tagged(&seeded[1])}),
+            serde_json::json!({"kind": "assistant", "role": "assistant", "content": [{"type": "text", "text": "b's answer"}]}),
+        ],
+    );
     drop(store);
 
     let gw = start(cfg);
@@ -463,12 +540,7 @@ async fn both_channels_feed_one_main_session() {
     gw.wait_replies_on("discord", 1).await;
     gw.shutdown().await;
 
-    let session: Value =
-        serde_json::from_str(&std::fs::read_to_string(home.join("sessions/main.json")).unwrap())
-            .unwrap();
-    let users: Vec<_> = session["messages"]
-        .as_array()
-        .unwrap()
+    let users: Vec<_> = session_messages(&home, "main")
         .iter()
         .filter(|m| m["kind"] == "user")
         .map(|m| m["content"].as_str().unwrap().to_string())
@@ -705,8 +777,8 @@ async fn job_output_is_delivered_unless_silent() {
     assert!(gw.replies_on("discord").is_empty());
     let prompts = log(&home, "prompt");
     assert_eq!(prompts.len(), 2, "no /job command reaches the agent");
-    assert!(home.join("sessions/job-1-1.json").exists());
-    assert!(home.join("sessions/job-2-2.json").exists());
+    assert!(session_file(&home, "job-1-1").is_some());
+    assert!(session_file(&home, "job-2-2").is_some());
     gw.shutdown().await;
 }
 
@@ -1005,9 +1077,8 @@ async fn new_starts_a_fresh_main_session_and_keeps_it_across_restarts() {
     let fresh = sessions.last().unwrap();
     assert!(fresh.starts_with("main-"), "{sessions:?}");
     // The new session holds only what came after /new.
-    let path = home.join("sessions").join(format!("{fresh}.json"));
-    let held: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    assert_eq!(held["messages"][0]["content"], "[chat #3] again");
+    let held = session_messages(&home, fresh);
+    assert_eq!(held[0]["content"], "[chat #3] again");
     gw.shutdown().await;
 
     let gw = start(config(&home));
@@ -1054,15 +1125,8 @@ async fn switch_goes_back_to_an_earlier_conversation_and_keeps_it() {
     gw.say("m7", "owner", "back").await;
     assert_eq!(gw.wait_replies(7).await[6], "echo: [chat #7] back");
     assert_eq!(log(&home, "start").last().unwrap()["sessionId"], "main");
-    let held: Value =
-        serde_json::from_str(&std::fs::read_to_string(home.join("sessions/main.json")).unwrap())
-            .unwrap();
-    let texts: Vec<&str> = held["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|m| m["content"].as_str())
-        .collect();
+    let held = session_messages(&home, "main");
+    let texts: Vec<&str> = held.iter().filter_map(|m| m["content"].as_str()).collect();
     assert_eq!(texts, ["[chat #1] hi", "[chat #7] back"]);
     gw.say("m8", "owner", "/switch main").await;
     assert_eq!(gw.wait_replies(8).await[7], "[zephyr] already on main");
@@ -1317,7 +1381,7 @@ async fn a_rate_limited_job_retries_on_the_next_account() {
     assert_eq!(replies[2], "hello", "{replies:?}");
     assert_eq!(cooldowns(&home)["a"].until, reset);
     assert!(
-        home.join("sessions/job-1-1-1.json").exists(),
+        session_file(&home, "job-1-1-1").is_some(),
         "a fresh session on b"
     );
     gw.shutdown().await;
@@ -1812,7 +1876,9 @@ async fn a_job_cannot_propose() {
 }
 
 fn main_session(home: &Path) -> String {
-    std::fs::read_to_string(home.join("sessions").join("main.json")).unwrap_or_default()
+    session_file(home, "main")
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .unwrap_or_default()
 }
 
 #[tokio::test]
@@ -2723,13 +2789,15 @@ async fn a_task_that_finished_before_the_restart_reports_without_running_again()
         store.set_task_session(1, "task-1").unwrap();
     }
     // Its session already ends with the agent's answer: the gateway died before the report.
-    std::fs::create_dir_all(home.join("sessions")).unwrap();
-    let session = serde_json::json!({"pending": false, "messages": [
-        {"kind": "user", "role": "user", "content": "You are a background task …", "timestamp": 0},
-        {"kind": "assistant", "role": "assistant", "stopReason": "stop", "timestamp": 0,
-         "content": [{"type": "text", "text": "there are 3 files"}]}
-    ]});
-    std::fs::write(home.join("sessions/task-1.json"), session.to_string()).unwrap();
+    write_session(
+        &home,
+        "task-1",
+        &[
+            serde_json::json!({"kind": "user", "role": "user", "content": "You are a background task …", "timestamp": 0}),
+            serde_json::json!({"kind": "assistant", "role": "assistant", "stopReason": "stop", "timestamp": 0,
+         "content": [{"type": "text", "text": "there are 3 files"}]}),
+        ],
+    );
     let gw = start(cfg);
     wait(|| task_status(&home, "completed") == 1).await;
     wait(|| prompt_with(&home, "[task #1 finished;").is_some()).await;
@@ -2970,10 +3038,9 @@ async fn a_job_repeating_a_failing_call_is_stopped() {
 const UNDONE: &str = "[zephyr] undone: the agent no longer sees your last message or its reply; \
                       files it changed stay changed (see /rollback)";
 
-/// The main session's messages, as the fake keeps them.
+/// The main session's messages on the path to its leaf.
 fn messages(home: &Path) -> Vec<Value> {
-    let session: Value = serde_json::from_str(&main_session(home)).unwrap();
-    session["messages"].as_array().unwrap().clone()
+    session_messages(home, "main")
 }
 
 /// The text of each message in the main session.
@@ -3001,8 +3068,9 @@ async fn undo_takes_the_last_exchange_and_its_steers_out_of_the_context() {
 
     gw.say("m4", "owner", "/undo").await;
     assert_eq!(gw.wait_replies(4).await[3], UNDONE);
-    // The leaf goes on the entry before the run's own message: "one", which stays.
-    assert_eq!(log(&home, "navigate")[0]["targetId"], "m1");
+    // The leaf goes on the entry before the run's own message: "one"'s reply (the fake's
+    // second entry, e2), which stays.
+    assert_eq!(log(&home, "navigate")[0]["targetId"], "e2");
     assert_eq!(inbox_status(&home, "undone"), 2);
     assert_eq!(texts(&home), ["[chat #1] one", "echo: [chat #1] one"]);
 
@@ -3098,8 +3166,8 @@ async fn undo_n_takes_that_many_exchanges_back() {
         "[zephyr] undone: the agent no longer sees your last 3 messages or their replies; \
          files it changed stay changed (see /rollback)"
     );
-    // The leaf goes on the reply to "one": the three exchanges after it are gone.
-    assert_eq!(log(&home, "navigate")[0]["targetId"], "m1");
+    // The leaf goes on the reply to "one" (e2): the three exchanges after it are gone.
+    assert_eq!(log(&home, "navigate")[0]["targetId"], "e2");
     assert_eq!(texts(&home), ["[chat #1] one", "echo: [chat #1] one"]);
     assert_eq!(inbox_status(&home, "undone"), 3);
     gw.say("m6", "owner", "/undo 2").await;
@@ -3158,11 +3226,7 @@ async fn fork_carries_on_in_a_copy_and_leaves_the_original() {
         fork.as_str()
     );
     assert_eq!(texts(&home), ["[chat #1] one", "echo: [chat #1] one"]);
-    let held: Value = serde_json::from_str(
-        &std::fs::read_to_string(home.join(format!("sessions/{fork}.json"))).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(held["messages"].as_array().unwrap().len(), 4);
+    assert_eq!(session_messages(&home, &fork).len(), 4);
     gw.say("m4", "owner", "/switch").await;
     let list = gw.wait_replies(4).await[3].clone();
     assert!(
@@ -3513,7 +3577,8 @@ async fn a_vault_use_waits_for_the_owners_ok_and_a_granted_token_comes_back_scru
         "{reply}"
     );
     // The value never reaches the model's context, nor any chat.
-    let session = std::fs::read_to_string(home.join("sessions/main.json")).unwrap_or_default();
+    let session = main_session(&home);
+    assert!(session.contains("[vault:GH_TOKEN]"), "{session}");
     assert!(!session.contains("ghp_vaulttoken42"));
     assert!(!gw.replies().iter().any(|r| r.contains("ghp_vaulttoken42")));
     // Another program is another use: asked again, and nothing runs.
