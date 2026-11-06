@@ -41,8 +41,17 @@ impl Channel for ChatChannel {
         let listener = UnixListener::bind(&self.path)
             .with_context(|| format!("binding {}", self.path.display()))?;
         for conn_id in 0u64.. {
-            let (stream, _) = listener.accept().await?;
-            let uid = stream.peer_cred()?.uid().to_string();
+            // One failed accept (EMFILE, a peer gone already) must not end the gateway.
+            let accepted = listener.accept().await;
+            let cred = accepted.and_then(|(stream, _)| Ok((stream.peer_cred()?, stream)));
+            let (uid, stream) = match cred {
+                Ok((cred, stream)) => (cred.uid().to_string(), stream),
+                Err(e) => {
+                    eprintln!("zephyr: chat accept failed: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let (read, write) = stream.into_split();
             self.conns
                 .lock()
