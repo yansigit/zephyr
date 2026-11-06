@@ -950,11 +950,19 @@ async fn a_follow_up_waits_for_the_settle_and_then_runs() {
     wait(|| gw.log("queue_message").len() == 1).await;
     let steer = &gw.log("queue_message")[0];
     let steered = steer["message"].as_str().unwrap();
-    assert!(steered.starts_with("[tui #3] now"), "{steer}");
+    // The two travel to the router on separate channels, so either may get the lower inbox id.
+    assert!(
+        steered.starts_with("[tui #") && steered.contains("] now"),
+        "{steer}"
+    );
     assert_eq!(gw.count("inbox", "new"), 1, "the follow-up waits");
     std::fs::remove_file(gw.home.join("tool_wait")).unwrap();
     wait(|| prompts(&gw).len() == 2).await;
-    assert_eq!(prompts(&gw)[1], "[tui #2] later");
+    let second = &prompts(&gw)[1];
+    assert!(
+        second.starts_with("[tui #") && second.ends_with("] later"),
+        "{second}"
+    );
     assert_eq!(gw.log("queue_message").len(), 1, "never steered");
     gw.shutdown().await;
 }
