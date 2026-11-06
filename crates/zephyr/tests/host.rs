@@ -42,6 +42,10 @@ case "$1" in
     esac ;;
   exec)
     case " $* " in *" -i "*) cat >> "$SHIM_DIR/stdin.log" ;; esac
+    # The daemon edits zephyr.toml while a sign-in or the model picker waits on the owner.
+    case " $* " in *" auth login "*|*" --list-models "*)
+      [ -n "$SHIM_EDIT" ] && echo "$SHIM_EDIT" >> "$HOME/.zephyr-daemon/zephyr.toml" ;;
+    esac
     case " $* " in
       *" --list-models "*) printf 'provider model context\nanthropic claude-sonnet-5 200K\nopenai-codex gpt-5.5 400K\nopenai-codex gpt-5.4 400K\n' ;;
       *" auth check "*) echo '{"ready":true,"provider":"claude-code","source":"auth.json"}' ;;
@@ -1780,4 +1784,30 @@ fn up_and_going_back_without_a_container_keep_the_backups() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("no backup from 0.0.1"), "{err}");
     assert_eq!(at(&env.calls(), RUN, ""), None);
+}
+
+#[test]
+fn host_edits_keep_what_the_daemon_wrote_meanwhile() {
+    let env = Env::new("reread");
+    env.init(&["--no-start"]);
+    let edit = "# the daemon was here";
+    let out = env.zephyr_env(
+        &["login", "anthropic", "--no-verify"],
+        &[("ANTHROPIC_API_KEY", "sk-fake"), ("SHIM_EDIT", edit)],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(env.config().contains(edit), "{}", env.config());
+    assert!(env.config().contains("anthropic-1"), "{}", env.config());
+    let edit = "# and again";
+    let out = env.zephyr_env(&["model"], &[("SHIM_EDIT", edit)]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(env.config().contains(edit), "{}", env.config());
 }

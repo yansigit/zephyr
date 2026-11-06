@@ -218,7 +218,7 @@ fn login(
 ) -> anyhow::Result<()> {
     known_provider(provider)?;
     h.need_running()?;
-    let mut doc = h.data.load()?;
+    let doc = h.data.load()?;
     let name = account.unwrap_or_else(|| next_name(&doc, provider));
     if name.is_empty() || name.contains(['/', '.']) {
         bail!("account name {name:?}: no '/' or '.'");
@@ -304,6 +304,8 @@ fn login(
         Some(m) => m,
         None => pick_model(h, &exts, Some(provider))?,
     };
+    // Read again: the sign-in and the picker take minutes, and the daemon may have edited it since.
+    let mut doc = h.data.load()?;
     conf::upsert_account(&mut doc, &name, &model);
     h.data.save(&doc)?;
     println!("account {name}: {model}");
@@ -424,7 +426,7 @@ pub fn accounts(h: &Host, a: Args) -> anyhow::Result<()> {
 pub fn model(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let account = a.value("--account")?;
     let rest = a.rest()?;
-    let mut doc = h.data.load()?;
+    let doc = h.data.load()?;
     let accounts = conf::accounts(&doc);
     // In pool mode each account has its own model; the top-level one is unused.
     let account = match (account, &accounts[..]) {
@@ -450,6 +452,8 @@ pub fn model(h: &Host, mut a: Args) -> anyhow::Result<()> {
         }
         _ => bail!("usage: zephyr model [--account NAME] [PROVIDER/MODEL]"),
     };
+    // Read again: the picker can take minutes, and the daemon may have edited it since.
+    let mut doc = h.data.load()?;
     match account {
         Some((name, _)) => {
             // The account's sign-in belongs to one provider.
@@ -860,10 +864,10 @@ fn channel_add(h: &Host, kind: &str) -> anyhow::Result<()> {
     if !h.interactive {
         bail!("channel add asks for secrets: run it in a terminal");
     }
-    let mut doc = h.data.load()?;
+    let shown = h.data.load()?;
     let ask = |prompt: &str, key: &str| -> anyhow::Result<String> {
         let mut input = Input::<String>::new().with_prompt(prompt);
-        if let Some(v) = conf::get(&doc, key) {
+        if let Some(v) = conf::get(&shown, key) {
             input = input.default(v);
         }
         Ok(input.interact_text()?)
@@ -876,14 +880,16 @@ fn channel_add(h: &Host, kind: &str) -> anyhow::Result<()> {
         let items: Vec<String> = v.split(',').map(|s| format!("{:?}", s.trim())).collect();
         format!("[{}]", items.join(", "))
     };
-    if kind == "discord" {
+    let sets = if kind == "discord" {
         let owner = ask(
             "Your Discord user id (Developer Mode, Copy User ID)",
             "owners.discord",
         )?;
         hidden("Discord bot token (hidden)", "ZEPHYR_DISCORD_TOKEN")?;
-        conf::set(&mut doc, "discord.token_env", "ZEPHYR_DISCORD_TOKEN")?;
-        conf::set(&mut doc, "owners.discord", &list(&owner))?;
+        vec![
+            ("discord.token_env", "ZEPHYR_DISCORD_TOKEN".to_string()),
+            ("owners.discord", list(&owner)),
+        ]
     } else {
         let listen = ask(
             "Webhook listen address (this host's Tailscale IP:port)",
@@ -894,15 +900,22 @@ fn channel_add(h: &Host, kind: &str) -> anyhow::Result<()> {
         hidden("BlueBubbles server password (hidden)", "ZEPHYR_BB_PASSWORD")?;
         h.data
             .set_secret("ZEPHYR_BB_SECRET", &conf::random_hex(24)?)?;
-        conf::set(&mut doc, "imessage.listen", &format!("{listen:?}"))?;
-        conf::set(&mut doc, "imessage.server_url", &format!("{server:?}"))?;
-        conf::set(&mut doc, "imessage.password_env", "ZEPHYR_BB_PASSWORD")?;
-        conf::set(&mut doc, "imessage.secret_env", "ZEPHYR_BB_SECRET")?;
-        conf::set(&mut doc, "owners.imessage", &list(&owners))?;
         println!(
             "Register the BlueBubbles webhook http://{listen}/?secret=<ZEPHYR_BB_SECRET from {}/secrets.env, readable with sudo>",
             h.data.daemon.display()
         );
+        vec![
+            ("imessage.listen", format!("{listen:?}")),
+            ("imessage.server_url", format!("{server:?}")),
+            ("imessage.password_env", "ZEPHYR_BB_PASSWORD".to_string()),
+            ("imessage.secret_env", "ZEPHYR_BB_SECRET".to_string()),
+            ("owners.imessage", list(&owners)),
+        ]
+    };
+    // Read again: the prompts take minutes, and the daemon may have edited it since.
+    let mut doc = h.data.load()?;
+    for (key, raw) in sets {
+        conf::set(&mut doc, key, &raw)?;
     }
     h.data.save(&doc)
 }
