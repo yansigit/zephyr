@@ -10,7 +10,8 @@ reply carries: {"totalTokens": n, "costTotal": x}, sent as message.usage.{totalT
 `get_stats` always reports 0, as rpi does for replies.
 Auth: the OAuth store is $RPI_CODING_AGENT_DIR/auth.json. `get_auth_status` lists its oauth
 entries. `auth refresh --provider P` (the CLI, not the RPC) gives P a fresh expiry, and records
-an "auth-refresh" line in ./log.jsonl (an `oauth_fail` file in the home makes it fail).
+an "auth-refresh" line in ./log.jsonl (an `oauth_fail` file in the home makes it fail; a
+`refresh_hang` file makes it write its pid to `refresh_pid` in the home and hang).
 `auth login --provider P` records an "auth-login" line and stores {"type": "oauth"} for P: with a
 `login_url` file in the home it prints a sign-in URL and waits for a `login_go` file (the browser
 coming back), otherwise it prompts and reads one stdin line; a `login_fail` file makes it fail.
@@ -142,6 +143,9 @@ if args[:1] == ["auth"]:
         sys.exit(0)
     # `rpi auth refresh --provider P`.
     open(os.path.join(home, "log.jsonl"), "a").write(json.dumps({"type": "auth-refresh", "provider": provider}) + "\n")
+    if os.path.exists(os.path.join(home, "refresh_hang")):
+        open(os.path.join(home, "refresh_pid"), "w").write(str(os.getpid()))
+        time.sleep(300)
     if os.path.exists(os.path.join(home, "oauth_fail")) or store.get(provider, {}).get("type") != "oauth":
         print("error: OAuth refresh failed", file=sys.stderr); sys.exit(1)
     store[provider]["expires"] = int(time.time()) + 3600
