@@ -45,7 +45,18 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
         // While paused nothing starts; the runner aborts what was running (scheduler::until_cut).
         while running.len() < cfg.parallel_tasks() && store.pause_reason().ok() == Some(None) {
             match store.start_next_task(crate::now()) {
-                Ok(Some(task)) => running.push(one(cfg.clone(), task, wake)),
+                // Its own connection: a task awaits for minutes while others write. One that
+                // cannot open ends failed here, never left `running` with nothing running it.
+                Ok(Some(task)) => match Store::open(&cfg.db_path()) {
+                    Ok(own) => running.push(one(cfg.clone(), own, task, wake)),
+                    Err(e) => {
+                        let why =
+                            format!("[zephyr] task #{} could not open the store: {e}", task.id);
+                        eprintln!("zephyr: {why}");
+                        log(store.finish_task(&task, "failed", &why, crate::now()));
+                        wake.inbox.notify_one();
+                    }
+                },
                 Ok(None) => break,
                 Err(e) => {
                     eprintln!("zephyr: starting a task failed: {e}");
@@ -57,12 +68,7 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
 }
 
 /// Runs one task to its end and hands the report to the main session.
-async fn one(cfg: Arc<Config>, task: Task, wake: &Wake) {
-    // Its own connection: a task awaits for minutes while others write.
-    let mut store = match Store::open(&cfg.db_path()) {
-        Ok(s) => s,
-        Err(e) => return eprintln!("zephyr: task #{} could not open the store: {e}", task.id),
-    };
+async fn one(cfg: Arc<Config>, mut store: Store, task: Task, wake: &Wake) {
     let role = (task.preamble.as_ref()).map_or(String::new(), |p| format!("{p}\n\n"));
     let prompt = format!("{BRIEF}{role}Goal: {}", task.goal);
     // A task a restart cut reopens the session it ran in.
