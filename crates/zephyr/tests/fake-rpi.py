@@ -3,7 +3,8 @@
 
 State lives next to --session-dir (the zephyr home): log.jsonl records every command,
 pid holds the current pid, and a `hang` file makes the next prompt commit its user
-message, mark the run resumable, and stop answering (the test then kills -9 it); a `wedge`
+message, mark the run resumable, and never finish it, answering only what needs no run (the
+test then kills -9 it, or aborts it); a `wedge`
 file does the same but never takes another command, `abort` included (a wedged rpi); a
 `slow` file holds the seconds each prompt takes. `usage.json` (if present) is the usage each
 reply carries: {"totalTokens": n, "costTotal": x}, sent as message.usage.{totalTokens,cost.total}.
@@ -530,7 +531,10 @@ for line in iter(next_line, None):
                 c = json.loads(line)
                 open(os.path.join(home, "log.jsonl"), "a").write(line)
                 if c["type"] != "abort":
-                    respond(c, error="a run is already active"); continue
+                    # As rpi: what needs no run is answered; anything else waits for none.
+                    if not quick(c, s):
+                        respond(c, error="a run is already active")
+                    continue
                 abort_reply(c); set_pending(s, False)
                 # As rpi: a cancelled run still records an aborted assistant message.
                 msg = {"kind": "assistant", "role": "assistant", "content": [], "stopReason": "aborted",
