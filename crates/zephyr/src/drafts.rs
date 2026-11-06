@@ -710,8 +710,9 @@ fn write_files(dir: &Path, files: &Files) -> anyhow::Result<()> {
 }
 
 /// git as the daemon: `<state>/skills` is its own, never the agent's (memory's git is the agent's).
+/// By full path, so no PATH entry chooses which git root runs.
 fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = Command::new("git")
+    let out = Command::new("/usr/bin/git")
         .arg("-C")
         .arg(dir)
         .args([
