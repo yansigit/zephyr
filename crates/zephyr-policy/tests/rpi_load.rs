@@ -17,6 +17,15 @@ use serde_json::{json, Value};
 
 const RPI: &str = "/home/user/Projects/.always-on/rpi-0.18.0/bin/rpi";
 
+/// A test that needs the pinned rpi skips without it, unless ZEPHYR_REAL_RPI=1 (deploy/release.sh
+/// sets it): then it fails, so a run cannot go green without testing anything.
+fn skip_without_rpi(rpi: impl std::fmt::Display) {
+    if std::env::var("ZEPHYR_REAL_RPI").as_deref() == Ok("1") {
+        panic!("ZEPHYR_REAL_RPI=1 but {rpi} is not installed");
+    }
+    eprintln!("skipping: {rpi} is not installed");
+}
+
 fn sse(event: &str, data: Value) -> String {
     format!("event: {event}\ndata: {data}\n\n")
 }
@@ -152,7 +161,7 @@ fn scratch(name: &str) -> PathBuf {
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
 fn rpi_loads_plugin_and_vetoes_write_into_ssh() {
     if !Path::new(RPI).exists() {
-        eprintln!("SKIP: {RPI} not installed");
+        skip_without_rpi(RPI);
         return;
     }
     let lib = common::build_cdylib();
@@ -300,7 +309,7 @@ fn rpc_command_names(extension: Option<&Path>) -> Vec<String> {
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
 fn rpc_lists_status_command_only_when_plugin_is_loaded() {
     if !Path::new(RPI).exists() {
-        eprintln!("SKIP: {RPI} not installed");
+        skip_without_rpi(RPI);
         return;
     }
     let lib = common::build_cdylib();
@@ -447,7 +456,7 @@ impl Drop for GatewayRpi {
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
 fn rpi_waits_for_a_gateway_answer_mid_turn() {
     if !Path::new(RPI).exists() {
-        eprintln!("SKIP: {RPI} not installed");
+        skip_without_rpi(RPI);
         return;
     }
     let first = call_turn("toolu_gw", "gateway", "{\"command\":\"/status\"}");
@@ -483,7 +492,7 @@ fn rpi_waits_for_a_gateway_answer_mid_turn() {
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
 fn the_main_child_runs_commands_through_exec_and_waits_for_them() {
     if !Path::new(RPI).exists() {
-        eprintln!("SKIP: {RPI} not installed");
+        skip_without_rpi(RPI);
         return;
     }
     let first = call_turn("toolu_exec", "exec", "{\"command\":\"make\"}");
@@ -511,7 +520,7 @@ fn the_main_child_runs_commands_through_exec_and_waits_for_them() {
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
 fn other_children_keep_bash_and_get_no_exec() {
     if !Path::new(RPI).exists() {
-        eprintln!("SKIP: {RPI} not installed");
+        skip_without_rpi(RPI);
         return;
     }
     let mut rpi = GatewayRpi::start("no-exec", vec![text_turn()]);
@@ -528,7 +537,7 @@ fn other_children_keep_bash_and_get_no_exec() {
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
 fn an_abort_ends_a_waiting_gateway_call() {
     if !Path::new(RPI).exists() {
-        eprintln!("SKIP: {RPI} not installed");
+        skip_without_rpi(RPI);
         return;
     }
     let first = call_turn("toolu_gw", "gateway", "{\"command\":\"/status\"}");
@@ -560,7 +569,7 @@ fn an_abort_ends_a_waiting_gateway_call() {
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
 fn rpi_waits_for_a_task_answer_mid_turn() {
     if !Path::new(RPI).exists() {
-        eprintln!("SKIP: {RPI} not installed");
+        skip_without_rpi(RPI);
         return;
     }
     let list = call_turn("toolu_task", "task", "{\"action\":\"list\"}");

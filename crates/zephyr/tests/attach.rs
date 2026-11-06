@@ -822,6 +822,15 @@ fn token_file_must_be_private() {
     assert_eq!(zephyr::attach::token(&attach(&file)).unwrap(), "t");
 }
 
+/// A test that needs the pinned rpi skips without it, unless ZEPHYR_REAL_RPI=1 (deploy/release.sh
+/// sets it): then it fails, so a run cannot go green without testing anything.
+fn skip_without_rpi(rpi: impl std::fmt::Display) {
+    if std::env::var("ZEPHYR_REAL_RPI").as_deref() == Ok("1") {
+        panic!("ZEPHYR_REAL_RPI=1 but {rpi} is not installed");
+    }
+    eprintln!("skipping: {rpi} is not installed");
+}
+
 /// The pinned stock client, typed into through a pty (its TUI needs a terminal; with piped
 /// stdin it only handshakes and exits). Needs python3 and the binary; no model is called.
 #[tokio::test]
@@ -829,7 +838,7 @@ fn token_file_must_be_private() {
 async fn stock_rpi_connect_attaches_chats_and_detaches() {
     let rpi = Path::new("/home/user/Projects/.always-on/rpi-0.18.0/bin/rpi");
     if !rpi.exists() {
-        eprintln!("skipped: {} is absent", rpi.display());
+        skip_without_rpi(rpi.display());
         return;
     }
     let gw = start("stock");

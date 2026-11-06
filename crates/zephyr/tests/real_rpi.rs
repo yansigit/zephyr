@@ -12,6 +12,15 @@ use zephyr::config::Config;
 
 const RPI: &str = "/home/user/Projects/.always-on/rpi-0.18.0/bin/rpi";
 
+/// A test that needs the pinned rpi skips without it, unless ZEPHYR_REAL_RPI=1 (deploy/release.sh
+/// sets it): then it fails, so a run cannot go green without testing anything.
+fn skip_without_rpi(rpi: impl std::fmt::Display) {
+    if std::env::var("ZEPHYR_REAL_RPI").as_deref() == Ok("1") {
+        panic!("ZEPHYR_REAL_RPI=1 but {rpi} is not installed");
+    }
+    eprintln!("skipping: {rpi} is not installed");
+}
+
 struct TestChannel {
     feed: tokio::sync::Mutex<mpsc::Receiver<Inbound>>,
     sent: Mutex<Vec<Outbound>>,
@@ -88,7 +97,7 @@ async fn stub_provider(hang: Arc<AtomicBool>, seen: Arc<Mutex<Vec<String>>>) -> 
 #[ignore = "needs the pinned rpi binary"]
 async fn real_rpi_round_trip_and_kill_mid_run() {
     if !std::path::Path::new(RPI).exists() {
-        eprintln!("skipping: {RPI} is not installed");
+        skip_without_rpi(RPI);
         return;
     }
     let hang = Arc::new(AtomicBool::new(false));
@@ -198,7 +207,7 @@ async fn rate_limited_provider(hits: Arc<std::sync::atomic::AtomicUsize>) -> u16
 #[ignore = "needs the pinned rpi binary"]
 async fn real_rpi_fails_over_to_the_next_account() {
     if !std::path::Path::new(RPI).exists() {
-        eprintln!("skipping: {RPI} is not installed");
+        skip_without_rpi(RPI);
         return;
     }
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -281,7 +290,7 @@ async fn real_rpi_fails_over_to_the_next_account() {
 #[ignore = "needs the pinned rpi binary"]
 async fn real_rpi_btw_runs_with_no_tools_and_no_session_mid_run() {
     if !std::path::Path::new(RPI).exists() {
-        eprintln!("skipping: {RPI} is not installed");
+        skip_without_rpi(RPI);
         return;
     }
     let (hang, seen) = (Arc::new(AtomicBool::new(false)), Arc::default());
@@ -414,7 +423,7 @@ async fn real_rpi_btw_runs_with_no_tools_and_no_session_mid_run() {
 #[ignore = "needs the pinned rpi binary"]
 async fn real_rpi_undo_retry_and_compact() {
     if !std::path::Path::new(RPI).exists() {
-        eprintln!("skipping: {RPI} is not installed");
+        skip_without_rpi(RPI);
         return;
     }
     let seen: Arc<Mutex<Vec<String>>> = Arc::default();
