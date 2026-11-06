@@ -261,11 +261,23 @@ fn log_path(cfg: &Config, id: i64) -> PathBuf {
     cfg.home.join(".procs").join(format!("{id}.log"))
 }
 
+/// The most a command's log holds, the note that it was cut included (`WRAPPER`).
+const LOG_CAP: u64 = 50 * 1024 * 1024;
+
 /// Runs `$0` (the command) and records its exit code in `$1` once it ends, so a daemon that is not
-/// its parent (after a crash) still learns it. Both are arguments, never spliced into the script.
+/// its parent (after a crash) still learns it. All are arguments, never spliced into the script.
 /// The outer `bash` stays the process-group leader and keeps the command's exit code.
-const WRAPPER: &str =
-    r#"bash -c "$0"; s=$?; echo "$s" > "$1.tmp" && mv -f "$1.tmp" "$1"; exit "$s""#;
+/// The output goes through `head`, so the log stays within `$2` bytes (`LOG_CAP`): what is past
+/// it is counted and dropped, and the command keeps running. Unbuffered (`stdbuf`), so the log
+/// shows output as it comes. A process substitution, not a pipe: a server the command leaves in
+/// the background may hold its output open, and the wrapper waits at most a second for it.
+const WRAPPER: &str = concat!(
+    r#"exec 3> >(stdbuf -o0 head -c "$(($2 - 200))"; n=$(wc -c); [ "$n" -gt 0 ] && "#,
+    r#"printf '\n[zephyr: the log stops here; %s more bytes of output were dropped]\n' "$n"); "#,
+    r#"o=$!; bash -c "$0" >&3 2>&3 3>&-; s=$?; exec 3>&-; "#,
+    r#"for _ in {1..50}; do kill -0 "$o" 2>/dev/null || break; sleep 0.02; done; "#,
+    r#"echo "$s" > "$1.tmp" && mv -f "$1.tmp" "$1"; exit "$s""#,
+);
 
 /// The exit code the wrapper recorded for the command logging to `log`, read as the agent.
 fn recorded_exit(log: &Path) -> Option<i32> {
@@ -296,6 +308,7 @@ fn spawn(
     let mut cmd = tokio::process::Command::new("bash");
     cmd.args(["-c", WRAPPER, command])
         .arg(&exit)
+        .arg(LOG_CAP.to_string())
         .current_dir(&cfg.home)
         .stdin(std::process::Stdio::null())
         .stdout(file.try_clone()?)
@@ -713,6 +726,7 @@ mod tests {
         let child = std::process::Command::new("bash")
             .args(["-c", WRAPPER, script])
             .arg(log.with_extension("exit"))
+            .arg(LOG_CAP.to_string())
             .stdout(file)
             .process_group(0)
             .spawn()
@@ -793,6 +807,7 @@ mod tests {
             let mut child = std::process::Command::new("bash")
                 .args(["-c", WRAPPER, script])
                 .arg(log.with_extension("exit"))
+                .arg(LOG_CAP.to_string())
                 .process_group(0)
                 .spawn()
                 .unwrap();
@@ -808,6 +823,7 @@ mod tests {
         let mut child = std::process::Command::new("bash")
             .args(["-c", WRAPPER, "sleep 30"])
             .arg(log.with_extension("exit"))
+            .arg(LOG_CAP.to_string())
             .process_group(0)
             .spawn()
             .unwrap();
@@ -816,6 +832,59 @@ mod tests {
         unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
         child.wait().unwrap();
         assert_eq!(recorded_exit(&log), None);
+    }
+
+    #[test]
+    fn the_log_stops_at_its_cap_with_a_note_and_the_exit_code_is_kept() {
+        let dir = crate::test_dir("procs-cap");
+        let log = dir.join("1.log");
+        let script = "head -c 100000 /dev/zero | tr '\\0' x; echo; echo late >&2; exit 5";
+        let status = std::process::Command::new("bash")
+            .args(["-c", WRAPPER, script])
+            .arg(log.with_extension("exit"))
+            .arg("4096")
+            .stdout(std::fs::File::create(&log).unwrap())
+            .process_group(0)
+            .status()
+            .unwrap();
+        assert_eq!((status.code(), recorded_exit(&log)), (Some(5), Some(5)));
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.len() <= 4096, "{} bytes", text.len());
+        assert!(text.starts_with("xxxx"), "{text}");
+        let dropped = 100000 + 1 + 5 - (4096 - 200);
+        let note =
+            format!("[zephyr: the log stops here; {dropped} more bytes of output were dropped]\n");
+        assert!(text.ends_with(&note), "{text}");
+        // Under the cap, the log is the output, as before.
+        let status = std::process::Command::new("bash")
+            .args(["-c", WRAPPER, "echo hi; echo err >&2"])
+            .arg(dir.join("2.exit"))
+            .arg("4096")
+            .stdout(std::fs::File::create(dir.join("2.log")).unwrap())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let text = std::fs::read_to_string(dir.join("2.log")).unwrap();
+        assert_eq!(text, "hi\nerr\n");
+        // A server left in the background holds the output open: the wrapper does not wait on it.
+        let start = Instant::now();
+        let mut child = std::process::Command::new("bash")
+            .args(["-c", WRAPPER, "sleep 30 & echo up"])
+            .arg(dir.join("3.exit"))
+            .arg("4096")
+            .stdout(std::fs::File::create(dir.join("3.log")).unwrap())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("3.log")).unwrap(), "up\n");
+        // SAFETY: a plain syscall on the group this test just made.
+        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
     }
 
     #[tokio::test]
@@ -832,11 +901,12 @@ mod tests {
         let out = std::process::Command::new("bash")
             .args([
                 "-c",
-                r#"setsid bash -c "$0" "$1" "$2" > "$3" 2>&1 & echo $!"#,
+                r#"setsid bash -c "$0" "$1" "$2" "$3" > "$4" 2>&1 & echo $!"#,
                 WRAPPER,
                 "sleep 1; echo orphan",
             ])
             .arg(log.with_extension("exit"))
+            .arg(LOG_CAP.to_string())
             .arg(&log)
             .output()
             .unwrap();
