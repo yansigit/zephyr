@@ -481,28 +481,55 @@ pub fn edit<T>(path: &Path, f: impl FnOnce(&mut Vault) -> anyhow::Result<T>) -> 
 /// shortcut: such a value is shown as is; refuse to save it if that ever matters.
 const MIN_SCRUB: usize = 4;
 
-/// `text` with every value in `secrets` replaced by `[vault:NAME]`, longest first.
+/// `text` with every value in `secrets` replaced by `[vault:NAME]`, longest first, and so its
+/// base64 forms (`curl -u x:$TOKEN -v` prints one); then any run of 8 or more characters of
+/// either, as a cut-off or partial print leaves, masked as `auth::redact` masks a login's echo.
 pub fn scrub(text: &str, secrets: &[(String, String)]) -> String {
-    let mut by_len: Vec<&(String, String)> = secrets
-        .iter()
-        .filter(|(_, v)| v.len() >= MIN_SCRUB)
-        .collect();
-    by_len.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+    let mut forms: Vec<(&str, String)> = Vec::new();
+    for (name, v) in secrets.iter().filter(|(_, v)| v.len() >= MIN_SCRUB) {
+        forms.push((name.as_str(), v.clone()));
+        forms.extend(base64_forms(v).into_iter().map(|f| (name.as_str(), f)));
+    }
+    forms.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
     let mut out = text.to_string();
-    for (name, v) in by_len {
+    for (name, v) in &forms {
         if out.contains(v.as_str()) {
             out = out.replace(v.as_str(), &format!("[vault:{name}]"));
+        }
+    }
+    let all: Vec<String> = forms.into_iter().map(|(_, v)| v).collect();
+    crate::auth::redact(&out, &all)
+}
+
+/// The base64 text `value` always turns into, standard and URL-safe, wherever it sits in the
+/// encoded bytes (`user:value` puts it at another offset): at each of the three byte alignments,
+/// the characters that depend on `value` alone. A form shorter than 8 characters could be anything.
+fn base64_forms(value: &str) -> Vec<String> {
+    use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+    use base64::Engine;
+    let mut out = Vec::new();
+    for k in 0..3 {
+        let mut bytes = vec![0u8; k];
+        bytes.extend_from_slice(value.as_bytes());
+        // Character i holds bits 6i..6i+6; keep those inside the value's bits 8k..8(k+n).
+        let (first, end) = ((8 * k).div_ceil(6), 8 * bytes.len() / 6);
+        for engine in [&STANDARD_NO_PAD, &URL_SAFE_NO_PAD] {
+            let text = engine.encode(&bytes);
+            if end >= first + 8 && !out.contains(&text[first..end].to_string()) {
+                out.push(text[first..end].to_string());
+            }
         }
     }
     out
 }
 
 /// [`scrub`] with the vault as it is now. A command re-adopted after a re-exec is scrubbed this
-/// way too: no value is ever kept anywhere but the vault file.
+/// way too: no value is ever kept anywhere but the vault file. Fails closed: output the vault
+/// cannot be checked against is not shown.
 pub fn scrubbed(cfg: &Config, text: String) -> String {
     match Vault::load(&path(cfg)) {
         Ok(v) => scrub(&text, &v.secrets()),
-        Err(_) => text,
+        Err(_) => "[output withheld: the vault could not be read]".into(),
     }
 }
 
@@ -706,14 +733,15 @@ fn request(store: &Store, name: &str, kind: &str, site: Option<&str>, why: &str)
             )
         }
     };
+    // The agent's words, marked as such and on this one line, so they cannot pass as zephyr's.
     let why: String = why.split_whitespace().collect::<Vec<_>>().join(" ");
     let why = match why.chars().take(200).collect::<String>() {
         w if w.is_empty() => String::new(),
-        w => format!(" ({w})"),
+        w => format!(" The agent says: \"{w}\""),
     };
     let text = format!(
-        "[zephyr] the agent asks you to save {what}{why}: {tui} in zephyr attach, or `{host}` on \
-         the host. Never paste it into the chat."
+        "[zephyr] the agent asks you to save {what}: {tui} in zephyr attach, or `{host}` on the \
+         host. Never paste it into the chat.{why}"
     );
     match store.notify_last_owner(&text) {
         Ok(()) => "asked the owner to save it. Tell them and end your turn: a save in zephyr \
@@ -971,6 +999,45 @@ programs = ["gh"]
             scrub("abcdefgh and abcd and xy", &secrets),
             "[vault:B] and [vault:A] and xy"
         );
+    }
+
+    #[test]
+    fn scrub_masks_encoded_and_partial_prints() {
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE};
+        use base64::Engine;
+        let token = "ghp_s3cret?Token>42";
+        let secrets = vec![("GH_TOKEN".to_string(), token.to_string())];
+        for user in ["x", "ab", "abc", ""] {
+            for b64 in [
+                STANDARD.encode(format!("{user}:{token}")),
+                URL_SAFE.encode(token),
+            ] {
+                let out = scrub(&format!("> Authorization: Basic {b64}\n"), &secrets);
+                assert!(out.contains("[vault:GH_TOKEN]"), "{out}");
+                // What is left decodes to no more than a few bits of the token.
+                let rest = out.replace("[vault:GH_TOKEN]", "");
+                assert!(!rest.contains(&b64[b64.len() / 2..]), "{out}");
+            }
+        }
+        // A print cut off partway, or a piece of the value, is masked too.
+        let out = scrub("token=ghp_s3cre (truncated)", &secrets);
+        assert_eq!(out, "token=[redacted] (truncated)");
+        assert_eq!(scrub("cret?Token>", &secrets), "[redacted]");
+        assert_eq!(scrub("ghp_ and Token", &secrets), "ghp_ and Token");
+    }
+
+    #[test]
+    fn scrubbed_withholds_output_when_the_vault_cannot_be_read() {
+        let dir = crate::test_dir("vault-broken");
+        let cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = {dir:?}\n")).unwrap();
+        std::fs::write(
+            path(&cfg),
+            "[[token]]\nname = \"A\"\nvalue = \"s3cret\" x\n",
+        )
+        .unwrap();
+        let out = scrubbed(&cfg, "the value is s3cret".into());
+        assert_eq!(out, "[output withheld: the vault could not be read]");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
