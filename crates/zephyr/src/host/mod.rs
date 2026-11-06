@@ -39,11 +39,6 @@ const LOCAL: &str = "zephyr-local:";
 /// This CLI's version, and the image it runs by default.
 const ME: &str = env!("CARGO_PKG_VERSION");
 
-/// The agent's PATH, which the image's own `ENV PATH` (root's) no longer carries.
-/// Kept in step with `agent::AGENT_PATH`, the daemon's copy.
-const AGENT_PATH: &str =
-    "/zephyr/.local/bin:/opt/zephyr/py/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-
 /// The daemon's config files a rollback restores with state.db: an older daemon refuses keys it
 /// does not know.
 const ROLLED_BACK: [&str; 3] = ["zephyr.toml", "vault.toml", "host.toml"];
@@ -169,7 +164,8 @@ impl Host {
     ) -> Command {
         let ids = agent_ids();
         let user = format!("{}:{}", ids.0, ids.1);
-        let path = format!("PATH={AGENT_PATH}");
+        // The image's `ENV PATH` is root's; the agent's adds its own bin folder.
+        let path = format!("PATH={}", crate::agent::AGENT_PATH);
         let flags = [&["-u", &user, "-w", "/zephyr", "-e", &path], flags].concat();
         self.exec(&flags, env, argv)
     }
