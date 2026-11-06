@@ -21,7 +21,8 @@ pub fn rate_limit(error: &str) -> Option<Option<i64>> {
             .and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok());
         return Some(resets);
     }
-    // `429|rate.?limit|usage limit|quota|too many requests`, case-insensitive.
+    // `\b429\b|rate.?limit|usage limit|quota|too many requests`, case-insensitive; 429 only as a
+    // whole token, so "204290 tokens" or task #1429 is not one.
     let rate_limit = lower.match_indices("rate").any(|(i, _)| {
         let rest = &lower[i + 4..];
         rest.starts_with("limit")
@@ -31,7 +32,10 @@ pub fn rate_limit(error: &str) -> Option<Option<i64>> {
                 .is_some_and(|c| rest[c.len_utf8()..].starts_with("limit"))
     });
     let hit = rate_limit
-        || ["429", "usage limit", "quota", "too many requests"]
+        || lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|w| w == "429")
+        || ["usage limit", "quota", "too many requests"]
             .iter()
             .any(|p| lower.contains(p));
     hit.then_some(None)
@@ -201,6 +205,8 @@ mod tests {
             "You have hit your usage limit",
             "insufficient_quota",
             "Too Many Requests",
+            "HTTP 429",
+            "status=429",
         ] {
             assert_eq!(rate_limit(text), Some(None), "{text}");
         }
@@ -209,6 +215,9 @@ mod tests {
             "rate of change",
             "limit reached",
             "500 server error",
+            "prompt is too long: 204290 tokens",
+            "task #1429 failed: boom",
+            "error 4290",
         ] {
             assert_eq!(rate_limit(text), None, "{text}");
         }

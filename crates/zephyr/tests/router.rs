@@ -1323,6 +1323,53 @@ async fn a_rate_limited_job_retries_on_the_next_account() {
     gw.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_message_rate_limited_on_five_accounts_gets_an_answer_not_a_sixth_try() {
+    let home = home("failover-cap");
+    let mut cfg = config(&home);
+    let reset = zephyr::now() + 3600;
+    cfg.accounts = (1..=6)
+        .map(|i| {
+            let name = format!("a{i}");
+            rate_limit(&home, &name, &format!("rate_limited; resets_at={reset}"));
+            zephyr::config::Account {
+                name,
+                model: format!("p{i}/m"),
+            }
+        })
+        .collect();
+    let gw = start(cfg);
+    gw.say("m1", "owner", "hi").await;
+    let answer = "[zephyr] the run ended without a reply".to_string();
+    wait(|| gw.replies().contains(&answer)).await;
+    assert_eq!(inbox_status(&home, "done"), 1);
+    assert_eq!(log(&home, "prompt").len(), 5);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_job_whose_label_holds_429_failing_otherwise_cools_no_account() {
+    let home = home("job-429-label");
+    rate_limit(&home, "a", "prompt is too long: 204290 tokens");
+    let gw = start(pooled(&home));
+    // The run's label is "[zephyr] job #1 (429) run 1", as a task's is "task #429".
+    gw.say("m1", "owner", &format!("/job add 429 | {NEVER} | say: hi"))
+        .await;
+    gw.say("m2", "owner", "/job run 1").await;
+    wait(|| run_status(&home, "failed") == 1).await;
+    assert!(cooldowns(&home).is_empty());
+    let models: Vec<_> = log(&home, "start")
+        .iter()
+        .map(|s| s["model"].clone())
+        .collect();
+    assert_eq!(
+        models,
+        ["pa/m", "pa/m"],
+        "main, then the job, not re-run on b"
+    );
+    gw.shutdown().await;
+}
+
 /// A config loaded from `<home>/zephyr.toml`, so reloads have a file to read: accounts `a`
 /// (`fake/m1`) then `b` (`other/m3`), both models in the fake rpi's catalogue.
 fn on_file(home: &Path, extra: &str) -> Config {

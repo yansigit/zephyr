@@ -297,11 +297,12 @@ pub async fn execute(
         };
         // Only the first attempt reopens the stored session; a failover starts fresh.
         let resume = spec.resume && attempt == 0;
-        let (status, text, over) = attempt_once(cfg, store, spec, &session, account, resume).await;
+        let (status, text, over, error) =
+            attempt_once(cfg, store, spec, &session, account, resume).await;
         crossed |= over;
-        let limited = (status == "failed")
-            .then(|| crate::pool::rate_limit(&text))
-            .flatten();
+        // Only the run's own error: the label holds ids ("task #429") and a cut-short report
+        // holds the agent's words.
+        let limited = error.as_deref().and_then(crate::pool::rate_limit);
         let (Some(a), Some(resets_at)) = (account, limited) else {
             return (status, text, crossed);
         };
@@ -324,7 +325,7 @@ async fn attempt_once(
     session: &str,
     account: Option<&crate::config::Account>,
     resume: bool,
-) -> (&'static str, String, bool) {
+) -> (&'static str, String, bool, Option<String>) {
     let label = &spec.label;
     if let Some(id) = spec.task {
         // Recorded first, so a restart during this attempt resumes this session.
@@ -334,7 +335,14 @@ async fn attempt_once(
     }
     let mut child = match Child::spawn_as(cfg, Some(session), account).await {
         Ok(child) => child,
-        Err(e) => return ("failed", format!("{label} could not start: {e:#}"), false),
+        Err(e) => {
+            return (
+                "failed",
+                format!("{label} could not start: {e:#}"),
+                false,
+                None,
+            )
+        }
     };
     let limit = cfg.job_timeout;
     let max_turns = cfg.budget.as_ref().and_then(|b| b.run_turns);
@@ -344,13 +352,18 @@ async fn attempt_once(
         why = until_cut(store, spec.task) => Err(why),
     };
     // `cut_short`: stopped, paused, timed out or stalled, so it may have done some of the work.
+    let mut error = None;
     let (status, text, cut_short) = match ended {
         Ok(Ok(Ok(Ok(text)))) => ("completed", text, false),
         Ok(Ok(Ok(Err(why)))) => {
             let stalled = why.to_string().starts_with("stalled");
+            error = Some(format!("{why:#}"));
             ("failed", format!("{label} failed: {why:#}"), stalled)
         }
-        Ok(Ok(Err(why))) => ("failed", format!("{label} failed: {why:#}"), false),
+        Ok(Ok(Err(why))) => {
+            error = Some(format!("{why:#}"));
+            ("failed", format!("{label} failed: {why:#}"), false)
+        }
         cut => {
             let abort = child.call(json!({"type": "abort"}));
             let _ = tokio::time::timeout(Duration::from_secs(5), abort).await;
@@ -384,7 +397,7 @@ async fn attempt_once(
     crate::tools::apply(store, cfg, &tally.requests, Some(spec.to.clone()));
     let crossed = book(store, cfg, account, tally.used);
     child.stop().await;
-    (out.0, out.1, crossed)
+    (out.0, out.1, crossed, error)
 }
 
 /// The most a cut-short run's last message adds to its report, as `tasks::MAX_REPORT` is for a
