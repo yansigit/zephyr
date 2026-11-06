@@ -851,10 +851,21 @@ pub fn mcp_path(cfg: &Config) -> PathBuf {
 
 /// Where the daemon puts AGENTS.md when the agent runs on a uid of its own: in the parent of its
 /// home (`/` in the container), root's, which rpi loads as it walks up from its working
-/// directory. `None` outside the container, where that parent is no one's to write.
+/// directory. `None` outside the container, and when that parent is not the daemon's alone (a
+/// doctor probe's home in `/tmp`): AGENTS.md then stays in the home, as it was before.
 fn owner_agents_md(cfg: &Config) -> Option<PathBuf> {
     crate::agent::ids()?;
-    Some(cfg.home.parent()?.join("AGENTS.md"))
+    let parent = cfg.home.parent()?;
+    daemons_alone(parent).then(|| parent.join("AGENTS.md"))
+}
+
+/// `dir` is a real folder of this process's uid that no one else may write.
+fn daemons_alone(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    dir.symlink_metadata()
+        .is_ok_and(|m| m.is_dir() && m.uid() == me && m.mode() & 0o022 == 0)
 }
 
 /// What `<home>/AGENTS.md` says when the real one is root's (`owner_agents_md`).
@@ -864,14 +875,12 @@ const AGENTS_STUB: &str = "# AGENTS.md\n\nZephyr writes your standing instructio
 /// Writes `text` to `path` as the daemon, readable by all (0644), in a folder only the daemon may
 /// write: what the agent may read but must not change.
 fn write_public(path: &Path, text: &str) -> anyhow::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let dir = path.parent().context("no folder")?;
     if !dir.exists() {
         std::fs::DirBuilder::new().mode(0o755).create(dir)?;
     }
-    let meta = dir.symlink_metadata()?;
-    // SAFETY: geteuid takes no arguments and cannot fail.
-    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+    if !daemons_alone(dir) {
         bail!("{} is not a folder only zephyr may write", dir.display());
     }
     let name = path.file_name().context("no file name")?.to_string_lossy();

@@ -736,7 +736,9 @@ fn a_reexec_waits_for_the_running_reply() {
     let text = std::fs::read_to_string(&cfg).unwrap();
     std::fs::write(&cfg, format!("{text}[owners]\nchat = [\"{uid}\"]\n")).unwrap();
     std::fs::write(home.join("secrets.env"), "ZEPHYR_CLI_RELOAD=one\n").unwrap();
-    std::fs::write(home.join("slow"), "3").unwrap();
+    // Long enough that "and this", sent right after the reload, lands while the run still goes;
+    // one that comes after the settle is kept for after the re-exec instead.
+    std::fs::write(home.join("slow"), "6").unwrap();
     let running = daemon(&cfg, &home);
     wait_for("the child has the secret", || {
         child_env(&home).contains("ZEPHYR_CLI_RELOAD=one")
