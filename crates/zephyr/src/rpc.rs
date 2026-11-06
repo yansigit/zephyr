@@ -450,7 +450,7 @@ impl Child {
         let Ok(written) = tokio::time::timeout_at(deadline, write).await else {
             self.pending.lock().unwrap().remove(&id);
             // A half-written line has broken the stream: end the child, whose exit the caller sees.
-            let _ = self.process.start_kill();
+            let _ = self.process.0.start_kill();
             bail!("{} timed out: rpi is not reading its input", cmd["type"]);
         };
         written?;
@@ -877,8 +877,8 @@ mod tests {
         let pid = std::fs::read_to_string(home.join("tool_pid")).unwrap();
         let stat = format!("/proc/{pid}/stat");
         assert!(std::fs::read_to_string(&stat).is_ok_and(|s| !s.contains(") Z ")));
-        drop(child); // as a re-exec drops a task's child
-                     // Gone, or a zombie until it is reaped: either way no longer running.
+        // As a re-exec drops a task's child. Then gone, or a zombie until reaped: not running.
+        drop(child);
         for _ in 0..100 {
             match std::fs::read_to_string(&stat) {
                 Ok(s) if !s.contains(") Z ") => {}
