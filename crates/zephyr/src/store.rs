@@ -655,6 +655,15 @@ impl Store {
         Ok(())
     }
 
+    /// A consistent copy of the whole store into `path`, which must not exist or be empty.
+    pub fn copy_into(&self, path: &Path) -> rusqlite::Result<()> {
+        let path = path
+            .to_str()
+            .ok_or(rusqlite::Error::InvalidPath(path.into()))?;
+        self.db.execute("VACUUM INTO ?1", [path])?;
+        Ok(())
+    }
+
     /// The UTC day, as `YYYY-MM-DD`.
     pub fn today(&self) -> rusqlite::Result<String> {
         self.db.query_row("SELECT date('now')", [], |r| r.get(0))
