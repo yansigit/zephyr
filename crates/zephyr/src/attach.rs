@@ -28,7 +28,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::OwnedReadHalf;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -38,6 +38,10 @@ pub const CHANNEL: &str = "tui";
 const SUB_ID: u64 = 1;
 const MAX_LINE: u64 = 1 << 20;
 const UNAUTHORIZED: i64 = -32001;
+/// Connections served at once; one more is closed as it arrives.
+const MAX_CONNS: usize = 32;
+/// How long a connection has to authenticate before it is closed.
+const AUTH_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What a connection asks of the router.
 pub enum AttachRequest {
@@ -88,9 +92,15 @@ pub async fn serve(
         .await
         .with_context(|| format!("binding attach port {}", a.port))?;
     eprintln!("zephyr: attach listening on {}", listener.local_addr()?);
+    // Anything on the host can connect (the agent too, under host networking): a cap, so idle
+    // sockets cannot use up the daemon's file descriptors, and `AUTH_WAIT` to authenticate.
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
+                let Ok(slot) = slots.clone().try_acquire_owned() else {
+                    continue; // dropped, so closed at once
+                };
                 let conn = Conn {
                     token: token.clone(),
                     snap: snap.clone(),
@@ -103,7 +113,10 @@ pub async fn serve(
                     models: None,
                     late: mpsc::channel(4),
                 };
-                tokio::spawn(conn.run(stream));
+                tokio::spawn(async move {
+                    conn.run(stream).await;
+                    drop(slot);
+                });
             }
             Err(e) => eprintln!("zephyr: attach accept failed: {e}"),
         }
@@ -134,12 +147,19 @@ struct Conn {
 type Reply = (Vec<Value>, bool);
 
 impl Conn {
-    async fn run(mut self, stream: TcpStream) {
-        let (read, mut write) = stream.into_split();
-        let (tx, mut lines) = mpsc::channel(16);
-        tokio::spawn(read_lines(read, tx));
+    async fn run(self, stream: TcpStream) {
+        let (read, write) = stream.into_split();
+        let (tx, lines) = mpsc::channel(16);
+        let reader = tokio::spawn(read_lines(read, tx));
+        self.talk(write, lines).await;
+        reader.abort(); // its half holds the socket open until the client sends again
+    }
+
+    async fn talk(mut self, mut write: OwnedWriteHalf, mut lines: mpsc::Receiver<Vec<u8>>) {
+        let deadline = tokio::time::Instant::now() + AUTH_WAIT;
         loop {
             let (frames, close) = tokio::select! {
+                () = tokio::time::sleep_until(deadline), if !self.authed => return,
                 line = lines.recv() => match line {
                     Some(line) => self.request(&line).await,
                     None => return, // client gone; the run carries on
