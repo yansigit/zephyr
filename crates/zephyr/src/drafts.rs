@@ -189,6 +189,10 @@ fn walk(dir: &Path, prefix: &str, files: &mut Files, total: &mut usize) -> anyho
         } else {
             format!("{prefix}/{name}")
         };
+        // Root's git in the skills repo would read one as an embedded repo with its own config.
+        if name.eq_ignore_ascii_case(".git") {
+            bail!("{rel}: a skill cannot hold a .git");
+        }
         let kind = entry.path().symlink_metadata()?.file_type();
         if kind.is_dir() {
             walk(&entry.path(), &rel, files, total)?;
@@ -721,7 +725,8 @@ fn write_files(dir: &Path, files: &Files) -> anyhow::Result<()> {
 }
 
 /// git as the daemon: `<state>/skills` is its own, never the agent's (memory's git is the agent's).
-/// By full path, so no PATH entry chooses which git root runs.
+/// By full path, so no PATH entry chooses which git root runs, and with no config or hook beyond
+/// its own repo's, which the daemon wrote.
 fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new("/usr/bin/git")
         .arg("-C")
@@ -731,7 +736,13 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
             "user.name=Zephyr",
             "-c",
             "user.email=zephyr@localhost",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
         ])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .args(args)
         .output()
         .context("running git")?;
@@ -1085,6 +1096,19 @@ mod tests {
         std::os::unix::fs::symlink("/etc/passwd", dir.join("link")).unwrap();
         assert!(refused(&dir, "ok-1").contains("symlink"));
         std::fs::remove_file(dir.join("link")).unwrap();
+
+        // An embedded repo, whose config root's git would obey, at any depth and in any case.
+        for git in [".git/config", "sub/.Git/config", ".git"] {
+            let path = dir.join(git);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "[core]\n\tfsmonitor = touch /tmp/pwned\n").unwrap();
+            assert!(
+                refused(&dir, "ok-1").contains("cannot hold a .git"),
+                "{git}"
+            );
+            let top = dir.join(git.split('/').next().unwrap());
+            let _ = std::fs::remove_dir_all(&top).or_else(|_| std::fs::remove_file(&top));
+        }
 
         for i in 0..MAX_FILES {
             std::fs::write(dir.join(format!("f{i}")), "x").unwrap();
