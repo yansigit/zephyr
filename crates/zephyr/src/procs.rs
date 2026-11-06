@@ -149,6 +149,38 @@ impl Procs {
         running.len()
     }
 
+    /// `/stop`, `/pause` and a main child restart: kills the agent's processes that nothing live
+    /// accounts for, the ones that left their process group (`setsid`, a double fork) and so
+    /// outlived the kill of their command or child. Spared: whatever descends from this daemon
+    /// (the rpi children of main, tasks and jobs, the desktop it started, the commands it runs as
+    /// the agent), from a tracked command, or from the desktop, and what is outside `scope` (a
+    /// `docker exec` into the container). Returns how many were killed.
+    pub fn kill_strays(&self) -> usize {
+        // In the container the agent's uid is its own; outside, only a test's scope is swept.
+        let (uid, scope) = match crate::agent::ids() {
+            Some((uid, _)) => (uid, 1),
+            None => match std::env::var("ZEPHYR_STRAY_SCOPE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
+                // SAFETY: getuid has no arguments and cannot fail.
+                Some(scope) => (unsafe { libc::getuid() }, scope),
+                None => return 0,
+            },
+        };
+        let mut keep = vec![std::process::id() as i32];
+        keep.extend(self.running.lock().unwrap().values().map(|h| h.pgid));
+        let found = strays(&processes(), uid, scope, &keep);
+        let killed = found
+            .iter()
+            .filter(|(pid, ticks)| kill_exact(*pid, *ticks))
+            .count();
+        if killed > 0 {
+            eprintln!("zephyr: killed {killed} stray process(es) of the agent");
+        }
+        killed
+    }
+
     /// Startup: takes over the commands a re-exec handed over alive, and reports the rest
     /// `unknown`. A pid whose start time no longer matches was reused by something else: it is
     /// neither adopted nor signalled.
@@ -483,6 +515,94 @@ fn start_ticks(pid: i32) -> Option<i64> {
     after.split_whitespace().nth(19)?.parse().ok()
 }
 
+/// A process as `/proc` shows it.
+struct Ps {
+    ppid: i32,
+    uid: u32,
+    ticks: i64,
+    comm: String,
+}
+
+/// Every process now, by pid. One that ends while it is read is left out.
+fn processes() -> HashMap<i32, Ps> {
+    let mut all = HashMap::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
+            continue;
+        };
+        let read = || -> Option<Ps> {
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
+            let (open, close) = (stat.find('(')?, stat.rfind(')')?);
+            let mut after = stat[close + 1..].split_whitespace();
+            let uid = status.lines().find_map(|l| l.strip_prefix("Uid:"))?;
+            Some(Ps {
+                ppid: after.nth(1)?.parse().ok()?,
+                ticks: after.nth(17)?.parse().ok()?,
+                uid: uid.split_whitespace().next()?.parse().ok()?,
+                comm: stat[open + 1..close].to_string(),
+            })
+        };
+        if let Some(p) = read() {
+            all.insert(pid, p);
+        }
+    }
+    all
+}
+
+/// The desktop's programs (`desktop::ensure`), which a crashed daemon leaves running.
+const DESKTOP: [&str; 2] = ["Xvfb", "openbox"];
+
+/// `(pid, start ticks)` of each process of `uid` whose parents lead to `scope` without passing
+/// one of `keep` or the desktop. A chain that breaks (a parent not in `all`) is spared.
+fn strays(all: &HashMap<i32, Ps>, uid: u32, scope: i32, keep: &[i32]) -> Vec<(i32, i64)> {
+    let stray = |mut pid: i32| {
+        for _ in 0..all.len() {
+            let Some(p) = all.get(&pid) else {
+                return false;
+            };
+            if keep.contains(&pid) || DESKTOP.contains(&p.comm.as_str()) {
+                return false;
+            }
+            if p.ppid == scope {
+                return true;
+            }
+            pid = p.ppid;
+        }
+        false
+    };
+    (all.iter())
+        .filter(|(pid, p)| p.uid == uid && stray(**pid))
+        .map(|(pid, p)| (*pid, p.ticks))
+        .collect()
+}
+
+/// SIGKILLs `pid` only if it still has the start time `ticks`: a reused pid is left alone.
+fn kill_exact(pid: i32, ticks: i64) -> bool {
+    // The pidfd first, as in `adopt`: it pins the process the start-time check is about.
+    // SAFETY: a plain syscall; the fd it returns is ours to own.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: a fresh fd from pidfd_open, owned by nothing else.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    if start_ticks(pid) != Some(ticks) {
+        return false;
+    }
+    // SAFETY: a plain syscall on a live pidfd with no siginfo.
+    let sent = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    sent == 0
+}
+
 /// `(status, what to say)` for a command that ended.
 fn ended(s: &std::io::Result<std::process::ExitStatus>, h: &Handle) -> (&'static str, String) {
     match s {
@@ -776,6 +896,37 @@ mod tests {
             "{rows:?}"
         );
         assert!(rows[0].text.contains("> built"), "{rows:?}");
+    }
+
+    #[test]
+    fn a_stray_is_an_agent_process_under_scope_that_nothing_live_leads_to() {
+        let ps = |ppid, uid, comm: &str| Ps {
+            ppid,
+            uid,
+            ticks: 7,
+            comm: comm.into(),
+        };
+        // 1 init, 10 the daemon (root), 20 its rpi child, 30 a tracked command, 50 the desktop
+        // a crashed daemon left, 60 a `docker exec` shell, 0 its parent outside the namespace.
+        let all = HashMap::from([
+            (1, ps(0, 0, "init")),
+            (10, ps(1, 0, "zephyr")),
+            (20, ps(10, 9, "rpi")),
+            (21, ps(20, 9, "bash")),
+            (30, ps(1, 9, "bash")),
+            (31, ps(30, 9, "sleep")),
+            (40, ps(1, 9, "sleep")),
+            (41, ps(40, 9, "sh")),
+            (50, ps(1, 9, "Xvfb")),
+            (51, ps(50, 9, "xkbcomp")),
+            (60, ps(0, 9, "bash")),
+            (61, ps(60, 9, "sleep")),
+            (70, ps(1, 8, "someone")),
+            (80, ps(99, 9, "orphan")), // its parent ended while /proc was read
+        ]);
+        let mut found = strays(&all, 9, 1, &[10, 30]);
+        found.sort();
+        assert_eq!(found, [(40, 7), (41, 7)]);
     }
 
     #[test]
