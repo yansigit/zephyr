@@ -1,6 +1,7 @@
 //! Host-side commands: set up `~/.zephyr` and drive the `zephyr` container through the docker CLI.
 //! Inside the container the same binary runs the daemon commands instead (see `in_container`).
 
+mod alert;
 pub mod conf;
 mod setup;
 
@@ -27,6 +28,7 @@ pub const USAGE: &str = "usage: zephyr <command>   (zephyr --version: this CLI's
   config get|set KEY [VALUE]
   chat | attach [--stock] | shell [bash|zsh] | pause | resume | reload
   doctor [--fix]
+  alert setup TOPIC [--server URL] | check | test | off
   uninstall [--keep-data] [--yes]
 env: ZEPHYR_CONTAINER (default zephyr), ZEPHYR_IMAGE, ZEPHYR_SRC (for --build); data in ~/.zephyr";
 
@@ -43,7 +45,7 @@ const ME: &str = env!("CARGO_PKG_VERSION");
 /// does not know.
 const ROLLED_BACK: [&str; 3] = ["zephyr.toml", "vault.toml", "host.toml"];
 
-const COMMANDS: [&str; 25] = [
+const COMMANDS: [&str; 26] = [
     "init",
     "up",
     "down",
@@ -69,6 +71,7 @@ const COMMANDS: [&str; 25] = [
     "packages",
     "vault",
     "subagent",
+    "alert",
 ];
 
 /// The image sets ZEPHYR_IN_CONTAINER. ZEPHYR_CONFIG (set in the image and by tests) also points
@@ -1327,6 +1330,7 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
         "packages" => setup::packages(&h, a),
         "vault" => setup::vault(&h, a),
         "subagent" => setup::subagent(&h, a),
+        "alert" => alert::main(&h, a),
         _ => bail!("{USAGE}"),
     }
 }

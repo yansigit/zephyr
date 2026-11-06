@@ -224,6 +224,16 @@ impl Data {
         self.write("host.toml", &doc.to_string())
     }
 
+    /// `[alert]` in `host.toml`: where `zephyr alert check` posts (an ntfy server and topic).
+    pub fn set_alert(&self, topic: &str, server: &str) -> anyhow::Result<()> {
+        let mut doc = self.host_doc()?.unwrap_or_default();
+        let mut alert = Table::new();
+        alert["topic"] = value(topic);
+        alert["server"] = value(server);
+        doc["alert"] = Item::Table(alert);
+        self.write("host.toml", &doc.to_string())
+    }
+
     /// `packages` from `host.toml`: the apt packages `zephyr packages` bakes into a local image.
     pub fn packages(&self) -> anyhow::Result<Vec<String>> {
         let doc = self.host_doc()?.unwrap_or_default();
