@@ -258,7 +258,22 @@ pub struct Child {
     stdin: ChildStdin,
     pending: Pending,
     next_id: u64,
-    process: tokio::process::Child,
+    process: Group,
+}
+
+/// The rpi process, which leads its own group (`spawn_as`). Dropped before it is reaped (a task's
+/// child at a re-exec, say), it takes the whole group with it: the tools it started, a build or a
+/// dev server, would otherwise run on as orphans beside the run that resumes.
+struct Group(tokio::process::Child);
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        // Not yet reaped, so the pid is still this group's and cannot have been reused.
+        if let Some(pid) = self.0.id() {
+            // SAFETY: a plain syscall.
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        }
+    }
 }
 
 impl Child {
@@ -395,7 +410,7 @@ impl Child {
             stdin,
             pending,
             next_id: 0,
-            process,
+            process: Group(process),
         };
         if cfg.policy_plugin.is_some() {
             let listed = child.call(json!({"type": "get_commands"})).await?;
@@ -450,7 +465,7 @@ impl Child {
     }
 
     pub fn pid(&self) -> Option<u32> {
-        self.process.id()
+        self.process.0.id()
     }
 
     /// `stop` lets rpi drain its session; then wait for the process to exit.
@@ -458,12 +473,8 @@ impl Child {
         let _ =
             tokio::time::timeout(Duration::from_secs(5), self.call(json!({"type": "stop"}))).await;
         drop(self.stdin);
-        if tokio::time::timeout(Duration::from_secs(10), self.process.wait())
-            .await
-            .is_err()
-        {
-            let _ = self.process.kill().await;
-        }
+        // Past that, dropping `self.process` kills its group.
+        let _ = tokio::time::timeout(Duration::from_secs(10), self.process.0.wait()).await;
     }
 }
 
@@ -850,5 +861,28 @@ mod tests {
             .flat_map(|p| ["--extension".to_string(), p.display().to_string()])
             .collect();
         assert_eq!(argv[at..], want[..]);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_child_takes_the_tools_it_started_with_it() {
+        let home = crate::test_dir("rpc-drop-group");
+        std::fs::write(home.join("tool_sleep"), "").unwrap();
+        let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-rpi.py");
+        let cfg: Config =
+            toml::from_str(&format!("rpi = {fake:?}\nhome = {:?}\n", home.display())).unwrap();
+        let child = Child::spawn(&cfg, "task-1").await.unwrap();
+        let pid = std::fs::read_to_string(home.join("tool_pid")).unwrap();
+        let stat = format!("/proc/{pid}/stat");
+        assert!(std::fs::read_to_string(&stat).is_ok_and(|s| !s.contains(") Z ")));
+        drop(child); // as a re-exec drops a task's child
+                     // Gone, or a zombie until it is reaped: either way no longer running.
+        for _ in 0..100 {
+            match std::fs::read_to_string(&stat) {
+                Ok(s) if !s.contains(") Z ") => {}
+                _ => return,
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the tool {pid} is still running");
     }
 }

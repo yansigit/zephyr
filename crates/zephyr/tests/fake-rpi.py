@@ -20,7 +20,8 @@ Accounts: each start logs {"type": "start", "agentDir", "model"} to ./log.jsonl.
 `rate_limited` file in $RPI_CODING_AGENT_DIR holds an error text: every prompt then ends with
 that error (stopReason "error", settle outcome "failed"), as a rate-limited provider does.
 A prompt containing WRITE_MEMORY first writes memory/MEMORY.md under the home.
-argv.json holds the argv of the latest start.
+argv.json holds the argv of the latest start. With a `tool_sleep` file in the home, each start
+leaves a `sleep 300` running in its process group, as a tool would, its pid in `tool_pid`.
 A prompt containing `bash: CMD` first reports a bash tool call running CMD (tool_execution_start).
 With `--no-tools` (a /btw child) none of the tool markers below (`bash: `, `[tool]`, `[call ...]`)
 runs anything, so its prompt is echoed whole; with `--no-session` there is no session file (the
@@ -167,6 +168,9 @@ json.dump(args, open(os.path.join(home, "argv.json"), "w"))  # the flags this ch
 open(os.path.join(home, "log.jsonl"), "a").write(json.dumps(
     {"type": "start", "agentDir": os.environ.get("RPI_CODING_AGENT_DIR"), "model": opt("--model"),
      "sessionId": opt("--session-id"), "noSession": ephemeral, "noTools": not tools}) + "\n")
+if os.path.exists(os.path.join(home, "tool_sleep")):  # a tool left running in the child's group
+    import subprocess
+    open(os.path.join(home, "tool_pid"), "w").write(str(subprocess.Popen(["sleep", "300"]).pid))
 if os.path.isdir(os.environ.get("RPI_CODING_AGENT_DIR") or ""):  # which account started, for tests whose home is temporary
     open(os.path.join(os.environ["RPI_CODING_AGENT_DIR"], "starts.log"), "a").write("%s\n" % opt("--model"))
 
