@@ -1108,21 +1108,23 @@ impl<'a> Router<'a> {
         if m.text.trim().is_empty() {
             return; // attachment-only messages are not handled in v1
         }
-        let id = match self.store.insert_inbox(&m) {
+        // Decided before the write: a crash in between must not leave a stranger's row `new`.
+        let owner = self.cfg.is_owner(&m.channel, &m.sender);
+        let status = if owner { "new" } else { "dropped" };
+        let id = match self.store.insert_inbox_as(&m, status) {
             Ok(Some(id)) => id,
             Ok(None) => return, // duplicate platform id
             Err(e) => return eprintln!("zephyr: inbox write failed: {e}"),
         };
-        if after {
-            log(self.store.deliver_after(id).map_err(Into::into));
-        }
-        if !self.cfg.is_owner(&m.channel, &m.sender) {
+        if !owner {
             eprintln!(
                 "zephyr: dropped message {id} from unknown sender {:?} on {}",
                 m.sender, m.channel
             );
-            log(self.store.set_status(id, "dropped").map_err(Into::into));
             return;
+        }
+        if after {
+            log(self.store.deliver_after(id).map_err(Into::into));
         }
         let decided = crate::tools::decide(&self.store, m.text.trim());
         // An approved proposal runs exactly as if the owner had typed it.

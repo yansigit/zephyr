@@ -417,6 +417,16 @@ impl Store {
         Ok((n == 1).then(|| self.db.last_insert_rowid()))
     }
 
+    /// As `insert_inbox`, with the status in the same statement: a stranger's row is never `new`.
+    pub fn insert_inbox_as(&self, m: &Inbound, status: &str) -> rusqlite::Result<Option<i64>> {
+        let n = self.db.execute(
+            "INSERT OR IGNORE INTO inbox(channel, platform_msg_id, sender, text, status)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![m.channel, m.platform_msg_id, m.sender, m.text, status],
+        )?;
+        Ok((n == 1).then(|| self.db.last_insert_rowid()))
+    }
+
     /// Makes a `new` row a follow-up: it waits for the run to settle (DESIGN §4.1).
     pub fn deliver_after(&self, id: i64) -> rusqlite::Result<()> {
         self.db.execute(
