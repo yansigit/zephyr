@@ -93,7 +93,9 @@ impl Channel for ChatChannel {
             Some(name) => format!("{}\n[file] {}", msg.text, name.to_string_lossy()),
             None => msg.text.clone(),
         };
-        let mut line = serde_json::to_vec(&json!({"id": msg.client_id, "text": text}))?;
+        // `re`: the message this answers (null for a notice), so `ask` skips other lines.
+        let line = json!({"id": msg.client_id, "text": text, "re": msg.reply_to});
+        let mut line = serde_json::to_vec(&line)?;
         line.push(b'\n');
         let mut delivered = false;
         let mut conns = self.conns.lock().await;
@@ -170,6 +172,7 @@ mod tests {
             client_id: "z1".into(),
             text: "x".repeat(4 << 20), // more than the socket buffers hold
             attachment: None,
+            reply_to: None,
         };
         let sent = tokio::time::timeout(std::time::Duration::from_secs(5), chat.send(&msg)).await;
         assert!(sent.expect("send returned").is_err(), "nothing was read");

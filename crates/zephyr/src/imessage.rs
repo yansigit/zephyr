@@ -890,6 +890,7 @@ mod tests {
             client_id: "client-1".into(),
             text: "hi there".into(),
             attachment: None,
+            reply_to: None,
         }
     }
 

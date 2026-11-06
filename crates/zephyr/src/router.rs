@@ -2509,6 +2509,7 @@ impl<'a> Router<'a> {
                 client_id: row.client_id,
                 text: row.text,
                 attachment: row.attachment.clone().map(Into::into),
+                reply_to: row.reply_to,
             };
             let sent = match tokio::time::timeout(SEND_TIMEOUT, channel.send(&msg)).await {
                 Ok(sent) => sent,

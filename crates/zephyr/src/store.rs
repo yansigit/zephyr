@@ -35,6 +35,8 @@ pub struct OutboxRow {
     pub prompt: Option<String>,
     /// A file to send with `text` (the agent's `send_file`), a copy owned by the daemon.
     pub attachment: Option<String>,
+    /// The `platform_msg_id` of the inbox row this answers; `None` for a notice.
+    pub reply_to: Option<String>,
 }
 
 /// The platform dedupe key for a reply: at most 20 ASCII chars, so Discord's 25-char
@@ -554,7 +556,8 @@ impl Store {
     pub fn pending_outbox(&self) -> rusqlite::Result<Vec<OutboxRow>> {
         let mut stmt = self.db.prepare(
             "SELECT id, channel, recipient, client_id, text, created_at,
-                    (SELECT text FROM inbox WHERE inbox.id = outbox.inbox_id), attachment
+                    (SELECT text FROM inbox WHERE inbox.id = outbox.inbox_id), attachment,
+                    (SELECT platform_msg_id FROM inbox WHERE inbox.id = outbox.inbox_id)
              FROM outbox WHERE status = 'pending' ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -567,6 +570,7 @@ impl Store {
                 created_at: r.get(5)?,
                 prompt: r.get(6)?,
                 attachment: r.get(7)?,
+                reply_to: r.get(8)?,
             })
         })?;
         rows.collect()

@@ -212,14 +212,29 @@ async fn ask(cfg: &Config, text: &str) -> anyhow::Result<Option<String>> {
     line.push(b'\n');
     write.write_all(&line).await?;
     let mut lines = BufReader::new(read).lines();
-    // The reply comes back on this connection; no reply means this uid is not an owner.
-    let reply = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+    // The reply comes back on this connection; no reply means this uid is not an owner. Chat
+    // writes every pending row for this uid here too: only the line whose `re` is our id is
+    // the reply (a daemon before `re` sends none, and its first line is taken).
+    let reply = async {
+        while let Some(line) = lines.next_line().await? {
+            let v: serde_json::Value = serde_json::from_str(&line)?;
+            if v.get("re").is_none_or(|re| *re == id) {
+                return Ok(Some(v));
+            }
+        }
+        anyhow::Ok(None)
+    };
+    let v = tokio::time::timeout(Duration::from_secs(10), reply)
         .await
         .map_err(|_| {
             anyhow::anyhow!("no reply from zephyr within 10s; is this user in owners.chat?")
         })??;
-    let v: serde_json::Value = serde_json::from_str(reply.as_deref().unwrap_or("null"))?;
-    Ok(Some(v["text"].as_str().unwrap_or_default().to_string()))
+    Ok(Some(
+        v.as_ref()
+            .and_then(|v| v["text"].as_str())
+            .unwrap_or_default()
+            .to_string(),
+    ))
 }
 
 /// `zephyr skill list | rm NAME | add NAME` in the container, run by the host's `zephyr skill`

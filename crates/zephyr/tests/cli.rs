@@ -97,6 +97,13 @@ fn pause_and_resume_work_with_a_daemon_and_without_one() {
     )
     .unwrap();
 
+    // A notice waiting for this uid goes out on the same connection first: not the reply.
+    let store = zephyr::store::Store::open(&home.join("state.db")).unwrap();
+    store
+        .notify("chat", &uid.to_string(), "[zephyr] a stale notice")
+        .unwrap();
+    drop(store);
+
     let running = daemon(&cfg, &home);
     assert_eq!(stdout(&zephyr(&cfg, &["pause"])), PAUSED);
     assert!(stdout(&zephyr(&cfg, &["status"])).contains("paused: yes (user)"));
