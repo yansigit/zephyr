@@ -362,9 +362,12 @@ impl Host {
             &format!("type=bind,src={projects},dst={projects}"),
         ])
         .args(masks(&projects.to_string())?)
+        // Docker's json-file logs grow without end by default.
+        .args(["--log-opt", "max-size=20m", "--log-opt", "max-file=5"])
+        .args(["--ulimit", "nofile=65536:65536"])
         .args(
-            self.data
-                .host_get("memory")?
+            (self.data.host_get("memory")?)
+                .or_else(default_memory)
                 .map(|m| ["--memory".to_string(), m])
                 .into_iter()
                 .flatten(),
@@ -1326,6 +1329,21 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
         "subagent" => setup::subagent(&h, a),
         _ => bail!("{USAGE}"),
     }
+}
+
+/// The container's memory cap when host.toml sets none: 75% of the host's RAM, so a runaway
+/// agent cannot push the host into swap or its OOM killer. None when `/proc/meminfo` is unreadable.
+fn default_memory() -> Option<String> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: u64 = info
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(format!("{}k", kb / 4 * 3))
 }
 
 /// `zephyr-local:<version>-<hash>` for apt `packages` on `base`, None without packages. The hash

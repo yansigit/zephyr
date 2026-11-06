@@ -378,10 +378,13 @@ fn init_non_interactive_builds_the_layout_and_starts_the_container() {
     ] {
         assert!(run.windows(2).any(|w| w == pair), "{pair:?} in {run:?}");
     }
-    assert!(
-        !run.iter().any(|a| a == "--memory"),
-        "no memory cap unless set"
-    );
+    for pair in [
+        ["--log-opt", "max-size=20m"],
+        ["--log-opt", "max-file=5"],
+        ["--ulimit", "nofile=65536:65536"],
+    ] {
+        assert!(run.windows(2).any(|w| w == pair), "{pair:?} in {run:?}");
+    }
     assert!(
         !run.iter().any(|a| a == "--gpus"),
         "no GPU without its runtime"
@@ -471,9 +474,26 @@ fn up_build_passes_the_gh_token_as_a_secret_only() {
 }
 
 #[test]
-fn up_caps_memory_only_when_host_toml_sets_it() {
+fn up_caps_memory_at_host_toml_or_three_quarters_of_the_host() {
     let env = Env::new("memory");
     env.init(&["--no-start"]);
+    // Unset: 75% of this host's MemTotal.
+    env.ok(&["up"]);
+    let calls = env.calls();
+    let run = find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
+    let info = std::fs::read_to_string("/proc/meminfo").unwrap();
+    let kb: u64 = info
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))
+        .unwrap()
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .unwrap();
+    let want = format!("{}k", kb / 4 * 3);
+    assert!(run.windows(2).any(|w| w == ["--memory", &want]), "{run:?}");
+    // Set: the owner's value.
     let host = env.daemon().join("host.toml");
     let text = std::fs::read_to_string(&host).unwrap();
     std::fs::write(&host, format!("{text}memory = \"6g\"\n")).unwrap();
