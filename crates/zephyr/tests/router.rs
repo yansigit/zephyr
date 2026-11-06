@@ -591,6 +591,24 @@ async fn budget_pauses_at_the_limit_and_holds_until_resume() {
     gw.shutdown().await;
 }
 
+#[tokio::test]
+async fn waiting_messages_go_when_the_budget_pause_ends_at_midnight() {
+    let home = home("budget-midnight");
+    let cfg = config(&home);
+    let store = Store::open(&cfg.db_path()).unwrap();
+    let today = store.today().unwrap();
+    store.set_paused(Some(&format!("budget:{today}"))).unwrap();
+    let gw = start(cfg);
+    wait(|| !log(&home, "get_messages").is_empty()).await; // the child is up
+    gw.say("m1", "owner", "held").await;
+    wait(|| inbox_status(&home, "new") == 1).await;
+    assert!(log(&home, "prompt").is_empty());
+    // The UTC day turns: the pause is yesterday's, and the next tick sends the row.
+    store.set_paused(Some("budget:2000-01-01")).unwrap();
+    assert_eq!(gw.wait_replies(1).await, ["echo: [chat #1] held"]);
+    gw.shutdown().await;
+}
+
 fn run_status(home: &Path, status: &str) -> i64 {
     let counts = Store::open(&home.join("state.db"))
         .unwrap()

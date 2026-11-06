@@ -536,6 +536,8 @@ impl<'a> Router<'a> {
         let mut exit = Exit::Shutdown;
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
         let mut tick = tokio::time::interval(Duration::from_secs(5));
+        let paused = |store: &Store| store.pause_reason().ok().flatten().is_some();
+        let mut was_paused = paused(&self.store);
         self.publish();
         loop {
             tokio::select! {
@@ -585,6 +587,12 @@ impl<'a> Router<'a> {
                     if self.cfg.path.is_some() && edits(&self.cfg) != self.edits {
                         let text = self.reload().await;
                         eprintln!("zephyr: zephyr.toml or secrets.env changed: {text}");
+                    }
+                    // A budget pause ends at UTC midnight with nothing else to wake the router;
+                    // a run in progress reconciles at its settle, a new child when it starts.
+                    let ended = std::mem::replace(&mut was_paused, paused(&self.store));
+                    if ended && !was_paused && !self.busy && self.child.is_some() {
+                        log(self.reconcile(None, false).await);
                     }
                 }
             }
