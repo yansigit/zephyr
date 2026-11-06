@@ -145,6 +145,9 @@ struct Attachment {
 #[derive(Deserialize)]
 struct Handle {
     address: String,
+    /// `iMessage` or `SMS`. An SMS sender number is trivial to spoof, so only iMessage counts;
+    /// every BlueBubbles message we have recorded names its service.
+    service: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -183,6 +186,9 @@ fn message_to_inbound(m: Message) -> Option<(Inbound, Vec<Attachment>)> {
     let (Some(handle), false) = (m.handle, text.is_empty() && files.is_empty()) else {
         return None;
     };
+    if handle.service.as_deref() != Some("iMessage") {
+        return None;
+    }
     let inbound = Inbound {
         channel: "imessage".into(),
         platform_msg_id: m.guid,
@@ -616,6 +622,13 @@ mod tests {
             to_inbound(updated.as_bytes()).unwrap().is_none(),
             "updated-message"
         );
+        // An SMS, whose sender number anyone can spoof, or a handle naming no service.
+        let sms = NEW.replace(r#""service": "iMessage""#, r#""service": "SMS""#);
+        assert_ne!(sms, NEW);
+        assert!(to_inbound(sms.as_bytes()).unwrap().is_none(), "sms");
+        let bare = NEW.replace(r#", "service": "iMessage""#, "");
+        assert_ne!(bare, NEW);
+        assert!(to_inbound(bare.as_bytes()).unwrap().is_none(), "no service");
     }
 
     #[test]
