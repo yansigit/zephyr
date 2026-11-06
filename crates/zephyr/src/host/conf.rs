@@ -38,8 +38,14 @@ pub fn replace_private(path: &Path, text: &str) -> anyhow::Result<()> {
     let name = path.file_name().context("no file name")?.to_string_lossy();
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = path.with_file_name(format!(".{name}.{}-{seq}.tmp", std::process::id()));
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
     write_private(&tmp, text)
         .and_then(|()| Ok(std::fs::rename(&tmp, path)?))
+        // The rename itself is durable only once its directory is on disk too.
+        .and_then(|()| Ok(std::fs::File::open(dir)?.sync_all()?))
         .with_context(|| format!("writing {}", path.display()))
 }
 
@@ -310,6 +316,8 @@ pub fn write_private(path: &Path, text: &str) -> anyhow::Result<()> {
         .open(path)?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     file.write_all(text.as_bytes())?;
+    // On disk before a rename can publish it: a crash then leaves the old file, never an empty one.
+    file.sync_all()?;
     Ok(())
 }
 

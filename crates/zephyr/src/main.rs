@@ -101,7 +101,17 @@ fn file_cmd(args: &[String]) -> ExitCode {
                     let mut text = String::new();
                     std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
                         .map_err(anyhow::Error::from)
-                        .and_then(|_| zephyr::host::conf::replace_private(&file, &text))
+                        .and_then(|_| {
+                            // A newer host CLI may write keys this daemon refuses; it would then
+                            // crash-loop at its next start.
+                            if name == "zephyr.toml" {
+                                toml::from_str::<Config>(&text)
+                                    .map_err(anyhow::Error::from)
+                                    .and_then(|c| c.validate())
+                                    .map_err(|e| e.context("zephyr.toml not replaced"))?;
+                            }
+                            zephyr::host::conf::replace_private(&file, &text)
+                        })
                 }
                 _ => Err(anyhow::anyhow!("usage: zephyr __file get|put NAME")),
             }

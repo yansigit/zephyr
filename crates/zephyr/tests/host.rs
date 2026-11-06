@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const CONTAINER: &str = "zephyr-lanetest";
+/// The agent's PATH, passed to each exec as the agent: the image's own is root's.
+const AGENT_PATH: &str =
+    "/zephyr/.local/bin:/opt/zephyr/py/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const GH_TOKEN: &str = "gho_FAKE_GH_TOKEN_0123";
 const CLAUDE_TOKEN: &str = "sk-ant-oat01-FAKE-CLAUDE-TOKEN";
 
@@ -19,7 +22,7 @@ case " $* " in
 esac
 [ -n "$GH_TOKEN" ] && echo "GH_TOKEN set" >> "$SHIM_DIR/env.log"
 case "$1" in
-  inspect) echo "${SHIM_STATE:-running}"; exit 0 ;;
+  inspect) [ -n "$SHIM_NO_CONTAINER" ] && exit 1; echo "${SHIM_STATE:-running}"; exit 0 ;;
   info) echo "${SHIM_RUNTIMES:-io.containerd.runc.v2 runc}"; exit 0 ;;
   image) exit "${SHIM_IMAGE_MISSING:-0}" ;;
   pull) exit "${SHIM_PULL_FAIL:-0}" ;;
@@ -27,21 +30,26 @@ case "$1" in
   build) [ "${@: -1}" = - ] && cat >> "$SHIM_DIR/build.log"; exit "${SHIM_BUILD_FAIL:-0}" ;;
   run)
     case " $* " in
+      *" -d --name "*) exit "${SHIM_RUN_FAIL:-0}" ;;
       *" --entrypoint zephyr "*) echo "zephyr $SHIM_LATEST" ;;
       # The image's CLI: names its image's tag, and logs how it was run.
       *" --entrypoint cat "*) printf '#!/bin/bash\n[ "$1" = --version ] && { echo "zephyr %s"; exit; }\necho "$@" >> "%s/exec.log"\n' "${5##*:}" "$SHIM_DIR" ;;
       *" --entrypoint python3 "*)
         case "${@: -1}" in
-          *"sys.exit(not os.path.exists"*) [ -n "$SHIM_HAS_BAK" ]; exit ;;
+          *"os.path.exists(p) or sys.exit(1)"*) [ -n "$SHIM_HAS_BAK" ]; exit ;;
           *".backup("*) exit "${SHIM_PY_FAIL:-0}" ;;
         esac ;;
     esac ;;
   exec)
     case " $* " in *" -i "*) cat >> "$SHIM_DIR/stdin.log" ;; esac
+    # The daemon edits zephyr.toml while a sign-in or the model picker waits on the owner.
+    case " $* " in *" auth login "*|*" --list-models "*)
+      [ -n "$SHIM_EDIT" ] && echo "$SHIM_EDIT" >> "$HOME/.zephyr-daemon/zephyr.toml" ;;
+    esac
     case " $* " in
       *" --list-models "*) printf 'provider model context\nanthropic claude-sonnet-5 200K\nopenai-codex gpt-5.5 400K\nopenai-codex gpt-5.4 400K\n' ;;
       *" auth check "*) echo '{"ready":true,"provider":"claude-code","source":"auth.json"}' ;;
-      *" zephyr status "*) echo "daemon: ${SHIM_DAEMON:-running}" ;;
+      *" zephyr status "*) echo "daemon: ${SHIM_DAEMON:-running}"; [ -n "$SHIM_STATUS" ] && printf '%b\n' "$SHIM_STATUS" ;;
       *" zephyr --version "*) [ -n "$SHIM_VERSION" ] || exit 2; echo "zephyr $SHIM_VERSION" ;;
       *" zephyr tui "*) exit "${SHIM_TUI_EXIT:-0}" ;;
     esac ;;
@@ -218,6 +226,21 @@ impl Env {
         std::fs::read_to_string(self.daemon().join("zephyr.toml")).unwrap()
     }
 
+    /// The layout after the first `up`: the daemon's files root's, reached through `__file` in the
+    /// container (the shim serves them from `files/`). `unsplit` gives the dir back.
+    fn split(&self) {
+        let files = self.dir.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        for name in ["zephyr.toml", "secrets.env", "tui.token", "host.toml"] {
+            std::fs::rename(self.daemon().join(name), files.join(name)).unwrap();
+        }
+        std::fs::set_permissions(self.daemon(), std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    fn unsplit(&self) {
+        std::fs::set_permissions(self.daemon(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     fn init(&self, extra: &[&str]) {
         let projects = self.projects.display().to_string();
         let mut args = vec!["init", "--non-interactive", "--projects", &projects];
@@ -249,7 +272,8 @@ fn ids() -> String {
 /// A `docker exec` as the agent (this user, in its home) whose argv starts with `rest`.
 fn find_agent<'a>(calls: &'a [Vec<String>], rest: &[&str]) -> &'a Vec<String> {
     let ids = ids();
-    let prefix: Vec<&str> = ["docker", "exec", "-u", &ids, "-w", "/zephyr"]
+    let path = format!("PATH={AGENT_PATH}");
+    let prefix: Vec<&str> = ["docker", "exec", "-u", &ids, "-w", "/zephyr", "-e", &path]
         .into_iter()
         .chain(rest.iter().copied())
         .collect();
@@ -514,7 +538,11 @@ fn packages_build_a_local_image_that_up_and_upgrade_run() {
     let me = env!("CARGO_PKG_VERSION");
     let out = env.zephyr_env(
         &["upgrade", me],
-        &[("ZEPHYR_IMAGE", ""), ("SHIM_VERSION", "0.0.1")],
+        &[
+            ("ZEPHYR_IMAGE", ""),
+            ("SHIM_VERSION", "0.0.1"),
+            ("SHIM_IMAGE_MISSING", "1"),
+        ],
     );
     assert!(
         out.status.success(),
@@ -598,7 +626,7 @@ fn login_feeds_secrets_on_stdin_and_records_the_account() {
     let acct = "RPI_CODING_AGENT_DIR=/zephyr/accounts/claude-main";
     let login = find_agent(&calls, &["-i", "-e", acct, CONTAINER, "script", "-qec"]);
     assert!(
-        login[12].starts_with("rpi auth login --provider claude-code --extension /opt/zephyr/ext/"),
+        login[14].starts_with("rpi auth login --provider claude-code --extension /opt/zephyr/ext/"),
         "{login:?}"
     );
     find_agent(&calls, &["-e", acct, CONTAINER, "rpi", "auth", "check"]);
@@ -896,6 +924,10 @@ fn lifecycle_commands_build_the_expected_docker_calls() {
         tui.windows(2).any(|w| w == ["-e", "TZ=Europe/Berlin"]),
         "{tui:?}"
     );
+    assert!(
+        tui.contains(&"HOME=/var/lib/zephyr/tui".to_string()),
+        "{tui:?}"
+    );
     assert!(!format!("{calls:?}").contains(token.trim()));
 
     env.ok(&["attach", "--stock"]);
@@ -909,15 +941,30 @@ fn lifecycle_commands_build_the_expected_docker_calls() {
             "-e",
             "RPI_SERVER_TOKEN",
             "-e",
-            "HOME=/tmp",
+            "HOME=/var/lib/zephyr/tui",
             "-e",
-            "RPI_CODING_AGENT_DIR=/tmp/zephyr-attach",
+            "RPI_CODING_AGENT_DIR=/var/lib/zephyr/tui/agent",
             CONTAINER,
             "rpi",
             "--connect",
             "127.0.0.1:7790",
         ],
     );
+    // In the daemon's dir, which the agent cannot enter, not in /tmp, where it could make it first.
+    find(
+        &calls,
+        &[
+            "docker",
+            "exec",
+            CONTAINER,
+            "mkdir",
+            "-p",
+            "-m",
+            "0700",
+            "/var/lib/zephyr/tui",
+        ],
+    );
+    assert!(!format!("{calls:?}").contains("/tmp"), "{calls:#?}");
     assert!(!format!("{calls:?}").contains(token.trim()));
 
     assert!(
@@ -1404,8 +1451,19 @@ fn upgrade_waits_backs_up_and_goes_back_only_with_a_backup() {
     assert_eq!(stdout(&out), format!("already on {me}\n"));
     assert_eq!(at(&calls, RM, ""), None);
 
+    // A release never comes from a local build: missing and not pullable, it stops.
+    let (out, calls) = upgrade(&[
+        ("SHIM_VERSION", "0.0.1"),
+        ("SHIM_IMAGE_MISSING", "1"),
+        ("SHIM_PULL_FAIL", "1"),
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("could not pull"));
+    assert_eq!(at(&calls, &["docker", "build"], ""), None);
+    assert_eq!(at(&calls, RM, ""), None);
+
     // Forward: state.db is backed up under the running version before the container goes.
-    let (out, calls) = upgrade(&[("SHIM_VERSION", "0.0.1")]);
+    let (out, calls) = upgrade(&[("SHIM_VERSION", "0.0.1"), ("SHIM_IMAGE_MISSING", "1")]);
     assert!(
         out.status.success(),
         "{}",
@@ -1443,11 +1501,81 @@ fn upgrade_waits_backs_up_and_goes_back_only_with_a_backup() {
         String::from_utf8_lossy(&out.stderr)
     );
     let backup = at(&calls, PY, "connect('/var/lib/zephyr/state.db.99.0.0.bak')").expect("backup");
+    let stop = at(&calls, &["docker", "stop"], "").unwrap();
     let rm = at(&calls, RM, "").unwrap();
     let restore = at(&calls, PY, &format!("shutil.copy(d + 'state.db.{me}.bak'")).expect("restore");
     let run = at(&calls, RUN, "").unwrap();
-    assert!(backup < rm && rm < restore && restore < run, "{calls:#?}");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("changes since that backup are lost"));
+    assert!(
+        backup < stop && stop < rm && rm < restore && restore < run,
+        "{calls:#?}"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("changes since then are lost"));
+    // The image is here already: going back pulls nothing.
+    assert_eq!(at(&calls, &["docker", "pull"], ""), None, "{calls:#?}");
+
+    // The scripts themselves, on a copy of the daemon's dir: the config goes with state.db, and
+    // only the newest 5 versions' backups stay.
+    let script = |at: usize| calls[at].last().unwrap().clone();
+    let (backup, restore) = (script(backup), script(restore));
+    let dir = env.dir.join("daemon-copy");
+    std::fs::create_dir_all(&dir).unwrap();
+    let py = |script: &str| {
+        let script = script.replace("/var/lib/zephyr/", &format!("{}/", dir.display()));
+        let out = Command::new("python3")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    py("import sqlite3; sqlite3.connect('/var/lib/zephyr/state.db').execute('create table t (x)')");
+    std::fs::write(dir.join("zephyr.toml"), "newer = 1\n").unwrap();
+    std::fs::write(dir.join("host.toml"), "projects = '/p'\n").unwrap();
+    let day = std::time::Duration::from_secs(86_400);
+    for n in 1..=5 {
+        for f in ["state.db", "zephyr.toml"] {
+            let file = std::fs::File::create(dir.join(format!("{f}.0.0.{n}.bak"))).unwrap();
+            let age = std::time::SystemTime::now() - day * (10 - n);
+            file.set_modified(age).unwrap();
+        }
+    }
+    py(&backup);
+    let names = |prefix: &str| {
+        let mut v: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with(prefix) && n.ends_with(".bak"))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        names("state.db."),
+        ["0.0.2", "0.0.3", "0.0.4", "0.0.5", "99.0.0"].map(|v| format!("state.db.{v}.bak"))
+    );
+    assert_eq!(
+        names("zephyr.toml."),
+        ["0.0.2", "0.0.3", "0.0.4", "0.0.5", "99.0.0"].map(|v| format!("zephyr.toml.{v}.bak"))
+    );
+    assert_eq!(read(&dir.join("zephyr.toml.99.0.0.bak")), "newer = 1\n");
+    assert!(dir.join("host.toml.99.0.0.bak").exists());
+    assert!(!dir.join("vault.toml.99.0.0.bak").exists());
+    std::fs::copy(
+        dir.join("state.db.99.0.0.bak"),
+        dir.join(format!("state.db.{me}.bak")),
+    )
+    .unwrap();
+    std::fs::write(dir.join(format!("zephyr.toml.{me}.bak")), "older = 1\n").unwrap();
+    py(&restore);
+    assert_eq!(read(&dir.join("zephyr.toml")), "older = 1\n");
+    assert_eq!(
+        read(&dir.join("host.toml")),
+        "projects = '/p'\n",
+        "no backup: left alone"
+    );
 
     // A named image keeps its own: no CLI from it, but the backup still comes first.
     let out = env.zephyr(&["upgrade"]);
@@ -1550,4 +1678,136 @@ fn vault_add_list_and_rm_reach_roots_file_and_never_put_a_value_in_argv() {
     );
     assert!(!env.zephyr(&["vault", "rm", "github"]).status.success());
     std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn upgrade_waits_only_for_work_in_flight() {
+    let env = Env::new("upgrade-busy");
+    env.init(&["--no-start"]);
+    // A notice for a TUI nobody attaches, messages while paused: these never clear by themselves.
+    let out = env.zephyr_env(
+        &["upgrade"],
+        &[(
+            "SHIM_STATUS",
+            "outbox  pending     1\\ninbox   new         2",
+        )],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!stdout(&out).contains("the agent is busy"));
+    find(&env.calls(), RUN);
+}
+
+#[test]
+fn up_keeps_the_old_container_until_the_new_one_runs() {
+    let env = Env::new("up-order");
+    env.init(&["--no-start"]);
+    // An unreadable dir under projects (a database's data dir) does not stop it; a comma, which
+    // --mount cannot carry, is skipped with a warning.
+    let locked = env.projects.join("pgdata");
+    std::fs::create_dir_all(env.projects.join("a,b")).unwrap();
+    std::fs::write(env.projects.join("a,b/.env"), "S=1").unwrap();
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let out = env.zephyr(&["up"]);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("a,b/.env stays visible"));
+    let calls = env.calls();
+    let run = find(&calls, RUN);
+    assert!(!run.iter().any(|a| a.contains("a,b")), "{run:?}");
+    assert!(run.iter().any(|a| a.contains("app/.env")), "{run:?}");
+    // Stopped before it is removed, so its daemon drains.
+    let stop = at(&calls, &["docker", "stop", CONTAINER], "").unwrap();
+    assert!(stop < at(&calls, RM, "").unwrap(), "{calls:#?}");
+
+    // Once split, the old container only steps aside, and comes back when the new one fails.
+    env.split();
+    let old = format!("{CONTAINER}-old");
+    let out = env.zephyr_env(&["up"], &[("SHIM_RUN_FAIL", "1")]);
+    assert!(!out.status.success());
+    let calls = env.calls();
+    let run = at(&calls, RUN, "").unwrap();
+    assert!(
+        !calls[..run]
+            .iter()
+            .any(|c| c[..] == ["docker", "rm", "-f", CONTAINER]),
+        "{calls:#?}"
+    );
+    let stop = at(&calls, &["docker", "stop", CONTAINER], "").unwrap();
+    let aside = at(&calls, &["docker", "rename", CONTAINER, &old], "").unwrap();
+    let back = at(&calls, &["docker", "rename", &old, CONTAINER], "").unwrap();
+    let start = at(&calls, &["docker", "start", CONTAINER], "").unwrap();
+    assert!(
+        stop < aside && aside < run && run < back && back < start,
+        "{calls:#?}"
+    );
+    // It runs: the old one goes only now.
+    env.ok(&["up"]);
+    let calls = env.calls();
+    let run = at(&calls, RUN, "").unwrap();
+    let removed = calls
+        .iter()
+        .rposition(|c| c[..] == ["docker", "rm", "-f", &old])
+        .unwrap();
+    assert!(run < removed, "{calls:#?}");
+    env.unsplit();
+}
+
+#[test]
+fn up_and_going_back_without_a_container_keep_the_backups() {
+    let env = Env::new("up-backup");
+    env.init(&["--no-start"]);
+    // Another version runs: `up` backs it up before replacing it, as an upgrade does.
+    env.ok(&["up"]);
+    assert_eq!(at(&env.calls(), PY, ".backup("), None);
+    let out = env.zephyr_env(&["up"], &[("SHIM_VERSION", "0.0.1")]);
+    assert!(out.status.success());
+    let calls = env.calls();
+    let backup = at(&calls, PY, "connect('/var/lib/zephyr/state.db.0.0.1.bak')").expect("backup");
+    assert!(backup < at(&calls, RUN, "").unwrap(), "{calls:#?}");
+
+    // After `zephyr down` no container names the version, so this CLI's stands in: going back
+    // still needs the older version's backup.
+    let out = env.zephyr_env(
+        &["upgrade", "0.0.1"],
+        &[("ZEPHYR_IMAGE", ""), ("SHIM_NO_CONTAINER", "1")],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no backup from 0.0.1"), "{err}");
+    assert_eq!(at(&env.calls(), RUN, ""), None);
+}
+
+#[test]
+fn host_edits_keep_what_the_daemon_wrote_meanwhile() {
+    let env = Env::new("reread");
+    env.init(&["--no-start"]);
+    let edit = "# the daemon was here";
+    let out = env.zephyr_env(
+        &["login", "anthropic", "--no-verify"],
+        &[("ANTHROPIC_API_KEY", "sk-fake"), ("SHIM_EDIT", edit)],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(env.config().contains(edit), "{}", env.config());
+    assert!(env.config().contains("anthropic-1"), "{}", env.config());
+    let edit = "# and again";
+    let out = env.zephyr_env(&["model"], &[("SHIM_EDIT", edit)]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(env.config().contains(edit), "{}", env.config());
 }

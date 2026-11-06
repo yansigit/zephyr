@@ -434,6 +434,11 @@ fn file_reads_and_replaces_only_the_daemons_files() {
         zephyr(&cfg, &["__file", "get", "host.toml"]).status.code(),
         Some(3)
     );
+    // A zephyr.toml this daemon would refuse is not written.
+    let before = std::fs::read_to_string(&cfg).unwrap();
+    assert!(!put("zephyr.toml", &format!("{before}\nnot_a_key = 1\n")).success());
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), before);
+    assert!(put("zephyr.toml", &format!("{before}\n# kept\n")).success());
     // Nothing outside the list, and no paths.
     assert!(!put("state.db", "x").success());
     assert!(!zephyr(&cfg, &["__file", "get", "../zephyr.toml"])

@@ -36,6 +36,13 @@ const REPO: &str = "ghcr.io/yansigit/zephyr:";
 /// The image built from it with host.toml's apt `packages` (`zephyr packages`), never pushed.
 const LOCAL: &str = "zephyr-local:";
 
+/// This CLI's version, and the image it runs by default.
+const ME: &str = env!("CARGO_PKG_VERSION");
+
+/// The daemon's config files a rollback restores with state.db: an older daemon refuses keys it
+/// does not know.
+const ROLLED_BACK: [&str; 3] = ["zephyr.toml", "vault.toml", "host.toml"];
+
 const COMMANDS: [&str; 25] = [
     "init",
     "up",
@@ -157,7 +164,9 @@ impl Host {
     ) -> Command {
         let ids = agent_ids();
         let user = format!("{}:{}", ids.0, ids.1);
-        let flags = [&["-u", user.as_str(), "-w", "/zephyr"], flags].concat();
+        // The image's `ENV PATH` is root's; the agent's adds its own bin folder.
+        let path = format!("PATH={}", crate::agent::AGENT_PATH);
+        let flags = [&["-u", &user, "-w", "/zephyr", "-e", &path], flags].concat();
         self.exec(&flags, env, argv)
     }
 
@@ -297,26 +306,16 @@ impl Host {
     /// The daemon runs as root holding only SETUID, SETGID and KILL; the agent runs as this
     /// user, and cannot reach the daemon's files in `~/.zephyr-daemon` (DESIGN §4.4).
     fn up(&self) -> anyhow::Result<()> {
-        // The old container goes first: it holds the files the migration moves.
-        let _ = quiet(docker(&["rm", "-f", &self.container]));
+        // Before the first split the old container holds the files the migration moves, so it
+        // goes first; otherwise it runs until the new one's arguments are all known.
+        if self.data.direct() {
+            self.remove();
+        }
         self.migrate()?;
         let projects = self
             .data
             .projects()?
             .context("no projects dir: run `zephyr init`")?;
-        // As `init` does: the extensions the image ships since this config was written.
-        // A convenience only: the old container is already gone, so a failure must not stop the start.
-        match self
-            .data
-            .load()
-            .and_then(|mut doc| self.data.add_image_extensions(&mut doc))
-        {
-            Ok(true) => println!("added the image's new extensions to zephyr.toml"),
-            Ok(false) => {}
-            Err(e) => eprintln!(
-                "warning: could not add the image's new extensions: {e:#}; run `zephyr init` later"
-            ),
-        }
         let image = self.run_image()?;
         let ids = agent_ids();
         let data = self.data.dir.display();
@@ -384,8 +383,63 @@ impl Host {
         // Root cannot enter the agent's 0700 home; the daemon starts each child there as the agent.
         .args(["-w", "/", &image])
         .stdout(Stdio::null());
-        run(&mut cmd)?;
+
+        // The old container steps aside (stopped, so its daemon drains) and comes back if the new
+        // one cannot be created.
+        let old = format!("{}-old", self.container);
+        let was_running = self.running();
+        let aside = self.state().is_some();
+        if aside {
+            // Left by an `up` that died between the rename and the removal.
+            let _ = quiet(docker(&["rm", "-f", &old]));
+            let _ = quiet(docker(&["stop", &self.container]));
+            run(&mut docker(&["rename", &self.container, &old]))?;
+        }
+        // As `init` does: the extensions the image ships since this config was written. Only
+        // with the old daemon stopped, which would load them; a convenience, so it only warns.
+        match self
+            .data
+            .load()
+            .and_then(|mut doc| self.data.add_image_extensions(&mut doc))
+        {
+            Ok(true) => println!("added the image's new extensions to zephyr.toml"),
+            Ok(false) => {}
+            Err(e) => eprintln!(
+                "warning: could not add the image's new extensions: {e:#}; run `zephyr init` later"
+            ),
+        }
+        if let Err(e) = run(&mut cmd) {
+            if aside {
+                let _ = quiet(docker(&["rm", "-f", &self.container]));
+                let _ = quiet(docker(&["rename", &old, &self.container]));
+                if was_running {
+                    let _ = quiet(docker(&["start", &self.container]));
+                }
+            }
+            return Err(e);
+        }
+        if aside {
+            let _ = quiet(docker(&["rm", "-f", &old]));
+        }
         self.wait_ready()
+    }
+
+    /// `up`, backed up first as an upgrade is when the container runs another version.
+    fn up_checked(&self) -> anyhow::Result<()> {
+        let running = running_version(self);
+        if running
+            .as_deref()
+            .is_some_and(|v| v != ME && semver(v).is_some())
+        {
+            self.settle(running.as_deref())?;
+        }
+        self.up()
+    }
+
+    /// Stops the container, so its daemon drains (tasks, long execs), then removes it.
+    fn remove(&self) {
+        let _ = quiet(docker(&["stop", &self.container]));
+        let _ = quiet(docker(&["rm", "-f", &self.container]));
     }
 
     /// Waits until the daemon answers on its socket (`zephyr status`), so "ready" means a message
@@ -508,17 +562,18 @@ impl Host {
     fn attach(&self, stock: bool) -> anyhow::Result<()> {
         self.need_running()?;
         let token = self.data.token()?;
+        // Root's own files for the client: in the daemon's dir, which the agent cannot enter (it
+        // could make a dir in /tmp first). Root cannot enter the agent's home either.
+        let home = format!("{DAEMON_MOUNT}/tui");
+        run(&mut self.exec(&[], &[], &["mkdir", "-p", "-m", "0700", &home]))?;
         // `-e NAME` without a value: docker copies it from this process's environment, when set.
         let mut flags = vec!["-it", "-e", "RPI_SERVER_TOKEN"];
         let mut cmd = if stock {
             let doc = self.data.load()?;
             let port = conf::get(&doc, "attach.port").context("no [attach] port in zephyr.toml")?;
-            // As root, so the agent's uid cannot read the token from the client's environment; root
-            // cannot enter the agent's home, so the client keeps its own files in /tmp.
-            let env = [
-                ("HOME", "/tmp"),
-                ("RPI_CODING_AGENT_DIR", "/tmp/zephyr-attach"),
-            ];
+            // As root, so the agent's uid cannot read the token from the client's environment.
+            let agent = format!("{home}/agent");
+            let env = [("HOME", home.as_str()), ("RPI_CODING_AGENT_DIR", &agent)];
             let mut cmd = self.exec(&flags, &env, &["rpi", "--connect"]);
             cmd.arg(format!("127.0.0.1:{port}"));
             cmd
@@ -541,7 +596,7 @@ impl Host {
                 .filter(|t| !t.is_empty())
                 .or_else(|| jiff::tz::TimeZone::system().iana_name().map(String::from))
                 .unwrap_or_else(|| "UTC".into());
-            self.exec(&flags, &[("HOME", "/tmp"), ("TZ", &tz)], &["zephyr", "tui"])
+            self.exec(&flags, &[("HOME", &home), ("TZ", &tz)], &["zephyr", "tui"])
         };
         let ran = run(cmd.env("RPI_SERVER_TOKEN", &token));
         if ran.is_err() && !stock && std::io::stdout().is_terminal() {
@@ -596,7 +651,7 @@ impl Host {
         ok &= check("zephyr.toml parses", self.data.load().is_ok());
         if fix && !self.running() && self.data.projects()?.is_some() {
             self.ensure_image(false, false)?;
-            self.up()?;
+            self.up_checked()?;
         }
         let running = self.running();
         ok &= check(&format!("container {} is running", self.container), running);
@@ -618,7 +673,6 @@ impl Host {
     /// `zephyr upgrade [VERSION]`: the newest release, or VERSION. This CLI is replaced first, so
     /// the CLI that starts the container always matches its image.
     fn upgrade(mut self, version: Option<&str>) -> anyhow::Result<()> {
-        const ME: &str = env!("CARGO_PKG_VERSION");
         if std::env::var("ZEPHYR_IMAGE").is_ok_and(|v| !v.is_empty()) {
             // A named image (a local build, a test install): no versions to compare.
             self.ensure_image(false, true)?;
@@ -637,22 +691,22 @@ impl Host {
         }
         self.image = format!("{REPO}{target}");
         self.data.image = self.image.clone();
-        // A local build is this source tree's version, so only for this CLI's own.
-        if target == ME {
-            self.ensure_image(false, true)?;
-        } else if !pull(&self.image) {
+        // A release is its published image, never a local build of this tree under its tag.
+        if !quiet(docker(&["image", "inspect", &self.image])) && !pull(&self.image) {
             bail!("could not pull {}", self.image);
-        } else {
-            // While the old container still runs: the owner's packages on the new image.
-            self.derive(&self.data.packages()?, false)?;
         }
+        // While the old container still runs: the owner's packages on the new image.
+        self.derive(&self.data.packages()?, false)?;
+        // Without a container (after `zephyr down`), state.db is most likely this CLI's version's.
         let back = matches!(
-            (running.as_deref().and_then(semver), semver(&target)),
+            (semver(running.as_deref().unwrap_or(ME)), semver(&target)),
             (Some(r), Some(t)) if t < r
         );
         let bak = format!("state.db.{target}.bak");
-        let exists =
-            format!("import os, sys; sys.exit(not os.path.exists('{DAEMON_MOUNT}/{bak}'))");
+        // Touched as well, so `settle`'s pruning (oldest first) keeps the backup this restores.
+        let exists = format!(
+            "import os, sys; p = '{DAEMON_MOUNT}/{bak}'; os.path.exists(p) or sys.exit(1); os.utime(p)"
+        );
         if back && !quiet(self.daemon_py(&exists)) {
             bail!("no backup from {target} ({bak}); its schema may not read this state.db");
         }
@@ -665,15 +719,24 @@ impl Host {
             self.settle(running.as_deref())?;
         }
         if back {
-            let _ = quiet(docker(&["rm", "-f", &self.container]));
-            // The WAL belongs to the newer state.db, which is backed up now.
+            // Removed, not only stopped: an older CLI run next must not name the restored
+            // state.db's backup after the newer container.
+            self.remove();
+            // The WAL belongs to the newer state.db, which is backed up now. The config goes back
+            // too: the older daemon refuses keys it does not know.
             let restore = format!(
-                "import os, shutil; d = '{DAEMON_MOUNT}/'; \
+                "import os, shutil; \
+                 d = '{DAEMON_MOUNT}/'; \
                  [os.remove(d + f) for f in ('state.db-wal', 'state.db-shm') if os.path.exists(d + f)]; \
-                 shutil.copy(d + '{bak}', d + 'state.db')"
+                 shutil.copy(d + '{bak}', d + 'state.db'); \
+                 [shutil.copy(d + f + '.{target}.bak', d + f) for f in {ROLLED_BACK:?} \
+                 if os.path.exists(d + f + '.{target}.bak')]"
             );
             run(&mut self.daemon_py(&restore)).context("restoring state.db")?;
-            eprintln!("warning: state.db is back to {bak}; changes since that backup are lost");
+            eprintln!(
+                "warning: state.db and the config are back to {target}'s backups; \
+                 changes since then are lost"
+            );
         }
         let Some((new, exe)) = cli else {
             return self.up();
@@ -684,10 +747,14 @@ impl Host {
         Err(err).with_context(|| format!("running {}", exe.display()))
     }
 
-    /// Waits until no message, reply or job is in flight, then backs up state.db as
-    /// `state.db.<running>.bak` (migrations only go forward). A failed backup stops the upgrade;
-    /// only a first install, without state.db, goes on without one.
+    /// Waits until no message, job, task or process is in flight (30 minutes at most), then
+    /// backs up state.db as `state.db.<running>.bak` (migrations only go forward), and the
+    /// `ROLLED_BACK` config files beside it as `<file>.<running>.bak`. The newest 5 versions'
+    /// backups are kept. A failed backup stops the upgrade; only a first install, without
+    /// state.db, goes on without one.
     fn settle(&self, running: Option<&str>) -> anyhow::Result<()> {
+        const LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+        let start = std::time::Instant::now();
         while self.running() {
             let status = self
                 .exec(&[], &[], &["zephyr", "status"])
@@ -696,6 +763,12 @@ impl Host {
             if !status.is_ok_and(|o| busy(&String::from_utf8_lossy(&o.stdout))) {
                 break;
             }
+            if start.elapsed() >= LIMIT {
+                bail!(
+                    "the agent has been busy for 30 minutes (`zephyr status`); \
+                     send it /stop, then run this again"
+                );
+            }
             println!("the agent is busy; waiting...");
             std::thread::sleep(std::time::Duration::from_secs(10));
         }
@@ -703,16 +776,23 @@ impl Host {
             return Ok(());
         }
         // Without a container to name it (after `zephyr down`), a name going back never picks.
-        let name = match running.filter(|v| semver(v).is_some()) {
-            Some(v) => format!("state.db.{v}.bak"),
-            None => "state.db.bak".into(),
+        let suffix = match running.filter(|v| semver(v).is_some()) {
+            Some(v) => format!(".{v}.bak"),
+            None => ".bak".into(),
         };
+        let name = format!("state.db{suffix}");
+        // `b[len(d) + 8:]` is a backup's `.<version>.bak`, after `state.db`.
         let script = format!(
-            "import os, sqlite3, sys; \
-             os.path.exists('{DAEMON_MOUNT}/state.db') or sys.exit(3); \
+            "import glob, os, shutil, sqlite3, sys; \
+             d = '{DAEMON_MOUNT}/'; \
+             os.path.exists(d + 'state.db') or sys.exit(3); \
              bak = sqlite3.connect('{DAEMON_MOUNT}/{name}'); \
-             sqlite3.connect('{DAEMON_MOUNT}/state.db').backup(bak); \
-             bak.close()"
+             sqlite3.connect(d + 'state.db').backup(bak); \
+             bak.close(); \
+             [shutil.copy(d + f, d + f + '{suffix}') for f in {ROLLED_BACK:?} if os.path.exists(d + f)]; \
+             old = sorted(glob.glob(d + 'state.db.*.bak'), key=os.path.getmtime)[:-5]; \
+             [os.remove(p) for b in old for p in [d + f + b[len(d) + 8:] for f in ('state.db', *{ROLLED_BACK:?})] \
+             if os.path.exists(p)]"
         );
         match self.daemon_py(&script).status()?.code() {
             Some(0) => println!(
@@ -782,15 +862,17 @@ fn semver(v: &str) -> Option<(u64, u64, u64)> {
     }
 }
 
-/// `zephyr status` shows a message, a reply or a job in flight.
+/// `zephyr status` shows work in flight: a message the agent is on, a job run, a task or a
+/// process. Rows that wait on someone else never clear by themselves, so they do not count: a
+/// notice for a TUI nobody attaches, a reply for a removed channel, messages while paused.
 fn busy(status: &str) -> bool {
     status.lines().any(|l| {
         let mut w = l.split_whitespace();
         matches!(
             (w.next(), w.next()),
-            (Some("inbox"), Some("new" | "dispatched"))
-                | (Some("outbox"), Some("pending"))
+            (Some("inbox"), Some("dispatched"))
                 | (Some("runs"), Some("claimed" | "running"))
+                | (Some("tasks" | "procs"), Some("running"))
         )
     })
 }
@@ -971,24 +1053,27 @@ fn masks(projects: &str) -> anyhow::Result<Vec<String>> {
         format!("{projects}/.parity-env.sh"),
         format!("{projects}/.parity-lanes/archive"),
     ];
-    let found = output(Command::new("find").args([
-        projects,
-        "-name",
-        "node_modules",
-        "-prune",
-        "-o",
-        "-name",
-        ".env*",
-        "-print0",
-    ]))?;
+    // find exits 1 on any dir it cannot read (a database's 0700 data dir); what it found counts.
+    let found = Command::new("find")
+        .args([projects, "-name", "node_modules", "-prune", "-o"])
+        .args(["-name", ".git", "-prune", "-o", "-name", ".env*", "-print0"])
+        .stderr(Stdio::null())
+        .output()
+        .context("running find")?;
     paths.extend(
-        found
+        String::from_utf8_lossy(&found.stdout)
             .split('\0')
             .filter(|p| !p.is_empty())
             .map(String::from),
     );
     let mut args = vec![];
     for p in paths {
+        if p.contains(',') {
+            eprintln!(
+                "warning: {p} stays visible to the agent: --mount cannot name a path with a comma"
+            );
+            continue;
+        }
         let path = std::path::Path::new(&p);
         let spec = if path.is_dir() {
             format!("type=tmpfs,dst={p}")
@@ -1054,7 +1139,7 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
             let build = a.flag("--build");
             a.rest()?;
             h.ensure_image(build, false)?;
-            h.up()
+            h.up_checked()
         }
         "upgrade" => match &a.rest()?[..] {
             [] => h.upgrade(None),
@@ -1281,11 +1366,22 @@ mod tests {
         let idle = "daemon: running\ninbox   done        12\noutbox  sent        3\nruns    ok          2\n";
         assert!(!busy(idle));
         for line in [
-            "inbox   new         1",
-            "outbox  pending     2",
+            "inbox   dispatched  1",
+            "runs    claimed     1",
             "runs    running     1",
+            "tasks   running     1",
+            "procs   running     2",
         ] {
             assert!(busy(&format!("{idle}{line}\n")), "{line}");
+        }
+        // Rows that wait on someone else would hold an upgrade forever.
+        for line in [
+            "inbox   new         1",
+            "outbox  pending     2",
+            "tasks   queued      1",
+            "procs   exited      3",
+        ] {
+            assert!(!busy(&format!("{idle}{line}\n")), "{line}");
         }
     }
 
