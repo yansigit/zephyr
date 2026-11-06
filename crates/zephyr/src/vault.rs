@@ -803,9 +803,32 @@ fn page_address(out: &str) -> Option<&str> {
     out.split_whitespace().find(|w| origin(w).is_some())
 }
 
+/// Where the browser's page is now, as `get url` says: `None` when that fails or is no http(s) page.
+async fn page_now(cfg: &Config) -> Option<String> {
+    let out = browser(cfg, &["get", "url"]).await.ok()?;
+    page_address(&out).map(String::from)
+}
+
+/// Why a fill stops after typing `done` because the page left `site` (`now`), or `None` while the
+/// page is still on it.
+fn moved(site: &str, now: Option<&str>, done: &[&str]) -> Option<String> {
+    if now.is_some_and(|p| same_origin(site, p)) {
+        return None;
+    }
+    let on = now
+        .and_then(origin)
+        .map_or("an unknown page".into(), |o| o.ascii_serialization());
+    Some(format!(
+        "stopped: after the {} was typed the page was on {on}, not {site}; the value may have \
+         reached that page. Submit nothing there, and tell the owner",
+        done.join(" and ")
+    ))
+}
+
 /// Types the login's fields into the page open in agent-browser, once the page is on its site.
-/// shortcut: the page could navigate between the address check and the fill; agent-browser has no
-/// fill-if-origin, so a redirect in that moment would get the value.
+/// The address is read again after each field, so a page that moves away gets no further field.
+/// shortcut: agent-browser has no fill-if-origin, so a redirect in the moment before a fill still
+/// gets that one value; then the agent is told, and submits nothing.
 async fn fill(cfg: &Config, login: &Entry, selectors: [Option<String>; 3]) -> String {
     let fields = match fields(login, &selectors, crate::now() as u64) {
         Ok(f) => f,
@@ -841,11 +864,15 @@ async fn fill(cfg: &Config, login: &Entry, selectors: [Option<String>; 3]) -> St
             return scrub(&format!("{done}but not the {label}: {e}"), &secrets);
         }
         done.push(label);
+        if let Some(stop) = moved(&login.site, page_now(cfg).await.as_deref(), &done) {
+            return stop;
+        }
     }
     format!("filled the {} on {page}", done.join(" and "))
 }
 
-/// How long one agent-browser command may take; a fill runs up to four within the tool's wait.
+/// How long one agent-browser command may take; a fill runs up to seven (an address read before
+/// and after each field), normally well within the tool's wait.
 const BROWSER_WAIT: Duration = Duration::from_secs(20);
 
 /// `agent-browser ARGS` as the agent, as `exec` runs it: its stdout, or why it failed.
@@ -1024,6 +1051,23 @@ programs = ["gh"]
         assert_eq!(out, "token=[redacted] (truncated)");
         assert_eq!(scrub("cret?Token>", &secrets), "[redacted]");
         assert_eq!(scrub("ghp_ and Token", &secrets), "ghp_ and Token");
+    }
+
+    #[test]
+    fn a_fill_stops_once_the_page_leaves_the_site() {
+        let site = "https://github.com";
+        assert_eq!(
+            moved(site, Some("https://github.com/session"), &["username"]),
+            None
+        );
+        let stop = moved(site, Some("https://evil.io/x"), &["username"]).unwrap();
+        assert!(
+            stop.starts_with("stopped: after the username was typed"),
+            "{stop}"
+        );
+        assert!(stop.contains("on https://evil.io") && stop.contains("Submit nothing"));
+        let stop = moved(site, None, &["username", "password"]).unwrap();
+        assert!(stop.contains("username and password") && stop.contains("an unknown page"));
     }
 
     #[test]
