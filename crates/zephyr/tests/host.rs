@@ -548,10 +548,9 @@ fn alert_installs_a_user_timer_and_posts_only_when_health_changes() {
     let timer = std::fs::read_to_string(units.join("zephyr-alert.timer")).unwrap();
     assert!(timer.contains("OnCalendar=*:0/5"), "{timer}");
     assert!(timer.contains("WantedBy=timers.target"), "{timer}");
-    let host: toml::Value =
-        toml::from_str(&std::fs::read_to_string(env.daemon().join("host.toml")).unwrap()).unwrap();
-    assert_eq!(host["alert"]["topic"].as_str(), Some("zephyr-lane_1"));
-    assert_eq!(host["alert"]["server"].as_str(), Some("https://ntfy.sh"));
+    // In the owner's home, readable with Docker down.
+    let saved = std::fs::read_to_string(env.home.join(".config/zephyr/alert-url")).unwrap();
+    assert_eq!(saved.trim(), "https://ntfy.sh/zephyr-lane_1");
     let calls = env.calls();
     find(&calls, &["systemctl", "--user", "daemon-reload"]);
     find(
@@ -629,17 +628,22 @@ fn alert_installs_a_user_timer_and_posts_only_when_health_changes() {
     );
     check(&[]);
     posts(&env);
-    check(&[(
+    // Failed replies are a count, posted when it grows, never a lasting "down".
+    let failed = [(
         "SHIM_STATUS",
         "outbox  sent        4\noutbox  failed      2",
-    )]);
+    )];
+    check(&failed);
     let p = posts(&env);
+    assert_eq!(p.len(), 1, "{p:?}");
     assert!(
-        p[0].contains(&"zephyr is unhealthy: 2 replies failed to send".to_string()),
+        p[0].contains(&"2 more replies failed to send (2 in all)".to_string()),
         "{p:?}"
     );
+    check(&failed);
+    assert!(posts(&env).is_empty(), "the same count again: nothing new");
     check(&[]);
-    posts(&env);
+    assert!(posts(&env).is_empty(), "healthy all along");
     // A post that fails is made again at the next check.
     let out = env.zephyr_env(
         &["alert", "check"],

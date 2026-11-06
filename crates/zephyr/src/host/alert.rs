@@ -14,10 +14,10 @@ pub fn main(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let rest = a.rest()?;
     let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
     match (&rest[..], server) {
-        (["setup", topic], server) => setup(h, topic, server.as_deref().unwrap_or(DEFAULT_SERVER)),
+        (["setup", topic], server) => setup(topic, server.as_deref().unwrap_or(DEFAULT_SERVER)),
         (["check"], None) => check(h),
         (["test"], None) => {
-            let url = target(h)?;
+            let url = target()?;
             post(&url, "zephyr alert test", "a test alert from zephyr")?;
             println!("sent a test alert to {url}");
             Ok(())
@@ -31,9 +31,16 @@ fn units_dir() -> PathBuf {
     home().join(".config/systemd/user")
 }
 
-/// `up` or `down`: what the last check found, so only a change is posted.
+/// `up` or `down`, then the failed-reply count: what the last check found, so only a change is
+/// posted.
 fn state_path() -> PathBuf {
     home().join(".local/state/zephyr/alert-state")
+}
+
+/// `<server>/<topic>`, in the owner's own home: a check must post even when Docker itself is down,
+/// so it cannot read its target through the container.
+fn url_path() -> PathBuf {
+    home().join(".config/zephyr/alert-url")
 }
 
 fn systemctl(args: &[&str]) -> Command {
@@ -42,7 +49,7 @@ fn systemctl(args: &[&str]) -> Command {
     cmd
 }
 
-fn setup(h: &Host, topic: &str, server: &str) -> anyhow::Result<()> {
+fn setup(topic: &str, server: &str) -> anyhow::Result<()> {
     // Both end up in a URL: nothing that could change its path or query.
     let topic_ok = (1..=64).contains(&topic.len())
         && topic
@@ -56,7 +63,9 @@ fn setup(h: &Host, topic: &str, server: &str) -> anyhow::Result<()> {
     if !scheme || server.contains(|c: char| c.is_whitespace() || c == '?' || c == '#') {
         bail!("--server takes an http(s) URL, e.g. {DEFAULT_SERVER}");
     }
-    h.data.set_alert(topic, server)?;
+    let url_file = url_path();
+    std::fs::create_dir_all(url_file.parent().context("no parent")?)?;
+    std::fs::write(&url_file, format!("{server}/{topic}\n"))?;
     let exe = std::env::current_exe().context("finding this zephyr")?;
     // A check against another container (`ZEPHYR_CONTAINER`) keeps checking that one.
     let env: String = ["ZEPHYR_CONTAINER", "ZEPHYR_IMAGE"]
@@ -90,21 +99,24 @@ fn setup(h: &Host, topic: &str, server: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `<server>/<topic>` from host.toml's `[alert]`.
-fn target(h: &Host) -> anyhow::Result<String> {
-    let topic = (h.data.host_get("alert.topic")?)
+/// `<server>/<topic>`, as `setup` saved it.
+fn target() -> anyhow::Result<String> {
+    let url = std::fs::read_to_string(url_path())
         .context("no alert is set up: zephyr alert setup TOPIC")?;
-    let server = (h.data.host_get("alert.server")?).unwrap_or_else(|| DEFAULT_SERVER.into());
-    Ok(format!("{}/{topic}", server.trim_end_matches('/')))
+    Ok(url.trim().to_string())
 }
 
-/// Posts when the gateway's health changed since the last check. The state is saved only once
-/// the post went out, so a failed post is tried again at the next check.
+/// Posts when the gateway's health changed since the last check, and when more replies failed to
+/// send than before (a count, not a state: failed rows stay until they are pruned). The state is
+/// saved only once the posts went out, so a failed post is tried again at the next check.
 fn check(h: &Host) -> anyhow::Result<()> {
-    let url = target(h)?;
-    let problem = problem(h);
+    let url = target()?;
+    let (problem, failed) = problem(h);
     let path = state_path();
-    let was_down = std::fs::read_to_string(&path).is_ok_and(|s| s.trim() == "down");
+    let saved = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut words = saved.split_whitespace();
+    let was_down = words.next() == Some("down");
+    let was_failed: i64 = words.next().and_then(|n| n.parse().ok()).unwrap_or(0);
     match (&problem, was_down) {
         (Some(why), false) => post(
             &url,
@@ -114,8 +126,22 @@ fn check(h: &Host) -> anyhow::Result<()> {
         (None, true) => post(&url, "zephyr is back", "zephyr is back")?,
         _ => {}
     }
+    if failed > was_failed {
+        let body = format!(
+            "{} more replies failed to send ({failed} in all)",
+            failed - was_failed
+        );
+        post(&url, "zephyr could not deliver replies", &body)?;
+    }
     std::fs::create_dir_all(path.parent().context("no parent")?)?;
-    std::fs::write(&path, if problem.is_some() { "down\n" } else { "up\n" })?;
+    let state = if problem.is_some() { "down" } else { "up" };
+    // While the status cannot be read, the last count stands.
+    let failed = if problem.is_some() {
+        was_failed.max(failed)
+    } else {
+        failed
+    };
+    std::fs::write(&path, format!("{state} {failed}\n"))?;
     match problem {
         Some(why) => println!("unhealthy: {why}"),
         None => println!("healthy"),
@@ -123,21 +149,24 @@ fn check(h: &Host) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What is wrong with the gateway, if anything: its container is not running, `zephyr status`
-/// fails, or replies failed to send.
-fn problem(h: &Host) -> Option<String> {
+/// What is wrong with the gateway, if anything (its container is not running, or `zephyr status`
+/// fails), and how many replies have failed to send.
+fn problem(h: &Host) -> (Option<String>, i64) {
     if !h.running() {
         let state = h.state().unwrap_or_else(|| "not created".into());
-        return Some(format!("container {} is {state}", h.container));
+        return (Some(format!("container {} is {state}", h.container)), 0);
     }
     let out = match h.exec(&[], &[], &["zephyr", "status"]).output() {
         Ok(out) => out,
-        Err(e) => return Some(format!("running docker exec failed: {e}")),
+        Err(e) => return (Some(format!("running docker exec failed: {e}")), 0),
     };
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let last = err.lines().last().unwrap_or_default().trim();
-        return Some(format!("zephyr status failed ({}) {last}", out.status));
+        return (
+            Some(format!("zephyr status failed ({}) {last}", out.status)),
+            0,
+        );
     }
     let failed: i64 = String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -146,7 +175,7 @@ fn problem(h: &Host) -> Option<String> {
             _ => None,
         })
         .sum();
-    (failed > 0).then(|| format!("{failed} replies failed to send"))
+    (None, failed)
 }
 
 fn post(url: &str, title: &str, body: &str) -> anyhow::Result<()> {
@@ -181,6 +210,7 @@ fn off() -> anyhow::Result<()> {
     }
     run(&mut systemctl(&["daemon-reload"]))?;
     let _ = std::fs::remove_file(state_path());
+    let _ = std::fs::remove_file(url_path());
     println!("outage alerts are off");
     Ok(())
 }
