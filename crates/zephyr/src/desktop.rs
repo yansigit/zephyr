@@ -81,7 +81,8 @@ fn cookie(path: &std::path::Path, display: &str) -> std::io::Result<()> {
         .open(&tmp)?;
     f.write_all(&entry(number, &secret))?;
     f.sync_all()?;
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    crate::host::conf::sync_parent(path)
 }
 
 /// One Xauthority entry: any host (`FamilyWild`), display `number`, an MIT-MAGIC-COOKIE.

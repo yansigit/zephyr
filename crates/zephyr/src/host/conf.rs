@@ -38,15 +38,29 @@ pub fn replace_private(path: &Path, text: &str) -> anyhow::Result<()> {
     let name = path.file_name().context("no file name")?.to_string_lossy();
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = path.with_file_name(format!(".{name}.{}-{seq}.tmp", std::process::id()));
+    write_private(&tmp, text)
+        .and_then(|()| Ok(std::fs::rename(&tmp, path)?))
+        .and_then(|()| Ok(sync_parent(path)?))
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// Replaces `path` whole with `bytes`, written to `tmp` first, as `replace_private` does but with
+/// the default mode: for files the agent's processes read.
+pub fn replace_durably(path: &Path, tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(tmp, path)?;
+    sync_parent(path)
+}
+
+/// A rename into `path` is durable only once its directory is on disk too.
+pub fn sync_parent(path: &Path) -> std::io::Result<()> {
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    write_private(&tmp, text)
-        .and_then(|()| Ok(std::fs::rename(&tmp, path)?))
-        // The rename itself is durable only once its directory is on disk too.
-        .and_then(|()| Ok(std::fs::File::open(dir)?.sync_all()?))
-        .with_context(|| format!("writing {}", path.display()))
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// Where `~/.zephyr-daemon` is mounted in the container.
