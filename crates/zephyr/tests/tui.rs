@@ -277,7 +277,8 @@ fn normalize(screen: &str) -> String {
                 }
                 _ => l.to_string(),
             };
-            let live = ["esc to stop", "retry ", "● ", "✗ "];
+            // `* ` is `● ` under LANG=C: a running tool's clock.
+            let live = ["esc to stop", "retry ", "● ", "✗ ", "* "];
             if !live.iter().any(|m| l.contains(m)) {
                 return l.trim_end().to_string();
             }
@@ -484,8 +485,21 @@ async fn shoot(
     }
     screen.keys(keys);
     screen.wait_for(shown).await;
-    // One more frame for anything that arrived with the marker.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Anything that arrived with the marker is drawn once the screen stops changing, apart from
+    // what moves with the clock (`normalize` masks it).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = normalize(&screen.tmux.capture(false));
+    let mut same = 0;
+    while same < 3 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now = normalize(&screen.tmux.capture(false));
+        same = if now == last { same + 1 } else { 0 };
+        last = now;
+        assert!(
+            Instant::now() < deadline,
+            "the screen never settled:\n{last}"
+        );
+    }
     (screen.tmux.capture(false), screen.tmux.capture(true))
 }
 
