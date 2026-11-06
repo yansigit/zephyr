@@ -610,7 +610,7 @@ impl<'a> Router<'a> {
         if exit != Exit::Reexec {
             self.procs.stop_all();
         }
-        self.drain(channels).await;
+        self.drain(channels, &mut rx).await;
         Ok(exit)
     }
 
@@ -1264,8 +1264,8 @@ impl<'a> Router<'a> {
     /// which rpi delivers after the current tool as a user message of its own. A follow-up
     /// waits for the settle, and each one then starts a run of its own, in order.
     async fn dispatch_new(&mut self) -> anyhow::Result<()> {
-        // Rows stay `new` while the child is down or the gateway is paused.
-        if self.child.is_none() || self.store.pause_reason()?.is_some() {
+        // Rows stay `new` while the child is down, the gateway is paused or stopping.
+        if self.stopping || self.child.is_none() || self.store.pause_reason()?.is_some() {
             return Ok(());
         }
         for row in self.store.inbox_with_status("new")? {
@@ -2545,9 +2545,11 @@ impl<'a> Router<'a> {
         let _ = self.tap.send(reply); // no receivers is fine
     }
 
-    /// SIGTERM: stop intake, let a running turn settle, flush, then stop the child.
-    async fn drain<C: Channel>(&mut self, channels: &[C]) {
+    /// SIGTERM: let a running turn settle, flush, then stop the child. Nothing more is
+    /// dispatched; messages that come in meanwhile get their rows, for the next start.
+    async fn drain<C: Channel>(&mut self, channels: &[C], rx: &mut mpsc::Receiver<Inbound>) {
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
+        self.stopping = true;
         let deadline = Instant::now() + Duration::from_secs(20);
         while self.busy {
             match tokio::time::timeout_at(deadline, next_event(&mut self.child)).await {
@@ -2569,9 +2571,25 @@ impl<'a> Router<'a> {
                 log(self.store.notify_last_owner(&alert).map_err(Into::into));
             }
         }
+        self.take_in(rx).await;
         self.flush(channels).await;
         if let Some(child) = self.child.take() {
             child.stop().await;
+        }
+        // Last, and nothing awaits a channel after it: a closed intake ends the adapters' runs,
+        // which ends the gateway.
+        rx.close();
+        self.attaches.close();
+        self.take_in(rx).await;
+    }
+
+    /// Writes the waiting messages' rows (and answers commands) while draining.
+    async fn take_in(&mut self, rx: &mut mpsc::Receiver<Inbound>) {
+        while let Ok(m) = rx.try_recv() {
+            self.inbound(m, false).await;
+        }
+        while let Ok(req) = self.attaches.try_recv() {
+            self.attach(req).await;
         }
     }
 

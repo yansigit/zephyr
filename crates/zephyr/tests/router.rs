@@ -617,6 +617,30 @@ async fn waiting_messages_go_when_the_budget_pause_ends_at_midnight() {
     gw.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_message_that_comes_in_during_the_drain_is_kept_for_the_next_start() {
+    let home = home("drain-intake");
+    std::fs::write(home.join("slow"), "3").unwrap();
+    let mut cfg = config(&home);
+    cfg.auth.enabled = false; // its call would hold the loop while the fake sleeps
+    let mut gw = start(cfg);
+    gw.say("m1", "owner", "first").await;
+    wait(|| inbox_status(&home, "dispatched") == 1).await;
+    let _ = gw.stop.take().unwrap().send(());
+    tokio::time::sleep(Duration::from_millis(500)).await; // the drain has begun
+    gw.say("m2", "owner", "during the drain").await;
+    gw.task.await.unwrap().unwrap();
+    assert_eq!(log(&home, "prompt").len(), 1, "nothing new went to rpi");
+
+    std::fs::remove_file(home.join("slow")).unwrap();
+    let gw = start(config(&home));
+    assert_eq!(
+        gw.wait_replies(1).await,
+        ["echo: [chat #2] during the drain"]
+    );
+    gw.shutdown().await;
+}
+
 fn run_status(home: &Path, status: &str) -> i64 {
     let counts = Store::open(&home.join("state.db"))
         .unwrap()
