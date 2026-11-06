@@ -574,8 +574,10 @@ for line in iter(next_line, None):
             hanging = True; continue
         answers, text = [], ""
         for name, args in re.findall(r"\[call (\w+) (\{[^{}]*\})\]", cmd["message"]) if tools else []:
-            calls += 1  # a fresh id per call, as a model would
-            text = run_tool(s, name, json.loads(args), "c%d" % calls)
+            # A fresh id per call, unique across children too, as a model's are: main and its tasks
+            # share one gateway dir, so a task must never read main's answer to the same number.
+            calls += 1
+            text = run_tool(s, name, json.loads(args), "c%d-%d" % (os.getpid(), calls))
             if text is None:
                 break
             if name in ("gateway", "task", "exec", "process", "vault"):
