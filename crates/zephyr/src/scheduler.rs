@@ -490,11 +490,19 @@ async fn resume(
         // Cut before the prompt was committed: start it now.
         return prompt(cfg, child, spec.prompt, spec.refuse, tally, max_turns).await;
     };
-    let text = message_text(last);
-    if last["kind"] == "assistant" && !text.is_empty() {
+    if let Some(text) = final_reply(last) {
         return Ok(Ok(text));
     }
     prompt(cfg, child, RESUME_NOTE, spec.refuse, tally, max_turns).await
+}
+
+/// The text of `last` when it is a finished reply: the agent's, with text, and no tool call
+/// still waiting on its result.
+fn final_reply(last: &serde_json::Value) -> Option<String> {
+    let blocks = last["content"].as_array().into_iter().flatten();
+    let calling = blocks.clone().any(|b| b["type"] == "toolCall");
+    let text = message_text(last);
+    (last["kind"] == "assistant" && !calling && !text.is_empty()).then_some(text)
 }
 
 /// The most of a tool call's arguments an audit line keeps.
@@ -734,6 +742,19 @@ mod tests {
 
     fn utc(schedule: &str, after: i64) -> Option<i64> {
         next_after(schedule, after, &TimeZone::UTC)
+    }
+
+    #[test]
+    fn a_reply_still_calling_a_tool_is_not_the_finished_report() {
+        let calling = json!({"kind": "assistant", "content": [
+            {"type": "text", "text": "Let me build it."},
+            {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": "make"}}
+        ]});
+        assert_eq!(final_reply(&calling), None);
+        let done = json!({"kind": "assistant", "content": [{"type": "text", "text": "Built."}]});
+        assert_eq!(final_reply(&done).as_deref(), Some("Built."));
+        let user = json!({"kind": "user", "content": "go"});
+        assert_eq!(final_reply(&user), None);
     }
 
     fn cfg(timezone: Option<&str>) -> Config {
