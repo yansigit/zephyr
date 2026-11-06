@@ -4,26 +4,7 @@
 [advisories]
 # cargo-deny 0.20 has no warn level: every unmaintained crate fails the job (the default scope is
 # `all`). `unmaintained = "workspace"` or `"none"` would narrow or drop that. Vulnerabilities always fail.
-#
-# The seven ignores below all sit in one chain: zephyr -> serenity 0.12.5 (rustls_backend) ->
-# tokio-tungstenite 0.21 -> rustls 0.22.4 -> rustls-webpki 0.102.8. serenity 0.12.5 is the newest release.
-# Its native_tls_backend drops rustls 0.22 and clears all seven (checked in a scratch copy). Until that
-# change lands, the last three are accepted risks: they reach the Discord gateway's TLS verification.
-ignore = [
-    # Not reachable: rustls 0.22 has no hybrid post-quantum key exchange to downgrade.
-    { id = "RUSTSEC-2026-0349", reason = "rustls 0.22 has no X25519MLKEM768 group, so nothing to downgrade" },
-    # Not reachable: the Debug leak needs a custom ClientSessionStore, and zephyr has none.
-    { id = "RUSTSEC-2026-0346", reason = "no custom ClientSessionStore formats TLS session values" },
-    # Not reachable: no CRLs are configured in the chain, so CRL parsing and matching never run.
-    { id = "RUSTSEC-2026-0049", reason = "CRL checking is not configured" },
-    { id = "RUSTSEC-2026-0104", reason = "CRL checking is not configured" },
-    # Accepted risk: needs a misissued certificate from a trusted CA. Reaches the Discord gateway.
-    { id = "RUSTSEC-2026-0098", reason = "accepted risk: URI name constraints ignored; needs misissuance; reaches the Discord gateway" },
-    { id = "RUSTSEC-2026-0099", reason = "accepted risk: wildcard name constraints; needs misissuance; reaches the Discord gateway" },
-    # Accepted risk: a chain through a distrusted emSign intermediate (its key is public) is accepted,
-    # so an on-path attacker could pose as the Discord gateway. Reaches the Discord gateway.
-    { id = "RUSTSEC-2026-0382", reason = "accepted risk: distrusted emSign intermediates accepted; reaches the Discord gateway" },
-]
+
 
 [bans]
 multiple-versions = "warn"
