@@ -7,7 +7,8 @@
 
 use anyhow::{bail, Context};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 const USER: &str = "USER.md";
 const MEMORY: &str = "MEMORY.md";
@@ -245,6 +246,13 @@ fn read_rules(state: &Path) -> anyhow::Result<Vec<String>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// `commit_if_changed` on a blocking thread: the daemon is one future, and git in the agent's
+/// repo must never stall it.
+pub async fn commit(home: &Path, state: &Path) -> anyhow::Result<Option<String>> {
+    let (home, state) = (home.to_path_buf(), state.to_path_buf());
+    tokio::task::spawn_blocking(move || commit_if_changed(&home, &state)).await?
 }
 
 /// Commits every change in the memory dir as `memory: <utc time>`. Returns the owner's notice
@@ -519,13 +527,41 @@ fn revert_newest(home: &Path) -> anyhow::Result<String> {
     ))
 }
 
+/// The longest one memory git call may take before its process group is killed.
+const GIT_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 3 } else { 30 });
+
+/// git as the agent in its own repo. The agent owns `.git`, so none of its hooks or fsmonitor
+/// runs, nor system or global config; a filter or signing program it set up there still could,
+/// so the call is killed, with everything it started, at `GIT_TIMEOUT`.
 fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = crate::agent::cmd(&mut Command::new("git"))
+    use std::os::unix::process::CommandExt;
+    let child = crate::agent::cmd(&mut Command::new("git"))
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+        ])
         .arg("-C")
         .arg(dir)
         .args(args)
-        .output()
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
         .context("running git")?;
+    let group = child.id() as i32;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(child.wait_with_output()));
+    let Ok(out) = rx.recv_timeout(GIT_TIMEOUT) else {
+        // SAFETY: a plain syscall on the group git leads.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+        bail!("git {}: no answer in {GIT_TIMEOUT:?}", args[0]);
+    };
+    let out = out.context("running git")?;
     if !out.status.success() {
         bail!(
             "git {}: {}",
@@ -594,6 +630,37 @@ mod tests {
         assert_eq!(who, "Zephyr <zephyr@localhost>");
         assert!(subject.starts_with("memory: 20"), "got {subject}");
         assert_eq!(commits(&home).len(), 2);
+    }
+
+    #[test]
+    fn the_agents_hooks_never_run_and_a_hanging_filter_is_killed() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = home();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
+        let hook = dir(&home).join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir(&home).join(USER), "name: Aiden\n").unwrap();
+        let start = std::time::Instant::now();
+        commit_if_changed(&home, &state(&home)).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(commits(&home).len(), 2);
+
+        // A clean filter is the repo's own config, so it runs; the call is cut off instead.
+        git(&dir(&home), &["config", "filter.slow.clean", "sleep 30"]).unwrap();
+        std::fs::write(dir(&home).join(".gitattributes"), "* filter=slow\n").unwrap();
+        std::fs::write(dir(&home).join(MEMORY), "likes tea\n").unwrap();
+        let start = std::time::Instant::now();
+        assert!(commit_if_changed(&home, &state(&home)).is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

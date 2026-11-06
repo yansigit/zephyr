@@ -1346,7 +1346,8 @@ impl<'a> Router<'a> {
         // Before reconcile dispatches the next row, so that row runs on the new model.
         self.apply_model().await;
         self.backoff = FIRST_BACKOFF;
-        let memory = crate::memory::commit_if_changed(&self.cfg.home, self.cfg.state_dir())
+        let memory = crate::memory::commit(&self.cfg.home, self.cfg.state_dir())
+            .await
             .unwrap_or_else(|e| {
                 eprintln!("zephyr: memory commit failed: {e:#}");
                 None

@@ -138,6 +138,7 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
     let mut poll = tokio::time::interval(PAUSE_POLL);
     let mut was_paused = false;
     let mut swept: Option<Instant> = None;
+    let mut sweeping: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         let woke = tokio::select! {
             _ = tick.tick() => true,
@@ -149,15 +150,22 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
             tz = zone(&cfg)?; // checked by Config::validate
         }
         // Hourly, from the first tick on: leftovers older than 30 days (DESIGN §4.1).
-        if woke && swept.is_none_or(|t| t.elapsed() >= SWEEP_EVERY) {
+        // On a blocking thread with its own connection, one at a time: it walks dirs and runs
+        // checkpoint git, which must never stall the daemon's one future.
+        let idle = sweeping.as_ref().is_none_or(|h| h.is_finished());
+        if woke && idle && swept.is_none_or(|t| t.elapsed() >= SWEEP_EVERY) {
             swept = Some(Instant::now());
-            match crate::retention::sweep(&cfg, &store, crate::retention::AGE) {
-                Ok(0) => {}
-                Ok(n) => {
-                    eprintln!("zephyr: removed {n} files of background work older than 30 days")
+            let cfg = cfg.clone();
+            sweeping = Some(tokio::task::spawn_blocking(move || {
+                let store = Store::open(&cfg.db_path());
+                match store.and_then(|s| crate::retention::sweep(&cfg, &s, crate::retention::AGE)) {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        eprintln!("zephyr: removed {n} files of background work older than 30 days")
+                    }
+                    Err(e) => eprintln!("zephyr: sweeping old background files failed: {e}"),
                 }
-                Err(e) => eprintln!("zephyr: sweeping old background files failed: {e}"),
-            }
+            }));
         }
         let now_paused = paused(&store);
         // A resume works through what waited without waiting for the next tick.
@@ -195,7 +203,8 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
             let (status, output, crossed) = execute(&cfg, &mut store, &spec).await;
             wake.running.store(false, Ordering::SeqCst);
             // The run's memory edits are committed as main's settle would commit them.
-            let memory = crate::memory::commit_if_changed(&cfg.home, cfg.state_dir())
+            let memory = crate::memory::commit(&cfg.home, cfg.state_dir())
+                .await
                 .unwrap_or_else(|e| {
                     eprintln!("zephyr: memory commit failed: {e:#}");
                     None
