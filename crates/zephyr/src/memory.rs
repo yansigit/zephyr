@@ -270,10 +270,7 @@ pub fn commit_if_changed(home: &Path, state: &Path) -> anyhow::Result<Option<Str
 
 /// Records `working` as the content the owner was last shown. False when it already was.
 fn mark_shown(state: &Path, working: &Files) -> anyhow::Result<bool> {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    working.hash(&mut h);
-    let hash = format!("{:x}", h.finish());
+    let hash = crate::drafts::digest(working.iter().map(String::as_bytes));
     let seen = approved_dir(state).join(".notified");
     if std::fs::read_to_string(&seen).is_ok_and(|s| s == hash) {
         return Ok(false);

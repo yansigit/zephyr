@@ -118,15 +118,27 @@ impl Content {
 /// A draft as read: its content, or why it cannot be approved.
 type Draft = Result<Content, String>;
 
+/// What an approval trusts to mean "unchanged since shown", so a hash no draft can be made to
+/// collide with. A fingerprint stored in the old form never matches: the draft is shown again.
 fn fingerprint(draft: &Draft) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
     match draft {
-        Ok(Content::Skill(files)) => files.hash(&mut h),
-        Ok(c) => c.render().hash(&mut h),
-        Err(e) => e.hash(&mut h),
+        Ok(Content::Skill(files)) => digest(
+            std::iter::once(&b"skill"[..])
+                .chain(files.iter().flat_map(|(p, b)| [p.as_bytes(), b.as_slice()])),
+        ),
+        Ok(c) => digest([&b"connector"[..], c.render().as_bytes()]),
+        Err(e) => digest([&b"error"[..], e.as_bytes()]),
     }
-    format!("{:x}", h.finish())
+}
+
+/// SHA-256 over `parts`, each prefixed by its length so no two lists of parts hash alike, as hex.
+pub(crate) fn digest<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> String {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    for part in parts {
+        ctx.update(&(part.len() as u64).to_be_bytes());
+        ctx.update(part);
+    }
+    data_encoding::HEXLOWER.encode(ctx.finish().as_ref())
 }
 
 /// A skill or connector name: 1 to 64 lowercase letters, digits or '-'. It becomes a folder or
@@ -1227,6 +1239,29 @@ mod tests {
         assert!(say(&gone, "/mcp rm files")
             .0
             .contains("no approved connector"));
+    }
+
+    #[test]
+    fn fingerprints_are_sha256_and_an_old_one_shows_the_draft_again() {
+        let one = |files: &[(&str, &str)]| {
+            let files = files
+                .iter()
+                .map(|(p, b)| (p.to_string(), b.as_bytes().to_vec()))
+                .collect();
+            fingerprint(&Ok(Content::Skill(files)))
+        };
+        let a = one(&[("SKILL.md", "ab"), ("x", "c")]);
+        assert_eq!(a.len(), 64, "{a}");
+        assert_ne!(a, one(&[("SKILL.md", "a"), ("bx", "c")]), "length-prefixed");
+        assert_ne!(a, one(&[("SKILL.md", "ab"), ("x", "d")]));
+
+        let cfg = cfg("");
+        skill(&cfg, "tea", "Boil water.");
+        let mut old = BTreeMap::new();
+        old.insert(key(Kind::Skill, "tea"), "9f3a1c0b2d4e5f60".to_string());
+        save_shown(cfg.state_dir(), &old).unwrap();
+        assert_eq!(scan(&cfg).len(), 1, "shown again");
+        assert!(say(&cfg, "/skill ok tea").0.contains("approved"));
     }
 
     #[test]
