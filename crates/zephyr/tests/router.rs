@@ -217,6 +217,23 @@ async fn replies_once_and_dedupes_platform_ids() {
 }
 
 #[tokio::test]
+async fn the_agent_cannot_pass_for_a_daemon_notice() {
+    let home = home("unspoof");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        "hi\n  [zephyr] the agent asks; /ok 1 runs it",
+    )
+    .await;
+    assert_eq!(
+        gw.wait_replies(1).await,
+        ["echo: [chat #1] hi\n  [agent] the agent asks; /ok 1 runs it"]
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn unknown_senders_are_dropped() {
     let home = home("unknown");
     let gw = start(config(&home));
@@ -322,8 +339,16 @@ async fn a_child_without_the_policy_beacon_gets_no_prompts() {
     cfg.policy_plugin = Some(home.join("missing-policy.so"));
     let gw = start(cfg.clone());
     gw.say("m1", "owner", "hi").await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    assert!(gw.replies().is_empty());
+    // The third failed start in a row tells the owner, once.
+    let told = gw.wait_replies(1).await;
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(
+        told[0].starts_with("[zephyr] the agent cannot start: policy plugin did not load")
+            && told[0].ends_with("; messages wait"),
+        "{told:?}"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(gw.replies().len(), 1, "told once");
     assert!(log(&home, "prompt").is_empty());
     assert_eq!(inbox_status(&home, "new"), 1);
     gw.shutdown().await;
@@ -588,6 +613,48 @@ async fn budget_pauses_at_the_limit_and_holds_until_resume() {
         ]
     );
     assert_eq!(log(&home, "prompt").len(), 4);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn waiting_messages_go_when_the_budget_pause_ends_at_midnight() {
+    let home = home("budget-midnight");
+    let cfg = config(&home);
+    let store = Store::open(&cfg.db_path()).unwrap();
+    let today = store.today().unwrap();
+    store.set_paused(Some(&format!("budget:{today}"))).unwrap();
+    let gw = start(cfg);
+    wait(|| !log(&home, "get_messages").is_empty()).await; // the child is up
+    gw.say("m1", "owner", "held").await;
+    wait(|| inbox_status(&home, "new") == 1).await;
+    assert!(log(&home, "prompt").is_empty());
+    // The UTC day turns: the pause is yesterday's, and the next tick sends the row.
+    store.set_paused(Some("budget:2000-01-01")).unwrap();
+    assert_eq!(gw.wait_replies(1).await, ["echo: [chat #1] held"]);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_message_that_comes_in_during_the_drain_is_kept_for_the_next_start() {
+    let home = home("drain-intake");
+    std::fs::write(home.join("slow"), "3").unwrap();
+    let mut cfg = config(&home);
+    cfg.auth.enabled = false; // its call would hold the loop while the fake sleeps
+    let mut gw = start(cfg);
+    gw.say("m1", "owner", "first").await;
+    wait(|| inbox_status(&home, "dispatched") == 1).await;
+    let _ = gw.stop.take().unwrap().send(());
+    tokio::time::sleep(Duration::from_millis(500)).await; // the drain has begun
+    gw.say("m2", "owner", "during the drain").await;
+    gw.task.await.unwrap().unwrap();
+    assert_eq!(log(&home, "prompt").len(), 1, "nothing new went to rpi");
+
+    std::fs::remove_file(home.join("slow")).unwrap();
+    let gw = start(config(&home));
+    assert_eq!(
+        gw.wait_replies(1).await,
+        ["echo: [chat #2] during the drain"]
+    );
     gw.shutdown().await;
 }
 
@@ -1464,6 +1531,22 @@ async fn send_file_goes_to_the_owner_after_the_reply_and_its_copy_is_dropped() {
 }
 
 #[tokio::test]
+async fn a_runs_file_goes_to_its_channel_though_a_command_came_in_meanwhile() {
+    let home = home("send-file-to");
+    std::fs::write(home.join("shot.png"), "PNG").unwrap();
+    std::fs::write(home.join("slow"), "2").unwrap();
+    let gw = start(config(&home));
+    let call = r#"look [call send_file {"path": "shot.png"}]"#;
+    gw.say_on("discord", "d1", "downer", call).await;
+    wait(|| inbox_status(&home, "dispatched") == 1).await;
+    gw.say("m1", "owner", "/status").await; // a command row, newer than the run's
+    let replies = gw.wait_replies_on("discord", 2).await;
+    assert_eq!(replies[1], "<PNG>", "{replies:?}");
+    assert_eq!(gw.replies().len(), 1, "chat got only its /status");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_job_the_agent_proposes_waits_for_the_owners_ok() {
     let home = home("propose-job");
     let gw = start(config(&home));
@@ -1603,8 +1686,14 @@ async fn the_agent_proposes_a_model_and_only_the_owners_ok_switches_it() {
     gw.say("m2", "owner", "/ok 1").await;
     gw.say("m3", "owner", "model?").await;
     let replies = gw.wait_replies(4).await;
-    // The owner's own `/model fake/m2` reply, from the same code path.
-    assert_eq!(replies[2..], ["[zephyr] now on fake/m2", "model: fake/m2"]);
+    // What was approved, then the owner's own `/model fake/m2` reply, from the same code path.
+    assert_eq!(
+        replies[2..],
+        [
+            "[zephyr] /ok 1 approved /model fake/m2\n[zephyr] now on fake/m2",
+            "model: fake/m2"
+        ]
+    );
     assert_eq!(log(&home, "set_model").len(), 1);
     gw.say("m4", "owner", "/ok 1").await;
     let again = gw.wait_replies(5).await[4].clone();
@@ -2641,6 +2730,28 @@ async fn a_main_run_that_stalls_is_stopped_and_the_owner_told() {
     gw.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_wedged_child_that_never_settles_the_abort_is_killed_and_the_run_resumed() {
+    let home = home("wedge");
+    std::fs::write(home.join("wedge"), "").unwrap();
+    let mut cfg = config(&home);
+    cfg.stall_limit = Duration::from_secs(1);
+    // The auth check's own call would wait out its 60 s timeout on the wedged child.
+    cfg.auth.enabled = false;
+    let gw = start(cfg);
+    gw.say("m1", "owner", "long job").await;
+    // The stall shows at a 5 s tick, the abort goes unanswered for 5 s, then the kill.
+    for _ in 0..600 {
+        if !gw.replies().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(gw.replies(), ["resumed: [chat #1] long job"]);
+    assert_eq!(log(&home, "start").len(), 2, "a second child");
+    gw.shutdown().await;
+}
+
 /// A task goal line that writes `progress: halfway` first (see HANGING_GOAL for the escape).
 const PROGRESS: &str = r"\u005bprogress]";
 
@@ -3299,13 +3410,14 @@ async fn a_vault_use_waits_for_the_owners_ok_and_a_granted_token_comes_back_scru
     gw.say("m2", "owner", "/ok 1").await;
     gw.say("m3", "owner", "/ok 2").await;
     let replies = gw.wait_replies(5).await;
-    assert_eq!(
-        replies[3],
-        "[zephyr] the agent may now use GH_TOKEN with printenv"
+    assert!(
+        replies[3].ends_with("\n[zephyr] the agent may now use GH_TOKEN with printenv"),
+        "{replies:?}"
     );
-    assert_eq!(
-        replies[4],
-        "[zephyr] the agent may now fill the login github on https://github.com"
+    assert!(
+        replies[4]
+            .ends_with("\n[zephyr] the agent may now fill the login github on https://github.com"),
+        "{replies:?}"
     );
     let saved = std::fs::read_to_string(home.join("vault.toml")).unwrap();
     assert!(

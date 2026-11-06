@@ -3,7 +3,8 @@
 
 State lives next to --session-dir (the zephyr home): log.jsonl records every command,
 pid holds the current pid, and a `hang` file makes the next prompt commit its user
-message, mark the run resumable, and stop answering (the test then kills -9 it); a
+message, mark the run resumable, and stop answering (the test then kills -9 it); a `wedge`
+file does the same but never takes another command, `abort` included (a wedged rpi); a
 `slow` file holds the seconds each prompt takes. `usage.json` (if present) is the usage each
 reply carries: {"totalTokens": n, "costTotal": x}, sent as message.usage.{totalTokens,cost.total}.
 `get_stats` always reports 0, as rpi does for replies.
@@ -408,6 +409,11 @@ for line in iter(next_line, None):
         deliver_steering(s)  # as rpi: one steered while idle waits for the next run
         if os.path.exists(os.path.join(home, "slow")):
             time.sleep(float(open(os.path.join(home, "slow")).read() or 1))
+        if os.path.exists(os.path.join(home, "wedge")):
+            os.remove(os.path.join(home, "wedge"))
+            s["pending"] = True; save(s)
+            while True:  # wedged: no command is read or answered again, abort included
+                time.sleep(3600)
         if os.path.exists(os.path.join(home, "hang")):
             os.remove(os.path.join(home, "hang"))
             s["pending"] = True; save(s)

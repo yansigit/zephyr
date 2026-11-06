@@ -41,8 +41,17 @@ impl Channel for ChatChannel {
         let listener = UnixListener::bind(&self.path)
             .with_context(|| format!("binding {}", self.path.display()))?;
         for conn_id in 0u64.. {
-            let (stream, _) = listener.accept().await?;
-            let uid = stream.peer_cred()?.uid().to_string();
+            // One failed accept (EMFILE, a peer gone already) must not end the gateway.
+            let accepted = listener.accept().await;
+            let cred = accepted.and_then(|(stream, _)| Ok((stream.peer_cred()?, stream)));
+            let (uid, stream) = match cred {
+                Ok((cred, stream)) => (cred.uid().to_string(), stream),
+                Err(e) => {
+                    eprintln!("zephyr: chat accept failed: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let (read, write) = stream.into_split();
             self.conns
                 .lock()
@@ -84,7 +93,9 @@ impl Channel for ChatChannel {
             Some(name) => format!("{}\n[file] {}", msg.text, name.to_string_lossy()),
             None => msg.text.clone(),
         };
-        let mut line = serde_json::to_vec(&json!({"id": msg.client_id, "text": text}))?;
+        // `re`: the message this answers (null for a notice), so `ask` skips other lines.
+        let line = json!({"id": msg.client_id, "text": text, "re": msg.reply_to});
+        let mut line = serde_json::to_vec(&line)?;
         line.push(b'\n');
         let mut delivered = false;
         let mut conns = self.conns.lock().await;
@@ -161,6 +172,7 @@ mod tests {
             client_id: "z1".into(),
             text: "x".repeat(4 << 20), // more than the socket buffers hold
             attachment: None,
+            reply_to: None,
         };
         let sent = tokio::time::timeout(std::time::Duration::from_secs(5), chat.send(&msg)).await;
         assert!(sent.expect("send returned").is_err(), "nothing was read");

@@ -22,6 +22,13 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// one stuck channel can't hold up the router or the other channels.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const STUCK_PAUSE: Duration = Duration::from_secs(30);
+/// How long the router waits for rpi to answer an `abort`: the settle is what counts.
+const ABORT_WAIT: Duration = Duration::from_secs(5);
+/// A run cut this long ago (at most `stall_limit`) that never settled: the child is wedged and
+/// is killed, and the run resumes as after a crash.
+const WEDGED: Duration = Duration::from_secs(60);
+/// After this many failed starts in a row the owner is told the agent cannot start.
+const SPAWN_FAILURES: u32 = 3;
 
 /// The prompt text for a row. The `#id` tag is what recovery looks for in `get_messages`.
 pub fn tagged(row: &InboxRow) -> String {
@@ -303,6 +310,9 @@ pub async fn run<C: Channel>(
         last_event: Instant::now(),
         note_pending: false,
         cut: None,
+        cut_at: None,
+        spawn_failures: 0,
+        stopping: false,
         procs: Default::default(),
         compacting: None,
     };
@@ -465,6 +475,12 @@ struct Router<'a> {
     note_pending: bool,
     /// Why the current run was stopped by a run limit; told to the owner at its settle.
     cut: Option<String>,
+    /// When `cut` was set: a cut run that never settles is a wedged child (`cap_run`).
+    cut_at: Option<Instant>,
+    /// Failed child starts in a row, so the owner is told once (`SPAWN_FAILURES`).
+    spawn_failures: u32,
+    /// Draining for a shutdown: rows are written but never dispatched.
+    stopping: bool,
     /// The main agent's `exec` commands (DESIGN §4.13).
     procs: crate::procs::Procs,
     /// The pooled account the child runs on (DESIGN §4.9). `None` without a pool.
@@ -520,6 +536,8 @@ impl<'a> Router<'a> {
         let mut exit = Exit::Shutdown;
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
         let mut tick = tokio::time::interval(Duration::from_secs(5));
+        let paused = |store: &Store| store.pause_reason().ok().flatten().is_some();
+        let mut was_paused = paused(&self.store);
         self.publish();
         loop {
             tokio::select! {
@@ -570,6 +588,12 @@ impl<'a> Router<'a> {
                         let text = self.reload().await;
                         eprintln!("zephyr: zephyr.toml or secrets.env changed: {text}");
                     }
+                    // A budget pause ends at UTC midnight with nothing else to wake the router;
+                    // a run in progress reconciles at its settle, a new child when it starts.
+                    let ended = std::mem::replace(&mut was_paused, paused(&self.store));
+                    if ended && !was_paused && !self.busy && self.child.is_some() {
+                        log(self.reconcile(None, false).await);
+                    }
                 }
             }
             self.flush(channels).await;
@@ -586,7 +610,7 @@ impl<'a> Router<'a> {
         if exit != Exit::Reexec {
             self.procs.stop_all();
         }
-        self.drain(channels).await;
+        self.drain(channels, &mut rx).await;
         Ok(exit)
     }
 
@@ -819,7 +843,10 @@ impl<'a> Router<'a> {
             Some("assistant") if !text.is_empty() => {
                 if let Some(i) = self.steered.iter().position(|(_, delivered)| *delivered) {
                     let (row, _) = self.steered.remove(i);
-                    log(self.store.reply(&row, &text, "done").map_err(Into::into));
+                    log(self
+                        .store
+                        .reply(&row, &unspoof(&text), "done")
+                        .map_err(Into::into));
                     self.steer_sent.push(text);
                     self.steer_replied = true;
                 }
@@ -1006,6 +1033,7 @@ impl<'a> Router<'a> {
         match Child::spawn_as(&self.cfg, Some(&session), account.as_ref()).await {
             Ok(child) => {
                 eprintln!("zephyr: rpi child {:?} ready", child.pid());
+                self.spawn_failures = 0;
                 if let Some(a) = &account {
                     eprintln!("zephyr: on account {} ({})", a.name, a.model);
                 }
@@ -1024,6 +1052,17 @@ impl<'a> Router<'a> {
             }
             Err(e) => {
                 eprintln!("zephyr: spawning rpi failed: {e:#}");
+                self.spawn_failures += 1;
+                if self.spawn_failures == SPAWN_FAILURES {
+                    let text = format!("[zephyr] the agent cannot start: {e:#}; messages wait");
+                    // Whoever waits for an answer, else whoever had the last one.
+                    let waiting = self.store.inbox_with_status("new").ok();
+                    let told = match waiting.as_ref().and_then(|w| w.first()) {
+                        Some(row) => self.store.notify(&row.channel, &row.sender, &text),
+                        None => self.store.notify_last_owner(&text),
+                    };
+                    log(told.map_err(Into::into));
+                }
                 self.schedule_respawn();
             }
         }
@@ -1054,6 +1093,7 @@ impl<'a> Router<'a> {
         update(&self.snap, |s| s.run = Run::default());
         self.run_start = None;
         self.cut = None;
+        self.cut_at = None;
         if let Some((channel, to)) = self.compacting.take() {
             let text = "[zephyr] /compact was cut off: the agent restarted";
             log(self.store.notify(&channel, &to, text).map_err(Into::into));
@@ -1071,21 +1111,23 @@ impl<'a> Router<'a> {
         if m.text.trim().is_empty() {
             return; // attachment-only messages are not handled in v1
         }
-        let id = match self.store.insert_inbox(&m) {
+        // Decided before the write: a crash in between must not leave a stranger's row `new`.
+        let owner = self.cfg.is_owner(&m.channel, &m.sender);
+        let status = if owner { "new" } else { "dropped" };
+        let id = match self.store.insert_inbox_as(&m, status) {
             Ok(Some(id)) => id,
             Ok(None) => return, // duplicate platform id
             Err(e) => return eprintln!("zephyr: inbox write failed: {e}"),
         };
-        if after {
-            log(self.store.deliver_after(id).map_err(Into::into));
-        }
-        if !self.cfg.is_owner(&m.channel, &m.sender) {
+        if !owner {
             eprintln!(
                 "zephyr: dropped message {id} from unknown sender {:?} on {}",
                 m.sender, m.channel
             );
-            log(self.store.set_status(id, "dropped").map_err(Into::into));
             return;
+        }
+        if after {
+            log(self.store.deliver_after(id).map_err(Into::into));
         }
         let decided = crate::tools::decide(&self.store, m.text.trim());
         // An approved proposal runs exactly as if the owner had typed it.
@@ -1113,6 +1155,11 @@ impl<'a> Router<'a> {
             self.procs.yield_all();
             return log(self.dispatch_new().await);
         };
+        // What `/ok N` ran, in the daemon's words: the agent's request may have said otherwise.
+        let reply = match &decided {
+            Some(Ok(command)) => format!("[zephyr] {} approved {command}\n{reply}", m.text.trim()),
+            _ => reply,
+        };
         let resume = text == "/resume";
         let row = InboxRow {
             id,
@@ -1139,9 +1186,17 @@ impl<'a> Router<'a> {
 
     /// Stops the run once it passes `budget.run_turns` or `run_minutes` (DESIGN §4.4).
     async fn cap_run(&mut self) {
-        let (Some(start), None) = (self.run_start, &self.cut) else {
+        let Some(start) = self.run_start else {
             return;
         };
+        if let Some(at) = self.cut_at {
+            if at.elapsed() >= WEDGED.min(self.cfg.stall_limit) {
+                eprintln!("zephyr: rpi never settled the stopped run; killing it");
+                self.child = None; // dropping it kills it
+                self.child_exited().await;
+            }
+            return;
+        }
         if self.guard_run().await {
             return;
         }
@@ -1153,7 +1208,16 @@ impl<'a> Router<'a> {
         };
         eprintln!("zephyr: {notice}");
         self.cut = Some(notice);
-        log(self.call(json!({"type": "abort"})).await.map(drop));
+        self.cut_at = Some(Instant::now());
+        self.abort().await;
+    }
+
+    /// Asks rpi to abort the run, waiting at most `ABORT_WAIT`: a wedged child never answers.
+    async fn abort(&mut self) {
+        match tokio::time::timeout(ABORT_WAIT, self.call(json!({"type": "abort"}))).await {
+            Ok(r) => log(r.map(drop)),
+            Err(_) => eprintln!("zephyr: rpi did not answer the abort"),
+        }
     }
 
     /// The owner's notice when the run counts as stuck: no rpi event for `cfg.stall_limit`, twice
@@ -1178,7 +1242,7 @@ impl<'a> Router<'a> {
             "/pause" => {
                 log(self.store.set_paused(Some("user")).map_err(Into::into));
                 if self.busy {
-                    log(self.call(json!({"type": "abort"})).await.map(drop));
+                    self.abort().await;
                 }
                 self.procs.stop_all();
                 "[zephyr] paused: messages wait in the inbox until /resume"
@@ -1188,7 +1252,7 @@ impl<'a> Router<'a> {
                 "[zephyr] resumed"
             }
             _ => {
-                log(self.call(json!({"type": "abort"})).await.map(drop));
+                self.abort().await;
                 // Background tasks too (DESIGN §4.12); each still reports back as stopped.
                 crate::tasks::stop(&mut self.store, self.jobs, None);
                 self.procs.stop_all();
@@ -1210,8 +1274,8 @@ impl<'a> Router<'a> {
     /// which rpi delivers after the current tool as a user message of its own. A follow-up
     /// waits for the settle, and each one then starts a run of its own, in order.
     async fn dispatch_new(&mut self) -> anyhow::Result<()> {
-        // Rows stay `new` while the child is down or the gateway is paused.
-        if self.child.is_none() || self.store.pause_reason()?.is_some() {
+        // Rows stay `new` while the child is down, the gateway is paused or stopping.
+        if self.stopping || self.child.is_none() || self.store.pause_reason()?.is_some() {
             return Ok(());
         }
         for row in self.store.inbox_with_status("new")? {
@@ -1277,6 +1341,7 @@ impl<'a> Router<'a> {
         self.busy = false;
         self.run_start = None;
         let cut = self.cut.take();
+        self.cut_at = None;
         self.compacted(ev);
         // Before reconcile dispatches the next row, so that row runs on the new model.
         self.apply_model().await;
@@ -1298,6 +1363,11 @@ impl<'a> Router<'a> {
             ),
             None => "[zephyr] the run ended without a reply".into(),
         };
+        // Who this run served, read before reconcile dispatches the next row.
+        let to = self.store.last_owner().unwrap_or_else(|e| {
+            eprintln!("zephyr: reading the last owner failed: {e}");
+            None
+        });
         let limited = self
             .account
             .clone()
@@ -1318,24 +1388,21 @@ impl<'a> Router<'a> {
             }
         }
         // The agent's files and proposed jobs, after the reply they belong to.
-        let to = self.store.last_owner().unwrap_or_else(|e| {
-            eprintln!("zephyr: reading the last owner failed: {e}");
-            None
-        });
-        crate::tools::apply(&self.store, &self.cfg, &tally.requests, to);
+        crate::tools::apply(&self.store, &self.cfg, &tally.requests, to.clone());
         // After the reply, so the owner reads what was sent out next to what it was for.
-        for notice in [cut, tally.alert(), memory].into_iter().flatten() {
-            log(self.store.notify_last_owner(&notice).map_err(Into::into));
-        }
+        let mut notices: Vec<String> = [cut, tally.alert(), memory].into_iter().flatten().collect();
         // Skill and connector drafts the run wrote, each shown once (DESIGN §4.6).
-        for notice in crate::drafts::scan(&self.cfg) {
-            log(self.store.notify_last_owner(&notice).map_err(Into::into));
-        }
+        notices.extend(crate::drafts::scan(&self.cfg));
         if crossed {
-            log(self
-                .store
-                .notify_last_owner(BUDGET_NOTICE)
-                .map_err(Into::into));
+            notices.push(BUDGET_NOTICE.into());
+        }
+        for notice in notices {
+            if let Some((channel, recipient)) = &to {
+                log(self
+                    .store
+                    .notify(channel, recipient, &notice)
+                    .map_err(Into::into));
+            }
         }
         self.restart_if_idle().await;
     }
@@ -2366,7 +2433,7 @@ impl<'a> Router<'a> {
                 Some(Some(reply)) if self.steer_sent.contains(reply) => {
                     self.store.set_status(row.id, "done")?
                 }
-                Some(Some(reply)) => self.store.reply(&row, reply, "done")?,
+                Some(Some(reply)) => self.store.reply(&row, &unspoof(reply), "done")?,
                 Some(None) if steers && !requeue && row.tries < 2 => {
                     self.store.requeue_as_continue(row.id)?
                 }
@@ -2450,6 +2517,7 @@ impl<'a> Router<'a> {
                 client_id: row.client_id,
                 text: row.text,
                 attachment: row.attachment.clone().map(Into::into),
+                reply_to: row.reply_to,
             };
             let sent = match tokio::time::timeout(SEND_TIMEOUT, channel.send(&msg)).await {
                 Ok(sent) => sent,
@@ -2488,9 +2556,11 @@ impl<'a> Router<'a> {
         let _ = self.tap.send(reply); // no receivers is fine
     }
 
-    /// SIGTERM: stop intake, let a running turn settle, flush, then stop the child.
-    async fn drain<C: Channel>(&mut self, channels: &[C]) {
+    /// SIGTERM: let a running turn settle, flush, then stop the child. Nothing more is
+    /// dispatched; messages that come in meanwhile get their rows, for the next start.
+    async fn drain<C: Channel>(&mut self, channels: &[C], rx: &mut mpsc::Receiver<Inbound>) {
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
+        self.stopping = true;
         let deadline = Instant::now() + Duration::from_secs(20);
         while self.busy {
             match tokio::time::timeout_at(deadline, next_event(&mut self.child)).await {
@@ -2512,9 +2582,25 @@ impl<'a> Router<'a> {
                 log(self.store.notify_last_owner(&alert).map_err(Into::into));
             }
         }
+        self.take_in(rx).await;
         self.flush(channels).await;
         if let Some(child) = self.child.take() {
             child.stop().await;
+        }
+        // Last, and nothing awaits a channel after it: a closed intake ends the adapters' runs,
+        // which ends the gateway.
+        rx.close();
+        self.attaches.close();
+        self.take_in(rx).await;
+    }
+
+    /// Writes the waiting messages' rows (and answers commands) while draining.
+    async fn take_in(&mut self, rx: &mut mpsc::Receiver<Inbound>) {
+        while let Ok(m) = rx.try_recv() {
+            self.inbound(m, false).await;
+        }
+        while let Ok(req) = self.attaches.try_recv() {
+            self.attach(req).await;
         }
     }
 
@@ -2544,7 +2630,8 @@ impl<'a> Router<'a> {
                 let notice = format!("[zephyr] stopped a run that {why}");
                 eprintln!("zephyr: {notice}");
                 self.cut = Some(notice);
-                log(self.call(json!({"type": "abort"})).await.map(drop));
+                self.cut_at = Some(Instant::now());
+                self.abort().await;
                 true
             }
             None => false,
@@ -2785,6 +2872,19 @@ fn pick_in(cfg: &Config, store: &Store) -> Result<Option<Account>, i64> {
         Default::default()
     });
     crate::pool::pick(&cfg.accounts, &cooling, crate::now()).map(|a| Some(a.clone()))
+}
+
+/// Agent text as it goes out: a line that starts `[zephyr]` is shown as `[agent]`, so the agent
+/// cannot pass for a daemon notice (to bait an `/ok`, say). Never applied to the daemon's own.
+fn unspoof(text: &str) -> String {
+    let lines = text.split('\n').map(|line| {
+        let body = line.trim_start();
+        match body.strip_prefix("[zephyr]") {
+            Some(rest) => format!("{}[agent]{rest}", &line[..line.len() - body.len()]),
+            None => line.to_string(),
+        }
+    });
+    lines.collect::<Vec<_>>().join("\n")
 }
 
 fn log(r: anyhow::Result<()>) {

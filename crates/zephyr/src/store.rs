@@ -35,6 +35,8 @@ pub struct OutboxRow {
     pub prompt: Option<String>,
     /// A file to send with `text` (the agent's `send_file`), a copy owned by the daemon.
     pub attachment: Option<String>,
+    /// The `platform_msg_id` of the inbox row this answers; `None` for a notice.
+    pub reply_to: Option<String>,
 }
 
 /// The platform dedupe key for a reply: at most 20 ASCII chars, so Discord's 25-char
@@ -417,6 +419,16 @@ impl Store {
         Ok((n == 1).then(|| self.db.last_insert_rowid()))
     }
 
+    /// As `insert_inbox`, with the status in the same statement: a stranger's row is never `new`.
+    pub fn insert_inbox_as(&self, m: &Inbound, status: &str) -> rusqlite::Result<Option<i64>> {
+        let n = self.db.execute(
+            "INSERT OR IGNORE INTO inbox(channel, platform_msg_id, sender, text, status)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![m.channel, m.platform_msg_id, m.sender, m.text, status],
+        )?;
+        Ok((n == 1).then(|| self.db.last_insert_rowid()))
+    }
+
     /// Makes a `new` row a follow-up: it waits for the run to settle (DESIGN §4.1).
     pub fn deliver_after(&self, id: i64) -> rusqlite::Result<()> {
         self.db.execute(
@@ -544,7 +556,8 @@ impl Store {
     pub fn pending_outbox(&self) -> rusqlite::Result<Vec<OutboxRow>> {
         let mut stmt = self.db.prepare(
             "SELECT id, channel, recipient, client_id, text, created_at,
-                    (SELECT text FROM inbox WHERE inbox.id = outbox.inbox_id), attachment
+                    (SELECT text FROM inbox WHERE inbox.id = outbox.inbox_id), attachment,
+                    (SELECT platform_msg_id FROM inbox WHERE inbox.id = outbox.inbox_id)
              FROM outbox WHERE status = 'pending' ORDER BY id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -557,6 +570,7 @@ impl Store {
                 created_at: r.get(5)?,
                 prompt: r.get(6)?,
                 attachment: r.get(7)?,
+                reply_to: r.get(8)?,
             })
         })?;
         rows.collect()
@@ -684,7 +698,7 @@ impl Store {
         self.db
             .query_row(
                 "SELECT channel, sender FROM inbox WHERE status IN ('done', 'dispatched')
-                 ORDER BY id DESC LIMIT 1",
+                 AND sent_as IS NOT NULL ORDER BY id DESC LIMIT 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -1464,8 +1478,14 @@ mod tests {
         let mut store = Store::open(&dir.join("state.db")).unwrap();
         store.notify_last_owner("nobody yet").unwrap();
         assert!(store.pending_outbox().unwrap().is_empty());
+        // A command's row is answered but never taken up by the agent: nobody to tell yet.
+        store.insert_inbox(&msg("cmd")).unwrap();
+        let cmd = store.inbox_with_status("new").unwrap().remove(0);
+        store.set_status(cmd.id, "done").unwrap();
+        store.notify_last_owner("nobody yet").unwrap();
         store.insert_inbox(&msg("a")).unwrap();
         let row = store.inbox_with_status("new").unwrap().remove(0);
+        store.mark_dispatched_as(row.id, "prompt").unwrap();
         store.reply(&row, "answer", "done").unwrap();
         store.notify_last_owner("first notice").unwrap();
         store.notify_last_owner("second notice").unwrap();
