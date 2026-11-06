@@ -85,10 +85,12 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   `connectors/drafts/`, shown to the owner once after each run (`scan`) and approved with
   `/skill ok` / `/mcp ok` only if unchanged since shown. Approved skills are a root-owned git repo in
   `<state>/skills`; connectors are `[[mcp]]` in `zephyr.toml`. `drafts::prepare` (called by
-  `spawn_as` in place of `memory::prepare`, which it runs first) publishes them as the agent to
-  `<home>/.approved/` (`mcp.json` with `${NAME}` secrets filled in) and adds `## Skills` and
-  `## Connectors` to AGENTS.md. zephyr-policy's `check_mcp` lets MCP calls use only that file
-  (`ZEPHYR_MCP_CONFIG`), byte-identical to what it read at load.
+  `spawn_as` in place of `memory::prepare`, which it runs first) publishes the skills as the agent
+  to `<home>/.approved/skills`, and as root `mcp.json` (`${NAME}` secrets filled in, never
+  `ZEPHYR_*` or a channel's) to `<state>-public/` and AGENTS.md (with `## Skills` and
+  `## Connectors`) to root's `/AGENTS.md` in the container, both readable but not writable by the
+  agent. zephyr-policy's `check_mcp` lets MCP calls use only that file (`ZEPHYR_MCP_CONFIG`),
+  byte-identical to what it read at load.
 - The agent's tools (DESIGN §4.11): the browser, Camoufox and the X desktop are CLIs in the image,
   run through `bash`. `desktop.rs` keeps Xvfb up when `ZEPHYR_DESKTOP` is set. `send_file`,
   `schedule`, `gateway`, `task` and `recall` are registered by zephyr-policy (`tools.rs`). The first
@@ -103,12 +105,14 @@ session leaf, `compact` is a run of its own that settles `compacted`, and undone
 for tasks and jobs (`scheduler::follow`).
 
 **`crates/zephyr-policy`** is a cdylib rpi plugin loaded with `--extension`. Its `ToolCall` handler
-vetoes hardline commands (`policy.rs` `check`) and appends audit lines to `$ZEPHYR_AUDIT_LOG`. It fails
-closed: any non-`Allow`, malformed event or panic blocks the call.
+vetoes hardline commands (`policy.rs` `check`). It fails closed: any non-`Allow`, malformed event or
+panic blocks the call. The audit of tool calls is state.db's `audit` table, written by the daemon
+from the event stream (`Router::tapped`, `scheduler::follow`); `$ZEPHYR_AUDIT_LOG` is the plugin's
+optional log, off in production.
 
 **Tests** (`crates/zephyr/tests/`) run the daemon against `fake-rpi.py`, a scripted stand-in for rpi
-0.18.0 frames. Its behaviour is driven by marker files in the zephyr home (`hang`, `slow`,
-`stats.json`, `oauth_fail`, ...) and it logs every command to `log.jsonl`; read its docstring before
+0.18.0 frames. Its behaviour is driven by marker files in the zephyr home (`hang`, `slow`, `wedge`,
+`refresh_hang`, `tool_sleep`, `stats.json`, `oauth_fail`, ...) and it logs every command to `log.jsonl`; read its docstring before
 adding a test. When rpi's frame shapes matter, update fake-rpi.py to match the real binary.
 
 ## Conventions
@@ -116,5 +120,10 @@ adding a test. When rpi's frame shapes matter, update fake-rpi.py to match the r
 - Commits: conventional prefix with scope, then a plain-English sentence about the behaviour, e.g.
   `fix(model): check a model with the target account's rpi --list-models`. Authored as the user, no trailers.
 - Never read tokens into structs or log them; status/doctor report only whether a credential is present.
+- Root in the container never runs anything the agent could have placed: no agent-writable directory
+  on root's PATH (agent processes get `agent::AGENT_PATH` through `agent::cmd`), root's own binaries
+  by full path (`/usr/bin/git`, `/usr/local/bin/zephyr`), and root's git always with
+  `core.hooksPath=/dev/null`, `core.fsmonitor=false` and no system or global config. Files root
+  publishes for the agent go in a root-owned 0755 folder, never into the agent's home.
 - Providers come only from the image (`/opt/zephyr/ext/`, loaded via `extensions`); don't install rpi
   packages into `~/.zephyr`.

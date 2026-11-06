@@ -40,7 +40,7 @@ zephyr login openai-codex --account codex-main
 | Command | What it does |
 |---|---|
 | `zephyr up [--build]` / `down` / `restart` | Start (building the image locally with `--build`), stop, restart |
-| `zephyr upgrade [VERSION]` | Move to the newest release (updating this CLI from the image first), once the agent is idle, after backing up `state.db` to `~/.zephyr-daemon/state.db.<old version>.bak`. With an older VERSION, go back to it by restoring that version's backup |
+| `zephyr upgrade [VERSION]` | Move to the newest release (updating this CLI from the image first), once the agent is idle, after backing up `state.db`, `zephyr.toml`, `vault.toml` and `host.toml` to `~/.zephyr-daemon/<file>.<old version>.bak` (the newest 5 versions are kept). With an older VERSION, go back to it by restoring that version's backups. A release is always its published image: a local copy is used, else it is pulled, never built |
 | `zephyr status` / `logs [-f]` / `doctor [--fix]` | Container and daemon state, logs, checks (and repairs) |
 | `zephyr --version` | This CLI's version and the running container's, with a hint when they differ |
 | `zephyr login <provider> [--account NAME]` | Sign in an account, then make a small test call (`--no-verify` skips it) |
@@ -203,7 +203,7 @@ zephyr mcp add files -- npx -y @modelcontextprotocol/server-filesystem /zephyr/p
 This writes an `[[mcp]]` table to `zephyr.toml` (`name`, then `url` and `headers`, or `command`,
 `args` and `cwd`; also `env`, `timeout`, `enabled`), and the agent restarts after the reply in
 progress. `${NAME}` is filled in from `secrets.env`; a connector whose secret is missing is left
-out, and `zephyr doctor` and `/mcp` say so. The agent may also propose one in
+out, and `zephyr doctor` and `/mcp` say so. zephyr's own secrets (`ZEPHYR_*`) and the channels' tokens can never be filled into a connector. The agent may also propose one in
 `connectors/drafts/<name>.json`: `/mcp ok NAME` adds it, `/mcp no NAME` drops it, `/mcp rm NAME`
 removes a connector, and `/mcp` lists them. The agent can use only these connectors: an MCP config
 it writes itself, or a server named by URL, is refused. A connector runs as the agent, so the
@@ -456,10 +456,22 @@ deploy/release.sh --cli   # only the host CLI changed: reinstall it, publish not
 The script stops at the first problem. It runs fmt, clippy and the tests, sets the version in
 `Cargo.toml` (the CLI pulls `ghcr.io/yansigit/zephyr:<version>`), commits and tags `v<version>`,
 pushes, and waits for the image workflow. Then it installs the CLI into `~/.cargo/bin` (from the
-clean tree, so nothing uncommitted ships) and runs `zephyr upgrade <version>`, which waits until no
-message, reply or job is in flight and backs up `state.db` to
-`~/.zephyr-daemon/state.db.<old version>.bak` (migrations only go forward). `zephyr upgrade <older
-version>` goes back, restoring that version's backup.
+clean tree, so nothing uncommitted ships) and runs `zephyr upgrade <version>`.
+
+`zephyr upgrade` waits until nothing is in flight: a message the agent is answering, a job run, a
+background task or an `exec` command. Replies waiting for a channel (a notice for a TUI nobody has
+attached, say) and messages held by `/pause` don't count, since they never clear by themselves. After
+30 minutes busy it gives up and says to send `/stop` and run it again. Then it backs up `state.db`,
+`zephyr.toml`, `vault.toml` and `host.toml` as `~/.zephyr-daemon/<file>.<old version>.bak`
+(migrations only go forward; the newest 5 versions are kept) and replaces the container. `zephyr
+upgrade <older version>` goes back, restoring that version's backups, also after `zephyr down` and
+offline when the image is still local. `zephyr up`, `doctor --fix` and `init` back up the same way
+when the running container is another version than the CLI's.
+
+`zephyr up` stops the old container (so its daemon drains) and keeps it as `zephyr-old` until the
+new one runs; if the new one cannot be created, the old one is put back. `.env*` files under the
+projects folder are masked from the agent at each `up` (not inside `.git` or `node_modules`; a path
+with a comma cannot be masked and is named in a warning).
 
 The image workflow tags `:<version>` and `:latest` and runs on GitHub-hosted runners. When the
 Actions minutes run out, start the fallback runner on this machine once with
