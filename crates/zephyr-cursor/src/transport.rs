@@ -58,7 +58,7 @@ impl BlobStore {
 }
 
 /// Everything a session needs to open: where, as whom, and under which ids.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SessionConfig {
     /// Full `https://host/agent.v1.AgentService/Run` URL, or `http://` for a plaintext test server.
     pub url: String,
@@ -66,6 +66,18 @@ pub struct SessionConfig {
     /// One per conversation: Cursor keys its server-side state (and its billing) by this.
     pub conversation_id: String,
     pub request_id: String,
+}
+
+// Hand-written so a `{:?}` in a log line never prints the bearer token.
+impl std::fmt::Debug for SessionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionConfig")
+            .field("url", &self.url)
+            .field("token", &"[redacted]")
+            .field("conversation_id", &self.conversation_id)
+            .field("request_id", &self.request_id)
+            .finish()
+    }
 }
 
 /// A live `Run` call.
@@ -438,6 +450,9 @@ enum Frame {
     EndStream(Vec<u8>),
 }
 
+/// Largest compressed or decompressed frame payload accepted off the wire.
+const MAX_FRAME: usize = 16 * 1024 * 1024;
+
 /// Pops one complete `[flag][len:u32 be][payload]` frame off `pending`, gunzipping a compressed
 /// payload. `Ok(None)` means the buffer holds only part of a frame.
 // Adapted from 1jehuang/jcode (MIT), agent_transport.rs
@@ -447,6 +462,9 @@ fn next_frame(pending: &mut Vec<u8>) -> anyhow::Result<Option<Frame>> {
     }
     let flag = pending[0];
     let len = u32::from_be_bytes([pending[1], pending[2], pending[3], pending[4]]) as usize;
+    if len > MAX_FRAME {
+        bail!("a response frame of {len} bytes exceeds the 16 MiB limit");
+    }
     let end = 5 + len;
     if pending.len() < end {
         return Ok(None);
@@ -456,8 +474,12 @@ fn next_frame(pending: &mut Vec<u8>) -> anyhow::Result<Option<Frame>> {
     if flag & COMPRESSED_FLAG != 0 {
         let mut decoded = Vec::new();
         GzDecoder::new(&payload[..])
+            .take(MAX_FRAME as u64 + 1)
             .read_to_end(&mut decoded)
             .context("a gzip-flagged response frame is not valid gzip")?;
+        if decoded.len() > MAX_FRAME {
+            bail!("a gzip response frame decompresses past the 16 MiB limit");
+        }
         payload = decoded;
     }
     Ok(Some(if flag & END_STREAM_FLAG != 0 {
@@ -509,4 +531,56 @@ async fn error_body(mut body: h2::RecvStream) -> String {
     }
     bytes.truncate(ERROR_BODY_LIMIT);
     String::from_utf8_lossy(&bytes).trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::{self, Read};
+
+    #[test]
+    fn session_config_debug_redacts_token() {
+        let config = SessionConfig {
+            url: "https://agent.example/Run".into(),
+            token: "secret-token-value".into(),
+            conversation_id: "conv-1".into(),
+            request_id: "req-1".into(),
+        };
+        let shown = format!("{config:?}");
+        assert!(!shown.contains("secret-token-value"), "{shown}");
+        assert!(shown.contains("redacted"), "{shown}");
+    }
+
+    #[test]
+    fn oversize_frame_length_is_rejected_before_the_body_arrives() {
+        let mut pending = vec![0];
+        pending.extend_from_slice(&((MAX_FRAME as u32) + 1).to_be_bytes());
+        let err = next_frame(&mut pending)
+            .err()
+            .expect("an oversize frame must be rejected with only its header buffered");
+        assert!(
+            err.to_string().contains("exceeds the 16 MiB limit"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn gzip_frame_that_inflates_past_the_cap_is_rejected() {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        io::copy(&mut io::repeat(0).take(MAX_FRAME as u64 + 1), &mut encoder).unwrap();
+        let gz = encoder.finish().unwrap();
+        let mut pending = vec![COMPRESSED_FLAG];
+        pending.extend_from_slice(&(gz.len() as u32).to_be_bytes());
+        pending.extend_from_slice(&gz);
+        let err = next_frame(&mut pending)
+            .err()
+            .expect("a gzip bomb past the cap must be rejected");
+        assert!(
+            err.to_string()
+                .contains("decompresses past the 16 MiB limit"),
+            "{err}"
+        );
+    }
 }
