@@ -15,7 +15,6 @@ libc = "0.2"
 base64 = "0.22"
 zephyr-policy = { path = "../zephyr-policy" }
 rusqlite.workspace = true
-sd-notify.workspace = true
 toml.workspace = true
 toml_edit = "0.25"
 dialoguer = { version = "0.12", default-features = false, features = ["password"] }

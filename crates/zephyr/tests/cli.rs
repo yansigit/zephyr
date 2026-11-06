@@ -125,6 +125,44 @@ fn pause_and_resume_work_with_a_daemon_and_without_one() {
 }
 
 #[test]
+fn status_fails_without_a_daemon_or_with_a_stale_heartbeat() {
+    let (home, cfg) = setup("status-beat", "");
+    let out = zephyr(&cfg, &["status"]);
+    assert!(!out.status.success(), "no daemon: {out:?}");
+    assert!(stdout(&out).contains("heartbeat: none"), "{out:?}");
+
+    let running = daemon(&cfg, &home);
+    let beat = home.join("heartbeat");
+    let start = Instant::now();
+    while !beat.exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "no heartbeat");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = zephyr(&cfg, &["status"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = stdout(&out);
+    assert!(
+        text.contains("\ndaemon: running\nheartbeat: 0s ago\n")
+            || text.contains("\ndaemon: running\nheartbeat: 1s ago\n"),
+        "{text}"
+    );
+
+    // Frozen, it still accepts connections; only the heartbeat tells.
+    let pid = running.0.id() as i32;
+    // SAFETY: plain syscalls to our own child.
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    std::fs::write(&beat, format!("{}\n", zephyr::now() - 200)).unwrap();
+    let out = zephyr(&cfg, &["status"]);
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    assert!(!out.status.success(), "{out:?}");
+    assert!(stdout(&out).contains("heartbeat: 200s ago"), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("hung"),
+        "{out:?}"
+    );
+}
+
+#[test]
 fn doctor_reports_presence_and_never_values() {
     // A stand-in BlueBubbles that answers the ping and records the request line.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -331,8 +369,9 @@ fn status_lists_each_pooled_account() {
         r#"{"anthropic": {"type": "oauth", "access": "SECRET"}}"#,
     )
     .unwrap();
+    // No daemon runs: status still prints, and fails.
     let out = zephyr(&cfg, &["status"]);
-    assert!(out.status.success(), "{out:?}");
+    assert!(!out.status.success(), "{out:?}");
     let text = stdout(&out);
     assert!(
         text.contains("account a (anthropic/m): ready; today 0 tokens"),

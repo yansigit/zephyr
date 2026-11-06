@@ -535,7 +535,6 @@ impl<'a> Router<'a> {
     ) -> anyhow::Result<Exit> {
         tokio::pin!(shutdown);
         let mut exit = Exit::Shutdown;
-        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
         let mut tick = tokio::time::interval(self.cfg.tick);
         let paused = |store: &Store| store.pause_reason().ok().flatten().is_some();
         let mut was_paused = paused(&self.store);
@@ -581,7 +580,9 @@ impl<'a> Router<'a> {
                     None => self.child_exited().await,
                 },
                 _ = tick.tick() => {
-                    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
+                    // Liveness for `zephyr supervise` and `zephyr status`: a plain overwrite.
+                    let beat = self.cfg.state_dir().join(crate::supervise::HEARTBEAT);
+                    let _ = std::fs::write(beat, format!("{}\n", crate::now()));
                     self.cap_run().await;
                     self.login_starts().await;
                     self.login_notices();
@@ -2565,7 +2566,6 @@ impl<'a> Router<'a> {
     /// SIGTERM: let a running turn settle, flush, then stop the child. Nothing more is
     /// dispatched; messages that come in meanwhile get their rows, for the next start.
     async fn drain<C: Channel>(&mut self, channels: &[C], rx: &mut mpsc::Receiver<Inbound>) {
-        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
         self.stopping = true;
         let deadline = Instant::now() + Duration::from_secs(20);
         while self.busy {

@@ -282,18 +282,31 @@ async fn control(cfg: &Config, text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Fails when the daemon does not answer or its heartbeat is stale: the image's HEALTHCHECK.
 async fn status(cfg: &Config) -> anyhow::Result<()> {
+    use zephyr::supervise::{heartbeat_age, HEARTBEAT, STALE};
     let up = tokio::net::UnixStream::connect(cfg.socket_path())
         .await
         .is_ok();
+    let beat = heartbeat_age(&cfg.state_dir().join(HEARTBEAT));
     println!("version: {}", env!("CARGO_PKG_VERSION"));
     println!("daemon: {}", if up { "running" } else { "not reachable" });
+    println!(
+        "heartbeat: {}",
+        beat.map_or("none".into(), |s| format!("{s}s ago"))
+    );
     let store = Store::open(&cfg.db_path())?;
     for line in zephyr::reload::status_lines(cfg, &store)? {
         println!("{line}");
     }
     for (table, status, n) in store.counts()? {
         println!("{table:<7} {status:<11} {n}");
+    }
+    if !up {
+        anyhow::bail!("the daemon is not running");
+    }
+    if beat.is_none_or(|s| s >= STALE.as_secs()) {
+        anyhow::bail!("the daemon is hung: no heartbeat for {}s", STALE.as_secs());
     }
     Ok(())
 }
