@@ -785,9 +785,16 @@ async fn zephyr_subscribe_replays_raw_history_and_streams_status_and_replies() {
     );
     assert!(running["run"]["since_unix_ms"].as_i64().unwrap() > 0);
     std::fs::remove_file(gw.home.join("tool_wait")).unwrap();
-    let done = status_until(&mut c, |s| s["run"]["tools_done"] == 1).await;
+    // Snapshots go out on a watch channel, so a slow reader sees only the newest: the run may
+    // already be over (busy false, its counts reset) by the time the next one is read.
+    let done = status_until(&mut c, |s| {
+        s["run"]["tools_done"] == 1 || s["run"]["busy"] == false
+    })
+    .await;
     assert_eq!(done["run"]["current_tool"], Value::Null);
-    status_until(&mut c, |s| s["run"]["busy"] == false).await;
+    if done["run"]["busy"] == true {
+        status_until(&mut c, |s| s["run"]["busy"] == false).await;
+    }
 
     // The agent's reply is not repeated; a command's reply is.
     wait(|| gw.count("outbox", "sent") == 2).await;
