@@ -499,13 +499,12 @@ fn list(cfg: &Config, kind: Kind) -> anyhow::Result<String> {
             }
         }
         Kind::Connector => {
-            let secrets = secrets(cfg);
             for m in &cfg.mcp {
                 let what = match (&m.url, &m.command) {
                     (Some(url), _) => url.clone(),
                     (_, command) => command.clone().unwrap_or_default(),
                 };
-                let missing = filled(m, &secrets).err().unwrap_or_default();
+                let missing = missing(cfg, m);
                 let note = if missing.is_empty() {
                     String::new()
                 } else {
@@ -572,7 +571,7 @@ fn ok(cfg: &Config, kind: Kind, name: &str) -> anyhow::Result<(String, After)> {
         }
         Content::Connector(m) => {
             write_config(cfg, |doc| crate::host::conf::upsert_mcp(doc, &m))?;
-            let missing = filled(&m, &secrets(cfg)).err().unwrap_or_default();
+            let missing = missing(cfg, &m);
             let mut reply = format!("[zephyr] connector {name} added to zephyr.toml");
             if !missing.is_empty() {
                 reply += &format!(
@@ -734,8 +733,34 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// secrets.env as a connector may use it: never zephyr's own (`ZEPHYR_*`) or a channel's, which
+/// would land in the agent-readable mcp.json and let the agent post as the owner.
 fn secrets(cfg: &Config) -> Vec<(String, String)> {
-    crate::dotenv::read(&cfg.secrets_path()).unwrap_or_default()
+    let mut all = crate::dotenv::read(&cfg.secrets_path()).unwrap_or_default();
+    all.retain(|(k, _)| !reserved(cfg, k));
+    all
+}
+
+fn reserved(cfg: &Config, name: &str) -> bool {
+    let channel = [
+        cfg.discord.as_ref().map(|d| &d.token_env),
+        cfg.imessage.as_ref().map(|i| &i.password_env),
+        cfg.imessage.as_ref().map(|i| &i.secret_env),
+        cfg.attach.as_ref().and_then(|a| a.token_env.as_ref()),
+    ];
+    name.starts_with("ZEPHYR_") || channel.into_iter().flatten().any(|k| k == name)
+}
+
+/// The secrets.env keys `m` needs that are not set, or are refused (`reserved`), saying which.
+fn missing(cfg: &Config, m: &Mcp) -> Vec<String> {
+    let missing = filled(m, &secrets(cfg)).err().unwrap_or_default();
+    missing
+        .into_iter()
+        .map(|k| match reserved(cfg, &k) {
+            true => format!("{k} (zephyr's own secret, never a connector's)"),
+            false => k,
+        })
+        .collect()
 }
 
 /// `m` in the adapter's `mcpServers` shape, each `${NAME}` filled in from secrets.env. `Err`
@@ -785,7 +810,7 @@ fn expand(text: &str, secrets: &[(String, String)], missing: &mut Vec<String>) -
 
 /// The secrets.env keys a connector needs that are not set; `doctor` warns about them.
 pub fn missing_secrets(cfg: &Config, m: &Mcp) -> Vec<String> {
-    filled(m, &secrets(cfg)).err().unwrap_or_default()
+    missing(cfg, m)
 }
 
 /// The connectors file each child gets (`ZEPHYR_MCP_CONFIG`), the only one the policy plugin
@@ -810,10 +835,10 @@ pub fn prepare(cfg: &Config, agent_dir: &Path) -> anyhow::Result<()> {
                 servers.insert(m.name.clone(), spec);
                 listed.push(m);
             }
-            Err(missing) => eprintln!(
+            Err(_) => eprintln!(
                 "zephyr: connector {} left out: secrets.env lacks {}",
                 m.name,
-                missing.join(", ")
+                missing(cfg, m).join(", ")
             ),
         }
     }
@@ -1202,6 +1227,33 @@ mod tests {
         assert!(say(&gone, "/mcp rm files")
             .0
             .contains("no approved connector"));
+    }
+
+    #[test]
+    fn a_connector_never_gets_a_channel_secret() {
+        let cfg = cfg("[discord]\ntoken_env = 'DISCORD_BOT'\n\
+             [[mcp]]\nname = 'leak'\nurl = 'https://x/mcp'\n\
+             headers = { A = '${ZEPHYR_BB_PASSWORD}', B = '${DISCORD_BOT}' }\n\
+             [[mcp]]\nname = 'fine'\nurl = 'https://y/mcp'\nheaders = { A = '${DOCS}' }\n");
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        std::fs::write(
+            cfg.secrets_path(),
+            "ZEPHYR_BB_PASSWORD=bbpass1\nDISCORD_BOT=dtoken1\nDOCS=d0cs\n",
+        )
+        .unwrap();
+        agents(&cfg);
+        let text = std::fs::read_to_string(mcp_path(&cfg.home)).unwrap();
+        assert!(
+            text.contains("d0cs") && !text.contains("\"leak\""),
+            "{text}"
+        );
+        for value in ["bbpass1", "dtoken1"] {
+            assert!(!text.contains(value), "{text}");
+        }
+        let missing = missing_secrets(&cfg, &cfg.mcp[0]);
+        assert_eq!(missing.len(), 2, "{missing:?}");
+        assert!(missing.iter().all(|m| m.contains("never a connector's")));
+        assert!(say(&cfg, "/mcp").0.contains("DISCORD_BOT (zephyr's own"));
     }
 
     #[test]
