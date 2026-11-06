@@ -44,6 +44,10 @@ const ME: &str = env!("CARGO_PKG_VERSION");
 const AGENT_PATH: &str =
     "/zephyr/.local/bin:/opt/zephyr/py/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// The daemon's config files a rollback restores with state.db: an older daemon refuses keys it
+/// does not know.
+const ROLLED_BACK: [&str; 3] = ["zephyr.toml", "vault.toml", "host.toml"];
+
 const COMMANDS: [&str; 25] = [
     "init",
     "up",
@@ -691,17 +695,15 @@ impl Host {
         }
         self.image = format!("{REPO}{target}");
         self.data.image = self.image.clone();
-        // A local build is this source tree's version, so only for this CLI's own.
-        if target == ME {
-            self.ensure_image(false, true)?;
-        } else if !pull(&self.image) {
+        // A release is its published image, never a local build of this tree under its tag.
+        if !quiet(docker(&["image", "inspect", &self.image])) && !pull(&self.image) {
             bail!("could not pull {}", self.image);
-        } else {
-            // While the old container still runs: the owner's packages on the new image.
-            self.derive(&self.data.packages()?, false)?;
         }
+        // While the old container still runs: the owner's packages on the new image.
+        self.derive(&self.data.packages()?, false)?;
+        // Without a container (after `zephyr down`), state.db is most likely this CLI's version's.
         let back = matches!(
-            (running.as_deref().and_then(semver), semver(&target)),
+            (semver(running.as_deref().unwrap_or(ME)), semver(&target)),
             (Some(r), Some(t)) if t < r
         );
         let bak = format!("state.db.{target}.bak");
@@ -719,15 +721,24 @@ impl Host {
             self.settle(running.as_deref())?;
         }
         if back {
-            let _ = quiet(docker(&["rm", "-f", &self.container]));
-            // The WAL belongs to the newer state.db, which is backed up now.
+            // Removed, not only stopped: an older CLI run next must not name the restored
+            // state.db's backup after the newer container.
+            self.remove();
+            // The WAL belongs to the newer state.db, which is backed up now. The config goes back
+            // too: the older daemon refuses keys it does not know.
             let restore = format!(
-                "import os, shutil; d = '{DAEMON_MOUNT}/'; \
+                "import os, shutil; \
+                 d = '{DAEMON_MOUNT}/'; \
                  [os.remove(d + f) for f in ('state.db-wal', 'state.db-shm') if os.path.exists(d + f)]; \
-                 shutil.copy(d + '{bak}', d + 'state.db')"
+                 shutil.copy(d + '{bak}', d + 'state.db'); \
+                 [shutil.copy(d + f + '.{target}.bak', d + f) for f in {ROLLED_BACK:?} \
+                 if os.path.exists(d + f + '.{target}.bak')]"
             );
             run(&mut self.daemon_py(&restore)).context("restoring state.db")?;
-            eprintln!("warning: state.db is back to {bak}; changes since that backup are lost");
+            eprintln!(
+                "warning: state.db and the config are back to {target}'s backups; \
+                 changes since then are lost"
+            );
         }
         let Some((new, exe)) = cli else {
             return self.up();
@@ -739,8 +750,10 @@ impl Host {
     }
 
     /// Waits until no message, job, task or process is in flight (30 minutes at most), then
-    /// backs up state.db as `state.db.<running>.bak` (migrations only go forward). A failed backup
-    /// stops the upgrade; only a first install, without state.db, goes on without one.
+    /// backs up state.db as `state.db.<running>.bak` (migrations only go forward), and the
+    /// `ROLLED_BACK` config files beside it as `<file>.<running>.bak`. The newest 5 versions'
+    /// backups are kept. A failed backup stops the upgrade; only a first install, without
+    /// state.db, goes on without one.
     fn settle(&self, running: Option<&str>) -> anyhow::Result<()> {
         const LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
         let start = std::time::Instant::now();
@@ -765,16 +778,23 @@ impl Host {
             return Ok(());
         }
         // Without a container to name it (after `zephyr down`), a name going back never picks.
-        let name = match running.filter(|v| semver(v).is_some()) {
-            Some(v) => format!("state.db.{v}.bak"),
-            None => "state.db.bak".into(),
+        let suffix = match running.filter(|v| semver(v).is_some()) {
+            Some(v) => format!(".{v}.bak"),
+            None => ".bak".into(),
         };
+        let name = format!("state.db{suffix}");
+        // `b[len(d) + 8:]` is a backup's `.<version>.bak`, after `state.db`.
         let script = format!(
-            "import os, sqlite3, sys; \
-             os.path.exists('{DAEMON_MOUNT}/state.db') or sys.exit(3); \
+            "import glob, os, shutil, sqlite3, sys; \
+             d = '{DAEMON_MOUNT}/'; \
+             os.path.exists(d + 'state.db') or sys.exit(3); \
              bak = sqlite3.connect('{DAEMON_MOUNT}/{name}'); \
-             sqlite3.connect('{DAEMON_MOUNT}/state.db').backup(bak); \
-             bak.close()"
+             sqlite3.connect(d + 'state.db').backup(bak); \
+             bak.close(); \
+             [shutil.copy(d + f, d + f + '{suffix}') for f in {ROLLED_BACK:?} if os.path.exists(d + f)]; \
+             old = sorted(glob.glob(d + 'state.db.*.bak'), key=os.path.getmtime)[:-5]; \
+             [os.remove(p) for b in old for p in [d + f + b[len(d) + 8:] for f in ('state.db', *{ROLLED_BACK:?})] \
+             if os.path.exists(p)]"
         );
         match self.daemon_py(&script).status()?.code() {
             Some(0) => println!(

@@ -22,7 +22,7 @@ case " $* " in
 esac
 [ -n "$GH_TOKEN" ] && echo "GH_TOKEN set" >> "$SHIM_DIR/env.log"
 case "$1" in
-  inspect) echo "${SHIM_STATE:-running}"; exit 0 ;;
+  inspect) [ -n "$SHIM_NO_CONTAINER" ] && exit 1; echo "${SHIM_STATE:-running}"; exit 0 ;;
   info) echo "${SHIM_RUNTIMES:-io.containerd.runc.v2 runc}"; exit 0 ;;
   image) exit "${SHIM_IMAGE_MISSING:-0}" ;;
   pull) exit "${SHIM_PULL_FAIL:-0}" ;;
@@ -534,7 +534,11 @@ fn packages_build_a_local_image_that_up_and_upgrade_run() {
     let me = env!("CARGO_PKG_VERSION");
     let out = env.zephyr_env(
         &["upgrade", me],
-        &[("ZEPHYR_IMAGE", ""), ("SHIM_VERSION", "0.0.1")],
+        &[
+            ("ZEPHYR_IMAGE", ""),
+            ("SHIM_VERSION", "0.0.1"),
+            ("SHIM_IMAGE_MISSING", "1"),
+        ],
     );
     assert!(
         out.status.success(),
@@ -1443,8 +1447,19 @@ fn upgrade_waits_backs_up_and_goes_back_only_with_a_backup() {
     assert_eq!(stdout(&out), format!("already on {me}\n"));
     assert_eq!(at(&calls, RM, ""), None);
 
+    // A release never comes from a local build: missing and not pullable, it stops.
+    let (out, calls) = upgrade(&[
+        ("SHIM_VERSION", "0.0.1"),
+        ("SHIM_IMAGE_MISSING", "1"),
+        ("SHIM_PULL_FAIL", "1"),
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("could not pull"));
+    assert_eq!(at(&calls, &["docker", "build"], ""), None);
+    assert_eq!(at(&calls, RM, ""), None);
+
     // Forward: state.db is backed up under the running version before the container goes.
-    let (out, calls) = upgrade(&[("SHIM_VERSION", "0.0.1")]);
+    let (out, calls) = upgrade(&[("SHIM_VERSION", "0.0.1"), ("SHIM_IMAGE_MISSING", "1")]);
     assert!(
         out.status.success(),
         "{}",
@@ -1482,11 +1497,81 @@ fn upgrade_waits_backs_up_and_goes_back_only_with_a_backup() {
         String::from_utf8_lossy(&out.stderr)
     );
     let backup = at(&calls, PY, "connect('/var/lib/zephyr/state.db.99.0.0.bak')").expect("backup");
+    let stop = at(&calls, &["docker", "stop"], "").unwrap();
     let rm = at(&calls, RM, "").unwrap();
     let restore = at(&calls, PY, &format!("shutil.copy(d + 'state.db.{me}.bak'")).expect("restore");
     let run = at(&calls, RUN, "").unwrap();
-    assert!(backup < rm && rm < restore && restore < run, "{calls:#?}");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("changes since that backup are lost"));
+    assert!(
+        backup < stop && stop < rm && rm < restore && restore < run,
+        "{calls:#?}"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("changes since then are lost"));
+    // The image is here already: going back pulls nothing.
+    assert_eq!(at(&calls, &["docker", "pull"], ""), None, "{calls:#?}");
+
+    // The scripts themselves, on a copy of the daemon's dir: the config goes with state.db, and
+    // only the newest 5 versions' backups stay.
+    let script = |at: usize| calls[at].last().unwrap().clone();
+    let (backup, restore) = (script(backup), script(restore));
+    let dir = env.dir.join("daemon-copy");
+    std::fs::create_dir_all(&dir).unwrap();
+    let py = |script: &str| {
+        let script = script.replace("/var/lib/zephyr/", &format!("{}/", dir.display()));
+        let out = Command::new("python3")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    py("import sqlite3; sqlite3.connect('/var/lib/zephyr/state.db').execute('create table t (x)')");
+    std::fs::write(dir.join("zephyr.toml"), "newer = 1\n").unwrap();
+    std::fs::write(dir.join("host.toml"), "projects = '/p'\n").unwrap();
+    let day = std::time::Duration::from_secs(86_400);
+    for n in 1..=5 {
+        for f in ["state.db", "zephyr.toml"] {
+            let file = std::fs::File::create(dir.join(format!("{f}.0.0.{n}.bak"))).unwrap();
+            let age = std::time::SystemTime::now() - day * (10 - n);
+            file.set_modified(age).unwrap();
+        }
+    }
+    py(&backup);
+    let names = |prefix: &str| {
+        let mut v: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with(prefix) && n.ends_with(".bak"))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        names("state.db."),
+        ["0.0.2", "0.0.3", "0.0.4", "0.0.5", "99.0.0"].map(|v| format!("state.db.{v}.bak"))
+    );
+    assert_eq!(
+        names("zephyr.toml."),
+        ["0.0.2", "0.0.3", "0.0.4", "0.0.5", "99.0.0"].map(|v| format!("zephyr.toml.{v}.bak"))
+    );
+    assert_eq!(read(&dir.join("zephyr.toml.99.0.0.bak")), "newer = 1\n");
+    assert!(dir.join("host.toml.99.0.0.bak").exists());
+    assert!(!dir.join("vault.toml.99.0.0.bak").exists());
+    std::fs::copy(
+        dir.join("state.db.99.0.0.bak"),
+        dir.join(format!("state.db.{me}.bak")),
+    )
+    .unwrap();
+    std::fs::write(dir.join(format!("zephyr.toml.{me}.bak")), "older = 1\n").unwrap();
+    py(&restore);
+    assert_eq!(read(&dir.join("zephyr.toml")), "older = 1\n");
+    assert_eq!(
+        read(&dir.join("host.toml")),
+        "projects = '/p'\n",
+        "no backup: left alone"
+    );
 
     // A named image keeps its own: no CLI from it, but the backup still comes first.
     let out = env.zephyr(&["upgrade"]);
@@ -1684,4 +1769,15 @@ fn up_and_going_back_without_a_container_keep_the_backups() {
     let calls = env.calls();
     let backup = at(&calls, PY, "connect('/var/lib/zephyr/state.db.0.0.1.bak')").expect("backup");
     assert!(backup < at(&calls, RUN, "").unwrap(), "{calls:#?}");
+
+    // After `zephyr down` no container names the version, so this CLI's stands in: going back
+    // still needs the older version's backup.
+    let out = env.zephyr_env(
+        &["upgrade", "0.0.1"],
+        &[("ZEPHYR_IMAGE", ""), ("SHIM_NO_CONTAINER", "1")],
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no backup from 0.0.1"), "{err}");
+    assert_eq!(at(&env.calls(), RUN, ""), None);
 }
