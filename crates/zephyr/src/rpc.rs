@@ -255,6 +255,8 @@ pub struct Child {
     pub ready: Value,
     /// Every frame that is not a command response. Closes when the child exits.
     pub events: mpsc::UnboundedReceiver<Value>,
+    /// The session it runs, for the audit; `None` for a `/btw` child.
+    pub session: Option<String>,
     stdin: ChildStdin,
     pending: Pending,
     next_id: u64,
@@ -407,6 +409,7 @@ impl Child {
         let mut child = Self {
             ready,
             events,
+            session: session_id.map(Into::into),
             stdin,
             pending,
             next_id: 0,

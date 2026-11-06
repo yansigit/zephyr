@@ -619,6 +619,9 @@ impl<'a> Router<'a> {
             let _ = self.tap.send(ev.clone()); // no receivers is fine
             self.last_event = Instant::now();
             self.tally.add(ev);
+            if let Some(session) = self.child.as_ref().and_then(|c| c.session.as_deref()) {
+                crate::scheduler::audit(&self.store, &self.cfg, session, ev);
+            }
             self.track(ev);
             self.steer_event(ev);
             if let Some((id, command)) = crate::tools::gateway_call(ev) {

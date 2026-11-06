@@ -497,6 +497,37 @@ async fn resume(
     prompt(cfg, child, RESUME_NOTE, spec.refuse, tally, max_turns).await
 }
 
+/// The most of a tool call's arguments an audit line keeps.
+const AUDIT_ARGS: usize = 500;
+
+/// Records a tool call's start (or the policy's refusal of it) and its failure in the audit
+/// (DESIGN §4.4), from rpi's own events, in root's store: the agent can write neither.
+/// Arguments are cut to `AUDIT_ARGS` and the vault's values scrubbed out.
+pub(crate) fn audit(store: &Store, cfg: &Config, session: &str, ev: &serde_json::Value) {
+    let Some(tool) = ev["toolName"].as_str() else {
+        return;
+    };
+    let (args, outcome) = match ev["type"].as_str() {
+        Some("tool_execution_start") => {
+            let refused = matches!(
+                zephyr_policy::policy::check(tool, &ev["args"]),
+                zephyr_policy::policy::Decision::Deny(_)
+            );
+            let outcome = if refused { "refused" } else { "started" };
+            (crate::vault::scrubbed(cfg, ev["args"].to_string()), outcome)
+        }
+        Some("tool_execution_end") if ev["isError"] == true => (String::new(), "error"),
+        _ => return,
+    };
+    let end = (0..=AUDIT_ARGS.min(args.len()))
+        .rev()
+        .find(|&i| args.is_char_boundary(i))
+        .unwrap_or(0);
+    if let Err(e) = store.audit(session, tool, &args[..end], outcome) {
+        eprintln!("zephyr: writing the audit failed: {e}");
+    }
+}
+
 /// Sends the prompt and waits for the run to settle (`follow`).
 pub(crate) async fn prompt(
     cfg: &Config,
@@ -526,6 +557,8 @@ async fn follow(
     let mut cut = None;
     let mut guarded: Option<String> = None;
     let mut in_tool = 0usize;
+    // Its own connection: `follow` is not handed the run's store.
+    let audited = child.session.clone().zip(Store::open(&cfg.db_path()).ok());
     let settled = loop {
         let limit = cfg.stall_limit * if in_tool > 0 { 2 } else { 1 };
         let Ok(ev) = tokio::time::timeout(limit, child.events.recv()).await else {
@@ -536,6 +569,9 @@ async fn follow(
             Some(ev) if ev["type"] == "agent_settled" => break ev,
             Some(ev) => {
                 tally.add(&ev);
+                if let Some((session, store)) = &audited {
+                    audit(store, cfg, session, &ev);
+                }
                 match ev["type"].as_str() {
                     Some("tool_execution_start") => in_tool += 1,
                     Some("tool_execution_end") => in_tool = in_tool.saturating_sub(1),
