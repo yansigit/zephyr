@@ -41,7 +41,8 @@ zephyr login openai-codex --account codex-main
 |---|---|
 | `zephyr up [--build]` / `down` / `restart` | Start (building the image locally with `--build`), stop, restart |
 | `zephyr upgrade [VERSION]` | Move to the newest release (updating this CLI from the image first), once the agent is idle, after backing up `state.db`, `zephyr.toml`, `vault.toml` and `host.toml` to `~/.zephyr-daemon/<file>.<old version>.bak` (the newest 5 versions are kept). With an older VERSION, go back to it by restoring that version's backups. A release is always its published image: a local copy is used, else it is pulled, never built |
-| `zephyr status` / `logs [-f]` / `doctor [--fix]` | Container and daemon state, logs, checks (and repairs) |
+| `zephyr status` / `logs [-f]` / `doctor [--fix]` | Container and daemon state (heartbeat, whether the agent is up, the oldest waiting message, replies pending and failed; exits non-zero when the daemon is down or hung), logs, checks (and repairs) |
+| `zephyr alert setup TOPIC [--server URL] \| check \| test \| off` | Outage alerts: a systemd user timer on this machine checks every 5 minutes and posts to an [ntfy](https://ntfy.sh) topic when zephyr goes down, comes back, or more replies fail to send. Run `loginctl enable-linger $USER` so it runs while you are logged out |
 | `zephyr --version` | This CLI's version and the running container's, with a hint when they differ |
 | `zephyr login <provider> [--account NAME]` | Sign in an account, then make a small test call (`--no-verify` skips it) |
 | `zephyr accounts [list \| order NAME.. \| remove NAME]` | The failover pool |
@@ -315,7 +316,9 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   commands through its own `exec` tool: when you send a message during a long command (or after
   10 minutes, or for a server it starts), the command moves to the background without being
   stopped, the agent answers you, and you get its result as a message when it exits.
-  `/process list` and `/process stop N` show and stop them; `/stop` stops them too. A settings
+  `/process list` and `/process stop N` show and stop them; `/stop` stops them too, along with any
+  process the agent detached (`setsid`, `nohup ... &`), and says how many. Each command's log stops
+  at 50 MB with a note of what was dropped. A settings
   reload or a daemon crash keeps them running (the daemon is started again inside the container);
   a container restart ends them, and they are reported. A stopped task reports how far it got.
   Old job and task sessions and process logs are deleted after 30 days. A run that makes
@@ -420,12 +423,61 @@ The first `himalaya` command run with `secrets: ["MAIL_PASSWORD"]` asks you to a
   - `tui.token`: the `zephyr attach` token.
   - `vault.toml` (0600): the [vault](#the-vault)'s logins and tokens, and what each may be used
     for. `zephyr vault` edits it; comments you add by hand are kept.
-  - `host.toml`: the projects folder, optionally `memory = "8g"` to cap the container's memory,
+  - `host.toml`: the projects folder, optionally `memory = "8g"` to cap the container's memory (75% of the machine's when unset),
     `packages`: the apt packages `zephyr packages` bakes into the local image, and `offered_extensions`: the image extensions `init`, `up` and `upgrade` have already added to `zephyr.toml`, so one you remove stays removed. The first `up` after upgrading to a zephyr that keeps this record adds once any image extension removed earlier, or every one if the config lists none; after that, a removal sticks.
     Used only on the host, at `zephyr up`.
-  - `state.db`: inbox, outbox, jobs, spend.
+  - `state.db`: inbox, outbox, jobs, spend, and the audit of tool calls. Rows older than 90 days
+    are pruned; a reply that could not be sent for 7 days is given up as `expired`.
+  - `backups/` (0700): a daily copy of `state.db` and the four files above, the newest 7 kept.
+    `zephyr doctor` warns when the newest is over 2 days old. Copy this folder off the machine
+    yourself (it holds secrets: keep the copy encrypted).
+
+`zephyr up` caps the container's logs (100 MB), open files (65536) and memory (host.toml's
+`memory`, else 75% of the machine's). A daemon that hangs is restarted inside the container after 5
+minutes without a heartbeat.
 
 An install from before this layout is moved over by the next `zephyr up`.
+
+## When something goes wrong
+
+**The upgrade failed, or the container will not start.** `docker logs --tail 100 zephyr` shows why.
+`zephyr upgrade <previous version>` goes back: it restores that version's `state.db`,
+`zephyr.toml`, `vault.toml` and `host.toml` backups (works offline when the image is still local).
+If `up` failed to create the new container, the old one was put back and is running.
+
+**Restoring by hand** (the CLI itself is broken, or you want a nightly backup):
+
+```sh
+docker stop zephyr
+sudo ls ~/.zephyr-daemon/backups/                # state-YYYYMMDD.db, zephyr.toml.YYYYMMDD, ...
+sudo cp ~/.zephyr-daemon/backups/state-20261105.db ~/.zephyr-daemon/state.db
+sudo rm -f ~/.zephyr-daemon/state.db-wal ~/.zephyr-daemon/state.db-shm
+sudo cp ~/.zephyr-daemon/backups/zephyr.toml.20261105 ~/.zephyr-daemon/zephyr.toml   # if needed
+zephyr up                                        # with the CLI of the version that made the backup
+```
+
+A newer `state.db` cannot be read by an older zephyr (migrations only go forward), so restore a
+backup made by the version you start, or start a newer one.
+
+**A token leaked.** Rotate it where it was issued, then:
+- the attach token: `sudo rm ~/.zephyr-daemon/tui.token`, then `zephyr doctor --fix` writes a new one
+  and `zephyr restart` applies it;
+- Discord or BlueBubbles: `zephyr channel add discord|imessage` asks for the new secret;
+- a provider account: `zephyr login <provider> --account NAME`;
+- a vault entry: `zephyr vault edit NAME` (grants are kept);
+- a connector's secret: edit `secrets.env` through `zephyr config` or `sudo`, then `zephyr reload`.
+
+**Moving to a new machine.** `zephyr down`, then copy `~/.zephyr` and `~/.zephyr-daemon`
+(`sudo rsync -aHAX`, keeping owners), and the projects folder at the same path. On the new
+machine: install the CLI of the same version, `zephyr up`, `zephyr doctor`.
+
+**The disk is full.** Look at, in this order: `docker image prune` (keep the running release and
+the one before it, for going back), `~/.zephyr-daemon/*.bak` (the newest 5 versions are kept),
+`~/.zephyr/sessions` (task and job sessions go after 30 days; `main` sessions stay), `.procs` logs
+(50 MB each, gone 30 days after they end), and the projects' checkpoints (50 per project).
+
+**Hearing about outages.** `zephyr alert setup <topic>` (pick a long random topic: anyone who
+knows it can read it), subscribe to the topic in the ntfy app, then `zephyr alert test`.
 
 ## Claude subscription
 
@@ -453,7 +505,10 @@ deploy/release.sh 0.2.1   # the image changed: publish it and upgrade the live i
 deploy/release.sh --cli   # only the host CLI changed: reinstall it, publish nothing
 ```
 
-The script stops at the first problem. It runs fmt, clippy and the tests, sets the version in
+Every PR runs fmt, clippy (`-D warnings`, Rust 1.95 as the image) and the tests, and `cargo deny check
+advisories bans` (`.github/workflows/ci.yml`). The script stops at the first problem. It runs fmt,
+clippy and the tests, then the real-rpi suite (`ZEPHYR_REAL_RPI=1 cargo test -- --ignored`, which
+fails rather than skips when the pinned binary is missing) when the binary is on this machine, sets the version in
 `Cargo.toml` (the CLI pulls `ghcr.io/yansigit/zephyr:<version>`), commits and tags `v<version>`,
 pushes, and waits for the image workflow. Then it installs the CLI into `~/.cargo/bin` (from the
 clean tree, so nothing uncommitted ships) and runs `zephyr upgrade <version>`.
@@ -473,7 +528,8 @@ new one runs; if the new one cannot be created, the old one is put back. `.env*`
 projects folder are masked from the agent at each `up` (not inside `.git` or `node_modules`; a path
 with a comma cannot be masked and is named in a warning).
 
-The image workflow tags `:<version>` and `:latest` and runs on GitHub-hosted runners. When the
+The image workflow smoke-tests the built image (zephyr, rpi, the policy plugin and every extension)
+before it pushes, and tags `:<version>` and `:latest` and runs on GitHub-hosted runners. When the
 Actions minutes run out, start the fallback runner on this machine once with
 `deploy/runner/start.sh up`, then `gh variable set ZEPHYR_RUNNER --body zephyr-local` and
 `gh run rerun <id>`; `gh variable delete ZEPHYR_RUNNER` switches back, and
