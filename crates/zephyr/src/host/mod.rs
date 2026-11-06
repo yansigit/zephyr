@@ -36,6 +36,11 @@ const REPO: &str = "ghcr.io/yansigit/zephyr:";
 /// The image built from it with host.toml's apt `packages` (`zephyr packages`), never pushed.
 const LOCAL: &str = "zephyr-local:";
 
+/// The agent's PATH, which the image's own `ENV PATH` (root's) no longer carries.
+/// Kept in step with `agent::AGENT_PATH`, the daemon's copy.
+const AGENT_PATH: &str =
+    "/zephyr/.local/bin:/opt/zephyr/py/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 const COMMANDS: [&str; 25] = [
     "init",
     "up",
@@ -157,7 +162,8 @@ impl Host {
     ) -> Command {
         let ids = agent_ids();
         let user = format!("{}:{}", ids.0, ids.1);
-        let flags = [&["-u", user.as_str(), "-w", "/zephyr"], flags].concat();
+        let path = format!("PATH={AGENT_PATH}");
+        let flags = [&["-u", &user, "-w", "/zephyr", "-e", &path], flags].concat();
         self.exec(&flags, env, argv)
     }
 

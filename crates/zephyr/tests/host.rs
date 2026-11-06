@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const CONTAINER: &str = "zephyr-lanetest";
+/// The agent's PATH, passed to each exec as the agent: the image's own is root's.
+const AGENT_PATH: &str =
+    "/zephyr/.local/bin:/opt/zephyr/py/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const GH_TOKEN: &str = "gho_FAKE_GH_TOKEN_0123";
 const CLAUDE_TOKEN: &str = "sk-ant-oat01-FAKE-CLAUDE-TOKEN";
 
@@ -249,7 +252,8 @@ fn ids() -> String {
 /// A `docker exec` as the agent (this user, in its home) whose argv starts with `rest`.
 fn find_agent<'a>(calls: &'a [Vec<String>], rest: &[&str]) -> &'a Vec<String> {
     let ids = ids();
-    let prefix: Vec<&str> = ["docker", "exec", "-u", &ids, "-w", "/zephyr"]
+    let path = format!("PATH={AGENT_PATH}");
+    let prefix: Vec<&str> = ["docker", "exec", "-u", &ids, "-w", "/zephyr", "-e", &path]
         .into_iter()
         .chain(rest.iter().copied())
         .collect();
@@ -598,7 +602,7 @@ fn login_feeds_secrets_on_stdin_and_records_the_account() {
     let acct = "RPI_CODING_AGENT_DIR=/zephyr/accounts/claude-main";
     let login = find_agent(&calls, &["-i", "-e", acct, CONTAINER, "script", "-qec"]);
     assert!(
-        login[12].starts_with("rpi auth login --provider claude-code --extension /opt/zephyr/ext/"),
+        login[14].starts_with("rpi auth login --provider claude-code --extension /opt/zephyr/ext/"),
         "{login:?}"
     );
     find_agent(&calls, &["-e", acct, CONTAINER, "rpi", "auth", "check"]);
