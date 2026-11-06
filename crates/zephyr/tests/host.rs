@@ -44,7 +44,7 @@ case "$1" in
     case " $* " in
       *" --list-models "*) printf 'provider model context\nanthropic claude-sonnet-5 200K\nopenai-codex gpt-5.5 400K\nopenai-codex gpt-5.4 400K\n' ;;
       *" auth check "*) echo '{"ready":true,"provider":"claude-code","source":"auth.json"}' ;;
-      *" zephyr status "*) echo "daemon: ${SHIM_DAEMON:-running}" ;;
+      *" zephyr status "*) echo "daemon: ${SHIM_DAEMON:-running}"; [ -n "$SHIM_STATUS" ] && printf '%b\n' "$SHIM_STATUS" ;;
       *" zephyr --version "*) [ -n "$SHIM_VERSION" ] || exit 2; echo "zephyr $SHIM_VERSION" ;;
       *" zephyr tui "*) exit "${SHIM_TUI_EXIT:-0}" ;;
     esac ;;
@@ -1573,4 +1573,25 @@ fn vault_add_list_and_rm_reach_roots_file_and_never_put_a_value_in_argv() {
     );
     assert!(!env.zephyr(&["vault", "rm", "github"]).status.success());
     std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn upgrade_waits_only_for_work_in_flight() {
+    let env = Env::new("upgrade-busy");
+    env.init(&["--no-start"]);
+    // A notice for a TUI nobody attaches, messages while paused: these never clear by themselves.
+    let out = env.zephyr_env(
+        &["upgrade"],
+        &[(
+            "SHIM_STATUS",
+            "outbox  pending     1\\ninbox   new         2",
+        )],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!stdout(&out).contains("the agent is busy"));
+    find(&env.calls(), RUN);
 }

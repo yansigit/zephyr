@@ -691,10 +691,12 @@ impl Host {
         Err(err).with_context(|| format!("running {}", exe.display()))
     }
 
-    /// Waits until no message, reply or job is in flight, then backs up state.db as
-    /// `state.db.<running>.bak` (migrations only go forward). A failed backup stops the upgrade;
-    /// only a first install, without state.db, goes on without one.
+    /// Waits until no message, job, task or process is in flight (30 minutes at most), then
+    /// backs up state.db as `state.db.<running>.bak` (migrations only go forward). A failed backup
+    /// stops the upgrade; only a first install, without state.db, goes on without one.
     fn settle(&self, running: Option<&str>) -> anyhow::Result<()> {
+        const LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+        let start = std::time::Instant::now();
         while self.running() {
             let status = self
                 .exec(&[], &[], &["zephyr", "status"])
@@ -702,6 +704,12 @@ impl Host {
                 .output();
             if !status.is_ok_and(|o| busy(&String::from_utf8_lossy(&o.stdout))) {
                 break;
+            }
+            if start.elapsed() >= LIMIT {
+                bail!(
+                    "the agent has been busy for 30 minutes (`zephyr status`); \
+                     send it /stop, then run this again"
+                );
             }
             println!("the agent is busy; waiting...");
             std::thread::sleep(std::time::Duration::from_secs(10));
@@ -789,15 +797,17 @@ fn semver(v: &str) -> Option<(u64, u64, u64)> {
     }
 }
 
-/// `zephyr status` shows a message, a reply or a job in flight.
+/// `zephyr status` shows work in flight: a message the agent is on, a job run, a task or a
+/// process. Rows that wait on someone else never clear by themselves, so they do not count: a
+/// notice for a TUI nobody attaches, a reply for a removed channel, messages while paused.
 fn busy(status: &str) -> bool {
     status.lines().any(|l| {
         let mut w = l.split_whitespace();
         matches!(
             (w.next(), w.next()),
-            (Some("inbox"), Some("new" | "dispatched"))
-                | (Some("outbox"), Some("pending"))
+            (Some("inbox"), Some("dispatched"))
                 | (Some("runs"), Some("claimed" | "running"))
+                | (Some("tasks" | "procs"), Some("running"))
         )
     })
 }
@@ -1288,11 +1298,22 @@ mod tests {
         let idle = "daemon: running\ninbox   done        12\noutbox  sent        3\nruns    ok          2\n";
         assert!(!busy(idle));
         for line in [
-            "inbox   new         1",
-            "outbox  pending     2",
+            "inbox   dispatched  1",
+            "runs    claimed     1",
             "runs    running     1",
+            "tasks   running     1",
+            "procs   running     2",
         ] {
             assert!(busy(&format!("{idle}{line}\n")), "{line}");
+        }
+        // Rows that wait on someone else would hold an upgrade forever.
+        for line in [
+            "inbox   new         1",
+            "outbox  pending     2",
+            "tasks   queued      1",
+            "procs   exited      3",
+        ] {
+            assert!(!busy(&format!("{idle}{line}\n")), "{line}");
         }
     }
 
