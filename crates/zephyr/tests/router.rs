@@ -424,7 +424,8 @@ async fn a_child_without_the_policy_beacon_gets_no_prompts() {
             && told[0].ends_with("; messages wait"),
         "{told:?}"
     );
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Two more starts: the fourth failed (the fifth only follows a failure) and told no one.
+    wait(|| log(&home, "start").len() >= 5).await;
     assert_eq!(gw.replies().len(), 1, "told once");
     assert!(log(&home, "prompt").is_empty());
     assert_eq!(inbox_status(&home, "new"), 1);
@@ -521,6 +522,7 @@ async fn a_run_past_its_time_cap_is_stopped() {
     let home = home("run-minutes");
     let mut cfg = config(&home);
     cfg.budget = Some(toml::from_str("run_minutes = 0.01").unwrap()); // 0.6 s
+    cfg.tick = Duration::from_millis(200); // the cap is checked on the tick
     let gw = start(cfg);
     gw.say("m1", "owner", "[hang] forever").await;
     assert_eq!(
@@ -691,7 +693,8 @@ async fn budget_pauses_at_the_limit_and_holds_until_resume() {
 #[tokio::test]
 async fn waiting_messages_go_when_the_budget_pause_ends_at_midnight() {
     let home = home("budget-midnight");
-    let cfg = config(&home);
+    let mut cfg = config(&home);
+    cfg.tick = Duration::from_millis(200);
     let store = Store::open(&cfg.db_path()).unwrap();
     let today = store.today().unwrap();
     store.set_paused(Some(&format!("budget:{today}"))).unwrap();
@@ -915,14 +918,22 @@ async fn a_paused_scheduler_claims_nothing_and_catches_up_once_on_resume() {
     drop(store);
 
     let gw = start(cfg);
-    tokio::time::sleep(Duration::from_millis(1500)).await; // first tick and a pause poll
+    // The scheduler shares the router's task, and its first tick and pause poll are due at
+    // once: a reply from the router comes after the scheduler's first look at the missed runs.
+    gw.say("m0", "owner", "/job list").await;
+    gw.wait_replies(1).await;
     assert!(log(&home, "prompt").is_empty());
     assert_eq!(run_status(&home, "claimed"), 0);
     gw.say("m1", "owner", "/resume").await;
     wait(|| run_status(&home, "completed") == 2).await;
+    // shortcut: no event shows the scheduler looked again after the catch-up, so this waits
+    // past its next pause polls (1 s); a hook in the scheduler would make it exact.
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(run_status(&home, "completed"), 2, "one catch-up run");
-    assert_eq!(gw.wait_replies(2).await, ["[zephyr] resumed", "caught up"]);
+    assert_eq!(
+        gw.wait_replies(3).await[1..],
+        ["[zephyr] resumed", "caught up"]
+    );
     gw.shutdown().await;
 }
 
@@ -1534,7 +1545,9 @@ async fn unknown_models_and_bad_edits_change_nothing() {
 #[tokio::test]
 async fn hand_edits_apply_live_on_the_next_tick() {
     let home = home("hand-edit");
-    let gw = start(on_file(&home, ""));
+    let mut cfg = on_file(&home, "");
+    cfg.tick = Duration::from_millis(200);
+    let gw = start(cfg);
     gw.say("m1", "owner", "hi").await;
     gw.wait_replies(1).await;
     std::fs::write(
@@ -1542,9 +1555,16 @@ async fn hand_edits_apply_live_on_the_next_tick() {
         file_text(&home, "[budget]\ndaily_tokens = 5"),
     )
     .unwrap();
-    tokio::time::sleep(Duration::from_secs(6)).await; // the 5 s tick
-    gw.say("m2", "owner", "/status").await;
-    let status = gw.wait_replies(2).await.remove(1);
+    // Nothing but the tick reloads it: ask until the status shows the new limit.
+    let mut n = 1;
+    let status = loop {
+        n += 1;
+        gw.say(&format!("s{n}"), "owner", "/status").await;
+        let status = gw.wait_replies(n).await.remove(n - 1);
+        if status.contains("(limit 5)") || n == 20 {
+            break status;
+        }
+    };
     assert!(status.contains("(limit 5)"), "{status}");
     assert!(
         status.starts_with("agent: account a on fake/m1"),
@@ -1552,7 +1572,7 @@ async fn hand_edits_apply_live_on_the_next_tick() {
     );
     assert_eq!(log(&home, "start").len(), 1, "no restart");
     gw.say("m3", "owner", "/reload").await;
-    assert_eq!(gw.wait_replies(3).await[2], "[zephyr] nothing changed");
+    assert_eq!(gw.wait_replies(n + 1).await[n], "[zephyr] nothing changed");
     gw.shutdown().await;
 }
 
@@ -2835,6 +2855,7 @@ async fn a_main_run_that_stalls_is_stopped_and_the_owner_told() {
     let home = home("main-stall");
     let mut cfg = config(&home);
     cfg.stall_limit = Duration::from_secs(1);
+    cfg.tick = Duration::from_millis(200); // the stall shows on the tick
     let gw = start(cfg);
     gw.say("m1", "owner", "[hang] think hard").await;
     let replies = gw.wait_replies(2).await;
@@ -2854,11 +2875,12 @@ async fn a_wedged_child_that_never_settles_the_abort_is_killed_and_the_run_resum
     std::fs::write(home.join("wedge"), "").unwrap();
     let mut cfg = config(&home);
     cfg.stall_limit = Duration::from_secs(1);
+    cfg.tick = Duration::from_millis(200);
     // The auth check's own call would wait out its 60 s timeout on the wedged child.
     cfg.auth.enabled = false;
     let gw = start(cfg);
     gw.say("m1", "owner", "long job").await;
-    // The stall shows at a 5 s tick, the abort goes unanswered for 5 s, then the kill.
+    // The stall shows on a tick, the abort goes unanswered for 5 s, then the kill.
     for _ in 0..600 {
         if !gw.replies().is_empty() {
             break;

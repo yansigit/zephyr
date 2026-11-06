@@ -133,6 +133,19 @@ fn of_type(home: &Path, kind: &str) -> Vec<Value> {
         .collect()
 }
 
+/// Sends a message and waits for the reconcile after its run settled. The router checks
+/// credentials inline in its loop, so a check under way when the message came in has finished
+/// by then, and over the run's events one that was due has had its turn.
+async fn round_trip(gw: &Gateway) {
+    gw.say("probe", "hi").await;
+    wait(|| {
+        let commands = log(&gw.home);
+        let prompt = commands.iter().position(|c| c["type"] == "prompt");
+        prompt.is_some_and(|at| commands[at..].iter().any(|c| c["type"] == "get_messages"))
+    })
+    .await;
+}
+
 fn refreshes(home: &Path) -> Vec<Value> {
     of_type(home, "auth-refresh")
 }
@@ -215,7 +228,7 @@ async fn no_oauth_credentials_means_no_refresh_and_no_restart() {
     );
     wait(|| !of_type(&gw.home, "get_auth_status").is_empty()).await;
     let first = pid(&gw.home);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    round_trip(&gw).await;
     assert!(refreshes(&gw.home).is_empty());
     assert_eq!(pid(&gw.home), first, "no restart");
     gw.shutdown().await;
@@ -234,7 +247,7 @@ async fn a_credential_with_time_left_is_left_alone() {
     let gw = start("fresh", Some(expiring_in(7200)), "");
     wait(|| !of_type(&gw.home, "get_auth_status").is_empty()).await;
     let first = pid(&gw.home);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    round_trip(&gw).await;
     assert!(refreshes(&gw.home).is_empty());
     assert_eq!(pid(&gw.home), first);
     gw.shutdown().await;
@@ -246,7 +259,7 @@ async fn a_failed_refresh_leaves_the_child_running() {
     std::fs::write(gw.home.join("oauth_fail"), "").unwrap();
     wait(|| !refreshes(&gw.home).is_empty()).await;
     let first = pid(&gw.home);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    round_trip(&gw).await;
     assert_eq!(refreshes(&gw.home).len(), 1);
     assert_eq!(pid(&gw.home), first, "nothing refreshed, so no restart");
     assert_eq!(stored(&gw.agent, "anthropic")["access"], "old");
@@ -261,7 +274,7 @@ async fn disabled_means_the_child_is_never_asked() {
         "[auth]\nenabled = false\n",
     );
     wait(|| pid(&gw.home).is_some()).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    round_trip(&gw).await;
     assert!(of_type(&gw.home, "get_auth_status").is_empty());
     assert!(refreshes(&gw.home).is_empty());
     gw.shutdown().await;
