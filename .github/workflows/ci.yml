@@ -13,7 +13,9 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain the image builds with (deploy/Dockerfile's rust:1.95), so a newer clippy's lints
+      # land with a deliberate bump, not on an unrelated PR.
+      - uses: dtolnay/rust-toolchain@1.95
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
