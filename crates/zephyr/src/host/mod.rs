@@ -707,8 +707,10 @@ impl Host {
             (Some(r), Some(t)) if t < r
         );
         let bak = format!("state.db.{target}.bak");
-        let exists =
-            format!("import os, sys; sys.exit(not os.path.exists('{DAEMON_MOUNT}/{bak}'))");
+        // Touched as well, so `settle`'s pruning (oldest first) keeps the backup this restores.
+        let exists = format!(
+            "import os, sys; p = '{DAEMON_MOUNT}/{bak}'; os.path.exists(p) or sys.exit(1); os.utime(p)"
+        );
         if back && !quiet(self.daemon_py(&exists)) {
             bail!("no backup from {target} ({bak}); its schema may not read this state.db");
         }

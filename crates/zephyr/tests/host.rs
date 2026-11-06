@@ -36,7 +36,7 @@ case "$1" in
       *" --entrypoint cat "*) printf '#!/bin/bash\n[ "$1" = --version ] && { echo "zephyr %s"; exit; }\necho "$@" >> "%s/exec.log"\n' "${5##*:}" "$SHIM_DIR" ;;
       *" --entrypoint python3 "*)
         case "${@: -1}" in
-          *"sys.exit(not os.path.exists"*) [ -n "$SHIM_HAS_BAK" ]; exit ;;
+          *"os.path.exists(p) or sys.exit(1)"*) [ -n "$SHIM_HAS_BAK" ]; exit ;;
           *".backup("*) exit "${SHIM_PY_FAIL:-0}" ;;
         esac ;;
     esac ;;
