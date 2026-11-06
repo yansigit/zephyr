@@ -30,6 +30,7 @@ case "$1" in
   build) [ "${@: -1}" = - ] && cat >> "$SHIM_DIR/build.log"; exit "${SHIM_BUILD_FAIL:-0}" ;;
   run)
     case " $* " in
+      *" -d --name "*) exit "${SHIM_RUN_FAIL:-0}" ;;
       *" --entrypoint zephyr "*) echo "zephyr $SHIM_LATEST" ;;
       # The image's CLI: names its image's tag, and logs how it was run.
       *" --entrypoint cat "*) printf '#!/bin/bash\n[ "$1" = --version ] && { echo "zephyr %s"; exit; }\necho "$@" >> "%s/exec.log"\n' "${5##*:}" "$SHIM_DIR" ;;
@@ -219,6 +220,21 @@ impl Env {
 
     fn config(&self) -> String {
         std::fs::read_to_string(self.daemon().join("zephyr.toml")).unwrap()
+    }
+
+    /// The layout after the first `up`: the daemon's files root's, reached through `__file` in the
+    /// container (the shim serves them from `files/`). `unsplit` gives the dir back.
+    fn split(&self) {
+        let files = self.dir.join("files");
+        std::fs::create_dir_all(&files).unwrap();
+        for name in ["zephyr.toml", "secrets.env", "tui.token", "host.toml"] {
+            std::fs::rename(self.daemon().join(name), files.join(name)).unwrap();
+        }
+        std::fs::set_permissions(self.daemon(), std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    fn unsplit(&self) {
+        std::fs::set_permissions(self.daemon(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     fn init(&self, extra: &[&str]) {
@@ -1594,4 +1610,78 @@ fn upgrade_waits_only_for_work_in_flight() {
     );
     assert!(!stdout(&out).contains("the agent is busy"));
     find(&env.calls(), RUN);
+}
+
+#[test]
+fn up_keeps_the_old_container_until_the_new_one_runs() {
+    let env = Env::new("up-order");
+    env.init(&["--no-start"]);
+    // An unreadable dir under projects (a database's data dir) does not stop it; a comma, which
+    // --mount cannot carry, is skipped with a warning.
+    let locked = env.projects.join("pgdata");
+    std::fs::create_dir_all(env.projects.join("a,b")).unwrap();
+    std::fs::write(env.projects.join("a,b/.env"), "S=1").unwrap();
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let out = env.zephyr(&["up"]);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("a,b/.env stays visible"));
+    let calls = env.calls();
+    let run = find(&calls, RUN);
+    assert!(!run.iter().any(|a| a.contains("a,b")), "{run:?}");
+    assert!(run.iter().any(|a| a.contains("app/.env")), "{run:?}");
+    // Stopped before it is removed, so its daemon drains.
+    let stop = at(&calls, &["docker", "stop", CONTAINER], "").unwrap();
+    assert!(stop < at(&calls, RM, "").unwrap(), "{calls:#?}");
+
+    // Once split, the old container only steps aside, and comes back when the new one fails.
+    env.split();
+    let old = format!("{CONTAINER}-old");
+    let out = env.zephyr_env(&["up"], &[("SHIM_RUN_FAIL", "1")]);
+    assert!(!out.status.success());
+    let calls = env.calls();
+    let run = at(&calls, RUN, "").unwrap();
+    assert!(
+        !calls[..run]
+            .iter()
+            .any(|c| c[..] == ["docker", "rm", "-f", CONTAINER]),
+        "{calls:#?}"
+    );
+    let stop = at(&calls, &["docker", "stop", CONTAINER], "").unwrap();
+    let aside = at(&calls, &["docker", "rename", CONTAINER, &old], "").unwrap();
+    let back = at(&calls, &["docker", "rename", &old, CONTAINER], "").unwrap();
+    let start = at(&calls, &["docker", "start", CONTAINER], "").unwrap();
+    assert!(
+        stop < aside && aside < run && run < back && back < start,
+        "{calls:#?}"
+    );
+    // It runs: the old one goes only now.
+    env.ok(&["up"]);
+    let calls = env.calls();
+    let run = at(&calls, RUN, "").unwrap();
+    let removed = calls
+        .iter()
+        .rposition(|c| c[..] == ["docker", "rm", "-f", &old])
+        .unwrap();
+    assert!(run < removed, "{calls:#?}");
+    env.unsplit();
+}
+
+#[test]
+fn up_and_going_back_without_a_container_keep_the_backups() {
+    let env = Env::new("up-backup");
+    env.init(&["--no-start"]);
+    // Another version runs: `up` backs it up before replacing it, as an upgrade does.
+    env.ok(&["up"]);
+    assert_eq!(at(&env.calls(), PY, ".backup("), None);
+    let out = env.zephyr_env(&["up"], &[("SHIM_VERSION", "0.0.1")]);
+    assert!(out.status.success());
+    let calls = env.calls();
+    let backup = at(&calls, PY, "connect('/var/lib/zephyr/state.db.0.0.1.bak')").expect("backup");
+    assert!(backup < at(&calls, RUN, "").unwrap(), "{calls:#?}");
 }

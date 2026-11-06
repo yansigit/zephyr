@@ -102,7 +102,7 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
         }
         if !no_start {
             h.ensure_image(false, false)?;
-            h.up()?;
+            h.up_checked()?;
             h.doctor(false)?;
         }
         return Ok(());
@@ -110,7 +110,7 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
 
     // Logins run in the container, so it starts before them.
     h.ensure_image(false, false)?;
-    h.up()?;
+    h.up_checked()?;
     let have: Vec<String> = conf::accounts(&doc)
         .iter()
         .map(|(_, m)| provider_of(m).to_string())

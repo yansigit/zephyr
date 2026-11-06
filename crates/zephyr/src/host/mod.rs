@@ -36,6 +36,9 @@ const REPO: &str = "ghcr.io/yansigit/zephyr:";
 /// The image built from it with host.toml's apt `packages` (`zephyr packages`), never pushed.
 const LOCAL: &str = "zephyr-local:";
 
+/// This CLI's version, and the image it runs by default.
+const ME: &str = env!("CARGO_PKG_VERSION");
+
 /// The agent's PATH, which the image's own `ENV PATH` (root's) no longer carries.
 /// Kept in step with `agent::AGENT_PATH`, the daemon's copy.
 const AGENT_PATH: &str =
@@ -303,26 +306,16 @@ impl Host {
     /// The daemon runs as root holding only SETUID, SETGID and KILL; the agent runs as this
     /// user, and cannot reach the daemon's files in `~/.zephyr-daemon` (DESIGN §4.4).
     fn up(&self) -> anyhow::Result<()> {
-        // The old container goes first: it holds the files the migration moves.
-        let _ = quiet(docker(&["rm", "-f", &self.container]));
+        // Before the first split the old container holds the files the migration moves, so it
+        // goes first; otherwise it runs until the new one's arguments are all known.
+        if self.data.direct() {
+            self.remove();
+        }
         self.migrate()?;
         let projects = self
             .data
             .projects()?
             .context("no projects dir: run `zephyr init`")?;
-        // As `init` does: the extensions the image ships since this config was written.
-        // A convenience only: the old container is already gone, so a failure must not stop the start.
-        match self
-            .data
-            .load()
-            .and_then(|mut doc| self.data.add_image_extensions(&mut doc))
-        {
-            Ok(true) => println!("added the image's new extensions to zephyr.toml"),
-            Ok(false) => {}
-            Err(e) => eprintln!(
-                "warning: could not add the image's new extensions: {e:#}; run `zephyr init` later"
-            ),
-        }
         let image = self.run_image()?;
         let ids = agent_ids();
         let data = self.data.dir.display();
@@ -390,8 +383,63 @@ impl Host {
         // Root cannot enter the agent's 0700 home; the daemon starts each child there as the agent.
         .args(["-w", "/", &image])
         .stdout(Stdio::null());
-        run(&mut cmd)?;
+
+        // The old container steps aside (stopped, so its daemon drains) and comes back if the new
+        // one cannot be created.
+        let old = format!("{}-old", self.container);
+        let was_running = self.running();
+        let aside = self.state().is_some();
+        if aside {
+            // Left by an `up` that died between the rename and the removal.
+            let _ = quiet(docker(&["rm", "-f", &old]));
+            let _ = quiet(docker(&["stop", &self.container]));
+            run(&mut docker(&["rename", &self.container, &old]))?;
+        }
+        // As `init` does: the extensions the image ships since this config was written. Only
+        // with the old daemon stopped, which would load them; a convenience, so it only warns.
+        match self
+            .data
+            .load()
+            .and_then(|mut doc| self.data.add_image_extensions(&mut doc))
+        {
+            Ok(true) => println!("added the image's new extensions to zephyr.toml"),
+            Ok(false) => {}
+            Err(e) => eprintln!(
+                "warning: could not add the image's new extensions: {e:#}; run `zephyr init` later"
+            ),
+        }
+        if let Err(e) = run(&mut cmd) {
+            if aside {
+                let _ = quiet(docker(&["rm", "-f", &self.container]));
+                let _ = quiet(docker(&["rename", &old, &self.container]));
+                if was_running {
+                    let _ = quiet(docker(&["start", &self.container]));
+                }
+            }
+            return Err(e);
+        }
+        if aside {
+            let _ = quiet(docker(&["rm", "-f", &old]));
+        }
         self.wait_ready()
+    }
+
+    /// `up`, backed up first as an upgrade is when the container runs another version.
+    fn up_checked(&self) -> anyhow::Result<()> {
+        let running = running_version(self);
+        if running
+            .as_deref()
+            .is_some_and(|v| v != ME && semver(v).is_some())
+        {
+            self.settle(running.as_deref())?;
+        }
+        self.up()
+    }
+
+    /// Stops the container, so its daemon drains (tasks, long execs), then removes it.
+    fn remove(&self) {
+        let _ = quiet(docker(&["stop", &self.container]));
+        let _ = quiet(docker(&["rm", "-f", &self.container]));
     }
 
     /// Waits until the daemon answers on its socket (`zephyr status`), so "ready" means a message
@@ -603,7 +651,7 @@ impl Host {
         ok &= check("zephyr.toml parses", self.data.load().is_ok());
         if fix && !self.running() && self.data.projects()?.is_some() {
             self.ensure_image(false, false)?;
-            self.up()?;
+            self.up_checked()?;
         }
         let running = self.running();
         ok &= check(&format!("container {} is running", self.container), running);
@@ -625,7 +673,6 @@ impl Host {
     /// `zephyr upgrade [VERSION]`: the newest release, or VERSION. This CLI is replaced first, so
     /// the CLI that starts the container always matches its image.
     fn upgrade(mut self, version: Option<&str>) -> anyhow::Result<()> {
-        const ME: &str = env!("CARGO_PKG_VERSION");
         if std::env::var("ZEPHYR_IMAGE").is_ok_and(|v| !v.is_empty()) {
             // A named image (a local build, a test install): no versions to compare.
             self.ensure_image(false, true)?;
@@ -988,24 +1035,27 @@ fn masks(projects: &str) -> anyhow::Result<Vec<String>> {
         format!("{projects}/.parity-env.sh"),
         format!("{projects}/.parity-lanes/archive"),
     ];
-    let found = output(Command::new("find").args([
-        projects,
-        "-name",
-        "node_modules",
-        "-prune",
-        "-o",
-        "-name",
-        ".env*",
-        "-print0",
-    ]))?;
+    // find exits 1 on any dir it cannot read (a database's 0700 data dir); what it found counts.
+    let found = Command::new("find")
+        .args([projects, "-name", "node_modules", "-prune", "-o"])
+        .args(["-name", ".git", "-prune", "-o", "-name", ".env*", "-print0"])
+        .stderr(Stdio::null())
+        .output()
+        .context("running find")?;
     paths.extend(
-        found
+        String::from_utf8_lossy(&found.stdout)
             .split('\0')
             .filter(|p| !p.is_empty())
             .map(String::from),
     );
     let mut args = vec![];
     for p in paths {
+        if p.contains(',') {
+            eprintln!(
+                "warning: {p} stays visible to the agent: --mount cannot name a path with a comma"
+            );
+            continue;
+        }
         let path = std::path::Path::new(&p);
         let spec = if path.is_dir() {
             format!("type=tmpfs,dst={p}")
@@ -1071,7 +1121,7 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
             let build = a.flag("--build");
             a.rest()?;
             h.ensure_image(build, false)?;
-            h.up()
+            h.up_checked()
         }
         "upgrade" => match &a.rest()?[..] {
             [] => h.upgrade(None),
