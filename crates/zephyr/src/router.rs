@@ -580,9 +580,12 @@ impl<'a> Router<'a> {
                     None => self.child_exited().await,
                 },
                 _ = tick.tick() => {
-                    // Liveness for `zephyr supervise` and `zephyr status`: a plain overwrite.
+                    // Liveness for `zephyr supervise` and `zephyr status`: a plain overwrite of
+                    // `<unix time> <main child up: 0|1> <failed child starts in a row>`.
                     let beat = self.cfg.state_dir().join(crate::supervise::HEARTBEAT);
-                    let _ = std::fs::write(beat, format!("{}\n", crate::now()));
+                    let up = self.child.is_some() as u8;
+                    let line = format!("{} {up} {}\n", crate::now(), self.spawn_failures);
+                    let _ = std::fs::write(beat, line);
                     self.cap_run().await;
                     self.login_starts().await;
                     self.login_notices();

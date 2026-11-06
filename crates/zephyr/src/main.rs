@@ -299,7 +299,30 @@ async fn status(cfg: &Config) -> anyhow::Result<()> {
     for line in zephyr::reload::status_lines(cfg, &store)? {
         println!("{line}");
     }
-    for (table, status, n) in store.counts()? {
+    // The router's view, written with the heartbeat: `<unix> <main up> <failed starts>`.
+    let file = std::fs::read_to_string(cfg.state_dir().join(HEARTBEAT)).unwrap_or_default();
+    match file.split_whitespace().collect::<Vec<_>>()[..] {
+        [_, up, failures] => println!(
+            "main: {}, {failures} failed starts in a row",
+            if up == "1" { "up" } else { "down" }
+        ),
+        _ => println!("main: unknown"),
+    }
+    let ago = |at: Option<i64>| at.map_or("none".into(), |t| format!("{}s ago", zephyr::now() - t));
+    println!("oldest new message: {}", ago(store.oldest("inbox", "new")?));
+    let counts = store.counts()?;
+    let outbox = |status: &str| {
+        (counts.iter())
+            .find(|(t, s, _)| t == "outbox" && s == status)
+            .map_or(0, |c| c.2)
+    };
+    println!(
+        "replies: {} pending (oldest {}), {} failed",
+        outbox("pending"),
+        ago(store.oldest("outbox", "pending")?),
+        outbox("failed")
+    );
+    for (table, status, n) in counts {
         println!("{table:<7} {status:<11} {n}");
     }
     if !up {

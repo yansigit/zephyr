@@ -163,6 +163,41 @@ fn status_fails_without_a_daemon_or_with_a_stale_heartbeat() {
 }
 
 #[test]
+fn status_shows_the_main_child_the_waiting_message_and_the_replies() {
+    let (home, cfg) = setup("status-ops", "");
+    let store = zephyr::store::Store::open(&home.join("state.db")).unwrap();
+    let m = zephyr::channel::Inbound {
+        channel: "chat".into(),
+        platform_msg_id: "1".into(),
+        sender: "owner".into(),
+        text: "hi".into(),
+    };
+    store.insert_inbox(&m).unwrap();
+    for text in ["one", "two", "three"] {
+        store.notify("chat", "owner", text).unwrap();
+    }
+    drop(store);
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    db.execute_batch(
+        "UPDATE inbox SET created_at = unixepoch() - 100;
+         UPDATE outbox SET created_at = unixepoch() - 50 WHERE text = 'one';
+         UPDATE outbox SET status = 'failed' WHERE text = 'three';",
+    )
+    .unwrap();
+    // What the router last wrote: the child down after 3 failed starts.
+    std::fs::write(home.join("heartbeat"), format!("{} 0 3\n", zephyr::now())).unwrap();
+    let text = stdout(&zephyr(&cfg, &["status"]));
+    for line in [
+        "main: down, 3 failed starts in a row",
+        "oldest new message: 100s ago",
+        "replies: 2 pending (oldest 50s ago), 1 failed",
+        "inbox   new         1",
+    ] {
+        assert!(text.contains(line), "{line}\n{text}");
+    }
+}
+
+#[test]
 fn doctor_reports_presence_and_never_values() {
     // A stand-in BlueBubbles that answers the ping and records the request line.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

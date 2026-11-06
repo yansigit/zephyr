@@ -1350,6 +1350,13 @@ impl Store {
         rows.collect()
     }
 
+    /// When the oldest `status` row of `table` (`inbox` or `outbox`) was created, if there is one.
+    pub fn oldest(&self, table: &str, status: &str) -> rusqlite::Result<Option<i64>> {
+        assert!(matches!(table, "inbox" | "outbox"));
+        let sql = format!("SELECT min(created_at) FROM {table} WHERE status = ?1");
+        self.db.query_row(&sql, params![status], |r| r.get(0))
+    }
+
     /// Inbox row `id`: the one `/retry` sends again (DESIGN §4.1).
     pub fn inbox_row(&self, id: i64) -> rusqlite::Result<Option<InboxRow>> {
         self.db
