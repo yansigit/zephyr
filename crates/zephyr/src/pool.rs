@@ -129,8 +129,8 @@ fn limit_retries(path: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("json.zephyr-tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&v)?)?;
-    std::fs::rename(&tmp, path)?;
+    let text = serde_json::to_string_pretty(&v)?;
+    crate::host::conf::replace_durably(path, &tmp, text.as_bytes())?;
     Ok(())
 }
 

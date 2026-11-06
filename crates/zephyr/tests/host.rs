@@ -49,7 +49,7 @@ case "$1" in
     case " $* " in
       *" --list-models "*) printf 'provider model context\nanthropic claude-sonnet-5 200K\nopenai-codex gpt-5.5 400K\nopenai-codex gpt-5.4 400K\n' ;;
       *" auth check "*) echo '{"ready":true,"provider":"claude-code","source":"auth.json"}' ;;
-      *" zephyr status "*) echo "daemon: ${SHIM_DAEMON:-running}"; [ -n "$SHIM_STATUS" ] && printf '%b\n' "$SHIM_STATUS" ;;
+      *" zephyr status "*) echo "daemon: ${SHIM_DAEMON:-running}"; [ -n "$SHIM_STATUS" ] && printf '%b\n' "$SHIM_STATUS"; exit "${SHIM_STATUS_EXIT:-0}" ;;
       *" zephyr --version "*) [ -n "$SHIM_VERSION" ] || exit 2; echo "zephyr $SHIM_VERSION" ;;
       *" zephyr tui "*) exit "${SHIM_TUI_EXIT:-0}" ;;
     esac ;;
@@ -63,6 +63,22 @@ case "$1 $2" in
   "auth token") echo "gho_FAKE_GH_TOKEN_0123" ;;
   "api user") echo "tester" ;;
 esac
+"#;
+
+/// `systemctl`, `loginctl` and `curl`: logged like `docker`, never the real ones. `loginctl`
+/// answers `Linger=$SHIM_LINGER` (default no); `curl` exits `$SHIM_CURL_FAIL` (default 0).
+const SYSTEMCTL: &str = r#"#!/bin/bash
+(IFS=$'\x1f'; echo "systemctl$IFS$*") >> "$SHIM_DIR/calls.log"
+"#;
+
+const LOGINCTL: &str = r#"#!/bin/bash
+(IFS=$'\x1f'; echo "loginctl$IFS$*") >> "$SHIM_DIR/calls.log"
+echo "Linger=${SHIM_LINGER:-no}"
+"#;
+
+const CURL: &str = r#"#!/bin/bash
+(IFS=$'\x1f'; echo "curl$IFS$*") >> "$SHIM_DIR/calls.log"
+exit "${SHIM_CURL_FAIL:-0}"
 "#;
 
 struct Env {
@@ -84,7 +100,13 @@ impl Env {
         }
         std::fs::write(projects.join("app/.env"), "SECRET=1").unwrap();
         std::fs::write(projects.join("app/node_modules/x/.env"), "").unwrap();
-        for (name, body) in [("docker", DOCKER), ("gh", GH)] {
+        for (name, body) in [
+            ("docker", DOCKER),
+            ("gh", GH),
+            ("systemctl", SYSTEMCTL),
+            ("loginctl", LOGINCTL),
+            ("curl", CURL),
+        ] {
             std::fs::write(bin.join(name), body).unwrap();
             std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
                 .unwrap();
@@ -378,10 +400,13 @@ fn init_non_interactive_builds_the_layout_and_starts_the_container() {
     ] {
         assert!(run.windows(2).any(|w| w == pair), "{pair:?} in {run:?}");
     }
-    assert!(
-        !run.iter().any(|a| a == "--memory"),
-        "no memory cap unless set"
-    );
+    for pair in [
+        ["--log-opt", "max-size=20m"],
+        ["--log-opt", "max-file=5"],
+        ["--ulimit", "nofile=65536:65536"],
+    ] {
+        assert!(run.windows(2).any(|w| w == pair), "{pair:?} in {run:?}");
+    }
     assert!(
         !run.iter().any(|a| a == "--gpus"),
         "no GPU without its runtime"
@@ -471,9 +496,26 @@ fn up_build_passes_the_gh_token_as_a_secret_only() {
 }
 
 #[test]
-fn up_caps_memory_only_when_host_toml_sets_it() {
+fn up_caps_memory_at_host_toml_or_three_quarters_of_the_host() {
     let env = Env::new("memory");
     env.init(&["--no-start"]);
+    // Unset: 75% of this host's MemTotal.
+    env.ok(&["up"]);
+    let calls = env.calls();
+    let run = find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
+    let info = std::fs::read_to_string("/proc/meminfo").unwrap();
+    let kb: u64 = info
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))
+        .unwrap()
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .unwrap();
+    let want = format!("{}k", kb / 4 * 3);
+    assert!(run.windows(2).any(|w| w == ["--memory", &want]), "{run:?}");
+    // Set: the owner's value.
     let host = env.daemon().join("host.toml");
     let text = std::fs::read_to_string(&host).unwrap();
     std::fs::write(&host, format!("{text}memory = \"6g\"\n")).unwrap();
@@ -486,6 +528,151 @@ fn up_caps_memory_only_when_host_toml_sets_it() {
     let calls = env.calls();
     let run = find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
     assert!(run.windows(2).any(|w| w == ["--memory", "6g"]), "{run:?}");
+}
+
+#[test]
+fn alert_installs_a_user_timer_and_posts_only_when_health_changes() {
+    let env = Env::new("alert");
+    env.init(&["--no-start"]);
+    let out = env.ok(&["alert", "setup", "zephyr-lane_1"]);
+    assert!(out.contains("loginctl enable-linger $USER"), "{out}");
+    let units = env.home.join(".config/systemd/user");
+    let service = std::fs::read_to_string(units.join("zephyr-alert.service")).unwrap();
+    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_zephyr")).unwrap();
+    assert!(
+        service.contains(&format!("\nExecStart={} alert check\n", exe.display())),
+        "{service}"
+    );
+    assert!(service.contains("Type=oneshot"), "{service}");
+    assert!(service.contains(&format!("Environment=ZEPHYR_CONTAINER={CONTAINER}")));
+    let timer = std::fs::read_to_string(units.join("zephyr-alert.timer")).unwrap();
+    assert!(timer.contains("OnCalendar=*:0/5"), "{timer}");
+    assert!(timer.contains("WantedBy=timers.target"), "{timer}");
+    // In the owner's home, readable with Docker down.
+    let saved = std::fs::read_to_string(env.home.join(".config/zephyr/alert-url")).unwrap();
+    assert_eq!(saved.trim(), "https://ntfy.sh/zephyr-lane_1");
+    let calls = env.calls();
+    find(&calls, &["systemctl", "--user", "daemon-reload"]);
+    find(
+        &calls,
+        &[
+            "systemctl",
+            "--user",
+            "enable",
+            "--now",
+            "zephyr-alert.timer",
+        ],
+    );
+    let uid = ids().split(':').next().unwrap().to_string();
+    find(&calls, &["loginctl", "show-user", &uid, "-p", "Linger"]);
+    // Lingering on: no hint.
+    let out = env.zephyr_env(
+        &["alert", "setup", "zephyr-lane_1"],
+        &[("SHIM_LINGER", "yes")],
+    );
+    assert!(!stdout(&out).contains("enable-linger"));
+    assert!(
+        !env.zephyr(&["alert", "setup", "a/b"]).status.success(),
+        "a topic is checked"
+    );
+    env.calls();
+
+    let url = "https://ntfy.sh/zephyr-lane_1";
+    let posts = |env: &Env| -> Vec<Vec<String>> {
+        env.calls().into_iter().filter(|c| c[0] == "curl").collect()
+    };
+    let check = |vars: &[(&str, &str)]| {
+        let out = env.zephyr_env(&["alert", "check"], vars);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    check(&[]);
+    assert!(
+        posts(&env).is_empty(),
+        "healthy from the start: nothing to say"
+    );
+    // Stopped: one post, however many checks find it so.
+    check(&[("SHIM_STATE", "exited")]);
+    check(&[("SHIM_STATE", "exited")]);
+    let p = posts(&env);
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert!(
+        p[0].windows(2)
+            .any(|w| w == ["-H", "Title: zephyr is down"]),
+        "{p:?}"
+    );
+    let body = &p[0][p[0].iter().position(|a| a == "-d").unwrap() + 1];
+    assert_eq!(
+        body,
+        &format!("zephyr is unhealthy: container {CONTAINER} is exited")
+    );
+    assert_eq!(p[0].last().unwrap(), url);
+    assert!(p[0].contains(&"-fsS".to_string()));
+    // Still down, for another reason: nothing new.
+    check(&[("SHIM_STATUS_EXIT", "1")]);
+    assert!(posts(&env).is_empty());
+    check(&[]);
+    let p = posts(&env);
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert!(p[0].contains(&"zephyr is back".to_string()), "{p:?}");
+    // `zephyr status` failing, then replies failing, each after a recovery.
+    check(&[("SHIM_STATUS_EXIT", "1")]);
+    let p = posts(&env);
+    assert!(
+        p[0].iter()
+            .any(|a| a.starts_with("zephyr is unhealthy: zephyr status failed")),
+        "{p:?}"
+    );
+    check(&[]);
+    posts(&env);
+    // Failed replies are a count, posted when it grows, never a lasting "down".
+    let failed = [(
+        "SHIM_STATUS",
+        "outbox  sent        4\noutbox  failed      2",
+    )];
+    check(&failed);
+    let p = posts(&env);
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert!(
+        p[0].contains(&"2 more replies failed to send (2 in all)".to_string()),
+        "{p:?}"
+    );
+    check(&failed);
+    assert!(posts(&env).is_empty(), "the same count again: nothing new");
+    check(&[]);
+    assert!(posts(&env).is_empty(), "healthy all along");
+    // A post that fails is made again at the next check.
+    let out = env.zephyr_env(
+        &["alert", "check"],
+        &[("SHIM_STATE", "exited"), ("SHIM_CURL_FAIL", "22")],
+    );
+    assert!(!out.status.success());
+    check(&[("SHIM_STATE", "exited")]);
+    assert_eq!(posts(&env).len(), 2);
+
+    env.ok(&["alert", "test"]);
+    let p = posts(&env);
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0].last().unwrap(), url);
+
+    env.ok(&["alert", "off"]);
+    let calls = env.calls();
+    find(
+        &calls,
+        &[
+            "systemctl",
+            "--user",
+            "disable",
+            "--now",
+            "zephyr-alert.timer",
+        ],
+    );
+    find(&calls, &["systemctl", "--user", "daemon-reload"]);
+    assert!(!units.join("zephyr-alert.service").exists());
+    assert!(!units.join("zephyr-alert.timer").exists());
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! Deletes what background work leaves behind once it is 30 days old (DESIGN §4.1): job and task
 //! sessions, ended processes' logs and exit files, and ended tasks' overflow reports. Never a
 //! `main` session, which `/switch` goes back to, and never a file of work still open. Run hourly
-//! from the scheduler's tick.
+//! from the scheduler's tick, which also makes the day's backup of state.db (`backup`).
 
 use crate::config::Config;
 use crate::store::Store;
@@ -26,6 +26,17 @@ pub fn sweep(cfg: &Config, store: &Store, age: Duration) -> rusqlite::Result<usi
         Ok(0) => {}
         Ok(n) => eprintln!("zephyr: pruned {n} state.db rows older than 90 days"),
         Err(e) => eprintln!("zephyr: pruning state.db failed: {e}"),
+    }
+    // As root, before the agent's identity below: the backups are root's.
+    match backup(cfg, store) {
+        Ok(false) => {}
+        Ok(true) => eprintln!("zephyr: backed up state.db and the config files"),
+        Err(e) => eprintln!("zephyr: backing up state.db failed: {e:#}"),
+    }
+    match sweep_copies(cfg, store) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("zephyr: removed {n} copies of files no reply waits to send"),
+        Err(e) => eprintln!("zephyr: removing sent files' copies failed: {e}"),
     }
     let _fs = crate::agent::fs();
     let dir = cfg.session_dir();
@@ -57,9 +68,158 @@ pub fn sweep(cfg: &Config, store: &Store, age: Duration) -> rusqlite::Result<usi
     Ok(gone)
 }
 
+/// How long a reply may wait for its channel (one no longer configured, say) before it is given up.
+const OUTBOX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// How old a copy under `<state>/files` must be before it can go: `send_file` makes it just
+/// before the reply that names it.
+const COPY_GRACE: Duration = Duration::from_secs(3600);
+
+/// Gives up replies pending past `OUTBOX_AGE` (status `expired`), then removes the copies of
+/// files (`tools::send_file`) no pending reply names: sent, failed or given up, or left by a
+/// crash before its reply was written or after it was sent. As root, whose files they are.
+fn sweep_copies(cfg: &Config, store: &Store) -> rusqlite::Result<usize> {
+    let n = store.expire_outbox(crate::now() - OUTBOX_AGE.as_secs() as i64)?;
+    if n > 0 {
+        eprintln!("zephyr: gave up {n} replies that waited over 7 days for their channel");
+    }
+    let rows = store.pending_outbox()?;
+    let waiting: HashSet<&Path> = rows
+        .iter()
+        .filter_map(|r| Path::new(r.attachment.as_deref()?).parent())
+        .collect();
+    let mut gone = 0;
+    for d in subdirs(&cfg.state_dir().join("files")) {
+        let old = (d.symlink_metadata().and_then(|m| m.modified()))
+            .is_ok_and(|t| t.elapsed().is_ok_and(|e| e > COPY_GRACE));
+        if old && !waiting.contains(d.as_path()) && std::fs::remove_dir_all(&d).is_ok() {
+            gone += 1;
+        }
+    }
+    Ok(gone)
+}
+
+/// How many backups of each file `backup` keeps.
+const BACKUPS_KEPT: usize = 7;
+
+/// The daemon's files `backup` copies beside state.db, when present.
+const BACKED_UP: [&str; 4] = ["zephyr.toml", "vault.toml", "host.toml", "secrets.env"];
+
+fn backups_dir(cfg: &Config) -> PathBuf {
+    cfg.state_dir().join("backups")
+}
+
+/// Once a UTC day: a consistent copy of state.db to `<state>/backups/state-YYYYMMDD.db` and copies
+/// of the `BACKED_UP` files as `<name>.YYYYMMDD`, all root's (dir 0700, files 0600), keeping the
+/// newest `BACKUPS_KEPT` of each. Returns false when today's backup was already there.
+pub fn backup(cfg: &Config, store: &Store) -> anyhow::Result<bool> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    let dir = backups_dir(cfg);
+    let day = store.today()?.replace('-', "");
+    let db = dir.join(format!("state-{day}.db"));
+    if db.exists() {
+        return Ok(false);
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    let private =
+        |path: &Path| std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    for name in BACKED_UP {
+        let to = dir.join(format!("{name}.{day}"));
+        match std::fs::copy(cfg.state_dir().join(name), &to) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            r => r?,
+        };
+        private(&to)?;
+    }
+    // Last, under a temp name: its presence marks the day's backup as whole.
+    let tmp = dir.join(format!(".state-{day}.db.tmp"));
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    store.copy_into(&tmp)?;
+    std::fs::File::open(&tmp)?.sync_all()?;
+    std::fs::rename(&tmp, &db)?;
+    std::fs::File::open(&dir)?.sync_all()?;
+    prune_backups(&dir);
+    Ok(true)
+}
+
+/// The kind of a backup file: `state.db`, or the `BACKED_UP` name it copies.
+fn backup_kind(name: &str) -> Option<&str> {
+    let dated = |d: &str| d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit());
+    if let Some(d) = name
+        .strip_prefix("state-")
+        .and_then(|n| n.strip_suffix(".db"))
+    {
+        return dated(d).then_some("state.db");
+    }
+    let (base, d) = name.rsplit_once('.')?;
+    (dated(d) && BACKED_UP.contains(&base)).then_some(base)
+}
+
+/// Removes all but the newest `BACKUPS_KEPT` of each kind; the date in the name orders them.
+fn prune_backups(dir: &Path) {
+    let mut kinds: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let Ok(name) = e.file_name().into_string() else {
+            continue;
+        };
+        if let Some(kind) = backup_kind(&name) {
+            kinds.entry(kind.to_string()).or_default().push(name);
+        }
+    }
+    for names in kinds.values_mut() {
+        names.sort_unstable_by(|a, b| b.cmp(a));
+        for old in names.iter().skip(BACKUPS_KEPT) {
+            let _ = std::fs::remove_file(dir.join(old));
+        }
+    }
+}
+
+/// `zephyr doctor`'s warning: the newest backup of state.db is over 2 days old, or there is none
+/// though state.db was made over a day ago. `now` is the clock, for tests.
+pub fn backup_warning(cfg: &Config, now: std::time::SystemTime) -> Option<String> {
+    let age =
+        |t: std::io::Result<std::time::SystemTime>| t.ok().and_then(|t| now.duration_since(t).ok());
+    let newest = std::fs::read_dir(backups_dir(cfg))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_str().and_then(backup_kind) == Some("state.db"))
+        .filter_map(|e| age(e.metadata().and_then(|m| m.modified())))
+        .min();
+    const DAY: u64 = 24 * 3600;
+    match newest {
+        Some(a) if a.as_secs() > 2 * DAY => Some(format!(
+            "the newest backup of state.db is {} days old ({})",
+            a.as_secs() / DAY,
+            backups_dir(cfg).display()
+        )),
+        Some(_) => None,
+        // When state.db was made: roughly since when the daemon has run.
+        None => age(std::fs::metadata(cfg.db_path()).and_then(|m| m.created()))
+            .filter(|a| a.as_secs() > DAY)
+            .map(|_| {
+                format!(
+                    "no backup of state.db in {} yet",
+                    backups_dir(cfg).display()
+                )
+            }),
+    }
+}
+
 /// The session id in rpi's `<timestamp>_<session id>.jsonl` (or its `.lock`).
 fn session_of(name: &str) -> Option<&str> {
+    // rpi's companions of a session file: its lock and its progress log.
     let name = name.strip_suffix(".lock").unwrap_or(name);
+    let name = name.strip_suffix(".progress.jsonl").unwrap_or(name);
     Some(name.strip_suffix(".jsonl")?.split_once('_')?.1)
 }
 
@@ -191,6 +351,144 @@ mod tests {
     }
 
     #[test]
+    fn a_backup_is_made_once_a_day_and_the_newest_seven_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = crate::test_dir("retention-backup");
+        let cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = {home:?}\n")).unwrap();
+        let store = Store::open(&cfg.db_path()).unwrap();
+        store.audit("main", "bash", "ls", "started").unwrap();
+        std::fs::write(home.join("zephyr.toml"), "rpi = '/r'\n").unwrap();
+        std::fs::write(home.join("secrets.env"), "K=v\n").unwrap();
+        let dir = home.join("backups");
+        // Eight older days of each kind, the oldest of which goes.
+        std::fs::create_dir_all(&dir).unwrap();
+        for d in 20250101..20250109 {
+            for name in [format!("state-{d}.db"), format!("zephyr.toml.{d}")] {
+                std::fs::write(dir.join(name), "old").unwrap();
+            }
+        }
+        std::fs::write(dir.join("notes.txt"), "mine").unwrap();
+        assert!(backup(&cfg, &store).unwrap());
+        let day = store.today().unwrap().replace('-', "");
+        let db = dir.join(format!("state-{day}.db"));
+        let copy = Store::open(&db).unwrap();
+        assert_eq!(copy.audit_rows().unwrap().len(), 1, "a whole copy");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&db), 0o600);
+        assert_eq!(mode(&dir.join(format!("secrets.env.{day}"))), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(format!("secrets.env.{day}"))).unwrap(),
+            "K=v\n"
+        );
+        assert!(
+            !dir.join(format!("vault.toml.{day}")).exists(),
+            "none to copy"
+        );
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| backup_kind(n) == Some("state.db"))
+                .count(),
+            7
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.starts_with("zephyr.toml."))
+                .count(),
+            7
+        );
+        assert!(!names.contains(&"state-20250101.db".into()), "{names:?}");
+        assert!(!names.contains(&"state-20250102.db".into()), "{names:?}");
+        assert!(names.contains(&"state-20250103.db".into()), "{names:?}");
+        assert!(names.contains(&"notes.txt".into()), "not a backup: kept");
+        // Today's is there: a second sweep (a restart) makes no other.
+        let before = std::fs::metadata(&db).unwrap().modified().unwrap();
+        assert!(!backup(&cfg, &store).unwrap());
+        assert_eq!(std::fs::metadata(&db).unwrap().modified().unwrap(), before);
+    }
+
+    #[test]
+    fn doctor_warns_of_a_stale_or_missing_backup() {
+        let home = crate::test_dir("retention-backup-age");
+        let cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = {home:?}\n")).unwrap();
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let now = std::time::SystemTime::now();
+        let day = Duration::from_secs(24 * 3600);
+        assert_eq!(
+            backup_warning(&cfg, now),
+            None,
+            "a new state.db needs none yet"
+        );
+        let none = backup_warning(&cfg, now + 2 * day).unwrap();
+        assert!(none.starts_with("no backup of state.db"), "{none}");
+        backup(&cfg, &store).unwrap();
+        assert_eq!(backup_warning(&cfg, now + day), None);
+        let stale = backup_warning(&cfg, now + 3 * day + Duration::from_secs(60)).unwrap();
+        assert!(
+            stale.starts_with("the newest backup of state.db is 3 days old"),
+            "{stale}"
+        );
+    }
+
+    #[test]
+    fn copies_go_once_no_pending_reply_names_them_and_old_replies_expire() {
+        let home = crate::test_dir("retention-files");
+        let cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = {home:?}\n")).unwrap();
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let hour_ago = std::time::SystemTime::now() - COPY_GRACE - Duration::from_secs(60);
+        let copy = |n: &str, row: Option<&str>| {
+            let dir = home.join("files").join(n);
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("a.png");
+            std::fs::write(&file, "x").unwrap();
+            let f = std::fs::File::open(&dir).unwrap();
+            f.set_modified(hour_ago).unwrap();
+            if let Some(status) = row {
+                store.notify_file("discord", "o", n, file.to_str()).unwrap();
+                let db = rusqlite::Connection::open(cfg.db_path()).unwrap();
+                db.execute("UPDATE outbox SET status = ?1 WHERE text = ?2", [status, n])
+                    .unwrap();
+            }
+            dir
+        };
+        let pending = copy("1-0", Some("pending"));
+        let sent = copy("2-0", Some("sent"));
+        let failed = copy("3-0", Some("failed"));
+        let stale = copy("4-0", Some("pending"));
+        let orphan = copy("5-0", None);
+        let db = rusqlite::Connection::open(cfg.db_path()).unwrap();
+        let week_ago = crate::now() - OUTBOX_AGE.as_secs() as i64 - 60;
+        db.execute(
+            "UPDATE outbox SET created_at = ?1 WHERE text = '4-0'",
+            [week_ago],
+        )
+        .unwrap();
+        // Just made: its reply may not be written yet.
+        let fresh = home.join("files/6-0");
+        std::fs::create_dir_all(&fresh).unwrap();
+        sweep(&cfg, &store, AGE).unwrap();
+        assert!(pending.exists(), "its reply still waits");
+        assert!(fresh.exists());
+        for d in [&sent, &failed, &stale, &orphan] {
+            assert!(!d.exists(), "{} should be gone", d.display());
+        }
+        let status: String = db
+            .query_row("SELECT status FROM outbox WHERE text = '4-0'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "expired");
+        assert_eq!(store.pending_outbox().unwrap().len(), 1);
+    }
+
+    #[test]
     fn names_are_matched_exactly() {
         assert_eq!(
             session_of("2026-01-01T00-00Z_job-1-2.jsonl"),
@@ -199,6 +497,11 @@ mod tests {
         assert_eq!(
             session_of("2026-01-01T00-00Z_task-3.jsonl.lock"),
             Some("task-3")
+        );
+        assert_eq!(
+            session_of("2026-01-01T00-00Z_task-3.jsonl.progress.jsonl"),
+            Some("task-3"),
+            "an open task's progress log is its session's"
         );
         assert_eq!(session_of("job-1-2.jsonl"), None);
         assert_eq!(session_of("x_task-3.json"), None);

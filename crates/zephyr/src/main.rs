@@ -527,6 +527,10 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
             ext_dir.display()
         );
     }
+    // A warning, not a failure: the daemon backs state.db up daily (`retention::backup`).
+    if let Some(w) = zephyr::retention::backup_warning(cfg, std::time::SystemTime::now()) {
+        println!("warn {w}");
+    }
     if !ok {
         anyhow::bail!("doctor found problems");
     }

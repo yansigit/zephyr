@@ -45,7 +45,7 @@ pub fn answer_gateway(cfg: &Config, call_id: &str, text: &str) {
     // The id has no '.', so this never collides with another call's answer.
     let tmp = path.with_extension("tmp");
     let _fs = crate::agent::fs();
-    if let Err(e) = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path)) {
+    if let Err(e) = crate::host::conf::replace_durably(&path, &tmp, text.as_bytes()) {
         eprintln!("zephyr: answering gateway call {call_id}: {e}");
     }
     sweep(&gateway_dir(cfg), GATEWAY_STALE);
