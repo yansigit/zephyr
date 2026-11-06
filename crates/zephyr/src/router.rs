@@ -2437,7 +2437,8 @@ impl<'a> Router<'a> {
                 Some(None) if steers && !requeue && row.tries < 2 => {
                     self.store.requeue_as_continue(row.id)?
                 }
-                Some(None) if requeue => self.store.set_status(row.id, "new")?,
+                // A failover sends it again, but not forever.
+                Some(None) if requeue && row.tries < 5 => self.store.set_status(row.id, "new")?,
                 Some(None) => {
                     let text = fallback
                         .as_deref()
