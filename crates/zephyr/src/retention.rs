@@ -33,6 +33,11 @@ pub fn sweep(cfg: &Config, store: &Store, age: Duration) -> rusqlite::Result<usi
         Ok(true) => eprintln!("zephyr: backed up state.db and the config files"),
         Err(e) => eprintln!("zephyr: backing up state.db failed: {e:#}"),
     }
+    match sweep_copies(cfg, store) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("zephyr: removed {n} copies of files no reply waits to send"),
+        Err(e) => eprintln!("zephyr: removing sent files' copies failed: {e}"),
+    }
     let _fs = crate::agent::fs();
     let dir = cfg.session_dir();
     let mut gone = 0;
@@ -58,6 +63,37 @@ pub fn sweep(cfg: &Config, store: &Store, age: Duration) -> rusqlite::Result<usi
             Ok(0) => {}
             Ok(n) => eprintln!("zephyr: pruned {n} old checkpoints of the projects"),
             Err(e) => eprintln!("zephyr: pruning checkpoints failed: {e:#}"),
+        }
+    }
+    Ok(gone)
+}
+
+/// How long a reply may wait for its channel (one no longer configured, say) before it is given up.
+const OUTBOX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// How old a copy under `<state>/files` must be before it can go: `send_file` makes it just
+/// before the reply that names it.
+const COPY_GRACE: Duration = Duration::from_secs(3600);
+
+/// Gives up replies pending past `OUTBOX_AGE` (status `expired`), then removes the copies of
+/// files (`tools::send_file`) no pending reply names: sent, failed or given up, or left by a
+/// crash before its reply was written or after it was sent. As root, whose files they are.
+fn sweep_copies(cfg: &Config, store: &Store) -> rusqlite::Result<usize> {
+    let n = store.expire_outbox(crate::now() - OUTBOX_AGE.as_secs() as i64)?;
+    if n > 0 {
+        eprintln!("zephyr: gave up {n} replies that waited over 7 days for their channel");
+    }
+    let rows = store.pending_outbox()?;
+    let waiting: HashSet<&Path> = rows
+        .iter()
+        .filter_map(|r| Path::new(r.attachment.as_deref()?).parent())
+        .collect();
+    let mut gone = 0;
+    for d in subdirs(&cfg.state_dir().join("files")) {
+        let old = (d.symlink_metadata().and_then(|m| m.modified()))
+            .is_ok_and(|t| t.elapsed().is_ok_and(|e| e > COPY_GRACE));
+        if old && !waiting.contains(d.as_path()) && std::fs::remove_dir_all(&d).is_ok() {
+            gone += 1;
         }
     }
     Ok(gone)
@@ -397,6 +433,57 @@ mod tests {
             stale.starts_with("the newest backup of state.db is 3 days old"),
             "{stale}"
         );
+    }
+
+    #[test]
+    fn copies_go_once_no_pending_reply_names_them_and_old_replies_expire() {
+        let home = crate::test_dir("retention-files");
+        let cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = {home:?}\n")).unwrap();
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let hour_ago = std::time::SystemTime::now() - COPY_GRACE - Duration::from_secs(60);
+        let copy = |n: &str, row: Option<&str>| {
+            let dir = home.join("files").join(n);
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("a.png");
+            std::fs::write(&file, "x").unwrap();
+            let f = std::fs::File::open(&dir).unwrap();
+            f.set_modified(hour_ago).unwrap();
+            if let Some(status) = row {
+                store.notify_file("discord", "o", n, file.to_str()).unwrap();
+                let db = rusqlite::Connection::open(cfg.db_path()).unwrap();
+                db.execute("UPDATE outbox SET status = ?1 WHERE text = ?2", [status, n])
+                    .unwrap();
+            }
+            dir
+        };
+        let pending = copy("1-0", Some("pending"));
+        let sent = copy("2-0", Some("sent"));
+        let failed = copy("3-0", Some("failed"));
+        let stale = copy("4-0", Some("pending"));
+        let orphan = copy("5-0", None);
+        let db = rusqlite::Connection::open(cfg.db_path()).unwrap();
+        let week_ago = crate::now() - OUTBOX_AGE.as_secs() as i64 - 60;
+        db.execute(
+            "UPDATE outbox SET created_at = ?1 WHERE text = '4-0'",
+            [week_ago],
+        )
+        .unwrap();
+        // Just made: its reply may not be written yet.
+        let fresh = home.join("files/6-0");
+        std::fs::create_dir_all(&fresh).unwrap();
+        sweep(&cfg, &store, AGE).unwrap();
+        assert!(pending.exists(), "its reply still waits");
+        assert!(fresh.exists());
+        for d in [&sent, &failed, &stale, &orphan] {
+            assert!(!d.exists(), "{} should be gone", d.display());
+        }
+        let status: String = db
+            .query_row("SELECT status FROM outbox WHERE text = '4-0'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "expired");
+        assert_eq!(store.pending_outbox().unwrap().len(), 1);
     }
 
     #[test]

@@ -591,6 +591,15 @@ impl Store {
         )
     }
 
+    /// Gives up the replies still pending since before `before` (unix secs), such as those for a
+    /// channel no longer configured: status `expired`. Returns how many.
+    pub fn expire_outbox(&self, before: i64) -> rusqlite::Result<usize> {
+        self.db.execute(
+            "UPDATE outbox SET status = 'expired' WHERE status = 'pending' AND created_at < ?1",
+            params![before],
+        )
+    }
+
     pub fn set_outbox_status(&self, id: i64, status: &str) -> rusqlite::Result<()> {
         self.db.execute(
             "UPDATE outbox SET status = ?2 WHERE id = ?1",
