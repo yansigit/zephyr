@@ -46,6 +46,32 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Smoke test, hosted runners only: the fallback has no Docker daemon to load or run the image.
+      - if: vars.ZEPHYR_RUNNER == ''
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          load: true
+          tags: zephyr-smoke:ci
+          secrets: |
+            gh_token=${{ secrets.PROVIDER_REPOS_TOKEN }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # The paths are the image's extensions (EXTENSIONS in crates/zephyr/src/host/conf.rs) and the policy plugin.
+      - if: vars.ZEPHYR_RUNNER == ''
+        run: |
+          docker run --rm zephyr-smoke:ci sh -c '
+            set -e
+            zephyr --version
+            rpi --version
+            test -x /usr/local/bin/zephyr
+            test -f /usr/local/lib/libzephyr_policy.so
+            test -f /opt/zephyr/ext/librpi_providers.so
+            test -f /opt/zephyr/ext/librpi_mcp_adapter.so
+            test -f /opt/zephyr/ext/libzephyr_cursor.so
+            test -f /opt/zephyr/ext/rpi-claude-agent/librpi_claude_agent.so
+          '
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -57,3 +83,6 @@ jobs:
             ${{ github.event_name == 'push' && 'ghcr.io/yansigit/zephyr:latest' || '' }}
           secrets: |
             gh_token=${{ secrets.PROVIDER_REPOS_TOKEN }}
+          # Hosted runners only: the fallback's remote BuildKit runs outside the job, without an Actions cache token.
+          cache-from: ${{ vars.ZEPHYR_RUNNER == '' && 'type=gha' || '' }}
+          cache-to: ${{ vars.ZEPHYR_RUNNER == '' && 'type=gha,mode=max' || '' }}

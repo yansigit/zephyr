@@ -26,6 +26,15 @@ cargo fmt --check
 cargo clippy -q --all-targets -- -D warnings
 cargo test -q
 
+step "testing against the pinned rpi"
+# The ignored tests drive the real binary at this fixed path (the tests' RPI consts).
+rpi=/home/user/Projects/.always-on/rpi-0.18.0/bin/rpi
+if [ -x "$rpi" ]; then
+  ZEPHYR_REAL_RPI=1 cargo test --workspace -- --ignored
+else
+  echo "warning: $rpi is missing, so the real-rpi tests did not run" >&2
+fi
+
 if [ -n "$version" ]; then
   tag=v$version
   git rev-parse -q --verify "refs/tags/$tag" >/dev/null && die "$tag already exists"

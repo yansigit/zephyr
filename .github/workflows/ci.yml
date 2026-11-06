@@ -1,0 +1,33 @@
+# fmt, clippy and the tests on every PR and push to main, as deploy/release.sh runs them. The ignored
+# tests need the pinned rpi binary, which this runner does not have: deploy/release.sh runs them.
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain the image builds with (deploy/Dockerfile's rust:1.95), so a newer clippy's lints
+      # land with a deliberate bump, not on an unrelated PR.
+      - uses: dtolnay/rust-toolchain@1.95
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # tests/tui.rs drives tmux and skips without it; script and python3 come with the runner.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --workspace
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans

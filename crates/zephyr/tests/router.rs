@@ -2091,19 +2091,24 @@ async fn a_finished_task_reports_on_the_channel_that_started_it() {
         r#"[call task {"action": "start", "goal": "find the price"}] ok"#,
     )
     .await;
+    // Either order: a task that ends before main's turn settles is steered into it.
     let replies = gw.wait_replies_on("discord", 2).await;
     assert!(
-        replies[0].contains("\ntask: task #1 started"),
+        replies
+            .iter()
+            .any(|r| r.contains("\ntask: task #1 started")),
         "{replies:?}"
     );
     // The child's last message (the fake echoes its prompt) is the report main reads.
+    let report = replies
+        .iter()
+        .find(|r| {
+            r.starts_with("echo: [discord #2] [task #1 finished; a background agent's report")
+        })
+        .unwrap_or_else(|| panic!("{replies:?}"));
     assert!(
-        replies[1].starts_with("echo: [discord #2] [task #1 finished; a background agent's report"),
-        "{replies:?}"
-    );
-    assert!(
-        replies[1].contains("\n> echo: You are a background task")
-            && replies[1].ends_with("\n> Goal: find the price"),
+        report.contains("\n> echo: You are a background task")
+            && report.contains("\n> Goal: find the price"),
         "{replies:?}"
     );
     assert!(gw.replies_on("chat").is_empty());
@@ -2117,7 +2122,14 @@ async fn a_task_with_a_model_runs_on_that_providers_account_as_that_model() {
     let gw = start(on_file(&home, ""));
     let call = r#"[call task {"action": "start", "goal": "look it up", "model": "other/m9"}]"#;
     gw.say("m1", "owner", call).await;
-    assert!(gw.wait_replies(1).await[0].contains("\ntask: task #1 started"));
+    // Either order: the task may finish and report before main's reply.
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        replies
+            .iter()
+            .any(|r| r.contains("\ntask: task #1 started")),
+        "{replies:?}"
+    );
     wait(|| task_status(&home, "completed") == 1).await;
     let starts = std::fs::read_to_string(home.join("accounts/b/starts.log")).unwrap();
     assert_eq!(

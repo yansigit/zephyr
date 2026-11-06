@@ -1,0 +1,13 @@
+# `cargo deny check advisories bans`, run by .github/workflows/ci.yml. Licenses and sources are not
+# checked: the job does not run those checks.
+
+[advisories]
+# cargo-deny 0.20 has no warn level: every unmaintained crate fails the job (the default scope is
+# `all`). `unmaintained = "workspace"` or `"none"` would narrow or drop that. Vulnerabilities always fail.
+
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# zephyr depends on zephyr-policy by path, without a version: a path dependency is not a wildcard.
+allow-wildcard-paths = true
