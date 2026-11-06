@@ -2217,6 +2217,9 @@ async fn a_task_runs_as_a_subagent_on_the_model_its_settings_resolve_to() {
 async fn the_owner_edits_subagents_and_task_settings_from_a_chat() {
     let home = home("subagent-commands");
     let gw = start(on_file(&home, ""));
+    // Until the first child is up the router has no account, and any change reads as moving
+    // to one (a restart). Once it has started, the messages below wait for its spawn to finish.
+    wait(|| !log(&home, "start").is_empty()).await;
     let says = [
         "/subagent",
         "/subagent add explorer other/m3 You explore.\nNever edit.",
