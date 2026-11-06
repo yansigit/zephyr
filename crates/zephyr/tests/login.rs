@@ -74,7 +74,10 @@ fn setup(name: &str, extra: &str) -> (Config, PathBuf) {
     );
     let path = root.join("zephyr.toml");
     std::fs::write(&path, &toml).unwrap();
-    (Config::load(&path).unwrap(), home)
+    let mut cfg = Config::load(&path).unwrap();
+    // A sign-in's notices and the pool it changes are picked up on the router's tick.
+    cfg.tick = Duration::from_millis(200);
+    (cfg, home)
 }
 
 fn toml_at(cfg: &Config) -> String {
@@ -571,9 +574,18 @@ async fn a_login_restarts_the_child_only_for_a_re_sign_in_of_the_running_account
     assert!(zephyr::auth::input(&start.login_id, KEY));
     until(&start.login_id, |l| l["phase"] == "done").await;
     let b = cfg.home.join("accounts").join(&start.account);
-    // The router reads the pool on its 5 s tick: a full tick goes by, and the child is the same
-    // one, still on account a.
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // The router reads the pool on its tick: once `/model` lists the new account the tick has
+    // been, and the child is the same one, still on account a.
+    let mut n = 1;
+    loop {
+        n += 1;
+        gw.say("/model", n).await;
+        let listed = gw.replies(n).await[n - 1].contains("account opencode-go-1:");
+        if listed || n == 20 {
+            assert!(listed, "the tick never read the pool");
+            break;
+        }
+    }
     assert_eq!(
         starts(&home, &a).len(),
         1,
@@ -591,8 +603,8 @@ async fn a_login_restarts_the_child_only_for_a_re_sign_in_of_the_running_account
     );
 
     // It becomes active on an explicit `/model`, and only then.
-    gw.say("/model opencode-go/alpha", 2).await;
-    gw.replies(2).await;
+    gw.say("/model opencode-go/alpha", n + 1).await;
+    gw.replies(n + 1).await;
     wait_for(
         || !starts(&home, &b).is_empty(),
         "the child to start on opencode-go-1",
@@ -698,7 +710,7 @@ async fn login_from_a_channel() {
     assert!(got[0].contains("anthropic"), "{}", got[0]);
 
     // A browser sign-in: the reply says what was started, and the URL follows as its own notice
-    // on the router's 5 s tick — the one loop that reads the child never waits on a login. That
+    // on the router's tick — the one loop that reads the child never waits on a login. That
     // notice goes to the attach bus (`zephyr_reply`, §4.3.1), so here the login itself is asked.
     std::fs::write(home.join("login_url"), "").unwrap();
     say(
@@ -739,10 +751,12 @@ async fn login_from_a_channel() {
 
     // A key provider is signed in on the host, not in a chat: the reply says so and holds no
     // credential, and no account is added.
+    // Found by content: the sign-in's own notice, posted on a tick, may come before it.
     say(feed.clone(), "/login opencode-go", 3).await;
-    let got = wait_replies(&sent, 3).await;
-    assert!(got[2].contains("zephyr login opencode-go"), "{}", got[2]);
-    assert!(!got[2].contains(KEY), "{}", got[2]);
+    let host = |x: &String| x.contains("zephyr login opencode-go");
+    let got = replies_until(&sent, |r| r.iter().any(host), "the key provider's reply").await;
+    let refused = got.iter().find(|x| host(x)).unwrap();
+    assert!(!refused.contains(KEY), "{refused}");
     assert!(!std::fs::read_to_string(&path)
         .unwrap()
         .contains("opencode-go"));

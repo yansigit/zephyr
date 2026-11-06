@@ -104,11 +104,17 @@ impl Env {
         self.run_cli(Path::new(env!("CARGO_BIN_EXE_zephyr")), args, env)
     }
 
-    /// A copy of the CLI, for `zephyr upgrade` to replace instead of target/debug/zephyr.
+    /// A copy of the CLI, for `zephyr upgrade` to replace instead of target/debug/zephyr, which
+    /// every test runs. Copied by cp: a child another test forks mid-copy would inherit this
+    /// process's write fd and make exec'ing the copy fail with ETXTBSY.
     fn cli_copy(&self) -> PathBuf {
         let cli = self.dir.join("cli/zephyr");
         std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
-        std::fs::copy(env!("CARGO_BIN_EXE_zephyr"), &cli).unwrap();
+        let cp = Command::new("cp")
+            .arg(env!("CARGO_BIN_EXE_zephyr"))
+            .arg(&cli)
+            .status();
+        assert!(cp.unwrap().success());
         cli
     }
 
@@ -249,6 +255,22 @@ impl Env {
     }
 }
 
+impl Drop for Env {
+    /// Unlocks what a test locked, even when it panicked, then removes the dir (kept on failure).
+    fn drop(&mut self) {
+        for (d, m) in [
+            (self.daemon(), 0o700),
+            (self.dir.join("cli"), 0o755),
+            (self.projects.join("pgdata"), 0o700),
+        ] {
+            let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(m));
+        }
+        if !std::thread::panicking() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
 fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
@@ -262,11 +284,8 @@ fn find<'a>(calls: &'a [Vec<String>], prefix: &[&str]) -> &'a Vec<String> {
 
 /// This user's `uid:gid`, the agent's in the container: the owner of a file it just made.
 fn ids() -> String {
-    let probe = std::env::temp_dir().join(format!("zephyr-host-ids-{}", std::process::id()));
-    std::fs::write(&probe, "").unwrap();
-    let me = std::fs::metadata(&probe).unwrap();
-    let _ = std::fs::remove_file(&probe);
-    format!("{}:{}", me.uid(), me.gid())
+    // SAFETY: getuid and getgid have no arguments and cannot fail.
+    unsafe { format!("{}:{}", libc::getuid(), libc::getgid()) }
 }
 
 /// A `docker exec` as the agent (this user, in its home) whose argv starts with `rest`.
@@ -536,7 +555,8 @@ fn packages_build_a_local_image_that_up_and_upgrade_run() {
 
     // upgrade builds it on the new image before the container goes.
     let me = env!("CARGO_PKG_VERSION");
-    let out = env.zephyr_env(
+    let out = env.run_cli(
+        &env.cli_copy(),
         &["upgrade", me],
         &[
             ("ZEPHYR_IMAGE", ""),
@@ -1439,9 +1459,10 @@ fn upgrade_waits_backs_up_and_goes_back_only_with_a_backup() {
     let env = Env::new("upgrade-db");
     env.init(&["--no-start"]);
     let me = env!("CARGO_PKG_VERSION");
+    let cli = env.cli_copy();
     let upgrade = |vars: &[(&str, &str)]| {
         let vars = [&[("ZEPHYR_IMAGE", "")][..], vars].concat();
-        let out = env.zephyr_env(&["upgrade", me], &vars);
+        let out = env.run_cli(&cli, &["upgrade", me], &vars);
         (out, env.calls())
     };
 
@@ -1776,7 +1797,8 @@ fn up_and_going_back_without_a_container_keep_the_backups() {
 
     // After `zephyr down` no container names the version, so this CLI's stands in: going back
     // still needs the older version's backup.
-    let out = env.zephyr_env(
+    let out = env.run_cli(
+        &env.cli_copy(),
         &["upgrade", "0.0.1"],
         &[("ZEPHYR_IMAGE", ""), ("SHIM_NO_CONTAINER", "1")],
     );

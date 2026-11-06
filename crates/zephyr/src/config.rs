@@ -60,6 +60,10 @@ pub struct Config {
     /// configurable; tests shorten it.
     #[serde(skip, default = "stall_limit")]
     pub stall_limit: std::time::Duration,
+    /// The router's housekeeping tick (watchdog, run caps, sign-in notices, config edits) and how
+    /// often a run's progress is shown again. Not configurable; tests shorten it.
+    #[serde(skip, default = "tick")]
+    pub tick: std::time::Duration,
     /// `[agent]`: what the agent's processes get (DESIGN §4.4).
     #[serde(default)]
     pub agent: Agent,
@@ -88,6 +92,10 @@ fn exec_backstop() -> std::time::Duration {
 
 fn stall_limit() -> std::time::Duration {
     std::time::Duration::from_secs(10 * 60)
+}
+
+fn tick() -> std::time::Duration {
+    std::time::Duration::from_secs(5)
 }
 
 fn projects() -> Option<PathBuf> {

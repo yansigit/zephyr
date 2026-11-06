@@ -3,7 +3,8 @@
 
 State lives next to --session-dir (the zephyr home): log.jsonl records every command,
 pid holds the current pid, and a `hang` file makes the next prompt commit its user
-message, mark the run resumable, and stop answering (the test then kills -9 it); a `wedge`
+message, mark the run resumable, and never finish it, answering only what needs no run (the
+test then kills -9 it, or aborts it); a `wedge`
 file does the same but never takes another command, `abort` included (a wedged rpi); a
 `slow` file holds the seconds each prompt takes. `usage.json` (if present) is the usage each
 reply carries: {"totalTokens": n, "costTotal": x}, sent as message.usage.{totalTokens,cost.total}.
@@ -77,16 +78,32 @@ replies with the rest; `model?` replies with the current model.
 Models: `--list-models` (held while a `list_wait` file exists in the home) prints fake/m1, fake/m2, other/m3 and opencode-go/alpha, the catalogue `set_model` accepts
 (plus the started model);
 `set_model` switches to one of them and errors on anything else.
-The session is <session-dir>/<session-id>.json: {"messages": [...], "pending": bool}.
-`get_messages` gives each message an `entryId`, `m<index>` (its place on the current path).
-`navigate {targetId}` (idle) puts the leaf on that entry, dropping everything after it, and
-answers {"outcome": "completed", "leafId": ...}; with no `targetId` it empties the context (the root).
+Sessions are laid out as rpi 0.18 lays them out (checked against the real binary): at start,
+<session-dir>/--<cwd, / as ->--/<ISO stamp>_<session-id>.jsonl with a header line
+{"kind": "header", "version": 4, "id", ...}, an empty `.lock` and a `.progress.jsonl` companion
+({"session_id", ...}); a later start reopens the newest file for that id, and exits with an error
+unless its header and companion name the id (as `/fork`'s copy must). Each message is appended as
+{"kind": "entry", "type": "message", "id", "parentId", "message"}, `navigate` appends
+{"kind": "lane", "leafId"}, a compaction an entry of type "compaction". Entry ids are `e<n>`. A
+run is resumable while an `operation_started` record has no `operation_finished` after it; unlike
+rpi, which starts one for every run, the fake writes one only for the markers that say so (`hang`,
+`wedge`, `[hang-pending]`, `[pend-after-steer]`), so a run killed otherwise is not resumed.
+`get_messages` gives each message on the path to the leaf its `entryId`.
+`navigate {targetId}` (idle) puts the leaf on that entry, dropping everything after it from the
+context, and answers {"outcome": "completed", "leafId": ...}; with no `targetId` it empties the
+context (the root).
 `compact` (idle, optional `customInstructions`) answers `accepted`, replaces the messages with
 one `compactionSummary`, and settles with outcome "compacted" and a `summary`, as rpi does.
+One run at a time (`maxConcurrentPrompts: 1`): from an accepted `prompt` or `resume_pending` to its
+settle, a `prompt` (whatever its `streamingBehavior`), `compact` or `resume_pending` is refused with
+rpi's error "a run is already active", and `navigate` with "cannot navigate while an operation is
+active".
+Not modelled: `--extension` is only checked to exist (for the policy beacon in `get_commands`),
+never loaded, so no policy veto runs; `--exclude-tools` is recorded in argv.json but ignored.
 While a `tool_fail` file exists in the home, every tool call other than gateway/task/exec/process/vault
 ends with `isError` and the error `tool error: <the file's text>`.
 """
-import json, os, queue as queues, re, sys, threading, time
+import glob, json, os, queue as queues, re, sys, threading, time
 
 args = sys.argv[1:]
 if "--version" in args:
@@ -159,8 +176,7 @@ session_dir = opt("--session-dir")
 ephemeral = "--no-session" in args  # a /btw child: no session file, and the cwd is the home
 tools = "--no-tools" not in args
 home = os.getcwd() if ephemeral else os.path.dirname(os.path.abspath(session_dir))
-path = None if ephemeral else os.path.join(session_dir, opt("--session-id") + ".json")
-memory = {"messages": [], "pending": False}  # the session while ephemeral
+memory = []  # the session's lines while ephemeral
 extension = opt("--extension")
 if not ephemeral:  # `pid` is main's, for the tests that kill it
     open(os.path.join(home, "pid"), "w").write(str(os.getpid()))
@@ -174,18 +190,88 @@ if os.path.exists(os.path.join(home, "tool_sleep")):  # a tool left running in t
 if os.path.isdir(os.environ.get("RPI_CODING_AGENT_DIR") or ""):  # which account started, for tests whose home is temporary
     open(os.path.join(os.environ["RPI_CODING_AGENT_DIR"], "starts.log"), "a").write("%s\n" % opt("--model"))
 
-def load():
-    if ephemeral:
-        return memory
-    try:
-        return json.load(open(path))
-    except FileNotFoundError:
-        return {"messages": [], "pending": False}
+def session_file():
+    """As rpi 0.18: <session-dir>/--<cwd>--/<ISO stamp>_<id>.jsonl, made at start with its header
+    line, an empty `.lock` and a `.progress.jsonl` companion; an existing one for the id is reopened,
+    and refused unless the header and the companion name that id."""
+    sid = opt("--session-id")
+    folder = os.path.join(session_dir, "--%s--" % os.getcwd().strip("/").replace("/", "-"))
+    found = sorted(glob.glob(os.path.join(glob.escape(folder), "*_%s.jsonl" % sid)))
+    if found:
+        head = json.loads(open(found[-1]).readline())
+        progress = json.loads(open(found[-1] + ".progress.jsonl").readline())
+        if head.get("id") != sid or progress.get("session_id") != sid:
+            print("error: session file %s is not session %s" % (found[-1], sid), file=sys.stderr); sys.exit(1)
+        return found[-1]
+    os.makedirs(folder, exist_ok=True)
+    ms = int(time.time() * 1000)
+    stamp = time.strftime("%Y-%m-%dT%H-%M-%S", time.gmtime(ms // 1000)) + "-%03dZ" % (ms % 1000)
+    p = os.path.join(folder, "%s_%s.jsonl" % (stamp, sid))
+    open(p + ".lock", "w").close()
+    open(p + ".progress.jsonl", "w").write(json.dumps(
+        {"format": "assistant-progress-v1", "session_id": sid, "state": {"sequence": 0, "frames": []}}) + "\n")
+    open(p, "w").write(json.dumps({"kind": "header", "version": 4, "id": sid, "createdAt": ms, "cwd": os.getcwd(),
+                                   "progressFormat": "assistant-progress-v1"}) + "\n")
+    return p
 
-def save(s):
+def session_lines():
+    """The session's lines after the header."""
+    return memory if ephemeral else open(path).read().splitlines()[1:]
+
+def append(v):
+    """Appends one line to the session, numbered as rpi numbers them (`seq`)."""
+    v["seq"] = len(session_lines()) + 1
     if ephemeral:
-        return
-    json.dump(s, open(path + ".tmp", "w")); os.replace(path + ".tmp", path)
+        memory.append(json.dumps(v))
+    else:
+        open(path, "a").write(json.dumps(v) + "\n")
+
+def load():
+    """The session as {"messages", "pending", "leaf"}: the messages on the path to the leaf (a
+    `lane` line moves it, as `navigate` does; a compaction restarts the context), and whether the
+    last operation was left unfinished (`resume_pending` then resumes it)."""
+    entries, leaf, pending = {}, None, False
+    for line in session_lines():
+        v = json.loads(line)
+        if v["kind"] == "entry":
+            entries[v["id"]] = v; leaf = v["id"]
+        elif v["kind"] == "lane":
+            leaf = v["leafId"]
+        elif v["kind"] == "record" and v["type"] in ("operation_started", "operation_finished"):
+            pending = v["type"] == "operation_started"
+    chain, at = [], leaf
+    while at is not None:
+        chain.append(entries[at]); at = entries[at]["parentId"]
+    messages = []
+    for e in reversed(chain):
+        if e["type"] == "compaction":
+            messages = [{"kind": "compactionSummary", "role": "compactionSummary", "timestamp": 0, "entryId": e["id"],
+                         "content": [{"type": "text", "text": e["summary"]}]}]
+        else:
+            messages.append(dict(e["message"], entryId=e["id"]))
+    return {"messages": messages, "pending": pending, "leaf": leaf}
+
+def add(s, m, kind="message", **fields):
+    """Commits message `m` (or, with no message, a `compaction`) as an entry after the leaf;
+    returns its id."""
+    eid = "e%d" % (len(session_lines()) + 1)
+    entry = {"kind": "entry", "lane": "main", "type": kind, "id": eid, "parentId": s["leaf"],
+             "timestamp": int(time.time() * 1000)}
+    entry.update(fields if m is None else {"message": m})
+    append(entry)
+    s["leaf"] = eid
+    if m is not None:
+        s["messages"].append(dict(m, entryId=eid))
+    return eid
+
+def set_pending(s, on):
+    """Marks the run resumable (an operation started, not finished), or settled."""
+    if s["pending"] != on:
+        append({"kind": "record", "type": "operation_started" if on else "operation_finished", "id": "op",
+                "lane": "main", "timestamp": int(time.time() * 1000)})
+        s["pending"] = on
+
+path = None if ephemeral else session_file()
 
 def out(v):
     sys.stdout.write(json.dumps(v) + "\n"); sys.stdout.flush()
@@ -199,8 +285,7 @@ def respond(cmd, data=None, error=None):
 
 def said(s, m):
     """Records message `m` in the session and reports it, its `messageId` its entry id (as 0.18)."""
-    s["messages"].append(m); save(s)
-    mid = "m%d" % (len(s["messages"]) - 1)
+    mid = add(s, m)
     out({"type": "message_start", "messageId": mid, "message": m})
     out({"type": "message_end", "messageId": mid, "message": m})
 
@@ -211,7 +296,8 @@ def turn_end(msg=None):
     out(v)
 
 def settled(outcome, error=None, summary=None):
-    aborted = outcome == "aborted"
+    global running
+    aborted, running = outcome == "aborted", False
     out({"type": "agent_settled", "runId": "r", "outcome": outcome, "aborted": aborted, "error": error,
          "summary": summary, "pendingResume": False,
          "reclaimed": {"steer": [], "followUp": []} if aborted else None})
@@ -246,7 +332,7 @@ def rate_limit():
 def fail(s, error):
     msg = {"kind": "assistant", "role": "assistant", "content": [], "stopReason": "error",
            "errorMessage": error, "timestamp": 0}
-    s["pending"] = False; said(s, msg)
+    set_pending(s, False); said(s, msg)
     turn_end(msg)
     out({"type": "session_entry_committed", "entryId": "e", "entryType": "message", "customType": None, "lane": "main"})
     out({"type": "agent_end", "messageCount": 0, "messages": []})
@@ -254,17 +340,29 @@ def fail(s, error):
 
 def finish(s, text, outcome="completed"):
     msg = assistant(text)
-    s["pending"] = False; said(s, msg)
+    set_pending(s, False); said(s, msg)
     out({"type": "agent_end", "messageCount": 0, "messages": []})
     settled(outcome)
+
+def refused(cmd):
+    """As rpi (`maxConcurrentPrompts: 1`): while a run is active, another run is refused, a
+    `prompt` whatever its `streamingBehavior` included."""
+    if running and cmd["type"] in ("prompt", "compact", "resume_pending"):
+        respond(cmd, error="a run is already active")
+    elif running and cmd["type"] == "navigate":
+        respond(cmd, error="cannot navigate while an operation is active")
+    else:
+        return False
+    return True
 
 def quick(cmd, s):
     """Answers a command that needs no run (also while a gateway call waits); False otherwise."""
     global queue, steering, model, thinking
     kind = cmd["type"]
-    if kind == "get_messages":
-        entries = [dict(m, entryId="m%d" % i) for i, m in enumerate(s["messages"])]
-        respond(cmd, {"messages": entries, "total": len(s["messages"]), "pendingResume": s["pending"]})
+    if refused(cmd):
+        pass
+    elif kind == "get_messages":
+        respond(cmd, {"messages": s["messages"], "total": len(s["messages"]), "pendingResume": s["pending"]})
     elif kind == "get_commands":
         names = ["zephyr-policy"] if extension and os.path.exists(extension) else []
         respond(cmd, {"commands": [{"name": n, "description": ""} for n in names]})
@@ -387,6 +485,7 @@ queue = []
 steering = []  # queue_message with deliverAs "steer": delivered after the running tool
 steered_this_run = False
 hanging = False
+running = False  # a run is active: from an accepted prompt or resume to its settle
 calls = 0
 model = opt("--model")
 LEVELS = ["off", "minimal", "low", "medium", "high"]
@@ -405,9 +504,11 @@ for line in iter(next_line, None):
     cmd = json.loads(line)
     open(os.path.join(home, "log.jsonl"), "a").write(line)
     kind, s = cmd["type"], load()
+    if refused(cmd):
+        continue
     if kind == "prompt":
-        respond(cmd, {"accepted": True})
-        s["messages"].append(user(cmd["message"])); save(s)
+        respond(cmd, {"accepted": True}); running = True
+        add(s, user(cmd["message"]))
         if "WRITE_MEMORY" in cmd["message"]:
             open(os.path.join(home, "memory", "MEMORY.md"), "a").write("remembered: " + cmd["message"] + "\n")
         # As rpi: the prompt is committed (before agent_start), but no message events carry it.
@@ -419,19 +520,22 @@ for line in iter(next_line, None):
             time.sleep(float(open(os.path.join(home, "slow")).read() or 1))
         if os.path.exists(os.path.join(home, "wedge")):
             os.remove(os.path.join(home, "wedge"))
-            s["pending"] = True; save(s)
+            set_pending(s, True)
             while True:  # wedged: no command is read or answered again, abort included
                 time.sleep(3600)
         if os.path.exists(os.path.join(home, "hang")):
             os.remove(os.path.join(home, "hang"))
-            s["pending"] = True; save(s)
+            set_pending(s, True)
             # Stay busy until aborted, then settle with no reply, as a cancelled run does.
             for line in iter(next_line, None):
                 c = json.loads(line)
                 open(os.path.join(home, "log.jsonl"), "a").write(line)
                 if c["type"] != "abort":
-                    respond(c, error="a run is already active"); continue
-                abort_reply(c); s["pending"] = False
+                    # As rpi: what needs no run is answered; anything else waits for none.
+                    if not quick(c, s):
+                        respond(c, error="a run is already active")
+                    continue
+                abort_reply(c); set_pending(s, False)
                 # As rpi: a cancelled run still records an aborted assistant message.
                 msg = {"kind": "assistant", "role": "assistant", "content": [], "stopReason": "aborted",
                        "errorMessage": "abort error: Request aborted", "timestamp": 0}
@@ -454,7 +558,7 @@ for line in iter(next_line, None):
             hanging = True; continue
         if "[hang-pending]" in cmd["message"]:
             # As a run cut mid-flight: resumable after a restart (`resume_pending`).
-            s["pending"] = True; save(s)
+            set_pending(s, True)
             hanging = True; continue
         if "[hang]" in cmd["message"]:
             hanging = True; continue
@@ -466,12 +570,14 @@ for line in iter(next_line, None):
             run_tool(s)
         if "[pend-after-steer]" in cmd["message"] and steered_this_run:
             # A crash point: the steer was answered, the run never settles until resumed.
-            s["pending"] = True; save(s)
+            set_pending(s, True)
             hanging = True; continue
         answers, text = [], ""
         for name, args in re.findall(r"\[call (\w+) (\{[^{}]*\})\]", cmd["message"]) if tools else []:
-            calls += 1  # a fresh id per call, as a model would
-            text = run_tool(s, name, json.loads(args), "c%d" % calls)
+            # A fresh id per call, unique across children too, as a model's are: main and its tasks
+            # share one gateway dir, so a task must never read main's answer to the same number.
+            calls += 1
+            text = run_tool(s, name, json.loads(args), "c%d-%d" % (os.getpid(), calls))
             if text is None:
                 break
             if name in ("gateway", "task", "exec", "process", "vault"):
@@ -490,7 +596,7 @@ for line in iter(next_line, None):
     elif kind == "resume_pending":
         if not s["pending"]:
             respond(cmd, {"resumed": False}); continue
-        respond(cmd, {"accepted": True})
+        respond(cmd, {"accepted": True}); running = True
         out({"type": "agent_start"})
         # While `resume_wait` exists the resumed run stays open, taking commands (a steer is held).
         while os.path.exists(os.path.join(home, "resume_wait")):
@@ -507,20 +613,14 @@ for line in iter(next_line, None):
         finish(s, "resumed: " + last["content"])
     elif kind == "navigate":
         target = cmd.get("targetId")
-        if target is None:
-            s["messages"] = []
-        elif re.fullmatch(r"m\d+", target) and int(target[1:]) < len(s["messages"]):
-            s["messages"] = s["messages"][:int(target[1:]) + 1]
-        else:
+        if target is not None and target not in [m["entryId"] for m in s["messages"]]:
             respond(cmd, error="unknown entry: %s" % target); continue
-        save(s)
+        append({"kind": "lane", "lane": "main", "leafId": target})
         respond(cmd, {"outcome": "completed", "leafId": target})
     elif kind == "compact":
         respond(cmd, {"accepted": True})
         before = sum(len(json.dumps(m["content"])) for m in s["messages"])
-        s["messages"] = [{"kind": "compactionSummary", "role": "compactionSummary", "timestamp": 0,
-                          "content": [{"type": "text", "text": "summary"}]}]
-        save(s)
+        add(s, None, "compaction", summary="summary", retainedTail=[])
         out({"type": "session_entry_committed", "entryId": "c", "entryType": "compaction", "customType": None, "lane": "main"})
         settled("compacted", summary="Conversation compacted · %d tokens before, 0 messages kept." % before)
     elif quick(cmd, s):
