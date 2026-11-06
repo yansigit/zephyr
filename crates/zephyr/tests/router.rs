@@ -1464,6 +1464,22 @@ async fn send_file_goes_to_the_owner_after_the_reply_and_its_copy_is_dropped() {
 }
 
 #[tokio::test]
+async fn a_runs_file_goes_to_its_channel_though_a_command_came_in_meanwhile() {
+    let home = home("send-file-to");
+    std::fs::write(home.join("shot.png"), "PNG").unwrap();
+    std::fs::write(home.join("slow"), "2").unwrap();
+    let gw = start(config(&home));
+    let call = r#"look [call send_file {"path": "shot.png"}]"#;
+    gw.say_on("discord", "d1", "downer", call).await;
+    wait(|| inbox_status(&home, "dispatched") == 1).await;
+    gw.say("m1", "owner", "/status").await; // a command row, newer than the run's
+    let replies = gw.wait_replies_on("discord", 2).await;
+    assert_eq!(replies[1], "<PNG>", "{replies:?}");
+    assert_eq!(gw.replies().len(), 1, "chat got only its /status");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_job_the_agent_proposes_waits_for_the_owners_ok() {
     let home = home("propose-job");
     let gw = start(config(&home));

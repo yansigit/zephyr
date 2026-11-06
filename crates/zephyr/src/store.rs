@@ -684,7 +684,7 @@ impl Store {
         self.db
             .query_row(
                 "SELECT channel, sender FROM inbox WHERE status IN ('done', 'dispatched')
-                 ORDER BY id DESC LIMIT 1",
+                 AND sent_as IS NOT NULL ORDER BY id DESC LIMIT 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -1464,8 +1464,14 @@ mod tests {
         let mut store = Store::open(&dir.join("state.db")).unwrap();
         store.notify_last_owner("nobody yet").unwrap();
         assert!(store.pending_outbox().unwrap().is_empty());
+        // A command's row is answered but never taken up by the agent: nobody to tell yet.
+        store.insert_inbox(&msg("cmd")).unwrap();
+        let cmd = store.inbox_with_status("new").unwrap().remove(0);
+        store.set_status(cmd.id, "done").unwrap();
+        store.notify_last_owner("nobody yet").unwrap();
         store.insert_inbox(&msg("a")).unwrap();
         let row = store.inbox_with_status("new").unwrap().remove(0);
+        store.mark_dispatched_as(row.id, "prompt").unwrap();
         store.reply(&row, "answer", "done").unwrap();
         store.notify_last_owner("first notice").unwrap();
         store.notify_last_owner("second notice").unwrap();

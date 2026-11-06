@@ -1333,6 +1333,11 @@ impl<'a> Router<'a> {
             ),
             None => "[zephyr] the run ended without a reply".into(),
         };
+        // Who this run served, read before reconcile dispatches the next row.
+        let to = self.store.last_owner().unwrap_or_else(|e| {
+            eprintln!("zephyr: reading the last owner failed: {e}");
+            None
+        });
         let limited = self
             .account
             .clone()
@@ -1353,24 +1358,21 @@ impl<'a> Router<'a> {
             }
         }
         // The agent's files and proposed jobs, after the reply they belong to.
-        let to = self.store.last_owner().unwrap_or_else(|e| {
-            eprintln!("zephyr: reading the last owner failed: {e}");
-            None
-        });
-        crate::tools::apply(&self.store, &self.cfg, &tally.requests, to);
+        crate::tools::apply(&self.store, &self.cfg, &tally.requests, to.clone());
         // After the reply, so the owner reads what was sent out next to what it was for.
-        for notice in [cut, tally.alert(), memory].into_iter().flatten() {
-            log(self.store.notify_last_owner(&notice).map_err(Into::into));
-        }
+        let mut notices: Vec<String> = [cut, tally.alert(), memory].into_iter().flatten().collect();
         // Skill and connector drafts the run wrote, each shown once (DESIGN §4.6).
-        for notice in crate::drafts::scan(&self.cfg) {
-            log(self.store.notify_last_owner(&notice).map_err(Into::into));
-        }
+        notices.extend(crate::drafts::scan(&self.cfg));
         if crossed {
-            log(self
-                .store
-                .notify_last_owner(BUDGET_NOTICE)
-                .map_err(Into::into));
+            notices.push(BUDGET_NOTICE.into());
+        }
+        for notice in notices {
+            if let Some((channel, recipient)) = &to {
+                log(self
+                    .store
+                    .notify(channel, recipient, &notice)
+                    .map_err(Into::into));
+            }
         }
         self.restart_if_idle().await;
     }
