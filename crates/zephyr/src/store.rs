@@ -1821,9 +1821,14 @@ mod tests {
     }
 
     #[test]
-    fn processes_opening_a_new_store_at_once_migrate_it_once() {
+    fn processes_opening_an_old_store_at_once_migrate_it_once() {
         for n in 0..5 {
             let path = crate::test_dir(&format!("store-race-{n}")).join("state.db");
+            // An empty store from before any version, already in WAL mode as every store is.
+            Connection::open(&path)
+                .unwrap()
+                .pragma_update(None, "journal_mode", "WAL")
+                .unwrap();
             let go = std::sync::Barrier::new(8);
             std::thread::scope(|s| {
                 let opens: Vec<_> = (0..8)
