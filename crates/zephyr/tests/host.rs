@@ -900,6 +900,10 @@ fn lifecycle_commands_build_the_expected_docker_calls() {
         tui.windows(2).any(|w| w == ["-e", "TZ=Europe/Berlin"]),
         "{tui:?}"
     );
+    assert!(
+        tui.contains(&"HOME=/var/lib/zephyr/tui".to_string()),
+        "{tui:?}"
+    );
     assert!(!format!("{calls:?}").contains(token.trim()));
 
     env.ok(&["attach", "--stock"]);
@@ -913,15 +917,30 @@ fn lifecycle_commands_build_the_expected_docker_calls() {
             "-e",
             "RPI_SERVER_TOKEN",
             "-e",
-            "HOME=/tmp",
+            "HOME=/var/lib/zephyr/tui",
             "-e",
-            "RPI_CODING_AGENT_DIR=/tmp/zephyr-attach",
+            "RPI_CODING_AGENT_DIR=/var/lib/zephyr/tui/agent",
             CONTAINER,
             "rpi",
             "--connect",
             "127.0.0.1:7790",
         ],
     );
+    // In the daemon's dir, which the agent cannot enter, not in /tmp, where it could make it first.
+    find(
+        &calls,
+        &[
+            "docker",
+            "exec",
+            CONTAINER,
+            "mkdir",
+            "-p",
+            "-m",
+            "0700",
+            "/var/lib/zephyr/tui",
+        ],
+    );
+    assert!(!format!("{calls:?}").contains("/tmp"), "{calls:#?}");
     assert!(!format!("{calls:?}").contains(token.trim()));
 
     assert!(

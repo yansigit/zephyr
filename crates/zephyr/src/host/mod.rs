@@ -514,17 +514,18 @@ impl Host {
     fn attach(&self, stock: bool) -> anyhow::Result<()> {
         self.need_running()?;
         let token = self.data.token()?;
+        // Root's own files for the client: in the daemon's dir, which the agent cannot enter (it
+        // could make a dir in /tmp first). Root cannot enter the agent's home either.
+        let home = format!("{DAEMON_MOUNT}/tui");
+        run(&mut self.exec(&[], &[], &["mkdir", "-p", "-m", "0700", &home]))?;
         // `-e NAME` without a value: docker copies it from this process's environment, when set.
         let mut flags = vec!["-it", "-e", "RPI_SERVER_TOKEN"];
         let mut cmd = if stock {
             let doc = self.data.load()?;
             let port = conf::get(&doc, "attach.port").context("no [attach] port in zephyr.toml")?;
-            // As root, so the agent's uid cannot read the token from the client's environment; root
-            // cannot enter the agent's home, so the client keeps its own files in /tmp.
-            let env = [
-                ("HOME", "/tmp"),
-                ("RPI_CODING_AGENT_DIR", "/tmp/zephyr-attach"),
-            ];
+            // As root, so the agent's uid cannot read the token from the client's environment.
+            let agent = format!("{home}/agent");
+            let env = [("HOME", home.as_str()), ("RPI_CODING_AGENT_DIR", &agent)];
             let mut cmd = self.exec(&flags, &env, &["rpi", "--connect"]);
             cmd.arg(format!("127.0.0.1:{port}"));
             cmd
@@ -547,7 +548,7 @@ impl Host {
                 .filter(|t| !t.is_empty())
                 .or_else(|| jiff::tz::TimeZone::system().iana_name().map(String::from))
                 .unwrap_or_else(|| "UTC".into());
-            self.exec(&flags, &[("HOME", "/tmp"), ("TZ", &tz)], &["zephyr", "tui"])
+            self.exec(&flags, &[("HOME", &home), ("TZ", &tz)], &["zephyr", "tui"])
         };
         let ran = run(cmd.env("RPI_SERVER_TOKEN", &token));
         if ran.is_err() && !stock && std::io::stdout().is_terminal() {
