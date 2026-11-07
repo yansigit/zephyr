@@ -113,7 +113,7 @@ if "--version" in args:
     print("rpi 0.18.0"); sys.exit(0)
 CATALOG = ["fake/m1", "fake/m2", "other/m3", "opencode-go/alpha"]
 # zephyr_policy::tools::GATEWAY_COMMANDS
-GATEWAY_COMMANDS = ["/status", "/model", "/switch", "/rules", "/memory diff", "/memory log", "/job list", "/settings"]
+GATEWAY_COMMANDS = ["/status", "/model", "/switch", "/rules", "/memory diff", "/memory log", "/job list", "/settings", "/approvals"]
 def gateway_kind(c):
     """zephyr_policy::tools::gateway_kind: "read", "set", "propose" or None."""
     if c in GATEWAY_COMMANDS:

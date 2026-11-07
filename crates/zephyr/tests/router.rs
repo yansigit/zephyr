@@ -2547,6 +2547,168 @@ async fn a_strong_loosening_is_refused_from_discord_and_accepted_from_chat() {
     gw.shutdown().await;
 }
 
+/// Approvals spec §4.3: a preset is one change through `set_setting`. Loosening needs a strong
+/// channel and tightening does not; a hand value stricter than the preset stays.
+#[tokio::test]
+async fn approvals_full_from_discord_is_refused_and_from_chat_applies() {
+    let home = home("approvals-preset");
+    let gw = start(on_file_with_discord(&home, ""));
+    wait(|| !log(&home, "start").is_empty()).await;
+    gw.say_on("discord", "d1", "downer", "/approvals").await;
+    assert_eq!(
+        gw.wait_replies_on("discord", 1).await,
+        ["[zephyr] preset manual · messages ask · posts ask · money ask · facts hold"]
+    );
+    for (id, text) in [
+        ("d2", "/approvals full"),
+        ("d3", "/approvals off"),
+        ("d4", "/approvals messages auto"),
+    ] {
+        gw.say_on("discord", id, "downer", text).await;
+    }
+    let r = gw.wait_replies_on("discord", 4).await;
+    assert_eq!(
+        r[1..],
+        [
+            "[zephyr] loosening approvals.preset needs tui or chat",
+            "[zephyr] loosening approvals.preset needs tui or chat",
+            "[zephyr] loosening approvals.messages needs tui or chat",
+        ]
+    );
+    let file = || Config::load(&home.join("zephyr.toml")).unwrap();
+    assert_eq!(file().approvals, None, "nothing changed");
+
+    gw.say("m1", "owner", "/approvals full").await;
+    assert_eq!(
+        gw.wait_replies(1).await,
+        ["[zephyr] approvals.preset manual → full\n\
+          [zephyr] preset full · messages auto · posts auto · money auto · facts warn"]
+    );
+    // Tightening from any owner channel: a class by hand, then a stricter preset that keeps it.
+    gw.say_on("discord", "d5", "downer", "/approvals messages ask")
+        .await;
+    assert_eq!(
+        gw.wait_replies_on("discord", 5).await[4],
+        "[zephyr] approvals.messages auto → ask\n\
+         [zephyr] preset full (modified) · messages ask · posts auto · money auto · facts warn"
+    );
+    gw.say_on("discord", "d6", "downer", "/approvals semi")
+        .await;
+    assert_eq!(
+        gw.wait_replies_on("discord", 6).await[5],
+        "[zephyr] approvals.preset full → semi\n\
+         [zephyr] preset semi (modified) · messages ask · posts delay 5 · money ask · facts hold"
+    );
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let change = store
+        .last_setting_change("approvals.preset")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (change.actor.as_str(), change.channel.as_deref()),
+        ("owner", Some("discord"))
+    );
+    gw.say("m2", "owner", "/approvals facts off").await;
+    assert_eq!(
+        gw.wait_replies(2).await[1],
+        "[zephyr] approvals.facts hold → off\n\
+         [zephyr] preset semi (modified) · messages ask · posts delay 5 · money ask · facts off"
+    );
+    gw.say_on("discord", "d7", "downer", "/approvals sometimes")
+        .await;
+    assert!(
+        gw.wait_replies_on("discord", 7).await[6].starts_with("[zephyr] usage: /approvals"),
+        "{:?}",
+        gw.replies_on("discord")
+    );
+    gw.shutdown().await;
+}
+
+/// `/approvals full for 2h` goes back to the whole `[approvals]` it replaced: the preset, and
+/// the hand-set value `full` dropped as looser than its own.
+#[tokio::test]
+async fn a_timed_preset_goes_back_to_the_whole_set() {
+    let home = home("approvals-timed");
+    let approvals = "[approvals]\npreset = \"semi\"\nmessages = \"ask\"\nfacts = \"off\"";
+    let mut cfg = on_file(&home, approvals);
+    cfg.tick = Duration::from_millis(200);
+    cfg.min_until = Duration::from_secs(1);
+    let gw = start(cfg);
+    wait(|| !log(&home, "start").is_empty()).await;
+    gw.say("m1", "owner", "/approvals full for 1s").await;
+    let timed = gw.wait_replies(1).await.remove(0);
+    assert!(
+        timed.starts_with("[zephyr] approvals.preset semi → full until ")
+            && timed.ends_with(
+                "\n[zephyr] preset full (modified) · messages ask · posts auto · money auto · \
+                 facts warn"
+            ),
+        "{timed}"
+    );
+    let file = || Config::load(&home.join("zephyr.toml")).unwrap();
+    assert_eq!(
+        file().approvals.unwrap().facts,
+        None,
+        "dropped as looser than warn"
+    );
+    wait(|| gw.replies().len() == 2).await;
+    assert_eq!(
+        gw.replies()[1],
+        "[zephyr] approvals.preset went back to semi (the 1s you set ended)"
+    );
+    assert_eq!(
+        zephyr::approvals::effective(&file()).line(),
+        "preset semi (modified) · messages ask · posts delay 5 · money ask · facts off"
+    );
+    let store = Store::open(&home.join("state.db")).unwrap();
+    assert!(store.due_reverts(i64::MAX).unwrap().is_empty(), "done once");
+    gw.shutdown().await;
+}
+
+/// The agent reads the modes with `gateway "/approvals"`, tightens a class at once and proposes
+/// a loosening, which needs a strong channel to approve.
+#[tokio::test]
+async fn the_agent_reads_approvals_tightens_a_class_and_proposes_a_loosening() {
+    let home = home("approvals-agent");
+    let gw = start(on_file(&home, "[approvals]\npreset = \"full\""));
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call gateway {"command": "/approvals"}] [call gateway {"command": "/set approvals.messages ask"}] careful"#,
+    )
+    .await;
+    let replies = gw.wait_replies(2).await;
+    let reply = replies.iter().find(|r| r.contains("gateway:")).unwrap();
+    assert!(
+        reply.contains("gateway: [zephyr] preset full · messages auto · posts auto"),
+        "{replies:?}"
+    );
+    assert!(
+        reply.contains("gateway: changed approvals.messages auto → ask"),
+        "{replies:?}"
+    );
+    assert!(
+        replies
+            .iter()
+            .any(|r| r.starts_with("[zephyr] the agent set approvals.messages auto → ask")),
+        "{replies:?}"
+    );
+    gw.say(
+        "m2",
+        "owner",
+        r#"[call gateway {"command": "/set approvals.messages auto"}] faster"#,
+    )
+    .await;
+    let replies = gw.wait_replies(4).await;
+    assert!(
+        replies.iter().any(|r| r
+            .starts_with("[zephyr] the agent proposes #1: approvals.messages ask → auto\n")
+            && r.ends_with("/ok 1 · /no 1 · this one needs tui or chat")),
+        "{replies:?}"
+    );
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_timed_change_reverts_on_the_tick() {
     let home = home("set-timed");

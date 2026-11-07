@@ -174,6 +174,7 @@ fn takes(kind: &Value) -> String {
         "choice" => format!("one of {}", options(kind).join(", ")),
         "model" => "PROVIDER/MODEL, one an account lists".into(),
         "list" => format!("names, comma separated: {}", options(kind).join(", ")),
+        "mode" => format!("one of {}", options(kind).join(", ")),
         "optional" => format!("{}, or none", takes(&kind["inner"])),
         _ => match kind["max"].as_u64() {
             Some(max) if max > 0 => format!("text, at most {max} characters"),

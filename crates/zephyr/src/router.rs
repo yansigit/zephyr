@@ -485,6 +485,9 @@ const APPLIED: &str = "[zephyr] applied";
 
 const SET_USAGE: &str = "[zephyr] usage: /set KEY VALUE [for 2h]; /settings lists the keys";
 
+const APPROVALS_USAGE: &str = "[zephyr] usage: /approvals, /approvals manual|semi|full|on|off \
+    [for 2h], /approvals messages|posts|money|facts MODE [for 2h]";
+
 const SUBAGENT_USAGE: &str = "usage: /subagent, /subagent add NAME [PROVIDER/MODEL] PROMPT, \
     /subagent model NAME PROVIDER/MODEL|default, /subagent prompt NAME PROMPT, /subagent rm NAME";
 
@@ -864,6 +867,7 @@ impl<'a> Router<'a> {
             "/status" => self.status(),
             "/model" => self.models(),
             "/switch" => self.list_sessions(),
+            "/approvals" => format!("[zephyr] {}", crate::approvals::effective(&self.cfg).line()),
             settings if settings.starts_with("/settings") => {
                 self.settings_listing(settings["/settings".len()..].trim())
             }
@@ -1747,6 +1751,7 @@ impl<'a> Router<'a> {
             ("/thinking", level) => self.thinking_level(level, from.0).await,
             ("/set", arg) => self.set_command(arg, from.0).await,
             ("/settings", arg) => self.settings_listing(arg),
+            ("/approvals", arg) => self.approvals(arg, from.0).await,
             // `/rule` alone and `/rules` are `memory::command`'s.
             ("/rule", rule) if !rule.is_empty() => {
                 self.owner_set("rule", rule, from.0, |a| a).await
@@ -1936,20 +1941,28 @@ impl<'a> Router<'a> {
             return Outcome::Refused(format!("a change to {key} cannot be timed"));
         }
         let (old, seen) = (self.shown(key), self.current(s, key));
+        // The end of a timed preset puts back the whole `[approvals]` it replaced, which its
+        // revert holds (`approvals::snapshot`); nobody else writes one.
+        let restore = (s.apply == Apply::Preset && actor == Actor::Internal).then_some(raw);
         // `None` clears the key. A thinking level, a subagent or a rule is checked as it applies.
         let value = match s.apply {
-            Apply::Toml | Apply::Model if !reg::clears(s, raw) => match reg::parse(s, raw) {
-                Ok(v) => Some(v),
-                Err(e) if s.apply == Apply::Model => {
-                    return Outcome::Refused(format!("model not changed: {e}"))
+            Apply::Preset if restore.is_some() => None,
+            Apply::Toml | Apply::Model | Apply::Preset if !reg::clears(s, raw) => {
+                match reg::parse(s, raw) {
+                    Ok(v) => Some(v),
+                    Err(e) if s.apply == Apply::Model => {
+                        return Outcome::Refused(format!("model not changed: {e}"))
+                    }
+                    Err(e) => return Outcome::Refused(format!("not changed: {e}")),
                 }
-                Err(e) => return Outcome::Refused(format!("not changed: {e}")),
-            },
+            }
             _ => None,
         };
         let new = match (&value, s.apply) {
             (Some(v), _) => Some(reg::text(v)),
-            (None, Apply::Toml) => None,
+            // An approval class cleared follows the preset.
+            (None, Apply::Toml) => reg::cleared(&self.cfg, key),
+            (None, Apply::Preset) => raw.split(';').next().map(|p| p.trim().to_string()),
             (None, _) => Some(raw.to_string()),
         };
         let loosens = reg::loosens(s, old.as_deref(), new.as_deref());
@@ -1998,12 +2011,38 @@ impl<'a> Router<'a> {
                 return Outcome::Proposed { id };
             }
         }
+        // What a time limit on a preset goes back to: all of `[approvals]` before the change.
+        let mut before = None;
         let applied = match s.apply {
             Apply::Toml => {
                 let model =
                     matches!(s.kind, Kind::Model | Kind::Optional(Kind::Model)) && value.is_some();
                 let write = |doc: &mut toml_edit::DocumentMut| reg::write(doc, key, value.as_ref());
                 self.edit_config(model.then_some(raw), write).await
+            }
+            // The preset and the hand-set values it drops (or a timed one's whole set put back)
+            // are one update, worked out from the file as it is under the writer's lock.
+            Apply::Preset => {
+                let preset = value.as_ref().map(reg::text);
+                let write = |doc: &mut toml_edit::DocumentMut| {
+                    let now: Config = toml::from_str(&doc.to_string())?;
+                    before = Some(crate::approvals::snapshot(&now));
+                    let edits = match (restore, preset.as_deref()) {
+                        (Some(snapshot), _) => crate::approvals::restore_edits(&now, snapshot)
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                        (None, Some(p)) => {
+                            let p =
+                                crate::approvals::Preset::parse(p).map_err(anyhow::Error::msg)?;
+                            crate::approvals::preset_edits(&now, p)
+                        }
+                        (None, None) => anyhow::bail!("no preset to set"),
+                    };
+                    for (key, v) in edits {
+                        reg::write(doc, &key, v.map(toml_edit::Value::from).as_ref())?;
+                    }
+                    Ok(())
+                };
+                self.edit_config(None, write).await
             }
             Apply::Model => self.switch_model(raw).await,
             Apply::Thinking => self.apply_thinking(raw).await,
@@ -2022,7 +2061,7 @@ impl<'a> Router<'a> {
         // What is in effect now; a model asked for may still be on its way to the child, and
         // after a failed reload the file holds what was asked, not what is in effect.
         let new = match (s.apply, applied.failed) {
-            (Apply::Toml | Apply::Thinking, false) => self.shown(key),
+            (Apply::Toml | Apply::Thinking | Apply::Preset, false) => self.shown(key),
             _ => new,
         };
         let (who, channel, proposal) = match actor {
@@ -2047,6 +2086,7 @@ impl<'a> Router<'a> {
                 // value it had by default.
                 (Apply::Toml, Kind::Optional(_)) => seen,
                 (Apply::Toml, _) => seen.or_else(|| old.clone()),
+                (Apply::Preset, _) => before,
                 _ => old.clone(),
             };
             self.time_limit(key, actor, until, back, channel);
@@ -2141,6 +2181,34 @@ impl<'a> Router<'a> {
         }
     }
 
+    /// `/approvals` (approvals spec §4.3): the modes in effect; `manual|semi|full` (`off` is
+    /// full, `on` manual) or `messages|posts|money|facts MODE`, each `[for D]`, through
+    /// `set_setting` as `/set` would, answered with the change and the modes after it.
+    async fn approvals(&mut self, arg: &str, channel: &str) -> String {
+        let shown = |cfg: &Config| format!("[zephyr] {}", crate::approvals::effective(cfg).line());
+        let (what, until) = match arg.rsplit_once(" for ") {
+            Some((what, d)) if !what.trim().is_empty() => (what.trim(), format!(" for {d}")),
+            _ => (arg.trim(), String::new()),
+        };
+        let (key, value) = match word(what) {
+            ("", "") => return shown(&self.cfg),
+            (p @ ("manual" | "semi" | "full"), "") => ("approvals.preset".to_string(), p),
+            ("off", "") => ("approvals.preset".into(), "full"),
+            ("on", "") => ("approvals.preset".into(), "manual"),
+            (class @ ("messages" | "posts" | "money" | "facts"), mode) if !mode.is_empty() => {
+                (format!("approvals.{class}"), mode)
+            }
+            _ => return APPROVALS_USAGE.into(),
+        };
+        let reply = self
+            .set_command(&format!("{key} {value}{until}"), channel)
+            .await;
+        match crate::settings::is_change(&reply, &key) {
+            true => format!("{reply}\n{}", shown(&self.cfg)),
+            false => reply,
+        }
+    }
+
     /// `/settings [SECTION|KEY]`: the values in effect and where each came from.
     fn settings_listing(&self, arg: &str) -> String {
         let strong = &self.cfg.settings.strong_channels;
@@ -2152,6 +2220,10 @@ impl<'a> Router<'a> {
         let keys: Vec<String> = match s.key {
             "mcp.<name>.enabled" => (self.cfg.mcp.iter())
                 .map(|m| format!("mcp.{}.enabled", m.name))
+                .collect(),
+            // The tools the owner gave a class.
+            "mcp.<name>.classes.<tool>" => (self.cfg.mcp.iter())
+                .flat_map(|m| (m.classes.keys()).map(|t| format!("mcp.{}.classes.{t}", m.name)))
                 .collect(),
             key => vec![key.to_string()],
         };
@@ -2165,19 +2237,21 @@ impl<'a> Router<'a> {
     }
 
     /// Where `key`'s value came from: `until HH:MM` while a time limit runs, `default` when
-    /// nothing sets it, else who changed it last.
+    /// nothing sets it (`preset` for an approval class), else who changed it last.
     fn source(&self, s: &Setting, key: &str) -> String {
         if let Ok(Some(r)) = self.store.revert(key) {
             return format!("until {}", self.clock(r.at));
         }
         let change = self.store.last_setting_change(key).ok().flatten();
         let set = match s.apply {
-            Apply::Toml => self.current(s, key).is_some(),
+            Apply::Toml | Apply::Preset => self.current(s, key).is_some(),
             // rpi's own level until one is chosen.
             Apply::Thinking => change.is_some(),
             _ => self.shown(key).is_some(),
         };
         match (set, change) {
+            // Settings spec §4.6: an approval class nobody set follows the preset.
+            (false, _) if crate::settings::cleared(&self.cfg, key).is_some() => "preset".into(),
             (false, _) => "default".into(),
             (true, Some(c)) => crate::settings::source(&c),
             // In zephyr.toml, written by hand or by the host CLI.
@@ -2213,7 +2287,7 @@ impl<'a> Router<'a> {
     fn current(&self, s: &Setting, key: &str) -> Option<String> {
         let doc = || crate::host::conf::load(self.cfg.path.as_deref()?).ok();
         match s.apply {
-            Apply::Toml => crate::settings::read(&doc()?, key),
+            Apply::Toml | Apply::Preset => crate::settings::read(&doc()?, key),
             Apply::Subagent => {
                 let table = doc()?.get("subagent").map(|t| t.to_string());
                 Some(crate::drafts::digest([table

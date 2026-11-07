@@ -35,6 +35,7 @@ pub const GATEWAY_COMMANDS: &[&str] = &[
     "/memory log",
     "/job list",
     "/settings",
+    "/approvals",
 ];
 
 /// What a `gateway` command is to the agent.

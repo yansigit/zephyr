@@ -6,8 +6,10 @@
 
 use std::time::Duration;
 
-use toml_edit::{Array, DocumentMut, Item, Value};
+use toml_edit::{Array, DocumentMut, Item, Table, Value};
+use zephyr_policy::policy::Class;
 
+use crate::approvals::{FactsMode, Preset};
 use crate::config::Config;
 
 pub struct Setting {
@@ -51,6 +53,9 @@ pub enum Kind {
     List(&'static [&'static str]),
     /// `none` or `default` clears the key.
     Optional(&'static Kind),
+    /// A class's approval mode: `ask`, `ask-new`, `delay N`, `auto`, money's `auto N`
+    /// (`approvals::parse_mode`).
+    Mode(Class),
 }
 
 /// Read is implied for every entry.
@@ -73,6 +78,10 @@ pub enum Stricter {
     NoneIsLoosest,
     /// A list: removing entries is stricter, adding is looser.
     Fewer,
+    /// A list: adding entries is stricter, removing is looser (`approvals.strong_only`).
+    More,
+    /// An approval mode, ordered by `approvals::stricter`.
+    Approval,
     NotOrdered,
 }
 
@@ -85,6 +94,9 @@ pub enum Apply {
     Rule,
     /// Private facts (approvals spec A1).
     Facts,
+    /// `approvals.preset`: the preset and the hand-set values it drops, in one update
+    /// (`approvals::preset_edits`); its time limit goes back to the whole set.
+    Preset,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -350,6 +362,100 @@ pub static SETTINGS: &[Setting] = &[
         Stricter::Fewer,
         Apply::Toml,
     ),
+    row(
+        CLASSES_KEY,
+        "Connectors",
+        "Connector tool class",
+        "Which approvals a connector's tool follows, over what its name implies: messages, \
+         posts, money or none; the agent may only move a tool into a stricter class.",
+        Kind::Choice(&crate::approvals::CLASS_CHOICES),
+        Access::Tighten,
+        true,
+        Stricter::Earlier,
+        Apply::Toml,
+    ),
+    row(
+        "approvals.preset",
+        "Approvals",
+        "Preset",
+        "manual asks before every message, post and payment; semi lets known recipients \
+         through and delays posts 5 minutes; full asks for nothing. A preset never loosens a \
+         value set by hand.",
+        Kind::Choice(&Preset::NAMES),
+        Access::Tighten,
+        true,
+        Stricter::Earlier,
+        Apply::Preset,
+    ),
+    row(
+        "approvals.messages",
+        "Approvals",
+        "Messages",
+        "What a message to someone waits for; default follows the preset.",
+        Kind::Optional(&Kind::Mode(Class::Messages)),
+        Access::Tighten,
+        true,
+        Stricter::Approval,
+        Apply::Toml,
+    ),
+    row(
+        "approvals.posts",
+        "Approvals",
+        "Posts",
+        "What a public post waits for; default follows the preset.",
+        Kind::Optional(&Kind::Mode(Class::Posts)),
+        Access::Tighten,
+        true,
+        Stricter::Approval,
+        Apply::Toml,
+    ),
+    row(
+        "approvals.money",
+        "Approvals",
+        "Payments",
+        "What a payment waits for; auto N lets one through up to N in the currency; default \
+         follows the preset.",
+        Kind::Optional(&Kind::Mode(Class::Money)),
+        Access::Tighten,
+        true,
+        Stricter::Approval,
+        Apply::Toml,
+    ),
+    row(
+        "approvals.currency",
+        "Approvals",
+        "Currency",
+        "The ISO 4217 currency an auto N cap counts in.",
+        Kind::Text { max: 3 },
+        Access::Propose,
+        false,
+        Stricter::NotOrdered,
+        Apply::Toml,
+    ),
+    row(
+        "approvals.facts",
+        "Approvals",
+        "Private facts",
+        "What a call holding one of your private facts does: hold it, warn you, or nothing; \
+         default follows the preset.",
+        Kind::Optional(&Kind::Choice(&FactsMode::NAMES)),
+        Access::Tighten,
+        true,
+        Stricter::Earlier,
+        Apply::Toml,
+    ),
+    row(
+        "approvals.strong_only",
+        "Approvals",
+        "Approved only from a strong channel",
+        "loosen: a proposal that relaxes approvals or a fact; money: payments. The agent may \
+         only add entries.",
+        Kind::List(&crate::approvals::STRONG_ONLY),
+        Access::Tighten,
+        true,
+        Stricter::More,
+        Apply::Toml,
+    ),
     fixed(
         "owners",
         "Owners",
@@ -379,8 +485,15 @@ pub static SETTINGS: &[Setting] = &[
     ),
 ];
 
-/// The setting for a dotted key. `mcp.NAME.enabled` finds the connector entry.
+/// The entry every `mcp.NAME.classes.TOOL` key shares.
+const CLASSES_KEY: &str = "mcp.<name>.classes.<tool>";
+
+/// The setting for a dotted key. `mcp.NAME.enabled` finds the connector entry, and
+/// `mcp.NAME.classes.TOOL` the one for a connector tool's class.
 pub fn find(key: &str) -> Option<&'static Setting> {
+    if classes_key(key).is_some() {
+        return SETTINGS.iter().find(|s| s.key == CLASSES_KEY);
+    }
     if let Some(name) = key
         .strip_prefix("mcp.")
         .and_then(|k| k.strip_suffix(".enabled"))
@@ -406,6 +519,12 @@ pub fn clears(s: &Setting, raw: &str) -> bool {
 pub fn parse(s: &Setting, raw: &str) -> Result<Value, String> {
     if s.section == READ_ONLY {
         return Err(format!("{} is read-only", s.key));
+    }
+    if s.key == "approvals.currency" {
+        let code = crate::approvals::currency_code(raw);
+        return code
+            .map(Value::from)
+            .map_err(|e| format!("[approvals] {e}"));
     }
     let value = parse_kind(&s.kind, raw.trim(), &named(s.key))?;
     if s.key == "settings.strong_channels" && !list_names(raw).contains(&"tui") {
@@ -484,6 +603,22 @@ fn parse_kind(kind: &Kind, raw: &str, key: &str) -> Result<Value, String> {
             }
             parse_kind(inner, raw, key)
         }
+        Kind::Mode(class) => match crate::approvals::parse_mode(*class, raw) {
+            Ok(mode) => Ok(Value::from(mode.to_string())),
+            Err(_) => Err(format!(
+                "{key} is {}, not {raw:?}",
+                crate::approvals::takes(*class)
+            )),
+        },
+    }
+}
+
+/// The class a mode setting is for.
+fn mode_class(kind: &Kind) -> Option<Class> {
+    match kind {
+        Kind::Mode(class) => Some(*class),
+        Kind::Optional(inner) => mode_class(inner),
+        _ => None,
     }
 }
 
@@ -566,15 +701,18 @@ fn rank(kind: &Kind, raw: &str) -> Option<Rank> {
             ))
         }
         Kind::Optional(inner) => rank(inner, raw),
-        Kind::Model | Kind::Text { .. } => None,
+        // Ordered by `approvals::stricter` in `tighter`.
+        Kind::Model | Kind::Text { .. } | Kind::Mode(_) => None,
     }
 }
 
 /// Whether going from `old` to `new` is no looser than before (`None` is an absent value), or
 /// `None` when the setting has no order or a value does not parse. Equal values are not looser.
 pub fn tighter(s: &Setting, old: Option<&str>, new: Option<&str>) -> Option<bool> {
-    let old = old.map(str::trim).filter(|o| !is_clear(o));
-    let new = new.map(str::trim).filter(|n| !is_clear(n));
+    // A clearing word is an absent value only where it clears: `none` is a tool's class.
+    let value = |v: &str| !(matches!(s.kind, Kind::Optional(_)) && is_clear(v));
+    let old = old.map(str::trim).filter(|o| value(o));
+    let new = new.map(str::trim).filter(|n| value(n));
     if s.stricter == Stricter::NotOrdered {
         return None;
     }
@@ -587,6 +725,11 @@ pub fn tighter(s: &Setting, old: Option<&str>, new: Option<&str>) -> Option<bool
         }
     }
     let (old, new) = (old?, new?);
+    if s.stricter == Stricter::Approval {
+        let class = mode_class(&s.kind)?;
+        let parse = |raw| crate::approvals::parse_mode(class, raw).ok();
+        return Some(!crate::approvals::stricter(parse(old)?, parse(new)?));
+    }
     let (a, b) = (rank(&s.kind, old)?, rank(&s.kind, new)?);
     match (s.stricter, a, b) {
         (Stricter::Lower | Stricter::NoneIsLoosest, Rank::Num(a), Rank::Num(b)) => Some(b <= a),
@@ -594,6 +737,7 @@ pub fn tighter(s: &Setting, old: Option<&str>, new: Option<&str>) -> Option<bool
         (Stricter::Earlier, Rank::Index(a), Rank::Index(b)) => Some(b <= a),
         (Stricter::FalseIsStricter, Rank::Flag(a), Rank::Flag(b)) => Some(!b || a),
         (Stricter::Fewer, Rank::Set(a), Rank::Set(b)) => Some(b.iter().all(|n| a.contains(n))),
+        (Stricter::More, Rank::Set(a), Rank::Set(b)) => Some(a.iter().all(|n| b.contains(n))),
         _ => None,
     }
 }
@@ -631,10 +775,39 @@ pub fn decide(s: &Setting, actor: &Actor, loosens: bool, strong_channels: &[Stri
     }
 }
 
+/// What `key` comes to once cleared, as replies show it, where that is not simply unset: an
+/// approval class follows the preset.
+pub fn cleared(cfg: &Config, key: &str) -> Option<String> {
+    crate::approvals::cleared(cfg, key.strip_prefix("approvals.")?)
+}
+
 /// The connector a `mcp.NAME.enabled` key names.
 fn connector(key: &str) -> Option<&str> {
     let name = key.strip_prefix("mcp.")?.strip_suffix(".enabled")?;
     (!name.is_empty() && !name.contains('.')).then_some(name)
+}
+
+/// The connector and tool a `mcp.NAME.classes.TOOL` key names.
+fn classes_key(key: &str) -> Option<(&str, &str)> {
+    let (name, tool) = key.strip_prefix("mcp.")?.split_once(".classes.")?;
+    let plain = |s: &str| !s.is_empty() && !s.contains('.');
+    (plain(name) && plain(tool)).then_some((name, tool))
+}
+
+/// The `[[mcp]]` table named `name`.
+fn mcp_table<'a>(doc: &'a DocumentMut, name: &str) -> Option<&'a Table> {
+    let list = doc.get("mcp")?.as_array_of_tables()?;
+    list.iter()
+        .find(|t| t.get("name").and_then(Item::as_str) == Some(name))
+}
+
+fn mcp_table_mut<'a>(doc: &'a mut DocumentMut, name: &str) -> anyhow::Result<&'a mut Table> {
+    let list = doc.get_mut("mcp").and_then(Item::as_array_of_tables_mut);
+    list.and_then(|l| {
+        l.iter_mut()
+            .find(|t| t.get("name").and_then(Item::as_str) == Some(name))
+    })
+    .ok_or_else(|| anyhow::anyhow!("no connector named {name}"))
 }
 
 /// The value of `key` in effect in `cfg`, as replies show it: a default when the file has
@@ -654,7 +827,18 @@ pub fn value(cfg: &Config, key: &str) -> Option<String> {
         "auth.enabled" => Some(cfg.auth.enabled.to_string()),
         "auth.refresh_minutes" => Some(cfg.auth.refresh_minutes.to_string()),
         "settings.strong_channels" => Some(cfg.settings.strong_channels.join(", ")),
+        key if key.starts_with("approvals.") => {
+            crate::approvals::value(cfg, &key["approvals.".len()..])
+        }
         key => {
+            if let Some((name, tool)) = classes_key(key) {
+                let m = cfg.mcp.iter().find(|m| m.name == name)?;
+                // Without the owner's class, the one the tool's name implies.
+                return Some(match m.classes.get(tool) {
+                    Some(class) => class.clone(),
+                    None => crate::approvals::verb_class(name, tool).into(),
+                });
+            }
             let m = cfg
                 .mcp
                 .iter()
@@ -681,27 +865,44 @@ pub fn text(v: &Value) -> String {
 /// `key` as `zephyr.toml` holds it (`None`: absent), for a proposal to be checked against at
 /// `/ok`. `mcp.NAME.enabled` is that `[[mcp]]` table's.
 pub fn read(doc: &DocumentMut, key: &str) -> Option<String> {
+    if let Some((name, tool)) = classes_key(key) {
+        let classes = mcp_table(doc, name)?.get("classes")?.as_table_like()?;
+        return classes.get(tool)?.as_str().map(String::from);
+    }
     let Some(name) = connector(key) else {
         return crate::host::conf::get(doc, key);
     };
-    let list = doc.get("mcp")?.as_array_of_tables()?;
-    let t = list
-        .iter()
-        .find(|t| t.get("name").and_then(Item::as_str) == Some(name))?;
-    t.get("enabled")?.as_bool().map(|b| b.to_string())
+    mcp_table(doc, name)?
+        .get("enabled")?
+        .as_bool()
+        .map(|b| b.to_string())
 }
 
 /// Sets `key` to `value` in `doc`, or removes it (`None`, back to its default). A value already
 /// there keeps its comment.
 pub fn write(doc: &mut DocumentMut, key: &str, value: Option<&Value>) -> anyhow::Result<()> {
+    if let Some((name, tool)) = classes_key(key) {
+        let t = mcp_table_mut(doc, name)?;
+        let Some(v) = value else {
+            let classes = t.get_mut("classes").and_then(Item::as_table_like_mut);
+            if let Some(classes) = classes {
+                classes.remove(tool);
+                if classes.is_empty() {
+                    t.remove("classes");
+                }
+            }
+            return Ok(());
+        };
+        let classes = t
+            .entry("classes")
+            .or_insert_with(|| Item::Value(Value::InlineTable(toml_edit::InlineTable::new())));
+        let classes = (classes.as_table_like_mut())
+            .ok_or_else(|| anyhow::anyhow!("classes of connector {name} is not a table"))?;
+        classes.insert(tool, Item::Value(v.clone()));
+        return Ok(());
+    }
     if let Some(name) = connector(key) {
-        let list = doc.get_mut("mcp").and_then(Item::as_array_of_tables_mut);
-        let t = list
-            .and_then(|l| {
-                l.iter_mut()
-                    .find(|t| t.get("name").and_then(Item::as_str) == Some(name))
-            })
-            .ok_or_else(|| anyhow::anyhow!("no connector named {name}"))?;
+        let t = mcp_table_mut(doc, name)?;
         match value {
             Some(v) => t["enabled"] = Item::Value(v.clone()),
             None => drop(t.remove("enabled")),
@@ -890,12 +1091,20 @@ pub fn kind_json(k: &Kind) -> serde_json::Value {
         Kind::Text { max } => json!({"type": "text", "max": max}),
         Kind::List(o) => json!({"type": "list", "options": o}),
         Kind::Optional(inner) => json!({"type": "optional", "inner": kind_json(inner)}),
+        Kind::Mode(class) => json!({
+            "type": "mode",
+            "class": crate::approvals::class_name(*class),
+            "options": crate::approvals::forms(*class),
+        }),
     }
 }
 
-/// What attached clients call `key`'s row: a connector's row names its connector, since every
-/// connector shares one entry and its rows would otherwise look alike.
+/// What attached clients call `key`'s row: a connector's row names its connector (and a tool's
+/// class row its tool), since such rows share one entry and would otherwise look alike.
 pub fn label(s: &Setting, key: &str) -> String {
+    if let Some((name, tool)) = classes_key(key) {
+        return format!("Connector {name}: {tool}");
+    }
     match connector(key) {
         Some(name) => format!("Connector {name} enabled"),
         None => s.label.to_string(),
@@ -928,13 +1137,20 @@ fn allowed(s: &Setting) -> String {
             Kind::Text { max } => format!("text, up to {max} characters"),
             Kind::List(o) => format!("a comma separated list of {}", o.join(", ")),
             Kind::Optional(inner) => format!("{}, or none", kind(inner)),
+            Kind::Mode(class) => crate::approvals::takes(*class).into(),
         }
     }
-    match s.apply {
-        Apply::Thinking => "one of the levels the model offers (/thinking lists them)".into(),
-        Apply::Subagent => "/subagent add NAME [PROVIDER/MODEL] PROMPT, model, prompt, rm".into(),
-        Apply::Rule => "/rule TEXT, /rule rm N".into(),
-        _ => kind(&s.kind),
+    match (s.apply, &s.kind) {
+        (Apply::Thinking, _) => "one of the levels the model offers (/thinking lists them)".into(),
+        (Apply::Subagent, _) => {
+            "/subagent add NAME [PROVIDER/MODEL] PROMPT, model, prompt, rm".into()
+        }
+        (Apply::Rule, _) => "/rule TEXT, /rule rm N".into(),
+        (_, Kind::Optional(inner)) if s.key.starts_with("approvals.") => {
+            format!("{}, or default (the preset's)", kind(inner))
+        }
+        _ if s.key == "approvals.currency" => "a three-letter ISO 4217 code such as USD".into(),
+        (_, k) => kind(k),
     }
 }
 
@@ -1084,13 +1300,18 @@ mod tests {
             Kind::Text { max } => ("x".into(), vec![String::new(), "x".repeat(max + 1)]),
             Kind::List(o) => (o[0].into(), vec!["nowhere".into()]),
             Kind::Optional(inner) => sample(inner),
+            Kind::Mode(_) => ("ask".into(), vec!["sometimes".into(), "delay 0".into()]),
         }
     }
 
     #[test]
     fn every_registered_key_parses_its_own_default_and_rejects_out_of_bounds() {
         for s in SETTINGS.iter().filter(|s| s.section != READ_ONLY) {
-            let (good, bad) = sample(&s.kind);
+            let (good, bad) = match s.key {
+                // Its own check: a three-letter code.
+                "approvals.currency" => ("EUR".into(), vec!["x".into(), "EURO".into()]),
+                _ => sample(&s.kind),
+            };
             assert!(parse(s, &good).is_ok(), "{} rejected {good}", s.key);
             for b in bad {
                 assert!(parse(s, &b).is_err(), "{} accepted {b:?}", s.key);
@@ -1142,6 +1363,94 @@ mod tests {
             None
         );
         assert_eq!(tighter(find("model").unwrap(), None, Some("a/b")), None);
+    }
+
+    #[test]
+    fn approvals_entries_order_and_read_as_the_spec_says() {
+        let preset = find("approvals.preset").unwrap();
+        assert_eq!(tighter(preset, Some("full"), Some("semi")), Some(true));
+        assert_eq!(tighter(preset, Some("manual"), Some("full")), Some(false));
+        // For strong_only, adding is the stricter way: the opposite of strong_channels.
+        let only = find("approvals.strong_only").unwrap();
+        assert_eq!(
+            tighter(only, Some("loosen"), Some("loosen, money")),
+            Some(true)
+        );
+        assert_eq!(
+            tighter(only, Some("loosen, money"), Some("loosen")),
+            Some(false)
+        );
+        assert!(parse(only, "loosen, all").is_err());
+        let class = find("mcp.mail.classes.send_x").unwrap();
+        assert_eq!(class.key, "mcp.<name>.classes.<tool>");
+        assert_eq!(tighter(class, Some("none"), Some("messages")), Some(true));
+        assert_eq!(tighter(class, Some("messages"), Some("none")), Some(false));
+        assert_eq!(tighter(class, Some("messages"), Some("money")), Some(true));
+        for bad in ["mcp.mail.classes.", "mcp..classes.x", "mcp.a.classes.b.c"] {
+            assert!(find(bad).is_none(), "{bad}");
+        }
+        for key in [
+            "approvals.preset",
+            "approvals.messages",
+            "approvals.posts",
+            "approvals.money",
+            "approvals.facts",
+            "approvals.strong_only",
+            "mcp.mail.classes.x",
+        ] {
+            let s = find(key).unwrap();
+            assert!(s.strong && s.agent == Access::Tighten, "{key}");
+        }
+        let cur = find("approvals.currency").unwrap();
+        assert!(!cur.strong && cur.agent == Access::Propose);
+        assert_eq!(text(&parse(cur, "eur").unwrap()), "EUR");
+        assert!(parse(cur, "euro").is_err() && parse(cur, "E1R").is_err());
+        let money = find("approvals.money").unwrap();
+        assert_eq!(text(&parse(money, "Auto  20").unwrap()), "auto 20");
+        assert_eq!(
+            parse(money, "ask-new").unwrap_err(),
+            "[approvals] money is ask, delay N (1 to 60 minutes), auto or auto N (a cap), \
+             not \"ask-new\""
+        );
+
+        let cfg: Config = toml::from_str(
+            "rpi = 'a'\nhome = 'b'\n[approvals]\npreset = 'semi'\nmoney = 'auto 20'\n\
+             [[mcp]]\nname = 'mail'\ncommand = 'm'\nclasses = { archive = 'posts' }\n",
+        )
+        .unwrap();
+        let v = |key| value(&cfg, key);
+        assert_eq!(v("approvals.preset").as_deref(), Some("semi"));
+        assert_eq!(v("approvals.posts").as_deref(), Some("delay 5"));
+        assert_eq!(v("approvals.money").as_deref(), Some("auto 20"));
+        assert_eq!(v("approvals.facts").as_deref(), Some("hold"));
+        assert_eq!(v("approvals.currency").as_deref(), Some("USD"));
+        assert_eq!(v("approvals.strong_only").as_deref(), Some("loosen"));
+        assert_eq!(v("mcp.mail.classes.archive").as_deref(), Some("posts"));
+        // Without the owner's class, the verb rule's.
+        assert_eq!(v("mcp.mail.classes.send_note").as_deref(), Some("messages"));
+        assert_eq!(v("mcp.mail.classes.get_note").as_deref(), Some("none"));
+        assert_eq!(v("mcp.nope.classes.x"), None);
+        // Cleared, a class follows the preset.
+        assert_eq!(cleared(&cfg, "approvals.money").as_deref(), Some("ask"));
+        assert_eq!(cleared(&cfg, "approvals.facts").as_deref(), Some("hold"));
+        assert_eq!(cleared(&cfg, "budget.daily_tokens"), None);
+
+        let mut doc: DocumentMut = "[[mcp]]\nname = 'mail'\ncommand = 'm'\n".parse().unwrap();
+        let none = Value::from("none");
+        write(&mut doc, "mcp.mail.classes.send_x", Some(&none)).unwrap();
+        assert_eq!(
+            read(&doc, "mcp.mail.classes.send_x").as_deref(),
+            Some("none")
+        );
+        assert!(
+            doc.to_string().contains("classes = { send_x = \"none\" }"),
+            "{doc}"
+        );
+        let cfg: Config = toml::from_str(&format!("rpi = 'a'\nhome = 'b'\n{doc}")).unwrap();
+        assert_eq!(cfg.mcp[0].classes["send_x"], "none");
+        write(&mut doc, "mcp.mail.classes.send_x", None).unwrap();
+        assert_eq!(read(&doc, "mcp.mail.classes.send_x"), None);
+        assert!(write(&mut doc, "mcp.nope.classes.x", Some(&none)).is_err());
     }
 
     #[test]

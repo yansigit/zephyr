@@ -1095,6 +1095,33 @@ async fn settings_lists_sections_with_kinds() {
     assert_eq!(parallel["strong"], false);
     assert_eq!(parallel["until"], Value::Null);
     assert!(parallel["label"].is_string() && parallel["help"].is_string());
+    // The approvals entries (approvals spec §4.3), a new install's manual preset.
+    let approvals = sections
+        .iter()
+        .find(|s| s["name"] == "Approvals")
+        .unwrap_or_else(|| panic!("{got}"));
+    let row = |key: &str| {
+        (approvals["settings"].as_array().unwrap().iter())
+            .find(|s| s["key"] == key)
+            .unwrap_or_else(|| panic!("{key}: {approvals}"))
+            .clone()
+    };
+    let preset = row("approvals.preset");
+    assert_eq!(
+        preset["kind"],
+        json!({"type": "choice", "options": ["manual", "semi", "full"]})
+    );
+    assert_eq!(
+        (&preset["value"], &preset["source"], &preset["strong"]),
+        (&json!("manual"), &json!("default"), &json!(true))
+    );
+    let money = row("approvals.money");
+    assert_eq!(money["kind"]["inner"]["type"], "mode", "{money}");
+    assert_eq!(
+        (&money["value"], &money["source"]),
+        (&json!("ask"), &json!("preset"))
+    );
+    assert_eq!(row("approvals.currency")["value"], "USD");
     let read_only = sections.iter().find(|s| s["name"] == "Read-only").unwrap();
     assert!(read_only["settings"]
         .as_array()

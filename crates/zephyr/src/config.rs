@@ -80,6 +80,9 @@ pub struct Config {
     /// `[settings]`: who may loosen a protected setting (settings spec §2).
     #[serde(default)]
     pub settings: Settings,
+    /// `[approvals]`: how messages, posts and payments wait for the owner (approvals spec §4.3).
+    /// Absent is the `manual` preset. `approvals::effective` reads it.
+    pub approvals: Option<Approvals>,
     /// The file this was loaded from, which a reload reads again. `None` when built in memory.
     #[serde(skip)]
     pub path: Option<PathBuf>,
@@ -200,6 +203,27 @@ fn strong_default() -> Vec<String> {
     vec!["tui".into(), "chat".into()]
 }
 
+/// `[approvals]` (approvals spec §4.3), kept as the file says it: `Config::validate` refuses a
+/// value that does not parse, and `approvals::effective` reads anything that still does not as
+/// the strictest. A class left out follows the preset.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Approvals {
+    /// `manual`, `semi` or `full`; absent is `manual`.
+    pub preset: Option<String>,
+    /// `ask`, `ask-new`, `delay N` or `auto`.
+    pub messages: Option<String>,
+    pub posts: Option<String>,
+    /// `ask`, `delay N`, `auto` or `auto N` (a cap per purchase, in `currency`).
+    pub money: Option<String>,
+    /// ISO 4217; absent is `USD`.
+    pub currency: Option<String>,
+    /// Private facts: `hold`, `warn` or `off`.
+    pub facts: Option<String>,
+    /// What only a strong channel may approve: `loosen`, `money`. Absent is `["loosen"]`.
+    pub strong_only: Option<Vec<String>>,
+}
+
 /// `[agent]`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -249,6 +273,11 @@ pub struct Mcp {
     pub timeout: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// The owner's class for a tool, over the verb rule (approvals spec §4.1): `messages`,
+    /// `posts`, `money` or `none`. The daemon's, never the adapter's: `drafts::filled` leaves it
+    /// out of `mcp.json`, and a draft cannot carry it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub classes: BTreeMap<String, String>,
 }
 
 impl Mcp {
@@ -348,6 +377,18 @@ impl Config {
             if !names.insert(&m.name) {
                 anyhow::bail!("connector name {:?} is used twice", m.name);
             }
+            let classes = crate::approvals::CLASS_CHOICES;
+            if let Some((tool, c)) =
+                (m.classes.iter()).find(|(_, c)| !classes.contains(&c.as_str()))
+            {
+                anyhow::bail!(
+                    "connector {}: classes {tool} is {c:?}; use messages, posts, money or none",
+                    m.name
+                );
+            }
+        }
+        if let Some(a) = &self.approvals {
+            crate::approvals::check(a)?;
         }
         let strong = &self.settings.strong_channels;
         if let Some(bad) = strong
