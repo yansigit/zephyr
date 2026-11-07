@@ -82,6 +82,10 @@ pub enum Stricter {
     More,
     /// An approval mode, ordered by `approvals::stricter`.
     Approval,
+    /// A connector tool's class (approvals spec §4.1): only a move into a class from `none`,
+    /// or none at all, is tighter. Classes have no order of their own (which is stricter
+    /// depends on the modes), so any move out of one is a loosening.
+    IntoClass,
     NotOrdered,
 }
 
@@ -371,7 +375,7 @@ pub static SETTINGS: &[Setting] = &[
         Kind::Choice(&crate::approvals::CLASS_CHOICES),
         Access::Tighten,
         true,
-        Stricter::Earlier,
+        Stricter::IntoClass,
         Apply::Toml,
     ),
     row(
@@ -729,6 +733,16 @@ pub fn tighter(s: &Setting, old: Option<&str>, new: Option<&str>) -> Option<bool
         let class = mode_class(&s.kind)?;
         let parse = |raw| crate::approvals::parse_mode(class, raw).ok();
         return Some(!crate::approvals::stricter(parse(old)?, parse(new)?));
+    }
+    if s.stricter == Stricter::IntoClass {
+        let class = |raw: &str| {
+            let raw = raw.to_ascii_lowercase();
+            crate::approvals::CLASS_CHOICES
+                .contains(&raw.as_str())
+                .then_some(raw)
+        };
+        let (old, new) = (class(old)?, class(new)?);
+        return Some(old == new || old == "none");
     }
     let (a, b) = (rank(&s.kind, old)?, rank(&s.kind, new)?);
     match (s.stricter, a, b) {
@@ -1383,9 +1397,24 @@ mod tests {
         assert!(parse(only, "loosen, all").is_err());
         let class = find("mcp.mail.classes.send_x").unwrap();
         assert_eq!(class.key, "mcp.<name>.classes.<tool>");
+        // Into a class from none, or no move, is tighter; any move out of a class is looser
+        // (spec §4.1): which class is stricter depends on the modes, so none ranks above another.
         assert_eq!(tighter(class, Some("none"), Some("messages")), Some(true));
+        assert_eq!(tighter(class, Some("none"), Some("money")), Some(true));
+        assert_eq!(tighter(class, Some("posts"), Some("posts")), Some(true));
         assert_eq!(tighter(class, Some("messages"), Some("none")), Some(false));
-        assert_eq!(tighter(class, Some("messages"), Some("money")), Some(true));
+        for (old, new) in [
+            ("messages", "money"),
+            ("money", "messages"),
+            ("messages", "posts"),
+        ] {
+            assert_eq!(
+                tighter(class, Some(old), Some(new)),
+                Some(false),
+                "{old} → {new}"
+            );
+        }
+        assert_eq!(tighter(class, Some("none"), Some("spam")), None);
         for bad in ["mcp.mail.classes.", "mcp..classes.x", "mcp.a.classes.b.c"] {
             assert!(find(bad).is_none(), "{bad}");
         }

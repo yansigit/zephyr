@@ -1977,7 +1977,8 @@ impl<'a> Router<'a> {
                             .log_setting(key, old, new, "refused", Some(channel), None);
                     log(refused.map_err(Into::into));
                 }
-                return Outcome::Refused(why);
+                // The key asked for, not the entry it shares (`mcp.<name>.classes.<tool>`).
+                return Outcome::Refused(why.replace(s.key, key));
             }
             Verdict::Propose => {
                 let span = until.map(reg::span);
@@ -2013,6 +2014,8 @@ impl<'a> Router<'a> {
         }
         // What a time limit on a preset goes back to: all of `[approvals]` before the change.
         let mut before = None;
+        // R31: the class time limits an owner's preset ends, as it changes or clears them.
+        let mut ended: Vec<String> = Vec::new();
         let applied = match s.apply {
             Apply::Toml => {
                 let model =
@@ -2024,9 +2027,18 @@ impl<'a> Router<'a> {
             // are one update, worked out from the file as it is under the writer's lock.
             Apply::Preset => {
                 let preset = value.as_ref().map(reg::text);
+                // R31: as any later owner change of a key does, an owner's preset ends the time
+                // limit of each class it changes or clears, so that limit's revert can never
+                // loosen what the preset chose. The agent's never does (R12); the preset's own
+                // limit is set below as usual.
+                let limits: Vec<(String, Option<String>)> = match actor {
+                    Actor::Owner { .. } => (crate::approvals::CLASS_KEYS.iter())
+                        .filter_map(|k| Some((k.to_string(), self.store.revert(k).ok()??.value)))
+                        .collect(),
+                    _ => Vec::new(),
+                };
                 let write = |doc: &mut toml_edit::DocumentMut| {
                     let now: Config = toml::from_str(&doc.to_string())?;
-                    before = Some(crate::approvals::snapshot(&now));
                     let edits = match (restore, preset.as_deref()) {
                         (Some(snapshot), _) => crate::approvals::restore_edits(&now, snapshot)
                             .map_err(|e| anyhow::anyhow!(e))?,
@@ -2037,6 +2049,12 @@ impl<'a> Router<'a> {
                         }
                         (None, None) => anyhow::bail!("no preset to set"),
                     };
+                    let ends: Vec<(String, Option<String>)> = (limits.into_iter())
+                        .filter(|(k, _)| edits.iter().any(|(e, _)| e == k))
+                        .collect();
+                    // A timed preset saves such a class as what its limit would have put back.
+                    before = Some(crate::approvals::snapshot_with(&now, &ends));
+                    ended = ends.into_iter().map(|(k, _)| k).collect();
                     for (key, v) in edits {
                         reg::write(doc, &key, v.map(toml_edit::Value::from).as_ref())?;
                     }
@@ -2081,6 +2099,9 @@ impl<'a> Router<'a> {
         log((self.store.log_setting(key, o, n, &who, channel, proposal)).map_err(Into::into));
         // A change that did not take effect leaves the time limits as they were.
         if !applied.failed {
+            for key in &ended {
+                log(self.store.drop_revert(key).map_err(Into::into));
+            }
             let back = match (s.apply, &s.kind) {
                 // Back to what the file held: unset, or for a setting that has no "none", the
                 // value it had by default.
@@ -2319,7 +2340,10 @@ impl<'a> Router<'a> {
         }
         let strong = &self.cfg.settings.strong_channels;
         match crate::settings::decide(s, &Actor::Owner { channel }, p.strong, strong) {
-            crate::settings::Verdict::Refuse(why) => Some(NotNow::Weak(format!("[zephyr] {why}"))),
+            crate::settings::Verdict::Refuse(why) => Some(NotNow::Weak(format!(
+                "[zephyr] {}",
+                why.replace(s.key, key)
+            ))),
             _ => None,
         }
     }

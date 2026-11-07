@@ -2709,6 +2709,100 @@ async fn the_agent_reads_approvals_tightens_a_class_and_proposes_a_loosening() {
     gw.shutdown().await;
 }
 
+/// Spec §4.1: the agent may move a connector's tool into a class, never out of one. Moving
+/// `send_note` (messages by its name) to money is a loosening when money is looser, so it is
+/// proposed, and from the owner it needs a strong channel; `get_note` (no class) into posts
+/// applies at once.
+#[tokio::test]
+async fn a_tool_moves_into_a_class_at_once_and_out_of_one_only_with_approval() {
+    let home = home("approvals-classes");
+    let mcp = "[[mcp]]\nname = \"mail\"\ncommand = \"m\"";
+    let gw = start(on_file_with_discord(&home, mcp));
+    wait(|| !log(&home, "start").is_empty()).await;
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call gateway {"command": "/set mcp.mail.classes.send_note money"}] [call gateway {"command": "/set mcp.mail.classes.get_note posts"}] reclass"#,
+    )
+    .await;
+    let replies = gw.wait_replies(3).await;
+    let all = replies.join("\n");
+    assert!(
+        all.contains("gateway: proposed as #1")
+            && all.contains("proposes #1: mcp.mail.classes.send_note messages → money\n")
+            && all.contains("/ok 1 · /no 1 · this one needs tui or chat"),
+        "{replies:?}"
+    );
+    assert!(
+        all.contains("gateway: changed mcp.mail.classes.get_note none → posts"),
+        "{replies:?}"
+    );
+    let file = || Config::load(&home.join("zephyr.toml")).unwrap();
+    let classes = file().mcp[0].classes.clone();
+    assert_eq!(classes.get("send_note"), None, "only proposed");
+    assert_eq!(classes["get_note"], "posts");
+
+    let set = "/set mcp.mail.classes.send_note posts";
+    gw.say_on("discord", "d1", "downer", set).await;
+    assert_eq!(
+        gw.wait_replies_on("discord", 1).await,
+        ["[zephyr] loosening mcp.mail.classes.send_note needs tui or chat"]
+    );
+    gw.say("m2", "owner", set).await;
+    assert_eq!(
+        gw.wait_replies(4).await[3],
+        "[zephyr] mcp.mail.classes.send_note messages → posts"
+    );
+    assert_eq!(file().mcp[0].classes["send_note"], "posts");
+    gw.shutdown().await;
+}
+
+/// Ruling R31: a preset the owner sets ends the time limits of the classes it clears, so no
+/// revert later loosens what the preset chose. A timed preset then saves such a class as what
+/// its limit would have gone back to.
+#[tokio::test]
+async fn a_preset_ends_the_time_limits_of_the_classes_it_clears() {
+    let home = home("approvals-r31");
+    let approvals = "[approvals]\npreset = \"semi\"\nmessages = \"delay 10\"";
+    let gw = start(on_file_with_discord(&home, approvals));
+    wait(|| !log(&home, "start").is_empty()).await;
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let revert = |key: &str| store.revert(key).unwrap().map(|r| r.value);
+    gw.say("m1", "owner", "/approvals messages auto for 2h")
+        .await;
+    gw.wait_replies(1).await;
+    assert_eq!(revert("approvals.messages"), Some(Some("delay 10".into())));
+    // `manual` clears messages = auto (looser than its ask), and with it the 2h limit.
+    gw.say_on("discord", "d1", "downer", "/approvals manual")
+        .await;
+    let r = gw.wait_replies_on("discord", 1).await;
+    assert!(
+        r[0].starts_with("[zephyr] approvals.preset semi → manual\n"),
+        "{r:?}"
+    );
+    assert_eq!(revert("approvals.messages"), None);
+    let file = || Config::load(&home.join("zephyr.toml")).unwrap();
+    assert_eq!(file().approvals.unwrap().messages, None);
+
+    // Timed: `manual for 2h` clears posts = auto and its limit; the preset's own revert
+    // brings posts back as delay 10, where its limit would have put it, not as auto.
+    gw.say("m2", "owner", "/approvals semi").await;
+    gw.say("m3", "owner", "/approvals posts delay 10").await;
+    gw.say("m4", "owner", "/approvals posts auto for 2h").await;
+    gw.say("m5", "owner", "/approvals manual for 2h").await;
+    let r = gw.wait_replies(5).await;
+    assert_eq!(revert("approvals.posts"), None, "{r:?}");
+    assert!(
+        r[4].starts_with("[zephyr] approvals.preset semi → manual until "),
+        "{r:?}"
+    );
+    assert_eq!(
+        revert("approvals.preset"),
+        Some(Some("semi; posts=delay 10".into()))
+    );
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_timed_change_reverts_on_the_tick() {
     let home = home("set-timed");

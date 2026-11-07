@@ -62,9 +62,18 @@ const MAX_CAP: u64 = 1_000_000_000;
 /// The `[approvals]` keys a preset sets, in the order `/approvals` shows them.
 const PARTS: [&str; 4] = ["messages", "posts", "money", "facts"];
 
-/// A connector tool's class names, strictest first (the registry's order for
-/// `mcp.NAME.classes.TOOL`); `none` takes the tool out of every class.
-pub const CLASS_CHOICES: [&str; 4] = ["money", "posts", "messages", "none"];
+/// The same keys, dotted, as the registry names them.
+pub const CLASS_KEYS: [&str; 4] = [
+    "approvals.messages",
+    "approvals.posts",
+    "approvals.money",
+    "approvals.facts",
+];
+
+/// A connector tool's class names (`mcp.NAME.classes.TOOL`); `none` takes the tool out of
+/// every class. Unordered: which class is stricter depends on the modes, so the registry counts
+/// only a move into a class from `none` as tightening (`Stricter::IntoClass`).
+pub const CLASS_CHOICES: [&str; 4] = ["messages", "posts", "money", "none"];
 
 /// What `approvals.strong_only` may name.
 pub const STRONG_ONLY: [&str; 2] = ["loosen", "money"];
@@ -360,7 +369,10 @@ pub fn preset_edits(cfg: &Config, preset: Preset) -> Vec<(String, Option<String>
 /// What a timed preset goes back to: the preset as the file names it (`default` when it names
 /// none) and each hand-set class, as `semi; messages=ask; facts=off`.
 pub fn snapshot(cfg: &Config) -> String {
-    let a = cfg.approvals.as_ref();
+    snapshot_of(cfg.approvals.as_ref())
+}
+
+fn snapshot_of(a: Option<&Approvals>) -> String {
     let mut out = (a.and_then(|a| a.preset.as_deref()))
         .unwrap_or("default")
         .trim()
@@ -371,6 +383,25 @@ pub fn snapshot(cfg: &Config) -> String {
         }
     }
     out
+}
+
+/// `snapshot`, with each `approvals.<class>` in `instead` saved as the value given (`None`:
+/// absent) rather than the file's. R31: a class whose own time limit a preset ends is saved as
+/// what that limit would have put back, so the preset's revert never brings back the timed
+/// value with no limit on it.
+pub fn snapshot_with(cfg: &Config, instead: &[(String, Option<String>)]) -> String {
+    let mut a = cfg.approvals.clone().unwrap_or_default();
+    for (key, value) in instead {
+        let slot = match key.strip_prefix("approvals.") {
+            Some("messages") => &mut a.messages,
+            Some("posts") => &mut a.posts,
+            Some("money") => &mut a.money,
+            Some("facts") => &mut a.facts,
+            _ => continue,
+        };
+        *slot = value.clone();
+    }
+    snapshot_of(Some(&a))
 }
 
 /// The edits that put `snapshot` back over `cfg`: the preset and every class as they were.
@@ -604,6 +635,14 @@ mod tests {
         let back = restore_edits(&cfg("[approvals]\npreset = 'full'\n"), &none).unwrap();
         assert_eq!(back[0], edit("approvals.preset", None));
         assert!(restore_edits(&before, "nonsense; x=y").is_err());
+        // R31: a class whose own time limit the preset ends is saved as what that limit
+        // goes back to, never as the timed value.
+        let timed = cfg("[approvals]\npreset = 'semi'\nposts = 'auto'\n");
+        let instead = [edit("approvals.posts", Some("delay 10"))];
+        assert_eq!(snapshot_with(&timed, &instead), "semi; posts=delay 10");
+        let instead = [edit("approvals.posts", None)];
+        assert_eq!(snapshot_with(&timed, &instead), "semi");
+        assert_eq!(snapshot_with(&cfg(""), &[]), "default");
     }
 
     #[test]
