@@ -159,7 +159,9 @@ From Discord or iMessage it is refused, and a proposal that needs one stays wait
 stolen chat session can lower a limit but not lift it. An approval is checked when you give it: if
 the setting changed since the card was made, `/ok` says so and drops the proposal, and a waiting
 `/subagent` or `/rule` proposal goes stale when the subagents or the rules change. The agent never
-removes or replaces a time limit you set. From any channel: `/model` shows the models, `/model PROVIDER/MODEL` switches (to the account on that
+removes or replaces a time limit you set.
+
+From any channel: `/model` shows the models, `/model PROVIDER/MODEL` switches (to the account on that
 provider), `/thinking` shows how hard the model thinks and `/thinking LEVEL` or `/thinking next`
 changes it from the next request (kept until the daemon restarts), `/status` shows the agent's account and model, `/reload` re-reads the files, and `/new` (or `/clear`)
 starts a fresh conversation (memory and rules carry over; the old one stays in `sessions/`), and
