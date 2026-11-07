@@ -54,8 +54,8 @@ Nothing in this spec adds multi-user state to the daemon.
   showing `old → new` in the daemon's words. Settings marked `never` cannot be changed or
   proposed by the agent.
 - **Strong channels.** Loosening a setting marked `strong`, whether typed by the owner or approved
-  from a proposal, is accepted only from a strong channel: the TUI today, the web app with a
-  passkey later (W). A stolen Discord or iMessage session cannot loosen it.
+  from a proposal, is accepted only from a strong channel: the TUI and the root-only chat socket (`chat`), the
+  web app with a passkey later (W). A stolen Discord or iMessage session cannot loosen it.
 - Any change can be time-limited (`… for 2h`); it reverts on its own and the owner is told.
 - The TUI gets a `/settings` panel: sections, current values and where each came from, an
   editor per type, and a **Waiting** tab that approves or drops pending proposals.

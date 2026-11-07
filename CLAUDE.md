@@ -56,6 +56,12 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   `oauth` RPC). A new token only binds after a child restart, done when idle.
 - `reload.rs`: live settings. `diff` returns the least disruptive `Plan`: read-in-place, `set_model`,
   restart the child (same session), or re-exec the daemon. Config edits go through `toml_edit` to keep comments.
+- `settings.rs` (DESIGN §4.17): the registry of settings (`SETTINGS`: kind, the agent's `Access`, `strong`,
+  how a change is stricter), pure, with the texts the owner reads. The router's `set_setting` is the
+  one write path for `/set`, `/model`, `/task`, `/subagent`, `/rule`, the attach methods, the panel
+  and the agent's `gateway` `/set`; a loosening of a `strong` setting needs a channel in
+  `[settings] strong_channels` (default `tui`, `chat`); changes land in `settings_log`, time limits
+  in `setting_reverts` and are undone on the tick. A new setting is one row in the table.
 - `scheduler.rs` (cron jobs, run ledger: interrupted runs become `unknown`, never auto-retried;
   `execute` is the unattended-run path jobs and tasks share), `tasks.rs` (background tasks the agent
   starts with its `task` tool, DESIGN §4.12: at most `[tasks] parallel` at once, default 2, each

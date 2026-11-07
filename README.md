@@ -53,7 +53,9 @@ zephyr login openai-codex --account codex-main
 | `zephyr packages add NAME.. \| rm NAME.. \| list` | Ubuntu (apt) packages for the agent, baked into a local image (`zephyr-local:<version>-<hash>`) on the release one; `up` and `upgrade` build it, and `add`/`rm` rebuild and recreate the container once the agent is idle |
 | `zephyr vault list \| add login NAME --site URL [--user U] [--totp] \| add token NAME \| edit NAME \| rm NAME \| revoke NAME [PROGRAM]` | Logins and tokens the agent uses by name (see [The vault](#the-vault)); values are asked for hidden, or read one per line from stdin when piped, never taken as arguments |
 | `zephyr subagent list \| add NAME [--model P/M] [--prompt TEXT] \| edit NAME [--model P/M\|default] [--prompt TEXT] \| rm NAME` | The named subagents the agent starts background tasks as (see [Background tasks](#the-agents-browser-and-desktop)); without `--prompt`, the prompt is read from stdin when piped |
-| `zephyr config get\|set KEY [VALUE]` | Edit `zephyr.toml` (comments are kept; invalid keys are refused), e.g. `config set tasks.parallel 16` or `config set tasks.model PROVIDER/MODEL` |
+| `zephyr config get\|set KEY [VALUE]` | Read or edit `zephyr.toml` (comments are kept; a change that would make it invalid is refused), e.g. `config set tasks.parallel 16` or `config set tasks.model PROVIDER/MODEL`. A key in the [settings list](#changing-settings) goes through the running daemon, which checks it, logs it and applies it. Any other key prints a warning that it is saved without checking, and is saved. With no daemon running, the file is edited directly and applies at the next start |
+| `/settings [SECTION\|KEY]` | From any channel: every setting by section with its value and where it came from (`default`, `you`, `agent (#N)`, `until HH:MM`); with a section or a key, its help line, what it takes and who may change it. In `zephyr attach` it opens the settings panel |
+| `/set KEY VALUE [for DURATION]` | From any channel: change a setting, e.g. `/set tasks.parallel 4` or `/set budget.daily_cost_usd 10 for 1d` (`zephyr set KEY VALUE` does the same inside the container) |
 | `zephyr attach [--stock]` | Zephyr's terminal UI on the live session: history, tool calls, what the agent is doing, the queue and today's spend; `^D` detaches and the agent keeps running. `--stock` runs the stock `rpi --connect` client instead |
 | `zephyr shell [bash\|zsh]` | A login shell in the container as the agent, in its home (`/zephyr`) and on its desktop; needs a terminal |
 | `zephyr chat` | The same UI on a terminal; a line client (`< reply` per line) when piped or scripted |
@@ -106,6 +108,17 @@ In `zephyr attach` (`?` lists all of these):
 | `Home` / `End` | Top or bottom of the conversation, when the composer is empty |
 | `/focus` | Hide tool calls and thinking (again to show them); `focus` shows in the footer |
 
+In the settings panel (`/settings`; `?` lists these):
+
+| Key | What it does |
+|---|---|
+| `↑` / `↓`, `→` / `←` | Choose a section, then a setting in it; `←` goes back to the sections |
+| `Enter` | Edit the setting: a list for a choice or a true-or-false setting, the model picker for a model, a one-line field for a number or text. On a proposal under Waiting, the whole card |
+| `Space` | Turn a true-or-false setting over at once |
+| `t` (or `Tab` in an editor) | Add a time limit (`30m`, `2h`, `1d`); the setting goes back by itself |
+| `o` / `1` / `d` | Under Waiting: approve a proposal, approve it once (the same as `o` for a setting), or drop it |
+| `Esc` | Back, or close the panel |
+
 Drafts put aside are gone when you detach; the history starts again from the messages in the conversation. The footer shows `ctx N%`, how full the model's context is after the last reply.
 
 The window title shows `◇` idle, `✦` working and `✋` when something waits for your OK, and the tab
@@ -126,8 +139,27 @@ Changes apply by themselves; nothing needs `zephyr restart`. The commands above,
 | A model on another provider, the active account, extensions, connectors (`[[mcp]]`), subagents (`[[subagent]]`), a re-login | the agent restarts after the reply in progress; the conversation carries on |
 | Discord, iMessage, `[attach]`, `[agent]`, a secret | the daemon restarts itself in place once idle; waiting messages are kept |
 
-A file that does not load is not applied, and the daemon keeps its current settings. From any
-channel: `/model` shows the models, `/model PROVIDER/MODEL` switches (to the account on that
+A file that does not load is not applied, and the daemon keeps its current settings.
+
+Most settings are in one registry, so the same change works from a command, the panel in
+`zephyr attach` (`/settings`), `zephyr config set` and the agent. `/settings` lists them; `/set KEY
+VALUE` changes one, and `/set KEY VALUE for 2h` changes it for a while (30 seconds to 30 days): it
+goes back by itself and you are told. The agent can read all of them. What it may change:
+
+| Setting | The agent may |
+|---|---|
+| `tasks.parallel`, `mcp.NAME.enabled` (a connector off), `settings.strong_channels` (remove a channel), the `budget.*` limits | make it stricter at once (lower, off, fewer channels, a limit where there was none); you are told and `/set KEY OLD` puts it back |
+| `model`, `thinking`, `tasks.model`, `timezone`, `auth.*`, subagents, rules, and any change of the above that loosens | propose it: a card shows `KEY old → new` (or the exact `/subagent` or `/rule` text, up to 1500 characters), and `/ok N` applies it, `/no N` drops it |
+| `owners`, `[discord]`, `[imessage]`, `[attach]`, `[agent]`, `extensions`, `policy_plugin`, `rpi`, `home`, `state`, the `[[account]]` pool | nothing; edit `zephyr.toml` |
+
+The `budget.*` limits and `settings.strong_channels` are protected: raising a limit, or adding a
+channel, is accepted only from a strong channel, by default `zephyr attach` and the chat socket
+that `zephyr chat` and the host CLI use (`[settings] strong_channels`; the TUI can't be removed).
+From Discord or iMessage it is refused, and a proposal that needs one stays waiting for it, so a
+stolen chat session can lower a limit but not lift it. An approval is checked when you give it: if
+the setting changed since the card was made, `/ok` says so and drops the proposal, and a waiting
+`/subagent` or `/rule` proposal goes stale when the subagents or the rules change. The agent never
+removes or replaces a time limit you set. From any channel: `/model` shows the models, `/model PROVIDER/MODEL` switches (to the account on that
 provider), `/thinking` shows how hard the model thinks and `/thinking LEVEL` or `/thinking next`
 changes it from the next request (kept until the daemon restarts), `/status` shows the agent's account and model, `/reload` re-reads the files, and `/new` (or `/clear`)
 starts a fresh conversation (memory and rules carry over; the old one stays in `sessions/`), and
@@ -228,7 +260,8 @@ goes on too long, and you are told why. A job run also stops after 30 minutes.
 ## Standing rules
 
 `/rule never push to main` adds a rule the agent sees first in every session, above its memory,
-from the next message on. `/rules` lists them, `/rule rm 2` removes one. Rules live with the
+from the next message on. `/rules` lists them, `/rule rm 2` removes one. The agent can propose a
+rule or a removal; it never takes effect until you `/ok` the card, which shows the rule whole. Rules live with the
 daemon, out of the agent's reach, and do not fade when a long conversation is summarised the way
 instructions given in chat can. `/new` starts a fresh conversation; rules and memory carry over, and `/switch` goes back to an earlier one.
 
@@ -274,10 +307,12 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   PDF) with its reply. Its `schedule` tool only proposes a job: you are shown it, and it runs after
   `/job ok N` (`/job rm N` drops it; `/job list` marks the ones waiting).
 - **Commands.** The agent's `gateway` tool runs `/status`, `/model`, `/switch`, `/rules`,
-  `/memory diff`, `/memory log` or `/job list` and reads the output in the same turn. It can only
-  propose `/model PROVIDER/MODEL`, `/new`, `/switch ID`, `/pause` or `/reload`: you are asked
+  `/memory diff`, `/memory log`, `/job list` or `/settings` and reads the output in the same turn. It
+  can change a setting with `/set KEY VALUE [for D]` (stricter at once, else proposed; see
+  [Changing settings](#changing-settings)), and propose `/model PROVIDER/MODEL`, `/new`, `/switch ID`,
+  `/pause`, `/reload`, `/subagent …` or `/rule …`: you are asked
   (`the agent asks to run /new (#3)`), `/ok 3` runs it exactly as if you had typed it, and `/no 3`
-  drops it (a proposal lapses after 24 hours). Approvals (`/ok`, `/memory ok`, `/job ok`, `/rule`,
+  drops it (a proposal lapses after 24 hours). Approvals (`/ok`, `/memory ok`, `/job ok`,
   `/login`, `/resume`) and `/stop` are never proposable, so text the agent read cannot approve
   itself. In a scheduled job it gets no answer and proposes nothing.
 - **Background tasks.** You can keep talking while the agent works. It hands anything that takes
@@ -301,7 +336,8 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   ```
 
   A task's model is the one the agent names, else its subagent's, else `[tasks] model`, else the
-  account's own. Only you set these: from any channel `/subagent` lists them,
+  account's own. You set these from any channel, and the agent may propose a change (a card shows
+  the exact command; `/ok N` applies it only if the subagents are unchanged since): `/subagent` lists them,
   `/subagent add NAME [PROVIDER/MODEL] PROMPT`, `/subagent model NAME PROVIDER/MODEL|default`,
   `/subagent prompt NAME PROMPT` and `/subagent rm NAME` edit them, and `/task parallel N` and
   `/task model PROVIDER/MODEL|default` set the defaults (`zephyr subagent` and `zephyr config set`
