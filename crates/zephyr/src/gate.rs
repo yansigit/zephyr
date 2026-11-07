@@ -29,6 +29,8 @@ pub const WAIT_MINUTES: u32 = 10;
 pub const OUTBOUND: &str = "outbound";
 /// What a call whose private facts could not be read is held as.
 pub const UNREADABLE: &str = "your private facts could not be read";
+/// Why values are not shown when a fact is split across them.
+const SPLIT: &str = "it holds a private fact split across its values";
 /// The most of a call's arguments an audit row keeps, in bytes.
 const AUDIT_ARGS: usize = 500;
 /// The longest command or arguments a card shows.
@@ -283,7 +285,9 @@ impl Call {
         let origin = origin_of(&b.origin);
         let typing = matches!(b.action.as_str(), "fill" | "type");
         let unread = !typing && b.role.trim().is_empty();
-        let class = match typing || unread {
+        // R39: with no role, a readable name still gives its class (`browser_class` reads an
+        // empty role as a button's); the action is held either way.
+        let class = match typing {
             true => None,
             false => {
                 let (role, name) = (&b.role, &b.name);
@@ -297,7 +301,9 @@ impl Call {
         let name = quoted_cut(&b.name, 80);
         let summary = match b.action.as_str() {
             _ if typing => format!("typing on {origin}"),
-            _ if unread => format!("a click the gate could not read on {origin}"),
+            _ if unread && name.is_empty() => {
+                format!("a click the gate could not read on {origin}")
+            }
             "press" | "keyboard" if name.is_empty() => format!("Enter on {origin}"),
             "press" | "keyboard" => format!("Enter in \"{name}\" on {origin}"),
             _ => format!("click \"{name}\" on {origin}"),
@@ -324,33 +330,44 @@ impl Call {
     }
 }
 
-/// Every string, number and key in `v`, decoded, one per line: what the facts are looked for in
-/// (C2). The newline join also catches a value split across two of them.
+/// Every string and number in `v`, decoded, one per line, then every key: what the facts are
+/// looked for in (C2). The newline join also catches a value split across two of them, and the
+/// keys come after all the values, so `{"area": "555", "number": "010-2345"}` reads
+/// `555\n010-2345`, one number.
 fn decoded(v: &Value) -> String {
-    let mut out = Vec::new();
-    leaves(v, &mut out);
-    out.join("\n")
+    let (mut values, mut keys) = (Vec::new(), Vec::new());
+    leaves(v, &mut values, &mut keys);
+    values.append(&mut keys);
+    values.join("\n")
 }
 
-fn leaves(v: &Value, out: &mut Vec<String>) {
+/// The values of `v` alone, keys left out, one per line: the join a split fact is looked for in.
+fn values_of(v: &Value) -> String {
+    let (mut values, mut keys) = (Vec::new(), Vec::new());
+    leaves(v, &mut values, &mut keys);
+    values.join("\n")
+}
+
+fn leaves(v: &Value, values: &mut Vec<String>, keys: &mut Vec<String>) {
     match v {
-        Value::String(s) => out.push(s.clone()),
-        Value::Number(n) => out.push(n.to_string()),
-        Value::Array(items) => items.iter().for_each(|i| leaves(i, out)),
+        Value::String(s) => values.push(s.clone()),
+        Value::Number(n) => values.push(n.to_string()),
+        Value::Array(items) => items.iter().for_each(|i| leaves(i, values, keys)),
         Value::Object(map) => {
             for (k, v) in map {
-                out.push(k.clone());
-                leaves(v, out);
+                keys.push(k.clone());
+                leaves(v, values, keys);
             }
         }
         Value::Bool(_) | Value::Null => {}
     }
 }
 
-/// Agent or page text as part of one card or notice line: control and bidi characters dropped,
-/// whitespace folded, cut (C1; `settings::quoted_cut`'s rules).
+/// Agent or page text as part of one card or notice line, not between quotes: control and bidi
+/// characters dropped, whitespace folded, cut (C1; `settings::one_line`). Text between quotes
+/// goes through `quoted_cut`, which escapes its quotes too (R41).
 fn one_line(text: &str) -> String {
-    quoted_cut(text, LINE_CHARS)
+    crate::settings::one_line(text, LINE_CHARS)
 }
 
 /// The vault's and the private facts' values, loaded once for one decision or one card, and
@@ -403,15 +420,22 @@ impl Scrub {
     }
 
     /// `v` scrubbed and written as JSON. A fact split across values, each part too short to
-    /// match alone, still matches their join: then none of it is shown.
+    /// match alone, still matches their join (values only, keys left out): then none of it is
+    /// shown.
     fn json(&self, v: &Value) -> String {
         let clean = self.value(v);
-        if let Ok(f) = &self.facts {
-            if !names_in(f, &decoded(&clean), &[]).is_empty() {
-                return "[withheld: it holds a private fact split across its values]".into();
-            }
+        match self.split(&values_of(&clean)) {
+            true => format!("[withheld: {SPLIT}]"),
+            false => clean.to_string(),
         }
-        clean.to_string()
+    }
+
+    /// Whether `joined`, values already scrubbed one by one, still holds a fact: one split
+    /// across them.
+    fn split(&self, joined: &str) -> bool {
+        self.facts
+            .as_ref()
+            .is_ok_and(|f| !names_in(f, joined, &[]).is_empty())
     }
 }
 
@@ -500,9 +524,9 @@ enum Plan {
     Delay(u32),
 }
 
-/// The names of the facts in `text`, once each. A fact is skipped only for a call whose every
-/// target it is allowed to go to.
-fn names_in(facts: &[Fact], text: &str, targets: &[String]) -> Vec<String> {
+/// The names of the facts in `text`, once each. R38: a fact is skipped only for a call with
+/// recipients every one of which its `allow` list names; `unknown` is never in it.
+fn names_in(facts: &[Fact], text: &str, recipients: &[String]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut add = |found: Vec<&str>| {
         for n in found {
@@ -511,13 +535,23 @@ fn names_in(facts: &[Fact], text: &str, targets: &[String]) -> Vec<String> {
             }
         }
     };
-    match targets {
+    match recipients {
         [] => add(facts::found(facts, text, None)),
-        all => all
-            .iter()
-            .for_each(|t| add(facts::found(facts, text, Some(t)))),
+        all => all.iter().for_each(|t| {
+            let target = (t != UNKNOWN).then_some(t.as_str());
+            add(facts::found(facts, text, target))
+        }),
     }
     names
+}
+
+/// The targets of a call that are where it goes, for a fact's `allow` list (R38): a connector
+/// call's first target is its `server/tool`, the medium, not a recipient.
+fn recipients(kind: ActionKind, targets: &[String]) -> &[String] {
+    match kind {
+        ActionKind::Pass => targets.get(1..).unwrap_or_default(),
+        _ => targets,
+    }
 }
 
 /// `contains your private fact phone`, or `facts a, b`.
@@ -611,7 +645,7 @@ impl Gate<'_> {
         let found = match (e.facts, &self.scrub.facts) {
             (FactsMode::Off, _) => Found::Nothing,
             (_, Err(_)) => Found::Unreadable,
-            (_, Ok(f)) => match names_in(f, &call.text, &call.targets) {
+            (_, Ok(f)) => match names_in(f, &call.text, recipients(call.kind, &call.targets)) {
                 names if names.is_empty() => Found::Nothing,
                 names => Found::Names(names),
             },
@@ -718,7 +752,8 @@ impl Gate<'_> {
             Found::Nothing => self.shown(&call.summary),
         };
         let reason = (req.reason.as_deref())
-            .map(|r| quoted(&self.scrub.text(r)))
+            // One line and cut, not yet escaped: the card quotes it (once) when it shows it.
+            .map(|r| one_line(&self.scrub.text(r)))
             .filter(|r| !r.is_empty());
         let new = NewAction {
             kind: call.kind,
@@ -862,13 +897,13 @@ pub fn card(a: &Action, cfg: &Config, store: &Store) -> String {
             run_lines(cfg, a, class, &targets, command, &clean)
         }
         ActionKind::Pass => pass_lines(a, class, &targets, &scrub),
-        ActionKind::Wait => wait_lines(class, &targets, browser.as_ref(), &clean),
+        ActionKind::Wait => wait_lines(class, &targets, browser.as_ref(), &scrub),
     });
     if e.facts != FactsMode::Off {
         match &scrub.facts {
             Err(_) => lines.push(UNREADABLE.into()),
             Ok(f) => {
-                let names = names_in(f, &checked_text(a), &a.targets);
+                let names = names_in(f, &checked_text(a), recipients(a.kind, &a.targets));
                 if !names.is_empty() {
                     lines.push(fact_note(&names));
                 }
@@ -975,7 +1010,7 @@ fn run_lines(
             let title = title.map_or(String::new(), |t| {
                 format!(" · title: \"{}\"", quoted_cut(&t, LINE_CHARS))
             });
-            let label = quoted_cut(&clean(&label), LINE_CHARS);
+            let label = one_line(&clean(&label));
             if !label.is_empty() || !title.is_empty() {
                 lines.push(format!("{label}{title}"));
             }
@@ -1031,32 +1066,42 @@ fn amount(m: &Amount) -> String {
 
 /// A browser action's lines: the origin, the page and the control, what was typed, and for a
 /// payment that the amount could not be read (the wrapper reads none). `browser` is the
-/// request decoded; each of its fields is scrubbed on its own (C2).
+/// request decoded; each of its fields is scrubbed on its own (C2), and what was typed is not
+/// shown at all when a fact is split across its entries.
 fn wait_lines(
     class: Option<Class>,
     targets: &[String],
     browser: Option<&Browser>,
-    clean: &dyn Fn(&str) -> String,
+    scrub: &Scrub,
 ) -> Vec<String> {
     let mut lines = vec![format!("on: {}", targets.join(", "))];
     let Some(b) = browser else {
         lines.push("page: could not be read".into());
         return lines;
     };
-    let page = format!("page: \"{}\"", quoted_cut(&clean(&b.url), LINE_CHARS));
-    let name = quoted_cut(&clean(&b.name), LINE_CHARS);
+    let page = format!("page: \"{}\"", quoted_cut(&scrub.text(&b.url), LINE_CHARS));
+    let name = quoted_cut(&scrub.text(&b.name), LINE_CHARS);
+    // R39: a control with no role is one the gate could not read; its name, when there is one,
+    // still shows (and gave the class).
     let unread = b.role.trim().is_empty();
     lines.push(match b.action.as_str() {
         "fill" | "type" => page,
-        _ if unread => format!("{page} · the control could not be read"),
+        _ if unread && name.is_empty() => format!("{page} · the control could not be read"),
+        _ if unread => format!("{page} · button: \"{name}\" (its role could not be read)"),
         "press" | "keyboard" => format!("{page} · key: Enter in \"{name}\""),
         _ => format!("{page} · button: \"{name}\""),
     });
     if !b.typed.is_empty() {
-        let typed: Vec<String> = (b.typed.iter())
-            .map(|t| format!("\"{}\"", quoted_cut(&clean(t), LINE_CHARS)))
-            .collect();
-        lines.push(format!("typed: {}", typed.join(" · ")));
+        let typed: Vec<String> = b.typed.iter().map(|t| scrub.text(t)).collect();
+        match scrub.split(&typed.join("\n")) {
+            true => lines.push(format!("typed: [withheld: {SPLIT}]")),
+            false => {
+                let typed: Vec<String> = (typed.iter())
+                    .map(|t| format!("\"{}\"", quoted_cut(t, LINE_CHARS)))
+                    .collect();
+                lines.push(format!("typed: {}", typed.join(" · ")));
+            }
+        }
     }
     if class == Some(Class::Money) {
         lines.push("amount: could not be read".into());
@@ -1484,9 +1529,24 @@ mod tests {
             )),
             "{card}"
         );
+        // A copy to someone new holds a send to a known recipient (R37 amended: cc and bcc).
+        let mail = [
+            "mail/send_email".to_string(),
+            "alice@example.com".to_string(),
+        ];
+        h.store.remember_targets("messages", &mail).unwrap();
+        let email = |arguments: Value| {
+            let req = mcp("mail", "send_email", arguments, "task-6");
+            decide(&h.cfg, &h.store, &req, owner(), now)
+        };
+        let to = email(json!({"to": "alice@example.com", "body": "hi"}));
+        assert_eq!(to, Verdict::Allow);
+        held(&email(
+            json!({"to": "alice@example.com", "cc": "eve@example.org", "body": "hi"}),
+        ));
         assert_eq!(
             outcomes(&h.store),
-            ["known", "known", "held", "held", "held", "known", "held", "held"]
+            ["known", "known", "held", "held", "held", "known", "held", "held", "known", "held"]
         );
     }
 
@@ -1727,6 +1787,8 @@ mod tests {
             json!({"address": "12 Oak Street,\nSpringfield"}),
             json!({"phone": "555\n010\n2345"}),
             json!({"lines": ["12 Oak Street,", "Springfield"]}),
+            // Two fields of one number: their keys must not break the digit run.
+            json!({"area": "555", "number": "010-2345"}),
         ];
         for (i, arguments) in values.into_iter().enumerate() {
             let req = mcp("crm", "update_contact", arguments, &format!("facts:{i}"));
@@ -1774,6 +1836,39 @@ mod tests {
         );
         assert!(card.contains("typed: \"[fact:addr]\""), "{card}");
         assert!(!card.contains("Oak Street"), "{card}");
+        // A value typed in two entries is held, and neither entry is shown.
+        for (i, typed) in [["555", "010 2345"], ["12 Oak Street,", "Springfield"]]
+            .into_iter()
+            .enumerate()
+        {
+            let mut split = click("", "https://forms.example.com", &format!("facts:split{i}"));
+            if let Some(b) = split.browser.as_mut() {
+                b.action = "fill".into();
+                b.typed = typed.iter().map(|t| t.to_string()).collect();
+            }
+            held(&decide(&h.cfg, &h.store, &split, owner(), now));
+            let card = notices(&h.store).pop().unwrap();
+            assert!(card.contains("\ntyped: [withheld: "), "{card}");
+            for value in typed {
+                assert!(!card.contains(value), "{value} in {card}");
+            }
+        }
+        // R38: a fact's allow list is compared with the recipients, not the connector's tool.
+        let to = |to: Value, run: &str| {
+            let req = mcp(
+                "mail",
+                "send_email",
+                json!({"to": to, "body": "call 5550102345"}),
+                run,
+            );
+            decide(&h.cfg, &h.store, &req, owner(), now)
+        };
+        assert_eq!(
+            to(json!("carol@example.com"), "facts:carol"),
+            Verdict::Allow
+        );
+        let both = json!(["carol@example.com", "dave@example.com"]);
+        held(&to(both, "facts:dave"));
         // C1: the owner's notice that a fact went somewhere is one line, whatever the agent named.
         let slack = mcp(
             "slack",
@@ -2013,6 +2108,33 @@ mod tests {
             }
             assert!(!shown.contains('\u{202e}'), "{shown}");
         }
+        // R41: a quote inside quoted text is escaped, so it cannot close the quote and add text
+        // that reads as the daemon's.
+        let subject = "himalaya message send <<'EOF'\nTo: alice@example.com\n\
+                       Subject: Hi\" · to: boss@corp.com\n\nHello.\nEOF";
+        held(&decide(
+            &h.cfg,
+            &h.store,
+            &exec(subject, "card:6"),
+            owner(),
+            now,
+        ));
+        let shown = notices(&h.store).pop().unwrap();
+        assert!(
+            shown.contains("\nto: alice@example.com · subject: \"Hi\\\" · to: boss@corp.com\"\n"),
+            "{shown}"
+        );
+        let button = click(
+            "Send\" · on: https://bank.example.com",
+            "https://mail.example.com",
+            "card:7",
+        );
+        held(&decide(&h.cfg, &h.store, &button, owner(), now));
+        let shown = notices(&h.store).pop().unwrap();
+        assert!(
+            shown.contains("· button: \"Send\\\" · on: https://bank.example.com\"\n"),
+            "{shown}"
+        );
     }
 
     #[test]
@@ -2092,6 +2214,30 @@ mod tests {
             outcomes(&h.store),
             ["held", "held", "held", "held", "denied", "held"]
         );
+        // R39: no role but a readable name keeps the class the name gives; still held, and the
+        // card shows the button and what a payment needs.
+        let strong = config(
+            &h.dir,
+            "[approvals]\npreset = 'full'\nstrong_only = ['loosen', 'money']\n",
+        );
+        let mut buy = click("Place order", "https://shop.example.com", "unread:5");
+        if let Some(b) = buy.browser.as_mut() {
+            b.role = String::new();
+        }
+        let Verdict::Wait { id } = decide(&strong, &h.store, &buy, owner(), now) else {
+            panic!("an unreadable order button waits")
+        };
+        assert_eq!(action(&h.store, id).class, "money");
+        let card = notices(&h.store).pop().unwrap();
+        assert!(
+            card.starts_with(&format!(
+                "[zephyr] approve #{id}: payment (browser)\non: https://shop.example.com\n\
+                 page: \"https://shop.example.com/compose\" · button: \"Place order\" (its role \
+                 could not be read)\namount: could not be read\n"
+            )),
+            "{card}"
+        );
+        assert!(card.ends_with("· this one needs tui or chat"), "{card}");
     }
 
     #[test]

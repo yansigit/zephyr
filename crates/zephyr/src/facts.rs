@@ -192,6 +192,23 @@ fn decoded(text: &str) -> Option<Vec<Piece>> {
     Some(out)
 }
 
+/// Whether `c` shows nothing and so cannot keep a value from being one (R40): a control that is
+/// not whitespace, a zero-width or direction mark, or a byte-order mark. A line break and a tab
+/// are spacing, not invisible.
+fn invisible(c: char) -> bool {
+    (c.is_control() && !c.is_whitespace())
+        || matches!(
+            c,
+            '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}'
+        )
+}
+
+/// `view` without its invisible characters.
+fn visible(mut view: Vec<Piece>) -> Vec<Piece> {
+    view.retain(|p| !invisible(p.0));
+    view
+}
+
 /// `view` after NFKC, lower case and collapsing runs of whitespace to one space; a character
 /// keeps the range it came from, so a match maps back to the text it was found in.
 fn folded(view: &[Piece]) -> Vec<Piece> {
@@ -286,9 +303,10 @@ fn spans(f: &Fact, text: &str) -> Vec<(usize, usize)> {
         return Vec::new();
     }
     let mut out = Vec::new();
-    // The value as written, in the text's own terms: case, spacing and Unicode forms ignored.
+    // The value as written, in the text's own terms: case, spacing, Unicode forms and invisible
+    // characters ignored.
     let pattern: Vec<char> = {
-        let p: Vec<char> = folded(&raw(&f.value))
+        let p: Vec<char> = folded(&visible(raw(&f.value)))
             .into_iter()
             .map(|(c, ..)| c)
             .collect();
@@ -299,8 +317,9 @@ fn spans(f: &Fact, text: &str) -> Vec<(usize, usize)> {
         p[from..to.max(from)].to_vec()
     };
     let value = digits_of(&f.value);
-    // The text as it is, and percent-decoded (a URL, a form body).
-    let views = std::iter::once(raw(text)).chain(decoded(text));
+    // The text as it is, and percent-decoded (a URL, a form body), its invisible characters
+    // left out: a match still spans them, so scrubbing removes them with the value (R40).
+    let views = std::iter::once(raw(text)).chain(decoded(text)).map(visible);
     for view in views {
         if f.kind == FactKind::Digits {
             for (a, b, run) in runs(&view) {
@@ -804,6 +823,31 @@ mod tests {
         ] {
             assert_eq!(redact(cmd), want, "{cmd}");
         }
+    }
+
+    #[test]
+    fn invisible_characters_hide_no_fact() {
+        // R40: control, direction and zero-width characters count as absent, matching and
+        // scrubbing; a line break still counts as the space it is.
+        let facts = [
+            fact("phone", FactKind::Digits, "5550102345"),
+            fact("addr", FactKind::Text, "12 Oak Street, Springfield"),
+            fact("mail", FactKind::Email, "owner@example.com"),
+        ];
+        for (text, name) in [
+            ("555\u{202e}0102345", "phone"),
+            ("555\u{200b}010\u{feff}2345", "phone"),
+            ("555\u{7}010\u{2066}2345", "phone"),
+            ("12 Oak\u{200d} Street,\u{2060} Spring\u{200f}field", "addr"),
+            ("12 Oak Street,\nSpringfield", "addr"),
+            ("owner\u{202d}@exam\u{200c}ple.com", "mail"),
+        ] {
+            assert_eq!(found(&facts, text, None), [name], "{text:?}");
+            let out = scrub(&facts, &format!("x {text} y"));
+            assert_eq!(out, format!("x [fact:{name}] y"), "{text:?}");
+        }
+        // An invisible character is no separator: digits on either side of a letter still are not.
+        assert!(found(&facts, "555\u{202e}x0102345", None).is_empty());
     }
 
     #[test]

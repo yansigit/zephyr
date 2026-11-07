@@ -1009,8 +1009,19 @@ pub(crate) fn quoted(text: &str) -> String {
 }
 
 /// `quoted`, cut at `max` characters: for text that is not the agent's reason but is still not
-/// the daemon's (a message's subject, a command a card shows).
+/// the daemon's (a message's subject, a command a card shows). R41: it goes between quotes, so
+/// a quote inside is escaped as `\"` and a backslash as `\\` (else `\"` would undo the escape):
+/// the text can never close its quote and add words that read as the daemon's.
 pub(crate) fn quoted_cut(text: &str, max: usize) -> String {
+    one_line(text, max)
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+/// Text that is not the daemon's as part of one line, not between quotes (a recipient, a
+/// summary): control and direction characters dropped, whitespace folded, cut at `max`
+/// characters. Applied twice it gives the same text, so a stored line can be shown again.
+pub(crate) fn one_line(text: &str, max: usize) -> String {
     let clean: String = (text.chars())
         .map(|c| {
             match c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
@@ -1296,6 +1307,21 @@ mod tests {
             "{q:?}"
         );
         assert!(q.starts_with("fine txt") && q.contains("and more"), "{q:?}");
+    }
+
+    #[test]
+    fn a_quoted_text_cannot_close_its_quote() {
+        // R41: a quote inside is escaped, and a backslash too, so `\"` cannot undo the escape.
+        assert_eq!(
+            super::quoted(r#"Hi" · to: boss@corp.com"#),
+            r#"Hi\" · to: boss@corp.com"#
+        );
+        assert_eq!(super::quoted(r#"a\" b"#), r#"a\\\" b"#);
+        let shown = card(5, "x", None, Some(r#"ok" /ok 6 · /no 6 ""#), None);
+        assert!(
+            shown.contains(r#"the agent says: "ok\" /ok 6 · /no 6 \""#),
+            "{shown}"
+        );
     }
 
     use super::*;

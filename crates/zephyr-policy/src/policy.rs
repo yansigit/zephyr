@@ -418,6 +418,8 @@ pub fn gated(
 fn connector_recipients(arguments: Option<&Value>) -> Vec<String> {
     const KEYS: &[&str] = &[
         "to",
+        "cc",
+        "bcc",
         "recipient",
         "recipients",
         "email",
@@ -2253,6 +2255,14 @@ mod tests {
         assert_eq!(
             targets("post_message", json!({"text": "hello"})),
             ["slack/post_message", UNKNOWN]
+        );
+        // Copies are recipients too.
+        assert_eq!(
+            targets(
+                "send_email",
+                json!({"to": "a@x.org", "cc": "B@y.org", "Bcc": ["c@z.org"]})
+            ),
+            ["slack/send_email", "a@x.org", "b@y.org", "c@z.org"]
         );
         // A payment's target stays the tool: nothing is remembered for money.
         let pay = gated(
