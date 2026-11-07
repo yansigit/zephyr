@@ -797,6 +797,17 @@ pub fn changed(key: &str, old: Option<&str>, new: Option<&str>, until: Option<&s
     format!("[zephyr] {key} {} → {}{until}", shown(old), shown(new))
 }
 
+/// True when `reply` is `changed`'s line for `key`: the inverse of the builder, so a caller can
+/// tell a change from a refusal, a stale answer or "no setting" (`[zephyr] <words>`). Only the
+/// first line counts: the router may append what a reload said.
+pub fn is_change(reply: &str, key: &str) -> bool {
+    let first = reply.lines().next().unwrap_or_default();
+    first
+        .strip_prefix("[zephyr] ")
+        .and_then(|r| r.strip_prefix(key))
+        .is_some_and(|r| r.starts_with(' ') && r.contains(" → "))
+}
+
 /// The owner's notice of a tightening the agent applied at once.
 pub fn tightened(key: &str, old: Option<&str>, new: Option<&str>, reason: Option<&str>) -> String {
     let says = reason.map_or(String::new(), |r| format!(" (it says: \"{}\")", quoted(r)));
@@ -998,6 +1009,34 @@ pub fn listing(arg: &str, strong: &[String], rows: impl Fn(&Setting) -> Vec<Row>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn is_change_accepts_the_change_line_and_nothing_the_router_refuses_with() {
+        for line in [
+            changed("tasks.parallel", Some("2"), Some("4"), None),
+            changed("budget.daily_cost_usd", None, Some("3"), Some("18:00")),
+            format!(
+                "{}\n[zephyr] reloaded",
+                changed("timezone", None, Some("UTC"), None)
+            ),
+        ] {
+            let key = line[9..].split(' ').next().unwrap();
+            assert!(is_change(&line, key), "{line}");
+        }
+        let change = changed("tasks.parallel", Some("2"), Some("4"), None);
+        assert!(!is_change(&change, "tasks"), "a different key");
+        let refused = [
+            "[zephyr] loosening budget.daily_cost_usd needs tui or chat".to_string(),
+            "[zephyr] tasks.parallel must be 1 to 32".to_string(),
+            stale("tasks.parallel", Some("6")),
+            "[zephyr] no setting or section nope; /settings lists them".to_string(),
+            "[zephyr] usage: /set KEY VALUE [for 2h]; /settings lists the keys".to_string(),
+            "[zephyr] proposed as #3".to_string(),
+        ];
+        for r in refused {
+            assert!(!is_change(&r, "tasks.parallel"), "{r}");
+        }
+    }
+
     #[test]
     fn a_quoted_reason_drops_control_and_direction_characters() {
         let q = super::quoted("fine\u{202e}txt\u{7}\x1b[31m and\nmore\u{2066}!");

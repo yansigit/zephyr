@@ -53,7 +53,7 @@ case "$1" in
       *" zephyr --version "*) [ -n "$SHIM_VERSION" ] || exit 2; echo "zephyr $SHIM_VERSION" ;;
       *" zephyr tui "*) exit "${SHIM_TUI_EXIT:-0}" ;;
       # `zephyr set KEY VALUE`: the daemon's reply, a refusal when SHIM_SET_REFUSE is set.
-      *" zephyr set "*) [ -n "$SHIM_SET_REFUSE" ] && { echo "[zephyr] $SHIM_SET_REFUSE"; exit 1; }; echo "[zephyr] ${@: -2:1} 1 → ${@: -1}" ;;
+      *" zephyr set "*) [ -n "$SHIM_SET_DOWN" ] && { echo "zephyr: the daemon is not running" >&2; exit 3; }; [ -n "$SHIM_SET_REFUSE" ] && { echo "[zephyr] $SHIM_SET_REFUSE"; exit 1; }; echo "[zephyr] ${@: -2:1} 1 → ${@: -1}" ;;
     esac ;;
 esac
 exit 0
@@ -1002,6 +1002,29 @@ fn config_set_of_a_known_key_goes_through_the_daemon() {
     );
     assert!(!out.status.success());
     assert!(stdout(&out).contains("must be positive"), "{out:?}");
+}
+
+#[test]
+fn config_set_with_the_container_up_but_the_daemon_down_edits_the_file() {
+    let env = Env::new("config-down");
+    env.init(&["--no-start"]);
+    env.calls();
+    let out = env.zephyr_env(
+        &["config", "set", "budget.daily_tokens", "8000"],
+        &[("SHIM_SET_DOWN", "1")],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        stdout(&out).contains("applies when zephyr starts"),
+        "{out:?}"
+    );
+    let calls = env.calls();
+    find(&calls, &["docker", "exec", CONTAINER, "zephyr", "set"]);
+    assert!(!calls.iter().any(|c| c.contains(&"reload".to_string())));
+    assert_eq!(
+        env.ok(&["config", "get", "budget.daily_tokens"]).trim(),
+        "8000"
+    );
 }
 
 #[test]

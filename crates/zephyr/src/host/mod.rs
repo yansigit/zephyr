@@ -1227,11 +1227,22 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
         "config" => {
             let rest = a.rest()?;
             let args = rest.iter().map(String::as_str).collect::<Vec<_>>();
+            let mut daemon_down = false;
             // A registered setting goes through the daemon's checks (validation, the change log,
             // time limits) while it runs; its refusal is this command's failure.
             if let ["set", key, value] = args[..] {
                 if crate::settings::find(key).is_some() && h.running() {
-                    return run(&mut h.exec(&[], &[], &["zephyr", "set", key, value]));
+                    // Exit 3: the container is up but the daemon is not (a restart); edit the
+                    // file below, as for a stopped container.
+                    let status = h
+                        .exec(&[], &[], &["zephyr", "set", key, value])
+                        .status()
+                        .context("running docker exec")?;
+                    match status.code() {
+                        Some(0) => return Ok(()),
+                        Some(3) => daemon_down = true,
+                        _ => bail!("zephyr set failed ({status})"),
+                    }
                 }
             }
             let mut doc = h.data.load()?;
@@ -1256,7 +1267,11 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                         })?;
                     h.data.save(&doc)?;
                     println!("set {key}");
-                    h.apply()?;
+                    if daemon_down {
+                        println!("saved; applies when zephyr starts (`zephyr up`)");
+                    } else {
+                        h.apply()?;
+                    }
                 }
                 _ => bail!("usage: zephyr config get KEY | config set KEY VALUE"),
             }

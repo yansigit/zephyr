@@ -84,6 +84,38 @@ fn a_second_run_on_the_same_home_is_refused() {
 }
 
 #[test]
+fn set_tells_a_change_from_a_refusal_and_a_missing_daemon() {
+    let (home, cfg) = setup("set", "");
+    let uid = std::fs::metadata(&home).unwrap().uid();
+    std::fs::write(
+        &cfg,
+        format!(
+            "{}[owners]\nchat = [\"{uid}\"]\n",
+            std::fs::read_to_string(&cfg).unwrap()
+        ),
+    )
+    .unwrap();
+    // No daemon: exit 3, not the 1 of a refusal.
+    let out = zephyr(&cfg, &["set", "tasks.parallel", "3"]);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+
+    let running = daemon(&cfg, &home);
+    let out = zephyr(&cfg, &["set", "tasks.parallel", "3"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(
+        stdout(&out).starts_with("[zephyr] tasks.parallel "),
+        "{out:?}"
+    );
+    let out = zephyr(&cfg, &["set", "tasks.parallel", "99"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(stdout(&out).starts_with("[zephyr] "), "{out:?}");
+    assert!(!stdout(&out).contains(" → "), "{out:?}");
+    let out = zephyr(&cfg, &["set", "nope.nothing", "1"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    drop(running);
+}
+
+#[test]
 fn pause_and_resume_work_with_a_daemon_and_without_one() {
     let (home, cfg) = setup("pause", "");
     // The test runs as the owner: the chat socket sees this uid as the sender.

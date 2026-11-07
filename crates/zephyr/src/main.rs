@@ -122,11 +122,29 @@ fn file_cmd(args: &[String]) -> ExitCode {
     finish(result)
 }
 
+/// `zephyr set`'s exit code when no daemon listens (1 is a refusal): the host CLI then edits the
+/// file itself.
+const NOT_RUNNING: u8 = 3;
+
+#[derive(Debug)]
+struct NotRunning;
+
+impl std::fmt::Display for NotRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the daemon is not running; edit zephyr.toml or `zephyr up` first")
+    }
+}
+
+impl std::error::Error for NotRunning {}
+
 fn finish(result: anyhow::Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("zephyr: {e:#}");
+            if e.downcast_ref::<NotRunning>().is_some() {
+                return ExitCode::from(NOT_RUNNING);
+            }
             ExitCode::FAILURE
         }
     }
@@ -284,16 +302,14 @@ async fn control(cfg: &Config, text: &str) -> anyhow::Result<()> {
 }
 
 /// `zephyr set KEY VALUE [for D]`: the owner's `/set` over the chat socket (a strong channel).
-/// Prints the daemon's reply; a refusal (anything but `[zephyr] KEY OLD → NEW`) exits 1.
+/// Prints the daemon's reply; a refusal exits 1, no daemon 3.
 async fn set(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
     anyhow::ensure!(args.len() >= 2, "usage: zephyr set KEY VALUE [for D]");
     let Some(reply) = ask(cfg, &format!("/set {}", args.join(" "))).await? else {
-        anyhow::bail!("the daemon is not running; edit zephyr.toml or `zephyr up` first");
+        return Err(NotRunning.into());
     };
     println!("{reply}");
-    let first = reply.lines().next().unwrap_or_default();
-    let done = first.starts_with(&format!("[zephyr] {} ", args[0])) && first.contains(" → ");
-    anyhow::ensure!(done, "not changed");
+    anyhow::ensure!(zephyr::settings::is_change(&reply, &args[0]), "not changed");
     Ok(())
 }
 
