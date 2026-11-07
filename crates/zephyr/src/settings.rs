@@ -1004,7 +1004,13 @@ fn cut(text: &str, max: usize) -> String {
 }
 
 /// What the agent says, on one line and cut: it can never pass for a line of the daemon's own.
-fn quoted(text: &str) -> String {
+pub(crate) fn quoted(text: &str) -> String {
+    quoted_cut(text, REASON_CHARS)
+}
+
+/// `quoted`, cut at `max` characters: for text that is not the agent's reason but is still not
+/// the daemon's (a message's subject, a command a card shows).
+pub(crate) fn quoted_cut(text: &str, max: usize) -> String {
     let clean: String = (text.chars())
         .map(|c| {
             match c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
@@ -1013,10 +1019,7 @@ fn quoted(text: &str) -> String {
             }
         })
         .collect();
-    cut(
-        &clean.split_whitespace().collect::<Vec<_>>().join(" "),
-        REASON_CHARS,
-    )
+    cut(&clean.split_whitespace().collect::<Vec<_>>().join(" "), max)
 }
 
 /// The reply to a change: `[zephyr] KEY OLD → NEW`, with ` until HH:MM` when it is timed.
