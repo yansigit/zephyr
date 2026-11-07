@@ -4,7 +4,7 @@ use crate::channel::Inbound;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 /// Queued and running tasks allowed at once (DESIGN §4.12); a start past this is refused.
 pub const MAX_OPEN_TASKS: i64 = 64;
@@ -225,6 +225,112 @@ pub struct PendingProposal {
     pub key: Option<String>,
     pub seen: Option<String>,
     pub strong: bool,
+    /// `command` or `setting` rows are slash commands; `run`, `pass` and `wait` are held actions.
+    pub kind: String,
+}
+
+/// What a held action does when the owner approves it (DESIGN approvals §4.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    Run,
+    Pass,
+    Wait,
+}
+
+impl ActionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Pass => "pass",
+            Self::Wait => "wait",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "run" => Some(Self::Run),
+            "pass" => Some(Self::Pass),
+            "wait" => Some(Self::Wait),
+            _ => None,
+        }
+    }
+}
+
+/// Who asked for a held action. `run` is the session id for tasks and jobs (`task-7`), and
+/// `main:<run start ms>` for main.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct Origin {
+    pub channel: String,
+    pub sender: String,
+    pub session: String,
+    pub run: String,
+    #[serde(default)]
+    pub call_id: Option<String>,
+}
+
+/// An action to hold. `due_at: Some(_)` is a delay: it is stored `scheduled`, else `pending`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAction {
+    pub kind: ActionKind,
+    pub class: String,
+    pub targets: Vec<String>,
+    pub summary: String,
+    pub reason: Option<String>,
+    pub payload: String,
+    pub secrets: Vec<String>,
+    pub origin: Origin,
+    pub due_at: Option<i64>,
+}
+
+/// A held action as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Action {
+    pub id: i64,
+    pub kind: ActionKind,
+    pub class: String,
+    pub targets: Vec<String>,
+    pub summary: String,
+    pub reason: Option<String>,
+    pub payload: String,
+    pub secrets: Vec<String>,
+    pub origin: Origin,
+    pub status: String,
+    pub due_at: Option<i64>,
+    pub created_at: i64,
+}
+
+const ACTION_COLS: &str = "id, kind, class, targets, summary, reason, payload, secrets, origin, \
+                           status, due_at, created_at";
+
+fn action_row(r: &rusqlite::Row) -> rusqlite::Result<Action> {
+    let bad = |i: usize, e: String| {
+        rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, e.into())
+    };
+    let kind: String = r.get(1)?;
+    let list = |i: usize| -> rusqlite::Result<Vec<String>> {
+        let t: Option<String> = r.get(i)?;
+        t.map_or(Ok(vec![]), |t| {
+            serde_json::from_str(&t).map_err(|e| bad(i, e.to_string()))
+        })
+    };
+    let origin: Option<String> = r.get(8)?;
+    Ok(Action {
+        id: r.get(0)?,
+        kind: ActionKind::parse(&kind).ok_or_else(|| bad(1, format!("kind {kind}")))?,
+        class: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+        targets: list(3)?,
+        summary: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+        reason: r.get(5)?,
+        payload: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+        secrets: list(7)?,
+        origin: origin
+            .map(|o| serde_json::from_str(&o).map_err(|e| bad(8, e.to_string())))
+            .transpose()?
+            .unwrap_or_default(),
+        status: r.get(9)?,
+        due_at: r.get(10)?,
+        created_at: r.get(11)?,
+    })
 }
 
 /// A time limit's end: `key` goes back to `value` (`None`: unset) at `at`. `since` is when the
@@ -470,6 +576,34 @@ impl Store {
                  ALTER TABLE proposals ADD COLUMN seen TEXT;
                  ALTER TABLE proposals ADD COLUMN strong INTEGER NOT NULL DEFAULT 0;
                  PRAGMA user_version = 15;",
+            )?;
+        }
+        if version < 16 {
+            // Held actions share the proposals' id space; the targets the owner has approved,
+            // and one-time passes for MCP calls (approvals design §4.6).
+            db.execute_batch(
+                "ALTER TABLE proposals ADD COLUMN kind TEXT NOT NULL DEFAULT 'command';
+                 ALTER TABLE proposals ADD COLUMN class TEXT;
+                 ALTER TABLE proposals ADD COLUMN targets TEXT;
+                 ALTER TABLE proposals ADD COLUMN summary TEXT;
+                 ALTER TABLE proposals ADD COLUMN reason TEXT;
+                 ALTER TABLE proposals ADD COLUMN payload TEXT;
+                 ALTER TABLE proposals ADD COLUMN secrets TEXT;
+                 ALTER TABLE proposals ADD COLUMN origin TEXT;
+                 ALTER TABLE proposals ADD COLUMN due_at INTEGER;
+                 ALTER TABLE proposals ADD COLUMN settled_at INTEGER;
+                 ALTER TABLE proposals ADD COLUMN result TEXT;
+                 CREATE TABLE known_targets(
+                    class TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    added_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                    PRIMARY KEY (class, target));
+                 CREATE TABLE passes(
+                    digest TEXT PRIMARY KEY,
+                    proposal INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    used INTEGER NOT NULL DEFAULT 0);
+                 PRAGMA user_version = 16;",
             )?;
         }
         db.commit()?;
@@ -896,7 +1030,7 @@ impl Store {
     /// The proposals still waiting (pending and inside the 24 h window), newest first.
     pub fn pending_proposals(&self) -> rusqlite::Result<Vec<PendingProposal>> {
         let mut stmt = self.db.prepare(
-            "SELECT id, command, created_at, key, seen, strong FROM proposals
+            "SELECT id, command, created_at, key, seen, strong, kind FROM proposals
              WHERE status = 'pending' AND created_at > unixepoch() - 86400
              ORDER BY created_at DESC, id DESC",
         )?;
@@ -908,6 +1042,7 @@ impl Store {
                 key: r.get(3)?,
                 seen: r.get(4)?,
                 strong: r.get(5)?,
+                kind: r.get(6)?,
             })
         })?;
         rows.collect()
@@ -996,12 +1131,216 @@ impl Store {
         self.db
             .query_row(
                 "UPDATE proposals SET status = ?2
-                 WHERE id = ?1 AND status = 'pending' AND created_at > unixepoch() - 86400
+                 WHERE id = ?1 AND kind = 'command' AND status = 'pending'
+                   AND created_at > unixepoch() - 86400
                  RETURNING command",
                 params![id, status],
                 |r| r.get(0),
             )
             .optional()
+    }
+
+    /// Holds an action for the owner: `pending`, or `scheduled` when it has a `due_at`. The
+    /// `command` column carries the summary, so the waiting list reads it like any proposal.
+    pub fn hold_action(&self, a: &NewAction) -> rusqlite::Result<i64> {
+        let targets = serde_json::to_string(&a.targets).unwrap_or_default();
+        let secrets = serde_json::to_string(&a.secrets).unwrap_or_default();
+        let origin = serde_json::to_string(&a.origin).unwrap_or_default();
+        self.db.execute(
+            "INSERT INTO proposals(command, status, kind, class, targets, summary, reason, payload,
+                                   secrets, origin, due_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?1, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                a.summary,
+                if a.due_at.is_some() {
+                    "scheduled"
+                } else {
+                    "pending"
+                },
+                a.kind.as_str(),
+                a.class,
+                targets,
+                a.reason,
+                a.payload,
+                secrets,
+                origin,
+                a.due_at
+            ],
+        )?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    /// Moves a waiting action (`pending` or `scheduled`, inside 24 h) to `to` (`running`,
+    /// `dropped` or `cancelled`) in one statement, so of two `/ok N` only one gets it.
+    pub fn take_action(&self, id: i64, to: &str) -> rusqlite::Result<Option<Action>> {
+        self.db
+            .query_row(
+                &format!(
+                    "UPDATE proposals SET status = ?2, settled_at = unixepoch()
+                     WHERE id = ?1 AND kind != 'command' AND status IN ('pending', 'scheduled')
+                       AND created_at > unixepoch() - 86400
+                     RETURNING {ACTION_COLS}"
+                ),
+                params![id, to],
+                action_row,
+            )
+            .optional()
+    }
+
+    /// Records how a taken action ended (`done`, `failed`, ...) and its output.
+    pub fn finish_action(&self, id: i64, status: &str, result: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE proposals SET status = ?2, result = ?3, settled_at = unixepoch()
+             WHERE id = ?1 AND kind != 'command'",
+            params![id, status, result],
+        )?;
+        Ok(())
+    }
+
+    fn actions(&self, filter: &str, p: impl rusqlite::Params) -> rusqlite::Result<Vec<Action>> {
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT {ACTION_COLS} FROM proposals WHERE kind != 'command' AND {filter}"
+        ))?;
+        let rows = stmt.query_map(p, action_row)?;
+        rows.collect()
+    }
+
+    /// Actions waiting for the owner or for their delay, newest first.
+    pub fn held_actions(&self) -> rusqlite::Result<Vec<Action>> {
+        self.actions(
+            "status IN ('pending', 'scheduled') AND created_at > unixepoch() - 86400
+             ORDER BY created_at DESC, id DESC",
+            [],
+        )
+    }
+
+    /// The waiting action held for tool call `call_id` of `session`, with its summary.
+    pub fn held_for_call(
+        &self,
+        session: &str,
+        call_id: &str,
+    ) -> rusqlite::Result<Option<(i64, String)>> {
+        self.db
+            .query_row(
+                "SELECT id, summary FROM proposals
+                 WHERE kind != 'command' AND status IN ('pending', 'scheduled')
+                   AND json_extract(origin, '$.session') = ?1
+                   AND json_extract(origin, '$.call_id') = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![session, call_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    ))
+                },
+            )
+            .optional()
+    }
+
+    /// Actions of `run` (see `Origin`) still waiting.
+    pub fn waiting_in_run(&self, run: &str) -> rusqlite::Result<u32> {
+        self.db.query_row(
+            "SELECT count(*) FROM proposals
+             WHERE kind != 'command' AND status IN ('pending', 'scheduled')
+               AND json_extract(origin, '$.run') = ?1",
+            params![run],
+            |r| r.get(0),
+        )
+    }
+
+    /// Actions held in the 24 h before `now`, whatever became of them.
+    pub fn held_today(&self, now: i64) -> rusqlite::Result<u32> {
+        self.db.query_row(
+            "SELECT count(*) FROM proposals WHERE kind != 'command' AND created_at > ?1 - 86400",
+            params![now],
+            |r| r.get(0),
+        )
+    }
+
+    /// Delayed actions whose time has come.
+    pub fn due_actions(&self, now: i64) -> rusqlite::Result<Vec<Action>> {
+        self.actions(
+            "status = 'scheduled' AND due_at <= ?1 ORDER BY due_at, id",
+            params![now],
+        )
+    }
+
+    /// Expires `pending` actions older than 24 h and browser waits older than 10 min.
+    pub fn expire_actions(&self, now: i64) -> rusqlite::Result<Vec<Action>> {
+        let mut stmt = self.db.prepare(&format!(
+            "UPDATE proposals SET status = 'expired', settled_at = ?1
+             WHERE kind != 'command' AND status = 'pending'
+               AND (created_at <= ?1 - 86400 OR (kind = 'wait' AND created_at <= ?1 - 600))
+             RETURNING {ACTION_COLS}"
+        ))?;
+        let rows = stmt.query_map(params![now], action_row)?;
+        rows.collect()
+    }
+
+    /// At start: delays that came due while the daemon was down wait for the owner, and actions
+    /// that were running when it stopped are `unknown`, never run again.
+    pub fn restore_actions(&self, now: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE proposals SET status = 'pending'
+             WHERE kind != 'command' AND status = 'scheduled' AND due_at <= ?1",
+            params![now],
+        )?;
+        self.db.execute(
+            "UPDATE proposals SET status = 'unknown', settled_at = ?1
+             WHERE kind != 'command' AND status = 'running'",
+            params![now],
+        )?;
+        Ok(())
+    }
+
+    /// Remembers the targets the owner approved for `class`. `unknown` is never remembered.
+    pub fn remember_targets(&self, class: &str, targets: &[String]) -> rusqlite::Result<()> {
+        for t in targets.iter().filter(|t| *t != "unknown") {
+            self.db.execute(
+                "INSERT OR IGNORE INTO known_targets(class, target) VALUES (?1, ?2)",
+                params![class, t],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Whether every target is known for `class`; any `unknown` target is not.
+    pub fn all_known(&self, class: &str, targets: &[String]) -> rusqlite::Result<bool> {
+        for t in targets {
+            let known = t != "unknown"
+                && self
+                    .db
+                    .query_row(
+                        "SELECT 1 FROM known_targets WHERE class = ?1 AND target = ?2",
+                        params![class, t],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+            if !known {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Stores a one-time pass for `digest`, made by proposal `proposal`.
+    pub fn add_pass(&self, digest: &str, proposal: i64, expires_at: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO passes(digest, proposal, expires_at, used) VALUES (?1, ?2, ?3, 0)",
+            params![digest, proposal, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// Consumes the pass for `digest` if it is unused and not expired, in one statement.
+    pub fn use_pass(&self, digest: &str, now: i64) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
+            "UPDATE passes SET used = 1 WHERE digest = ?1 AND used = 0 AND expires_at > ?2",
+            params![digest, now],
+        )?;
+        Ok(n == 1)
     }
 
     /// Turns a job on. Returns whether it exists. A job turned on now counts from now, so a
@@ -1941,10 +2280,211 @@ mod tests {
         assert!(store.steered_into_run().unwrap().is_empty());
     }
 
+    fn new_action(run: &str, due_at: Option<i64>) -> NewAction {
+        NewAction {
+            kind: ActionKind::Run,
+            class: "messages".into(),
+            targets: vec!["alice@example.com".into()],
+            summary: "message (email)".into(),
+            reason: Some("the owner asked".into()),
+            payload: "himalaya message send".into(),
+            secrets: vec![],
+            origin: Origin {
+                channel: "discord".into(),
+                sender: "1000".into(),
+                session: "main".into(),
+                run: run.into(),
+                call_id: Some("call-1".into()),
+            },
+            due_at,
+        }
+    }
+
+    #[test]
+    fn one_id_space_for_commands_and_actions() {
+        let store = Store::open(&crate::test_dir("store-ids").join("state.db")).unwrap();
+        let c = store.propose_command("/new").unwrap();
+        let a = store.hold_action(&new_action("r", None)).unwrap();
+        let d = store.hold_action(&new_action("r", Some(i64::MAX))).unwrap();
+        assert_eq!([c, a, d], [1, 2, 3]);
+        // `/ok N` on an action is not a slash command, and the other way round.
+        assert_eq!(store.settle_proposal(a, "done").unwrap(), None);
+        assert_eq!(store.take_action(c, "running").unwrap(), None);
+        assert_eq!(
+            store.settle_proposal(c, "done").unwrap().as_deref(),
+            Some("/new")
+        );
+        let held = store.held_actions().unwrap();
+        assert_eq!(held.iter().map(|h| h.id).collect::<Vec<_>>(), [d, a]);
+        assert_eq!(held[0].status, "scheduled");
+        assert_eq!(held[1].status, "pending");
+        assert_eq!(held[1].origin.call_id.as_deref(), Some("call-1"));
+        assert_eq!(held[1].targets, ["alice@example.com"]);
+        // The waiting list still shows the pending action, with its kind.
+        let p = store.pending_proposals().unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!((p[0].id, p[0].kind.as_str()), (a, "run"));
+        assert_eq!(
+            store.held_for_call("main", "call-1").unwrap().map(|h| h.0),
+            Some(d.max(a))
+        );
+        assert_eq!(store.held_for_call("main", "other").unwrap(), None);
+    }
+
+    #[test]
+    fn an_action_is_taken_once() {
+        let store = Store::open(&crate::test_dir("store-take").join("state.db")).unwrap();
+        let a = store.hold_action(&new_action("r", None)).unwrap();
+        let got = store.take_action(a, "running").unwrap().unwrap();
+        assert_eq!((got.id, got.status.as_str()), (a, "running"));
+        assert_eq!(got.payload, "himalaya message send");
+        assert_eq!(store.take_action(a, "running").unwrap(), None);
+        assert_eq!(store.take_action(a, "dropped").unwrap(), None);
+        store.finish_action(a, "done", "ok").unwrap();
+        let status: String = store
+            .db
+            .query_row("SELECT status FROM proposals WHERE id = ?1", [a], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "done");
+        let old = store.hold_action(&new_action("r", None)).unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE proposals SET created_at = unixepoch() - 90000 WHERE id = ?1",
+                [old],
+            )
+            .unwrap();
+        assert_eq!(store.take_action(old, "running").unwrap(), None, "too old");
+    }
+
+    #[test]
+    fn restore_moves_overdue_delays_back_and_marks_running_unknown() {
+        let store = Store::open(&crate::test_dir("store-restore").join("state.db")).unwrap();
+        let overdue = store.hold_action(&new_action("r", Some(100))).unwrap();
+        let later = store
+            .hold_action(&new_action("r", Some(10_000_000_000)))
+            .unwrap();
+        let running = store.hold_action(&new_action("r", None)).unwrap();
+        store.take_action(running, "running").unwrap();
+        assert_eq!(
+            store
+                .due_actions(100)
+                .unwrap()
+                .iter()
+                .map(|a| a.id)
+                .collect::<Vec<_>>(),
+            [overdue]
+        );
+        store.restore_actions(200).unwrap();
+        let st = |id: i64| -> String {
+            store
+                .db
+                .query_row("SELECT status FROM proposals WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(st(overdue), "pending");
+        assert_eq!(st(later), "scheduled");
+        assert_eq!(st(running), "unknown");
+    }
+
+    #[test]
+    fn expiry_takes_old_pending_actions_and_old_waits() {
+        let store = Store::open(&crate::test_dir("store-expire").join("state.db")).unwrap();
+        let run = store.hold_action(&new_action("r", None)).unwrap();
+        let mut w = new_action("r", None);
+        w.kind = ActionKind::Wait;
+        let wait = store.hold_action(&w).unwrap();
+        let now: i64 = store
+            .db
+            .query_row("SELECT unixepoch()", [], |r| r.get(0))
+            .unwrap();
+        assert!(store.expire_actions(now + 100).unwrap().is_empty());
+        let gone = store.expire_actions(now + 601).unwrap();
+        assert_eq!(gone.iter().map(|a| a.id).collect::<Vec<_>>(), [wait]);
+        let gone = store.expire_actions(now + 86_401).unwrap();
+        assert_eq!(gone.iter().map(|a| a.id).collect::<Vec<_>>(), [run]);
+        assert!(store.held_actions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_targets_are_never_known() {
+        let store = Store::open(&crate::test_dir("store-known").join("state.db")).unwrap();
+        let t = |s: &str| s.to_string();
+        assert!(!store.all_known("messages", &[t("a@b.c")]).unwrap());
+        store
+            .remember_targets("messages", &[t("a@b.c"), t("unknown")])
+            .unwrap();
+        assert!(store.all_known("messages", &[t("a@b.c")]).unwrap());
+        assert!(
+            !store.all_known("posts", &[t("a@b.c")]).unwrap(),
+            "per class"
+        );
+        assert!(!store
+            .all_known("messages", &[t("a@b.c"), t("x@y.z")])
+            .unwrap());
+        assert!(!store
+            .all_known("messages", &[t("a@b.c"), t("unknown")])
+            .unwrap());
+        assert!(!store.all_known("messages", &[t("unknown")]).unwrap());
+    }
+
+    #[test]
+    fn a_pass_is_used_once_and_expires() {
+        let store = Store::open(&crate::test_dir("store-pass").join("state.db")).unwrap();
+        store.add_pass("d1", 7, 1000).unwrap();
+        assert!(!store.use_pass("nope", 10).unwrap());
+        assert!(store.use_pass("d1", 10).unwrap());
+        assert!(!store.use_pass("d1", 10).unwrap(), "once");
+        store.add_pass("d2", 8, 1000).unwrap();
+        assert!(!store.use_pass("d2", 1000).unwrap(), "expired");
+    }
+
+    #[test]
+    fn flood_counts_per_run_and_day() {
+        let store = Store::open(&crate::test_dir("store-flood").join("state.db")).unwrap();
+        let now: i64 = store
+            .db
+            .query_row("SELECT unixepoch()", [], |r| r.get(0))
+            .unwrap();
+        for _ in 0..2 {
+            store.hold_action(&new_action("main:1", None)).unwrap();
+        }
+        store
+            .hold_action(&new_action("task-7", Some(i64::MAX)))
+            .unwrap();
+        let c = store.propose_command("/new").unwrap();
+        assert_eq!(store.waiting_in_run("main:1").unwrap(), 2);
+        assert_eq!(store.waiting_in_run("task-7").unwrap(), 1);
+        assert_eq!(store.waiting_in_run("main:2").unwrap(), 0);
+        assert_eq!(store.held_today(now).unwrap(), 3, "commands do not count");
+        let first = store.held_actions().unwrap().pop().unwrap().id;
+        store.take_action(first, "running").unwrap();
+        assert_eq!(
+            store.waiting_in_run("main:1").unwrap(),
+            1,
+            "settled ones do not wait"
+        );
+        assert_eq!(store.held_today(now).unwrap(), 3, "but they count today");
+        store
+            .db
+            .execute(
+                "UPDATE proposals SET created_at = unixepoch() - 90000 WHERE id = ?1",
+                [first],
+            )
+            .unwrap();
+        assert_eq!(store.held_today(now).unwrap(), 2);
+        let _ = c;
+    }
+
     #[test]
     fn older_databases_migrate_in_order_and_keep_their_rows() {
         // Each case undoes the steps after `version`, as a db made by that build would look:
         // v14's first, while the tables its indexes are on still exist.
+        const V16: &str = "DROP TABLE known_targets; DROP TABLE passes; ALTER TABLE proposals DROP COLUMN kind; ALTER TABLE proposals DROP COLUMN class; ALTER TABLE proposals DROP COLUMN targets; ALTER TABLE proposals DROP COLUMN summary; ALTER TABLE proposals DROP COLUMN reason; ALTER TABLE proposals DROP COLUMN payload; ALTER TABLE proposals DROP COLUMN secrets; ALTER TABLE proposals DROP COLUMN origin; ALTER TABLE proposals DROP COLUMN due_at; ALTER TABLE proposals DROP COLUMN settled_at; ALTER TABLE proposals DROP COLUMN result;";
         const V15: &str = "DROP TABLE settings_log; DROP TABLE setting_reverts; ALTER TABLE proposals DROP COLUMN key; ALTER TABLE proposals DROP COLUMN seen; ALTER TABLE proposals DROP COLUMN strong;";
         const V14: &str = "DROP TABLE audit; DROP INDEX inbox_status; DROP INDEX outbox_status; DROP INDEX tasks_status; DROP INDEX procs_status; DROP INDEX runs_job_due;";
         for (version, undo) in [
@@ -1965,13 +2505,15 @@ mod tests {
             (12, "ALTER TABLE tasks DROP COLUMN subagent; ALTER TABLE tasks DROP COLUMN preamble;"),
             (13, ""),
             (14, ""),
+            (15, ""),
         ] {
             let dir = crate::test_dir(&format!("store-v{version}"));
             let path = dir.join("state.db");
             Store::open(&path).unwrap().insert_inbox(&msg("a")).unwrap();
             let db = Connection::open(&path).unwrap();
             let v14 = if version < 14 { V14 } else { "" };
-            db.execute_batch(&format!("{V15} {v14} {undo} PRAGMA user_version = {version};"))
+            let v15 = if version < 15 { V15 } else { "" };
+            db.execute_batch(&format!("{V16} {v15} {v14} {undo} PRAGMA user_version = {version};"))
                 .unwrap();
             drop(db);
             let store = Store::open(&path).unwrap();
@@ -2027,6 +2569,13 @@ mod tests {
             let id = store.propose_setting("/set k v", "k", Some("old"), true).unwrap();
             let p = store.pending_proposals().unwrap();
             assert_eq!(p.iter().filter(|p| p.id == id).count(), 1);
+            // v16: held actions, known targets and passes.
+            let a = store.hold_action(&new_action("run", None)).unwrap();
+            assert_eq!(store.held_actions().unwrap()[0].id, a);
+            store.remember_targets("messages", &["a@b.c".into()]).unwrap();
+            assert!(store.all_known("messages", &["a@b.c".into()]).unwrap());
+            store.add_pass("d", a, 100).unwrap();
+            assert!(store.use_pass("d", 50).unwrap());
             let now: i64 = store
                 .db
                 .pragma_query_value(None, "user_version", |r| r.get(0))
