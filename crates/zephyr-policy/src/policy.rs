@@ -264,6 +264,336 @@ pub fn outbound(command: &str) -> Vec<String> {
     found
 }
 
+/// What a gated call is (DESIGN approvals §4.1): messages, posts or money.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Class {
+    Messages,
+    Posts,
+    Money,
+}
+
+/// How a held call is carried out once approved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replay {
+    /// A shell command, run again.
+    Run,
+    /// A connector call, let through on the retry.
+    Pass,
+    /// A browser action, the wrapper waiting.
+    Wait,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Amount {
+    pub value: f64,
+    /// Upper-case; empty when the call names none.
+    pub currency: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gated {
+    pub class: Class,
+    /// Normalized: lowercased emails, `owner/repo`, origins, `server/tool`. Never empty; a target
+    /// that cannot be read is exactly [`UNKNOWN`].
+    pub targets: Vec<String>,
+    /// One line, built from the call in the daemon's words, never agent prose.
+    pub summary: String,
+    pub amount: Option<Amount>,
+    pub replay: Replay,
+}
+
+/// The target of something whose target cannot be read.
+pub const UNKNOWN: &str = "unknown";
+
+/// Whether a `bash`/`exec` command or an `mcp_call` is a message, a post or a payment.
+/// `classes(server, tool)` is the owner's per-connector table: `Some(Some(c))` puts the tool in a
+/// class, `Some(None)` takes it out of all, `None` leaves the verb rule.
+pub fn gated(
+    tool: &str,
+    args: &Value,
+    classes: &dyn Fn(&str, &str) -> Option<Option<Class>>,
+) -> Option<Gated> {
+    match tool {
+        "bash" | "exec" => {
+            let found = gated_command(args.get("command")?.as_str()?, 0);
+            let class = found.iter().map(|f| f.0).max()?;
+            let mut targets: Vec<String> = Vec::new();
+            for t in found.iter().flat_map(|f| f.1.iter()) {
+                if !targets.contains(t) {
+                    targets.push(t.clone());
+                }
+            }
+            let summary: Vec<&str> = found.iter().map(|f| f.2.as_str()).collect();
+            Some(Gated {
+                class,
+                targets,
+                summary: summary.join("; "),
+                amount: None,
+                replay: Replay::Run,
+            })
+        }
+        "mcp_call" => {
+            let server = args.get("server")?.as_str()?.to_lowercase();
+            let name = args.get("tool")?.as_str()?.to_lowercase();
+            let class = match classes(&server, &name) {
+                Some(over) => over?,
+                None => verb_class(&name)?,
+            };
+            let arguments = args.get("arguments");
+            let field = |k: &str| arguments.and_then(|a| a.get(k));
+            let amount = (class == Class::Money)
+                .then(|| {
+                    let value = ["amount", "total", "price"].iter().find_map(|k| {
+                        let v = field(k)?;
+                        v.as_f64().or_else(|| v.as_str()?.trim().parse().ok())
+                    })?;
+                    let currency = field("currency")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_uppercase();
+                    Some(Amount { value, currency })
+                })
+                .flatten();
+            let label = format!("{server}/{name}");
+            Some(Gated {
+                class,
+                targets: vec![label.clone()],
+                summary: label,
+                amount,
+                replay: Replay::Pass,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The class a connector tool's name implies; the strictest when several words match.
+fn verb_class(tool: &str) -> Option<Class> {
+    const MONEY: &[&str] = &[
+        "pay",
+        "purchase",
+        "order",
+        "checkout",
+        "transfer",
+        "refund",
+        "charge",
+        "subscribe",
+    ];
+    const POSTS: &[&str] = &[
+        "post",
+        "publish",
+        "comment",
+        "tweet",
+        "share",
+        "create_issue",
+        "create_pull",
+    ];
+    const MESSAGES: &[&str] = &["send", "reply", "message", "email"];
+    let has = |words: &[&str]| words.iter().any(|w| tool.contains(w));
+    if has(MONEY) {
+        Some(Class::Money)
+    } else if has(POSTS) {
+        Some(Class::Posts)
+    } else if has(MESSAGES)
+        || tool
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| w == "dm" || w == "dms")
+    {
+        // shortcut: `dm` only as a whole word, so `admin_list` is not a message.
+        Some(Class::Messages)
+    } else {
+        None
+    }
+}
+
+/// (class, targets, summary) for each stage of `command` that sends, posts or pays.
+fn gated_command(command: &str, depth: usize) -> Vec<(Class, Vec<String>, String)> {
+    let mut found = Vec::new();
+    if depth > 4 {
+        return found;
+    }
+    for stage in stages(command) {
+        let Some(words) = command_words(&stage.words) else {
+            continue;
+        };
+        let name = basename(&words[0]);
+        let args = &words[1..];
+        if let Some(script) = nested(name, args) {
+            found.extend(gated_command(&script, depth + 1));
+            continue;
+        }
+        if name == "himalaya" && himalaya_send(args) {
+            let mut to = recipients(command);
+            if to.is_empty() {
+                to.push(UNKNOWN.to_string());
+            }
+            let summary = if to == [UNKNOWN] {
+                "email to unreadable recipients".to_string()
+            } else {
+                format!("email to {}", to.join(", "))
+            };
+            found.push((Class::Messages, to, summary));
+        } else if name == "gh" {
+            if let Some(label) = gh_write(args) {
+                let repo = gh_repo(args).unwrap_or_else(|| UNKNOWN.to_string());
+                let summary = if repo == UNKNOWN {
+                    format!("{label} on an unreadable repo")
+                } else {
+                    format!("{label} on {repo}")
+                };
+                found.push((Class::Posts, vec![repo], summary));
+            }
+        }
+    }
+    found
+}
+
+/// Email addresses in the `To:`, `Cc:` and `Bcc:` headers of the command's own text (a heredoc,
+/// or `-H "To: ..."`), lowercased, in order, without repeats.
+fn recipients(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let lower = line.to_lowercase();
+        let chars: Vec<char> = lower.chars().collect();
+        for header in ["to:", "cc:", "bcc:"] {
+            let h: Vec<char> = header.chars().collect();
+            let mut i = 0;
+            while i + h.len() <= chars.len() {
+                let at_start =
+                    i == 0 || chars[i - 1].is_whitespace() || "\"'".contains(chars[i - 1]);
+                if at_start && chars[i..i + h.len()] == h[..] {
+                    let rest: String = chars[i + h.len()..]
+                        .iter()
+                        .take_while(|c| !"\"'".contains(**c))
+                        .collect();
+                    for tok in rest.split(|c: char| c.is_whitespace() || ",;<>()".contains(c)) {
+                        let tok = tok.trim_matches(|c: char| "\\".contains(c));
+                        if tok.contains('@') && !tok.starts_with('@') && !tok.ends_with('@') {
+                            let t = tok.to_string();
+                            if !out.contains(&t) {
+                                out.push(t);
+                            }
+                        }
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// `owner/repo` of a gh command: `-R`/`--repo`, a github.com URL, or a `repos/owner/repo/...` path.
+fn gh_repo(args: &[String]) -> Option<String> {
+    fn clean(s: &str) -> Option<String> {
+        let mut it = s.split('/').filter(|p| !p.is_empty());
+        let (o, r) = (it.next()?, it.next()?);
+        let r = r.strip_suffix(".git").unwrap_or(r);
+        let ok = |p: &str| {
+            !p.is_empty()
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        };
+        (ok(o) && ok(r)).then(|| format!("{o}/{r}").to_lowercase())
+    }
+    for (i, a) in args.iter().enumerate() {
+        let value = match a.as_str() {
+            "-R" | "--repo" => args.get(i + 1).map(String::as_str),
+            _ => a.strip_prefix("--repo="),
+        };
+        if let Some(repo) = value.and_then(clean) {
+            return Some(repo);
+        }
+    }
+    for a in args {
+        if let Some(rest) = a.split_once("github.com/").map(|p| p.1) {
+            if let Some(repo) = clean(rest) {
+                return Some(repo);
+            }
+        }
+        let path = a.trim_start_matches('/');
+        if let Some(rest) = path.strip_prefix("repos/") {
+            if let Some(repo) = clean(rest) {
+                return Some(repo);
+            }
+        }
+    }
+    None
+}
+
+// The button lexicon: whole words, case-insensitive, English and Korean. More languages are data.
+const BROWSER_MONEY: &[&str] = &[
+    "buy",
+    "pay",
+    "place order",
+    "checkout",
+    "complete purchase",
+    "confirm order",
+    "subscribe",
+    "donate",
+    "transfer",
+    "결제",
+    "구매",
+    "주문",
+    "주문하기",
+    "결제하기",
+    "송금",
+];
+const BROWSER_POSTS: &[&str] = &[
+    "post",
+    "publish",
+    "tweet",
+    "share",
+    "comment",
+    "게시",
+    "게시하기",
+    "공유",
+    "댓글",
+];
+const BROWSER_MESSAGES: &[&str] = &["send", "reply", "보내기", "전송", "답장"];
+
+/// What clicking a control (or pressing Enter in a composer) does, from its role and accessible
+/// name and what its form holds. Pure; the browser wrapper gathers the inputs. Search boxes,
+/// password forms and everything that is not a button are not gated; an unrecognized label is
+/// not gated (a documented limit).
+pub fn browser_class(
+    role: &str,
+    name: &str,
+    form_has_textarea: bool,
+    form_has_password: bool,
+    key_enter_in_composer: bool,
+) -> Option<Class> {
+    let role = role.trim().to_lowercase();
+    let name = name.to_lowercase();
+    if form_has_password || role == "searchbox" || name.contains("search") || name.contains("검색")
+    {
+        return None;
+    }
+    let words: Vec<&str> = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let matches = |list: &[&str]| {
+        list.iter().any(|phrase| {
+            let p: Vec<&str> = phrase.split(' ').collect();
+            words.windows(p.len()).any(|w| w == p.as_slice())
+        })
+    };
+    if matches!(role.as_str(), "button" | "menuitem" | "") || key_enter_in_composer {
+        if matches(BROWSER_MONEY) {
+            return Some(Class::Money);
+        }
+        if matches(BROWSER_POSTS) || (form_has_textarea && words == ["submit"]) {
+            return Some(Class::Posts);
+        }
+        if matches(BROWSER_MESSAGES) {
+            return Some(Class::Messages);
+        }
+    }
+    key_enter_in_composer.then_some(Class::Messages)
+}
+
 /// `gh pr create`, `gh api POST repos/o/r/issues`: a gh command that writes to GitHub.
 fn gh_write(args: &[String]) -> Option<String> {
     const WRITES: &[(&str, &[&str])] = &[
@@ -1041,5 +1371,213 @@ mod tests {
                 "expected allow: {tool} {args}"
             );
         }
+    }
+
+    fn no_classes(_: &str, _: &str) -> Option<Option<Class>> {
+        None
+    }
+
+    fn gbash(command: &str) -> Option<Gated> {
+        gated("bash", &json!({ "command": command }), &no_classes)
+    }
+
+    fn mcp(server: &str, tool: &str, arguments: Value) -> Value {
+        json!({ "configPath": "/x/mcp.json", "server": server, "tool": tool, "arguments": arguments })
+    }
+
+    #[test]
+    fn gated_classifies_mail_github_and_connectors() {
+        let g =
+            gbash("himalaya message send <<'EOF'\nTo: Bob@X.org\nCc: c@y.org\n\nhi\nEOF").unwrap();
+        assert_eq!((g.class, g.replay), (Class::Messages, Replay::Run));
+        assert_eq!(g.targets, vec!["bob@x.org", "c@y.org"]);
+        assert!(g.summary.contains("bob@x.org"), "{}", g.summary);
+        let g = gbash("himalaya message send -H \"To: a@x.org\" body").unwrap();
+        assert_eq!(g.targets, vec!["a@x.org"]);
+        assert_eq!(g.summary, "email to a@x.org");
+
+        let g = gbash("gh pr create -R Owner/Repo --title t").unwrap();
+        assert_eq!(
+            (g.class, g.targets),
+            (Class::Posts, vec!["owner/repo".to_string()])
+        );
+        assert_eq!(g.summary, "gh pr create on owner/repo");
+        let g = gbash("gh issue comment https://github.com/o/r/issues/3 -b hi").unwrap();
+        assert_eq!(g.targets, vec!["o/r"]);
+        let g = gbash("gh api repos/o/r/issues -f title=x").unwrap();
+        assert_eq!(
+            (g.class, g.targets),
+            (Class::Posts, vec!["o/r".to_string()])
+        );
+        assert_eq!(gbash("gh pr create").unwrap().targets, vec![UNKNOWN]);
+        assert!(gbash("gh pr view 3").is_none());
+        assert!(gbash("himalaya envelope list").is_none());
+        assert!(gbash("ls -la").is_none());
+
+        let g = gated(
+            "mcp_call",
+            &mcp("Mail", "send_message", json!({})),
+            &no_classes,
+        )
+        .unwrap();
+        assert_eq!((g.class, g.replay), (Class::Messages, Replay::Pass));
+        assert_eq!(
+            (g.targets, g.summary),
+            (
+                vec!["mail/send_message".to_string()],
+                "mail/send_message".to_string()
+            )
+        );
+        let g = gated(
+            "mcp_call",
+            &mcp("s", "create_issue", json!({})),
+            &no_classes,
+        )
+        .unwrap();
+        assert_eq!(g.class, Class::Posts);
+        let g = gated(
+            "mcp_call",
+            &mcp(
+                "shop",
+                "place_order",
+                json!({"total": 12.5, "currency": "usd"}),
+            ),
+            &no_classes,
+        )
+        .unwrap();
+        assert_eq!(g.class, Class::Money);
+        assert_eq!(
+            g.amount,
+            Some(Amount {
+                value: 12.5,
+                currency: "USD".into()
+            })
+        );
+        let g = gated(
+            "mcp_call",
+            &mcp("shop", "pay", json!({"amount": "7"})),
+            &no_classes,
+        )
+        .unwrap();
+        assert_eq!(g.amount.map(|a| a.value), Some(7.0));
+        assert!(gated(
+            "mcp_call",
+            &mcp("s", "list_messages_x", json!({})),
+            &no_classes
+        )
+        .is_some());
+        assert!(gated("mcp_call", &mcp("s", "get_file", json!({})), &no_classes).is_none());
+        assert!(gated("read", &json!({"path": "/x"}), &no_classes).is_none());
+    }
+
+    #[test]
+    fn targets_are_unknown_when_not_in_the_command() {
+        for cmd in [
+            "cat msg.eml | himalaya message send",
+            "himalaya message send < msg.eml",
+            "himalaya template send",
+        ] {
+            let g = gbash(cmd).unwrap_or_else(|| panic!("{cmd}"));
+            assert_eq!(g.targets, vec![UNKNOWN], "{cmd}");
+        }
+        let g = gbash("sh -c 'himalaya message send -H \"To: z@x.org\"'").unwrap();
+        assert_eq!(g.targets, vec!["z@x.org"]);
+    }
+
+    #[test]
+    fn a_multi_stage_command_takes_the_strictest_class() {
+        let g = gbash("gh pr create -R o/r && himalaya message send -H 'To: a@x.org' x").unwrap();
+        assert_eq!(g.class, Class::Messages.max(Class::Posts));
+        assert_eq!(g.targets, vec!["o/r", "a@x.org"]);
+        assert!(Class::Money > Class::Posts && Class::Posts > Class::Messages);
+        let g = gbash("bash -c 'gh pr create -R o/r; echo hi'").unwrap();
+        assert_eq!(g.class, Class::Posts);
+    }
+
+    #[test]
+    fn connector_classes_override_the_verb_rule() {
+        let args = mcp("mail", "send_message", json!({}));
+        let none = |_: &str, _: &str| Some(None);
+        assert!(gated("mcp_call", &args, &none).is_none());
+        let money =
+            |s: &str, t: &str| (s == "mail" && t == "send_message").then_some(Some(Class::Money));
+        assert_eq!(
+            gated("mcp_call", &args, &money).unwrap().class,
+            Class::Money
+        );
+        let plain = mcp("mail", "get_thing", json!({}));
+        assert_eq!(
+            gated("mcp_call", &plain, &|_: &str, _: &str| Some(Some(
+                Class::Posts
+            )))
+            .unwrap()
+            .class,
+            Class::Posts
+        );
+        assert_eq!(
+            gated("mcp_call", &args, &no_classes).unwrap().class,
+            Class::Messages
+        );
+    }
+
+    #[test]
+    fn browser_labels_in_english_and_korean() {
+        let table = [
+            ("button", "Place order", Some(Class::Money)),
+            ("button", "BUY NOW", Some(Class::Money)),
+            ("button", "결제하기", Some(Class::Money)),
+            ("button", "구매", Some(Class::Money)),
+            ("button", "주문", Some(Class::Money)),
+            ("button", "송금", Some(Class::Money)),
+            ("button", "Post", Some(Class::Posts)),
+            ("button", "게시하기", Some(Class::Posts)),
+            ("button", "댓글", Some(Class::Posts)),
+            ("button", "Send", Some(Class::Messages)),
+            ("button", "보내기", Some(Class::Messages)),
+            ("button", "전송", Some(Class::Messages)),
+            ("button", "답장", Some(Class::Messages)),
+            ("button", "Reply all", Some(Class::Messages)),
+            ("button", "Sender settings", None),
+            ("button", "Postcard gallery", None),
+            ("button", "Menu", None),
+            ("link", "Share", None),
+        ];
+        for (role, name, want) in table {
+            assert_eq!(
+                browser_class(role, name, false, false, false),
+                want,
+                "{role} {name}"
+            );
+        }
+        assert_eq!(
+            browser_class("button", "Submit", true, false, false),
+            Some(Class::Posts)
+        );
+        assert_eq!(browser_class("button", "Submit", false, false, false), None);
+        assert_eq!(
+            browser_class("textbox", "Message", false, false, true),
+            Some(Class::Messages)
+        );
+        assert_eq!(
+            browser_class("textbox", "Message", false, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn search_boxes_and_login_forms_are_not_sends() {
+        assert_eq!(browser_class("searchbox", "Find", false, false, true), None);
+        assert_eq!(
+            browser_class("textbox", "Search messages", false, false, true),
+            None
+        );
+        assert_eq!(browser_class("textbox", "검색", false, false, true), None);
+        assert_eq!(browser_class("button", "Search", false, false, false), None);
+        assert_eq!(browser_class("button", "Send", false, true, false), None);
+        assert_eq!(browser_class("button", "Submit", true, true, false), None);
+        assert_eq!(
+            browser_class("textbox", "Password", false, true, true),
+            None
+        );
     }
 }
