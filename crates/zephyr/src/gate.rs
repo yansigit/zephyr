@@ -207,7 +207,8 @@ struct Call {
     targets: Vec<String>,
     /// One line in the daemon's words.
     summary: String,
-    /// What runs on `/ok`: the exact command, the `mcp_call` arguments, or the browser request.
+    /// What runs on `/ok`: the exact command with its timeout (`store::run_payload`), the
+    /// `mcp_call` arguments, or the browser request.
     payload: String,
     secrets: Vec<String>,
     /// What the audit row records, scrubbed value by value when it is written.
@@ -261,7 +262,7 @@ impl Call {
             })
             .unwrap_or_default();
         let payload = match kind {
-            ActionKind::Run => text.clone(),
+            ActionKind::Run => crate::store::run_payload(&req.args),
             _ => req.args.to_string(),
         };
         Some(Call {
@@ -890,7 +891,7 @@ pub fn card(a: &Action, cfg: &Config, store: &Store) -> String {
     )];
     // A command is plain text, scrubbed whole; a connector call and a browser request are
     // decoded first and scrubbed value by value (C2).
-    let command = (a.kind == ActionKind::Run).then(|| clean(&a.payload));
+    let command = (a.kind == ActionKind::Run).then(|| clean(&a.command()));
     lines.extend(match a.kind {
         ActionKind::Run => {
             let command = command.as_deref().unwrap_or_default();
@@ -955,7 +956,7 @@ fn what(class: Option<Class>, kind: ActionKind, browser: Option<&Browser>) -> St
 /// or what was typed.
 fn checked_text(a: &Action) -> String {
     match a.kind {
-        ActionKind::Run => a.payload.clone(),
+        ActionKind::Run => a.command(),
         ActionKind::Pass => match serde_json::from_str::<Value>(&a.payload) {
             Ok(v) => decoded(&v),
             Err(_) => a.payload.clone(),
@@ -971,7 +972,7 @@ fn browser_of(payload: &str) -> Option<Browser> {
 
 /// A shell command's lines: who a mail goes to with its subject and first lines, a GitHub post's
 /// repo and title, or what an outgoing command sends. `payload` is the command, plain text,
-/// scrubbed whole.
+/// scrubbed whole; the label is read again from the command as stored.
 fn run_lines(
     cfg: &Config,
     a: &Action,
@@ -998,10 +999,11 @@ fn run_lines(
             // The daemon's own label for it, read again from the command (the stored summary
             // carries the fact note the agent is told).
             let classes = |server: &str, tool: &str| connector_class(cfg, server, tool);
-            let args = serde_json::json!({ "command": a.payload });
+            let stored = a.command();
+            let args = serde_json::json!({ "command": stored });
             let label = match policy::gated("bash", &args, &classes) {
                 Some(g) => g.summary,
-                None => policy::outbound(&a.payload).join("; "),
+                None => policy::outbound(&stored).join("; "),
             };
             let (title, body) = match class {
                 Some(Class::Posts) => gh_parts(payload),
@@ -1413,7 +1415,11 @@ mod tests {
             (ActionKind::Run, "messages", "pending", None)
         );
         // Exactly what runs on `/ok`.
-        assert_eq!(a.payload, MAIL);
+        assert_eq!(a.command(), MAIL);
+        assert_eq!(
+            a.payload,
+            serde_json::json!({ "command": MAIL }).to_string()
+        );
         assert_eq!(a.targets, ["alice@example.com"]);
         assert_eq!(a.reason.as_deref(), Some(REASON));
         assert_eq!(

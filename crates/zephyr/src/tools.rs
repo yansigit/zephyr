@@ -186,21 +186,38 @@ pub enum NotNow {
     Weak(String),
 }
 
-/// The owner's `/ok N` or `/no N`. `Some(Ok(command))` is the approved command, for the router to
-/// run as the owner's own; `Some(Err(reply))` is the whole answer; `None` for any other text.
-/// Before an `/ok` settles, `check` sees the waiting proposal and may hold it back.
+/// What the owner's `/ok N` approved: a proposed slash command, for the router to run as the
+/// owner's own, or a held action (approvals spec §4.6), for `actions::approve` to carry out.
+/// `once` (`/ok N once`) approves an action without remembering its targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decided {
+    Command(String),
+    Action { id: i64, once: bool },
+}
+
+/// The owner's `/ok N [once]` or `/no N`. `Some(Ok(_))` is what was approved; `Some(Err(reply))`
+/// is the whole answer (a `/no`, or why nothing was approved); `None` for any other text. Before
+/// an `/ok` settles a proposed command, `check` sees it and may hold it back. A held action is
+/// only looked up here: `actions::approve` takes it, once, and `/no` drops it through
+/// `actions::decline`. `once` on a proposed command is a plain `/ok`.
 pub fn decide(
     store: &Store,
     text: &str,
     check: impl FnOnce(&crate::store::PendingProposal) -> Option<NotNow>,
-) -> Option<Result<String, String>> {
-    let (verb, n) = text.split_once(' ').unwrap_or((text, ""));
+) -> Option<Result<Decided, String>> {
+    let (verb, rest) = text.split_once(' ').unwrap_or((text, ""));
     let status = match verb {
         "/ok" => "done",
         "/no" => "dropped",
         _ => return None,
     };
-    let n = n.trim();
+    let mut words = rest.split_whitespace();
+    let (n, extra) = (words.next().unwrap_or(""), words.collect::<Vec<_>>());
+    let once = match (status, extra.as_slice()) {
+        (_, []) => false,
+        ("done", ["once"]) => true,
+        _ => return Some(Err("[zephyr] usage: /ok N, /ok N once, /no N".into())),
+    };
     let Ok(id) = n.trim_start_matches('#').parse::<i64>() else {
         return Some(Err(format!(
             "[zephyr] {verb} takes a proposal number, e.g. {verb} 3"
@@ -208,12 +225,19 @@ pub fn decide(
     };
     let failed =
         |e: rusqlite::Error| Some(Err(format!("[zephyr] reading proposal #{id} failed: {e}")));
+    let waiting = match store.pending_proposals() {
+        Ok(waiting) => waiting,
+        Err(e) => return failed(e),
+    };
+    let found = waiting.iter().find(|p| p.id == id);
+    if found.is_some_and(|p| p.kind != "command") {
+        return Some(match status {
+            "done" => Ok(Decided::Action { id, once }),
+            _ => Err(crate::actions::decline(store, id)),
+        });
+    }
     if status == "done" {
-        let waiting = match store.pending_proposals() {
-            Ok(waiting) => waiting,
-            Err(e) => return failed(e),
-        };
-        match waiting.iter().find(|p| p.id == id).and_then(check) {
+        match found.and_then(check) {
             Some(NotNow::Weak(reply)) => return Some(Err(reply)),
             Some(NotNow::Stale(reply)) => {
                 return match store.settle_proposal(id, "dropped") {
@@ -225,14 +249,19 @@ pub fn decide(
         }
     }
     Some(match store.settle_proposal(id, status) {
-        Ok(Some(command)) if status == "done" => Ok(command),
+        Ok(Some(command)) if status == "done" => Ok(Decided::Command(command)),
         Ok(Some(command)) => Err(format!("[zephyr] dropped #{id} ({command})")),
-        Ok(None) => Err(format!(
-            "[zephyr] no proposal #{id} is waiting: it was never made, is already handled, or is \
-             older than 24 h"
-        )),
+        Ok(None) => Err(not_waiting(id)),
         Err(e) => return failed(e),
     })
+}
+
+/// Why `/ok N` or `/no N` found nothing to settle.
+pub fn not_waiting(id: i64) -> String {
+    format!(
+        "[zephyr] no proposal #{id} is waiting: it was never made, is already handled, or is \
+         older than 24 h"
+    )
 }
 
 /// Drops a sent (or given up) file's copy: its whole per-file dir under `<state>/files`.

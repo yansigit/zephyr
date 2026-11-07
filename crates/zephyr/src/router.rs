@@ -5,6 +5,7 @@ use crate::config::{Account, Config, BUDGET_NOTICE};
 use crate::rpc::{message_text, Child, MAIN_SESSION};
 use crate::settings::{Actor, Apply, Outcome, Setting};
 use crate::store::{InboxRow, Store};
+use crate::tools::Decided;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -276,6 +277,9 @@ pub async fn run<C: Channel>(
     // Commands a re-exec handed over alive are adopted; the rest a dead gateway left running
     // are reported, never re-run (DESIGN §4.13).
     router.procs.adopt(&router.cfg, &mut router.store)?;
+    // After the adoption, so an approved action whose command is still running stays running;
+    // a delay that came due while down waits for the owner (approvals spec §4.9).
+    crate::actions::restore(&router.cfg, &router.store, crate::now());
     for c in channels {
         c.live(cfg_rx.clone()); // owners for file downloads, kept current by reload
     }
@@ -441,6 +445,8 @@ struct Router<'a> {
     stopping: bool,
     /// The main agent's `exec` commands (DESIGN §4.13).
     procs: crate::procs::Procs,
+    /// Browser actions waiting in place for the owner's answer (approvals spec §4.4).
+    waits: crate::actions::Waits,
     /// The pooled account the child runs on (DESIGN §4.9). `None` without a pool.
     account: Option<Account>,
     /// What attached clients see; `publish` refreshes it, `tapped` keeps `run` current.
@@ -574,6 +580,7 @@ impl<'a> Router<'a> {
             spawn_failures: 0,
             stopping: false,
             procs: Default::default(),
+            waits: Default::default(),
             compacting: None,
             approving: None,
             cfg_tx,
@@ -649,6 +656,9 @@ impl<'a> Router<'a> {
                         eprintln!("zephyr: zephyr.toml or secrets.env changed: {text}");
                     }
                     self.revert_due().await;
+                    // Delays that came due, and held actions nobody answered (approvals §4.6).
+                    crate::actions::tick(&self.actions(), crate::now());
+                    self.settled_actions();
                     // A budget pause ends at UTC midnight with nothing else to wake the router;
                     // a run in progress reconciles at its settle, a new child when it starts.
                     let ended = std::mem::replace(&mut was_paused, paused(&self.store));
@@ -719,9 +729,7 @@ impl<'a> Router<'a> {
                         ),
                     };
                     match (self.origin(), env) {
-                        (Some(to), Ok(env)) => {
-                            self.procs.start(&self.cfg, &self.store, id, call, to, env)
-                        }
+                        (Some(to), Ok(env)) => self.exec(id, args, call, to, env),
                         (None, _) => {
                             crate::tools::answer_gateway(&self.cfg, id, "no owner; not run")
                         }
@@ -757,6 +765,70 @@ impl<'a> Router<'a> {
         match self.snap.borrow().run.origin.clone() {
             Some(o) => Some((o.channel, o.sender)),
             None => self.store.last_owner().ok().flatten(),
+        }
+    }
+
+    /// Main's `exec` call `id` once the veto and the vault passed: the gate decides it
+    /// (approvals spec §4.2 path 1). Allowed, it starts; held or refused, the call is answered
+    /// with the daemon's words and nothing starts. The gate sends the owner's card itself.
+    fn exec(
+        &self,
+        id: &str,
+        args: &Value,
+        call: zephyr_policy::tools::ExecCall,
+        to: (String, String),
+        env: Vec<(String, String)>,
+    ) {
+        use crate::gate::Verdict;
+        let session = self.child.as_ref().and_then(|c| c.session.clone());
+        let since = self.snap.borrow().run.since_unix_ms.unwrap_or_default();
+        let req = crate::gate::Request {
+            session: session.unwrap_or_default(),
+            call_id: Some(id.into()),
+            tool: "exec".into(),
+            args: args.clone(),
+            browser: None,
+            // R3: main's run key.
+            run: format!("main:{since}"),
+            // Cut to 200 by the gate, after its scrub: a cut here could split a value it hides.
+            reason: Some(self.last_say.clone()).filter(|r| !r.trim().is_empty()),
+        };
+        match crate::gate::decide(&self.cfg, &self.store, &req, to.clone(), crate::now()) {
+            Verdict::Allow => self.procs.start(&self.cfg, &self.store, id, call, to, env),
+            Verdict::Hold { text, .. } | Verdict::Deny(text) => {
+                crate::tools::answer_gateway(&self.cfg, id, &text)
+            }
+            // Only the browser wrapper's requests wait in place.
+            Verdict::Wait { id: n } => crate::tools::answer_gateway(
+                &self.cfg,
+                id,
+                &format!("not run: #{n} waits for the owner"),
+            ),
+        }
+    }
+
+    /// What the held actions' lifecycle needs from the router (`crate::actions`).
+    fn actions(&self) -> crate::actions::Ctx<'_> {
+        crate::actions::Ctx {
+            cfg: &self.cfg,
+            store: &self.store,
+            procs: &self.procs,
+            waits: &self.waits,
+        }
+    }
+
+    /// The owner's `/ok N [once]` on `channel` for held action `id` (`actions::approve`).
+    fn approve(&self, id: i64, once: bool, channel: &str) -> Result<String, String> {
+        let by = crate::actions::By::Owner { channel };
+        crate::actions::approve(&self.actions(), id, once, by, crate::now())
+    }
+
+    /// After a held action was settled: a waiting browser action whose action ended is denied,
+    /// and a note for main (a decline, a cancel, an expiry, a pass) is dispatched as a report is.
+    fn settled_actions(&self) {
+        self.waits.deny_settled(&self.store);
+        if self.store.action_rows_waiting().unwrap_or(false) {
+            self.jobs.inbox.notify_one();
         }
     }
 
@@ -1276,7 +1348,11 @@ impl<'a> Router<'a> {
     /// `zephyr.decide`: `/ok N` or `/no N` from the TUI, through the checks the chat commands
     /// make (stale, strong channel). `once` is `ok` for a setting.
     async fn decide(&mut self, id: i64, verb: &str) -> Value {
-        let text = format!("/{} {id}", if verb == "no" { "no" } else { "ok" });
+        let text = match verb {
+            "no" => format!("/no {id}"),
+            "once" => format!("/ok {id} once"),
+            _ => format!("/ok {id}"),
+        };
         let m = Inbound {
             channel: crate::attach::CHANNEL.into(),
             platform_msg_id: String::new(),
@@ -1289,7 +1365,15 @@ impl<'a> Router<'a> {
             self.not_now(p, &m.channel)
         });
         let (ok, reply) = match decided {
-            Some(Ok(command)) => {
+            Some(Ok(Decided::Action { id, once })) => {
+                let done = self.approve(id, once, &m.channel);
+                self.settled_actions();
+                match done {
+                    Ok(reply) => (true, reply),
+                    Err(reply) => (false, reply),
+                }
+            }
+            Some(Ok(Decided::Command(command))) => {
                 self.approving = approving;
                 let run = Inbound {
                     text: command.clone(),
@@ -1301,7 +1385,10 @@ impl<'a> Router<'a> {
                 self.restart_if_idle().await;
                 (true, format!("[zephyr] {text} approved {command}\n{reply}"))
             }
-            Some(Err(reply)) => (reply.starts_with("[zephyr] dropped #"), reply),
+            Some(Err(reply)) => {
+                self.settled_actions();
+                (reply.starts_with("[zephyr] dropped #"), reply)
+            }
             None => (false, format!("[zephyr] {text} is not a decision")),
         };
         json!({"ok": ok, "text": reply.trim_end()})
@@ -1470,6 +1557,17 @@ impl<'a> Router<'a> {
             approving = Some(p.id);
             self.not_now(p, &m.channel)
         });
+        // A held action is carried out here, its answer the whole reply.
+        let decided = decided.map(|d| match d {
+            Ok(Decided::Command(command)) => Ok(command),
+            Ok(Decided::Action { id, once }) => {
+                Err(self.approve(id, once, &m.channel).unwrap_or_else(|e| e))
+            }
+            Err(reply) => Err(reply),
+        });
+        if decided.is_some() {
+            self.settled_actions();
+        }
         // An approved proposal runs exactly as if the owner had typed it, logged as the agent's.
         self.approving = approving.filter(|_| matches!(decided, Some(Ok(_))));
         let text = match &decided {
@@ -1587,7 +1685,9 @@ impl<'a> Router<'a> {
                 self.abort().await;
                 // Background tasks too (DESIGN §4.12); each still reports back as stopped.
                 crate::tasks::stop(&mut self.store, self.jobs, None);
+                // Approved actions running are `procs` commands; held ones stay held.
                 self.procs.stop_all();
+                self.waits.deny_all();
                 "[zephyr] stopped"
             }
         };
@@ -1798,6 +1898,13 @@ impl<'a> Router<'a> {
             ("/set", arg) => self.set_command(arg, from.0).await,
             ("/settings", arg) => self.settings_listing(arg),
             ("/approvals", arg) => self.approvals(arg, from.0).await,
+            // Held messages, posts and payments (approvals spec §4.6).
+            ("/held", "") => crate::actions::held(&self.cfg, &self.store),
+            ("/cancel", n) => {
+                let reply = crate::actions::cancel(&self.store, &self.waits, n);
+                self.settled_actions();
+                reply
+            }
             // `/rule` alone and `/rules` are `memory::command`'s.
             ("/rule", rule) if !rule.is_empty() => {
                 self.owner_set("rule", rule, from.0, |a| a).await
@@ -3051,10 +3158,11 @@ impl<'a> Router<'a> {
             return Reloaded::failed("[zephyr] no zephyr.toml to reload".into());
         };
         self.edits = edits(&self.cfg);
-        let new = match Config::load(&path) {
+        let mut new = match Config::load(&path) {
             Ok(new) => new,
             Err(e) => return Reloaded::failed(format!("[zephyr] zephyr.toml not applied: {e:#}")),
         };
+        new.keep_hidden(&self.cfg);
         let secrets = crate::dotenv::read(&new.secrets_path()).unwrap_or_default();
         let next = pick_in(&new, &self.store).ok().flatten();
         let mut plan = crate::reload::diff(&self.cfg, &new, self.account.as_ref(), next.as_ref());
@@ -3836,6 +3944,44 @@ mod tests {
         let own = r.store.revert(key).unwrap().unwrap();
         let got = (own.value.as_deref(), own.at - own.since, own.channel);
         assert_eq!(got, (Some("6.0"), 30, None));
+    }
+
+    /// R30: a reload reads the file again, but what no file sets (tests shorten these) stays.
+    #[tokio::test]
+    async fn a_reload_keeps_what_no_file_sets() {
+        let mut cfg = on_file("reload-hidden", "");
+        cfg.tick = Duration::from_millis(200);
+        cfg.stall_limit = Duration::from_secs(3);
+        cfg.min_until = Duration::from_secs(1);
+        cfg.job_timeout = Duration::from_secs(4);
+        cfg.exec_backstop = Duration::from_secs(5);
+        cfg.projects = Some("/p".into());
+        let jobs = Default::default();
+        let mut r = router(&cfg, &jobs);
+        let set = r
+            .set_setting("tasks.parallel", "3", OWNER, None, None)
+            .await;
+        assert!(matches!(set, Outcome::Changed { .. }), "{set:?}");
+        assert_eq!(r.cfg.tasks.as_ref().map(|t| t.parallel), Some(3));
+        let c = &r.cfg;
+        assert_eq!(
+            (
+                c.tick,
+                c.stall_limit,
+                c.min_until,
+                c.job_timeout,
+                c.exec_backstop
+            ),
+            (
+                cfg.tick,
+                cfg.stall_limit,
+                cfg.min_until,
+                cfg.job_timeout,
+                cfg.exec_backstop
+            )
+        );
+        assert_eq!((&c.path, &c.projects), (&cfg.path, &cfg.projects));
+        assert_eq!(r.cfg_tx.borrow().tick, cfg.tick, "and what the others read");
     }
 
     /// The owner's `/ok N` on `chat`, and the reply it got.

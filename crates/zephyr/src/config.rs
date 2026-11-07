@@ -318,6 +318,19 @@ impl Config {
         Ok(cfg)
     }
 
+    /// A reloaded file keeps the running daemon's values of the fields no file sets (`tick`,
+    /// `stall_limit`, `min_until`, `job_timeout`, `exec_backstop`, `path`, `projects`): a reload
+    /// changes settings, never these (R30).
+    pub fn keep_hidden(&mut self, running: &Config) {
+        self.job_timeout = running.job_timeout;
+        self.exec_backstop = running.exec_backstop;
+        self.stall_limit = running.stall_limit;
+        self.tick = running.tick;
+        self.min_until = running.min_until;
+        self.path = running.path.clone();
+        self.projects = running.projects.clone();
+    }
+
     /// Account names become directory names, so each must be a plain, unique path segment.
     pub fn validate(&self) -> anyhow::Result<()> {
         let mut seen = std::collections::HashSet::new();

@@ -4354,3 +4354,455 @@ async fn a_vault_request_asks_the_owner_with_the_commands_that_save_it() {
     assert_eq!(replies[3], "[zephyr] the vault is empty");
     gw.shutdown().await;
 }
+
+// ---- approvals: main's exec, /ok /no /cancel /held, delays (approvals spec §4.2, §4.6) ----
+
+/// R6: an `exec` that writes its mail to `file` in the agent's home before the send stage, so
+/// the file shows whether the held command ran, and ran word for word. No himalaya is on the
+/// test PATH, so the send stage itself exits 127.
+fn mail_via(file: &str) -> String {
+    format!(
+        r#"[call exec {{"command": "cat > {file} <<'EOF'\nTo: a@x.org\nSubject: hi\n\nhello there\nEOF\nhimalaya message send < {file}"}}]"#
+    )
+}
+
+/// What `mail_via` writes, exactly.
+const MAIL_TEXT: &str = "To: a@x.org\nSubject: hi\n\nhello there\n";
+
+/// A send whose recipient the gate reads from its own heredoc.
+const SEND_TO_A: &str =
+    r#"[call exec {"command": "himalaya message send <<'EOF'\nTo: a@x.org\n\nhi\nEOF"}]"#;
+
+const HELD_UNREAD: &str = "held for the owner as #1 (email to unreadable recipients); don't \
+                           retry it; carry on or end your turn";
+
+/// Waits for a reply on `channel` that `f` accepts, and returns it. Replies a slow machine can
+/// reorder (a card, the run's reply, a report) are found by content, never by position.
+async fn reply_where(gw: &Gateway, channel: &str, f: impl Fn(&str) -> bool) -> String {
+    for _ in 0..200 {
+        if let Some(r) = gw.replies_on(channel).into_iter().find(|r| f(r)) {
+            return r;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out; on {channel}: {:#?}", gw.replies_on(channel));
+}
+
+fn action_status(home: &Path, id: i64) -> String {
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    db.query_row("SELECT status FROM proposals WHERE id = ?1", [id], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+/// The text of main's inbox row with platform id `platform`, if there is one.
+fn inbox_text(home: &Path, platform: &str) -> Option<String> {
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    db.query_row(
+        "SELECT text FROM inbox WHERE platform_msg_id = ?1",
+        [platform],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// Waits until main was handed action `id`'s report or note (inbox row `action-<id>`, sent as
+/// a prompt or steered in), and returns its text. Not its reply: the fake answers a report that
+/// quotes a `bash: …` error with `ran`.
+async fn to_main(home: &Path, id: i64) -> String {
+    let header = format!("[action #{id} ");
+    let sent = |kind: &str| {
+        log(home, kind)
+            .iter()
+            .any(|c| c["message"].as_str().is_some_and(|m| m.contains(&header)))
+    };
+    wait(|| sent("prompt") || sent("queue_message")).await;
+    inbox_text(home, &format!("action-{id}")).expect("the row")
+}
+
+/// Makes held action `id` due now, as if its delay had passed.
+fn make_due(home: &Path, id: i64) {
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    let n = db
+        .execute(
+            "UPDATE proposals SET due_at = unixepoch() - 1 WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+#[tokio::test]
+async fn a_held_mail_send_runs_exactly_on_ok() {
+    let home = home("gate-exact");
+    let gw = start(config(&home)); // no [approvals]: manual
+    gw.say("m1", "owner", &format!("{} send it", mail_via("sent.eml")))
+        .await;
+    let card = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    assert!(
+        card.starts_with(
+            "[zephyr] approve #1: message (email)\nto: recipients the gate could not read"
+        ),
+        "{card}"
+    );
+    assert!(
+        card.ends_with("/ok 1 · /ok 1 once · /no 1 · expires in 24 h"),
+        "{card}"
+    );
+    let reply = reply_where(&gw, "chat", |r| r.starts_with("echo: ")).await;
+    assert!(
+        reply.ends_with(&format!("\nexec: {HELD_UNREAD}")),
+        "{reply}"
+    );
+    assert!(!home.join("sent.eml").exists(), "nothing ran");
+    assert_eq!(
+        proc_status(&home, "exited") + proc_status(&home, "running"),
+        0
+    );
+
+    gw.say("m2", "owner", "/ok 1").await;
+    let approved = reply_where(&gw, "chat", |r| r.contains("approved #1")).await;
+    assert!(
+        approved.starts_with("[zephyr] approved #1 (email to unreadable recipients): running it"),
+        "{approved}"
+    );
+    // The report comes back to main, on the channel the run served.
+    let header = "[action #1 done; zephyr ran what the owner approved]";
+    let row = to_main(&home, 1).await;
+    assert!(row.starts_with(header), "{row}");
+    assert!(row.contains("exited 127"), "{row}");
+    // Exactly the text the owner was shown, written by the command it held.
+    let sent = std::fs::read_to_string(home.join("sent.eml")).unwrap();
+    assert_eq!(sent, MAIL_TEXT);
+    assert_eq!(
+        action_status(&home, 1),
+        "failed",
+        "himalaya is not on the test PATH"
+    );
+    // Held, then approved: both are audit rows, the second in the daemon's words.
+    let audit = Store::open(&home.join("state.db"))
+        .unwrap()
+        .audit_rows()
+        .unwrap();
+    let outcomes: Vec<(&str, &str)> = (audit.iter())
+        .filter(|(_, tool, _, outcome)| tool == "exec" && outcome != "started")
+        .map(|(_, _, args, outcome)| (outcome.as_str(), args.as_str()))
+        .collect();
+    assert_eq!(outcomes.len(), 2, "{audit:?}");
+    assert_eq!(outcomes[0].0, "held");
+    assert_eq!(
+        outcomes[1],
+        ("approved", "#1 email to unreadable recipients")
+    );
+    // Once only.
+    gw.say("m3", "owner", "/ok 1").await;
+    reply_where(&gw, "chat", |r| r.starts_with(NO_PROPOSAL)).await;
+    assert_eq!(proc_status(&home, "exited"), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn once_does_not_remember_and_ok_does() {
+    let home = home("gate-once");
+    let gw = start(on_file(&home, "[approvals]\npreset = \"semi\""));
+    let known = || {
+        let store = Store::open(&home.join("state.db")).unwrap();
+        store.all_known("messages", &["a@x.org".into()]).unwrap()
+    };
+    gw.say("m1", "owner", SEND_TO_A).await;
+    let card = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    assert!(card.contains("\nto: a@x.org (new)\n"), "{card}");
+    gw.say("m2", "owner", "/ok 1 once").await;
+    let approved = reply_where(&gw, "chat", |r| r.contains("approved #1")).await;
+    assert!(!approved.contains("without asking"), "{approved}");
+    let audit = Store::open(&home.join("state.db"))
+        .unwrap()
+        .audit_rows()
+        .unwrap();
+    let once = |(_, _, args, outcome): &(String, String, String, String)| {
+        outcome == "once" && args == "#1 email to a@x.org"
+    };
+    assert!(audit.iter().any(once), "{audit:?}");
+    assert!(to_main(&home, 1).await.starts_with("[action #1 done;"));
+    assert!(!known(), "once remembers nobody");
+
+    gw.say("m3", "owner", SEND_TO_A).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains("\nexec: held for the owner as #2 (email to a@x.org)")
+    })
+    .await;
+    gw.say("m4", "owner", "/ok 2").await;
+    let approved = reply_where(&gw, "chat", |r| r.contains("approved #2")).await;
+    assert!(
+        approved.ends_with("; from now on a@x.org goes without asking"),
+        "{approved}"
+    );
+    assert!(to_main(&home, 2).await.starts_with("[action #2 done;"));
+    assert!(known());
+
+    // A known recipient goes at once: the agent gets the command's own answer.
+    gw.say("m5", "owner", &format!("{SEND_TO_A} again")).await;
+    let ran = reply_where(&gw, "chat", |r| r.contains("again\nexec: ")).await;
+    assert!(ran.contains("\nexec: exited 127\n"), "{ran}");
+    let store = Store::open(&home.join("state.db")).unwrap();
+    assert!(store.held_actions().unwrap().is_empty());
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_delay_runs_on_the_tick_unless_cancelled() {
+    let home = home("gate-delay");
+    let mut cfg = on_file(&home, "[approvals]\nmessages = \"delay 1\"");
+    cfg.tick = Duration::from_millis(200);
+    let gw = start(cfg);
+    gw.say("m1", "owner", &mail_via("one.eml")).await;
+    let card = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] delayed #1:")).await;
+    assert!(card.ends_with(" unless /cancel 1"), "{card}");
+    reply_where(&gw, "chat", |r| {
+        r.contains(&format!("\nexec: {HELD_UNREAD}"))
+    })
+    .await;
+    gw.say("m2", "owner", "/cancel 1").await;
+    let cancelled = reply_where(&gw, "chat", |r| r.contains("cancelled #1")).await;
+    assert_eq!(
+        cancelled,
+        "[zephyr] cancelled #1 (email to unreadable recipients)"
+    );
+    assert_eq!(action_status(&home, 1), "cancelled");
+    // The agent is told, so it does not try again.
+    let note = to_main(&home, 1).await;
+    assert!(
+        note.starts_with(
+            "[action #1 cancelled; zephyr's note, not the owner's words] the owner \
+                          cancelled #1 (email to unreadable recipients); don't try it again"
+        ),
+        "{note}"
+    );
+    gw.say("m3", "owner", "/cancel 1").await;
+    reply_where(&gw, "chat", |r| r.starts_with(NO_PROPOSAL)).await;
+
+    gw.say("m4", "owner", &mail_via("two.eml")).await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] delayed #2:")).await;
+    gw.say("m5", "owner", "/held").await;
+    let held = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] held for you")).await;
+    assert!(
+        held.contains("#2 email to unreadable recipients · sending at "),
+        "{held}"
+    );
+    assert!(!held.contains("#1 "), "{held}");
+    assert!(!home.join("two.eml").exists());
+    make_due(&home, 2);
+    assert!(to_main(&home, 2).await.starts_with("[action #2 done;"));
+    assert_eq!(
+        std::fs::read_to_string(home.join("two.eml")).unwrap(),
+        MAIL_TEXT
+    );
+    assert!(
+        !home.join("one.eml").exists(),
+        "the cancelled one never ran"
+    );
+    gw.say("m6", "owner", "/held").await;
+    reply_where(&gw, "chat", |r| r == "[zephyr] nothing is held for you").await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_delay_due_while_down_comes_back_pending() {
+    let home = home("gate-delay-down");
+    let mut cfg = on_file(&home, "[approvals]\nmessages = \"delay 1\"");
+    cfg.tick = Duration::from_millis(200);
+    let gw = start(cfg.clone());
+    gw.say("m1", "owner", &mail_via("late.eml")).await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] delayed #1:")).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains(&format!("\nexec: {HELD_UNREAD}"))
+    })
+    .await;
+    gw.shutdown().await;
+    // Its time comes while the daemon is down: never sent late without the owner.
+    make_due(&home, 1);
+    let gw = start(cfg);
+    let card = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    assert!(
+        card.ends_with("/ok 1 · /ok 1 once · /no 1 · expires in 24 h"),
+        "{card}"
+    );
+    assert_eq!(action_status(&home, 1), "pending");
+    gw.say("m2", "owner", "/held").await;
+    let held = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] held for you")).await;
+    assert!(
+        held.contains("#1 email to unreadable recipients · /ok 1 · /no 1"),
+        "{held}"
+    );
+    assert!(!home.join("late.eml").exists());
+    gw.say("m3", "owner", "/ok 1").await;
+    assert!(to_main(&home, 1).await.starts_with("[action #1 done;"));
+    assert_eq!(
+        std::fs::read_to_string(home.join("late.eml")).unwrap(),
+        MAIL_TEXT
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn ok_while_paused_waits_for_resume() {
+    let home = home("gate-paused");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", &mail_via("p.eml")).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains(&format!("\nexec: {HELD_UNREAD}"))
+    })
+    .await;
+    gw.say("m2", "owner", "/pause").await;
+    reply_where(&gw, "chat", |r| r == PAUSED).await;
+    gw.say("m3", "owner", "/ok 1").await;
+    reply_where(&gw, "chat", |r| r == "[zephyr] paused; /resume first").await;
+    assert_eq!(action_status(&home, 1), "pending");
+    assert!(!home.join("p.eml").exists());
+    gw.say("m4", "owner", "/resume").await;
+    reply_where(&gw, "chat", |r| r == "[zephyr] resumed").await;
+    gw.say("m5", "owner", "/ok 1").await;
+    assert!(to_main(&home, 1).await.starts_with("[action #1 done;"));
+    assert_eq!(
+        std::fs::read_to_string(home.join("p.eml")).unwrap(),
+        MAIL_TEXT
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn upgrade_free_full_mode_runs_sends_at_once() {
+    let home = home("gate-full");
+    let gw = start(on_file(&home, "[approvals]\npreset = \"full\""));
+    gw.say("m1", "owner", &mail_via("now.eml")).await;
+    let reply = reply_where(&gw, "chat", |r| r.starts_with("echo: ")).await;
+    assert!(reply.contains("\nexec: exited 127\n"), "{reply}");
+    assert_eq!(
+        std::fs::read_to_string(home.join("now.eml")).unwrap(),
+        MAIL_TEXT
+    );
+    // Still listed after the turn, and recorded; nothing waits for the owner.
+    reply_where(&gw, "chat", |r| {
+        r == "[zephyr] outbound this turn:\n- himalaya send"
+    })
+    .await;
+    assert!(!gw.replies().iter().any(|r| r.contains("approve #")));
+    let store = Store::open(&home.join("state.db")).unwrap();
+    assert!(store.held_actions().unwrap().is_empty());
+    let audit = store.audit_rows().unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|(_, tool, _, outcome)| tool == "exec" && outcome == "auto"),
+        "{audit:?}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_payment_ok_from_discord_is_refused_when_money_is_strong_only() {
+    use zephyr::store::{ActionKind, NewAction, Origin};
+    let home = home("gate-money-strong");
+    let strong = "[approvals]\nstrong_only = [\"loosen\", \"money\"]";
+    let gw = start(on_file_with_discord(&home, strong));
+    wait(|| !log(&home, "start").is_empty()).await;
+    // A connector payment held from a run on discord, as the gate stores one.
+    let payload = r#"{"server":"shop","tool":"pay","arguments":{"amount":5,"currency":"USD"}}"#;
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let id = store
+        .hold_action(&NewAction {
+            kind: ActionKind::Pass,
+            class: "money".into(),
+            targets: vec!["shop/pay".into()],
+            summary: "payment through shop/pay".into(),
+            reason: None,
+            payload: payload.into(),
+            secrets: vec![],
+            origin: Origin {
+                channel: "discord".into(),
+                sender: "downer".into(),
+                session: "main".into(),
+                run: "main:1".into(),
+                call_id: Some("c1".into()),
+            },
+            due_at: None,
+        })
+        .unwrap();
+    assert_eq!(id, 1);
+    gw.say_on("discord", "d1", "downer", "/ok 1").await;
+    reply_where(&gw, "discord", |r| {
+        r == "[zephyr] approving a payment needs tui or chat"
+    })
+    .await;
+    assert_eq!(action_status(&home, 1), "pending", "it still waits");
+    gw.say("m1", "owner", "/ok 1").await;
+    let approved = reply_where(&gw, "chat", |r| r.contains("approved #1")).await;
+    assert!(
+        approved.starts_with("[zephyr] approved #1 (payment through shop/pay)"),
+        "{approved}"
+    );
+    // The pass is for exactly that call, once; the agent is told on the run's channel.
+    let digest = zephyr::gate::pass_digest(&serde_json::from_str(payload).unwrap()).unwrap();
+    assert!(store.use_pass(&digest, zephyr::now()).unwrap());
+    assert!(!store.use_pass(&digest, zephyr::now()).unwrap());
+    let note = to_main(&home, 1).await;
+    assert!(note.starts_with("[action #1 approved;"), "{note}");
+    reply_where(&gw, "discord", |r| r.contains("[action #1 approved;")).await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn no_drops_a_held_action_and_stop_kills_an_approved_one() {
+    let home = home("gate-no-stop");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", &mail_via("no.eml")).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains(&format!("\nexec: {HELD_UNREAD}"))
+    })
+    .await;
+    gw.say("m2", "owner", "/no 1").await;
+    let dropped = reply_where(&gw, "chat", |r| r.contains("dropped #1")).await;
+    assert_eq!(
+        dropped,
+        "[zephyr] dropped #1 (email to unreadable recipients)"
+    );
+    let note = to_main(&home, 1).await;
+    assert!(
+        note.starts_with(
+            "[action #1 declined; zephyr's note, not the owner's words] the owner \
+                          declined #1 (email to unreadable recipients); don't try it again"
+        ),
+        "{note}"
+    );
+    assert_eq!(action_status(&home, 1), "dropped");
+    let audit = Store::open(&home.join("state.db"))
+        .unwrap()
+        .audit_rows()
+        .unwrap();
+    assert!(
+        audit.iter().any(|(_, _, _, outcome)| outcome == "dropped"),
+        "{audit:?}"
+    );
+    gw.say("m3", "owner", "/ok 1").await;
+    reply_where(&gw, "chat", |r| r.starts_with(NO_PROPOSAL)).await;
+
+    // An approved command runs as a process: /stop kills it, and a held one stays held.
+    let slow = r#"[call exec {"command": "sleep 30; himalaya message send <<'EOF'\nTo: a@x.org\n\nhi\nEOF"}]"#;
+    gw.say("m4", "owner", &format!("{slow} {}", mail_via("kept.eml")))
+        .await;
+    reply_where(&gw, "chat", |r| r.contains("held for the owner as #3")).await;
+    gw.say("m5", "owner", "/ok 2").await;
+    wait(|| proc_status(&home, "running") == 1).await;
+    gw.say("m6", "owner", "/stop").await;
+    let report = to_main(&home, 2).await;
+    assert!(
+        report
+            .starts_with("[action #2 done; zephyr ran what the owner approved] was stopped after "),
+        "{report}"
+    );
+    assert_eq!(action_status(&home, 2), "failed");
+    assert_eq!(action_status(&home, 3), "pending");
+    assert!(!home.join("kept.eml").exists());
+    gw.shutdown().await;
+}
