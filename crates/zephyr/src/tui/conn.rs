@@ -188,6 +188,19 @@ pub enum Ask {
     Sessions,
     /// `zephyr.turns`, answered with [`Msg::Turns`].
     Turns,
+    /// `zephyr.settings`, answered with [`Msg::Settings`].
+    Settings,
+    /// `zephyr.settings_set`: a change as the owner on the TUI, a strong channel; `until` is a
+    /// time limit like `2h`. Answered with [`Msg::SettingResult`].
+    SettingsSet {
+        key: String,
+        value: String,
+        until: Option<String>,
+    },
+    /// `zephyr.proposals`, answered with [`Msg::Proposals`].
+    Proposals,
+    /// `zephyr.decide` (`ok`, `once` or `no`), answered with [`Msg::Decided`].
+    Decide { id: i64, verb: String },
 }
 
 impl std::fmt::Debug for Ask {
@@ -229,6 +242,20 @@ impl std::fmt::Debug for Ask {
             Ask::VaultRevoke(name) => f.debug_tuple("VaultRevoke").field(name).finish(),
             Ask::Sessions => f.write_str("Sessions"),
             Ask::Turns => f.write_str("Turns"),
+            Ask::Settings => f.write_str("Settings"),
+            // No setting holds a secret (settings spec §4.4); private facts get asks of their own.
+            Ask::SettingsSet { key, value, until } => f
+                .debug_struct("SettingsSet")
+                .field("key", key)
+                .field("value", value)
+                .field("until", until)
+                .finish(),
+            Ask::Proposals => f.write_str("Proposals"),
+            Ask::Decide { id, verb } => f
+                .debug_struct("Decide")
+                .field("id", id)
+                .field("verb", verb)
+                .finish(),
         }
     }
 }
@@ -268,6 +295,15 @@ pub enum Msg {
     Sessions(Vec<SessionInfo>),
     /// The `zephyr.turns` answer; empty from a daemon without it.
     Turns(Vec<Turn>),
+    /// `zephyr.settings`' answer, or `{"error": why}`.
+    Settings(Value),
+    /// `zephyr.settings_set`'s answer: `changed`, `proposed` or `refused` (an error answer is a
+    /// refusal with the error as its reason).
+    SettingResult(Value),
+    /// `zephyr.proposals`' answer; `{"proposals": []}` from a daemon without it.
+    Proposals(Value),
+    /// `zephyr.decide`'s answer, `{"ok", "text"}`; an error answer is `ok: false` with its text.
+    Decided(Value),
     /// The connection is gone or was refused; it retries.
     Down(String),
     /// Retrying would not help: a wrong token, or a daemon without `zephyr.hello`.
@@ -464,6 +500,24 @@ async fn session(
                     let id = rpc.request("zephyr.turns", json!({})).await?;
                     pending.insert(id, Pending::Turns);
                 }
+                Some(Ask::Settings) => {
+                    let id = rpc.request("zephyr.settings", json!({})).await?;
+                    pending.insert(id, Pending::Settings);
+                }
+                Some(Ask::SettingsSet { key, value, until }) => {
+                    let params = json!({"key": key, "value": value, "until": until});
+                    let id = rpc.request("zephyr.settings_set", params).await?;
+                    pending.insert(id, Pending::SettingsSet);
+                }
+                Some(Ask::Proposals) => {
+                    let id = rpc.request("zephyr.proposals", json!({})).await?;
+                    pending.insert(id, Pending::Proposals);
+                }
+                Some(Ask::Decide { id, verb }) => {
+                    let params = json!({"id": id, "verb": verb});
+                    let id = rpc.request("zephyr.decide", params).await?;
+                    pending.insert(id, Pending::Decide);
+                }
                 None => return Ok(()),
             },
         }
@@ -490,6 +544,10 @@ enum Pending {
     Dequeue,
     Sessions,
     Turns,
+    Settings,
+    SettingsSet,
+    Proposals,
+    Decide,
 }
 
 /// An error answer to one of the login calls.
@@ -509,6 +567,8 @@ fn answer(what: Pending, mut v: Value) -> Option<Msg> {
             .to_string(),
         gone: e["code"].as_i64() == Some(UNKNOWN_LOGIN),
     });
+    // The settings calls show the daemon's own words for a refusal.
+    let error = (v.get("error")).map(|e| e["message"].as_str().unwrap_or("refused").to_string());
     let mut result = v["result"].take();
     Some(match what {
         // A daemon without these answers an error, so the panel shows an empty list rather
@@ -573,6 +633,22 @@ fn answer(what: Pending, mut v: Value) -> Option<Msg> {
         Pending::Turns => {
             Msg::Turns(serde_json::from_value(result["turns"].take()).unwrap_or_default())
         }
+        Pending::Settings => Msg::Settings(match error {
+            Some(why) => json!({"error": why}),
+            None => result,
+        }),
+        Pending::SettingsSet => Msg::SettingResult(match error {
+            Some(why) => json!({"outcome": "refused", "reason": why}),
+            None => result,
+        }),
+        Pending::Proposals => Msg::Proposals(match error {
+            Some(_) => json!({"proposals": []}),
+            None => result,
+        }),
+        Pending::Decide => Msg::Decided(match error {
+            Some(why) => json!({"ok": false, "text": why}),
+            None => result,
+        }),
     })
 }
 

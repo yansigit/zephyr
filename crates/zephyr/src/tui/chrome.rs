@@ -448,7 +448,10 @@ pub fn header(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
         ],
         p,
     );
-    let paused = paused_badge(s, p).unwrap_or_default();
+    let badges: Vec<String> = (waiting_badge(s, p).into_iter())
+        .chain(paused_badge(s, p))
+        .collect();
+    let badges = badges.join("   ");
     let mut channels = channel_dots(s, p);
     let mut right: Vec<String> = failed(s, p).into_iter().collect();
     if s.link == Link::Up {
@@ -471,7 +474,7 @@ pub fn header(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
     let [m0, m1, m2] = mascot(Mood::of(s, now), p, now);
     let rule = format!(" {} ", glyph("─").repeat(width.saturating_sub(2)));
     vec![
-        format!("{m0}{}", spread(&name, &format!("{paused} "), text)),
+        format!("{m0}{}", spread(&name, &format!("{badges} "), text)),
         format!("{m1}{}", spread(&title, "", text)),
         format!("{m2}{status}"),
         p.dim.fg(&rule),
@@ -517,6 +520,12 @@ fn paused_badge(s: &State, p: &Palette) -> Option<String> {
     Some(p.warning.fg(&format!("{} {label}", glyph("⏸"))))
 }
 
+/// `2 waiting`, while proposals wait for the owner's OK (`Snapshot.proposals`).
+fn waiting_badge(s: &State, p: &Palette) -> Option<String> {
+    let n = s.snapshot.proposals;
+    (n > 0 && s.link == Link::Up).then(|| p.warning.fg(&format!("{n} waiting")))
+}
+
 /// `discord ●` per channel adapter; none while not connected.
 fn channel_dots(s: &State, p: &Palette) -> Vec<String> {
     if s.link != Link::Up {
@@ -556,11 +565,13 @@ fn compact_header(s: &State, p: &Palette, width: usize) -> Vec<String> {
     };
     left.push_str(&p.muted.fg(&format!(" {} ", glyph("·"))));
     left.push_str(&where_);
-    let paused = paused_badge(s, p);
+    let badges: Vec<String> = (waiting_badge(s, p).into_iter())
+        .chain(paused_badge(s, p))
+        .collect();
     let mut channels = channel_dots(s, p);
-    // The right side drops off first, the last channel first; the pause badge stays.
+    // The right side drops off first, the last channel first; the badges stay.
     let right = loop {
-        let right = paused
+        let right = badges
             .iter()
             .cloned()
             .chain((!channels.is_empty()).then(|| channels.join("  ")))
@@ -711,11 +722,24 @@ pub fn footer(s: &State, p: &Palette, width: usize, now: i64) -> Vec<String> {
     let arrows = glyph("↑↓");
     // (hint, rank): when the row is short, the highest rank goes first.
     let mut hints = match (&s.overlay, &s.complete) {
+        // The settings panel says what the keys do where its keyboard is; esc stays longest.
+        (Some(o), _) if o.kind == Kind::Settings => {
+            let hints = super::settings_panel::hints(o);
+            let last = hints.len().saturating_sub(1);
+            (hints.into_iter().enumerate())
+                .map(|(i, (k, what))| match k {
+                    "" => (p.muted.fg(what), i + 1),
+                    k => (key(k, what), if i == last { 0 } else { i + 1 }),
+                })
+                .collect()
+        }
         (Some(o), _) => {
             let (choose, pick) = match o.kind {
                 Kind::Model => ("choose", Some("switch")),
                 Kind::Help | Kind::History => ("choose", Some("insert")),
                 Kind::Rewind => ("choose", Some("undo")),
+                // Named by the arm above.
+                Kind::Settings => ("choose", None),
                 Kind::Status => ("scroll", None),
                 // The vault panel names its own keys on its last row.
                 Kind::Vault => ("choose", None),
@@ -989,6 +1013,38 @@ mod tests {
             !h[2].contains("discord"),
             "stale channel dots are hidden: {h:?}"
         );
+    }
+
+    #[test]
+    fn header_shows_the_waiting_badge() {
+        let mut s = up();
+        assert!(!plain(header(&s, &DARK, 100, NOW))[0].contains("waiting"));
+        s.snapshot.proposals = 2;
+        let h = plain(header(&s, &DARK, 100, NOW));
+        assert!(h[0].trim_end().ends_with("2 waiting"), "{h:?}");
+        assert_eq!(rpi_tui::visible_width(&h[0]), 100);
+        // Beside the pause badge, which stays rightmost.
+        s.snapshot.paused = Some("user".into());
+        let h = plain(header(&s, &DARK, 100, NOW));
+        assert!(h[0].trim_end().ends_with("2 waiting   ⏸ paused"), "{h:?}");
+        // The one-row header keeps it like the pause badge: the channels go first.
+        for w in [59, 50] {
+            let tiny = plain(header(&s, &DARK, w, NOW));
+            assert!(
+                tiny[0].trim_end().ends_with("2 waiting   ⏸ paused"),
+                "{w}: {tiny:?}"
+            );
+            assert!(!tiny[0].contains("discord"), "{w}: {tiny:?}");
+        }
+        s.snapshot.paused = None;
+        let tiny = plain(header(&s, &DARK, 59, NOW));
+        assert!(tiny[0].trim_end().ends_with("2 waiting"), "{tiny:?}");
+        // A count the daemon cannot vouch for right now is not shown.
+        s.link = Link::Down {
+            why: "refused".into(),
+        };
+        assert!(!plain(header(&s, &DARK, 100, NOW))[0].contains("waiting"));
+        assert!(!plain(header(&s, &DARK, 59, NOW))[0].contains("waiting"));
     }
 
     #[test]
@@ -1319,6 +1375,50 @@ mod tests {
         }
         assert!(
             left(&s, 120).starts_with("  ⏎ send the code · esc cancel"),
+            "{}",
+            left(&s, 120)
+        );
+        // The settings panel names the keys of where the keyboard is.
+        s.overlay = Some(Overlay::new(Kind::Settings));
+        if let Some(o) = s.overlay.as_mut() {
+            o.settings.load(
+                &serde_json::json!({"sections": [{"name": "Accounts", "settings": [
+                {"key": "auth.enabled", "label": "Token refresh", "kind": {"type": "bool"},
+                 "value": "true", "source": "default", "access": "propose"}]},
+                {"name": "Read-only", "settings": [{"key": "rpi", "label": "rpi",
+                 "kind": {"type": "text", "max": 0}, "access": "read-only"}]}]}),
+            );
+        }
+        assert!(
+            left(&s, 120).starts_with("  ↑↓ choose · → open · ? keys · esc close"),
+            "{}",
+            left(&s, 120)
+        );
+        s.overlay.as_mut().unwrap().settings.row = Some(0);
+        assert!(
+            left(&s, 120).starts_with(
+                "  ⏎ edit · space toggle · t time limit · ↑↓ choose · ← sections · ? keys · esc close"
+            ),
+            "{}",
+            left(&s, 120)
+        );
+        assert!(
+            left(&s, 59).starts_with("  ⏎ edit · esc close  "),
+            "{}",
+            left(&s, 59)
+        );
+        // A read-only row has nothing to edit.
+        s.overlay.as_mut().unwrap().settings.at = 1;
+        assert!(
+            left(&s, 120).starts_with("  ↑↓ choose · ← sections · ? keys · esc close"),
+            "{}",
+            left(&s, 120)
+        );
+        s.overlay.as_mut().unwrap().settings.at = 2;
+        assert!(
+            left(&s, 120).starts_with(
+                "  ⏎ card · o ok · 1 once · d drop · ↑↓ choose · ← sections · esc close"
+            ),
             "{}",
             left(&s, 120)
         );

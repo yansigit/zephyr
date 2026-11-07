@@ -4,6 +4,7 @@
 
 use super::chrome::{short_model, spend, State};
 use super::conn::{AccountModels, Login, LoginStatus, Provider, Snapshot, Turn, VaultEntry};
+use super::settings_panel::{self, SettingsPanel};
 use super::theme::{glyph, Palette};
 use super::view::clean;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -209,6 +210,16 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("Gateway", "/resume", "answer what waited"),
     ("Gateway", "/reload", "apply zephyr.toml and secrets.env"),
     (
+        "Gateway",
+        "/settings",
+        "every setting to change, and what waits for your OK",
+    ),
+    (
+        "Gateway",
+        "/set <key> <value> [for <time>]",
+        "change one setting, for good or for a while",
+    ),
+    (
         "Keys",
         "Up / Down",
         "your earlier messages; Up on an empty box first undoes ^C",
@@ -279,6 +290,9 @@ pub enum Kind {
     History,
     /// Esc Esc: the exchanges `/undo N` counts, newest first; picking one takes it back.
     Rewind,
+    /// `/settings`: every setting by section, an editor per kind, and what waits for the owner
+    /// (settings spec §4.6; `settings_panel.rs`).
+    Settings,
 }
 
 /// `Kind::Vault`'s own state.
@@ -536,9 +550,11 @@ pub struct Overlay {
     pub history: Vec<String>,
     /// The `zephyr.turns` answer for the rewind picker, once it came.
     pub turns: Option<Vec<Turn>>,
+    /// The settings panel's own state.
+    pub settings: SettingsPanel,
     /// The first row shown and how many fit, from the last frame.
-    top: usize,
-    page: usize,
+    pub(super) top: usize,
+    pub(super) page: usize,
 }
 
 impl Overlay {
@@ -553,6 +569,7 @@ impl Overlay {
             vault: VaultPanel::default(),
             history: vec![],
             turns: None,
+            settings: SettingsPanel::default(),
             top: 0,
             page: 1,
         }
@@ -578,6 +595,17 @@ pub enum Action {
     VaultRm(String),
     /// Take back every grant of this vault entry.
     VaultRevoke(String),
+    /// Change a setting: `zephyr.settings_set`, with a time limit (`2h`) or for good.
+    SettingsSet {
+        key: String,
+        value: String,
+        until: Option<String>,
+    },
+    /// Decide a waiting proposal: `zephyr.decide` with `ok`, `once` or `no`.
+    Decide {
+        id: i64,
+        verb: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -593,6 +621,9 @@ pub enum Row {
     },
     /// A styled line (the status panel).
     Line(String),
+    /// A styled line holding the keyboard, in a panel that draws its own selection (settings):
+    /// drawn as it is, and kept in view like a chosen item.
+    Focus(String),
 }
 
 /// The panel's rows for `snap`, filtered by the query. `now` is in milliseconds; `width` is
@@ -613,6 +644,7 @@ pub fn rows(
         Kind::History => return history_rows(o, p),
         Kind::Model => model_groups(o, snap, tz, now),
         Kind::Rewind => rewind_groups(o),
+        Kind::Settings => return settings_panel::rows(o, snap, p, tz, now, width),
     };
     let words: Vec<String> = o.query.split_whitespace().map(str::to_lowercase).collect();
     let mut out = vec![];
@@ -676,7 +708,7 @@ pub fn rewound(o: &Overlay, pick: &str) -> Option<String> {
     Some(o.turns.as_ref()?.get(k.checked_sub(1)?)?.text.clone())
 }
 
-type Group = (String, String, Vec<Row>);
+pub(super) type Group = (String, String, Vec<Row>);
 
 /// Ctrl+R's rows: every entry holding what was typed, one line each.
 fn history_rows(o: &Overlay, p: &Palette) -> Vec<Row> {
@@ -723,7 +755,12 @@ fn help_groups() -> Vec<Group> {
 
 /// One group per account, or per provider without a pool. Until `zephyr.models` answers,
 /// each account shows the model it is set to.
-fn model_groups(o: &Overlay, snap: &Snapshot, tz: &jiff::tz::TimeZone, now: i64) -> Vec<Group> {
+pub(super) fn model_groups(
+    o: &Overlay,
+    snap: &Snapshot,
+    tz: &jiff::tz::TimeZone,
+    now: i64,
+) -> Vec<Group> {
     let fallback = || -> Vec<AccountModels> {
         if snap.accounts.is_empty() {
             return vec![AccountModels {
@@ -1265,10 +1302,13 @@ fn vault_key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
     Action::None
 }
 
-/// A paste into the vault form goes to the field at the cursor, as typing would.
+/// A paste into the vault form or a settings editor goes where typing would.
 pub fn paste(o: &mut Overlay, text: &str) {
     if let Some(form) = o.vault.form.as_mut().filter(|_| o.kind == Kind::Vault) {
         form.type_text(text);
+    }
+    if o.kind == Kind::Settings {
+        settings_panel::paste(o, text);
     }
 }
 
@@ -1337,14 +1377,15 @@ fn login_key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
 /// picker only until its sign-in starts — the token goes where the filter was.
 fn lists(o: &Overlay) -> bool {
     match o.kind {
-        Kind::Status | Kind::Vault => false,
+        // The settings panel's model editor draws its own filter line, among its rows.
+        Kind::Status | Kind::Vault | Kind::Settings => false,
         Kind::Login => o.login.running().is_none(),
         Kind::Model | Kind::Help | Kind::History | Kind::Rewind => true,
     }
 }
 
 /// The positions of the pickable rows.
-fn picks(rows: &[Row]) -> Vec<usize> {
+pub(super) fn picks(rows: &[Row]) -> Vec<usize> {
     (0..rows.len())
         .filter(|&i| matches!(rows[i], Row::Item { .. }))
         .collect()
@@ -1357,6 +1398,9 @@ pub fn key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
     }
     if o.kind == Kind::Vault {
         return vault_key(o, k, rows);
+    }
+    if o.kind == Kind::Settings {
+        return settings_panel::key(o, k, rows);
     }
     let picks = picks(rows);
     let last = picks.len().saturating_sub(1);
@@ -1419,6 +1463,7 @@ pub fn render(
         Kind::Login => " sign in ",
         Kind::Vault => " vault ",
         Kind::Rewind => " rewind ",
+        Kind::Settings => " settings ",
     };
     let fill = width.saturating_sub(visible_width(title) + 3);
     let mut lines = vec![format!(
@@ -1458,7 +1503,10 @@ pub fn render(
     }
     let cap = height.saturating_sub(lines.len() + 1).max(1);
     o.page = cap;
-    if let Some(&at) = picks.get(o.selected) {
+    // The chosen item, else the row a panel marked as holding the keyboard.
+    let focus = (picks.get(o.selected).copied())
+        .or_else(|| rows.iter().position(|r| matches!(r, Row::Focus(_))));
+    if let Some(at) = focus {
         // A group's first item brings its heading into view.
         let at_head =
             at.saturating_sub(usize::from(at > 0 && matches!(rows[at - 1], Row::Head(..))));
@@ -1486,10 +1534,10 @@ pub fn render(
                 } else {
                     " ".into()
                 };
-                // Only the model picker has a current choice to mark.
+                // The model picker and the settings editors mark the value in use.
                 let dot = match (o.kind, current) {
-                    (Kind::Model, true) => format!("{} ", p.accent.fg(glyph("●"))),
-                    (Kind::Model, false) => "  ".into(),
+                    (Kind::Model | Kind::Settings, true) => format!("{} ", p.accent.fg(glyph("●"))),
+                    (Kind::Model | Kind::Settings, false) => "  ".into(),
                     _ => String::new(),
                 };
                 let label = format!(
@@ -1499,7 +1547,7 @@ pub fn render(
                 let label = if sel { bold(&label) } else { label };
                 format!(" {mark} {dot}{}  {}", p.text.fg(&label), p.muted.fg(note))
             }
-            Row::Line(text) => text.clone(),
+            Row::Line(text) | Row::Focus(text) => text.clone(),
         };
         lines.push(boxed(&line, sel));
     }
@@ -1522,7 +1570,7 @@ pub fn render(
 
 /// The width of a label column: the widest label that is not an outlier; a longer one
 /// pushes its note right instead of widening every row.
-fn column<'a>(labels: impl Iterator<Item = &'a str>) -> usize {
+pub(super) fn column<'a>(labels: impl Iterator<Item = &'a str>) -> usize {
     const MAX: usize = 26;
     labels
         .map(visible_width)
@@ -1837,7 +1885,7 @@ mod tests {
         let got = plain(&render(&mut o, &rows, &DARK, 80, 8));
         assert_eq!(got.len(), 8);
         assert_eq!(got[2], format!("│ Chat{}│", " ".repeat(73)));
-        assert!(got[7].ends_with(" 1-5 of 89 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 1-5 of 91 ─╯"), "{got:?}");
         for _ in 0..40 {
             key(&mut o, press(KeyCode::Down), &rows);
         }
@@ -1847,7 +1895,7 @@ mod tests {
             got[6],
             "│  › /memory ok                  let the agent see the waiting change          │"
         );
-        assert!(got[7].ends_with(" 40-44 of 89 ─╯"), "{got:?}");
+        assert!(got[7].ends_with(" 40-44 of 91 ─╯"), "{got:?}");
         key(&mut o, press(KeyCode::Down), &rows);
         assert_eq!(
             key(&mut o, press(KeyCode::Enter), &rows),
@@ -2053,6 +2101,441 @@ mod tests {
             Action::VaultRevoke("GH_TOKEN".into())
         );
         assert_eq!(hit(&mut o, &s, KeyCode::Esc), Action::Close);
+    }
+
+    /// `zephyr.settings`' answer, cut down: a model, a choice, an optional number with a time
+    /// limit running, a bool the agent changed, a bounded number and a read-only entry.
+    fn settings_answer() -> serde_json::Value {
+        use serde_json::json;
+        let row = |key: &str, label: &str, kind: serde_json::Value, value: Option<&str>| {
+            json!({"key": key, "label": label, "help": format!("help for {key}"), "kind": kind,
+                   "value": value, "source": "default", "access": "propose", "strong": false,
+                   "until": null})
+        };
+        let with = |mut v: serde_json::Value, field: &str, x: serde_json::Value| {
+            v[field] = x;
+            v
+        };
+        let float =
+            json!({"type": "optional", "inner": {"type": "float", "min": 0.0, "max": 1.0e9}});
+        let cost = row(
+            "budget.daily_cost_usd",
+            "Daily cost (USD)",
+            float,
+            Some("5"),
+        );
+        let cost = with(
+            with(cost, "source", json!("until 15:30")),
+            "strong",
+            json!(true),
+        );
+        let cost = with(cost, "access", json!("tighten"));
+        let turns = json!({"type": "optional", "inner": {"type": "int", "min": 1, "max": 100000}});
+        let refresh = row(
+            "auth.enabled",
+            "Token refresh",
+            json!({"type": "bool"}),
+            Some("true"),
+        );
+        json!({"sections": [
+            {"name": "Model", "settings": [
+                with(row("model", "Model", json!({"type": "model"}), Some("anthropic/claude-opus-5")),
+                     "source", json!("you")),
+                row("thinking", "Thinking level",
+                    json!({"type": "choice", "options": ["off", "low", "medium", "high"]}), Some("medium")),
+            ]},
+            {"name": "Budget", "settings": [cost, row("budget.run_turns", "Turns per run", turns, None)]},
+            {"name": "Accounts", "settings": [
+                with(refresh, "source", json!("agent (#4)")),
+                row("auth.refresh_minutes", "Refresh check (minutes)",
+                    json!({"type": "int", "min": 1, "max": 60}), Some("5")),
+            ]},
+            {"name": "Read-only", "settings": [
+                with(row("owners", "Owners", json!({"type": "text", "max": 0}), None),
+                     "access", json!("read-only")),
+            ]},
+        ], "strong_channels": ["tui", "chat"]})
+    }
+
+    fn proposals_answer() -> serde_json::Value {
+        serde_json::json!({"proposals": [
+            {"id": 12, "card": "/set budget.daily_cost_usd 8 for 2h", "kind": "setting",
+             "key": "budget.daily_cost_usd", "age_secs": 180, "expires_in_secs": 86_220, "strong": true},
+            {"id": 11, "card": "/set tasks.parallel 4", "kind": "setting", "key": "tasks.parallel",
+             "age_secs": 7_200, "expires_in_secs": 79_200, "strong": false},
+        ]})
+    }
+
+    fn settings_panel() -> Overlay {
+        let mut o = Overlay::new(Kind::Settings);
+        o.settings.load(&settings_answer());
+        o
+    }
+
+    fn typing(o: &mut Overlay, s: &Snapshot, text: &str) {
+        for c in text.chars() {
+            assert_eq!(hit(o, s, KeyCode::Char(c)), Action::None, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn settings_panel_lists_sections_and_sources() {
+        let s = snap();
+        let mut o = Overlay::new(Kind::Settings);
+        let early = draw(&mut o, &s, 80, 20);
+        assert_eq!(
+            early[0],
+            "╭─ settings ───────────────────────────────────────────────────────────────────╮"
+        );
+        assert!(early[1].contains("listing settings…"), "{early:?}");
+        o.settings.load(&settings_answer());
+        o.settings.load_waiting(&proposals_answer());
+        let got = draw(&mut o, &s, 80, 20);
+        // Left: the sections, then Waiting with its count; right: the open section's rows,
+        // each `label · value · source`.
+        assert_eq!(
+            got[1],
+            "│ › Model           Model           anthropic/claude-opus-5 · you              │"
+        );
+        assert_eq!(
+            got[2],
+            "│   Budget          Thinking level  medium                  · default          │"
+        );
+        assert!(got[3].starts_with("│   Accounts  "), "{got:?}");
+        assert!(got[4].starts_with("│   Read-only  "), "{got:?}");
+        assert!(got[5].starts_with("│   Waiting (2)  "), "{got:?}");
+        // Down opens the next section; its sources say who set each value, and until when.
+        hit(&mut o, &s, KeyCode::Down);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got[1].contains("  Daily cost (USD)  5    · until 15:30"),
+            "{got:?}"
+        );
+        assert!(
+            got[2].contains("› Budget          Turns per run     none · default"),
+            "{got:?}"
+        );
+        // Right moves the keyboard onto the rows: the chosen one says what it is and takes.
+        hit(&mut o, &s, KeyCode::Right);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(got[1].contains("› Daily cost (USD)  5"), "{got:?}");
+        assert!(
+            got.iter()
+                .any(|l| l.contains("help for budget.daily_cost_usd")),
+            "{got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|l| l.contains("a number from 0, or none · the agent may tighten it  ")),
+            "{got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|l| l.contains("loosening it needs tui or chat")),
+            "{got:?}"
+        );
+        hit(&mut o, &s, KeyCode::Down);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(got[2].contains("› Turns per run     none"), "{got:?}");
+        // The agent's change names its proposal; read-only entries are drawn muted.
+        hit(&mut o, &s, KeyCode::Left);
+        hit(&mut o, &s, KeyCode::Down);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got[1].contains("Token refresh            true · agent (#4)"),
+            "{got:?}"
+        );
+        hit(&mut o, &s, KeyCode::Down);
+        let lines: Vec<String> = (list(&o, &s).into_iter())
+            .filter_map(|r| match r {
+                Row::Line(t) | Row::Focus(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        let owners = lines.iter().find(|l| l.contains("Owners")).unwrap();
+        assert!(
+            owners.contains(&DARK.muted.fg("Owners  help for owners")),
+            "{owners:?}"
+        );
+        // Enter on a read-only row says where it changes instead of opening an editor.
+        hit(&mut o, &s, KeyCode::Right);
+        assert_eq!(hit(&mut o, &s, KeyCode::Enter), Action::None);
+        assert!(o.settings.editing.is_none());
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got.iter()
+                .any(|l| l.contains("Owners is read-only here: edit zephyr.toml")),
+            "{got:?}"
+        );
+        assert_eq!(hit(&mut o, &s, KeyCode::Esc), Action::Close);
+    }
+
+    #[test]
+    fn a_bool_toggles_with_space_and_sends_settings_set() {
+        let s = snap();
+        let mut o = settings_panel();
+        draw(&mut o, &s, 80, 20);
+        hit(&mut o, &s, KeyCode::Down);
+        hit(&mut o, &s, KeyCode::Down);
+        hit(&mut o, &s, KeyCode::Right);
+        // Space toggles at once: the change goes out, with no editor in between.
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Char(' ')),
+            Action::SettingsSet {
+                key: "auth.enabled".into(),
+                value: "false".into(),
+                until: None,
+            }
+        );
+        assert!(o.settings.editing.is_none());
+        // `t` makes the same change for a while: the other value is chosen, the keyboard on
+        // the time limit.
+        assert_eq!(hit(&mut o, &s, KeyCode::Char('t')), Action::None);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(got[1].contains("Token refresh  auth.enabled"), "{got:?}");
+        assert!(got.iter().any(|l| l.contains("  ● true")), "{got:?}");
+        assert!(got.iter().any(|l| l.contains("›   false")), "{got:?}");
+        assert!(got.iter().any(|l| l.contains("› for")), "{got:?}");
+        typing(&mut o, &s, "2h");
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Enter),
+            Action::SettingsSet {
+                key: "auth.enabled".into(),
+                value: "false".into(),
+                until: Some("2h".into()),
+            }
+        );
+        // The change closes the editor and is said where the owner is looking.
+        o.settings.answered(
+            &serde_json::json!({"outcome": "changed", "key": "auth.enabled", "old": "true",
+                "new": "false", "applied": "[zephyr] applied", "until": NOW / 1000 + 7200}),
+            &jiff::tz::TimeZone::UTC,
+        );
+        assert!(o.settings.editing.is_none());
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got.iter()
+                .any(|l| l.contains("auth.enabled true → false until 16:02")),
+            "{got:?}"
+        );
+        // Space leaves a number alone.
+        hit(&mut o, &s, KeyCode::Down);
+        assert_eq!(hit(&mut o, &s, KeyCode::Char(' ')), Action::None);
+        assert!(o.settings.editing.is_none());
+    }
+
+    #[test]
+    fn a_refused_edit_shows_its_reason() {
+        let s = snap();
+        let mut o = settings_panel();
+        draw(&mut o, &s, 80, 20);
+        hit(&mut o, &s, KeyCode::Down);
+        // Enter opens the section, then edits the row in a field that fits its kind.
+        hit(&mut o, &s, KeyCode::Enter);
+        assert_eq!(hit(&mut o, &s, KeyCode::Enter), Action::None);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got[1].contains("Daily cost (USD)  budget.daily_cost_usd"),
+            "{got:?}"
+        );
+        assert!(
+            got.iter().any(|l| l.contains("a number from 0, or none")),
+            "{got:?}"
+        );
+        assert!(got.iter().any(|l| l.contains("› value  5")), "{got:?}");
+        hit(&mut o, &s, KeyCode::Backspace);
+        typing(&mut o, &s, "-1");
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Enter),
+            Action::SettingsSet {
+                key: "budget.daily_cost_usd".into(),
+                value: "-1".into(),
+                until: None,
+            }
+        );
+        let reason = "not changed: [budget] daily_cost_usd must be 0 to 1000000000";
+        o.settings.answered(
+            &serde_json::json!({"outcome": "refused", "reason": reason}),
+            &jiff::tz::TimeZone::UTC,
+        );
+        // The editor stays, with what was typed and why it was refused, in the error colour.
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(got.iter().any(|l| l.contains("› value  -1")), "{got:?}");
+        assert!(got.iter().any(|l| l.contains(reason)), "{got:?}");
+        let rows = list(&o, &s);
+        assert!(rows.contains(&Row::Line(DARK.error.fg(reason))), "{rows:?}");
+        // Fixed and sent again it goes out; Esc leaves the editor, and the reason with it.
+        hit(&mut o, &s, KeyCode::Backspace);
+        hit(&mut o, &s, KeyCode::Backspace);
+        typing(&mut o, &s, "8");
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Enter),
+            Action::SettingsSet {
+                key: "budget.daily_cost_usd".into(),
+                value: "8".into(),
+                until: None,
+            }
+        );
+        assert_eq!(hit(&mut o, &s, KeyCode::Esc), Action::None);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(!got.iter().any(|l| l.contains("must be")), "{got:?}");
+        assert!(got[1].contains("› Daily cost (USD)"), "{got:?}");
+        // The answer to the edit left behind says what changed, and leaves the editor opened since.
+        hit(&mut o, &s, KeyCode::Down);
+        hit(&mut o, &s, KeyCode::Enter);
+        o.settings.answered(
+            &serde_json::json!({"outcome": "changed", "key": "budget.daily_cost_usd", "old": "5",
+                "new": "8", "applied": "[zephyr] applied", "until": null}),
+            &jiff::tz::TimeZone::UTC,
+        );
+        let editing = o.settings.editing.as_ref().map(|e| e.key.as_str());
+        assert_eq!(editing, Some("budget.run_turns"));
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got.iter()
+                .any(|l| l.contains("budget.daily_cost_usd 5 → 8")),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_model_setting_edits_in_the_model_picker_and_a_choice_in_a_list() {
+        let s = snap();
+        let mut o = settings_panel();
+        o.models = Some(models());
+        draw(&mut o, &s, 80, 20);
+        hit(&mut o, &s, KeyCode::Right);
+        hit(&mut o, &s, KeyCode::Enter);
+        // The model picker's groups, the model in effect marked; typing filters them.
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got.iter().any(|l| l.contains("› type to filter")),
+            "{got:?}"
+        );
+        assert!(got.iter().any(|l| l.contains("work  in use")), "{got:?}");
+        assert!(
+            got.iter().any(|l| l.contains("› ● claude-opus-5")),
+            "{got:?}"
+        );
+        assert!(got.iter().any(|l| l.contains("    gpt-6")), "{got:?}");
+        typing(&mut o, &s, "sonn");
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(!got.iter().any(|l| l.contains("gpt-6")), "{got:?}");
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Enter),
+            Action::SettingsSet {
+                key: "model".into(),
+                value: "anthropic/claude-sonnet-5".into(),
+                until: None,
+            }
+        );
+        hit(&mut o, &s, KeyCode::Esc);
+        // A choice is a list starting on the value in effect.
+        hit(&mut o, &s, KeyCode::Down);
+        hit(&mut o, &s, KeyCode::Enter);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(got.iter().any(|l| l.contains("› ● medium")), "{got:?}");
+        assert!(
+            got.iter()
+                .any(|l| l.contains("one of off, low, medium, high")),
+            "{got:?}"
+        );
+        hit(&mut o, &s, KeyCode::Down);
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Enter),
+            Action::SettingsSet {
+                key: "thinking".into(),
+                value: "high".into(),
+                until: None,
+            }
+        );
+    }
+
+    #[test]
+    fn waiting_tab_approves_with_o_and_drops_with_d() {
+        let s = snap();
+        let mut o = settings_panel();
+        o.settings.load_waiting(&proposals_answer());
+        draw(&mut o, &s, 80, 20);
+        hit(&mut o, &s, KeyCode::End);
+        // Newest first, each with how long it has waited.
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got[1].contains("#12  /set budget.daily_cost_usd 8 for 2h"),
+            "{got:?}"
+        );
+        assert!(got[1].trim_end_matches(" │").ends_with("3m ago"), "{got:?}");
+        assert!(got[2].contains("#11  /set tasks.parallel 4"), "{got:?}");
+        assert!(got[2].trim_end_matches(" │").ends_with("2h ago"), "{got:?}");
+        assert!(got[5].starts_with("│ › Waiting (2)"), "{got:?}");
+        hit(&mut o, &s, KeyCode::Right);
+        // Enter shows the whole card; Esc goes back to the list.
+        hit(&mut o, &s, KeyCode::Enter);
+        let card = draw(&mut o, &s, 80, 20);
+        assert!(card[1].contains("proposal #12"), "{card:?}");
+        assert!(
+            card.iter()
+                .any(|l| l.contains("/set budget.daily_cost_usd 8 for 2h")),
+            "{card:?}"
+        );
+        assert!(
+            card.iter()
+                .any(|l| l.contains("waited 3m · expires in 23h 57m")),
+            "{card:?}"
+        );
+        // What it would change, as it stands.
+        assert!(
+            card.iter().any(|l| l.contains("now 5 · until 15:30")),
+            "{card:?}"
+        );
+        assert!(
+            card.iter()
+                .any(|l| l.contains("needs a strong channel: tui or chat")),
+            "{card:?}"
+        );
+        assert_eq!(hit(&mut o, &s, KeyCode::Esc), Action::None);
+        assert!(!draw(&mut o, &s, 80, 20)[1].contains("proposal #12"));
+        hit(&mut o, &s, KeyCode::Enter);
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Char('o')),
+            Action::Decide {
+                id: 12,
+                verb: "ok".into()
+            }
+        );
+        o.settings.decided(&serde_json::json!({"ok": true,
+            "text": "[zephyr] /ok 12 approved /set budget.daily_cost_usd 8 for 2h\n[zephyr] budget.daily_cost_usd 5 → 8 until 16:02"}));
+        let mut left = proposals_answer();
+        left["proposals"].as_array_mut().unwrap().remove(0);
+        o.settings.load_waiting(&left);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(got[1].contains("› #11  /set tasks.parallel 4"), "{got:?}");
+        assert!(got[5].starts_with("│ › Waiting (1)"), "{got:?}");
+        assert!(
+            got.iter()
+                .any(|l| l.contains("budget.daily_cost_usd 5 → 8 until 16:02")),
+            "{got:?}"
+        );
+        // `1` approves once (the same as ok for a setting); `d` drops.
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Char('1')),
+            Action::Decide {
+                id: 11,
+                verb: "once".into()
+            }
+        );
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Char('d')),
+            Action::Decide {
+                id: 11,
+                verb: "no".into()
+            }
+        );
+        o.settings
+            .load_waiting(&serde_json::json!({"proposals": []}));
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(got[1].contains("nothing waits for you"), "{got:?}");
+        assert!(got[5].starts_with("│ › Waiting (0)"), "{got:?}");
     }
 
     #[test]
