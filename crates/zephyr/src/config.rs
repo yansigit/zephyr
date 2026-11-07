@@ -64,6 +64,10 @@ pub struct Config {
     /// often a run's progress is shown again. Not configurable; tests shorten it.
     #[serde(skip, default = "tick")]
     pub tick: std::time::Duration,
+    /// The shortest time limit a setting change may carry (`for 30s`). Not configurable; tests
+    /// shorten it.
+    #[serde(skip, default = "min_until")]
+    pub min_until: std::time::Duration,
     /// `[agent]`: what the agent's processes get (DESIGN §4.4).
     #[serde(default)]
     pub agent: Agent,
@@ -96,6 +100,10 @@ fn stall_limit() -> std::time::Duration {
 
 fn tick() -> std::time::Duration {
     std::time::Duration::from_secs(5)
+}
+
+fn min_until() -> std::time::Duration {
+    std::time::Duration::from_secs(30)
 }
 
 fn projects() -> Option<PathBuf> {

@@ -24,6 +24,7 @@ pub mod retention;
 pub mod router;
 pub mod rpc;
 pub mod scheduler;
+pub mod settings;
 pub mod store;
 pub mod supervise;
 pub mod tasks;
