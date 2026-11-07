@@ -89,6 +89,9 @@ pub struct SettingsPanel {
     pub note: Option<(bool, String)>,
     /// `?`: the panel's keys instead of the settings.
     pub help: bool,
+    /// The proposal the Waiting cursor was on, when a reload took it away and moved the cursor
+    /// to another the owner has not seen chosen: the next `o`, `1` or `d` only says so.
+    moved: Option<i64>,
 }
 
 /// An edit of one setting, in the editor its kind takes.
@@ -140,7 +143,7 @@ fn field(kind: &Value) -> Field {
 
 fn options(kind: &Value) -> Vec<String> {
     (kind["options"].as_array().into_iter().flatten())
-        .filter_map(|o| o.as_str().map(String::from))
+        .filter_map(|o| o.as_str().map(line))
         .collect()
 }
 
@@ -185,39 +188,75 @@ impl SettingsPanel {
         if let Some(e) = v.get("error") {
             self.problem = Some(format!(
                 "the gateway did not list its settings: {}",
-                e.as_str().unwrap_or("no answer")
+                line(e.as_str().unwrap_or("no answer"))
             ));
             self.sections.get_or_insert_with(Vec::new);
         } else {
-            self.sections = Some(serde_json::from_value(v["sections"].clone()).unwrap_or_default());
-            self.strong = serde_json::from_value(v["strong_channels"].clone()).unwrap_or_default();
+            let mut sections: Vec<Section> =
+                serde_json::from_value(v["sections"].clone()).unwrap_or_default();
+            for x in &mut sections {
+                x.name = line(&x.name);
+                for e in &mut x.settings {
+                    for text in [
+                        &mut e.key,
+                        &mut e.label,
+                        &mut e.help,
+                        &mut e.source,
+                        &mut e.access,
+                    ] {
+                        *text = line(text);
+                    }
+                    e.value = e.value.as_deref().map(line);
+                }
+            }
+            self.sections = Some(sections);
+            let strong: Vec<String> =
+                serde_json::from_value(v["strong_channels"].clone()).unwrap_or_default();
+            self.strong = strong.iter().map(|c| line(c)).collect();
             self.problem = None;
         }
         self.clamp();
     }
 
-    /// Takes `zephyr.proposals`' answer. A card whose proposal is gone closes.
+    /// Takes `zephyr.proposals`' answer. The cursor stays on the proposal it was on wherever the
+    /// newest-first list moved it; if that one is gone, the nearest row is chosen and marked
+    /// unseen. A card whose proposal is gone closes.
     pub fn load_waiting(&mut self, v: &Value) {
-        let list: Vec<Proposal> =
+        let mut list: Vec<Proposal> =
             serde_json::from_value(v["proposals"].clone()).unwrap_or_default();
+        for pr in &mut list {
+            pr.card = tidy(&pr.card);
+            pr.kind = line(&pr.kind);
+            pr.key = pr.key.as_deref().map(line);
+        }
+        let picked = self.proposal().map(|pr| pr.id);
         if self.card.is_some_and(|id| !list.iter().any(|p| p.id == id)) {
             self.card = None;
         }
+        let at = picked.and_then(|id| list.iter().position(|p| p.id == id));
         self.waiting = Some(list);
+        match (picked, at) {
+            (Some(_), Some(i)) => self.row = Some(i),
+            (Some(id), None) => self.moved = Some(id),
+            (None, _) => {}
+        }
         self.clamp();
+        if self.proposal().is_none() {
+            self.moved = None;
+        }
     }
 
     /// Takes `zephyr.settings_set`'s answer: a change closes the editor and says what changed; a
     /// refusal keeps it open, with the reason under what was typed. Only the editor that sent
     /// the change is closed: one the owner opened since, after leaving that one, stays.
     pub fn answered(&mut self, v: &Value, tz: &jiff::tz::TimeZone) {
-        let shown = |k: &str| v[k].as_str().unwrap_or("none").to_string();
+        let shown = |k: &str| line(v[k].as_str().unwrap_or("none"));
         let sent = self.editing.as_ref().is_some_and(|e| e.sent);
         match v["outcome"].as_str() {
             Some("changed") => {
                 let mut said = format!(
                     "{} {} {} {}",
-                    v["key"].as_str().unwrap_or_default(),
+                    line(v["key"].as_str().unwrap_or_default()),
                     shown("old"),
                     glyph("→"),
                     shown("new")
@@ -295,9 +334,27 @@ impl SettingsPanel {
     }
 }
 
+/// Text from the daemon, safe to draw: [`clean`]'s cleaning (no escape sequences or control
+/// characters), and no characters that turn the direction of what follows, so a value the agent
+/// once had approved cannot paint over the panel or pass for other text. Lines are kept.
+fn tidy(text: &str) -> String {
+    // The embeddings, overrides and isolates the plugin refuses in rule text, and the marks.
+    let turns = |c: char| {
+        matches!(c,
+            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            | '\u{200e}' | '\u{200f}' | '\u{061c}')
+    };
+    clean(text).chars().filter(|&c| !turns(c)).collect()
+}
+
+/// [`tidy`] on one line: a label, a value, a source.
+fn line(text: &str) -> String {
+    tidy(text).replace('\n', " ")
+}
+
 /// The daemon's reply without its `[zephyr] ` prefixes, cleaned like the transcript's text.
 fn unprefixed(text: &str) -> String {
-    let lines: Vec<String> = (clean(text).lines())
+    let lines: Vec<String> = (tidy(text).lines())
         .map(|l| l.strip_prefix("[zephyr] ").unwrap_or(l).to_string())
         .collect();
     lines.join("\n")
@@ -550,14 +607,19 @@ fn waiting_cells(s: &SettingsPanel, p: &Palette, w: usize) -> Vec<String> {
 
 /// The text a card shows, on one line: the agent shaped it, so nothing in it moves the cursor.
 fn one_line(text: &str) -> String {
-    clean(text).split_whitespace().collect::<Vec<_>>().join(" ")
+    tidy(text).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// What the chosen setting is, what it takes and who may change it.
 fn about_setting(e: &Entry, strong: &[String]) -> Vec<String> {
-    // A read-only row without a value shows its help in the row already.
+    // The key first, since rows can share a label; a read-only row without a value already
+    // shows its help.
+    let dot = format!(" {} ", glyph("·"));
     let help = !e.help.is_empty() && !(e.read_only() && e.value.is_none());
-    let mut out: Vec<String> = help.then(|| e.help.clone()).into_iter().collect();
+    let mut out = vec![match help {
+        true => format!("{}{dot}{}", e.key, e.help),
+        false => e.key.clone(),
+    }];
     if e.read_only() {
         out.push("read-only here: edit zephyr.toml to change it".into());
         return out;
@@ -571,7 +633,7 @@ fn about_setting(e: &Entry, strong: &[String]) -> Vec<String> {
         }
         .into(),
     );
-    out.push(what.join(&format!(" {} ", glyph("·"))));
+    out.push(what.join(&dot));
     if e.strong && !strong.is_empty() {
         out.push(format!("loosening it needs {}", strong.join(" or ")));
     }
@@ -619,8 +681,8 @@ fn card_rows(s: &SettingsPanel, pr: &Proposal, p: &Palette, width: usize) -> Vec
     };
     let mut out = vec![Row::Head(format!("proposal #{}", pr.id), what)];
     let inner = width.saturating_sub(4).max(1);
-    for line in clean(&pr.card).lines() {
-        out.extend(wrap(line, inner).iter().map(|l| Row::Line(p.text.fg(l))));
+    for text in tidy(&pr.card).lines() {
+        out.extend(wrap(text, inner).iter().map(|l| Row::Line(p.text.fg(l))));
     }
     out.push(Row::Line(String::new()));
     let dot = format!(" {} ", glyph("·"));
@@ -740,18 +802,19 @@ fn model_rows(
                     pick, label, note, ..
                 } if fits(format!("{head} {label} {note} {pick}")) => {
                     let id = pick.strip_prefix("/model ").unwrap_or(&pick).to_string();
+                    // The accounts' model lists come from the daemon too.
                     Some(Row::Item {
                         current: e.value.as_deref() == Some(id.as_str()),
                         pick: id,
-                        label,
-                        note,
+                        label: line(&label),
+                        note: line(&note),
                     })
                 }
                 _ => None,
             })
             .collect();
         if !hit.is_empty() {
-            out.push(Row::Head(head, note));
+            out.push(Row::Head(line(&head), line(&note)));
             out.extend(hit);
         }
     }
@@ -849,6 +912,16 @@ pub fn key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
             }
         }
         (Some(r), code) => {
+            // Any key shows the owner the row a reload moved the cursor to; a decision on it
+            // waits for the next one.
+            if let Some(gone) = s.moved.take() {
+                if let (Some(pr), KeyCode::Char('o' | '1' | 'd')) = (s.proposal(), code) {
+                    let id = pr.id;
+                    let said = format!("#{gone} is no longer waiting; the cursor is on #{id}");
+                    s.note = Some((false, format!("{said}: press again to decide it")));
+                    return Action::None;
+                }
+            }
             let row = match code {
                 KeyCode::Up => r.saturating_sub(1),
                 KeyCode::Down => (r + 1).min(last(len)),

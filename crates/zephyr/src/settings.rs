@@ -882,6 +882,15 @@ pub fn kind_json(k: &Kind) -> serde_json::Value {
     }
 }
 
+/// What attached clients call `key`'s row: a connector's row names its connector, since every
+/// connector shares one entry and its rows would otherwise look alike.
+pub fn label(s: &Setting, key: &str) -> String {
+    match connector(key) {
+        Some(name) => format!("Connector {name} enabled"),
+        None => s.label.to_string(),
+    }
+}
+
 /// The agent's access as attached clients read it; `read-only` for an entry edited in the file.
 pub fn access_name(s: &Setting) -> &'static str {
     if s.section == READ_ONLY {

@@ -1104,6 +1104,38 @@ async fn settings_lists_sections_with_kinds() {
     gw.shutdown().await;
 }
 
+/// Each connector's row names its connector, so two rows Space can flip are told apart.
+#[tokio::test]
+async fn settings_name_each_connector_row() {
+    let gw = start_with(
+        "settings-mcp",
+        "[[mcp]]\nname = \"mail\"\ncommand = \"m\"\n[[mcp]]\nname = \"notes\"\ncommand = \"n\"\n",
+    );
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    let got = c.call("zephyr.settings", json!({})).await;
+    let sections = got["result"]["sections"].as_array().unwrap();
+    let connectors = sections
+        .iter()
+        .find(|s| s["name"] == "Connectors")
+        .unwrap_or_else(|| panic!("{got}"));
+    let rows: Vec<(String, String)> = (connectors["settings"].as_array().unwrap().iter())
+        .map(|r| {
+            let text = |k: &str| r[k].as_str().unwrap_or_default().to_string();
+            (text("key"), text("label"))
+        })
+        .collect();
+    let row = |key: &str, label: &str| (key.to_string(), label.to_string());
+    assert_eq!(
+        rows,
+        [
+            row("mcp.mail.enabled", "Connector mail enabled"),
+            row("mcp.notes.enabled", "Connector notes enabled"),
+        ]
+    );
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn settings_set_answers_changed_or_refused() {
     let gw = start("settings-set");

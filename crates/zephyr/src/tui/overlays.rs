@@ -2219,9 +2219,10 @@ mod tests {
         hit(&mut o, &s, KeyCode::Right);
         let got = draw(&mut o, &s, 80, 20);
         assert!(got[1].contains("› Daily cost (USD)  5"), "{got:?}");
+        // The row's key leads what it is: two rows with one label are still told apart.
         assert!(
             got.iter()
-                .any(|l| l.contains("help for budget.daily_cost_usd")),
+                .any(|l| l.contains("budget.daily_cost_usd · help for budget.daily_cost_usd")),
             "{got:?}"
         );
         assert!(
@@ -2452,6 +2453,122 @@ mod tests {
     }
 
     #[test]
+    fn the_waiting_cursor_stays_on_the_proposal_the_owner_picked() {
+        let s = snap();
+        let mut o = settings_panel();
+        o.settings.load_waiting(&proposals_answer());
+        draw(&mut o, &s, 80, 20);
+        hit(&mut o, &s, KeyCode::End);
+        hit(&mut o, &s, KeyCode::Right);
+        hit(&mut o, &s, KeyCode::Down);
+        assert!(draw(&mut o, &s, 80, 20)[2].contains("› #11"));
+        // The agent files #13 meanwhile. Newest first, #11 moves down a row; the cursor with it.
+        let thirteen = serde_json::json!({"id": 13, "card": "/set tasks.parallel 1",
+            "kind": "setting", "key": "tasks.parallel", "age_secs": 5,
+            "expires_in_secs": 86_395, "strong": false});
+        let mut more = proposals_answer();
+        more["proposals"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, thirteen);
+        o.settings.load_waiting(&more);
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Char('o')),
+            Action::Decide {
+                id: 11,
+                verb: "ok".into()
+            }
+        );
+        assert!(draw(&mut o, &s, 80, 20)[3].contains("› #11"));
+        // #11 is decided elsewhere: the cursor goes to the nearest row, and the next o, 1 or d
+        // only says so, since the owner never saw that row chosen.
+        let mut gone = more.clone();
+        gone["proposals"].as_array_mut().unwrap().remove(2);
+        o.settings.load_waiting(&gone);
+        assert_eq!(hit(&mut o, &s, KeyCode::Char('o')), Action::None);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(got[2].contains("› #12"), "{got:?}");
+        assert!(
+            got.iter()
+                .any(|l| l.contains("#11 is no longer waiting; the cursor is on #12")),
+            "{got:?}"
+        );
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Char('o')),
+            Action::Decide {
+                id: 12,
+                verb: "ok".into()
+            }
+        );
+        // Moving on also counts as having seen the row.
+        gone["proposals"].as_array_mut().unwrap().remove(1);
+        o.settings.load_waiting(&gone);
+        hit(&mut o, &s, KeyCode::Up);
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Char('d')),
+            Action::Decide {
+                id: 13,
+                verb: "no".into()
+            }
+        );
+    }
+
+    #[test]
+    fn what_the_daemon_sends_is_cleaned_before_it_is_drawn() {
+        let s = snap();
+        let mut answer = settings_answer();
+        let model = &mut answer["sections"][0]["settings"][0];
+        model["value"] = serde_json::json!("Asia/\x1b[31mSeoul\u{202e}x");
+        model["source"] = serde_json::json!("you\x1b]0;pwned\x07\u{2066}");
+        model["label"] = serde_json::json!("Mo\u{7}del\nX");
+        let mut o = Overlay::new(Kind::Settings);
+        o.settings.load(&answer);
+        o.settings.load_waiting(&serde_json::json!({"proposals": [
+            {"id": 12, "card": "/set timezone Asia/\x1b[2JSeoul\u{202e}", "kind": "setting",
+             "key": "time\u{2066}zone", "age_secs": 1, "expires_in_secs": 9, "strong": false}]}));
+        let bad = [
+            "\x1b[31m", "\x1b]0;", "\x1b[2J", "\x07", "\u{202e}", "\u{2066}", "\n",
+        ];
+        let check = |o: &Overlay| {
+            for row in list(o, &s) {
+                let text = match row {
+                    Row::Line(t) | Row::Focus(t) => t,
+                    Row::Head(a, b) => format!("{a}{b}"),
+                    Row::Item { label, note, .. } => format!("{label}{note}"),
+                };
+                for b in bad {
+                    assert!(!text.contains(b), "{b:?} reached {text:?}");
+                }
+            }
+        };
+        check(&o);
+        let got = draw(&mut o, &s, 90, 20);
+        assert!(
+            got[1].contains("Model X") && got[1].contains("Asia/Seoulx · you"),
+            "{got:?}"
+        );
+        // An editor, the Waiting list and the card are drawn from the same cleaned text.
+        hit(&mut o, &s, KeyCode::Right);
+        hit(&mut o, &s, KeyCode::Down);
+        hit(&mut o, &s, KeyCode::Enter);
+        assert!(o.settings.editing.is_some());
+        check(&o);
+        hit(&mut o, &s, KeyCode::Esc);
+        hit(&mut o, &s, KeyCode::Left);
+        hit(&mut o, &s, KeyCode::End);
+        hit(&mut o, &s, KeyCode::Right);
+        check(&o);
+        hit(&mut o, &s, KeyCode::Enter);
+        assert!(o.settings.card.is_some());
+        check(&o);
+        let card = draw(&mut o, &s, 90, 20);
+        assert!(
+            card.iter().any(|l| l.contains("/set timezone Asia/Seoul")),
+            "{card:?}"
+        );
+    }
+
+    #[test]
     fn waiting_tab_approves_with_o_and_drops_with_d() {
         let s = snap();
         let mut o = settings_panel();
@@ -2516,7 +2633,12 @@ mod tests {
                 .any(|l| l.contains("budget.daily_cost_usd 5 → 8 until 16:02")),
             "{got:?}"
         );
-        // `1` approves once (the same as ok for a setting); `d` drops.
+        // The cursor moved to #11 with the reload, unseen: the first `1` only says so. Then `1`
+        // approves once (the same as ok for a setting); `d` drops.
+        assert_eq!(hit(&mut o, &s, KeyCode::Char('1')), Action::None);
+        assert!(draw(&mut o, &s, 80, 20)
+            .iter()
+            .any(|l| l.contains("#12 is no longer waiting; the cursor is on #11")),);
         assert_eq!(
             hit(&mut o, &s, KeyCode::Char('1')),
             Action::Decide {

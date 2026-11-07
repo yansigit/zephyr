@@ -1159,7 +1159,7 @@ impl<'a> Router<'a> {
                             let until = self.store.revert(&r.key).ok().flatten().map(|v| v.at);
                             json!({
                                 "key": r.key,
-                                "label": s.label,
+                                "label": crate::settings::label(s, &r.key),
                                 "help": s.help,
                                 "kind": crate::settings::kind_json(&s.kind),
                                 "value": self.shown(&r.key),

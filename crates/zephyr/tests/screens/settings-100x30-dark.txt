@@ -23,7 +23,7 @@
  │   Read-only                                                                                    │
  │   Waiting (1)                                                                                  │
  │                                                                                                │
- │ Tokens per UTC day before the agent pauses; none is no limit.                                  │
+ │ budget.daily_tokens · Tokens per UTC day before the agent pauses; none is no limit.            │
  │ a whole number from 1, or none · the agent may tighten it                                      │
  │ loosening it needs tui or chat                                                                 │
  ╰────────────────────────────────────────────────────────────────────────────────────────────────╯

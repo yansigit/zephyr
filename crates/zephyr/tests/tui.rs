@@ -164,7 +164,7 @@ fn settings() -> Value {
                 json!("5"), "default", "propose"),
         ]},
         {"name": "Connectors", "settings": [
-            row("mcp.github.enabled", "Connector enabled", "Whether the agent may call this connector.", json!({"type": "bool"}),
+            row("mcp.github.enabled", "Connector github enabled", "Whether the agent may call this connector.", json!({"type": "bool"}),
                 json!("true"), "you", "tighten"),
         ]},
         {"name": "Rules", "settings": [
