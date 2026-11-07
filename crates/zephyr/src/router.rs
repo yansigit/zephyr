@@ -1254,7 +1254,15 @@ impl<'a> Router<'a> {
                 json!({
                     "id": p.id,
                     "card": p.command,
-                    "kind": if p.key.is_some() { "setting" } else { "command" },
+                    "kind": if p.kind != "command" {
+                        p.kind.as_str()
+                    } else if p.key.is_some() {
+                        "setting"
+                    } else {
+                        "command"
+                    },
+                    "status": p.status,
+                    "due_at": p.due_at,
                     "key": p.key,
                     "age_secs": (now - p.created_at).max(0),
                     "expires_in_secs": (p.created_at + 86_400 - now).max(0),

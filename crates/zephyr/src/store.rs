@@ -225,8 +225,13 @@ pub struct PendingProposal {
     pub key: Option<String>,
     pub seen: Option<String>,
     pub strong: bool,
-    /// `command` or `setting` rows are slash commands; `run`, `pass` and `wait` are held actions.
+    /// `command` for a slash command (a setting's proposal is one too, see `key`); `run`, `pass`
+    /// or `wait` for a held action.
     pub kind: String,
+    /// `pending`, or `scheduled` for an action waiting out its delay.
+    pub status: String,
+    /// When a `scheduled` action comes due.
+    pub due_at: Option<i64>,
 }
 
 /// What a held action does when the owner approves it (DESIGN approvals §4.6).
@@ -268,8 +273,41 @@ pub struct Origin {
     pub call_id: Option<String>,
 }
 
+/// `Debug` for the two action types prints lengths only: a payload can hold message text and
+/// fact values.
+impl std::fmt::Debug for NewAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("NewAction");
+        d.field("kind", &self.kind)
+            .field("class", &self.class)
+            .field("targets", &self.targets.len())
+            .field("summary_len", &self.summary.len())
+            .field("payload_len", &self.payload.len())
+            .field("secrets", &self.secrets.len())
+            .field("origin", &self.origin)
+            .field("due_at", &self.due_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Action {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("Action");
+        d.field("id", &self.id);
+        d.field("kind", &self.kind)
+            .field("class", &self.class)
+            .field("targets", &self.targets.len())
+            .field("summary_len", &self.summary.len())
+            .field("payload_len", &self.payload.len())
+            .field("secrets", &self.secrets.len())
+            .field("origin", &self.origin)
+            .field("due_at", &self.due_at)
+            .finish_non_exhaustive()
+    }
+}
+
 /// An action to hold. `due_at: Some(_)` is a delay: it is stored `scheduled`, else `pending`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NewAction {
     pub kind: ActionKind,
     pub class: String,
@@ -283,7 +321,7 @@ pub struct NewAction {
 }
 
 /// A held action as stored.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Action {
     pub id: i64,
     pub kind: ActionKind,
@@ -1030,8 +1068,9 @@ impl Store {
     /// The proposals still waiting (pending and inside the 24 h window), newest first.
     pub fn pending_proposals(&self) -> rusqlite::Result<Vec<PendingProposal>> {
         let mut stmt = self.db.prepare(
-            "SELECT id, command, created_at, key, seen, strong, kind FROM proposals
-             WHERE status = 'pending' AND created_at > unixepoch() - 86400
+            "SELECT id, command, created_at, key, seen, strong, kind, status, due_at FROM proposals
+             WHERE (status = 'pending' OR (status = 'scheduled' AND kind != 'command'))
+               AND created_at > unixepoch() - 86400
              ORDER BY created_at DESC, id DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1043,6 +1082,8 @@ impl Store {
                 seen: r.get(4)?,
                 strong: r.get(5)?,
                 kind: r.get(6)?,
+                status: r.get(7)?,
+                due_at: r.get(8)?,
             })
         })?;
         rows.collect()
@@ -1187,14 +1228,16 @@ impl Store {
             .optional()
     }
 
-    /// Records how a taken action ended (`done`, `failed`, ...) and its output.
-    pub fn finish_action(&self, id: i64, status: &str, result: &str) -> rusqlite::Result<()> {
-        self.db.execute(
+    /// Records how a taken action ended (`done`, `failed`, ...) and its output, only for a row
+    /// still `running` or `unknown`: a finished run never overwrites `dropped`, `cancelled` or
+    /// `expired`. Returns whether a row changed.
+    pub fn finish_action(&self, id: i64, status: &str, result: &str) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
             "UPDATE proposals SET status = ?2, result = ?3, settled_at = unixepoch()
-             WHERE id = ?1 AND kind != 'command'",
+             WHERE id = ?1 AND kind != 'command' AND status IN ('running', 'unknown')",
             params![id, status, result],
         )?;
-        Ok(())
+        Ok(n == 1)
     }
 
     fn actions(&self, filter: &str, p: impl rusqlite::Params) -> rusqlite::Result<Vec<Action>> {
@@ -1261,17 +1304,19 @@ impl Store {
     /// Delayed actions whose time has come.
     pub fn due_actions(&self, now: i64) -> rusqlite::Result<Vec<Action>> {
         self.actions(
-            "status = 'scheduled' AND due_at <= ?1 ORDER BY due_at, id",
+            "status = 'scheduled' AND due_at <= ?1 AND created_at > unixepoch() - 86400
+             ORDER BY due_at, id",
             params![now],
         )
     }
 
-    /// Expires `pending` actions older than 24 h and browser waits older than 10 min.
+    /// Expires `pending` and `scheduled` actions older than 24 h and pending browser waits older than 10 min.
     pub fn expire_actions(&self, now: i64) -> rusqlite::Result<Vec<Action>> {
         let mut stmt = self.db.prepare(&format!(
             "UPDATE proposals SET status = 'expired', settled_at = ?1
-             WHERE kind != 'command' AND status = 'pending'
-               AND (created_at <= ?1 - 86400 OR (kind = 'wait' AND created_at <= ?1 - 600))
+             WHERE kind != 'command' AND status IN ('pending', 'scheduled')
+               AND (created_at <= ?1 - 86400
+                    OR (status = 'pending' AND kind = 'wait' AND created_at <= ?1 - 600))
              RETURNING {ACTION_COLS}"
         ))?;
         let rows = stmt.query_map(params![now], action_row)?;
@@ -1305,8 +1350,11 @@ impl Store {
         Ok(())
     }
 
-    /// Whether every target is known for `class`; any `unknown` target is not.
+    /// Whether every target is known for `class`; any `unknown` target is not, nor is no target.
     pub fn all_known(&self, class: &str, targets: &[String]) -> rusqlite::Result<bool> {
+        if targets.is_empty() {
+            return Ok(false);
+        }
         for t in targets {
             let known = t != "unknown"
                 && self
@@ -2322,8 +2370,9 @@ mod tests {
         assert_eq!(held[1].targets, ["alice@example.com"]);
         // The waiting list still shows the pending action, with its kind.
         let p = store.pending_proposals().unwrap();
-        assert_eq!(p.len(), 1);
-        assert_eq!((p[0].id, p[0].kind.as_str()), (a, "run"));
+        assert_eq!(p.len(), 2, "the delayed one waits too");
+        assert_eq!((p[0].id, p[0].kind.as_str()), (d, "run"));
+        assert_eq!((p[1].id, p[1].status.as_str()), (a, "pending"));
         assert_eq!(
             store.held_for_call("main", "call-1").unwrap().map(|h| h.0),
             Some(d.max(a))
@@ -2478,6 +2527,97 @@ mod tests {
             .unwrap();
         assert_eq!(store.held_today(now).unwrap(), 2);
         let _ = c;
+    }
+
+    #[test]
+    fn a_scheduled_action_is_listed_as_waiting_with_its_due_time() {
+        let store = Store::open(&crate::test_dir("store-sched").join("state.db")).unwrap();
+        let d = store.hold_action(&new_action("r", Some(12345))).unwrap();
+        let p = store.pending_proposals().unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!(
+            (p[0].id, p[0].status.as_str(), p[0].due_at),
+            (d, "scheduled", Some(12345))
+        );
+        assert_eq!(p[0].kind, "run");
+    }
+
+    #[test]
+    fn a_scheduled_action_past_a_day_expires_and_is_never_due() {
+        let store = Store::open(&crate::test_dir("store-stuck").join("state.db")).unwrap();
+        let d = store.hold_action(&new_action("r", Some(100))).unwrap();
+        let now: i64 = store
+            .db
+            .query_row("SELECT unixepoch()", [], |r| r.get(0))
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE proposals SET created_at = unixepoch() - 86401 WHERE id = ?1",
+                [d],
+            )
+            .unwrap();
+        assert!(store.due_actions(now).unwrap().is_empty());
+        assert_eq!(store.take_action(d, "running").unwrap(), None);
+        let gone = store.expire_actions(now).unwrap();
+        assert_eq!(gone.iter().map(|a| a.id).collect::<Vec<_>>(), [d]);
+        assert_eq!(gone[0].status, "expired");
+        assert!(store.expire_actions(now).unwrap().is_empty());
+    }
+
+    #[test]
+    fn debug_prints_lengths_not_payloads() {
+        let mut n = new_action("r", None);
+        n.payload = "SECRETPAYLOAD".into();
+        n.secrets = vec!["TOKENNAME".into()];
+        let out = format!("{n:?}");
+        assert!(
+            !out.contains("SECRETPAYLOAD") && !out.contains("TOKENNAME"),
+            "{out}"
+        );
+        assert!(out.contains("payload_len: 13"), "{out}");
+        let store = Store::open(&crate::test_dir("store-debug").join("state.db")).unwrap();
+        let id = store.hold_action(&n).unwrap();
+        let a = store.take_action(id, "running").unwrap().unwrap();
+        let out = format!("{a:?}");
+        assert!(
+            !out.contains("SECRETPAYLOAD") && !out.contains("TOKENNAME"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn no_targets_are_not_known_and_a_finish_never_overwrites() {
+        let store = Store::open(&crate::test_dir("store-finish").join("state.db")).unwrap();
+        assert!(!store.all_known("messages", &[]).unwrap());
+        let a = store.hold_action(&new_action("r", None)).unwrap();
+        assert!(
+            !store.finish_action(a, "done", "x").unwrap(),
+            "still pending"
+        );
+        store.take_action(a, "running").unwrap();
+        assert!(store.finish_action(a, "done", "x").unwrap());
+        assert!(
+            !store.finish_action(a, "failed", "y").unwrap(),
+            "already done"
+        );
+        let b = store.hold_action(&new_action("r", None)).unwrap();
+        store.take_action(b, "dropped").unwrap();
+        assert!(!store.finish_action(b, "done", "z").unwrap());
+        let st: String = store
+            .db
+            .query_row("SELECT status FROM proposals WHERE id = ?1", [b], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(st, "dropped");
+        let c = store.hold_action(&new_action("r", None)).unwrap();
+        store.take_action(c, "running").unwrap();
+        store.restore_actions(1).unwrap();
+        assert!(
+            store.finish_action(c, "done", "late").unwrap(),
+            "unknown can be settled"
+        );
     }
 
     #[test]
