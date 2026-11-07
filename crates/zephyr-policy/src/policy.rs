@@ -459,7 +459,20 @@ fn gated_command(command: &str, depth: usize) -> Vec<(Class, Vec<String>, String
             .ok()?;
         heredocs.get(k)
     };
-    for stage in stages(&text) {
+    let all = stages(&text);
+    // The heredoc body `cat <<EOF |` feeds to the next stage, when the stage before it is that cat.
+    let fed = |i: usize| -> Option<&String> {
+        let prev = all.get(i.checked_sub(1)?)?;
+        if !prev.piped {
+            return None;
+        }
+        let words = command_words(&prev.words)?;
+        if basename(&words[0]) != "cat" {
+            return None;
+        }
+        words[1..].iter().find_map(heredoc)
+    };
+    for (si, stage) in all.iter().enumerate() {
         let Some(words) = command_words(&stage.words) else {
             continue;
         };
@@ -470,7 +483,7 @@ fn gated_command(command: &str, depth: usize) -> Vec<(Class, Vec<String>, String
             continue;
         }
         if SHELLS.contains(&name) {
-            if let Some(body) = args.iter().find_map(heredoc) {
+            if let Some(body) = args.iter().find_map(heredoc).or_else(|| fed(si)) {
                 found.extend(gated_command(body, depth + 1));
                 continue;
             }
@@ -480,6 +493,11 @@ fn gated_command(command: &str, depth: usize) -> Vec<(Class, Vec<String>, String
             // block of a heredoc attached to it. A `To:` elsewhere in the command is the agent's
             // own text and proves nothing about who this send goes to.
             let mut to = Vec::new();
+            if let Some(body) = fed(si) {
+                for line in body.lines().take_while(|l| !l.trim().is_empty()) {
+                    header_emails(line, &mut to);
+                }
+            }
             for (i, a) in args.iter().enumerate() {
                 let header = match a.as_str() {
                     "-H" | "--header" => args.get(i + 1).map(String::as_str),
@@ -518,66 +536,124 @@ fn gated_command(command: &str, depth: usize) -> Vec<(Class, Vec<String>, String
     found
 }
 
-/// Replaces each heredoc operator with `<<__HEREDOC_k__` and returns the bodies, so a body is
-/// data attached to its own stage, not commands of the script.
+/// Replaces each real heredoc operator with `<<__HEREDOC_k__` and returns the bodies, so a body
+/// is data attached to its own stage, not commands of the script. An operator is real only
+/// outside quotes and `((...))` arithmetic, with a delimiter word, and when a line equal to the
+/// delimiter follows; anything else stays in the text and is scanned like any other command.
 fn extract_heredocs(command: &str) -> (String, Vec<String>) {
+    struct Op {
+        start: usize,
+        end: usize,
+        delim: String,
+        strip_tabs: bool,
+    }
+    let lines: Vec<&str> = command.split('\n').collect();
     let mut out = String::new();
     let mut bodies: Vec<String> = Vec::new();
-    let mut lines = command.split('\n');
-    while let Some(line) = lines.next() {
-        let mut rest = line;
-        let mut pending: Vec<(String, bool)> = Vec::new();
-        while let Some(p) = rest.find("<<") {
-            let after = &rest[p + 2..];
-            if after.starts_with('<') {
-                out.push_str(&rest[..p + 3]);
-                rest = &rest[p + 3..];
-                continue;
-            }
-            let strip_tabs = after.starts_with('-');
-            let after = after.strip_prefix('-').unwrap_or(after).trim_start();
-            let quote = after.chars().next().filter(|c| *c == '\'' || *c == '"');
-            let (delim, remaining) = match quote {
-                Some(q) => match after[1..].find(q) {
-                    Some(e) => (&after[1..1 + e], &after[e + 2..]),
-                    None => ("", after),
-                },
-                None => {
-                    let e = after
-                        .find(|c: char| c.is_whitespace() || ";|&<>()".contains(c))
-                        .unwrap_or(after.len());
-                    (&after[..e], &after[e..])
+    let mut quote: Option<char> = None;
+    let mut arith = 0usize;
+    let mut idx = 0;
+    while idx < lines.len() {
+        let line = lines[idx];
+        idx += 1;
+        let chars: Vec<(usize, char)> = line.char_indices().collect();
+        let mut ops: Vec<Op> = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let (pos, c) = chars[i];
+            let next = chars.get(i + 1).map(|x| x.1);
+            if let Some(q) = quote {
+                if c == '\\' && q == '"' {
+                    i += 1;
+                } else if c == q {
+                    quote = None;
                 }
-            };
-            let delim = delim.trim_start_matches('\\');
-            if delim.is_empty() {
-                out.push_str(&rest[..p + 2]);
-                rest = &rest[p + 2..];
-                continue;
+            } else if c == '\\' {
+                i += 1;
+            } else if c == '\'' || c == '"' {
+                quote = Some(c);
+            } else if c == '(' && next == Some('(') {
+                arith += 1;
+                i += 1;
+            } else if c == ')' && next == Some(')') && arith > 0 {
+                arith -= 1;
+                i += 1;
+            } else if c == '<' && next == Some('<') && arith == 0 {
+                if chars.get(i + 2).map(|x| x.1) == Some('<') {
+                    i += 2; // here-string
+                } else {
+                    let after = &line[pos + 2..];
+                    let strip_tabs = after.starts_with('-');
+                    let body = after.strip_prefix('-').unwrap_or(after);
+                    let body_start = pos + 2 + (after.len() - body.len());
+                    let trimmed = body.trim_start();
+                    let word_start = body_start + (body.len() - trimmed.len());
+                    let q = trimmed.chars().next().filter(|c| *c == '\'' || *c == '"');
+                    let word = match q {
+                        Some(q) => trimmed[1..]
+                            .find(q)
+                            .map(|e| (&trimmed[1..1 + e], word_start + e + 2)),
+                        None => {
+                            let e = trimmed
+                                .find(|c: char| c.is_whitespace() || ";|&<>()".contains(c))
+                                .unwrap_or(trimmed.len());
+                            Some((&trimmed[..e], word_start + e))
+                        }
+                    };
+                    if let Some((delim, end)) = word {
+                        let delim = delim.trim_start_matches('\\');
+                        if !delim.is_empty() {
+                            ops.push(Op {
+                                start: pos,
+                                end,
+                                delim: delim.to_string(),
+                                strip_tabs,
+                            });
+                            // skip past the delimiter word
+                            while i < chars.len() && chars[i].0 < end {
+                                i += 1;
+                            }
+                            continue;
+                        }
+                    }
+                    i += 1;
+                }
             }
-            out.push_str(&rest[..p]);
-            out.push_str(&format!("<<__HEREDOC_{}__", bodies.len() + pending.len()));
-            pending.push((delim.to_string(), strip_tabs));
-            rest = remaining;
+            i += 1;
         }
-        out.push_str(rest);
-        out.push('\n');
-        for (delim, strip_tabs) in pending {
-            let mut body = String::new();
-            for l in lines.by_ref() {
-                let t = if strip_tabs {
+        // Take each operator's body, if its terminator line exists.
+        let mut placed: Vec<Option<usize>> = Vec::new();
+        for op in &ops {
+            let found = (idx..lines.len()).find(|&j| {
+                let l = lines[j];
+                let t = if op.strip_tabs {
                     l.trim_start_matches('\t')
                 } else {
                     l
                 };
-                if t.trim_end() == delim {
-                    break;
+                t.trim_end() == op.delim
+            });
+            match found {
+                Some(j) => {
+                    let mut body = lines[idx..j].join("\n");
+                    body.push('\n');
+                    placed.push(Some(bodies.len()));
+                    bodies.push(body);
+                    idx = j + 1;
                 }
-                body.push_str(l);
-                body.push('\n');
+                None => placed.push(None),
             }
-            bodies.push(body);
         }
+        let mut at = 0;
+        for (op, k) in ops.iter().zip(&placed) {
+            if let Some(k) = k {
+                out.push_str(&line[at..op.start]);
+                out.push_str(&format!("<<__HEREDOC_{k}__"));
+                at = op.end;
+            }
+        }
+        out.push_str(&line[at..]);
+        out.push('\n');
     }
     (out, bodies)
 }
@@ -642,6 +718,35 @@ const GH_VALUE_FLAGS: &[&str] = &[
     "--notes",
     "-n",
     "--notes-file",
+    "--add-label",
+    "--add-assignee",
+    "--add-reviewer",
+    "--add-project",
+    "--remove-label",
+    "--remove-assignee",
+    "--remove-reviewer",
+    "--remove-project",
+    "--subject",
+    "--author-email",
+    "--match-head-commit",
+    "-c",
+    "--comment",
+    "--reason",
+    "-T",
+    "--target",
+    "--discussion-category",
+    "--notes-start-tag",
+    "--description",
+    "--homepage",
+    "--gitignore",
+    "--license",
+    "--source",
+    "--team",
+    "--filename",
+    "--fork-name",
+    "--remote-name",
+    "--org",
+    "--limit",
 ];
 
 /// `owner/repo` of a gh command: `-R`/`--repo`, a github.com URL given as an argument, or the
@@ -2022,6 +2127,76 @@ mod tests {
                 want,
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn only_real_heredocs_hide_lines_from_the_scan() {
+        let send = "himalaya message send -H 'To: a@b.org' x";
+        for prefix in [
+            "echo '<<X'",
+            "echo $((1 << 3))",
+            "echo \"a << b\"",
+            "echo hi <<EOF-never-closed",
+            "((n = 1 << 2))",
+            "echo 'multi\nline <<Y'",
+        ] {
+            let cmd = format!("{prefix}\n{send}");
+            let g = gbash(&cmd).unwrap_or_else(|| panic!("{cmd}"));
+            assert_eq!(g.targets, vec!["a@b.org"], "{cmd}");
+        }
+        // a terminated heredoc still hides its body: text inside is data
+        let g = gbash("cat <<EOF >note.txt\nhimalaya message send -H 'To: z@b.org' x\nEOF\nls");
+        assert!(g.is_none());
+    }
+
+    #[test]
+    fn a_heredoc_fed_to_a_shell_is_scanned_as_commands() {
+        let body = "himalaya message send -H 'To: a@b.org' x";
+        for cmd in [
+            format!("cat <<EOF | bash\n{body}\nEOF"),
+            format!("cat <<'EOF' | sh -s\n{body}\nEOF"),
+            format!("bash <<EOF\n{body}\nEOF"),
+            format!("sh - <<EOF\n{body}\nEOF"),
+            format!("cat <<EOF | zsh\n{body}\nEOF"),
+            format!("bash -s <<'EOF'\n{body}\nEOF"),
+        ] {
+            let g = gbash(&cmd).unwrap_or_else(|| panic!("{cmd}"));
+            assert_eq!(
+                (g.class, g.targets),
+                (Class::Messages, vec!["a@b.org".to_string()]),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_heredoc_piped_into_himalaya_is_its_message() {
+        let g = gbash("cat <<'EOF' | himalaya message send\nTo: a@x.org\nCc: b@x.org\n\nhi\nEOF")
+            .unwrap();
+        assert_eq!(g.targets, vec!["a@x.org", "b@x.org"]);
+        for cmd in [
+            "cat <<'EOF' > f\nTo: a@x.org\n\nhi\nEOF\nhimalaya message send < f",
+            "cat <<'EOF'\nTo: a@x.org\n\nEOF\n; himalaya message send",
+        ] {
+            assert_eq!(gbash(cmd).unwrap().targets, vec![UNKNOWN], "{cmd}");
+        }
+    }
+
+    #[test]
+    fn gh_flag_values_are_never_a_repo() {
+        for cmd in [
+            "gh issue create --add-label github.com/known/repo -t x",
+            "gh issue edit 3 --add-assignee github.com/k/r --add-reviewer github.com/k/r",
+            "gh issue edit 3 --remove-label repos/k/r --remove-assignee github.com/k/r",
+            "gh issue edit 3 --milestone github.com/k/r --add-project github.com/k/r",
+            "gh pr merge 3 --subject github.com/k/r",
+            "gh pr create -l github.com/k/r -a github.com/k/r -r github.com/k/r",
+            "gh release create v1 --notes github.com/k/r --target github.com/k/r",
+            "gh issue close 3 -c github.com/k/r",
+        ] {
+            let g = gbash(cmd).unwrap_or_else(|| panic!("{cmd}"));
+            assert_eq!(g.targets, vec![UNKNOWN], "{cmd}");
         }
     }
 }
