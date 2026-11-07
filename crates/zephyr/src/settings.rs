@@ -386,7 +386,11 @@ pub fn parse(s: &Setting, raw: &str) -> Result<Value, String> {
     if s.section == READ_ONLY {
         return Err(format!("{} is read-only", s.key));
     }
-    parse_kind(&s.kind, raw.trim(), s.key)
+    let value = parse_kind(&s.kind, raw.trim(), s.key)?;
+    if s.key == "settings.strong_channels" && !list_names(raw).contains(&"tui") {
+        return Err("tui stays a strong channel".into());
+    }
+    Ok(value)
 }
 
 fn parse_kind(kind: &Kind, raw: &str, key: &str) -> Result<Value, String> {
@@ -475,18 +479,15 @@ fn list_names(raw: &str) -> Vec<&str> {
 /// `30s`, `5m`, `2h`, `1d`.
 fn duration(raw: &str) -> Result<Duration, String> {
     let raw = raw.trim();
-    let split = raw.len().saturating_sub(1);
-    let (num, unit) = raw.split_at(split);
-    let unit = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86_400,
-        _ => return Err(format!("{raw:?} is not a duration like 30s, 5m, 2h or 1d")),
-    };
-    let n: u64 = num
-        .parse()
-        .map_err(|_| format!("{raw:?} is not a duration like 30s, 5m, 2h or 1d"))?;
+    let bad = || format!("{raw:?} is not a duration like 30s, 5m, 2h or 1d");
+    let (num, unit) = [("s", 1), ("m", 60), ("h", 3600), ("d", 86_400)]
+        .into_iter()
+        .find_map(|(u, n)| raw.strip_suffix(u).map(|num| (num, n)))
+        .ok_or_else(bad)?;
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let n: u64 = num.parse().map_err(|_| bad())?;
     n.checked_mul(unit)
         .map(Duration::from_secs)
         .ok_or_else(|| format!("{raw:?} is too long"))
@@ -566,6 +567,12 @@ pub fn tighter(s: &Setting, old: Option<&str>, new: Option<&str>) -> Option<bool
         (Stricter::Fewer, Rank::Set(a), Rank::Set(b)) => Some(b.iter().all(|n| a.contains(n))),
         _ => None,
     }
+}
+
+/// Whether the change is a loosening, the only way callers compute `decide`'s `loosens`
+/// argument: a setting with no order, or a value that does not compare, counts as loosening.
+pub fn loosens(s: &Setting, old: Option<&str>, new: Option<&str>) -> bool {
+    tighter(s, old, new) != Some(true)
 }
 
 /// What the actor's change to `s` comes to. `loosens` is the caller's answer from `tighter`
@@ -690,6 +697,33 @@ mod tests {
             None
         );
         assert_eq!(tighter(find("model").unwrap(), None, Some("a/b")), None);
+    }
+
+    #[test]
+    fn loosens_is_anything_not_known_to_be_no_looser() {
+        let tz = find("timezone").unwrap();
+        assert!(loosens(tz, Some("UTC"), Some("Asia/Seoul")));
+        let par = find("tasks.parallel").unwrap();
+        assert!(!loosens(par, Some("2"), Some("2")));
+        assert!(!loosens(par, Some("4"), Some("2")));
+        assert!(loosens(par, Some("2"), Some("4")));
+    }
+
+    #[test]
+    fn non_ascii_durations_are_errors_not_panics() {
+        let min = Duration::from_secs(30);
+        for raw in ["5분", "30초", "３０s", "é", "s", "-5s", "+5s"] {
+            assert!(parse_until(raw, min).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn strong_channels_always_keep_the_tui() {
+        let s = find("settings.strong_channels").unwrap();
+        assert!(parse(s, "tui").is_ok());
+        assert!(parse(s, "chat,tui").is_ok());
+        assert_eq!(parse(s, "chat").unwrap_err(), "tui stays a strong channel");
+        assert_eq!(parse(s, "").unwrap_err(), "tui stays a strong channel");
     }
 
     #[test]
