@@ -104,6 +104,8 @@ pub struct Snapshot {
     pub accounts: Vec<AccountState>,
     /// The soonest scheduled job runs, soonest first.
     pub jobs: Vec<NextJob>,
+    /// Proposals waiting for the owner's `/ok` or `/no`.
+    pub proposals: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1072,6 +1074,7 @@ impl<'a> Router<'a> {
                         }
                     })
                     .collect(),
+                proposals: self.store.pending_proposals()?.len() as u32,
                 jobs: {
                     let tz = crate::scheduler::zone(&self.cfg)?;
                     let mut jobs: Vec<NextJob> = (self.store.jobs()?.into_iter())
@@ -1116,7 +1119,167 @@ impl<'a> Router<'a> {
                     vec![]
                 }));
             }
+            AttachRequest::Settings(tx) => {
+                let _ = tx.send(self.settings_json());
+            }
+            AttachRequest::SettingsSet {
+                key,
+                value,
+                until,
+                reply,
+            } => {
+                let _ = reply.send(self.settings_set(&key, &value, until.as_deref()).await);
+                self.publish();
+            }
+            AttachRequest::Proposals(tx) => {
+                let _ = tx.send(self.proposals_json());
+            }
+            AttachRequest::Decide { id, verb, reply } => {
+                let _ = reply.send(self.decide(id, &verb).await);
+                self.publish();
+            }
         }
+    }
+
+    /// `zephyr.settings`: every setting by section, as `/settings` shows them.
+    fn settings_json(&self) -> Value {
+        let mut names: Vec<&str> = vec![];
+        for s in crate::settings::SETTINGS {
+            if !names.contains(&s.section) {
+                names.push(s.section);
+            }
+        }
+        let strong = &self.cfg.settings.strong_channels;
+        let sections: Vec<Value> = (names.into_iter())
+            .map(|name| {
+                let settings: Vec<Value> = (crate::settings::SETTINGS.iter())
+                    .filter(|s| s.section == name)
+                    .flat_map(|s| {
+                        self.setting_rows(s).into_iter().map(move |r| {
+                            let until = self.store.revert(&r.key).ok().flatten().map(|v| v.at);
+                            json!({
+                                "key": r.key,
+                                "label": s.label,
+                                "help": s.help,
+                                "kind": crate::settings::kind_json(&s.kind),
+                                "value": self.shown(&r.key),
+                                "source": r.source,
+                                "access": crate::settings::access_name(s),
+                                "strong": s.strong,
+                                "until": until,
+                            })
+                        })
+                    })
+                    .collect();
+                json!({"name": name, "settings": settings})
+            })
+            .collect();
+        json!({"sections": sections, "strong_channels": strong})
+    }
+
+    /// `zephyr.settings_set`: `/set KEY VALUE [for D]` as the owner on the TUI, answered as data.
+    async fn settings_set(&mut self, key: &str, value: &str, until: Option<&str>) -> Value {
+        let refused = |why: String| json!({"outcome": "refused", "reason": why});
+        if matches!(key, "subagent" | "rule") {
+            return refused("change subagents with /subagent and rules with /rule".into());
+        }
+        let min = self.cfg.min_until;
+        let until = match until
+            .map(|d| crate::settings::parse_until(d, min))
+            .transpose()
+        {
+            Ok(until) => until,
+            Err(e) => return refused(e),
+        };
+        let owner = Actor::Owner {
+            channel: crate::attach::CHANNEL,
+        };
+        match self.set_setting(key, value, owner, until, None).await {
+            Outcome::Changed { old, new, applied } => {
+                let at = until
+                    .and(self.store.revert(key).ok().flatten())
+                    .map(|r| r.at);
+                json!({"outcome": "changed", "key": key, "old": old, "new": new,
+                       "applied": applied, "until": at})
+            }
+            Outcome::Proposed { id } => json!({"outcome": "proposed", "id": id}),
+            Outcome::Refused(why) => refused(why),
+        }
+    }
+
+    /// `zephyr.proposals`: what waits for the owner, newest first.
+    fn proposals_json(&self) -> Value {
+        let now = crate::now();
+        let list = self.store.pending_proposals().unwrap_or_else(|e| {
+            eprintln!("zephyr: reading proposals failed: {e}");
+            vec![]
+        });
+        let proposals: Vec<Value> = (list.into_iter())
+            .map(|p| {
+                json!({
+                    "id": p.id,
+                    "card": p.command,
+                    "kind": if p.key.is_some() { "setting" } else { "command" },
+                    "key": p.key,
+                    "age_secs": (now - p.created_at).max(0),
+                    "expires_in_secs": (p.created_at + 86_400 - now).max(0),
+                    "strong": p.strong,
+                })
+            })
+            .collect();
+        json!({"proposals": proposals})
+    }
+
+    /// `zephyr.decide`: `/ok N` or `/no N` from the TUI, through the checks the chat commands
+    /// make (stale, strong channel). `once` is `ok` for a setting.
+    async fn decide(&mut self, id: i64, verb: &str) -> Value {
+        let text = format!("/{} {id}", if verb == "no" { "no" } else { "ok" });
+        let m = Inbound {
+            channel: crate::attach::CHANNEL.into(),
+            platform_msg_id: String::new(),
+            sender: "token".into(),
+            text: text.clone(),
+        };
+        let mut approving = None;
+        let decided = crate::tools::decide(&self.store, &text, |p| {
+            approving = Some(p.id);
+            self.not_now(p, &m.channel)
+        });
+        let (ok, reply) = match decided {
+            Some(Ok(command)) => {
+                self.approving = approving;
+                let run = Inbound {
+                    text: command.clone(),
+                    ..m.clone()
+                };
+                let reply = self.owner_command(&command, &run).await;
+                self.approving = None;
+                let reply = reply.unwrap_or_default();
+                self.restart_if_idle().await;
+                (true, format!("[zephyr] {text} approved {command}\n{reply}"))
+            }
+            Some(Err(reply)) => (reply.starts_with("[zephyr] dropped #"), reply),
+            None => (false, format!("[zephyr] {text} is not a decision")),
+        };
+        json!({"ok": ok, "text": reply.trim_end()})
+    }
+
+    /// An approved or typed command that the daemon answers itself; `None` is a message for the agent.
+    async fn owner_command(&mut self, text: &str, m: &Inbound) -> Option<String> {
+        if let Some(reply) = crate::memory::command(&self.cfg.home, self.cfg.state_dir(), text) {
+            return Some(reply);
+        }
+        if let Some(reply) = crate::scheduler::command(&mut self.store, &self.cfg, m) {
+            self.jobs.runs.notify_one();
+            return Some(reply);
+        }
+        if let Some(reply) = self.command(text, (&m.channel, &m.sender)).await {
+            return Some(reply);
+        }
+        if matches!(text, "/stop" | "/pause" | "/resume") {
+            return Some(self.control(text).await);
+        }
+        None
     }
 
     /// `zephyr.dequeue` (DESIGN §4.1): the attached client's messages rpi has not been sent yet,
@@ -1272,17 +1435,8 @@ impl<'a> Router<'a> {
         };
         let reply = if let Some(Err(reply)) = &decided {
             reply.clone()
-        } else if let Some(reply) =
-            crate::memory::command(&self.cfg.home, self.cfg.state_dir(), text)
-        {
+        } else if let Some(reply) = self.owner_command(text, &m).await {
             reply
-        } else if let Some(reply) = crate::scheduler::command(&mut self.store, &self.cfg, &m) {
-            self.jobs.runs.notify_one();
-            reply
-        } else if let Some(reply) = self.command(text, (&m.channel, &m.sender)).await {
-            reply
-        } else if matches!(text, "/stop" | "/pause" | "/resume") {
-            self.control(text).await
         } else {
             self.approving = None;
             // The owner spoke: a command still in the turn moves to the background (DESIGN §4.13).

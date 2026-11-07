@@ -482,6 +482,7 @@ async fn zephyr_hello_returns_the_snapshot() {
             "queue": [],
             "failed_replies": 0,
             "run": {"busy": false, "since_unix_ms": null, "origin": null, "current_tool": null, "tools_done": 0},
+            "proposals": 0,
             // No auth.json in the account's dir.
             "accounts": [{"name": "a", "model": "fake/m1", "state": "needs login", "until_unix": null}],
             "jobs": [],
@@ -1061,5 +1062,182 @@ async fn zephyr_sessions_and_turns_list_the_conversations_and_what_undo_counts()
     // The header shows the name.
     let snap = c.call("zephyr.hello", json!({})).await["result"].clone();
     assert_eq!(snap["session"], "trip");
+    gw.shutdown().await;
+}
+
+/// The panel draws its editors from `zephyr.settings` alone: kinds carry their bounds.
+#[tokio::test]
+async fn settings_lists_sections_with_kinds() {
+    let gw = start("settings-list");
+    let mut c = Client::connect(gw.port).await;
+    let early = c.call("zephyr.settings", json!({})).await;
+    assert_eq!(early["error"]["code"], -32001, "{early}");
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    let got = c.call("zephyr.settings", json!({})).await;
+    let sections = got["result"]["sections"].as_array().unwrap();
+    let bg = sections
+        .iter()
+        .find(|s| s["name"] == "Background tasks")
+        .unwrap_or_else(|| panic!("{got}"));
+    let parallel = bg["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["key"] == "tasks.parallel")
+        .unwrap();
+    assert_eq!(
+        parallel["kind"],
+        json!({"type": "int", "min": 1, "max": 32})
+    );
+    assert_eq!(parallel["value"], "2");
+    assert_eq!(parallel["source"], "default");
+    assert_eq!(parallel["access"], "tighten");
+    assert_eq!(parallel["strong"], false);
+    assert_eq!(parallel["until"], Value::Null);
+    assert!(parallel["label"].is_string() && parallel["help"].is_string());
+    let read_only = sections.iter().find(|s| s["name"] == "Read-only").unwrap();
+    assert!(read_only["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|s| s["access"] == "read-only"));
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn settings_set_answers_changed_or_refused() {
+    let gw = start("settings-set");
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    let got = c
+        .call(
+            "zephyr.settings_set",
+            json!({"key": "tasks.parallel", "value": "4"}),
+        )
+        .await;
+    let r = &got["result"];
+    assert_eq!(r["outcome"], "changed", "{got}");
+    assert_eq!((&r["old"], &r["new"]), (&json!("2"), &json!("4")), "{got}");
+    assert_eq!(r["until"], Value::Null);
+    let file = std::fs::read_to_string(gw.home.join("zephyr.toml")).unwrap();
+    assert!(file.contains("parallel = 4"), "{file}");
+    let listed = c.call("zephyr.settings", json!({})).await;
+    let row = listed["result"]["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|s| s["settings"].as_array().unwrap())
+        .find(|s| s["key"] == "tasks.parallel")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (&row["value"], &row["source"]),
+        (&json!("4"), &json!("you"))
+    );
+
+    // A time limit.
+    let timed = c
+        .call(
+            "zephyr.settings_set",
+            json!({"key": "tasks.parallel", "value": "3", "until": "2h"}),
+        )
+        .await;
+    assert_eq!(timed["result"]["outcome"], "changed", "{timed}");
+    assert!(timed["result"]["until"].as_i64().unwrap() > 0, "{timed}");
+
+    for (params, why) in [
+        (json!({"key": "tasks.parallel", "value": "99"}), "32"),
+        (
+            json!({"key": "no.such", "value": "1"}),
+            "no setting no.such",
+        ),
+        (
+            json!({"key": "tasks.parallel", "value": "1", "until": "45d"}),
+            "time limit",
+        ),
+    ] {
+        let got = c.call("zephyr.settings_set", params).await;
+        assert_eq!(got["result"]["outcome"], "refused", "{got}");
+        assert!(
+            got["result"]["reason"].as_str().unwrap().contains(why),
+            "{got}"
+        );
+    }
+    let bad = c
+        .call("zephyr.settings_set", json!({"key": "tasks.parallel"}))
+        .await;
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn proposals_and_decide_settle_a_waiting_proposal() {
+    let gw = start("proposals");
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    let none = c.call("zephyr.proposals", json!({})).await;
+    assert_eq!(none["result"]["proposals"], json!([]), "{none}");
+
+    let store = Store::open(&gw.home.join("state.db")).unwrap();
+    let a = store
+        .propose_setting("/set tasks.parallel 4", "tasks.parallel", None, false)
+        .unwrap();
+    let b = store.propose_command("/pause").unwrap();
+    let got = c.call("zephyr.proposals", json!({})).await;
+    let list = got["result"]["proposals"].as_array().unwrap();
+    assert_eq!(list.len(), 2, "{got}");
+    let first = list.iter().find(|p| p["id"] == a).unwrap();
+    assert_eq!(first["card"], "/set tasks.parallel 4");
+    assert_eq!(first["kind"], "setting");
+    assert_eq!(first["strong"], false);
+    assert!(first["age_secs"].as_i64().unwrap() >= 0);
+    assert!(first["expires_in_secs"].as_i64().unwrap() > 80_000);
+    assert_eq!(
+        list.iter().find(|p| p["id"] == b).unwrap()["kind"],
+        "command"
+    );
+    let snap = c.call("zephyr.hello", json!({})).await;
+    assert_eq!(snap["result"]["proposals"], 2, "{snap}");
+
+    let ok = c
+        .call("zephyr.decide", json!({"id": a, "verb": "once"}))
+        .await;
+    assert_eq!(ok["result"]["ok"], true, "{ok}");
+    assert!(
+        ok["result"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("tasks.parallel"),
+        "{ok}"
+    );
+    let file = std::fs::read_to_string(gw.home.join("zephyr.toml")).unwrap();
+    assert!(file.contains("parallel = 4"), "{file}");
+    // Settled: a second approval finds nothing waiting.
+    let again = c
+        .call("zephyr.decide", json!({"id": a, "verb": "ok"}))
+        .await;
+    assert_eq!(again["result"]["ok"], false, "{again}");
+    assert!(
+        again["result"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("no proposal #"),
+        "{again}"
+    );
+
+    let no = c
+        .call("zephyr.decide", json!({"id": b, "verb": "no"}))
+        .await;
+    assert_eq!(no["result"]["ok"], true, "{no}");
+    assert!(
+        no["result"]["text"].as_str().unwrap().contains("dropped"),
+        "{no}"
+    );
+    let left = c.call("zephyr.proposals", json!({})).await;
+    assert_eq!(left["result"]["proposals"], json!([]), "{left}");
+    let bad = c
+        .call("zephyr.decide", json!({"id": 1, "verb": "maybe"}))
+        .await;
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
     gw.shutdown().await;
 }

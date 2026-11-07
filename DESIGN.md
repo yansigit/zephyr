@@ -174,7 +174,8 @@ Zephyr's own TUI uses the same port, token and framing (one JSON-RPC 2.0 object 
   ],
   "jobs": [                          // the 5 soonest scheduled runs, soonest first
     {"id": 3, "name": "renew domain", "next_unix": 1793350800}
-  ]
+  ],
+  "proposals": 0                     // integer: proposals waiting for /ok or /no (not the `queue`)
 }
 ```
 
@@ -218,6 +219,13 @@ The same login is a slash command on every channel: `/login` lists the provider 
 A slash command goes in as `send {"sessionId": "main", "command": {"type": "prompt", "content": "/status"}}`, as with the stock client. A prompt with `"followUp": true` waits for the run to settle instead of steering in (§4.1).
 
 **`zephyr.dequeue {}`** → `{"texts": ["first", "second"]}`: the `tui` messages rpi has not been sent yet, oldest first, now `withdrawn` (§4.1); `[]` when none wait.
+
+The settings and approvals methods act as the owner on channel `tui`, a strong channel by default, and go through the same code as `/set`, `/ok` and `/no`:
+
+- **`zephyr.settings {}`** → `{"sections": [{"name", "settings": [{"key", "label", "help", "kind", "value", "source", "access", "strong", "until"}]}], "strong_channels": [...]}`. `kind` is `{"type": "bool" | "int" | "float" | "duration" | "choice" | "model" | "text" | "list" | "optional", ...}` with its `min`/`max`, `min_secs`/`max_secs`, `options` or `inner`; `value` is the text replies show (`null`: unset); `source` is `default`, `you`, `agent (#N)` or `until HH:MM`; `access` is the agent's (`never`, `propose`, `tighten`) or `read-only`; `until` is a unix time while a time limit runs, else `null`. A connector's setting has one entry per connector.
+- **`zephyr.settings_set {"key", "value", "until"?}`** → `{"outcome": "changed", "key", "old", "new", "applied", "until"}`, `{"outcome": "proposed", "id"}` or `{"outcome": "refused", "reason"}`. `until` is `30s`..`30d` as in `/set KEY VALUE for 2h`. A missing `key` or `value` is `-32602`.
+- **`zephyr.proposals {}`** → `{"proposals": [{"id", "card", "kind": "setting" | "command", "key", "age_secs", "expires_in_secs", "strong"}]}`, newest first; `strong` says the proposal needs a strong channel.
+- **`zephyr.decide {"id", "verb": "ok" | "once" | "no"}`** → `{"ok": bool, "text"}`, `text` being what `/ok N` or `/no N` replies, with the stale and strong-channel checks. `once` is `ok` for a setting. Another `verb` is `-32602`.
 
 #### 4.3.2 The TUI client (`zephyr tui`)
 

@@ -148,7 +148,7 @@ const fn row(
     }
 }
 
-const READ_ONLY: &str = "Read-only";
+pub const READ_ONLY: &str = "Read-only";
 
 const fn fixed(key: &'static str, label: &'static str, help: &'static str) -> Setting {
     row(
@@ -860,6 +860,37 @@ pub struct Row {
 impl Row {
     fn line(&self) -> String {
         format!("{} · {} · {}", self.key, self.value, self.source)
+    }
+}
+
+/// A kind as attached clients read it, bounds and choices included, so a client draws the
+/// right editor without its own table.
+pub fn kind_json(k: &Kind) -> serde_json::Value {
+    use serde_json::json;
+    match k {
+        Kind::Bool => json!({"type": "bool"}),
+        Kind::Int { min, max } => json!({"type": "int", "min": min, "max": max}),
+        Kind::Float { min, max } => json!({"type": "float", "min": min, "max": max}),
+        Kind::Duration { min_secs, max_secs } => {
+            json!({"type": "duration", "min_secs": min_secs, "max_secs": max_secs})
+        }
+        Kind::Choice(o) => json!({"type": "choice", "options": o}),
+        Kind::Model => json!({"type": "model"}),
+        Kind::Text { max } => json!({"type": "text", "max": max}),
+        Kind::List(o) => json!({"type": "list", "options": o}),
+        Kind::Optional(inner) => json!({"type": "optional", "inner": kind_json(inner)}),
+    }
+}
+
+/// The agent's access as attached clients read it; `read-only` for an entry edited in the file.
+pub fn access_name(s: &Setting) -> &'static str {
+    if s.section == READ_ONLY {
+        return "read-only";
+    }
+    match s.agent {
+        Access::Never => "never",
+        Access::Propose => "propose",
+        Access::Tighten => "tighten",
     }
 }
 

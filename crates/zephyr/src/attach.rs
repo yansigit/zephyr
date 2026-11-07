@@ -51,6 +51,23 @@ pub enum AttachRequest {
     FollowUp(Inbound),
     /// `zephyr.dequeue`: the texts of this channel's messages still waiting, withdrawn.
     Dequeue(oneshot::Sender<Vec<String>>),
+    /// `zephyr.settings`: every setting as it stands now.
+    Settings(oneshot::Sender<Value>),
+    /// `zephyr.settings_set`: a change by the owner on the TUI, answered as the outcome.
+    SettingsSet {
+        key: String,
+        value: String,
+        until: Option<String>,
+        reply: oneshot::Sender<Value>,
+    },
+    /// `zephyr.proposals`: the proposals still waiting.
+    Proposals(oneshot::Sender<Value>),
+    /// `zephyr.decide`: `/ok N` (`ok`, `once`) or `/no N` (`no`) as the owner on the TUI.
+    Decide {
+        id: i64,
+        verb: String,
+        reply: oneshot::Sender<Value>,
+    },
 }
 
 /// Reads the attach token. Never log the result.
@@ -324,6 +341,61 @@ impl Conn {
                 let asked = self.router.send(AttachRequest::Dequeue(tx)).await;
                 match (asked, rx.await) {
                     (Ok(()), Ok(texts)) => (vec![ok(id, json!({ "texts": texts }))], false),
+                    _ => (vec![error(id, -32000, "gateway is shutting down")], true),
+                }
+            }
+            "zephyr.settings" | "zephyr.proposals" => {
+                let (tx, rx) = oneshot::channel();
+                let req = if method == "zephyr.settings" {
+                    AttachRequest::Settings(tx)
+                } else {
+                    AttachRequest::Proposals(tx)
+                };
+                match (self.router.send(req).await, rx.await) {
+                    (Ok(()), Ok(value)) => (vec![ok(id, value)], false),
+                    _ => (vec![error(id, -32000, "gateway is shutting down")], true),
+                }
+            }
+            "zephyr.settings_set" => {
+                let (Some(key), Some(value)) = (
+                    params["key"].as_str(),
+                    // A client may send a number or a flag as such.
+                    match &params["value"] {
+                        Value::String(s) => Some(s.clone()),
+                        v @ (Value::Number(_) | Value::Bool(_)) => Some(v.to_string()),
+                        _ => None,
+                    },
+                ) else {
+                    return (vec![error(id, -32602, "key and value are required")], false);
+                };
+                let until = params["until"].as_str().map(String::from);
+                let (tx, rx) = oneshot::channel();
+                let req = AttachRequest::SettingsSet {
+                    key: key.into(),
+                    value,
+                    until,
+                    reply: tx,
+                };
+                match (self.router.send(req).await, rx.await) {
+                    (Ok(()), Ok(value)) => (vec![ok(id, value)], false),
+                    _ => (vec![error(id, -32000, "gateway is shutting down")], true),
+                }
+            }
+            "zephyr.decide" => {
+                let (Some(n), Some(verb)) = (params["id"].as_i64(), params["verb"].as_str()) else {
+                    return (vec![error(id, -32602, "id and verb are required")], false);
+                };
+                if !matches!(verb, "ok" | "once" | "no") {
+                    return (vec![error(id, -32602, "verb is ok, once or no")], false);
+                }
+                let (tx, rx) = oneshot::channel();
+                let req = AttachRequest::Decide {
+                    id: n,
+                    verb: verb.into(),
+                    reply: tx,
+                };
+                match (self.router.send(req).await, rx.await) {
+                    (Ok(()), Ok(value)) => (vec![ok(id, value)], false),
                     _ => (vec![error(id, -32000, "gateway is shutting down")], true),
                 }
             }
