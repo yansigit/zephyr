@@ -52,6 +52,8 @@ case "$1" in
       *" zephyr status "*) echo "daemon: ${SHIM_DAEMON:-running}"; [ -n "$SHIM_STATUS" ] && printf '%b\n' "$SHIM_STATUS"; exit "${SHIM_STATUS_EXIT:-0}" ;;
       *" zephyr --version "*) [ -n "$SHIM_VERSION" ] || exit 2; echo "zephyr $SHIM_VERSION" ;;
       *" zephyr tui "*) exit "${SHIM_TUI_EXIT:-0}" ;;
+      # `zephyr set KEY VALUE`: the daemon's reply, a refusal when SHIM_SET_REFUSE is set.
+      *" zephyr set "*) [ -n "$SHIM_SET_REFUSE" ] && { echo "[zephyr] $SHIM_SET_REFUSE"; exit 1; }; echo "[zephyr] ${@: -2:1} 1 → ${@: -1}" ;;
     esac ;;
 esac
 exit 0
@@ -964,28 +966,113 @@ fn accounts_model_and_config_edit_the_toml() {
 }
 
 #[test]
-fn config_get_and_set_check_the_daemon_schema() {
-    let env = Env::new("config");
+fn config_set_of_a_known_key_goes_through_the_daemon() {
+    let env = Env::new("config-known");
     env.init(&["--no-start"]);
-    assert_eq!(env.ok(&["config", "get", "attach.port"]).trim(), "7790");
-    env.ok(&["config", "set", "budget.daily_tokens", "5000"]);
-    assert_eq!(
-        env.ok(&["config", "get", "budget.daily_tokens"]).trim(),
-        "5000"
-    );
-    env.ok(&["config", "set", "timezone", "Asia/Seoul"]);
-    assert_eq!(env.ok(&["config", "get", "timezone"]).trim(), "Asia/Seoul");
-    // A running daemon reloads; a stopped one picks the file up when it starts.
+    let before = env.config();
     env.calls();
-    env.ok(&["config", "set", "budget.daily_tokens", "6000"]);
-    find(
-        &env.calls(),
-        &["docker", "exec", CONTAINER, "zephyr", "reload"],
+    let out = env.zephyr(&["config", "set", "budget.daily_tokens", "5000"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        stdout(&out).contains("budget.daily_tokens 1 → 5000"),
+        "{out:?}"
     );
+    let calls = env.calls();
+    find(
+        &calls,
+        &[
+            "docker",
+            "exec",
+            CONTAINER,
+            "zephyr",
+            "set",
+            "budget.daily_tokens",
+            "5000",
+        ],
+    );
+    assert!(
+        !calls.iter().any(|c| c.contains(&"reload".to_string())),
+        "the daemon applies it itself"
+    );
+    assert_eq!(env.config(), before, "the host does not edit the file");
+    // The daemon's refusal is the command's failure, and its words reach the owner.
+    let out = env.zephyr_env(
+        &["config", "set", "budget.daily_tokens", "0"],
+        &[("SHIM_SET_REFUSE", "budget.daily_tokens must be positive")],
+    );
+    assert!(!out.status.success());
+    assert!(stdout(&out).contains("must be positive"), "{out:?}");
+}
+
+#[test]
+fn config_set_of_an_unknown_key_warns_and_saves() {
+    let env = Env::new("config-unknown");
+    env.init(&["--no-start"]);
+    env.calls();
+    let out = env.zephyr(&["config", "set", "attach.port", "7791"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("warn: attach.port is not a known setting; saved without checking"),
+        "{out:?}"
+    );
+    assert_eq!(env.ok(&["config", "get", "attach.port"]).trim(), "7791");
+    assert!(!env
+        .calls()
+        .iter()
+        .any(|c| c.contains(&"set".to_string()) && c.contains(&"zephyr".to_string())));
+}
+
+#[test]
+fn config_set_while_stopped_edits_the_file_as_before() {
+    let env = Env::new("config-stopped");
+    env.init(&["--no-start"]);
+    env.calls();
     let out = env.zephyr_env(
         &["config", "set", "budget.daily_tokens", "7000"],
         &[("SHIM_STATE", "exited")],
     );
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        stdout(&out).contains("applies when zephyr starts"),
+        "{out:?}"
+    );
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("warn:"));
+    assert_eq!(
+        env.ok(&["config", "get", "budget.daily_tokens"]).trim(),
+        "7000"
+    );
+    assert!(!env
+        .calls()
+        .iter()
+        .any(|c| c.contains(&"set".to_string()) && c.contains(&"zephyr".to_string())));
+}
+
+#[test]
+fn config_get_and_set_check_the_daemon_schema() {
+    let env = Env::new("config");
+    env.init(&["--no-start"]);
+    // A stopped container: the file is edited here (a running daemon's registry settings go
+    // through it instead).
+    let stopped = [("SHIM_STATE", "exited")];
+    let set = |k: &str, v: &str| env.zephyr_env(&["config", "set", k, v], &stopped);
+    assert_eq!(env.ok(&["config", "get", "attach.port"]).trim(), "7790");
+    assert!(set("budget.daily_tokens", "5000").status.success());
+    assert_eq!(
+        env.ok(&["config", "get", "budget.daily_tokens"]).trim(),
+        "5000"
+    );
+    assert!(set("timezone", "Asia/Seoul").status.success());
+    assert_eq!(env.ok(&["config", "get", "timezone"]).trim(), "Asia/Seoul");
+    // A running daemon reloads a key the registry does not know; a stopped one picks the file
+    // up when it starts.
+    env.calls();
+    env.ok(&["config", "set", "attach.port", "7791"]);
+    find(
+        &env.calls(),
+        &["docker", "exec", CONTAINER, "zephyr", "reload"],
+    );
+    let out = set("budget.daily_tokens", "7000");
     assert!(
         stdout(&out).contains("applies when zephyr starts"),
         "{out:?}"
@@ -995,11 +1082,8 @@ fn config_get_and_set_check_the_daemon_schema() {
         .iter()
         .any(|c| c.contains(&"reload".to_string())));
     let before = env.config();
-    assert!(!env
-        .zephyr(&["config", "set", "timezone", "Mars/Olympus"])
-        .status
-        .success());
-    assert!(!env.zephyr(&["config", "set", "typo", "1"]).status.success());
+    assert!(!set("timezone", "Mars/Olympus").status.success());
+    assert!(!set("typo", "1").status.success());
     assert_eq!(env.config(), before, "a refused set writes nothing");
     assert!(
         before.contains("# `zephyr model` picks one"),
@@ -1011,17 +1095,18 @@ fn config_get_and_set_check_the_daemon_schema() {
 fn subagents_and_task_settings_edit_the_toml() {
     let env = Env::new("subagent");
     env.init(&["--no-start"]);
-    env.ok(&["config", "set", "tasks.parallel", "16"]);
-    env.ok(&[
-        "config",
-        "set",
-        "tasks.model",
-        "claude-code/claude-haiku-5-5",
-    ]);
-    assert!(!env
-        .zephyr(&["config", "set", "tasks.model", "haiku"])
-        .status
-        .success());
+    // Stopped, so the file is edited here rather than through the daemon.
+    let set = |v: &str| {
+        let key = if v.parse::<u32>().is_ok() {
+            "tasks.parallel"
+        } else {
+            "tasks.model"
+        };
+        env.zephyr_env(&["config", "set", key, v], &[("SHIM_STATE", "exited")])
+    };
+    assert!(set("16").status.success());
+    assert!(set("claude-code/claude-haiku-5-5").status.success());
+    assert!(!set("haiku").status.success());
     let add = [
         "subagent",
         "add",
@@ -1338,7 +1423,7 @@ fn settings_reach_roots_files_through_the_container() {
     }
     std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o000)).unwrap();
 
-    env.ok(&["config", "set", "budget.daily_tokens", "5"]);
+    env.ok(&["config", "set", "attach.port", "7791"]);
     let calls = env.calls();
     let get = ["zephyr", "__file", "get", "zephyr.toml"];
     let put = ["zephyr", "__file", "put", "zephyr.toml"];
@@ -1346,14 +1431,14 @@ fn settings_reach_roots_files_through_the_container() {
     find(&calls, &[&root[..], &get[..]].concat());
     find(&calls, &[&root[..], &put[..]].concat());
     let text = std::fs::read_to_string(files.join("zephyr.toml")).unwrap();
-    assert!(text.contains("daily_tokens = 5"), "{text}");
+    assert!(text.contains("port = 7791"), "{text}");
 
     // Stopped: a throwaway root container with no capabilities and no network.
     let out = env.zephyr_env(
-        &["config", "get", "budget.daily_tokens"],
+        &["config", "get", "attach.port"],
         &[("SHIM_STATE", "exited")],
     );
-    assert_eq!(stdout(&out).trim(), "5");
+    assert_eq!(stdout(&out).trim(), "7791");
     let calls = env.calls();
     let run = find(&calls, &["docker", "run", "--rm", "-i", "-u", "0"]);
     for pair in [["--cap-drop", "ALL"], ["--network", "none"]] {

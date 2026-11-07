@@ -71,6 +71,7 @@ async fn main() -> ExitCode {
             ("pause", Ok(cfg)) => control(&cfg, "/pause").await,
             ("resume", Ok(cfg)) => control(&cfg, "/resume").await,
             ("reload", Ok(cfg)) => control(&cfg, "/reload").await,
+            ("set", Ok(cfg)) => set(&cfg, &args.collect::<Vec<_>>()).await,
             ("skill", Ok(cfg)) => skill(&cfg, &args.collect::<Vec<_>>()).await,
             _ => {
                 eprintln!("{USAGE}");
@@ -279,6 +280,20 @@ async fn control(cfg: &Config, text: &str) -> anyhow::Result<()> {
         store.set_paused((text == "/pause").then_some("user"))?;
         println!("{text}: the daemon is not running; the change applies at its next start");
     }
+    Ok(())
+}
+
+/// `zephyr set KEY VALUE [for D]`: the owner's `/set` over the chat socket (a strong channel).
+/// Prints the daemon's reply; a refusal (anything but `[zephyr] KEY OLD → NEW`) exits 1.
+async fn set(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(args.len() >= 2, "usage: zephyr set KEY VALUE [for D]");
+    let Some(reply) = ask(cfg, &format!("/set {}", args.join(" "))).await? else {
+        anyhow::bail!("the daemon is not running; edit zephyr.toml or `zephyr up` first");
+    };
+    println!("{reply}");
+    let first = reply.lines().next().unwrap_or_default();
+    let done = first.starts_with(&format!("[zephyr] {} ", args[0])) && first.contains(" → ");
+    anyhow::ensure!(done, "not changed");
     Ok(())
 }
 
