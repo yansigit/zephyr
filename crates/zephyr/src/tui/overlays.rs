@@ -1954,6 +1954,9 @@ mod tests {
                 "Memory" => {
                     crate::memory::command(&dir, &dir, &text).is_some()
                         || crate::drafts::command(&cfg, &text).is_some()
+                        // A rule is a setting: the router's `set_setting` calls `memory::rule`.
+                        || (text.strip_prefix("/rule "))
+                            .is_some_and(|arg| crate::memory::rule(&dir, arg).is_ok())
                 }
                 "Schedule" => {
                     let m = crate::channel::Inbound {

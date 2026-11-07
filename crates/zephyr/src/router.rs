@@ -3,6 +3,7 @@
 use crate::channel::{Activity, Channel, Inbound, Outbound};
 use crate::config::{Account, Config, BUDGET_NOTICE};
 use crate::rpc::{message_text, Child, MAIN_SESSION};
+use crate::settings::{Actor, Apply, Outcome, Setting};
 use crate::store::{InboxRow, Store};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -315,6 +316,7 @@ pub async fn run<C: Channel>(
         stopping: false,
         procs: Default::default(),
         compacting: None,
+        approving: None,
     };
     // Commands a re-exec handed over alive are adopted; the rest a dead gateway left running
     // are reported, never re-run (DESIGN §4.13).
@@ -514,10 +516,20 @@ struct Router<'a> {
     run_completed: bool,
     /// A `/compact` is running: `(channel, sender)` of who asked, told its summary at the settle.
     compacting: Option<(String, String)>,
+    /// The agent's proposal the owner's `/ok` is running, so its setting change is logged as it.
+    approving: Option<i64>,
 }
 
 /// The reply to `/undo`, `/retry` and `/compact` while a run is going: they need the agent idle.
 const BUSY: &str = "[zephyr] the agent is busy: wait for its reply, or /stop it first";
+
+/// A reload that applied live: `/set` leaves it out of its reply.
+const APPLIED: &str = "[zephyr] applied";
+
+const SET_USAGE: &str = "[zephyr] usage: /set KEY VALUE [for 2h]; /settings lists the keys";
+
+const SUBAGENT_USAGE: &str = "usage: /subagent, /subagent add NAME [PROVIDER/MODEL] PROMPT, \
+    /subagent model NAME PROVIDER/MODEL|default, /subagent prompt NAME PROMPT, /subagent rm NAME";
 
 async fn next_event(child: &mut Option<Child>) -> Option<Value> {
     match child {
@@ -538,6 +550,8 @@ impl<'a> Router<'a> {
         let mut tick = tokio::time::interval(self.cfg.tick);
         let paused = |store: &Store| store.pause_reason().ok().flatten().is_some();
         let mut was_paused = paused(&self.store);
+        // Time limits that ended while the daemon was down, before anything is dispatched.
+        self.revert_due().await;
         self.publish();
         loop {
             tokio::select! {
@@ -593,6 +607,7 @@ impl<'a> Router<'a> {
                         let text = self.reload().await;
                         eprintln!("zephyr: zephyr.toml or secrets.env changed: {text}");
                     }
+                    self.revert_due().await;
                     // A budget pause ends at UTC midnight with nothing else to wake the router;
                     // a run in progress reconciles at its settle, a new child when it starts.
                     let ended = std::mem::replace(&mut was_paused, paused(&self.store));
@@ -796,7 +811,7 @@ impl<'a> Router<'a> {
             "/job list" => crate::scheduler::list(&self.store)
                 .unwrap_or_else(|e| format!("[zephyr] listing jobs failed: {e}")),
             memory => crate::memory::command(&self.cfg.home, self.cfg.state_dir(), memory)
-                .map_or_else(String::new, |(reply, _)| reply),
+                .unwrap_or_default(),
         })
     }
 
@@ -1137,19 +1152,22 @@ impl<'a> Router<'a> {
         if after {
             log(self.store.deliver_after(id).map_err(Into::into));
         }
-        let decided = crate::tools::decide(&self.store, m.text.trim());
-        // An approved proposal runs exactly as if the owner had typed it.
+        let mut approving = None;
+        let decided = crate::tools::decide(&self.store, m.text.trim(), |p| {
+            approving = Some(p.id);
+            self.not_now(p, &m.channel)
+        });
+        // An approved proposal runs exactly as if the owner had typed it, logged as the agent's.
+        self.approving = approving.filter(|_| matches!(decided, Some(Ok(_))));
         let text = match &decided {
             Some(Ok(command)) => command.as_str(),
             _ => m.text.trim(),
         };
         let reply = if let Some(Err(reply)) = &decided {
             reply.clone()
-        } else if let Some((reply, rules_changed)) =
+        } else if let Some(reply) =
             crate::memory::command(&self.cfg.home, self.cfg.state_dir(), text)
         {
-            // rpi reads AGENTS.md once, at start: a fresh child on the same session loads the rules.
-            self.restart |= rules_changed;
             reply
         } else if let Some(reply) = crate::scheduler::command(&mut self.store, &self.cfg, &m) {
             self.jobs.runs.notify_one();
@@ -1159,10 +1177,12 @@ impl<'a> Router<'a> {
         } else if matches!(text, "/stop" | "/pause" | "/resume") {
             self.control(text).await
         } else {
+            self.approving = None;
             // The owner spoke: a command still in the turn moves to the background (DESIGN §4.13).
             self.procs.yield_all();
             return log(self.dispatch_new().await);
         };
+        self.approving = None;
         // What `/ok N` ran, in the daemon's words: the agent's request may have said otherwise.
         let reply = match &decided {
             Some(Ok(command)) => format!("[zephyr] {} approved {command}\n{reply}", m.text.trim()),
@@ -1462,8 +1482,14 @@ impl<'a> Router<'a> {
             ("/reload", "") => self.reload().await,
             ("/status", "") => self.status(),
             ("/model", "") => self.models(),
-            ("/model", model) => self.switch_model(model).await,
-            ("/thinking", level) => self.thinking_level(level).await,
+            ("/model", model) => self.owner_set("model", model, from.0, |a| a).await,
+            ("/thinking", level) => self.thinking_level(level, from.0).await,
+            ("/set", arg) => self.set_command(arg, from.0).await,
+            ("/settings", arg) => self.settings_listing(arg),
+            // `/rule` alone and `/rules` are `memory::command`'s.
+            ("/rule", rule) if !rule.is_empty() => {
+                self.owner_set("rule", rule, from.0, |a| a).await
+            }
             ("/new" | "/clear", "") => self.new_session().await,
             ("/switch", "") => self.list_sessions(),
             ("/switch", id) => self.switch(id).await,
@@ -1489,32 +1515,24 @@ impl<'a> Router<'a> {
                     crate::tasks::stop(&mut self.store, self.jobs, id)
                 }
                 ("parallel", n) if n.parse::<usize>().is_ok() => {
-                    let set = |doc: &mut toml_edit::DocumentMut| {
-                        crate::host::conf::set(doc, "tasks.parallel", n)
-                    };
-                    let done = format!("up to {n} tasks run at once");
-                    self.edit_tasks(None, set, done).await
+                    let done = |a| format!("[zephyr] up to {n} tasks run at once\n{a}");
+                    self.owner_set("tasks.parallel", n, from.0, done).await
                 }
                 ("model", m) if !m.is_empty() && word(m).1.is_empty() => {
-                    let set = |doc: &mut toml_edit::DocumentMut| match m {
-                        "default" => {
-                            let tasks = doc.get_mut("tasks").and_then(|t| t.as_table_like_mut());
-                            tasks.map(|t| t.remove("model"));
-                            Ok(())
-                        }
-                        m => crate::host::conf::set(doc, "tasks.model", &format!("{m:?}")),
+                    let done = |a| match m {
+                        "default" => format!("[zephyr] tasks run on the account's own model\n{a}"),
+                        m => format!("[zephyr] tasks run on {m} unless they name a model\n{a}"),
                     };
-                    let done = match m {
-                        "default" => "tasks run on the account's own model".into(),
-                        m => format!("tasks run on {m} unless they name a model"),
-                    };
-                    self.edit_tasks(Some(m), set, done).await
+                    self.owner_set("tasks.model", m, from.0, done).await
                 }
                 _ => "[zephyr] usage: /task list, /task stop <id>, /task parallel <1-32>, \
                       /task model PROVIDER/MODEL|default"
                     .into(),
             },
-            ("/subagent", arg) => self.subagent(arg).await,
+            ("/subagent", arg) => match word(arg) {
+                ("" | "list", "") => format!("[zephyr] {}", crate::tasks::settings(&self.cfg)),
+                _ => self.owner_set("subagent", arg, from.0, |a| a).await,
+            },
             ("/undo", n) => match if n.is_empty() { Ok(1) } else { n.parse() } {
                 Ok(n @ 1..=20) => match self.undo(n).await {
                     Ok(_) if n == 1 => "[zephyr] undone: the agent no longer sees your last \
@@ -1560,18 +1578,15 @@ impl<'a> Router<'a> {
         })
     }
 
-    /// `/subagent [add|model|prompt|rm ...]`: the owner's named subagents (DESIGN §4.12). Never
-    /// through the agent's `gateway`: what a subagent is told is the owner's to write.
-    async fn subagent(&mut self, arg: &str) -> String {
+    /// `/subagent add|model|prompt|rm ...`: a change to the owner's named subagents (DESIGN
+    /// §4.12), through `set_setting`. The reply, or why nothing changed.
+    async fn subagent(&mut self, arg: &str) -> Result<String, String> {
         use crate::host::conf::{remove_subagent, set_subagent};
         type Doc = toml_edit::DocumentMut;
         let (sub, rest) = word(arg);
         let (name, rest) = word(rest);
         let name = name.to_string();
-        match (sub, name.as_str(), rest) {
-            ("" | "list", "", "") => {
-                format!("[zephyr] {}", crate::tasks::settings(&self.cfg))
-            }
+        let (done, applied) = match (sub, name.as_str(), rest) {
             ("add", n, rest) if !n.is_empty() && !rest.is_empty() => {
                 // The second word is a model when it has a '/'; the rest is the prompt.
                 let (model, prompt) = match word(rest) {
@@ -1579,25 +1594,25 @@ impl<'a> Router<'a> {
                     _ => (None, rest),
                 };
                 if self.cfg.subagents.iter().any(|s| s.name == name) {
-                    return format!(
-                        "[zephyr] there is a subagent named {name} already; change it with \
+                    return Err(format!(
+                        "there is a subagent named {name} already; change it with \
                          /subagent model {name} ... or /subagent prompt {name} ..., or remove it \
                          with /subagent rm {name}"
-                    );
+                    ));
                 }
                 let set = |doc: &mut Doc| set_subagent(doc, &name, true, model, Some(prompt));
                 let done = format!("added the subagent {name}");
-                self.edit_tasks(model, set, done).await
+                (done, self.edit_config(model, set).await)
             }
             ("model", n, m) if !n.is_empty() && !m.is_empty() && word(m).1.is_empty() => {
                 let set = |doc: &mut Doc| set_subagent(doc, &name, false, Some(m), None);
                 let done = format!("subagent {name} runs on {m}");
-                self.edit_tasks(Some(m), set, done).await
+                (done, self.edit_config(Some(m), set).await)
             }
             ("prompt", n, prompt) if !n.is_empty() && !prompt.is_empty() => {
                 let set = |doc: &mut Doc| set_subagent(doc, &name, false, None, Some(prompt));
                 let done = format!("changed the prompt of subagent {name}");
-                self.edit_tasks(None, set, done).await
+                (done, self.edit_config(None, set).await)
             }
             ("rm", n, "") if !n.is_empty() => {
                 let rm = |doc: &mut Doc| match remove_subagent(doc, &name) {
@@ -1605,51 +1620,396 @@ impl<'a> Router<'a> {
                     false => Err(anyhow::anyhow!("no subagent named {name}")),
                 };
                 let done = format!("removed the subagent {name}");
-                self.edit_tasks(None, rm, done).await
+                (done, self.edit_config(None, rm).await)
             }
-            _ => "[zephyr] usage: /subagent, /subagent add NAME [PROVIDER/MODEL] PROMPT, \
-                  /subagent model NAME PROVIDER/MODEL|default, /subagent prompt NAME PROMPT, \
-                  /subagent rm NAME"
-                .into(),
-        }
+            _ => return Err(SUBAGENT_USAGE.into()),
+        };
+        Ok(format!("[zephyr] {done}\n{}", applied?))
     }
 
-    /// The owner's `/subagent` and `/task parallel|model` edits: checks `model` (unless
-    /// `default`) as `/model` does, saves `zephyr.toml` only if it still loads, then reloads.
-    async fn edit_tasks(
+    /// Edits `zephyr.toml` for the owner: checks `model` (unless `default`) as `/model` does,
+    /// saves the file only if it still loads, then reloads. The reload's answer, or why nothing
+    /// changed.
+    async fn edit_config(
         &mut self,
         model: Option<&str>,
         edit: impl FnOnce(&mut toml_edit::DocumentMut) -> anyhow::Result<()>,
-        done: String,
-    ) -> String {
+    ) -> Result<String, String> {
         let Some(path) = self.cfg.path.clone() else {
-            return "[zephyr] no zephyr.toml to change".into();
+            return Err("no zephyr.toml to change".into());
         };
         if let Some(m) = model.filter(|m| *m != "default") {
-            if !zephyr_policy::tools::model_shape(m) {
-                return format!("[zephyr] not changed: {m} is not PROVIDER/MODEL");
-            }
-            let provider = m.split('/').next().unwrap_or_default();
-            let cfg = self.cfg.clone();
-            let account = cfg.accounts.iter().find(|a| a.provider() == provider);
-            if !cfg.accounts.is_empty() && account.is_none() {
-                return format!(
-                    "[zephyr] not changed: no account is signed in to {provider}; run `zephyr \
-                     login {provider}`"
-                );
-            }
-            if !lists(&cfg, account, m).await {
-                return format!("[zephyr] rpi has no model {m}");
-            }
+            check_model(&self.cfg, m).await?;
         }
-        let saved = crate::host::conf::update(&path, |doc| {
+        crate::host::conf::update(&path, |doc| {
             edit(doc)?;
             toml::from_str::<Config>(&doc.to_string())?.validate()
-        });
-        match saved {
-            Ok(()) => format!("[zephyr] {done}\n{}", self.reload().await),
-            Err(e) => format!("[zephyr] not changed: {e:#}"),
+        })
+        .map_err(|e| format!("not changed: {e:#}"))?;
+        Ok(self.reload().await)
+    }
+
+    /// The one way a setting changes (settings spec §4.3), whoever asks: the key is looked up,
+    /// `raw` checked against its kind, the change decided (an owner on a channel that is not
+    /// strong cannot loosen a strong setting; the agent tightens at once and proposes anything
+    /// else), applied, logged and, with `until`, given its revert. `reason` is the agent's,
+    /// quoted on the owner's notice or card.
+    async fn set_setting(
+        &mut self,
+        key: &str,
+        raw: &str,
+        actor: Actor<'_>,
+        until: Option<Duration>,
+        reason: Option<&str>,
+    ) -> Outcome {
+        use crate::settings::{self as reg, Kind, Verdict};
+        let Some(s) = reg::find(key) else {
+            return Outcome::Refused(format!("no setting {key}; /settings lists them"));
+        };
+        let (raw, list) = (raw.trim(), matches!(s.apply, Apply::Subagent | Apply::Rule));
+        if until.is_some() && list {
+            return Outcome::Refused(format!("a change to {key} cannot be timed"));
         }
+        let (old, seen) = (self.shown(key), self.current(s, key));
+        // `None` clears the key. A thinking level, a subagent or a rule is checked as it applies.
+        let value = match s.apply {
+            Apply::Toml | Apply::Model if !reg::clears(s, raw) => match reg::parse(s, raw) {
+                Ok(v) => Some(v),
+                Err(e) if s.apply == Apply::Model => {
+                    return Outcome::Refused(format!("model not changed: {e}"))
+                }
+                Err(e) => return Outcome::Refused(format!("not changed: {e}")),
+            },
+            _ => None,
+        };
+        let new = match (&value, s.apply) {
+            (Some(v), _) => Some(reg::text(v)),
+            (None, Apply::Toml) => None,
+            (None, _) => Some(raw.to_string()),
+        };
+        let loosens = reg::loosens(s, old.as_deref(), new.as_deref());
+        let strong = self.cfg.settings.strong_channels.clone();
+        match reg::decide(s, &actor, loosens, &strong) {
+            Verdict::Apply => {}
+            Verdict::Refuse(why) => {
+                if let (Actor::Owner { channel }, true) = (actor, s.strong && loosens) {
+                    let (old, new) = (old.as_deref(), new.as_deref());
+                    let refused =
+                        self.store
+                            .log_setting(key, old, new, "refused", Some(channel), None);
+                    log(refused.map_err(Into::into));
+                }
+                return Outcome::Refused(why);
+            }
+            Verdict::Propose => {
+                let span = until.map(reg::span);
+                let command = match s.apply {
+                    Apply::Subagent => format!("/subagent {raw}"),
+                    Apply::Rule => format!("/rule {raw}"),
+                    _ => {
+                        let span = span.as_ref().map_or(String::new(), |d| format!(" for {d}"));
+                        format!("/set {key} {raw}{span}")
+                    }
+                };
+                let needs = s.strong && loosens;
+                let id = match self
+                    .store
+                    .propose_setting(&command, key, seen.as_deref(), needs)
+                {
+                    Ok(id) => id,
+                    Err(e) => return Outcome::Refused(format!("proposing {command} failed: {e}")),
+                };
+                let what = match list {
+                    true => command,
+                    false => format!(
+                        "{key} {} → {}",
+                        reg::shown(old.as_deref()),
+                        reg::shown(new.as_deref())
+                    ),
+                };
+                let needs = needs.then(|| strong.join(" or "));
+                let card = reg::card(id, &what, span.as_deref(), reason, needs.as_deref());
+                self.tell_owner(&card);
+                return Outcome::Proposed { id };
+            }
+        }
+        let applied = match s.apply {
+            Apply::Toml => {
+                let model =
+                    matches!(s.kind, Kind::Model | Kind::Optional(Kind::Model)) && value.is_some();
+                let write = |doc: &mut toml_edit::DocumentMut| reg::write(doc, key, value.as_ref());
+                self.edit_config(model.then_some(raw), write).await
+            }
+            Apply::Model => self.switch_model(raw).await,
+            Apply::Thinking => self.apply_thinking(raw).await,
+            Apply::Subagent => self.subagent(raw).await,
+            // rpi reads AGENTS.md once, at start: a fresh child on the same session loads the rules.
+            Apply::Rule => crate::memory::rule(self.cfg.state_dir(), raw).inspect(|_| {
+                self.restart = true;
+            }),
+            Apply::Facts => Err(format!("{key} cannot be set here")),
+        };
+        let applied = match applied {
+            Ok(applied) => applied,
+            Err(why) => return Outcome::Refused(why),
+        };
+        // What is in effect now; a model asked for may still be on its way to the child.
+        let new = match s.apply {
+            Apply::Toml | Apply::Thinking => self.shown(key),
+            _ => new,
+        };
+        let (who, channel, proposal) = match actor {
+            Actor::Owner { channel } if self.approving.is_some() => {
+                ("agent", Some(channel), self.approving)
+            }
+            Actor::Owner { channel } => ("owner", Some(channel), None),
+            Actor::Agent { .. } => ("agent", None, None),
+            Actor::Internal => ("zephyr", None, None),
+        };
+        let logged =
+            (self.store).log_setting(key, old.as_deref(), new.as_deref(), who, channel, proposal);
+        log(logged.map_err(Into::into));
+        let revert = match until {
+            None => self.store.drop_revert(key),
+            Some(d) => {
+                // Back to what the file held: unset, or for a setting that has no "none", the
+                // value it had by default.
+                let back = match (s.apply, &s.kind) {
+                    (Apply::Toml, Kind::Optional(_)) => seen,
+                    (Apply::Toml, _) => seen.or_else(|| old.clone()),
+                    _ => old.clone(),
+                };
+                // Due `d` after the change as logged, so its notice can say how long it was.
+                let at = (self.store.last_setting_change(key).ok().flatten())
+                    .map_or_else(crate::now, |c| c.at);
+                self.store
+                    .set_revert(key, back.as_deref(), at + d.as_secs() as i64)
+            }
+        };
+        log(revert.map_err(Into::into));
+        if let Actor::Agent { .. } = actor {
+            let (o, n) = (old.as_deref(), new.as_deref());
+            self.tell_owner(&reg::tightened(key, o, n, reason));
+        }
+        Outcome::Changed { old, new, applied }
+    }
+
+    /// An owner's command that changes `key` through `set_setting`: `done` words a change from
+    /// how it applied; a refusal is `[zephyr] ` and its reason.
+    async fn owner_set(
+        &mut self,
+        key: &str,
+        raw: &str,
+        channel: &str,
+        done: impl FnOnce(String) -> String,
+    ) -> String {
+        let owner = Actor::Owner { channel };
+        match self.set_setting(key, raw, owner, None, None).await {
+            Outcome::Changed { applied, .. } => done(applied),
+            Outcome::Proposed { id } => format!("[zephyr] proposed as #{id}"),
+            Outcome::Refused(why) => format!("[zephyr] {why}"),
+        }
+    }
+
+    /// `/set KEY VALUE [for D]`, for any registered setting.
+    async fn set_command(&mut self, arg: &str, channel: &str) -> String {
+        let Some((key, value, until)) = crate::settings::set_args(arg) else {
+            return SET_USAGE.into();
+        };
+        if matches!(key, "subagent" | "rule") {
+            return "[zephyr] change subagents with /subagent and rules with /rule".into();
+        }
+        let min = self.cfg.min_until;
+        let until = match until
+            .map(|d| crate::settings::parse_until(d, min))
+            .transpose()
+        {
+            Ok(until) => until,
+            Err(e) => return format!("[zephyr] {e}"),
+        };
+        let owner = Actor::Owner { channel };
+        match self.set_setting(key, value, owner, until, None).await {
+            Outcome::Changed { old, new, applied } => {
+                let at = until.and(self.store.revert_at(key).ok().flatten());
+                let at = at.map(|at| self.clock(at));
+                let (old, new) = (old.as_deref(), new.as_deref());
+                let line = crate::settings::changed(key, old, new, at.as_deref());
+                match applied.as_str() {
+                    "" | APPLIED => line,
+                    applied => format!("{line}\n{applied}"),
+                }
+            }
+            Outcome::Proposed { id } => format!("[zephyr] proposed as #{id}"),
+            Outcome::Refused(why) => format!("[zephyr] {why}"),
+        }
+    }
+
+    /// `/settings [SECTION|KEY]`: the values in effect and where each came from.
+    fn settings_listing(&self, arg: &str) -> String {
+        let strong = &self.cfg.settings.strong_channels;
+        crate::settings::listing(arg, strong, |s| self.setting_rows(s))
+    }
+
+    /// `s`'s rows for `/settings`: one per connector for a connector's setting.
+    fn setting_rows(&self, s: &Setting) -> Vec<crate::settings::Row> {
+        let keys: Vec<String> = match s.key {
+            "mcp.<name>.enabled" => (self.cfg.mcp.iter())
+                .map(|m| format!("mcp.{}.enabled", m.name))
+                .collect(),
+            key => vec![key.to_string()],
+        };
+        (keys.into_iter())
+            .map(|key| crate::settings::Row {
+                value: crate::settings::shown(self.shown(&key).as_deref()).to_string(),
+                source: self.source(s, &key),
+                key,
+            })
+            .collect()
+    }
+
+    /// Where `key`'s value came from: `until HH:MM` while a time limit runs, `default` when
+    /// nothing sets it, else who changed it last.
+    fn source(&self, s: &Setting, key: &str) -> String {
+        if let Ok(Some(at)) = self.store.revert_at(key) {
+            return format!("until {}", self.clock(at));
+        }
+        let change = self.store.last_setting_change(key).ok().flatten();
+        let set = match s.apply {
+            Apply::Toml => self.current(s, key).is_some(),
+            // rpi's own level until one is chosen.
+            Apply::Thinking => change.is_some(),
+            _ => self.shown(key).is_some(),
+        };
+        match (set, change) {
+            (false, _) => "default".into(),
+            (true, Some(c)) => crate::settings::source(&c),
+            // In zephyr.toml, written by hand or by the host CLI.
+            (true, None) => "you".into(),
+        }
+    }
+
+    /// `key`'s value in effect, as replies show it (`None`: unset): the model the child runs on
+    /// and rpi's thinking level, the subagents' names and how many rules there are, the rest
+    /// from the config.
+    fn shown(&self, key: &str) -> Option<String> {
+        match key {
+            "model" => (self.account.as_ref().map(|a| a.model.clone()))
+                .or_else(|| crate::settings::value(&self.cfg, key)),
+            "thinking" => self.thinking.clone(),
+            "subagent" => {
+                let names: Vec<&str> = self.cfg.subagents.iter().map(|s| s.name.as_str()).collect();
+                (!names.is_empty()).then(|| names.join(", "))
+            }
+            "rule" => match crate::memory::read_rules(self.cfg.state_dir()).map(|r| r.len()) {
+                Ok(0) | Err(_) => None,
+                Ok(1) => Some("1 rule".into()),
+                Ok(n) => Some(format!("{n} rules")),
+            },
+            _ => crate::settings::value(&self.cfg, key),
+        }
+    }
+
+    /// `key` as it stands, which a proposal records as the value the owner saw and `/ok` checks
+    /// again: the file's text for a `zephyr.toml` setting (`None`: absent), else `shown`.
+    fn current(&self, s: &Setting, key: &str) -> Option<String> {
+        match s.apply {
+            Apply::Toml => {
+                let doc = crate::host::conf::load(self.cfg.path.as_deref()?).ok()?;
+                crate::settings::read(&doc, key)
+            }
+            _ => self.shown(key),
+        }
+    }
+
+    /// Why the owner's `/ok` on `channel` must not run proposal `p` now (`tools::decide`): its
+    /// setting moved on since the owner was shown it, or it loosens a strong setting and
+    /// `channel` is not a strong one.
+    fn not_now(
+        &self,
+        p: &crate::store::PendingProposal,
+        channel: &str,
+    ) -> Option<crate::tools::NotNow> {
+        use crate::tools::NotNow;
+        let key = p.key.as_deref()?;
+        let s = crate::settings::find(key)?;
+        if self.current(s, key) != p.seen {
+            let now = self.shown(key);
+            return Some(NotNow::Stale(crate::settings::stale(key, now.as_deref())));
+        }
+        let strong = &self.cfg.settings.strong_channels;
+        match crate::settings::decide(s, &Actor::Owner { channel }, p.strong, strong) {
+            crate::settings::Verdict::Refuse(why) => Some(NotNow::Weak(format!("[zephyr] {why}"))),
+            _ => None,
+        }
+    }
+
+    /// A notice for the owner, on the channel the run answers (else the one last answered).
+    fn tell_owner(&self, text: &str) {
+        if let Some((channel, to)) = self.origin() {
+            log(self.store.notify(&channel, &to, text).map_err(Into::into));
+        }
+    }
+
+    /// `at` as `HH:MM` in the owner's time zone.
+    fn clock(&self, at: i64) -> String {
+        let tz = crate::scheduler::zone(&self.cfg).unwrap_or(jiff::tz::TimeZone::UTC);
+        crate::settings::clock(at, &tz)
+    }
+
+    /// Applies the time limits that ended (settings spec §4.5), and tells whoever set each, on
+    /// the channel they set it from (else the owner last answered). A revert that cannot apply
+    /// is not tried again: the owner is told why instead.
+    async fn revert_due(&mut self) {
+        let due = match self.store.due_reverts(crate::now()) {
+            Ok(due) => due,
+            Err(e) => return eprintln!("zephyr: reading setting reverts failed: {e}"),
+        };
+        for (key, value) in due {
+            // Read before the revert, which becomes the latest change.
+            let change = self.store.last_setting_change(&key).ok().flatten();
+            let span = match (self.store.revert_at(&key).ok().flatten(), &change) {
+                (Some(at), Some(c)) => {
+                    crate::settings::span(Duration::from_secs((at - c.at).max(0) as u64))
+                }
+                _ => "time limit".into(),
+            };
+            let raw = value.as_deref().unwrap_or("none");
+            let text = match self
+                .set_setting(&key, raw, Actor::Internal, None, None)
+                .await
+            {
+                Outcome::Changed { new, .. } => {
+                    crate::settings::reverted(&key, new.as_deref(), &span)
+                }
+                failed => {
+                    log(self.store.drop_revert(&key).map_err(Into::into));
+                    let why = match failed {
+                        Outcome::Refused(why) => why,
+                        _ => "it was not applied".into(),
+                    };
+                    format!(
+                        "[zephyr] {key} could not go back to {raw} when the {span} you set \
+                         ended: {why}"
+                    )
+                }
+            };
+            let to = change.and_then(|c| c.channel);
+            let told = match to.and_then(|channel| self.owner_on(&channel)) {
+                Some((channel, owner)) => self.store.notify(&channel, &owner, &text),
+                None => self.store.notify_last_owner(&text),
+            };
+            log(told.map_err(Into::into));
+        }
+    }
+
+    /// The owner on `channel`, as a notice there is addressed. On the TUI's channel the
+    /// attached client is the owner (`attach` sends as `token`).
+    fn owner_on(&self, channel: &str) -> Option<(String, String)> {
+        if channel == crate::attach::CHANNEL {
+            return Some((channel.into(), "token".into()));
+        }
+        let owner = self.cfg.owners.get(channel)?.first()?;
+        Some((channel.into(), owner.clone()))
     }
 
     /// What a `/rollback N` waits for: anything that may still be writing to the projects.
@@ -2160,9 +2520,9 @@ impl<'a> Router<'a> {
     /// on the file as it is now, and the write re-derives: a `/login` that records an account in
     /// between must not make the write land on an account no rpi was asked about, so it writes
     /// nothing and the new pool goes through the check first.
-    async fn switch_model(&mut self, model: &str) -> String {
+    async fn switch_model(&mut self, model: &str) -> Result<String, String> {
         let Some(path) = self.cfg.path.clone() else {
-            return "[zephyr] no zephyr.toml to change".into();
+            return Err("no zephyr.toml to change".into());
         };
         let active = self.account.as_ref().map(|a| a.name.clone());
         for _ in 0..3 {
@@ -2170,16 +2530,13 @@ impl<'a> Router<'a> {
                 crate::reload::set_model(&mut doc, active.as_deref(), model)?;
                 Ok(model_account(&doc, model))
             });
-            let name = match derived {
-                Ok(name) => name,
-                Err(e) => return format!("[zephyr] model not changed: {e:#}"),
-            };
+            let name = derived.map_err(|e| format!("model not changed: {e:#}"))?;
             let target = name.clone().map(|name| Account {
                 name,
                 model: model.to_string(),
             });
             if !lists(&self.cfg.clone(), target.as_ref(), model).await {
-                return format!("[zephyr] rpi has no model {model}");
+                return Err(format!("rpi has no model {model}"));
             }
             // The check and the write must name the same account: the closure that writes
             // re-derives, and a pool that moved under the check leaves the file untouched.
@@ -2196,12 +2553,11 @@ impl<'a> Router<'a> {
                 continue;
             }
             return match saved {
-                Ok(()) => self.reload().await,
-                Err(e) => format!("[zephyr] model not changed: {e:#}"),
+                Ok(()) => Ok(self.reload().await),
+                Err(e) => Err(format!("model not changed: {e:#}")),
             };
         }
-        "[zephyr] model not changed: the account pool kept changing while rpi listed the model"
-            .into()
+        Err("model not changed: the account pool kept changing while rpi listed the model".into())
     }
 
     /// Reads `zephyr.toml` and `secrets.env` again and applies what changed (`reload::diff`).
@@ -2239,7 +2595,7 @@ impl<'a> Router<'a> {
             Plan::Same => "[zephyr] nothing changed".into(),
             Plan::Live => {
                 self.account = next.or(self.account.take());
-                "[zephyr] applied".into()
+                APPLIED.into()
             }
             Plan::SetModel(model) => {
                 self.account = next;
@@ -2265,51 +2621,65 @@ impl<'a> Router<'a> {
         }
     }
 
-    /// `/thinking [level|next]`: how hard the model thinks, from the next request on. Without an
-    /// argument, the level and the ones this model offers.
-    async fn thinking_level(&mut self, arg: &str) -> String {
+    /// `/thinking [level|next]`: how hard the model thinks, from the next request on, through
+    /// `set_setting`. Without an argument, the level and the ones this model offers.
+    async fn thinking_level(&mut self, arg: &str, channel: &str) -> String {
         if self.child.is_none() {
             return "[zephyr] the agent is not running".into();
         }
-        let levels = match self
-            .call(json!({"type": "get_available_thinking_levels"}))
-            .await
-        {
-            Ok(v) => (v["levels"].as_array().into_iter().flatten())
-                .filter_map(|l| l.as_str().map(String::from))
-                .collect::<Vec<_>>(),
-            Err(e) => return format!("[zephyr] no thinking levels: {e:#}"),
-        };
-        let current = self.thinking.clone().unwrap_or_default();
         let level = match arg {
-            "" => {
-                return format!(
-                    "[zephyr] thinking {current}; /thinking {} or next sets it",
-                    levels.join("|")
-                )
-            }
-            "next" => {
+            "" | "next" => {
+                let levels = match self.thinking_levels().await {
+                    Ok(levels) => levels,
+                    Err(e) => return format!("[zephyr] {e}"),
+                };
+                let current = self.thinking.clone().unwrap_or_default();
+                if arg.is_empty() {
+                    return format!(
+                        "[zephyr] thinking {current}; /thinking {} or next sets it",
+                        levels.join("|")
+                    );
+                }
                 let at = levels.iter().position(|l| *l == current);
                 match levels.get(at.map_or(0, |i| (i + 1) % levels.len())) {
                     Some(l) => l.clone(),
                     None => return "[zephyr] this model has no thinking levels".into(),
                 }
             }
-            l if levels.iter().any(|x| x == l) => l.to_string(),
-            l => {
-                return format!(
-                    "[zephyr] no thinking level {l}; one of {}",
-                    levels.join(", ")
-                )
-            }
+            l => l.to_string(),
         };
-        match self.set_thinking(&level).await {
-            Ok(()) => {
-                self.thinking_choice = Some(level.clone());
-                format!("[zephyr] thinking {level}")
-            }
-            Err(e) => format!("[zephyr] rpi refused thinking {level}: {e:#}"),
+        let done = |_| format!("[zephyr] thinking {level}");
+        self.owner_set("thinking", &level, channel, done).await
+    }
+
+    /// The levels the child's model offers: rpi's list is the one that counts.
+    async fn thinking_levels(&mut self) -> Result<Vec<String>, String> {
+        let levels = (self
+            .call(json!({"type": "get_available_thinking_levels"}))
+            .await)
+            .map_err(|e| format!("no thinking levels: {e:#}"))?;
+        Ok((levels["levels"].as_array().into_iter().flatten())
+            .filter_map(|l| l.as_str().map(String::from))
+            .collect())
+    }
+
+    /// Sets rpi's thinking level, kept for each new child (`thinking_choice`), if the model
+    /// offers it.
+    async fn apply_thinking(&mut self, level: &str) -> Result<String, String> {
+        if self.child.is_none() {
+            return Err("the agent is not running".into());
         }
+        let levels = self.thinking_levels().await?;
+        if !levels.iter().any(|l| l == level) {
+            return Err(format!(
+                "no thinking level {level}; one of {}",
+                levels.join(", ")
+            ));
+        }
+        (self.set_thinking(level).await)
+            .map_err(|e| format!("rpi refused thinking {level}: {e:#}"))?;
+        self.thinking_choice = Some(level.to_string());
+        Ok(String::new())
     }
 
     async fn set_thinking(&mut self, level: &str) -> anyhow::Result<()> {
@@ -2809,6 +3179,25 @@ fn model_account(doc: &toml_edit::DocumentMut, model: &str) -> Option<String> {
         .into_iter()
         .find(|(_, m)| m == model)
         .map(|(name, _)| name)
+}
+
+/// `m` checked as `/model` checks a model: PROVIDER/MODEL, an account on its provider, and that
+/// account's rpi lists it.
+async fn check_model(cfg: &Config, m: &str) -> Result<(), String> {
+    if !zephyr_policy::tools::model_shape(m) {
+        return Err(format!("not changed: {m} is not PROVIDER/MODEL"));
+    }
+    let provider = m.split('/').next().unwrap_or_default();
+    let account = cfg.accounts.iter().find(|a| a.provider() == provider);
+    if !cfg.accounts.is_empty() && account.is_none() {
+        return Err(format!(
+            "not changed: no account is signed in to {provider}; run `zephyr login {provider}`"
+        ));
+    }
+    if !lists(cfg, account, m).await {
+        return Err(format!("rpi has no model {m}"));
+    }
+    Ok(())
 }
 
 /// Whether `rpi --list-models`, signed in as `account`, lists `model`. A listing that fails

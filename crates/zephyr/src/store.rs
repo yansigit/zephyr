@@ -221,6 +221,8 @@ pub struct PendingProposal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingChange {
     pub actor: String,
+    /// The channel the change was made or approved on, if any.
+    pub channel: Option<String>,
     pub proposal: Option<i64>,
     pub at: i64,
 }
@@ -906,18 +908,19 @@ impl Store {
         Ok(())
     }
 
-    /// The latest recorded change to `key`.
+    /// The latest recorded change to `key`. A refusal (actor `refused`) is not a change.
     pub fn last_setting_change(&self, key: &str) -> rusqlite::Result<Option<SettingChange>> {
         self.db
             .query_row(
-                "SELECT actor, proposal, at FROM settings_log WHERE key = ?1
-                 ORDER BY id DESC LIMIT 1",
+                "SELECT actor, channel, proposal, at FROM settings_log
+                 WHERE key = ?1 AND actor != 'refused' ORDER BY id DESC LIMIT 1",
                 params![key],
                 |r| {
                     Ok(SettingChange {
                         actor: r.get(0)?,
-                        proposal: r.get(1)?,
-                        at: r.get(2)?,
+                        channel: r.get(1)?,
+                        proposal: r.get(2)?,
+                        at: r.get(3)?,
                     })
                 },
             )
@@ -932,6 +935,17 @@ impl Store {
             params![key, value, at],
         )?;
         Ok(())
+    }
+
+    /// When `key`'s pending revert is due, if it has one.
+    pub fn revert_at(&self, key: &str) -> rusqlite::Result<Option<i64>> {
+        self.db
+            .query_row(
+                "SELECT at FROM setting_reverts WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()
     }
 
     /// Cancels the revert for `key`, if any.
@@ -2009,6 +2023,8 @@ mod tests {
         store.set_revert("a", Some("1"), 100).unwrap();
         store.set_revert("a", Some("2"), 200).unwrap();
         store.set_revert("b", None, 150).unwrap();
+        assert_eq!(store.revert_at("a").unwrap(), Some(200));
+        assert_eq!(store.revert_at("c").unwrap(), None);
         assert!(store.due_reverts(99).unwrap().is_empty());
         assert_eq!(store.due_reverts(150).unwrap(), [("b".to_string(), None)]);
         store.drop_revert("b").unwrap();
@@ -2077,6 +2093,15 @@ mod tests {
         assert!(store.last_setting_change("old").unwrap().is_none());
         let c = store.last_setting_change("new").unwrap().unwrap();
         assert_eq!((c.actor.as_str(), c.proposal), ("owner", Some(7)));
+        assert_eq!(c.channel.as_deref(), Some("chat"));
+        store
+            .log_setting("new", None, Some("9"), "refused", Some("discord"), None)
+            .unwrap();
+        assert_eq!(
+            store.last_setting_change("new").unwrap().unwrap().actor,
+            "owner",
+            "a refusal is not a change"
+        );
         store
             .log_setting("new", None, None, "agent", None, None)
             .unwrap();

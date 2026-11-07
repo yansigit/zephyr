@@ -77,6 +77,9 @@ pub struct Config {
     /// `[[mcp]]`: the connectors (MCP servers) the agent may call (DESIGN §4.6).
     #[serde(default, rename = "mcp")]
     pub mcp: Vec<Mcp>,
+    /// `[settings]`: who may loosen a protected setting (settings spec §2).
+    #[serde(default)]
+    pub settings: Settings,
     /// The file this was loaded from, which a reload reads again. `None` when built in memory.
     #[serde(skip)]
     pub path: Option<PathBuf>,
@@ -173,6 +176,28 @@ pub const MAX_SUBAGENT_PROMPT: usize = zephyr_policy::tools::MAX_GOAL;
 
 fn default_parallel() -> usize {
     2
+}
+
+/// `[settings]` (settings spec §2).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Settings {
+    /// Channels that may loosen a setting marked strong (a budget, this list). The TUI is
+    /// always one; `chat` is the root-only socket the host CLI uses.
+    #[serde(default = "strong_default")]
+    pub strong_channels: Vec<String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            strong_channels: strong_default(),
+        }
+    }
+}
+
+fn strong_default() -> Vec<String> {
+    vec!["tui".into(), "chat".into()]
 }
 
 /// `[agent]`.
@@ -323,6 +348,19 @@ impl Config {
             if !names.insert(&m.name) {
                 anyhow::bail!("connector name {:?} is used twice", m.name);
             }
+        }
+        let strong = &self.settings.strong_channels;
+        if let Some(bad) = strong
+            .iter()
+            .find(|c| !crate::settings::CHANNELS.contains(&c.as_str()))
+        {
+            anyhow::bail!(
+                "[settings] strong_channels names {bad:?}; allowed: {}",
+                crate::settings::CHANNELS.join(", ")
+            );
+        }
+        if !strong.iter().any(|c| c == "tui") {
+            anyhow::bail!("[settings] strong_channels must keep tui");
         }
         crate::scheduler::zone(self)?;
         Ok(())
@@ -507,6 +545,22 @@ prompt = "Build it."
             "{base}[[subagent]]\nname = 'a'\nprompt = 'p'\ntypo = 1\n"
         ))
         .is_err());
+    }
+
+    #[test]
+    fn strong_channels_default_to_the_tui_and_chat_and_keep_the_tui() {
+        let base = "rpi = 'a'\nhome = 'b'\n";
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert_eq!(cfg.settings.strong_channels, ["tui", "chat"]);
+        let with = |text: &str| -> Config { toml::from_str(&format!("{base}{text}")).unwrap() };
+        with("[settings]\nstrong_channels = ['tui']\n")
+            .validate()
+            .unwrap();
+        for bad in ["['chat']", "[]", "['tui', 'telegram']"] {
+            let cfg = with(&format!("[settings]\nstrong_channels = {bad}\n"));
+            assert!(cfg.validate().is_err(), "{bad}");
+        }
+        assert!(toml::from_str::<Config>(&format!("{base}[settings]\ntypo = 1\n")).is_err());
     }
 
     #[test]

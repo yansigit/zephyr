@@ -178,9 +178,22 @@ pub fn ask_owner(store: &Store, command: &str, ask: &str, ok: &str) -> rusqlite:
     Ok(id)
 }
 
+/// Why `/ok N` does not run a proposal now (`decide`'s `check`).
+pub enum NotNow {
+    /// Its setting changed since the owner was shown it: it is dropped, with this answer.
+    Stale(String),
+    /// Approving it needs a strong channel: it stays waiting, with this answer.
+    Weak(String),
+}
+
 /// The owner's `/ok N` or `/no N`. `Some(Ok(command))` is the approved command, for the router to
 /// run as the owner's own; `Some(Err(reply))` is the whole answer; `None` for any other text.
-pub fn decide(store: &Store, text: &str) -> Option<Result<String, String>> {
+/// Before an `/ok` settles, `check` sees the waiting proposal and may hold it back.
+pub fn decide(
+    store: &Store,
+    text: &str,
+    check: impl FnOnce(&crate::store::PendingProposal) -> Option<NotNow>,
+) -> Option<Result<String, String>> {
     let (verb, n) = text.split_once(' ').unwrap_or((text, ""));
     let status = match verb {
         "/ok" => "done",
@@ -193,6 +206,24 @@ pub fn decide(store: &Store, text: &str) -> Option<Result<String, String>> {
             "[zephyr] {verb} takes a proposal number, e.g. {verb} 3"
         )));
     };
+    let failed =
+        |e: rusqlite::Error| Some(Err(format!("[zephyr] reading proposal #{id} failed: {e}")));
+    if status == "done" {
+        let waiting = match store.pending_proposals() {
+            Ok(waiting) => waiting,
+            Err(e) => return failed(e),
+        };
+        match waiting.iter().find(|p| p.id == id).and_then(check) {
+            Some(NotNow::Weak(reply)) => return Some(Err(reply)),
+            Some(NotNow::Stale(reply)) => {
+                return match store.settle_proposal(id, "dropped") {
+                    Ok(_) => Some(Err(reply)),
+                    Err(e) => failed(e),
+                }
+            }
+            None => {}
+        }
+    }
     Some(match store.settle_proposal(id, status) {
         Ok(Some(command)) if status == "done" => Ok(command),
         Ok(Some(command)) => Err(format!("[zephyr] dropped #{id} ({command})")),
@@ -200,7 +231,7 @@ pub fn decide(store: &Store, text: &str) -> Option<Result<String, String>> {
             "[zephyr] no proposal #{id} is waiting: it was never made, is already handled, or is \
              older than 24 h"
         )),
-        Err(e) => Err(format!("[zephyr] reading proposal #{id} failed: {e}")),
+        Err(e) => return failed(e),
     })
 }
 

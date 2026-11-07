@@ -2330,6 +2330,171 @@ async fn the_owner_edits_subagents_and_task_settings_from_a_chat() {
     gw.shutdown().await;
 }
 
+/// `on_file` with `extra`, and `downer` as the owner on `discord` too.
+fn on_file_with_discord(home: &Path, extra: &str) -> Config {
+    let path = home.join("zephyr.toml");
+    let text = file_text(home, extra).replace(
+        "chat = [\"owner\"]",
+        "chat = [\"owner\"]\ndiscord = [\"downer\"]",
+    );
+    std::fs::write(&path, text).unwrap();
+    Config::load(&path).unwrap()
+}
+
+#[tokio::test]
+async fn set_changes_a_registered_value_and_logs_who() {
+    let home = home("set-value");
+    let gw = start(on_file(&home, ""));
+    // Before the first child is up any reload reads as a move to an account (a restart).
+    wait(|| !log(&home, "start").is_empty()).await;
+    gw.say("m1", "owner", "/set tasks.parallel 3").await;
+    gw.say("m2", "owner", "/set nope 1").await;
+    gw.say("m3", "owner", "/set tasks.parallel 40").await;
+    assert_eq!(
+        gw.wait_replies(3).await,
+        [
+            "[zephyr] tasks.parallel 2 → 3",
+            "[zephyr] no setting nope; /settings lists them",
+            "[zephyr] not changed: [tasks] parallel must be 1 to 32",
+        ]
+    );
+    let text = std::fs::read_to_string(home.join("zephyr.toml")).unwrap();
+    assert!(text.contains("parallel = 3"), "{text}");
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let change = store
+        .last_setting_change("tasks.parallel")
+        .unwrap()
+        .unwrap();
+    assert_eq!(change.actor, "owner");
+    assert_eq!(change.channel.as_deref(), Some("chat"));
+    assert_eq!(change.proposal, None);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_strong_loosening_is_refused_from_discord_and_accepted_from_chat() {
+    let home = home("set-strong");
+    let gw = start(on_file_with_discord(
+        &home,
+        "[budget]\ndaily_cost_usd = 5.0",
+    ));
+    wait(|| !log(&home, "start").is_empty()).await;
+    let refused = "[zephyr] loosening budget.daily_cost_usd needs tui or chat";
+    gw.say_on("discord", "d1", "downer", "/set budget.daily_cost_usd 8")
+        .await;
+    assert_eq!(gw.wait_replies_on("discord", 1).await, [refused]);
+    // The agent's proposal to loosen it: approving it needs a strong channel too, and a refused
+    // approval leaves it waiting.
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let cmd = "/set budget.daily_cost_usd 9";
+    let id = (store.propose_setting(cmd, "budget.daily_cost_usd", Some("5.0"), true)).unwrap();
+    gw.say_on("discord", "d2", "downer", &format!("/ok {id}"))
+        .await;
+    assert_eq!(gw.wait_replies_on("discord", 2).await[1], refused);
+    assert_eq!(store.pending_proposals().unwrap().len(), 1, "still waiting");
+    gw.say("m1", "owner", &format!("/ok {id}")).await;
+    assert_eq!(
+        gw.wait_replies(1).await,
+        [format!(
+            "[zephyr] /ok {id} approved {cmd}\n[zephyr] budget.daily_cost_usd 5 → 9"
+        )]
+    );
+    // Tightening needs no strong channel.
+    gw.say_on("discord", "d3", "downer", "/set budget.daily_cost_usd 3")
+        .await;
+    assert_eq!(
+        gw.wait_replies_on("discord", 3).await[2],
+        "[zephyr] budget.daily_cost_usd 9 → 3"
+    );
+    let cfg = Config::load(&home.join("zephyr.toml")).unwrap();
+    assert_eq!(cfg.budget.unwrap().daily_cost_usd, Some(3.0));
+    let change = store.last_setting_change("budget.daily_cost_usd").unwrap();
+    assert_eq!(change.unwrap().actor, "owner");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_timed_change_reverts_on_the_tick() {
+    let home = home("set-timed");
+    let mut cfg = on_file(&home, "");
+    cfg.tick = Duration::from_millis(200);
+    cfg.min_until = Duration::from_secs(1);
+    let gw = start(cfg);
+    wait(|| !log(&home, "start").is_empty()).await;
+    gw.say("m1", "owner", "/set tasks.parallel 3 for 1s").await;
+    let first = gw.wait_replies(1).await.remove(0);
+    assert!(
+        first.starts_with("[zephyr] tasks.parallel 2 → 3 until "),
+        "{first}"
+    );
+    wait(|| gw.replies().len() == 2).await;
+    assert_eq!(
+        gw.replies()[1],
+        "[zephyr] tasks.parallel went back to 2 (the 1s you set ended)"
+    );
+    let cfg = Config::load(&home.join("zephyr.toml")).unwrap();
+    assert_eq!(cfg.parallel_tasks(), 2);
+    let store = Store::open(&home.join("state.db")).unwrap();
+    assert!(store.due_reverts(i64::MAX).unwrap().is_empty(), "done once");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn settings_lists_a_section_with_values_and_sources() {
+    let home = home("settings-list");
+    let gw = start(on_file(&home, ""));
+    wait(|| !log(&home, "start").is_empty()).await;
+    gw.say("m1", "owner", "/settings Background tasks").await;
+    gw.say("m2", "owner", "/set tasks.parallel 3").await;
+    gw.say("m3", "owner", "/settings tasks.parallel").await;
+    let r = gw.wait_replies(3).await;
+    assert!(
+        r[0].contains("\ntasks.parallel · 2 · default\n"),
+        "{}",
+        r[0]
+    );
+    assert!(r[0].contains("\ntasks.model · none · default"), "{}", r[0]);
+    assert!(
+        r[2].starts_with("[zephyr] tasks.parallel · 3 · you\n"),
+        "{}",
+        r[2]
+    );
+    assert!(r[2].contains("1 to 32"), "{}", r[2]);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stale_proposal_is_refused() {
+    let home = home("set-stale");
+    let gw = start(on_file(&home, ""));
+    wait(|| !log(&home, "start").is_empty()).await;
+    let store = Store::open(&home.join("state.db")).unwrap();
+    // The owner was shown `tasks.parallel` at 3; it is unset (2) now.
+    let cmd = "/set tasks.parallel 4";
+    let stale = (store.propose_setting(cmd, "tasks.parallel", Some("3"), false)).unwrap();
+    let fresh = (store.propose_setting(cmd, "tasks.parallel", None, false)).unwrap();
+    gw.say("m1", "owner", &format!("/ok {stale}")).await;
+    gw.say("m2", "owner", &format!("/ok {stale}")).await;
+    gw.say("m3", "owner", &format!("/ok {fresh}")).await;
+    let r = gw.wait_replies(3).await;
+    assert_eq!(r[0], "[zephyr] tasks.parallel is now 2; propose again");
+    let gone = format!("[zephyr] no proposal #{stale} is waiting");
+    assert!(r[1].starts_with(&gone), "{}", r[1]);
+    assert_eq!(
+        r[2],
+        format!("[zephyr] /ok {fresh} approved {cmd}\n[zephyr] tasks.parallel 2 → 4")
+    );
+    let change = store
+        .last_setting_change("tasks.parallel")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (change.actor.as_str(), change.proposal),
+        ("agent", Some(fresh))
+    );
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn two_tasks_run_at_once_and_owner_stop_ends_them_all() {
     let home = home("task-owner-stop");

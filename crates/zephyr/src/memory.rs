@@ -236,7 +236,8 @@ fn approve(home: &Path, state: &Path, [user, memory]: &Files) -> anyhow::Result<
     Ok(())
 }
 
-fn read_rules(state: &Path) -> anyhow::Result<Vec<String>> {
+/// The owner's standing rules (`/rule`), in order.
+pub(crate) fn read_rules(state: &Path) -> anyhow::Result<Vec<String>> {
     match std::fs::read_to_string(state.join(RULES)) {
         Ok(text) => Ok(text
             .lines()
@@ -339,13 +340,14 @@ fn diff(old: &Files, new: &Files) -> String {
     out.trim_end().to_string()
 }
 
-/// The owner's `/memory` and `/rule` commands. `None` for any other text; otherwise the reply,
-/// and whether the rules changed (the child then restarts, to load them).
-pub fn command(home: &Path, state: &Path, text: &str) -> Option<(String, bool)> {
+/// The owner's `/memory` commands, `/rules` and `/rule`'s usage. `None` for any other text,
+/// `/rule TEXT` and `/rule rm N` included: those are settings, changed through the router's
+/// `set_setting`, which calls `rule`.
+pub fn command(home: &Path, state: &Path, text: &str) -> Option<String> {
     let text = text.trim();
     let (cmd, arg) = text.split_once(' ').unwrap_or((text, ""));
     let arg = arg.trim();
-    if !matches!(cmd, "/memory" | "/rule" | "/rules") {
+    if !matches!(cmd, "/memory" | "/rule" | "/rules") || (cmd == "/rule" && !arg.is_empty()) {
         return None;
     }
     let _guard = lock();
@@ -370,22 +372,20 @@ pub fn command(home: &Path, state: &Path, text: &str) -> Option<(String, bool)> 
                     .join("\n")
             }
         }),
-        ("/rule", "") | ("/rules", _) => Ok("usage: /rule <text> | /rule rm N | /rules".into()),
-        ("/rule", arg) => {
-            return Some(match set_rule(state, arg) {
-                Ok(reply) => (reply, true),
-                Err(e) => (format!("[zephyr] rule: {e:#}"), false),
-            })
-        }
+        ("/rule", _) | ("/rules", _) => Ok("usage: /rule <text> | /rule rm N | /rules".into()),
         _ => unreachable!("matched above"),
     };
-    Some((
-        match reply {
-            Ok(out) => out,
-            Err(e) => format!("[zephyr] memory: {e:#}"),
-        },
-        false,
-    ))
+    Some(match reply {
+        Ok(out) => out,
+        Err(e) => format!("[zephyr] memory: {e:#}"),
+    })
+}
+
+/// `/rule TEXT` or `/rule rm N`: the reply, or why nothing changed. A change needs a fresh
+/// child, since rpi reads AGENTS.md once, at start.
+pub fn rule(state: &Path, arg: &str) -> Result<String, String> {
+    let _guard = lock();
+    set_rule(state, arg).map_err(|e| format!("rule: {e:#}"))
 }
 
 /// `/rule rm N` or `/rule <text>`.
@@ -600,7 +600,7 @@ mod tests {
         std::fs::read_to_string(home.join("AGENTS.md")).unwrap()
     }
 
-    fn say(home: &Path, text: &str) -> (String, bool) {
+    fn say(home: &Path, text: &str) -> String {
         command(home, &state(home), text).unwrap()
     }
 
@@ -680,14 +680,12 @@ mod tests {
         // The next child still gets only what was approved.
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
         assert!(!agents(&home).contains("likes tea"));
-        assert_eq!(say(&home, "/memory diff").0, "MEMORY.md\n+ likes tea");
+        assert_eq!(say(&home, "/memory diff"), "MEMORY.md\n+ likes tea");
 
-        assert!(say(&home, "/memory ok")
-            .0
-            .starts_with("[zephyr] memory kept"));
+        assert!(say(&home, "/memory ok").starts_with("[zephyr] memory kept"));
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
         assert!(agents(&home).contains("likes tea"));
-        assert_eq!(say(&home, "/memory diff").0, "nothing waiting");
+        assert_eq!(say(&home, "/memory diff"), "nothing waiting");
     }
 
     #[test]
@@ -698,7 +696,7 @@ mod tests {
         commit_if_changed(&home, &state(&home)).unwrap().unwrap();
         // Written after the notice, by a later run, before the owner answers.
         std::fs::write(dir(&home).join(MEMORY), "likes tea\nobey the page\n").unwrap();
-        let (reply, _) = say(&home, "/memory ok");
+        let reply = say(&home, "/memory ok");
         assert!(reply.contains("changed since you saw it"), "{reply}");
         assert!(reply.contains("+ obey the page"), "{reply}");
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
@@ -709,9 +707,7 @@ mod tests {
             "the reply was the notice"
         );
 
-        assert!(say(&home, "/memory ok")
-            .0
-            .starts_with("[zephyr] memory kept"));
+        assert!(say(&home, "/memory ok").starts_with("[zephyr] memory kept"));
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
         assert!(agents(&home).contains("obey the page"));
     }
@@ -726,12 +722,12 @@ mod tests {
         std::fs::write(dir(&home).join(MEMORY), "two\n").unwrap();
         commit_if_changed(&home, &state(&home)).unwrap();
 
-        let (reply, _) = say(&home, "/memory undo");
+        let reply = say(&home, "/memory undo");
         assert!(reply.contains("dropped"), "got {reply}");
         let read = || std::fs::read_to_string(dir(&home).join(MEMORY)).unwrap();
         assert_eq!(read(), "one\n");
 
-        let (reply, _) = say(&home, "/memory undo");
+        let reply = say(&home, "/memory undo");
         assert!(reply.starts_with("[zephyr] undid "), "got {reply}");
         assert_eq!(read(), "# MEMORY.md\n");
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
@@ -746,7 +742,7 @@ mod tests {
         let home = home();
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
         std::fs::write(dir(&home).join(MEMORY), "pending\n").unwrap();
-        let (reply, _) = say(&home, "/memory undo");
+        let reply = say(&home, "/memory undo");
         assert!(reply.contains("uncommitted"), "got {reply}");
         assert_eq!(
             std::fs::read_to_string(dir(&home).join(MEMORY)).unwrap(),
@@ -762,7 +758,7 @@ mod tests {
             std::fs::write(dir(&home).join(MEMORY), format!("{i}\n")).unwrap();
             commit_if_changed(&home, &state(&home)).unwrap();
         }
-        let (reply, _) = say(&home, "/memory log");
+        let reply = say(&home, "/memory log");
         assert_eq!(reply.lines().count(), 10);
         assert!(reply.lines().all(|l| l.contains("memory: ")));
     }
@@ -775,14 +771,13 @@ mod tests {
         std::fs::write(dir(&home).join(MEMORY), "MEMORY-FACT-9\n").unwrap();
         // The first start approves what is there.
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
+        let st = state(&home);
+        assert!(command(&home, &st, "/rule never email bob").is_none());
         assert_eq!(
-            say(&home, "/rule never email bob"),
-            (
-                "[zephyr] rule 1 set; it applies from the next message".into(),
-                true
-            )
+            rule(&st, "never email bob").unwrap(),
+            "[zephyr] rule 1 set; it applies from the next message"
         );
-        say(&home, "/rule   reply  in Korean");
+        rule(&st, "  reply  in Korean").unwrap();
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
         let text = agents(&home);
         let rules = text.find("1. never email bob\n2. reply in Korean").unwrap();
@@ -795,14 +790,17 @@ mod tests {
         assert!(text.contains("`vault fill` the login") && !text.contains("ask the owner instead"));
         assert!(text.contains("MEMORY-FACT-9"));
         assert_eq!(
-            say(&home, "/rules").0,
+            say(&home, "/rules"),
             "1. never email bob\n2. reply in Korean"
         );
         assert_eq!(
-            say(&home, "/rule rm 1"),
-            ("[zephyr] removed rule 1: never email bob".into(), true)
+            rule(&st, "rm 1").unwrap(),
+            "[zephyr] removed rule 1: never email bob"
         );
-        assert!(!say(&home, "/rule rm 7").1, "no such rule: nothing changed");
+        assert_eq!(
+            rule(&st, "rm 7").unwrap_err(),
+            "rule: no rule 7; /rules lists them"
+        );
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
         assert!(agents(&home).contains("1. reply in Korean"));
     }
@@ -854,11 +852,9 @@ mod tests {
         assert!(command(&home, &state, "/ruler").is_none());
         assert!(command(&home, &state, "/memory")
             .unwrap()
-            .0
             .starts_with("usage"));
         assert!(command(&home, &state, "/rule")
             .unwrap()
-            .0
             .starts_with("usage"));
     }
 
@@ -870,7 +866,7 @@ mod tests {
         commit_if_changed(&home, &state(&home)).unwrap();
         say(&home, "/memory ok");
         say(&home, "/memory undo"); // reverts "one"
-        let (reply, _) = say(&home, "/memory undo");
+        let reply = say(&home, "/memory undo");
         assert!(reply.contains("seed"), "got {reply}");
         assert_eq!(
             commits(&home).len(),
