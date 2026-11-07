@@ -51,6 +51,7 @@ zephyr login openai-codex --account codex-main
 | `zephyr skill add DIR \| list \| rm NAME` | Skills the agent may use (see [Skills and connectors](#skills-and-connectors)); one you add is approved at once |
 | `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}` |
 | `zephyr packages add NAME.. \| rm NAME.. \| list` | Ubuntu (apt) packages for the agent, baked into a local image (`zephyr-local:<version>-<hash>`) on the release one; `up` and `upgrade` build it, and `add`/`rm` rebuild and recreate the container once the agent is idle |
+| `zephyr facts list \| add NAME --kind text\|digits\|email \| rm NAME \| allow NAME TARGET \| disallow NAME TARGET` | Private facts (a phone number, an address) that must not leave in an outgoing call; the value is asked for hidden, or read from one stdin line when piped, never taken as an argument. They are kept in `facts.toml` (0600, with the daemon's files). `/facts` in a chat lists names, kinds and allowed targets and, from `tui` or `chat` only, `rm NAME` and `allow NAME TARGET`; a chat never takes a value. The agent may add a fact (you are told its name); removing one or allowing a target is only proposed |
 | `zephyr vault list \| add login NAME --site URL [--user U] [--totp] \| add token NAME \| edit NAME \| rm NAME \| revoke NAME [PROGRAM]` | Logins and tokens the agent uses by name (see [The vault](#the-vault)); values are asked for hidden, or read one per line from stdin when piped, never taken as arguments |
 | `zephyr subagent list \| add NAME [--model P/M] [--prompt TEXT] \| edit NAME [--model P/M\|default] [--prompt TEXT] \| rm NAME` | The named subagents the agent starts background tasks as (see [Background tasks](#the-agents-browser-and-desktop)); without `--prompt`, the prompt is read from stdin when piped |
 | `zephyr config get\|set KEY [VALUE]` | Read or edit `zephyr.toml` (comments are kept; a change that would make it invalid is refused), e.g. `config set tasks.parallel 16` or `config set tasks.model PROVIDER/MODEL`. A key in the [settings list](#changing-settings) goes through the running daemon, which checks it, logs it and applies it. Any other key prints a warning that it is saved without checking, and is saved. With no daemon running, the file is edited directly and applies at the next start |
@@ -461,6 +462,10 @@ The first `himalaya` command run with `secrets: ["MAIL_PASSWORD"]` asks you to a
   - `tui.token`: the `zephyr attach` token.
   - `vault.toml` (0600): the [vault](#the-vault)'s logins and tokens, and what each may be used
     for. `zephyr vault` edits it; comments you add by hand are kept.
+  - `facts.toml` (0600): your private facts: name, kind (`text`, `digits`, `email`), value and the
+    targets each may go to. `zephyr facts` edits it. A value is matched however it is written (case,
+    spacing, `+1 (555) 010-2345` against `5550102345`, percent-encoded, base64); a digits fact
+    needs 6 digits and a text one 4 characters or it never matches.
   - `host.toml`: the projects folder, optionally `memory = "8g"` to cap the container's memory (75% of the machine's when unset),
     `packages`: the apt packages `zephyr packages` bakes into the local image, and `offered_extensions`: the image extensions `init`, `up` and `upgrade` have already added to `zephyr.toml`, so one you remove stays removed. The first `up` after upgrading to a zephyr that keeps this record adds once any image extension removed earlier, or every one if the config lists none; after that, a removal sticks.
     Used only on the host, at `zephyr up`.

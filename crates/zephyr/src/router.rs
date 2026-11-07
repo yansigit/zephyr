@@ -857,6 +857,9 @@ impl<'a> Router<'a> {
             {
                 return Some(self.agent_set(command).await)
             }
+            Some(Gateway::Propose) if command.starts_with("/facts ") => {
+                return Some(self.agent_facts(command))
+            }
             Some(Gateway::Propose) => {
                 return Some(crate::tools::propose_command(&self.store, command))
             }
@@ -876,6 +879,27 @@ impl<'a> Router<'a> {
             memory => crate::memory::command(&self.cfg.home, self.cfg.state_dir(), memory)
                 .unwrap_or_default(),
         })
+    }
+
+    /// The agent's `/facts …`: an `add` is saved at once (a new fact only makes calls stricter)
+    /// and the owner is told its name, never its value; `rm` and `allow` loosen the check, so
+    /// they are stored for the owner's `/ok` from a strong channel (`not_now`).
+    fn agent_facts(&mut self, command: &str) -> String {
+        let arg = command.strip_prefix("/facts ").unwrap_or_default();
+        let Some(add) = arg.strip_prefix("add ") else {
+            return crate::tools::propose_command(&self.store, command);
+        };
+        match crate::facts::agent_add(&crate::facts::path(&self.cfg), add) {
+            Ok(said) => {
+                let name = add.split(' ').next().unwrap_or_default();
+                self.tell_owner(&format!(
+                    "[zephyr] the agent saved a private fact named {name}; calls holding it \
+                     follow approvals.facts. /facts lists the facts, /facts rm {name} removes it"
+                ));
+                said
+            }
+            Err(why) => format!("refused: {why}"),
+        }
     }
 
     /// The agent's `/set KEY VALUE [for D]`, `/subagent …` and `/rule …`: through `set_setting`
@@ -1184,6 +1208,9 @@ impl<'a> Router<'a> {
     /// `zephyr.settings_set`: `/set KEY VALUE [for D]` as the owner on the TUI, answered as data.
     async fn settings_set(&mut self, key: &str, value: &str, until: Option<&str>) -> Value {
         let refused = |why: String| json!({"outcome": "refused", "reason": why});
+        if key == "facts" {
+            return refused("change private facts with /facts".into());
+        }
         if matches!(key, "subagent" | "rule") {
             return refused("change subagents with /subagent and rules with /rule".into());
         }
@@ -1826,6 +1853,16 @@ impl<'a> Router<'a> {
             }
             // The owner's credentials (DESIGN §4.15); also an approved `/vault grant` proposal.
             ("/vault", arg) => crate::vault::command(&crate::vault::path(&self.cfg), arg),
+            // The owner's private facts (approvals spec §4.5): names only, never a value.
+            ("/facts", arg) => {
+                let strong = self
+                    .cfg
+                    .settings
+                    .strong_channels
+                    .iter()
+                    .any(|c| c == from.0);
+                crate::facts::command(&crate::facts::path(&self.cfg), arg, strong)
+            }
             // Skills and connectors the agent drafted (DESIGN §4.6).
             ("/skills" | "/skill" | "/mcp", _) => {
                 use crate::drafts::After;
@@ -1936,6 +1973,9 @@ impl<'a> Router<'a> {
         let Some(s) = reg::find(key) else {
             return Outcome::Refused(format!("no setting {key}; /settings lists them"));
         };
+        if s.apply == Apply::Facts {
+            return Outcome::Refused("change private facts with /facts".into());
+        }
         let (raw, list) = (raw.trim(), matches!(s.apply, Apply::Subagent | Apply::Rule));
         if until.is_some() && list {
             return Outcome::Refused(format!("a change to {key} cannot be timed"));
@@ -2070,7 +2110,7 @@ impl<'a> Router<'a> {
                 self.restart = true;
                 Reloaded::done(reply)
             }),
-            Apply::Facts => Err(format!("{key} cannot be set here")),
+            Apply::Facts => Err("change private facts with /facts".into()),
         };
         let applied = match applied {
             Ok(applied) => applied,
@@ -2174,6 +2214,9 @@ impl<'a> Router<'a> {
         let Some((key, value, until)) = crate::settings::set_args(arg) else {
             return SET_USAGE.into();
         };
+        if key == "facts" {
+            return "[zephyr] change private facts with /facts".into();
+        }
         if matches!(key, "subagent" | "rule") {
             return "[zephyr] change subagents with /subagent and rules with /rule".into();
         }
@@ -2292,6 +2335,15 @@ impl<'a> Router<'a> {
                 let names: Vec<&str> = self.cfg.subagents.iter().map(|s| s.name.as_str()).collect();
                 (!names.is_empty()).then(|| names.join(", "))
             }
+            // Names only: the values never leave facts.toml.
+            "facts" => (crate::facts::load(&crate::facts::path(&self.cfg)).ok())
+                .filter(|f| !f.is_empty())
+                .map(|f| {
+                    f.iter()
+                        .map(|f| f.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }),
             "rule" => match crate::memory::read_rules(self.cfg.state_dir()).map(|r| r.len()) {
                 Ok(0) | Err(_) => None,
                 Ok(1) => Some("1 rule".into()),
@@ -2332,6 +2384,16 @@ impl<'a> Router<'a> {
         channel: &str,
     ) -> Option<crate::tools::NotNow> {
         use crate::tools::NotNow;
+        // A fact's removal or new allowed target loosens the check: from a strong channel only.
+        let facts = p.command.starts_with("/facts rm ") || p.command.starts_with("/facts allow ");
+        let strong = &self.cfg.settings.strong_channels;
+        if p.key.is_none() && facts && !strong.iter().any(|c| c == channel) {
+            return Some(NotNow::Weak(format!(
+                "[zephyr] #{} loosens the check for a private fact: approve it from {}",
+                p.id,
+                strong.join(" or ")
+            )));
+        }
         let key = p.key.as_deref()?;
         let s = crate::settings::find(key)?;
         if self.current(s, key) != p.seen {

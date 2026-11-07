@@ -356,6 +356,19 @@ pub static SETTINGS: &[Setting] = &[
         Apply::Rule,
     ),
     row(
+        "facts",
+        "Approvals",
+        "Private facts",
+        "Things that must not leave in an outgoing call, kept by name: /facts lists them, \
+         /facts rm NAME and /facts allow NAME TARGET loosen the check. Values are saved only \
+         in zephyr attach or with `zephyr facts add`. The agent may add one, never change one.",
+        Kind::Text { max: 4000 },
+        Access::Propose,
+        true,
+        Stricter::NotOrdered,
+        Apply::Facts,
+    ),
+    row(
         "settings.strong_channels",
         "Security",
         "Strong channels",
@@ -1160,6 +1173,9 @@ fn allowed(s: &Setting) -> String {
             "/subagent add NAME [PROVIDER/MODEL] PROMPT, model, prompt, rm".into()
         }
         (Apply::Rule, _) => "/rule TEXT, /rule rm N".into(),
+        (Apply::Facts, _) => {
+            "/facts rm NAME, /facts allow NAME TARGET, /facts disallow NAME TARGET".into()
+        }
         (_, Kind::Optional(inner)) if s.key.starts_with("approvals.") => {
             format!("{}, or default (the preset's)", kind(inner))
         }

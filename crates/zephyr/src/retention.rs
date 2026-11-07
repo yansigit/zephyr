@@ -103,7 +103,13 @@ fn sweep_copies(cfg: &Config, store: &Store) -> rusqlite::Result<usize> {
 const BACKUPS_KEPT: usize = 7;
 
 /// The daemon's files `backup` copies beside state.db, when present.
-const BACKED_UP: [&str; 4] = ["zephyr.toml", "vault.toml", "host.toml", "secrets.env"];
+const BACKED_UP: [&str; 5] = [
+    "zephyr.toml",
+    "vault.toml",
+    "facts.toml",
+    "host.toml",
+    "secrets.env",
+];
 
 fn backups_dir(cfg: &Config) -> PathBuf {
     cfg.state_dir().join("backups")

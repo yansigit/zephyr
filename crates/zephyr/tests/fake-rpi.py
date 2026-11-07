@@ -146,6 +146,19 @@ def gateway_kind(c):
         return "propose" if ok else None
     if cmd == "/rule":
         return "propose" if plain(arg) else None
+    if cmd == "/facts":
+        w = arg.split(" ", 3)
+        name = lambda n: re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", n) is not None
+        aword = lambda t: t != "" and all(33 <= ord(ch) <= 126 for ch in t)
+        if len(w) == 4 and w[0] == "add":
+            ok = name(w[1]) and w[2] in ("text", "digits", "email") and plain(w[3]) and len(w[3]) <= 500
+        elif len(w) == 2 and w[0] == "rm":
+            ok = name(w[1])
+        elif len(w) == 3 and w[0] == "allow":
+            ok = name(w[1]) and aword(w[2]) and len(w[2]) <= 200
+        else:
+            ok = False
+        return "propose" if ok else None
     ok = {"/new": c == cmd, "/pause": c == cmd, "/reload": c == cmd, "/switch": word,
           "/model": word and re.fullmatch(r"[^/]+/.+", arg) is not None}.get(cmd, False)
     return "propose" if ok else None

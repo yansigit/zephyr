@@ -934,6 +934,57 @@ async fn zephyr_vault_methods_save_list_and_remove_without_echoing_a_value() {
     gw.shutdown().await;
 }
 
+#[tokio::test]
+async fn facts_put_answers_without_values() {
+    const PHONE: &str = "+1 555 010 2345";
+    let gw = start("facts");
+    let mut c = Client::connect(gw.port).await;
+    let early = c.call("zephyr.facts_list", json!({})).await;
+    assert_eq!(early["error"]["code"], -32001, "{early}");
+    c.call("authenticate", json!({"token": TOKEN})).await;
+
+    let fact =
+        json!({"name": "phone", "kind": "digits", "value": PHONE, "allow": ["mum@example.com"]});
+    let put = c.call("zephyr.facts_put", fact).await;
+    let listed = c.call("zephyr.facts_list", json!({})).await;
+    for frame in [&put, &listed] {
+        let facts = frame["result"]["facts"].as_array().expect("facts");
+        assert_eq!(facts.len(), 1, "{frame}");
+        assert_eq!(facts[0]["name"], "phone");
+        assert_eq!(facts[0]["kind"], "digits");
+        assert_eq!(facts[0]["allow"], json!(["mum@example.com"]));
+        assert!(!frame.to_string().contains("555"), "{frame}");
+    }
+    let saved = std::fs::read_to_string(gw.home.join("facts.toml")).unwrap();
+    assert!(saved.contains(PHONE));
+
+    // An empty value on a saved name keeps the value and changes the rest.
+    let edit = json!({"name": "phone", "kind": "digits", "value": "", "allow": []});
+    let kept = c.call("zephyr.facts_put", edit).await;
+    assert_eq!(kept["result"]["facts"][0]["allow"], json!([]), "{kept}");
+    assert!(std::fs::read_to_string(gw.home.join("facts.toml"))
+        .unwrap()
+        .contains(PHONE));
+
+    // A refusal names the problem, never the value; the agent is not told of the fact.
+    let short = json!({"name": "pin", "kind": "digits", "value": "98765"});
+    let refused = c.call("zephyr.facts_put", short).await;
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    assert!(!refused.to_string().contains("98765"), "{refused}");
+    let odd = json!({"name": "x", "kind": PHONE, "value": PHONE});
+    let refused = c.call("zephyr.facts_put", odd).await;
+    assert!(!refused.to_string().contains("555"), "{refused}");
+    assert!(!std::fs::read_to_string(gw.home.join("log.jsonl"))
+        .unwrap()
+        .contains("555"));
+
+    let gone = c.call("zephyr.facts_rm", json!({"name": "phone"})).await;
+    assert_eq!(gone["result"]["facts"], json!([]), "{gone}");
+    let again = c.call("zephyr.facts_rm", json!({"name": "phone"})).await;
+    assert_eq!(again["error"]["code"], -32602, "{again}");
+    gw.shutdown().await;
+}
+
 /// The prompts the fake child got, in order.
 fn prompts(gw: &Gateway) -> Vec<String> {
     let log = gw.log("prompt");

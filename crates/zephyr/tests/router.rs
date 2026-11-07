@@ -1791,6 +1791,67 @@ async fn a_job_gets_no_gateway() {
     gw.shutdown().await;
 }
 
+#[tokio::test]
+async fn the_agent_adds_a_fact_at_once_but_only_a_strong_ok_removes_it() {
+    const PHONE: &str = "+1 555 010 2345";
+    let home = home("facts");
+    let gw = start(on_file_with_discord(&home, ""));
+    let saw = |what: &str| gw.replies_on("chat").iter().any(|r| r.contains(what));
+    gw.say(
+        "m1",
+        "owner",
+        &format!(r#"[call gateway {{"command": "/facts add phone digits {PHONE}"}}] note it"#),
+    )
+    .await;
+    wait(|| saw("gateway: saved the private fact phone")).await;
+    // The owner is told the name, and the value is in no notice.
+    let notice = (gw.replies_on("chat").into_iter())
+        .find(|r| r.starts_with("[zephyr] the agent saved a private fact named phone"))
+        .expect("the owner is told");
+    assert!(!notice.contains("555"), "{notice}");
+    assert!(std::fs::read_to_string(home.join("facts.toml"))
+        .unwrap()
+        .contains(PHONE));
+
+    gw.say("m2", "owner", "/facts").await;
+    wait(|| saw("phone (digits) allow: none")).await;
+    gw.say("m3", "owner", "/facts add pin text 1234 5678").await;
+    wait(|| saw("values never go through a chat")).await;
+    assert!(!std::fs::read_to_string(home.join("facts.toml"))
+        .unwrap()
+        .contains("pin"));
+    // The agent cannot replace a fact, and a removal is only proposed.
+    gw.say(
+        "m4",
+        "owner",
+        r#"[call gateway {"command": "/facts rm phone"}] drop it"#,
+    )
+    .await;
+    wait(|| saw("[zephyr] the agent asks to run /facts rm phone (#1)")).await;
+
+    // Discord is not a strong channel: the proposal stays waiting.
+    gw.say_on("discord", "d1", "downer", "/ok 1").await;
+    let weak = gw.wait_replies_on("discord", 1).await;
+    assert!(
+        weak[0].contains("loosens the check for a private fact"),
+        "{weak:?}"
+    );
+    assert!(std::fs::read_to_string(home.join("facts.toml"))
+        .unwrap()
+        .contains("phone"));
+    gw.say_on("discord", "d2", "downer", "/facts rm phone")
+        .await;
+    let weak = gw.wait_replies_on("discord", 2).await;
+    assert!(weak[1].contains("needs a strong channel"), "{weak:?}");
+
+    gw.say("m5", "owner", "/ok 1").await;
+    wait(|| saw("/ok 1 approved /facts rm phone")).await;
+    assert!(!std::fs::read_to_string(home.join("facts.toml"))
+        .unwrap()
+        .contains("phone"));
+    gw.shutdown().await;
+}
+
 const NO_PROPOSAL: &str = "[zephyr] no proposal #1 is waiting";
 
 #[tokio::test]

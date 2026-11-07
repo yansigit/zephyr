@@ -25,6 +25,7 @@ pub const USAGE: &str = "usage: zephyr <command>   (zephyr --version: this CLI's
   packages add NAME.. | rm NAME.. | list
   subagent list | add NAME [--model P/M] [--prompt TEXT] | edit NAME [--model P/M|default] [--prompt TEXT] | rm NAME
   vault list | add login NAME --site URL [--user U] [--totp] | add token NAME | edit NAME | rm NAME | revoke NAME [PROGRAM]
+  facts list | add NAME --kind text|digits|email | rm NAME | allow NAME TARGET | disallow NAME TARGET
   config get KEY | set KEY VALUE   (a known setting goes through the daemon while it runs)
   chat | attach [--stock] | shell [bash|zsh] | pause | resume | reload
   doctor [--fix]
@@ -45,7 +46,7 @@ const ME: &str = env!("CARGO_PKG_VERSION");
 /// does not know.
 const ROLLED_BACK: [&str; 3] = ["zephyr.toml", "vault.toml", "host.toml"];
 
-const COMMANDS: [&str; 26] = [
+const COMMANDS: [&str; 27] = [
     "init",
     "up",
     "down",
@@ -70,6 +71,7 @@ const COMMANDS: [&str; 26] = [
     "mcp",
     "packages",
     "vault",
+    "facts",
     "subagent",
     "alert",
 ];
@@ -1355,6 +1357,7 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
         "mcp" => setup::mcp(&h, a),
         "packages" => setup::packages(&h, a),
         "vault" => setup::vault(&h, a),
+        "facts" => setup::facts(&h, a),
         "subagent" => setup::subagent(&h, a),
         "alert" => alert::main(&h, a),
         _ => bail!("{USAGE}"),

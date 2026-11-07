@@ -97,9 +97,34 @@ fn subagent_shape(arg: &str) -> bool {
     }
 }
 
+/// A fact's name: `[a-z0-9][a-z0-9_-]{0,63}`.
+fn fact_name(n: &str) -> bool {
+    let b = n.as_bytes();
+    (1..=64).contains(&b.len())
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_' || *c == b'-')
+}
+
+/// `/facts add NAME text|digits|email VALUE`, `rm NAME` and `allow NAME TARGET`.
+fn facts_shape(arg: &str) -> bool {
+    let words: Vec<&str> = arg.splitn(4, ' ').collect();
+    match words[..] {
+        ["add", name, kind, value] => {
+            fact_name(name)
+                && matches!(kind, "text" | "digits" | "email")
+                && plain_text(value)
+                && value.chars().count() <= 500
+        }
+        ["rm", name] => fact_name(name),
+        ["allow", name, target] => fact_name(name) && ascii_word(target) && target.len() <= 200,
+        _ => false,
+    }
+}
+
 /// `Some` for a command the agent may send through `gateway`, in these exact shapes only:
 /// [`GATEWAY_COMMANDS`] and `/settings WORDS` are read; `/set KEY VALUE [for D]` is a [`Gateway::Set`];
-/// `/subagent add|prompt|model|rm …` and `/rule …` are proposed, like `/model PROVIDER/MODEL`, `/new`, `/switch ID`, `/pause` and
+/// `/subagent add|prompt|model|rm …` and `/rule …` are proposed, `/facts add|rm|allow …` too (`add` the daemon applies at once), like `/model PROVIDER/MODEL`, `/new`, `/switch ID`, `/pause` and
 /// `/reload` are proposed. Approvals, and `/stop`, are neither. The argument is one printable
 /// ASCII word, so the owner's approval notice shows exactly what would run.
 pub fn gateway_kind(command: &str) -> Option<Gateway> {
@@ -118,6 +143,9 @@ pub fn gateway_kind(command: &str) -> Option<Gateway> {
         "/subagent" | "/rule" if command.chars().count() > CARD_CHARS => return None,
         "/subagent" => return subagent_shape(arg).then_some(Gateway::Propose),
         "/rule" => return plain_text(arg).then_some(Gateway::Propose),
+        // `add` is carried out at once by the daemon (it only makes calls stricter); `rm` and
+        // `allow` are stored for the owner's `/ok`.
+        "/facts" => return facts_shape(arg).then_some(Gateway::Propose),
         _ => {}
     }
     let ok = match cmd {
@@ -1170,6 +1198,19 @@ mod tests {
             // The owner's subagents and task settings (DESIGN §4.12).
             "/task parallel 32",
             "/task model p/m",
+            // Facts: the owner's `/facts list`, `disallow` and the shapes below stay theirs.
+            "/facts",
+            "/facts list",
+            "/facts add",
+            "/facts add phone digits",
+            "/facts add Phone text some value",
+            "/facts add phone number some value",
+            "/facts add phone text some\nvalue",
+            "/facts rm",
+            "/facts rm Phone",
+            "/facts rm a b",
+            "/facts allow phone",
+            "/facts disallow phone x",
             "hello",
         ] {
             assert_eq!(gateway_kind(never), None, "{never}");
@@ -1178,6 +1219,19 @@ mod tests {
             gateway(&json!({ "command": "/model fake/m2" })).unwrap(),
             "/model fake/m2"
         );
+    }
+
+    #[test]
+    fn gateway_facts_forms_are_proposals_of_exact_shapes() {
+        for facts in [
+            "/facts add phone digits +1 555 010 2345",
+            "/facts add home-address text 12 Elm Street, Springfield",
+            "/facts add mail email owner@example.com",
+            "/facts rm phone",
+            "/facts allow mail mum@example.com",
+        ] {
+            assert_eq!(gateway_kind(facts), Some(Gateway::Propose), "{facts}");
+        }
     }
 
     #[test]

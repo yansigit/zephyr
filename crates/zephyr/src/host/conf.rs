@@ -22,12 +22,13 @@ const RETIRED_EXTENSIONS: [&str; 1] = ["/opt/zephyr/ext/rpi-cursor-lite/librpi_c
 
 /// The daemon's files, which `__file` may read and write. In the container they live in
 /// `/var/lib/zephyr` (on the host `~/.zephyr-daemon`), which only root can enter.
-pub const DAEMON_FILES: [&str; 5] = [
+pub const DAEMON_FILES: [&str; 6] = [
     "zephyr.toml",
     "secrets.env",
     "tui.token",
     "host.toml",
     "vault.toml",
+    "facts.toml",
 ];
 
 /// Replaces `path` whole with `text`, mode 0600: written beside it, then renamed over it, so a

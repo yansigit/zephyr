@@ -810,6 +810,75 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `zephyr facts list | add NAME --kind text|digits|email | rm NAME | allow NAME TARGET |
+/// disallow NAME TARGET`: `facts.toml`, the owner's private facts (approvals spec §4.5), one of
+/// the daemon's files, read on every use. The value is asked at a hidden prompt, or read from one
+/// stdin line when it is not a terminal; never taken as an argument. Adding over an existing name
+/// replaces its value and keeps its allowed targets.
+pub fn facts(h: &Host, mut a: Args) -> anyhow::Result<()> {
+    use crate::facts::{allow, parse, put, remove, render, Fact, FactKind};
+    let kind = a.value("--kind")?;
+    let rest = a.rest()?;
+    let usage = "usage: zephyr facts list | add NAME --kind text|digits|email | rm NAME | \
+                 allow NAME TARGET | disallow NAME TARGET";
+    let text = match h.data.read(crate::facts::FILE) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        r => r?,
+    };
+    let mut facts = parse(&text)?;
+    let args: Vec<&str> = rest.iter().map(String::as_str).collect();
+    let said = match args[..] {
+        [] | ["list"] => {
+            if facts.is_empty() {
+                println!("no private facts saved");
+            }
+            facts.iter().for_each(|f| println!("{}", f.line()));
+            return Ok(());
+        }
+        ["add", name] => {
+            let kind = kind.as_deref().unwrap_or("text");
+            let kind = FactKind::parse(kind)
+                .with_context(|| format!("--kind is text, digits or email\n{usage}"))?;
+            let value = match h.interactive {
+                true => Password::new()
+                    .with_prompt(format!("value of {name} (hidden)"))
+                    .allow_empty_password(true)
+                    .interact()?,
+                false => std::io::stdin()
+                    .lines()
+                    .next()
+                    .transpose()?
+                    .unwrap_or_default(),
+            };
+            let allowed = facts
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.allow.clone());
+            let fact = Fact {
+                name: name.into(),
+                kind,
+                value: value.trim().into(),
+                allow: allowed.unwrap_or_default(),
+            };
+            let new = put(&mut facts, fact, true)?;
+            match new {
+                true => format!("saved the fact {name}; calls holding it are held for your OK"),
+                false => format!("replaced the value of {name}"),
+            }
+        }
+        ["rm", name] => match remove(&mut facts, name) {
+            true => format!("removed {name}"),
+            false => bail!("no fact named {name}"),
+        },
+        ["allow", name, target] => allow(&mut facts, name, target, true)?,
+        ["disallow", name, target] => allow(&mut facts, name, target, false)?,
+        _ => bail!("{usage}"),
+    };
+    h.data.write(crate::facts::FILE, &render(&text, &facts)?)?;
+    println!("{said}");
+    Ok(())
+}
+
 /// `zephyr subagent list | add NAME [--model P/M] [--prompt TEXT] | edit NAME [--model
 /// P/M|default] [--prompt TEXT] | rm NAME`: the owner's `[[subagent]]`s in zephyr.toml (DESIGN
 /// §4.12). Without `--prompt`, `add` and `edit` read the prompt from stdin when it is not a

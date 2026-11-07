@@ -504,7 +504,7 @@ pub fn scrub(text: &str, secrets: &[(String, String)]) -> String {
 /// The base64 text `value` always turns into, standard and URL-safe, wherever it sits in the
 /// encoded bytes (`user:value` puts it at another offset): at each of the three byte alignments,
 /// the characters that depend on `value` alone. A form shorter than 8 characters could be anything.
-fn base64_forms(value: &str) -> Vec<String> {
+pub(crate) fn base64_forms(value: &str) -> Vec<String> {
     use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
     use base64::Engine;
     let mut out = Vec::new();

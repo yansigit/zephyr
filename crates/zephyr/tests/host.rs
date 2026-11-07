@@ -1997,6 +1997,65 @@ fn vault_add_list_and_rm_reach_roots_file_and_never_put_a_value_in_argv() {
 }
 
 #[test]
+fn facts_add_reads_the_value_hidden_and_lists_names_only() {
+    const PHONE: &str = "+1 555 010 2345";
+    let env = Env::new("facts");
+    env.init(&["--no-start"]);
+    // As after `zephyr up`: the daemon's files are root's, reached through `zephyr __file`.
+    let files = env.dir.join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    for name in ["zephyr.toml", "secrets.env", "tui.token", "host.toml"] {
+        std::fs::rename(env.daemon().join(name), files.join(name)).unwrap();
+    }
+    std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = env.zephyr_input(
+        &["facts", "add", "phone", "--kind", "digits"],
+        &format!("{PHONE}\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    env.ok(&["facts", "allow", "phone", "mum@example.com"]);
+    let list = env.ok(&["facts", "list"]);
+    assert!(
+        list.contains("phone (digits) allow: mum@example.com"),
+        "{list}"
+    );
+
+    let calls = env.calls();
+    let root = ["docker", "exec", "-i", "-u", "0", CONTAINER];
+    for op in ["get", "put"] {
+        find(
+            &calls,
+            &[&root[..], &["zephyr", "__file", op, "facts.toml"]].concat(),
+        );
+    }
+    let saved = std::fs::read_to_string(files.join("facts.toml")).unwrap();
+    assert!(saved.contains(PHONE), "{saved}");
+    let output = std::fs::read_to_string(env.dir.join("output.log")).unwrap();
+    assert!(!format!("{calls:?}").contains(PHONE), "value in argv");
+    assert!(!output.contains(PHONE), "value printed");
+
+    // A value never goes in an argument; too short a one is refused, naming no value.
+    assert!(!env
+        .zephyr(&["facts", "add", "phone", "--kind", "digits", PHONE])
+        .status
+        .success());
+    let out = env.zephyr_input(&["facts", "add", "pin", "--kind", "digits"], "12345\n");
+    assert!(!out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("12345"));
+
+    env.ok(&["facts", "rm", "phone"]);
+    let saved = std::fs::read_to_string(files.join("facts.toml")).unwrap();
+    assert!(!saved.contains("phone"), "{saved}");
+    assert!(!env.zephyr(&["facts", "rm", "phone"]).status.success());
+    std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
 fn upgrade_waits_only_for_work_in_flight() {
     let env = Env::new("upgrade-busy");
     env.init(&["--no-start"]);
