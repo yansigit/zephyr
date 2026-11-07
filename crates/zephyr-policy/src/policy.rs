@@ -334,8 +334,12 @@ pub fn gated(
         }
         "mcp_call" => {
             let server = args.get("server")?.as_str()?.to_lowercase();
-            let name = args.get("tool")?.as_str()?.to_lowercase();
-            let class = match classes(&server, &name) {
+            let raw = args.get("tool")?.as_str()?;
+            let name = normalize_tool(raw);
+            let class = match classes(&server, raw)
+                .or_else(|| classes(&server, &raw.to_lowercase()))
+                .or_else(|| classes(&server, &name))
+            {
                 Some(over) => over?,
                 None => verb_class(&name)?,
             };
@@ -368,8 +372,31 @@ pub fn gated(
     }
 }
 
-/// The class a connector tool's name implies; the strictest when several words match.
+/// `createIssue`, `create-issue` and `Create_Issue` all become `create_issue`.
+fn normalize_tool(name: &str) -> String {
+    let mut out = String::new();
+    let mut prev: Option<char> = None;
+    for c in name.trim().chars() {
+        if c.is_uppercase() && prev.is_some_and(|p| p.is_lowercase() || p.is_ascii_digit()) {
+            out.push('_');
+        }
+        if c.is_alphanumeric() {
+            out.extend(c.to_lowercase());
+        } else {
+            out.push('_');
+        }
+        prev = Some(c);
+    }
+    out
+}
+
+/// The class a connector tool's name implies, from its `_`-separated segments taken as whole
+/// words (`unsubscribe`, `payload` and `border` are not verbs); the strictest class when several
+/// match. A name that starts with a read verb (`get_order_status`) is not gated.
 fn verb_class(tool: &str) -> Option<Class> {
+    const READS: &[&str] = &[
+        "get", "list", "read", "search", "find", "fetch", "view", "show", "count", "describe",
+    ];
     const MONEY: &[&str] = &[
         "pay",
         "purchase",
@@ -386,21 +413,31 @@ fn verb_class(tool: &str) -> Option<Class> {
         "comment",
         "tweet",
         "share",
-        "create_issue",
-        "create_pull",
+        "create issue",
+        "create pull",
     ];
-    const MESSAGES: &[&str] = &["send", "reply", "message", "email"];
-    let has = |words: &[&str]| words.iter().any(|w| tool.contains(w));
+    const MESSAGES: &[&str] = &["send", "reply", "message", "email", "dm"];
+    let segs: Vec<&str> = tool.split('_').filter(|s| !s.is_empty()).collect();
+    if segs.first().is_some_and(|f| READS.contains(f)) {
+        return None;
+    }
+    let has = |words: &[&str]| {
+        words.iter().any(|w| {
+            let p: Vec<&str> = w.split(' ').collect();
+            segs.windows(p.len()).any(|win| {
+                let last = p.len() - 1;
+                win[..last] == p[..last]
+                    && (win[last] == p[last]
+                        || win[last].strip_suffix('s') == Some(p[last])
+                        || win[last].strip_suffix("es") == Some(p[last]))
+            })
+        })
+    };
     if has(MONEY) {
         Some(Class::Money)
     } else if has(POSTS) {
         Some(Class::Posts)
-    } else if has(MESSAGES)
-        || tool
-            .split(|c: char| !c.is_alphanumeric())
-            .any(|w| w == "dm" || w == "dms")
-    {
-        // shortcut: `dm` only as a whole word, so `admin_list` is not a message.
+    } else if has(MESSAGES) {
         Some(Class::Messages)
     } else {
         None
@@ -413,7 +450,16 @@ fn gated_command(command: &str, depth: usize) -> Vec<(Class, Vec<String>, String
     if depth > 4 {
         return found;
     }
-    for stage in stages(command) {
+    let (text, heredocs) = extract_heredocs(command);
+    let heredoc = |a: &String| -> Option<&String> {
+        let k = a
+            .strip_prefix("<<__HEREDOC_")?
+            .strip_suffix("__")?
+            .parse::<usize>()
+            .ok()?;
+        heredocs.get(k)
+    };
+    for stage in stages(&text) {
         let Some(words) = command_words(&stage.words) else {
             continue;
         };
@@ -423,8 +469,31 @@ fn gated_command(command: &str, depth: usize) -> Vec<(Class, Vec<String>, String
             found.extend(gated_command(&script, depth + 1));
             continue;
         }
+        if SHELLS.contains(&name) {
+            if let Some(body) = args.iter().find_map(heredoc) {
+                found.extend(gated_command(body, depth + 1));
+                continue;
+            }
+        }
         if name == "himalaya" && himalaya_send(args) {
-            let mut to = recipients(command);
+            // Recipients come only from this stage: its `-H "To: ..."` arguments and the header
+            // block of a heredoc attached to it. A `To:` elsewhere in the command is the agent's
+            // own text and proves nothing about who this send goes to.
+            let mut to = Vec::new();
+            for (i, a) in args.iter().enumerate() {
+                let header = match a.as_str() {
+                    "-H" | "--header" => args.get(i + 1).map(String::as_str),
+                    _ => a.strip_prefix("--header="),
+                };
+                if let Some(h) = header {
+                    header_emails(h, &mut to);
+                }
+                if let Some(body) = heredoc(a) {
+                    for line in body.lines().take_while(|l| !l.trim().is_empty()) {
+                        header_emails(line, &mut to);
+                    }
+                }
+            }
             if to.is_empty() {
                 to.push(UNKNOWN.to_string());
             }
@@ -449,42 +518,134 @@ fn gated_command(command: &str, depth: usize) -> Vec<(Class, Vec<String>, String
     found
 }
 
-/// Email addresses in the `To:`, `Cc:` and `Bcc:` headers of the command's own text (a heredoc,
-/// or `-H "To: ..."`), lowercased, in order, without repeats.
-fn recipients(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let lower = line.to_lowercase();
-        let chars: Vec<char> = lower.chars().collect();
-        for header in ["to:", "cc:", "bcc:"] {
-            let h: Vec<char> = header.chars().collect();
-            let mut i = 0;
-            while i + h.len() <= chars.len() {
-                let at_start =
-                    i == 0 || chars[i - 1].is_whitespace() || "\"'".contains(chars[i - 1]);
-                if at_start && chars[i..i + h.len()] == h[..] {
-                    let rest: String = chars[i + h.len()..]
-                        .iter()
-                        .take_while(|c| !"\"'".contains(**c))
-                        .collect();
-                    for tok in rest.split(|c: char| c.is_whitespace() || ",;<>()".contains(c)) {
-                        let tok = tok.trim_matches(|c: char| "\\".contains(c));
-                        if tok.contains('@') && !tok.starts_with('@') && !tok.ends_with('@') {
-                            let t = tok.to_string();
-                            if !out.contains(&t) {
-                                out.push(t);
-                            }
-                        }
-                    }
+/// Replaces each heredoc operator with `<<__HEREDOC_k__` and returns the bodies, so a body is
+/// data attached to its own stage, not commands of the script.
+fn extract_heredocs(command: &str) -> (String, Vec<String>) {
+    let mut out = String::new();
+    let mut bodies: Vec<String> = Vec::new();
+    let mut lines = command.split('\n');
+    while let Some(line) = lines.next() {
+        let mut rest = line;
+        let mut pending: Vec<(String, bool)> = Vec::new();
+        while let Some(p) = rest.find("<<") {
+            let after = &rest[p + 2..];
+            if after.starts_with('<') {
+                out.push_str(&rest[..p + 3]);
+                rest = &rest[p + 3..];
+                continue;
+            }
+            let strip_tabs = after.starts_with('-');
+            let after = after.strip_prefix('-').unwrap_or(after).trim_start();
+            let quote = after.chars().next().filter(|c| *c == '\'' || *c == '"');
+            let (delim, remaining) = match quote {
+                Some(q) => match after[1..].find(q) {
+                    Some(e) => (&after[1..1 + e], &after[e + 2..]),
+                    None => ("", after),
+                },
+                None => {
+                    let e = after
+                        .find(|c: char| c.is_whitespace() || ";|&<>()".contains(c))
+                        .unwrap_or(after.len());
+                    (&after[..e], &after[e..])
                 }
-                i += 1;
+            };
+            let delim = delim.trim_start_matches('\\');
+            if delim.is_empty() {
+                out.push_str(&rest[..p + 2]);
+                rest = &rest[p + 2..];
+                continue;
+            }
+            out.push_str(&rest[..p]);
+            out.push_str(&format!("<<__HEREDOC_{}__", bodies.len() + pending.len()));
+            pending.push((delim.to_string(), strip_tabs));
+            rest = remaining;
+        }
+        out.push_str(rest);
+        out.push('\n');
+        for (delim, strip_tabs) in pending {
+            let mut body = String::new();
+            for l in lines.by_ref() {
+                let t = if strip_tabs {
+                    l.trim_start_matches('\t')
+                } else {
+                    l
+                };
+                if t.trim_end() == delim {
+                    break;
+                }
+                body.push_str(l);
+                body.push('\n');
+            }
+            bodies.push(body);
+        }
+    }
+    (out, bodies)
+}
+
+/// Adds the addresses of a `To:`, `Cc:` or `Bcc:` header line (lowercased, no repeats).
+fn header_emails(line: &str, out: &mut Vec<String>) {
+    let line = line.trim();
+    let lower = line.to_lowercase();
+    let Some(value) = ["to:", "cc:", "bcc:"]
+        .iter()
+        .find_map(|h| lower.strip_prefix(h))
+    else {
+        return;
+    };
+    for tok in value.split(|c: char| c.is_whitespace() || ",;<>()\"'".contains(c)) {
+        if tok.contains('@') && !tok.starts_with('@') && !tok.ends_with('@') {
+            let t = tok.to_string();
+            if !out.contains(&t) {
+                out.push(t);
             }
         }
     }
-    out
 }
 
-/// `owner/repo` of a gh command: `-R`/`--repo`, a github.com URL, or a `repos/owner/repo/...` path.
+/// gh flags that take a value, so the value is never read as a subcommand, a repo or an endpoint.
+const GH_VALUE_FLAGS: &[&str] = &[
+    "-R",
+    "--repo",
+    "-t",
+    "--title",
+    "-b",
+    "--body",
+    "-B",
+    "--base",
+    "-H",
+    "--head",
+    "--header",
+    "-a",
+    "--assignee",
+    "-l",
+    "--label",
+    "-m",
+    "--milestone",
+    "-F",
+    "--body-file",
+    "--field",
+    "-f",
+    "--raw-field",
+    "--input",
+    "-X",
+    "--method",
+    "-q",
+    "--jq",
+    "--template",
+    "--hostname",
+    "--cache",
+    "-p",
+    "--preview",
+    "--project",
+    "-r",
+    "--reviewer",
+    "--notes",
+    "-n",
+    "--notes-file",
+];
+
+/// `owner/repo` of a gh command: `-R`/`--repo`, a github.com URL given as an argument, or the
+/// `repos/owner/repo/...` endpoint of `gh api`. Free text (`-b`, `--title`, `-f`) is never read.
 fn gh_repo(args: &[String]) -> Option<String> {
     fn clean(s: &str) -> Option<String> {
         let mut it = s.split('/').filter(|p| !p.is_empty());
@@ -497,7 +658,12 @@ fn gh_repo(args: &[String]) -> Option<String> {
         };
         (ok(o) && ok(r)).then(|| format!("{o}/{r}").to_lowercase())
     }
+    let mut positional: Vec<&str> = Vec::new();
+    let mut skip = false;
     for (i, a) in args.iter().enumerate() {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
         let value = match a.as_str() {
             "-R" | "--repo" => args.get(i + 1).map(String::as_str),
             _ => a.strip_prefix("--repo="),
@@ -505,16 +671,25 @@ fn gh_repo(args: &[String]) -> Option<String> {
         if let Some(repo) = value.and_then(clean) {
             return Some(repo);
         }
+        if GH_VALUE_FLAGS.contains(&a.as_str()) {
+            skip = true;
+        } else if !a.starts_with('-') {
+            positional.push(a);
+        }
     }
-    for a in args {
+    let is_api = positional.first() == Some(&"api");
+    for (i, a) in positional.iter().enumerate() {
         if let Some(rest) = a.split_once("github.com/").map(|p| p.1) {
             if let Some(repo) = clean(rest) {
                 return Some(repo);
             }
         }
-        let path = a.trim_start_matches('/');
-        if let Some(rest) = path.strip_prefix("repos/") {
-            if let Some(repo) = clean(rest) {
+        if is_api && i == 1 {
+            if let Some(repo) = a
+                .trim_start_matches('/')
+                .strip_prefix("repos/")
+                .and_then(clean)
+            {
                 return Some(repo);
             }
         }
@@ -522,23 +697,36 @@ fn gh_repo(args: &[String]) -> Option<String> {
     None
 }
 
-// The button lexicon: whole words, case-insensitive, English and Korean. More languages are data.
+// The button lexicon: case-insensitive, English and Korean. Latin entries match whole words;
+// Hangul entries match by prefix within a word (`구매하기` for `구매`). More languages are data.
 const BROWSER_MONEY: &[&str] = &[
     "buy",
+    "buy now",
     "pay",
+    "pay now",
     "place order",
-    "checkout",
-    "complete purchase",
+    "place your order",
+    "order now",
+    "complete order",
+    "submit order",
     "confirm order",
+    "confirm and pay",
+    "checkout",
+    "purchase",
+    "complete purchase",
     "subscribe",
     "donate",
     "transfer",
     "결제",
+    "결제 완료",
     "구매",
+    "바로구매",
     "주문",
     "주문하기",
     "결제하기",
     "송금",
+    "구독",
+    "후원",
 ];
 const BROWSER_POSTS: &[&str] = &[
     "post",
@@ -552,6 +740,8 @@ const BROWSER_POSTS: &[&str] = &[
     "댓글",
 ];
 const BROWSER_MESSAGES: &[&str] = &["send", "reply", "보내기", "전송", "답장"];
+/// A Korean label with one of these is a history, lookup or list button, never an action.
+const BROWSER_HISTORY: &[&str] = &["내역", "조회", "목록"];
 
 /// What clicking a control (or pressing Enter in a composer) does, from its role and accessible
 /// name and what its form holds. Pure; the browser wrapper gathers the inputs. Search boxes,
@@ -574,10 +764,21 @@ pub fn browser_class(
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
         .collect();
+    if words
+        .iter()
+        .any(|w| BROWSER_HISTORY.iter().any(|h| w.contains(h)))
+    {
+        return None;
+    }
+    let hangul = |w: &str| w.chars().any(|c| ('\u{AC00}'..='\u{D7A3}').contains(&c));
     let matches = |list: &[&str]| {
         list.iter().any(|phrase| {
             let p: Vec<&str> = phrase.split(' ').collect();
-            words.windows(p.len()).any(|w| w == p.as_slice())
+            words.windows(p.len()).any(|win| {
+                win.iter()
+                    .zip(&p)
+                    .all(|(w, e)| if hangul(e) { w.starts_with(e) } else { w == e })
+            })
         })
     };
     if matches!(role.as_str(), "button" | "menuitem" | "") || key_enter_in_composer {
@@ -603,11 +804,18 @@ fn gh_write(args: &[String]) -> Option<String> {
         ("repo", &["create", "delete", "fork"]),
         ("gist", &["create"]),
     ];
-    let words: Vec<&str> = args
-        .iter()
-        .map(String::as_str)
-        .filter(|a| !a.starts_with('-'))
-        .collect();
+    let mut words: Vec<&str> = Vec::new();
+    let mut skip = false;
+    for a in args {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        if GH_VALUE_FLAGS.contains(&a.as_str()) {
+            skip = true;
+        } else if !a.starts_with('-') {
+            words.push(a);
+        }
+    }
     let (group, sub) = (*words.first()?, words.get(1).copied().unwrap_or_default());
     if group != "api" {
         return WRITES
@@ -776,17 +984,87 @@ fn is_fork_bomb(command: &str) -> bool {
     !name.is_empty() && s[i + 3..].starts_with(&format!("{name}|{name}&}};{name}"))
 }
 
-/// The first word that is the command, after prefixes, flags and assignments.
+/// Flags that take a separate value, for the runners `PREFIXES` skips.
+fn runner_value_flags(runner: &str) -> &'static [&'static str] {
+    match runner {
+        "timeout" => &["-s", "--signal", "-k", "--kill-after"],
+        "env" => &["-u", "--unset", "-C", "--chdir", "-S", "--split-string"],
+        "nice" => &["-n", "--adjustment"],
+        "stdbuf" => &["-o", "-e", "-i", "--output", "--error", "--input"],
+        "xargs" => &[
+            "-I",
+            "-d",
+            "-E",
+            "-L",
+            "-n",
+            "-P",
+            "-s",
+            "-a",
+            "--max-args",
+            "--max-procs",
+            "--max-lines",
+            "--delimiter",
+            "--arg-file",
+            "--max-chars",
+        ],
+        "sudo" => &[
+            "-u",
+            "-g",
+            "-h",
+            "-p",
+            "-C",
+            "-D",
+            "-R",
+            "-T",
+            "-U",
+            "--user",
+            "--group",
+            "--host",
+            "--prompt",
+            "--close-from",
+            "--chdir",
+            "--chroot",
+        ],
+        "doas" => &["-u", "-C"],
+        "time" => &["-f", "-o", "--format", "--output"],
+        _ => &[],
+    }
+}
+
+/// `5`, `1.5m`, `2h`: the duration `timeout` takes before the command.
+fn is_duration(w: &str) -> bool {
+    let n = w.trim_end_matches(['s', 'm', 'h', 'd']);
+    !n.is_empty()
+        && n.starts_with(|c: char| c.is_ascii_digit())
+        && n.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// The first word that is the command, after prefixes (and the flags, values and durations of
+/// the runners among them), flags and assignments.
 fn command_words(words: &[String]) -> Option<&[String]> {
-    let skip = |w: &str| {
-        PREFIXES.contains(&w)
-            || w.starts_with('-')
-            || w.bytes().all(|b| b.is_ascii_digit())
-            || matches!(w.split_once('='), Some((k, _)) if !k.is_empty()
-                && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+    let assignment = |w: &str| {
+        matches!(w.split_once('='), Some((k, _)) if !k.is_empty()
+            && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
     };
-    let start = words.iter().position(|w| !skip(w))?;
-    Some(&words[start..])
+    let mut runner = "";
+    let mut duration = false;
+    let mut i = 0;
+    while let Some(w) = words.get(i).map(String::as_str) {
+        if PREFIXES.contains(&w) {
+            runner = w;
+            duration = w == "timeout";
+        } else if w.starts_with('-') {
+            if runner_value_flags(runner).contains(&w) {
+                i += 1;
+            }
+        } else if duration && is_duration(w) {
+            duration = false;
+        } else if !(assignment(w) || w.bytes().all(|b| b.is_ascii_digit())) {
+            return Some(&words[i..]);
+        }
+        i += 1;
+    }
+    None
 }
 
 fn basename(word: &str) -> &str {
@@ -1465,7 +1743,7 @@ mod tests {
             &mcp("s", "list_messages_x", json!({})),
             &no_classes
         )
-        .is_some());
+        .is_none());
         assert!(gated("mcp_call", &mcp("s", "get_file", json!({})), &no_classes).is_none());
         assert!(gated("read", &json!({"path": "/x"}), &no_classes).is_none());
     }
@@ -1579,5 +1857,171 @@ mod tests {
             browser_class("textbox", "Password", false, true, true),
             None
         );
+    }
+
+    #[test]
+    fn recipients_come_only_from_the_send_itself() {
+        let unknown = vec![UNKNOWN.to_string()];
+        for cmd in [
+            "echo 'To: known@x.org' >/dev/null; cat evil.eml | himalaya message send",
+            "# To: known@x.org\ncat evil.eml | himalaya message send",
+            "himalaya message send <<'EOF'\nSubject: hi\n\nplease reply to: a@b.org\nTo: c@d.org\nEOF",
+            "cat <<EOF >/dev/null\nTo: known@x.org\n\nEOF\ncat evil | himalaya message send",
+        ] {
+            assert_eq!(gbash(cmd).unwrap().targets, unknown, "{cmd}");
+        }
+        let g = gbash("himalaya message send <<'EOF'\nFrom: me@x.org\nTo: A@x.org, B <b@x.org>\nBcc: c@x.org\n\nTo: no@x.org\nEOF").unwrap();
+        assert_eq!(g.targets, vec!["a@x.org", "b@x.org", "c@x.org"]);
+        let g = gbash("himalaya message send --header 'Cc: q@x.org' -H 'To: r@x.org' x").unwrap();
+        assert_eq!(g.targets, vec!["q@x.org", "r@x.org"]);
+    }
+
+    #[test]
+    fn gh_targets_ignore_free_text() {
+        let table = [
+            ("gh pr comment 3 -b 'github.com/known/repo'", vec![UNKNOWN]),
+            (
+                "gh issue create --title 'see github.com/k/r' --body repos/k/r",
+                vec![UNKNOWN],
+            ),
+            ("gh api repos/a/b/issues -f title=repos/k/r/x", vec!["a/b"]),
+            (
+                "gh api -X POST /repos/a/b/issues -F body=github.com/k/r",
+                vec!["a/b"],
+            ),
+            (
+                "gh pr comment https://github.com/Own/Rep/pull/3 -b hi",
+                vec!["own/rep"],
+            ),
+            ("gh pr -R o/r create", vec!["o/r"]),
+            (
+                "gh api --method post repos/o/r/issues -f title=x",
+                vec!["o/r"],
+            ),
+        ];
+        for (cmd, want) in table {
+            let g = gbash(cmd).unwrap_or_else(|| panic!("{cmd}"));
+            assert_eq!(g.class, Class::Posts, "{cmd}");
+            assert_eq!(g.targets, want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn runners_do_not_hide_the_command() {
+        let table = [
+            "/usr/bin/himalaya message send -H 'To: a@x.org'",
+            "env X=1 himalaya message send -H 'To: a@x.org'",
+            "env -u X -C /tmp himalaya message send -H 'To: a@x.org'",
+            "timeout 5s himalaya message send -H 'To: a@x.org'",
+            "timeout -s KILL 5 himalaya message send -H 'To: a@x.org'",
+            "timeout --kill-after 2 1.5m himalaya message send -H 'To: a@x.org'",
+            "nice -n 5 himalaya message send -H 'To: a@x.org'",
+            "stdbuf -o L himalaya message send -H 'To: a@x.org'",
+            "sudo -u bob env A=b himalaya message send -H 'To: a@x.org'",
+        ];
+        for cmd in table {
+            let g = gbash(cmd).unwrap_or_else(|| panic!("{cmd}"));
+            assert_eq!(
+                (g.class, g.targets),
+                (Class::Messages, vec!["a@x.org".to_string()]),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn hardline_sees_through_runner_flags() {
+        for cmd in [
+            "timeout 5s rm -rf /",
+            "timeout -s KILL 5 rm -rf /",
+            "env -u X rm -rf /",
+            "nice -n 5 rm -rf /",
+            "env FOO=1 rm -rf /",
+        ] {
+            assert!(
+                matches!(check_bash(cmd), Decision::Deny(_)),
+                "expected deny: {cmd}"
+            );
+        }
+        assert!(matches!(check_bash("timeout 5s ls /"), Decision::Allow));
+    }
+
+    #[test]
+    fn mcp_verbs_match_whole_segments_and_read_verbs_are_not_gated() {
+        let table = [
+            ("get_message", None),
+            ("search_messages", None),
+            ("list_comments", None),
+            ("get_order_status", None),
+            ("list_posts", None),
+            ("unsubscribe", None),
+            ("get_payload", None),
+            ("border_style", None),
+            ("send_message", Some(Class::Messages)),
+            ("post_message", Some(Class::Posts)),
+            ("create_issue", Some(Class::Posts)),
+            ("create_pull_request", Some(Class::Posts)),
+            ("place_order", Some(Class::Money)),
+            ("createIssue", Some(Class::Posts)),
+            ("create-issue", Some(Class::Posts)),
+            ("createPullRequest", Some(Class::Posts)),
+            ("sendEmail", Some(Class::Messages)),
+            ("Send-DM", Some(Class::Messages)),
+            ("refundCharge", Some(Class::Money)),
+        ];
+        for (tool, want) in table {
+            let got = gated("mcp_call", &mcp("s", tool, json!({})), &no_classes);
+            assert_eq!(got.map(|g| g.class), want, "{tool}");
+        }
+        for (raw, want) in [
+            ("createIssue", "s/create_issue"),
+            ("create-issue", "s/create_issue"),
+            ("createPullRequest", "s/create_pull_request"),
+            ("sendEmail", "s/send_email"),
+        ] {
+            let g = gated("mcp_call", &mcp("s", raw, json!({})), &no_classes).unwrap();
+            assert_eq!(g.targets, vec![want], "{raw}");
+        }
+        // an owner override still beats the read-verb rule
+        let g = gated(
+            "mcp_call",
+            &mcp("s", "get_order_status", json!({})),
+            &|_: &str, _: &str| Some(Some(Class::Money)),
+        );
+        assert_eq!(g.unwrap().class, Class::Money);
+    }
+
+    #[test]
+    fn korean_and_english_labels_match_stems_and_phrases() {
+        let table = [
+            ("구매하기", Some(Class::Money)),
+            ("바로구매", Some(Class::Money)),
+            ("구독하기", Some(Class::Money)),
+            ("후원하기", Some(Class::Money)),
+            ("송금하기", Some(Class::Money)),
+            ("결제 완료", Some(Class::Money)),
+            ("전송하기", Some(Class::Messages)),
+            ("공유하기", Some(Class::Posts)),
+            ("주문내역", None),
+            ("결제 내역 조회", None),
+            ("주문 목록", None),
+            ("Place your order", Some(Class::Money)),
+            ("Buy now", Some(Class::Money)),
+            ("Purchase", Some(Class::Money)),
+            ("Order now", Some(Class::Money)),
+            ("Pay now", Some(Class::Money)),
+            ("Complete order", Some(Class::Money)),
+            ("Submit order", Some(Class::Money)),
+            ("Confirm and pay", Some(Class::Money)),
+            ("Order history", None),
+            ("Repay", None),
+        ];
+        for (name, want) in table {
+            assert_eq!(
+                browser_class("button", name, false, false, false),
+                want,
+                "{name}"
+            );
+        }
     }
 }
