@@ -4,7 +4,7 @@ use crate::channel::Inbound;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// Queued and running tasks allowed at once (DESIGN §4.12); a start past this is refused.
 pub const MAX_OPEN_TASKS: i64 = 64;
@@ -206,6 +206,25 @@ fn proc_report(p: &Proc, outcome: &str, output: &str) -> String {
     report(&header, "the command's output", output)
 }
 
+/// A proposal still waiting for `/ok` or `/no`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingProposal {
+    pub id: i64,
+    pub command: String,
+    pub created_at: i64,
+    pub key: Option<String>,
+    pub seen: Option<String>,
+    pub strong: bool,
+}
+
+/// The latest change recorded for a setting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingChange {
+    pub actor: String,
+    pub proposal: Option<i64>,
+    pub at: i64,
+}
+
 pub struct Store {
     db: Connection,
 }
@@ -402,6 +421,30 @@ impl Store {
                     outcome TEXT NOT NULL); -- started|error|refused
                  CREATE INDEX audit_ts ON audit(ts);
                  PRAGMA user_version = 14;",
+            )?;
+        }
+        if version < 15 {
+            // The settings registry: a log of changes, one timed revert per key, and what a
+            // proposal needs to be shown and confirmed on its own (the key, the value the owner
+            // saw, whether it came through a strong channel).
+            db.execute_batch(
+                "CREATE TABLE settings_log(
+                    id INTEGER PRIMARY KEY,
+                    key TEXT NOT NULL,
+                    old TEXT,
+                    new TEXT,
+                    actor TEXT NOT NULL,
+                    channel TEXT,
+                    proposal INTEGER,
+                    at INTEGER NOT NULL DEFAULT (unixepoch()));
+                 CREATE TABLE setting_reverts(
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    at INTEGER NOT NULL);
+                 ALTER TABLE proposals ADD COLUMN key TEXT;
+                 ALTER TABLE proposals ADD COLUMN seen TEXT;
+                 ALTER TABLE proposals ADD COLUMN strong INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 15;",
             )?;
         }
         db.commit()?;
@@ -809,6 +852,105 @@ impl Store {
         Ok(self.db.last_insert_rowid())
     }
 
+    /// As `propose_command`, for a change to setting `key`: `seen` is the value the owner was
+    /// shown, and `strong` whether the proposal arrived on a strong channel.
+    pub fn propose_setting(
+        &self,
+        command: &str,
+        key: &str,
+        seen: Option<&str>,
+        strong: bool,
+    ) -> rusqlite::Result<i64> {
+        self.db.execute(
+            "INSERT INTO proposals(command, key, seen, strong) VALUES (?1, ?2, ?3, ?4)",
+            params![command, key, seen, strong],
+        )?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    /// The proposals still waiting (pending and inside the 24 h window), newest first.
+    pub fn pending_proposals(&self) -> rusqlite::Result<Vec<PendingProposal>> {
+        let mut stmt = self.db.prepare(
+            "SELECT id, command, created_at, key, seen, strong FROM proposals
+             WHERE status = 'pending' AND created_at > unixepoch() - 86400
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PendingProposal {
+                id: r.get(0)?,
+                command: r.get(1)?,
+                created_at: r.get(2)?,
+                key: r.get(3)?,
+                seen: r.get(4)?,
+                strong: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Records a change to setting `key` (values as text; `None` is unset).
+    pub fn log_setting(
+        &self,
+        key: &str,
+        old: Option<&str>,
+        new: Option<&str>,
+        actor: &str,
+        channel: Option<&str>,
+        proposal: Option<i64>,
+    ) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO settings_log(key, old, new, actor, channel, proposal)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![key, old, new, actor, channel, proposal],
+        )?;
+        Ok(())
+    }
+
+    /// The latest recorded change to `key`.
+    pub fn last_setting_change(&self, key: &str) -> rusqlite::Result<Option<SettingChange>> {
+        self.db
+            .query_row(
+                "SELECT actor, proposal, at FROM settings_log WHERE key = ?1
+                 ORDER BY id DESC LIMIT 1",
+                params![key],
+                |r| {
+                    Ok(SettingChange {
+                        actor: r.get(0)?,
+                        proposal: r.get(1)?,
+                        at: r.get(2)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Schedules `key` to go back to `value` (`None`: unset) at `at`, replacing any earlier
+    /// revert for the key.
+    pub fn set_revert(&self, key: &str, value: Option<&str>, at: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO setting_reverts(key, value, at) VALUES (?1, ?2, ?3)",
+            params![key, value, at],
+        )?;
+        Ok(())
+    }
+
+    /// Cancels the revert for `key`, if any.
+    pub fn drop_revert(&self, key: &str) -> rusqlite::Result<()> {
+        self.db
+            .execute("DELETE FROM setting_reverts WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// The reverts at or before `now`, as `(key, value)`, oldest first. They stay until
+    /// `drop_revert`.
+    pub fn due_reverts(&self, now: i64) -> rusqlite::Result<Vec<(String, Option<String>)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT key, value FROM setting_reverts WHERE at <= ?1 ORDER BY at, key")?;
+        let rows = stmt.query_map(params![now], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
     /// Settles proposal `id` as `status` (`done` or `dropped`), once, within 24 h of it being
     /// made. Returns its command, or `None` when there is no such proposal waiting.
     pub fn settle_proposal(&self, id: i64, status: &str) -> rusqlite::Result<Option<String>> {
@@ -858,8 +1000,8 @@ impl Store {
         rows.collect()
     }
 
-    /// Drops what is older than `before` (unix secs) and settled: sent or failed replies, and
-    /// audit lines. An inbox row is never deleted, only emptied of its text: its platform id
+    /// Drops what is older than `before` (unix secs) and settled: sent or failed replies,
+    /// audit lines and setting changes. An inbox row is never deleted, only emptied of its text: its platform id
     /// keeps dedupe working against any replay (an iMessage backfill reaches back as far as the
     /// owner sets), and its id keeps reply ids (`client_id`) from ever being reused. Returns
     /// how many rows went or were emptied.
@@ -876,7 +1018,10 @@ impl Store {
         let audit = self
             .db
             .execute("DELETE FROM audit WHERE ts < ?1", params![before])?;
-        Ok(emptied + sent + audit)
+        let changes = self
+            .db
+            .execute("DELETE FROM settings_log WHERE at < ?1", params![before])?;
+        Ok(emptied + sent + audit + changes)
     }
 
     pub fn jobs(&self) -> rusqlite::Result<Vec<Job>> {
@@ -1761,6 +1906,7 @@ mod tests {
     fn older_databases_migrate_in_order_and_keep_their_rows() {
         // Each case undoes the steps after `version`, as a db made by that build would look:
         // v14's first, while the tables its indexes are on still exist.
+        const V15: &str = "DROP TABLE settings_log; DROP TABLE setting_reverts; ALTER TABLE proposals DROP COLUMN key; ALTER TABLE proposals DROP COLUMN seen; ALTER TABLE proposals DROP COLUMN strong;";
         const V14: &str = "DROP TABLE audit; DROP INDEX inbox_status; DROP INDEX outbox_status; DROP INDEX tasks_status; DROP INDEX procs_status; DROP INDEX runs_job_due;";
         for (version, undo) in [
             (
@@ -1779,12 +1925,14 @@ mod tests {
             (11, "ALTER TABLE tasks DROP COLUMN model; ALTER TABLE tasks DROP COLUMN subagent; ALTER TABLE tasks DROP COLUMN preamble;"),
             (12, "ALTER TABLE tasks DROP COLUMN subagent; ALTER TABLE tasks DROP COLUMN preamble;"),
             (13, ""),
+            (14, ""),
         ] {
             let dir = crate::test_dir(&format!("store-v{version}"));
             let path = dir.join("state.db");
             Store::open(&path).unwrap().insert_inbox(&msg("a")).unwrap();
             let db = Connection::open(&path).unwrap();
-            db.execute_batch(&format!("{V14} {undo} PRAGMA user_version = {version};"))
+            let v14 = if version < 14 { V14 } else { "" };
+            db.execute_batch(&format!("{V15} {v14} {undo} PRAGMA user_version = {version};"))
                 .unwrap();
             drop(db);
             let store = Store::open(&path).unwrap();
@@ -1829,6 +1977,16 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(indexes, 5);
+            // v15: the settings log, the timed reverts and the proposal columns.
+            store
+                .log_setting("k", None, Some("v"), "owner", Some("chat"), None)
+                .unwrap();
+            assert_eq!(store.last_setting_change("k").unwrap().unwrap().actor, "owner");
+            store.set_revert("k", None, 5).unwrap();
+            assert_eq!(store.due_reverts(5).unwrap(), [("k".to_string(), None)]);
+            let id = store.propose_setting("/set k v", "k", Some("old"), true).unwrap();
+            let p = store.pending_proposals().unwrap();
+            assert_eq!(p.iter().filter(|p| p.id == id).count(), 1);
             let now: i64 = store
                 .db
                 .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -1843,6 +2001,89 @@ mod tests {
             .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .unwrap();
         assert!(Store::open(&path).is_err(), "a newer schema is refused");
+    }
+
+    #[test]
+    fn a_revert_replaces_the_last_for_its_key_and_comes_due_once() {
+        let store = Store::open(&crate::test_dir("store-revert").join("state.db")).unwrap();
+        store.set_revert("a", Some("1"), 100).unwrap();
+        store.set_revert("a", Some("2"), 200).unwrap();
+        store.set_revert("b", None, 150).unwrap();
+        assert!(store.due_reverts(99).unwrap().is_empty());
+        assert_eq!(store.due_reverts(150).unwrap(), [("b".to_string(), None)]);
+        store.drop_revert("b").unwrap();
+        assert!(store.due_reverts(150).unwrap().is_empty(), "dropped");
+        assert_eq!(
+            store.due_reverts(200).unwrap(),
+            [("a".to_string(), Some("2".to_string()))]
+        );
+        store.drop_revert("a").unwrap();
+        assert!(store.due_reverts(1000).unwrap().is_empty());
+        store.drop_revert("a").unwrap();
+    }
+
+    #[test]
+    fn pending_proposals_lists_only_waiting_ones_newest_first() {
+        let store = Store::open(&crate::test_dir("store-pending").join("state.db")).unwrap();
+        let a = store.propose_command("/new").unwrap();
+        let b = store
+            .propose_setting("/set k v", "k", Some("old"), true)
+            .unwrap();
+        let c = store.propose_command("/pause").unwrap();
+        let d = store.propose_command("/old").unwrap();
+        store.settle_proposal(c, "done").unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE proposals SET created_at = unixepoch() - 90000 WHERE id = ?1",
+                params![d],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE proposals SET created_at = created_at - 10 WHERE id = ?1",
+                params![a],
+            )
+            .unwrap();
+        let got = store.pending_proposals().unwrap();
+        let ids: Vec<_> = got.iter().map(|p| p.id).collect();
+        assert_eq!(ids, [b, a], "settled and expired ones are not listed");
+        assert_eq!(got[0].command, "/set k v");
+        assert_eq!(got[0].key.as_deref(), Some("k"));
+        assert_eq!(got[0].seen.as_deref(), Some("old"));
+        assert!(got[0].strong);
+        assert!(got[0].created_at > 0);
+        assert_eq!(
+            (got[1].key.clone(), got[1].seen.clone(), got[1].strong),
+            (None, None, false)
+        );
+    }
+
+    #[test]
+    fn prune_drops_old_setting_changes() {
+        let store = Store::open(&crate::test_dir("store-prune-log").join("state.db")).unwrap();
+        store
+            .log_setting("old", None, Some("1"), "owner", None, None)
+            .unwrap();
+        store
+            .log_setting("new", Some("1"), None, "owner", Some("chat"), Some(7))
+            .unwrap();
+        store
+            .db
+            .execute("UPDATE settings_log SET at = 10 WHERE key = 'old'", [])
+            .unwrap();
+        assert_eq!(store.prune(100).unwrap(), 1);
+        assert!(store.last_setting_change("old").unwrap().is_none());
+        let c = store.last_setting_change("new").unwrap().unwrap();
+        assert_eq!((c.actor.as_str(), c.proposal), ("owner", Some(7)));
+        store
+            .log_setting("new", None, None, "agent", None, None)
+            .unwrap();
+        assert_eq!(
+            store.last_setting_change("new").unwrap().unwrap().actor,
+            "agent"
+        );
     }
 
     #[test]
