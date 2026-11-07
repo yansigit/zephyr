@@ -318,6 +318,13 @@ pub const UNKNOWN: &str = "unknown";
 /// run later, interpreters other than the shells) is not looked into.
 /// `classes(server, tool)` is the owner's per-connector table: `Some(Some(c))` puts the tool in a
 /// class, `Some(None)` takes it out of all, `None` leaves the verb rule.
+///
+/// R28: a command is also classified as a de-quoted copy (every `'`, `"`, `` ` `` and `\` a
+/// space), so a quote the tokenizer misreads (`$'\''`) cannot swallow a send. No target is read
+/// from that copy: a send it finds that the plain scan did not (by the send's own text) counts
+/// with target `unknown`. A send whose quoted text holds `;`, `&` or `|` (or, single-quoted,
+/// `(`, `)` or a backtick) on its own line splits differently in the copy, so it also gains
+/// `unknown`: over-gating, the safe direction.
 pub fn gated(
     tool: &str,
     args: &Value,
@@ -325,15 +332,27 @@ pub fn gated(
 ) -> Option<Gated> {
     match tool {
         "bash" | "exec" => {
-            let found = gated_command(args.get("command")?.as_str()?, 0);
-            let class = found.iter().map(|f| f.0).max()?;
-            let mut targets: Vec<String> = Vec::new();
-            for t in found.iter().flat_map(|f| f.1.iter()) {
-                if !targets.contains(t) {
-                    targets.push(t.clone());
+            let command = args.get("command")?.as_str()?;
+            let mut found = gated_command(command, 0, true);
+            let plain = command.replace(['\'', '"', '`', '\\'], " ");
+            for item in gated_command(&plain, 0, false) {
+                if !found.iter().any(|f| f.stage == item.stage) {
+                    found.push(item);
                 }
             }
-            let summary: Vec<&str> = found.iter().map(|f| f.2.as_str()).collect();
+            let class = found.iter().map(|f| f.class).max()?;
+            let mut targets: Vec<String> = Vec::new();
+            let mut summary: Vec<&str> = Vec::new();
+            for f in &found {
+                for t in &f.targets {
+                    if !targets.contains(t) {
+                        targets.push(t.clone());
+                    }
+                }
+                if !summary.contains(&f.summary.as_str()) {
+                    summary.push(&f.summary);
+                }
+            }
             Some(Gated {
                 class,
                 targets,
@@ -454,27 +473,55 @@ fn verb_class(tool: &str) -> Option<Class> {
     }
 }
 
-type Item = (Class, Vec<String>, String);
+/// A stage that sends, posts or pays.
+#[derive(PartialEq)]
+struct Item {
+    class: Class,
+    targets: Vec<String>,
+    summary: String,
+    /// The stage's own text (see [`stage_text`]), by which the de-quoted scan tells a send the
+    /// plain scan saw from one it missed (R28).
+    stage: String,
+}
 
-/// (class, targets, summary) for each stage of `command` that sends, posts or pays.
+/// Each stage of `command` that sends, posts or pays. With `read` false (the de-quoted copy,
+/// R28) no target is read: every one is `unknown`.
 ///
 /// R26: nothing is hidden from this scan. The whole text is scanned, heredoc bodies and comments
 /// included, and each physical line again on its own, so a quoting trick the tokenizer misreads
 /// cannot swallow a send; over-gating is the safe direction. Heredocs are parsed only to read
 /// recipients, where any doubt gives `unknown`.
-fn gated_command(command: &str, depth: usize) -> Vec<Item> {
+fn gated_command(command: &str, depth: usize, read: bool) -> Vec<Item> {
     let mut found = Vec::new();
     if depth > 4 {
         return found;
     }
     let (text, heredocs) = mark_heredocs(command);
-    scan_stages(&text, &heredocs, depth, &mut found);
+    scan_stages(&text, &heredocs, depth, read, &mut found);
     if text.trim_end().contains('\n') {
         for line in text.lines() {
-            scan_stages(line, &heredocs, depth, &mut found);
+            scan_stages(line, &heredocs, depth, read, &mut found);
         }
     }
     found
+}
+
+/// A stage's words, each heredoc it takes (attached, or `fed` from a `cat` piped in) written out,
+/// with quotes and backslashes made spaces and whitespace collapsed: the same for a send in the
+/// plain and the de-quoted scan, and different for two sends that differ in words or message.
+fn stage_text(words: &[String], heredocs: &[Heredoc], fed: Option<&Heredoc>) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(h) = fed {
+        parts.extend(["<<", &h.body, "|"]);
+    }
+    for w in words {
+        match heredoc_of(heredocs, w) {
+            Some(h) => parts.extend(["<<", &h.body]),
+            None => parts.push(w),
+        }
+    }
+    let text = parts.join(" ").replace(['\'', '"', '`', '\\'], " ");
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The heredoc a `<<__HEREDOC_k__` word names.
@@ -492,7 +539,7 @@ fn other_stdin(word: &str) -> bool {
     (word.starts_with('<') && !word.starts_with("<<__HEREDOC_")) || word.ends_with("<<")
 }
 
-fn scan_stages(text: &str, heredocs: &[Heredoc], depth: usize, found: &mut Vec<Item>) {
+fn scan_stages(text: &str, heredocs: &[Heredoc], depth: usize, read: bool, found: &mut Vec<Item>) {
     let all = stages(text);
     let mut add = |item: Item| {
         if !found.contains(&item) {
@@ -545,75 +592,139 @@ fn scan_stages(text: &str, heredocs: &[Heredoc], depth: usize, found: &mut Vec<I
         let name = basename(&words[0]);
         let args = &words[1..];
         if let Some(script) = nested(name, args) {
-            for item in gated_command(&script, depth + 1) {
+            for item in gated_command(&script, depth + 1, read) {
                 add(item);
             }
             continue;
         }
         if SHELLS.contains(&name) {
             if let Some(script) = echoed(si) {
-                for item in gated_command(&script, depth + 1) {
+                for item in gated_command(&script, depth + 1, read) {
                     add(item);
                 }
             }
         }
         if name == "himalaya" && himalaya_send(args) {
-            // Recipients come only from this stage's `-H "To: ..."` arguments, a heredoc attached
-            // to it, or a heredoc on a bare `cat` piped straight into it. A `To:` elsewhere in
-            // the command is the agent's own text and proves nothing about who this goes to.
-            let mut to = Vec::new();
-            let mut doubt = false;
-            let mut sources: Vec<&Heredoc> = fed(si).into_iter().collect();
-            let own: Vec<&Heredoc> = args
-                .iter()
-                .filter_map(|a| heredoc_of(heredocs, a))
-                .collect();
-            if !own.is_empty() && args.iter().any(|a| other_stdin(a)) {
-                doubt = true; // a later redirect may override the heredoc
-            }
-            sources.extend(own);
-            if args
-                .iter()
-                .any(|a| a.starts_with("<<") && heredoc_of(heredocs, a).is_none())
-            {
-                doubt = true; // a heredoc operator the parser did not take
-            }
-            for h in sources {
-                match header_block(h) {
-                    Some(headers) => headers.iter().for_each(|l| header_emails(l, &mut to)),
-                    None => doubt = true,
-                }
-            }
-            for (i, a) in args.iter().enumerate() {
-                let header = match a.as_str() {
-                    "-H" | "--header" => args.get(i + 1).map(String::as_str),
-                    _ => a.strip_prefix("--header="),
-                };
-                if let Some(h) = header {
-                    header_emails(h, &mut to);
-                }
-            }
-            if doubt || to.is_empty() {
-                to = vec![UNKNOWN.to_string()];
-            }
+            let fed = fed(si);
+            let to = if read {
+                himalaya_recipients(args, heredocs, fed)
+            } else {
+                vec![UNKNOWN.to_string()]
+            };
             let summary = if to == [UNKNOWN] {
                 "email to unreadable recipients".to_string()
             } else {
                 format!("email to {}", to.join(", "))
             };
-            add((Class::Messages, to, summary));
+            add(Item {
+                class: Class::Messages,
+                targets: to,
+                summary,
+                stage: stage_text(&stage.words, heredocs, fed),
+            });
         } else if name == "gh" {
             if let Some(label) = gh_write(args) {
-                let repo = gh_repo(args).unwrap_or_else(|| UNKNOWN.to_string());
+                let repo = gh_repo(args)
+                    .filter(|_| read)
+                    .unwrap_or_else(|| UNKNOWN.to_string());
                 let summary = if repo == UNKNOWN {
                     format!("{label} on an unreadable repo")
                 } else {
                     format!("{label} on {repo}")
                 };
-                add((Class::Posts, vec![repo], summary));
+                add(Item {
+                    class: Class::Posts,
+                    targets: vec![repo],
+                    summary,
+                    stage: stage_text(&stage.words, heredocs, None),
+                });
             }
         }
     }
+}
+
+/// Who a himalaya send goes to. Recipients come only from this stage's `-H "To: ..."` arguments,
+/// a heredoc attached to it, or `fed`, a heredoc on a bare `cat` piped straight into it; a `To:`
+/// elsewhere in the command is the agent's own text and proves nothing. A heredoc counts only
+/// when it is the message himalaya reads (R29): not beside a message operand, nor beside another
+/// stdin redirect. Any doubt gives `[UNKNOWN]`.
+fn himalaya_recipients(
+    args: &[String],
+    heredocs: &[Heredoc],
+    fed: Option<&Heredoc>,
+) -> Vec<String> {
+    let mut to = Vec::new();
+    let mut doubt = false;
+    if !message_operand(args) {
+        let own = args.iter().filter_map(|a| heredoc_of(heredocs, a));
+        let sources: Vec<&Heredoc> = fed.into_iter().chain(own).collect();
+        if !sources.is_empty() && args.iter().any(|a| other_stdin(a)) {
+            doubt = true; // another redirect may give stdin in place of the heredoc
+        }
+        if args
+            .iter()
+            .any(|a| a.starts_with("<<") && heredoc_of(heredocs, a).is_none())
+        {
+            doubt = true; // a heredoc operator the parser did not take
+        }
+        for h in sources {
+            match header_block(h) {
+                Some(headers) => headers.iter().for_each(|l| header_emails(l, &mut to)),
+                None => doubt = true,
+            }
+        }
+    }
+    for (i, a) in args.iter().enumerate() {
+        let header = match a.as_str() {
+            "-H" | "--header" => args.get(i + 1).map(String::as_str),
+            _ => a.strip_prefix("--header="),
+        };
+        if let Some(h) = header {
+            header_emails(h, &mut to);
+        }
+    }
+    if doubt || to.is_empty() {
+        to = vec![UNKNOWN.to_string()];
+    }
+    to
+}
+
+/// Whether a word follows `send` in a himalaya stage that himalaya takes as the message
+/// (`himalaya message send "$msg"`), so stdin is not the message. Flags, the values of the flags
+/// that take one, heredocs, redirections and their targets are not operands; an input redirect
+/// counts as stdin, not as an operand, and is doubted where it is read.
+fn message_operand(args: &[String]) -> bool {
+    const VALUED: &[&str] = &[
+        "-a",
+        "--account",
+        "-c",
+        "--config",
+        "-o",
+        "--output",
+        "-H",
+        "--header",
+    ];
+    let mut skip = false;
+    let mut after_send = false;
+    for a in args {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        let op = a.trim_start_matches(|c: char| c.is_ascii_digit());
+        if VALUED.contains(&a.as_str()) {
+            skip = true;
+        } else if op.starts_with(['<', '>']) || op.starts_with("&>") {
+            // `>`, `2>`, `<<<`: a bare operator takes the next word
+            skip = op.chars().all(|c| "<>&|".contains(c));
+        } else if a.starts_with('-') || a.trim().is_empty() {
+            // a flag, or the newline of a `\` line continuation
+        } else if after_send {
+            return true;
+        } else if a == "send" {
+            after_send = true;
+        }
+    }
+    false
 }
 
 /// A heredoc found by [`mark_heredocs`].
@@ -626,14 +737,14 @@ struct Heredoc {
 /// The logical header lines (continuations, which start with a space or tab, folded into their
 /// header) of a heredoc's header block, the part before the first empty line. `None` when the
 /// block cannot be read with confidence: an unquoted delimiter with `$` or a backtick in it, or
-/// a whitespace-only line.
+/// a line ending in `\` (the shell joins it to the next, R29); or a whitespace-only line.
 fn header_block(h: &Heredoc) -> Option<Vec<String>> {
     let mut headers: Vec<String> = Vec::new();
     for line in h.body.lines() {
         if line.is_empty() {
             break;
         }
-        if line.trim().is_empty() {
+        if line.trim().is_empty() || (!h.quoted && line.ends_with('\\')) {
             return None;
         }
         if line.starts_with([' ', '\t']) {
@@ -2403,5 +2514,76 @@ mod tests {
             check_bash("bash <<< 'rm -rf /'"),
             Decision::Deny(_)
         ));
+    }
+
+    #[test]
+    fn no_quote_hides_a_send_and_the_de_quoted_copy_reads_no_recipients() {
+        let unknown = vec![UNKNOWN.to_string()];
+        // R28: bash reads $'\'' as one quote and runs himalaya; the tokenizer opens a quote there
+        // that swallows the send. Only the de-quoted copy sees it, so its recipients are unknown.
+        let g = gbash("echo $'\\''; himalaya message send -H 'To: z@b.org' x").unwrap();
+        assert_eq!((g.class, g.targets), (Class::Messages, unknown.clone()));
+        assert_eq!(g.summary, "email to unreadable recipients");
+        let g = gbash("echo $'\\''; gh pr create -R o/r").unwrap();
+        assert_eq!((g.class, g.targets), (Class::Posts, unknown.clone()));
+        // a send both scans see keeps its recipients; a hidden second one adds `unknown`, also
+        // beside a decoy only the plain scan sees as a send (`h"imalaya"`)
+        for (cmd, want) in [
+            (
+                "himalaya message send -H 'To: a@x.org' x; echo $'\\''; himalaya message send -H 'To: z@b.org' y",
+                vec!["a@x.org", UNKNOWN],
+            ),
+            (
+                "h\"imalaya\" message send -H 'To: a@x.org' x; echo $'\\''; himalaya message send -H 'To: z@b.org' x",
+                vec!["a@x.org", UNKNOWN],
+            ),
+            (
+                "cat <<'A' | h\"imalaya\" message send\nTo: a@x.org\n\nA\necho $'\\''; cat <<'B' | himalaya message send\nTo: z@b.org\n\nB",
+                vec!["a@x.org", UNKNOWN],
+            ),
+        ] {
+            assert_eq!(gbash(cmd).unwrap().targets, want, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_backslash_joined_header_line_gives_unknown() {
+        // R29: an unquoted heredoc joins `To: known@x.org\` and `,z@evil.org` into one header
+        for cmd in [
+            "himalaya message send <<EOF\nTo: known@x.org\\\n,z@evil.org\n\nhi\nEOF",
+            "cat <<EOF | himalaya message send\nTo: known@x.org\\\n,z@evil.org\n\nhi\nEOF",
+            // the shell joins the blank line too, so `Cc:` is still a header
+            "himalaya message send <<-EOF\nTo: known@x.org\\\n\nCc: z@evil.org\n\nhi\nEOF",
+        ] {
+            assert_eq!(gbash(cmd).unwrap().targets, vec![UNKNOWN], "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_heredoc_himalaya_does_not_read_gives_no_recipients() {
+        // R29: a message operand after `send` is the message; stdin, and a heredoc on it, is not.
+        // The same for a heredoc piped in while the himalaya stage takes stdin from elsewhere.
+        for cmd in [
+            "himalaya message send \"<raw msg>\" <<'EOF'\nTo: known@x.org\n\nEOF",
+            "himalaya message send 'To: z@evil.org\n\nhi' <<'EOF'\nTo: known@x.org\n\nEOF",
+            "himalaya message send \"$msg\" <<'EOF'\nTo: known@x.org\n\nEOF",
+            "himalaya message send -a work raw <<'EOF'\nTo: known@x.org\n\nEOF",
+            "cat <<'EOF' | himalaya message send \"$msg\"\nTo: known@x.org\n\nEOF",
+            "cat <<'EOF' | himalaya message send < evil.eml\nTo: known@x.org\n\nEOF",
+        ] {
+            assert_eq!(gbash(cmd).unwrap().targets, vec![UNKNOWN], "{cmd}");
+        }
+        // rule (a): -H arguments still give them, beside an operand
+        let g = gbash("himalaya message send -H 'To: a@x.org' x <<'EOF'\nTo: known@x.org\n\nEOF")
+            .unwrap();
+        assert_eq!(g.targets, vec!["a@x.org"]);
+        // flag values and output redirections are not operands
+        for cmd in [
+            "himalaya message send -a work <<'EOF' 2>&1\nTo: a@x.org\n\nEOF",
+            "himalaya -a work message send <<'EOF' >/dev/null\nTo: a@x.org\n\nEOF",
+            "cat <<'EOF' | himalaya message send > log\nTo: a@x.org\n\nEOF",
+        ] {
+            assert_eq!(gbash(cmd).unwrap().targets, vec!["a@x.org"], "{cmd}");
+        }
     }
 }
