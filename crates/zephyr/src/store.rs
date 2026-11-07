@@ -197,6 +197,16 @@ fn proc_row(r: &rusqlite::Row) -> rusqlite::Result<Proc> {
     })
 }
 
+fn revert_row(r: &rusqlite::Row) -> rusqlite::Result<Revert> {
+    Ok(Revert {
+        key: r.get(0)?,
+        value: r.get(1)?,
+        at: r.get(2)?,
+        since: r.get(3)?,
+        channel: r.get(4)?,
+    })
+}
+
 fn proc_report(p: &Proc, outcome: &str, output: &str) -> String {
     let header = format!(
         "[process #{} {outcome}; a command you moved to the background, not the owner's words] \
@@ -215,6 +225,17 @@ pub struct PendingProposal {
     pub key: Option<String>,
     pub seen: Option<String>,
     pub strong: bool,
+}
+
+/// A time limit's end: `key` goes back to `value` (`None`: unset) at `at`. `since` is when the
+/// limit was set and `channel` where, so whoever set it is told how long it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Revert {
+    pub key: String,
+    pub value: Option<String>,
+    pub at: i64,
+    pub since: i64,
+    pub channel: Option<String>,
 }
 
 /// The latest change recorded for a setting.
@@ -442,7 +463,9 @@ impl Store {
                  CREATE TABLE setting_reverts(
                     key TEXT PRIMARY KEY,
                     value TEXT,
-                    at INTEGER NOT NULL);
+                    at INTEGER NOT NULL,
+                    since INTEGER NOT NULL, -- when the time limit was set
+                    channel TEXT); -- where, to tell whoever set it
                  ALTER TABLE proposals ADD COLUMN key TEXT;
                  ALTER TABLE proposals ADD COLUMN seen TEXT;
                  ALTER TABLE proposals ADD COLUMN strong INTEGER NOT NULL DEFAULT 0;
@@ -908,12 +931,14 @@ impl Store {
         Ok(())
     }
 
-    /// The latest recorded change to `key`. A refusal (actor `refused`) is not a change.
+    /// The latest recorded change to `key`. A refusal (actor `refused`) is not a change, nor is
+    /// one whose reload failed (actor `… (reload failed)`).
     pub fn last_setting_change(&self, key: &str) -> rusqlite::Result<Option<SettingChange>> {
         self.db
             .query_row(
                 "SELECT actor, channel, proposal, at FROM settings_log
-                 WHERE key = ?1 AND actor != 'refused' ORDER BY id DESC LIMIT 1",
+                 WHERE key = ?1 AND actor != 'refused' AND actor NOT LIKE '% (reload failed)'
+                 ORDER BY id DESC LIMIT 1",
                 params![key],
                 |r| {
                     Ok(SettingChange {
@@ -927,23 +952,23 @@ impl Store {
             .optional()
     }
 
-    /// Schedules `key` to go back to `value` (`None`: unset) at `at`, replacing any earlier
-    /// revert for the key.
-    pub fn set_revert(&self, key: &str, value: Option<&str>, at: i64) -> rusqlite::Result<()> {
+    /// Schedules `r`, replacing any earlier revert for its key.
+    pub fn set_revert(&self, r: &Revert) -> rusqlite::Result<()> {
         self.db.execute(
-            "INSERT OR REPLACE INTO setting_reverts(key, value, at) VALUES (?1, ?2, ?3)",
-            params![key, value, at],
+            "INSERT OR REPLACE INTO setting_reverts(key, value, at, since, channel)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![r.key, r.value, r.at, r.since, r.channel],
         )?;
         Ok(())
     }
 
-    /// When `key`'s pending revert is due, if it has one.
-    pub fn revert_at(&self, key: &str) -> rusqlite::Result<Option<i64>> {
+    /// `key`'s pending revert, if it has one.
+    pub fn revert(&self, key: &str) -> rusqlite::Result<Option<Revert>> {
         self.db
             .query_row(
-                "SELECT at FROM setting_reverts WHERE key = ?1",
+                "SELECT key, value, at, since, channel FROM setting_reverts WHERE key = ?1",
                 params![key],
-                |r| r.get(0),
+                revert_row,
             )
             .optional()
     }
@@ -955,13 +980,13 @@ impl Store {
         Ok(())
     }
 
-    /// The reverts at or before `now`, as `(key, value)`, oldest first. They stay until
-    /// `drop_revert`.
-    pub fn due_reverts(&self, now: i64) -> rusqlite::Result<Vec<(String, Option<String>)>> {
-        let mut stmt = self
-            .db
-            .prepare("SELECT key, value FROM setting_reverts WHERE at <= ?1 ORDER BY at, key")?;
-        let rows = stmt.query_map(params![now], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    /// The reverts at or before `now`, oldest first. They stay until `drop_revert`.
+    pub fn due_reverts(&self, now: i64) -> rusqlite::Result<Vec<Revert>> {
+        let mut stmt = self.db.prepare(
+            "SELECT key, value, at, since, channel FROM setting_reverts WHERE at <= ?1
+             ORDER BY at, key",
+        )?;
+        let rows = stmt.query_map(params![now], revert_row)?;
         rows.collect()
     }
 
@@ -1996,8 +2021,9 @@ mod tests {
                 .log_setting("k", None, Some("v"), "owner", Some("chat"), None)
                 .unwrap();
             assert_eq!(store.last_setting_change("k").unwrap().unwrap().actor, "owner");
-            store.set_revert("k", None, 5).unwrap();
-            assert_eq!(store.due_reverts(5).unwrap(), [("k".to_string(), None)]);
+            let r = revert("k", None, 5);
+            store.set_revert(&r).unwrap();
+            assert_eq!(store.due_reverts(5).unwrap(), [r]);
             let id = store.propose_setting("/set k v", "k", Some("old"), true).unwrap();
             let p = store.pending_proposals().unwrap();
             assert_eq!(p.iter().filter(|p| p.id == id).count(), 1);
@@ -2017,22 +2043,31 @@ mod tests {
         assert!(Store::open(&path).is_err(), "a newer schema is refused");
     }
 
+    fn revert(key: &str, value: Option<&str>, at: i64) -> Revert {
+        Revert {
+            key: key.into(),
+            value: value.map(Into::into),
+            at,
+            since: at - 10,
+            channel: Some("chat".into()),
+        }
+    }
+
     #[test]
     fn a_revert_replaces_the_last_for_its_key_and_comes_due_once() {
         let store = Store::open(&crate::test_dir("store-revert").join("state.db")).unwrap();
-        store.set_revert("a", Some("1"), 100).unwrap();
-        store.set_revert("a", Some("2"), 200).unwrap();
-        store.set_revert("b", None, 150).unwrap();
-        assert_eq!(store.revert_at("a").unwrap(), Some(200));
-        assert_eq!(store.revert_at("c").unwrap(), None);
+        store.set_revert(&revert("a", Some("1"), 100)).unwrap();
+        let a = revert("a", Some("2"), 200);
+        store.set_revert(&a).unwrap();
+        let b = revert("b", None, 150);
+        store.set_revert(&b).unwrap();
+        assert_eq!(store.revert("a").unwrap().as_ref(), Some(&a));
+        assert_eq!(store.revert("c").unwrap(), None);
         assert!(store.due_reverts(99).unwrap().is_empty());
-        assert_eq!(store.due_reverts(150).unwrap(), [("b".to_string(), None)]);
+        assert_eq!(store.due_reverts(150).unwrap(), [b]);
         store.drop_revert("b").unwrap();
         assert!(store.due_reverts(150).unwrap().is_empty(), "dropped");
-        assert_eq!(
-            store.due_reverts(200).unwrap(),
-            [("a".to_string(), Some("2".to_string()))]
-        );
+        assert_eq!(store.due_reverts(200).unwrap(), [a]);
         store.drop_revert("a").unwrap();
         assert!(store.due_reverts(1000).unwrap().is_empty());
         store.drop_revert("a").unwrap();
@@ -2097,10 +2132,20 @@ mod tests {
         store
             .log_setting("new", None, Some("9"), "refused", Some("discord"), None)
             .unwrap();
+        store
+            .log_setting(
+                "new",
+                None,
+                Some("9"),
+                "owner (reload failed)",
+                Some("chat"),
+                None,
+            )
+            .unwrap();
         assert_eq!(
             store.last_setting_change("new").unwrap().unwrap().actor,
             "owner",
-            "a refusal is not a change"
+            "neither a refusal nor a failed reload is a change"
         );
         store
             .log_setting("new", None, None, "agent", None, None)

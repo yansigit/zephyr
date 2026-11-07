@@ -2464,6 +2464,35 @@ async fn settings_lists_a_section_with_values_and_sources() {
 }
 
 #[tokio::test]
+async fn a_change_whose_reload_fails_is_logged_as_failed_and_not_timed() {
+    let home = home("set-reload-fails");
+    let gw = start(on_file(&home, ""));
+    wait(|| !log(&home, "start").is_empty()).await;
+    std::fs::write(home.join("model_refuse"), "").unwrap();
+    gw.say("m1", "owner", "/set model fake/m2 for 1h").await;
+    let reply = gw.wait_replies(1).await.remove(0);
+    assert!(
+        reply.starts_with("[zephyr] model fake/m1 → fake/m2\n[zephyr] rpi refused fake/m2: "),
+        "{reply}"
+    );
+    // The file keeps what was asked (spec §4.9); the log says the reload failed.
+    assert_eq!(accounts_in_file(&home)[0], ("a".into(), "fake/m2".into()));
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    let actor: String = db
+        .query_row(
+            "SELECT actor FROM settings_log WHERE key = 'model'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(actor, "owner (reload failed)");
+    let store = Store::open(&home.join("state.db")).unwrap();
+    assert_eq!(store.revert("model").unwrap(), None, "no time limit");
+    assert_eq!(store.last_setting_change("model").unwrap(), None);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_stale_proposal_is_refused() {
     let home = home("set-stale");
     let gw = start(on_file(&home, ""));

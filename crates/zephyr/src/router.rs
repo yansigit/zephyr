@@ -265,59 +265,12 @@ pub async fn run<C: Channel>(
     let (tx, rx) = mpsc::channel(64);
     let (attach_tx, attaches) = mpsc::channel(4);
     let jobs = crate::scheduler::Wake::default();
-    let shared = Arc::new(cfg.clone());
-    let (cfg_tx, cfg_rx) = watch::channel(shared.clone());
+    let (cfg_tx, cfg_rx) = watch::channel(Arc::new(cfg.clone()));
     let (snap, snap_rx) = watch::channel(Snapshot::default());
     let activity_rx = snap_rx.clone();
     let attach_cfgs = cfg_rx.clone();
-    let mut router = Router {
-        cfg: shared,
-        cfg_tx,
-        edits: edits(cfg),
-        secrets: crate::dotenv::read(&cfg.secrets_path()).unwrap_or_default(),
-        pending_model: None,
-        reexec: false,
-        auth_stamp: None,
-        logins: Vec::new(),
-        starting: Vec::new(),
-        btw: None,
-        store: Store::open(&cfg.db_path())?,
-        child: None,
-        busy: false,
-        resumes: 0,
-        backoff: FIRST_BACKOFF,
-        respawn_at: Instant::now(),
-        unrouted: HashSet::new(),
-        stuck: HashMap::new(),
-        tap: broadcast::channel(1024).0,
-        attaches,
-        jobs: &jobs,
-        auth_at: Instant::now(),
-        restart: false,
-        account: None,
-        tally: Default::default(),
-        snap,
-        names: channels.iter().map(|c| c.name().to_string()).collect(),
-        thinking: None,
-        context_window: None,
-        thinking_choice: None,
-        shown: 0,
-        steered: Vec::new(),
-        steered_texts: HashSet::new(),
-        steer_sent: Vec::new(),
-        steer_replied: false,
-        run_completed: false,
-        run_start: None,
-        last_event: Instant::now(),
-        note_pending: false,
-        cut: None,
-        cut_at: None,
-        spawn_failures: 0,
-        stopping: false,
-        procs: Default::default(),
-        compacting: None,
-        approving: None,
-    };
+    let names = channels.iter().map(|c| c.name().to_string()).collect();
+    let mut router = Router::new(cfg, &jobs, attaches, cfg_tx, snap, names)?;
     // Commands a re-exec handed over alive are adopted; the rest a dead gateway left running
     // are reported, never re-run (DESIGN §4.13).
     router.procs.adopt(&router.cfg, &mut router.store)?;
@@ -531,6 +484,26 @@ const SET_USAGE: &str = "[zephyr] usage: /set KEY VALUE [for 2h]; /settings list
 const SUBAGENT_USAGE: &str = "usage: /subagent, /subagent add NAME [PROVIDER/MODEL] PROMPT, \
     /subagent model NAME PROVIDER/MODEL|default, /subagent prompt NAME PROMPT, /subagent rm NAME";
 
+/// How a saved setting took effect: the reload's answer (or the command's own reply), and
+/// whether the reload failed, which leaves the file saved but the change not in effect.
+struct Reloaded {
+    text: String,
+    failed: bool,
+}
+
+impl Reloaded {
+    fn done(text: String) -> Self {
+        Self {
+            text,
+            failed: false,
+        }
+    }
+
+    fn failed(text: String) -> Self {
+        Self { text, failed: true }
+    }
+}
+
 async fn next_event(child: &mut Option<Child>) -> Option<Value> {
     match child {
         Some(c) => c.events.recv().await,
@@ -539,6 +512,66 @@ async fn next_event(child: &mut Option<Child>) -> Option<Value> {
 }
 
 impl<'a> Router<'a> {
+    /// A router for `cfg` with no child yet. `cfg_tx` holds the config it starts on.
+    fn new(
+        cfg: &Config,
+        jobs: &'a crate::scheduler::Wake,
+        attaches: mpsc::Receiver<crate::attach::AttachRequest>,
+        cfg_tx: watch::Sender<Arc<Config>>,
+        snap: watch::Sender<Snapshot>,
+        names: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        let shared = cfg_tx.borrow().clone();
+        Ok(Router {
+            cfg: shared,
+            edits: edits(cfg),
+            secrets: crate::dotenv::read(&cfg.secrets_path()).unwrap_or_default(),
+            pending_model: None,
+            reexec: false,
+            auth_stamp: None,
+            logins: Vec::new(),
+            starting: Vec::new(),
+            btw: None,
+            store: Store::open(&cfg.db_path())?,
+            child: None,
+            busy: false,
+            resumes: 0,
+            backoff: FIRST_BACKOFF,
+            respawn_at: Instant::now(),
+            unrouted: HashSet::new(),
+            stuck: HashMap::new(),
+            tap: broadcast::channel(1024).0,
+            attaches,
+            jobs,
+            auth_at: Instant::now(),
+            restart: false,
+            account: None,
+            tally: Default::default(),
+            snap,
+            names,
+            thinking: None,
+            context_window: None,
+            thinking_choice: None,
+            shown: 0,
+            steered: Vec::new(),
+            steered_texts: HashSet::new(),
+            steer_sent: Vec::new(),
+            steer_replied: false,
+            run_completed: false,
+            run_start: None,
+            last_event: Instant::now(),
+            note_pending: false,
+            cut: None,
+            cut_at: None,
+            spawn_failures: 0,
+            stopping: false,
+            procs: Default::default(),
+            compacting: None,
+            approving: None,
+            cfg_tx,
+        })
+    }
+
     async fn main<C: Channel>(
         &mut self,
         mut rx: mpsc::Receiver<Inbound>,
@@ -1580,7 +1613,7 @@ impl<'a> Router<'a> {
 
     /// `/subagent add|model|prompt|rm ...`: a change to the owner's named subagents (DESIGN
     /// §4.12), through `set_setting`. The reply, or why nothing changed.
-    async fn subagent(&mut self, arg: &str) -> Result<String, String> {
+    async fn subagent(&mut self, arg: &str) -> Result<Reloaded, String> {
         use crate::host::conf::{remove_subagent, set_subagent};
         type Doc = toml_edit::DocumentMut;
         let (sub, rest) = word(arg);
@@ -1624,17 +1657,21 @@ impl<'a> Router<'a> {
             }
             _ => return Err(SUBAGENT_USAGE.into()),
         };
-        Ok(format!("[zephyr] {done}\n{}", applied?))
+        let applied = applied?;
+        Ok(Reloaded {
+            text: format!("[zephyr] {done}\n{}", applied.text),
+            failed: applied.failed,
+        })
     }
 
     /// Edits `zephyr.toml` for the owner: checks `model` (unless `default`) as `/model` does,
-    /// saves the file only if it still loads, then reloads. The reload's answer, or why nothing
+    /// saves the file only if it still loads, then reloads. How the reload went, or why nothing
     /// changed.
     async fn edit_config(
         &mut self,
         model: Option<&str>,
         edit: impl FnOnce(&mut toml_edit::DocumentMut) -> anyhow::Result<()>,
-    ) -> Result<String, String> {
+    ) -> Result<Reloaded, String> {
         let Some(path) = self.cfg.path.clone() else {
             return Err("no zephyr.toml to change".into());
         };
@@ -1646,7 +1683,7 @@ impl<'a> Router<'a> {
             toml::from_str::<Config>(&doc.to_string())?.validate()
         })
         .map_err(|e| format!("not changed: {e:#}"))?;
-        Ok(self.reload().await)
+        Ok(self.reloaded().await)
     }
 
     /// The one way a setting changes (settings spec §4.3), whoever asks: the key is looked up,
@@ -1744,8 +1781,9 @@ impl<'a> Router<'a> {
             Apply::Thinking => self.apply_thinking(raw).await,
             Apply::Subagent => self.subagent(raw).await,
             // rpi reads AGENTS.md once, at start: a fresh child on the same session loads the rules.
-            Apply::Rule => crate::memory::rule(self.cfg.state_dir(), raw).inspect(|_| {
+            Apply::Rule => crate::memory::rule(self.cfg.state_dir(), raw).map(|reply| {
                 self.restart = true;
+                Reloaded::done(reply)
             }),
             Apply::Facts => Err(format!("{key} cannot be set here")),
         };
@@ -1753,9 +1791,10 @@ impl<'a> Router<'a> {
             Ok(applied) => applied,
             Err(why) => return Outcome::Refused(why),
         };
-        // What is in effect now; a model asked for may still be on its way to the child.
-        let new = match s.apply {
-            Apply::Toml | Apply::Thinking => self.shown(key),
+        // What is in effect now; a model asked for may still be on its way to the child, and
+        // after a failed reload the file holds what was asked, not what is in effect.
+        let new = match (s.apply, applied.failed) {
+            (Apply::Toml | Apply::Thinking, false) => self.shown(key),
             _ => new,
         };
         let (who, channel, proposal) = match actor {
@@ -1766,32 +1805,62 @@ impl<'a> Router<'a> {
             Actor::Agent { .. } => ("agent", None, None),
             Actor::Internal => ("zephyr", None, None),
         };
-        let logged =
-            (self.store).log_setting(key, old.as_deref(), new.as_deref(), who, channel, proposal);
-        log(logged.map_err(Into::into));
-        let revert = match until {
-            None => self.store.drop_revert(key),
-            Some(d) => {
+        // Spec §4.9: the file stays saved, and the log says the reload failed.
+        let who = match applied.failed {
+            true => format!("{who} (reload failed)"),
+            false => who.to_string(),
+        };
+        let (o, n) = (old.as_deref(), new.as_deref());
+        log((self.store.log_setting(key, o, n, &who, channel, proposal)).map_err(Into::into));
+        // A change that did not take effect leaves the time limits as they were.
+        if !applied.failed {
+            let back = match (s.apply, &s.kind) {
                 // Back to what the file held: unset, or for a setting that has no "none", the
                 // value it had by default.
-                let back = match (s.apply, &s.kind) {
-                    (Apply::Toml, Kind::Optional(_)) => seen,
-                    (Apply::Toml, _) => seen.or_else(|| old.clone()),
-                    _ => old.clone(),
-                };
-                // Due `d` after the change as logged, so its notice can say how long it was.
-                let at = (self.store.last_setting_change(key).ok().flatten())
-                    .map_or_else(crate::now, |c| c.at);
-                self.store
-                    .set_revert(key, back.as_deref(), at + d.as_secs() as i64)
-            }
-        };
-        log(revert.map_err(Into::into));
+                (Apply::Toml, Kind::Optional(_)) => seen,
+                (Apply::Toml, _) => seen.or_else(|| old.clone()),
+                _ => old.clone(),
+            };
+            self.time_limit(key, actor, until, back, channel);
+        }
         if let Actor::Agent { .. } = actor {
-            let (o, n) = (old.as_deref(), new.as_deref());
             self.tell_owner(&reg::tightened(key, o, n, reason));
         }
-        Outcome::Changed { old, new, applied }
+        Outcome::Changed {
+            old,
+            new,
+            applied: applied.text,
+        }
+    }
+
+    /// The time limit after a change to `key`: with `until`, it goes `back` then; without, a
+    /// pending one is cancelled. The agent never cancels or replaces one that is pending:
+    /// its own `for D` counts only when none is.
+    fn time_limit(
+        &self,
+        key: &str,
+        actor: Actor<'_>,
+        until: Option<Duration>,
+        back: Option<String>,
+        channel: Option<&str>,
+    ) {
+        // A revert that cannot be read counts as pending: the agent then leaves it alone.
+        let pending = self.store.revert(key).map_or(true, |r| r.is_some());
+        let done = match (actor, until) {
+            (Actor::Agent { .. }, _) if pending => return,
+            (_, None) => self.store.drop_revert(key),
+            (_, Some(d)) => {
+                let since = crate::now();
+                self.store.set_revert(&crate::store::Revert {
+                    key: key.into(),
+                    value: back,
+                    at: since + d.as_secs() as i64,
+                    since,
+                    channel: channel.map(Into::into),
+                })
+            }
+        };
+        log(done.map_err(Into::into));
     }
 
     /// An owner's command that changes `key` through `set_setting`: `done` words a change from
@@ -1830,8 +1899,8 @@ impl<'a> Router<'a> {
         let owner = Actor::Owner { channel };
         match self.set_setting(key, value, owner, until, None).await {
             Outcome::Changed { old, new, applied } => {
-                let at = until.and(self.store.revert_at(key).ok().flatten());
-                let at = at.map(|at| self.clock(at));
+                let at = until.and(self.store.revert(key).ok().flatten());
+                let at = at.map(|r| self.clock(r.at));
                 let (old, new) = (old.as_deref(), new.as_deref());
                 let line = crate::settings::changed(key, old, new, at.as_deref());
                 match applied.as_str() {
@@ -1870,8 +1939,8 @@ impl<'a> Router<'a> {
     /// Where `key`'s value came from: `until HH:MM` while a time limit runs, `default` when
     /// nothing sets it, else who changed it last.
     fn source(&self, s: &Setting, key: &str) -> String {
-        if let Ok(Some(at)) = self.store.revert_at(key) {
-            return format!("until {}", self.clock(at));
+        if let Ok(Some(r)) = self.store.revert(key) {
+            return format!("until {}", self.clock(r.at));
         }
         let change = self.store.last_setting_change(key).ok().flatten();
         let set = match s.apply {
@@ -1910,12 +1979,22 @@ impl<'a> Router<'a> {
     }
 
     /// `key` as it stands, which a proposal records as the value the owner saw and `/ok` checks
-    /// again: the file's text for a `zephyr.toml` setting (`None`: absent), else `shown`.
+    /// again: the file's text for a `zephyr.toml` setting (`None`: absent); for the subagents and
+    /// the rules, a SHA-256 of their whole text, so any edit makes a waiting `/subagent …` or
+    /// `/rule rm N` stale; else `shown`.
     fn current(&self, s: &Setting, key: &str) -> Option<String> {
+        let doc = || crate::host::conf::load(self.cfg.path.as_deref()?).ok();
         match s.apply {
-            Apply::Toml => {
-                let doc = crate::host::conf::load(self.cfg.path.as_deref()?).ok()?;
-                crate::settings::read(&doc, key)
+            Apply::Toml => crate::settings::read(&doc()?, key),
+            Apply::Subagent => {
+                let table = doc()?.get("subagent").map(|t| t.to_string());
+                Some(crate::drafts::digest([table
+                    .unwrap_or_default()
+                    .as_bytes()]))
+            }
+            Apply::Rule => {
+                let rules = crate::memory::read_rules(self.cfg.state_dir()).ok()?;
+                Some(crate::drafts::digest(rules.iter().map(|r| r.as_bytes())))
             }
             _ => self.shown(key),
         }
@@ -1964,25 +2043,18 @@ impl<'a> Router<'a> {
             Ok(due) => due,
             Err(e) => return eprintln!("zephyr: reading setting reverts failed: {e}"),
         };
-        for (key, value) in due {
-            // Read before the revert, which becomes the latest change.
-            let change = self.store.last_setting_change(&key).ok().flatten();
-            let span = match (self.store.revert_at(&key).ok().flatten(), &change) {
-                (Some(at), Some(c)) => {
-                    crate::settings::span(Duration::from_secs((at - c.at).max(0) as u64))
-                }
-                _ => "time limit".into(),
-            };
-            let raw = value.as_deref().unwrap_or("none");
+        for r in due {
+            let span = crate::settings::span(Duration::from_secs((r.at - r.since).max(0) as u64));
+            let (key, raw) = (r.key.as_str(), r.value.as_deref().unwrap_or("none"));
             let text = match self
-                .set_setting(&key, raw, Actor::Internal, None, None)
+                .set_setting(key, raw, Actor::Internal, None, None)
                 .await
             {
                 Outcome::Changed { new, .. } => {
-                    crate::settings::reverted(&key, new.as_deref(), &span)
+                    crate::settings::reverted(key, new.as_deref(), &span)
                 }
                 failed => {
-                    log(self.store.drop_revert(&key).map_err(Into::into));
+                    log(self.store.drop_revert(key).map_err(Into::into));
                     let why = match failed {
                         Outcome::Refused(why) => why,
                         _ => "it was not applied".into(),
@@ -1993,8 +2065,7 @@ impl<'a> Router<'a> {
                     )
                 }
             };
-            let to = change.and_then(|c| c.channel);
-            let told = match to.and_then(|channel| self.owner_on(&channel)) {
+            let told = match r.channel.and_then(|channel| self.owner_on(&channel)) {
                 Some((channel, owner)) => self.store.notify(&channel, &owner, &text),
                 None => self.store.notify_last_owner(&text),
             };
@@ -2520,7 +2591,7 @@ impl<'a> Router<'a> {
     /// on the file as it is now, and the write re-derives: a `/login` that records an account in
     /// between must not make the write land on an account no rpi was asked about, so it writes
     /// nothing and the new pool goes through the check first.
-    async fn switch_model(&mut self, model: &str) -> Result<String, String> {
+    async fn switch_model(&mut self, model: &str) -> Result<Reloaded, String> {
         let Some(path) = self.cfg.path.clone() else {
             return Err("no zephyr.toml to change".into());
         };
@@ -2553,7 +2624,7 @@ impl<'a> Router<'a> {
                 continue;
             }
             return match saved {
-                Ok(()) => Ok(self.reload().await),
+                Ok(()) => Ok(self.reloaded().await),
                 Err(e) => Err(format!("model not changed: {e:#}")),
             };
         }
@@ -2563,14 +2634,19 @@ impl<'a> Router<'a> {
     /// Reads `zephyr.toml` and `secrets.env` again and applies what changed (`reload::diff`).
     /// A file that does not load leaves everything as it was. Returns the reply text.
     async fn reload(&mut self) -> String {
+        self.reloaded().await.text
+    }
+
+    /// `reload`, saying whether it failed: the file did not load, or rpi refused the new model.
+    async fn reloaded(&mut self) -> Reloaded {
         use crate::reload::Plan;
         let Some(path) = self.cfg.path.clone() else {
-            return "[zephyr] no zephyr.toml to reload".into();
+            return Reloaded::failed("[zephyr] no zephyr.toml to reload".into());
         };
         self.edits = edits(&self.cfg);
         let new = match Config::load(&path) {
             Ok(new) => new,
-            Err(e) => return format!("[zephyr] zephyr.toml not applied: {e:#}"),
+            Err(e) => return Reloaded::failed(format!("[zephyr] zephyr.toml not applied: {e:#}")),
         };
         let secrets = crate::dotenv::read(&new.secrets_path()).unwrap_or_default();
         let next = pick_in(&new, &self.store).ok().flatten();
@@ -2591,7 +2667,7 @@ impl<'a> Router<'a> {
         } else {
             "now"
         };
-        match plan {
+        Reloaded::done(match plan {
             Plan::Same => "[zephyr] nothing changed".into(),
             Plan::Live => {
                 self.account = next.or(self.account.take());
@@ -2601,11 +2677,11 @@ impl<'a> Router<'a> {
                 self.account = next;
                 self.pending_model = Some(model.clone());
                 if self.busy {
-                    return format!("[zephyr] switching to {model} {after}");
+                    return Reloaded::done(format!("[zephyr] switching to {model} {after}"));
                 }
                 match self.apply_model().await {
                     None => format!("[zephyr] now on {model}"),
-                    Some(e) => e,
+                    Some(e) => return Reloaded::failed(e),
                 }
             }
             Plan::RestartChild => {
@@ -2618,7 +2694,7 @@ impl<'a> Router<'a> {
                 self.reexec = true;
                 format!("[zephyr] restarting zephyr's channels {after}")
             }
-        }
+        })
     }
 
     /// `/thinking [level|next]`: how hard the model thinks, from the next request on, through
@@ -2665,7 +2741,7 @@ impl<'a> Router<'a> {
 
     /// Sets rpi's thinking level, kept for each new child (`thinking_choice`), if the model
     /// offers it.
-    async fn apply_thinking(&mut self, level: &str) -> Result<String, String> {
+    async fn apply_thinking(&mut self, level: &str) -> Result<Reloaded, String> {
         if self.child.is_none() {
             return Err("the agent is not running".into());
         }
@@ -2679,7 +2755,7 @@ impl<'a> Router<'a> {
         (self.set_thinking(level).await)
             .map_err(|e| format!("rpi refused thinking {level}: {e:#}"))?;
         self.thinking_choice = Some(level.to_string());
-        Ok(String::new())
+        Ok(Reloaded::done(String::new()))
     }
 
     async fn set_thinking(&mut self, level: &str) -> anyhow::Result<()> {
@@ -3299,6 +3375,122 @@ fn log(r: anyhow::Result<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config on `<dir>/zephyr.toml` holding `extra`, `owner` the owner on `chat`.
+    fn on_file(name: &str, extra: &str) -> Config {
+        let dir = crate::test_dir(name);
+        let path = dir.join("zephyr.toml");
+        let text = format!(
+            "rpi = '/nonexistent/rpi'\nhome = {:?}\n{extra}\n[owners]\nchat = ['owner']\n",
+            dir.display().to_string()
+        );
+        std::fs::write(&path, text).unwrap();
+        Config::load(&path).unwrap()
+    }
+
+    /// A router on `cfg` with no child, so `set_setting` can be driven as any actor.
+    fn router<'a>(cfg: &Config, jobs: &'a crate::scheduler::Wake) -> Router<'a> {
+        let (_, attaches) = mpsc::channel(1);
+        let (cfg_tx, _) = watch::channel(Arc::new(cfg.clone()));
+        let (snap, _) = watch::channel(Snapshot::default());
+        Router::new(cfg, jobs, attaches, cfg_tx, snap, vec!["chat".into()]).unwrap()
+    }
+
+    const OWNER: Actor = Actor::Owner { channel: "chat" };
+    const AGENT: Actor = Actor::Agent { session: "main" };
+
+    #[tokio::test]
+    async fn the_agent_never_cancels_or_replaces_the_owners_time_limit() {
+        let cfg = on_file("set-agent-revert", "[budget]\ndaily_cost_usd = 5.0");
+        let jobs = Default::default();
+        let mut r = router(&cfg, &jobs);
+        let key = "budget.daily_cost_usd";
+        let hour = Some(Duration::from_secs(3600));
+        let short = Some(Duration::from_secs(30));
+        let set = r.set_setting(key, "8", OWNER, hour, None).await;
+        assert!(matches!(set, Outcome::Changed { .. }), "{set:?}");
+        let limit = r.store.revert(key).unwrap().unwrap();
+        assert_eq!(limit.value.as_deref(), Some("5.0"));
+        assert_eq!(limit.channel.as_deref(), Some("chat"));
+        // A tightening, then a timed tightening: both apply, and the owner's limit stays.
+        let tight = r.set_setting(key, "7.99", AGENT, None, Some("asked")).await;
+        let (old, new) = (Some("8".into()), Some("7.99".into()));
+        let applied = APPLIED.into();
+        assert_eq!(tight, Outcome::Changed { old, new, applied });
+        assert_eq!(r.store.revert(key).unwrap().as_ref(), Some(&limit));
+        let timed = r.set_setting(key, "7.5", AGENT, short, None).await;
+        assert!(matches!(timed, Outcome::Changed { .. }), "{timed:?}");
+        assert_eq!(r.store.revert(key).unwrap().as_ref(), Some(&limit));
+        // The owner's own change cancels it.
+        r.set_setting(key, "6", OWNER, None, None).await;
+        assert_eq!(r.store.revert(key).unwrap(), None);
+        // With none pending, the agent's `for D` goes back to the value before its change.
+        r.set_setting(key, "4", AGENT, short, None).await;
+        let own = r.store.revert(key).unwrap().unwrap();
+        let got = (own.value.as_deref(), own.at - own.since, own.channel);
+        assert_eq!(got, (Some("6.0"), 30, None));
+    }
+
+    /// The owner's `/ok N` on `chat`, and the reply it got.
+    async fn ok(r: &mut Router<'_>, id: i64) -> String {
+        let m = Inbound {
+            channel: "chat".into(),
+            platform_msg_id: format!("ok-{id}"),
+            sender: "owner".into(),
+            text: format!("/ok {id}"),
+        };
+        r.inbound(m, false).await;
+        let sent = r.store.pending_outbox().unwrap();
+        sent.last().unwrap().text.clone()
+    }
+
+    #[tokio::test]
+    async fn a_waiting_rule_or_subagent_change_goes_stale_after_any_edit() {
+        let cfg = on_file("set-list-stale", "");
+        let jobs = Default::default();
+        let mut r = router(&cfg, &jobs);
+        let proposed = |o| match o {
+            Outcome::Proposed { id } => id,
+            other => panic!("{other:?}"),
+        };
+        for rule in ["be brief", "reply in Korean"] {
+            r.set_setting("rule", rule, OWNER, None, None).await;
+        }
+        // Two rules before and after: `rm 2` would now remove another rule than the one shown.
+        let rm = proposed(r.set_setting("rule", "rm 2", AGENT, None, None).await);
+        r.set_setting("rule", "rm 1", OWNER, None, None).await;
+        r.set_setting("rule", "never email bob", OWNER, None, None)
+            .await;
+        let stale = "[zephyr] rule is now 2 rules; propose again";
+        assert_eq!(ok(&mut r, rm).await, stale);
+        let rules = crate::memory::read_rules(r.cfg.state_dir()).unwrap();
+        assert_eq!(rules, ["reply in Korean", "never email bob"]);
+        // An edit that adds one makes it stale too; one unchanged since it was shown runs.
+        let rm = proposed(r.set_setting("rule", "rm 2", AGENT, None, None).await);
+        r.set_setting("rule", "be kind", OWNER, None, None).await;
+        let stale = "[zephyr] rule is now 3 rules; propose again";
+        assert_eq!(ok(&mut r, rm).await, stale);
+        let rm = proposed(r.set_setting("rule", "rm 3", AGENT, None, None).await);
+        assert_eq!(
+            ok(&mut r, rm).await,
+            format!("[zephyr] /ok {rm} approved /rule rm 3\n[zephyr] removed rule 3: be kind")
+        );
+
+        // A subagent whose prompt changed keeps its name, but the proposal is stale all the same.
+        r.set_setting("subagent", "add y Build.", OWNER, None, None)
+            .await;
+        let edit =
+            proposed((r.set_setting("subagent", "prompt y Explore.", AGENT, None, None)).await);
+        let own = r
+            .set_setting("subagent", "prompt y Build well.", OWNER, None, None)
+            .await;
+        assert!(matches!(own, Outcome::Changed { .. }), "{own:?}");
+        assert_eq!(
+            ok(&mut r, edit).await,
+            "[zephyr] subagent is now y; propose again"
+        );
+        assert_eq!(r.cfg.subagents[0].prompt, "Build well.");
+    }
 
     fn origin(channel: &str) -> Origin {
         Origin {

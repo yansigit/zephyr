@@ -79,7 +79,8 @@ outcome "aborted"; one that starts with `say: `
 replies with the rest; `model?` replies with the current model.
 Models: `--list-models` (held while a `list_wait` file exists in the home) prints fake/m1, fake/m2, other/m3 and opencode-go/alpha, the catalogue `set_model` accepts
 (plus the started model);
-`set_model` switches to one of them and errors on anything else.
+`set_model` switches to one of them and errors on anything else, and on everything while a
+`model_refuse` file exists in the home.
 Sessions are laid out as rpi 0.18 lays them out (checked against the real binary): at start,
 <session-dir>/--<cwd, / as ->--/<ISO stamp>_<session-id>.jsonl with a header line
 {"kind": "header", "version": 4, "id", ...}, an empty `.lock` and a `.progress.jsonl` companion
@@ -388,7 +389,7 @@ def quick(cmd, s):
         respond(cmd, {"totalTokens": 0, "costTotal": 0.0})
     elif kind == "set_model":
         want = "%s/%s" % (cmd.get("provider"), cmd.get("modelId"))
-        if want in catalog:
+        if want in catalog and not os.path.exists("model_refuse"):
             model = want; respond(cmd, {"modelId": cmd.get("modelId"), "provider": cmd.get("provider")})
         else:
             respond(cmd, error="unknown model: %s" % cmd.get("modelId"))
