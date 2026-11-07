@@ -180,7 +180,14 @@ fn nested(name: &str, args: &[String]) -> Option<String> {
         let flag = args
             .iter()
             .position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'));
-        flag.and_then(|p| args.get(p + 1).cloned())
+        flag.and_then(|p| args.get(p + 1).cloned()).or_else(|| {
+            // `bash <<< 'script'`
+            let p = args.iter().position(|a| a.starts_with("<<<"))?;
+            match &args[p][3..] {
+                "" => args.get(p + 1).cloned(),
+                text => Some(text.to_string()),
+            }
+        })
     } else {
         None
     }
@@ -306,6 +313,9 @@ pub struct Gated {
 pub const UNKNOWN: &str = "unknown";
 
 /// Whether a `bash`/`exec` command or an `mcp_call` is a message, a post or a payment.
+///
+/// Non-goal (spec A1 §2): elaborate obfuscation (encoded scripts, scripts written to a file and
+/// run later, interpreters other than the shells) is not looked into.
 /// `classes(server, tool)` is the owner's per-connector table: `Some(Some(c))` puts the tool in a
 /// class, `Some(None)` takes it out of all, `None` leaves the verb rule.
 pub fn gated(
@@ -444,33 +454,89 @@ fn verb_class(tool: &str) -> Option<Class> {
     }
 }
 
+type Item = (Class, Vec<String>, String);
+
 /// (class, targets, summary) for each stage of `command` that sends, posts or pays.
-fn gated_command(command: &str, depth: usize) -> Vec<(Class, Vec<String>, String)> {
+///
+/// R26: nothing is hidden from this scan. The whole text is scanned, heredoc bodies and comments
+/// included, and each physical line again on its own, so a quoting trick the tokenizer misreads
+/// cannot swallow a send; over-gating is the safe direction. Heredocs are parsed only to read
+/// recipients, where any doubt gives `unknown`.
+fn gated_command(command: &str, depth: usize) -> Vec<Item> {
     let mut found = Vec::new();
     if depth > 4 {
         return found;
     }
-    let (text, heredocs) = extract_heredocs(command);
-    let heredoc = |a: &String| -> Option<&String> {
-        let k = a
-            .strip_prefix("<<__HEREDOC_")?
-            .strip_suffix("__")?
-            .parse::<usize>()
-            .ok()?;
-        heredocs.get(k)
+    let (text, heredocs) = mark_heredocs(command);
+    scan_stages(&text, &heredocs, depth, &mut found);
+    if text.trim_end().contains('\n') {
+        for line in text.lines() {
+            scan_stages(line, &heredocs, depth, &mut found);
+        }
+    }
+    found
+}
+
+/// The heredoc a `<<__HEREDOC_k__` word names.
+fn heredoc_of<'a>(heredocs: &'a [Heredoc], word: &str) -> Option<&'a Heredoc> {
+    let k = word
+        .strip_prefix("<<__HEREDOC_")?
+        .strip_suffix("__")?
+        .parse::<usize>()
+        .ok()?;
+    heredocs.get(k)
+}
+
+/// A word that redirects stdin from something other than a marked heredoc.
+fn other_stdin(word: &str) -> bool {
+    (word.starts_with('<') && !word.starts_with("<<__HEREDOC_")) || word.ends_with("<<")
+}
+
+fn scan_stages(text: &str, heredocs: &[Heredoc], depth: usize, found: &mut Vec<Item>) {
+    let all = stages(text);
+    let mut add = |item: Item| {
+        if !found.contains(&item) {
+            found.push(item);
+        }
     };
-    let all = stages(&text);
-    // The heredoc body `cat <<EOF |` feeds to the next stage, when the stage before it is that cat.
-    let fed = |i: usize| -> Option<&String> {
+    // The text the stage before `i` pipes in, when it is a plain `echo`/`printf`.
+    let echoed = |i: usize| -> Option<String> {
         let prev = all.get(i.checked_sub(1)?)?;
-        if !prev.piped {
-            return None;
-        }
         let words = command_words(&prev.words)?;
-        if basename(&words[0]) != "cat" {
+        if !prev.piped || !["echo", "printf"].contains(&basename(&words[0])) {
             return None;
         }
-        words[1..].iter().find_map(heredoc)
+        let text: Vec<&str> = words[1..]
+            .iter()
+            .map(String::as_str)
+            .skip_while(|w| w.starts_with('-'))
+            .collect();
+        // printf's first word is a format; with a `%` in it the text is in the words after it
+        let text = match text.split_first() {
+            Some((f, rest)) if basename(&words[0]) == "printf" && f.contains('%') => rest.to_vec(),
+            _ => text,
+        };
+        Some(text.join(" "))
+    };
+    // The heredoc of a `cat` (no file operands, or only `-`) piped directly into stage `i`.
+    let fed = |i: usize| -> Option<&Heredoc> {
+        let prev = all.get(i.checked_sub(1)?)?;
+        let words = command_words(&prev.words)?;
+        if !prev.piped || basename(&words[0]) != "cat" {
+            return None;
+        }
+        let rest = &words[1..];
+        if rest.iter().any(|w| other_stdin(w)) {
+            return None;
+        }
+        let operands = rest
+            .iter()
+            .filter(|w| !w.starts_with('-') || w.len() == 1)
+            .filter(|w| heredoc_of(heredocs, w).is_none() && w.as_str() != "-");
+        if operands.count() > 0 {
+            return None;
+        }
+        rest.iter().find_map(|w| heredoc_of(heredocs, w))
     };
     for (si, stage) in all.iter().enumerate() {
         let Some(words) = command_words(&stage.words) else {
@@ -479,23 +545,43 @@ fn gated_command(command: &str, depth: usize) -> Vec<(Class, Vec<String>, String
         let name = basename(&words[0]);
         let args = &words[1..];
         if let Some(script) = nested(name, args) {
-            found.extend(gated_command(&script, depth + 1));
+            for item in gated_command(&script, depth + 1) {
+                add(item);
+            }
             continue;
         }
         if SHELLS.contains(&name) {
-            if let Some(body) = args.iter().find_map(heredoc).or_else(|| fed(si)) {
-                found.extend(gated_command(body, depth + 1));
-                continue;
+            if let Some(script) = echoed(si) {
+                for item in gated_command(&script, depth + 1) {
+                    add(item);
+                }
             }
         }
         if name == "himalaya" && himalaya_send(args) {
-            // Recipients come only from this stage: its `-H "To: ..."` arguments and the header
-            // block of a heredoc attached to it. A `To:` elsewhere in the command is the agent's
-            // own text and proves nothing about who this send goes to.
+            // Recipients come only from this stage's `-H "To: ..."` arguments, a heredoc attached
+            // to it, or a heredoc on a bare `cat` piped straight into it. A `To:` elsewhere in
+            // the command is the agent's own text and proves nothing about who this goes to.
             let mut to = Vec::new();
-            if let Some(body) = fed(si) {
-                for line in body.lines().take_while(|l| !l.trim().is_empty()) {
-                    header_emails(line, &mut to);
+            let mut doubt = false;
+            let mut sources: Vec<&Heredoc> = fed(si).into_iter().collect();
+            let own: Vec<&Heredoc> = args
+                .iter()
+                .filter_map(|a| heredoc_of(heredocs, a))
+                .collect();
+            if !own.is_empty() && args.iter().any(|a| other_stdin(a)) {
+                doubt = true; // a later redirect may override the heredoc
+            }
+            sources.extend(own);
+            if args
+                .iter()
+                .any(|a| a.starts_with("<<") && heredoc_of(heredocs, a).is_none())
+            {
+                doubt = true; // a heredoc operator the parser did not take
+            }
+            for h in sources {
+                match header_block(h) {
+                    Some(headers) => headers.iter().for_each(|l| header_emails(l, &mut to)),
+                    None => doubt = true,
                 }
             }
             for (i, a) in args.iter().enumerate() {
@@ -506,21 +592,16 @@ fn gated_command(command: &str, depth: usize) -> Vec<(Class, Vec<String>, String
                 if let Some(h) = header {
                     header_emails(h, &mut to);
                 }
-                if let Some(body) = heredoc(a) {
-                    for line in body.lines().take_while(|l| !l.trim().is_empty()) {
-                        header_emails(line, &mut to);
-                    }
-                }
             }
-            if to.is_empty() {
-                to.push(UNKNOWN.to_string());
+            if doubt || to.is_empty() {
+                to = vec![UNKNOWN.to_string()];
             }
             let summary = if to == [UNKNOWN] {
                 "email to unreadable recipients".to_string()
             } else {
                 format!("email to {}", to.join(", "))
             };
-            found.push((Class::Messages, to, summary));
+            add((Class::Messages, to, summary));
         } else if name == "gh" {
             if let Some(label) = gh_write(args) {
                 let repo = gh_repo(args).unwrap_or_else(|| UNKNOWN.to_string());
@@ -529,29 +610,65 @@ fn gated_command(command: &str, depth: usize) -> Vec<(Class, Vec<String>, String
                 } else {
                     format!("{label} on {repo}")
                 };
-                found.push((Class::Posts, vec![repo], summary));
+                add((Class::Posts, vec![repo], summary));
             }
         }
     }
-    found
 }
 
-/// Replaces each real heredoc operator with `<<__HEREDOC_k__` and returns the bodies, so a body
-/// is data attached to its own stage, not commands of the script. An operator is real only
-/// outside quotes and `((...))` arithmetic, with a delimiter word, and when a line equal to the
-/// delimiter follows; anything else stays in the text and is scanned like any other command.
-fn extract_heredocs(command: &str) -> (String, Vec<String>) {
+/// A heredoc found by [`mark_heredocs`].
+struct Heredoc {
+    body: String,
+    /// The delimiter was quoted or backslashed, so the shell does not expand the body.
+    quoted: bool,
+}
+
+/// The logical header lines (continuations, which start with a space or tab, folded into their
+/// header) of a heredoc's header block, the part before the first empty line. `None` when the
+/// block cannot be read with confidence: an unquoted delimiter with `$` or a backtick in it, or
+/// a whitespace-only line.
+fn header_block(h: &Heredoc) -> Option<Vec<String>> {
+    let mut headers: Vec<String> = Vec::new();
+    for line in h.body.lines() {
+        if line.is_empty() {
+            break;
+        }
+        if line.trim().is_empty() {
+            return None;
+        }
+        if line.starts_with([' ', '\t']) {
+            headers.last_mut()?.push_str(&format!(" {}", line.trim()));
+        } else {
+            headers.push(line.to_string());
+        }
+    }
+    let expands = |l: &String| l.contains(['$', '`']);
+    if !h.quoted && headers.iter().any(expands) {
+        return None;
+    }
+    Some(headers)
+}
+
+/// Replaces each plausible heredoc operator with `<<__HEREDOC_k__`, keeping every line of the
+/// text (bodies included, so they are scanned too), and returns the bodies. An operator counts
+/// only outside quotes, comments and `((...))`/`$[...]` arithmetic, with a delimiter word and a
+/// terminator line after it. The parse is approximate on purpose: it only feeds recipients,
+/// and a miss gives `unknown`.
+fn mark_heredocs(command: &str) -> (String, Vec<Heredoc>) {
     struct Op {
         start: usize,
         end: usize,
         delim: String,
         strip_tabs: bool,
+        quoted: bool,
     }
     let lines: Vec<&str> = command.split('\n').collect();
     let mut out = String::new();
-    let mut bodies: Vec<String> = Vec::new();
+    let mut bodies: Vec<Heredoc> = Vec::new();
+    // quote: ' " or A (an ANSI-C $'...' string, where a backslash escapes the quote)
     let mut quote: Option<char> = None;
     let mut arith = 0usize;
+    let mut bracket = 0usize;
     let mut idx = 0;
     while idx < lines.len() {
         let line = lines[idx];
@@ -562,23 +679,34 @@ fn extract_heredocs(command: &str) -> (String, Vec<String>) {
         while i < chars.len() {
             let (pos, c) = chars[i];
             let next = chars.get(i + 1).map(|x| x.1);
+            let prev = i.checked_sub(1).map(|j| chars[j].1);
             if let Some(q) = quote {
-                if c == '\\' && q == '"' {
+                if c == '\\' && q != '\'' {
                     i += 1;
-                } else if c == q {
+                } else if c == q || (q == 'A' && c == '\'') {
                     quote = None;
                 }
             } else if c == '\\' {
                 i += 1;
+            } else if c == '$' && next == Some('\'') {
+                quote = Some('A');
+                i += 1;
             } else if c == '\'' || c == '"' {
                 quote = Some(c);
+            } else if c == '$' && next == Some('[') {
+                bracket += 1;
+                i += 1;
+            } else if c == ']' && bracket > 0 {
+                bracket -= 1;
             } else if c == '(' && next == Some('(') {
                 arith += 1;
                 i += 1;
             } else if c == ')' && next == Some(')') && arith > 0 {
                 arith -= 1;
                 i += 1;
-            } else if c == '<' && next == Some('<') && arith == 0 {
+            } else if c == '#' && prev.is_none_or(|p| p.is_whitespace() || ";|&(".contains(p)) {
+                break; // a comment runs to the end of the line
+            } else if c == '<' && next == Some('<') && arith == 0 && bracket == 0 {
                 if chars.get(i + 2).map(|x| x.1) == Some('<') {
                     i += 2; // here-string
                 } else {
@@ -592,15 +720,16 @@ fn extract_heredocs(command: &str) -> (String, Vec<String>) {
                     let word = match q {
                         Some(q) => trimmed[1..]
                             .find(q)
-                            .map(|e| (&trimmed[1..1 + e], word_start + e + 2)),
+                            .map(|e| (&trimmed[1..1 + e], word_start + e + 2, true)),
                         None => {
                             let e = trimmed
                                 .find(|c: char| c.is_whitespace() || ";|&<>()".contains(c))
                                 .unwrap_or(trimmed.len());
-                            Some((&trimmed[..e], word_start + e))
+                            let w = &trimmed[..e];
+                            Some((w, word_start + e, w.starts_with('\\')))
                         }
                     };
-                    if let Some((delim, end)) = word {
+                    if let Some((delim, end, quoted)) = word {
                         let delim = delim.trim_start_matches('\\');
                         if !delim.is_empty() {
                             ops.push(Op {
@@ -608,8 +737,8 @@ fn extract_heredocs(command: &str) -> (String, Vec<String>) {
                                 end,
                                 delim: delim.to_string(),
                                 strip_tabs,
+                                quoted,
                             });
-                            // skip past the delimiter word
                             while i < chars.len() && chars[i].0 < end {
                                 i += 1;
                             }
@@ -621,10 +750,10 @@ fn extract_heredocs(command: &str) -> (String, Vec<String>) {
             }
             i += 1;
         }
-        // Take each operator's body, if its terminator line exists.
         let mut placed: Vec<Option<usize>> = Vec::new();
+        let mut body_end = idx;
         for op in &ops {
-            let found = (idx..lines.len()).find(|&j| {
+            let found = (body_end..lines.len()).find(|&j| {
                 let l = lines[j];
                 let t = if op.strip_tabs {
                     l.trim_start_matches('\t')
@@ -635,11 +764,14 @@ fn extract_heredocs(command: &str) -> (String, Vec<String>) {
             });
             match found {
                 Some(j) => {
-                    let mut body = lines[idx..j].join("\n");
+                    let mut body = lines[body_end..j].join("\n");
                     body.push('\n');
                     placed.push(Some(bodies.len()));
-                    bodies.push(body);
-                    idx = j + 1;
+                    bodies.push(Heredoc {
+                        body,
+                        quoted: op.quoted,
+                    });
+                    body_end = j + 1;
                 }
                 None => placed.push(None),
             }
@@ -654,6 +786,12 @@ fn extract_heredocs(command: &str) -> (String, Vec<String>) {
         }
         out.push_str(&line[at..]);
         out.push('\n');
+        // the bodies stay in the text, unparsed for quotes and operators
+        for l in &lines[idx..body_end] {
+            out.push_str(l);
+            out.push('\n');
+        }
+        idx = body_end;
     }
     (out, bodies)
 }
@@ -2145,9 +2283,9 @@ mod tests {
             let g = gbash(&cmd).unwrap_or_else(|| panic!("{cmd}"));
             assert_eq!(g.targets, vec!["a@b.org"], "{cmd}");
         }
-        // a terminated heredoc still hides its body: text inside is data
+        // R26: a terminated heredoc body is scanned too (over-gating is the safe direction)
         let g = gbash("cat <<EOF >note.txt\nhimalaya message send -H 'To: z@b.org' x\nEOF\nls");
-        assert!(g.is_none());
+        assert!(g.is_some());
     }
 
     #[test]
@@ -2198,5 +2336,72 @@ mod tests {
             let g = gbash(cmd).unwrap_or_else(|| panic!("{cmd}"));
             assert_eq!(g.targets, vec![UNKNOWN], "{cmd}");
         }
+    }
+
+    #[test]
+    fn nothing_hides_a_send_from_the_scan() {
+        let table = [
+            "echo hi # <<X\nhimalaya message send -H 'To: z@b.org' x\nX",
+            "echo $'\\' <<X'\nhimalaya message send -H 'To: z@b.org' x\nX'",
+            "echo $[1 <<X]\nhimalaya message send -H 'To: z@b.org' x\nX",
+            "cat <<EOF\n$(himalaya message send -H 'To: z@b.org' x)\nEOF",
+            "cat <<'EOF' >f\nhimalaya message send -H 'To: z@b.org' x\nEOF",
+        ];
+        for cmd in table {
+            let g = gbash(cmd).unwrap_or_else(|| panic!("{cmd}"));
+            assert_eq!(
+                (g.class, g.targets),
+                (Class::Messages, vec!["z@b.org".to_string()]),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn heredoc_recipients_are_read_only_when_they_cannot_be_faked() {
+        let unknown = vec![UNKNOWN.to_string()];
+        for cmd in [
+            "cat real.eml <<'EOF' | himalaya message send\nTo: known@x.org\n\nEOF",
+            "himalaya message send <<EOF\nTo: $ADDR\n\nhi\nEOF",
+            "himalaya message send <<EOF\nTo: `cat a`\n\nhi\nEOF",
+            "himalaya message send < evil.eml # <<X\nTo: known@x.org\n\nX",
+            "himalaya message send <<EOF < evil.eml\nTo: a@x.org\n\nEOF",
+            "himalaya message send <<EOF\nTo: a@x.org\n \nCc: b@x.org\n\nEOF",
+            "himalaya message send <<EOF\nTo: a@x.org\n\nno terminator",
+        ] {
+            assert_eq!(gbash(cmd).unwrap().targets, unknown, "{cmd}");
+        }
+        let g = gbash(
+            "himalaya message send <<'EOF'\nTo: known@x.org,\n z@evil.org\nCc: c@x.org\n\nhi\nEOF",
+        )
+        .unwrap();
+        assert_eq!(g.targets, vec!["known@x.org", "z@evil.org", "c@x.org"]);
+        // a quoted delimiter may carry $ in the header block; cat with only `-` is still cat
+        let g = gbash("cat - <<'EOF' | himalaya message send\nTo: a@x.org\nSubject: $5\n\nEOF")
+            .unwrap();
+        assert_eq!(g.targets, vec!["a@x.org"]);
+    }
+
+    #[test]
+    fn shell_feeding_forms_are_classified() {
+        let send = "himalaya message send -H \"To: a@b.org\" x";
+        for cmd in [
+            format!("bash <<< '{send}'"),
+            format!("sh <<<'{send}'"),
+            format!("echo '{send}' | bash"),
+            format!("printf '%s' '{send}' | sh"),
+            format!("echo -e '{send}' | dash"),
+        ] {
+            let g = gbash(&cmd).unwrap_or_else(|| panic!("{cmd}"));
+            assert_eq!(
+                (g.class, g.targets),
+                (Class::Messages, vec!["a@b.org".to_string()]),
+                "{cmd}"
+            );
+        }
+        assert!(matches!(
+            check_bash("bash <<< 'rm -rf /'"),
+            Decision::Deny(_)
+        ));
     }
 }
