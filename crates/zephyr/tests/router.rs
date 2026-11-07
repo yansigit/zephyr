@@ -1852,6 +1852,57 @@ async fn the_agent_adds_a_fact_at_once_but_only_a_strong_ok_removes_it() {
     gw.shutdown().await;
 }
 
+#[tokio::test]
+async fn the_agent_reads_fact_names_and_no_value_reaches_the_audit() {
+    const PHONE: &str = "+1 555 010 2345";
+    let home = home("facts-audit");
+    let gw = start(on_file_with_discord(&home, ""));
+    let saw = |what: &str| gw.replies_on("chat").iter().any(|r| r.contains(what));
+    gw.say(
+        "m1",
+        "owner",
+        &format!(r#"[call gateway {{"command": "/facts add phone digits {PHONE}"}}] note it"#),
+    )
+    .await;
+    wait(|| saw("gateway: saved the private fact phone")).await;
+    // A malformed add (a bad name) is refused, and is audited without its value too.
+    gw.say(
+        "m2",
+        "owner",
+        r#"[call gateway {"command": "/facts add Phone text secret-value-9"}] again"#,
+    )
+    .await;
+    gw.say("m3", "owner", "/facts allow-not-a-thing").await;
+    gw.say("m4", "owner", "/facts allow phone mum@example.com")
+        .await;
+    gw.say(
+        "m5",
+        "owner",
+        r#"[call gateway {"command": "/facts"}] list"#,
+    )
+    .await;
+    wait(|| saw("gateway: private facts:\nphone (digits)")).await;
+    let read = (gw.replies_on("chat").into_iter())
+        .find(|r| r.contains("gateway: private facts:"))
+        .unwrap();
+    assert!(
+        !read.contains("mum@example.com") && !read.contains("allow"),
+        "{read}"
+    );
+    let rows = Store::open(&home.join("state.db"))
+        .unwrap()
+        .audit_rows()
+        .unwrap();
+    assert!(rows.iter().any(|r| r.1 == "gateway"), "{rows:?}");
+    let all = format!("{rows:?}");
+    assert!(
+        !all.contains("555") && !all.contains("secret-value"),
+        "{all}"
+    );
+    assert!(all.contains("/facts add phone digits [value]"), "{all}");
+    gw.shutdown().await;
+}
+
 const NO_PROPOSAL: &str = "[zephyr] no proposal #1 is waiting";
 
 #[tokio::test]

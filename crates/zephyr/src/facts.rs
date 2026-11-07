@@ -136,22 +136,95 @@ fn digits_of(s: &str) -> String {
     s.nfkc().filter(char::is_ascii_digit).collect()
 }
 
-/// Whether `c` can sit between the digits of one written number.
-fn separator(c: char) -> bool {
-    matches!(c, ' ' | '-' | '.' | '(' | ')' | '/' | '\u{a0}')
+/// One character of a text, with the byte range of the original it stands for.
+type Piece = (char, usize, usize);
+
+/// The characters of `text` as they are.
+fn raw(text: &str) -> Vec<Piece> {
+    text.char_indices()
+        .map(|(i, c)| (c, i, i + c.len_utf8()))
+        .collect()
 }
 
-/// The digit runs in `text`, as (byte start, byte end, digits): a run is digits with the
+/// `text` percent-decoded, with `+` as a space (a form body); each decoded character keeps the
+/// range of the `%XX` bytes it came from. `None` when there is nothing to decode.
+fn decoded(text: &str) -> Option<Vec<Piece>> {
+    let b = text.as_bytes();
+    let hex = |i: usize| -> Option<u8> {
+        let h = std::str::from_utf8(b.get(i..i + 2)?).ok()?;
+        u8::from_str_radix(h, 16).ok()
+    };
+    let (mut bytes, mut at, mut i) = (Vec::new(), Vec::new(), 0);
+    while i < b.len() {
+        match b[i] {
+            b'%' if hex(i + 1).is_some() => {
+                bytes.push(hex(i + 1).unwrap_or(0));
+                at.push((i, i + 3));
+                i += 3;
+            }
+            b'+' => {
+                bytes.push(b' ');
+                at.push((i, i + 1));
+                i += 1;
+            }
+            c => {
+                bytes.push(c);
+                at.push((i, i + 1));
+                i += 1;
+            }
+        }
+    }
+    if bytes == b {
+        return None;
+    }
+    let (mut out, mut pos) = (Vec::new(), 0);
+    for chunk in bytes.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            let n = c.len_utf8();
+            out.push((c, at[pos].0, at[pos + n - 1].1));
+            pos += n;
+        }
+        for _ in chunk.invalid() {
+            out.push(('\u{fffd}', at[pos].0, at[pos].1));
+            pos += 1;
+        }
+    }
+    Some(out)
+}
+
+/// `view` after NFKC, lower case and collapsing runs of whitespace to one space; a character
+/// keeps the range it came from, so a match maps back to the text it was found in.
+fn folded(view: &[Piece]) -> Vec<Piece> {
+    let mut out: Vec<Piece> = Vec::new();
+    for &(c, from, to) in view {
+        for n in c.to_string().nfkc().flat_map(char::to_lowercase) {
+            match (n.is_whitespace(), out.last_mut()) {
+                (true, Some(last)) if last.0 == ' ' => last.2 = to,
+                (true, _) => out.push((' ', from, to)),
+                (false, _) => out.push((n, from, to)),
+            }
+        }
+    }
+    out
+}
+
+/// Whether `c` (after NFKC) can sit between the digits of one written number: spaces, tabs,
+/// slashes, dots, brackets and every kind of dash.
+fn separator(c: char) -> bool {
+    c.to_string().nfkc().all(|n| {
+        n.is_whitespace()
+            || matches!(
+                n,
+                '-' | '.' | '(' | ')' | '/' | '\u{2010}'..='\u{2015}' | '\u{2212}'
+            )
+    })
+}
+
+/// The digit runs in `view` as (byte start, byte end, digits): a run is digits with the
 /// separators phone numbers and card numbers are written with between them.
-fn runs(text: &str) -> Vec<(usize, usize, String)> {
+fn runs(view: &[Piece]) -> Vec<(usize, usize, String)> {
     let digit = |c: char| -> Option<char> {
-        let mut it = c
-            .to_string()
-            .nfkc()
-            .collect::<String>()
-            .chars()
-            .collect::<Vec<_>>()
-            .into_iter();
+        let mut it = c.to_string().nfkc().collect::<Vec<_>>().into_iter();
         match (it.next(), it.next()) {
             (Some(d), None) if d.is_ascii_digit() => Some(d),
             _ => None,
@@ -159,13 +232,13 @@ fn runs(text: &str) -> Vec<(usize, usize, String)> {
     };
     let mut out = Vec::new();
     let mut cur: Option<(usize, usize, String)> = None;
-    for (i, c) in text.char_indices() {
+    for &(c, from, to) in view {
         match (digit(c), &mut cur) {
             (Some(d), Some(run)) => {
-                run.1 = i + c.len_utf8();
+                run.1 = to;
                 run.2.push(d);
             }
-            (Some(d), None) => cur = Some((i, i + c.len_utf8(), d.to_string())),
+            (Some(d), None) => cur = Some((from, to, d.to_string())),
             (None, Some(_)) if separator(c) => {}
             (None, _) => out.extend(cur.take()),
         }
@@ -174,52 +247,23 @@ fn runs(text: &str) -> Vec<(usize, usize, String)> {
     out
 }
 
-/// Whether the digits `run` are the digits `value` written another way: the same, inside a
-/// longer number, or the number without its country code (up to three digits).
+/// `digits` without the zeros a national number starts with (the trunk prefix), when at least
+/// the minimum is left.
+fn untrunked(digits: &str) -> &str {
+    let t = digits.trim_start_matches('0');
+    if t.len() >= MIN_DIGITS {
+        t
+    } else {
+        digits
+    }
+}
+
+/// Whether the digits `run` are the digits `value` written another way: one inside the other, or
+/// one the other with a country code (up to three digits) in front, trunk zeros aside
+/// (`+82 10…` is `010…`).
 fn same_number(value: &str, run: &str) -> bool {
-    run.contains(value)
-        || (run.len() >= MIN_DIGITS && run.len() + 3 >= value.len() && value.ends_with(run))
-}
-
-/// `value` percent-encoded, with a space as `%20` and as `+`, lower case: how it sits in a URL
-/// or a form body.
-fn encoded_forms(value: &str) -> Vec<String> {
-    let enc = |plus: bool| -> String {
-        let mut out = String::new();
-        for b in value.nfkc().collect::<String>().bytes() {
-            match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    out.push(b as char)
-                }
-                b' ' if plus => out.push('+'),
-                _ => out.push_str(&format!("%{b:02x}")),
-            }
-        }
-        out.to_lowercase()
-    };
-    let mut forms = vec![enc(false)];
-    if value.contains(' ') {
-        forms.push(enc(true));
-    }
-    forms.retain(|f| f != &value.to_lowercase());
-    forms
-}
-
-/// `s` as (character, start byte, end byte in `s`) after NFKC, lower case and collapsing runs of
-/// whitespace to one space, so a match in it maps back to the text it came from.
-fn folded(s: &str) -> Vec<(char, usize, usize)> {
-    let mut out: Vec<(char, usize, usize)> = Vec::new();
-    for (i, c) in s.char_indices() {
-        let end = i + c.len_utf8();
-        for n in c.to_string().nfkc().flat_map(char::to_lowercase) {
-            match (n.is_whitespace(), out.last_mut()) {
-                (true, Some(last)) if last.0 == ' ' => last.2 = end,
-                (true, _) => out.push((' ', i, end)),
-                (false, _) => out.push((n, i, end)),
-            }
-        }
-    }
-    out
+    let (v, r) = (untrunked(value), untrunked(run));
+    r.contains(v) || (r.len() >= MIN_DIGITS && v.ends_with(r) && v.len() <= r.len() + 3)
 }
 
 /// Whether the fact's value is long enough to be looked for at all.
@@ -242,39 +286,41 @@ fn spans(f: &Fact, text: &str) -> Vec<(usize, usize)> {
         return Vec::new();
     }
     let mut out = Vec::new();
-    if f.kind == FactKind::Digits {
-        let value = digits_of(&f.value);
-        for (a, b, run) in runs(text) {
-            if same_number(&value, &run) {
-                out.push((a, b));
-            }
-        }
-    }
     // The value as written, in the text's own terms: case, spacing and Unicode forms ignored.
     let pattern: Vec<char> = {
-        let p: Vec<char> = folded(&f.value).into_iter().map(|(c, ..)| c).collect();
+        let p: Vec<char> = folded(&raw(&f.value))
+            .into_iter()
+            .map(|(c, ..)| c)
+            .collect();
         let (from, to) = (
             p.iter().position(|c| *c != ' ').unwrap_or(p.len()),
             p.iter().rposition(|c| *c != ' ').map_or(0, |i| i + 1),
         );
         p[from..to.max(from)].to_vec()
     };
-    let hay = folded(text);
-    if !pattern.is_empty() && hay.len() >= pattern.len() {
-        for at in 0..=hay.len() - pattern.len() {
-            if hay[at..at + pattern.len()]
-                .iter()
-                .zip(&pattern)
-                .all(|(h, p)| h.0 == *p)
-            {
-                out.push((hay[at].1, hay[at + pattern.len() - 1].2));
+    let value = digits_of(&f.value);
+    // The text as it is, and percent-decoded (a URL, a form body).
+    let views = std::iter::once(raw(text)).chain(decoded(text));
+    for view in views {
+        if f.kind == FactKind::Digits {
+            for (a, b, run) in runs(&view) {
+                if same_number(&value, &run) {
+                    out.push((a, b));
+                }
             }
         }
-    }
-    // Percent-encoded: hex digits in either case, so compare lower case (ASCII keeps offsets).
-    let lower = text.to_ascii_lowercase();
-    for form in encoded_forms(&f.value) {
-        out.extend(lower.match_indices(&form).map(|(i, m)| (i, i + m.len())));
+        let hay = folded(&view);
+        if !pattern.is_empty() && hay.len() >= pattern.len() {
+            for at in 0..=hay.len() - pattern.len() {
+                if hay[at..at + pattern.len()]
+                    .iter()
+                    .zip(&pattern)
+                    .all(|(h, p)| h.0 == *p)
+                {
+                    out.push((hay[at].1, hay[at + pattern.len() - 1].2));
+                }
+            }
+        }
     }
     for form in crate::vault::base64_forms(&f.value) {
         out.extend(text.match_indices(&form).map(|(i, m)| (i, i + m.len())));
@@ -294,7 +340,8 @@ pub fn found<'a>(facts: &'a [Fact], text: &str, target: Option<&str>) -> Vec<&'a
     names
 }
 
-/// `text` with each fact found in it replaced by `[fact:NAME]`, for audit rows and notices.
+/// `text` with each fact found in it replaced by `[fact:NAME]`, for audit rows and notices. A
+/// fact overlapping another one's span is covered with it: no part of either is left.
 pub fn scrub(facts: &[Fact], text: &str) -> String {
     let mut marks: Vec<(usize, usize, &str)> = Vec::new();
     for f in facts {
@@ -304,11 +351,12 @@ pub fn scrub(facts: &[Fact], text: &str) -> String {
                 .map(|(a, b)| (a, b, f.name.as_str())),
         );
     }
-    // Leftmost first, the longest of those starting together; a span inside another is dropped.
+    // Leftmost first, the longest of those starting together.
     marks.sort_by_key(|&(a, b, _)| (a, std::cmp::Reverse(b)));
     let (mut out, mut at) = (String::new(), 0);
     for (a, b, name) in marks {
         if a < at {
+            at = at.max(b);
             continue;
         }
         out.push_str(&text[at..a]);
@@ -317,6 +365,41 @@ pub fn scrub(facts: &[Fact], text: &str) -> String {
     }
     out.push_str(&text[at..]);
     out
+}
+
+/// A `gateway` command with the value of a `/facts add NAME KIND VALUE` replaced by `[value]`,
+/// well-formed or not: for the audit and the log, which must never hold a value.
+pub fn redact(command: &str) -> String {
+    let Some(rest) = command.strip_prefix("/facts add") else {
+        return command.into();
+    };
+    let kept: Vec<&str> = rest.split(' ').filter(|w| !w.is_empty()).take(2).collect();
+    match kept.is_empty() {
+        true => "/facts add [value]".into(),
+        false => format!("/facts add {} [value]", kept.join(" ")),
+    }
+}
+
+/// `text` with the facts as they are now scrubbed out. Fails closed, as `vault::scrubbed` does.
+pub fn scrubbed(cfg: &Config, text: String) -> String {
+    match load(&path(cfg)) {
+        Ok(facts) => scrub(&facts, &text),
+        Err(_) => "[output withheld: the private facts could not be read]".into(),
+    }
+}
+
+/// Names and kinds, no value and no target: what the agent may read.
+pub fn names(facts: &[Fact]) -> String {
+    match facts.is_empty() {
+        true => "no private facts saved".into(),
+        false => {
+            let lines: Vec<String> = facts
+                .iter()
+                .map(|f| format!("{} ({})", f.name, f.kind.key()))
+                .collect();
+            format!("private facts:\n{}", lines.join("\n"))
+        }
+    }
 }
 
 // ---- the file ----
@@ -622,6 +705,105 @@ mod tests {
         assert_eq!(found(&facts, text, None), ["mail"]);
         assert_eq!(found(&facts, text, Some("someone@else.org")), ["mail"]);
         assert!(found(&facts, text, Some("me@example.com")).is_empty());
+    }
+
+    #[test]
+    fn trunk_prefixes_and_country_codes_match_both_ways() {
+        let local = [fact("phone", FactKind::Digits, "010-1234-5678")];
+        let intl = [fact("phone", FactKind::Digits, "+82 10-1234-5678")];
+        assert_eq!(found(&local, "call +82 10-1234-5678", None), ["phone"]);
+        assert_eq!(found(&local, "call +82 (0)10 1234 5678", None), ["phone"]);
+        assert_eq!(found(&intl, "call 010-1234-5678", None), ["phone"]);
+        let uk_local = [fact("uk", FactKind::Digits, "020 7946 0958")];
+        let uk_intl = [fact("uk", FactKind::Digits, "+44 20 7946 0958")];
+        assert_eq!(found(&uk_local, "+44 20 7946 0958", None), ["uk"]);
+        assert_eq!(found(&uk_intl, "020 7946 0958", None), ["uk"]);
+        assert!(found(&local, "010-1234-5679", None).is_empty());
+        assert!(found(&uk_intl, "7946 0958", None).is_empty());
+    }
+
+    #[test]
+    fn dashes_and_full_width_separators_match() {
+        let phone = [fact("phone", FactKind::Digits, "5550102345")];
+        for text in [
+            "５５５－０１０－２３４５",
+            "555\u{2013}010\u{2013}2345",
+            "555\u{2010}010\u{2011}2345",
+            "555\u{2212}010\u{2212}2345",
+            "555\t010\t2345",
+            "555\u{3000}010\u{3000}2345",
+        ] {
+            assert_eq!(found(&phone, text, None), ["phone"], "{text:?}");
+        }
+        assert_eq!(
+            scrub(&phone, "tel ５５５－０１０－２３４５ ok"),
+            "tel [fact:phone] ok"
+        );
+    }
+
+    #[test]
+    fn partly_encoded_text_and_form_bodies_match() {
+        let facts = [
+            fact("addr", FactKind::Text, "12 Elm Street, Springfield"),
+            fact("phone", FactKind::Digits, "5550102345"),
+        ];
+        for text in [
+            "q=12%20Elm%20Street,%20Springfield",
+            "q=12+Elm+Street%2C+Springfield&x=1",
+            "q=12%20elm%20street%2c%20springfield",
+        ] {
+            assert_eq!(found(&facts, text, None), ["addr"], "{text}");
+        }
+        for text in [
+            "phone=555%20010%202345",
+            "phone=555+010+2345",
+            "p=555%2D010%2D2345",
+        ] {
+            assert_eq!(found(&facts, text, None), ["phone"], "{text}");
+        }
+        // The original bytes are what is replaced.
+        assert_eq!(
+            scrub(&facts, "a=1&phone=555+010+2345&b=2"),
+            "a=1&phone=[fact:phone]&b=2"
+        );
+        assert_eq!(
+            scrub(&facts, "q=12%20Elm%20Street,%20Springfield!"),
+            "q=[fact:addr]!"
+        );
+    }
+
+    #[test]
+    fn overlapping_facts_leave_no_part_of_either() {
+        let facts = [
+            fact("a", FactKind::Text, "12 Elm Street"),
+            fact("b", FactKind::Text, "Elm Street, Springfield"),
+        ];
+        let out = scrub(&facts, "x 12 Elm Street, Springfield y");
+        assert!(
+            !out.contains("Elm") && !out.contains("Springfield"),
+            "{out}"
+        );
+        assert!(out.starts_with("x [fact:") && out.ends_with(" y"), "{out}");
+    }
+
+    #[test]
+    fn a_facts_add_is_redacted_to_name_and_kind() {
+        for (cmd, want) in [
+            (
+                "/facts add phone digits +1 555 010 2345",
+                "/facts add phone digits [value]",
+            ),
+            (
+                "/facts add Phone text a\tb",
+                "/facts add Phone text [value]",
+            ),
+            ("/facts add phone", "/facts add phone [value]"),
+            ("/facts add", "/facts add [value]"),
+            ("/facts rm phone", "/facts rm phone"),
+            ("/status", "/status"),
+        ] {
+            assert_eq!(redact(cmd), want, "{cmd}");
+        }
     }
 
     #[test]

@@ -23,7 +23,8 @@ pub const MAX_FILE: u64 = 10 * 1024 * 1024;
 /// the owner's card shows: what `/ok` applies is never more than the card showed.
 pub const CARD_CHARS: usize = 1500;
 
-/// The read-only slash commands the agent may run through `gateway`. The owner's approvals
+/// The read-only slash commands the agent may run through `gateway` (`/facts` answers names and
+/// kinds only). The owner's approvals
 /// (`/memory ok`, `/job ok`, `/login`, `/resume`, `/ok`) stay out, so injected text
 /// cannot approve itself (DESIGN §4.5, §4.6). The daemon checks [`gateway_kind`] again.
 pub const GATEWAY_COMMANDS: &[&str] = &[
@@ -36,6 +37,7 @@ pub const GATEWAY_COMMANDS: &[&str] = &[
     "/job list",
     "/settings",
     "/approvals",
+    "/facts",
 ];
 
 /// What a `gateway` command is to the agent.
@@ -1199,7 +1201,6 @@ mod tests {
             "/task parallel 32",
             "/task model p/m",
             // Facts: the owner's `/facts list`, `disallow` and the shapes below stay theirs.
-            "/facts",
             "/facts list",
             "/facts add",
             "/facts add phone digits",
@@ -1223,6 +1224,7 @@ mod tests {
 
     #[test]
     fn gateway_facts_forms_are_proposals_of_exact_shapes() {
+        assert_eq!(gateway_kind("/facts"), Some(Gateway::Read));
         for facts in [
             "/facts add phone digits +1 555 010 2345",
             "/facts add home-address text 12 Elm Street, Springfield",

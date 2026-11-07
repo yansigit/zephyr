@@ -847,7 +847,9 @@ impl<'a> Router<'a> {
         use zephyr_policy::tools::Gateway;
         match zephyr_policy::tools::gateway_kind(command) {
             None => {
-                eprintln!("zephyr: gateway {command:?} is not on the list; not run");
+                // A malformed `/facts add` holds a value: never in the log.
+                let shown = crate::facts::redact(command);
+                eprintln!("zephyr: gateway {shown:?} is not on the list; not run");
                 return None;
             }
             // Subagents and rules are settings: proposed through `set_setting`, so the card and
@@ -870,6 +872,8 @@ impl<'a> Router<'a> {
             "/status" => self.status(),
             "/model" => self.models(),
             "/switch" => self.list_sessions(),
+            "/facts" => (crate::facts::load(&crate::facts::path(&self.cfg)))
+                .map_or_else(|e| format!("{e:#}"), |f| crate::facts::names(&f)),
             "/approvals" => format!("[zephyr] {}", crate::approvals::effective(&self.cfg).line()),
             settings if settings.starts_with("/settings") => {
                 self.settings_listing(settings["/settings".len()..].trim())
@@ -1716,7 +1720,14 @@ impl<'a> Router<'a> {
         // The agent's files and proposed jobs, after the reply they belong to.
         crate::tools::apply(&self.store, &self.cfg, &tally.requests, to.clone());
         // After the reply, so the owner reads what was sent out next to what it was for.
-        let mut notices: Vec<String> = [cut, tally.alert(), memory].into_iter().flatten().collect();
+        let mut notices: Vec<String> = [
+            cut,
+            tally.alert().map(|a| crate::facts::scrubbed(&self.cfg, a)),
+            memory,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         // Skill and connector drafts the run wrote, each shown once (DESIGN §4.6).
         notices.extend(crate::drafts::scan(&self.cfg));
         if crossed {
@@ -3426,7 +3437,7 @@ impl<'a> Router<'a> {
             log(self.record_spend(tally.used).map(drop));
             let to = self.store.last_owner().ok().flatten();
             crate::tools::apply(&self.store, &self.cfg, &tally.requests, to);
-            if let Some(alert) = tally.alert() {
+            if let Some(alert) = tally.alert().map(|a| crate::facts::scrubbed(&self.cfg, a)) {
                 log(self.store.notify_last_owner(&alert).map_err(Into::into));
             }
         }

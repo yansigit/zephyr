@@ -398,7 +398,7 @@ async fn attempt_once(
         },
         false => (status, text),
     };
-    if let Some(alert) = tally.alert() {
+    if let Some(alert) = tally.alert().map(|a| crate::facts::scrubbed(cfg, a)) {
         if let Err(e) = store.notify(&spec.to.0, &spec.to.1, &alert) {
             eprintln!("zephyr: outbound notice failed: {e}");
         }
@@ -522,7 +522,18 @@ pub(crate) fn audit(store: &Store, cfg: &Config, session: &str, ev: &serde_json:
                 zephyr_policy::policy::Decision::Deny(_)
             );
             let outcome = if refused { "refused" } else { "started" };
-            (crate::vault::scrubbed(cfg, ev["args"].to_string()), outcome)
+            // A fact's value is saved only after this runs: redact the `/facts add` itself.
+            let mut args = ev["args"].clone();
+            if tool == "gateway" {
+                if let Some(c) = args["command"]
+                    .as_str()
+                    .filter(|c| c.starts_with("/facts add"))
+                {
+                    args["command"] = crate::facts::redact(c).into();
+                }
+            }
+            let text = crate::vault::scrubbed(cfg, args.to_string());
+            (crate::facts::scrubbed(cfg, text), outcome)
         }
         Some("tool_execution_end") if ev["isError"] == true => (String::new(), "error"),
         _ => return,
