@@ -1296,3 +1296,21 @@ async fn decide_applies_a_strong_proposal_that_a_weak_channel_cannot() {
     );
     gw.shutdown().await;
 }
+
+/// A numeric time limit is refused, never read as a permanent change.
+#[tokio::test]
+async fn settings_set_refuses_a_numeric_time_limit() {
+    let gw = start("settings-until");
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    let before = std::fs::read(gw.home.join("zephyr.toml")).unwrap();
+    let params = json!({"key": "tasks.parallel", "value": "3", "until": 7200});
+    let got = c.call("zephyr.settings_set", params).await;
+    assert_eq!(got["error"]["code"], -32602, "{got}");
+    assert!(
+        got["error"]["message"].as_str().unwrap().contains("until"),
+        "{got}"
+    );
+    assert_eq!(std::fs::read(gw.home.join("zephyr.toml")).unwrap(), before);
+    gw.shutdown().await;
+}
