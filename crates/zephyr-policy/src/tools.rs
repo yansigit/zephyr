@@ -19,8 +19,12 @@ use std::time::{Duration, Instant};
 /// Discord's upload limit for a bot in a server without boosts, and so the cap for every channel.
 pub const MAX_FILE: u64 = 10 * 1024 * 1024;
 
+/// The most characters of a subagent's or rule's text the agent may propose, and of any proposal
+/// the owner's card shows: what `/ok` applies is never more than the card showed.
+pub const CARD_CHARS: usize = 1500;
+
 /// The read-only slash commands the agent may run through `gateway`. The owner's approvals
-/// (`/memory ok`, `/job ok`, `/rule`, `/login`, `/resume`, `/ok`) stay out, so injected text
+/// (`/memory ok`, `/job ok`, `/login`, `/resume`, `/ok`) stay out, so injected text
 /// cannot approve itself (DESIGN §4.5, §4.6). The daemon checks [`gateway_kind`] again.
 pub const GATEWAY_COMMANDS: &[&str] = &[
     "/status",
@@ -53,7 +57,7 @@ fn ascii_word(s: &str) -> bool {
 /// Free text the owner reads on a card: one line, no control or direction-changing characters.
 fn plain_text(s: &str) -> bool {
     !s.trim().is_empty()
-        && s.len() <= 2000
+        && s.chars().count() <= CARD_CHARS
         && !s.chars().any(|c| {
             c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
         })
@@ -109,6 +113,8 @@ pub fn gateway_kind(command: &str) -> Option<Gateway> {
             return words.then_some(Gateway::Read);
         }
         "/set" => return set_shape(arg).then_some(Gateway::Set),
+        // The card shows the whole command, `/rule ` and all, in CARD_CHARS.
+        "/subagent" | "/rule" if command.chars().count() > CARD_CHARS => return None,
         "/subagent" => return subagent_shape(arg).then_some(Gateway::Propose),
         "/rule" => return plain_text(arg).then_some(Gateway::Propose),
         _ => {}
@@ -492,7 +498,7 @@ pub fn gateway(params: &Value) -> Result<String, String> {
         return Err(format!(
             "{command} is not available to the agent; it can run {}, and propose \
              /model PROVIDER/MODEL, /new, /switch ID, /pause or /reload; /settings and /set KEY \
-             VALUE [for D] read and change settings; /subagent and /rule changes are proposed",
+             VALUE [for D] read and change settings; /subagent and /rule changes are proposed, in at most {CARD_CHARS} characters",
             GATEWAY_COMMANDS.join(", ")
         ));
     }
@@ -1226,6 +1232,14 @@ mod tests {
         ] {
             assert_eq!(gateway_kind(never), None, "{never:?}");
         }
+        let rule = |n: usize| format!("/rule {}", "é".repeat(n));
+        assert_eq!(rule(1494).chars().count(), CARD_CHARS);
+        assert_eq!(gateway_kind(&rule(1494)), Some(Gateway::Propose));
+        assert_eq!(gateway_kind(&rule(1495)), None);
+        assert_eq!(gateway_kind(&rule(1600)), None);
+        let sub = |n: usize| format!("/subagent add a {}", "é".repeat(n));
+        assert_eq!(gateway_kind(&sub(1484)), Some(Gateway::Propose));
+        assert_eq!(gateway_kind(&sub(1485)), None);
         let long = format!("/set tasks.model {}", "a".repeat(201));
         assert_eq!(gateway_kind(&long), None);
         assert!(gateway(&json!({ "command": "/set tasks.parallel 1" })).is_ok());

@@ -882,7 +882,14 @@ impl<'a> Router<'a> {
                 Some(parts) => parts,
                 None => return "refused: usage /set KEY VALUE [for D]".into(),
             },
-            // `/rule rm 2` and `/subagent add …` are the list settings' own values.
+            // `/rule rm 2` and `/subagent add …` are the list settings' own values, shown whole
+            // on the owner's card.
+            _ if command.chars().count() > zephyr_policy::tools::CARD_CHARS => {
+                return format!(
+                    "refused: the text is longer than the owner's card shows ({} characters)",
+                    zephyr_policy::tools::CARD_CHARS
+                )
+            }
             other => (other.trim_start_matches('/'), arg, None),
         };
         let until = match until

@@ -1932,6 +1932,42 @@ async fn the_agent_proposes_a_subagent_and_the_card_shows_its_prompt() {
 }
 
 #[tokio::test]
+async fn proposed_text_is_capped_at_what_the_card_shows() {
+    let home = home("gateway-card-cap");
+    let gw = start(on_file(&home, ""));
+    // 10 for "/subagent " and 18 for "add scout fake/m2 " leave 1472 characters of prompt.
+    let fits = format!("{}Z", "p".repeat(1471));
+    let cmd = format!("/subagent add scout fake/m2 {fits}");
+    assert_eq!(cmd.chars().count(), 1500);
+    gw.say(
+        "m1",
+        "owner",
+        &format!(r#"[call gateway {{"command": "{cmd}"}}] go"#),
+    )
+    .await;
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        replies
+            .iter()
+            .any(|r| r.contains("proposes #1:") && r.contains(&format!("{fits}\n"))),
+        "the card shows it whole: {replies:?}"
+    );
+    let over = format!("/rule {}", "r".repeat(1600));
+    gw.say(
+        "m2",
+        "owner",
+        &format!(r#"[call gateway {{"command": "{over}"}}] again"#),
+    )
+    .await;
+    let replies = gw.wait_replies(3).await;
+    assert!(
+        !replies[2..].iter().any(|r| r.contains("proposes #2")),
+        "{replies:?}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn no_drops_a_proposal() {
     let home = home("gateway-no");
     let gw = start(config(&home));

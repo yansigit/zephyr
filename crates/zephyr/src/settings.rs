@@ -765,7 +765,7 @@ pub fn shown(v: Option<&str>) -> &str {
 /// The longest agent reason a card or notice quotes (settings spec §4.4).
 const REASON_CHARS: usize = 200;
 /// The longest proposed command a card shows.
-const CARD_CHARS: usize = 1500;
+const CARD_CHARS: usize = zephyr_policy::tools::CARD_CHARS;
 
 /// `text` cut at `max` characters.
 fn cut(text: &str, max: usize) -> String {
@@ -777,8 +777,16 @@ fn cut(text: &str, max: usize) -> String {
 
 /// What the agent says, on one line and cut: it can never pass for a line of the daemon's own.
 fn quoted(text: &str) -> String {
+    let clean: String = (text.chars())
+        .map(|c| {
+            match c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+                true => ' ',
+                false => c,
+            }
+        })
+        .collect();
     cut(
-        &text.split_whitespace().collect::<Vec<_>>().join(" "),
+        &clean.split_whitespace().collect::<Vec<_>>().join(" "),
         REASON_CHARS,
     )
 }
@@ -950,6 +958,18 @@ pub fn listing(arg: &str, strong: &[String], rows: impl Fn(&Setting) -> Vec<Row>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_quoted_reason_drops_control_and_direction_characters() {
+        let q = super::quoted("fine\u{202e}txt\u{7}\x1b[31m and\nmore\u{2066}!");
+        assert!(
+            !q.chars().any(|c| c.is_control()
+                || ('\u{202a}'..='\u{202e}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c)),
+            "{q:?}"
+        );
+        assert!(q.starts_with("fine txt") && q.contains("and more"), "{q:?}");
+    }
+
     use super::*;
 
     fn strong() -> Vec<String> {

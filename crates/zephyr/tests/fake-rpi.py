@@ -115,13 +115,13 @@ CATALOG = ["fake/m1", "fake/m2", "other/m3", "opencode-go/alpha"]
 # zephyr_policy::tools::GATEWAY_COMMANDS
 GATEWAY_COMMANDS = ["/status", "/model", "/switch", "/rules", "/memory diff", "/memory log", "/job list", "/settings"]
 def gateway_kind(c):
-    """zephyr_policy::tools::gateway_kind: "read", "propose" or None."""
+    """zephyr_policy::tools::gateway_kind: "read", "set", "propose" or None."""
     if c in GATEWAY_COMMANDS:
         return "read"
     cmd, _, arg = c.partition(" ")
     word = arg != "" and all(33 <= ord(ch) <= 126 for ch in arg)
     def plain(t):
-        return t.strip() != "" and len(t.encode()) <= 2000 and not any(
+        return t.strip() != "" and len(t) <= 1500 and not any(
             ord(ch) < 32 or 0x7f <= ord(ch) < 0xa0 or 0x202a <= ord(ch) <= 0x202e
             or 0x2066 <= ord(ch) <= 0x2069 for ch in t)
     if cmd == "/settings":
@@ -134,6 +134,8 @@ def gateway_kind(c):
         ok = (len(w) == 2 and key(w[0]) and val(w[1])) or (
             len(w) == 4 and w[2] == "for" and key(w[0]) and val(w[1]) and span(w[3]))
         return "set" if ok else None
+    if cmd in ("/subagent", "/rule") and len(c) > 1500:
+        return None
     if cmd == "/subagent":
         verb, _, rest = arg.partition(" ")
         rest = rest.lstrip(" ")
