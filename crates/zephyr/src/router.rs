@@ -464,6 +464,8 @@ struct Router<'a> {
     steer_sent: Vec<String>,
     /// A steered message was answered mid-run: flush now, not at the settle.
     steer_replied: bool,
+    /// The latest thing the agent said in this run: the reason it gives for a setting change.
+    last_say: String,
     /// The run that just settled ended `completed`: only such a run's rows may be continued.
     /// Set by `settled` for the one `reconcile` that follows; never after an abort or a failure.
     run_completed: bool,
@@ -557,6 +559,7 @@ impl<'a> Router<'a> {
             steered_texts: HashSet::new(),
             steer_sent: Vec::new(),
             steer_replied: false,
+            last_say: String::new(),
             run_completed: false,
             run_start: None,
             last_event: Instant::now(),
@@ -615,7 +618,7 @@ impl<'a> Router<'a> {
                 _ = tokio::time::sleep_until(self.auth_at), if (self.child.is_some() || !self.cfg.accounts.is_empty()) && self.cfg.auth.enabled => {
                     self.auth_check().await
                 }
-                ev = next_event(&mut self.child) => match self.tapped(ev) {
+                ev = next_event(&mut self.child) => match self.tapped(ev).await {
                     Some(ev) if ev["type"] == "agent_settled" => self.settled(&ev).await,
                     Some(_) => {
                         self.cap_run().await;
@@ -667,7 +670,7 @@ impl<'a> Router<'a> {
         Ok(exit)
     }
 
-    fn tapped(&mut self, ev: Option<Value>) -> Option<Value> {
+    async fn tapped(&mut self, ev: Option<Value>) -> Option<Value> {
         if let Some(ev) = &ev {
             let _ = self.tap.send(ev.clone()); // no receivers is fine
             self.last_event = Instant::now();
@@ -676,10 +679,20 @@ impl<'a> Router<'a> {
                 crate::scheduler::audit(&self.store, &self.cfg, session, ev);
             }
             self.track(ev);
+            match (ev["type"].as_str(), ev["message"]["role"].as_str()) {
+                (Some("agent_start"), _) => self.last_say.clear(),
+                (Some("message_end"), Some("assistant")) => {
+                    let say = message_text(&ev["message"]);
+                    if !say.trim().is_empty() {
+                        self.last_say = say;
+                    }
+                }
+                _ => {}
+            }
             self.steer_event(ev);
             if let Some((id, command)) = crate::tools::gateway_call(ev) {
                 // Off the list, the plugin has already refused the call: nobody waits for it.
-                if let Some(text) = self.gateway_reply(command) {
+                if let Some(text) = self.gateway_reply(command).await {
                     crate::tools::answer_gateway(&self.cfg, id, &text);
                 }
             }
@@ -825,27 +838,81 @@ impl<'a> Router<'a> {
     /// the plugin's check is the agent's side of the boundary, this is the daemon's. A read is
     /// the same text the owner would get; none restarts or queues anything mid-turn. An action is
     /// only stored, for the owner's `/ok`. `None`, and nothing run, for anything else.
-    fn gateway_reply(&self, command: &str) -> Option<String> {
+    async fn gateway_reply(&mut self, command: &str) -> Option<String> {
         use zephyr_policy::tools::Gateway;
         match zephyr_policy::tools::gateway_kind(command) {
             None => {
                 eprintln!("zephyr: gateway {command:?} is not on the list; not run");
                 return None;
             }
+            // Subagents and rules are settings: proposed through `set_setting`, so the card and
+            // the owner's `/ok` check them by content (settings spec §4.4).
+            Some(Gateway::Propose)
+                if command.starts_with("/subagent ") || command.starts_with("/rule ") =>
+            {
+                return Some(self.agent_set(command).await)
+            }
             Some(Gateway::Propose) => {
                 return Some(crate::tools::propose_command(&self.store, command))
             }
+            Some(Gateway::Set) => return Some(self.agent_set(command).await),
             Some(Gateway::Read) => {}
         }
         Some(match command {
             "/status" => self.status(),
             "/model" => self.models(),
             "/switch" => self.list_sessions(),
+            settings if settings.starts_with("/settings") => {
+                self.settings_listing(settings["/settings".len()..].trim())
+            }
             "/job list" => crate::scheduler::list(&self.store)
                 .unwrap_or_else(|e| format!("[zephyr] listing jobs failed: {e}")),
             memory => crate::memory::command(&self.cfg.home, self.cfg.state_dir(), memory)
                 .unwrap_or_default(),
         })
+    }
+
+    /// The agent's `/set KEY VALUE [for D]`, `/subagent …` and `/rule …`: through `set_setting`
+    /// as the agent, which applies a tightening at once and stores everything else for the
+    /// owner. The reason is what the agent said last in this run.
+    async fn agent_set(&mut self, command: &str) -> String {
+        let (cmd, arg) = command.split_once(' ').unwrap_or((command, ""));
+        let (key, raw, until) = match cmd {
+            "/set" => match crate::settings::set_args(arg) {
+                Some(parts) => parts,
+                None => return "refused: usage /set KEY VALUE [for D]".into(),
+            },
+            // `/rule rm 2` and `/subagent add …` are the list settings' own values.
+            other => (other.trim_start_matches('/'), arg, None),
+        };
+        let until = match until
+            .map(|d| crate::settings::parse_until(d, self.cfg.min_until))
+            .transpose()
+        {
+            Ok(until) => until,
+            Err(e) => return format!("refused: {e}"),
+        };
+        let session = self.child.as_ref().and_then(|c| c.session.clone());
+        let session = session.unwrap_or_default();
+        let reason = self.last_say.clone();
+        let reason = (!reason.is_empty()).then_some(reason);
+        let actor = Actor::Agent { session: &session };
+        match self
+            .set_setting(key, raw, actor, until, reason.as_deref())
+            .await
+        {
+            Outcome::Changed { old, new, .. } => {
+                let (old, new) = (
+                    crate::settings::shown(old.as_deref()),
+                    crate::settings::shown(new.as_deref()),
+                );
+                format!("changed {key} {old} → {new}")
+            }
+            Outcome::Proposed { id } => {
+                format!("proposed as #{id}; it runs only if the owner approves with /ok {id}")
+            }
+            Outcome::Refused(why) => format!("refused: {why}"),
+        }
     }
 
     /// Keeps `Snapshot.run` in step with the child's run events. The origin comes from
@@ -3025,7 +3092,7 @@ impl<'a> Router<'a> {
         while self.busy {
             match tokio::time::timeout_at(deadline, next_event(&mut self.child)).await {
                 // As in `main`, so the run's spend and outbound list are booked.
-                Ok(Some(ev)) => match self.tapped(Some(ev)) {
+                Ok(Some(ev)) => match self.tapped(Some(ev)).await {
                     Some(ev) if ev["type"] == "agent_settled" => self.settled(&ev).await,
                     _ => {}
                 },

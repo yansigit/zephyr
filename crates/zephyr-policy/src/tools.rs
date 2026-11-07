@@ -30,6 +30,7 @@ pub const GATEWAY_COMMANDS: &[&str] = &[
     "/memory diff",
     "/memory log",
     "/job list",
+    "/settings",
 ];
 
 /// What a `gateway` command is to the agent.
@@ -39,10 +40,61 @@ pub enum Gateway {
     Read,
     /// An action the daemon only stores, until the owner's `/ok N` runs it.
     Propose,
+    /// `/set KEY VALUE [for D]`: the daemon decides. Making a setting stricter applies at once,
+    /// anything else is stored for the owner's `/ok N`.
+    Set,
+}
+
+/// A printable ASCII word, nothing else: what the owner would be shown is what would run.
+fn ascii_word(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// Free text the owner reads on a card: one line, no control or direction-changing characters.
+fn plain_text(s: &str) -> bool {
+    !s.trim().is_empty()
+        && s.len() <= 2000
+        && !s.chars().any(|c| {
+            c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+}
+
+/// `/set KEY VALUE` or `/set KEY VALUE for D`, with a registry-shaped key, one printable word of
+/// at most 200 bytes and a duration word.
+fn set_shape(arg: &str) -> bool {
+    let words: Vec<&str> = arg.split(' ').collect();
+    let key = |k: &str| {
+        !k.is_empty()
+            && k.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b))
+    };
+    let value = |v: &str| ascii_word(v) && v.len() <= 200;
+    let span = |d: &str| !d.is_empty() && d.bytes().all(|b| b.is_ascii_alphanumeric());
+    match words[..] {
+        [k, v] => key(k) && value(v),
+        [k, v, "for", d] => key(k) && value(v) && span(d),
+        _ => false,
+    }
+}
+
+/// `/subagent add NAME [PROVIDER/MODEL] PROMPT`, `prompt NAME PROMPT`, `model NAME PROVIDER/MODEL`
+/// and `rm NAME`: the verb, then plain text.
+fn subagent_shape(arg: &str) -> bool {
+    let (verb, rest) = arg.split_once(' ').unwrap_or((arg, ""));
+    let rest = rest.trim_start();
+    match verb {
+        "add" | "prompt" => plain_text(rest) && rest.contains(' '),
+        "model" => rest
+            .split_once(' ')
+            .is_some_and(|(n, m)| ascii_word(n) && ascii_word(m)),
+        "rm" => ascii_word(rest),
+        _ => false,
+    }
 }
 
 /// `Some` for a command the agent may send through `gateway`, in these exact shapes only:
-/// [`GATEWAY_COMMANDS`] are read; `/model PROVIDER/MODEL`, `/new`, `/switch ID`, `/pause` and
+/// [`GATEWAY_COMMANDS`] and `/settings WORDS` are read; `/set KEY VALUE [for D]` is a [`Gateway::Set`];
+/// `/subagent add|prompt|model|rm …` and `/rule …` are proposed, like `/model PROVIDER/MODEL`, `/new`, `/switch ID`, `/pause` and
 /// `/reload` are proposed. Approvals, and `/stop`, are neither. The argument is one printable
 /// ASCII word, so the owner's approval notice shows exactly what would run.
 pub fn gateway_kind(command: &str) -> Option<Gateway> {
@@ -50,7 +102,17 @@ pub fn gateway_kind(command: &str) -> Option<Gateway> {
         return Some(Gateway::Read);
     }
     let (cmd, arg) = command.split_once(' ').unwrap_or((command, ""));
-    let word = !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_graphic());
+    let word = ascii_word(arg);
+    match cmd {
+        "/settings" => {
+            let words = arg.split(' ').all(ascii_word) && arg.len() <= 100;
+            return words.then_some(Gateway::Read);
+        }
+        "/set" => return set_shape(arg).then_some(Gateway::Set),
+        "/subagent" => return subagent_shape(arg).then_some(Gateway::Propose),
+        "/rule" => return plain_text(arg).then_some(Gateway::Propose),
+        _ => {}
+    }
     let ok = match cmd {
         "/new" | "/pause" | "/reload" => command == cmd,
         "/switch" => word,
@@ -429,7 +491,8 @@ pub fn gateway(params: &Value) -> Result<String, String> {
     if gateway_kind(command).is_none() {
         return Err(format!(
             "{command} is not available to the agent; it can run {}, and propose \
-             /model PROVIDER/MODEL, /new, /switch ID, /pause or /reload",
+             /model PROVIDER/MODEL, /new, /switch ID, /pause or /reload; /settings and /set KEY \
+             VALUE [for D] read and change settings; /subagent and /rule changes are proposed",
             GATEWAY_COMMANDS.join(", ")
         ));
     }
@@ -1046,14 +1109,7 @@ mod tests {
             gateway(&json!({ "command": " /status " })).unwrap(),
             "/status"
         );
-        for bad in [
-            "/memory ok",
-            "/job ok 1",
-            "/rule x",
-            "/login",
-            "/resume",
-            "/status x",
-        ] {
+        for bad in ["/memory ok", "/job ok 1", "/login", "/resume", "/status x"] {
             assert!(gateway(&json!({ "command": bad })).is_err(), "{bad}");
         }
         assert!(gateway(&json!({})).is_err());
@@ -1088,8 +1144,6 @@ mod tests {
             "/job rm 1",
             "/job add a | b | c",
             "/job run 1",
-            "/rule x",
-            "/rule rm 1",
             "/login",
             "/login anthropic",
             "/resume",
@@ -1107,9 +1161,6 @@ mod tests {
             "/switch ",
             "/switch a b",
             // The owner's subagents and task settings (DESIGN §4.12).
-            "/subagent",
-            "/subagent add x p/m be terse",
-            "/subagent rm x",
             "/task parallel 32",
             "/task model p/m",
             "hello",
@@ -1120,6 +1171,65 @@ mod tests {
             gateway(&json!({ "command": "/model fake/m2" })).unwrap(),
             "/model fake/m2"
         );
+    }
+
+    #[test]
+    fn gateway_sets_reads_and_still_refuses_approvals() {
+        for read in ["/settings", "/settings tasks", "/settings tasks.parallel"] {
+            assert_eq!(gateway_kind(read), Some(Gateway::Read), "{read}");
+        }
+        for set in [
+            "/set tasks.parallel 1",
+            "/set tasks.parallel 4 for 2h",
+            "/set budget.day_usd 5 for 30m",
+            "/set tasks.model none",
+        ] {
+            assert_eq!(gateway_kind(set), Some(Gateway::Set), "{set}");
+        }
+        for propose in [
+            "/subagent add scout fake/m2 You explore. Never edit.",
+            "/subagent prompt scout Be brief.",
+            "/subagent model scout fake/m2",
+            "/subagent rm scout",
+            "/rule never email bob",
+            "/rule rm 2",
+        ] {
+            assert_eq!(gateway_kind(propose), Some(Gateway::Propose), "{propose}");
+        }
+        for never in [
+            "/set",
+            "/set tasks.parallel",
+            "/set tasks.parallel 1 2",
+            "/set Tasks.Parallel 1",
+            "/set tasks.parallel 1 for",
+            "/set tasks.parallel 1 for 2h 3h",
+            "/set tasks.parallel 1 until 2h",
+            "/set tasks.parallel 1 for 2 h",
+            "/set  tasks.parallel 1",
+            "/set tasks.parallel 1\u{202e}",
+            "/subagent",
+            "/subagent list",
+            "/subagent add",
+            "/subagent frob x",
+            "/subagent rm",
+            "/rule",
+            "/rule ",
+            "/rule a\nb",
+            "/rule a\u{202e}b",
+            "/ok 1",
+            "/no 1",
+            "/vault grant X",
+            "/vault",
+            "/login",
+            "/resume",
+            "/stop",
+        ] {
+            assert_eq!(gateway_kind(never), None, "{never:?}");
+        }
+        let long = format!("/set tasks.model {}", "a".repeat(201));
+        assert_eq!(gateway_kind(&long), None);
+        assert!(gateway(&json!({ "command": "/set tasks.parallel 1" })).is_ok());
+        assert!(gateway(&json!({ "command": "/ok 1" })).is_err());
     }
 
     #[test]

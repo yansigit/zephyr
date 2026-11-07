@@ -1834,6 +1834,104 @@ async fn the_agent_proposes_a_model_and_only_the_owners_ok_switches_it() {
 }
 
 #[tokio::test]
+async fn the_agent_tightens_at_once_and_proposes_a_loosening() {
+    let home = home("gateway-set");
+    let gw = start(on_file(&home, ""));
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call gateway {"command": "/set tasks.parallel 1"}] fewer please"#,
+    )
+    .await;
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        replies
+            .iter()
+            .any(|r| r.ends_with("\ngateway: changed tasks.parallel 2 → 1")),
+        "{replies:?}"
+    );
+    assert!(
+        replies.iter().any(
+            |r| r.starts_with("[zephyr] the agent set tasks.parallel 2 → 1")
+                && r.contains("/set tasks.parallel 2 puts it back")
+        ),
+        "{replies:?}"
+    );
+    gw.say(
+        "m2",
+        "owner",
+        r#"[call gateway {"command": "/set tasks.parallel 4"}] more please"#,
+    )
+    .await;
+    let replies = gw.wait_replies(4).await;
+    assert!(
+        replies
+            .iter()
+            .any(|r| r.contains("proposes #1: tasks.parallel 1 → 4")),
+        "{replies:?}"
+    );
+    assert!(
+        replies.iter().any(|r| r
+            .ends_with("\ngateway: proposed as #1; it runs only if the owner approves with /ok 1")),
+        "{replies:?}"
+    );
+    gw.say("m3", "owner", "/ok 1").await;
+    gw.say("m4", "owner", "/settings tasks.parallel").await;
+    let replies = gw.wait_replies(6).await;
+    assert!(replies[4].contains("tasks.parallel"), "{replies:?}");
+    assert!(replies[5].contains("tasks.parallel · 4"), "{replies:?}");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_agent_reads_settings_and_is_refused_what_is_not_its_to_set() {
+    let home = home("gateway-settings-read");
+    let gw = start(on_file(&home, ""));
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call gateway {"command": "/settings tasks.parallel"}] [call gateway {"command": "/set nope.x 1"}]"#,
+    )
+    .await;
+    let reply = gw.wait_replies(1).await[0].clone();
+    assert!(reply.contains("gateway: [zephyr]"), "{reply}");
+    assert!(reply.contains("tasks.parallel"), "{reply}");
+    assert!(reply.contains("refused: no setting nope.x"), "{reply}");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_agent_proposes_a_subagent_and_the_card_shows_its_prompt() {
+    let home = home("gateway-subagent");
+    let gw = start(on_file(&home, ""));
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call gateway {"command": "/subagent add scout fake/m2 You explore. Never edit."}] add one"#,
+    )
+    .await;
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        replies.iter().any(
+            |r| r.contains("proposes #1: /subagent add scout fake/m2 You explore. Never edit.")
+        ),
+        "{replies:?}"
+    );
+    assert!(
+        replies.iter().any(|r| r
+            .ends_with("\ngateway: proposed as #1; it runs only if the owner approves with /ok 1")),
+        "{replies:?}"
+    );
+    let cfg = std::fs::read_to_string(home.join("zephyr.toml")).unwrap();
+    assert!(!cfg.contains("scout"), "nothing applied before /ok");
+    gw.say("m2", "owner", "/ok 1").await;
+    gw.wait_replies(3).await;
+    let cfg = std::fs::read_to_string(home.join("zephyr.toml")).unwrap();
+    assert!(cfg.contains("scout"), "{cfg}");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn no_drops_a_proposal() {
     let home = home("gateway-no");
     let gw = start(config(&home));

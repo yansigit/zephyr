@@ -113,13 +113,37 @@ if "--version" in args:
     print("rpi 0.18.0"); sys.exit(0)
 CATALOG = ["fake/m1", "fake/m2", "other/m3", "opencode-go/alpha"]
 # zephyr_policy::tools::GATEWAY_COMMANDS
-GATEWAY_COMMANDS = ["/status", "/model", "/switch", "/rules", "/memory diff", "/memory log", "/job list"]
+GATEWAY_COMMANDS = ["/status", "/model", "/switch", "/rules", "/memory diff", "/memory log", "/job list", "/settings"]
 def gateway_kind(c):
     """zephyr_policy::tools::gateway_kind: "read", "propose" or None."""
     if c in GATEWAY_COMMANDS:
         return "read"
     cmd, _, arg = c.partition(" ")
     word = arg != "" and all(33 <= ord(ch) <= 126 for ch in arg)
+    def plain(t):
+        return t.strip() != "" and len(t.encode()) <= 2000 and not any(
+            ord(ch) < 32 or 0x7f <= ord(ch) < 0xa0 or 0x202a <= ord(ch) <= 0x202e
+            or 0x2066 <= ord(ch) <= 0x2069 for ch in t)
+    if cmd == "/settings":
+        return "read" if all(w != "" and all(33 <= ord(ch) <= 126 for ch in w) for w in arg.split(" ")) and len(arg) <= 100 else None
+    if cmd == "/set":
+        w = arg.split(" ")
+        key = lambda k: re.fullmatch(r"[a-z0-9_.-]+", k) is not None
+        val = lambda v: v != "" and all(33 <= ord(ch) <= 126 for ch in v) and len(v) <= 200
+        span = lambda d: re.fullmatch(r"[A-Za-z0-9]+", d) is not None
+        ok = (len(w) == 2 and key(w[0]) and val(w[1])) or (
+            len(w) == 4 and w[2] == "for" and key(w[0]) and val(w[1]) and span(w[3]))
+        return "set" if ok else None
+    if cmd == "/subagent":
+        verb, _, rest = arg.partition(" ")
+        rest = rest.lstrip(" ")
+        n, _, m = rest.partition(" ")
+        ok = {"add": plain(rest) and " " in rest, "prompt": plain(rest) and " " in rest,
+              "model": n != "" and m != "" and all(33 <= ord(ch) <= 126 for ch in n + m) and " " not in m,
+              "rm": rest != "" and all(33 <= ord(ch) <= 126 for ch in rest)}.get(verb, False)
+        return "propose" if ok else None
+    if cmd == "/rule":
+        return "propose" if plain(arg) else None
     ok = {"/new": c == cmd, "/pause": c == cmd, "/reload": c == cmd, "/switch": word,
           "/model": word and re.fullmatch(r"[^/]+/.+", arg) is not None}.get(cmd, False)
     return "propose" if ok else None
