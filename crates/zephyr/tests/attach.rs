@@ -1241,3 +1241,58 @@ async fn proposals_and_decide_settle_a_waiting_proposal() {
     assert_eq!(bad["error"]["code"], -32602, "{bad}");
     gw.shutdown().await;
 }
+
+const WEAK_CHAT: &str = "[settings]\nstrong_channels = [\"tui\"]\n[budget]\nrun_turns = 5\n";
+
+/// `zephyr.decide` keeps `/ok N`'s strong-channel rule: a loosening of a strong setting waits
+/// when `chat` says `/ok`, and the TUI, a strong channel, settles it.
+#[tokio::test]
+async fn decide_applies_a_strong_proposal_that_a_weak_channel_cannot() {
+    let gw = start_with("strong-decide", WEAK_CHAT);
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    let store = Store::open(&gw.home.join("state.db")).unwrap();
+    let n = store
+        .propose_setting(
+            "/set budget.run_turns 10",
+            "budget.run_turns",
+            Some("5"),
+            true,
+        )
+        .unwrap();
+    gw.say("m1", &format!("/ok {n}")).await;
+    wait(|| gw.count("outbox", "sent") == 1).await;
+    let file = std::fs::read_to_string(gw.home.join("zephyr.toml")).unwrap();
+    assert!(
+        file.contains("run_turns = 5") && !file.contains("run_turns = 10"),
+        "{file}"
+    );
+    let got = c.call("zephyr.proposals", json!({})).await;
+    let list = got["result"]["proposals"].as_array().unwrap();
+    assert!(
+        list.iter().any(|p| p["id"] == n && p["strong"] == true),
+        "{got}"
+    );
+
+    let ok = c
+        .call("zephyr.decide", json!({"id": n, "verb": "ok"}))
+        .await;
+    assert_eq!(ok["result"]["ok"], true, "{ok}");
+    let file = std::fs::read_to_string(gw.home.join("zephyr.toml")).unwrap();
+    assert!(file.contains("run_turns = 10"), "{file}");
+    let left = c.call("zephyr.proposals", json!({})).await;
+    assert_eq!(left["result"]["proposals"], json!([]), "{left}");
+
+    // The panel's own edit of a strong setting: a loosening applies from the TUI.
+    let set = json!({"key": "budget.run_turns", "value": "20"});
+    let set = c.call("zephyr.settings_set", set).await;
+    assert_eq!(set["result"]["outcome"], "changed", "{set}");
+    let big = json!({"key": "budget.run_turns", "value": "100001"});
+    let big = c.call("zephyr.settings_set", big).await;
+    assert_eq!(big["result"]["outcome"], "refused", "{big}");
+    assert!(
+        big["result"]["reason"].as_str().unwrap().contains("100000"),
+        "{big}"
+    );
+    gw.shutdown().await;
+}

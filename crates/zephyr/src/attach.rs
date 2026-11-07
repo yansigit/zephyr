@@ -368,7 +368,15 @@ impl Conn {
                 ) else {
                     return (vec![error(id, -32602, "key and value are required")], false);
                 };
-                let until = params["until"].as_str().map(String::from);
+                // A number would read as "no limit": refuse it rather than loosen for good.
+                let until = match &params["until"] {
+                    Value::Null => None,
+                    Value::String(s) => Some(s.clone()),
+                    _ => {
+                        let why = "until must be text like 30m, 2h or 1d";
+                        return (vec![error(id, -32602, why)], false);
+                    }
+                };
                 let (tx, rx) = oneshot::channel();
                 let req = AttachRequest::SettingsSet {
                     key: key.into(),
