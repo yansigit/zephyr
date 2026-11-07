@@ -300,8 +300,9 @@ pub struct Amount {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Gated {
     pub class: Class,
-    /// Normalized: lowercased emails, `owner/repo`, origins, `server/tool`. Never empty; a target
-    /// that cannot be read is exactly [`UNKNOWN`].
+    /// Normalized: lowercased emails, `owner/repo`, origins, `server/tool`. A connector message or
+    /// post also goes to each recipient its arguments name, or to [`UNKNOWN`] when they name
+    /// none (R37). Never empty; a target that cannot be read is exactly [`UNKNOWN`].
     pub targets: Vec<String>,
     /// One line, built from the call in the daemon's words, never agent prose.
     pub summary: String,
@@ -389,9 +390,18 @@ pub fn gated(
                 })
                 .flatten();
             let label = format!("{server}/{name}");
+            // R37: a message or a post goes to its tool and to whoever its arguments name; one
+            // naming no one goes to someone the gate cannot read, so `ask-new` never lets it by.
+            let mut targets = vec![label.clone()];
+            if class != Class::Money {
+                match connector_recipients(arguments) {
+                    named if named.is_empty() => targets.push(UNKNOWN.to_string()),
+                    named => targets.extend(named.into_iter().filter(|t| *t != label)),
+                }
+            }
             Some(Gated {
                 class,
-                targets: vec![label.clone()],
+                targets,
                 summary: label,
                 amount,
                 replay: Replay::Pass,
@@ -399,6 +409,63 @@ pub fn gated(
         }
         _ => None,
     }
+}
+
+/// The recipients a connector message or post names in its arguments (R37): the string and
+/// number values of recipient-like keys, however the key is spelled (`channelId` is
+/// `channel_id`), lists flattened, in this order of keys. Normalized as mail recipients are:
+/// lower case, and the addresses taken out of `Name <a@x.org>` and comma-separated lists.
+fn connector_recipients(arguments: Option<&Value>) -> Vec<String> {
+    const KEYS: &[&str] = &[
+        "to",
+        "recipient",
+        "recipients",
+        "email",
+        "channel",
+        "channel_id",
+        "user",
+        "user_id",
+        "chat_id",
+        "thread",
+        "thread_id",
+        "phone",
+        "number",
+    ];
+    fn add(v: &Value, out: &mut Vec<String>) {
+        let mut push = |t: String| {
+            if !t.is_empty() && !out.contains(&t) {
+                out.push(t);
+            }
+        };
+        match v {
+            Value::String(s) => {
+                let s = s.trim().to_lowercase();
+                let emails: Vec<&str> = (s
+                    .split(|c: char| c.is_whitespace() || ",;<>()\"'".contains(c)))
+                .filter(|t| t.contains('@') && !t.starts_with('@') && !t.ends_with('@'))
+                .collect();
+                match emails.is_empty() {
+                    true => push(s.clone()),
+                    false => emails.into_iter().for_each(|e| push(e.to_string())),
+                }
+            }
+            Value::Number(n) => push(n.to_string()),
+            Value::Array(items) => items.iter().for_each(|i| add(i, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    let Some(Value::Object(map)) = arguments else {
+        return out;
+    };
+    for key in KEYS {
+        for (k, v) in map {
+            if normalize_tool(k) == *key {
+                add(v, &mut out);
+            }
+        }
+    }
+    out
 }
 
 /// `createIssue`, `create-issue` and `Create_Issue` all become `create_issue`.
@@ -2053,10 +2120,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!((g.class, g.replay), (Class::Messages, Replay::Pass));
+        // R37: a send that names no recipient goes to someone the gate cannot read.
         assert_eq!(
             (g.targets, g.summary),
             (
-                vec!["mail/send_message".to_string()],
+                vec!["mail/send_message".to_string(), UNKNOWN.to_string()],
                 "mail/send_message".to_string()
             )
         );
@@ -2150,6 +2218,49 @@ mod tests {
             gated("mcp_call", &args, &no_classes).unwrap().class,
             Class::Messages
         );
+    }
+
+    #[test]
+    fn connector_sends_name_their_recipients() {
+        // R37: a message or a post goes to the tool and to whoever its arguments name.
+        let targets = |tool: &str, arguments: Value| {
+            gated("mcp_call", &mcp("Slack", tool, arguments), &no_classes)
+                .unwrap()
+                .targets
+        };
+        assert_eq!(
+            targets("send_message", json!({"channel": "#General", "text": "hi"})),
+            ["slack/send_message", "#general"]
+        );
+        assert_eq!(
+            targets(
+                "sendEmail",
+                json!({"To": ["Bob <Bob@X.org>", "c@y.org, d@z.org"], "subject": "s"})
+            ),
+            ["slack/send_email", "bob@x.org", "c@y.org", "d@z.org"]
+        );
+        assert_eq!(
+            targets(
+                "send_message",
+                json!({"channelId": "C123", "user_id": 42, "thread": "  T9 "})
+            ),
+            ["slack/send_message", "c123", "42", "t9"]
+        );
+        assert_eq!(
+            targets("send_dm", json!({"recipients": [{"id": 1}], "phone": ""})),
+            ["slack/send_dm", UNKNOWN]
+        );
+        assert_eq!(
+            targets("post_message", json!({"text": "hello"})),
+            ["slack/post_message", UNKNOWN]
+        );
+        // A payment's target stays the tool: nothing is remembered for money.
+        let pay = gated(
+            "mcp_call",
+            &mcp("shop", "checkout", json!({"to": "a@x.org"})),
+            &no_classes,
+        );
+        assert_eq!(pay.unwrap().targets, ["shop/checkout"]);
     }
 
     #[test]
@@ -2334,7 +2445,7 @@ mod tests {
             ("sendEmail", "s/send_email"),
         ] {
             let g = gated("mcp_call", &mcp("s", raw, json!({})), &no_classes).unwrap();
-            assert_eq!(g.targets, vec![want], "{raw}");
+            assert_eq!(g.targets, vec![want, UNKNOWN], "{raw}");
         }
         // an owner override still beats the read-verb rule
         let g = gated(

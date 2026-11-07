@@ -53,9 +53,11 @@ pub struct Request {
 
 /// What the browser wrapper read about the page and the control (approvals spec §4.4):
 /// `action` is the wrapper's command (`click`, `press`, `fill`, ...), `typed` the values typed
-/// into the page (checked for private facts), the flags what `browser_class` takes.
+/// into the page (checked for private facts), the flags what `browser_class` takes. It reads
+/// the control's `role` and `name` flat or as the spec's `element: {role, name}`; a control
+/// whose role is missing either way is one the gate could not read, and is held.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "BrowserWire")]
 pub struct Browser {
     pub action: String,
     pub url: String,
@@ -66,6 +68,49 @@ pub struct Browser {
     pub form_textarea: bool,
     pub form_password: bool,
     pub composer: bool,
+}
+
+/// `Browser` as it arrives: the control flat (`role`, `name`) or nested (`element`).
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct BrowserWire {
+    action: String,
+    url: String,
+    origin: String,
+    role: String,
+    name: String,
+    element: Element,
+    typed: Vec<String>,
+    form_textarea: bool,
+    form_password: bool,
+    composer: bool,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Element {
+    role: String,
+    name: String,
+}
+
+impl From<BrowserWire> for Browser {
+    fn from(w: BrowserWire) -> Browser {
+        let pick = |flat: String, nested: String| match flat.trim().is_empty() {
+            true => nested,
+            false => flat,
+        };
+        Browser {
+            action: w.action,
+            url: w.url,
+            origin: w.origin,
+            role: pick(w.role, w.element.role),
+            name: pick(w.name, w.element.name),
+            typed: w.typed,
+            form_textarea: w.form_textarea,
+            form_password: w.form_password,
+            composer: w.composer,
+        }
+    }
 }
 
 /// Lengths only for what was typed: it can hold a private fact.
@@ -116,16 +161,28 @@ pub fn decide(
     origin: (String, String),
     now: i64,
 ) -> Verdict {
+    // What the wrapper sends always carries the page: without it, nothing could be checked.
+    if req.tool == "browser" && req.browser.is_none() {
+        let scrub = Scrub::load(cfg);
+        audit_row(
+            store,
+            &req.session,
+            &req.tool,
+            &scrub.json(&req.args),
+            "denied",
+        );
+        return Verdict::Deny("not run: the gate could not read the browser request".into());
+    }
     let Some(call) = Call::of(cfg, req) else {
         return Verdict::Allow;
     };
-    let facts = facts::load(&facts::path(cfg));
+    let scrub = Scrub::load(cfg);
     let gate = Gate {
         cfg,
         store,
         req,
         call: &call,
-        facts: &facts,
+        scrub: &scrub,
         origin: &origin,
         now,
     };
@@ -151,8 +208,11 @@ struct Call {
     /// What runs on `/ok`: the exact command, the `mcp_call` arguments, or the browser request.
     payload: String,
     secrets: Vec<String>,
-    /// What the audit row records, before scrubbing.
-    audit: String,
+    /// What the audit row records, scrubbed value by value when it is written.
+    audit: Value,
+    /// A browser action on a control the wrapper could not read (no role): held whatever the
+    /// modes say (spec §4.4).
+    unread: bool,
 }
 
 impl Call {
@@ -177,9 +237,11 @@ impl Call {
             "mcp_call" => {
                 let field = |k: &str| req.args.get(k).and_then(Value::as_str).unwrap_or("");
                 let label = format!("{}/{}", field("server").to_lowercase(), field("tool"));
+                // The values the call carries, decoded (C2): never its JSON text, where a
+                // newline is `\n` and no fact written across two lines would match.
                 (
                     ActionKind::Pass,
-                    req.args.to_string(),
+                    decoded(&req.args),
                     vec![label.clone()],
                     label,
                 )
@@ -196,25 +258,32 @@ impl Call {
                 names.map(String::from).collect()
             })
             .unwrap_or_default();
+        let payload = match kind {
+            ActionKind::Run => text.clone(),
+            _ => req.args.to_string(),
+        };
         Some(Call {
             gated,
             kind,
             class: class.into(),
-            payload: text.clone(),
+            payload,
             text,
             targets,
             summary,
             secrets,
-            audit: req.args.to_string(),
+            audit: req.args.clone(),
+            unread: false,
         })
     }
 
     /// A click or key press the wrapper caught, classified by `browser_class`, or typing, which
-    /// only the facts check looks at. Its target is the page's origin.
+    /// only the facts check looks at. Its target is the page's origin. Any action but typing on
+    /// a control with no role is one the gate could not read: held, never let through (I3).
     fn browser(req: &Request, b: &Browser) -> Option<Call> {
         let origin = origin_of(&b.origin);
         let typing = matches!(b.action.as_str(), "fill" | "type");
-        let class = match typing {
+        let unread = !typing && b.role.trim().is_empty();
+        let class = match typing || unread {
             true => None,
             false => {
                 let (role, name) = (&b.role, &b.name);
@@ -222,17 +291,18 @@ impl Call {
             }
         };
         let text = b.typed.join("\n");
-        if class.is_none() && text.trim().is_empty() {
+        if class.is_none() && !unread && text.trim().is_empty() {
             return None;
         }
         let name = quoted_cut(&b.name, 80);
         let summary = match b.action.as_str() {
             _ if typing => format!("typing on {origin}"),
+            _ if unread => format!("a click the gate could not read on {origin}"),
             "press" | "keyboard" if name.is_empty() => format!("Enter on {origin}"),
             "press" | "keyboard" => format!("Enter in \"{name}\" on {origin}"),
             _ => format!("click \"{name}\" on {origin}"),
         };
-        let payload = serde_json::json!({ "args": req.args, "browser": b }).to_string();
+        let audit = serde_json::json!({ "args": req.args, "browser": b });
         Some(Call {
             gated: class.map(|class| Gated {
                 class,
@@ -246,10 +316,113 @@ impl Call {
             text,
             targets: vec![origin],
             summary,
-            payload: payload.clone(),
+            payload: audit.to_string(),
             secrets: Vec::new(),
-            audit: payload,
+            audit,
+            unread,
         })
+    }
+}
+
+/// Every string, number and key in `v`, decoded, one per line: what the facts are looked for in
+/// (C2). The newline join also catches a value split across two of them.
+fn decoded(v: &Value) -> String {
+    let mut out = Vec::new();
+    leaves(v, &mut out);
+    out.join("\n")
+}
+
+fn leaves(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => out.push(s.clone()),
+        Value::Number(n) => out.push(n.to_string()),
+        Value::Array(items) => items.iter().for_each(|i| leaves(i, out)),
+        Value::Object(map) => {
+            for (k, v) in map {
+                out.push(k.clone());
+                leaves(v, out);
+            }
+        }
+        Value::Bool(_) | Value::Null => {}
+    }
+}
+
+/// Agent or page text as part of one card or notice line: control and bidi characters dropped,
+/// whitespace folded, cut (C1; `settings::quoted_cut`'s rules).
+fn one_line(text: &str) -> String {
+    quoted_cut(text, LINE_CHARS)
+}
+
+/// The vault's and the private facts' values, loaded once for one decision or one card, and
+/// scrubbed out of what is shown or recorded. `text` is `vault::scrubbed` followed by
+/// `facts::scrub`, and fails closed as they do: nothing of the text is shown when the vault or
+/// the facts cannot be read.
+struct Scrub {
+    secrets: Option<Vec<(String, String)>>,
+    facts: anyhow::Result<Vec<Fact>>,
+}
+
+impl Scrub {
+    fn load(cfg: &Config) -> Scrub {
+        let vault = crate::vault::Vault::load(&crate::vault::path(cfg));
+        Scrub {
+            secrets: vault.ok().map(|v| v.secrets()),
+            facts: facts::load(&facts::path(cfg)),
+        }
+    }
+
+    fn text(&self, text: &str) -> String {
+        let Some(secrets) = &self.secrets else {
+            return "[output withheld: the vault could not be read]".into();
+        };
+        let text = crate::vault::scrub(text, secrets);
+        match &self.facts {
+            Ok(f) => facts::scrub(f, &text),
+            Err(_) => format!("[withheld: {UNREADABLE}]"),
+        }
+    }
+
+    /// `v` with each string, number and key scrubbed as decoded text (C2).
+    fn value(&self, v: &Value) -> Value {
+        match v {
+            Value::String(s) => Value::String(self.text(s)),
+            Value::Number(n) => {
+                let (raw, clean) = (n.to_string(), self.text(&n.to_string()));
+                match raw == clean {
+                    true => v.clone(),
+                    false => Value::String(clean),
+                }
+            }
+            Value::Array(items) => Value::Array(items.iter().map(|i| self.value(i)).collect()),
+            Value::Object(map) => {
+                let map = map.iter().map(|(k, v)| (self.text(k), self.value(v)));
+                Value::Object(map.collect())
+            }
+            Value::Bool(_) | Value::Null => v.clone(),
+        }
+    }
+
+    /// `v` scrubbed and written as JSON. A fact split across values, each part too short to
+    /// match alone, still matches their join: then none of it is shown.
+    fn json(&self, v: &Value) -> String {
+        let clean = self.value(v);
+        if let Ok(f) = &self.facts {
+            if !names_in(f, &decoded(&clean), &[]).is_empty() {
+                return "[withheld: it holds a private fact split across its values]".into();
+            }
+        }
+        clean.to_string()
+    }
+}
+
+/// One audit row, its arguments cut to 500 bytes.
+fn audit_row(store: &Store, session: &str, tool: &str, args: &str, outcome: &str) {
+    let end = (0..=AUDIT_ARGS.min(args.len()))
+        .rev()
+        .find(|&i| args.is_char_boundary(i))
+        .unwrap_or(0);
+    if let Err(e) = store.audit(session, tool, &args[..end], outcome) {
+        eprintln!("zephyr: writing the audit failed: {e}");
     }
 }
 
@@ -354,22 +527,14 @@ fn fact_note(names: &[String]) -> String {
 }
 
 /// Whether `amount` is known, in `currency` and at most `cap` cents. R21: an amount in another
-/// currency, one naming no currency, or none at all counts as over the cap.
+/// currency, one naming no currency, or none at all counts as over the cap. R36: the amount
+/// counts rounded up to the cent, so 50.004 is over a cap of 50 (the float error of `x * 100`,
+/// such as 0.1 being 10.000000000000002 cents, is rounded away first).
 fn within(amount: Option<&Amount>, cap: u64, currency: &str) -> bool {
     amount.is_some_and(|a| {
-        let cents = (a.value * 100.0).round();
+        let cents = ((a.value * 100.0 * 1e6).round() / 1e6).ceil();
         a.currency == currency && cents.is_finite() && cents >= 0.0 && cents <= cap as f64
     })
-}
-
-/// `text` with the vault's and the private facts' values scrubbed out (`vault::scrubbed`, then
-/// `facts::scrub`). Fails closed: when the facts cannot be read, none of it is shown.
-fn clean(cfg: &Config, facts: &anyhow::Result<Vec<Fact>>, text: &str) -> String {
-    let text = crate::vault::scrubbed(cfg, text.to_string());
-    match facts {
-        Ok(f) => facts::scrub(f, &text),
-        Err(_) => format!("[withheld: {UNREADABLE}]"),
-    }
 }
 
 /// A notice for the owner on `origin`, else on the channel last answered.
@@ -406,27 +571,28 @@ struct Gate<'a> {
     store: &'a Store,
     req: &'a Request,
     call: &'a Call,
-    facts: &'a anyhow::Result<Vec<Fact>>,
+    scrub: &'a Scrub,
     origin: &'a (String, String),
     now: i64,
 }
 
 impl Gate<'_> {
-    fn clean(&self, text: &str) -> String {
-        clean(self.cfg, self.facts, text)
+    /// Scrubbed and on one line: how anything from the call goes into a notice or the summary.
+    fn shown(&self, text: &str) -> String {
+        one_line(&self.scrub.text(text))
     }
 
-    /// The audit row for this call: arguments scrubbed, cut to 500 bytes.
+    /// The audit row for this call: its arguments scrubbed value by value (a command's text
+    /// with its own newlines), cut to 500 bytes.
     fn audit(&self, outcome: &str) {
-        let args = self.clean(&self.call.audit);
-        let end = (0..=AUDIT_ARGS.min(args.len()))
-            .rev()
-            .find(|&i| args.is_char_boundary(i))
-            .unwrap_or(0);
-        let (session, tool) = (&self.req.session, &self.req.tool);
-        if let Err(e) = self.store.audit(session, tool, &args[..end], outcome) {
-            eprintln!("zephyr: writing the audit failed: {e}");
-        }
+        let args = self.scrub.json(&self.call.audit);
+        audit_row(
+            self.store,
+            &self.req.session,
+            &self.req.tool,
+            &args,
+            outcome,
+        );
     }
 
     fn judge(&self) -> rusqlite::Result<Verdict> {
@@ -442,7 +608,7 @@ impl Gate<'_> {
                 }
             }
         }
-        let found = match (e.facts, self.facts) {
+        let found = match (e.facts, &self.scrub.facts) {
             (FactsMode::Off, _) => Found::Nothing,
             (_, Err(_)) => Found::Unreadable,
             (_, Ok(f)) => match names_in(f, &call.text, &call.targets) {
@@ -453,6 +619,7 @@ impl Gate<'_> {
         let plan = match (&found, &call.gated) {
             (Found::Unreadable, _) => Plan::Hold("fact-hold"),
             (Found::Names(_), _) if e.facts == FactsMode::Hold => Plan::Hold("fact-hold"),
+            _ if call.unread => Plan::Hold("held"),
             (_, None) => Plan::Allow(None),
             (_, Some(g)) => self.mode(&e, g)?,
         };
@@ -460,10 +627,12 @@ impl Gate<'_> {
             Plan::Allow(outcome) => {
                 if let Found::Names(names) = &found {
                     let to = match call.targets.as_slice() {
-                        [] => call.summary.clone(),
-                        all => all.join(", "),
+                        [] => self.shown(&call.summary),
+                        all => {
+                            let all: Vec<String> = all.iter().map(|t| self.shown(t)).collect();
+                            all.join(", ")
+                        }
                     };
-                    let to = self.clean(&to);
                     for name in names {
                         let text =
                             format!("[zephyr] the agent sent your private fact {name} to {to}");
@@ -541,13 +710,15 @@ impl Gate<'_> {
             let n = if wait { n.min(WAIT_MINUTES) } else { n };
             self.now + 60 * i64::from(n)
         });
+        // On one line (C1): `/held` and the agent's held text print it as it is. The fact note
+        // is the daemon's, with names that are only `[a-z0-9_-]`.
         let summary = match found {
             Found::Unreadable => UNREADABLE.to_string(),
-            Found::Names(names) => self.clean(&format!("{}; {}", call.summary, fact_note(names))),
-            Found::Nothing => self.clean(&call.summary),
+            Found::Names(names) => format!("{}; {}", self.shown(&call.summary), fact_note(names)),
+            Found::Nothing => self.shown(&call.summary),
         };
         let reason = (req.reason.as_deref())
-            .map(|r| quoted(&self.clean(r)))
+            .map(|r| quoted(&self.scrub.text(r)))
             .filter(|r| !r.is_empty());
         let new = NewAction {
             kind: call.kind,
@@ -656,35 +827,45 @@ fn canonical(v: &Value) -> String {
 /// never its value; under `ask-new` a target not approved before is marked `(new)`; a delayed
 /// action says when it goes; one that needs a strong channel to approve says so.
 pub fn card(a: &Action, cfg: &Config, store: &Store) -> String {
-    let facts = facts::load(&facts::path(cfg));
-    let clean = |text: &str| clean(cfg, &facts, text);
+    let scrub = Scrub::load(cfg);
+    let clean = |text: &str| scrub.text(text);
     let e = approvals::effective(cfg);
     let class = class_of(&a.class);
     let ask_new = class.is_some_and(|c| mode_of(&e, c) == Mode::AskNew);
+    // Each target scrubbed and on one line (C1): a server, a recipient or an origin is the
+    // agent's or a page's text.
     let targets: Vec<String> = (a.targets.iter())
         .map(|t| {
             let known = || store.all_known(&a.class, std::slice::from_ref(t));
             let new = ask_new && t != UNKNOWN && !known().unwrap_or(false);
-            format!("{}{}", clean(t), if new { " (new)" } else { "" })
+            format!("{}{}", one_line(&clean(t)), if new { " (new)" } else { "" })
         })
         .collect();
     let verb = match a.status.as_str() {
         "scheduled" => "delayed",
         _ => "approve",
     };
+    let browser = (a.kind == ActionKind::Wait)
+        .then(|| browser_of(&a.payload))
+        .flatten();
     let mut lines = vec![format!(
         "[zephyr] {verb} #{}: {}",
         a.id,
-        what(class, a.kind)
+        what(class, a.kind, browser.as_ref())
     )];
-    let payload = clean(&a.payload);
-    match a.kind {
-        ActionKind::Run => lines.extend(run_lines(cfg, a, class, &targets, &payload, &clean)),
-        ActionKind::Pass => lines.extend(pass_lines(a, class, &targets, &payload, &clean)),
-        ActionKind::Wait => lines.extend(wait_lines(class, &targets, &payload)),
-    }
+    // A command is plain text, scrubbed whole; a connector call and a browser request are
+    // decoded first and scrubbed value by value (C2).
+    let command = (a.kind == ActionKind::Run).then(|| clean(&a.payload));
+    lines.extend(match a.kind {
+        ActionKind::Run => {
+            let command = command.as_deref().unwrap_or_default();
+            run_lines(cfg, a, class, &targets, command, &clean)
+        }
+        ActionKind::Pass => pass_lines(a, class, &targets, &scrub),
+        ActionKind::Wait => wait_lines(class, &targets, browser.as_ref(), &clean),
+    });
     if e.facts != FactsMode::Off {
-        match &facts {
+        match &scrub.facts {
             Err(_) => lines.push(UNREADABLE.into()),
             Ok(f) => {
                 let names = names_in(f, &checked_text(a), &a.targets);
@@ -694,8 +875,8 @@ pub fn card(a: &Action, cfg: &Config, store: &Store) -> String {
             }
         }
     }
-    if a.kind == ActionKind::Run {
-        lines.push(format!("command: \"{}\"", quoted_cut(&payload, BODY_CHARS)));
+    if let Some(command) = command {
+        lines.push(format!("command: \"{}\"", quoted_cut(&command, BODY_CHARS)));
     }
     if let Some(reason) = a.reason.as_deref().map(|r| quoted(&clean(r))) {
         if !reason.is_empty() {
@@ -707,18 +888,22 @@ pub fn card(a: &Action, cfg: &Config, store: &Store) -> String {
 }
 
 /// The card's first line after the id: `message (email)`, `payment (browser)`.
-fn what(class: Option<Class>, kind: ActionKind) -> String {
+fn what(class: Option<Class>, kind: ActionKind, browser: Option<&Browser>) -> String {
     let noun = match class {
         Some(Class::Messages) => "message",
         Some(Class::Posts) => "post",
         Some(Class::Money) => "payment",
         None => {
+            let typing = browser.is_some_and(|b| matches!(b.action.as_str(), "fill" | "type"));
+            let unread = browser.is_none_or(|b| b.role.trim().is_empty());
             return match kind {
                 ActionKind::Run => "outgoing command",
                 ActionKind::Pass => "connector call",
-                ActionKind::Wait => "typing in the browser",
+                ActionKind::Wait if typing => "typing in the browser",
+                ActionKind::Wait if unread => "a click the gate could not read (browser)",
+                ActionKind::Wait => "click in the browser",
             }
-            .into()
+            .into();
         }
     };
     let medium = match (kind, class) {
@@ -731,11 +916,16 @@ fn what(class: Option<Class>, kind: ActionKind) -> String {
     format!("{noun} ({medium})")
 }
 
-/// What the facts check looked at in `a`: the command, the connector call, or what was typed.
+/// What the facts check looked at in `a`: the command, the connector call's values decoded,
+/// or what was typed.
 fn checked_text(a: &Action) -> String {
     match a.kind {
+        ActionKind::Run => a.payload.clone(),
+        ActionKind::Pass => match serde_json::from_str::<Value>(&a.payload) {
+            Ok(v) => decoded(&v),
+            Err(_) => a.payload.clone(),
+        },
         ActionKind::Wait => browser_of(&a.payload).map_or_else(String::new, |b| b.typed.join("\n")),
-        _ => a.payload.clone(),
     }
 }
 
@@ -745,7 +935,8 @@ fn browser_of(payload: &str) -> Option<Browser> {
 }
 
 /// A shell command's lines: who a mail goes to with its subject and first lines, a GitHub post's
-/// repo and title, or what an outgoing command sends. `payload` is the command, scrubbed.
+/// repo and title, or what an outgoing command sends. `payload` is the command, plain text,
+/// scrubbed whole.
 fn run_lines(
     cfg: &Config,
     a: &Action,
@@ -794,28 +985,34 @@ fn run_lines(
     lines
 }
 
-/// A connector call's lines: the tool, the amount for a payment, the arguments as sent.
-fn pass_lines(
-    a: &Action,
-    class: Option<Class>,
-    targets: &[String],
-    payload: &str,
-    clean: &dyn Fn(&str) -> String,
-) -> Vec<String> {
-    let mut lines = vec![format!("tool: {}", targets.join(", "))];
+/// A connector call's lines: the tool and, for a message or a post, whoever it goes to; the
+/// amount for a payment; the arguments as sent, decoded, scrubbed value by value and written
+/// again (C2). `targets` are shown already: the tool first, then the recipients (R37).
+fn pass_lines(a: &Action, class: Option<Class>, targets: &[String], scrub: &Scrub) -> Vec<String> {
+    let (tool, to) = targets
+        .split_first()
+        .map_or(("", &[][..]), |(t, to)| (t, to));
+    let mut first = format!("tool: {tool}");
+    if matches!(class, Some(Class::Messages | Class::Posts)) {
+        let to = match a.targets.get(1..).unwrap_or_default() {
+            [t] if t == UNKNOWN => "recipients the gate could not read".to_string(),
+            _ => to.join(", "),
+        };
+        first += &format!(" · to: {to}");
+    }
+    let mut lines = vec![first];
+    let raw: Value = serde_json::from_str(&a.payload).unwrap_or_default();
     if class == Some(Class::Money) {
-        let raw: Value = serde_json::from_str(&a.payload).unwrap_or_default();
         let gated = policy::gated("mcp_call", &raw, &|_, _| Some(Some(Class::Money)));
         lines.push(match gated.and_then(|g| g.amount) {
             None => "amount: could not be read".into(),
-            Some(m) => format!("amount: {}", clean(&amount(&m))),
+            Some(m) => format!("amount: {}", one_line(&scrub.text(&amount(&m)))),
         });
     }
-    let arguments = match serde_json::from_str::<Value>(payload) {
-        Ok(v) => v
-            .get("arguments")
-            .map_or_else(String::new, Value::to_string),
-        Err(_) => payload.to_string(),
+    let arguments = match raw.get("arguments") {
+        Some(v) => scrub.json(v),
+        None if raw.is_null() => scrub.text(&a.payload),
+        None => String::new(),
     };
     lines.push(format!(
         "arguments: \"{}\"",
@@ -824,36 +1021,40 @@ fn pass_lines(
     lines
 }
 
-/// `20 EUR`, `50.01 USD`, `20, no currency named`.
+/// `20 EUR`, `50.004 USD`, `20, no currency named`: the value as the call gave it.
 fn amount(m: &Amount) -> String {
-    let value = match m.value.fract() == 0.0 {
-        true => format!("{:.0}", m.value),
-        false => format!("{:.2}", m.value),
-    };
     match m.currency.is_empty() {
-        true => format!("{value}, no currency named"),
-        false => format!("{value} {}", m.currency),
+        true => format!("{}, no currency named", m.value),
+        false => format!("{} {}", m.value, m.currency),
     }
 }
 
 /// A browser action's lines: the origin, the page and the control, what was typed, and for a
-/// payment that the amount could not be read (the wrapper reads none).
-fn wait_lines(class: Option<Class>, targets: &[String], payload: &str) -> Vec<String> {
+/// payment that the amount could not be read (the wrapper reads none). `browser` is the
+/// request decoded; each of its fields is scrubbed on its own (C2).
+fn wait_lines(
+    class: Option<Class>,
+    targets: &[String],
+    browser: Option<&Browser>,
+    clean: &dyn Fn(&str) -> String,
+) -> Vec<String> {
     let mut lines = vec![format!("on: {}", targets.join(", "))];
-    let Some(b) = browser_of(payload) else {
-        lines.push(format!("page: \"{}\"", quoted_cut(payload, LINE_CHARS)));
+    let Some(b) = browser else {
+        lines.push("page: could not be read".into());
         return lines;
     };
-    let page = format!("page: \"{}\"", quoted_cut(&b.url, LINE_CHARS));
-    let name = quoted_cut(&b.name, LINE_CHARS);
+    let page = format!("page: \"{}\"", quoted_cut(&clean(&b.url), LINE_CHARS));
+    let name = quoted_cut(&clean(&b.name), LINE_CHARS);
+    let unread = b.role.trim().is_empty();
     lines.push(match b.action.as_str() {
         "fill" | "type" => page,
+        _ if unread => format!("{page} · the control could not be read"),
         "press" | "keyboard" => format!("{page} · key: Enter in \"{name}\""),
         _ => format!("{page} · button: \"{name}\""),
     });
     if !b.typed.is_empty() {
         let typed: Vec<String> = (b.typed.iter())
-            .map(|t| format!("\"{}\"", quoted_cut(t, LINE_CHARS)))
+            .map(|t| format!("\"{}\"", quoted_cut(&clean(t), LINE_CHARS)))
             .collect();
         lines.push(format!("typed: {}", typed.join(" · ")));
     }
@@ -1254,9 +1455,38 @@ mod tests {
             .unwrap();
         let gh = d("gh issue comment 4 -R octo/hello --body 'thanks'");
         held(&gh);
+        // R37: a connector send is known by its tool and by every recipient it names, as an
+        // `/ok` of `slack/send_message` to `#general` remembered them.
+        let known = ["slack/send_message".to_string(), "#general".to_string()];
+        h.store.remember_targets("messages", &known).unwrap();
+        let slack = |arguments: Value| {
+            let req = mcp("slack", "send_message", arguments, "task-5");
+            decide(&h.cfg, &h.store, &req, owner(), now)
+        };
+        let general = slack(json!({"channel": "#General", "text": "hi"}));
+        assert_eq!(general, Verdict::Allow);
+        let id = held(&slack(json!({"channel": "#random", "text": "hi"})));
+        let card = notices(&h.store).pop().unwrap();
+        assert!(
+            card.starts_with(&format!(
+                "[zephyr] approve #{id}: message (connector)\n\
+                 tool: slack/send_message · to: #random (new)\n"
+            )),
+            "{card}"
+        );
+        // A send naming no recipient is one the gate cannot attribute: never known.
+        let id = held(&slack(json!({"text": "hi"})));
+        let card = notices(&h.store).pop().unwrap();
+        assert!(
+            card.starts_with(&format!(
+                "[zephyr] approve #{id}: message (connector)\n\
+                 tool: slack/send_message · to: recipients the gate could not read\n"
+            )),
+            "{card}"
+        );
         assert_eq!(
             outcomes(&h.store),
-            ["known", "known", "held", "held", "held"]
+            ["known", "known", "held", "held", "held", "known", "held", "held"]
         );
     }
 
@@ -1490,7 +1720,83 @@ mod tests {
             decide(&off, &h.store, &plain_send, owner(), now),
             Verdict::Allow
         );
+        // C2: facts are looked for in the values a call carries, decoded, never in its JSON text
+        // (where a newline is the two characters `\n`), and scrubbed there too.
+        std::fs::write(crate::facts::path(&h.cfg), format!("{PHONE}{ADDR}")).unwrap();
+        let values = [
+            json!({"address": "12 Oak Street,\nSpringfield"}),
+            json!({"phone": "555\n010\n2345"}),
+            json!({"lines": ["12 Oak Street,", "Springfield"]}),
+        ];
+        for (i, arguments) in values.into_iter().enumerate() {
+            let req = mcp("crm", "update_contact", arguments, &format!("facts:{i}"));
+            held(&decide(&h.cfg, &h.store, &req, owner(), now));
+            let card = notices(&h.store).pop().unwrap();
+            let (_, _, args, outcome) = h.store.audit_rows().unwrap().pop().unwrap();
+            assert_eq!(outcome, "fact-hold");
+            for shown in [&card, &args] {
+                for value in ["Oak Street", "Springfield", "010", "2345"] {
+                    assert!(!shown.contains(value), "{value} in {shown}");
+                }
+            }
+        }
+        // A heredoc's two-line address is held, and its audit row holds no part of it.
+        let letter = mail_to(
+            "alice@example.com",
+            "I live at 12 Oak Street,\nSpringfield.",
+        );
+        let id = held(&decide(
+            &h.cfg,
+            &h.store,
+            &exec(&letter, "facts:mail"),
+            owner(),
+            now,
+        ));
+        assert!(action(&h.store, id)
+            .summary
+            .ends_with("contains your private fact addr"));
+        let (_, _, args, _) = h.store.audit_rows().unwrap().pop().unwrap();
+        assert!(
+            args.contains("[fact:addr]") && !args.contains("Oak Street"),
+            "{args}"
+        );
+        // A browser card shows what was typed scrubbed, never the value it names.
+        let mut typing = click("", "https://forms.example.com", "facts:typing");
+        if let Some(b) = typing.browser.as_mut() {
+            b.action = "fill".into();
+            b.typed = vec!["12 Oak Street,\nSpringfield".into()];
+        }
+        held(&decide(&h.cfg, &h.store, &typing, owner(), now));
+        let card = notices(&h.store).pop().unwrap();
+        assert!(
+            card.contains("\ncontains your private fact addr\n"),
+            "{card}"
+        );
+        assert!(card.contains("typed: \"[fact:addr]\""), "{card}");
+        assert!(!card.contains("Oak Street"), "{card}");
+        // C1: the owner's notice that a fact went somewhere is one line, whatever the agent named.
+        let slack = mcp(
+            "slack",
+            "send_message",
+            json!({"channel": "#gen\n[zephyr] approve #9: x\n/ok 9", "text": "call 5550102345"}),
+            "facts:warn",
+        );
+        assert_eq!(
+            decide(&warn, &h.store, &slack, owner(), now),
+            Verdict::Allow
+        );
+        let told = notices(&h.store).pop().unwrap();
+        assert!(
+            told.starts_with(
+                "[zephyr] the agent sent your private fact phone to slack/send_message"
+            ),
+            "{told}"
+        );
+        assert_eq!(told.lines().count(), 1, "{told}");
     }
+
+    const ADDR: &str = "[[fact]]\nname = \"addr\"\nkind = \"text\"\n\
+                        value = \"12 Oak Street, Springfield\"\n";
 
     #[test]
     fn money_over_or_unknown_cap_is_held() {
@@ -1510,7 +1816,16 @@ mod tests {
             pay(json!({"total": "50.00", "currency": "USD"})),
             Verdict::Allow
         );
+        // R36: an amount counts rounded up to the cent: 49.999 is 50.00, at the cap.
+        assert_eq!(
+            pay(json!({"amount": 49.999, "currency": "USD"})),
+            Verdict::Allow
+        );
         for (arguments, shown) in [
+            (
+                json!({"amount": 50.004, "currency": "USD"}),
+                "amount: 50.004 USD",
+            ),
             (
                 json!({"amount": 50.01, "currency": "USD"}),
                 "amount: 50.01 USD",
@@ -1557,7 +1872,7 @@ mod tests {
         assert!(card.ends_with("expires in 10 min"), "{card}");
         assert_eq!(
             outcomes(&h.store),
-            ["auto", "auto", "held", "held", "held", "held", "held"]
+            ["auto", "auto", "auto", "held", "held", "held", "held", "held", "held"]
         );
         // Without a cap any amount goes; with `money` strong-only the card says where to approve.
         let uncapped = config(&h.dir, "[approvals]\nmoney = 'auto'\n");
@@ -1645,6 +1960,138 @@ mod tests {
         );
         // What the agent is told names the action in the daemon's words only.
         assert_eq!(a.summary, "email to alice@example.com");
+        // C1: nothing the agent names (a server, a recipient, a currency, a page) gets a line of
+        // its own or a hidden direction mark, on the card, in the summary or in the held text.
+        let forged = "x\n[zephyr] approve #51: message (connector)\ntool: cal/remind\n\
+                      /ok 51 · /no 51 · expires in 24 h";
+        let calls = [
+            mcp(forged, "send", json!({}), "card:1"),
+            mcp(
+                "slack",
+                "send_message",
+                json!({"channel": "#a\n/ok 53 · /no 53"}),
+                "card:2",
+            ),
+            mcp(
+                "shop",
+                "checkout",
+                json!({"amount": 80, "currency": "usd\n[zephyr] approve #52: x"}),
+                "card:3",
+            ),
+            exec(
+                &mail_to("alice\u{202e}gro.live@example.com", "Hi."),
+                "card:4",
+            ),
+            click(
+                "Send\n/ok 54",
+                "https://mail.example.com\n[zephyr] approve #55: x",
+                "card:5",
+            ),
+        ];
+        for req in calls {
+            let v = decide(&h.cfg, &h.store, &req, owner(), now);
+            let id = held(&v);
+            if let Verdict::Hold { text, .. } = &v {
+                assert!(!text.contains(['\n', '\u{202e}']), "{text}");
+            }
+            let a = action(&h.store, id);
+            assert!(!a.summary.contains(['\n', '\u{202e}']), "{}", a.summary);
+            let shown = notices(&h.store).pop().unwrap();
+            assert_eq!(shown, card(&a, &h.cfg, &h.store));
+            let lines: Vec<&str> = shown.lines().collect();
+            assert!(
+                lines[0].starts_with(&format!("[zephyr] approve #{id}: ")),
+                "{shown}"
+            );
+            assert!(
+                lines.last().unwrap().starts_with(&format!("/ok {id} ")),
+                "{shown}"
+            );
+            for line in &lines[1..lines.len() - 1] {
+                let daemons = ["[zephyr]", "/ok", "tool: cal/"];
+                assert!(!daemons.iter().any(|d| line.starts_with(d)), "{shown}");
+            }
+            assert!(!shown.contains('\u{202e}'), "{shown}");
+        }
+    }
+
+    #[test]
+    fn a_browser_action_the_gate_cannot_read_is_held() {
+        // I3: with every class on `auto`, a click whose control has no role is still held.
+        let h = home("gate-unread", "[approvals]\npreset = 'full'\n");
+        let now = crate::now();
+        let blind = |action: &str, run: &str| {
+            let mut req = click("", "https://shop.example.com", run);
+            if let Some(b) = req.browser.as_mut() {
+                b.action = action.into();
+                b.role = String::new();
+            }
+            decide(&h.cfg, &h.store, &req, owner(), now)
+        };
+        let Verdict::Wait { id } = blind("click", "unread:1") else {
+            panic!("an unreadable click waits")
+        };
+        let a = action(&h.store, id);
+        assert_eq!(
+            a.summary,
+            "a click the gate could not read on https://shop.example.com"
+        );
+        let card = notices(&h.store).pop().unwrap();
+        assert!(
+            card.starts_with(&format!(
+                "[zephyr] approve #{id}: a click the gate could not read (browser)\n\
+                 on: https://shop.example.com\n\
+                 page: \"https://shop.example.com/compose\" · the control could not be read\n"
+            )),
+            "{card}"
+        );
+        for action in ["press", "keyboard", "find"] {
+            let v = blind(action, &format!("unread:{action}"));
+            assert!(matches!(v, Verdict::Wait { .. }), "{action}: {v:?}");
+        }
+        // A control the gate reads and knows is no send still goes (an unknown label: §4.4).
+        let mut link = click("Home", "https://shop.example.com", "unread:2");
+        if let Some(b) = link.browser.as_mut() {
+            b.role = "link".into();
+        }
+        assert_eq!(
+            decide(&h.cfg, &h.store, &link, owner(), now),
+            Verdict::Allow
+        );
+        // A browser request without its page facts is refused.
+        let bare = Request {
+            browser: None,
+            ..click("Send", "https://mail.example.com", "unread:3")
+        };
+        assert_eq!(
+            decide(&h.cfg, &h.store, &bare, owner(), now),
+            Verdict::Deny("not run: the gate could not read the browser request".into())
+        );
+        // The spec's wire shape, `element: {role, name}`, reads as the flat one does.
+        let wire: Browser = serde_json::from_value(json!({
+            "action": "click", "url": "https://mail.example.com/c",
+            "origin": "https://mail.example.com",
+            "element": {"role": "button", "name": "Send"}, "typed": []
+        }))
+        .unwrap();
+        assert_eq!((wire.role.as_str(), wire.name.as_str()), ("button", "Send"));
+        let manual = config(&h.dir, "");
+        let req = Request {
+            browser: Some(wire),
+            ..click("", "", "unread:4")
+        };
+        let Verdict::Wait { id } = decide(&manual, &h.store, &req, owner(), now) else {
+            panic!("a send button waits under manual")
+        };
+        let card = notices(&h.store).pop().unwrap();
+        assert!(
+            card.starts_with(&format!("[zephyr] approve #{id}: message (browser)\n")),
+            "{card}"
+        );
+        assert_eq!(
+            outcomes(&h.store),
+            ["held", "held", "held", "held", "denied", "held"]
+        );
     }
 
     #[test]
