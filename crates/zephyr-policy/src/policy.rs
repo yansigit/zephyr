@@ -455,12 +455,14 @@ pub fn gated(
             // naming no one goes to someone the gate cannot read, so `ask-new` never lets it by.
             let mut targets = vec![label.clone()];
             if class != Class::Money {
-                // B3: the tool's own name is no recipient; with nothing else, `unknown`.
-                let named = connector_recipients(arguments);
+                // B3: the tool's own name is no recipient; with nothing else, `unknown`. R69: a
+                // recipient found deeper never stands in for a top level that names no one.
+                let (named, top) = connector_recipients(arguments);
                 let named: Vec<String> = named.into_iter().filter(|t| *t != label).collect();
-                match named.is_empty() {
-                    true => targets.push(UNKNOWN.to_string()),
-                    false => targets.extend(named),
+                let unread = named.is_empty() || !top.iter().any(|t| *t != label);
+                targets.extend(named);
+                if unread && !targets.iter().any(|t| t == UNKNOWN) {
+                    targets.push(UNKNOWN.to_string());
                 }
             }
             Some(Gated {
@@ -481,8 +483,10 @@ pub fn gated(
 /// out of `Name <a@x.org>` and comma-separated lists. B3: a recipient given as an object counts
 /// by its address-like fields (an `id`, an `address`, a recipient key, an email anywhere in it),
 /// and one that names none, or a value that is no string, number, list or object (`true`,
-/// `null`), is [`UNKNOWN`], so `ask-new` never lets a send by on its one known recipient.
-fn connector_recipients(arguments: Option<&Value>) -> Vec<String> {
+/// `null`), is [`UNKNOWN`], so `ask-new` never lets a send by on its one known recipient. R69: a
+/// key also counts by its words (`toRecipients`, `cc_emails`, `channelIds`). Returns every
+/// recipient, and those the top level of the arguments names.
+fn connector_recipients(arguments: Option<&Value>) -> (Vec<String>, Vec<String>) {
     const KEYS: &[&str] = &[
         "to",
         "cc",
@@ -573,32 +577,69 @@ fn connector_recipients(arguments: Option<&Value>) -> Vec<String> {
             _ => false,
         }
     }
-    /// The arguments: recipient keys at any depth.
+    /// Whether a (normalized) key names recipients: one of `KEYS`, or one with a recipient word
+    /// among its parts (R69).
+    fn recipient_key(k: &str) -> bool {
+        const WORDS: &[&str] = &[
+            "to",
+            "cc",
+            "bcc",
+            "recipient",
+            "recipients",
+            "email",
+            "emails",
+            "channel",
+            "channels",
+            "user",
+            "users",
+            "chat",
+            "thread",
+            "phone",
+        ];
+        KEYS.contains(&k) || k.split('_').any(|w| WORDS.contains(&w))
+    }
+    /// The recipients one object's own keys name: `KEYS` first, in their order, then the keys
+    /// that count by their words.
+    fn level(map: &serde_json::Map<String, Value>, out: &mut Vec<String>) {
+        for key in KEYS {
+            for (k, v) in map {
+                if normalize_tool(k) == *key {
+                    value(v, out);
+                }
+            }
+        }
+        for (k, v) in map {
+            let k = normalize_tool(k);
+            if !KEYS.contains(&k.as_str()) && recipient_key(&k) {
+                value(v, out);
+            }
+        }
+    }
+    /// What lies under an object's other keys: recipient keys at any depth.
+    fn below(map: &serde_json::Map<String, Value>, out: &mut Vec<String>) {
+        for (k, v) in map {
+            if !recipient_key(&normalize_tool(k)) {
+                walk(v, out);
+            }
+        }
+    }
     fn walk(v: &Value, out: &mut Vec<String>) {
         match v {
             Value::Object(map) => {
-                for key in KEYS {
-                    for (k, v) in map {
-                        if normalize_tool(k) == *key {
-                            value(v, out);
-                        }
-                    }
-                }
-                for (k, v) in map {
-                    if !KEYS.contains(&normalize_tool(k).as_str()) {
-                        walk(v, out);
-                    }
-                }
+                level(map, out);
+                below(map, out);
             }
             Value::Array(items) => items.iter().for_each(|i| walk(i, out)),
             _ => {}
         }
     }
-    let mut out = Vec::new();
-    if let Some(v @ Value::Object(_)) = arguments {
-        walk(v, &mut out);
+    let (mut out, mut top) = (Vec::new(), Vec::new());
+    if let Some(Value::Object(map)) = arguments {
+        level(map, &mut top);
+        out.clone_from(&top);
+        below(map, &mut out);
     }
-    out
+    (out, top)
 }
 
 /// `createIssue`, `create-issue` and `Create_Issue` all become `create_issue`.
@@ -2652,9 +2693,10 @@ mod tests {
                 json!({"to": "a@x.org", "message": {"cc": "b@y.org"}}),
                 vec!["mail/send_email", "a@x.org", "b@y.org"],
             ),
+            // R69: found only below the top level, so `unknown` too, as `main` had it
             (
                 json!({"envelope": [{"recipients": [{"user": {"id": "U9"}}]}]}),
-                vec!["mail/send_email", "u9"],
+                vec!["mail/send_email", "u9", UNKNOWN],
             ),
             (
                 json!({"to": "a@x.org", "cc": {"list": [{"address": "c@z.org"}]}}),
@@ -2673,6 +2715,50 @@ mod tests {
         for (arguments, want) in table {
             assert_eq!(targets(arguments.clone()), want, "{arguments}");
         }
+    }
+
+    /// R69: a recipient found deeper in a connector call never stands in for the `unknown` the
+    /// top level gives when it names no one, and recipient keys are read by their words
+    /// (`toRecipients`, `cc_emails`), so a decoy beside the real recipient can't make it known.
+    #[test]
+    fn a_nested_recipient_never_stands_in_for_unknown() {
+        let targets = |arguments: Value| {
+            gated(
+                "mcp_call",
+                &mcp("Mail", "send_email", arguments),
+                &no_classes,
+            )
+            .unwrap()
+            .targets
+        };
+        let decoy = json!({
+            "message": {"toRecipients": [{"emailAddress": {"address": "new@y.org"}}]},
+            "meta": {"to": "known@x.org"},
+        });
+        let got = targets(decoy);
+        for want in ["known@x.org", "new@y.org", UNKNOWN] {
+            assert!(got.iter().any(|t| t == want), "{want} not in {got:?}");
+        }
+        let got = targets(json!({"message": {"dest": "new"}, "meta": {"to": "known@x.org"}}));
+        assert!(got.iter().any(|t| t == UNKNOWN), "{got:?}");
+        let got = targets(json!({
+            "to": "known@x.org",
+            "message": {"toRecipients": [{"emailAddress": {"address": "new@y.org"}}]},
+        }));
+        assert!(got.iter().any(|t| t == "new@y.org"), "{got:?}");
+        // Named at the top level by their words: no `unknown`.
+        let got = targets(json!({
+            "toRecipients": [{"emailAddress": {"address": "a@x.org"}}],
+            "ccRecipients": [{"emailAddress": {"address": "b@y.org"}}],
+            "cc_emails": ["c@z.org"],
+        }));
+        assert_eq!(got.len(), 4, "{got:?}");
+        for want in ["a@x.org", "b@y.org", "c@z.org"] {
+            assert!(got.iter().any(|t| t == want), "{want} not in {got:?}");
+        }
+        // The tool's own name at the top level names no one either.
+        let got = targets(json!({"to": "mail/send_email", "message": {"cc": "b@y.org"}}));
+        assert!(got.iter().any(|t| t == UNKNOWN), "{got:?}");
     }
 
     #[test]
