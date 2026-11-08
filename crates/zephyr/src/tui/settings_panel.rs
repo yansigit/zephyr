@@ -995,7 +995,7 @@ fn about_setting(e: &Entry, strong: &[String]) -> Vec<String> {
     // The key first, since rows can share a label; a read-only row without a value already
     // shows its help.
     let dot = format!(" {} ", glyph("·"));
-    let help = !e.help.is_empty() && !(e.read_only() && e.value.is_none());
+    let help = !(e.help.is_empty() || (e.read_only() && e.value.is_none()));
     let mut out = vec![match help {
         true => format!("{}{dot}{}", e.key, e.help),
         false => e.key.clone(),
