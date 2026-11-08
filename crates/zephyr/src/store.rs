@@ -250,9 +250,15 @@ fn action_row_in(
     let Some((channel, sender)) = to else {
         return Ok(false);
     };
+    // R70: the summary as the private facts are now, from the facts file beside the database.
+    let summary = summary.unwrap_or_default();
+    let summary = match db.path().filter(|p| !p.is_empty()) {
+        Some(p) => crate::facts::scrubbed_in(&crate::facts::beside(Path::new(p)), summary),
+        None => summary,
+    };
     let n = db.execute(
         "INSERT OR IGNORE INTO inbox(channel, platform_msg_id, sender, text) VALUES (?1, ?2, ?3, ?4)",
-        params![channel, format!("action-{id}"), sender, text(&summary.unwrap_or_default())],
+        params![channel, format!("action-{id}"), sender, text(&summary)],
     )?;
     Ok(n == 1)
 }

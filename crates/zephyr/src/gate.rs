@@ -1223,8 +1223,10 @@ impl Conn {
             // Told only of a row this ended, on the action's channel, as its other outcomes.
             if store.finish_action(id, status, result)? {
                 if let (Some(tail), Some(a)) = (told, store.action(id)?) {
-                    let text = format!("[zephyr] #{id} ({}){tail}", a.summary);
-                    crate::actions::tell(&cfg, &store, &a, &text);
+                    // R70: the summary as the private facts are now.
+                    let summary = crate::facts::scrubbed(&cfg, a.summary.clone());
+                    let text = format!("[zephyr] #{id} ({summary}){tail}");
+                    crate::actions::tell(&store, &a, &text);
                     return Ok(true);
                 }
             }

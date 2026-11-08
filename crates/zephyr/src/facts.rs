@@ -28,6 +28,12 @@ pub fn path(cfg: &Config) -> PathBuf {
     cfg.state_dir().join(FILE)
 }
 
+/// The facts file beside the state database at `db` (`<state>/state.db`), for the store, which
+/// has no config, to scrub what it writes (R70).
+pub fn beside(db: &Path) -> PathBuf {
+    db.with_file_name(FILE)
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FactKind {
     #[default]
@@ -452,7 +458,12 @@ pub fn redact(command: &str) -> String {
 
 /// `text` with the facts as they are now scrubbed out. Fails closed, as `vault::scrubbed` does.
 pub fn scrubbed(cfg: &Config, text: String) -> String {
-    match load(&path(cfg)) {
+    scrubbed_in(&path(cfg), text)
+}
+
+/// `text` scrubbed of the facts in the file at `facts`; fails closed.
+pub fn scrubbed_in(facts: &Path, text: String) -> String {
+    match load(facts) {
         Ok(facts) => scrub(&facts, &text),
         Err(_) => "[output withheld: the private facts could not be read]".into(),
     }
@@ -697,6 +708,16 @@ mod tests {
             kind,
             value: value.into(),
             allow: vec![],
+        }
+    }
+
+    /// The store finds the facts beside its database: the same file the config names.
+    #[test]
+    fn the_facts_lie_beside_the_state_database() {
+        for extra in ["", "state = '/var/lib/zephyr'\n"] {
+            let text = format!("rpi = '/r'\nhome = '/zephyr'\ntimezone = 'UTC'\n{extra}");
+            let cfg: Config = toml::from_str(&text).unwrap();
+            assert_eq!(beside(&cfg.db_path()), path(&cfg));
         }
     }
 

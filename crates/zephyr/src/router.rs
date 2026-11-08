@@ -1397,9 +1397,14 @@ impl<'a> Router<'a> {
         let money_strong = (crate::approvals::strong_only(&self.cfg).iter()).any(|s| s == "money");
         let proposals: Vec<Value> = (list.into_iter())
             .map(|p| {
+                // An action's stored summary, until its card is read below (R70).
+                let card = match p.kind.as_str() {
+                    "command" => p.command.clone(),
+                    _ => crate::facts::scrubbed(&self.cfg, p.command.clone()),
+                };
                 let mut v = json!({
                     "id": p.id,
-                    "card": p.command,
+                    "card": card,
                     "kind": if p.kind != "command" {
                         p.kind.as_str()
                     } else if p.key.is_some() {

@@ -101,11 +101,6 @@ pub enum By<'a> {
 /// paused, a payment needs a strong channel, or every process slot is taken (R44). The owner
 /// approving under `ask-new` remembers its targets once it started, unless `once` (R46).
 pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<String, String> {
-    let shown = |text: String| shown(ctx.cfg, text);
-    approved(ctx, id, once, by, now).map(shown).map_err(shown)
-}
-
-fn approved(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<String, String> {
     let store = ctx.store;
     let failed = |e: rusqlite::Error| format!("[zephyr] reading proposal #{id} failed: {e}");
     let waiting = |a: &Action| matches!(a.status.as_str(), "pending" | "scheduled");
@@ -151,7 +146,7 @@ fn approved(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<String, 
         ActionKind::Pass => pass(ctx, &a, by, now),
         ActionKind::Wait => wait(ctx, &a),
     };
-    let (n, s) = (a.id, &a.summary);
+    let (n, s) = (a.id, summary(ctx.cfg, &a));
     Ok(match (started, by) {
         (Ok(what), By::Owner { .. }) => {
             // Only the owner's own approval of what started makes a target known.
@@ -195,7 +190,10 @@ fn remember(cfg: &Config, store: &Store, a: &Action) -> String {
     }
     match new.is_empty() {
         true => String::new(),
-        false => format!("; from now on {} goes without asking", new.join(", ")),
+        false => format!(
+            "; from now on {} goes without asking",
+            crate::facts::scrubbed(cfg, new.join(", "))
+        ),
     }
 }
 
@@ -242,7 +240,7 @@ fn pass(ctx: &Ctx, a: &Action, by: By, now: i64) -> Result<String, String> {
     let text = format!(
         "{what} ({}): make exactly that connector call again within 30 min and it goes \
          through, once",
-        a.summary
+        summary(ctx.cfg, a)
     );
     let steered = Note {
         action: a.id,
@@ -255,7 +253,7 @@ fn pass(ctx: &Ctx, a: &Action, by: By, now: i64) -> Result<String, String> {
         ..
     }) = ctx.steers.send(&a.origin.session, steered)
     {
-        note(ctx.cfg, store, a, &word, &text);
+        note(store, a, &word, &text);
     }
     Ok("the agent may make exactly that call once in the next 30 min".into())
 }
@@ -274,7 +272,7 @@ fn wait(ctx: &Ctx, a: &Action) -> Result<String, String> {
 /// set it in motion.
 fn not_run(cfg: &Config, store: &Store, a: &Action, by: By, why: &str) -> String {
     finish(store, a, "failed", why);
-    let (n, s) = (a.id, &a.summary);
+    let (n, s) = (a.id, summary(cfg, a));
     let (agent, owner) = match by {
         By::Owner { .. } => (
             format!("the owner approved #{n} ({s}), but it did not start: {why}"),
@@ -285,14 +283,15 @@ fn not_run(cfg: &Config, store: &Store, a: &Action, by: By, why: &str) -> String
             format!("[zephyr] #{n} ({s}) came due, but it did not start: {why}"),
         ),
     };
-    note(cfg, store, a, "not run", &agent);
+    note(store, a, "not run", &agent);
     owner
 }
 
-/// R70: `text` about a held action as it may be shown now. Its summary was scrubbed of the
-/// private facts when it was held; a fact saved since is scrubbed here (fails closed).
-fn shown(cfg: &Config, text: String) -> String {
-    crate::facts::scrubbed(cfg, text)
+/// R70: `a`'s summary as it may be shown now. It was scrubbed of the private facts when it was
+/// held; a fact saved since is scrubbed here. When the facts can't be read only the summary is
+/// withheld, so whatever shows it still names the action and how to answer it.
+fn summary(cfg: &Config, a: &Action) -> String {
+    crate::facts::scrubbed(cfg, a.summary.clone())
 }
 
 /// The owner's decision on `a` as an audit row (spec §4.9), beside the gate's own: the action's
@@ -305,7 +304,7 @@ fn audit(cfg: &Config, store: &Store, a: &Action, outcome: &str) {
         ActionKind::Pass => "mcp_call",
         ActionKind::Wait => "browser",
     };
-    let args = shown(cfg, format!("#{} {}", a.id, a.summary));
+    let args = format!("#{} {}", a.id, summary(cfg, a));
     if let Err(e) = store.audit(&a.origin.session, tool, &args, outcome) {
         eprintln!("zephyr: writing the audit failed: {e}");
     }
@@ -317,8 +316,8 @@ fn finish(store: &Store, a: &Action, status: &str, result: &str) {
     }
 }
 
-fn note(cfg: &Config, store: &Store, a: &Action, word: &str, text: &str) {
-    if let Err(e) = store.action_note(a.id, word, &shown(cfg, text.to_string())) {
+fn note(store: &Store, a: &Action, word: &str, text: &str) {
+    if let Err(e) = store.action_note(a.id, word, text) {
         eprintln!("zephyr: telling the agent about #{} failed: {e}", a.id);
     }
 }
@@ -347,12 +346,10 @@ pub fn decline(cfg: &Config, store: &Store, id: i64) -> String {
     match store.take_action(id, "dropped") {
         Ok(Some(a)) => {
             audit(cfg, store, &a, "dropped");
-            let text = format!(
-                "the owner declined #{id} ({}); don't try it again",
-                a.summary
-            );
-            note(cfg, store, &a, "declined", &text);
-            shown(cfg, format!("[zephyr] dropped #{id} ({})", a.summary))
+            let s = summary(cfg, &a);
+            let text = format!("the owner declined #{id} ({s}); don't try it again");
+            note(store, &a, "declined", &text);
+            format!("[zephyr] dropped #{id} ({s})")
         }
         Ok(None) => not_waiting(id),
         Err(e) => format!("[zephyr] reading proposal #{id} failed: {e}"),
@@ -380,15 +377,10 @@ pub fn cancel(cfg: &Config, store: &Store, waits: &Waits, arg: &str) -> Result<S
         Ok(Some(a)) => {
             audit(cfg, store, &a, "cancelled");
             waits.answer(id, false);
-            let text = format!(
-                "the owner cancelled #{id} ({}); don't try it again",
-                a.summary
-            );
-            note(cfg, store, &a, "cancelled", &text);
-            Ok(shown(
-                cfg,
-                format!("[zephyr] cancelled #{id} ({})", a.summary),
-            ))
+            let s = summary(cfg, &a);
+            let text = format!("the owner cancelled #{id} ({s}); don't try it again");
+            note(store, &a, "cancelled", &text);
+            Ok(format!("[zephyr] cancelled #{id} ({s})"))
         }
         Ok(None) => Err(not_waiting(id)),
         Err(e) => Err(format!("[zephyr] reading proposal #{id} failed: {e}")),
@@ -410,17 +402,20 @@ pub fn held(cfg: &Config, store: &Store) -> String {
             ("scheduled", Some(at)) => format!(
                 "#{} {} · sending at {} unless /cancel {}",
                 a.id,
-                a.summary,
+                summary(cfg, a),
                 crate::settings::clock(at, &tz),
                 a.id
             ),
-            _ => format!("#{} {} · /ok {} · /no {}", a.id, a.summary, a.id, a.id),
+            _ => format!(
+                "#{} {} · /ok {} · /no {}",
+                a.id,
+                summary(cfg, a),
+                a.id,
+                a.id
+            ),
         })
         .collect();
-    shown(
-        cfg,
-        format!("[zephyr] held for you, newest first:\n{}", lines.join("\n")),
-    )
+    format!("[zephyr] held for you, newest first:\n{}", lines.join("\n"))
 }
 
 /// The router's tick (spec §4.6). Delays that came due go as an `/ok` would, and whoever set
@@ -453,9 +448,10 @@ pub fn tick(ctx: &Ctx, now: i64, held: bool) {
                 let text = format!(
                     "the owner did not answer #{} ({}) within {within}, so it was not run; ask \
                      again if it is still wanted",
-                    a.id, a.summary
+                    a.id,
+                    summary(ctx.cfg, &a)
                 );
-                note(ctx.cfg, store, &a, "expired", &text);
+                note(store, &a, "expired", &text);
             }
         }
         Err(e) => eprintln!("zephyr: expiring held actions failed: {e}"),
@@ -473,18 +469,13 @@ fn due_now(ctx: &Ctx, a: &Action, now: i64) {
         match store.unschedule(a.id) {
             Ok(true) => {
                 audit(ctx.cfg, store, a, "re-asked");
-                let (n, s) = (a.id, &a.summary);
+                let (n, s) = (a.id, summary(ctx.cfg, a));
                 let text =
                     format!("[zephyr] #{n} ({s}) came due, but {why}, so it waits for you again");
-                tell(ctx.cfg, store, a, &text);
+                tell(store, a, &text);
                 let mut again = a.clone();
                 again.status = "pending".into();
-                tell(
-                    ctx.cfg,
-                    store,
-                    a,
-                    &crate::gate::card(&again, ctx.cfg, store),
-                );
+                tell(store, a, &crate::gate::card(&again, ctx.cfg, store));
             }
             Ok(false) => {}
             Err(e) => eprintln!("zephyr: holding delayed #{} failed: {e}", a.id),
@@ -495,13 +486,14 @@ fn due_now(ctx: &Ctx, a: &Action, now: i64) {
     if full {
         match store.unschedule(a.id) {
             Ok(true) => {
-                let (n, s) = (a.id, &a.summary);
+                audit(ctx.cfg, store, a, "re-asked");
+                let (n, s) = (a.id, summary(ctx.cfg, a));
                 let text = format!(
                     "[zephyr] #{n} ({s}) came due, but {} commands are running, so it waits for \
                      you: /ok {n} when one ends, /no {n} drops it",
                     crate::store::MAX_RUNNING_PROCS
                 );
-                tell(ctx.cfg, store, a, &text);
+                tell(store, a, &text);
             }
             Ok(false) => {}
             Err(e) => eprintln!("zephyr: holding delayed #{} failed: {e}", a.id),
@@ -509,7 +501,7 @@ fn due_now(ctx: &Ctx, a: &Action, now: i64) {
         return;
     }
     match approve(ctx, a.id, false, By::Delay, now) {
-        Ok(text) => tell(ctx.cfg, store, a, &text),
+        Ok(text) => tell(store, a, &text),
         Err(why) => eprintln!("zephyr: delayed #{} did not go: {why}", a.id),
     }
 }
@@ -558,9 +550,10 @@ pub fn restore(cfg: &Config, store: &Store, now: i64) {
                 audit(cfg, store, &a, "failed");
                 let text = format!(
                     "[zephyr] #{} ({}) did not run: {RESTARTED}",
-                    a.id, a.summary
+                    a.id,
+                    summary(cfg, &a)
                 );
-                tell(cfg, store, &a, &text);
+                tell(store, &a, &text);
             }
         }
         Err(e) => eprintln!("zephyr: ending the browser waits failed: {e}"),
@@ -574,21 +567,21 @@ pub fn restore(cfg: &Config, store: &Store, now: i64) {
 /// Why a browser action waiting at start did not run.
 const RESTARTED: &str = "zephyr restarted while the browser waited";
 
-/// Shows each action's card to whoever it waits for.
+/// Shows each action's card to whoever it waits for, again, and audits that it was asked again.
 fn ask(cfg: &Config, store: &Store, actions: &[Action]) {
     for a in actions {
-        tell(cfg, store, a, &crate::gate::card(a, cfg, store));
+        audit(cfg, store, a, "re-asked");
+        tell(store, a, &crate::gate::card(a, cfg, store));
     }
 }
 
-/// A notice about `a` for the owner of the run that asked (else the owner last answered),
-/// scrubbed of the private facts as they are now (R70). The gate socket tells this way of a
-/// browser action the owner let go that did not run.
-pub(crate) fn tell(cfg: &Config, store: &Store, a: &Action, text: &str) {
-    let text = shown(cfg, text.to_string());
+/// A notice about `a` for the owner of the run that asked (else the owner last answered). The
+/// gate socket tells this way of a browser action the owner let go that did not run. What it
+/// says shows `a`'s summary as [`summary`] gives it (R70).
+pub(crate) fn tell(store: &Store, a: &Action, text: &str) {
     let told = match a.origin.channel.is_empty() {
-        true => store.notify_last_owner(&text),
-        false => store.notify(&a.origin.channel, &a.origin.sender, &text),
+        true => store.notify_last_owner(text),
+        false => store.notify(&a.origin.channel, &a.origin.sender, text),
     };
     if let Err(e) = told {
         eprintln!("zephyr: telling the owner about #{} failed: {e}", a.id);
@@ -925,11 +918,12 @@ mod tests {
             .any(|t| t.contains("5550102345") || t.contains("010 2345")));
     }
 
-    /// R66: a held action's summary was scrubbed of the facts when it was held. A fact saved
-    /// since is scrubbed too, from every notice, agent note, reply and audit row that shows it.
+    /// R70: a held action's summary was scrubbed of the facts when it was held. A fact saved
+    /// since is scrubbed too, from every notice, agent note (the store's own reports among them),
+    /// reply and audit row that shows it.
     #[test]
     fn a_summary_is_scrubbed_with_the_facts_as_they_are_when_shown() {
-        let (held_cfg, store) = setup(
+        let (held_cfg, mut store) = setup(
             "actions-scrub-summary",
             "[approvals]\nmessages = 'delay 5'\n",
         );
@@ -937,6 +931,11 @@ mod tests {
         let due = hold(&store, ActionKind::Run, SEND, &[], Some(now + 300));
         let declined = hold(&store, ActionKind::Run, SEND, &[], None);
         let cancelled = hold(&store, ActionKind::Run, SEND, &[], Some(now + 300));
+        let ran = hold(&store, ActionKind::Run, SEND, &[], None);
+        let lost = hold(&store, ActionKind::Run, SEND, &[], None);
+        for id in [ran, lost] {
+            store.take_action(id, "running").unwrap();
+        }
         // The owner saved the recipient as a private fact since, and made messages `ask`.
         let cfg = again(&held_cfg, "[approvals]\nmessages = 'ask'\n");
         std::fs::write(
@@ -948,6 +947,12 @@ mod tests {
         let mut shown = vec![held(&cfg, &store)];
         shown.push(decline(&cfg, &store, declined));
         shown.push(cancel(&cfg, &store, &waits, &cancelled.to_string()).unwrap());
+        // The store's own notes to main: an approved command's report, and one a restart lost.
+        store
+            .action_report(ran, "done", "exited 0 after 1s", "ok")
+            .unwrap();
+        restore(&cfg, &store, now);
+        assert_eq!(store.action(lost).unwrap().unwrap().status, "unknown");
         let ctx = Ctx {
             cfg: &cfg,
             store: &store,
@@ -965,7 +970,7 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert!(!notes.is_empty());
+        assert_eq!(notes.len(), 4, "{notes:#?}");
         shown.extend(notes);
         let audit = store.audit_rows().unwrap();
         shown.extend(audit.iter().map(|(_, _, args, _)| args.clone()));
@@ -980,6 +985,58 @@ mod tests {
             "{shown:#?}"
         );
         // NB6: asking again is in the audit, as every other outcome on the tick is.
+        assert!(
+            audit.iter().any(
+                |(_, _, args, outcome)| args.starts_with(&format!("#{due} "))
+                    && outcome == "re-asked"
+            ),
+            "{audit:#?}"
+        );
+    }
+
+    /// R70: with a facts file that can't be read, only what could hold a fact is withheld:
+    /// `/held`, the notices, the card shown again and the audit still name the action and how to
+    /// answer it.
+    #[test]
+    fn an_unreadable_facts_file_withholds_only_the_summary() {
+        let (held_cfg, store) = setup(
+            "actions-scrub-unreadable",
+            "[approvals]\nmessages = 'delay 5'\n",
+        );
+        let now = crate::now();
+        let due = hold(&store, ActionKind::Run, SEND, &[], Some(now + 300));
+        let cfg = again(&held_cfg, "[approvals]\nmessages = 'ask'\n");
+        std::fs::write(crate::facts::path(&cfg), "not toml [").unwrap();
+        let listed = held(&cfg, &store);
+        assert!(
+            listed.contains(&format!("#{due} ")) && listed.contains(&format!("/cancel {due}")),
+            "{listed}"
+        );
+        let (procs, waits, steers) = (Procs::default(), Waits::default(), Steers::default());
+        let ctx = Ctx {
+            cfg: &cfg,
+            store: &store,
+            procs: &procs,
+            waits: &waits,
+            steers: &steers,
+        };
+        tick(&ctx, now + 301, false);
+        let told = told(&store);
+        assert!(
+            told.iter()
+                .any(|t| t.starts_with(&format!("[zephyr] #{due} (")) && t.contains("came due")),
+            "{told:#?}"
+        );
+        assert!(
+            told.iter()
+                .any(|t| t.starts_with(&format!("[zephyr] approve #{due}:"))
+                    && t.contains(&format!("/ok {due}"))),
+            "{told:#?}"
+        );
+        let mut all = told;
+        all.push(listed);
+        assert!(!all.iter().any(|t| t.contains("a@x.org")), "{all:#?}");
+        let audit = store.audit_rows().unwrap();
         assert!(
             audit.iter().any(
                 |(_, _, args, outcome)| args.starts_with(&format!("#{due} "))
