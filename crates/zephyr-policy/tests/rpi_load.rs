@@ -466,6 +466,14 @@ impl GatewayRpi {
         self.stdin.write_all(b"\n").unwrap();
     }
 
+    /// Answers the waiting call `id` as the daemon does (`tools::answer_gateway`): the whole
+    /// file at once, renamed into place, since the plugin's poll consumes whatever it reads.
+    fn answer(&self, id: &str, text: &str) {
+        let tmp = self.gw.join(format!("{id}.tmp"));
+        std::fs::write(&tmp, text).unwrap();
+        std::fs::rename(&tmp, self.gw.join(id)).unwrap();
+    }
+
     /// Sends the prompt and returns once the `tool` call `id` has started.
     fn until_call(&mut self, tool: &str, id: &str) {
         self.send(r#"{"id":"1","type":"prompt","message":"status?"}"#);
@@ -503,7 +511,7 @@ fn rpi_waits_for_a_gateway_answer_mid_turn() {
         state["type"], "response",
         "rpi ended the call before the answer: {state}"
     );
-    std::fs::write(rpi.gw.join("toolu_gw"), "agent: answered by the test").unwrap();
+    rpi.answer("toolu_gw", "agent: answered by the test");
     let end = rpi.next(|v| v["type"] == "tool_execution_end");
     assert_ne!(end["isError"], true, "{end}");
     rpi.next(|v| v["type"] == "agent_settled");
@@ -533,7 +541,7 @@ fn the_main_child_runs_commands_through_exec_and_waits_for_them() {
     let mut rpi = GatewayRpi::start_with("exec", vec![first], true);
     rpi.until_call("exec", "toolu_exec");
     std::thread::sleep(std::time::Duration::from_secs(11));
-    std::fs::write(rpi.gw.join("toolu_exec"), "exited 0\nbuilt").unwrap();
+    rpi.answer("toolu_exec", "exited 0\nbuilt");
     let end = rpi.next(|v| v["type"] == "tool_execution_end");
     assert_ne!(end["isError"], true, "{end}");
     assert!(end.to_string().contains("exited 0"), "{end}");
@@ -617,7 +625,7 @@ fn rpi_waits_for_a_task_answer_mid_turn() {
         state["type"], "response",
         "rpi ended the call before the answer: {state}"
     );
-    std::fs::write(rpi.gw.join("toolu_task"), "task 1: running").unwrap();
+    rpi.answer("toolu_task", "task 1: running");
     let end = rpi.next(|v| v["type"] == "tool_execution_end");
     assert_ne!(end["isError"], true, "{end}");
     assert!(
