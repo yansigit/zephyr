@@ -174,13 +174,21 @@ COPY --from=rust /out/lib/libzephyr_policy.so /usr/local/lib/libzephyr_policy.so
 COPY --from=rust /out/ext/ /opt/zephyr/ext/
 COPY --from=plugins /out/ext/ /opt/zephyr/ext/
 COPY --from=browser /out/browser/ /opt/zephyr/browser/
-COPY --from=browser /out/bin/agent-browser /usr/local/bin/agent-browser
+# The real agent-browser, out of the agent's PATH: `agent-browser` there is zephyr's approvals
+# wrapper (approvals spec §4.4), which runs this one once the click is allowed.
+COPY --from=browser /out/bin/agent-browser /opt/zephyr/libexec/agent-browser
 COPY --from=python /opt/zephyr/py/ /opt/zephyr/py/
 COPY --from=python /opt/zephyr/camoufox/ /opt/zephyr/camoufox/
 COPY --from=python /usr/local/bin/uv /usr/local/bin/uv
+# `/opt/zephyr/gate/bin` (root's, 0755, holding only the browser wrapper) is first on the
+# agent's PATH (agent::AGENT_PATH), so an agent-browser the agent drops in its own bin does
+# not shadow it; `zephyr doctor` checks the layout.
 RUN ln -s /opt/zephyr/camoufox/camoufox-python /usr/local/bin/camoufox-python \
     && ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
-    && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+    && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && mkdir -p /opt/zephyr/gate/bin \
+    && chmod 755 /opt/zephyr/libexec /opt/zephyr/gate /opt/zephyr/gate/bin \
+    && ln -s /usr/local/bin/zephyr /opt/zephyr/gate/bin/agent-browser
 # The zephyr binary runs its daemon commands here, and the host commands outside.
 ENV ZEPHYR_IN_CONTAINER=1
 # The daemon starts an X display here for the agent (§4.11); every child inherits these.

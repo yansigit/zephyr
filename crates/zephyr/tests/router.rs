@@ -5165,3 +5165,164 @@ async fn a_pass_is_steered_into_the_task_that_asked_while_it_runs() {
     assert!(inbox_text(&home, "action-1").is_none());
     gw.shutdown().await;
 }
+
+// ---- the browser wrapper (approvals spec §4.4) ----
+
+/// A stand-in for the real agent-browser: it appends each argv to `ab-argv.log` beside it and
+/// answers `get url`, `get title`, `snapshot` and `eval` with `ab-<what>.json` (with `--json`) or
+/// `ab-<what>.txt` (without); anything else prints `done: <argv>`.
+const FAKE_BROWSER: &str = r#"#!/bin/sh
+d=$(dirname "$0")
+printf '%s\n' "$*" >> "$d/ab-argv.log"
+case " $* " in *" --json "*) ext=json ;; *) ext=txt ;; esac
+case " $* " in
+  *" get url "*) f=url ;;
+  *" get title "*) f=title ;;
+  *" snapshot "*) f=snapshot ;;
+  *" eval "*) f=eval ;;
+  *) echo "done: $*"; exit 0 ;;
+esac
+[ -f "$d/ab-$f.$ext" ] || { echo "no $f" >&2; exit 1; }
+cat "$d/ab-$f.$ext"
+"#;
+
+/// A home whose `bin/agent-browser` is the wrapper (zephyr itself, by that name), with the fake
+/// as the real agent-browser, open on `url`: a compose page with a Send button, `@e3`.
+fn browser_home(name: &str, url: &str) -> (PathBuf, Config) {
+    use std::os::unix::fs::PermissionsExt;
+    let home = home(name);
+    std::fs::create_dir_all(home.join("bin")).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_zephyr"), home.join("bin/agent-browser"))
+        .unwrap();
+    let real = home.join("real-agent-browser");
+    std::fs::write(&real, FAKE_BROWSER).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ok = |data: Value| serde_json::json!({"success": true, "data": data}).to_string();
+    std::fs::write(
+        home.join("ab-url.json"),
+        ok(serde_json::json!({ "url": url })),
+    )
+    .unwrap();
+    std::fs::write(home.join("ab-url.txt"), format!("{url}\n")).unwrap();
+    let tree =
+        "- textbox \"To\" [ref=e1]\n- textbox \"Message\" [ref=e2]\n- button \"Send\" [ref=e3]";
+    let refs = serde_json::json!({
+        "e1": {"role": "textbox", "name": "To"},
+        "e2": {"role": "textbox", "name": "Message"},
+        "e3": {"role": "button", "name": "Send"},
+    });
+    let snapshot = ok(serde_json::json!({"snapshot": tree, "origin": url, "refs": refs}));
+    std::fs::write(home.join("ab-snapshot.json"), snapshot).unwrap();
+    let mut cfg = config(&home);
+    cfg.agent_browser = real;
+    (home, cfg)
+}
+
+/// Each command the fake real agent-browser ran.
+fn browser_argv(home: &Path) -> Vec<String> {
+    let log = std::fs::read_to_string(home.join("ab-argv.log")).unwrap_or_default();
+    log.lines().map(String::from).collect()
+}
+
+fn clicks(home: &Path) -> Vec<String> {
+    let all = browser_argv(home).into_iter();
+    all.filter(|l| l.starts_with("click")).collect()
+}
+
+/// Main's `exec` of `<home>/bin/agent-browser click @e3`: the agent clicking Send.
+fn click_send(home: &Path) -> String {
+    let wrapper = home.join("bin/agent-browser");
+    format!(
+        r#"[call exec {{"command": "{} click @e3"}}]"#,
+        wrapper.display()
+    )
+}
+
+const COMPOSE_URL: &str = "https://mail.example.com/compose";
+
+#[tokio::test]
+async fn a_browser_send_waits_until_ok_and_then_clicks() {
+    let (home, cfg) = browser_home("gate-browser", COMPOSE_URL);
+    let gw = start(cfg); // manual
+    gw.say("m1", "owner", &click_send(&home)).await;
+    let card = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    assert!(
+        card.starts_with(
+            "[zephyr] approve #1: message (browser)\non: https://mail.example.com\n\
+             page: \"https://mail.example.com/compose\" · button: \"Send\"\n"
+        ),
+        "{card}"
+    );
+    assert!(
+        card.ends_with("/ok 1 · /ok 1 once · /no 1 · expires in 10 min"),
+        "{card}"
+    );
+    // The wrapper read the page through the real binary, and clicked nothing yet.
+    let argv = browser_argv(&home);
+    assert!(argv.contains(&"get url --json".to_string()), "{argv:?}");
+    assert!(clicks(&home).is_empty(), "{argv:?}");
+    assert_eq!(action_status(&home, 1), "pending");
+
+    gw.say("m2", "owner", "/ok 1").await;
+    let approved = reply_where(&gw, "chat", |r| r.contains("approved #1")).await;
+    assert!(
+        approved.starts_with(
+            "[zephyr] approved #1 (click \"Send\" on https://mail.example.com): the browser goes on"
+        ),
+        "{approved}"
+    );
+    // Exactly the agent's own click, once; its output is what `exec` answers.
+    let reply = reply_where(&gw, "chat", |r| r.contains("done: click @e3")).await;
+    assert!(reply.contains("exited 0"), "{reply}");
+    assert_eq!(clicks(&home), ["click @e3"]);
+    assert_eq!(action_status(&home, 1), "done");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn stop_denies_a_waiting_click() {
+    let (home, cfg) = browser_home("gate-browser-stop", COMPOSE_URL);
+    let gw = start(cfg);
+    gw.say("m1", "owner", &click_send(&home)).await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    wait(|| proc_status(&home, "running") == 1).await;
+    gw.say("m2", "owner", "/stop").await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] stopped")).await;
+    // The wrapper ends without clicking; an `/ok` now has no browser to let go.
+    wait(|| proc_status(&home, "running") == 0).await;
+    gw.say("m3", "owner", "/ok 1").await;
+    let late = reply_where(&gw, "chat", |r| {
+        r.starts_with(NO_PROPOSAL) || r.contains("no longer waiting")
+    })
+    .await;
+    assert!(!late.contains("goes on"), "{late}");
+    assert!(clicks(&home).is_empty(), "{:?}", browser_argv(&home));
+    assert_ne!(action_status(&home, 1), "done");
+    gw.shutdown().await;
+}
+
+/// The daemon's own browser calls never go through the wrapper: the vault's fill runs the real
+/// agent-browser by its full path (approvals spec §4.4).
+#[tokio::test]
+async fn the_vaults_fill_runs_the_real_browser_by_its_path() {
+    let (home, cfg) = browser_home("vault-real-browser", "https://github.com/login");
+    let vault = VAULT.replace(
+        "password = \"hunter2-secret\"\n",
+        "password = \"hunter2-secret\"\ngranted = true\n",
+    );
+    std::fs::write(home.join("vault.toml"), vault).unwrap();
+    let gw = start(cfg);
+    let fill = r##"[call vault {"action": "fill", "name": "github", "password": "#pw"}]"##;
+    gw.say("m1", "owner", fill).await;
+    let reply = reply_where(&gw, "chat", |r| r.contains("\nvault: ")).await;
+    assert!(
+        reply.contains("\nvault: filled the password on https://github.com/login"),
+        "{reply}"
+    );
+    assert!(
+        browser_argv(&home).contains(&"fill #pw hunter2-secret".to_string()),
+        "{:?}",
+        browser_argv(&home)
+    );
+    gw.shutdown().await;
+}

@@ -108,11 +108,24 @@ pub fn check_mcp(
     Decision::Allow
 }
 
-/// Files no tool may touch: credentials, another process's environment, ssh keys, and git
-/// hooks and config (a hook, or a program the config names, in a project runs as the owner, on
-/// the host, at their next commit).
+/// Files no tool may touch: credentials, another process's environment, ssh keys, git hooks and
+/// config (a hook, or a program the config names, in a project runs as the owner, on the host,
+/// at their next commit), and the real agent-browser, which clicks past the approvals gate's
+/// wrapper (approvals spec §4.4: `/opt/zephyr/libexec`, or `$ZEPHYR_AGENT_BROWSER` that names
+/// it). A name check: a copy of the binary gets past it (spec §2 non-goals).
 fn sensitive(path: &str) -> Option<&'static str> {
+    if path.contains("ZEPHYR_AGENT_BROWSER") {
+        return Some("the real agent-browser, past the approvals gate");
+    }
     let parts: Vec<&str> = path.split('/').collect();
+    let named: Vec<&str> = parts
+        .iter()
+        .copied()
+        .filter(|p| !matches!(*p, "" | "."))
+        .collect();
+    if named.windows(3).any(|w| w == ["opt", "zephyr", "libexec"]) {
+        return Some("the real agent-browser, past the approvals gate");
+    }
     if let Some(&("auth.json" | ".credentials.json" | "secrets.env")) = parts.last() {
         return Some("a credential file");
     }
@@ -2010,6 +2023,17 @@ mod tests {
             bash("printf '[core]' >> proj/.git/config"),
             bash("sed -i s/a/b/ .git/config"),
             file("write", "proj/.git/config"),
+            // The real browser binary, past the approvals gate's wrapper (approvals §4.4).
+            bash("/opt/zephyr/libexec/agent-browser click @e3"),
+            bash("cd /tmp && ../opt/zephyr/libexec/./agent-browser click @e3"),
+            bash("cp /opt/zephyr/libexec/agent-browser ~/.local/bin/ab"),
+            bash("\"$ZEPHYR_AGENT_BROWSER\" click @e3"),
+            bash("${ZEPHYR_AGENT_BROWSER} press Enter"),
+            (
+                "read",
+                json!({ "path": "/opt/zephyr/libexec/agent-browser" }),
+            ),
+            file("write", "/opt/zephyr/libexec/agent-browser"),
         ];
         let allow: Vec<(&str, Value)> = vec![
             bash("rm -rf ./build"),
@@ -2049,6 +2073,9 @@ mod tests {
             bash("grep -rn auth src"),
             bash("cat .git/HEAD"),
             bash("ls /proc/1"),
+            bash("agent-browser click @e3"),
+            bash("/opt/zephyr/gate/bin/agent-browser snapshot -i"),
+            bash("ls /opt/zephyr"),
             file("write", "src/auth.json.rs"),
             ("some_other_tool", json!({ "command": "rm -rf /" })),
             ("mcp_list", json!({})),

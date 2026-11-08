@@ -4052,6 +4052,7 @@ mod tests {
         cfg.job_timeout = Duration::from_secs(4);
         cfg.exec_backstop = Duration::from_secs(5);
         cfg.projects = Some("/p".into());
+        cfg.agent_browser = "/fake/agent-browser".into();
         let jobs = Default::default();
         let mut r = router(&cfg, &jobs);
         let set = r
@@ -4077,6 +4078,7 @@ mod tests {
             )
         );
         assert_eq!((&c.path, &c.projects), (&cfg.path, &cfg.projects));
+        assert_eq!(c.agent_browser, cfg.agent_browser);
         assert_eq!(r.cfg_tx.borrow().tick, cfg.tick, "and what the others read");
     }
 

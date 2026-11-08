@@ -90,6 +90,11 @@ pub struct Config {
     /// `zephyr up` sets. `None` turns checkpoints off. Not configurable; tests set it.
     #[serde(skip, default = "projects")]
     pub projects: Option<PathBuf>,
+    /// The real agent-browser, which the daemon's own browser calls (the vault's fill) run by
+    /// full path and the browser wrapper is pointed at (approvals spec §4.4). Not configurable;
+    /// tests set a fake.
+    #[serde(skip, default = "agent_browser")]
+    pub agent_browser: PathBuf,
 }
 
 fn job_timeout() -> std::time::Duration {
@@ -110,6 +115,10 @@ fn tick() -> std::time::Duration {
 
 fn min_until() -> std::time::Duration {
     std::time::Duration::from_secs(30)
+}
+
+fn agent_browser() -> PathBuf {
+    PathBuf::from(crate::browser_gate::REAL)
 }
 
 fn projects() -> Option<PathBuf> {
@@ -319,8 +328,8 @@ impl Config {
     }
 
     /// A reloaded file keeps the running daemon's values of the fields no file sets (`tick`,
-    /// `stall_limit`, `min_until`, `job_timeout`, `exec_backstop`, `path`, `projects`): a reload
-    /// changes settings, never these (R30).
+    /// `stall_limit`, `min_until`, `job_timeout`, `exec_backstop`, `path`, `projects`,
+    /// `agent_browser`): a reload changes settings, never these (R30).
     pub fn keep_hidden(&mut self, running: &Config) {
         self.job_timeout = running.job_timeout;
         self.exec_backstop = running.exec_backstop;
@@ -329,6 +338,7 @@ impl Config {
         self.min_until = running.min_until;
         self.path = running.path.clone();
         self.projects = running.projects.clone();
+        self.agent_browser = running.agent_browser.clone();
     }
 
     /// Account names become directory names, so each must be a plain, unique path segment.

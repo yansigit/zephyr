@@ -49,9 +49,10 @@ pub fn ids() -> Option<(u32, u32)> {
 
 /// The `PATH` of every process run for the agent. Only these get `/zephyr/.local/bin`, where the
 /// agent installs its own tools: root's PATH (the image's) leaves it out, or the agent could plant
-/// a `git` or `zephyr` there for root to run.
-pub const AGENT_PATH: &str =
-    "/zephyr/.local/bin:/opt/zephyr/py/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+/// a `git` or `zephyr` there for root to run. `/opt/zephyr/gate/bin` (root's, holding only the
+/// browser wrapper, `browser_gate`) comes first, so an `agent-browser` the agent puts in its own
+/// bin does not shadow the wrapper (approvals spec §4.4; doctor checks it).
+pub const AGENT_PATH: &str = "/opt/zephyr/gate/bin:/zephyr/.local/bin:/opt/zephyr/py/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Prepares `cmd` to run for the agent: without the hidden variables, on [`AGENT_PATH`], and as
 /// the agent's uid.
@@ -138,6 +139,13 @@ mod tests {
         sh.args(["-c", "printf %s \"$PATH\""]).env("PATH", "/x");
         let out = cmd(&mut sh).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), AGENT_PATH);
+        // The browser wrapper comes first, so no agent-browser of the agent's own shadows it.
+        let first = AGENT_PATH.split(':').next();
+        assert_eq!(first, Some(crate::browser_gate::GATE_BIN));
+        let own = AGENT_PATH
+            .split(':')
+            .position(|d| d == "/zephyr/.local/bin");
+        assert_eq!(own, Some(1));
     }
 
     #[test]

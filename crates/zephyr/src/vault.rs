@@ -875,9 +875,11 @@ async fn fill(cfg: &Config, login: &Entry, selectors: [Option<String>; 3]) -> St
 /// and after each field), normally well within the tool's wait.
 const BROWSER_WAIT: Duration = Duration::from_secs(20);
 
-/// `agent-browser ARGS` as the agent, as `exec` runs it: its stdout, or why it failed.
+/// `agent-browser ARGS` as the agent, as `exec` runs it: its stdout, or why it failed. The real
+/// binary, by full path (`cfg.agent_browser`): the daemon's own fill never goes through the
+/// approvals gate's wrapper that `agent-browser` on the agent's PATH is (approvals spec §4.4).
 async fn browser(cfg: &Config, args: &[&str]) -> Result<String, String> {
-    let mut cmd = tokio::process::Command::new("agent-browser");
+    let mut cmd = tokio::process::Command::new(&cfg.agent_browser);
     cmd.args(args)
         .current_dir(&cfg.home)
         .env("HOME", &cfg.home)

@@ -68,7 +68,7 @@ pub struct Request {
 /// into the page (checked for private facts), the flags what `browser_class` takes. It reads
 /// the control's `role` and `name` flat or as the spec's `element: {role, name}`; a control
 /// whose role is missing either way is one the gate could not read, and is held.
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(from = "BrowserWire")]
 pub struct Browser {
     pub action: String,
@@ -80,6 +80,28 @@ pub struct Browser {
     pub form_textarea: bool,
     pub form_password: bool,
     pub composer: bool,
+    pub amount: Option<PageAmount>,
+    pub title: String,
+}
+
+/// The total a page labels (`total`, `order total`, `amount due`), as the wrapper read it
+/// (`browser_gate::page_total`): its value and the currency written beside it, empty for none.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageAmount {
+    pub value: f64,
+    #[serde(default)]
+    pub currency: String,
+}
+
+impl PageAmount {
+    /// As a payment's amount: `None` for a value no total can be. R21: an empty currency stays
+    /// empty, so a cap counts it as unknown, never as `approvals.currency`.
+    fn amount(&self) -> Option<Amount> {
+        (self.value.is_finite() && self.value >= 0.0).then(|| Amount {
+            value: self.value,
+            currency: self.currency.trim().to_uppercase(),
+        })
+    }
 }
 
 /// `Browser` as it arrives: the control flat (`role`, `name`) or nested (`element`).
@@ -96,6 +118,8 @@ struct BrowserWire {
     form_textarea: bool,
     form_password: bool,
     composer: bool,
+    amount: Option<PageAmount>,
+    title: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -121,6 +145,8 @@ impl From<BrowserWire> for Browser {
             form_textarea: w.form_textarea,
             form_password: w.form_password,
             composer: w.composer,
+            amount: w.amount,
+            title: w.title,
         }
     }
 }
@@ -325,7 +351,8 @@ impl Call {
                 class,
                 targets: vec![origin.clone()],
                 summary: summary.clone(),
-                amount: None,
+                // The page's labelled total, which a money cap compares (A5's carry-over).
+                amount: b.amount.as_ref().and_then(PageAmount::amount),
                 replay: policy::Replay::Wait,
             }),
             kind: ActionKind::Wait,
@@ -837,7 +864,8 @@ pub fn socket_path(cfg: &Config) -> PathBuf {
 }
 
 /// What every process run for the agent gets beside its command (a child of rpi in `session`,
-/// main's `exec` commands): the gate socket and the session to name in its requests.
+/// main's `exec` commands, approved runs): the gate socket and the session to name in its
+/// requests, and the real agent-browser for the browser wrapper to run (spec §4.4).
 pub fn agent_env(cfg: &Config, session: &str) -> Vec<(String, String)> {
     use zephyr_policy::tools::{GATE_SOCKET_ENV, SESSION_ENV};
     vec![
@@ -846,6 +874,10 @@ pub fn agent_env(cfg: &Config, session: &str) -> Vec<(String, String)> {
             socket_path(cfg).display().to_string(),
         ),
         (SESSION_ENV.into(), session.into()),
+        (
+            crate::browser_gate::REAL_ENV.into(),
+            cfg.agent_browser.display().to_string(),
+        ),
     ]
 }
 
@@ -1390,10 +1422,10 @@ fn amount(m: &Amount) -> String {
     }
 }
 
-/// A browser action's lines: the origin, the page and the control, what was typed, and for a
-/// payment that the amount could not be read (the wrapper reads none). `browser` is the
-/// request decoded; each of its fields is scrubbed on its own (C2), and what was typed is not
-/// shown at all when a fact is split across its entries.
+/// A browser action's lines: the origin, the page and the control, the page's title, what was
+/// typed, and for a payment the page's labelled total (or that it could not be read). `browser`
+/// is the request decoded; each of its fields is scrubbed on its own (C2), and what was typed is
+/// not shown at all when a fact is split across its entries.
 fn wait_lines(
     class: Option<Class>,
     targets: &[String],
@@ -1417,6 +1449,10 @@ fn wait_lines(
         "press" | "keyboard" => format!("{page} · key: Enter in \"{name}\""),
         _ => format!("{page} · button: \"{name}\""),
     });
+    if !b.title.trim().is_empty() {
+        let title = quoted_cut(&scrub.text(&b.title), LINE_CHARS);
+        lines.push(format!("title: \"{title}\""));
+    }
     if !b.typed.is_empty() {
         let typed: Vec<String> = b.typed.iter().map(|t| scrub.text(t)).collect();
         match scrub.split(&typed.join("\n")) {
@@ -1430,7 +1466,10 @@ fn wait_lines(
         }
     }
     if class == Some(Class::Money) {
-        lines.push("amount: could not be read".into());
+        lines.push(match b.amount.as_ref().and_then(PageAmount::amount) {
+            None => "amount: could not be read".into(),
+            Some(m) => format!("amount: {}", one_line(&scrub.text(&amount(&m)))),
+        });
     }
     lines
 }
@@ -2299,6 +2338,44 @@ mod tests {
             outcomes(&h.store),
             ["auto", "auto", "auto", "held", "held", "held", "held", "held", "held"]
         );
+        // The page's labelled total, as the wrapper read it, counts as a connector's amount does.
+        let checkout = |amount: Option<PageAmount>, run: &str| {
+            let mut req = click("Place order", "https://shop.example.com", run);
+            if let Some(b) = req.browser.as_mut() {
+                b.amount = amount;
+                b.title = "Checkout · Shop".into();
+            }
+            decide(&h.cfg, &h.store, &req, owner(), now)
+        };
+        let usd = |value: f64| PageAmount {
+            value,
+            currency: "USD".into(),
+        };
+        assert_eq!(checkout(Some(usd(49.99)), "page:1"), Verdict::Allow);
+        for (amount, shown) in [
+            (Some(usd(54.2)), "amount: 54.2 USD"),
+            (
+                Some(PageAmount {
+                    value: 20.0,
+                    currency: String::new(),
+                }),
+                "amount: 20, no currency named",
+            ),
+            (None, "amount: could not be read"),
+        ] {
+            let Verdict::Wait { id } = checkout(amount.clone(), &format!("page:{shown}")) else {
+                panic!("{amount:?} waits")
+            };
+            let card = notices(&h.store).pop().unwrap();
+            assert!(
+                card.starts_with(&format!(
+                    "[zephyr] approve #{id}: payment (browser)\non: https://shop.example.com\n\
+                     page: \"https://shop.example.com/compose\" · button: \"Place order\"\n\
+                     title: \"Checkout · Shop\"\n{shown}\n"
+                )),
+                "{card}"
+            );
+        }
         // Without a cap any amount goes; with `money` strong-only the card says where to approve.
         let uncapped = config(&h.dir, "[approvals]\nmoney = 'auto'\n");
         let req = mcp("shop", "checkout", json!({}), "task-3");
@@ -2597,6 +2674,33 @@ mod tests {
         assert_eq!(decide(&h.cfg, &h.store, &req, owner(), now), Verdict::Allow);
         held(&decide(&h.cfg, &h.store, &req, owner(), now));
         assert_eq!(outcomes(&h.store), ["held", "pass", "held"]);
+    }
+
+    /// Every process run for the agent can ask the gate, as its session, and its browser wrapper
+    /// finds the real agent-browser (approvals spec §4.4).
+    #[test]
+    fn agent_processes_get_the_gate_and_the_real_browser() {
+        let h = home("gate-env", "");
+        let mut cfg = h.cfg.clone();
+        cfg.agent_browser = "/x/real-agent-browser".into();
+        let env = agent_env(&cfg, "task-3");
+        let get = |k: &str| {
+            env.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("ZEPHYR_SESSION"), Some("task-3"));
+        let socket = socket_path(&cfg).display().to_string();
+        assert_eq!(get("ZEPHYR_GATE_SOCKET"), Some(socket.as_str()));
+        assert_eq!(
+            get(crate::browser_gate::REAL_ENV),
+            Some("/x/real-agent-browser")
+        );
+        assert_eq!(
+            Config::clone(&h.cfg).agent_browser,
+            PathBuf::from(crate::browser_gate::REAL),
+            "by default the image's"
+        );
     }
 
     // ---- the socket ----

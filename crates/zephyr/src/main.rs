@@ -18,8 +18,20 @@ const RPI_PIN: &str = "rpi 0.18.";
 
 const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|resume|reload|skill>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
 
+fn main() -> ExitCode {
+    // `agent-browser` on the agent's PATH is this binary (approvals spec §4.4): the wrapper runs
+    // before anything else, with no runtime and no config (the agent cannot read the daemon's).
+    let mut argv = std::env::args_os();
+    let zero = argv.next().unwrap_or_default();
+    if Path::new(&zero).file_name() == Some(std::ffi::OsStr::new("agent-browser")) {
+        let args = argv.map(|a| a.to_string_lossy().into_owned()).collect();
+        return zephyr::browser_gate::main(args);
+    }
+    zephyr_main()
+}
+
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn zephyr_main() -> ExitCode {
     let first = std::env::args().nth(1).unwrap_or_default();
     if first == "--version" || first == "-V" {
         println!("zephyr {}", env!("CARGO_PKG_VERSION"));
@@ -409,6 +421,9 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
         };
         ok & check(&label, planted.is_empty())
     };
+    // In the container: the approvals gate's browser wrapper as the image lays it out (§4.4).
+    // SAFETY: getuid has no arguments and cannot fail.
+    let wrapper_ok = unsafe { libc::getuid() } != 0 || browser_wrapper();
 
     // A throwaway home so doctor never touches the live `main` session.
     let mut probe = cfg.clone();
@@ -459,7 +474,19 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     }
 
     // Names and presence only: a secret's value is never printed.
-    let mut ok = version_ok && split_ok && commands_ok;
+    let mut ok = version_ok && split_ok && wrapper_ok && commands_ok;
+    // While the daemon is up, its gate socket is there: without it every send is refused
+    // (approvals spec §4.9).
+    if tokio::net::UnixStream::connect(cfg.socket_path())
+        .await
+        .is_ok()
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let socket = zephyr::gate::socket_path(cfg);
+        let there = std::fs::symlink_metadata(&socket).is_ok_and(|m| m.file_type().is_socket());
+        let label = format!("the approvals gate listens at {}", socket.display());
+        ok &= check(&label, there);
+    }
     if let Some(d) = &cfg.discord {
         let label = format!("env {} is set (discord token)", d.token_env);
         ok &= check(&label, env_set(&d.token_env));
@@ -501,6 +528,7 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
         }
     }
     // Warnings, not failures: the browser and desktop are extras the image brings (DESIGN §4.11).
+    // `agent-browser` on the agent's PATH is the wrapper, which passes `--version` to the real one.
     if let Ok(display) = std::env::var("ZEPHYR_DESKTOP") {
         let chrome = std::env::var("AGENT_BROWSER_EXECUTABLE_PATH").unwrap_or_default();
         for (what, program, args) in [
@@ -571,6 +599,45 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
 fn check(label: &str, ok: bool) -> bool {
     println!("{} {label}", mark(ok));
     ok
+}
+
+/// The browser wrapper as the image lays it out (approvals spec §4.4, §4.9): `/opt/zephyr/gate/bin`
+/// first on the agent's PATH, root's and not the agent's to write, its `agent-browser` this
+/// binary, and no other `agent-browser` reachable on that PATH (one the agent dropped in its own
+/// bin is shadowed, but says something is wrong).
+fn browser_wrapper() -> bool {
+    use zephyr::browser_gate::GATE_BIN;
+    let path = zephyr::agent::AGENT_PATH;
+    let first = path.split(':').next() == Some(GATE_BIN);
+    let mut ok = check(&format!("{GATE_BIN} is first on the agent's PATH"), first);
+    let theirs = zephyr::agent::ids().map_or(vec![], |(u, g)| {
+        zephyr::agent::writable_dirs(GATE_BIN, u, g)
+    });
+    let roots = std::fs::metadata(GATE_BIN).is_ok_and(|m| m.uid() == 0 && m.mode() & 0o022 == 0);
+    let label = format!("{GATE_BIN} is root's and the agent cannot write to it");
+    ok &= check(&label, roots && theirs.is_empty());
+    let wrapper = Path::new(GATE_BIN).join("agent-browser");
+    let me = std::fs::canonicalize("/proc/self/exe");
+    let is_me = matches!((std::fs::canonicalize(&wrapper), me), (Ok(a), Ok(b)) if a == b);
+    let label = format!("{} is zephyr's browser wrapper", wrapper.display());
+    ok &= check(&label, is_me);
+    let others: Vec<String> = {
+        // `/zephyr/.local/bin` is the agent's: looked at as the agent.
+        let _fs = zephyr::agent::fs();
+        (path.split(':').skip(1))
+            .map(|d| Path::new(d).join("agent-browser"))
+            .filter(|p| p.symlink_metadata().is_ok())
+            .map(|p| p.display().to_string())
+            .collect()
+    };
+    let label = match others.is_empty() {
+        true => "no other agent-browser is on the agent's PATH".to_string(),
+        false => format!(
+            "another agent-browser is on the agent's PATH: {}",
+            others.join(", ")
+        ),
+    };
+    ok & check(&label, others.is_empty())
 }
 
 fn env_set(name: &str) -> bool {
