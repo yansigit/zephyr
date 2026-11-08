@@ -104,8 +104,9 @@ As built (R22, R37, R38): a connector tool's name is normalized (`createIssue` i
 gated. A connector message's or post's targets are `server/tool` plus the values of its
 recipient-like arguments (`to`, `cc`, `bcc`, `recipient`, `recipients`, `email`, `channel`,
 `channel_id`, `user`, `user_id`, `chat_id`, `thread`, `thread_id`, `phone`, `number`), read at
-any depth, plus the addresses and recipient objects held by any key with one of those words among
-its parts (`toRecipients`, `cc_emails`); with none present, or none named by the listed keys at
+any depth, and so is any key with one of those words among its parts (`toRecipients`,
+`cc_emails`) unless its last word says it holds text (`email_subject`, `user_agent`); with none
+present, or none named by the listed keys at
 the top level of the arguments (R69), the targets include `unknown`, so `ask-new` never lets such
 a send through on its own. A
 payment's target is `server/tool`. A fact's `allow` list is compared with the recipient targets
