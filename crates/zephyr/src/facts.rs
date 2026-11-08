@@ -193,13 +193,17 @@ fn decoded(text: &str) -> Option<Vec<Piece>> {
 }
 
 /// Whether `c` shows nothing and so cannot keep a value from being one (R40): a control that is
-/// not whitespace, a zero-width or direction mark, or a byte-order mark. A line break and a tab
+/// not whitespace, a zero-width or direction mark (U+061C too), or a byte-order mark. A line break and a tab
 /// are spacing, not invisible.
 fn invisible(c: char) -> bool {
     (c.is_control() && !c.is_whitespace())
         || matches!(
             c,
-            '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}'
+            '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{feff}'
+                | '\u{061c}'
         )
 }
 
@@ -341,10 +345,24 @@ fn spans(f: &Fact, text: &str) -> Vec<(usize, usize)> {
             }
         }
     }
-    for form in crate::vault::base64_forms(&f.value) {
+    // A5: base64, at any alignment; a digits fact's digit-only value too.
+    let mut forms = crate::vault::base64_forms(&f.value);
+    if f.kind == FactKind::Digits && value != f.value {
+        forms.extend(crate::vault::base64_forms(&value));
+    }
+    for form in forms {
         out.extend(text.match_indices(&form).map(|(i, m)| (i, i + m.len())));
     }
     out
+}
+
+/// D6: whether `f` is in `text` with NFKC applied to the whole of each, not character by
+/// character as `spans` does, so a value written decomposed (NFD Hangul, as macOS writes names)
+/// matches it composed, and the other way round.
+fn whole(f: &Fact, text: &str) -> bool {
+    let strip = |s: &str| -> String { s.chars().filter(|c| !invisible(*c)).collect() };
+    let value = norm(&strip(&f.value));
+    matchable(f) && !value.is_empty() && norm(&strip(text)).contains(&value)
 }
 
 /// The names of the facts in `text`, once each. A fact whose `allow` names `target` is skipped.
@@ -352,7 +370,8 @@ pub fn found<'a>(facts: &'a [Fact], text: &str, target: Option<&str>) -> Vec<&'a
     let mut names: Vec<&str> = Vec::new();
     for f in facts {
         let skip = target.is_some_and(|t| allowed(f, t));
-        if !skip && !names.contains(&f.name.as_str()) && !spans(f, text).is_empty() {
+        let here = || !spans(f, text).is_empty() || whole(f, text);
+        if !skip && !names.contains(&f.name.as_str()) && here() {
             names.push(&f.name);
         }
     }
@@ -364,11 +383,12 @@ pub fn found<'a>(facts: &'a [Fact], text: &str, target: Option<&str>) -> Vec<&'a
 pub fn scrub(facts: &[Fact], text: &str) -> String {
     let mut marks: Vec<(usize, usize, &str)> = Vec::new();
     for f in facts {
-        marks.extend(
-            spans(f, text)
-                .into_iter()
-                .map(|(a, b)| (a, b, f.name.as_str())),
-        );
+        let at = spans(f, text);
+        // D6: found where it cannot be placed: none of the text is shown.
+        if at.is_empty() && whole(f, text) {
+            return format!("[withheld: it holds the private fact {}]", f.name);
+        }
+        marks.extend(at.into_iter().map(|(a, b)| (a, b, f.name.as_str())));
     }
     // Leftmost first, the longest of those starting together.
     marks.sort_by_key(|&(a, b, _)| (a, std::cmp::Reverse(b)));
@@ -386,16 +406,47 @@ pub fn scrub(facts: &[Fact], text: &str) -> String {
     out
 }
 
-/// A `gateway` command with the value of a `/facts add NAME KIND VALUE` replaced by `[value]`,
-/// well-formed or not: for the audit and the log, which must never hold a value.
+/// A `gateway` command as the audit and the log may keep it, which must never hold a value:
+/// read trimmed, as the plugin and the daemon read it (B1). `/facts add NAME KIND VALUE`, with
+/// any whitespace between its words, keeps its name and kind only when they are a valid name
+/// and a valid kind (and the name holds neither the value nor a number), else it is
+/// `/facts add [value]`; a
+/// well-formed `/facts`, `/facts rm` or `/facts allow` is kept; any other `/facts…` is only
+/// `/facts …` (A4). Any other command is as it came.
 pub fn redact(command: &str) -> String {
-    let Some(rest) = command.strip_prefix("/facts add") else {
+    let c = command.trim();
+    let Some(rest) = c.strip_prefix("/facts") else {
         return command.into();
     };
-    let kept: Vec<&str> = rest.split(' ').filter(|w| !w.is_empty()).take(2).collect();
-    match kept.is_empty() {
-        true => "/facts add [value]".into(),
-        false => format!("/facts add {} [value]", kept.join(" ")),
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    let spaced = rest.is_empty() || rest.starts_with(char::is_whitespace);
+    if spaced && words.first() == Some(&"add") {
+        let value = words.get(3..).map(|v| v.join(" ")).unwrap_or_default();
+        let kept = match (words.get(1), words.get(2).and_then(|k| FactKind::parse(k))) {
+            // a name with a number's worth of digits may be the value itself
+            (Some(name), Some(kind))
+                if crate::vault::login_name(name) && digits_of(name).len() < MIN_DIGITS =>
+            {
+                let f = Fact {
+                    name: name.to_string(),
+                    kind,
+                    value,
+                    allow: vec![],
+                };
+                spans(&f, name)
+                    .is_empty()
+                    .then(|| format!("{name} {}", kind.key()))
+            }
+            _ => None,
+        };
+        return match kept {
+            Some(kept) => format!("/facts add {kept} [value]"),
+            None => "/facts add [value]".into(),
+        };
+    }
+    match spaced && zephyr_policy::tools::gateway_kind(c).is_some() {
+        true => c.into(),
+        false => "/facts …".into(),
     }
 }
 
@@ -812,17 +863,116 @@ mod tests {
                 "/facts add phone digits +1 555 010 2345",
                 "/facts add phone digits [value]",
             ),
-            (
-                "/facts add Phone text a\tb",
-                "/facts add Phone text [value]",
-            ),
-            ("/facts add phone", "/facts add phone [value]"),
+            ("/facts add phone", "/facts add [value]"),
             ("/facts add", "/facts add [value]"),
             ("/facts rm phone", "/facts rm phone"),
+            (
+                "/facts allow mail mum@example.com",
+                "/facts allow mail mum@example.com",
+            ),
+            ("/facts", "/facts"),
             ("/status", "/status"),
         ] {
             assert_eq!(redact(cmd), want, "{cmd}");
         }
+    }
+
+    /// A4, B1: however the command is spaced, a value never survives: the command is read
+    /// trimmed, `/facts` and `add` with any whitespace between; a word is kept only as a valid
+    /// fact name followed by a valid kind, and any other malformed `/facts` command is only
+    /// `/facts …`.
+    #[test]
+    fn a_facts_add_is_redacted_however_it_is_spaced() {
+        for (cmd, want) in [
+            (
+                " /facts add phone digits 5550102345",
+                "/facts add phone digits [value]",
+            ),
+            (
+                "\n/facts add phone digits 5550102345\n",
+                "/facts add phone digits [value]",
+            ),
+            (
+                "/facts\tadd  phone\tdigits 5550102345",
+                "/facts add phone digits [value]",
+            ),
+            ("/facts add 5550102345 digits", "/facts add [value]"),
+            ("/facts add Phone text a\tb", "/facts add [value]"),
+            ("/facts add phone number 5550102345", "/facts add [value]"),
+            (
+                "/facts add 5550102345 digits 5550102345",
+                "/facts add [value]",
+            ),
+            ("/facts addphone digits 5550102345", "/facts …"),
+            ("/factsadd phone digits 5550102345", "/facts …"),
+            ("/facts edit phone 5550102345", "/facts …"),
+            ("/facts rm 5550102345 now", "/facts …"),
+            ("  /facts rm phone ", "/facts rm phone"),
+        ] {
+            let got = redact(cmd);
+            assert_eq!(got, want, "{cmd:?}");
+            assert!(!got.contains("555010"), "{cmd:?}: {got}");
+        }
+    }
+
+    /// A5: the base64 forms of a value, standard and URL-safe, padded or not, at each of the
+    /// three alignments, are found and scrubbed; a digits fact's digit-only value too.
+    #[test]
+    fn base64_forms_are_found_and_scrubbed_at_every_alignment() {
+        use base64::engine::general_purpose::{
+            STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD,
+        };
+        use base64::Engine;
+        // `?>~` puts `/` and `+` (`_` and `-` URL-safe) into the encoding.
+        let facts = [
+            fact("token", FactKind::Text, "pass?>~word>>key"),
+            fact("phone", FactKind::Digits, "+1 (555) 010-2345"),
+        ];
+        let engines: [&base64::engine::GeneralPurpose; 4] =
+            [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD];
+        let standard = STANDARD.encode("pass?>~word>>key");
+        let url = URL_SAFE.encode("pass?>~word>>key");
+        assert!(
+            standard.contains(['+', '/']) && url.contains(['-', '_']),
+            "{standard} {url}"
+        );
+        for (name, secret) in [("token", "pass?>~word>>key"), ("phone", "15550102345")] {
+            for engine in engines {
+                for prefix in ["", "u", "us", "user:"] {
+                    let encoded = engine.encode(format!("{prefix}{secret} and more"));
+                    let text = format!("Authorization: Basic {encoded}");
+                    assert_eq!(found(&facts, &text, None), [name], "{text}");
+                    let out = scrub(&facts, &text);
+                    assert!(out.contains(&format!("[fact:{name}]")), "{out}");
+                    // The characters only the value makes are gone.
+                    let k = prefix.len() % 3;
+                    let middle = &encoded[(prefix.len() + 2) * 4 / 3..][..8];
+                    assert!(!out.contains(middle), "{k} {middle}: {out}");
+                }
+            }
+        }
+    }
+
+    /// D6: NFKC over the whole text, not character by character: a value written decomposed
+    /// (NFD Hangul, as macOS names files) matches it composed, and the other way round; where
+    /// the match cannot be placed, the whole text is withheld.
+    #[test]
+    fn decomposed_text_matches_composed_values() {
+        use unicode_normalization::UnicodeNormalization;
+        let nfc = "서울시 강남구 테헤란로";
+        let nfd: String = nfc.nfd().collect();
+        assert_ne!(nfd, nfc);
+        for (value, text) in [(nfd.as_str(), nfc), (nfc, nfd.as_str())] {
+            let facts = [fact("addr", FactKind::Text, value)];
+            let text = format!("send to {text} today");
+            assert_eq!(found(&facts, &text, None), ["addr"], "{text:?}");
+            let out = scrub(&facts, &text);
+            assert!(!out.contains("서울") && !out.contains(&nfd[..6]), "{out}");
+            assert!(out.contains("[fact:addr]") || out.contains("addr"), "{out}");
+        }
+        // U+061C, a direction mark, hides no fact either.
+        let phone = [fact("phone", FactKind::Digits, "5550102345")];
+        assert_eq!(found(&phone, "555\u{061c}0102345", None), ["phone"]);
     }
 
     #[test]

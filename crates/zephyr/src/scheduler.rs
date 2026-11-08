@@ -574,13 +574,12 @@ pub(crate) fn audit(store: &Store, cfg: &Config, session: &str, ev: &serde_json:
                 zephyr_policy::policy::Decision::Deny(_)
             );
             let outcome = if refused { "refused" } else { "started" };
-            // A fact's value is saved only after this runs: redact the `/facts add` itself.
+            // A fact's value is saved only after this runs: redact the `/facts add` itself,
+            // read trimmed as the plugin and the daemon read it (B1), and any `/facts…` that
+            // is not well formed.
             let mut args = ev["args"].clone();
             if tool == "gateway" {
-                if let Some(c) = args["command"]
-                    .as_str()
-                    .filter(|c| c.starts_with("/facts add"))
-                {
+                if let Some(c) = args["command"].as_str() {
                     args["command"] = crate::facts::redact(c).into();
                 }
             }
@@ -975,6 +974,34 @@ mod tests {
             text: text.into(),
         };
         command(store, &cfg(None), &m).expect("a /job command")
+    }
+
+    /// B1: the agent's `/facts add` never puts its value in the audit, however it is spaced: the
+    /// audit runs before the fact is saved, so nothing could scrub it yet.
+    #[test]
+    fn a_facts_add_leaves_no_value_in_the_audit_however_it_is_spaced() {
+        let dir = crate::test_dir("sched-audit-facts");
+        let cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = {dir:?}\n")).unwrap();
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let store = Store::open(&cfg.db_path()).unwrap();
+        for command in [
+            "/facts add phone digits 5550102345",
+            " /facts add phone digits 5550102345",
+            "\n\t/facts add phone digits 5550102345\n",
+            "/facts  add\tphone digits 5550102345",
+            "/facts add 5550102345 digits 5550102345",
+            "/factsadd phone digits 5550102345",
+        ] {
+            let ev = serde_json::json!({"type": "tool_execution_start", "toolName": "gateway",
+                                        "toolCallId": "c", "args": {"command": command}});
+            audit(&store, &cfg, "main", &ev);
+        }
+        let rows = store.audit_rows().unwrap();
+        assert_eq!(rows.len(), 6);
+        for (_, tool, args, _) in &rows {
+            assert_eq!(tool, "gateway");
+            assert!(!args.contains("555010"), "{args}");
+        }
     }
 
     /// C4: a call the gate delayed is told that it goes by itself, and when; one held for the
