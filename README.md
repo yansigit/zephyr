@@ -46,6 +46,7 @@ zephyr login openai-codex --account codex-main
 
 | Command | What it does |
 |---|---|
+| `zephyr init [--non-interactive --projects DIR --provider ID.. --account NAME=PROVIDER/MODEL.. --model P/M --preset manual\|semi\|full --no-start]` | The setup wizard (see [Quick start](#quick-start)); `--preset` picks the [approvals](#approvals-and-presets) preset to start in, and a re-run keeps the one you have unless it is given |
 | `zephyr up [--build]` / `down` / `restart` | Start (building the image locally with `--build`), stop, restart |
 | `zephyr upgrade [VERSION]` | Move to the newest release (updating this CLI from the image first), once the agent is idle, after backing up `state.db`, `zephyr.toml`, `vault.toml` and `host.toml` to `~/.zephyr-daemon/<file>.<old version>.bak` (the newest 5 versions are kept). With an older VERSION, go back to it by restoring that version's backups. A release is always its published image: a local copy is used, else it is pulled, never built |
 | `zephyr status` / `logs [-f]` / `doctor [--fix]` | Container and daemon state (heartbeat, whether the agent is up, the oldest waiting message, replies pending and failed; exits non-zero when the daemon is down or hung), logs, checks (and repairs) |
@@ -64,6 +65,11 @@ zephyr login openai-codex --account codex-main
 | `zephyr config get\|set KEY [VALUE]` | Read or edit `zephyr.toml` (comments are kept; a change that would make it invalid is refused), e.g. `config set tasks.parallel 16` or `config set tasks.model PROVIDER/MODEL`. A key in the [settings list](#changing-settings) goes through the running daemon, which checks it, logs it and applies it. Any other key prints a warning that it is saved without checking, and is saved. With no daemon running, the file is edited directly and applies at the next start |
 | `/settings [SECTION\|KEY]` | From any channel: every setting by section with its value and where it came from (`default`, `you`, `agent (#N)`, `until HH:MM`); with a section or a key, its help line, what it takes and who may change it. In `zephyr attach` it opens the settings panel |
 | `/set KEY VALUE [for DURATION]` | From any channel: change a setting, e.g. `/set tasks.parallel 4` or `/set budget.daily_cost_usd 10 for 1d` (`zephyr set KEY VALUE` does the same inside the container) |
+| `/approvals [manual\|semi\|full\|on\|off] [for D]`, `/approvals messages\|posts\|money\|facts MODE [for D]` | From any channel: what waits for you before the agent sends a message, posts or pays (see [Approvals and presets](#approvals-and-presets)). Alone it shows the modes in effect, `preset semi (modified) · messages ask-new · posts delay 5 · money ask · facts hold`; `off` is `full`, `on` is `manual`. Loosening is accepted only from a strong channel (`zephyr attach` or the chat socket, by default) |
+| `/held` | The messages, posts and payments waiting for you or for their delay, newest first |
+| `/ok N [once]` / `/no N` | Approve or drop proposal or held action #N. `/ok N` runs exactly what its card showed; under `ask-new` it also remembers the new recipients, and `/ok N once` approves without remembering them |
+| `/cancel N` | Stop an action waiting out its delay (`sending at 14:05 unless /cancel 7`) before it goes |
+| `/facts [rm NAME \| allow NAME TARGET \| disallow NAME TARGET]` | From any channel: your private facts' names, kinds and allowed targets, never a value. `rm` and `allow` loosen the check, so only a strong channel may; a value is entered only in `zephyr attach` or with `zephyr facts add` |
 | `zephyr attach [--stock]` | Zephyr's terminal UI on the live session: history, tool calls, what the agent is doing, the queue and today's spend; `^D` detaches and the agent keeps running. `--stock` runs the stock `rpi --connect` client instead |
 | `zephyr shell [bash\|zsh]` | A login shell in the container as the agent, in its home (`/zephyr`) and on its desktop; needs a terminal |
 | `zephyr chat` | The same UI on a terminal; a line client (`< reply` per line) when piped or scripted |
@@ -116,17 +122,21 @@ In `zephyr attach` (`?` lists all of these):
 | `Home` / `End` | Top or bottom of the conversation, when the composer is empty |
 | `/focus` | Hide tool calls and thinking (again to show them); `focus` shows in the footer |
 
-In the settings panel (`/settings`; `?` lists these):
+In the settings panel (`/settings`; `?` lists these). Its Approvals section holds the preset, each
+class's mode, the currency, what needs a strong channel and a row that opens Private facts, the
+section after it: each fact as `name  kind · allow: targets`, never its value. Waiting lists what
+waits for you, newest first, a held action as its class and summary (`message · email to
+alice@example.com`) and, waiting out a delay, when it goes.
 
 | Key | What it does |
 |---|---|
 | `↑` / `↓`, `→` / `←` | Choose a section, then a setting in it; `←` goes back to the sections |
-| `Enter` | Edit the setting: a list for a choice or a true-or-false setting, the model picker for a model, a one-line field for a number or text. On a proposal under Waiting, the whole card |
+| `Enter` | Edit the setting: a list for a choice or a true-or-false setting, the model picker for a model, a one-line field for a number or text. On a proposal under Waiting, the whole card; on the Approvals section's Private facts row, that section |
 | `Space` | Turn a true-or-false setting over at once |
 | `t` (or `Tab` in an editor) | Add a time limit (`30m`, `2h`, `1d`); the setting goes back by itself |
-| `o` / `1` / `d` | Under Waiting: approve a proposal, approve it once (a message or post to a new recipient goes without being remembered; the same as `o` for a setting), or drop it |
+| `o` / `1` / `d` | Under Waiting: approve, approve once, or drop. `1` on a message or post approves without remembering its recipients, whatever mode its class was in when the list was read; on a setting, a payment or anything else it is the same as `o`, and it is offered only where the two differ (`ask-new`) |
 | `c` | Under Waiting: cancel an action waiting out its delay, before it goes |
-| `a` / `e` / `d` | Under Private facts: add a fact, edit one (an empty value keeps the saved one), or delete it; the value is typed masked and never shown again |
+| `a` / `e` / `d` | Under Private facts: add a fact, edit one (`Enter` too; an empty value keeps the saved one), or delete one (`y` confirms); the value is typed masked, checked before it leaves, and never shown again |
 | `Esc` | Back, or close the panel |
 
 Drafts put aside are gone when you detach; the history starts again from the messages in the conversation. The footer shows `ctx N%`, how full the model's context is after the last reply.
@@ -158,13 +168,18 @@ goes back by itself and you are told. The agent can read all of them. What it ma
 
 | Setting | The agent may |
 |---|---|
-| `tasks.parallel`, `mcp.NAME.enabled` (a connector off), `settings.strong_channels` (remove a channel), the `budget.*` limits | make it stricter at once (lower, off, fewer channels, a limit where there was none); you are told and `/set KEY OLD` puts it back |
-| `model`, `thinking`, `tasks.model`, `timezone`, `auth.*`, subagents, rules, and any change of the above that loosens | propose it: a card shows `KEY old → new` (or the exact `/subagent` or `/rule` text, up to 1500 characters), and `/ok N` applies it, `/no N` drops it |
+| `tasks.parallel`, `mcp.NAME.enabled` (a connector off), `settings.strong_channels` (remove a channel), the `budget.*` limits, the `approvals.*` modes and preset, `approvals.strong_only` (add `money`), `mcp.NAME.classes.TOOL` (put a tool in a class) | make it stricter at once (lower, off, fewer channels, a limit where there was none, a stricter mode or preset); you are told and `/set KEY OLD` puts it back. Its `/set` takes one word, so it can tighten approvals to `ask` but not to `delay 10` |
+| `model`, `thinking`, `tasks.model`, `timezone`, `auth.*`, `approvals.currency`, subagents, rules, removing a private fact or allowing it a target, and any change of the above that loosens | propose it: a card shows `KEY old → new` (or the exact `/subagent` or `/rule` text, up to 1500 characters), and `/ok N` applies it, `/no N` drops it |
 | `owners`, `[discord]`, `[imessage]`, `[attach]`, `[agent]`, `extensions`, `policy_plugin`, `rpi`, `home`, `state`, the `[[account]]` pool | nothing; edit `zephyr.toml` |
 
-The `budget.*` limits and `settings.strong_channels` are protected: raising a limit, or adding a
-channel, is accepted only from a strong channel, by default `zephyr attach` and the chat socket
-that `zephyr chat` and the host CLI use (`[settings] strong_channels`; the TUI can't be removed).
+The agent may also save a new private fact at once (it only makes the check stricter); you are told
+its name, and `/facts rm NAME` removes it.
+
+The `budget.*` limits, `settings.strong_channels`, the `approvals.*` settings (all but the currency),
+the connector tool classes and the private facts are protected: raising a limit, adding a channel,
+or loosening an approval or a fact is accepted only from a strong channel, by default `zephyr
+attach` and the chat socket that `zephyr chat` and the host CLI use (`[settings] strong_channels`;
+the TUI can't be removed).
 From Discord or iMessage it is refused, and a proposal that needs one stays waiting for it, so a
 stolen chat session can lower a limit but not lift it. An approval is checked when you give it: if
 the setting changed since the card was made, `/ok` says so and drops the proposal, and a waiting
@@ -205,6 +220,97 @@ composer to edit and send again.
 `ZEPHYR_CONTAINER` (default `zephyr`) and `ZEPHYR_IMAGE` choose another container or image, for
 example to test beside a live install.
 
+## Approvals and presets
+
+Messages, posts and payments the agent makes wait for you, as far as you want; everything else it
+does on its own, and what went off the machine is listed after the turn (DESIGN §4.16). What
+counts:
+
+- **Messages**: mail sent with `himalaya`; a connector tool named for sending (`send`, `reply`,
+  `message`, `email`, `dm`); in the agent's browser, a Send or Reply button, or Enter in a message box.
+- **Posts**: GitHub writes through `gh` (`pr create`, `issue comment`, `release create`, `gh api -X
+  POST`, ...); a connector tool that posts (`post`, `publish`, `comment`, `tweet`, `share`,
+  `create_issue`, `create_pull`); a Post, Publish, Tweet, Share or Comment button, or Submit on a
+  form with a text area.
+- **Payments**: a connector tool that pays (`pay`, `purchase`, `order`, `checkout`, `transfer`,
+  `refund`, `charge`, `subscribe`); a Buy, Pay, Place order, Checkout, Subscribe, Donate or Transfer
+  button, whatever form it is in.
+
+Buttons are read in English and Korean (`보내기`, `전송`, `게시`, `결제`, `구매`, `주문`, ...). A
+search box, Enter in a login form and links are not caught (clicking a login form's "Send code" is,
+as a message), and neither is a label zephyr does not know or one in another language. A click
+zephyr cannot read at all waits for you whatever the mode. A connector tool goes by its name (one
+whose name starts with `get`, `list`, `search` and the like is a read); `/set
+mcp.NAME.classes.TOOL messages|posts|money|none` puts it in another class.
+
+Each class has a mode:
+
+| Mode | What happens |
+|---|---|
+| `ask` | it waits for your `/ok` |
+| `ask-new` | messages and posts: it goes at once to the recipients (or repos, or sites) you approved before, and waits for anyone new or anyone zephyr cannot read |
+| `delay N` | it goes after N minutes (1 to 60) unless you `/cancel` it; in the browser the page waits at most 10 minutes |
+| `auto` | it goes |
+| `auto N` | payments: it goes when the amount is known, in `approvals.currency` (USD unless set), and at most N; otherwise it waits |
+
+A preset sets them all:
+
+| Preset | messages | posts | payments | private facts |
+|---|---|---|---|---|
+| `manual` (new installs) | ask | ask | ask | hold |
+| `semi` | ask-new | delay 5 | ask | hold |
+| `full` | auto | auto | auto | warn |
+
+`/approvals` shows what is in effect; `/approvals manual|semi|full` picks a preset, `/approvals off`
+is `full` and `/approvals on` is `manual`, and `/approvals messages|posts|money|facts MODE` sets one
+class (`/approvals money auto 50`, `/approvals posts ask`). Add `for 2h` to any of them to change it
+for a while. A preset never loosens a class you set yourself: picking one drops the classes you set
+looser than it and keeps the stricter ones, and `/approvals` says `semi (modified)` while one
+differs. These are settings like the rest (`approvals.*` in `/settings`, `[approvals]` in
+`zephyr.toml`, the Approvals section of the settings panel): loosening one needs a strong channel,
+and the agent can make one stricter at once but only propose the reverse. An install made before
+approvals keeps sending as it did: its first start on this version writes `preset = "full"` and
+tells you once.
+
+When something waits, you get a card on the channel the agent was answering, and under Waiting in
+the settings panel:
+
+```
+[zephyr] approve #7: message (email)
+to: alice@example.com (new) · subject: "Invoice March"
+first lines: "Hi Alice, attached is the invoice for March."
+command: "himalaya message send <<'EOF' To: alice@example.com Subject: Invoice March Hi Alice, attached is the invoice for March. EOF"
+the agent says: "the owner asked me to send the March invoice"
+/ok 7 · /ok 7 once · /no 7 · expires in 24 h
+```
+
+The card is zephyr's reading of the action, not the agent's account of it; only the quoted line is
+the agent's. `/ok 7` carries out exactly that, once: zephyr runs the command itself and tells the
+agent how it went, lets that exact connector call through once in the next 30 minutes, or lets the
+browser click go on after checking the page is still the one you approved (if it changed, nothing
+is clicked and you are told). Under `ask-new`, `/ok 7` also remembers the new recipients (marked
+`(new)`), and `/ok 7 once` approves without remembering them. `/no 7` drops it, `/cancel 7` stops
+a delayed one (`sending at 14:05 unless /cancel 7`) before it goes, and `/held` lists what waits.
+
+- An action nobody answers expires after 24 hours (a browser click after 10 minutes), and the
+  agent is told. The agent never retries a held action: it is told `held for the owner as #7`.
+- Nothing goes late on its own: a delay that comes due while zephyr is paused, after `/stop`, or
+  while it is down waits for your `/ok` again, with its card sent once more. `/stop` also refuses
+  every browser click still waiting. Two `/ok` for the same action, from two channels, run it once.
+- At most 3 actions wait from one run and 20 in a day; past that, the agent's further ones that
+  would wait are refused, and you get one line about it.
+- `[approvals] strong_only = ["loosen", "money"]` lets a payment be approved only from a strong
+  channel. It is off by default, so you can approve a purchase from your phone. A payment set to
+  `delay N` still goes when its delay ends.
+- **Private facts** (`zephyr facts`, `/facts`, the settings panel): a call that holds one waits for
+  you (`hold`; the card names the fact, never its value), goes and tells you (`warn`), or is not
+  checked (`off`); `/approvals facts MODE` sets which. A fact allowed for a recipient (`zephyr facts
+  allow phone mum@example.com`) goes to that recipient without a check.
+
+What it does not stop: an agent set on getting around it, which can run a copy of the real browser,
+send from a Python script or reach a mail API with `curl`. It stops a confused or misled agent
+using its usual tools; general network traffic is not limited.
+
 ## What you are told
 
 - After a turn that ran a command sending data off the machine (curl or wget with a body, ssh, scp,
@@ -212,6 +318,9 @@ example to test beside a live install.
   Jobs report theirs on the job's channel. Plain downloads are not listed. In the agent's browser,
   typing, uploading and running script on a page count (`agent-browser fill`, `type`, `keyboard`,
   `upload`, `eval`); plain browsing does not.
+- When the agent sends a message, posts or pays and your approval modes say to wait, you get its
+  card (see [Approvals and presets](#approvals-and-presets)); under `warn`, a call holding a private
+  fact tells you `[zephyr] the agent sent your private fact NAME to …`.
 - When the agent repeats a tool call that keeps failing the same way, zephyr tells it after 3 tries
   to change approach, and after 5 stops the run: `[zephyr] stopped a run that repeated a failing …
   call 5 times`. Jobs and background tasks end `failed` the same way.
@@ -282,7 +391,9 @@ instructions given in chat can. `/new` starts a fresh conversation; rules and me
 The image gives the agent a browser and a screen of its own (DESIGN §4.11):
 
 - **Browser.** fingerprint-chromium (ungoogled-chromium with fingerprint patches; Playwright's
-  Chromium on arm64), driven by the `agent-browser` CLI. Its profile is `~/.zephyr/browser`, kept
+  Chromium on arm64), driven by the `agent-browser` CLI. The `agent-browser` the agent runs is
+  zephyr's wrapper, which holds a click on a send, post or pay button for your approval (see
+  [Approvals and presets](#approvals-and-presets)). Its profile is `~/.zephyr/browser`, kept
   across restarts. It is the agent's, never yours, and holds only the sign-ins you give it: through
   [the vault](#the-vault), or by hand (below).
   A site that still blocks it gets Camoufox, a stealth Firefox, which keeps no sign-ins.
@@ -294,7 +405,8 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
 - **Command-line tools.** `gh` (GitHub, once you give the agent a token), `himalaya` (mail, below),
   `jq`, `rg`, `fd`, `sqlite3`, `ssh`, `zip`/`unzip`, `tree`, `file`, `zsh`, and node with `npm` and
   `npx`. Writes through `gh` (`pr create`, `issue comment`, `api -X POST`, ...) and mail
-  `himalaya` sends are in the turn's outbound list.
+  `himalaya` sends are posts and messages: they wait for you as your
+  [approval modes](#approvals-and-presets) say, and are in the turn's outbound list.
 - **Installing.** The agent has no sudo. What it installs lands in its home and survives upgrades:
   `uv tool install`, `npm i -g` (`NPM_CONFIG_PREFIX` is `~/.zephyr/.local`) and any binary in
   `~/.zephyr/.local/bin`, which is first on its PATH. An apt package needs you:
@@ -319,13 +431,16 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   PDF) with its reply. Its `schedule` tool only proposes a job: you are shown it, and it runs after
   `/job ok N` (`/job rm N` drops it; `/job list` marks the ones waiting).
 - **Commands.** The agent's `gateway` tool runs `/status`, `/model`, `/switch`, `/rules`,
-  `/memory diff`, `/memory log`, `/job list` or `/settings` and reads the output in the same turn. It
+  `/memory diff`, `/memory log`, `/job list`, `/settings`, `/approvals` or `/facts` (the facts'
+  names and kinds, never a value) and reads the output in the same turn. It can save a private fact
+  (`/facts add NAME KIND VALUE`; you are told its name) and propose removing one or allowing it a
+  target. It
   can change a setting with `/set KEY VALUE [for D]` (stricter at once, else proposed; see
   [Changing settings](#changing-settings)), and propose `/model PROVIDER/MODEL`, `/new`, `/switch ID`,
   `/pause`, `/reload`, `/subagent …` or `/rule …`: you are asked
   (`the agent asks to run /new (#3)`), `/ok 3` runs it exactly as if you had typed it, and `/no 3`
-  drops it (a proposal lapses after 24 hours). Approvals (`/ok`, `/memory ok`, `/job ok`,
-  `/login`, `/resume`) and `/stop` are never proposable, so text the agent read cannot approve
+  drops it (a proposal lapses after 24 hours). Approvals (`/ok`, `/no`, `/cancel`, `/held`,
+  `/memory ok`, `/job ok`, `/login`, `/resume`) and `/stop` are never proposable, so text the agent read cannot approve
   itself. In a scheduled job it gets no answer and proposes nothing.
 - **Background tasks.** You can keep talking while the agent works. It hands anything that takes
   more than a minute to a task (its `task` tool): a fresh session running beside the conversation,
@@ -478,7 +593,8 @@ The first `himalaya` command run with `secrets: ["MAIL_PASSWORD"]` asks you to a
   - `host.toml`: the projects folder, optionally `memory = "8g"` to cap the container's memory (75% of the machine's when unset),
     `packages`: the apt packages `zephyr packages` bakes into the local image, and `offered_extensions`: the image extensions `init`, `up` and `upgrade` have already added to `zephyr.toml`, so one you remove stays removed. The first `up` after upgrading to a zephyr that keeps this record adds once any image extension removed earlier, or every one if the config lists none; after that, a removal sticks.
     Used only on the host, at `zephyr up`.
-  - `state.db`: inbox, outbox, jobs, spend, and the audit of tool calls. Rows older than 90 days
+  - `state.db`: inbox, outbox, jobs, spend, the actions waiting for your approval and the
+    recipients you approved, and the audit of tool calls. Rows older than 90 days
     are pruned; a reply that could not be sent for 7 days is given up as `expired`.
   - `backups/` (0700): a daily copy of `state.db` and the four files above, the newest 7 kept.
     `zephyr doctor` warns when the newest is over 2 days old. Copy this folder off the machine

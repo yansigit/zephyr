@@ -50,7 +50,9 @@ The owner's decisions, from the design conversation:
 - Gating general data egress (curl POSTs, scp, rsync, `git push`): A2.
 - Stopping a deliberately hostile agent that calls the real browser binary by path, posts from a
   Python script, or reaches a mail API with curl: A2 (network floor) and A3 (token broker). This
-  gate stops a confused or prompt-injected agent using zephyr's own tools.
+  gate stops a confused or prompt-injected agent using zephyr's own tools. Elaborate obfuscation
+  of a send (encoded scripts, interpreters fed from files, a script written now and run later) is
+  out of scope too (R27): the gate covers the shell forms it recognizes.
 - Payments infrastructure (virtual cards): D5. A1 gates checkouts the agent drives in the browser
   and connector calls that pay.
 - The web app's approval cards and push: W, built on the attach methods here.
@@ -96,6 +98,16 @@ pub fn gated(tool: &str, args: &Value) -> Option<Gated>
 | Money | connector calls whose tool name contains `pay`, `purchase`, `order`, `checkout`, `transfer`, `refund`, `charge`, `subscribe`; amount from `amount`/`total`/`price` and `currency` in the arguments |
 | Money | browser checkout and payment buttons (§4.4) |
 
+As built (R22, R37, R38): a connector tool's name is normalized (`createIssue` is
+`create_issue`) and matched by whole `_` words, and a name whose first word is a read verb
+(`get`, `list`, `read`, `search`, `find`, `fetch`, `view`, `show`, `count`, `describe`) is not
+gated. A connector message's or post's targets are `server/tool` plus the values of its
+recipient-like arguments (`to`, `cc`, `bcc`, `recipient`, `recipients`, `email`, `channel`,
+`channel_id`, `user`, `user_id`, `chat_id`, `thread`, `thread_id`, `phone`, `number`); with none
+present the targets include `unknown`, so `ask-new` never lets such a send through on its own. A
+payment's target is `server/tool`. A fact's `allow` list is compared with the recipient targets
+only.
+
 A command with several stages is classified per stage (`policy::stages`, nested `sh -c`/`eval`
 as `outbound` does); the strictest class and every target count. `[[mcp]]` gains an optional
 `classes = { tool_name = "messages" | "posts" | "money" | "none" }` table that overrides the verb
@@ -117,14 +129,19 @@ agent-browser click/press/Enter ─────▶ wrapper ──▶ gate socket
    veto and `vault::exec_env`, it calls `gate::decide`. `allow` starts the process; `hold`
    answers the call (§4.6) and starts nothing.
 2. **Tasks' and jobs' `bash`, and `mcp_call` in every session.** The plugin's `ToolCall`
-   handler, for a call `gated` recognizes or `outbound` lists (the second only for the
-   private-facts check), connects to the **gate socket**, sends the request and waits for the
+   handler, for a `bash` call `gated` recognizes or `outbound` lists (the second only for the
+   private-facts check), and for every `mcp_call` (as built: the owner's `classes` are the
+   daemon's to apply), connects to the **gate socket**, sends the request and waits for the
    verdict (at most 5 s; browser waits never reach the plugin). `allow`
    continues; anything else, including no socket, a timeout or a malformed answer, aborts (the
    plugin already fails closed). A veto shows the model no reason, so the daemon steers in
    `held for the owner as #N (…); don't retry it; carry on or end your turn`, through the same
    path the repeated-failure note uses for main (`router::steered`) and for tasks and jobs
-   (`scheduler::follow`).
+   (`scheduler::follow`). As built (R51, A11): the note goes into the asking run before the
+   plugin hears `hold` (the gate waits at most 2 s for rpi to take it); rpi 0.18 accepts that
+   `queue_message` while the plugin's `ToolCall` handler is blocked on the gate and delivers it
+   right after the vetoed call's result. The call's own `tool_execution_end` carries only rpi's
+   "extension … blocked tool …" line, so the note is what tells the agent why.
 3. **Browser sends.** §4.4.
 
 **The gate socket** is `/var/lib/zephyr-public/gate.sock`: a Unix socket in root's 0755 public
@@ -132,7 +149,10 @@ folder (the one that holds `mcp.json`), mode 0666 so the agent can connect but n
 The daemon checks `SO_PEERCRED` (the agent's uid only), takes one JSON request per connection,
 caps connections at 32 as the attach port does, and closes a connection idle for 10 s. The
 request names its session (`ZEPHYR_SESSION`, which `rpc::spawn_as` sets in every child, inherited
-by the wrapper); a forged session only misroutes a card, it grants nothing.
+by the wrapper). As built (A7): the session is supplied by the agent's process, so a forged one
+can misroute a card, bypass the per-run flood cap (the 20-a-day cap still binds) and steer a held
+or pass note into another run; no verdict depends on it. Cards for socket requests carry no agent
+reason.
 
 ```jsonc
 // request
@@ -144,16 +164,22 @@ by the wrapper); a forged session only misroutes a card, it grants nothing.
 {"verdict": "allow" | "hold" | "deny", "id": 7, "text": "held for the owner as #7 (…)"}
 ```
 
-**`gate::decide`**, in order:
+**`gate::decide`**, in order (as built, R35):
 
 1. `gated` → `None`: allow (the private-facts check below still runs on every call `outbound`
-   lists, and on browser `fill`/`type` values, whether gated or not).
+   lists, every `mcp_call`, and on browser `fill`/`type` values, whether gated or not). A
+   connector call with an unused one-time pass for exactly its arguments (§4.6) goes through
+   first, once.
 2. **Private facts** (§4.5): a match with facts `hold` → hold as a fact hold; `warn` → note it for
-   the owner's notice and go on; `off` → go on.
-3. **The flood cap**: at most 3 actions waiting from one run (main's run, a task, a job run) and
-   20 a day. Past it the call is denied at once with `not run: N actions already wait for the
-   owner`, and the owner gets one summary line per run, not a card per call.
+   the owner's notice and go on; `off` → go on. A facts file that cannot be read holds unless
+   `off`.
+3. A browser action on a control the wrapper could not read is held, whatever the mode.
 4. **The class's mode** (§4.3).
+5. **The flood cap**: at most 3 actions waiting from one run (main's run, a task, a job run) and
+   20 held in the last 24 h. It counts only calls that would wait and is applied after the mode,
+   so a call allowed by `auto` or by known targets still runs at the cap. Past it the call is
+   denied at once with `not run: N actions already wait for the owner`, and the owner gets one
+   summary line per run, not a card per call.
 
 ### 4.3 Modes, presets and their settings
 
@@ -191,7 +217,8 @@ Per mode, for a gated call:
 - `ask`: hold.
 - `ask-new`: allow when every target is in `known_targets(class, target)`; a target `unknown`
   never is. Otherwise hold. Approving with `/ok N` adds the action's targets; `/ok N once` does
-  not.
+  not. As built (R46, A6): targets are remembered only when the class is `ask-new` at approval,
+  the owner answered `/ok N` (not `once`, and never a delay running out), and the action started.
 - `delay N`: a `Run` or `Pass` action is stored `scheduled` with `due_at = now + N min`, and the
   owner is told `sending at 14:05 unless /cancel 7`; a `Wait` action (browser) holds the page for
   `min(N, 10)` minutes, then allows unless cancelled.
@@ -225,8 +252,25 @@ as the wrapper when `argv[0]` is `agent-browser`) **first** on `agent::AGENT_PAT
     `type=search`, or a name/placeholder containing "search"). A browser send's `ask-new`
     target is the page's origin in both classes.
   - Not gated: login forms (the form has a password field; the vault's fill handles those), and
-    everything else (links, tabs, menus, navigation).
+    everything else (links, tabs, menus, navigation). As built (R58): a password field in a form
+    excludes only messages and posts (a login form's "Send code"); a money label is gated whatever
+    the form holds, since a checkout may carry an optional account password. Only Enter in a
+    field reads the form's password field: a click never does, so a clicked "Send code" is held.
   - The snapshot fails or the ref matches nothing: held as "a click the gate could not read".
+  - As built (A8): the wrapper reads commands as agent-browser 0.41 does (global flags anywhere,
+    `batch` strings split like a shell, `press` key chords as its `parse_key_chord`). Clicks are
+    `click`, `dblclick`, `tap` and `find … click`; Enter is any spelling (`press`, `key`,
+    `keydown`, `keyup` with `Enter`, `Return` or `NumpadEnter`, with modifiers, `\n` or `\r`, a line
+    break typed with `type` or `keyboard type`), and Space or Enter on a focused button is a click
+    on it. A click on a child of a button counts as the button (R53); a scoped read is followed by
+    a full snapshot so the agent's refs keep working (R54). A `batch` carrying any gated command or
+    reading stdin, `mcp`, `chat` and `webmcp invoke` (R55) are refused. A Tab before a line break,
+    or keys after the first Enter, hold as "a key press the gate could not read" (R57). After an
+    `allow` the wrapper reads the page again and refuses `the page changed while the owner decided;
+    not run` when it is not what the owner approved, and tells the gate whether it ran; the owner
+    is told when an approved click did not run. An amount it cannot read counts as over the cap.
+    The lexicon is English and Korean; an unrecognized label is not gated (a documented limit). The
+    wrapper trusts only a gate socket run by root.
 - A gated click goes to the gate socket as a `Wait` request. The wrapper blocks until the
   verdict: `allow` runs the real command; `hold`/`deny` exits non-zero with the daemon's text on
   stderr, which is what the agent reads. While it waits, nothing touches the page.
@@ -282,7 +326,7 @@ ALTER TABLE proposals ADD COLUMN class TEXT;          -- messages|posts|money
 ALTER TABLE proposals ADD COLUMN targets TEXT;        -- JSON list
 ALTER TABLE proposals ADD COLUMN summary TEXT;        -- the card's first lines, daemon's words
 ALTER TABLE proposals ADD COLUMN reason TEXT;         -- the agent's words, quoted on the card
-ALTER TABLE proposals ADD COLUMN payload TEXT;        -- exact command, or tool + args JSON
+ALTER TABLE proposals ADD COLUMN payload TEXT;        -- exact command and its timeout, or tool + args JSON
 ALTER TABLE proposals ADD COLUMN secrets TEXT;        -- vault token names (exec)
 ALTER TABLE proposals ADD COLUMN origin TEXT;         -- JSON {channel, sender, session, run}
 ALTER TABLE proposals ADD COLUMN due_at INTEGER;      -- delay
@@ -312,6 +356,7 @@ CREATE TABLE known_targets(class TEXT NOT NULL, target TEXT NOT NULL,
 - **`/no N`**: dropped; the agent gets a short inbox note (`the owner declined #7 (…); don't try
   it again`), a waiting wrapper gets `deny`.
 - **`/cancel N`**: a `scheduled` action becomes `cancelled`, a delayed browser wait gets `deny`.
+  It is for delayed actions only: a `pending` one is pointed at `/no N`.
 - **`/held`**: lists `pending` and `scheduled` actions, newest first (also the TUI's Waiting tab).
 - **Expiry**: `pending` actions expire after 24 h (the agent is told), browser waits after 10 min.
   The sweep runs on the router's tick.
@@ -340,7 +385,11 @@ the agent says: "the owner asked me to send the March invoice"
 - **Strong channels for approval**: `approvals.strong_only` (default `["loosen"]`) lists what may
   be approved only from a strong channel. `loosen` is any proposal that relaxes an `approvals.*`
   setting or a fact. Adding `money` locks purchase approvals to the TUI (and W with a passkey);
-  it is off by default until W ships so a purchase can be approved from a phone.
+  it is off by default until W ships so a purchase can be approved from a phone. As built (R48):
+  a `delay N` mode is the owner's standing choice, and `strong_only` governs who may approve, so
+  a delayed payment that runs out sends without a strong-channel approval. `loosen` is enforced by
+  the `approvals.*` settings' `strong` flag and `Router::not_now` (facts), whether or not the
+  list names it.
 - The existing rules stand: agent lines starting `[zephyr]` go out as `[agent]` (§4.4 item 7), so
   no card can be forged in the agent's own text.
 
@@ -359,7 +408,8 @@ the agent says: "the owner asked me to send the March invoice"
 
 - **No gate** (the daemon restarting, the socket missing): the plugin and the wrapper deny.
 - **`/stop`**: kills running approved actions (they are `procs` processes) and denies every
-  browser wait; `pending` actions stay pending.
+  browser wait; `pending` actions stay pending. As built (R47): every `scheduled` action goes
+  back to `pending` too, its card shown again, so nothing set to go by itself goes after a stop.
 - **`/pause` and a budget pause**: `/ok` answers `paused; /resume first`; scheduled actions wait
   and run at `/resume` if still due, otherwise they go back to `pending` and the owner is asked.
 - **A child killed while its wrapper waits** (failover, re-exec, crash): the wait gets `deny`.
@@ -369,8 +419,8 @@ the agent says: "the owner asked me to send the March invoice"
   file (§4.13), and it is never run again.
 - **Settings and facts** are read on every decision, so a change applies to the next call.
 - **Audit**: every decision is an `audit` row (`held`, `auto`, `known`, `approved`, `once`,
-  `dropped`, `expired`, `cancelled`, `fact-hold`, `fact-warn`), arguments scrubbed of vault and
-  fact values and cut to 500 bytes, as today.
+  `dropped`, `expired`, `cancelled`, `fact-hold`, `fact-warn`; as built also `pass`, `denied` and
+  `due`), arguments scrubbed of vault and fact values and cut to 500 bytes, as today.
 - **`doctor`**: fails when the gate socket is missing while the daemon is up, when
   `/opt/zephyr/gate/bin` is not root-owned or not first on `AGENT_PATH`, or when another
   `agent-browser` is reachable on `AGENT_PATH`.
@@ -418,5 +468,6 @@ Each piece starts with a failing test (CLAUDE.md, DESIGN §6).
     `/stop` denying it; a timeout denying it.
 - **TUI screen tests**: the Approvals section of the settings panel, preset rows marked
   `(modified)`, the Waiting tab with an action card, the facts editor's masked field.
-- **Ignored real-rpi test** (`tests/real_rpi.rs`): the plugin's gate-socket round trip under the
-  pinned binary, a held `bash` call vetoed and the steered note delivered.
+- **Ignored real-rpi test** (`crates/zephyr-policy/tests/rpi_load.rs`, as built, not
+  `tests/real_rpi.rs`): the plugin's gate-socket round trip under the pinned binary, a held `bash`
+  call vetoed and the steered note delivered.

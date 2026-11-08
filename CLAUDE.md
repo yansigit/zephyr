@@ -85,9 +85,40 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   pruned to 50 per project by `retention.rs`), `attach.rs` (rpi remote JSON-RPC shim so stock
   `rpi --connect` attaches to `main`).
 - `vault.rs` (DESIGN §4.15): owner-saved logins and tokens in `<state>/vault.toml` (root, 0600,
-  read fresh on each use). Main's `vault` tool lists, requests and fills (`agent-browser`, only on
-  the login's own origin); `exec`'s `secrets` sets tokens per command, its output scrubbed to
+  read fresh on each use). Main's `vault` tool lists, requests and fills (the real `agent-browser`,
+  only on the login's own origin); `exec`'s `secrets` sets tokens per command, its output scrubbed to
   `[vault:NAME]`. Grants come only from the owner (`/vault grant`, or `/ok N` on a proposal).
+- The approvals gate (DESIGN §4.16): messages, posts and payments wait for the owner as far as
+  `[approvals]` says. `approvals.rs` is pure: `Mode`/`FactsMode`/`Preset`, `effective` (hand-set
+  class, else the preset's; an unparseable value reads as the strictest), `preset_edits` (a preset
+  never loosens a hand-set class), `snapshot`/`restore_edits` for a timed preset; strictness is
+  `stricter` alone, never a derived order. `gate.rs` `decide` is the one decision (pass, facts,
+  unreadable control, mode, then the flood cap of 3 per run and 20 a day on calls that would wait),
+  fails closed, audits each outcome and builds the card from the payload (`card`; agent and page
+  text quoted, cut, scrubbed of vault and fact values). It is reached from the router for main's
+  `exec` and over `<state>-public/gate.sock` (`serve`: the agent's uid only, 32 connections, 10 s
+  to send) for the plugin and the browser wrapper; a hold's note is steered into the asking run
+  before the plugin hears `hold`. The `ZEPHYR_SESSION` a request names is the agent's to forge, so
+  no verdict may depend on it. `actions.rs` carries a held action out (`proposals` rows of
+  kind `run`/`pass`/`wait`, schema v16, one id space with proposed commands): `/ok N [once]` takes
+  it once in one statement, then runs the stored payload through `procs` (report `action-<id>` to
+  main), stores a 30-minute one-time pass, or answers the waiting wrapper (`Waits`); `/no`,
+  `/cancel`, `/held`, and the tick's due delays and expiry (24 h, a browser wait 10 min). A delay
+  never goes late: pause, `/resume`, `/stop` and start put it back to `pending` with its card.
+- `facts.rs` (DESIGN §4.18): private facts in `<state>/facts.toml` (root, 0600, read fresh).
+  `found`/`scrub` match a value however it is written (NFKC, case, spacing, invisible characters,
+  digit runs, percent and base64 forms; at least 6 digits or 4 characters); a fact's `allow` is
+  compared with recipient targets only. A value is never in `Debug`, a log, an audit row, a notice
+  or an error (`[fact:NAME]`); only the TUI, `zephyr facts` and the agent's `/facts add` take one.
+- `browser_gate.rs`: `agent-browser` on the agent's PATH is the zephyr binary (`argv[0]`,
+  dispatched in main.rs before any config is read), linked from root's `/opt/zephyr/gate/bin`, first
+  on `agent::AGENT_PATH`; the real 0.41 binary is `/opt/zephyr/libexec/agent-browser`
+  (`ZEPHYR_AGENT_BROWSER`, `Config::agent_browser` for the daemon's own fill). It reads argv as
+  agent-browser 0.41 does (keep `split`, `parse_key_chord` and the batch splitting in step with the
+  pin), asks the real binary about the page and the control, sends clicks and Enter on send, post
+  and pay controls (and controls it cannot read) to the gate, waits on the open connection, reads
+  the page again after `allow` and tells the gate whether it ran (`{"ran": …}`); typing goes to the
+  gate for the facts only. `doctor` checks the layout.
 - `inbox.rs`: files the owner sends on Discord or iMessage (DESIGN §4.3). The adapter saves them as
   the agent into `<home>/inbox/` before the row goes to the router and appends a
   `[attached image: <path> ...]` line per file to its text; owners come from the router's live
@@ -117,9 +148,13 @@ for tasks and jobs (`scheduler::follow`).
 
 **`crates/zephyr-policy`** is a cdylib rpi plugin loaded with `--extension`. Its `ToolCall` handler
 vetoes hardline commands (`policy.rs` `check`). It fails closed: any non-`Allow`, malformed event or
-panic blocks the call. The audit of tool calls is state.db's `audit` table, written by the daemon
-from the event stream (`Router::tapped`, `scheduler::follow`); `$ZEPHYR_AUDIT_LOG` is the plugin's
-optional log, off in production.
+panic blocks the call. `policy::gated` (messages, posts, payments and their targets) and
+`browser_class` (the English and Korean button lexicon) are shared with the daemon; for a gated or
+`outbound` `bash` command and every `mcp_call` the handler asks the gate socket (`gate_client`: 5 s,
+a socket served by root, or by the program's owner outside the image) and runs the call only on
+`allow`. The audit of tool calls is state.db's `audit` table, written by the daemon from the event
+stream (`Router::tapped`, `scheduler::follow`); `$ZEPHYR_AUDIT_LOG` is the plugin's optional log,
+off in production.
 
 **Tests** (`crates/zephyr/tests/`) run the daemon against `fake-rpi.py`, a scripted stand-in for rpi
 0.18.0 frames. Its behaviour is driven by marker files in the zephyr home (`hang`, `slow`, `wedge`,
@@ -127,13 +162,17 @@ optional log, off in production.
 `log.jsonl`; read its docstring before adding a test. It writes rpi 0.18's real session layout
 (`--<cwd>--/<stamp>_<id>.jsonl` with `.lock` and `.progress.jsonl`; read sessions in tests through
 `session_file` / `session_messages`), refuses a second run while one is active, and gives tool calls
-ids unique across children. When rpi's frame shapes matter, update fake-rpi.py to match the real
-binary. `Config::tick` (the router's 5 s housekeeping tick) is a hidden field like `stall_limit`;
-tests that wait on it set 200 ms. Wait on events, not fixed sleeps, and don't assume the order of
-replies a slow machine can reorder (a task's report may be steered into main's running turn). CI
-(`.github/workflows/ci.yml`) runs fmt, clippy and the tests on Rust 1.95 and `cargo deny check
-advisories bans`; `ZEPHYR_REAL_RPI=1` makes the ignored real-rpi tests fail instead of skip when the
-binary is missing.
+ids unique across children. It also plays the plugin's gate client: with `$ZEPHYR_GATE_SOCKET` set,
+every `bash` and `mcp_call` sends the gate its request line and waits up to 5 s (checking the
+socket's uid as the plugin does), answering what needs no run meanwhile, and runs the call only on
+`allow`; `[mcp SERVER TOOL {json}]` in a prompt makes one `mcp_call` with those arguments. It
+mirrors `gateway_kind` and the gate's protocol: change them in the same commit as the Rust. When
+rpi's frame shapes matter, update fake-rpi.py to match the real binary. `Config::tick` (the
+router's 5 s housekeeping tick) is a hidden field like `stall_limit`; tests that wait on it set
+200 ms. Wait on events, not fixed sleeps, and don't assume the order of replies a slow machine can
+reorder (a task's report may be steered into main's running turn). CI (`.github/workflows/ci.yml`)
+runs fmt, clippy and the tests on Rust 1.95 and `cargo deny check advisories bans`;
+`ZEPHYR_REAL_RPI=1` makes the ignored real-rpi tests fail instead of skip when the binary is missing.
 
 ## Conventions
 
