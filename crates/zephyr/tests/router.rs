@@ -5365,3 +5365,105 @@ async fn the_vaults_fill_runs_the_real_browser_by_its_path() {
     );
     gw.shutdown().await;
 }
+
+/// A `state.db` as 0.6 left it: v15, with one answered message from `owner` on `chat`.
+fn old_install(home: &Path) {
+    const V16: &str = "DROP TABLE known_targets; DROP TABLE passes; ALTER TABLE proposals DROP COLUMN kind; ALTER TABLE proposals DROP COLUMN class; ALTER TABLE proposals DROP COLUMN targets; ALTER TABLE proposals DROP COLUMN summary; ALTER TABLE proposals DROP COLUMN reason; ALTER TABLE proposals DROP COLUMN payload; ALTER TABLE proposals DROP COLUMN secrets; ALTER TABLE proposals DROP COLUMN origin; ALTER TABLE proposals DROP COLUMN due_at; ALTER TABLE proposals DROP COLUMN settled_at; ALTER TABLE proposals DROP COLUMN result; ALTER TABLE procs DROP COLUMN action;";
+    let path = home.join("state.db");
+    drop(Store::open(&path).unwrap());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch(
+        "INSERT INTO inbox(channel, platform_msg_id, sender, text, status, sent_as)
+         VALUES ('chat', 'old', 'owner', 'earlier', 'done', 'prompt');",
+    )
+    .unwrap();
+    db.execute_batch(&format!("{V16} PRAGMA user_version = 15;"))
+        .unwrap();
+}
+
+const KEPT: &str = "# kept as before 0.7; /approvals manual turns approvals on";
+const OFF_NOTICE: &str = "[zephyr] approvals are off, as before this version; \
+                          /approvals manual or /settings turns them on";
+
+/// Approvals spec §4.10: an install made before the gate keeps sending, is told once, and the
+/// change is in the settings log; a second start neither writes nor tells again.
+#[tokio::test]
+async fn an_upgraded_install_keeps_sending_and_is_told_once() {
+    let home = home("upgraded");
+    old_install(&home);
+    let gw = start(on_file(&home, ""));
+    assert_eq!(gw.wait_replies(1).await, [OFF_NOTICE]);
+    let text = std::fs::read_to_string(home.join("zephyr.toml")).unwrap();
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("preset = \"full\"") && l.contains(KEPT)),
+        "{text}"
+    );
+    let cfg = Config::load(&home.join("zephyr.toml")).unwrap();
+    assert_eq!(cfg.approvals.unwrap().preset.as_deref(), Some("full"));
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let change = store
+        .last_setting_change("approvals.preset")
+        .unwrap()
+        .unwrap();
+    assert_eq!(change.actor, "zephyr");
+    gw.say("m1", "owner", "/approvals").await;
+    assert_eq!(
+        gw.wait_replies(2).await[1],
+        "[zephyr] preset full · messages auto · posts auto · money auto · facts warn"
+    );
+    gw.shutdown().await;
+
+    let again = std::fs::read_to_string(home.join("zephyr.toml")).unwrap();
+    let gw = start(on_file_keep(&home));
+    gw.say("m2", "owner", "hi").await;
+    assert_eq!(gw.wait_replies(1).await, ["echo: [chat #3] hi"]);
+    gw.shutdown().await;
+    assert_eq!(
+        std::fs::read_to_string(home.join("zephyr.toml")).unwrap(),
+        again
+    );
+}
+
+/// A config that has an `[approvals]` table already is left alone, though the store was upgraded.
+#[tokio::test]
+async fn an_upgrade_leaves_an_approvals_table_the_owner_wrote() {
+    let home = home("upgraded-table");
+    old_install(&home);
+    let path = home.join("zephyr.toml");
+    std::fs::write(
+        &path,
+        format!("{}\n[approvals]\npreset = \"semi\"\n", file_text(&home, "")),
+    )
+    .unwrap();
+    let gw = start(Config::load(&path).unwrap());
+    gw.say("m1", "owner", "hi").await;
+    assert_eq!(gw.wait_replies(1).await, ["echo: [chat #2] hi"]);
+    gw.shutdown().await;
+    let cfg = Config::load(&path).unwrap();
+    assert_eq!(cfg.approvals.unwrap().preset.as_deref(), Some("semi"));
+    let store = Store::open(&home.join("state.db")).unwrap();
+    assert_eq!(store.last_setting_change("approvals.preset").unwrap(), None);
+    assert_eq!(store.upgraded_from(), None, "dealt with");
+}
+
+/// A home with no `state.db` is a new install: no `[approvals]` written, no notice, `manual`.
+#[tokio::test]
+async fn a_fresh_install_starts_in_manual() {
+    let home = home("fresh-manual");
+    let gw = start(on_file(&home, ""));
+    gw.say("m1", "owner", "/approvals").await;
+    assert_eq!(
+        gw.wait_replies(1).await,
+        ["[zephyr] preset manual · messages ask · posts ask · money ask · facts hold"]
+    );
+    gw.shutdown().await;
+    let text = std::fs::read_to_string(home.join("zephyr.toml")).unwrap();
+    assert!(!text.contains("approvals"), "{text}");
+    let store = Store::open(&home.join("state.db")).unwrap();
+    assert_eq!(store.last_setting_change("approvals.preset").unwrap(), None);
+}
+
+fn on_file_keep(home: &Path) -> Config {
+    Config::load(&home.join("zephyr.toml")).unwrap()
+}

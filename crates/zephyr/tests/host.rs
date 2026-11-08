@@ -327,6 +327,132 @@ fn mode(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().mode() & 0o777
 }
 
+/// Answers a prompting `zephyr` on a pty, one `(prompt text, keys)` step at a time: each is sent
+/// once the prompt's text has been printed. Returns the exit code and everything printed.
+const PTY_DRIVER: &str = r#"
+import json, os, pty, re, select, sys, time
+steps = json.loads(sys.argv[1]); argv = sys.argv[2:]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(argv[0], argv)
+seen, at, deadline = "", 0, time.time() + 60
+while time.time() < deadline:
+    r, _, _ = select.select([fd], [], [], 0.2)
+    if r:
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            break
+        if not data:
+            break
+        seen += re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", data.decode(errors="replace"))
+    if steps:
+        prompt, keys = steps[0]
+        i = seen.find(prompt, at)
+        if i >= 0:
+            at = i + len(prompt)
+            time.sleep(0.2)
+            os.write(fd, keys.encode())
+            steps.pop(0)
+_, status = os.waitpid(pid, 0)
+print(seen)
+print("LEFT", len(steps))
+sys.exit(os.waitstatus_to_exitcode(status))
+"#;
+
+impl Env {
+    /// `zephyr <args>` on a terminal answering `steps` (see `PTY_DRIVER`): `(code, output)`.
+    fn on_a_driven_tty(&self, args: &[&str], steps: &[(&str, &str)]) -> (i32, String) {
+        let path = format!(
+            "{}:{}",
+            self.dir.join("bin").display(),
+            std::env::var("PATH").unwrap()
+        );
+        let steps = serde_json::to_string(steps).unwrap();
+        let out = Command::new("python3")
+            .args(["-I", "-c", PTY_DRIVER, &steps, env!("CARGO_BIN_EXE_zephyr")])
+            .args(args)
+            .env_clear()
+            .env("PATH", path)
+            .env("HOME", &self.home)
+            .env("SHIM_DIR", &self.dir)
+            .env("ZEPHYR_CONTAINER", CONTAINER)
+            .env("ZEPHYR_IMAGE", "zephyr-lanetest")
+            .env("TERM", "xterm")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        (out.status.code().unwrap_or(-1), stdout(&out))
+    }
+}
+
+#[test]
+fn init_asks_for_a_preset_and_writes_it() {
+    const PIN: &str = "4829105";
+    const DOWN: &str = "\x1b[B";
+    let env = Env::new("init-preset");
+    let projects = env.projects.display().to_string();
+    let (code, shown) = env.on_a_driven_tty(
+        &["init", "--projects", &projects, "--no-start"],
+        &[
+            ("Providers", "\n"),
+            ("Set up discord?", "n"),
+            ("Set up imessage?", "n"),
+            // manual is first; semi is one down.
+            ("Approvals: how much", &format!("{DOWN}\n")),
+            ("Add private facts", "y"),
+            ("Fact name", "pin\n"),
+            ("Kind", &format!("{DOWN}\n")),
+            ("value of pin (hidden)", &format!("{PIN}\n")),
+            ("Add another fact?", "n"),
+        ],
+    );
+    assert!(
+        shown.contains("LEFT 0"),
+        "every prompt was answered: {shown}"
+    );
+    assert_eq!(code, 0, "{shown}");
+    let config = env.config();
+    assert!(
+        config.contains("[approvals]") && config.contains("preset = \"semi\""),
+        "{config}"
+    );
+    let facts = std::fs::read_to_string(env.daemon().join("facts.toml")).unwrap();
+    assert!(facts.contains(PIN) && facts.contains("digits"), "{facts}");
+    assert!(!shown.contains(PIN), "the value was echoed");
+    assert!(!format!("{:?}", env.calls()).contains(PIN), "value in argv");
+}
+
+#[test]
+fn init_non_interactive_takes_preset_flag() {
+    let env = Env::new("init-preset-flag");
+    env.init(&["--no-start", "--preset", "full"]);
+    let config = env.config();
+    assert!(
+        config.contains("[approvals]") && config.contains("preset = \"full\""),
+        "{config}"
+    );
+    // Not given: the table stays absent, which is manual; and no facts are asked for.
+    let plain = Env::new("init-no-preset");
+    plain.init(&["--no-start"]);
+    assert!(!plain.config().contains("approvals"));
+    assert!(!plain.daemon().join("facts.toml").exists());
+    // A word that is no preset is refused before anything is written.
+    let bad = Env::new("init-bad-preset");
+    let projects = bad.projects.display().to_string();
+    let out = bad.zephyr(&[
+        "init",
+        "--non-interactive",
+        "--projects",
+        &projects,
+        "--preset",
+        "some",
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("manual, semi or full"));
+    assert!(!bad.daemon().join("zephyr.toml").exists());
+}
+
 #[test]
 fn init_non_interactive_builds_the_layout_and_starts_the_container() {
     let env = Env::new("init");

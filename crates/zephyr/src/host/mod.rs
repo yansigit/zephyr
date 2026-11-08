@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub const USAGE: &str = "usage: zephyr <command>   (zephyr --version: this CLI's and the container's)
-  init [--non-interactive --projects DIR --provider ID.. --account NAME=PROVIDER/MODEL.. --model P/M --no-start]
+  init [--non-interactive --projects DIR --provider ID.. --account NAME=PROVIDER/MODEL.. --model P/M --preset manual|semi|full --no-start]
   up [--build] | down | restart | logs [-f] | status | upgrade [VERSION]
   login <provider> [--account NAME] [--model P/M] [--no-verify]
   accounts [list | order NAME.. | remove NAME]

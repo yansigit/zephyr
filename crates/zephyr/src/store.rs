@@ -767,9 +767,40 @@ impl Store {
                  ALTER TABLE procs ADD COLUMN action INTEGER; -- the approved action it runs
                  PRAGMA user_version = 16;",
             )?;
+            // A db that had a version had rows: this is an upgrade, not a first start. The
+            // router reads the mark at its next start (`upgraded_from`) and clears it, so
+            // `zephyr status` or the gate opening the store first cannot lose it.
+            if version > 0 {
+                db.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES ('upgraded_from', ?1)",
+                    params![version.to_string()],
+                )?;
+            }
         }
         db.commit()?;
         Ok(Self { db: conn })
+    }
+
+    /// The schema version an existing `state.db` was migrated to v16 from (approvals
+    /// spec §4.10), until `clear_upgraded`. `None` for a database that was new, or already seen.
+    pub fn upgraded_from(&self) -> Option<i64> {
+        self.db
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'upgraded_from'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok())
+    }
+
+    /// The upgrade has been dealt with.
+    pub fn clear_upgraded(&self) -> rusqlite::Result<()> {
+        self.db
+            .execute("DELETE FROM meta WHERE key = 'upgraded_from'", [])?;
+        Ok(())
     }
 
     /// Commits the message. Returns `None` when `(channel, platform_msg_id)` was already seen.
@@ -2996,6 +3027,10 @@ mod tests {
                 .unwrap();
             drop(db);
             let store = Store::open(&path).unwrap();
+            assert_eq!(store.upgraded_from(), Some(version), "an old db with rows is an upgrade");
+            store.clear_upgraded().unwrap();
+            assert_eq!(store.upgraded_from(), None);
+            assert_eq!(Store::open(&path).unwrap().upgraded_from(), None, "once");
             assert_eq!(store.inbox_with_status("new").unwrap().len(), 1);
             store.set_paused(Some("user")).unwrap();
             assert_eq!(
@@ -3069,6 +3104,14 @@ mod tests {
             .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .unwrap();
         assert!(Store::open(&path).is_err(), "a newer schema is refused");
+    }
+
+    #[test]
+    fn a_brand_new_database_is_not_an_upgrade() {
+        let dir = crate::test_dir("store-fresh");
+        let path = dir.join("state.db");
+        assert_eq!(Store::open(&path).unwrap().upgraded_from(), None);
+        assert_eq!(Store::open(&path).unwrap().upgraded_from(), None);
     }
 
     fn revert(key: &str, value: Option<&str>, at: i64) -> Revert {

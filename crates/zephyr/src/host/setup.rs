@@ -28,9 +28,13 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let providers = a.values("--provider")?;
     let account_flags = a.values("--account")?;
     let model = a.value("--model")?;
+    let preset = a.value("--preset")?;
     let rest = a.rest()?;
     if !rest.is_empty() {
         bail!("{USAGE}");
+    }
+    if let Some(p) = &preset {
+        crate::approvals::Preset::parse(p).map_err(|e| anyhow::anyhow!("--preset: {e}"))?;
     }
 
     if !no_start && !super::quiet(super::docker(&["version"])) {
@@ -87,6 +91,10 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
     }
     if let Some(m) = &model {
         conf::set(&mut doc, "model", m)?;
+    }
+    // Without --preset, [approvals] stays absent, which is `manual`; the interactive run asks.
+    if let Some(p) = preset.as_deref().filter(|_| non_interactive) {
+        conf::set(&mut doc, "approvals.preset", &p.to_ascii_lowercase())?;
     }
     h.data.save(&doc)?;
 
@@ -169,8 +177,94 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
             channel_add(h, kind)?;
         }
     }
+    init_approvals(h, preset.as_deref())?;
     run(&mut super::docker(&["restart", &h.container]))?;
     h.doctor(false)
+}
+
+/// The preset to start in (approvals spec §4.10), then the private facts. A config that already
+/// has an `[approvals]` table (a re-run of `init`) keeps it unless `--preset` says otherwise.
+fn init_approvals(h: &Host, preset: Option<&str>) -> anyhow::Result<()> {
+    use crate::approvals::Preset;
+    let mut doc = h.data.load()?;
+    let chosen = match preset {
+        Some(p) => Some(Preset::parse(p).map_err(anyhow::Error::msg)?),
+        None if doc.get("approvals").is_some() => None,
+        None => {
+            let items = [
+                "manual: every message, post and payment waits for your OK",
+                "semi: messages to people you have not written to, posts and payments wait",
+                "full: nothing waits (what zephyr did before approvals)",
+            ];
+            let i = Select::new()
+                .with_prompt("Approvals: how much may the agent do without asking you")
+                .items(items)
+                .default(0)
+                .interact()?;
+            Some([Preset::Manual, Preset::Semi, Preset::Full][i])
+        }
+    };
+    if let Some(p) = chosen {
+        conf::set(&mut doc, "approvals.preset", p.name())?;
+        h.data.save(&doc)?;
+    }
+    if Confirm::new()
+        .with_prompt(
+            "Add private facts (a phone number, an address) the agent may not send unasked?",
+        )
+        .default(false)
+        .interact()?
+    {
+        loop {
+            if let Err(e) = add_fact(h) {
+                println!("not saved: {e:#}");
+            }
+            if !Confirm::new()
+                .with_prompt("Add another fact?")
+                .default(false)
+                .interact()?
+            {
+                break;
+            }
+        }
+        println!("allow a fact to go to someone with: zephyr facts allow NAME TARGET");
+    }
+    Ok(())
+}
+
+/// One fact, asked for: its name, kind and value (hidden), saved as `zephyr facts add` does.
+fn add_fact(h: &Host) -> anyhow::Result<()> {
+    use crate::facts::{parse, put, render, Fact, FactKind};
+    let name: String = Input::new()
+        .with_prompt("Fact name (e.g. phone)")
+        .interact_text()?;
+    let kinds = ["text", "digits", "email"];
+    let k = Select::new()
+        .with_prompt("Kind")
+        .items(kinds)
+        .default(0)
+        .interact()?;
+    let value = Password::new()
+        .with_prompt(format!("value of {name} (hidden)"))
+        .allow_empty_password(true)
+        .interact()?;
+    let text = match h.data.read(crate::facts::FILE) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        r => r?,
+    };
+    let mut facts = parse(&text)?;
+    let allow = (facts.iter().find(|f| f.name == name)).map_or_else(Vec::new, |f| f.allow.clone());
+    let fact = Fact {
+        name: name.trim().into(),
+        kind: FactKind::parse(kinds[k]).unwrap_or_default(),
+        value: value.trim().into(),
+        allow,
+    };
+    let name = fact.name.clone();
+    put(&mut facts, fact, true)?;
+    h.data.write(crate::facts::FILE, &render(&text, &facts)?)?;
+    println!("saved the fact {name}; calls holding it are held for your OK");
+    Ok(())
 }
 
 fn known_provider(id: &str) -> anyhow::Result<()> {

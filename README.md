@@ -21,7 +21,11 @@ docker run --rm --entrypoint cat ghcr.io/yansigit/zephyr:latest /usr/local/bin/z
 `zephyr init` checks Docker, asks for the projects folder the agent may work in, pulls the image
 (`docker login ghcr.io` with your `gh` token when needed; it builds locally when it cannot pull),
 starts the container, signs in the providers you pick, sets the failover order and the channels,
-then runs `zephyr doctor`.
+asks which approvals preset to start in (`manual`, `semi` or `full`; `[approvals] preset` in
+`zephyr.toml`) and whether to add private facts (hidden prompts, as `zephyr facts add`), then runs
+`zephyr doctor`. A new install without a preset starts in `manual`. An install made before approvals
+keeps sending as it did: its first start on this version writes `preset = "full"` and tells you once;
+`/approvals manual` turns them on.
 
 Providers: OpenCode Go, Antigravity, ChatGPT/Codex, Claude (through the Claude Agent SDK), Cursor
 (through its agent service, tools included) and the Anthropic API key. Each sign-in is an account
@@ -31,9 +35,12 @@ Without prompts:
 
 ```sh
 zephyr init --non-interactive --projects ~/Projects \
-  --account codex-main=openai-codex/gpt-5.5 --model openai-codex/gpt-5.5
+  --account codex-main=openai-codex/gpt-5.5 --model openai-codex/gpt-5.5 --preset manual
 zephyr login openai-codex --account codex-main
 ```
+
+`--preset manual|semi|full` sets the approvals preset; without it a non-interactive `init` leaves
+`[approvals]` out (which is `manual`) and asks for no facts.
 
 ## Everyday commands
 

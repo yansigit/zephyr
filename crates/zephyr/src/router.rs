@@ -278,6 +278,7 @@ pub async fn run<C: Channel>(
     // The gate's held notes for main's run, steered in before the plugin is answered (R51).
     let (gate_notes, notes_rx) = mpsc::channel(16);
     router.gate_notes = Some(notes_rx);
+    router.keep_upgraded_install_as_it_was().await;
     // Commands a re-exec handed over alive are adopted; the rest a dead gateway left running
     // are reported, never re-run (DESIGN §4.13).
     router.procs.adopt(&router.cfg, &mut router.store)?;
@@ -2150,6 +2151,48 @@ impl<'a> Router<'a> {
         })
         .map_err(|e| format!("not changed: {e:#}"))?;
         Ok(self.reloaded().await)
+    }
+
+    /// Approvals spec §4.10: an install made before the gate keeps today's behaviour. The first
+    /// start after the v16 migration of an existing `state.db`, with no `[approvals]` table in
+    /// `zephyr.toml`, writes `preset = "full"` (logged like any change) and tells the owner once.
+    /// The mark is cleared once dealt with; if the file cannot be written it stays for the next
+    /// start.
+    async fn keep_upgraded_install_as_it_was(&mut self) {
+        let Some(from) = self.store.upgraded_from() else {
+            return;
+        };
+        if self.cfg.approvals.is_none() && self.cfg.path.is_some() {
+            let write = |doc: &mut toml_edit::DocumentMut| {
+                crate::settings::write(doc, "approvals.preset", Some(&"full".into()))?;
+                let value = (doc.get_mut("approvals"))
+                    .and_then(|a| a.get_mut("preset"))
+                    .and_then(|v| v.as_value_mut());
+                if let Some(v) = value {
+                    v.decor_mut()
+                        .set_suffix(" # kept as before 0.7; /approvals manual turns approvals on");
+                }
+                Ok(())
+            };
+            if let Err(why) = self.edit_config(None, write).await {
+                return eprintln!("zephyr: upgrade from schema {from}: {why}");
+            }
+            let logged = self.store.log_setting(
+                "approvals.preset",
+                Some("manual"),
+                Some("full"),
+                "zephyr",
+                None,
+                None,
+            );
+            log(logged.map_err(Into::into));
+            let told = self.store.notify_last_owner(
+                "[zephyr] approvals are off, as before this version; \
+                 /approvals manual or /settings turns them on",
+            );
+            log(told.map_err(Into::into));
+        }
+        log(self.store.clear_upgraded().map_err(Into::into));
     }
 
     /// The one way a setting changes (settings spec §4.3), whoever asks: the key is looked up,
