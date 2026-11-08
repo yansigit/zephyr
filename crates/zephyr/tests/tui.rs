@@ -649,7 +649,8 @@ impl Screen {
     /// torn (half a panel over the last frame), so the screen counts once two reads agree,
     /// apart from what moves with the clock (`normalize` masks it).
     async fn wait_for(&self, text: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        // Long enough for a full suite on a loaded machine (A7); a pass takes well under 1 s.
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut last: Option<String> = None;
         loop {
             let screen = self.tmux.capture(false);
@@ -674,6 +675,28 @@ impl Screen {
         }
     }
 
+    /// The plain screen once it shows `text`, torn or not: for a step that only needs the TUI
+    /// to have reached a state (the next keys act on it), not a frame to compare. Under load a
+    /// busy screen may not read the same twice in a row before `wait_for` gives up (A7).
+    async fn wait_text(&self, text: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let screen = self.tmux.capture(false);
+            if screen.contains(text) {
+                return screen;
+            }
+            assert!(
+                !screen.contains("zephyr exited"),
+                "zephyr tui exited:\n{screen}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "no {text:?} on screen:\n{screen}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// tmux key names (`Enter`, `C-o`), or literal text with a leading `=`.
     fn keys(&self, keys: &[&str]) {
         for k in keys {
@@ -688,9 +711,9 @@ impl Screen {
     }
 
     async fn next_sent(&mut self) -> String {
-        tokio::time::timeout(Duration::from_secs(10), self.sent.recv())
+        tokio::time::timeout(Duration::from_secs(60), self.sent.recv())
             .await
-            .expect("nothing sent within 10s")
+            .expect("nothing sent within 60s")
             .unwrap()
     }
 }
@@ -825,7 +848,7 @@ async fn the_composer_recalls_completes_stashes_and_edits() {
     let projects = screen.dir.join("projects");
     std::fs::create_dir_all(screen.dir.join("prompts")).unwrap();
     std::fs::write(screen.dir.join("prompts/hi.md"), "Say hi to $1\n").unwrap();
-    screen.wait_for("Three files").await;
+    screen.wait_text("Three files").await;
     // Up brings back your own message from the replayed conversation.
     screen.keys(&["Up", "Enter"]);
     assert_eq!(
@@ -852,7 +875,7 @@ async fn the_composer_recalls_completes_stashes_and_edits() {
     assert_eq!(screen.next_sent().await, "aside");
     // ^R finds an earlier message and puts it in the box, unsent.
     screen.keys(&["C-r"]);
-    screen.wait_for("╭─ history").await;
+    screen.wait_text("╭─ history").await;
     screen.keys(&["=deploy", "Enter", "=!", "Enter"]);
     assert_eq!(
         screen.next_sent().await,
@@ -860,12 +883,12 @@ async fn the_composer_recalls_completes_stashes_and_edits() {
     );
     // A saved prompt fills the box; Enter sends what you read.
     screen.keys(&["=/p hi bob", "Enter"]);
-    screen.wait_for("Say hi to bob").await;
+    screen.wait_text("Say hi to bob").await;
     screen.keys(&["Enter"]);
     assert_eq!(screen.next_sent().await, "Say hi to bob");
     // ^G hands the draft to $EDITOR and takes back what it wrote.
     screen.keys(&["=draft", "C-g"]);
-    screen.wait_for("draft edited").await;
+    screen.wait_text("draft edited").await;
     screen.keys(&["Enter"]);
     assert_eq!(screen.next_sent().await, "draft edited");
 }

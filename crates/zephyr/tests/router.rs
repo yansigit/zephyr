@@ -2748,7 +2748,11 @@ async fn a_timed_preset_goes_back_to_the_whole_set() {
     let gw = start(cfg);
     wait(|| !log(&home, "start").is_empty()).await;
     gw.say("m1", "owner", "/approvals full for 1s").await;
-    let timed = gw.wait_replies(1).await.remove(0);
+    wait(|| !gw.replies().is_empty()).await;
+    let timed = gw.replies().remove(0);
+    // The hand-set `facts = "off"`, looser than full's warn, was dropped: the modes after the
+    // change read the preset's `facts warn`. Read from the reply, not the file, which the revert
+    // may already have written back by now (A1).
     assert!(
         timed.starts_with("[zephyr] approvals.preset semi → full until ")
             && timed.ends_with(
@@ -2758,11 +2762,6 @@ async fn a_timed_preset_goes_back_to_the_whole_set() {
         "{timed}"
     );
     let file = || Config::load(&home.join("zephyr.toml")).unwrap();
-    assert_eq!(
-        file().approvals.unwrap().facts,
-        None,
-        "dropped as looser than warn"
-    );
     wait(|| gw.replies().len() == 2).await;
     assert_eq!(
         gw.replies()[1],

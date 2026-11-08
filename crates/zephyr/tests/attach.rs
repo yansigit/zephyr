@@ -974,8 +974,9 @@ async fn facts_put_answers_without_values() {
     let odd = json!({"name": "x", "kind": PHONE, "value": PHONE});
     let refused = c.call("zephyr.facts_put", odd).await;
     assert!(!refused.to_string().contains("555"), "{refused}");
+    // A6: no log at all means the child was told nothing, which is what this says.
     assert!(!std::fs::read_to_string(gw.home.join("log.jsonl"))
-        .unwrap()
+        .unwrap_or_default()
         .contains("555"));
 
     let gone = c.call("zephyr.facts_rm", json!({"name": "phone"})).await;
