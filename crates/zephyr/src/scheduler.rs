@@ -9,10 +9,11 @@ use crate::store::Store;
 use croner::parser::{CronParser, Seconds, Year};
 use jiff::{tz::TimeZone, Timestamp};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{watch, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 
 const TICK: Duration = Duration::from_secs(30);
 /// How often background work's old leftovers are swept (`retention`).
@@ -38,6 +39,47 @@ pub struct Wake {
     pub tasks: Notify,
     /// A task wrote its report to the inbox: the router dispatches it.
     pub inbox: Notify,
+    /// The task and job runs in progress that take notes (`Steers`).
+    pub steers: Steers,
+}
+
+/// A note for a task's or job's run in progress, from outside it: the owner approved the
+/// connector call it asked for (approvals spec §4.6). The run is steered `store::note_text`
+/// of it; one that ends before the model reads it leaves it to main as `action_note`.
+#[derive(Clone)]
+pub struct Note {
+    pub action: i64,
+    pub word: String,
+    pub text: String,
+}
+
+/// The task and job runs in progress, by session, that a [`Note`] can be steered into. A run's
+/// inbox closes when its `follow` ends, and every note already in it then goes to main instead:
+/// a note is either steered into the run that asked or handed to main, never lost between.
+#[derive(Clone, Default)]
+pub struct Steers(Arc<std::sync::Mutex<HashMap<String, mpsc::UnboundedSender<Note>>>>);
+
+impl Steers {
+    /// Opens `session`'s inbox, for the run about to start in it.
+    pub fn open(&self, session: &str) -> mpsc::UnboundedReceiver<Note> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut map = self.lock();
+        map.retain(|_, tx| !tx.is_closed());
+        map.insert(session.to_string(), tx);
+        rx
+    }
+
+    /// Hands `note` to `session`'s run if one is in progress; `Err(note)` when none is.
+    pub fn send(&self, session: &str, note: Note) -> Result<(), Note> {
+        match self.lock().get(session) {
+            Some(tx) => tx.send(note).map_err(|e| e.0),
+            None => Err(note),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, mpsc::UnboundedSender<Note>>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// One unattended prompt in a fresh child: a job run or a background task.
@@ -60,6 +102,8 @@ pub struct Spec<'a> {
     /// `provider/model` to run on instead of the account's own (a task's `model`, DESIGN
     /// §4.12): only that provider's accounts are tried.
     pub model: Option<&'a str>,
+    /// Where each attempt opens its session's inbox for notes (`Steers`).
+    pub steers: &'a Steers,
 }
 
 /// What a run resumed after a restart is told (OpenClaw's restart-recovery wording): rpi
@@ -199,6 +243,7 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
                 task: None,
                 resume: false,
                 model: None,
+                steers: &wake.steers,
             };
             let (status, output, crossed) = execute(&cfg, &mut store, &spec).await;
             wake.running.store(false, Ordering::SeqCst);
@@ -343,7 +388,10 @@ async fn attempt_once(
         }
     }
     let mut child = match Child::spawn_as(cfg, Some(session), account).await {
-        Ok(child) => child,
+        Ok(mut child) => {
+            child.notes = Some(spec.steers.open(session));
+            child
+        }
         Err(e) => {
             return (
                 "failed",
@@ -578,9 +626,26 @@ async fn follow(
     let mut in_tool = 0usize;
     // Its own connection: `follow` is not handed the run's store.
     let audited = child.session.clone().zip(Store::open(&cfg.db_path()).ok());
+    let mut notes = Notes {
+        inbox: child.notes.take(),
+        steered: Vec::new(),
+        db: cfg.db_path(),
+    };
     let settled = loop {
         let limit = cfg.stall_limit * if in_tool > 0 { 2 } else { 1 };
-        let Ok(ev) = tokio::time::timeout(limit, child.events.recv()).await else {
+        let ev = tokio::select! {
+            ev = tokio::time::timeout(limit, child.events.recv()) => ev,
+            Some(note) = notes.next() => {
+                // A note from outside the run (an approved connector call): steered in, and
+                // handed to main at the end unless the run reached it.
+                let text = crate::store::note_text(note.action, &note.word, &note.text);
+                let steer = json!({"type": "queue_message", "message": text, "deliverAs": "steer"});
+                let _ = child.call(steer).await;
+                notes.steered.push(note);
+                continue;
+            }
+        };
+        let Ok(ev) = ev else {
             let _ = child.call(json!({"type": "abort"})).await;
             return Ok(Err(anyhow::anyhow!("stalled: no progress for {limit:?}")));
         };
@@ -588,8 +653,16 @@ async fn follow(
             Some(ev) if ev["type"] == "agent_settled" => break ev,
             Some(ev) => {
                 tally.add(&ev);
+                notes.delivered(&ev);
                 if let Some((session, store)) = &audited {
                     audit(store, cfg, session, &ev);
+                    // The plugin refused a call the gate held: it shows the model no reason, so
+                    // the run is told it waits for the owner (approvals spec §4.2).
+                    if let Some(note) = held_note(store, session, &ev) {
+                        let steer =
+                            json!({"type": "queue_message", "message": note, "deliverAs": "steer"});
+                        let _ = child.call(steer).await;
+                    }
                 }
                 match ev["type"].as_str() {
                     Some("tool_execution_start") => in_tool += 1,
@@ -654,6 +727,89 @@ async fn follow(
             settled["error"].as_str().unwrap_or("no error given")
         )),
     })
+}
+
+/// What the agent is told when the plugin refused its call `ev` (a `tool_execution_end` with
+/// `isError`) because the gate held it for the owner (approvals spec §4.2, §4.8): `None` for
+/// any other event or refusal.
+pub(crate) fn held_note(store: &Store, session: &str, ev: &serde_json::Value) -> Option<String> {
+    if ev["type"] != "tool_execution_end" || ev["isError"] != true {
+        return None;
+    }
+    let call = ev["toolCallId"].as_str()?;
+    match store.held_for_call(session, call) {
+        Ok(held) => held.map(|(id, summary)| crate::gate::held_text(id, &summary)),
+        Err(e) => {
+            eprintln!("zephyr: reading what the gate held failed: {e}");
+            None
+        }
+    }
+}
+
+/// A run's notes from outside it (`Steers`) while `follow` reads its events: each is steered in
+/// as it comes, and when `follow` ends, by whatever way, the inbox is closed and every note the
+/// model never got (still in the inbox, or steered in but not delivered when the run ended)
+/// goes to main as the action's note instead.
+struct Notes {
+    inbox: Option<mpsc::UnboundedReceiver<Note>>,
+    steered: Vec<Note>,
+    /// The store, opened only when a note is left for main.
+    db: std::path::PathBuf,
+}
+
+impl Notes {
+    /// The next note; never, once the inbox is gone (its sender replaced by a later run's).
+    async fn next(&mut self) -> Option<Note> {
+        let Some(inbox) = &mut self.inbox else {
+            return std::future::pending().await;
+        };
+        let note = inbox.recv().await;
+        if note.is_none() {
+            self.inbox = None;
+        }
+        note
+    }
+
+    /// Takes a steered note off the list once rpi delivers it to the model as a user message.
+    fn delivered(&mut self, ev: &serde_json::Value) {
+        if self.steered.is_empty() || ev["type"] != "message_end" || ev["message"]["role"] != "user"
+        {
+            return;
+        }
+        let text = message_text(&ev["message"]);
+        let mut gone = self
+            .steered
+            .iter()
+            .map(|n| crate::store::note_text(n.action, &n.word, &n.text));
+        if let Some(i) = gone.position(|t| t == text) {
+            self.steered.remove(i);
+        }
+    }
+}
+
+impl Drop for Notes {
+    fn drop(&mut self) {
+        let mut left = std::mem::take(&mut self.steered);
+        if let Some(inbox) = &mut self.inbox {
+            inbox.close();
+            while let Ok(note) = inbox.try_recv() {
+                left.push(note);
+            }
+        }
+        if left.is_empty() {
+            return;
+        }
+        let store = Store::open(&self.db);
+        for n in left {
+            let handed = (store.as_ref()).map(|s| s.action_note(n.action, &n.word, &n.text));
+            if !matches!(handed, Ok(Ok(_))) {
+                eprintln!(
+                    "zephyr: action #{}'s note reached neither its run nor main",
+                    n.action
+                );
+            }
+        }
+    }
 }
 
 /// An owner's `/job …` command. `None` when the text is not one; otherwise the reply.

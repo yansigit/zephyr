@@ -272,6 +272,7 @@ pub async fn run<C: Channel>(
     let (snap, snap_rx) = watch::channel(Snapshot::default());
     let activity_rx = snap_rx.clone();
     let attach_cfgs = cfg_rx.clone();
+    let (gate_cfgs, gate_snap) = (cfg_rx.clone(), snap_rx.clone());
     let names = channels.iter().map(|c| c.name().to_string()).collect();
     let mut router = Router::new(cfg, &jobs, attaches, cfg_tx, snap, names)?;
     // Commands a re-exec handed over alive are adopted; the rest a dead gateway left running
@@ -283,9 +284,12 @@ pub async fn run<C: Channel>(
     for c in channels {
         c.live(cfg_rx.clone()); // owners for file downloads, kept current by reload
     }
+    let waits = router.waits.clone();
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
         r = runs => r.map(|_| Exit::Shutdown),
+        // Tasks' and jobs' sends, every connector call, the browser's clicks (approvals §4.2).
+        r = crate::gate::serve(gate_cfgs, gate_snap, waits, &jobs) => r.map(|()| Exit::Shutdown),
         r = crate::attach::serve(cfg, tx, attach_tx, snap_rx, attach_cfgs) => r.map(|()| Exit::Shutdown),
         r = crate::scheduler::run(cfg_rx.clone(), &jobs) => r.map(|()| Exit::Shutdown),
         r = crate::tasks::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),
@@ -695,8 +699,14 @@ impl<'a> Router<'a> {
             let _ = self.tap.send(ev.clone()); // no receivers is fine
             self.last_event = Instant::now();
             self.tally.add(ev);
-            if let Some(session) = self.child.as_ref().and_then(|c| c.session.as_deref()) {
+            let session = self.child.as_ref().and_then(|c| c.session.clone());
+            if let Some(session) = &session {
                 crate::scheduler::audit(&self.store, &self.cfg, session, ev);
+                // The plugin refused a call the gate held, showing the model no reason: the run
+                // is told it waits for the owner (approvals spec §4.2), as the guard's note is.
+                if let Some(note) = crate::scheduler::held_note(&self.store, session, ev) {
+                    self.steer_note(note).await;
+                }
             }
             self.track(ev);
             match (ev["type"].as_str(), ev["message"]["role"].as_str()) {
@@ -734,7 +744,12 @@ impl<'a> Router<'a> {
                         ),
                     };
                     match (self.origin(), env) {
-                        (Some(to), Ok(env)) => self.exec(id, args, call, to, env),
+                        (Some(to), Ok(mut env)) => {
+                            // What it runs asks the gate as main (the browser wrapper).
+                            let session = session.as_deref().unwrap_or_default();
+                            env.extend(crate::gate::agent_env(&self.cfg, session));
+                            self.exec(id, args, call, to, env)
+                        }
                         (None, _) => {
                             crate::tools::answer_gateway(&self.cfg, id, "no owner; not run")
                         }
@@ -819,6 +834,7 @@ impl<'a> Router<'a> {
             store: &self.store,
             procs: &self.procs,
             waits: &self.waits,
+            steers: &self.jobs.steers,
         }
     }
 
@@ -3619,13 +3635,7 @@ impl<'a> Router<'a> {
         match self.tally.guard() {
             Some(crate::rpc::Guard::Steer(note)) => {
                 eprintln!("zephyr: {note}");
-                let steer = json!({"type": "queue_message", "message": note, "deliverAs": "steer"});
-                log(self.call(steer).await.map(drop));
-                // Not the owner's message: `reconcile` never takes it for the run's request.
-                self.steered_texts.insert(note);
-                // A run that ends before reaching it would leave it to open the next run: the
-                // settle takes it back, as it does the resume note.
-                self.note_pending = true;
+                self.steer_note(note).await;
                 false
             }
             Some(crate::rpc::Guard::Stop(why)) => {
@@ -3638,6 +3648,18 @@ impl<'a> Router<'a> {
             }
             None => false,
         }
+    }
+
+    /// Steers the daemon's own `note` into the running turn: the repeated-failure guard's, or
+    /// what a held call means.
+    async fn steer_note(&mut self, note: String) {
+        let steer = json!({"type": "queue_message", "message": note, "deliverAs": "steer"});
+        log(self.call(steer).await.map(drop));
+        // Not the owner's message: `reconcile` never takes it for the run's request.
+        self.steered_texts.insert(note);
+        // A run that ends before reaching it would leave it to open the next run: the settle
+        // takes it back, as it does the resume note.
+        self.note_pending = true;
     }
 
     /// `/undo [n]` (DESIGN §4.1), idle only: takes the last `n` exchanges (`turns`) out of the

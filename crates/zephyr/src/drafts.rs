@@ -852,13 +852,17 @@ pub fn missing_secrets(cfg: &Config, m: &Mcp) -> Vec<String> {
 /// lets the MCP adapter's tools use. The daemon's, in `<state>-public/` beside `<state>` (which
 /// only root may enter), so the agent can read it but never rewrite it before a child loads it.
 pub fn mcp_path(cfg: &Config) -> PathBuf {
+    public_dir(cfg).join("mcp.json")
+}
+
+/// `<state>-public/`, beside `<state>`: root's 0755 folder of what the daemon publishes for the
+/// agent to read or connect to, never to change (`mcp.json`, the gate socket).
+pub fn public_dir(cfg: &Config) -> PathBuf {
     let state = cfg.state_dir();
     let name = state
         .file_name()
         .map_or("zephyr".into(), |n| n.to_string_lossy());
-    state
-        .with_file_name(format!("{name}-public"))
-        .join("mcp.json")
+    state.with_file_name(format!("{name}-public"))
 }
 
 /// Where the daemon puts AGENTS.md when the agent runs on a uid of its own: in the parent of its
@@ -884,17 +888,32 @@ fn daemons_alone(dir: &Path) -> bool {
 const AGENTS_STUB: &str = "# AGENTS.md\n\nZephyr writes your standing instructions to the \
     AGENTS.md above this folder at each start; this file is rewritten then too.\n";
 
-/// Writes `text` to `path` as the daemon, readable by all (0644), in a folder only the daemon may
-/// write: what the agent may read but must not change.
-fn write_public(path: &Path, text: &str) -> anyhow::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    let dir = path.parent().context("no folder")?;
+/// `public_dir`, made 0755 when it is not there, and checked to be the daemon's alone: what the
+/// gate socket and the connectors file go in.
+pub fn ensure_public_dir(cfg: &Config) -> anyhow::Result<PathBuf> {
+    let dir = public_dir(cfg);
+    daemons_dir(&dir)?;
+    Ok(dir)
+}
+
+/// Makes `dir` 0755 when it is not there; fails unless it is a folder only the daemon may write.
+fn daemons_dir(dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
     if !dir.exists() {
         std::fs::DirBuilder::new().mode(0o755).create(dir)?;
     }
     if !daemons_alone(dir) {
         bail!("{} is not a folder only zephyr may write", dir.display());
     }
+    Ok(())
+}
+
+/// Writes `text` to `path` as the daemon, readable by all (0644), in a folder only the daemon may
+/// write: what the agent may read but must not change.
+fn write_public(path: &Path, text: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = path.parent().context("no folder")?;
+    daemons_dir(dir)?;
     let name = path.file_name().context("no file name")?.to_string_lossy();
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     let mut file = std::fs::OpenOptions::new()

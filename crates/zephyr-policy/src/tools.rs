@@ -169,6 +169,15 @@ pub const GATEWAY_DIR_ENV: &str = "ZEPHYR_GATEWAY_DIR";
 /// The sessions folder `recall` searches (DESIGN §4.11), set by `rpc::spawn_as` in every child.
 pub const SESSIONS_DIR_ENV: &str = "ZEPHYR_SESSIONS_DIR";
 
+/// The child's session id (`main`, `task-7`, `job-2-5`), set by `rpc::spawn_as` in every child
+/// and inherited by what it runs: the gate socket's requests name it (approvals spec §4.2). A
+/// wrong one only sends a card to the wrong channel; it grants nothing.
+pub const SESSION_ENV: &str = "ZEPHYR_SESSION";
+
+/// The daemon's gate socket (`<state>-public/gate.sock`), set by `rpc::spawn_as` in every child
+/// and for main's `exec` commands: where the plugin and the browser wrapper ask about a send.
+pub const GATE_SOCKET_ENV: &str = "ZEPHYR_GATE_SOCKET";
+
 /// How long a `gateway` or `task` call waits for the daemon.
 const GATEWAY_WAIT: Duration = Duration::from_secs(10);
 

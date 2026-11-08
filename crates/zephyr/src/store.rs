@@ -257,6 +257,12 @@ fn action_row_in(
     Ok(n == 1)
 }
 
+/// What the agent is told about action `id` that ran nothing: `[action #N WORD; zephyr's note,
+/// not the owner's words] TEXT`, as main's inbox row or steered into the task that asked.
+pub fn note_text(id: i64, word: &str, text: &str) -> String {
+    format!("[action #{id} {word}; zephyr's note, not the owner's words] {text}")
+}
+
 /// Ends approved action `id` as `status` (`done`, `failed`, `unknown`) with `outcome` (how its
 /// command ended, `exited 0 after 3s`), and hands main its report, the output quoted as a
 /// process report's is (approvals spec §4.6).
@@ -1366,9 +1372,7 @@ impl Store {
     /// given, not started): `[action #N WORD; zephyr's note, not the owner's words] TEXT`, on the
     /// run's channel, once per action (inbox row `action-<id>`). Returns whether it was written.
     pub fn action_note(&self, id: i64, word: &str, text: &str) -> rusqlite::Result<bool> {
-        action_row_in(&self.db, id, |_| {
-            format!("[action #{id} {word}; zephyr's note, not the owner's words] {text}")
-        })
+        action_row_in(&self.db, id, |_| note_text(id, word, text))
     }
 
     /// The newest report or note about a held action still waiting for main (`action_note`),
@@ -1642,6 +1646,17 @@ impl Store {
         Ok(emptied + sent + audit + changes)
     }
 
+    /// Job `id`, if there is one.
+    pub fn job(&self, id: i64) -> rusqlite::Result<Option<Job>> {
+        self.db
+            .query_row(
+                &format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1"),
+                params![id],
+                |r| job_row(r, 0),
+            )
+            .optional()
+    }
+
     pub fn jobs(&self) -> rusqlite::Result<Vec<Job>> {
         let mut stmt = self
             .db
@@ -1799,6 +1814,17 @@ impl Store {
             params![goal, model, name, preamble, channel, recipient, MAX_OPEN_TASKS],
         )?;
         Ok((n == 1).then(|| self.db.last_insert_rowid()))
+    }
+
+    /// Task `id`, whatever its status.
+    pub fn task(&self, id: i64) -> rusqlite::Result<Option<Task>> {
+        self.db
+            .query_row(
+                &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
+                params![id],
+                task_row,
+            )
+            .optional()
     }
 
     /// The open tasks, oldest first, then up to `finished` of the newest that ended.

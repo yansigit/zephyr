@@ -4966,3 +4966,191 @@ async fn stop_asks_again_for_delayed_actions() {
     );
     gw.shutdown().await;
 }
+
+// ---- the gate socket (approvals spec §4.2 path 2): tasks', jobs' and connectors' sends ----
+
+/// A subagent whose task sends a mail through `bash`, then makes one more call (rpi would take
+/// the next turn: the steered note reaches it there) and stops after answering what was steered
+/// in, so its report quotes no call of its own for main to run again.
+const MAILER: &str = r#"[call bash {"command": "himalaya message send <<'EOF'\nTo: a@x.org\n\nhi\nEOF"}] [call task {"action": "list"}] [stop-after-steer]"#;
+
+fn with_subagent(mut cfg: Config, name: &str, prompt: &str) -> Config {
+    cfg.subagents.push(zephyr::config::Subagent {
+        name: name.into(),
+        model: None,
+        prompt: prompt.into(),
+    });
+    cfg
+}
+
+/// Whether session `id` holds a user message saying exactly `text` (a steered note).
+fn told_in(home: &Path, id: &str, text: &str) -> bool {
+    session_file(home, id).is_some()
+        && session_messages(home, id)
+            .iter()
+            .any(|m| m["role"] == "user" && m["content"] == text)
+}
+
+#[tokio::test]
+async fn a_tasks_send_is_held_through_the_socket_and_runs_on_ok() {
+    let home = home("gate-task");
+    let gw = start(with_subagent(config(&home), "mailer", MAILER));
+    let start_task =
+        r#"[call task {"action": "start", "goal": "send the note", "subagent": "mailer"}] ok"#;
+    gw.say_on("discord", "m1", "downer", start_task).await;
+    // The card goes to the channel that started the task, in the daemon's words.
+    let card = reply_where(&gw, "discord", |r| r.starts_with("[zephyr] approve #1:")).await;
+    assert!(
+        card.starts_with("[zephyr] approve #1: message (email)\nto: a@x.org"),
+        "{card}"
+    );
+    assert!(
+        card.contains("\ncommand: \"himalaya message send"),
+        "{card}"
+    );
+    // The plugin refused the call; the task was told why, in its own session.
+    let held = "held for the owner as #1 (email to a@x.org); don't retry it; carry on or end \
+                your turn";
+    wait(|| told_in(&home, "task-1", held)).await;
+    wait(|| task_status(&home, "completed") == 1).await;
+    assert_eq!(
+        proc_status(&home, "running") + proc_status(&home, "exited"),
+        0
+    );
+    assert!(
+        gw.replies_on("chat").is_empty(),
+        "{:?}",
+        gw.replies_on("chat")
+    );
+    let audit = Store::open(&home.join("state.db"))
+        .unwrap()
+        .audit_rows()
+        .unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|(s, t, _, o)| s == "task-1" && t == "bash" && o == "held"),
+        "{audit:?}"
+    );
+
+    gw.say_on("discord", "m2", "downer", "/ok 1").await;
+    let approved = reply_where(&gw, "discord", |r| r.contains("approved #1")).await;
+    assert!(
+        approved.starts_with("[zephyr] approved #1 (email to a@x.org): running it"),
+        "{approved}"
+    );
+    // Its report comes back to main on the task's channel, as a task's report does.
+    let row = to_main(&home, 1).await;
+    assert!(
+        row.starts_with("[action #1 done; zephyr ran what the owner approved]"),
+        "{row}"
+    );
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    let channel: String = db
+        .query_row(
+            "SELECT channel FROM inbox WHERE platform_msg_id = 'action-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(channel, "discord");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_connector_pass_is_used_once() {
+    let home = home("gate-pass");
+    let gw = start(config(&home));
+    let call = r#"[mcp mail send {"to": "a@x.org"}]"#;
+    gw.say("m1", "owner", call).await;
+    let card = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    assert!(
+        card.starts_with("[zephyr] approve #1: message (connector)\ntool: mail/send · to: a@x.org"),
+        "{card}"
+    );
+    let refused = reply_where(&gw, "chat", |r| r.starts_with("echo: [chat #1]")).await;
+    assert!(refused.ends_with("\nmcp: tool error: blocked"), "{refused}");
+    // The plugin shows the model no reason: the daemon steered the held note into main's run.
+    let held = "held for the owner as #1 (mail/send); don't retry it; carry on or end your turn";
+    wait(|| {
+        log(&home, "queue_message")
+            .iter()
+            .any(|c| c["message"] == held && c["deliverAs"] == "steer")
+    })
+    .await;
+
+    gw.say("m2", "owner", "/ok 1").await;
+    let approved = reply_where(&gw, "chat", |r| r.contains("approved #1")).await;
+    assert!(
+        approved.starts_with(
+            "[zephyr] approved #1 (mail/send): the agent may make exactly that call once"
+        ),
+        "{approved}"
+    );
+    assert!(to_main(&home, 1)
+        .await
+        .contains("make exactly that connector call again within 30 min"));
+    // The same call goes through once ...
+    gw.say("m3", "owner", call).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains(call) && r.ends_with("\nmcp: ok")
+    })
+    .await;
+    assert!(!gw
+        .replies_on("chat")
+        .iter()
+        .any(|r| r.starts_with("[zephyr] approve #2:")));
+    // ... and is held again after that.
+    gw.say("m4", "owner", call).await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #2:")).await;
+    let audit = Store::open(&home.join("state.db"))
+        .unwrap()
+        .audit_rows()
+        .unwrap();
+    // The gate's and the owner's decisions, each refused call's `error` after its hold.
+    let outcomes: Vec<&str> = (audit.iter())
+        .filter(|(_, tool, _, _)| tool == "mcp_call")
+        .map(|(_, _, _, o)| o.as_str())
+        .filter(|o| *o != "started")
+        .collect();
+    assert_eq!(
+        outcomes,
+        ["held", "error", "approved", "pass", "held", "error"],
+        "{audit:?}"
+    );
+    gw.shutdown().await;
+}
+
+/// A subagent whose task asks for a connector send and then waits in its next tool while
+/// `tool_wait` exists, so it is still running when the owner approves.
+const ASKER: &str =
+    r#"[mcp mail send {"to": "a@x.org"}] [call bash {"command": "true"}] [stop-after-steer]"#;
+
+#[tokio::test]
+async fn a_pass_is_steered_into_the_task_that_asked_while_it_runs() {
+    let home = home("gate-pass-task");
+    // Every tool waits while this exists: main's `task` call and the task's second call.
+    std::fs::write(home.join("tool_wait"), "").unwrap();
+    let gw = start(with_subagent(config(&home), "asker", ASKER));
+    let start_task = r#"[call task {"action": "start", "goal": "mail a", "subagent": "asker"}]"#;
+    gw.say("m1", "owner", start_task).await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    wait(|| task_status(&home, "running") == 1).await;
+    gw.say("m2", "owner", "/ok 1").await;
+    reply_where(&gw, "chat", |r| r.contains("approved #1")).await;
+    let note = "[action #1 approved; zephyr's note, not the owner's words] the owner approved \
+                #1 (mail/send): make exactly that connector call again within 30 min and it \
+                goes through, once";
+    wait(|| {
+        log(&home, "queue_message")
+            .iter()
+            .any(|c| c["message"] == note && c["deliverAs"] == "steer")
+    })
+    .await;
+    std::fs::remove_file(home.join("tool_wait")).unwrap();
+    // Delivered into the task's run, so main is not handed it as well.
+    wait(|| told_in(&home, "task-1", note)).await;
+    wait(|| task_status(&home, "completed") == 1).await;
+    assert!(inbox_text(&home, "action-1").is_none());
+    gw.shutdown().await;
+}

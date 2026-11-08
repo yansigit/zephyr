@@ -45,6 +45,10 @@ pub fn check(tool: &str, args: &Value) -> Decision {
                 None => Decision::Deny("file tool call has no path"),
             }
         }
+        // A connector call the gate cannot class (approvals spec §4.1) never runs ungated.
+        "mcp_call" if !["server", "tool"].iter().all(|k| named(args, k)) => {
+            Decision::Deny("an MCP call that names no server or tool")
+        }
         // MCP: a server spec's `configPath` can point at a credential file, so the adapter's tools
         // get the same name check as any other path (a server may also pass one as a resource).
         "mcp_list" | "mcp_call" | "mcp_resource" | "mcp_request" => {
@@ -60,6 +64,13 @@ pub fn check(tool: &str, args: &Value) -> Decision {
             .find_map(sensitive)
             .map_or(Decision::Allow, Decision::Deny),
     }
+}
+
+/// Whether `args[key]` is a string with something in it.
+fn named(args: &Value, key: &str) -> bool {
+    args.get(key)
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
 }
 
 /// Names the connectors file the daemon wrote for this child (DESIGN §4.6).

@@ -7,15 +7,25 @@
 //! reason shows only as one quoted line, and whatever came from the agent or a page is put on a
 //! labelled line of its own, quoted, with the vault's and the facts' values scrubbed out first.
 
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::OwnedReadHalf;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::watch;
 use zephyr_policy::policy::{self, Amount, Class, Gated, UNKNOWN};
 
+use crate::actions::Waits;
 use crate::approvals::{self, Effective, FactsMode, Mode};
 use crate::config::Config;
 use crate::facts::{self, Fact};
+use crate::router::Snapshot;
+use crate::scheduler::Wake;
 use crate::settings::{quoted, quoted_cut};
 use crate::store::{Action, ActionKind, NewAction, Origin, Store};
 
@@ -807,6 +817,264 @@ impl Gate<'_> {
             },
         })
     }
+}
+
+// ---- the gate socket (spec §4.2 path 2) ----
+
+/// Connections served at once, as the attach port; one more is closed as it arrives.
+const MAX_CONNS: usize = 32;
+/// How long a connection may sit before its request is in.
+const IDLE: Duration = Duration::from_secs(10);
+/// The longest request taken, as rpi's frame limit.
+const MAX_REQUEST: usize = 1 << 20;
+
+/// `<state>-public/gate.sock`: where the plugin and the browser wrapper ask about a send.
+pub fn socket_path(cfg: &Config) -> PathBuf {
+    crate::drafts::public_dir(cfg).join("gate.sock")
+}
+
+/// What every process run for the agent gets beside its command (a child of rpi in `session`,
+/// main's `exec` commands): the gate socket and the session to name in its requests.
+pub fn agent_env(cfg: &Config, session: &str) -> Vec<(String, String)> {
+    use zephyr_policy::tools::{GATE_SOCKET_ENV, SESSION_ENV};
+    vec![
+        (
+            GATE_SOCKET_ENV.into(),
+            socket_path(cfg).display().to_string(),
+        ),
+        (SESSION_ENV.into(), session.into()),
+    ]
+}
+
+/// The request as it arrives (spec §4.2): `v` 1, the session that asks (`ZEPHYR_SESSION`), the
+/// tool call, and for the browser wrapper what it read of the page.
+#[derive(Deserialize)]
+struct Wire {
+    v: u32,
+    #[serde(default)]
+    session: String,
+    #[serde(default)]
+    call_id: Option<String>,
+    tool: String,
+    #[serde(default)]
+    args: Value,
+    #[serde(default)]
+    browser: Option<Browser>,
+}
+
+/// Serves the gate socket until dropped: tasks' and jobs' sends, every connector call and the
+/// browser wrapper's clicks come here (spec §4.2 path 2, §4.4). Only the agent's uid is
+/// answered (`SO_PEERCRED`); each connection carries one request, sent within 10 s, and gets one
+/// answer, a `Wait` only once the owner (or the end of a delay) settles it. A socket that cannot
+/// be made is logged and nothing is served: the plugin and the wrapper then refuse every call
+/// they would have asked about (§4.9), never let one through.
+pub async fn serve(
+    cfgs: watch::Receiver<Arc<Config>>,
+    snap: watch::Receiver<Snapshot>,
+    waits: Waits,
+    wake: &Wake,
+) -> anyhow::Result<()> {
+    let cfg = cfgs.borrow().clone();
+    let listener = match bind(&cfg) {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("zephyr: no gate socket, so the agent's sends are refused: {e:#}");
+            return std::future::pending().await;
+        }
+    };
+    let store = Arc::new(Mutex::new(Store::open(&cfg.db_path())?));
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
+    let mut conns = FuturesUnordered::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    let Ok(slot) = slots.clone().try_acquire_owned() else {
+                        continue; // dropped, so closed at once
+                    };
+                    let conn = Conn {
+                        cfg: cfgs.borrow().clone(),
+                        snap: snap.borrow().clone(),
+                        store: store.clone(),
+                        waits: waits.clone(),
+                    };
+                    conns.push(async move {
+                        conn.run(stream, wake).await;
+                        drop(slot);
+                    });
+                }
+                Err(e) => {
+                    eprintln!("zephyr: gate accept failed: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            },
+            Some(()) = conns.next(), if !conns.is_empty() => {}
+        }
+    }
+}
+
+/// The gate socket, new: in the public folder (root's, 0755), mode 0666 so the agent may connect
+/// but, the folder being root's, never replace it.
+fn bind(cfg: &Config) -> anyhow::Result<UnixListener> {
+    use anyhow::Context;
+    use std::os::unix::fs::PermissionsExt;
+    crate::drafts::ensure_public_dir(cfg)?;
+    let path = socket_path(cfg);
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("removing {}", path.display()))
+        }
+        _ => {}
+    }
+    let listener =
+        UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
+    Ok(listener)
+}
+
+/// The uid the gate answers: the agent's, or, outside the container, the daemon's own.
+fn agent_uid() -> u32 {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    crate::agent::ids().map_or_else(|| unsafe { libc::geteuid() }, |(uid, _)| uid)
+}
+
+/// One connection to the gate socket.
+struct Conn {
+    /// The live config and the router's snapshot as the connection came in.
+    cfg: Arc<Config>,
+    snap: Snapshot,
+    store: Arc<Mutex<Store>>,
+    waits: Waits,
+}
+
+impl Conn {
+    async fn run(self, stream: UnixStream, wake: &Wake) {
+        // Another uid is hung up on, unanswered.
+        if !stream.peer_cred().is_ok_and(|c| c.uid() == agent_uid()) {
+            return;
+        }
+        let (read, mut write) = stream.into_split();
+        let mut reader = BufReader::new(read).take(MAX_REQUEST as u64 + 1);
+        let mut line = Vec::new();
+        match tokio::time::timeout(IDLE, reader.read_until(b'\n', &mut line)).await {
+            Ok(Ok(n)) if n > 0 => {}
+            _ => return, // idle, gone or broken
+        }
+        // Only what reaches the gate this way: main's `exec` is decided in the router.
+        let served = |w: &Wire| matches!(w.tool.as_str(), "bash" | "mcp_call" | "browser");
+        let verdict = match serde_json::from_slice::<Wire>(&line) {
+            Ok(wire) if wire.v == 1 && line.len() <= MAX_REQUEST && served(&wire) => {
+                self.decide(wire).await
+            }
+            _ => Verdict::Deny("not run: the gate could not read the request".into()),
+        };
+        // A card, a flood or a fact notice may be waiting for the owner.
+        wake.outbox.notify_one();
+        let answer = match verdict {
+            Verdict::Allow => serde_json::json!({ "verdict": "allow" }),
+            Verdict::Hold { id, text } => {
+                serde_json::json!({ "verdict": "hold", "id": id, "text": text })
+            }
+            Verdict::Deny(text) => serde_json::json!({ "verdict": "deny", "text": text }),
+            Verdict::Wait { id } => {
+                let read = reader.into_inner();
+                let clean = read.buffer().is_empty();
+                match self.wait(id, read.into_inner(), clean).await {
+                    Some(answer) => answer,
+                    None => return, // nobody left to answer
+                }
+            }
+        };
+        let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
+    }
+
+    /// Decides the request on a blocking thread: the store is synchronous.
+    async fn decide(&self, w: Wire) -> Verdict {
+        let (cfg, snap, store) = (self.cfg.clone(), self.snap.clone(), self.store.clone());
+        let decided = tokio::task::spawn_blocking(move || {
+            let store = store.lock().unwrap_or_else(|e| e.into_inner());
+            let (origin, run) = whose(&store, &snap, &w.session);
+            let req = Request {
+                session: w.session,
+                call_id: w.call_id,
+                tool: w.tool,
+                args: w.args,
+                browser: w.browser,
+                run,
+                // shortcut: no card quotes a task's or job's reason; their runs' texts are in
+                // their sessions, which the socket does not read.
+                reason: None,
+            };
+            decide(&cfg, &store, &req, origin, crate::now())
+        });
+        decided.await.unwrap_or_else(|e| {
+            eprintln!("zephyr: the gate failed: {e}");
+            Verdict::Deny("not run: the gate failed".into())
+        })
+    }
+
+    /// A browser action waiting for the owner (spec §4.4): the answer once its action is
+    /// settled. A wrapper that hangs up first (killed with its child), or sends more than its
+    /// request, is gone: the action is dropped and nothing waits on it any more.
+    async fn wait(&self, id: i64, mut read: OwnedReadHalf, clean: bool) -> Option<Value> {
+        let verdict = self.waits.add(id);
+        let gone = async {
+            let mut byte = [0u8; 1];
+            if clean {
+                let _ = read.read(&mut byte).await;
+            }
+        };
+        let allowed = tokio::select! {
+            v = verdict => v.unwrap_or(false),
+            () = gone => {
+                self.waits.remove(id);
+                let store = self.store.clone();
+                let dropped = tokio::task::spawn_blocking(move || {
+                    let store = store.lock().unwrap_or_else(|e| e.into_inner());
+                    crate::actions::abandon(&store, id);
+                });
+                let _ = dropped.await;
+                return None;
+            }
+        };
+        Some(match allowed {
+            true => serde_json::json!({ "verdict": "allow", "id": id }),
+            false => {
+                let text = format!("not run: the owner did not approve #{id}");
+                serde_json::json!({ "verdict": "deny", "id": id, "text": text })
+            }
+        })
+    }
+}
+
+/// Who a request's card and report go to, and its run key (R3), from the session it names: main's
+/// run (`main:<run start ms>`, the channel it serves), a task's (the channel that started it), a
+/// job run's (its job's delivery channel). Any other session goes to the owner last answered,
+/// its run the session itself. A forged session misroutes a card; it grants nothing.
+fn whose(store: &Store, snap: &Snapshot, session: &str) -> ((String, String), String) {
+    let main = !session.is_empty()
+        && (session == snap.session
+            || session == crate::rpc::MAIN_SESSION
+            || (session.strip_prefix("main-"))
+                .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit())));
+    if main {
+        let to = (snap.run.origin.as_ref()).map(|o| (o.channel.clone(), o.sender.clone()));
+        let since = snap.run.since_unix_ms.unwrap_or_default();
+        return (to.unwrap_or_default(), format!("main:{since}"));
+    }
+    // `task-7`, `task-7-1` (a retry on another account); `job-2-5`, `job-2-5-1`.
+    let number = |prefix: &str| {
+        let rest = session.strip_prefix(prefix)?;
+        rest.split('-').next()?.parse::<i64>().ok()
+    };
+    let task = number("task-").and_then(|id| store.task(id).ok().flatten());
+    let job = number("job-").and_then(|id| store.job(id).ok().flatten());
+    let to = match (task, job) {
+        (Some(t), _) => (t.channel, t.recipient),
+        (_, Some(j)) => (j.channel, j.recipient),
+        _ => Default::default(),
+    };
+    (to, session.to_string())
 }
 
 /// The one-time pass of an approved connector call (spec §4.6): SHA-256 of its server, tool and
@@ -2273,5 +2541,214 @@ mod tests {
         assert_eq!(decide(&h.cfg, &h.store, &req, owner(), now), Verdict::Allow);
         held(&decide(&h.cfg, &h.store, &req, owner(), now));
         assert_eq!(outcomes(&h.store), ["held", "pass", "held"]);
+    }
+
+    // ---- the socket ----
+
+    /// The gate socket served for `h`, with its own waits, once it is there.
+    async fn serving(h: &Home) -> (PathBuf, crate::actions::Waits) {
+        let waits = crate::actions::Waits::default();
+        let (_, cfgs) = tokio::sync::watch::channel(Arc::new(h.cfg.clone()));
+        let (_, snap) = tokio::sync::watch::channel(crate::router::Snapshot::default());
+        let wake: &'static crate::scheduler::Wake = Box::leak(Box::default());
+        tokio::spawn(serve(cfgs, snap, waits.clone(), wake));
+        let socket = socket_path(&h.cfg);
+        for _ in 0..200 {
+            if tokio::net::UnixStream::connect(&socket).await.is_ok() {
+                return (socket, waits);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no gate socket at {}", socket.display());
+    }
+
+    /// One request on a connection of our own, and the answer, `None` when it hung up.
+    async fn ask(socket: &Path, req: &Value) -> Option<Value> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        write
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        let mut read = tokio::io::BufReader::new(read);
+        read.read_line(&mut line).await.unwrap();
+        serde_json::from_str(&line).ok()
+    }
+
+    fn mail_request(session: &str) -> Value {
+        json!({"v": 1, "session": session, "call_id": "c1", "tool": "bash",
+               "args": {"command": mail_to("a@x.org", "hi")}})
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_socket_refuses_another_uid() {
+        // SAFETY: plain syscalls with no arguments.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: only root can connect as another uid");
+            return;
+        }
+        let h = home("gate-uid", "");
+        let (socket, _waits) = serving(&h).await;
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&socket).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o666,
+            "anyone may connect; only the agent is answered"
+        );
+        // The agent's uid (in tests, ours) is answered ...
+        let answer = ask(&socket, &mail_request("task-1")).await.unwrap();
+        assert_eq!(answer["verdict"], "hold", "{answer}");
+        assert_eq!(answer["id"], 1);
+        // ... another uid is hung up on, unanswered and with nothing held (so soon that its
+        // send may break).
+        let script = "import socket, sys\n\
+                      s = socket.socket(socket.AF_UNIX)\n\
+                      s.connect(sys.argv[1])\n\
+                      try:\n    \
+                          s.sendall(sys.argv[2].encode() + b'\\n')\n    \
+                          sys.stdout.write(s.recv(4096).decode())\n\
+                      except OSError:\n    \
+                          pass\n";
+        let out = tokio::process::Command::new("python3")
+            .args(["-I", "-c", script])
+            .arg(&socket)
+            .arg(mail_request("task-2").to_string())
+            .uid(65534)
+            .gid(65534)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+        assert_eq!(h.store.held_actions().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_waiting_click_is_answered_or_dropped_when_its_wrapper_goes() {
+        let h = home("gate-wait", "");
+        let (socket, waits) = serving(&h).await;
+        let click = |n: u32| {
+            json!({"v": 1, "session": "main", "tool": "browser", "args": {"argv": ["click", "@e3"]},
+                   "browser": {"action": "click", "url": "https://mail.x/compose",
+                               "origin": "https://mail.x",
+                               "element": {"role": "button", "name": format!("Send {n}")}}})
+        };
+        // Answered: the wrapper is told to go on.
+        let asked = tokio::spawn({
+            let socket = socket.clone();
+            async move { ask(&socket, &click(1)).await }
+        });
+        let pending = |id: i64| {
+            let store = Store::open(&h.cfg.db_path()).unwrap();
+            store
+                .action(id)
+                .unwrap()
+                .is_some_and(|a| a.status == "pending")
+        };
+        for _ in 0..200 {
+            if pending(1) && waits.answer(1, true) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(asked.await.unwrap().unwrap()["verdict"], "allow");
+        // Gone before the owner answered: the action is dropped and nothing waits on it.
+        let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        {
+            use tokio::io::AsyncWriteExt;
+            let (_, mut write) = stream.into_split();
+            write
+                .write_all(format!("{}\n", click(2)).as_bytes())
+                .await
+                .unwrap();
+            for _ in 0..200 {
+                if pending(2) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(pending(2));
+        } // both halves dropped: the wrapper is gone
+        let status = || h.store.action(2).unwrap().unwrap().status;
+        for _ in 0..200 {
+            if status() == "dropped" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(status(), "dropped");
+        assert!(!waits.answer(2, true), "its wait is gone");
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_the_gate_cannot_read_is_denied() {
+        let h = home("gate-bad", "");
+        let (socket, _waits) = serving(&h).await;
+        for bad in [
+            json!({"v": 2, "session": "main", "tool": "bash", "args": {}}),
+            json!({"v": 1, "session": "main", "tool": "exec", "args": {"command": "ls"}}),
+            json!([1]),
+        ] {
+            let answer = ask(&socket, &bad).await.unwrap();
+            assert_eq!(answer["verdict"], "deny", "{bad}: {answer}");
+        }
+        // A plain command is let through; a task's card goes to the channel that started it.
+        let ls = json!({"v": 1, "session": "task-1", "tool": "bash", "args": {"command": "ls"}});
+        assert_eq!(ask(&socket, &ls).await.unwrap()["verdict"], "allow");
+        h.store
+            .add_task("g", None, None, "discord", "owner-1")
+            .unwrap()
+            .unwrap();
+        let answer = ask(&socket, &mail_request("task-1")).await.unwrap();
+        assert_eq!(answer["verdict"], "hold");
+        let a = h.store.action(1).unwrap().unwrap();
+        assert_eq!(
+            (
+                a.origin.channel.as_str(),
+                a.origin.sender.as_str(),
+                a.origin.run.as_str()
+            ),
+            ("discord", "owner-1", "task-1")
+        );
+        assert_eq!(a.origin.call_id.as_deref(), Some("c1"));
+        // A job run's goes to its job's delivery channel; main's to the run it serves (none
+        // yet: the owner last answered), counted under main's run key.
+        let job = h
+            .store
+            .add_job("j", "0 0 1 1 *", "p", "imessage", "+1555")
+            .unwrap();
+        let answer = ask(&socket, &mail_request(&format!("job-{job}-5")))
+            .await
+            .unwrap();
+        let a = h
+            .store
+            .action(answer["id"].as_i64().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (a.origin.channel.as_str(), a.origin.sender.as_str()),
+            ("imessage", "+1555")
+        );
+        assert_eq!(a.origin.run, format!("job-{job}-5"));
+        let answer = ask(&socket, &mail_request("main")).await.unwrap();
+        let a = h
+            .store
+            .action(answer["id"].as_i64().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (a.origin.channel.as_str(), a.origin.run.as_str()),
+            ("", "main:0")
+        );
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
     }
 }

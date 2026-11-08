@@ -14,6 +14,7 @@ use zephyr_policy::policy::{Decision, UNKNOWN};
 use crate::approvals::{self, Mode};
 use crate::config::Config;
 use crate::procs::Procs;
+use crate::scheduler::{Note, Steers};
 use crate::store::{Action, ActionKind, Store};
 use crate::tools::not_waiting;
 
@@ -41,6 +42,11 @@ impl Waits {
     pub fn answer(&self, id: i64, allow: bool) -> bool {
         let waiting = self.lock().remove(&id);
         waiting.is_some_and(|tx| tx.send(allow).is_ok())
+    }
+
+    /// Forgets action `id`'s wait without answering it: its wrapper is gone.
+    pub fn remove(&self, id: i64) {
+        self.lock().remove(&id);
     }
 
     /// `/stop`: denies every browser action waiting. Returns how many.
@@ -78,6 +84,8 @@ pub struct Ctx<'a> {
     pub store: &'a Store,
     pub procs: &'a Procs,
     pub waits: &'a Waits,
+    /// The task and job runs in progress, which a pass's note is steered into.
+    pub steers: &'a Steers,
 }
 
 /// Who approves an action: the owner on a channel, or its delay running out (the tick).
@@ -131,7 +139,7 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
     audit(store, &a, decision);
     let started = match a.kind {
         ActionKind::Run => run(ctx, &a),
-        ActionKind::Pass => pass(store, &a, by, now),
+        ActionKind::Pass => pass(ctx, &a, by, now),
         ActionKind::Wait => wait(ctx, &a),
     };
     let (n, s) = (a.id, &a.summary);
@@ -195,10 +203,12 @@ fn run(ctx: &Ctx, a: &Action) -> Result<String, String> {
     if let Decision::Deny(why) = zephyr_policy::policy::check("exec", &args) {
         return Err(format!("the policy refuses it: {why}"));
     }
-    let env = match call.secrets.is_empty() {
+    let mut env = match call.secrets.is_empty() {
         true => Vec::new(),
         false => crate::vault::exec_env(ctx.cfg, ctx.store, &call.command, &call.secrets)?,
     };
+    // As an `exec` command: what it runs asks the gate as the session that asked.
+    env.extend(crate::gate::agent_env(ctx.cfg, &a.origin.session));
     let to = origin(ctx.store, a).ok_or("there is no owner to report to")?;
     let p = (ctx.procs).start_action(ctx.cfg, ctx.store, a.id, call, to, env)?;
     Ok(format!(
@@ -207,8 +217,10 @@ fn run(ctx: &Ctx, a: &Action) -> Result<String, String> {
 }
 
 /// A connector action: a one-time pass for exactly that call (server, tool, arguments), good
-/// for 30 minutes; the agent is told to make it again.
-fn pass(store: &Store, a: &Action, by: By, now: i64) -> Result<String, String> {
+/// for 30 minutes; the agent is told to make it again: steered into the task or job run that
+/// asked while it still runs, else as main's note.
+fn pass(ctx: &Ctx, a: &Action, by: By, now: i64) -> Result<String, String> {
+    let store = ctx.store;
     let args: Value = serde_json::from_str(&a.payload).unwrap_or_default();
     let digest = crate::gate::pass_digest(&args).ok_or("the call names no server or tool")?;
     (store.add_pass(&digest, a.id, now + PASS_SECS))
@@ -223,7 +235,14 @@ fn pass(store: &Store, a: &Action, by: By, now: i64) -> Result<String, String> {
          through, once",
         a.summary
     );
-    note(store, a, word, &text);
+    let steered = Note {
+        action: a.id,
+        word: word.into(),
+        text,
+    };
+    if let Err(n) = ctx.steers.send(&a.origin.session, steered) {
+        note(store, a, &n.word, &n.text);
+    }
     Ok("the agent may make exactly that call once in the next 30 min".into())
 }
 
@@ -290,6 +309,16 @@ fn origin(store: &Store, a: &Action) -> Option<(String, String)> {
     match a.origin.channel.is_empty() {
         false => Some((a.origin.channel.clone(), a.origin.sender.clone())),
         true => store.last_owner().ok().flatten(),
+    }
+}
+
+/// A browser action whose wrapper went away before the owner answered (killed with its
+/// child): dropped, as the gate socket finds it, with nothing left to tell.
+pub fn abandon(store: &Store, id: i64) {
+    match store.take_action(id, "dropped") {
+        Ok(Some(a)) => audit(store, &a, "dropped"),
+        Ok(None) => {}
+        Err(e) => eprintln!("zephyr: dropping #{id} failed: {e}"),
     }
 }
 
@@ -537,12 +566,13 @@ mod tests {
     #[test]
     fn a_target_is_remembered_only_when_its_action_starts() {
         let (cfg, store) = setup("actions-remember", "[approvals]\npreset = \"semi\"");
-        let (procs, waits) = (Procs::default(), Waits::default());
+        let (procs, waits, steers) = (Procs::default(), Waits::default(), Steers::default());
         let ctx = Ctx {
             cfg: &cfg,
             store: &store,
             procs: &procs,
             waits: &waits,
+            steers: &steers,
         };
         // Its token is not in the vault: it cannot start.
         let id = hold(&store, ActionKind::Run, SEND, &["NOPE"], None);
@@ -564,12 +594,13 @@ mod tests {
     #[tokio::test]
     async fn the_owner_is_told_how_a_delay_ended() {
         let (cfg, store) = setup("actions-delay-told", "");
-        let (procs, waits) = (Procs::default(), Waits::default());
+        let (procs, waits, steers) = (Procs::default(), Waits::default(), Steers::default());
         let ctx = Ctx {
             cfg: &cfg,
             store: &store,
             procs: &procs,
             waits: &waits,
+            steers: &steers,
         };
         let now = crate::now();
         let pass = r#"{"server": "mail", "tool": "send", "arguments": {"to": "a@x.org"}}"#;
@@ -608,6 +639,63 @@ mod tests {
             )),
             "{told:?}"
         );
+    }
+
+    /// Spec §4.6: the session that asked is told to make the call again, steered in while its
+    /// run goes on, else through main.
+    #[test]
+    fn a_pass_is_steered_into_the_run_that_asked_else_told_to_main() {
+        let (cfg, store) = setup("actions-pass-steer", "");
+        let (procs, waits, steers) = (Procs::default(), Waits::default(), Steers::default());
+        let ctx = Ctx {
+            cfg: &cfg,
+            store: &store,
+            procs: &procs,
+            waits: &waits,
+            steers: &steers,
+        };
+        let pass = r#"{"server": "mail", "tool": "send", "arguments": {"to": "a@x.org"}}"#;
+        let from = |session: &str| {
+            let id = hold(&store, ActionKind::Pass, pass, &[], None);
+            let db = rusqlite::Connection::open(cfg.db_path()).unwrap();
+            let origin = format!(
+                r#"{{"channel":"chat","sender":"o","session":"{session}","run":"{session}"}}"#
+            );
+            db.execute(
+                "UPDATE proposals SET origin = ?2 WHERE id = ?1",
+                rusqlite::params![id, origin],
+            )
+            .unwrap();
+            id
+        };
+        let by = By::Owner { channel: "chat" };
+        // Task 3 still runs: the note goes into its run, and main is handed nothing.
+        let mut inbox = steers.open("task-3");
+        let id = from("task-3");
+        approve(&ctx, id, false, by, crate::now()).unwrap();
+        let note = inbox.try_recv().expect("steered in");
+        assert_eq!(note.action, id);
+        assert!(
+            crate::store::note_text(note.action, &note.word, &note.text).starts_with(&format!(
+                "[action #{id} approved; zephyr's note, not the owner's words] the owner \
+                 approved #{id} (email to a@x.org): make exactly that connector call again"
+            ))
+        );
+        let row = |id: i64| {
+            let db = rusqlite::Connection::open(cfg.db_path()).unwrap();
+            db.query_row(
+                "SELECT text FROM inbox WHERE platform_msg_id = ?1",
+                [format!("action-{id}")],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        };
+        assert_eq!(row(id), None);
+        // Its run ended: main is told instead.
+        drop(inbox);
+        let id = from("task-3");
+        approve(&ctx, id, false, by, crate::now()).unwrap();
+        assert!(row(id).is_some_and(|t| t.contains("make exactly that connector call")));
     }
 
     #[tokio::test]
