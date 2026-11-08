@@ -453,6 +453,74 @@ fn init_non_interactive_takes_preset_flag() {
     assert!(!bad.daemon().join("zephyr.toml").exists());
 }
 
+/// D11: a re-run of `init --preset` writes the preset as `/approvals PRESET` does
+/// (`preset_edits`): a hand-set class looser than the new preset is cleared, a stricter one kept.
+#[test]
+fn init_again_with_a_preset_drops_looser_hand_set_classes() {
+    let env = Env::new("init-preset-edits");
+    env.init(&["--no-start", "--preset", "full"]);
+    let path = env.daemon().join("zephyr.toml");
+    let text = env.config().replace(
+        "[approvals]\npreset = \"full\"",
+        "[approvals]\npreset = \"full\"\nmessages = \"auto\"\nposts = \"ask\"\nmoney = \"auto 50\"",
+    );
+    assert!(text.contains("messages = \"auto\""), "{text}");
+    std::fs::write(&path, text).unwrap();
+    env.init(&["--no-start", "--preset", "manual"]);
+    let config = env.config();
+    assert!(config.contains("preset = \"manual\""), "{config}");
+    assert!(
+        !config.contains("messages ="),
+        "looser than manual: {config}"
+    );
+    assert!(!config.contains("money ="), "looser than manual: {config}");
+    assert!(config.contains("posts = \"ask\""), "as strict: {config}");
+}
+
+/// D4: adding a connector again (a new URL or command) keeps the classes the owner gave its
+/// tools.
+#[test]
+fn mcp_add_again_keeps_the_owners_classes() {
+    let env = Env::new("mcp-classes");
+    env.init(&["--no-start"]);
+    env.ok(&["mcp", "add", "mail", "--", "mail-server", "--stdio"]);
+    let path = env.daemon().join("zephyr.toml");
+    let text = env.config().replace(
+        "name = \"mail\"",
+        "name = \"mail\"\nclasses = { archive = \"posts\", note = \"none\" }",
+    );
+    assert!(text.contains("archive"), "{text}");
+    std::fs::write(&path, text).unwrap();
+    env.ok(&[
+        "mcp",
+        "add",
+        "mail",
+        "--url",
+        "https://mail.example.com/mcp",
+    ]);
+    let config = env.config();
+    assert!(config.contains("https://mail.example.com/mcp"), "{config}");
+    assert!(!config.contains("mail-server"), "{config}");
+    assert!(
+        config.contains("archive = \"posts\"") && config.contains("note = \"none\""),
+        "{config}"
+    );
+    env.ok(&["mcp", "add", "mail", "--", "other-server"]);
+    let config = env.config();
+    assert!(
+        config.contains("other-server") && config.contains("archive = \"posts\""),
+        "{config}"
+    );
+    // A new connector has none.
+    env.ok(&["mcp", "add", "docs", "--", "docs-server"]);
+    assert_eq!(
+        env.config().matches("classes").count(),
+        1,
+        "{}",
+        env.config()
+    );
+}
+
 #[test]
 fn init_writes_the_parsed_preset_name() {
     let env = Env::new("init-preset-trim");

@@ -95,7 +95,7 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
     }
     // Without --preset, [approvals] stays absent, which is `manual`; the interactive run asks.
     if let Some(p) = preset.filter(|_| non_interactive) {
-        conf::set(&mut doc, "approvals.preset", p.name())?;
+        write_preset(&mut doc, p)?;
     }
     h.data.save(&doc)?;
 
@@ -183,6 +183,22 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
     h.doctor(false)
 }
 
+/// Writes `preset` as `/approvals PRESET` does (D11, `approvals::preset_edits`): the preset, and
+/// every hand-set class looser than it cleared, so a re-run of `init --preset manual` never
+/// leaves a looser class behind.
+fn write_preset(
+    doc: &mut toml_edit::DocumentMut,
+    preset: crate::approvals::Preset,
+) -> anyhow::Result<()> {
+    let cfg: crate::config::Config =
+        toml::from_str(&doc.to_string()).context("reading zephyr.toml")?;
+    for (key, value) in crate::approvals::preset_edits(&cfg, preset) {
+        let value = value.map(toml_edit::Value::from);
+        crate::settings::write(doc, &key, value.as_ref())?;
+    }
+    Ok(())
+}
+
 /// The preset to start in (approvals spec §4.10), then the private facts. A config that already
 /// has an `[approvals]` table (a re-run of `init`) keeps it unless `--preset` says otherwise.
 fn init_approvals(h: &Host, preset: Option<crate::approvals::Preset>) -> anyhow::Result<()> {
@@ -205,7 +221,7 @@ fn init_approvals(h: &Host, preset: Option<crate::approvals::Preset>) -> anyhow:
         }
     };
     if let Some(p) = chosen {
-        conf::set(&mut doc, "approvals.preset", p.name())?;
+        write_preset(&mut doc, p)?;
         h.data.save(&doc)?;
     }
     if Confirm::new()
@@ -778,18 +794,26 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
                         .with_context(|| format!("--header {h}: write it as K=V"))
                 })
                 .collect::<anyhow::Result<_>>()?;
+            // D4: added again, a connector keeps the classes the owner gave its tools.
+            let classes = || {
+                let cfg = parse(&doc).ok();
+                let existing = cfg.and_then(|c| c.mcp.into_iter().find(|m| m.name == *name));
+                existing.map(|m| m.classes).unwrap_or_default()
+            };
             let m = match (url, command.split_first()) {
                 (Some(_), Some(_)) => bail!("give --url or a command after --, not both"),
                 (Some(url), None) => Mcp {
                     name: name.clone(),
                     url: Some(url),
                     headers,
+                    classes: classes(),
                     ..Mcp::default()
                 },
                 (None, Some((cmd, args))) if headers.is_empty() => Mcp {
                     name: name.clone(),
                     command: Some(cmd.clone()),
                     args: args.to_vec(),
+                    classes: classes(),
                     ..Mcp::default()
                 },
                 (None, Some(_)) => bail!("--header goes with --url"),

@@ -384,7 +384,7 @@ pub static SETTINGS: &[Setting] = &[
         "Connectors",
         "Connector tool class",
         "Which approvals a connector's tool follows, over what its name implies: messages, \
-         posts, money or none; the agent may only move a tool into a stricter class.",
+         posts, money or none; the agent may only move a tool from none into a class.",
         Kind::Choice(&crate::approvals::CLASS_CHOICES),
         Access::Tighten,
         true,
@@ -445,7 +445,8 @@ pub static SETTINGS: &[Setting] = &[
         "The ISO 4217 currency an auto N cap counts in.",
         Kind::Text { max: 3 },
         Access::Propose,
-        false,
+        // C2: another currency changes what an `auto N` cap lets through.
+        true,
         Stricter::NotOrdered,
         Apply::Toml,
     ),
@@ -1497,8 +1498,23 @@ mod tests {
             let s = find(key).unwrap();
             assert!(s.strong && s.agent == Access::Tighten, "{key}");
         }
+        // C2: a stronger currency raises an `auto N` cap's real worth, so a change of currency
+        // is a loosening a weak channel cannot make; the agent still only proposes it.
         let cur = find("approvals.currency").unwrap();
-        assert!(!cur.strong && cur.agent == Access::Propose);
+        assert!(cur.strong && cur.agent == Access::Propose);
+        assert!(loosens(cur, Some("JPY"), Some("USD")));
+        let discord = Actor::Owner { channel: "discord" };
+        assert_eq!(
+            decide(
+                cur,
+                &discord,
+                loosens(cur, Some("JPY"), Some("USD")),
+                &strong()
+            ),
+            Verdict::Refuse("loosening approvals.currency needs tui or chat".into())
+        );
+        let tui = Actor::Owner { channel: "tui" };
+        assert_eq!(decide(cur, &tui, true, &strong()), Verdict::Apply);
         assert_eq!(text(&parse(cur, "eur").unwrap()), "EUR");
         assert!(parse(cur, "euro").is_err() && parse(cur, "E1R").is_err());
         let money = find("approvals.money").unwrap();

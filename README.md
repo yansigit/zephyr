@@ -39,7 +39,8 @@ zephyr init --non-interactive --projects ~/Projects \
 zephyr login openai-codex --account codex-main
 ```
 
-`--preset manual|semi|full` sets the approvals preset; without it a non-interactive `init` leaves
+`--preset manual|semi|full` sets the approvals preset as `/approvals PRESET` does (a class you set
+by hand that is looser than the preset is cleared); without it a non-interactive `init` leaves
 `[approvals]` out (which is `manual`) and asks for no facts.
 
 ## Everyday commands
@@ -175,9 +176,10 @@ goes back by itself and you are told. The agent can read all of them. What it ma
 The agent may also save a new private fact at once (it only makes the check stricter); you are told
 its name, and `/facts rm NAME` removes it.
 
-The `budget.*` limits, `settings.strong_channels`, the `approvals.*` settings (all but the currency),
-the connector tool classes and the private facts are protected: raising a limit, adding a channel,
-or loosening an approval or a fact is accepted only from a strong channel, by default `zephyr
+The `budget.*` limits, `settings.strong_channels`, the `approvals.*` settings (the currency too: it
+changes what an `auto N` cap lets through), the connector tool classes and the private facts are
+protected: raising a limit, adding a channel, changing the currency, or loosening an approval or a
+fact is accepted only from a strong channel, by default `zephyr
 attach` and the chat socket that `zephyr chat` and the host CLI use (`[settings] strong_channels`;
 the TUI can't be removed).
 From Discord or iMessage it is refused, and a proposal that needs one stays waiting for it, so a
@@ -365,7 +367,8 @@ zephyr mcp add files -- npx -y @modelcontextprotocol/server-filesystem /zephyr/p
 
 This writes an `[[mcp]]` table to `zephyr.toml` (`name`, then `url` and `headers`, or `command`,
 `args` and `cwd`; also `env`, `timeout`, `enabled`), and the agent restarts after the reply in
-progress. `${NAME}` is filled in from `secrets.env`; a connector whose secret is missing is left
+progress. Adding a connector of the same name again replaces it and keeps the classes you gave its
+tools. `${NAME}` is filled in from `secrets.env`; a connector whose secret is missing is left
 out, and `zephyr doctor` and `/mcp` say so. zephyr's own secrets (`ZEPHYR_*`) and the channels' tokens can never be filled into a connector. The agent may also propose one in
 `connectors/drafts/<name>.json`: `/mcp ok NAME` adds it, `/mcp no NAME` drops it, `/mcp rm NAME`
 removes a connector, and `/mcp` lists them. The agent can use only these connectors: an MCP config

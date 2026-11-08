@@ -194,7 +194,7 @@ Registry entries (S §4.1), all in `zephyr.toml` under `[approvals]`:
 | `approvals.messages` | `ask`, `ask-new`, `delay N` (1–60), `auto` | Tighten | yes |
 | `approvals.posts` | `ask`, `ask-new`, `delay N`, `auto` | Tighten | yes |
 | `approvals.money` | `ask`, `delay N`, `auto`, `auto N` (cap) | Tighten | yes |
-| `approvals.currency` | ISO 4217 code, default `USD` | Propose | no |
+| `approvals.currency` | ISO 4217 code, default `USD` | Propose | yes (as built, C2: another currency changes what an `auto N` cap lets through) |
 | `approvals.facts` | `hold`, `warn`, `off` | Tighten | yes |
 | `approvals.strong_only` | list of `loosen`, `money` | Tighten (add only) | yes |
 
