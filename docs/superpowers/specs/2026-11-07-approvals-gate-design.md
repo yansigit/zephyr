@@ -249,8 +249,8 @@ as the wrapper when `argv[0]` is `agent-browser`) **first** on `agent::AGENT_PAT
     is `submit` on a form that has a textarea.
   - **Messages**: the name matches `send` or `reply`, or Enter is pressed in a
     `textbox`/`contenteditable` composer that is not a search box (`role=searchbox`,
-    `type=search`, or a name/placeholder containing "search"). A browser send's `ask-new`
-    target is the page's origin in both classes.
+    `type=search`, or a name/placeholder with the word "search", so "Send research summary" is
+    still a send). A browser send's `ask-new` target is the page's origin in both classes.
   - Not gated: login forms (the form has a password field; the vault's fill handles those), and
     everything else (links, tabs, menus, navigation). As built (R58): a password field in a form
     excludes only messages and posts (a login form's "Send code"); a money label is gated whatever

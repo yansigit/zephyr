@@ -123,12 +123,28 @@ fn sensitive(path: &str) -> Option<&'static str> {
         return Some("the approvals gate's socket, which only the daemon names");
     }
     let parts: Vec<&str> = path.split('/').collect();
-    let named: Vec<&str> = parts
-        .iter()
-        .copied()
+    // C6: the path as written, and with `.` and `..` resolved as `check_path` does, so
+    // `/opt/zephyr/../zephyr/libexec` is still the real browser's folder.
+    let mut resolved: Vec<&str> = Vec::new();
+    for p in &parts {
+        match *p {
+            "" | "." => {}
+            ".." if resolved.last().is_some_and(|l| *l != "..") => {
+                resolved.pop();
+            }
+            p => resolved.push(p),
+        }
+    }
+    let named: Vec<&str> = (parts.iter().copied())
         .filter(|p| !matches!(*p, "" | "."))
         .collect();
-    if named.windows(3).any(|w| w == ["opt", "zephyr", "libexec"]) {
+    named_sensitive(&parts, &named).or_else(|| named_sensitive(&resolved, &named))
+}
+
+/// What `sensitive` finds in one reading of a path's parts.
+fn named_sensitive(parts: &[&str], named: &[&str]) -> Option<&'static str> {
+    let browser = |p: &[&str]| p.windows(3).any(|w| w == ["opt", "zephyr", "libexec"]);
+    if browser(named) || browser(parts) {
         return Some("the real agent-browser, past the approvals gate");
     }
     if let Some(&("auth.json" | ".credentials.json" | "secrets.env")) = parts.last() {
@@ -156,7 +172,13 @@ const SYSTEM_DIRS: &[&str] = &[
 /// Words that may sit in front of the real command.
 const PREFIXES: &[&str] = &[
     "sudo", "doas", "env", "nohup", "nice", "time", "timeout", "command", "exec", "builtin",
-    "xargs", "stdbuf", "{", "}", "!", "if", "then", "do", "else", "while", "until",
+    "xargs", "stdbuf", "setsid", "ionice", "flock", "chronic", "unbuffer", "{", "}", "!", "if",
+    "then", "do", "else", "while", "until",
+];
+/// The prefixes that run the command after them, which `programs` names too.
+const RUNNERS: &[&str] = &[
+    "sudo", "doas", "env", "nohup", "nice", "time", "timeout", "xargs", "stdbuf", "setsid",
+    "ionice", "flock", "chronic", "unbuffer",
 ];
 
 struct Stage {
@@ -201,10 +223,18 @@ fn check_bash(command: &str) -> Decision {
     Decision::Allow
 }
 
-/// The script an `eval` or `sh -c` stage runs.
+/// The script an `eval`, `sh -c` or `flock FILE -c` stage runs.
 fn nested(name: &str, args: &[String]) -> Option<String> {
     if name == "eval" {
         Some(args.join(" "))
+    } else if name == "flock" {
+        let p = args
+            .iter()
+            .position(|a| matches!(a.as_str(), "-c" | "--command"));
+        match p {
+            Some(p) => args.get(p + 1).cloned(),
+            None => (args.iter()).find_map(|a| a.strip_prefix("--command=").map(String::from)),
+        }
     } else if SHELLS.contains(&name) {
         let flag = args
             .iter()
@@ -350,7 +380,7 @@ pub const UNKNOWN: &str = "unknown";
 /// class, `Some(None)` takes it out of all, `None` leaves the verb rule.
 ///
 /// R28: a command is also classified as a de-quoted copy (every `'`, `"`, `` ` `` and `\` a
-/// space), so a quote the tokenizer misreads (`$'\''`) cannot swallow a send. No target is read
+/// space), so a quote the tokenizer misreads (`"$(printf '"')"`) cannot swallow a send. No target is read
 /// from that copy: a send it finds that the plain scan did not (by the send's own text) counts
 /// with target `unknown`. A send whose quoted text holds `;`, `&` or `|` (or, single-quoted,
 /// `(`, `)` or a backtick) on its own line splits differently in the copy, so it also gains
@@ -1110,6 +1140,26 @@ fn gh_repo(args: &[String]) -> Option<String> {
         };
         (ok(o) && ok(r)).then(|| format!("{o}/{r}").to_lowercase())
     }
+    // B4: `-R` takes gh's `[HOST/]OWNER/REPO`: three parts are a host, an owner and a repo,
+    // the host kept in the target unless it is github.com; more parts are no repo.
+    fn flag_repo(s: &str) -> Option<String> {
+        let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
+        match parts.as_slice() {
+            [host, owner, repo] => {
+                let host = host.to_lowercase();
+                let host_ok =
+                    (host.chars()).all(|c| c.is_ascii_alphanumeric() || "-.:".contains(c));
+                let repo = clean(&format!("{owner}/{repo}"));
+                match host.as_str() {
+                    "github.com" | "www.github.com" => repo,
+                    _ if host_ok => repo.map(|r| format!("{host}/{r}")),
+                    _ => None,
+                }
+            }
+            [_, _] => clean(s),
+            _ => None,
+        }
+    }
     let mut positional: Vec<&str> = Vec::new();
     let mut skip = false;
     for (i, a) in args.iter().enumerate() {
@@ -1120,7 +1170,7 @@ fn gh_repo(args: &[String]) -> Option<String> {
             "-R" | "--repo" => args.get(i + 1).map(String::as_str),
             _ => a.strip_prefix("--repo="),
         };
-        if let Some(repo) = value.and_then(clean) {
+        if let Some(repo) = value.and_then(flag_repo) {
             return Some(repo);
         }
         if GH_VALUE_FLAGS.contains(&a.as_str()) {
@@ -1210,13 +1260,14 @@ pub fn browser_class(
 ) -> Option<Class> {
     let role = role.trim().to_lowercase();
     let name = name.to_lowercase();
-    if role == "searchbox" || name.contains("search") || name.contains("검색") {
-        return None;
-    }
     let words: Vec<&str> = name
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
         .collect();
+    // D2: the word `search`, not `research`; Hangul has no spaces in its compounds.
+    if role == "searchbox" || words.contains(&"search") || name.contains("검색") {
+        return None;
+    }
     if words
         .iter()
         .any(|w| BROWSER_HISTORY.iter().any(|h| w.contains(h)))
@@ -1254,7 +1305,12 @@ pub fn browser_class(
 /// `gh pr create`, `gh api POST repos/o/r/issues`: a gh command that writes to GitHub.
 fn gh_write(args: &[String]) -> Option<String> {
     const WRITES: &[(&str, &[&str])] = &[
-        ("pr", &["create", "merge", "comment", "review"]),
+        (
+            "pr",
+            &[
+                "create", "merge", "comment", "review", "edit", "close", "ready",
+            ],
+        ),
         ("issue", &["create", "comment", "close", "edit"]),
         ("release", &["create", "upload", "delete"]),
         ("repo", &["create", "delete", "fork"]),
@@ -1337,17 +1393,26 @@ fn gh_write(args: &[String]) -> Option<String> {
 /// Whether a himalaya command sends mail: a `send` subcommand (message, smtp, gmail, msgraph),
 /// `--send` on compose/reply/forward, a raw SMTP command or a JMAP submission.
 fn himalaya_send(args: &[String]) -> bool {
-    let words: Vec<&str> = args
-        .iter()
-        .map(String::as_str)
-        .filter(|a| !a.starts_with('-'))
-        .take(4) // an `-a account` value may come first
+    // The words, without the values of the global flags that take one (`-a work`).
+    let mut skip = false;
+    let all: Vec<&str> = (args.iter().map(String::as_str))
+        .filter(|a| {
+            if std::mem::take(&mut skip) {
+                return false;
+            }
+            skip = ["-a", "--account", "-c", "--config", "-o", "--output"].contains(a);
+            !a.starts_with('-')
+        })
         .collect();
+    let first = &all[..all.len().min(4)];
+    let pair = |a: &str, b: &str| all.windows(2).any(|w| w == [a, b]);
     args.iter().any(|a| a == "--send")
-        || words.contains(&"send")
-        || words
-            .windows(2)
-            .any(|w| w == ["smtp", "raw"] || w == ["submission", "create"])
+        || first.contains(&"send")
+        // C5: `message send` and `template send` wherever they come, whatever flags went first
+        || pair("message", "send")
+        || pair("template", "send")
+        || pair("smtp", "raw")
+        || pair("submission", "create")
 }
 
 /// The programs `command` runs, by name: the command word of every stage, the programs in front
@@ -1355,9 +1420,6 @@ fn himalaya_send(args: &[String]) -> bool {
 /// inside it, once each, in order. A vault token is handed only to a command whose programs the
 /// owner allowed it for (DESIGN §4.15). `cd` is left out: it runs nothing and reads no variable.
 pub fn programs(command: &str) -> Vec<String> {
-    const RUNNERS: &[&str] = &[
-        "sudo", "doas", "env", "nohup", "nice", "time", "timeout", "xargs", "stdbuf",
-    ];
     let mut found: Vec<String> = Vec::new();
     let mut add = |p: &str| {
         if p != "cd" && !found.iter().any(|f| f == p) {
@@ -1483,6 +1545,19 @@ fn runner_value_flags(runner: &str) -> &'static [&'static str] {
         ],
         "doas" => &["-u", "-C"],
         "time" => &["-f", "-o", "--format", "--output"],
+        "ionice" => &[
+            "-c",
+            "--class",
+            "-n",
+            "--classdata",
+            "-p",
+            "--pid",
+            "-P",
+            "--pgid",
+            "-u",
+            "--uid",
+        ],
+        "flock" => &["-w", "--wait", "--timeout", "-E", "--conflict-exit-code"],
         _ => &[],
     }
 }
@@ -1495,8 +1570,25 @@ fn is_duration(w: &str) -> bool {
         && n.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
-/// The first word that is the command, after prefixes (and the flags, values and durations of
-/// the runners among them), flags and assignments.
+/// Whether `word` is a redirection (`2>`, `>>f`, `&>f`, `<f`, `<<<x`, `<<EOF`, a marked
+/// heredoc), and whether it is a bare operator, whose target is the next word (A2).
+fn redirection(word: &str) -> Option<bool> {
+    let op = match word.strip_prefix('&') {
+        Some(rest) if rest.starts_with('>') => rest,
+        _ => word.trim_start_matches(|c: char| c.is_ascii_digit()),
+    };
+    if !op.starts_with(['<', '>']) {
+        return None;
+    }
+    if op.starts_with("<<__HEREDOC_") {
+        return Some(false);
+    }
+    Some(op.chars().all(|c| "<>&|".contains(c)) || op == "<<-")
+}
+
+/// The first word that is the command, after redirections (A2), prefixes (and the flags, values
+/// and durations of the runners among them, and `flock`'s lock file), flags and assignments. A
+/// `flock FILE -c CMD` is the command `flock` itself, whose script `nested` reads.
 fn command_words(words: &[String]) -> Option<&[String]> {
     let assignment = |w: &str| {
         matches!(w.split_once('='), Some((k, _)) if !k.is_empty()
@@ -1504,17 +1596,30 @@ fn command_words(words: &[String]) -> Option<&[String]> {
     };
     let mut runner = "";
     let mut duration = false;
+    // flock's word, until its lock file is passed
+    let mut flock: Option<usize> = None;
     let mut i = 0;
     while let Some(w) = words.get(i).map(String::as_str) {
-        if PREFIXES.contains(&w) {
+        if let Some(bare) = redirection(w) {
+            if bare {
+                i += 1;
+            }
+        } else if PREFIXES.contains(&w) {
             runner = w;
             duration = w == "timeout";
+            flock = (w == "flock").then_some(i);
         } else if w.starts_with('-') {
             if runner_value_flags(runner).contains(&w) {
                 i += 1;
             }
         } else if duration && is_duration(w) {
             duration = false;
+        } else if let Some(at) = flock.take() {
+            // the lock file; `-c CMD` after it runs CMD through the shell
+            let next = words.get(i + 1).map(String::as_str).unwrap_or_default();
+            if matches!(next, "-c" | "--command") || next.starts_with("--command=") {
+                return Some(&words[at..]);
+            }
         } else if !(assignment(w) || w.bytes().all(|b| b.is_ascii_digit())) {
             return Some(&words[i..]);
         }
@@ -1695,7 +1800,85 @@ fn check_path(raw: &str) -> Decision {
     denied.map_or(Decision::Allow, Decision::Deny)
 }
 
-/// Split a command into stages. Words have their quotes removed.
+/// The rest of an ANSI-C string (`$'…'`, after its opening quote) up to its closing quote, as
+/// bash decodes it (A3): `\n \t \\ \' \" \xHH \NNN \uHHHH`, and the rest of bash's escapes. The
+/// bytes an escape gives are read as UTF-8, so `\xe2\x80\x8b` is one character.
+fn ansi_c(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
+    let mut bytes: Vec<u8> = Vec::new();
+    let number = |chars: &mut std::iter::Peekable<std::str::Chars>, radix: u32, most: usize| {
+        let mut digits = String::new();
+        while digits.len() < most {
+            match chars.peek() {
+                Some(c) if c.is_digit(radix) => digits.push(*c),
+                _ => break,
+            }
+            chars.next();
+        }
+        u32::from_str_radix(&digits, radix).ok()
+    };
+    let push = |bytes: &mut Vec<u8>, c: char| {
+        let mut buf = [0u8; 4];
+        bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => break,
+            '\\' => match chars.next() {
+                None => bytes.push(b'\\'),
+                Some(e) => match e {
+                    'a' => bytes.push(0x07),
+                    'b' => bytes.push(0x08),
+                    'e' | 'E' => bytes.push(0x1b),
+                    'f' => bytes.push(0x0c),
+                    'n' => bytes.push(b'\n'),
+                    'r' => bytes.push(b'\r'),
+                    't' => bytes.push(b'\t'),
+                    'v' => bytes.push(0x0b),
+                    '\\' | '\'' | '"' | '?' => push(&mut bytes, e),
+                    'c' => match chars.next() {
+                        Some(x) => bytes.push((x as u32 & 0x1f) as u8),
+                        None => bytes.extend_from_slice(b"\\c"),
+                    },
+                    '0'..='7' => {
+                        let mut digits = String::from(e);
+                        while digits.len() < 3 {
+                            match chars.peek() {
+                                Some(d @ '0'..='7') => digits.push(*d),
+                                _ => break,
+                            }
+                            chars.next();
+                        }
+                        let v = u32::from_str_radix(&digits, 8).unwrap_or(0);
+                        bytes.push((v & 0xff) as u8);
+                    }
+                    'x' => match number(chars, 16, 2) {
+                        Some(v) => bytes.push(v as u8),
+                        None => bytes.extend_from_slice(b"\\x"),
+                    },
+                    'u' | 'U' => {
+                        let most = if e == 'u' { 4 } else { 8 };
+                        match number(chars, 16, most).map(char::from_u32) {
+                            Some(Some(ch)) => push(&mut bytes, ch),
+                            Some(None) => push(&mut bytes, char::REPLACEMENT_CHARACTER),
+                            None => {
+                                bytes.push(b'\\');
+                                push(&mut bytes, e);
+                            }
+                        }
+                    }
+                    other => {
+                        bytes.push(b'\\');
+                        push(&mut bytes, other);
+                    }
+                },
+            },
+            c => push(&mut bytes, c),
+        }
+    }
+    out.push_str(&String::from_utf8_lossy(&bytes));
+}
+
+/// Split a command into stages. Words have their quotes removed, and ANSI-C strings decoded.
 fn stages(command: &str) -> Vec<Stage> {
     fn end_word(word: &mut Option<String>, words: &mut Vec<String>) {
         if let Some(w) = word.take() {
@@ -1740,6 +1923,14 @@ fn stages(command: &str) -> Vec<Stage> {
                 _ => word.get_or_insert_with(String::new).push(c),
             },
             None => match c {
+                // A3: `$'…'` is the text bash makes of it, escapes decoded.
+                '$' if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                    let w = word.get_or_insert_with(String::new);
+                    ansi_c(&mut chars, w);
+                    prev = '\'';
+                    continue;
+                }
                 '\'' | '"' => {
                     quote = Some(c);
                     word.get_or_insert_with(String::new);
@@ -2732,30 +2923,39 @@ mod tests {
     #[test]
     fn no_quote_hides_a_send_and_the_de_quoted_copy_reads_no_recipients() {
         let unknown = vec![UNKNOWN.to_string()];
-        // R28: bash reads $'\'' as one quote and runs himalaya; the tokenizer opens a quote there
+        // R28: bash reads `"$(printf '"')"` as one word and runs himalaya after it; the tokenizer
+        // takes the inner `"` as the end of the outer quotes, and the `'` after it opens a quote
         // that swallows the send. Only the de-quoted copy sees it, so its recipients are unknown.
-        let g = gbash("echo $'\\''; himalaya message send -H 'To: z@b.org' x").unwrap();
+        let trick = "echo \"$(printf '\"')\"";
+        let g = gbash(&format!(
+            "{trick}; himalaya message send -H 'To: z@b.org' x"
+        ))
+        .unwrap();
         assert_eq!((g.class, g.targets), (Class::Messages, unknown.clone()));
         assert_eq!(g.summary, "email to unreadable recipients");
-        let g = gbash("echo $'\\''; gh pr create -R o/r").unwrap();
+        let g = gbash(&format!("{trick}; gh pr create -R o/r")).unwrap();
         assert_eq!((g.class, g.targets), (Class::Posts, unknown.clone()));
+        // A3: an ANSI-C string is read as bash reads it, so `$'\''` is one quote and the send
+        // after it keeps its recipients.
+        let g = gbash("echo $'\\''; himalaya message send -H 'To: z@b.org' x").unwrap();
+        assert_eq!(g.targets, vec!["z@b.org"]);
         // a send both scans see keeps its recipients; a hidden second one adds `unknown`, also
         // beside a decoy only the plain scan sees as a send (`h"imalaya"`)
         for (cmd, want) in [
             (
-                "himalaya message send -H 'To: a@x.org' x; echo $'\\''; himalaya message send -H 'To: z@b.org' y",
+                format!("himalaya message send -H 'To: a@x.org' x; {trick}; himalaya message send -H 'To: z@b.org' y"),
                 vec!["a@x.org", UNKNOWN],
             ),
             (
-                "h\"imalaya\" message send -H 'To: a@x.org' x; echo $'\\''; himalaya message send -H 'To: z@b.org' x",
+                format!("h\"imalaya\" message send -H 'To: a@x.org' x; {trick}; himalaya message send -H 'To: z@b.org' x"),
                 vec!["a@x.org", UNKNOWN],
             ),
             (
-                "cat <<'A' | h\"imalaya\" message send\nTo: a@x.org\n\nA\necho $'\\''; cat <<'B' | himalaya message send\nTo: z@b.org\n\nB",
+                format!("cat <<'A' | h\"imalaya\" message send\nTo: a@x.org\n\nA\n{trick}; cat <<'B' | himalaya message send\nTo: z@b.org\n\nB"),
                 vec!["a@x.org", UNKNOWN],
             ),
         ] {
-            assert_eq!(gbash(cmd).unwrap().targets, want, "{cmd}");
+            assert_eq!(gbash(&cmd).unwrap().targets, want, "{cmd}");
         }
     }
 
@@ -2769,6 +2969,224 @@ mod tests {
             "himalaya message send <<-EOF\nTo: known@x.org\\\n\nCc: z@evil.org\n\nhi\nEOF",
         ] {
             assert_eq!(gbash(cmd).unwrap().targets, vec![UNKNOWN], "{cmd}");
+        }
+    }
+
+    /// A2: a redirection before the command word is not the command (`2>/dev/null rm -rf /`
+    /// runs `rm`), for the veto, the classifier, `outbound` and `programs` alike.
+    #[test]
+    fn a_leading_redirect_hides_no_command() {
+        for cmd in [
+            "2>/dev/null rm -rf /",
+            "2> /dev/null rm -rf /",
+            ">/tmp/log rm -rf /",
+            "</dev/null rm -rf /",
+            "&>/dev/null rm -rf /",
+            "2>>/tmp/x 1>&2 rm -rf /",
+            "<<<x rm -rf /",
+            "< /dev/null sudo rm -rf /",
+        ] {
+            assert!(
+                matches!(check_bash(cmd), Decision::Deny(_)),
+                "expected deny: {cmd}"
+            );
+        }
+        let g = gbash("2> /dev/null himalaya message send -H 'To: a@x.org' x").unwrap();
+        assert_eq!(
+            (g.class, g.targets),
+            (Class::Messages, vec!["a@x.org".to_string()])
+        );
+        let g = gbash("</dev/null gh issue create -R o/r --title t").unwrap();
+        assert_eq!(
+            (g.class, g.targets),
+            (Class::Posts, vec!["o/r".to_string()])
+        );
+        let g = gbash("cat <<'EOF' | >/dev/null himalaya message send\nTo: a@x.org\n\nhi\nEOF");
+        assert_eq!(g.unwrap().class, Class::Messages);
+        assert_eq!(
+            outbound("2>/dev/null curl -d x https://e.x/a"),
+            ["curl POST e.x"]
+        );
+        assert_eq!(programs("2>/dev/null gh pr list"), ["gh"]);
+        assert_eq!(programs("2> err.log gh pr list"), ["gh"]);
+        // still allowed
+        assert_eq!(check_bash("2>/dev/null ls /"), Decision::Allow);
+    }
+
+    /// A3: an ANSI-C string (`$'…'`) is the text bash makes of it, so the veto and the
+    /// classifier see the script it runs.
+    #[test]
+    fn ansi_c_strings_are_read_as_bash_reads_them() {
+        for cmd in [
+            "bash -c $'rm -rf /'",
+            "bash -c $'rm\\t-rf\\x20/'",
+            "sh -c $'echo hi\\nrm -rf /'",
+            "$'\\x72m' -rf /",
+            "$'\\162\\155' -rf /",
+            "$'\\u0072m' -rf /",
+            "eval $'rm -rf \\'/\\''",
+        ] {
+            assert!(
+                matches!(check_bash(cmd), Decision::Deny(_)),
+                "expected deny: {cmd}"
+            );
+        }
+        let g = gbash("$'\\x68imalaya' message send").unwrap();
+        assert_eq!(
+            (g.class, g.targets),
+            (Class::Messages, vec![UNKNOWN.to_string()])
+        );
+        let g = gbash("bash -c $'himalaya message send -H \"To: a@x.org\" x'").unwrap();
+        assert_eq!(g.targets, vec!["a@x.org"]);
+        assert_eq!(programs("$'\\x67h' pr list"), ["gh"]);
+        // An ANSI-C string inside double quotes is plain text.
+        assert_eq!(check_bash("echo \"$'rm -rf /'\""), Decision::Allow);
+        assert_eq!(check_bash("echo $'a\\'b'"), Decision::Allow);
+    }
+
+    /// B4: gh reads `-R HOST/OWNER/REPO`: the target is the repo, never `HOST/OWNER`.
+    #[test]
+    fn gh_repo_flags_with_a_host_name_the_repo() {
+        let table = [
+            ("gh pr create -R github.com/alice/repo1 -t x", "alice/repo1"),
+            ("gh pr create -R GitHub.com/Alice/Repo1 -t x", "alice/repo1"),
+            ("gh pr create --repo=github.com/alice/repo1", "alice/repo1"),
+            ("gh issue create --repo www.github.com/a/b", "a/b"),
+            (
+                "gh pr create -R ghe.corp.com/alice/repo1",
+                "ghe.corp.com/alice/repo1",
+            ),
+            ("gh pr create -R alice/repo1", "alice/repo1"),
+            ("gh pr create -R a/b/c/d", UNKNOWN),
+        ];
+        for (cmd, want) in table {
+            let g = gbash(cmd).unwrap_or_else(|| panic!("{cmd}"));
+            assert_eq!(g.targets, vec![want], "{cmd}");
+        }
+    }
+
+    /// C5: more runners, and himalaya's send after any number of global flags.
+    #[test]
+    fn more_runners_and_late_sends_are_seen() {
+        for cmd in [
+            "setsid himalaya message send -H 'To: a@x.org'",
+            "setsid -f himalaya message send -H 'To: a@x.org'",
+            "ionice -c 3 himalaya message send -H 'To: a@x.org'",
+            "ionice -c2 -n 7 himalaya message send -H 'To: a@x.org'",
+            "flock /tmp/l himalaya message send -H 'To: a@x.org'",
+            "flock -w 5 -x /tmp/l himalaya message send -H 'To: a@x.org'",
+            "flock /tmp/l -c \"himalaya message send -H 'To: a@x.org'\"",
+            "chronic himalaya message send -H 'To: a@x.org'",
+            "unbuffer -p himalaya message send -H 'To: a@x.org'",
+            "nohup setsid flock /tmp/l chronic himalaya message send -H 'To: a@x.org'",
+        ] {
+            let g = gbash(cmd).unwrap_or_else(|| panic!("{cmd}"));
+            assert_eq!(
+                (g.class, g.targets),
+                (Class::Messages, vec!["a@x.org".to_string()]),
+                "{cmd}"
+            );
+        }
+        for cmd in [
+            "setsid rm -rf /",
+            "ionice -c 3 rm -rf /",
+            "flock /tmp/l rm -rf /",
+            "flock -n /tmp/l -c 'rm -rf /'",
+            "chronic rm -rf /",
+            "unbuffer rm -rf /",
+        ] {
+            assert!(
+                matches!(check_bash(cmd), Decision::Deny(_)),
+                "expected deny: {cmd}"
+            );
+        }
+        assert_eq!(programs("flock /tmp/l -c 'gh pr list'"), ["flock", "gh"]);
+        assert_eq!(
+            programs("setsid ionice -c 3 gh x"),
+            ["setsid", "ionice", "gh"]
+        );
+        for cmd in [
+            "himalaya -a x -c y -o z message send -H 'To: a@x.org'",
+            "himalaya --account x --config y --output json template send",
+            "himalaya -a x -c y -o json -a w message send",
+        ] {
+            let g = gbash(cmd).unwrap_or_else(|| panic!("{cmd}"));
+            assert_eq!(g.class, Class::Messages, "{cmd}");
+            assert_eq!(outbound(cmd), ["himalaya send"], "{cmd}");
+        }
+        assert!(gbash("himalaya -a x -c y -o z envelope list").is_none());
+    }
+
+    /// C6: `..` in a path is read as the kernel would, so it does not hide the real browser.
+    #[test]
+    fn dot_dot_does_not_hide_a_sensitive_name() {
+        for cmd in [
+            "/opt/zephyr/../zephyr/libexec/agent-browser click @e3",
+            "/opt/x/../zephyr/libexec/agent-browser click @e3",
+            "/opt/zephyr/libexec/../libexec/agent-browser click @e3",
+            "cat proj/.git/x/../hooks/pre-commit",
+            "cat /zephyr/accounts/a/auth.json/.",
+        ] {
+            assert!(
+                matches!(check_bash(cmd), Decision::Deny(_)),
+                "expected deny: {cmd}"
+            );
+        }
+        assert!(matches!(
+            check(
+                "read",
+                &json!({ "path": "/opt/zephyr/gate/../libexec/agent-browser" })
+            ),
+            Decision::Deny(_)
+        ));
+        assert_eq!(check_bash("ls /opt/zephyr/x/.."), Decision::Allow);
+        assert_eq!(
+            check_bash("/opt/zephyr/gate/bin/agent-browser click @e3"),
+            Decision::Allow
+        );
+    }
+
+    /// D2: only the word `search` exempts a control, not `research`.
+    #[test]
+    fn search_is_a_whole_word() {
+        assert_eq!(
+            browser_class("button", "Send research summary", false, false, false),
+            Some(Class::Messages)
+        );
+        assert_eq!(
+            browser_class("button", "Post researcher notes", false, false, false),
+            Some(Class::Posts)
+        );
+        assert_eq!(browser_class("button", "Search", false, false, false), None);
+        assert_eq!(
+            browser_class("button", "Send search", false, false, false),
+            None
+        );
+        assert_eq!(
+            browser_class("textbox", "Search messages", false, false, true),
+            None
+        );
+    }
+
+    /// D3: editing, closing or readying a pull request writes to GitHub.
+    #[test]
+    fn pr_edit_close_and_ready_are_posts() {
+        for (cmd, label) in [
+            ("gh pr edit 3 -R o/r --title x", "gh pr edit"),
+            ("gh pr close 3 -R o/r", "gh pr close"),
+            ("gh pr ready 3 -R o/r", "gh pr ready"),
+        ] {
+            let g = gbash(cmd).unwrap_or_else(|| panic!("{cmd}"));
+            assert_eq!(
+                (g.class, g.targets, g.summary),
+                (
+                    Class::Posts,
+                    vec!["o/r".to_string()],
+                    format!("{label} on o/r")
+                ),
+                "{cmd}"
+            );
+            assert_eq!(outbound(cmd), [label], "{cmd}");
         }
     }
 
