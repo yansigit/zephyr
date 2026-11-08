@@ -201,6 +201,7 @@ pub enum Decided {
 /// only looked up here: `actions::approve` takes it, once, and `/no` drops it through
 /// `actions::decline`. `once` on a proposed command is a plain `/ok`.
 pub fn decide(
+    cfg: &crate::config::Config,
     store: &Store,
     text: &str,
     check: impl FnOnce(&crate::store::PendingProposal) -> Option<NotNow>,
@@ -233,7 +234,7 @@ pub fn decide(
     if found.is_some_and(|p| p.kind != "command") {
         return Some(match status {
             "done" => Ok(Decided::Action { id, once }),
-            _ => Err(crate::actions::decline(store, id)),
+            _ => Err(crate::actions::decline(cfg, store, id)),
         });
     }
     if status == "done" {

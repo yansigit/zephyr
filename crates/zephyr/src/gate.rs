@@ -1217,14 +1217,14 @@ impl Conn {
             None => Some(None),
         };
         let (status, result, told) = ending(said);
-        let store = self.store.clone();
+        let (cfg, store) = (self.cfg.clone(), self.store.clone());
         let recorded = tokio::task::spawn_blocking(move || {
             let store = store.lock().unwrap_or_else(|e| e.into_inner());
             // Told only of a row this ended, on the action's channel, as its other outcomes.
             if store.finish_action(id, status, result)? {
                 if let (Some(tail), Some(a)) = (told, store.action(id)?) {
                     let text = format!("[zephyr] #{id} ({}){tail}", a.summary);
-                    crate::actions::tell(&store, &a, &text);
+                    crate::actions::tell(&cfg, &store, &a, &text);
                     return Ok(true);
                 }
             }
@@ -1313,10 +1313,10 @@ impl Conn {
             v = verdict => v.unwrap_or(false),
             () = gone => {
                 self.waits.remove(id);
-                let store = self.store.clone();
+                let (cfg, store) = (self.cfg.clone(), self.store.clone());
                 let dropped = tokio::task::spawn_blocking(move || {
                     let store = store.lock().unwrap_or_else(|e| e.into_inner());
-                    crate::actions::abandon(&store, id);
+                    crate::actions::abandon(&cfg, &store, id);
                 });
                 let _ = dropped.await;
                 return None;
@@ -2376,7 +2376,7 @@ mod tests {
         assert_eq!(send("day:last"), day);
         // One the owner declines still counts; one approved now no longer does.
         let pending = h.store.held_actions().unwrap();
-        crate::actions::decline(&h.store, pending[0].id);
+        crate::actions::decline(ctx.cfg, &h.store, pending[0].id);
         assert_eq!(h.store.held_today(now).unwrap(), 20);
         crate::actions::approve(&ctx, pending[1].id, false, by, now).unwrap();
         assert_eq!(h.store.held_today(now).unwrap(), 19);

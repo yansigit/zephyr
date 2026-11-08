@@ -1424,7 +1424,8 @@ impl<'a> Router<'a> {
                         v["expires_in_secs"] = json!((a.created_at + wait - now).max(0));
                     }
                     v["card"] = json!(crate::gate::card(&a, &self.cfg, &self.store));
-                    v["summary"] = json!(a.summary);
+                    // R70: the summary as the private facts are now.
+                    v["summary"] = json!(crate::facts::scrubbed(&self.cfg, a.summary.clone()));
                     v["strong"] = json!(a.class == "money" && money_strong);
                     v["once"] = json!(crate::gate::asks_new(&e, &a.class));
                     v["class"] = json!(a.class);
@@ -1439,7 +1440,7 @@ impl<'a> Router<'a> {
     /// commands make (stale, strong channel). `once` is `ok` for a setting.
     async fn decide(&mut self, id: i64, verb: &str) -> Value {
         if verb == "cancel" {
-            let done = crate::actions::cancel(&self.store, &self.waits, &id.to_string());
+            let done = crate::actions::cancel(&self.cfg, &self.store, &self.waits, &id.to_string());
             self.settled_actions();
             let (ok, text) = match done {
                 Ok(text) => (true, text),
@@ -1459,7 +1460,7 @@ impl<'a> Router<'a> {
             text: text.clone(),
         };
         let mut approving = None;
-        let decided = crate::tools::decide(&self.store, &text, |p| {
+        let decided = crate::tools::decide(&self.cfg, &self.store, &text, |p| {
             approving = Some(p.id);
             self.not_now(p, &m.channel)
         });
@@ -1652,7 +1653,7 @@ impl<'a> Router<'a> {
             log(self.store.deliver_after(id).map_err(Into::into));
         }
         let mut approving = None;
-        let decided = crate::tools::decide(&self.store, m.text.trim(), |p| {
+        let decided = crate::tools::decide(&self.cfg, &self.store, m.text.trim(), |p| {
             approving = Some(p.id);
             self.not_now(p, &m.channel)
         });
@@ -2006,7 +2007,7 @@ impl<'a> Router<'a> {
             // Held messages, posts and payments (approvals spec §4.6).
             ("/held", "") => crate::actions::held(&self.cfg, &self.store),
             ("/cancel", n) => {
-                let reply = crate::actions::cancel(&self.store, &self.waits, n);
+                let reply = crate::actions::cancel(&self.cfg, &self.store, &self.waits, n);
                 self.settled_actions();
                 reply.unwrap_or_else(|refused| refused)
             }

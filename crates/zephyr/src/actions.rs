@@ -101,6 +101,11 @@ pub enum By<'a> {
 /// paused, a payment needs a strong channel, or every process slot is taken (R44). The owner
 /// approving under `ask-new` remembers its targets once it started, unless `once` (R46).
 pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<String, String> {
+    let shown = |text: String| shown(ctx.cfg, text);
+    approved(ctx, id, once, by, now).map(shown).map_err(shown)
+}
+
+fn approved(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<String, String> {
     let store = ctx.store;
     let failed = |e: rusqlite::Error| format!("[zephyr] reading proposal #{id} failed: {e}");
     let waiting = |a: &Action| matches!(a.status.as_str(), "pending" | "scheduled");
@@ -140,7 +145,7 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
         (_, true) => "once",
         _ => "approved",
     };
-    audit(store, &a, decision);
+    audit(ctx.cfg, store, &a, decision);
     let started = match a.kind {
         ActionKind::Run => run(ctx, &a),
         ActionKind::Pass => pass(ctx, &a, by, now),
@@ -159,7 +164,7 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
         (Ok(what), By::Delay) => {
             format!("[zephyr] #{n} ({s}) went at the end of its delay: {what}")
         }
-        (Err(why), by) => not_run(store, &a, by, &why),
+        (Err(why), by) => not_run(ctx.cfg, store, &a, by, &why),
     })
 }
 
@@ -250,7 +255,7 @@ fn pass(ctx: &Ctx, a: &Action, by: By, now: i64) -> Result<String, String> {
         ..
     }) = ctx.steers.send(&a.origin.session, steered)
     {
-        note(store, a, &word, &text);
+        note(ctx.cfg, store, a, &word, &text);
     }
     Ok("the agent may make exactly that call once in the next 30 min".into())
 }
@@ -267,7 +272,7 @@ fn wait(ctx: &Ctx, a: &Action) -> Result<String, String> {
 
 /// A taken action that did not start: failed, the agent told why, and the answer for whoever
 /// set it in motion.
-fn not_run(store: &Store, a: &Action, by: By, why: &str) -> String {
+fn not_run(cfg: &Config, store: &Store, a: &Action, by: By, why: &str) -> String {
     finish(store, a, "failed", why);
     let (n, s) = (a.id, &a.summary);
     let (agent, owner) = match by {
@@ -280,13 +285,19 @@ fn not_run(store: &Store, a: &Action, by: By, why: &str) -> String {
             format!("[zephyr] #{n} ({s}) came due, but it did not start: {why}"),
         ),
     };
-    note(store, a, "not run", &agent);
+    note(cfg, store, a, "not run", &agent);
     owner
+}
+
+/// R70: `text` about a held action as it may be shown now. Its summary was scrubbed of the
+/// private facts when it was held; a fact saved since is scrubbed here (fails closed).
+fn shown(cfg: &Config, text: String) -> String {
+    crate::facts::scrubbed(cfg, text)
 }
 
 /// The owner's decision on `a` as an audit row (spec §4.9), beside the gate's own: the action's
 /// number and summary, the daemon's words, never its payload.
-fn audit(store: &Store, a: &Action, outcome: &str) {
+fn audit(cfg: &Config, store: &Store, a: &Action, outcome: &str) {
     let tool = match a.kind {
         ActionKind::Run if a.origin.session.starts_with("task-") => "bash",
         ActionKind::Run if a.origin.session.starts_with("job-") => "bash",
@@ -294,7 +305,7 @@ fn audit(store: &Store, a: &Action, outcome: &str) {
         ActionKind::Pass => "mcp_call",
         ActionKind::Wait => "browser",
     };
-    let args = format!("#{} {}", a.id, a.summary);
+    let args = shown(cfg, format!("#{} {}", a.id, a.summary));
     if let Err(e) = store.audit(&a.origin.session, tool, &args, outcome) {
         eprintln!("zephyr: writing the audit failed: {e}");
     }
@@ -306,8 +317,8 @@ fn finish(store: &Store, a: &Action, status: &str, result: &str) {
     }
 }
 
-fn note(store: &Store, a: &Action, word: &str, text: &str) {
-    if let Err(e) = store.action_note(a.id, word, text) {
+fn note(cfg: &Config, store: &Store, a: &Action, word: &str, text: &str) {
+    if let Err(e) = store.action_note(a.id, word, &shown(cfg, text.to_string())) {
         eprintln!("zephyr: telling the agent about #{} failed: {e}", a.id);
     }
 }
@@ -322,9 +333,9 @@ fn origin(store: &Store, a: &Action) -> Option<(String, String)> {
 
 /// A browser action whose wrapper went away before the owner answered (killed with its
 /// child): dropped, as the gate socket finds it, with nothing left to tell.
-pub fn abandon(store: &Store, id: i64) {
+pub fn abandon(cfg: &Config, store: &Store, id: i64) {
     match store.take_action(id, "dropped") {
-        Ok(Some(a)) => audit(store, &a, "dropped"),
+        Ok(Some(a)) => audit(cfg, store, &a, "dropped"),
         Ok(None) => {}
         Err(e) => eprintln!("zephyr: dropping #{id} failed: {e}"),
     }
@@ -332,16 +343,16 @@ pub fn abandon(store: &Store, id: i64) {
 
 /// `/no N` on a held action: dropped, and the agent told not to try it again (spec §4.6). The
 /// router denies a waiting browser action afterwards (`Waits::deny_settled`).
-pub fn decline(store: &Store, id: i64) -> String {
+pub fn decline(cfg: &Config, store: &Store, id: i64) -> String {
     match store.take_action(id, "dropped") {
         Ok(Some(a)) => {
-            audit(store, &a, "dropped");
+            audit(cfg, store, &a, "dropped");
             let text = format!(
                 "the owner declined #{id} ({}); don't try it again",
                 a.summary
             );
-            note(store, &a, "declined", &text);
-            format!("[zephyr] dropped #{id} ({})", a.summary)
+            note(cfg, store, &a, "declined", &text);
+            shown(cfg, format!("[zephyr] dropped #{id} ({})", a.summary))
         }
         Ok(None) => not_waiting(id),
         Err(e) => format!("[zephyr] reading proposal #{id} failed: {e}"),
@@ -351,7 +362,7 @@ pub fn decline(store: &Store, id: i64) -> String {
 /// `/cancel N`: a delayed action is cancelled before it goes, and the agent is told; a delayed
 /// browser action is denied. `Ok` is the answer once it was cancelled, `Err` the answer when
 /// nothing was (as `approve` answers).
-pub fn cancel(store: &Store, waits: &Waits, arg: &str) -> Result<String, String> {
+pub fn cancel(cfg: &Config, store: &Store, waits: &Waits, arg: &str) -> Result<String, String> {
     let Ok(id) = arg.trim().trim_start_matches('#').parse::<i64>() else {
         return Err("[zephyr] usage: /cancel N, for an action waiting out its delay".into());
     };
@@ -367,14 +378,17 @@ pub fn cancel(store: &Store, waits: &Waits, arg: &str) -> Result<String, String>
     }
     match store.take_action(id, "cancelled") {
         Ok(Some(a)) => {
-            audit(store, &a, "cancelled");
+            audit(cfg, store, &a, "cancelled");
             waits.answer(id, false);
             let text = format!(
                 "the owner cancelled #{id} ({}); don't try it again",
                 a.summary
             );
-            note(store, &a, "cancelled", &text);
-            Ok(format!("[zephyr] cancelled #{id} ({})", a.summary))
+            note(cfg, store, &a, "cancelled", &text);
+            Ok(shown(
+                cfg,
+                format!("[zephyr] cancelled #{id} ({})", a.summary),
+            ))
         }
         Ok(None) => Err(not_waiting(id)),
         Err(e) => Err(format!("[zephyr] reading proposal #{id} failed: {e}")),
@@ -403,7 +417,10 @@ pub fn held(cfg: &Config, store: &Store) -> String {
             _ => format!("#{} {} · /ok {} · /no {}", a.id, a.summary, a.id, a.id),
         })
         .collect();
-    format!("[zephyr] held for you, newest first:\n{}", lines.join("\n"))
+    shown(
+        cfg,
+        format!("[zephyr] held for you, newest first:\n{}", lines.join("\n")),
+    )
 }
 
 /// The router's tick (spec §4.6). Delays that came due go as an `/ok` would, and whoever set
@@ -427,7 +444,7 @@ pub fn tick(ctx: &Ctx, now: i64, held: bool) {
     match store.expire_actions(now) {
         Ok(expired) => {
             for a in expired {
-                audit(store, &a, "expired");
+                audit(ctx.cfg, store, &a, "expired");
                 ctx.waits.answer(a.id, false);
                 let within = match a.kind {
                     ActionKind::Wait => "10 min",
@@ -438,7 +455,7 @@ pub fn tick(ctx: &Ctx, now: i64, held: bool) {
                      again if it is still wanted",
                     a.id, a.summary
                 );
-                note(store, &a, "expired", &text);
+                note(ctx.cfg, store, &a, "expired", &text);
             }
         }
         Err(e) => eprintln!("zephyr: expiring held actions failed: {e}"),
@@ -455,13 +472,19 @@ fn due_now(ctx: &Ctx, a: &Action, now: i64) {
     if let Some(why) = crate::gate::due_check(ctx.cfg, store, a) {
         match store.unschedule(a.id) {
             Ok(true) => {
+                audit(ctx.cfg, store, a, "re-asked");
                 let (n, s) = (a.id, &a.summary);
                 let text =
                     format!("[zephyr] #{n} ({s}) came due, but {why}, so it waits for you again");
-                tell(store, a, &text);
+                tell(ctx.cfg, store, a, &text);
                 let mut again = a.clone();
                 again.status = "pending".into();
-                tell(store, a, &crate::gate::card(&again, ctx.cfg, store));
+                tell(
+                    ctx.cfg,
+                    store,
+                    a,
+                    &crate::gate::card(&again, ctx.cfg, store),
+                );
             }
             Ok(false) => {}
             Err(e) => eprintln!("zephyr: holding delayed #{} failed: {e}", a.id),
@@ -478,7 +501,7 @@ fn due_now(ctx: &Ctx, a: &Action, now: i64) {
                      you: /ok {n} when one ends, /no {n} drops it",
                     crate::store::MAX_RUNNING_PROCS
                 );
-                tell(store, a, &text);
+                tell(ctx.cfg, store, a, &text);
             }
             Ok(false) => {}
             Err(e) => eprintln!("zephyr: holding delayed #{} failed: {e}", a.id),
@@ -486,7 +509,7 @@ fn due_now(ctx: &Ctx, a: &Action, now: i64) {
         return;
     }
     match approve(ctx, a.id, false, By::Delay, now) {
-        Ok(text) => tell(store, a, &text),
+        Ok(text) => tell(ctx.cfg, store, a, &text),
         Err(why) => eprintln!("zephyr: delayed #{} did not go: {why}", a.id),
     }
 }
@@ -515,7 +538,7 @@ pub fn stop(cfg: &Config, store: &Store, waits: &Waits) {
             "dropped",
             "the owner's /stop denied the waiting browser",
         ) {
-            Ok(Some(a)) => audit(store, &a, "stopped"),
+            Ok(Some(a)) => audit(cfg, store, &a, "stopped"),
             Ok(None) => {}
             Err(e) => eprintln!("zephyr: settling #{id} at /stop failed: {e}"),
         }
@@ -532,12 +555,12 @@ pub fn restore(cfg: &Config, store: &Store, now: i64) {
     match store.end_waits(now) {
         Ok(ended) => {
             for a in ended {
-                audit(store, &a, "failed");
+                audit(cfg, store, &a, "failed");
                 let text = format!(
                     "[zephyr] #{} ({}) did not run: {RESTARTED}",
                     a.id, a.summary
                 );
-                tell(store, &a, &text);
+                tell(cfg, store, &a, &text);
             }
         }
         Err(e) => eprintln!("zephyr: ending the browser waits failed: {e}"),
@@ -554,16 +577,18 @@ const RESTARTED: &str = "zephyr restarted while the browser waited";
 /// Shows each action's card to whoever it waits for.
 fn ask(cfg: &Config, store: &Store, actions: &[Action]) {
     for a in actions {
-        tell(store, a, &crate::gate::card(a, cfg, store));
+        tell(cfg, store, a, &crate::gate::card(a, cfg, store));
     }
 }
 
-/// A notice about `a` for the owner of the run that asked (else the owner last answered). The
-/// gate socket tells this way of a browser action the owner let go that did not run.
-pub(crate) fn tell(store: &Store, a: &Action, text: &str) {
+/// A notice about `a` for the owner of the run that asked (else the owner last answered),
+/// scrubbed of the private facts as they are now (R70). The gate socket tells this way of a
+/// browser action the owner let go that did not run.
+pub(crate) fn tell(cfg: &Config, store: &Store, a: &Action, text: &str) {
+    let text = shown(cfg, text.to_string());
     let told = match a.origin.channel.is_empty() {
-        true => store.notify_last_owner(text),
-        false => store.notify(&a.origin.channel, &a.origin.sender, text),
+        true => store.notify_last_owner(&text),
+        false => store.notify(&a.origin.channel, &a.origin.sender, &text),
     };
     if let Err(e) = told {
         eprintln!("zephyr: telling the owner about #{} failed: {e}", a.id);
@@ -649,18 +674,18 @@ mod tests {
     /// `/cancel N` says whether it cancelled, so `zephyr.decide` need not read its words.
     #[test]
     fn cancel_says_whether_it_cancelled() {
-        let (_, store) = setup("actions-cancel", "");
+        let (cfg, store) = setup("actions-cancel", "");
         let waits = Waits::default();
         let now = hold(&store, ActionKind::Run, SEND, &[], None);
         let later = hold(&store, ActionKind::Run, SEND, &[], Some(crate::now() + 300));
-        let refused = cancel(&store, &waits, &now.to_string()).unwrap_err();
+        let refused = cancel(&cfg, &store, &waits, &now.to_string()).unwrap_err();
         assert!(refused.contains("is not waiting out a delay"), "{refused}");
         assert_eq!(
-            cancel(&store, &waits, &later.to_string()),
+            cancel(&cfg, &store, &waits, &later.to_string()),
             Ok(format!("[zephyr] cancelled #{later} (email to a@x.org)"))
         );
-        assert!(cancel(&store, &waits, &later.to_string()).is_err());
-        assert!(cancel(&store, &waits, "x").is_err());
+        assert!(cancel(&cfg, &store, &waits, &later.to_string()).is_err());
+        assert!(cancel(&cfg, &store, &waits, "x").is_err());
     }
 
     /// R46: a target becomes known only once its action started.
@@ -898,6 +923,70 @@ mod tests {
         assert!(!told
             .iter()
             .any(|t| t.contains("5550102345") || t.contains("010 2345")));
+    }
+
+    /// R66: a held action's summary was scrubbed of the facts when it was held. A fact saved
+    /// since is scrubbed too, from every notice, agent note, reply and audit row that shows it.
+    #[test]
+    fn a_summary_is_scrubbed_with_the_facts_as_they_are_when_shown() {
+        let (held_cfg, store) = setup(
+            "actions-scrub-summary",
+            "[approvals]\nmessages = 'delay 5'\n",
+        );
+        let now = crate::now();
+        let due = hold(&store, ActionKind::Run, SEND, &[], Some(now + 300));
+        let declined = hold(&store, ActionKind::Run, SEND, &[], None);
+        let cancelled = hold(&store, ActionKind::Run, SEND, &[], Some(now + 300));
+        // The owner saved the recipient as a private fact since, and made messages `ask`.
+        let cfg = again(&held_cfg, "[approvals]\nmessages = 'ask'\n");
+        std::fs::write(
+            crate::facts::path(&cfg),
+            "[[fact]]\nname = \"mine\"\nkind = \"email\"\nvalue = \"a@x.org\"\n",
+        )
+        .unwrap();
+        let (procs, waits, steers) = (Procs::default(), Waits::default(), Steers::default());
+        let mut shown = vec![held(&cfg, &store)];
+        shown.push(decline(&cfg, &store, declined));
+        shown.push(cancel(&cfg, &store, &waits, &cancelled.to_string()).unwrap());
+        let ctx = Ctx {
+            cfg: &cfg,
+            store: &store,
+            procs: &procs,
+            waits: &waits,
+            steers: &steers,
+        };
+        tick(&ctx, now + 301, false);
+        assert_eq!(store.action(due).unwrap().unwrap().status, "pending");
+        shown.extend(told(&store));
+        let notes: Vec<String> = (store.db_for_test())
+            .prepare("SELECT text FROM inbox WHERE platform_msg_id LIKE 'action-%'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(!notes.is_empty());
+        shown.extend(notes);
+        let audit = store.audit_rows().unwrap();
+        shown.extend(audit.iter().map(|(_, _, args, _)| args.clone()));
+        assert!(
+            shown.iter().any(|t| t.starts_with(&format!(
+                "[zephyr] #{due} (email to [fact:mine]) came due"
+            ))),
+            "{shown:#?}"
+        );
+        assert!(
+            !shown.iter().any(|t| t.to_lowercase().contains("a@x.org")),
+            "{shown:#?}"
+        );
+        // NB6: asking again is in the audit, as every other outcome on the tick is.
+        assert!(
+            audit.iter().any(
+                |(_, _, args, outcome)| args.starts_with(&format!("#{due} "))
+                    && outcome == "re-asked"
+            ),
+            "{audit:#?}"
+        );
     }
 
     /// R63 under `ask-new` and a longer delay: a known recipient goes, a new one asks, and a
