@@ -636,12 +636,19 @@ fn connector_recipients(arguments: Option<&Value>) -> (Vec<String>, Vec<String>)
         TEXT.contains(&last) || (last == "id" && words.next() == Some("message"))
     }
     /// What the keys that count by their words hold, read as the listed keys are (an object
-    /// naming no one, `true` or `null`, is `unknown`), unless the key holds text.
+    /// naming no one, `true` or `null`, is `unknown`); one that holds text (`cc_name`) gives
+    /// only the addresses and recipient objects in it.
     fn words(map: &serde_json::Map<String, Value>, out: &mut Vec<String>) {
         for (k, v) in map {
             let k = normalize_tool(k);
-            if !KEYS.contains(&k.as_str()) && recipient_key(&k) && !text_key(&k) {
-                value(v, out);
+            if KEYS.contains(&k.as_str()) || !recipient_key(&k) {
+                continue;
+            }
+            match text_key(&k) {
+                true => {
+                    inside(v, out);
+                }
+                false => value(v, out),
             }
         }
     }
@@ -2867,8 +2874,20 @@ mod tests {
                 "{want} not in {got:?} for {arguments}"
             );
         }
-        // ...unless its last word says it holds text: a subject, a body, a title, an agent, a
-        // link or a message's id is no recipient.
+        // ...unless its last word says it holds text: then only an address or a recipient object
+        // in it counts...
+        for arguments in [
+            json!({"to": "known@x.org", "cc_name": "Eve <eve@evil.org>"}),
+            json!({"to": "known@x.org", "cc_name": {"email": "eve@evil.org"}}),
+            json!({"to": "known@x.org", "message": {"recipient_label": "eve@evil.org"}}),
+        ] {
+            let got = targets(arguments.clone());
+            assert!(
+                got.iter().any(|t| t == "eve@evil.org"),
+                "{arguments}: {got:?}"
+            );
+        }
+        // ...and a subject, a body, a title, an agent, a link or a message's id is no recipient.
         assert_eq!(
             targets(json!({
                 "to": "a@x.org", "email_body": "Hello there", "email_subject": "Hi",
