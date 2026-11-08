@@ -1196,9 +1196,11 @@ const BROWSER_MESSAGES: &[&str] = &["send", "reply", "보내기", "전송", "답
 const BROWSER_HISTORY: &[&str] = &["내역", "조회", "목록"];
 
 /// What clicking a control (or pressing Enter in a composer) does, from its role and accessible
-/// name and what its form holds. Pure; the browser wrapper gathers the inputs. Search boxes,
-/// password forms and everything that is not a button are not gated; an unrecognized label is
-/// not gated (a documented limit).
+/// name and what its form holds. Pure; the browser wrapper gathers the inputs. Search boxes and
+/// everything that is not a button are not gated; a form with a password field sends no message
+/// or post (a login form's "Send code"), but a money label is gated whatever its form holds
+/// (R58: a checkout with an optional account password); an unrecognized label is not gated (a
+/// documented limit).
 pub fn browser_class(
     role: &str,
     name: &str,
@@ -1208,8 +1210,7 @@ pub fn browser_class(
 ) -> Option<Class> {
     let role = role.trim().to_lowercase();
     let name = name.to_lowercase();
-    if form_has_password || role == "searchbox" || name.contains("search") || name.contains("검색")
-    {
+    if role == "searchbox" || name.contains("search") || name.contains("검색") {
         return None;
     }
     let words: Vec<&str> = name
@@ -1236,6 +1237,9 @@ pub fn browser_class(
     if matches!(role.as_str(), "button" | "menuitem" | "") || key_enter_in_composer {
         if matches(BROWSER_MONEY) {
             return Some(Class::Money);
+        }
+        if form_has_password {
+            return None;
         }
         if matches(BROWSER_POSTS) || (form_has_textarea && words == ["submit"]) {
             return Some(Class::Posts);
@@ -2375,9 +2379,49 @@ mod tests {
         assert_eq!(browser_class("textbox", "검색", false, false, true), None);
         assert_eq!(browser_class("button", "Search", false, false, false), None);
         assert_eq!(browser_class("button", "Send", false, true, false), None);
+        assert_eq!(
+            browser_class("button", "Send code", false, true, false),
+            None
+        );
+        assert_eq!(
+            browser_class("button", "Send magic link", false, true, false),
+            None
+        );
+        assert_eq!(browser_class("button", "Post", false, true, false), None);
         assert_eq!(browser_class("button", "Submit", true, true, false), None);
         assert_eq!(
             browser_class("textbox", "Password", false, true, true),
+            None
+        );
+    }
+
+    /// R58: a password field in the form takes out only messages and posts (a login form's
+    /// "Send code"); a money label is gated whatever its form holds (a checkout with an
+    /// optional account password).
+    #[test]
+    fn a_money_label_is_gated_whatever_its_form_holds() {
+        for (role, name, textarea) in [
+            ("button", "Place order", false),
+            ("button", "Pay", true),
+            ("menuitem", "Buy now", false),
+            ("button", "결제하기", false),
+            ("", "Transfer", false),
+        ] {
+            assert_eq!(
+                browser_class(role, name, textarea, true, false),
+                Some(Class::Money),
+                "{role} {name}"
+            );
+        }
+        // The field Enter is pressed in is no button: its form's default button counts
+        // (`gate::browser_class`).
+        assert_eq!(
+            browser_class("textbox", "Coupon code", false, true, true),
+            None
+        );
+        // Search stays out, whatever the label.
+        assert_eq!(
+            browser_class("button", "Search orders", false, true, false),
             None
         );
     }

@@ -437,13 +437,14 @@ fn look(page: &Page, act: &Act) -> Option<Look> {
             };
             if pressable(&seen.role) {
                 // A button pressed by a key: what clicking it does, classed as a click on it is
-                // (N1): its form's flags kept, a plain `submit` looked up the same way; nothing
+                // (N1): its form's textarea kept and a plain `submit` looked up the same way, but
+                // never its form's password field, which a click never reads either (round 3:
+                // a checkout's optional account password must not make its Pay pass); nothing
                 // typed into it.
                 let pressed = Seen {
                     role: seen.role,
                     name: seen.name,
                     textarea: seen.textarea,
-                    password: seen.password,
                     ..Seen::default()
                 };
                 return Some(Look {
@@ -1467,12 +1468,13 @@ const doc = e.ownerDocument;
 if (e === doc.body || e === doc.documentElement) return JSON.stringify({ role: 'document', name: '' });
 const tag = e.tagName.toLowerCase();
 const type = (e.getAttribute('type') || '').toLowerCase();
-// M3: with no interactive role, a clickable element (R53's rule) is a button named by its text,
-// which Space or Enter presses as a click does.
-const own = roleOf(e);
-const role = !INTERACTIVE[own] && clickable(e) ? 'button' : own;
-const name = nameOf(e, !!BY_CONTENT[role]);
 const field = tag === 'textarea' || (tag === 'input' && (!(type in INPUTS) || type === 'search'));
+// M3: with no interactive role, a clickable element (R53's rule) is a button named by its text,
+// which Space or Enter presses as a click does; never a composer or a field (a role of its own
+// on an editable element leaves it one: Enter types there).
+const own = roleOf(e);
+const role = !INTERACTIVE[own] && !e.isContentEditable && !field && clickable(e) ? 'button' : own;
+const name = nameOf(e, !!BY_CONTENT[role]);
 // A password's value is never read: the vault's fill handles logins.
 const value = e.isContentEditable ? raw(e) : field && type !== 'password' ? (e.value || '') : '';
 const facts = formFacts(formOf(e));
@@ -2683,6 +2685,29 @@ cat "$d/$f.json"
         assert_eq!(t.run(&["press", "Enter"]), Next::Exec);
         assert_eq!(t.run(&["type", "@e1", "\n"]), Next::Exec);
         assert!(gate.try_recv().is_err());
+        // Round 3: a password field in its form leaves a pressed button classed as a click on
+        // it is (a click never reads its form's password field): a Pay in a checkout with an
+        // account password is a payment, a Send in a transfer form with a confirmation one a
+        // message.
+        for (name, class) in [("Pay", Class::Money), ("Send", Class::Messages)] {
+            t.focus(json!({"role": "button", "name": name, "password": true}));
+            let waiting = t.spawn(&["press", "Enter"]);
+            let (req, mut conn) = asked(&gate);
+            let b = &req["browser"];
+            assert_eq!(
+                (b["action"].as_str(), b["name"].as_str()),
+                (Some("click"), Some(name)),
+                "{req}"
+            );
+            assert_eq!(b["form_password"], false, "as a click on it: {req}");
+            assert_eq!(
+                gate::browser_class(&serde_json::from_value(b.clone()).unwrap()),
+                Some(class),
+                "{name}"
+            );
+            answer(&mut conn, json!({"verdict": "allow"}));
+            assert_eq!(waiting.join().unwrap(), Next::Exec, "{name}");
+        }
     }
 
     /// I3: Enter in a form's field submits it through its default button, which the wrapper
@@ -2743,6 +2768,24 @@ cat "$d/$f.json"
                        "submit": {"role": "button", "name": "Send code"}}),
         );
         assert_eq!(t.run(&["press", "Enter"]), Next::Exec);
+        // R58: a checkout with an optional account password still pays.
+        t.focus(
+            json!({"role": "textbox", "name": "Coupon code", "editable": true, "password": true,
+                   "submit": order}),
+        );
+        let waiting = t.spawn(&["press", "Enter"]);
+        let (req, mut conn) = asked(&gate);
+        let b = req["browser"].clone();
+        assert_eq!(
+            (b["form_password"].clone(), b["submit"].clone()),
+            (json!(true), order.clone())
+        );
+        assert_eq!(
+            gate::browser_class(&serde_json::from_value(b).unwrap()),
+            Some(Class::Money)
+        );
+        answer(&mut conn, json!({"verdict": "allow"}));
+        assert_eq!(waiting.join().unwrap(), Next::Exec);
         // Space or Enter on a focused button is a click on it.
         t.focus(json!({"role": "button", "name": "Send"}));
         for args in [
@@ -2962,6 +3005,10 @@ const cases = {
   pointer: el('span', { tabindex: '-1' }, { innerText: 'Send', pointer: true }),
   plain: el('div', { tabindex: '-1' }, { innerText: 'Send' }),
   button: el('button', {}, { innerText: 'Send' }),
+  // Round 3: a composer or a field with a role of its own stays what it is: Enter types there.
+  editable: el('div', { contenteditable: 'true', role: 'presentation', tabindex: '0' },
+    { isContentEditable: true, innerText: 'Send it now' }),
+  field: el('input', { role: 'presentation', onclick: 'go()' }, { value: 'hi' }),
 };
 for (const n of Object.values(cases)) { n.ownerDocument = document; n.parentElement = body; }
 const script = require('fs').readFileSync(process.argv[2], 'utf8');
@@ -2991,7 +3038,8 @@ console.log(JSON.stringify(out));
         assert_eq!(
             got,
             json!({"onclick": button, "handler": button, "tabstop": button,
-                   "pointer": button, "plain": ["generic", ""], "button": button}),
+                   "pointer": button, "plain": ["generic", ""], "button": button,
+                   "editable": ["presentation", ""], "field": ["presentation", ""]}),
         );
     }
 

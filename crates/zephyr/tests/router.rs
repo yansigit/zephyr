@@ -5299,11 +5299,22 @@ async fn an_approved_click_on_a_page_that_changed_is_recorded_as_not_run() {
     std::fs::write(home.join("ab-url.txt"), format!("{away}\n")).unwrap();
     gw.say("m2", "owner", "/ok 1").await;
     reply_where(&gw, "chat", |r| r.contains("approved #1")).await;
-    let reply = reply_where(&gw, "chat", |r| r.contains("the page changed")).await;
+    // What the agent reads: the exec's reply, with the wrapper's words.
+    let reply = reply_where(&gw, "chat", |r| {
+        r.contains("the page changed while the owner decided")
+    })
+    .await;
     assert!(reply.contains("exited 1"), "{reply}");
     assert!(clicks(&home).is_empty(), "{:?}", browser_argv(&home));
     wait(|| action_status(&home, 1) != "running").await;
     assert_eq!(action_status(&home, 1), "failed");
+    // ... and the owner, told at `/ok` that the browser goes on, is told it did not (round 3).
+    let told = reply_where(&gw, "chat", |r| r.contains("did not run")).await;
+    assert_eq!(
+        told,
+        "[zephyr] #1 (click \"Send\" on https://mail.example.com) did not run: the page \
+         changed while you decided"
+    );
     gw.shutdown().await;
 }
 

@@ -349,8 +349,12 @@ impl Call {
             return None;
         }
         let name = quoted_cut(&b.name, 80);
+        let key = matches!(b.action.as_str(), "press" | "keyboard");
         let summary = match b.action.as_str() {
             _ if typing => format!("typing on {origin}"),
+            _ if unread && name.is_empty() && key => {
+                format!("a key press the gate could not read on {origin}")
+            }
             _ if unread && name.is_empty() => {
                 format!("a click the gate could not read on {origin}")
             }
@@ -1059,7 +1063,7 @@ impl Conn {
                 let sent = write.write_all(format!("{answer}\n").as_bytes()).await;
                 if answer["verdict"] == "allow" {
                     let told = sent.is_ok();
-                    self.ended(id, told.then_some(read)).await;
+                    self.ended(id, told.then_some(read), wake).await;
                 }
                 return;
             }
@@ -1070,8 +1074,9 @@ impl Conn {
     /// M2: a browser action the owner let go ends as its wrapper says, once it read the page
     /// again (I4): `{"ran": true}` just before it runs the agent's command is `done`; `{"ran":
     /// false}` (the page changed), anything else, or the wrapper gone first (never told to go
-    /// on, or killed) is `failed`, as nothing ran; no word in [`REPORT_WAIT`] is `unknown`.
-    async fn ended(&self, id: i64, read: Option<OwnedReadHalf>) {
+    /// on, or killed) is `failed`, as nothing ran; no word in [`REPORT_WAIT`] is `unknown`. The
+    /// owner is told of any but a run ([`ending`]).
+    async fn ended(&self, id: i64, read: Option<OwnedReadHalf>, wake: &Wake) {
         let said = match read {
             Some(read) => {
                 let mut line = Vec::new();
@@ -1083,22 +1088,23 @@ impl Conn {
             }
             None => Some(None),
         };
-        let (status, result) = match said {
-            None => ("unknown", "the browser did not say whether it went on"),
-            Some(Some(v)) if v["ran"] == true => ("done", "the browser went on"),
-            Some(Some(v)) if v["ran"] == false => (
-                "failed",
-                "not run: the page changed while the owner decided",
-            ),
-            Some(_) => ("failed", "the browser did not go on"),
-        };
+        let (status, result, told) = ending(said);
         let store = self.store.clone();
         let recorded = tokio::task::spawn_blocking(move || {
             let store = store.lock().unwrap_or_else(|e| e.into_inner());
-            store.finish_action(id, status, result)
+            // Told only of a row this ended, on the action's channel, as its other outcomes.
+            if store.finish_action(id, status, result)? {
+                if let (Some(tail), Some(a)) = (told, store.action(id)?) {
+                    let text = format!("[zephyr] #{id} ({}){tail}", a.summary);
+                    crate::actions::tell(&store, &a, &text);
+                    return Ok(true);
+                }
+            }
+            Ok::<_, rusqlite::Error>(false)
         });
         match recorded.await {
-            Ok(Ok(_)) => {}
+            Ok(Ok(true)) => wake.outbox.notify_one(),
+            Ok(Ok(false)) => {}
             Ok(Err(e)) => eprintln!("zephyr: recording how #{id} ended failed: {e}"),
             Err(e) => eprintln!("zephyr: recording how #{id} ended failed: {e}"),
         }
@@ -1195,6 +1201,31 @@ impl Conn {
                 serde_json::json!({ "verdict": "deny", "id": id, "text": text })
             }
         })
+    }
+}
+
+/// How a browser action the owner let go ended, from what its wrapper said (`None`: nothing in
+/// [`REPORT_WAIT`]; `Some(None)`: gone, or nothing it could read): its status, the record's
+/// words, and, when it did not run (or may not have), what the owner is told after
+/// `[zephyr] #N (summary)`: at `/ok` they read that the browser goes on (round 3).
+fn ending(said: Option<Option<Value>>) -> (&'static str, &'static str, Option<&'static str>) {
+    match said {
+        None => (
+            "unknown",
+            "the browser did not say whether it went on",
+            Some(": zephyr could not tell whether it ran"),
+        ),
+        Some(Some(v)) if v["ran"] == true => ("done", "the browser went on", None),
+        Some(Some(v)) if v["ran"] == false => (
+            "failed",
+            "not run: the page changed while the owner decided",
+            Some(" did not run: the page changed while you decided"),
+        ),
+        Some(_) => (
+            "failed",
+            "the browser did not go on",
+            Some(" did not run: the browser did not go on"),
+        ),
     }
 }
 
@@ -1350,11 +1381,15 @@ fn what(class: Option<Class>, kind: ActionKind, browser: Option<&Browser>) -> St
         Some(Class::Money) => "payment",
         None => {
             let typing = browser.is_some_and(|b| matches!(b.action.as_str(), "fill" | "type"));
+            let key = browser.is_some_and(|b| matches!(b.action.as_str(), "press" | "keyboard"));
             let unread = browser.is_none_or(|b| b.role.trim().is_empty());
             return match kind {
                 ActionKind::Run => "outgoing command",
                 ActionKind::Pass => "connector call",
                 ActionKind::Wait if typing => "typing in the browser",
+                ActionKind::Wait if unread && key => {
+                    "a key press the gate could not read (browser)"
+                }
                 ActionKind::Wait if unread => "a click the gate could not read (browser)",
                 ActionKind::Wait => "click in the browser",
             }
@@ -2647,9 +2682,22 @@ mod tests {
             )),
             "{card}"
         );
-        for action in ["press", "keyboard", "find"] {
-            let v = blind(action, &format!("unread:{action}"));
-            assert!(matches!(v, Verdict::Wait { .. }), "{action}: {v:?}");
+        // A key press on a control the gate could not read says so (R57's blind keys too).
+        for (kind, what) in [
+            ("press", "a key press"),
+            ("keyboard", "a key press"),
+            ("find", "a click"),
+        ] {
+            let v = blind(kind, &format!("unread:{kind}"));
+            let Verdict::Wait { id } = v else {
+                panic!("{kind}: {v:?}")
+            };
+            let summary = format!("{what} the gate could not read on https://shop.example.com");
+            assert_eq!(action(&h.store, id).summary, summary, "{kind}");
+            let card = notices(&h.store).pop().unwrap();
+            let head =
+                format!("[zephyr] approve #{id}: {what} the gate could not read (browser)\n");
+            assert!(card.starts_with(&head), "{kind}: {card}");
         }
         // A control the gate reads and knows is no send still goes (an unknown label: §4.4).
         let mut link = click("Home", "https://shop.example.com", "unread:2");
@@ -2757,10 +2805,25 @@ mod tests {
             "a button that is no send leaves the message's class"
         );
         assert_eq!(
-            press(button("Place order"), true, "submit:3"),
+            press(button("Send code"), true, "submit:3"),
             Verdict::Allow,
             "a login form's button sends nothing"
         );
+        // R58: a payment button counts whatever its form holds (a checkout with an optional
+        // account password): Enter in a field of that form, and a click on it (which is also
+        // how the wrapper sends a key pressed on it).
+        let Verdict::Wait { id } = press(button("Place order"), true, "submit:5") else {
+            panic!("Enter in a checkout with a password field waits")
+        };
+        assert_eq!(action(&h.store, id).class, "money");
+        let mut req = click("Place order", "https://shop.example.com", "submit:6");
+        if let Some(b) = req.browser.as_mut() {
+            b.form_password = true;
+        }
+        let Verdict::Wait { id } = decide(&h.cfg, &h.store, &req, owner(), now) else {
+            panic!("a click on Place order in a form with a password field waits")
+        };
+        assert_eq!(action(&h.store, id).class, "money");
         let Verdict::Wait { id } = press(button("Place order"), false, "submit:4") else {
             panic!("the order waits")
         };
@@ -3073,20 +3136,30 @@ mod tests {
     }
 
     /// M2: a click the owner let go ends as its wrapper says once it read the page again (I4):
-    /// done when it runs, failed when the page changed or the wrapper went before saying.
+    /// done when it runs, failed when the page changed or the wrapper went before saying; and
+    /// the owner is told of any that did not run, on the action's channel (round 3).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_let_go_click_is_recorded_as_its_wrapper_says() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         let h = home("gate-ended", "");
         let (socket, waits) = serving(&h).await;
+        // A task's click: its cards and notices go to the channel that started it.
+        (h.store.add_task("g", None, None, "discord", "owner-1"))
+            .unwrap()
+            .unwrap();
         let ended = |id: i64| -> (String, String) {
             let db = rusqlite::Connection::open(h.cfg.db_path()).unwrap();
             let row = "SELECT status, coalesce(result, '') FROM proposals WHERE id = ?1";
             db.query_row(row, [id], |r| Ok((r.get(0)?, r.get(1)?)))
                 .unwrap()
         };
-        for (id, said, want) in [
-            (1, Some("{\"ran\": true}"), ("done", "the browser went on")),
+        for (id, said, want, told) in [
+            (
+                1,
+                Some("{\"ran\": true}"),
+                ("done", "the browser went on"),
+                None,
+            ),
             (
                 2,
                 Some("{\"ran\": false}"),
@@ -3094,10 +3167,16 @@ mod tests {
                     "failed",
                     "not run: the page changed while the owner decided",
                 ),
+                Some("did not run: the page changed while you decided"),
             ),
-            (3, None, ("failed", "the browser did not go on")),
+            (
+                3,
+                None,
+                ("failed", "the browser did not go on"),
+                Some("did not run: the browser did not go on"),
+            ),
         ] {
-            let req = json!({"v": 1, "session": "main", "tool": "browser",
+            let req = json!({"v": 1, "session": "task-1", "tool": "browser",
                 "args": {"argv": ["click", "@e3"]},
                 "browser": {"action": "click", "url": "https://mail.x/compose",
                             "origin": "https://mail.x",
@@ -3146,7 +3225,37 @@ mod tests {
             }
             let (status, result) = ended(id);
             assert_eq!((status.as_str(), result.as_str()), want, "#{id}");
+            let summary = format!("click \"Send {id}\" on https://mail.x");
+            let ran =
+                |n: &String| n.contains(&format!("#{id} ({summary})")) && !n.contains("approve");
+            let notice = || {
+                let all = h.store.pending_outbox().unwrap().into_iter();
+                all.filter(|o| o.channel == "discord")
+                    .map(|o| o.text)
+                    .find(|t| ran(t))
+            };
+            match told {
+                Some(tail) => {
+                    for _ in 0..200 {
+                        if notice().is_some() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    assert_eq!(notice(), Some(format!("[zephyr] #{id} ({summary}) {tail}")));
+                }
+                None => assert_eq!(notice(), None, "#{id} ran: nothing to tell"),
+            }
         }
+        // No word in time: whether it ran is unknown, and the owner is told so.
+        assert_eq!(
+            ending(None),
+            (
+                "unknown",
+                "the browser did not say whether it went on",
+                Some(": zephyr could not tell whether it ran")
+            )
+        );
         let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
     }
 

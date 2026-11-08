@@ -504,8 +504,9 @@ fn ask(cfg: &Config, store: &Store, actions: &[Action]) {
     }
 }
 
-/// A notice about `a` for the owner of the run that asked (else the owner last answered).
-fn tell(store: &Store, a: &Action, text: &str) {
+/// A notice about `a` for the owner of the run that asked (else the owner last answered). The
+/// gate socket tells this way of a browser action the owner let go that did not run.
+pub(crate) fn tell(store: &Store, a: &Action, text: &str) {
     let told = match a.origin.channel.is_empty() {
         true => store.notify_last_owner(text),
         false => store.notify(&a.origin.channel, &a.origin.sender, text),
