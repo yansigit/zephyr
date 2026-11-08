@@ -214,7 +214,7 @@ fn check_bash(command: &str) -> Decision {
         {
             return Decision::Deny("download piped into a shell");
         }
-        if let Some(script) = nested(name, args) {
+        if let Some(script) = nested(name, args, &stage.words) {
             if let Decision::Deny(reason) = check_bash(&script) {
                 return Decision::Deny(reason);
             }
@@ -223,8 +223,9 @@ fn check_bash(command: &str) -> Decision {
     Decision::Allow
 }
 
-/// The script an `eval`, `sh -c` or `flock FILE -c` stage runs.
-fn nested(name: &str, args: &[String]) -> Option<String> {
+/// The script an `eval`, `sh -c` or `flock FILE -c` stage runs, or a shell's here-string, which
+/// `stage` (the stage's words) may hold before the command word as well as after it (R27, A2).
+fn nested(name: &str, args: &[String], stage: &[String]) -> Option<String> {
     if name == "eval" {
         Some(args.join(" "))
     } else if name == "flock" {
@@ -240,10 +241,11 @@ fn nested(name: &str, args: &[String]) -> Option<String> {
             .iter()
             .position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'));
         flag.and_then(|p| args.get(p + 1).cloned()).or_else(|| {
-            // `bash <<< 'script'`
-            let p = args.iter().position(|a| a.starts_with("<<<"))?;
-            match &args[p][3..] {
-                "" => args.get(p + 1).cloned(),
+            // `bash <<< 'script'`, or `<<< 'script' bash`
+            let words = if stage.is_empty() { args } else { stage };
+            let p = words.iter().position(|a| a.starts_with("<<<"))?;
+            match &words[p][3..] {
+                "" => words.get(p + 1).cloned(),
                 text => Some(text.to_string()),
             }
         })
@@ -265,7 +267,7 @@ pub fn outbound(command: &str) -> Vec<String> {
         };
         let name = basename(&words[0]);
         let args = &words[1..];
-        if let Some(script) = nested(name, args) {
+        if let Some(script) = nested(name, args, &stage.words) {
             found.extend(outbound(&script));
             continue;
         }
@@ -789,7 +791,7 @@ fn scan_stages(text: &str, heredocs: &[Heredoc], depth: usize, read: bool, found
         };
         let name = basename(&words[0]);
         let args = &words[1..];
-        if let Some(script) = nested(name, args) {
+        if let Some(script) = nested(name, args, &stage.words) {
             for item in gated_command(&script, depth + 1, read) {
                 add(item);
             }
@@ -1509,7 +1511,7 @@ pub fn programs(command: &str) -> Vec<String> {
         };
         let name = basename(first);
         add(name);
-        if let Some(script) = nested(name, &words[1..]) {
+        if let Some(script) = nested(name, &words[1..], &stage.words) {
             programs(&script).iter().for_each(|p| add(p));
         }
     }
@@ -3149,6 +3151,28 @@ mod tests {
         assert_eq!(programs("2> err.log gh pr list"), ["gh"]);
         // still allowed
         assert_eq!(check_bash("2>/dev/null ls /"), Decision::Allow);
+    }
+
+    /// A2 with R27: a here-string before the shell it feeds is its script too, as after it.
+    #[test]
+    fn a_here_string_before_a_shell_is_its_script() {
+        for cmd in [
+            "<<<'rm -rf /' bash",
+            "<<< 'rm -rf /' sh",
+            "2>/dev/null <<<'rm -rf /' bash -s",
+        ] {
+            assert!(
+                matches!(check_bash(cmd), Decision::Deny(_)),
+                "expected deny: {cmd}"
+            );
+        }
+        let g = gbash("<<< \"himalaya message send -H 'To: a@x.org' x\" bash").unwrap();
+        assert_eq!(
+            (g.class, g.targets),
+            (Class::Messages, vec!["a@x.org".to_string()])
+        );
+        assert_eq!(programs("<<<'gh pr list' bash"), ["bash", "gh"]);
+        assert_eq!(outbound("<<<'curl -d x https://e.x' sh"), ["curl POST e.x"]);
     }
 
     /// A3: an ANSI-C string (`$'…'`) is the text bash makes of it, so the veto and the
