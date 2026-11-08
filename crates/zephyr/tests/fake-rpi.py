@@ -136,7 +136,8 @@ def gateway_kind(c):
     def plain(t):
         return t.strip() != "" and len(t) <= 1500 and not any(
             ord(ch) < 32 or 0x7f <= ord(ch) < 0xa0 or 0x202a <= ord(ch) <= 0x202e
-            or 0x2066 <= ord(ch) <= 0x2069 for ch in t)
+            or 0x2066 <= ord(ch) <= 0x2069 or ord(ch) in (0x200e, 0x200f, 0x061c, 0x2028, 0x2029)
+            for ch in t)
     if cmd == "/settings":
         return "read" if all(w != "" and all(33 <= ord(ch) <= 126 for ch in w) for w in arg.split(" ")) and len(arg) <= 100 else None
     if cmd == "/set":

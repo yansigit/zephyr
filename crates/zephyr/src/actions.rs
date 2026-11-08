@@ -49,13 +49,12 @@ impl Waits {
         self.lock().remove(&id);
     }
 
-    /// `/stop`: denies every browser action waiting. Returns how many.
-    pub fn deny_all(&self) -> usize {
+    /// `/stop`: denies every browser action waiting. Returns the actions whose wrapper was told.
+    pub fn deny_all(&self) -> Vec<i64> {
         let all: Vec<_> = self.lock().drain().collect();
-        all.into_iter()
-            .map(|(_, tx)| tx.send(false).is_ok())
-            .filter(|sent| *sent)
-            .count()
+        (all.into_iter())
+            .filter_map(|(id, tx)| tx.send(false).is_ok().then_some(id))
+            .collect()
     }
 
     /// Denies each wait whose action no longer waits for the owner, whatever ended it (`/no`
@@ -128,7 +127,12 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
             crate::store::MAX_RUNNING_PROCS
         ));
     }
-    let Some(a) = store.take_action(id, "running").map_err(failed)? else {
+    // R62: the owner's own `/ok` marks it approved, so it no longer counts toward the day.
+    let taken = match by {
+        By::Owner { .. } => store.take_approved(id),
+        By::Delay => store.take_action(id, "running"),
+    };
+    let Some(a) = taken.map_err(failed)? else {
         return Err(not_waiting(id));
     };
     let decision = match (by, once) {
@@ -442,10 +446,28 @@ pub fn tick(ctx: &Ctx, now: i64, held: bool) {
     ctx.waits.deny_settled(store);
 }
 
-/// Delayed action `a` came due: it goes, and its owner is told how it ended. With every process
-/// slot taken it waits for the owner instead, who is told so.
+/// Delayed action `a` came due: it goes, and its owner is told how it ended. R63: when the facts
+/// or its class's mode would hold it now (the owner turned approvals on, or saved a fact it
+/// holds), it waits for the owner again, who is told why and shown its card. With every process
+/// slot taken it waits for the owner too, who is told so.
 fn due_now(ctx: &Ctx, a: &Action, now: i64) {
     let store = ctx.store;
+    if let Some(why) = crate::gate::due_check(ctx.cfg, store, a) {
+        match store.unschedule(a.id) {
+            Ok(true) => {
+                let (n, s) = (a.id, &a.summary);
+                let text =
+                    format!("[zephyr] #{n} ({s}) came due, but {why}, so it waits for you again");
+                tell(store, a, &text);
+                let mut again = a.clone();
+                again.status = "pending".into();
+                tell(store, a, &crate::gate::card(&again, ctx.cfg, store));
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("zephyr: holding delayed #{} failed: {e}", a.id),
+        }
+        return;
+    }
     let full = a.kind == ActionKind::Run && !store.proc_slot_free().unwrap_or(false);
     if full {
         match store.unschedule(a.id) {
@@ -483,22 +505,51 @@ pub fn resume(cfg: &Config, store: &Store, now: i64) {
     ask_again(cfg, store, now);
 }
 
-/// `/stop` (R47): every delay waits for the owner again, so nothing set to go by itself goes
-/// after the owner said stop; every browser action waiting is denied. Held actions stay held.
+/// `/stop` (R47): every browser action waiting is denied, and settled as `dropped` (D10), so no
+/// card is left that can only fail; then every other delay waits for the owner again, so nothing
+/// set to go by itself goes after the owner said stop. Held actions stay held.
 pub fn stop(cfg: &Config, store: &Store, waits: &Waits) {
+    for id in waits.deny_all() {
+        match store.end_action(
+            id,
+            "dropped",
+            "the owner's /stop denied the waiting browser",
+        ) {
+            Ok(Some(a)) => audit(store, &a, "stopped"),
+            Ok(None) => {}
+            Err(e) => eprintln!("zephyr: settling #{id} at /stop failed: {e}"),
+        }
+    }
     ask_again(cfg, store, i64::MAX);
-    waits.deny_all();
 }
 
-/// At start (spec §4.9), after `procs` adopted what a re-exec handed over: a delay that came due
-/// while the daemon was down waits for the owner again, who is shown its card once more, and an
-/// action that was running is `unknown` unless its command is still running.
+/// At start (spec §4.9), after `procs` adopted what a re-exec handed over: a browser action
+/// still waiting ended with the daemon that held its wrapper's connection (D10), so it is
+/// `failed` and its owner told; a delay that came due while the daemon was down waits for the
+/// owner again, who is shown its card once more; and an action that was running is `unknown`
+/// unless its command is still running.
 pub fn restore(cfg: &Config, store: &Store, now: i64) {
+    match store.end_waits(now) {
+        Ok(ended) => {
+            for a in ended {
+                audit(store, &a, "failed");
+                let text = format!(
+                    "[zephyr] #{} ({}) did not run: {RESTARTED}",
+                    a.id, a.summary
+                );
+                tell(store, &a, &text);
+            }
+        }
+        Err(e) => eprintln!("zephyr: ending the browser waits failed: {e}"),
+    }
     match store.restore_actions(now) {
         Ok(back) => ask(cfg, store, &back),
         Err(e) => eprintln!("zephyr: restoring held actions failed: {e}"),
     }
 }
+
+/// Why a browser action waiting at start did not run.
+const RESTARTED: &str = "zephyr restarted while the browser waited";
 
 /// Shows each action's card to whoever it waits for.
 fn ask(cfg: &Config, store: &Store, actions: &[Action]) {
@@ -533,6 +584,15 @@ mod tests {
         (Arc::new(cfg), store)
     }
 
+    /// `cfg`'s home with other settings, as a reload makes it.
+    fn again(cfg: &Config, extra: &str) -> Arc<Config> {
+        let text = format!(
+            "rpi = '/r'\nhome = {:?}\ntimezone = 'UTC'\n{extra}",
+            cfg.home
+        );
+        Arc::new(toml::from_str(&text).unwrap())
+    }
+
     /// A message held from main on `chat`, as the gate stores one.
     fn hold(
         store: &Store,
@@ -541,7 +601,7 @@ mod tests {
         secrets: &[&str],
         due: Option<i64>,
     ) -> i64 {
-        store
+        let id = store
             .hold_action(&NewAction {
                 kind,
                 class: "messages".into(),
@@ -559,8 +619,24 @@ mod tests {
                 },
                 due_at: due,
             })
-            .unwrap()
+            .unwrap();
+        // A delay of 5 minutes, as the gate holds one, however soon it is due.
+        if let Some(due) = due {
+            store
+                .db_for_test()
+                .execute(
+                    "UPDATE proposals SET created_at = ?2 WHERE id = ?1",
+                    rusqlite::params![id, due - 300],
+                )
+                .unwrap();
+        }
+        id
     }
+
+    /// A browser click on Send waiting in place, as the wrapper asks for one.
+    const CLICK: &str = r#"{"args": {"argv": ["click", "@e3"]}, "browser": {"action": "click",
+        "url": "https://mail.example.com/c", "origin": "https://mail.example.com",
+        "role": "button", "name": "Send"}}"#;
 
     fn told(store: &Store) -> Vec<String> {
         (store.pending_outbox().unwrap().into_iter())
@@ -618,7 +694,7 @@ mod tests {
     /// R45: whoever set a delay in motion is told how it ended: gone, or not started and why.
     #[tokio::test]
     async fn the_owner_is_told_how_a_delay_ended() {
-        let (cfg, store) = setup("actions-delay-told", "");
+        let (cfg, store) = setup("actions-delay-told", "[approvals]\nmessages = 'delay 5'\n");
         let (procs, waits, steers) = (Procs::default(), Waits::default(), Steers::default());
         let ctx = Ctx {
             cfg: &cfg,
@@ -630,7 +706,7 @@ mod tests {
         let now = crate::now();
         let pass = r#"{"server": "mail", "tool": "send", "arguments": {"to": "a@x.org"}}"#;
         let p = hold(&store, ActionKind::Pass, pass, &[], Some(now - 1));
-        let w = hold(&store, ActionKind::Wait, "{}", &[], Some(now - 1));
+        let w = hold(&store, ActionKind::Wait, CLICK, &[], Some(now - 1));
         tick(&ctx, now, false);
         let status = |id| store.action(id).unwrap().unwrap().status;
         assert_eq!((status(p).as_str(), status(w).as_str()), ("done", "failed"));
@@ -721,6 +797,253 @@ mod tests {
         assert!(row(id).is_some_and(|t| t.contains("make exactly that connector call")));
     }
 
+    /// R63: a delay re-checks the facts and the class's mode when it comes due: stricter now, it
+    /// waits for the owner again, with its card; the same or looser, it goes.
+    #[test]
+    fn a_delay_comes_due_as_the_owner_has_it_now() {
+        let (held_cfg, store) = setup(
+            "actions-due-recheck",
+            "[approvals]\nposts = 'delay 5'\nmessages = 'delay 5'\n",
+        );
+        let now = crate::now();
+        let owner = ("chat".to_string(), "o".to_string());
+        let hold = |tool: &str, arguments: Value, run: &str| {
+            let req = crate::gate::Request {
+                session: "task-3".into(),
+                call_id: None,
+                tool: "mcp_call".into(),
+                args: serde_json::json!({"server": "mail", "tool": tool, "arguments": arguments}),
+                browser: None,
+                run: run.into(),
+                reason: None,
+            };
+            match crate::gate::decide(&held_cfg, &store, &req, owner.clone(), now) {
+                crate::gate::Verdict::Hold { id, .. } => id,
+                v => panic!("{v:?}"),
+            }
+        };
+        let post = hold("create_issue", serde_json::json!({"to": "o/r"}), "due:1");
+        let fact = hold(
+            "send_email",
+            serde_json::json!({"to": "a@x.org", "body": "call 555 010 2345"}),
+            "due:2",
+        );
+        let same = hold("send_email", serde_json::json!({"to": "b@x.org"}), "due:3");
+        let status = |id| store.action(id).unwrap().unwrap().status;
+        assert_eq!(status(post), "scheduled");
+        for o in store.pending_outbox().unwrap() {
+            store.set_outbox_status(o.id, "sent").unwrap();
+        }
+        // The owner made posts `ask` and saved a fact the payload holds since.
+        let now_cfg = again(
+            &held_cfg,
+            "[approvals]\nposts = 'ask'\nmessages = 'delay 5'\n",
+        );
+        std::fs::write(
+            crate::facts::path(&now_cfg),
+            "[[fact]]\nname = \"phone\"\nkind = \"digits\"\nvalue = \"5550102345\"\n",
+        )
+        .unwrap();
+        let (procs, waits, steers) = (Procs::default(), Waits::default(), Steers::default());
+        let ctx = Ctx {
+            cfg: &now_cfg,
+            store: &store,
+            procs: &procs,
+            waits: &waits,
+            steers: &steers,
+        };
+        tick(&ctx, now + 301, false);
+        assert_eq!(
+            (
+                status(post).as_str(),
+                status(fact).as_str(),
+                status(same).as_str()
+            ),
+            ("pending", "pending", "done")
+        );
+        let told = told(&store);
+        let summary = |id| store.action(id).unwrap().unwrap().summary;
+        assert!(
+            told.contains(&format!(
+                "[zephyr] #{post} ({}) came due, but approvals.posts is now ask, so it waits \
+                 for you again",
+                summary(post)
+            )),
+            "{told:#?}"
+        );
+        assert!(
+            told.contains(&format!(
+                "[zephyr] #{fact} ({}) came due, but it contains your private fact phone, so \
+                 it waits for you again",
+                summary(fact)
+            )),
+            "{told:#?}"
+        );
+        for id in [post, fact] {
+            let card = told
+                .iter()
+                .find(|t| t.starts_with(&format!("[zephyr] approve #{id}:")));
+            let card = card.unwrap_or_else(|| panic!("no card for #{id}: {told:#?}"));
+            assert!(
+                card.ends_with(&format!("/no {id} · expires in 24 h")),
+                "{card}"
+            );
+        }
+        assert!(
+            told.iter()
+                .any(|t| t.starts_with(&format!("[zephyr] #{same} ("))
+                    && t.contains("went at the end of its delay")),
+            "{told:#?}"
+        );
+        assert!(!told
+            .iter()
+            .any(|t| t.contains("5550102345") || t.contains("010 2345")));
+    }
+
+    /// R63 under `ask-new` and a longer delay: a known recipient goes, a new one asks, and a
+    /// delay made longer since asks too.
+    #[test]
+    fn a_delay_due_under_ask_new_goes_only_to_known_recipients() {
+        let (held_cfg, store) = setup("actions-due-ask-new", "[approvals]\nmessages = 'delay 5'\n");
+        let now = crate::now();
+        let hold = |to: &str, run: &str| {
+            let req = crate::gate::Request {
+                session: "task-3".into(),
+                call_id: None,
+                tool: "mcp_call".into(),
+                args: serde_json::json!({"server": "mail", "tool": "send_email",
+                                         "arguments": {"to": to}}),
+                browser: None,
+                run: run.into(),
+                reason: None,
+            };
+            let origin = ("chat".to_string(), "o".to_string());
+            match crate::gate::decide(&held_cfg, &store, &req, origin, now) {
+                crate::gate::Verdict::Hold { id, .. } => id,
+                v => panic!("{v:?}"),
+            }
+        };
+        let (known, new) = (hold("c@x.org", "an:1"), hold("d@x.org", "an:2"));
+        let longer = hold("e@x.org", "an:3");
+        store
+            .remember_targets("messages", &["mail/send_email".into(), "c@x.org".into()])
+            .unwrap();
+        let ask_new = again(&held_cfg, "[approvals]\nmessages = 'ask-new'\n");
+        let (procs, waits, steers) = (Procs::default(), Waits::default(), Steers::default());
+        let ctx = |cfg| Ctx {
+            cfg,
+            store: &store,
+            procs: &procs,
+            waits: &waits,
+            steers: &steers,
+        };
+        // Only the first two are due by now + 301 if the third is pushed back: tick them alone.
+        let db = rusqlite::Connection::open(ask_new.db_path()).unwrap();
+        db.execute(
+            "UPDATE proposals SET due_at = due_at + 3600 WHERE id = ?1",
+            [longer],
+        )
+        .unwrap();
+        tick(&ctx(&ask_new), now + 301, false);
+        let status = |id| store.action(id).unwrap().unwrap().status;
+        assert_eq!(
+            (status(known).as_str(), status(new).as_str()),
+            ("done", "pending")
+        );
+        let delay30 = again(&held_cfg, "[approvals]\nmessages = 'delay 30'\n");
+        db.execute(
+            "UPDATE proposals SET due_at = due_at - 3600 WHERE id = ?1",
+            [longer],
+        )
+        .unwrap();
+        tick(&ctx(&delay30), now + 301, false);
+        assert_eq!(status(longer), "pending");
+        let told = told(&store);
+        assert!(
+            told.iter().any(|t| {
+                t.starts_with(&format!("[zephyr] #{longer} (")) && t.contains(
+                "came due, but approvals.messages is now delay 30, so it waits for you again"
+            )
+            }),
+            "{told:#?}"
+        );
+    }
+
+    /// D10: a restart ends every browser action still waiting (its wrapper saw the socket close),
+    /// and `/stop` settles each one it denied, so no card is left that can only fail.
+    #[test]
+    fn waits_a_restart_or_a_stop_ended_are_settled() {
+        let (cfg, store) = setup("actions-waits-restart", "");
+        let now = crate::now();
+        let pending = hold(&store, ActionKind::Wait, "{}", &[], None);
+        let scheduled = hold(&store, ActionKind::Wait, "{}", &[], Some(now + 300));
+        let run = hold(&store, ActionKind::Run, SEND, &[], None);
+        restore(&cfg, &store, now);
+        let status = |id| store.action(id).unwrap().unwrap().status;
+        assert_eq!(
+            (
+                status(pending).as_str(),
+                status(scheduled).as_str(),
+                status(run).as_str()
+            ),
+            ("failed", "failed", "pending")
+        );
+        let told = told(&store);
+        for id in [pending, scheduled] {
+            assert!(
+                told.contains(&format!(
+                    "[zephyr] #{id} (email to a@x.org) did not run: zephyr restarted while the \
+                     browser waited"
+                )),
+                "{told:#?}"
+            );
+        }
+        assert!(!told
+            .iter()
+            .any(|t| t.starts_with(&format!("[zephyr] approve #{scheduled}"))));
+        // `/stop`: the waiting wrapper is denied, and its action is settled with it.
+        let waits = Waits::default();
+        let stopped = hold(&store, ActionKind::Wait, "{}", &[], None);
+        let mut rx = waits.add(stopped);
+        let delayed = hold(&store, ActionKind::Wait, "{}", &[], Some(now + 300));
+        let mut rx2 = waits.add(delayed);
+        stop(&cfg, &store, &waits);
+        assert_eq!(rx.try_recv(), Ok(false));
+        assert_eq!(rx2.try_recv(), Ok(false));
+        assert_eq!(
+            (status(stopped).as_str(), status(delayed).as_str()),
+            ("dropped", "dropped")
+        );
+        let told = super::tests::told(&store);
+        assert!(!told
+            .iter()
+            .any(|t| t.starts_with(&format!("[zephyr] approve #{delayed}"))));
+    }
+
+    /// R62: a delay that went by itself still counts toward the day; the owner's `/ok` does not.
+    #[test]
+    fn only_the_owners_ok_takes_an_action_off_the_day() {
+        let (cfg, store) = setup("actions-day", "[approvals]\nmessages = 'delay 5'\n");
+        let (procs, waits, steers) = (Procs::default(), Waits::default(), Steers::default());
+        let ctx = Ctx {
+            cfg: &cfg,
+            store: &store,
+            procs: &procs,
+            waits: &waits,
+            steers: &steers,
+        };
+        let now = crate::now();
+        let pass = r#"{"server": "mail", "tool": "send", "arguments": {"to": "a@x.org"}}"#;
+        let delayed = hold(&store, ActionKind::Pass, pass, &[], Some(now - 1));
+        let asked = hold(&store, ActionKind::Pass, pass, &[], None);
+        assert_eq!(store.held_today(now).unwrap(), 2);
+        tick(&ctx, now, false);
+        assert_eq!(store.action(delayed).unwrap().unwrap().status, "done");
+        assert_eq!(store.held_today(now).unwrap(), 2);
+        approve(&ctx, asked, false, By::Owner { channel: "chat" }, now).unwrap();
+        assert_eq!(store.held_today(now).unwrap(), 1);
+    }
+
     #[tokio::test]
     async fn a_wait_is_answered_once_and_denied_when_its_action_ends() {
         let store = Store::open(&crate::test_dir("actions-waits").join("state.db")).unwrap();
@@ -734,6 +1057,6 @@ mod tests {
         waits.deny_settled(&store);
         assert_eq!(rx.await, Ok(false));
         let _rx = waits.add(9);
-        assert_eq!(waits.deny_all(), 1);
+        assert_eq!(waits.deny_all(), [9]);
     }
 }

@@ -4376,6 +4376,11 @@ const SEND_TO_A: &str =
 const HELD_UNREAD: &str = "held for the owner as #1 (email to unreadable recipients); don't \
                            retry it; carry on or end your turn";
 
+/// What the agent is told of the same send under `delay 1` (C4).
+const DELAYED_UNREAD: &str = "delayed as #1 (email to unreadable recipients): it goes by itself \
+                              in 1 min unless the owner cancels it with /cancel 1; don't retry \
+                              it; carry on or end your turn";
+
 /// Waits for a reply on `channel` that `f` accepts, and returns it. Replies a slow machine can
 /// reorder (a card, the run's reply, a report) are found by content, never by position.
 async fn reply_where(gw: &Gateway, channel: &str, f: impl Fn(&str) -> bool) -> String {
@@ -4421,12 +4426,15 @@ async fn to_main(home: &Path, id: i64) -> String {
     inbox_text(home, &format!("action-{id}")).expect("the row")
 }
 
-/// Makes held action `id` due now, as if its delay had passed.
+/// Makes held action `id` due now, as if its delay had passed: when it was held moves back as
+/// far, so the delay it was held for stays what it was (R63 reads it).
 fn make_due(home: &Path, id: i64) {
     let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
     let n = db
         .execute(
-            "UPDATE proposals SET due_at = unixepoch() - 1 WHERE id = ?1",
+            "UPDATE proposals SET created_at = created_at - (due_at - (unixepoch() - 1)),
+                                  due_at = unixepoch() - 1
+             WHERE id = ?1",
             [id],
         )
         .unwrap();
@@ -4582,7 +4590,7 @@ async fn a_delay_runs_on_the_tick_unless_cancelled() {
     let card = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] delayed #1:")).await;
     assert!(card.ends_with(" unless /cancel 1"), "{card}");
     reply_where(&gw, "chat", |r| {
-        r.contains(&format!("\nexec: {HELD_UNREAD}"))
+        r.contains(&format!("\nexec: {DELAYED_UNREAD}"))
     })
     .await;
     gw.say("m2", "owner", "/cancel 1").await;
@@ -4644,7 +4652,7 @@ async fn a_delay_due_while_down_comes_back_pending() {
     gw.say("m1", "owner", &mail_via("late.eml")).await;
     reply_where(&gw, "chat", |r| r.starts_with("[zephyr] delayed #1:")).await;
     reply_where(&gw, "chat", |r| {
-        r.contains(&format!("\nexec: {HELD_UNREAD}"))
+        r.contains(&format!("\nexec: {DELAYED_UNREAD}"))
     })
     .await;
     gw.shutdown().await;
@@ -4857,7 +4865,7 @@ async fn a_delay_due_while_paused_is_asked_again() {
     let gw = start(cfg);
     gw.say("m1", "owner", &mail_via("paused.eml")).await;
     reply_where(&gw, "chat", |r| {
-        r.contains(&format!("\nexec: {HELD_UNREAD}"))
+        r.contains(&format!("\nexec: {DELAYED_UNREAD}"))
     })
     .await;
     budget_pause(&home, true);
@@ -4889,7 +4897,7 @@ async fn resume_asks_again_before_a_delay_goes() {
     let gw = start(cfg);
     gw.say("m1", "owner", &mail_via("resumed.eml")).await;
     reply_where(&gw, "chat", |r| {
-        r.contains(&format!("\nexec: {HELD_UNREAD}"))
+        r.contains(&format!("\nexec: {DELAYED_UNREAD}"))
     })
     .await;
     gw.say("m2", "owner", "/pause").await;
@@ -5384,7 +5392,7 @@ async fn the_vaults_fill_runs_the_real_browser_by_its_path() {
 
 /// A `state.db` as 0.6 left it: v15, with one answered message from `owner` on `chat`.
 fn old_install(home: &Path) {
-    const V16: &str = "DROP TABLE known_targets; DROP TABLE passes; ALTER TABLE proposals DROP COLUMN kind; ALTER TABLE proposals DROP COLUMN class; ALTER TABLE proposals DROP COLUMN targets; ALTER TABLE proposals DROP COLUMN summary; ALTER TABLE proposals DROP COLUMN reason; ALTER TABLE proposals DROP COLUMN payload; ALTER TABLE proposals DROP COLUMN secrets; ALTER TABLE proposals DROP COLUMN origin; ALTER TABLE proposals DROP COLUMN due_at; ALTER TABLE proposals DROP COLUMN settled_at; ALTER TABLE proposals DROP COLUMN result; ALTER TABLE procs DROP COLUMN action;";
+    const V16: &str = "DROP TABLE known_targets; DROP TABLE passes; ALTER TABLE proposals DROP COLUMN kind; ALTER TABLE proposals DROP COLUMN class; ALTER TABLE proposals DROP COLUMN targets; ALTER TABLE proposals DROP COLUMN summary; ALTER TABLE proposals DROP COLUMN reason; ALTER TABLE proposals DROP COLUMN payload; ALTER TABLE proposals DROP COLUMN secrets; ALTER TABLE proposals DROP COLUMN origin; ALTER TABLE proposals DROP COLUMN due_at; ALTER TABLE proposals DROP COLUMN settled_at; ALTER TABLE proposals DROP COLUMN result; ALTER TABLE procs DROP COLUMN action; ALTER TABLE proposals DROP COLUMN approved;";
     let path = home.join("state.db");
     drop(Store::open(&path).unwrap());
     let db = rusqlite::Connection::open(&path).unwrap();

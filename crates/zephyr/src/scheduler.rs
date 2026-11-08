@@ -762,7 +762,17 @@ pub(crate) fn held_note(
     }
     let call = ev["toolCallId"].as_str()?;
     match store.held_for_call(session, call) {
-        Ok(held) => held.map(|(id, summary)| (id, crate::gate::held_text(id, &summary))),
+        // C4: a delayed one goes by itself, and the agent is told when.
+        Ok(held) => held.map(|(id, summary, due)| {
+            let text = match due {
+                Some(at) => {
+                    let minutes = crate::gate::minutes_until(at, crate::now());
+                    crate::gate::delayed_text(id, &summary, minutes)
+                }
+                None => crate::gate::held_text(id, &summary),
+            };
+            (id, text)
+        }),
         Err(e) => {
             eprintln!("zephyr: reading what the gate held failed: {e}");
             None
@@ -965,6 +975,48 @@ mod tests {
             text: text.into(),
         };
         command(store, &cfg(None), &m).expect("a /job command")
+    }
+
+    /// C4: a call the gate delayed is told that it goes by itself, and when; one held for the
+    /// owner, that it waits.
+    #[test]
+    fn a_held_calls_note_says_whether_it_goes_by_itself() {
+        use crate::store::{ActionKind, NewAction, Origin};
+        let store = Store::open(&crate::test_dir("sched-held-note").join("state.db")).unwrap();
+        let hold = |call: &str, due_at: Option<i64>| {
+            store
+                .hold_action(&NewAction {
+                    kind: ActionKind::Run,
+                    class: "posts".into(),
+                    targets: vec!["o/r".into()],
+                    summary: "gh pr create on o/r".into(),
+                    reason: None,
+                    payload: r#"{"command": "gh pr create -R o/r"}"#.into(),
+                    secrets: vec![],
+                    origin: Origin {
+                        session: "task-1".into(),
+                        run: "task-1".into(),
+                        call_id: Some(call.into()),
+                        ..Origin::default()
+                    },
+                    due_at,
+                })
+                .unwrap()
+        };
+        let later = hold("c1", Some(crate::now() + 290));
+        let asked = hold("c2", None);
+        let ended = |call: &str| serde_json::json!({"type": "tool_execution_end", "isError": true, "toolCallId": call});
+        assert_eq!(
+            held_note(&store, "task-1", &ended("c1")),
+            Some((
+                later,
+                crate::gate::delayed_text(later, "gh pr create on o/r", 5)
+            ))
+        );
+        assert_eq!(
+            held_note(&store, "task-1", &ended("c2")),
+            Some((asked, crate::gate::held_text(asked, "gh pr create on o/r")))
+        );
     }
 
     #[test]

@@ -453,9 +453,12 @@ pub fn gated(
             // naming no one goes to someone the gate cannot read, so `ask-new` never lets it by.
             let mut targets = vec![label.clone()];
             if class != Class::Money {
-                match connector_recipients(arguments) {
-                    named if named.is_empty() => targets.push(UNKNOWN.to_string()),
-                    named => targets.extend(named.into_iter().filter(|t| *t != label)),
+                // B3: the tool's own name is no recipient; with nothing else, `unknown`.
+                let named = connector_recipients(arguments);
+                let named: Vec<String> = named.into_iter().filter(|t| *t != label).collect();
+                match named.is_empty() {
+                    true => targets.push(UNKNOWN.to_string()),
+                    false => targets.extend(named),
                 }
             }
             Some(Gated {
@@ -470,10 +473,13 @@ pub fn gated(
     }
 }
 
-/// The recipients a connector message or post names in its arguments (R37): the string and
-/// number values of recipient-like keys, however the key is spelled (`channelId` is
-/// `channel_id`), lists flattened, in this order of keys. Normalized as mail recipients are:
-/// lower case, and the addresses taken out of `Name <a@x.org>` and comma-separated lists.
+/// The recipients a connector message or post names in its arguments (R37): the values of
+/// recipient-like keys at any depth, however the key is spelled (`channelId` is `channel_id`),
+/// in this order of keys. Normalized as mail recipients are: lower case, and the addresses taken
+/// out of `Name <a@x.org>` and comma-separated lists. B3: a recipient given as an object counts
+/// by its address-like fields (an `id`, an `address`, a recipient key, an email anywhere in it),
+/// and one that names none, or a value that is no string, number, list or object (`true`,
+/// `null`), is [`UNKNOWN`], so `ask-new` never lets a send by on its one known recipient.
 fn connector_recipients(arguments: Option<&Value>) -> Vec<String> {
     const KEYS: &[&str] = &[
         "to",
@@ -492,39 +498,103 @@ fn connector_recipients(arguments: Option<&Value>) -> Vec<String> {
         "phone",
         "number",
     ];
-    fn add(v: &Value, out: &mut Vec<String>) {
-        let mut push = |t: String| {
-            if !t.is_empty() && !out.contains(&t) {
-                out.push(t);
-            }
-        };
+    /// What names a recipient given as an object, beside the keys above.
+    const IDS: &[&str] = &["id", "address", "email_address", "handle", "username"];
+    fn push(out: &mut Vec<String>, t: String) {
+        if !t.is_empty() && !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    fn emails(s: &str) -> Vec<String> {
+        (s.split(|c: char| c.is_whitespace() || ",;<>()\"'".contains(c)))
+            .filter(|t| t.contains('@') && !t.starts_with('@') && !t.ends_with('@'))
+            .map(String::from)
+            .collect()
+    }
+    fn string(s: &str, out: &mut Vec<String>) {
+        let s = s.trim().to_lowercase();
+        match emails(&s) {
+            found if found.is_empty() => push(out, s),
+            found => found.into_iter().for_each(|e| push(out, e)),
+        }
+    }
+    /// A recipient value.
+    fn value(v: &Value, out: &mut Vec<String>) {
         match v {
-            Value::String(s) => {
-                let s = s.trim().to_lowercase();
-                let emails: Vec<&str> = (s
-                    .split(|c: char| c.is_whitespace() || ",;<>()\"'".contains(c)))
-                .filter(|t| t.contains('@') && !t.starts_with('@') && !t.ends_with('@'))
-                .collect();
-                match emails.is_empty() {
-                    true => push(s.clone()),
-                    false => emails.into_iter().for_each(|e| push(e.to_string())),
+            Value::String(s) => string(s, out),
+            Value::Number(n) => push(out, n.to_string()),
+            Value::Array(items) => items.iter().for_each(|i| value(i, out)),
+            Value::Object(map) => {
+                if !object(map, out) {
+                    push(out, UNKNOWN.to_string());
                 }
             }
-            Value::Number(n) => push(n.to_string()),
-            Value::Array(items) => items.iter().for_each(|i| add(i, out)),
+            Value::Bool(_) | Value::Null => push(out, UNKNOWN.to_string()),
+        }
+    }
+    /// A recipient given as an object: whether it named anyone.
+    fn object(map: &serde_json::Map<String, Value>, out: &mut Vec<String>) -> bool {
+        let mut found = false;
+        for key in KEYS.iter().chain(IDS) {
+            for (k, v) in map {
+                if normalize_tool(k) == *key {
+                    value(v, out);
+                    found = true;
+                }
+            }
+        }
+        for (k, v) in map {
+            let k = normalize_tool(k);
+            if KEYS.contains(&k.as_str()) || IDS.contains(&k.as_str()) {
+                continue;
+            }
+            found |= inside(v, out);
+        }
+        found
+    }
+    /// The emails and recipient objects within a recipient's other fields.
+    fn inside(v: &Value, out: &mut Vec<String>) -> bool {
+        match v {
+            Value::String(s) if !emails(&s.to_lowercase()).is_empty() => {
+                string(s, out);
+                true
+            }
+            Value::Array(items) => {
+                // every item read, not only up to the first that names someone
+                let mut found = false;
+                for i in items {
+                    found |= inside(i, out);
+                }
+                found
+            }
+            Value::Object(map) => object(map, out),
+            _ => false,
+        }
+    }
+    /// The arguments: recipient keys at any depth.
+    fn walk(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::Object(map) => {
+                for key in KEYS {
+                    for (k, v) in map {
+                        if normalize_tool(k) == *key {
+                            value(v, out);
+                        }
+                    }
+                }
+                for (k, v) in map {
+                    if !KEYS.contains(&normalize_tool(k).as_str()) {
+                        walk(v, out);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|i| walk(i, out)),
             _ => {}
         }
     }
     let mut out = Vec::new();
-    let Some(Value::Object(map)) = arguments else {
-        return out;
-    };
-    for key in KEYS {
-        for (k, v) in map {
-            if normalize_tool(k) == *key {
-                add(v, &mut out);
-            }
-        }
+    if let Some(v @ Value::Object(_)) = arguments {
+        walk(v, &mut out);
     }
     out
 }
@@ -2493,6 +2563,13 @@ mod tests {
         );
         assert_eq!(
             targets("send_dm", json!({"recipients": [{"id": 1}], "phone": ""})),
+            ["slack/send_dm", "1"]
+        );
+        assert_eq!(
+            targets(
+                "send_dm",
+                json!({"recipients": [{"label": "x"}], "phone": ""})
+            ),
             ["slack/send_dm", UNKNOWN]
         );
         assert_eq!(
@@ -2514,6 +2591,67 @@ mod tests {
             &no_classes,
         );
         assert_eq!(pay.unwrap().targets, ["shop/checkout"]);
+    }
+
+    /// B3: every recipient a connector send names counts, however it is nested; one the gate
+    /// cannot read is `unknown`, so `ask-new` never lets a send by on its known first recipient.
+    #[test]
+    fn every_recipient_of_a_connector_send_is_read() {
+        let targets = |arguments: Value| {
+            gated(
+                "mcp_call",
+                &mcp("Mail", "send_email", arguments),
+                &no_classes,
+            )
+            .unwrap()
+            .targets
+        };
+        let table = [
+            (
+                json!({"to": "known@x.org", "cc": [{"email": "New@Y.org"}]}),
+                vec!["mail/send_email", "known@x.org", "new@y.org"],
+            ),
+            (
+                json!({"to": {"address": "A <a@x.org>", "name": "A"}}),
+                vec!["mail/send_email", "a@x.org"],
+            ),
+            (
+                json!({"to": [{"name": "Bob"}]}),
+                vec!["mail/send_email", UNKNOWN],
+            ),
+            (
+                json!({"to": "a@x.org", "cc": true}),
+                vec!["mail/send_email", "a@x.org", UNKNOWN],
+            ),
+            (
+                json!({"to": "a@x.org", "bcc": null}),
+                vec!["mail/send_email", "a@x.org", UNKNOWN],
+            ),
+            (
+                json!({"to": "a@x.org", "message": {"cc": "b@y.org"}}),
+                vec!["mail/send_email", "a@x.org", "b@y.org"],
+            ),
+            (
+                json!({"envelope": [{"recipients": [{"user": {"id": "U9"}}]}]}),
+                vec!["mail/send_email", "u9"],
+            ),
+            (
+                json!({"to": "a@x.org", "cc": {"list": [{"address": "c@z.org"}]}}),
+                vec!["mail/send_email", "a@x.org", "c@z.org"],
+            ),
+            (
+                json!({"to": "a@x.org", "cc": {"list": [{"label": "c"}], "n": 1}}),
+                vec!["mail/send_email", "a@x.org", UNKNOWN],
+            ),
+            // the tool's own name is no recipient: nothing is left, so `unknown`
+            (
+                json!({"to": "mail/send_email"}),
+                vec!["mail/send_email", UNKNOWN],
+            ),
+        ];
+        for (arguments, want) in table {
+            assert_eq!(targets(arguments.clone()), want, "{arguments}");
+        }
     }
 
     #[test]

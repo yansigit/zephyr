@@ -57,13 +57,21 @@ fn ascii_word(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_graphic())
 }
 
-/// Free text the owner reads on a card: one line, no control or direction-changing characters.
+/// A character that turns the direction of the text around it: the embeddings and overrides,
+/// the isolates, and (D1) the marks, U+200E, U+200F and U+061C. A card drops them.
+pub fn turns(c: char) -> bool {
+    matches!(c,
+        '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' | '\u{061c}')
+}
+
+/// Free text the owner reads on a card: one line, no control or direction-changing characters,
+/// and no line or paragraph separator (U+2028, U+2029), which `is_control` lets through (D1).
 fn plain_text(s: &str) -> bool {
     !s.trim().is_empty()
         && s.chars().count() <= CARD_CHARS
-        && !s.chars().any(|c| {
-            c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        })
+        && !s
+            .chars()
+            .any(|c| c.is_control() || turns(c) || matches!(c, '\u{2028}' | '\u{2029}'))
 }
 
 /// `/set KEY VALUE` or `/set KEY VALUE for D`, with a registry-shaped key, one printable word of
@@ -1229,6 +1237,24 @@ mod tests {
             gateway(&json!({ "command": "/model fake/m2" })).unwrap(),
             "/model fake/m2"
         );
+    }
+
+    /// D1: free text for a card takes no direction marks (U+200E, U+200F, U+061C) and no line
+    /// or paragraph separators (U+2028, U+2029), which `is_control` lets through.
+    #[test]
+    fn card_text_takes_no_marks_or_separators() {
+        for c in [
+            '\u{200e}', '\u{200f}', '\u{061c}', '\u{2028}', '\u{2029}', '\u{202e}',
+        ] {
+            for command in [
+                format!("/rule be{c}brief"),
+                format!("/subagent add helper You{c} help."),
+                format!("/facts add phone text 555{c}0102"),
+            ] {
+                assert_eq!(gateway_kind(&command), None, "{command:?}");
+            }
+        }
+        assert_eq!(gateway_kind("/rule be brief"), Some(Gateway::Propose));
     }
 
     #[test]

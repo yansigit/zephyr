@@ -293,12 +293,21 @@ is clicked and you are told). Under `ask-new`, `/ok 7` also remembers the new re
 a delayed one (`sending at 14:05 unless /cancel 7`) before it goes, and `/held` lists what waits.
 
 - An action nobody answers expires after 24 hours (a browser click after 10 minutes), and the
-  agent is told. The agent never retries a held action: it is told `held for the owner as #7`.
+  agent is told. The agent never retries a held action: it is told `held for the owner as #7`, or
+  for a delay `delayed as #7 … it goes by itself in 5 min unless the owner cancels it`.
 - Nothing goes late on its own: a delay that comes due while zephyr is paused, after `/stop`, or
-  while it is down waits for your `/ok` again, with its card sent once more. `/stop` also refuses
-  every browser click still waiting. Two `/ok` for the same action, from two channels, run it once.
-- At most 3 actions wait from one run and 20 in a day; past that, the agent's further ones that
-  would wait are refused, and you get one line about it.
+  while it is down waits for your `/ok` again, with its card sent once more. A delay also waits
+  for you again when it comes due under stricter approvals than it was held under (you typed
+  `/approvals on`, or saved a private fact it holds): you are told why and get its card. `/stop`
+  also refuses every browser click still waiting, and a restart ends the ones that were waiting.
+  Two `/ok` for the same action, from two channels, run it once.
+- At most 3 actions wait from one run, and at most 20 held in a day that you did not approve
+  with `/ok` (waiting, declined, expired, or delays that went by themselves); past either, the
+  agent's further ones that would wait are refused, and you get one line about it. Sends you
+  approve never count toward the day.
+- A command too long for the card is cut there, and the card says how much is not shown, that
+  `/ok` runs all of it, and everything the whole command sends. A command that gets vault tokens
+  names them on its card.
 - `[approvals] strong_only = ["loosen", "money"]` lets a payment be approved only from a strong
   channel. It is off by default, so you can approve a purchase from your phone. A payment set to
   `delay N` still goes when its delay ends.

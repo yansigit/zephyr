@@ -435,6 +435,20 @@ fn look(page: &Page, act: &Act) -> Option<Look> {
                     seen
                 }
             };
+            // B7: 0.41 focuses a target without checking that it took the focus, so a key typed
+            // into one that takes no text (and is no button a key presses) lands wherever the
+            // focus was: where the wrapper did not read, held as unread (R57).
+            let lands = |role: &str| editable(role) || pressable(role) || role.trim().is_empty();
+            if !matches!(target, Target::Focus) && !lands(&seen.role) {
+                let seen = Seen {
+                    typed: typed.clone(),
+                    ..Seen::default()
+                };
+                return Some(Look {
+                    action: "press",
+                    seen,
+                });
+            }
             if pressable(&seen.role) {
                 // A button pressed by a key: what clicking it does, classed as a click on it is
                 // (N1): its form's textarea kept and a plain `submit` looked up the same way, but
@@ -488,6 +502,14 @@ fn unchanged(page: &Page, act: &Act, url: &str, first: &Look, class: Option<Clas
 /// A role a key press activates as a click: Space or Enter on a focused button.
 fn pressable(role: &str) -> bool {
     matches!(role, "button" | "menuitem")
+}
+
+/// A role that takes typed text, and so the focus `type` gives it (B7).
+fn editable(role: &str) -> bool {
+    matches!(
+        role.trim().to_lowercase().as_str(),
+        "textbox" | "searchbox" | "combobox" | "contenteditable"
+    )
 }
 
 /// The gate's verdict on the request (spec §4.2): `allow` runs the command; `hold` and `deny`
@@ -2107,7 +2129,10 @@ cat "$d/$f.json"
                 "hold",
                 "held for the owner as #3 (click \"Send\" on https://mail.example.com)",
             ),
-            ("deny", "not run: 3 actions already wait for the owner"),
+            (
+                "deny",
+                "not run: 3 actions already wait for the owner in this run",
+            ),
         ] {
             let waiting = t.spawn(&["click", "@e3"]);
             let (_, mut conn) = asked(&gate);
@@ -2638,6 +2663,53 @@ cat "$d/$f.json"
         assert_eq!(waiting.join().unwrap(), Next::Exec);
         assert_eq!(t.run(&["keyboard", "type", "\t\t"]), Next::Exec);
         assert!(gate.try_recv().is_err());
+    }
+
+    /// B7: agent-browser 0.41 focuses a `type` target without checking that it took the focus,
+    /// so a line break typed into a control that cannot take text lands wherever the focus was:
+    /// the wrapper cannot read where, and holds it as unread (R57).
+    #[test]
+    fn a_line_break_typed_into_a_control_that_takes_no_text_is_blind() {
+        let t = T::new("bg-no-focus");
+        t.page(
+            MAIL,
+            &[
+                ("link", "Inbox"),
+                ("checkbox", "Remember me"),
+                ("textbox", "Message"),
+                ("combobox", "To"),
+            ],
+            "",
+        );
+        t.focus(json!({"role": "textbox", "name": "Message"}));
+        t.eval("forms", json!({"forms": []}));
+        let gate = t.gate();
+        for target in ["@e1", "@e2"] {
+            let waiting = t.spawn(&["type", target, "hi\n"]);
+            let (req, mut conn) = asked(&gate);
+            let b = &req["browser"];
+            assert_eq!(
+                (b["action"].as_str(), b["role"].as_str(), b["name"].as_str()),
+                (Some("press"), Some(""), Some("")),
+                "{target}: {req}"
+            );
+            assert_eq!(b["typed"], json!(["hi\n"]), "{target}");
+            answer(&mut conn, json!({"verdict": "hold", "text": "held"}));
+            assert_eq!(waiting.join().unwrap(), Next::Refuse("held".into()));
+        }
+        // A field that takes text is where the line break lands, as read.
+        for (target, role, name) in [("@e3", "textbox", "Message"), ("@e4", "combobox", "To")] {
+            let waiting = t.spawn(&["type", target, "hi\n"]);
+            let (req, mut conn) = asked(&gate);
+            let b = &req["browser"];
+            assert_eq!(
+                (b["role"].as_str(), b["name"].as_str()),
+                (Some(role), Some(name)),
+                "{target}: {req}"
+            );
+            answer(&mut conn, json!({"verdict": "allow"}));
+            assert_eq!(waiting.join().unwrap(), Next::Exec, "{target}");
+        }
     }
 
     /// N1: a button pressed by a key keeps its form's facts, as a click on it is classed: a

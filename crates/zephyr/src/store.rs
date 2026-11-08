@@ -520,6 +520,12 @@ pub struct Store {
 }
 
 impl Store {
+    /// The connection itself, for a test to set what no code path writes (an old timestamp).
+    #[cfg(test)]
+    pub(crate) fn db_for_test(&self) -> &Connection {
+        &self.db
+    }
+
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -765,6 +771,7 @@ impl Store {
                     expires_at INTEGER NOT NULL,
                     used INTEGER NOT NULL DEFAULT 0);
                  ALTER TABLE procs ADD COLUMN action INTEGER; -- the approved action it runs
+                 ALTER TABLE proposals ADD COLUMN approved INTEGER NOT NULL DEFAULT 0; -- by /ok
                  PRAGMA user_version = 16;",
             )?;
             // A db that had a version had rows: this is an upgrade, not a first start. The
@@ -1403,6 +1410,56 @@ impl Store {
             .optional()
     }
 
+    /// `take_action` to `running` for the owner's own `/ok`: marked approved, so it no longer
+    /// counts toward the day's holds (R62).
+    pub fn take_approved(&self, id: i64) -> rusqlite::Result<Option<Action>> {
+        self.db
+            .query_row(
+                &format!(
+                    "UPDATE proposals SET status = 'running', approved = 1, settled_at = unixepoch()
+                     WHERE id = ?1 AND kind != 'command' AND status IN ('pending', 'scheduled')
+                       AND created_at > unixepoch() - 86400
+                     RETURNING {ACTION_COLS}"
+                ),
+                params![id],
+                action_row,
+            )
+            .optional()
+    }
+
+    /// Ends waiting action `id` (`pending` or `scheduled`) as `status` with `result`, once.
+    pub fn end_action(
+        &self,
+        id: i64,
+        status: &str,
+        result: &str,
+    ) -> rusqlite::Result<Option<Action>> {
+        self.db
+            .query_row(
+                &format!(
+                    "UPDATE proposals SET status = ?2, result = ?3, settled_at = unixepoch()
+                     WHERE id = ?1 AND kind != 'command' AND status IN ('pending', 'scheduled')
+                     RETURNING {ACTION_COLS}"
+                ),
+                params![id, status, result],
+                action_row,
+            )
+            .optional()
+    }
+
+    /// At start (D10): every browser action still waiting is `failed`, as its wrapper's
+    /// connection ended with the daemon that held it. Returns them, so their owners are told.
+    pub fn end_waits(&self, now: i64) -> rusqlite::Result<Vec<Action>> {
+        let mut stmt = self.db.prepare(&format!(
+            "UPDATE proposals SET status = 'failed', settled_at = ?1,
+                    result = 'zephyr restarted while the browser waited'
+             WHERE kind = 'wait' AND status IN ('pending', 'scheduled')
+             RETURNING {ACTION_COLS}"
+        ))?;
+        let rows = stmt.query_map(params![now], action_row)?;
+        rows.collect()
+    }
+
     /// Records how a taken action ended (`done`, `failed`, ...) and its output, only for a row
     /// still `running` or `unknown`: a finished run never overwrites `dropped`, `cancelled` or
     /// `expired`. Returns whether a row changed.
@@ -1466,15 +1523,16 @@ impl Store {
         )
     }
 
-    /// The waiting action held for tool call `call_id` of `session`, with its summary.
+    /// The waiting action held for tool call `call_id` of `session`, with its summary and, for
+    /// one waiting out a delay, when it goes.
     pub fn held_for_call(
         &self,
         session: &str,
         call_id: &str,
-    ) -> rusqlite::Result<Option<(i64, String)>> {
+    ) -> rusqlite::Result<Option<(i64, String, Option<i64>)>> {
         self.db
             .query_row(
-                "SELECT id, summary FROM proposals
+                "SELECT id, summary, iif(status = 'scheduled', due_at, NULL) FROM proposals
                  WHERE kind != 'command' AND status IN ('pending', 'scheduled')
                    AND json_extract(origin, '$.session') = ?1
                    AND json_extract(origin, '$.call_id') = ?2
@@ -1484,6 +1542,7 @@ impl Store {
                     Ok((
                         r.get(0)?,
                         r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        r.get(2)?,
                     ))
                 },
             )
@@ -1501,10 +1560,12 @@ impl Store {
         )
     }
 
-    /// Actions held in the 24 h before `now`, whatever became of them.
+    /// Actions held in the 24 h before `now` that the owner did not approve with `/ok` (R62):
+    /// waiting, dropped, cancelled, expired, and delays that went by themselves.
     pub fn held_today(&self, now: i64) -> rusqlite::Result<u32> {
         self.db.query_row(
-            "SELECT count(*) FROM proposals WHERE kind != 'command' AND created_at > ?1 - 86400",
+            "SELECT count(*) FROM proposals
+             WHERE kind != 'command' AND created_at > ?1 - 86400 AND approved = 0",
             params![now],
             |r| r.get(0),
         )
@@ -2770,9 +2831,13 @@ mod tests {
         assert_eq!(p.len(), 2, "the delayed one waits too");
         assert_eq!((p[0].id, p[0].kind.as_str()), (d, "run"));
         assert_eq!((p[1].id, p[1].status.as_str()), (a, "pending"));
+        // The newest, with when it goes, as it waits out a delay.
         assert_eq!(
-            store.held_for_call("main", "call-1").unwrap().map(|h| h.0),
-            Some(d.max(a))
+            store
+                .held_for_call("main", "call-1")
+                .unwrap()
+                .map(|h| (h.0, h.2)),
+            Some((d, Some(i64::MAX)))
         );
         assert_eq!(store.held_for_call("main", "other").unwrap(), None);
     }
@@ -3021,7 +3086,7 @@ mod tests {
     fn older_databases_migrate_in_order_and_keep_their_rows() {
         // Each case undoes the steps after `version`, as a db made by that build would look:
         // v14's first, while the tables its indexes are on still exist.
-        const V16: &str = "DROP TABLE known_targets; DROP TABLE passes; ALTER TABLE proposals DROP COLUMN kind; ALTER TABLE proposals DROP COLUMN class; ALTER TABLE proposals DROP COLUMN targets; ALTER TABLE proposals DROP COLUMN summary; ALTER TABLE proposals DROP COLUMN reason; ALTER TABLE proposals DROP COLUMN payload; ALTER TABLE proposals DROP COLUMN secrets; ALTER TABLE proposals DROP COLUMN origin; ALTER TABLE proposals DROP COLUMN due_at; ALTER TABLE proposals DROP COLUMN settled_at; ALTER TABLE proposals DROP COLUMN result; ALTER TABLE procs DROP COLUMN action;";
+        const V16: &str = "DROP TABLE known_targets; DROP TABLE passes; ALTER TABLE proposals DROP COLUMN kind; ALTER TABLE proposals DROP COLUMN class; ALTER TABLE proposals DROP COLUMN targets; ALTER TABLE proposals DROP COLUMN summary; ALTER TABLE proposals DROP COLUMN reason; ALTER TABLE proposals DROP COLUMN payload; ALTER TABLE proposals DROP COLUMN secrets; ALTER TABLE proposals DROP COLUMN origin; ALTER TABLE proposals DROP COLUMN due_at; ALTER TABLE proposals DROP COLUMN settled_at; ALTER TABLE proposals DROP COLUMN result; ALTER TABLE procs DROP COLUMN action; ALTER TABLE proposals DROP COLUMN approved;";
         const V15: &str = "DROP TABLE settings_log; DROP TABLE setting_reverts; ALTER TABLE proposals DROP COLUMN key; ALTER TABLE proposals DROP COLUMN seen; ALTER TABLE proposals DROP COLUMN strong;";
         const V14: &str = "DROP TABLE audit; DROP INDEX inbox_status; DROP INDEX outbox_status; DROP INDEX tasks_status; DROP INDEX procs_status; DROP INDEX runs_job_due;";
         for (version, undo) in [

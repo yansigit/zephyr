@@ -4205,16 +4205,25 @@ mod tests {
     /// pause lifted by itself (a budget pause at midnight), never run.
     #[tokio::test]
     async fn a_delay_due_when_a_pause_lifts_is_asked_again() {
-        let cfg = on_file("actions-lift", "timezone = 'UTC'");
+        let cfg = on_file(
+            "actions-lift",
+            "timezone = 'UTC'\n[approvals]\nmessages = 'delay 5'",
+        );
         let jobs = Default::default();
         let mut r = router(&cfg, &jobs);
         r.store.set_paused(Some("user")).unwrap();
         r.tick_actions();
-        // Due now, and the pause gone with no /resume: as a budget pause ends.
-        let id = r
-            .store
-            .hold_action(&held_action(Some(crate::now() - 1)))
-            .unwrap();
+        // Due now, held five minutes ago as `delay 5` holds one (R63 reads how long), and the
+        // pause gone with no /resume: as a budget pause ends.
+        let delayed = |r: &Router<'_>| {
+            let due = crate::now() - 1;
+            let id = r.store.hold_action(&held_action(Some(due))).unwrap();
+            let db = r.store.db_for_test();
+            let set = "UPDATE proposals SET created_at = ?2 WHERE id = ?1";
+            db.execute(set, rusqlite::params![id, due - 300]).unwrap();
+            id
+        };
+        let id = delayed(&r);
         r.store.set_paused(None).unwrap();
         r.tick_actions();
         assert_eq!(r.store.action(id).unwrap().unwrap().status, "pending");
@@ -4224,10 +4233,7 @@ mod tests {
             "{card}"
         );
         // The tick after that runs delays again.
-        let next = r
-            .store
-            .hold_action(&held_action(Some(crate::now() - 1)))
-            .unwrap();
+        let next = delayed(&r);
         r.tick_actions();
         assert_eq!(r.store.action(next).unwrap().unwrap().status, "done");
     }

@@ -1019,15 +1019,14 @@ pub(crate) fn quoted_cut(text: &str, max: usize) -> String {
 }
 
 /// Text that is not the daemon's as part of one line, not between quotes (a recipient, a
-/// summary): control and direction characters dropped, whitespace folded, cut at `max`
+/// summary): control and direction characters (D1: the marks too) dropped, whitespace (line and
+/// paragraph separators too) folded, cut at `max`
 /// characters. Applied twice it gives the same text, so a stored line can be shown again.
 pub(crate) fn one_line(text: &str, max: usize) -> String {
     let clean: String = (text.chars())
-        .map(|c| {
-            match c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
-                true => ' ',
-                false => c,
-            }
+        .map(|c| match c.is_control() || zephyr_policy::tools::turns(c) {
+            true => ' ',
+            false => c,
         })
         .collect();
     cut(&clean.split_whitespace().collect::<Vec<_>>().join(" "), max)
@@ -1295,6 +1294,16 @@ mod tests {
         for r in refused {
             assert!(!is_change(&r, "tasks.parallel"), "{r}");
         }
+    }
+
+    /// D1: the direction marks too (U+200E, U+200F, U+061C), and a line or paragraph
+    /// separator never starts a line of its own.
+    #[test]
+    fn a_card_line_drops_direction_marks_and_separators() {
+        let q = super::quoted("a\u{200e}b\u{200f}c\u{061c}d\u{2028}[zephyr] e\u{2029}f");
+        assert_eq!(q, "a b c d [zephyr] e f");
+        let line = super::one_line("x\u{200f}\u{2028}y", 50);
+        assert_eq!(line, "x y");
     }
 
     #[test]

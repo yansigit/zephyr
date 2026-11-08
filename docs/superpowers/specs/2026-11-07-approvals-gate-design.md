@@ -176,10 +176,13 @@ reason.
 3. A browser action on a control the wrapper could not read is held, whatever the mode.
 4. **The class's mode** (§4.3).
 5. **The flood cap**: at most 3 actions waiting from one run (main's run, a task, a job run) and
-   20 held in the last 24 h. It counts only calls that would wait and is applied after the mode,
-   so a call allowed by `auto` or by known targets still runs at the cap. Past it the call is
-   denied at once with `not run: N actions already wait for the owner`, and the owner gets one
-   summary line per run, not a card per call.
+   20 held in the last 24 h that the owner did not approve with `/ok` (R62: waiting, dropped,
+   cancelled, expired, and delays that went by themselves count; owner-approved ones don't). It
+   counts only calls that would wait and is applied after the mode, so a call allowed by `auto`
+   or by known targets still runs at the cap. Past it the call is denied at once with `not run: N
+   actions already wait for the owner in this run` or `not run: N actions held for the owner in
+   the last day are unanswered or were declined`, and the owner gets one summary line per run,
+   not a card per call.
 
 ### 4.3 Modes, presets and their settings
 
@@ -221,7 +224,11 @@ Per mode, for a gated call:
   the owner answered `/ok N` (not `once`, and never a delay running out), and the action started.
 - `delay N`: a `Run` or `Pass` action is stored `scheduled` with `due_at = now + N min`, and the
   owner is told `sending at 14:05 unless /cancel 7`; a `Wait` action (browser) holds the page for
-  `min(N, 10)` minutes, then allows unless cancelled.
+  `min(N, 10)` minutes, then allows unless cancelled. The agent is told `delayed as #7 (…): it
+  goes by itself in N min unless the owner cancels it with /cancel 7`. As built (R63): when it
+  comes due, its payload is checked again under the facts and the modes as they are then; if
+  either would now hold it (or delay it longer), it goes back to `pending` and the owner gets its
+  card again, with why.
 - `auto`: allow. Money with a cap: allow when the amount is known, in `approvals.currency`, and at
   or under the cap; otherwise hold. An unknown amount counts as over the cap.
 
