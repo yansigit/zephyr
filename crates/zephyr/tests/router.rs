@@ -5275,7 +5275,35 @@ async fn a_browser_send_waits_until_ok_and_then_clicks() {
     let reply = reply_where(&gw, "chat", |r| r.contains("done: click @e3")).await;
     assert!(reply.contains("exited 0"), "{reply}");
     assert_eq!(clicks(&home), ["click @e3"]);
-    assert_eq!(action_status(&home, 1), "done");
+    // Recorded done once the wrapper said it runs (M2).
+    wait(|| action_status(&home, 1) == "done").await;
+    gw.shutdown().await;
+}
+
+/// M2: a click the owner approved that the wrapper then refuses, the page having changed while
+/// the owner decided (I4), is recorded as not run.
+#[tokio::test]
+async fn an_approved_click_on_a_page_that_changed_is_recorded_as_not_run() {
+    let (home, cfg) = browser_home("gate-browser-changed", COMPOSE_URL);
+    let gw = start(cfg);
+    gw.say("m1", "owner", &click_send(&home)).await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    // The page went to another site while the owner decided.
+    let ok = |data: Value| serde_json::json!({"success": true, "data": data}).to_string();
+    let away = "https://evil.example.org/x";
+    std::fs::write(
+        home.join("ab-url.json"),
+        ok(serde_json::json!({ "url": away })),
+    )
+    .unwrap();
+    std::fs::write(home.join("ab-url.txt"), format!("{away}\n")).unwrap();
+    gw.say("m2", "owner", "/ok 1").await;
+    reply_where(&gw, "chat", |r| r.contains("approved #1")).await;
+    let reply = reply_where(&gw, "chat", |r| r.contains("the page changed")).await;
+    assert!(reply.contains("exited 1"), "{reply}");
+    assert!(clicks(&home).is_empty(), "{:?}", browser_argv(&home));
+    wait(|| action_status(&home, 1) != "running").await;
+    assert_eq!(action_status(&home, 1), "failed");
     gw.shutdown().await;
 }
 

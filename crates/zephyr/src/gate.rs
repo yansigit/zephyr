@@ -870,6 +870,11 @@ const MAX_REQUEST: usize = 1 << 20;
 /// How long a hold waits for its note to be in the asking run's queue before the plugin is
 /// answered (R51), well inside the plugin's 5 s.
 const STEER_WAIT: Duration = Duration::from_secs(2);
+/// How long a wrapper the owner let go has to say whether it ran (M2): its reads of the page
+/// again (I4) take a few of its 20 s questions at most.
+const REPORT_WAIT: Duration = Duration::from_secs(180);
+/// The longest report read: `{"ran": true}`.
+const MAX_REPORT: u64 = 256;
 
 /// `<state>-public/gate.sock`: where the plugin and the browser wrapper ask about a send.
 pub fn socket_path(cfg: &Config) -> PathBuf {
@@ -913,7 +918,9 @@ struct Wire {
 /// Serves the gate socket until dropped: tasks' and jobs' sends, every connector call and the
 /// browser wrapper's clicks come here (spec §4.2 path 2, §4.4). Only the agent's uid is
 /// answered (`SO_PEERCRED`); each connection carries one request, sent within 10 s, and gets one
-/// answer, a `Wait` only once the owner (or the end of a delay) settles it. A held call's note
+/// answer, a `Wait` only once the owner (or the end of a delay) settles it; after a `Wait`'s
+/// `allow`, the wrapper's one line saying whether it ran is what records how it ended (M2,
+/// `Conn::ended`). A held call's note
 /// goes into the run that asked before the plugin hears `hold` (R51): a task's or job's through
 /// `wake.steers`, main's through `main` into the router. A gate that cannot start (no store, no
 /// socket) says so and serves nothing, R52: the plugin and the wrapper then refuse every call
@@ -1045,13 +1052,56 @@ impl Conn {
             (Verdict::Wait { id }, verdict) => {
                 let read = reader.into_inner();
                 let clean = read.buffer().is_empty();
-                match self.wait(id, verdict, read.into_inner(), clean).await {
-                    Some(answer) => answer,
-                    None => return, // nobody left to answer
+                let mut read = read.into_inner();
+                let Some(answer) = self.wait(id, verdict, &mut read, clean).await else {
+                    return; // nobody left to answer
+                };
+                let sent = write.write_all(format!("{answer}\n").as_bytes()).await;
+                if answer["verdict"] == "allow" {
+                    let told = sent.is_ok();
+                    self.ended(id, told.then_some(read)).await;
                 }
+                return;
             }
         };
         let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
+    }
+
+    /// M2: a browser action the owner let go ends as its wrapper says, once it read the page
+    /// again (I4): `{"ran": true}` just before it runs the agent's command is `done`; `{"ran":
+    /// false}` (the page changed), anything else, or the wrapper gone first (never told to go
+    /// on, or killed) is `failed`, as nothing ran; no word in [`REPORT_WAIT`] is `unknown`.
+    async fn ended(&self, id: i64, read: Option<OwnedReadHalf>) {
+        let said = match read {
+            Some(read) => {
+                let mut line = Vec::new();
+                let mut reader = BufReader::new(read).take(MAX_REPORT);
+                match tokio::time::timeout(REPORT_WAIT, reader.read_until(b'\n', &mut line)).await {
+                    Err(_) => None,
+                    Ok(_) => Some(serde_json::from_slice::<Value>(&line).ok()),
+                }
+            }
+            None => Some(None),
+        };
+        let (status, result) = match said {
+            None => ("unknown", "the browser did not say whether it went on"),
+            Some(Some(v)) if v["ran"] == true => ("done", "the browser went on"),
+            Some(Some(v)) if v["ran"] == false => (
+                "failed",
+                "not run: the page changed while the owner decided",
+            ),
+            Some(_) => ("failed", "the browser did not go on"),
+        };
+        let store = self.store.clone();
+        let recorded = tokio::task::spawn_blocking(move || {
+            let store = store.lock().unwrap_or_else(|e| e.into_inner());
+            store.finish_action(id, status, result)
+        });
+        match recorded.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!("zephyr: recording how #{id} ended failed: {e}"),
+            Err(e) => eprintln!("zephyr: recording how #{id} ended failed: {e}"),
+        }
     }
 
     /// R51: the held note goes into the asking run's queue before the plugin hears `hold`, while
@@ -1115,7 +1165,7 @@ impl Conn {
         &self,
         id: i64,
         verdict: Option<oneshot::Receiver<bool>>,
-        mut read: OwnedReadHalf,
+        read: &mut OwnedReadHalf,
         clean: bool,
     ) -> Option<Value> {
         let verdict = verdict.unwrap_or_else(|| self.waits.add(id));
@@ -3019,6 +3069,84 @@ mod tests {
         }
         assert_eq!(status(), "dropped");
         assert!(!waits.answer(2, true), "its wait is gone");
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
+    }
+
+    /// M2: a click the owner let go ends as its wrapper says once it read the page again (I4):
+    /// done when it runs, failed when the page changed or the wrapper went before saying.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_let_go_click_is_recorded_as_its_wrapper_says() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let h = home("gate-ended", "");
+        let (socket, waits) = serving(&h).await;
+        let ended = |id: i64| -> (String, String) {
+            let db = rusqlite::Connection::open(h.cfg.db_path()).unwrap();
+            let row = "SELECT status, coalesce(result, '') FROM proposals WHERE id = ?1";
+            db.query_row(row, [id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+        };
+        for (id, said, want) in [
+            (1, Some("{\"ran\": true}"), ("done", "the browser went on")),
+            (
+                2,
+                Some("{\"ran\": false}"),
+                (
+                    "failed",
+                    "not run: the page changed while the owner decided",
+                ),
+            ),
+            (3, None, ("failed", "the browser did not go on")),
+        ] {
+            let req = json!({"v": 1, "session": "main", "tool": "browser",
+                "args": {"argv": ["click", "@e3"]},
+                "browser": {"action": "click", "url": "https://mail.x/compose",
+                            "origin": "https://mail.x",
+                            "element": {"role": "button", "name": format!("Send {id}")}}});
+            let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            let (read, mut write) = stream.into_split();
+            write
+                .write_all(format!("{req}\n").as_bytes())
+                .await
+                .unwrap();
+            for _ in 0..200 {
+                if h.store.action(id).unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // The owner's `/ok`: taken, then the wrapper let go.
+            assert!(h.store.take_action(id, "running").unwrap().is_some());
+            for _ in 0..200 {
+                if waits.answer(id, true) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let mut line = String::new();
+            let mut read = tokio::io::BufReader::new(read);
+            read.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).unwrap()["verdict"],
+                "allow"
+            );
+            assert_eq!(
+                ended(id).0,
+                "running",
+                "nothing is recorded before the wrapper says"
+            );
+            match said {
+                Some(s) => write.write_all(format!("{s}\n").as_bytes()).await.unwrap(),
+                None => drop((read, write)),
+            }
+            for _ in 0..200 {
+                if ended(id).0 != "running" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let (status, result) = ended(id);
+            assert_eq!((status.as_str(), result.as_str()), want, "#{id}");
+        }
         let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
     }
 

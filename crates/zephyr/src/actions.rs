@@ -251,13 +251,12 @@ fn pass(ctx: &Ctx, a: &Action, by: By, now: i64) -> Result<String, String> {
     Ok("the agent may make exactly that call once in the next 30 min".into())
 }
 
-/// A browser action: the wrapper waiting on it goes on, if it still waits.
+/// A browser action: the wrapper waiting on it goes on, if it still waits. It stays `running`
+/// until the wrapper says whether it ran, once it read the page again (I4): the gate socket
+/// records how it ended then (M2).
 fn wait(ctx: &Ctx, a: &Action) -> Result<String, String> {
     match ctx.waits.answer(a.id, true) {
-        true => {
-            finish(ctx.store, a, "done", "the browser went on");
-            Ok("the browser goes on".into())
-        }
+        true => Ok("the browser goes on".into()),
         false => Err("the browser is no longer waiting, so nothing was done".into()),
     }
 }

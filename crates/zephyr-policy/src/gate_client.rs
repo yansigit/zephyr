@@ -1,6 +1,7 @@
 //! Asking the daemon's gate socket about a call (approvals spec §4.2 path 2): one JSON request
-//! line on a connection of its own, one JSON answer line back. Std only, no runtime: the plugin's
-//! `ToolCall` handler is synchronous.
+//! line on a connection of its own, one JSON answer line back (and from the browser wrapper,
+//! after an `allow` that ended a wait, one line saying whether it ran: M2). Std only, no runtime:
+//! the plugin's `ToolCall` handler is synchronous.
 
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -23,6 +24,16 @@ const MAX_ANSWER: u64 = 64 * 1024;
 /// full listen queue never holds the call past `timeout`; the thread itself ends within
 /// `timeout` of its last read or write, or when the daemon goes.
 pub fn ask(socket: &Path, req: &Value, timeout: Duration) -> Result<Value, String> {
+    ask_open(socket, req, timeout).map(|(answer, _)| answer)
+}
+
+/// [`ask`], with the connection the answer came on, still open: the browser wrapper tells the
+/// gate on it whether an action the owner let go ran (M2).
+pub fn ask_open(
+    socket: &Path,
+    req: &Value,
+    timeout: Duration,
+) -> Result<(Value, UnixStream), String> {
     let deadline = Instant::now() + timeout;
     let (tx, rx) = std::sync::mpsc::channel();
     let (socket, line) = (socket.to_path_buf(), format!("{req}\n"));
@@ -38,7 +49,7 @@ pub fn ask(socket: &Path, req: &Value, timeout: Duration) -> Result<Value, Strin
     }
 }
 
-fn exchange(socket: &Path, line: &str, deadline: Instant) -> Result<Value, String> {
+fn exchange(socket: &Path, line: &str, deadline: Instant) -> Result<(Value, UnixStream), String> {
     let left = || {
         let left = deadline.saturating_duration_since(Instant::now());
         // A zero timeout means none at all to std: never pass one.
@@ -77,7 +88,9 @@ fn exchange(socket: &Path, line: &str, deadline: Instant) -> Result<Value, Strin
             break;
         }
     }
-    serde_json::from_slice(&answer).map_err(|_| "the gate's answer is not JSON".into())
+    drop(reader);
+    let answer = serde_json::from_slice(&answer).map_err(|_| "the gate's answer is not JSON")?;
+    Ok((answer, stream))
 }
 
 /// Whether a gate socket served by uid `peer` may answer for the daemon: root's, as the daemon in

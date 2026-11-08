@@ -7,15 +7,19 @@
 //! Every command goes straight through (`exec`, as it was), except:
 //!
 //! - a click (`click`, `dblclick`, `tap`, `find … click`) and Enter (`press`/`key`/`keydown`/
-//!   `keyup` Enter, `\n` or `\r`, or a line break typed with `type` or `keyboard type`): the
+//!   `keyup` Enter, with modifiers or none, as 0.41's `parse_key_chord` reads it: N2; `\n` or
+//!   `\r`, or a line break typed with `type` or `keyboard type`): the
 //!   wrapper asks the real binary for the page's address (`get url`) and for the control, its
 //!   role and accessible name (`snapshot`'s refs and tree, scoped to a CSS selector when one
 //!   names it; for a key press the focused element, which a read-only script reports), classes
 //!   it with `gate::browser_class`, and takes a message, post or payment, or a control it could
 //!   not read, to the gate socket. A click lands on what holds its target (a span in a Send
 //!   button is the button's: R53); Enter in a form's field also counts the form's default
-//!   button, which it submits, and Space or Enter on a focused button is a click on it (I3);
-//!   anything typed before a line break is checked for the private facts (I1);
+//!   button, which it submits, and Space or Enter on a focused button (or on an element a click
+//!   handler or a tab stop makes one: M3) is a click on it, classed with its form (I3, N1);
+//!   anything typed before a line break is checked for the private facts (I1); a line break
+//!   typed after a Tab (which moves the focus), or any key typed after the first Enter, lands
+//!   where the wrapper did not read, and is held as a control it could not read (N3, R57);
 //! - typing (`fill`, `type`, `keyboard type|inserttext`, `find … fill`): its value goes to the
 //!   gate first, for the private facts (never gated by class);
 //! - `batch` carrying any of these or reading its commands from stdin (each split as 0.41 splits
@@ -24,8 +28,10 @@
 //!
 //! The wrapper then waits for the gate's verdict with its connection open (A7: a closed one is the
 //! action dropped, so a killed wrapper leaves nothing waiting), on a socket the daemon serves
-//! (`gate_client` checks its peer: I2). `allow` reads the page again, and runs the agent's
-//! command as it was only if the page is still the one the owner approved (I4); anything else, a
+//! (`gate_client` checks its peer: I2). `allow` reads the page again, the control too (a ref's
+//! from a full snapshot: M1), and runs the agent's command as it was only if the page is still
+//! the one the owner approved (I4); after a wait, it tells the gate on the same connection
+//! whether it ran, which is what the owner's record says (M2). Anything else, a
 //! closed socket or no gate at all exits 1 with the daemon's words, or [`NOT_ANSWERING`] or
 //! [`CHANGED`], on stderr: what the agent reads. Nothing touches the page while it waits, and
 //! every scoped snapshot the wrapper takes is followed by a full one, so the agent's refs resolve
@@ -338,7 +344,11 @@ pub fn run(args: &[String], env: &Env) -> Next {
                 typed: vec![typed.clone()],
                 ..Seen::default()
             };
-            return ask_gate(env, args, &request(action, &page.url(), &seen));
+            let (next, wait) = ask_gate(env, args, &request(action, &page.url(), &seen));
+            if next == Next::Exec && !said(wait, true) {
+                return Next::Refuse(NOT_ANSWERING.into());
+            }
+            return next;
         }
         Act::Click(_) | Act::Key { .. } => {}
     }
@@ -358,15 +368,30 @@ pub fn run(args: &[String], env: &Env) -> Next {
         seen.title = page.title();
     }
     let first = Look { action, seen };
-    match ask_gate(env, args, &request(action, &url, &first.seen)) {
-        Next::Exec => {}
-        refused => return refused,
-    }
+    let wait = match ask_gate(env, args, &request(action, &url, &first.seen)) {
+        (Next::Exec, wait) => wait,
+        (refused, _) => return refused,
+    };
     // I4: up to 10 minutes went by; what the owner approved must still be what runs.
-    match unchanged(&Page::new(env, &flags), &act, &url, &first, class) {
-        true => Next::Exec,
-        false => Next::Refuse(CHANGED.into()),
+    let same = unchanged(&Page::new(env, &flags), &act, &url, &first, class);
+    match (same, said(wait, same)) {
+        (true, true) => Next::Exec,
+        (true, false) => Next::Refuse(NOT_ANSWERING.into()),
+        (false, _) => Next::Refuse(CHANGED.into()),
     }
+}
+
+/// M2: an action the owner let go (an `allow` after a wait, with its number) is recorded by the
+/// daemon only as the wrapper says, on the connection the `allow` came on: `{"ran": true}` just
+/// before the command runs, `{"ran": false}` when it will not. Returns whether it was said (or
+/// there was nothing to say): what the gate cannot be told ran is not run.
+fn said(wait: Option<std::os::unix::net::UnixStream>, ran: bool) -> bool {
+    use std::io::Write;
+    let Some(mut conn) = wait else {
+        return true;
+    };
+    let line = format!("{}\n", json!({ "ran": ran }));
+    conn.set_write_timeout(Some(FACT_WAIT)).is_ok() && conn.write_all(line.as_bytes()).is_ok()
 }
 
 /// What the wrapper read for a click or a key press: the action the gate is told of (`click` or
@@ -381,21 +406,27 @@ struct Look {
 /// on it (I3); Enter in a form's field reads what the form submits.
 fn look(page: &Page, act: &Act) -> Option<Look> {
     match act {
-        Act::Click(target) => {
-            let mut seen = page.control(target);
-            if plain_submit(&seen) {
-                // A `submit` posts on a form with a textarea: unread, it counts as one.
-                seen.textarea = match page.eval(&script("submit", "", SUBMIT_BODY)) {
-                    Some(v) if v["found"].as_u64().is_some_and(|n| n > 0) => v["textarea"] == true,
-                    _ => true,
-                };
-            }
+        Act::Click(target) => Some(Look {
+            action: "click",
+            seen: page.submit_form(page.control(target)),
+        }),
+        Act::Key {
+            blind: true, typed, ..
+        } => {
+            // Where these keys land is not where the wrapper could read: a control it could
+            // not read, which the gate holds, with what is typed for the facts check.
+            let seen = Seen {
+                typed: typed.clone(),
+                ..Seen::default()
+            };
             Some(Look {
-                action: "click",
+                action: "press",
                 seen,
             })
         }
-        Act::Key { target, typed, key } => {
+        Act::Key {
+            target, typed, key, ..
+        } => {
             let mut seen = match target {
                 Target::Focus => page.focused(),
                 target => {
@@ -405,15 +436,19 @@ fn look(page: &Page, act: &Act) -> Option<Look> {
                 }
             };
             if pressable(&seen.role) {
-                // A button pressed by a key: what clicking it does, nothing typed into it.
+                // A button pressed by a key: what clicking it does, classed as a click on it is
+                // (N1): its form's flags kept, a plain `submit` looked up the same way; nothing
+                // typed into it.
                 let pressed = Seen {
                     role: seen.role,
                     name: seen.name,
+                    textarea: seen.textarea,
+                    password: seen.password,
                     ..Seen::default()
                 };
                 return Some(Look {
                     action: "click",
-                    seen: pressed,
+                    seen: page.submit_form(pressed),
                 });
             }
             let unread = seen.role.trim().is_empty();
@@ -434,26 +469,17 @@ fn look(page: &Page, act: &Act) -> Option<Look> {
 }
 
 /// Whether the page, read again after the owner's `allow`, still shows what the owner approved
-/// (I4): the same site, and for a control found by a selector, a locator or the focus, the same
-/// control (its role, name, form and what is typed); for a payment, the same total. A ref stays
-/// on its element (agent-browser's refs are per DOM node), so only its page is read again.
+/// (I4): the same site, the same control (its role, name, form and what is typed), and for a
+/// payment, the same total. A ref's control is read again too, from one full snapshot (M1): a
+/// ref whose node went away falls back to another with its role and name (0.41 element.rs), and
+/// a node kept may have been relabelled.
 fn unchanged(page: &Page, act: &Act, url: &str, first: &Look, class: Option<Class>) -> bool {
     if origin_of(&page.url()) != origin_of(url) {
         return false;
     }
-    let by_ref = match act {
-        Act::Click(Target::Selector(s))
-        | Act::Key {
-            target: Target::Selector(s),
-            ..
-        } => ref_of(s).is_some(),
-        _ => false,
-    };
-    if !by_ref {
-        match look(page, act) {
-            Some(again) if again.action == first.action && again.seen.same(&first.seen) => {}
-            _ => return false,
-        }
+    match look(page, act) {
+        Some(again) if again.action == first.action && again.seen.same(&first.seen) => {}
+        _ => return false,
     }
     class != Some(Class::Money) || page.total() == first.seen.amount
 }
@@ -465,10 +491,15 @@ fn pressable(role: &str) -> bool {
 
 /// The gate's verdict on the request (spec §4.2): `allow` runs the command; `hold` and `deny`
 /// refuse it with the daemon's text; no gate, a closed socket or an answer that cannot be read
-/// refuse it with [`NOT_ANSWERING`]. The connection stays open until the answer (A7).
-fn ask_gate(env: &Env, args: &[String], browser: &gate::Browser) -> Next {
+/// refuse it with [`NOT_ANSWERING`]. The connection stays open until the answer (A7), and after
+/// an `allow` that ends a wait (it names the action), for [`said`].
+fn ask_gate(
+    env: &Env,
+    args: &[String],
+    browser: &gate::Browser,
+) -> (Next, Option<std::os::unix::net::UnixStream>) {
     let Some(socket) = &env.socket else {
-        return Next::Refuse(NOT_ANSWERING.into());
+        return (Next::Refuse(NOT_ANSWERING.into()), None);
     };
     let req = json!({
         "v": 1,
@@ -477,13 +508,14 @@ fn ask_gate(env: &Env, args: &[String], browser: &gate::Browser) -> Next {
         "args": { "argv": args },
         "browser": browser,
     });
-    match zephyr_policy::gate_client::ask(socket, &req, VERDICT_WAIT) {
-        Ok(a) if a["verdict"] == "allow" => Next::Exec,
-        Ok(a) if matches!(a["verdict"].as_str(), Some("hold" | "deny")) => {
+    match zephyr_policy::gate_client::ask_open(socket, &req, VERDICT_WAIT) {
+        Ok((a, conn)) if a["verdict"] == "allow" => (Next::Exec, a["id"].is_i64().then_some(conn)),
+        Ok((a, _)) if matches!(a["verdict"].as_str(), Some("hold" | "deny")) => {
             let text = a["text"].as_str().filter(|t| !t.trim().is_empty());
-            Next::Refuse(text.unwrap_or("not run: the gate did not allow it").into())
+            let text = text.unwrap_or("not run: the gate did not allow it");
+            (Next::Refuse(text.into()), None)
         }
-        _ => Next::Refuse(NOT_ANSWERING.into()),
+        _ => (Next::Refuse(NOT_ANSWERING.into()), None),
     }
 }
 
@@ -577,10 +609,14 @@ enum Act {
     /// A click on the target.
     Click(Target),
     /// Enter or Space in the focused element, or Enter in the target a line break is typed into.
+    /// `blind`: typed keys that land where the wrapper cannot read (R57): a line break after a
+    /// Tab, which moves the focus, or any key after the first Enter, which may have sent and
+    /// moved it.
     Key {
         target: Target,
         typed: Vec<String>,
         key: Key,
+        blind: bool,
     },
     /// Typing a value (`fill`, `type`).
     Type {
@@ -625,6 +661,7 @@ fn what(rest: &[String]) -> Act {
                 target: Target::Focus,
                 typed: Vec::new(),
                 key,
+                blind: false,
             },
             None => Act::Pass,
         },
@@ -672,14 +709,21 @@ fn what(rest: &[String]) -> Act {
 
 /// Typing `typed`: with a line break where Enter would go (`enter_in`), a key press there, which
 /// 0.41 sends as a real Enter for each `\n` or `\r` (`type_text_into_active_context`), however
-/// little else is typed (C2); else a facts check. Nothing typed is nothing to check.
+/// little else is typed (C2); else a facts check. Nothing typed is nothing to check. 0.41 sends
+/// each `\t` as a real Tab too, which moves the focus, and the rest as text (`insertText`): a
+/// line break after a Tab, or a Tab or line break after the first one, is `blind` (N3, R57).
 fn typing(action: &'static str, typed: String, enter_in: Option<Target>) -> Act {
     match enter_in {
-        Some(target) if typed.contains(['\n', '\r']) => Act::Key {
-            target,
-            typed: vec![typed],
-            key: Key::Enter,
-        },
+        Some(target) if typed.contains(['\n', '\r']) => {
+            let first = typed.find(['\n', '\r']).unwrap_or_default();
+            let (before, after) = (&typed[..first], &typed[first + 1..]);
+            Act::Key {
+                target,
+                blind: before.contains('\t') || after.contains(['\n', '\r', '\t']),
+                typed: vec![typed],
+                key: Key::Enter,
+            }
+        }
         _ if typed.trim().is_empty() => Act::Pass,
         _ => Act::Type { action, typed },
     }
@@ -694,12 +738,46 @@ enum Key {
     Space,
 }
 
-/// The key a `press` names, as 0.41 reads it (`parse_key_chord`, `named_key_info`): the part
-/// after the last `+`, any case. `Enter`, `Return`, `NumpadEnter` and a single `\n` or `\r` are
-/// Enter; `Space` and a single space are Space.
+/// agent-browser 0.41's `parse_key_chord` (cli/src/native/actions.rs), ported as it is: how
+/// `press` reads `Control+Shift+Enter`. The parts between `+` that name a modifier (`alt`,
+/// `control`/`ctrl`, `meta`/`cmd`/`command`, `shift`, any case, wherever they stand) are taken
+/// out, and the rest, joined by `+` again, is the key, with the modifiers' CDP bits (1 Alt,
+/// 2 Control, 4 Meta, 8 Shift). With no modifier, the whole text is the key (`+`, `a+Enter`).
+pub fn parse_key_chord(input: &str) -> (String, Option<i32>) {
+    let parts: Vec<&str> = input.split('+').collect();
+    if parts.len() < 2 {
+        return (input.to_string(), None);
+    }
+    let mut modifiers = 0i32;
+    let mut key_parts: Vec<&str> = Vec::new();
+    for part in &parts {
+        match part.to_lowercase().as_str() {
+            "alt" => modifiers |= 1,
+            "control" | "ctrl" => modifiers |= 2,
+            "meta" | "cmd" | "command" => modifiers |= 4,
+            "shift" => modifiers |= 8,
+            _ => key_parts.push(part),
+        }
+    }
+    if modifiers == 0 {
+        return (input.to_string(), None);
+    }
+    let actual_key = match key_parts.is_empty() {
+        true => input.to_string(),
+        false => key_parts.join("+"),
+    };
+    (actual_key, Some(modifiers))
+}
+
+/// The key a `press` sends, as 0.41 reads it (N2): [`parse_key_chord`], then `named_key_info`
+/// (native/interaction.rs), modifiers or none. `Enter` or `Return` in any case, or a single
+/// `\n` or `\r`, is Enter; `Space` or a single space is Space. `NumpadEnter`, which 0.41 sends as
+/// a key of that name and code, counts as Enter too: a page's own handler may read its code.
+/// `keydown`/`keyup` send their key as named, unparsed, so reading them this way finds every
+/// Enter they send.
 fn key_of(key: &str) -> Option<Key> {
-    let last = key.rsplit('+').next().unwrap_or(key).to_lowercase();
-    match last.as_str() {
+    let (key, _) = parse_key_chord(key);
+    match key.to_lowercase().as_str() {
         "enter" | "return" | "numpadenter" | "\n" | "\r" => Some(Key::Enter),
         "space" | " " => Some(Key::Space),
         _ => None,
@@ -1179,6 +1257,19 @@ impl<'a> Page<'a> {
         strictest(found).map_or_else(Seen::default, |c| c.seen())
     }
 
+    /// `seen` (a button clicked or pressed) with its form read when it is a plain `submit`, a
+    /// post on a form with a textarea: what was read of its form already (the focus) counts, else
+    /// a script looks, and a form it cannot read counts as one with a textarea.
+    fn submit_form(&self, mut seen: Seen) -> Seen {
+        if plain_submit(&seen) && !seen.textarea {
+            seen.textarea = match self.eval(&script("submit", "", SUBMIT_BODY)) {
+                Some(v) if v["found"].as_u64().is_some_and(|n| n > 0) => v["textarea"] == true,
+                _ => true,
+            };
+        }
+        seen
+    }
+
     /// `seen` (a field the agent types a line break into) with what Enter submits there (I3):
     /// the form a script finds it in by its selector (or, for a ref or a text, by its name: a
     /// script cannot reach an element by ref), with that form's flags and default button; of
@@ -1330,6 +1421,15 @@ const find = sel => {
     return document.querySelector(sel);
   } catch (_) { return null; }
 };
+const up = n => n.parentElement || (n.parentNode && n.parentNode.host) || null;
+const pointer = n => { try { return getComputedStyle(n).cursor === 'pointer'; } catch (_) { return false; } };
+// What agent-browser's own scan finds clickable with no interactive role (R53): a click handler,
+// a tab stop, or a pointer cursor of its own (not one it takes from its parent).
+const clickable = n => {
+  const tab = n.getAttribute('tabindex'), parent = up(n);
+  const own = pointer(n) && !(parent && parent.nodeType === 1 && pointer(parent));
+  return n.hasAttribute('onclick') || n.onclick !== null || (tab !== null && tab !== '-1') || own;
+};
 const formOf = e => e.form || (e.closest && e.closest('form')) || null;
 const submitOf = form => {
   if (!form) return null;
@@ -1348,7 +1448,8 @@ const formFacts = form => ({
 });"#;
 
 /// The focused element's facts: `{unread}` inside another site's frame, `{role: "document"}`
-/// when nothing is focused; for a field in a form, the form's facts and default button.
+/// when nothing is focused; for a field in a form, the form's facts and default button. An
+/// element with no interactive role that is clickable as R53 counts one is a button (M3).
 const FOCUS_BODY: &str = r#"let e = document.activeElement;
 for (let i = 0; e && i < 16; i++) {
   if (e.shadowRoot && e.shadowRoot.activeElement) { e = e.shadowRoot.activeElement; continue; }
@@ -1366,7 +1467,10 @@ const doc = e.ownerDocument;
 if (e === doc.body || e === doc.documentElement) return JSON.stringify({ role: 'document', name: '' });
 const tag = e.tagName.toLowerCase();
 const type = (e.getAttribute('type') || '').toLowerCase();
-const role = roleOf(e);
+// M3: with no interactive role, a clickable element (R53's rule) is a button named by its text,
+// which Space or Enter presses as a click does.
+const own = roleOf(e);
+const role = !INTERACTIVE[own] && clickable(e) ? 'button' : own;
 const name = nameOf(e, !!BY_CONTENT[role]);
 const field = tag === 'textarea' || (tag === 'input' && (!(type in INPUTS) || type === 'search'));
 // A password's value is never read: the vault's fill handles logins.
@@ -1386,18 +1490,11 @@ return JSON.stringify({
 /// by its text), as agent-browser's own scan finds them; `{role: ""}` with its text for none.
 const HOLDER_BODY: &str = r#"const e = find(sel);
 if (!e) return JSON.stringify({ unread: true });
-const up = n => n.parentElement || (n.parentNode && n.parentNode.host) || null;
-const pointer = n => { try { return getComputedStyle(n).cursor === 'pointer'; } catch (_) { return false; } };
 for (let n = e, i = 0; n && i < 64; n = up(n), i++) {
   if (n.nodeType !== 1) continue;
   const role = roleOf(n);
   if (INTERACTIVE[role]) return JSON.stringify({ role, name: nameOf(n, !!BY_CONTENT[role]) });
-  const tab = n.getAttribute('tabindex');
-  const parent = up(n);
-  const own = pointer(n) && !(parent && parent.nodeType === 1 && pointer(parent));
-  if (n.hasAttribute('onclick') || n.onclick !== null || (tab !== null && tab !== '-1') || own) {
-    return JSON.stringify({ role: 'button', name: nameOf(n, true) });
-  }
+  if (clickable(n)) return JSON.stringify({ role: 'button', name: nameOf(n, true) });
 }
 return JSON.stringify({ role: '', name: text(e).slice(0, 200) });"#;
 
@@ -2373,7 +2470,7 @@ cat "$d/$f.json"
         for args in [
             &["type", "@e2", "\n"][..],
             &["type", "@e2", "\r"],
-            &["type", "@e2", "--delay", "5", "ok\r\n"],
+            &["type", "@e2", "--delay", "5", "ok\r"],
             &["keyboard", "type", "\n"],
             &["press", "\n"],
             &["press", "\r"],
@@ -2381,6 +2478,14 @@ cat "$d/$f.json"
             &["press", "ENTER"],
             &["keydown", "Return"],
             &["keyup", "Enter"],
+            // N2: 0.41 takes the modifier words out wherever they stand (`parse_key_chord`).
+            &["press", "Enter+Control"],
+            &["press", "Return+Meta"],
+            &["press", "Enter+Shift"],
+            &["press", "\r+Control"],
+            &["press", "Control+Shift+Enter"],
+            &["press", "ctrl+enter+alt"],
+            &["keydown", "Enter+Meta"],
         ] {
             let waiting = t.spawn(args);
             let (req, mut conn) = asked(&gate);
@@ -2393,16 +2498,45 @@ cat "$d/$f.json"
             answer(&mut conn, json!({"verdict": "allow"}));
             assert_eq!(waiting.join().unwrap(), Next::Exec, "{args:?}");
         }
-        // A space or a tab typed or pressed in a composer is no send.
+        // A space or a tab typed or pressed in a composer is no send; nor is a chord with no
+        // modifier word, which 0.41 sends whole as a key of that name (`a+Enter`).
         for args in [
             &["type", "@e2", " "][..],
             &["keyboard", "type", "  "],
             &["press", "Tab"],
             &["press", "Space"],
+            &["press", "a+Enter"],
+            &["press", "Control+a"],
+            &["press", "Enter+"],
         ] {
             assert_eq!(t.run(args), Next::Exec, "{args:?}");
         }
         assert!(gate.try_recv().is_err());
+    }
+
+    /// N2: agent-browser 0.41's own `parse_key_chord` tests (native/actions.rs), and modifiers
+    /// after the key.
+    #[test]
+    fn a_key_chord_is_read_as_agent_browser_reads_it() {
+        for (input, key, mods) in [
+            ("a", "a", None),
+            ("Enter", "Enter", None),
+            ("Control+a", "a", Some(2)),
+            ("Ctrl+c", "c", Some(2)),
+            ("Shift+Enter", "Enter", Some(8)),
+            ("Control+Shift+a", "a", Some(2 | 8)),
+            ("Meta+a", "a", Some(4)),
+            ("Alt+Tab", "Tab", Some(1)),
+            ("+", "+", None),
+            ("Enter+Control", "Enter", Some(2)),
+            ("\r+Control", "\r", Some(2)),
+            ("cmd+Return+SHIFT", "Return", Some(4 | 8)),
+            ("a+Enter", "a+Enter", None),
+            ("Control+a+Enter", "a+Enter", Some(2)),
+            ("Control+", "", Some(2)),
+        ] {
+            assert_eq!(parse_key_chord(input), (key.to_string(), mods), "{input:?}");
+        }
     }
 
     /// I1: what is typed before a line break goes out with it, so it is checked for private
@@ -2437,6 +2571,116 @@ cat "$d/$f.json"
         answer(&mut conn, json!({"verdict": "allow"}));
         assert_eq!(waiting.join().unwrap(), Next::Exec);
         // Nothing typed but the line break, where Enter sends nothing: nothing to ask.
+        assert_eq!(t.run(&["type", "@e1", "\n"]), Next::Exec);
+        assert!(gate.try_recv().is_err());
+    }
+
+    /// N3, R57: 0.41 types each `\t` as a real Tab, which moves the focus, and an Enter can
+    /// send and move it too: a line break after a Tab, and any key after the first Enter, land
+    /// on a control the wrapper did not read, which the gate holds.
+    #[test]
+    fn keys_after_a_tab_or_an_enter_land_where_the_wrapper_did_not_read() {
+        let t = T::new("bg-tabs");
+        t.page(
+            MAIL,
+            &[("searchbox", "Search mail"), ("textbox", "Message")],
+            "",
+        );
+        t.focus(json!({"role": "document", "name": ""}));
+        t.eval("forms", json!({"forms": []}));
+        let gate = t.gate();
+        for (args, typed) in [
+            (&["keyboard", "type", "\t\t\n"][..], "\t\t\n"),
+            (&["type", "@e1", "\t\n"], "\t\n"),
+            (&["type", "@e1", "x\t\n"], "x\t\n"),
+            (&["type", "@e2", "hi\t\n"], "hi\t\n"),
+            (&["type", "@e2", "ok\n\n"], "ok\n\n"),
+            (&["type", "@e2", "ok\r\n"], "ok\r\n"),
+            (&["type", "@e2", "ok\n\t"], "ok\n\t"),
+            (&["keyboard", "type", "a\rb\r"], "a\rb\r"),
+        ] {
+            let waiting = t.spawn(args);
+            let (req, mut conn) = asked(&gate);
+            let b = &req["browser"];
+            assert_eq!(
+                (b["action"].as_str(), b["role"].as_str(), b["name"].as_str()),
+                (Some("press"), Some(""), Some("")),
+                "{args:?}: {req}"
+            );
+            assert_eq!(b["typed"], json!([typed]), "{args:?}");
+            answer(&mut conn, json!({"verdict": "hold", "text": "held"}));
+            assert_eq!(
+                waiting.join().unwrap(),
+                Next::Refuse("held".into()),
+                "{args:?}"
+            );
+        }
+        // One Enter, with only text around it (typed in, not keys), lands where it was read.
+        for args in [&["type", "@e2", "ok\n"][..], &["type", "@e2", "ok\n  "]] {
+            let waiting = t.spawn(args);
+            let (req, mut conn) = asked(&gate);
+            let b = &req["browser"];
+            assert_eq!(
+                (b["role"].as_str(), b["name"].as_str()),
+                (Some("textbox"), Some("Message")),
+                "{args:?}: {req}"
+            );
+            answer(&mut conn, json!({"verdict": "allow"}));
+            assert_eq!(waiting.join().unwrap(), Next::Exec, "{args:?}");
+        }
+        // Tabs with no line break send nothing: what is typed is checked for facts only.
+        let waiting = t.spawn(&["type", "@e2", "a\tb"]);
+        let (req, mut conn) = asked(&gate);
+        assert_eq!(req["browser"]["action"], "type", "{req}");
+        answer(&mut conn, json!({"verdict": "allow"}));
+        assert_eq!(waiting.join().unwrap(), Next::Exec);
+        assert_eq!(t.run(&["keyboard", "type", "\t\t"]), Next::Exec);
+        assert!(gate.try_recv().is_err());
+    }
+
+    /// N1: a button pressed by a key keeps its form's facts, as a click on it is classed: a
+    /// plain `submit` in a form with a textarea posts.
+    #[test]
+    fn a_pressed_button_keeps_its_forms_facts() {
+        let t = T::new("bg-pressed");
+        t.page(MAIL, &[("button", "Submit")], "");
+        let gate = t.gate();
+        let posts = |args: &[&str], why: &str| {
+            let waiting = t.spawn(args);
+            let (req, mut conn) = asked(&gate);
+            let b = &req["browser"];
+            assert_eq!(
+                (b["action"].as_str(), b["role"].as_str(), b["name"].as_str()),
+                (Some("click"), Some("button"), Some("Submit")),
+                "{args:?} {why}: {req}"
+            );
+            assert_eq!(b["form_textarea"], true, "{args:?} {why}: {req}");
+            assert_eq!(
+                gate::browser_class(&serde_json::from_value(b.clone()).unwrap()),
+                Some(Class::Posts),
+                "{args:?} {why}"
+            );
+            answer(&mut conn, json!({"verdict": "allow"}));
+            assert_eq!(waiting.join().unwrap(), Next::Exec, "{args:?} {why}");
+        };
+        // The focus script read the button's form: it has a textarea.
+        t.focus(json!({"role": "button", "name": "Submit", "textarea": true}));
+        t.eval("submit", json!({"found": 1, "textarea": false}));
+        for args in [
+            &["press", "Enter"][..],
+            &["press", "Space"],
+            &["keyup", "Enter"],
+        ] {
+            posts(args, "(its form read with the focus)");
+        }
+        // Not read with the focus: the page is asked, as for a click.
+        t.focus(json!({"role": "button", "name": "Submit"}));
+        t.eval("submit", json!({"found": 1, "textarea": true}));
+        posts(&["press", "Enter"], "(its form asked about)");
+        posts(&["type", "@e1", "\n"], "(a line break typed into it)");
+        // A Submit in a form with no textarea is no post.
+        t.eval("submit", json!({"found": 1, "textarea": false}));
+        assert_eq!(t.run(&["press", "Enter"]), Next::Exec);
         assert_eq!(t.run(&["type", "@e1", "\n"]), Next::Exec);
         assert!(gate.try_recv().is_err());
     }
@@ -2538,9 +2782,9 @@ cat "$d/$f.json"
         assert_eq!(waiting.join().unwrap(), Next::Refuse("held".into()));
     }
 
-    /// I4: after the owner's answer, a control found by a selector, a locator or the focus is
-    /// read again, and the action goes only if it is still the one the owner saw, on the same
-    /// site; a ref stays on its element, so only the page's address (and a payment's total) is.
+    /// I4: after the owner's answer, the control (found by a ref, a selector, a locator or the
+    /// focus) is read again, and the action goes only if it is still the one the owner saw, on
+    /// the same site, and for a payment with the same total.
     #[test]
     fn the_page_is_read_again_before_an_approved_click() {
         let t = T::new("bg-recheck");
@@ -2592,15 +2836,30 @@ cat "$d/$f.json"
             answer(&mut conn, json!({"verdict": "allow"}));
             assert_eq!(waiting.join().unwrap(), changed, "{now}");
         }
-        // A ref is the element itself: only the page's address is read again.
-        t.page(MAIL, COMPOSE, "");
-        let waiting = t.spawn(&["click", "@e3"]);
-        let (_, mut conn) = asked(&gate);
-        let reads = t.argv().len();
-        t.page(MAIL, &[("button", "Delete account")], "");
-        answer(&mut conn, json!({"verdict": "allow"}));
-        assert_eq!(waiting.join().unwrap(), Next::Exec);
-        assert_eq!(t.argv()[reads..], ["get url --json"]);
+        // M1: a ref is read again too, in one full snapshot: a node gone falls back to another
+        // with its role and name (0.41 element.rs), and a live one may be relabelled.
+        let relabelled: &[(&str, &str)] =
+            &[("textbox", "To"), ("textbox", "Message"), ("button", "Pay")];
+        let gone: &[(&str, &str)] = &[("textbox", "To"), ("textbox", "Message")];
+        for (now, want) in [
+            (&[("button", "Delete account")][..], changed.clone()),
+            (relabelled, changed.clone()),
+            (gone, changed.clone()),
+            (COMPOSE, Next::Exec),
+        ] {
+            t.page(MAIL, COMPOSE, "");
+            let waiting = t.spawn(&["click", "@e3"]);
+            let (_, mut conn) = asked(&gate);
+            let reads = t.argv().len();
+            t.page(MAIL, now, "");
+            answer(&mut conn, json!({"verdict": "allow"}));
+            assert_eq!(waiting.join().unwrap(), want, "{now:?}");
+            assert_eq!(
+                t.argv()[reads..],
+                ["get url --json", "snapshot --json"],
+                "{now:?}"
+            );
+        }
         // ... and a ref on a page that went to another site clicks nothing there.
         t.page(MAIL, COMPOSE, "");
         let waiting = t.spawn(&["click", "@e3"]);
@@ -2620,6 +2879,120 @@ cat "$d/$f.json"
             assert_eq!(waiting.join().unwrap(), want, "{later}");
         }
         assert!(!t.clicked());
+    }
+
+    /// M2: an action the owner let go (an `allow` with its number, after a wait) tells the gate
+    /// whether it ran, on the same connection, once the page is read again: `{"ran": true}`
+    /// just before it runs, `{"ran": false}` when the page changed. One the gate cannot be told
+    /// of is not run. An `allow` with no wait behind it is told nothing.
+    #[test]
+    fn a_let_go_action_tells_the_gate_whether_it_ran() {
+        let t = T::new("bg-report");
+        let gate = t.gate();
+        let said = |conn: &mut UnixStream| {
+            conn.set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            let mut line = String::new();
+            let _ = BufReader::new(conn.try_clone().unwrap()).read_line(&mut line);
+            line
+        };
+        for (moved, want, report) in [
+            (false, Next::Exec, "{\"ran\":true}\n"),
+            (true, Next::Refuse(CHANGED.into()), "{\"ran\":false}\n"),
+        ] {
+            t.page(MAIL, COMPOSE, "");
+            let waiting = t.spawn(&["click", "@e3"]);
+            let (_, mut conn) = asked(&gate);
+            if moved {
+                t.page("https://evil.example.org/x", COMPOSE, "");
+            }
+            answer(&mut conn, json!({"verdict": "allow", "id": 7}));
+            assert_eq!(said(&mut conn), report, "moved: {moved}");
+            assert_eq!(waiting.join().unwrap(), want, "moved: {moved}");
+        }
+        // Typing let go after a wait says so too.
+        let waiting = t.spawn(&["fill", "@e1", "bob@example.com"]);
+        let (_, mut conn) = asked(&gate);
+        answer(&mut conn, json!({"verdict": "allow", "id": 8}));
+        assert_eq!(said(&mut conn), "{\"ran\":true}\n");
+        assert_eq!(waiting.join().unwrap(), Next::Exec);
+        // No wait behind the `allow`: nothing is said (the gate has hung up).
+        t.page(MAIL, COMPOSE, "");
+        let waiting = t.spawn(&["click", "@e3"]);
+        let (_, mut conn) = asked(&gate);
+        answer(&mut conn, json!({"verdict": "allow"}));
+        assert_eq!(waiting.join().unwrap(), Next::Exec);
+        assert_eq!(said(&mut conn), "");
+        // A gate that stopped listening cannot be told that it ran: not run.
+        let waiting = t.spawn(&["click", "@e3"]);
+        let (_, mut conn) = asked(&gate);
+        conn.shutdown(std::net::Shutdown::Read).unwrap();
+        answer(&mut conn, json!({"verdict": "allow", "id": 9}));
+        assert_eq!(waiting.join().unwrap(), Next::Refuse(NOT_ANSWERING.into()));
+        assert!(!t.clicked());
+    }
+
+    /// M3, R53: the focus script reads a focused element with no interactive role that a click
+    /// handler, a tab stop or its own pointer cursor makes clickable as a button named by its
+    /// text, so Space or Enter on it is a click on it, as a click there is. Run in node against
+    /// a stand-in for the page (skipped where there is no node).
+    #[test]
+    fn the_focus_script_reads_a_clickable_element_as_a_button() {
+        let Ok(out) = Command::new("node").arg("--version").output() else {
+            eprintln!("skipped: no node");
+            return;
+        };
+        assert!(out.status.success());
+        let dir = crate::test_dir("bg-focus-js");
+        let page = r#"
+const el = (tag, attrs, props) => Object.assign({
+  tagName: tag.toUpperCase(), nodeType: 1, shadowRoot: null, isContentEditable: false,
+  onclick: null, labels: null, innerText: '', textContent: '', parentElement: null,
+  parentNode: null, form: null, closest: () => null,
+  getAttribute: k => (k in attrs ? String(attrs[k]) : null), hasAttribute: k => k in attrs,
+}, props);
+const body = el('body', {}, {});
+globalThis.document = { body, documentElement: el('html', {}, {}), activeElement: body,
+  getElementById: () => null, querySelectorAll: () => [] };
+globalThis.getComputedStyle = n => ({ cursor: n.pointer ? 'pointer' : 'auto' });
+const cases = {
+  onclick: el('div', { onclick: 'go()' }, { innerText: 'Send' }),
+  handler: el('div', { tabindex: '-1' }, { innerText: 'Send', onclick: () => {} }),
+  tabstop: el('div', { tabindex: '0' }, { innerText: 'Send' }),
+  pointer: el('span', { tabindex: '-1' }, { innerText: 'Send', pointer: true }),
+  plain: el('div', { tabindex: '-1' }, { innerText: 'Send' }),
+  button: el('button', {}, { innerText: 'Send' }),
+};
+for (const n of Object.values(cases)) { n.ownerDocument = document; n.parentElement = body; }
+const script = require('fs').readFileSync(process.argv[2], 'utf8');
+const out = {};
+for (const [k, n] of Object.entries(cases)) {
+  document.activeElement = n;
+  const v = JSON.parse(eval(script));
+  out[k] = [v.role, v.name];
+}
+console.log(JSON.stringify(out));
+"#;
+        std::fs::write(dir.join("page.js"), page).unwrap();
+        std::fs::write(dir.join("focus.js"), script("focus", "", FOCUS_BODY)).unwrap();
+        let out = Command::new("node")
+            .arg(dir.join("page.js"))
+            .arg(dir.join("focus.js"))
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let button = json!(["button", "Send"]);
+        assert_eq!(
+            got,
+            json!({"onclick": button, "handler": button, "tabstop": button,
+                   "pointer": button, "plain": ["generic", ""], "button": button}),
+        );
     }
 
     /// R53: a click lands on what holds its target: a heading in a Send button is the button's,
