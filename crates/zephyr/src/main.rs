@@ -424,6 +424,9 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     // In the container: the approvals gate's browser wrapper as the image lays it out (§4.4).
     // SAFETY: getuid has no arguments and cannot fail.
     let wrapper_ok = unsafe { libc::getuid() } != 0 || browser_wrapper();
+    // In the container: what root starts or trusts is root's, never the agent's to swap (B5).
+    // SAFETY: getuid has no arguments and cannot fail.
+    let binaries_ok = unsafe { libc::getuid() } != 0 || roots_binaries(cfg);
 
     // A throwaway home so doctor never touches the live `main` session.
     let mut probe = cfg.clone();
@@ -474,7 +477,7 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     }
 
     // Names and presence only: a secret's value is never printed.
-    let mut ok = version_ok && split_ok && wrapper_ok && commands_ok;
+    let mut ok = version_ok && split_ok && wrapper_ok && binaries_ok && commands_ok;
     // While the daemon is up, its gate socket is there: without it every send is refused
     // (approvals spec §4.9).
     if tokio::net::UnixStream::connect(cfg.socket_path())
@@ -638,6 +641,27 @@ fn browser_wrapper() -> bool {
         ),
     };
     ok & check(&label, others.is_empty())
+}
+
+/// B5: rpi, this binary, the policy plugin and the real agent-browser are root's and writable by
+/// no one else, and no folder above them is the agent's to write (`agent::replaceable`).
+fn roots_binaries(cfg: &Config) -> bool {
+    let Some((uid, gid)) = zephyr::agent::ids() else {
+        return check("the agent's uid is known, to check root's programs", false);
+    };
+    let me = std::fs::canonicalize("/proc/self/exe").unwrap_or_else(|_| "/proc/self/exe".into());
+    let mut programs = vec![cfg.rpi.clone(), me, cfg.agent_browser.clone()];
+    programs.extend(cfg.policy_plugin.clone());
+    let mut ok = true;
+    for p in programs {
+        let why = zephyr::agent::replaceable(&p, 0, uid, gid);
+        let label = match &why {
+            None => format!("{} is root's and the agent cannot replace it", p.display()),
+            Some(why) => format!("{} could be replaced by the agent: {why}", p.display()),
+        };
+        ok &= check(&label, why.is_none());
+    }
+    ok
 }
 
 fn env_set(name: &str) -> bool {

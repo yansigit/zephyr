@@ -96,7 +96,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && f="rpi-v$RPI_VERSION-$t-unknown-linux-gnu.tar.gz" \
     && curl -fsSLo "/tmp/$f" "https://github.com/bigfish1913/pi-rust/releases/download/v$RPI_VERSION/$f" \
     && echo "$s  /tmp/$f" | sha256sum -c - \
-    && tar -xzf "/tmp/$f" -C /usr/local/bin ./rpi
+    && tar -xzf "/tmp/$f" --no-same-owner -C /usr/local/bin ./rpi
 
 # gh and himalaya from their pinned releases, checked against their sha256s.
 FROM ubuntu:24.04 AS tools

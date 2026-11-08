@@ -88,6 +88,52 @@ pub fn writable_dirs(path: &str, uid: u32, gid: u32) -> Vec<String> {
         .collect()
 }
 
+/// Why the agent (`uid`, `gid`) could replace or rewrite the program at `path` (B5), or `None`
+/// when it cannot: the file (a link followed) must be `owner`'s (root's in the image) and
+/// writable by no one else, and no folder above it, or above the link, the agent's or one it may
+/// write; in a sticky folder (`/tmp`) only what the agent owns is its to replace. Doctor checks
+/// rpi, zephyr, the policy plugin and the real agent-browser this way: a pinned tarball's
+/// `./rpi` unpacked with its own owner (uid 1001) would be the agent's when the host user is.
+pub fn replaceable(path: &std::path::Path, owner: u32, uid: u32, gid: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let real = match std::fs::canonicalize(path) {
+        Ok(real) => real,
+        Err(e) => return Some(format!("{} cannot be read: {e}", path.display())),
+    };
+    let m = match std::fs::metadata(&real) {
+        Ok(m) => m,
+        Err(e) => return Some(format!("{} cannot be read: {e}", real.display())),
+    };
+    if m.uid() != owner {
+        return Some(format!("{} is uid {}'s", real.display(), m.uid()));
+    }
+    if m.mode() & 0o022 != 0 {
+        return Some(format!("{} may be written by others", real.display()));
+    }
+    let writes = |m: &std::fs::Metadata| {
+        m.uid() == uid || m.mode() & 0o002 != 0 || (m.gid() == gid && m.mode() & 0o020 != 0)
+    };
+    for start in [path, real.as_path()] {
+        // What the entry each folder holds belongs to, for the sticky bit.
+        let mut child = std::fs::symlink_metadata(start).map_or(owner, |m| m.uid());
+        for dir in start
+            .ancestors()
+            .skip(1)
+            .filter(|d| !d.as_os_str().is_empty())
+        {
+            let Ok(d) = std::fs::metadata(dir) else {
+                return Some(format!("{} cannot be read", dir.display()));
+            };
+            let sticky = d.mode() & 0o1000 != 0;
+            if d.uid() == uid || (writes(&d) && (!sticky || child == uid)) {
+                return Some(format!("{} is the agent's to write", dir.display()));
+            }
+            child = d.uid();
+        }
+    }
+    None
+}
+
 /// While held, this thread's file access is the agent's (setfsuid/setfsgid), so what the
 /// daemon reads or writes in the agent's home is exactly what the agent itself could: a
 /// symlink the agent plants there leads nowhere it could not go. Never hold it across an
@@ -146,6 +192,59 @@ mod tests {
             .split(':')
             .position(|d| d == "/zephyr/.local/bin");
         assert_eq!(own, Some(1));
+    }
+
+    /// B5: a program root starts or trusts (rpi, zephyr, the real agent-browser) is root's and
+    /// writable by no one else, and no folder above it lets the agent replace it.
+    #[test]
+    fn replaceable_names_why_the_agent_could_swap_a_program() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        let dir = crate::test_dir("agent-replaceable");
+        let bin = dir.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        mode(&dir, 0o755);
+        mode(&bin, 0o755);
+        let rpi = bin.join("rpi");
+        std::fs::write(&rpi, "#!/bin/sh\n").unwrap();
+        mode(&rpi, 0o755);
+        // SAFETY: plain syscalls with no arguments.
+        let (me, group) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let (agent, agent_group) = (me + 1, group + 1);
+        // Mine (root's in the image) and the folders above it no one else's: /tmp is sticky.
+        assert_eq!(replaceable(&rpi, me, agent, agent_group), None);
+        // Someone else's file: the tarball's uid 1001, say.
+        let theirs = replaceable(&rpi, me + 7, agent, agent_group);
+        assert!(theirs.is_some_and(|w| w.contains(&format!("uid {me}"))));
+        mode(&rpi, 0o775);
+        assert!(replaceable(&rpi, me, agent, agent_group).is_some());
+        mode(&rpi, 0o757);
+        assert!(replaceable(&rpi, me, agent, agent_group).is_some());
+        mode(&rpi, 0o755);
+        // A folder above it the agent may write, without the sticky bit.
+        mode(&bin, 0o777);
+        let why = replaceable(&rpi, me, agent, agent_group).unwrap();
+        assert!(why.contains(&bin.display().to_string()), "{why}");
+        mode(&bin, 0o1777);
+        assert_eq!(replaceable(&rpi, me, agent, agent_group), None);
+        mode(&bin, 0o775);
+        assert_eq!(replaceable(&rpi, me, agent, agent_group), None);
+        assert!(
+            replaceable(&rpi, me, agent, group).is_some(),
+            "the agent's group may write it"
+        );
+        mode(&bin, 0o755);
+        // Reached through a link: the link's folder counts too.
+        let open = dir.join("open");
+        std::fs::create_dir(&open).unwrap();
+        mode(&open, 0o777);
+        let link = open.join("rpi");
+        std::os::unix::fs::symlink(&rpi, &link).unwrap();
+        assert!(replaceable(&link, me, agent, agent_group).is_some());
+        assert!(replaceable(&dir.join("none"), me, agent, agent_group).is_some());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
