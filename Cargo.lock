@@ -3250,6 +3250,7 @@ dependencies = [
 name = "zephyr-policy"
 version = "0.6.0"
 dependencies = [
+ "libc",
  "rpi-plugin-sdk",
  "serde",
  "serde_json",

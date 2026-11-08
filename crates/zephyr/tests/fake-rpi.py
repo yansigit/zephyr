@@ -114,11 +114,12 @@ the rest): before the tool runs (and before any `tool_wait`), it sends
 {"v": 1, "session": $ZEPHYR_SESSION, "call_id", "tool", "args"} as one line and waits up to 5 s for
 the answer line, answering meanwhile (as rpi does while a plugin holds a call) the commands that
 need no run, so a note the daemon steers in before it answers is queued, and delivered right after
-the call's result. Only {"verdict": "allow"} runs the call; anything else (no socket, no answer, a
-bad one, a hold, a deny) refuses it, `isError` with "tool error: blocked" and nothing of the
-daemon's text, as rpi shows a vetoed call.
+the call's result. Only {"verdict": "allow"} runs the call; anything else (no socket, a socket
+served by a uid other than root or this script's owner (SO_PEERCRED, as the plugin checks), no
+answer, a bad one, a hold, a deny) refuses it, `isError` with "tool error: blocked" and nothing of
+the daemon's text, as rpi shows a vetoed call.
 """
-import glob, json, os, queue as queues, re, select, socket, sys, threading, time
+import glob, json, os, queue as queues, re, select, socket, struct, sys, threading, time
 
 args = sys.argv[1:]
 if "--version" in args:
@@ -481,6 +482,11 @@ def gate_allows(s, name, args, cid):
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
             c.settimeout(5)
             c.connect(path)
+            # As gate_client::trusted: root's daemon, or the uid that owns this program.
+            peer = struct.unpack("3i", c.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                                    struct.calcsize("3i")))[1]
+            if peer not in (0, os.stat(__file__).st_uid):
+                return False
             c.sendall((json.dumps(req) + "\n").encode())
             answer, deadline = b"", time.time() + 5
             while not answer.endswith(b"\n") and time.time() < deadline:

@@ -112,10 +112,15 @@ pub fn check_mcp(
 /// config (a hook, or a program the config names, in a project runs as the owner, on the host,
 /// at their next commit), and the real agent-browser, which clicks past the approvals gate's
 /// wrapper (approvals spec §4.4: `/opt/zephyr/libexec`, or `$ZEPHYR_AGENT_BROWSER` that names
-/// it). A name check: a copy of the binary gets past it (spec §2 non-goals).
+/// it), and `$ZEPHYR_GATE_SOCKET`, which would name another gate than the daemon's (the gate
+/// client also refuses a socket the daemon does not serve: I2). A name check: a copy of the
+/// binary gets past it (spec §2 non-goals).
 fn sensitive(path: &str) -> Option<&'static str> {
     if path.contains("ZEPHYR_AGENT_BROWSER") {
         return Some("the real agent-browser, past the approvals gate");
+    }
+    if path.contains(crate::tools::GATE_SOCKET_ENV) {
+        return Some("the approvals gate's socket, which only the daemon names");
     }
     let parts: Vec<&str> = path.split('/').collect();
     let named: Vec<&str> = parts
@@ -2029,6 +2034,11 @@ mod tests {
             bash("cp /opt/zephyr/libexec/agent-browser ~/.local/bin/ab"),
             bash("\"$ZEPHYR_AGENT_BROWSER\" click @e3"),
             bash("${ZEPHYR_AGENT_BROWSER} press Enter"),
+            // I2: another gate socket, where something else would answer for the daemon.
+            bash("ZEPHYR_GATE_SOCKET=/tmp/s agent-browser click @e3"),
+            bash("export ZEPHYR_GATE_SOCKET=/tmp/s; agent-browser click @e3"),
+            bash("env ZEPHYR_GATE_SOCKET=/tmp/s agent-browser press Enter"),
+            bash("env -u ZEPHYR_GATE_SOCKET agent-browser click @e3"),
             (
                 "read",
                 json!({ "path": "/opt/zephyr/libexec/agent-browser" }),

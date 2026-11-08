@@ -6,36 +6,46 @@
 //!
 //! Every command goes straight through (`exec`, as it was), except:
 //!
-//! - a click (`click`, `dblclick`, `tap`, `find … click`) and Enter (`press`/`key`/`keydown`
-//!   Enter, or a line break typed with `type` or `keyboard type`): the wrapper asks the real
-//!   binary for the page's address (`get url`) and for the control, its role and accessible name
-//!   (`snapshot`'s refs, scoped to a CSS selector when one names it; for a key press the focused
-//!   element, which a read-only script reports), classes it with `policy::browser_class`, and
-//!   takes a message, post or payment, or a control it could not read, to the gate socket;
+//! - a click (`click`, `dblclick`, `tap`, `find … click`) and Enter (`press`/`key`/`keydown`/
+//!   `keyup` Enter, `\n` or `\r`, or a line break typed with `type` or `keyboard type`): the
+//!   wrapper asks the real binary for the page's address (`get url`) and for the control, its
+//!   role and accessible name (`snapshot`'s refs and tree, scoped to a CSS selector when one
+//!   names it; for a key press the focused element, which a read-only script reports), classes
+//!   it with `gate::browser_class`, and takes a message, post or payment, or a control it could
+//!   not read, to the gate socket. A click lands on what holds its target (a span in a Send
+//!   button is the button's: R53); Enter in a form's field also counts the form's default
+//!   button, which it submits, and Space or Enter on a focused button is a click on it (I3);
+//!   anything typed before a line break is checked for the private facts (I1);
 //! - typing (`fill`, `type`, `keyboard type|inserttext`, `find … fill`): its value goes to the
 //!   gate first, for the private facts (never gated by class);
-//! - `batch` carrying any of these or reading its commands from stdin, and agent-browser's own
-//!   agents (`mcp`, `chat`), which would act past the wrapper: refused.
+//! - `batch` carrying any of these or reading its commands from stdin (each split as 0.41 splits
+//!   it: C1), and what acts on the page past the wrapper (agent-browser's `mcp` and `chat`, a
+//!   page's own tools through `webmcp invoke`: R55): refused.
 //!
 //! The wrapper then waits for the gate's verdict with its connection open (A7: a closed one is the
-//! action dropped, so a killed wrapper leaves nothing waiting). `allow` runs the agent's command
-//! as it was; anything else, a closed socket or no gate at all exits 1 with the daemon's words,
-//! or [`NOT_ANSWERING`], on stderr: what the agent reads. Nothing touches the page while it waits.
+//! action dropped, so a killed wrapper leaves nothing waiting), on a socket the daemon serves
+//! (`gate_client` checks its peer: I2). `allow` reads the page again, and runs the agent's
+//! command as it was only if the page is still the one the owner approved (I4); anything else, a
+//! closed socket or no gate at all exits 1 with the daemon's words, or [`NOT_ANSWERING`] or
+//! [`CHANGED`], on stderr: what the agent reads. Nothing touches the page while it waits, and
+//! every scoped snapshot the wrapper takes is followed by a full one, so the agent's refs resolve
+//! as before (R54).
 //!
 //! What is not gated, by design: an unrecognized label (documented limit), `eval`, `mouse`,
 //! `select`, `drag` and the rest of the commands (spec §4.4's list), and the real binary run by
 //! its path or by a copy (a name check, like the plugin's: spec §2 non-goals).
 
-use std::cell::OnceCell;
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use serde_json::{json, Value};
 use zephyr_policy::policy::{self, Class};
 
-use crate::gate::PageAmount;
+use crate::gate::{self, PageAmount};
 
 /// Names the real agent-browser for the wrapper (`gate::agent_env` sets it; tests name a fake).
 pub const REAL_ENV: &str = "ZEPHYR_AGENT_BROWSER";
@@ -45,13 +55,15 @@ pub const REAL: &str = "/opt/zephyr/libexec/agent-browser";
 pub const GATE_BIN: &str = "/opt/zephyr/gate/bin";
 /// What the agent reads when the gate cannot be asked or does not answer.
 pub const NOT_ANSWERING: &str = "the gate is not answering; not run";
+/// What the agent reads when the control or the page is not what the owner approved (I4).
+pub const CHANGED: &str = "the page changed while the owner decided; not run";
 
 const BATCH: &str = "not run: agent-browser batch takes no clicks, key presses or typing here, \
                      which the approvals gate checks one by one; run each as a command of its own";
 const BATCH_STDIN: &str = "not run: give agent-browser batch its commands as arguments here, so \
                            the approvals gate can check them";
-const AGENTS: &str = "not run: agent-browser's mcp and chat act on the page past the approvals \
-                      gate; use its commands";
+const AGENTS: &str = "not run: agent-browser's mcp, chat and webmcp invoke act on the page past \
+                      the approvals gate; use its commands";
 
 /// The longest a verdict takes: a browser wait's 10 minutes and the tick that ends them.
 const VERDICT_WAIT: Duration = Duration::from_secs(60 * crate::gate::WAIT_MINUTES as u64 + 60);
@@ -315,36 +327,76 @@ pub fn run(args: &[String], env: &Env) -> Next {
         return Next::Exec;
     }
     let argv = split(args);
-    let page = Page {
-        env,
-        flags: forwarded(&argv.globals),
-        snap: OnceCell::new(),
-    };
-    match what(&argv.rest) {
-        Act::Pass => Next::Exec,
-        Act::Refuse(text) => Next::Refuse(text.into()),
+    let flags = forwarded(&argv.globals);
+    let page = Page::new(env, &flags);
+    let act = what(&argv.rest);
+    match &act {
+        Act::Pass => return Next::Exec,
+        Act::Refuse(text) => return Next::Refuse((*text).into()),
         Act::Type { action, typed } => {
             let seen = Seen {
-                typed: vec![typed],
+                typed: vec![typed.clone()],
                 ..Seen::default()
             };
-            ask_gate(env, args, &browser(action, &page.url(), &seen))
+            return ask_gate(env, args, &request(action, &page.url(), &seen));
         }
+        Act::Click(_) | Act::Key { .. } => {}
+    }
+    let url = page.url();
+    let Some(Look { action, mut seen }) = look(&page, &act) else {
+        return Next::Exec;
+    };
+    let class = gate::browser_class(&request(action, &url, &seen));
+    // Through at once: a control read and no message, post or payment, with nothing typed that
+    // could hold a private fact (I1: a line break typed anywhere sends what came before it).
+    let typed = seen.typed.iter().any(|t| !t.trim().is_empty());
+    if class.is_none() && !seen.role.trim().is_empty() && !typed {
+        return Next::Exec;
+    }
+    if class == Some(Class::Money) {
+        seen.amount = page.total();
+        seen.title = page.title();
+    }
+    let first = Look { action, seen };
+    match ask_gate(env, args, &request(action, &url, &first.seen)) {
+        Next::Exec => {}
+        refused => return refused,
+    }
+    // I4: up to 10 minutes went by; what the owner approved must still be what runs.
+    match unchanged(&Page::new(env, &flags), &act, &url, &first, class) {
+        true => Next::Exec,
+        false => Next::Refuse(CHANGED.into()),
+    }
+}
+
+/// What the wrapper read for a click or a key press: the action the gate is told of (`click` or
+/// `press`) and the control.
+struct Look {
+    action: &'static str,
+    seen: Seen,
+}
+
+/// The control `act` lands on, read from the page; `None` for an action that does nothing the
+/// gate looks at (Space anywhere but on a button). Space or Enter on a focused button is a click
+/// on it (I3); Enter in a form's field reads what the form submits.
+fn look(page: &Page, act: &Act) -> Option<Look> {
+    match act {
         Act::Click(target) => {
-            let url = page.url();
-            let mut seen = page.control(&target);
+            let mut seen = page.control(target);
             if plain_submit(&seen) {
                 // A `submit` posts on a form with a textarea: unread, it counts as one.
-                seen.textarea = match page.eval(SUBMIT_JS) {
+                seen.textarea = match page.eval(&script("submit", "", SUBMIT_BODY)) {
                     Some(v) if v["found"].as_u64().is_some_and(|n| n > 0) => v["textarea"] == true,
                     _ => true,
                 };
             }
-            decide(env, args, &page, "click", &url, seen)
+            Some(Look {
+                action: "click",
+                seen,
+            })
         }
-        Act::Key { target, typed } => {
-            let url = page.url();
-            let mut seen = match &target {
+        Act::Key { target, typed, key } => {
+            let mut seen = match target {
                 Target::Focus => page.focused(),
                 target => {
                     let mut seen = page.control(target);
@@ -352,37 +404,69 @@ pub fn run(args: &[String], env: &Env) -> Next {
                     seen
                 }
             };
-            seen.typed.extend(typed);
-            decide(env, args, &page, "press", &url, seen)
+            if pressable(&seen.role) {
+                // A button pressed by a key: what clicking it does, nothing typed into it.
+                let pressed = Seen {
+                    role: seen.role,
+                    name: seen.name,
+                    ..Seen::default()
+                };
+                return Some(Look {
+                    action: "click",
+                    seen: pressed,
+                });
+            }
+            let unread = seen.role.trim().is_empty();
+            if *key == Key::Space && !unread {
+                return None; // a space typed, or the page scrolled
+            }
+            if !unread && !matches!(target, Target::Focus) {
+                seen = page.with_form(target, seen);
+            }
+            seen.typed.extend(typed.iter().cloned());
+            Some(Look {
+                action: "press",
+                seen,
+            })
         }
+        Act::Pass | Act::Refuse(_) | Act::Type { .. } => None,
     }
 }
 
-/// A click or a key press on `seen`: through at once when the control is read and is no message,
-/// post or payment; otherwise the gate decides (a payment with the page's total and title).
-fn decide(
-    env: &Env,
-    args: &[String],
-    page: &Page,
-    action: &str,
-    url: &str,
-    mut seen: Seen,
-) -> Next {
-    let class = seen.class();
-    if class.is_none() && !seen.role.trim().is_empty() {
-        return Next::Exec;
+/// Whether the page, read again after the owner's `allow`, still shows what the owner approved
+/// (I4): the same site, and for a control found by a selector, a locator or the focus, the same
+/// control (its role, name, form and what is typed); for a payment, the same total. A ref stays
+/// on its element (agent-browser's refs are per DOM node), so only its page is read again.
+fn unchanged(page: &Page, act: &Act, url: &str, first: &Look, class: Option<Class>) -> bool {
+    if origin_of(&page.url()) != origin_of(url) {
+        return false;
     }
-    if class == Some(Class::Money) {
-        seen.amount = page.snap().and_then(|s| page_total(&s.tree));
-        seen.title = page.title();
+    let by_ref = match act {
+        Act::Click(Target::Selector(s))
+        | Act::Key {
+            target: Target::Selector(s),
+            ..
+        } => ref_of(s).is_some(),
+        _ => false,
+    };
+    if !by_ref {
+        match look(page, act) {
+            Some(again) if again.action == first.action && again.seen.same(&first.seen) => {}
+            _ => return false,
+        }
     }
-    ask_gate(env, args, &browser(action, url, &seen))
+    class != Some(Class::Money) || page.total() == first.seen.amount
+}
+
+/// A role a key press activates as a click: Space or Enter on a focused button.
+fn pressable(role: &str) -> bool {
+    matches!(role, "button" | "menuitem")
 }
 
 /// The gate's verdict on the request (spec §4.2): `allow` runs the command; `hold` and `deny`
 /// refuse it with the daemon's text; no gate, a closed socket or an answer that cannot be read
 /// refuse it with [`NOT_ANSWERING`]. The connection stays open until the answer (A7).
-fn ask_gate(env: &Env, args: &[String], browser: &Value) -> Next {
+fn ask_gate(env: &Env, args: &[String], browser: &gate::Browser) -> Next {
     let Some(socket) = &env.socket else {
         return Next::Refuse(NOT_ANSWERING.into());
     };
@@ -403,22 +487,31 @@ fn ask_gate(env: &Env, args: &[String], browser: &Value) -> Next {
     }
 }
 
-/// The request's `browser` part (`gate::Browser`).
-fn browser(action: &str, url: &str, seen: &Seen) -> Value {
-    let origin = crate::vault::origin(url).map_or_else(String::new, |o| o.ascii_serialization());
-    json!({
-        "action": action,
-        "url": url,
-        "origin": origin,
-        "role": seen.role,
-        "name": seen.name,
-        "typed": seen.typed,
-        "form_textarea": seen.textarea,
-        "form_password": seen.password,
-        "composer": seen.composer,
-        "amount": seen.amount,
-        "title": seen.title,
-    })
+/// The request's `browser` part, which the gate classes as the wrapper does
+/// (`gate::browser_class`).
+fn request(action: &str, url: &str, seen: &Seen) -> gate::Browser {
+    gate::Browser {
+        action: action.into(),
+        url: url.into(),
+        origin: origin_of(url),
+        role: seen.role.clone(),
+        name: seen.name.clone(),
+        typed: seen.typed.clone(),
+        form_textarea: seen.textarea,
+        form_password: seen.password,
+        composer: seen.composer,
+        amount: seen.amount.clone(),
+        title: seen.title.clone(),
+        submit: (seen.submit.as_ref()).map(|c| gate::Element {
+            role: c.role.clone(),
+            name: c.name.clone(),
+        }),
+    }
+}
+
+/// `https://mail.example.com` for a page there; empty when its address cannot be read.
+fn origin_of(url: &str) -> String {
+    crate::vault::origin(url).map_or_else(String::new, |o| o.ascii_serialization())
 }
 
 // ---- the agent's command ----
@@ -483,10 +576,11 @@ enum Act {
     Refuse(&'static str),
     /// A click on the target.
     Click(Target),
-    /// Enter in the focused element, or in the target a line break is typed into.
+    /// Enter or Space in the focused element, or Enter in the target a line break is typed into.
     Key {
         target: Target,
         typed: Vec<String>,
+        key: Key,
     },
     /// Typing a value (`fill`, `type`).
     Type {
@@ -524,12 +618,15 @@ fn what(rest: &[String]) -> Act {
                 .find(|a| !matches!(a.as_str(), "--new-tab" | "--human"));
             sel.map_or(Act::Pass, |s| Act::Click(Target::Selector(s.clone())))
         }
-        "press" | "key" | "keydown" => match args.first() {
-            Some(key) if enter(key) => Act::Key {
+        // A key going up can send too (a page's own handler); keydown and keyup send the key
+        // as named (0.41), press reads `\n` and chords as Enter.
+        "press" | "key" | "keydown" | "keyup" => match args.first().and_then(|k| key_of(k)) {
+            Some(key) => Act::Key {
                 target: Target::Focus,
                 typed: Vec::new(),
+                key,
             },
-            _ => Act::Pass,
+            None => Act::Pass,
         },
         "keyboard" => match args.split_first() {
             Some((sub, words)) if matches!(sub.as_str(), "type" | "inserttext" | "insertText") => {
@@ -563,29 +660,50 @@ fn what(rest: &[String]) -> Act {
         "find" => find(args),
         "batch" => batch(args),
         "mcp" | "chat" => Act::Refuse(AGENTS),
+        // R55: `webmcp invoke` calls a page's own tool (a send, a checkout); listing and reading
+        // them do nothing.
+        "webmcp" => match args.first().map(String::as_str) {
+            Some("invoke") => Act::Refuse(AGENTS),
+            _ => Act::Pass,
+        },
         _ => Act::Pass,
     }
 }
 
-/// Typing `typed`: a facts check, or with a line break where Enter would go (`enter_in`), a key
-/// press there. Nothing typed is nothing to check.
+/// Typing `typed`: with a line break where Enter would go (`enter_in`), a key press there, which
+/// 0.41 sends as a real Enter for each `\n` or `\r` (`type_text_into_active_context`), however
+/// little else is typed (C2); else a facts check. Nothing typed is nothing to check.
 fn typing(action: &'static str, typed: String, enter_in: Option<Target>) -> Act {
-    if typed.trim().is_empty() {
-        return Act::Pass;
-    }
     match enter_in {
         Some(target) if typed.contains(['\n', '\r']) => Act::Key {
             target,
             typed: vec![typed],
+            key: Key::Enter,
         },
+        _ if typed.trim().is_empty() => Act::Pass,
         _ => Act::Type { action, typed },
     }
 }
 
-/// `Enter`, `Control+Enter`, `NumpadEnter`, `Return`: a key that sends.
-fn enter(key: &str) -> bool {
-    let last = key.rsplit('+').next().unwrap_or(key).to_ascii_lowercase();
-    matches!(last.as_str(), "enter" | "return" | "numpadenter")
+/// A key the wrapper looks at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Key {
+    /// Sends: a message in a composer, a form through its default button, a focused button.
+    Enter,
+    /// Presses a focused button.
+    Space,
+}
+
+/// The key a `press` names, as 0.41 reads it (`parse_key_chord`, `named_key_info`): the part
+/// after the last `+`, any case. `Enter`, `Return`, `NumpadEnter` and a single `\n` or `\r` are
+/// Enter; `Space` and a single space are Space.
+fn key_of(key: &str) -> Option<Key> {
+    let last = key.rsplit('+').next().unwrap_or(key).to_lowercase();
+    match last.as_str() {
+        "enter" | "return" | "numpadenter" | "\n" | "\r" => Some(Key::Enter),
+        "space" | " " => Some(Key::Space),
+        _ => None,
+    }
 }
 
 /// `find LOCATOR VALUE [ACTION] [TEXT] [--name N] [--exact]`, `find nth N SELECTOR [ACTION]
@@ -642,8 +760,11 @@ fn find(args: &[String]) -> Act {
     }
 }
 
-/// A batch passes only when none of its commands would need the gate, read as the wrapper reads a
-/// command; one read from stdin cannot be seen first, so it is refused.
+/// A batch passes only when none of its commands would need the gate; one read from stdin cannot
+/// be seen first, so it is refused. Each command is split as 0.41 splits it
+/// ([`shell_words_split`], never read as JSON) and parsed as it stands, no flag taken out
+/// (`run_batch` calls `parse_command` on it); it is also read the top level's way, flags out,
+/// and either reading that needs the gate refuses the batch (C1).
 fn batch(args: &[String]) -> Act {
     let commands: Vec<&String> = (args.iter())
         .filter(|a| !matches!(a.as_str(), "--bail" | "--omit-command"))
@@ -652,16 +773,11 @@ fn batch(args: &[String]) -> Act {
         return Act::Refuse(BATCH_STDIN);
     }
     for c in commands {
-        let words: Vec<String> = match c.trim_start().starts_with('[') {
-            true => match serde_json::from_str(c) {
-                Ok(words) => words,
-                Err(_) => return Act::Refuse(BATCH),
-            },
-            false => (c.split_whitespace())
-                .map(|w| w.trim_matches(['"', '\'']).to_string())
-                .collect(),
-        };
-        if what(&split(&words).rest) != Act::Pass {
+        let words = shell_words_split(c);
+        if words.is_empty() {
+            continue; // 0.41 skips an empty command
+        }
+        if what(&words) != Act::Pass || what(&split(&words).rest) != Act::Pass {
             return Act::Refuse(BATCH);
         }
     }
@@ -672,27 +788,28 @@ fn batch(args: &[String]) -> Act {
 
 /// What the wrapper read of the control: what `gate::Browser` carries. No `Debug`: what is
 /// typed can hold a private fact.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Seen {
     role: String,
     name: String,
     textarea: bool,
     password: bool,
     composer: bool,
+    /// For a key press in a form's field: the form's default button (I3).
+    submit: Option<Control>,
     typed: Vec<String>,
     amount: Option<PageAmount>,
     title: String,
 }
 
 impl Seen {
-    fn class(&self) -> Option<Class> {
-        policy::browser_class(
-            &self.role,
-            &self.name,
-            self.textarea,
-            self.password,
-            self.composer,
-        )
+    /// The same control, read twice (I4): everything its class comes from, and what is typed.
+    fn same(&self, other: &Seen) -> bool {
+        (self.role == other.role && self.name == other.name)
+            && (self.textarea, self.password, self.composer)
+                == (other.textarea, other.password, other.composer)
+            && self.submit == other.submit
+            && self.typed == other.typed
     }
 }
 
@@ -705,7 +822,8 @@ fn plain_submit(seen: &Seen) -> bool {
     words == ["submit"] && matches!(seen.role.as_str(), "button" | "menuitem")
 }
 
-/// A control as a snapshot names it.
+/// A control as a snapshot (or a page script) names it. An empty role is a control the wrapper
+/// could not read, which the gate holds (R39); its name still gives its class.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Control {
     role: String,
@@ -720,11 +838,50 @@ impl Control {
             ..Seen::default()
         }
     }
+
+    /// `{role, name}` from a page script; `None` for anything else.
+    fn of(v: &Value) -> Option<Control> {
+        let s = |k: &str| v[k].as_str().map(|s| s.trim().to_string());
+        Some(Control {
+            role: s("role")?,
+            name: s("name").unwrap_or_default(),
+        })
+    }
+
+    fn unread(name: String) -> Control {
+        Control {
+            role: String::new(),
+            name,
+        }
+    }
 }
 
-/// A snapshot: its refs (each control's role and name) and its text.
+/// The roles agent-browser 0.41 counts as interactive (snapshot.rs `INTERACTIVE_ROLES`, but an
+/// iframe, whose click lands on whatever is inside it): what a click on one lands on is itself.
+const INTERACTIVE: &[&str] = &[
+    "button",
+    "link",
+    "textbox",
+    "checkbox",
+    "radio",
+    "combobox",
+    "listbox",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "option",
+    "searchbox",
+    "slider",
+    "spinbutton",
+    "switch",
+    "tab",
+    "treeitem",
+];
+
+/// A snapshot: its refs (each control's role and name), its text and that text's lines.
 struct Snap {
     refs: Vec<(String, Control)>,
+    nodes: Vec<Line>,
     tree: String,
 }
 
@@ -743,37 +900,102 @@ impl Snap {
             .collect();
         let number = |r: &str| r.trim_start_matches('e').parse::<u64>().unwrap_or(u64::MAX);
         refs.sort_by_key(|(r, _)| number(r));
-        Some(Snap { refs, tree })
+        let nodes = tree.lines().filter_map(line).collect();
+        Some(Snap { refs, nodes, tree })
     }
 
-    /// The controls at the top of the tree: what a snapshot scoped to a selector matched.
-    fn top(&self) -> Vec<Control> {
-        let lines: Vec<Line> = self.tree.lines().filter_map(line).collect();
-        let depth = lines.iter().map(|l| l.depth).min();
-        (lines.into_iter())
-            .filter(|l| Some(l.depth) == depth)
-            .map(|l| Control {
-                role: l.role,
-                name: l.name,
-            })
+    /// The lines at the top of the tree: what a snapshot scoped to a selector matched.
+    fn top(&self) -> Vec<usize> {
+        let depth = self.nodes.iter().map(|l| l.depth).min();
+        (0..self.nodes.len())
+            .filter(|&i| Some(self.nodes[i].depth) == depth)
             .collect()
+    }
+
+    /// The control a click on ref `r` lands on ([`Snap::receiver`]): one nothing clickable
+    /// holds is one the wrapper could not read, named by its text (R53). `None`: no such ref.
+    fn by_ref(&self, r: &str) -> Option<Control> {
+        let (_, control) = self.refs.iter().find(|(id, _)| id == r)?;
+        let at = (self.nodes.iter()).position(|n| n.reference.as_deref() == Some(r));
+        Some(match at {
+            Some(i) => (self.receiver(i)).unwrap_or_else(|| Control::unread(self.text_of(i))),
+            None if INTERACTIVE.contains(&control.role.as_str()) => control.clone(),
+            None => Control::unread(control.name.clone()),
+        })
+    }
+
+    /// What a click on line `i` lands on (R53): the line itself when it is interactive, else the
+    /// nearest line holding it that is; one agent-browser marks clickable or focusable (a `div`
+    /// with a click handler, no role) is a button named by its text. `None` when nothing in the
+    /// tree is.
+    fn receiver(&self, i: usize) -> Option<Control> {
+        let mut depth = self.nodes[i].depth;
+        if let Some(c) = self.as_control(i) {
+            return Some(c);
+        }
+        for j in (0..i).rev() {
+            if self.nodes[j].depth >= depth {
+                continue;
+            }
+            depth = self.nodes[j].depth;
+            if let Some(c) = self.as_control(j) {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    /// Line `i` as a control a click lands on: an interactive role with the browser's own name
+    /// for it, or one agent-browser's scan found clickable (a button named by its text) or
+    /// editable; `None` for any other.
+    fn as_control(&self, i: usize) -> Option<Control> {
+        let n = &self.nodes[i];
+        let (role, name) = match n.cursor.as_deref() {
+            _ if INTERACTIVE.contains(&n.role.as_str()) => (n.role.clone(), n.name.clone()),
+            Some("clickable" | "focusable") => ("button".into(), self.text_of(i)),
+            Some("editable") => ("textbox".into(), n.name.clone()),
+            _ => return None,
+        };
+        Some(Control { role, name })
+    }
+
+    /// Line `i`'s name, or with none the names of the lines it holds, as a button's text.
+    fn text_of(&self, i: usize) -> String {
+        let n = &self.nodes[i];
+        if !n.name.trim().is_empty() {
+            return n.name.trim().to_string();
+        }
+        let inside = (self.nodes[i + 1..].iter()).take_while(|l| l.depth > n.depth);
+        let words: Vec<&str> = (inside.map(|l| l.name.trim()))
+            .filter(|t| !t.is_empty())
+            .collect();
+        words.join(" ").chars().take(200).collect()
     }
 }
 
 /// The real binary, asked as the agent's own command would be (its session, its browser).
 struct Page<'a> {
     env: &'a Env,
-    flags: Vec<String>,
-    snap: OnceCell<Option<Snap>>,
+    flags: &'a [String],
+    /// The page's full snapshot, taken once (and again after a scoped one: [`Page::restore`]).
+    snap: RefCell<Option<Rc<Option<Snap>>>>,
 }
 
-impl Page<'_> {
+impl<'a> Page<'a> {
+    fn new(env: &'a Env, flags: &'a [String]) -> Page<'a> {
+        Page {
+            env,
+            flags,
+            snap: RefCell::new(None),
+        }
+    }
+
     /// `agent-browser FLAGS ARGS --json`: the answer's `data`, `None` when it fails, says it did
     /// not succeed, or takes longer than [`FACT_WAIT`].
     fn ask(&self, args: &[&str]) -> Option<Value> {
         use std::io::Read;
         let mut child = Command::new(&self.env.real)
-            .args(&self.flags)
+            .args(self.flags)
             .args(args)
             .arg("--json")
             .stdin(Stdio::null())
@@ -823,13 +1045,30 @@ impl Page<'_> {
         title.unwrap_or_default().to_string()
     }
 
-    /// The page's snapshot, taken once. It keeps the agent's refs: they belong to the elements,
-    /// and a snapshot gives each element the ref it had.
-    fn snap(&self) -> Option<&Snap> {
-        let taken = self
-            .snap
-            .get_or_init(|| Snap::of(&self.ask(&["snapshot"])?));
-        taken.as_ref()
+    /// The page's labelled total, from its snapshot.
+    fn total(&self) -> Option<PageAmount> {
+        self.with_snap(|s| page_total(&s.tree)).flatten()
+    }
+
+    /// `f` of the page's full snapshot, taken once; `None` when it cannot be taken. A snapshot
+    /// gives each element the ref it had (0.41 `durable_ref`), so the agent's refs keep theirs.
+    fn with_snap<R>(&self, f: impl FnOnce(&Snap) -> R) -> Option<R> {
+        let taken = self.snap.borrow().clone();
+        let snap = taken.unwrap_or_else(|| {
+            let snap = Rc::new(self.ask(&["snapshot"]).as_ref().and_then(Snap::of));
+            *self.snap.borrow_mut() = Some(snap.clone());
+            snap
+        });
+        Option::as_ref(&snap).map(f)
+    }
+
+    /// R54: a snapshot rebuilds agent-browser's ref map from what it read (0.41 `handle_snapshot`
+    /// calls `begin_snapshot`, which clears it). A scoped one re-adds the refs of the page's own
+    /// document but not a frame's, and none at all when its selector matches nothing there; so
+    /// after each, a full one is taken, which leaves the map as the agent's own snapshot did.
+    fn restore(&self) {
+        *self.snap.borrow_mut() = None;
+        self.with_snap(|_| ());
     }
 
     /// A read-only script's answer, its JSON text read back.
@@ -843,17 +1082,16 @@ impl Page<'_> {
         }
     }
 
-    /// The control `target` names. Nothing readable (no such ref, a failed snapshot) is a control
-    /// with neither role nor name, which the gate holds; a locator whose text the page has
-    /// nowhere keeps that text as the name, for its class (R39).
+    /// The control `target` names, as a click on it lands (R53). Nothing readable (no such
+    /// ref, a failed snapshot) is a control with neither role nor name, which the gate holds; a
+    /// locator whose text the page has nowhere keeps that text as the name, for its class (R39).
     fn control(&self, target: &Target) -> Seen {
         match target {
             Target::Focus => self.focused(),
             Target::Selector(sel) => {
                 if let Some(r) = ref_of(sel) {
-                    let snap = self.snap();
-                    let found = snap.and_then(|s| s.refs.iter().find(|(id, _)| id == r));
-                    return found.map_or_else(Seen::default, |(_, c)| c.seen());
+                    let found = self.with_snap(|s| s.by_ref(r)).flatten();
+                    return found.map_or_else(Seen::default, |c| c.seen());
                 }
                 if let Some(text) = sel.strip_prefix("text=") {
                     return self.named(text, false);
@@ -870,17 +1108,17 @@ impl Page<'_> {
                 exact,
             } => match by.as_str() {
                 "role" => {
-                    let Some(snap) = self.snap() else {
-                        return Seen::default();
-                    };
                     let fits = |c: &Control| {
                         c.role.eq_ignore_ascii_case(value)
                             && name
                                 .as_deref()
                                 .is_none_or(|n| matches_text(&c.name, n, *exact))
                     };
-                    let all = snap.refs.iter().map(|(_, c)| c).filter(|c| fits(c));
-                    strictest(all.cloned().collect()).map_or_else(Seen::default, |c| c.seen())
+                    let all = self.with_snap(|s| {
+                        let ids = s.refs.iter().filter(|(_, c)| fits(c));
+                        ids.filter_map(|(id, _)| s.by_ref(id)).collect()
+                    });
+                    strictest(all.unwrap_or_default()).map_or_else(Seen::default, |c| c.seen())
                 }
                 "text" | "label" | "placeholder" | "alt" | "title" => self.named(value, *exact),
                 "testid" => self.scoped(&format!("[data-testid={}]", Value::from(value.as_str()))),
@@ -889,17 +1127,19 @@ impl Page<'_> {
         }
     }
 
-    /// The strictest control whose name holds `text` (all of it with `exact`); none is `text`
-    /// itself, with no role.
+    /// The strictest control a click on an element whose name holds `text` (all of it with
+    /// `exact`) lands on; none is `text` itself, with no role.
     fn named(&self, text: &str, exact: bool) -> Seen {
-        let Some(snap) = self.snap() else {
+        let found = self.with_snap(|s| {
+            let ids = s
+                .refs
+                .iter()
+                .filter(|(_, c)| matches_text(&c.name, text, exact));
+            ids.filter_map(|(id, _)| s.by_ref(id)).collect::<Vec<_>>()
+        });
+        let Some(found) = found else {
             return Seen::default();
         };
-        let all = snap.refs.iter().map(|(_, c)| c);
-        let found: Vec<Control> = all
-            .filter(|c| matches_text(&c.name, text, exact))
-            .cloned()
-            .collect();
         match strictest(found) {
             Some(c) => c.seen(),
             None => Seen {
@@ -909,18 +1149,76 @@ impl Page<'_> {
         }
     }
 
-    /// The strictest control a CSS selector matches, read from a snapshot scoped to it.
+    /// The strictest control a CSS selector's match lands on, read from a snapshot scoped to
+    /// it. A match with no interactive role is classed by what holds it in the page, which a
+    /// scoped snapshot does not show (R53): a script finds its nearest clickable ancestor.
     fn scoped(&self, selector: &str) -> Seen {
         let scoped = self.ask(&["snapshot", "-s", selector]);
-        let top = scoped.as_ref().and_then(Snap::of).map(|s| s.top());
-        strictest(top.unwrap_or_default()).map_or_else(Seen::default, |c| c.seen())
+        self.restore();
+        let Some(snap) = scoped.as_ref().and_then(Snap::of) else {
+            return Seen::default();
+        };
+        let (mut found, mut loose) = (Vec::new(), None);
+        for i in snap.top() {
+            match snap.receiver(i) {
+                Some(c) => found.push(c),
+                None => {
+                    loose.get_or_insert(i);
+                }
+            }
+        }
+        if let Some(i) = loose {
+            let setup = format!("const sel = {};", Value::from(selector));
+            let holder = self.eval(&script("holder", &setup, HOLDER_BODY));
+            let holder = holder.filter(|v| v["unread"] != true);
+            found.push(holder.as_ref().and_then(Control::of).unwrap_or_else(|| {
+                // Nothing read: a control the gate could not read, named by its text.
+                Control::unread(snap.text_of(i))
+            }));
+        }
+        strictest(found).map_or_else(Seen::default, |c| c.seen())
+    }
+
+    /// `seen` (a field the agent types a line break into) with what Enter submits there (I3):
+    /// the form a script finds it in by its selector (or, for a ref or a text, by its name: a
+    /// script cannot reach an element by ref), with that form's flags and default button; of
+    /// several forms, the strictest. Not read: a control the gate could not read.
+    fn with_form(&self, target: &Target, seen: Seen) -> Seen {
+        let css = match target {
+            Target::Selector(s) if ref_of(s).is_none() && !s.starts_with("text=") => Some(s),
+            _ => None,
+        };
+        let setup = format!(
+            "const sel = {}, name = {};",
+            css.map_or(Value::Null, |s| Value::from(s.as_str())),
+            Value::from(seen.name.as_str()),
+        );
+        let answer = self.eval(&script("forms", &setup, FORMS_BODY));
+        let forms = answer.as_ref().and_then(|v| v["forms"].as_array());
+        let Some(forms) = forms else {
+            return Seen {
+                role: String::new(),
+                ..seen
+            };
+        };
+        let with = |f: &Value| Seen {
+            textarea: f["textarea"] == true,
+            password: f["password"] == true,
+            submit: Control::of(&f["submit"]),
+            ..seen.clone()
+        };
+        let class = |s: &Seen| gate::browser_class(&request("press", "", s));
+        let ranked = forms.iter().map(with).enumerate();
+        let best = ranked.max_by_key(|(i, s)| (class(s), std::cmp::Reverse(*i)));
+        best.map_or(seen, |(_, s)| s)
     }
 
     /// The focused element, read by a script (a snapshot does not mark focus): its role and name
     /// with its placeholder folded in (a search box named only by its placeholder stays one), its
-    /// text (what Enter sends, checked for facts and shown on the card) and its form.
+    /// text (what Enter sends, checked for facts and shown on the card), its form and that form's
+    /// default button (what Enter in a field submits: I3).
     fn focused(&self) -> Seen {
-        let Some(v) = self.eval(FOCUS_JS) else {
+        let Some(v) = self.eval(&script("focus", "", FOCUS_BODY)) else {
             return Seen::default();
         };
         if v["unread"] == true {
@@ -942,6 +1240,7 @@ impl Page<'_> {
             name,
             textarea: v["textarea"] == true,
             password: v["password"] == true,
+            submit: Control::of(&v["submit"]),
             typed: (!value.trim().is_empty())
                 .then_some(value)
                 .into_iter()
@@ -972,92 +1271,190 @@ fn matches_text(name: &str, text: &str, exact: bool) -> bool {
 }
 
 /// Of the controls an action may land on, the one whose class is strictest (a payment, a post, a
-/// message), else the first.
+/// message), one the wrapper could not read before one it read, else the first.
 fn strictest(controls: Vec<Control>) -> Option<Control> {
-    let rank = |c: &Control| match policy::browser_class(&c.role, &c.name, false, false, false) {
-        Some(Class::Money) => 3,
-        Some(Class::Posts) => 2,
-        Some(Class::Messages) => 1,
-        None => 0,
+    let rank = |c: &Control| {
+        let class = policy::browser_class(&c.role, &c.name, false, false, false);
+        (class, c.role.trim().is_empty())
     };
     let ranked = controls.into_iter().enumerate();
     let best = ranked.max_by_key(|(i, c)| (rank(c), std::cmp::Reverse(*i)));
     best.map(|(_, c)| c)
 }
 
-/// The focused element's facts, as JSON text: `{unread}` inside another site's frame, `{role:
-/// "document"}` when nothing is focused. Reads the page only.
-const FOCUS_JS: &str = r#"(() => {
-  let e = document.activeElement;
-  for (let i = 0; e && i < 16; i++) {
-    if (e.shadowRoot && e.shadowRoot.activeElement) { e = e.shadowRoot.activeElement; continue; }
-    if (e.tagName === 'IFRAME' || e.tagName === 'FRAME') {
-      let d = null;
-      try { d = e.contentDocument; } catch (_) {}
-      if (!d) return JSON.stringify({ unread: true });
-      e = d.activeElement;
-      continue;
-    }
-    break;
-  }
-  if (!e) return JSON.stringify({ unread: true });
+/// A page script: `/*zephyr:KIND*/` first (tests' fake browser answers by it), then
+/// [`JS_LIB`], `setup` (the script's inputs, as JSON) and `body`. Each reads the page only and
+/// returns JSON text.
+fn script(kind: &str, setup: &str, body: &str) -> String {
+    format!("/*zephyr:{kind}*/(() => {{\n{JS_LIB}\n{setup}\n{body}\n}})()")
+}
+
+/// What the page scripts share: an element's role and accessible name as the browser would give
+/// them (near enough: the snapshot's are the browser's own), and a form's facts.
+const JS_LIB: &str = r#"const INPUTS = { search: 'searchbox', button: 'button', submit: 'button', reset: 'button',
+  image: 'button', checkbox: 'checkbox', radio: 'radio', range: 'slider', number: 'spinbutton' };
+const INTERACTIVE = { button: 1, link: 1, textbox: 1, checkbox: 1, radio: 1, combobox: 1,
+  listbox: 1, menuitem: 1, menuitemcheckbox: 1, menuitemradio: 1, option: 1, searchbox: 1,
+  slider: 1, spinbutton: 1, switch: 1, tab: 1, treeitem: 1 };
+// The roles named by their content (a field's content is what is typed in it).
+const BY_CONTENT = { button: 1, link: 1, menuitem: 1, menuitemcheckbox: 1, menuitemradio: 1,
+  option: 1, tab: 1, treeitem: 1 };
+const raw = n => ((n && (n.innerText || n.textContent)) || '').trim();
+const text = n => raw(n).replace(/\s+/g, ' ');
+const roleOf = e => {
+  const explicit = (e.getAttribute('role') || '').trim().split(/\s+/)[0].toLowerCase();
+  if (explicit) return explicit;
+  const tag = e.tagName.toLowerCase(), type = (e.getAttribute('type') || '').toLowerCase();
+  if (tag === 'textarea') return 'textbox';
+  if (tag === 'input') return INPUTS[type] || 'textbox';
+  if (tag === 'button' || tag === 'summary') return 'button';
+  if ((tag === 'a' || tag === 'area') && e.hasAttribute('href')) return 'link';
+  if (tag === 'select') return 'combobox';
+  if (e.isContentEditable) return 'textbox';
+  return 'generic';
+};
+const nameOf = (e, byContent) => {
   const doc = e.ownerDocument;
-  if (e === doc.body || e === doc.documentElement) return JSON.stringify({ role: 'document', name: '' });
-  const tag = e.tagName.toLowerCase();
-  const type = (e.getAttribute('type') || '').toLowerCase();
-  const inputs = { search: 'searchbox', button: 'button', submit: 'button', reset: 'button',
-    image: 'button', checkbox: 'checkbox', radio: 'radio', range: 'slider', number: 'spinbutton' };
-  let role = (e.getAttribute('role') || '').trim().split(/\s+/)[0];
-  if (!role) {
-    if (tag === 'textarea') role = 'textbox';
-    else if (tag === 'input') role = inputs[type] || 'textbox';
-    else if (tag === 'button') role = 'button';
-    else if (tag === 'a' && e.hasAttribute('href')) role = 'link';
-    else if (tag === 'select') role = 'combobox';
-    else if (e.isContentEditable) role = 'textbox';
-    else role = 'generic';
-  }
-  const text = n => ((n && (n.innerText || n.textContent)) || '').trim();
   const by = (e.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
     .map(id => text(doc.getElementById(id))).join(' ').trim();
   const labels = e.labels ? Array.from(e.labels).map(text).join(' ').trim() : '';
   let name = (e.getAttribute('aria-label') || '').trim() || by || labels;
-  if (!name && (role === 'button' || role === 'link' || role === 'menuitem')) name = text(e) || e.value || '';
+  if (!name && byContent) name = text(e) || e.value || '';
   if (!name) name = e.getAttribute('title') || e.getAttribute('alt') || '';
-  const field = tag === 'textarea' || (tag === 'input' && (!(type in inputs) || type === 'search'));
-  // A password's value is never read: the vault's fill handles logins.
-  const value = e.isContentEditable ? text(e) : field && type !== 'password' ? (e.value || '') : '';
-  const form = e.form || (e.closest && e.closest('form'));
-  return JSON.stringify({
-    role, name: String(name).trim(),
-    placeholder: e.getAttribute('placeholder') || e.getAttribute('aria-placeholder') || '',
-    editable: !!e.isContentEditable || field, value: String(value).slice(0, 4000),
-    textarea: !!(form && form.querySelector('textarea, [contenteditable]:not([contenteditable="false"])')),
-    password: !!(form && form.querySelector('input[type="password" i]')),
-  });
-})()"#;
+  return String(name).replace(/\s+/g, ' ').trim();
+};
+const find = sel => {
+  try {
+    if (sel.startsWith('xpath=')) return document.evaluate(sel.slice(6), document, null,
+      XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+    return document.querySelector(sel);
+  } catch (_) { return null; }
+};
+const formOf = e => e.form || (e.closest && e.closest('form')) || null;
+const submitOf = form => {
+  if (!form) return null;
+  const all = form.ownerDocument.querySelectorAll('button, input[type="submit" i], input[type="image" i]');
+  for (const b of all) {
+    if (b.form === form && (b.type === 'submit' || b.type === 'image')) {
+      return { role: 'button', name: nameOf(b, true) };
+    }
+  }
+  return null;
+};
+const formFacts = form => ({
+  textarea: !!(form && form.querySelector('textarea, [contenteditable]:not([contenteditable="false"])')),
+  password: !!(form && form.querySelector('input[type="password" i]')),
+  submit: submitOf(form),
+});"#;
 
-/// Whether a form holding a control named `submit` has a textarea (or an editable area). Reads the
-/// page only.
-const SUBMIT_JS: &str = r#"(() => {
-  const norm = s => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-  const named = e => norm(e.getAttribute('aria-label') || e.innerText || e.value || e.getAttribute('title'));
-  const all = Array.from(document.querySelectorAll('button, input[type="submit" i], input[type="button" i], ' +
-    'input[type="image" i], [role="button"], [role="menuitem"]')).filter(e => named(e) === 'submit');
-  const forms = all.map(e => e.form || e.closest('form'));
-  const area = 'textarea, [contenteditable]:not([contenteditable="false"])';
-  return JSON.stringify({ found: all.length, textarea: forms.some(f => !!(f && f.querySelector(area))) });
-})()"#;
+/// The focused element's facts: `{unread}` inside another site's frame, `{role: "document"}`
+/// when nothing is focused; for a field in a form, the form's facts and default button.
+const FOCUS_BODY: &str = r#"let e = document.activeElement;
+for (let i = 0; e && i < 16; i++) {
+  if (e.shadowRoot && e.shadowRoot.activeElement) { e = e.shadowRoot.activeElement; continue; }
+  if (e.tagName === 'IFRAME' || e.tagName === 'FRAME') {
+    let d = null;
+    try { d = e.contentDocument; } catch (_) {}
+    if (!d) return JSON.stringify({ unread: true });
+    e = d.activeElement;
+    continue;
+  }
+  break;
+}
+if (!e) return JSON.stringify({ unread: true });
+const doc = e.ownerDocument;
+if (e === doc.body || e === doc.documentElement) return JSON.stringify({ role: 'document', name: '' });
+const tag = e.tagName.toLowerCase();
+const type = (e.getAttribute('type') || '').toLowerCase();
+const role = roleOf(e);
+const name = nameOf(e, !!BY_CONTENT[role]);
+const field = tag === 'textarea' || (tag === 'input' && (!(type in INPUTS) || type === 'search'));
+// A password's value is never read: the vault's fill handles logins.
+const value = e.isContentEditable ? raw(e) : field && type !== 'password' ? (e.value || '') : '';
+const facts = formFacts(formOf(e));
+return JSON.stringify({
+  role, name,
+  placeholder: e.getAttribute('placeholder') || e.getAttribute('aria-placeholder') || '',
+  editable: !!e.isContentEditable || field, value: String(value).slice(0, 4000),
+  textarea: facts.textarea, password: facts.password,
+  // Enter on a button presses the button; in any other control of a form, it submits the form.
+  submit: role === 'button' ? null : facts.submit,
+});"#;
+
+/// What holds `sel`'s match (R53): the match or its nearest ancestor with an interactive role,
+/// or one a click handler, a tab stop or its own pointer cursor makes clickable (a button named
+/// by its text), as agent-browser's own scan finds them; `{role: ""}` with its text for none.
+const HOLDER_BODY: &str = r#"const e = find(sel);
+if (!e) return JSON.stringify({ unread: true });
+const up = n => n.parentElement || (n.parentNode && n.parentNode.host) || null;
+const pointer = n => { try { return getComputedStyle(n).cursor === 'pointer'; } catch (_) { return false; } };
+for (let n = e, i = 0; n && i < 64; n = up(n), i++) {
+  if (n.nodeType !== 1) continue;
+  const role = roleOf(n);
+  if (INTERACTIVE[role]) return JSON.stringify({ role, name: nameOf(n, !!BY_CONTENT[role]) });
+  const tab = n.getAttribute('tabindex');
+  const parent = up(n);
+  const own = pointer(n) && !(parent && parent.nodeType === 1 && pointer(parent));
+  if (n.hasAttribute('onclick') || n.onclick !== null || (tab !== null && tab !== '-1') || own) {
+    return JSON.stringify({ role: 'button', name: nameOf(n, true) });
+  }
+}
+return JSON.stringify({ role: '', name: text(e).slice(0, 200) });"#;
+
+/// The forms a field may be in (I3), each with its facts and default button: the field `sel`
+/// matches, or with no selector the fields named `name` in the page and the frames it can reach
+/// (all of their fields when none is), as a script cannot reach an element by ref; `{unread}`
+/// when `sel` matches nothing.
+const FORMS_BODY: &str = r#"const norm = s => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+let fields = [];
+if (sel !== null) {
+  const e = find(sel);
+  if (!e) return JSON.stringify({ unread: true });
+  fields = [e];
+} else {
+  // The page's own document and those of the frames it can reach (a ref may be in one).
+  const docs = [document];
+  for (let i = 0; i < docs.length && docs.length < 32; i++) {
+    for (const f of docs[i].querySelectorAll('iframe, frame')) {
+      try { if (f.contentDocument) docs.push(f.contentDocument); } catch (_) {}
+    }
+  }
+  const all = docs.flatMap(d => Array.from(d.querySelectorAll(
+    'input, textarea, select, [contenteditable]:not([contenteditable="false"])')));
+  const named = all.filter(e => norm(nameOf(e, false) || e.getAttribute('placeholder')) === norm(name));
+  fields = named.length ? named : all;
+}
+const forms = [];
+for (const f of fields) {
+  const form = formOf(f);
+  if (form && !forms.includes(form)) forms.push(form);
+}
+return JSON.stringify({ forms: forms.map(formFacts) });"#;
+
+/// Whether a form holding a control named `submit` has a textarea (or an editable area).
+const SUBMIT_BODY: &str = r#"const norm = s => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+const named = e => norm(e.getAttribute('aria-label') || e.innerText || e.value || e.getAttribute('title'));
+const all = Array.from(document.querySelectorAll('button, input[type="submit" i], input[type="button" i], ' +
+  'input[type="image" i], [role="button"], [role="menuitem"]')).filter(e => named(e) === 'submit');
+const forms = all.map(e => e.form || e.closest('form'));
+const area = 'textarea, [contenteditable]:not([contenteditable="false"])';
+return JSON.stringify({ found: all.length, textarea: forms.some(f => !!(f && f.querySelector(area))) });"#;
 
 // ---- the snapshot's text ----
 
-/// One line of agent-browser's snapshot (0.41): `- role "name" [level=1, ref=e3] …: value`,
-/// two spaces of indent a level, the name written as JSON.
+/// One line of agent-browser's snapshot (0.41 `render_tree`): `- role "name" [level=1, ref=e3]
+/// clickable [cursor:pointer] : value`, two spaces of indent a level (a node agent-browser
+/// skips leaves its children at its own), the name written as JSON.
 struct Line {
     depth: usize,
     role: String,
     name: String,
     value: String,
+    /// `e3` for `[…, ref=e3]`.
+    reference: Option<String>,
+    /// What agent-browser's scan for clickable elements with no role found (`clickable`,
+    /// `focusable`, `editable`).
+    cursor: Option<String>,
 }
 
 fn line(raw: &str) -> Option<Line> {
@@ -1073,13 +1470,61 @@ fn line(raw: &str) -> Option<Line> {
             rest = &rest[strings.byte_offset()..];
         }
     }
-    let value = rest.split_once(": ").map_or("", |(_, v)| v);
+    let mut after = rest.trim_start();
+    let mut reference = None;
+    if let Some((attrs, more)) = (after.strip_prefix('[')).and_then(|a| a.split_once(']')) {
+        let refs = attrs.split(", ").filter_map(|a| a.strip_prefix("ref="));
+        reference = refs.last().map(String::from);
+        after = more.trim_start();
+    }
+    let mut cursor = None;
+    for kind in ["clickable", "focusable", "editable"] {
+        if let Some(more) = (after.strip_prefix(kind)).and_then(|m| m.strip_prefix(" [")) {
+            cursor = Some(kind.to_string());
+            after = more.split_once(']').map_or("", |(_, m)| m);
+        }
+    }
+    let value = after.split_once(": ").map_or("", |(_, v)| v);
     Some(Line {
         depth,
         role: role.trim_end_matches(':').to_string(),
         name,
         value: value.to_string(),
+        reference,
+        cursor,
     })
+}
+
+/// agent-browser 0.41's `shell_words_split` (cli/src/commands.rs), ported as it is: how it splits
+/// each of a batch's commands. Words part at a space (only), outside quotes; `"` and `'` quote
+/// and are dropped; a backslash outside single quotes keeps the next character as it is (and a
+/// trailing one is dropped); an empty word is no word.
+pub fn shell_words_split(s: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let (mut in_double, mut in_single) = (false, false);
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if !in_single => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => in_single = !in_single,
+            ' ' if !in_double && !in_single => {
+                if !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
 }
 
 /// The page's labelled total (`total`, `order total`, `amount due`, `you pay`; Korean `합계`,
@@ -1088,6 +1533,8 @@ fn line(raw: &str) -> Option<Line> {
 /// stands for the order's total; amounts that name a currency count over those that name none,
 /// and totals in two currencies are no total. `$` reads as US dollars (every other dollar is
 /// worth less, so a cap is never passed on that reading); `¥` names no currency (yen or yuan).
+/// A number by a label that reads more than one way (`1 23,50`) makes it no total at all: an
+/// unknown amount is over any cap (I5).
 pub fn page_total(tree: &str) -> Option<PageAmount> {
     let texts: Vec<String> = (tree.lines().filter_map(line))
         .flat_map(|l| [l.name, l.value])
@@ -1099,10 +1546,13 @@ pub fn page_total(tree: &str) -> Option<PageAmount> {
             continue;
         };
         let next = texts.get(i + 1..).unwrap_or_default().iter().take(3);
-        let ahead: Vec<PageAmount> = next.filter_map(|n| money(n)).collect();
+        let mut ahead = Vec::new();
+        for n in next {
+            ahead.extend(amounts(n)?);
+        }
         let marked = ahead.iter().find(|a| !a.currency.is_empty()).cloned();
         found.extend(
-            money(&after)
+            money(&after)?
                 .or(marked)
                 .or_else(|| ahead.into_iter().next()),
         );
@@ -1161,15 +1611,21 @@ fn word_at(hay: &str, word: &str) -> Option<usize> {
     None
 }
 
-/// The first amount in `text` that names its currency, else its first number.
-fn money(text: &str) -> Option<PageAmount> {
-    let all = amounts(text);
+/// The first amount in `text` that names its currency, else its first number; `None` when a
+/// number there reads more than one way.
+fn money(text: &str) -> Option<Option<PageAmount>> {
+    let all = amounts(text)?;
     let marked = all.iter().find(|a| !a.currency.is_empty()).cloned();
-    marked.or_else(|| all.into_iter().next())
+    Some(marked.or_else(|| all.into_iter().next()))
 }
 
-/// Every number in `text`, each with the currency written beside it (empty for none).
-fn amounts(text: &str) -> Vec<PageAmount> {
+/// What may group a number's thousands besides `,` and `.`: a space, a no-break space, a narrow
+/// or thin one, an apostrophe (`1 234,50`, `1'234.50`), each only before exactly three digits.
+const GROUPING: &[char] = &[' ', '\u{a0}', '\u{202f}', '\u{2009}', '\'', '\u{2019}'];
+
+/// Every number in `text`, each with the currency written beside it (empty for none); `None`
+/// when one reads more than one way ([`number_value`]).
+fn amounts(text: &str) -> Option<Vec<PageAmount>> {
     let chars: Vec<char> = text.chars().collect();
     let (mut out, mut i) = (Vec::new(), 0);
     while i < chars.len() {
@@ -1180,7 +1636,7 @@ fn amounts(text: &str) -> Vec<PageAmount> {
         let start = i;
         while i < chars.len()
             && (chars[i].is_ascii_digit()
-                || (matches!(chars[i], ',' | '.')
+                || ((matches!(chars[i], ',' | '.') || GROUPING.contains(&chars[i]))
                     && chars.get(i + 1).is_some_and(char::is_ascii_digit)))
         {
             i += 1;
@@ -1188,24 +1644,50 @@ fn amounts(text: &str) -> Vec<PageAmount> {
         let number: String = chars[start..i].iter().collect();
         let before: String = chars[..start].iter().collect();
         let after: String = chars[i..].iter().collect();
-        if let Some(value) = number_value(&number) {
-            let currency = currency(before.trim_end(), after.trim_start());
-            out.push(PageAmount { value, currency });
-        }
+        let value = number_value(&number)?;
+        let currency = currency(before.trim_end(), after.trim_start());
+        out.push(PageAmount { value, currency });
     }
-    out
+    Some(out)
 }
 
-/// `1,234.56`, `1.234,56`, `54,200`, `54.20`: the last separator is the decimal point when one or
-/// two digits (or more than three) follow it; with exactly three it groups thousands, the larger
-/// reading.
+/// `1,234.56`, `1.234,56`, `1 234,56`, `1'234.56`, `54,200`, `54.20`: the last `,` or `.` is the
+/// decimal point when one or two digits (or more than three) follow it; with exactly three it
+/// groups thousands, the larger reading. Every other separator groups thousands: all one kind,
+/// not the decimal point's, with one to three digits before the first and exactly three after
+/// each. Anything else (`1 23,50`, `1.23.45`, `12 3456`, India's `1,23,456`) reads more than one
+/// way: `None`.
 fn number_value(number: &str) -> Option<f64> {
-    let plain = |s: &str| s.chars().filter(char::is_ascii_digit).collect::<String>();
-    let text = match number.rfind([',', '.']) {
-        Some(i) if number.len() - i - 1 != 3 => {
-            format!("{}.{}", plain(&number[..i]), &number[i + 1..])
+    let mut groups = vec![String::new()];
+    let mut seps = Vec::new();
+    for c in number.chars() {
+        match c.is_ascii_digit() {
+            true => groups.last_mut()?.push(c),
+            false => {
+                seps.push(c);
+                groups.push(String::new());
+            }
         }
-        _ => plain(number),
+    }
+    let last = groups.last()?;
+    let decimal = match seps.last() {
+        Some(&s @ (',' | '.')) if last.len() != 3 => Some(s),
+        _ => None,
+    };
+    let whole = groups.len() - usize::from(decimal.is_some());
+    let grouping = &seps[..whole - 1];
+    if let Some(&g) = grouping.first() {
+        let one_kind = grouping.iter().all(|&s| s == g) && Some(g) != decimal;
+        let sizes =
+            (1..=3).contains(&groups[0].len()) && groups[1..whole].iter().all(|g| g.len() == 3);
+        if !(one_kind && sizes) {
+            return None;
+        }
+    }
+    let int = groups[..whole].concat();
+    let text = match decimal {
+        Some(_) => format!("{int}.{last}"),
+        None => int,
     };
     text.parse::<f64>().ok().filter(|v| v.is_finite())
 }
@@ -1251,7 +1733,13 @@ fn currency(before: &str, after: &str) -> String {
     if let Some(code) = word(before.split_whitespace().next_back()) {
         return code;
     }
-    const AFTER: &[(&str, &str)] = &[("원", "KRW"), ("€", "EUR"), ("円", "JPY"), ("元", "CNY")];
+    const AFTER: &[(&str, &str)] = &[
+        ("원", "KRW"),
+        ("₩", "KRW"),
+        ("€", "EUR"),
+        ("円", "JPY"),
+        ("元", "CNY"),
+    ];
     if let Some((_, code)) = AFTER.iter().find(|(s, _)| after.starts_with(s)) {
         return code.to_string();
     }
@@ -1268,15 +1756,21 @@ mod tests {
 
     /// A stand-in for the real agent-browser: it appends each argv to `argv.log` beside it and
     /// answers `get url`, `get title`, `snapshot` and `eval` with `<what>.json` from its folder
-    /// (failing when there is none); anything else prints `done: <argv>`.
+    /// (failing when there is none); anything else prints `done: <argv>`. A scoped snapshot
+    /// (`-s`) reads `scoped.json` when there is one; an eval reads `eval-<kind>.json` for the
+    /// script whose first line is `/*zephyr:<kind>*/`, when there is one.
     const FAKE: &str = r#"#!/bin/sh
 d=$(dirname "$0")
 printf '%s\n' "$*" >> "$d/argv.log"
 case " $* " in
   *" get url "*) f=url ;;
   *" get title "*) f=title ;;
-  *" snapshot "*) f=snapshot ;;
-  *" eval "*) f=eval ;;
+  *" snapshot "*) f=snapshot
+    case " $* " in *" -s "*) [ -f "$d/scoped.json" ] && f=scoped ;; esac ;;
+  *" eval "*) f=eval
+    prev=; for a in "$@"; do [ "$prev" = "-b" ] && b=$a; prev=$a; done
+    k=$(printf '%s' "$b" | base64 -d 2>/dev/null | sed -n '1s|^/\*zephyr:\([a-z]*\)\*/.*|\1|p')
+    [ -n "$k" ] && [ -f "$d/eval-$k.json" ] && f=eval-$k ;;
   *) echo "done: $*"; exit 0 ;;
 esac
 [ -f "$d/$f.json" ] || { echo '{"success":false,"data":null,"error":"no page"}'; exit 1; }
@@ -1336,6 +1830,27 @@ cat "$d/$f.json"
                 "eval.json",
                 json!({"result": facts.to_string(), "origin": "x"}),
             );
+        }
+
+        /// What the wrapper's `kind` script (`/*zephyr:<kind>*/`) reports.
+        fn eval(&self, kind: &str, facts: Value) {
+            let name = format!("eval-{kind}.json");
+            self.file(&name, json!({"result": facts.to_string(), "origin": "x"}));
+        }
+
+        /// What a snapshot scoped to a selector shows: `lines` (role, name), top-level, no refs.
+        fn scoped(&self, lines: &[(&str, &str)]) {
+            let tree: Vec<String> = (lines.iter())
+                .map(|(role, name)| format!("- {role} {}", Value::from(*name)))
+                .collect();
+            let data = json!({"snapshot": tree.join("\n"), "origin": MAIL, "refs": {}});
+            self.file("scoped.json", data);
+        }
+
+        /// The wrapper's snapshots, in the order it took them.
+        fn snapshots(&self) -> Vec<String> {
+            let all = self.argv().into_iter();
+            all.filter(|l| l.contains("snapshot")).collect()
         }
 
         fn argv(&self) -> Vec<String> {
@@ -1684,10 +2199,10 @@ cat "$d/$f.json"
             Next::Exec
         );
         assert!(gate.try_recv().is_err());
-        // Enter goes unasked in a search box, a box whose placeholder says search (A1), a login
-        // form, a link and the page itself.
+        // Enter goes unasked in an empty search box, a box whose placeholder says search (A1), a
+        // login form, a link and the page itself (with text in them, it is asked about: I1).
         for facts in [
-            json!({"role": "searchbox", "name": "", "editable": true, "value": "rust"}),
+            json!({"role": "searchbox", "name": "", "editable": true, "value": ""}),
             json!({"role": "textbox", "name": "", "placeholder": "Search mail", "editable": true}),
             json!({"role": "textbox", "name": "Password", "editable": true, "password": true}),
             json!({"role": "link", "name": "Inbox"}),
@@ -1698,6 +2213,7 @@ cat "$d/$f.json"
         }
         assert!(gate.try_recv().is_err());
         // Typing a line break into a composer presses Enter there: asked about as a key press.
+        t.eval("forms", json!({"forms": []}));
         let waiting = t.spawn(&["type", "@e2", "see you\n"]);
         let (req, mut conn) = asked(&gate);
         let b = &req["browser"];
@@ -1779,20 +2295,447 @@ cat "$d/$f.json"
         let t = T::new("bg-batch");
         for args in [
             &["batch", "open https://x.org", "click @e3"][..],
-            &["batch", r#"["fill", "@e1", "x"]"#],
-            &["batch", "--bail", "--session s press Enter"],
+            &["batch", "--bail", "press Enter"],
             // In a batch, `--help` is no help: the click would run.
             &["batch", "click @e3 --help"],
             &["batch", "\"click\" @e3"],
+            // C1: each command is split as agent-browser 0.41 splits it (`shell_words_split`).
+            &["batch", r#"find text "Send message""#],
+            &["batch", "find text 'Send message' click"],
+            &["batch", r#"find label "Card number" fill 4111 1111"#],
+            &["batch", r#"cl"ic"k @e3"#],
+            &["batch", r"cl\ick @e3"],
+            &["batch", r#"type @e2 "hi\ there""#],
+            &["batch", "keyboard type 'a\nb'"],
+            // Inside a batch no flag is taken out (0.41 parses each command as it stands), and
+            // either reading that needs the gate refuses the batch.
+            &["batch", "type @e2 --session \"\n\""],
+            &["batch", "--session s click @e3"],
+            &["batch", "batch 'click @e3'"],
             &["batch"],
             &["batch", "--bail"],
             &["mcp"],
             &["mcp", "call", "agent_browser_click", "{}"],
             &["chat", "send the mail"],
+            // R55: a page's own tools act past the gate too.
+            &["webmcp", "invoke", "send_email", "--params", "{}"],
+            &["--session", "s", "webmcp", "invoke", "checkout"],
+            &["batch", "webmcp invoke checkout"],
         ] {
             assert!(matches!(t.run(args), Next::Refuse(_)), "{args:?}");
         }
+        // What agent-browser runs nothing for, or only reads, passes: 0.41 reads no JSON in a
+        // batch's arguments (`[click,` is no command), skips an empty command, and lists or
+        // reads a page's tools without calling one.
+        for args in [
+            &["batch", r#"["click", "@e3"]"#][..],
+            &["batch", "snapshot -i", "get text @e1", ""],
+            &["webmcp", "list"],
+            &["webmcp", "result", "inv-1"],
+        ] {
+            assert_eq!(t.run(args), Next::Exec, "{args:?}");
+        }
         assert!(t.argv().is_empty());
+    }
+
+    /// C1: agent-browser 0.41's `shell_words_split` (commands.rs), which splits a batch's
+    /// commands: spaces only, single and double quotes, a backslash escaping the next character
+    /// outside single quotes, and no empty word.
+    #[test]
+    fn batch_commands_split_as_agent_browser_splits_them() {
+        for (text, want) in [
+            (
+                r#"find text "Send message""#,
+                &["find", "text", "Send message"][..],
+            ),
+            (r#"cl"ic"k @e3"#, &["click", "@e3"]),
+            (r"cl\ick  @e3 ", &["click", "@e3"]),
+            ("a 'b \"c\" d' e", &["a", "b \"c\" d", "e"]),
+            (r#""a \"b\"" 'c\d'"#, &["a \"b\"", r"c\d"]),
+            ("tab\tstays one", &["tab\tstays", "one"]),
+            (r#"x "" y"#, &["x", "y"]),
+            (r"end\", &["end"]),
+            ("", &[]),
+        ] {
+            assert_eq!(shell_words_split(text), want, "{text}");
+        }
+    }
+
+    /// C2: Enter however it is written: a typed line break, a `\n` or `\r` key, a chord ending
+    /// in Enter, a key going up as well as down.
+    #[test]
+    fn enter_however_it_is_written_is_a_key_press() {
+        let t = T::new("bg-enter");
+        t.page(MAIL, COMPOSE, "");
+        t.focus(json!({"role": "textbox", "name": "Message", "editable": true, "value": "hi"}));
+        t.eval("forms", json!({"forms": []}));
+        let gate = t.gate();
+        for args in [
+            &["type", "@e2", "\n"][..],
+            &["type", "@e2", "\r"],
+            &["type", "@e2", "--delay", "5", "ok\r\n"],
+            &["keyboard", "type", "\n"],
+            &["press", "\n"],
+            &["press", "\r"],
+            &["key", "Shift+\n"],
+            &["press", "ENTER"],
+            &["keydown", "Return"],
+            &["keyup", "Enter"],
+        ] {
+            let waiting = t.spawn(args);
+            let (req, mut conn) = asked(&gate);
+            let b = &req["browser"];
+            assert_eq!(
+                (b["action"].as_str(), b["name"].as_str()),
+                (Some("press"), Some("Message")),
+                "{args:?}: {req}"
+            );
+            answer(&mut conn, json!({"verdict": "allow"}));
+            assert_eq!(waiting.join().unwrap(), Next::Exec, "{args:?}");
+        }
+        // A space or a tab typed or pressed in a composer is no send.
+        for args in [
+            &["type", "@e2", " "][..],
+            &["keyboard", "type", "  "],
+            &["press", "Tab"],
+            &["press", "Space"],
+        ] {
+            assert_eq!(t.run(args), Next::Exec, "{args:?}");
+        }
+        assert!(gate.try_recv().is_err());
+    }
+
+    /// I1: what is typed before a line break goes out with it, so it is checked for private
+    /// facts even where Enter sends nothing the gate holds by class.
+    #[test]
+    fn typing_with_a_line_break_is_checked_for_facts_wherever_it_goes() {
+        let t = T::new("bg-typed-enter");
+        t.page(MAIL, &[("searchbox", "Search mail")], "");
+        t.eval("forms", json!({"forms": []}));
+        let gate = t.gate();
+        for (args, typed) in [
+            (&["type", "#q", "12 Main St\n"][..], "12 Main St\n"),
+            (&["type", "@e1", "010-2345-6789\r"], "010-2345-6789\r"),
+        ] {
+            let waiting = t.spawn(args);
+            let (req, mut conn) = asked(&gate);
+            let b = &req["browser"];
+            assert_eq!(
+                (b["action"].as_str(), b["role"].as_str()),
+                (Some("press"), Some("searchbox")),
+                "{args:?}: {req}"
+            );
+            assert_eq!(b["typed"], json!([typed]), "{args:?}");
+            answer(&mut conn, json!({"verdict": "allow"}));
+            assert_eq!(waiting.join().unwrap(), Next::Exec, "{args:?}");
+        }
+        // Enter in a search box holding text: its text goes out.
+        t.focus(json!({"role": "searchbox", "name": "", "editable": true, "value": "my address"}));
+        let waiting = t.spawn(&["press", "Enter"]);
+        let (req, mut conn) = asked(&gate);
+        assert_eq!(req["browser"]["typed"], json!(["my address"]), "{req}");
+        answer(&mut conn, json!({"verdict": "allow"}));
+        assert_eq!(waiting.join().unwrap(), Next::Exec);
+        // Nothing typed but the line break, where Enter sends nothing: nothing to ask.
+        assert_eq!(t.run(&["type", "@e1", "\n"]), Next::Exec);
+        assert!(gate.try_recv().is_err());
+    }
+
+    /// I3: Enter in a form's field submits it through its default button, which the wrapper
+    /// reads and the gate classes with the field; Space or Enter on a focused button presses it.
+    #[test]
+    fn a_key_press_counts_what_it_submits_or_presses() {
+        let t = T::new("bg-submit");
+        let checkout = "https://shop.example.com/checkout";
+        let total = "- StaticText \"Total\"\n- StaticText \"$54.20\"";
+        t.page(
+            checkout,
+            &[("textbox", "Coupon code"), ("button", "Apply")],
+            total,
+        );
+        t.scoped(&[("textbox", "Coupon code")]);
+        t.file("title.json", json!({"title": "Checkout"}));
+        let gate = t.gate();
+        let order = json!({"role": "button", "name": "Place order"});
+        t.focus(
+            json!({"role": "textbox", "name": "Coupon code", "editable": true,
+                       "value": "SAVE10", "submit": order}),
+        );
+        let waiting = t.spawn(&["press", "Enter"]);
+        let (req, mut conn) = asked(&gate);
+        let b = &req["browser"];
+        assert_eq!(b["submit"], order, "{req}");
+        assert_eq!(
+            b["title"], "Checkout",
+            "a payment: its title and total are read"
+        );
+        assert_eq!(b["amount"], json!({"value": 54.2, "currency": "USD"}));
+        answer(&mut conn, json!({"verdict": "allow"}));
+        assert_eq!(waiting.join().unwrap(), Next::Exec);
+        // A line break typed there does the same: the field found by its selector, or by name.
+        let apply = json!({"submit": {"role": "button", "name": "Apply"}});
+        t.eval("forms", json!({"forms": [apply, {"submit": order}]}));
+        for args in [
+            &["type", "#coupon", "SAVE10\n"][..],
+            &["type", "@e1", "SAVE10\n"],
+        ] {
+            let waiting = t.spawn(args);
+            let (req, mut conn) = asked(&gate);
+            assert_eq!(req["browser"]["submit"], order, "{args:?}: {req}");
+            assert_eq!(req["browser"]["title"], "Checkout", "{args:?}");
+            answer(&mut conn, json!({"verdict": "allow"}));
+            assert_eq!(waiting.join().unwrap(), Next::Exec, "{args:?}");
+        }
+        // What the form submits cannot be read: the control is one the gate could not read.
+        std::fs::remove_file(t.dir.join("eval-forms.json")).unwrap();
+        let waiting = t.spawn(&["type", "@e1", "SAVE10\n"]);
+        let (req, mut conn) = asked(&gate);
+        assert_eq!(req["browser"]["role"], "", "{req}");
+        answer(&mut conn, json!({"verdict": "hold", "text": "held"}));
+        assert_eq!(waiting.join().unwrap(), Next::Refuse("held".into()));
+        // A login form's default button sends nothing.
+        t.focus(
+            json!({"role": "textbox", "name": "Email", "editable": true, "password": true,
+                       "submit": {"role": "button", "name": "Send code"}}),
+        );
+        assert_eq!(t.run(&["press", "Enter"]), Next::Exec);
+        // Space or Enter on a focused button is a click on it.
+        t.focus(json!({"role": "button", "name": "Send"}));
+        for args in [
+            &["press", "Space"][..],
+            &["press", " "],
+            &["key", "Enter"],
+            &["keyup", "Space"],
+        ] {
+            let waiting = t.spawn(args);
+            let (req, mut conn) = asked(&gate);
+            let b = &req["browser"];
+            assert_eq!(
+                (b["action"].as_str(), b["role"].as_str(), b["name"].as_str()),
+                (Some("click"), Some("button"), Some("Send")),
+                "{args:?}: {req}"
+            );
+            assert_eq!(b["composer"], false, "{args:?}");
+            answer(&mut conn, json!({"verdict": "allow"}));
+            assert_eq!(waiting.join().unwrap(), Next::Exec, "{args:?}");
+        }
+        // Space on a link, in a composer or on the page is no press of a button.
+        for facts in [
+            json!({"role": "link", "name": "Send"}),
+            json!({"role": "textbox", "name": "Message", "editable": true, "value": "hi"}),
+            json!({"role": "document", "name": ""}),
+        ] {
+            t.focus(facts.clone());
+            assert_eq!(t.run(&["press", "Space"]), Next::Exec, "{facts}");
+        }
+        assert!(gate.try_recv().is_err());
+        // A focus the wrapper cannot read may be on a button: Space is asked about too.
+        t.focus(json!({"unread": true}));
+        let waiting = t.spawn(&["press", "Space"]);
+        let (req, mut conn) = asked(&gate);
+        assert_eq!(req["browser"]["role"], "", "{req}");
+        answer(&mut conn, json!({"verdict": "hold", "text": "held"}));
+        assert_eq!(waiting.join().unwrap(), Next::Refuse("held".into()));
+    }
+
+    /// I4: after the owner's answer, a control found by a selector, a locator or the focus is
+    /// read again, and the action goes only if it is still the one the owner saw, on the same
+    /// site; a ref stays on its element, so only the page's address (and a payment's total) is.
+    #[test]
+    fn the_page_is_read_again_before_an_approved_click() {
+        let t = T::new("bg-recheck");
+        let gate = t.gate();
+        let changed = Next::Refuse(CHANGED.into());
+        for (args, change) in [
+            (&["click", "#send"][..], "name"),
+            (&["click", "#send"], "role"),
+            (&["click", "#send"], "origin"),
+            (&["find", "text", "Send"], "name"),
+            (
+                &["find", "role", "button", "click", "--name", "Send"],
+                "origin",
+            ),
+            (&["click", "#send"], "nothing"),
+            (&["find", "text", "Send"], "nothing"),
+        ] {
+            t.page(MAIL, &[("button", "Send")], "");
+            let waiting = t.spawn(args);
+            let (_, mut conn) = asked(&gate);
+            match change {
+                "name" => t.page(MAIL, &[("button", "Send all")], ""),
+                "role" => t.page(MAIL, &[("menuitem", "Send")], ""),
+                "origin" => t.page("https://evil.example.org/x", &[("button", "Send")], ""),
+                _ => {}
+            }
+            answer(&mut conn, json!({"verdict": "allow"}));
+            let want = match change {
+                "nothing" => Next::Exec,
+                _ => changed.clone(),
+            };
+            assert_eq!(waiting.join().unwrap(), want, "{args:?}: {change}");
+        }
+        // A key press: the focused element, the text it holds and what its form submits.
+        let composer = json!({"role": "textbox", "name": "Message", "editable": true,
+                              "value": "hi bob"});
+        for now in [
+            json!({"role": "textbox", "name": "Search mail", "editable": true, "value": "hi bob"}),
+            json!({"role": "textbox", "name": "Message", "editable": true,
+                   "value": "and the card number"}),
+            json!({"role": "textbox", "name": "Message", "editable": true, "value": "hi bob",
+                   "submit": {"role": "button", "name": "Pay"}}),
+        ] {
+            t.page(MAIL, COMPOSE, "");
+            t.focus(composer.clone());
+            let waiting = t.spawn(&["press", "Enter"]);
+            let (_, mut conn) = asked(&gate);
+            t.focus(now.clone());
+            answer(&mut conn, json!({"verdict": "allow"}));
+            assert_eq!(waiting.join().unwrap(), changed, "{now}");
+        }
+        // A ref is the element itself: only the page's address is read again.
+        t.page(MAIL, COMPOSE, "");
+        let waiting = t.spawn(&["click", "@e3"]);
+        let (_, mut conn) = asked(&gate);
+        let reads = t.argv().len();
+        t.page(MAIL, &[("button", "Delete account")], "");
+        answer(&mut conn, json!({"verdict": "allow"}));
+        assert_eq!(waiting.join().unwrap(), Next::Exec);
+        assert_eq!(t.argv()[reads..], ["get url --json"]);
+        // ... and a ref on a page that went to another site clicks nothing there.
+        t.page(MAIL, COMPOSE, "");
+        let waiting = t.spawn(&["click", "@e3"]);
+        let (_, mut conn) = asked(&gate);
+        t.page("https://evil.example.org/x", COMPOSE, "");
+        answer(&mut conn, json!({"verdict": "allow"}));
+        assert_eq!(waiting.join().unwrap(), changed);
+        // A payment's total is read again: the owner approved the amount the card showed.
+        let shop = "https://shop.example.com/cart";
+        for (later, want) in [("$54.20", Next::Exec), ("$540.20", changed.clone())] {
+            t.page(shop, &[("button", "Pay")], "- StaticText \"Total $54.20\"");
+            let waiting = t.spawn(&["click", "@e1"]);
+            let (_, mut conn) = asked(&gate);
+            let tree = format!("- StaticText \"Total {later}\"");
+            t.page(shop, &[("button", "Pay")], &tree);
+            answer(&mut conn, json!({"verdict": "allow"}));
+            assert_eq!(waiting.join().unwrap(), want, "{later}");
+        }
+        assert!(!t.clicked());
+    }
+
+    /// R53: a click lands on what holds its target: a heading in a Send button is the button's,
+    /// a clickable element with no role is a button named by its text, a heading in a link is
+    /// the link's, and a target nothing clickable holds is one the gate could not read.
+    #[test]
+    fn a_click_inside_a_button_is_the_buttons() {
+        let t = T::new("bg-inside");
+        let gate = t.gate();
+        let tree = "- form \"Compose\"\n  - button \"Send\" [ref=e1]\n    - heading \"Now\" [level=3, ref=e2]\n\
+                    - generic [ref=e3] clickable [cursor:pointer, onclick]\n  - StaticText \"Post it\"\n\
+                    - heading \"Inbox\" [level=1, ref=e4]\n\
+                    - link \"Home\" [ref=e5]\n  - heading \"Send\" [level=2, ref=e6]";
+        let refs = json!({
+            "e1": {"role": "button", "name": "Send"}, "e2": {"role": "heading", "name": "Now"},
+            "e3": {"role": "generic", "name": ""}, "e4": {"role": "heading", "name": "Inbox"},
+            "e5": {"role": "link", "name": "Home"}, "e6": {"role": "heading", "name": "Send"},
+        });
+        t.file("url.json", json!({"url": MAIL}));
+        t.file(
+            "snapshot.json",
+            json!({"snapshot": tree, "origin": MAIL, "refs": refs}),
+        );
+        for (args, role, name) in [
+            (&["click", "@e2"][..], "button", "Send"),
+            (&["find", "text", "Now"], "button", "Send"),
+            (&["click", "@e3"], "button", "Post it"),
+            (&["click", "@e4"], "", "Inbox"),
+        ] {
+            let waiting = t.spawn(args);
+            let (req, mut conn) = asked(&gate);
+            let b = &req["browser"];
+            assert_eq!(
+                (b["role"].as_str(), b["name"].as_str()),
+                (Some(role), Some(name)),
+                "{args:?}: {req}"
+            );
+            answer(&mut conn, json!({"verdict": "allow"}));
+            assert_eq!(waiting.join().unwrap(), Next::Exec, "{args:?}");
+        }
+        // A heading named Send, in a link: the link's, which sends nothing.
+        assert_eq!(t.run(&["click", "@e6"]), Next::Exec);
+        assert!(gate.try_recv().is_err());
+        // A selector's target with no role: the page says what holds it.
+        t.scoped(&[("StaticText", "Send")]);
+        for (holder, role, name) in [
+            (
+                Some(json!({"role": "button", "name": "Send"})),
+                "button",
+                "Send",
+            ),
+            (Some(json!({"role": "", "name": "Send"})), "", "Send"),
+            (None, "", "Send"),
+        ] {
+            match holder {
+                Some(h) => t.eval("holder", h),
+                None => std::fs::remove_file(t.dir.join("eval-holder.json")).unwrap(),
+            }
+            let waiting = t.spawn(&["click", "button.send span"]);
+            let (req, mut conn) = asked(&gate);
+            let b = &req["browser"];
+            assert_eq!(
+                (b["role"].as_str(), b["name"].as_str()),
+                (Some(role), Some(name)),
+                "{req}"
+            );
+            answer(&mut conn, json!({"verdict": "allow"}));
+            assert_eq!(waiting.join().unwrap(), Next::Exec);
+        }
+        t.eval("holder", json!({"role": "link", "name": "Home"}));
+        assert_eq!(t.run(&["click", "a.home span"]), Next::Exec);
+        assert!(gate.try_recv().is_err());
+    }
+
+    /// R54: agent-browser 0.41 rebuilds its ref map at every snapshot, and a scoped one leaves
+    /// out a frame's refs, or all of them when its selector matches nothing in the page; so the
+    /// wrapper's last snapshot is always a full one, which gives every element the ref it had.
+    #[test]
+    fn the_wrappers_reads_leave_the_agents_refs_resolving() {
+        let t = T::new("bg-refs");
+        t.page(MAIL, COMPOSE, "");
+        t.scoped(&[("button", "Send")]);
+        t.eval("forms", json!({"forms": []}));
+        let gate = t.gate();
+        let last_is_full = |args: &[&str]| {
+            let snaps = t.snapshots();
+            assert!(
+                snaps.iter().any(|l| l.contains(" -s ")),
+                "{args:?}: {snaps:?}"
+            );
+            let last = snaps.last().unwrap();
+            assert!(!last.contains(" -s "), "{args:?}: {snaps:?}");
+        };
+        for args in [
+            &["click", "#send"][..],
+            &["find", "testid", "send"],
+            &["find", "first", "button"],
+            &["type", "#msg", "hi\n"],
+        ] {
+            let waiting = t.spawn(args);
+            let (_, mut conn) = asked(&gate);
+            last_is_full(args);
+            answer(&mut conn, json!({"verdict": "allow"}));
+            assert_eq!(waiting.join().unwrap(), Next::Exec, "{args:?}");
+            last_is_full(args);
+        }
+        // A scoped read that fails rebuilds them too.
+        let failed =
+            r#"{"success":false,"data":null,"error":"Selector '#x' did not match any element"}"#;
+        std::fs::write(t.dir.join("scoped.json"), failed).unwrap();
+        let waiting = t.spawn(&["click", "#x"]);
+        let (req, mut conn) = asked(&gate);
+        assert_eq!(req["browser"]["role"], "", "{req}");
+        last_is_full(&["click", "#x"]);
+        answer(&mut conn, json!({"verdict": "hold", "text": "held"}));
+        waiting.join().unwrap();
     }
 
     #[test]
@@ -1815,11 +2758,57 @@ cat "$d/$f.json"
             ("- StaticText \"Total\"\n- StaticText \"¥5,000\"", amount(5000.0, "")),
             ("- StaticText \"Total\"\n- StaticText \"CA$20\"", amount(20.0, "CAD")),
             ("- StaticText \"Total $10\"\n- StaticText \"Total €20\"", None),
+            // I5: a space, a no-break space, a narrow or thin one, or an apostrophe groups
+            // thousands, before exactly three digits.
+            ("- StaticText \"Total 1 234,50 €\"", amount(1234.5, "EUR")),
+            ("- StaticText \"Total 1\u{a0}234,50\u{a0}€\"", amount(1234.5, "EUR")),
+            ("- StaticText \"Total 1\u{202f}234,50\u{202f}€\"", amount(1234.5, "EUR")),
+            ("- StaticText \"Total\"\n- StaticText \"12\u{2009}345\u{2009}678 ₩\"", amount(12_345_678.0, "KRW")),
+            ("- StaticText \"Total CHF 1'234.50\"", amount(1234.5, "CHF")),
+            ("- StaticText \"Total CHF 1’234.50\"", amount(1234.5, "CHF")),
+            ("- StaticText \"Total\"\n- StaticText \"$ 1 054.20\"", amount(1054.2, "USD")),
+            // A total that cannot be read one way only is no total: over any cap.
+            ("- StaticText \"Total 1 23,50 €\"", None),
+            ("- StaticText \"Total 12 3456 €\"", None),
+            ("- StaticText \"Total 1.23.45 €\"", None),
+            ("- StaticText \"Total 1,234,56 €\"", None),
+            ("- StaticText \"Total 1 234.567,89 €\"", None),
+            ("- StaticText \"Total ₹1,23,456\"", None),
+            ("- StaticText \"Total\"\n- StaticText \"1'23 CHF\"", None),
             ("- StaticText \"Subtotal $50\"", None),
             ("- button \"Pay\" [ref=e1]", None),
         ] {
             assert_eq!(page_total(tree), want, "{tree}");
         }
+    }
+
+    /// The page scripts parse as JavaScript (checked with `node --check` where node is).
+    #[test]
+    fn the_page_scripts_are_javascript() {
+        let sel = format!("const sel = {};", Value::from("a[title=\"it's\"] > span"));
+        let forms = |sel: Value| format!("const sel = {sel}, name = {};", Value::from("Q's"));
+        let scripts = [
+            script("focus", "", FOCUS_BODY),
+            script("holder", &sel, HOLDER_BODY),
+            script("forms", &forms(Value::Null), FORMS_BODY),
+            script("forms", &forms(Value::from("#q")), FORMS_BODY),
+            script("submit", "", SUBMIT_BODY),
+        ];
+        let dir = crate::test_dir("bg-scripts");
+        for (i, s) in scripts.iter().enumerate() {
+            assert!(s.starts_with("/*zephyr:"), "{s}");
+            let path = dir.join(format!("{i}.js"));
+            std::fs::write(&path, s).unwrap();
+            match Command::new("node").arg("--check").arg(&path).output() {
+                Ok(out) => assert!(
+                    out.status.success(),
+                    "{s}\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+                Err(_) => eprintln!("skipped: no node to check the page scripts with"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

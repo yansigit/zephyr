@@ -82,6 +82,8 @@ pub struct Browser {
     pub composer: bool,
     pub amount: Option<PageAmount>,
     pub title: String,
+    /// For a key press in a form's field: the form's default button, which Enter submits.
+    pub submit: Option<Element>,
 }
 
 /// The total a page labels (`total`, `order total`, `amount due`), as the wrapper read it
@@ -120,13 +122,15 @@ struct BrowserWire {
     composer: bool,
     amount: Option<PageAmount>,
     title: String,
+    submit: Option<Element>,
 }
 
-#[derive(Default, Deserialize)]
+/// A control as the wrapper read it: its role and accessible name.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-struct Element {
-    role: String,
-    name: String,
+pub struct Element {
+    pub role: String,
+    pub name: String,
 }
 
 impl From<BrowserWire> for Browser {
@@ -147,8 +151,20 @@ impl From<BrowserWire> for Browser {
             composer: w.composer,
             amount: w.amount,
             title: w.title,
+            submit: w.submit,
         }
     }
+}
+
+/// What a click or key press on the control does (`policy::browser_class`): for a key press in a
+/// form's field, the stricter of the field's class and its form's default button's, which Enter
+/// submits (I3). The wrapper and the gate both read it here.
+pub fn browser_class(b: &Browser) -> Option<Class> {
+    let (textarea, password) = (b.form_textarea, b.form_password);
+    let control = policy::browser_class(&b.role, &b.name, textarea, password, b.composer);
+    let submit = (b.submit.as_ref())
+        .and_then(|s| policy::browser_class(&s.role, &s.name, textarea, password, false));
+    control.max(submit)
 }
 
 /// Lengths only for what was typed: it can hold a private fact.
@@ -326,10 +342,7 @@ impl Call {
         // empty role as a button's); the action is held either way.
         let class = match typing {
             true => None,
-            false => {
-                let (role, name) = (&b.role, &b.name);
-                policy::browser_class(role, name, b.form_textarea, b.form_password, b.composer)
-            }
+            false => browser_class(b),
         };
         let text = b.typed.join("\n");
         if class.is_none() && !unread && text.trim().is_empty() {
@@ -1442,11 +1455,21 @@ fn wait_lines(
     // R39: a control with no role is one the gate could not read; its name, when there is one,
     // still shows (and gave the class).
     let unread = b.role.trim().is_empty();
+    // I3: what Enter submits, when the field is in a form with a default button.
+    let submits = match (b.action.as_str(), &b.submit) {
+        ("press" | "keyboard", Some(s)) if !s.name.trim().is_empty() => {
+            format!(
+                " · submits: \"{}\"",
+                quoted_cut(&scrub.text(&s.name), LINE_CHARS)
+            )
+        }
+        _ => String::new(),
+    };
     lines.push(match b.action.as_str() {
         "fill" | "type" => page,
         _ if unread && name.is_empty() => format!("{page} · the control could not be read"),
         _ if unread => format!("{page} · button: \"{name}\" (its role could not be read)"),
-        "press" | "keyboard" => format!("{page} · key: Enter in \"{name}\""),
+        "press" | "keyboard" => format!("{page} · key: Enter in \"{name}\"{submits}"),
         _ => format!("{page} · button: \"{name}\""),
     });
     if !b.title.trim().is_empty() {
@@ -2645,6 +2668,74 @@ mod tests {
             "{card}"
         );
         assert!(card.ends_with("· this one needs tui or chat"), "{card}");
+    }
+
+    /// I3: Enter in a form's field submits the form through its default button, so the stricter
+    /// of the two classes counts: Enter in a checkout's coupon field is a payment.
+    #[test]
+    fn enter_in_a_form_counts_its_default_button() {
+        let h = home(
+            "gate-submit",
+            "[approvals]\nmessages = 'auto'\nmoney = 'ask'\n",
+        );
+        let now = crate::now();
+        let press = |submit: Option<Element>, password: bool, run: &str| {
+            let mut req = click("Coupon code", "https://shop.example.com", run);
+            if let Some(b) = req.browser.as_mut() {
+                b.action = "press".into();
+                b.role = "textbox".into();
+                b.composer = true;
+                b.form_password = password;
+                b.submit = submit;
+            }
+            decide(&h.cfg, &h.store, &req, owner(), now)
+        };
+        let button = |name: &str| {
+            Some(Element {
+                role: "button".into(),
+                name: name.into(),
+            })
+        };
+        assert_eq!(
+            press(None, false, "submit:1"),
+            Verdict::Allow,
+            "a message, auto"
+        );
+        assert_eq!(
+            press(button("Apply"), false, "submit:2"),
+            Verdict::Allow,
+            "a button that is no send leaves the message's class"
+        );
+        assert_eq!(
+            press(button("Place order"), true, "submit:3"),
+            Verdict::Allow,
+            "a login form's button sends nothing"
+        );
+        let Verdict::Wait { id } = press(button("Place order"), false, "submit:4") else {
+            panic!("the order waits")
+        };
+        assert_eq!(action(&h.store, id).class, "money");
+        let card = notices(&h.store).pop().unwrap();
+        assert!(
+            card.starts_with(&format!(
+                "[zephyr] approve #{id}: payment (browser)\non: https://shop.example.com\n\
+                 page: \"https://shop.example.com/compose\" · key: Enter in \"Coupon code\" · \
+                 submits: \"Place order\"\n"
+            )),
+            "{card}"
+        );
+        // The wire shape: `submit: {role, name}`, and the wrapper's own reading of it agrees.
+        let wire: Browser = serde_json::from_value(json!({
+            "action": "press", "role": "textbox", "name": "Coupon code", "composer": true,
+            "submit": {"role": "button", "name": "Place order"}
+        }))
+        .unwrap();
+        assert_eq!(wire.submit, button("Place order"));
+        assert_eq!(browser_class(&wire), Some(Class::Money));
+        assert_eq!(
+            serde_json::to_value(&wire).unwrap()["submit"]["name"],
+            "Place order"
+        );
     }
 
     #[test]
