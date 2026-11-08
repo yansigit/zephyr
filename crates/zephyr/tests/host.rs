@@ -4,10 +4,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use zephyr::agent::AGENT_PATH;
+
 const CONTAINER: &str = "zephyr-lanetest";
-/// The agent's PATH, passed to each exec as the agent: the image's own is root's.
-const AGENT_PATH: &str =
-    "/zephyr/.local/bin:/opt/zephyr/py/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const GH_TOKEN: &str = "gho_FAKE_GH_TOKEN_0123";
 const CLAUDE_TOKEN: &str = "sk-ant-oat01-FAKE-CLAUDE-TOKEN";
 
