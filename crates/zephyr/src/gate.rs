@@ -17,7 +17,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedReadHalf;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use zephyr_policy::policy::{self, Amount, Class, Gated, UNKNOWN};
 
 use crate::actions::Waits;
@@ -827,6 +827,9 @@ const MAX_CONNS: usize = 32;
 const IDLE: Duration = Duration::from_secs(10);
 /// The longest request taken, as rpi's frame limit.
 const MAX_REQUEST: usize = 1 << 20;
+/// How long a hold waits for its note to be in the asking run's queue before the plugin is
+/// answered (R51), well inside the plugin's 5 s.
+const STEER_WAIT: Duration = Duration::from_secs(2);
 
 /// `<state>-public/gate.sock`: where the plugin and the browser wrapper ask about a send.
 pub fn socket_path(cfg: &Config) -> PathBuf {
@@ -865,24 +868,30 @@ struct Wire {
 /// Serves the gate socket until dropped: tasks' and jobs' sends, every connector call and the
 /// browser wrapper's clicks come here (spec §4.2 path 2, §4.4). Only the agent's uid is
 /// answered (`SO_PEERCRED`); each connection carries one request, sent within 10 s, and gets one
-/// answer, a `Wait` only once the owner (or the end of a delay) settles it. A socket that cannot
-/// be made is logged and nothing is served: the plugin and the wrapper then refuse every call
-/// they would have asked about (§4.9), never let one through.
+/// answer, a `Wait` only once the owner (or the end of a delay) settles it. A held call's note
+/// goes into the run that asked before the plugin hears `hold` (R51): a task's or job's through
+/// `wake.steers`, main's through `main` into the router. A gate that cannot start (no store, no
+/// socket) says so and serves nothing, R52: the plugin and the wrapper then refuse every call
+/// they would have asked about (§4.9), never let one through, and the daemon goes on.
 pub async fn serve(
     cfgs: watch::Receiver<Arc<Config>>,
     snap: watch::Receiver<Snapshot>,
     waits: Waits,
     wake: &Wake,
+    main: mpsc::Sender<crate::router::GateNote>,
 ) -> anyhow::Result<()> {
     let cfg = cfgs.borrow().clone();
-    let listener = match bind(&cfg) {
-        Ok(listener) => listener,
+    let started = Store::open(&cfg.db_path())
+        .map_err(anyhow::Error::from)
+        .and_then(|store| Ok((store, bind(&cfg)?)));
+    let (store, listener) = match started {
+        Ok(started) => started,
         Err(e) => {
-            eprintln!("zephyr: no gate socket, so the agent's sends are refused: {e:#}");
+            eprintln!("zephyr: the gate is down, so the agent's sends are refused: {e:#}");
             return std::future::pending().await;
         }
     };
-    let store = Arc::new(Mutex::new(Store::open(&cfg.db_path())?));
+    let store = Arc::new(Mutex::new(store));
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
     let mut conns = FuturesUnordered::new();
     loop {
@@ -897,6 +906,7 @@ pub async fn serve(
                         snap: snap.borrow().clone(),
                         store: store.clone(),
                         waits: waits.clone(),
+                        main: main.clone(),
                     };
                     conns.push(async move {
                         conn.run(stream, wake).await;
@@ -945,6 +955,8 @@ struct Conn {
     snap: Snapshot,
     store: Arc<Mutex<Store>>,
     waits: Waits,
+    /// Into the router, for main's held notes.
+    main: mpsc::Sender<crate::router::GateNote>,
 }
 
 impl Conn {
@@ -962,24 +974,33 @@ impl Conn {
         }
         // Only what reaches the gate this way: main's `exec` is decided in the router.
         let served = |w: &Wire| matches!(w.tool.as_str(), "bash" | "mcp_call" | "browser");
-        let verdict = match serde_json::from_slice::<Wire>(&line) {
+        let (verdict, waiting, session) = match serde_json::from_slice::<Wire>(&line) {
             Ok(wire) if wire.v == 1 && line.len() <= MAX_REQUEST && served(&wire) => {
-                self.decide(wire).await
+                let session = wire.session.clone();
+                let (verdict, waiting) = self.decide(wire).await;
+                (verdict, waiting, session)
             }
-            _ => Verdict::Deny("not run: the gate could not read the request".into()),
+            _ => {
+                let deny = Verdict::Deny("not run: the gate could not read the request".into());
+                (deny, None, String::new())
+            }
         };
-        // A card, a flood or a fact notice may be waiting for the owner.
+        if let Verdict::Hold { id, text } = &verdict {
+            self.steer(&session, *id, text, wake).await;
+        }
+        // A card, a flood or a fact notice may be waiting for the owner: told now, with a
+        // browser action's wait already in place (R52) and a hold's note in its run.
         wake.outbox.notify_one();
-        let answer = match verdict {
-            Verdict::Allow => serde_json::json!({ "verdict": "allow" }),
-            Verdict::Hold { id, text } => {
+        let answer = match (verdict, waiting) {
+            (Verdict::Allow, _) => serde_json::json!({ "verdict": "allow" }),
+            (Verdict::Hold { id, text }, _) => {
                 serde_json::json!({ "verdict": "hold", "id": id, "text": text })
             }
-            Verdict::Deny(text) => serde_json::json!({ "verdict": "deny", "text": text }),
-            Verdict::Wait { id } => {
+            (Verdict::Deny(text), _) => serde_json::json!({ "verdict": "deny", "text": text }),
+            (Verdict::Wait { id }, verdict) => {
                 let read = reader.into_inner();
                 let clean = read.buffer().is_empty();
-                match self.wait(id, read.into_inner(), clean).await {
+                match self.wait(id, verdict, read.into_inner(), clean).await {
                     Some(answer) => answer,
                     None => return, // nobody left to answer
                 }
@@ -988,9 +1009,33 @@ impl Conn {
         let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
     }
 
-    /// Decides the request on a blocking thread: the store is synchronous.
-    async fn decide(&self, w: Wire) -> Verdict {
+    /// R51: the held note goes into the asking run's queue before the plugin hears `hold`, while
+    /// rpi still waits on the call, so the step right after the refused call reads it (rpi takes
+    /// its steers as the tool batch ends). At most `STEER_WAIT`: then `hold` goes anyway, and the
+    /// call's own end steers the note in instead (`scheduler::held_note`).
+    async fn steer(&self, session: &str, id: i64, text: &str, wake: &Wake) {
+        let (queued, taken) = tokio::sync::oneshot::channel();
+        let note = crate::scheduler::Note {
+            action: id,
+            text: text.into(),
+            fallback: None,
+            queued: Some(queued),
+        };
+        // A task's or job's run, else main's, which the router checks is the one asking.
+        let sent = match wake.steers.send(session, note) {
+            Ok(()) => true,
+            Err(note) => self.main.try_send((session.to_string(), note)).is_ok(),
+        };
+        if sent {
+            let _ = tokio::time::timeout(STEER_WAIT, taken).await;
+        }
+    }
+
+    /// Decides the request on a blocking thread (the store is synchronous). A browser action
+    /// that waits gets its place in `Waits` there and then, before anything tells the owner.
+    async fn decide(&self, w: Wire) -> (Verdict, Option<oneshot::Receiver<bool>>) {
         let (cfg, snap, store) = (self.cfg.clone(), self.snap.clone(), self.store.clone());
+        let waits = self.waits.clone();
         let decided = tokio::task::spawn_blocking(move || {
             let store = store.lock().unwrap_or_else(|e| e.into_inner());
             let (origin, run) = whose(&store, &snap, &w.session);
@@ -1005,19 +1050,30 @@ impl Conn {
                 // their sessions, which the socket does not read.
                 reason: None,
             };
-            decide(&cfg, &store, &req, origin, crate::now())
+            let verdict = decide(&cfg, &store, &req, origin, crate::now());
+            let waiting = match verdict {
+                Verdict::Wait { id } => Some(waits.add(id)),
+                _ => None,
+            };
+            (verdict, waiting)
         });
         decided.await.unwrap_or_else(|e| {
             eprintln!("zephyr: the gate failed: {e}");
-            Verdict::Deny("not run: the gate failed".into())
+            (Verdict::Deny("not run: the gate failed".into()), None)
         })
     }
 
     /// A browser action waiting for the owner (spec §4.4): the answer once its action is
     /// settled. A wrapper that hangs up first (killed with its child), or sends more than its
     /// request, is gone: the action is dropped and nothing waits on it any more.
-    async fn wait(&self, id: i64, mut read: OwnedReadHalf, clean: bool) -> Option<Value> {
-        let verdict = self.waits.add(id);
+    async fn wait(
+        &self,
+        id: i64,
+        verdict: Option<oneshot::Receiver<bool>>,
+        mut read: OwnedReadHalf,
+        clean: bool,
+    ) -> Option<Value> {
+        let verdict = verdict.unwrap_or_else(|| self.waits.add(id));
         let gone = async {
             let mut byte = [0u8; 1];
             if clean {
@@ -2547,19 +2603,101 @@ mod tests {
 
     /// The gate socket served for `h`, with its own waits, once it is there.
     async fn serving(h: &Home) -> (PathBuf, crate::actions::Waits) {
+        let (socket, waits, _) = serving_with(h).await;
+        (socket, waits)
+    }
+
+    /// `serving`, with the wake the gate notifies.
+    async fn serving_with(
+        h: &Home,
+    ) -> (
+        PathBuf,
+        crate::actions::Waits,
+        &'static crate::scheduler::Wake,
+    ) {
         let waits = crate::actions::Waits::default();
         let (_, cfgs) = tokio::sync::watch::channel(Arc::new(h.cfg.clone()));
         let (_, snap) = tokio::sync::watch::channel(crate::router::Snapshot::default());
         let wake: &'static crate::scheduler::Wake = Box::leak(Box::default());
-        tokio::spawn(serve(cfgs, snap, waits.clone(), wake));
+        let (main, _) = mpsc::channel(1);
+        tokio::spawn(serve(cfgs, snap, waits.clone(), wake, main));
         let socket = socket_path(&h.cfg);
         for _ in 0..200 {
             if tokio::net::UnixStream::connect(&socket).await.is_ok() {
-                return (socket, waits);
+                return (socket, waits, wake);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("no gate socket at {}", socket.display());
+    }
+
+    /// R51: a hold is answered once its note is in the asking run's queue, so the model's next
+    /// step reads it; a run that never takes it delays the answer by at most `STEER_WAIT`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hold_is_answered_once_its_note_is_in_the_run() {
+        let h = home("gate-steer", "");
+        let (socket, _waits, wake) = serving_with(&h).await;
+        let mut inbox = wake.steers.open("task-1");
+        let asked = tokio::spawn({
+            let socket = socket.clone();
+            async move { ask(&socket, &mail_request("task-1")).await }
+        });
+        let note = inbox.recv().await.expect("the note, before the answer");
+        let held = "held for the owner as #1 (email to a@x.org); don't retry it; carry on or end \
+                    your turn";
+        assert_eq!((note.action, note.text.as_str()), (1, held));
+        assert!(note.fallback.is_none());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!asked.is_finished(), "answered before the note was queued");
+        note.queued.unwrap().send(()).unwrap();
+        assert_eq!(asked.await.unwrap().unwrap()["verdict"], "hold");
+        // Never taken: `hold` goes anyway, well inside the plugin's 5 s.
+        let started = std::time::Instant::now();
+        let asked = tokio::spawn(async move { ask(&socket, &mail_request("task-1")).await });
+        let _kept = inbox.recv().await.expect("the second note");
+        assert_eq!(asked.await.unwrap().unwrap()["verdict"], "hold");
+        let took = started.elapsed();
+        assert!(
+            took >= STEER_WAIT && took < Duration::from_secs(4),
+            "{took:?}"
+        );
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
+    }
+
+    /// R52: a gate that cannot start (no store, or a public folder others may write) says so and
+    /// serves nothing, never ending the daemon: every call the plugin would ask about is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gate_that_cannot_start_serves_nothing_and_never_ends() {
+        use std::os::unix::fs::PermissionsExt;
+        let start = |cfg: &Config| {
+            let (_, cfgs) = tokio::sync::watch::channel(Arc::new(cfg.clone()));
+            let (_, snap) = tokio::sync::watch::channel(crate::router::Snapshot::default());
+            let wake: &'static crate::scheduler::Wake = Box::leak(Box::default());
+            let waits = crate::actions::Waits::default();
+            let (main, _) = mpsc::channel(1);
+            tokio::spawn(serve(cfgs, snap, waits, wake, main))
+        };
+        // No store: state.db is a folder.
+        let h = home("gate-no-store", "");
+        let db = h.cfg.db_path();
+        let _ = std::fs::remove_file(&db);
+        std::fs::create_dir_all(&db).unwrap();
+        let served = start(&h.cfg);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!served.is_finished(), "the gate ended: {:?}", served.await);
+        served.abort();
+        assert!(!socket_path(&h.cfg).exists(), "no socket to ask");
+        // A public folder others may write: no socket is made in it.
+        let h = home("gate-open-dir", "");
+        let public = crate::drafts::public_dir(&h.cfg);
+        std::fs::create_dir_all(&public).unwrap();
+        std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let served = start(&h.cfg);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!served.is_finished(), "the gate ended: {:?}", served.await);
+        served.abort();
+        assert!(!socket_path(&h.cfg).exists(), "no socket to ask");
+        let _ = std::fs::remove_dir_all(&public);
     }
 
     /// One request on a connection of our own, and the answer, `None` when it hung up.
@@ -2634,7 +2772,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_waiting_click_is_answered_or_dropped_when_its_wrapper_goes() {
         let h = home("gate-wait", "");
-        let (socket, waits) = serving(&h).await;
+        let (socket, waits, wake) = serving_with(&h).await;
         let click = |n: u32| {
             json!({"v": 1, "session": "main", "tool": "browser", "args": {"argv": ["click", "@e3"]},
                    "browser": {"action": "click", "url": "https://mail.x/compose",
@@ -2653,12 +2791,12 @@ mod tests {
                 .unwrap()
                 .is_some_and(|a| a.status == "pending")
         };
-        for _ in 0..200 {
-            if pending(1) && waits.answer(1, true) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        // R52: by the time the router is told a card waits, the wrapper's wait is in place, so
+        // an `/ok` as fast as the card always finds it.
+        let told = tokio::time::timeout(Duration::from_secs(10), wake.outbox.notified()).await;
+        assert!(told.is_ok(), "the card was never flushed");
+        assert!(pending(1));
+        assert!(waits.answer(1, true), "no wait when the card went out");
         assert_eq!(asked.await.unwrap().unwrap()["verdict"], "allow");
         // Gone before the owner answered: the action is dropped and nothing waits on it.
         let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();

@@ -4969,10 +4969,9 @@ async fn stop_asks_again_for_delayed_actions() {
 
 // ---- the gate socket (approvals spec §4.2 path 2): tasks', jobs' and connectors' sends ----
 
-/// A subagent whose task sends a mail through `bash`, then makes one more call (rpi would take
-/// the next turn: the steered note reaches it there) and stops after answering what was steered
+/// A subagent whose task sends a mail through `bash` and stops after answering what was steered
 /// in, so its report quotes no call of its own for main to run again.
-const MAILER: &str = r#"[call bash {"command": "himalaya message send <<'EOF'\nTo: a@x.org\n\nhi\nEOF"}] [call task {"action": "list"}] [stop-after-steer]"#;
+const MAILER: &str = r#"[call bash {"command": "himalaya message send <<'EOF'\nTo: a@x.org\n\nhi\nEOF"}] [stop-after-steer]"#;
 
 fn with_subagent(mut cfg: Config, name: &str, prompt: &str) -> Config {
     cfg.subagents.push(zephyr::config::Subagent {
@@ -5013,6 +5012,13 @@ async fn a_tasks_send_is_held_through_the_socket_and_runs_on_ok() {
                 your turn";
     wait(|| told_in(&home, "task-1", held)).await;
     wait(|| task_status(&home, "completed") == 1).await;
+    // Steered once: before the plugin was answered, not again at the call's end (R51).
+    let steers = log(&home, "queue_message");
+    assert_eq!(
+        steers.iter().filter(|c| c["message"] == held).count(),
+        1,
+        "{steers:?}"
+    );
     assert_eq!(
         proc_status(&home, "running") + proc_status(&home, "exited"),
         0
@@ -5070,14 +5076,19 @@ async fn a_connector_pass_is_used_once() {
     );
     let refused = reply_where(&gw, "chat", |r| r.starts_with("echo: [chat #1]")).await;
     assert!(refused.ends_with("\nmcp: tool error: blocked"), "{refused}");
-    // The plugin shows the model no reason: the daemon steered the held note into main's run.
+    // The plugin shows the model no reason: the daemon put the held note in main's run before
+    // the plugin was answered, so the step after the refused call reads it (R51), once.
     let held = "held for the owner as #1 (mail/send); don't retry it; carry on or end your turn";
-    wait(|| {
-        log(&home, "queue_message")
-            .iter()
-            .any(|c| c["message"] == held && c["deliverAs"] == "steer")
-    })
-    .await;
+    wait(|| told_in(&home, "main", held)).await;
+    let messages = session_messages(&home, "main");
+    let refused = messages
+        .iter()
+        .position(|m| m["role"] == "toolResult" && m["isError"] == true)
+        .expect("the refused call");
+    assert_eq!(messages[refused + 1]["content"], held, "{messages:#?}");
+    let steers = log(&home, "queue_message");
+    let steers = steers.iter().filter(|c| c["message"] == held).count();
+    assert_eq!(steers, 1, "{:?}", log(&home, "queue_message"));
 
     gw.say("m2", "owner", "/ok 1").await;
     let approved = reply_where(&gw, "chat", |r| r.contains("approved #1")).await;

@@ -237,11 +237,16 @@ fn pass(ctx: &Ctx, a: &Action, by: By, now: i64) -> Result<String, String> {
     );
     let steered = Note {
         action: a.id,
-        word: word.into(),
-        text,
+        text: crate::store::note_text(a.id, word, &text),
+        fallback: Some((word.into(), text)),
+        queued: None,
     };
-    if let Err(n) = ctx.steers.send(&a.origin.session, steered) {
-        note(store, a, &n.word, &n.text);
+    if let Err(Note {
+        fallback: Some((word, text)),
+        ..
+    }) = ctx.steers.send(&a.origin.session, steered)
+    {
+        note(store, a, &word, &text);
     }
     Ok("the agent may make exactly that call once in the next 30 min".into())
 }
@@ -675,12 +680,10 @@ mod tests {
         approve(&ctx, id, false, by, crate::now()).unwrap();
         let note = inbox.try_recv().expect("steered in");
         assert_eq!(note.action, id);
-        assert!(
-            crate::store::note_text(note.action, &note.word, &note.text).starts_with(&format!(
-                "[action #{id} approved; zephyr's note, not the owner's words] the owner \
-                 approved #{id} (email to a@x.org): make exactly that connector call again"
-            ))
-        );
+        assert!(note.text.starts_with(&format!(
+            "[action #{id} approved; zephyr's note, not the owner's words] the owner approved \
+             #{id} (email to a@x.org): make exactly that connector call again"
+        )));
         let row = |id: i64| {
             let db = rusqlite::Connection::open(cfg.db_path()).unwrap();
             db.query_row(

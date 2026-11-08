@@ -275,6 +275,9 @@ pub async fn run<C: Channel>(
     let (gate_cfgs, gate_snap) = (cfg_rx.clone(), snap_rx.clone());
     let names = channels.iter().map(|c| c.name().to_string()).collect();
     let mut router = Router::new(cfg, &jobs, attaches, cfg_tx, snap, names)?;
+    // The gate's held notes for main's run, steered in before the plugin is answered (R51).
+    let (gate_notes, notes_rx) = mpsc::channel(16);
+    router.gate_notes = Some(notes_rx);
     // Commands a re-exec handed over alive are adopted; the rest a dead gateway left running
     // are reported, never re-run (DESIGN §4.13).
     router.procs.adopt(&router.cfg, &mut router.store)?;
@@ -289,7 +292,7 @@ pub async fn run<C: Channel>(
     tokio::select! {
         r = runs => r.map(|_| Exit::Shutdown),
         // Tasks' and jobs' sends, every connector call, the browser's clicks (approvals §4.2).
-        r = crate::gate::serve(gate_cfgs, gate_snap, waits, &jobs) => r.map(|()| Exit::Shutdown),
+        r = crate::gate::serve(gate_cfgs, gate_snap, waits, &jobs, gate_notes) => r.map(|()| Exit::Shutdown),
         r = crate::attach::serve(cfg, tx, attach_tx, snap_rx, attach_cfgs) => r.map(|()| Exit::Shutdown),
         r = crate::scheduler::run(cfg_rx.clone(), &jobs) => r.map(|()| Exit::Shutdown),
         r = crate::tasks::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),
@@ -453,6 +456,10 @@ struct Router<'a> {
     waits: crate::actions::Waits,
     /// The last tick found the gateway paused: the next one holds what came due (I1).
     due_held: bool,
+    /// The gate's held notes for main's run (R51), from `gate::serve`.
+    gate_notes: Option<mpsc::Receiver<GateNote>>,
+    /// Actions whose held note is in this run already, so the call's end steers it in no more.
+    held_steered: HashSet<i64>,
     /// The newest note about an action main was woken for (R49).
     action_woken: i64,
     /// The pooled account the child runs on (DESIGN §4.9). `None` without a pool.
@@ -525,6 +532,16 @@ impl Reloaded {
     }
 }
 
+/// A note the gate hands main's run (`Router::gate_note`): the session it is for, and the note.
+pub type GateNote = (String, crate::scheduler::Note);
+
+async fn next_gate_note(rx: &mut Option<mpsc::Receiver<GateNote>>) -> Option<GateNote> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn next_event(child: &mut Option<Child>) -> Option<Value> {
     match child {
         Some(c) => c.events.recv().await,
@@ -590,6 +607,8 @@ impl<'a> Router<'a> {
             procs: Default::default(),
             waits: Default::default(),
             due_held: false,
+            gate_notes: None,
+            held_steered: HashSet::new(),
             action_woken: 0,
             compacting: None,
             approving: None,
@@ -619,6 +638,9 @@ impl<'a> Router<'a> {
                 }
                 Some(m) = rx.recv() => self.inbound(m, false).await,
                 Some(req) = self.attaches.recv() => self.attach(req).await,
+                Some((session, note)) = next_gate_note(&mut self.gate_notes) => {
+                    self.gate_note(&session, note).await
+                }
                 _ = self.jobs.outbox.notified() => {} // a job's output: flush below
                 // The `/btw` answer is in the outbox: flush below.
                 r = async { self.btw.as_mut().expect("guarded").await }, if self.btw.is_some() => {
@@ -702,10 +724,14 @@ impl<'a> Router<'a> {
             let session = self.child.as_ref().and_then(|c| c.session.clone());
             if let Some(session) = &session {
                 crate::scheduler::audit(&self.store, &self.cfg, session, ev);
-                // The plugin refused a call the gate held, showing the model no reason: the run
-                // is told it waits for the owner (approvals spec §4.2), as the guard's note is.
-                if let Some(note) = crate::scheduler::held_note(&self.store, session, ev) {
-                    self.steer_note(note).await;
+                // The plugin refused a call the gate held, showing the model no reason. The gate
+                // put the note in the run before it answered (R51); if that did not get through
+                // in time, it goes in now, once (approvals spec §4.2), as the guard's note does.
+                match crate::scheduler::held_note(&self.store, session, ev) {
+                    Some((id, note)) if self.held_steered.insert(id) => {
+                        self.steer_note(note).await;
+                    }
+                    _ => {}
                 }
             }
             self.track(ev);
@@ -1148,6 +1174,7 @@ impl<'a> Router<'a> {
         self.steered.clear();
         self.steered_texts.clear();
         self.steer_sent.clear();
+        self.held_steered.clear();
     }
 
     /// Rebuilds the snapshot from the store and config, keeping `run`. Pushed only on change.
@@ -3651,15 +3678,35 @@ impl<'a> Router<'a> {
     }
 
     /// Steers the daemon's own `note` into the running turn: the repeated-failure guard's, or
-    /// what a held call means.
-    async fn steer_note(&mut self, note: String) {
+    /// what a held call means. Returns whether rpi took it.
+    async fn steer_note(&mut self, note: String) -> bool {
         let steer = json!({"type": "queue_message", "message": note, "deliverAs": "steer"});
-        log(self.call(steer).await.map(drop));
+        let queued = self.call(steer).await.map(drop);
+        let took = queued.is_ok();
+        log(queued);
         // Not the owner's message: `reconcile` never takes it for the run's request.
         self.steered_texts.insert(note);
         // A run that ends before reaching it would leave it to open the next run: the settle
         // takes it back, as it does the resume note.
         self.note_pending = true;
+        took
+    }
+
+    /// The gate's held note for main's run (R51), before it answers the plugin `hold`: steered
+    /// in now, while rpi still waits on the call, so the step after the refused call reads it
+    /// (rpi takes its steers as the tool batch ends). `note.queued` is told once rpi has it; a
+    /// note for a session or a run that is not this one is dropped, which tells the gate at once.
+    async fn gate_note(&mut self, session: &str, mut note: crate::scheduler::Note) {
+        let ours = self.child.as_ref().and_then(|c| c.session.as_deref()) == Some(session);
+        if !(self.busy && ours) || self.held_steered.contains(&note.action) {
+            return;
+        }
+        if self.steer_note(note.text).await {
+            self.held_steered.insert(note.action);
+            if let Some(queued) = note.queued.take() {
+                let _ = queued.send(());
+            }
+        }
     }
 
     /// `/undo [n]` (DESIGN §4.1), idle only: takes the last `n` exchanges (`turns`) out of the

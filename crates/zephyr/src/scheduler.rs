@@ -43,19 +43,23 @@ pub struct Wake {
     pub steers: Steers,
 }
 
-/// A note for a task's or job's run in progress, from outside it: the owner approved the
-/// connector call it asked for (approvals spec §4.6). The run is steered `store::note_text`
-/// of it; one that ends before the model reads it leaves it to main as `action_note`.
-#[derive(Clone)]
+/// A note for a run in progress about action `action`, from outside it, steered in whole as
+/// `text`: the gate's held note, before the plugin hears `hold` (R51), or the owner's pass for
+/// the connector call the run asked for (approvals spec §4.6).
 pub struct Note {
     pub action: i64,
-    pub word: String,
     pub text: String,
+    /// What main is handed as the action's note (`word`, text; `Store::action_note`) when the
+    /// run ends before the model reads it: a pass's. `None` for a held note, which the call's
+    /// own end steers again if it must.
+    pub fallback: Option<(String, String)>,
+    /// Told once rpi has queued it: the gate waits for that before it answers the plugin.
+    pub queued: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// The task and job runs in progress, by session, that a [`Note`] can be steered into. A run's
-/// inbox closes when its `follow` ends, and every note already in it then goes to main instead:
-/// a note is either steered into the run that asked or handed to main, never lost between.
+/// inbox closes when its `follow` ends, and every pass note in it then goes to main instead: a
+/// note is either steered into the run that asked or handed to main, never lost between.
 #[derive(Clone, Default)]
 pub struct Steers(Arc<std::sync::Mutex<HashMap<String, mpsc::UnboundedSender<Note>>>>);
 
@@ -629,19 +633,31 @@ async fn follow(
     let mut notes = Notes {
         inbox: child.notes.take(),
         steered: Vec::new(),
+        held: std::collections::HashSet::new(),
         db: cfg.db_path(),
     };
     let settled = loop {
         let limit = cfg.stall_limit * if in_tool > 0 { 2 } else { 1 };
         let ev = tokio::select! {
             ev = tokio::time::timeout(limit, child.events.recv()) => ev,
-            Some(note) = notes.next() => {
-                // A note from outside the run (an approved connector call): steered in, and
-                // handed to main at the end unless the run reached it.
-                let text = crate::store::note_text(note.action, &note.word, &note.text);
-                let steer = json!({"type": "queue_message", "message": text, "deliverAs": "steer"});
-                let _ = child.call(steer).await;
-                notes.steered.push(note);
+            Some(mut note) = notes.next() => {
+                // A note from outside the run (the gate's, an approved connector call's): steered
+                // in, and a pass's handed to main at the end unless the run reached it. A held
+                // note the call's end already steered in (the gate's came late) goes no more.
+                if note.fallback.is_none() && notes.held.contains(&note.action) {
+                    continue;
+                }
+                let steer =
+                    json!({"type": "queue_message", "message": note.text, "deliverAs": "steer"});
+                if child.call(steer).await.is_ok() {
+                    if let Some(queued) = note.queued.take() {
+                        let _ = queued.send(());
+                    }
+                    notes.held.insert(note.action);
+                    if note.fallback.is_some() {
+                        notes.steered.push(note);
+                    }
+                }
                 continue;
             }
         };
@@ -656,12 +672,16 @@ async fn follow(
                 notes.delivered(&ev);
                 if let Some((session, store)) = &audited {
                     audit(store, cfg, session, &ev);
-                    // The plugin refused a call the gate held: it shows the model no reason, so
-                    // the run is told it waits for the owner (approvals spec §4.2).
-                    if let Some(note) = held_note(store, session, &ev) {
-                        let steer =
-                            json!({"type": "queue_message", "message": note, "deliverAs": "steer"});
-                        let _ = child.call(steer).await;
+                    // The plugin refused a call the gate held, showing the model no reason. The
+                    // gate steered the note in before it answered (R51); if that did not get
+                    // through in time, it goes in now, once (approvals spec §4.2).
+                    match held_note(store, session, &ev) {
+                        Some((id, note)) if notes.held.insert(id) => {
+                            let steer = json!({"type": "queue_message", "message": note,
+                                               "deliverAs": "steer"});
+                            let _ = child.call(steer).await;
+                        }
+                        _ => {}
                     }
                 }
                 match ev["type"].as_str() {
@@ -729,16 +749,20 @@ async fn follow(
     })
 }
 
-/// What the agent is told when the plugin refused its call `ev` (a `tool_execution_end` with
-/// `isError`) because the gate held it for the owner (approvals spec §4.2, §4.8): `None` for
-/// any other event or refusal.
-pub(crate) fn held_note(store: &Store, session: &str, ev: &serde_json::Value) -> Option<String> {
+/// The held action and what the agent is told, when the plugin refused its call `ev` (a
+/// `tool_execution_end` with `isError`) because the gate held it for the owner (approvals spec
+/// §4.2, §4.8): `None` for any other event or refusal.
+pub(crate) fn held_note(
+    store: &Store,
+    session: &str,
+    ev: &serde_json::Value,
+) -> Option<(i64, String)> {
     if ev["type"] != "tool_execution_end" || ev["isError"] != true {
         return None;
     }
     let call = ev["toolCallId"].as_str()?;
     match store.held_for_call(session, call) {
-        Ok(held) => held.map(|(id, summary)| crate::gate::held_text(id, &summary)),
+        Ok(held) => held.map(|(id, summary)| (id, crate::gate::held_text(id, &summary))),
         Err(e) => {
             eprintln!("zephyr: reading what the gate held failed: {e}");
             None
@@ -747,12 +771,15 @@ pub(crate) fn held_note(store: &Store, session: &str, ev: &serde_json::Value) ->
 }
 
 /// A run's notes from outside it (`Steers`) while `follow` reads its events: each is steered in
-/// as it comes, and when `follow` ends, by whatever way, the inbox is closed and every note the
-/// model never got (still in the inbox, or steered in but not delivered when the run ended)
+/// as it comes, and when `follow` ends, by whatever way, the inbox is closed and every pass note
+/// the model never got (still in the inbox, or steered in but not delivered when the run ended)
 /// goes to main as the action's note instead.
 struct Notes {
     inbox: Option<mpsc::UnboundedReceiver<Note>>,
+    /// Pass notes steered in, until rpi delivers them.
     steered: Vec<Note>,
+    /// The actions whose note is in the run already, so a held call's end steers none again.
+    held: std::collections::HashSet<i64>,
     /// The store, opened only when a note is left for main.
     db: std::path::PathBuf,
 }
@@ -777,11 +804,7 @@ impl Notes {
             return;
         }
         let text = message_text(&ev["message"]);
-        let mut gone = self
-            .steered
-            .iter()
-            .map(|n| crate::store::note_text(n.action, &n.word, &n.text));
-        if let Some(i) = gone.position(|t| t == text) {
+        if let Some(i) = self.steered.iter().position(|n| n.text == text) {
             self.steered.remove(i);
         }
     }
@@ -796,17 +819,17 @@ impl Drop for Notes {
                 left.push(note);
             }
         }
-        if left.is_empty() {
-            return;
+        if left.iter().all(|n| n.fallback.is_none()) {
+            return; // held notes: the gate has answered by now
         }
         let store = Store::open(&self.db);
-        for n in left {
-            let handed = (store.as_ref()).map(|s| s.action_note(n.action, &n.word, &n.text));
+        for (n, (word, text)) in left
+            .into_iter()
+            .filter_map(|n| Some((n.action, n.fallback?)))
+        {
+            let handed = (store.as_ref()).map(|s| s.action_note(n, &word, &text));
             if !matches!(handed, Ok(Ok(_))) {
-                eprintln!(
-                    "zephyr: action #{}'s note reached neither its run nor main",
-                    n.action
-                );
+                eprintln!("zephyr: action #{n}'s note reached neither its run nor main");
             }
         }
     }

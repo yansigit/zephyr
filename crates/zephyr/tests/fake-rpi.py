@@ -112,11 +112,13 @@ The gate: a `bash` or `mcp_call` call plays the policy plugin's gate client when
 $ZEPHYR_GATE_SOCKET is set (every call, where the plugin asks only about sends; the daemon allows
 the rest): before the tool runs (and before any `tool_wait`), it sends
 {"v": 1, "session": $ZEPHYR_SESSION, "call_id", "tool", "args"} as one line and waits up to 5 s for
-the answer line. Only {"verdict": "allow"} runs the call; anything else (no socket, no answer, a bad
-one, a hold, a deny) refuses it, `isError` with "tool error: blocked" and nothing of the daemon's
-text, as rpi shows a vetoed call.
+the answer line, answering meanwhile (as rpi does while a plugin holds a call) the commands that
+need no run, so a note the daemon steers in before it answers is queued, and delivered right after
+the call's result. Only {"verdict": "allow"} runs the call; anything else (no socket, no answer, a
+bad one, a hold, a deny) refuses it, `isError` with "tool error: blocked" and nothing of the
+daemon's text, as rpi shows a vetoed call.
 """
-import glob, json, os, queue as queues, re, socket, sys, threading, time
+import glob, json, os, queue as queues, re, select, socket, sys, threading, time
 
 args = sys.argv[1:]
 if "--version" in args:
@@ -466,9 +468,10 @@ def deliver_steering(s):
             said(s, m)
     steering = []
 
-def gate_allows(name, args, cid):
+def gate_allows(s, name, args, cid):
     """The policy plugin's gate client (zephyr_policy::gate_client): True only when the daemon's
-    gate socket answers allow within 5 s."""
+    gate socket answers allow within 5 s. While it waits, the commands that need no run are
+    answered (a steer is queued), as rpi does while a plugin holds a call; the rest wait."""
     path = os.environ.get("ZEPHYR_GATE_SOCKET")
     if name not in ("bash", "mcp_call") or not path:
         return True
@@ -479,12 +482,23 @@ def gate_allows(name, args, cid):
             c.settimeout(5)
             c.connect(path)
             c.sendall((json.dumps(req) + "\n").encode())
-            answer = b""
-            while not answer.endswith(b"\n"):
-                chunk = c.recv(4096)
-                if not chunk:
-                    break
-                answer += chunk
+            answer, deadline = b"", time.time() + 5
+            while not answer.endswith(b"\n") and time.time() < deadline:
+                if select.select([c], [], [], 0.02)[0]:
+                    chunk = c.recv(4096)
+                    if not chunk:
+                        break
+                    answer += chunk
+                    continue
+                try:
+                    line = lines.get_nowait()
+                except queues.Empty:
+                    continue
+                if line is None:
+                    lines.put(None); continue
+                open(os.path.join(home, "log.jsonl"), "a").write(line)
+                if not quick(json.loads(line), s):
+                    deferred.append(line)
         return json.loads(answer).get("verdict") == "allow"
     except Exception:
         return False
@@ -496,7 +510,7 @@ def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
               "content": [{"type": "text", "text": "ok"}], "isError": False, "timestamp": 0}
     said(s, call)
     out({"type": "tool_execution_start", "toolCallId": cid, "toolName": name, "args": args})
-    allowed = gate_allows(name, args, cid)  # as the plugin's ToolCall handler, before the tool runs
+    allowed = gate_allows(s, name, args, cid)  # as the plugin's ToolCall handler, before the tool runs
     while allowed and os.path.exists(os.path.join(home, "tool_wait")):
         # As rpi: commands that need no run are answered while the tool runs; the rest wait.
         try:
