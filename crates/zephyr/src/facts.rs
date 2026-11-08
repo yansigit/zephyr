@@ -29,7 +29,8 @@ pub fn path(cfg: &Config) -> PathBuf {
 }
 
 /// The facts file beside the state database at `db` (`<state>/state.db`), for the store, which
-/// has no config, to scrub what it writes (R70).
+/// has no config, to scrub what it writes (R70). The store takes it from the path it was opened
+/// at, not the file SQLite resolved, so a linked state.db still finds the right facts.
 pub fn beside(db: &Path) -> PathBuf {
     db.with_file_name(FILE)
 }

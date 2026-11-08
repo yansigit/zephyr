@@ -271,7 +271,9 @@ fn wait(ctx: &Ctx, a: &Action) -> Result<String, String> {
 /// A taken action that did not start: failed, the agent told why, and the answer for whoever
 /// set it in motion.
 fn not_run(cfg: &Config, store: &Store, a: &Action, by: By, why: &str) -> String {
-    finish(store, a, "failed", why);
+    // R70: why can carry the agent's words (a program's name), so it is scrubbed too.
+    let why = crate::facts::scrubbed(cfg, why.to_string());
+    finish(store, a, "failed", &why);
     let (n, s) = (a.id, summary(cfg, a));
     let (agent, owner) = match by {
         By::Owner { .. } => (
@@ -991,6 +993,64 @@ mod tests {
                     && outcome == "re-asked"
             ),
             "{audit:#?}"
+        );
+    }
+
+    /// Main's notes about held actions, as the store wrote them.
+    fn notes(store: &Store) -> Vec<String> {
+        (store.db_for_test())
+            .prepare("SELECT text FROM inbox WHERE platform_msg_id LIKE 'action-%'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    const PHONE: &str = "[[fact]]\nname = \"phone\"\nkind = \"digits\"\nvalue = \"5550102345\"\n";
+
+    /// R70: why an approved action did not start can carry the agent's words (a program's name
+    /// from the vault's check); it is scrubbed of the facts too.
+    #[test]
+    fn why_an_action_did_not_start_is_scrubbed() {
+        let (cfg, store) = setup("actions-not-run-scrub", "");
+        std::fs::write(crate::facts::path(&cfg), PHONE).unwrap();
+        let id = hold(&store, ActionKind::Run, SEND, &[], None);
+        let a = store.action(id).unwrap().unwrap();
+        let why = "it needs the owner's OK to use GH_TOKEN with notify-5550102345";
+        let owner = not_run(&cfg, &store, &a, By::Delay, why);
+        let notes = notes(&store);
+        assert!(owner.contains("notify-[fact:phone]"), "{owner}");
+        assert!(
+            !owner.contains("5550102345") && !notes.iter().any(|t| t.contains("5550102345")),
+            "{owner} {notes:?}"
+        );
+    }
+
+    /// R70: the store reads the facts beside the path it was opened at, even when state.db is
+    /// a link to a file in another folder (SQLite opens the file the link names).
+    #[test]
+    fn the_store_scrubs_with_the_facts_beside_the_path_it_was_opened_at() {
+        let (cfg, first) = setup("actions-scrub-linked", "");
+        drop(first);
+        let elsewhere = cfg.state_dir().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::rename(cfg.db_path(), elsewhere.join("state.db")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("state.db"), cfg.db_path()).unwrap();
+        let store = Store::open(&cfg.db_path()).unwrap();
+        std::fs::write(
+            crate::facts::path(&cfg),
+            "[[fact]]\nname = \"mine\"\nkind = \"email\"\nvalue = \"a@x.org\"\n",
+        )
+        .unwrap();
+        let id = hold(&store, ActionKind::Run, SEND, &[], None);
+        store.take_action(id, "running").unwrap();
+        store.restore_actions(crate::now()).unwrap();
+        let notes = notes(&store);
+        assert!(
+            notes.iter().any(|t| t.contains("[fact:mine]"))
+                && !notes.iter().any(|t| t.contains("a@x.org")),
+            "{notes:?}"
         );
     }
 

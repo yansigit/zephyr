@@ -227,6 +227,7 @@ fn last_owner_in(db: &Connection) -> rusqlite::Result<Option<(String, String)>> 
 /// the action's summary. Returns whether a row was written.
 fn action_row_in(
     db: &Connection,
+    facts: &Path,
     id: i64,
     text: impl FnOnce(&str) -> String,
 ) -> rusqlite::Result<bool> {
@@ -250,12 +251,8 @@ fn action_row_in(
     let Some((channel, sender)) = to else {
         return Ok(false);
     };
-    // R70: the summary as the private facts are now, from the facts file beside the database.
-    let summary = summary.unwrap_or_default();
-    let summary = match db.path().filter(|p| !p.is_empty()) {
-        Some(p) => crate::facts::scrubbed_in(&crate::facts::beside(Path::new(p)), summary),
-        None => summary,
-    };
+    // R70: the summary as the private facts are now.
+    let summary = crate::facts::scrubbed_in(facts, summary.unwrap_or_default());
     let n = db.execute(
         "INSERT OR IGNORE INTO inbox(channel, platform_msg_id, sender, text) VALUES (?1, ?2, ?3, ?4)",
         params![channel, format!("action-{id}"), sender, text(&summary)],
@@ -274,6 +271,7 @@ pub fn note_text(id: i64, word: &str, text: &str) -> String {
 /// process report's is (approvals spec §4.6).
 fn action_report_in(
     db: &Connection,
+    facts: &Path,
     id: i64,
     status: &str,
     outcome: &str,
@@ -285,7 +283,7 @@ fn action_report_in(
     } else {
         "done"
     };
-    action_row_in(db, id, |summary| {
+    action_row_in(db, facts, id, |summary| {
         let header = format!(
             "[action #{id} {word}; zephyr ran what the owner approved] {outcome}: {summary}"
         );
@@ -523,6 +521,9 @@ pub struct SettingChange {
 
 pub struct Store {
     db: Connection,
+    /// The private facts file beside the path the store was opened at, which what the store
+    /// writes into main's inbox is scrubbed with (R70).
+    facts: std::path::PathBuf,
 }
 
 impl Store {
@@ -791,7 +792,10 @@ impl Store {
             }
         }
         db.commit()?;
-        Ok(Self { db: conn })
+        Ok(Self {
+            db: conn,
+            facts: crate::facts::beside(path),
+        })
     }
 
     /// The schema version an existing `state.db` was migrated to v16 from (approvals
@@ -1485,7 +1489,7 @@ impl Store {
         output: &str,
     ) -> rusqlite::Result<()> {
         let tx = self.db.transaction()?;
-        action_report_in(&tx, id, status, outcome, output)?;
+        action_report_in(&tx, &self.facts, id, status, outcome, output)?;
         tx.commit()
     }
 
@@ -1493,7 +1497,7 @@ impl Store {
     /// given, not started): `[action #N WORD; zephyr's note, not the owner's words] TEXT`, on the
     /// run's channel, once per action (inbox row `action-<id>`). Returns whether it was written.
     pub fn action_note(&self, id: i64, word: &str, text: &str) -> rusqlite::Result<bool> {
-        action_row_in(&self.db, id, |_| note_text(id, word, text))
+        action_row_in(&self.db, &self.facts, id, |_| note_text(id, word, text))
     }
 
     /// The newest report or note about a held action still waiting for main (`action_note`),
@@ -1617,7 +1621,7 @@ impl Store {
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
         for id in lost {
-            action_row_in(&self.db, id, |summary| {
+            action_row_in(&self.db, &self.facts, id, |summary| {
                 format!(
                     "[action #{id} unknown; zephyr's note, not the owner's words] zephyr \
                      restarted while it carried out #{id} ({summary}), so whether it went is \
@@ -2125,7 +2129,7 @@ impl Store {
                     ("unknown", _) => "unknown",
                     _ => "failed",
                 };
-                action_report_in(&tx, action, ended, outcome, output)?;
+                action_report_in(&tx, &self.facts, action, ended, outcome, output)?;
             }
             (Some((outcome, output)), None) => {
                 tx.execute(
@@ -2177,7 +2181,7 @@ impl Store {
         for p in &cut {
             let text = "the gateway restarted while it ran, so it was stopped or lost";
             if let Some(action) = p.action {
-                action_report_in(&tx, action, "unknown", text, "")?;
+                action_report_in(&tx, &self.facts, action, "unknown", text, "")?;
                 continue;
             }
             tx.execute(
