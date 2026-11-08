@@ -4,10 +4,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use zephyr::agent::AGENT_PATH;
+
 const CONTAINER: &str = "zephyr-lanetest";
-/// The agent's PATH, passed to each exec as the agent: the image's own is root's.
-const AGENT_PATH: &str =
-    "/zephyr/.local/bin:/opt/zephyr/py/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const GH_TOKEN: &str = "gho_FAKE_GH_TOKEN_0123";
 const CLAUDE_TOKEN: &str = "sk-ant-oat01-FAKE-CLAUDE-TOKEN";
 
@@ -52,6 +51,8 @@ case "$1" in
       *" zephyr status "*) echo "daemon: ${SHIM_DAEMON:-running}"; [ -n "$SHIM_STATUS" ] && printf '%b\n' "$SHIM_STATUS"; exit "${SHIM_STATUS_EXIT:-0}" ;;
       *" zephyr --version "*) [ -n "$SHIM_VERSION" ] || exit 2; echo "zephyr $SHIM_VERSION" ;;
       *" zephyr tui "*) exit "${SHIM_TUI_EXIT:-0}" ;;
+      # `zephyr set KEY VALUE`: the daemon's reply, a refusal when SHIM_SET_REFUSE is set.
+      *" zephyr set "*) [ -n "$SHIM_SET_DOWN" ] && { echo "zephyr: the daemon is not running" >&2; exit 3; }; [ -n "$SHIM_SET_REFUSE" ] && { echo "[zephyr] $SHIM_SET_REFUSE"; exit 1; }; echo "[zephyr] ${@: -2:1} 1 → ${@: -1}" ;;
     esac ;;
 esac
 exit 0
@@ -323,6 +324,279 @@ fn find_agent<'a>(calls: &'a [Vec<String>], rest: &[&str]) -> &'a Vec<String> {
 
 fn mode(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().mode() & 0o777
+}
+
+/// Answers a prompting `zephyr` on a pty, one `(prompt text, keys)` step at a time: each is sent
+/// once the prompt's text has been printed. Returns the exit code and everything printed.
+const PTY_DRIVER: &str = r#"
+import json, os, pty, re, select, sys, time
+steps = json.loads(sys.argv[1]); argv = sys.argv[2:]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(argv[0], argv)
+seen, at, deadline = "", 0, time.time() + 60
+while time.time() < deadline:
+    r, _, _ = select.select([fd], [], [], 0.2)
+    if r:
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            break
+        if not data:
+            break
+        seen += re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", data.decode(errors="replace"))
+    if steps:
+        prompt, keys = steps[0]
+        i = seen.find(prompt, at)
+        if i >= 0:
+            at = i + len(prompt)
+            time.sleep(0.2)
+            os.write(fd, keys.encode())
+            steps.pop(0)
+_, status = os.waitpid(pid, 0)
+print(seen)
+print("LEFT", len(steps))
+sys.exit(os.waitstatus_to_exitcode(status))
+"#;
+
+impl Env {
+    /// `zephyr <args>` on a terminal answering `steps` (see `PTY_DRIVER`): `(code, output)`.
+    fn on_a_driven_tty(&self, args: &[&str], steps: &[(&str, &str)]) -> (i32, String) {
+        let path = format!(
+            "{}:{}",
+            self.dir.join("bin").display(),
+            std::env::var("PATH").unwrap()
+        );
+        let steps = serde_json::to_string(steps).unwrap();
+        let out = Command::new("python3")
+            .args(["-I", "-c", PTY_DRIVER, &steps, env!("CARGO_BIN_EXE_zephyr")])
+            .args(args)
+            .env_clear()
+            .env("PATH", path)
+            .env("HOME", &self.home)
+            .env("SHIM_DIR", &self.dir)
+            .env("ZEPHYR_CONTAINER", CONTAINER)
+            .env("ZEPHYR_IMAGE", "zephyr-lanetest")
+            .env("TERM", "xterm")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        (out.status.code().unwrap_or(-1), stdout(&out))
+    }
+}
+
+#[test]
+fn init_asks_for_a_preset_and_writes_it() {
+    const PIN: &str = "4829105";
+    const DOWN: &str = "\x1b[B";
+    let env = Env::new("init-preset");
+    let projects = env.projects.display().to_string();
+    let (code, shown) = env.on_a_driven_tty(
+        &["init", "--projects", &projects, "--no-start"],
+        &[
+            ("Providers", "\n"),
+            ("Set up discord?", "n"),
+            ("Set up imessage?", "n"),
+            // manual is first; semi is one down.
+            ("Approvals: how much", &format!("{DOWN}\n")),
+            ("Add private facts", "y"),
+            ("Fact name", "pin\n"),
+            ("Kind", &format!("{DOWN}\n")),
+            ("value of pin (hidden)", &format!("{PIN}\n")),
+            ("Add another fact?", "n"),
+        ],
+    );
+    assert!(
+        shown.contains("LEFT 0"),
+        "every prompt was answered: {shown}"
+    );
+    assert_eq!(code, 0, "{shown}");
+    let config = env.config();
+    assert!(
+        config.contains("[approvals]") && config.contains("preset = \"semi\""),
+        "{config}"
+    );
+    let facts = std::fs::read_to_string(env.daemon().join("facts.toml")).unwrap();
+    assert!(facts.contains(PIN) && facts.contains("digits"), "{facts}");
+    assert!(!shown.contains(PIN), "the value was echoed");
+    assert!(!format!("{:?}", env.calls()).contains(PIN), "value in argv");
+}
+
+#[test]
+fn init_non_interactive_takes_preset_flag() {
+    let env = Env::new("init-preset-flag");
+    env.init(&["--no-start", "--preset", "full"]);
+    let config = env.config();
+    assert!(
+        config.contains("[approvals]") && config.contains("preset = \"full\""),
+        "{config}"
+    );
+    // Not given: the table stays absent, which is manual; and no facts are asked for.
+    let plain = Env::new("init-no-preset");
+    plain.init(&["--no-start"]);
+    assert!(!plain.config().contains("approvals"));
+    assert!(!plain.daemon().join("facts.toml").exists());
+    // A word that is no preset is refused before anything is written.
+    let bad = Env::new("init-bad-preset");
+    let projects = bad.projects.display().to_string();
+    let out = bad.zephyr(&[
+        "init",
+        "--non-interactive",
+        "--projects",
+        &projects,
+        "--preset",
+        "some",
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("manual, semi or full"));
+    assert!(!bad.daemon().join("zephyr.toml").exists());
+}
+
+/// D11: a re-run of `init --preset` writes the preset as `/approvals PRESET` does
+/// (`preset_edits`): a hand-set class looser than the new preset is cleared, a stricter one kept.
+#[test]
+fn init_again_with_a_preset_drops_looser_hand_set_classes() {
+    let env = Env::new("init-preset-edits");
+    env.init(&["--no-start", "--preset", "full"]);
+    let path = env.daemon().join("zephyr.toml");
+    let text = env.config().replace(
+        "[approvals]\npreset = \"full\"",
+        "[approvals]\npreset = \"full\"\nmessages = \"auto\"\nposts = \"ask\"\nmoney = \"auto 50\"",
+    );
+    assert!(text.contains("messages = \"auto\""), "{text}");
+    std::fs::write(&path, text).unwrap();
+    env.init(&["--no-start", "--preset", "manual"]);
+    let config = env.config();
+    assert!(config.contains("preset = \"manual\""), "{config}");
+    assert!(
+        !config.contains("messages ="),
+        "looser than manual: {config}"
+    );
+    assert!(!config.contains("money ="), "looser than manual: {config}");
+    assert!(config.contains("posts = \"ask\""), "as strict: {config}");
+}
+
+/// D4: adding a connector again (a new URL or command) keeps the classes the owner gave its
+/// tools.
+#[test]
+fn mcp_add_again_keeps_the_owners_classes() {
+    let env = Env::new("mcp-classes");
+    env.init(&["--no-start"]);
+    env.ok(&["mcp", "add", "mail", "--", "mail-server", "--stdio"]);
+    let path = env.daemon().join("zephyr.toml");
+    let text = env.config().replace(
+        "name = \"mail\"",
+        "name = \"mail\"\nclasses = { archive = \"posts\", note = \"none\" }",
+    );
+    assert!(text.contains("archive"), "{text}");
+    std::fs::write(&path, text).unwrap();
+    env.ok(&[
+        "mcp",
+        "add",
+        "mail",
+        "--url",
+        "https://mail.example.com/mcp",
+    ]);
+    let config = env.config();
+    assert!(config.contains("https://mail.example.com/mcp"), "{config}");
+    assert!(!config.contains("mail-server"), "{config}");
+    assert!(
+        config.contains("archive = \"posts\"") && config.contains("note = \"none\""),
+        "{config}"
+    );
+    env.ok(&["mcp", "add", "mail", "--", "other-server"]);
+    let config = env.config();
+    assert!(
+        config.contains("other-server") && config.contains("archive = \"posts\""),
+        "{config}"
+    );
+    // A new connector has none.
+    env.ok(&["mcp", "add", "docs", "--", "docs-server"]);
+    assert_eq!(
+        env.config().matches("classes").count(),
+        1,
+        "{}",
+        env.config()
+    );
+}
+
+#[test]
+fn init_writes_the_parsed_preset_name() {
+    let env = Env::new("init-preset-trim");
+    env.init(&["--no-start", "--preset", " Full"]);
+    let config = env.config();
+    assert!(config.contains("preset = \"full\""), "{config}");
+}
+
+/// D12: what `zephyr facts add` says follows the facts mode: held under `hold`, gone with a
+/// notice under `warn`, not looked for under `off`.
+#[test]
+fn facts_add_says_what_the_facts_mode_does() {
+    let env = Env::new("facts-mode-words");
+    env.init(&["--no-start", "--preset", "manual"]);
+    let add = |name: &str| {
+        let out = env.zephyr_input(&["facts", "add", name, "--kind", "digits"], "4829105\n");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout(&out)
+    };
+    assert!(add("a").contains("calls holding it are held for your OK"));
+    let path = env.daemon().join("zephyr.toml");
+    let full = env
+        .config()
+        .replace("preset = \"manual\"", "preset = \"full\"");
+    std::fs::write(&path, &full).unwrap();
+    let warn = add("b");
+    assert!(
+        warn.contains("calls holding it go, and you are told"),
+        "{warn}"
+    );
+    assert!(!warn.contains("held for your OK"), "{warn}");
+    std::fs::write(
+        &path,
+        full.replace("preset = \"full\"", "preset = \"full\"\nfacts = \"off\""),
+    )
+    .unwrap();
+    let off = add("c");
+    assert!(
+        off.contains("not looked for while approvals.facts is off"),
+        "{off}"
+    );
+}
+
+#[test]
+fn saving_a_fact_under_a_name_with_spaces_replaces_it_and_keeps_its_targets() {
+    let env = Env::new("facts-trim");
+    env.init(&["--no-start"]);
+    let out = env.zephyr_input(&["facts", "add", "pin", "--kind", "digits"], "4829105\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    env.ok(&["facts", "allow", "pin", "mum@example.com"]);
+    let out = env.zephyr_input(
+        &["facts", "add", "pin ", "--kind", "digits"],
+        "5550102345\n",
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout(&out).contains("replaced the value of pin"),
+        "{}",
+        stdout(&out)
+    );
+    let list = env.ok(&["facts", "list"]);
+    assert!(
+        list.contains("pin (digits) allow: mum@example.com"),
+        "{list}"
+    );
 }
 
 #[test]
@@ -964,28 +1238,136 @@ fn accounts_model_and_config_edit_the_toml() {
 }
 
 #[test]
-fn config_get_and_set_check_the_daemon_schema() {
-    let env = Env::new("config");
+fn config_set_of_a_known_key_goes_through_the_daemon() {
+    let env = Env::new("config-known");
     env.init(&["--no-start"]);
-    assert_eq!(env.ok(&["config", "get", "attach.port"]).trim(), "7790");
-    env.ok(&["config", "set", "budget.daily_tokens", "5000"]);
+    let before = env.config();
+    env.calls();
+    let out = env.zephyr(&["config", "set", "budget.daily_tokens", "5000"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        stdout(&out).contains("budget.daily_tokens 1 → 5000"),
+        "{out:?}"
+    );
+    let calls = env.calls();
+    find(
+        &calls,
+        &[
+            "docker",
+            "exec",
+            CONTAINER,
+            "zephyr",
+            "set",
+            "budget.daily_tokens",
+            "5000",
+        ],
+    );
+    assert!(
+        !calls.iter().any(|c| c.contains(&"reload".to_string())),
+        "the daemon applies it itself"
+    );
+    assert_eq!(env.config(), before, "the host does not edit the file");
+    // The daemon's refusal is the command's failure, and its words reach the owner.
+    let out = env.zephyr_env(
+        &["config", "set", "budget.daily_tokens", "0"],
+        &[("SHIM_SET_REFUSE", "budget.daily_tokens must be positive")],
+    );
+    assert!(!out.status.success());
+    assert!(stdout(&out).contains("must be positive"), "{out:?}");
+}
+
+#[test]
+fn config_set_with_the_container_up_but_the_daemon_down_edits_the_file() {
+    let env = Env::new("config-down");
+    env.init(&["--no-start"]);
+    env.calls();
+    let out = env.zephyr_env(
+        &["config", "set", "budget.daily_tokens", "8000"],
+        &[("SHIM_SET_DOWN", "1")],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        stdout(&out).contains("applies when zephyr starts"),
+        "{out:?}"
+    );
+    let calls = env.calls();
+    find(&calls, &["docker", "exec", CONTAINER, "zephyr", "set"]);
+    assert!(!calls.iter().any(|c| c.contains(&"reload".to_string())));
     assert_eq!(
         env.ok(&["config", "get", "budget.daily_tokens"]).trim(),
-        "5000"
+        "8000"
     );
-    env.ok(&["config", "set", "timezone", "Asia/Seoul"]);
-    assert_eq!(env.ok(&["config", "get", "timezone"]).trim(), "Asia/Seoul");
-    // A running daemon reloads; a stopped one picks the file up when it starts.
+}
+
+#[test]
+fn config_set_of_an_unknown_key_warns_and_saves() {
+    let env = Env::new("config-unknown");
+    env.init(&["--no-start"]);
     env.calls();
-    env.ok(&["config", "set", "budget.daily_tokens", "6000"]);
-    find(
-        &env.calls(),
-        &["docker", "exec", CONTAINER, "zephyr", "reload"],
+    let out = env.zephyr(&["config", "set", "attach.port", "7791"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("warn: attach.port is not a known setting; saved without checking"),
+        "{out:?}"
     );
+    assert_eq!(env.ok(&["config", "get", "attach.port"]).trim(), "7791");
+    assert!(!env
+        .calls()
+        .iter()
+        .any(|c| c.contains(&"set".to_string()) && c.contains(&"zephyr".to_string())));
+}
+
+#[test]
+fn config_set_while_stopped_edits_the_file_as_before() {
+    let env = Env::new("config-stopped");
+    env.init(&["--no-start"]);
+    env.calls();
     let out = env.zephyr_env(
         &["config", "set", "budget.daily_tokens", "7000"],
         &[("SHIM_STATE", "exited")],
     );
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        stdout(&out).contains("applies when zephyr starts"),
+        "{out:?}"
+    );
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("warn:"));
+    assert_eq!(
+        env.ok(&["config", "get", "budget.daily_tokens"]).trim(),
+        "7000"
+    );
+    assert!(!env
+        .calls()
+        .iter()
+        .any(|c| c.contains(&"set".to_string()) && c.contains(&"zephyr".to_string())));
+}
+
+#[test]
+fn config_get_and_set_check_the_daemon_schema() {
+    let env = Env::new("config");
+    env.init(&["--no-start"]);
+    // A stopped container: the file is edited here (a running daemon's registry settings go
+    // through it instead).
+    let stopped = [("SHIM_STATE", "exited")];
+    let set = |k: &str, v: &str| env.zephyr_env(&["config", "set", k, v], &stopped);
+    assert_eq!(env.ok(&["config", "get", "attach.port"]).trim(), "7790");
+    assert!(set("budget.daily_tokens", "5000").status.success());
+    assert_eq!(
+        env.ok(&["config", "get", "budget.daily_tokens"]).trim(),
+        "5000"
+    );
+    assert!(set("timezone", "Asia/Seoul").status.success());
+    assert_eq!(env.ok(&["config", "get", "timezone"]).trim(), "Asia/Seoul");
+    // A running daemon reloads a key the registry does not know; a stopped one picks the file
+    // up when it starts.
+    env.calls();
+    env.ok(&["config", "set", "attach.port", "7791"]);
+    find(
+        &env.calls(),
+        &["docker", "exec", CONTAINER, "zephyr", "reload"],
+    );
+    let out = set("budget.daily_tokens", "7000");
     assert!(
         stdout(&out).contains("applies when zephyr starts"),
         "{out:?}"
@@ -995,11 +1377,8 @@ fn config_get_and_set_check_the_daemon_schema() {
         .iter()
         .any(|c| c.contains(&"reload".to_string())));
     let before = env.config();
-    assert!(!env
-        .zephyr(&["config", "set", "timezone", "Mars/Olympus"])
-        .status
-        .success());
-    assert!(!env.zephyr(&["config", "set", "typo", "1"]).status.success());
+    assert!(!set("timezone", "Mars/Olympus").status.success());
+    assert!(!set("typo", "1").status.success());
     assert_eq!(env.config(), before, "a refused set writes nothing");
     assert!(
         before.contains("# `zephyr model` picks one"),
@@ -1011,17 +1390,18 @@ fn config_get_and_set_check_the_daemon_schema() {
 fn subagents_and_task_settings_edit_the_toml() {
     let env = Env::new("subagent");
     env.init(&["--no-start"]);
-    env.ok(&["config", "set", "tasks.parallel", "16"]);
-    env.ok(&[
-        "config",
-        "set",
-        "tasks.model",
-        "claude-code/claude-haiku-5-5",
-    ]);
-    assert!(!env
-        .zephyr(&["config", "set", "tasks.model", "haiku"])
-        .status
-        .success());
+    // Stopped, so the file is edited here rather than through the daemon.
+    let set = |v: &str| {
+        let key = if v.parse::<u32>().is_ok() {
+            "tasks.parallel"
+        } else {
+            "tasks.model"
+        };
+        env.zephyr_env(&["config", "set", key, v], &[("SHIM_STATE", "exited")])
+    };
+    assert!(set("16").status.success());
+    assert!(set("claude-code/claude-haiku-5-5").status.success());
+    assert!(!set("haiku").status.success());
     let add = [
         "subagent",
         "add",
@@ -1338,7 +1718,7 @@ fn settings_reach_roots_files_through_the_container() {
     }
     std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o000)).unwrap();
 
-    env.ok(&["config", "set", "budget.daily_tokens", "5"]);
+    env.ok(&["config", "set", "attach.port", "7791"]);
     let calls = env.calls();
     let get = ["zephyr", "__file", "get", "zephyr.toml"];
     let put = ["zephyr", "__file", "put", "zephyr.toml"];
@@ -1346,14 +1726,14 @@ fn settings_reach_roots_files_through_the_container() {
     find(&calls, &[&root[..], &get[..]].concat());
     find(&calls, &[&root[..], &put[..]].concat());
     let text = std::fs::read_to_string(files.join("zephyr.toml")).unwrap();
-    assert!(text.contains("daily_tokens = 5"), "{text}");
+    assert!(text.contains("port = 7791"), "{text}");
 
     // Stopped: a throwaway root container with no capabilities and no network.
     let out = env.zephyr_env(
-        &["config", "get", "budget.daily_tokens"],
+        &["config", "get", "attach.port"],
         &[("SHIM_STATE", "exited")],
     );
-    assert_eq!(stdout(&out).trim(), "5");
+    assert_eq!(stdout(&out).trim(), "7791");
     let calls = env.calls();
     let run = find(&calls, &["docker", "run", "--rm", "-i", "-u", "0"]);
     for pair in [["--cap-drop", "ALL"], ["--network", "none"]] {
@@ -1885,6 +2265,65 @@ fn vault_add_list_and_rm_reach_roots_file_and_never_put_a_value_in_argv() {
         "{saved}"
     );
     assert!(!env.zephyr(&["vault", "rm", "github"]).status.success());
+    std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn facts_add_reads_the_value_hidden_and_lists_names_only() {
+    const PHONE: &str = "+1 555 010 2345";
+    let env = Env::new("facts");
+    env.init(&["--no-start"]);
+    // As after `zephyr up`: the daemon's files are root's, reached through `zephyr __file`.
+    let files = env.dir.join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    for name in ["zephyr.toml", "secrets.env", "tui.token", "host.toml"] {
+        std::fs::rename(env.daemon().join(name), files.join(name)).unwrap();
+    }
+    std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = env.zephyr_input(
+        &["facts", "add", "phone", "--kind", "digits"],
+        &format!("{PHONE}\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    env.ok(&["facts", "allow", "phone", "mum@example.com"]);
+    let list = env.ok(&["facts", "list"]);
+    assert!(
+        list.contains("phone (digits) allow: mum@example.com"),
+        "{list}"
+    );
+
+    let calls = env.calls();
+    let root = ["docker", "exec", "-i", "-u", "0", CONTAINER];
+    for op in ["get", "put"] {
+        find(
+            &calls,
+            &[&root[..], &["zephyr", "__file", op, "facts.toml"]].concat(),
+        );
+    }
+    let saved = std::fs::read_to_string(files.join("facts.toml")).unwrap();
+    assert!(saved.contains(PHONE), "{saved}");
+    let output = std::fs::read_to_string(env.dir.join("output.log")).unwrap();
+    assert!(!format!("{calls:?}").contains(PHONE), "value in argv");
+    assert!(!output.contains(PHONE), "value printed");
+
+    // A value never goes in an argument; too short a one is refused, naming no value.
+    assert!(!env
+        .zephyr(&["facts", "add", "phone", "--kind", "digits", PHONE])
+        .status
+        .success());
+    let out = env.zephyr_input(&["facts", "add", "pin", "--kind", "digits"], "12345\n");
+    assert!(!out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("12345"));
+
+    env.ok(&["facts", "rm", "phone"]);
+    let saved = std::fs::read_to_string(files.join("facts.toml")).unwrap();
+    assert!(!saved.contains("phone"), "{saved}");
+    assert!(!env.zephyr(&["facts", "rm", "phone"]).status.success());
     std::fs::set_permissions(env.daemon(), std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 

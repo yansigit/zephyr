@@ -28,10 +28,15 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let providers = a.values("--provider")?;
     let account_flags = a.values("--account")?;
     let model = a.value("--model")?;
+    let preset = a.value("--preset")?;
     let rest = a.rest()?;
     if !rest.is_empty() {
         bail!("{USAGE}");
     }
+    let preset = preset
+        .map(|p| crate::approvals::Preset::parse(&p))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("--preset: {e}"))?;
 
     if !no_start && !super::quiet(super::docker(&["version"])) {
         bail!("docker is not reachable: install Docker and make sure `docker version` works");
@@ -87,6 +92,10 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
     }
     if let Some(m) = &model {
         conf::set(&mut doc, "model", m)?;
+    }
+    // Without --preset, [approvals] stays absent, which is `manual`; the interactive run asks.
+    if let Some(p) = preset.filter(|_| non_interactive) {
+        write_preset(&mut doc, p)?;
     }
     h.data.save(&doc)?;
 
@@ -169,8 +178,137 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
             channel_add(h, kind)?;
         }
     }
+    init_approvals(h, preset)?;
     run(&mut super::docker(&["restart", &h.container]))?;
     h.doctor(false)
+}
+
+/// Writes `preset` as `/approvals PRESET` does (D11, `approvals::preset_edits`): the preset, and
+/// every hand-set class looser than it cleared, so a re-run of `init --preset manual` never
+/// leaves a looser class behind.
+fn write_preset(
+    doc: &mut toml_edit::DocumentMut,
+    preset: crate::approvals::Preset,
+) -> anyhow::Result<()> {
+    let cfg: crate::config::Config =
+        toml::from_str(&doc.to_string()).context("reading zephyr.toml")?;
+    for (key, value) in crate::approvals::preset_edits(&cfg, preset) {
+        let value = value.map(toml_edit::Value::from);
+        crate::settings::write(doc, &key, value.as_ref())?;
+    }
+    Ok(())
+}
+
+/// The preset to start in (approvals spec §4.10), then the private facts. A config that already
+/// has an `[approvals]` table (a re-run of `init`) keeps it unless `--preset` says otherwise.
+fn init_approvals(h: &Host, preset: Option<crate::approvals::Preset>) -> anyhow::Result<()> {
+    use crate::approvals::Preset;
+    let mut doc = h.data.load()?;
+    let chosen = match preset {
+        Some(p) => Some(p),
+        None if doc.get("approvals").is_some() => None,
+        None => {
+            let presets = [Preset::Manual, Preset::Semi, Preset::Full];
+            let items: Vec<String> = (presets.iter())
+                .map(|p| format!("{}: {}", p.name(), p.summary()))
+                .collect();
+            let i = Select::new()
+                .with_prompt("Approvals: how much may the agent do without asking you")
+                .items(&items)
+                .default(0)
+                .interact()?;
+            Some(presets[i])
+        }
+    };
+    if let Some(p) = chosen {
+        write_preset(&mut doc, p)?;
+        h.data.save(&doc)?;
+    }
+    if Confirm::new()
+        .with_prompt(
+            "Add private facts (a phone number, an address) the agent may not send unasked?",
+        )
+        .default(false)
+        .interact()?
+    {
+        loop {
+            if let Err(e) = add_fact(h) {
+                println!("not saved: {e:#}");
+            }
+            if !Confirm::new()
+                .with_prompt("Add another fact?")
+                .default(false)
+                .interact()?
+            {
+                break;
+            }
+        }
+        println!("allow a fact to go to someone with: zephyr facts allow NAME TARGET");
+    }
+    Ok(())
+}
+
+/// One fact, asked for: its name, kind and value (hidden), saved as `zephyr facts add` does.
+fn add_fact(h: &Host) -> anyhow::Result<()> {
+    use crate::facts::FactKind;
+    let name: String = Input::new()
+        .with_prompt("Fact name (e.g. phone)")
+        .interact_text()?;
+    let kinds = ["text", "digits", "email"];
+    let k = Select::new()
+        .with_prompt("Kind")
+        .items(kinds)
+        .default(0)
+        .interact()?;
+    let value = Password::new()
+        .with_prompt(format!("value of {name} (hidden)"))
+        .allow_empty_password(true)
+        .interact()?;
+    let kind = FactKind::parse(kinds[k]).unwrap_or_default();
+    println!("{}", save_fact(h, &name, kind, &value)?);
+    Ok(())
+}
+
+/// Saves one fact in facts.toml the way `zephyr facts add` does: the name trimmed, an existing
+/// fact of that name keeping its allowed targets. Returns what to tell the owner.
+fn save_fact(
+    h: &Host,
+    name: &str,
+    kind: crate::facts::FactKind,
+    value: &str,
+) -> anyhow::Result<String> {
+    use crate::facts::{parse, put, render, Fact};
+    let name = name.trim();
+    let text = match h.data.read(crate::facts::FILE) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        r => r?,
+    };
+    let mut facts = parse(&text)?;
+    let allow = (facts.iter().find(|f| f.name == name)).map_or_else(Vec::new, |f| f.allow.clone());
+    let fact = Fact {
+        name: name.into(),
+        kind,
+        value: value.trim().into(),
+        allow,
+    };
+    let new = put(&mut facts, fact, true)?;
+    h.data.write(crate::facts::FILE, &render(&text, &facts)?)?;
+    // D12: what a call holding it does now, as `approvals.facts` says.
+    let cfg = h.data.load().ok();
+    let cfg = cfg.and_then(|d| toml::from_str::<crate::config::Config>(&d.to_string()).ok());
+    let mode = cfg.map(|c| crate::approvals::effective(&c).facts);
+    let then = match mode {
+        Some(crate::approvals::FactsMode::Hold) => "; calls holding it are held for your OK",
+        Some(crate::approvals::FactsMode::Warn) => "; calls holding it go, and you are told",
+        Some(crate::approvals::FactsMode::Off) => {
+            "; it is not looked for while approvals.facts is off"
+        }
+        None => "",
+    };
+    Ok(match new {
+        true => format!("saved the fact {name}{then}"),
+        false => format!("replaced the value of {name}"),
+    })
 }
 
 fn known_provider(id: &str) -> anyhow::Result<()> {
@@ -668,18 +806,26 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
                         .with_context(|| format!("--header {h}: write it as K=V"))
                 })
                 .collect::<anyhow::Result<_>>()?;
+            // D4: added again, a connector keeps the classes the owner gave its tools.
+            let classes = || {
+                let cfg = parse(&doc).ok();
+                let existing = cfg.and_then(|c| c.mcp.into_iter().find(|m| m.name == *name));
+                existing.map(|m| m.classes).unwrap_or_default()
+            };
             let m = match (url, command.split_first()) {
                 (Some(_), Some(_)) => bail!("give --url or a command after --, not both"),
                 (Some(url), None) => Mcp {
                     name: name.clone(),
                     url: Some(url),
                     headers,
+                    classes: classes(),
                     ..Mcp::default()
                 },
                 (None, Some((cmd, args))) if headers.is_empty() => Mcp {
                     name: name.clone(),
                     command: Some(cmd.clone()),
                     args: args.to_vec(),
+                    classes: classes(),
                     ..Mcp::default()
                 },
                 (None, Some(_)) => bail!("--header goes with --url"),
@@ -806,6 +952,62 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
         _ => bail!("{usage}"),
     };
     h.data.write(crate::vault::FILE, &vault.to_string())?;
+    println!("{said}");
+    Ok(())
+}
+
+/// `zephyr facts list | add NAME --kind text|digits|email | rm NAME | allow NAME TARGET |
+/// disallow NAME TARGET`: `facts.toml`, the owner's private facts (approvals spec §4.5), one of
+/// the daemon's files, read on every use. The value is asked at a hidden prompt, or read from one
+/// stdin line when it is not a terminal; never taken as an argument. Adding over an existing name
+/// replaces its value and keeps its allowed targets.
+pub fn facts(h: &Host, mut a: Args) -> anyhow::Result<()> {
+    use crate::facts::{allow, parse, remove, render, FactKind};
+    let kind = a.value("--kind")?;
+    let rest = a.rest()?;
+    let usage = "usage: zephyr facts list | add NAME --kind text|digits|email | rm NAME | \
+                 allow NAME TARGET | disallow NAME TARGET";
+    let text = match h.data.read(crate::facts::FILE) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        r => r?,
+    };
+    let mut facts = parse(&text)?;
+    let args: Vec<&str> = rest.iter().map(String::as_str).collect();
+    let said = match args[..] {
+        [] | ["list"] => {
+            if facts.is_empty() {
+                println!("no private facts saved");
+            }
+            facts.iter().for_each(|f| println!("{}", f.line()));
+            return Ok(());
+        }
+        ["add", name] => {
+            let kind = kind.as_deref().unwrap_or("text");
+            let kind = FactKind::parse(kind)
+                .with_context(|| format!("--kind is text, digits or email\n{usage}"))?;
+            let value = match h.interactive {
+                true => Password::new()
+                    .with_prompt(format!("value of {name} (hidden)"))
+                    .allow_empty_password(true)
+                    .interact()?,
+                false => std::io::stdin()
+                    .lines()
+                    .next()
+                    .transpose()?
+                    .unwrap_or_default(),
+            };
+            println!("{}", save_fact(h, name, kind, &value)?);
+            return Ok(());
+        }
+        ["rm", name] => match remove(&mut facts, name) {
+            true => format!("removed {name}"),
+            false => bail!("no fact named {name}"),
+        },
+        ["allow", name, target] => allow(&mut facts, name, target, true)?,
+        ["disallow", name, target] => allow(&mut facts, name, target, false)?,
+        _ => bail!("{usage}"),
+    };
+    h.data.write(crate::facts::FILE, &render(&text, &facts)?)?;
     println!("{said}");
     Ok(())
 }

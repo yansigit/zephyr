@@ -7,6 +7,7 @@ mod conn;
 mod files;
 mod history;
 mod overlays;
+mod settings_panel;
 mod shell;
 mod theme;
 mod view;
@@ -256,8 +257,14 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         let _ = prompt_tx.send(Ask::Sessions);
                     }
                     Msg::Event(ev) => {
+                        let waited = s.snapshot.proposals;
                         let ping = event(&mut s, &mut view, &ev)
                             .and_then(|what| attention.ping(what, crate::unix_millis() as i64));
+                        // A proposal came or went while the settings panel is open: list them again.
+                        let settings = s.overlay.as_ref().is_some_and(|o| o.kind == Kind::Settings);
+                        if settings && s.snapshot.proposals != waited {
+                            let _ = prompt_tx.send(Ask::Proposals);
+                        }
                         if let Some(ping) = ping {
                             tui.terminal().write(&ping);
                             tui.terminal().flush();
@@ -285,7 +292,9 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                 send(&mut s, &prompt_tx, format!("/model {m}"));
                             }
                         }
-                        if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Model) {
+                        // The settings panel's model editor is the same picker.
+                        let picking = |o: &&mut Overlay| matches!(o.kind, Kind::Model | Kind::Settings);
+                        if let Some(o) = s.overlay.as_mut().filter(picking) {
                             o.models = Some(list.clone());
                             o.placed = false;
                         }
@@ -394,6 +403,60 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         match s.overlay.as_mut().filter(|o| o.kind == Kind::Vault) {
                             Some(o) => o.vault.problem = Some(e),
                             None => view.error(&e),
+                        }
+                    }
+                    Msg::Settings(v) => {
+                        if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Settings) {
+                            o.settings.load(&v);
+                        }
+                    }
+                    Msg::Proposals(v) => {
+                        if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Settings) {
+                            o.settings.load_waiting(&v);
+                        }
+                    }
+                    Msg::SettingResult(v) => {
+                        match s.overlay.as_mut().filter(|o| o.kind == Kind::Settings) {
+                            Some(o) => {
+                                o.settings.answered(&v, &tz);
+                                // The values and their sources moved on, and with an approval
+                                // mode, whether once differs for what waits, and its card.
+                                let _ = prompt_tx.send(Ask::Settings);
+                                let _ = prompt_tx.send(Ask::Proposals);
+                            }
+                            // The panel closed before the answer came: say it in the transcript.
+                            None => {
+                                let mut panel = settings_panel::SettingsPanel::default();
+                                panel.answered(&v, &tz);
+                                match panel.note {
+                                    Some((true, said)) => view.notice(&said),
+                                    Some((false, why)) => view.error(&why),
+                                    None => {}
+                                }
+                            }
+                        }
+                    }
+                    Msg::Decided(v) => match s.overlay.as_mut().filter(|o| o.kind == Kind::Settings) {
+                        Some(o) => {
+                            o.settings.decided(&v);
+                            let _ = prompt_tx.send(Ask::Settings);
+                            let _ = prompt_tx.send(Ask::Proposals);
+                        }
+                        // As `/ok N` would have answered it.
+                        None => view.reply(None, v["text"].as_str().unwrap_or_default()),
+                    },
+                    Msg::Facts(list) => {
+                        if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Settings) {
+                            // The Approvals section's row names the facts.
+                            if o.settings.load_facts(list) {
+                                let _ = prompt_tx.send(Ask::Settings);
+                            }
+                        }
+                    }
+                    Msg::FactsError(why) => {
+                        match s.overlay.as_mut().filter(|o| o.kind == Kind::Settings) {
+                            Some(o) => o.settings.facts_refused(&why),
+                            None => view.error(&why),
                         }
                     }
                     Msg::Down(why) if was_up => {
@@ -542,6 +605,18 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                     }
                                     Action::VaultRevoke(name) => {
                                         let _ = prompt_tx.send(Ask::VaultRevoke(name));
+                                    }
+                                    Action::SettingsSet { key, value, until } => {
+                                        let _ = prompt_tx.send(Ask::SettingsSet { key, value, until });
+                                    }
+                                    Action::Decide { id, verb } => {
+                                        let _ = prompt_tx.send(Ask::Decide { id, verb });
+                                    }
+                                    Action::FactsPut(fact) => {
+                                        let _ = prompt_tx.send(Ask::FactsPut(fact));
+                                    }
+                                    Action::FactsRm(name) => {
+                                        let _ = prompt_tx.send(Ask::FactsRm(name));
                                     }
                                 }
                             }
@@ -809,6 +884,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                     "/model" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Model),
                     "/login" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Login),
                     "/vault" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Vault),
+                    "/settings" => open(&tui, &panel, &editor, &mut s, &prompt_tx, Kind::Settings),
                     // A value is typed into the vault's form, never sent as a message.
                     text if text.starts_with("/vault add") || text.starts_with("/vault edit") => {
                         match overlays::Form::from_command(text) {
@@ -1486,6 +1562,13 @@ fn open(
         }
         Kind::Rewind => {
             let _ = asks.send(Ask::Turns);
+        }
+        // The models, for its model editor, which is the model picker.
+        Kind::Settings => {
+            let _ = asks.send(Ask::Settings);
+            let _ = asks.send(Ask::Proposals);
+            let _ = asks.send(Ask::Models);
+            let _ = asks.send(Ask::FactsList);
         }
         Kind::Status | Kind::Help | Kind::History => {}
     }

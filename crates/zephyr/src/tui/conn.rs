@@ -129,6 +129,17 @@ impl VaultEntry {
     }
 }
 
+/// One private fact as `zephyr.facts_*` lists it: never its value (approvals spec §4.5).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct FactEntry {
+    pub name: String,
+    /// `text` | `digits` | `email`
+    pub kind: String,
+    /// Where it may go without a check.
+    pub allow: Vec<String>,
+}
+
 /// A saved main session as `zephyr.sessions` lists it, newest first.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
@@ -188,6 +199,26 @@ pub enum Ask {
     Sessions,
     /// `zephyr.turns`, answered with [`Msg::Turns`].
     Turns,
+    /// `zephyr.settings`, answered with [`Msg::Settings`].
+    Settings,
+    /// `zephyr.settings_set`: a change as the owner on the TUI, a strong channel; `until` is a
+    /// time limit like `2h`. Answered with [`Msg::SettingResult`].
+    SettingsSet {
+        key: String,
+        value: String,
+        until: Option<String>,
+    },
+    /// `zephyr.proposals`, answered with [`Msg::Proposals`].
+    Proposals,
+    /// `zephyr.decide` (`ok`, `once`, `no` or `cancel`), answered with [`Msg::Decided`].
+    Decide { id: i64, verb: String },
+    /// `zephyr.facts_list`; this and the two below are answered with [`Msg::Facts`].
+    FactsList,
+    /// `zephyr.facts_put`: the fact, value and all, for `facts.toml` only. An empty value keeps
+    /// the saved one.
+    FactsPut(Box<crate::facts::Fact>),
+    /// `zephyr.facts_rm`.
+    FactsRm(String),
 }
 
 impl std::fmt::Debug for Ask {
@@ -229,6 +260,24 @@ impl std::fmt::Debug for Ask {
             Ask::VaultRevoke(name) => f.debug_tuple("VaultRevoke").field(name).finish(),
             Ask::Sessions => f.write_str("Sessions"),
             Ask::Turns => f.write_str("Turns"),
+            Ask::Settings => f.write_str("Settings"),
+            // No setting holds a secret (settings spec §4.4); private facts get asks of their own.
+            Ask::SettingsSet { key, value, until } => f
+                .debug_struct("SettingsSet")
+                .field("key", key)
+                .field("value", value)
+                .field("until", until)
+                .finish(),
+            Ask::Proposals => f.write_str("Proposals"),
+            Ask::Decide { id, verb } => f
+                .debug_struct("Decide")
+                .field("id", id)
+                .field("verb", verb)
+                .finish(),
+            Ask::FactsList => f.write_str("FactsList"),
+            // `Fact`'s own Debug prints only the value's length.
+            Ask::FactsPut(fact) => f.debug_tuple("FactsPut").field(fact).finish(),
+            Ask::FactsRm(name) => f.debug_tuple("FactsRm").field(name).finish(),
         }
     }
 }
@@ -268,6 +317,19 @@ pub enum Msg {
     Sessions(Vec<SessionInfo>),
     /// The `zephyr.turns` answer; empty from a daemon without it.
     Turns(Vec<Turn>),
+    /// `zephyr.settings`' answer, or `{"error": why}`.
+    Settings(Value),
+    /// `zephyr.settings_set`'s answer: `changed`, `proposed` or `refused` (an error answer is a
+    /// refusal with the error as its reason).
+    SettingResult(Value),
+    /// `zephyr.proposals`' answer; `{"proposals": []}` from a daemon without it.
+    Proposals(Value),
+    /// `zephyr.decide`'s answer, `{"ok", "text"}`; an error answer is `ok: false` with its text.
+    Decided(Value),
+    /// The private facts, after a `zephyr.facts_*` call: names, kinds and allowed targets.
+    Facts(Vec<FactEntry>),
+    /// A facts call the daemon refused, and why (never with a value).
+    FactsError(String),
     /// The connection is gone or was refused; it retries.
     Down(String),
     /// Retrying would not help: a wrong token, or a daemon without `zephyr.hello`.
@@ -464,6 +526,38 @@ async fn session(
                     let id = rpc.request("zephyr.turns", json!({})).await?;
                     pending.insert(id, Pending::Turns);
                 }
+                Some(Ask::Settings) => {
+                    let id = rpc.request("zephyr.settings", json!({})).await?;
+                    pending.insert(id, Pending::Settings);
+                }
+                Some(Ask::SettingsSet { key, value, until }) => {
+                    let params = json!({"key": key, "value": value, "until": until});
+                    let id = rpc.request("zephyr.settings_set", params).await?;
+                    pending.insert(id, Pending::SettingsSet);
+                }
+                Some(Ask::Proposals) => {
+                    let id = rpc.request("zephyr.proposals", json!({})).await?;
+                    pending.insert(id, Pending::Proposals);
+                }
+                Some(Ask::Decide { id, verb }) => {
+                    let params = json!({"id": id, "verb": verb});
+                    let id = rpc.request("zephyr.decide", params).await?;
+                    pending.insert(id, Pending::Decide);
+                }
+                Some(Ask::FactsList) => {
+                    let id = rpc.request("zephyr.facts_list", json!({})).await?;
+                    pending.insert(id, Pending::Facts);
+                }
+                Some(Ask::FactsPut(fact)) => {
+                    let params = json!({"name": fact.name, "kind": fact.kind.key(),
+                                        "value": fact.value, "allow": fact.allow});
+                    let id = rpc.request("zephyr.facts_put", params).await?;
+                    pending.insert(id, Pending::Facts);
+                }
+                Some(Ask::FactsRm(name)) => {
+                    let id = rpc.request("zephyr.facts_rm", json!({"name": name})).await?;
+                    pending.insert(id, Pending::Facts);
+                }
                 None => return Ok(()),
             },
         }
@@ -490,6 +584,12 @@ enum Pending {
     Dequeue,
     Sessions,
     Turns,
+    Settings,
+    SettingsSet,
+    Proposals,
+    Decide,
+    /// Any `zephyr.facts_*` call: the facts, or why not.
+    Facts,
 }
 
 /// An error answer to one of the login calls.
@@ -509,6 +609,8 @@ fn answer(what: Pending, mut v: Value) -> Option<Msg> {
             .to_string(),
         gone: e["code"].as_i64() == Some(UNKNOWN_LOGIN),
     });
+    // The settings calls show the daemon's own words for a refusal.
+    let error = (v.get("error")).map(|e| e["message"].as_str().unwrap_or("refused").to_string());
     let mut result = v["result"].take();
     Some(match what {
         // A daemon without these answers an error, so the panel shows an empty list rather
@@ -573,6 +675,26 @@ fn answer(what: Pending, mut v: Value) -> Option<Msg> {
         Pending::Turns => {
             Msg::Turns(serde_json::from_value(result["turns"].take()).unwrap_or_default())
         }
+        Pending::Settings => Msg::Settings(match error {
+            Some(why) => json!({"error": why}),
+            None => result,
+        }),
+        Pending::SettingsSet => Msg::SettingResult(match error {
+            Some(why) => json!({"outcome": "refused", "reason": why}),
+            None => result,
+        }),
+        Pending::Proposals => Msg::Proposals(match error {
+            Some(_) => json!({"proposals": []}),
+            None => result,
+        }),
+        Pending::Decide => Msg::Decided(match error {
+            Some(why) => json!({"ok": false, "text": why}),
+            None => result,
+        }),
+        Pending::Facts => match error {
+            Some(why) => Msg::FactsError(why),
+            None => Msg::Facts(serde_json::from_value(result["facts"].take()).unwrap_or_default()),
+        },
     })
 }
 
@@ -1065,6 +1187,85 @@ mod tests {
         let shown = format!("{ask:?}");
         assert!(!shown.contains("sk-ant"), "{shown}");
         assert!(shown.contains("text: 10"), "{shown}");
+    }
+
+    #[test]
+    fn a_fact_value_is_counted_not_printed() {
+        let ask = Ask::FactsPut(Box::new(crate::facts::Fact {
+            name: "test-pin".into(),
+            kind: crate::facts::FactKind::Digits,
+            value: "135798".into(),
+            allow: vec![],
+        }));
+        let shown = format!("{ask:?}");
+        assert!(!shown.contains("135798"), "{shown}");
+        assert!(
+            shown.contains("test-pin") && shown.contains("value: 6"),
+            "{shown}"
+        );
+    }
+
+    /// The facts calls carry the value only in `facts_put`, and come back as the list.
+    #[tokio::test]
+    async fn facts_are_listed_saved_and_removed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (r, mut w) = s.into_split();
+            let mut lines = BufReader::new(r).lines();
+            handshake(&mut lines, &mut w, "t", "m").await.unwrap();
+            let mut asked = vec![];
+            for _ in 0..3 {
+                let req: Value =
+                    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                let answer = match req["method"].as_str().unwrap() {
+                    "zephyr.facts_rm" => json!({"jsonrpc": "2.0", "id": req["id"],
+                        "error": {"code": -32602, "message": "no fact named gone"}}),
+                    _ => json!({"jsonrpc": "2.0", "id": req["id"], "result": {"facts": [
+                        {"name": "test-pin", "kind": "digits", "allow": []}]}}),
+                };
+                w.write_all(format!("{answer}\n").as_bytes()).await.unwrap();
+                asked.push(req);
+            }
+            asked
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (ptx, prx) = mpsc::unbounded_channel();
+        tokio::spawn(run(addr, "t".into(), tx, prx));
+        assert!(matches!(rx.recv().await, Some(Msg::Up { .. })));
+        ptx.send(Ask::FactsList).unwrap();
+        ptx.send(Ask::FactsPut(Box::new(crate::facts::Fact {
+            name: "test-pin".into(),
+            kind: crate::facts::FactKind::Digits,
+            value: "135798".into(),
+            allow: vec!["a.example.com".into()],
+        })))
+        .unwrap();
+        ptx.send(Ask::FactsRm("gone".into())).unwrap();
+        let listed = FactEntry {
+            name: "test-pin".into(),
+            kind: "digits".into(),
+            allow: vec![],
+        };
+        for _ in 0..2 {
+            match rx.recv().await {
+                Some(Msg::Facts(list)) => assert_eq!(list, std::slice::from_ref(&listed)),
+                other => panic!("{other:?}"),
+            }
+        }
+        match rx.recv().await {
+            Some(Msg::FactsError(why)) => assert_eq!(why, "no fact named gone"),
+            other => panic!("{other:?}"),
+        }
+        let asked = server.await.unwrap();
+        assert_eq!(asked[0]["method"], "zephyr.facts_list");
+        assert_eq!(
+            asked[1]["params"],
+            json!({"name": "test-pin", "kind": "digits", "value": "135798",
+                   "allow": ["a.example.com"]})
+        );
+        assert_eq!(asked[2]["params"], json!({"name": "gone"}));
     }
 
     #[tokio::test]

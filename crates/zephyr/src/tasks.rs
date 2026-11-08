@@ -86,6 +86,7 @@ async fn one(cfg: Arc<Config>, mut store: Store, task: Task, wake: &Wake) {
         task: Some(task.id),
         resume,
         model: task.model.as_deref(),
+        steers: &wake.steers,
     };
     let (status, output, crossed) = execute(&cfg, &mut store, &spec).await;
     let report = cut(&cfg, task.id, &output);

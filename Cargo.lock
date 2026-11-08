@@ -2752,6 +2752,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "unicode-segmentation"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3206,6 +3215,7 @@ dependencies = [
  "tokio",
  "toml",
  "toml_edit",
+ "unicode-normalization",
  "unicode-width 0.1.14",
  "url",
  "zephyr-policy",
@@ -3240,6 +3250,7 @@ dependencies = [
 name = "zephyr-policy"
 version = "0.6.0"
 dependencies = [
+ "libc",
  "rpi-plugin-sdk",
  "serde",
  "serde_json",

@@ -232,6 +232,9 @@ pub struct Child {
     pub events: mpsc::UnboundedReceiver<Value>,
     /// The session it runs, for the audit; `None` for a `/btw` child.
     pub session: Option<String>,
+    /// A task's or job's inbox for notes from outside its run (`scheduler::Steers`), which
+    /// `scheduler::follow` steers in; `None` for main and `/btw`.
+    pub notes: Option<mpsc::UnboundedReceiver<crate::scheduler::Note>>,
     stdin: ChildStdin,
     pending: Pending,
     next_id: u64,
@@ -330,6 +333,8 @@ impl Child {
         );
         // `recall` reads the session files itself (DESIGN §4.11).
         cmd.env(zephyr_policy::tools::SESSIONS_DIR_ENV, cfg.session_dir());
+        // Where the plugin asks about a send, and as which session (approvals spec §4.2).
+        cmd.envs(crate::gate::agent_env(cfg, session_id.unwrap_or_default()));
         // The only MCP config the policy plugin lets the adapter's tools use (DESIGN §4.6).
         cmd.env(
             zephyr_policy::policy::MCP_CONFIG_ENV,
@@ -385,6 +390,7 @@ impl Child {
             ready,
             events,
             session: session_id.map(Into::into),
+            notes: None,
             stdin,
             pending,
             next_id: 0,

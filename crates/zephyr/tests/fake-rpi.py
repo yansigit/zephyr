@@ -79,7 +79,8 @@ outcome "aborted"; one that starts with `say: `
 replies with the rest; `model?` replies with the current model.
 Models: `--list-models` (held while a `list_wait` file exists in the home) prints fake/m1, fake/m2, other/m3 and opencode-go/alpha, the catalogue `set_model` accepts
 (plus the started model);
-`set_model` switches to one of them and errors on anything else.
+`set_model` switches to one of them and errors on anything else, and on everything while a
+`model_refuse` file exists in the home.
 Sessions are laid out as rpi 0.18 lays them out (checked against the real binary): at start,
 <session-dir>/--<cwd, / as ->--/<ISO stamp>_<session-id>.jsonl with a header line
 {"kind": "header", "version": 4, "id", ...}, an empty `.lock` and a `.progress.jsonl` companion
@@ -104,21 +105,74 @@ Not modelled: `--extension` is only checked to exist (for the policy beacon in `
 never loaded, so no policy veto runs; `--exclude-tools` is recorded in argv.json but ignored.
 While a `tool_fail` file exists in the home, every tool call other than gateway/task/exec/process/vault
 ends with `isError` and the error `tool error: <the file's text>`.
+Each `[mcp SERVER TOOL {JSON}]` in a prompt runs one `mcp_call` (in prompt order with the `[call]`s)
+with args {configPath: $ZEPHYR_MCP_CONFIG, server, tool, arguments: those flat args}, and the reply
+gets an `mcp: <result>` line per call.
+The gate: a `bash` or `mcp_call` call plays the policy plugin's gate client when
+$ZEPHYR_GATE_SOCKET is set (every call, where the plugin asks only about sends; the daemon allows
+the rest): before the tool runs (and before any `tool_wait`), it sends
+{"v": 1, "session": $ZEPHYR_SESSION, "call_id", "tool", "args"} as one line and waits up to 5 s for
+the answer line, answering meanwhile (as rpi does while a plugin holds a call) the commands that
+need no run, so a note the daemon steers in before it answers is queued, and delivered right after
+the call's result. Only {"verdict": "allow"} runs the call; anything else (no socket, a socket
+served by a uid other than root or this script's owner (SO_PEERCRED, as the plugin checks), no
+answer, a bad one, a hold, a deny) refuses it, `isError` with "tool error: blocked" and nothing of
+the daemon's text, as rpi shows a vetoed call.
 """
-import glob, json, os, queue as queues, re, sys, threading, time
+import glob, json, os, queue as queues, re, select, socket, struct, sys, threading, time
 
 args = sys.argv[1:]
 if "--version" in args:
     print("rpi 0.18.0"); sys.exit(0)
 CATALOG = ["fake/m1", "fake/m2", "other/m3", "opencode-go/alpha"]
 # zephyr_policy::tools::GATEWAY_COMMANDS
-GATEWAY_COMMANDS = ["/status", "/model", "/switch", "/rules", "/memory diff", "/memory log", "/job list"]
+GATEWAY_COMMANDS = ["/status", "/model", "/switch", "/rules", "/memory diff", "/memory log", "/job list", "/settings", "/approvals", "/facts"]
 def gateway_kind(c):
-    """zephyr_policy::tools::gateway_kind: "read", "propose" or None."""
+    """zephyr_policy::tools::gateway_kind: "read", "set", "propose" or None."""
     if c in GATEWAY_COMMANDS:
         return "read"
     cmd, _, arg = c.partition(" ")
     word = arg != "" and all(33 <= ord(ch) <= 126 for ch in arg)
+    def plain(t):
+        return t.strip() != "" and len(t) <= 1500 and not any(
+            ord(ch) < 32 or 0x7f <= ord(ch) < 0xa0 or 0x202a <= ord(ch) <= 0x202e
+            or 0x2066 <= ord(ch) <= 0x2069 or ord(ch) in (0x200e, 0x200f, 0x061c, 0x2028, 0x2029)
+            for ch in t)
+    if cmd == "/settings":
+        return "read" if all(w != "" and all(33 <= ord(ch) <= 126 for ch in w) for w in arg.split(" ")) and len(arg) <= 100 else None
+    if cmd == "/set":
+        w = arg.split(" ")
+        key = lambda k: re.fullmatch(r"[a-z0-9_.-]+", k) is not None
+        val = lambda v: v != "" and all(33 <= ord(ch) <= 126 for ch in v) and len(v) <= 200
+        span = lambda d: re.fullmatch(r"[A-Za-z0-9]+", d) is not None
+        ok = (len(w) == 2 and key(w[0]) and val(w[1])) or (
+            len(w) == 4 and w[2] == "for" and key(w[0]) and val(w[1]) and span(w[3]))
+        return "set" if ok else None
+    if cmd in ("/subagent", "/rule") and len(c) > 1500:
+        return None
+    if cmd == "/subagent":
+        verb, _, rest = arg.partition(" ")
+        rest = rest.lstrip(" ")
+        n, _, m = rest.partition(" ")
+        ok = {"add": plain(rest) and " " in rest, "prompt": plain(rest) and " " in rest,
+              "model": n != "" and m != "" and all(33 <= ord(ch) <= 126 for ch in n + m) and " " not in m,
+              "rm": rest != "" and all(33 <= ord(ch) <= 126 for ch in rest)}.get(verb, False)
+        return "propose" if ok else None
+    if cmd == "/rule":
+        return "propose" if plain(arg) else None
+    if cmd == "/facts":
+        w = arg.split(" ", 3)
+        name = lambda n: re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", n) is not None
+        aword = lambda t: t != "" and all(33 <= ord(ch) <= 126 for ch in t)
+        if len(w) == 4 and w[0] == "add":
+            ok = name(w[1]) and w[2] in ("text", "digits", "email") and plain(w[3]) and len(w[3]) <= 500
+        elif len(w) == 2 and w[0] == "rm":
+            ok = name(w[1])
+        elif len(w) == 3 and w[0] == "allow":
+            ok = name(w[1]) and aword(w[2]) and len(w[2]) <= 200
+        else:
+            ok = False
+        return "propose" if ok else None
     ok = {"/new": c == cmd, "/pause": c == cmd, "/reload": c == cmd, "/switch": word,
           "/model": word and re.fullmatch(r"[^/]+/.+", arg) is not None}.get(cmd, False)
     return "propose" if ok else None
@@ -388,7 +442,7 @@ def quick(cmd, s):
         respond(cmd, {"totalTokens": 0, "costTotal": 0.0})
     elif kind == "set_model":
         want = "%s/%s" % (cmd.get("provider"), cmd.get("modelId"))
-        if want in catalog:
+        if want in catalog and not os.path.exists("model_refuse"):
             model = want; respond(cmd, {"modelId": cmd.get("modelId"), "provider": cmd.get("provider")})
         else:
             respond(cmd, error="unknown model: %s" % cmd.get("modelId"))
@@ -416,6 +470,46 @@ def deliver_steering(s):
             said(s, m)
     steering = []
 
+def gate_allows(s, name, args, cid):
+    """The policy plugin's gate client (zephyr_policy::gate_client): True only when the daemon's
+    gate socket answers allow within 5 s. While it waits, the commands that need no run are
+    answered (a steer is queued), as rpi does while a plugin holds a call; the rest wait."""
+    path = os.environ.get("ZEPHYR_GATE_SOCKET")
+    if name not in ("bash", "mcp_call") or not path:
+        return True
+    req = {"v": 1, "session": os.environ.get("ZEPHYR_SESSION", ""), "call_id": cid, "tool": name,
+           "args": args}
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.settimeout(5)
+            c.connect(path)
+            # As gate_client::trusted: root's daemon, or the uid that owns this program.
+            peer = struct.unpack("3i", c.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                                    struct.calcsize("3i")))[1]
+            if peer not in (0, os.stat(__file__).st_uid):
+                return False
+            c.sendall((json.dumps(req) + "\n").encode())
+            answer, deadline = b"", time.time() + 5
+            while not answer.endswith(b"\n") and time.time() < deadline:
+                if select.select([c], [], [], 0.02)[0]:
+                    chunk = c.recv(4096)
+                    if not chunk:
+                        break
+                    answer += chunk
+                    continue
+                try:
+                    line = lines.get_nowait()
+                except queues.Empty:
+                    continue
+                if line is None:
+                    lines.put(None); continue
+                open(os.path.join(home, "log.jsonl"), "a").write(line)
+                if not quick(json.loads(line), s):
+                    deferred.append(line)
+        return json.loads(answer).get("verdict") == "allow"
+    except Exception:
+        return False
+
 def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
     call = {"kind": "assistant", "role": "assistant", "stopReason": "toolUse", "timestamp": 0,
             "content": [{"type": "toolCall", "id": cid, "name": name, "arguments": args}]}
@@ -423,7 +517,8 @@ def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
               "content": [{"type": "text", "text": "ok"}], "isError": False, "timestamp": 0}
     said(s, call)
     out({"type": "tool_execution_start", "toolCallId": cid, "toolName": name, "args": args})
-    while os.path.exists(os.path.join(home, "tool_wait")):
+    allowed = gate_allows(s, name, args, cid)  # as the plugin's ToolCall handler, before the tool runs
+    while allowed and os.path.exists(os.path.join(home, "tool_wait")):
         # As rpi: commands that need no run are answered while the tool runs; the rest wait.
         try:
             line = lines.get(timeout=0.05)
@@ -435,7 +530,10 @@ def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
         if not quick(json.loads(line), s):
             deferred.append(line)
     aborted = False
-    if name == "gateway" and gateway_kind(args.get("command", "").strip()) is None:
+    if not allowed:
+        result["isError"] = True
+        result["content"] = [{"type": "text", "text": "tool error: blocked"}]
+    elif name == "gateway" and gateway_kind(args.get("command", "").strip()) is None:
         # As the plugin: refused in the child, with no wait (rpi still reports the start).
         result["isError"] = True
         result["content"] = [{"type": "text", "text": "tool error: %s is not available to the agent"
@@ -579,15 +677,22 @@ for line in iter(next_line, None):
             set_pending(s, True)
             hanging = True; continue
         answers, text = [], ""
-        for name, args in re.findall(r"\[call (\w+) (\{[^{}]*\})\]", cmd["message"]) if tools else []:
+        marks = r"\[(?:call (\w+)|mcp ([\w.-]+) ([\w.-]+)) (\{[^{}]*\})\]"
+        for m in re.finditer(marks, cmd["message"]) if tools else []:
+            name, args = m.group(1), json.loads(m.group(4))
+            if name is None:
+                name, args = "mcp_call", {"configPath": os.environ.get("ZEPHYR_MCP_CONFIG", ""),
+                                          "server": m.group(2), "tool": m.group(3), "arguments": args}
             # A fresh id per call, unique across children too, as a model's are: main and its tasks
             # share one gateway dir, so a task must never read main's answer to the same number.
             calls += 1
-            text = run_tool(s, name, json.loads(args), "c%d-%d" % (os.getpid(), calls))
+            text = run_tool(s, name, args, "c%d-%d" % (os.getpid(), calls))
             if text is None:
                 break
             if name in ("gateway", "task", "exec", "process", "vault"):
                 answers.append("\n%s: %s" % (name, text))
+            elif name == "mcp_call":
+                answers.append("\nmcp: %s" % text)
         if text is None:
             finish(s, "", "aborted"); continue
         if cmd["message"].endswith("model?"):

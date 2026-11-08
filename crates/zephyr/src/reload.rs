@@ -2,7 +2,7 @@
 //! `/reload` or when either file's mtime changes, and applies each change the least
 //! disruptive way (`diff`). `/model` and `/status` live here too.
 
-use crate::config::{Account, Config};
+use crate::config::{Account, Config, Mcp};
 use crate::host::conf;
 use crate::store::Store;
 use std::path::Path;
@@ -38,7 +38,7 @@ pub fn diff(old: &Config, new: &Config, active: Option<&Account>, next: Option<&
     if old.extensions != new.extensions
         || old.policy_plugin != new.policy_plugin
         || old.agent_dir != new.agent_dir
-        || old.mcp != new.mcp
+        || !same_connectors(&old.mcp, &new.mcp)
         || old.subagents != new.subagents
     {
         return Plan::RestartChild;
@@ -56,6 +56,20 @@ pub fn diff(old: &Config, new: &Config, active: Option<&Account>, next: Option<&
         None if old == new => Plan::Same,
         None => Plan::Live,
     }
+}
+
+/// The connectors as the child sees them: a tool's approval class is read where the daemon
+/// decides, so changing one needs no restart.
+fn same_connectors(old: &[Mcp], new: &[Mcp]) -> bool {
+    let unclassed = |list: &[Mcp]| -> Vec<Mcp> {
+        (list.iter())
+            .map(|m| Mcp {
+                classes: Default::default(),
+                ..m.clone()
+            })
+            .collect()
+    };
+    old.len() == new.len() && unclassed(old) == unclassed(new)
 }
 
 fn provider(model: &str) -> &str {
@@ -186,6 +200,17 @@ mod tests {
                 "{POOL}[[mcp]]\nname = 'd'\nurl = 'http://x'\n"
             ))),
             Plan::RestartChild
+        );
+        // A tool's approval class and the approval modes are read where the daemon decides.
+        let mcp = format!("{POOL}[[mcp]]\nname = 'd'\nurl = 'http://x'\n");
+        let classed = format!("{mcp}classes = {{ send = 'money' }}\n");
+        assert_eq!(
+            diff(&cfg(&mcp), &cfg(&classed), first(&old), first(&old)),
+            Plan::Live
+        );
+        assert_eq!(
+            same(&cfg(&format!("{POOL}[approvals]\npreset = 'full'\n"))),
+            Plan::Live
         );
         // What the agent's processes may see is fixed at start.
         assert_eq!(

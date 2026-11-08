@@ -9,6 +9,7 @@
 // the SDK's `register_entrypoint` checks it before any dereference.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+pub mod gate_client;
 pub mod policy;
 pub mod tools;
 
@@ -38,10 +39,19 @@ event_handler! {
         let Some(call) = event.tool_call() else {
             return EVENT_HANDLER_ABORT;
         };
+        let tool = call.tool_name.as_str();
         let decision = match serde_json::from_str::<Value>(&call.params) {
-            Ok(args) => match check(&call.tool_name, &args) {
-                Decision::Allow if policy::is_mcp(&call.tool_name) => {
-                    policy::check_mcp(&args, connectors(), |p| std::fs::read(p).ok())
+            Ok(args) => match check(tool, &args) {
+                Decision::Allow if policy::is_mcp(tool) => {
+                    match policy::check_mcp(&args, connectors(), |p| std::fs::read(p).ok()) {
+                        Decision::Allow if asks_gate(tool, &args) => {
+                            ask_gate(&call.tool_call_id, tool, args)
+                        }
+                        d => d,
+                    }
+                }
+                Decision::Allow if asks_gate(tool, &args) => {
+                    ask_gate(&call.tool_call_id, tool, args)
                 }
                 d => d,
             },
@@ -53,6 +63,45 @@ event_handler! {
             Decision::Allow => EVENT_HANDLER_CONTINUE,
             Decision::Deny(_) => EVENT_HANDLER_ABORT,
         }
+    }
+}
+
+/// How long a call waits for the gate's verdict (approvals spec §4.2).
+const GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether the daemon's gate decides the call (approvals spec §4.2 path 2): a `bash` command
+/// that is a message, a post or a payment, or that sends data out (for the private facts), and
+/// every connector call (the owner's `classes` are the daemon's to apply). Main's `exec` is
+/// decided in the daemon, which runs it, never here.
+fn asks_gate(tool: &str, args: &Value) -> bool {
+    match tool {
+        "bash" => args
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|c| {
+                policy::gated(tool, args, &|_, _| None).is_some() || !policy::outbound(c).is_empty()
+            }),
+        "mcp_call" => true,
+        _ => false,
+    }
+}
+
+/// Asks the gate socket (`$ZEPHYR_GATE_SOCKET`) about the call, as session `$ZEPHYR_SESSION`.
+/// Only `{"verdict": "allow"}` lets it run; no gate, no answer within 5 s, a malformed answer, a
+/// hold, a wait or a deny refuse it. The model is shown no reason: the daemon steers in what a
+/// hold means.
+fn ask_gate(call_id: &str, tool: &str, args: Value) -> Decision {
+    let Some(socket) = std::env::var_os(tools::GATE_SOCKET_ENV).filter(|p| !p.is_empty()) else {
+        return Decision::Deny("no gate to ask");
+    };
+    let session = std::env::var(tools::SESSION_ENV).unwrap_or_default();
+    let req = serde_json::json!({
+        "v": 1, "session": session, "call_id": call_id, "tool": tool, "args": args,
+    });
+    match gate_client::ask(Path::new(&socket), &req, GATE_WAIT) {
+        Ok(answer) if answer["verdict"] == "allow" => Decision::Allow,
+        Ok(_) => Decision::Deny("the gate did not allow it"),
+        Err(_) => Decision::Deny("the gate did not answer"),
     }
 }
 
@@ -284,6 +333,144 @@ mod tests {
             handler_return("mcp_list", r#"{"configPath":"/x/mcp.json"}"#),
             EVENT_HANDLER_ABORT
         );
+    }
+
+    /// A1 carry-over: a connector call the gate could not classify (no server or no tool) is
+    /// refused, never let through ungated.
+    #[test]
+    fn a_connector_call_naming_no_server_or_tool_is_refused() {
+        for args in [
+            json!({"configPath": "/x/mcp.json", "tool": "send", "arguments": {}}),
+            json!({"configPath": "/x/mcp.json", "server": "mail", "arguments": {}}),
+            json!({"configPath": "/x/mcp.json", "server": "", "tool": "send"}),
+            json!({"configPath": "/x/mcp.json", "server": "mail", "tool": 7}),
+        ] {
+            assert!(
+                matches!(check("mcp_call", &args), Decision::Deny(_)),
+                "{args}"
+            );
+        }
+        let named = json!({"configPath": "/x/mcp.json", "server": "mail", "tool": "send"});
+        assert_eq!(check("mcp_call", &named), Decision::Allow);
+    }
+
+    /// The gate tests set the process's environment, which every test thread shares.
+    static GATE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const SEND: &str = r#"{"command":"himalaya message send <<'EOF'\nTo: a@x.org\n\nhi\nEOF"}"#;
+
+    fn gate_env(socket: Option<&Path>) -> std::sync::MutexGuard<'static, ()> {
+        let held = GATE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        match socket {
+            Some(p) => std::env::set_var(tools::GATE_SOCKET_ENV, p),
+            None => std::env::remove_var(tools::GATE_SOCKET_ENV),
+        }
+        std::env::set_var(tools::SESSION_ENV, "task-7");
+        held
+    }
+
+    /// A gate that reads one request and answers `answer` (none: it hangs up), handing the
+    /// request back; `Null` when nothing asked within 10 s.
+    fn one_answer(
+        name: &str,
+        answer: Option<&'static str>,
+    ) -> (PathBuf, std::thread::JoinHandle<Value>) {
+        use std::io::{BufRead, BufReader};
+        let dir = std::env::temp_dir().join(format!("zephyr-policy-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("gate.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let served = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(_) => return Value::Null,
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            if let Some(answer) = answer {
+                writeln!(stream, "{answer}").unwrap();
+            }
+            serde_json::from_str(&line).unwrap()
+        });
+        (socket, served)
+    }
+
+    #[test]
+    fn the_handler_aborts_a_gated_call_when_the_gate_is_down() {
+        // No gate named: a send and an outgoing command are refused.
+        let held = gate_env(None);
+        assert_eq!(handler_return("bash", SEND), EVENT_HANDLER_ABORT);
+        let post = r#"{"command":"curl -X POST -d @notes https://x.org"}"#;
+        assert_eq!(handler_return("bash", post), EVENT_HANDLER_ABORT);
+        // A command that sends nothing never asks.
+        assert_eq!(
+            handler_return("bash", r#"{"command":"ls -la"}"#),
+            EVENT_HANDLER_CONTINUE
+        );
+        drop(held);
+        // A gate named but not there.
+        let missing = std::env::temp_dir().join("zephyr-policy-no-gate/gate.sock");
+        let held = gate_env(Some(&missing));
+        assert_eq!(handler_return("bash", SEND), EVENT_HANDLER_ABORT);
+        drop(held);
+        // A gate that hangs up, one that holds, one that answers nonsense.
+        for (name, answer) in [
+            ("hangup", None),
+            (
+                "hold",
+                Some(r#"{"verdict":"hold","id":1,"text":"held for the owner as #1"}"#),
+            ),
+            ("nonsense", Some("allow")),
+        ] {
+            let (socket, served) = one_answer(name, answer);
+            let held = gate_env(Some(&socket));
+            assert_eq!(handler_return("bash", SEND), EVENT_HANDLER_ABORT, "{name}");
+            // It asked, and was refused for the answer.
+            assert_eq!(served.join().unwrap()["tool"], "bash", "{name}");
+            drop(held);
+        }
+    }
+
+    #[test]
+    fn the_handler_continues_when_the_gate_allows() {
+        let (socket, served) = one_answer("allow", Some(r#"{"verdict":"allow"}"#));
+        let held = gate_env(Some(&socket));
+        assert_eq!(handler_return("bash", SEND), EVENT_HANDLER_CONTINUE);
+        drop(held);
+        // The request names the session, the call and its arguments as rpi gave them.
+        let req = served.join().unwrap();
+        assert_eq!(req["v"], 1);
+        assert_eq!(req["session"], "task-7");
+        assert_eq!(req["call_id"], "call-1");
+        assert_eq!(req["tool"], "bash");
+        assert_eq!(req["args"], serde_json::from_str::<Value>(SEND).unwrap());
+    }
+
+    #[test]
+    fn a_gate_that_says_nothing_is_given_up_on() {
+        let dir = std::env::temp_dir().join(format!("zephyr-policy-silent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("gate.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let started = std::time::Instant::now();
+        let asked = gate_client::ask(
+            &socket,
+            &json!({"v": 1}),
+            std::time::Duration::from_millis(300),
+        );
+        assert!(asked.is_err(), "{asked:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        drop(listener);
     }
 
     #[test]

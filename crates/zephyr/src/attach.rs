@@ -11,7 +11,8 @@
 //! `zephyr.hello`, `zephyr.subscribe` and `zephyr.models` are Zephyr's own additions
 //! (DESIGN §4.3.1), as are `zephyr.login_providers`/`_start`/`_poll`/`_input`/`_cancel`, which
 //! sign a provider in on the live gateway (`crate::auth`), and `zephyr.vault_list`/`_put`/`_rm`/
-//! `_revoke`, the owner's credential vault (`crate::vault`), `zephyr.sessions`, the saved main
+//! `_revoke`, the owner's credential vault (`crate::vault`), `zephyr.facts_list`/`_put`/`_rm`, the
+//! owner's private facts (`crate::facts`), `zephyr.sessions`, the saved main
 //! sessions with their `/rename` names, and `zephyr.turns`, the exchanges `/undo N` counts, newest
 //! first, for the TUI's rewind picker, and `zephyr.dequeue`, which takes back the `tui` messages
 //! still waiting (a `send` prompt with `followUp: true` waits for the settle). `zephyr.login_start` answers once rpi's
@@ -51,6 +52,24 @@ pub enum AttachRequest {
     FollowUp(Inbound),
     /// `zephyr.dequeue`: the texts of this channel's messages still waiting, withdrawn.
     Dequeue(oneshot::Sender<Vec<String>>),
+    /// `zephyr.settings`: every setting as it stands now.
+    Settings(oneshot::Sender<Value>),
+    /// `zephyr.settings_set`: a change by the owner on the TUI, answered as the outcome.
+    SettingsSet {
+        key: String,
+        value: String,
+        until: Option<String>,
+        reply: oneshot::Sender<Value>,
+    },
+    /// `zephyr.proposals`: the proposals still waiting.
+    Proposals(oneshot::Sender<Value>),
+    /// `zephyr.decide`: `/ok N` (`ok`, `once`), `/no N` (`no`) or `/cancel N` (`cancel`) as the
+    /// owner on the TUI.
+    Decide {
+        id: i64,
+        verb: String,
+        reply: oneshot::Sender<Value>,
+    },
 }
 
 /// Reads the attach token. Never log the result.
@@ -327,10 +346,77 @@ impl Conn {
                     _ => (vec![error(id, -32000, "gateway is shutting down")], true),
                 }
             }
+            "zephyr.settings" | "zephyr.proposals" => {
+                let (tx, rx) = oneshot::channel();
+                let req = if method == "zephyr.settings" {
+                    AttachRequest::Settings(tx)
+                } else {
+                    AttachRequest::Proposals(tx)
+                };
+                match (self.router.send(req).await, rx.await) {
+                    (Ok(()), Ok(value)) => (vec![ok(id, value)], false),
+                    _ => (vec![error(id, -32000, "gateway is shutting down")], true),
+                }
+            }
+            "zephyr.settings_set" => {
+                let (Some(key), Some(value)) = (
+                    params["key"].as_str(),
+                    // A client may send a number or a flag as such.
+                    match &params["value"] {
+                        Value::String(s) => Some(s.clone()),
+                        v @ (Value::Number(_) | Value::Bool(_)) => Some(v.to_string()),
+                        _ => None,
+                    },
+                ) else {
+                    return (vec![error(id, -32602, "key and value are required")], false);
+                };
+                // A number would read as "no limit": refuse it rather than loosen for good.
+                let until = match &params["until"] {
+                    Value::Null => None,
+                    Value::String(s) => Some(s.clone()),
+                    _ => {
+                        let why = "until must be text like 30m, 2h or 1d";
+                        return (vec![error(id, -32602, why)], false);
+                    }
+                };
+                let (tx, rx) = oneshot::channel();
+                let req = AttachRequest::SettingsSet {
+                    key: key.into(),
+                    value,
+                    until,
+                    reply: tx,
+                };
+                match (self.router.send(req).await, rx.await) {
+                    (Ok(()), Ok(value)) => (vec![ok(id, value)], false),
+                    _ => (vec![error(id, -32000, "gateway is shutting down")], true),
+                }
+            }
+            "zephyr.decide" => {
+                let (Some(n), Some(verb)) = (params["id"].as_i64(), params["verb"].as_str()) else {
+                    return (vec![error(id, -32602, "id and verb are required")], false);
+                };
+                if !matches!(verb, "ok" | "once" | "no" | "cancel") {
+                    let why = "verb is ok, once, no or cancel";
+                    return (vec![error(id, -32602, why)], false);
+                }
+                let (tx, rx) = oneshot::channel();
+                let req = AttachRequest::Decide {
+                    id: n,
+                    verb: verb.into(),
+                    reply: tx,
+                };
+                match (self.router.send(req).await, rx.await) {
+                    (Ok(()), Ok(value)) => (vec![ok(id, value)], false),
+                    _ => (vec![error(id, -32000, "gateway is shutting down")], true),
+                }
+            }
             "zephyr.vault_list"
             | "zephyr.vault_put"
             | "zephyr.vault_rm"
             | "zephyr.vault_revoke" => self.vault(id, method, params).await,
+            "zephyr.facts_list" | "zephyr.facts_put" | "zephyr.facts_rm" => {
+                self.facts(id, method, params)
+            }
             "zephyr.sessions" => {
                 let cfg = self.cfgs.borrow().clone();
                 let names = (crate::store::Store::open(&cfg.db_path()))
@@ -410,6 +496,65 @@ impl Conn {
         }
         let entries: Vec<Value> = vault.entries().iter().map(Entry::public).collect();
         (vec![ok(id, json!({ "entries": entries }))], false)
+    }
+
+    /// The owner's private facts (approvals spec §4.5): every call answers with the facts as they
+    /// are now, names, kinds and allowed targets, never a value. `facts_put` takes the value, and
+    /// it goes nowhere but `facts.toml`: not into an answer, a log or an error. An empty `value`
+    /// for a saved name keeps the saved one. The agent is not told of a fact.
+    fn facts(&mut self, id: &Value, method: &str, params: &Value) -> Reply {
+        use crate::facts::{edit, load, put, remove, Fact, FactKind};
+        let path = crate::facts::path(&self.cfgs.borrow());
+        let name = params["name"].as_str().unwrap_or_default();
+        let done: anyhow::Result<()> = match method {
+            "zephyr.facts_put" => {
+                let text = |k: &str| params[k].as_str().map(str::to_string);
+                // Not serde's message: it can quote the value it did not like.
+                match (
+                    text("name"),
+                    FactKind::parse(&text("kind").unwrap_or_default()),
+                ) {
+                    (Some(name), Some(kind)) => {
+                        let allow: Vec<String> = (params["allow"].as_array().into_iter().flatten())
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect();
+                        let value = text("value").unwrap_or_default();
+                        edit(&path, |facts| {
+                            let kept = facts.iter().find(|f| f.name == name);
+                            let value = match (value.is_empty(), kept) {
+                                (true, Some(old)) => old.value.clone(),
+                                _ => value.trim().to_string(),
+                            };
+                            put(
+                                facts,
+                                Fact {
+                                    name,
+                                    kind,
+                                    value,
+                                    allow,
+                                },
+                                true,
+                            )
+                            .map(drop)
+                        })
+                    }
+                    _ => Err(anyhow::anyhow!("the fact is malformed")),
+                }
+            }
+            "zephyr.facts_rm" => edit(&path, |facts| match remove(facts, name) {
+                true => Ok(()),
+                false => bail!("no fact named {name}"),
+            }),
+            _ => Ok(()),
+        };
+        let listed = done.and_then(|()| load(&path));
+        match listed {
+            Ok(facts) => {
+                let facts: Vec<Value> = facts.iter().map(Fact::public).collect();
+                (vec![ok(id, json!({ "facts": facts }))], false)
+            }
+            Err(e) => (vec![error(id, -32602, &format!("{e:#}"))], false),
+        }
     }
 
     /// Replays the session from `get_messages`, then streams live events.

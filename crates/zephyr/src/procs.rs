@@ -72,16 +72,48 @@ impl Procs {
         to: (String, String),
         env: Vec<(String, String)>,
     ) {
-        let answer = |text: &str| crate::tools::answer_gateway(cfg, call_id, text);
-        let p = match store.add_proc(&call.command, &to.0, &to.1) {
+        if let Err(text) = self.launch(cfg, store, Some(call_id), None, call, to, env) {
+            crate::tools::answer_gateway(cfg, call_id, &text);
+        }
+    }
+
+    /// Runs the command of held action `action`, which the owner approved (approvals spec §4.6),
+    /// as `start` runs an `exec`: as the agent, with its log, timeout and `env`. No turn waits
+    /// for it, so it is in the background from the start, and its end is the action's report to
+    /// main on `to` (`Store::finish_proc`). Returns its process number, or why it did not start.
+    pub fn start_action(
+        &self,
+        cfg: &Arc<Config>,
+        store: &Store,
+        action: i64,
+        call: ExecCall,
+        to: (String, String),
+        env: Vec<(String, String)>,
+    ) -> Result<i64, String> {
+        self.launch(cfg, store, None, Some(action), call, to, env)
+    }
+
+    /// `start` and `start_action`: `call_id` is the tool call that waits, if one does.
+    #[allow(clippy::too_many_arguments)]
+    fn launch(
+        &self,
+        cfg: &Arc<Config>,
+        store: &Store,
+        call_id: Option<&str>,
+        action: Option<i64>,
+        call: ExecCall,
+        to: (String, String),
+        env: Vec<(String, String)>,
+    ) -> Result<i64, String> {
+        let p = match store.add_proc_for(&call.command, &to.0, &to.1, action) {
             Ok(Some(p)) => p,
             Ok(None) => {
-                return answer(&format!(
+                return Err(format!(
                     "not started: {} commands are running; stop one with `process stop`",
                     crate::store::MAX_RUNNING_PROCS
                 ))
             }
-            Err(e) => return answer(&format!("not started: {e}")),
+            Err(e) => return Err(format!("not started: {e}")),
         };
         let log = log_path(cfg, p.id);
         let child = match spawn(cfg, &call.command, &log, env) {
@@ -91,7 +123,7 @@ impl Procs {
                 if let Ok(mut s) = Store::open(&cfg.db_path()) {
                     let _ = s.finish_proc(&p, "exited", None, None, crate::now());
                 }
-                return answer(&text);
+                return Err(text);
             }
         };
         let pid = child.id().unwrap_or(0) as i32;
@@ -109,16 +141,18 @@ impl Procs {
             stopped: Arc::new(AtomicBool::new(false)),
         };
         self.running.lock().unwrap().insert(p.id, handle.clone());
+        let id = p.id;
         tokio::spawn(run(
             self.clone(),
             cfg.clone(),
             p,
-            call_id.to_string(),
+            call_id.map(String::from),
             child,
             handle,
             timeout,
             call.background,
         ));
+        Ok(id)
     }
 
     /// A message for main arrived: every command still in the agent's turn moves to the
@@ -340,12 +374,15 @@ enum First {
     Timeout,
 }
 
+/// Follows a started command to its end. `call_id` is the turn's tool call waiting for it; with
+/// none (an approved action), the command is in the background from the start and nothing is
+/// answered.
 #[allow(clippy::too_many_arguments)]
 async fn run(
     procs: Procs,
     cfg: Arc<Config>,
     p: Proc,
-    call_id: String,
+    call_id: Option<String>,
     mut child: tokio::process::Child,
     h: Handle,
     timeout: Duration,
@@ -353,12 +390,18 @@ async fn run(
 ) {
     let started = Instant::now();
     let log = log_path(&cfg, p.id);
-    let answer = |text: String| crate::tools::answer_gateway(&cfg, &call_id, &text);
+    let answer = |text: String| {
+        if let Some(id) = &call_id {
+            crate::tools::answer_gateway(&cfg, id, &text)
+        }
+    };
     let output = |max| match tail(&log, max) {
         Ok(t) => crate::vault::scrubbed(&cfg, t.text(p.id)),
         Err(e) => format!("[output unreadable: {e}]"),
     };
-    let first = if background {
+    let first = if call_id.is_none() {
+        First::Yield("the owner approved it".into())
+    } else if background {
         First::Yield("you asked for the background".into())
     } else {
         tokio::select! {
@@ -398,13 +441,16 @@ async fn run(
         }
         First::Yield(why) => {
             h.foreground.store(false, Ordering::SeqCst);
-            answer(format!(
-                "Moved to the background ({why}) without being killed: it is still running as \
-                 process #{}. You get a message when it exits. Reply to the owner now and end your \
-                 turn; `process` lists, shows or stops it.\nOutput so far:\n{}",
-                p.id,
-                output(MAX_BYTES)
-            ));
+            // Nobody waits for an approved action's start: only its report is told.
+            if call_id.is_some() {
+                answer(format!(
+                    "Moved to the background ({why}) without being killed: it is still running \
+                     as process #{}. You get a message when it exits. Reply to the owner now and \
+                     end your turn; `process` lists, shows or stops it.\nOutput so far:\n{}",
+                    p.id,
+                    output(MAX_BYTES)
+                ));
+            }
             let left = timeout.saturating_sub(started.elapsed());
             let (status, said, code) = tokio::select! {
                 s = child.wait() => {

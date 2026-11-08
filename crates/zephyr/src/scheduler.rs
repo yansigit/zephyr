@@ -9,10 +9,11 @@ use crate::store::Store;
 use croner::parser::{CronParser, Seconds, Year};
 use jiff::{tz::TimeZone, Timestamp};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{watch, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 
 const TICK: Duration = Duration::from_secs(30);
 /// How often background work's old leftovers are swept (`retention`).
@@ -38,6 +39,51 @@ pub struct Wake {
     pub tasks: Notify,
     /// A task wrote its report to the inbox: the router dispatches it.
     pub inbox: Notify,
+    /// The task and job runs in progress that take notes (`Steers`).
+    pub steers: Steers,
+}
+
+/// A note for a run in progress about action `action`, from outside it, steered in whole as
+/// `text`: the gate's held note, before the plugin hears `hold` (R51), or the owner's pass for
+/// the connector call the run asked for (approvals spec §4.6).
+pub struct Note {
+    pub action: i64,
+    pub text: String,
+    /// What main is handed as the action's note (`word`, text; `Store::action_note`) when the
+    /// run ends before the model reads it: a pass's. `None` for a held note, which the call's
+    /// own end steers again if it must.
+    pub fallback: Option<(String, String)>,
+    /// Told once rpi has queued it: the gate waits for that before it answers the plugin.
+    pub queued: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// The task and job runs in progress, by session, that a [`Note`] can be steered into. A run's
+/// inbox closes when its `follow` ends, and every pass note in it then goes to main instead: a
+/// note is either steered into the run that asked or handed to main, never lost between.
+#[derive(Clone, Default)]
+pub struct Steers(Arc<std::sync::Mutex<HashMap<String, mpsc::UnboundedSender<Note>>>>);
+
+impl Steers {
+    /// Opens `session`'s inbox, for the run about to start in it.
+    pub fn open(&self, session: &str) -> mpsc::UnboundedReceiver<Note> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut map = self.lock();
+        map.retain(|_, tx| !tx.is_closed());
+        map.insert(session.to_string(), tx);
+        rx
+    }
+
+    /// Hands `note` to `session`'s run if one is in progress; `Err(note)` when none is.
+    pub fn send(&self, session: &str, note: Note) -> Result<(), Note> {
+        match self.lock().get(session) {
+            Some(tx) => tx.send(note).map_err(|e| e.0),
+            None => Err(note),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, mpsc::UnboundedSender<Note>>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// One unattended prompt in a fresh child: a job run or a background task.
@@ -60,6 +106,8 @@ pub struct Spec<'a> {
     /// `provider/model` to run on instead of the account's own (a task's `model`, DESIGN
     /// §4.12): only that provider's accounts are tried.
     pub model: Option<&'a str>,
+    /// Where each attempt opens its session's inbox for notes (`Steers`).
+    pub steers: &'a Steers,
 }
 
 /// What a run resumed after a restart is told (OpenClaw's restart-recovery wording): rpi
@@ -199,6 +247,7 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
                 task: None,
                 resume: false,
                 model: None,
+                steers: &wake.steers,
             };
             let (status, output, crossed) = execute(&cfg, &mut store, &spec).await;
             wake.running.store(false, Ordering::SeqCst);
@@ -343,7 +392,10 @@ async fn attempt_once(
         }
     }
     let mut child = match Child::spawn_as(cfg, Some(session), account).await {
-        Ok(child) => child,
+        Ok(mut child) => {
+            child.notes = Some(spec.steers.open(session));
+            child
+        }
         Err(e) => {
             return (
                 "failed",
@@ -398,7 +450,7 @@ async fn attempt_once(
         },
         false => (status, text),
     };
-    if let Some(alert) = tally.alert() {
+    if let Some(alert) = tally.alert().map(|a| crate::facts::scrubbed(cfg, a)) {
         if let Err(e) = store.notify(&spec.to.0, &spec.to.1, &alert) {
             eprintln!("zephyr: outbound notice failed: {e}");
         }
@@ -522,7 +574,17 @@ pub(crate) fn audit(store: &Store, cfg: &Config, session: &str, ev: &serde_json:
                 zephyr_policy::policy::Decision::Deny(_)
             );
             let outcome = if refused { "refused" } else { "started" };
-            (crate::vault::scrubbed(cfg, ev["args"].to_string()), outcome)
+            // A fact's value is saved only after this runs: redact the `/facts add` itself,
+            // read trimmed as the plugin and the daemon read it (B1), and any `/facts…` that
+            // is not well formed.
+            let mut args = ev["args"].clone();
+            if tool == "gateway" {
+                if let Some(c) = args["command"].as_str() {
+                    args["command"] = crate::facts::redact(c).into();
+                }
+            }
+            let text = crate::vault::scrubbed(cfg, args.to_string());
+            (crate::facts::scrubbed(cfg, text), outcome)
         }
         Some("tool_execution_end") if ev["isError"] == true => (String::new(), "error"),
         _ => return,
@@ -567,9 +629,38 @@ async fn follow(
     let mut in_tool = 0usize;
     // Its own connection: `follow` is not handed the run's store.
     let audited = child.session.clone().zip(Store::open(&cfg.db_path()).ok());
+    let mut notes = Notes {
+        inbox: child.notes.take(),
+        steered: Vec::new(),
+        held: std::collections::HashSet::new(),
+        db: cfg.db_path(),
+    };
     let settled = loop {
         let limit = cfg.stall_limit * if in_tool > 0 { 2 } else { 1 };
-        let Ok(ev) = tokio::time::timeout(limit, child.events.recv()).await else {
+        let ev = tokio::select! {
+            ev = tokio::time::timeout(limit, child.events.recv()) => ev,
+            Some(mut note) = notes.next() => {
+                // A note from outside the run (the gate's, an approved connector call's): steered
+                // in, and a pass's handed to main at the end unless the run reached it. A held
+                // note the call's end already steered in (the gate's came late) goes no more.
+                if note.fallback.is_none() && notes.held.contains(&note.action) {
+                    continue;
+                }
+                let steer =
+                    json!({"type": "queue_message", "message": note.text, "deliverAs": "steer"});
+                if child.call(steer).await.is_ok() {
+                    if let Some(queued) = note.queued.take() {
+                        let _ = queued.send(());
+                    }
+                    notes.held.insert(note.action);
+                    if note.fallback.is_some() {
+                        notes.steered.push(note);
+                    }
+                }
+                continue;
+            }
+        };
+        let Ok(ev) = ev else {
             let _ = child.call(json!({"type": "abort"})).await;
             return Ok(Err(anyhow::anyhow!("stalled: no progress for {limit:?}")));
         };
@@ -577,8 +668,20 @@ async fn follow(
             Some(ev) if ev["type"] == "agent_settled" => break ev,
             Some(ev) => {
                 tally.add(&ev);
+                notes.delivered(&ev);
                 if let Some((session, store)) = &audited {
                     audit(store, cfg, session, &ev);
+                    // The plugin refused a call the gate held, showing the model no reason. The
+                    // gate steered the note in before it answered (R51); if that did not get
+                    // through in time, it goes in now, once (approvals spec §4.2).
+                    match held_note(store, session, &ev) {
+                        Some((id, note)) if notes.held.insert(id) => {
+                            let steer = json!({"type": "queue_message", "message": note,
+                                               "deliverAs": "steer"});
+                            let _ = child.call(steer).await;
+                        }
+                        _ => {}
+                    }
                 }
                 match ev["type"].as_str() {
                     Some("tool_execution_start") => in_tool += 1,
@@ -643,6 +746,102 @@ async fn follow(
             settled["error"].as_str().unwrap_or("no error given")
         )),
     })
+}
+
+/// The held action and what the agent is told, when the plugin refused its call `ev` (a
+/// `tool_execution_end` with `isError`) because the gate held it for the owner (approvals spec
+/// §4.2, §4.8): `None` for any other event or refusal.
+pub(crate) fn held_note(
+    store: &Store,
+    session: &str,
+    ev: &serde_json::Value,
+) -> Option<(i64, String)> {
+    if ev["type"] != "tool_execution_end" || ev["isError"] != true {
+        return None;
+    }
+    let call = ev["toolCallId"].as_str()?;
+    match store.held_for_call(session, call) {
+        // C4: a delayed one goes by itself, and the agent is told when.
+        Ok(held) => held.map(|(id, summary, due)| {
+            let text = match due {
+                Some(at) => {
+                    let minutes = crate::gate::minutes_until(at, crate::now());
+                    crate::gate::delayed_text(id, &summary, minutes)
+                }
+                None => crate::gate::held_text(id, &summary),
+            };
+            (id, text)
+        }),
+        Err(e) => {
+            eprintln!("zephyr: reading what the gate held failed: {e}");
+            None
+        }
+    }
+}
+
+/// A run's notes from outside it (`Steers`) while `follow` reads its events: each is steered in
+/// as it comes, and when `follow` ends, by whatever way, the inbox is closed and every pass note
+/// the model never got (still in the inbox, or steered in but not delivered when the run ended)
+/// goes to main as the action's note instead.
+struct Notes {
+    inbox: Option<mpsc::UnboundedReceiver<Note>>,
+    /// Pass notes steered in, until rpi delivers them.
+    steered: Vec<Note>,
+    /// The actions whose note is in the run already, so a held call's end steers none again.
+    held: std::collections::HashSet<i64>,
+    /// The store, opened only when a note is left for main.
+    db: std::path::PathBuf,
+}
+
+impl Notes {
+    /// The next note; never, once the inbox is gone (its sender replaced by a later run's).
+    async fn next(&mut self) -> Option<Note> {
+        let Some(inbox) = &mut self.inbox else {
+            return std::future::pending().await;
+        };
+        let note = inbox.recv().await;
+        if note.is_none() {
+            self.inbox = None;
+        }
+        note
+    }
+
+    /// Takes a steered note off the list once rpi delivers it to the model as a user message.
+    fn delivered(&mut self, ev: &serde_json::Value) {
+        if self.steered.is_empty() || ev["type"] != "message_end" || ev["message"]["role"] != "user"
+        {
+            return;
+        }
+        let text = message_text(&ev["message"]);
+        if let Some(i) = self.steered.iter().position(|n| n.text == text) {
+            self.steered.remove(i);
+        }
+    }
+}
+
+impl Drop for Notes {
+    fn drop(&mut self) {
+        let mut left = std::mem::take(&mut self.steered);
+        if let Some(inbox) = &mut self.inbox {
+            inbox.close();
+            while let Ok(note) = inbox.try_recv() {
+                left.push(note);
+            }
+        }
+        if left.iter().all(|n| n.fallback.is_none()) {
+            return; // held notes: the gate has answered by now
+        }
+        let store = Store::open(&self.db);
+        for (n, (word, text)) in left
+            .into_iter()
+            .filter_map(|n| Some((n.action, n.fallback?)))
+        {
+            let handed = (store.as_ref()).map(|s| s.action_note(n, &word, &text));
+            if !matches!(handed, Ok(Ok(_))) {
+                eprintln!("zephyr: action #{n}'s note reached neither its run nor main");
+            }
+        }
+    }
 }
 
 /// An owner's `/job …` command. `None` when the text is not one; otherwise the reply.
@@ -775,6 +974,76 @@ mod tests {
             text: text.into(),
         };
         command(store, &cfg(None), &m).expect("a /job command")
+    }
+
+    /// B1: the agent's `/facts add` never puts its value in the audit, however it is spaced: the
+    /// audit runs before the fact is saved, so nothing could scrub it yet.
+    #[test]
+    fn a_facts_add_leaves_no_value_in_the_audit_however_it_is_spaced() {
+        let dir = crate::test_dir("sched-audit-facts");
+        let cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = {dir:?}\n")).unwrap();
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let store = Store::open(&cfg.db_path()).unwrap();
+        for command in [
+            "/facts add phone digits 5550102345",
+            " /facts add phone digits 5550102345",
+            "\n\t/facts add phone digits 5550102345\n",
+            "/facts  add\tphone digits 5550102345",
+            "/facts add 5550102345 digits 5550102345",
+            "/factsadd phone digits 5550102345",
+        ] {
+            let ev = serde_json::json!({"type": "tool_execution_start", "toolName": "gateway",
+                                        "toolCallId": "c", "args": {"command": command}});
+            audit(&store, &cfg, "main", &ev);
+        }
+        let rows = store.audit_rows().unwrap();
+        assert_eq!(rows.len(), 6);
+        for (_, tool, args, _) in &rows {
+            assert_eq!(tool, "gateway");
+            assert!(!args.contains("555010"), "{args}");
+        }
+    }
+
+    /// C4: a call the gate delayed is told that it goes by itself, and when; one held for the
+    /// owner, that it waits.
+    #[test]
+    fn a_held_calls_note_says_whether_it_goes_by_itself() {
+        use crate::store::{ActionKind, NewAction, Origin};
+        let store = Store::open(&crate::test_dir("sched-held-note").join("state.db")).unwrap();
+        let hold = |call: &str, due_at: Option<i64>| {
+            store
+                .hold_action(&NewAction {
+                    kind: ActionKind::Run,
+                    class: "posts".into(),
+                    targets: vec!["o/r".into()],
+                    summary: "gh pr create on o/r".into(),
+                    reason: None,
+                    payload: r#"{"command": "gh pr create -R o/r"}"#.into(),
+                    secrets: vec![],
+                    origin: Origin {
+                        session: "task-1".into(),
+                        run: "task-1".into(),
+                        call_id: Some(call.into()),
+                        ..Origin::default()
+                    },
+                    due_at,
+                })
+                .unwrap()
+        };
+        let later = hold("c1", Some(crate::now() + 290));
+        let asked = hold("c2", None);
+        let ended = |call: &str| serde_json::json!({"type": "tool_execution_end", "isError": true, "toolCallId": call});
+        assert_eq!(
+            held_note(&store, "task-1", &ended("c1")),
+            Some((
+                later,
+                crate::gate::delayed_text(later, "gh pr create on o/r", 5)
+            ))
+        );
+        assert_eq!(
+            held_note(&store, "task-1", &ended("c2")),
+            Some((asked, crate::gate::held_text(asked, "gh pr create on o/r")))
+        );
     }
 
     #[test]

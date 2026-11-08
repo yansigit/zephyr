@@ -8,12 +8,15 @@ mod common;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use zephyr_policy::tools::{GATE_SOCKET_ENV, SESSION_ENV};
 
 const RPI: &str = "/home/user/Projects/.always-on/rpi-0.18.0/bin/rpi";
 
@@ -343,6 +346,42 @@ impl GatewayRpi {
 
     /// `main` starts it as zephyr starts the main child: `exec`/`process`, no `bash`.
     fn start_with(name: &str, turns: Vec<String>, main: bool) -> Self {
+        Self::launch(name, turns, |cmd, _| {
+            if main {
+                cmd.env("ZEPHYR_EXEC", "1")
+                    .args(["--exclude-tools", "bash"]);
+            }
+        })
+    }
+
+    /// A task's child, with the gate env `rpc::spawn_as` gives every child (`gate::agent_env`):
+    /// the plugin asks the socket `<root>/gate.sock`, bound here and handed back for the test to
+    /// serve, as `session`. `bin/himalaya` (first on `PATH`) leaves `bin/himalaya.ran` if run;
+    /// the plugin's audit lines go to `audit.jsonl`.
+    fn start_gated(name: &str, turns: Vec<String>, session: &str) -> (Self, UnixListener) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut gate = None;
+        let rpi = Self::launch(name, turns, |cmd, root| {
+            let socket = root.join("gate.sock");
+            gate = Some(UnixListener::bind(&socket).expect("bind the gate socket"));
+            let bin = root.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let fake = bin.join("himalaya");
+            std::fs::write(&fake, "#!/bin/sh\ntouch \"$0.ran\"\n").unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut path = std::ffi::OsString::from(&bin);
+            path.push(":");
+            path.push(std::env::var_os("PATH").unwrap_or_default());
+            cmd.env("PATH", path)
+                .env("ZEPHYR_AUDIT_LOG", root.join("audit.jsonl"))
+                .env(GATE_SOCKET_ENV, &socket)
+                .env(SESSION_ENV, session);
+        });
+        (rpi, gate.unwrap())
+    }
+
+    /// Starts the child; `setup` adds to its command last, so its env wins.
+    fn launch(name: &str, turns: Vec<String>, setup: impl FnOnce(&mut Command, &Path)) -> Self {
         use std::io::BufRead;
         let lib = common::build_cdylib();
         let root = scratch(name);
@@ -363,12 +402,7 @@ impl GatewayRpi {
             move || serve_turns(listener, Default::default(), turns, seen)
         });
         let mut cmd = Command::new(RPI);
-        cmd.env_clear();
-        if main {
-            cmd.env("ZEPHYR_EXEC", "1")
-                .args(["--exclude-tools", "bash"]);
-        }
-        let mut child = cmd
+        cmd.env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &home)
             .env("RPI_CODING_AGENT_DIR", &agent)
@@ -389,9 +423,9 @@ impl GatewayRpi {
             .args(["--mode", "rpc"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn rpi");
+            .stderr(std::process::Stdio::null());
+        setup(&mut cmd, &root);
+        let mut child = cmd.spawn().expect("spawn rpi");
         let stdin = child.stdin.take().unwrap();
         let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
         let (tx, events) = std::sync::mpsc::channel::<Value>();
@@ -432,6 +466,14 @@ impl GatewayRpi {
         self.stdin.write_all(b"\n").unwrap();
     }
 
+    /// Answers the waiting call `id` as the daemon does (`tools::answer_gateway`): the whole
+    /// file at once, renamed into place, since the plugin's poll consumes whatever it reads.
+    fn answer(&self, id: &str, text: &str) {
+        let tmp = self.gw.join(format!("{id}.tmp"));
+        std::fs::write(&tmp, text).unwrap();
+        std::fs::rename(&tmp, self.gw.join(id)).unwrap();
+    }
+
     /// Sends the prompt and returns once the `tool` call `id` has started.
     fn until_call(&mut self, tool: &str, id: &str) {
         self.send(r#"{"id":"1","type":"prompt","message":"status?"}"#);
@@ -469,7 +511,7 @@ fn rpi_waits_for_a_gateway_answer_mid_turn() {
         state["type"], "response",
         "rpi ended the call before the answer: {state}"
     );
-    std::fs::write(rpi.gw.join("toolu_gw"), "agent: answered by the test").unwrap();
+    rpi.answer("toolu_gw", "agent: answered by the test");
     let end = rpi.next(|v| v["type"] == "tool_execution_end");
     assert_ne!(end["isError"], true, "{end}");
     rpi.next(|v| v["type"] == "agent_settled");
@@ -499,7 +541,7 @@ fn the_main_child_runs_commands_through_exec_and_waits_for_them() {
     let mut rpi = GatewayRpi::start_with("exec", vec![first], true);
     rpi.until_call("exec", "toolu_exec");
     std::thread::sleep(std::time::Duration::from_secs(11));
-    std::fs::write(rpi.gw.join("toolu_exec"), "exited 0\nbuilt").unwrap();
+    rpi.answer("toolu_exec", "exited 0\nbuilt");
     let end = rpi.next(|v| v["type"] == "tool_execution_end");
     assert_ne!(end["isError"], true, "{end}");
     assert!(end.to_string().contains("exited 0"), "{end}");
@@ -583,7 +625,7 @@ fn rpi_waits_for_a_task_answer_mid_turn() {
         state["type"], "response",
         "rpi ended the call before the answer: {state}"
     );
-    std::fs::write(rpi.gw.join("toolu_task"), "task 1: running").unwrap();
+    rpi.answer("toolu_task", "task 1: running");
     let end = rpi.next(|v| v["type"] == "tool_execution_end");
     assert_ne!(end["isError"], true, "{end}");
     assert!(
@@ -616,5 +658,197 @@ fn rpi_waits_for_a_task_answer_mid_turn() {
     assert!(
         !rpi.gw.join("toolu_task").exists(),
         "the answer file is consumed"
+    );
+}
+
+/// A held send, as the gate words it (`gate::held_text`).
+const HELD: &str =
+    "held for the owner as #1 (email to a@x.org); don't retry it; carry on or end your turn";
+
+/// Why a test saw no request: the plugin asks only a gate served by root or by the rpi binary's
+/// owner (`gate_client::trusted`), so the tests must run as one of them.
+const NEVER_ASKED: &str = "the plugin never asked the gate (run the test as root or as the user \
+                           that owns the rpi binary)";
+
+/// The model's turn: a task's `bash` sends a message, which `policy::gated` recognises.
+fn send_turn() -> String {
+    let command = "himalaya message send <<'EOF'\nTo: a@x.org\nSubject: hi\n\nhi\nEOF";
+    call_turn(
+        "toolu_send",
+        "bash",
+        &json!({ "command": command }).to_string(),
+    )
+}
+
+/// The daemon's gate, played by a thread: reads the one request on `gate`, hands it to the
+/// returned receiver, waits for `go` (when given), then answers `answer`.
+fn serve_gate(
+    gate: UnixListener,
+    answer: Value,
+    go: Option<std::sync::mpsc::Receiver<()>>,
+) -> std::sync::mpsc::Receiver<Value> {
+    use std::io::BufRead;
+    let (tx, asked) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = gate.accept() else {
+            return;
+        };
+        let mut line = String::new();
+        // A plugin that hangs up unasked (it trusted no gate here) asked nothing.
+        match std::io::BufReader::new(&stream).read_line(&mut line) {
+            Ok(n) if n > 0 => {}
+            _ => return,
+        }
+        let _ = tx.send(serde_json::from_str(&line).unwrap_or(Value::Null));
+        if let Some(go) = go {
+            let _ = go.recv();
+        }
+        let _ = writeln!(stream, "{answer}");
+    });
+    asked
+}
+
+/// The `messages` of a request the model server kept.
+fn model_messages(request: &str) -> Vec<Value> {
+    let body = request.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+    let body: Value = serde_json::from_str(body).unwrap_or_else(|_| panic!("{request}"));
+    body["messages"].as_array().cloned().unwrap_or_default()
+}
+
+/// Approvals spec §4.2 path 2 under the pinned rpi: a task's `bash` send makes the plugin ask the
+/// gate socket, naming the session `rpc::spawn_as` gave the child, and the gate's `hold` vetoes
+/// the call before it runs. rpi shows the model only its own block line, never the gate's text:
+/// what a hold means reaches the model as the daemon's steered note (next test).
+#[test]
+#[ignore = "needs the pinned rpi binary; run with --ignored"]
+fn rpi_vetoes_a_held_bash_call_after_asking_the_gate() {
+    if !Path::new(RPI).exists() {
+        skip_without_rpi(RPI);
+        return;
+    }
+    let (mut rpi, gate) = GatewayRpi::start_gated("gate-hold", vec![send_turn()], "task-7");
+    let asked = serve_gate(
+        gate,
+        json!({"verdict": "hold", "id": 1, "text": HELD}),
+        None,
+    );
+    rpi.until_call("bash", "toolu_send");
+    let req = asked
+        .recv_timeout(Duration::from_secs(20))
+        .expect(NEVER_ASKED);
+    assert_eq!(req["v"], 1, "{req}");
+    assert_eq!(req["tool"], "bash", "{req}");
+    assert_eq!(req["session"], "task-7", "{req}");
+    assert_eq!(req["call_id"], "toolu_send", "{req}");
+    assert!(
+        req["args"]["command"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("himalaya message send")),
+        "{req}"
+    );
+    let end = rpi.next(|v| v["type"] == "tool_execution_end");
+    assert_eq!(end["toolCallId"], "toolu_send", "{end}");
+    assert_eq!(end["isError"], true, "{end}");
+    assert!(
+        end["result"].to_string().contains("blocked tool `bash`"),
+        "not rpi's block line: {end}"
+    );
+    assert!(
+        !end.to_string().contains(HELD),
+        "the gate's text is the daemon's to steer: {end}"
+    );
+    rpi.next(|v| v["type"] == "agent_settled");
+    // Refused for the gate's answer, not for want of one (a missing, silent or untrusted gate
+    // is "the gate did not answer"), and never run.
+    let audit = std::fs::read_to_string(rpi.root.join("audit.jsonl")).unwrap_or_default();
+    assert!(
+        audit
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .any(|l| l["tool"] == "bash" && l["reason"] == "the gate did not allow it"),
+        "{audit}"
+    );
+    assert!(
+        !rpi.root.join("bin/himalaya.ran").exists(),
+        "the held send ran"
+    );
+}
+
+/// R51 under the pinned rpi: while the plugin's `ToolCall` handler waits on the gate, rpi still
+/// reads its stdin and answers the daemon's `queue_message` steer at once, inside the 2 s
+/// `gate::steer` waits for it; once the hold vetoes the call, the note is the model's next input,
+/// right after the refused call's result.
+#[test]
+#[ignore = "needs the pinned rpi binary; run with --ignored"]
+fn rpi_takes_a_steer_while_the_plugin_waits_on_the_gate() {
+    if !Path::new(RPI).exists() {
+        skip_without_rpi(RPI);
+        return;
+    }
+    let (mut rpi, gate) = GatewayRpi::start_gated("gate-steer", vec![send_turn()], "task-7");
+    let (answer, go) = std::sync::mpsc::channel();
+    let hold = json!({"verdict": "hold", "id": 1, "text": HELD});
+    let asked = serve_gate(gate, hold, Some(go));
+    rpi.until_call("bash", "toolu_send");
+    asked
+        .recv_timeout(Duration::from_secs(20))
+        .expect(NEVER_ASKED);
+    // The handler waits for the gate's answer now, as the daemon's gate holds it during R51.
+    let steer =
+        json!({"id": "steer", "type": "queue_message", "message": HELD, "deliverAs": "steer"});
+    let sent = Instant::now();
+    rpi.send(&steer.to_string());
+    let queued = rpi.next(|v| v["id"] == "steer" || v["type"] == "tool_execution_end");
+    let took = sent.elapsed();
+    assert_eq!(
+        queued["type"], "response",
+        "rpi ended the call before it took the steer: {queued}"
+    );
+    assert_eq!(queued["success"], true, "{queued}");
+    assert_eq!(queued["data"]["queue"], "steer", "{queued}");
+    assert!(
+        took < Duration::from_secs(2),
+        "the steer waited past gate::steer's 2 s: {took:?}"
+    );
+    answer.send(()).unwrap();
+    let end = rpi.next(|v| v["type"] == "tool_execution_end");
+    assert_eq!(end["isError"], true, "{end}");
+    rpi.next(|v| v["type"] == "agent_settled");
+    let seen = rpi.seen.lock().unwrap().clone();
+    assert!(seen.len() >= 2, "no second model request");
+    let messages = model_messages(&seen[1]);
+    let [.., result, note] = messages.as_slice() else {
+        panic!("{messages:?}");
+    };
+    assert_eq!(result["content"][0]["type"], "tool_result", "{result}");
+    assert_eq!(
+        result["content"][0]["tool_use_id"], "toolu_send",
+        "{result}"
+    );
+    assert_eq!(result["content"][0]["is_error"], true, "{result}");
+    assert_eq!(note["role"], "user", "{note}");
+    assert_eq!(note["content"][0]["text"], HELD, "{note}");
+}
+
+/// The round trip's other answer: `allow` lets the call run.
+#[test]
+#[ignore = "needs the pinned rpi binary; run with --ignored"]
+fn rpi_runs_a_bash_call_the_gate_allows() {
+    if !Path::new(RPI).exists() {
+        skip_without_rpi(RPI);
+        return;
+    }
+    let (mut rpi, gate) = GatewayRpi::start_gated("gate-allow", vec![send_turn()], "task-7");
+    let asked = serve_gate(gate, json!({"verdict": "allow"}), None);
+    rpi.until_call("bash", "toolu_send");
+    let req = asked
+        .recv_timeout(Duration::from_secs(20))
+        .expect(NEVER_ASKED);
+    assert_eq!(req["tool"], "bash", "{req}");
+    let end = rpi.next(|v| v["type"] == "tool_execution_end");
+    assert_ne!(end["isError"], true, "{end}");
+    assert!(
+        rpi.root.join("bin/himalaya.ran").exists(),
+        "the allowed send did not run: {end}"
     );
 }

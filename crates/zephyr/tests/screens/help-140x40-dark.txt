@@ -36,5 +36,5 @@
  │    /subagent model <name> <model|default>  change its model                                                                            │
  │    /subagent rm <name>         remove one                                                                                              │
  │    /process list               commands running in the background                                                                      │
- ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 1-32 of 89 ─╯
+ ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 1-32 of 91 ─╯
   ↑↓ choose · ⏎ insert · type to filter · esc close                                                                                 ctx 42%

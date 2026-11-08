@@ -17,6 +17,7 @@ zephyr-policy = { path = "../zephyr-policy" }
 rusqlite.workspace = true
 toml.workspace = true
 toml_edit = "0.25"
+unicode-normalization = "0.1"
 dialoguer = { version = "0.12", default-features = false, features = ["password"] }
 futures-util.workspace = true
 # native-tls, not rustls_backend: serenity 0.12.5's rustls path pins rustls-webpki 0.102, which has

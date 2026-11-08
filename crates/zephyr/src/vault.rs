@@ -504,7 +504,7 @@ pub fn scrub(text: &str, secrets: &[(String, String)]) -> String {
 /// The base64 text `value` always turns into, standard and URL-safe, wherever it sits in the
 /// encoded bytes (`user:value` puts it at another offset): at each of the three byte alignments,
 /// the characters that depend on `value` alone. A form shorter than 8 characters could be anything.
-fn base64_forms(value: &str) -> Vec<String> {
+pub(crate) fn base64_forms(value: &str) -> Vec<String> {
     use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
     use base64::Engine;
     let mut out = Vec::new();
@@ -875,9 +875,11 @@ async fn fill(cfg: &Config, login: &Entry, selectors: [Option<String>; 3]) -> St
 /// and after each field), normally well within the tool's wait.
 const BROWSER_WAIT: Duration = Duration::from_secs(20);
 
-/// `agent-browser ARGS` as the agent, as `exec` runs it: its stdout, or why it failed.
+/// `agent-browser ARGS` as the agent, as `exec` runs it: its stdout, or why it failed. The real
+/// binary, by full path (`cfg.agent_browser`): the daemon's own fill never goes through the
+/// approvals gate's wrapper that `agent-browser` on the agent's PATH is (approvals spec §4.4).
 async fn browser(cfg: &Config, args: &[&str]) -> Result<String, String> {
-    let mut cmd = tokio::process::Command::new("agent-browser");
+    let mut cmd = tokio::process::Command::new(&cfg.agent_browser);
     cmd.args(args)
         .current_dir(&cfg.home)
         .env("HOME", &cfg.home)

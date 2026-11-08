@@ -3,7 +3,9 @@
 use crate::channel::{Activity, Channel, Inbound, Outbound};
 use crate::config::{Account, Config, BUDGET_NOTICE};
 use crate::rpc::{message_text, Child, MAIN_SESSION};
+use crate::settings::{Actor, Apply, Outcome, Setting};
 use crate::store::{InboxRow, Store};
+use crate::tools::Decided;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -103,6 +105,8 @@ pub struct Snapshot {
     pub accounts: Vec<AccountState>,
     /// The soonest scheduled job runs, soonest first.
     pub jobs: Vec<NextJob>,
+    /// Proposals waiting for the owner's `/ok` or `/no`.
+    pub proposals: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -264,67 +268,32 @@ pub async fn run<C: Channel>(
     let (tx, rx) = mpsc::channel(64);
     let (attach_tx, attaches) = mpsc::channel(4);
     let jobs = crate::scheduler::Wake::default();
-    let shared = Arc::new(cfg.clone());
-    let (cfg_tx, cfg_rx) = watch::channel(shared.clone());
+    let (cfg_tx, cfg_rx) = watch::channel(Arc::new(cfg.clone()));
     let (snap, snap_rx) = watch::channel(Snapshot::default());
     let activity_rx = snap_rx.clone();
     let attach_cfgs = cfg_rx.clone();
-    let mut router = Router {
-        cfg: shared,
-        cfg_tx,
-        edits: edits(cfg),
-        secrets: crate::dotenv::read(&cfg.secrets_path()).unwrap_or_default(),
-        pending_model: None,
-        reexec: false,
-        auth_stamp: None,
-        logins: Vec::new(),
-        starting: Vec::new(),
-        btw: None,
-        store: Store::open(&cfg.db_path())?,
-        child: None,
-        busy: false,
-        resumes: 0,
-        backoff: FIRST_BACKOFF,
-        respawn_at: Instant::now(),
-        unrouted: HashSet::new(),
-        stuck: HashMap::new(),
-        tap: broadcast::channel(1024).0,
-        attaches,
-        jobs: &jobs,
-        auth_at: Instant::now(),
-        restart: false,
-        account: None,
-        tally: Default::default(),
-        snap,
-        names: channels.iter().map(|c| c.name().to_string()).collect(),
-        thinking: None,
-        context_window: None,
-        thinking_choice: None,
-        shown: 0,
-        steered: Vec::new(),
-        steered_texts: HashSet::new(),
-        steer_sent: Vec::new(),
-        steer_replied: false,
-        run_completed: false,
-        run_start: None,
-        last_event: Instant::now(),
-        note_pending: false,
-        cut: None,
-        cut_at: None,
-        spawn_failures: 0,
-        stopping: false,
-        procs: Default::default(),
-        compacting: None,
-    };
+    let (gate_cfgs, gate_snap) = (cfg_rx.clone(), snap_rx.clone());
+    let names = channels.iter().map(|c| c.name().to_string()).collect();
+    let mut router = Router::new(cfg, &jobs, attaches, cfg_tx, snap, names)?;
+    // The gate's held notes for main's run, steered in before the plugin is answered (R51).
+    let (gate_notes, notes_rx) = mpsc::channel(16);
+    router.gate_notes = Some(notes_rx);
+    router.keep_upgraded_install_as_it_was().await;
     // Commands a re-exec handed over alive are adopted; the rest a dead gateway left running
     // are reported, never re-run (DESIGN §4.13).
     router.procs.adopt(&router.cfg, &mut router.store)?;
+    // After the adoption, so an approved action whose command is still running stays running;
+    // a delay that came due while down waits for the owner (approvals spec §4.9).
+    crate::actions::restore(&router.cfg, &router.store, crate::now());
     for c in channels {
         c.live(cfg_rx.clone()); // owners for file downloads, kept current by reload
     }
+    let waits = router.waits.clone();
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
         r = runs => r.map(|_| Exit::Shutdown),
+        // Tasks' and jobs' sends, every connector call, the browser's clicks (approvals §4.2).
+        r = crate::gate::serve(gate_cfgs, gate_snap, waits, &jobs, gate_notes) => r.map(|()| Exit::Shutdown),
         r = crate::attach::serve(cfg, tx, attach_tx, snap_rx, attach_cfgs) => r.map(|()| Exit::Shutdown),
         r = crate::scheduler::run(cfg_rx.clone(), &jobs) => r.map(|()| Exit::Shutdown),
         r = crate::tasks::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),
@@ -484,6 +453,16 @@ struct Router<'a> {
     stopping: bool,
     /// The main agent's `exec` commands (DESIGN §4.13).
     procs: crate::procs::Procs,
+    /// Browser actions waiting in place for the owner's answer (approvals spec §4.4).
+    waits: crate::actions::Waits,
+    /// The last tick found the gateway paused: the next one holds what came due (I1).
+    due_held: bool,
+    /// The gate's held notes for main's run (R51), from `gate::serve`.
+    gate_notes: Option<mpsc::Receiver<GateNote>>,
+    /// Actions whose held note is in this run already, so the call's end steers it in no more.
+    held_steered: HashSet<i64>,
+    /// The newest note about an action main was woken for (R49).
+    action_woken: i64,
     /// The pooled account the child runs on (DESIGN §4.9). `None` without a pool.
     account: Option<Account>,
     /// What attached clients see; `publish` refreshes it, `tapped` keeps `run` current.
@@ -509,15 +488,60 @@ struct Router<'a> {
     steer_sent: Vec<String>,
     /// A steered message was answered mid-run: flush now, not at the settle.
     steer_replied: bool,
+    /// The latest thing the agent said in this run: the reason it gives for a setting change.
+    last_say: String,
     /// The run that just settled ended `completed`: only such a run's rows may be continued.
     /// Set by `settled` for the one `reconcile` that follows; never after an abort or a failure.
     run_completed: bool,
     /// A `/compact` is running: `(channel, sender)` of who asked, told its summary at the settle.
     compacting: Option<(String, String)>,
+    /// The agent's proposal the owner's `/ok` is running, so its setting change is logged as it.
+    approving: Option<i64>,
 }
 
 /// The reply to `/undo`, `/retry` and `/compact` while a run is going: they need the agent idle.
 const BUSY: &str = "[zephyr] the agent is busy: wait for its reply, or /stop it first";
+
+/// A reload that applied live: `/set` leaves it out of its reply.
+const APPLIED: &str = "[zephyr] applied";
+
+const SET_USAGE: &str = "[zephyr] usage: /set KEY VALUE [for 2h]; /settings lists the keys";
+
+const APPROVALS_USAGE: &str = "[zephyr] usage: /approvals, /approvals manual|semi|full|on|off \
+    [for 2h], /approvals messages|posts|money|facts MODE [for 2h]";
+
+const SUBAGENT_USAGE: &str = "usage: /subagent, /subagent add NAME [PROVIDER/MODEL] PROMPT, \
+    /subagent model NAME PROVIDER/MODEL|default, /subagent prompt NAME PROMPT, /subagent rm NAME";
+
+/// How a saved setting took effect: the reload's answer (or the command's own reply), and
+/// whether the reload failed, which leaves the file saved but the change not in effect.
+struct Reloaded {
+    text: String,
+    failed: bool,
+}
+
+impl Reloaded {
+    fn done(text: String) -> Self {
+        Self {
+            text,
+            failed: false,
+        }
+    }
+
+    fn failed(text: String) -> Self {
+        Self { text, failed: true }
+    }
+}
+
+/// A note the gate hands main's run (`Router::gate_note`): the session it is for, and the note.
+pub type GateNote = (String, crate::scheduler::Note);
+
+async fn next_gate_note(rx: &mut Option<mpsc::Receiver<GateNote>>) -> Option<GateNote> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
 
 async fn next_event(child: &mut Option<Child>) -> Option<Value> {
     match child {
@@ -527,6 +551,72 @@ async fn next_event(child: &mut Option<Child>) -> Option<Value> {
 }
 
 impl<'a> Router<'a> {
+    /// A router for `cfg` with no child yet. `cfg_tx` holds the config it starts on.
+    fn new(
+        cfg: &Config,
+        jobs: &'a crate::scheduler::Wake,
+        attaches: mpsc::Receiver<crate::attach::AttachRequest>,
+        cfg_tx: watch::Sender<Arc<Config>>,
+        snap: watch::Sender<Snapshot>,
+        names: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        let shared = cfg_tx.borrow().clone();
+        Ok(Router {
+            cfg: shared,
+            edits: edits(cfg),
+            secrets: crate::dotenv::read(&cfg.secrets_path()).unwrap_or_default(),
+            pending_model: None,
+            reexec: false,
+            auth_stamp: None,
+            logins: Vec::new(),
+            starting: Vec::new(),
+            btw: None,
+            store: Store::open(&cfg.db_path())?,
+            child: None,
+            busy: false,
+            resumes: 0,
+            backoff: FIRST_BACKOFF,
+            respawn_at: Instant::now(),
+            unrouted: HashSet::new(),
+            stuck: HashMap::new(),
+            tap: broadcast::channel(1024).0,
+            attaches,
+            jobs,
+            auth_at: Instant::now(),
+            restart: false,
+            account: None,
+            tally: Default::default(),
+            snap,
+            names,
+            thinking: None,
+            context_window: None,
+            thinking_choice: None,
+            shown: 0,
+            steered: Vec::new(),
+            steered_texts: HashSet::new(),
+            steer_sent: Vec::new(),
+            steer_replied: false,
+            last_say: String::new(),
+            run_completed: false,
+            run_start: None,
+            last_event: Instant::now(),
+            note_pending: false,
+            cut: None,
+            cut_at: None,
+            spawn_failures: 0,
+            stopping: false,
+            procs: Default::default(),
+            waits: Default::default(),
+            due_held: false,
+            gate_notes: None,
+            held_steered: HashSet::new(),
+            action_woken: 0,
+            compacting: None,
+            approving: None,
+            cfg_tx,
+        })
+    }
+
     async fn main<C: Channel>(
         &mut self,
         mut rx: mpsc::Receiver<Inbound>,
@@ -538,6 +628,8 @@ impl<'a> Router<'a> {
         let mut tick = tokio::time::interval(self.cfg.tick);
         let paused = |store: &Store| store.pause_reason().ok().flatten().is_some();
         let mut was_paused = paused(&self.store);
+        // Time limits that ended while the daemon was down, before anything is dispatched.
+        self.revert_due().await;
         self.publish();
         loop {
             tokio::select! {
@@ -547,6 +639,9 @@ impl<'a> Router<'a> {
                 }
                 Some(m) = rx.recv() => self.inbound(m, false).await,
                 Some(req) = self.attaches.recv() => self.attach(req).await,
+                Some((session, note)) = next_gate_note(&mut self.gate_notes) => {
+                    self.gate_note(&session, note).await
+                }
                 _ = self.jobs.outbox.notified() => {} // a job's output: flush below
                 // The `/btw` answer is in the outbox: flush below.
                 r = async { self.btw.as_mut().expect("guarded").await }, if self.btw.is_some() => {
@@ -568,7 +663,7 @@ impl<'a> Router<'a> {
                 _ = tokio::time::sleep_until(self.auth_at), if (self.child.is_some() || !self.cfg.accounts.is_empty()) && self.cfg.auth.enabled => {
                     self.auth_check().await
                 }
-                ev = next_event(&mut self.child) => match self.tapped(ev) {
+                ev = next_event(&mut self.child) => match self.tapped(ev).await {
                     Some(ev) if ev["type"] == "agent_settled" => self.settled(&ev).await,
                     Some(_) => {
                         self.cap_run().await;
@@ -593,6 +688,10 @@ impl<'a> Router<'a> {
                         let text = self.reload().await;
                         eprintln!("zephyr: zephyr.toml or secrets.env changed: {text}");
                     }
+                    self.revert_due().await;
+                    self.upgrade_notice();
+                    // Delays that came due, and held actions nobody answered (approvals §4.6).
+                    self.tick_actions();
                     // A budget pause ends at UTC midnight with nothing else to wake the router;
                     // a run in progress reconciles at its settle, a new child when it starts.
                     let ended = std::mem::replace(&mut was_paused, paused(&self.store));
@@ -619,19 +718,39 @@ impl<'a> Router<'a> {
         Ok(exit)
     }
 
-    fn tapped(&mut self, ev: Option<Value>) -> Option<Value> {
+    async fn tapped(&mut self, ev: Option<Value>) -> Option<Value> {
         if let Some(ev) = &ev {
             let _ = self.tap.send(ev.clone()); // no receivers is fine
             self.last_event = Instant::now();
             self.tally.add(ev);
-            if let Some(session) = self.child.as_ref().and_then(|c| c.session.as_deref()) {
+            let session = self.child.as_ref().and_then(|c| c.session.clone());
+            if let Some(session) = &session {
                 crate::scheduler::audit(&self.store, &self.cfg, session, ev);
+                // The plugin refused a call the gate held, showing the model no reason. The gate
+                // put the note in the run before it answered (R51); if that did not get through
+                // in time, it goes in now, once (approvals spec §4.2), as the guard's note does.
+                match crate::scheduler::held_note(&self.store, session, ev) {
+                    Some((id, note)) if self.held_steered.insert(id) => {
+                        self.steer_note(note).await;
+                    }
+                    _ => {}
+                }
             }
             self.track(ev);
+            match (ev["type"].as_str(), ev["message"]["role"].as_str()) {
+                (Some("agent_start"), _) => self.last_say.clear(),
+                (Some("message_end"), Some("assistant")) => {
+                    let say = message_text(&ev["message"]);
+                    if !say.trim().is_empty() {
+                        self.last_say = say;
+                    }
+                }
+                _ => {}
+            }
             self.steer_event(ev);
             if let Some((id, command)) = crate::tools::gateway_call(ev) {
                 // Off the list, the plugin has already refused the call: nobody waits for it.
-                if let Some(text) = self.gateway_reply(command) {
+                if let Some(text) = self.gateway_reply(command).await {
                     crate::tools::answer_gateway(&self.cfg, id, &text);
                 }
             }
@@ -653,8 +772,11 @@ impl<'a> Router<'a> {
                         ),
                     };
                     match (self.origin(), env) {
-                        (Some(to), Ok(env)) => {
-                            self.procs.start(&self.cfg, &self.store, id, call, to, env)
+                        (Some(to), Ok(mut env)) => {
+                            // What it runs asks the gate as main (the browser wrapper).
+                            let session = session.as_deref().unwrap_or_default();
+                            env.extend(crate::gate::agent_env(&self.cfg, session));
+                            self.exec(id, args, call, to, env)
                         }
                         (None, _) => {
                             crate::tools::answer_gateway(&self.cfg, id, "no owner; not run")
@@ -692,6 +814,87 @@ impl<'a> Router<'a> {
             Some(o) => Some((o.channel, o.sender)),
             None => self.store.last_owner().ok().flatten(),
         }
+    }
+
+    /// Main's `exec` call `id` once the veto and the vault passed: the gate decides it
+    /// (approvals spec §4.2 path 1). Allowed, it starts; held or refused, the call is answered
+    /// with the daemon's words and nothing starts. The gate sends the owner's card itself.
+    fn exec(
+        &self,
+        id: &str,
+        args: &Value,
+        call: zephyr_policy::tools::ExecCall,
+        to: (String, String),
+        env: Vec<(String, String)>,
+    ) {
+        use crate::gate::Verdict;
+        let session = self.child.as_ref().and_then(|c| c.session.clone());
+        let since = self.snap.borrow().run.since_unix_ms.unwrap_or_default();
+        let req = crate::gate::Request {
+            session: session.unwrap_or_default(),
+            call_id: Some(id.into()),
+            tool: "exec".into(),
+            args: args.clone(),
+            browser: None,
+            // R3: main's run key.
+            run: format!("main:{since}"),
+            // Cut to 200 by the gate, after its scrub: a cut here could split a value it hides.
+            reason: Some(self.last_say.clone()).filter(|r| !r.trim().is_empty()),
+        };
+        match crate::gate::decide(&self.cfg, &self.store, &req, to.clone(), crate::now()) {
+            Verdict::Allow => self.procs.start(&self.cfg, &self.store, id, call, to, env),
+            Verdict::Hold { text, .. } | Verdict::Deny(text) => {
+                crate::tools::answer_gateway(&self.cfg, id, &text)
+            }
+            // Only the browser wrapper's requests wait in place.
+            Verdict::Wait { id: n } => crate::tools::answer_gateway(
+                &self.cfg,
+                id,
+                &format!("not run: #{n} waits for the owner"),
+            ),
+        }
+    }
+
+    /// What the held actions' lifecycle needs from the router (`crate::actions`).
+    fn actions(&self) -> crate::actions::Ctx<'_> {
+        crate::actions::Ctx {
+            cfg: &self.cfg,
+            store: &self.store,
+            procs: &self.procs,
+            waits: &self.waits,
+            steers: &self.jobs.steers,
+        }
+    }
+
+    /// The owner's `/ok N [once]` on `channel` for held action `id` (`actions::approve`).
+    fn approve(&self, id: i64, once: bool, channel: &str) -> Result<String, String> {
+        let by = crate::actions::By::Owner { channel };
+        crate::actions::approve(&self.actions(), id, once, by, crate::now())
+    }
+
+    /// After a held action was settled: a waiting browser action whose action ended is denied,
+    /// and a new note for main (a decline, a cancel, an expiry, a pass) is dispatched as a report
+    /// is. Main is woken once per new note, not on every tick while one waits undelivered: each
+    /// wake moves its running command to the background (R49). Returns whether it woke main.
+    fn settled_actions(&mut self) -> bool {
+        self.waits.deny_settled(&self.store);
+        let newest = self.store.newest_action_row().unwrap_or(0);
+        if newest <= self.action_woken {
+            return false;
+        }
+        self.action_woken = newest;
+        self.jobs.inbox.notify_one();
+        true
+    }
+
+    /// The tick's part for held actions (`actions::tick`): `held` while the gateway is paused,
+    /// and on the first tick after a pause ended by itself, so nothing that came due meanwhile
+    /// goes late without the owner (I1).
+    fn tick_actions(&mut self) {
+        let paused = self.store.pause_reason().map_or(true, |p| p.is_some());
+        crate::actions::tick(&self.actions(), crate::now(), paused || self.due_held);
+        self.due_held = paused;
+        self.settled_actions();
     }
 
     /// The agent's `task` call (DESIGN §4.12), answered mid-turn. A started task reports back
@@ -777,27 +980,117 @@ impl<'a> Router<'a> {
     /// the plugin's check is the agent's side of the boundary, this is the daemon's. A read is
     /// the same text the owner would get; none restarts or queues anything mid-turn. An action is
     /// only stored, for the owner's `/ok`. `None`, and nothing run, for anything else.
-    fn gateway_reply(&self, command: &str) -> Option<String> {
+    async fn gateway_reply(&mut self, command: &str) -> Option<String> {
         use zephyr_policy::tools::Gateway;
         match zephyr_policy::tools::gateway_kind(command) {
             None => {
-                eprintln!("zephyr: gateway {command:?} is not on the list; not run");
+                // A malformed `/facts add` holds a value: never in the log.
+                let shown = crate::facts::redact(command);
+                eprintln!("zephyr: gateway {shown:?} is not on the list; not run");
                 return None;
+            }
+            // Subagents and rules are settings: proposed through `set_setting`, so the card and
+            // the owner's `/ok` check them by content (settings spec §4.4).
+            Some(Gateway::Propose)
+                if command.starts_with("/subagent ") || command.starts_with("/rule ") =>
+            {
+                return Some(self.agent_set(command).await)
+            }
+            Some(Gateway::Propose) if command.starts_with("/facts ") => {
+                return Some(self.agent_facts(command))
             }
             Some(Gateway::Propose) => {
                 return Some(crate::tools::propose_command(&self.store, command))
             }
+            Some(Gateway::Set) => return Some(self.agent_set(command).await),
             Some(Gateway::Read) => {}
         }
         Some(match command {
             "/status" => self.status(),
             "/model" => self.models(),
             "/switch" => self.list_sessions(),
+            "/facts" => (crate::facts::load(&crate::facts::path(&self.cfg)))
+                .map_or_else(|e| format!("{e:#}"), |f| crate::facts::names(&f)),
+            "/approvals" => format!("[zephyr] {}", crate::approvals::effective(&self.cfg).line()),
+            settings if settings.starts_with("/settings") => {
+                self.settings_listing(settings["/settings".len()..].trim())
+            }
             "/job list" => crate::scheduler::list(&self.store)
                 .unwrap_or_else(|e| format!("[zephyr] listing jobs failed: {e}")),
             memory => crate::memory::command(&self.cfg.home, self.cfg.state_dir(), memory)
-                .map_or_else(String::new, |(reply, _)| reply),
+                .unwrap_or_default(),
         })
+    }
+
+    /// The agent's `/facts …`: an `add` is saved at once (a new fact only makes calls stricter)
+    /// and the owner is told its name, never its value; `rm` and `allow` loosen the check, so
+    /// they are stored for the owner's `/ok` from a strong channel (`not_now`).
+    fn agent_facts(&mut self, command: &str) -> String {
+        let arg = command.strip_prefix("/facts ").unwrap_or_default();
+        let Some(add) = arg.strip_prefix("add ") else {
+            return crate::tools::propose_command(&self.store, command);
+        };
+        match crate::facts::agent_add(&crate::facts::path(&self.cfg), add) {
+            Ok(said) => {
+                let name = add.split(' ').next().unwrap_or_default();
+                self.tell_owner(&format!(
+                    "[zephyr] the agent saved a private fact named {name}; calls holding it \
+                     follow approvals.facts. /facts lists the facts, /facts rm {name} removes it"
+                ));
+                said
+            }
+            Err(why) => format!("refused: {why}"),
+        }
+    }
+
+    /// The agent's `/set KEY VALUE [for D]`, `/subagent …` and `/rule …`: through `set_setting`
+    /// as the agent, which applies a tightening at once and stores everything else for the
+    /// owner. The reason is what the agent said last in this run.
+    async fn agent_set(&mut self, command: &str) -> String {
+        let (cmd, arg) = command.split_once(' ').unwrap_or((command, ""));
+        let (key, raw, until) = match cmd {
+            "/set" => match crate::settings::set_args(arg) {
+                Some(parts) => parts,
+                None => return "refused: usage /set KEY VALUE [for D]".into(),
+            },
+            // `/rule rm 2` and `/subagent add …` are the list settings' own values, shown whole
+            // on the owner's card.
+            _ if command.chars().count() > zephyr_policy::tools::CARD_CHARS => {
+                return format!(
+                    "refused: the text is longer than the owner's card shows ({} characters)",
+                    zephyr_policy::tools::CARD_CHARS
+                )
+            }
+            other => (other.trim_start_matches('/'), arg, None),
+        };
+        let until = match until
+            .map(|d| crate::settings::parse_until(d, self.cfg.min_until))
+            .transpose()
+        {
+            Ok(until) => until,
+            Err(e) => return format!("refused: {e}"),
+        };
+        let session = self.child.as_ref().and_then(|c| c.session.clone());
+        let session = session.unwrap_or_default();
+        let reason = self.last_say.clone();
+        let reason = (!reason.is_empty()).then_some(reason);
+        let actor = Actor::Agent { session: &session };
+        match self
+            .set_setting(key, raw, actor, until, reason.as_deref())
+            .await
+        {
+            Outcome::Changed { old, new, .. } => {
+                let (old, new) = (
+                    crate::settings::shown(old.as_deref()),
+                    crate::settings::shown(new.as_deref()),
+                );
+                format!("changed {key} {old} → {new}")
+            }
+            Outcome::Proposed { id } => {
+                format!("proposed as #{id}; it runs only if the owner approves with /ok {id}")
+            }
+            Outcome::Refused(why) => format!("refused: {why}"),
+        }
     }
 
     /// Keeps `Snapshot.run` in step with the child's run events. The origin comes from
@@ -883,6 +1176,7 @@ impl<'a> Router<'a> {
         self.steered.clear();
         self.steered_texts.clear();
         self.steer_sent.clear();
+        self.held_steered.clear();
     }
 
     /// Rebuilds the snapshot from the store and config, keeping `run`. Pushed only on change.
@@ -950,6 +1244,7 @@ impl<'a> Router<'a> {
                         }
                     })
                     .collect(),
+                proposals: self.store.pending_proposals()?.len() as u32,
                 jobs: {
                     let tz = crate::scheduler::zone(&self.cfg)?;
                     let mut jobs: Vec<NextJob> = (self.store.jobs()?.into_iter())
@@ -994,7 +1289,232 @@ impl<'a> Router<'a> {
                     vec![]
                 }));
             }
+            AttachRequest::Settings(tx) => {
+                let _ = tx.send(self.settings_json());
+            }
+            AttachRequest::SettingsSet {
+                key,
+                value,
+                until,
+                reply,
+            } => {
+                let _ = reply.send(self.settings_set(&key, &value, until.as_deref()).await);
+                self.publish();
+            }
+            AttachRequest::Proposals(tx) => {
+                let _ = tx.send(self.proposals_json());
+            }
+            AttachRequest::Decide { id, verb, reply } => {
+                let _ = reply.send(self.decide(id, &verb).await);
+                self.publish();
+            }
         }
+    }
+
+    /// `zephyr.settings`: every setting by section, as `/settings` shows them.
+    fn settings_json(&self) -> Value {
+        let mut names: Vec<&str> = vec![];
+        for s in crate::settings::SETTINGS {
+            if !names.contains(&s.section) {
+                names.push(s.section);
+            }
+        }
+        let strong = &self.cfg.settings.strong_channels;
+        // `semi (modified)` (approvals spec §4.3): a hand-set class differs from the preset.
+        let modified = crate::approvals::effective(&self.cfg).modified;
+        let sections: Vec<Value> = (names.into_iter())
+            .map(|name| {
+                let settings: Vec<Value> = (crate::settings::SETTINGS.iter())
+                    .filter(|s| s.section == name)
+                    .flat_map(|s| {
+                        self.setting_rows(s).into_iter().map(move |r| {
+                            let until = self.store.revert(&r.key).ok().flatten().map(|v| v.at);
+                            json!({
+                                "key": r.key,
+                                "label": crate::settings::label(s, &r.key),
+                                "help": s.help,
+                                "kind": crate::settings::kind_json(&s.kind),
+                                "value": self.shown(&r.key),
+                                "source": r.source,
+                                "access": crate::settings::access_name(s),
+                                "strong": s.strong,
+                                "until": until,
+                                "modified": modified && r.key == "approvals.preset",
+                            })
+                        })
+                    })
+                    .collect();
+                json!({"name": name, "settings": settings})
+            })
+            .collect();
+        json!({"sections": sections, "strong_channels": strong})
+    }
+
+    /// `zephyr.settings_set`: `/set KEY VALUE [for D]` as the owner on the TUI, answered as data.
+    async fn settings_set(&mut self, key: &str, value: &str, until: Option<&str>) -> Value {
+        let refused = |why: String| json!({"outcome": "refused", "reason": why});
+        if key == "facts" {
+            return refused("change private facts with /facts".into());
+        }
+        if matches!(key, "subagent" | "rule") {
+            return refused("change subagents with /subagent and rules with /rule".into());
+        }
+        let min = self.cfg.min_until;
+        let until = match until
+            .map(|d| crate::settings::parse_until(d, min))
+            .transpose()
+        {
+            Ok(until) => until,
+            Err(e) => return refused(e),
+        };
+        let owner = Actor::Owner {
+            channel: crate::attach::CHANNEL,
+        };
+        match self.set_setting(key, value, owner, until, None).await {
+            Outcome::Changed { old, new, applied } => {
+                let at = until
+                    .and(self.store.revert(key).ok().flatten())
+                    .map(|r| r.at);
+                json!({"outcome": "changed", "key": key, "old": old, "new": new,
+                       "applied": applied, "until": at})
+            }
+            Outcome::Proposed { id } => json!({"outcome": "proposed", "id": id}),
+            Outcome::Refused(why) => refused(why),
+        }
+    }
+
+    /// `zephyr.proposals`: what waits for the owner, newest first. A held action carries its
+    /// class, its summary and the card the chat was sent, in the gate's words (`gate::card`);
+    /// `once` says whether `/ok N once` differs from `/ok N` for it now (its class asks only
+    /// about new targets), and `strong` whether only a strong channel may approve it.
+    fn proposals_json(&self) -> Value {
+        let now = crate::now();
+        let list = self.store.pending_proposals().unwrap_or_else(|e| {
+            eprintln!("zephyr: reading proposals failed: {e}");
+            vec![]
+        });
+        let e = crate::approvals::effective(&self.cfg);
+        let money_strong = (crate::approvals::strong_only(&self.cfg).iter()).any(|s| s == "money");
+        let proposals: Vec<Value> = (list.into_iter())
+            .map(|p| {
+                // An action's stored summary, until its card is read below (R70).
+                let card = match p.kind.as_str() {
+                    "command" => p.command.clone(),
+                    _ => crate::facts::scrubbed(&self.cfg, p.command.clone()),
+                };
+                let mut v = json!({
+                    "id": p.id,
+                    "card": card,
+                    "kind": if p.kind != "command" {
+                        p.kind.as_str()
+                    } else if p.key.is_some() {
+                        "setting"
+                    } else {
+                        "command"
+                    },
+                    "status": p.status,
+                    "due_at": p.due_at,
+                    "key": p.key,
+                    "age_secs": (now - p.created_at).max(0),
+                    "expires_in_secs": (p.created_at + 86_400 - now).max(0),
+                    "strong": p.strong,
+                });
+                let action = (p.kind != "command")
+                    .then(|| self.store.action(p.id).ok().flatten())
+                    .flatten();
+                if let Some(a) = action {
+                    // A browser action waits 10 minutes, not a day (spec §4.6).
+                    if a.kind == crate::store::ActionKind::Wait {
+                        let wait = 60 * i64::from(crate::gate::WAIT_MINUTES);
+                        v["expires_in_secs"] = json!((a.created_at + wait - now).max(0));
+                    }
+                    v["card"] = json!(crate::gate::card(&a, &self.cfg, &self.store));
+                    // R70: the summary as the private facts are now.
+                    v["summary"] = json!(crate::facts::scrubbed(&self.cfg, a.summary.clone()));
+                    v["strong"] = json!(a.class == "money" && money_strong);
+                    v["once"] = json!(crate::gate::asks_new(&e, &a.class));
+                    v["class"] = json!(a.class);
+                }
+                v
+            })
+            .collect();
+        json!({"proposals": proposals})
+    }
+
+    /// `zephyr.decide`: `/ok N`, `/no N` or `/cancel N` from the TUI, through the checks the chat
+    /// commands make (stale, strong channel). `once` is `ok` for a setting.
+    async fn decide(&mut self, id: i64, verb: &str) -> Value {
+        if verb == "cancel" {
+            let done = crate::actions::cancel(&self.cfg, &self.store, &self.waits, &id.to_string());
+            self.settled_actions();
+            let (ok, text) = match done {
+                Ok(text) => (true, text),
+                Err(text) => (false, text),
+            };
+            return json!({"ok": ok, "text": text});
+        }
+        let text = match verb {
+            "no" => format!("/no {id}"),
+            "once" => format!("/ok {id} once"),
+            _ => format!("/ok {id}"),
+        };
+        let m = Inbound {
+            channel: crate::attach::CHANNEL.into(),
+            platform_msg_id: String::new(),
+            sender: "token".into(),
+            text: text.clone(),
+        };
+        let mut approving = None;
+        let decided = crate::tools::decide(&self.cfg, &self.store, &text, |p| {
+            approving = Some(p.id);
+            self.not_now(p, &m.channel)
+        });
+        let (ok, reply) = match decided {
+            Some(Ok(Decided::Action { id, once })) => {
+                let done = self.approve(id, once, &m.channel);
+                self.settled_actions();
+                match done {
+                    Ok(reply) => (true, reply),
+                    Err(reply) => (false, reply),
+                }
+            }
+            Some(Ok(Decided::Command(command))) => {
+                self.approving = approving;
+                let run = Inbound {
+                    text: command.clone(),
+                    ..m.clone()
+                };
+                let reply = self.owner_command(&command, &run).await;
+                self.approving = None;
+                let reply = reply.unwrap_or_default();
+                self.restart_if_idle().await;
+                (true, format!("[zephyr] {text} approved {command}\n{reply}"))
+            }
+            Some(Err(reply)) => {
+                self.settled_actions();
+                (reply.starts_with("[zephyr] dropped #"), reply)
+            }
+            None => (false, format!("[zephyr] {text} is not a decision")),
+        };
+        json!({"ok": ok, "text": reply.trim_end()})
+    }
+
+    /// An approved or typed command that the daemon answers itself; `None` is a message for the agent.
+    async fn owner_command(&mut self, text: &str, m: &Inbound) -> Option<String> {
+        if let Some(reply) = crate::memory::command(&self.cfg.home, self.cfg.state_dir(), text) {
+            return Some(reply);
+        }
+        if let Some(reply) = crate::scheduler::command(&mut self.store, &self.cfg, m) {
+            self.jobs.runs.notify_one();
+            return Some(reply);
+        }
+        if let Some(reply) = self.command(text, (&m.channel, &m.sender)).await {
+            return Some(reply);
+        }
+        if matches!(text, "/stop" | "/pause" | "/resume") {
+            return Some(self.control(text).await);
+        }
+        None
     }
 
     /// `zephyr.dequeue` (DESIGN §4.1): the attached client's messages rpi has not been sent yet,
@@ -1137,32 +1657,39 @@ impl<'a> Router<'a> {
         if after {
             log(self.store.deliver_after(id).map_err(Into::into));
         }
-        let decided = crate::tools::decide(&self.store, m.text.trim());
-        // An approved proposal runs exactly as if the owner had typed it.
+        let mut approving = None;
+        let decided = crate::tools::decide(&self.cfg, &self.store, m.text.trim(), |p| {
+            approving = Some(p.id);
+            self.not_now(p, &m.channel)
+        });
+        // A held action is carried out here, its answer the whole reply.
+        let decided = decided.map(|d| match d {
+            Ok(Decided::Command(command)) => Ok(command),
+            Ok(Decided::Action { id, once }) => {
+                Err(self.approve(id, once, &m.channel).unwrap_or_else(|e| e))
+            }
+            Err(reply) => Err(reply),
+        });
+        if decided.is_some() {
+            self.settled_actions();
+        }
+        // An approved proposal runs exactly as if the owner had typed it, logged as the agent's.
+        self.approving = approving.filter(|_| matches!(decided, Some(Ok(_))));
         let text = match &decided {
             Some(Ok(command)) => command.as_str(),
             _ => m.text.trim(),
         };
         let reply = if let Some(Err(reply)) = &decided {
             reply.clone()
-        } else if let Some((reply, rules_changed)) =
-            crate::memory::command(&self.cfg.home, self.cfg.state_dir(), text)
-        {
-            // rpi reads AGENTS.md once, at start: a fresh child on the same session loads the rules.
-            self.restart |= rules_changed;
+        } else if let Some(reply) = self.owner_command(text, &m).await {
             reply
-        } else if let Some(reply) = crate::scheduler::command(&mut self.store, &self.cfg, &m) {
-            self.jobs.runs.notify_one();
-            reply
-        } else if let Some(reply) = self.command(text, (&m.channel, &m.sender)).await {
-            reply
-        } else if matches!(text, "/stop" | "/pause" | "/resume") {
-            self.control(text).await
         } else {
+            self.approving = None;
             // The owner spoke: a command still in the turn moves to the background (DESIGN §4.13).
             self.procs.yield_all();
             return log(self.dispatch_new().await);
         };
+        self.approving = None;
         // What `/ok N` ran, in the daemon's words: the agent's request may have said otherwise.
         let reply = match &decided {
             Some(Ok(command)) => format!("[zephyr] {} approved {command}\n{reply}", m.text.trim()),
@@ -1256,6 +1783,11 @@ impl<'a> Router<'a> {
                 "[zephyr] paused: messages wait in the inbox until /resume"
             }
             "/resume" => {
+                // What came due during the pause waits for the owner, before a tick runs it.
+                if self.store.pause_reason().ok().flatten().is_some() {
+                    crate::actions::resume(&self.cfg, &self.store, crate::now());
+                    self.due_held = false;
+                }
                 log(self.store.set_paused(None).map_err(Into::into));
                 return "[zephyr] resumed".into();
             }
@@ -1263,7 +1795,10 @@ impl<'a> Router<'a> {
                 self.abort().await;
                 // Background tasks too (DESIGN §4.12); each still reports back as stopped.
                 crate::tasks::stop(&mut self.store, self.jobs, None);
+                // Approved actions running are `procs` commands; held ones stay held, and
+                // delayed ones wait for the owner again (R47).
                 self.procs.stop_all();
+                crate::actions::stop(&self.cfg, &self.store, &self.waits);
                 "[zephyr] stopped"
             }
         };
@@ -1404,7 +1939,14 @@ impl<'a> Router<'a> {
         // The agent's files and proposed jobs, after the reply they belong to.
         crate::tools::apply(&self.store, &self.cfg, &tally.requests, to.clone());
         // After the reply, so the owner reads what was sent out next to what it was for.
-        let mut notices: Vec<String> = [cut, tally.alert(), memory].into_iter().flatten().collect();
+        let mut notices: Vec<String> = [
+            cut,
+            tally.alert().map(|a| crate::facts::scrubbed(&self.cfg, a)),
+            memory,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         // Skill and connector drafts the run wrote, each shown once (DESIGN §4.6).
         notices.extend(crate::drafts::scan(&self.cfg));
         if crossed {
@@ -1462,8 +2004,22 @@ impl<'a> Router<'a> {
             ("/reload", "") => self.reload().await,
             ("/status", "") => self.status(),
             ("/model", "") => self.models(),
-            ("/model", model) => self.switch_model(model).await,
-            ("/thinking", level) => self.thinking_level(level).await,
+            ("/model", model) => self.owner_set("model", model, from.0, |a| a).await,
+            ("/thinking", level) => self.thinking_level(level, from.0).await,
+            ("/set", arg) => self.set_command(arg, from.0).await,
+            ("/settings", arg) => self.settings_listing(arg),
+            ("/approvals", arg) => self.approvals(arg, from.0).await,
+            // Held messages, posts and payments (approvals spec §4.6).
+            ("/held", "") => crate::actions::held(&self.cfg, &self.store),
+            ("/cancel", n) => {
+                let reply = crate::actions::cancel(&self.cfg, &self.store, &self.waits, n);
+                self.settled_actions();
+                reply.unwrap_or_else(|refused| refused)
+            }
+            // `/rule` alone and `/rules` are `memory::command`'s.
+            ("/rule", rule) if !rule.is_empty() => {
+                self.owner_set("rule", rule, from.0, |a| a).await
+            }
             ("/new" | "/clear", "") => self.new_session().await,
             ("/switch", "") => self.list_sessions(),
             ("/switch", id) => self.switch(id).await,
@@ -1489,32 +2045,24 @@ impl<'a> Router<'a> {
                     crate::tasks::stop(&mut self.store, self.jobs, id)
                 }
                 ("parallel", n) if n.parse::<usize>().is_ok() => {
-                    let set = |doc: &mut toml_edit::DocumentMut| {
-                        crate::host::conf::set(doc, "tasks.parallel", n)
-                    };
-                    let done = format!("up to {n} tasks run at once");
-                    self.edit_tasks(None, set, done).await
+                    let done = |a| format!("[zephyr] up to {n} tasks run at once\n{a}");
+                    self.owner_set("tasks.parallel", n, from.0, done).await
                 }
                 ("model", m) if !m.is_empty() && word(m).1.is_empty() => {
-                    let set = |doc: &mut toml_edit::DocumentMut| match m {
-                        "default" => {
-                            let tasks = doc.get_mut("tasks").and_then(|t| t.as_table_like_mut());
-                            tasks.map(|t| t.remove("model"));
-                            Ok(())
-                        }
-                        m => crate::host::conf::set(doc, "tasks.model", &format!("{m:?}")),
+                    let done = |a| match m {
+                        "default" => format!("[zephyr] tasks run on the account's own model\n{a}"),
+                        m => format!("[zephyr] tasks run on {m} unless they name a model\n{a}"),
                     };
-                    let done = match m {
-                        "default" => "tasks run on the account's own model".into(),
-                        m => format!("tasks run on {m} unless they name a model"),
-                    };
-                    self.edit_tasks(Some(m), set, done).await
+                    self.owner_set("tasks.model", m, from.0, done).await
                 }
                 _ => "[zephyr] usage: /task list, /task stop <id>, /task parallel <1-32>, \
                       /task model PROVIDER/MODEL|default"
                     .into(),
             },
-            ("/subagent", arg) => self.subagent(arg).await,
+            ("/subagent", arg) => match word(arg) {
+                ("" | "list", "") => format!("[zephyr] {}", crate::tasks::settings(&self.cfg)),
+                _ => self.owner_set("subagent", arg, from.0, |a| a).await,
+            },
             ("/undo", n) => match if n.is_empty() { Ok(1) } else { n.parse() } {
                 Ok(n @ 1..=20) => match self.undo(n).await {
                     Ok(_) if n == 1 => "[zephyr] undone: the agent no longer sees your last \
@@ -1542,6 +2090,16 @@ impl<'a> Router<'a> {
             }
             // The owner's credentials (DESIGN §4.15); also an approved `/vault grant` proposal.
             ("/vault", arg) => crate::vault::command(&crate::vault::path(&self.cfg), arg),
+            // The owner's private facts (approvals spec §4.5): names only, never a value.
+            ("/facts", arg) => {
+                let strong = self
+                    .cfg
+                    .settings
+                    .strong_channels
+                    .iter()
+                    .any(|c| c == from.0);
+                crate::facts::command(&crate::facts::path(&self.cfg), arg, strong)
+            }
             // Skills and connectors the agent drafted (DESIGN §4.6).
             ("/skills" | "/skill" | "/mcp", _) => {
                 use crate::drafts::After;
@@ -1560,18 +2118,15 @@ impl<'a> Router<'a> {
         })
     }
 
-    /// `/subagent [add|model|prompt|rm ...]`: the owner's named subagents (DESIGN §4.12). Never
-    /// through the agent's `gateway`: what a subagent is told is the owner's to write.
-    async fn subagent(&mut self, arg: &str) -> String {
+    /// `/subagent add|model|prompt|rm ...`: a change to the owner's named subagents (DESIGN
+    /// §4.12), through `set_setting`. The reply, or why nothing changed.
+    async fn subagent(&mut self, arg: &str) -> Result<Reloaded, String> {
         use crate::host::conf::{remove_subagent, set_subagent};
         type Doc = toml_edit::DocumentMut;
         let (sub, rest) = word(arg);
         let (name, rest) = word(rest);
         let name = name.to_string();
-        match (sub, name.as_str(), rest) {
-            ("" | "list", "", "") => {
-                format!("[zephyr] {}", crate::tasks::settings(&self.cfg))
-            }
+        let (done, applied) = match (sub, name.as_str(), rest) {
             ("add", n, rest) if !n.is_empty() && !rest.is_empty() => {
                 // The second word is a model when it has a '/'; the rest is the prompt.
                 let (model, prompt) = match word(rest) {
@@ -1579,25 +2134,25 @@ impl<'a> Router<'a> {
                     _ => (None, rest),
                 };
                 if self.cfg.subagents.iter().any(|s| s.name == name) {
-                    return format!(
-                        "[zephyr] there is a subagent named {name} already; change it with \
+                    return Err(format!(
+                        "there is a subagent named {name} already; change it with \
                          /subagent model {name} ... or /subagent prompt {name} ..., or remove it \
                          with /subagent rm {name}"
-                    );
+                    ));
                 }
                 let set = |doc: &mut Doc| set_subagent(doc, &name, true, model, Some(prompt));
                 let done = format!("added the subagent {name}");
-                self.edit_tasks(model, set, done).await
+                (done, self.edit_config(model, set).await)
             }
             ("model", n, m) if !n.is_empty() && !m.is_empty() && word(m).1.is_empty() => {
                 let set = |doc: &mut Doc| set_subagent(doc, &name, false, Some(m), None);
                 let done = format!("subagent {name} runs on {m}");
-                self.edit_tasks(Some(m), set, done).await
+                (done, self.edit_config(Some(m), set).await)
             }
             ("prompt", n, prompt) if !n.is_empty() && !prompt.is_empty() => {
                 let set = |doc: &mut Doc| set_subagent(doc, &name, false, None, Some(prompt));
                 let done = format!("changed the prompt of subagent {name}");
-                self.edit_tasks(None, set, done).await
+                (done, self.edit_config(None, set).await)
             }
             ("rm", n, "") if !n.is_empty() => {
                 let rm = |doc: &mut Doc| match remove_subagent(doc, &name) {
@@ -1605,51 +2160,614 @@ impl<'a> Router<'a> {
                     false => Err(anyhow::anyhow!("no subagent named {name}")),
                 };
                 let done = format!("removed the subagent {name}");
-                self.edit_tasks(None, rm, done).await
+                (done, self.edit_config(None, rm).await)
             }
-            _ => "[zephyr] usage: /subagent, /subagent add NAME [PROVIDER/MODEL] PROMPT, \
-                  /subagent model NAME PROVIDER/MODEL|default, /subagent prompt NAME PROMPT, \
-                  /subagent rm NAME"
-                .into(),
-        }
+            _ => return Err(SUBAGENT_USAGE.into()),
+        };
+        let applied = applied?;
+        Ok(Reloaded {
+            text: format!("[zephyr] {done}\n{}", applied.text),
+            failed: applied.failed,
+        })
     }
 
-    /// The owner's `/subagent` and `/task parallel|model` edits: checks `model` (unless
-    /// `default`) as `/model` does, saves `zephyr.toml` only if it still loads, then reloads.
-    async fn edit_tasks(
+    /// Edits `zephyr.toml` for the owner: checks `model` (unless `default`) as `/model` does,
+    /// saves the file only if it still loads, then reloads. How the reload went, or why nothing
+    /// changed.
+    async fn edit_config(
         &mut self,
         model: Option<&str>,
         edit: impl FnOnce(&mut toml_edit::DocumentMut) -> anyhow::Result<()>,
-        done: String,
-    ) -> String {
+    ) -> Result<Reloaded, String> {
         let Some(path) = self.cfg.path.clone() else {
-            return "[zephyr] no zephyr.toml to change".into();
+            return Err("no zephyr.toml to change".into());
         };
         if let Some(m) = model.filter(|m| *m != "default") {
-            if !zephyr_policy::tools::model_shape(m) {
-                return format!("[zephyr] not changed: {m} is not PROVIDER/MODEL");
-            }
-            let provider = m.split('/').next().unwrap_or_default();
-            let cfg = self.cfg.clone();
-            let account = cfg.accounts.iter().find(|a| a.provider() == provider);
-            if !cfg.accounts.is_empty() && account.is_none() {
-                return format!(
-                    "[zephyr] not changed: no account is signed in to {provider}; run `zephyr \
-                     login {provider}`"
-                );
-            }
-            if !lists(&cfg, account, m).await {
-                return format!("[zephyr] rpi has no model {m}");
-            }
+            check_model(&self.cfg, m).await?;
         }
-        let saved = crate::host::conf::update(&path, |doc| {
+        crate::host::conf::update(&path, |doc| {
             edit(doc)?;
             toml::from_str::<Config>(&doc.to_string())?.validate()
-        });
-        match saved {
-            Ok(()) => format!("[zephyr] {done}\n{}", self.reload().await),
-            Err(e) => format!("[zephyr] not changed: {e:#}"),
+        })
+        .map_err(|e| format!("not changed: {e:#}"))?;
+        Ok(self.reloaded().await)
+    }
+
+    /// Approvals spec §4.10: an install made before the gate keeps today's behaviour. The first
+    /// start after the v16 migration of an existing `state.db`, with no `[approvals]` table in
+    /// `zephyr.toml`, writes `preset = "full"` (logged like any change) and tells the owner once.
+    /// The mark is cleared once dealt with; if the file cannot be written it stays for the next
+    /// start.
+    async fn keep_upgraded_install_as_it_was(&mut self) {
+        let Some(from) = self.store.upgraded_from() else {
+            return;
+        };
+        if self.cfg.approvals.is_none() && self.cfg.path.is_some() {
+            let write = |doc: &mut toml_edit::DocumentMut| {
+                crate::settings::write(doc, "approvals.preset", Some(&"full".into()))?;
+                let value = (doc.get_mut("approvals"))
+                    .and_then(|a| a.get_mut("preset"))
+                    .and_then(|v| v.as_value_mut());
+                if let Some(v) = value {
+                    v.decor_mut()
+                        .set_suffix(" # kept as before 0.7; /approvals manual turns approvals on");
+                }
+                Ok(())
+            };
+            if let Err(why) = self.edit_config(None, write).await {
+                return eprintln!("zephyr: upgrade from schema {from}: {why}");
+            }
+            let logged = self.store.log_setting(
+                "approvals.preset",
+                Some("manual"),
+                Some("full"),
+                "zephyr",
+                None,
+                None,
+            );
+            log(logged.map_err(Into::into));
+            log(self
+                .store
+                .set_upgrade_notice_pending(true)
+                .map_err(Into::into));
         }
+        log(self.store.clear_upgraded().map_err(Into::into));
+        self.upgrade_notice();
+    }
+
+    /// The once-only notice that an upgrade kept approvals off. It waits, across restarts, until
+    /// there is an owner to tell (an install whose agent has only run jobs has none yet).
+    fn upgrade_notice(&self) {
+        if !self.store.upgrade_notice_pending() || self.store.last_owner().ok().flatten().is_none()
+        {
+            return;
+        }
+        let told = self.store.notify_last_owner(
+            "[zephyr] approvals are off, as before this version; \
+             /approvals manual or /settings turns them on",
+        );
+        match told {
+            Ok(()) => log(self
+                .store
+                .set_upgrade_notice_pending(false)
+                .map_err(Into::into)),
+            Err(e) => log(Err(e.into())),
+        }
+    }
+
+    /// The one way a setting changes (settings spec §4.3), whoever asks: the key is looked up,
+    /// `raw` checked against its kind, the change decided (an owner on a channel that is not
+    /// strong cannot loosen a strong setting; the agent tightens at once and proposes anything
+    /// else), applied, logged and, with `until`, given its revert. `reason` is the agent's,
+    /// quoted on the owner's notice or card.
+    async fn set_setting(
+        &mut self,
+        key: &str,
+        raw: &str,
+        actor: Actor<'_>,
+        until: Option<Duration>,
+        reason: Option<&str>,
+    ) -> Outcome {
+        use crate::settings::{self as reg, Kind, Verdict};
+        let Some(s) = reg::find(key) else {
+            return Outcome::Refused(format!("no setting {key}; /settings lists them"));
+        };
+        if s.apply == Apply::Facts {
+            return Outcome::Refused("change private facts with /facts".into());
+        }
+        let (raw, list) = (raw.trim(), matches!(s.apply, Apply::Subagent | Apply::Rule));
+        if until.is_some() && list {
+            return Outcome::Refused(format!("a change to {key} cannot be timed"));
+        }
+        let (old, seen) = (self.shown(key), self.current(s, key));
+        // The end of a timed preset puts back the whole `[approvals]` it replaced, which its
+        // revert holds (`approvals::snapshot`); nobody else writes one.
+        let restore = (s.apply == Apply::Preset && actor == Actor::Internal).then_some(raw);
+        // `None` clears the key. A thinking level, a subagent or a rule is checked as it applies.
+        let value = match s.apply {
+            Apply::Preset if restore.is_some() => None,
+            Apply::Toml | Apply::Model | Apply::Preset if !reg::clears(s, raw) => {
+                match reg::parse(s, raw) {
+                    Ok(v) => Some(v),
+                    Err(e) if s.apply == Apply::Model => {
+                        return Outcome::Refused(format!("model not changed: {e}"))
+                    }
+                    Err(e) => return Outcome::Refused(format!("not changed: {e}")),
+                }
+            }
+            _ => None,
+        };
+        let new = match (&value, s.apply) {
+            (Some(v), _) => Some(reg::text(v)),
+            // An approval class cleared follows the preset.
+            (None, Apply::Toml) => reg::cleared(&self.cfg, key),
+            (None, Apply::Preset) => raw.split(';').next().map(|p| p.trim().to_string()),
+            (None, _) => Some(raw.to_string()),
+        };
+        let loosens = reg::loosens(s, old.as_deref(), new.as_deref());
+        let strong = self.cfg.settings.strong_channels.clone();
+        match reg::decide(s, &actor, loosens, &strong) {
+            Verdict::Apply => {}
+            Verdict::Refuse(why) => {
+                if let (Actor::Owner { channel }, true) = (actor, s.strong && loosens) {
+                    let (old, new) = (old.as_deref(), new.as_deref());
+                    let refused =
+                        self.store
+                            .log_setting(key, old, new, "refused", Some(channel), None);
+                    log(refused.map_err(Into::into));
+                }
+                // The key asked for, not the entry it shares (`mcp.<name>.classes.<tool>`).
+                return Outcome::Refused(why.replace(s.key, key));
+            }
+            Verdict::Propose => {
+                let span = until.map(reg::span);
+                let command = match s.apply {
+                    Apply::Subagent => format!("/subagent {raw}"),
+                    Apply::Rule => format!("/rule {raw}"),
+                    _ => {
+                        let span = span.as_ref().map_or(String::new(), |d| format!(" for {d}"));
+                        format!("/set {key} {raw}{span}")
+                    }
+                };
+                let needs = s.strong && loosens;
+                let id = match self
+                    .store
+                    .propose_setting(&command, key, seen.as_deref(), needs)
+                {
+                    Ok(id) => id,
+                    Err(e) => return Outcome::Refused(format!("proposing {command} failed: {e}")),
+                };
+                let what = match list {
+                    true => command,
+                    false => format!(
+                        "{key} {} → {}",
+                        reg::shown(old.as_deref()),
+                        reg::shown(new.as_deref())
+                    ),
+                };
+                let needs = needs.then(|| strong.join(" or "));
+                let card = reg::card(id, &what, span.as_deref(), reason, needs.as_deref());
+                self.tell_owner(&card);
+                return Outcome::Proposed { id };
+            }
+        }
+        // What a time limit on a preset goes back to: all of `[approvals]` before the change.
+        let mut before = None;
+        // R31: the class time limits an owner's preset ends, as it changes or clears them.
+        let mut ended: Vec<String> = Vec::new();
+        let applied = match s.apply {
+            Apply::Toml => {
+                let model =
+                    matches!(s.kind, Kind::Model | Kind::Optional(Kind::Model)) && value.is_some();
+                let write = |doc: &mut toml_edit::DocumentMut| reg::write(doc, key, value.as_ref());
+                self.edit_config(model.then_some(raw), write).await
+            }
+            // The preset and the hand-set values it drops (or a timed one's whole set put back)
+            // are one update, worked out from the file as it is under the writer's lock.
+            Apply::Preset => {
+                let preset = value.as_ref().map(reg::text);
+                // R31: as any later owner change of a key does, an owner's preset ends the time
+                // limit of each class it changes or clears, so that limit's revert can never
+                // loosen what the preset chose. The agent's never does (R12); the preset's own
+                // limit is set below as usual.
+                let limits: Vec<(String, Option<String>)> = match actor {
+                    Actor::Owner { .. } => (crate::approvals::CLASS_KEYS.iter())
+                        .filter_map(|k| Some((k.to_string(), self.store.revert(k).ok()??.value)))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let write = |doc: &mut toml_edit::DocumentMut| {
+                    let now: Config = toml::from_str(&doc.to_string())?;
+                    let edits = match (restore, preset.as_deref()) {
+                        (Some(snapshot), _) => crate::approvals::restore_edits(&now, snapshot)
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                        (None, Some(p)) => {
+                            let p =
+                                crate::approvals::Preset::parse(p).map_err(anyhow::Error::msg)?;
+                            crate::approvals::preset_edits(&now, p)
+                        }
+                        (None, None) => anyhow::bail!("no preset to set"),
+                    };
+                    let ends: Vec<(String, Option<String>)> = (limits.into_iter())
+                        .filter(|(k, _)| edits.iter().any(|(e, _)| e == k))
+                        .collect();
+                    // A timed preset saves such a class as what its limit would have put back.
+                    before = Some(crate::approvals::snapshot_with(&now, &ends));
+                    ended = ends.into_iter().map(|(k, _)| k).collect();
+                    for (key, v) in edits {
+                        reg::write(doc, &key, v.map(toml_edit::Value::from).as_ref())?;
+                    }
+                    Ok(())
+                };
+                self.edit_config(None, write).await
+            }
+            Apply::Model => self.switch_model(raw).await,
+            Apply::Thinking => self.apply_thinking(raw).await,
+            Apply::Subagent => self.subagent(raw).await,
+            // rpi reads AGENTS.md once, at start: a fresh child on the same session loads the rules.
+            Apply::Rule => crate::memory::rule(self.cfg.state_dir(), raw).map(|reply| {
+                self.restart = true;
+                Reloaded::done(reply)
+            }),
+            Apply::Facts => Err("change private facts with /facts".into()),
+        };
+        let applied = match applied {
+            Ok(applied) => applied,
+            Err(why) => return Outcome::Refused(why),
+        };
+        // What is in effect now; a model asked for may still be on its way to the child, and
+        // after a failed reload the file holds what was asked, not what is in effect.
+        let new = match (s.apply, applied.failed) {
+            (Apply::Toml | Apply::Thinking | Apply::Preset, false) => self.shown(key),
+            _ => new,
+        };
+        let (who, channel, proposal) = match actor {
+            Actor::Owner { channel } if self.approving.is_some() => {
+                ("agent", Some(channel), self.approving)
+            }
+            Actor::Owner { channel } => ("owner", Some(channel), None),
+            Actor::Agent { .. } => ("agent", None, None),
+            Actor::Internal => ("zephyr", None, None),
+        };
+        // Spec §4.9: the file stays saved, and the log says the reload failed.
+        let who = match applied.failed {
+            true => format!("{who} (reload failed)"),
+            false => who.to_string(),
+        };
+        let (o, n) = (old.as_deref(), new.as_deref());
+        log((self.store.log_setting(key, o, n, &who, channel, proposal)).map_err(Into::into));
+        // A change that did not take effect leaves the time limits as they were.
+        if !applied.failed {
+            for key in &ended {
+                log(self.store.drop_revert(key).map_err(Into::into));
+            }
+            let back = match (s.apply, &s.kind) {
+                // Back to what the file held: unset, or for a setting that has no "none", the
+                // value it had by default.
+                (Apply::Toml, Kind::Optional(_)) => seen,
+                (Apply::Toml, _) => seen.or_else(|| old.clone()),
+                (Apply::Preset, _) => before,
+                _ => old.clone(),
+            };
+            self.time_limit(key, actor, until, back, channel);
+        }
+        if let Actor::Agent { .. } = actor {
+            self.tell_owner(&reg::tightened(key, o, n, reason));
+        }
+        Outcome::Changed {
+            old,
+            new,
+            applied: applied.text,
+        }
+    }
+
+    /// The time limit after a change to `key`: with `until`, it goes `back` then; without, a
+    /// pending one is cancelled. The agent never cancels or replaces one that is pending:
+    /// its own `for D` counts only when none is.
+    fn time_limit(
+        &self,
+        key: &str,
+        actor: Actor<'_>,
+        until: Option<Duration>,
+        back: Option<String>,
+        channel: Option<&str>,
+    ) {
+        // A revert that cannot be read counts as pending: the agent then leaves it alone.
+        let pending = self.store.revert(key).map_or(true, |r| r.is_some());
+        let done = match (actor, until) {
+            (Actor::Agent { .. }, _) if pending => return,
+            (_, None) => self.store.drop_revert(key),
+            (_, Some(d)) => {
+                let since = crate::now();
+                self.store.set_revert(&crate::store::Revert {
+                    key: key.into(),
+                    value: back,
+                    at: since + d.as_secs() as i64,
+                    since,
+                    channel: channel.map(Into::into),
+                })
+            }
+        };
+        log(done.map_err(Into::into));
+    }
+
+    /// An owner's command that changes `key` through `set_setting`: `done` words a change from
+    /// how it applied; a refusal is `[zephyr] ` and its reason.
+    async fn owner_set(
+        &mut self,
+        key: &str,
+        raw: &str,
+        channel: &str,
+        done: impl FnOnce(String) -> String,
+    ) -> String {
+        let owner = Actor::Owner { channel };
+        match self.set_setting(key, raw, owner, None, None).await {
+            Outcome::Changed { applied, .. } => done(applied),
+            Outcome::Proposed { id } => format!("[zephyr] proposed as #{id}"),
+            Outcome::Refused(why) => format!("[zephyr] {why}"),
+        }
+    }
+
+    /// `/set KEY VALUE [for D]`, for any registered setting.
+    async fn set_command(&mut self, arg: &str, channel: &str) -> String {
+        let Some((key, value, until)) = crate::settings::set_args(arg) else {
+            return SET_USAGE.into();
+        };
+        if key == "facts" {
+            return "[zephyr] change private facts with /facts".into();
+        }
+        if matches!(key, "subagent" | "rule") {
+            return "[zephyr] change subagents with /subagent and rules with /rule".into();
+        }
+        let min = self.cfg.min_until;
+        let until = match until
+            .map(|d| crate::settings::parse_until(d, min))
+            .transpose()
+        {
+            Ok(until) => until,
+            Err(e) => return format!("[zephyr] {e}"),
+        };
+        let owner = Actor::Owner { channel };
+        match self.set_setting(key, value, owner, until, None).await {
+            Outcome::Changed { old, new, applied } => {
+                let at = until.and(self.store.revert(key).ok().flatten());
+                let at = at.map(|r| self.clock(r.at));
+                let (old, new) = (old.as_deref(), new.as_deref());
+                let line = crate::settings::changed(key, old, new, at.as_deref());
+                match applied.as_str() {
+                    "" | APPLIED => line,
+                    applied => format!("{line}\n{applied}"),
+                }
+            }
+            Outcome::Proposed { id } => format!("[zephyr] proposed as #{id}"),
+            Outcome::Refused(why) => format!("[zephyr] {why}"),
+        }
+    }
+
+    /// `/approvals` (approvals spec §4.3): the modes in effect; `manual|semi|full` (`off` is
+    /// full, `on` manual) or `messages|posts|money|facts MODE`, each `[for D]`, through
+    /// `set_setting` as `/set` would, answered with the change and the modes after it.
+    async fn approvals(&mut self, arg: &str, channel: &str) -> String {
+        let shown = |cfg: &Config| format!("[zephyr] {}", crate::approvals::effective(cfg).line());
+        let (what, until) = match arg.rsplit_once(" for ") {
+            Some((what, d)) if !what.trim().is_empty() => (what.trim(), format!(" for {d}")),
+            _ => (arg.trim(), String::new()),
+        };
+        let (key, value) = match word(what) {
+            ("", "") => return shown(&self.cfg),
+            (p @ ("manual" | "semi" | "full"), "") => ("approvals.preset".to_string(), p),
+            ("off", "") => ("approvals.preset".into(), "full"),
+            ("on", "") => ("approvals.preset".into(), "manual"),
+            (class @ ("messages" | "posts" | "money" | "facts"), mode) if !mode.is_empty() => {
+                (format!("approvals.{class}"), mode)
+            }
+            _ => return APPROVALS_USAGE.into(),
+        };
+        let reply = self
+            .set_command(&format!("{key} {value}{until}"), channel)
+            .await;
+        match crate::settings::is_change(&reply, &key) {
+            true => format!("{reply}\n{}", shown(&self.cfg)),
+            false => reply,
+        }
+    }
+
+    /// `/settings [SECTION|KEY]`: the values in effect and where each came from.
+    fn settings_listing(&self, arg: &str) -> String {
+        let strong = &self.cfg.settings.strong_channels;
+        crate::settings::listing(arg, strong, |s| self.setting_rows(s))
+    }
+
+    /// `s`'s rows for `/settings`: one per connector for a connector's setting.
+    fn setting_rows(&self, s: &Setting) -> Vec<crate::settings::Row> {
+        let keys: Vec<String> = match s.key {
+            "mcp.<name>.enabled" => (self.cfg.mcp.iter())
+                .map(|m| format!("mcp.{}.enabled", m.name))
+                .collect(),
+            // The tools the owner gave a class.
+            "mcp.<name>.classes.<tool>" => (self.cfg.mcp.iter())
+                .flat_map(|m| (m.classes.keys()).map(|t| format!("mcp.{}.classes.{t}", m.name)))
+                .collect(),
+            key => vec![key.to_string()],
+        };
+        (keys.into_iter())
+            .map(|key| crate::settings::Row {
+                value: crate::settings::shown(self.shown(&key).as_deref()).to_string(),
+                source: self.source(s, &key),
+                key,
+            })
+            .collect()
+    }
+
+    /// Where `key`'s value came from: `until HH:MM` while a time limit runs, `default` when
+    /// nothing sets it (`preset` for an approval class), else who changed it last.
+    fn source(&self, s: &Setting, key: &str) -> String {
+        if let Ok(Some(r)) = self.store.revert(key) {
+            return format!("until {}", self.clock(r.at));
+        }
+        let change = self.store.last_setting_change(key).ok().flatten();
+        let set = match s.apply {
+            Apply::Toml | Apply::Preset => self.current(s, key).is_some(),
+            // rpi's own level until one is chosen.
+            Apply::Thinking => change.is_some(),
+            _ => self.shown(key).is_some(),
+        };
+        match (set, change) {
+            // Settings spec §4.6: an approval class nobody set follows the preset.
+            (false, _) if crate::settings::cleared(&self.cfg, key).is_some() => "preset".into(),
+            (false, _) => "default".into(),
+            (true, Some(c)) => crate::settings::source(&c),
+            // In zephyr.toml, written by hand or by the host CLI.
+            (true, None) => "you".into(),
+        }
+    }
+
+    /// `key`'s value in effect, as replies show it (`None`: unset): the model the child runs on
+    /// and rpi's thinking level, the subagents' names and how many rules there are, the rest
+    /// from the config.
+    fn shown(&self, key: &str) -> Option<String> {
+        match key {
+            "model" => (self.account.as_ref().map(|a| a.model.clone()))
+                .or_else(|| crate::settings::value(&self.cfg, key)),
+            "thinking" => self.thinking.clone(),
+            "subagent" => {
+                let names: Vec<&str> = self.cfg.subagents.iter().map(|s| s.name.as_str()).collect();
+                (!names.is_empty()).then(|| names.join(", "))
+            }
+            // Names only: the values never leave facts.toml.
+            "facts" => (crate::facts::load(&crate::facts::path(&self.cfg)).ok())
+                .filter(|f| !f.is_empty())
+                .map(|f| {
+                    f.iter()
+                        .map(|f| f.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }),
+            "rule" => match crate::memory::read_rules(self.cfg.state_dir()).map(|r| r.len()) {
+                Ok(0) | Err(_) => None,
+                Ok(1) => Some("1 rule".into()),
+                Ok(n) => Some(format!("{n} rules")),
+            },
+            _ => crate::settings::value(&self.cfg, key),
+        }
+    }
+
+    /// `key` as it stands, which a proposal records as the value the owner saw and `/ok` checks
+    /// again: the file's text for a `zephyr.toml` setting (`None`: absent); for the subagents and
+    /// the rules, a SHA-256 of their whole text, so any edit makes a waiting `/subagent …` or
+    /// `/rule rm N` stale; else `shown`.
+    fn current(&self, s: &Setting, key: &str) -> Option<String> {
+        let doc = || crate::host::conf::load(self.cfg.path.as_deref()?).ok();
+        match s.apply {
+            Apply::Toml | Apply::Preset => crate::settings::read(&doc()?, key),
+            Apply::Subagent => {
+                let table = doc()?.get("subagent").map(|t| t.to_string());
+                Some(crate::drafts::digest([table
+                    .unwrap_or_default()
+                    .as_bytes()]))
+            }
+            Apply::Rule => {
+                let rules = crate::memory::read_rules(self.cfg.state_dir()).ok()?;
+                Some(crate::drafts::digest(rules.iter().map(|r| r.as_bytes())))
+            }
+            _ => self.shown(key),
+        }
+    }
+
+    /// Why the owner's `/ok` on `channel` must not run proposal `p` now (`tools::decide`): its
+    /// setting moved on since the owner was shown it, or it loosens a strong setting and
+    /// `channel` is not a strong one.
+    fn not_now(
+        &self,
+        p: &crate::store::PendingProposal,
+        channel: &str,
+    ) -> Option<crate::tools::NotNow> {
+        use crate::tools::NotNow;
+        // A fact's removal or new allowed target loosens the check: from a strong channel only.
+        let facts = p.command.starts_with("/facts rm ") || p.command.starts_with("/facts allow ");
+        let strong = &self.cfg.settings.strong_channels;
+        if p.key.is_none() && facts && !strong.iter().any(|c| c == channel) {
+            return Some(NotNow::Weak(format!(
+                "[zephyr] #{} loosens the check for a private fact: approve it from {}",
+                p.id,
+                strong.join(" or ")
+            )));
+        }
+        let key = p.key.as_deref()?;
+        let s = crate::settings::find(key)?;
+        if self.current(s, key) != p.seen {
+            let now = self.shown(key);
+            return Some(NotNow::Stale(crate::settings::stale(key, now.as_deref())));
+        }
+        let strong = &self.cfg.settings.strong_channels;
+        match crate::settings::decide(s, &Actor::Owner { channel }, p.strong, strong) {
+            crate::settings::Verdict::Refuse(why) => Some(NotNow::Weak(format!(
+                "[zephyr] {}",
+                why.replace(s.key, key)
+            ))),
+            _ => None,
+        }
+    }
+
+    /// A notice for the owner, on the channel the run answers (else the one last answered).
+    fn tell_owner(&self, text: &str) {
+        if let Some((channel, to)) = self.origin() {
+            log(self.store.notify(&channel, &to, text).map_err(Into::into));
+        }
+    }
+
+    /// `at` as `HH:MM` in the owner's time zone.
+    fn clock(&self, at: i64) -> String {
+        let tz = crate::scheduler::zone(&self.cfg).unwrap_or(jiff::tz::TimeZone::UTC);
+        crate::settings::clock(at, &tz)
+    }
+
+    /// Applies the time limits that ended (settings spec §4.5), and tells whoever set each, on
+    /// the channel they set it from (else the owner last answered). A revert that cannot apply
+    /// is not tried again: the owner is told why instead.
+    async fn revert_due(&mut self) {
+        let due = match self.store.due_reverts(crate::now()) {
+            Ok(due) => due,
+            Err(e) => return eprintln!("zephyr: reading setting reverts failed: {e}"),
+        };
+        for r in due {
+            let span = crate::settings::span(Duration::from_secs((r.at - r.since).max(0) as u64));
+            let (key, raw) = (r.key.as_str(), r.value.as_deref().unwrap_or("none"));
+            let text = match self
+                .set_setting(key, raw, Actor::Internal, None, None)
+                .await
+            {
+                Outcome::Changed { new, .. } => {
+                    crate::settings::reverted(key, new.as_deref(), &span)
+                }
+                failed => {
+                    log(self.store.drop_revert(key).map_err(Into::into));
+                    let why = match failed {
+                        Outcome::Refused(why) => why,
+                        _ => "it was not applied".into(),
+                    };
+                    format!(
+                        "[zephyr] {key} could not go back to {raw} when the {span} you set \
+                         ended: {why}"
+                    )
+                }
+            };
+            let told = match r.channel.and_then(|channel| self.owner_on(&channel)) {
+                Some((channel, owner)) => self.store.notify(&channel, &owner, &text),
+                None => self.store.notify_last_owner(&text),
+            };
+            log(told.map_err(Into::into));
+        }
+    }
+
+    /// The owner on `channel`, as a notice there is addressed. On the TUI's channel the
+    /// attached client is the owner (`attach` sends as `token`).
+    fn owner_on(&self, channel: &str) -> Option<(String, String)> {
+        if channel == crate::attach::CHANNEL {
+            return Some((channel.into(), "token".into()));
+        }
+        let owner = self.cfg.owners.get(channel)?.first()?;
+        Some((channel.into(), owner.clone()))
     }
 
     /// What a `/rollback N` waits for: anything that may still be writing to the projects.
@@ -2160,9 +3278,9 @@ impl<'a> Router<'a> {
     /// on the file as it is now, and the write re-derives: a `/login` that records an account in
     /// between must not make the write land on an account no rpi was asked about, so it writes
     /// nothing and the new pool goes through the check first.
-    async fn switch_model(&mut self, model: &str) -> String {
+    async fn switch_model(&mut self, model: &str) -> Result<Reloaded, String> {
         let Some(path) = self.cfg.path.clone() else {
-            return "[zephyr] no zephyr.toml to change".into();
+            return Err("no zephyr.toml to change".into());
         };
         let active = self.account.as_ref().map(|a| a.name.clone());
         for _ in 0..3 {
@@ -2170,16 +3288,13 @@ impl<'a> Router<'a> {
                 crate::reload::set_model(&mut doc, active.as_deref(), model)?;
                 Ok(model_account(&doc, model))
             });
-            let name = match derived {
-                Ok(name) => name,
-                Err(e) => return format!("[zephyr] model not changed: {e:#}"),
-            };
+            let name = derived.map_err(|e| format!("model not changed: {e:#}"))?;
             let target = name.clone().map(|name| Account {
                 name,
                 model: model.to_string(),
             });
             if !lists(&self.cfg.clone(), target.as_ref(), model).await {
-                return format!("[zephyr] rpi has no model {model}");
+                return Err(format!("rpi has no model {model}"));
             }
             // The check and the write must name the same account: the closure that writes
             // re-derives, and a pool that moved under the check leaves the file untouched.
@@ -2196,26 +3311,31 @@ impl<'a> Router<'a> {
                 continue;
             }
             return match saved {
-                Ok(()) => self.reload().await,
-                Err(e) => format!("[zephyr] model not changed: {e:#}"),
+                Ok(()) => Ok(self.reloaded().await),
+                Err(e) => Err(format!("model not changed: {e:#}")),
             };
         }
-        "[zephyr] model not changed: the account pool kept changing while rpi listed the model"
-            .into()
+        Err("model not changed: the account pool kept changing while rpi listed the model".into())
     }
 
     /// Reads `zephyr.toml` and `secrets.env` again and applies what changed (`reload::diff`).
     /// A file that does not load leaves everything as it was. Returns the reply text.
     async fn reload(&mut self) -> String {
+        self.reloaded().await.text
+    }
+
+    /// `reload`, saying whether it failed: the file did not load, or rpi refused the new model.
+    async fn reloaded(&mut self) -> Reloaded {
         use crate::reload::Plan;
         let Some(path) = self.cfg.path.clone() else {
-            return "[zephyr] no zephyr.toml to reload".into();
+            return Reloaded::failed("[zephyr] no zephyr.toml to reload".into());
         };
         self.edits = edits(&self.cfg);
-        let new = match Config::load(&path) {
+        let mut new = match Config::load(&path) {
             Ok(new) => new,
-            Err(e) => return format!("[zephyr] zephyr.toml not applied: {e:#}"),
+            Err(e) => return Reloaded::failed(format!("[zephyr] zephyr.toml not applied: {e:#}")),
         };
+        new.keep_hidden(&self.cfg);
         let secrets = crate::dotenv::read(&new.secrets_path()).unwrap_or_default();
         let next = pick_in(&new, &self.store).ok().flatten();
         let mut plan = crate::reload::diff(&self.cfg, &new, self.account.as_ref(), next.as_ref());
@@ -2235,21 +3355,21 @@ impl<'a> Router<'a> {
         } else {
             "now"
         };
-        match plan {
+        Reloaded::done(match plan {
             Plan::Same => "[zephyr] nothing changed".into(),
             Plan::Live => {
                 self.account = next.or(self.account.take());
-                "[zephyr] applied".into()
+                APPLIED.into()
             }
             Plan::SetModel(model) => {
                 self.account = next;
                 self.pending_model = Some(model.clone());
                 if self.busy {
-                    return format!("[zephyr] switching to {model} {after}");
+                    return Reloaded::done(format!("[zephyr] switching to {model} {after}"));
                 }
                 match self.apply_model().await {
                     None => format!("[zephyr] now on {model}"),
-                    Some(e) => e,
+                    Some(e) => return Reloaded::failed(e),
                 }
             }
             Plan::RestartChild => {
@@ -2262,54 +3382,68 @@ impl<'a> Router<'a> {
                 self.reexec = true;
                 format!("[zephyr] restarting zephyr's channels {after}")
             }
-        }
+        })
     }
 
-    /// `/thinking [level|next]`: how hard the model thinks, from the next request on. Without an
-    /// argument, the level and the ones this model offers.
-    async fn thinking_level(&mut self, arg: &str) -> String {
+    /// `/thinking [level|next]`: how hard the model thinks, from the next request on, through
+    /// `set_setting`. Without an argument, the level and the ones this model offers.
+    async fn thinking_level(&mut self, arg: &str, channel: &str) -> String {
         if self.child.is_none() {
             return "[zephyr] the agent is not running".into();
         }
-        let levels = match self
-            .call(json!({"type": "get_available_thinking_levels"}))
-            .await
-        {
-            Ok(v) => (v["levels"].as_array().into_iter().flatten())
-                .filter_map(|l| l.as_str().map(String::from))
-                .collect::<Vec<_>>(),
-            Err(e) => return format!("[zephyr] no thinking levels: {e:#}"),
-        };
-        let current = self.thinking.clone().unwrap_or_default();
         let level = match arg {
-            "" => {
-                return format!(
-                    "[zephyr] thinking {current}; /thinking {} or next sets it",
-                    levels.join("|")
-                )
-            }
-            "next" => {
+            "" | "next" => {
+                let levels = match self.thinking_levels().await {
+                    Ok(levels) => levels,
+                    Err(e) => return format!("[zephyr] {e}"),
+                };
+                let current = self.thinking.clone().unwrap_or_default();
+                if arg.is_empty() {
+                    return format!(
+                        "[zephyr] thinking {current}; /thinking {} or next sets it",
+                        levels.join("|")
+                    );
+                }
                 let at = levels.iter().position(|l| *l == current);
                 match levels.get(at.map_or(0, |i| (i + 1) % levels.len())) {
                     Some(l) => l.clone(),
                     None => return "[zephyr] this model has no thinking levels".into(),
                 }
             }
-            l if levels.iter().any(|x| x == l) => l.to_string(),
-            l => {
-                return format!(
-                    "[zephyr] no thinking level {l}; one of {}",
-                    levels.join(", ")
-                )
-            }
+            l => l.to_string(),
         };
-        match self.set_thinking(&level).await {
-            Ok(()) => {
-                self.thinking_choice = Some(level.clone());
-                format!("[zephyr] thinking {level}")
-            }
-            Err(e) => format!("[zephyr] rpi refused thinking {level}: {e:#}"),
+        let done = |_| format!("[zephyr] thinking {level}");
+        self.owner_set("thinking", &level, channel, done).await
+    }
+
+    /// The levels the child's model offers: rpi's list is the one that counts.
+    async fn thinking_levels(&mut self) -> Result<Vec<String>, String> {
+        let levels = (self
+            .call(json!({"type": "get_available_thinking_levels"}))
+            .await)
+            .map_err(|e| format!("no thinking levels: {e:#}"))?;
+        Ok((levels["levels"].as_array().into_iter().flatten())
+            .filter_map(|l| l.as_str().map(String::from))
+            .collect())
+    }
+
+    /// Sets rpi's thinking level, kept for each new child (`thinking_choice`), if the model
+    /// offers it.
+    async fn apply_thinking(&mut self, level: &str) -> Result<Reloaded, String> {
+        if self.child.is_none() {
+            return Err("the agent is not running".into());
         }
+        let levels = self.thinking_levels().await?;
+        if !levels.iter().any(|l| l == level) {
+            return Err(format!(
+                "no thinking level {level}; one of {}",
+                levels.join(", ")
+            ));
+        }
+        (self.set_thinking(level).await)
+            .map_err(|e| format!("rpi refused thinking {level}: {e:#}"))?;
+        self.thinking_choice = Some(level.to_string());
+        Ok(Reloaded::done(String::new()))
     }
 
     async fn set_thinking(&mut self, level: &str) -> anyhow::Result<()> {
@@ -2579,7 +3713,7 @@ impl<'a> Router<'a> {
         while self.busy {
             match tokio::time::timeout_at(deadline, next_event(&mut self.child)).await {
                 // As in `main`, so the run's spend and outbound list are booked.
-                Ok(Some(ev)) => match self.tapped(Some(ev)) {
+                Ok(Some(ev)) => match self.tapped(Some(ev)).await {
                     Some(ev) if ev["type"] == "agent_settled" => self.settled(&ev).await,
                     _ => {}
                 },
@@ -2592,7 +3726,7 @@ impl<'a> Router<'a> {
             log(self.record_spend(tally.used).map(drop));
             let to = self.store.last_owner().ok().flatten();
             crate::tools::apply(&self.store, &self.cfg, &tally.requests, to);
-            if let Some(alert) = tally.alert() {
+            if let Some(alert) = tally.alert().map(|a| crate::facts::scrubbed(&self.cfg, a)) {
                 log(self.store.notify_last_owner(&alert).map_err(Into::into));
             }
         }
@@ -2631,13 +3765,7 @@ impl<'a> Router<'a> {
         match self.tally.guard() {
             Some(crate::rpc::Guard::Steer(note)) => {
                 eprintln!("zephyr: {note}");
-                let steer = json!({"type": "queue_message", "message": note, "deliverAs": "steer"});
-                log(self.call(steer).await.map(drop));
-                // Not the owner's message: `reconcile` never takes it for the run's request.
-                self.steered_texts.insert(note);
-                // A run that ends before reaching it would leave it to open the next run: the
-                // settle takes it back, as it does the resume note.
-                self.note_pending = true;
+                self.steer_note(note).await;
                 false
             }
             Some(crate::rpc::Guard::Stop(why)) => {
@@ -2649,6 +3777,38 @@ impl<'a> Router<'a> {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Steers the daemon's own `note` into the running turn: the repeated-failure guard's, or
+    /// what a held call means. Returns whether rpi took it.
+    async fn steer_note(&mut self, note: String) -> bool {
+        let steer = json!({"type": "queue_message", "message": note, "deliverAs": "steer"});
+        let queued = self.call(steer).await.map(drop);
+        let took = queued.is_ok();
+        log(queued);
+        // Not the owner's message: `reconcile` never takes it for the run's request.
+        self.steered_texts.insert(note);
+        // A run that ends before reaching it would leave it to open the next run: the settle
+        // takes it back, as it does the resume note.
+        self.note_pending = true;
+        took
+    }
+
+    /// The gate's held note for main's run (R51), before it answers the plugin `hold`: steered
+    /// in now, while rpi still waits on the call, so the step after the refused call reads it
+    /// (rpi takes its steers as the tool batch ends). `note.queued` is told once rpi has it; a
+    /// note for a session or a run that is not this one is dropped, which tells the gate at once.
+    async fn gate_note(&mut self, session: &str, mut note: crate::scheduler::Note) {
+        let ours = self.child.as_ref().and_then(|c| c.session.as_deref()) == Some(session);
+        if !(self.busy && ours) || self.held_steered.contains(&note.action) {
+            return;
+        }
+        if self.steer_note(note.text).await {
+            self.held_steered.insert(note.action);
+            if let Some(queued) = note.queued.take() {
+                let _ = queued.send(());
+            }
         }
     }
 
@@ -2811,6 +3971,25 @@ fn model_account(doc: &toml_edit::DocumentMut, model: &str) -> Option<String> {
         .map(|(name, _)| name)
 }
 
+/// `m` checked as `/model` checks a model: PROVIDER/MODEL, an account on its provider, and that
+/// account's rpi lists it.
+async fn check_model(cfg: &Config, m: &str) -> Result<(), String> {
+    if !zephyr_policy::tools::model_shape(m) {
+        return Err(format!("not changed: {m} is not PROVIDER/MODEL"));
+    }
+    let provider = m.split('/').next().unwrap_or_default();
+    let account = cfg.accounts.iter().find(|a| a.provider() == provider);
+    if !cfg.accounts.is_empty() && account.is_none() {
+        return Err(format!(
+            "not changed: no account is signed in to {provider}; run `zephyr login {provider}`"
+        ));
+    }
+    if !lists(cfg, account, m).await {
+        return Err(format!("rpi has no model {m}"));
+    }
+    Ok(())
+}
+
 /// Whether `rpi --list-models`, signed in as `account`, lists `model`. A listing that fails
 /// says nothing, so it counts as yes. The running child lists only its own sign-in's models.
 async fn lists(cfg: &Config, account: Option<&Account>, model: &str) -> bool {
@@ -2910,6 +4089,242 @@ fn log(r: anyhow::Result<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config on `<dir>/zephyr.toml` holding `extra`, `owner` the owner on `chat`.
+    fn on_file(name: &str, extra: &str) -> Config {
+        let dir = crate::test_dir(name);
+        let path = dir.join("zephyr.toml");
+        let text = format!(
+            "rpi = '/nonexistent/rpi'\nhome = {:?}\n{extra}\n[owners]\nchat = ['owner']\n",
+            dir.display().to_string()
+        );
+        std::fs::write(&path, text).unwrap();
+        Config::load(&path).unwrap()
+    }
+
+    /// A router on `cfg` with no child, so `set_setting` can be driven as any actor.
+    fn router<'a>(cfg: &Config, jobs: &'a crate::scheduler::Wake) -> Router<'a> {
+        let (_, attaches) = mpsc::channel(1);
+        let (cfg_tx, _) = watch::channel(Arc::new(cfg.clone()));
+        let (snap, _) = watch::channel(Snapshot::default());
+        Router::new(cfg, jobs, attaches, cfg_tx, snap, vec!["chat".into()]).unwrap()
+    }
+
+    const OWNER: Actor = Actor::Owner { channel: "chat" };
+    const AGENT: Actor = Actor::Agent { session: "main" };
+
+    #[tokio::test]
+    async fn the_agent_never_cancels_or_replaces_the_owners_time_limit() {
+        let cfg = on_file("set-agent-revert", "[budget]\ndaily_cost_usd = 5.0");
+        let jobs = Default::default();
+        let mut r = router(&cfg, &jobs);
+        let key = "budget.daily_cost_usd";
+        let hour = Some(Duration::from_secs(3600));
+        let short = Some(Duration::from_secs(30));
+        let set = r.set_setting(key, "8", OWNER, hour, None).await;
+        assert!(matches!(set, Outcome::Changed { .. }), "{set:?}");
+        let limit = r.store.revert(key).unwrap().unwrap();
+        assert_eq!(limit.value.as_deref(), Some("5.0"));
+        assert_eq!(limit.channel.as_deref(), Some("chat"));
+        // A tightening, then a timed tightening: both apply, and the owner's limit stays.
+        let tight = r.set_setting(key, "7.99", AGENT, None, Some("asked")).await;
+        let (old, new) = (Some("8".into()), Some("7.99".into()));
+        let applied = APPLIED.into();
+        assert_eq!(tight, Outcome::Changed { old, new, applied });
+        assert_eq!(r.store.revert(key).unwrap().as_ref(), Some(&limit));
+        let timed = r.set_setting(key, "7.5", AGENT, short, None).await;
+        assert!(matches!(timed, Outcome::Changed { .. }), "{timed:?}");
+        assert_eq!(r.store.revert(key).unwrap().as_ref(), Some(&limit));
+        // The owner's own change cancels it.
+        r.set_setting(key, "6", OWNER, None, None).await;
+        assert_eq!(r.store.revert(key).unwrap(), None);
+        // With none pending, the agent's `for D` goes back to the value before its change.
+        r.set_setting(key, "4", AGENT, short, None).await;
+        let own = r.store.revert(key).unwrap().unwrap();
+        let got = (own.value.as_deref(), own.at - own.since, own.channel);
+        assert_eq!(got, (Some("6.0"), 30, None));
+    }
+
+    /// R30: a reload reads the file again, but what no file sets (tests shorten these) stays.
+    #[tokio::test]
+    async fn a_reload_keeps_what_no_file_sets() {
+        let mut cfg = on_file("reload-hidden", "");
+        cfg.tick = Duration::from_millis(200);
+        cfg.stall_limit = Duration::from_secs(3);
+        cfg.min_until = Duration::from_secs(1);
+        cfg.job_timeout = Duration::from_secs(4);
+        cfg.exec_backstop = Duration::from_secs(5);
+        cfg.projects = Some("/p".into());
+        cfg.agent_browser = "/fake/agent-browser".into();
+        let jobs = Default::default();
+        let mut r = router(&cfg, &jobs);
+        let set = r
+            .set_setting("tasks.parallel", "3", OWNER, None, None)
+            .await;
+        assert!(matches!(set, Outcome::Changed { .. }), "{set:?}");
+        assert_eq!(r.cfg.tasks.as_ref().map(|t| t.parallel), Some(3));
+        let c = &r.cfg;
+        assert_eq!(
+            (
+                c.tick,
+                c.stall_limit,
+                c.min_until,
+                c.job_timeout,
+                c.exec_backstop
+            ),
+            (
+                cfg.tick,
+                cfg.stall_limit,
+                cfg.min_until,
+                cfg.job_timeout,
+                cfg.exec_backstop
+            )
+        );
+        assert_eq!((&c.path, &c.projects), (&cfg.path, &cfg.projects));
+        assert_eq!(c.agent_browser, cfg.agent_browser);
+        assert_eq!(r.cfg_tx.borrow().tick, cfg.tick, "and what the others read");
+    }
+
+    /// R49: main is woken once for each new note about an action, not on every tick while it
+    /// waits undelivered (each wake moves main's running command to the background).
+    #[tokio::test]
+    async fn main_is_woken_once_per_action_note() {
+        let cfg = on_file("actions-wake", "");
+        let jobs = Default::default();
+        let mut r = router(&cfg, &jobs);
+        let note = |r: &Router, id| {
+            r.store
+                .action_note(id, "declined", "the owner declined it")
+                .unwrap()
+        };
+        let held = |r: &Router| r.store.hold_action(&held_action(None)).unwrap();
+        assert!(!r.settled_actions(), "nothing new");
+        let (a, b) = (held(&r), held(&r));
+        assert!(note(&r, a));
+        assert!(r.settled_actions());
+        assert!(!r.settled_actions(), "the same row, still undelivered");
+        assert!(note(&r, b));
+        assert!(r.settled_actions(), "a new one");
+    }
+
+    /// I1: a delay that came due during a pause is asked again on the first tick after the
+    /// pause lifted by itself (a budget pause at midnight), never run.
+    #[tokio::test]
+    async fn a_delay_due_when_a_pause_lifts_is_asked_again() {
+        let cfg = on_file(
+            "actions-lift",
+            "timezone = 'UTC'\n[approvals]\nmessages = 'delay 5'",
+        );
+        let jobs = Default::default();
+        let mut r = router(&cfg, &jobs);
+        r.store.set_paused(Some("user")).unwrap();
+        r.tick_actions();
+        // Due now, held five minutes ago as `delay 5` holds one (R63 reads how long), and the
+        // pause gone with no /resume: as a budget pause ends.
+        let delayed = |r: &Router<'_>| {
+            let due = crate::now() - 1;
+            let id = r.store.hold_action(&held_action(Some(due))).unwrap();
+            let db = r.store.db_for_test();
+            let set = "UPDATE proposals SET created_at = ?2 WHERE id = ?1";
+            db.execute(set, rusqlite::params![id, due - 300]).unwrap();
+            id
+        };
+        let id = delayed(&r);
+        r.store.set_paused(None).unwrap();
+        r.tick_actions();
+        assert_eq!(r.store.action(id).unwrap().unwrap().status, "pending");
+        let card = r.store.pending_outbox().unwrap().pop().unwrap().text;
+        assert!(
+            card.starts_with(&format!("[zephyr] approve #{id}:")),
+            "{card}"
+        );
+        // The tick after that runs delays again.
+        let next = delayed(&r);
+        r.tick_actions();
+        assert_eq!(r.store.action(next).unwrap().unwrap().status, "done");
+    }
+
+    /// A connector message held from main on `chat`, delayed to `due` when given.
+    fn held_action(due: Option<i64>) -> crate::store::NewAction {
+        crate::store::NewAction {
+            kind: crate::store::ActionKind::Pass,
+            class: "messages".into(),
+            targets: vec!["mail/send".into(), "a@x.org".into()],
+            summary: "mail/send".into(),
+            reason: None,
+            payload: r#"{"server": "mail", "tool": "send", "arguments": {}}"#.into(),
+            secrets: vec![],
+            origin: crate::store::Origin {
+                channel: "chat".into(),
+                sender: "owner".into(),
+                session: "main".into(),
+                run: "main:1".into(),
+                call_id: None,
+            },
+            due_at: due,
+        }
+    }
+
+    /// The owner's `/ok N` on `chat`, and the reply it got.
+    async fn ok(r: &mut Router<'_>, id: i64) -> String {
+        let m = Inbound {
+            channel: "chat".into(),
+            platform_msg_id: format!("ok-{id}"),
+            sender: "owner".into(),
+            text: format!("/ok {id}"),
+        };
+        r.inbound(m, false).await;
+        let sent = r.store.pending_outbox().unwrap();
+        sent.last().unwrap().text.clone()
+    }
+
+    #[tokio::test]
+    async fn a_waiting_rule_or_subagent_change_goes_stale_after_any_edit() {
+        let cfg = on_file("set-list-stale", "");
+        let jobs = Default::default();
+        let mut r = router(&cfg, &jobs);
+        let proposed = |o| match o {
+            Outcome::Proposed { id } => id,
+            other => panic!("{other:?}"),
+        };
+        for rule in ["be brief", "reply in Korean"] {
+            r.set_setting("rule", rule, OWNER, None, None).await;
+        }
+        // Two rules before and after: `rm 2` would now remove another rule than the one shown.
+        let rm = proposed(r.set_setting("rule", "rm 2", AGENT, None, None).await);
+        r.set_setting("rule", "rm 1", OWNER, None, None).await;
+        r.set_setting("rule", "never email bob", OWNER, None, None)
+            .await;
+        let stale = "[zephyr] rule is now 2 rules; propose again";
+        assert_eq!(ok(&mut r, rm).await, stale);
+        let rules = crate::memory::read_rules(r.cfg.state_dir()).unwrap();
+        assert_eq!(rules, ["reply in Korean", "never email bob"]);
+        // An edit that adds one makes it stale too; one unchanged since it was shown runs.
+        let rm = proposed(r.set_setting("rule", "rm 2", AGENT, None, None).await);
+        r.set_setting("rule", "be kind", OWNER, None, None).await;
+        let stale = "[zephyr] rule is now 3 rules; propose again";
+        assert_eq!(ok(&mut r, rm).await, stale);
+        let rm = proposed(r.set_setting("rule", "rm 3", AGENT, None, None).await);
+        assert_eq!(
+            ok(&mut r, rm).await,
+            format!("[zephyr] /ok {rm} approved /rule rm 3\n[zephyr] removed rule 3: be kind")
+        );
+
+        // A subagent whose prompt changed keeps its name, but the proposal is stale all the same.
+        r.set_setting("subagent", "add y Build.", OWNER, None, None)
+            .await;
+        let edit =
+            proposed((r.set_setting("subagent", "prompt y Explore.", AGENT, None, None)).await);
+        let own = r
+            .set_setting("subagent", "prompt y Build well.", OWNER, None, None)
+            .await;
+        assert!(matches!(own, Outcome::Changed { .. }), "{own:?}");
+        assert_eq!(
+            ok(&mut r, edit).await,
+            "[zephyr] subagent is now y; propose again"
+        );
+        assert_eq!(r.cfg.subagents[0].prompt, "Build well.");
+    }
 
     fn origin(channel: &str) -> Origin {
         Origin {

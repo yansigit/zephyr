@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub const USAGE: &str = "usage: zephyr <command>   (zephyr --version: this CLI's and the container's)
-  init [--non-interactive --projects DIR --provider ID.. --account NAME=PROVIDER/MODEL.. --model P/M --no-start]
+  init [--non-interactive --projects DIR --provider ID.. --account NAME=PROVIDER/MODEL.. --model P/M --preset manual|semi|full --no-start]
   up [--build] | down | restart | logs [-f] | status | upgrade [VERSION]
   login <provider> [--account NAME] [--model P/M] [--no-verify]
   accounts [list | order NAME.. | remove NAME]
@@ -25,7 +25,8 @@ pub const USAGE: &str = "usage: zephyr <command>   (zephyr --version: this CLI's
   packages add NAME.. | rm NAME.. | list
   subagent list | add NAME [--model P/M] [--prompt TEXT] | edit NAME [--model P/M|default] [--prompt TEXT] | rm NAME
   vault list | add login NAME --site URL [--user U] [--totp] | add token NAME | edit NAME | rm NAME | revoke NAME [PROGRAM]
-  config get|set KEY [VALUE]
+  facts list | add NAME --kind text|digits|email | rm NAME | allow NAME TARGET | disallow NAME TARGET
+  config get KEY | set KEY VALUE   (a known setting goes through the daemon while it runs)
   chat | attach [--stock] | shell [bash|zsh] | pause | resume | reload
   doctor [--fix]
   alert setup TOPIC [--server URL] | check | test | off
@@ -45,7 +46,7 @@ const ME: &str = env!("CARGO_PKG_VERSION");
 /// does not know.
 const ROLLED_BACK: [&str; 3] = ["zephyr.toml", "vault.toml", "host.toml"];
 
-const COMMANDS: [&str; 26] = [
+const COMMANDS: [&str; 27] = [
     "init",
     "up",
     "down",
@@ -70,6 +71,7 @@ const COMMANDS: [&str; 26] = [
     "mcp",
     "packages",
     "vault",
+    "facts",
     "subagent",
     "alert",
 ];
@@ -1226,8 +1228,27 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
         },
         "config" => {
             let rest = a.rest()?;
+            let args = rest.iter().map(String::as_str).collect::<Vec<_>>();
+            let mut daemon_down = false;
+            // A registered setting goes through the daemon's checks (validation, the change log,
+            // time limits) while it runs; its refusal is this command's failure.
+            if let ["set", key, value] = args[..] {
+                if crate::settings::find(key).is_some() && h.running() {
+                    // Exit 3: the container is up but the daemon is not (a restart); edit the
+                    // file below, as for a stopped container.
+                    let status = h
+                        .exec(&[], &[], &["zephyr", "set", key, value])
+                        .status()
+                        .context("running docker exec")?;
+                    match status.code() {
+                        Some(0) => return Ok(()),
+                        Some(3) => daemon_down = true,
+                        _ => bail!("zephyr set failed ({status})"),
+                    }
+                }
+            }
             let mut doc = h.data.load()?;
-            match rest.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+            match args[..] {
                 ["get", key] => {
                     println!(
                         "{}",
@@ -1235,6 +1256,9 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                     );
                 }
                 ["set", key, value] => {
+                    if crate::settings::find(key).is_none() {
+                        eprintln!("warn: {key} is not a known setting; saved without checking");
+                    }
                     conf::set(&mut doc, key, value)?;
                     // Refuse what the daemon would refuse (unknown keys, a bad time zone).
                     toml::from_str::<crate::config::Config>(&doc.to_string())
@@ -1245,7 +1269,11 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                         })?;
                     h.data.save(&doc)?;
                     println!("set {key}");
-                    h.apply()?;
+                    if daemon_down {
+                        println!("saved; applies when zephyr starts (`zephyr up`)");
+                    } else {
+                        h.apply()?;
+                    }
                 }
                 _ => bail!("usage: zephyr config get KEY | config set KEY VALUE"),
             }
@@ -1329,6 +1357,7 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
         "mcp" => setup::mcp(&h, a),
         "packages" => setup::packages(&h, a),
         "vault" => setup::vault(&h, a),
+        "facts" => setup::facts(&h, a),
         "subagent" => setup::subagent(&h, a),
         "alert" => alert::main(&h, a),
         _ => bail!("{USAGE}"),

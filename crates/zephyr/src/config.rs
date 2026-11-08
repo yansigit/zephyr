@@ -64,6 +64,10 @@ pub struct Config {
     /// often a run's progress is shown again. Not configurable; tests shorten it.
     #[serde(skip, default = "tick")]
     pub tick: std::time::Duration,
+    /// The shortest time limit a setting change may carry (`for 30s`). Not configurable; tests
+    /// shorten it.
+    #[serde(skip, default = "min_until")]
+    pub min_until: std::time::Duration,
     /// `[agent]`: what the agent's processes get (DESIGN §4.4).
     #[serde(default)]
     pub agent: Agent,
@@ -73,6 +77,12 @@ pub struct Config {
     /// `[[mcp]]`: the connectors (MCP servers) the agent may call (DESIGN §4.6).
     #[serde(default, rename = "mcp")]
     pub mcp: Vec<Mcp>,
+    /// `[settings]`: who may loosen a protected setting (settings spec §2).
+    #[serde(default)]
+    pub settings: Settings,
+    /// `[approvals]`: how messages, posts and payments wait for the owner (approvals spec §4.3).
+    /// Absent is the `manual` preset. `approvals::effective` reads it.
+    pub approvals: Option<Approvals>,
     /// The file this was loaded from, which a reload reads again. `None` when built in memory.
     #[serde(skip)]
     pub path: Option<PathBuf>,
@@ -80,6 +90,11 @@ pub struct Config {
     /// `zephyr up` sets. `None` turns checkpoints off. Not configurable; tests set it.
     #[serde(skip, default = "projects")]
     pub projects: Option<PathBuf>,
+    /// The real agent-browser, which the daemon's own browser calls (the vault's fill) run by
+    /// full path and the browser wrapper is pointed at (approvals spec §4.4). Not configurable;
+    /// tests set a fake.
+    #[serde(skip, default = "agent_browser")]
+    pub agent_browser: PathBuf,
 }
 
 fn job_timeout() -> std::time::Duration {
@@ -96,6 +111,14 @@ fn stall_limit() -> std::time::Duration {
 
 fn tick() -> std::time::Duration {
     std::time::Duration::from_secs(5)
+}
+
+fn min_until() -> std::time::Duration {
+    std::time::Duration::from_secs(30)
+}
+
+fn agent_browser() -> PathBuf {
+    PathBuf::from(crate::browser_gate::REAL)
 }
 
 fn projects() -> Option<PathBuf> {
@@ -167,6 +190,49 @@ fn default_parallel() -> usize {
     2
 }
 
+/// `[settings]` (settings spec §2).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Settings {
+    /// Channels that may loosen a setting marked strong (a budget, this list). The TUI is
+    /// always one; `chat` is the root-only socket the host CLI uses.
+    #[serde(default = "strong_default")]
+    pub strong_channels: Vec<String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            strong_channels: strong_default(),
+        }
+    }
+}
+
+fn strong_default() -> Vec<String> {
+    vec!["tui".into(), "chat".into()]
+}
+
+/// `[approvals]` (approvals spec §4.3), kept as the file says it: `Config::validate` refuses a
+/// value that does not parse, and `approvals::effective` reads anything that still does not as
+/// the strictest. A class left out follows the preset.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Approvals {
+    /// `manual`, `semi` or `full`; absent is `manual`.
+    pub preset: Option<String>,
+    /// `ask`, `ask-new`, `delay N` or `auto`.
+    pub messages: Option<String>,
+    pub posts: Option<String>,
+    /// `ask`, `delay N`, `auto` or `auto N` (a cap per purchase, in `currency`).
+    pub money: Option<String>,
+    /// ISO 4217; absent is `USD`.
+    pub currency: Option<String>,
+    /// Private facts: `hold`, `warn` or `off`.
+    pub facts: Option<String>,
+    /// What only a strong channel may approve: `loosen`, `money`. Absent is `["loosen"]`.
+    pub strong_only: Option<Vec<String>>,
+}
+
 /// `[agent]`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -216,6 +282,11 @@ pub struct Mcp {
     pub timeout: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// The owner's class for a tool, over the verb rule (approvals spec §4.1): `messages`,
+    /// `posts`, `money` or `none`. The daemon's, never the adapter's: `drafts::filled` leaves it
+    /// out of `mcp.json`, and a draft cannot carry it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub classes: BTreeMap<String, String>,
 }
 
 impl Mcp {
@@ -254,6 +325,20 @@ impl Config {
         cfg.validate()?;
         cfg.path = Some(path.to_path_buf());
         Ok(cfg)
+    }
+
+    /// A reloaded file keeps the running daemon's values of the fields no file sets (`tick`,
+    /// `stall_limit`, `min_until`, `job_timeout`, `exec_backstop`, `path`, `projects`,
+    /// `agent_browser`): a reload changes settings, never these (R30).
+    pub fn keep_hidden(&mut self, running: &Config) {
+        self.job_timeout = running.job_timeout;
+        self.exec_backstop = running.exec_backstop;
+        self.stall_limit = running.stall_limit;
+        self.tick = running.tick;
+        self.min_until = running.min_until;
+        self.path = running.path.clone();
+        self.projects = running.projects.clone();
+        self.agent_browser = running.agent_browser.clone();
     }
 
     /// Account names become directory names, so each must be a plain, unique path segment.
@@ -315,6 +400,31 @@ impl Config {
             if !names.insert(&m.name) {
                 anyhow::bail!("connector name {:?} is used twice", m.name);
             }
+            let classes = crate::approvals::CLASS_CHOICES;
+            if let Some((tool, c)) =
+                (m.classes.iter()).find(|(_, c)| !classes.contains(&c.as_str()))
+            {
+                anyhow::bail!(
+                    "connector {}: classes {tool} is {c:?}; use messages, posts, money or none",
+                    m.name
+                );
+            }
+        }
+        if let Some(a) = &self.approvals {
+            crate::approvals::check(a)?;
+        }
+        let strong = &self.settings.strong_channels;
+        if let Some(bad) = strong
+            .iter()
+            .find(|c| !crate::settings::CHANNELS.contains(&c.as_str()))
+        {
+            anyhow::bail!(
+                "[settings] strong_channels names {bad:?}; allowed: {}",
+                crate::settings::CHANNELS.join(", ")
+            );
+        }
+        if !strong.iter().any(|c| c == "tui") {
+            anyhow::bail!("[settings] strong_channels must keep tui");
         }
         crate::scheduler::zone(self)?;
         Ok(())
@@ -499,6 +609,22 @@ prompt = "Build it."
             "{base}[[subagent]]\nname = 'a'\nprompt = 'p'\ntypo = 1\n"
         ))
         .is_err());
+    }
+
+    #[test]
+    fn strong_channels_default_to_the_tui_and_chat_and_keep_the_tui() {
+        let base = "rpi = 'a'\nhome = 'b'\n";
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert_eq!(cfg.settings.strong_channels, ["tui", "chat"]);
+        let with = |text: &str| -> Config { toml::from_str(&format!("{base}{text}")).unwrap() };
+        with("[settings]\nstrong_channels = ['tui']\n")
+            .validate()
+            .unwrap();
+        for bad in ["['chat']", "[]", "['tui', 'telegram']"] {
+            let cfg = with(&format!("[settings]\nstrong_channels = {bad}\n"));
+            assert!(cfg.validate().is_err(), "{bad}");
+        }
+        assert!(toml::from_str::<Config>(&format!("{base}[settings]\ntypo = 1\n")).is_err());
     }
 
     #[test]

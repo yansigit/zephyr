@@ -108,6 +108,8 @@ impl Content {
                 let mut v = serde_json::to_value(m).unwrap_or_default();
                 if let Some(o) = v.as_object_mut() {
                     o.remove("name");
+                    // The owner's, kept through an approval: not the draft's to change.
+                    o.remove("classes");
                 }
                 serde_json::to_string_pretty(&v).unwrap_or_default()
             }
@@ -247,6 +249,10 @@ fn read_connector(path: &Path, name: &str) -> anyhow::Result<Mcp> {
         }
         Some(n) if n == name => {}
         Some(_) => bail!("its name must match its file name"),
+    }
+    // A tool's approval class is the owner's to set (approvals spec §4.1), never a draft's.
+    if spec.contains_key("classes") {
+        bail!("a connector draft cannot set classes; the owner sets them with /set");
     }
     let m: Mcp = serde_json::from_value(v).context("it is not a server spec")?;
     m.check()?;
@@ -585,7 +591,11 @@ fn ok(cfg: &Config, kind: Kind, name: &str) -> anyhow::Result<(String, After)> {
                 After::Restart,
             )
         }
-        Content::Connector(m) => {
+        Content::Connector(mut m) => {
+            // The owner's tool classes stay through an update: a draft cannot carry them.
+            if let Some(old) = cfg.mcp.iter().find(|o| o.name == m.name) {
+                m.classes = old.classes.clone();
+            }
             write_config(cfg, |doc| crate::host::conf::upsert_mcp(doc, &m))?;
             let missing = missing(cfg, &m);
             let mut reply = format!("[zephyr] connector {name} added to zephyr.toml");
@@ -800,6 +810,8 @@ fn filled(m: &Mcp, secrets: &[(String, String)]) -> Result<Value, Vec<String>> {
     let mut v = serde_json::to_value(m).expect("plain data");
     if let Some(o) = v.as_object_mut() {
         o.remove("name");
+        // The gate's, not the adapter's (approvals spec §4.1).
+        o.remove("classes");
     }
     let mut missing = Vec::new();
     fill(&mut v, secrets, &mut missing);
@@ -840,13 +852,17 @@ pub fn missing_secrets(cfg: &Config, m: &Mcp) -> Vec<String> {
 /// lets the MCP adapter's tools use. The daemon's, in `<state>-public/` beside `<state>` (which
 /// only root may enter), so the agent can read it but never rewrite it before a child loads it.
 pub fn mcp_path(cfg: &Config) -> PathBuf {
+    public_dir(cfg).join("mcp.json")
+}
+
+/// `<state>-public/`, beside `<state>`: root's 0755 folder of what the daemon publishes for the
+/// agent to read or connect to, never to change (`mcp.json`, the gate socket).
+pub fn public_dir(cfg: &Config) -> PathBuf {
     let state = cfg.state_dir();
     let name = state
         .file_name()
         .map_or("zephyr".into(), |n| n.to_string_lossy());
-    state
-        .with_file_name(format!("{name}-public"))
-        .join("mcp.json")
+    state.with_file_name(format!("{name}-public"))
 }
 
 /// Where the daemon puts AGENTS.md when the agent runs on a uid of its own: in the parent of its
@@ -872,17 +888,32 @@ fn daemons_alone(dir: &Path) -> bool {
 const AGENTS_STUB: &str = "# AGENTS.md\n\nZephyr writes your standing instructions to the \
     AGENTS.md above this folder at each start; this file is rewritten then too.\n";
 
-/// Writes `text` to `path` as the daemon, readable by all (0644), in a folder only the daemon may
-/// write: what the agent may read but must not change.
-fn write_public(path: &Path, text: &str) -> anyhow::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    let dir = path.parent().context("no folder")?;
+/// `public_dir`, made 0755 when it is not there, and checked to be the daemon's alone: what the
+/// gate socket and the connectors file go in.
+pub fn ensure_public_dir(cfg: &Config) -> anyhow::Result<PathBuf> {
+    let dir = public_dir(cfg);
+    daemons_dir(&dir)?;
+    Ok(dir)
+}
+
+/// Makes `dir` 0755 when it is not there; fails unless it is a folder only the daemon may write.
+fn daemons_dir(dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
     if !dir.exists() {
         std::fs::DirBuilder::new().mode(0o755).create(dir)?;
     }
     if !daemons_alone(dir) {
         bail!("{} is not a folder only zephyr may write", dir.display());
     }
+    Ok(())
+}
+
+/// Writes `text` to `path` as the daemon, readable by all (0644), in a folder only the daemon may
+/// write: what the agent may read but must not change.
+fn write_public(path: &Path, text: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = path.parent().context("no folder")?;
+    daemons_dir(dir)?;
     let name = path.file_name().context("no file name")?.to_string_lossy();
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     let mut file = std::fs::OpenOptions::new()
@@ -1342,6 +1373,33 @@ mod tests {
         assert!(say(&gone, "/mcp rm files")
             .0
             .contains("no approved connector"));
+    }
+
+    /// Approvals spec §4.1: a tool's class is the owner's. A draft cannot set one, an approved
+    /// update keeps the owner's, and the adapter's `mcp.json` never carries them.
+    #[test]
+    fn a_connector_draft_cannot_set_classes_and_an_update_keeps_the_owners() {
+        let cfg =
+            cfg("[[mcp]]\nname = 'mail'\ncommand = 'old'\nclasses = { send_note = 'money' }\n");
+        let drafts = Kind::Connector.drafts(&cfg.home);
+        std::fs::create_dir_all(&drafts).unwrap();
+        let draft = drafts.join("mail.json");
+        std::fs::write(
+            &draft,
+            r#"{"command": "new", "classes": {"send_note": "none"}}"#,
+        )
+        .unwrap();
+        let notices = scan(&cfg);
+        assert!(notices[0].contains("cannot set classes"), "{notices:?}");
+        std::fs::write(&draft, r#"{"command": "new"}"#).unwrap();
+        let notices = scan(&cfg);
+        assert!(notices[0].contains("/mcp ok mail"), "{notices:?}");
+        assert!(!notices[0].contains("classes"), "{notices:?}");
+        say(&cfg, "/mcp ok mail");
+        let new = Config::load(cfg.path.as_ref().unwrap()).unwrap();
+        assert_eq!(new.mcp[0].command.as_deref(), Some("new"));
+        assert_eq!(new.mcp[0].classes["send_note"], "money");
+        assert!(filled(&new.mcp[0], &[]).unwrap().get("classes").is_none());
     }
 
     #[test]
