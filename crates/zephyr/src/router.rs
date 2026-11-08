@@ -447,6 +447,10 @@ struct Router<'a> {
     procs: crate::procs::Procs,
     /// Browser actions waiting in place for the owner's answer (approvals spec §4.4).
     waits: crate::actions::Waits,
+    /// The last tick found the gateway paused: the next one holds what came due (I1).
+    due_held: bool,
+    /// The newest note about an action main was woken for (R49).
+    action_woken: i64,
     /// The pooled account the child runs on (DESIGN §4.9). `None` without a pool.
     account: Option<Account>,
     /// What attached clients see; `publish` refreshes it, `tapped` keeps `run` current.
@@ -581,6 +585,8 @@ impl<'a> Router<'a> {
             stopping: false,
             procs: Default::default(),
             waits: Default::default(),
+            due_held: false,
+            action_woken: 0,
             compacting: None,
             approving: None,
             cfg_tx,
@@ -657,8 +663,7 @@ impl<'a> Router<'a> {
                     }
                     self.revert_due().await;
                     // Delays that came due, and held actions nobody answered (approvals §4.6).
-                    crate::actions::tick(&self.actions(), crate::now());
-                    self.settled_actions();
+                    self.tick_actions();
                     // A budget pause ends at UTC midnight with nothing else to wake the router;
                     // a run in progress reconciles at its settle, a new child when it starts.
                     let ended = std::mem::replace(&mut was_paused, paused(&self.store));
@@ -824,12 +829,28 @@ impl<'a> Router<'a> {
     }
 
     /// After a held action was settled: a waiting browser action whose action ended is denied,
-    /// and a note for main (a decline, a cancel, an expiry, a pass) is dispatched as a report is.
-    fn settled_actions(&self) {
+    /// and a new note for main (a decline, a cancel, an expiry, a pass) is dispatched as a report
+    /// is. Main is woken once per new note, not on every tick while one waits undelivered: each
+    /// wake moves its running command to the background (R49). Returns whether it woke main.
+    fn settled_actions(&mut self) -> bool {
         self.waits.deny_settled(&self.store);
-        if self.store.action_rows_waiting().unwrap_or(false) {
-            self.jobs.inbox.notify_one();
+        let newest = self.store.newest_action_row().unwrap_or(0);
+        if newest <= self.action_woken {
+            return false;
         }
+        self.action_woken = newest;
+        self.jobs.inbox.notify_one();
+        true
+    }
+
+    /// The tick's part for held actions (`actions::tick`): `held` while the gateway is paused,
+    /// and on the first tick after a pause ended by itself, so nothing that came due meanwhile
+    /// goes late without the owner (I1).
+    fn tick_actions(&mut self) {
+        let paused = self.store.pause_reason().map_or(true, |p| p.is_some());
+        crate::actions::tick(&self.actions(), crate::now(), paused || self.due_held);
+        self.due_held = paused;
+        self.settled_actions();
     }
 
     /// The agent's `task` call (DESIGN §4.12), answered mid-turn. A started task reports back
@@ -1678,6 +1699,11 @@ impl<'a> Router<'a> {
                 "[zephyr] paused: messages wait in the inbox until /resume"
             }
             "/resume" => {
+                // What came due during the pause waits for the owner, before a tick runs it.
+                if self.store.pause_reason().ok().flatten().is_some() {
+                    crate::actions::resume(&self.cfg, &self.store, crate::now());
+                    self.due_held = false;
+                }
                 log(self.store.set_paused(None).map_err(Into::into));
                 return "[zephyr] resumed".into();
             }
@@ -1685,9 +1711,10 @@ impl<'a> Router<'a> {
                 self.abort().await;
                 // Background tasks too (DESIGN §4.12); each still reports back as stopped.
                 crate::tasks::stop(&mut self.store, self.jobs, None);
-                // Approved actions running are `procs` commands; held ones stay held.
+                // Approved actions running are `procs` commands; held ones stay held, and
+                // delayed ones wait for the owner again (R47).
                 self.procs.stop_all();
-                self.waits.deny_all();
+                crate::actions::stop(&self.cfg, &self.store, &self.waits);
                 "[zephyr] stopped"
             }
         };
@@ -3982,6 +4009,80 @@ mod tests {
         );
         assert_eq!((&c.path, &c.projects), (&cfg.path, &cfg.projects));
         assert_eq!(r.cfg_tx.borrow().tick, cfg.tick, "and what the others read");
+    }
+
+    /// R49: main is woken once for each new note about an action, not on every tick while it
+    /// waits undelivered (each wake moves main's running command to the background).
+    #[tokio::test]
+    async fn main_is_woken_once_per_action_note() {
+        let cfg = on_file("actions-wake", "");
+        let jobs = Default::default();
+        let mut r = router(&cfg, &jobs);
+        let note = |r: &Router, id| {
+            r.store
+                .action_note(id, "declined", "the owner declined it")
+                .unwrap()
+        };
+        let held = |r: &Router| r.store.hold_action(&held_action(None)).unwrap();
+        assert!(!r.settled_actions(), "nothing new");
+        let (a, b) = (held(&r), held(&r));
+        assert!(note(&r, a));
+        assert!(r.settled_actions());
+        assert!(!r.settled_actions(), "the same row, still undelivered");
+        assert!(note(&r, b));
+        assert!(r.settled_actions(), "a new one");
+    }
+
+    /// I1: a delay that came due during a pause is asked again on the first tick after the
+    /// pause lifted by itself (a budget pause at midnight), never run.
+    #[tokio::test]
+    async fn a_delay_due_when_a_pause_lifts_is_asked_again() {
+        let cfg = on_file("actions-lift", "timezone = 'UTC'");
+        let jobs = Default::default();
+        let mut r = router(&cfg, &jobs);
+        r.store.set_paused(Some("user")).unwrap();
+        r.tick_actions();
+        // Due now, and the pause gone with no /resume: as a budget pause ends.
+        let id = r
+            .store
+            .hold_action(&held_action(Some(crate::now() - 1)))
+            .unwrap();
+        r.store.set_paused(None).unwrap();
+        r.tick_actions();
+        assert_eq!(r.store.action(id).unwrap().unwrap().status, "pending");
+        let card = r.store.pending_outbox().unwrap().pop().unwrap().text;
+        assert!(
+            card.starts_with(&format!("[zephyr] approve #{id}:")),
+            "{card}"
+        );
+        // The tick after that runs delays again.
+        let next = r
+            .store
+            .hold_action(&held_action(Some(crate::now() - 1)))
+            .unwrap();
+        r.tick_actions();
+        assert_eq!(r.store.action(next).unwrap().unwrap().status, "done");
+    }
+
+    /// A connector message held from main on `chat`, delayed to `due` when given.
+    fn held_action(due: Option<i64>) -> crate::store::NewAction {
+        crate::store::NewAction {
+            kind: crate::store::ActionKind::Pass,
+            class: "messages".into(),
+            targets: vec!["mail/send".into(), "a@x.org".into()],
+            summary: "mail/send".into(),
+            reason: None,
+            payload: r#"{"server": "mail", "tool": "send", "arguments": {}}"#.into(),
+            secrets: vec![],
+            origin: crate::store::Origin {
+                channel: "chat".into(),
+                sender: "owner".into(),
+                session: "main".into(),
+                run: "main:1".into(),
+                call_id: None,
+            },
+            due_at: due,
+        }
     }
 
     /// The owner's `/ok N` on `chat`, and the reply it got.

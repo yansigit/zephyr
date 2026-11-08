@@ -4598,6 +4598,12 @@ async fn a_delay_runs_on_the_tick_unless_cancelled() {
         std::fs::read_to_string(home.join("two.eml")).unwrap(),
         MAIL_TEXT
     );
+    // R45: whoever set it in motion is told it went.
+    reply_where(&gw, "chat", |r| {
+        r == "[zephyr] #2 (email to unreadable recipients) went at the end of its delay: running \
+              it as process #1; the agent gets its report"
+    })
+    .await;
     assert!(
         !home.join("one.eml").exists(),
         "the cancelled one never ran"
@@ -4804,5 +4810,159 @@ async fn no_drops_a_held_action_and_stop_kills_an_approved_one() {
     assert_eq!(action_status(&home, 2), "failed");
     assert_eq!(action_status(&home, 3), "pending");
     assert!(!home.join("kept.eml").exists());
+    gw.shutdown().await;
+}
+
+/// Sets or lifts a budget pause as the daemon writes one (`budget:<today>`); a lifted one reads
+/// as a budget pause of a past day, as one does after UTC midnight.
+fn budget_pause(home: &Path, on: bool) {
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    let value = match on {
+        true => "'budget:' || date('now')",
+        false => "'budget:2000-01-01'",
+    };
+    db.execute(
+        &format!("INSERT OR REPLACE INTO meta(key, value) VALUES ('paused', {value})"),
+        [],
+    )
+    .unwrap();
+}
+
+/// I1: a delay that falls due while a budget pause holds the gateway waits for the owner again;
+/// it never goes when the pause lifts.
+#[tokio::test]
+async fn a_delay_due_while_paused_is_asked_again() {
+    let home = home("gate-delay-paused");
+    let mut cfg = on_file(&home, "[approvals]\nmessages = \"delay 1\"");
+    cfg.tick = Duration::from_millis(200);
+    let gw = start(cfg);
+    gw.say("m1", "owner", &mail_via("paused.eml")).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains(&format!("\nexec: {HELD_UNREAD}"))
+    })
+    .await;
+    budget_pause(&home, true);
+    make_due(&home, 1);
+    // A tick while it is paused.
+    let beat = home.join("heartbeat");
+    let _ = std::fs::remove_file(&beat);
+    wait(|| beat.exists()).await;
+    budget_pause(&home, false);
+    let card = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    assert!(
+        card.ends_with("/ok 1 · /ok 1 once · /no 1 · expires in 24 h"),
+        "{card}"
+    );
+    assert_eq!(action_status(&home, 1), "pending");
+    assert!(!home.join("paused.eml").exists());
+    gw.say("m2", "owner", "/ok 1").await;
+    assert!(to_main(&home, 1).await.starts_with("[action #1 done;"));
+    assert_eq!(
+        std::fs::read_to_string(home.join("paused.eml")).unwrap(),
+        MAIL_TEXT
+    );
+    gw.shutdown().await;
+}
+
+/// I1: `/resume` asks again for what fell due while paused, before any tick could run it.
+#[tokio::test]
+async fn resume_asks_again_before_a_delay_goes() {
+    let home = home("gate-delay-resume");
+    let mut cfg = on_file(&home, "[approvals]\nmessages = \"delay 1\"");
+    cfg.tick = Duration::from_secs(60); // no tick between the pause and the resume
+    let gw = start(cfg);
+    gw.say("m1", "owner", &mail_via("resumed.eml")).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains(&format!("\nexec: {HELD_UNREAD}"))
+    })
+    .await;
+    gw.say("m2", "owner", "/pause").await;
+    reply_where(&gw, "chat", |r| r == PAUSED).await;
+    make_due(&home, 1);
+    gw.say("m3", "owner", "/resume").await;
+    reply_where(&gw, "chat", |r| r == "[zephyr] resumed").await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    assert_eq!(action_status(&home, 1), "pending");
+    assert!(!home.join("resumed.eml").exists());
+    gw.shutdown().await;
+}
+
+/// R44: with every process slot taken, `/ok` keeps the action waiting and says why.
+#[tokio::test]
+async fn a_full_process_table_keeps_the_approval_waiting() {
+    let home = home("gate-slots");
+    let gw = start(config(&home));
+    let sleep = r#"[call exec {"command": "sleep 30", "background": true}]"#;
+    let eight = [sleep; 8].join(" ");
+    gw.say("m1", "owner", &format!("{eight} {}", mail_via("slot.eml")))
+        .await;
+    reply_where(&gw, "chat", |r| {
+        r.contains(&format!("\nexec: {HELD_UNREAD}"))
+    })
+    .await;
+    assert_eq!(proc_status(&home, "running"), 8);
+    gw.say("m2", "owner", "/ok 1").await;
+    reply_where(&gw, "chat", |r| {
+        r == "[zephyr] 8 commands are running; /ok 1 again when one ends"
+    })
+    .await;
+    assert_eq!(action_status(&home, 1), "pending");
+    gw.say("m3", "owner", "/process stop 1").await;
+    wait(|| proc_status(&home, "running") == 7).await;
+    gw.say("m4", "owner", "/ok 1").await;
+    assert!(to_main(&home, 1).await.starts_with("[action #1 done;"));
+    assert_eq!(
+        std::fs::read_to_string(home.join("slot.eml")).unwrap(),
+        MAIL_TEXT
+    );
+    gw.shutdown().await;
+}
+
+/// R47: `/stop` stops what was set to go by itself: each delay waits for the owner again.
+#[tokio::test]
+async fn stop_asks_again_for_delayed_actions() {
+    use zephyr::store::{ActionKind, NewAction, Origin};
+    let home = home("gate-stop-delays");
+    let mut cfg = on_file(&home, "[approvals]\nmessages = \"delay 30\"");
+    cfg.tick = Duration::from_millis(200);
+    let gw = start(cfg);
+    gw.say("m1", "owner", &mail_via("stopped.eml")).await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] delayed #1:")).await;
+    // A delayed browser click, as the gate stores one.
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let wait_id = store
+        .hold_action(&NewAction {
+            kind: ActionKind::Wait,
+            class: "messages".into(),
+            targets: vec!["https://mail.x".into()],
+            summary: "click \"Send\" on https://mail.x".into(),
+            reason: None,
+            payload: "{}".into(),
+            secrets: vec![],
+            origin: Origin {
+                channel: "chat".into(),
+                sender: "owner".into(),
+                session: "main".into(),
+                run: "main:2".into(),
+                call_id: None,
+            },
+            due_at: Some(zephyr::now() + 600),
+        })
+        .unwrap();
+    gw.say("m2", "owner", "/stop").await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    reply_where(&gw, "chat", |r| {
+        r.starts_with(&format!("[zephyr] approve #{wait_id}:"))
+    })
+    .await;
+    assert_eq!(action_status(&home, 1), "pending");
+    assert_eq!(action_status(&home, wait_id), "pending");
+    make_due(&home, 1);
+    gw.say("m3", "owner", "/held").await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] held for you")).await;
+    assert!(
+        !home.join("stopped.eml").exists(),
+        "it no longer goes by itself"
+    );
     gw.shutdown().await;
 }

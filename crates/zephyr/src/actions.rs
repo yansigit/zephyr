@@ -89,9 +89,10 @@ pub enum By<'a> {
 
 /// `/ok N [once]`, and a delay that came due: carries out held action `id` exactly as it was
 /// stored, once (`take_action` settles it in one statement, so of two `/ok` only one runs it).
-/// `Ok` is the owner's answer once it was taken; `Err` the answer when it still waits (the
-/// gateway is paused, or a payment needs a strong channel) or nothing waits under that number.
-/// The owner approving under `ask-new` remembers its targets, unless `once`.
+/// `Ok` is the answer once it was taken (the owner's reply, or for a delay the notice its owner
+/// gets), whether it started or not; `Err` the answer when it still waits: the gateway is
+/// paused, a payment needs a strong channel, or every process slot is taken (R44). The owner
+/// approving under `ask-new` remembers its targets once it started, unless `once` (R46).
 pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<String, String> {
     let store = ctx.store;
     let failed = |e: rusqlite::Error| format!("[zephyr] reading proposal #{id} failed: {e}");
@@ -112,6 +113,13 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
             ));
         }
     }
+    // Before it is taken, so a full process table leaves the approval waiting (R44).
+    if a.kind == ActionKind::Run && !store.proc_slot_free().map_err(failed)? {
+        return Err(format!(
+            "[zephyr] {} commands are running; /ok {id} again when one ends",
+            crate::store::MAX_RUNNING_PROCS
+        ));
+    }
     let Some(a) = store.take_action(id, "running").map_err(failed)? else {
         return Err(not_waiting(id));
     };
@@ -121,17 +129,26 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
         _ => "approved",
     };
     audit(store, &a, decision);
-    // Only the owner's own approval makes a target known: a delay running out is none.
-    let remembered = match (by, once) {
-        (By::Owner { .. }, false) => remember(ctx.cfg, store, &a),
-        _ => String::new(),
-    };
-    let done = match a.kind {
+    let started = match a.kind {
         ActionKind::Run => run(ctx, &a),
-        ActionKind::Pass => pass(store, &a, now),
+        ActionKind::Pass => pass(store, &a, by, now),
         ActionKind::Wait => wait(ctx, &a),
     };
-    Ok(format!("{done}{remembered}"))
+    let (n, s) = (a.id, &a.summary);
+    Ok(match (started, by) {
+        (Ok(what), By::Owner { .. }) => {
+            // Only the owner's own approval of what started makes a target known.
+            let remembered = match once {
+                true => String::new(),
+                false => remember(ctx.cfg, store, &a),
+            };
+            format!("[zephyr] approved #{n} ({s}): {what}{remembered}")
+        }
+        (Ok(what), By::Delay) => {
+            format!("[zephyr] #{n} ({s}) went at the end of its delay: {what}")
+        }
+        (Err(why), by) => not_run(store, &a, by, &why),
+    })
 }
 
 /// Under `ask-new` the approved action's targets are known from now on (spec §4.3): what the
@@ -167,106 +184,77 @@ fn remember(cfg: &Config, store: &Store, a: &Action) -> String {
 
 /// A shell action: its command again, as the agent, through `procs`, as `exec` runs one (the
 /// same log, timeout and vault tokens, the grants checked again now); its end is reported to
-/// main on the run's channel.
-fn run(ctx: &Ctx, a: &Action) -> String {
+/// main on the run's channel. `Ok` says what started, `Err` why it did not.
+fn run(ctx: &Ctx, a: &Action) -> Result<String, String> {
     let mut args: Value = serde_json::from_str(&a.payload).unwrap_or_default();
     if !args.is_object() {
         args = serde_json::json!({ "command": a.command() });
     }
     args["secrets"] = serde_json::json!(a.secrets);
-    let call = match zephyr_policy::tools::exec_call(&args) {
-        Ok(call) => call,
-        Err(why) => return not_run(ctx.store, a, &why),
-    };
+    let call = zephyr_policy::tools::exec_call(&args)?;
     if let Decision::Deny(why) = zephyr_policy::policy::check("exec", &args) {
-        return not_run(ctx.store, a, &format!("the policy refuses it: {why}"));
+        return Err(format!("the policy refuses it: {why}"));
     }
     let env = match call.secrets.is_empty() {
-        true => Ok(Vec::new()),
-        false => crate::vault::exec_env(ctx.cfg, ctx.store, &call.command, &call.secrets),
+        true => Vec::new(),
+        false => crate::vault::exec_env(ctx.cfg, ctx.store, &call.command, &call.secrets)?,
     };
-    let env = match env {
-        Ok(env) => env,
-        Err(why) => return not_run(ctx.store, a, &why),
-    };
-    let Some(to) = origin(ctx.store, a) else {
-        return not_run(ctx.store, a, "there is no owner to report to");
-    };
-    match ctx
-        .procs
-        .start_action(ctx.cfg, ctx.store, a.id, call, to, env)
-    {
-        Ok(p) => format!(
-            "[zephyr] approved #{} ({}): running it as process #{p}; the agent gets its report",
-            a.id, a.summary
-        ),
-        Err(why) => not_run(ctx.store, a, &why),
-    }
+    let to = origin(ctx.store, a).ok_or("there is no owner to report to")?;
+    let p = (ctx.procs).start_action(ctx.cfg, ctx.store, a.id, call, to, env)?;
+    Ok(format!(
+        "running it as process #{p}; the agent gets its report"
+    ))
 }
 
 /// A connector action: a one-time pass for exactly that call (server, tool, arguments), good
 /// for 30 minutes; the agent is told to make it again.
-fn pass(store: &Store, a: &Action, now: i64) -> String {
+fn pass(store: &Store, a: &Action, by: By, now: i64) -> Result<String, String> {
     let args: Value = serde_json::from_str(&a.payload).unwrap_or_default();
-    let Some(digest) = crate::gate::pass_digest(&args) else {
-        return not_run(store, a, "the call names no server or tool");
-    };
-    if let Err(e) = store.add_pass(&digest, a.id, now + PASS_SECS) {
-        return not_run(store, a, &format!("its pass could not be stored: {e}"));
-    }
+    let digest = crate::gate::pass_digest(&args).ok_or("the call names no server or tool")?;
+    (store.add_pass(&digest, a.id, now + PASS_SECS))
+        .map_err(|e| format!("its pass could not be stored: {e}"))?;
     finish(store, a, "done", "a pass for 30 min");
-    note(
-        store,
-        a,
-        "approved",
-        &format!(
-            "the owner approved #{} ({}): make exactly that connector call again within 30 min \
-             and it goes through, once",
-            a.id, a.summary
-        ),
+    let (word, what) = match by {
+        By::Owner { .. } => ("approved", format!("the owner approved #{}", a.id)),
+        By::Delay => ("due", format!("#{}'s delay ended", a.id)),
+    };
+    let text = format!(
+        "{what} ({}): make exactly that connector call again within 30 min and it goes \
+         through, once",
+        a.summary
     );
-    format!(
-        "[zephyr] approved #{} ({}): the agent may make exactly that call once in the next 30 min",
-        a.id, a.summary
-    )
+    note(store, a, word, &text);
+    Ok("the agent may make exactly that call once in the next 30 min".into())
 }
 
 /// A browser action: the wrapper waiting on it goes on, if it still waits.
-fn wait(ctx: &Ctx, a: &Action) -> String {
+fn wait(ctx: &Ctx, a: &Action) -> Result<String, String> {
     match ctx.waits.answer(a.id, true) {
         true => {
             finish(ctx.store, a, "done", "the browser went on");
-            format!(
-                "[zephyr] approved #{} ({}): the browser goes on",
-                a.id, a.summary
-            )
+            Ok("the browser goes on".into())
         }
-        false => {
-            finish(ctx.store, a, "failed", "the browser was no longer waiting");
-            format!(
-                "[zephyr] #{} ({}): the browser is no longer waiting, so nothing was done",
-                a.id, a.summary
-            )
-        }
+        false => Err("the browser is no longer waiting, so nothing was done".into()),
     }
 }
 
-/// An approved action that did not start: failed, the agent told why, and the owner's answer.
-fn not_run(store: &Store, a: &Action, why: &str) -> String {
+/// A taken action that did not start: failed, the agent told why, and the answer for whoever
+/// set it in motion.
+fn not_run(store: &Store, a: &Action, by: By, why: &str) -> String {
     finish(store, a, "failed", why);
-    note(
-        store,
-        a,
-        "not run",
-        &format!(
-            "the owner approved #{} ({}), but it did not start: {why}",
-            a.id, a.summary
+    let (n, s) = (a.id, &a.summary);
+    let (agent, owner) = match by {
+        By::Owner { .. } => (
+            format!("the owner approved #{n} ({s}), but it did not start: {why}"),
+            format!("[zephyr] approved #{n} ({s}), but it did not start: {why}"),
         ),
-    );
-    format!(
-        "[zephyr] approved #{} ({}), but it did not start: {why}",
-        a.id, a.summary
-    )
+        By::Delay => (
+            format!("#{n} ({s}) came due, but it did not start: {why}"),
+            format!("[zephyr] #{n} ({s}) came due, but it did not start: {why}"),
+        ),
+    };
+    note(store, a, "not run", &agent);
+    owner
 }
 
 /// The owner's decision on `a` as an audit row (spec §4.9), beside the gate's own: the action's
@@ -378,22 +366,21 @@ pub fn held(cfg: &Config, store: &Store) -> String {
     format!("[zephyr] held for you, newest first:\n{}", lines.join("\n"))
 }
 
-/// The router's tick (spec §4.6): delays that came due go as an `/ok` would, unless the gateway
-/// is paused (then they wait for `/resume`); actions left unanswered expire, and the agent is
+/// The router's tick (spec §4.6). Delays that came due go as an `/ok` would, and whoever set
+/// each in motion is told how it ended (R45). While the gateway is paused, and on the first tick
+/// after a pause lifted by itself (a budget pause at midnight), `held` is set: what came due
+/// waits for the owner again instead, never going late on its own (I1). A due command with no
+/// free process slot waits for the owner too. Actions left unanswered expire, and the agent is
 /// told; a browser wait whose action ended is denied.
-pub fn tick(ctx: &Ctx, now: i64) {
+pub fn tick(ctx: &Ctx, now: i64, held: bool) {
     let store = ctx.store;
     // A store error counts as paused: nothing goes on a guess.
     let paused = store.pause_reason().map_or(true, |p| p.is_some());
-    if !paused {
+    if held || paused {
+        ask_again(ctx.cfg, store, now);
+    } else {
         match store.due_actions(now) {
-            Ok(due) => {
-                for a in due {
-                    if let Err(why) = approve(ctx, a.id, false, By::Delay, now) {
-                        eprintln!("zephyr: delayed #{} did not go: {why}", a.id);
-                    }
-                }
-            }
+            Ok(due) => due.iter().for_each(|a| due_now(ctx, a, now)),
             Err(e) => eprintln!("zephyr: reading delayed actions failed: {e}"),
         }
     }
@@ -419,29 +406,209 @@ pub fn tick(ctx: &Ctx, now: i64) {
     ctx.waits.deny_settled(store);
 }
 
+/// Delayed action `a` came due: it goes, and its owner is told how it ended. With every process
+/// slot taken it waits for the owner instead, who is told so.
+fn due_now(ctx: &Ctx, a: &Action, now: i64) {
+    let store = ctx.store;
+    let full = a.kind == ActionKind::Run && !store.proc_slot_free().unwrap_or(false);
+    if full {
+        match store.unschedule(a.id) {
+            Ok(true) => {
+                let (n, s) = (a.id, &a.summary);
+                let text = format!(
+                    "[zephyr] #{n} ({s}) came due, but {} commands are running, so it waits for \
+                     you: /ok {n} when one ends, /no {n} drops it",
+                    crate::store::MAX_RUNNING_PROCS
+                );
+                tell(store, a, &text);
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("zephyr: holding delayed #{} failed: {e}", a.id),
+        }
+        return;
+    }
+    match approve(ctx, a.id, false, By::Delay, now) {
+        Ok(text) => tell(store, a, &text),
+        Err(why) => eprintln!("zephyr: delayed #{} did not go: {why}", a.id),
+    }
+}
+
+/// Delays due by `due_by` wait for the owner again, each card shown once more: at start, while
+/// paused, at `/resume`, and at `/stop` (`i64::MAX`, every delay).
+pub fn ask_again(cfg: &Config, store: &Store, due_by: i64) {
+    match store.ask_again(due_by) {
+        Ok(back) => ask(cfg, store, &back),
+        Err(e) => eprintln!("zephyr: holding delayed actions failed: {e}"),
+    }
+}
+
+/// `/resume` (I1): what came due during the pause waits for the owner, before any tick runs it.
+pub fn resume(cfg: &Config, store: &Store, now: i64) {
+    ask_again(cfg, store, now);
+}
+
+/// `/stop` (R47): every delay waits for the owner again, so nothing set to go by itself goes
+/// after the owner said stop; every browser action waiting is denied. Held actions stay held.
+pub fn stop(cfg: &Config, store: &Store, waits: &Waits) {
+    ask_again(cfg, store, i64::MAX);
+    waits.deny_all();
+}
+
 /// At start (spec §4.9), after `procs` adopted what a re-exec handed over: a delay that came due
 /// while the daemon was down waits for the owner again, who is shown its card once more, and an
 /// action that was running is `unknown` unless its command is still running.
 pub fn restore(cfg: &Config, store: &Store, now: i64) {
-    let back = match store.restore_actions(now) {
-        Ok(back) => back,
-        Err(e) => return eprintln!("zephyr: restoring held actions failed: {e}"),
+    match store.restore_actions(now) {
+        Ok(back) => ask(cfg, store, &back),
+        Err(e) => eprintln!("zephyr: restoring held actions failed: {e}"),
+    }
+}
+
+/// Shows each action's card to whoever it waits for.
+fn ask(cfg: &Config, store: &Store, actions: &[Action]) {
+    for a in actions {
+        tell(store, a, &crate::gate::card(a, cfg, store));
+    }
+}
+
+/// A notice about `a` for the owner of the run that asked (else the owner last answered).
+fn tell(store: &Store, a: &Action, text: &str) {
+    let told = match a.origin.channel.is_empty() {
+        true => store.notify_last_owner(text),
+        false => store.notify(&a.origin.channel, &a.origin.sender, text),
     };
-    for a in back {
-        let card = crate::gate::card(&a, cfg, store);
-        let told = match a.origin.channel.is_empty() {
-            true => store.notify_last_owner(&card),
-            false => store.notify(&a.origin.channel, &a.origin.sender, &card),
-        };
-        if let Err(e) = told {
-            eprintln!("zephyr: asking the owner about #{} again failed: {e}", a.id);
-        }
+    if let Err(e) = told {
+        eprintln!("zephyr: telling the owner about #{} failed: {e}", a.id);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{NewAction, Origin};
+
+    fn setup(name: &str, extra: &str) -> (Arc<Config>, Store) {
+        let home = crate::test_dir(name);
+        let text = format!("rpi = '/r'\nhome = {home:?}\ntimezone = 'UTC'\n{extra}");
+        let cfg: Config = toml::from_str(&text).unwrap();
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let store = Store::open(&cfg.db_path()).unwrap();
+        (Arc::new(cfg), store)
+    }
+
+    /// A message held from main on `chat`, as the gate stores one.
+    fn hold(
+        store: &Store,
+        kind: ActionKind,
+        payload: &str,
+        secrets: &[&str],
+        due: Option<i64>,
+    ) -> i64 {
+        store
+            .hold_action(&NewAction {
+                kind,
+                class: "messages".into(),
+                targets: vec!["a@x.org".into()],
+                summary: "email to a@x.org".into(),
+                reason: None,
+                payload: payload.into(),
+                secrets: secrets.iter().map(|s| s.to_string()).collect(),
+                origin: Origin {
+                    channel: "chat".into(),
+                    sender: "o".into(),
+                    session: "main".into(),
+                    run: "main:1".into(),
+                    call_id: Some("c1".into()),
+                },
+                due_at: due,
+            })
+            .unwrap()
+    }
+
+    fn told(store: &Store) -> Vec<String> {
+        (store.pending_outbox().unwrap().into_iter())
+            .map(|o| o.text)
+            .collect()
+    }
+
+    const SEND: &str = r#"{"command": "himalaya message send < m.eml"}"#;
+
+    /// R46: a target becomes known only once its action started.
+    #[test]
+    fn a_target_is_remembered_only_when_its_action_starts() {
+        let (cfg, store) = setup("actions-remember", "[approvals]\npreset = \"semi\"");
+        let (procs, waits) = (Procs::default(), Waits::default());
+        let ctx = Ctx {
+            cfg: &cfg,
+            store: &store,
+            procs: &procs,
+            waits: &waits,
+        };
+        // Its token is not in the vault: it cannot start.
+        let id = hold(&store, ActionKind::Run, SEND, &["NOPE"], None);
+        let by = By::Owner { channel: "chat" };
+        let reply = approve(&ctx, id, false, by, crate::now()).unwrap();
+        assert!(
+            reply.starts_with(&format!(
+                "[zephyr] approved #{id} (email to a@x.org), but it did not start: not run: no \
+                 token named NOPE"
+            )),
+            "{reply}"
+        );
+        assert!(!reply.contains("without asking"), "{reply}");
+        assert!(!store.all_known("messages", &["a@x.org".into()]).unwrap());
+        assert_eq!(store.action(id).unwrap().unwrap().status, "failed");
+    }
+
+    /// R45: whoever set a delay in motion is told how it ended: gone, or not started and why.
+    #[tokio::test]
+    async fn the_owner_is_told_how_a_delay_ended() {
+        let (cfg, store) = setup("actions-delay-told", "");
+        let (procs, waits) = (Procs::default(), Waits::default());
+        let ctx = Ctx {
+            cfg: &cfg,
+            store: &store,
+            procs: &procs,
+            waits: &waits,
+        };
+        let now = crate::now();
+        let pass = r#"{"server": "mail", "tool": "send", "arguments": {"to": "a@x.org"}}"#;
+        let p = hold(&store, ActionKind::Pass, pass, &[], Some(now - 1));
+        let w = hold(&store, ActionKind::Wait, "{}", &[], Some(now - 1));
+        tick(&ctx, now, false);
+        let status = |id| store.action(id).unwrap().unwrap().status;
+        assert_eq!((status(p).as_str(), status(w).as_str()), ("done", "failed"));
+        let told = told(&store);
+        assert!(
+            told.contains(&format!(
+                "[zephyr] #{p} (email to a@x.org) went at the end of its delay: the agent may make \
+                 exactly that call once in the next 30 min"
+            )),
+            "{told:?}"
+        );
+        assert!(
+            told.contains(&format!(
+                "[zephyr] #{w} (email to a@x.org) came due, but it did not start: the browser is \
+                 no longer waiting, so nothing was done"
+            )),
+            "{told:?}"
+        );
+        // With every process slot taken, a due command waits for the owner instead.
+        for _ in 0..crate::store::MAX_RUNNING_PROCS {
+            store.add_proc("sleep 9", "chat", "o").unwrap().unwrap();
+        }
+        let r = hold(&store, ActionKind::Run, SEND, &[], Some(now - 1));
+        tick(&ctx, now, false);
+        assert_eq!(status(r), "pending");
+        let told = super::tests::told(&store);
+        assert!(
+            told.contains(&format!(
+                "[zephyr] #{r} (email to a@x.org) came due, but 8 commands are running, so it \
+                 waits for you: /ok {r} when one ends, /no {r} drops it"
+            )),
+            "{told:?}"
+        );
+    }
 
     #[tokio::test]
     async fn a_wait_is_answered_once_and_denied_when_its_action_ends() {

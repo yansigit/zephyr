@@ -1371,11 +1371,12 @@ impl Store {
         })
     }
 
-    /// Whether a report or note about a held action waits for main (`action_note`).
-    pub fn action_rows_waiting(&self) -> rusqlite::Result<bool> {
+    /// The newest report or note about a held action still waiting for main (`action_note`),
+    /// by inbox id; 0 when none waits.
+    pub fn newest_action_row(&self) -> rusqlite::Result<i64> {
         self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM inbox WHERE status = 'new'
-                           AND platform_msg_id LIKE 'action-%')",
+            "SELECT coalesce(max(id), 0) FROM inbox
+             WHERE status = 'new' AND platform_msg_id LIKE 'action-%'",
             [],
             |r| r.get(0),
         )
@@ -1474,15 +1475,7 @@ impl Store {
     /// actions that were running when it stopped are `unknown`, never run again, and main is
     /// told. One whose command `procs` still runs stays `running`; it reports when it ends.
     pub fn restore_actions(&self, now: i64) -> rusqlite::Result<Vec<Action>> {
-        let back = {
-            let mut stmt = self.db.prepare(&format!(
-                "UPDATE proposals SET status = 'pending'
-                 WHERE kind != 'command' AND status = 'scheduled' AND due_at <= ?1
-                 RETURNING {ACTION_COLS}"
-            ))?;
-            let rows = stmt.query_map(params![now], action_row)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
+        let back = self.ask_again(now)?;
         let lost = {
             let mut stmt = self.db.prepare(
                 "UPDATE proposals SET status = 'unknown', settled_at = ?1
@@ -1504,6 +1497,38 @@ impl Store {
             })?;
         }
         Ok(back)
+    }
+
+    /// Delayed actions due by `due_by` wait for the owner again (`pending`), never going by
+    /// themselves: at start, while the gateway is paused, at `/resume` and at `/stop`
+    /// (`i64::MAX`). Returns them, so the owner is asked.
+    pub fn ask_again(&self, due_by: i64) -> rusqlite::Result<Vec<Action>> {
+        let mut stmt = self.db.prepare(&format!(
+            "UPDATE proposals SET status = 'pending'
+             WHERE kind != 'command' AND status = 'scheduled' AND due_at <= ?1
+             RETURNING {ACTION_COLS}"
+        ))?;
+        let rows = stmt.query_map(params![due_by], action_row)?;
+        rows.collect()
+    }
+
+    /// Delayed action `id` waits for the owner again. Returns whether it was delayed.
+    pub fn unschedule(&self, id: i64) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
+            "UPDATE proposals SET status = 'pending'
+             WHERE id = ?1 AND kind != 'command' AND status = 'scheduled'",
+            params![id],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Whether another command may start: fewer than [`MAX_RUNNING_PROCS`] are running.
+    pub fn proc_slot_free(&self) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT (SELECT count(*) FROM procs WHERE status = 'running') < ?1",
+            params![MAX_RUNNING_PROCS],
+            |r| r.get(0),
+        )
     }
 
     /// Remembers the targets the owner approved for `class`. `unknown` is never remembered.
@@ -2600,7 +2625,7 @@ mod tests {
             "{texts:?}"
         );
         assert!(texts[3].starts_with(&format!("[action #{lost} unknown; zephyr's note")));
-        assert!(store.action_rows_waiting().unwrap());
+        assert!(store.newest_action_row().unwrap() > 0);
         // `action_report` itself, for a command run some other way: once, and only while running.
         let e = id(&store);
         store
