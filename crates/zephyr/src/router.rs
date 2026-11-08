@@ -689,6 +689,7 @@ impl<'a> Router<'a> {
                         eprintln!("zephyr: zephyr.toml or secrets.env changed: {text}");
                     }
                     self.revert_due().await;
+                    self.upgrade_notice();
                     // Delays that came due, and held actions nobody answered (approvals §4.6).
                     self.tick_actions();
                     // A budget pause ends at UTC midnight with nothing else to wake the router;
@@ -2186,13 +2187,33 @@ impl<'a> Router<'a> {
                 None,
             );
             log(logged.map_err(Into::into));
-            let told = self.store.notify_last_owner(
-                "[zephyr] approvals are off, as before this version; \
-                 /approvals manual or /settings turns them on",
-            );
-            log(told.map_err(Into::into));
+            log(self
+                .store
+                .set_upgrade_notice_pending(true)
+                .map_err(Into::into));
         }
         log(self.store.clear_upgraded().map_err(Into::into));
+        self.upgrade_notice();
+    }
+
+    /// The once-only notice that an upgrade kept approvals off. It waits, across restarts, until
+    /// there is an owner to tell (an install whose agent has only run jobs has none yet).
+    fn upgrade_notice(&self) {
+        if !self.store.upgrade_notice_pending() || self.store.last_owner().ok().flatten().is_none()
+        {
+            return;
+        }
+        let told = self.store.notify_last_owner(
+            "[zephyr] approvals are off, as before this version; \
+             /approvals manual or /settings turns them on",
+        );
+        match told {
+            Ok(()) => log(self
+                .store
+                .set_upgrade_notice_pending(false)
+                .map_err(Into::into)),
+            Err(e) => log(Err(e.into())),
+        }
     }
 
     /// The one way a setting changes (settings spec §4.3), whoever asks: the key is looked up,

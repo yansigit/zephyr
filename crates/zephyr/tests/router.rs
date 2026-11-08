@@ -5467,3 +5467,37 @@ async fn a_fresh_install_starts_in_manual() {
 fn on_file_keep(home: &Path) -> Config {
     Config::load(&home.join("zephyr.toml")).unwrap()
 }
+
+/// An upgraded install whose agent never took up an owner message (scheduled jobs only): the
+/// preset is written at the start, the notice waits for the first owner message and is sent once.
+#[tokio::test]
+async fn an_upgraded_install_with_no_owner_yet_is_told_after_the_first_message() {
+    let home = home("upgraded-no-owner");
+    old_install(&home);
+    rusqlite::Connection::open(home.join("state.db"))
+        .unwrap()
+        .execute("DELETE FROM inbox", [])
+        .unwrap();
+    let mut cfg = on_file(&home, "");
+    cfg.tick = Duration::from_millis(200);
+    let gw = start(cfg);
+    wait(|| !log(&home, "start").is_empty()).await;
+    let text = std::fs::read_to_string(home.join("zephyr.toml")).unwrap();
+    assert!(text.contains("preset = \"full\""), "{text}");
+    assert!(gw.replies().is_empty(), "no owner to tell yet");
+    gw.say("m1", "owner", "hi").await;
+    wait(|| gw.replies().len() >= 2).await;
+    let r = gw.replies();
+    assert!(
+        r.contains(&OFF_NOTICE.to_string()) && r.contains(&"echo: [chat #1] hi".to_string()),
+        "{r:?}"
+    );
+    gw.say("m2", "owner", "again").await;
+    assert_eq!(
+        gw.wait_replies(3).await.len(),
+        3,
+        "told once, not again: {:?}",
+        gw.replies()
+    );
+    gw.shutdown().await;
+}

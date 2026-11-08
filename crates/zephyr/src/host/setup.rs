@@ -33,9 +33,10 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
     if !rest.is_empty() {
         bail!("{USAGE}");
     }
-    if let Some(p) = &preset {
-        crate::approvals::Preset::parse(p).map_err(|e| anyhow::anyhow!("--preset: {e}"))?;
-    }
+    let preset = preset
+        .map(|p| crate::approvals::Preset::parse(&p))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("--preset: {e}"))?;
 
     if !no_start && !super::quiet(super::docker(&["version"])) {
         bail!("docker is not reachable: install Docker and make sure `docker version` works");
@@ -93,8 +94,8 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
         conf::set(&mut doc, "model", m)?;
     }
     // Without --preset, [approvals] stays absent, which is `manual`; the interactive run asks.
-    if let Some(p) = preset.as_deref().filter(|_| non_interactive) {
-        conf::set(&mut doc, "approvals.preset", &p.to_ascii_lowercase())?;
+    if let Some(p) = preset.filter(|_| non_interactive) {
+        conf::set(&mut doc, "approvals.preset", p.name())?;
     }
     h.data.save(&doc)?;
 
@@ -177,31 +178,30 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
             channel_add(h, kind)?;
         }
     }
-    init_approvals(h, preset.as_deref())?;
+    init_approvals(h, preset)?;
     run(&mut super::docker(&["restart", &h.container]))?;
     h.doctor(false)
 }
 
 /// The preset to start in (approvals spec §4.10), then the private facts. A config that already
 /// has an `[approvals]` table (a re-run of `init`) keeps it unless `--preset` says otherwise.
-fn init_approvals(h: &Host, preset: Option<&str>) -> anyhow::Result<()> {
+fn init_approvals(h: &Host, preset: Option<crate::approvals::Preset>) -> anyhow::Result<()> {
     use crate::approvals::Preset;
     let mut doc = h.data.load()?;
     let chosen = match preset {
-        Some(p) => Some(Preset::parse(p).map_err(anyhow::Error::msg)?),
+        Some(p) => Some(p),
         None if doc.get("approvals").is_some() => None,
         None => {
-            let items = [
-                "manual: every message, post and payment waits for your OK",
-                "semi: messages to people you have not written to, posts and payments wait",
-                "full: nothing waits (what zephyr did before approvals)",
-            ];
+            let presets = [Preset::Manual, Preset::Semi, Preset::Full];
+            let items: Vec<String> = (presets.iter())
+                .map(|p| format!("{}: {}", p.name(), p.summary()))
+                .collect();
             let i = Select::new()
                 .with_prompt("Approvals: how much may the agent do without asking you")
-                .items(items)
+                .items(&items)
                 .default(0)
                 .interact()?;
-            Some([Preset::Manual, Preset::Semi, Preset::Full][i])
+            Some(presets[i])
         }
     };
     if let Some(p) = chosen {
@@ -234,7 +234,7 @@ fn init_approvals(h: &Host, preset: Option<&str>) -> anyhow::Result<()> {
 
 /// One fact, asked for: its name, kind and value (hidden), saved as `zephyr facts add` does.
 fn add_fact(h: &Host) -> anyhow::Result<()> {
-    use crate::facts::{parse, put, render, Fact, FactKind};
+    use crate::facts::FactKind;
     let name: String = Input::new()
         .with_prompt("Fact name (e.g. phone)")
         .interact_text()?;
@@ -248,6 +248,21 @@ fn add_fact(h: &Host) -> anyhow::Result<()> {
         .with_prompt(format!("value of {name} (hidden)"))
         .allow_empty_password(true)
         .interact()?;
+    let kind = FactKind::parse(kinds[k]).unwrap_or_default();
+    println!("{}", save_fact(h, &name, kind, &value)?);
+    Ok(())
+}
+
+/// Saves one fact in facts.toml the way `zephyr facts add` does: the name trimmed, an existing
+/// fact of that name keeping its allowed targets. Returns what to tell the owner.
+fn save_fact(
+    h: &Host,
+    name: &str,
+    kind: crate::facts::FactKind,
+    value: &str,
+) -> anyhow::Result<String> {
+    use crate::facts::{parse, put, render, Fact};
+    let name = name.trim();
     let text = match h.data.read(crate::facts::FILE) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         r => r?,
@@ -255,16 +270,17 @@ fn add_fact(h: &Host) -> anyhow::Result<()> {
     let mut facts = parse(&text)?;
     let allow = (facts.iter().find(|f| f.name == name)).map_or_else(Vec::new, |f| f.allow.clone());
     let fact = Fact {
-        name: name.trim().into(),
-        kind: FactKind::parse(kinds[k]).unwrap_or_default(),
+        name: name.into(),
+        kind,
         value: value.trim().into(),
         allow,
     };
-    let name = fact.name.clone();
-    put(&mut facts, fact, true)?;
+    let new = put(&mut facts, fact, true)?;
     h.data.write(crate::facts::FILE, &render(&text, &facts)?)?;
-    println!("saved the fact {name}; calls holding it are held for your OK");
-    Ok(())
+    Ok(match new {
+        true => format!("saved the fact {name}; calls holding it are held for your OK"),
+        false => format!("replaced the value of {name}"),
+    })
 }
 
 fn known_provider(id: &str) -> anyhow::Result<()> {
@@ -910,7 +926,7 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
 /// stdin line when it is not a terminal; never taken as an argument. Adding over an existing name
 /// replaces its value and keeps its allowed targets.
 pub fn facts(h: &Host, mut a: Args) -> anyhow::Result<()> {
-    use crate::facts::{allow, parse, put, remove, render, Fact, FactKind};
+    use crate::facts::{allow, parse, remove, render, FactKind};
     let kind = a.value("--kind")?;
     let rest = a.rest()?;
     let usage = "usage: zephyr facts list | add NAME --kind text|digits|email | rm NAME | \
@@ -944,21 +960,8 @@ pub fn facts(h: &Host, mut a: Args) -> anyhow::Result<()> {
                     .transpose()?
                     .unwrap_or_default(),
             };
-            let allowed = facts
-                .iter()
-                .find(|f| f.name == name)
-                .map(|f| f.allow.clone());
-            let fact = Fact {
-                name: name.into(),
-                kind,
-                value: value.trim().into(),
-                allow: allowed.unwrap_or_default(),
-            };
-            let new = put(&mut facts, fact, true)?;
-            match new {
-                true => format!("saved the fact {name}; calls holding it are held for your OK"),
-                false => format!("replaced the value of {name}"),
-            }
+            println!("{}", save_fact(h, name, kind, &value)?);
+            return Ok(());
         }
         ["rm", name] => match remove(&mut facts, name) {
             true => format!("removed {name}"),

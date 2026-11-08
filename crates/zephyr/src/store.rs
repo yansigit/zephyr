@@ -796,6 +796,33 @@ impl Store {
             .and_then(|v| v.parse().ok())
     }
 
+    /// Whether the owner still has to be told that an upgrade kept approvals off.
+    pub fn upgrade_notice_pending(&self) -> bool {
+        (self.db)
+            .query_row(
+                "SELECT 1 FROM meta WHERE key = 'upgrade_notice'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    pub fn set_upgrade_notice_pending(&self, pending: bool) -> rusqlite::Result<()> {
+        match pending {
+            true => self.db.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('upgrade_notice', '1')",
+                [],
+            ),
+            false => self
+                .db
+                .execute("DELETE FROM meta WHERE key = 'upgrade_notice'", []),
+        }?;
+        Ok(())
+    }
+
     /// The upgrade has been dealt with.
     pub fn clear_upgraded(&self) -> rusqlite::Result<()> {
         self.db

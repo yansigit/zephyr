@@ -454,6 +454,46 @@ fn init_non_interactive_takes_preset_flag() {
 }
 
 #[test]
+fn init_writes_the_parsed_preset_name() {
+    let env = Env::new("init-preset-trim");
+    env.init(&["--no-start", "--preset", " Full"]);
+    let config = env.config();
+    assert!(config.contains("preset = \"full\""), "{config}");
+}
+
+#[test]
+fn saving_a_fact_under_a_name_with_spaces_replaces_it_and_keeps_its_targets() {
+    let env = Env::new("facts-trim");
+    env.init(&["--no-start"]);
+    let out = env.zephyr_input(&["facts", "add", "pin", "--kind", "digits"], "4829105\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    env.ok(&["facts", "allow", "pin", "mum@example.com"]);
+    let out = env.zephyr_input(
+        &["facts", "add", "pin ", "--kind", "digits"],
+        "5550102345\n",
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout(&out).contains("replaced the value of pin"),
+        "{}",
+        stdout(&out)
+    );
+    let list = env.ok(&["facts", "list"]);
+    assert!(
+        list.contains("pin (digits) allow: mum@example.com"),
+        "{list}"
+    );
+}
+
+#[test]
 fn init_non_interactive_builds_the_layout_and_starts_the_container() {
     let env = Env::new("init");
     env.init(&[

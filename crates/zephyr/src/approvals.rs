@@ -102,6 +102,22 @@ impl Preset {
         }
     }
 
+    /// What the preset sets, from the table below: `messages ask · posts ask · money ask · facts
+    /// hold` for the owner choosing one (`zephyr init`).
+    pub fn summary(self) -> String {
+        let shown = |part| match self.value(part) {
+            Val::Mode(m) => m.to_string(),
+            Val::Facts(f) => f.name().to_string(),
+        };
+        format!(
+            "messages {} · posts {} · money {} · facts {}",
+            shown("messages"),
+            shown("posts"),
+            shown("money"),
+            shown("facts")
+        )
+    }
+
     /// The preset's own value for `part`: spec §4.3's table.
     fn value(self, part: &str) -> Val {
         use Mode::*;
@@ -537,6 +553,18 @@ mod tests {
 
     fn modes(e: &Effective) -> (Mode, Mode, Mode, FactsMode) {
         (e.messages, e.posts, e.money, e.facts)
+    }
+
+    #[test]
+    fn a_presets_summary_comes_from_its_table() {
+        assert_eq!(
+            Preset::Semi.summary(),
+            "messages ask-new · posts delay 5 · money ask · facts hold"
+        );
+        assert_eq!(
+            Preset::Full.summary(),
+            "messages auto · posts auto · money auto · facts warn"
+        );
     }
 
     #[test]
