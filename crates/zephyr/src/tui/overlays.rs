@@ -321,19 +321,49 @@ pub struct Form {
     pub fields: Vec<(&'static str, bool, String)>,
 }
 
+/// A form's fields as `Debug` prints them: a secret one by its length only.
+pub(super) fn fields_debug(fields: &[(&'static str, bool, String)]) -> Vec<String> {
+    (fields.iter())
+        .map(|(label, secret, text)| match secret {
+            true => format!("{label}: {} chars", text.chars().count()),
+            false => format!("{label}: {text:?}"),
+        })
+        .collect()
+}
+
+/// A form's fields, one row each, the keyboard's marked: a secret field is drawn one bullet per
+/// character, so onlookers learn only its length.
+pub(super) fn field_rows(
+    fields: &[(&'static str, bool, String)],
+    at: usize,
+    p: &Palette,
+) -> Vec<Row> {
+    let mut out = vec![];
+    for (i, (label, secret, text)) in fields.iter().enumerate() {
+        let shown = match secret {
+            true => glyph("•").repeat(text.chars().count()),
+            false => text.clone(),
+        };
+        let (mark, cursor) = match i == at {
+            true => (p.accent.fg(glyph("›")), CURSOR_MARKER),
+            false => (" ".into(), ""),
+        };
+        let label = p.muted.fg(&format!("{label:<10}"));
+        out.push(Row::Line(format!(
+            " {mark} {label}{}{cursor}",
+            p.text.fg(&shown)
+        )));
+    }
+    out
+}
+
 impl std::fmt::Debug for Form {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let fields: Vec<String> = (self.fields.iter())
-            .map(|(label, secret, text)| match secret {
-                true => format!("{label}: {} chars", text.chars().count()),
-                false => format!("{label}: {text:?}"),
-            })
-            .collect();
         f.debug_struct("Form")
             .field("kind", &self.kind)
             .field("editing", &self.editing)
             .field("at", &self.at)
-            .field("fields", &fields)
+            .field("fields", &fields_debug(&self.fields))
             .finish()
     }
 }
@@ -601,11 +631,15 @@ pub enum Action {
         value: String,
         until: Option<String>,
     },
-    /// Decide a waiting proposal: `zephyr.decide` with `ok`, `once` or `no`.
+    /// Decide a waiting proposal: `zephyr.decide` with `ok`, `once`, `no` or `cancel`.
     Decide {
         id: i64,
         verb: String,
     },
+    /// Save this private fact (`Fact`'s Debug prints only its value's length).
+    FactsPut(Box<crate::facts::Fact>),
+    /// Delete this private fact.
+    FactsRm(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1167,21 +1201,7 @@ fn vault_rows(o: &Overlay, p: &Palette) -> Vec<Row> {
             false => format!("add a {what}"),
         };
         out.push(Row::Head(title, String::new()));
-        for (i, (label, secret, text)) in form.fields.iter().enumerate() {
-            let shown = match secret {
-                true => glyph("•").repeat(text.chars().count()),
-                false => text.clone(),
-            };
-            let (mark, cursor) = match i == form.at {
-                true => (p.accent.fg(glyph("›")), CURSOR_MARKER),
-                false => (" ".into(), ""),
-            };
-            let label = p.muted.fg(&format!("{label:<10}"));
-            out.push(Row::Line(format!(
-                " {mark} {label}{}{cursor}",
-                p.text.fg(&shown)
-            )));
-        }
+        out.extend(field_rows(&form.fields, form.at, p));
         let keep = match form.editing {
             true => "; an empty secret keeps the saved one",
             false => "",
@@ -1302,7 +1322,7 @@ fn vault_key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
     Action::None
 }
 
-/// A paste into the vault form or a settings editor goes where typing would.
+/// A paste into the vault form, a settings editor or the facts form goes where typing would.
 pub fn paste(o: &mut Overlay, text: &str) {
     if let Some(form) = o.vault.form.as_mut().filter(|_| o.kind == Kind::Vault) {
         form.type_text(text);
@@ -2658,6 +2678,393 @@ mod tests {
         let got = draw(&mut o, &s, 80, 20);
         assert!(got[1].contains("nothing waits for you"), "{got:?}");
         assert!(got[5].starts_with("│ › Waiting (0)"), "{got:?}");
+    }
+
+    /// `zephyr.settings` with its Approvals section, cut down (made-up values). `modified`: a
+    /// hand-set value differs from the preset.
+    fn approvals_answer(modified: bool) -> serde_json::Value {
+        use serde_json::json;
+        let row = |key: &str, label: &str, kind: serde_json::Value, value: &str, source: &str| {
+            json!({"key": key, "label": label, "help": format!("help for {key}"), "kind": kind,
+                   "value": value, "source": source, "access": "tighten", "strong": true,
+                   "until": null, "modified": false})
+        };
+        let mode = |options: &[&str]| json!({"type": "optional", "inner": {"type": "mode", "options": options}});
+        let mut preset = row(
+            "approvals.preset",
+            "Preset",
+            json!({"type": "choice", "options": ["manual", "semi", "full"]}),
+            "semi",
+            "you",
+        );
+        preset["modified"] = json!(modified);
+        let classes = ["ask", "ask-new", "delay N", "auto"];
+        json!({"sections": [
+            {"name": "Model", "settings": [
+                row("model", "Model", json!({"type": "model"}), "anthropic/claude-opus-5", "you")]},
+            {"name": "Approvals", "settings": [
+                row("facts", "Private facts", json!({"type": "text", "max": 4000}), "home-address", "you"),
+                preset,
+                row("approvals.messages", "Messages", mode(&classes), "ask", "you"),
+                row("approvals.posts", "Posts", mode(&classes), "delay 5", "preset"),
+                row("approvals.money", "Payments", mode(&["ask", "delay N", "auto", "auto N"]),
+                    "auto 50", "you"),
+                row("approvals.currency", "Currency", json!({"type": "text", "max": 3}), "EUR", "you"),
+                row("approvals.facts", "Facts check",
+                    json!({"type": "optional", "inner": {"type": "choice", "options": ["hold", "warn", "off"]}}),
+                    "hold", "preset"),
+            ]},
+            {"name": "Read-only", "settings": [
+                {"key": "owners", "label": "Owners", "kind": {"type": "text", "max": 0},
+                 "access": "read-only"}]},
+        ], "strong_channels": ["tui", "chat"]})
+    }
+
+    /// The line of `got` that holds `label`.
+    fn line_of<'a>(got: &'a [String], label: &str) -> &'a str {
+        let found = got.iter().find(|l| l.contains(label));
+        found.unwrap_or_else(|| panic!("no {label:?} in {got:?}"))
+    }
+
+    #[test]
+    fn approvals_rows_show_the_preset_and_modified() {
+        let s = snap();
+        let mut o = Overlay::new(Kind::Settings);
+        o.settings.load(&approvals_answer(true));
+        o.settings
+            .load_waiting(&serde_json::json!({"proposals": []}));
+        let got = draw(&mut o, &s, 80, 20);
+        // Private facts sit right after Approvals; Waiting stays last.
+        assert!(got[2].starts_with("│   Approvals  "), "{got:?}");
+        assert!(got[3].starts_with("│   Private facts  "), "{got:?}");
+        assert!(got[4].starts_with("│   Read-only  "), "{got:?}");
+        assert!(got[5].starts_with("│   Waiting (0)  "), "{got:?}");
+        // End still reaches Waiting, past the facts.
+        hit(&mut o, &s, KeyCode::End);
+        assert!(draw(&mut o, &s, 80, 20)[5].starts_with("│ › Waiting (0)"));
+        hit(&mut o, &s, KeyCode::Home);
+        hit(&mut o, &s, KeyCode::Down);
+        let got = draw(&mut o, &s, 80, 20);
+        // The preset says when a hand-set value differs from it; each class shows its mode and
+        // where it came from, the money cap and its currency too.
+        let preset = line_of(&got, "Preset");
+        assert!(preset.contains("semi (modified) · you"), "{got:?}");
+        assert!(line_of(&got, "Messages").contains("ask "), "{got:?}");
+        assert!(line_of(&got, "Posts").contains("delay 5"), "{got:?}");
+        assert!(line_of(&got, "Posts").contains("· preset"), "{got:?}");
+        assert!(line_of(&got, "Payments").contains("auto 50"), "{got:?}");
+        assert!(line_of(&got, "Currency").contains("EUR"), "{got:?}");
+        o.settings.load(&approvals_answer(false));
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(!line_of(&got, "Preset").contains("modified"), "{got:?}");
+        assert!(line_of(&got, "Preset").contains("semi "), "{got:?}");
+        // The preset's list marks the preset itself, without the note.
+        o.settings.load(&approvals_answer(true));
+        hit(&mut o, &s, KeyCode::Right);
+        hit(&mut o, &s, KeyCode::Down);
+        assert_eq!(hit(&mut o, &s, KeyCode::Enter), Action::None);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(got.iter().any(|l| l.contains("● semi")), "{got:?}");
+        hit(&mut o, &s, KeyCode::Esc);
+        // A class's mode is typed; the registry refuses what it does not take, inline.
+        hit(&mut o, &s, KeyCode::Down);
+        hit(&mut o, &s, KeyCode::Enter);
+        for _ in 0..3 {
+            hit(&mut o, &s, KeyCode::Backspace);
+        }
+        typing(&mut o, &s, "sometimes");
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Enter),
+            Action::SettingsSet {
+                key: "approvals.messages".into(),
+                value: "sometimes".into(),
+                until: None,
+            }
+        );
+        let why = "[zephyr] not changed: messages is ask, ask-new, delay N or auto";
+        o.settings.answered(
+            &serde_json::json!({"outcome": "refused", "reason": why}),
+            &jiff::tz::TimeZone::UTC,
+        );
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got.iter()
+                .any(|l| l.contains("not changed: messages is ask, ask-new")),
+            "{got:?}"
+        );
+        assert!(
+            got.iter().any(|l| l.contains("› value  sometimes")),
+            "{got:?}"
+        );
+        hit(&mut o, &s, KeyCode::Esc);
+        // Clearing a class goes back to the preset: `default`, never a `none` beside `off`.
+        hit(&mut o, &s, KeyCode::End);
+        hit(&mut o, &s, KeyCode::Enter);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got.iter()
+                .any(|l| l.contains("one of hold, warn, off, or default (the preset's)")),
+            "{got:?}"
+        );
+        assert!(got.iter().any(|l| l.contains("  default")), "{got:?}");
+        assert!(!got.iter().any(|l| l.contains(" none")), "{got:?}");
+        hit(&mut o, &s, KeyCode::Esc);
+        // The facts' row leads to their own section, where values are typed.
+        hit(&mut o, &s, KeyCode::Home);
+        assert_eq!(hit(&mut o, &s, KeyCode::Enter), Action::None);
+        assert!(o.settings.editing.is_none());
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(got[3].starts_with("│ › Private facts"), "{got:?}");
+    }
+
+    /// `zephyr.proposals` with held actions (made-up data): a delayed post, a message whose
+    /// class asks about new recipients, a payment that needs a strong channel, and a setting.
+    fn actions_answer() -> serde_json::Value {
+        let due = NOW / 1000 + 600;
+        serde_json::json!({"proposals": [
+            {"id": 8, "kind": "run", "class": "posts", "status": "scheduled", "due_at": due,
+             "summary": "gh issue create on owner/repo",
+             "card": "[zephyr] delayed #8: post (GitHub)\ngh issue create on owner/repo\nsending at 14:12 unless /cancel 8",
+             "age_secs": 60, "expires_in_secs": 86_340, "strong": false, "once": false},
+            {"id": 7, "kind": "run", "class": "messages", "status": "pending",
+             "summary": "email to alice@example.com",
+             "card": "[zephyr] approve #7: message (email)\nto: alice@example.com (new) · subject: \"Invoice March\"\n/ok 7 · /ok 7 once · /no 7 · expires in 24 h",
+             "age_secs": 180, "expires_in_secs": 86_220, "strong": false, "once": true},
+            {"id": 6, "kind": "wait", "class": "money", "status": "pending",
+             "summary": "pay on https://shop.example.com",
+             "card": "[zephyr] approve #6: payment (browser)\n/ok 6 · /no 6 · expires in 10 min · this one needs tui or chat",
+             "age_secs": 30, "expires_in_secs": 570, "strong": true, "once": false},
+            {"id": 5, "card": "/set tasks.parallel 4", "kind": "setting", "key": "tasks.parallel",
+             "age_secs": 7_200, "expires_in_secs": 79_200, "strong": false},
+        ]})
+    }
+
+    fn keys_named(o: &Overlay) -> Vec<&'static str> {
+        settings_panel::hints(o).into_iter().map(|h| h.0).collect()
+    }
+
+    #[test]
+    fn an_action_card_approves_once_with_1() {
+        let s = snap();
+        let mut o = settings_panel();
+        o.settings.load_waiting(&actions_answer());
+        draw(&mut o, &s, 80, 20);
+        hit(&mut o, &s, KeyCode::End);
+        // An action's row says what it is and what it does; a delayed one when it goes.
+        let got = draw(&mut o, &s, 80, 20);
+        let at = crate::settings::clock(NOW / 1000 + 600, &jiff::tz::TimeZone::UTC);
+        assert!(
+            got[1].contains("#8  post · gh issue create on owner/repo"),
+            "{got:?}"
+        );
+        assert!(
+            got[1].trim_end_matches(" │").ends_with(&format!("at {at}")),
+            "{got:?}"
+        );
+        assert!(
+            got[2].contains("#7  message · email to alice@example.com"),
+            "{got:?}"
+        );
+        assert!(got[2].trim_end_matches(" │").ends_with("3m ago"), "{got:?}");
+        assert!(got[3].contains("#6  payment · pay on"), "{got:?}");
+        assert!(got[4].contains("#5  /set tasks.parallel 4"), "{got:?}");
+        // A delayed action is cancelled with `c`.
+        hit(&mut o, &s, KeyCode::Right);
+        assert!(keys_named(&o).contains(&"c"), "{:?}", keys_named(&o));
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Char('c')),
+            Action::Decide {
+                id: 8,
+                verb: "cancel".into()
+            }
+        );
+        // The message: its whole card in the daemon's words; `1` approves it once.
+        hit(&mut o, &s, KeyCode::Down);
+        assert!(keys_named(&o).contains(&"1"), "{:?}", keys_named(&o));
+        assert!(!keys_named(&o).contains(&"c"), "{:?}", keys_named(&o));
+        hit(&mut o, &s, KeyCode::Enter);
+        let card = draw(&mut o, &s, 80, 20);
+        assert!(card[1].contains("held #7"), "{card:?}");
+        assert!(
+            card.iter()
+                .any(|l| l.contains("│ approve #7: message (email)")),
+            "{card:?}"
+        );
+        assert!(
+            card.iter()
+                .any(|l| l.contains("to: alice@example.com (new) · subject: \"Invoice March\"")),
+            "{card:?}"
+        );
+        assert!(
+            card.iter()
+                .any(|l| l.contains("waited 3m · expires in 23h 57m")),
+            "{card:?}"
+        );
+        assert_eq!(keys_named(&o), ["o", "1", "d", "esc"]);
+        assert_eq!(hit(&mut o, &s, KeyCode::Char('c')), Action::None);
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Char('1')),
+            Action::Decide {
+                id: 7,
+                verb: "once".into()
+            }
+        );
+        hit(&mut o, &s, KeyCode::Esc);
+        // A payment's class does not ask about new recipients, so once is no different: `1`
+        // approves it as `o` does, and is not offered.
+        hit(&mut o, &s, KeyCode::Down);
+        assert!(!keys_named(&o).contains(&"1"), "{:?}", keys_named(&o));
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got.iter()
+                .any(|l| l.contains("a payment · expires in 9m · needs a strong channel")),
+            "{got:?}"
+        );
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Char('1')),
+            Action::Decide {
+                id: 6,
+                verb: "ok".into()
+            }
+        );
+        // A setting's proposal is as it was: `1` is `once`, which the daemon reads as ok.
+        hit(&mut o, &s, KeyCode::Down);
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Char('1')),
+            Action::Decide {
+                id: 5,
+                verb: "once".into()
+            }
+        );
+    }
+
+    #[test]
+    fn the_fact_value_is_masked_while_typed() {
+        use super::super::conn::FactEntry;
+        // Made up for the test; nothing here is anyone's.
+        const VALUE: &str = "135798";
+        let s = snap();
+        let mut o = Overlay::new(Kind::Settings);
+        o.settings.load(&approvals_answer(false));
+        o.settings.load_facts(vec![FactEntry {
+            name: "home-address".into(),
+            kind: "text".into(),
+            allow: vec!["https://shop.example.com".into()],
+        }]);
+        hit(&mut o, &s, KeyCode::Down);
+        hit(&mut o, &s, KeyCode::Down);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(got[3].starts_with("│ › Private facts"), "{got:?}");
+        assert!(
+            line_of(&got, "home-address").contains("text · allow: https://shop.example.com"),
+            "{got:?}"
+        );
+        assert!(keys_named(&o).contains(&"a"), "{:?}", keys_named(&o));
+        // `a` adds one: a name, a kind (space changes it), the value masked, where it may go.
+        assert_eq!(hit(&mut o, &s, KeyCode::Char('a')), Action::None);
+        typing(&mut o, &s, "test-pin");
+        hit(&mut o, &s, KeyCode::Tab);
+        hit(&mut o, &s, KeyCode::Char(' '));
+        hit(&mut o, &s, KeyCode::Tab);
+        typing(&mut o, &s, &VALUE[..5]);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got.iter().any(|l| l.contains("add a private fact")),
+            "{got:?}"
+        );
+        assert!(line_of(&got, "kind   ").contains("digits"), "{got:?}");
+        assert!(line_of(&got, "› value").contains("•••••"), "{got:?}");
+        let shown = format!("{got:?}{o:?}");
+        assert!(!shown.contains(&VALUE[..5]), "{shown}");
+        // Too short for a digits fact: the form stays open with the reason, the value kept.
+        hit(&mut o, &s, KeyCode::Tab);
+        assert_eq!(hit(&mut o, &s, KeyCode::Enter), Action::None);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got.iter().any(|l| l.contains("needs at least 6 digits")),
+            "{got:?}"
+        );
+        hit(&mut o, &s, KeyCode::BackTab);
+        typing(&mut o, &s, &VALUE[5..]);
+        assert_eq!(hit(&mut o, &s, KeyCode::Enter), Action::None);
+        let saved = hit(&mut o, &s, KeyCode::Enter);
+        let shown = format!("{saved:?}");
+        assert!(!shown.contains(VALUE), "{shown}");
+        assert!(shown.contains("value: 6"), "{shown}");
+        assert_eq!(
+            saved,
+            Action::FactsPut(Box::new(crate::facts::Fact {
+                name: "test-pin".into(),
+                kind: crate::facts::FactKind::Digits,
+                value: VALUE.into(),
+                allow: vec![],
+            }))
+        );
+        // The value leaves with the save: nothing on screen or in the panel holds it.
+        assert!(o.settings.fact_form.is_none());
+        let shown = format!("{:?}{o:?}", draw(&mut o, &s, 80, 20));
+        assert!(!shown.contains(VALUE), "{shown}");
+        // A name in use is edited, not added again; an edit keeps the name and, left empty,
+        // the saved value.
+        hit(&mut o, &s, KeyCode::Right);
+        hit(&mut o, &s, KeyCode::Char('a'));
+        typing(&mut o, &s, "home-address");
+        hit(&mut o, &s, KeyCode::Tab);
+        hit(&mut o, &s, KeyCode::Tab);
+        typing(&mut o, &s, "made-up place");
+        hit(&mut o, &s, KeyCode::Tab);
+        assert_eq!(hit(&mut o, &s, KeyCode::Enter), Action::None);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got.iter()
+                .any(|l| l.contains("home-address is saved; e edits it")),
+            "{got:?}"
+        );
+        hit(&mut o, &s, KeyCode::Esc);
+        assert_eq!(hit(&mut o, &s, KeyCode::Char('e')), Action::None);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got.iter().any(|l| l.contains("edit home-address")),
+            "{got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|l| l.contains("an empty value keeps the saved one")),
+            "{got:?}"
+        );
+        // The name cannot be typed over.
+        hit(&mut o, &s, KeyCode::BackTab);
+        hit(&mut o, &s, KeyCode::BackTab);
+        typing(&mut o, &s, "x");
+        let got = draw(&mut o, &s, 80, 20);
+        let name = line_of(&got, "› name");
+        assert!(name.contains("home-address") && !name.contains("home-addressx"));
+        hit(&mut o, &s, KeyCode::Tab);
+        hit(&mut o, &s, KeyCode::Tab);
+        assert_eq!(hit(&mut o, &s, KeyCode::Enter), Action::None);
+        let Action::FactsPut(kept) = hit(&mut o, &s, KeyCode::Enter) else {
+            panic!("no save")
+        };
+        assert_eq!(
+            (kept.name.as_str(), kept.value.as_str(), &kept.allow),
+            (
+                "home-address",
+                "",
+                &vec!["https://shop.example.com".to_string()]
+            )
+        );
+        // `d` asks first; `y` deletes.
+        assert_eq!(hit(&mut o, &s, KeyCode::Char('d')), Action::None);
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got.iter()
+                .any(|l| l.contains("delete the private fact home-address? y deletes it")),
+            "{got:?}"
+        );
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Char('y')),
+            Action::FactsRm("home-address".into())
+        );
     }
 
     #[test]

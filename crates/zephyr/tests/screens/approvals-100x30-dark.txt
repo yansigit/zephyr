@@ -1,0 +1,30 @@
+  .◠◠.◠◠.       zephyr v0.1.0                                                             2 waiting
+( ◦^ ᴗ ^◦ )~    main · claude-code-1 › claude-opus-5-5 · medium
+ `-.___.-'      discord ●  imessage ●  chat ○                          today 41.2k tok · $0.38 / $5
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+   ─────────────────────────────────────── Fri 30 Oct 2026 ───────────────────────────────────────
+
+ ▌ remind me to renew the domain on friday                                         discord · 14:02
+
+ ≋ Done. I scheduled renew kimchigoose.com for Fri 09:00 KST.
+   ▸ schedule  add "renew domain" fri 09:00                                                  ✓ 0.2s
+ ╭─ settings ─────────────────────────────────────────────────────────────────────────────────────╮
+ │   Model                Private facts  home-address, phone · you                                │
+ │   Background tasks   › Preset         semi (modified)     · you                                │
+ │   Budget               Messages       ask                 · you                                │
+ │   General              Posts          delay 5             · preset                             │
+ │   Accounts             Payments       auto 50             · you                                │
+ │   Connectors           Currency       EUR                 · you                                │
+ │   Rules                Private facts  hold                · preset                             │
+ │ › Approvals            Approved only from a strong channel  loosen              · default      │
+ │   Private facts                                                                                │
+ │   Security                                                                                     │
+ │   Read-only                                                                                    │
+ │   Waiting (2)                                                                                  │
+ │                                                                                                │
+ │ approvals.preset · manual asks before every message, post and payment; semi lets known         │
+ │ recipients through and delays posts 5 minutes; full asks for nothing.                          │
+ │ one of manual, semi, full · the agent may tighten it                                           │
+ │ loosening it needs tui or chat                                                                 │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+  ⏎ edit · t time limit · ↑↓ choose · ← sections · ? keys · esc close                       ctx 42%

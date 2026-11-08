@@ -9,8 +9,6 @@
  ≋ Done. I scheduled renew kimchigoose.com for Fri 09:00 KST.
    ▸ schedule  add "renew domain" fri 09:00                                                  ✓ 0.2s
 
- ▌ what's in ~/Projects/zephyr/deploy?                                                 you · 14:05
-
  ╭─ settings ─────────────────────────────────────────────────────────────────────────────────────╮
  │   Model              › Daily tokens      none · default                                        │
  │   Background tasks     Daily cost (USD)  5    · until 18:00                                    │
@@ -19,6 +17,8 @@
  │   Accounts                                                                                     │
  │   Connectors                                                                                   │
  │   Rules                                                                                        │
+ │   Approvals                                                                                    │
+ │   Private facts                                                                                │
  │   Security                                                                                     │
  │   Read-only                                                                                    │
  │   Waiting (1)                                                                                  │

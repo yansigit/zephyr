@@ -1320,6 +1320,8 @@ impl<'a> Router<'a> {
             }
         }
         let strong = &self.cfg.settings.strong_channels;
+        // `semi (modified)` (approvals spec §4.3): a hand-set class differs from the preset.
+        let modified = crate::approvals::effective(&self.cfg).modified;
         let sections: Vec<Value> = (names.into_iter())
             .map(|name| {
                 let settings: Vec<Value> = (crate::settings::SETTINGS.iter())
@@ -1337,6 +1339,7 @@ impl<'a> Router<'a> {
                                 "access": crate::settings::access_name(s),
                                 "strong": s.strong,
                                 "until": until,
+                                "modified": modified && r.key == "approvals.preset",
                             })
                         })
                     })
@@ -1380,16 +1383,21 @@ impl<'a> Router<'a> {
         }
     }
 
-    /// `zephyr.proposals`: what waits for the owner, newest first.
+    /// `zephyr.proposals`: what waits for the owner, newest first. A held action carries its
+    /// class, its summary and the card the chat was sent, in the gate's words (`gate::card`);
+    /// `once` says whether `/ok N once` differs from `/ok N` for it now (its class asks only
+    /// about new targets), and `strong` whether only a strong channel may approve it.
     fn proposals_json(&self) -> Value {
         let now = crate::now();
         let list = self.store.pending_proposals().unwrap_or_else(|e| {
             eprintln!("zephyr: reading proposals failed: {e}");
             vec![]
         });
+        let e = crate::approvals::effective(&self.cfg);
+        let money_strong = (crate::approvals::strong_only(&self.cfg).iter()).any(|s| s == "money");
         let proposals: Vec<Value> = (list.into_iter())
             .map(|p| {
-                json!({
+                let mut v = json!({
                     "id": p.id,
                     "card": p.command,
                     "kind": if p.kind != "command" {
@@ -1405,15 +1413,37 @@ impl<'a> Router<'a> {
                     "age_secs": (now - p.created_at).max(0),
                     "expires_in_secs": (p.created_at + 86_400 - now).max(0),
                     "strong": p.strong,
-                })
+                });
+                let action = (p.kind != "command")
+                    .then(|| self.store.action(p.id).ok().flatten())
+                    .flatten();
+                if let Some(a) = action {
+                    // A browser action waits 10 minutes, not a day (spec §4.6).
+                    if a.kind == crate::store::ActionKind::Wait {
+                        let wait = 60 * i64::from(crate::gate::WAIT_MINUTES);
+                        v["expires_in_secs"] = json!((a.created_at + wait - now).max(0));
+                    }
+                    v["card"] = json!(crate::gate::card(&a, &self.cfg, &self.store));
+                    v["summary"] = json!(a.summary);
+                    v["strong"] = json!(a.class == "money" && money_strong);
+                    v["once"] = json!(crate::gate::asks_new(&e, &a.class));
+                    v["class"] = json!(a.class);
+                }
+                v
             })
             .collect();
         json!({"proposals": proposals})
     }
 
-    /// `zephyr.decide`: `/ok N` or `/no N` from the TUI, through the checks the chat commands
-    /// make (stale, strong channel). `once` is `ok` for a setting.
+    /// `zephyr.decide`: `/ok N`, `/no N` or `/cancel N` from the TUI, through the checks the chat
+    /// commands make (stale, strong channel). `once` is `ok` for a setting.
     async fn decide(&mut self, id: i64, verb: &str) -> Value {
+        if verb == "cancel" {
+            let reply = crate::actions::cancel(&self.store, &self.waits, &id.to_string());
+            self.settled_actions();
+            let ok = reply.starts_with(&format!("[zephyr] cancelled #{id} "));
+            return json!({"ok": ok, "text": reply});
+        }
         let text = match verb {
             "no" => format!("/no {id}"),
             "once" => format!("/ok {id} once"),

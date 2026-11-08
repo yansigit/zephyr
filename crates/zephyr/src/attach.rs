@@ -63,7 +63,8 @@ pub enum AttachRequest {
     },
     /// `zephyr.proposals`: the proposals still waiting.
     Proposals(oneshot::Sender<Value>),
-    /// `zephyr.decide`: `/ok N` (`ok`, `once`) or `/no N` (`no`) as the owner on the TUI.
+    /// `zephyr.decide`: `/ok N` (`ok`, `once`), `/no N` (`no`) or `/cancel N` (`cancel`) as the
+    /// owner on the TUI.
     Decide {
         id: i64,
         verb: String,
@@ -394,8 +395,9 @@ impl Conn {
                 let (Some(n), Some(verb)) = (params["id"].as_i64(), params["verb"].as_str()) else {
                     return (vec![error(id, -32602, "id and verb are required")], false);
                 };
-                if !matches!(verb, "ok" | "once" | "no") {
-                    return (vec![error(id, -32602, "verb is ok, once or no")], false);
+                if !matches!(verb, "ok" | "once" | "no" | "cancel") {
+                    let why = "verb is ok, once, no or cancel";
+                    return (vec![error(id, -32602, why)], false);
                 }
                 let (tx, rx) = oneshot::channel();
                 let req = AttachRequest::Decide {

@@ -443,6 +443,20 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         // As `/ok N` would have answered it.
                         None => view.reply(None, v["text"].as_str().unwrap_or_default()),
                     },
+                    Msg::Facts(list) => {
+                        if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Settings) {
+                            // The Approvals section's row names the facts.
+                            if o.settings.load_facts(list) {
+                                let _ = prompt_tx.send(Ask::Settings);
+                            }
+                        }
+                    }
+                    Msg::FactsError(why) => {
+                        match s.overlay.as_mut().filter(|o| o.kind == Kind::Settings) {
+                            Some(o) => o.settings.facts_refused(&why),
+                            None => view.error(&why),
+                        }
+                    }
                     Msg::Down(why) if was_up => {
                         // The answer to a poll in flight is lost with the connection; the sign-in
                         // is asked about again once the link is back, not waited on.
@@ -595,6 +609,12 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                     }
                                     Action::Decide { id, verb } => {
                                         let _ = prompt_tx.send(Ask::Decide { id, verb });
+                                    }
+                                    Action::FactsPut(fact) => {
+                                        let _ = prompt_tx.send(Ask::FactsPut(fact));
+                                    }
+                                    Action::FactsRm(name) => {
+                                        let _ = prompt_tx.send(Ask::FactsRm(name));
                                     }
                                 }
                             }
@@ -1546,6 +1566,7 @@ fn open(
             let _ = asks.send(Ask::Settings);
             let _ = asks.send(Ask::Proposals);
             let _ = asks.send(Ask::Models);
+            let _ = asks.send(Ask::FactsList);
         }
         Kind::Status | Kind::Help | Kind::History => {}
     }

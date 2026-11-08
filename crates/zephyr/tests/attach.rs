@@ -1166,6 +1166,7 @@ async fn settings_lists_sections_with_kinds() {
         (&preset["value"], &preset["source"], &preset["strong"]),
         (&json!("manual"), &json!("default"), &json!(true))
     );
+    assert_eq!(preset["modified"], false, "{preset}");
     let money = row("approvals.money");
     assert_eq!(money["kind"]["inner"]["type"], "mode", "{money}");
     assert_eq!(
@@ -1404,6 +1405,174 @@ async fn decide_applies_a_strong_proposal_that_a_weak_channel_cannot() {
         big["result"]["reason"].as_str().unwrap().contains("100000"),
         "{big}"
     );
+    gw.shutdown().await;
+}
+
+/// A connector call held for the owner, as the gate stores one (fixed, fake data).
+fn held_pass(store: &Store, class: &str, to: &str, due_at: Option<i64>) -> i64 {
+    use zephyr::store::{ActionKind, NewAction, Origin};
+    let args = json!({"server": "mail", "tool": "send", "arguments": {"to": to}});
+    store
+        .hold_action(&NewAction {
+            kind: ActionKind::Pass,
+            class: class.into(),
+            targets: vec![to.into()],
+            summary: format!("mail/send to {to}"),
+            reason: None,
+            payload: args.to_string(),
+            secrets: vec![],
+            origin: Origin {
+                channel: "chat".into(),
+                sender: "owner".into(),
+                session: "main".into(),
+                run: "main:1".into(),
+                call_id: None,
+            },
+            due_at,
+        })
+        .unwrap()
+}
+
+/// `zephyr.proposals` lists a held action with its class and the daemon's whole card, and
+/// says whether `once` makes a difference (ask-new) and whether it needs a strong channel;
+/// `zephyr.decide` `once` approves it without remembering its recipient, `ok` remembers it.
+#[tokio::test]
+async fn proposals_carry_a_held_actions_card_and_once_skips_remembering() {
+    let gw = start_with(
+        "held-once",
+        "[approvals]\npreset = \"semi\"\nstrong_only = [\"loosen\", \"money\"]\n",
+    );
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    let store = Store::open(&gw.home.join("state.db")).unwrap();
+    let a = held_pass(&store, "messages", "a@x.org", None);
+    let pay = held_pass(&store, "money", "shop.example.com", None);
+    let got = c.call("zephyr.proposals", json!({})).await;
+    let list = got["result"]["proposals"].as_array().unwrap();
+    let first = list.iter().find(|p| p["id"] == a).unwrap();
+    assert_eq!(
+        (&first["kind"], &first["class"], &first["status"]),
+        (&json!("pass"), &json!("messages"), &json!("pending")),
+        "{got}"
+    );
+    assert_eq!(first["summary"], "mail/send to a@x.org", "{got}");
+    // The card is the daemon's own, as the chat shows it, not the stored summary.
+    let card = first["card"].as_str().unwrap();
+    assert!(
+        card.starts_with(&format!("[zephyr] approve #{a}: ")),
+        "{card}"
+    );
+    assert!(card.contains("a@x.org (new)"), "{card}");
+    assert!(card.contains(&format!("/ok {a} once")), "{card}");
+    assert_eq!(
+        (&first["once"], &first["strong"]),
+        (&json!(true), &json!(false))
+    );
+    // Money under semi asks, so once is no different; and only a strong channel approves it.
+    let money = list.iter().find(|p| p["id"] == pay).unwrap();
+    assert_eq!(
+        (&money["once"], &money["strong"]),
+        (&json!(false), &json!(true))
+    );
+
+    let once = c
+        .call("zephyr.decide", json!({"id": a, "verb": "once"}))
+        .await;
+    assert_eq!(once["result"]["ok"], true, "{once}");
+    let text = once["result"]["text"].as_str().unwrap();
+    assert!(text.contains(&format!("approved #{a}")), "{once}");
+    assert!(!text.contains("without asking"), "{once}");
+    assert!(!store.all_known("messages", &["a@x.org".into()]).unwrap());
+    let b = held_pass(&store, "messages", "a@x.org", None);
+    let ok = c
+        .call("zephyr.decide", json!({"id": b, "verb": "ok"}))
+        .await;
+    assert!(
+        ok["result"]["text"]
+            .as_str()
+            .unwrap()
+            .ends_with("from now on a@x.org goes without asking"),
+        "{ok}"
+    );
+    assert!(store.all_known("messages", &["a@x.org".into()]).unwrap());
+    gw.shutdown().await;
+}
+
+/// `zephyr.decide` `cancel` is `/cancel N`: a delayed action is cancelled before it goes; one
+/// that waits for the owner is not waiting out a delay.
+#[tokio::test]
+async fn decide_cancel_stops_a_delayed_action() {
+    let gw = start("held-cancel");
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    let store = Store::open(&gw.home.join("state.db")).unwrap();
+    let due = zephyr::unix_millis() as i64 / 1000 + 300;
+    let later = held_pass(&store, "posts", "x.example.com", Some(due));
+    let now = held_pass(&store, "messages", "a@x.org", None);
+    let got = c.call("zephyr.proposals", json!({})).await;
+    let list = got["result"]["proposals"].as_array().unwrap();
+    let delayed = list.iter().find(|p| p["id"] == later).unwrap();
+    assert_eq!(
+        (&delayed["status"], &delayed["due_at"]),
+        (&json!("scheduled"), &json!(due)),
+        "{got}"
+    );
+    assert!(
+        delayed["card"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!(" unless /cancel {later}")),
+        "{got}"
+    );
+    let refused = c
+        .call("zephyr.decide", json!({"id": now, "verb": "cancel"}))
+        .await;
+    assert_eq!(refused["result"]["ok"], false, "{refused}");
+    assert!(
+        refused["result"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("is not waiting out a delay"),
+        "{refused}"
+    );
+    let cancelled = c
+        .call("zephyr.decide", json!({"id": later, "verb": "cancel"}))
+        .await;
+    assert_eq!(cancelled["result"]["ok"], true, "{cancelled}");
+    assert_eq!(
+        cancelled["result"]["text"],
+        format!("[zephyr] cancelled #{later} (mail/send to x.example.com)")
+    );
+    assert_eq!(store.action(later).unwrap().unwrap().status, "cancelled");
+    let left = c.call("zephyr.proposals", json!({})).await;
+    let ids: Vec<&Value> = (left["result"]["proposals"].as_array().unwrap().iter())
+        .map(|p| &p["id"])
+        .collect();
+    assert_eq!(ids, [&json!(now)], "{left}");
+    gw.shutdown().await;
+}
+
+/// The preset's row says when a hand-set value differs from it (`semi (modified)`).
+#[tokio::test]
+async fn settings_mark_a_modified_preset() {
+    let gw = start_with(
+        "settings-modified",
+        "[approvals]\npreset = \"semi\"\nmessages = \"ask\"\n",
+    );
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    let got = c.call("zephyr.settings", json!({})).await;
+    let rows: Vec<Value> = (got["result"]["sections"].as_array().unwrap().iter())
+        .flat_map(|s| s["settings"].as_array().unwrap().clone())
+        .collect();
+    let row = |key: &str| rows.iter().find(|r| r["key"] == key).unwrap().clone();
+    let preset = row("approvals.preset");
+    assert_eq!(
+        (&preset["value"], &preset["modified"]),
+        (&json!("semi"), &json!(true)),
+        "{preset}"
+    );
+    assert_eq!(row("approvals.messages")["modified"], false);
     gw.shutdown().await;
 }
 

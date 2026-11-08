@@ -548,6 +548,12 @@ fn mode_of(e: &Effective, class: Class) -> Mode {
     }
 }
 
+/// Whether `class` (`messages`, `posts`, `money`) asks only about new targets now, the one mode
+/// where `/ok N once` differs from `/ok N`: it approves without remembering the targets.
+pub fn asks_new(e: &Effective, class: &str) -> bool {
+    class_of(class).is_some_and(|c| mode_of(e, c) == Mode::AskNew)
+}
+
 fn class_key(class: Class) -> &'static str {
     approvals::class_name(class)
 }
@@ -1317,7 +1323,7 @@ pub fn card(a: &Action, cfg: &Config, store: &Store) -> String {
     let clean = |text: &str| scrub.text(text);
     let e = approvals::effective(cfg);
     let class = class_of(&a.class);
-    let ask_new = class.is_some_and(|c| mode_of(&e, c) == Mode::AskNew);
+    let ask_new = asks_new(&e, &a.class);
     // Each target scrubbed and on one line (C1): a server, a recipient or an origin is the
     // agent's or a page's text.
     let targets: Vec<String> = (a.targets.iter())

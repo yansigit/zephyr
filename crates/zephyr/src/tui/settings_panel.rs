@@ -1,12 +1,17 @@
 //! The settings panel (`/settings`, settings spec §4.6): the daemon's settings by section on the
-//! right of a section list, an editor that fits each kind, and a Waiting tab for the proposals
-//! the owner has to decide. overlays.rs draws it with [`rows`] and hands it its keys with
-//! [`key`]; everything it shows comes from `zephyr.settings` and `zephyr.proposals`.
+//! right of a section list, an editor that fits each kind, the owner's private facts with a
+//! masked field for their values (approvals spec §4.5), and a Waiting tab for the proposals and
+//! held actions the owner has to decide. overlays.rs draws it with [`rows`] and hands it its
+//! keys with [`key`]; everything it shows comes from `zephyr.settings`, `zephyr.facts_list` and
+//! `zephyr.proposals`.
 
-use super::conn::Snapshot;
-use super::overlays::{column, model_groups, picks, Action, Overlay, Row};
+use super::conn::{FactEntry, Snapshot};
+use super::overlays::{
+    column, field_rows, fields_debug, model_groups, picks, Action, Overlay, Row,
+};
 use super::theme::{glyph, Palette};
 use super::view::clean;
+use crate::facts::{Fact, FactKind};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rpi_tui::{bold, truncate_to_width, visible_width, CURSOR_MARKER};
 use serde::Deserialize;
@@ -38,11 +43,22 @@ pub struct Entry {
     pub strong: bool,
     /// While a time limit runs: when it ends, unix seconds.
     pub until: Option<i64>,
+    /// The approvals preset: a hand-set class differs from it (`semi (modified)`).
+    pub modified: bool,
 }
 
 impl Entry {
     fn read_only(&self) -> bool {
         self.access == "read-only"
+    }
+
+    /// The value as a row shows it: `none` when unset, the preset with `(modified)`.
+    fn shown(&self) -> String {
+        let value = self.value.as_deref().unwrap_or("none");
+        match self.modified {
+            true => format!("{value} (modified)"),
+            false => value.to_string(),
+        }
     }
 
     fn bool(&self) -> bool {
@@ -55,15 +71,166 @@ impl Entry {
 #[serde(default)]
 pub struct Proposal {
     pub id: i64,
-    /// What `/ok` runs, in the daemon's words.
+    /// What `/ok` runs, in the daemon's words: for a held action, the whole card the chat got.
     pub card: String,
-    /// `setting` | `command`
+    /// `setting` | `command`, or a held action's `run` | `pass` | `wait`.
     pub kind: String,
     pub key: Option<String>,
     pub age_secs: i64,
     pub expires_in_secs: i64,
-    /// It loosens a protected setting, so only a strong channel may approve it.
+    /// Only a strong channel may approve it: it loosens a protected setting, or it is a payment
+    /// while `approvals.strong_only` names money.
     pub strong: bool,
+    /// A held action's class: `messages`, `posts`, `money`, or `outbound` (held for a fact).
+    pub class: Option<String>,
+    /// A held action's summary, in the gate's words.
+    pub summary: Option<String>,
+    /// `pending`, or `scheduled` for an action waiting out its delay.
+    pub status: String,
+    /// When a `scheduled` action goes, unix seconds.
+    pub due_at: Option<i64>,
+    /// `/ok N once` differs from `/ok N` for this action: its class asks only about new
+    /// targets, and once approves it without remembering them.
+    pub once: bool,
+}
+
+impl Proposal {
+    /// A held message, post or payment, not a command or a setting.
+    fn action(&self) -> bool {
+        matches!(self.kind.as_str(), "run" | "pass" | "wait")
+    }
+
+    /// An action waiting out its delay: `c` cancels it before it goes.
+    fn delayed(&self) -> bool {
+        self.action() && self.status == "scheduled"
+    }
+
+    /// Whether `1` approves it once: always for a command or a setting (where the daemon reads
+    /// `once` as `ok`), and for an action only where once differs from ok.
+    fn offers_once(&self) -> bool {
+        !self.action() || self.once
+    }
+
+    /// What a held action is, with its article: `a message`, `a payment`.
+    fn what(&self) -> (&'static str, &'static str) {
+        match self.class.as_deref() {
+            Some("messages") => ("a", "message"),
+            Some("posts") => ("a", "post"),
+            Some("money") => ("a", "payment"),
+            _ => ("an", "outgoing call"),
+        }
+    }
+}
+
+/// The daemon's section the private facts follow on the left: a daemon with approvals keeps
+/// facts too, and one without has neither.
+const APPROVALS: &str = "Approvals";
+
+/// What the left column lists: the daemon's sections, the private facts, then Waiting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tab {
+    Section(usize),
+    Facts,
+    Waiting,
+}
+
+/// The facts form's fields, in order.
+const NAME: usize = 0;
+const KIND: usize = 1;
+const VALUE: usize = 2;
+const ALLOW: usize = 3;
+const KINDS: [&str; 3] = ["text", "digits", "email"];
+
+/// The form for a private fact: its name, its kind, its value, and where it may go without a
+/// check. The value is drawn one bullet per character ([`field_rows`]), handed over in the
+/// `facts_put` the moment the form is saved, and dropped with the form: never shown, logged
+/// (`Debug` counts it) or kept.
+#[derive(Clone, PartialEq)]
+pub struct FactForm {
+    /// Editing a saved fact: its name stays, and an empty value keeps the saved one.
+    pub editing: bool,
+    /// The field being typed into.
+    pub at: usize,
+    /// `(label, secret, text)` per field.
+    pub fields: Vec<(&'static str, bool, String)>,
+}
+
+impl std::fmt::Debug for FactForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FactForm")
+            .field("editing", &self.editing)
+            .field("at", &self.at)
+            .field("fields", &fields_debug(&self.fields))
+            .finish()
+    }
+}
+
+impl FactForm {
+    fn new() -> FactForm {
+        FactForm {
+            editing: false,
+            at: NAME,
+            fields: vec![
+                ("name", false, String::new()),
+                ("kind", false, KINDS[0].into()),
+                ("value", true, String::new()),
+                ("may go to", false, String::new()),
+            ],
+        }
+    }
+
+    /// The form to edit `f`, on its value: everything but the value, which an empty field keeps.
+    fn edit(f: &FactEntry) -> FactForm {
+        let mut form = FactForm::new();
+        form.editing = true;
+        form.fields[NAME].2 = f.name.clone();
+        form.fields[KIND].2 = f.kind.clone();
+        form.fields[ALLOW].2 = f.allow.join(", ");
+        form.at = VALUE;
+        form
+    }
+
+    /// Whether typing goes into the field at the cursor: not a saved fact's name, and the
+    /// kind only turns.
+    fn typed(&self) -> bool {
+        !(self.at == KIND || (self.editing && self.at == NAME))
+    }
+
+    fn type_text(&mut self, text: &str) {
+        if self.typed() {
+            let one_line = text.replace(['\r', '\n'], "");
+            self.fields[self.at].2.push_str(&one_line);
+        }
+    }
+
+    fn backspace(&mut self) {
+        if self.typed() {
+            self.fields[self.at].2.pop();
+        }
+    }
+
+    /// The next kind (`by` 1) or the one before (-1).
+    fn turn_kind(&mut self, by: isize) {
+        let now = KINDS.iter().position(|k| *k == self.fields[KIND].2);
+        let next = (now.unwrap_or(0) as isize + by).rem_euclid(KINDS.len() as isize);
+        self.fields[KIND].2 = KINDS[next as usize].into();
+    }
+
+    /// The fact to save; the targets are comma separated.
+    fn fact(&self) -> Fact {
+        let field = |i: usize| self.fields[i].2.trim().to_string();
+        let allow = (self.fields[ALLOW].2.split(','))
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .collect();
+        Fact {
+            name: field(NAME),
+            kind: FactKind::parse(&field(KIND)).unwrap_or_default(),
+            value: field(VALUE),
+            allow,
+        }
+    }
 }
 
 /// `Kind::Settings`' own state.
@@ -90,8 +257,19 @@ pub struct SettingsPanel {
     /// `?`: the panel's keys instead of the settings.
     pub help: bool,
     /// The proposal the Waiting cursor was on, when a reload took it away and moved the cursor
-    /// to another the owner has not seen chosen: the next `o`, `1` or `d` only says so.
+    /// to another the owner has not seen chosen: the next `o`, `1`, `c` or `d` only says so.
     moved: Option<i64>,
+    /// `zephyr.facts_list`'s answer: names, kinds and allowed targets, never a value; `None`
+    /// until it came.
+    pub facts: Option<Vec<FactEntry>>,
+    /// Why the daemon would not list or change the facts.
+    pub facts_problem: Option<String>,
+    /// The private fact being added or edited.
+    pub fact_form: Option<FactForm>,
+    /// The fact `d` asked to delete, until `y` or any other key.
+    pub fact_confirm: Option<String>,
+    /// The fact the last facts call saved (`true`) or deleted, for the note its answer brings.
+    fact_sent: Option<(bool, String)>,
 }
 
 /// An edit of one setting, in the editor its kind takes.
@@ -147,8 +325,17 @@ fn options(kind: &Value) -> Vec<String> {
         .collect()
 }
 
-/// What a kind takes, in words: `a whole number, 1 to 32`.
-fn takes(kind: &Value) -> String {
+/// The word that clears an optional setting: an approval class's goes back to the preset, so it
+/// reads `default` (which the daemon takes, as it takes `none`) and never looks like `off`.
+fn clearing(key: &str) -> &'static str {
+    match key.starts_with("approvals.") {
+        true => "default",
+        false => "none",
+    }
+}
+
+/// What a kind takes, in words: `a whole number, 1 to 32`; `clear` is the word that unsets it.
+fn takes(kind: &Value, clear: &str) -> String {
     let num = |v: &Value| match v.as_f64() {
         Some(f) if f.fract() == 0.0 && f.abs() < 1e15 => format!("{}", f as i64),
         Some(f) => format!("{f}"),
@@ -175,7 +362,13 @@ fn takes(kind: &Value) -> String {
         "model" => "PROVIDER/MODEL, one an account lists".into(),
         "list" => format!("names, comma separated: {}", options(kind).join(", ")),
         "mode" => format!("one of {}", options(kind).join(", ")),
-        "optional" => format!("{}, or none", takes(&kind["inner"])),
+        "optional" if clear == "default" => {
+            format!(
+                "{}, or default (the preset's)",
+                takes(&kind["inner"], clear)
+            )
+        }
+        "optional" => format!("{}, or {clear}", takes(&kind["inner"], clear)),
         _ => match kind["max"].as_u64() {
             Some(max) if max > 0 => format!("text, at most {max} characters"),
             _ => "text".into(),
@@ -229,6 +422,9 @@ impl SettingsPanel {
             pr.card = tidy(&pr.card);
             pr.kind = line(&pr.kind);
             pr.key = pr.key.as_deref().map(line);
+            pr.class = pr.class.as_deref().map(line);
+            pr.summary = pr.summary.as_deref().map(line);
+            pr.status = line(&pr.status);
         }
         let picked = self.proposal().map(|pr| pr.id);
         if self.card.is_some_and(|id| !list.iter().any(|p| p.id == id)) {
@@ -299,21 +495,77 @@ impl SettingsPanel {
         self.note = Some((ok, unprefixed(v["text"].as_str().unwrap_or_default())));
     }
 
+    /// Takes the facts a `zephyr.facts_*` call answered with. Returns whether it answered a
+    /// change made here, which then says what it did.
+    pub fn load_facts(&mut self, list: Vec<FactEntry>) -> bool {
+        let list = (list.into_iter())
+            .map(|f| FactEntry {
+                name: line(&f.name),
+                kind: line(&f.kind),
+                allow: f.allow.iter().map(|t| line(t)).collect(),
+            })
+            .collect();
+        self.facts = Some(list);
+        self.facts_problem = None;
+        let sent = self.fact_sent.take();
+        if let Some((saved, name)) = &sent {
+            self.note = Some(match saved {
+                true => (
+                    true,
+                    format!("saved the private fact {name}; its value is not shown"),
+                ),
+                false => (true, format!("deleted the private fact {name}")),
+            });
+        }
+        self.clamp();
+        sent.is_some()
+    }
+
+    /// Takes a facts call's refusal: why, where the facts are listed.
+    pub fn facts_refused(&mut self, why: &str) {
+        self.fact_sent = None;
+        self.facts.get_or_insert_with(Vec::new);
+        self.facts_problem = Some(unprefixed(why).replace('\n', " "));
+    }
+
+    /// The left column: each section, the private facts after Approvals, then Waiting.
+    fn tabs(&self) -> Vec<Tab> {
+        let mut out = vec![];
+        for (i, x) in self.sections.iter().flatten().enumerate() {
+            out.push(Tab::Section(i));
+            if x.name == APPROVALS {
+                out.push(Tab::Facts);
+            }
+        }
+        out.push(Tab::Waiting);
+        out
+    }
+
+    /// The open entry of the left column.
+    fn tab(&self) -> Tab {
+        self.tabs().get(self.at).copied().unwrap_or(Tab::Waiting)
+    }
+
     fn waiting_tab(&self) -> bool {
-        self.at >= self.sections.as_ref().map_or(0, Vec::len)
+        self.tab() == Tab::Waiting
     }
 
     /// The rows the open section has.
     fn len(&self) -> usize {
-        match (&self.sections, self.waiting_tab()) {
-            (_, true) => self.waiting.as_ref().map_or(0, Vec::len),
-            (Some(s), false) => s[self.at].settings.len(),
-            (None, false) => 0,
+        match self.tab() {
+            Tab::Waiting => self.waiting.as_ref().map_or(0, Vec::len),
+            Tab::Facts => self.facts.as_ref().map_or(0, Vec::len),
+            Tab::Section(i) => (self.sections.iter().flatten())
+                .nth(i)
+                .map_or(0, |x| x.settings.len()),
         }
     }
 
     fn entry(&self) -> Option<&Entry> {
-        let section = self.sections.as_ref()?.get(self.at)?;
+        let Tab::Section(i) = self.tab() else {
+            return None;
+        };
+        let section = self.sections.as_ref()?.get(i)?;
         section.settings.get(self.row?)
     }
 
@@ -324,10 +576,17 @@ impl SettingsPanel {
         }
     }
 
+    /// The fact the cursor is on.
+    fn fact(&self) -> Option<&FactEntry> {
+        match self.tab() {
+            Tab::Facts => self.facts.as_ref()?.get(self.row?),
+            _ => None,
+        }
+    }
+
     /// Keeps the selection on something that is still there after a new answer.
     fn clamp(&mut self) {
-        let sections = self.sections.as_ref().map_or(0, Vec::len);
-        self.at = self.at.min(sections);
+        self.at = self.at.min(self.tabs().len() - 1);
         let len = self.len();
         self.row = self
             .row
@@ -427,7 +686,8 @@ fn cut(text: &str, width: usize) -> String {
     truncate_to_width(text, width, glyph("…"))
 }
 
-/// The panel's rows: its keys, an editor, a proposal's card, or the sections and their settings.
+/// The panel's rows: its keys, an editor, the facts form, a proposal's card, or the sections and
+/// their settings.
 pub fn rows(
     o: &Overlay,
     snap: &Snapshot,
@@ -443,15 +703,24 @@ pub fn rows(
     if let Some(e) = &s.editing {
         return editor_rows(o, e, snap, p, tz, now, width);
     }
+    if let Some(form) = &s.fact_form {
+        return fact_form_rows(s, form, p, width);
+    }
     let card = (s.waiting.iter().flatten()).find(|pr| Some(pr.id) == s.card);
     if let Some(pr) = card {
-        return card_rows(s, pr, p, width);
+        return card_rows(s, pr, p, tz, width);
     }
-    main_rows(s, snap, p, width)
+    main_rows(s, snap, p, tz, width)
 }
 
 /// The sections on the left, the open one's rows on the right, and what the chosen row is.
-fn main_rows(s: &SettingsPanel, snap: &Snapshot, p: &Palette, width: usize) -> Vec<Row> {
+fn main_rows(
+    s: &SettingsPanel,
+    snap: &Snapshot,
+    p: &Palette,
+    tz: &jiff::tz::TimeZone,
+    width: usize,
+) -> Vec<Row> {
     let Some(sections) = &s.sections else {
         let listing = format!("listing settings{}", glyph("…"));
         return vec![Row::Line(p.muted.fg(&listing))];
@@ -461,15 +730,22 @@ fn main_rows(s: &SettingsPanel, snap: &Snapshot, p: &Palette, width: usize) -> V
         out.push(Row::Line(p.error.fg(problem)));
     }
     let count = s.waiting.as_ref().map_or(snap.proposals as usize, Vec::len);
-    let mut names: Vec<String> = sections.iter().map(|x| x.name.clone()).collect();
-    names.push(format!("Waiting ({count})"));
+    let tabs = s.tabs();
+    let names: Vec<String> = (tabs.iter())
+        .map(|t| match t {
+            Tab::Section(i) => sections[*i].name.clone(),
+            Tab::Facts => "Private facts".into(),
+            Tab::Waiting => format!("Waiting ({count})"),
+        })
+        .collect();
     let name_w = names.iter().map(|n| visible_width(n)).max().unwrap_or(0);
     // `› ` and a name, a column of its own, then a two-column gap.
     let left_w = name_w + 3;
     let right_w = width.saturating_sub(4).saturating_sub(left_w + 2);
-    let right = match s.waiting_tab() {
-        true => waiting_cells(s, p, right_w),
-        false => setting_cells(&sections[s.at], s.row, p, right_w),
+    let right = match s.tab() {
+        Tab::Waiting => waiting_cells(s, p, tz, right_w),
+        Tab::Facts => fact_cells(s, p, right_w),
+        Tab::Section(i) => setting_cells(&sections[i], s.row, p, right_w),
     };
     let focus = s.row.unwrap_or(s.at);
     for i in 0..names.len().max(right.len()) {
@@ -483,7 +759,7 @@ fn main_rows(s: &SettingsPanel, snap: &Snapshot, p: &Palette, width: usize) -> V
                     (true, false) => p.muted.fg(glyph("›")),
                     _ => " ".into(),
                 };
-                let colour = match i == sections.len() && count > 0 {
+                let colour = match tabs.get(i) == Some(&Tab::Waiting) && count > 0 {
                     true => p.warning,
                     false => p.text,
                 };
@@ -503,9 +779,14 @@ fn main_rows(s: &SettingsPanel, snap: &Snapshot, p: &Palette, width: usize) -> V
             false => Row::Line(line),
         });
     }
-    let about = match (s.entry(), s.proposal()) {
-        (Some(e), _) => about_setting(e, &s.strong),
-        (_, Some(pr)) => vec![about_proposal(pr, &s.strong)],
+    let about = match (s.entry(), s.proposal(), s.tab()) {
+        (Some(e), ..) => about_setting(e, &s.strong),
+        (_, Some(pr), _) => vec![about_proposal(pr, &s.strong, tz)],
+        (.., Tab::Facts) => vec![
+            "Kept out of outgoing calls: a call holding one waits for you, as approvals.facts \
+             says. A value is typed here, masked, and never shown again."
+                .into(),
+        ],
         _ => vec![],
     };
     let inner = width.saturating_sub(4);
@@ -513,6 +794,10 @@ fn main_rows(s: &SettingsPanel, snap: &Snapshot, p: &Palette, width: usize) -> V
         out.push(Row::Line(String::new()));
         let lines = about.iter().flat_map(|l| wrap(l, inner));
         out.extend(lines.map(|l| Row::Line(p.muted.fg(&l))));
+    }
+    if let Some(name) = &s.fact_confirm {
+        let ask = format!("delete the private fact {name}? y deletes it, any other key keeps it");
+        out.extend(wrap(&ask, inner).iter().map(|l| Row::Line(p.warning.fg(l))));
     }
     out.extend(note_rows(s, p, inner));
     out
@@ -526,7 +811,7 @@ fn setting_cells(section: &Section, row: Option<usize>, p: &Palette, w: usize) -
     let label_w = column(section.settings.iter().map(|e| e.label.as_str()));
     let value_w = (section.settings.iter())
         .filter(|e| !e.read_only())
-        .map(|e| visible_width(e.value.as_deref().unwrap_or("none")))
+        .map(|e| visible_width(&e.shown()))
         .max()
         .unwrap_or(0)
         .min(w / 2);
@@ -544,7 +829,7 @@ fn setting_cells(section: &Section, row: Option<usize>, p: &Palette, w: usize) -
                 let what = e.value.as_deref().unwrap_or(&e.help);
                 p.muted.fg(&format!("{label}  {what}"))
             } else {
-                let value = cut(e.value.as_deref().unwrap_or("none"), value_w);
+                let value = cut(&e.shown(), value_w);
                 let source = match e.source.as_str() {
                     s if s.starts_with("agent") => p.warning.fg(s),
                     s if s.starts_with("until") => p.accent.fg(s),
@@ -566,8 +851,9 @@ fn setting_cells(section: &Section, row: Option<usize>, p: &Palette, w: usize) -
         .collect()
 }
 
-/// One `#id  card  3m ago` per proposal, the card cut to leave the age in view.
-fn waiting_cells(s: &SettingsPanel, p: &Palette, w: usize) -> Vec<String> {
+/// One `#id  card  3m ago` per proposal, the card cut to leave the age in view: for a held
+/// action its class and summary, and for one waiting out its delay when it goes.
+fn waiting_cells(s: &SettingsPanel, p: &Palette, tz: &jiff::tz::TimeZone, w: usize) -> Vec<String> {
     let list = match &s.waiting {
         None => return vec![p.muted.fg(&format!("  listing{}", glyph("…")))],
         Some(l) if l.is_empty() => return vec![p.muted.fg("  nothing waits for you")],
@@ -586,9 +872,16 @@ fn waiting_cells(s: &SettingsPanel, p: &Palette, w: usize) -> Vec<String> {
             } else {
                 " ".into()
             };
-            let age = format!("{} ago", span(pr.age_secs));
+            let age = match (pr.delayed(), pr.due_at) {
+                (true, Some(at)) => format!("at {}", crate::settings::clock(at, tz)),
+                _ => format!("{} ago", span(pr.age_secs)),
+            };
             let room = w.saturating_sub(2 + id_w + 2 + 2 + visible_width(&age));
-            let card = cut(&one_line(&pr.card), room);
+            let text = match (pr.action(), &pr.summary) {
+                (true, Some(summary)) => format!("{} {} {summary}", pr.what().1, glyph("·")),
+                _ => one_line(&pr.card),
+            };
+            let card = cut(&text, room);
             let id = pad(&format!("#{}", pr.id), id_w);
             let id = if sel { bold(&id) } else { id };
             let cell = format!(
@@ -604,6 +897,56 @@ fn waiting_cells(s: &SettingsPanel, p: &Palette, w: usize) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// One `name  kind · allow: targets` per private fact; never a value, which the daemon never
+/// sends.
+fn fact_cells(s: &SettingsPanel, p: &Palette, w: usize) -> Vec<String> {
+    let mut out = vec![];
+    if let Some(problem) = &s.facts_problem {
+        out.push(cut(&p.error.fg(&format!("  {problem}")), w));
+    }
+    let list = match &s.facts {
+        None => return vec![p.muted.fg(&format!("  listing{}", glyph("…")))],
+        Some(l) if l.is_empty() => {
+            out.push(p.muted.fg("  none yet: a adds one"));
+            return out;
+        }
+        Some(l) => l,
+    };
+    let name_w = column(list.iter().map(|f| f.name.as_str()));
+    let kind_w = list
+        .iter()
+        .map(|f| visible_width(&f.kind))
+        .max()
+        .unwrap_or(0);
+    out.extend((list.iter().enumerate()).map(|(j, f)| {
+        let sel = s.row == Some(j);
+        let mark = if sel {
+            p.accent.fg(glyph("›"))
+        } else {
+            " ".into()
+        };
+        let name = pad(&f.name, name_w);
+        let name = if sel { bold(&name) } else { name };
+        let allow = match f.allow.as_slice() {
+            [] => "none".to_string(),
+            a => a.join(", "),
+        };
+        let cell = format!(
+            "{mark} {}  {} {} {}",
+            p.text.fg(&name),
+            p.text.fg(&pad(&f.kind, kind_w)),
+            p.muted.fg(glyph("·")),
+            p.muted.fg(&format!("allow: {allow}"))
+        );
+        let cell = cut(&cell, w);
+        match sel {
+            true => p.surface.bg(&pad(&cell, w)),
+            false => cell,
+        }
+    }));
+    out
 }
 
 /// The text a card shows, on one line: the agent shaped it, so nothing in it moves the cursor.
@@ -625,7 +968,7 @@ fn about_setting(e: &Entry, strong: &[String]) -> Vec<String> {
         out.push("read-only here: edit zephyr.toml to change it".into());
         return out;
     }
-    let mut what = vec![takes(&e.kind)];
+    let mut what = vec![takes(&e.kind, clearing(&e.key))];
     what.push(
         match e.access.as_str() {
             "tighten" => "the agent may tighten it",
@@ -641,19 +984,28 @@ fn about_setting(e: &Entry, strong: &[String]) -> Vec<String> {
     out
 }
 
-fn about_proposal(pr: &Proposal, strong: &[String]) -> String {
+fn about_proposal(pr: &Proposal, strong: &[String], tz: &jiff::tz::TimeZone) -> String {
     let dot = format!(" {} ", glyph("·"));
     let mut what = vec![match pr.kind.as_str() {
+        _ if pr.action() => format!("{} {}", pr.what().0, pr.what().1),
         "setting" => "a setting".to_string(),
         "command" => "a command".to_string(),
         other => other.to_string(),
     }];
     what.extend(pr.key.clone());
-    what.push(format!("expires in {}", span(pr.expires_in_secs)));
+    what.push(when(pr, tz));
     if pr.strong {
         what.push(needs(strong));
     }
     what.join(&dot)
+}
+
+/// `goes at 14:05` for an action waiting out its delay, else `expires in 23h 57m`.
+fn when(pr: &Proposal, tz: &jiff::tz::TimeZone) -> String {
+    match (pr.delayed(), pr.due_at) {
+        (true, Some(at)) => format!("goes at {}", crate::settings::clock(at, tz)),
+        _ => format!("expires in {}", span(pr.expires_in_secs)),
+    }
 }
 
 fn needs(strong: &[String]) -> String {
@@ -675,14 +1027,31 @@ fn note_rows(s: &SettingsPanel, p: &Palette, width: usize) -> Vec<Row> {
 }
 
 /// A proposal's whole card, wrapped: what `/ok` runs, how long it has waited and who may decide.
-fn card_rows(s: &SettingsPanel, pr: &Proposal, p: &Palette, width: usize) -> Vec<Row> {
+/// A held action's card is the gate's, as the chat got it.
+fn card_rows(
+    s: &SettingsPanel,
+    pr: &Proposal,
+    p: &Palette,
+    tz: &jiff::tz::TimeZone,
+    width: usize,
+) -> Vec<Row> {
     let what = match (pr.kind.as_str(), &pr.key) {
+        _ if pr.action() => format!("{} {}", pr.what().0, pr.what().1),
         ("setting", Some(key)) => format!("a setting: {key}"),
         (kind, _) => format!("a {kind}"),
     };
-    let mut out = vec![Row::Head(format!("proposal #{}", pr.id), what)];
+    let head = match (pr.action(), pr.delayed()) {
+        (true, true) => format!("delayed #{}", pr.id),
+        (true, false) => format!("held #{}", pr.id),
+        _ => format!("proposal #{}", pr.id),
+    };
+    let mut out = vec![Row::Head(head, what)];
     let inner = width.saturating_sub(4).max(1);
-    for text in tidy(&pr.card).lines() {
+    let card = match pr.action() {
+        true => unprefixed(&pr.card),
+        false => tidy(&pr.card),
+    };
+    for text in card.lines() {
         out.extend(wrap(text, inner).iter().map(|l| Row::Line(p.text.fg(l))));
     }
     out.push(Row::Line(String::new()));
@@ -696,14 +1065,11 @@ fn card_rows(s: &SettingsPanel, pr: &Proposal, p: &Palette, width: usize) -> Vec
         let line = format!("now {value}{dot}{}", e.source);
         out.extend(wrap(&line, inner).iter().map(|l| Row::Line(p.muted.fg(l))));
     }
-    let mut when = vec![
-        format!("waited {}", span(pr.age_secs)),
-        format!("expires in {}", span(pr.expires_in_secs)),
-    ];
+    let mut times = vec![format!("waited {}", span(pr.age_secs)), when(pr, tz)];
     if pr.strong {
-        when.push(needs(&s.strong));
+        times.push(needs(&s.strong));
     }
-    let when = wrap(&when.join(&dot), inner);
+    let when = wrap(&times.join(&dot), inner);
     out.extend(when.iter().map(|l| Row::Line(p.muted.fg(l))));
     out.extend(note_rows(s, p, inner));
     out
@@ -725,7 +1091,7 @@ fn editor_rows(
     if !e.help.is_empty() {
         out.push(Row::Line(p.muted.fg(&e.help)));
     }
-    out.push(Row::Line(p.muted.fg(&takes(&e.kind))));
+    out.push(Row::Line(p.muted.fg(&takes(&e.kind, clearing(&e.key)))));
     let field_line = |label: &str, text: &str, here: bool| {
         let (mark, cursor) = match here {
             true => (p.accent.fg(glyph("›")), CURSOR_MARKER),
@@ -736,12 +1102,15 @@ fn editor_rows(
     };
     match field(&e.kind) {
         Field::List(values) => {
-            out.extend(values.into_iter().map(|v| Row::Item {
-                current: e.value.as_deref() == Some(v.as_str())
-                    || (v == "none" && e.value.is_none()),
-                pick: v.clone(),
-                label: v,
-                note: String::new(),
+            out.extend(values.into_iter().map(|v| {
+                let unset = v == "none";
+                let v = if unset { clearing(&e.key).into() } else { v };
+                Row::Item {
+                    current: e.value.as_deref() == Some(v.as_str()) || (unset && e.value.is_none()),
+                    pick: v.clone(),
+                    label: v,
+                    note: String::new(),
+                }
             }));
         }
         Field::Model { optional } => {
@@ -765,6 +1134,33 @@ fn editor_rows(
         out.push(Row::Line(p.muted.fg(&format!("saving{}", glyph("…")))));
     }
     out.extend(note_rows(&o.settings, p, width.saturating_sub(4)));
+    out
+}
+
+/// The facts form: name, kind, the value masked, where it may go; then how to save it and the
+/// last refusal.
+fn fact_form_rows(s: &SettingsPanel, form: &FactForm, p: &Palette, width: usize) -> Vec<Row> {
+    let title = match form.editing {
+        true => format!("edit {}", form.fields[NAME].2),
+        false => "add a private fact".into(),
+    };
+    let mut out = vec![Row::Head(title, String::new())];
+    out.extend(field_rows(&form.fields, form.at, p));
+    let inner = width.saturating_sub(4);
+    let mut help = vec![
+        "tab next field, enter on the last saves, esc back".to_string(),
+        "kind: text, digits or email (space or ←→ turns it); may go to: targets it may reach \
+         without a check, comma separated"
+            .replace("←→", &format!("{}{}", glyph("←"), glyph("→"))),
+    ];
+    if form.editing {
+        help.push("an empty value keeps the saved one".into());
+    }
+    help.push("the value is never shown again".into());
+    for l in help.iter().flat_map(|l| wrap(l, inner)) {
+        out.push(Row::Line(p.muted.fg(&l)));
+    }
+    out.extend(note_rows(s, p, inner));
     out
 }
 
@@ -846,8 +1242,14 @@ fn help_rows(p: &Palette) -> Vec<Row> {
         ),
         ("tab", "in an editor: the time limit"),
         ("o", "Waiting: approve it"),
-        ("1", "Waiting: approve it once"),
-        ("d", "Waiting: drop it"),
+        ("1", "Waiting: approve once, not remembering the recipients"),
+        ("c", "Waiting: cancel a delayed action before it goes"),
+        ("d", "Waiting: drop it; Private facts: delete one"),
+        ("a", "Private facts: add one, its value typed masked"),
+        (
+            "e",
+            "Private facts: edit one; an empty value keeps the saved one",
+        ),
         ("esc", "back, or close the panel"),
     ];
     let mut out = vec![Row::Head("keys".into(), "esc goes back".into())];
@@ -870,6 +1272,18 @@ pub fn key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
     if o.settings.editing.is_some() {
         return editor_key(o, k, rows);
     }
+    if o.settings.fact_form.is_some() {
+        return fact_form_key(&mut o.settings, k);
+    }
+    if let Some(name) = o.settings.fact_confirm.take() {
+        return match k.code {
+            KeyCode::Char('y') => {
+                o.settings.fact_sent = Some((false, name.clone()));
+                Action::FactsRm(name)
+            }
+            _ => Action::None,
+        };
+    }
     if let Some(id) = o.settings.card {
         return match k.code {
             KeyCode::Esc | KeyCode::Left => {
@@ -887,7 +1301,7 @@ pub fn key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
             _ => Action::None,
         };
     }
-    let total = s.sections.as_ref().map_or(0, Vec::len) + 1;
+    let total = s.tabs().len();
     let len = s.len();
     let page = o.page.max(1);
     let last = |n: usize| n.saturating_sub(1);
@@ -910,13 +1324,17 @@ pub fn key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
             } else if matches!(code, KeyCode::Enter | KeyCode::Right | KeyCode::Tab) && len > 0 {
                 s.row = Some(0);
                 s.note = None;
+            } else if code == KeyCode::Char('a') && s.tab() == Tab::Facts {
+                // Nothing to go into yet, so a fact is added from the section's own name too.
+                s.note = None;
+                s.fact_form = Some(FactForm::new());
             }
         }
         (Some(r), code) => {
             // Any key shows the owner the row a reload moved the cursor to; a decision on it
             // waits for the next one.
             if let Some(gone) = s.moved.take() {
-                if let (Some(pr), KeyCode::Char('o' | '1' | 'd')) = (s.proposal(), code) {
+                if let (Some(pr), KeyCode::Char('o' | '1' | 'c' | 'd')) = (s.proposal(), code) {
                     let id = pr.id;
                     let said = format!("#{gone} is no longer waiting; the cursor is on #{id}");
                     s.note = Some((false, format!("{said}: press again to decide it")));
@@ -940,6 +1358,10 @@ pub fn key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
             if matches!(code, KeyCode::Left | KeyCode::BackTab) {
                 s.row = None;
                 s.note = None;
+                return Action::None;
+            }
+            if s.tab() == Tab::Facts {
+                fact_key(s, code);
                 return Action::None;
             }
             if let Some(pr) = s.proposal() {
@@ -980,12 +1402,19 @@ pub fn key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
     Action::None
 }
 
-/// `o` approves, `1` approves once, `d` drops.
+/// `o` approves, `1` approves once, `d` drops, `c` cancels a delayed action. Once differs from
+/// ok only for an action whose class asks about new targets: elsewhere `1` approves as `o` does
+/// (and is not offered), so the daemon is never asked for a once that means nothing.
 fn decide(o: &mut Overlay, id: i64, c: char) -> Action {
+    let Some(pr) = (o.settings.waiting.iter().flatten()).find(|p| p.id == id) else {
+        return Action::None;
+    };
     let verb = match c {
         'o' => "ok",
-        '1' => "once",
+        '1' if pr.offers_once() => "once",
+        '1' => "ok",
         'd' => "no",
+        'c' if pr.delayed() => "cancel",
         _ => return Action::None,
     };
     o.settings.note = None;
@@ -999,6 +1428,13 @@ fn decide(o: &mut Overlay, id: i64, c: char) -> Action {
 /// subagents and the rules say where they change instead.
 fn edit(o: &mut Overlay, e: &Entry, timed: bool) {
     let s = &mut o.settings;
+    // The facts' values are typed in their own section.
+    if e.key == "facts" {
+        if let Some(at) = s.tabs().iter().position(|t| *t == Tab::Facts) {
+            (s.at, s.row, s.note) = (at, None, None);
+            return;
+        }
+    }
     let elsewhere = match e.key.as_str() {
         _ if e.read_only() => Some(format!(
             "{} is read-only here: edit zephyr.toml to change it",
@@ -1035,6 +1471,67 @@ fn edit(o: &mut Overlay, e: &Entry, timed: bool) {
         o.placed = true;
         o.selected = usize::from(e.value.as_deref() == Some("true"));
     }
+}
+
+/// A key on the private facts' rows: `a` adds one, Enter or `e` edits the chosen one, `d` asks
+/// to delete it.
+fn fact_key(s: &mut SettingsPanel, code: KeyCode) {
+    let chosen = s.fact().cloned();
+    match (code, chosen) {
+        (KeyCode::Char('a'), _) => s.fact_form = Some(FactForm::new()),
+        (KeyCode::Enter | KeyCode::Char('e'), Some(f)) => s.fact_form = Some(FactForm::edit(&f)),
+        (KeyCode::Char('d'), Some(f)) => s.fact_confirm = Some(f.name),
+        _ => return,
+    }
+    s.note = None;
+}
+
+/// The facts form's keys. It takes every printable key while it is open; the kind turns with
+/// Space or ←/→.
+fn fact_form_key(s: &mut SettingsPanel, k: KeyEvent) -> Action {
+    let form = s.fact_form.as_mut().expect("open");
+    let last = form.fields.len() - 1;
+    match k.code {
+        KeyCode::Esc => {
+            s.fact_form = None;
+            s.note = None;
+        }
+        KeyCode::Tab | KeyCode::Down => form.at = (form.at + 1).min(last),
+        KeyCode::BackTab | KeyCode::Up => form.at = form.at.saturating_sub(1),
+        KeyCode::Enter if form.at < last => form.at += 1,
+        KeyCode::Enter => return save_fact(s),
+        KeyCode::Left if form.at == KIND => form.turn_kind(-1),
+        KeyCode::Right | KeyCode::Char(' ') if form.at == KIND => form.turn_kind(1),
+        KeyCode::Backspace => form.backspace(),
+        KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+            form.type_text(c.encode_utf8(&mut [0; 4]))
+        }
+        _ => {}
+    }
+    Action::None
+}
+
+/// Saves the form: checked here first (`Fact::check`, whose reasons never quote a value), so a
+/// value too short is fixed in place rather than typed again; the daemon checks it again. A
+/// name already saved is edited with `e`, never overwritten by an add.
+fn save_fact(s: &mut SettingsPanel) -> Action {
+    let form = s.fact_form.as_ref().expect("open");
+    let fact = form.fact();
+    let saved = (s.facts.iter().flatten()).any(|f| f.name == fact.name);
+    let problem = match () {
+        _ if !form.editing && saved => Some(format!("{} is saved; e edits it", fact.name)),
+        // The saved value stays: the daemon checks the rest.
+        _ if form.editing && fact.value.is_empty() => None,
+        _ => fact.check().err().map(|e| format!("{e:#}")),
+    };
+    if let Some(why) = problem {
+        s.note = Some((false, why));
+        return Action::None;
+    }
+    s.fact_form = None;
+    s.note = None;
+    s.fact_sent = Some((true, fact.name.clone()));
+    Action::FactsPut(Box::new(fact))
 }
 
 fn editor_key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
@@ -1121,6 +1618,10 @@ fn editor_key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
 
 /// A paste goes where typing would, on one line.
 pub fn paste(o: &mut Overlay, text: &str) {
+    if let Some(form) = o.settings.fact_form.as_mut() {
+        form.type_text(text);
+        return;
+    }
     let text = text.replace(['\r', '\n'], "");
     let Some(e) = o.settings.editing.as_mut() else {
         return;
@@ -1155,16 +1656,43 @@ pub fn hints(o: &Overlay) -> Vec<(&'static str, &'static str)> {
             out.push(("tab", "time limit"));
             out
         }
-        _ if s.card.is_some() => vec![("o", "ok"), ("1", "once"), ("d", "drop")],
+        _ if s.fact_form.is_some() => {
+            let form = s.fact_form.as_ref().expect("open");
+            let mut out = vec![("tab", "next field"), (glyph("⏎"), "save on the last")];
+            if form.at == KIND {
+                out.push(("space", "turn the kind"));
+            }
+            out
+        }
+        _ if s.fact_confirm.is_some() => vec![("y", "delete"), ("", "any other key keeps it")],
+        _ if s.card.is_some() => {
+            let card = (s.waiting.iter().flatten()).find(|pr| Some(pr.id) == s.card);
+            card.map_or_else(Vec::new, decisions)
+        }
+        _ if s.row.is_none() && s.tab() == Tab::Facts => vec![
+            (glyph("↑↓"), "choose"),
+            (glyph("→"), "open"),
+            ("a", "add"),
+            ("?", "keys"),
+        ],
         _ if s.row.is_none() => vec![(glyph("↑↓"), "choose"), (glyph("→"), "open"), ("?", "keys")],
-        _ if s.waiting_tab() => vec![
-            (glyph("⏎"), "card"),
-            ("o", "ok"),
-            ("1", "once"),
-            ("d", "drop"),
+        _ if s.tab() == Tab::Facts => vec![
+            (glyph("⏎"), "edit"),
+            ("a", "add"),
+            ("d", "delete"),
             (glyph("↑↓"), "choose"),
             (glyph("←"), "sections"),
+            ("?", "keys"),
         ],
+        _ if s.waiting_tab() => {
+            let mut out = vec![(glyph("⏎"), "card")];
+            match s.proposal() {
+                Some(pr) => out.extend(decisions(pr)),
+                None => out.extend([("o", "ok"), ("1", "once"), ("d", "drop")]),
+            }
+            out.extend([(glyph("↑↓"), "choose"), (glyph("←"), "sections")]);
+            out
+        }
         _ => {
             let mut out = vec![];
             match s.entry() {
@@ -1186,8 +1714,26 @@ pub fn hints(o: &Overlay) -> Vec<(&'static str, &'static str)> {
             out
         }
     };
-    let back = s.help || s.editing.is_some() || s.card.is_some();
+    let back = s.help
+        || s.editing.is_some()
+        || s.card.is_some()
+        || s.fact_form.is_some()
+        || s.fact_confirm.is_some();
     out.push(("esc", if back { "back" } else { "close" }));
+    out
+}
+
+/// What may be decided about `pr`: `o`, then `1` where once differs (always for a setting), `c`
+/// for a delayed action, `d`.
+fn decisions(pr: &Proposal) -> Vec<(&'static str, &'static str)> {
+    let mut out = vec![("o", "ok")];
+    if pr.offers_once() {
+        out.push(("1", "once"));
+    }
+    if pr.delayed() {
+        out.push(("c", "cancel"));
+    }
+    out.push(("d", "drop"));
     out
 }
 
@@ -1209,7 +1755,7 @@ mod tests {
         use serde_json::json;
         let float = json!({"type": "optional", "inner": {"type": "float", "min": 0.0, "max": 1e9}});
         assert_eq!(field(&float), Field::Typed);
-        assert_eq!(takes(&float), "a number from 0, or none");
+        assert_eq!(takes(&float, "none"), "a number from 0, or none");
         let model = json!({"type": "optional", "inner": {"type": "model"}});
         assert_eq!(field(&model), Field::Model { optional: true });
         assert_eq!(
@@ -1217,13 +1763,16 @@ mod tests {
             Field::List(vec!["true".into(), "false".into()])
         );
         let tokens = json!({"type": "int", "min": 1, "max": i64::MAX});
-        assert_eq!(takes(&tokens), "a whole number from 1");
+        assert_eq!(takes(&tokens, "none"), "a whole number from 1");
         assert_eq!(
-            takes(&json!({"type": "int", "min": 1, "max": 32})),
+            takes(&json!({"type": "int", "min": 1, "max": 32}), "none"),
             "a whole number, 1 to 32"
         );
         assert_eq!(
-            takes(&json!({"type": "duration", "min_secs": 30, "max_secs": 60})),
+            takes(
+                &json!({"type": "duration", "min_secs": 30, "max_secs": 60}),
+                "none"
+            ),
             "a time like 30m, 2h or 1d"
         );
         assert_eq!(span(86_220), "23h 57m");

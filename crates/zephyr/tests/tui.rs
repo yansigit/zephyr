@@ -58,9 +58,10 @@ fn history() -> Vec<Value> {
     ]
 }
 
-/// The scenes with nothing running: "waiting" is "idle" with a proposal waiting for the owner.
+/// The scenes with nothing running: "waiting" is "idle" with a proposal waiting for the owner,
+/// "held" with a message held for the owner and a post waiting out its delay.
 fn idle(scene: &str) -> bool {
-    matches!(scene, "paused" | "down" | "idle" | "waiting")
+    matches!(scene, "paused" | "down" | "idle" | "waiting" | "held")
 }
 
 fn snapshot(scene: &str) -> Value {
@@ -94,7 +95,7 @@ fn snapshot(scene: &str) -> Value {
             {"id": 3, "name": "renew domain", "next_unix": COOL_UNTIL + 3_600},
             {"id": 1, "name": "daily-brief", "next_unix": COOL_UNTIL + 86_400},
         ],
-        "proposals": if scene == "waiting" { 1 } else { 0 },
+        "proposals": match scene { "waiting" => 1, "held" => 2, _ => 0 },
     })
 }
 
@@ -111,11 +112,17 @@ fn settings() -> Value {
                source: &str,
                access: &str| {
         json!({"key": key, "label": label, "help": help, "kind": kind, "value": value, "source": source,
-               "access": access, "strong": key.starts_with("budget.") || key == "settings.strong_channels",
-               "until": if source.starts_with("until") { json!(COOL_UNTIL) } else { Value::Null }})
+               "access": access, "strong": key.starts_with("budget.")
+                   || (key.starts_with("approvals.") && key != "approvals.currency")
+                   || key == "settings.strong_channels" || key == "facts",
+               "until": if source.starts_with("until") { json!(COOL_UNTIL) } else { Value::Null },
+               // A hand-set class differs from the semi preset.
+               "modified": key == "approvals.preset"})
     };
     let int = |min: i64, max: i64| json!({"type": "int", "min": min, "max": max});
     let optional = |inner: Value| json!({"type": "optional", "inner": inner});
+    let mode = |options: &[&str]| optional(json!({"type": "mode", "options": options}));
+    let classes = ["ask", "ask-new", "delay N", "auto"];
     let fixed = |key: &str, label: &str, help: &str| {
         row(
             key,
@@ -171,6 +178,24 @@ fn settings() -> Value {
             row("rule", "Standing rules", "Rules the agent follows in every run: add, rm.", json!({"type": "text", "max": 4000}),
                 json!("2 rules"), "you", "propose"),
         ]},
+        {"name": "Approvals", "settings": [
+            row("facts", "Private facts", "Things that must not leave in an outgoing call, kept by name.",
+                json!({"type": "text", "max": 4000}), json!("home-address, phone"), "you", "propose"),
+            row("approvals.preset", "Preset", "manual asks before every message, post and payment; semi lets known recipients through and delays posts 5 minutes; full asks for nothing.",
+                json!({"type": "choice", "options": ["manual", "semi", "full"]}), json!("semi"), "you", "tighten"),
+            row("approvals.messages", "Messages", "What a message to someone waits for; default follows the preset.",
+                mode(&classes), json!("ask"), "you", "tighten"),
+            row("approvals.posts", "Posts", "What a public post waits for; default follows the preset.",
+                mode(&classes), json!("delay 5"), "preset", "tighten"),
+            row("approvals.money", "Payments", "What a payment waits for; auto N lets one through up to N in the currency.",
+                mode(&["ask", "delay N", "auto", "auto N"]), json!("auto 50"), "you", "tighten"),
+            row("approvals.currency", "Currency", "The ISO 4217 currency an auto N cap counts in.",
+                json!({"type": "text", "max": 3}), json!("EUR"), "you", "propose"),
+            row("approvals.facts", "Private facts", "What a call holding one of your private facts does.",
+                optional(json!({"type": "choice", "options": ["hold", "warn", "off"]})), json!("hold"), "preset", "tighten"),
+            row("approvals.strong_only", "Approved only from a strong channel", "loosen: a proposal that relaxes approvals or a fact; money: payments.",
+                json!({"type": "list", "options": ["loosen", "money"]}), json!("loosen"), "default", "tighten"),
+        ]},
         {"name": "Security", "settings": [
             row("settings.strong_channels", "Strong channels",
                 "Channels that may loosen a protected setting; the agent may only remove entries.",
@@ -192,13 +217,44 @@ fn settings() -> Value {
     ], "strong_channels": ["tui", "chat"]})
 }
 
-/// `zephyr.proposals` in the "waiting" scene: the agent asks for a bigger budget for a while.
+/// `zephyr.proposals` in the "waiting" scene: the agent asks for a bigger budget for a while. In
+/// "held": a post waiting out its delay and a message to a new recipient, cards in the gate's
+/// words (made-up people and places).
 fn proposals(scene: &str) -> Value {
-    if scene != "waiting" {
-        return json!({"proposals": []});
+    match scene {
+        "waiting" => {
+            json!({"proposals": [{"id": 12, "card": "/set budget.daily_cost_usd 8 for 2h", "kind": "setting",
+            "key": "budget.daily_cost_usd", "age_secs": 180, "expires_in_secs": 86_220, "strong": true}]})
+        }
+        "held" => json!({"proposals": [
+            {"id": 8, "kind": "run", "class": "posts", "status": "scheduled", "due_at": COOL_UNTIL,
+             "summary": "gh pr create on octo/hello",
+             "card": "[zephyr] delayed #8: post (GitHub)\ngh pr create on octo/hello · title: \"Fix typo\"\n\
+                      first lines: \"One letter was wrong.\"\n\
+                      command: \"gh pr create --repo octo/hello --title 'Fix typo' --body 'One letter was wrong.'\"\n\
+                      sending at 09:00 unless /cancel 8",
+             "key": null, "age_secs": 60, "expires_in_secs": 86_340, "strong": false, "once": false},
+            {"id": 7, "kind": "run", "class": "messages", "status": "pending", "due_at": null,
+             "summary": "email to alice@example.com",
+             "card": "[zephyr] approve #7: message (email)\n\
+                      to: alice@example.com (new) · subject: \"Invoice March\"\n\
+                      first lines: \"Hi Alice, attached is the invoice for March. Best, A.\"\n\
+                      command: \"himalaya message send <<'EOF' To: alice@example.com Subject: Invoice March \
+                      Hi Alice, attached is the invoice for March. Best, A. EOF\"\n\
+                      the agent says: \"the owner asked me to send the March invoice\"\n\
+                      /ok 7 · /ok 7 once · /no 7 · expires in 24 h",
+             "key": null, "age_secs": 180, "expires_in_secs": 86_220, "strong": false, "once": true},
+        ]}),
+        _ => json!({"proposals": []}),
     }
-    json!({"proposals": [{"id": 12, "card": "/set budget.daily_cost_usd 8 for 2h", "kind": "setting",
-        "key": "budget.daily_cost_usd", "age_secs": 180, "expires_in_secs": 86_220, "strong": true}]})
+}
+
+/// `zephyr.facts_*` answers: names, kinds and where each may go, never a value.
+fn facts() -> Value {
+    json!({"facts": [
+        {"name": "home-address", "kind": "text", "allow": ["https://shop.example.com"]},
+        {"name": "phone", "kind": "digits", "allow": []},
+    ]})
 }
 
 /// What the router answers `zephyr.settings_set` with: `tasks.parallel` takes 1 to 32.
@@ -316,9 +372,21 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
                             p["id"],
                             p["verb"].as_str().unwrap()
                         ));
-                        json!({"ok": true, "text": "[zephyr] /ok 12 approved /set budget.daily_cost_usd 8 for 2h\n\
-                               [zephyr] budget.daily_cost_usd 5 → 8 until 16:02"})
+                        match p["id"].as_i64() {
+                            Some(12) => {
+                                json!({"ok": true, "text": "[zephyr] /ok 12 approved /set budget.daily_cost_usd 8 for 2h\n\
+                                   [zephyr] budget.daily_cost_usd 5 → 8 until 16:02"})
+                            }
+                            Some(8) => {
+                                json!({"ok": true, "text": "[zephyr] cancelled #8 (gh pr create on octo/hello)"})
+                            }
+                            _ => {
+                                json!({"ok": true, "text": "[zephyr] approved #7 (email to alice@example.com): \
+                                   running it as process #3; the agent gets its report"})
+                            }
+                        }
                     }
+                    "zephyr.facts_list" => facts(),
                     "send" => {
                         let text = req["params"]["command"]["content"]
                             .as_str()
@@ -979,6 +1047,59 @@ async fn the_settings_panel_opens_from_slash_settings() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_waiting_tab_shows_a_held_message() {
+    if tmux_missing() {
+        return;
+    }
+    let mut screen = Screen::start("held", 100, 30, "dark").await;
+    let first = screen.wait_for("^L model").await;
+    assert!(
+        first
+            .lines()
+            .next()
+            .unwrap()
+            .trim_end()
+            .ends_with("2 waiting"),
+        "{first}"
+    );
+    screen.keys(&["=/settings", "Enter"]);
+    screen.wait_for("Waiting (2)").await;
+    screen.keys(&["End", "Right"]);
+    // Newest first: the delayed post says when it goes, the message how long it has waited.
+    let list = screen
+        .wait_for("#7  message · email to alice@example.com")
+        .await;
+    assert!(
+        list.contains("#8  post · gh pr create on octo/hello"),
+        "{list}"
+    );
+    assert!(list.contains("at 09:00"), "{list}");
+    assert!(list.contains("c cancel"), "{list}");
+    // The post is cancelled before it goes.
+    screen.keys(&["c"]);
+    assert_eq!(screen.next_sent().await, "zephyr.decide 8 cancel");
+    screen
+        .wait_for("cancelled #8 (gh pr create on octo/hello)")
+        .await;
+    // The message: its whole card in the daemon's words; `1` approves it once.
+    screen.keys(&["Down", "Enter"]);
+    let card = screen.wait_for("held #7").await;
+    assert!(
+        card.contains("to: alice@example.com (new) · subject: \"Invoice March\""),
+        "{card}"
+    );
+    assert!(card.contains("o ok · 1 once · d drop · esc back"), "{card}");
+    screen.keys(&["1"]);
+    assert_eq!(screen.next_sent().await, "zephyr.decide 7 once");
+    screen
+        .wait_for("approved #7 (email to alice@example.com)")
+        .await;
+    screen.keys(&["Escape"]);
+    let closed = screen.wait_for("^L model").await;
+    assert!(!closed.contains("╭─ settings"), "{closed}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn screens_match_the_goldens() {
     if tmux_missing() {
         return;
@@ -1019,9 +1140,42 @@ async fn screens_match_the_goldens() {
         ][..],
         "proposal #12",
     );
+    // The Approvals section, the keyboard on the preset.
+    let approvals = (
+        "^L model",
+        &[
+            "=/settings",
+            "Enter",
+            "~Waiting (2)",
+            "Down",
+            "Down",
+            "Down",
+            "Down",
+            "Down",
+            "Down",
+            "Down",
+            "Right",
+            "Down",
+        ][..],
+        "approvals.preset ·",
+    );
+    let action = (
+        "^L model",
+        &[
+            "=/settings",
+            "Enter",
+            "~Waiting (2)",
+            "End",
+            "~#7",
+            "Right",
+            "Down",
+            "Enter",
+        ][..],
+        "held #7",
+    );
     // (golden name, scene, size, theme, (ready, keys, shown))
     #[allow(clippy::type_complexity)]
-    let shots: [(&str, &'static str, u16, u16, &str, (&str, &[&str], &str)); 29] = [
+    let shots: [(&str, &'static str, u16, u16, &str, (&str, &[&str], &str)); 31] = [
         ("busy", "busy", 80, 24, "dark", busy),
         ("busy", "busy", 80, 24, "light", busy),
         ("busy", "busy", 140, 40, "dark", busy),
@@ -1100,6 +1254,8 @@ async fn screens_match_the_goldens() {
         ("status", "idle", 80, 24, "nocolor", status),
         ("settings", "waiting", 100, 30, "dark", settings),
         ("waiting", "waiting", 100, 30, "dark", card),
+        ("approvals", "held", 100, 30, "dark", approvals),
+        ("action", "held", 100, 30, "dark", action),
     ];
     let mut failures = vec![];
     for (name, scene, cols, rows, theme, steps) in shots {

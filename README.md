@@ -124,7 +124,9 @@ In the settings panel (`/settings`; `?` lists these):
 | `Enter` | Edit the setting: a list for a choice or a true-or-false setting, the model picker for a model, a one-line field for a number or text. On a proposal under Waiting, the whole card |
 | `Space` | Turn a true-or-false setting over at once |
 | `t` (or `Tab` in an editor) | Add a time limit (`30m`, `2h`, `1d`); the setting goes back by itself |
-| `o` / `1` / `d` | Under Waiting: approve a proposal, approve it once (the same as `o` for a setting), or drop it |
+| `o` / `1` / `d` | Under Waiting: approve a proposal, approve it once (a message or post to a new recipient goes without being remembered; the same as `o` for a setting), or drop it |
+| `c` | Under Waiting: cancel an action waiting out its delay, before it goes |
+| `a` / `e` / `d` | Under Private facts: add a fact, edit one (an empty value keeps the saved one), or delete it; the value is typed masked and never shown again |
 | `Esc` | Back, or close the panel |
 
 Drafts put aside are gone when you detach; the history starts again from the messages in the conversation. The footer shows `ctx N%`, how full the model's context is after the last reply.
