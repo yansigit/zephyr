@@ -1742,11 +1742,23 @@ impl Store {
     }
 
     /// Drops what is older than `before` (unix secs) and settled: sent or failed replies,
-    /// audit lines and setting changes. An inbox row is never deleted, only emptied of its text: its platform id
+    /// audit lines, setting changes and one-time passes. An inbox row is never deleted, only emptied of its text: its platform id
     /// keeps dedupe working against any replay (an iMessage backfill reaches back as far as the
-    /// owner sets), and its id keeps reply ids (`client_id`) from ever being reused. Returns
-    /// how many rows went or were emptied.
+    /// owner sets), and its id keeps reply ids (`client_id`) from ever being reused. A settled
+    /// held action is kept the same way, its payload and the agent's reason emptied (D8: a
+    /// message's text, and what a fact hold was about, would otherwise stay in state.db and its
+    /// backups), so its id is never used again. Returns how many rows went or were emptied.
     pub fn prune(&self, before: i64) -> rusqlite::Result<usize> {
+        let passes = self
+            .db
+            .execute("DELETE FROM passes WHERE expires_at < ?1", params![before])?;
+        let actions = self.db.execute(
+            "UPDATE proposals SET payload = '', reason = NULL
+             WHERE kind != 'command' AND status NOT IN ('pending', 'scheduled', 'running')
+               AND coalesce(settled_at, created_at) < ?1
+               AND (coalesce(payload, '') != '' OR reason IS NOT NULL)",
+            params![before],
+        )?;
         let emptied = self.db.execute(
             "UPDATE inbox SET text = '' WHERE created_at < ?1 AND text != ''
              AND status NOT IN ('new', 'dispatched')",
@@ -1762,7 +1774,7 @@ impl Store {
         let changes = self
             .db
             .execute("DELETE FROM settings_log WHERE at < ?1", params![before])?;
-        Ok(emptied + sent + audit + changes)
+        Ok(emptied + sent + audit + changes + passes + actions)
     }
 
     /// Job `id`, if there is one.
@@ -3397,6 +3409,61 @@ mod tests {
         assert_eq!(store.pending_outbox().unwrap().len(), 1);
         assert!(store.audit_rows().unwrap().is_empty());
         assert_eq!(store.prune(1000).unwrap(), 0);
+    }
+
+    /// D8: an old pass goes, and a settled action old enough loses its payload and reason (a
+    /// message's text, a fact a hold named), as an old inbox row loses its text; one still waiting
+    /// or running, or settled lately, keeps them.
+    #[test]
+    fn prune_forgets_old_passes_and_old_action_bodies() {
+        let dir = crate::test_dir("store-prune-actions");
+        let store = Store::open(&dir.join("state.db")).unwrap();
+        let body = |run: &str| NewAction {
+            payload:
+                r#"{"command": "himalaya message send <<'EOF'\nTo: a@x.org\n\nsecret text\nEOF"}"#
+                    .into(),
+            ..new_action(run, None)
+        };
+        let old = store.hold_action(&body("r1")).unwrap();
+        store.take_action(old, "dropped").unwrap();
+        let lately = store.hold_action(&body("r2")).unwrap();
+        store.take_action(lately, "dropped").unwrap();
+        let waiting = store.hold_action(&body("r3")).unwrap();
+        let running = store.hold_action(&body("r4")).unwrap();
+        store.take_action(running, "running").unwrap();
+        store.add_pass("old", old, 10).unwrap();
+        store.add_pass("live", lately, i64::MAX).unwrap();
+        let set =
+            "UPDATE proposals SET created_at = 0, settled_at = iif(settled_at IS NULL, NULL, 0)
+                   WHERE id IN (?1, ?2, ?3)";
+        store
+            .db
+            .execute(set, params![old, waiting, running])
+            .unwrap();
+        assert!(store.prune(1000).unwrap() >= 2);
+        let row = |id: i64| -> (String, Option<String>) {
+            store
+                .db
+                .query_row(
+                    "SELECT coalesce(payload, ''), reason FROM proposals WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(row(old), (String::new(), None));
+        for id in [lately, waiting, running] {
+            let (payload, reason) = row(id);
+            assert!(payload.contains("secret text"), "#{id}");
+            assert_eq!(reason.as_deref(), Some("the owner asked"), "#{id}");
+        }
+        let passes: Vec<String> = {
+            let mut stmt = store.db.prepare("SELECT digest FROM passes").unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        assert_eq!(passes, ["live"]);
+        assert_eq!(store.prune(1000).unwrap(), 0, "once");
     }
 
     #[test]

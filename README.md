@@ -607,7 +607,8 @@ The first `himalaya` command run with `secrets: ["MAIL_PASSWORD"]` asks you to a
     Used only on the host, at `zephyr up`.
   - `state.db`: inbox, outbox, jobs, spend, the actions waiting for your approval and the
     recipients you approved, and the audit of tool calls. Rows older than 90 days
-    are pruned; a reply that could not be sent for 7 days is given up as `expired`.
+    are pruned (a held action that old keeps its number and summary, not its message); a reply
+    that could not be sent for 7 days is given up as `expired`.
   - `backups/` (0700): a daily copy of `state.db` and the four files above, the newest 7 kept.
     `zephyr doctor` warns when the newest is over 2 days old. Copy this folder off the machine
     yourself (it holds secrets: keep the copy encrypted).
