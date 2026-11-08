@@ -1316,8 +1316,9 @@ fn canonical(v: &Value) -> String {
 /// Every line but the first and the last starts with a label of the daemon's; what came from
 /// the agent or a page is quoted on one line and cut, with the vault's and the facts' values
 /// scrubbed out (none of it is shown when the facts cannot be read). A fact hold names the fact,
-/// never its value; under `ask-new` a target not approved before is marked `(new)`; a delayed
-/// action says when it goes; one that needs a strong channel to approve says so.
+/// never its value; under `ask-new` a target not approved before is marked `(new)`, and only
+/// there is `/ok N once` offered (the example's class is `ask-new`); a delayed action says when
+/// it goes; one that needs a strong channel to approve says so.
 pub fn card(a: &Action, cfg: &Config, store: &Store) -> String {
     let scrub = Scrub::load(cfg);
     let clean = |text: &str| scrub.text(text);
@@ -1596,10 +1597,11 @@ fn footer(a: &Action, cfg: &Config, class: Option<Class>) -> String {
         let at = crate::settings::clock(a.due_at.unwrap_or(a.created_at), &tz);
         return format!("sending at {at} unless /cancel {id}");
     }
-    // `once` approves without remembering the targets, which only messages and posts keep.
-    let once = match class {
-        Some(Class::Messages | Class::Posts) => format!(" · /ok {id} once"),
-        _ => String::new(),
+    // `once` approves without remembering the targets, which only `ask-new` does: elsewhere it
+    // is `ok` (`/ok N once` is still taken), so the card offers it only there.
+    let once = match asks_new(&approvals::effective(cfg), &a.class) {
+        true => format!(" · /ok {id} once"),
+        false => String::new(),
     };
     // What is left of the 24 h (10 min for a browser wait), rounded up.
     let now = crate::now();
@@ -1923,7 +1925,7 @@ mod tests {
              command: \"himalaya message send <<'EOF' To: alice@example.com Subject: Invoice \
              March Hi Alice, attached is the invoice for March. Best, A. EOF\"\n\
              the agent says: \"{REASON}\"\n\
-             /ok {id} · /ok {id} once · /no {id} · expires in 24 h"
+             /ok {id} · /no {id} · expires in 24 h"
         );
         assert_eq!(rows[0].text, want);
         assert_eq!(card(&a, &h.cfg, &h.store), want);
@@ -1963,6 +1965,13 @@ mod tests {
             card.starts_with(&format!(
                 "[zephyr] approve #{id}: message (email)\n\
                  to: alice@example.com, bob@example.org (new) · subject: \"Hello\"\n"
+            )),
+            "{card}"
+        );
+        // Only under ask-new does `once` differ from `ok`, so only here does the card offer it.
+        assert!(
+            card.ends_with(&format!(
+                "/ok {id} · /ok {id} once · /no {id} · expires in 24 h"
             )),
             "{card}"
         );
@@ -2538,7 +2547,7 @@ mod tests {
         assert!(lines[0].starts_with(&format!("[zephyr] approve #{id}: ")));
         assert_eq!(
             *lines.last().unwrap(),
-            format!("/ok {id} · /ok {id} once · /no {id} · expires in 24 h")
+            format!("/ok {id} · /no {id} · expires in 24 h")
         );
         for line in &lines[1..lines.len() - 1] {
             assert!(

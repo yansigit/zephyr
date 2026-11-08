@@ -345,18 +345,21 @@ pub fn decline(store: &Store, id: i64) -> String {
 }
 
 /// `/cancel N`: a delayed action is cancelled before it goes, and the agent is told; a delayed
-/// browser action is denied.
-pub fn cancel(store: &Store, waits: &Waits, arg: &str) -> String {
+/// browser action is denied. `Ok` is the answer once it was cancelled, `Err` the answer when
+/// nothing was (as `approve` answers).
+pub fn cancel(store: &Store, waits: &Waits, arg: &str) -> Result<String, String> {
     let Ok(id) = arg.trim().trim_start_matches('#').parse::<i64>() else {
-        return "[zephyr] usage: /cancel N, for an action waiting out its delay".into();
+        return Err("[zephyr] usage: /cancel N, for an action waiting out its delay".into());
     };
     match store.action(id) {
         Ok(Some(a)) if a.status == "scheduled" => {}
         Ok(Some(a)) if a.status == "pending" => {
-            return format!("[zephyr] #{id} is not waiting out a delay; /no {id} drops it")
+            return Err(format!(
+                "[zephyr] #{id} is not waiting out a delay; /no {id} drops it"
+            ))
         }
-        Ok(_) => return not_waiting(id),
-        Err(e) => return format!("[zephyr] reading proposal #{id} failed: {e}"),
+        Ok(_) => return Err(not_waiting(id)),
+        Err(e) => return Err(format!("[zephyr] reading proposal #{id} failed: {e}")),
     }
     match store.take_action(id, "cancelled") {
         Ok(Some(a)) => {
@@ -367,10 +370,10 @@ pub fn cancel(store: &Store, waits: &Waits, arg: &str) -> String {
                 a.summary
             );
             note(store, &a, "cancelled", &text);
-            format!("[zephyr] cancelled #{id} ({})", a.summary)
+            Ok(format!("[zephyr] cancelled #{id} ({})", a.summary))
         }
-        Ok(None) => not_waiting(id),
-        Err(e) => format!("[zephyr] reading proposal #{id} failed: {e}"),
+        Ok(None) => Err(not_waiting(id)),
+        Err(e) => Err(format!("[zephyr] reading proposal #{id} failed: {e}")),
     }
 }
 
@@ -566,6 +569,23 @@ mod tests {
     }
 
     const SEND: &str = r#"{"command": "himalaya message send < m.eml"}"#;
+
+    /// `/cancel N` says whether it cancelled, so `zephyr.decide` need not read its words.
+    #[test]
+    fn cancel_says_whether_it_cancelled() {
+        let (_, store) = setup("actions-cancel", "");
+        let waits = Waits::default();
+        let now = hold(&store, ActionKind::Run, SEND, &[], None);
+        let later = hold(&store, ActionKind::Run, SEND, &[], Some(crate::now() + 300));
+        let refused = cancel(&store, &waits, &now.to_string()).unwrap_err();
+        assert!(refused.contains("is not waiting out a delay"), "{refused}");
+        assert_eq!(
+            cancel(&store, &waits, &later.to_string()),
+            Ok(format!("[zephyr] cancelled #{later} (email to a@x.org)"))
+        );
+        assert!(cancel(&store, &waits, &later.to_string()).is_err());
+        assert!(cancel(&store, &waits, "x").is_err());
+    }
 
     /// R46: a target becomes known only once its action started.
     #[test]

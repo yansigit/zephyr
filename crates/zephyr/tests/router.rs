@@ -4446,10 +4446,7 @@ async fn a_held_mail_send_runs_exactly_on_ok() {
         ),
         "{card}"
     );
-    assert!(
-        card.ends_with("/ok 1 · /ok 1 once · /no 1 · expires in 24 h"),
-        "{card}"
-    );
+    assert!(card.ends_with("/ok 1 · /no 1 · expires in 24 h"), "{card}");
     let reply = reply_where(&gw, "chat", |r| r.starts_with("echo: ")).await;
     assert!(
         reply.ends_with(&format!("\nexec: {HELD_UNREAD}")),
@@ -4550,6 +4547,31 @@ async fn once_does_not_remember_and_ok_does() {
     gw.shutdown().await;
 }
 
+/// Under `ask` the card does not offer `/ok N once`, which would do what `/ok N` does; typed
+/// anyway (or sent by the TUI's `1`), it still approves, once.
+#[tokio::test]
+async fn once_still_approves_a_send_whose_card_does_not_offer_it() {
+    let home = home("gate-once-ask");
+    let gw = start(config(&home)); // no [approvals]: manual
+    gw.say("m1", "owner", SEND_TO_A).await;
+    let card = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    assert!(
+        card.ends_with("\n/ok 1 · /no 1 · expires in 24 h"),
+        "{card}"
+    );
+    gw.say("m2", "owner", "/ok 1 once").await;
+    reply_where(&gw, "chat", |r| r.contains("approved #1")).await;
+    let audit = Store::open(&home.join("state.db"))
+        .unwrap()
+        .audit_rows()
+        .unwrap();
+    assert!(
+        audit.iter().any(|(_, _, _, outcome)| outcome == "once"),
+        "{audit:?}"
+    );
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_delay_runs_on_the_tick_unless_cancelled() {
     let home = home("gate-delay");
@@ -4630,10 +4652,7 @@ async fn a_delay_due_while_down_comes_back_pending() {
     make_due(&home, 1);
     let gw = start(cfg);
     let card = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
-    assert!(
-        card.ends_with("/ok 1 · /ok 1 once · /no 1 · expires in 24 h"),
-        "{card}"
-    );
+    assert!(card.ends_with("/ok 1 · /no 1 · expires in 24 h"), "{card}");
     assert_eq!(action_status(&home, 1), "pending");
     gw.say("m2", "owner", "/held").await;
     let held = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] held for you")).await;
@@ -4849,10 +4868,7 @@ async fn a_delay_due_while_paused_is_asked_again() {
     wait(|| beat.exists()).await;
     budget_pause(&home, false);
     let card = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
-    assert!(
-        card.ends_with("/ok 1 · /ok 1 once · /no 1 · expires in 24 h"),
-        "{card}"
-    );
+    assert!(card.ends_with("/ok 1 · /no 1 · expires in 24 h"), "{card}");
     assert_eq!(action_status(&home, 1), "pending");
     assert!(!home.join("paused.eml").exists());
     gw.say("m2", "owner", "/ok 1").await;
@@ -5254,7 +5270,7 @@ async fn a_browser_send_waits_until_ok_and_then_clicks() {
         "{card}"
     );
     assert!(
-        card.ends_with("/ok 1 · /ok 1 once · /no 1 · expires in 10 min"),
+        card.ends_with("/ok 1 · /no 1 · expires in 10 min"),
         "{card}"
     );
     // The wrapper read the page through the real binary, and clicked nothing yet.

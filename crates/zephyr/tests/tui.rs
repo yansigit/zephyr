@@ -184,14 +184,14 @@ fn settings() -> Value {
             row("approvals.preset", "Preset", "manual asks before every message, post and payment; semi lets known recipients through and delays posts 5 minutes; full asks for nothing.",
                 json!({"type": "choice", "options": ["manual", "semi", "full"]}), json!("semi"), "you", "tighten"),
             row("approvals.messages", "Messages", "What a message to someone waits for; default follows the preset.",
-                mode(&classes), json!("ask"), "you", "tighten"),
+                mode(&classes), json!("ask-new"), "preset", "tighten"),
             row("approvals.posts", "Posts", "What a public post waits for; default follows the preset.",
                 mode(&classes), json!("delay 5"), "preset", "tighten"),
             row("approvals.money", "Payments", "What a payment waits for; auto N lets one through up to N in the currency.",
                 mode(&["ask", "delay N", "auto", "auto N"]), json!("auto 50"), "you", "tighten"),
             row("approvals.currency", "Currency", "The ISO 4217 currency an auto N cap counts in.",
                 json!({"type": "text", "max": 3}), json!("EUR"), "you", "propose"),
-            row("approvals.facts", "Private facts", "What a call holding one of your private facts does.",
+            row("approvals.facts", "Facts check", "What a call holding one of your private facts does.",
                 optional(json!({"type": "choice", "options": ["hold", "warn", "off"]})), json!("hold"), "preset", "tighten"),
             row("approvals.strong_only", "Approved only from a strong channel", "loosen: a proposal that relaxes approvals or a fact; money: payments.",
                 json!({"type": "list", "options": ["loosen", "money"]}), json!("loosen"), "default", "tighten"),
@@ -219,8 +219,21 @@ fn settings() -> Value {
 
 /// `zephyr.proposals` in the "waiting" scene: the agent asks for a bigger budget for a while. In
 /// "held": a post waiting out its delay and a message to a new recipient, cards in the gate's
-/// words (made-up people and places).
-fn proposals(scene: &str) -> Value {
+/// words (made-up people and places). Once a setting `changed` (messages went from ask-new to
+/// ask), once no longer differs for the message, and its card says so.
+fn proposals(scene: &str, changed: bool) -> Value {
+    let (new, footer) = match changed {
+        false => (" (new)", "/ok 7 · /ok 7 once · /no 7 · expires in 24 h"),
+        true => ("", "/ok 7 · /no 7 · expires in 24 h"),
+    };
+    let message = format!(
+        "[zephyr] approve #7: message (email)\n\
+         to: alice@example.com{new} · subject: \"Invoice March\"\n\
+         first lines: \"Hi Alice, attached is the invoice for March. Best, A.\"\n\
+         command: \"himalaya message send <<'EOF' To: alice@example.com Subject: Invoice March \
+         Hi Alice, attached is the invoice for March. Best, A. EOF\"\n\
+         the agent says: \"the owner asked me to send the March invoice\"\n{footer}"
+    );
     match scene {
         "waiting" => {
             json!({"proposals": [{"id": 12, "card": "/set budget.daily_cost_usd 8 for 2h", "kind": "setting",
@@ -236,14 +249,8 @@ fn proposals(scene: &str) -> Value {
              "key": null, "age_secs": 60, "expires_in_secs": 86_340, "strong": false, "once": false},
             {"id": 7, "kind": "run", "class": "messages", "status": "pending", "due_at": null,
              "summary": "email to alice@example.com",
-             "card": "[zephyr] approve #7: message (email)\n\
-                      to: alice@example.com (new) · subject: \"Invoice March\"\n\
-                      first lines: \"Hi Alice, attached is the invoice for March. Best, A.\"\n\
-                      command: \"himalaya message send <<'EOF' To: alice@example.com Subject: Invoice March \
-                      Hi Alice, attached is the invoice for March. Best, A. EOF\"\n\
-                      the agent says: \"the owner asked me to send the March invoice\"\n\
-                      /ok 7 · /ok 7 once · /no 7 · expires in 24 h",
-             "key": null, "age_secs": 180, "expires_in_secs": 86_220, "strong": false, "once": true},
+             "card": message,
+             "key": null, "age_secs": 180, "expires_in_secs": 86_220, "strong": false, "once": !changed},
         ]}),
         _ => json!({"proposals": []}),
     }
@@ -257,18 +264,24 @@ fn facts() -> Value {
     ]})
 }
 
-/// What the router answers `zephyr.settings_set` with: `tasks.parallel` takes 1 to 32.
+/// What the router answers `zephyr.settings_set` with: `tasks.parallel` takes 1 to 32; the old
+/// value is the one `settings` lists.
 fn settings_set(params: &Value) -> Value {
     let (key, value) = (
         params["key"].as_str().unwrap_or_default(),
         params["value"].as_str().unwrap_or_default(),
     );
+    let all = settings();
+    let old = (all["sections"].as_array().unwrap().iter())
+        .flat_map(|s| s["settings"].as_array().unwrap())
+        .find(|r| r["key"] == key)
+        .map_or(Value::Null, |r| r["value"].clone());
     match value.parse::<i64>() {
         Ok(n) if key == "tasks.parallel" && !(1..=32).contains(&n) => {
             json!({"outcome": "refused", "reason": "not changed: [tasks] parallel must be 1 to 32"})
         }
         _ => {
-            json!({"outcome": "changed", "key": key, "old": "2", "new": value, "applied": "[zephyr] applied",
+            json!({"outcome": "changed", "key": key, "old": old, "new": value, "applied": "[zephyr] applied",
                     "until": null})
         }
     }
@@ -327,6 +340,8 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
             }
             let (read, mut write) = stream.into_split();
             let mut lines = BufReader::new(read).lines();
+            // A setting changed on this connection.
+            let mut changed = false;
             let frame = |v: Value| format!("{v}\n");
             while let Ok(Some(line)) = lines.next_line().await {
                 let req: Value = serde_json::from_str(&line).unwrap();
@@ -351,7 +366,7 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
                         {"channel": "discord", "text": "remind me to renew the domain on friday"},
                     ]}),
                     "zephyr.settings" => settings(),
-                    "zephyr.proposals" => proposals(scene),
+                    "zephyr.proposals" => proposals(scene, changed),
                     // The changes and decisions are passed on like prompts, for the test to read.
                     "zephyr.settings_set" => {
                         let p = &req["params"];
@@ -363,7 +378,9 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
                             p["key"].as_str().unwrap(),
                             p["value"].as_str().unwrap()
                         ));
-                        settings_set(p)
+                        let answer = settings_set(p);
+                        changed |= answer["outcome"] == "changed";
+                        answer
                     }
                     "zephyr.decide" => {
                         let p = &req["params"];
@@ -1097,6 +1114,38 @@ async fn the_waiting_tab_shows_a_held_message() {
     screen.keys(&["Escape"]);
     let closed = screen.wait_for("^L model").await;
     assert!(!closed.contains("╭─ settings"), "{closed}");
+}
+
+/// A setting changed in the panel lists what waits again: whether once differs, and the card,
+/// follow the mode now. `1` on the message still approves it once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_setting_lists_the_held_actions_again() {
+    if tmux_missing() {
+        return;
+    }
+    let mut screen = Screen::start("held", 100, 30, "dark").await;
+    screen.wait_for("^L model").await;
+    screen.keys(&["=/settings", "Enter"]);
+    screen.wait_for("Waiting (2)").await;
+    // Approvals, then its messages row: ask-new becomes ask.
+    for _ in 0..7 {
+        screen.keys(&["Down"]);
+    }
+    screen.keys(&["Right", "Down", "Down"]);
+    screen.wait_for("approvals.messages ·").await;
+    screen.keys(&["Enter"]);
+    screen.wait_for("› value  ask-new").await;
+    screen.keys(&["BSpace", "BSpace", "BSpace", "BSpace", "Enter"]);
+    assert_eq!(
+        screen.next_sent().await,
+        "zephyr.settings_set approvals.messages ask"
+    );
+    screen.wait_for("approvals.messages ask-new → ask").await;
+    screen.keys(&["Left", "End", "Right", "Down", "Enter"]);
+    let card = screen.wait_for("/ok 7 · /no 7 · expires in 24 h").await;
+    assert!(card.contains("o ok · d drop · esc back"), "{card}");
+    screen.keys(&["1"]);
+    assert_eq!(screen.next_sent().await, "zephyr.decide 7 once");
 }
 
 #[tokio::test(flavor = "multi_thread")]

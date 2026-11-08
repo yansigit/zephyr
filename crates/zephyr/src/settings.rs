@@ -452,7 +452,7 @@ pub static SETTINGS: &[Setting] = &[
     row(
         "approvals.facts",
         "Approvals",
-        "Private facts",
+        "Facts check",
         "What a call holding one of your private facts does: hold it, warn you, or nothing; \
          default follows the preset.",
         Kind::Optional(&Kind::Choice(&FactsMode::NAMES)),
@@ -1422,6 +1422,19 @@ mod tests {
             None
         );
         assert_eq!(tighter(find("model").unwrap(), None, Some("a/b")), None);
+    }
+
+    /// The panel shows labels, not keys: two rows of one section read alike only when they are
+    /// one entry's rows (a connector's).
+    #[test]
+    fn labels_differ_within_a_section() {
+        for s in SETTINGS {
+            let alike: Vec<&str> = (SETTINGS.iter())
+                .filter(|o| o.section == s.section && o.label == s.label)
+                .map(|o| o.key)
+                .collect();
+            assert_eq!(alike, [s.key], "{} in {}", s.label, s.section);
+        }
     }
 
     #[test]

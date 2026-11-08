@@ -1439,10 +1439,13 @@ impl<'a> Router<'a> {
     /// commands make (stale, strong channel). `once` is `ok` for a setting.
     async fn decide(&mut self, id: i64, verb: &str) -> Value {
         if verb == "cancel" {
-            let reply = crate::actions::cancel(&self.store, &self.waits, &id.to_string());
+            let done = crate::actions::cancel(&self.store, &self.waits, &id.to_string());
             self.settled_actions();
-            let ok = reply.starts_with(&format!("[zephyr] cancelled #{id} "));
-            return json!({"ok": ok, "text": reply});
+            let (ok, text) = match done {
+                Ok(text) => (true, text),
+                Err(text) => (false, text),
+            };
+            return json!({"ok": ok, "text": text});
         }
         let text = match verb {
             "no" => format!("/no {id}"),
@@ -2005,7 +2008,7 @@ impl<'a> Router<'a> {
             ("/cancel", n) => {
                 let reply = crate::actions::cancel(&self.store, &self.waits, n);
                 self.settled_actions();
-                reply
+                reply.unwrap_or_else(|refused| refused)
             }
             // `/rule` alone and `/rules` are `memory::command`'s.
             ("/rule", rule) if !rule.is_empty() => {

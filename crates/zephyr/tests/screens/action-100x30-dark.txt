@@ -21,7 +21,7 @@
  │ to: alice@example.com (new) · subject: "Invoice March"                                         │
  │ first lines: "Hi Alice, attached is the invoice for March. Best, A."                           │
  │ command: "himalaya message send <<'EOF' To: alice@example.com Subject: Invoice March Hi Alice, │
- │ attached is the invoice for March. Best, A. EOF"                                               │
+ │   attached is the invoice for March. Best, A. EOF"                                             │
  │ the agent says: "the owner asked me to send the March invoice"                                 │
  │ /ok 7 · /ok 7 once · /no 7 · expires in 24 h                                                   │
  │                                                                                                │

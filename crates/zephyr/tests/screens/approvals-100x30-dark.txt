@@ -11,11 +11,11 @@
  ╭─ settings ─────────────────────────────────────────────────────────────────────────────────────╮
  │   Model                Private facts  home-address, phone · you                                │
  │   Background tasks   › Preset         semi (modified)     · you                                │
- │   Budget               Messages       ask                 · you                                │
+ │   Budget               Messages       ask-new             · preset                             │
  │   General              Posts          delay 5             · preset                             │
  │   Accounts             Payments       auto 50             · you                                │
  │   Connectors           Currency       EUR                 · you                                │
- │   Rules                Private facts  hold                · preset                             │
+ │   Rules                Facts check    hold                · preset                             │
  │ › Approvals            Approved only from a strong channel  loosen              · default      │
  │   Private facts                                                                                │
  │   Security                                                                                     │

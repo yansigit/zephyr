@@ -419,8 +419,10 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         match s.overlay.as_mut().filter(|o| o.kind == Kind::Settings) {
                             Some(o) => {
                                 o.settings.answered(&v, &tz);
-                                // The values and their sources moved on.
+                                // The values and their sources moved on, and with an approval
+                                // mode, whether once differs for what waits, and its card.
                                 let _ = prompt_tx.send(Ask::Settings);
+                                let _ = prompt_tx.send(Ask::Proposals);
                             }
                             // The panel closed before the answer came: say it in the transcript.
                             None => {

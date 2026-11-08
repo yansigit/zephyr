@@ -21,7 +21,7 @@
  [38;2;92;102;117m│[39m [38;2;216;222;233mto: alice@example.com (new) · subject: "Invoice March"[39m                                         [38;2;92;102;117m│[39m
  [38;2;92;102;117m│[39m [38;2;216;222;233mfirst lines: "Hi Alice, attached is the invoice for March. Best, A."[39m                           [38;2;92;102;117m│[39m
  [38;2;92;102;117m│[39m [38;2;216;222;233mcommand: "himalaya message send <<'EOF' To: alice@example.com Subject: Invoice March Hi Alice,[39m [38;2;92;102;117m│[39m
- [38;2;92;102;117m│[39m [38;2;216;222;233mattached is the invoice for March. Best, A. EOF"[39m                                               [38;2;92;102;117m│[39m
+ [38;2;92;102;117m│[39m [38;2;216;222;233m  attached is the invoice for March. Best, A. EOF"[39m                                             [38;2;92;102;117m│[39m
  [38;2;92;102;117m│[39m [38;2;216;222;233mthe agent says: "the owner asked me to send the March invoice"[39m                                 [38;2;92;102;117m│[39m
  [38;2;92;102;117m│[39m [38;2;216;222;233m/ok 7 · /ok 7 once · /no 7 · expires in 24 h[39m                                                   [38;2;92;102;117m│[39m
  [38;2;92;102;117m│[39m                                                                                                [38;2;92;102;117m│[39m

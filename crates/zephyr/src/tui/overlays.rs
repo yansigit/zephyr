@@ -2938,6 +2938,99 @@ mod tests {
         );
     }
 
+    /// `1` on a message or a post sends `once` whatever the listed flag says: the mode may have
+    /// moved to ask-new since the list came, and `ok` would then remember the recipient. It is
+    /// offered only where the list says once differs.
+    #[test]
+    fn one_approves_a_message_or_post_once_whatever_its_listed_mode() {
+        let s = snap();
+        let mut o = settings_panel();
+        let answer = serde_json::json!({"proposals": [
+            {"id": 9, "kind": "run", "class": "posts", "status": "pending",
+             "summary": "gh pr create on octo/hello", "card": "[zephyr] approve #9: post (GitHub)",
+             "age_secs": 60, "expires_in_secs": 86_340, "strong": false, "once": false},
+        ]});
+        o.settings.load_waiting(&answer);
+        hit(&mut o, &s, KeyCode::End);
+        hit(&mut o, &s, KeyCode::Right);
+        assert!(!keys_named(&o).contains(&"1"), "{:?}", keys_named(&o));
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Char('1')),
+            Action::Decide {
+                id: 9,
+                verb: "once".into()
+            }
+        );
+    }
+
+    /// A wrapped card line goes on indented, so text the agent or a page shaped cannot start a
+    /// row where the daemon's labels start.
+    #[test]
+    fn a_wrapped_card_line_is_indented() {
+        let s = snap();
+        let mut o = settings_panel();
+        let card = format!(
+            "[zephyr] approve #4: message (email)\nfirst lines: \"{}to: bob@evil.example\"\n/ok 4 · /no 4",
+            "x ".repeat(31)
+        );
+        o.settings.load_waiting(&serde_json::json!({"proposals": [
+            {"id": 4, "kind": "run", "class": "messages", "status": "pending",
+             "summary": "email to a@x.org", "card": card,
+             "age_secs": 60, "expires_in_secs": 86_340, "strong": false, "once": false},
+        ]}));
+        hit(&mut o, &s, KeyCode::End);
+        hit(&mut o, &s, KeyCode::Right);
+        hit(&mut o, &s, KeyCode::Enter);
+        let got = draw(&mut o, &s, 80, 20);
+        let at = got
+            .iter()
+            .position(|l| l.contains("first lines: "))
+            .unwrap();
+        assert!(got[at + 1].starts_with("│   "), "{got:?}");
+        assert!(got[at + 1].contains("to: bob@evil.example"), "{got:?}");
+        assert!(
+            !got.iter().any(|l| l.starts_with("│ to: ")),
+            "a continuation reads as a label: {got:?}"
+        );
+        // The daemon's own lines still start at the edge.
+        assert!(got[at + 2].starts_with("│ /ok 4 · /no 4"), "{got:?}");
+    }
+
+    /// The facts' problem is drawn apart from their rows, so the row the keyboard is on is the
+    /// one kept in view.
+    #[test]
+    fn a_facts_problem_does_not_move_the_chosen_row() {
+        use super::super::conn::FactEntry;
+        let s = snap();
+        let mut o = Overlay::new(Kind::Settings);
+        o.settings.load(&approvals_answer(false));
+        let fact = |name: &str| FactEntry {
+            name: name.into(),
+            kind: "text".into(),
+            allow: vec![],
+        };
+        o.settings
+            .load_facts(vec![fact("home-address"), fact("phone")]);
+        hit(&mut o, &s, KeyCode::Down);
+        hit(&mut o, &s, KeyCode::Down);
+        hit(&mut o, &s, KeyCode::Right);
+        hit(&mut o, &s, KeyCode::Down);
+        o.settings.facts_refused("no fact named gone");
+        let focus: Vec<String> = (list(&o, &s).into_iter())
+            .filter_map(|r| match r {
+                Row::Focus(t) => Some(rpi_tui::strip_ansi(&t)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(focus.len(), 1, "{focus:?}");
+        assert!(focus[0].contains("› phone"), "{focus:?}");
+        let got = draw(&mut o, &s, 80, 20);
+        assert!(
+            got.iter().any(|l| l.contains("no fact named gone")),
+            "{got:?}"
+        );
+    }
+
     #[test]
     fn the_fact_value_is_masked_while_typed() {
         use super::super::conn::FactEntry;

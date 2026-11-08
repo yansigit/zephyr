@@ -36,7 +36,8 @@ pub struct Entry {
     pub kind: Value,
     /// As replies show it; `None` is unset.
     pub value: Option<String>,
-    /// `default`, `you`, `agent (#N)` or `until HH:MM`.
+    /// `default`, `you`, `preset` (an approval class that follows it), `agent (#N)` or
+    /// `until HH:MM`.
     pub source: String,
     /// The agent's access (`never`, `propose`, `tighten`), or `read-only`.
     pub access: String,
@@ -105,10 +106,19 @@ impl Proposal {
         self.action() && self.status == "scheduled"
     }
 
-    /// Whether `1` approves it once: always for a command or a setting (where the daemon reads
-    /// `once` as `ok`), and for an action only where once differs from ok.
+    /// Whether `1` is offered: always for a command or a setting (where the daemon reads
+    /// `once` as `ok`), and for an action where the list says once differs from ok.
     fn offers_once(&self) -> bool {
         !self.action() || self.once
+    }
+
+    /// Whether `1` sends `once`. A message or a post always does, whatever the list says: its
+    /// class may have moved to ask-new since, and `ok` would then remember its recipients
+    /// against the owner's choice. Only a payment or another call, where once never differs,
+    /// is approved as `o` approves it, so its audit row reads `approved`.
+    fn sends_once(&self) -> bool {
+        let remembers = matches!(self.class.as_deref(), Some("messages" | "posts"));
+        self.offers_once() || remembers
     }
 
     /// What a held action is, with its article: `a message`, `a payment`.
@@ -640,14 +650,37 @@ fn span(secs: i64) -> String {
 /// `text` broken at spaces into rows of at most `width` columns; a word wider than a row is
 /// cut into rows of its own, so nothing is lost at the panel's edge.
 fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut out = vec![];
+    wrap_rows(text, width, width)
+}
+
+/// A card's line, wrapped with each row after the first indented two columns: text the agent or
+/// a page shaped can then never start a row where the daemon's labels start (`to:`, `/ok`).
+fn hanging(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(3);
+    let mut rows = wrap_rows(text, width, width - 2);
+    for row in rows.iter_mut().skip(1) {
+        row.insert_str(0, "  ");
+    }
+    rows
+}
+
+/// [`wrap`] with the first row `first` columns wide and the others `rest`.
+fn wrap_rows(text: &str, first: usize, rest: usize) -> Vec<String> {
+    let (first, rest) = (first.max(1), rest.max(1));
+    let mut out: Vec<String> = vec![];
     let mut row = String::new();
     for word in text.split(' ') {
         let mut word = word.to_string();
-        while visible_width(&word) > width {
-            if !row.is_empty() {
+        // Find the row the word starts on: this one, or the next when it does not fit beside
+        // what is there; a word wider than its row is cut into rows of its own.
+        loop {
+            let width = if out.is_empty() { first } else { rest };
+            if !row.is_empty() && visible_width(&row) + 1 + visible_width(&word) > width {
                 out.push(std::mem::take(&mut row));
+                continue;
+            }
+            if !row.is_empty() || visible_width(&word) <= width {
+                break;
             }
             let (mut head, mut w) = (String::new(), 0);
             for c in word.chars() {
@@ -661,9 +694,6 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
             }
             word = word[head.len()..].to_string();
             out.push(head);
-        }
-        if !row.is_empty() && visible_width(&row) + 1 + visible_width(&word) > width {
-            out.push(std::mem::take(&mut row));
         }
         if !row.is_empty() {
             row.push(' ');
@@ -799,6 +829,15 @@ fn main_rows(
         let ask = format!("delete the private fact {name}? y deletes it, any other key keeps it");
         out.extend(wrap(&ask, inner).iter().map(|l| Row::Line(p.warning.fg(l))));
     }
+    // Under the rows, not among them: a row of its own there would move each fact down one from
+    // the line the keyboard's mark is kept on.
+    if let Some(problem) = s.facts_problem.as_ref().filter(|_| s.tab() == Tab::Facts) {
+        out.extend(
+            wrap(problem, inner)
+                .iter()
+                .map(|l| Row::Line(p.error.fg(l))),
+        );
+    }
     out.extend(note_rows(s, p, inner));
     out
 }
@@ -903,9 +942,6 @@ fn waiting_cells(s: &SettingsPanel, p: &Palette, tz: &jiff::tz::TimeZone, w: usi
 /// sends.
 fn fact_cells(s: &SettingsPanel, p: &Palette, w: usize) -> Vec<String> {
     let mut out = vec![];
-    if let Some(problem) = &s.facts_problem {
-        out.push(cut(&p.error.fg(&format!("  {problem}")), w));
-    }
     let list = match &s.facts {
         None => return vec![p.muted.fg(&format!("  listing{}", glyph("…")))],
         Some(l) if l.is_empty() => {
@@ -1052,7 +1088,7 @@ fn card_rows(
         false => tidy(&pr.card),
     };
     for text in card.lines() {
-        out.extend(wrap(text, inner).iter().map(|l| Row::Line(p.text.fg(l))));
+        out.extend(hanging(text, inner).iter().map(|l| Row::Line(p.text.fg(l))));
     }
     out.push(Row::Line(String::new()));
     let dot = format!(" {} ", glyph("·"));
@@ -1402,16 +1438,16 @@ pub fn key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
     Action::None
 }
 
-/// `o` approves, `1` approves once, `d` drops, `c` cancels a delayed action. Once differs from
-/// ok only for an action whose class asks about new targets: elsewhere `1` approves as `o` does
-/// (and is not offered), so the daemon is never asked for a once that means nothing.
+/// `o` approves, `1` approves once, `d` drops, `c` cancels a delayed action. `1` sends `once`
+/// for a setting, a command, a message or a post ([`Proposal::sends_once`]); on a payment or
+/// another call, where once never differs, it approves as `o` does.
 fn decide(o: &mut Overlay, id: i64, c: char) -> Action {
     let Some(pr) = (o.settings.waiting.iter().flatten()).find(|p| p.id == id) else {
         return Action::None;
     };
     let verb = match c {
         'o' => "ok",
-        '1' if pr.offers_once() => "once",
+        '1' if pr.sends_once() => "once",
         '1' => "ok",
         'd' => "no",
         'c' if pr.delayed() => "cancel",
@@ -1748,6 +1784,9 @@ mod tests {
         assert_eq!(wrap("", 5), [""]);
         // A glyph wider than the row still moves on, one to a row.
         assert_eq!(wrap("日本", 1), ["日", "本"]);
+        // A card's line goes on two columns in, the rows after the first two narrower.
+        assert_eq!(hanging("to: a b c d", 6), ["to: a", "  b c", "  d"]);
+        assert_eq!(hanging("abcdefghij", 6), ["abcdef", "  ghij"]);
     }
 
     #[test]
