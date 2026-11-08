@@ -1360,7 +1360,9 @@ fn ending(said: Option<Option<Value>>) -> (&'static str, &'static str, Option<&'
 /// Who a request's card and report go to, and its run key (R3), from the session it names: main's
 /// run (`main:<run start ms>`, the channel it serves), a task's (the channel that started it), a
 /// job run's (its job's delivery channel). Any other session goes to the owner last answered,
-/// its run the session itself. A forged session misroutes a card; it grants nothing.
+/// its run the session itself. The session is the agent's to forge: a forged one misroutes a
+/// card, slips past the per-run cap (the day cap still binds) and steers a held note into
+/// another run, so no verdict may depend on it.
 fn whose(store: &Store, snap: &Snapshot, session: &str) -> ((String, String), String) {
     let main = !session.is_empty()
         && (session == snap.session

@@ -466,8 +466,9 @@ pub static SETTINGS: &[Setting] = &[
         "approvals.strong_only",
         "Approvals",
         "Approved only from a strong channel",
-        "loosen: a proposal that relaxes approvals or a fact; money: payments. The agent may \
-         only add entries.",
+        "money: a payment's /ok only from a strong channel. loosen names the rule that a \
+         loosening of approvals or a fact needs one, which holds whatever this says. The agent \
+         may only add entries.",
         Kind::List(&crate::approvals::STRONG_ONLY),
         Access::Tighten,
         true,

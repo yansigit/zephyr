@@ -529,6 +529,45 @@ fn init_writes_the_parsed_preset_name() {
     assert!(config.contains("preset = \"full\""), "{config}");
 }
 
+/// D12: what `zephyr facts add` says follows the facts mode: held under `hold`, gone with a
+/// notice under `warn`, not looked for under `off`.
+#[test]
+fn facts_add_says_what_the_facts_mode_does() {
+    let env = Env::new("facts-mode-words");
+    env.init(&["--no-start", "--preset", "manual"]);
+    let add = |name: &str| {
+        let out = env.zephyr_input(&["facts", "add", name, "--kind", "digits"], "4829105\n");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout(&out)
+    };
+    assert!(add("a").contains("calls holding it are held for your OK"));
+    let path = env.daemon().join("zephyr.toml");
+    let full = env
+        .config()
+        .replace("preset = \"manual\"", "preset = \"full\"");
+    std::fs::write(&path, &full).unwrap();
+    let warn = add("b");
+    assert!(
+        warn.contains("calls holding it go, and you are told"),
+        "{warn}"
+    );
+    assert!(!warn.contains("held for your OK"), "{warn}");
+    std::fs::write(
+        &path,
+        full.replace("preset = \"full\"", "preset = \"full\"\nfacts = \"off\""),
+    )
+    .unwrap();
+    let off = add("c");
+    assert!(
+        off.contains("not looked for while approvals.facts is off"),
+        "{off}"
+    );
+}
+
 #[test]
 fn saving_a_fact_under_a_name_with_spaces_replaces_it_and_keeps_its_targets() {
     let env = Env::new("facts-trim");

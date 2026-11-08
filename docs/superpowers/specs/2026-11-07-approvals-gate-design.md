@@ -373,7 +373,7 @@ CREATE TABLE known_targets(class TEXT NOT NULL, target TEXT NOT NULL,
 
 ```
 [zephyr] approve #7: message (email)
-to: alice@example.com · subject: "Invoice March"
+to: alice@example.com (new) · subject: "Invoice March"
 first lines: "Hi Alice, attached is the invoice for…"
 the agent says: "the owner asked me to send the March invoice"
 /ok 7 · /ok 7 once · /no 7 · expires in 24 h
@@ -404,6 +404,8 @@ the agent says: "the owner asked me to send the March invoice"
 
 - On a hold: `held for the owner as #7 (message to alice@example.com); don't retry it; carry on
   or end your turn` (exec's answer, the steered note for a vetoed call, or the wrapper's stderr).
+  As built (C4): on a delay, `delayed as #7 (…): it goes by itself in 5 min unless the owner
+  cancels it with /cancel 7; don't retry it; carry on or end your turn`.
 - On a decision: the action's report row, or the decline or expiry note.
 - AGENTS.md gains a fixed `## Approvals` section (compiled in, like `## Tools`): which actions are
   gated, that `gateway /approvals` reads the current modes, that held actions run without a retry
@@ -417,8 +419,10 @@ the agent says: "the owner asked me to send the March invoice"
 - **`/stop`**: kills running approved actions (they are `procs` processes) and denies every
   browser wait; `pending` actions stay pending. As built (R47): every `scheduled` action goes
   back to `pending` too, its card shown again, so nothing set to go by itself goes after a stop.
-- **`/pause` and a budget pause**: `/ok` answers `paused; /resume first`; scheduled actions wait
-  and run at `/resume` if still due, otherwise they go back to `pending` and the owner is asked.
+- **`/pause` and a budget pause**: `/ok` answers `paused; /resume first`. As built (I1): a
+  delay that comes due during the pause is never run late by itself: at `/resume` (or the first
+  tick after a budget pause lifts) it goes back to `pending` and the owner is asked again, with
+  its card; one not yet due keeps counting down.
 - **A child killed while its wrapper waits** (failover, re-exec, crash): the wait gets `deny`.
 - **Restarts**: rows are durable. At start, a `scheduled` action whose `due_at` passed while the
   daemon was down goes back to `pending` and the owner is asked (never run late silently, the job

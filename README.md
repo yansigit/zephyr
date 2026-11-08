@@ -135,7 +135,7 @@ alice@example.com`) and, waiting out a delay, when it goes.
 | `Enter` | Edit the setting: a list for a choice or a true-or-false setting, the model picker for a model, a one-line field for a number or text. On a proposal under Waiting, the whole card; on the Approvals section's Private facts row, that section |
 | `Space` | Turn a true-or-false setting over at once |
 | `t` (or `Tab` in an editor) | Add a time limit (`30m`, `2h`, `1d`); the setting goes back by itself |
-| `o` / `1` / `d` | Under Waiting: approve, approve once, or drop. `1` on a message or post approves without remembering its recipients, whatever mode its class was in when the list was read; on a setting, a payment or anything else it is the same as `o`, and it is offered only where the two differ (`ask-new`) |
+| `o` / `1` / `d` | Under Waiting: approve, approve once, or drop. `1` is always offered on a setting or a command, where it is the same as `o`; on an action it is offered where once differs from ok (`ask-new`), and on a message or post it approves once, without remembering its recipients, whatever mode its class was in when the list was read; on a payment or any other call it is the same as `o` |
 | `c` | Under Waiting: cancel an action waiting out its delay, before it goes |
 | `a` / `e` / `d` | Under Private facts: add a fact, edit one (`Enter` too; an empty value keeps the saved one), or delete one (`y` confirms); the value is typed masked, checked before it leaves, and never shown again |
 | `Esc` | Back, or close the panel |
@@ -311,7 +311,9 @@ a delayed one (`sending at 14:05 unless /cancel 7`) before it goes, and `/held` 
   `/ok` runs all of it, and everything the whole command sends. A command that gets vault tokens
   names them on its card.
 - `[approvals] strong_only = ["loosen", "money"]` lets a payment be approved only from a strong
-  channel. It is off by default, so you can approve a purchase from your phone. A payment set to
+  channel. It is off by default, so you can approve a purchase from your phone. A loosening (of an
+  approval, the currency or a private fact) needs a strong channel whatever the list says: the
+  `loosen` entry names that rule and changes nothing on its own. A payment set to
   `delay N` still goes when its delay ends.
 - **Private facts** (`zephyr facts`, `/facts`, the settings panel): a call that holds one waits for
   you (`hold`; the card names the fact, never its value), goes and tells you (`warn`), or is not
@@ -609,7 +611,8 @@ The first `himalaya` command run with `secrets: ["MAIL_PASSWORD"]` asks you to a
     recipients you approved, and the audit of tool calls. Rows older than 90 days
     are pruned (a held action that old keeps its number and summary, not its message); a reply
     that could not be sent for 7 days is given up as `expired`.
-  - `backups/` (0700): a daily copy of `state.db` and the four files above, the newest 7 kept.
+  - `backups/` (0700): a daily copy of `state.db` and five of the files above (`zephyr.toml`,
+    `secrets.env`, `vault.toml`, `facts.toml` and `host.toml`; not `tui.token`), the newest 7 kept.
     `zephyr doctor` warns when the newest is over 2 days old. Copy this folder off the machine
     yourself (it holds secrets: keep the copy encrypted).
 

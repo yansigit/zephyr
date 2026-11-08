@@ -178,8 +178,10 @@ pub const GATEWAY_DIR_ENV: &str = "ZEPHYR_GATEWAY_DIR";
 pub const SESSIONS_DIR_ENV: &str = "ZEPHYR_SESSIONS_DIR";
 
 /// The child's session id (`main`, `task-7`, `job-2-5`), set by `rpc::spawn_as` in every child
-/// and inherited by what it runs: the gate socket's requests name it (approvals spec §4.2). A
-/// wrong one only sends a card to the wrong channel; it grants nothing.
+/// and inherited by what it runs: the gate socket's requests name it (approvals spec §4.2). The
+/// agent can name another: that sends a card to another channel, slips past the per-run cap (the
+/// day cap still binds) and steers a held or pass note into another run, so no verdict may
+/// depend on it.
 pub const SESSION_ENV: &str = "ZEPHYR_SESSION";
 
 /// The daemon's gate socket (`<state>-public/gate.sock`), set by `rpc::spawn_as` in every child

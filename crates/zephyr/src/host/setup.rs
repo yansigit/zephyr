@@ -293,8 +293,20 @@ fn save_fact(
     };
     let new = put(&mut facts, fact, true)?;
     h.data.write(crate::facts::FILE, &render(&text, &facts)?)?;
+    // D12: what a call holding it does now, as `approvals.facts` says.
+    let cfg = h.data.load().ok();
+    let cfg = cfg.and_then(|d| toml::from_str::<crate::config::Config>(&d.to_string()).ok());
+    let mode = cfg.map(|c| crate::approvals::effective(&c).facts);
+    let then = match mode {
+        Some(crate::approvals::FactsMode::Hold) => "; calls holding it are held for your OK",
+        Some(crate::approvals::FactsMode::Warn) => "; calls holding it go, and you are told",
+        Some(crate::approvals::FactsMode::Off) => {
+            "; it is not looked for while approvals.facts is off"
+        }
+        None => "",
+    };
     Ok(match new {
-        true => format!("saved the fact {name}; calls holding it are held for your OK"),
+        true => format!("saved the fact {name}{then}"),
         false => format!("replaced the value of {name}"),
     })
 }
