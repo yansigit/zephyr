@@ -5137,20 +5137,22 @@ async fn a_connector_pass_is_used_once() {
     // ... and is held again after that.
     gw.say("m4", "owner", call).await;
     reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #2:")).await;
-    let audit = Store::open(&home.join("state.db"))
-        .unwrap()
-        .audit_rows()
-        .unwrap();
-    // The gate's and the owner's decisions, each refused call's `error` after its hold.
-    let outcomes: Vec<&str> = (audit.iter())
-        .filter(|(_, tool, _, _)| tool == "mcp_call")
-        .map(|(_, _, _, o)| o.as_str())
-        .filter(|o| *o != "started")
-        .collect();
+    // The gate's and the owner's decisions, each refused call's `error` after its hold. The last
+    // `error` comes from rpi's events, after the card, so a slow machine may not have it yet.
+    let outcomes = || {
+        let audit = Store::open(&home.join("state.db"))
+            .unwrap()
+            .audit_rows()
+            .unwrap();
+        (audit.into_iter())
+            .filter(|(_, tool, _, o)| tool == "mcp_call" && o != "started")
+            .map(|(_, _, _, o)| o)
+            .collect::<Vec<_>>()
+    };
+    wait(|| outcomes().len() >= 6).await;
     assert_eq!(
-        outcomes,
-        ["held", "error", "approved", "pass", "held", "error"],
-        "{audit:?}"
+        outcomes(),
+        ["held", "error", "approved", "pass", "held", "error"]
     );
     gw.shutdown().await;
 }
