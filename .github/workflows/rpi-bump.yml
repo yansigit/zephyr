@@ -1,0 +1,90 @@
+# Each day, moves the rpi pins to the newest upstream release (deploy/bump-rpi.sh) and tests it as
+# deploy/release.sh does: fmt, clippy, the tests, and the ignored tests against the new binary
+# itself. Green, the bump is merged into main; red, its PR stays open with the failing run linked,
+# for a person to fix. A manual run can name a version: `gh workflow run rpi-bump.yml -f version=0.22.0`.
+# Merging does not release: tag as usual (README "Releasing") to publish an image with the new rpi.
+# Needs, in the repo's Settings > Actions > General, "Allow GitHub Actions to create and approve pull
+# requests". If main requires status checks, a PR opened with GITHUB_TOKEN starts no ci run, so set
+# secret RPI_BUMP_TOKEN (a fine-grained token with contents and pull-requests write on this repo) to
+# have ci run on the PR, and the merge then waits for it (`--auto`, with auto-merge allowed).
+name: rpi-bump
+on:
+  schedule:
+    - cron: "17 21 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "rpi version (default: the latest)"
+        required: false
+permissions:
+  contents: write
+  pull-requests: write
+concurrency: rpi-bump
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ secrets.RPI_BUMP_TOKEN || github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.RPI_BUMP_TOKEN || github.token }}
+      - id: bump
+        run: deploy/bump-rpi.sh "$VERSION"
+        env:
+          VERSION: ${{ inputs.version }}
+          RPI_BUMP_DIR: ${{ runner.temp }}/rpi
+      # An open PR for this version that already failed stays as it is until a person acts on it.
+      - id: pr
+        if: steps.bump.outputs.version != ''
+        run: |
+          branch=rpi-bump/v${{ steps.bump.outputs.version }}
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "open=$(gh pr list --head "$branch" --state open --json number --jq length)" >> "$GITHUB_OUTPUT"
+      - if: steps.bump.outputs.version != '' && steps.pr.outputs.open == '0'
+        uses: dtolnay/rust-toolchain@1.95
+        with:
+          components: rustfmt, clippy
+      - if: steps.bump.outputs.version != '' && steps.pr.outputs.open == '0'
+        uses: Swatinem/rust-cache@v2
+      - if: steps.bump.outputs.version != '' && steps.pr.outputs.open == '0'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
+      - id: test
+        if: steps.bump.outputs.version != '' && steps.pr.outputs.open == '0'
+        env:
+          RPI_BIN: ${{ steps.bump.outputs.rpi }}
+          ZEPHYR_REAL_RPI: "1"
+        run: |
+          cargo fmt --all --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --workspace
+          cargo test --workspace -- --ignored
+      - id: push
+        if: always() && steps.bump.outputs.version != '' && steps.pr.outputs.open == '0'
+        run: |
+          v=${{ steps.bump.outputs.version }} old=${{ steps.bump.outputs.old }}
+          branch=${{ steps.pr.outputs.branch }}
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -qam "chore(rpi): move the rpi pins from $old to $v"
+          git push -f origin "$branch"
+          run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ "${{ steps.test.outcome }}" = success ]; then
+            result="fmt, clippy, the tests and the ignored tests against rpi $v passed ([run]($run))."
+          else
+            result="**Not merged**: the checks against rpi $v failed ([run]($run)). Fix them on this branch."
+          fi
+          gh pr create --base main --head "$branch" --title "chore(rpi): move the rpi pins from $old to $v" --body "$(printf '%s\n\n%s\n\n%s' \
+            "Moves every rpi pin (Dockerfile version and sha256s, RPI_PIN, the Cargo pins, fake-rpi's version, the real-rpi test path) from $old to $v with deploy/bump-rpi.sh." \
+            "$result" \
+            "Release notes: https://github.com/bigfish1913/pi-rust/releases/tag/v$v")"
+      - if: steps.test.outcome == 'success' && steps.push.outcome == 'success'
+        run: |
+          branch=${{ steps.pr.outputs.branch }}
+          if [ -n "${{ secrets.RPI_BUMP_TOKEN }}" ]; then
+            gh pr merge "$branch" --squash --delete-branch --auto
+          else
+            gh pr merge "$branch" --squash --delete-branch
+          fi

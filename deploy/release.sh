@@ -28,7 +28,19 @@ cargo test -q
 
 step "testing against the pinned rpi"
 # The ignored tests drive the real binary at this fixed path (the tests' RPI consts).
-rpi=/home/user/Projects/.always-on/rpi-0.18.0/bin/rpi
+rpi=/home/user/Projects/.always-on/rpi-0.21.2/bin/rpi
+if [ ! -x "$rpi" ] && [ "$(uname -m)" = x86_64 ]; then
+  # The pin moves with each rpi-bump merge: fetch the Dockerfile's release, checked as it checks it.
+  v=$(sed -n 's/^ARG RPI_VERSION=//p' deploy/Dockerfile)
+  s=$(sed -n 's/^ARG RPI_SHA256_AMD64=//p' deploy/Dockerfile)
+  f=rpi-v$v-x86_64-unknown-linux-gnu.tar.gz
+  t=$(mktemp -d)
+  curl -fsSLo "$t/$f" "https://github.com/bigfish1913/pi-rust/releases/download/v$v/$f" \
+    && echo "$s  $t/$f" | sha256sum -c --quiet - \
+    && mkdir -p "$(dirname "$rpi")" && tar -xzf "$t/$f" --no-same-owner -C "$(dirname "$rpi")" ./rpi \
+    || echo "warning: could not fetch rpi $v" >&2
+  rm -rf "$t"
+fi
 if [ -x "$rpi" ]; then
   ZEPHYR_REAL_RPI=1 cargo test --workspace -- --ignored
 else

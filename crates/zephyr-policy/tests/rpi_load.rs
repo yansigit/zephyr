@@ -18,7 +18,12 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use zephyr_policy::tools::{GATE_SOCKET_ENV, SESSION_ENV};
 
-const RPI: &str = "/home/user/Projects/.always-on/rpi-0.18.0/bin/rpi";
+/// The real binary: `$RPI_BIN` (CI's `rpi-bump` workflow sets it), else the pinned release at its
+/// fixed path.
+static RPI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("RPI_BIN")
+        .unwrap_or_else(|_| "/home/user/Projects/.always-on/rpi-0.21.2/bin/rpi".into())
+});
 
 /// A test that needs the pinned rpi skips without it, unless ZEPHYR_REAL_RPI=1 (deploy/release.sh
 /// sets it): then it fails, so a run cannot go green without testing anything.
@@ -163,8 +168,8 @@ fn scratch(name: &str) -> PathBuf {
 #[test]
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
 fn rpi_loads_plugin_and_vetoes_write_into_ssh() {
-    if !Path::new(RPI).exists() {
-        skip_without_rpi(RPI);
+    if !Path::new(&*RPI).exists() {
+        skip_without_rpi(&*RPI);
         return;
     }
     let lib = common::build_cdylib();
@@ -185,7 +190,7 @@ fn rpi_loads_plugin_and_vetoes_write_into_ssh() {
         move || serve(listener, requests)
     });
 
-    let output = Command::new(RPI)
+    let output = Command::new(&*RPI)
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", &home)
@@ -268,7 +273,7 @@ fn rpc_command_names(extension: Option<&Path>) -> Vec<String> {
     }
     args.extend(["--mode".into(), "rpc".into()]);
 
-    let mut child = Command::new(RPI)
+    let mut child = Command::new(&*RPI)
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", &home)
@@ -311,8 +316,8 @@ fn rpc_command_names(extension: Option<&Path>) -> Vec<String> {
 #[test]
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
 fn rpc_lists_status_command_only_when_plugin_is_loaded() {
-    if !Path::new(RPI).exists() {
-        skip_without_rpi(RPI);
+    if !Path::new(&*RPI).exists() {
+        skip_without_rpi(&*RPI);
         return;
     }
     let lib = common::build_cdylib();
@@ -401,7 +406,7 @@ impl GatewayRpi {
             let seen = seen.clone();
             move || serve_turns(listener, Default::default(), turns, seen)
         });
-        let mut cmd = Command::new(RPI);
+        let mut cmd = Command::new(&*RPI);
         cmd.env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &home)
@@ -497,8 +502,8 @@ impl Drop for GatewayRpi {
 #[test]
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
 fn rpi_waits_for_a_gateway_answer_mid_turn() {
-    if !Path::new(RPI).exists() {
-        skip_without_rpi(RPI);
+    if !Path::new(&*RPI).exists() {
+        skip_without_rpi(&*RPI);
         return;
     }
     let first = call_turn("toolu_gw", "gateway", "{\"command\":\"/status\"}");
@@ -533,8 +538,8 @@ fn rpi_waits_for_a_gateway_answer_mid_turn() {
 #[test]
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
 fn the_main_child_runs_commands_through_exec_and_waits_for_them() {
-    if !Path::new(RPI).exists() {
-        skip_without_rpi(RPI);
+    if !Path::new(&*RPI).exists() {
+        skip_without_rpi(&*RPI);
         return;
     }
     let first = call_turn("toolu_exec", "exec", "{\"command\":\"make\"}");
@@ -561,8 +566,8 @@ fn the_main_child_runs_commands_through_exec_and_waits_for_them() {
 #[test]
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
 fn other_children_keep_bash_and_get_no_exec() {
-    if !Path::new(RPI).exists() {
-        skip_without_rpi(RPI);
+    if !Path::new(&*RPI).exists() {
+        skip_without_rpi(&*RPI);
         return;
     }
     let mut rpi = GatewayRpi::start("no-exec", vec![text_turn()]);
@@ -578,8 +583,8 @@ fn other_children_keep_bash_and_get_no_exec() {
 #[test]
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
 fn an_abort_ends_a_waiting_gateway_call() {
-    if !Path::new(RPI).exists() {
-        skip_without_rpi(RPI);
+    if !Path::new(&*RPI).exists() {
+        skip_without_rpi(&*RPI);
         return;
     }
     let first = call_turn("toolu_gw", "gateway", "{\"command\":\"/status\"}");
@@ -610,8 +615,8 @@ fn an_abort_ends_a_waiting_gateway_call() {
 #[test]
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
 fn rpi_waits_for_a_task_answer_mid_turn() {
-    if !Path::new(RPI).exists() {
-        skip_without_rpi(RPI);
+    if !Path::new(&*RPI).exists() {
+        skip_without_rpi(&*RPI);
         return;
     }
     let list = call_turn("toolu_task", "task", "{\"action\":\"list\"}");
@@ -722,8 +727,8 @@ fn model_messages(request: &str) -> Vec<Value> {
 #[test]
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
 fn rpi_vetoes_a_held_bash_call_after_asking_the_gate() {
-    if !Path::new(RPI).exists() {
-        skip_without_rpi(RPI);
+    if !Path::new(&*RPI).exists() {
+        skip_without_rpi(&*RPI);
         return;
     }
     let (mut rpi, gate) = GatewayRpi::start_gated("gate-hold", vec![send_turn()], "task-7");
@@ -781,8 +786,8 @@ fn rpi_vetoes_a_held_bash_call_after_asking_the_gate() {
 #[test]
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
 fn rpi_takes_a_steer_while_the_plugin_waits_on_the_gate() {
-    if !Path::new(RPI).exists() {
-        skip_without_rpi(RPI);
+    if !Path::new(&*RPI).exists() {
+        skip_without_rpi(&*RPI);
         return;
     }
     let (mut rpi, gate) = GatewayRpi::start_gated("gate-steer", vec![send_turn()], "task-7");
@@ -834,8 +839,8 @@ fn rpi_takes_a_steer_while_the_plugin_waits_on_the_gate() {
 #[test]
 #[ignore = "needs the pinned rpi binary; run with --ignored"]
 fn rpi_runs_a_bash_call_the_gate_allows() {
-    if !Path::new(RPI).exists() {
-        skip_without_rpi(RPI);
+    if !Path::new(&*RPI).exists() {
+        skip_without_rpi(&*RPI);
         return;
     }
     let (mut rpi, gate) = GatewayRpi::start_gated("gate-allow", vec![send_turn()], "task-7");

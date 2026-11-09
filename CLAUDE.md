@@ -17,7 +17,8 @@ cargo test -p zephyr --test router some_name  # one test by name filter
 cargo clippy --all-targets && cargo fmt
 cargo deny check advisories bans               # what CI's deny job runs
 
-# Ignored tests need the pinned real binary at /home/user/Projects/.always-on/rpi-0.18.0/bin/rpi
+# Ignored tests need the pinned real binary at /home/user/Projects/.always-on/rpi-0.21.2/bin/rpi
+# (or RPI_BIN=<path>; deploy/bump-rpi.sh rewrites that default path)
 cargo test -p zephyr --test real_rpi -- --ignored
 cargo test -p zephyr-policy --test rpi_load -- --ignored
 cargo test -p zephyr --test attach -- --ignored   # drives real `rpi --connect` via tests/drive-connect.py
@@ -25,6 +26,7 @@ cargo test -p zephyr --test attach -- --ignored   # drives real `rpi --connect` 
 cargo install --path crates/zephyr && zephyr up --build   # build deploy/Dockerfile and run it locally
 deploy/release.sh 0.2.1 | --cli                           # release from a clean main (README "Releasing")
 deploy/runner/start.sh up|down                            # self-hosted fallback runner (README "Releasing")
+deploy/bump-rpi.sh [0.22.0]                               # move every rpi pin; .github/workflows/rpi-bump.yml runs it daily
 ```
 
 `ZEPHYR_CONTAINER` / `ZEPHYR_IMAGE` point the host CLI at another container or image, to test beside a
@@ -47,9 +49,10 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   the outbox (client id = Discord nonce / BlueBubbles tempGuid), budgets, `/stop` `/pause` `/model`
   `/reload`, and crash reconcile (re-send rows whose text isn't in `get_messages`).
 - `rpc.rs` `Child` wraps one `rpi --mode rpc` child (JSONL). `USED_COMMANDS` must stay a subset of
-  rpi's `ready.supportedCommands`; `doctor` checks it. rpi is pinned to 0.18.x (`RPI_PIN` in
-  main.rs, `deploy/Dockerfile`, `rpi-plugin-sdk = "=0.18.0"` in zephyr-policy and zephyr-cursor,
-  and `rpi-tui = "=0.18.0"` in zephyr).
+  rpi's `ready.supportedCommands`; `doctor` checks it. rpi is pinned to 0.21.x (`RPI_PIN` in
+  main.rs, `deploy/Dockerfile`, `rpi-plugin-sdk = "=0.21.2"` in zephyr-policy and zephyr-cursor,
+  and `rpi-tui = "=0.21.2"` in zephyr); `deploy/bump-rpi.sh` moves them all, daily via
+  `.github/workflows/rpi-bump.yml`, which merges the bump when the tests and real-rpi suite pass.
 - `pool.rs`: `[[account]]` failover. Each account gets its own `RPI_CODING_AGENT_DIR` under
   `<home>/accounts/<name>/`; rate-limit detection reads `agent_settled.error`; cooldowns live in `state.db`.
 - `auth_keeper.rs`: refreshes expiring OAuth tokens via `rpi auth refresh` subprocess (not the
