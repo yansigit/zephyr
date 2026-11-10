@@ -1994,8 +1994,8 @@ impl<'a> Router<'a> {
             Some(Ok(SessionOrigin::Clean)) if self.writers_since(now) => Trust::Not(BESIDE.into()),
             Some(Ok(SessionOrigin::Clean)) => {
                 match crate::memory::base(&self.cfg.home, self.cfg.state_dir()).await {
-                    Some(base) => Trust::Owner { base, since: now },
-                    None => Trust::Not(ON_WAITING.into()),
+                    Ok(base) => Trust::Owner { base, since: now },
+                    Err(why) => Trust::Not(why.into()),
                 }
             }
             Some(Ok(SessionOrigin::Tainted(why))) => {
@@ -4325,7 +4325,6 @@ enum Trust {
 
 /// `Trust::Not`'s labels for work beside the run and for a change already waiting.
 const BESIDE: &str = "your message, while other work of the agent's was running";
-const ON_WAITING: &str = "your message, on top of a change still waiting";
 
 /// What taking in an inbox row with this platform id means for the conversation, when the row
 /// is the daemon's (a task's or a process's report, a held action's result) and not the owner's.

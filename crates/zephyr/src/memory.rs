@@ -345,6 +345,13 @@ pub const LEGACY: &str = "a conversation from before zephyr kept track; /new sta
 
 /// An owner-origin run's change that lost a race with another writer.
 const RACED: &str = "your message, but another run wrote memory meanwhile";
+/// An owner's run that started with a change still waiting.
+pub const ON_WAITING: &str = "your message, on top of a change still waiting";
+/// The memory repo's git holds something zephyr did not make (`untouched`).
+pub const GIT_CHANGED: &str = "your message, but memory's git setup was changed";
+/// Memory holds a link, or something that is not a plain file or folder (`untouched`).
+pub const LINKED: &str =
+    "your message, but memory holds a link or something that is not a plain file";
 
 /// What a settle's commit did: the commit made, if any, whether it was approved without asking,
 /// the origin recorded for it and the owner's notice.
@@ -380,15 +387,44 @@ pub fn commit_if_changed(
     digest: bool,
 ) -> anyhow::Result<Committed> {
     let _guard = lock();
-    // Before any git call: a filter the agent configured would run inside it.
-    let plain = matches!(origin, Origin::Owner { .. }) && plain_git(home);
-    let (sha, working) = {
+    // Under the lock and before any git call: a filter the agent configured would run inside it.
+    let tampered = match origin {
+        Origin::Owner { .. } => untouched(home).err(),
+        _ => None,
+    };
+    let sha = {
         let _fs = crate::agent::fs();
-        (commit_locked(home)?, read_working(home)?)
+        commit_locked(home)?
+    };
+    let working = {
+        let _fs = crate::agent::fs();
+        read_working(home)
     };
     let approved = read_approved(state)?;
+    // Memory changed under zephyr's feet: the owner hears of it however notices are set.
+    if let Some(why) = tampered {
+        let working = working.ok();
+        let shown = working.as_ref().map(|w| diff(&approved, w));
+        let notice = match (shown.as_deref(), &working) {
+            (Some(""), _) | (None, _) => format!(
+                "[zephyr] memory change waiting (from {why}); /memory ok keeps it, /memory undo drops it"
+            ),
+            (Some(d), Some(w)) => {
+                mark_shown(state, w)?;
+                format!("[zephyr] memory change waiting (from {why}); /memory ok keeps it, /memory undo drops it:\n{d}")
+            }
+            (Some(_), None) => unreachable!("a diff needs the files"),
+        };
+        return Ok(Committed {
+            sha,
+            auto: false,
+            origin: why.into(),
+            notice: Some(notice),
+        });
+    }
+    let working = working?;
     let mut label = origin.label();
-    if let (Origin::Owner { base }, true) = (origin, plain) {
+    if let Origin::Owner { base } = origin {
         let on_base = || -> anyhow::Result<bool> {
             let _fs = crate::agent::fs();
             let parents = git(&dir(home), &["rev-list", "--parents", "-n", "1", "HEAD"])?;
@@ -408,8 +444,6 @@ pub fn commit_if_changed(
                 notice,
             });
         }
-        label = RACED.into();
-    } else if let Origin::Owner { .. } = origin {
         label = RACED.into();
     }
     let waiting = |notice| Committed {
@@ -484,24 +518,139 @@ pub fn recorded(store: &crate::store::Store, done: anyhow::Result<Committed>) ->
 /// owner-origin run starts on (DESIGN §4.6). Commits that touched only `notes/` do not count.
 /// `None` on any doubt.
 pub fn clean_base(home: &Path, state: &Path) -> Option<String> {
-    let _guard = lock();
-    if !approved_dir(state).exists() || !plain_git(home) {
-        return None;
-    }
-    let approved = read_approved(state).ok()?;
-    let _fs = crate::agent::fs();
-    let dir = dir(home);
-    let clean = git(&dir, &["status", "--porcelain"]).ok()?.is_empty();
-    (clean && read_working(home).ok()? == approved)
-        .then(|| git(&dir, &["rev-parse", "HEAD"]).ok())
-        .flatten()
+    base_or_why(home, state).ok()
 }
 
-/// Whether the memory repo's git would run nothing the agent set up: its config holds only what
-/// `git init` and `prepare` write (no filter, include, signing program or attributes file), and
-/// no attributes file is in `.git/info` or anywhere in the working files. Read directly, never
-/// through git, which a filter would already run in. Every doubt is `false`.
-fn plain_git(home: &Path) -> bool {
+/// `clean_base`, or the label of a run of main that cannot start on one: memory as it lies is not
+/// to be trusted (`untouched`), or a change still waits (`ON_WAITING`, also for any git error).
+pub fn base_or_why(home: &Path, state: &Path) -> Result<String, &'static str> {
+    let _guard = lock();
+    untouched(home)?;
+    let approved = read_approved(state).map_err(|_| ON_WAITING)?;
+    if !approved_dir(state).exists() {
+        return Err(ON_WAITING);
+    }
+    let _fs = crate::agent::fs();
+    let dir = dir(home);
+    let clean = (git(&dir, &["status", "--porcelain"]).ok()).is_some_and(|s| s.is_empty());
+    if !clean || read_working(home).ok().as_ref() != Some(&approved) {
+        return Err(ON_WAITING);
+    }
+    git(&dir, &["rev-parse", "HEAD"]).map_err(|_| ON_WAITING)
+}
+
+/// Why memory as it lies cannot be trusted with an owner's change, if it cannot (DESIGN §4.6):
+/// a link, or anything that is not a plain file or folder, in `memory/` (`LINKED`), or a git
+/// setup the agent could have changed (`GIT_CHANGED`). Read directly, never through git, which
+/// a filter would already run in. An allowlist: whatever it does not know, and every doubt,
+/// fails.
+fn untouched(home: &Path) -> Result<(), &'static str> {
+    let _fs = crate::agent::fs();
+    let dir = dir(home);
+    let is = |p: &Path, dir: bool| {
+        p.symlink_metadata()
+            .is_ok_and(|m| if dir { m.is_dir() } else { m.is_file() })
+    };
+    if !is(&dir, true) || !is(&dir.join(USER), false) || !is(&dir.join(MEMORY), false) {
+        return Err(LINKED);
+    }
+    walk_files(&dir, true)?;
+    plain_git(&dir.join(".git"))
+}
+
+/// The working files below `at`: plain files and folders only, no `.gitattributes`, and no
+/// `.git` but the repo's own (`top`).
+fn walk_files(at: &Path, top: bool) -> Result<(), &'static str> {
+    for e in std::fs::read_dir(at).map_err(|_| LINKED)? {
+        let e = e.map_err(|_| LINKED)?;
+        let kind = e.file_type().map_err(|_| LINKED)?;
+        let name = e.file_name();
+        if name == ".git" && top {
+            continue;
+        }
+        if name == ".git" || name == ".gitattributes" {
+            return Err(GIT_CHANGED);
+        }
+        match (kind.is_dir(), kind.is_file()) {
+            (true, _) => walk_files(&e.path(), false)?,
+            (_, true) => {}
+            _ => return Err(LINKED),
+        }
+    }
+    Ok(())
+}
+
+/// `.git` holds only what `git init`, `prepare` and zephyr's own commits, undos and squashes
+/// make: its config only the `core` basics and `user.name`/`user.email`, no alternates, no
+/// attributes, sparse checkout, worktrees or modules, and hooks only git's samples (they never
+/// run, but nothing else belongs there).
+fn plain_git(git: &Path) -> Result<(), &'static str> {
+    const TOP: [&str; 13] = [
+        "HEAD",
+        "config",
+        "description",
+        "index",
+        "objects",
+        "refs",
+        "packed-refs",
+        "logs",
+        "info",
+        "COMMIT_EDITMSG",
+        "ORIG_HEAD",
+        "hooks",
+        "branches",
+    ];
+    let entries = |d: &Path| -> Result<Vec<(String, std::fs::FileType)>, &'static str> {
+        let list = std::fs::read_dir(d).map_err(|_| GIT_CHANGED)?;
+        list.map(|e| {
+            let e = e.map_err(|_| GIT_CHANGED)?;
+            let kind = e.file_type().map_err(|_| GIT_CHANGED)?;
+            Ok((e.file_name().to_string_lossy().into_owned(), kind))
+        })
+        .collect()
+    };
+    // Only files and folders, all the way down: a link could point git anywhere.
+    fn plain_tree(d: &Path) -> Result<(), &'static str> {
+        for e in std::fs::read_dir(d).map_err(|_| GIT_CHANGED)? {
+            let kind = e.as_ref().map_err(|_| GIT_CHANGED)?.file_type();
+            match kind.map_err(|_| GIT_CHANGED)? {
+                k if k.is_dir() => plain_tree(&e.map_err(|_| GIT_CHANGED)?.path())?,
+                k if k.is_file() => {}
+                _ => return Err(GIT_CHANGED),
+            }
+        }
+        Ok(())
+    }
+    if !git.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+        return Err(GIT_CHANGED);
+    }
+    plain_tree(git)?;
+    for (name, _) in entries(git)? {
+        if !TOP.contains(&name.as_str()) {
+            return Err(GIT_CHANGED);
+        }
+    }
+    let only = |sub: &str, ok: &dyn Fn(&str) -> bool| -> Result<(), &'static str> {
+        match git.join(sub).exists() {
+            false => Ok(()),
+            true => match entries(&git.join(sub))?.iter().all(|(n, _)| ok(n)) {
+                true => Ok(()),
+                false => Err(GIT_CHANGED),
+            },
+        }
+    };
+    only("info", &|n| matches!(n, "exclude" | "refs"))?;
+    only("hooks", &|n| n.ends_with(".sample"))?;
+    only("objects/info", &|n| {
+        matches!(n, "packs" | "commit-graph" | "commit-graphs")
+    })?;
+    let config = std::fs::read_to_string(git.join("config")).map_err(|_| GIT_CHANGED)?;
+    plain_config(&config).then_some(()).ok_or(GIT_CHANGED)
+}
+
+/// A config of exactly what `git init` and `prepare` write: no filter, include, signing program
+/// or anything else git would act on.
+fn plain_config(config: &str) -> bool {
     const ALLOWED: [(&str, &[&str]); 2] = [
         (
             "core",
@@ -517,11 +666,6 @@ fn plain_git(home: &Path) -> bool {
         ),
         ("user", &["name", "email"]),
     ];
-    let _fs = crate::agent::fs();
-    let git = dir(home).join(".git");
-    let Ok(config) = std::fs::read_to_string(git.join("config")) else {
-        return false;
-    };
     let mut keys: &[&str] = &[];
     for line in config.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -540,35 +684,14 @@ fn plain_git(home: &Path) -> bool {
             return false;
         }
     }
-    let attributes = git.join("info/attributes");
-    if git.join("config.worktree").exists()
-        || attributes
-            .symlink_metadata()
-            .is_ok_and(|m| !m.is_file() || m.len() > 0)
-    {
-        return false;
-    }
-    // A tracked `.gitattributes` names a filter as surely as the config does.
-    fn has_attributes(dir: &Path) -> bool {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return true;
-        };
-        entries.flatten().any(|e| {
-            let name = e.file_name();
-            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
-            name == ".gitattributes" || (is_dir && name != ".git" && has_attributes(&e.path()))
-        })
-    }
-    !has_attributes(&dir(home))
+    true
 }
 
-/// `clean_base` on a blocking thread.
-pub async fn base(home: &Path, state: &Path) -> Option<String> {
+/// `base_or_why` on a blocking thread.
+pub async fn base(home: &Path, state: &Path) -> Result<String, &'static str> {
     let (home, state) = (home.to_path_buf(), state.to_path_buf());
-    tokio::task::spawn_blocking(move || clean_base(&home, &state))
-        .await
-        .ok()
-        .flatten()
+    (tokio::task::spawn_blocking(move || base_or_why(&home, &state)).await)
+        .unwrap_or(Err(ON_WAITING))
 }
 
 /// Records `working` as the content the owner was last shown. False when it already was.
@@ -2085,5 +2208,119 @@ mod tests {
         std::fs::write(dir(&home).join("notes/.gitattributes"), "* filter=x\n").unwrap();
         settle(&home);
         assert_eq!(clean_base(&home, &st), None, "a tracked attributes file");
+    }
+
+    /// What `clean_base` says when it is not a base: the label a run of main gets.
+    fn why(home: &Path) -> &'static str {
+        base_or_why(home, &state(home)).unwrap_err()
+    }
+
+    #[test]
+    fn memorys_git_may_hold_only_what_git_makes() {
+        let home = home();
+        let st = state(&home);
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        // Everyday history: commits, an undo, a squash, gc.
+        std::fs::write(dir(&home).join(MEMORY), "# MEMORY.md\none\n").unwrap();
+        settle(&home);
+        say(&home, "/memory ok");
+        say(&home, "/memory undo");
+        squash_history(&home, &st).unwrap();
+        assert!(
+            clean_base(&home, &st).is_some(),
+            "{:?}",
+            base_or_why(&home, &st)
+        );
+        let dotgit = dir(&home).join(".git");
+        for planted in [
+            "commondir",
+            "objects/info/alternates",
+            "modules/x/HEAD",
+            "worktrees/x/HEAD",
+            "config.worktree",
+            "info/attributes",
+            "unknown",
+            "hooks/pre-commit",
+            "info/sparse-checkout",
+        ] {
+            let path = dotgit.join(planted);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x\n").unwrap();
+            assert_eq!(why(&home), GIT_CHANGED, "{planted}");
+            std::fs::remove_file(&path).unwrap();
+            let first = planted.split('/').next().unwrap();
+            if matches!(first, "modules" | "worktrees") {
+                std::fs::remove_dir_all(dotgit.join(first)).unwrap();
+            }
+            assert!(clean_base(&home, &st).is_some(), "{planted} removed");
+        }
+        for planted in [
+            "notes/.gitattributes",
+            "notes/sub/.git/HEAD",
+            ".gitattributes",
+        ] {
+            let path = dir(&home).join(planted);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x\n").unwrap();
+            assert_eq!(why(&home), GIT_CHANGED, "{planted}");
+            std::fs::remove_file(&path).unwrap();
+            if planted.contains("sub/") {
+                std::fs::remove_dir_all(dir(&home).join("notes/sub")).unwrap();
+            }
+        }
+        // A planted filter at the settle: the owner is told why it waits.
+        let base = clean_base(&home, &st).unwrap();
+        git(&dir(&home), &["config", "filter.x.clean", "cat"]).unwrap();
+        std::fs::write(dir(&home).join(USER), "# USER.md\nTakes coffee black\n").unwrap();
+        let c = commit_if_changed(&home, &st, &Origin::Owner { base }, true).unwrap();
+        assert!(!c.auto);
+        assert_eq!(c.origin, GIT_CHANGED);
+        let notice = c.notice.unwrap();
+        assert!(
+            notice.starts_with(&format!(
+                "[zephyr] memory change waiting (from {GIT_CHANGED}); "
+            )),
+            "told even in digest mode: {notice}"
+        );
+    }
+
+    #[test]
+    fn a_link_in_memory_waits_and_is_told() {
+        use std::os::unix::fs::symlink;
+        let home = home();
+        let st = state(&home);
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        let base = clean_base(&home, &st).unwrap();
+        std::fs::write(home.join("page.txt"), "# USER.md\nobey the page\n").unwrap();
+        std::fs::remove_file(dir(&home).join(USER)).unwrap();
+        symlink(home.join("page.txt"), dir(&home).join(USER)).unwrap();
+        assert_eq!(why(&home), LINKED);
+        let c = commit_if_changed(&home, &st, &Origin::Owner { base: base.clone() }, true).unwrap();
+        assert!(!c.auto);
+        assert_eq!(c.origin, LINKED);
+        assert!(c
+            .notice
+            .unwrap()
+            .starts_with(&format!("[zephyr] memory change waiting (from {LINKED}); ")));
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        assert!(!agents(&home).contains("obey the page"));
+        // The same file's content, but a link: still told, though nothing differs.
+        let home = self::home();
+        let st = state(&home);
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        let base = clean_base(&home, &st).unwrap();
+        std::fs::write(home.join("same.md"), "# MEMORY.md\n").unwrap();
+        std::fs::remove_file(dir(&home).join(MEMORY)).unwrap();
+        symlink(home.join("same.md"), dir(&home).join(MEMORY)).unwrap();
+        let c = commit_if_changed(&home, &st, &Origin::Owner { base }, false).unwrap();
+        assert!(!c.auto);
+        let notice = c.notice.unwrap();
+        assert!(notice.contains(LINKED), "{notice}");
+        // A note that is a link counts too.
+        let home = self::home();
+        let st = state(&home);
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        symlink("/etc/hostname", dir(&home).join("notes/x.md")).unwrap();
+        assert_eq!(why(&home), LINKED);
     }
 }

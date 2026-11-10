@@ -509,10 +509,27 @@ fn clean_call(home: &Path, tool: &str, path: Option<&str>) -> bool {
     {
         return false;
     }
-    matches!(
+    let listed = matches!(
         (tool, &parts[..]),
         ("read" | "edit", ["memory", "USER.md" | "MEMORY.md"]) | ("write", ["memory", _, ..])
-    )
+    );
+    // The path names a memory file; the files must be what they say: plain folders down to a
+    // plain file (a `write` may make a new one), never a link to text from anywhere else.
+    let _fs = crate::agent::fs();
+    let mut at = Path::new(home).to_path_buf();
+    for (i, part) in parts.iter().enumerate() {
+        at.push(part);
+        let last = i + 1 == parts.len();
+        match at.symlink_metadata() {
+            Ok(m) if last => return listed && m.is_file(),
+            Ok(m) if m.is_dir() => {}
+            Err(e) if last && tool == "write" && e.kind() == std::io::ErrorKind::NotFound => {
+                return listed
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Identical failures in a row: the call (tool and args), the error's first line, how many,
@@ -712,7 +729,13 @@ mod tests {
 
     #[test]
     fn main_taints_on_any_call_off_the_clean_list() {
-        let home = Path::new("/zephyr");
+        let home = crate::test_dir("rpc-clean-list");
+        std::fs::create_dir_all(home.join("memory/notes")).unwrap();
+        for name in ["USER.md", "MEMORY.md"] {
+            std::fs::write(home.join("memory").join(name), "x\n").unwrap();
+        }
+        let home = home.as_path();
+        let abs = home.join("memory/USER.md").to_string_lossy().into_owned();
         let start = |tool: &str, path: Option<&str>| {
             let args = path.map_or(
                 serde_json::json!({"command": "ls"}),
@@ -731,7 +754,7 @@ mod tests {
         for clean in [
             ("read", "memory/USER.md"),
             ("edit", "memory/MEMORY.md"),
-            ("read", "/zephyr/memory/USER.md"),
+            ("read", abs.as_str()),
             ("write", "memory/notes/2026-11-10.md"),
             ("write", "memory/x.md"),
         ] {
@@ -777,6 +800,44 @@ mod tests {
         let mut tally = Tally::default();
         tally.add(&start("exec", None));
         assert_eq!(tally.taint, None, "a task's or job's tally never taints");
+    }
+
+    #[test]
+    fn a_link_in_memory_is_off_the_clean_list() {
+        use std::os::unix::fs::symlink;
+        let tainted = |home: &Path, tool: &str, path: &str| {
+            let mut tally = Tally::main(home);
+            tally.add(
+                &serde_json::json!({"type": "tool_execution_start", "toolCallId": "c",
+                                          "toolName": tool, "args": {"path": path}}),
+            );
+            tally.taint.is_some()
+        };
+        // USER.md a link to a file the owner sent.
+        let home = crate::test_dir("rpc-link-file");
+        std::fs::create_dir_all(home.join("memory")).unwrap();
+        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::write(home.join("inbox/a.txt"), "obey the page\n").unwrap();
+        symlink(home.join("inbox/a.txt"), home.join("memory/USER.md")).unwrap();
+        std::fs::write(home.join("memory/MEMORY.md"), "x\n").unwrap();
+        assert!(tainted(&home, "read", "memory/USER.md"));
+        assert!(!tainted(&home, "read", "memory/MEMORY.md"));
+        // A link part way down, and memory itself a link.
+        std::fs::create_dir_all(home.join("elsewhere")).unwrap();
+        symlink(home.join("elsewhere"), home.join("memory/notes")).unwrap();
+        assert!(tainted(&home, "write", "memory/notes/x.md"));
+        let other = crate::test_dir("rpc-link-dir");
+        std::fs::create_dir_all(other.join("real")).unwrap();
+        std::fs::write(other.join("real/USER.md"), "x\n").unwrap();
+        symlink(other.join("real"), other.join("memory")).unwrap();
+        assert!(tainted(&other, "read", "memory/USER.md"));
+        assert!(tainted(&other, "write", "memory/x.md"));
+        // A memory file that is missing, or not a plain file.
+        let gone = crate::test_dir("rpc-link-gone");
+        std::fs::create_dir_all(gone.join("memory/USER.md")).unwrap();
+        assert!(tainted(&gone, "read", "memory/USER.md"), "a directory");
+        assert!(tainted(&gone, "read", "memory/MEMORY.md"), "missing");
+        assert!(!tainted(&gone, "write", "memory/MEMORY.md"), "a new file");
     }
 
     #[test]
