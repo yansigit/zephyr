@@ -190,6 +190,9 @@ pub struct Review {
 #[serde(deny_unknown_fields)]
 pub struct MemorySettings {
     pub notify: Option<String>,
+    /// `off` (absent): every change waits for `/memory ok`; `owner`: one the daemon saw came
+    /// only from the owner is saved at once (DESIGN §4.6).
+    pub auto: Option<String>,
 }
 
 /// `HH:MM` as `(hour, minute)`, 00:00 to 23:59, two digits each.
@@ -399,6 +402,18 @@ impl Config {
         self.memory_notify() == "digest"
     }
 
+    /// `[memory] auto`, `off` when unset.
+    pub fn memory_auto(&self) -> &str {
+        (self.memory.as_ref())
+            .and_then(|m| m.auto.as_deref())
+            .unwrap_or("off")
+    }
+
+    /// Whether a memory change the daemon saw came only from the owner is saved at once.
+    pub fn auto_save(&self) -> bool {
+        self.memory_auto() == "owner"
+    }
+
     /// `[memory] notify`, `each` when unset.
     pub fn memory_notify(&self) -> &str {
         (self.memory.as_ref())
@@ -438,6 +453,9 @@ impl Config {
             if hh_mm(at).is_none() {
                 anyhow::bail!("[review] at must be HH:MM, e.g. 21:30");
             }
+        }
+        if !matches!(self.memory_auto(), "off" | "owner") {
+            anyhow::bail!("[memory] auto must be off or owner");
         }
         if !matches!(self.memory_notify(), "each" | "digest") {
             anyhow::bail!("[memory] notify must be each or digest");
@@ -843,6 +861,24 @@ prompt = "Build it."
         assert_eq!(
             load("[memory]\nnotify = \"weekly\"\n"),
             Err("[memory] notify must be each or digest".into())
+        );
+    }
+
+    #[test]
+    fn memory_auto_is_off_unless_set_to_owner() {
+        let load = |extra: &str| {
+            let cfg: Config =
+                toml::from_str(&format!("rpi = \"/r\"\nhome = \"/h\"\n{extra}")).unwrap();
+            cfg.validate()
+                .map(|()| cfg.memory_auto().to_string())
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(load(""), Ok("off".into()), "an install with no key");
+        assert_eq!(load("[memory]\nnotify = \"each\"\n"), Ok("off".into()));
+        assert_eq!(load("[memory]\nauto = \"owner\"\n"), Ok("owner".into()));
+        assert_eq!(
+            load("[memory]\nauto = \"always\"\n"),
+            Err("[memory] auto must be off or owner".into())
         );
     }
 }

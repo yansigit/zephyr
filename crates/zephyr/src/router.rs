@@ -2272,6 +2272,11 @@ impl<'a> Router<'a> {
         // under the memory lock, right before the commit.
         let (db, procs) = (self.cfg.db_path(), self.procs.clone());
         let (origin, since) = match trust {
+            // `memory.auto` off (the default): the owner's change waits as any other, its
+            // origin named.
+            Trust::Owner { .. } if !self.cfg.auto_save() => {
+                (crate::memory::Origin::Main(OWNER_OFF.into()), 0)
+            }
             Trust::Owner { base, since } => (crate::memory::Origin::Owner { base }, since),
             Trust::Not(label) => (crate::memory::Origin::Main(label), 0),
         };
@@ -4593,6 +4598,9 @@ enum Trust {
     /// Why it is not: the waiting notice's `(from …)`.
     Not(String),
 }
+
+/// The label of an owner's run while `memory.auto` is off: it waits, from where it came.
+const OWNER_OFF: &str = "your message";
 
 /// `Trust::Not`'s label for a run zephyr did not see start (`begin_run`).
 const UNSEEN_RUN: &str = "your message, but zephyr did not see the run start";

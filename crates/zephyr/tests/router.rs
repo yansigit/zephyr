@@ -89,8 +89,9 @@ fn home(name: &str) -> PathBuf {
 }
 
 fn config(home: &Path) -> Config {
+    // With saving at once on (`memory.auto = "owner"`): most memory tests are about its checks.
     toml::from_str(&format!(
-        "rpi = {:?}\nhome = {:?}\nagent_dir = {:?}\n[owners]\nchat = [\"owner\"]\ndiscord = [\"downer\"]\n",
+        "rpi = {:?}\nhome = {:?}\nagent_dir = {:?}\n[owners]\nchat = [\"owner\"]\ndiscord = [\"downer\"]\n[memory]\nauto = \"owner\"\n",
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-rpi.py"),
         home,
         home.join("agent"),
@@ -1738,6 +1739,60 @@ async fn a_session_file_edited_during_an_owner_run_keeps_its_memory_waiting() {
         ),
         "{notice}"
     );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn memory_is_never_saved_at_once_unless_the_owner_turned_it_on() {
+    let home = home("memory-auto-off");
+    let mut cfg = config(&home);
+    cfg.memory = None; // an install with no `[memory] auto`
+    let gw = start(cfg);
+    gw.say("m1", "owner", "/new").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "WRITE_MEMORY likes tea").await;
+    let notice = reply_starting(&gw, "[zephyr] memory").await;
+    assert!(
+        notice.starts_with(
+            "[zephyr] memory change waiting (from your message); /memory ok keeps it, /memory undo drops it:"
+        ),
+        "{notice}"
+    );
+    gw.say("m3", "owner", "/memory ok").await;
+    reply_starting(&gw, "[zephyr] memory kept").await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn turning_memory_auto_on_needs_a_strong_channel_and_the_agent_may_only_turn_it_off() {
+    let home = home("memory-auto-set");
+    let gw = start(on_file_with_discord(&home, ""));
+    wait(|| !log(&home, "start").is_empty()).await;
+    gw.say_on("discord", "d1", "downer", "/set memory.auto owner")
+        .await;
+    assert_eq!(
+        gw.wait_replies_on("discord", 1).await,
+        ["[zephyr] loosening memory.auto needs tui or chat"]
+    );
+    gw.say("m1", "owner", "/set memory.auto owner").await;
+    reply_starting(&gw, "[zephyr] memory.auto off → owner").await;
+    // The agent's turning it on is a card; turning it off applies at once.
+    gw.say(
+        "m2",
+        "owner",
+        r#"[call gateway {"command": "/set memory.auto owner"}] go"#,
+    )
+    .await;
+    wait(|| gw.replies().iter().any(|r| r.contains("gateway: "))).await;
+    gw.say(
+        "m3",
+        "owner",
+        r#"[call gateway {"command": "/set memory.auto off"}] go"#,
+    )
+    .await;
+    reply_starting(&gw, "[zephyr] the agent set memory.auto owner → off").await;
+    let cfg = Config::load(&home.join("zephyr.toml")).unwrap();
+    assert_eq!(cfg.memory_auto(), "off");
     gw.shutdown().await;
 }
 

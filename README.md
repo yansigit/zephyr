@@ -359,14 +359,21 @@ using its usual tools; general network traffic is not limited.
   reaches the agent's context only after `/memory ok` (if it changed after you were sent the diff,
   you are shown the new one first); `/memory undo` drops it, `/memory diff` shows
   it again, `/memory log` lists commits. A web page cannot plant a lasting "preference" without you.
-- Memory is saved without asking only when zephyr saw that the change came from you alone: in a
-  conversation started with `/new` that has read nothing but your messages (no web page, command,
-  file you sent, task report or tool other than reading and editing `memory/USER.md` and
-  `MEMORY.md`), with nothing else of the agent's running, and nothing waiting. You are still told
-  (`[zephyr] memory saved from your message; /memory undo drops it`), and `/memory undo` takes it
-  back. Anything else waits for `/memory ok`, and the notice says where it came from. Once a
-  conversation has read anything else it stays that way until the next `/new`; after the agent
-  used its browser, `/stop` first (its browser keeps running in the background).
+- Every memory change waits for `/memory ok`, and its notice says where it came from (`from
+  your message`, `from task #7`, `from this conversation, which used exec at 14:02`). You can
+  have zephyr save a change at once when it saw the change came from you alone: `/set
+  memory.auto owner`, from the TUI or `zephyr chat` (Discord and iMessage cannot turn it on; the
+  agent can only turn it off). We recommend leaving it off. With it on, a change is saved without
+  asking only in a conversation started with `/new` that has read nothing but your messages (no
+  web page, command, file you sent, task report or tool other than reading and editing
+  `memory/USER.md` and `MEMORY.md`), with nothing else of the agent's running or alive, and
+  nothing waiting; you are still told (`[zephyr] memory saved from your message; /memory undo
+  drops it`), and `/memory undo` takes it back. Once a conversation has read anything else it
+  stays that way until the next `/new`; after the agent used its browser, `/stop` then `/new`.
+  What it cannot see: a program you start as the agent yourself (a `zephyr shell`, which reads
+  the agent's `~/.profile`; `docker exec -u agent x11vnc`, which reads `~/.x11vncrc`) runs what
+  the agent left there, and on a host whose `kernel.yama.ptrace_scope` is 0 an agent process can
+  attach to the desktop's programs. Leave it off if either applies.
   For the same reason rpi skills are off, only the image's extensions load, and a `SYSTEM.md`, `APPEND_SYSTEM.md`, `CLAUDE.md` or
   extra `AGENTS*.md` the agent writes is renamed `*.ignored-by-zephyr` before the next start.
 - `/forget TEXT` removes every memory line holding TEXT (at least 3 characters, any case), saves

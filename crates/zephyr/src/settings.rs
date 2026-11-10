@@ -383,6 +383,18 @@ pub static SETTINGS: &[Setting] = &[
         Apply::Toml,
     ),
     row(
+        "memory.auto",
+        "Memory",
+        "Save at once",
+        "off: every memory change waits for /memory ok; owner: one zephyr saw came only from \
+         you is saved at once. Off is the safer choice.",
+        Kind::Choice(&["off", "owner"]),
+        Access::Tighten,
+        true,
+        Stricter::Earlier,
+        Apply::Toml,
+    ),
+    row(
         "memory.notify",
         "Memory",
         "Memory notices",
@@ -919,6 +931,7 @@ pub fn value(cfg: &Config, key: &str) -> Option<String> {
         "timezone" => cfg.timezone.clone(),
         "review.at" => cfg.review_at().map(String::from),
         "memory.notify" => Some(cfg.memory_notify().into()),
+        "memory.auto" => Some(cfg.memory_auto().into()),
         "auth.enabled" => Some(cfg.auth.enabled.to_string()),
         "auth.refresh_minutes" => Some(cfg.auth.refresh_minutes.to_string()),
         "settings.strong_channels" => Some(cfg.settings.strong_channels.join(", ")),

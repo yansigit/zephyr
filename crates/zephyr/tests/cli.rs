@@ -333,7 +333,7 @@ fn stop_kills_the_agents_stray_processes_and_spares_the_live_child() {
 /// memory too, so while one is alive an owner's change waits.
 #[test]
 fn a_stray_agent_process_keeps_an_owner_memory_change_waiting() {
-    let (home, cfg) = setup("stray-memory", "");
+    let (home, cfg) = setup("stray-memory", "[memory]\nauto = \"owner\"\n");
     let uid = std::fs::metadata(&home).unwrap().uid();
     let text = std::fs::read_to_string(&cfg).unwrap();
     std::fs::write(&cfg, format!("{text}[owners]\nchat = [\"{uid}\"]\n")).unwrap();
@@ -385,7 +385,7 @@ fn a_stray_agent_process_keeps_an_owner_memory_change_waiting() {
 /// at all is still not the owner's alone (DESIGN §4.6).
 #[test]
 fn a_stray_at_a_runs_start_taints_its_conversation_after_it_ends() {
-    let (home, cfg) = setup("stray-at-start", "");
+    let (home, cfg) = setup("stray-at-start", "[memory]\nauto = \"owner\"\n");
     let uid = std::fs::metadata(&home).unwrap().uid();
     let text = std::fs::read_to_string(&cfg).unwrap();
     std::fs::write(&cfg, format!("{text}[owners]\nchat = [\"{uid}\"]\n")).unwrap();
