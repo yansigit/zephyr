@@ -660,25 +660,172 @@ pub fn direct_refused(addr: SocketAddr, wait: Duration) -> Result<(), String> {
     }
 }
 
-/// `zephyr __netcheck`: what the agent's uid can reach, one `ok|fail|warn <what>` line per check.
-/// Run as the agent, by the daemon at start and by `doctor`. Fails when any check does.
-pub fn netcheck(_args: &[String]) -> std::process::ExitCode {
+/// How one check of `__netcheck` came out; `Warn` is something the floor does not depend on.
+enum Check {
+    Ok,
+    Warn(String),
+    Fail(String),
+}
+
+impl From<Result<(), String>> for Check {
+    fn from(r: Result<(), String>) -> Check {
+        r.map_or_else(Check::Fail, |()| Check::Ok)
+    }
+}
+
+/// `zephyr __netcheck [OWN_IP:ATTACH_PORT]`: what the agent's uid can reach, one
+/// `ok|fail|warn <what>` line per check. Run as the agent: by the daemon at start with no
+/// argument (the direct connection alone), and by `doctor` with the daemon's address, which adds
+/// the daemon's own port, name lookups and the proxy's refusals. Fails when any check does.
+pub fn netcheck(args: &[String]) -> std::process::ExitCode {
+    let wait = Duration::from_secs(2);
     let public: SocketAddr = (Ipv4Addr::new(1, 1, 1, 1), 443).into();
-    let checks = [(
-        "a direct connection to the internet is refused",
-        direct_refused(public, Duration::from_secs(2)),
+    let mut checks: Vec<(String, Check)> = vec![(
+        "a direct connection to the internet is refused".into(),
+        direct_refused(public, wait).into(),
     )];
+    if let Some(own) = args.first() {
+        match own.parse::<SocketAddr>() {
+            // Port 0: no attach port to try.
+            Ok(own) if own.port() == 0 => {}
+            Ok(own) => checks.push((
+                format!("the daemon's port {} is refused", own.port()),
+                direct_refused(own, wait).into(),
+            )),
+            Err(_) => checks.push((own.clone(), Check::Fail("not ADDRESS:PORT".into()))),
+        }
+        checks.push((
+            "no name resolves without the proxy".into(),
+            unresolved("example.com"),
+        ));
+        let proxy: SocketAddr = (Ipv4Addr::LOCALHOST, PORT).into();
+        for target in ["169.254.169.254:80", "[::ffff:7f00:1]:443"] {
+            let check = match proxy_status(proxy, target) {
+                Ok(403) => Check::Ok,
+                Ok(status) => Check::Fail(format!("it answered {status}")),
+                // No proxy, no way out: the daemon may be stopped.
+                Err(e) => Check::Warn(format!("the proxy did not answer: {e}")),
+            };
+            checks.push((format!("the proxy refuses {target}"), check));
+        }
+        let check = match proxy_status(proxy, "example.com:443") {
+            Ok(200) => Check::Ok,
+            Ok(status) => Check::Warn(format!("it answered {status}; this machine may be offline")),
+            Err(e) => Check::Warn(format!("the proxy did not answer: {e}")),
+        };
+        checks.push(("the proxy reaches example.com:443".into(), check));
+    }
     let mut code = std::process::ExitCode::SUCCESS;
-    for (what, result) in checks {
-        match result {
-            Ok(()) => println!("ok {what}"),
-            Err(e) => {
-                println!("fail {what}: {e}");
+    for (what, check) in checks {
+        match check {
+            Check::Ok => println!("ok {what}"),
+            Check::Warn(why) => println!("warn {what}: {why}"),
+            Check::Fail(why) => {
+                println!("fail {what}: {why}");
                 code = std::process::ExitCode::FAILURE;
             }
         }
     }
     code
+}
+
+/// Fails when `name` resolves, or is still being looked up after 5 s: the agent has no resolver.
+fn unresolved(name: &'static str) -> Check {
+    use std::net::ToSocketAddrs;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send((name, 80).to_socket_addrs().map(|a| a.count())));
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(found)) if found > 0 => Check::Fail(format!("{name} resolved")),
+        Ok(_) => Check::Ok,
+        Err(_) => Check::Fail(format!("looking up {name} neither failed nor finished")),
+    }
+}
+
+/// The status the proxy at `proxy` gives a `CONNECT` to `target`.
+fn proxy_status(proxy: SocketAddr, target: &str) -> Result<u16, String> {
+    use std::io::{BufRead, Write};
+    let io = |e: std::io::Error| e.to_string();
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&proxy, Duration::from_secs(2)).map_err(io)?;
+    // Past the proxy's own lookup and connect waits.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .map_err(io)?;
+    let head = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
+    stream.write_all(head.as_bytes()).map_err(io)?;
+    let mut line = String::new();
+    std::io::BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(io)?;
+    let status = line.strip_prefix("HTTP/1.1 ").and_then(|l| l.get(..3));
+    status
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| "not an HTTP reply".to_string())
+}
+
+/// An address as `/proc/net/tcp` prints it: each 32-bit word in hex as this machine holds it,
+/// then the port.
+fn proc_addr(text: &str) -> Option<SocketAddr> {
+    let (ip, port) = text.split_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    let word = |i: usize| {
+        let hex = ip.get(i * 8..i * 8 + 8)?;
+        Some(u32::from_str_radix(hex, 16).ok()?.to_ne_bytes())
+    };
+    let ip: IpAddr = match ip.len() {
+        8 => Ipv4Addr::from(word(0)?).into(),
+        32 => {
+            let mut bytes = [0u8; 16];
+            for i in 0..4 {
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&word(i)?);
+            }
+            Ipv6Addr::from(bytes).into()
+        }
+        _ => return None,
+    };
+    Some(SocketAddr::new(ip, port))
+}
+
+/// Root's sockets the agent could reach, as `ADDR:PORT`: uid-0 TCP listeners and unconnected UDP
+/// sockets on loopback or a wildcard address, except the proxy and Docker's DNS (127.0.0.11,
+/// which the rules refuse). The rules hold no port list because this list is empty (doctor
+/// checks). `files` are `/proc/net`'s `tcp`, `tcp6`, `udp` and `udp6`, by name. A line that
+/// cannot be read is listed too.
+pub fn exposed(files: &[(&str, &str)]) -> Vec<String> {
+    let mut found = Vec::new();
+    for (kind, text) in files {
+        let tcp = kind.starts_with("tcp");
+        for line in text.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let read = || {
+                let (local, remote) = (proc_addr(fields.get(1)?)?, proc_addr(fields.get(2)?)?);
+                Some((
+                    local,
+                    remote,
+                    *fields.get(3)?,
+                    fields.get(7)?.parse::<u32>().ok()?,
+                ))
+            };
+            let Some((local, remote, state, uid)) = read() else {
+                found.push(format!("(unreadable: {})", line.trim()));
+                continue;
+            };
+            let listens = match tcp {
+                true => state == "0A", // TCP_LISTEN
+                false => remote.ip().is_unspecified() && remote.port() == 0,
+            };
+            let ip = match local.ip() {
+                IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(local.ip(), IpAddr::V4),
+                v4 => v4,
+            };
+            let proxy = tcp && ip == IpAddr::V4(Ipv4Addr::LOCALHOST) && local.port() == PORT;
+            let dns = ip == IpAddr::V4(Ipv4Addr::new(127, 0, 0, 11));
+            if uid == 0 && listens && (ip.is_loopback() || ip.is_unspecified()) && !proxy && !dns {
+                found.push(local.to_string());
+            }
+        }
+    }
+    found
 }
 
 /// Proves the floor before the daemon starts anything for the agent, in bridge mode: the
@@ -1358,5 +1505,83 @@ table inet zephyr {
         assert_eq!(net_admin(&status("00000000a80435fb")), Some(true));
         assert_eq!(net_admin("Name:\tzephyr\n"), None);
         assert_eq!(net_admin("CapEff:\tnonsense\n"), None);
+    }
+
+    /// A `/proc/net/tcp` or `udp` line: local address, remote address, state and uid.
+    fn sock(local: &str, remote: &str, state: &str, uid: u32) -> String {
+        format!("   0: {local} {remote} {state} 00000000:00000000 00:00000000 00000000  {uid}        0 6417364 1 0000000000000000 100 0 0 10 0\n")
+    }
+
+    #[test]
+    fn exposed_names_root_listeners_the_agent_could_reach() {
+        const HEAD: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+        let (none4, none6) = ("00000000:0000", "00000000000000000000000000000000:0000");
+        let tcp = [
+            sock("0100007F:1F90", none4, "0A", 0), // root on 127.0.0.1:8080
+            sock("00000000:1E6E", none4, "0A", 0), // root on 0.0.0.0:7790
+            sock("0100007F:1E70", none4, "0A", 0), // the proxy
+            sock("0100007F:0BB8", none4, "0A", 1000), // the agent's own server
+            sock("020012AC:1E6E", none4, "0A", 0), // root on the container's address
+            sock("0B00007F:9C41", none4, "0A", 0), // Docker's DNS
+            sock("0100007F:C350", "0100007F:1E70", "01", 0), // root's connection, not a listener
+        ];
+        let tcp6 = [
+            sock("00000000000000000000000001000000:1F90", none6, "0A", 0), // root on [::1]:8080
+            sock("0000000000000000FFFF00000100007F:1F91", none6, "0A", 0), // and on mapped loopback
+            sock("B80D0120000000000000000001000000:1F90", none6, "0A", 0), // 2001:db8::1, not loopback
+        ];
+        let udp = [
+            sock("0B00007F:D431", none4, "07", 0),           // Docker's DNS
+            sock("00000000:14E9", none4, "07", 0),           // root bound on 0.0.0.0:5353
+            sock("0100007F:D432", "0B00007F:0035", "01", 0), // root's own lookup, connected
+        ];
+        let text = |lines: &[String]| format!("{HEAD}{}", lines.concat());
+        let files = [
+            ("tcp", text(&tcp)),
+            ("tcp6", text(&tcp6)),
+            ("udp", text(&udp)),
+            ("udp6", HEAD.to_string()),
+        ];
+        let files: Vec<(&str, &str)> = files.iter().map(|(k, t)| (*k, t.as_str())).collect();
+        assert_eq!(
+            exposed(&files),
+            [
+                "127.0.0.1:8080",
+                "0.0.0.0:7790",
+                "[::1]:8080",
+                "[::ffff:127.0.0.1]:8081",
+                "0.0.0.0:5353"
+            ]
+        );
+        // A line that cannot be read is named, never skipped.
+        assert_eq!(
+            exposed(&[("tcp", "head\n   0: nonsense\n")]),
+            ["(unreadable: 0: nonsense)"]
+        );
+    }
+
+    #[test]
+    fn proxy_status_reads_the_status_code() {
+        let answering = |reply: &'static str| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let (mut s, _) = listener.accept().unwrap();
+                let mut head = [0u8; 256];
+                let n = s.read(&mut head).unwrap();
+                assert!(head[..n].starts_with(b"CONNECT example.com:443 HTTP/1.1\r\n"));
+                s.write_all(reply.as_bytes()).unwrap();
+            });
+            addr
+        };
+        let status = |reply| proxy_status(answering(reply), "example.com:443");
+        assert_eq!(status("HTTP/1.1 403 zephyr: x\r\n\r\n"), Ok(403));
+        assert_eq!(status("HTTP/1.1 200 OK\r\n\r\n"), Ok(200));
+        assert!(status("SSH-2.0-OpenSSH\r\n").is_err());
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        assert!(proxy_status(addr, "example.com:443").is_err());
     }
 }

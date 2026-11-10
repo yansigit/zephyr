@@ -21,7 +21,12 @@ case " $* " in
 esac
 [ -n "$GH_TOKEN" ] && echo "GH_TOKEN set" >> "$SHIM_DIR/env.log"
 case "$1" in
-  inspect) [ -n "$SHIM_NO_CONTAINER" ] && exit 1; echo "${SHIM_STATE:-running}"; exit 0 ;;
+  inspect) [ -n "$SHIM_NO_CONTAINER" ] && exit 1
+    case "$*" in
+      *NetworkMode*) echo "${SHIM_NETMODE:-$ZEPHYR_CONTAINER}" ;;
+      *IPAddress*) echo "${SHIM_IP:-172.18.0.2}" ;;
+      *) echo "${SHIM_STATE:-running}" ;;
+    esac; exit 0 ;;
   info) echo "${SHIM_RUNTIMES:-io.containerd.runc.v2 runc}"; exit 0 ;;
   image) exit "${SHIM_IMAGE_MISSING:-0}" ;;
   pull) exit "${SHIM_PULL_FAIL:-0}" ;;
@@ -1876,6 +1881,22 @@ fn doctor_fix_repairs_modes() {
     assert!(stdout(&out).contains(&format!("FAIL {} is private", secrets.display())));
     env.ok(&["doctor", "--fix"]);
     assert_eq!(mode(&secrets), 0o600);
+}
+
+#[test]
+fn doctor_warns_about_a_container_on_host_networking() {
+    const WARNING: &str =
+        "warn the container still runs host networking; zephyr up moves it to the network floor";
+    let env = Env::new("doctor-netmode");
+    env.init(&[]);
+    let old = stdout(&env.zephyr_env(&["doctor"], &[("SHIM_NETMODE", "host")]));
+    assert!(old.contains(WARNING), "{old}");
+    let moved = stdout(&env.zephyr(&["doctor"]));
+    assert!(!moved.contains("host networking"), "{moved}");
+    // Asked for in host.toml, it is no surprise.
+    std::fs::write(env.daemon().join("host.toml"), "network = \"host\"\n").unwrap();
+    let asked = stdout(&env.zephyr_env(&["doctor"], &[("SHIM_NETMODE", "host")]));
+    assert!(!asked.contains(WARNING), "{asked}");
 }
 
 #[test]

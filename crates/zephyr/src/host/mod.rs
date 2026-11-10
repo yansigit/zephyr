@@ -226,6 +226,11 @@ impl Host {
         self.state().as_deref() == Some("running")
     }
 
+    /// The container's network: `host`, or the bridge network's name (DESIGN §4.19).
+    fn network_mode(&self) -> Option<String> {
+        inspect(&self.container, "{{.HostConfig.NetworkMode}}")
+    }
+
     fn need_running(&self) -> anyhow::Result<()> {
         if !self.running() {
             bail!("container {} is not running: `zephyr up`", self.container);
@@ -682,6 +687,9 @@ impl Host {
         }
         let running = self.running();
         ok &= check(&format!("container {} is running", self.container), running);
+        if running && self.network_mode().as_deref() == Some("host") && self.bridge()? {
+            println!("warn the container still runs host networking; zephyr up moves it to the network floor");
+        }
         if running {
             ok &= self
                 .exec(&[], &[], &["zephyr", "doctor"])
@@ -942,7 +950,12 @@ fn fetch_cli(image: &str, target: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
 
 /// The container's state (`running`, `exited`, ...), or None when it does not exist.
 pub(crate) fn state(container: &str) -> Option<String> {
-    let out = docker(&["inspect", "-f", "{{.State.Status}}", container])
+    inspect(container, "{{.State.Status}}")
+}
+
+/// `docker inspect -f FORMAT CONTAINER`, when there is such a container.
+fn inspect(container: &str, format: &str) -> Option<String> {
+    let out = docker(&["inspect", "-f", format, container])
         .stderr(Stdio::null())
         .output()
         .ok()?;

@@ -435,6 +435,7 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     // In the container: what root starts or trusts is root's, never the agent's to swap (B5).
     // SAFETY: getuid has no arguments and cannot fail.
     let binaries_ok = unsafe { libc::getuid() } != 0 || roots_binaries(cfg);
+    let floor_ok = network_floor(cfg);
 
     // A throwaway home so doctor never touches the live `main` session.
     let mut probe = cfg.clone();
@@ -485,7 +486,7 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     }
 
     // Names and presence only: a secret's value is never printed.
-    let mut ok = version_ok && split_ok && wrapper_ok && binaries_ok && commands_ok;
+    let mut ok = version_ok && split_ok && wrapper_ok && binaries_ok && floor_ok && commands_ok;
     // While the daemon is up, its gate socket is there: without it every send is refused
     // (approvals spec §4.9).
     if tokio::net::UnixStream::connect(cfg.socket_path())
@@ -609,6 +610,64 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
 
 fn check(label: &str, ok: bool) -> bool {
     println!("{} {label}", mark(ok));
+    ok
+}
+
+/// The network floor (DESIGN §4.19), proved by probing as the agent (`zephyr __netcheck`), and
+/// that nothing of root's listens where the agent's uid is let through. Under host networking,
+/// one warning.
+fn network_floor(cfg: &Config) -> bool {
+    if !zephyr::egress::bridge() {
+        println!("warn network floor off (host networking): the agent can reach the host's loopback and private ranges");
+        return true;
+    }
+    let own = match zephyr::egress::own_ip() {
+        Ok(own) => own,
+        Err(e) => return check(&format!("{e:#}"), false),
+    };
+    let port = cfg.attach.as_ref().map_or(0, |a| a.port);
+    let mut probe = std::process::Command::new("/usr/local/bin/zephyr");
+    probe.args(["__netcheck", &format!("{own}:{port}")]);
+    let mut ok = match zephyr::agent::cmd(&mut probe).output() {
+        Ok(out) => {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                match line.split_once(' ') {
+                    Some(("ok", what)) => println!("ok   {what}"),
+                    Some(("warn", what)) => println!("warn {what}"),
+                    _ => println!("FAIL {}", line.trim_start_matches("fail ")),
+                }
+            }
+            out.status.success() || check("the network floor holds for the agent", false)
+        }
+        Err(e) => check(
+            &format!("probing the network floor as the agent: {e}"),
+            false,
+        ),
+    };
+    let files: Vec<(&str, String)> = ["tcp", "tcp6", "udp", "udp6"]
+        .into_iter()
+        .map(|name| {
+            let text = match std::fs::read_to_string(format!("/proc/net/{name}")) {
+                Ok(text) => text,
+                // No IPv6 in this kernel: no such sockets.
+                Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
+                Err(e) => format!("\n/proc/net/{name}: {e}\n"),
+            };
+            (name, text)
+        })
+        .collect();
+    let files: Vec<(&str, &str)> = files.iter().map(|(n, t)| (*n, t.as_str())).collect();
+    let open = zephyr::egress::exposed(&files);
+    if open.is_empty() {
+        check(
+            "nothing of root's listens where the agent can reach it",
+            true,
+        );
+    }
+    for addr in open {
+        let label = format!("root listens on {addr}, where the agent can reach it");
+        ok &= check(&label, false);
+    }
     ok
 }
 

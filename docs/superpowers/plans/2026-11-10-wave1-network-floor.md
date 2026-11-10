@@ -228,15 +228,19 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
 - In bridge mode, in-container `doctor` runs `__netcheck <own_ip>:<attach.port|0>` as the agent and prints its lines (a `fail` fails doctor). It prints `exposed` over `/proc/net/{tcp,tcp6,udp,udp6}` as `root listens on ADDR, where the agent can reach it`. In host mode it prints one warning: `network floor off (host networking): the agent can reach the host's loopback and private ranges`.
 - Host `doctor` reads `docker inspect -f '{{.HostConfig.NetworkMode}}' <container>` and warns `the container still runs host networking; zephyr up moves it to the network floor` when it says `host` while host.toml does not.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `exposed_names_root_listeners_the_agent_could_reach`, on fixture `/proc/net` lines:
     - listed: uid 0 LISTEN `0100007F:1F90` (127.0.0.1:8080), `00000000:1E6E` (0.0.0.0:7790), and tcp6 `00000000000000000000000001000000:1F90` (::1:8080);
     - not listed: `0100007F:1E70` (the proxy), uid 1000 on 127.0.0.1:3000, uid 0 on `020012AC:1E6E` (172.18.0.2), and uid 0 udp `0B00007F:…` (127.0.0.11).
   - `proxy_status_reads_the_status_code`: a local listener answering `HTTP/1.1 403 x\r\n\r\n` gives `Ok(403)`.
   - `tests/host.rs` `doctor_warns_about_a_container_on_host_networking`: the shim's `inspect` answers `${SHIM_NETMODE}` for a `NetworkMode` format, and with `SHIM_NETMODE=host` the output contains the warning.
-- [ ] **Step 2:** Run → FAIL. **Step 3:** Implement. **Step 4:** `cargo test -p zephyr --lib egress` and `cargo test -p zephyr --test host` → PASS.
-- [ ] **Step 5: Docs.** DESIGN §4.8 `doctor`: the probes run as the agent, the root-listener rule, and the host-mode warning.
-- [ ] **Step 6:** Commit `feat(doctor): prove the network floor by probing as the agent and refusing root listeners it could reach`.
+- [x] **Step 2:** Run → FAIL. **Step 3:** Implement. **Step 4:** `cargo test -p zephyr --lib egress` and `cargo test -p zephyr --test host` → PASS.
+- [x] **Step 5: Docs.** DESIGN §4.8 `doctor`: the probes run as the agent, the root-listener rule, and the host-mode warning.
+- [x] **Step 6:** Commit `feat(doctor): prove the network floor by probing as the agent and refusing root listeners it could reach`.
+- Deviation: `proxy_status(proxy, target)` takes the proxy address, so the test can point it at a local listener.
+- Deviation: `exposed` counts a root UDP socket only when it is unconnected (remote `0.0.0.0:0`): the daemon resolver holds connected sockets on loopback for a moment, which nobody else can send to, and they would fail doctor at random. A `/proc/net` line that cannot be read is listed, not skipped, and an IPv4-mapped loopback counts as loopback.
+- Deviation: a proxy that does not answer at all makes probe (d) a `warn`, not a `fail`: with the daemon stopped the agent has no way out, and `doctor` is also run then. Any status but 403 for the two refused targets is still a `fail`. Probe (b) is skipped when the port is 0 (no `[attach]`).
+- Deviation: `network_mode` (planned for A2-7) is added here, where the host `doctor` first needs it.
 
 ### Task A2-7: `zephyr up` in bridge mode, publishing, migration
 
