@@ -3669,6 +3669,8 @@ mod tests {
              "revoke": "/approvals forget 4"},
             {"at": 2, "kind": "grant", "subject": "#3",
              "line": "job #3 morning-brief, 0 7 * * *, to discord · /job rm 3", "revoke": "/job rm 3"},
+            {"at": 3, "kind": "grant", "subject": "k",
+             "line": "k until 18:00, then [vault:A] · set k back by hand", "revoke": null},
         ], "next": null})
     }
 
@@ -3756,6 +3758,9 @@ mod tests {
             hit(&mut o, &s, KeyCode::Char('r')),
             Action::Revoke("/job rm 3".into())
         );
+        // A grant whose value could not be shown as it is offers no command to send.
+        hit(&mut o, &s, KeyCode::Down);
+        assert_eq!(hit(&mut o, &s, KeyCode::Char('r')), Action::None);
         let hints = settings_panel::hints(&o);
         assert!(hints.iter().any(|(k, _)| *k == "r"), "{hints:?}");
         hit(&mut o, &s, KeyCode::Char('?'));

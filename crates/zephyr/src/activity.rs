@@ -255,9 +255,16 @@ pub struct Grant {
     pub at: i64,
     /// The class, the setting's key, or `#id` for a job.
     pub subject: String,
-    /// The line every client shows, ending ` · REVOKE`.
+    /// The line every client shows, ending ` · REVOKE` (or saying to set it back by hand).
     pub line: String,
-    pub revoke: String,
+    /// The command that takes it back; `None` when the value it would send could not be shown
+    /// as it is (scrubbed or cut), so no command with a wrong value is ever offered.
+    pub revoke: Option<String>,
+}
+
+/// `/set KEY RAW`, only when `shown` (what the owner reads) is `raw` itself.
+fn revoke_for(key: &str, raw: &str, shown: &str) -> Option<String> {
+    (raw == shown).then(|| format!("/set {key} {raw}"))
 }
 
 /// The standing grants (DESIGN §4.19), current state: remembered targets, time limits, then
@@ -266,10 +273,13 @@ pub fn grants(cfg: &Config, store: &Store, now: i64) -> rusqlite::Result<Vec<Gra
     let tz = crate::scheduler::zone(cfg).unwrap_or(TimeZone::UTC);
     let scrub = Scrub::load(cfg);
     let clean = |s: &str| one_line(&scrub.text(s), 200);
-    let grant = |at: i64, subject: String, shown: String, revoke: String| Grant {
+    let grant = |at: i64, subject: String, shown: String, revoke: Option<String>| Grant {
         at,
+        line: match &revoke {
+            Some(r) => format!("{shown} · {r}"),
+            None => format!("{shown} · set {subject} back by hand"),
+        },
         subject,
-        line: format!("{shown} · {revoke}"),
         revoke,
     };
     let mut out = Vec::new();
@@ -282,22 +292,40 @@ pub fn grants(cfg: &Config, store: &Store, now: i64) -> rusqlite::Result<Vec<Gra
             t.added_at,
             t.class,
             shown,
-            format!("/approvals forget {}", t.n),
+            Some(format!("/approvals forget {}", t.n)),
         ));
     }
     for r in store.due_reverts(i64::MAX)? {
-        let value = clean(crate::settings::shown(r.value.as_deref()));
+        let Some(setting) = crate::settings::find(&r.key) else {
+            continue;
+        };
         // A timed preset's value is a snapshot (`manual; messages=ask`); setting the preset its
         // first item names is what takes the limit back; an unset one (`default`) reads as manual.
-        let back = match r.key.as_str() {
-            "approvals.preset" => match value.split(';').next().unwrap_or_default().trim() {
-                "default" => "manual".to_string(),
-                first => first.to_string(),
-            },
-            _ => value.clone(),
-        };
+        let back =
+            match r.key.as_str() {
+                "approvals.preset" => r.value.as_deref().map(|v| {
+                    match v.split(';').next().unwrap_or_default().trim() {
+                        "default" => "manual".to_string(),
+                        first => first.to_string(),
+                    }
+                }),
+                _ => r.value.clone(),
+            };
+        // Only a limit that loosened something is a grant: going back must be stricter, by the
+        // registry's own order. An approval class going back to unset follows the preset.
+        let now_value = crate::settings::value(cfg, &r.key);
+        let back_value = back
+            .clone()
+            .or_else(|| crate::settings::cleared(cfg, &r.key));
+        let stricter =
+            crate::settings::tighter(setting, now_value.as_deref(), back_value.as_deref());
+        if stricter != Some(true) || now_value == back_value {
+            continue;
+        }
+        let value = clean(crate::settings::shown(r.value.as_deref()));
+        let raw = crate::settings::shown(back.as_deref());
         let shown = format!("{} until {}, then {value}", r.key, when(r.at, now, &tz));
-        let revoke = format!("/set {} {back}", r.key);
+        let revoke = revoke_for(&r.key, raw, &clean(raw));
         out.push(grant(r.since, r.key, shown, revoke));
     }
     for (job, created) in store.enabled_jobs()? {
@@ -312,7 +340,7 @@ pub fn grants(cfg: &Config, store: &Store, now: i64) -> rusqlite::Result<Vec<Gra
             created,
             format!("#{}", job.id),
             shown,
-            format!("/job rm {}", job.id),
+            Some(format!("/job rm {}", job.id)),
         ));
     }
     Ok(out)
@@ -814,7 +842,7 @@ mod tests {
                 "job #1 morning-brief, 0 7 * * *, to discord · /job rm 1",
             ]
         );
-        let revokes: Vec<&str> = g.iter().map(|g| g.revoke.as_str()).collect();
+        let revokes: Vec<&str> = g.iter().filter_map(|g| g.revoke.as_deref()).collect();
         assert_eq!(
             revokes,
             [
@@ -836,9 +864,24 @@ mod tests {
         );
     }
 
+    /// A store and a config whose zephyr.toml holds `extra`: the values in effect now.
+    fn cfg_with(name: &str, extra: &str) -> (Config, Store) {
+        let (cfg, store) = cfg(name);
+        let cfg: Config = toml::from_str(&format!(
+            "rpi = '/r'\nhome = {:?}\ntimezone = 'UTC'\n{extra}",
+            cfg.home
+        ))
+        .unwrap();
+        (cfg, store)
+    }
+
     #[test]
     fn a_timed_presets_revoke_is_a_working_command() {
-        let (cfg, store) = cfg("activity-grants-preset");
+        // `/approvals semi for 2h` over manual: semi now, manual back at 18:00.
+        let (cfg, store) = cfg_with(
+            "activity-grants-preset",
+            "[approvals]\npreset = 'semi'\n[budget]\ndaily_cost_usd = 1\n",
+        );
         store
             .set_revert(&revert(
                 "approvals.preset",
@@ -846,19 +889,18 @@ mod tests {
                 at(18, 0),
             ))
             .unwrap();
+        // PR #39 review: a timed tightening (`/set budget.daily_cost_usd 1 for 2h` over 5) is no
+        // grant, and its "take it back" would loosen at once.
         store
-            .set_revert(&revert("tasks.parallel", None, at(19, 0)))
+            .set_revert(&revert("budget.daily_cost_usd", Some("5"), at(19, 0)))
             .unwrap();
         let g = grants(&cfg, &store, NOW).unwrap();
+        assert_eq!(g.len(), 1, "{g:?}");
         assert_eq!(
             g[0].line,
             "approvals.preset until 18:00, then manual; messages=ask · /set approvals.preset manual"
         );
-        assert_eq!(g[0].revoke, "/set approvals.preset manual");
-        assert_eq!(
-            g[1].line,
-            "tasks.parallel until 19:00, then none · /set tasks.parallel none"
-        );
+        assert_eq!(g[0].revoke.as_deref(), Some("/set approvals.preset manual"));
         store
             .set_revert(&revert(
                 "approvals.preset",
@@ -868,11 +910,24 @@ mod tests {
             .unwrap();
         let g = grants(&cfg, &store, NOW).unwrap();
         // An unset preset reads as manual; `none` is no value approvals.preset takes.
-        assert_eq!(g[0].revoke, "/set approvals.preset manual");
+        assert_eq!(g[0].revoke.as_deref(), Some("/set approvals.preset manual"));
         assert!(
             g[0].line.contains("then default; posts=hold · "),
             "{}",
             g[0].line
         );
+    }
+
+    /// PR #39 review: a revoke is offered only when the value it sends is the real one, not a
+    /// scrubbed or cut copy of it.
+    #[test]
+    fn a_revoke_is_offered_only_for_the_real_value() {
+        assert_eq!(
+            revoke_for("budget.daily_cost_usd", "5", "5").as_deref(),
+            Some("/set budget.daily_cost_usd 5")
+        );
+        assert_eq!(revoke_for("k", "s3cr3tvalue", "[vault:A]"), None);
+        let long = "x".repeat(250);
+        assert_eq!(revoke_for("k", &long, &one_line(&long, 200)), None);
     }
 }

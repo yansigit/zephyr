@@ -1550,7 +1550,9 @@ pub fn key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
                 return Action::None;
             }
             if s.tab() == Tab::Grants && code == KeyCode::Char('r') {
-                if let Some((_, revoke)) = s.grants.as_ref().and_then(|g| g.get(r)) {
+                // None for a grant set back by hand: its value could not be shown as it is.
+                let grant = s.grants.as_ref().and_then(|g| g.get(r));
+                if let Some((_, revoke)) = grant.filter(|(_, revoke)| !revoke.is_empty()) {
                     let revoke = revoke.clone();
                     s.note = None;
                     return Action::Revoke(revoke);
