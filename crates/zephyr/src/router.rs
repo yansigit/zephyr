@@ -457,6 +457,9 @@ struct Router<'a> {
     run_taint: bool,
     /// Taints `session_origin` could not take, by session: they hold for this process's life.
     tainted: HashMap<String, String>,
+    /// A run cut off by a restart whose conversation could not be read: no run of main is the
+    /// owner's until the daemon starts again.
+    unplaced: bool,
     /// When the child last said anything, for stall detection (`cap_run`).
     last_event: Instant,
     /// `RESUME_NOTE` was steered into a resumed run and not delivered yet: taken back at the
@@ -623,6 +626,7 @@ impl<'a> Router<'a> {
             trust: Trust::Not(crate::memory::LEGACY.into()),
             run_taint: false,
             tainted: HashMap::new(),
+            unplaced: false,
             last_event: Instant::now(),
             note_pending: false,
             cut: None,
@@ -1721,7 +1725,19 @@ impl<'a> Router<'a> {
 
     async fn child_exited(&mut self) {
         eprintln!("zephyr: rpi child exited; respawning in {:?}", self.backoff);
-        self.child = None;
+        // A run its agent died in may have read text whose events never came: its conversation
+        // is not the owner's alone. Nothing of the dead run's is carried into the next one.
+        let session = self.child.take().and_then(|c| c.session.clone());
+        if let (Some(session), Some(_)) = (session, self.run_start) {
+            let why = format!(
+                "was cut off when its agent stopped at {}",
+                self.clock(crate::now())
+            );
+            self.record_taint(session, &why);
+        }
+        self.tally.taint = None;
+        self.trust = Trust::Not(crate::memory::LEGACY.into());
+        self.run_taint = false;
         self.busy = false;
         update(&self.snap, |s| s.run = Run::default());
         self.run_start = None;
@@ -1987,11 +2003,14 @@ impl<'a> Router<'a> {
         let failed = session.as_ref().and_then(|s| self.tainted.get(s)).cloned();
         let origin = session.map(|s| self.store.session_origin(&s));
         self.trust = match origin {
+            _ if self.unplaced => Trust::Not(UNPLACED.into()),
             _ if failed.is_some() => Trust::Not(format!(
                 "this conversation, which {}",
                 failed.unwrap_or_default()
             )),
-            Some(Ok(SessionOrigin::Clean)) if self.writers_since(now) => Trust::Not(BESIDE.into()),
+            Some(Ok(SessionOrigin::Clean)) if self.writers_since(now) => {
+                Trust::Not(crate::memory::BESIDE.into())
+            }
             Some(Ok(SessionOrigin::Clean)) => {
                 match crate::memory::base(&self.cfg.home, self.cfg.state_dir()).await {
                     Ok(base) => Trust::Owner { base, since: now },
@@ -2045,7 +2064,13 @@ impl<'a> Router<'a> {
         if rows.as_ref().is_ok_and(|r| r.is_empty()) {
             return;
         }
-        let session = (self.store.main_session()).unwrap_or_else(|_| MAIN_SESSION.into());
+        let Ok(session) = self.store.main_session() else {
+            eprintln!(
+                "zephyr: a run was cut off by a restart in a conversation zephyr cannot read"
+            );
+            self.unplaced = true;
+            return;
+        };
         let why = format!("was cut off by a restart at {}", self.clock(crate::now()));
         self.record_taint(session, &why);
     }
@@ -2081,16 +2106,19 @@ impl<'a> Router<'a> {
         self.apply_model().await;
         self.backoff = FIRST_BACKOFF;
         let trust = std::mem::replace(&mut self.trust, Trust::Not(crate::memory::LEGACY.into()));
-        let origin = match trust {
-            // Anything that ran beside the run, or a stray, could have written memory too.
-            Trust::Owner { base, since } => match self.writers_since(since) {
-                false => crate::memory::Origin::Owner { base },
-                true => crate::memory::Origin::Main(BESIDE.into()),
-            },
-            Trust::Not(label) => crate::memory::Origin::Main(label),
+        // Anything that ran beside the run, or a stray, could have written memory too: asked
+        // under the memory lock, right before the commit.
+        let (db, procs) = (self.cfg.db_path(), self.procs.clone());
+        let (origin, since) = match trust {
+            Trust::Owner { base, since } => (crate::memory::Origin::Owner { base }, since),
+            Trust::Not(label) => (crate::memory::Origin::Main(label), 0),
+        };
+        let others = move || {
+            let writers = Store::open(&db).and_then(|s| s.writers_since(since));
+            writers.unwrap_or(true) || procs.strays_alive()
         };
         let (home, state, digest) = (&self.cfg.home, self.cfg.state_dir(), self.cfg.digest());
-        let done = crate::memory::commit(home, state, origin, digest).await;
+        let done = crate::memory::commit(home, state, origin, digest, others).await;
         // A change saved at once is in the next child's context, as a rule is.
         if done.as_ref().is_ok_and(|c| c.auto && c.sha.is_some()) {
             self.restart = true;
@@ -4323,8 +4351,9 @@ enum Trust {
     Not(String),
 }
 
-/// `Trust::Not`'s labels for work beside the run and for a change already waiting.
-const BESIDE: &str = "your message, while other work of the agent's was running";
+/// `Trust::Not`'s label while a run cut off by a restart could not be placed (`taint_cut_off`).
+const UNPLACED: &str =
+    "your message, but zephyr could not tell which conversation a restart cut off";
 
 /// What taking in an inbox row with this platform id means for the conversation, when the row
 /// is the daemon's (a task's or a process's report, a held action's result) and not the owner's.
@@ -4830,5 +4859,40 @@ mod tests {
         assert_eq!(preview("a\n\n b"), "a b");
         assert_eq!(preview(&"é".repeat(61)), format!("{}…", "é".repeat(60)));
         assert_eq!(preview(&"é".repeat(60)), "é".repeat(60));
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_run_zephyr_cannot_place_stops_auto_approve_until_restart() {
+        let cfg = on_file("router-cut-off-unplaced", "");
+        let jobs = Default::default();
+        let mut r = router(&cfg, &jobs);
+        let m = Inbound {
+            channel: "chat".into(),
+            platform_msg_id: "a".into(),
+            sender: "owner".into(),
+            text: "in flight".into(),
+        };
+        let id = r.store.insert_inbox(&m).unwrap().unwrap();
+        r.store.mark_dispatched(id).unwrap();
+        // The main session's id cannot be read.
+        rusqlite::Connection::open(cfg.db_path())
+            .unwrap()
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('main_session', X'ff')",
+                [],
+            )
+            .unwrap();
+        r.taint_cut_off();
+        assert_eq!(
+            r.store.session_origin("main").unwrap(),
+            SessionOrigin::Clean,
+            "never a guess at main"
+        );
+        r.begin_run().await;
+        assert!(
+            matches!(&r.trust, Trust::Not(why) if why == UNPLACED),
+            "{:?}",
+            r.trust
+        );
     }
 }

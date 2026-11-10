@@ -1436,6 +1436,45 @@ async fn a_taint_that_could_not_be_written_still_holds() {
 }
 
 #[tokio::test]
+async fn a_run_its_agent_died_in_taints_its_conversation_and_no_other() {
+    let home = home("memory-child-died");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "/new").await;
+    gw.wait_replies(1).await;
+    let id = Store::open(&home.join("state.db"))
+        .unwrap()
+        .main_session()
+        .unwrap();
+    std::fs::write(home.join("hang"), "").unwrap();
+    gw.say("m2", "owner", "long job").await;
+    wait(|| !home.join("hang").exists()).await; // the child is now mid-run
+    let pid = std::fs::read_to_string(home.join("pid")).unwrap();
+    std::process::Command::new("kill")
+        .args(["-9", &pid])
+        .status()
+        .unwrap();
+    reply_starting(&gw, "resumed: ").await;
+    match Store::open(&home.join("state.db"))
+        .unwrap()
+        .session_origin(&id)
+        .unwrap()
+    {
+        SessionOrigin::Tainted(why) => {
+            assert!(
+                why.starts_with("was cut off when its agent stopped at "),
+                "{why}"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+    gw.say("m3", "owner", "/new").await;
+    reply_starting(&gw, "[zephyr] new conversation").await;
+    gw.say("m4", "owner", "WRITE_MEMORY likes tea").await;
+    reply_starting(&gw, SAVED).await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_rule_restarts_the_agent_and_leads_its_context() {
     let home = home("rules");
     let gw = start(config(&home));

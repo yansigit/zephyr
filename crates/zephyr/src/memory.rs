@@ -345,6 +345,8 @@ pub const LEGACY: &str = "a conversation from before zephyr kept track; /new sta
 
 /// An owner-origin run's change that lost a race with another writer.
 const RACED: &str = "your message, but another run wrote memory meanwhile";
+/// An owner's run while other work of the agent's ran, or a stray of its lived.
+pub const BESIDE: &str = "your message, while other work of the agent's was running";
 /// An owner's run that started with a change still waiting.
 pub const ON_WAITING: &str = "your message, on top of a change still waiting";
 /// The memory repo's git holds something zephyr did not make (`untouched`).
@@ -365,14 +367,27 @@ pub struct Committed {
 
 /// `commit_if_changed` on a blocking thread: the daemon is one future, and git in the agent's
 /// repo must never stall it.
+/// `others` is `commit_checked`'s.
 pub async fn commit(
     home: &Path,
     state: &Path,
     origin: Origin,
     digest: bool,
+    others: impl Fn() -> bool + Send + 'static,
 ) -> anyhow::Result<Committed> {
     let (home, state) = (home.to_path_buf(), state.to_path_buf());
-    tokio::task::spawn_blocking(move || commit_if_changed(&home, &state, &origin, digest)).await?
+    let commit = move || commit_checked(&home, &state, &origin, digest, &others);
+    tokio::task::spawn_blocking(commit).await?
+}
+
+/// `commit_checked` with nothing else to ask about other writers.
+pub fn commit_if_changed(
+    home: &Path,
+    state: &Path,
+    origin: &Origin,
+    digest: bool,
+) -> anyhow::Result<Committed> {
+    commit_checked(home, state, origin, digest, &|| false)
 }
 
 /// Commits every change in the memory dir as `memory: <utc time>`. With `Origin::Owner`, a
@@ -380,11 +395,14 @@ pub async fn commit(
 /// else waits, and the notice (once per content) names where it came from. With `digest`
 /// (`memory.notify = digest`) nothing is told and nothing marked shown: the daily review lists
 /// it, and `/memory ok` shows the diff first until then.
-pub fn commit_if_changed(
+/// `others`, asked for an owner's run under the memory lock right before the commit, says whether
+/// other work of the agent's ran beside the run or a stray of its lives (`BESIDE`).
+pub fn commit_checked(
     home: &Path,
     state: &Path,
     origin: &Origin,
     digest: bool,
+    others: &dyn Fn() -> bool,
 ) -> anyhow::Result<Committed> {
     let _guard = lock();
     // Under the lock and before any git call: a filter the agent configured would run inside it.
@@ -392,6 +410,8 @@ pub fn commit_if_changed(
         Origin::Owner { .. } => untouched(home).err(),
         _ => None,
     };
+    // Then whether anything else could have written: as late as zephyr can ask, before it reads.
+    let beside = matches!(origin, Origin::Owner { .. }) && tampered.is_none() && others();
     let sha = {
         let _fs = crate::agent::fs();
         commit_locked(home)?
@@ -424,7 +444,9 @@ pub fn commit_if_changed(
     }
     let working = working?;
     let mut label = origin.label();
-    if let Origin::Owner { base } = origin {
+    if beside {
+        label = BESIDE.into();
+    } else if let Origin::Owner { base } = origin {
         let on_base = || -> anyhow::Result<bool> {
             let _fs = crate::agent::fs();
             let parents = git(&dir(home), &["rev-list", "--parents", "-n", "1", "HEAD"])?;
@@ -2322,5 +2344,29 @@ mod tests {
         prepare(&home, &st, &home.join("agent")).unwrap();
         symlink("/etc/hostname", dir(&home).join("notes/x.md")).unwrap();
         assert_eq!(why(&home), LINKED);
+    }
+
+    #[test]
+    fn other_writers_checked_under_the_lock_keep_an_owner_change_waiting() {
+        let home = home();
+        let st = state(&home);
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        let base = clean_base(&home, &st).unwrap();
+        std::fs::write(dir(&home).join(USER), "# USER.md\nTakes coffee black\n").unwrap();
+        let asked = std::sync::atomic::AtomicBool::new(false);
+        let others = || {
+            // Asked while zephyr holds the memory lock, so no commit of its own comes between.
+            assert!(GIT.try_lock().is_err(), "under the lock");
+            asked.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        };
+        let c = commit_checked(&home, &st, &Origin::Owner { base }, false, &others).unwrap();
+        assert!(asked.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!c.auto);
+        assert_eq!(c.origin, BESIDE);
+        assert!(c
+            .notice
+            .unwrap()
+            .starts_with(&format!("[zephyr] memory change waiting (from {BESIDE})")));
     }
 }
