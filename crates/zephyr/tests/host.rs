@@ -2712,3 +2712,35 @@ fn host_edits_keep_what_the_daemon_wrote_meanwhile() {
     );
     assert!(env.config().contains(edit), "{}", env.config());
 }
+
+/// Every file the image copies from the build context is let back in by `.dockerignore`
+/// (`*`, then `!PATH` per allowed path): one left out fails `docker build` at that COPY.
+#[test]
+fn every_copy_in_the_dockerfile_is_in_the_build_context() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let ignore = std::fs::read_to_string(root.join(".dockerignore")).unwrap();
+    assert!(ignore.lines().any(|l| l.trim() == "*"), "{ignore}");
+    let allowed: Vec<&str> = (ignore.lines())
+        .filter_map(|l| l.trim().strip_prefix('!'))
+        .map(|p| p.trim_end_matches('/'))
+        .collect();
+    let dockerfile = std::fs::read_to_string(root.join("deploy/Dockerfile")).unwrap();
+    let mut checked = 0;
+    for line in dockerfile.lines().map(str::trim) {
+        let Some(args) = line.strip_prefix("COPY ") else {
+            continue;
+        };
+        let words: Vec<&str> = args.split_whitespace().collect();
+        if words.iter().any(|w| w.starts_with("--from")) {
+            continue;
+        }
+        for source in &words[..words.len() - 1] {
+            let source = source.trim_end_matches('/');
+            let ok = (allowed.iter()).any(|a| source == *a || source.starts_with(&format!("{a}/")));
+            assert!(ok, "COPY {source} is left out by .dockerignore");
+            assert!(root.join(source).exists(), "COPY {source}: no such path");
+            checked += 1;
+        }
+    }
+    assert!(checked >= 4, "{checked}");
+}
