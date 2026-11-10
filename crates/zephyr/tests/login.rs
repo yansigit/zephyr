@@ -764,7 +764,8 @@ async fn a_channel_pastes_the_callback_into_its_own_oauth_login() {
 
     say(
         "owner",
-        "/login paste http://127.0.0.1:1455/cb?code=SECRETCODE",
+        // As Discord sends a link whose preview is off: in angle brackets.
+        "/login paste <http://127.0.0.1:1455/cb?state=1&c=SECRETCODE>",
     )
     .await;
     told("[zephyr] sent to the antigravity sign-in").await;
@@ -788,6 +789,58 @@ async fn a_channel_pastes_the_callback_into_its_own_oauth_login() {
     )
     .await;
 
+    let _ = stop.send(());
+    task.await.unwrap().unwrap();
+}
+
+/// `/login cancel` reaches a sign-in whose URL was already posted, by itself and by provider, and
+/// the account name it held is free for the next one. (Not by id here: the registry is this
+/// whole test binary's, so the test cannot tell which id is its own.)
+#[tokio::test]
+async fn login_cancel_stops_a_sign_in_whose_url_was_posted() {
+    let (cfg, home) = setup("cancel-posted", "");
+    std::fs::write(home.join("login_url"), "").unwrap();
+    let (feed, rx) = tokio::sync::mpsc::channel(8);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let sent: Sent = Default::default();
+    let task = tokio::spawn({
+        let sent = sent.clone();
+        async move {
+            let feed = Feed {
+                rx: tokio::sync::Mutex::new(rx),
+                sent,
+            };
+            let stop = async {
+                let _ = stopped.await;
+            };
+            zephyr::router::run(&cfg, &[feed], stop).await
+        }
+    });
+    const URL: &str = "sign in to antigravity as antigravity-1 at https://example.test";
+    const CANCELLED: &str = "[zephyr] cancelled the sign-in to antigravity as antigravity-1";
+    let count = |r: &[String], what: &str| r.iter().filter(|x| x.contains(what)).count();
+    for (round, cancel) in ["/login cancel", "/login cancel antigravity"]
+        .into_iter()
+        .enumerate()
+    {
+        let n = round + 1;
+        let say = |text: String, id: String| {
+            let feed = feed.clone();
+            let msg = Inbound {
+                channel: "chat".into(),
+                platform_msg_id: id,
+                sender: "owner".into(),
+                text,
+            };
+            async move { feed.send(msg).await.unwrap() }
+        };
+        // No account named: the first free one, which is antigravity-1 again each round only
+        // if the cancel before freed it.
+        say("/login antigravity".into(), format!("l{n}")).await;
+        replies_until(&sent, |r| count(r, URL) == n, "the sign-in's URL").await;
+        say(cancel.into(), format!("c{n}")).await;
+        replies_until(&sent, |r| count(r, CANCELLED) == n, "the cancel's reply").await;
+    }
     let _ = stop.send(());
     task.await.unwrap().unwrap();
 }

@@ -3028,7 +3028,9 @@ impl<'a> Router<'a> {
     /// of the sender's own newest sign-in, where rpi reads the code from it (DESIGN §4.7.1). Only
     /// something that looks like that address is taken, so a token pasted by mistake goes nowhere.
     fn login_paste(&mut self, text: &str, from: (&str, &str)) -> String {
+        // Discord wraps a link in angle brackets when its preview is off.
         let text = text.trim();
+        let text = (text.strip_prefix('<').and_then(|t| t.strip_suffix('>'))).unwrap_or(text);
         let address = ["http://127.0.0.1", "http://localhost"]
             .iter()
             .any(|start| text.starts_with(start))
@@ -3096,28 +3098,18 @@ impl<'a> Router<'a> {
                 }
             }
         }
-        let ids: Vec<String> = match provider {
-            // Only `/login` knows a login's provider for as long as it waits, so the ids of the
-            // ones it already announced are gone with the notice; `auth::logins` has them all.
-            // But only this router's own logins are cancelled: the registry is process-wide,
-            // and another daemon (or an attached TUI's `zephyr.login_*`) may hold a login with
-            // the same provider. A bare cancel takes every login this router started.
-            Some(p) => self
-                .logins
-                .iter()
-                .filter(|l| l.provider == p)
-                .map(|l| l.id.clone())
-                .collect(),
-            None if what.is_empty() => self.logins.iter().map(|l| l.id.clone()).collect(),
-            // An id names one login; only this router's own ids are honoured, so one channel
-            // cannot stop another daemon's (or an attached TUI's) sign-in by guessing its id.
-            None => vec![what.to_string()]
-                .into_iter()
-                .filter(|id| self.logins.iter().any(|l| &l.id == id))
-                .collect(),
+        // Only this router's own logins, the ones still waiting for their URL and the ones
+        // whose URL was posted: the registry is process-wide, and an attached TUI's
+        // `zephyr.login_*` may hold a login with the same provider, or an id a channel guessed.
+        let own = |l: &&Login| match provider {
+            Some(p) => l.provider == p,
+            None => what.is_empty() || l.id == what,
         };
-        for id in ids {
-            let provider = self.logins.iter().find(|l| l.id == id).map(|l| l.provider);
+        let mine: Vec<(String, &'static str)> = (self.logins.iter().chain(&self.posted))
+            .filter(own)
+            .map(|l| (l.id.clone(), l.provider))
+            .collect();
+        for (id, provider) in mine {
             // Read before the cancel: `cancel` takes the entry out of the registry.
             let account = crate::auth::poll(&id)
                 .and_then(|l| l["account"].as_str().map(str::to_string))
@@ -3127,11 +3119,10 @@ impl<'a> Router<'a> {
                 continue;
             }
             self.logins.retain(|l| l.id != id);
-            lines.push(match (provider, account) {
-                (Some(p), Some(a)) => format!("[zephyr] cancelled the sign-in to {p} as {a}"),
-                (Some(p), None) => format!("[zephyr] cancelled the sign-in to {p}"),
-                (None, Some(a)) => format!("[zephyr] cancelled the sign-in as {a}"),
-                (None, None) => "[zephyr] cancelled a sign-in".to_string(),
+            self.posted.retain(|l| l.id != id);
+            lines.push(match account {
+                Some(a) => format!("[zephyr] cancelled the sign-in to {provider} as {a}"),
+                None => format!("[zephyr] cancelled the sign-in to {provider}"),
             });
         }
         if lines.is_empty() {
