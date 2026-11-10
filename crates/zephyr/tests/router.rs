@@ -2025,7 +2025,8 @@ async fn an_ordinary_error_does_not_fail_over() {
 #[tokio::test]
 async fn every_account_cooling_holds_the_inbox_until_the_earliest_reset() {
     let home = home("failover-all");
-    let reset = zephyr::now() + 3;
+    // Far enough out that a loaded machine fails over to b and back before a resets.
+    let reset = zephyr::now() + 6;
     rate_limit(&home, "a", &format!("rate_limited; resets_at={reset}"));
     rate_limit(
         &home,
