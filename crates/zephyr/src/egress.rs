@@ -1988,6 +1988,11 @@ table inet zephyr {
         let e = direct_refused(addr, wait).unwrap_err();
         assert!(e.contains("connected"), "{e}");
         drop(listener);
+        // A port held but not listening refuses, and no other test can take it meanwhile (a
+        // dropped listener's port could be bound again by one running beside this).
+        let closed = tokio::net::TcpSocket::new_v4().unwrap();
+        closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = closed.local_addr().unwrap();
         assert_eq!(direct_refused(addr, wait), Ok(()));
     }
 
