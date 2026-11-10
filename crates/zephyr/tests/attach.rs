@@ -1219,6 +1219,31 @@ async fn settings_name_each_connector_row() {
 }
 
 #[tokio::test]
+async fn goals_lists_open_and_recently_done_goals() {
+    let gw = start("goals");
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    let empty = c.call("zephyr.goals", json!({})).await;
+    assert_eq!(empty["result"], json!({"goals": []}), "{empty}");
+    gw.say("m1", "/goal add Renew passport").await;
+    gw.say("m2", "/goal add Ship zephyr 0.8").await;
+    gw.say("m3", "/goal done 1").await;
+    let goals = gw.home.join("GOALS.md");
+    wait(|| std::fs::read_to_string(&goals).is_ok_and(|g| g == "Ship zephyr 0.8\n")).await;
+    let got = c.call("zephyr.goals", json!({})).await;
+    assert_eq!(
+        got,
+        json!({"jsonrpc": "2.0", "id": got["id"], "result": {"goals": [
+            {"n": 1, "text": "Ship zephyr 0.8", "done": false},
+            {"n": null, "text": "Renew passport", "done": true}]}})
+    );
+    // Params may be absent.
+    let bare = c.call("zephyr.goals", Value::Null).await;
+    assert_eq!(bare["result"], got["result"]);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn settings_set_answers_changed_or_refused() {
     let gw = start("settings-set");
     let mut c = Client::connect(gw.port).await;

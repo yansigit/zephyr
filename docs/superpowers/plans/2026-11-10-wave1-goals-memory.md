@@ -335,8 +335,8 @@ Deviation: the router restarts the child after any change saved at once (`auto` 
   // errors: -32000 "gateway is shutting down" | -32000 "reading the goals failed: <error>"
   ```
 
-- [ ] **Step 1: Write the failing test** `goals_lists_open_and_recently_done_goals` in `tests/attach.rs` (two goals added, one done through `/goal done 1` → exactly the shape above with the remaining goal as `n: 1`).
-- [ ] **Step 2:** `cargo test -p zephyr --test attach goals` → FAIL (`-32601`).
-- [ ] **Step 3:** Implement as a router round trip, as `zephyr.settings`.
-- [ ] **Step 4:** `cargo test -p zephyr --test attach` → PASS; `cargo test` → PASS.
-- [ ] **Step 5:** DESIGN §4.3.1. Commit `feat(attach): serve the owner's goals to clients`.
+- [x] **Step 1: Write the failing test** `goals_lists_open_and_recently_done_goals` in `tests/attach.rs` (two goals added, one done through `/goal done 1` → exactly the shape above with the remaining goal as `n: 1`).
+- [x] **Step 2:** `cargo test -p zephyr --test attach goals` → FAIL (`-32601`).
+- [x] **Step 3:** Implement as a router round trip, as `zephyr.settings`.
+- [x] **Step 4:** `cargo test -p zephyr --test attach` → PASS; `cargo test` → PASS.
+- [x] **Step 5:** DESIGN §4.3.1. Commit `feat(attach): serve the owner's goals to clients`.

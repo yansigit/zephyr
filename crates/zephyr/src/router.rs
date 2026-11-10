@@ -1366,6 +1366,9 @@ impl<'a> Router<'a> {
             AttachRequest::Settings(tx) => {
                 let _ = tx.send(self.settings_json());
             }
+            AttachRequest::Goals(tx) => {
+                let _ = tx.send(self.goals_json());
+            }
             AttachRequest::SettingsSet {
                 key,
                 value,
@@ -1426,6 +1429,23 @@ impl<'a> Router<'a> {
             })
             .collect();
         json!({"sections": sections, "strong_channels": strong})
+    }
+
+    /// `zephyr.goals`: the open goals in file order, then those done since the last review,
+    /// newest first. Changes go through the `/goal` commands, as text.
+    fn goals_json(&self) -> Result<Value, String> {
+        let failed = |e: String| format!("reading the goals failed: {e}");
+        let open = crate::memory::read_goals(self.cfg.state_dir())
+            .map_err(|e| failed(format!("{e:#}")))?;
+        let since = crate::review::since(&self.store, crate::now());
+        let done = self
+            .store
+            .goals_done_since(since)
+            .map_err(|e| failed(e.to_string()))?;
+        let open = (open.iter().enumerate())
+            .map(|(i, text)| json!({"n": i + 1, "text": text, "done": false}));
+        let done = (done.iter().rev()).map(|d| json!({"n": null, "text": d.text, "done": true}));
+        Ok(json!({"goals": open.chain(done).collect::<Vec<_>>()}))
     }
 
     /// `zephyr.settings_set`: `/set KEY VALUE [for D]` as the owner on the TUI, answered as data.

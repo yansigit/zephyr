@@ -70,6 +70,8 @@ pub enum AttachRequest {
         query: crate::activity::Query,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    /// `zephyr.goals`: the open goals, then those done since the last review (read-only).
+    Goals(oneshot::Sender<Result<Value, String>>),
     /// `zephyr.decide`: `/ok N` (`ok`, `once`), `/no N` (`no`) or `/cancel N` (`cancel`) as the
     /// owner on the TUI.
     Decide {
@@ -374,6 +376,14 @@ impl Conn {
                 let (tx, rx) = oneshot::channel();
                 let req = AttachRequest::Activity { query, reply: tx };
                 match (self.router.send(req).await, rx.await) {
+                    (Ok(()), Ok(Ok(value))) => (vec![ok(id, value)], false),
+                    (Ok(()), Ok(Err(why))) => (vec![error(id, -32000, &why)], false),
+                    _ => (vec![error(id, -32000, "gateway is shutting down")], true),
+                }
+            }
+            "zephyr.goals" => {
+                let (tx, rx) = oneshot::channel();
+                match (self.router.send(AttachRequest::Goals(tx)).await, rx.await) {
                     (Ok(()), Ok(Ok(value))) => (vec![ok(id, value)], false),
                     (Ok(()), Ok(Err(why))) => (vec![error(id, -32000, &why)], false),
                     _ => (vec![error(id, -32000, "gateway is shutting down")], true),
