@@ -282,8 +282,10 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         let revoked = ["/approvals forget", "/set ", "/job rm"]
                             .iter()
                             .any(|c| command.starts_with(c));
-                        if ev["type"] == "zephyr_reply" && revoked && settings {
-                            let _ = prompt_tx.send(Ask::Activity { grants: true, before: None });
+                        let open = s.overlay.as_ref().filter(|o| o.kind == Kind::Settings);
+                        if let Some(o) = open.filter(|_| ev["type"] == "zephyr_reply" && revoked) {
+                            let generation = o.settings.generation;
+                            let _ = prompt_tx.send(Ask::Activity { grants: true, before: None, generation });
                         }
                     }
                     Msg::Sessions(list) => s.sessions = list,
@@ -422,11 +424,11 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                             o.settings.load_waiting(&v);
                         }
                     }
-                    Msg::Activity { grants, append, answer } => {
+                    Msg::Activity { grants, append, generation, answer } => {
                         if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Settings) {
                             match grants {
-                                true => o.settings.load_grants(&answer),
-                                false => o.settings.load_activity(&answer, append),
+                                true => o.settings.load_grants(&answer, generation),
+                                false => o.settings.load_activity(&answer, append, generation),
                             }
                         }
                     }
@@ -634,8 +636,9 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                         let _ = prompt_tx.send(Ask::FactsRm(name));
                                     }
                                     Action::ActivityPage(before) => {
+                                        let generation = s.overlay.as_ref().map_or(0, |o| o.settings.generation);
                                         let before = Some(before);
-                                        let _ = prompt_tx.send(Ask::Activity { grants: false, before });
+                                        let _ = prompt_tx.send(Ask::Activity { grants: false, before, generation });
                                     }
                                     // Typed as the owner on `tui`; the panel stays open, and the
                                     // reply reloads the grants.
@@ -1591,10 +1594,17 @@ fn open(
             let _ = asks.send(Ask::Proposals);
             let _ = asks.send(Ask::Models);
             let _ = asks.send(Ask::FactsList);
+            // Each opening is its own: an answer asked for by an earlier one is dropped.
+            static OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let generation = OPENED.fetch_add(1, Ordering::Relaxed);
+            if let Some(o) = s.overlay.as_mut() {
+                o.settings.generation = generation;
+            }
             for grants in [false, true] {
                 let _ = asks.send(Ask::Activity {
                     grants,
                     before: None,
+                    generation,
                 });
             }
         }

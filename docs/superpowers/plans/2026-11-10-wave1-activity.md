@@ -301,3 +301,15 @@ Deviation: the footer on Grants reads `r take it back` (the tab names it); help 
 Deviation: a new job's id is past every job and every run's `job_id` (`NEW_JOB_ID` in `add_job`/`propose_job`): with A4-5's `remove_job` keeping a removed job's runs, SQLite would otherwise give the highest removed id to the next job, which `claim_due` then dated from the old runs and could fire at once. Test `store::tests::a_new_job_never_takes_a_removed_jobs_id`.
 Deviation: a timed preset over an unset one reverts with `/set approvals.preset manual`, not `none` (spec §4.4 says `default` → `none`, but `approvals.preset` is a choice and refuses `none`; an unset preset reads as manual). Router test `a_timed_presets_revoke_works_when_sent`.
 Deviation: `/approvals forget N` answers with the target scrubbed and on one line (`forgetting_a_target_answers_on_one_line`); the daemon-shaped session fallback needs fewer than 6 digits, so no digits fact passes for an id.
+
+## PR #39 review fixes
+
+Deviation: an outbound row is confirmed by its call's end, never its start: `sent` once it ran, `held` when the gate holds it (the plugin's block, found through `held_for_call`, or main's `exec` held in `Router::exec`), `refused` when the gate denies main's `exec`, `error` when it failed or was blocked; a row whose end never came stays `started` and reads `out … unconfirmed`. The start's row ids wait for the end in `scheduler::OUTBOUND`, by tool call id (no schema change). `fake-rpi.py`'s `bash:` marker now sends the `tool_execution_end` real rpi sends.
+Deviation: `/job rm` refuses while a run of the job is in progress (`JobRemoval::Running`), so `interrupt_running_runs`' notice, which joins `jobs`, is never lost.
+Deviation: the grants view lists only the time limits whose revert is stricter by `settings::tighter` (an approval class going back to unset is compared as the preset's mode), and offers a revoke only when the value it sends reads as it is; otherwise the line ends `set KEY back by hand` and `revoke` is `null`.
+Deviation: `Store::activity` reads only the tables the asked kinds come from, each branch bounded by the window and the cursor (`audit` through `audit_ts`).
+Deviation: the TUI keeps `activity_next` when an appended page fails (asked again at the next move to the bottom), and drops activity answers from an earlier opening of the panel (`SettingsPanel::generation`).
+Skipped: README's `zephyr status` row ("counts of job runs, tasks and processes over the last 90 days") is accurate: `main.rs` prints every `Store::counts` row, `runs`, `tasks` and `procs` among them, and those tables are now kept 90 days.
+Skipped (a known limit): a row that changes while the owner pages back moves above the cursor and shows at the next reload, not on the page being read.
+Skipped: soft-deleting jobs instead of keeping orphan runs needs a schema change, and A4 takes no schema version.
+Skipped: `/approvals forget N` uses the rowid, which only a backup restore could renumber; forgetting the wrong row only makes the gate ask again.

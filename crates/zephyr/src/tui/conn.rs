@@ -219,6 +219,8 @@ pub enum Ask {
     Activity {
         grants: bool,
         before: Option<String>,
+        /// The panel's opening that asks, handed back with the answer.
+        generation: u64,
     },
     /// `zephyr.facts_list`; this and the two below are answered with [`Msg::Facts`].
     FactsList,
@@ -286,10 +288,15 @@ impl std::fmt::Debug for Ask {
             // `Fact`'s own Debug prints only the value's length.
             Ask::FactsPut(fact) => f.debug_tuple("FactsPut").field(fact).finish(),
             Ask::FactsRm(name) => f.debug_tuple("FactsRm").field(name).finish(),
-            Ask::Activity { grants, before } => f
+            Ask::Activity {
+                grants,
+                before,
+                generation,
+            } => f
                 .debug_struct("Activity")
                 .field("grants", grants)
                 .field("before", before)
+                .field("generation", generation)
                 .finish(),
         }
     }
@@ -345,6 +352,7 @@ pub enum Msg {
     Activity {
         grants: bool,
         append: bool,
+        generation: u64,
         answer: Value,
     },
     /// The private facts, after a `zephyr.facts_*` call: names, kinds and allowed targets.
@@ -565,14 +573,25 @@ async fn session(
                     let id = rpc.request("zephyr.decide", params).await?;
                     pending.insert(id, Pending::Decide);
                 }
-                Some(Ask::Activity { grants, before }) => {
+                Some(Ask::Activity {
+                    grants,
+                    before,
+                    generation,
+                }) => {
                     let params = match grants {
                         true => json!({"kind": "grants"}),
                         false => json!({"before": before}),
                     };
                     let id = rpc.request("zephyr.activity", params).await?;
                     let append = before.is_some();
-                    pending.insert(id, Pending::Activity { grants, append });
+                    pending.insert(
+                        id,
+                        Pending::Activity {
+                            grants,
+                            append,
+                            generation,
+                        },
+                    );
                 }
                 Some(Ask::FactsList) => {
                     let id = rpc.request("zephyr.facts_list", json!({})).await?;
@@ -623,6 +642,7 @@ enum Pending {
     Activity {
         grants: bool,
         append: bool,
+        generation: u64,
     },
 }
 
@@ -729,9 +749,14 @@ fn answer(what: Pending, mut v: Value) -> Option<Msg> {
             Some(why) => Msg::FactsError(why),
             None => Msg::Facts(serde_json::from_value(result["facts"].take()).unwrap_or_default()),
         },
-        Pending::Activity { grants, append } => Msg::Activity {
+        Pending::Activity {
             grants,
             append,
+            generation,
+        } => Msg::Activity {
+            grants,
+            append,
+            generation,
             answer: match (v["error"]["code"].as_i64(), error) {
                 (Some(METHOD_NOT_FOUND), _) => json!({"entries": [], "next": null, "old": true}),
                 (_, Some(why)) => json!({"error": why}),

@@ -3678,7 +3678,7 @@ mod tests {
     fn activity_mutes_tool_rows_and_asks_for_the_next_page_at_the_bottom() {
         let s = snap();
         let mut o = settings_panel();
-        o.settings.load_activity(&activity_answer(), false);
+        o.settings.load_activity(&activity_answer(), false, 0);
         // Activity and Grants follow Waiting.
         hit(&mut o, &s, KeyCode::End);
         hit(&mut o, &s, KeyCode::Up);
@@ -3721,7 +3721,7 @@ mod tests {
             "status": "completed", "text": "morning-brief",
             "line": "13:00 job #3 run 88 completed: morning-brief", "stream": false}]);
         page2["next"] = serde_json::Value::Null;
-        o.settings.load_activity(&page2, true);
+        o.settings.load_activity(&page2, true, 0);
         let got = draw(&mut o, &s, 100, 20);
         assert!(
             got[4].contains("13:00 job #3 run 88 completed: morning-brief"),
@@ -3739,7 +3739,7 @@ mod tests {
     fn r_on_a_grant_sends_its_revoke() {
         let s = snap();
         let mut o = settings_panel();
-        o.settings.load_grants(&grants_answer());
+        o.settings.load_grants(&grants_answer(), 0);
         hit(&mut o, &s, KeyCode::End);
         let got = draw(&mut o, &s, 100, 20);
         assert!(got[7].starts_with("│ › Grants"), "{got:?}");
@@ -3777,8 +3777,8 @@ mod tests {
         let s = snap();
         let mut o = settings_panel();
         let old = serde_json::json!({"entries": [], "next": null, "old": true});
-        o.settings.load_activity(&old, false);
-        o.settings.load_grants(&old);
+        o.settings.load_activity(&old, false, 0);
+        o.settings.load_grants(&old, 0);
         hit(&mut o, &s, KeyCode::End);
         hit(&mut o, &s, KeyCode::Up);
         let got = draw(&mut o, &s, 100, 20);
@@ -3793,5 +3793,48 @@ mod tests {
             got[1].contains("this zephyr keeps no activity record; zephyr upgrade"),
             "{got:?}"
         );
+    }
+
+    /// PR #39 review: a failed page keeps the cursor of the page it asked for, so reaching the
+    /// bottom again asks again; an answer to a panel opened before this one is dropped.
+    #[test]
+    fn a_failed_or_stale_activity_page_never_loses_or_mixes_rows() {
+        let s = snap();
+        let mut o = settings_panel();
+        o.settings.generation = 7;
+        o.settings.load_activity(&activity_answer(), false, 7);
+        hit(&mut o, &s, KeyCode::End);
+        hit(&mut o, &s, KeyCode::Up);
+        hit(&mut o, &s, KeyCode::Right);
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::End),
+            Action::ActivityPage("5.audit.9".into())
+        );
+        o.settings.load_activity(
+            &serde_json::json!({"error": "the gateway is busy"}),
+            true,
+            7,
+        );
+        hit(&mut o, &s, KeyCode::Up);
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Down),
+            Action::ActivityPage("5.audit.9".into()),
+            "asked again after the failure"
+        );
+        let got = draw(&mut o, &s, 100, 20);
+        assert!(
+            got.iter().any(|l| l.contains("the gateway is busy")),
+            "{got:?}"
+        );
+        // A page from the panel opened before this one is not this panel's.
+        let mut stale = activity_answer();
+        stale["entries"] = serde_json::json!([{"at": 0, "kind": "job", "subject": "#9",
+            "status": "completed", "text": "old", "line": "09:00 job #9 run 1 completed: old",
+            "stream": false}]);
+        o.settings.load_activity(&stale, true, 6);
+        o.settings.load_grants(&grants_answer(), 6);
+        let got = draw(&mut o, &s, 100, 20);
+        assert!(!got.iter().any(|l| l.contains("job #9 run 1")), "{got:?}");
+        assert_eq!(o.settings.grants, None, "{got:?}");
     }
 }

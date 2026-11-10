@@ -298,6 +298,9 @@ pub struct SettingsPanel {
     /// Why the Activity or the Grants tab has nothing to show.
     activity_note: Option<String>,
     grants_note: Option<String>,
+    /// Which opening of the panel this is: an activity answer asked for by an earlier one is
+    /// not this panel's, and is dropped.
+    pub generation: u64,
 }
 
 /// An edit of one setting, in the editor its kind takes.
@@ -558,8 +561,16 @@ impl SettingsPanel {
 
     /// Takes a `zephyr.activity` page: the first replaces what is shown, a later one (`append`,
     /// asked with `before`) goes under it.
-    pub fn load_activity(&mut self, v: &Value, append: bool) {
+    pub fn load_activity(&mut self, v: &Value, append: bool, generation: u64) {
+        if generation != self.generation {
+            return;
+        }
         self.activity_note = record_note(v);
+        if append && v.get("error").is_some() {
+            // The page is still to come: kept, and asked for again at the next move to the bottom.
+            self.activity_asked = None;
+            return;
+        }
         let rows = (v["entries"].as_array().into_iter().flatten()).map(|e| {
             (
                 line(e["line"].as_str().unwrap_or_default()),
@@ -577,7 +588,10 @@ impl SettingsPanel {
     }
 
     /// Takes `zephyr.activity`'s grants: each line and its revoke.
-    pub fn load_grants(&mut self, v: &Value) {
+    pub fn load_grants(&mut self, v: &Value, generation: u64) {
+        if generation != self.generation {
+            return;
+        }
         self.grants_note = record_note(v);
         let rows = (v["entries"].as_array().into_iter().flatten()).map(|e| {
             let text = |k: &str| line(e[k].as_str().unwrap_or_default());
