@@ -1788,6 +1788,24 @@ fn footer(a: &Action, cfg: &Config, class: Option<Class>) -> String {
     line
 }
 
+/// What a passkey signs of a card (DESIGN §4.3.3): the card without the time left on its last
+/// line, which changes by itself and would undo a signature made a moment earlier. Only the
+/// last line, the daemon's own, is touched.
+pub fn signed(card: &str) -> String {
+    let (head, last) = match card.rsplit_once('\n') {
+        Some((head, last)) => (Some(head), last),
+        None => (None, card),
+    };
+    let kept: Vec<&str> = (last.split(" · "))
+        .filter(|part| !part.starts_with("expires in "))
+        .collect();
+    let last = kept.join(" · ");
+    match head {
+        Some(head) => format!("{head}\n{last}"),
+        None => last,
+    }
+}
+
 /// The subject and the first lines of the message a send carries in its own text: a heredoc's
 /// headers and body, or `-H "Subject: …"`. `None` for each that is not there.
 fn mail_parts(command: &str) -> (Option<String>, Option<String>) {
@@ -2815,6 +2833,22 @@ mod tests {
             "{card}"
         );
         assert!(card.ends_with("expires in 10 min"), "{card}");
+        // What a passkey signs is the card without the time left, which changes by itself.
+        let signed = signed(&card);
+        assert!(!signed.contains("expires in"), "{signed}");
+        assert_eq!(format!("{signed} · expires in 10 min"), card);
+        let strong = "a\n/ok 6 · /no 6 · expires in 24 h · this one needs tui or chat";
+        assert_eq!(
+            super::signed(strong),
+            "a\n/ok 6 · /no 6 · this one needs tui or chat"
+        );
+        // Only the daemon's own last line is touched; a one-line command card not at all.
+        let quoted = "said: \"x · expires in 1 h\"\n/ok 6 · /no 6 · expires in 2 h";
+        assert_eq!(
+            super::signed(quoted),
+            "said: \"x · expires in 1 h\"\n/ok 6 · /no 6"
+        );
+        assert_eq!(super::signed("/new"), "/new");
         assert_eq!(
             outcomes(&h.store),
             ["auto", "auto", "auto", "held", "held", "held", "held", "held", "held"]

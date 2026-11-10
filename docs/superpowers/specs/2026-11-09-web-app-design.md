@@ -615,3 +615,27 @@ Each piece starts with a failing test (CLAUDE.md, DESIGN §6).
 3. Swipe-to-deny stays (Android only).
 4. Goals come from B's read-only `zephyr.goals` method; changes are sent as `/goal` commands.
 5. Passkey receipts (the signature and what it signed) are not stored yet.
+
+## Deviations and known limits, as built (2026-11-10, after review)
+
+1. **What is signed is the card without its countdown.** `card_sha256` is over `zephyr.proposals`'
+   `signed`, the card less `expires in N h` on its last line (§4.5 says "the card"). The time
+   left changes by itself, so a hash over it refused signatures made just before it changed.
+2. **Typed approvals are refused on `web`.** §4.3 lets the cookie do "everything" a weak channel
+   does; as built, `/ok`, `/vault grant`, `/memory ok`, `/job ok`, `/skill ok` and `/mcp ok` typed
+   in the app answer "approve with your passkey". Only the notification button approves on the
+   cookie, and only a message or post that needs no strong channel (§4.7).
+3. **The sign count follows WebAuthn §7.2**, not §4.5's wording: once the stored or the new count
+   is not zero, the new one must be greater.
+4. **Challenge ids are random**, a finish by the wrong owner leaves a challenge alone, and a
+   sign-in start is turned away when 16 wait instead of evicting the oldest (§4.5, §4.6). Starts
+   are not counted in the 20 a minute; the code check and the finishes are.
+5. **Remaining limit under host networking.** The sign-in limits are global (§4.6): every request
+   comes from 127.0.0.1, so they cannot tell the owner from anything else that reaches the port.
+   Under `--network host` the agent, or another user of the host, can keep enrolment and sign-in
+   closed (five failed finishes every 15 minutes) or keep 16 sign-ins waiting. It cannot sign in,
+   enrol or use a session, open sessions keep working, and the owner is told of each lockout.
+   Under A2's bridge network the agent's uid cannot reach the port. No per-client limit is
+   possible behind `tailscale serve` without trusting a header the agent can forge.
+6. **HTTP keep-alive stays on** (§4.1 says `keep_alive(false)`): with it off hyper answers the
+   WebSocket upgrade `Connection: Upgrade, close`.

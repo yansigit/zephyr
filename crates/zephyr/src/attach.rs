@@ -1008,6 +1008,16 @@ async fn next_live(
     }
 }
 
+/// The channel whose rows a decision made on `channel` belongs to: `passkey`, a signed decision
+/// in the web app, has no inbox or outbox rows of its own, so its notices are `web`'s.
+pub fn rows(channel: &str) -> &str {
+    if channel == "passkey" {
+        WEB
+    } else {
+        channel
+    }
+}
+
 /// Who an attached client's messages are from: the attach token's holder, or the web session's.
 pub fn sender(channel: &str) -> &'static str {
     if channel == WEB {

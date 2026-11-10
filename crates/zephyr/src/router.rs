@@ -256,6 +256,22 @@ pub enum Exit {
     Reexec,
 }
 
+/// What a typed approval gets on channel `web`.
+const WEB_APPROVAL: &str = "[zephyr] approve with your passkey: open the card in the app. \
+    A typed /ok, /vault grant, /memory ok, /job ok, /skill ok or /mcp ok is taken on your other channels";
+
+/// Whether the owner's `text` approves or grants something: the commands the web app takes
+/// only signed, never typed.
+fn approves(text: &str) -> bool {
+    let mut words = text.split_whitespace();
+    matches!(
+        (words.next(), words.next()),
+        (Some("/ok"), _)
+            | (Some("/vault"), Some("grant"))
+            | (Some("/memory" | "/job" | "/skill" | "/mcp"), Some("ok"))
+    )
+}
+
 /// Runs the gateway until `shutdown` resolves, then drains. Every channel feeds one main session.
 pub async fn run<C: Channel>(
     cfg: &Config,
@@ -1306,14 +1322,19 @@ impl<'a> Router<'a> {
         if self.web.is_none() || after == i64::MAX {
             return;
         }
-        let all = self.proposals_json();
-        let mut newest = after;
-        for p in all["proposals"].as_array().into_iter().flatten() {
-            let id = p["id"].as_i64().unwrap_or(0);
-            newest = newest.max(id);
-            if id <= after || p["status"] != "pending" {
+        // Called on every publish and tick: nothing is built unless something new waits.
+        let Ok(waiting) = self.store.pending_proposals() else {
+            return;
+        };
+        let newest = waiting.iter().map(|p| p.id).max().unwrap_or(0);
+        if newest <= after {
+            return;
+        }
+        for p in waiting {
+            if p.id <= after || p.status != "pending" {
                 continue;
             }
+            let (id, p) = (p.id, self.proposal_json(p));
             let (class, summary) = (p["class"].as_str(), p["summary"].as_str());
             let body = match (class, summary) {
                 (Some(class), Some(summary)) => format!("{class}: {summary}"),
@@ -1620,57 +1641,61 @@ impl<'a> Router<'a> {
     /// `once` says whether `/ok N once` differs from `/ok N` for it now (its class asks only
     /// about new targets), and `strong` whether only a strong channel may approve it.
     fn proposals_json(&self) -> Value {
-        let now = crate::now();
         let list = self.store.pending_proposals().unwrap_or_else(|e| {
             eprintln!("zephyr: reading proposals failed: {e}");
             vec![]
         });
-        let e = crate::approvals::effective(&self.cfg);
-        let money_strong = (crate::approvals::strong_only(&self.cfg).iter()).any(|s| s == "money");
-        let proposals: Vec<Value> = (list.into_iter())
-            .map(|p| {
-                // An action's stored summary, until its card is read below (R70).
-                let card = match p.kind.as_str() {
-                    "command" => p.command.clone(),
-                    _ => crate::facts::scrubbed(&self.cfg, p.command.clone()),
-                };
-                let mut v = json!({
-                    "id": p.id,
-                    "card": card,
-                    "kind": if p.kind != "command" {
-                        p.kind.as_str()
-                    } else if p.key.is_some() {
-                        "setting"
-                    } else {
-                        "command"
-                    },
-                    "status": p.status,
-                    "due_at": p.due_at,
-                    "key": p.key,
-                    "age_secs": (now - p.created_at).max(0),
-                    "expires_in_secs": (p.created_at + 86_400 - now).max(0),
-                    "strong": p.strong,
-                });
-                let action = (p.kind != "command")
-                    .then(|| self.store.action(p.id).ok().flatten())
-                    .flatten();
-                if let Some(a) = action {
-                    // A browser action waits 10 minutes, not a day (spec §4.6).
-                    if a.kind == crate::store::ActionKind::Wait {
-                        let wait = 60 * i64::from(crate::gate::WAIT_MINUTES);
-                        v["expires_in_secs"] = json!((a.created_at + wait - now).max(0));
-                    }
-                    v["card"] = json!(crate::gate::card(&a, &self.cfg, &self.store));
-                    // R70: the summary as the private facts are now.
-                    v["summary"] = json!(crate::facts::scrubbed(&self.cfg, a.summary.clone()));
-                    v["strong"] = json!(a.class == "money" && money_strong);
-                    v["once"] = json!(crate::gate::asks_new(&e, &a.class));
-                    v["class"] = json!(a.class);
-                }
-                v
-            })
-            .collect();
+        let proposals: Vec<Value> = list.into_iter().map(|p| self.proposal_json(p)).collect();
         json!({"proposals": proposals})
+    }
+
+    /// One waiting proposal, as `zephyr.proposals` lists it. `signed` is its card without the
+    /// time left (`gate::signed`): what the web app shows as the card and a passkey signs.
+    fn proposal_json(&self, p: crate::store::PendingProposal) -> Value {
+        let now = crate::now();
+        // An action's stored summary, until its card is read below (R70).
+        let card = match p.kind.as_str() {
+            "command" => p.command.clone(),
+            _ => crate::facts::scrubbed(&self.cfg, p.command.clone()),
+        };
+        let mut v = json!({
+            "id": p.id,
+            "card": card,
+            "kind": if p.kind != "command" {
+                p.kind.as_str()
+            } else if p.key.is_some() {
+                "setting"
+            } else {
+                "command"
+            },
+            "status": p.status,
+            "due_at": p.due_at,
+            "key": p.key,
+            "age_secs": (now - p.created_at).max(0),
+            "expires_in_secs": (p.created_at + 86_400 - now).max(0),
+            "strong": p.strong,
+        });
+        let action = (p.kind != "command")
+            .then(|| self.store.action(p.id).ok().flatten())
+            .flatten();
+        if let Some(a) = action {
+            // A browser action waits 10 minutes, not a day (spec §4.6).
+            if a.kind == crate::store::ActionKind::Wait {
+                let wait = 60 * i64::from(crate::gate::WAIT_MINUTES);
+                v["expires_in_secs"] = json!((a.created_at + wait - now).max(0));
+            }
+            let e = crate::approvals::effective(&self.cfg);
+            let money_strong =
+                (crate::approvals::strong_only(&self.cfg).iter()).any(|s| s == "money");
+            v["card"] = json!(crate::gate::card(&a, &self.cfg, &self.store));
+            // R70: the summary as the private facts are now.
+            v["summary"] = json!(crate::facts::scrubbed(&self.cfg, a.summary.clone()));
+            v["strong"] = json!(a.class == "money" && money_strong);
+            v["once"] = json!(crate::gate::asks_new(&e, &a.class));
+            v["class"] = json!(a.class);
+        }
+        v["signed"] = json!(crate::gate::signed(v["card"].as_str().unwrap_or_default()));
+        v
     }
 
     /// `zephyr.decide`: `/ok N`, `/no N` or `/cancel N` from an attached client, through the
@@ -1706,13 +1731,13 @@ impl<'a> Router<'a> {
         done
     }
 
-    /// A waiting proposal's card, as `zephyr.proposals` gives it now, and its digest.
+    /// What a passkey signs of a waiting proposal: its card as `zephyr.proposals` gives it
+    /// now, less the time left (`signed`), and its digest. Only that proposal is built.
     fn card(&self, id: i64) -> Option<(String, [u8; 32])> {
-        let all = self.proposals_json();
-        let card =
-            (all["proposals"].as_array()?.iter()).find(|p| p["id"] == id)?["card"].as_str()?;
+        let waiting = self.store.pending_proposals().ok()?;
+        let p = self.proposal_json(waiting.into_iter().find(|p| p.id == id)?);
         let digest = self.store.proposal_digest(id).ok()??;
-        Some((card.to_string(), digest))
+        Some((p["signed"].as_str()?.to_string(), digest))
     }
 
     async fn decide_as(&mut self, id: i64, verb: &str, channel: &'static str) -> Value {
@@ -1730,20 +1755,18 @@ impl<'a> Router<'a> {
             "once" => format!("/ok {id} once"),
             _ => format!("/ok {id}"),
         };
-        let rows = if channel == "passkey" {
-            crate::attach::WEB
-        } else {
-            channel
-        };
+        // An approved command runs as whoever approved it: a signed approval as `passkey`,
+        // or its `/set` or `/facts rm` would be refused as the weak `web` after the proposal
+        // was settled. The commands an agent can propose write no rows of their own.
         let m = Inbound {
-            channel: rows.into(),
+            channel: channel.into(),
             platform_msg_id: String::new(),
-            sender: crate::attach::sender(rows).into(),
+            sender: crate::attach::sender(crate::attach::rows(channel)).into(),
             text: text.clone(),
         };
-        let mut approving = None;
+        let (mut approving, mut key) = (None, None);
         let decided = crate::tools::decide(&self.cfg, &self.store, &text, |p| {
-            approving = Some(p.id);
+            (approving, key) = (Some(p.id), p.key.clone());
             self.not_now(p, channel)
         });
         let (ok, reply) = match decided {
@@ -1765,7 +1788,16 @@ impl<'a> Router<'a> {
                 self.approving = None;
                 let reply = reply.unwrap_or_default();
                 self.restart_if_idle().await;
-                (true, format!("[zephyr] {text} approved {command}\n{reply}"))
+                // Never `ok` with nothing applied: a `/set` the registry still refused says so.
+                let refused = command.starts_with("/set ")
+                    && key.is_some_and(|key| !crate::settings::is_change(&reply, &key));
+                match refused {
+                    true => (
+                        false,
+                        format!("[zephyr] {text} did not apply {command}\n{reply}"),
+                    ),
+                    false => (true, format!("[zephyr] {text} approved {command}\n{reply}")),
+                }
             }
             Some(Err(reply)) => {
                 self.settled_actions();
@@ -1951,10 +1983,15 @@ impl<'a> Router<'a> {
             log(self.store.deliver_after(id).map_err(Into::into));
         }
         let mut approving = None;
-        let decided = crate::tools::decide(&self.cfg, &self.store, m.text.trim(), |p| {
-            approving = Some(p.id);
-            self.not_now(p, &m.channel)
-        });
+        // Every approval made in the web app is signed with a passkey, on its card
+        // (`zephyr.decide`): typed over the socket, it would rest on the session cookie alone.
+        let decided = match m.channel == crate::attach::WEB && approves(m.text.trim()) {
+            true => Some(Err(WEB_APPROVAL.to_string())),
+            false => crate::tools::decide(&self.cfg, &self.store, m.text.trim(), |p| {
+                approving = Some(p.id);
+                self.not_now(p, &m.channel)
+            }),
+        };
         // A held action is carried out here, its answer the whole reply.
         let decided = decided.map(|d| match d {
             Ok(Decided::Command(command)) => Ok(command),
@@ -3439,11 +3476,7 @@ impl<'a> Router<'a> {
     /// the client is the owner (`attach` sends as `token`, or as `web`); a passkey-signed
     /// change was made in the web app.
     fn owner_on(&self, channel: &str) -> Option<(String, String)> {
-        let channel = if channel == "passkey" {
-            crate::attach::WEB
-        } else {
-            channel
-        };
+        let channel = crate::attach::rows(channel);
         if crate::attach::attached(channel) {
             return Some((channel.into(), crate::attach::sender(channel).into()));
         }
@@ -4387,10 +4420,18 @@ impl<'a> Router<'a> {
         // The web app's rows are handled the same way while one of its sockets is open, and
         // wait otherwise: its client may be a phone in a pocket.
         let web_open = self.web.as_ref().is_some_and(|hub| hub.connected() > 0);
+        // Only rows that still wait need remembering as pushed.
+        (self.pushed_replies).retain(|id| rows.iter().any(|r| r.id == *id));
         for row in (rows.iter()).filter(|r| crate::attach::attached(&r.channel)) {
+            if row.channel == crate::attach::WEB && self.web.is_none() {
+                // `[web]` is not set (any more): no socket will open to show this row, so it
+                // does not sit pending for its week.
+                log((self.store.set_outbox_status(row.id, "failed")).map_err(Into::into));
+                continue;
+            }
             if row.channel == crate::attach::WEB && !web_open {
                 // Nobody is looking: one push, and the row waits for the next socket.
-                if self.web.is_some() && self.pushed_replies.insert(row.id) {
+                if self.pushed_replies.insert(row.id) {
                     let reply = crate::web::push::reply(&row.text);
                     crate::web::push::spawn(self.cfg_tx.borrow().clone(), reply, "normal", 3600);
                 }

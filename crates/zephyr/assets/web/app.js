@@ -536,14 +536,19 @@
 
   // ---- the card sheet ----
 
+  // What the sheet shows and a passkey signs: the card without its countdown, which changes
+  // by itself and is shown apart, in the title.
+  const signedText = (p) => String(p.signed !== undefined ? p.signed : p.card || "");
+
   async function openSheet(p) {
-    const card = String(p.card || "");
-    // The hash is of the card as received: what the daemon will compare.
-    state.sheet = { id: p.id, card, hash: await sha256hex(card), strong: !!p.strong };
-    const lines = card.split("\n");
+    const text = signedText(p);
+    // The hash is of the text as received: what the daemon will compare.
+    state.sheet = { id: p.id, hash: await sha256hex(text), strong: !!p.strong };
+    const lines = text.split("\n");
     const at = lines.findIndex((line) => line.startsWith("the agent says: "));
     const reason = at >= 0 ? lines.splice(at, 1)[0] : null;
-    $("sheet-title").textContent = "#" + p.id;
+    const left = p.status === "scheduled" ? "" : " · expires in " + span(p.expires_in_secs);
+    $("sheet-title").textContent = "#" + p.id + left;
     $("sheet-card").textContent = clean(lines.join("\n"));
     $("sheet-reason").hidden = reason === null;
     $("sheet-reason").open = false;
@@ -567,7 +572,7 @@
     const sheet = state.sheet;
     if (!sheet || !$("sheet").open || $("sheet").classList.contains("stale")) return;
     const now = state.proposals.find((p) => p.id === sheet.id);
-    const same = now && (await sha256hex(String(now.card || ""))) === sheet.hash;
+    const same = now && (await sha256hex(signedText(now))) === sheet.hash;
     if (!same && state.sheet === sheet) staleSheet("this card changed or was handled; close and look again");
   }
 

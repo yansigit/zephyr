@@ -1204,28 +1204,19 @@ async fn web_signout_ends_every_session() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_unauthenticated_routes_take_20_a_minute() {
+async fn the_guessing_routes_take_20_a_minute() {
     let gw = start("rate");
     gw.up().await;
-    for n in 0..20 {
-        assert_eq!(
-            gw.post("/api/login/start", json!({})).await.status(),
-            200,
-            "{n}"
-        );
+    // A wrong code is an attempt; a sign-in merely started is not (it can guess nothing).
+    for n in 0..4 {
+        let wrong = gw.post("/api/enrol/start", json!({"code": "x"})).await;
+        assert_eq!(wrong.status(), 403, "{n}");
+        assert_eq!(gw.post("/api/login/start", json!({})).await.status(), 200);
     }
-    let over = gw.post("/api/login/start", json!({})).await;
-    assert_eq!(over.status(), 429);
-    assert_eq!(
-        over.json::<Value>().await.unwrap(),
-        json!({"error": "too many attempts; wait a minute"})
-    );
-    assert_eq!(
-        gw.post("/api/enrol/start", json!({"code": "x"}))
-            .await
-            .status(),
-        429
-    );
+    // The fifth failure closes sign-in; here the lockout is what answers.
+    let closed = gw.post("/api/enrol/start", json!({"code": "x"})).await;
+    assert_eq!(closed.status(), 403);
+    assert_eq!(gw.post("/api/login/start", json!({})).await.status(), 429);
     // The files and a signed-in browser's routes are not counted.
     assert_eq!(gw.get("/").await.status(), 200);
     let mut ws = gw.ws(&gw.cookie("phone")).await;
@@ -1342,7 +1333,8 @@ impl Ws {
     async fn card_hash(&mut self, id: i64) -> String {
         let all = self.rpc("zephyr.proposals", json!({})).await;
         let list = all["result"]["proposals"].as_array().unwrap();
-        let card = list.iter().find(|p| p["id"] == id).expect("it waits")["card"]
+        // What is signed: the card without its countdown.
+        let card = list.iter().find(|p| p["id"] == id).expect("it waits")["signed"]
             .as_str()
             .unwrap();
         data_encoding::HEXLOWER.encode(&sha256(card.as_bytes()))
@@ -1482,9 +1474,9 @@ async fn a_challenge_used_twice_is_refused() {
         answer["error"]["message"], "the passkey signature did not verify",
         "{answer}"
     );
-    // Another session cannot use this one's challenge.
+    // Another session cannot use this one's challenge, nor use it up.
     let mut ipad = gw.ws(&gw.cookie("ipad")).await;
-    let answer = ipad.rpc("zephyr.decide", two).await;
+    let answer = ipad.rpc("zephyr.decide", two.clone()).await;
     assert_eq!(
         answer["error"]["message"],
         "that signature expired or was used; tap again"
@@ -1493,6 +1485,8 @@ async fn a_challenge_used_twice_is_refused() {
         (gw.status(second), gw.ran().len()),
         ("pending".to_string(), 1)
     );
+    assert_eq!(ws.rpc("zephyr.decide", two).await["result"]["ok"], true);
+    assert_eq!(gw.ran().len(), 2);
     gw.shutdown().await;
 }
 
@@ -2092,5 +2086,239 @@ async fn a_subscription_outside_the_allowlist_is_refused() {
         .await,
         409
     );
+    gw.shutdown().await;
+}
+
+// ---- review of 91d0c76..98a575b ----
+
+impl Gateway {
+    /// Has the agent propose `command` through its `gateway` tool, and gives the proposal's id.
+    async fn proposed(&self, calls: &str) -> i64 {
+        self.say("chat", calls).await;
+        let card = self
+            .sent("chat", |t| {
+                t.contains("the agent proposes #") || t.contains("the agent asks to run")
+            })
+            .await;
+        let at = card.find('#').expect("a number") + 1;
+        let digits: String = card[at..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().unwrap()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signed_approval_of_a_strong_proposal_applies_it() {
+    let (gw, phone, mut ws) = signed_in("sign-strong", "").await;
+    // A loosening of a protected setting: only a strong channel may approve it.
+    let id = gw
+        .proposed(r#"[call gateway {"command": "/set approvals.messages auto"}] go"#)
+        .await;
+    let unsigned = ws
+        .rpc("zephyr.decide", json!({"id": id, "verb": "ok"}))
+        .await;
+    assert_eq!(unsigned["error"]["message"], "approve with your passkey");
+    let signed = ws.sign_decide(&phone, id, "ok").await;
+    let done = ws.rpc("zephyr.decide", signed).await["result"].take();
+    assert_eq!(done["ok"], true, "{done}");
+    let text = done["text"].as_str().unwrap();
+    assert!(
+        text.contains("approvals.messages") && text.contains(" → auto"),
+        "{text}"
+    );
+    let logged = gw
+        .store()
+        .last_setting_change("approvals.messages")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (logged.channel.as_deref(), logged.proposal),
+        (Some("passkey"), Some(id))
+    );
+    let file = std::fs::read_to_string(gw.home.join("zephyr.toml")).unwrap();
+    assert!(file.contains("messages = \"auto\""), "{file}");
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signed_approval_removes_a_private_fact() {
+    let (gw, phone, mut ws) = signed_in("sign-fact", "").await;
+    let calls = r#"[call gateway {"command": "/facts add pin digits 12345678"}] [call gateway {"command": "/facts rm pin"}] go"#;
+    let id = gw.proposed(calls).await;
+    const FACTS: &str = "zephyr.facts_list";
+    assert_eq!(
+        ws.rpc(FACTS, json!({})).await["result"]["facts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let signed = ws.sign_decide(&phone, id, "ok").await;
+    let done = ws.rpc("zephyr.decide", signed).await["result"].take();
+    assert_eq!(done["ok"], true, "{done}");
+    assert_eq!(
+        ws.rpc(FACTS, json!({})).await["result"]["facts"],
+        json!([]),
+        "{done}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn typed_approvals_on_web_are_refused() {
+    let (gw, _phone, mut ws) = signed_in("typed-ok", "").await;
+    ws.rpc("zephyr.subscribe", json!({})).await;
+    let id = gw.hold_send();
+    for typed in [
+        format!("/ok {id}"),
+        format!("/ok {id} once"),
+        "/vault grant login bank".to_string(),
+        "/memory ok".to_string(),
+        "/job ok 1".to_string(),
+        "/skill ok notes".to_string(),
+        "/mcp ok notes".to_string(),
+    ] {
+        ws.say(&typed).await;
+        let reply = ws
+            .event(|e| e["type"] == "zephyr_reply" && e["command"] == typed.as_str())
+            .await;
+        let text = reply["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("[zephyr] approve with your passkey"),
+            "{typed}: {text}"
+        );
+    }
+    assert_eq!((gw.status(id), gw.ran()), ("pending".to_string(), vec![]));
+    // Refusing takes nothing away from the check, so it is typed freely.
+    ws.say(&format!("/no {id}")).await;
+    let no = format!("/no {id}");
+    ws.event(|e| e["type"] == "zephyr_reply" && e["command"] == no.as_str())
+        .await;
+    assert_eq!(gw.status(id), "dropped");
+    // Elsewhere a typed /ok is what it always was.
+    let other = gw.hold_send();
+    gw.say("chat", &format!("/ok {other}")).await;
+    gw.sent("chat", |t| {
+        t.starts_with(&format!("[zephyr] approved #{other}"))
+    })
+    .await;
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn what_is_signed_holds_no_countdown() {
+    let (gw, phone, mut ws) = signed_in("sign-countdown", "").await;
+    let id = gw.hold_send();
+    let all = ws.rpc("zephyr.proposals", json!({})).await;
+    let p = &all["result"]["proposals"][0];
+    let (card, signed) = (p["card"].as_str().unwrap(), p["signed"].as_str().unwrap());
+    assert!(card.contains("expires in 24 h"), "{card}");
+    assert!(
+        !signed.contains("expires in") && signed.ends_with(&format!("/ok {id} · /no {id}")),
+        "{signed}"
+    );
+    assert_eq!(signed.lines().count(), card.lines().count());
+    // Signed with 24 h left, approved with 22 h left: the same text, so the same signature.
+    let signature = ws.sign_decide(&phone, id, "ok").await;
+    let db = rusqlite::Connection::open(gw.home.join("state.db")).unwrap();
+    db.execute(
+        "UPDATE proposals SET created_at = created_at - 7200 WHERE id = ?1",
+        [id],
+    )
+    .unwrap();
+    let later = ws.rpc("zephyr.proposals", json!({})).await;
+    assert!(later["result"]["proposals"][0]["card"]
+        .as_str()
+        .unwrap()
+        .contains("expires in 22 h"));
+    let done = ws.rpc("zephyr.decide", signature).await["result"].take();
+    assert_eq!(done["ok"], true, "{done}");
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_button_the_router_refuses_is_not_a_success() {
+    let service = PushService::start().await;
+    let (gw, cookie, _phone) = pushing("push-refused", "", &service).await;
+    let id = gw.hold_send();
+    gw.say("chat", "/pause").await;
+    gw.sent("chat", |t| t.contains("paused")).await;
+    let res = (gw
+        .req(reqwest::Method::POST, "/api/push/decide")
+        .header("Cookie", &cookie))
+    .json(&json!({"id": id, "verb": "ok"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        res.status(),
+        409,
+        "the service worker opens the app on a refusal"
+    );
+    let said: Value = res.json().await.unwrap();
+    assert_eq!(said["ok"], false, "{said}");
+    assert!(said["text"].as_str().unwrap().contains("paused"), "{said}");
+    assert_eq!((gw.status(id), gw.ran()), ("pending".to_string(), vec![]));
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flood_of_sign_in_starts_keeps_the_one_in_flight() {
+    let gw = start("flood");
+    gw.up().await;
+    let phone = Authenticator::new("phone-cred");
+    gw.enrol("phone", &phone).await;
+    // The owner's phone is showing its passkey prompt.
+    let start: Value = gw
+        .post("/api/login/start", json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let mut refused = 0;
+    for _ in 0..40 {
+        let res = gw.post("/api/login/start", json!({})).await;
+        match res.status().as_u16() {
+            200 => {}
+            429 => {
+                refused += 1;
+                let said: Value = res.json().await.unwrap();
+                assert_eq!(
+                    said,
+                    json!({"error": "too many sign-ins are waiting; try again in two minutes"})
+                );
+            }
+            other => panic!("{other}"),
+        }
+    }
+    assert_eq!(refused, 25, "16 wait at once: the owner's and 15 more");
+    // Starts that were never finished used up neither the owner's challenge nor the minute's
+    // attempts, and closed nothing.
+    let body = with(
+        phone.get(&start["publicKey"]),
+        json!({"challengeId": start["challengeId"]}),
+    );
+    let done = gw.post("/api/login/finish", body).await;
+    assert_eq!(done.status(), 200);
+    set_cookie(&done);
+    // A new device's enrolment, proven by its code, is never the one turned away.
+    let code = gw.enrol_code("ipad").await;
+    assert_eq!(
+        gw.post("/api/enrol/start", json!({"code": code}))
+            .await
+            .status(),
+        200
+    );
+    // The attempts that can guess something still take 20 a minute.
+    let mut over = 0;
+    for _ in 0..20 {
+        let res = gw
+            .post("/api/login/finish", json!({"challengeId": "nope"}))
+            .await;
+        over += usize::from(res.status() == 429);
+    }
+    assert!(over > 0, "finishes are counted");
     gw.shutdown().await;
 }

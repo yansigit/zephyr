@@ -424,7 +424,8 @@ A phone-first app the daemon serves itself, reached over your tailnet through `t
 
 - **Chat** with the live status line (`working · 0:24 · bash · 3 tools`), the reply as it is
   written, a turn's tools folded into one line, "take back" for a message still waiting, and Stop.
-- **Approvals**: the same cards your other channels get, in full. Approve and Approve once take
+- **Approvals**: the same cards your other channels get, in full. Approvals are made on the
+  card: a `/ok` typed into the app's chat is refused. Approve and Approve once take
   your passkey, and what you sign is that exact card: if it changes before you sign, the signature
   is refused and you are shown the new one. Deny needs no passkey. The agent's own stated reason
   is folded away under "the agent's reason (not checked)".

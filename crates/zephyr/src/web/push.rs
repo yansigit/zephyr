@@ -358,7 +358,12 @@ impl super::App {
             reply: tx,
         };
         match (self.handles.router.send(decide).await, rx.await) {
-            (Ok(()), Ok(done)) => super::json(StatusCode::OK, done),
+            // A refusal (paused, handled meanwhile, now strong) is not a 2xx: the service
+            // worker opens the app on it instead of leaving the owner to think it went through.
+            (Ok(()), Ok(done)) => match done["ok"] == true {
+                true => super::json(StatusCode::OK, done),
+                false => super::json(StatusCode::CONFLICT, done),
+            },
             _ => down(),
         }
     }

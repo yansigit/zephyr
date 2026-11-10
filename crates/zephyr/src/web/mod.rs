@@ -363,7 +363,7 @@ async fn route(req: Request<Incoming>, path: &str, app: &Arc<App>) -> Res {
             "/api/enrol/start" | "/api/enrol/finish" | "/api/login/start" | "/api/login/finish",
         ) => {
             // Before the body is read: a closed or flooded sign-in costs nothing more.
-            if let Some(res) = app.closed() {
+            if let Some(res) = app.closed(path != "/api/login/start") {
                 return res;
             }
             let Some(body) = body(req).await else {

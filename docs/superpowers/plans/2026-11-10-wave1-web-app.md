@@ -765,6 +765,17 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
 
 ---
 
+## After the review of 91d0c76..98a575b
+
+Fixed on this branch, each with a test that failed first (the spec's closing "Deviations and known limits" has the behaviour):
+
+- Deviation (W-7): an approved proposal's command runs as `passkey` (`attach::rows` maps its notices to `web`); a refused `/set` answers `ok: false`.
+- Deviation (W-5, spec §4.3): typed `/ok`, `/vault grant`, `/memory ok`, `/job ok`, `/skill ok`, `/mcp ok` are refused on `web`.
+- Deviation (W-7): the signed text is `signed`, the card without `expires in …`.
+- Deviation (W-2): challenge ids are random, a wrong owner's `take` leaves the entry, `try_issue` turns a new one away when full; the sign count follows WebAuthn §7.2.
+- Deviation (W-8): `/api/push/decide` answers 409 with the router's refusal; `push_cards` and `card()` build only what they need (no behaviour change, so no new test); `pushed_replies` is pruned to the rows still pending; without `[web]`, `web` rows are marked `failed`.
+- Deviation (W-6): `login/start` is not counted in the 20 a minute and is refused when 16 wait.
+
 ## Built against sibling lanes (run after the rebase onto A4, A2 and B)
 
 ### Task W-11: Activity tab (A4's `zephyr.activity`)

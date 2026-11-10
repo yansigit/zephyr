@@ -273,14 +273,16 @@ impl App {
 
     /// Before a ceremony: the 429 to answer while sign-in is closed (not counted) or past 20
     /// requests a minute.
-    pub(super) fn closed(&self) -> Option<Res> {
+    pub(super) fn closed(&self, counted: bool) -> Option<Res> {
         let mut limits = self.hub.limits.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         if let Some(at) = limits.closed(now) {
             let why = format!("sign-in is closed until {}", self.clock(at));
             return Some(error(StatusCode::TOO_MANY_REQUESTS, &why));
         }
-        let over = !limits.requests.hit(now);
+        // A sign-in merely started guesses nothing, so it is not an attempt: counting it let
+        // anything at the port use up the owner's minute. `login_start` bounds those itself.
+        let over = counted && !limits.requests.hit(now);
         over.then(|| {
             error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -438,10 +440,13 @@ impl App {
     /// is named: the passkey is discoverable.
     pub(super) fn login_start(&self) -> Res {
         let challenge: [u8; 32] = random();
-        let id = self
-            .hub
-            .ceremonies
-            .issue(NOBODY, Ceremony::Login, challenge);
+        // Anyone at the port may start a sign-in. When 16 wait, a new one is turned away
+        // rather than push out one in flight, which may be the owner's.
+        let issued = (self.hub.ceremonies).try_issue(NOBODY, Ceremony::Login, challenge);
+        let Some(id) = issued else {
+            let why = "too many sign-ins are waiting; try again in two minutes";
+            return error(StatusCode::TOO_MANY_REQUESTS, why);
+        };
         json(
             StatusCode::OK,
             json!({"challengeId": id, "publicKey": {"challenge": B64.encode(&challenge),

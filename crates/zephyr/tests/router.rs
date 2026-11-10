@@ -3092,6 +3092,28 @@ async fn approvals_are_never_proposed() {
 }
 
 #[tokio::test]
+async fn a_web_reply_with_no_web_app_is_settled_not_kept() {
+    let home = home("web-off-rows");
+    let mut cfg = config(&home);
+    cfg.tick = Duration::from_millis(200);
+    let gw = start(cfg);
+    wait(|| !log(&home, "start").is_empty()).await;
+    // A row left from when `[web]` was set: no socket will ever open to show it.
+    let store = Store::open(&home.join("state.db")).unwrap();
+    store
+        .notify("web", "web", "[zephyr] nobody reads this")
+        .unwrap();
+    let outbox = |status: &str| {
+        let counts = store.counts().unwrap();
+        let row = counts.iter().find(|(t, s, _)| t == "outbox" && s == status);
+        row.map_or(0, |c| c.2)
+    };
+    wait(|| outbox("failed") == 1).await;
+    assert_eq!(outbox("pending"), 0);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn the_agent_cannot_run_web_commands() {
     let home = home("gateway-no-web");
     let gw = start(config(&home));

@@ -144,8 +144,9 @@ pub fn verify(
     if !es256(point, &msg, &a.signature) {
         return Err("bad signature");
     }
-    // A counter that does not move forward is a cloned authenticator; synced passkeys send 0.
-    if count != 0 && stored != 0 && count <= stored {
+    // WebAuthn §7.2 step 21: once either count is not zero, the new one must be the greater,
+    // else the authenticator may be a clone. Synced passkeys keep no count: 0 both times.
+    if (count != 0 || stored != 0) && count <= stored {
         return Err("sign count went back");
     }
     Ok(count)
@@ -239,7 +240,7 @@ struct Pending<T> {
 pub struct Challenges<T> {
     ttl: Duration,
     cap: usize,
-    inner: Mutex<(u64, VecDeque<Pending<T>>)>,
+    inner: Mutex<VecDeque<Pending<T>>>,
 }
 
 impl<T> Challenges<T> {
@@ -247,36 +248,56 @@ impl<T> Challenges<T> {
         Self {
             ttl,
             cap,
-            inner: Mutex::new((0, VecDeque::new())),
+            inner: Mutex::new(VecDeque::new()),
         }
     }
 
-    /// Keeps a challenge and names it (`c1`, `c2`, …). Past `cap`, the oldest goes.
+    /// Keeps a challenge under a random name. Past `cap`, the oldest goes.
     pub fn issue(&self, owner: [u8; 32], what: T, challenge: [u8; 32]) -> String {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.0 += 1;
-        let id = format!("c{}", inner.0);
-        inner.1.push_back(Pending {
+        let mut waiting = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if waiting.len() >= self.cap {
+            waiting.pop_front();
+        }
+        self.keep(&mut waiting, owner, what, challenge)
+    }
+
+    /// Like `issue`, but turns the new one away (`None`) rather than drop one that waits: for
+    /// challenges anyone may ask for, so a flood of asking cannot push out the owner's.
+    pub fn try_issue(&self, owner: [u8; 32], what: T, challenge: [u8; 32]) -> Option<String> {
+        let mut waiting = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        waiting.retain(|p| p.at.elapsed() < self.ttl);
+        (waiting.len() < self.cap).then(|| self.keep(&mut waiting, owner, what, challenge))
+    }
+
+    fn keep(
+        &self,
+        waiting: &mut VecDeque<Pending<T>>,
+        owner: [u8; 32],
+        what: T,
+        challenge: [u8; 32],
+    ) -> String {
+        // 128 random bits: the name tells nothing of how many were issued or to whom.
+        let mut name = [0; 16];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut name)
+            .expect("the system's random source");
+        let id = HEXLOWER.encode(&name);
+        waiting.push_back(Pending {
             id: id.clone(),
             owner,
             what,
             challenge,
             at: Instant::now(),
         });
-        if inner.1.len() > self.cap {
-            inner.1.pop_front();
-        }
         id
     }
 
-    /// Takes a challenge out, whether or not what follows verifies. `None` for another owner's,
-    /// a used one, or one past its `ttl`.
+    /// Takes its owner's challenge out, whether or not what follows verifies. `None` for a used
+    /// one or one past its `ttl`, and for another owner's, which is left where it is.
     pub fn take(&self, id: &str, owner: [u8; 32]) -> Option<(T, [u8; 32])> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let at = inner.1.iter().position(|p| p.id == id)?;
-        let p = inner.1.remove(at)?;
-        let live = p.at.elapsed() < self.ttl && bool::from(p.owner.ct_eq(&owner));
-        live.then_some((p.what, p.challenge))
+        let mut waiting = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let at = (waiting.iter()).position(|p| p.id == id && bool::from(p.owner.ct_eq(&owner)))?;
+        let p = waiting.remove(at)?;
+        (p.at.elapsed() < self.ttl).then_some((p.what, p.challenge))
     }
 }
 
@@ -376,11 +397,16 @@ mod tests {
         let point = soft.point();
         assert_eq!(verify(HOST, &CHALLENGE, &point, 4, &good(&soft, 5)), Ok(5));
         assert_eq!(
-            verify(HOST, &CHALLENGE, &point, 9, &good(&soft, 0)),
+            verify(HOST, &CHALLENGE, &point, 0, &good(&soft, 0)),
             Ok(0),
-            "a synced passkey"
+            "a synced passkey keeps no count"
         );
         assert_eq!(verify(HOST, &CHALLENGE, &point, 0, &good(&soft, 1)), Ok(1));
+        // WebAuthn §7.2: once either count is not zero, the new one must be the greater.
+        for (stored, new) in [(9, 0), (9, 9), (9, 8), (1, 0)] {
+            let refused = verify(HOST, &CHALLENGE, &point, stored, &good(&soft, new));
+            assert_eq!(refused, Err("sign count went back"), "{stored} then {new}");
+        }
     }
 
     #[test]
@@ -609,14 +635,39 @@ mod tests {
         let q = Challenges::new(minute, 16);
         let (me, other) = ([1; 32], [2; 32]);
         let id = q.issue(me, "a", [9; 32]);
-        assert_eq!(id, "c1");
         assert_eq!(q.take(&id, me), Some(("a", [9; 32])));
         assert_eq!(q.take(&id, me), None, "used once");
 
+        // Another owner neither gets it nor uses it up.
         let id = q.issue(me, "b", [9; 32]);
         assert_eq!(q.take(&id, other), None, "not its owner");
-        assert_eq!(q.take(&id, me), None, "and then it is gone");
+        assert_eq!(
+            q.take(&id, me),
+            Some(("b", [9; 32])),
+            "and it is still its owner's"
+        );
         assert_eq!(q.take("c99", me), None);
+
+        // Ids are random, so one session cannot name another's challenge: 128 bits, hex.
+        let ids: Vec<String> = (0..8).map(|n| q.issue(me, "x", [n; 32])).collect();
+        let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(distinct.len(), 8);
+        assert!(ids.iter().all(|id| id.len() == 32), "{ids:?}");
+
+        // `try_issue` turns a new one away rather than drop one that waits.
+        let full = Challenges::new(minute, 2);
+        let first = full.try_issue(me, 1, [9; 32]).unwrap();
+        assert!(full.try_issue(me, 2, [9; 32]).is_some());
+        assert_eq!(full.try_issue(me, 3, [9; 32]), None);
+        assert_eq!(full.take(&first, me), Some((1, [9; 32])));
+        assert!(
+            full.try_issue(me, 4, [9; 32]).is_some(),
+            "a place came free"
+        );
+        // One past its ttl holds no place.
+        let stale = Challenges::new(Duration::ZERO, 1);
+        assert!(stale.try_issue(me, 1, [9; 32]).is_some());
+        assert!(stale.try_issue(me, 2, [9; 32]).is_some());
 
         let stale = Challenges::new(Duration::ZERO, 16);
         let id = stale.issue(me, "c", [9; 32]);
