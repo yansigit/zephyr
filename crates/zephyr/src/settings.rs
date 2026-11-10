@@ -369,6 +369,17 @@ pub static SETTINGS: &[Setting] = &[
         Apply::Facts,
     ),
     row(
+        "network.allow",
+        "Security",
+        "Network exceptions",
+        "Exact HOST:PORT the agent may reach beyond public ports 80 and 443, comma separated. No wildcards.",
+        Kind::Text { max: 2000 },
+        Access::Propose,
+        true,
+        Stricter::NotOrdered,
+        Apply::Toml,
+    ),
+    row(
         "settings.strong_channels",
         "Security",
         "Strong channels",
@@ -548,6 +559,9 @@ pub fn parse(s: &Setting, raw: &str) -> Result<Value, String> {
     let value = parse_kind(&s.kind, raw.trim(), &named(s.key))?;
     if s.key == "settings.strong_channels" && !list_names(raw).contains(&"tui") {
         return Err("tui stays a strong channel".into());
+    }
+    if s.key == "network.allow" {
+        crate::egress::parse_allow(raw)?;
     }
     Ok(value)
 }
@@ -856,6 +870,7 @@ pub fn value(cfg: &Config, key: &str) -> Option<String> {
         "auth.enabled" => Some(cfg.auth.enabled.to_string()),
         "auth.refresh_minutes" => Some(cfg.auth.refresh_minutes.to_string()),
         "settings.strong_channels" => Some(cfg.settings.strong_channels.join(", ")),
+        "network.allow" => Some(cfg.network.allow.clone()).filter(|a| !a.is_empty()),
         key if key.starts_with("approvals.") => {
             crate::approvals::value(cfg, &key["approvals.".len()..])
         }
@@ -1380,6 +1395,8 @@ mod tests {
             let (good, bad) = match s.key {
                 // Its own check: a three-letter code.
                 "approvals.currency" => ("EUR".into(), vec!["x".into(), "EURO".into()]),
+                // Its own check: exact HOST:PORT entries.
+                "network.allow" => ("github.com:22".into(), vec!["x".into(), "*.x:443".into()]),
                 _ => sample(&s.kind),
             };
             assert!(parse(s, &good).is_ok(), "{} rejected {good}", s.key);
@@ -1655,6 +1672,24 @@ mod tests {
         assert_eq!(
             decide(cost, &Actor::Internal, true, &strong()),
             Verdict::Apply
+        );
+    }
+
+    #[test]
+    fn network_allow_is_a_strong_proposal_only_row() {
+        let s = find("network.allow").unwrap();
+        assert_eq!(s.agent, Access::Propose);
+        assert!(s.strong);
+        let agent = Actor::Agent { session: "main" };
+        assert_eq!(decide(s, &agent, false, &strong()), Verdict::Propose);
+        assert_eq!(decide(s, &agent, true, &strong()), Verdict::Propose);
+        assert!(parse(s, "imap.gmail.com:993, github.com:22").is_ok());
+        assert!(parse(s, "*.gmail.com:993").is_err());
+        let cfg: Config =
+            toml::from_str("rpi = 'a'\nhome = 'b'\n[network]\nallow = 'github.com:22'").unwrap();
+        assert_eq!(
+            value(&cfg, "network.allow").as_deref(),
+            Some("github.com:22")
         );
     }
 

@@ -63,17 +63,18 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
 - `config.rs`: `#[derive(Default, …)] pub struct Network { #[serde(default)] pub allow: String }` and `#[serde(default)] pub network: Network` on `Config` (`deny_unknown_fields` as its neighbours). `validate` calls `egress::parse_allow(&self.network.allow)` and fails with `network.allow: <its error>`. `reload::diff` needs no change: `[network]` is `Plan::Live`, because the proxy reads `cfgs.borrow()` on each request.
 - `settings.rs` row, verbatim from spec §4.4: `row("network.allow", "Security", "Network exceptions", "Exact HOST:PORT the agent may reach beyond public ports 80 and 443, comma separated. No wildcards.", Kind::Text { max: 2000 }, Access::Propose, true, Stricter::NotOrdered, Apply::Toml)`.
 
-- [ ] **Step 1: Write the failing tests** in `egress.rs` `mod tests`:
+- [x] **Step 1: Write the failing tests** in `egress.rs` `mod tests`:
   - `public_refuses_every_special_range_and_embedded_ipv4`: every denied literal in spec §5's list, plus `::127.0.0.1`, gives `!public(ip)`. `1.1.1.1`, `8.8.8.8` and `2606:4700::1111` give `public(ip)`.
   - `targets_normalize_numeric_hosts_through_url`: `target("2130706433:443")`, `"0x7f.1:443"`, `"0177.0.0.1:443"` and `"127.1:443"` all give `Host::Ipv4(127.0.0.1)`. `"[::ffff:127.0.0.1]:443"` gives `Host::Ipv6(::ffff:7f00:1)`. `"example.com:80"` gives port 80. Take the port from the authority, never `Url::port()`, which drops a default port. `"example.com"` (no port), `"user@example.com:443"` and `"example.com:0"` give `Refusal::Bad`.
   - `parse_allow_takes_exact_host_ports_only`: `"imap.gmail.com:993, github.com:22,homeassistant.lan:8123"` gives 3 entries, and `""` gives `[]`. Errors for `*.x:443`, `x`, `x:0`, `x:65536`, `http://x:1`, `127.0.0.1:22`, `[::1]:22` and `169.254.169.254:80`.
   - `decide_applies_the_port_rule_and_the_allow_list`, with a test `Lookup` fn that matches on the name: `example.com:22` unlisted gives `Denied("port 22 needs network.allow")`, and listed gives Ok. `1.1.1.1:443` gives `Ok([1.1.1.1:443])`. `10.0.0.5:443` gives `Denied("private address 10.0.0.5")`. `homeassistant.lan:8123` listed (→ 192.168.1.10) gives Ok, and the same name on `:443` unlisted gives Denied. A mixed answer `[1.1.1.1, 10.0.0.5]` gives Denied. An empty answer gives `Unreachable`. Matching is case-insensitive through `url` (`IMAP.GMAIL.COM:993` matches `imap.gmail.com:993`).
   - `a_listed_name_never_reaches_loopback_link_local_or_this_container` (Review Focus 4): listed names resolving to 169.254.169.254, to 127.0.0.1 and to `own` are each Denied. The 127.0.0.1 one gives `loopback is never allowed`.
   - In `config.rs` tests, `a_wildcard_network_allow_is_refused`: `[network]\nallow = "*.gmail.com:993"` fails `validate`. In `settings.rs` tests, `network_allow_is_a_strong_proposal_only_row`: `find("network.allow")` is `Access::Propose` and `strong`, and `decide` for `Actor::Agent` gives `Verdict::Propose`.
-- [ ] **Step 2:** `cargo test -p zephyr --lib -- egress config settings` gives FAIL (module missing).
-- [ ] **Step 3: Implement.** `target` parses with `url::Url::parse(&format!("http://{authority}"))`. `decide` runs the port rule before any lookup. An IP literal skips the lookup. A name goes through `lookup` under `tokio::time::timeout(5 s)`. The check runs over every address before any is returned.
-- [ ] **Step 4:** Run the tests again: PASS. Then run `cargo test -p zephyr` (the registry's own table tests cover the new row).
-- [ ] **Step 5:** Commit `feat(egress): decide which addresses the agent may reach, and let the owner list exact exceptions in network.allow`.
+- [x] **Step 2:** `cargo test -p zephyr --lib -- egress config settings` gives FAIL (module missing).
+- [x] **Step 3: Implement.** `target` parses with `url::Url::parse(&format!("http://{authority}"))`. `decide` runs the port rule before any lookup. An IP literal skips the lookup. A name goes through `lookup` under `tokio::time::timeout(5 s)`. The check runs over every address before any is returned.
+- [x] **Step 4:** Run the tests again: PASS. Then run `cargo test -p zephyr` (the registry's own table tests cover the new row).
+- [x] **Step 5:** Commit `feat(egress): decide which addresses the agent may reach, and let the owner list exact exceptions in network.allow`.
+- Deviation: `settings::parse` also runs `egress::parse_allow` for `network.allow` and `settings::value` shows it, so `/set network.allow` refuses a bad entry before the file is written (spec §4.4: "the value is checked by `egress::parse_allow`"). `target` also refuses an authority with a path, a query or whitespace.
 
 ### Task A2-2: The proxy and its audit
 

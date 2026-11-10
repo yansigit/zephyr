@@ -80,6 +80,9 @@ pub struct Config {
     /// `[settings]`: who may loosen a protected setting (settings spec §2).
     #[serde(default)]
     pub settings: Settings,
+    /// `[network]`: where the agent may connect beyond public ports 80 and 443 (DESIGN §4.19).
+    #[serde(default)]
+    pub network: Network,
     /// `[approvals]`: how messages, posts and payments wait for the owner (approvals spec §4.3).
     /// Absent is the `manual` preset. `approvals::effective` reads it.
     pub approvals: Option<Approvals>,
@@ -188,6 +191,15 @@ pub const MAX_SUBAGENT_PROMPT: usize = zephyr_policy::tools::MAX_GOAL;
 
 fn default_parallel() -> usize {
     2
+}
+
+/// `[network]` (DESIGN §4.19).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Network {
+    /// Exact `HOST:PORT` entries, comma separated (`egress::parse_allow`).
+    #[serde(default)]
+    pub allow: String,
 }
 
 /// `[settings]` (settings spec §2).
@@ -426,6 +438,8 @@ impl Config {
         if !strong.iter().any(|c| c == "tui") {
             anyhow::bail!("[settings] strong_channels must keep tui");
         }
+        crate::egress::parse_allow(&self.network.allow)
+            .map_err(|e| anyhow::anyhow!("network.allow: {e}"))?;
         crate::scheduler::zone(self)?;
         Ok(())
     }
@@ -518,6 +532,19 @@ mod tests {
         assert_eq!(cfg.discord.unwrap().token_env, "ZEPHYR_DISCORD_TOKEN");
         assert_eq!(cfg.imessage.unwrap().lookback_hours, 24);
         assert!(toml::from_str::<Config>("rpi='a'\nhome='b'\ntypo=1").is_err());
+    }
+
+    #[test]
+    fn a_wildcard_network_allow_is_refused() {
+        let with = |allow: &str| -> Config {
+            toml::from_str(&format!("rpi='a'\nhome='b'\n[network]\nallow = {allow:?}")).unwrap()
+        };
+        let e = with("*.gmail.com:993").validate().unwrap_err().to_string();
+        assert!(e.starts_with("network.allow: "), "{e}");
+        with("imap.gmail.com:993, github.com:22")
+            .validate()
+            .unwrap();
+        assert!(toml::from_str::<Config>("rpi='a'\nhome='b'\n[network]\nallowed=''").is_err());
     }
 
     #[test]
