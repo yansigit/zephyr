@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -363,6 +363,24 @@ pub struct Audit {
 }
 
 impl Audit {
+    /// Once the minute of the last refusals is over: the row counting those not written, if
+    /// any. The writer calls it every second, so the count does not wait for a later request.
+    pub fn flush(&mut self, now: i64) -> Option<(String, String, String)> {
+        if now / 60 == self.minute {
+            return None;
+        }
+        let more = self.refused.saturating_sub(REFUSALS_A_MINUTE);
+        (self.minute, self.refused) = (now / 60, 0);
+        // No request's own row: `proxy`, with no destination.
+        (more > 0).then(|| {
+            (
+                "proxy".into(),
+                String::new(),
+                format!("refused: {more} more"),
+            )
+        })
+    }
+
     /// The `(tool, args, outcome)` rows to write for a request to `dest` (`host:port -> ip`).
     pub fn note(
         &mut self,
@@ -371,17 +389,7 @@ impl Audit {
         dest: &str,
         o: Outcome,
     ) -> Vec<(String, String, String)> {
-        let mut rows = Vec::new();
-        if now / 60 != self.minute {
-            if let Some(more) = (self.refused.checked_sub(REFUSALS_A_MINUTE)).filter(|m| *m > 0) {
-                rows.push((
-                    "connect".into(),
-                    String::new(),
-                    format!("refused: {more} more"),
-                ));
-            }
-            (self.minute, self.refused) = (now / 60, 0);
-        }
+        let mut rows: Vec<_> = self.flush(now).into_iter().collect();
         let outcome = match o {
             Outcome::Allowed => {
                 if now / 3600 != self.hour {
@@ -413,7 +421,7 @@ type Body = UnsyncBoxBody<Bytes, BoxError>;
 struct Conn {
     cfgs: watch::Receiver<Arc<Config>>,
     floor: Floor,
-    log: Arc<Mutex<(Store, Audit)>>,
+    log: std::sync::mpsc::Sender<Note>,
     /// Held until the connection and its tunnel are both over.
     slot: Arc<OwnedSemaphorePermit>,
 }
@@ -453,7 +461,9 @@ pub async fn serve_on(
     floor: Floor,
 ) -> anyhow::Result<()> {
     let store = Store::open(&cfgs.borrow().db_path()).context("opening state.db")?;
-    let log = Arc::new(Mutex::new((store, Audit::default())));
+    let (log, notes) = std::sync::mpsc::channel();
+    let cfg = cfgs.borrow().clone();
+    std::thread::spawn(move || write_audit(store, notes, cfg));
     let slots = Arc::new(Semaphore::new(floor.conns));
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -554,7 +564,13 @@ impl Conn {
     }
 
     /// The reply to a request that is not carried, with its audit row.
-    fn refuse(&self, cfg: &Config, tool: &str, dest: &str, e: Refusal) -> Response<Body> {
+    fn refuse(
+        &self,
+        cfg: &Arc<Config>,
+        tool: &'static str,
+        dest: &str,
+        e: Refusal,
+    ) -> Response<Body> {
         let (status, reason, text) = match e {
             Refusal::Bad(r) => (StatusCode::BAD_REQUEST, r, String::new()),
             Refusal::Denied(r) => (StatusCode::FORBIDDEN, r, HINT.into()),
@@ -570,16 +586,51 @@ impl Conn {
         reply
     }
 
-    /// Writes the request's audit rows, if it leaves any, with vault and fact values scrubbed.
-    fn record(&self, cfg: &Config, tool: &str, dest: &str, o: Outcome) {
-        let mut log = self.log.lock().unwrap_or_else(|e| e.into_inner());
-        let rows = log.1.note(crate::now(), tool, dest, o);
+    /// Hands the request to the audit's writer: nothing here touches a file.
+    fn record(&self, cfg: &Arc<Config>, tool: &'static str, dest: &str, outcome: Outcome) {
+        let note = Note {
+            cfg: cfg.clone(),
+            at: crate::now(),
+            tool,
+            dest: dest.into(),
+            outcome,
+        };
+        // The writer is gone only when the proxy is.
+        let _ = self.log.send(note);
+    }
+}
+
+/// One request, on its way to the audit.
+struct Note {
+    cfg: Arc<Config>,
+    at: i64,
+    tool: &'static str,
+    dest: String,
+    outcome: Outcome,
+}
+
+/// The audit's one writer, on a thread of its own, so reading the vault and the facts and
+/// writing state.db never hold up the runtime the proxy runs on. It decides which rows a request
+/// leaves (`Audit`), scrubs vault and fact values out of them and writes them; every second it
+/// closes a minute whose refusals went over the cap. Ends when the proxy does.
+fn write_audit(store: Store, notes: std::sync::mpsc::Receiver<Note>, mut cfg: Arc<Config>) {
+    use std::sync::mpsc::RecvTimeoutError;
+    let mut audit = Audit::default();
+    loop {
+        let rows = match notes.recv_timeout(Duration::from_secs(1)) {
+            Ok(note) => {
+                cfg = note.cfg;
+                audit.note(note.at, note.tool, &note.dest, note.outcome)
+            }
+            Err(RecvTimeoutError::Timeout) => audit.flush(crate::now()).into_iter().collect(),
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
         if rows.is_empty() {
-            return;
+            continue;
         }
-        let scrub = crate::gate::Scrub::load(cfg);
+        let scrub = crate::gate::Scrub::load(&cfg);
         for (tool, args, outcome) in rows {
-            crate::gate::audit_row(&log.0, "net", &tool, &scrub.text(&args), &outcome);
+            crate::gate::audit_row(&store, "net", &tool, &scrub.text(&args), &outcome);
         }
     }
 }
@@ -1266,12 +1317,20 @@ mod tests {
             (s, reply)
         }
 
-        fn net_rows(&self) -> Vec<(String, String, String)> {
+        /// The proxy's audit rows, once its writer has written `n` of them.
+        async fn net_rows(&self, n: usize) -> Vec<(String, String, String)> {
             let store = Store::open(&config(&self.dir, "").db_path()).unwrap();
-            let rows = store.audit_rows().unwrap().into_iter();
-            rows.filter(|r| r.0 == "net")
-                .map(|r| (r.1, r.2, r.3))
-                .collect()
+            let deadline = tokio::time::Instant::now() + WAIT;
+            loop {
+                let rows = store.audit_rows().unwrap().into_iter();
+                let rows: Vec<_> = (rows.filter(|r| r.0 == "net"))
+                    .map(|r| (r.1, r.2, r.3))
+                    .collect();
+                if rows.len() >= n || tokio::time::Instant::now() > deadline {
+                    return rows;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
     }
 
@@ -1361,7 +1420,7 @@ mod tests {
                 "allowed".to_string(),
             )
         };
-        assert_eq!(proxy.net_rows(), [row("connect")]);
+        assert_eq!(proxy.net_rows(1).await, [row("connect")]);
     }
 
     #[tokio::test]
@@ -1387,7 +1446,7 @@ mod tests {
             !seen.contains("proxy-") && !seen.contains("other.example"),
             "{seen}"
         );
-        assert_eq!(proxy.net_rows()[0].0, "http");
+        assert_eq!(proxy.net_rows(1).await[0].0, "http");
     }
 
     #[tokio::test]
@@ -1450,7 +1509,7 @@ mod tests {
         assert_eq!(up.accepts.load(Ordering::SeqCst), 0);
         let refusal = format!("refused: port {} needs network.allow", up.port);
         assert_eq!(
-            proxy.net_rows(),
+            proxy.net_rows(1).await,
             [("connect".into(), dest.clone(), refusal)]
         );
 
@@ -1532,14 +1591,22 @@ mod tests {
         let row = |tool: &str, args: &str, outcome: &str| {
             (tool.to_string(), args.to_string(), outcome.to_string())
         };
+        // The minute's end writes the count of the rest, with no later request to wait for,
+        // once, and under no one request's tool.
+        assert_eq!(a.flush(59), None);
+        assert_eq!(a.flush(60), Some(row("proxy", "", "refused: 1 more")));
+        assert_eq!(a.flush(60), None);
+        assert_eq!(refuse(&mut a, 60), [row("http", "x:22", "refused: no")]);
+        // A request that comes before any flush closes the minute before it itself.
+        let rows: usize = (0..62).map(|_| refuse(&mut a, 119).len()).sum();
+        assert_eq!(rows, 59);
         assert_eq!(
-            refuse(&mut a, 60),
+            refuse(&mut a, 120),
             [
-                row("connect", "", "refused: 1 more"),
+                row("proxy", "", "refused: 3 more"),
                 row("http", "x:22", "refused: no")
             ]
         );
-        assert_eq!(refuse(&mut a, 120), [row("http", "x:22", "refused: no")]);
     }
 
     #[tokio::test]
@@ -1551,7 +1618,7 @@ mod tests {
             .ask("CONNECT 5550102345.example:443 HTTP/1.1\r\n\r\n")
             .await;
         assert!(reply.starts_with("HTTP/1.1 502 "), "{reply}");
-        let rows = proxy.net_rows();
+        let rows = proxy.net_rows(1).await;
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert!(rows[0].2.starts_with("refused: "), "{rows:?}");
         assert!(rows[0].1.contains("[fact:phone]"), "{rows:?}");
