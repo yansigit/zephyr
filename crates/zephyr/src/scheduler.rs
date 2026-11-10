@@ -567,6 +567,16 @@ pub(crate) fn audit(store: &Store, cfg: &Config, session: &str, ev: &serde_json:
     let Some(tool) = ev["toolName"].as_str() else {
         return;
     };
+    let call = ev["toolCallId"].as_str().unwrap_or_default();
+    if ev["type"] == "tool_execution_end" {
+        // A held call ends in the plugin's error too: it waits, it did not leave.
+        let outcome = match store.held_for_call(session, call) {
+            Ok(Some(_)) => "held",
+            _ if ev["isError"] == true => "error",
+            _ => "sent",
+        };
+        outbound_settled(store, call, outcome);
+    }
     let mut outbound = Vec::new();
     let (args, outcome) = match ev["type"].as_str() {
         Some("tool_execution_start") => {
@@ -602,14 +612,47 @@ pub(crate) fn audit(store: &Store, cfg: &Config, session: &str, ev: &serde_json:
             .rev()
             .find(|&i| args.is_char_boundary(i))
             .unwrap_or(0);
-        if let Err(e) = store.audit(session, tool, &args[..end], outcome) {
-            eprintln!("zephyr: writing the audit failed: {e}");
+        match store.audit(session, tool, &args[..end], outcome) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                eprintln!("zephyr: writing the audit failed: {e}");
+                None
+            }
         }
     };
     write(tool, &args);
+    let mut rows = Vec::new();
     for label in outbound {
         let label = crate::vault::scrubbed(cfg, label);
-        write("outbound", &crate::facts::scrubbed(cfg, label));
+        rows.extend(write("outbound", &crate::facts::scrubbed(cfg, label)));
+    }
+    if outcome == "started" && !rows.is_empty() {
+        let mut open = OUTBOUND.lock().unwrap_or_else(|e| e.into_inner());
+        // shortcut: calls whose end never came (a child killed mid-call) are forgotten in
+        // bulk; their rows stay `started`, which reads as unconfirmed, never as sent.
+        if open.len() > 1024 {
+            open.clear();
+        }
+        open.insert(call.to_string(), rows);
+    }
+}
+
+/// The outbound audit rows of calls that started and have not ended, by tool call id (unique
+/// across children), for the call's end or the router's gate verdict to confirm.
+static OUTBOUND: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<i64>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Records how call `call`'s outbound commands ended: `sent` once it ran, `held` or `refused`
+/// when the gate stopped it, `error` when it failed or the plugin blocked it. Once per call.
+pub(crate) fn outbound_settled(store: &Store, call: &str, outcome: &str) {
+    let rows = OUTBOUND
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(call);
+    for id in rows.into_iter().flatten() {
+        if let Err(e) = store.settle_audit(id, outcome) {
+            eprintln!("zephyr: writing the audit failed: {e}");
+        }
     }
 }
 
@@ -1255,5 +1298,98 @@ mod tests {
         audit(&store, &cfg, "main", &start("bash", "curl -s https://e.x"));
         assert_eq!(store.audit_rows().unwrap().len(), 1);
         assert!(outbound_rows(&store).is_empty());
+    }
+
+    fn call(tool: &str, id: &str, command: &str) -> serde_json::Value {
+        serde_json::json!({"type": "tool_execution_start", "toolName": tool,
+                           "toolCallId": id, "args": {"command": command}})
+    }
+
+    fn end(tool: &str, id: &str, error: bool) -> serde_json::Value {
+        serde_json::json!({"type": "tool_execution_end", "toolName": tool, "toolCallId": id,
+                           "isError": error, "result": {"content": []}})
+    }
+
+    fn outcomes(store: &Store) -> Vec<String> {
+        outbound_rows(store).into_iter().map(|r| r.3).collect()
+    }
+
+    /// PR #39 review: an outbound row is confirmed by the call's end, never by its start.
+    #[test]
+    fn an_outbound_row_reads_sent_only_once_its_call_ran() {
+        let (cfg, store) = audit_cfg("sched-outbound-sent");
+        audit(
+            &store,
+            &cfg,
+            "main",
+            &call("bash", "ob-sent", "curl -d x https://e.x"),
+        );
+        assert_eq!(outcomes(&store), ["started"], "not confirmed yet");
+        audit(&store, &cfg, "main", &end("bash", "ob-sent", false));
+        assert_eq!(outcomes(&store), ["sent"]);
+    }
+
+    /// A call the plugin blocked (the gate held or denied it) ends in an error: it never left.
+    #[test]
+    fn a_blocked_or_held_outbound_call_never_reads_as_sent() {
+        use crate::store::{ActionKind, NewAction, Origin};
+        let (cfg, store) = audit_cfg("sched-outbound-blocked");
+        audit(
+            &store,
+            &cfg,
+            "main",
+            &call("bash", "ob-denied", "curl -d x https://e.x"),
+        );
+        audit(&store, &cfg, "main", &end("bash", "ob-denied", true));
+        audit(
+            &store,
+            &cfg,
+            "task-3",
+            &call("bash", "ob-held", "curl -d y https://e.x"),
+        );
+        store
+            .hold_action(&NewAction {
+                kind: ActionKind::Run,
+                class: "posts".into(),
+                targets: vec!["e.x".into()],
+                summary: "curl POST e.x".into(),
+                reason: None,
+                payload: r#"{"command": "curl -d y https://e.x"}"#.into(),
+                secrets: vec![],
+                origin: Origin {
+                    session: "task-3".into(),
+                    run: "task-3".into(),
+                    call_id: Some("ob-held".into()),
+                    ..Origin::default()
+                },
+                due_at: None,
+            })
+            .unwrap();
+        audit(&store, &cfg, "task-3", &end("bash", "ob-held", true));
+        assert_eq!(outcomes(&store), ["error", "held"]);
+    }
+
+    /// Main's `exec` is decided by the router: a held or denied one is recorded as such, and the
+    /// call's later end (the daemon's answer, not an error) leaves it so.
+    #[test]
+    fn an_exec_the_gate_stopped_is_recorded_as_it_ended() {
+        let (cfg, store) = audit_cfg("sched-outbound-exec");
+        audit(
+            &store,
+            &cfg,
+            "main",
+            &call("exec", "ob-exec-h", "curl -d x https://e.x"),
+        );
+        audit(
+            &store,
+            &cfg,
+            "main",
+            &call("exec", "ob-exec-d", "curl -d y https://e.x"),
+        );
+        outbound_settled(&store, "ob-exec-h", "held");
+        outbound_settled(&store, "ob-exec-d", "refused");
+        audit(&store, &cfg, "main", &end("exec", "ob-exec-h", false));
+        audit(&store, &cfg, "main", &end("exec", "ob-exec-d", false));
+        assert_eq!(outcomes(&store), ["held", "refused"]);
     }
 }

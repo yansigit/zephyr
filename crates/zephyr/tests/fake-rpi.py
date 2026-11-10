@@ -25,7 +25,8 @@ argv.json holds the argv of the latest start. With a `tool_sleep` file in the ho
 leaves a `sleep 300` running in its process group, as a tool would, its pid in `tool_pid`. With a
 `stray` file, each start leaves a `setsid sleep 300` that escaped through a shell that exited (an
 orphan in its own session, as an agent's `setsid cmd &` is), its pid in `stray_pid`.
-A prompt containing `bash: CMD` first reports a bash tool call running CMD (tool_execution_start).
+A prompt containing `bash: CMD` first reports a bash tool call running CMD (tool_execution_start,
+then its tool_execution_end, as rpi does; nothing is run).
 With `--no-tools` (a /btw child) none of the tool markers below (`bash: `, `[tool]`, `[call ...]`)
 runs anything, so its prompt is echoed whole; with `--no-session` there is no session file (the
 session lives in memory), the home is the cwd, and `pid` is left to main's child. The start line in
@@ -675,6 +676,8 @@ for line in iter(next_line, None):
         if "bash: " in cmd["message"] and tools:
             out({"type": "tool_execution_start", "toolCallId": "t1", "toolName": "bash",
                  "args": {"command": cmd["message"].split("bash: ", 1)[1]}})
+            out({"type": "tool_execution_end", "toolCallId": "t1", "toolName": "bash",
+                 "isError": False, "result": {"content": [{"type": "text", "text": ""}]}})
             finish(s, "ran"); continue
         if "[tool]" in cmd["message"] and tools:
             run_tool(s)

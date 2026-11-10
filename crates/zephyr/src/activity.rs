@@ -169,6 +169,9 @@ pub(crate) fn entry(r: &Record, scrub: &Scrub, now: i64, tz: &TimeZone) -> Entry
         false => one_line(&r.subject, 40),
     };
     let status = match (r.kind.as_str(), r.status.as_str()) {
+        // An outbound command left only once its call ran: until then it is not confirmed.
+        ("out", "sent") => String::new(),
+        ("out", "started") => " unconfirmed".into(),
         ("setting", _) | (_, "started") => String::new(),
         ("refused", "refused") => " by the policy".into(),
         ("refused", "denied") => " by the gate".into(),
@@ -493,10 +496,33 @@ mod tests {
                     "audit",
                     "out",
                     "main",
-                    "started",
+                    "sent",
                     "curl POST api.example.com",
                 ),
                 "14:02 out main: curl POST api.example.com",
+            ),
+            // Started, its end not seen (the daemon died mid-call): never read as sent.
+            (
+                rec(
+                    at(14, 2),
+                    "audit",
+                    "out",
+                    "main",
+                    "started",
+                    "curl POST b.example.com",
+                ),
+                "14:02 out main unconfirmed: curl POST b.example.com",
+            ),
+            (
+                rec(
+                    at(14, 2),
+                    "audit",
+                    "out",
+                    "main",
+                    "held",
+                    "curl POST c.example.com",
+                ),
+                "14:02 out main held: curl POST c.example.com",
             ),
             (
                 rec(
@@ -613,7 +639,7 @@ mod tests {
             "audit",
             "out",
             "main",
-            "started",
+            "sent",
             "curl POST 5550102345.example.com",
         );
         crate::facts::agent_add(&crate::facts::path(&cfg), "phone digits 5550102345").unwrap();
@@ -672,14 +698,14 @@ mod tests {
             "audit",
             "out",
             "main",
-            "started",
+            "sent",
             "curl POST api.example.com",
         );
         assert_eq!(
             entry(&r, &scrub, NOW, &TimeZone::UTC).line,
             "14:02 out main: [output withheld: the vault could not be read]"
         );
-        let r = rec(at(14, 2), "audit", "out", "job-3-88", "started", "x");
+        let r = rec(at(14, 2), "audit", "out", "job-3-88", "sent", "x");
         assert!(entry(&r, &scrub, NOW, &TimeZone::UTC)
             .line
             .starts_with("14:02 out job-3-88: "));
@@ -692,7 +718,7 @@ mod tests {
             "task-5550102345",
             "job-555-0102",
         ] {
-            let r = rec(at(14, 2), "audit", "out", forged, "started", "x");
+            let r = rec(at(14, 2), "audit", "out", forged, "sent", "x");
             let line = entry(&r, &scrub, NOW, &TimeZone::UTC).line;
             assert!(line.starts_with("14:02 out [output withheld"), "{line}");
         }
