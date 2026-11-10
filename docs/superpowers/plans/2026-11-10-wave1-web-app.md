@@ -237,7 +237,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - or an endpoint whose origin (`scheme://host:port`) equals an entry of `extra`.
 - `card` and `reply` cut `body`: card to 200 chars plus `…`, reply to 120 chars. `card` passes the text through unchanged otherwise, since the caller scrubs.
 
-- [ ] **Step 1: Write the failing tests** in `push.rs` `mod tests`:
+- [x] **Step 1: Write the failing tests** in `push.rs` `mod tests`:
   - `encrypt_matches_rfc_8291_appendix_a` (values base64url, whitespace removed):
     - ecdh_secret `kyrL1jIIOHEzg3sM2ZWRHDRB62YACZhhSlknJ672kSs`;
     - auth `BTBZMqHH6r4Tts7J_aSIgg`;
@@ -261,10 +261,11 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
     - `encrypt(...)` of it is ≤ 4096 bytes;
     - the body ends with `…`;
     - `reply(&"x".repeat(500))["body"]` has 120 chars.
-- [ ] **Step 2: Run** `cargo test -p zephyr --lib web::push` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** → PASS.
-- [ ] **Step 5: Commit** `feat(web): encrypt Web Push messages (RFC 8291) and sign VAPID tokens on ring`.
+- [x] **Step 2: Run** `cargo test -p zephyr --lib web::push` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** → PASS.
+- [x] **Step 5: Commit** `feat(web): encrypt Web Push messages (RFC 8291) and sign VAPID tokens on ring`.
+- Deviation: `allowed_endpoint` refuses userinfo for an `extra` origin too, not only for the push services.
 
 ### Task W-4: The listener: `[web]`, channels `web` and `passkey`, checks, headers, files
 
