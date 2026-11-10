@@ -175,6 +175,195 @@ pub fn vapid(cfg: &crate::config::Config, make: bool) -> anyhow::Result<EcdsaKey
         .map_err(|_| anyhow::anyhow!("{} is not a P-256 key", path.display()))
 }
 
+/// Sends `payload` to every subscribed device, on a task of its own: the router never waits
+/// for a push service.
+pub fn spawn(
+    cfg: std::sync::Arc<crate::config::Config>,
+    payload: Value,
+    urgency: &'static str,
+    ttl: u32,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = send(&cfg, &payload, urgency, ttl).await {
+            eprintln!("zephyr: web push is off: {e:#}");
+        }
+    });
+}
+
+/// One aes128gcm body for a subscription, under a key pair and a salt made for this message.
+fn sealed(sub: &crate::store::WebPush, plaintext: &[u8]) -> Option<Vec<u8>> {
+    use ring::agreement::{agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey, ECDH_P256};
+    use ring::rand::SecureRandom;
+    let rng = ring::rand::SystemRandom::new();
+    let ours = EphemeralPrivateKey::generate(&ECDH_P256, &rng).ok()?;
+    let as_public: [u8; 65] = ours.compute_public_key().ok()?.as_ref().try_into().ok()?;
+    let mut salt = [0; 16];
+    rng.fill(&mut salt).ok()?;
+    let theirs = UnparsedPublicKey::new(&ECDH_P256, &sub.p256dh);
+    let seal =
+        |secret: &[u8]| encrypt(secret, &as_public, &sub.p256dh, &sub.auth, &salt, plaintext);
+    agree_ephemeral(ours, &theirs, seal).ok()
+}
+
+/// Opens the store and the key itself, as it runs beside the router. A device its push service
+/// no longer knows (404, 410) is dropped. Nothing logged names an endpoint's path or a key.
+async fn send(
+    cfg: &crate::config::Config,
+    payload: &Value,
+    urgency: &str,
+    ttl: u32,
+) -> anyhow::Result<()> {
+    use ring::signature::KeyPair;
+    let Some(web) = &cfg.web else {
+        return Ok(());
+    };
+    let subs = crate::store::Store::open(&cfg.db_path())?.pushes()?;
+    let plaintext = payload.to_string();
+    if subs.is_empty() || plaintext.len() > MAX_PLAINTEXT {
+        return Ok(());
+    }
+    let key = vapid(cfg, false)?;
+    let k = B64.encode(key.public_key().as_ref());
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    for sub in subs {
+        // Checked when it was saved, and again here: the daemon posts to push services only.
+        let Some(endpoint) = allowed_endpoint(&sub.endpoint, &cfg.push_hosts) else {
+            continue;
+        };
+        let host = endpoint.host_str().unwrap_or_default().to_string();
+        let Some(body) = sealed(&sub, plaintext.as_bytes()) else {
+            eprintln!("zephyr: a web push subscription for {host} has no usable key");
+            continue;
+        };
+        let jwt = vapid_jwt(&key, &endpoint, &web.host, crate::now());
+        let sent = (client.post(endpoint))
+            .header("TTL", ttl)
+            .header("Urgency", urgency)
+            .header("Content-Encoding", "aes128gcm")
+            .header("Content-Type", "application/octet-stream")
+            .header("Authorization", format!("vapid t={jwt}, k={k}"))
+            .body(body)
+            .send()
+            .await;
+        match sent.map(|res| res.status().as_u16()) {
+            Ok(200..=299) => {}
+            Ok(404 | 410) => crate::store::Store::open(&cfg.db_path())?.drop_push(&sub.endpoint)?,
+            // shortcut: no retry; add one if pushes are seen lost.
+            Ok(code) => eprintln!("zephyr: a web push to {host} was refused: {code}"),
+            // Not the error itself: reqwest's names the whole URL.
+            Err(e) if e.is_timeout() => eprintln!("zephyr: a web push to {host} timed out"),
+            Err(_) => eprintln!("zephyr: a web push to {host} did not connect"),
+        }
+    }
+    Ok(())
+}
+
+impl super::App {
+    /// `GET /api/push/key`: the VAPID public key a device subscribes with.
+    pub(super) fn push_key(&self) -> super::Res {
+        use ring::signature::KeyPair;
+        match vapid(&self.cfg(), false) {
+            Ok(key) => {
+                let key = B64.encode(key.public_key().as_ref());
+                super::json(hyper::StatusCode::OK, json!({ "key": key }))
+            }
+            Err(_) => super::error(hyper::StatusCode::SERVICE_UNAVAILABLE, "push is off"),
+        }
+    }
+
+    /// `POST /api/push {endpoint, keys: {p256dh, auth}}` saves this device's subscription
+    /// against the session's passkey; `DELETE /api/push {endpoint}` drops it.
+    pub(super) fn push_save(&self, add: bool, passkey: i64, body: &Value) -> super::Res {
+        use hyper::StatusCode;
+        let bad = || super::error(StatusCode::BAD_REQUEST, "that is not a push subscription");
+        let endpoint = body["endpoint"].as_str().unwrap_or_default();
+        let Ok(store) = crate::store::Store::open(&self.cfg().db_path()) else {
+            return super::error(StatusCode::INTERNAL_SERVER_ERROR, "try again");
+        };
+        let saved = if add {
+            let key = |name: &str| {
+                let text = body["keys"][name].as_str().unwrap_or_default();
+                B64.decode(text.as_bytes()).unwrap_or_default()
+            };
+            let (p256dh, auth) = (key("p256dh"), key("auth"));
+            let known = allowed_endpoint(endpoint, &self.cfg().push_hosts).is_some();
+            if !known || p256dh.len() != 65 || auth.len() != 16 {
+                return bad();
+            }
+            store.add_push(endpoint, &p256dh, &auth, passkey)
+        } else {
+            store.drop_push(endpoint).map(|()| true)
+        };
+        match saved {
+            Ok(true) => super::text(StatusCode::NO_CONTENT, ""),
+            Ok(false) => super::error(StatusCode::CONFLICT, "10 devices is the most"),
+            Err(_) => super::error(StatusCode::INTERNAL_SERVER_ERROR, "try again"),
+        }
+    }
+
+    /// `POST /api/push/decide {id, verb}`: a notification's button, with the cookie alone. It
+    /// reads the proposal again at the click: `no` for anything waiting, `ok` only for a held
+    /// message or post that needs no strong channel. The rest opens the app, and its passkey.
+    pub(super) async fn push_decide(&self, session: &[u8; 32], body: &Value) -> super::Res {
+        use crate::attach::AttachRequest;
+        use hyper::StatusCode;
+        let fresh = {
+            let mut windows = self.hub.decides.lock().unwrap_or_else(|e| e.into_inner());
+            if windows.len() > 64 {
+                windows.clear(); // ended sessions' windows; at most 20 sessions live
+            }
+            let minute = std::time::Duration::from_secs(60);
+            let window = windows
+                .entry(*session)
+                .or_insert_with(|| super::Window::new(10, minute));
+            window.hit(std::time::Instant::now())
+        };
+        if !fresh {
+            return super::error(StatusCode::TOO_MANY_REQUESTS, "too many; open the app");
+        }
+        let open = || super::error(StatusCode::CONFLICT, "open the app to approve this");
+        let down = || super::error(StatusCode::SERVICE_UNAVAILABLE, "try again");
+        let (Some(id), Some(verb)) = (body["id"].as_i64(), body["verb"].as_str()) else {
+            return open();
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let asked = self.handles.router.send(AttachRequest::Proposals(tx)).await;
+        let (Ok(()), Ok(all)) = (asked, rx.await) else {
+            return down();
+        };
+        let waiting = all["proposals"]
+            .as_array()
+            .and_then(|l| l.iter().find(|p| p["id"] == id));
+        let Some(p) = waiting else {
+            return open();
+        };
+        let quick = matches!(p["kind"].as_str(), Some("run" | "pass" | "wait"))
+            && matches!(p["class"].as_str(), Some("messages" | "posts"))
+            && p["status"] == "pending"
+            && p["strong"] == false;
+        if !(verb == "no" || (verb == "ok" && quick)) {
+            return open();
+        }
+        // As `web`: if a setting changed since, the router's own checks still refuse anything
+        // strong, so a lock-screen button never approves a payment or a loosening.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let decide = AttachRequest::Decide {
+            id,
+            verb: verb.into(),
+            channel: crate::attach::WEB,
+            expect: None,
+            reply: tx,
+        };
+        match (self.handles.router.send(decide).await, rx.await) {
+            (Ok(()), Ok(done)) => super::json(StatusCode::OK, done),
+            _ => down(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

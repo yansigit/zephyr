@@ -651,7 +651,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - else 409 `{"error":"open the app to approve this"}`;
   - then `Decide { channel: "web", expect: None }` → 200 with its `{ok, text}`.
 
-- [ ] **Step 1: Write the failing tests** in `tests/web.rs`. The fake push service is a hyper server on 127.0.0.1 that records each request (headers, body), answering 201 or a status from a file. Set `cfg.push_hosts = ["http://127.0.0.1:PP"]` and `cfg.web_ping = 300ms`. Each subscription gets its own ring `EphemeralPrivateKey`: ring cannot import a static ECDH key, and one ephemeral key decrypts one push.
+- [x] **Step 1: Write the failing tests** in `tests/web.rs`. The fake push service is a hyper server on 127.0.0.1 that records each request (headers, body), answering 201 or a status from a file. Set `cfg.push_hosts = ["http://127.0.0.1:PP"]` and `cfg.web_ping = 300ms`. Each subscription gets its own ring `EphemeralPrivateKey`: ring cannot import a static ECDH key, and one ephemeral key decrypts one push.
   - `a_new_card_is_pushed_encrypted_without_the_agents_reason`:
     - subscribe; hold a `messages` action with `reason: Some("trust me")`;
     - the service receives one POST with `Urgency: high`, `TTL: 86400` and `Content-Encoding: aes128gcm`;
@@ -672,10 +672,14 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
     - `ok` on a money action under `strong_only = ["money"]` → 409;
     - `no` on it → `ok: true`, and the action is `dropped`.
   - `a_subscription_outside_the_allowlist_is_refused` → 400.
-- [ ] **Step 2: Run** `cargo test -p zephyr --test web push` → FAIL.
-- [ ] **Step 3: Implement.** Write the docs.
-- [ ] **Step 4: Run** the same, then `cargo test -p zephyr` → PASS.
-- [ ] **Step 5: Commit** `feat(web): push new cards and replies to the owner's phone, and take deny from a notification`.
+- [x] **Step 2: Run** `cargo test -p zephyr --test web push` → FAIL.
+- [x] **Step 3: Implement.** Write the docs.
+- [x] **Step 4: Run** the same, then `cargo test -p zephyr` → PASS.
+- [x] **Step 5: Commit** `feat(web): push new cards and replies to the owner's phone, and take deny from a notification`.
+- Deviation: the tests' subscriber holds an OpenSSL P-256 key (the crate is already a dependency) instead of a ring `EphemeralPrivateKey`, so one subscription opens several pushes and the ECDH is not ring's on both ends. The frozen-phone test uses `slow` = 2 and `web_ping` = 200 ms, for a wider margin than 1 s and 300 ms.
+- Deviation: `Store::remove_passkey` (W-1) now opens an immediate transaction: the deferred one read first and then failed with `database is locked`, without the busy timeout, when another connection wrote in between (seen once in `web_rm_closes_that_passkeys_socket_at_once`).
+- Deviation: the harness's `up()` waits for an HTTP answer, not a TCP connection: after a restart on the same port, a child another test had just forked could still hold the old listening socket, the kernel completed the connection, and the test went on before the new gateway had started (it then counted the test's next card as one that waited through the restart).
+- Deviation: the three push routes are `impl App` in `push.rs`; the 10-a-minute limit of `/api/push/decide` is a `Window` per session in `Hub`. `push_cards` pushes proposals that are `pending`, not ones waiting out a delay (`shortcut:` in the code), and `/api/push/decide` takes `ok` only while the action is `pending`; any verb but `ok` and `no` is 409. `send` checks the endpoint against the allowlist again before it posts.
 
 ### Task W-9: The app: sign-in, chat, drawer, card sheet, settings, facts, vault, devices
 

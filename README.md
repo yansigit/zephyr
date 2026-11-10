@@ -447,6 +447,16 @@ removes a passkey and signs its devices out (from any channel: use it for a lost
 `/web signout` ends every session. Five failed sign-in attempts in ten minutes close sign-in for
 15 minutes and you are told; devices already signed in keep working.
 
+**Notifications.** On the app's Devices screen, "Turn on notifications" subscribes that device
+(on an iPhone, add the app to the Home Screen first: iOS offers notifications only there). You
+then get a push when something waits for your approval, and when a reply arrives while the app
+is closed. A push says no more than a Discord message would: the kind of action and its summary,
+or the first 120 characters of a reply; never the agent's stated reason. On Android and desktop a
+card's notification has buttons: **Deny** always, and **Approve** only for a message or a post
+that your other channels could approve too. A payment, or anything that loosens a protected
+setting, opens the app, where approving takes your passkey. Up to 10 devices; `/web rm NAME`
+removes a passkey's devices with it.
+
 ## Sending the agent files
 
 Images and files you send on Discord or iMessage are saved for the agent in `~/.zephyr/inbox/`

@@ -116,19 +116,32 @@ fn start_in(home: &Path, port: u16, extra: &str, tweak: impl FnOnce(&mut Config)
     }
 }
 
+/// A connection to a listener of the gateway's, once it is up.
+async fn listening(port: u16) -> tokio::net::TcpStream {
+    for _ in 0..200 {
+        if let Ok(stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            return stream;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("nothing ever listened on port {port}");
+}
+
 impl Gateway {
-    /// Waits for the web listener.
+    /// Waits for the web listener to answer. An answer, not a connection: after a restart on
+    /// the same port, a child another test forked may still hold the old listening socket for
+    /// a moment, and the kernel completes connections to it that nothing will ever accept.
     async fn up(&self) {
         for _ in 0..200 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", self.port))
-                .await
-                .is_ok()
-            {
+            let get = self
+                .req(reqwest::Method::GET, "/")
+                .timeout(Duration::from_millis(500));
+            if get.send().await.is_ok_and(|res| res.status() == 200) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        panic!("the web listener never came up");
+        panic!("the web listener never answered");
     }
 
     /// A request as the app's own page would send it through `tailscale serve`.
@@ -461,9 +474,7 @@ async fn slash_status_answers_on_web_only() {
     let gw = start_in(&home, free_port(), &extra, |_| {});
     gw.up().await;
     // A TUI, attached and subscribed.
-    let tui = tokio::net::TcpStream::connect(("127.0.0.1", attach))
-        .await
-        .unwrap();
+    let tui = listening(attach).await;
     let (read, mut write) = tui.into_split();
     let mut lines = tokio::io::BufReader::new(read).lines();
     for (id, method, params) in [
@@ -1642,6 +1653,444 @@ async fn a_signed_change_is_refused_when_the_value_moved() {
     assert_eq!(
         done,
         json!({"outcome": "refused", "reason": "tasks.parallel changed; look at it again"})
+    );
+    gw.shutdown().await;
+}
+
+// ---- Web Push ----
+
+/// A stand-in for a push service: keeps each request, and answers with `status`.
+struct PushService {
+    origin: String,
+    got: tokio::sync::Mutex<mpsc::UnboundedReceiver<(reqwest::header::HeaderMap, Vec<u8>)>>,
+    status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+}
+
+impl PushService {
+    async fn start() -> Self {
+        use http_body_util::BodyExt;
+        use std::sync::atomic::{AtomicU16, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let (tx, got) = mpsc::unbounded_channel();
+        let status = std::sync::Arc::new(AtomicU16::new(201));
+        let answer = status.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (tx, answer) = (tx.clone(), answer.clone());
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let (tx, answer) = (tx.clone(), answer.clone());
+                            async move {
+                                let (head, body) = req.into_parts();
+                                let body = body.collect().await.unwrap().to_bytes().to_vec();
+                                let _ = tx.send((head.headers, body));
+                                let mut res = hyper::Response::new(http_body_util::Full::new(
+                                    hyper::body::Bytes::new(),
+                                ));
+                                *res.status_mut() =
+                                    hyper::StatusCode::from_u16(answer.load(Ordering::Relaxed))
+                                        .unwrap();
+                                Ok::<_, std::convert::Infallible>(res)
+                            }
+                        },
+                    );
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        Self {
+            origin,
+            got: tokio::sync::Mutex::new(got),
+            status,
+        }
+    }
+
+    /// The next push it was sent.
+    async fn next(&self) -> (reqwest::header::HeaderMap, Vec<u8>) {
+        let mut got = self.got.lock().await;
+        tokio::time::timeout(WAIT, got.recv())
+            .await
+            .expect("a push in time")
+            .unwrap()
+    }
+}
+
+/// A browser's push subscription: a P-256 key of its own (OpenSSL's, so one key opens many
+/// pushes and the ECDH is not ring's on both ends) and an auth secret.
+struct Subscriber {
+    key: openssl::ec::EcKey<openssl::pkey::Private>,
+    auth: [u8; 16],
+}
+
+impl Subscriber {
+    fn new() -> Self {
+        let group = Self::group();
+        let mut auth = [0; 16];
+        openssl::rand::rand_bytes(&mut auth).unwrap();
+        Self {
+            key: openssl::ec::EcKey::generate(&group).unwrap(),
+            auth,
+        }
+    }
+
+    fn group() -> openssl::ec::EcGroup {
+        openssl::ec::EcGroup::from_curve_name(openssl::nid::Nid::X9_62_PRIME256V1).unwrap()
+    }
+
+    fn public(&self) -> Vec<u8> {
+        let mut ctx = openssl::bn::BigNumContext::new().unwrap();
+        let form = openssl::ec::PointConversionForm::UNCOMPRESSED;
+        self.key
+            .public_key()
+            .to_bytes(&Self::group(), form, &mut ctx)
+            .unwrap()
+    }
+
+    /// What `pushManager.subscribe` gives the page to post.
+    fn subscription(&self, endpoint: &str) -> Value {
+        json!({"endpoint": endpoint, "keys": {"p256dh": b64(&self.public()), "auth": b64(&self.auth)}})
+    }
+
+    /// Opens a push body as the browser does: ECDH with the sender's key in the header.
+    fn open(&self, body: &[u8]) -> Value {
+        let (group, mut ctx) = (Self::group(), openssl::bn::BigNumContext::new().unwrap());
+        assert!(body.len() <= 4096, "{}", body.len());
+        let point = openssl::ec::EcPoint::from_bytes(&group, &body[21..86], &mut ctx).unwrap();
+        let theirs = openssl::ec::EcKey::from_public_key(&group, &point).unwrap();
+        let (ours, theirs) = (
+            openssl::pkey::PKey::from_ec_key(self.key.clone()).unwrap(),
+            openssl::pkey::PKey::from_ec_key(theirs).unwrap(),
+        );
+        let mut ecdh = openssl::derive::Deriver::new(&ours).unwrap();
+        ecdh.set_peer(&theirs).unwrap();
+        let secret = ecdh.derive_to_vec().unwrap();
+        let plain = zephyr::web::push::decrypt(&secret, &self.public(), &self.auth, body);
+        serde_json::from_slice(&plain.expect("it decrypts")).unwrap()
+    }
+}
+
+/// A gateway that may push to `service`, a signed-in phone's cookie, and its subscription.
+async fn pushing(name: &str, extra: &str, service: &PushService) -> (Gateway, String, Subscriber) {
+    let extra = format!("[approvals]\npreset = \"manual\"\n{extra}");
+    let origin = service.origin.clone();
+    let gw = start_in(&new_home(name), free_port(), &extra, |cfg| {
+        cfg.push_hosts = vec![origin];
+        cfg.web_ping = Duration::from_millis(200);
+    });
+    gw.up().await;
+    let cookie = gw.cookie("phone");
+    let phone = Subscriber::new();
+    let body = phone.subscription(&format!("{}/push/phone", service.origin));
+    let res = gw
+        .req(reqwest::Method::POST, "/api/push")
+        .header("Cookie", &cookie)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 204);
+    (gw, cookie, phone)
+}
+
+/// The claims of a VAPID header's token, verified under its own `k`, and `k`.
+fn vapid(header: &str) -> (Value, String) {
+    let rest = header.strip_prefix("vapid t=").expect("a vapid header");
+    let (token, k) = rest.split_once(", k=").unwrap();
+    let (signed, signature) = token.rsplit_once('.').unwrap();
+    let point = data_encoding::BASE64URL_NOPAD.decode(k.as_bytes()).unwrap();
+    let signature = data_encoding::BASE64URL_NOPAD
+        .decode(signature.as_bytes())
+        .unwrap();
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, &point)
+        .verify(signed.as_bytes(), &signature)
+        .expect("the token verifies under k");
+    let claims =
+        data_encoding::BASE64URL_NOPAD.decode(signed.split_once('.').unwrap().1.as_bytes());
+    (
+        serde_json::from_slice(&claims.unwrap()).unwrap(),
+        k.to_string(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_card_is_pushed_encrypted_without_the_agents_reason() {
+    let service = PushService::start().await;
+    let (gw, cookie, phone) = pushing("push-card", "", &service).await;
+    let key: Value = gw
+        .req(reqwest::Method::GET, "/api/push/key")
+        .header("Cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(gw.get("/api/push/key").await.status(), 401, "no cookie");
+    let id = gw.hold_send();
+    let (headers, body) = service.next().await;
+    let h = |name: &str| headers[name].to_str().unwrap().to_string();
+    assert_eq!(
+        (h("urgency"), h("ttl")),
+        ("high".to_string(), "86400".to_string())
+    );
+    assert_eq!(
+        (h("content-encoding"), h("content-type")),
+        (
+            "aes128gcm".to_string(),
+            "application/octet-stream".to_string()
+        )
+    );
+    let (claims, k) = vapid(&h("authorization"));
+    assert_eq!(claims["aud"], service.origin);
+    assert_eq!(claims["sub"], "https://zephyr.test");
+    let life = claims["exp"].as_i64().unwrap() - zephyr::now();
+    assert!((43_000..=43_200).contains(&life), "{life}");
+    assert_eq!(key, json!({ "key": k }), "the key the page subscribes with");
+    let card = phone.open(&body);
+    assert_eq!(card["kind"], "card");
+    assert_eq!((&card["id"], &card["quick"]), (&json!(id), &json!(true)));
+    assert_eq!(card["title"], "zephyr: approve #1");
+    assert_eq!(card["body"], "messages: messages to a@x.org");
+    assert!(!card.to_string().contains("trust me"), "{card}");
+    // After a restart the card that is still waiting is not pushed again: the next push is
+    // for the next card.
+    let (home, port) = (gw.home.clone(), gw.port);
+    gw.shutdown().await;
+    let origin = service.origin.clone();
+    let gw = start_in(&home, port, "[approvals]\npreset = \"manual\"\n", |cfg| {
+        cfg.push_hosts = vec![origin]
+    });
+    gw.up().await;
+    let next = gw.hold(ActionKind::Pass, "money", "{}".into());
+    let card = phone.open(&service.next().await.1);
+    assert_eq!(
+        (&card["id"], &card["quick"]),
+        (&json!(next), &json!(false)),
+        "{card}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_is_pushed_only_while_no_socket_is_open() {
+    let service = PushService::start().await;
+    let (gw, cookie, phone) = pushing("push-reply", "", &service).await;
+    let mut ws = gw.ws(&cookie).await;
+    ws.rpc("zephyr.subscribe", json!({})).await;
+    gw.store().notify("web", "web", "[zephyr] one").unwrap();
+    let shown = ws.event(|e| e["type"] == "zephyr_reply").await;
+    assert_eq!(shown["text"], "[zephyr] one");
+    ws.sock.close(None).await.unwrap();
+    ws.closed().await;
+    gw.store().notify("web", "web", "[zephyr] two").unwrap();
+    let (headers, body) = service.next().await;
+    assert_eq!(
+        phone.open(&body),
+        json!({"kind": "reply", "body": "[zephyr] two"}),
+        "the first push"
+    );
+    assert_eq!(headers["ttl"], "3600");
+    assert_eq!(headers["urgency"], "normal");
+    // Pushed once, though it still waits for a socket: the next push is the next row's.
+    gw.store().notify("web", "web", &"3".repeat(500)).unwrap();
+    assert_eq!(phone.open(&service.next().await.1)["body"], "3".repeat(120));
+    // The rows are shown when a socket opens.
+    let mut ws = gw.ws(&cookie).await;
+    ws.rpc("zephyr.subscribe", json!({})).await;
+    let shown = ws.event(|e| e["type"] == "zephyr_reply").await;
+    assert_eq!(shown["text"], "[zephyr] two");
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_phone_that_stops_answering_pings_gets_the_reply_pushed() {
+    let service = PushService::start().await;
+    let (gw, cookie, phone) = pushing("push-frozen", "", &service).await;
+    // The reply takes far longer than two ping intervals.
+    std::fs::write(gw.home.join("slow"), "2").unwrap();
+    let mut ws = gw.ws(&cookie).await;
+    ws.rpc("zephyr.subscribe", json!({})).await;
+    assert_eq!(ws.say("are you there").await["result"]["status"], "sent");
+    // From here the socket is never read again, as on a phone that froze the page: no pong
+    // goes back, so the server closes it and the reply is pushed rather than marked sent.
+    let pushed = phone.open(&service.next().await.1);
+    assert_eq!(
+        pushed,
+        json!({"kind": "reply", "body": "echo: [web #1] are you there"})
+    );
+    drop(ws);
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_410_drops_the_subscription() {
+    let service = PushService::start().await;
+    let (gw, _cookie, _phone) = pushing("push-gone", "", &service).await;
+    service
+        .status
+        .store(500, std::sync::atomic::Ordering::Relaxed);
+    gw.hold_send();
+    service.next().await;
+    service
+        .status
+        .store(410, std::sync::atomic::Ordering::Relaxed);
+    gw.hold_send();
+    service.next().await;
+    // The 500 kept it; the 410 drops it, so the next card goes nowhere.
+    for _ in 0..400 {
+        if gw.store().pushes().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(gw.store().pushes().unwrap().is_empty());
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn push_decide_takes_ok_only_for_quick_messages() {
+    let service = PushService::start().await;
+    let strong = "strong_only = [\"loosen\", \"money\"]\n";
+    let (gw, cookie, _phone) = pushing("push-decide", strong, &service).await;
+    let decide = |id: i64, verb: &'static str| {
+        let req = gw
+            .req(reqwest::Method::POST, "/api/push/decide")
+            .header("Cookie", &cookie);
+        async move {
+            req.json(&json!({"id": id, "verb": verb}))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let message = gw.hold_send();
+    let done = decide(message, "ok").await;
+    assert_eq!(done.status(), 200);
+    let done: Value = done.json().await.unwrap();
+    assert_eq!(done["ok"], true, "{done}");
+    assert!(
+        done["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("[zephyr] approved #1"),
+        "{done}"
+    );
+    assert_eq!(gw.ran(), [(SEND.to_string(), message)]);
+
+    let payload = r#"{"server":"shop","tool":"pay","arguments":{"amount":5,"currency":"USD"}}"#;
+    let payment = gw.hold(ActionKind::Pass, "money", payload.into());
+    let refused = decide(payment, "ok").await;
+    assert_eq!(refused.status(), 409);
+    assert_eq!(
+        refused.json::<Value>().await.unwrap(),
+        json!({"error": "open the app to approve this"})
+    );
+    assert_eq!(gw.status(payment), "pending");
+    let denied = decide(payment, "no").await;
+    assert_eq!(denied.status(), 200);
+    assert_eq!(denied.json::<Value>().await.unwrap()["ok"], true);
+    assert_eq!(gw.status(payment), "dropped");
+    // Nothing waits under that id, an unknown verb, and no cookie.
+    assert_eq!(decide(payment, "no").await.status(), 409);
+    assert_eq!(decide(message, "once").await.status(), 409);
+    assert_eq!(
+        gw.post("/api/push/decide", json!({"id": 1, "verb": "no"}))
+            .await
+            .status(),
+        401
+    );
+    // Ten a minute for a session.
+    for _ in 0..5 {
+        assert_eq!(decide(99, "no").await.status(), 409);
+    }
+    assert_eq!(decide(99, "no").await.status(), 429);
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscription_outside_the_allowlist_is_refused() {
+    let service = PushService::start().await;
+    let (gw, cookie, phone) = pushing("push-allow", "", &service).await;
+    let post = |method: reqwest::Method, body: Value| {
+        let req = gw.req(method, "/api/push").header("Cookie", &cookie);
+        async move { req.json(&body).send().await.unwrap().status().as_u16() }
+    };
+    let (post_, delete) = (reqwest::Method::POST, reqwest::Method::DELETE);
+    assert_eq!(
+        post(post_.clone(), phone.subscription("https://evil.test/push")).await,
+        400
+    );
+    assert_eq!(
+        post(post_.clone(), phone.subscription("http://127.0.0.1:9/push")).await,
+        400
+    );
+    let short = json!({"endpoint": "https://fcm.googleapis.com/fcm/send/x", "keys": {"p256dh": "BA", "auth": "AA"}});
+    assert_eq!(
+        post(post_.clone(), short).await,
+        400,
+        "keys of the wrong size"
+    );
+    assert_eq!(
+        post(
+            post_.clone(),
+            phone.subscription("https://fcm.googleapis.com/fcm/send/x")
+        )
+        .await,
+        204
+    );
+    assert_eq!(
+        gw.post(
+            "/api/push",
+            phone.subscription("https://fcm.googleapis.com/fcm/send/y")
+        )
+        .await
+        .status(),
+        401
+    );
+    let saved: Vec<String> = gw
+        .store()
+        .pushes()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.endpoint)
+        .collect();
+    assert_eq!(
+        saved,
+        [
+            format!("{}/push/phone", service.origin),
+            "https://fcm.googleapis.com/fcm/send/x".to_string()
+        ]
+    );
+    assert_eq!(
+        post(
+            delete,
+            json!({"endpoint": "https://fcm.googleapis.com/fcm/send/x"})
+        )
+        .await,
+        204
+    );
+    assert_eq!(gw.store().pushes().unwrap().len(), 1);
+    // The eleventh device is refused.
+    for n in 0..9 {
+        let endpoint = format!("https://fcm.googleapis.com/fcm/send/{n}");
+        assert_eq!(
+            post(post_.clone(), phone.subscription(&endpoint)).await,
+            204
+        );
+    }
+    assert_eq!(
+        post(
+            post_,
+            phone.subscription("https://fcm.googleapis.com/fcm/send/more")
+        )
+        .await,
+        409
     );
     gw.shutdown().await;
 }

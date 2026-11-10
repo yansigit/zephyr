@@ -3131,7 +3131,10 @@ impl Store {
     /// Deletes a passkey with its pushes and sessions, in one transaction. The number of
     /// sessions ended; `None` when no passkey has that name.
     pub fn remove_passkey(&self, name: &str) -> rusqlite::Result<Option<usize>> {
-        let tx = self.db.unchecked_transaction()?;
+        // Immediate: a deferred one that reads first fails at once ("database is locked"),
+        // without the busy timeout, when another connection writes before its first write.
+        let behavior = rusqlite::TransactionBehavior::Immediate;
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, behavior)?;
         let id: Option<i64> = tx
             .query_row("SELECT id FROM web_passkeys WHERE name = ?1", [name], |r| {
                 r.get(0)

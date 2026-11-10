@@ -286,6 +286,10 @@ pub async fn run<C: Channel>(
     let (gate_notes, notes_rx) = mpsc::channel(16);
     router.gate_notes = Some(notes_rx);
     router.web = cfg.web.is_some().then(|| hub.clone());
+    // Cards that waited through the restart were pushed before it: only newer ones go out.
+    let waiting = router.store.pending_proposals();
+    let newest = waiting.map_or(i64::MAX, |all| all.iter().map(|p| p.id).max().unwrap_or(0));
+    router.pushed_up_to = std::sync::atomic::AtomicI64::new(newest);
     router.keep_upgraded_install_as_it_was().await;
     router.taint_cut_off();
     // Before the first child starts the desktop: one a daemon before this left is no child of
@@ -499,6 +503,12 @@ struct Router<'a> {
     gate_notes: Option<mpsc::Receiver<GateNote>>,
     /// The web app's sockets and sessions (DESIGN §4.3.3), when `[web]` is set; `run` sets it.
     pub(crate) web: Option<Arc<crate::web::Hub>>,
+    /// The newest proposal a Web Push went out for (DESIGN §4.3.3). Atomic, so `push_cards`
+    /// takes `&self` as `publish` does.
+    pushed_up_to: std::sync::atomic::AtomicI64,
+    /// The `web` replies pushed while no web socket was open.
+    /// shortcut: in memory, so a restart may push a reply twice.
+    pushed_replies: HashSet<i64>,
     /// Actions whose held note is in this run already, so the call's end steers it in no more.
     held_steered: HashSet<i64>,
     /// The newest note about an action main was woken for (R49).
@@ -657,6 +667,8 @@ impl<'a> Router<'a> {
             due_held: false,
             gate_notes: None,
             web: None,
+            pushed_up_to: std::sync::atomic::AtomicI64::new(i64::MAX),
+            pushed_replies: HashSet::new(),
             held_steered: HashSet::new(),
             action_woken: 0,
             compacting: None,
@@ -733,6 +745,8 @@ impl<'a> Router<'a> {
                     self.login_starts().await;
                     self.login_notices();
                     self.unpublished_notice();
+                    // A card the gate stored off this loop goes out within a tick.
+                    self.push_cards();
                     if self.cfg.path.is_some() && edits(&self.cfg) != self.edits {
                         let text = self.reload().await;
                         eprintln!("zephyr: zephyr.toml or secrets.env changed: {text}");
@@ -1281,8 +1295,42 @@ impl<'a> Router<'a> {
         self.held_steered.clear();
     }
 
+    /// A Web Push for each proposal that began to wait since the last call (DESIGN §4.3.3):
+    /// its class and summary, facts scrubbed as `zephyr.proposals` gives them, or a setting's
+    /// or command's first line. Never the agent's reason. `quick` says a lock-screen button
+    /// may approve it: a held message or post that needs no strong channel.
+    /// shortcut: a delayed action that comes back to `pending` later is not pushed again.
+    fn push_cards(&self) {
+        use std::sync::atomic::Ordering;
+        let after = self.pushed_up_to.load(Ordering::Relaxed);
+        if self.web.is_none() || after == i64::MAX {
+            return;
+        }
+        let all = self.proposals_json();
+        let mut newest = after;
+        for p in all["proposals"].as_array().into_iter().flatten() {
+            let id = p["id"].as_i64().unwrap_or(0);
+            newest = newest.max(id);
+            if id <= after || p["status"] != "pending" {
+                continue;
+            }
+            let (class, summary) = (p["class"].as_str(), p["summary"].as_str());
+            let body = match (class, summary) {
+                (Some(class), Some(summary)) => format!("{class}: {summary}"),
+                _ => (p["card"].as_str().unwrap_or_default().lines().next())
+                    .unwrap_or_default()
+                    .to_string(),
+            };
+            let quick = matches!(class, Some("messages" | "posts")) && p["strong"] == false;
+            let card = crate::web::push::card(id, &body, quick);
+            crate::web::push::spawn(self.cfg_tx.borrow().clone(), card, "high", 86_400);
+        }
+        self.pushed_up_to.store(newest, Ordering::Relaxed);
+    }
+
     /// Rebuilds the snapshot from the store and config, keeping `run`. Pushed only on change.
     fn publish(&self) {
+        self.push_cards();
         let built = (|| -> anyhow::Result<Snapshot> {
             let day = self.store.today()?;
             let (tokens, cost) = self.store.spend(&day)?;
@@ -4341,6 +4389,11 @@ impl<'a> Router<'a> {
         let web_open = self.web.as_ref().is_some_and(|hub| hub.connected() > 0);
         for row in (rows.iter()).filter(|r| crate::attach::attached(&r.channel)) {
             if row.channel == crate::attach::WEB && !web_open {
+                // Nobody is looking: one push, and the row waits for the next socket.
+                if self.web.is_some() && self.pushed_replies.insert(row.id) {
+                    let reply = crate::web::push::reply(&row.text);
+                    crate::web::push::spawn(self.cfg_tx.borrow().clone(), reply, "normal", 3600);
+                }
                 continue;
             }
             let command =

@@ -154,7 +154,13 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   `attach::Handles`; `admit` checks Host, the Tailscale header (which only ever refuses, and is
   never logged) and Origin before any route, and the files of `assets/web/` are embedded (no
   inline code: a test reads them). `passkey.rs` (WebAuthn ES256) and `push.rs` (RFC 8291
-  aes128gcm, the VAPID token) are pure functions on `ring`, tested against the RFCs' vectors.
+  aes128gcm, the VAPID token) are pure functions on `ring`, tested against the RFCs' vectors;
+  `signin.rs` holds enrolment (a one-time code from a strong channel), sign-in, the cookie, the
+  lockout and `/web`. A decision made in the app is signed over the proposal's digest and its
+  card's hash (`zephyr.web_challenge`), and the router compares both again on its loop before
+  `/ok`. `push::spawn` posts new cards (`Router::push_cards`) and, while no web socket is open,
+  replies, to the allowlisted push services only; `/api/push/decide` (a notification button)
+  approves only what `web` may.
   Two channels: `web` is the session cookie alone and weak; `passkey` is a signed decision and in
   the default `strong_channels`.
 - `inbox.rs`: files the owner sends on Discord or iMessage (DESIGN §4.3). The adapter saves them as

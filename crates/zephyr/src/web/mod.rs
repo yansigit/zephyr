@@ -97,6 +97,8 @@ pub struct Hub {
     limits: std::sync::Mutex<signin::Limits>,
     /// What signed-in sessions are about to sign, each owned by its session.
     signing: passkey::Challenges<passkey::Signed>,
+    /// Each session's notification-button presses this minute: at most 10.
+    decides: std::sync::Mutex<std::collections::HashMap<[u8; 32], Window>>,
 }
 
 /// How long a challenge waits for its signature.
@@ -112,6 +114,7 @@ impl Hub {
             ceremonies: passkey::Challenges::new(CHALLENGE_LIFE, MAX_CHALLENGES),
             limits: std::sync::Mutex::new(signin::Limits::new()),
             signing: passkey::Challenges::new(CHALLENGE_LIFE, MAX_CHALLENGES),
+            decides: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -374,6 +377,24 @@ async fn route(req: Request<Incoming>, path: &str, app: &Arc<App>) -> Res {
             }
         }
         (POST, "/api/logout") => app.logout(req.headers()),
+        (&Method::GET, "/api/push/key")
+        | (POST | &Method::DELETE, "/api/push" | "/api/push/decide") => {
+            let Some(session) = app.session(req.headers()) else {
+                return error(StatusCode::UNAUTHORIZED, "sign in first");
+            };
+            if req.method() == Method::GET {
+                return app.push_key();
+            }
+            let add = req.method() == Method::POST;
+            let Some(body) = body(req).await else {
+                return error(StatusCode::BAD_REQUEST, "the request is malformed");
+            };
+            match path {
+                "/api/push" => app.push_save(add, session.passkey, &body),
+                _ if add => app.push_decide(&session.token_hash, &body).await,
+                _ => text(StatusCode::NOT_FOUND, ""),
+            }
+        }
         (&Method::GET, _) => file(&req, path),
         _ => text(StatusCode::NOT_FOUND, ""),
     }
