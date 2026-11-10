@@ -1824,6 +1824,7 @@ impl<'a> Router<'a> {
             text: m.text,
             tries: 0,
             platform_id: m.platform_msg_id,
+            owner: true,
         };
         if reply.is_empty() {
             // A `/btw` whose answer its task posts.
@@ -1965,10 +1966,10 @@ impl<'a> Router<'a> {
             if !self.busy {
                 self.begin_run().await;
             }
-            // A task's, a process's or an action's report is the daemon's, not the owner's text:
-            // the conversation holds it from now on (DESIGN §4.6).
-            if let Some(reason) = daemon_row(&row.platform_id) {
-                self.taint_session(&reason);
+            // Only a row an owner sent on a channel is the owner's text; any other (a report, a
+            // result, anything zephyr wrote) is in the conversation from now on (DESIGN §4.6).
+            if !row.owner || !self.cfg.is_owner(&row.channel, &row.sender) {
+                self.taint_session(&daemon_row(&row.platform_id));
             }
             // Durable before the child sees it, so recovery knows to look for it, and how.
             self.store.mark_dispatched_as(row.id, sent_as)?;
@@ -4265,6 +4266,11 @@ impl<'a> Router<'a> {
                 Err(e) => return format!("[zephyr] undone, but not sent again: {e}"),
             }
         };
+        // The retried text is the original row's, so it is the owner's only if that row was; a
+        // failed copy leaves it zephyr's.
+        if let Err(e) = self.store.copy_owner(row.id, id) {
+            eprintln!("zephyr: marking the /retry row failed: {e}");
+        }
         // Dispatched from the loop, as a task's report is: this `/retry` row is still `new`.
         self.jobs.inbox.notify_one();
         format!("[zephyr] undone; sending your last message again as #{id}")
@@ -4355,15 +4361,14 @@ enum Trust {
 const UNPLACED: &str =
     "your message, but zephyr could not tell which conversation a restart cut off";
 
-/// What taking in an inbox row with this platform id means for the conversation, when the row
-/// is the daemon's (a task's or a process's report, a held action's result) and not the owner's.
-fn daemon_row(platform_id: &str) -> Option<String> {
-    let (what, n) = platform_id.split_once('-')?;
-    match what {
-        "task" => Some(format!("took in task #{n}'s report")),
-        "proc" => Some(format!("took in process #{n}'s report")),
-        "action" => Some(format!("took in action #{n}'s result")),
-        _ => None,
+/// What taking in an inbox row that is not the owner's means for the conversation, named by its
+/// platform id when zephyr knows what wrote it (a task's or process's report, an action's result).
+fn daemon_row(platform_id: &str) -> String {
+    match platform_id.split_once('-') {
+        Some(("task", n)) => format!("took in task #{n}'s report"),
+        Some(("proc", n)) => format!("took in process #{n}'s report"),
+        Some(("action", n)) => format!("took in action #{n}'s result"),
+        _ => "took in a message zephyr wrote".into(),
     }
 }
 
@@ -4805,6 +4810,7 @@ mod tests {
             text: text.into(),
             tries: 0,
             platform_id: "p".into(),
+            owner: true,
         };
         for text in ["hi", "", "[a #1] nested\nlines"] {
             assert_eq!(

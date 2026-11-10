@@ -387,6 +387,7 @@ async fn restart_with_dispatched_rows_resends_only_what_the_session_lacks() {
             text: text.into(),
             tries: 1,
             platform_id: id.into(),
+            owner: false,
         });
     }
     // Row b is already in the session, answered.
@@ -572,6 +573,7 @@ async fn outbox_rows_for_unconfigured_channels_stay_pending() {
         text: "hi".into(),
         tries: 0,
         platform_id: "x".into(),
+        owner: false,
     };
     store.reply(&row, "stranded", "done").unwrap();
     drop(store);
@@ -1067,15 +1069,51 @@ async fn a_read_file_taints_the_conversation_for_good() {
     gw.shutdown().await;
 }
 
+/// A row zephyr writes into main's inbox itself (a report, a result), as the store does.
+fn daemon_row(home: &Path, id: &str, text: &str) {
+    rusqlite::Connection::open(home.join("state.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO inbox(channel, platform_msg_id, sender, text) VALUES ('chat', ?1, 'owner', ?2)",
+            [id, text],
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_row_zephyr_wrote_taints_whatever_its_id_and_an_owners_never_does() {
+    let home = home("memory-row-origin");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "/new").await;
+    gw.wait_replies(1).await;
+    // An owner's message whose id happens to look like a report's is still the owner's.
+    gw.say("task-5", "owner", "WRITE_MEMORY likes tea").await;
+    reply_starting(&gw, SAVED).await;
+    daemon_row(&home, "note-1", "from zephyr");
+    gw.say("m2", "owner", "hi").await;
+    wait(|| gw.replies().iter().any(|r| r.contains("from zephyr"))).await;
+    gw.say("m3", "owner", "WRITE_MEMORY likes coffee").await;
+    let notice = reply_starting(&gw, "[zephyr] memory change").await;
+    assert!(
+        notice.starts_with(
+            "[zephyr] memory change waiting (from this conversation, which took in a message zephyr wrote at "
+        ),
+        "{notice}"
+    );
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_task_report_taints_the_conversation() {
     let home = home("memory-report");
     let gw = start(config(&home));
     gw.say("m1", "owner", "/new").await;
     gw.wait_replies(1).await;
-    gw.say("task-99", "owner", "report: done").await;
-    gw.wait_replies(2).await;
-    gw.say("m2", "owner", "WRITE_MEMORY likes tea").await;
+    // As `finish_task` writes a report: on the owner's channel, for the owner, but zephyr's.
+    daemon_row(&home, "task-99", "report: done");
+    gw.say("m2", "owner", "hi").await;
+    wait(|| gw.replies().iter().any(|r| r.contains("report: done"))).await;
+    gw.say("m3", "owner", "WRITE_MEMORY likes tea").await;
     let notice = reply_starting(&gw, "[zephyr] memory").await;
     assert!(
         notice.starts_with(
@@ -3820,6 +3858,7 @@ async fn a_message_sent_mid_tool_is_steered_in_and_answered_before_the_run_ends(
         text: "what are you doing?".into(),
         tries: 1,
         platform_id: "m2".into(),
+        owner: true,
     };
     assert_eq!(
         gw.wait_replies(2).await,
@@ -6054,7 +6093,7 @@ fn old_install(home: &Path) {
     )
     .unwrap();
     db.execute_batch(&format!(
-        "DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin; {V16} PRAGMA user_version = 15;"
+        "DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin; ALTER TABLE inbox DROP COLUMN owner; {V16} PRAGMA user_version = 15;"
     ))
         .unwrap();
 }

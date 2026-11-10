@@ -22,6 +22,9 @@ pub struct InboxRow {
     pub tries: i64,
     /// The platform's message id: `task-N`, `proc-N` and `action-N` are the daemon's (B §4.3).
     pub platform_id: String,
+    /// Written by the router from an owner on a channel (`insert_inbox_as` with `new`), or a
+    /// `/retry` of one; every row zephyr writes itself is not (DESIGN §4.6).
+    pub owner: bool,
 }
 
 /// Where a conversation's text came from (DESIGN §4.6): `Unknown` when it has no row, which
@@ -987,6 +990,7 @@ impl Store {
                 "CREATE TABLE session_origin(session TEXT PRIMARY KEY, tainted TEXT, at INTEGER NOT NULL);
                  CREATE TABLE memory_commits(sha TEXT PRIMARY KEY, at INTEGER NOT NULL, origin TEXT NOT NULL, auto INTEGER NOT NULL);
                  ALTER TABLE jobs ADD COLUMN builtin TEXT;
+                 ALTER TABLE inbox ADD COLUMN owner INTEGER NOT NULL DEFAULT 0;
                  INSERT INTO session_origin(session, tainted, at) SELECT 'main', NULL, unixepoch() WHERE NOT EXISTS (SELECT 1 FROM inbox);
                  PRAGMA user_version = 17;",
             )?;
@@ -1057,13 +1061,23 @@ impl Store {
     }
 
     /// As `insert_inbox`, with the status in the same statement: a stranger's row is never `new`.
+    /// The router's write of a channel's message; a `new` one is an owner's (`InboxRow::owner`).
     pub fn insert_inbox_as(&self, m: &Inbound, status: &str) -> rusqlite::Result<Option<i64>> {
         let n = self.db.execute(
-            "INSERT OR IGNORE INTO inbox(channel, platform_msg_id, sender, text, status)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR IGNORE INTO inbox(channel, platform_msg_id, sender, text, status, owner)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5 = 'new')",
             params![m.channel, m.platform_msg_id, m.sender, m.text, status],
         )?;
         Ok((n == 1).then(|| self.db.last_insert_rowid()))
+    }
+
+    /// Row `to` is as much the owner's as row `from` (a `/retry` of it).
+    pub fn copy_owner(&self, from: i64, to: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE inbox SET owner = coalesce((SELECT owner FROM inbox WHERE id = ?1), 0) WHERE id = ?2",
+            params![from, to],
+        )?;
+        Ok(())
     }
 
     /// Makes a `new` row a follow-up: it waits for the run to settle (DESIGN §4.1).
@@ -1136,7 +1150,7 @@ impl Store {
     /// prompt or a continuation), oldest first, each with the reply already sent to it.
     pub fn steered_into_run(&self) -> rusqlite::Result<Vec<(InboxRow, Option<String>)>> {
         let mut stmt = self.db.prepare(
-            "SELECT i.id, i.channel, i.sender, i.text, i.tries, o.text, i.platform_msg_id
+            "SELECT i.id, i.channel, i.sender, i.text, i.tries, o.text, i.platform_msg_id, i.owner
              FROM inbox i LEFT JOIN outbox o ON o.inbox_id = i.id
              WHERE i.sent_as = 'steer' AND i.status IN ('dispatched', 'done')
                AND i.id > (SELECT max(id) FROM inbox
@@ -1152,6 +1166,7 @@ impl Store {
                     text: r.get(3)?,
                     tries: r.get(4)?,
                     platform_id: r.get(6)?,
+                    owner: r.get(7)?,
                 },
                 r.get(5)?,
             ))
@@ -1161,7 +1176,7 @@ impl Store {
 
     pub fn inbox_with_status(&self, status: &str) -> rusqlite::Result<Vec<InboxRow>> {
         let mut stmt = self.db.prepare(
-            "SELECT id, channel, sender, text, tries, platform_msg_id FROM inbox WHERE status = ?1 ORDER BY id",
+            "SELECT id, channel, sender, text, tries, platform_msg_id, owner FROM inbox WHERE status = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map(params![status], |r| {
             Ok(InboxRow {
@@ -1171,6 +1186,7 @@ impl Store {
                 text: r.get(3)?,
                 tries: r.get(4)?,
                 platform_id: r.get(5)?,
+                owner: r.get(6)?,
             })
         })?;
         rows.collect()
@@ -2827,7 +2843,7 @@ impl Store {
     pub fn inbox_row(&self, id: i64) -> rusqlite::Result<Option<InboxRow>> {
         self.db
             .query_row(
-                "SELECT id, channel, sender, text, tries, platform_msg_id FROM inbox WHERE id = ?1",
+                "SELECT id, channel, sender, text, tries, platform_msg_id, owner FROM inbox WHERE id = ?1",
                 params![id],
                 |r| {
                     Ok(InboxRow {
@@ -2837,6 +2853,7 @@ impl Store {
                         text: r.get(3)?,
                         tries: r.get(4)?,
                         platform_id: r.get(5)?,
+                        owner: r.get(6)?,
                     })
                 },
             )
@@ -3599,7 +3616,7 @@ mod tests {
     fn older_databases_migrate_in_order_and_keep_their_rows() {
         // Each case undoes the steps after `version`, as a db made by that build would look:
         // v14's first, while the tables its indexes are on still exist.
-        const V17: &str = "DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin;";
+        const V17: &str = "DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin; ALTER TABLE inbox DROP COLUMN owner;";
         const V16: &str = "DROP TABLE known_targets; DROP TABLE passes; ALTER TABLE proposals DROP COLUMN kind; ALTER TABLE proposals DROP COLUMN class; ALTER TABLE proposals DROP COLUMN targets; ALTER TABLE proposals DROP COLUMN summary; ALTER TABLE proposals DROP COLUMN reason; ALTER TABLE proposals DROP COLUMN payload; ALTER TABLE proposals DROP COLUMN secrets; ALTER TABLE proposals DROP COLUMN origin; ALTER TABLE proposals DROP COLUMN due_at; ALTER TABLE proposals DROP COLUMN settled_at; ALTER TABLE proposals DROP COLUMN result; ALTER TABLE procs DROP COLUMN action; ALTER TABLE proposals DROP COLUMN approved;";
         const V15: &str = "DROP TABLE settings_log; DROP TABLE setting_reverts; ALTER TABLE proposals DROP COLUMN key; ALTER TABLE proposals DROP COLUMN seen; ALTER TABLE proposals DROP COLUMN strong;";
         const V14: &str = "DROP TABLE audit; DROP INDEX inbox_status; DROP INDEX outbox_status; DROP INDEX tasks_status; DROP INDEX procs_status; DROP INDEX runs_job_due;";
@@ -3775,6 +3792,35 @@ mod tests {
         assert_eq!((left[0].sha.as_str(), left[0].auto), ("new", true));
         assert_eq!(store.clear_memory_commits().unwrap(), 1);
         assert!(store.memory_commits_since(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_an_owners_message_is_marked_theirs() {
+        let mut store = Store::open(&crate::test_dir("store-owner-row").join("state.db")).unwrap();
+        let owner = store.insert_inbox_as(&msg("a"), "new").unwrap().unwrap();
+        store.insert_inbox_as(&msg("b"), "dropped").unwrap();
+        let retry = store.insert_inbox(&msg("retry-1-1")).unwrap().unwrap();
+        let task = store
+            .add_task("g", None, None, "chat", "1000")
+            .unwrap()
+            .unwrap();
+        let task = store
+            .tasks(0)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == task)
+            .unwrap();
+        store.finish_task(&task, "completed", "done", 5).unwrap();
+        let rows = store.inbox_with_status("new").unwrap();
+        let owned = |id: &str| rows.iter().find(|r| r.platform_id == id).unwrap().owner;
+        assert!(owned("a"));
+        assert!(!owned("retry-1-1"), "a row zephyr wrote");
+        assert!(!owned(&format!("task-{}", task.id)));
+        store.copy_owner(owner, retry).unwrap();
+        assert!(
+            store.inbox_row(retry).unwrap().unwrap().owner,
+            "a retry is what it retries"
+        );
     }
 
     #[test]
