@@ -593,6 +593,79 @@ pub struct KnownTarget {
     pub added_at: i64,
 }
 
+/// Each table the activity record reads, with the kinds it gives: a branch of the query, bounded
+/// by the window (`?1`) and the cursor (`?3..?5`) itself, so the union never carries rows a page
+/// would drop. `audit` has the index on `ts`, which `ts <= ?3` lets the cursor use too.
+const ACTIVITY_BRANCHES: [(&[&str], &str); 6] = [
+    (
+        &["out", "gate", "refused", "tool"],
+        "SELECT ts, 'audit', id,
+                CASE WHEN tool = 'outbound' THEN 'out'
+                     WHEN outcome IN ('refused', 'denied') THEN 'refused'
+                     WHEN outcome IN ('started', 'error') THEN 'tool' ELSE 'gate' END,
+                session, outcome, iif(tool = 'outbound', args, tool || ' ' || args)
+           FROM audit WHERE ts >= ?1 AND ts <= ?3 AND (ts, 'audit', id) < (?3, ?4, ?5)",
+    ),
+    (
+        &["setting"],
+        "SELECT at, 'settings_log', id, 'setting',
+                actor || coalesce(' on ' || channel, '') || coalesce(' (#' || proposal || ')', ''),
+                actor, key || ' ' || coalesce(old, 'none') || ' → ' || coalesce(new, 'none')
+           FROM settings_log WHERE at >= ?1 AND (at, 'settings_log', id) < (?3, ?4, ?5)",
+    ),
+    (
+        &["proposal"],
+        "SELECT coalesce(settled_at, created_at), 'proposals', id, 'proposal', '#' || id,
+                iif(status = 'pending' AND created_at <= unixepoch() - 86400, 'expired', status),
+                command
+           FROM proposals WHERE kind = 'command' AND coalesce(settled_at, created_at) >= ?1
+            AND (coalesce(settled_at, created_at), 'proposals', id) < (?3, ?4, ?5)",
+    ),
+    (
+        &["job"],
+        "SELECT coalesce(r.ended_at, r.started_at, r.due_at), 'runs', r.id, 'job',
+                '#' || r.job_id || ' run ' || r.id, r.status, coalesce(j.name, '(removed)')
+           FROM runs r LEFT JOIN jobs j ON j.id = r.job_id
+          WHERE coalesce(r.ended_at, r.started_at, r.due_at) >= ?1
+            AND (coalesce(r.ended_at, r.started_at, r.due_at), 'runs', r.id) < (?3, ?4, ?5)",
+    ),
+    (
+        &["task"],
+        "SELECT coalesce(ended_at, started_at, created_at), 'tasks', id, 'task', '#' || id,
+                status, goal
+           FROM tasks WHERE coalesce(ended_at, started_at, created_at) >= ?1
+            AND (coalesce(ended_at, started_at, created_at), 'tasks', id) < (?3, ?4, ?5)",
+    ),
+    (
+        &["process"],
+        "SELECT coalesce(ended_at, created_at), 'procs', id, 'process', '#' || id,
+                status || coalesce(' ' || exit_code, ''), command
+           FROM procs WHERE coalesce(ended_at, created_at) >= ?1
+            AND (coalesce(ended_at, created_at), 'procs', id) < (?3, ?4, ?5)",
+    ),
+];
+
+/// The activity query over only the tables `kinds` (empty: all but `tool`) come from; `None`
+/// when none does.
+fn activity_sql(kinds: &[&str]) -> Option<String> {
+    let asked = |gives: &[&str]| match kinds.is_empty() {
+        true => gives.iter().any(|k| *k != "tool"),
+        false => gives.iter().any(|k| kinds.contains(k)),
+    };
+    let branches: Vec<&str> = (ACTIVITY_BRANCHES.iter())
+        .filter(|(gives, _)| asked(gives))
+        .map(|(_, sql)| *sql)
+        .collect();
+    (!branches.is_empty()).then(|| {
+        format!(
+            "WITH a(at, src, id, kind, subject, status, text) AS ({})
+             SELECT * FROM a WHERE instr(?2, ',' || kind || ',')
+             ORDER BY at DESC, src DESC, id DESC LIMIT ?6",
+            branches.join(" UNION ALL ")
+        )
+    })
+}
+
 /// The latest change recorded for a setting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingChange {
@@ -1895,39 +1968,16 @@ impl Store {
         before: Option<&Cursor>,
         limit: u32,
     ) -> rusqlite::Result<Vec<Record>> {
+        let Some(sql) = activity_sql(kinds) else {
+            return Ok(vec![]);
+        };
         let kinds = if kinds.is_empty() {
             ",out,gate,refused,setting,proposal,job,task,process,".to_string()
         } else {
             format!(",{},", kinds.join(","))
         };
         let (at, src, id) = before.map_or((i64::MAX, "", 0), |c| (c.at, c.src.as_str(), c.id));
-        let mut stmt = self.db.prepare_cached(
-            "WITH a(at, src, id, kind, subject, status, text) AS (
-               SELECT ts, 'audit', id,
-                      CASE WHEN tool = 'outbound' THEN 'out'
-                           WHEN outcome IN ('refused', 'denied') THEN 'refused'
-                           WHEN outcome IN ('started', 'error') THEN 'tool' ELSE 'gate' END,
-                      session, outcome, iif(tool = 'outbound', args, tool || ' ' || args)
-                 FROM audit WHERE ts >= ?1
-               UNION ALL SELECT at, 'settings_log', id, 'setting',
-                      actor || coalesce(' on ' || channel, '') || coalesce(' (#' || proposal || ')', ''),
-                      actor, key || ' ' || coalesce(old, 'none') || ' → ' || coalesce(new, 'none')
-                 FROM settings_log WHERE at >= ?1
-               UNION ALL SELECT coalesce(settled_at, created_at), 'proposals', id, 'proposal', '#' || id,
-                      iif(status = 'pending' AND created_at <= unixepoch() - 86400, 'expired', status), command
-                 FROM proposals WHERE kind = 'command' AND coalesce(settled_at, created_at) >= ?1
-               UNION ALL SELECT coalesce(r.ended_at, r.started_at, r.due_at), 'runs', r.id, 'job',
-                      '#' || r.job_id || ' run ' || r.id, r.status, coalesce(j.name, '(removed)')
-                 FROM runs r LEFT JOIN jobs j ON j.id = r.job_id
-                WHERE coalesce(r.ended_at, r.started_at, r.due_at) >= ?1
-               UNION ALL SELECT coalesce(ended_at, started_at, created_at), 'tasks', id, 'task', '#' || id,
-                      status, goal FROM tasks WHERE coalesce(ended_at, started_at, created_at) >= ?1
-               UNION ALL SELECT coalesce(ended_at, created_at), 'procs', id, 'process', '#' || id,
-                      status || coalesce(' ' || exit_code, ''), command
-                 FROM procs WHERE coalesce(ended_at, created_at) >= ?1)
-             SELECT * FROM a WHERE instr(?2, ',' || kind || ',') AND (at, src, id) < (?3, ?4, ?5)
-             ORDER BY at DESC, src DESC, id DESC LIMIT ?6",
-        )?;
+        let mut stmt = self.db.prepare_cached(&sql)?;
         let rows = stmt.query_map(params![since, kinds, at, src, id, limit], |r| {
             Ok(Record {
                 at: r.get(0)?,
@@ -4256,5 +4306,47 @@ mod tests {
         assert_eq!(store.remove_job(job).unwrap(), JobRemoval::Removed);
         assert_eq!(store.remove_job(job).unwrap(), JobRemoval::Missing);
         let _ = run;
+    }
+
+    /// PR #39 review: a narrow ask reads only the tables it needs (`/activity task 90d` never
+    /// scans `audit` on the router loop), and the audit branch is bounded by its index.
+    #[test]
+    fn a_query_for_one_kind_reads_only_its_table() {
+        let store = Store::open(&crate::test_dir("store-activity-plan").join("state.db")).unwrap();
+        let plan = |kinds: &[&str]| -> String {
+            let sql = activity_sql(kinds).unwrap();
+            let mut stmt = store
+                .db
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let rows = stmt
+                .query_map(params![0, ",task,", i64::MAX, "", 0, 10], |r| {
+                    r.get::<_, String>(3)
+                })
+                .unwrap();
+            rows.map(Result::unwrap).collect::<Vec<_>>().join("\n")
+        };
+        let task = plan(&["task"]);
+        assert!(!task.contains("audit") && task.contains("tasks"), "{task}");
+        assert!(!plan(&["tool"]).contains("settings_log"));
+        let all = plan(&[]);
+        // `runs` is read as `r`.
+        for table in [
+            "audit",
+            "settings_log",
+            "proposals",
+            "SCAN r",
+            "tasks",
+            "procs",
+        ] {
+            assert!(all.contains(table), "{table}: {all}");
+        }
+        assert!(
+            plan(&["out"]).contains("INDEX audit_ts"),
+            "{}",
+            plan(&["out"])
+        );
+        assert_eq!(activity_sql(&["inbox"]), None);
+        assert!(store.activity(0, &["inbox"], None, 10).unwrap().is_empty());
     }
 }
