@@ -65,6 +65,8 @@ pub enum AttachRequest {
     },
     /// `zephyr.proposals`: the proposals still waiting.
     Proposals(oneshot::Sender<Value>),
+    /// A note of zephyr's own for main (the vault's new entry): an inbox row that is no owner's.
+    Notice(Inbound),
     /// `zephyr.activity`: a page of the activity record, or the grants (DESIGN §4.19).
     Activity {
         query: crate::activity::Query,
@@ -523,7 +525,8 @@ impl Conn {
                 sender: "token".into(),
                 text,
             };
-            let _ = self.inbound.send(m).await;
+            // zephyr's words, not the owner's: never through `inbound`, which marks the owner's.
+            let _ = self.router.send(AttachRequest::Notice(m)).await;
         }
         let entries: Vec<Value> = vault.entries().iter().map(Entry::public).collect();
         (vec![ok(id, json!({ "entries": entries }))], false)

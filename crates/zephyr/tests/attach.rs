@@ -919,6 +919,16 @@ async fn zephyr_vault_methods_save_list_and_remove_without_echoing_a_value() {
     assert!(!std::fs::read_to_string(gw.home.join("log.jsonl"))
         .unwrap()
         .contains(PASSWORD));
+    // The notice is zephyr's text, not the owner's: its row is no owner's (DESIGN §4.6).
+    let owner: i64 = rusqlite::Connection::open(gw.home.join("state.db"))
+        .unwrap()
+        .query_row(
+            "SELECT owner FROM inbox WHERE text LIKE '%in the vault; you can use it now'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner, 0);
 
     // A refusal names the problem, never the value.
     let bad = json!({"kind": "token", "name": "lower", "value": PASSWORD});

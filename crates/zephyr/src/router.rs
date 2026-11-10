@@ -1377,6 +1377,12 @@ impl<'a> Router<'a> {
             AttachRequest::Settings(tx) => {
                 let _ = tx.send(self.settings_json());
             }
+            AttachRequest::Notice(m) => {
+                if let Err(e) = self.store.insert_inbox(&m) {
+                    eprintln!("zephyr: inbox write failed: {e}");
+                }
+                log(self.dispatch_new().await);
+            }
             AttachRequest::Goals(tx) => {
                 let _ = tx.send(self.goals_json());
             }
