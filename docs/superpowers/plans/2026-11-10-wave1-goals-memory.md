@@ -145,11 +145,11 @@ Deviation: the spec's `## Goals` paragraph is wrapped at 100 columns in a code b
   ```
 - Judged at `tool_execution_start` from `toolName` and `args.path` (the key `policy::check` reads, policy.rs:42). Clean: `read`/`edit` of exactly `memory/USER.md` or `memory/MEMORY.md`; `write` of `memory/<one or more normal components>`. The path is taken relative to `home` when absolute (else as given); `~`, `..`, `.` or a component starting with `.` taints. Any other call taints, success or not.
 
-- [ ] **Step 1: Write the failing test** `main_taints_on_any_call_off_the_clean_list`: clean — `(read, memory/USER.md)`, `(edit, memory/MEMORY.md)`, `(read, <home>/memory/USER.md)`, `(write, memory/notes/2026-11-10.md)`, `(write, memory/x.md)`; each tainting alone — `(read, memory/notes/x.md)`, `(read, inbox/a.png)`, `(read, ../memory/USER.md)`, `(write, memory/../x)`, `(read, ~/memory/USER.md)`, `(write, memory/.git/config)`, `(write, memory)`, `(write, notes.md)`, `exec`, `process`, `gateway`, `recall`, `task`, `vault`, `mcp_call`, `ls`, `frobnicate`; `exec` then `gateway` → `taint == Some("used exec")`; an `isError` end changes nothing; `Tally::default()` with an `exec` → `None`.
-- [ ] **Step 2:** `cargo test -p zephyr --lib rpc::tests::main_taints` → FAIL.
-- [ ] **Step 3:** Implement.
-- [ ] **Step 4:** `cargo test -p zephyr --lib rpc` → PASS.
-- [ ] **Step 5:** Commit `feat(rpc): tell which of main's tool calls could have read text that is not the owner's`.
+- [x] **Step 1: Write the failing test** `main_taints_on_any_call_off_the_clean_list`: clean — `(read, memory/USER.md)`, `(edit, memory/MEMORY.md)`, `(read, <home>/memory/USER.md)`, `(write, memory/notes/2026-11-10.md)`, `(write, memory/x.md)`; each tainting alone — `(read, memory/notes/x.md)`, `(read, inbox/a.png)`, `(read, ../memory/USER.md)`, `(write, memory/../x)`, `(read, ~/memory/USER.md)`, `(write, memory/.git/config)`, `(write, memory)`, `(write, notes.md)`, `exec`, `process`, `gateway`, `recall`, `task`, `vault`, `mcp_call`, `ls`, `frobnicate`; `exec` then `gateway` → `taint == Some("used exec")`; an `isError` end changes nothing; `Tally::default()` with an `exec` → `None`.
+- [x] **Step 2:** `cargo test -p zephyr --lib rpc::tests::main_taints` → FAIL.
+- [x] **Step 3:** Implement.
+- [x] **Step 4:** `cargo test -p zephyr --lib rpc` → PASS.
+- [x] **Step 5:** Commit `feat(rpc): tell which of main's tool calls could have read text that is not the owner's`.
 
 ### Task B-5: Memory commits with an origin, approved at once only on a clean base
 

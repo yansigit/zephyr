@@ -5,6 +5,7 @@ use crate::config::{Account, Config};
 use anyhow::{anyhow, bail, Context};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -481,6 +482,37 @@ pub struct Tally {
     calls: std::collections::HashMap<String, (String, String)>,
     /// The same call failing with the same error, in a row (DESIGN §4.4).
     streak: Streak,
+    /// Main's home (`Tally::main`): its tool calls are judged against the clean list.
+    home: Option<std::path::PathBuf>,
+    /// The first of main's calls that could have read text that is not the owner's, as
+    /// `used TOOL` (DESIGN §4.6); a task's or job's tally never sets it.
+    pub taint: Option<String>,
+}
+
+/// A call of main's that reads or writes only the memory the owner sees (DESIGN §4.6): `read`
+/// and `edit` of `memory/USER.md` or `memory/MEMORY.md`, `write` of a file under `memory/`. The
+/// path is taken relative to `home` when absolute; `~`, `..`, `.`, an empty part and any
+/// dot-named part make it not clean.
+fn clean_call(home: &Path, tool: &str, path: Option<&str>) -> bool {
+    let (Some(path), Some(home)) = (path, home.to_str()) else {
+        return false;
+    };
+    let rel = match path.starts_with('/') {
+        true => (path.strip_prefix(home.trim_end_matches('/'))).and_then(|r| r.strip_prefix('/')),
+        false => Some(path),
+    };
+    let Some(rel) = rel else { return false };
+    let parts: Vec<&str> = rel.split('/').collect();
+    if parts
+        .iter()
+        .any(|c| c.is_empty() || c.starts_with('.') || c.starts_with('~'))
+    {
+        return false;
+    }
+    matches!(
+        (tool, &parts[..]),
+        ("read" | "edit", ["memory", "USER.md" | "MEMORY.md"]) | ("write", ["memory", _, ..])
+    )
 }
 
 /// Identical failures in a row: the call (tool and args), the error's first line, how many,
@@ -507,7 +539,23 @@ pub const GUARD_STEER: u32 = 3;
 pub const GUARD_STOP: u32 = 5;
 
 impl Tally {
+    /// Main's tally, which judges each tool call against the clean list.
+    pub fn main(home: &Path) -> Tally {
+        Tally {
+            home: Some(home.to_path_buf()),
+            ..Tally::default()
+        }
+    }
+
     pub fn add(&mut self, ev: &Value) {
+        if let (Some(home), None, Some("tool_execution_start")) =
+            (&self.home, &self.taint, ev["type"].as_str())
+        {
+            let tool = ev["toolName"].as_str().unwrap_or("an unnamed tool");
+            if !clean_call(home, tool, ev["args"]["path"].as_str()) {
+                self.taint = Some(format!("used {tool}"));
+            }
+        }
         let m = &ev["message"];
         if ev["type"] == "message_end" && m["role"] == "assistant" {
             self.used.0 += m["usage"]["totalTokens"].as_i64().unwrap_or(0);
@@ -660,6 +708,75 @@ mod tests {
         assert_eq!(kill_leftovers(fake, &dir.join("none")), 0);
         let _ = kept.kill();
         let _ = kept.wait();
+    }
+
+    #[test]
+    fn main_taints_on_any_call_off_the_clean_list() {
+        let home = Path::new("/zephyr");
+        let start = |tool: &str, path: Option<&str>| {
+            let args = path.map_or(
+                serde_json::json!({"command": "ls"}),
+                |p| serde_json::json!({ "path": p }),
+            );
+            serde_json::json!({"type": "tool_execution_start", "toolCallId": "c",
+                               "toolName": tool, "args": args})
+        };
+        let taint = |calls: &[(&str, Option<&str>)]| {
+            let mut tally = Tally::main(home);
+            for (tool, path) in calls {
+                tally.add(&start(tool, *path));
+            }
+            tally.taint
+        };
+        for clean in [
+            ("read", "memory/USER.md"),
+            ("edit", "memory/MEMORY.md"),
+            ("read", "/zephyr/memory/USER.md"),
+            ("write", "memory/notes/2026-11-10.md"),
+            ("write", "memory/x.md"),
+        ] {
+            assert_eq!(taint(&[(clean.0, Some(clean.1))]), None, "{clean:?}");
+        }
+        for (tool, path) in [
+            ("read", Some("memory/notes/x.md")),
+            ("read", Some("inbox/a.png")),
+            ("read", Some("../memory/USER.md")),
+            ("write", Some("memory/../x")),
+            ("read", Some("~/memory/USER.md")),
+            ("write", Some("memory/.git/config")),
+            ("write", Some("memory")),
+            ("write", Some("notes.md")),
+            ("read", Some("/etc/memory/USER.md")),
+            ("read", None),
+            ("exec", None),
+            ("process", None),
+            ("gateway", None),
+            ("recall", None),
+            ("task", None),
+            ("vault", None),
+            ("mcp_call", None),
+            ("ls", None),
+            ("frobnicate", None),
+        ] {
+            assert_eq!(
+                taint(&[(tool, path)]),
+                Some(format!("used {tool}")),
+                "{tool} {path:?}"
+            );
+        }
+        assert_eq!(
+            taint(&[("exec", None), ("gateway", None)]),
+            Some("used exec".into())
+        );
+        let mut tally = Tally::main(home);
+        tally.add(
+            &serde_json::json!({"type": "tool_execution_end", "toolCallId": "c",
+                                      "toolName": "exec", "isError": true}),
+        );
+        assert_eq!(tally.taint, None, "only a start is judged");
+        let mut tally = Tally::default();
+        tally.add(&start("exec", None));
+        assert_eq!(tally.taint, None, "a task's or job's tally never taints");
     }
 
     #[test]
