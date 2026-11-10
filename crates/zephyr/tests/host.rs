@@ -313,13 +313,28 @@ fn ids() -> String {
 
 /// A `docker exec` as the agent (this user, in its home) whose argv starts with `rest`.
 fn find_agent<'a>(calls: &'a [Vec<String>], rest: &[&str]) -> &'a Vec<String> {
+    let proxy = zephyr::agent::PROXY_ENV.iter();
+    let proxy: Vec<String> = proxy.map(|(k, v)| format!("{k}={v}")).collect();
+    let proxy: Vec<&str> = proxy.iter().flat_map(|p| ["-e", p.as_str()]).collect();
+    find_agent_with(calls, &proxy, rest)
+}
+
+/// A `docker exec` as the agent with `proxy` after its PATH: the network floor's variables
+/// (DESIGN §4.19), or nothing under host networking.
+fn find_agent_with<'a>(calls: &'a [Vec<String>], proxy: &[&str], rest: &[&str]) -> &'a Vec<String> {
     let ids = ids();
     let path = format!("PATH={AGENT_PATH}");
     let prefix: Vec<&str> = ["docker", "exec", "-u", &ids, "-w", "/zephyr", "-e", &path]
         .into_iter()
+        .chain(proxy.iter().copied())
         .chain(rest.iter().copied())
         .collect();
     find(calls, &prefix)
+}
+
+/// Whether `call` has `flag` followed by `value`.
+fn has_pair(call: &[String], flag: &str, value: &str) -> bool {
+    call.windows(2).any(|w| w[0] == flag && w[1] == value)
 }
 
 fn mode(path: &Path) -> u32 {
@@ -1107,7 +1122,8 @@ fn login_feeds_secrets_on_stdin_and_records_the_account() {
     let acct = "RPI_CODING_AGENT_DIR=/zephyr/accounts/claude-main";
     let login = find_agent(&calls, &["-i", "-e", acct, CONTAINER, "script", "-qec"]);
     assert!(
-        login[14].starts_with("rpi auth login --provider claude-code --extension /opt/zephyr/ext/"),
+        login[login.len() - 2]
+            .starts_with("rpi auth login --provider claude-code --extension /opt/zephyr/ext/"),
         "{login:?}"
     );
     find_agent(&calls, &["-e", acct, CONTAINER, "rpi", "auth", "check"]);
@@ -1627,7 +1643,21 @@ fn shell_opens_a_login_shell_as_the_agent() {
             "-l",
         ];
         assert!(call.ends_with(&tail.map(String::from)), "{call:?}");
+        // The agent's shell has no route out but the proxy (DESIGN §4.19).
+        assert!(
+            has_pair(call, "-e", "HTTPS_PROXY=http://127.0.0.1:7792"),
+            "{call:?}"
+        );
+        assert!(
+            has_pair(call, "-e", "NO_PROXY=localhost,127.0.0.1,::1"),
+            "{call:?}"
+        );
     }
+    std::fs::write(env.daemon().join("host.toml"), "network = \"host\"\n").unwrap();
+    assert!(env.on_a_tty("shell", &[]).status.success());
+    let calls = env.calls();
+    let call = find_agent_with(&calls, &[], &["-it", "-e", "TERM"]);
+    assert!(!call.iter().any(|a| a.contains("_PROXY")), "{call:?}");
     assert!(!env.zephyr(&["shell", "fish"]).status.success());
 }
 

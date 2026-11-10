@@ -171,8 +171,27 @@ impl Host {
         let user = format!("{}:{}", ids.0, ids.1);
         // The image's `ENV PATH` is root's; the agent's adds its own bin folder.
         let path = format!("PATH={}", crate::agent::AGENT_PATH);
-        let flags = [&["-u", &user, "-w", "/zephyr", "-e", &path], flags].concat();
-        self.exec(&flags, env, argv)
+        // Under the network floor the agent's uid has no route out but the proxy. An unreadable
+        // host.toml counts as bridge: the variables only point at a port nothing else serves.
+        let proxy: &[(&str, &str)] = match self.bridge().unwrap_or(true) {
+            true => crate::agent::PROXY_ENV,
+            false => &[],
+        };
+        let proxy: Vec<String> = proxy.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let mut all = vec!["-u", &user, "-w", "/zephyr", "-e", &path];
+        all.extend(proxy.iter().flat_map(|pair| ["-e", pair.as_str()]));
+        all.extend(flags);
+        self.exec(&all, env, argv)
+    }
+
+    /// Whether host.toml asks for the network floor (DESIGN §4.19): `network = "bridge"`, the
+    /// default, or `"host"`, which runs without it.
+    pub(crate) fn bridge(&self) -> anyhow::Result<bool> {
+        match self.data.host_get("network")?.as_deref() {
+            None | Some("bridge") => Ok(true),
+            Some("host") => Ok(false),
+            Some(_) => anyhow::bail!("network in host.toml must be \"bridge\" or \"host\""),
+        }
     }
 
     /// `docker exec [flags] [-e K=V].. <container> argv..`

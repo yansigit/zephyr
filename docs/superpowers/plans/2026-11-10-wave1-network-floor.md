@@ -138,12 +138,13 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
   ```
   `cmd` calls `proxy` when `egress::bridge()`. There is no `ALL_PROXY` (rpi 0.18 refuses a non-HTTP proxy URL). `Host::bridge(&self) -> anyhow::Result<bool>` reads `host_get("network")`, validated as in Global Constraints. `exec_agent` adds each `PROXY_ENV` pair as `-e K=V` when `self.bridge().unwrap_or(true)`. That covers `zephyr shell`, `login` and `--list-models`.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `bridge_mode_gives_the_agent_the_proxy_and_the_browser_flag`: `proxy(&mut Command::new("true")).get_envs()` holds every `PROXY_ENV` pair, and `AGENT_BROWSER_ARGS` ends with `--proxy-server=http://127.0.0.1:7792`. `PROXY_ENV[0].1 == format!("http://127.0.0.1:{}", egress::PORT)`.
   - `outside_bridge_mode_the_agent_gets_no_proxy`: `cmd(&mut Command::new("true"))` sets none of the keys (the test process has no `ZEPHYR_NETWORK`).
   - `tests/host.rs`: the shell's `docker exec` has `-e HTTPS_PROXY=http://127.0.0.1:7792` with the default host.toml, and has no `HTTPS_PROXY` with `network = "host"`.
-- [ ] **Step 2:** Run → FAIL. **Step 3:** Implement. **Step 4:** `cargo test -p zephyr --lib agent` and `cargo test -p zephyr --test host` → PASS.
-- [ ] **Step 5:** Commit `feat(agent): send the agent's processes and its browser through the network proxy in bridge mode`.
+- [x] **Step 2:** Run → FAIL. **Step 3:** Implement. **Step 4:** `cargo test -p zephyr --lib agent` and `cargo test -p zephyr --test host` → PASS.
+- [x] **Step 5:** Commit `feat(agent): send the agent's processes and its browser through the network proxy in bridge mode`.
+- Deviation: `exec_agent` puts the `-e` proxy pairs straight after `PATH`, before the caller flags, so each existing call keeps its tail; the host tests match them through `find_agent`.
 
 ### Task A2-4: Listeners on the container's address
 
