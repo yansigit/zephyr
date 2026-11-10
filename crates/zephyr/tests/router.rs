@@ -1375,6 +1375,67 @@ fn crate_goal(home: &Path) {
 }
 
 #[tokio::test]
+async fn a_run_cut_off_by_a_restart_taints_its_conversation() {
+    let home = home("memory-restarted");
+    let cfg = config(&home);
+    let store = Store::open(&cfg.db_path()).unwrap();
+    let id = store
+        .insert_inbox(&Inbound {
+            channel: "chat".into(),
+            platform_msg_id: "a".into(),
+            sender: "owner".into(),
+            text: "in flight".into(),
+        })
+        .unwrap()
+        .unwrap();
+    store.mark_dispatched(id).unwrap();
+    assert_eq!(store.session_origin("main").unwrap(), SessionOrigin::Clean);
+    drop(store);
+    let gw = start(cfg);
+    let origin = || {
+        Store::open(&home.join("state.db"))
+            .unwrap()
+            .session_origin("main")
+            .unwrap()
+    };
+    wait(|| matches!(origin(), SessionOrigin::Tainted(_))).await;
+    match origin() {
+        SessionOrigin::Tainted(why) => {
+            assert!(why.starts_with("was cut off by a restart at "), "{why}")
+        }
+        other => panic!("{other:?}"),
+    }
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_taint_that_could_not_be_written_still_holds() {
+    let home = home("memory-taint-fails");
+    let cfg = config(&home);
+    drop(Store::open(&cfg.db_path()).unwrap());
+    rusqlite::Connection::open(cfg.db_path())
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER no_insert BEFORE INSERT ON session_origin BEGIN SELECT RAISE(FAIL, 'full'); END;
+             CREATE TRIGGER no_update BEFORE UPDATE ON session_origin BEGIN SELECT RAISE(FAIL, 'full'); END;",
+        )
+        .unwrap();
+    let gw = start(cfg);
+    gw.say("m1", "owner", r#"[call read {"path": "inbox/a.png"}] look"#)
+        .await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "WRITE_MEMORY likes tea").await;
+    let notice = reply_starting(&gw, "[zephyr] memory").await;
+    assert!(
+        notice.starts_with(
+            "[zephyr] memory change waiting (from this conversation, which used read at "
+        ),
+        "{notice}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_rule_restarts_the_agent_and_leads_its_context() {
     let home = home("rules");
     let gw = start(config(&home));

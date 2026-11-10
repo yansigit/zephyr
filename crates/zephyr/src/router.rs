@@ -279,6 +279,7 @@ pub async fn run<C: Channel>(
     let (gate_notes, notes_rx) = mpsc::channel(16);
     router.gate_notes = Some(notes_rx);
     router.keep_upgraded_install_as_it_was().await;
+    router.taint_cut_off();
     // Commands a re-exec handed over alive are adopted; the rest a dead gateway left running
     // are reported, never re-run (DESIGN §4.13).
     router.procs.adopt(&router.cfg, &mut router.store)?;
@@ -454,6 +455,8 @@ struct Router<'a> {
     trust: Trust,
     /// The run's conversation was tainted already: one `session_origin` write per run.
     run_taint: bool,
+    /// Taints `session_origin` could not take, by session: they hold for this process's life.
+    tainted: HashMap<String, String>,
     /// When the child last said anything, for stall detection (`cap_run`).
     last_event: Instant,
     /// `RESUME_NOTE` was steered into a resumed run and not delivered yet: taken back at the
@@ -619,6 +622,7 @@ impl<'a> Router<'a> {
             run_start: None,
             trust: Trust::Not(crate::memory::LEGACY.into()),
             run_taint: false,
+            tainted: HashMap::new(),
             last_event: Instant::now(),
             note_pending: false,
             cut: None,
@@ -1980,8 +1984,13 @@ impl<'a> Router<'a> {
         self.run_taint = false;
         let now = crate::now();
         let session = self.child.as_ref().and_then(|c| c.session.clone());
+        let failed = session.as_ref().and_then(|s| self.tainted.get(s)).cloned();
         let origin = session.map(|s| self.store.session_origin(&s));
         self.trust = match origin {
+            _ if failed.is_some() => Trust::Not(format!(
+                "this conversation, which {}",
+                failed.unwrap_or_default()
+            )),
             Some(Ok(SessionOrigin::Clean)) if self.writers_since(now) => Trust::Not(BESIDE.into()),
             Some(Ok(SessionOrigin::Clean)) => {
                 match crate::memory::base(&self.cfg.home, self.cfg.state_dir()).await {
@@ -2011,14 +2020,34 @@ impl<'a> Router<'a> {
         }
         self.run_taint = true;
         let why = format!("{reason} at {}", self.clock(crate::now()));
-        let session = self.child.as_ref().and_then(|c| c.session.clone());
-        let written = session.map(|s| self.store.taint(&s, &why));
-        if let Some(Err(e)) = written {
-            eprintln!("zephyr: recording the conversation's taint failed: {e}");
+        if let Some(session) = self.child.as_ref().and_then(|c| c.session.clone()) {
+            self.record_taint(session, &why);
         }
         if let Trust::Owner { .. } = self.trust {
             self.trust = Trust::Not(format!("this conversation, which {why}"));
         }
+    }
+
+    /// `session_origin` takes the taint; when it cannot, this process remembers it.
+    fn record_taint(&mut self, session: String, why: &str) {
+        if let Err(e) = self.store.taint(&session, why) {
+            eprintln!("zephyr: recording the conversation's taint failed: {e}");
+            self.tainted
+                .entry(session)
+                .or_insert_with(|| why.to_string());
+        }
+    }
+
+    /// At start: a run of main in flight when the daemon stopped may have read text whose events
+    /// were never read, so its conversation is not the owner's alone (DESIGN §4.6).
+    fn taint_cut_off(&mut self) {
+        let rows = self.store.inbox_with_status("dispatched");
+        if rows.as_ref().is_ok_and(|r| r.is_empty()) {
+            return;
+        }
+        let session = (self.store.main_session()).unwrap_or_else(|_| MAIN_SESSION.into());
+        let why = format!("was cut off by a restart at {}", self.clock(crate::now()));
+        self.record_taint(session, &why);
     }
 
     /// rpi 0.15 sends no message events for a prompt it accepts, so the router reports the user

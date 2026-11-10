@@ -380,13 +380,15 @@ pub fn commit_if_changed(
     digest: bool,
 ) -> anyhow::Result<Committed> {
     let _guard = lock();
+    // Before any git call: a filter the agent configured would run inside it.
+    let plain = matches!(origin, Origin::Owner { .. }) && plain_git(home);
     let (sha, working) = {
         let _fs = crate::agent::fs();
         (commit_locked(home)?, read_working(home)?)
     };
     let approved = read_approved(state)?;
     let mut label = origin.label();
-    if let Origin::Owner { base } = origin {
+    if let (Origin::Owner { base }, true) = (origin, plain) {
         let on_base = || -> anyhow::Result<bool> {
             let _fs = crate::agent::fs();
             let parents = git(&dir(home), &["rev-list", "--parents", "-n", "1", "HEAD"])?;
@@ -406,6 +408,8 @@ pub fn commit_if_changed(
                 notice,
             });
         }
+        label = RACED.into();
+    } else if let Origin::Owner { .. } = origin {
         label = RACED.into();
     }
     let waiting = |notice| Committed {
@@ -481,7 +485,7 @@ pub fn recorded(store: &crate::store::Store, done: anyhow::Result<Committed>) ->
 /// `None` on any doubt.
 pub fn clean_base(home: &Path, state: &Path) -> Option<String> {
     let _guard = lock();
-    if !approved_dir(state).exists() {
+    if !approved_dir(state).exists() || !plain_git(home) {
         return None;
     }
     let approved = read_approved(state).ok()?;
@@ -491,6 +495,71 @@ pub fn clean_base(home: &Path, state: &Path) -> Option<String> {
     (clean && read_working(home).ok()? == approved)
         .then(|| git(&dir, &["rev-parse", "HEAD"]).ok())
         .flatten()
+}
+
+/// Whether the memory repo's git would run nothing the agent set up: its config holds only what
+/// `git init` and `prepare` write (no filter, include, signing program or attributes file), and
+/// no attributes file is in `.git/info` or anywhere in the working files. Read directly, never
+/// through git, which a filter would already run in. Every doubt is `false`.
+fn plain_git(home: &Path) -> bool {
+    const ALLOWED: [(&str, &[&str]); 2] = [
+        (
+            "core",
+            &[
+                "repositoryformatversion",
+                "filemode",
+                "bare",
+                "logallrefupdates",
+                "ignorecase",
+                "precomposeunicode",
+                "symlinks",
+            ],
+        ),
+        ("user", &["name", "email"]),
+    ];
+    let _fs = crate::agent::fs();
+    let git = dir(home).join(".git");
+    let Ok(config) = std::fs::read_to_string(git.join("config")) else {
+        return false;
+    };
+    let mut keys: &[&str] = &[];
+    for line in config.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            let section = section.trim().to_ascii_lowercase();
+            match ALLOWED.iter().find(|(name, _)| *name == section) {
+                Some((_, allowed)) => keys = allowed,
+                None => return false,
+            }
+            continue;
+        }
+        let key = line.split('=').next().unwrap_or_default().trim();
+        if !keys.contains(&key.to_ascii_lowercase().as_str()) {
+            return false;
+        }
+    }
+    let attributes = git.join("info/attributes");
+    if git.join("config.worktree").exists()
+        || attributes
+            .symlink_metadata()
+            .is_ok_and(|m| !m.is_file() || m.len() > 0)
+    {
+        return false;
+    }
+    // A tracked `.gitattributes` names a filter as surely as the config does.
+    fn has_attributes(dir: &Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return true;
+        };
+        entries.flatten().any(|e| {
+            let name = e.file_name();
+            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+            name == ".gitattributes" || (is_dir && name != ".git" && has_attributes(&e.path()))
+        })
+    }
+    !has_attributes(&dir(home))
 }
 
 /// `clean_base` on a blocking thread.
@@ -1993,5 +2062,28 @@ mod tests {
         assert!(c.auto);
         assert_eq!(c.notice, None);
         assert_eq!(clean_base(&home, &st), Some(head(&home)));
+    }
+
+    #[test]
+    fn a_git_filter_or_attributes_the_agent_set_stop_saving_at_once() {
+        let home = home();
+        let st = state(&home);
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        let base = clean_base(&home, &st).unwrap();
+        // Planted by an earlier run: it would run during the owner's commit, as the agent.
+        git(&dir(&home), &["config", "filter.x.clean", "cat"]).unwrap();
+        assert_eq!(clean_base(&home, &st), None);
+        std::fs::write(dir(&home).join(USER), "# USER.md\nTakes coffee black\n").unwrap();
+        let c = commit_if_changed(&home, &st, &Origin::Owner { base }, false).unwrap();
+        assert!(!c.auto, "{c:?}");
+        say(&home, "/memory ok");
+        git(&dir(&home), &["config", "--remove-section", "filter.x"]).unwrap();
+        assert!(clean_base(&home, &st).is_some());
+        std::fs::write(dir(&home).join(".git/info/attributes"), "* filter=x\n").unwrap();
+        assert_eq!(clean_base(&home, &st), None);
+        std::fs::remove_file(dir(&home).join(".git/info/attributes")).unwrap();
+        std::fs::write(dir(&home).join("notes/.gitattributes"), "* filter=x\n").unwrap();
+        settle(&home);
+        assert_eq!(clean_base(&home, &st), None, "a tracked attributes file");
     }
 }

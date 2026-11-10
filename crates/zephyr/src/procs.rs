@@ -192,7 +192,7 @@ impl Procs {
     /// `docker exec` into the container). Returns how many were killed.
     pub fn kill_strays(&self) -> usize {
         let killed = self
-            .find_strays()
+            .find_strays(false)
             .iter()
             .filter(|(pid, ticks)| kill_exact(*pid, *ticks))
             .count();
@@ -205,11 +205,11 @@ impl Procs {
     /// Whether `kill_strays` would find any (DESIGN §4.6: a stray can write memory, so an owner's
     /// change made while one lives waits). The agent-browser daemon counts.
     pub fn strays_alive(&self) -> bool {
-        !self.find_strays().is_empty()
+        !self.find_strays(true).is_empty()
     }
 
     /// `kill_strays`' search: `(pid, start ticks)` of each.
-    fn find_strays(&self) -> Vec<(i32, i64)> {
+    fn find_strays(&self, strict: bool) -> Vec<(i32, i64)> {
         // In the container the agent's uid is its own; outside, only a test's scope is swept.
         let (uid, scope) = match crate::agent::ids() {
             Some((uid, _)) => (uid, 1),
@@ -224,7 +224,7 @@ impl Procs {
         };
         let mut keep = vec![std::process::id() as i32];
         keep.extend(self.running.lock().unwrap().values().map(|h| h.pgid));
-        strays(&processes(), uid, scope, &keep)
+        strays(&processes(), uid, scope, &keep, strict)
     }
 
     /// Startup: takes over the commands a re-exec handed over alive, and reports the rest
@@ -592,6 +592,8 @@ struct Ps {
     uid: u32,
     ticks: i64,
     comm: String,
+    /// What it runs (`/proc/<pid>/exe`), when that can be read.
+    exe: Option<String>,
 }
 
 /// Every process now, by pid. One that ends while it is read is left out.
@@ -612,6 +614,8 @@ fn processes() -> HashMap<i32, Ps> {
                 ticks: after.nth(17)?.parse().ok()?,
                 uid: uid.split_whitespace().next()?.parse().ok()?,
                 comm: stat[open + 1..close].to_string(),
+                exe: (std::fs::read_link(entry.path().join("exe")).ok())
+                    .map(|p| p.to_string_lossy().into_owned()),
             })
         };
         if let Some(p) = read() {
@@ -626,13 +630,26 @@ const DESKTOP: [&str; 2] = ["Xvfb", "openbox"];
 
 /// `(pid, start ticks)` of each process of `uid` whose parents lead to `scope` without passing
 /// one of `keep` or the desktop. A chain that breaks (a parent not in `all`) is spared.
-fn strays(all: &HashMap<i32, Ps>, uid: u32, scope: i32, keep: &[i32]) -> Vec<(i32, i64)> {
-    let stray = |mut pid: i32| {
+/// `strict` (whether memory can be trusted, DESIGN §4.6): only the desktop's own programs, run
+/// from `/usr/bin`, are spared, not what they started nor a program that only takes their name.
+fn strays(
+    all: &HashMap<i32, Ps>,
+    uid: u32,
+    scope: i32,
+    keep: &[i32],
+    strict: bool,
+) -> Vec<(i32, i64)> {
+    let desktop = |p: &Ps| {
+        let real = p.exe.as_deref() == Some(&format!("/usr/bin/{}", p.comm));
+        DESKTOP.contains(&p.comm.as_str()) && (!strict || real)
+    };
+    let stray = |start: i32| {
+        let mut pid = start;
         for _ in 0..all.len() {
             let Some(p) = all.get(&pid) else {
                 return false;
             };
-            if keep.contains(&pid) || DESKTOP.contains(&p.comm.as_str()) {
+            if keep.contains(&pid) || (desktop(p) && (!strict || pid == start)) {
                 return false;
             }
             if p.ppid == scope {
@@ -1033,6 +1050,7 @@ mod tests {
             uid,
             ticks: 7,
             comm: comm.into(),
+            exe: None,
         };
         // 1 init, 10 the daemon (root), 20 its rpi child, 30 a tracked command, 50 the desktop
         // a crashed daemon left, 60 a `docker exec` shell, 0 its parent outside the namespace.
@@ -1052,7 +1070,7 @@ mod tests {
             (70, ps(1, 8, "someone")),
             (80, ps(99, 9, "orphan")), // its parent ended while /proc was read
         ]);
-        let mut found = strays(&all, 9, 1, &[10, 30]);
+        let mut found = strays(&all, 9, 1, &[10, 30], false);
         found.sort();
         assert_eq!(found, [(40, 7), (41, 7)]);
     }
@@ -1087,5 +1105,29 @@ mod tests {
         let t = tail(&path, MAX_BYTES).unwrap();
         assert!(t.cut && t.text.starts_with("5\n") && t.text.lines().count() == MAX_LINES);
         assert!(t.text(1).ends_with("the whole log is .procs/1.log]"));
+    }
+
+    #[test]
+    fn for_memory_only_the_real_desktop_is_spared() {
+        let ps = |ppid, comm: &str, exe: &str| Ps {
+            ppid,
+            uid: 9,
+            ticks: 7,
+            comm: comm.into(),
+            exe: Some(exe.into()),
+        };
+        let all = HashMap::from([
+            (1, ps(0, "init", "/sbin/init")),
+            (50, ps(1, "Xvfb", "/usr/bin/Xvfb")),
+            (51, ps(50, "xkbcomp", "/usr/bin/xkbcomp")),
+            (52, ps(1, "openbox", "/usr/bin/openbox")),
+            (60, ps(1, "Xvfb", "/zephyr/.local/bin/Xvfb")),
+        ]);
+        let mut loose = strays(&all, 9, 1, &[], false);
+        loose.sort();
+        assert_eq!(loose, [], "kill_strays spares the desktop by name");
+        let mut strict = strays(&all, 9, 1, &[], true);
+        strict.sort();
+        assert_eq!(strict, [(51, 7), (60, 7)]);
     }
 }
