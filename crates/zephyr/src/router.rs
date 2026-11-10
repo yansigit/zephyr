@@ -271,7 +271,7 @@ pub async fn run<C: Channel>(
     let (cfg_tx, cfg_rx) = watch::channel(Arc::new(cfg.clone()));
     let (snap, snap_rx) = watch::channel(Snapshot::default());
     let activity_rx = snap_rx.clone();
-    let attach_cfgs = cfg_rx.clone();
+    let (attach_cfgs, egress_cfgs) = (cfg_rx.clone(), cfg_rx.clone());
     let (gate_cfgs, gate_snap) = (cfg_rx.clone(), snap_rx.clone());
     let names = channels.iter().map(|c| c.name().to_string()).collect();
     let mut router = Router::new(cfg, &jobs, attaches, cfg_tx, snap, names)?;
@@ -294,6 +294,8 @@ pub async fn run<C: Channel>(
         r = runs => r.map(|_| Exit::Shutdown),
         // Tasks' and jobs' sends, every connector call, the browser's clicks (approvals §4.2).
         r = crate::gate::serve(gate_cfgs, gate_snap, waits, &jobs, gate_notes) => r.map(|()| Exit::Shutdown),
+        // The agent's only way out, in bridge mode (DESIGN §4.19).
+        r = crate::egress::serve(egress_cfgs, &jobs) => r.map(|()| Exit::Shutdown),
         r = crate::attach::serve(cfg, tx, attach_tx, snap_rx, attach_cfgs) => r.map(|()| Exit::Shutdown),
         r = crate::scheduler::run(cfg_rx.clone(), &jobs) => r.map(|()| Exit::Shutdown),
         r = crate::tasks::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),

@@ -101,7 +101,7 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
   - Anything else is 400. The store is `Store::open(&cfg.db_path())` held behind a mutex, as the gate's. Rows are written with `gate::audit_row(store, "net", tool, &facts::scrubbed(&cfg, args), outcome)`.
 - `Audit::note`: `allowed` once per `dest`'s `host:port` per `now / 3600`. Refusals count per `now / 60`, rows up to 60. The first note in a later minute first emits `("connect", "", "refused: N more")` when N > 0.
 
-- [ ] **Step 1: Write the failing tests** in `egress.rs` (tokio). Each test serves `serve_on` on `127.0.0.1:0` with a temp config and state dir. The `Floor` has `public = |ip| ip == 127.0.0.1`, `own = 10.255.255.1`, and a test `Lookup` mapping `upstream.test` to `127.0.0.1:<port>` and `rebind.test` to `[127.0.0.1:<port>, 127.0.0.2:<port>]`. The upstream is a local listener counting accepts. Allow entries carry the upstream's dynamic port (`upstream.test:<port>`).
+- [x] **Step 1: Write the failing tests** in `egress.rs` (tokio). Each test serves `serve_on` on `127.0.0.1:0` with a temp config and state dir. The `Floor` has `public = |ip| ip == 127.0.0.1`, `own = 10.255.255.1`, and a test `Lookup` mapping `upstream.test` to `127.0.0.1:<port>` and `rebind.test` to `[127.0.0.1:<port>, 127.0.0.2:<port>]`. The upstream is a local listener counting accepts. Allow entries carry the upstream's dynamic port (`upstream.test:<port>`).
   - `a_connect_tunnel_carries_bytes_both_ways`: listed, `CONNECT upstream.test:<port>` gives `200`, then `ping` goes up and `pong` comes back.
   - `an_absolute_get_arrives_in_origin_form_without_proxy_headers`: the upstream reads `GET /p?q HTTP/1.1`, a `Host` header, and no `Proxy-Authorization` or `Proxy-Connection`.
   - `a_name_with_one_refused_address_is_refused_whole` (Review Focus 2): `CONNECT rebind.test:<port>` (listed) gives `403`, and the upstream's accept count stays 0.
@@ -112,11 +112,15 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
   - `an_unfinished_head_is_closed`: `head_wait: 200 ms`, send `CONNECT x` with no blank line, and read EOF within 2 s.
   - `audit_lists_destinations_hourly_and_folds_refusal_floods` (pure `Audit`): two `Allowed` notes in one hour give 1 row, and the next hour gives 1 more. 61 `Refused` notes in minute 0 give 60 rows. The first note in minute 1 gives `refused: 1 more` and then its own row.
   - `audit_rows_carry_no_fact_value`: a fact saved through the crate's facts API (as `gate.rs`'s tests do), then `CONNECT <value>.example:443`. `store.audit_rows()` shows a `net` row whose args lack the value.
-- [ ] **Step 2:** `cargo test -p zephyr --lib egress` gives FAIL.
-- [ ] **Step 3: Implement** as in Interfaces. Add `"client"` to hyper's features. `cargo deny check advisories bans`.
-- [ ] **Step 4:** `cargo test -p zephyr --lib egress` passes, then `cargo test -p zephyr --test router` (the extra `select!` arm is pending outside bridge mode).
-- [ ] **Step 5: Docs.** DESIGN §4.4 item 3: "General egress is not blocked either" becomes "the agent's egress goes only through the proxy, to public ports 80 and 443 plus `network.allow` (§4.19)". The ClawSafety reasoning stays. §4.16: SMTP, IMAP and other non-HTTP protocols are closed by §4.19, and HTTPS to a mail API with a token the agent holds stays open (A3). README: the `network.allow` row and its typical entries (`imap.gmail.com:993`, `github.com:22`, `homeassistant.lan:8123`).
-- [ ] **Step 6:** Commit `feat(egress): serve the agent's only way out, a proxy that connects only to addresses it checked`.
+- [x] **Step 2:** `cargo test -p zephyr --lib egress` gives FAIL.
+- [x] **Step 3: Implement** as in Interfaces. Add `"client"` to hyper's features. `cargo deny check advisories bans`.
+- [x] **Step 4:** `cargo test -p zephyr --lib egress` passes, then `cargo test -p zephyr --test router` (the extra `select!` arm is pending outside bridge mode).
+- [x] **Step 5: Docs.** DESIGN §4.4 item 3: "General egress is not blocked either" becomes "the agent's egress goes only through the proxy, to public ports 80 and 443 plus `network.allow` (§4.19)". The ClawSafety reasoning stays. §4.16: SMTP, IMAP and other non-HTTP protocols are closed by §4.19, and HTTPS to a mail API with a token the agent holds stays open (A3). README: the `network.allow` row and its typical entries (`imap.gmail.com:993`, `github.com:22`, `homeassistant.lan:8123`).
+- [x] **Step 6:** Commit `feat(egress): serve the agent's only way out, a proxy that connects only to addresses it checked`.
+- Deviation: the embedded-IPv4 refusal reads `private address ::ffff:127.0.0.1`, not `::ffff:7f00:1`: Rust prints a mapped address in dotted form. The test also covers `::ffff:7f00:1`, NAT64, `::127.0.0.1`, a decimal host and the metadata address.
+- Deviation: forwarded requests always get `Host` from the URI the proxy checked, not only when it is missing (RFC 9112 §3.2.2), so a request cannot name one host to the proxy and another to the server.
+- Deviation: audit args and outcomes are scrubbed with `gate::Scrub` (vault, then facts; made `pub(crate)`) rather than `facts::scrubbed` alone, as spec §4.8 and the wave rule say. A refusal reason never repeats the agent text (400 and 502 reasons are fixed strings); the destination is in the row args. 400 and 502 are audited as `refused: …` too.
+- Deviation: connections are served with `keep_alive(false)`, as the webhook is, so the head deadline also bounds an idle connection and a slot cannot be held open for nothing. The upstream is connected before the `200` of a CONNECT, so a dead destination answers 502.
 
 ### Task A2-3: The agent's processes use the proxy
 

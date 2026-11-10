@@ -172,13 +172,20 @@ goes back by itself and you are told. The agent can read all of them. What it ma
 | Setting | The agent may |
 |---|---|
 | `tasks.parallel`, `mcp.NAME.enabled` (a connector off), `settings.strong_channels` (remove a channel), the `budget.*` limits, the `approvals.*` modes and preset, `approvals.strong_only` (add `money`), `mcp.NAME.classes.TOOL` (put a tool in a class) | make it stricter at once (lower, off, fewer channels, a limit where there was none, a stricter mode or preset); you are told and `/set KEY OLD` puts it back. Its `/set` takes one word, so it can tighten approvals to `ask` but not to `delay 10` |
-| `model`, `thinking`, `tasks.model`, `timezone`, `auth.*`, `approvals.currency`, subagents, rules, removing a private fact or allowing it a target, and any change of the above that loosens | propose it: a card shows `KEY old → new` (or the exact `/subagent` or `/rule` text, up to 1500 characters), and `/ok N` applies it, `/no N` drops it |
+| `model`, `thinking`, `tasks.model`, `timezone`, `auth.*`, `approvals.currency`, `network.allow`, subagents, rules, removing a private fact or allowing it a target, and any change of the above that loosens | propose it: a card shows `KEY old → new` (or the exact `/subagent` or `/rule` text, up to 1500 characters), and `/ok N` applies it, `/no N` drops it |
 | `owners`, `[discord]`, `[imessage]`, `[attach]`, `[agent]`, `extensions`, `policy_plugin`, `rpi`, `home`, `state`, the `[[account]]` pool | nothing; edit `zephyr.toml` |
 
 The agent may also save a new private fact at once (it only makes the check stricter); you are told
 its name, and `/facts rm NAME` removes it.
 
-The `budget.*` limits, `settings.strong_channels`, the `approvals.*` settings (the currency too: it
+`network.allow` lists what the agent may reach beyond public addresses on ports 80 and 443, which
+need no entry: exact `HOST:PORT` pairs, comma separated, with no wildcards, e.g.
+`/set network.allow imap.gmail.com:993, github.com:22, homeassistant.lan:8123`. A listed name may
+be on your LAN or tailnet; loopback, link-local addresses (cloud metadata) and the container itself
+are refused even when listed. The value is the whole list, so include the entries you keep. A
+change applies to the next connection.
+
+The `budget.*` limits, `network.allow`, `settings.strong_channels`, the `approvals.*` settings (the currency too: it
 changes what an `auto N` cap lets through), the connector tool classes and the private facts are
 protected: raising a limit, adding a channel, changing the currency, or loosening an approval or a
 fact is accepted only from a strong channel, by default `zephyr

@@ -3,9 +3,22 @@
 
 use anyhow::Context;
 use futures_util::future::BoxFuture;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Bytes, Incoming};
+use hyper::header::{HeaderValue, HOST};
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use url::Host;
+
+use crate::config::Config;
+use crate::store::Store;
 
 /// The proxy's port on the container's loopback.
 pub const PORT: u16 = 7792;
@@ -149,7 +162,7 @@ pub enum Refusal {
 /// The host and port an authority (`host:port`) names. The host is read as a browser reads it
 /// (WHATWG, through `url`), so `2130706433`, `0x7f.1` and `127.1` are all 127.0.0.1.
 pub fn target(authority: &str) -> Result<(Host<String>, u16), Refusal> {
-    let bad = || Refusal::Bad(format!("{authority:?} is not HOST:PORT"));
+    let bad = || Refusal::Bad("the target is not HOST:PORT".into());
     // `url` drops tabs and newlines; an authority holding one is not taken at all.
     if authority.bytes().any(|b| b <= b' ') {
         return Err(bad());
@@ -206,7 +219,7 @@ pub async fn decide(
             let found = tokio::time::timeout(LOOKUP_WAIT, lookup(name.clone(), port)).await;
             match found {
                 Ok(Ok(addrs)) if !addrs.is_empty() => addrs.iter().map(SocketAddr::ip).collect(),
-                _ => return Err(Refusal::Unreachable(format!("{name} has no address"))),
+                _ => return Err(Refusal::Unreachable("the name has no address".into())),
             }
         }
     };
@@ -225,6 +238,309 @@ pub async fn decide(
         .into_iter()
         .map(|ip| SocketAddr::new(ip, port))
         .collect())
+}
+
+/// What the proxy runs with. Tests pass their own.
+#[derive(Clone, Copy)]
+pub struct Floor {
+    pub public: fn(IpAddr) -> bool,
+    /// This container's address, never a destination.
+    pub own: IpAddr,
+    pub lookup: Lookup,
+    /// Connections served at once; one more is closed at once.
+    pub conns: usize,
+    /// How long a client has to send its request head.
+    pub head_wait: Duration,
+    /// How long each checked address gets to answer.
+    pub connect_wait: Duration,
+}
+
+impl Floor {
+    pub fn live() -> anyhow::Result<Floor> {
+        Ok(Floor {
+            public,
+            own: own_ip()?.into(),
+            lookup: system_lookup,
+            conns: 256,
+            head_wait: Duration::from_secs(10),
+            connect_wait: Duration::from_secs(10),
+        })
+    }
+}
+
+/// How a request ended, for the audit.
+pub enum Outcome {
+    Allowed,
+    Refused(String),
+}
+
+/// Refusals written in one minute; the rest of that minute are counted in one closing row.
+const REFUSALS_A_MINUTE: usize = 60;
+
+/// Which audit rows a request leaves: a destination once an hour, and each refusal up to
+/// `REFUSALS_A_MINUTE`, so neither a browser nor a looping agent floods state.db.
+#[derive(Default)]
+pub struct Audit {
+    hour: i64,
+    seen: HashSet<String>,
+    minute: i64,
+    refused: usize,
+}
+
+impl Audit {
+    /// The `(tool, args, outcome)` rows to write for a request to `dest` (`host:port -> ip`).
+    pub fn note(
+        &mut self,
+        now: i64,
+        tool: &str,
+        dest: &str,
+        o: Outcome,
+    ) -> Vec<(String, String, String)> {
+        let mut rows = Vec::new();
+        if now / 60 != self.minute {
+            if let Some(more) = (self.refused.checked_sub(REFUSALS_A_MINUTE)).filter(|m| *m > 0) {
+                rows.push((
+                    "connect".into(),
+                    String::new(),
+                    format!("refused: {more} more"),
+                ));
+            }
+            (self.minute, self.refused) = (now / 60, 0);
+        }
+        let outcome = match o {
+            Outcome::Allowed => {
+                if now / 3600 != self.hour {
+                    self.hour = now / 3600;
+                    self.seen.clear();
+                }
+                let host_port = dest.split(" -> ").next().unwrap_or(dest);
+                (self.seen.insert(host_port.into())).then(|| "allowed".to_string())
+            }
+            Outcome::Refused(reason) => {
+                self.refused += 1;
+                (self.refused <= REFUSALS_A_MINUTE).then(|| format!("refused: {reason}"))
+            }
+        };
+        rows.extend(outcome.map(|o| (tool.into(), dest.into(), o)));
+        rows
+    }
+}
+
+/// What a 403 says after its reason.
+const HINT: &str =
+    "the owner can allow HOST:PORT in network.allow; propose it with gateway /set network.allow\n";
+
+type Body = BoxBody<Bytes, hyper::Error>;
+
+/// One connection's share of the proxy.
+#[derive(Clone)]
+struct Conn {
+    cfgs: watch::Receiver<Arc<Config>>,
+    floor: Floor,
+    log: Arc<Mutex<(Store, Audit)>>,
+    /// Held until the connection and its tunnel are both over.
+    slot: Arc<OwnedSemaphorePermit>,
+}
+
+/// Serves the proxy until dropped. Pending forever outside bridge mode, and when it cannot
+/// start: nothing else listens on its port, so the agent then has no network at all.
+pub async fn serve(
+    cfgs: watch::Receiver<Arc<Config>>,
+    wake: &crate::scheduler::Wake,
+) -> anyhow::Result<()> {
+    if !bridge() {
+        return std::future::pending().await;
+    }
+    let db = cfgs.borrow().db_path();
+    let run = async {
+        let floor = Floor::live()?;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, PORT))
+            .await
+            .with_context(|| format!("binding 127.0.0.1:{PORT}"))?;
+        serve_on(listener, cfgs, floor).await
+    };
+    let Err(e) = run.await else { return Ok(()) };
+    eprintln!("zephyr: the network proxy is down, so the agent has no internet: {e:#}");
+    let notice = format!("[zephyr] the network proxy is down, so the agent has no internet: {e:#}");
+    match Store::open(&db).and_then(|s| s.notify_last_owner(&notice)) {
+        Ok(()) => wake.outbox.notify_one(),
+        Err(e) => eprintln!("zephyr: telling the owner that the proxy is down failed: {e}"),
+    }
+    std::future::pending().await
+}
+
+/// Serves the proxy on `listener`: `CONNECT host:port` tunnels and absolute-form `http://`
+/// requests, each to addresses `decide` passed, and nothing else.
+pub async fn serve_on(
+    listener: TcpListener,
+    cfgs: watch::Receiver<Arc<Config>>,
+    floor: Floor,
+) -> anyhow::Result<()> {
+    let store = Store::open(&cfgs.borrow().db_path()).context("opening state.db")?;
+    let log = Arc::new(Mutex::new((store, Audit::default())));
+    let slots = Arc::new(Semaphore::new(floor.conns));
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            // shortcut: a persistent accept error (e.g. out of fds) retries every 100 ms with no backoff.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            continue; // dropped, so closed at once
+        };
+        let conn = Conn {
+            cfgs: cfgs.clone(),
+            floor,
+            log: log.clone(),
+            slot: Arc::new(slot),
+        };
+        tokio::spawn(async move {
+            let svc = hyper::service::service_fn(move |req| {
+                let conn = conn.clone();
+                async move { Ok::<_, std::convert::Infallible>(conn.answer(req).await) }
+            });
+            // One request per connection, so the head deadline bounds an idle one too.
+            let _ = hyper::server::conn::http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(floor.head_wait)
+                .keep_alive(false)
+                .serve_connection(TokioIo::new(stream), svc)
+                .with_upgrades()
+                .await;
+        });
+    }
+}
+
+impl Conn {
+    async fn answer(self, req: Request<Incoming>) -> Response<Body> {
+        let cfg = self.cfgs.borrow().clone();
+        let uri = req.uri().clone();
+        // The two forms a proxy is asked in; `authority` always carries a port.
+        let (tool, authority) = match (req.method() == Method::CONNECT, uri.authority()) {
+            (true, Some(a)) if uri.scheme().is_none() && uri.path_and_query().is_none() => {
+                ("connect", a.to_string())
+            }
+            (false, Some(a)) if uri.scheme_str() == Some("http") => match a.port() {
+                Some(_) => ("http", a.to_string()),
+                None => ("http", format!("{a}:80")),
+            },
+            _ => ("http", String::new()),
+        };
+        let checked = match target(&authority) {
+            Ok((host, port)) => {
+                // Malformed entries were refused when the file loaded; none means none.
+                let allow = parse_allow(&cfg.network.allow).unwrap_or_default();
+                let f = &self.floor;
+                let addrs = decide(&host, port, &allow, f.own, f.public, f.lookup).await;
+                addrs.map(|addrs| (format!("{host}:{port}"), addrs))
+            }
+            Err(e) => Err(e),
+        };
+        let (dest, addrs) = match checked {
+            Ok(checked) => checked,
+            Err(e) => {
+                let dest = match authority.is_empty() {
+                    true => uri.to_string(),
+                    false => authority,
+                };
+                return self.refuse(&cfg, tool, &dest, e);
+            }
+        };
+        // Only the addresses just checked, never the name again.
+        let Some((upstream, addr)) = connect(&addrs, self.floor.connect_wait).await else {
+            let e = Refusal::Unreachable("no address answered".into());
+            return self.refuse(&cfg, tool, &dest, e);
+        };
+        let dest = format!("{dest} -> {}", addr.ip());
+        if tool == "connect" {
+            self.record(&cfg, tool, &dest, Outcome::Allowed);
+            tokio::spawn(self.tunnel(req, upstream));
+            return Response::new(body(""));
+        }
+        match forward(req, upstream).await {
+            Ok(reply) => {
+                self.record(&cfg, tool, &dest, Outcome::Allowed);
+                reply
+            }
+            Err(_) => {
+                let e = Refusal::Unreachable("the server did not answer".into());
+                self.refuse(&cfg, tool, &dest, e)
+            }
+        }
+    }
+
+    /// Carries bytes between the client and `upstream` until either side closes.
+    async fn tunnel(self, req: Request<Incoming>, mut upstream: TcpStream) {
+        if let Ok(client) = hyper::upgrade::on(req).await {
+            let _ = tokio::io::copy_bidirectional(&mut TokioIo::new(client), &mut upstream).await;
+        }
+        drop(self.slot);
+    }
+
+    /// The reply to a request that is not carried, with its audit row.
+    fn refuse(&self, cfg: &Config, tool: &str, dest: &str, e: Refusal) -> Response<Body> {
+        let (status, reason, text) = match e {
+            Refusal::Bad(r) => (StatusCode::BAD_REQUEST, r, String::new()),
+            Refusal::Denied(r) => (StatusCode::FORBIDDEN, r, HINT.into()),
+            Refusal::Unreachable(r) => (StatusCode::BAD_GATEWAY, r, String::new()),
+        };
+        let mut reply = Response::new(body(&text));
+        *reply.status_mut() = status;
+        // The reason is in the status line, where curl -v and a library's error show it.
+        if let Ok(phrase) = hyper::ext::ReasonPhrase::try_from(format!("zephyr: {reason}")) {
+            reply.extensions_mut().insert(phrase);
+        }
+        self.record(cfg, tool, dest, Outcome::Refused(reason));
+        reply
+    }
+
+    /// Writes the request's audit rows, if it leaves any, with vault and fact values scrubbed.
+    fn record(&self, cfg: &Config, tool: &str, dest: &str, o: Outcome) {
+        let mut log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = log.1.note(crate::now(), tool, dest, o);
+        if rows.is_empty() {
+            return;
+        }
+        let scrub = crate::gate::Scrub::load(cfg);
+        for (tool, args, outcome) in rows {
+            crate::gate::audit_row(&log.0, "net", &tool, &scrub.text(&args), &outcome);
+        }
+    }
+}
+
+fn body(text: &str) -> Body {
+    Full::new(Bytes::from(text.to_owned()))
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+/// A connection to the first of `addrs` that answers within `wait`. It takes addresses, never
+/// a name, so nothing is resolved again between the check and the connect.
+async fn connect(addrs: &[SocketAddr], wait: Duration) -> Option<(TcpStream, SocketAddr)> {
+    for &addr in addrs {
+        if let Ok(Ok(stream)) = tokio::time::timeout(wait, TcpStream::connect(addr)).await {
+            return Some((stream, addr));
+        }
+    }
+    None
+}
+
+/// Sends an absolute-form request on to `upstream` in origin form and returns its reply.
+async fn forward(
+    mut req: Request<Incoming>,
+    upstream: TcpStream,
+) -> anyhow::Result<Response<Body>> {
+    let uri = req.uri().clone();
+    let authority = uri.authority().context("no authority")?.as_str();
+    *req.uri_mut() = uri.path_and_query().map_or("/", |p| p.as_str()).parse()?;
+    let headers = req.headers_mut();
+    headers.remove(hyper::header::PROXY_AUTHORIZATION);
+    headers.remove("proxy-connection");
+    // The server the proxy checked, whatever the request's own header named (RFC 9112 §3.2.2).
+    headers.insert(HOST, HeaderValue::from_str(authority)?);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(upstream)).await?;
+    tokio::spawn(conn);
+    Ok(sender.send_request(req).await?.map(BodyExt::boxed))
 }
 
 #[cfg(test)]
@@ -440,5 +756,353 @@ mod tests {
             decided("self.lan:7790", "self.lan:7790").await,
             denied("172.18.0.2 is never allowed")
         );
+    }
+
+    // The proxy. 127.0.0.1 counts as public here, so a local listener can stand in for the
+    // internet; 127.0.0.2 stays refused.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    const WAIT: Duration = Duration::from_secs(10);
+
+    fn local_is_public(ip: IpAddr) -> bool {
+        ip == IpAddr::V4(Ipv4Addr::LOCALHOST)
+    }
+
+    fn local(host: String, port: u16) -> BoxFuture<'static, std::io::Result<Vec<SocketAddr>>> {
+        let ips: &[&str] = match host.as_str() {
+            "upstream.test" => &["127.0.0.1"],
+            "rebind.test" => &["127.0.0.1", "127.0.0.2"],
+            _ => &[],
+        };
+        let addrs = ips.iter().map(|i| SocketAddr::new(ip(i), port)).collect();
+        Box::pin(async move { Ok(addrs) })
+    }
+
+    fn floor() -> Floor {
+        Floor {
+            public: local_is_public,
+            own: ip("10.255.255.1"),
+            lookup: local,
+            conns: 256,
+            head_wait: WAIT,
+            connect_wait: WAIT,
+        }
+    }
+
+    fn config(dir: &std::path::Path, allow: &str) -> Arc<Config> {
+        let text = format!("rpi = '/r'\nhome = {dir:?}\n[network]\nallow = {allow:?}\n");
+        Arc::new(toml::from_str(&text).unwrap())
+    }
+
+    struct Proxy {
+        addr: SocketAddr,
+        dir: std::path::PathBuf,
+        cfgs: watch::Sender<Arc<Config>>,
+    }
+
+    impl Proxy {
+        async fn start(name: &str, allow: &str, floor: Floor) -> Proxy {
+            let dir = crate::test_dir(name);
+            let (cfgs, rx) = watch::channel(config(&dir, allow));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(serve_on(listener, rx, floor));
+            Proxy { addr, dir, cfgs }
+        }
+
+        /// Sends `head` and returns the connection with the reply's head.
+        async fn ask(&self, head: &str) -> (TcpStream, String) {
+            let mut s = TcpStream::connect(self.addr).await.unwrap();
+            s.write_all(head.as_bytes()).await.unwrap();
+            let reply = head_of(&mut s).await;
+            (s, reply)
+        }
+
+        fn net_rows(&self) -> Vec<(String, String, String)> {
+            let store = Store::open(&config(&self.dir, "").db_path()).unwrap();
+            let rows = store.audit_rows().unwrap().into_iter();
+            rows.filter(|r| r.0 == "net")
+                .map(|r| (r.1, r.2, r.3))
+                .collect()
+        }
+    }
+
+    /// Reads up to the blank line that ends a head.
+    async fn head_of(s: &mut TcpStream) -> String {
+        let mut got = Vec::new();
+        let read = async {
+            while !got.ends_with(b"\r\n\r\n") {
+                let byte = s.read_u8().await.expect("the head ended early");
+                got.push(byte);
+            }
+        };
+        tokio::time::timeout(WAIT, read)
+            .await
+            .expect("no head came");
+        String::from_utf8(got).unwrap()
+    }
+
+    /// A server on 127.0.0.1 that counts its connections. It answers `ping` with `pong`, and
+    /// anything else as an HTTP request, whose head it hands back.
+    struct Upstream {
+        port: u16,
+        accepts: Arc<AtomicUsize>,
+        heads: tokio::sync::mpsc::UnboundedReceiver<String>,
+    }
+
+    async fn upstream() -> Upstream {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let (tx, heads) = tokio::sync::mpsc::unbounded_channel();
+        let count = accepts.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                count.fetch_add(1, Ordering::SeqCst);
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut first = [0u8; 4];
+                    if s.read_exact(&mut first).await.is_err() {
+                        return;
+                    }
+                    if &first == b"ping" {
+                        let _ = s.write_all(b"pong").await;
+                        return;
+                    }
+                    let rest = head_of(&mut s).await;
+                    let _ = tx.send(format!("{}{rest}", String::from_utf8_lossy(&first)));
+                    let _ = s
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                        .await;
+                });
+            }
+        });
+        Upstream {
+            port,
+            accepts,
+            heads,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connect_tunnel_carries_bytes_both_ways() {
+        let up = upstream().await;
+        let dest = format!("upstream.test:{}", up.port);
+        let proxy = Proxy::start("egress-tunnel", &dest, floor()).await;
+        let (mut s, reply) = proxy.ask(&format!("CONNECT {dest} HTTP/1.1\r\n\r\n")).await;
+        assert!(reply.starts_with("HTTP/1.1 200 "), "{reply}");
+        s.write_all(b"ping").await.unwrap();
+        let mut pong = [0u8; 4];
+        tokio::time::timeout(WAIT, s.read_exact(&mut pong))
+            .await
+            .expect("nothing came back")
+            .unwrap();
+        assert_eq!(&pong, b"pong");
+        let row = |tool: &str| {
+            (
+                tool.to_string(),
+                format!("{dest} -> 127.0.0.1"),
+                "allowed".to_string(),
+            )
+        };
+        assert_eq!(proxy.net_rows(), [row("connect")]);
+    }
+
+    #[tokio::test]
+    async fn an_absolute_get_arrives_in_origin_form_without_proxy_headers() {
+        let mut up = upstream().await;
+        let dest = format!("upstream.test:{}", up.port);
+        let proxy = Proxy::start("egress-get", &dest, floor()).await;
+        let head = format!(
+            "GET http://{dest}/p?q HTTP/1.1\r\nHost: other.example\r\nProxy-Authorization: Basic eDp5\r\n\
+             Proxy-Connection: keep-alive\r\nX-Kept: 1\r\n\r\n"
+        );
+        let (mut s, reply) = proxy.ask(&head).await;
+        assert!(reply.starts_with("HTTP/1.1 200 "), "{reply}");
+        let mut body = [0u8; 2];
+        s.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"ok");
+        let seen = up.heads.recv().await.unwrap().to_lowercase();
+        assert!(seen.starts_with("get /p?q http/1.1\r\n"), "{seen}");
+        // The host is the one the proxy checked, whatever the request's own header said.
+        assert!(seen.contains(&format!("\r\nhost: {dest}\r\n")), "{seen}");
+        assert!(seen.contains("\r\nx-kept: 1\r\n"), "{seen}");
+        assert!(
+            !seen.contains("proxy-") && !seen.contains("other.example"),
+            "{seen}"
+        );
+        assert_eq!(proxy.net_rows()[0].0, "http");
+    }
+
+    #[tokio::test]
+    async fn a_name_with_one_refused_address_is_refused_whole() {
+        let up = upstream().await;
+        let dest = format!("rebind.test:{}", up.port);
+        let proxy = Proxy::start("egress-rebind", &dest, floor()).await;
+        let (_s, reply) = proxy.ask(&format!("CONNECT {dest} HTTP/1.1\r\n\r\n")).await;
+        assert!(
+            reply.starts_with("HTTP/1.1 403 zephyr: loopback is never allowed\r\n"),
+            "{reply}"
+        );
+        let (_s, reply) = proxy.ask("CONNECT rebind.test:443 HTTP/1.1\r\n\r\n").await;
+        assert!(
+            reply.starts_with("HTTP/1.1 403 zephyr: private address 127.0.0.2\r\n"),
+            "{reply}"
+        );
+        // The replies are out, so a connection to the public address would have been made by now.
+        assert_eq!(up.accepts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_embedded_ipv4_literal_is_refused() {
+        let real = Floor { public, ..floor() };
+        let proxy = Proxy::start("egress-mapped", "", real).await;
+        for (literal, shown) in [
+            ("[::ffff:127.0.0.1]", "::ffff:127.0.0.1"),
+            ("[::ffff:7f00:1]", "::ffff:127.0.0.1"),
+            ("[64:ff9b::a9fe:a9fe]", "64:ff9b::a9fe:a9fe"),
+            ("[::127.0.0.1]", "::7f00:1"),
+            ("2130706433", "127.0.0.1"),
+            ("169.254.169.254", "169.254.169.254"),
+        ] {
+            let (_s, reply) = proxy
+                .ask(&format!("CONNECT {literal}:443 HTTP/1.1\r\n\r\n"))
+                .await;
+            let line = format!("HTTP/1.1 403 zephyr: private address {shown}\r\n");
+            assert!(reply.starts_with(&line), "{literal}: {reply}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_port_is_refused_until_the_owner_lists_it() {
+        let up = upstream().await;
+        let dest = format!("upstream.test:{}", up.port);
+        let proxy = Proxy::start("egress-port", "", floor()).await;
+        let connect = format!("CONNECT {dest} HTTP/1.1\r\n\r\n");
+        let (mut s, reply) = proxy.ask(&connect).await;
+        let line = format!(
+            "HTTP/1.1 403 zephyr: port {} needs network.allow\r\n",
+            up.port
+        );
+        assert!(reply.starts_with(&line), "{reply}");
+        let mut body = String::new();
+        s.read_to_string(&mut body).await.unwrap();
+        assert!(
+            body.contains("propose it with gateway /set network.allow"),
+            "{body}"
+        );
+        assert_eq!(up.accepts.load(Ordering::SeqCst), 0);
+        let refusal = format!("refused: port {} needs network.allow", up.port);
+        assert_eq!(
+            proxy.net_rows(),
+            [("connect".into(), dest.clone(), refusal)]
+        );
+
+        proxy.cfgs.send(config(&proxy.dir, &dest)).unwrap();
+        let (_s, reply) = proxy.ask(&connect).await;
+        assert!(reply.starts_with("HTTP/1.1 200 "), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn absolute_form_follows_the_same_rules() {
+        let up = upstream().await;
+        let proxy = Proxy::start("egress-forms", "", floor()).await;
+        let proxy = &proxy;
+        let status = |head: String| async move {
+            let (_s, reply) = proxy.ask(&head).await;
+            reply[..12].to_string()
+        };
+        let get = format!("GET http://upstream.test:{}/ HTTP/1.1\r\n\r\n", up.port);
+        assert_eq!(status(get).await, "HTTP/1.1 403");
+        for bad in [
+            "GET https://example.com/ HTTP/1.1\r\n\r\n",
+            "CONNECT example.com HTTP/1.1\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: upstream.test\r\n\r\n",
+            "GET http://user@upstream.test/ HTTP/1.1\r\n\r\n",
+            "GET ftp://upstream.test/ HTTP/1.1\r\n\r\n",
+        ] {
+            assert_eq!(status(bad.into()).await, "HTTP/1.1 400", "{bad}");
+        }
+        assert_eq!(up.accepts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_full_proxy_refuses_at_once() {
+        let two = Floor {
+            conns: 2,
+            ..floor()
+        };
+        let proxy = Proxy::start("egress-full", "", two).await;
+        let _a = TcpStream::connect(proxy.addr).await.unwrap();
+        let _b = TcpStream::connect(proxy.addr).await.unwrap();
+        let mut third = TcpStream::connect(proxy.addr).await.unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(1), third.read(&mut [0u8; 1])).await;
+        assert!(matches!(closed, Ok(Ok(0) | Err(_))), "{closed:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_head_is_closed() {
+        let quick = Floor {
+            head_wait: Duration::from_millis(200),
+            ..floor()
+        };
+        let proxy = Proxy::start("egress-head", "", quick).await;
+        let mut s = TcpStream::connect(proxy.addr).await.unwrap();
+        s.write_all(b"CONNECT x").await.unwrap();
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut rest)).await;
+        assert!(closed.is_ok(), "the connection stayed open");
+    }
+
+    #[test]
+    fn audit_lists_destinations_hourly_and_folds_refusal_floods() {
+        let mut a = Audit::default();
+        let dest = "example.com:443 -> 1.1.1.1";
+        let allowed = [(
+            "connect".to_string(),
+            dest.to_string(),
+            "allowed".to_string(),
+        )];
+        assert_eq!(a.note(0, "connect", dest, Outcome::Allowed), allowed);
+        let other_ip = "example.com:443 -> 1.0.0.1";
+        assert_eq!(a.note(3599, "connect", other_ip, Outcome::Allowed), []);
+        assert_eq!(a.note(3600, "connect", dest, Outcome::Allowed), allowed);
+
+        let mut a = Audit::default();
+        let refuse =
+            |a: &mut Audit, now| a.note(now, "http", "x:22", Outcome::Refused("no".into()));
+        let rows: usize = (0..61).map(|_| refuse(&mut a, 59).len()).sum();
+        assert_eq!(rows, 60);
+        let row = |tool: &str, args: &str, outcome: &str| {
+            (tool.to_string(), args.to_string(), outcome.to_string())
+        };
+        assert_eq!(
+            refuse(&mut a, 60),
+            [
+                row("connect", "", "refused: 1 more"),
+                row("http", "x:22", "refused: no")
+            ]
+        );
+        assert_eq!(refuse(&mut a, 120), [row("http", "x:22", "refused: no")]);
+    }
+
+    #[tokio::test]
+    async fn audit_rows_carry_no_fact_value() {
+        let proxy = Proxy::start("egress-facts", "", floor()).await;
+        let fact = "[[fact]]\nname = \"phone\"\nkind = \"digits\"\nvalue = \"5550102345\"\n";
+        std::fs::write(crate::facts::path(&config(&proxy.dir, "")), fact).unwrap();
+        let (_s, reply) = proxy
+            .ask("CONNECT 5550102345.example:443 HTTP/1.1\r\n\r\n")
+            .await;
+        assert!(reply.starts_with("HTTP/1.1 502 "), "{reply}");
+        let rows = proxy.net_rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].2.starts_with("refused: "), "{rows:?}");
+        assert!(rows[0].1.contains("[fact:phone]"), "{rows:?}");
+        assert!(!format!("{rows:?}").contains("5550102345"), "{rows:?}");
     }
 }
