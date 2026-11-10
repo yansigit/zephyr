@@ -4,6 +4,9 @@
 
 pub mod passkey;
 pub mod push;
+mod signin;
+
+pub use signin::{command, cookie, devices, Ceremony};
 
 use crate::attach::{Handles, MAX_LINE};
 use crate::config::{Config, Web};
@@ -88,13 +91,23 @@ const ETAG: &str = concat!("\"", env!("CARGO_PKG_VERSION"), "\"");
 pub struct Hub {
     sockets: AtomicUsize,
     revoked: watch::Sender<u64>,
+    /// Enrolments and sign-ins between their start and finish: 2 min each, at most 16.
+    ceremonies: passkey::Challenges<Ceremony>,
+    limits: std::sync::Mutex<signin::Limits>,
 }
+
+/// How long a challenge waits for its signature.
+const CHALLENGE_LIFE: Duration = Duration::from_secs(120);
+/// Challenges waiting at once, in each queue; one more drops the oldest.
+const MAX_CHALLENGES: usize = 16;
 
 impl Hub {
     pub fn new() -> Arc<Hub> {
         Arc::new(Hub {
             sockets: AtomicUsize::new(0),
             revoked: watch::channel(0).0,
+            ceremonies: passkey::Challenges::new(CHALLENGE_LIFE, MAX_CHALLENGES),
+            limits: std::sync::Mutex::new(signin::Limits::new()),
         })
     }
 
@@ -208,6 +221,19 @@ fn text(code: StatusCode, body: &'static str) -> Res {
     res
 }
 
+fn json(code: StatusCode, body: serde_json::Value) -> Res {
+    let mut res = Response::new(Full::new(Bytes::from(body.to_string())));
+    *res.status_mut() = code;
+    let kind = HeaderValue::from_static("application/json");
+    res.headers_mut().insert(header::CONTENT_TYPE, kind);
+    res
+}
+
+/// A refusal the page shows: `{"error": why}`. Never a value from the request.
+fn error(code: StatusCode, why: &str) -> Res {
+    json(code, serde_json::json!({ "error": why }))
+}
+
 /// What every listener task needs.
 struct App {
     web: Web,
@@ -302,18 +328,56 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Res {
             "open the app through tailscale serve",
         ),
         Err(code) => text(code, ""),
-        Ok(()) => route(req, &path, &app),
+        Ok(()) => route(req, &path, &app).await,
     };
     secure(res.headers_mut(), &app.web.host, path.starts_with("/api/"));
     res
 }
 
-fn route(req: Request<Incoming>, path: &str, app: &Arc<App>) -> Res {
-    if (req.method(), path) == (&Method::GET, "/api/ws") {
-        return ws(req, app);
+/// The most a request's body may hold.
+const MAX_BODY: usize = 64 * 1024;
+
+async fn route(req: Request<Incoming>, path: &str, app: &Arc<App>) -> Res {
+    const POST: &Method = &Method::POST;
+    match (req.method(), path) {
+        (&Method::GET, "/api/ws") => ws(req, app),
+        (
+            POST,
+            "/api/enrol/start" | "/api/enrol/finish" | "/api/login/start" | "/api/login/finish",
+        ) => {
+            // Before the body is read: a closed or flooded sign-in costs nothing more.
+            if let Some(res) = app.closed() {
+                return res;
+            }
+            let Some(body) = body(req).await else {
+                return error(StatusCode::BAD_REQUEST, "the request is malformed");
+            };
+            match path {
+                "/api/enrol/start" => app.enrol_start(&body).await,
+                "/api/enrol/finish" => app.enrol_finish(&body).await,
+                "/api/login/start" => app.login_start(),
+                _ => app.login_finish(&body).await,
+            }
+        }
+        (POST, "/api/logout") => app.logout(req.headers()),
+        (&Method::GET, _) => file(&req, path),
+        _ => text(StatusCode::NOT_FOUND, ""),
     }
+}
+
+/// A request's JSON object, of at most `MAX_BODY` bytes.
+async fn body(req: Request<Incoming>) -> Option<serde_json::Value> {
+    use http_body_util::BodyExt;
+    let body = http_body_util::Limited::new(req.into_body(), MAX_BODY);
+    let bytes = body.collect().await.ok()?.to_bytes();
+    serde_json::from_slice(&bytes)
+        .ok()
+        .filter(serde_json::Value::is_object)
+}
+
+fn file(req: &Request<Incoming>, path: &str) -> Res {
     match FILES.iter().find(|f| f.0 == path) {
-        Some(&(_, kind, bytes)) if req.method() == Method::GET => {
+        Some(&(_, kind, bytes)) => {
             let fresh = req
                 .headers()
                 .get(header::IF_NONE_MATCH)
@@ -327,7 +391,7 @@ fn route(req: Request<Incoming>, path: &str, app: &Arc<App>) -> Res {
             h.insert(header::ETAG, HeaderValue::from_static(ETAG));
             res
         }
-        _ => text(StatusCode::NOT_FOUND, ""),
+        None => text(StatusCode::NOT_FOUND, ""),
     }
 }
 

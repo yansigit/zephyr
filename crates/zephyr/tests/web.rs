@@ -2,8 +2,6 @@
 //! child (tests/fake-rpi.py). Requests carry what `tailscale serve` and a browser on the app's
 //! own origin would send.
 
-#![allow(dead_code)] // the harness is filled in as the routes arrive
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -43,7 +41,7 @@ struct Gateway {
     home: PathBuf,
     port: u16,
     say: mpsc::Sender<Inbound>,
-    sent: mpsc::UnboundedReceiver<Outbound>,
+    sent: tokio::sync::Mutex<mpsc::UnboundedReceiver<Outbound>>,
     stop: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<anyhow::Result<zephyr::router::Exit>>,
 }
@@ -112,7 +110,7 @@ fn start_in(home: &Path, port: u16, extra: &str, tweak: impl FnOnce(&mut Config)
         home: home.to_path_buf(),
         port,
         say,
-        sent: got,
+        sent: tokio::sync::Mutex::new(got),
         stop,
         task,
     }
@@ -616,5 +614,649 @@ async fn a_frame_over_1_mib_or_with_a_newline_closes_the_socket() {
     }
     let _ = busy.sock.send(Message::Text("{}".into())).await;
     busy.closed().await;
+    gw.shutdown().await;
+}
+
+// ---- enrolment, sign-in and /web ----
+
+use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+
+/// A software authenticator: a P-256 key that answers `navigator.credentials` as a platform
+/// passkey would, with user verification.
+struct Authenticator {
+    key: EcdsaKeyPair,
+    rng: ring::rand::SystemRandom,
+    id: Vec<u8>,
+}
+
+impl Authenticator {
+    fn new(id: &str) -> Self {
+        let rng = ring::rand::SystemRandom::new();
+        let alg = &ECDSA_P256_SHA256_ASN1_SIGNING;
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(alg, &rng).unwrap();
+        Self {
+            key: EcdsaKeyPair::from_pkcs8(alg, pkcs8.as_ref(), &rng).unwrap(),
+            rng,
+            id: id.as_bytes().to_vec(),
+        }
+    }
+
+    fn client_data(kind: &str, options: &Value) -> Vec<u8> {
+        json!({"type": kind, "challenge": options["challenge"], "origin": ORIGIN, "crossOrigin": false})
+            .to_string()
+            .into_bytes()
+    }
+
+    /// rpIdHash, the flags (UP, UV, and AT for a registration) and a zero sign count.
+    fn auth_data(flags: u8) -> Vec<u8> {
+        let mut out = sha256(HOST.as_bytes()).to_vec();
+        out.push(flags);
+        out.extend_from_slice(&[0; 4]);
+        out
+    }
+
+    /// What the page posts to `enrol/finish`, less `challengeId` and `name`.
+    fn create(&self, options: &Value) -> Value {
+        assert_eq!(options["rp"]["id"], HOST);
+        assert_eq!(
+            options["pubKeyCredParams"],
+            json!([{"type": "public-key", "alg": -7}])
+        );
+        let mut auth = Self::auth_data(0x45);
+        auth.extend_from_slice(&[0; 16]);
+        auth.extend_from_slice(&(self.id.len() as u16).to_be_bytes());
+        auth.extend_from_slice(&self.id);
+        let mut spki = data_encoding::HEXLOWER
+            .decode(b"3059301306072a8648ce3d020106082a8648ce3d030107034200")
+            .unwrap();
+        spki.extend_from_slice(self.key.public_key().as_ref());
+        json!({"id": b64(&self.id), "clientDataJSON": b64(&Self::client_data("webauthn.create", options)),
+            "authenticatorData": b64(&auth), "publicKey": b64(&spki), "alg": -7})
+    }
+
+    /// What the page posts to `login/finish`, or sends as an `assertion`.
+    fn get(&self, options: &Value) -> Value {
+        assert_eq!(options["rpId"], HOST);
+        assert_eq!(options["userVerification"], "required");
+        let client = Self::client_data("webauthn.get", options);
+        let auth = Self::auth_data(0x05);
+        let mut msg = auth.clone();
+        msg.extend_from_slice(&sha256(&client));
+        let signature = self.key.sign(&self.rng, &msg).unwrap();
+        json!({"id": b64(&self.id), "clientDataJSON": b64(&client), "authenticatorData": b64(&auth),
+            "signature": b64(signature.as_ref())})
+    }
+}
+
+/// `value` with the fields of `more` added.
+fn with(mut value: Value, more: Value) -> Value {
+    for (k, v) in more.as_object().unwrap() {
+        value[k] = v.clone();
+    }
+    value
+}
+
+const COOKIE_PATTERN: &str = "; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=2592000";
+
+/// The `name=value` of a response's session cookie, after checking its attributes.
+fn set_cookie(res: &reqwest::Response) -> String {
+    let header = res.headers()["set-cookie"].to_str().unwrap();
+    let (pair, attributes) = header.split_at(header.find(';').unwrap());
+    assert_eq!(attributes, COOKIE_PATTERN);
+    let token = pair
+        .strip_prefix("__Host-zephyr=")
+        .expect("the cookie's name");
+    assert_eq!(
+        data_encoding::BASE64URL_NOPAD
+            .decode(token.as_bytes())
+            .unwrap()
+            .len(),
+        32
+    );
+    pair.to_string()
+}
+
+impl Gateway {
+    async fn say(&self, channel: &str, text: &str) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let m = Inbound {
+            channel: channel.into(),
+            platform_msg_id: format!("m{n}"),
+            sender: "owner".into(),
+            text: text.into(),
+        };
+        self.say.send(m).await.unwrap();
+    }
+
+    /// The next thing sent on `channel` that `f` takes; others are dropped.
+    async fn sent(&self, channel: &str, f: impl Fn(&str) -> bool) -> String {
+        let mut sent = self.sent.lock().await;
+        loop {
+            let out = tokio::time::timeout(WAIT, sent.recv()).await;
+            let out = out.expect("a reply in time").expect("the gateway runs");
+            if out.channel == channel && f(&out.text) {
+                return out.text;
+            }
+        }
+    }
+
+    async fn post(&self, path: &str, body: Value) -> reqwest::Response {
+        self.req(reqwest::Method::POST, path)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// `/web enrol NAME` on chat, and the code its reply carries.
+    async fn enrol_code(&self, name: &str) -> String {
+        self.say("chat", &format!("/web enrol {name}")).await;
+        let reply = self.sent("chat", |t| t.contains("#enrol=")).await;
+        let expected = "[zephyr] open https://zephyr.test/#enrol=";
+        assert!(reply.starts_with(expected), "{reply}");
+        assert!(
+            reply.ends_with(" on the phone within 10 min, or type the code there; it works once")
+        );
+        let code = &reply[expected.len()..expected.len() + 11];
+        let ok = |c: char| c.is_ascii_uppercase() || ('2'..='7').contains(&c);
+        assert!(
+            code.len() == 11
+                && code
+                    .char_indices()
+                    .all(|(i, c)| if i == 5 { c == '-' } else { ok(c) }),
+            "{code}"
+        );
+        code.to_string()
+    }
+
+    /// Enrols `auth` as NAME with a fresh code, and gives the new session's cookie.
+    async fn enrol(&self, name: &str, auth: &Authenticator) -> String {
+        let code = self.enrol_code(name).await;
+        let start: Value = self
+            .post("/api/enrol/start", json!({"code": code}))
+            .await
+            .json()
+            .await
+            .unwrap();
+        let body = with(
+            auth.create(&start["publicKey"]),
+            json!({"challengeId": start["challengeId"]}),
+        );
+        let done = self.post("/api/enrol/finish", body).await;
+        assert_eq!(done.status(), 200);
+        set_cookie(&done)
+    }
+
+    /// A sign-in with `auth`: the `login/finish` response.
+    async fn login(&self, auth: &Authenticator) -> reqwest::Response {
+        let start: Value = self
+            .post("/api/login/start", json!({}))
+            .await
+            .json()
+            .await
+            .unwrap();
+        let body = with(
+            auth.get(&start["publicKey"]),
+            json!({"challengeId": start["challengeId"]}),
+        );
+        self.post("/api/login/finish", body).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn enrolment_takes_a_code_once_and_says_so() {
+    let gw = start("enrol");
+    gw.up().await;
+    // The owner the agent last answered is told of a new passkey.
+    gw.say("chat", "hi").await;
+    gw.sent("chat", |t| t.starts_with("echo:")).await;
+    let code = gw.enrol_code("phone").await;
+    let wrong = gw
+        .post("/api/enrol/start", json!({"code": "AAAAA-AAAAA"}))
+        .await;
+    assert_eq!(wrong.status(), 403);
+    assert_eq!(wrong.headers()["cache-control"], "no-store");
+    let said: Value = wrong.json().await.unwrap();
+    assert_eq!(
+        said,
+        json!({"error": "that code is wrong, used or expired"})
+    );
+
+    let start = gw.post("/api/enrol/start", json!({"code": code})).await;
+    assert_eq!(start.status(), 200);
+    let start: Value = start.json().await.unwrap();
+    let options = &start["publicKey"];
+    assert_eq!(options["rp"], json!({"id": HOST, "name": "zephyr"}));
+    assert_eq!(options["user"]["name"], "zephyr owner");
+    assert_eq!(b64_decode(&options["user"]["id"]).len(), 16);
+    assert_eq!(b64_decode(&options["challenge"]).len(), 32);
+    assert_eq!(
+        options["authenticatorSelection"],
+        json!({"residentKey": "required", "userVerification": "required"})
+    );
+    assert_eq!(
+        (&options["attestation"], &options["timeout"]),
+        (&json!("none"), &json!(120_000))
+    );
+    assert_eq!(options["excludeCredentials"], json!([]));
+
+    let phone = Authenticator::new("phone-cred");
+    let body = with(
+        phone.create(options),
+        json!({"challengeId": start["challengeId"]}),
+    );
+    let done = gw.post("/api/enrol/finish", body.clone()).await;
+    assert_eq!(done.status(), 200);
+    let cookie = set_cookie(&done);
+    assert_eq!(
+        done.json::<Value>().await.unwrap(),
+        json!({"name": "phone"})
+    );
+    let notice = gw.sent("chat", |t| t.contains("passkey phone")).await;
+    assert_eq!(
+        notice,
+        "[zephyr] passkey phone was added to the web app; /web rm phone removes it"
+    );
+    // The cookie is a session: the socket opens.
+    let mut ws = gw.ws(&cookie).await;
+    assert_eq!(ws.rpc("ping", json!({})).await["result"]["type"], "pong");
+
+    // The code is used, and so is the ceremony.
+    assert_eq!(
+        gw.post("/api/enrol/start", json!({"code": code}))
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(gw.post("/api/enrol/finish", body).await.status(), 403);
+    let store = gw.store();
+    let keys = store.passkeys().unwrap();
+    assert_eq!(
+        (
+            keys.len(),
+            keys[0].name.as_str(),
+            keys[0].cred_id.as_slice()
+        ),
+        (1, "phone", &b"phone-cred"[..])
+    );
+    assert_eq!(store.meta("web_enrol").unwrap(), None);
+    // The next ceremony names the enrolled passkey, so a device does not enrol twice.
+    let code = gw.enrol_code("ipad").await;
+    let start: Value = gw
+        .post("/api/enrol/start", json!({"code": code}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        start["publicKey"]["excludeCredentials"],
+        json!([{"type": "public-key", "id": b64(b"phone-cred")}])
+    );
+    gw.shutdown().await;
+}
+
+fn b64_decode(v: &Value) -> Vec<u8> {
+    data_encoding::BASE64URL_NOPAD
+        .decode(v.as_str().unwrap().as_bytes())
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_enrol_code_typed_in_lowercase_with_spaces_is_accepted() {
+    let gw = start("enrol-typed");
+    gw.up().await;
+    let code = gw.enrol_code("phone").await;
+    let typed = code.to_lowercase().replace('-', " ");
+    assert_eq!(
+        gw.post("/api/enrol/start", json!({"code": typed}))
+            .await
+            .status(),
+        200
+    );
+    let spaced = format!("  {} - {}\n", &code[..5], &code[6..]);
+    assert_eq!(
+        gw.post("/api/enrol/start", json!({"code": spaced}))
+            .await
+            .status(),
+        200
+    );
+    // One code, one passkey: of two ceremonies started with it, the second to finish fails.
+    let (a, b) = (Authenticator::new("a"), Authenticator::new("b"));
+    let mut bodies = vec![];
+    for auth in [&a, &b] {
+        let start: Value = gw
+            .post("/api/enrol/start", json!({"code": code}))
+            .await
+            .json()
+            .await
+            .unwrap();
+        bodies.push(with(
+            auth.create(&start["publicKey"]),
+            json!({"challengeId": start["challengeId"]}),
+        ));
+    }
+    assert_eq!(
+        gw.post("/api/enrol/finish", bodies.remove(0))
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        gw.post("/api/enrol/finish", bodies.remove(0))
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(gw.store().passkeys().unwrap().len(), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn five_failures_lock_sign_in_and_tell_the_owner() {
+    let home = new_home("lockout");
+    let gw = start_in(&home, free_port(), "", |cfg| {
+        cfg.web_lockout = Duration::from_secs(1)
+    });
+    gw.up().await;
+    gw.say("chat", "hi").await;
+    gw.sent("chat", |t| t.starts_with("echo:")).await;
+    let phone = Authenticator::new("phone-cred");
+    let cookie = gw.enrol("phone", &phone).await;
+    let mut ws = gw.ws(&cookie).await;
+    // An unknown credential, a bad signature, a used challenge and a wrong code all count.
+    let stranger = Authenticator::new("nobody");
+    assert_eq!(gw.login(&stranger).await.status(), 403);
+    let forged = Authenticator::new("phone-cred");
+    assert_eq!(gw.login(&forged).await.status(), 403);
+    let start: Value = gw
+        .post("/api/login/start", json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let body = with(
+        phone.get(&start["publicKey"]),
+        json!({"challengeId": start["challengeId"]}),
+    );
+    assert_eq!(
+        gw.post("/api/login/finish", body.clone()).await.status(),
+        200
+    );
+    assert_eq!(
+        gw.post("/api/login/finish", body).await.status(),
+        403,
+        "a used challenge"
+    );
+    assert_eq!(
+        gw.post("/api/enrol/start", json!({"code": "AAAAA-AAAAA"}))
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(
+        gw.post("/api/login/finish", json!({"challengeId": "c0"}))
+            .await
+            .status(),
+        403
+    );
+    // Closed: both ceremonies, to the right passkey too.
+    let closed = gw.post("/api/login/start", json!({})).await;
+    assert_eq!(closed.status(), 429);
+    let said = closed.json::<Value>().await.unwrap()["error"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        said.starts_with("sign-in is closed until ")
+            && said.len() == "sign-in is closed until 00:00".len(),
+        "{said}"
+    );
+    assert_eq!(
+        gw.post("/api/enrol/start", json!({"code": "x"}))
+            .await
+            .status(),
+        429
+    );
+    let notice = gw
+        .sent("chat", |t| t.contains("failed passkey attempts"))
+        .await;
+    assert_eq!(
+        notice,
+        format!("[zephyr] 5 failed passkey attempts on the web app; {said}")
+    );
+    // An open session keeps working.
+    assert_eq!(ws.rpc("ping", json!({})).await["result"]["type"], "pong");
+    // It opens again by itself; refusals while closed did not use up the minute's requests.
+    loop {
+        let res = gw.post("/api/login/start", json!({})).await;
+        if res.status() == 200 {
+            break;
+        }
+        assert_eq!(res.status(), 429);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(gw.login(&phone).await.status(), 200);
+    // Told once: the next notice on chat is not a second lockout.
+    gw.say("chat", "/web").await;
+    let next = gw.sent("chat", |_| true).await;
+    assert!(
+        next.starts_with("[zephyr] web app https://zephyr.test · passkeys: phone (used "),
+        "{next}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sign_in_with_a_passkey_sets_a_cookie_and_logout_ends_it() {
+    let gw = start("login");
+    gw.up().await;
+    let phone = Authenticator::new("phone-cred");
+    gw.enrol("phone", &phone).await;
+    let start: Value = gw
+        .post("/api/login/start", json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let options = &start["publicKey"];
+    assert_eq!(b64_decode(&options["challenge"]).len(), 32);
+    assert_eq!(
+        (&options["timeout"], options.get("allowCredentials")),
+        (&json!(120_000), None)
+    );
+    let body = with(
+        phone.get(options),
+        json!({"challengeId": start["challengeId"]}),
+    );
+    let done = gw.post("/api/login/finish", body).await;
+    assert_eq!(done.status(), 200);
+    let cookie = set_cookie(&done);
+    assert!(gw.store().passkeys().unwrap()[0].last_used_at.is_some());
+    assert_eq!(
+        gw.store().web_sessions().unwrap().len(),
+        2,
+        "the enrolment's and this one"
+    );
+
+    let mut ws = gw.ws(&cookie).await;
+    let out = gw
+        .req(reqwest::Method::POST, "/api/logout")
+        .header("Cookie", &cookie)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(out.status(), 204);
+    assert_eq!(
+        out.headers()["set-cookie"],
+        "__Host-zephyr=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"
+    );
+    ws.closed().await;
+    let headers = [
+        ("Origin", ORIGIN),
+        ("Tailscale-User-Login", LOGIN),
+        ("Cookie", cookie.as_str()),
+    ];
+    assert_eq!(gw.upgrade(HOST, &headers).await.err(), Some(401));
+    assert_eq!(
+        gw.store().web_sessions().unwrap().len(),
+        1,
+        "only this session ended"
+    );
+    assert_eq!(
+        gw.post("/api/logout", json!({})).await.status(),
+        401,
+        "no cookie"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_enrol_from_a_weak_channel_is_refused() {
+    let gw = start("enrol-weak");
+    gw.up().await;
+    gw.say("discord", "/web enrol phone").await;
+    let reply = gw.sent("discord", |_| true).await;
+    assert_eq!(reply, "[zephyr] /web enrol needs tui or chat");
+    assert_eq!(gw.store().meta("web_enrol").unwrap(), None);
+    for (text, reply) in [
+        ("/web enrol two words", "[zephyr] usage: /web | /web enrol [NAME] | /web rm NAME | /web signout"),
+        ("/web enrol bad/name", "[zephyr] usage: /web | /web enrol [NAME] | /web rm NAME | /web signout"),
+        ("/web nope", "[zephyr] usage: /web | /web enrol [NAME] | /web rm NAME | /web signout"),
+        ("/web rm nope", "[zephyr] no passkey nope; /web lists them"),
+        ("/web", "[zephyr] web app https://zephyr.test · passkeys: none · 0 sessions · push on 0 devices"),
+    ] {
+        gw.say("chat", text).await;
+        assert_eq!(gw.sent("chat", |_| true).await, reply, "{text}");
+    }
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_enrol_code_never_reaches_a_web_socket() {
+    let gw = start("enrol-quiet");
+    gw.up().await;
+    let mut ws = gw.ws(&gw.cookie("phone")).await;
+    ws.rpc("zephyr.subscribe", json!({})).await;
+    gw.enrol_code("ipad").await;
+    // Everything the socket was sent up to the answer of a later call of its own.
+    ws.say("/status").await;
+    ws.event(|e| e["type"] == "zephyr_reply" && e["command"] == "/status")
+        .await;
+    for frame in &ws.events {
+        assert!(!frame.to_string().contains("enrol="), "{frame}");
+    }
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_rm_closes_that_passkeys_socket_at_once() {
+    let gw = start("rm");
+    gw.up().await;
+    let (mut phone, mut ipad) = (
+        gw.ws(&gw.cookie("phone")).await,
+        gw.ws(&gw.cookie("ipad")).await,
+    );
+    gw.store()
+        .add_push("https://fcm.googleapis.com/x", &[4; 65], &[1; 16], 1)
+        .unwrap();
+    gw.say("discord", "/web rm phone").await;
+    let reply = gw.sent("discord", |_| true).await;
+    assert_eq!(
+        reply,
+        "[zephyr] removed passkey phone and its 1 sessions and pushes"
+    );
+    phone.closed().await;
+    assert_eq!(ipad.rpc("ping", json!({})).await["result"]["type"], "pong");
+    assert!(gw.store().pushes().unwrap().is_empty());
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_signout_ends_every_session() {
+    let gw = start("signout");
+    gw.up().await;
+    let (mut phone, mut ipad) = (
+        gw.ws(&gw.cookie("phone")).await,
+        gw.ws(&gw.cookie("ipad")).await,
+    );
+    gw.say("chat", "/web signout").await;
+    assert_eq!(
+        gw.sent("chat", |_| true).await,
+        "[zephyr] ended 2 web sessions"
+    );
+    phone.closed().await;
+    ipad.closed().await;
+    assert_eq!(gw.store().passkeys().unwrap().len(), 2, "the passkeys stay");
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_unauthenticated_routes_take_20_a_minute() {
+    let gw = start("rate");
+    gw.up().await;
+    for n in 0..20 {
+        assert_eq!(
+            gw.post("/api/login/start", json!({})).await.status(),
+            200,
+            "{n}"
+        );
+    }
+    let over = gw.post("/api/login/start", json!({})).await;
+    assert_eq!(over.status(), 429);
+    assert_eq!(
+        over.json::<Value>().await.unwrap(),
+        json!({"error": "too many attempts; wait a minute"})
+    );
+    assert_eq!(
+        gw.post("/api/enrol/start", json!({"code": "x"}))
+            .await
+            .status(),
+        429
+    );
+    // The files and a signed-in browser's routes are not counted.
+    assert_eq!(gw.get("/").await.status(), 200);
+    let mut ws = gw.ws(&gw.cookie("phone")).await;
+    assert_eq!(ws.rpc("ping", json!({})).await["result"]["type"], "pong");
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_devices_lists_this_session() {
+    let gw = start("devices");
+    gw.up().await;
+    let (phone, _ipad) = (gw.cookie("phone"), gw.cookie("ipad"));
+    gw.store()
+        .add_push("https://fcm.googleapis.com/x", &[4; 65], &[1; 16], 2)
+        .unwrap();
+    let mut ws = gw.ws(&phone).await;
+    let devices = ws.rpc("zephyr.web_devices", json!({})).await["result"].take();
+    let names = |list: &Value, key: &str| -> Vec<String> {
+        (list.as_array().unwrap().iter())
+            .map(|v| v[key].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(names(&devices["passkeys"], "name"), ["phone", "ipad"]);
+    assert!(
+        devices["passkeys"][0]["created_at"].is_i64()
+            && devices["passkeys"][0]["last_used_at"].is_null()
+    );
+    assert_eq!(names(&devices["sessions"], "passkey"), ["phone", "ipad"]);
+    assert_eq!(
+        (
+            &devices["sessions"][0]["this"],
+            &devices["sessions"][1]["this"]
+        ),
+        (&json!(true), &json!(false))
+    );
+    assert!(devices["sessions"][0]["seen_at"].is_i64());
+    assert_eq!(names(&devices["push"], "passkey"), ["ipad"]);
+    // Names and times only: no credential id, key, cookie hash or endpoint.
+    let text = devices.to_string();
+    assert!(
+        !text.contains("fcm") && !text.contains("cred") && !text.contains("token"),
+        "{text}"
+    );
     gw.shutdown().await;
 }

@@ -3085,6 +3085,15 @@ impl Store {
         .map(drop)
     }
 
+    /// Deletes `key` if it still holds `value`: of two takers, one gets `true`.
+    pub fn take_meta(&self, key: &str, value: &str) -> rusqlite::Result<bool> {
+        let n = (self.db).execute(
+            "DELETE FROM meta WHERE key = ?1 AND value = ?2",
+            params![key, value],
+        )?;
+        Ok(n == 1)
+    }
+
     pub fn add_passkey(&self, name: &str, cred_id: &[u8], point: &[u8]) -> rusqlite::Result<i64> {
         self.db.execute(
             "INSERT INTO web_passkeys(name, cred_id, public_key) VALUES (?1, ?2, ?3)",
@@ -5326,6 +5335,11 @@ mod tests {
         assert_eq!(store.meta("web_user").unwrap().as_deref(), Some("cd"));
         store.set_meta("web_user", None).unwrap();
         assert_eq!(store.meta("web_user").unwrap(), None);
+        // Taken once, and only as it was read.
+        store.set_meta("web_enrol", Some("one")).unwrap();
+        assert!(!store.take_meta("web_enrol", "two").unwrap());
+        assert!(store.take_meta("web_enrol", "one").unwrap());
+        assert!(!store.take_meta("web_enrol", "one").unwrap());
     }
 
     #[test]

@@ -1424,6 +1424,21 @@ impl<'a> Router<'a> {
                 let answer = crate::activity::answer(&self.cfg, &self.store, &query, crate::now());
                 let _ = reply.send(answer);
             }
+            AttachRequest::WebNotice(text) => {
+                // An attached owner is shown the row by the flush, with every other client
+                // (a web row waits for a socket); anyone else gets a row, and the clients see
+                // it now.
+                let last = self.store.last_owner().ok().flatten();
+                if !last
+                    .as_ref()
+                    .is_some_and(|(c, _)| crate::attach::attached(c))
+                {
+                    self.show(&text, None, None);
+                }
+                if let Some((channel, to)) = last {
+                    log(self.store.notify(&channel, &to, &text).map_err(Into::into));
+                }
+            }
             AttachRequest::Decide {
                 id,
                 verb,
@@ -2457,6 +2472,13 @@ impl<'a> Router<'a> {
             ("/thinking", level) => self.thinking_level(level, from.0).await,
             ("/set", arg) => self.set_command(arg, from.0).await,
             ("/settings", arg) => self.settings_listing(arg),
+            ("/web", _) => {
+                let (reply, ended) = crate::web::command(&self.cfg, &self.store, text, from.0)?;
+                if let (true, Some(hub)) = (ended, &self.web) {
+                    hub.revoke(); // open sockets check their sessions at once
+                }
+                reply
+            }
             ("/approvals", arg) => self.approvals(arg, from.0).await,
             // Held messages, posts and payments (approvals spec §4.6).
             ("/held", "") => crate::actions::held(&self.cfg, &self.store),

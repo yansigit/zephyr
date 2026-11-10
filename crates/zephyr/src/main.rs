@@ -16,7 +16,7 @@ use zephyr::store::Store;
 /// The rpi minor this build speaks (DESIGN §3).
 const RPI_PIN: &str = "rpi 0.21.";
 
-const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|resume|reload|skill>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
+const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|resume|reload|skill|web>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
 
 fn main() -> ExitCode {
     // `agent-browser` on the agent's PATH is this binary (approvals spec §4.4): the wrapper runs
@@ -89,6 +89,7 @@ async fn zephyr_main() -> ExitCode {
             ("reload", Ok(cfg)) => control(&cfg, "/reload").await,
             ("set", Ok(cfg)) => set(&cfg, &args.collect::<Vec<_>>()).await,
             ("skill", Ok(cfg)) => skill(&cfg, &args.collect::<Vec<_>>()).await,
+            ("web", Ok(cfg)) => web(&cfg, &args.collect::<Vec<_>>()).await,
             _ => {
                 eprintln!("{USAGE}");
                 return ExitCode::from(2);
@@ -330,6 +331,27 @@ async fn set(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
     };
     println!("{reply}");
     anyhow::ensure!(zephyr::settings::is_change(&reply, &args[0]), "not changed");
+    Ok(())
+}
+
+/// `zephyr web` and `zephyr web enrol [NAME]`: `/web` and `/web enrol` as the owner on the chat
+/// socket, a strong channel, so the first passkey can be enrolled from the host. Fails when the
+/// reply names no address: the app is not set up, or the code was refused.
+async fn web(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
+    let text = match args {
+        [] => "/web".to_string(),
+        [verb] if verb == "enrol" => "/web enrol".to_string(),
+        [verb, name] if verb == "enrol" => format!("/web enrol {name}"),
+        _ => anyhow::bail!("usage: zephyr web [enrol [NAME]]"),
+    };
+    let Some(reply) = ask(cfg, &text).await? else {
+        return Err(NotRunning.into());
+    };
+    println!("{reply}");
+    anyhow::ensure!(
+        reply.contains("https://"),
+        "the web app did not answer with its address"
+    );
     Ok(())
 }
 

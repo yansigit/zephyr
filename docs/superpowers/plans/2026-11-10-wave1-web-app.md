@@ -503,7 +503,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
 - `zephyr.web_devices {}` → `{"passkeys":[{"name","created_at","last_used_at"}],"sessions":[{"passkey": name,"created_at","seen_at","this"}],"push":[{"passkey","created_at"}]}`.
 - In the container, `zephyr web` sends `/web`, and `zephyr web enrol [NAME]` sends `/web enrol [NAME]`, over the chat socket; it prints the reply. It exits 1 on a reply that holds no `https://`, and 3 when no daemon answers (`NotRunning`).
 
-- [ ] **Step 1: Write the failing tests.** In `tests/web.rs`, helper `Authenticator` (ring P-256 key, cred id, `create(options) -> Value`, `get(options) -> Value`) builds clientData and authData as W-2's helpers do.
+- [x] **Step 1: Write the failing tests.** In `tests/web.rs`, helper `Authenticator` (ring P-256 key, cred id, `create(options) -> Value`, `get(options) -> Value`) builds clientData and authData as W-2's helpers do.
   - `enrolment_takes_a_code_once_and_says_so` (spec):
     - `/web enrol phone` on chat → a reply with a code; parse it with the regex `#enrol=([A-Z2-7]{5}-[A-Z2-7]{5})`;
     - a wrong code → 403;
@@ -523,10 +523,15 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - `web_devices_lists_this_session`.
 - In `tests/router.rs`: `the_agent_cannot_run_web_commands`: `[call gateway {"command":"/web enrol"}]` → a `tool error: … is not available to the agent` line.
 - In `retention.rs`: `the_sweep_ends_expired_web_sessions`.
-- [ ] **Step 2: Run** `cargo test -p zephyr --test web`, plus the router test and `--lib retention` → FAIL.
-- [ ] **Step 3: Implement.** Write the docs.
-- [ ] **Step 4: Run** the same, then `cargo test -p zephyr` → PASS.
-- [ ] **Step 5: Commit** `feat(web): enrol passkeys with a one-time code from a strong channel and sign in with them`.
+- [x] **Step 2: Run** `cargo test -p zephyr --test web`, plus the router test and `--lib retention` → FAIL.
+- [x] **Step 3: Implement.** Write the docs.
+- [x] **Step 4: Run** the same, then `cargo test -p zephyr` → PASS.
+- [x] **Step 5: Commit** `feat(web): enrol passkeys with a one-time code from a strong channel and sign in with them`.
+- Deviation: the ceremonies, the cookie, the limits, `command` and `devices` live in a new file `src/web/signin.rs` (re-exported from `web`), so `mod.rs` stays the listener and the bridge.
+- Deviation: `Store::take_meta(key, value)` deletes the enrolment code in one statement at `enrol/finish`: without it two ceremonies started with one code could both enrol. `/web enrol NAME` also refuses a NAME that is taken.
+- Deviation: the `Notice` arm does not write a second copy for an attached owner: when the owner last answered is on `tui` or `web` the outbox row alone is written and the flush shows it to every client; otherwise the notice is shown at once and a row goes to that owner. `notify_last_owner` knows only an owner the agent has answered, so the tests say `hi` on chat before they expect a notice there.
+- Deviation: a request refused while sign-in is closed does not count toward the 20 a minute, so the page can ask again when the lockout ends; the 429 bodies are `sign-in is closed until HH:MM` and `too many attempts; wait a minute`; a failed finish answers 403 `that did not verify; start again`, and is logged with its fixed reason. `/api/logout` also bumps the hub, so that session's socket closes at once.
+- Deviation: counts are worded `1 session`, `2 sessions` in `/web`'s line; `/web rm`'s and `/web signout`'s replies are the plan's text. Added tests: `tests/cli.rs` `web_asks_the_daemon_for_a_code_and_says_when_it_cannot` (written after the command, the one test here not seen failing first) and two unit tests in `signin.rs`.
 
 ### Task W-7: Signed approvals and settings: `zephyr.web_challenge` and the `passkey` channel
 

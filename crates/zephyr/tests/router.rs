@@ -3092,6 +3092,25 @@ async fn approvals_are_never_proposed() {
 }
 
 #[tokio::test]
+async fn the_agent_cannot_run_web_commands() {
+    let home = home("gateway-no-web");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call gateway {"command": "/web enrol"}] [call gateway {"command": "/web"}]"#,
+    )
+    .await;
+    let replies = gw.wait_replies(1).await;
+    assert_eq!(replies.len(), 1, "no notice: {replies:?}");
+    for refused in ["/web enrol", "/web"] {
+        let line = format!("\ngateway: tool error: {refused} is not available to the agent");
+        assert!(replies[0].contains(&line), "{replies:?}");
+    }
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_job_cannot_propose() {
     let home = home("gateway-job-propose");
     let gw = start(config(&home));

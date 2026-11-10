@@ -69,6 +69,9 @@ by hand that is looser than the preset is cleared); without it a non-interactive
 | `/approvals [manual\|semi\|full\|on\|off] [for D]`, `/approvals messages\|posts\|money\|facts MODE [for D]`, `/approvals forget N` | From any channel: what waits for you before the agent sends a message, posts or pays (see [Approvals and presets](#approvals-and-presets)). Alone it shows the modes in effect, `preset semi (modified) · messages ask-new · posts delay 5 · money ask · facts hold`; `off` is `full`, `on` is `manual`. Loosening is accepted only from a strong channel (`zephyr attach` or the chat socket, by default). `forget N` makes zephyr forget remembered recipient #N (`/activity grants` lists them), so under `ask-new` the next send to it waits for you again |
 | `/held` | The messages, posts and payments waiting for you or for their delay, newest first |
 | `/activity [today\|6h\|7d] [KIND]` | Zephyr's own record of what ran, what left the machine, what waited and what was refused, newest first (the last 24 h unless a time is given, up to 90 d; at most 30 lines). KIND narrows it: `out`, `gate`, `refused`, `setting`, `proposal`, `job`, `task`, `process`, or `tool` for every tool call, which the bare list leaves out. `/activity grants` lists what still goes without asking (remembered recipients, time limits, turned-on jobs), each with the command that takes it back. Read from zephyr's tables, never written by the agent, and scrubbed of vault and fact values as it is read |
+| `/web` | The [web app](#web-app): its address, passkeys, sessions and push devices |
+| `/web enrol [NAME]` | From the terminal chat or `zephyr attach` only: a one-time code (10 minutes) that adds a passkey for a phone or laptop |
+| `/web rm NAME` / `/web signout` | From any channel: remove a passkey with its sessions, or end every web session (a lost phone) |
 | `/ok N [once]` / `/no N` | Approve or drop proposal or held action #N. `/ok N` runs exactly what its card showed; under `ask-new` it also remembers the new recipients, and `/ok N once` approves without remembering them |
 | `/cancel N` | Stop an action waiting out its delay (`sending at 14:05 unless /cancel 7`) before it goes |
 | `/facts [rm NAME \| allow NAME TARGET \| disallow NAME TARGET]` | From any channel: your private facts' names, kinds and allowed targets, never a value. `rm` and `allow` loosen the check, so only a strong channel may; a value is entered only in `zephyr attach` or with `zephyr facts add` |
@@ -429,6 +432,20 @@ The daemon refuses any request whose `Host` is not that name, that did not come 
 `tailscale serve`, or (for anything that changes something) that does not come from the app's own
 page. `zephyr status` says `web: listening`, and `zephyr doctor` checks the listener and the
 push key.
+
+**Signing in.** The app has no password. Each device signs in with a passkey (Face ID, a
+fingerprint, the device PIN), and a new device needs a one-time code that only you can make:
+
+1. Type `/web enrol phone` in `zephyr chat` or `zephyr attach` (not Discord or iMessage), or run
+   `zephyr web enrol phone` on the host. The reply is a link, `https://HOST/#enrol=ABCDE-FGHJK`.
+2. Open the link on the phone within 10 minutes, or open the app and type the code. It works once.
+3. You are told on your usual channel that `passkey phone was added`. If you did not do that,
+   `/web rm phone` at once.
+
+A session lasts 30 days, or 7 days unused. `/web` lists the passkeys and sessions, `/web rm NAME`
+removes a passkey and signs its devices out (from any channel: use it for a lost phone), and
+`/web signout` ends every session. Five failed sign-in attempts in ten minutes close sign-in for
+15 minutes and you are told; devices already signed in keep working.
 
 ## Sending the agent files
 

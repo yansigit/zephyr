@@ -116,6 +116,41 @@ fn set_tells_a_change_from_a_refusal_and_a_missing_daemon() {
 }
 
 #[test]
+fn web_asks_the_daemon_for_a_code_and_says_when_it_cannot() {
+    let owned = |name: &str, more: &str| {
+        let (home, cfg) = setup(name, "");
+        let uid = std::fs::metadata(&home).unwrap().uid();
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        std::fs::write(&cfg, format!("{text}[owners]\nchat = [\"{uid}\"]\n{more}")).unwrap();
+        (home, cfg)
+    };
+    let (home, cfg) = owned("web-off", "");
+    // No daemon: exit 3.
+    assert_eq!(zephyr(&cfg, &["web", "enrol"]).status.code(), Some(3));
+    assert_eq!(zephyr(&cfg, &["web", "nope"]).status.code(), Some(1));
+    let running = daemon(&cfg, &home);
+    let out = zephyr(&cfg, &["web", "enrol", "phone"]);
+    assert_eq!(out.status.code(), Some(1), "no [web]: {out:?}");
+    assert!(
+        stdout(&out).contains("the web app is not set up"),
+        "{out:?}"
+    );
+    drop(running);
+    // Port 1 cannot be bound: the daemon runs on without the listener, and still makes codes.
+    let (home, cfg) = owned("web-on", "[web]\nhost = \"box.ts.net\"\nport = 1\n");
+    let _running = daemon(&cfg, &home);
+    let out = zephyr(&cfg, &["web", "enrol", "phone"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(
+        stdout(&out).starts_with("[zephyr] open https://box.ts.net/#enrol="),
+        "{out:?}"
+    );
+    let out = zephyr(&cfg, &["web"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(stdout(&out).contains("passkeys: none"), "{out:?}");
+}
+
+#[test]
 fn pause_and_resume_work_with_a_daemon_and_without_one() {
     let (home, cfg) = setup("pause", "");
     // The test runs as the owner: the chat socket sees this uid as the sender.

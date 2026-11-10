@@ -107,6 +107,9 @@ pub enum AttachRequest {
     },
     /// `zephyr.goals`: the open goals, then those done since the last review (read-only).
     Goals(oneshot::Sender<Result<Value, String>>),
+    /// A notice from the web app's listener (a passkey was added, sign-in was closed), for
+    /// every attached client and the owner last answered.
+    WebNotice(String),
     /// `zephyr.decide`: `/ok N` (`ok`, `once`), `/no N` (`no`) or `/cancel N` (`cancel`) as the
     /// owner on `channel`. `expect` is a passkey-signed decision's: what was signed, which the
     /// proposal must still be.
@@ -242,7 +245,6 @@ struct Conn {
     /// The inbox channel this client's messages and decisions are on: `tui` or `web`.
     channel: &'static str,
     /// A web app's socket: its session's hash, its passkey's row and the listener's hub.
-    #[allow(dead_code)] // read by the passkey methods
     web: Option<([u8; 32], i64, Arc<crate::web::Hub>)>,
     snap: watch::Receiver<Snapshot>,
     /// The live config, for `zephyr.models`.
@@ -558,6 +560,11 @@ impl Conn {
             | "zephyr.vault_revoke" => self.vault(id, method, params).await,
             "zephyr.facts_list" | "zephyr.facts_put" | "zephyr.facts_rm" => {
                 self.facts(id, method, params)
+            }
+            "zephyr.web_devices" if self.web.is_some() => {
+                let cfg = self.cfgs.borrow().clone();
+                let session = self.web.as_ref().map_or([0; 32], |w| w.0);
+                (vec![ok(id, crate::web::devices(&cfg, &session))], false)
             }
             "zephyr.sessions" => {
                 let cfg = self.cfgs.borrow().clone();
