@@ -2132,7 +2132,7 @@ impl Store {
         Ok(())
     }
 
-    /// What the conversation's saved file was when zephyr last saw it idle (`rpc::session_print`);
+    /// What the conversation's saved file was when zephyr last saw it idle (`rpc::SessionPrint`, as JSON);
     /// `None` when it has no row or none was recorded.
     pub fn session_file(&self, session: &str) -> rusqlite::Result<Option<String>> {
         let row: Option<Option<String>> = self

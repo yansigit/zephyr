@@ -455,6 +455,8 @@ struct Router<'a> {
     trust: Trust,
     /// The run's conversation was tainted already: one `session_origin` write per run.
     run_taint: bool,
+    /// When the current run of main started (`begin_run`), for what ran beside it.
+    run_since: Option<i64>,
     /// Taints `session_origin` could not take, by session: they hold for this process's life.
     tainted: HashMap<String, String>,
     /// A run cut off by a restart whose conversation could not be read: no run of main is the
@@ -625,6 +627,7 @@ impl<'a> Router<'a> {
             run_start: None,
             trust: Trust::Not(crate::memory::LEGACY.into()),
             run_taint: false,
+            run_since: None,
             tainted: HashMap::new(),
             unplaced: false,
             last_event: Instant::now(),
@@ -1668,11 +1671,12 @@ impl<'a> Router<'a> {
             MAIN_SESSION.into()
         });
         // What the new child loads must be what zephyr last saw.
+        let since = crate::now();
         self.check_session(&session);
         match Child::spawn_as(&self.cfg, Some(&session), account.as_ref()).await {
             Ok(child) => {
                 eprintln!("zephyr: rpi child {:?} ready", child.pid());
-                self.mark_session(&session);
+                self.settle_session(&session, Some(since), false);
                 self.spawn_failures = 0;
                 if let Some(a) = &account {
                     eprintln!("zephyr: on account {} ({})", a.name, a.model);
@@ -1853,7 +1857,7 @@ impl<'a> Router<'a> {
         if let Some(at) = self.cut_at {
             if at.elapsed() >= WEDGED.min(self.cfg.stall_limit) {
                 eprintln!("zephyr: rpi never settled the stopped run; killing it");
-                self.child = None; // dropping it kills it
+                // `child_exited` takes the child, which kills it, and taints its conversation.
                 self.child_exited().await;
             }
             return;
@@ -2003,6 +2007,7 @@ impl<'a> Router<'a> {
         self.run_start = Some(Instant::now());
         self.run_taint = false;
         let now = crate::now();
+        self.run_since = Some(now);
         let session = self.child.as_ref().and_then(|c| c.session.clone());
         if let Some(session) = &session {
             self.check_session(session);
@@ -2064,30 +2069,70 @@ impl<'a> Router<'a> {
         }
     }
 
+    /// What zephyr last recorded of a clean conversation's saved files: `None` when it is not
+    /// clean (nothing to look at), `Some(Err)` when the record cannot be read.
+    fn session_seen(&self, session: &str) -> Option<Result<crate::rpc::SessionPrint, ()>> {
+        if !matches!(self.store.session_origin(session), Ok(SessionOrigin::Clean)) {
+            return None;
+        }
+        Some(match self.store.session_file(session) {
+            Ok(None) => Ok(Default::default()),
+            Ok(Some(json)) => serde_json::from_str(&json).map_err(drop),
+            Err(_) => Err(()),
+        })
+    }
+
+    fn taint_now(&mut self, session: &str, what: &str) {
+        let why = format!("{what} at {}", self.clock(crate::now()));
+        self.record_taint(session.to_string(), &why);
+    }
+
     /// The conversation's saved file is what zephyr last saw (`mark_session`); anything else
     /// changed it while rpi was idle, so it is tainted (DESIGN §4.6). Only a clean one is looked at.
     fn check_session(&mut self, session: &str) {
-        if !matches!(self.store.session_origin(session), Ok(SessionOrigin::Clean)) {
+        let Some(seen) = self.session_seen(session) else {
             return;
+        };
+        let dir = self.cfg.session_dir();
+        let same = seen.is_ok_and(|s| crate::rpc::SessionPrint::now(&dir, session, Some(&s)) == s);
+        if !same {
+            self.taint_now(session, "was changed on disk outside zephyr");
         }
-        let now = crate::rpc::session_print(&self.cfg.session_dir(), session);
-        let seen = self.store.session_file(session);
-        if seen.as_ref().ok().map(|s| s.as_deref().unwrap_or("none")) != Some(now.as_str()) {
-            let why = format!(
-                "was changed on disk outside zephyr at {}",
-                self.clock(crate::now())
+    }
+
+    /// After rpi wrote the file (a run, a start, a stop, an idle command begun at `since`): when
+    /// other work of the agent's ran meanwhile it could have written there too, so the
+    /// conversation is tainted; else, when `grew`, rpi may only have added to what was recorded;
+    /// then the file is recorded as it is now.
+    fn settle_session(&mut self, session: &str, since: Option<i64>, grew: bool) {
+        let Some(seen) = self.session_seen(session) else {
+            return;
+        };
+        if since.is_none_or(|since| self.writers_since(since)) {
+            return self.taint_now(
+                session,
+                "was written while other work of the agent's was running",
             );
-            self.record_taint(session.to_string(), &why);
         }
+        let dir = self.cfg.session_dir();
+        let now = seen
+            .as_ref()
+            .map(|s| crate::rpc::SessionPrint::now(&dir, session, Some(s)));
+        if grew && !matches!((&now, &seen), (Ok(n), Ok(s)) if n.grew_from(s)) {
+            return self.taint_now(session, "was changed on disk outside zephyr");
+        }
+        self.mark_session(session);
     }
 
     /// Records the clean conversation's saved file as it is now, after rpi wrote it and with rpi
     /// idle. A record that cannot be written taints it: the next look would have nothing to trust.
     fn mark_session(&mut self, session: &str) {
-        if !matches!(self.store.session_origin(session), Ok(SessionOrigin::Clean)) {
+        let Some(seen) = self.session_seen(session) else {
             return;
-        }
-        let now = crate::rpc::session_print(&self.cfg.session_dir(), session);
+        };
+        let dir = self.cfg.session_dir();
+        let now = crate::rpc::SessionPrint::now(&dir, session, seen.as_ref().ok());
+        let now = serde_json::to_string(&now).unwrap_or_default();
         if let Err(e) = self.store.set_session_file(session, &now) {
             eprintln!("zephyr: recording the conversation's file failed: {e}");
             let why = format!(
@@ -2106,13 +2151,13 @@ impl<'a> Router<'a> {
     /// An rpi command that writes the session while it is idle (`set_model`,
     /// `set_thinking_level`, `navigate`): the file is checked before and recorded after.
     async fn call_writing(&mut self, cmd: Value) -> anyhow::Result<Value> {
-        let session = self.child_session();
+        let (session, since) = (self.child_session(), crate::now());
         if let Some(s) = &session {
             self.check_session(s);
         }
         let answer = self.call(cmd).await;
         if let Some(s) = &session {
-            self.mark_session(s);
+            self.settle_session(s, Some(since), false);
         }
         answer
     }
@@ -2159,9 +2204,11 @@ impl<'a> Router<'a> {
     async fn settled(&mut self, ev: &Value) {
         self.busy = false;
         self.run_start = None;
-        // What rpi wrote in the run is the conversation now.
+        // What rpi wrote in the run is the conversation now, if it only added to what was there
+        // and nothing else of the agent's ran beside it.
         if let Some(session) = self.child_session() {
-            self.mark_session(&session);
+            let since = self.run_since.take();
+            self.settle_session(&session, since, true);
         }
         let cut = self.cut.take();
         self.cut_at = None;
@@ -3557,7 +3604,7 @@ impl<'a> Router<'a> {
         let id = new_session_id(&self.store, crate::now());
         // Clean from its first message; `/switch` back to an older one never cleans it. A file
         // for the id already there was not rpi's for this conversation.
-        if crate::rpc::session_print(&self.cfg.session_dir(), &id) != "none" {
+        if crate::rpc::SessionPrint::now(&self.cfg.session_dir(), &id, None).exists() {
             let why = format!(
                 "was already on disk when /new made it at {}",
                 self.clock(crate::now())
@@ -3951,13 +3998,13 @@ impl<'a> Router<'a> {
         self.restart = false;
         if let Some(child) = self.child.take() {
             // rpi may write the session as it stops: checked before, recorded after.
-            let session = child.session.clone();
+            let (session, since) = (child.session.clone(), crate::now());
             if let Some(s) = &session {
                 self.check_session(s);
             }
             child.stop().await;
             if let Some(s) = &session {
-                self.mark_session(s);
+                self.settle_session(s, Some(since), false);
             }
             eprintln!("zephyr: restarting rpi");
         }
@@ -3978,6 +4025,8 @@ impl<'a> Router<'a> {
             }
             if self.resumes < MAX_RESUMES {
                 self.resumes += 1;
+                // Judged, and the file checked, before rpi starts writing it again.
+                self.begin_run().await;
                 self.call(json!({"type": "resume_pending"})).await?;
                 // Delivered at the resumed run's next step; `reconcile` never takes it for a row.
                 let note = crate::scheduler::RESUME_NOTE;
@@ -3985,7 +4034,6 @@ impl<'a> Router<'a> {
                 self.call(note).await?;
                 self.note_pending = true;
                 self.busy = true;
-                self.begin_run().await;
                 return Ok(());
             }
             for row in &rows {
@@ -4364,11 +4412,13 @@ impl<'a> Router<'a> {
         if !instructions.is_empty() {
             cmd["customInstructions"] = json!(instructions);
         }
+        // The run's start is judged, and the file checked, before rpi starts writing it.
+        self.begin_run().await;
         if let Err(e) = self.call(cmd).await {
+            (self.run_start, self.run_since) = (None, None);
             return format!("[zephyr] /compact failed: {e:#}");
         }
         self.busy = true;
-        self.begin_run().await;
         self.compacting = Some((from.0.into(), from.1.into()));
         String::new()
     }

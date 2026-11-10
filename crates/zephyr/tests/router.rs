@@ -1628,6 +1628,89 @@ async fn new_on_a_session_file_already_there_starts_tainted() {
     gw.shutdown().await;
 }
 
+/// The main conversation's taint, once it has one.
+async fn tainted_why(home: &Path) -> String {
+    let origin = || {
+        Store::open(&home.join("state.db"))
+            .unwrap()
+            .session_origin(&main_id(home))
+            .unwrap()
+    };
+    wait(|| matches!(origin(), SessionOrigin::Tainted(_))).await;
+    match origin() {
+        SessionOrigin::Tainted(why) => why,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A job holding its tool open, so it runs beside whatever main does next.
+async fn job_running_beside(gw: &Gateway, home: &Path) {
+    gw.say(
+        "j1",
+        "owner",
+        &format!("/job add bg | {NEVER} | [tool] hello"),
+    )
+    .await;
+    reply_starting(gw, "[zephyr] job #1 (bg) added").await;
+    std::fs::write(home.join("tool_wait"), "").unwrap();
+    gw.say("j2", "owner", "/job run 1").await;
+    wait(|| run_status(home, "running") == 1).await;
+}
+
+#[tokio::test]
+async fn a_run_with_other_work_beside_it_taints_its_conversation() {
+    let home = home("memory-session-beside");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "/new").await;
+    gw.wait_replies(1).await;
+    job_running_beside(&gw, &home).await;
+    // Anything else of the agent's could have added to the saved conversation as rpi did.
+    gw.say("m2", "owner", "hi").await;
+    let why = tainted_why(&home).await;
+    assert!(
+        why.starts_with("was written while other work of the agent's was running at "),
+        "{why}"
+    );
+    std::fs::remove_file(home.join("tool_wait")).unwrap();
+    wait(|| run_status(&home, "completed") == 1).await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_restart_with_other_work_beside_it_taints_its_conversation() {
+    let home = home("memory-session-restart-beside");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "/new").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "hi").await;
+    gw.wait_replies(2).await;
+    job_running_beside(&gw, &home).await;
+    gw.say("m3", "owner", "/rule be brief").await;
+    let why = tainted_why(&home).await;
+    assert!(
+        why.starts_with("was written while other work of the agent's was running at "),
+        "{why}"
+    );
+    std::fs::remove_file(home.join("tool_wait")).unwrap();
+    wait(|| run_status(&home, "completed") == 1).await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn compact_keeps_a_clean_conversation_clean() {
+    let home = home("memory-compact");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "/new").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "hi").await;
+    gw.wait_replies(2).await;
+    gw.say("m3", "owner", "/compact").await;
+    reply_starting(&gw, "[zephyr] Conversation compacted").await;
+    gw.say("m4", "owner", "WRITE_MEMORY likes tea").await;
+    reply_starting(&gw, SAVED).await;
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_rule_restarts_the_agent_and_leads_its_context() {
     let home = home("rules");
@@ -4403,6 +4486,20 @@ async fn a_wedged_child_that_never_settles_the_abort_is_killed_and_the_run_resum
     }
     assert_eq!(gw.replies(), ["resumed: [chat #1] long job"]);
     assert_eq!(log(&home, "start").len(), 2, "a second child");
+    // The run the wedged child was killed in is cut off like any other.
+    match Store::open(&home.join("state.db"))
+        .unwrap()
+        .session_origin("main")
+        .unwrap()
+    {
+        SessionOrigin::Tainted(why) => {
+            assert!(
+                why.starts_with("was cut off when its agent stopped at "),
+                "{why}"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
     gw.shutdown().await;
 }
 

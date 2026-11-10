@@ -111,33 +111,123 @@ fn session_file(dir: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
         .map(|f| f.1)
 }
 
-/// What session `id`'s saved files are now, to tell whether anything but rpi changed them
-/// between two looks: how many files it has, the newest one's path, and the length and SHA-256
-/// of it and its `.progress.jsonl`. `none` when it has no file.
-pub fn session_print(dir: &std::path::Path, id: &str) -> String {
-    let files: Vec<_> = (main_files(dir).into_iter())
-        .filter(|f| f.0 == id)
-        .collect();
-    let Some(newest) = files.iter().max_by_key(|f| f.2) else {
-        return "none".into();
-    };
-    let _fs = crate::agent::fs();
-    let read = |p: &std::path::Path| match std::fs::read(p) {
-        Ok(bytes) => format!(
-            "{} {}",
-            bytes.len(),
-            crate::drafts::digest([bytes.as_slice()])
-        ),
-        Err(e) => format!("unreadable ({})", e.kind()),
-    };
-    let progress = std::path::PathBuf::from(format!("{}.progress.jsonl", newest.1.display()));
-    format!(
-        "{} {} {} {}",
-        files.len(),
-        newest.1.display(),
-        read(&newest.1),
-        read(&progress)
-    )
+/// One saved file as zephyr last saw it: its length, inode, change and modification times and
+/// SHA-256. The change time cannot be set back by the agent, so a file whose length, inode and
+/// both times are as recorded is not hashed again.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FilePrint {
+    len: u64,
+    ino: u64,
+    ctime: (i64, i64),
+    mtime: (i64, i64),
+    hash: String,
+    /// When it was hashed, in unix seconds.
+    seen: i64,
+}
+
+/// The same file as seen, whenever it was hashed.
+impl PartialEq for FilePrint {
+    fn eq(&self, o: &FilePrint) -> bool {
+        (self.len, self.ino, self.ctime, self.mtime, &self.hash)
+            == (o.len, o.ino, o.ctime, o.mtime, &o.hash)
+    }
+}
+
+impl Eq for FilePrint {}
+
+impl FilePrint {
+    /// `path` now; `prior`'s hash is reused only when nothing else about the file differs.
+    fn of(path: &std::path::Path, prior: Option<&FilePrint>) -> Option<FilePrint> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(path)
+            .ok()
+            .filter(|m| m.is_file())?;
+        let (len, ino) = (m.len(), m.ino());
+        let (ctime, mtime) = ((m.ctime(), m.ctime_nsec()), (m.mtime(), m.mtime_nsec()));
+        // File times tick coarsely: a write in the same tick as the one hashed would keep them,
+        // so a hash taken within a second of the file's last change is never reused.
+        let same = |p: &&FilePrint| {
+            (p.len, p.ino, p.ctime, p.mtime) == (len, ino, ctime, mtime) && p.seen > p.ctime.0 + 1
+        };
+        let (hash, seen) = match prior.filter(same) {
+            Some(p) => (p.hash.clone(), p.seen),
+            None => (
+                crate::drafts::digest([std::fs::read(path).ok()?.as_slice()]),
+                crate::now(),
+            ),
+        };
+        Some(FilePrint {
+            len,
+            ino,
+            ctime,
+            mtime,
+            hash,
+            seen,
+        })
+    }
+}
+
+/// What session `id`'s saved files are (DESIGN §4.6): how many there are, the newest one's path,
+/// and its and its `.progress.jsonl`'s prints. No file at all is the `Default`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionPrint {
+    count: usize,
+    path: Option<String>,
+    file: Option<FilePrint>,
+    progress: Option<FilePrint>,
+}
+
+impl SessionPrint {
+    /// Session `id` now, hashing only what differs from `prior`.
+    pub fn now(dir: &std::path::Path, id: &str, prior: Option<&SessionPrint>) -> SessionPrint {
+        let files: Vec<_> = (main_files(dir).into_iter())
+            .filter(|f| f.0 == id)
+            .collect();
+        let Some(newest) = files.iter().max_by_key(|f| f.2) else {
+            return SessionPrint::default();
+        };
+        let _fs = crate::agent::fs();
+        let progress = std::path::PathBuf::from(format!("{}.progress.jsonl", newest.1.display()));
+        let path = newest.1.display().to_string();
+        // A print of another file is no help.
+        let prior = prior.filter(|p| p.path.as_deref() == Some(path.as_str()));
+        SessionPrint {
+            count: files.len(),
+            file: FilePrint::of(&newest.1, prior.and_then(|p| p.file.as_ref())),
+            progress: FilePrint::of(&progress, prior.and_then(|p| p.progress.as_ref())),
+            path: Some(path),
+        }
+    }
+
+    /// Whether there is any file.
+    pub fn exists(&self) -> bool {
+        self.count > 0
+    }
+
+    /// Whether this is `before` with lines added after it, as rpi adds them in a run: the same
+    /// file, as long or longer, its first `before` bytes unchanged. The progress companion,
+    /// which rpi rewrites, is not compared.
+    pub fn grew_from(&self, before: &SessionPrint) -> bool {
+        let (Some(now), Some(then)) = (&self.file, &before.file) else {
+            // No file before: rpi made the first one in the run.
+            return before.count == 0 && self.count <= 1;
+        };
+        let (Some(path), true) = (
+            &self.path,
+            self.count == before.count && self.path == before.path,
+        ) else {
+            return false;
+        };
+        if now.len < then.len {
+            return false;
+        }
+        let _fs = crate::agent::fs();
+        let Ok(bytes) = std::fs::read(path) else {
+            return false;
+        };
+        let head = bytes.get(..then.len as usize).unwrap_or_default();
+        crate::drafts::digest([head]) == then.hash
+    }
 }
 
 /// The first words of session `id`'s first user message, untagged, for `/switch`.
@@ -1066,5 +1156,39 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("the tool {pid} is still running");
+    }
+
+    #[test]
+    fn a_session_grows_only_by_lines_added_after_what_was_seen() {
+        let dir = crate::test_dir("rpc-session-print");
+        let folder = dir.join("--home--");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("2026-01-01T00-00-00-000Z_main-1.jsonl");
+        assert!(!SessionPrint::now(&dir, "main-1", None).exists());
+        std::fs::write(&file, "{\"kind\":\"header\"}\n{\"a\":1}\n").unwrap();
+        let seen = SessionPrint::now(&dir, "main-1", None);
+        assert_eq!(
+            SessionPrint::now(&dir, "main-1", Some(&seen)),
+            seen,
+            "unchanged"
+        );
+        let mut text = std::fs::read_to_string(&file).unwrap();
+        text.push_str("{\"b\":2}\n");
+        std::fs::write(&file, &text).unwrap();
+        let grown = SessionPrint::now(&dir, "main-1", Some(&seen));
+        assert_ne!(grown, seen);
+        assert!(grown.grew_from(&seen));
+        // An earlier line changed in place, same length: not a growth.
+        std::fs::write(&file, text.replace("\"a\":1", "\"a\":2")).unwrap();
+        let edited = SessionPrint::now(&dir, "main-1", Some(&grown));
+        assert_ne!(edited, grown, "hashed again: the change time moved");
+        assert!(!edited.grew_from(&seen));
+        // Cut short.
+        std::fs::write(&file, "{\"kind\":\"header\"}\n").unwrap();
+        assert!(!SessionPrint::now(&dir, "main-1", None).grew_from(&seen));
+        // A second file for the id.
+        std::fs::write(&file, &text).unwrap();
+        std::fs::write(folder.join("2027-01-01T00-00-00-000Z_main-1.jsonl"), &text).unwrap();
+        assert!(!SessionPrint::now(&dir, "main-1", None).grew_from(&seen));
     }
 }
