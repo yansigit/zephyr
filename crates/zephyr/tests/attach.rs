@@ -47,9 +47,11 @@ struct Gateway {
 /// block of 30, by pid.
 fn free_port() -> u16 {
     static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-    let block = 20_000 + (std::process::id() % 400) as u16 * 30;
+    // A block per test process, wider than this file's tests: a port handed out twice could go
+    // to a second gateway while the first has yet to bind it.
+    let block = 20_000 + (std::process::id() % 400) as u16 * 100;
     loop {
-        let port = block + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 30;
+        let port = block + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100;
         if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return port;
         }
@@ -124,7 +126,8 @@ impl Gateway {
         std::fs::read_to_string(self.home.join("log.jsonl"))
             .unwrap_or_default()
             .lines()
-            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            // The fake may be halfway through its last line.
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
             .filter(|v| v["type"] == kind)
             .collect()
     }
