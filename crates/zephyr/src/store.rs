@@ -1901,7 +1901,27 @@ impl Store {
         let changes = self
             .db
             .execute("DELETE FROM settings_log WHERE at < ?1", params![before])?;
-        Ok(emptied + sent + audit + changes + passes + actions)
+        // Each job's latest run stays, or `claim_due` would date a one-shot job from its
+        // creation and fire it again; each table's highest id stays, or SQLite would reuse it
+        // and a new report's `task-<id>`/`proc-<id>` inbox row would be ignored as a duplicate.
+        let runs = self.db.execute(
+            "DELETE FROM runs WHERE status NOT IN ('claimed', 'running')
+               AND coalesce(ended_at, due_at) < ?1
+               AND due_at < (SELECT max(due_at) FROM runs r WHERE r.job_id = runs.job_id)
+               AND id < (SELECT max(id) FROM runs)",
+            params![before],
+        )?;
+        let tasks = self.db.execute(
+            "DELETE FROM tasks WHERE status NOT IN ('queued', 'running')
+               AND coalesce(ended_at, created_at) < ?1 AND id < (SELECT max(id) FROM tasks)",
+            params![before],
+        )?;
+        let procs = self.db.execute(
+            "DELETE FROM procs WHERE status != 'running'
+               AND coalesce(ended_at, created_at) < ?1 AND id < (SELECT max(id) FROM procs)",
+            params![before],
+        )?;
+        Ok(emptied + sent + audit + changes + passes + actions + runs + tasks + procs)
     }
 
     /// Job `id`, if there is one.
@@ -3906,5 +3926,134 @@ mod tests {
         ] {
             assert_eq!(Cursor::parse(bad), None, "{bad}");
         }
+    }
+
+    const DAY: i64 = 86_400;
+
+    fn ids(store: &Store, table: &str) -> Vec<i64> {
+        let mut stmt = store
+            .db
+            .prepare(&format!("SELECT id FROM {table} ORDER BY id"))
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn inbox_count(store: &Store, platform_id: &str, holding: &str) -> i64 {
+        store
+            .db
+            .query_row(
+                "SELECT count(*) FROM inbox WHERE platform_msg_id = ?1 AND instr(text, ?2)",
+                params![platform_id, holding],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn pruning_never_refires_a_one_shot_job_or_reuses_an_id() {
+        use jiff::tz::TimeZone;
+        let mut store = Store::open(&crate::test_dir("store-prune-ids").join("state.db")).unwrap();
+        let now = crate::now();
+        let old = now - 91 * DAY;
+        let next = |s: &str, a: i64| crate::scheduler::next_after(s, a, &TimeZone::UTC);
+        let once = store
+            .add_job("once", "2025-01-01T00:00:00Z", "p", "chat", "1000")
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE jobs SET created_at = 1735000000 WHERE id = ?1",
+                params![once],
+            )
+            .unwrap();
+        assert_eq!(store.claim_due(now, next).unwrap().len(), 1);
+        let run = store.start_next_run(now).unwrap().unwrap();
+        store.finish_run(&run, "completed", "", None, now).unwrap();
+        // A yearly job, so only the pruning could make it due again.
+        let yearly = store
+            .add_job("yearly", "0 7 1 1 *", "p", "chat", "1000")
+            .unwrap();
+        for _ in 0..2 {
+            store.queue_run(yearly, now).unwrap();
+            let run = store.start_next_run(now).unwrap().unwrap();
+            store.finish_run(&run, "completed", "", None, now).unwrap();
+        }
+        for goal in ["first", "second"] {
+            store.add_task(goal, None, None, "chat", "1000").unwrap();
+            let t = store.start_next_task(now).unwrap().unwrap();
+            store.finish_task(&t, "completed", "done", now).unwrap();
+        }
+        for command in ["true", "false"] {
+            let p = store.add_proc(command, "chat", "1000").unwrap().unwrap();
+            store
+                .finish_proc(&p, "exited", Some(0), Some(("finished", "out")), now)
+                .unwrap();
+        }
+        store
+            .db
+            .execute_batch(&format!(
+                "UPDATE runs SET due_at = {old} + id, ended_at = {old} + id;
+                 UPDATE tasks SET created_at = {old}, ended_at = {old};
+                 UPDATE procs SET created_at = {old}, ended_at = {old};"
+            ))
+            .unwrap();
+        store.prune(now - 90 * DAY).unwrap();
+        assert_eq!(ids(&store, "runs"), [1, 3], "each job's latest run stays");
+        assert_eq!(store.claim_due(now, next).unwrap(), Vec::<i64>::new());
+        assert_eq!(ids(&store, "tasks"), [2]);
+        assert_eq!(ids(&store, "procs"), [2]);
+        let id = store
+            .add_task("third goal", None, None, "chat", "1000")
+            .unwrap()
+            .unwrap();
+        assert_eq!(id, 3);
+        let t = store.start_next_task(now).unwrap().unwrap();
+        store.finish_task(&t, "completed", "done", now).unwrap();
+        assert_eq!(inbox_count(&store, "task-3", "third goal"), 1);
+        let p = store.add_proc("echo new", "chat", "1000").unwrap().unwrap();
+        assert_eq!(p.id, 3);
+        store
+            .finish_proc(&p, "exited", Some(0), Some(("finished", "out")), now)
+            .unwrap();
+        assert_eq!(inbox_count(&store, "proc-3", "echo new"), 1);
+    }
+
+    #[test]
+    fn pruning_keeps_what_still_runs() {
+        let store = Store::open(&crate::test_dir("store-prune-running").join("state.db")).unwrap();
+        let now = crate::now();
+        let old = now - 91 * DAY;
+        let job = store
+            .add_job("j", "0 7 * * *", "p", "chat", "1000")
+            .unwrap();
+        for _ in 0..3 {
+            store.queue_run(job, now).unwrap();
+        }
+        store.start_next_run(now).unwrap().unwrap();
+        for _ in 0..3 {
+            store.add_task("t", None, None, "chat", "1000").unwrap();
+        }
+        store.start_next_task(now).unwrap().unwrap();
+        for _ in 0..2 {
+            store.add_proc("sleep 9", "chat", "1000").unwrap();
+        }
+        store
+            .db
+            .execute_batch(&format!(
+                "UPDATE runs SET due_at = {old}, started_at = NULL WHERE id < 3;
+                 UPDATE runs SET status = 'completed', ended_at = {now} WHERE id = 3;
+                 UPDATE tasks SET created_at = {old}, started_at = NULL WHERE id < 3;
+                 UPDATE tasks SET status = 'completed', ended_at = {now} WHERE id = 3;
+                 UPDATE procs SET created_at = {old} WHERE id = 1;
+                 UPDATE procs SET status = 'exited', ended_at = {now} WHERE id = 2;"
+            ))
+            .unwrap();
+        store.prune(now - 90 * DAY).unwrap();
+        assert_eq!(ids(&store, "runs"), [1, 2, 3]);
+        assert_eq!(ids(&store, "tasks"), [1, 2, 3]);
+        assert_eq!(ids(&store, "procs"), [1, 2]);
     }
 }

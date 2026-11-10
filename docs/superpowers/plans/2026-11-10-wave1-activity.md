@@ -73,15 +73,15 @@
 **Interfaces:**
 - Consumes: nothing new. Produces: `prune` also deletes from `runs`, `tasks`, `procs` (counted in its return).
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `store.rs` `pruning_never_refires_a_one_shot_job_or_reuses_an_id` (Review Focus 1): a job with schedule `"2025-01-01T00:00:00Z"`; `claim_due(now, |s, a| scheduler::next_after(s, a, &TimeZone::UTC))` claims one run; `start_next_run`, `finish_run(…, "completed", …)`; a cron job with two finished runs; two finished tasks and two exited procs; set every `ended_at`/`due_at`/`created_at` to `now - 91 days`; `prune(now - 90 days)`. Assert: the one-shot run and the cron job's newer run remain, its older run is gone; `claim_due` now returns `[]`; the lower task and proc ids are gone, the highest stay; `add_task` gives `max + 1`, and `finish_task` on it puts a `task-<new id>` row in the inbox (`SELECT count(*) FROM inbox WHERE platform_msg_id = ?` is 1 with the new report text); likewise `add_proc` + `finish_proc` → a new `proc-<id>` inbox row.
   - `store.rs` `pruning_keeps_what_still_runs`: aged `claimed` and `running` runs, a `queued` and a `running` task, a `running` proc all stay.
   - `retention.rs` `the_sweep_prunes_state_db_past_ninety_days`: also seed two finished tasks, age the first; after `sweep` only the second remains (`store.tasks(i64::MIN)` or a direct count).
-- [ ] **Step 2:** `cargo test -p zephyr --lib prun` → FAIL.
-- [ ] **Step 3: Implement** spec §4.9's three `DELETE`s verbatim, after the existing statements (a failing one still `?`-returns; earlier deletes have run).
-- [ ] **Step 4:** `cargo test -p zephyr --lib` → PASS.
-- [ ] **Step 5:** Docs: DESIGN §4.4 item 6 says `runs`, `tasks` and `procs` are kept 90 days, each job's latest run and each table's highest id always; README's `zephyr status` row says the counts cover 90 days.
-- [ ] **Step 6:** Commit `feat(retention): keep job runs, tasks and processes 90 days without ever refiring a job or reusing an id`.
+- [x] **Step 2:** `cargo test -p zephyr --lib prun` → FAIL.
+- [x] **Step 3: Implement** spec §4.9's three `DELETE`s verbatim, after the existing statements (a failing one still `?`-returns; earlier deletes have run).
+- [x] **Step 4:** `cargo test -p zephyr --lib` → PASS.
+- [x] **Step 5:** Docs: DESIGN §4.4 item 6 says `runs`, `tasks` and `procs` are kept 90 days, each job's latest run and each table's highest id always; README's `zephyr status` row says the counts cover 90 days.
+- [x] **Step 6:** Commit `feat(retention): keep job runs, tasks and processes 90 days without ever refiring a job or reusing an id`.
 
 ### Task A4-3: Outbound commands as audit rows
 
