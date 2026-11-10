@@ -2322,3 +2322,63 @@ async fn a_flood_of_sign_in_starts_keeps_the_one_in_flight() {
     assert!(over > 0, "finishes are counted");
     gw.shutdown().await;
 }
+
+// ---- the activity tab (A4's zephyr.activity) ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn activity_is_open_on_web_and_pages() {
+    let gw = start("activity");
+    gw.up().await;
+    let store = gw.store();
+    for n in 0..3 {
+        store
+            .audit("main", "bash", &format!("ls {n}"), "started")
+            .unwrap();
+    }
+    store
+        .remember_targets("messages", &["bob@x.org".into()])
+        .unwrap();
+    let mut ws = gw.ws(&gw.cookie("phone")).await;
+    let first = ws
+        .rpc("zephyr.activity", json!({"kind": "tool", "limit": 1}))
+        .await["result"]
+        .take();
+    let entries = first["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 1, "{first}");
+    assert!(
+        entries[0]["line"]
+            .as_str()
+            .is_some_and(|l| l.contains("ls 2")),
+        "{first}"
+    );
+    assert!(first["next"].is_string(), "more remain: {first}");
+    let older = json!({"kind": "tool", "limit": 5, "before": first["next"]});
+    let second = ws.rpc("zephyr.activity", older).await["result"].take();
+    let lines: Vec<&str> = (second["entries"].as_array().unwrap().iter())
+        .map(|e| e["line"].as_str().unwrap())
+        .collect();
+    assert!(
+        lines.len() == 2 && lines[0].contains("ls 1") && lines[1].contains("ls 0"),
+        "{second}"
+    );
+    assert!(second["next"].is_null());
+    let bad = ws.rpc("zephyr.activity", json!({"limit": 0})).await;
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
+
+    // The grants, each with the command that takes it back.
+    let grants = ws.rpc("zephyr.activity", json!({"kind": "grants"})).await["result"].take();
+    assert!(grants["since"].is_null());
+    let grant = &grants["entries"][0];
+    assert_eq!(
+        (&grant["kind"], &grant["revoke"]),
+        (&json!("grant"), &json!("/approvals forget 1"))
+    );
+    // A revoke only takes away, so the app sends it as the owner's own command, on the cookie.
+    ws.rpc("zephyr.subscribe", json!({})).await;
+    ws.say("/approvals forget 1").await;
+    ws.event(|e| e["type"] == "zephyr_reply" && e["command"] == "/approvals forget 1")
+        .await;
+    let grants = ws.rpc("zephyr.activity", json!({"kind": "grants"})).await["result"].take();
+    assert_eq!(grants["entries"], json!([]), "{grants}");
+    gw.shutdown().await;
+}

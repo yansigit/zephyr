@@ -793,11 +793,12 @@ Fixed on this branch, each with a test that failed first (the spec's closing "De
   - answered in the router through `AttachRequest::Activity { params, reply }`.
 - App: Activity shows each `line` (`tool` rows muted) and asks for the next page with `before: next` when the last row scrolls into view. A Grants sub-list sends a row's `revoke` as a `send` prompt; revoking only takes away, so `web` may. A `-32601` hides the tab.
 
-- [ ] **Step 1: Write the failing test** `activity_is_open_on_web_and_pages`: after a web `send`, `zephyr.activity {"limit":1}` → one entry with a `line`, and a non-null `next`, which `before` accepts. Also extend `every_method_the_app_calls_is_open_on_web`.
-- [ ] **Step 2: Run** `cargo test -p zephyr --test web activity` → FAIL (`-32601`).
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** → PASS, then `cargo test -p zephyr`.
-- [ ] **Step 5: Commit** `feat(web): show the activity record and its grants in the app's drawer`.
+- [x] **Step 1: Write the failing test** `activity_is_open_on_web_and_pages`: after a web `send`, `zephyr.activity {"limit":1}` → one entry with a `line`, and a non-null `next`, which `before` accepts. Also extend `every_method_the_app_calls_is_open_on_web`.
+- [x] **Step 2: Run** `cargo test -p zephyr --test web activity` → FAIL (`-32601`).
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** → PASS, then `cargo test -p zephyr`.
+- [x] **Step 5: Commit** `feat(web): show the activity record and its grants in the app's drawer`.
+- Deviation: built on A4's merged interface: `AttachRequest::Activity { query, reply }` is A4's own, so this task only adds `zephyr.activity` to `WEB_METHODS`, the tab and the test. The test seeds audit rows and asks for `kind: "tool"`, since the default kinds leave tool rows out. Grants are asked for with `kind: "grants"`; a null `revoke` gets no button.
 
 ### Task W-12: Goals screen (B's `zephyr.goals`)
 
@@ -832,11 +833,12 @@ Fixed on this branch, each with a test that failed first (the spec's closing "De
   If A2 adds a shared helper that picks the listener address, use it for the web app as `attach::serve` does.
 - `web::serve` binds `(own_ip, port)` in bridge mode, else `("127.0.0.1", port)`. `own_ip` failing makes `serve` return the error, as attach does under A2. `tailscale serve` still points at `http://127.0.0.1:7793` on the host.
 
-- [ ] **Step 1: Write the failing test** in host.rs: `up_in_bridge_mode_publishes_the_web_port_on_loopback`. A `[web]` config and `network = "bridge"` → the `docker run` args contain `-p 127.0.0.1:7793:7793`; with no `[web]`, they do not.
-- [ ] **Step 2: Run** `cargo test -p zephyr --test host bridge` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** → PASS; `cargo test -p zephyr`. On the side container in bridge mode: as the agent's uid, `curl http://<own_ip>:7793/` fails, and from the host `curl -H 'Host: HOST' -H 'Tailscale-User-Login: x' http://127.0.0.1:7793/` → 200.
-- [ ] **Step 5: Commit** `feat(web): listen on the container's address and publish the web app on host loopback under the bridge network`.
+- [x] **Step 1: Write the failing test** in host.rs: `up_in_bridge_mode_publishes_the_web_port_on_loopback`. A `[web]` config and `network = "bridge"` → the `docker run` args contain `-p 127.0.0.1:7793:7793`; with no `[web]`, they do not.
+- [x] **Step 2: Run** `cargo test -p zephyr --test host bridge` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** → PASS; `cargo test -p zephyr`. On the side container in bridge mode: as the agent's uid, `curl http://<own_ip>:7793/` fails, and from the host `curl -H 'Host: HOST' -H 'Tailscale-User-Login: x' http://127.0.0.1:7793/` → 200.
+- [x] **Step 5: Commit** `feat(web): listen on the container's address and publish the web app on host loopback under the bridge network`.
+- Deviation: built on A2's merged helpers: the listener binds through `egress::listen_addr`, and the port is a row of `egress::LISTENERS` (`published_from` gives 7793 when `[web]` names only its host), which is what makes `up` publish it; `host/mod.rs` itself is unchanged. `zephyr web setup` keeps a port the owner chose and serves that one. The host test is `up_in_bridge_mode_publishes_the_web_port_on_loopback`; `tests/net_floor.rs` (ignored, side container) also expects the agent's uid refused at port 7793, not run here.
 
 ---
 

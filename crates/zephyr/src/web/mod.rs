@@ -756,6 +756,7 @@ mod tests {
                 .map(|after| format!("zephyr.{}", name(after))),
         );
         for method in [
+            "zephyr.activity",
             "zephyr.subscribe",
             "send",
             "zephyr.proposals",

@@ -429,6 +429,8 @@ A phone-first app the daemon serves itself, reached over your tailnet through `t
   your passkey, and what you sign is that exact card: if it changes before you sign, the signature
   is refused and you are shown the new one. Deny needs no passkey. The agent's own stated reason
   is folded away under "the agent's reason (not checked)".
+- **Activity**: zephyr's own record of what ran, what left the machine, what waited and what was
+  refused, and the standing grants, each with a Revoke button.
 - **Upcoming**: scheduled jobs and delayed sends.
 - **Settings**, with an optional time limit; a protected setting is saved with your passkey.
 - **Private facts** and the **Vault**, names only. Secrets are never typed in the app.

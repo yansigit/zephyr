@@ -475,6 +475,77 @@
     for (const button of document.querySelectorAll("#drawer [data-tab]")) {
       button.setAttribute("aria-selected", String(button.dataset.tab === tab));
     }
+    if (tab === "activity") loadActivity();
+  }
+
+  // ---- the drawer: activity (the daemon's own record) and the standing grants ----
+
+  // A grant's revoke only takes away, so it goes as the owner's own command. One the daemon
+  // cannot offer (`revoke` null) says "set … back by hand" in its line, and gets no button.
+  async function loadGrants(rows) {
+    const grants = await rpc("zephyr.activity", { kind: "grants" });
+    for (const grant of grants.entries || []) {
+      const item = el("li", "row");
+      item.append(el("span", "what", grant.line));
+      if (typeof grant.revoke === "string" && grant.revoke.startsWith("/")) {
+        const revoke = el("button", "", "Revoke");
+        revoke.type = "button";
+        revoke.addEventListener("click", async () => {
+          if (!confirm("Send " + clean(grant.revoke) + " ?")) return;
+          await sendCommand(grant.revoke).catch((error) => addNotice(said(error)));
+          loadActivity();
+        });
+        item.append(revoke);
+      }
+      rows.append(item);
+    }
+  }
+
+  // One page of the record; `before` is the last page's `next`. The "older" row asks for the
+  // next page when it scrolls into view, or on a tap.
+  async function loadPage(rows, before) {
+    const page = await rpc("zephyr.activity", before ? { before } : {});
+    for (const entry of page.entries || []) {
+      rows.append(el("li", entry.kind === "tool" ? "row tool" : "row", entry.line));
+    }
+    if (!page.next) return;
+    const item = el("li");
+    const older = el("button", "row", "older");
+    older.type = "button";
+    const more = () => {
+      item.remove();
+      loadPage(rows, page.next).catch(() => null);
+    };
+    older.addEventListener("click", more);
+    item.append(older);
+    rows.append(item);
+    if ("IntersectionObserver" in window) {
+      const seen = new IntersectionObserver((hits) => {
+        if (hits.some((hit) => hit.isIntersecting) && item.isConnected) {
+          seen.disconnect();
+          more();
+        }
+      });
+      seen.observe(older);
+    }
+  }
+
+  async function loadActivity() {
+    const rows = $("activity");
+    rows.replaceChildren();
+    try {
+      await loadGrants(rows);
+      await loadPage(rows, null);
+      if (!rows.firstChild) rows.append(el("li", "empty", "nothing in the last 24 hours"));
+    } catch (error) {
+      // A daemon without the record: no tab.
+      if (error && error.code === -32601) {
+        document.querySelector('#drawer [data-tab="activity"]').hidden = true;
+        openDrawer("approvals");
+      } else {
+        rows.append(el("li", "empty", said(error)));
+      }
+    }
   }
 
   function firstLine(card) {

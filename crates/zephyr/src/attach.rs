@@ -61,6 +61,7 @@ pub const WEB_METHODS: &[&str] = &[
     "zephyr.decide",
     "zephyr.facts_list",
     "zephyr.vault_list",
+    "zephyr.activity",
     "ping",
     "zephyr.web_challenge",
     "zephyr.web_devices",
