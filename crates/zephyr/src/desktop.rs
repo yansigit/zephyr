@@ -39,7 +39,8 @@ pub fn ensure() -> Option<String> {
     }
     let mut running = RUNNING.lock().unwrap();
     running.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
-    if running.len() < 2 {
+    // Without root's openbox config there is no window manager, and the server alone is whole.
+    if running.len() < wanted(std::path::Path::new(OPENBOX_RC).is_file()) {
         for c in running.iter_mut() {
             let _ = c.kill();
             let _ = c.wait();
@@ -65,6 +66,11 @@ pub fn ensure() -> Option<String> {
         }
     }
     Some(display)
+}
+
+/// How many programs a whole desktop runs: the server, and openbox when its config is there.
+fn wanted(rc: bool) -> usize {
+    1 + usize::from(rc)
 }
 
 /// Where the desktop's cookie is, when there is a desktop: set it as `XAUTHORITY` beside `DISPLAY`.
@@ -205,5 +211,11 @@ mod tests {
             rc.contains("<file>/opt/zephyr/openbox/menu.xml</file>"),
             "{rc}"
         );
+    }
+
+    #[test]
+    fn a_desktop_without_openbox_is_whole_with_its_server() {
+        // Else every `ensure` would kill the server and start another.
+        assert_eq!((wanted(false), wanted(true)), (1, 2));
     }
 }
