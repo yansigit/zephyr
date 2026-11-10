@@ -14,6 +14,11 @@ use std::sync::Mutex;
 
 static RUNNING: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 
+/// The desktop's programs, by full path: run as the agent, but never ones it left on its PATH,
+/// which would be the daemon's children and spared by the stray check (DESIGN §4.6).
+const XVFB: &str = "/usr/bin/Xvfb";
+const OPENBOX: &str = "/usr/bin/openbox";
+
 /// The cookie file, in the agent's home: the agent's own clients read it through `XAUTHORITY`.
 pub(crate) const XAUTHORITY: &str = ".zephyr-xauthority";
 const COOKIE_NAME: &[u8] = b"MIT-MAGIC-COOKIE-1";
@@ -46,10 +51,10 @@ pub fn ensure() -> Option<String> {
             "-nolisten",
             "tcp",
         ];
-        running.extend(start("Xvfb", &[&display], &xvfb));
+        running.extend(start(XVFB, &[&display], &xvfb));
         // The window manager needs the server up first.
         std::thread::sleep(std::time::Duration::from_millis(300));
-        running.extend(start("openbox", &[], &[]));
+        running.extend(start(OPENBOX, &[], &[]));
     }
     Some(display)
 }
@@ -162,5 +167,13 @@ mod tests {
             parse(&entry("1", &[7; 16])[..10]).is_none(),
             "a cut file is refused"
         );
+    }
+
+    #[test]
+    fn the_desktop_runs_by_full_path() {
+        // Not looked up on the agent's PATH, where a program of its own of that name would be
+        // the daemon's child, spared by the stray check.
+        assert_eq!(XVFB, "/usr/bin/Xvfb");
+        assert_eq!(OPENBOX, "/usr/bin/openbox");
     }
 }

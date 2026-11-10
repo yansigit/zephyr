@@ -272,9 +272,16 @@ impl Checkpoints {
     }
 
     /// git as the agent on the store, with `project` as its work tree and index when given.
+    /// By full path: a `git` the agent left on its PATH would run before each prompt.
     fn git(&self, project: Option<&str>, args: &[&str]) -> Command {
-        let mut cmd = Command::new("git");
+        let mut cmd = Command::new("/usr/bin/git");
         crate::agent::cmd(&mut cmd)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+            ])
             .args(args)
             .env("GIT_DIR", &self.store)
             // The same behaviour whatever the agent's own git config says.
@@ -814,5 +821,12 @@ mod tests {
         assert!(!named(".parity-lanes") && !named("a b") && !named("x.lock") && !named("a..b"));
         assert_eq!(label("before: hi"), "before \"hi\"");
         assert_eq!(label("before rollback"), "before rollback");
+    }
+
+    #[test]
+    fn checkpoint_git_is_roots_own_by_full_path() {
+        let dir = crate::test_dir("checkpoint-git-path");
+        let store = Checkpoints::new(&dir.join("store"), &dir.join("projects"));
+        assert_eq!(store.git(None, &["status"]).get_program(), "/usr/bin/git");
     }
 }

@@ -1283,15 +1283,11 @@ fn revert_newest(home: &Path) -> anyhow::Result<String> {
     ))
 }
 
-/// The longest one memory git call may take before its process group is killed.
-const GIT_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 3 } else { 30 });
-
-/// git as the agent in its own repo. The agent owns `.git`, so none of its hooks or fsmonitor
-/// runs, nor system or global config; a filter or signing program it set up there still could,
-/// so the call is killed, with everything it started, at `GIT_TIMEOUT`.
-fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-    use std::os::unix::process::CommandExt;
-    let child = crate::agent::cmd(&mut Command::new("git"))
+/// `git` as the agent, by full path: the agent's PATH starts with its own `~/.local/bin`, where
+/// a `git` it left would run inside every memory commit, after every check.
+fn git_cmd(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("/usr/bin/git");
+    crate::agent::cmd(&mut cmd)
         .args([
             "-c",
             "core.hooksPath=/dev/null",
@@ -1302,7 +1298,19 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
         .arg(dir)
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    cmd
+}
+
+/// The longest one memory git call may take before its process group is killed.
+const GIT_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 3 } else { 30 });
+
+/// git as the agent in its own repo. The agent owns `.git`, so none of its hooks or fsmonitor
+/// runs, nor system or global config; a filter or signing program it set up there still could,
+/// so the call is killed, with everything it started, at `GIT_TIMEOUT`.
+fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    use std::os::unix::process::CommandExt;
+    let child = git_cmd(dir, args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2368,5 +2376,26 @@ mod tests {
             .notice
             .unwrap()
             .starts_with(&format!("[zephyr] memory change waiting (from {BESIDE})")));
+    }
+
+    #[test]
+    fn memorys_git_is_roots_own_by_full_path() {
+        // The agent's PATH starts with its own ~/.local/bin, where a `git` of its own would run
+        // inside every commit, after every check.
+        let cmd = git_cmd(Path::new("/tmp"), &["status"]);
+        assert_eq!(cmd.get_program(), "/usr/bin/git");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args[..4],
+            [
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false"
+            ]
+        );
     }
 }
