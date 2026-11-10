@@ -161,6 +161,7 @@ Changes apply by themselves; nothing needs `zephyr restart`. The commands above,
 | The model, on the same provider | at once, or after the reply in progress (rpi's `set_model`) |
 | A model on another provider, the active account, extensions, connectors (`[[mcp]]`), subagents (`[[subagent]]`), a re-login | the agent restarts after the reply in progress; the conversation carries on |
 | Discord, iMessage, `[attach]`, `[agent]`, a secret | the daemon restarts itself in place once idle; waiting messages are kept |
+| The attach port, the iMessage webhook's port | `zephyr config set` and `zephyr channel` start the container again to publish it; after a hand edit you are told to run `zephyr up` |
 
 A file that does not load is not applied, and the daemon keeps its current settings.
 
@@ -443,12 +444,18 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
 - **GPU.** When Docker has the NVIDIA runtime, `zephyr up` passes the GPU in, so the browser's
   WebGL is the real card instead of software rendering, which bot checks notice.
 - **Watching it, or signing it into a site.** Nothing listens by default. To look, start a one-shot
-  VNC server on 127.0.0.1:5900 and connect a VNC viewer; it exits when you disconnect:
+  VNC server on the container's own address, port 5900, and connect a VNC viewer on this machine to
+  that address; it exits when you disconnect (the address is reachable from this machine only):
 
   ```sh
+  ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' zephyr)
   docker exec -it -u "$(id -u)" zephyr x11vnc -storepasswd /zephyr/.vnc-passwd   # once
-  docker exec -d -u "$(id -u)" zephyr x11vnc -display :99 -auth /zephyr/.zephyr-xauthority -localhost -once -rfbauth /zephyr/.vnc-passwd
+  docker exec -d -u "$(id -u)" zephyr x11vnc -display :99 -auth /zephyr/.zephyr-xauthority -listen "$ip" -once -rfbauth /zephyr/.vnc-passwd
+  echo "connect to $ip:5900"
   ```
+
+  With `network = "host"` in host.toml, use `-localhost` in place of `-listen "$ip"` and connect
+  to 127.0.0.1:5900.
 
 - **Files and jobs.** The agent's `send_file` tool sends you a file (up to 10 MB: a screenshot, a
   PDF) with its reply. Its `schedule` tool only proposes a job: you are shown it, and it runs after
@@ -594,6 +601,40 @@ message.send.backend.auth.cmd = "printenv MAIL_PASSWORD"
 The first `himalaya` command run with `secrets: ["MAIL_PASSWORD"]` asks you to allow
 `MAIL_PASSWORD` for `himalaya`.
 
+## The agent's network
+
+The container runs on a Docker network of its own, and the agent has no direct route out of it. Its
+programs reach the internet only through a proxy in the daemon (`HTTP_PROXY` and friends are set
+for them): any public address on ports 80 and 443, and nothing else. Your machine's localhost, your
+LAN, your tailnet, cloud metadata addresses and every other port (SSH, SMTP, IMAP, databases) are
+refused at once, and the agent gets no DNS of its own. `git`, `curl`, `pip`, `npm`, `gh` and the
+browsers work as before; `ssh`, `ping` and mail clients fail until you allow their destination.
+
+- **Allowing more.** `/set network.allow HOST:PORT, HOST:PORT` lists exact destinations beyond
+  that, e.g. `imap.gmail.com:993, github.com:22, homeassistant.lan:8123` (see
+  [Changing settings](#changing-settings)). The agent can only propose a change; `/ok N` from
+  `zephyr attach` or `zephyr chat` applies it. A refused request tells the agent which entry to ask
+  for, and `sqlite3 ~/.zephyr-daemon/state.db "select * from audit where session = 'net'"` (with
+  `sudo`) shows what it reached, once per destination and hour, and everything that was refused.
+- **A model server on this machine** (Ollama, a local proxy) is no longer reachable on localhost.
+  Have it listen on the Docker network's gateway address
+  (`docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' zephyr`) and list that
+  `ADDRESS:PORT` in `network.allow`.
+- **zephyr's own ports** (the attach port, the iMessage webhook) are published on this machine's
+  `127.0.0.1` only. `zephyr config set attach.port N` and `zephyr channel add|remove imessage`
+  start the container again to publish the change; after a hand edit of those keys, run
+  `zephyr up`.
+- **iMessage.** BlueBubbles posts to your Tailscale address, so forward that to the webhook once
+  (`zephyr up` prints the line with your port): `sudo tailscale serve --bg --tcp 7791
+  tcp://127.0.0.1:7791`. `[imessage] listen` keeps naming the Tailscale address and port.
+- **Upgrading.** The first `zephyr up` or `zephyr upgrade` on a version with the network floor
+  moves the container over and says so once. Until `tailscale serve` forwards the webhook, iMessage
+  messages do not arrive (they are picked up from BlueBubbles when the daemon next starts).
+- **Going back.** `network = "host"` in `~/.zephyr-daemon/host.toml`, then `zephyr up`, runs the
+  container on the host's network as before: no proxy, no rules, and the agent can reach
+  everything this machine can. `zephyr doctor` says which of the two is in effect, and under the
+  floor proves it by trying the forbidden connections as the agent.
+
 ## Where things live
 
 - `~/.zephyr/` (mode 0700), seen as `/zephyr` in the container: the agent's home, with sessions,
@@ -614,7 +655,7 @@ The first `himalaya` command run with `secrets: ["MAIL_PASSWORD"]` asks you to a
     targets each may go to. `zephyr facts` edits it. A value is matched however it is written (case,
     spacing, `+1 (555) 010-2345` against `5550102345`, percent-encoded, base64); a digits fact
     needs 6 digits and a text one 4 characters or it never matches.
-  - `host.toml`: the projects folder, optionally `memory = "8g"` to cap the container's memory (75% of the machine's when unset),
+  - `host.toml`: the projects folder, `network` (`"bridge"`, the [network floor](#the-agents-network), or `"host"` to run without it), optionally `memory = "8g"` to cap the container's memory (75% of the machine's when unset),
     `packages`: the apt packages `zephyr packages` bakes into the local image, and `offered_extensions`: the image extensions `init`, `up` and `upgrade` have already added to `zephyr.toml`, so one you remove stays removed. The first `up` after upgrading to a zephyr that keeps this record adds once any image extension removed earlier, or every one if the config lists none; after that, a removal sticks.
     Used only on the host, at `zephyr up`.
   - `state.db`: inbox, outbox, jobs, spend, the actions waiting for your approval and the

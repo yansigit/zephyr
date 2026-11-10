@@ -28,6 +28,8 @@ case "$1" in
       *) echo "${SHIM_STATE:-running}" ;;
     esac; exit 0 ;;
   info) echo "${SHIM_RUNTIMES:-io.containerd.runc.v2 runc}"; exit 0 ;;
+  # `docker network inspect NAME` fails when the network is not there yet.
+  network) [ "$2" = inspect ] && exit "${SHIM_NO_NETWORK:-0}"; exit 0 ;;
   image) exit "${SHIM_IMAGE_MISSING:-0}" ;;
   pull) exit "${SHIM_PULL_FAIL:-0}" ;;
   # `docker build -t TAG -`: the Dockerfile on stdin goes to build.log.
@@ -691,9 +693,32 @@ fn init_non_interactive_builds_the_layout_and_starts_the_container() {
         ["--security-opt", "no-new-privileges"],
         ["--pids-limit", "4096"],
         ["-w", "/"],
+        // The network floor (DESIGN §4.19): its own bridge, the capabilities `supervise` loads
+        // the rules with and then drops, and only zephyr's port published, on loopback.
+        ["--network", CONTAINER],
+        ["--hostname", "zephyr"],
+        ["--cap-add", "NET_ADMIN"],
+        ["--cap-add", "SETPCAP"],
+        ["-e", "ZEPHYR_NETWORK=bridge"],
+        ["-p", "127.0.0.1:7790:7790"],
     ] {
         assert!(run.windows(2).any(|w| w == pair), "{pair:?} in {run:?}");
     }
+    assert!(!has_pair(run, "--network", "host"), "{run:?}");
+    let host = std::fs::read_to_string(daemon.join("host.toml")).unwrap();
+    assert!(host.contains("network = \"bridge\""), "{host}");
+    assert!(
+        host.contains("# \"host\" runs without the network floor (DESIGN §4.19)"),
+        "{host}"
+    );
+    // The network was there (the shim's `network inspect` succeeds), so none is created.
+    find(&calls, &["docker", "network", "inspect", CONTAINER]);
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.len() > 2 && c[1] == "network" && c[2] == "create"),
+        "{calls:#?}"
+    );
     for pair in [
         ["--log-opt", "max-size=20m"],
         ["--log-opt", "max-file=5"],
@@ -1383,7 +1408,7 @@ fn config_get_and_set_check_the_daemon_schema() {
     // A running daemon reloads a key the registry does not know; a stopped one picks the file
     // up when it starts.
     env.calls();
-    env.ok(&["config", "set", "attach.port", "7791"]);
+    env.ok(&["config", "set", "owners.discord", "[\"1234\"]"]);
     find(
         &env.calls(),
         &["docker", "exec", CONTAINER, "zephyr", "reload"],
@@ -1555,7 +1580,8 @@ fn lifecycle_commands_build_the_expected_docker_calls() {
             CONTAINER,
             "rpi",
             "--connect",
-            "127.0.0.1:7790",
+            // The daemon listens on the container's own address under the network floor.
+            "172.18.0.2:7790",
         ],
     );
     // In the daemon's dir, which the agent cannot enter, not in /tmp, where it could make it first.
@@ -1583,6 +1609,7 @@ fn lifecycle_commands_build_the_expected_docker_calls() {
     env.ok(&["uninstall", "--keep-data"]);
     let calls = env.calls();
     find(&calls, &["docker", "rm", "-f", CONTAINER]);
+    find(&calls, &["docker", "network", "rm", CONTAINER]);
     find(&calls, &["docker", "rmi", "zephyr-lanetest"]);
     assert!(env.data().exists());
     env.ok(&["uninstall", "--yes"]);
@@ -1881,6 +1908,146 @@ fn doctor_fix_repairs_modes() {
     assert!(stdout(&out).contains(&format!("FAIL {} is private", secrets.display())));
     env.ok(&["doctor", "--fix"]);
     assert_eq!(mode(&secrets), 0o600);
+}
+
+/// The `docker run -d` of the last `up`.
+fn run_call(env: &Env) -> Vec<String> {
+    find(&env.calls(), &["docker", "run", "-d", "--name", CONTAINER]).clone()
+}
+
+#[test]
+fn up_creates_the_network_only_when_missing() {
+    let env = Env::new("net-create");
+    env.init(&["--no-start"]);
+    let out = env.zephyr_env(&["up"], &[("SHIM_NO_NETWORK", "1")]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = env.calls();
+    let create = [
+        "docker", "network", "create", "--driver", "bridge", CONTAINER,
+    ];
+    let at = |prefix: &[&str]| {
+        (calls.iter()).position(|c| c.len() >= prefix.len() && c[..prefix.len()] == *prefix)
+    };
+    let (made, ran) = (at(&create), at(&["docker", "run", "-d"]));
+    assert!(made.is_some() && made < ran, "{calls:#?}");
+    assert!(!calls[made.unwrap()]
+        .iter()
+        .any(|a| a == "--ipv6" || a == "--subnet"));
+}
+
+#[test]
+fn host_networking_in_host_toml_keeps_todays_arguments() {
+    let env = Env::new("net-host");
+    env.init(&["--no-start"]);
+    let host = env.daemon().join("host.toml");
+    let text = std::fs::read_to_string(&host).unwrap();
+    let with = |mode: &str| text.replace("network = \"bridge\"", &format!("network = \"{mode}\""));
+    std::fs::write(&host, with("host")).unwrap();
+    env.ok(&["up"]);
+    let calls = env.calls();
+    let run = find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
+    assert!(has_pair(run, "--network", "host"), "{run:?}");
+    for absent in [
+        "NET_ADMIN",
+        "SETPCAP",
+        "-p",
+        "--hostname",
+        "ZEPHYR_NETWORK=bridge",
+    ] {
+        assert!(!run.iter().any(|a| a == absent), "{absent} in {run:?}");
+    }
+    assert!(!calls.iter().any(|c| c[1] == "network"), "{calls:#?}");
+    env.ok(&["attach", "--stock"]);
+    let stock = env.calls();
+    let connect = stock.iter().find(|c| c.iter().any(|a| a == "--connect"));
+    assert_eq!(connect.unwrap().last().unwrap(), "127.0.0.1:7790");
+
+    std::fs::write(&host, with("none")).unwrap();
+    let out = env.zephyr(&["up"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("network in host.toml must be \"bridge\" or \"host\""),
+        "{err}"
+    );
+    assert!(
+        !env.calls().iter().any(|c| c[1] == "run"),
+        "nothing was started"
+    );
+}
+
+#[test]
+fn imessage_is_published_on_loopback_with_a_tailscale_serve_hint() {
+    let env = Env::new("net-imessage");
+    env.init(&["--no-start"]);
+    let mut cfg = env.config();
+    cfg.push_str(
+        "\n[imessage]\nlisten = \"100.64.0.1:7791\"\nserver_url = \"http://100.64.0.2:1234\"\n\
+         password_env = \"ZEPHYR_BB_PASSWORD\"\nsecret_env = \"ZEPHYR_BB_SECRET\"\n",
+    );
+    std::fs::write(env.daemon().join("zephyr.toml"), cfg).unwrap();
+    let said = env.ok(&["up"]);
+    let run = run_call(&env);
+    assert!(has_pair(&run, "-p", "127.0.0.1:7791:7791"), "{run:?}");
+    assert!(has_pair(&run, "-p", "127.0.0.1:7790:7790"), "{run:?}");
+    // Never the Tailscale address: Docker could not bind it before tailscaled is up.
+    assert!(!run.iter().any(|a| a.contains("100.64.0.1")), "{run:?}");
+    assert!(
+        said.contains(
+            "the iMessage webhook is on this host's 127.0.0.1:7791 now; forward the Tailscale \
+             address to it once: sudo tailscale serve --bg --tcp 7791 tcp://127.0.0.1:7791"
+        ),
+        "{said}"
+    );
+}
+
+#[test]
+fn config_set_of_a_published_port_recreates_the_container() {
+    let env = Env::new("net-port");
+    env.init(&[]);
+    env.calls();
+    env.ok(&["config", "set", "attach.port", "7799"]);
+    let calls = env.calls();
+    let run = find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
+    assert!(has_pair(run, "-p", "127.0.0.1:7799:7799"), "{run:?}");
+    assert!(!run.iter().any(|a| a.contains("7790")), "{run:?}");
+    let reload = ["zephyr", "reload"].map(String::from);
+    assert!(!calls.iter().any(|c| c.ends_with(&reload)), "{calls:#?}");
+    // Any other key is the daemon's to reload, with no new container.
+    env.ok(&["config", "set", "timezone", "UTC"]);
+    let calls = env.calls();
+    assert!(!calls.iter().any(|c| c[1] == "run"), "{calls:#?}");
+    // Stopped: the next `up` publishes it.
+    let out = env.zephyr_env(
+        &["config", "set", "attach.port", "7798"],
+        &[("SHIM_STATE", "exited")],
+    );
+    assert!(out.status.success());
+    assert!(!env.calls().iter().any(|c| c[1] == "run"));
+}
+
+#[test]
+fn up_from_a_host_networking_container_explains_the_floor() {
+    const NOTICE: &str =
+        "the agent now reaches the internet only through zephyr's proxy: ports 80 \
+        and 443 to public addresses (DESIGN §4.19). Other destinations: /set network.allow \
+        HOST:PORT. Sign-ins: paste the address the browser cannot open. To go back: network = \
+        \"host\" in host.toml, then zephyr up.";
+    let env = Env::new("net-migrate");
+    env.init(&["--no-start"]);
+    let out = env.zephyr_env(&["up"], &[("SHIM_NETMODE", "host")]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout(&out).contains(NOTICE), "{}", stdout(&out));
+    // Already on the bridge: nothing to explain.
+    assert!(!env.ok(&["up"]).contains("zephyr's proxy"));
 }
 
 #[test]

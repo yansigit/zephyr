@@ -266,7 +266,7 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
   4. With `[imessage]` in bridge mode it prints `the iMessage webhook is on this host's 127.0.0.1:<p> now; forward the Tailscale address to it once: sudo tailscale serve --bg --tcp <p> tcp://127.0.0.1:<p>`.
 - `uninstall` runs `docker network rm <container>` after `rm -f`. `attach --stock` passes `<container_ip>:<port>` in bridge mode. `config set` (file path) and `channel add|remove` call `apply_published` with the `published` list read before the edit. `init` calls `set_network_default`.
 
-- [ ] **Step 1: Write the failing tests** in `tests/host.rs`. The shim's `network` case exits `${SHIM_NO_NETWORK:-0}` for `inspect`. Its `inspect` answers `${SHIM_NETMODE:-$CONTAINER}` for `NetworkMode` and `${SHIM_IP:-172.18.0.2}` for `IPAddress` formats, and keeps `SHIM_STATE` otherwise.
+- [x] **Step 1: Write the failing tests** in `tests/host.rs`. The shim's `network` case exits `${SHIM_NO_NETWORK:-0}` for `inspect`. Its `inspect` answers `${SHIM_NETMODE:-$CONTAINER}` for `NetworkMode` and `${SHIM_IP:-172.18.0.2}` for `IPAddress` formats, and keeps `SHIM_STATE` otherwise.
   - Extend `init_non_interactive_builds_the_layout_and_starts_the_container`. The run has the pairs `["--network", CONTAINER]`, `["--hostname", "zephyr"]` and `["--cap-add", "NET_ADMIN"]`, and contains `ZEPHYR_NETWORK=bridge` and `["-p", "127.0.0.1:7790:7790"]`. There is no `["--network", "host"]`. host.toml contains `network = "bridge"`.
   - `up_creates_the_network_only_when_missing`: with `SHIM_NO_NETWORK=1` the calls hold `docker network create --driver bridge CONTAINER`, and without it they do not.
   - `host_networking_in_host_toml_keeps_todays_arguments`: `network = "host"` gives `["--network", "host"]`, with no `NET_ADMIN`, no `-p` and no `ZEPHYR_NETWORK`. `network = "none"` fails with the Global Constraints text.
@@ -274,14 +274,18 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
   - `config_set_of_a_published_port_recreates_the_container`: with the daemon down, `config set attach.port 7799` makes a new `docker run -d` with `-p 127.0.0.1:7799:7799`, and no `zephyr reload` exec.
   - `up_from_a_host_networking_container_explains_the_floor`: with `SHIM_NETMODE=host`, stdout contains `the agent now reaches the internet only through zephyr's proxy`.
   - `uninstall_removes_the_network` and `attach_stock_connects_to_the_container_address` (argv ends with `172.18.0.2:7790`).
-- [ ] **Step 2:** `cargo test -p zephyr --test host` → FAIL. **Step 3:** Implement. **Step 4:** Run → PASS. The existing `up`/`upgrade` tests stay green.
-- [ ] **Step 5: Docs.** README covers:
+- [x] **Step 2:** `cargo test -p zephyr --test host` → FAIL. **Step 3:** Implement. **Step 4:** Run → PASS. The existing `up`/`upgrade` tests stay green.
+- [x] **Step 5: Docs.** README covers:
   - `network` in host.toml and how to go back;
   - the migration notice;
   - the iMessage `tailscale serve --bg --tcp` step in the channel setup;
   - the x11vnc recipe with `-listen <container ip>` in place of `-localhost`, where `docker inspect` prints the IP and the viewer connects to it from the host;
   - model servers on host loopback, which bind the bridge gateway and are listed in `network.allow`.
-- [ ] **Step 6:** Commit `feat(host): run the container on its own bridge with only zephyr's ports published on loopback`.
+- [x] **Step 6:** Commit `feat(host): run the container on its own bridge with only zephyr's ports published on loopback`.
+- Deviation: `up` also passes `--cap-add SETPCAP`. The container runs with `--cap-drop ALL`, and `PR_CAPBSET_DROP` needs SETPCAP, so without it `supervise` could not take NET_ADMIN away from the daemon. `egress::drop_net_admin` drops NET_ADMIN and then SETPCAP from the daemon bounding set, so the daemon holds SETUID, SETGID and KILL as before.
+- Deviation: `up` fails with `zephyr.toml is not a config zephyr can run` when the file does not parse as a `Config`, since it can no longer tell which ports to publish (before, the daemon failed at start instead).
+- Deviation: `apply_published` recreates only a running container; a stopped one publishes the port at its next `up`. The existing `config_get_and_set_check_the_daemon_schema` test now uses `owners.discord` as its unregistered key, since `attach.port` recreates the container.
+- Deviation: the README gets one section, "The agent network", for the host.toml line, the migration, `tailscale serve`, model servers and `network.allow`; the x11vnc recipe is changed in place.
 
 ### Task A2-8: Sign-ins by pasting the callback address
 

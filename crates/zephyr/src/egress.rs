@@ -629,17 +629,21 @@ pub fn load_floor() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// CAP_NET_ADMIN's number (linux/capability.h).
+/// CAP_NET_ADMIN's and CAP_SETPCAP's numbers (linux/capability.h).
 const NET_ADMIN: u32 = 12;
+const SETPCAP: u32 = 8;
 
 /// Drops NET_ADMIN from the calling thread's bounding set, so what it then executes as root
-/// cannot change the rules. For `pre_exec`: one syscall, nothing allocated.
+/// cannot change the rules, and then SETPCAP, which the drop itself needs and nothing after it
+/// does. For `pre_exec`: two syscalls, nothing allocated.
 pub fn drop_net_admin() -> std::io::Result<()> {
-    // SAFETY: a plain syscall with integer arguments.
-    match unsafe { libc::prctl(libc::PR_CAPBSET_DROP, NET_ADMIN as libc::c_ulong, 0, 0, 0) } {
-        0 => Ok(()),
-        _ => Err(std::io::Error::last_os_error()),
+    for cap in [NET_ADMIN, SETPCAP] {
+        // SAFETY: a plain syscall with integer arguments.
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
     }
+    Ok(())
 }
 
 /// Whether the process whose `/proc/<pid>/status` this is holds NET_ADMIN; `None` when the
