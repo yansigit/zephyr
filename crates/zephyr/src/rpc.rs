@@ -135,35 +135,69 @@ impl PartialEq for FilePrint {
 
 impl Eq for FilePrint {}
 
-impl FilePrint {
-    /// `path` now; `prior`'s hash is reused only when nothing else about the file differs.
-    fn of(path: &std::path::Path, prior: Option<&FilePrint>) -> Option<FilePrint> {
+/// A file that is there but not a plain file zephyr can read whole: a link, a folder, one that
+/// changed while it was read.
+#[derive(Debug)]
+struct Bad;
+
+/// `path`'s metadata, `None` when there is no file, `Bad` when it is not a plain file.
+fn plain(path: &std::path::Path) -> Result<Option<std::fs::Metadata>, Bad> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(m) if m.is_file() => Ok(Some(m)),
+        _ => Err(Bad),
+    }
+}
+
+/// `path`'s bytes, read whole between two looks that agree: what was read is what is there.
+fn read_whole(path: &std::path::Path, m: &std::fs::Metadata) -> Result<Vec<u8>, Bad> {
+    let bytes = std::fs::read(path).map_err(|_| Bad)?;
+    let after = plain(path)?.ok_or(Bad)?;
+    let key = |m: &std::fs::Metadata| {
         use std::os::unix::fs::MetadataExt;
-        let m = std::fs::symlink_metadata(path)
-            .ok()
-            .filter(|m| m.is_file())?;
-        let (len, ino) = (m.len(), m.ino());
-        let (ctime, mtime) = ((m.ctime(), m.ctime_nsec()), (m.mtime(), m.mtime_nsec()));
-        // File times tick coarsely: a write in the same tick as the one hashed would keep them,
-        // so a hash taken within a second of the file's last change is never reused.
-        let same = |p: &&FilePrint| {
-            (p.len, p.ino, p.ctime, p.mtime) == (len, ino, ctime, mtime) && p.seen > p.ctime.0 + 1
-        };
-        let (hash, seen) = match prior.filter(same) {
-            Some(p) => (p.hash.clone(), p.seen),
-            None => (
-                crate::drafts::digest([std::fs::read(path).ok()?.as_slice()]),
-                crate::now(),
-            ),
-        };
-        Some(FilePrint {
-            len,
-            ino,
-            ctime,
-            mtime,
+        (m.len(), m.ino(), m.ctime(), m.ctime_nsec())
+    };
+    match bytes.len() as u64 == m.len() && key(m) == key(&after) {
+        true => Ok(bytes),
+        false => Err(Bad),
+    }
+}
+
+fn hex(ctx: ring::digest::Context) -> String {
+    data_encoding::HEXLOWER.encode(ctx.finish().as_ref())
+}
+
+impl FilePrint {
+    fn with(m: &std::fs::Metadata, hash: String, seen: i64) -> FilePrint {
+        use std::os::unix::fs::MetadataExt;
+        FilePrint {
+            len: m.len(),
+            ino: m.ino(),
+            ctime: (m.ctime(), m.ctime_nsec()),
+            mtime: (m.mtime(), m.mtime_nsec()),
             hash,
             seen,
-        })
+        }
+    }
+
+    /// `path` now (`None`: no file); `prior`'s hash is reused only when nothing else about the
+    /// file differs and it was hashed more than a second after its last change: file times tick
+    /// coarsely, so a write in the same tick as the one hashed would keep them.
+    fn of(path: &std::path::Path, prior: Option<&FilePrint>) -> Result<Option<FilePrint>, Bad> {
+        let Some(m) = plain(path)? else {
+            return Ok(None);
+        };
+        let now = FilePrint::with(&m, String::new(), 0);
+        let same = |p: &&FilePrint| {
+            (p.len, p.ino, p.ctime, p.mtime) == (now.len, now.ino, now.ctime, now.mtime)
+                && p.seen > p.ctime.0 + 1
+        };
+        if let Some(p) = prior.filter(same) {
+            return Ok(Some(FilePrint::with(&m, p.hash.clone(), p.seen)));
+        }
+        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+        ctx.update(&read_whole(path, &m)?);
+        Ok(Some(FilePrint::with(&m, hex(ctx), crate::now())))
     }
 }
 
@@ -175,27 +209,46 @@ pub struct SessionPrint {
     path: Option<String>,
     file: Option<FilePrint>,
     progress: Option<FilePrint>,
+    /// One of them is there but not a plain file zephyr could read whole.
+    #[serde(default)]
+    bad: bool,
 }
 
 impl SessionPrint {
-    /// Session `id` now, hashing only what differs from `prior`.
-    pub fn now(dir: &std::path::Path, id: &str, prior: Option<&SessionPrint>) -> SessionPrint {
+    /// Session `id`'s files, and the newest one's and its companion's paths.
+    fn files(
+        dir: &std::path::Path,
+        id: &str,
+    ) -> (usize, Option<(std::path::PathBuf, std::path::PathBuf)>) {
         let files: Vec<_> = (main_files(dir).into_iter())
             .filter(|f| f.0 == id)
             .collect();
-        let Some(newest) = files.iter().max_by_key(|f| f.2) else {
+        let newest = files.iter().max_by_key(|f| f.2).map(|f| {
+            let progress = format!("{}.progress.jsonl", f.1.display());
+            (f.1.clone(), std::path::PathBuf::from(progress))
+        });
+        (files.len(), newest)
+    }
+
+    /// Session `id` now, hashing only what differs from `prior`.
+    pub fn now(dir: &std::path::Path, id: &str, prior: Option<&SessionPrint>) -> SessionPrint {
+        let (count, newest) = SessionPrint::files(dir, id);
+        let Some((file, progress)) = newest else {
             return SessionPrint::default();
         };
         let _fs = crate::agent::fs();
-        let progress = std::path::PathBuf::from(format!("{}.progress.jsonl", newest.1.display()));
-        let path = newest.1.display().to_string();
+        let path = file.display().to_string();
         // A print of another file is no help.
         let prior = prior.filter(|p| p.path.as_deref() == Some(path.as_str()));
+        let file = FilePrint::of(&file, prior.and_then(|p| p.file.as_ref()));
+        let progress = FilePrint::of(&progress, prior.and_then(|p| p.progress.as_ref()));
+        let bad = !matches!(file, Ok(Some(_))) || progress.is_err();
         SessionPrint {
-            count: files.len(),
-            file: FilePrint::of(&newest.1, prior.and_then(|p| p.file.as_ref())),
-            progress: FilePrint::of(&progress, prior.and_then(|p| p.progress.as_ref())),
+            count,
             path: Some(path),
+            file: file.ok().flatten(),
+            progress: progress.ok().flatten(),
+            bad,
         }
     }
 
@@ -204,29 +257,53 @@ impl SessionPrint {
         self.count > 0
     }
 
-    /// Whether this is `before` with lines added after it, as rpi adds them in a run: the same
-    /// file, as long or longer, its first `before` bytes unchanged. The progress companion,
-    /// which rpi rewrites, is not compared.
-    pub fn grew_from(&self, before: &SessionPrint) -> bool {
-        let (Some(now), Some(then)) = (&self.file, &before.file) else {
-            // No file before: rpi made the first one in the run.
-            return before.count == 0 && self.count <= 1;
+    /// Whether a file is there that is not a plain file zephyr could read whole.
+    pub fn bad(&self) -> bool {
+        self.bad
+    }
+
+    /// Session `id` now, if it is this print with lines added after it, as rpi adds them (or
+    /// unchanged): the same one file, its first bytes as hashed here; from no file, rpi's first.
+    /// The newest file is read once, and what is returned is the print of the bytes checked.
+    /// The progress companion, which rpi rewrites, only has to be a plain file.
+    pub fn follow(&self, dir: &std::path::Path, id: &str) -> Option<SessionPrint> {
+        if self.bad {
+            return None;
+        }
+        let (count, newest) = SessionPrint::files(dir, id);
+        let Some((file, progress)) = newest else {
+            return (self.count == 0).then(SessionPrint::default);
         };
-        let (Some(path), true) = (
-            &self.path,
-            self.count == before.count && self.path == before.path,
-        ) else {
-            return false;
+        let path = file.display().to_string();
+        let same = match &self.file {
+            None => self.count == 0 && count == 1,
+            Some(_) => count == self.count && self.path.as_deref() == Some(path.as_str()),
         };
-        if now.len < then.len {
-            return false;
+        if !same {
+            return None;
         }
         let _fs = crate::agent::fs();
-        let Ok(bytes) = std::fs::read(path) else {
-            return false;
-        };
-        let head = bytes.get(..then.len as usize).unwrap_or_default();
-        crate::drafts::digest([head]) == then.hash
+        let m = plain(&file).ok()??;
+        let bytes = read_whole(&file, &m).ok()?;
+        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+        if let Some(then) = &self.file {
+            let head = bytes.get(..then.len as usize)?;
+            ctx.update(head);
+            if hex(ctx.clone()) != then.hash {
+                return None;
+            }
+            ctx.update(&bytes[head.len()..]);
+        } else {
+            ctx.update(&bytes);
+        }
+        let progress = FilePrint::of(&progress, None).ok()?;
+        Some(SessionPrint {
+            count,
+            path: Some(path),
+            file: Some(FilePrint::with(&m, hex(ctx), crate::now())),
+            progress,
+            bad: false,
+        })
     }
 }
 
@@ -1159,36 +1236,81 @@ mod tests {
     }
 
     #[test]
-    fn a_session_grows_only_by_lines_added_after_what_was_seen() {
+    fn a_session_follows_only_by_lines_added_after_what_was_seen() {
         let dir = crate::test_dir("rpc-session-print");
         let folder = dir.join("--home--");
         std::fs::create_dir_all(&folder).unwrap();
         let file = folder.join("2026-01-01T00-00-00-000Z_main-1.jsonl");
-        assert!(!SessionPrint::now(&dir, "main-1", None).exists());
+        let none = SessionPrint::now(&dir, "main-1", None);
+        assert!(!none.exists() && !none.bad());
+        // From no file: rpi makes the first one.
         std::fs::write(&file, "{\"kind\":\"header\"}\n{\"a\":1}\n").unwrap();
-        let seen = SessionPrint::now(&dir, "main-1", None);
+        let seen = none.follow(&dir, "main-1").expect("a first file");
         assert_eq!(
             SessionPrint::now(&dir, "main-1", Some(&seen)),
             seen,
             "unchanged"
         );
+        assert_eq!(
+            seen.follow(&dir, "main-1").as_ref(),
+            Some(&seen),
+            "unchanged follows"
+        );
         let mut text = std::fs::read_to_string(&file).unwrap();
         text.push_str("{\"b\":2}\n");
         std::fs::write(&file, &text).unwrap();
-        let grown = SessionPrint::now(&dir, "main-1", Some(&seen));
-        assert_ne!(grown, seen);
-        assert!(grown.grew_from(&seen));
+        let grown = seen.follow(&dir, "main-1").expect("lines added");
+        assert_eq!(
+            SessionPrint::now(&dir, "main-1", Some(&grown)),
+            grown,
+            "recorded as read"
+        );
         // An earlier line changed in place, same length: not a growth.
         std::fs::write(&file, text.replace("\"a\":1", "\"a\":2")).unwrap();
-        let edited = SessionPrint::now(&dir, "main-1", Some(&grown));
-        assert_ne!(edited, grown, "hashed again: the change time moved");
-        assert!(!edited.grew_from(&seen));
+        assert_ne!(
+            SessionPrint::now(&dir, "main-1", Some(&grown)),
+            grown,
+            "hashed again"
+        );
+        assert_eq!(seen.follow(&dir, "main-1"), None);
         // Cut short.
         std::fs::write(&file, "{\"kind\":\"header\"}\n").unwrap();
-        assert!(!SessionPrint::now(&dir, "main-1", None).grew_from(&seen));
+        assert_eq!(seen.follow(&dir, "main-1"), None);
         // A second file for the id.
         std::fs::write(&file, &text).unwrap();
-        std::fs::write(folder.join("2027-01-01T00-00-00-000Z_main-1.jsonl"), &text).unwrap();
-        assert!(!SessionPrint::now(&dir, "main-1", None).grew_from(&seen));
+        let second = folder.join("2027-01-01T00-00-00-000Z_main-1.jsonl");
+        std::fs::write(&second, &text).unwrap();
+        assert_eq!(seen.follow(&dir, "main-1"), None);
+        assert_eq!(
+            none.follow(&dir, "main-1"),
+            None,
+            "two files where none was"
+        );
+    }
+
+    #[test]
+    fn a_session_file_that_is_a_link_or_unreadable_is_never_followed() {
+        use std::os::unix::fs::symlink;
+        let dir = crate::test_dir("rpc-session-bad");
+        let folder = dir.join("--home--");
+        std::fs::create_dir_all(&folder).unwrap();
+        let none = SessionPrint::now(&dir, "main-1", None);
+        std::fs::write(dir.join("elsewhere.jsonl"), "{\"kind\":\"header\"}\n").unwrap();
+        let file = folder.join("2026-01-01T00-00-00-000Z_main-1.jsonl");
+        symlink(dir.join("elsewhere.jsonl"), &file).unwrap();
+        assert!(SessionPrint::now(&dir, "main-1", None).bad());
+        assert_eq!(none.follow(&dir, "main-1"), None, "a link where none was");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(SessionPrint::now(&dir, "main-1", None).bad(), "a folder");
+        assert_eq!(none.follow(&dir, "main-1"), None);
+        std::fs::remove_dir(&file).unwrap();
+        // The companion counts too.
+        std::fs::write(&file, "{\"kind\":\"header\"}\n").unwrap();
+        let seen = none.follow(&dir, "main-1").unwrap();
+        let progress = folder.join("2026-01-01T00-00-00-000Z_main-1.jsonl.progress.jsonl");
+        symlink(dir.join("elsewhere.jsonl"), &progress).unwrap();
+        assert!(SessionPrint::now(&dir, "main-1", Some(&seen)).bad());
+        assert_eq!(seen.follow(&dir, "main-1"), None);
     }
 }

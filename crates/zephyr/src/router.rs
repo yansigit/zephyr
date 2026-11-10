@@ -1687,7 +1687,7 @@ impl<'a> Router<'a> {
         match Child::spawn_as(&self.cfg, Some(&session), account.as_ref()).await {
             Ok(child) => {
                 eprintln!("zephyr: rpi child {:?} ready", child.pid());
-                self.settle_session(&session, Some(since), false);
+                self.settle_session(&session, since);
                 self.spawn_failures = 0;
                 if let Some(a) = &account {
                     eprintln!("zephyr: on account {} ({})", a.name, a.model);
@@ -2020,22 +2020,33 @@ impl<'a> Router<'a> {
         let now = crate::now();
         self.run_since = Some(now);
         let session = self.child.as_ref().and_then(|c| c.session.clone());
+        let mut beside = None;
         if let Some(session) = &session {
             self.check_session(session);
+            if let Ok(SessionOrigin::Clean) = self.store.session_origin(session) {
+                beside = self.procs_beside(now);
+            }
+            // A stray may end before the settle, having written the file or memory: the
+            // conversation is not the owner's alone from now on.
+            if let Some(Beside::Stray(comm)) = &beside {
+                self.taint_stray(session, "open", comm);
+            }
         }
         let failed = session.as_ref().and_then(|s| self.tainted.get(s)).cloned();
         let origin = session.map(|s| self.store.session_origin(&s));
-        let beside = match origin {
-            Some(Ok(SessionOrigin::Clean)) => self.beside(now),
-            _ => None,
-        };
+        let beside = beside.map(|b| match b {
+            Beside::Work => crate::memory::BESIDE.to_string(),
+            Beside::Stray(comm) => stray_label(&comm),
+        });
         self.trust = match origin {
             _ if self.unplaced => Trust::Not(UNPLACED.into()),
             _ if failed.is_some() => Trust::Not(format!(
                 "this conversation, which {}",
                 failed.unwrap_or_default()
             )),
-            Some(Ok(SessionOrigin::Clean)) if beside.is_some() => {
+            Some(Ok(SessionOrigin::Clean)) | Some(Ok(SessionOrigin::Tainted(_)))
+                if beside.is_some() =>
+            {
                 Trust::Not(beside.unwrap_or_default())
             }
             Some(Ok(SessionOrigin::Clean)) => {
@@ -2049,15 +2060,6 @@ impl<'a> Router<'a> {
             }
             _ => Trust::Not(crate::memory::LEGACY.into()),
         };
-    }
-
-    /// What ran or runs beside a run of main since `since`, as its label: other work
-    /// (`BESIDE`), else a stray, named with what ends it.
-    fn beside(&self, since: i64) -> Option<String> {
-        self.procs_beside(since).map(|b| match b {
-            Beside::Work => crate::memory::BESIDE.into(),
-            Beside::Stray(comm) => stray_label(&comm),
-        })
     }
 
     /// What ran or runs beside since `since`: other work first, else a stray.
@@ -2113,71 +2115,68 @@ impl<'a> Router<'a> {
         self.record_taint(session.to_string(), &why);
     }
 
-    /// The conversation's saved file is what zephyr last saw (`mark_session`); anything else
-    /// changed it while rpi was idle, so it is tainted (DESIGN §4.6). Only a clean one is looked at.
+    /// The conversation's saved file is what zephyr last recorded; anything else changed it
+    /// while rpi was idle, so it is tainted (DESIGN §4.6). Only a clean one is looked at. On a
+    /// match the fresh print is kept, so the next look hashes nothing it need not.
     fn check_session(&mut self, session: &str) {
         let Some(seen) = self.session_seen(session) else {
             return;
         };
         let dir = self.cfg.session_dir();
-        let same = seen.is_ok_and(|s| crate::rpc::SessionPrint::now(&dir, session, Some(&s)) == s);
-        if !same {
-            self.taint_now(session, "was changed on disk outside zephyr");
+        let now =
+            (seen.as_ref().ok()).map(|s| crate::rpc::SessionPrint::now(&dir, session, Some(s)));
+        match (now, seen) {
+            (Some(now), Ok(seen)) if !now.bad() && now == seen => {
+                self.record_session(session, &now)
+            }
+            _ => self.taint_now(session, "was changed on disk outside zephyr"),
         }
     }
 
-    /// After rpi wrote the file (a run, a start, a stop, an idle command begun at `since`): when
-    /// other work of the agent's ran meanwhile it could have written there too, so the
-    /// conversation is tainted; else, when `grew`, rpi may only have added to what was recorded;
-    /// then the file is recorded as it is now.
-    fn settle_session(&mut self, session: &str, since: Option<i64>, grew: bool) {
+    /// After rpi wrote the file (a run, a start, a stop, an idle command, the window opened at
+    /// `since` by `check_session`): when other work of the agent's ran meanwhile, or a stray of
+    /// its lived, it could have written there too, so the conversation is tainted; else rpi may
+    /// only have added to the bytes recorded (`SessionPrint::follow`), and the print of exactly
+    /// the bytes so checked is recorded.
+    fn settle_session(&mut self, session: &str, since: i64) {
         let Some(seen) = self.session_seen(session) else {
             return;
         };
-        let beside = since.map(|since| self.procs_beside(since));
-        match beside {
-            None | Some(Some(Beside::Work)) => {
+        match self.procs_beside(since) {
+            Some(Beside::Work) => {
                 return self.taint_now(
                     session,
                     "was written while other work of the agent's was running",
                 )
             }
-            Some(Some(Beside::Stray(comm))) => {
-                let (what, cure) = stray_phrase(&comm);
-                let why = format!(
-                    "was written at {} while {what}; {cure}, then /new starts clean",
-                    self.clock(crate::now())
-                );
-                return self.record_taint(session.to_string(), &why);
-            }
-            Some(None) => {}
+            Some(Beside::Stray(comm)) => return self.taint_stray(session, "written", &comm),
+            None => {}
         }
         let dir = self.cfg.session_dir();
-        let now = seen
-            .as_ref()
-            .map(|s| crate::rpc::SessionPrint::now(&dir, session, Some(s)));
-        if grew && !matches!((&now, &seen), (Ok(n), Ok(s)) if n.grew_from(s)) {
-            return self.taint_now(session, "was changed on disk outside zephyr");
+        match seen.ok().and_then(|s| s.follow(&dir, session)) {
+            Some(now) => self.record_session(session, &now),
+            None => self.taint_now(session, "was changed on disk outside zephyr"),
         }
-        self.mark_session(session);
     }
 
-    /// Records the clean conversation's saved file as it is now, after rpi wrote it and with rpi
-    /// idle. A record that cannot be written taints it: the next look would have nothing to trust.
-    fn mark_session(&mut self, session: &str) {
-        let Some(seen) = self.session_seen(session) else {
-            return;
-        };
-        let dir = self.cfg.session_dir();
-        let now = crate::rpc::SessionPrint::now(&dir, session, seen.as_ref().ok());
-        let now = serde_json::to_string(&now).unwrap_or_default();
-        if let Err(e) = self.store.set_session_file(session, &now) {
+    /// A stray of the agent's lived while the conversation was open or written (`what`): it is
+    /// tainted, and the reason says what the stray was and how to end it.
+    fn taint_stray(&mut self, session: &str, what: &str, comm: &str) {
+        let (who, cure) = stray_phrase(comm);
+        let why = format!(
+            "was {what} at {} while {who}; {cure}, then /new starts clean",
+            self.clock(crate::now())
+        );
+        self.record_taint(session.to_string(), &why);
+    }
+
+    /// Records `print` as the clean conversation's saved files. A record that cannot be written
+    /// taints it: the next look would have nothing to trust.
+    fn record_session(&mut self, session: &str, print: &crate::rpc::SessionPrint) {
+        let json = serde_json::to_string(print).unwrap_or_default();
+        if let Err(e) = self.store.set_session_file(session, &json) {
             eprintln!("zephyr: recording the conversation's file failed: {e}");
-            let why = format!(
-                "could not have its saved file recorded at {}",
-                self.clock(crate::now())
-            );
-            self.record_taint(session.to_string(), &why);
+            self.taint_now(session, "could not have its saved file recorded");
         }
     }
 
@@ -2195,7 +2194,7 @@ impl<'a> Router<'a> {
         }
         let answer = self.call(cmd).await;
         if let Some(s) = &session {
-            self.settle_session(s, Some(since), false);
+            self.settle_session(s, since);
         }
         answer
     }
@@ -2243,10 +2242,24 @@ impl<'a> Router<'a> {
         self.busy = false;
         self.run_start = None;
         // What rpi wrote in the run is the conversation now, if it only added to what was there
-        // and nothing else of the agent's ran beside it.
-        if let Some(session) = self.child_session() {
-            let since = self.run_since.take();
-            self.settle_session(&session, since, true);
+        // and nothing else of the agent's ran beside it; else the conversation is tainted, and
+        // so is this run (DESIGN §4.6). A run zephyr did not see start saves nothing at once,
+        // and leaves the conversation as it is.
+        match (self.child_session(), self.run_since.take()) {
+            (Some(session), Some(since)) => {
+                self.settle_session(&session, since);
+                if let Trust::Owner { .. } = self.trust {
+                    let failed = self.tainted.get(&session).cloned();
+                    match (failed, self.store.session_origin(&session)) {
+                        (None, Ok(SessionOrigin::Clean)) => {}
+                        (Some(why), _) | (None, Ok(SessionOrigin::Tainted(why))) => {
+                            self.trust = Trust::Not(format!("this conversation, which {why}"));
+                        }
+                        _ => self.trust = Trust::Not(crate::memory::LEGACY.into()),
+                    }
+                }
+            }
+            _ => self.trust = Trust::Not(UNSEEN_RUN.into()),
         }
         let cut = self.cut.take();
         self.cut_at = None;
@@ -4045,7 +4058,7 @@ impl<'a> Router<'a> {
             }
             child.stop().await;
             if let Some(s) = &session {
-                self.settle_session(s, Some(since), false);
+                self.settle_session(s, since);
             }
             eprintln!("zephyr: restarting rpi");
         }
@@ -4456,7 +4469,8 @@ impl<'a> Router<'a> {
         // The run's start is judged, and the file checked, before rpi starts writing it.
         self.begin_run().await;
         if let Err(e) = self.call(cmd).await {
-            (self.run_start, self.run_since) = (None, None);
+            // `run_since` stays: rpi may have started the run before it answered.
+            self.run_start = None;
             return format!("[zephyr] /compact failed: {e:#}");
         }
         self.busy = true;
@@ -4579,6 +4593,9 @@ enum Trust {
     /// Why it is not: the waiting notice's `(from …)`.
     Not(String),
 }
+
+/// `Trust::Not`'s label for a run zephyr did not see start (`begin_run`).
+const UNSEEN_RUN: &str = "your message, but zephyr did not see the run start";
 
 /// `Trust::Not`'s label while a run cut off by a restart could not be placed (`taint_cut_off`).
 const UNPLACED: &str =

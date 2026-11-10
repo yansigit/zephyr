@@ -1712,6 +1712,33 @@ async fn compact_keeps_a_clean_conversation_clean() {
 }
 
 #[tokio::test]
+async fn a_session_file_edited_during_an_owner_run_keeps_its_memory_waiting() {
+    let home = home("memory-session-mid-run");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "/new").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "hi").await;
+    gw.wait_replies(2).await;
+    // While the run that saves the memory goes, an earlier line of the saved conversation is
+    // changed in place: the run's change must wait, not be saved at once.
+    std::fs::write(home.join("slow"), "2").unwrap();
+    gw.say("m3", "owner", "WRITE_MEMORY likes tea").await;
+    wait(|| log(&home, "prompt").len() == 2).await;
+    let file = session_file(&home, &main_id(&home)).unwrap();
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("[chat #2] hi"), "{text}");
+    std::fs::write(&file, text.replace("[chat #2] hi", "[chat #2] ho")).unwrap();
+    let notice = reply_starting(&gw, "[zephyr] memory change").await;
+    assert!(
+        notice.starts_with(
+            "[zephyr] memory change waiting (from this conversation, which was changed on disk outside zephyr at "
+        ),
+        "{notice}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_rule_restarts_the_agent_and_leads_its_context() {
     let home = home("rules");
     let gw = start(config(&home));
