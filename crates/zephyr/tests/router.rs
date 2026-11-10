@@ -636,6 +636,8 @@ async fn a_pause_survives_restart() {
 
     let gw = start(config(&home));
     gw.say("m2", "owner", "hi").await;
+    // Taken in (a slow machine's restart may take longer than a quiet wait), and then held.
+    wait(|| inbox_status(&home, "new") == 1).await;
     assert!(gw.wait_replies(0).await.is_empty());
     assert!(log(&home, "prompt").is_empty());
     assert_eq!(inbox_status(&home, "new"), 1);
@@ -676,6 +678,7 @@ async fn budget_pauses_at_the_limit_and_holds_until_resume() {
     // The pause is in the store, so a restart keeps it.
     let gw = start(cfg);
     gw.say("m4", "owner", "also held").await;
+    wait(|| inbox_status(&home, "new") == 2).await;
     assert!(gw.wait_replies(0).await.is_empty());
     assert_eq!(log(&home, "prompt").len(), 2);
     assert_eq!(inbox_status(&home, "new"), 2);
