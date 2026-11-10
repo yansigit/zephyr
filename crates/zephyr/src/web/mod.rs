@@ -1,12 +1,14 @@
 //! The web app (DESIGN §4.3.3): one hyper listener on 127.0.0.1 behind `tailscale serve`. It
-//! checks Host, Origin and the Tailscale header on every request, and serves the embedded files.
-//! `passkey` and `push` are pure.
+//! checks Host, Origin and the Tailscale header on every request, serves the embedded files, and
+//! upgrades `/api/ws` into an attach connection on channel `web`. `passkey` and `push` are pure.
 
 pub mod passkey;
 pub mod push;
 
-use crate::attach::Handles;
+use crate::attach::{Handles, MAX_LINE};
 use crate::config::{Config, Web};
+use crate::store::{Store, WebSession};
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{self, HeaderMap, HeaderValue};
@@ -18,13 +20,26 @@ use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
+use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 
 /// Connections served at once; one more is closed as it arrives.
 const MAX_CONNS: usize = 32;
 /// How long a connection has to send its request head.
 const HEAD_WAIT: Duration = Duration::from_secs(10);
+/// Web sockets open at once; one more gets 503.
+const MAX_SOCKETS: usize = 4;
+/// Requests a socket may send in a minute; one more closes it.
+const SOCKET_REQUESTS: u32 = 60;
+/// How often an open socket's session is read again (and at once on `Hub::revoke`).
+const SESSION_CHECK: Duration = Duration::from_secs(60);
+/// The session cookie. `__Host-` binds it to this origin over HTTPS, with `Path=/`.
+const COOKIE: &str = "__Host-zephyr";
 
 /// The app, embedded: path, content type, bytes. Nothing in it is private.
 pub(crate) const FILES: &[(&str, &str, &[u8])] = &[
@@ -95,6 +110,25 @@ impl Hub {
 
     pub fn revocations(&self) -> watch::Receiver<u64> {
         self.revoked.subscribe()
+    }
+
+    /// Counts a socket in until the guard is dropped; `None` when `MAX_SOCKETS` are open.
+    fn open(self: &Arc<Self>) -> Option<Socket> {
+        let counted = (self.sockets)
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < MAX_SOCKETS).then_some(n + 1)
+            })
+            .is_ok();
+        counted.then(|| Socket(self.clone()))
+    }
+}
+
+/// One open web socket, counted in its hub.
+struct Socket(Arc<Hub>);
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        self.0.sockets.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -177,10 +211,37 @@ fn text(code: StatusCode, body: &'static str) -> Res {
 /// What every listener task needs.
 struct App {
     web: Web,
-    #[allow(dead_code)] // the WebSocket bridge and the ceremonies read them
     handles: Handles,
-    #[allow(dead_code)]
     hub: Arc<Hub>,
+}
+
+impl App {
+    fn cfg(&self) -> Arc<Config> {
+        self.handles.cfgs.borrow().clone()
+    }
+
+    /// The live session a request's cookie names, with the cookie's hash. Only the hash is
+    /// ever stored or compared, by SQLite as a key.
+    fn session(&self, h: &HeaderMap) -> Option<WebSession> {
+        let cookies = h.get(header::COOKIE)?.to_str().ok()?;
+        let token = cookies
+            .split(';')
+            .filter_map(|c| c.trim().split_once('='))
+            .find_map(|(name, value)| (name == COOKIE).then_some(value))?;
+        let token = data_encoding::BASE64URL_NOPAD
+            .decode(token.as_bytes())
+            .ok()?;
+        if token.len() != 32 {
+            return None;
+        }
+        self.live(&passkey::sha256(&token))
+    }
+
+    /// The session with this hash, if it has not ended.
+    fn live(&self, hash: &[u8; 32]) -> Option<WebSession> {
+        let store = Store::open(&self.cfg().db_path()).ok()?;
+        store.web_session(hash, crate::now()).ok().flatten()
+    }
 }
 
 /// Serves the web app until dropped. Pending forever without `[web]`, and when the port cannot
@@ -217,13 +278,14 @@ pub async fn serve(cfg: &Config, handles: Handles, hub: Arc<Hub>) -> anyhow::Res
         tokio::spawn(async move {
             let svc = service_fn(move |req| {
                 let app = app.clone();
-                async move { Ok::<_, Infallible>(handle(req, &app).await) }
+                async move { Ok::<_, Infallible>(handle(req, app).await) }
             });
-            // One request per connection, so the head deadline bounds an idle one too.
+            // Keep-alive stays on: with it off hyper adds `close` to the 101's `Connection: Upgrade`,
+            // which a WebSocket client need not accept. The head deadline runs again for each
+            // request on the connection, so it bounds an idle one too.
             let _ = http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())
                 .header_read_timeout(HEAD_WAIT)
-                .keep_alive(false)
                 .serve_connection(TokioIo::new(stream), svc)
                 .with_upgrades()
                 .await;
@@ -232,7 +294,7 @@ pub async fn serve(cfg: &Config, handles: Handles, hub: Arc<Hub>) -> anyhow::Res
     }
 }
 
-async fn handle(req: Request<Incoming>, app: &App) -> Res {
+async fn handle(req: Request<Incoming>, app: Arc<App>) -> Res {
     let path = req.uri().path().to_string();
     let mut res = match admit(req.method(), &path, req.headers(), &app.web) {
         Err(StatusCode::FORBIDDEN) => text(
@@ -240,13 +302,16 @@ async fn handle(req: Request<Incoming>, app: &App) -> Res {
             "open the app through tailscale serve",
         ),
         Err(code) => text(code, ""),
-        Ok(()) => route(&req, &path),
+        Ok(()) => route(req, &path, &app),
     };
     secure(res.headers_mut(), &app.web.host, path.starts_with("/api/"));
     res
 }
 
-fn route(req: &Request<Incoming>, path: &str) -> Res {
+fn route(req: Request<Incoming>, path: &str, app: &Arc<App>) -> Res {
+    if (req.method(), path) == (&Method::GET, "/api/ws") {
+        return ws(req, app);
+    }
     match FILES.iter().find(|f| f.0 == path) {
         Some(&(_, kind, bytes)) if req.method() == Method::GET => {
             let fresh = req
@@ -264,6 +329,137 @@ fn route(req: &Request<Incoming>, path: &str) -> Res {
         }
         _ => text(StatusCode::NOT_FOUND, ""),
     }
+}
+
+/// `GET /api/ws`: the attach protocol over a WebSocket, for a signed-in browser (`admit` has
+/// checked its Origin). Answers the handshake, then bridges the socket once hyper hands it over.
+fn ws(mut req: Request<Incoming>, app: &Arc<App>) -> Res {
+    let Some(session) = app.session(req.headers()) else {
+        return text(StatusCode::UNAUTHORIZED, "");
+    };
+    let h = req.headers();
+    let asks = |name: header::HeaderName, want: &str| {
+        (h.get(name).and_then(|v| v.to_str().ok())).is_some_and(|v| {
+            v.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(want))
+        })
+    };
+    let key = h
+        .get(header::SEC_WEBSOCKET_KEY)
+        .map(|k| derive_accept_key(k.as_bytes()));
+    let (Some(accept), true, true) = (
+        key.and_then(|k| HeaderValue::from_str(&k).ok()),
+        asks(header::UPGRADE, "websocket"),
+        asks(header::SEC_WEBSOCKET_VERSION, "13"),
+    ) else {
+        return text(StatusCode::BAD_REQUEST, "");
+    };
+    let Some(socket) = app.hub.open() else {
+        return text(StatusCode::SERVICE_UNAVAILABLE, "");
+    };
+    let (upgrade, app) = (hyper::upgrade::on(&mut req), app.clone());
+    tokio::spawn(async move {
+        // Fails when the client went away before the 101 reached it.
+        if let Ok(upgraded) = upgrade.await {
+            bridge(TokioIo::new(upgraded), session, &app).await;
+        }
+        drop(socket);
+    });
+    let mut res = text(StatusCode::SWITCHING_PROTOCOLS, "");
+    let h = res.headers_mut();
+    h.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+    h.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+    h.insert(header::SEC_WEBSOCKET_ACCEPT, accept);
+    res
+}
+
+/// Joins a WebSocket to an attach connection on channel `web`: each text frame goes in as one
+/// line, each line out as one frame. The socket is closed on a binary frame, a frame holding a
+/// newline or over 1 MiB, more than 60 frames in a minute, no frame or pong for two ping
+/// intervals (a phone that froze the page), and once its session has ended.
+async fn bridge<S>(io: S, session: WebSession, app: &App)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let limits = WebSocketConfig {
+        max_message_size: Some(MAX_LINE as usize),
+        max_frame_size: Some(MAX_LINE as usize),
+        ..Default::default()
+    };
+    let ws = WebSocketStream::from_raw_socket(io, Role::Server, Some(limits)).await;
+    let (mut sink, mut frames) = ws.split();
+    let (near, far) = tokio::io::duplex(2 * MAX_LINE as usize);
+    let origin = crate::attach::Origin::Web {
+        session: session.token_hash,
+        passkey: session.passkey,
+        hub: app.hub.clone(),
+    };
+    let conn = tokio::spawn(crate::attach::serve_stream(
+        far,
+        origin,
+        app.handles.clone(),
+    ));
+    let (read, mut write) = tokio::io::split(near);
+    let mut lines = tokio::io::BufReader::new(read).lines();
+    let ping = app.cfg().web_ping;
+    let (mut pings, mut checks) = (
+        tokio::time::interval(ping),
+        tokio::time::interval(SESSION_CHECK),
+    );
+    let mut revoked = app.hub.revocations();
+    let mut requests = Window::new(SOCKET_REQUESTS, Duration::from_secs(60));
+    let mut heard = Instant::now();
+    // A send to a phone that stopped reading must not hold the loop past the dead-socket limit.
+    let limit = 2 * ping;
+    loop {
+        let out = tokio::select! {
+            frame = frames.next() => match frame {
+                Some(Ok(Message::Text(text))) => {
+                    heard = Instant::now();
+                    if text.contains('\n') || !requests.hit(heard) {
+                        break;
+                    }
+                    let line = format!("{text}\n");
+                    if write.write_all(line.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                // tungstenite answers a ping itself.
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+                    heard = Instant::now();
+                    continue;
+                }
+                _ => break, // binary, a close, an oversized frame, the end
+            },
+            line = lines.next_line() => match line {
+                Ok(Some(line)) => Message::Text(line),
+                _ => break, // the connection ended (the router is going down)
+            },
+            _ = pings.tick() => {
+                if heard.elapsed() > limit {
+                    break;
+                }
+                Message::Ping(vec![])
+            }
+            _ = checks.tick() => match app.live(&session.token_hash) {
+                Some(_) => continue,
+                None => break,
+            },
+            changed = revoked.changed() => match (changed, app.live(&session.token_hash)) {
+                (Ok(()), Some(_)) => continue,
+                _ => break,
+            },
+        };
+        if !matches!(
+            tokio::time::timeout(limit, sink.send(out)).await,
+            Ok(Ok(()))
+        ) {
+            break;
+        }
+    }
+    conn.abort();
+    let _ = tokio::time::timeout(limit, sink.close()).await;
 }
 
 /// The headers every response carries. Nothing in the app is inline, so the CSP needs no nonce.

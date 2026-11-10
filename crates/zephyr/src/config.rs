@@ -618,8 +618,8 @@ impl Config {
     }
 
     pub fn is_owner(&self, channel: &str, sender: &str) -> bool {
-        // The attach token already proved the sender is the owner.
-        channel == crate::attach::CHANNEL
+        // The attach token, or the web app's session cookie, already proved the sender is the owner.
+        crate::attach::attached(channel)
             || self
                 .owners
                 .get(channel)

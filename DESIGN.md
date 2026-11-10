@@ -149,7 +149,8 @@ Zephyr's own TUI uses the same port, token and framing (one JSON-RPC 2.0 object 
   "channels": [                      // the adapters this daemon runs, then the known ones it doesn't
     {"name": "chat",    "state": "connected"},
     {"name": "discord", "state": "connected"},
-    {"name": "imessage","state": "off"}
+    {"name": "imessage","state": "off"},
+    {"name": "web",     "state": "off"}        // "connected" while a web socket is open
   ],                                 // state: "connected" | "off" | "reconnecting" (today: running adapter = connected, not configured = off)
   "spend": {
     "tokens": 1234,                  // integer: today's (UTC) tokens, all accounts and jobs
@@ -194,7 +195,7 @@ Then events follow, in order:
 1. `{"type": "ready"}`
 2. `{"type": "zephyr_status", "snapshot": <Snapshot>}` at once, then again each time the snapshot changes (never twice with the same value). It is a `watch`: each event carries the latest whole snapshot, and quick intermediate values (a tool that starts and ends between two reads) may be skipped. Its order relative to the child events in 3 is not fixed.
 3. Every live child event (the `--mode rpc` line: `agent_start`, `message_update`, `tool_execution_start`, `agent_settled`, ...), except `response` lines. User messages in `message_start`/`message_end` get `origin` and `text` as above. Unlike `subscribe`, nothing is quoted or hidden: the client's own turns come back too.
-4. `{"type": "zephyr_reply", "text": "agent: account work on ...", "command": "/status"}`: a reply to the `tui` channel that the agent's stream does not show: answers to commands (`/status`, `/model`, `/reload`, `/login`, `/stop`, `/pause`, `/resume`, `/memory ...`, `/job ...`; `command` is the command text), notices and job output (`command` null), and `[zephyr] ...` fallbacks for a run that ended without a reply (`command` null). An ordinary agent reply is not repeated. Stock `subscribe` connections get this event too and ignore it.
+4. `{"type": "zephyr_reply", "text": "agent: account work on ...", "command": "/status", "channel": "tui"}`: a reply to an attached client's channel (`tui`, or the web app's `web`) that the agent's stream does not show; `channel` is where a command's reply belongs, and only that channel's clients are sent it, while a notice has `channel` null and goes to every client. It carries answers to commands (`/status`, `/model`, `/reload`, `/login`, `/stop`, `/pause`, `/resume`, `/memory ...`, `/job ...`; `command` is the command text), notices and job output (`command` null), and `[zephyr] ...` fallbacks for a run that ended without a reply (`command` null). An ordinary agent reply is not repeated. Stock `subscribe` connections get this event too and ignore it.
 
 **`zephyr.models {}`** → `{"accounts": [{"name": "work", "model": "anthropic/claude-x", "models": ["anthropic/claude-x", "anthropic/claude-y"]}]}`: each pooled account, its model, and the models `rpi --list-models` lists on that account's provider (run with the account's agent dir). Without a pool there is one entry with `name` null, the top-level `model`, and everything rpi lists. When rpi cannot list, `models` holds just the account's model. It runs rpi once per account, so a client asks only when it shows the list (the TUI's model picker).
 
@@ -314,6 +315,21 @@ port = 7793                        # the default
 3. **Origin.** A POST, a DELETE and the WebSocket upgrade need `Origin: https://HOST` exactly, and `Sec-Fetch-Site: same-origin` when that header is sent, else 403. A POST or DELETE also needs `Content-Type: application/json` (else 415), which a cross-site form cannot send without a preflight. With the cookie's `SameSite=Strict`, that is the CSRF defence, and it covers WebSocket hijacking.
 
 Tailscale Funnel and any other public exposure are refused by (2); the listen address is not configurable.
+
+**Channels `web` and `passkey`.** A session cookie is a bearer token on a phone, worth what a Discord session is worth. So the app speaks as two channels:
+
+- **`web`** is everything the cookie alone does: chat rows (inbox channel `web`, sender `web`), unsigned `no` and `cancel`, changes to settings that are not `strong`, and the notification buttons. It is weak unless the owner lists it in `strong_channels`.
+- **`passkey`** is the actor channel of a `zephyr.decide` or `zephyr.settings_set` that carried a verified passkey assertion for that exact request. It never has inbox or outbox rows: a command it approves runs as a `web` message, and a notice for it goes to `web`.
+- `attach::attached(channel)`, true for `tui` and `web`, is the test for "a client on one of the daemon's own ports": `Config::is_owner`, the reply shown on the event stream, notices, and the outbox flush, where a `web` row is handled as a `tui` row is while a web socket is open and waits otherwise.
+
+**The WebSocket bridge.** `GET /api/ws` carries the attach protocol (§4.3.1), one JSON-RPC message per text frame, into the same `attach::Conn` the TUI gets (`attach::serve_stream`, generic over the stream). There is no second protocol.
+
+- The upgrade needs what `admit` checks and the session cookie, else 401; a fifth open socket gets 503. hyper hands the connection over (`hyper::upgrade::on`) and `tokio-tungstenite` frames it (`WebSocketStream::from_raw_socket`, messages and frames of at most 1 MiB, the attach line limit). The listener leaves keep-alive on, since hyper would otherwise answer `Connection: Upgrade, close`; the 10 s head deadline runs again for each request on a connection.
+- `web::bridge` joins the socket to the `Conn` through a `tokio::io::duplex`: a text frame goes in with a newline, and each line out is one frame.
+- The socket is closed on a binary frame, a text frame holding a newline, a frame over the limit, more than 60 frames in a minute, no frame or pong for two ping intervals (it pings every 30 s; a phone that froze the page answers none), and once its session has ended, which is read again every 60 s and at once when a `/web` command ends sessions (`Hub::revoke`). A send that a stalled client does not take within two ping intervals closes it too.
+- `Hub::connected()` is the number of open sockets; `Snapshot.channels` lists `web` as `connected` while it is not 0.
+- A web `Conn` starts authenticated and is on channel `web`. **Open to it:** `zephyr.hello`, `zephyr.subscribe`, `send` (`prompt` with `followUp`, `abort`, `get_state`), `zephyr.models`, `zephyr.dequeue` (its own channel's messages), `zephyr.turns`, `zephyr.settings`, `zephyr.settings_set`, `zephyr.proposals`, `zephyr.decide`, `zephyr.facts_list`, `zephyr.vault_list`, `ping`, and the app's own `zephyr.web_challenge` and `zephyr.web_devices` (`attach::WEB_METHODS`). **Closed**, with `-32601` `not available in the web app`: everything else, so `authenticate`, the stock `start_session`, `subscribe`, `stop_session` and `list_sessions`, `zephyr.login_*`, `zephyr.vault_put`/`_rm`/`_revoke`, `zephyr.facts_put`/`_rm` and `zephyr.sessions`. Secrets are typed on the TUI or the host, never on the phone.
+- The TUI's `Conn` is unchanged: no gate, and channel `tui`.
 
 ### 4.4 Autonomy and safety (tools run without asking, except the gated classes)
 

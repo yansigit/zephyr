@@ -225,3 +225,396 @@ async fn unknown_paths_hosts_and_callers_are_refused() {
     );
     gw.shutdown().await;
 }
+
+// ---- the WebSocket bridge ----
+
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use zephyr::store::Store;
+
+fn b64(bytes: &[u8]) -> String {
+    data_encoding::BASE64URL_NOPAD.encode(bytes)
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    digest.as_ref().try_into().unwrap()
+}
+
+impl Gateway {
+    fn store(&self) -> Store {
+        Store::open(&self.home.join("state.db")).unwrap()
+    }
+
+    /// A signed-in browser's cookie: a passkey named `name` and a session for it, written
+    /// straight to the store.
+    fn cookie(&self, name: &str) -> String {
+        let store = self.store();
+        let token = sha256(name.as_bytes());
+        let passkey = store.add_passkey(name, name.as_bytes(), &[4; 65]).unwrap();
+        store
+            .add_web_session(&sha256(&token), passkey, zephyr::now())
+            .unwrap();
+        format!("__Host-zephyr={}", b64(&token))
+    }
+
+    /// Asks for the WebSocket as `host`, with these headers beside the handshake's own.
+    async fn upgrade(&self, host: &str, headers: &[(&str, &str)]) -> Result<Ws, u16> {
+        let mut req = format!("ws://{host}/api/ws").into_client_request().unwrap();
+        for (name, value) in headers {
+            let name: reqwest::header::HeaderName = name.parse().unwrap();
+            req.headers_mut().insert(name, value.parse().unwrap());
+        }
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+            .await
+            .unwrap();
+        match tokio_tungstenite::client_async(req, tcp).await {
+            Ok((sock, _)) => Ok(Ws {
+                sock,
+                next: 1,
+                events: vec![],
+            }),
+            Err(WsError::Http(res)) => Err(res.status().as_u16()),
+            Err(e) => panic!("the upgrade failed oddly: {e}"),
+        }
+    }
+
+    /// The app's socket for a signed-in browser.
+    async fn ws(&self, cookie: &str) -> Ws {
+        let headers = [
+            ("Origin", ORIGIN),
+            ("Tailscale-User-Login", LOGIN),
+            ("Cookie", cookie),
+        ];
+        self.upgrade(HOST, &headers)
+            .await
+            .expect("the socket opens")
+    }
+}
+
+struct Ws {
+    sock: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    next: u64,
+    /// Frames that were not the answer being waited for, oldest first.
+    events: Vec<Value>,
+}
+
+impl Ws {
+    /// The next JSON frame; `None` once the socket is closed.
+    async fn frame(&mut self) -> Option<Value> {
+        loop {
+            let next = tokio::time::timeout(WAIT, self.sock.next())
+                .await
+                .expect("a frame in time");
+            match next {
+                Some(Ok(Message::Text(text))) => return Some(serde_json::from_str(&text).unwrap()),
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                _ => return None,
+            }
+        }
+    }
+
+    /// Calls a method and gives its whole answer frame; what arrives meanwhile is kept.
+    async fn rpc(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next;
+        self.next += 1;
+        let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        self.sock
+            .send(Message::Text(req.to_string()))
+            .await
+            .unwrap();
+        loop {
+            let frame = self
+                .frame()
+                .await
+                .expect("an answer before the socket closes");
+            if frame["id"] == id {
+                return frame;
+            }
+            self.events.push(frame);
+        }
+    }
+
+    /// Sends the owner's text as a prompt.
+    async fn say(&mut self, text: &str) -> Value {
+        let cmd = json!({"type": "prompt", "content": text});
+        self.rpc("send", json!({"sessionId": "main", "command": cmd}))
+            .await
+    }
+
+    /// The first event (kept or still to come) that `f` takes.
+    async fn event(&mut self, f: impl Fn(&Value) -> bool) -> Value {
+        if let Some(at) = self.events.iter().position(|e| f(&e["params"]["event"])) {
+            return self.events.remove(at)["params"]["event"].take();
+        }
+        loop {
+            let mut frame = self
+                .frame()
+                .await
+                .expect("the event before the socket closes");
+            if f(&frame["params"]["event"]) {
+                return frame["params"]["event"].take();
+            }
+            self.events.push(frame);
+        }
+    }
+
+    /// Waits for the server to close the socket.
+    async fn closed(&mut self) {
+        while self.frame().await.is_some() {}
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_socket_needs_a_cookie_origin_host_and_tailnet_header() {
+    let gw = start("ws-checks");
+    gw.up().await;
+    let cookie = gw.cookie("phone");
+    let (origin, login) = (("Origin", ORIGIN), ("Tailscale-User-Login", LOGIN));
+    let cookie = ("Cookie", cookie.as_str());
+    let no_cookie = gw.upgrade(HOST, &[origin, login]).await;
+    assert_eq!(no_cookie.err(), Some(401));
+    let wrong = (
+        "Cookie",
+        "__Host-zephyr=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    );
+    assert_eq!(
+        gw.upgrade(HOST, &[origin, login, wrong]).await.err(),
+        Some(401)
+    );
+    let evil = ("Origin", "https://evil.test");
+    assert_eq!(
+        gw.upgrade(HOST, &[evil, login, cookie]).await.err(),
+        Some(403)
+    );
+    assert_eq!(
+        gw.upgrade(HOST, &[login, cookie]).await.err(),
+        Some(403),
+        "no Origin"
+    );
+    assert_eq!(
+        gw.upgrade("evil.test", &[origin, login, cookie])
+            .await
+            .err(),
+        Some(421)
+    );
+    assert_eq!(
+        gw.upgrade(HOST, &[origin, cookie]).await.err(),
+        Some(403),
+        "no Tailscale header"
+    );
+    let mut ws = gw
+        .upgrade(HOST, &[origin, login, cookie])
+        .await
+        .expect("all four");
+    assert_eq!(ws.rpc("ping", json!({})).await["result"]["type"], "pong");
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_web_send_is_a_web_row_and_its_reply_streams_back() {
+    let gw = start("ws-send");
+    gw.up().await;
+    let mut ws = gw.ws(&gw.cookie("phone")).await;
+    let hello = ws.rpc("zephyr.hello", json!({})).await;
+    assert_eq!(hello["result"]["version"], env!("CARGO_PKG_VERSION"));
+    let sub = ws.rpc("zephyr.subscribe", json!({})).await;
+    assert_eq!(sub["result"]["status"], "subscribed");
+    assert_eq!(ws.say("hi").await["result"]["status"], "sent");
+    let done = ws
+        .event(|e| e["type"] == "message_end" && e["message"]["role"] == "assistant")
+        .await;
+    assert!(done.to_string().contains("echo: [web #1] hi"), "{done}");
+    let db = rusqlite::Connection::open(gw.home.join("state.db")).unwrap();
+    let row: (String, String) = db
+        .query_row("SELECT channel, sender FROM inbox", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(row, ("web".into(), "web".into()));
+    // An open socket shows as the channel being connected, once the snapshot is next built.
+    let status = ws
+        .event(|e| {
+            e["type"] == "zephyr_status"
+                && e["snapshot"]["channels"]
+                    .to_string()
+                    .contains(r#"{"name":"web","state":"connected"}"#)
+        })
+        .await;
+    assert_eq!(status["snapshot"]["session"], "main");
+    // The queue is this channel's own to take back from.
+    assert_eq!(
+        ws.rpc("zephyr.dequeue", json!({})).await["result"]["texts"],
+        json!([])
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slash_status_answers_on_web_only() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let home = new_home("ws-status");
+    let (token, attach) = (home.join("tui.token"), free_port());
+    std::fs::write(&token, "s3cret\n").unwrap();
+    std::fs::set_permissions(&token, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    let extra = format!("[attach]\nport = {attach}\ntoken_file = {token:?}\n");
+    let gw = start_in(&home, free_port(), &extra, |_| {});
+    gw.up().await;
+    // A TUI, attached and subscribed.
+    let tui = tokio::net::TcpStream::connect(("127.0.0.1", attach))
+        .await
+        .unwrap();
+    let (read, mut write) = tui.into_split();
+    let mut lines = tokio::io::BufReader::new(read).lines();
+    for (id, method, params) in [
+        (1, "authenticate", json!({"token": "s3cret"})),
+        (2, "zephyr.subscribe", json!({})),
+    ] {
+        let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        write
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .unwrap();
+        loop {
+            let line = lines.next_line().await.unwrap().unwrap();
+            if serde_json::from_str::<Value>(&line).unwrap()["id"] == id {
+                break;
+            }
+        }
+    }
+    let mut ws = gw.ws(&gw.cookie("phone")).await;
+    ws.rpc("zephyr.subscribe", json!({})).await;
+    ws.say("/status").await;
+    let reply = ws.event(|e| e["type"] == "zephyr_reply").await;
+    assert_eq!(
+        (&reply["channel"], &reply["command"]),
+        (&json!("web"), &json!("/status"))
+    );
+    assert!(
+        reply["text"].as_str().unwrap().starts_with("agent: "),
+        "{reply}"
+    );
+    // The TUI was sent nothing for it before the answer to its own next call.
+    let req = json!({"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}});
+    write
+        .write_all(format!("{req}\n").as_bytes())
+        .await
+        .unwrap();
+    loop {
+        let line = lines.next_line().await.unwrap().unwrap();
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        assert_ne!(frame["params"]["event"]["type"], "zephyr_reply", "{frame}");
+        if frame["id"] == 3 {
+            break;
+        }
+    }
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn methods_closed_to_the_web_app_answer_32601() {
+    let gw = start("ws-closed");
+    gw.up().await;
+    let mut ws = gw.ws(&gw.cookie("phone")).await;
+    for method in [
+        "authenticate",
+        "start_session",
+        "subscribe",
+        "stop_session",
+        "list_sessions",
+        "zephyr.vault_put",
+        "zephyr.vault_rm",
+        "zephyr.vault_revoke",
+        "zephyr.facts_put",
+        "zephyr.facts_rm",
+        "zephyr.sessions",
+        "zephyr.login_providers",
+        "zephyr.login_start",
+        "zephyr.login_poll",
+        "zephyr.login_input",
+        "zephyr.login_cancel",
+        "zephyr.nope",
+    ] {
+        let params = json!({"token": "x", "name": "n", "provider": "p"});
+        let answer = ws.rpc(method, params).await;
+        assert_eq!(answer["error"]["code"], -32601, "{method}: {answer}");
+        assert_eq!(
+            answer["error"]["message"], "not available in the web app",
+            "{method}"
+        );
+    }
+    for open in [
+        "zephyr.settings",
+        "zephyr.proposals",
+        "zephyr.facts_list",
+        "zephyr.vault_list",
+        "zephyr.turns",
+    ] {
+        assert!(
+            ws.rpc(open, json!({})).await["result"].is_object(),
+            "{open}"
+        );
+    }
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fifth_socket_gets_503() {
+    let gw = start("ws-five");
+    gw.up().await;
+    let cookie = gw.cookie("phone");
+    let mut open = vec![];
+    for _ in 0..4 {
+        open.push(gw.ws(&cookie).await);
+    }
+    let headers = [
+        ("Origin", ORIGIN),
+        ("Tailscale-User-Login", LOGIN),
+        ("Cookie", cookie.as_str()),
+    ];
+    assert_eq!(gw.upgrade(HOST, &headers).await.err(), Some(503));
+    // A closed socket frees its place.
+    let mut first = open.remove(0);
+    first.sock.close(None).await.unwrap();
+    first.closed().await;
+    let mut fifth = loop {
+        match gw.upgrade(HOST, &headers).await {
+            Ok(ws) => break ws,
+            Err(503) => tokio::task::yield_now().await, // the server has not seen the close yet
+            Err(code) => panic!("{code}"),
+        }
+    };
+    assert_eq!(fifth.rpc("ping", json!({})).await["result"]["type"], "pong");
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frame_over_1_mib_or_with_a_newline_closes_the_socket() {
+    let gw = start("ws-frames");
+    gw.up().await;
+    let cookie = gw.cookie("phone");
+    let mut big = gw.ws(&cookie).await;
+    // The server closes mid-frame, so the send itself may fail.
+    let _ = big.sock.send(Message::Text("x".repeat(2 << 20))).await;
+    big.closed().await;
+    let mut two = gw.ws(&cookie).await;
+    two.sock.send(Message::Text("{}\n{}".into())).await.unwrap();
+    two.closed().await;
+    let mut binary = gw.ws(&cookie).await;
+    binary
+        .sock
+        .send(Message::Binary(b"{}".to_vec()))
+        .await
+        .unwrap();
+    binary.closed().await;
+    // More than 60 requests in a minute.
+    let mut busy = gw.ws(&cookie).await;
+    for _ in 0..60 {
+        assert_eq!(busy.rpc("ping", json!({})).await["result"]["type"], "pong");
+    }
+    let _ = busy.sock.send(Message::Text("{}".into())).await;
+    busy.closed().await;
+    gw.shutdown().await;
+}

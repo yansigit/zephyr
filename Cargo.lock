@@ -3221,6 +3221,7 @@ dependencies = [
  "serenity",
  "subtle",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "toml_edit",
  "unicode-normalization",

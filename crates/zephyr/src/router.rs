@@ -1387,8 +1387,8 @@ impl<'a> Router<'a> {
                 let _ = tx.send((history, self.tap.subscribe()));
             }
             AttachRequest::FollowUp(m) => self.inbound(m, true).await,
-            AttachRequest::Dequeue(tx) => {
-                let _ = tx.send(self.dequeue().unwrap_or_else(|e| {
+            AttachRequest::Dequeue { channel, reply } => {
+                let _ = reply.send(self.dequeue(channel).unwrap_or_else(|e| {
                     eprintln!("zephyr: dequeue failed: {e}");
                     vec![]
                 }));
@@ -1409,9 +1409,12 @@ impl<'a> Router<'a> {
                 key,
                 value,
                 until,
+                channel,
+                expect: _,
                 reply,
             } => {
-                let _ = reply.send(self.settings_set(&key, &value, until.as_deref()).await);
+                let set = self.settings_set(&key, &value, until.as_deref(), channel);
+                let _ = reply.send(set.await);
                 self.publish();
             }
             AttachRequest::Proposals(tx) => {
@@ -1421,8 +1424,14 @@ impl<'a> Router<'a> {
                 let answer = crate::activity::answer(&self.cfg, &self.store, &query, crate::now());
                 let _ = reply.send(answer);
             }
-            AttachRequest::Decide { id, verb, reply } => {
-                let _ = reply.send(self.decide(id, &verb).await);
+            AttachRequest::Decide {
+                id,
+                verb,
+                channel,
+                expect: _,
+                reply,
+            } => {
+                let _ = reply.send(self.decide(id, &verb, channel).await);
                 self.publish();
             }
         }
@@ -1484,8 +1493,15 @@ impl<'a> Router<'a> {
         Ok(json!({"goals": open.chain(done).collect::<Vec<_>>()}))
     }
 
-    /// `zephyr.settings_set`: `/set KEY VALUE [for D]` as the owner on the TUI, answered as data.
-    async fn settings_set(&mut self, key: &str, value: &str, until: Option<&str>) -> Value {
+    /// `zephyr.settings_set`: `/set KEY VALUE [for D]` as the owner on `channel` (`tui`, `web`
+    /// or, signed, `passkey`), answered as data.
+    async fn settings_set(
+        &mut self,
+        key: &str,
+        value: &str,
+        until: Option<&str>,
+        channel: &'static str,
+    ) -> Value {
         let refused = |why: String| json!({"outcome": "refused", "reason": why});
         if key == "facts" {
             return refused("change private facts with /facts".into());
@@ -1504,9 +1520,7 @@ impl<'a> Router<'a> {
             Ok(until) => until,
             Err(e) => return refused(e),
         };
-        let owner = Actor::Owner {
-            channel: crate::attach::CHANNEL,
-        };
+        let owner = Actor::Owner { channel };
         match self.set_setting(key, value, owner, until, None).await {
             Outcome::Changed { old, new, applied } => {
                 let at = until
@@ -1578,9 +1592,11 @@ impl<'a> Router<'a> {
         json!({"proposals": proposals})
     }
 
-    /// `zephyr.decide`: `/ok N`, `/no N` or `/cancel N` from the TUI, through the checks the chat
-    /// commands make (stale, strong channel). `once` is `ok` for a setting.
-    async fn decide(&mut self, id: i64, verb: &str) -> Value {
+    /// `zephyr.decide`: `/ok N`, `/no N` or `/cancel N` from an attached client, through the
+    /// checks the chat commands make (stale, strong channel). `once` is `ok` for a setting.
+    /// `channel` is who decides (`tui`, `web` or, signed, `passkey`); an approved command runs
+    /// as a message on the client's own channel, since `passkey` has no rows.
+    async fn decide(&mut self, id: i64, verb: &str, channel: &'static str) -> Value {
         if verb == "cancel" {
             let done = crate::actions::cancel(&self.cfg, &self.store, &self.waits, &id.to_string());
             self.settled_actions();
@@ -1595,20 +1611,25 @@ impl<'a> Router<'a> {
             "once" => format!("/ok {id} once"),
             _ => format!("/ok {id}"),
         };
+        let rows = if channel == "passkey" {
+            crate::attach::WEB
+        } else {
+            channel
+        };
         let m = Inbound {
-            channel: crate::attach::CHANNEL.into(),
+            channel: rows.into(),
             platform_msg_id: String::new(),
-            sender: "token".into(),
+            sender: crate::attach::sender(rows).into(),
             text: text.clone(),
         };
         let mut approving = None;
         let decided = crate::tools::decide(&self.cfg, &self.store, &text, |p| {
             approving = Some(p.id);
-            self.not_now(p, &m.channel)
+            self.not_now(p, channel)
         });
         let (ok, reply) = match decided {
             Some(Ok(Decided::Action { id, once })) => {
-                let done = self.approve(id, once, &m.channel);
+                let done = self.approve(id, once, channel);
                 self.settled_actions();
                 match done {
                     Ok(reply) => (true, reply),
@@ -1654,12 +1675,13 @@ impl<'a> Router<'a> {
         None
     }
 
-    /// `zephyr.dequeue` (DESIGN §4.1): the attached client's messages rpi has not been sent yet,
-    /// oldest first, withdrawn so the owner can edit them. Steered ones are already rpi's.
-    fn dequeue(&mut self) -> rusqlite::Result<Vec<String>> {
+    /// `zephyr.dequeue` (DESIGN §4.1): the attached client's messages (its own channel's) rpi
+    /// has not been sent yet, oldest first, withdrawn so the owner can edit them. Steered ones
+    /// are already rpi's.
+    fn dequeue(&mut self, channel: &str) -> rusqlite::Result<Vec<String>> {
         let mut texts = vec![];
         for row in self.store.inbox_with_status("new")? {
-            if row.channel == crate::attach::CHANNEL && row.tries == 0 {
+            if row.channel == channel && row.tries == 0 {
                 self.store.set_status(row.id, "withdrawn")?;
                 texts.push(row.text);
             }
@@ -1863,8 +1885,8 @@ impl<'a> Router<'a> {
         } else {
             log(self.store.reply(&row, &reply, "done").map_err(Into::into));
         }
-        if row.channel == crate::attach::CHANNEL && !reply.is_empty() {
-            self.show(&reply, Some(row.text.trim()));
+        if crate::attach::attached(&row.channel) && !reply.is_empty() {
+            self.show(&reply, Some(row.text.trim()), Some(&row.channel));
         }
         self.restart_if_idle().await;
         // A run in progress settles first; its settle reconciles and dispatches.
@@ -3287,11 +3309,17 @@ impl<'a> Router<'a> {
         }
     }
 
-    /// The owner on `channel`, as a notice there is addressed. On the TUI's channel the
-    /// attached client is the owner (`attach` sends as `token`).
+    /// The owner on `channel`, as a notice there is addressed. On an attached client's channel
+    /// the client is the owner (`attach` sends as `token`, or as `web`); a passkey-signed
+    /// change was made in the web app.
     fn owner_on(&self, channel: &str) -> Option<(String, String)> {
-        if channel == crate::attach::CHANNEL {
-            return Some((channel.into(), "token".into()));
+        let channel = if channel == "passkey" {
+            crate::attach::WEB
+        } else {
+            channel
+        };
+        if crate::attach::attached(channel) {
+            return Some((channel.into(), crate::attach::sender(channel).into()));
         }
         let owner = self.cfg.owners.get(channel)?.first()?;
         Some((channel.into(), owner.clone()))
@@ -3661,11 +3689,11 @@ impl<'a> Router<'a> {
     /// sender, not to whoever spoke last in the inbox: a second owner must not see the first
     /// one's sign-in URL. Both writes, neither waits.
     fn login_notice(&self, text: &str, from: &Option<(String, String)>) {
-        self.show(text, None);
+        self.show(text, None, None);
         let Some((channel, recipient)) = from else {
             return;
         };
-        if channel == crate::attach::CHANNEL {
+        if crate::attach::attached(channel) {
             return; // that sender is the attached client `show` has just reached
         }
         let _ = self.store.notify(channel, recipient, text);
@@ -4229,14 +4257,21 @@ impl<'a> Router<'a> {
         // job output go to the clients attached now, or wait for the next one; so do the
         // router's own `[zephyr]` answers to a turn (a failed or empty run), which no agent
         // event carries.
-        for row in rows.iter().filter(|r| r.channel == crate::attach::CHANNEL) {
+        //
+        // The web app's rows are handled the same way while one of its sockets is open, and
+        // wait otherwise: its client may be a phone in a pocket.
+        let web_open = self.web.as_ref().is_some_and(|hub| hub.connected() > 0);
+        for row in (rows.iter()).filter(|r| crate::attach::attached(&r.channel)) {
+            if row.channel == crate::attach::WEB && !web_open {
+                continue;
+            }
             let command =
                 (row.prompt.as_deref().map(str::trim)).is_some_and(|p| p.starts_with('/'));
             if !row.client_id.starts_with('z') || (!command && row.text.starts_with("[zephyr]")) {
                 if self.tap.receiver_count() == 0 {
                     continue;
                 }
-                self.show(&row.text, None);
+                self.show(&row.text, None, None);
             }
             log(self
                 .store
@@ -4245,7 +4280,7 @@ impl<'a> Router<'a> {
         }
         for row in rows
             .into_iter()
-            .filter(|r| r.channel != crate::attach::CHANNEL)
+            .filter(|r| !crate::attach::attached(&r.channel))
         {
             if self
                 .stuck
@@ -4302,9 +4337,12 @@ impl<'a> Router<'a> {
     }
 
     /// Shows `text`, the router's own (a command reply, a notice), to attached clients:
-    /// `attach` draws it for stock clients as an assistant message, the TUI as a reply card.
-    fn show(&self, text: &str, command: Option<&str>) {
-        let reply = json!({"type": "zephyr_reply", "text": text, "command": command});
+    /// `attach` draws it for stock clients as an assistant message, the TUI and the web app as
+    /// a reply card. `channel` is where a command's reply belongs (only that channel's clients
+    /// draw it); `None` is a notice, drawn by all.
+    fn show(&self, text: &str, command: Option<&str>, channel: Option<&str>) {
+        let reply =
+            json!({"type": "zephyr_reply", "text": text, "command": command, "channel": channel});
         let _ = self.tap.send(reply); // no receivers is fine
     }
 

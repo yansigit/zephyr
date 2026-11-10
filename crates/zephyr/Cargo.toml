@@ -27,6 +27,8 @@ serenity = { version = "0.12.5", default-features = false, features = ["client",
 # out of it needs a system libssl.
 openssl = { version = "0.10", features = ["vendored"] }
 hyper = { version = "1", features = ["server", "http1", "client"] }
+# Already in the tree through serenity: frames the web app's WebSocket (DESIGN §4.3.3).
+tokio-tungstenite = { version = "=0.21.0", default-features = false, features = ["handshake"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }

@@ -417,7 +417,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - a session that `store.web_session` no longer returns, re-checked every 60 s and at once when `hub.revocations()` changes.
 - It pings every `cfg.web_ping`. The socket count goes up on upgrade and down on drop (a guard).
 
-- [ ] **Step 1: Write the failing tests** in `tests/web.rs`. Helper `cookie(gw) -> String`: `Store::add_passkey` plus `add_web_session` with a known token. Helper `ws(gw, cookie) -> WebSocketStream` (`tokio_tungstenite::client_async` with Host, Origin and the Tailscale header). Helper `rpc(ws, id, method, params) -> Value`, which reads frames until the reply with that id.
+- [x] **Step 1: Write the failing tests** in `tests/web.rs`. Helper `cookie(gw) -> String`: `Store::add_passkey` plus `add_web_session` with a known token. Helper `ws(gw, cookie) -> WebSocketStream` (`tokio_tungstenite::client_async` with Host, Origin and the Tailscale header). Helper `rpc(ws, id, method, params) -> Value`, which reads frames until the reply with that id.
   - `the_socket_needs_a_cookie_origin_host_and_tailnet_header`: upgrade with no cookie → 401; `Origin: https://evil.test` → 403; `Host: evil.test` → 421; no Tailscale header → 403 (the spec's header test).
   - `a_web_send_is_a_web_row_and_its_reply_streams_back`:
     - `zephyr.hello` answers with `version`;
@@ -431,10 +431,13 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - `methods_closed_to_the_web_app_answer_32601`: `authenticate`, `start_session`, `zephyr.vault_put`, `zephyr.facts_put`, `zephyr.sessions`, `zephyr.login_start` → code `-32601`, message `not available in the web app`.
   - `a_fifth_socket_gets_503`.
   - `a_frame_over_1_mib_or_with_a_newline_closes_the_socket`: 2 MiB of text → closed; `"{}\n{}"` → closed.
-- [ ] **Step 2: Run** `cargo test -p zephyr --test web` → FAIL.
-- [ ] **Step 3: Implement.** Thread the channel through the three `AttachRequest`s; the TUI passes `"tui"`. Then run `cargo tree -d` and check that its output is unchanged from `main`.
-- [ ] **Step 4: Run** `cargo test -p zephyr --test web`, then `--test attach` and `--test router` (the TUI behaviour is unchanged), then `cargo test -p zephyr` and `cargo deny check advisories bans` → PASS.
-- [ ] **Step 5: Commit** `feat(web): bridge a WebSocket into the attach protocol as the owner on channel web`.
+- [x] **Step 2: Run** `cargo test -p zephyr --test web` → FAIL.
+- [x] **Step 3: Implement.** Thread the channel through the three `AttachRequest`s; the TUI passes `"tui"`. Then run `cargo tree -d` and check that its output is unchanged from `main`.
+- [x] **Step 4: Run** `cargo test -p zephyr --test web`, then `--test attach` and `--test router` (the TUI behaviour is unchanged), then `cargo test -p zephyr` and `cargo deny check advisories bans` → PASS.
+- [x] **Step 5: Commit** `feat(web): bridge a WebSocket into the attach protocol as the owner on channel web`.
+- Deviation: the listener leaves HTTP keep-alive on. With `keep_alive(false)` hyper 1.12 appends `close` to the 101 (`Connection: Upgrade, close`), which tungstenite's client refuses and a browser or `tailscale serve` need not accept. The 10 s head deadline runs again for each request on a connection, so an idle one is still bounded, and the 32-connection cap stands.
+- Deviation: a signed (`passkey`) decision's approved command runs as a `web` message and `owner_on("passkey")` answers `web`, since `passkey` has no rows (spec §4.3); `attach::sender(channel)` gives `token` or `web`.
+- Deviation: the upgrade also needs `Upgrade: websocket` and `Sec-WebSocket-Version: 13` (else 400), and a send a stalled client does not take within two ping intervals closes the socket, so a full TCP buffer cannot hold the bridge past the dead-socket limit. Added cases: the closed-method list also holds the stock and `zephyr.login_*` methods; a binary frame and the 61st frame in a minute close the socket.
 
 ### Task W-6: Enrolment, sign-in, sessions, limits, and `/web`
 

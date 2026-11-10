@@ -30,16 +30,43 @@ use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 /// The inbox channel name for messages typed in an attached client.
 pub const CHANNEL: &str = "tui";
+/// The inbox channel name for messages typed in the web app (DESIGN §4.3.3).
+pub const WEB: &str = "web";
+
+/// Whether `channel` is a client on one of the daemon's own ports (the TUI's or the web app's),
+/// which reads the router's replies from the event stream rather than from an adapter.
+pub fn attached(channel: &str) -> bool {
+    channel == CHANNEL || channel == WEB
+}
+
+/// The methods open to the web app. The rest answer `-32601`: sign-ins, the vault's and the
+/// facts' values and the saved sessions stay on the TUI.
+pub const WEB_METHODS: &[&str] = &[
+    "zephyr.hello",
+    "zephyr.subscribe",
+    "send",
+    "zephyr.models",
+    "zephyr.dequeue",
+    "zephyr.turns",
+    "zephyr.settings",
+    "zephyr.settings_set",
+    "zephyr.proposals",
+    "zephyr.decide",
+    "zephyr.facts_list",
+    "zephyr.vault_list",
+    "ping",
+    "zephyr.web_challenge",
+    "zephyr.web_devices",
+];
 /// One subscription per connection, so the id is fixed.
 const SUB_ID: u64 = 1;
-const MAX_LINE: u64 = 1 << 20;
+pub(crate) const MAX_LINE: u64 = 1 << 20;
 const UNAUTHORIZED: i64 = -32001;
 /// Connections served at once; one more is closed as it arrives.
 const MAX_CONNS: usize = 32;
@@ -53,14 +80,20 @@ pub enum AttachRequest {
     /// A prompt sent with `followUp: true`: held until the run settles (DESIGN §4.1).
     FollowUp(Inbound),
     /// `zephyr.dequeue`: the texts of this channel's messages still waiting, withdrawn.
-    Dequeue(oneshot::Sender<Vec<String>>),
+    Dequeue {
+        channel: &'static str,
+        reply: oneshot::Sender<Vec<String>>,
+    },
     /// `zephyr.settings`: every setting as it stands now.
     Settings(oneshot::Sender<Value>),
-    /// `zephyr.settings_set`: a change by the owner on the TUI, answered as the outcome.
+    /// `zephyr.settings_set`: a change by the owner on `channel`, answered as the outcome.
+    /// `expect` is a passkey-signed change's: the value the owner saw, which must still stand.
     SettingsSet {
         key: String,
         value: String,
         until: Option<String>,
+        channel: &'static str,
+        expect: Option<Option<String>>,
         reply: oneshot::Sender<Value>,
     },
     /// `zephyr.proposals`: the proposals still waiting.
@@ -75,12 +108,67 @@ pub enum AttachRequest {
     /// `zephyr.goals`: the open goals, then those done since the last review (read-only).
     Goals(oneshot::Sender<Result<Value, String>>),
     /// `zephyr.decide`: `/ok N` (`ok`, `once`), `/no N` (`no`) or `/cancel N` (`cancel`) as the
-    /// owner on the TUI.
+    /// owner on `channel`. `expect` is a passkey-signed decision's: what was signed, which the
+    /// proposal must still be.
     Decide {
         id: i64,
         verb: String,
+        channel: &'static str,
+        expect: Option<Expect>,
         reply: oneshot::Sender<Value>,
     },
+}
+
+/// What a passkey signature committed to: the proposal as stored (`Store::proposal_digest`) and
+/// the hex SHA-256 of the card the owner was shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expect {
+    pub digest: [u8; 32],
+    pub card_sha256: String,
+}
+
+/// Where a connection comes from: the attach port with its token, or the web app's socket,
+/// whose cookie the listener already checked.
+pub enum Origin {
+    Tui {
+        token: Arc<str>,
+    },
+    Web {
+        session: [u8; 32],
+        passkey: i64,
+        hub: Arc<crate::web::Hub>,
+    },
+}
+
+/// Serves one client on `stream` until it goes.
+pub async fn serve_stream<S>(stream: S, origin: Origin, handles: Handles)
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    let (token, web) = match origin {
+        Origin::Tui { token } => (token, None),
+        Origin::Web {
+            session,
+            passkey,
+            hub,
+        } => ("".into(), Some((session, passkey, hub))),
+    };
+    let conn = Conn {
+        token,
+        channel: if web.is_some() { WEB } else { CHANNEL },
+        // The cookie was checked at the upgrade.
+        authed: web.is_some(),
+        web,
+        snap: handles.snap,
+        cfgs: handles.cfgs,
+        inbound: handles.inbound,
+        router: handles.router,
+        live: None,
+        zephyr: false,
+        models: None,
+        late: mpsc::channel(4),
+    };
+    conn.run(stream).await;
 }
 
 /// Reads the attach token. Never log the result.
@@ -117,12 +205,6 @@ pub struct Handles {
 
 /// Serves attach clients until dropped. Pending forever when `[attach]` is not configured.
 pub async fn serve(cfg: &Config, handles: Handles) -> anyhow::Result<()> {
-    let Handles {
-        inbound,
-        router,
-        snap,
-        cfgs,
-    } = handles;
     let Some(a) = &cfg.attach else {
         return std::future::pending().await;
     };
@@ -141,20 +223,12 @@ pub async fn serve(cfg: &Config, handles: Handles) -> anyhow::Result<()> {
                 let Ok(slot) = slots.clone().try_acquire_owned() else {
                     continue; // dropped, so closed at once
                 };
-                let conn = Conn {
+                let origin = Origin::Tui {
                     token: token.clone(),
-                    snap: snap.clone(),
-                    cfgs: cfgs.clone(),
-                    inbound: inbound.clone(),
-                    router: router.clone(),
-                    authed: false,
-                    live: None,
-                    zephyr: false,
-                    models: None,
-                    late: mpsc::channel(4),
                 };
+                let handles = handles.clone();
                 tokio::spawn(async move {
-                    conn.run(stream).await;
+                    serve_stream(stream, origin, handles).await;
                     drop(slot);
                 });
             }
@@ -165,6 +239,11 @@ pub async fn serve(cfg: &Config, handles: Handles) -> anyhow::Result<()> {
 
 struct Conn {
     token: Arc<str>,
+    /// The inbox channel this client's messages and decisions are on: `tui` or `web`.
+    channel: &'static str,
+    /// A web app's socket: its session's hash, its passkey's row and the listener's hub.
+    #[allow(dead_code)] // read by the passkey methods
+    web: Option<([u8; 32], i64, Arc<crate::web::Hub>)>,
     snap: watch::Receiver<Snapshot>,
     /// The live config, for `zephyr.models`.
     cfgs: watch::Receiver<Arc<Config>>,
@@ -187,15 +266,19 @@ struct Conn {
 type Reply = (Vec<Value>, bool);
 
 impl Conn {
-    async fn run(self, stream: TcpStream) {
-        let (read, write) = stream.into_split();
+    async fn run<S: AsyncRead + AsyncWrite + Send + 'static>(self, stream: S) {
+        let (read, write) = tokio::io::split(stream);
         let (tx, lines) = mpsc::channel(16);
         let reader = tokio::spawn(read_lines(read, tx));
         self.talk(write, lines).await;
         reader.abort(); // its half holds the socket open until the client sends again
     }
 
-    async fn talk(mut self, mut write: OwnedWriteHalf, mut lines: mpsc::Receiver<Vec<u8>>) {
+    async fn talk(
+        mut self,
+        mut write: impl AsyncWrite + Unpin,
+        mut lines: mpsc::Receiver<Vec<u8>>,
+    ) {
         let deadline = tokio::time::Instant::now() + AUTH_WAIT;
         loop {
             let (frames, close) = tokio::select! {
@@ -205,6 +288,9 @@ impl Conn {
                     None => return, // client gone; the run carries on
                 },
                 ev = next_live(&mut self.live) => match ev {
+                    // A command's reply is drawn where it was typed; a notice (no channel) everywhere.
+                    Ok(ev) if ev["type"] == "zephyr_reply"
+                        && ev["channel"].as_str().is_some_and(|c| c != self.channel) => (vec![], false),
                     Ok(ev) if self.zephyr => (raw(ev).into_iter().map(event).collect(), false),
                     Ok(ev) => (live(ev), false),
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -251,6 +337,12 @@ impl Conn {
         let id = &req["id"];
         let params = &req["params"];
         let method = req["method"].as_str().unwrap_or_default();
+        if self.channel == WEB && !WEB_METHODS.contains(&method) {
+            return (
+                vec![error(id, -32601, "not available in the web app")],
+                false,
+            );
+        }
         if method == "authenticate" {
             let given = params["token"].as_str().unwrap_or_default();
             if !same(given, &self.token) {
@@ -361,7 +453,11 @@ impl Conn {
             }
             "zephyr.dequeue" => {
                 let (tx, rx) = oneshot::channel();
-                let asked = self.router.send(AttachRequest::Dequeue(tx)).await;
+                let req = AttachRequest::Dequeue {
+                    channel: self.channel,
+                    reply: tx,
+                };
+                let asked = self.router.send(req).await;
                 match (asked, rx.await) {
                     (Ok(()), Ok(texts)) => (vec![ok(id, json!({ "texts": texts }))], false),
                     _ => (vec![error(id, -32000, "gateway is shutting down")], true),
@@ -426,6 +522,8 @@ impl Conn {
                     key: key.into(),
                     value,
                     until,
+                    channel: self.channel,
+                    expect: None,
                     reply: tx,
                 };
                 match (self.router.send(req).await, rx.await) {
@@ -445,6 +543,8 @@ impl Conn {
                 let req = AttachRequest::Decide {
                     id: n,
                     verb: verb.into(),
+                    channel: self.channel,
+                    expect: None,
                     reply: tx,
                 };
                 match (self.router.send(req).await, rx.await) {
@@ -683,9 +783,9 @@ impl Conn {
             }
         };
         let m = Inbound {
-            channel: CHANNEL.into(),
+            channel: self.channel.into(),
             platform_msg_id: next_msg_id(),
-            sender: "token".into(),
+            sender: sender(self.channel).into(),
             text: text.into(),
         };
         let sent = match cmd["followUp"] == true {
@@ -708,6 +808,15 @@ async fn next_live(
     match live {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+/// Who an attached client's messages are from: the attach token's holder, or the web session's.
+pub fn sender(channel: &str) -> &'static str {
+    if channel == WEB {
+        WEB
+    } else {
+        "token"
     }
 }
 
@@ -787,7 +896,7 @@ fn role(m: &Value) -> Option<&str> {
 }
 
 /// Reads newline-delimited requests; a line over `MAX_LINE` ends the connection.
-async fn read_lines(read: OwnedReadHalf, tx: mpsc::Sender<Vec<u8>>) {
+async fn read_lines(read: impl AsyncRead + Unpin, tx: mpsc::Sender<Vec<u8>>) {
     let mut read = BufReader::new(read);
     loop {
         let mut line = Vec::new();
