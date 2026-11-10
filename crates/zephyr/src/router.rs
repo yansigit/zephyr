@@ -4,7 +4,7 @@ use crate::channel::{Activity, Channel, Inbound, Outbound};
 use crate::config::{Account, Config, BUDGET_NOTICE};
 use crate::rpc::{message_text, Child, MAIN_SESSION};
 use crate::settings::{Actor, Apply, Outcome, Setting};
-use crate::store::{InboxRow, Store};
+use crate::store::{InboxRow, SessionOrigin, Store};
 use crate::tools::Decided;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -449,6 +449,11 @@ struct Router<'a> {
     tally: crate::rpc::Tally,
     /// When the current run started, for `budget.run_minutes`.
     run_start: Option<Instant>,
+    /// Whether the current run of main is the owner's alone (DESIGN §4.6), decided at its start
+    /// and lost at the first text that is not the owner's.
+    trust: Trust,
+    /// The run's conversation was tainted already: one `session_origin` write per run.
+    run_taint: bool,
     /// When the child last said anything, for stall detection (`cap_run`).
     last_event: Instant,
     /// `RESUME_NOTE` was steered into a resumed run and not delivered yet: taken back at the
@@ -598,7 +603,7 @@ impl<'a> Router<'a> {
             auth_at: Instant::now(),
             restart: false,
             account: None,
-            tally: Default::default(),
+            tally: crate::rpc::Tally::main(&cfg.home),
             snap,
             names,
             thinking: None,
@@ -612,6 +617,8 @@ impl<'a> Router<'a> {
             last_say: String::new(),
             run_completed: false,
             run_start: None,
+            trust: Trust::Not(crate::memory::LEGACY.into()),
+            run_taint: false,
             last_event: Instant::now(),
             note_pending: false,
             cut: None,
@@ -737,6 +744,9 @@ impl<'a> Router<'a> {
             let _ = self.tap.send(ev.clone()); // no receivers is fine
             self.last_event = Instant::now();
             self.tally.add(ev);
+            if let Some(reason) = self.tally.taint.clone() {
+                self.taint_session(&reason);
+            }
             let session = self.child.as_ref().and_then(|c| c.session.clone());
             if let Some(session) = &session {
                 crate::scheduler::audit(&self.store, &self.cfg, session, ev);
@@ -1912,6 +1922,14 @@ impl<'a> Router<'a> {
             if !self.busy {
                 crate::checkpoint::before(&self.cfg, &row.text).await;
             }
+            if !self.busy {
+                self.begin_run().await;
+            }
+            // A task's, a process's or an action's report is the daemon's, not the owner's text:
+            // the conversation holds it from now on (DESIGN §4.6).
+            if let Some(reason) = daemon_row(&row.platform_id) {
+                self.taint_session(&reason);
+            }
             // Durable before the child sees it, so recovery knows to look for it, and how.
             self.store.mark_dispatched_as(row.id, sent_as)?;
             let text = match again {
@@ -1930,10 +1948,57 @@ impl<'a> Router<'a> {
                     .await?;
                 self.busy = true;
                 self.user_turn(&row, &text, true);
-                self.run_start = Some(Instant::now());
             }
         }
         Ok(())
+    }
+
+    /// A run of main starts: whether it is the owner's alone is decided now (DESIGN §4.6), from
+    /// what the daemon saw, never from what the agent says. Every doubt is `Trust::Not`.
+    async fn begin_run(&mut self) {
+        self.run_start = Some(Instant::now());
+        self.run_taint = false;
+        let now = crate::now();
+        let session = self.child.as_ref().and_then(|c| c.session.clone());
+        let origin = session.map(|s| self.store.session_origin(&s));
+        self.trust = match origin {
+            Some(Ok(SessionOrigin::Clean)) if self.writers_since(now) => Trust::Not(BESIDE.into()),
+            Some(Ok(SessionOrigin::Clean)) => {
+                match crate::memory::base(&self.cfg.home, self.cfg.state_dir()).await {
+                    Some(base) => Trust::Owner { base, since: now },
+                    None => Trust::Not(ON_WAITING.into()),
+                }
+            }
+            Some(Ok(SessionOrigin::Tainted(why))) => {
+                Trust::Not(format!("this conversation, which {why}"))
+            }
+            _ => Trust::Not(crate::memory::LEGACY.into()),
+        };
+    }
+
+    /// Whether other work of the agent's ran, or runs, since `since`, or a stray of its lives:
+    /// any of it could write memory. A failed read counts as yes.
+    fn writers_since(&self, since: i64) -> bool {
+        self.store.writers_since(since).unwrap_or(true) || self.procs.strays_alive()
+    }
+
+    /// The run's conversation took in text that is not the owner's: it is tainted for good, in
+    /// `session_origin` before the run goes on (once per run), and this run is not the owner's
+    /// even if that write fails.
+    fn taint_session(&mut self, reason: &str) {
+        if self.run_taint {
+            return;
+        }
+        self.run_taint = true;
+        let why = format!("{reason} at {}", self.clock(crate::now()));
+        let session = self.child.as_ref().and_then(|c| c.session.clone());
+        let written = session.map(|s| self.store.taint(&s, &why));
+        if let Some(Err(e)) = written {
+            eprintln!("zephyr: recording the conversation's taint failed: {e}");
+        }
+        if let Trust::Owner { .. } = self.trust {
+            self.trust = Trust::Not(format!("this conversation, which {why}"));
+        }
     }
 
     /// rpi 0.15 sends no message events for a prompt it accepts, so the router reports the user
@@ -1966,10 +2031,23 @@ impl<'a> Router<'a> {
         // Before reconcile dispatches the next row, so that row runs on the new model.
         self.apply_model().await;
         self.backoff = FIRST_BACKOFF;
-        let origin = crate::memory::Origin::Main(crate::memory::LEGACY.into());
+        let trust = std::mem::replace(&mut self.trust, Trust::Not(crate::memory::LEGACY.into()));
+        let origin = match trust {
+            // Anything that ran beside the run, or a stray, could have written memory too.
+            Trust::Owner { base, since } => match self.writers_since(since) {
+                false => crate::memory::Origin::Owner { base },
+                true => crate::memory::Origin::Main(BESIDE.into()),
+            },
+            Trust::Not(label) => crate::memory::Origin::Main(label),
+        };
         let done = crate::memory::commit(&self.cfg.home, self.cfg.state_dir(), origin).await;
+        // A change saved at once is in the next child's context, as a rule is.
+        if done.as_ref().is_ok_and(|c| c.auto && c.notice.is_some()) {
+            self.restart = true;
+        }
         let memory = crate::memory::recorded(&self.store, done);
-        let tally = std::mem::take(&mut self.tally);
+        let main = crate::rpc::Tally::main(&self.cfg.home);
+        let tally = std::mem::replace(&mut self.tally, main);
         let crossed = self.record_spend(tally.used).unwrap_or_else(|e| {
             eprintln!("zephyr: recording spend failed: {e:#}");
             false
@@ -3306,6 +3384,10 @@ impl<'a> Router<'a> {
     /// (ClawSafety Table 3), so the owner can cut one off.
     async fn new_session(&mut self) -> String {
         let id = format!("{MAIN_SESSION}-{}", crate::now());
+        // Clean from its first message; `/switch` back to an older one never cleans it.
+        if let Err(e) = self.store.mark_clean(&id) {
+            eprintln!("zephyr: marking {id} clean failed: {e}");
+        }
         match self.switch_main(&id).await {
             Ok(when) => format!("[zephyr] new conversation {when}; memory and rules are kept"),
             Err(e) => format!("[zephyr] no new conversation: {e}"),
@@ -3717,7 +3799,7 @@ impl<'a> Router<'a> {
                 self.call(note).await?;
                 self.note_pending = true;
                 self.busy = true;
-                self.run_start = Some(Instant::now());
+                self.begin_run().await;
                 return Ok(());
             }
             for row in &rows {
@@ -3918,7 +4000,8 @@ impl<'a> Router<'a> {
         }
         if self.busy {
             // Cut off: book what the run did so far.
-            let tally = std::mem::take(&mut self.tally);
+            let main = crate::rpc::Tally::main(&self.cfg.home);
+            let tally = std::mem::replace(&mut self.tally, main);
             log(self.record_spend(tally.used).map(drop));
             let to = self.store.last_owner().ok().flatten();
             crate::tools::apply(&self.store, &self.cfg, &tally.requests, to);
@@ -4094,7 +4177,7 @@ impl<'a> Router<'a> {
             return format!("[zephyr] /compact failed: {e:#}");
         }
         self.busy = true;
-        self.run_start = Some(Instant::now());
+        self.begin_run().await;
         self.compacting = Some((from.0.into(), from.1.into()));
         String::new()
     }
@@ -4152,6 +4235,31 @@ impl<'a> Router<'a> {
 }
 
 /// The first word of `s` and the rest, both trimmed; a line break ends a word too.
+/// Whether the current run of main is the owner's alone (DESIGN §4.6).
+#[derive(Debug)]
+enum Trust {
+    /// Started on a clean conversation, a clean memory base and nothing else running.
+    Owner { base: String, since: i64 },
+    /// Why it is not: the waiting notice's `(from …)`.
+    Not(String),
+}
+
+/// `Trust::Not`'s labels for work beside the run and for a change already waiting.
+const BESIDE: &str = "your message, while other work of the agent's was running";
+const ON_WAITING: &str = "your message, on top of a change still waiting";
+
+/// What taking in an inbox row with this platform id means for the conversation, when the row
+/// is the daemon's (a task's or a process's report, a held action's result) and not the owner's.
+fn daemon_row(platform_id: &str) -> Option<String> {
+    let (what, n) = platform_id.split_once('-')?;
+    match what {
+        "task" => Some(format!("took in task #{n}'s report")),
+        "proc" => Some(format!("took in process #{n}'s report")),
+        "action" => Some(format!("took in action #{n}'s result")),
+        _ => None,
+    }
+}
+
 fn word(s: &str) -> (&str, &str) {
     let s = s.trim();
     s.split_once(char::is_whitespace)

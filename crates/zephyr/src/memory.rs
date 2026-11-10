@@ -244,7 +244,10 @@ fn agents_md(rules: &[String], goals: &[String], persona: &str, [user, memory]: 
     out.push_str(SETTINGS);
     out.push_str(APPROVALS);
     out.push_str(
-        "## Memory\n\nWhat you write to memory/ reaches this context only after the owner approves it.\n\n",
+        "## Memory\n\nWhat you write to memory/ reaches this context only after the owner approves it. \
+         When the owner tells you something to remember and you only read and edit memory/USER.md and \
+         MEMORY.md, zephyr saves it at once. A rule the owner states in chat is not enforced until it \
+         is a /rule: say so, and offer to propose it with gateway \"/rule TEXT\".\n\n",
     );
     out.push_str(&format!("{user}\n\n{memory}"));
     out

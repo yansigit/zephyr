@@ -329,6 +329,55 @@ fn stop_kills_the_agents_stray_processes_and_spares_the_live_child() {
     unsafe { libc::kill(tool.trim().parse().unwrap(), libc::SIGKILL) };
 }
 
+/// Decision 3 (owner confirmed 2026-11-10): an agent process outside every tracked group can write
+/// memory too, so while one is alive an owner's change waits.
+#[test]
+fn a_stray_agent_process_keeps_an_owner_memory_change_waiting() {
+    let (home, cfg) = setup("stray-memory", "");
+    let uid = std::fs::metadata(&home).unwrap().uid();
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(&cfg, format!("{text}[owners]\nchat = [\"{uid}\"]\n")).unwrap();
+    std::fs::write(home.join("stray"), "").unwrap();
+    let mut cmd = Command::new("python3");
+    cmd.args(["-c", REAPER, env!("CARGO_BIN_EXE_zephyr"), "run"])
+        .env("ZEPHYR_CONFIG", &cfg);
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let _reaper = Reaper(cmd.spawn().unwrap());
+    let stray = read_pid(&home.join("stray_pid"));
+    assert!(alive(&stray), "the stray never ran");
+
+    let mut sock = None;
+    let start = Instant::now();
+    while sock.is_none() {
+        assert!(start.elapsed() < Duration::from_secs(10), "no chat socket");
+        sock = std::os::unix::net::UnixStream::connect(home.join("zephyr.sock")).ok();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut sock = sock.unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    sock.write_all(b"{\"id\": \"s1\", \"text\": \"/new\"}\n{\"id\": \"s2\", \"text\": \"WRITE_MEMORY likes tea\"}\n")
+        .unwrap();
+    let mut lines = std::io::BufReader::new(sock);
+    let notice = loop {
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut lines, &mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let text = v["text"].as_str().unwrap_or_default();
+        if text.starts_with("[zephyr] memory") {
+            break text.to_string();
+        }
+    };
+    assert!(
+        notice.starts_with(
+            "[zephyr] memory change waiting (from your message, while other work of the agent's was running)"
+        ),
+        "{notice}"
+    );
+    // SAFETY: a plain syscall to the test's own leftover.
+    unsafe { libc::kill(stray.trim().parse().unwrap(), libc::SIGKILL) };
+}
+
 #[test]
 fn doctor_reports_presence_and_never_values() {
     // A stand-in BlueBubbles that answers the ping and records the request line.

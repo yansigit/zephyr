@@ -191,6 +191,25 @@ impl Procs {
     /// the agent), from a tracked command, or from the desktop, and what is outside `scope` (a
     /// `docker exec` into the container). Returns how many were killed.
     pub fn kill_strays(&self) -> usize {
+        let killed = self
+            .find_strays()
+            .iter()
+            .filter(|(pid, ticks)| kill_exact(*pid, *ticks))
+            .count();
+        if killed > 0 {
+            eprintln!("zephyr: killed {killed} stray process(es) of the agent");
+        }
+        killed
+    }
+
+    /// Whether `kill_strays` would find any (DESIGN §4.6: a stray can write memory, so an owner's
+    /// change made while one lives waits). The agent-browser daemon counts.
+    pub fn strays_alive(&self) -> bool {
+        !self.find_strays().is_empty()
+    }
+
+    /// `kill_strays`' search: `(pid, start ticks)` of each.
+    fn find_strays(&self) -> Vec<(i32, i64)> {
         // In the container the agent's uid is its own; outside, only a test's scope is swept.
         let (uid, scope) = match crate::agent::ids() {
             Some((uid, _)) => (uid, 1),
@@ -200,20 +219,12 @@ impl Procs {
             {
                 // SAFETY: getuid has no arguments and cannot fail.
                 Some(scope) => (unsafe { libc::getuid() }, scope),
-                None => return 0,
+                None => return Vec::new(),
             },
         };
         let mut keep = vec![std::process::id() as i32];
         keep.extend(self.running.lock().unwrap().values().map(|h| h.pgid));
-        let found = strays(&processes(), uid, scope, &keep);
-        let killed = found
-            .iter()
-            .filter(|(pid, ticks)| kill_exact(*pid, *ticks))
-            .count();
-        if killed > 0 {
-            eprintln!("zephyr: killed {killed} stray process(es) of the agent");
-        }
-        killed
+        strays(&processes(), uid, scope, &keep)
     }
 
     /// Startup: takes over the commands a re-exec handed over alive, and reports the rest

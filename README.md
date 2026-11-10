@@ -359,6 +359,14 @@ using its usual tools; general network traffic is not limited.
   reaches the agent's context only after `/memory ok` (if it changed after you were sent the diff,
   you are shown the new one first); `/memory undo` drops it, `/memory diff` shows
   it again, `/memory log` lists commits. A web page cannot plant a lasting "preference" without you.
+- Memory is saved without asking only when zephyr saw that the change came from you alone: in a
+  conversation started with `/new` that has read nothing but your messages (no web page, command,
+  file you sent, task report or tool other than reading and editing `memory/USER.md` and
+  `MEMORY.md`), with nothing else of the agent's running, and nothing waiting. You are still told
+  (`[zephyr] memory saved from your message; /memory undo drops it`), and `/memory undo` takes it
+  back. Anything else waits for `/memory ok`, and the notice says where it came from. Once a
+  conversation has read anything else it stays that way until the next `/new`; after the agent
+  used its browser, `/stop` first (its browser keeps running in the background).
   For the same reason rpi skills are off, only the image's extensions load, and a `SYSTEM.md`, `APPEND_SYSTEM.md`, `CLAUDE.md` or
   extra `AGENTS*.md` the agent writes is renamed `*.ignored-by-zephyr` before the next start.
 - When the agent drafts a skill or a connector, you get its diff the same way (below).

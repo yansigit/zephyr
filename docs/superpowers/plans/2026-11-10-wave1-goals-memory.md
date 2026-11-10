@@ -201,7 +201,7 @@ Deviation: the spec's `## Goals` paragraph is wrapped at 100 columns in a code b
 - `dispatch_new`: a `daemon_row` taints before the row is sent, prompt or steer. `tapped`: after `tally.add`, a new `tally.taint` calls `taint_session`. `settled`: `Owner { since }` with `writers_since(since)` or `strays_alive()` true becomes `Not("your message, while other work of the agent's was running")`; then `memory::commit` with `Origin::Owner { base }` or `Origin::Main(label)`. The tally is reset with `Tally::main(&self.cfg.home)`. `new_session` calls `store.mark_clean(&id)` before `switch_main`.
 - `## Memory` text, copy (decision §6.2 included): `## Memory\n\nWhat you write to memory/ reaches this context only after the owner approves it. When the owner tells you something to remember and you only read and edit memory/USER.md and MEMORY.md, zephyr saves it at once. A rule the owner states in chat is not enforced until it is a /rule: say so, and offer to propose it with gateway "/rule TEXT".\n\n`
 
-- [ ] **Step 1: Write the failing tests** in `tests/router.rs` (helper `fn taint(cfg: &Config) { Store::open(&cfg.db_path()).unwrap().taint("main", "used exec at 00:00").unwrap() }`, called before `start` in `a_memory_edit_waits_for_the_owner_who_sees_its_diff` and `gateway_never_approves_for_the_owner`; :948 then asserts `(from this conversation, which used exec at 00:00)`):
+- [x] **Step 1: Write the failing tests** in `tests/router.rs` (helper `fn taint(cfg: &Config) { Store::open(&cfg.db_path()).unwrap().taint("main", "used exec at 00:00").unwrap() }`, called before `start` in `a_memory_edit_waits_for_the_owner_who_sees_its_diff` and `gateway_never_approves_for_the_owner`; :948 then asserts `(from this conversation, which used exec at 00:00)`):
   - `after_new_an_owner_message_saves_memory_at_once`: `/new`, `WRITE_MEMORY likes tea` → a notice starting `[zephyr] memory saved from your message; /memory undo drops it:`; the next message's AGENTS.md holds `remembered:`; `memory_commits` last row origin `your message`, `auto`.
   - `a_read_file_taints_the_conversation_for_good` (Review Focus 1): `/new`; `[call read {"path": "inbox/a.png"}] look`; then `WRITE_MEMORY likes tea` → notice starts `[zephyr] memory change waiting (from this conversation, which used read at `; `session_origin` of the new id is `Tainted("used read at …")`.
   - `a_task_report_taints_the_conversation` (Review Focus 1): `/new`; `gw.say("task-99", "owner", "report: done")`; then `WRITE_MEMORY likes tea` → waiting `(from this conversation, which took in task #99's report at `.
@@ -209,10 +209,12 @@ Deviation: the spec's `## Goals` paragraph is wrapped at 100 columns in a code b
   - `an_upgraded_conversation_waits_until_new`: delete `session_origin` rows with `rusqlite::Connection` before `start` → waiting `(from a conversation from before zephyr kept track; /new starts a clean one)`; after `/new` the next one saves.
   - `a_note_committed_earlier_does_not_stop_a_save_after_new` (Review Focus 2): with `taint`, write `memory/notes/x.md` by hand, send `hi` (its settle commits the note, no notice); `/new`; `WRITE_MEMORY likes tea` → `memory saved from your message`.
   - `tests/cli.rs` `a_stray_agent_process_keeps_an_owner_memory_change_waiting`: the subreaper harness of `stop_kills_the_agents_stray_processes_and_spares_the_live_child` (`stray` file), `/new`, `WRITE_MEMORY likes tea` → waiting `while other work of the agent's was running`.
-- [ ] **Step 2:** `cargo test -p zephyr --test router -- memory taint` and `cargo test -p zephyr --test cli stray` → FAIL.
-- [ ] **Step 3:** Implement.
-- [ ] **Step 4:** Run the same → PASS; `cargo test -p zephyr` → PASS.
-- [ ] **Step 5:** DESIGN §4.6 provenance (the five checks with decisions 1–7, `session_origin`, the notices, the `## Memory` text); README one paragraph on when memory is saved without asking; CLAUDE.md's `memory.rs` bullet. Commit `feat(memory): save a memory change at once when the daemon saw it came only from the owner`.
+- [x] **Step 2:** `cargo test -p zephyr --test router -- memory taint` and `cargo test -p zephyr --test cli stray` → FAIL.
+- [x] **Step 3:** Implement.
+- [x] **Step 4:** Run the same → PASS; `cargo test -p zephyr` → PASS.
+- [x] **Step 5:** DESIGN §4.6 provenance (the five checks with decisions 1–7, `session_origin`, the notices, the `## Memory` text); README one paragraph on when memory is saved without asking; CLAUDE.md's `memory.rs` bullet. Commit `feat(memory): save a memory change at once when the daemon saw it came only from the owner`.
+
+Deviation: a change saved at once also sets `self.restart` (the child restarts at idle), since the test wants the next message's AGENTS.md to hold it and AGENTS.md is written only at a child's start. `work_running_beside_the_run_keeps_its_change_waiting` holds the job with fake-rpi's `tool_wait` and a `[tool]` prompt instead of `slow`, which would let the job's settle commit main's edit first on a slow machine.
 
 ### Task B-7: `/forget TEXT` and `/memory squash yes`
 

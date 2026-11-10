@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use zephyr::channel::{Activity, Channel, Inbound, Outbound};
 use zephyr::config::Config;
-use zephyr::store::{client_id, InboxRow, Store};
+use zephyr::store::{client_id, InboxRow, SessionOrigin, Store};
 
 /// Each delivered reply, and whether its outbox row was already committed as pending.
 type Sent = Arc<Mutex<Vec<(Outbound, bool)>>>;
@@ -939,15 +939,44 @@ async fn a_paused_scheduler_claims_nothing_and_catches_up_once_on_resume() {
     gw.shutdown().await;
 }
 
+/// Marks main's conversation as having used `exec`, as an earlier run of it would have.
+fn taint(cfg: &Config) {
+    Store::open(&cfg.db_path())
+        .unwrap()
+        .taint("main", "used exec at 00:00")
+        .unwrap()
+}
+
+/// The first reply starting with `prefix`, once one has come.
+async fn reply_starting(gw: &Gateway, prefix: &str) -> String {
+    let find = || gw.replies().into_iter().find(|r| r.starts_with(prefix));
+    wait(|| find().is_some()).await;
+    find().unwrap()
+}
+
+/// What the newest memory commit was recorded as: its origin and whether it was saved at once.
+fn last_memory_commit(home: &Path) -> (String, bool) {
+    let commits = Store::open(&home.join("state.db"))
+        .unwrap()
+        .memory_commits_since(0)
+        .unwrap();
+    let c = commits.last().unwrap();
+    (c.origin.clone(), c.auto)
+}
+
+const SAVED: &str = "[zephyr] memory saved from your message; /memory undo drops it:";
+
 #[tokio::test]
 async fn a_memory_edit_waits_for_the_owner_who_sees_its_diff() {
     let home = home("memory");
-    let gw = start(config(&home));
+    let cfg = config(&home);
+    taint(&cfg);
+    let gw = start(cfg);
     gw.say("m1", "owner", "WRITE_MEMORY likes tea").await;
     let replies = gw.wait_replies(2).await;
     assert_eq!(replies[0], "echo: [chat #1] WRITE_MEMORY likes tea");
     assert!(
-        replies[1].starts_with("[zephyr] memory change waiting (from a conversation from before zephyr kept track; /new starts a clean one); /memory ok keeps it")
+        replies[1].starts_with("[zephyr] memory change waiting (from this conversation, which used exec at 00:00); /memory ok keeps it")
             && replies[1].ends_with("+ remembered: [chat #1] WRITE_MEMORY likes tea"),
         "{}",
         replies[1]
@@ -976,6 +1005,155 @@ async fn a_memory_edit_waits_for_the_owner_who_sees_its_diff() {
     assert!(
         !memory.contains("remembered: "),
         "the undo reverted the run's edit"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn after_new_an_owner_message_saves_memory_at_once() {
+    let home = home("memory-owner");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "/new").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "WRITE_MEMORY likes tea").await;
+    let saved = reply_starting(&gw, "[zephyr] memory").await;
+    assert!(saved.starts_with(SAVED), "{saved}");
+    assert!(
+        saved.ends_with("+ remembered: [chat #2] WRITE_MEMORY likes tea"),
+        "{saved}"
+    );
+    assert_eq!(last_memory_commit(&home), ("your message".into(), true));
+    gw.say("m3", "owner", "again").await;
+    wait(|| gw.replies().iter().any(|r| r.contains("again"))).await;
+    let agents = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    assert!(agents.contains("remembered: [chat #2]"), "{agents}");
+    assert!(
+        agents.contains("When the owner tells you something to remember and you only read and edit memory/USER.md and MEMORY.md, zephyr saves it at once."),
+        "{agents}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_read_file_taints_the_conversation_for_good() {
+    let home = home("memory-read");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "/new").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", r#"[call read {"path": "inbox/a.png"}] look"#)
+        .await;
+    gw.wait_replies(2).await;
+    gw.say("m3", "owner", "WRITE_MEMORY likes tea").await;
+    let notice = reply_starting(&gw, "[zephyr] memory").await;
+    assert!(
+        notice.starts_with(
+            "[zephyr] memory change waiting (from this conversation, which used read at "
+        ),
+        "{notice}"
+    );
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let id = store.main_session().unwrap();
+    assert!(id.starts_with("main-"), "{id}");
+    match store.session_origin(&id).unwrap() {
+        SessionOrigin::Tainted(why) => assert!(why.starts_with("used read at "), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_task_report_taints_the_conversation() {
+    let home = home("memory-report");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "/new").await;
+    gw.wait_replies(1).await;
+    gw.say("task-99", "owner", "report: done").await;
+    gw.wait_replies(2).await;
+    gw.say("m2", "owner", "WRITE_MEMORY likes tea").await;
+    let notice = reply_starting(&gw, "[zephyr] memory").await;
+    assert!(
+        notice.starts_with(
+            "[zephyr] memory change waiting (from this conversation, which took in task #99's report at "
+        ),
+        "{notice}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn work_running_beside_the_run_keeps_its_change_waiting() {
+    let home = home("memory-beside");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        &format!("/job add bg | {NEVER} | [tool] hello"),
+    )
+    .await;
+    gw.wait_replies(1).await;
+    // The job's tool keeps running until the file goes: main's run settles while it still does.
+    std::fs::write(home.join("tool_wait"), "").unwrap();
+    gw.say("m2", "owner", "/job run 1").await;
+    wait(|| run_status(&home, "running") == 1).await;
+    gw.say("m3", "owner", "WRITE_MEMORY likes tea").await;
+    let notice = reply_starting(&gw, "[zephyr] memory").await;
+    assert!(
+        notice.starts_with(
+            "[zephyr] memory change waiting (from your message, while other work of the agent's was running)"
+        ),
+        "{notice}"
+    );
+    std::fs::remove_file(home.join("tool_wait")).unwrap();
+    wait(|| run_status(&home, "completed") == 1).await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_upgraded_conversation_waits_until_new() {
+    let home = home("memory-upgraded");
+    let cfg = config(&home);
+    drop(Store::open(&cfg.db_path()).unwrap());
+    rusqlite::Connection::open(cfg.db_path())
+        .unwrap()
+        .execute("DELETE FROM session_origin", [])
+        .unwrap();
+    let gw = start(cfg);
+    gw.say("m1", "owner", "WRITE_MEMORY likes tea").await;
+    let notice = reply_starting(&gw, "[zephyr] memory").await;
+    assert!(
+        notice.starts_with("[zephyr] memory change waiting (from a conversation from before zephyr kept track; /new starts a clean one); /memory ok keeps it"),
+        "{notice}"
+    );
+    gw.say("m2", "owner", "/memory ok").await;
+    reply_starting(&gw, "[zephyr] memory kept").await;
+    gw.say("m3", "owner", "/new").await;
+    reply_starting(&gw, "[zephyr] new conversation").await;
+    gw.say("m4", "owner", "WRITE_MEMORY likes coffee").await;
+    reply_starting(&gw, SAVED).await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_note_committed_earlier_does_not_stop_a_save_after_new() {
+    let home = home("memory-note");
+    let cfg = config(&home);
+    taint(&cfg);
+    let gw = start(cfg);
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_replies(1).await;
+    std::fs::write(home.join("memory/notes/x.md"), "a note\n").unwrap();
+    gw.say("m2", "owner", "hi again").await;
+    gw.wait_replies(2).await;
+    gw.say("m3", "owner", "/new").await;
+    gw.wait_replies(3).await;
+    gw.say("m4", "owner", "WRITE_MEMORY likes tea").await;
+    reply_starting(&gw, SAVED).await;
+    assert!(
+        !gw.replies()
+            .iter()
+            .any(|r| r.starts_with("[zephyr] memory change waiting")),
+        "{:?}",
+        gw.replies()
     );
     gw.shutdown().await;
 }
@@ -1831,7 +2009,9 @@ async fn the_agent_reads_status_through_gateway_within_its_turn() {
 #[tokio::test]
 async fn gateway_never_approves_for_the_owner() {
     let home = home("gateway-approve");
-    let gw = start(config(&home));
+    let cfg = config(&home);
+    taint(&cfg);
+    let gw = start(cfg);
     gw.say("m1", "owner", "WRITE_MEMORY likes tea").await;
     gw.wait_replies(2).await; // the reply and the "memory change waiting" notice
     gw.say(
