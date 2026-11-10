@@ -380,6 +380,83 @@ fn a_stray_agent_process_keeps_an_owner_memory_change_waiting() {
     unsafe { libc::kill(stray.trim().parse().unwrap(), libc::SIGKILL) };
 }
 
+/// A stray seen when a run starts taints the conversation then: it may end before the run
+/// settles, having written the saved conversation or memory, so a later run that sees no stray
+/// at all is still not the owner's alone (DESIGN §4.6).
+#[test]
+fn a_stray_at_a_runs_start_taints_its_conversation_after_it_ends() {
+    let (home, cfg) = setup("stray-at-start", "");
+    let uid = std::fs::metadata(&home).unwrap().uid();
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(&cfg, format!("{text}[owners]\nchat = [\"{uid}\"]\n")).unwrap();
+    let mut cmd = Command::new("python3");
+    cmd.args(["-c", REAPER, env!("CARGO_BIN_EXE_zephyr"), "run"])
+        .env("ZEPHYR_CONFIG", &cfg);
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let _reaper = Reaper(cmd.spawn().unwrap());
+
+    let mut sock = None;
+    let start = Instant::now();
+    while sock.is_none() {
+        assert!(start.elapsed() < Duration::from_secs(10), "no chat socket");
+        sock = std::os::unix::net::UnixStream::connect(home.join("zephyr.sock")).ok();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut sock = sock.unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let mut lines = std::io::BufReader::new(sock.try_clone().unwrap());
+    let mut until = |want: &str| loop {
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut lines, &mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let text = v["text"].as_str().unwrap_or_default().to_string();
+        if text.contains(want) {
+            break text;
+        }
+    };
+    let mut say = |id: &str, text: &str| {
+        let line = serde_json::json!({"id": id, "text": text});
+        sock.write_all(format!("{line}\n").as_bytes()).unwrap();
+    };
+    say("s1", "/new");
+    until("[zephyr] new conversation");
+    // A run on the new child first, so the restart's own look is behind us.
+    say("s2", "hi");
+    until("] hi");
+    // After this run settles, a stray of the agent's lives a second, then ends.
+    std::fs::write(home.join("stray_soon"), "1").unwrap();
+    say("s3", "one more");
+    until("] one more");
+    let stray = read_pid(&home.join("stray_soon_pid"));
+    // The next run starts while it lives, and settles after it has gone.
+    std::fs::write(home.join("slow"), "3").unwrap();
+    say("s4", "again");
+    until("] again");
+    assert!(!alive(&stray), "the stray outlived the run");
+    std::fs::remove_file(home.join("slow")).unwrap();
+    // No stray now, but the conversation was not the owner's alone.
+    say("s5", "WRITE_MEMORY likes tea");
+    let notice = until("[zephyr] memory");
+    assert!(
+        notice.starts_with(
+            "[zephyr] memory change waiting (from this conversation, which was open at "
+        ) && notice.contains(
+            " while the agent's sleep was still running on its own; /stop ends it, then /new starts clean); "
+        ),
+        "{notice}"
+    );
+    let store = zephyr::store::Store::open(&home.join("state.db")).unwrap();
+    let id = store.main_session().unwrap();
+    assert!(
+        matches!(
+            store.session_origin(&id).unwrap(),
+            zephyr::store::SessionOrigin::Tainted(_)
+        ),
+        "{id}"
+    );
+}
+
 #[test]
 fn doctor_reports_presence_and_never_values() {
     // A stand-in BlueBubbles that answers the ping and records the request line.

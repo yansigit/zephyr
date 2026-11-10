@@ -24,7 +24,9 @@ A prompt containing WRITE_MEMORY first writes memory/MEMORY.md under the home.
 argv.json holds the argv of the latest start. With a `tool_sleep` file in the home, each start
 leaves a `sleep 300` running in its process group, as a tool would, its pid in `tool_pid`. With a
 `stray` file, each start leaves a `setsid sleep 300` that escaped through a shell that exited (an
-orphan in its own session, as an agent's `setsid cmd &` is), its pid in `stray_pid`.
+orphan in its own session, as an agent's `setsid cmd &` is), its pid in `stray_pid`. A `stray_soon`
+file (seconds) makes the next `get_messages` leave one that lives that long instead, the file
+removed and its pid in `stray_soon_pid`: a stray that comes between runs and ends before the next settles.
 A prompt containing `bash: CMD` first reports a bash tool call running CMD (tool_execution_start,
 then its tool_execution_end, as rpi does; nothing is run).
 With `--no-tools` (a /btw child) none of the tool markers below (`bash: `, `[tool]`, `[call ...]`)
@@ -450,6 +452,13 @@ def quick(cmd, s):
     if refused(cmd):
         pass
     elif kind == "get_messages":
+        soon = os.path.join(home, "stray_soon")
+        if os.path.exists(soon):
+            import subprocess
+            secs = open(soon).read().strip() or "1"
+            os.remove(soon)
+            subprocess.run(["sh", "-c", "setsid sleep %s </dev/null >/dev/null 2>&1 & echo $! > stray_soon_pid" % secs],
+                           cwd=home, check=True)
         respond(cmd, {"messages": s["messages"], "total": len(s["messages"]), "pendingResume": s["pending"]})
     elif kind == "get_commands":
         names = ["zephyr-policy"] if extension and os.path.exists(extension) else []
