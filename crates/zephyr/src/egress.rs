@@ -1982,8 +1982,7 @@ table inet zephyr {
     #[test]
     fn direct_refused_accepts_only_a_refusal() {
         let wait = Duration::from_secs(2);
-        // 127.0.0.2, which no other test binds, so the closed port is not taken again meanwhile.
-        let listener = std::net::TcpListener::bind("127.0.0.2:0").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let e = direct_refused(addr, wait).unwrap_err();
         assert!(e.contains("connected"), "{e}");
