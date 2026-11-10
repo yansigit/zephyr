@@ -3,16 +3,20 @@
 
 use anyhow::Context;
 use futures_util::future::BoxFuture;
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{HeaderValue, HOST};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::collections::HashSet;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use url::Host;
@@ -314,6 +318,11 @@ pub struct Floor {
     pub head_wait: Duration,
     /// How long each checked address gets to answer.
     pub connect_wait: Duration,
+    /// How long a server has to start its reply to a forwarded request, the client's upload
+    /// included.
+    pub reply_wait: Duration,
+    /// How long a tunnel, or a forwarded reply's body, may go with nothing moving.
+    pub idle: Duration,
 }
 
 impl Floor {
@@ -325,6 +334,11 @@ impl Floor {
             conns: 256,
             head_wait: Duration::from_secs(10),
             connect_wait: Duration::from_secs(10),
+            // Past the longest long-poll in common use (a minute or so), with room to spare.
+            reply_wait: Duration::from_secs(5 * 60),
+            // Websockets and event streams ping far more often; an IMAP IDLE is renewed within
+            // 29 minutes. A dead peer's slot comes back after this.
+            idle: Duration::from_secs(30 * 60),
         })
     }
 }
@@ -391,7 +405,8 @@ impl Audit {
 const HINT: &str =
     "the owner can allow HOST:PORT in network.allow; propose it with gateway /set network.allow\n";
 
-type Body = BoxBody<Bytes, hyper::Error>;
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type Body = UnsyncBoxBody<Bytes, BoxError>;
 
 /// One connection's share of the proxy.
 #[derive(Clone)]
@@ -518,7 +533,7 @@ impl Conn {
             tokio::spawn(self.tunnel(req, upstream));
             return Response::new(body(""));
         }
-        match forward(req, upstream).await {
+        match forward(req, upstream, &self.floor).await {
             Ok(reply) => {
                 self.record(&cfg, tool, &dest, Outcome::Allowed);
                 reply
@@ -530,10 +545,10 @@ impl Conn {
         }
     }
 
-    /// Carries bytes between the client and `upstream` until either side closes.
-    async fn tunnel(self, req: Request<Incoming>, mut upstream: TcpStream) {
+    /// Carries bytes between the client and `upstream` (`relay`), then frees the slot.
+    async fn tunnel(self, req: Request<Incoming>, upstream: TcpStream) {
         if let Ok(client) = hyper::upgrade::on(req).await {
-            let _ = tokio::io::copy_bidirectional(&mut TokioIo::new(client), &mut upstream).await;
+            relay(TokioIo::new(client), upstream, self.floor.idle).await;
         }
         drop(self.slot);
     }
@@ -572,7 +587,79 @@ impl Conn {
 fn body(text: &str) -> Body {
     Full::new(Bytes::from(text.to_owned()))
         .map_err(|never| match never {})
-        .boxed()
+        .boxed_unsync()
+}
+
+/// Carries bytes both ways until both sides have closed, one fails, or nothing has moved for
+/// `idle` (a write that stalls counts): a peer that went away without a word must not hold its
+/// slot for ever. A side that closes is closed on the other, which may go on sending.
+async fn relay<A, B>(a: A, b: B, idle: Duration)
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    /// What one side sent goes to the other; its end of stream ends that direction.
+    async fn pass<W: AsyncWrite + Unpin>(
+        read: std::io::Result<usize>,
+        from: &[u8],
+        to: &mut W,
+        open: &mut bool,
+    ) -> std::io::Result<()> {
+        match read? {
+            0 => {
+                *open = false;
+                to.shutdown().await
+            }
+            n => to.write_all(&from[..n]).await,
+        }
+    }
+    let (mut a_read, mut a_write) = tokio::io::split(a);
+    let (mut b_read, mut b_write) = tokio::io::split(b);
+    let (mut from_a, mut from_b) = (vec![0u8; 16 * 1024], vec![0u8; 16 * 1024]);
+    let (mut a_open, mut b_open) = (true, true);
+    while a_open || b_open {
+        let step = async {
+            tokio::select! {
+                n = a_read.read(&mut from_a), if a_open => pass(n, &from_a, &mut b_write, &mut a_open).await,
+                n = b_read.read(&mut from_b), if b_open => pass(n, &from_b, &mut a_write, &mut b_open).await,
+            }
+        };
+        if !matches!(tokio::time::timeout(idle, step).await, Ok(Ok(()))) {
+            break;
+        }
+    }
+}
+
+/// A forwarded reply's body, ended with an error when the server sends nothing for `wait`.
+struct Idle {
+    body: Incoming,
+    wait: Duration,
+    timer: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl hyper::body::Body for Idle {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.body).poll_frame(cx) {
+            Poll::Ready(frame) => {
+                let wait = this.wait;
+                this.timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + wait);
+                Poll::Ready(frame.map(|f| f.map_err(Into::into)))
+            }
+            Poll::Pending => {
+                let stopped = this.timer.as_mut().poll(cx);
+                stopped.map(|()| Some(Err("the server stopped sending".into())))
+            }
+        }
+    }
 }
 
 /// A connection to the first of `addrs` that answers within `wait`. It takes addresses, never
@@ -590,6 +677,7 @@ async fn connect(addrs: &[SocketAddr], wait: Duration) -> Option<(TcpStream, Soc
 async fn forward(
     mut req: Request<Incoming>,
     upstream: TcpStream,
+    floor: &Floor,
 ) -> anyhow::Result<Response<Body>> {
     let uri = req.uri().clone();
     let authority = uri.authority().context("no authority")?.as_str();
@@ -601,7 +689,13 @@ async fn forward(
     headers.insert(HOST, HeaderValue::from_str(authority)?);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(upstream)).await?;
     tokio::spawn(conn);
-    Ok(sender.send_request(req).await?.map(BodyExt::boxed))
+    let reply = tokio::time::timeout(floor.reply_wait, sender.send_request(req)).await??;
+    let idle = |body| Idle {
+        body,
+        wait: floor.idle,
+        timer: Box::pin(tokio::time::sleep(floor.idle)),
+    };
+    Ok(reply.map(|body| idle(body).boxed_unsync()))
 }
 
 /// The rules that leave the agent's uid no route but its own loopback (DESIGN §4.19). The jump
@@ -1131,7 +1225,16 @@ mod tests {
             conns: 256,
             head_wait: WAIT,
             connect_wait: WAIT,
+            reply_wait: WAIT,
+            idle: WAIT,
         }
+    }
+
+    /// Whether the connection ends within 3 s, and what came before that.
+    async fn ends(s: &mut TcpStream) -> Option<Vec<u8>> {
+        let mut rest = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut rest));
+        read.await.ok().map(|_| rest)
     }
 
     fn config(dir: &std::path::Path, allow: &str) -> Arc<Config> {
@@ -1217,9 +1320,16 @@ mod tests {
                     }
                     let rest = head_of(&mut s).await;
                     let _ = tx.send(format!("{}{rest}", String::from_utf8_lossy(&first)));
-                    let _ = s
-                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
-                        .await;
+                    // `/stall` never answers; `/half` stops after 2 of its 10 bytes.
+                    if rest.starts_with("/stall") {
+                        return std::future::pending().await;
+                    }
+                    let length = if rest.starts_with("/half") { 10 } else { 2 };
+                    let reply = format!("HTTP/1.1 200 OK\r\ncontent-length: {length}\r\n\r\nok");
+                    let _ = s.write_all(reply.as_bytes()).await;
+                    if length > 2 {
+                        std::future::pending::<()>().await;
+                    }
                 });
             }
         });
@@ -1644,5 +1754,59 @@ table inet zephyr {
         assert_eq!(of(&["127.0.0.1", "172.18.0.2"]), None);
         assert_eq!(of(&["fd00::2"]), None);
         assert_eq!(of(&[]), None);
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_with_nothing_moving_is_closed() {
+        let up = upstream().await;
+        let dest = format!("upstream.test:{}", up.port);
+        let quick = Floor {
+            idle: Duration::from_millis(300),
+            ..floor()
+        };
+        let proxy = Proxy::start("egress-idle", &dest, quick).await;
+        let (mut s, reply) = proxy.ask(&format!("CONNECT {dest} HTTP/1.1\r\n\r\n")).await;
+        assert!(reply.starts_with("HTTP/1.1 200 "), "{reply}");
+        assert_eq!(
+            ends(&mut s).await,
+            Some(vec![]),
+            "the idle tunnel stayed open"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_gets_a_502() {
+        let up = upstream().await;
+        let dest = format!("upstream.test:{}", up.port);
+        let quick = Floor {
+            reply_wait: Duration::from_millis(300),
+            ..floor()
+        };
+        let proxy = Proxy::start("egress-stall", &dest, quick).await;
+        let get = format!("GET http://{dest}/stall HTTP/1.1\r\n\r\n");
+        let (_s, reply) = proxy.ask(&get).await;
+        assert!(
+            reply.starts_with("HTTP/1.1 502 zephyr: the server did not answer\r\n"),
+            "{reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_stops_midway_is_cut() {
+        let up = upstream().await;
+        let dest = format!("upstream.test:{}", up.port);
+        let quick = Floor {
+            idle: Duration::from_millis(300),
+            ..floor()
+        };
+        let proxy = Proxy::start("egress-half", &dest, quick).await;
+        let get = format!("GET http://{dest}/half HTTP/1.1\r\n\r\n");
+        let (mut s, reply) = proxy.ask(&get).await;
+        assert!(reply.starts_with("HTTP/1.1 200 "), "{reply}");
+        assert_eq!(
+            ends(&mut s).await,
+            Some(b"ok".to_vec()),
+            "the stalled reply stayed open"
+        );
     }
 }
