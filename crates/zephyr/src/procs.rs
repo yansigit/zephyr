@@ -192,7 +192,7 @@ impl Procs {
     /// `docker exec` into the container). Returns how many were killed.
     pub fn kill_strays(&self) -> usize {
         let killed = self
-            .find_strays(false)
+            .find_strays()
             .iter()
             .filter(|(pid, ticks)| kill_exact(*pid, *ticks))
             .count();
@@ -204,27 +204,37 @@ impl Procs {
 
     /// Whether `kill_strays` would find any (DESIGN §4.6: a stray can write memory, so an owner's
     /// change made while one lives waits). The agent-browser daemon counts.
+    /// A `/proc` that cannot be read whole counts as one.
     pub fn strays_alive(&self) -> bool {
-        !self.find_strays(true).is_empty()
+        let Some((uid, scope, keep)) = self.sweep() else {
+            return false;
+        };
+        let (all, complete) = processes_in(Path::new("/proc"));
+        !complete || !strays(&all, uid, scope, &keep, true).is_empty()
     }
 
     /// `kill_strays`' search: `(pid, start ticks)` of each.
-    fn find_strays(&self, strict: bool) -> Vec<(i32, i64)> {
-        // In the container the agent's uid is its own; outside, only a test's scope is swept.
+    fn find_strays(&self) -> Vec<(i32, i64)> {
+        match self.sweep() {
+            Some((uid, scope, keep)) => strays(&processes(), uid, scope, &keep, false),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whose processes are swept, below which pid, and what is spared: in the container the
+    /// agent's uid is its own; outside, only a test's scope is swept (`None`: nothing is).
+    fn sweep(&self) -> Option<(u32, i32, Vec<i32>)> {
         let (uid, scope) = match crate::agent::ids() {
             Some((uid, _)) => (uid, 1),
-            None => match std::env::var("ZEPHYR_STRAY_SCOPE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-            {
+            None => {
+                let scope = std::env::var("ZEPHYR_STRAY_SCOPE").ok()?.parse().ok()?;
                 // SAFETY: getuid has no arguments and cannot fail.
-                Some(scope) => (unsafe { libc::getuid() }, scope),
-                None => return Vec::new(),
-            },
+                (unsafe { libc::getuid() }, scope)
+            }
         };
         let mut keep = vec![std::process::id() as i32];
         keep.extend(self.running.lock().unwrap().values().map(|h| h.pgid));
-        strays(&processes(), uid, scope, &keep, strict)
+        Some((uid, scope, keep))
     }
 
     /// Startup: takes over the commands a re-exec handed over alive, and reports the rest
@@ -592,37 +602,55 @@ struct Ps {
     uid: u32,
     ticks: i64,
     comm: String,
-    /// What it runs (`/proc/<pid>/exe`), when that can be read.
-    exe: Option<String>,
 }
 
 /// Every process now, by pid. One that ends while it is read is left out.
 fn processes() -> HashMap<i32, Ps> {
+    processes_in(Path::new("/proc")).0
+}
+
+/// The processes under `root` (`/proc`), and whether every one could be read: `false` when the
+/// folder cannot be listed or an entry fails for any reason but having ended.
+fn processes_in(root: &Path) -> (HashMap<i32, Ps>, bool) {
     let mut all = HashMap::new();
-    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+    let Ok(list) = std::fs::read_dir(root) else {
+        return (all, false);
+    };
+    let mut complete = true;
+    for entry in list {
+        let Ok(entry) = entry else {
+            complete = false;
+            continue;
+        };
         let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
             continue;
         };
-        let read = || -> Option<Ps> {
-            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
-            let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
-            let (open, close) = (stat.find('(')?, stat.rfind(')')?);
-            let mut after = stat[close + 1..].split_whitespace();
-            let uid = status.lines().find_map(|l| l.strip_prefix("Uid:"))?;
-            Some(Ps {
-                ppid: after.nth(1)?.parse().ok()?,
-                ticks: after.nth(17)?.parse().ok()?,
-                uid: uid.split_whitespace().next()?.parse().ok()?,
-                comm: stat[open + 1..close].to_string(),
-                exe: (std::fs::read_link(entry.path().join("exe")).ok())
-                    .map(|p| p.to_string_lossy().into_owned()),
-            })
+        let gone = |e: &std::io::Error| {
+            e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
         };
-        if let Some(p) = read() {
-            all.insert(pid, p);
+        let read = || -> Result<Option<Ps>, std::io::Error> {
+            let stat = std::fs::read_to_string(entry.path().join("stat"))?;
+            let status = std::fs::read_to_string(entry.path().join("status"))?;
+            let parse = || -> Option<Ps> {
+                let (open, close) = (stat.find('(')?, stat.rfind(')')?);
+                let mut after = stat[close + 1..].split_whitespace();
+                let uid = status.lines().find_map(|l| l.strip_prefix("Uid:"))?;
+                Some(Ps {
+                    ppid: after.nth(1)?.parse().ok()?,
+                    ticks: after.nth(17)?.parse().ok()?,
+                    uid: uid.split_whitespace().next()?.parse().ok()?,
+                    comm: stat[open + 1..close].to_string(),
+                })
+            };
+            Ok(parse())
+        };
+        match read() {
+            Ok(Some(p)) => drop(all.insert(pid, p)),
+            Err(e) if gone(&e) => {}
+            _ => complete = false,
         }
     }
-    all
+    (all, complete)
 }
 
 /// The desktop's programs (`desktop::ensure`), which a crashed daemon leaves running.
@@ -630,8 +658,9 @@ const DESKTOP: [&str; 2] = ["Xvfb", "openbox"];
 
 /// `(pid, start ticks)` of each process of `uid` whose parents lead to `scope` without passing
 /// one of `keep` or the desktop. A chain that breaks (a parent not in `all`) is spared.
-/// `strict` (whether memory can be trusted, DESIGN §4.6): only the desktop's own programs, run
-/// from `/usr/bin`, are spared, not what they started nor a program that only takes their name.
+/// `strict` (whether memory can be trusted, DESIGN §4.6): only what descends from `keep` (the
+/// daemon, which starts the desktop, and the tracked commands) is spared; a desktop program it
+/// did not start, or a program that takes that name, is a stray, and so is a broken chain.
 fn strays(
     all: &HashMap<i32, Ps>,
     uid: u32,
@@ -639,18 +668,17 @@ fn strays(
     keep: &[i32],
     strict: bool,
 ) -> Vec<(i32, i64)> {
-    let desktop = |p: &Ps| {
-        let real = p.exe.as_deref() == Some(&format!("/usr/bin/{}", p.comm));
-        DESKTOP.contains(&p.comm.as_str()) && (!strict || real)
-    };
     let stray = |start: i32| {
         let mut pid = start;
         for _ in 0..all.len() {
             let Some(p) = all.get(&pid) else {
-                return false;
+                return strict;
             };
-            if keep.contains(&pid) || (desktop(p) && (!strict || pid == start)) {
+            if keep.contains(&pid) || (!strict && DESKTOP.contains(&p.comm.as_str())) {
                 return false;
+            }
+            if p.ppid == 0 {
+                return false; // the top, or a parent outside the namespace: not under scope
             }
             if p.ppid == scope {
                 return true;
@@ -1050,7 +1078,6 @@ mod tests {
             uid,
             ticks: 7,
             comm: comm.into(),
-            exe: None,
         };
         // 1 init, 10 the daemon (root), 20 its rpi child, 30 a tracked command, 50 the desktop
         // a crashed daemon left, 60 a `docker exec` shell, 0 its parent outside the namespace.
@@ -1108,26 +1135,47 @@ mod tests {
     }
 
     #[test]
-    fn for_memory_only_the_real_desktop_is_spared() {
-        let ps = |ppid, comm: &str, exe: &str| Ps {
+    fn for_memory_only_what_the_daemon_runs_is_spared_and_doubt_is_a_stray() {
+        let ps = |ppid, comm: &str| Ps {
             ppid,
             uid: 9,
             ticks: 7,
             comm: comm.into(),
-            exe: Some(exe.into()),
         };
+        // 10 the daemon, 11 the desktop it started, 12 that desktop's helper; 50 a desktop a
+        // crashed daemon left (or a program that took its name), 80 a process whose parent ended.
         let all = HashMap::from([
-            (1, ps(0, "init", "/sbin/init")),
-            (50, ps(1, "Xvfb", "/usr/bin/Xvfb")),
-            (51, ps(50, "xkbcomp", "/usr/bin/xkbcomp")),
-            (52, ps(1, "openbox", "/usr/bin/openbox")),
-            (60, ps(1, "Xvfb", "/zephyr/.local/bin/Xvfb")),
+            (1, ps(0, "init")),
+            (10, ps(1, "zephyr")),
+            (11, ps(10, "Xvfb")),
+            (12, ps(11, "xkbcomp")),
+            (50, ps(1, "Xvfb")),
+            (51, ps(50, "xkbcomp")),
+            (52, ps(1, "openbox")),
+            (60, ps(0, "bash")),
+            (80, ps(99, "orphan")),
         ]);
-        let mut loose = strays(&all, 9, 1, &[], false);
+        let mut loose = strays(&all, 9, 1, &[10], false);
         loose.sort();
         assert_eq!(loose, [], "kill_strays spares the desktop by name");
-        let mut strict = strays(&all, 9, 1, &[], true);
+        let mut strict = strays(&all, 9, 1, &[10], true);
         strict.sort();
-        assert_eq!(strict, [(51, 7), (60, 7)]);
+        assert_eq!(strict, [(50, 7), (51, 7), (52, 7), (80, 7)]);
+    }
+
+    #[test]
+    fn a_proc_that_cannot_be_read_is_doubt() {
+        let root = crate::test_dir("procs-scan");
+        let (all, complete) = processes_in(&root.join("missing"));
+        assert!(all.is_empty() && !complete, "no /proc at all");
+        let me = std::process::id();
+        std::fs::create_dir_all(root.join("41/stat")).unwrap(); // reads as an error, not gone
+        std::fs::create_dir_all(root.join("42")).unwrap(); // gone while read: no stat
+        std::os::unix::fs::symlink(format!("/proc/{me}"), root.join(me.to_string())).unwrap();
+        let (all, complete) = processes_in(&root);
+        assert!(!complete, "41 could not be read");
+        assert!(all.contains_key(&(me as i32)));
+        std::fs::remove_dir_all(root.join("41")).unwrap();
+        assert!(processes_in(&root).1, "a process that ended is not doubt");
     }
 }
