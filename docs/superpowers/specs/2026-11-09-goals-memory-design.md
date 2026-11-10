@@ -5,7 +5,7 @@ Sub-project **B** of the Muse-parity roadmap (the table is in
 `2026-11-07-settings-registry-design.md` §1). Depends on **S** (every new setting and list is a
 registry row, written through `set_setting`), **A1** (proposals and cards) and **A4**
 (`2026-11-09-activity-design.md`: the review shows its `/activity` for the day; this spec calls
-it and does not design it). Schema **v18**.
+it and does not design it). Schema **v17**.
 
 ## 1. Why
 
@@ -51,8 +51,6 @@ forget can say exactly what is gone and what is not.
 - Scrubbing `/forget`'s text from rpi session files, `state.db` (inbox, outbox, audit) or its
   backups. They are named in the reply instead (§4.6).
 - Memory import (Muse's .zip): imported text is untrusted by construction and would only wait.
-- Telling the owner that a rule stated in chat ("never share my address") is not enforced and
-  offering `/rule` (audit B's last point): one sentence of AGENTS.md, left to the owner (§6).
 - A host-side persona editor (`/persona set` takes several lines); any scanner on memory writes.
 
 ## 3. What changes in DESIGN.md
@@ -137,7 +135,7 @@ The daemon decides, from what it saw, never from what the agent writes. A run of
    any tool call of its own (the delayed-trigger attack, Gemini Feb 2025). New table
    `session_origin(session TEXT PRIMARY KEY, tainted TEXT, at INTEGER NOT NULL)`. `/new` (via
    `switch_main`, router.rs ~3120) inserts the new id with `tainted` NULL. A session with **no row**
-   counts as tainted: every conversation from before v18, every `/switch` back to one, and every
+   counts as tainted: every conversation from before v17, every `/switch` back to one, and every
    `task-*` and `job-*` session, which is never created clean. The first taint writes its reason
    (`exec at 14:02`, `task #7's report`) and is never cleared; `/undo` and `/compact` do not clean.
 2. **Every row the run took in is the owner's.** In `dispatch_new` (router.rs:1824), a row whose
@@ -363,8 +361,7 @@ report; if only `gc` fails, say the old commits are unreachable but still on dis
 
 ### 4.9 Upgrade
 
-The v18 migration (the roadmap's number; A4's draft needs no v17, see its open question 1, and
-v18 follows whatever v17 becomes):
+The v17 migration (A4 needs no schema change, so B takes the next number after A1's v16):
 
 ```sql
 CREATE TABLE session_origin(session TEXT PRIMARY KEY, tainted TEXT, at INTEGER NOT NULL);
@@ -374,7 +371,7 @@ ALTER TABLE jobs ADD COLUMN builtin TEXT;
 -- A fresh install's first conversation starts clean; an existing one stays tainted.
 INSERT INTO session_origin(session, tainted, at)
   SELECT 'main', NULL, unixepoch() WHERE NOT EXISTS (SELECT 1 FROM inbox);
-PRAGMA user_version = 18;
+PRAGMA user_version = 17;
 ```
 
 Existing installs: nothing changes until the owner's first `/new`; the waiting notice says so
@@ -398,7 +395,7 @@ Each piece starts with a failing test (CLAUDE.md, DESIGN §6).
   root commit, no other refs and `undo` refusing to pass it.
 - **`zephyr-policy`**: `gateway_kind` for `/goals`, `/persona`, `/goal …`, `/persona …`, over
   `CARD_CHARS`; fake-rpi.py's mirror changed in the same commit.
-- **Store tests**: v17 → v18 migration, the fresh-install row present only with an empty inbox;
+- **Store tests**: v16 → v17 migration, the fresh-install row present only with an empty inbox;
   `session_origin` default-tainted; `builtin` kept by `jobs()`; `remove_job` of the built-in row.
 - **Router integration tests** (`tests/router.rs`, fake-rpi): after `/new`, a prompt with
   `WRITE_MEMORY` and no tool call gives the `saved from your message` notice and the next child's
@@ -413,10 +410,10 @@ Each piece starts with a failing test (CLAUDE.md, DESIGN §6).
   diff, and a `/memory ok` after it keeps without a second ask; `Config::validate` refusing digest
   without `review.at`, and clearing `review.at` while digest is set.
 
-## 6. Open questions for the owner
+## 6. Decided with the owner (2026-11-10)
 
-1. Taint is sticky per conversation, so in a long-lived `main` that reads the web most days,
-   auto-approve will mostly fire just after a `/new`. That is the price of closing the in-context
-   delayed trigger. The looser rule (taint per run) is one line to change, but it reopens that hole.
-2. Should AGENTS.md tell the agent to say plainly that a rule stated in chat is not enforced and to
-   offer `gateway "/rule …"` (audit B), or does that wait for a later sub-project?
+1. Taint is sticky per conversation, as §4 says: auto-approve mostly fires just after a `/new`.
+2. AGENTS.md's `## Memory` section gains one sentence: a rule the owner states in chat is not
+   enforced until it is a rule, so the agent says so and offers `gateway "/rule …"` (audit B).
+3. A `zephyr.goals` attach method (`{}` → `{"goals": [{"n", "text", "done"}]}`, read-only; changes
+   go through the `/goal` commands as text) so the web app (W) need not parse reply text.

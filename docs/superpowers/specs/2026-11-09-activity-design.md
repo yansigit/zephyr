@@ -64,7 +64,7 @@ read nor write, but its views show only current state (`/held`, `/job list`, `/t
 - **No live push** on `zephyr.subscribe` (the tabs reload on opening and after a revoke), no
   host `zephyr activity` (`zephyr chat` reaches `/activity`), and no way for the agent to
   forget a target.
-- **No schema change**: everything fits the v16 tables (§4.2, §4.4), so A4 does not use v17
+- **No schema change**: everything fits the v16 tables (§4.2, §4.4), so A4 takes no schema number (B takes v17)
   (open question 1).
 
 ## 3. What changes in DESIGN.md
@@ -361,12 +361,8 @@ A plain age cut would break two things; the guards prevent both:
 - **TUI screens** (`tests/screens/`): the Activity lines (`tool` muted) and the next page at the
   bottom; `r` on a Grants row sends its revoke and reloads; an old daemon's empty tab.
 
-## Open questions for the owner
+## Decided with the owner (2026-11-10)
 
-1. A4 needs no schema change, so v17 is unused. Should the next sub-project that needs a
-   migration take v17, or keep the version numbers as the roadmap assigned them, leaving a gap?
-2. Should the grants view also list vault grants (names and programs only, `/vault revoke …`
-   beside each)? That would put every standing grant in one place, at the cost of reading
-   `vault.toml` for a listing `/vault` already gives.
-3. Should `/activity` (not grants) remain readable by the agent? It helps when the owner asks
-   in conversation, but it also shows the agent the gate's decisions on its own calls.
+1. A4 takes no schema number; B takes v17 and W v18.
+2. The grants view leaves vault grants out; `/vault` lists them.
+3. `/activity` (not `/activity grants`) stays readable by the agent through `gateway`.

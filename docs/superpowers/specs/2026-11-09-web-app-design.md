@@ -48,7 +48,7 @@ The Muse audit (`reports/Muse agent audit.md`, W section) sets these rules:
   setting, is signed over a challenge that commits to the effect.
 - **Push.** Web Push (VAPID, RFC 8291) for new cards, and for replies while no web client is
   connected. Notification buttons approve only messages and posts that need no strong channel.
-- **Storage.** Schema **v19**: passkey credentials, push subscriptions, web sessions.
+- **Storage.** Schema **v18**: passkey credentials, push subscriptions, web sessions.
 - **Checks.** Origin and Host checks, `__Host-` cookies, session lifetimes, rate limits. The
   Tailscale identity headers never authenticate.
 
@@ -470,9 +470,9 @@ TUI's `view::clean`.
 The socket reconnects with backoff (1 s doubling to 30 s) and subscribes again. A 401 goes back to
 sign-in.
 
-### 4.9 Storage: schema v19
+### 4.9 Storage: schema v18
 
-`SCHEMA_VERSION` becomes 19. B takes v18, and A4 needs none (its open question 1).
+`SCHEMA_VERSION` becomes 18. B takes v17; A4 needs none.
 
 ```sql
 CREATE TABLE web_passkeys(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
@@ -486,7 +486,7 @@ CREATE TABLE web_push(id INTEGER PRIMARY KEY, endpoint TEXT NOT NULL UNIQUE,
     p256dh BLOB NOT NULL, auth BLOB NOT NULL,
     passkey INTEGER NOT NULL REFERENCES web_passkeys(id) ON DELETE CASCADE,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()));
-PRAGMA user_version = 19;
+PRAGMA user_version = 18;
 ```
 
 The enrolment code and the user handle live in `meta`. Challenges and rate counters live in
@@ -510,7 +510,7 @@ Changed files:
   methods.
 - `router.rs`: the channel on three requests, `attached()`, `push_cards`, the flush hook, `/web`,
   `AttachRequest::Card`, and the `select!` arm.
-- `config.rs`, `settings.rs` and `store.rs`: v19 and `proposal_digest`.
+- `config.rs`, `settings.rs` and `store.rs`: v18 and `proposal_digest`.
 - `retention.rs`, `reload.rs`, and `main.rs` (the in-container `zephyr web enrol`).
 - `host/mod.rs`: `web setup|enrol`, and the publish line under A2.
 - `doctor`: the listener and the VAPID key.
@@ -568,7 +568,7 @@ Each piece starts with a failing test (CLAUDE.md, DESIGN §6).
   - `app.js` holds no `innerHTML`, `insertAdjacentHTML`, `outerHTML`, `eval(` or `new Function`,
     and `index.html` holds no inline `<script>` or `style=`.
 - **Store.**
-  - The v19 migration on a v18 database.
+  - The v18 migration on a v17 database.
   - A passkey's delete cascades to its sessions and pushes.
   - `proposal_digest` changes when any column `/ok` reads changes.
 - **Integration, `tests/web.rs`.** Fake-rpi with `[web] host = "zephyr.test"`, reqwest setting

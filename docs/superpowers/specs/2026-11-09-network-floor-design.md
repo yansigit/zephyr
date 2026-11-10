@@ -439,13 +439,11 @@ Each piece starts with a failing test (CLAUDE.md, DESIGN §6).
 - **Manual, with the pinned rpi**: an `openai-codex` and an `antigravity` login completed by
   pasting the failed callback address, from the host `zephyr login` and from a channel's `/login`.
 
-## Open questions for the owner
+## Decided with the owner (2026-11-10)
 
-1. Upgrades default to `bridge` (this spec) rather than staying on `host` until the owner opts in.
-   Is that right?
-2. Webhook publishing: on the Tailscale IP (this spec, with the boot-ordering risk), or
-   `tailscale serve --tcp 7791 tcp://127.0.0.1:7791` on the host, with Docker publishing on loopback
-   only? The second has no ordering risk but needs tailscale operator rights at `init`.
-3. Ports without asking: only 80 and 443, or also 8443 and others?
-4. The host's own public address (VPS installs): leave it as a non-goal, or pass the host's
-   addresses into the container at `up` so the proxy denies them (they go stale on a change of IP)?
+1. Upgrades default to `bridge`; `network = "host"` in host.toml goes back.
+2. The iMessage webhook is published on host loopback only, and the owner fronts it with
+   `tailscale serve --tcp 7791 tcp://127.0.0.1:7791` (no boot-ordering risk; the web app, W,
+   already needs `tailscale serve`). §4 is amended to match when this is built.
+3. Only ports 80 and 443 without asking; anything else is a `network.allow` entry.
+4. The host's own public address on a VPS stays a non-goal.
