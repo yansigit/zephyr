@@ -1,4 +1,4 @@
-//! The network floor (DESIGN §4.19): the agent's uid has no route out but the proxy here, which
+//! The network floor (DESIGN §4.20): the agent's uid has no route out but the proxy here, which
 //! connects only to addresses it has checked.
 
 use anyhow::Context;
@@ -756,7 +756,7 @@ async fn forward(
     Ok(reply.map(|body| idle(body).boxed_unsync()))
 }
 
-/// The rules that leave the agent's uid no route but its own loopback (DESIGN §4.19). The jump
+/// The rules that leave the agent's uid no route but its own loopback (DESIGN §4.20). The jump
 /// is on the agent's uid, so a packet with no socket (a kernel reset) falls through to accept;
 /// TCP is reset, so a connect fails at once instead of timing out; and there is no port list,
 /// because nothing of root's listens on loopback but the proxy. The `allow` set holds the
@@ -1016,7 +1016,7 @@ fn allow_in(config: &std::path::Path) -> Option<String> {
     )
 }
 
-/// Keeps the agent's direct routes in step with `network.allow` (DESIGN §4.19), for the
+/// Keeps the agent's direct routes in step with `network.allow` (DESIGN §4.20), for the
 /// programs that speak no proxy: a mail client, `ssh`, a database client. Run by `supervise`,
 /// which alone holds NET_ADMIN; the daemon cannot change the rules. Every 5 s it reads the
 /// setting, and when it changed, or an hour has passed (a minute, while an entry has no route),

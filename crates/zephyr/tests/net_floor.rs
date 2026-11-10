@@ -1,4 +1,4 @@
-//! The network floor against a real container (DESIGN §4.19): as the agent's uid nothing is
+//! The network floor against a real container (DESIGN §4.20): as the agent's uid nothing is
 //! reachable but the daemon's proxy, and the proxy refuses what it must.
 //!
 //! Ignored: it needs Docker and a side container already up, made beside any live install with

@@ -294,7 +294,7 @@ pub async fn run<C: Channel>(
         r = runs => r.map(|_| Exit::Shutdown),
         // Tasks' and jobs' sends, every connector call, the browser's clicks (approvals §4.2).
         r = crate::gate::serve(gate_cfgs, gate_snap, waits, &jobs, gate_notes) => r.map(|()| Exit::Shutdown),
-        // The agent's only way out, in bridge mode (DESIGN §4.19).
+        // The agent's only way out, in bridge mode (DESIGN §4.20).
         r = crate::egress::serve(egress_cfgs, &jobs) => r.map(|()| Exit::Shutdown),
         r = crate::attach::serve(cfg, tx, attach_tx, snap_rx, attach_cfgs) => r.map(|()| Exit::Shutdown),
         r = crate::scheduler::run(cfg_rx.clone(), &jobs) => r.map(|()| Exit::Shutdown),
@@ -916,7 +916,7 @@ impl<'a> Router<'a> {
     }
 
     /// Tells the owner, once, when the daemon listens on a port its container does not publish
-    /// (DESIGN §4.19): zephyr.toml was edited by hand, and only `zephyr up` publishes a port. Not
+    /// (DESIGN §4.20): zephyr.toml was edited by hand, and only `zephyr up` publishes a port. Not
     /// before `UNPUBLISHED_WAIT`: the host's `config set` and `channel` commands make the new
     /// container themselves, and that takes this daemon down before it has said anything.
     fn unpublished_notice(&mut self) {

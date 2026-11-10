@@ -80,7 +80,7 @@ pub struct Config {
     /// `[settings]`: who may loosen a protected setting (settings spec §2).
     #[serde(default)]
     pub settings: Settings,
-    /// `[network]`: where the agent may connect beyond public ports 80 and 443 (DESIGN §4.19).
+    /// `[network]`: where the agent may connect beyond public ports 80 and 443 (DESIGN §4.20).
     #[serde(default)]
     pub network: Network,
     /// `[approvals]`: how messages, posts and payments wait for the owner (approvals spec §4.3).
@@ -98,7 +98,7 @@ pub struct Config {
     /// tests set a fake.
     #[serde(skip, default = "agent_browser")]
     pub agent_browser: PathBuf,
-    /// Whether the agent runs under the network floor (DESIGN §4.19): `ZEPHYR_NETWORK=bridge`.
+    /// Whether the agent runs under the network floor (DESIGN §4.20): `ZEPHYR_NETWORK=bridge`.
     /// An OAuth sign-in then takes the address its callback could not reach. Not configurable;
     /// tests set it.
     #[serde(skip, default = "floor")]
@@ -202,7 +202,7 @@ fn default_parallel() -> usize {
     2
 }
 
-/// `[network]` (DESIGN §4.19).
+/// `[network]` (DESIGN §4.20).
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Network {

@@ -461,7 +461,7 @@ impl Channel for IMessage {
 
     async fn run(&self, tx: mpsc::Sender<Inbound>) -> anyhow::Result<()> {
         // Under the network floor `listen` is where the host publishes the webhook; the daemon
-        // itself binds the container's own address (DESIGN §4.19).
+        // itself binds the container's own address (DESIGN §4.20).
         let addr = crate::egress::listen_addr(self.listen)?;
         let listener = TcpListener::bind(addr)
             .await

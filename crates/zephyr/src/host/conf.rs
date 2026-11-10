@@ -234,7 +234,7 @@ impl Data {
         }
         doc["network"] = value("bridge");
         if let Some(mut key) = doc.key_mut("network") {
-            let note = "# \"host\" runs without the network floor (DESIGN §4.19)\n";
+            let note = "# \"host\" runs without the network floor (DESIGN §4.20)\n";
             key.leaf_decor_mut().set_prefix(note);
         }
         self.write("host.toml", &doc.to_string())

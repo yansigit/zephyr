@@ -29,7 +29,7 @@ pub struct Policy {
     pub check: Duration,
     pub grace: Duration,
     pub stale: Duration,
-    /// Loads the agent's network floor before the first start (DESIGN §4.19); `None` outside
+    /// Loads the agent's network floor before the first start (DESIGN §4.20); `None` outside
     /// bridge mode. When it fails, the daemon is never started.
     pub floor: Option<fn() -> anyhow::Result<()>>,
 }

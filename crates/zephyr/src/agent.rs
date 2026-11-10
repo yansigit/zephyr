@@ -57,7 +57,7 @@ pub const AGENT_PATH: &str = "/opt/zephyr/gate/bin:/zephyr/.local/bin:/opt/zephy
 /// The daemon's proxy, the agent's only way out under the network floor (`egress::PORT`).
 const PROXY: &str = "http://127.0.0.1:7792";
 
-/// What points the agent's programs at the proxy (DESIGN §4.19). No `ALL_PROXY`: rpi 0.18
+/// What points the agent's programs at the proxy (DESIGN §4.20). No `ALL_PROXY`: rpi 0.18
 /// refuses a proxy URL that is not HTTP. Node's `fetch` ignores the rest without the last one.
 pub const PROXY_ENV: &[(&str, &str)] = &[
     ("HTTP_PROXY", PROXY),

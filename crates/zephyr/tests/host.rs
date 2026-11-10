@@ -333,7 +333,7 @@ fn find_agent<'a>(calls: &'a [Vec<String>], rest: &[&str]) -> &'a Vec<String> {
 }
 
 /// A `docker exec` as the agent with `proxy` after its PATH: the network floor's variables
-/// (DESIGN §4.19), or nothing under host networking.
+/// (DESIGN §4.20), or nothing under host networking.
 fn find_agent_with<'a>(calls: &'a [Vec<String>], proxy: &[&str], rest: &[&str]) -> &'a Vec<String> {
     let ids = ids();
     let path = format!("PATH={AGENT_PATH}");
@@ -699,7 +699,7 @@ fn init_non_interactive_builds_the_layout_and_starts_the_container() {
         ["--security-opt", "no-new-privileges"],
         ["--pids-limit", "4096"],
         ["-w", "/"],
-        // The network floor (DESIGN §4.19): its own bridge, the capabilities `supervise` loads
+        // The network floor (DESIGN §4.20): its own bridge, the capabilities `supervise` loads
         // the rules with and then drops, and only zephyr's port published, on loopback.
         ["--network", CONTAINER],
         ["--hostname", "zephyr"],
@@ -716,7 +716,7 @@ fn init_non_interactive_builds_the_layout_and_starts_the_container() {
     let host = std::fs::read_to_string(daemon.join("host.toml")).unwrap();
     assert!(host.contains("network = \"bridge\""), "{host}");
     assert!(
-        host.contains("# \"host\" runs without the network floor (DESIGN §4.19)"),
+        host.contains("# \"host\" runs without the network floor (DESIGN §4.20)"),
         "{host}"
     );
     // The network was there (the shim's `network inspect` succeeds), so none is created.
@@ -1688,7 +1688,7 @@ fn shell_opens_a_login_shell_as_the_agent() {
             "-l",
         ];
         assert!(call.ends_with(&tail.map(String::from)), "{call:?}");
-        // The agent's shell has no route out but the proxy (DESIGN §4.19).
+        // The agent's shell has no route out but the proxy (DESIGN §4.20).
         assert!(
             has_pair(call, "-e", "HTTPS_PROXY=http://127.0.0.1:7792"),
             "{call:?}"
@@ -2069,7 +2069,7 @@ fn config_set_of_a_published_port_recreates_the_container() {
 fn up_from_a_host_networking_container_explains_the_floor() {
     const NOTICE: &str =
         "the agent now reaches the internet only through zephyr's proxy: ports 80 \
-        and 443 to public addresses (DESIGN §4.19). Other destinations: /set network.allow \
+        and 443 to public addresses (DESIGN §4.20). Other destinations: /set network.allow \
         HOST:PORT. Sign-ins: paste the address the browser cannot open. To go back: network = \
         \"host\" in host.toml, then zephyr up.";
     let env = Env::new("net-migrate");

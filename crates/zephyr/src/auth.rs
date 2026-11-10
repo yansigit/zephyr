@@ -521,7 +521,7 @@ pub async fn start(
         inner.input = Some(input);
         // Now that there is a child to write to: a key provider is ready for the token from
         // here on. An OAuth one stays `waiting` for the browser, except under the network floor
-        // (DESIGN §4.19), where the redirect to 127.0.0.1 never gets to the container and the
+        // (DESIGN §4.20), where the redirect to 127.0.0.1 never gets to the container and the
         // owner pastes its address instead. `input` refuses a line in any other phase.
         if p.kind != Kind::Oauth || cfg.floor {
             inner.phase = Phase::NeedInput;

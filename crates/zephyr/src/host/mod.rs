@@ -200,7 +200,7 @@ impl Host {
         floored(&self.container_env())
     }
 
-    /// Whether host.toml asks for the network floor (DESIGN §4.19): `network = "bridge"`, the
+    /// Whether host.toml asks for the network floor (DESIGN §4.20): `network = "bridge"`, the
     /// default, or `"host"`, which runs without it. This is what `up` makes; what runs now is
     /// `floored`.
     pub(crate) fn bridge(&self) -> anyhow::Result<bool> {
@@ -243,7 +243,7 @@ impl Host {
         self.state().as_deref() == Some("running")
     }
 
-    /// The container's network: `host`, or the bridge network's name (DESIGN §4.19).
+    /// The container's network: `host`, or the bridge network's name (DESIGN §4.20).
     fn network_mode(&self) -> Option<String> {
         inspect(&self.container, "{{.HostConfig.NetworkMode}}")
     }
@@ -483,7 +483,7 @@ impl Host {
         self.wait_ready()
     }
 
-    /// The container's network arguments. Under the network floor (DESIGN §4.19): a bridge
+    /// The container's network arguments. Under the network floor (DESIGN §4.20): a bridge
     /// network of its own, made when missing; its address under the name `zephyr`; NET_ADMIN,
     /// which `supervise` loads the agent's rules with, and SETPCAP, which lets it drop both from
     /// the daemon it starts; and each of the daemon's ports published on this host's loopback
@@ -1050,7 +1050,7 @@ pub(crate) fn state(container: &str) -> Option<String> {
 /// What `up` says once when it moves a container from host networking to the network floor.
 const FLOOR_NOTICE: &str =
     "the agent now reaches the internet only through zephyr's proxy: ports 80 \
-    and 443 to public addresses (DESIGN §4.19). Other destinations: /set network.allow HOST:PORT. \
+    and 443 to public addresses (DESIGN §4.20). Other destinations: /set network.allow HOST:PORT. \
     Sign-ins: paste the address the browser cannot open. To go back: network = \"host\" in \
     host.toml, then zephyr up.";
 

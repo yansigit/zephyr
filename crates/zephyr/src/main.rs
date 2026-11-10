@@ -61,7 +61,7 @@ async fn zephyr_main() -> ExitCode {
     if cmd == "__file" {
         return file_cmd(&args.collect::<Vec<_>>());
     }
-    // Run as the agent, which cannot read the config: what its uid can reach (DESIGN §4.19).
+    // Run as the agent, which cannot read the config: what its uid can reach (DESIGN §4.20).
     if cmd == "__netcheck" {
         return zephyr::egress::netcheck(&args.collect::<Vec<_>>());
     }
@@ -613,7 +613,7 @@ fn check(label: &str, ok: bool) -> bool {
     ok
 }
 
-/// The network floor (DESIGN §4.19), proved by probing as the agent (`zephyr __netcheck`), and
+/// The network floor (DESIGN §4.20), proved by probing as the agent (`zephyr __netcheck`), and
 /// that nothing of root's listens where the agent's uid is let through. Under host networking,
 /// one warning.
 async fn network_floor(cfg: &Config) -> bool {

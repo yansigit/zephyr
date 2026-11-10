@@ -119,7 +119,7 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   from `Store::activity` (one `UNION ALL` over audit, settings_log, command proposals, runs, tasks
   and procs, keyset-paged by `store::Cursor`), every text scrubbed at read (`gate::Scrub`, then
   `settings::one_line`). The model never writes it.
-- `egress.rs` (DESIGN §4.19): the network floor. In bridge mode (`ZEPHYR_NETWORK=bridge`, set by
+- `egress.rs` (DESIGN §4.20): the network floor. In bridge mode (`ZEPHYR_NETWORK=bridge`, set by
   `zephyr up` unless host.toml says `network = "host"`) the agent's uid has no route but its own
   loopback and the proxy on `127.0.0.1:7792` (`serve`, in the router's `select!`). `public` (IPv4
   denylist, IPv6 allowlist, so no IPv4-embedding form passes) and `decide` (ports 80 and 443, or
