@@ -340,7 +340,11 @@ pub fn grants(cfg: &Config, store: &Store, now: i64) -> rusqlite::Result<Vec<Gra
             created,
             format!("#{}", job.id),
             shown,
-            Some(format!("/job rm {}", job.id)),
+            // The daily review is `review.at`'s, which `/job rm` points at anyway (DESIGN §4.5).
+            Some(match job.builtin {
+                Some(_) => "/set review.at none".into(),
+                None => format!("/job rm {}", job.id),
+            }),
         ));
     }
     Ok(out)

@@ -1930,7 +1930,7 @@ impl Store {
         let mut stmt = self.db.prepare(&format!(
             "SELECT {JOB_COLUMNS}, jobs.created_at FROM jobs WHERE enabled = 1 ORDER BY id"
         ))?;
-        let rows = stmt.query_map([], |r| Ok((job_row(r, 0)?, r.get(7)?)))?;
+        let rows = stmt.query_map([], |r| Ok((job_row(r, 0)?, r.get(8)?)))?;
         rows.collect()
     }
 

@@ -9,8 +9,9 @@ use crate::store::{JobRun, Store};
 pub const PROMPT: &str = "This is the owner's daily review; the record above is zephyr's. In at most 10 lines: for each goal, what moved today and one next step you could take. Do not start work and do not change memory. If there is nothing useful to say, reply exactly [SILENT].";
 
 const BUILTIN: &str = "review";
-/// The activity part's longest text.
+/// The activity part's longest text, and the most records it reads.
 const ACTIVITY_CHARS: usize = 3000;
+const ACTIVITY_RECORDS: u32 = 50;
 
 /// Brings the built-in job in step with `review.at`: made (counted from now), moved or removed.
 /// Run at the scheduler's start and at each config change.
@@ -54,11 +55,17 @@ fn cut(text: &str) -> String {
     }
 }
 
-/// The activity since `since`, one line a record, newest first.
-// shortcut: A4's Store::activity is not merged yet, the rebase onto claude/activity fills this in
-// with `store.activity(since, &[], None, 50)` rendered by its line renderer.
-fn activity_block(_store: &Store, _since: i64) -> Result<String, String> {
-    Ok(String::new())
+/// The activity since `since` (DESIGN §4.19, every kind but `tool`), at most 50 records, newest
+/// first, one line each as `/activity` shows them: scrubbed of vault and fact values.
+fn activity_block(cfg: &Config, store: &Store, since: i64, now: i64) -> Result<String, String> {
+    let tz = crate::scheduler::zone(cfg).unwrap_or(jiff::tz::TimeZone::UTC);
+    let records = store.activity(since, &[], None, ACTIVITY_RECORDS);
+    let records = records.map_err(|e| e.to_string())?;
+    let scrub = crate::gate::Scrub::load(cfg);
+    let lines = records
+        .iter()
+        .map(|r| crate::activity::entry(r, &scrub, now, &tz).line);
+    Ok(lines.collect::<Vec<_>>().join("\n"))
 }
 
 /// The daemon's part of the review, composed with no model. `None` when there is nothing to
@@ -67,7 +74,7 @@ pub fn block(cfg: &Config, store: &Store, since: i64, now: i64) -> Option<String
     let tz = crate::scheduler::zone(cfg).unwrap_or(jiff::tz::TimeZone::UTC);
     let clock = |at| crate::settings::clock(at, &tz);
     let goals = crate::memory::read_goals(cfg.state_dir()).unwrap_or_default();
-    let activity = activity_block(store, since);
+    let activity = activity_block(cfg, store, since, now);
     let digest = crate::memory::digest(&cfg.home, cfg.state_dir(), store, since, &tz);
     let quiet = matches!(&activity, Ok(a) if a.is_empty()) && matches!(digest, Ok(None));
     if goals.is_empty() && quiet {
@@ -227,20 +234,24 @@ mod tests {
         let date = jiff::Timestamp::from_second(now)
             .unwrap()
             .to_zoned(utc.clone());
-        let at = store.goals_done_since(0).unwrap()[0].at;
+        let done = store.goals_done_since(0).unwrap();
+        let (at, at_run) = (done[0].at, done[1].at);
         let sha = store.memory_commits_since(0).unwrap()[0].sha.clone();
         let commit_at = store.memory_commits_since(0).unwrap()[0].at;
         assert_eq!(
             block(&cfg, &store, since, now).unwrap(),
             format!(
                 "[zephyr] daily review, {}\nGoals\n1. Ship zephyr 0.8\nDone since the last review: \
-                 Renew passport (you, {}), Run (proposed as #4, {})\nActivity since {}\nnothing \
-                 recorded\nMemory\n- {} {} from task #1\nWaiting (/memory ok keeps it, /memory undo \
+                 Renew passport (you, {}), Run (proposed as #4, {})\nActivity since {}\n{} setting \
+                 agent on chat (#4): goal Run → done\n{} setting owner on chat: goal Renew passport \
+                 → done\nMemory\n- {} {} from task #1\nWaiting (/memory ok keeps it, /memory undo \
                  drops it):\nMEMORY.md\n+ likes tea",
                 date.strftime("%a %-d %b"),
                 clock(at),
-                clock(at),
+                clock(at_run),
                 clock(since),
+                clock(at_run),
+                clock(at),
                 clock(commit_at),
                 &sha[..7],
             )
@@ -305,5 +316,20 @@ mod tests {
         assert_eq!((moved.id, moved.schedule.as_str()), (job.id, "30 21 * * *"));
         sync(&mut store, &off).unwrap();
         assert_eq!(store.builtin_job("review").unwrap(), None);
+    }
+
+    #[test]
+    fn the_review_job_is_a_grant_taken_back_with_review_at_none() {
+        let on = cfg(Some("21:30"));
+        let mut store = ready(&on);
+        sync(&mut store, &on).unwrap();
+        let g = crate::activity::grants(&on, &store, crate::now()).unwrap();
+        let lines: Vec<&str> = g.iter().map(|g| g.line.as_str()).collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("review") && l.ends_with("/set review.at none")),
+            "{lines:?}"
+        );
     }
 }

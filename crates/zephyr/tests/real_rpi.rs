@@ -193,10 +193,11 @@ async fn real_rpi_round_trip_and_kill_mid_run() {
 #[tokio::test]
 #[ignore = "needs the pinned rpi binary"]
 async fn real_rpi_keeps_a_conversation_clean_across_runs_and_a_restart() {
-    if !std::path::Path::new(RPI).exists() {
-        skip_without_rpi(RPI);
+    if !std::path::Path::new(&*RPI).exists() {
+        skip_without_rpi(&*RPI);
         return;
     }
+    let rpi: &str = &RPI;
     let port = stub_provider(Default::default(), Default::default()).await;
     let home = std::env::temp_dir().join(format!(
         "zephyr-real-clean-{}-{}",
@@ -211,7 +212,7 @@ async fn real_rpi_keeps_a_conversation_clean_across_runs_and_a_restart() {
     )
     .unwrap();
     let cfg: Config = toml::from_str(&format!(
-        "rpi = {RPI:?}\nhome = {home:?}\nagent_dir = {agent:?}\nmodel = \"stub/m\"\n[owners]\nchat = [\"owner\"]\n"
+        "rpi = {rpi:?}\nhome = {home:?}\nagent_dir = {agent:?}\nmodel = \"stub/m\"\n[owners]\nchat = [\"owner\"]\n"
     ))
     .unwrap();
     let (feed, rx) = mpsc::channel(4);

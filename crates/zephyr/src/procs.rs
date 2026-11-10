@@ -1153,6 +1153,7 @@ mod tests {
             (51, ps(50, "xkbcomp")),
             (52, ps(1, "openbox")),
             (60, ps(0, "bash")),
+            (61, ps(60, "zephyr")), // doctor's `__netcheck`, run as the agent under a docker exec
             (80, ps(99, "orphan")),
         ]);
         let mut loose = strays(&all, 9, 1, &[10], false);
