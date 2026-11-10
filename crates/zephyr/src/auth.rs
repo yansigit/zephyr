@@ -186,7 +186,8 @@ enum Phase {
     /// The child is running and has not finished; it may still print a URL.
     #[default]
     Waiting,
-    /// The provider wants a key on stdin (`zephyr.login_input`).
+    /// The child takes a line on stdin (`zephyr.login_input`, `/login paste`): a key, or the
+    /// callback address of an OAuth sign-in.
     NeedInput,
     /// `rpi auth check` passed and the `[[account]]` row is going into `zephyr.toml`: set under
     /// the login's own lock, immediately before `record` writes. A cancel that lands during the
@@ -362,8 +363,8 @@ pub fn input(id: &str, text: &str) -> bool {
     };
     let text = text.trim().to_string();
     let mut inner = lock(&login.inner);
-    // Only at the prompt it was asked at: a line typed into a `waiting` OAuth login (or after the
-    // child is gone) is not input, and must not be kept as a secret either.
+    // Only while the child takes one: a line typed before it is there (or after it is gone) is
+    // not input, and must not be kept as a secret either.
     if inner.phase != Phase::NeedInput {
         return false;
     }
@@ -518,11 +519,11 @@ pub async fn start(
     {
         let mut inner = lock(&login.inner);
         inner.input = Some(input);
-        // Now that there is a child to write the key to: a key provider is ready for the token
-        // from here on, and `input` refuses it in any other phase.
-        if p.kind != Kind::Oauth {
-            inner.phase = Phase::NeedInput;
-        }
+        // Now that there is a child to write to: a key provider is ready for the token from
+        // here on, and an OAuth one for the address its callback could not reach (under the
+        // network floor the browser's redirect to 127.0.0.1 never gets to the container, DESIGN
+        // §4.19). `input` refuses a line in any other phase.
+        inner.phase = Phase::NeedInput;
         inner.child = Some(child);
         // From here the login releases the name when its phase turns terminal.
         inner.reserved = Some(reserved);

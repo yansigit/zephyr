@@ -81,7 +81,11 @@ by hand that is looser than the preset is cleared); without it a non-interactive
 
 Sign in from the running gateway too, with no re-exec afterwards. In `zephyr attach`, `/login`
 lists the providers and Enter starts the one you pick: an OAuth provider (Antigravity,
-ChatGPT/Codex) prints a URL to open in a browser on your machine; nothing else is needed. The
+ChatGPT/Codex) prints a URL to open in a browser on your machine. After you sign in there, the
+browser is sent to an address on `127.0.0.1` that it cannot open (the sign-in runs in the
+container, behind the [network floor](#the-agents-network)): copy that address from the address
+bar and paste it into the panel's input row, or at the prompt of `zephyr login` on the host, or
+send `/login paste ADDRESS` on the channel you started it from. The
 others ask for a key or a token, which is typed masked, goes to the sign-in once and is never
 shown or kept. From any channel, `/login PROVIDER [ACCOUNT] [MODEL]` can start a sign-in too, but
 only an OAuth one: a `key` or a token provider is refused there, so use `zephyr login` on the host,
@@ -217,7 +221,9 @@ agent to finish (or `/stop` it). `/usage [DAYS]` lists
 the spend per day and per account over the last 7 days, or `DAYS`.
 `/login` signs an account in from here: `/login` lists the provider ids, `/login PROVIDER [ACCOUNT]
 [MODEL]` starts an OAuth sign-in and needs no re-exec (a key or a token is refused — it is typed in
-`zephyr attach`, which masks it), and `/login cancel [ID|PROVIDER]` stops the ones you gave up on.
+`zephyr attach`, which masks it), `/login paste ADDRESS` finishes yours with the `127.0.0.1` address
+the browser could not open (never a token), and `/login cancel [ID|PROVIDER]` stops the ones you
+gave up on.
 The first account of an empty install does restart the agent once, when idle: there is nothing for
 it to start on until that account exists.
 

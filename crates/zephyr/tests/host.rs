@@ -1175,7 +1175,12 @@ fn login_feeds_secrets_on_stdin_and_records_the_account() {
     assert_eq!(mode(&env.data().join("accounts/claude-main")), 0o700);
 
     // OAuth providers run rpi's own login on a terminal; with no --model the first listed one is used.
-    env.ok(&["login", "openai-codex", "--no-verify"]);
+    let said = env.ok(&["login", "openai-codex", "--no-verify"]);
+    // Under the network floor the provider's callback cannot reach the container.
+    assert!(
+        said.starts_with("if the browser then cannot open 127.0.0.1, paste its address here\n"),
+        "{said}"
+    );
     let calls = env.calls();
     let login = find_agent(
         &calls,

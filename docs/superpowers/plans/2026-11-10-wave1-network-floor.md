@@ -306,14 +306,17 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
 - Host `zephyr login`, before the interactive OAuth `run`, prints `if the browser then cannot open 127.0.0.1, paste its address here`.
 - fake-rpi: the `login_url` branch prints `Paste OAuth code or response:` after the URL, then finishes on `login_go` **or** on a non-empty stdin line. A non-empty line logs `{"type": "auth-paste"}` (never the text) to `log.jsonl`.
 
-- [ ] **Step 1: Write the failing tests** in `tests/login.rs`:
+- [x] **Step 1: Write the failing tests** in `tests/login.rs`:
   - `a_pasted_callback_address_finishes_an_oauth_login_and_is_redacted`: start `antigravity` with `login_url`, wait for the URL, `auth::input(id, "http://127.0.0.1:1455/cb?code=SECRETCODE")` is true, and the login gets to `done`. `log.jsonl` has `auth-paste`, and no poll's `lines` contains `SECRETCODE`.
   - In `an_oauth_login_reports_its_url_then_finishes_when_the_browser_returns`, the waiting phase is now `need_input`.
   - `a_channel_pastes_the_callback_into_its_own_oauth_login`: owner A on discord runs `/login antigravity`, and the notice contains `/login paste`. Owner B's `/login paste http://127.0.0.1:1455/cb?code=X` gets the no-sign-in reply. `/login paste sk-ant-abc` gets the refusal. A's paste gets `sent to the antigravity sign-in` and later `done`.
   - `tests/host.rs`: an interactive OAuth `zephyr login` prints the hint before the `docker exec -it`.
-- [ ] **Step 2:** `cargo test -p zephyr --test login` → FAIL. **Step 3:** Implement Rust and fake-rpi together. **Step 4:** Run `cargo test -p zephyr --test login --test host --test router` and `cargo test -p zephyr --lib tui` → PASS.
-- [ ] **Step 5: Docs.** DESIGN §4.7.1: the callback no longer reaches the container, so the owner pastes the address. The text is kept only to redact the echo, and a channel paste stays in that inbox row as any message does (a used, single-use code). README covers sign-ins.
-- [ ] **Step 6:** Commit `feat(auth): finish an OAuth sign-in from the address the browser could not open`.
+- [x] **Step 2:** `cargo test -p zephyr --test login` → FAIL. **Step 3:** Implement Rust and fake-rpi together. **Step 4:** Run `cargo test -p zephyr --test login --test host --test router` and `cargo test -p zephyr --lib tui` → PASS.
+- [x] **Step 5: Docs.** DESIGN §4.7.1: the callback no longer reaches the container, so the owner pastes the address. The text is kept only to redact the echo, and a channel paste stays in that inbox row as any message does (a used, single-use code). README covers sign-ins.
+- [x] **Step 6:** Commit `feat(auth): finish an OAuth sign-in from the address the browser could not open`.
+- Deviation: a posted login is not only pruned when it ends: the tick posts `signed in to …` or `signing in to … failed` for it first, so the owner who pasted on a channel hears how it ended.
+- Deviation: the host `zephyr login` prints its hint only when host.toml asks for the network floor; with `network = "host"` the callback still reaches the container. The channel test uses two senders on the `chat` channel, which is what the router keys a login on (channel and sender).
+- Deviation: seen once in a full run, unrelated to this lane: `tests/cli.rs` `status_shows_the_main_child_the_waiting_message_and_the_replies` read `101s ago` where it expects `100s ago` (a second ticked between its UPDATE and the status call). It passes alone and on the rerun.
 
 ### Task A2-9: §4.19, and the side-container check
 

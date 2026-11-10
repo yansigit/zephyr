@@ -412,6 +412,9 @@ struct Router<'a> {
     auth_stamp: Option<SystemTime>,
     /// Sign-ins `/login` started whose URL is not out yet.
     logins: Vec<Login>,
+    /// The `/login` sign-ins whose URL was posted and that have not ended: `/login paste` feeds
+    /// the sender's own, and the tick posts how each ended.
+    posted: Vec<Login>,
     /// `/login` starts still running: the tick drains them, so this loop never waits on rpi.
     starting: Vec<Starting>,
     /// The `/btw` side question being answered (`crate::btw::run`), one at a time.
@@ -571,6 +574,7 @@ impl<'a> Router<'a> {
             reexec: false,
             auth_stamp: None,
             logins: Vec::new(),
+            posted: Vec::new(),
             starting: Vec::new(),
             btw: None,
             store: Store::open(&cfg.db_path())?,
@@ -2919,6 +2923,7 @@ impl<'a> Router<'a> {
             return format!(
                 "[zephyr] /login PROVIDER [ACCOUNT] [MODEL]\nproviders: {}\n\
                  /login cancel [ID|PROVIDER] stops a sign-in, so a refused one can be retried.\n\
+                 /login paste ADDRESS finishes one whose page could not open 127.0.0.1.\n\
                  A provider that takes a key or a setup token is signed in on the host: \
                  `zephyr login PROVIDER`. Never paste a token here.",
                 ids()
@@ -2928,6 +2933,9 @@ impl<'a> Router<'a> {
         let (verb, rest) = arg.split_once(' ').unwrap_or((arg, ""));
         if verb == "cancel" {
             return self.login_cancel(rest).await;
+        }
+        if verb == "paste" {
+            return self.login_paste(rest, from);
         }
         let mut words = arg.split_whitespace();
         let provider = words.next().unwrap_or_default();
@@ -2979,6 +2987,32 @@ impl<'a> Router<'a> {
                 format!("[zephyr] signing in to {provider} as {name}; the URL follows here.")
             }
             None => format!("[zephyr] signing in to {provider}; the URL follows here."),
+        }
+    }
+
+    /// `/login paste ADDRESS`: the address the owner's browser could not open goes to the stdin
+    /// of the sender's own newest sign-in, where rpi reads the code from it (DESIGN §4.7.1). Only
+    /// something that looks like that address is taken, so a token pasted by mistake goes nowhere.
+    fn login_paste(&mut self, text: &str, from: (&str, &str)) -> String {
+        let text = text.trim();
+        let address = ["http://127.0.0.1", "http://localhost"]
+            .iter()
+            .any(|start| text.starts_with(start))
+            || text.contains("code=");
+        if !address {
+            return "[zephyr] /login paste takes the address the browser could not open \
+                    (http://127.0.0.1:…?code=…). Never paste a token here."
+                .into();
+        }
+        let theirs = |l: &&Login| {
+            (l.from.as_ref())
+                .is_some_and(|(channel, sender)| (channel.as_str(), sender.as_str()) == from)
+        };
+        match self.posted.iter().rev().find(theirs) {
+            Some(login) if crate::auth::input(&login.id, text) => {
+                format!("[zephyr] sent to the {} sign-in", login.provider)
+            }
+            _ => "[zephyr] no sign-in of yours is waiting for a pasted address".into(),
         }
     }
 
@@ -3117,12 +3151,15 @@ impl<'a> Router<'a> {
         }
     }
 
-    /// Posts what each `/login` sign-in has to say — the URL, a failure, or the account once it
-    /// is recorded — and forgets it. On the 5 s config tick, so nothing here waits on a login and
-    /// a login that died without a word is dropped by the registry and forgotten with it.
+    /// Posts what each `/login` sign-in has to say: the URL once, then a failure or the account
+    /// once it is recorded, after which it is forgotten. On the 5 s config tick, so nothing here
+    /// waits on a login and a login that died without a word is dropped by the registry and
+    /// forgotten with it.
     fn login_notices(&mut self) {
-        let logins = std::mem::take(&mut self.logins);
-        for Login { id, provider, from } in logins {
+        let waiting = std::mem::take(&mut self.logins).into_iter();
+        let posted = std::mem::take(&mut self.posted).into_iter();
+        let all = waiting.map(|l| (l, false)).chain(posted.map(|l| (l, true)));
+        for (Login { id, provider, from }, announced) in all {
             let Some(login) = crate::auth::poll(&id) else {
                 continue; // finished long ago, or evicted: nothing left to say
             };
@@ -3140,11 +3177,22 @@ impl<'a> Router<'a> {
                     "[zephyr] signing in to {provider} failed: {}",
                     login["error"].as_str().unwrap_or("no reason given")
                 ),
+                // Its URL is out; the owner is signing in.
+                _ if announced => {
+                    self.posted.push(Login { id, provider, from });
+                    continue;
+                }
                 _ => match login["url"].as_str() {
-                    Some(url) => format!(
-                        "[zephyr] sign in to {provider} as {} at {url}",
-                        login["account"].as_str().unwrap_or_default()
-                    ),
+                    Some(url) => {
+                        let text = format!(
+                            "[zephyr] sign in to {provider} as {} at {url}\n\
+                             If the page then cannot open 127.0.0.1, send /login paste <its address>.",
+                            login["account"].as_str().unwrap_or_default()
+                        );
+                        self.login_notice(&text, &from);
+                        self.posted.push(Login { id, provider, from });
+                        continue;
+                    }
                     None => {
                         // Still waiting for the URL.
                         self.logins.push(Login { id, provider, from });
