@@ -634,13 +634,25 @@ fn plain_git(git: &Path) -> Result<(), &'static str> {
         })
         .collect()
     };
-    // Only files and folders, all the way down: a link could point git anywhere.
-    fn plain_tree(d: &Path) -> Result<(), &'static str> {
+    // Only files and folders, all the way down: a link could point git anywhere. `objects` is
+    // looked at only at its top: what is in a loose object's folder is content git names by
+    // hash, and walking every one at each run's start would cost more than it shows.
+    fn plain_tree(d: &Path, objects: &Path) -> Result<(), &'static str> {
         for e in std::fs::read_dir(d).map_err(|_| GIT_CHANGED)? {
-            let kind = e.as_ref().map_err(|_| GIT_CHANGED)?.file_type();
-            match kind.map_err(|_| GIT_CHANGED)? {
-                k if k.is_dir() => plain_tree(&e.map_err(|_| GIT_CHANGED)?.path())?,
-                k if k.is_file() => {}
+            let e = e.map_err(|_| GIT_CHANGED)?;
+            let (kind, path) = (e.file_type().map_err(|_| GIT_CHANGED)?, e.path());
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            let loose = name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit());
+            match (kind.is_dir(), kind.is_file()) {
+                (true, _) if path == objects => plain_tree(&path, objects)?,
+                (true, _) if d == objects && loose => {}
+                (true, _) if d == objects && !matches!(&*name, "pack" | "info") => {
+                    return Err(GIT_CHANGED)
+                }
+                (true, _) => plain_tree(&path, objects)?,
+                (_, true) if d == objects => return Err(GIT_CHANGED),
+                (_, true) => {}
                 _ => return Err(GIT_CHANGED),
             }
         }
@@ -649,7 +661,7 @@ fn plain_git(git: &Path) -> Result<(), &'static str> {
     if !git.symlink_metadata().is_ok_and(|m| m.is_dir()) {
         return Err(GIT_CHANGED);
     }
-    plain_tree(git)?;
+    plain_tree(git, &git.join("objects"))?;
     for (name, _) in entries(git)? {
         if !TOP.contains(&name.as_str()) {
             return Err(GIT_CHANGED);
@@ -2275,6 +2287,8 @@ mod tests {
             "unknown",
             "hooks/pre-commit",
             "info/sparse-checkout",
+            "objects/zz/x",
+            "objects/notes",
         ] {
             let path = dotgit.join(planted);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2284,6 +2298,9 @@ mod tests {
             let first = planted.split('/').next().unwrap();
             if matches!(first, "modules" | "worktrees") {
                 std::fs::remove_dir_all(dotgit.join(first)).unwrap();
+            }
+            if planted.starts_with("objects/zz/") {
+                std::fs::remove_dir_all(dotgit.join("objects/zz")).unwrap();
             }
             assert!(clean_base(&home, &st).is_some(), "{planted} removed");
         }
