@@ -715,18 +715,16 @@ pub fn kill_leftover_desktop() {
 const DESKTOP_OWN: [&str; 3] = ["Xvfb", "xkbcomp", "openbox"];
 
 /// `(pid, start ticks)` of each process of `uid` that could write memory unseen (DESIGN §4.6):
-/// whose parents lead to `scope` without passing one of `keep` (the daemon, which starts the
-/// desktop, and the tracked commands); anything the desktop started but its own programs; a
-/// desktop program the daemon did not start, wherever it runs; and, as doubt, any whose parent
-/// chain breaks. A chain that ends outside the namespace (`docker exec`) is not under scope.
+/// any outside the daemon's tree, that is, whose parents do not lead to one of `keep` (the
+/// daemon, which starts the desktop, and the tracked commands), whatever its name or where its
+/// chain ends (a `docker exec` too); anything the desktop started but its own programs; and, as
+/// doubt, any whose parent chain breaks. Swept below a test's `scope` (not 1, the container's
+/// whole namespace), a chain that ends at the machine's own top is not looked at.
 fn strays(all: &HashMap<i32, Ps>, uid: u32, scope: i32, keep: &[i32]) -> Vec<(i32, i64)> {
     let stray = |start: i32| {
         let own = all
             .get(&start)
             .is_some_and(|p| DESKTOP_OWN.contains(&p.comm.as_str()));
-        let named = all
-            .get(&start)
-            .is_some_and(|p| DESKTOP.contains(&p.comm.as_str()));
         let (mut pid, mut under_desktop) = (start, false);
         for _ in 0..all.len() {
             let Some(p) = all.get(&pid) else {
@@ -739,9 +737,7 @@ fn strays(all: &HashMap<i32, Ps>, uid: u32, scope: i32, keep: &[i32]) -> Vec<(i3
                 under_desktop = true;
             }
             if p.ppid == 0 {
-                // The top (pid 1), or a parent outside the namespace: not under scope, but a
-                // desktop program under a `docker exec` counts.
-                return named && pid != 1;
+                return scope == 1;
             }
             if p.ppid == scope {
                 return true;
@@ -1163,7 +1159,19 @@ mod tests {
         let mut found = strays(&all, 9, 1, &[10, 30]);
         found.sort();
         // The leftover desktop and its helper, and the orphan whose chain broke, count too.
-        assert_eq!(found, [(40, 7), (41, 7), (50, 7), (51, 7), (80, 7)]);
+        // And a shell under a `docker exec`: the agent's too, and outside the daemon's tree.
+        assert_eq!(
+            found,
+            [
+                (40, 7),
+                (41, 7),
+                (50, 7),
+                (51, 7),
+                (60, 7),
+                (61, 7),
+                (80, 7)
+            ]
+        );
     }
 
     #[test]
@@ -1211,7 +1219,13 @@ mod tests {
         // `docker exec` shell, 61 doctor's `__netcheck` under it, 62 a desktop program under it;
         // 80 a process whose parent ended.
         let all = HashMap::from([
-            (1, ps(0, "init")),
+            (
+                1,
+                Ps {
+                    uid: 0,
+                    ..ps(0, "init")
+                },
+            ), // root's
             (10, ps(1, "zephyr")),
             (11, ps(10, "Xvfb")),
             (12, ps(11, "xkbcomp")),
@@ -1236,16 +1250,18 @@ mod tests {
                 (50, 7),
                 (51, 7),
                 (52, 7),
+                (60, 7),
+                (61, 7),
                 (62, 7),
                 (80, 7)
             ]
         );
-        // Swept below another pid (a test's scope), a desktop under the machine's own init is
-        // not in the namespace zephyr looks at: only one under a `docker exec` counts.
+        // Swept below another pid (a test's scope), what ends at the machine's own top is not in
+        // what zephyr looks at.
         let mut found = strays(&all, 9, 10, &[]);
         found.sort();
         assert!(
-            !found.contains(&(50, 7)) && found.contains(&(62, 7)),
+            !found.contains(&(50, 7)) && !found.contains(&(62, 7)),
             "{found:?}"
         );
     }
@@ -1304,7 +1320,16 @@ mod tests {
             ticks: 7,
             comm: comm.into(),
         };
-        let all = HashMap::from([(1, ps(0, "init")), (40, ps(1, "chrome"))]);
+        let all = HashMap::from([
+            (
+                1,
+                Ps {
+                    uid: 0,
+                    ..ps(0, "init")
+                },
+            ),
+            (40, ps(1, "chrome")),
+        ]);
         assert_eq!(
             named(&all, &strays(&all, 9, 1, &[])).as_deref(),
             Some("chrome")
