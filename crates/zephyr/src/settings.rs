@@ -96,6 +96,10 @@ pub enum Apply {
     Thinking,
     Subagent,
     Rule,
+    /// The owner's goals, `<state>/GOALS.md` (`memory::goal`).
+    Goal,
+    /// The owner's persona, `<state>/PERSONA.md` (`memory::persona`).
+    Persona,
     /// Private facts (approvals spec A1).
     Facts,
     /// `approvals.preset`: the preset and the hand-set values it drops, in one update
@@ -354,6 +358,28 @@ pub static SETTINGS: &[Setting] = &[
         false,
         Stricter::NotOrdered,
         Apply::Rule,
+    ),
+    row(
+        "goal",
+        "Goals and review",
+        "Goals",
+        "Goals the agent keeps in mind in every run: /goal add, done, rm.",
+        Kind::Text { max: 500 },
+        Access::Propose,
+        false,
+        Stricter::NotOrdered,
+        Apply::Goal,
+    ),
+    row(
+        "persona",
+        "Memory",
+        "Persona",
+        "Who the agent is with you, in every run: /persona set, clear.",
+        Kind::Text { max: 4000 },
+        Access::Propose,
+        false,
+        Stricter::NotOrdered,
+        Apply::Persona,
     ),
     row(
         "facts",
@@ -1203,6 +1229,8 @@ fn allowed(s: &Setting) -> String {
             "/subagent add NAME [PROVIDER/MODEL] PROMPT, model, prompt, rm".into()
         }
         (Apply::Rule, _) => "/rule TEXT, /rule rm N".into(),
+        (Apply::Goal, _) => "/goal add TEXT, /goal done N, /goal rm N".into(),
+        (Apply::Persona, _) => "/persona set TEXT, /persona clear".into(),
         (Apply::Facts, _) => {
             "/facts rm NAME, /facts allow NAME TARGET, /facts disallow NAME TARGET".into()
         }

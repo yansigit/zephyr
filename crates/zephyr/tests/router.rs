@@ -1004,6 +1004,84 @@ async fn a_rule_restarts_the_agent_and_leads_its_context() {
     gw.shutdown().await;
 }
 
+/// `key`'s newest settings_log row: old, new, actor.
+fn last_logged(home: &Path, key: &str) -> (Option<String>, Option<String>, String) {
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    db.query_row(
+        "SELECT old, new, actor FROM settings_log WHERE key = ?1 ORDER BY id DESC LIMIT 1",
+        [key],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_goal_restarts_the_agent_and_reaches_its_context() {
+    let home = home("goals");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "/goal add Ship zephyr 0.8").await;
+    assert_eq!(
+        gw.wait_replies(2).await[1],
+        "[zephyr] goal 1 set; it applies from the next message"
+    );
+    gw.say("m3", "owner", "again").await;
+    gw.wait_replies(3).await;
+    assert_eq!(log(&home, "start").len(), 2, "one restart");
+    let agents = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    assert!(agents.contains("## Goals\n\n"), "{agents}");
+    assert!(agents.contains("1. Ship zephyr 0.8"), "{agents}");
+    gw.say("m4", "owner", "/goal done 1").await;
+    assert_eq!(
+        gw.wait_replies(4).await[3],
+        "[zephyr] goal 1 done: Ship zephyr 0.8"
+    );
+    assert_eq!(
+        last_logged(&home, "goal"),
+        (
+            Some("Ship zephyr 0.8".into()),
+            Some("done".into()),
+            "owner".into()
+        )
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_persona_set_by_the_owner_leads_the_context() {
+    let home = home("persona");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_replies(1).await;
+    gw.say(
+        "m2",
+        "owner",
+        "/persona set Warm and direct.\nNever gushes.",
+    )
+    .await;
+    assert_eq!(
+        gw.wait_replies(2).await[1],
+        "[zephyr] persona set; it applies from the next message"
+    );
+    gw.say("m3", "owner", "again").await;
+    gw.wait_replies(3).await;
+    assert_eq!(log(&home, "start").len(), 2, "one restart");
+    let agents = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    assert!(
+        agents.contains("## Persona\n\n") && agents.contains("Warm and direct.\nNever gushes."),
+        "{agents}"
+    );
+    gw.say("m4", "owner", "/set persona x").await;
+    assert_eq!(
+        gw.wait_replies(4).await[3],
+        "[zephyr] change goals with /goal and the persona with /persona"
+    );
+    let (old, new, _) = last_logged(&home, "persona");
+    assert_eq!((old, new.as_deref()), (None, Some("set")), "never the text");
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_job_run_commits_its_memory_edits() {
     let home = home("job-memory");

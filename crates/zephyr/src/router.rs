@@ -1424,6 +1424,9 @@ impl<'a> Router<'a> {
         if matches!(key, "subagent" | "rule") {
             return refused("change subagents with /subagent and rules with /rule".into());
         }
+        if matches!(key, "goal" | "persona") {
+            return refused("change goals with /goal and the persona with /persona".into());
+        }
         let min = self.cfg.min_until;
         let until = match until
             .map(|d| crate::settings::parse_until(d, min))
@@ -2088,6 +2091,13 @@ impl<'a> Router<'a> {
             ("/rule", rule) if !rule.is_empty() => {
                 self.owner_set("rule", rule, from.0, |a| a).await
             }
+            // `/goals`, `/persona` alone and the usages are `memory::command`'s.
+            ("/goal", arg) if matches!(word(arg).0, "add" | "done" | "rm") => {
+                self.owner_set("goal", arg, from.0, |a| a).await
+            }
+            ("/persona", arg) if matches!(word(arg).0, "set" | "clear") => {
+                self.owner_set("persona", arg, from.0, |a| a).await
+            }
             ("/new" | "/clear", "") => self.new_session().await,
             ("/switch", "") => self.list_sessions(),
             ("/switch", id) => self.switch(id).await,
@@ -2343,7 +2353,11 @@ impl<'a> Router<'a> {
         if s.apply == Apply::Facts {
             return Outcome::Refused("change private facts with /facts".into());
         }
-        let (raw, list) = (raw.trim(), matches!(s.apply, Apply::Subagent | Apply::Rule));
+        let list = matches!(
+            s.apply,
+            Apply::Subagent | Apply::Rule | Apply::Goal | Apply::Persona
+        );
+        let raw = raw.trim();
         if until.is_some() && list {
             return Outcome::Refused(format!("a change to {key} cannot be timed"));
         }
@@ -2392,6 +2406,8 @@ impl<'a> Router<'a> {
                 let command = match s.apply {
                     Apply::Subagent => format!("/subagent {raw}"),
                     Apply::Rule => format!("/rule {raw}"),
+                    Apply::Goal => format!("/goal {raw}"),
+                    Apply::Persona => format!("/persona {raw}"),
                     _ => {
                         let span = span.as_ref().map_or(String::new(), |d| format!(" for {d}"));
                         format!("/set {key} {raw}{span}")
@@ -2423,6 +2439,8 @@ impl<'a> Router<'a> {
         let mut before = None;
         // R31: the class time limits an owner's preset ends, as it changes or clears them.
         let mut ended: Vec<String> = Vec::new();
+        // A goal's or the persona's change logs what `memory::Change` says, never the persona.
+        let mut logged = None;
         let applied = match s.apply {
             Apply::Toml => {
                 let model =
@@ -2477,6 +2495,18 @@ impl<'a> Router<'a> {
                 self.restart = true;
                 Reloaded::done(reply)
             }),
+            Apply::Goal | Apply::Persona => {
+                let state = self.cfg.state_dir();
+                let change = match s.apply {
+                    Apply::Goal => crate::memory::goal(state, raw),
+                    _ => crate::memory::persona(state, raw),
+                };
+                change.map(|c| {
+                    self.restart = true;
+                    logged = Some((c.old, c.new));
+                    Reloaded::done(c.reply)
+                })
+            }
             Apply::Facts => Err("change private facts with /facts".into()),
         };
         let applied = match applied {
@@ -2502,6 +2532,7 @@ impl<'a> Router<'a> {
             true => format!("{who} (reload failed)"),
             false => who.to_string(),
         };
+        let (old, new) = logged.unwrap_or((old, new));
         let (o, n) = (old.as_deref(), new.as_deref());
         log((self.store.log_setting(key, o, n, &who, channel, proposal)).map_err(Into::into));
         // A change that did not take effect leaves the time limits as they were.
@@ -2586,6 +2617,9 @@ impl<'a> Router<'a> {
         }
         if matches!(key, "subagent" | "rule") {
             return "[zephyr] change subagents with /subagent and rules with /rule".into();
+        }
+        if matches!(key, "goal" | "persona") {
+            return "[zephyr] change goals with /goal and the persona with /persona".into();
         }
         let min = self.cfg.min_until;
         let until = match until
@@ -2753,6 +2787,15 @@ impl<'a> Router<'a> {
                 Ok(1) => Some("1 rule".into()),
                 Ok(n) => Some(format!("{n} rules")),
             },
+            "goal" => match crate::memory::read_goals(self.cfg.state_dir()).map(|g| g.len()) {
+                Ok(0) | Err(_) => None,
+                Ok(1) => Some("1 goal".into()),
+                Ok(n) => Some(format!("{n} goals")),
+            },
+            // Never the text: replies, the panel and settings_log say only whether there is one.
+            "persona" => (crate::memory::read_persona(self.cfg.state_dir()).ok())
+                .filter(|p| !p.is_empty())
+                .map(|_| "set".into()),
             _ => crate::settings::value(&self.cfg, key),
         }
     }
@@ -2774,6 +2817,15 @@ impl<'a> Router<'a> {
             Apply::Rule => {
                 let rules = crate::memory::read_rules(self.cfg.state_dir()).ok()?;
                 Some(crate::drafts::digest(rules.iter().map(|r| r.as_bytes())))
+            }
+            Apply::Goal | Apply::Persona => {
+                let name = if s.apply == Apply::Goal {
+                    "GOALS.md"
+                } else {
+                    "PERSONA.md"
+                };
+                let text = std::fs::read(self.cfg.state_dir().join(name)).unwrap_or_default();
+                Some(crate::drafts::digest([text.as_slice()]))
             }
             _ => self.shown(key),
         }

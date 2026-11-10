@@ -416,6 +416,16 @@ rule or a removal; it never takes effect until you `/ok` the card, which shows t
 daemon, out of the agent's reach, and do not fade when a long conversation is summarised the way
 instructions given in chat can. `/new` starts a fresh conversation; rules and memory carry over, and `/switch` goes back to an earlier one.
 
+## Goals and persona
+
+`/goal add Ship zephyr 0.8` gives the agent a goal it keeps in mind in every run, from the next
+message on (at most 20, each up to 500 characters). `/goals` lists them; `/goal done 2` marks one
+done and `/goal rm 2` removes one, and both take it off the list. `/persona set TEXT` (several
+lines are fine, up to 4000 characters) says who the agent is with you; `/persona` shows it and
+`/persona clear` removes it. The persona comes before your rules, which still win. The agent can
+propose a goal, that one is done, or a persona, through a card you `/ok`; it never changes them
+itself. Both live with the daemon, beside the rules.
+
 ## The agent's browser and desktop
 
 The image gives the agent a browser and a screen of its own (DESIGN §4.11):
