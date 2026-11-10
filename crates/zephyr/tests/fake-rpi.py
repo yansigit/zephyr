@@ -138,6 +138,12 @@ def gateway_kind(c):
             ord(ch) < 32 or 0x7f <= ord(ch) < 0xa0 or 0x202a <= ord(ch) <= 0x202e
             or 0x2066 <= ord(ch) <= 0x2069 or ord(ch) in (0x200e, 0x200f, 0x061c, 0x2028, 0x2029)
             for ch in t)
+    if cmd == "/activity":
+        words = arg.split(" ") if arg != "" else []
+        ok = len(c) <= 40 and len(words) <= 2 and all(
+            w != "" and all(33 <= ord(ch) <= 126 for ch in w) and w.lower() not in ("grants", "grant")
+            for w in words)
+        return "read" if ok else None
     if cmd == "/settings":
         return "read" if all(w != "" and all(33 <= ord(ch) <= 126 for ch in w) for w in arg.split(" ")) and len(arg) <= 100 else None
     if cmd == "/set":

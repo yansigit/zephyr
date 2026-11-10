@@ -200,15 +200,15 @@ Deviation: the unit test's lines use rowid 1 and job #1 (spec §4.4's example us
 - Produces: `gateway_kind("/activity…")` is `Some(Gateway::Read)` when the whole command is ≤ 40 bytes, has 0–2 words after `/activity`, each `ascii_word`, none equal to `grants` or `grant` ignoring ASCII case; else `None`. The daemon answers it with `activity::chat`, the owner's text.
 - AGENTS.md sentence (copy), appended to the gateway bullet: `When the owner asks what you did, sent or were refused, read gateway "/activity …" and give zephyr's record; do not answer from memory.`
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `zephyr-policy` `activity_is_a_read_but_grants_is_not`: `Some(Read)` for `/activity`, `/activity today task`, `/activity 7d`, `/activity Today`; `None` for `/activity grants`, `/activity GRANTS`, `/activity 7d Grants`, `/activity a b c`, `/activity tödåy`, a 41-byte command.
   - router `the_agent_reads_activity_but_not_grants`: prompt `[call gateway {"command": "/activity today"}]` → reply line `gateway: [zephyr] nothing recorded since 00:00 today` (the call's own audit row is kind `tool`, left out); `[call gateway {"command": "/activity grants"}]` → `tool error: … is not available to the agent`.
   - `memory.rs`: the gateway bullet contains the sentence.
-- [ ] **Step 2:** Run → FAIL.
-- [ ] **Step 3: Implement** the `"/activity"` arm in `gateway_kind`; the same rules in fake-rpi.py's `gateway_kind` (same commit); `activity if activity.starts_with("/activity") => crate::activity::chat(&self.cfg, &self.store, activity["/activity".len()..].trim(), crate::now())` in `gateway_reply`; mention `/activity` in `gateway`'s error text and in the `TOOLS` bullet's list of reads.
-- [ ] **Step 4:** `cargo test -p zephyr-policy && cargo test -p zephyr` → PASS.
-- [ ] **Step 5:** Docs: DESIGN §4.11 `gateway` reads `/activity …`, never `grants` (it names who passes without asking, what an injected run would aim at).
-- [ ] **Step 6:** Commit `feat(gateway): let the agent read zephyr's activity record, never the standing grants`.
+- [x] **Step 2:** Run → FAIL.
+- [x] **Step 3: Implement** the `"/activity"` arm in `gateway_kind`; the same rules in fake-rpi.py's `gateway_kind` (same commit); `activity if activity.starts_with("/activity") => crate::activity::chat(&self.cfg, &self.store, activity["/activity".len()..].trim(), crate::now())` in `gateway_reply`; mention `/activity` in `gateway`'s error text and in the `TOOLS` bullet's list of reads.
+- [x] **Step 4:** `cargo test -p zephyr-policy && cargo test -p zephyr` → PASS.
+- [x] **Step 5:** Docs: DESIGN §4.11 `gateway` reads `/activity …`, never `grants` (it names who passes without asking, what an injected run would aim at).
+- [x] **Step 6:** Commit `feat(gateway): let the agent read zephyr's activity record, never the standing grants`.
 
 ### Task A4-7: `zephyr.activity` on the attach socket
 

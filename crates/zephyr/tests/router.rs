@@ -5652,3 +5652,34 @@ async fn forgetting_a_known_target_asks_again() {
     .await;
     gw.shutdown().await;
 }
+
+/// The agent reads zephyr's own record through `gateway`, never the standing grants.
+#[tokio::test]
+async fn the_agent_reads_activity_but_not_grants() {
+    let home = home("activity-gateway");
+    let gw = start(config(&home));
+    let saw = |what: &str| gw.replies().iter().any(|r| r.contains(what));
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call gateway {"command": "/activity today"}] what did you do"#,
+    )
+    .await;
+    // The call's own audit row is a `tool` row, which the bare list leaves out.
+    wait(|| saw("gateway: [zephyr] nothing recorded since 00:00 today")).await;
+    gw.say(
+        "m2",
+        "owner",
+        r#"[call gateway {"command": "/activity grants"}] who passes"#,
+    )
+    .await;
+    wait(|| saw("is not available to the agent")).await;
+    let refused = (gw.replies().into_iter())
+        .find(|r| r.contains("is not available to the agent"))
+        .unwrap();
+    assert!(
+        refused.contains("tool error: /activity grants is not available"),
+        "{refused}"
+    );
+    gw.shutdown().await;
+}

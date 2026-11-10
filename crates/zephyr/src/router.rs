@@ -1015,6 +1015,13 @@ impl<'a> Router<'a> {
             settings if settings.starts_with("/settings") => {
                 self.settings_listing(settings["/settings".len()..].trim())
             }
+            // The owner's text, the daemon's words; `gateway_kind` keeps `grants` out.
+            activity if activity.starts_with("/activity") => crate::activity::chat(
+                &self.cfg,
+                &self.store,
+                activity["/activity".len()..].trim(),
+                crate::now(),
+            ),
             "/job list" => crate::scheduler::list(&self.store)
                 .unwrap_or_else(|e| format!("[zephyr] listing jobs failed: {e}")),
             memory => crate::memory::command(&self.cfg.home, self.cfg.state_dir(), memory)
