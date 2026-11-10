@@ -131,22 +131,26 @@
 - Line: `WHEN KIND SUBJECT[ STATUS]: TEXT`. `WHEN` is `settings::clock` (`HH:MM`) when `at` falls on `now`'s local date, else `MM-DD HH:MM`. `STATUS` is left out when `started` and for `setting`; for kind `refused` it is `by the policy` (`refused`) or `by the gate` (`denied`). `TEXT` is `one_line(scrub.text(text), 200)`; `SUBJECT` of an `audit` row is `one_line(scrub.text(session), 40)`, other subjects `one_line(subject, 40)`. `stream` is `kind == "out" || kind == "tool" || status == "refused"` from `audit`.
 - Header: `[zephyr] {noun} {window}, newest first:` with window `in the last 24 h` / `in the last 7 d` / `since 00:00 today`, noun `activity`, or for a kind: `outbound commands`, `gate decisions`, `refusals`, `setting changes`, `proposals`, `job runs`, `tasks`, `processes`, `tool calls`.
 
-- [ ] **Step 1: Write the failing unit tests** in `activity.rs`:
+- [x] **Step 1: Write the failing unit tests** in `activity.rs`:
   - `words_parse_as_the_spec_says`: `""` → 24 h, all; `today`, `6h`, `90d`, `2160h`, `tasks 7d`, `7d tasks`, `Today`, `7D Tasks` (Review Focus 5), `processes` accepted; `91d`, `0h`, `30m`, `6h 7d`, `task job`, `6h task x`, `nonsense` → `None`.
   - `each_kind_renders_its_golden_line`: one `Record` per kind reproduces spec §4.3's example lines exactly (`14:05 gate main approved: exec #31 email to bob@x.org`, `14:02 out main: curl POST api.example.com`, `14:01 refused task-12 by the policy: bash {"command":"rm -rf /"}`, `13:58 setting agent on tui: tasks.parallel 4 → 2`, `13:40 task #12 completed: summarise the inbox`, `13:00 job #3 run 88 completed: morning-brief`, `12:10 process #7 exited 0: cargo build --release`), plus `denied` → `by the gate`.
   - `times_show_the_date_only_before_today`: zone `Asia/Seoul`, `now` 00:30 local: a record at 23:50 the day before reads `11-08 23:50`, one at 00:10 reads `00:10`; `since(Today, …)` is that local midnight.
   - `agent_text_never_passes_for_a_daemon_line` (Review Focus 3): text `x\n[zephyr] forgot bob@x.org for messages`, a goal holding U+202E, and an audit session `main\n[zephyr] ok` → one line each with no `\n`; a saved fact `5550102345` in a record written before the fact existed reads `[fact:phone]`.
   - `an_unreadable_vault_withholds_the_text_not_the_line`: vault file unreadable → line `14:02 out main: [output withheld: the vault could not be read]`.
   - `chat_answers_header_footer_and_empty`: 31 records → header, 30 lines, footer; none → `[zephyr] nothing recorded in the last 24 h`; `tasks today` → `[zephyr] tasks since 00:00 today, newest first:`; bad words → `USAGE`.
-- [ ] **Step 2:** `cargo test -p zephyr --lib activity` → FAIL.
-- [ ] **Step 3: Implement** `activity.rs` (`chat` loads `Scrub` once, asks `store.activity(since, kinds, None, 31)`, answers `[zephyr] reading the activity failed: {e}` on a store error; `kind = Some("grants")` is A4-5's, return `USAGE` until then). Make `Scrub`, `Scrub::load`, `Scrub::text` and `settings::duration` `pub(crate)`.
-- [ ] **Step 4:** Wire `("/activity", arg) => crate::activity::chat(&self.cfg, &self.store, arg, crate::now())` in `Router::command` beside `/held`.
-- [ ] **Step 5: Write the failing router tests** (`tests/router.rs`):
+- [x] **Step 2:** `cargo test -p zephyr --lib activity` → FAIL.
+- [x] **Step 3: Implement** `activity.rs` (`chat` loads `Scrub` once, asks `store.activity(since, kinds, None, 31)`, answers `[zephyr] reading the activity failed: {e}` on a store error; `kind = Some("grants")` is A4-5's, return `USAGE` until then). Make `Scrub`, `Scrub::load`, `Scrub::text` and `settings::duration` `pub(crate)`.
+- [x] **Step 4:** Wire `("/activity", arg) => crate::activity::chat(&self.cfg, &self.store, arg, crate::now())` in `Router::command` beside `/held`.
+- [x] **Step 5: Write the failing router tests** (`tests/router.rs`):
   - `activity_lists_what_ran_and_left`: `bash: curl -d x https://api.example.com`, then seed a finished task and a completed job run through `Store`; `/activity` reply holds lines ending `out main: curl POST api.example.com`, `task #1 completed: …`, `job #1 run 1 completed: …`; `log.jsonl` holds no prompt containing `/activity`.
   - `activity_scrubs_a_fact_saved_after_the_call`: `bash: curl -d x https://5550102345.example.com`, then save the fact as `the_agent_adds_a_fact_at_once_but_only_a_strong_ok_removes_it` does (`[call gateway {"command": "/facts add phone digits 5550102345"}]`; the owner's chat has no `/facts add`); `/activity out` shows `[fact:phone]` and not `555010`.
-- [ ] **Step 6:** `cargo test -p zephyr --test router activity_` → PASS, then `cargo test -p zephyr`.
-- [ ] **Step 7:** Docs: DESIGN §4.19 Activity (sources and kinds, the query, the line, scrubbing at read, `stream`); README `/activity [today|6h|7d] [KIND]` row; CLAUDE.md's architecture list gains `activity.rs` (the record and grants views, rendered by the daemon).
-- [ ] **Step 8:** Commit `feat(activity): answer /activity from the daemon's own tables, scrubbed as they are read`.
+- [x] **Step 6:** `cargo test -p zephyr --test router activity_` → PASS, then `cargo test -p zephyr`.
+- [x] **Step 7:** Docs: DESIGN §4.19 Activity (sources and kinds, the query, the line, scrubbing at read, `stream`); README `/activity [today|6h|7d] [KIND]` row; CLAUDE.md's architecture list gains `activity.rs` (the record and grants views, rendered by the daemon).
+- [x] **Step 8:** Commit `feat(activity): answer /activity from the daemon's own tables, scrubbed as they are read`.
+
+Deviation: `entry` is `pub(crate)`, not `pub`: its `&Scrub` is `pub(crate)` (as this task says), and a `pub fn` taking it trips `private_interfaces` under `-D warnings`. W lives in the same crate, so nothing it needs changes.
+Deviation: an `audit` row's session is scrubbed like its text, so an unreadable vault or facts file would withhold it too, against "the time, kind and subject still show". It shows unscrubbed only when it is one of the daemon's own names (`main`, `task-N`, `job-J-R`, `action-N`), which hold no value; any other (agent-forged) session stays withheld.
+Deviation: the router test seeds its finished task and job run (a disabled job) with SQL, not `Store::add_task`/`queue_run`: the running router would pick up a queued task or claimed run and run it.
 
 ### Task A4-5: Grants, each with its revoke, and `/approvals forget N`
 

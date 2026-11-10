@@ -457,13 +457,13 @@ fn one_line(text: &str) -> String {
 /// scrubbed out of what is shown or recorded. `text` is `vault::scrubbed` followed by
 /// `facts::scrub`, and fails closed as they do: nothing of the text is shown when the vault or
 /// the facts cannot be read.
-struct Scrub {
+pub(crate) struct Scrub {
     secrets: Option<Vec<(String, String)>>,
     facts: anyhow::Result<Vec<Fact>>,
 }
 
 impl Scrub {
-    fn load(cfg: &Config) -> Scrub {
+    pub(crate) fn load(cfg: &Config) -> Scrub {
         let vault = crate::vault::Vault::load(&crate::vault::path(cfg));
         Scrub {
             secrets: vault.ok().map(|v| v.secrets()),
@@ -471,7 +471,7 @@ impl Scrub {
         }
     }
 
-    fn text(&self, text: &str) -> String {
+    pub(crate) fn text(&self, text: &str) -> String {
         let Some(secrets) = &self.secrets else {
             return "[output withheld: the vault could not be read]".into();
         };

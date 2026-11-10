@@ -5526,3 +5526,74 @@ async fn an_upgraded_install_with_no_owner_yet_is_told_after_the_first_message()
     );
     gw.shutdown().await;
 }
+
+/// The owner's `/activity` (DESIGN §4.19) is answered by the daemon from its own tables: an
+/// outbound command from its start, a finished task and a job's run, and never reaches the agent.
+#[tokio::test]
+async fn activity_lists_what_ran_and_left() {
+    let home = home("activity-record");
+    let gw = start(config(&home));
+    let saw = |what: &str| gw.replies().iter().any(|r| r.contains(what));
+    gw.say("m1", "owner", "bash: curl -d x https://api.example.com")
+        .await;
+    wait(|| saw("[zephyr] outbound this turn:")).await;
+    // Seeded as finished rows, so the router has nothing to run.
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    db.execute_batch(
+        "INSERT INTO tasks(goal, channel, recipient, status, ended_at)
+           VALUES ('summarise the inbox', 'chat', 'owner', 'completed', unixepoch());
+         INSERT INTO jobs(name, schedule, prompt, channel, recipient, enabled)
+           VALUES ('morning-brief', '0 7 * * *', 'p', 'chat', 'owner', 0);
+         INSERT INTO runs(job_id, due_at, status, started_at, ended_at)
+           VALUES (1, unixepoch(), 'completed', unixepoch(), unixepoch());",
+    )
+    .unwrap();
+    gw.say("m2", "owner", "/activity").await;
+    wait(|| saw("[zephyr] activity in the last 24 h, newest first:")).await;
+    let reply = (gw.replies().into_iter())
+        .find(|r| r.starts_with("[zephyr] activity"))
+        .unwrap();
+    for end in [
+        "out main: curl POST api.example.com",
+        "task #1 completed: summarise the inbox",
+        "job #1 run 1 completed: morning-brief",
+    ] {
+        assert!(reply.lines().any(|l| l.ends_with(end)), "{end}: {reply}");
+    }
+    let log = std::fs::read_to_string(home.join("log.jsonl")).unwrap();
+    assert!(!log.contains("/activity"), "the agent saw it: {log}");
+    gw.shutdown().await;
+}
+
+/// A fact saved after the call is still scrubbed from the record, which is scrubbed as it is read.
+#[tokio::test]
+async fn activity_scrubs_a_fact_saved_after_the_call() {
+    let home = home("activity-fact");
+    let gw = start(config(&home));
+    let saw = |what: &str| gw.replies().iter().any(|r| r.contains(what));
+    gw.say(
+        "m1",
+        "owner",
+        "bash: curl -d x https://5550102345.example.com",
+    )
+    .await;
+    wait(|| saw("[zephyr] outbound this turn:")).await;
+    gw.say(
+        "m2",
+        "owner",
+        r#"[call gateway {"command": "/facts add phone digits 5550102345"}] note it"#,
+    )
+    .await;
+    wait(|| saw("gateway: saved the private fact phone")).await;
+    gw.say("m3", "owner", "/activity out").await;
+    wait(|| saw("[zephyr] outbound commands in the last 24 h")).await;
+    let reply = (gw.replies().into_iter())
+        .find(|r| r.starts_with("[zephyr] outbound commands"))
+        .unwrap();
+    assert!(
+        reply.ends_with("out main: curl POST [fact:phone].example.com"),
+        "{reply}"
+    );
+    assert!(!reply.contains("555010"), "{reply}");
+    gw.shutdown().await;
+}

@@ -2011,6 +2011,8 @@ impl<'a> Router<'a> {
             ("/approvals", arg) => self.approvals(arg, from.0).await,
             // Held messages, posts and payments (approvals spec §4.6).
             ("/held", "") => crate::actions::held(&self.cfg, &self.store),
+            // The daemon's own record (DESIGN §4.19), answered outside the queue.
+            ("/activity", arg) => crate::activity::chat(&self.cfg, &self.store, arg, crate::now()),
             ("/cancel", n) => {
                 let reply = crate::actions::cancel(&self.cfg, &self.store, &self.waits, n);
                 self.settled_actions();

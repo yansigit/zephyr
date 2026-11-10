@@ -110,6 +110,10 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   digit runs, percent and base64 forms; at least 6 digits or 4 characters); a fact's `allow` is
   compared with recipient targets only. A value is never in `Debug`, a log, an audit row, a notice
   or an error (`[fact:NAME]`); only the TUI, `zephyr facts` and the agent's `/facts add` take one.
+- `activity.rs` (DESIGN §4.19): `/activity`, the record and grants views, rendered by the daemon
+  from `Store::activity` (one `UNION ALL` over audit, settings_log, command proposals, runs, tasks
+  and procs, keyset-paged by `store::Cursor`), every text scrubbed at read (`gate::Scrub`, then
+  `settings::one_line`). The model never writes it.
 - `browser_gate.rs`: `agent-browser` on the agent's PATH is the zephyr binary (`argv[0]`,
   dispatched in main.rs before any config is read), linked from root's `/opt/zephyr/gate/bin`, first
   on `agent::AGENT_PATH`; the real 0.41 binary is `/opt/zephyr/libexec/agent-browser`
