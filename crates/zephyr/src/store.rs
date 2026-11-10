@@ -575,6 +575,15 @@ impl std::fmt::Display for Cursor {
     }
 }
 
+/// What `/job rm` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobRemoval {
+    Removed,
+    Missing,
+    /// A run of it is in progress: its restart notice needs the job, so it stays.
+    Running,
+}
+
 /// A recipient the owner approved under `ask-new` (approvals spec §4.6); `n` is its rowid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnownTarget {
@@ -2008,21 +2017,33 @@ impl Store {
         rows.collect()
     }
 
-    /// Deletes the job and its runs that have not started. Returns whether it existed. Its other
-    /// runs stay, in the activity record as `(removed)` and keeping run ids from being reused,
-    /// so the key on `runs.job_id` (which the bundled SQLite enforces) is lifted for the delete;
-    /// the pragma cannot change inside a transaction.
-    pub fn remove_job(&mut self, id: i64) -> rusqlite::Result<bool> {
+    /// Deletes the job and its runs that have not started, unless a run of it is in progress
+    /// (its restart notice joins `jobs`). Its other runs stay, in the activity record as
+    /// `(removed)` and keeping run ids from being reused, so the key on `runs.job_id` (which the
+    /// bundled SQLite enforces) is lifted for the delete; the pragma cannot change inside a
+    /// transaction.
+    pub fn remove_job(&mut self, id: i64) -> rusqlite::Result<JobRemoval> {
         self.db.pragma_update(None, "foreign_keys", false)?;
         let removed = (|| {
             let tx = self.db.transaction()?;
+            let running: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE job_id = ?1 AND status = 'running')",
+                params![id],
+                |r| r.get(0),
+            )?;
+            if running {
+                return Ok(JobRemoval::Running);
+            }
             tx.execute(
                 "DELETE FROM runs WHERE job_id = ?1 AND status = 'claimed'",
                 params![id],
             )?;
             let n = tx.execute("DELETE FROM jobs WHERE id = ?1", params![id])?;
             tx.commit()?;
-            Ok(n == 1)
+            Ok(match n {
+                1 => JobRemoval::Removed,
+                _ => JobRemoval::Missing,
+            })
         })();
         self.db.pragma_update(None, "foreign_keys", true)?;
         removed
@@ -4161,7 +4182,7 @@ mod tests {
         let run = store.start_next_run(50).unwrap().unwrap();
         store.finish_run(&run, "completed", "", None, 50).unwrap();
         store.queue_run(job, 60).unwrap();
-        assert!(store.remove_job(job).unwrap());
+        assert_eq!(store.remove_job(job).unwrap(), JobRemoval::Removed);
         assert_eq!(
             ids(&store, "runs"),
             [run.id],
@@ -4169,7 +4190,7 @@ mod tests {
         );
         let runs = store.activity(0, &["job"], None, 10).unwrap();
         assert_eq!(runs[0].text, "(removed)");
-        assert!(!store.remove_job(job).unwrap());
+        assert_eq!(store.remove_job(job).unwrap(), JobRemoval::Missing);
         // The key is enforced again afterwards.
         let fk: i64 = store
             .db
@@ -4201,7 +4222,7 @@ mod tests {
         store.queue_run(old, 50).unwrap();
         let run = store.start_next_run(50).unwrap().unwrap();
         store.finish_run(&run, "completed", "", None, 50).unwrap();
-        assert!(store.remove_job(old).unwrap());
+        assert_eq!(store.remove_job(old).unwrap(), JobRemoval::Removed);
         let new = store
             .add_job("new", "0 18 * * *", "p", "chat", "1000")
             .unwrap();
@@ -4212,5 +4233,28 @@ mod tests {
         assert!(proposed > new);
         let runs = store.activity(0, &["job"], None, 10).unwrap();
         assert_eq!(runs[0].text, "(removed)");
+    }
+
+    /// PR #39 review: a job with a run in progress is not removed, or that run's restart notice
+    /// (which joins `jobs`) would be lost; the owner removes it once the run has ended.
+    #[test]
+    fn a_job_with_a_running_run_is_not_removed() {
+        let mut store = Store::open(&crate::test_dir("store-rm-running").join("state.db")).unwrap();
+        let job = store
+            .add_job("j", "0 7 * * *", "p", "chat", "1000")
+            .unwrap();
+        store.queue_run(job, 50).unwrap();
+        let run = store.start_next_run(50).unwrap().unwrap();
+        assert_eq!(store.remove_job(job).unwrap(), JobRemoval::Running);
+        assert!(store.job(job).unwrap().is_some());
+        assert_eq!(store.interrupt_running_runs(60).unwrap(), 1);
+        assert_eq!(
+            store.pending_outbox().unwrap().len(),
+            1,
+            "the restart notice"
+        );
+        assert_eq!(store.remove_job(job).unwrap(), JobRemoval::Removed);
+        assert_eq!(store.remove_job(job).unwrap(), JobRemoval::Missing);
+        let _ = run;
     }
 }

@@ -445,7 +445,8 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
 
 - **Files and jobs.** The agent's `send_file` tool sends you a file (up to 10 MB: a screenshot, a
   PDF) with its reply. Its `schedule` tool only proposes a job: you are shown it, and it runs after
-  `/job ok N` (`/job rm N` drops it; `/job list` marks the ones waiting).
+  `/job ok N` (`/job rm N` drops it, though not while one of its runs is in progress; `/job list`
+  marks the ones waiting).
 - **Commands.** The agent's `gateway` tool runs `/status`, `/model`, `/switch`, `/rules`,
   `/memory diff`, `/memory log`, `/job list`, `/settings`, `/approvals` or `/facts` (the facts'
   names and kinds, never a value) and reads the output in the same turn. It can save a private fact

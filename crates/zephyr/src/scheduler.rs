@@ -5,7 +5,7 @@
 use crate::channel::Inbound;
 use crate::config::{Config, BUDGET_NOTICE};
 use crate::rpc::{message_text, Child};
-use crate::store::Store;
+use crate::store::{JobRemoval, Store};
 use croner::parser::{CronParser, Seconds, Year};
 use jiff::{tz::TimeZone, Timestamp};
 use serde_json::json;
@@ -922,9 +922,12 @@ pub fn command(store: &mut Store, cfg: &Config, m: &Inbound) -> Option<String> {
             true => format!("[zephyr] job #{id} is on"),
             false => format!("[zephyr] no job #{id}"),
         }),
-        ("rm", Ok(id)) => store.remove_job(id).map(|found| match found {
-            true => format!("[zephyr] job #{id} removed"),
-            false => format!("[zephyr] no job #{id}"),
+        ("rm", Ok(id)) => store.remove_job(id).map(|done| match done {
+            JobRemoval::Removed => format!("[zephyr] job #{id} removed"),
+            JobRemoval::Missing => format!("[zephyr] no job #{id}"),
+            JobRemoval::Running => {
+                format!("[zephyr] job #{id} is running now; /job rm {id} once its run has ended")
+            }
         }),
         ("run", Ok(id)) => store.queue_run(id, crate::now()).map(|run| match run {
             Some(run) => format!("[zephyr] job #{id} queued as run {run}"),
