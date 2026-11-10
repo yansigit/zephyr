@@ -274,16 +274,20 @@ Deviation: the unit test's lines use rowid 1 and job #1 (spec §4.4's example us
   ```
 - Behaviour: opening the panel sends `Ask::Activity` for both tabs beside `Ask::Proposals`. Activity draws each `line`, `kind == "tool"` muted; the cursor reaching the last row with a `next` returns `Action::ActivityPage(next)` once per cursor. Grants draws each `line`; `r` returns `Action::Revoke(revoke)`, which mod.rs sends as `Ask::Prompt` with the panel left open; a `zephyr_reply` whose `command` starts with `/approvals forget`, `/set ` or `/job rm` while the panel is open sends `Ask::Activity { grants: true, before: None }`. `old: true` shows `this zephyr keeps no activity record; zephyr upgrade`. Help and footer gain `("r", "Grants: take it back")`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `overlays.rs` `activity_mutes_tool_rows_and_asks_for_the_next_page_at_the_bottom`: load 3 entries (one `tool`) with `next: "5.audit.9"`; draw shows the three lines; `End` returns `Action::ActivityPage("5.audit.9")`, a second `End` returns `Action::None`; `load_activity(page2, true)` appends.
   - `overlays.rs` `r_on_a_grant_sends_its_revoke`: on Grants, `r` → `Action::Revoke("/approvals forget 4")`.
   - `overlays.rs` `an_old_daemon_gives_an_empty_activity_tab`: `{"entries": [], "next": null, "old": true}` → the old-daemon text.
   - `tests/tui.rs`: the fake answers `zephyr.activity` with made-up entries (and sends `"zephyr.activity grants"` / `"zephyr.activity"` to `sent`); `revoking_a_grant_reloads_the_tab`: open `/settings`, go to `Grants`, `r` → `next_sent()` is `/approvals forget 4`, the fake replies `zephyr_reply` with that command, then `next_sent()` is `zephyr.activity grants`; shots `("activity", "held", 100, 30, "dark", …)` and `("grants", …)`.
-- [ ] **Step 2:** `cargo test -p zephyr --lib tui && cargo test -p zephyr --test tui` → FAIL.
-- [ ] **Step 3: Implement**; then `ZEPHYR_UPDATE_SCREENS=1 cargo test -p zephyr --test tui screens_match_the_goldens` and read both new goldens before keeping them.
-- [ ] **Step 4:** `cargo test -p zephyr` → PASS.
-- [ ] **Step 5:** Docs: DESIGN §4.3.2 the Activity and Grants tabs and `r`.
-- [ ] **Step 6:** Commit `feat(tui): show the activity record and the standing grants, each grant taken back with r`.
+- [x] **Step 2:** `cargo test -p zephyr --lib tui && cargo test -p zephyr --test tui` → FAIL.
+- [x] **Step 3: Implement**; then `ZEPHYR_UPDATE_SCREENS=1 cargo test -p zephyr --test tui screens_match_the_goldens` and read both new goldens before keeping them.
+- [x] **Step 4:** `cargo test -p zephyr` → PASS.
+- [x] **Step 5:** Docs: DESIGN §4.3.2 the Activity and Grants tabs and `r`.
+- [x] **Step 6:** Commit `feat(tui): show the activity record and the standing grants, each grant taken back with r`.
+
+Deviation: the fake in `tests/tui.rs` passes `zephyr.activity grants` on to `sent` only after a `/approvals forget` on that connection: the panel asks for both tabs each time it opens, and passing those on would queue them ahead of every other test's `next_sent`.
+Deviation: with Activity and Grants after Waiting, `End` on the left column lands on Grants, so the existing unit tests, tmux flows and the `waiting`/`action` shots that reached Waiting with `End` now press `End, Up, Up` (`to_waiting` in overlays.rs); the `settings` and `approvals` goldens gain the two tab names. Other goldens the update rewrote differed only in the masked mascot frame and were left as they were.
+Deviation: the footer on Grants reads `r take it back` (the tab names it); help reads `r  Grants: take it back`.
 
 ---
 

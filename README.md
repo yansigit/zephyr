@@ -139,6 +139,7 @@ alice@example.com`) and, waiting out a delay, when it goes.
 | `o` / `1` / `d` | Under Waiting: approve, approve once, or drop. `1` is always offered on a setting or a command, where it is the same as `o`; on an action it is offered where once differs from ok (`ask-new`), and on a message or post it approves once, without remembering its recipients, whatever mode its class was in when the list was read; on a payment or any other call it is the same as `o` |
 | `c` | Under Waiting: cancel an action waiting out its delay, before it goes |
 | `a` / `e` / `d` | Under Private facts: add a fact, edit one (`Enter` too; an empty value keeps the saved one), or delete one (`y` confirms); the value is typed masked, checked before it leaves, and never shown again |
+| `r` | Under Grants: send the command that takes the grant back (`/approvals forget N`, `/set KEY VALUE`, `/job rm N`), as if typed here; the list reloads. Activity, beside it, is zephyr's own record (`/activity`), and moving to its last row loads older entries |
 | `Esc` | Back, or close the panel |
 
 Drafts put aside are gone when you detach; the history starts again from the messages in the conversation. The footer shows `ctx N%`, how full the model's context is after the last reply.

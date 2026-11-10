@@ -136,13 +136,19 @@ impl Proposal {
 /// facts too, and one without has neither.
 const APPROVALS: &str = "Approvals";
 
-/// What the left column lists: the daemon's sections, the private facts, then Waiting.
+/// What the left column lists: the daemon's sections, the private facts, Waiting, then the
+/// activity record and the standing grants.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
     Section(usize),
     Facts,
     Waiting,
+    Activity,
+    Grants,
 }
+
+/// What the Activity and Grants tabs say for a daemon without `zephyr.activity`.
+const NO_RECORD: &str = "this zephyr keeps no activity record; zephyr upgrade";
 
 /// The facts form's fields, in order.
 const NAME: usize = 0;
@@ -280,6 +286,18 @@ pub struct SettingsPanel {
     pub fact_confirm: Option<String>,
     /// The fact the last facts call saved (`true`) or deleted, for the note its answer brings.
     fact_sent: Option<(bool, String)>,
+    /// `zephyr.activity`'s pages, newest first: each record's line, and whether it is a tool
+    /// call (drawn muted); `None` until the first came.
+    pub activity: Option<Vec<(String, bool)>>,
+    /// The cursor of the page after the last one shown, while there is one.
+    activity_next: Option<String>,
+    /// The page last asked for, so reaching the bottom asks for each page once.
+    activity_asked: Option<String>,
+    /// The standing grants: each line and the command that takes it back.
+    pub grants: Option<Vec<(String, String)>>,
+    /// Why the Activity or the Grants tab has nothing to show.
+    activity_note: Option<String>,
+    grants_note: Option<String>,
 }
 
 /// An edit of one setting, in the editor its kind takes.
@@ -538,7 +556,50 @@ impl SettingsPanel {
         self.facts_problem = Some(unprefixed(why).replace('\n', " "));
     }
 
-    /// The left column: each section, the private facts after Approvals, then Waiting.
+    /// Takes a `zephyr.activity` page: the first replaces what is shown, a later one (`append`,
+    /// asked with `before`) goes under it.
+    pub fn load_activity(&mut self, v: &Value, append: bool) {
+        self.activity_note = record_note(v);
+        let rows = (v["entries"].as_array().into_iter().flatten()).map(|e| {
+            (
+                line(e["line"].as_str().unwrap_or_default()),
+                e["kind"] == "tool",
+            )
+        });
+        let list = self.activity.get_or_insert_with(Vec::new);
+        if !append {
+            list.clear();
+            self.activity_asked = None;
+        }
+        list.extend(rows);
+        self.activity_next = v["next"].as_str().map(String::from);
+        self.clamp();
+    }
+
+    /// Takes `zephyr.activity`'s grants: each line and its revoke.
+    pub fn load_grants(&mut self, v: &Value) {
+        self.grants_note = record_note(v);
+        let rows = (v["entries"].as_array().into_iter().flatten()).map(|e| {
+            let text = |k: &str| line(e[k].as_str().unwrap_or_default());
+            (text("line"), text("revoke"))
+        });
+        self.grants = Some(rows.collect());
+        self.clamp();
+    }
+
+    /// The page before the last one shown, once, when the Activity cursor is on its last row.
+    fn more(&mut self) -> Action {
+        let last = self.len().checked_sub(1);
+        let next = self.activity_next.clone();
+        if self.tab() != Tab::Activity || self.row != last || next == self.activity_asked {
+            return Action::None;
+        }
+        self.activity_asked = next.clone();
+        next.map_or(Action::None, Action::ActivityPage)
+    }
+
+    /// The left column: each section, the private facts after Approvals, Waiting, Activity and
+    /// Grants.
     fn tabs(&self) -> Vec<Tab> {
         let mut out = vec![];
         for (i, x) in self.sections.iter().flatten().enumerate() {
@@ -547,7 +608,7 @@ impl SettingsPanel {
                 out.push(Tab::Facts);
             }
         }
-        out.push(Tab::Waiting);
+        out.extend([Tab::Waiting, Tab::Activity, Tab::Grants]);
         out
     }
 
@@ -565,6 +626,8 @@ impl SettingsPanel {
         match self.tab() {
             Tab::Waiting => self.waiting.as_ref().map_or(0, Vec::len),
             Tab::Facts => self.facts.as_ref().map_or(0, Vec::len),
+            Tab::Activity => self.activity.as_ref().map_or(0, Vec::len),
+            Tab::Grants => self.grants.as_ref().map_or(0, Vec::len),
             Tab::Section(i) => (self.sections.iter().flatten())
                 .nth(i)
                 .map_or(0, |x| x.settings.len()),
@@ -615,6 +678,18 @@ fn tidy(text: &str) -> String {
             | '\u{200e}' | '\u{200f}' | '\u{061c}')
     };
     clean(text).chars().filter(|&c| !turns(c)).collect()
+}
+
+/// What an Activity or Grants answer says instead of rows: an old daemon's, or why not.
+fn record_note(v: &Value) -> Option<String> {
+    match (v["old"].as_bool(), v.get("error")) {
+        (Some(true), _) => Some(NO_RECORD.into()),
+        (_, Some(e)) => Some(format!(
+            "the gateway did not list its activity: {}",
+            line(e.as_str().unwrap_or("no answer"))
+        )),
+        _ => None,
+    }
 }
 
 /// [`tidy`] on one line: a label, a value, a source.
@@ -766,6 +841,8 @@ fn main_rows(
             Tab::Section(i) => sections[*i].name.clone(),
             Tab::Facts => "Private facts".into(),
             Tab::Waiting => format!("Waiting ({count})"),
+            Tab::Activity => "Activity".into(),
+            Tab::Grants => "Grants".into(),
         })
         .collect();
     let name_w = names.iter().map(|n| visible_width(n)).max().unwrap_or(0);
@@ -775,6 +852,26 @@ fn main_rows(
     let right = match s.tab() {
         Tab::Waiting => waiting_cells(s, p, tz, right_w),
         Tab::Facts => fact_cells(s, p, right_w),
+        Tab::Activity => record_cells(
+            s.activity
+                .as_ref()
+                .map(|l| l.iter().map(|(t, m)| (t.as_str(), *m)).collect()),
+            s.activity_note.as_deref(),
+            "nothing recorded in the last 24 h",
+            s.row,
+            p,
+            right_w,
+        ),
+        Tab::Grants => record_cells(
+            s.grants
+                .as_ref()
+                .map(|l| l.iter().map(|(t, _)| (t.as_str(), false)).collect()),
+            s.grants_note.as_deref(),
+            "no standing grants",
+            s.row,
+            p,
+            right_w,
+        ),
         Tab::Section(i) => setting_cells(&sections[i], s.row, p, right_w),
     };
     let focus = s.row.unwrap_or(s.at);
@@ -815,6 +912,16 @@ fn main_rows(
         (.., Tab::Facts) => vec![
             "Kept out of outgoing calls: a call holding one waits for you, as approvals.facts \
              says. A value is typed here, masked, and never shown again."
+                .into(),
+        ],
+        (.., Tab::Activity) => vec![
+            "Zephyr's own record of what ran, what left the machine, what waited and what was \
+             refused, newest first. The agent never writes it."
+                .into(),
+        ],
+        (.., Tab::Grants) => vec![
+            "What still goes without asking. r sends the command that takes it back, as if \
+             typed here."
                 .into(),
         ],
         _ => vec![],
@@ -982,6 +1089,46 @@ fn fact_cells(s: &SettingsPanel, p: &Palette, w: usize) -> Vec<String> {
             false => cell,
         }
     }));
+    out
+}
+
+/// One line per record or grant, as the daemon drew it, `muted` ones (tool calls) dimmed; an
+/// empty list says `empty`, or the `note` (an old daemon, a refusal) when there is one.
+fn record_cells(
+    rows: Option<Vec<(&str, bool)>>,
+    note: Option<&str>,
+    empty: &str,
+    row: Option<usize>,
+    p: &Palette,
+    w: usize,
+) -> Vec<String> {
+    let rows = match rows {
+        None => return vec![p.muted.fg(&format!("  listing{}", glyph("…")))],
+        Some(r) if r.is_empty() => {
+            return vec![p.muted.fg(&format!("  {}", note.unwrap_or(empty)))];
+        }
+        Some(r) => r,
+    };
+    let mut out: Vec<String> = (rows.iter().enumerate())
+        .map(|(j, (text, muted))| {
+            let sel = row == Some(j);
+            let mark = if sel {
+                p.accent.fg(glyph("›"))
+            } else {
+                " ".into()
+            };
+            let colour = if *muted { p.muted } else { p.text };
+            let cell = format!("{mark} {}", colour.fg(&cut(text, w.saturating_sub(2))));
+            match sel {
+                true => p.surface.bg(&pad(&cell, w)),
+                false => cell,
+            }
+        })
+        .collect();
+    // A later page that failed: under the rows, so none moves.
+    if let Some(n) = note {
+        out.push(p.error.fg(&format!("  {}", cut(n, w.saturating_sub(2)))));
+    }
     out
 }
 
@@ -1286,6 +1433,7 @@ fn help_rows(p: &Palette) -> Vec<Row> {
             "e",
             "Private facts: edit one; an empty value keeps the saved one",
         ),
+        ("r", "Grants: take it back"),
         ("esc", "back, or close the panel"),
     ];
     let mut out = vec![Row::Head("keys".into(), "esc goes back".into())];
@@ -1360,6 +1508,7 @@ pub fn key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
             } else if matches!(code, KeyCode::Enter | KeyCode::Right | KeyCode::Tab) && len > 0 {
                 s.row = Some(0);
                 s.note = None;
+                return s.more();
             } else if code == KeyCode::Char('a') && s.tab() == Tab::Facts {
                 // Nothing to go into yet, so a fact is added from the section's own name too.
                 s.note = None;
@@ -1389,7 +1538,7 @@ pub fn key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
             if row != r {
                 s.row = Some(row);
                 s.note = None;
-                return Action::None;
+                return s.more();
             }
             if matches!(code, KeyCode::Left | KeyCode::BackTab) {
                 s.row = None;
@@ -1398,6 +1547,16 @@ pub fn key(o: &mut Overlay, k: KeyEvent, rows: &[Row]) -> Action {
             }
             if s.tab() == Tab::Facts {
                 fact_key(s, code);
+                return Action::None;
+            }
+            if s.tab() == Tab::Grants && code == KeyCode::Char('r') {
+                if let Some((_, revoke)) = s.grants.as_ref().and_then(|g| g.get(r)) {
+                    let revoke = revoke.clone();
+                    s.note = None;
+                    return Action::Revoke(revoke);
+                }
+            }
+            if matches!(s.tab(), Tab::Activity | Tab::Grants) {
                 return Action::None;
             }
             if let Some(pr) = s.proposal() {
@@ -1716,6 +1875,17 @@ pub fn hints(o: &Overlay) -> Vec<(&'static str, &'static str)> {
             (glyph("⏎"), "edit"),
             ("a", "add"),
             ("d", "delete"),
+            (glyph("↑↓"), "choose"),
+            (glyph("←"), "sections"),
+            ("?", "keys"),
+        ],
+        _ if s.tab() == Tab::Grants => vec![
+            ("r", "take it back"),
+            (glyph("↑↓"), "choose"),
+            (glyph("←"), "sections"),
+            ("?", "keys"),
+        ],
+        _ if s.tab() == Tab::Activity => vec![
             (glyph("↑↓"), "choose"),
             (glyph("←"), "sections"),
             ("?", "keys"),

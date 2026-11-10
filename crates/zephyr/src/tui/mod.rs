@@ -278,6 +278,13 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                         if ev["type"] == "zephyr_reply" && renamed {
                             let _ = prompt_tx.send(Ask::Sessions);
                         }
+                        // A revoke, or a change that may end a grant: list the grants again.
+                        let revoked = ["/approvals forget", "/set ", "/job rm"]
+                            .iter()
+                            .any(|c| command.starts_with(c));
+                        if ev["type"] == "zephyr_reply" && revoked && settings {
+                            let _ = prompt_tx.send(Ask::Activity { grants: true, before: None });
+                        }
                     }
                     Msg::Sessions(list) => s.sessions = list,
                     Msg::Turns(list) => {
@@ -413,6 +420,14 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                     Msg::Proposals(v) => {
                         if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Settings) {
                             o.settings.load_waiting(&v);
+                        }
+                    }
+                    Msg::Activity { grants, append, answer } => {
+                        if let Some(o) = s.overlay.as_mut().filter(|o| o.kind == Kind::Settings) {
+                            match grants {
+                                true => o.settings.load_grants(&answer),
+                                false => o.settings.load_activity(&answer, append),
+                            }
                         }
                     }
                     Msg::SettingResult(v) => {
@@ -618,6 +633,13 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
                                     Action::FactsRm(name) => {
                                         let _ = prompt_tx.send(Ask::FactsRm(name));
                                     }
+                                    Action::ActivityPage(before) => {
+                                        let before = Some(before);
+                                        let _ = prompt_tx.send(Ask::Activity { grants: false, before });
+                                    }
+                                    // Typed as the owner on `tui`; the panel stays open, and the
+                                    // reply reloads the grants.
+                                    Action::Revoke(command) => send(&mut s, &prompt_tx, command),
                                 }
                             }
                             _ if find.is_some() => {
@@ -1569,6 +1591,12 @@ fn open(
             let _ = asks.send(Ask::Proposals);
             let _ = asks.send(Ask::Models);
             let _ = asks.send(Ask::FactsList);
+            for grants in [false, true] {
+                let _ = asks.send(Ask::Activity {
+                    grants,
+                    before: None,
+                });
+            }
         }
         Kind::Status | Kind::Help | Kind::History => {}
     }
