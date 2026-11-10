@@ -605,3 +605,13 @@ Each piece starts with a failing test (CLAUDE.md, DESIGN §6).
   Screen app and on Android Chrome: enrol, sign in, chat, approve a card signed, deny from a
   notification, and swipe one away (Android).
 - **Not automated:** a real `tailscale serve`, and real push services.
+
+## Decided with the owner (2026-11-10)
+
+1. The session cookie is the weak `web` channel; each passkey-signed decision is the strong
+   `passkey` channel.
+2. `approvals.strong_only` keeps its default; `zephyr web setup` offers to add `money` once a
+   passkey is enrolled.
+3. Swipe-to-deny stays (Android only).
+4. Goals come from B's read-only `zephyr.goals` method; changes are sent as `/goal` commands.
+5. Passkey receipts (the signature and what it signed) are not stored yet.
