@@ -445,6 +445,10 @@ agent's short check-in on the goals (none when you have no goals). It goes to th
 wrote from. `/job list` shows it as a built-in job; `/job run N` sends one now, and
 `/set review.at none` turns it off.
 
+`/set memory.notify digest` (with `review.at` set) stops the memory notice after each run: the
+daily review lists every memory change since the last one, where each came from, and what is still
+waiting, and `/memory ok` after it keeps that. `/set memory.notify each` goes back.
+
 ## The agent's browser and desktop
 
 The image gives the agent a browser and a screen of its own (DESIGN §4.11):

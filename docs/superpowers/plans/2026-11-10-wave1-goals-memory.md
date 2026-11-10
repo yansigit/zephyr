@@ -309,11 +309,13 @@ Deviation: A4 is not merged, so the activity part is one private `review::activi
 - `validate`: `[memory] notify must be each or digest`; digest without `[review] at` → `[memory] notify = "digest" needs [review] at: the digest goes in the daily review` (so `/set memory.notify digest` with no review and `/set review.at none` under digest are both refused).
 - With `digest`, `commit_if_changed` neither marks shown nor returns a notice (an auto-approve still approves); callers pass `cfg.digest()`.
 
-- [ ] **Step 1: Write the failing tests.** `memory.rs`: `digest_mode_tells_nothing_and_leaves_it_unshown` (`Task(1)` commit with `digest = true` → `notice == None`; `/memory ok` → `memory changed since you saw it`). `config.rs`: `digest_needs_a_review_time`. `tests/router.rs`: `digest_is_refused_without_a_review_in_either_order`; `in_digest_mode_the_review_lists_the_change_and_ok_keeps_it` (with `taint`; `/set review.at 21:30`, `/set memory.notify digest`, `WRITE_MEMORY likes tea` → no reply starts `[zephyr] memory`; `/job run 1` → the block holds `Memory\n- `, `from this conversation, which used exec at 00:00` and `Waiting (/memory ok keeps it, /memory undo drops it):`; `/memory ok` → `[zephyr] memory kept`).
-- [ ] **Step 2:** `cargo test -p zephyr --lib -- memory config` and `cargo test -p zephyr --test router digest` → FAIL.
-- [ ] **Step 3:** Implement.
-- [ ] **Step 4:** Run the same → PASS; `cargo test -p zephyr` → PASS.
-- [ ] **Step 5:** DESIGN §4.6 digest mode, §4.17 row `memory.notify`; README `memory.notify`. Commit `feat(memory): list memory changes in the daily review instead of after each run, when the owner asks`.
+- [x] **Step 1: Write the failing tests.** `memory.rs`: `digest_mode_tells_nothing_and_leaves_it_unshown` (`Task(1)` commit with `digest = true` → `notice == None`; `/memory ok` → `memory changed since you saw it`). `config.rs`: `digest_needs_a_review_time`. `tests/router.rs`: `digest_is_refused_without_a_review_in_either_order`; `in_digest_mode_the_review_lists_the_change_and_ok_keeps_it` (with `taint`; `/set review.at 21:30`, `/set memory.notify digest`, `WRITE_MEMORY likes tea` → no reply starts `[zephyr] memory`; `/job run 1` → the block holds `Memory\n- `, `from this conversation, which used exec at 00:00` and `Waiting (/memory ok keeps it, /memory undo drops it):`; `/memory ok` → `[zephyr] memory kept`).
+- [x] **Step 2:** `cargo test -p zephyr --lib -- memory config` and `cargo test -p zephyr --test router digest` → FAIL.
+- [x] **Step 3:** Implement.
+- [x] **Step 4:** Run the same → PASS; `cargo test -p zephyr` → PASS.
+- [x] **Step 5:** DESIGN §4.6 digest mode, §4.17 row `memory.notify`; README `memory.notify`. Commit `feat(memory): list memory changes in the daily review instead of after each run, when the owner asks`.
+
+Deviation: the router restarts the child after any change saved at once (`auto` with a commit), since in digest mode the saved change has no notice to key on.
 
 ### Task B-10: `zephyr.goals` for clients
 

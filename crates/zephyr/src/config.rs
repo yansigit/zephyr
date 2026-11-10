@@ -83,6 +83,8 @@ pub struct Config {
     /// `[network]`: where the agent may connect beyond public ports 80 and 443 (DESIGN §4.20).
     #[serde(default)]
     pub network: Network,
+    /// `[memory]`: how memory changes are told (DESIGN §4.6). `each` when absent.
+    pub memory: Option<MemorySettings>,
     /// `[review]`: the built-in daily review (DESIGN §4.5). Off when absent.
     pub review: Option<Review>,
     /// `[approvals]`: how messages, posts and payments wait for the owner (approvals spec §4.3).
@@ -180,6 +182,14 @@ impl Budget {
 #[serde(deny_unknown_fields)]
 pub struct Review {
     pub at: Option<String>,
+}
+
+/// `[memory]` (DESIGN §4.6): `notify`, `each` (a notice after each run) or `digest` (the daily
+/// review lists the changes).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemorySettings {
+    pub notify: Option<String>,
 }
 
 /// `HH:MM` as `(hour, minute)`, 00:00 to 23:59, two digits each.
@@ -384,6 +394,18 @@ impl Config {
     }
 
     /// Account names become directory names, so each must be a plain, unique path segment.
+    /// Whether memory changes wait for the daily review instead of a notice each.
+    pub fn digest(&self) -> bool {
+        self.memory_notify() == "digest"
+    }
+
+    /// `[memory] notify`, `each` when unset.
+    pub fn memory_notify(&self) -> &str {
+        (self.memory.as_ref())
+            .and_then(|m| m.notify.as_deref())
+            .unwrap_or("each")
+    }
+
     /// `[review] at`, when the daily review is on.
     pub fn review_at(&self) -> Option<&str> {
         self.review.as_ref()?.at.as_deref()
@@ -416,6 +438,14 @@ impl Config {
             if hh_mm(at).is_none() {
                 anyhow::bail!("[review] at must be HH:MM, e.g. 21:30");
             }
+        }
+        if !matches!(self.memory_notify(), "each" | "digest") {
+            anyhow::bail!("[memory] notify must be each or digest");
+        }
+        if self.digest() && self.review_at().is_none() {
+            anyhow::bail!(
+                "[memory] notify = \"digest\" needs [review] at: the digest goes in the daily review"
+            );
         }
         if !(1..=32).contains(&self.parallel_tasks()) {
             anyhow::bail!("[tasks] parallel must be 1 to 32");
@@ -789,5 +819,30 @@ prompt = "Build it."
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn digest_needs_a_review_time() {
+        let load = |extra: &str| {
+            let cfg: Config =
+                toml::from_str(&format!("rpi = \"/r\"\nhome = \"/h\"\n{extra}")).unwrap();
+            cfg.validate()
+                .map(|()| cfg.digest())
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(load(""), Ok(false));
+        assert_eq!(load("[memory]\nnotify = \"each\"\n"), Ok(false));
+        assert_eq!(
+            load("[memory]\nnotify = \"digest\"\n[review]\nat = \"21:30\"\n"),
+            Ok(true)
+        );
+        assert_eq!(
+            load("[memory]\nnotify = \"digest\"\n"),
+            Err("[memory] notify = \"digest\" needs [review] at: the digest goes in the daily review".into())
+        );
+        assert_eq!(
+            load("[memory]\nnotify = \"weekly\"\n"),
+            Err("[memory] notify must be each or digest".into())
+        );
     }
 }

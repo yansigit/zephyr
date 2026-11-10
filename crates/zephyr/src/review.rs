@@ -218,7 +218,7 @@ mod tests {
         )
         .unwrap();
         let origin = crate::memory::Origin::Task(1);
-        let done = crate::memory::commit_if_changed(&cfg.home, cfg.state_dir(), &origin);
+        let done = crate::memory::commit_if_changed(&cfg.home, cfg.state_dir(), &origin, false);
         crate::memory::recorded(&store, done);
         let now = crate::now();
         let since = now - 86400;

@@ -2040,9 +2040,10 @@ impl<'a> Router<'a> {
             },
             Trust::Not(label) => crate::memory::Origin::Main(label),
         };
-        let done = crate::memory::commit(&self.cfg.home, self.cfg.state_dir(), origin).await;
+        let (home, state, digest) = (&self.cfg.home, self.cfg.state_dir(), self.cfg.digest());
+        let done = crate::memory::commit(home, state, origin, digest).await;
         // A change saved at once is in the next child's context, as a rule is.
-        if done.as_ref().is_ok_and(|c| c.auto && c.notice.is_some()) {
+        if done.as_ref().is_ok_and(|c| c.auto && c.sha.is_some()) {
             self.restart = true;
         }
         let memory = crate::memory::recorded(&self.store, done);

@@ -1304,6 +1304,71 @@ async fn a_review_before_any_message_fails_and_sends_nothing() {
     gw.shutdown().await;
 }
 
+const NEEDS_REVIEW: &str = "[zephyr] not changed: [memory] notify = \"digest\" needs [review] at: the digest goes in the daily review";
+
+#[tokio::test]
+async fn digest_is_refused_without_a_review_in_either_order() {
+    let home = home("digest-refused");
+    let gw = start(on_file(&home, "timezone = \"UTC\""));
+    gw.say("m1", "owner", "/set memory.notify digest").await;
+    reply_starting(&gw, NEEDS_REVIEW).await;
+    review_at(&gw, &home, "m2", "21:30", Some("30 21 * * *")).await;
+    gw.say("m3", "owner", "/set memory.notify digest").await;
+    reply_starting(&gw, "[zephyr] memory.notify each → digest").await;
+    gw.say("m4", "owner", "/set review.at none").await;
+    wait(|| {
+        gw.replies()
+            .iter()
+            .filter(|r| r.as_str() == NEEDS_REVIEW)
+            .count()
+            == 2
+    })
+    .await;
+    assert!(review_job(&home).is_some(), "the review stays");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn in_digest_mode_the_review_lists_the_change_and_ok_keeps_it() {
+    let home = home("digest-review");
+    let cfg = on_file(&home, "timezone = \"UTC\"");
+    taint(&cfg);
+    let gw = start(cfg);
+    review_at(&gw, &home, "m1", "21:30", Some("30 21 * * *")).await;
+    gw.say("m2", "owner", "/set memory.notify digest").await;
+    reply_starting(&gw, "[zephyr] memory.notify each → digest").await;
+    gw.say("m3", "owner", "WRITE_MEMORY likes tea").await;
+    wait(|| {
+        gw.replies()
+            .iter()
+            .any(|r| r.contains("] WRITE_MEMORY likes tea"))
+    })
+    .await;
+    gw.say("m4", "owner", "/job run 1").await;
+    let block = reply_starting(&gw, "[zephyr] daily review, ").await;
+    assert!(block.contains("\nMemory\n- "), "{block}");
+    assert!(
+        block.contains("from this conversation, which used exec at 00:00"),
+        "{block}"
+    );
+    assert!(
+        block.contains(
+            "Waiting (/memory ok keeps it, /memory undo drops it):\nMEMORY.md\n+ remembered: "
+        ),
+        "{block}"
+    );
+    assert!(
+        !gw.replies()
+            .iter()
+            .any(|r| r.starts_with("[zephyr] memory change") || r.starts_with(SAVED)),
+        "no notice after the run: {:?}",
+        gw.replies()
+    );
+    gw.say("m5", "owner", "/memory ok").await;
+    reply_starting(&gw, "[zephyr] memory kept").await;
+    gw.shutdown().await;
+}
+
 /// A goal written as `/goal add` would, without a message the agent takes up.
 fn crate_goal(home: &Path) {
     std::fs::write(home.join("GOALS.md"), "Ship zephyr 0.8\n").unwrap();

@@ -383,6 +383,18 @@ pub static SETTINGS: &[Setting] = &[
         Apply::Toml,
     ),
     row(
+        "memory.notify",
+        "Memory",
+        "Memory notices",
+        "each: you are sent each memory change after its run; digest: the daily review lists \
+         them instead (needs review.at).",
+        Kind::Choice(&["each", "digest"]),
+        Access::Tighten,
+        false,
+        Stricter::Earlier,
+        Apply::Toml,
+    ),
+    row(
         "persona",
         "Memory",
         "Persona",
@@ -906,6 +918,7 @@ pub fn value(cfg: &Config, key: &str) -> Option<String> {
         "budget.run_minutes" => budget?.run_minutes.map(|v| v.to_string()),
         "timezone" => cfg.timezone.clone(),
         "review.at" => cfg.review_at().map(String::from),
+        "memory.notify" => Some(cfg.memory_notify().into()),
         "auth.enabled" => Some(cfg.auth.enabled.to_string()),
         "auth.refresh_minutes" => Some(cfg.auth.refresh_minutes.to_string()),
         "settings.strong_channels" => Some(cfg.settings.strong_channels.join(", ")),
