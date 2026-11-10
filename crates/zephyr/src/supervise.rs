@@ -98,6 +98,12 @@ pub async fn main() -> ExitCode {
         }
         cmd.arg("run").spawn()
     };
+    if bridge {
+        // The agent's direct routes follow `network.allow`; only this process may change them.
+        tokio::spawn(crate::egress::keep_allow(
+            crate::config::Config::default_path(),
+        ));
+    }
     // Read once: with no readable config the daemon fails at start anyway.
     let config = crate::config::Config::load(&crate::config::Config::default_path());
     let policy = Policy {

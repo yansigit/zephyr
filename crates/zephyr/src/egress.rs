@@ -251,6 +251,20 @@ pub fn target(authority: &str) -> Result<(Host<String>, u16), Refusal> {
     }
 }
 
+/// Why `ip` may not be connected to, if it may not: it must be public, or private and of a
+/// listed entry, and never this container's own address. The one rule for the proxy and for
+/// the direct routes of `network.allow`.
+fn refused(ip: IpAddr, listed: bool, own: IpAddr, public: fn(IpAddr) -> bool) -> Option<String> {
+    if ip != own && (public(ip) || listed && private_ok(ip)) {
+        return None;
+    }
+    Some(match (listed, ip.is_loopback()) {
+        (false, _) => format!("private address {ip}"),
+        (true, true) => "loopback is never allowed".into(),
+        (true, false) => format!("{ip} is never allowed"),
+    })
+}
+
 /// Resolves a name to addresses. The proxy's is `system_lookup`; tests pass their own.
 pub type Lookup = fn(String, u16) -> BoxFuture<'static, std::io::Result<Vec<SocketAddr>>>;
 
@@ -288,15 +302,8 @@ pub async fn decide(
             }
         }
     };
-    for &ip in &ips {
-        if ip != own && (public(ip) || listed && private_ok(ip)) {
-            continue;
-        }
-        return Err(Refusal::Denied(match (listed, ip.is_loopback()) {
-            (false, _) => format!("private address {ip}"),
-            (true, true) => "loopback is never allowed".into(),
-            (true, false) => format!("{ip} is never allowed"),
-        }));
+    if let Some(reason) = ips.iter().find_map(|ip| refused(*ip, listed, own, public)) {
+        return Err(Refusal::Denied(reason));
     }
     // The port is the request's, whatever the lookup answered.
     Ok(ips
@@ -752,22 +759,30 @@ async fn forward(
 /// The rules that leave the agent's uid no route but its own loopback (DESIGN §4.19). The jump
 /// is on the agent's uid, so a packet with no socket (a kernel reset) falls through to accept;
 /// TCP is reset, so a connect fails at once instead of timing out; and there is no port list,
-/// because nothing of root's listens on loopback but the proxy.
+/// because nothing of root's listens on loopback but the proxy. The `allow` set holds the
+/// `address . port` pairs of `network.allow` (`keep_allow`), the only direct routes there are.
+/// The first rule keeps the agent from sending as Docker's resolver (127.0.0.11, an address any
+/// local process may bind): a lookup root makes there must not be answerable by the agent.
 pub fn ruleset(agent_uid: u32) -> String {
     format!(
         "\
 table inet zephyr
 delete table inet zephyr
 table inet zephyr {{
+  set allow {{
+    type ipv4_addr . inet_service
+  }}
   chain output {{
     type filter hook output priority filter; policy accept;
     meta skuid {agent_uid} jump agent
   }}
   chain agent {{
+    ip saddr 127.0.0.11 reject            # never as Docker's DNS: root's lookups cannot be answered by the agent
     ct state established accept           # replies on connections made to the agent (x11vnc, a dev server the owner opens)
     ip daddr 127.0.0.11 reject            # Docker's embedded DNS: the agent gets no resolver
     ip daddr 127.0.0.0/8 accept           # its own servers, and the proxy at 127.0.0.1:7792
     ip6 daddr ::1 accept
+    ip daddr . tcp dport @allow accept    # network.allow, as supervise resolved it (egress::keep_allow)
     meta l4proto tcp reject with tcp reset
     reject with icmpx admin-prohibited
   }}
@@ -779,11 +794,16 @@ table inet zephyr {{
 /// Loads the rules for the agent's uid (`ZEPHYR_AGENT_UID`) with root's own `nft`. `supervise`
 /// runs this once, before the first daemon: a container start is a fresh network namespace.
 pub fn load_floor() -> anyhow::Result<()> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
     let uid = std::env::var("ZEPHYR_AGENT_UID").context("ZEPHYR_AGENT_UID is not set")?;
     let uid: u32 = uid.parse().context("ZEPHYR_AGENT_UID is not a uid")?;
     anyhow::ensure!(uid != 0, "ZEPHYR_AGENT_UID is root's");
+    nft(&ruleset(uid))
+}
+
+/// Runs `script` through root's own `nft`, as one transaction.
+fn nft(script: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
     let mut nft = Command::new("/usr/sbin/nft")
         .args(["-f", "-"])
         .stdin(Stdio::piped())
@@ -792,12 +812,255 @@ pub fn load_floor() -> anyhow::Result<()> {
         .spawn()
         .context("running /usr/sbin/nft")?;
     let mut stdin = nft.stdin.take().context("nft's stdin")?;
-    stdin.write_all(ruleset(uid).as_bytes())?;
+    stdin.write_all(script.as_bytes())?;
     drop(stdin);
     let out = nft.wait_with_output()?;
     let said = String::from_utf8_lossy(&out.stderr);
     anyhow::ensure!(out.status.success(), "nft: {}", said.trim());
     Ok(())
+}
+
+/// The direct routes `network.allow` gives the agent: what goes into the `allow` set and into
+/// /etc/hosts, and what got no route and why.
+#[derive(Debug, Default, PartialEq)]
+pub struct Routes {
+    /// `address . port` pairs, sorted, each once.
+    pub pairs: Vec<(Ipv4Addr, u16)>,
+    /// One address per listed name, for /etc/hosts: the agent has no resolver.
+    pub names: Vec<(Ipv4Addr, String)>,
+    pub problems: Vec<String>,
+}
+
+/// Resolves `allow` into direct routes under the rule the proxy applies to a listed entry
+/// (`refused`): every address of a host must pass, or the host gets none. IPv4 only, as the
+/// container's network is.
+pub async fn routes(
+    allow: &[Entry],
+    own: IpAddr,
+    public: fn(IpAddr) -> bool,
+    lookup: Lookup,
+) -> Routes {
+    let mut out = Routes::default();
+    let mut seen: Vec<&Host<String>> = Vec::new();
+    for entry in allow {
+        if seen.contains(&&entry.host) {
+            continue;
+        }
+        seen.push(&entry.host);
+        let ips: Vec<IpAddr> = match &entry.host {
+            Host::Ipv4(ip) => vec![IpAddr::V4(*ip)],
+            Host::Ipv6(ip) => vec![IpAddr::V6(*ip)],
+            Host::Domain(name) => {
+                let found = tokio::time::timeout(LOOKUP_WAIT, lookup(name.clone(), entry.port));
+                let found = found.await.ok().and_then(Result::ok).unwrap_or_default();
+                found.iter().map(SocketAddr::ip).collect()
+            }
+        };
+        let v4: Vec<Ipv4Addr> = (ips.iter())
+            .filter_map(|ip| match ip {
+                IpAddr::V4(ip) => Some(*ip),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
+        let problem = match ips.iter().find_map(|ip| refused(*ip, true, own, public)) {
+            Some(reason) => Some(reason),
+            None if ips.is_empty() => Some("the name has no address".into()),
+            None if v4.is_empty() => Some("it has no IPv4 address".into()),
+            None => None,
+        };
+        if let Some(problem) = problem {
+            out.problems
+                .push(format!("{}:{}: {problem}", entry.host, entry.port));
+            continue;
+        }
+        if let Host::Domain(name) = &entry.host {
+            out.names.push((v4[0], name.clone()));
+        }
+        let ports = allow
+            .iter()
+            .filter(|e| e.host == entry.host)
+            .map(|e| e.port);
+        for port in ports {
+            out.pairs.extend(v4.iter().map(|ip| (*ip, port)));
+        }
+    }
+    out.pairs.sort();
+    out.pairs.dedup();
+    out
+}
+
+/// The nft commands that make the `allow` set exactly `pairs`, in one transaction.
+fn allow_script(pairs: &[(Ipv4Addr, u16)]) -> String {
+    let mut script = String::from("flush set inet zephyr allow\n");
+    if !pairs.is_empty() {
+        let pairs: Vec<String> = (pairs.iter())
+            .map(|(ip, port)| format!("{ip} . {port}"))
+            .collect();
+        script += &format!("add element inet zephyr allow {{ {} }}\n", pairs.join(", "));
+    }
+    script
+}
+
+/// What marks a line of /etc/hosts as one of ours.
+const HOSTS_MARK: &str = "\t# zephyr network.allow";
+
+/// /etc/hosts with the lines for `names` in place of the ones written before; every other line
+/// is kept as it is.
+fn hosts_with(current: &str, names: &[(Ipv4Addr, String)]) -> String {
+    let kept = current.lines().filter(|l| !l.ends_with(HOSTS_MARK));
+    let ours = (names.iter()).map(|(ip, name)| format!("{ip}\t{name}{HOSTS_MARK}"));
+    let lines: Vec<String> = kept.map(String::from).chain(ours).collect();
+    match lines.is_empty() {
+        true => String::new(),
+        false => lines.join("\n") + "\n",
+    }
+}
+
+/// A DNS query for `name`'s IPv4 addresses; `None` for a name that cannot be asked for.
+fn dns_query(name: &str, id: u16) -> Option<Vec<u8>> {
+    let mut query = id.to_be_bytes().to_vec();
+    // Recursion desired, one question.
+    query.extend([1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+    for label in name.trim_end_matches('.').split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+        query.push(label.len() as u8);
+        query.extend(label.bytes());
+    }
+    // The root, then type A, class IN.
+    query.extend([0, 0, 1, 0, 1]);
+    Some(query)
+}
+
+/// The IPv4 addresses in `reply`, when it is the answer to query `id` and reports no error.
+/// Every read is checked: the packet comes off the network.
+fn dns_answers(reply: &[u8], id: u16) -> Option<Vec<Ipv4Addr>> {
+    let u16_at = |at: usize| Some(u16::from_be_bytes([*reply.get(at)?, *reply.get(at + 1)?]));
+    let (response, failed) = (reply.get(2)? & 0x80 != 0, reply.get(3)? & 0x0f != 0);
+    if u16_at(0)? != id || !response || failed {
+        return None;
+    }
+    // A name ends at its root label or at a pointer to an earlier one.
+    let after_name = |mut at: usize| loop {
+        match *reply.get(at)? as usize {
+            0 => return Some(at + 1),
+            len if len & 0xc0 == 0xc0 => return Some(at + 2),
+            len => at += 1 + len,
+        }
+    };
+    let mut at = 12;
+    for _ in 0..u16_at(4)? {
+        at = after_name(at)? + 4;
+    }
+    let mut ips = Vec::new();
+    for _ in 0..u16_at(6)? {
+        at = after_name(at)?;
+        let (kind, class, len) = (u16_at(at)?, u16_at(at + 2)?, u16_at(at + 8)? as usize);
+        let data = reply.get(at + 10..at + 10 + len)?;
+        if let (1, 1, [a, b, c, d]) = (kind, class, data) {
+            ips.push(Ipv4Addr::new(*a, *b, *c, *d));
+        }
+        at += 10 + len;
+    }
+    Some(ips)
+}
+
+/// A name's IPv4 addresses as the nameservers of /etc/resolv.conf give them, never as /etc/hosts
+/// does: the lines `keep_allow` writes there would otherwise answer its own next lookup for ever.
+pub fn dns_lookup(host: String, port: u16) -> BoxFuture<'static, std::io::Result<Vec<SocketAddr>>> {
+    use std::hash::{BuildHasher, Hasher};
+    Box::pin(async move {
+        let conf = tokio::fs::read_to_string("/etc/resolv.conf").await?;
+        let servers = conf.lines().filter_map(|l| {
+            let server = l.strip_prefix("nameserver")?.trim();
+            server.parse::<IpAddr>().ok()
+        });
+        let id = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish() as u16;
+        let query = dns_query(&host, id).ok_or(std::io::ErrorKind::InvalidInput)?;
+        for server in servers {
+            let any: SocketAddr = match server {
+                IpAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+                IpAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+            };
+            // Connected, so only that server's own packets are read.
+            let socket = tokio::net::UdpSocket::bind(any).await?;
+            socket.connect((server, 53)).await?;
+            socket.send(&query).await?;
+            let mut reply = [0u8; 1500];
+            let got = tokio::time::timeout(Duration::from_secs(2), socket.recv(&mut reply)).await;
+            if let Some(ips) = got
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|n| dns_answers(&reply[..n], id))
+            {
+                return Ok(ips.into_iter().map(|ip| (ip, port).into()).collect());
+            }
+        }
+        Err(std::io::Error::other("no nameserver answered"))
+    })
+}
+
+/// `network.allow` as zephyr.toml has it now; `None` when the file cannot be read. Read by key,
+/// so nothing else in the file matters here.
+fn allow_in(config: &std::path::Path) -> Option<String> {
+    let file: toml::Value = toml::from_str(&std::fs::read_to_string(config).ok()?).ok()?;
+    let allow = file.get("network").and_then(|n| n.get("allow"));
+    Some(
+        allow
+            .and_then(|a| a.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+/// Keeps the agent's direct routes in step with `network.allow` (DESIGN §4.19), for the
+/// programs that speak no proxy: a mail client, `ssh`, a database client. Run by `supervise`,
+/// which alone holds NET_ADMIN; the daemon cannot change the rules. Every 5 s it reads the
+/// setting, and when it changed, or an hour has passed (a minute, while an entry has no route),
+/// it resolves the entries (`routes`), replaces the `allow` set and rewrites its own lines of
+/// /etc/hosts, so a listed name resolves for the agent, to an address in the set, and nothing
+/// else does. A file it cannot read, or an entry list the daemon would refuse, changes nothing.
+pub async fn keep_allow(config: std::path::PathBuf) {
+    const HOSTS: &str = "/etc/hosts";
+    let (mut applied, mut said): (Option<(String, std::time::Instant, bool)>, _) =
+        (None, Vec::new());
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let Some(raw) = allow_in(&config) else {
+            continue;
+        };
+        let due = applied.as_ref().is_none_or(|(was, at, whole)| {
+            let again = Duration::from_secs(if *whole { 3600 } else { 60 });
+            *was != raw || at.elapsed() >= again
+        });
+        let (Ok(entries), Ok(own), true) = (parse_allow(&raw), own_ip(), due) else {
+            continue;
+        };
+        let routes = routes(&entries, own.into(), public, dns_lookup).await;
+        let loaded = nft(&allow_script(&routes.pairs)).and_then(|()| {
+            let current = std::fs::read_to_string(HOSTS)?;
+            let next = hosts_with(&current, &routes.names);
+            // In place: Docker mounts this one file, so it cannot be replaced by a rename.
+            if next != current {
+                std::fs::write(HOSTS, next)?;
+            }
+            Ok(())
+        });
+        if let Err(e) = loaded {
+            eprintln!("zephyr: the routes for network.allow were not loaded: {e:#}");
+            continue;
+        }
+        if routes.problems != said {
+            for problem in &routes.problems {
+                eprintln!("zephyr: network.allow has no direct route for {problem}");
+            }
+            said = routes.problems.clone();
+        }
+        applied = Some((raw, std::time::Instant::now(), routes.problems.is_empty()));
+    }
 }
 
 /// CAP_NET_ADMIN's and CAP_SETPCAP's numbers (linux/capability.h).
@@ -1693,15 +1956,20 @@ mod tests {
 table inet zephyr
 delete table inet zephyr
 table inet zephyr {
+  set allow {
+    type ipv4_addr . inet_service
+  }
   chain output {
     type filter hook output priority filter; policy accept;
     meta skuid 1000 jump agent
   }
   chain agent {
+    ip saddr 127.0.0.11 reject            # never as Docker's DNS: root's lookups cannot be answered by the agent
     ct state established accept           # replies on connections made to the agent (x11vnc, a dev server the owner opens)
     ip daddr 127.0.0.11 reject            # Docker's embedded DNS: the agent gets no resolver
     ip daddr 127.0.0.0/8 accept           # its own servers, and the proxy at 127.0.0.1:7792
     ip6 daddr ::1 accept
+    ip daddr . tcp dport @allow accept    # network.allow, as supervise resolved it (egress::keep_allow)
     meta l4proto tcp reject with tcp reset
     reject with icmpx admin-prohibited
   }
@@ -1876,5 +2144,109 @@ table inet zephyr {
             Some(b"ok".to_vec()),
             "the stalled reply stayed open"
         );
+    }
+
+    #[tokio::test]
+    async fn routes_follow_the_allow_list_under_decides_rules() {
+        let allow = "imap.gmail.com:993, example.com:22, example.com:2222, 10.0.0.5:5432, \
+                     mixed.test:8443, meta.lan:80, loop.lan:8080, self.lan:7790, nowhere.test:25";
+        let allow = parse_allow(allow).unwrap();
+        let got = routes(&allow, ip(OWN), public, names).await;
+        let v4 = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        assert_eq!(
+            got.pairs,
+            [
+                (v4("1.1.1.1"), 22),
+                (v4("1.1.1.1"), 993),
+                (v4("1.1.1.1"), 2222),
+                (v4("1.1.1.1"), 8443),
+                // A listed entry may be on the LAN, as through the proxy.
+                (v4("10.0.0.5"), 5432),
+                (v4("10.0.0.5"), 8443),
+            ]
+        );
+        // One line per listed name, on an address that is in the set; a literal needs none.
+        assert_eq!(
+            got.names,
+            [
+                (v4("1.1.1.1"), "imap.gmail.com".to_string()),
+                (v4("1.1.1.1"), "example.com".to_string()),
+                (v4("1.1.1.1"), "mixed.test".to_string()),
+            ]
+        );
+        // What the proxy would refuse gets no route either, and a name with no address none.
+        assert_eq!(
+            got.problems,
+            [
+                "meta.lan:80: 169.254.169.254 is never allowed",
+                "loop.lan:8080: loopback is never allowed",
+                "self.lan:7790: 172.18.0.2 is never allowed",
+                "nowhere.test:25: the name has no address",
+            ]
+        );
+        let none = routes(&[], ip(OWN), public, names).await;
+        assert!(none.pairs.is_empty() && none.names.is_empty() && none.problems.is_empty());
+    }
+
+    #[test]
+    fn the_allow_set_is_replaced_whole() {
+        let v4 = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        assert_eq!(
+            allow_script(&[(v4("1.1.1.1"), 993), (v4("10.0.0.5"), 5432)]),
+            "flush set inet zephyr allow\nadd element inet zephyr allow { 1.1.1.1 . 993, 10.0.0.5 . 5432 }\n"
+        );
+        assert_eq!(allow_script(&[]), "flush set inet zephyr allow\n");
+    }
+
+    #[test]
+    fn hosts_lines_are_replaced_and_everything_else_is_kept() {
+        let v4 = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        let docker = "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost\n172.18.0.2\tzephyr\n";
+        let one = hosts_with(docker, &[(v4("1.1.1.1"), "imap.gmail.com".into())]);
+        assert_eq!(
+            one,
+            format!("{docker}1.1.1.1\timap.gmail.com\t# zephyr network.allow\n")
+        );
+        // A refresh replaces the old lines; with nothing listed the file is Docker's again.
+        let two = hosts_with(&one, &[(v4("8.8.8.8"), "github.com".into())]);
+        assert_eq!(
+            two,
+            format!("{docker}8.8.8.8\tgithub.com\t# zephyr network.allow\n")
+        );
+        assert_eq!(hosts_with(&two, &[]), docker);
+        assert_eq!(hosts_with(docker, &[]), docker);
+    }
+
+    #[test]
+    fn dns_asks_for_a_names_ipv4_addresses_and_reads_only_its_own_answer() {
+        let query = dns_query("example.com", 0xbeef).unwrap();
+        assert_eq!(
+            query,
+            b"\xbe\xef\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01"
+        );
+        assert!(dns_query("a..b", 1).is_none());
+        assert!(dns_query(&"x".repeat(64), 1).is_none());
+
+        // The question back, a CNAME, then two A records, names compressed as servers send them.
+        let mut reply = b"\xbe\xef\x81\x80\x00\x01\x00\x03\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01".to_vec();
+        reply.extend(b"\xc0\x0c\x00\x05\x00\x01\x00\x00\x00\x3c\x00\x06\x03www\xc0\x0c");
+        reply.extend(b"\xc0\x29\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04");
+        reply.extend(b"\xc0\x29\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x05\x06\x07\x08");
+        let ips = [
+            "1.2.3.4".parse::<Ipv4Addr>().unwrap(),
+            "5.6.7.8".parse().unwrap(),
+        ];
+        assert_eq!(dns_answers(&reply, 0xbeef), Some(ips.to_vec()));
+        // Another query's answer, a query, an error and a cut-off packet are not answers.
+        assert_eq!(dns_answers(&reply, 0xbeee), None);
+        let mut question = reply.clone();
+        question[2] = 0x01;
+        assert_eq!(dns_answers(&question, 0xbeef), None);
+        let mut nxdomain = reply.clone();
+        nxdomain[3] = 0x83;
+        assert_eq!(dns_answers(&nxdomain, 0xbeef), None);
+        for cut in 0..reply.len() {
+            assert_eq!(dns_answers(&reply[..cut], 0xbeef), None, "cut at {cut}");
+        }
     }
 }

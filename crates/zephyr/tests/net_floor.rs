@@ -199,4 +199,62 @@ fn the_agent_reaches_only_the_proxy() {
     // And the owner still reaches the attach port, published on this machine's loopback.
     std::net::TcpStream::connect(format!("127.0.0.1:{port}"))
         .expect("the attach port is published");
+
+    // network.allow opens a direct route, for programs that speak no proxy: ssh's greeting from
+    // a listed host and port, by name, with no resolver for anything else.
+    let greeting = |host: &str, port: u16| {
+        let open = format!("exec 3<>/dev/tcp/{host}/{port} && head -c 4 <&3");
+        side.agent(&["timeout", "8", "bash", "-c", &open])
+    };
+    let resolves = |name: &str| side.agent(&["getent", "hosts", name]).status.success();
+    let until = |what: &str, done: &dyn Fn() -> bool| {
+        let started = Instant::now();
+        while !done() {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "waited 60 s for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    };
+    assert!(
+        !greeting("github.com", 22).status.success(),
+        "open before it was listed"
+    );
+    let set = side.root(&["zephyr", "set", "network.allow", "github.com:22"]);
+    assert!(set.status.success(), "{}", text(&set));
+    until("github.com to resolve for the agent", &|| {
+        resolves("github.com")
+    });
+    let ssh = greeting("github.com", 22);
+    assert_eq!(text(&ssh), "SSH-", "the listed host and port");
+    // Only that port of it, only that name, and nothing as the resolver the daemon asks.
+    let started = Instant::now();
+    assert!(
+        !greeting("github.com", 443).status.success(),
+        "an unlisted port opened"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "it was not refused at once"
+    );
+    assert!(!resolves("gitlab.com"));
+    const AS_DNS: &str = "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); \
+        s.bind(('127.0.0.11', 0)); s.sendto(b'x', ('127.0.0.1', 9))";
+    let spoof = side.agent(&["python3", "-c", AS_DNS]);
+    assert!(
+        !spoof.status.success(),
+        "the agent sent a packet as Docker's DNS"
+    );
+    // An entry that goes takes its route and its name with it.
+    let set = side.root(&["zephyr", "set", "network.allow", "example.org:2222"]);
+    assert!(set.status.success(), "{}", text(&set));
+    until("github.com to stop resolving", &|| !resolves("github.com"));
+    let hosts = text(&side.root(&["cat", "/etc/hosts"]));
+    assert!(!hosts.contains("github.com"), "{hosts}");
+    let pairs = text(&side.root(&["nft", "list", "set", "inet", "zephyr", "allow"]));
+    assert!(
+        pairs.contains(". 2222") && !pairs.contains(". 22,") && !pairs.contains(". 22 "),
+        "{pairs}"
+    );
 }
