@@ -509,6 +509,67 @@ pub struct Revert {
     pub channel: Option<String>,
 }
 
+/// One entry of the activity record (DESIGN §4.19): `src` is the table it came from and `id` its
+/// row there, `at` its latest change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Record {
+    pub at: i64,
+    pub src: String,
+    pub id: i64,
+    pub kind: String,
+    pub subject: String,
+    pub status: String,
+    pub text: String,
+}
+
+/// Where a page of the activity record ends: the next page is what sorts strictly before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cursor {
+    pub at: i64,
+    pub src: String,
+    pub id: i64,
+}
+
+/// The tables the activity record reads, as a cursor names them.
+pub const ACTIVITY_SOURCES: [&str; 6] = [
+    "audit",
+    "settings_log",
+    "proposals",
+    "runs",
+    "tasks",
+    "procs",
+];
+
+impl Cursor {
+    /// `AT.SRC.ID`, strictly: an integer, one of [`ACTIVITY_SOURCES`], an integer.
+    pub fn parse(s: &str) -> Option<Cursor> {
+        let parts: Vec<&str> = s.split('.').collect();
+        let [at, src, id] = parts[..] else {
+            return None;
+        };
+        let src = ACTIVITY_SOURCES.iter().find(|t| **t == src)?;
+        Some(Cursor {
+            at: at.parse().ok()?,
+            src: (*src).to_string(),
+            id: id.parse().ok()?,
+        })
+    }
+
+    pub fn of(r: &Record) -> Cursor {
+        Cursor {
+            at: r.at,
+            src: r.src.clone(),
+            id: r.id,
+        }
+    }
+}
+
+impl std::fmt::Display for Cursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.at, self.src, self.id)
+    }
+}
+
 /// The latest change recorded for a setting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingChange {
@@ -1363,7 +1424,7 @@ impl Store {
     pub fn settle_proposal(&self, id: i64, status: &str) -> rusqlite::Result<Option<String>> {
         self.db
             .query_row(
-                "UPDATE proposals SET status = ?2
+                "UPDATE proposals SET status = ?2, settled_at = unixepoch()
                  WHERE id = ?1 AND kind = 'command' AND status = 'pending'
                    AND created_at > unixepoch() - 86400
                  RETURNING command",
@@ -1748,6 +1809,62 @@ impl Store {
             .db
             .prepare("SELECT session, tool, args, outcome FROM audit ORDER BY id")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect()
+    }
+
+    /// The activity record (DESIGN §4.19), newest first: what is at or after `since`, of `kinds`
+    /// (empty: all but `tool`), strictly before `before`, at most `limit`.
+    pub fn activity(
+        &self,
+        since: i64,
+        kinds: &[&str],
+        before: Option<&Cursor>,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<Record>> {
+        let kinds = if kinds.is_empty() {
+            ",out,gate,refused,setting,proposal,job,task,process,".to_string()
+        } else {
+            format!(",{},", kinds.join(","))
+        };
+        let (at, src, id) = before.map_or((i64::MAX, "", 0), |c| (c.at, c.src.as_str(), c.id));
+        let mut stmt = self.db.prepare_cached(
+            "WITH a(at, src, id, kind, subject, status, text) AS (
+               SELECT ts, 'audit', id,
+                      CASE WHEN tool = 'outbound' THEN 'out'
+                           WHEN outcome IN ('refused', 'denied') THEN 'refused'
+                           WHEN outcome IN ('started', 'error') THEN 'tool' ELSE 'gate' END,
+                      session, outcome, iif(tool = 'outbound', args, tool || ' ' || args)
+                 FROM audit WHERE ts >= ?1
+               UNION ALL SELECT at, 'settings_log', id, 'setting',
+                      actor || coalesce(' on ' || channel, '') || coalesce(' (#' || proposal || ')', ''),
+                      actor, key || ' ' || coalesce(old, 'none') || ' → ' || coalesce(new, 'none')
+                 FROM settings_log WHERE at >= ?1
+               UNION ALL SELECT coalesce(settled_at, created_at), 'proposals', id, 'proposal', '#' || id,
+                      iif(status = 'pending' AND created_at <= unixepoch() - 86400, 'expired', status), command
+                 FROM proposals WHERE kind = 'command' AND coalesce(settled_at, created_at) >= ?1
+               UNION ALL SELECT coalesce(r.ended_at, r.started_at, r.due_at), 'runs', r.id, 'job',
+                      '#' || r.job_id || ' run ' || r.id, r.status, coalesce(j.name, '(removed)')
+                 FROM runs r LEFT JOIN jobs j ON j.id = r.job_id
+                WHERE coalesce(r.ended_at, r.started_at, r.due_at) >= ?1
+               UNION ALL SELECT coalesce(ended_at, started_at, created_at), 'tasks', id, 'task', '#' || id,
+                      status, goal FROM tasks WHERE coalesce(ended_at, started_at, created_at) >= ?1
+               UNION ALL SELECT coalesce(ended_at, created_at), 'procs', id, 'process', '#' || id,
+                      status || coalesce(' ' || exit_code, ''), command
+                 FROM procs WHERE coalesce(ended_at, created_at) >= ?1)
+             SELECT * FROM a WHERE instr(?2, ',' || kind || ',') AND (at, src, id) < (?3, ?4, ?5)
+             ORDER BY at DESC, src DESC, id DESC LIMIT ?6",
+        )?;
+        let rows = stmt.query_map(params![since, kinds, at, src, id, limit], |r| {
+            Ok(Record {
+                at: r.get(0)?,
+                src: r.get(1)?,
+                id: r.get(2)?,
+                kind: r.get(3)?,
+                subject: r.get(4)?,
+                status: r.get(5)?,
+                text: r.get(6)?,
+            })
+        })?;
         rows.collect()
     }
 
@@ -3528,5 +3645,266 @@ mod tests {
             .unwrap();
         assert_eq!((mode.as_str(), sync), ("wal", 2));
         assert_eq!(store.inbox_with_status("new").unwrap().len(), 1);
+    }
+
+    fn kinds_of(rs: &[Record]) -> Vec<&str> {
+        rs.iter().map(|r| r.kind.as_str()).collect()
+    }
+
+    const ALL_KINDS: [&str; 9] = [
+        "out", "gate", "refused", "setting", "proposal", "job", "task", "process", "tool",
+    ];
+
+    #[test]
+    fn activity_lists_every_source_newest_first() {
+        let mut store =
+            Store::open(&crate::test_dir("store-activity-all").join("state.db")).unwrap();
+        store
+            .audit("main", "outbound", "curl POST api.example.com", "started")
+            .unwrap();
+        store
+            .audit("main", "exec", r#"{"command":"x"}"#, "held")
+            .unwrap();
+        store.audit("main", "read", "{}", "started").unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE audit SET ts = CASE id WHEN 1 THEN 10 WHEN 2 THEN 20 ELSE 25 END",
+                [],
+            )
+            .unwrap();
+        store
+            .log_setting(
+                "tasks.parallel",
+                Some("4"),
+                Some("2"),
+                "agent",
+                Some("tui"),
+                None,
+            )
+            .unwrap();
+        store
+            .db
+            .execute("UPDATE settings_log SET at = 30", [])
+            .unwrap();
+        store.propose_command("/vault grant x").unwrap();
+        store
+            .db
+            .execute("UPDATE proposals SET created_at = 40", [])
+            .unwrap();
+        let job = store
+            .add_job("brief", "0 7 * * *", "p", "chat", "1000")
+            .unwrap();
+        store.queue_run(job, 50).unwrap();
+        let run = store.start_next_run(50).unwrap().unwrap();
+        store.finish_run(&run, "completed", "", None, 50).unwrap();
+        store
+            .add_task("summarise", None, None, "chat", "1000")
+            .unwrap();
+        store
+            .db
+            .execute("UPDATE tasks SET created_at = 60", [])
+            .unwrap();
+        store.add_proc("cargo build", "chat", "1000").unwrap();
+        store
+            .db
+            .execute("UPDATE procs SET created_at = 70", [])
+            .unwrap();
+        let all = store.activity(0, &[], None, 100).unwrap();
+        assert_eq!(
+            kinds_of(&all),
+            ["process", "task", "job", "proposal", "setting", "gate", "out"]
+        );
+        let ats: Vec<i64> = all.iter().map(|r| r.at).collect();
+        assert_eq!(ats, [70, 60, 50, 40, 30, 20, 10]);
+        assert_eq!(all[2].text, "brief");
+        assert_eq!(all[2].subject, format!("#{job} run {}", run.id));
+        // A run whose job is gone (the bundled SQLite enforces the key, so set it up without).
+        store
+            .db
+            .execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM jobs;")
+            .unwrap();
+        let jobs = store.activity(0, &["job"], None, 100).unwrap();
+        assert_eq!(jobs[0].text, "(removed)");
+    }
+
+    #[test]
+    fn activity_maps_audit_outcomes_to_kinds() {
+        let store = Store::open(&crate::test_dir("store-activity-map").join("state.db")).unwrap();
+        for (tool, args, outcome) in [
+            ("outbound", "curl POST api.example.com", "started"),
+            ("bash", r#"{"command":"rm -rf /"}"#, "refused"),
+            ("exec", r#"{"command":"x"}"#, "denied"),
+            ("bash", r#"{"command":"false"}"#, "error"),
+            ("exec", r#"{"command":"send"}"#, "held"),
+        ] {
+            store.audit("main", tool, args, outcome).unwrap();
+        }
+        let mut rs = store.activity(0, &ALL_KINDS, None, 100).unwrap();
+        rs.reverse();
+        let got: Vec<(&str, &str, &str)> = rs
+            .iter()
+            .map(|r| (r.kind.as_str(), r.status.as_str(), r.text.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("out", "started", "curl POST api.example.com"),
+                ("refused", "refused", r#"bash {"command":"rm -rf /"}"#),
+                ("refused", "denied", r#"exec {"command":"x"}"#),
+                ("tool", "error", r#"bash {"command":"false"}"#),
+                ("gate", "held", r#"exec {"command":"send"}"#),
+            ]
+        );
+        assert!(rs.iter().all(|r| r.src == "audit" && r.subject == "main"));
+    }
+
+    #[test]
+    fn activity_filters_by_kind() {
+        let store = Store::open(&crate::test_dir("store-activity-kind").join("state.db")).unwrap();
+        store.audit("main", "read", "{}", "started").unwrap();
+        store.audit("main", "exec", "{}", "held").unwrap();
+        store.add_task("one", None, None, "chat", "1000").unwrap();
+        let tasks = store.activity(0, &["task"], None, 100).unwrap();
+        assert_eq!(kinds_of(&tasks), ["task"]);
+        assert_eq!(tasks[0].text, "one");
+        let tools = store.activity(0, &["tool"], None, 100).unwrap();
+        assert_eq!(kinds_of(&tools), ["tool"]);
+        assert_eq!(tools[0].status, "started");
+    }
+
+    fn page_through(store: &Store, size: u32) -> Vec<Record> {
+        let mut all = Vec::new();
+        let mut before: Option<Cursor> = None;
+        loop {
+            let page = store.activity(0, &[], before.as_ref(), size).unwrap();
+            if page.is_empty() {
+                return all;
+            }
+            before = Some(Cursor::of(page.last().unwrap()));
+            all.extend(page);
+        }
+    }
+
+    #[test]
+    fn keyset_pages_neither_overlap_nor_skip_within_one_second() {
+        let store =
+            Store::open(&crate::test_dir("store-activity-keyset").join("state.db")).unwrap();
+        for i in 0..5 {
+            store.audit("main", "exec", &i.to_string(), "held").unwrap();
+        }
+        store
+            .log_setting("k", None, Some("1"), "owner", None, None)
+            .unwrap();
+        store.db.execute("UPDATE audit SET ts = 100", []).unwrap();
+        store
+            .db
+            .execute("UPDATE settings_log SET at = 100", [])
+            .unwrap();
+        let whole = store.activity(0, &[], None, 100).unwrap();
+        assert_eq!(whole.len(), 6);
+        let paged = page_through(&store, 2);
+        let key = |r: &Record| (r.at, r.src.clone(), r.id);
+        assert_eq!(
+            paged.iter().map(key).collect::<Vec<_>>(),
+            whole.iter().map(key).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_row_written_between_pages_changes_neither_page() {
+        let store =
+            Store::open(&crate::test_dir("store-activity-between").join("state.db")).unwrap();
+        for i in 0..5 {
+            store.audit("main", "exec", &i.to_string(), "held").unwrap();
+        }
+        store
+            .db
+            .execute("UPDATE audit SET ts = 100 + id", [])
+            .unwrap();
+        let whole = store.activity(0, &[], None, 100).unwrap();
+        let page1 = store.activity(0, &[], None, 2).unwrap();
+        let cursor = Cursor::of(page1.last().unwrap());
+        store.audit("main", "exec", "new", "held").unwrap();
+        store
+            .log_setting("k", None, Some("1"), "owner", None, None)
+            .unwrap();
+        store
+            .db
+            .execute("UPDATE settings_log SET at = ?1", params![cursor.at])
+            .unwrap();
+        let page2 = store.activity(0, &[], Some(&cursor), 2).unwrap();
+        let key = |r: &Record| (r.at, r.src.clone(), r.id);
+        assert_eq!(
+            page2.iter().map(key).collect::<Vec<_>>(),
+            whole[2..4].iter().map(key).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_command_proposal_pending_a_day_reads_expired() {
+        let store =
+            Store::open(&crate::test_dir("store-activity-expired").join("state.db")).unwrap();
+        store.propose_command("/set x 1").unwrap();
+        store
+            .db
+            .execute("UPDATE proposals SET created_at = unixepoch() - 86401", [])
+            .unwrap();
+        let rs = store.activity(0, &["proposal"], None, 10).unwrap();
+        assert_eq!(rs[0].status, "expired");
+        assert_eq!(rs[0].text, "/set x 1");
+    }
+
+    #[test]
+    fn settling_a_proposal_dates_it() {
+        let store =
+            Store::open(&crate::test_dir("store-activity-settled").join("state.db")).unwrap();
+        let id = store.propose_command("/set x 1").unwrap();
+        store
+            .db
+            .execute("UPDATE proposals SET created_at = unixepoch() - 100", [])
+            .unwrap();
+        store.settle_proposal(id, "done").unwrap().unwrap();
+        let (created, settled): (i64, Option<i64>) = store
+            .db
+            .query_row(
+                "SELECT created_at, settled_at FROM proposals WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let settled = settled.expect("settled_at set");
+        assert!(settled >= created);
+        let rs = store.activity(0, &["proposal"], None, 10).unwrap();
+        assert_eq!((rs[0].at, rs[0].status.as_str()), (settled, "done"));
+    }
+
+    #[test]
+    fn cursors_round_trip_and_bad_ones_are_refused() {
+        let c = Cursor {
+            at: 1762693320,
+            src: "settings_log".into(),
+            id: 5512,
+        };
+        assert_eq!(c.to_string(), "1762693320.settings_log.5512");
+        assert_eq!(Cursor::parse(&c.to_string()), Some(c));
+        assert_eq!(
+            Cursor::parse("1762693320.audit.5512"),
+            Some(Cursor {
+                at: 1762693320,
+                src: "audit".into(),
+                id: 5512
+            })
+        );
+        for bad in [
+            "",
+            "1.audit",
+            "1.audit.2.3",
+            "x.audit.1",
+            "1.inbox.1",
+            "1.audit.y",
+        ] {
+            assert_eq!(Cursor::parse(bad), None, "{bad}");
+        }
     }
 }

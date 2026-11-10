@@ -51,7 +51,7 @@
   ```
 - `Cursor::parse`: exactly three `.`-separated parts, an `i64`, one of `ACTIVITY_SOURCES`, an `i64`; anything else `None`.
 
-- [ ] **Step 1: Write the failing tests** in `store.rs` `mod tests` (seed rows with the store's own writers, then age them with `UPDATE … SET ts/at/created_at = ?`):
+- [x] **Step 1: Write the failing tests** in `store.rs` `mod tests` (seed rows with the store's own writers, then age them with `UPDATE … SET ts/at/created_at = ?`):
   - `activity_lists_every_source_newest_first`: one row of each source at distinct times → kinds in `at` order `["process","task","job","proposal","setting","gate","out"]` (newest first) and `tool` absent with `kinds = &[]`; a job run of a removed job reads text `(removed)`.
   - `activity_maps_audit_outcomes_to_kinds`: `outbound`/`started` → `out`; `bash`/`refused` and `exec`/`denied` → `refused`; `bash`/`error` → `tool`; `exec`/`held` → `gate` with text `exec {…}`; `outbound` text is the bare label.
   - `activity_filters_by_kind`: `kinds = &["task"]` returns only tasks; `&["tool"]` returns the `started` row.
@@ -60,10 +60,10 @@
   - `a_command_proposal_pending_a_day_reads_expired`: `created_at = now - 86_401`, status `pending` → record status `expired`.
   - `settling_a_proposal_dates_it`: `settle_proposal(id, "done")` sets `settled_at` (non-null, ≥ `created_at`), and the record's `at` is it.
   - `cursors_round_trip_and_bad_ones_are_refused`: `parse(&c.to_string()) == Some(c)`; `None` for `""`, `"1.audit"`, `"1.audit.2.3"`, `"x.audit.1"`, `"1.inbox.1"`, `"1.audit.y"`.
-- [ ] **Step 2:** `cargo test -p zephyr --lib store::tests::activity` (and the other names) → FAIL (no `activity`).
-- [ ] **Step 3: Implement.** The SQL is spec §4.2's, verbatim; `?2` is the kinds comma-wrapped (`",out,gate,refused,setting,proposal,job,task,process,"` when `kinds` is empty), `?3..?5` are `(i64::MAX, "", 0)` without a cursor, `?6` is `limit`. `settle_proposal` adds `settled_at = unixepoch()` to its `UPDATE`.
-- [ ] **Step 4:** Run the tests, then `cargo test -p zephyr --lib` → PASS.
-- [ ] **Step 5:** Commit `feat(activity): read every record of what ran, sent, waited and was refused in one paged query`.
+- [x] **Step 2:** `cargo test -p zephyr --lib store::tests::activity` (and the other names) → FAIL (no `activity`).
+- [x] **Step 3: Implement.** The SQL is spec §4.2's, verbatim; `?2` is the kinds comma-wrapped (`",out,gate,refused,setting,proposal,job,task,process,"` when `kinds` is empty), `?3..?5` are `(i64::MAX, "", 0)` without a cursor, `?6` is `limit`. `settle_proposal` adds `settled_at = unixepoch()` to its `UPDATE`.
+- [x] **Step 4:** Run the tests, then `cargo test -p zephyr --lib` → PASS.
+- [x] **Step 5:** Commit `feat(activity): read every record of what ran, sent, waited and was refused in one paged query`.
 
 ### Task A4-2: Keep runs, tasks and processes 90 days
 
