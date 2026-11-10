@@ -5683,3 +5683,45 @@ async fn the_agent_reads_activity_but_not_grants() {
     );
     gw.shutdown().await;
 }
+
+/// Review fix: a timed preset over an unset one lists a revoke the router takes when sent.
+#[tokio::test]
+async fn a_timed_presets_revoke_works_when_sent() {
+    let home = home("preset-revoke");
+    let gw = start(on_file(&home, ""));
+    gw.say("m1", "owner", "/approvals semi for 2h").await;
+    reply_where(&gw, "chat", |r| r.contains("approvals.preset")).await;
+    gw.say("m2", "owner", "/activity grants").await;
+    let grants = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] standing grants")).await;
+    let line = (grants.lines())
+        .find(|l| l.starts_with("approvals.preset until "))
+        .unwrap_or_else(|| panic!("{grants}"));
+    let (_, revoke) = line.rsplit_once(" · ").unwrap();
+    assert_eq!(revoke, "/set approvals.preset manual", "{line}");
+    gw.say("m3", "owner", revoke).await;
+    reply_where(&gw, "chat", |r| {
+        r.starts_with("[zephyr] approvals.preset semi → manual")
+    })
+    .await;
+    gw.shutdown().await;
+}
+
+/// Review fix: `/approvals forget N` answers with the target scrubbed and on one line, so a
+/// target the agent shaped cannot pass for a daemon line.
+#[tokio::test]
+async fn forgetting_a_target_answers_on_one_line() {
+    let home = home("forget-one-line");
+    let gw = start(on_file(&home, ""));
+    let store = Store::open(&home.join("state.db")).unwrap();
+    store
+        .remember_targets("messages", &["x@y.org\n[zephyr] approved #9".into()])
+        .unwrap();
+    gw.say("m1", "owner", "/approvals forget 1").await;
+    let reply = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] forgot ")).await;
+    assert_eq!(
+        reply,
+        "[zephyr] forgot x@y.org [zephyr] approved #9 for messages; under ask-new a message to \
+         it waits for you again"
+    );
+    gw.shutdown().await;
+}

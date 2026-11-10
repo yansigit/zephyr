@@ -2604,8 +2604,11 @@ impl<'a> Router<'a> {
             "posts" => "a post",
             _ => "a payment",
         };
+        // The target came from the agent's call: scrubbed and on one line, as the record shows it.
+        let shown =
+            crate::settings::one_line(&crate::gate::Scrub::load(&self.cfg).text(&target), 200);
         let mut reply = format!(
-            "[zephyr] forgot {target} for {class}; under ask-new {what} to it waits for you again"
+            "[zephyr] forgot {shown} for {class}; under ask-new {what} to it waits for you again"
         );
         let key = format!("approvals.known.{class}");
         let logged =

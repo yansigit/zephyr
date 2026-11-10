@@ -88,6 +88,11 @@ pub struct JobRun {
     pub job: Job,
 }
 
+/// A new job's id: past every job and every run's job, so a removed job's runs (which stay,
+/// `remove_job`) never date a new job, which `claim_due` would otherwise fire at once.
+const NEW_JOB_ID: &str = "(SELECT coalesce(max(m), 0) + 1 FROM
+     (SELECT max(id) AS m FROM jobs UNION ALL SELECT max(job_id) FROM runs))";
+
 const JOB_COLUMNS: &str =
     "jobs.id, jobs.name, jobs.schedule, jobs.prompt, jobs.channel, jobs.recipient, jobs.enabled";
 
@@ -1279,7 +1284,10 @@ impl Store {
         recipient: &str,
     ) -> rusqlite::Result<i64> {
         self.db.execute(
-            "INSERT INTO jobs(name, schedule, prompt, channel, recipient) VALUES (?1, ?2, ?3, ?4, ?5)",
+            &format!(
+                "INSERT INTO jobs(id, name, schedule, prompt, channel, recipient)
+                 VALUES ({NEW_JOB_ID}, ?1, ?2, ?3, ?4, ?5)"
+            ),
             params![name, schedule, prompt, channel, recipient],
         )?;
         Ok(self.db.last_insert_rowid())
@@ -1295,8 +1303,10 @@ impl Store {
         recipient: &str,
     ) -> rusqlite::Result<i64> {
         self.db.execute(
-            "INSERT INTO jobs(name, schedule, prompt, channel, recipient, enabled)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            &format!(
+                "INSERT INTO jobs(id, name, schedule, prompt, channel, recipient, enabled)
+                 VALUES ({NEW_JOB_ID}, ?1, ?2, ?3, ?4, ?5, 0)"
+            ),
             params![name, schedule, prompt, channel, recipient],
         )?;
         Ok(self.db.last_insert_rowid())
@@ -4168,5 +4178,29 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].0.id, on);
         assert!(jobs[0].1 > 0);
+    }
+
+    /// Review fix: a removed job's runs stay, so its id is never given to a new job, which
+    /// would otherwise be dated from them and could fire the moment it is added.
+    #[test]
+    fn a_new_job_never_takes_a_removed_jobs_id() {
+        let mut store = Store::open(&crate::test_dir("store-job-ids").join("state.db")).unwrap();
+        let old = store
+            .add_job("old", "0 7 * * *", "p", "chat", "1000")
+            .unwrap();
+        store.queue_run(old, 50).unwrap();
+        let run = store.start_next_run(50).unwrap().unwrap();
+        store.finish_run(&run, "completed", "", None, 50).unwrap();
+        assert!(store.remove_job(old).unwrap());
+        let new = store
+            .add_job("new", "0 18 * * *", "p", "chat", "1000")
+            .unwrap();
+        assert_ne!(new, old);
+        let proposed = store
+            .propose_job("p", "0 9 * * *", "p", "chat", "1000")
+            .unwrap();
+        assert!(proposed > new);
+        let runs = store.activity(0, &["job"], None, 10).unwrap();
+        assert_eq!(runs[0].text, "(removed)");
     }
 }

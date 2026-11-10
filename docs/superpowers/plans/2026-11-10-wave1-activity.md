@@ -295,3 +295,9 @@ Deviation: the footer on Grants reads `r take it back` (the tab names it); help 
 
 - Spec coverage: §4.1–4.2 → A4-1; §4.3 → A4-4; §4.4 → A4-5; §4.5 → A4-3; §4.6 → A4-6; §4.7 → A4-7; §4.8 → A4-8; §4.9 → A4-2; §4.10 failure texts are in A4-4/5/7 and A4-2's ordering; §3's DESIGN/README/CLAUDE.md edits sit in the task of their behaviour. Owner decisions: no schema (Global Constraints), vault grants left out (A4-5 lists three sources only), `/activity` readable by the agent but not `grants` (A4-6).
 - Order: A4-1, A4-2, A4-3 are independent; A4-4 needs A4-1 (and A4-3 for its router test); A4-5 and A4-6 need A4-4; A4-7 needs A4-5; A4-8 needs A4-7.
+
+## Final review fixes
+
+Deviation: a new job's id is past every job and every run's `job_id` (`NEW_JOB_ID` in `add_job`/`propose_job`): with A4-5's `remove_job` keeping a removed job's runs, SQLite would otherwise give the highest removed id to the next job, which `claim_due` then dated from the old runs and could fire at once. Test `store::tests::a_new_job_never_takes_a_removed_jobs_id`.
+Deviation: a timed preset over an unset one reverts with `/set approvals.preset manual`, not `none` (spec §4.4 says `default` → `none`, but `approvals.preset` is a choice and refuses `none`; an unset preset reads as manual). Router test `a_timed_presets_revoke_works_when_sent`.
+Deviation: `/approvals forget N` answers with the target scrubbed and on one line (`forgetting_a_target_answers_on_one_line`); the daemon-shaped session fallback needs fewer than 6 digits, so no digits fact passes for an id.

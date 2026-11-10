@@ -197,10 +197,13 @@ fn session(scrub: &Scrub, s: &str) -> String {
     let clean = scrub.text(s);
     let withheld = clean.starts_with("[output withheld:") || clean.starts_with("[withheld:");
     let number = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+    // Fewer than 6 digits in all, the least a digits fact holds, so no fact passes as an id.
+    let digits = s.bytes().filter(u8::is_ascii_digit).count();
     let own = s == "main"
-        || s.split_once('-').is_some_and(|(word, ids)| {
-            matches!(word, "task" | "job" | "action") && ids.split('-').all(number)
-        });
+        || digits < 6
+            && s.split_once('-').is_some_and(|(word, ids)| {
+                matches!(word, "task" | "job" | "action") && ids.split('-').all(number)
+            });
     match withheld && own {
         true => s.into(),
         false => clean,
@@ -282,10 +285,10 @@ pub fn grants(cfg: &Config, store: &Store, now: i64) -> rusqlite::Result<Vec<Gra
     for r in store.due_reverts(i64::MAX)? {
         let value = clean(crate::settings::shown(r.value.as_deref()));
         // A timed preset's value is a snapshot (`manual; messages=ask`); setting the preset its
-        // first item names is what takes the limit back.
+        // first item names is what takes the limit back; an unset one (`default`) reads as manual.
         let back = match r.key.as_str() {
             "approvals.preset" => match value.split(';').next().unwrap_or_default().trim() {
-                "default" => "none".to_string(),
+                "default" => "manual".to_string(),
                 first => first.to_string(),
             },
             _ => value.clone(),
@@ -681,7 +684,14 @@ mod tests {
             .line
             .starts_with("14:02 out job-3-88: "));
         // A session the agent named itself is not shown unscrubbed.
-        for forged in ["s3cret", "task-s3cret", "job-", "main-1"] {
+        for forged in [
+            "s3cret",
+            "task-s3cret",
+            "job-",
+            "main-1",
+            "task-5550102345",
+            "job-555-0102",
+        ] {
             let r = rec(at(14, 2), "audit", "out", forged, "started", "x");
             let line = entry(&r, &scrub, NOW, &TimeZone::UTC).line;
             assert!(line.starts_with("14:02 out [output withheld"), "{line}");
@@ -831,7 +841,8 @@ mod tests {
             ))
             .unwrap();
         let g = grants(&cfg, &store, NOW).unwrap();
-        assert_eq!(g[0].revoke, "/set approvals.preset none");
+        // An unset preset reads as manual; `none` is no value approvals.preset takes.
+        assert_eq!(g[0].revoke, "/set approvals.preset manual");
         assert!(
             g[0].line.contains("then default; posts=hold · "),
             "{}",
