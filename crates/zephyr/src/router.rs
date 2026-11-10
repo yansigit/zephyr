@@ -1682,8 +1682,7 @@ impl<'a> Router<'a> {
             MAIN_SESSION.into()
         });
         // What the new child loads must be what zephyr last saw.
-        let since = crate::now();
-        self.check_session(&session);
+        let since = self.open_window(&session);
         match Child::spawn_as(&self.cfg, Some(&session), account.as_ref()).await {
             Ok(child) => {
                 eprintln!("zephyr: rpi child {:?} ready", child.pid());
@@ -2022,15 +2021,16 @@ impl<'a> Router<'a> {
         let session = self.child.as_ref().and_then(|c| c.session.clone());
         let mut beside = None;
         if let Some(session) = &session {
-            self.check_session(session);
+            // What else of the agent's lives first, then the file: a stray may end before the
+            // settle, having written the file or memory, so the conversation is not the owner's
+            // alone from now on.
             if let Ok(SessionOrigin::Clean) = self.store.session_origin(session) {
                 beside = self.procs_beside(now);
             }
-            // A stray may end before the settle, having written the file or memory: the
-            // conversation is not the owner's alone from now on.
             if let Some(Beside::Stray(comm)) = &beside {
                 self.taint_stray(session, "open", comm);
             }
+            self.check_session(session);
         }
         let failed = session.as_ref().and_then(|s| self.tainted.get(s)).cloned();
         let origin = session.map(|s| self.store.session_origin(&s));
@@ -2115,6 +2115,21 @@ impl<'a> Router<'a> {
         self.record_taint(session.to_string(), &why);
     }
 
+    /// Opens a window on a clean conversation's saved file, returning when: a stray of the
+    /// agent's alive now taints it at once (one that ends before the window closes would go
+    /// unseen there; work beside is seen there, as running or started since), then the file is
+    /// checked against its record.
+    fn open_window(&mut self, session: &str) -> i64 {
+        let since = crate::now();
+        if let Ok(SessionOrigin::Clean) = self.store.session_origin(session) {
+            if let Some(Beside::Stray(comm)) = self.procs_beside(since) {
+                self.taint_stray(session, "open", &comm);
+            }
+        }
+        self.check_session(session);
+        since
+    }
+
     /// The conversation's saved file is what zephyr last recorded; anything else changed it
     /// while rpi was idle, so it is tainted (DESIGN §4.6). Only a clean one is looked at. On a
     /// match the fresh print is kept, so the next look hashes nothing it need not.
@@ -2126,8 +2141,11 @@ impl<'a> Router<'a> {
         let now =
             (seen.as_ref().ok()).map(|s| crate::rpc::SessionPrint::now(&dir, session, Some(s)));
         match (now, seen) {
+            // Nothing new to keep when not even the hash was taken again.
             (Some(now), Ok(seen)) if !now.bad() && now == seen => {
-                self.record_session(session, &now)
+                if serde_json::to_string(&now).ok() != serde_json::to_string(&seen).ok() {
+                    self.record_session(session, &now)
+                }
             }
             _ => self.taint_now(session, "was changed on disk outside zephyr"),
         }
@@ -2188,10 +2206,10 @@ impl<'a> Router<'a> {
     /// An rpi command that writes the session while it is idle (`set_model`,
     /// `set_thinking_level`, `navigate`): the file is checked before and recorded after.
     async fn call_writing(&mut self, cmd: Value) -> anyhow::Result<Value> {
-        let (session, since) = (self.child_session(), crate::now());
-        if let Some(s) = &session {
-            self.check_session(s);
-        }
+        let session = self.child_session();
+        let since = session
+            .as_ref()
+            .map_or(crate::now(), |s| self.open_window(s));
         let answer = self.call(cmd).await;
         if let Some(s) = &session {
             self.settle_session(s, since);
@@ -4057,10 +4075,10 @@ impl<'a> Router<'a> {
         self.restart = false;
         if let Some(child) = self.child.take() {
             // rpi may write the session as it stops: checked before, recorded after.
-            let (session, since) = (child.session.clone(), crate::now());
-            if let Some(s) = &session {
-                self.check_session(s);
-            }
+            let session = child.session.clone();
+            let since = session
+                .as_ref()
+                .map_or(crate::now(), |s| self.open_window(s));
             child.stop().await;
             if let Some(s) = &session {
                 self.settle_session(s, since);

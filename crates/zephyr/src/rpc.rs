@@ -168,6 +168,14 @@ fn hex(ctx: ring::digest::Context) -> String {
 }
 
 impl FilePrint {
+    /// Whether the file `m` describes is the one this hashed, as far as its length, inode and
+    /// both times tell, and it was hashed more than a second after its last change.
+    fn unchanged(&self, m: &std::fs::Metadata) -> bool {
+        let now = FilePrint::with(m, String::new(), 0);
+        (self.len, self.ino, self.ctime, self.mtime) == (now.len, now.ino, now.ctime, now.mtime)
+            && self.seen > self.ctime.0 + 1
+    }
+
     fn with(m: &std::fs::Metadata, hash: String, seen: i64) -> FilePrint {
         use std::os::unix::fs::MetadataExt;
         FilePrint {
@@ -187,12 +195,7 @@ impl FilePrint {
         let Some(m) = plain(path)? else {
             return Ok(None);
         };
-        let now = FilePrint::with(&m, String::new(), 0);
-        let same = |p: &&FilePrint| {
-            (p.len, p.ino, p.ctime, p.mtime) == (now.len, now.ino, now.ctime, now.mtime)
-                && p.seen > p.ctime.0 + 1
-        };
-        if let Some(p) = prior.filter(same) {
+        if let Some(p) = prior.filter(|p| p.unchanged(&m)) {
             return Ok(Some(FilePrint::with(&m, p.hash.clone(), p.seen)));
         }
         let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
@@ -284,6 +287,17 @@ impl SessionPrint {
         }
         let _fs = crate::agent::fs();
         let m = plain(&file).ok()??;
+        let progress = FilePrint::of(&progress, self.progress.as_ref()).ok()?;
+        // Unchanged since hashed: nothing to read.
+        if let Some(then) = self.file.as_ref().filter(|t| t.unchanged(&m)) {
+            return Some(SessionPrint {
+                count,
+                path: Some(path),
+                file: Some(then.clone()),
+                progress,
+                bad: false,
+            });
+        }
         let bytes = read_whole(&file, &m).ok()?;
         let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
         if let Some(then) = &self.file {
@@ -296,7 +310,6 @@ impl SessionPrint {
         } else {
             ctx.update(&bytes);
         }
-        let progress = FilePrint::of(&progress, None).ok()?;
         Some(SessionPrint {
             count,
             path: Some(path),
@@ -1312,5 +1325,27 @@ mod tests {
         symlink(dir.join("elsewhere.jsonl"), &progress).unwrap();
         assert!(SessionPrint::now(&dir, "main-1", Some(&seen)).bad());
         assert_eq!(seen.follow(&dir, "main-1"), None);
+    }
+
+    #[test]
+    fn following_an_unchanged_file_hashed_long_after_its_change_reuses_the_hash() {
+        let dir = crate::test_dir("rpc-session-reuse");
+        let folder = dir.join("--home--");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("2026-01-01T00-00-00-000Z_main-1.jsonl");
+        std::fs::write(&file, "{\"kind\":\"header\"}\n").unwrap();
+        let seen_at = |p: &SessionPrint| p.file.as_ref().unwrap().seen;
+        let mut seen = SessionPrint::now(&dir, "main-1", None);
+        // As if hashed well after the file last changed: its hash is kept, not taken again
+        // (which would date it now).
+        let later = seen_at(&seen) + 10;
+        seen.file.as_mut().unwrap().seen = later;
+        let again = seen.follow(&dir, "main-1").unwrap();
+        assert_eq!((again == seen, seen_at(&again)), (true, later));
+        // Hashed within a second of the change: hashed again.
+        let mut fresh = seen.clone();
+        fresh.file.as_mut().unwrap().seen = fresh.file.as_ref().unwrap().ctime.0;
+        let read = fresh.follow(&dir, "main-1").unwrap();
+        assert!(seen_at(&read) >= crate::now() - 1, "{read:?}");
     }
 }
