@@ -358,6 +358,7 @@
         break;
       case "zephyr_reply":
         addNotice(String(event.text || ""), event.command);
+        if (String(event.command || "").startsWith("/goal") && !$("goals").hidden) loadGoals();
         // A reply to an approval or a `/web` command changes what the lists show.
         loadProposals();
         break;
@@ -828,6 +829,58 @@
     $("push-off").hidden = !sub;
   }
 
+  // ---- goals ----
+
+  // Read with `zephyr.goals`; changed with the owner's `/goal` commands, whose replies come
+  // back as notices and reload the list. A done goal has no number, so nothing acts on it.
+  async function goalCommand(text) {
+    $("goals-note").textContent = "";
+    await sendCommand(text).catch((error) => {
+      $("goals-note").textContent = clean(said(error));
+    });
+  }
+
+  async function loadGoals() {
+    const rows = $("goals-list");
+    let goals;
+    try {
+      goals = (await rpc("zephyr.goals", {})).goals || [];
+    } catch (error) {
+      // A daemon without goals: no screen.
+      if (error && error.code === -32601) {
+        document.querySelector('#screens [data-screen="goals"]').hidden = true;
+        showScreen("chat");
+      } else {
+        $("goals-note").textContent = clean(said(error));
+      }
+      return;
+    }
+    rows.replaceChildren();
+    for (const goal of goals) {
+      const open = !goal.done && Number.isInteger(goal.n);
+      const item = el("li", open ? "row" : "row done");
+      item.append(el("span", "what", (open ? goal.n + ". " : "") + goal.text));
+      if (open) {
+        for (const [label, verb] of [["Done", "done"], ["Remove", "rm"]]) {
+          const button = el("button", "", label);
+          button.type = "button";
+          button.addEventListener("click", () => goalCommand("/goal " + verb + " " + goal.n));
+          item.append(button);
+        }
+      }
+      rows.append(item);
+    }
+    if (!rows.firstChild) rows.append(el("li", "empty", "no goals yet"));
+  }
+
+  function addGoal() {
+    // One line: the command is the whole message.
+    const text = $("goal-text").value.replace(/\s+/g, " ").trim();
+    if (!text) return;
+    $("goal-text").value = "";
+    goalCommand("/goal add " + text);
+  }
+
   // ---- notifications ----
 
   async function subscription() {
@@ -900,7 +953,13 @@
 
   // ---- screens and wiring ----
 
-  const loaders = { settings: loadSettings, facts: loadFacts, vault: loadVault, devices: loadDevices };
+  const loaders = {
+    settings: loadSettings,
+    facts: loadFacts,
+    vault: loadVault,
+    goals: loadGoals,
+    devices: loadDevices,
+  };
 
   function showScreen(name) {
     for (const screen of document.querySelectorAll(".screen")) screen.hidden = screen.id !== name;
@@ -946,6 +1005,7 @@
     $("sheet").addEventListener("close", () => {
       state.sheet = null;
     });
+    $("goal-add").addEventListener("click", addGoal);
     $("push-on").addEventListener("click", pushOn);
     $("push-off").addEventListener("click", () => unsubscribe().then(loadDevices, loadDevices));
     $("signout").addEventListener("click", signOut);

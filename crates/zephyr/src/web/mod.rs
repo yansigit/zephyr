@@ -757,6 +757,7 @@ mod tests {
         );
         for method in [
             "zephyr.activity",
+            "zephyr.goals",
             "zephyr.subscribe",
             "send",
             "zephyr.proposals",

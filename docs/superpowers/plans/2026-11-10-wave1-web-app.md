@@ -812,11 +812,12 @@ Fixed on this branch, each with a test that failed first (the spec's closing "De
   - changes go as the owner's text commands `/goal add TEXT`, `/goal done N`, `/goal rm N`, whose replies are `[zephyr] goal N set; …`, `[zephyr] goal N done: TEXT`.
 - App: it lists the goals (done ones struck), sends the three commands as `send` prompts, and reloads `zephyr.goals` on their `zephyr_reply`. Goal text goes in through `textContent`. A `-32601` hides the screen.
 
-- [ ] **Step 1: Write the failing test** `goals_are_read_on_web_and_changed_by_command`: a web `send` of `/goal add ship W` → a `zephyr_reply` on `web`; `zephyr.goals` → one goal, `done: false`.
-- [ ] **Step 2: Run** → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** → PASS, then `cargo test -p zephyr`.
-- [ ] **Step 5: Commit** `feat(web): read the owner's goals in the app and change them with /goal`.
+- [x] **Step 1: Write the failing test** `goals_are_read_on_web_and_changed_by_command`: a web `send` of `/goal add ship W` → a `zephyr_reply` on `web`; `zephyr.goals` → one goal, `done: false`.
+- [x] **Step 2: Run** → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** → PASS, then `cargo test -p zephyr`.
+- [x] **Step 5: Commit** `feat(web): read the owner's goals in the app and change them with /goal`.
+- Deviation: built on B's merged `zephyr.goals`: done goals come with `n: null`, so they are listed struck through with no Done or Remove. Two more tests sit on B's merge: a message typed in the app is an owner row on `web` and leaves the conversation clean, and `memory.auto` is turned on only with the passkey (both passed as built).
 
 ### Task W-13: Bridge mode: bind the container's address and publish 7793 on host loopback (A2)
 

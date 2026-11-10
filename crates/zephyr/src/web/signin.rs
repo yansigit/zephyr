@@ -312,7 +312,11 @@ impl App {
 
     /// A notice to every attached client and the owner last answered.
     async fn notice(&self, text: String) {
-        let _ = self.handles.router.send(AttachRequest::WebNotice(text)).await;
+        let _ = self
+            .handles
+            .router
+            .send(AttachRequest::WebNotice(text))
+            .await;
     }
 
     /// Starts a session for a passkey: 200 `{"name"}` with its cookie.

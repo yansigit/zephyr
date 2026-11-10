@@ -432,6 +432,7 @@ A phone-first app the daemon serves itself, reached over your tailnet through `t
 - **Activity**: zephyr's own record of what ran, what left the machine, what waited and what was
   refused, and the standing grants, each with a Revoke button.
 - **Upcoming**: scheduled jobs and delayed sends.
+- **Goals**: your goals, with Add, Done and Remove.
 - **Settings**, with an optional time limit; a protected setting is saved with your passkey.
 - **Private facts** and the **Vault**, names only. Secrets are never typed in the app.
 - **Devices**: notifications, sign out, remove a passkey.

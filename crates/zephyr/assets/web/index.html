@@ -43,7 +43,7 @@
     <button type="button" data-screen="settings">Settings</button>
     <button type="button" data-screen="facts">Private facts</button>
     <button type="button" data-screen="vault">Vault</button>
-    <button type="button" data-screen="goals" hidden>Goals</button>
+    <button type="button" data-screen="goals">Goals</button>
     <button type="button" data-screen="devices">Devices</button>
   </nav>
 
@@ -81,7 +81,12 @@
 
   <section id="goals" class="screen" hidden>
     <h2>Goals</h2>
+    <p id="goals-note" class="note" role="status"></p>
     <ul id="goals-list" class="rows"></ul>
+    <div class="buttons">
+      <input id="goal-text" maxlength="500" placeholder="A new goal" aria-label="A new goal">
+      <button id="goal-add" type="button" class="primary">Add</button>
+    </div>
   </section>
 
   <section id="devices" class="screen" hidden>

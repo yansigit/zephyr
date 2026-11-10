@@ -2382,3 +2382,117 @@ async fn activity_is_open_on_web_and_pages() {
     assert_eq!(grants["entries"], json!([]), "{grants}");
     gw.shutdown().await;
 }
+
+// ---- on top of the goals and memory lane ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_typed_in_the_app_is_the_owners_and_keeps_the_conversation_clean() {
+    let gw = start("web-owner-row");
+    gw.up().await;
+    let mut ws = gw.ws(&gw.cookie("phone")).await;
+    ws.rpc("zephyr.subscribe", json!({})).await;
+    ws.say("hi").await;
+    ws.event(|e| e["type"] == "message_end" && e["message"]["role"] == "assistant")
+        .await;
+    ws.event(|e| e["type"] == "agent_settled").await;
+    let db = rusqlite::Connection::open(gw.home.join("state.db")).unwrap();
+    let row: (String, i64) = db
+        .query_row("SELECT channel, owner FROM inbox", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(
+        row,
+        ("web".to_string(), 1),
+        "written by the router for the owner on web"
+    );
+    // So it does not count as text from elsewhere: the conversation is still the owner's own.
+    let origin = gw.store().session_origin("main").unwrap();
+    assert_eq!(origin, zephyr::store::SessionOrigin::Clean);
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_auto_is_turned_on_only_with_the_passkey() {
+    let (gw, phone, mut ws) = signed_in("sign-memory-auto", "").await;
+    let change = json!({"key": "memory.auto", "value": "owner"});
+    let unsigned = ws.rpc("zephyr.settings_set", change.clone()).await["result"].take();
+    assert_eq!(unsigned["outcome"], "refused", "{unsigned}");
+    assert_eq!(
+        unsigned["reason"],
+        "loosening memory.auto needs tui or chat or passkey"
+    );
+    // As the app lists it: a strong choice, so its row is saved with the passkey.
+    let all = ws.rpc("zephyr.settings", json!({})).await["result"].take();
+    let rows = all["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|s| s["settings"].as_array().unwrap());
+    let row = rows
+        .clone()
+        .find(|r| r["key"] == "memory.auto")
+        .expect("listed")
+        .clone();
+    assert_eq!(
+        (&row["strong"], &row["value"]),
+        (&json!(true), &json!("off")),
+        "{row}"
+    );
+    assert_eq!(row["kind"]["options"], json!(["off", "owner"]), "{row}");
+    let signed = ws
+        .sign(&phone, with(change.clone(), json!({"op": "set"})))
+        .await;
+    let done = ws.rpc("zephyr.settings_set", with(signed, change)).await["result"].take();
+    assert_eq!(
+        (&done["outcome"], &done["new"]),
+        (&json!("changed"), &json!("owner")),
+        "{done}"
+    );
+    let logged = gw
+        .store()
+        .last_setting_change("memory.auto")
+        .unwrap()
+        .unwrap();
+    assert_eq!(logged.channel.as_deref(), Some("passkey"));
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn goals_are_read_on_web_and_changed_by_command() {
+    let gw = start("goals");
+    gw.up().await;
+    let mut ws = gw.ws(&gw.cookie("phone")).await;
+    ws.rpc("zephyr.subscribe", json!({})).await;
+    assert_eq!(
+        ws.rpc("zephyr.goals", json!({})).await["result"],
+        json!({"goals": []})
+    );
+    // `/goal` is not a strong setting: it is the owner's own command, on the cookie.
+    ws.say("/goal add ship W").await;
+    let reply = ws
+        .event(|e| e["type"] == "zephyr_reply" && e["command"] == "/goal add ship W")
+        .await;
+    assert_eq!(reply["channel"], "web");
+    assert!(
+        reply["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("[zephyr] goal 1 set"),
+        "{reply}"
+    );
+    let goals = ws.rpc("zephyr.goals", json!({})).await["result"].take();
+    assert_eq!(
+        goals,
+        json!({"goals": [{"n": 1, "text": "ship W", "done": false}]})
+    );
+    ws.say("/goal done 1").await;
+    ws.event(|e| e["type"] == "zephyr_reply" && e["command"] == "/goal done 1")
+        .await;
+    let goals = ws.rpc("zephyr.goals", json!({})).await["result"].take();
+    assert_eq!(
+        goals,
+        json!({"goals": [{"n": null, "text": "ship W", "done": true}]})
+    );
+    gw.shutdown().await;
+}
