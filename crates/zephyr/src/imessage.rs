@@ -460,9 +460,12 @@ impl Channel for IMessage {
     }
 
     async fn run(&self, tx: mpsc::Sender<Inbound>) -> anyhow::Result<()> {
-        let listener = TcpListener::bind(self.listen)
+        // Under the network floor `listen` is where the host publishes the webhook; the daemon
+        // itself binds the container's own address (DESIGN §4.19).
+        let addr = crate::egress::listen_addr(self.listen)?;
+        let listener = TcpListener::bind(addr)
             .await
-            .with_context(|| format!("binding {}", self.listen))?;
+            .with_context(|| format!("binding {addr}"))?;
         // Backfill runs beside the listener, so webhooks that arrive meanwhile are not missed. A failure
         // (Mac asleep, server down) is retried. It must not end run(), because the router ends the gateway then.
         let backfill_loop = async {

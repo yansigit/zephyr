@@ -79,7 +79,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
         Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
         _ => crate::attach::token(a)?,
     };
-    let addr = format!("127.0.0.1:{}", a.port);
+    let addr = crate::egress::listen_addr(([127, 0, 0, 1], a.port).into())?.to_string();
     let tz = crate::scheduler::zone(cfg).unwrap_or_else(|_| jiff::tz::TimeZone::system());
     let palette = theme::install(probe_background());
 

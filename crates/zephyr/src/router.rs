@@ -3402,6 +3402,14 @@ impl<'a> Router<'a> {
             Err(e) => return Reloaded::failed(format!("[zephyr] zephyr.toml not applied: {e:#}")),
         };
         new.keep_hidden(&self.cfg);
+        if crate::egress::bridge() {
+            // The container publishes the ports it was made with (DESIGN §4.19).
+            for key in crate::egress::moved(&self.cfg, &new) {
+                let text =
+                    format!("[zephyr] {key} changed; run zephyr up on the host to publish it");
+                log(self.store.notify_last_owner(&text).map_err(Into::into));
+            }
+        }
         let secrets = crate::dotenv::read(&new.secrets_path()).unwrap_or_default();
         let next = pick_in(&new, &self.store).ok().flatten();
         let mut plan = crate::reload::diff(&self.cfg, &new, self.account.as_ref(), next.as_ref());

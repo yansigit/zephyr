@@ -43,6 +43,41 @@ pub fn own_ip() -> anyhow::Result<Ipv4Addr> {
     }
 }
 
+/// Where a daemon listener binds, and where clients inside the container connect: under the
+/// floor the container's own address with `addr`'s port, which the agent's uid cannot reach,
+/// otherwise `addr` as it is. Nothing of root's listens on the container's loopback but the
+/// proxy (doctor checks it).
+pub fn listen_addr(addr: SocketAddr) -> anyhow::Result<SocketAddr> {
+    match bridge() {
+        true => Ok(SocketAddr::new(own_ip()?.into(), addr.port())),
+        false => Ok(addr),
+    }
+}
+
+/// Every daemon TCP port `zephyr up` publishes on the host's loopback, by the zephyr.toml key
+/// that sets it.
+pub fn published(cfg: &Config) -> Vec<(&'static str, u16)> {
+    let attach = cfg.attach.as_ref().map(|a| ("attach.port", a.port));
+    let imessage = cfg.imessage.as_ref();
+    let imessage = imessage.map(|i| ("imessage.listen", i.listen.port()));
+    attach.into_iter().chain(imessage).collect()
+}
+
+/// The keys whose published port differs between two configs: a container made for `old` does
+/// not publish what `new` listens on.
+pub fn moved(old: &Config, new: &Config) -> Vec<&'static str> {
+    let (old, new) = (published(old), published(new));
+    let port =
+        |list: &[(&str, u16)], key: &str| list.iter().find(|(k, _)| *k == key).map(|(_, p)| *p);
+    let mut keys: Vec<&'static str> = Vec::new();
+    for (key, _) in old.iter().chain(&new) {
+        if port(&old, key) != port(&new, key) && !keys.contains(key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
 /// IPv4 blocks that are not the public internet, from the IANA IPv4 Special-Purpose Address
 /// Registry and the multicast and reserved blocks.
 const V4_SPECIAL: &[([u8; 4], u32)] = &[
@@ -1104,5 +1139,47 @@ mod tests {
         assert!(rows[0].2.starts_with("refused: "), "{rows:?}");
         assert!(rows[0].1.contains("[fact:phone]"), "{rows:?}");
         assert!(!format!("{rows:?}").contains("5550102345"), "{rows:?}");
+    }
+
+    fn listeners(attach: u16, server_url: &str) -> Config {
+        let text = format!(
+            "rpi = '/r'\nhome = '/h'\n[attach]\nport = {attach}\n[imessage]\n\
+             listen = '100.64.0.1:7791'\nserver_url = '{server_url}'\n\
+             password_env = 'P'\nsecret_env = 'S'\n"
+        );
+        toml::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn published_lists_the_configured_ports() {
+        let cfg = listeners(7790, "http://100.64.0.2:1234");
+        assert_eq!(
+            published(&cfg),
+            [("attach.port", 7790), ("imessage.listen", 7791)]
+        );
+        let bare: Config = toml::from_str("rpi = '/r'\nhome = '/h'\n").unwrap();
+        assert_eq!(published(&bare), []);
+    }
+
+    #[test]
+    fn moved_names_a_changed_port_only() {
+        let old = listeners(7790, "http://100.64.0.2:1234");
+        assert_eq!(
+            moved(&old, &listeners(7799, "http://100.64.0.2:1234")),
+            ["attach.port"]
+        );
+        assert!(moved(&old, &listeners(7790, "http://100.64.0.3:1234")).is_empty());
+        // A listener added or removed is published or unpublished too.
+        let bare: Config = toml::from_str("rpi = '/r'\nhome = '/h'\n").unwrap();
+        assert_eq!(moved(&bare, &old), ["attach.port", "imessage.listen"]);
+        assert_eq!(moved(&old, &bare), ["attach.port", "imessage.listen"]);
+    }
+
+    #[test]
+    fn listen_addr_keeps_the_address_outside_bridge_mode() {
+        let addr: SocketAddr = "127.0.0.1:7790".parse().unwrap();
+        assert_eq!(listen_addr(addr).unwrap(), addr);
+        let tailnet: SocketAddr = "100.64.0.1:7791".parse().unwrap();
+        assert_eq!(listen_addr(tailnet).unwrap(), tailnet);
     }
 }

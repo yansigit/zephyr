@@ -167,13 +167,14 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
 - Publish rule (A2-7): for each `(key, port)` in `published(&cfg)`, `zephyr up` passes `-p 127.0.0.1:<port>:<port>`. The owner fronts the webhook and the web app with `tailscale serve`.
 - `zephyr tui` connects to `listen_addr(127.0.0.1:<a.port>)`. In `reloaded`, when `bridge()`, the router calls `notify_last_owner` once for each key in `moved(old, new)`: `[zephyr] <key> changed; run zephyr up on the host to publish it`.
 
-- [ ] **Step 1: Write the failing tests** in `egress.rs`:
+- [x] **Step 1: Write the failing tests** in `egress.rs`:
   - `published_lists_the_configured_ports`: a config with `[attach] port = 7790` and `[imessage] listen = "100.64.0.1:7791"` gives `[("attach.port", 7790), ("imessage.listen", 7791)]`, and neither section gives `[]`.
   - `moved_names_a_changed_port_only`: attach 7790 → 7799 gives `["attach.port"]`, and a changed `imessage.server_url` gives `[]`.
   - `listen_addr_keeps_the_address_outside_bridge_mode`.
-- [ ] **Step 2:** Run → FAIL. **Step 3:** Implement and switch the three binds/connects. **Step 4:** `cargo test -p zephyr` → PASS (attach, imessage and tui tests unchanged).
-- [ ] **Step 5: Docs.** DESIGN §4.3, line 122: under the floor the agent cannot reach the attach port or the webhook. The caps stay for other users on the host. Both bind the container's own address, and in-container clients connect there.
-- [ ] **Step 6:** Commit `feat(egress): bind the daemon's listeners on the container's own address in bridge mode`.
+- [x] **Step 2:** Run → FAIL. **Step 3:** Implement and switch the three binds/connects. **Step 4:** `cargo test -p zephyr` → PASS (attach, imessage and tui tests unchanged).
+- [x] **Step 5: Docs.** DESIGN §4.3, line 122: under the floor the agent cannot reach the attach port or the webhook. The caps stay for other users on the host. Both bind the container's own address, and in-container clients connect there.
+- [x] **Step 6:** Commit `feat(egress): bind the daemon's listeners on the container's own address in bridge mode`.
+- Deviation: `moved` also names a listener that was added or removed, since that port is published or unpublished too.
 
 ### Task A2-5: The rule set, loaded once by `supervise`, checked by the daemon
 
