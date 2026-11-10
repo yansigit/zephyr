@@ -19,9 +19,18 @@ pub fn sync(store: &mut Store, cfg: &Config) -> anyhow::Result<()> {
     let job = store.builtin_job(BUILTIN)?;
     let at = cfg.review_at().and_then(crate::config::hh_mm);
     match (job, at) {
-        (Some(job), None) => drop(store.remove_job(job.id)?),
+        // A review running now keeps its row until it ends (its report needs it), but cannot
+        // fire again; the scheduler syncs once more after each review run.
+        (Some(job), None) => {
+            if store.remove_job(job.id)? == crate::store::JobRemoval::Running {
+                store.disable_job(job.id)?;
+            }
+        }
         (job, Some((h, m))) => {
             let schedule = format!("{m} {h} * * *");
+            if let Some(job) = job.as_ref().filter(|j| !j.enabled) {
+                store.enable_job(job.id)?;
+            }
             match job {
                 Some(job) if job.schedule == schedule => {}
                 Some(job) => store.set_job_schedule(job.id, &schedule)?,
@@ -331,5 +340,41 @@ mod tests {
                 .any(|l| l.contains("review") && l.ends_with("/set review.at none")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn turning_the_review_off_mid_run_stops_it_firing_and_removes_it_after() {
+        let off = cfg(None);
+        let mut store = ready(&off);
+        let on = Config {
+            review: Some(crate::config::Review {
+                at: Some("21:30".into()),
+            }),
+            ..off.clone()
+        };
+        sync(&mut store, &on).unwrap();
+        let id = store.builtin_job("review").unwrap().unwrap().id;
+        store.queue_run(id, crate::now()).unwrap();
+        let run = store.start_next_run(crate::now()).unwrap().unwrap();
+        // `/set review.at none` while it runs: it can no longer fire, and goes once it ends.
+        sync(&mut store, &off).unwrap();
+        let job = store.builtin_job("review").unwrap().unwrap();
+        assert!(!job.enabled, "off at once");
+        store
+            .finish_run(&run, "completed", "[SILENT]", None, crate::now())
+            .unwrap();
+        sync(&mut store, &off).unwrap();
+        assert_eq!(store.builtin_job("review").unwrap(), None);
+        // Turned off mid-run and on again: on again.
+        sync(&mut store, &on).unwrap();
+        let id = store.builtin_job("review").unwrap().unwrap().id;
+        store.queue_run(id, crate::now()).unwrap();
+        let run = store.start_next_run(crate::now()).unwrap().unwrap();
+        sync(&mut store, &off).unwrap();
+        sync(&mut store, &on).unwrap();
+        assert!(store.builtin_job("review").unwrap().unwrap().enabled);
+        store
+            .finish_run(&run, "completed", "[SILENT]", None, crate::now())
+            .unwrap();
     }
 }

@@ -173,6 +173,14 @@ fn parse_cron(schedule: &str) -> Result<croner::Cron, String> {
     parser.parse(schedule).map_err(|e| e.to_string())
 }
 
+/// After a review run: `review.at` may have been turned off while it ran (`review::sync` could
+/// only turn the job off then), so the row goes now.
+fn resync_review(store: &mut Store, cfg: &Config) {
+    if let Err(e) = crate::review::sync(store, cfg) {
+        eprintln!("zephyr: keeping the daily review job in step failed: {e:#}");
+    }
+}
+
 /// Runs until an error opening the store; per-run errors are logged and the loop goes on.
 /// `cfgs` carries each reloaded config; a run started before a reload finishes on the old one.
 pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow::Result<()> {
@@ -255,6 +263,7 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
                             {
                                 eprintln!("zephyr: recording job run {} failed: {e}", run.id);
                             }
+                            resync_review(&mut store, &cfg);
                             wake.outbox.notify_one();
                             continue;
                         }
@@ -293,6 +302,9 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
             let delivery = (output.trim() != SILENT).then_some(output.as_str());
             if let Err(e) = store.finish_run(&run, status, &output, delivery, crate::now()) {
                 eprintln!("zephyr: recording job run {} failed: {e}", run.id);
+            }
+            if run.job.builtin.is_some() {
+                resync_review(&mut store, &cfg);
             }
             if let Some(notice) = memory {
                 if let Err(e) = store.notify(&run.job.channel, &run.job.recipient, &notice) {
