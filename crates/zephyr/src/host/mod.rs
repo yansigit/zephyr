@@ -470,13 +470,15 @@ impl Host {
         }
         if moved {
             println!("{FLOOR_NOTICE}");
-        }
-        let webhook = (self.published()?.into_iter()).find(|(key, _)| *key == "imessage.listen");
-        if let Some((_, p)) = webhook.filter(|_| bridge) {
-            println!(
-                "the iMessage webhook is on this host's 127.0.0.1:{p} now; forward the Tailscale \
-                 address to it once: sudo tailscale serve --bg --tcp {p} tcp://127.0.0.1:{p}"
-            );
+            // The webhook was on the Tailscale address BlueBubbles posts to; now it is not.
+            let webhook = self.published()?;
+            if let Some((_, p)) = webhook.iter().find(|(key, _)| *key == "imessage.listen") {
+                println!(
+                    "the iMessage webhook is on this host's 127.0.0.1:{p} now; forward the \
+                     Tailscale address to it once: sudo tailscale serve --bg --tcp {p} \
+                     tcp://127.0.0.1:{p}"
+                );
+            }
         }
         self.wait_ready()
     }
@@ -508,15 +510,20 @@ impl Host {
         ]
         .map(String::from)
         .into();
-        for (_, port) in self.published()? {
+        let ports: Vec<String> = (self.published()?.iter())
+            .map(|(_, port)| port.to_string())
+            .collect();
+        for port in &ports {
             args.extend(["-p".into(), format!("127.0.0.1:{port}:{port}")]);
         }
+        // For the daemon, which tells the owner when it listens on a port not among these.
+        args.extend(["-e".into(), format!("ZEPHYR_PUBLISHED={}", ports.join(","))]);
         Ok(args)
     }
 
     /// The daemon's ports that zephyr.toml asks for, by key (`egress::published`).
     pub(crate) fn published(&self) -> anyhow::Result<Vec<(&'static str, u16)>> {
-        published_in(&self.data.load()?)
+        Ok(published_in(&self.data.load()?))
     }
 
     /// After a zephyr.toml edit: under the network floor a running container publishes only the
@@ -1047,11 +1054,10 @@ const FLOOR_NOTICE: &str =
     Sign-ins: paste the address the browser cannot open. To go back: network = \"host\" in \
     host.toml, then zephyr up.";
 
-/// The daemon's ports the config in `doc` asks for, by key.
-fn published_in(doc: &toml_edit::DocumentMut) -> anyhow::Result<Vec<(&'static str, u16)>> {
-    let cfg: crate::config::Config =
-        toml::from_str(&doc.to_string()).context("zephyr.toml is not a config zephyr can run")?;
-    Ok(crate::egress::published(&cfg))
+/// The daemon's ports the config in `doc` asks for, by key. Read key by key, as `attach` reads
+/// its port: a key from a newer zephyr than this CLI must not stop `up` or a `config set`.
+fn published_in(doc: &toml_edit::DocumentMut) -> Vec<(&'static str, u16)> {
+    crate::egress::published_from(|key| conf::get(doc, key))
 }
 
 /// Whether a container with this environment is under the network floor: `up` sets
@@ -1387,7 +1393,7 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                 }
             }
             let mut doc = h.data.load()?;
-            let before = published_in(&doc).unwrap_or_default();
+            let before = published_in(&doc);
             match args[..] {
                 ["get", key] => {
                     println!(

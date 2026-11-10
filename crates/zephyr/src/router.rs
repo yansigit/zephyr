@@ -379,6 +379,9 @@ fn edits(cfg: &Config) -> Edits {
 /// starts, and waiting for it in the loop that reads the child would stop it from reading events,
 /// capping a run or flushing a channel, so the tick posts the notice instead. `from` is the
 /// channel and sender that asked: an attached client is reached by `show` alone.
+/// How long a port stays unpublished before the owner is told (`Router::unpublished_notice`).
+const UNPUBLISHED_WAIT: Duration = Duration::from_secs(60);
+
 struct Login {
     id: String,
     provider: &'static str,
@@ -415,6 +418,9 @@ struct Router<'a> {
     /// The `/login` sign-ins whose URL was posted and that have not ended: `/login paste` feeds
     /// the sender's own, and the tick posts how each ended.
     posted: Vec<Login>,
+    /// The keys whose port the container does not publish, since when, and whether the owner
+    /// was told (`unpublished_notice`).
+    unpublished: Option<(Vec<&'static str>, Instant, bool)>,
     /// `/login` starts still running: the tick drains them, so this loop never waits on rpi.
     starting: Vec<Starting>,
     /// The `/btw` side question being answered (`crate::btw::run`), one at a time.
@@ -575,6 +581,7 @@ impl<'a> Router<'a> {
             auth_stamp: None,
             logins: Vec::new(),
             posted: Vec::new(),
+            unpublished: None,
             starting: Vec::new(),
             btw: None,
             store: Store::open(&cfg.db_path())?,
@@ -690,6 +697,7 @@ impl<'a> Router<'a> {
                     self.cap_run().await;
                     self.login_starts().await;
                     self.login_notices();
+                    self.unpublished_notice();
                     if self.cfg.path.is_some() && edits(&self.cfg) != self.edits {
                         let text = self.reload().await;
                         eprintln!("zephyr: zephyr.toml or secrets.env changed: {text}");
@@ -905,6 +913,32 @@ impl<'a> Router<'a> {
         self.action_woken = newest;
         self.jobs.inbox.notify_one();
         true
+    }
+
+    /// Tells the owner, once, when the daemon listens on a port its container does not publish
+    /// (DESIGN §4.19): zephyr.toml was edited by hand, and only `zephyr up` publishes a port. Not
+    /// before `UNPUBLISHED_WAIT`: the host's `config set` and `channel` commands make the new
+    /// container themselves, and that takes this daemon down before it has said anything.
+    fn unpublished_notice(&mut self) {
+        if !crate::egress::bridge() {
+            return;
+        }
+        let made_with = std::env::var("ZEPHYR_PUBLISHED").ok();
+        let keys = crate::egress::unpublished(&self.cfg, made_with.as_deref());
+        if self.unpublished.as_ref().map(|u| &u.0) != Some(&keys) {
+            self.unpublished = Some((keys, Instant::now(), false));
+        }
+        let Some((keys, since, told)) = &mut self.unpublished else {
+            return;
+        };
+        if *told || since.elapsed() < UNPUBLISHED_WAIT {
+            return;
+        }
+        *told = true;
+        for key in keys.iter() {
+            let text = format!("[zephyr] {key} changed; run zephyr up on the host to publish it");
+            log(self.store.notify_last_owner(&text).map_err(Into::into));
+        }
     }
 
     /// The tick's part for held actions (`actions::tick`): `held` while the gateway is paused,
@@ -3450,14 +3484,6 @@ impl<'a> Router<'a> {
             Err(e) => return Reloaded::failed(format!("[zephyr] zephyr.toml not applied: {e:#}")),
         };
         new.keep_hidden(&self.cfg);
-        if crate::egress::bridge() {
-            // The container publishes the ports it was made with (DESIGN §4.19).
-            for key in crate::egress::moved(&self.cfg, &new) {
-                let text =
-                    format!("[zephyr] {key} changed; run zephyr up on the host to publish it");
-                log(self.store.notify_last_owner(&text).map_err(Into::into));
-            }
-        }
         let secrets = crate::dotenv::read(&new.secrets_path()).unwrap_or_default();
         let next = pick_in(&new, &self.store).ok().flatten();
         let mut plan = crate::reload::diff(&self.cfg, &new, self.account.as_ref(), next.as_ref());

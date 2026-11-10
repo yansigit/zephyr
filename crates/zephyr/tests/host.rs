@@ -706,6 +706,8 @@ fn init_non_interactive_builds_the_layout_and_starts_the_container() {
         ["--cap-add", "NET_ADMIN"],
         ["--cap-add", "SETPCAP"],
         ["-e", "ZEPHYR_NETWORK=bridge"],
+        // What it publishes, for the daemon to compare its ports with.
+        ["-e", "ZEPHYR_PUBLISHED=7790"],
         ["-p", "127.0.0.1:7790:7790"],
     ] {
         assert!(run.windows(2).any(|w| w == pair), "{pair:?} in {run:?}");
@@ -2012,20 +2014,30 @@ fn imessage_is_published_on_loopback_with_a_tailscale_serve_hint() {
         "\n[imessage]\nlisten = \"100.64.0.1:7791\"\nserver_url = \"http://100.64.0.2:1234\"\n\
          password_env = \"ZEPHYR_BB_PASSWORD\"\nsecret_env = \"ZEPHYR_BB_SECRET\"\n",
     );
+    // A key from a newer zephyr than this CLI: the ports are read by key, so it is no obstacle.
+    cfg.push_str("\n[future]\nsetting = 1\n");
     std::fs::write(env.daemon().join("zephyr.toml"), cfg).unwrap();
-    let said = env.ok(&["up"]);
+    const HINT: &str = "the iMessage webhook is on this host's 127.0.0.1:7791 now; forward the \
+        Tailscale address to it once: sudo tailscale serve --bg --tcp 7791 tcp://127.0.0.1:7791";
+    // Moving over from host networking: the webhook's address changes, and `up` says so.
+    let out = env.zephyr_env(&["up"], &[("SHIM_NETMODE", "host")]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout(&out).contains(HINT), "{}", stdout(&out));
     let run = run_call(&env);
     assert!(has_pair(&run, "-p", "127.0.0.1:7791:7791"), "{run:?}");
     assert!(has_pair(&run, "-p", "127.0.0.1:7790:7790"), "{run:?}");
+    assert!(
+        has_pair(&run, "-e", "ZEPHYR_PUBLISHED=7790,7791"),
+        "{run:?}"
+    );
     // Never the Tailscale address: Docker could not bind it before tailscaled is up.
     assert!(!run.iter().any(|a| a.contains("100.64.0.1")), "{run:?}");
-    assert!(
-        said.contains(
-            "the iMessage webhook is on this host's 127.0.0.1:7791 now; forward the Tailscale \
-             address to it once: sudo tailscale serve --bg --tcp 7791 tcp://127.0.0.1:7791"
-        ),
-        "{said}"
-    );
+    // Every later `up` has nothing new to say.
+    assert!(!env.ok(&["up"]).contains("tailscale serve"));
 }
 
 #[test]

@@ -165,7 +165,7 @@ Changes apply by themselves; nothing needs `zephyr restart`. The commands above,
 | The model, on the same provider | at once, or after the reply in progress (rpi's `set_model`) |
 | A model on another provider, the active account, extensions, connectors (`[[mcp]]`), subagents (`[[subagent]]`), a re-login | the agent restarts after the reply in progress; the conversation carries on |
 | Discord, iMessage, `[attach]`, `[agent]`, a secret | the daemon restarts itself in place once idle; waiting messages are kept |
-| The attach port, the iMessage webhook's port | `zephyr config set` and `zephyr channel` start the container again to publish it; after a hand edit you are told to run `zephyr up` |
+| The attach port, the iMessage webhook's port | `zephyr config set` and `zephyr channel` start the container again to publish it; after a hand edit you are told, a minute later, to run `zephyr up` |
 
 A file that does not load is not applied, and the daemon keeps its current settings.
 
@@ -631,7 +631,7 @@ browsers work as before; `ssh`, `ping` and mail clients fail until you allow the
   start the container again to publish the change; after a hand edit of those keys, run
   `zephyr up`.
 - **iMessage.** BlueBubbles posts to your Tailscale address, so forward that to the webhook once
-  (`zephyr up` prints the line with your port): `sudo tailscale serve --bg --tcp 7791
+  (the `zephyr up` that moves an install over prints the line with your port): `sudo tailscale serve --bg --tcp 7791
   tcp://127.0.0.1:7791`. `[imessage] listen` keeps naming the Tailscale address and port.
 - **Upgrading.** The first `zephyr up` or `zephyr upgrade` on a version with the network floor
   moves the container over and says so once. Until `tailscale serve` forwards the webhook, iMessage

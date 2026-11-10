@@ -60,28 +60,48 @@ pub fn listen_addr(addr: SocketAddr) -> anyhow::Result<SocketAddr> {
     }
 }
 
-/// Every daemon TCP port `zephyr up` publishes on the host's loopback, by the zephyr.toml key
-/// that sets it.
+/// Every daemon TCP listener `zephyr up` publishes on the host's loopback: the zephyr.toml key
+/// that sets its port, and the port a config has there. A new listener is one row here.
+type Listener = (&'static str, fn(&Config) -> Option<u16>);
+const LISTENERS: &[Listener] = &[
+    ("attach.port", |c| c.attach.as_ref().map(|a| a.port)),
+    ("imessage.listen", |c| {
+        c.imessage.as_ref().map(|i| i.listen.port())
+    }),
+];
+
+/// The ports `cfg` has the daemon listen on, by key.
 pub fn published(cfg: &Config) -> Vec<(&'static str, u16)> {
-    let attach = cfg.attach.as_ref().map(|a| ("attach.port", a.port));
-    let imessage = cfg.imessage.as_ref();
-    let imessage = imessage.map(|i| ("imessage.listen", i.listen.port()));
-    attach.into_iter().chain(imessage).collect()
+    let port = |(key, port): &Listener| port(cfg).map(|p| (*key, p));
+    LISTENERS.iter().filter_map(port).collect()
 }
 
-/// The keys whose published port differs between two configs: a container made for `old` does
-/// not publish what `new` listens on.
-pub fn moved(old: &Config, new: &Config) -> Vec<&'static str> {
-    let (old, new) = (published(old), published(new));
-    let port =
-        |list: &[(&str, u16)], key: &str| list.iter().find(|(k, _)| *k == key).map(|(_, p)| *p);
-    let mut keys: Vec<&'static str> = Vec::new();
-    for (key, _) in old.iter().chain(&new) {
-        if port(&old, key) != port(&new, key) && !keys.contains(key) {
-            keys.push(key);
-        }
-    }
-    keys
+/// The same from zephyr.toml's own text, where `get` reads a key's value: a port, or an address
+/// with one. The host reads the file this way, so a key this build does not know cannot stop it.
+pub fn published_from(get: impl Fn(&str) -> Option<String>) -> Vec<(&'static str, u16)> {
+    let port = |(key, _): &Listener| {
+        let value = get(key)?;
+        let port = value.parse().ok();
+        let port = port.or_else(|| Some(value.parse::<SocketAddr>().ok()?.port()));
+        port.map(|p| (*key, p))
+    };
+    LISTENERS.iter().filter_map(port).collect()
+}
+
+/// The keys whose port the container does not publish: `made_with` is `ZEPHYR_PUBLISHED`, the
+/// ports `zephyr up` published when it made the container, and `None` (a container that does
+/// not say) names nothing.
+pub fn unpublished(cfg: &Config, made_with: Option<&str>) -> Vec<&'static str> {
+    let Some(made_with) = made_with else {
+        return Vec::new();
+    };
+    let ports: Vec<u16> = (made_with.split(','))
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    let missing = published(cfg)
+        .into_iter()
+        .filter(|(_, p)| !ports.contains(p));
+    missing.map(|(key, _)| key).collect()
 }
 
 /// IPv4 blocks that are not the public internet, from the IANA IPv4 Special-Purpose Address
@@ -1449,17 +1469,36 @@ mod tests {
     }
 
     #[test]
-    fn moved_names_a_changed_port_only() {
-        let old = listeners(7790, "http://100.64.0.2:1234");
+    fn published_reads_the_same_keys_from_the_files_text() {
+        // As the host reads zephyr.toml: by key, so a key this build does not know is no obstacle.
+        let file = |key: &str| match key {
+            "attach.port" => Some("7790".to_string()),
+            "imessage.listen" => Some("100.64.0.1:7791".to_string()),
+            _ => None,
+        };
         assert_eq!(
-            moved(&old, &listeners(7799, "http://100.64.0.2:1234")),
-            ["attach.port"]
+            published_from(file),
+            published(&listeners(7790, "http://100.64.0.2:1234"))
         );
-        assert!(moved(&old, &listeners(7790, "http://100.64.0.3:1234")).is_empty());
-        // A listener added or removed is published or unpublished too.
-        let bare: Config = toml::from_str("rpi = '/r'\nhome = '/h'\n").unwrap();
-        assert_eq!(moved(&bare, &old), ["attach.port", "imessage.listen"]);
-        assert_eq!(moved(&old, &bare), ["attach.port", "imessage.listen"]);
+        assert_eq!(published_from(|_| None), []);
+        // A value that is no port is not published; the daemon refuses that file anyway.
+        let odd = |key: &str| (key == "attach.port").then(|| "soon".to_string());
+        assert_eq!(published_from(odd), []);
+    }
+
+    #[test]
+    fn unpublished_names_the_ports_the_container_was_not_made_with() {
+        let cfg = listeners(7799, "http://100.64.0.2:1234");
+        assert_eq!(unpublished(&cfg, Some("7790,7791")), ["attach.port"]);
+        assert!(unpublished(&cfg, Some("7799,7791")).is_empty());
+        // A listener added since: its port is not published either.
+        assert_eq!(unpublished(&cfg, Some("7799")), ["imessage.listen"]);
+        assert_eq!(
+            unpublished(&cfg, Some("")),
+            ["attach.port", "imessage.listen"]
+        );
+        // A container that does not say what it publishes is not second-guessed.
+        assert!(unpublished(&cfg, None).is_empty());
     }
 
     #[test]
