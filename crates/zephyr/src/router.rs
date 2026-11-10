@@ -1043,10 +1043,13 @@ impl<'a> Router<'a> {
                 eprintln!("zephyr: gateway {shown:?} is not on the list; not run");
                 return None;
             }
-            // Subagents and rules are settings: proposed through `set_setting`, so the card and
-            // the owner's `/ok` check them by content (settings spec §4.4).
+            // Subagents, rules, goals and the persona are settings: proposed through
+            // `set_setting`, so the card and the owner's `/ok` check them by content (settings
+            // spec §4.4).
             Some(Gateway::Propose)
-                if command.starts_with("/subagent ") || command.starts_with("/rule ") =>
+                if ["/subagent ", "/rule ", "/goal ", "/persona "]
+                    .iter()
+                    .any(|p| command.starts_with(p)) =>
             {
                 return Some(self.agent_set(command).await)
             }

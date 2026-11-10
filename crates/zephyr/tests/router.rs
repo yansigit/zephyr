@@ -2124,6 +2124,71 @@ async fn the_agent_proposes_a_subagent_and_the_card_shows_its_prompt() {
 }
 
 #[tokio::test]
+async fn the_agent_proposes_a_goal_and_a_stale_card_is_refused() {
+    let home = home("gateway-goal");
+    let gw = start(config(&home));
+    let call = |goal: &str| format!(r#"[call gateway {{"command": "/goal add {goal}"}}] suggest"#);
+    gw.say("m1", "owner", &call("Run a 10k by June")).await;
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        replies
+            .iter()
+            .any(|r| r.starts_with("[zephyr] the agent proposes #1: /goal add Run a 10k by June")),
+        "{replies:?}"
+    );
+    gw.say("m2", "owner", "/goal add Other").await;
+    assert_eq!(
+        gw.wait_replies(3).await[2],
+        "[zephyr] goal 1 set; it applies from the next message"
+    );
+    gw.say("m3", "owner", "/ok 1").await;
+    assert_eq!(
+        gw.wait_replies(4).await[3],
+        "[zephyr] goal is now 1 goal; propose again"
+    );
+    let goals = || std::fs::read_to_string(home.join("GOALS.md")).unwrap();
+    assert_eq!(goals(), "Other\n");
+    gw.say("m4", "owner", &call("Run a 10k by June")).await;
+    let replies = gw.wait_replies(6).await;
+    assert!(
+        replies.iter().any(|r| r.contains("proposes #2: /goal add")),
+        "{replies:?}"
+    );
+    gw.say("m5", "owner", "/ok 2").await;
+    let replies = gw.wait_replies(7).await;
+    assert!(replies[6].contains("goal 2 set"), "{replies:?}");
+    assert_eq!(goals(), "Other\nRun a 10k by June\n");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_agent_proposes_a_persona_shown_whole_on_its_card() {
+    let home = home("gateway-persona");
+    let gw = start(config(&home));
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call gateway {"command": "/persona set Warm.\nBrief."}] suggest"#,
+    )
+    .await;
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        replies
+            .iter()
+            .any(|r| r.starts_with("[zephyr] the agent proposes #1: /persona set Warm.\nBrief.")),
+        "{replies:?}"
+    );
+    assert!(!home.join("PERSONA.md").exists(), "nothing before /ok");
+    gw.say("m2", "owner", "/ok 1").await;
+    gw.wait_replies(3).await;
+    assert_eq!(
+        std::fs::read_to_string(home.join("PERSONA.md")).unwrap(),
+        "Warm.\nBrief.\n"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn proposed_text_is_capped_at_what_the_card_shows() {
     let home = home("gateway-card-cap");
     let gw = start(on_file(&home, ""));

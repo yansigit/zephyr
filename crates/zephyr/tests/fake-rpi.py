@@ -127,7 +127,7 @@ if "--version" in args:
     print("rpi 0.21.2"); sys.exit(0)
 CATALOG = ["fake/m1", "fake/m2", "other/m3", "opencode-go/alpha"]
 # zephyr_policy::tools::GATEWAY_COMMANDS
-GATEWAY_COMMANDS = ["/status", "/model", "/switch", "/rules", "/memory diff", "/memory log", "/job list", "/settings", "/approvals", "/facts"]
+GATEWAY_COMMANDS = ["/status", "/model", "/switch", "/rules", "/goals", "/persona", "/memory diff", "/memory log", "/job list", "/settings", "/approvals", "/facts"]
 def gateway_kind(c):
     """zephyr_policy::tools::gateway_kind: "read", "set", "propose" or None."""
     if c in GATEWAY_COMMANDS:
@@ -155,8 +155,17 @@ def gateway_kind(c):
         ok = (len(w) == 2 and key(w[0]) and val(w[1])) or (
             len(w) == 4 and w[2] == "for" and key(w[0]) and val(w[1]) and span(w[3]))
         return "set" if ok else None
-    if cmd in ("/subagent", "/rule") and len(c) > 1500:
+    if cmd in ("/subagent", "/rule", "/goal", "/persona") and len(c) > 1500:
         return None
+    if cmd == "/goal":
+        verb, _, rest = arg.partition(" ")
+        ok = (verb == "add" and plain(rest)) or (
+            verb in ("done", "rm") and re.fullmatch(r"[0-9]+", rest) is not None)
+        return "propose" if ok else None
+    if cmd == "/persona":
+        text = arg[len("set "):] if arg.startswith("set ") else None
+        ok = arg == "clear" or (text is not None and plain(text.replace("\n", " ")))
+        return "propose" if ok else None
     if cmd == "/subagent":
         verb, _, rest = arg.partition(" ")
         rest = rest.lstrip(" ")

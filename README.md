@@ -478,13 +478,13 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   `/job ok N` (`/job rm N` drops it, though not while one of its runs is in progress; `/job list`
   marks the ones waiting).
 - **Commands.** The agent's `gateway` tool runs `/status`, `/model`, `/switch`, `/rules`,
-  `/memory diff`, `/memory log`, `/job list`, `/settings`, `/approvals` or `/facts` (the facts'
+  `/goals`, `/persona`, `/memory diff`, `/memory log`, `/job list`, `/settings`, `/approvals` or `/facts` (the facts'
   names and kinds, never a value) and reads the output in the same turn. It can save a private fact
   (`/facts add NAME KIND VALUE`; you are told its name) and propose removing one or allowing it a
   target. It
   can change a setting with `/set KEY VALUE [for D]` (stricter at once, else proposed; see
   [Changing settings](#changing-settings)), and propose `/model PROVIDER/MODEL`, `/new`, `/switch ID`,
-  `/pause`, `/reload`, `/subagent …` or `/rule …`: you are asked
+  `/pause`, `/reload`, `/subagent …`, `/rule …`, `/goal add|done|rm …` or `/persona set …|clear`: you are asked
   (`the agent asks to run /new (#3)`), `/ok 3` runs it exactly as if you had typed it, and `/no 3`
   drops it (a proposal lapses after 24 hours). Approvals (`/ok`, `/no`, `/cancel`, `/held`,
   `/memory ok`, `/job ok`, `/login`, `/resume`) and `/stop` are never proposable, so text the agent read cannot approve
