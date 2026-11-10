@@ -1772,7 +1772,7 @@ async fn turning_memory_auto_on_needs_a_strong_channel_and_the_agent_may_only_tu
         .await;
     assert_eq!(
         gw.wait_replies_on("discord", 1).await,
-        ["[zephyr] loosening memory.auto needs tui or chat"]
+        ["[zephyr] loosening memory.auto needs tui or chat or passkey"]
     );
     gw.say("m1", "owner", "/set memory.auto owner").await;
     reply_starting(&gw, "[zephyr] memory.auto off → owner").await;
