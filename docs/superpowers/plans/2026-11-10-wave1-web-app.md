@@ -106,7 +106,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
 - `expire_web_sessions` deletes rows `web_session` would refuse.
 - `proposal_digest` is SHA-256 of `serde_json::to_vec(&json!([kind, class, command, targets, payload, secrets, key, seen]))` over the row's columns as stored (NULL → `null`).
 
-- [ ] **Step 1: Write the failing tests** in `store.rs` `mod tests`:
+- [x] **Step 1: Write the failing tests** in `store.rs` `mod tests`:
   - Extend `older_databases_migrate_in_order_and_keep_their_rows` with `const V18: &str = "DROP TABLE web_push; DROP TABLE web_sessions; DROP TABLE web_passkeys;"`, run first in the undo chain, and add the `(16, "")` case.
   - `a_session_ends_30_days_after_sign_in_or_7_days_unused`:
     - `add_web_session(h, 1, 0)`;
@@ -123,10 +123,13 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - `a_push_endpoint_is_saved_once_and_the_eleventh_is_refused`.
   - `proposal_digest_changes_with_every_column_ok_reads`: for each of the 8 columns, `UPDATE` it on a held action and assert that the digest differs from the one before. `summary` and `reason` do not change it.
   - `debug_of_web_rows_prints_lengths_only`: `format!("{p:?}")` holds `cred_id: 3 bytes` and no byte value.
-- [ ] **Step 2: Run** `cargo test -p zephyr --lib store::` → FAIL (no such functions).
-- [ ] **Step 3: Implement** in `store.rs`. Add an `if version < 18` block after v16's, ending `PRAGMA user_version = 18;`, and bump `SCHEMA_VERSION`. Write `remove_passkey` as one transaction: delete pushes, delete sessions (count them), delete the passkey.
-- [ ] **Step 4: Run** `cargo test -p zephyr --lib store::` → PASS; then `cargo test -p zephyr`.
-- [ ] **Step 5: Commit** `feat(store): keep the web app's passkeys, sessions and push subscriptions in schema v18`.
+- [x] **Step 2: Run** `cargo test -p zephyr --lib store::` → FAIL (no such functions).
+- [x] **Step 3: Implement** in `store.rs`. Add an `if version < 18` block after v16's, ending `PRAGMA user_version = 18;`, and bump `SCHEMA_VERSION`. Write `remove_passkey` as one transaction: delete pushes, delete sessions (count them), delete the passkey.
+- [x] **Step 4: Run** `cargo test -p zephyr --lib store::` → PASS; then `cargo test -p zephyr`.
+- [x] **Step 5: Commit** `feat(store): keep the web app's passkeys, sessions and push subscriptions in schema v18`.
+- Deviation: decision 2 is wrong about the code: the bundled SQLite of rusqlite 0.41 enforces foreign keys, so the spec's `REFERENCES` clauses are live. The schema stays verbatim; `remove_passkey` still deletes the rows itself (to count the sessions); the tests give a session or a push a real passkey first instead of `passkey = 1` on an empty table.
+- Deviation: `upgraded_from` is the approvals gate's v16 mark (the router writes `preset = "full"` on it), so a v16 database migrating to v18 does not set it; the migration test's `(16, "")` case expects `None`. `tests/router.rs` `old_install` also drops the v18 tables before stamping v15.
+- Deviation: added the test `meta_values_are_set_read_and_deleted` for `meta`/`set_meta`.
 
 ### Task W-2: `web/passkey.rs`: WebAuthn ES256 verification, preimages, challenge queues
 
