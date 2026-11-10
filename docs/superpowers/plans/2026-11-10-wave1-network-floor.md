@@ -328,9 +328,9 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
 - Consumes: everything above.
 - `net_floor.rs` panics at its start unless `ZEPHYR_CONTAINER` is set and is not `zephyr` (never the live install). Without Docker it skips, unless `ZEPHYR_REAL_RPI=1`. Agent commands are `docker exec -u <uid>:<gid> -e PATH=<AGENT_PATH>` plus each `agent::PROXY_ENV` pair, and `AGENT_BROWSER_ARGS` with the proxy flag (as `agent::proxy` builds it).
 
-- [ ] **Step 1: Docs.** DESIGN §4.19 Network floor: the rule set and why it looks as it does (spec §4.3), the proxy and its checks (§4.4), what the agent's processes get and what stops working (§4.5), listeners (§4.6, with decision 2's loopback publish and `tailscale serve`), sign-ins and X11 (§4.7), audit (§4.8), failure handling (§4.10, without the Tailscale boot-order case), and the owner's four decisions. §7: the host's own public address on a VPS stays open. CLAUDE.md: `egress.rs` (DESIGN §4.19): the proxy on 127.0.0.1:7792, `public`/`decide`, `listen_addr`/`published` for every daemon listener, `ruleset`/`load_floor` run by `supervise`, `verify`, and `__netcheck`.
-- [ ] **Step 2: Write `net_floor.rs`'s `the_agent_reaches_only_the_proxy`**, asserting each check in Step 4. It must compile and skip: `cargo test -p zephyr --test net_floor` → 0 run, 1 ignored.
-- [ ] **Step 3: Bring up the side container** (own HOME, own image, and attach on 17790 because the live install holds 7790):
+- [x] **Step 1: Docs.** DESIGN §4.19 Network floor: the rule set and why it looks as it does (spec §4.3), the proxy and its checks (§4.4), what the agent's processes get and what stops working (§4.5), listeners (§4.6, with decision 2's loopback publish and `tailscale serve`), sign-ins and X11 (§4.7), audit (§4.8), failure handling (§4.10, without the Tailscale boot-order case), and the owner's four decisions. §7: the host's own public address on a VPS stays open. CLAUDE.md: `egress.rs` (DESIGN §4.19): the proxy on 127.0.0.1:7792, `public`/`decide`, `listen_addr`/`published` for every daemon listener, `ruleset`/`load_floor` run by `supervise`, `verify`, and `__netcheck`.
+- [x] **Step 2: Write `net_floor.rs`'s `the_agent_reaches_only_the_proxy`**, asserting each check in Step 4. It must compile and skip: `cargo test -p zephyr --test net_floor` → 0 run, 1 ignored.
+- [x] **Step 3: Bring up the side container** (own HOME, own image, and attach on 17790 because the live install holds 7790):
   ```sh
   cargo build -p zephyr && Z=$PWD/target/debug/zephyr
   export ZEPHYR_CONTAINER=zephyr-test ZEPHYR_IMAGE=zephyr-dev:$(git rev-parse --short HEAD)
@@ -339,7 +339,7 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
   $Z config set attach.port 17790 && $Z up --build
   ```
   Expected: `docker inspect -f '{{.HostConfig.NetworkMode}}' zephyr-test` prints `zephyr-test`.
-- [ ] **Step 4: Run the checks:** `cargo test -p zephyr --test net_floor -- --ignored` (same env). It passes when all of these hold:
+- [x] **Step 4: Run the checks:** `cargo test -p zephyr --test net_floor -- --ignored` (same env). It passes when all of these hold:
   - As the agent, each of these fails at once and gets no answer:
     - `curl -m 5 http://127.0.0.1:17790/` and `curl -m 5 http://127.0.0.1:7790/`;
     - `curl -m 5 --noproxy '*'` to `http://192.168.1.1/`, `http://100.100.100.100/`, `http://169.254.169.254/` and `https://1.1.1.1`.
@@ -351,9 +351,14 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
   - `docker exec zephyr-test zephyr doctor` exits 0 with the floor lines `ok`.
   - The daemon's `CapEff` (`/proc/<pid of zephyr run>/status`) has bit 12 clear.
   - From the host, `curl -s -m 3 http://127.0.0.1:17790/` connects (the publish works).
-- [ ] **Step 5: Manual checks**, recorded in the PR body:
+- [x] **Step 5: Manual checks**, recorded in the PR body:
   - `docker exec -u $(id -u) -e DISPLAY=:99 -e XAUTHORITY=/zephyr/.zephyr-xauthority zephyr-test xdpyinfo` works, and `xdpyinfo -display :99` on the host does not reach it.
   - OAuth paste on the host: `$Z login openai-codex`. Open the URL in the host's browser, sign in, let the `127.0.0.1:1455` page fail, and paste its address at rpi's prompt. Then `$Z accounts` lists the account.
   - The same through the TUI: `$Z attach`, `/login antigravity`, and paste the failed address into the panel's input row. It reaches `done`.
-- [ ] **Step 6: Tear down:** `docker rm -f zephyr-test && docker network rm zephyr-test && rm -rf "$HOME"`.
-- [ ] **Step 7:** Commit `docs(egress): describe the network floor, and check it against a real container`.
+- [x] **Step 6: Tear down:** `docker rm -f zephyr-test && docker network rm zephyr-test && rm -rf "$HOME"`.
+- [x] **Step 7:** Commit `docs(egress): describe the network floor, and check it against a real container`.
+- Deviation: side-container run (image `zephyr-dev:a2-0932eae` built from this branch by `zephyr up --build`, container `zephyr-test` on its own bridge, attach on 17790, its own HOME; removed afterwards): `tests/net_floor.rs -- --ignored` passed. As the agent, direct connections to 127.0.0.1:7790, 127.0.0.1:17790, the container address on 17790, 192.168.1.1, 100.100.100.100, 169.254.169.254, 1.1.1.1:443 and the bridge gateway were each refused in about 0.1 s; the proxy answered 403 for the private and metadata addresses and for `[::ffff:127.0.0.1]`; `getent hosts example.com` failed; `curl https://example.com`, agent-browser and Camoufox each got `Example Domain`; the audit held `example.com:443 -> <ip>|allowed` and the refusals; the daemon `CapEff` was `e0` (SETUID, SETGID, KILL) while `supervise` kept `11e0`; the host reached 127.0.0.1:17790.
+- Deviation: `zephyr doctor` printed every floor line `ok` but exited 1 in the side container, because that install has no signed-in account (`rpi --mode rpc did not start: No API key`). The test asserts the floor lines, not the exit code.
+- Deviation: also checked by hand there: with the table deleted and the daemon killed, the restarted daemon refused to run (`the network floor is not in place: … connected to 1.1.1.1:443`), `supervise` gave up after 5 exits, Docker restarted the container and the rules were loaded again. `xdpyinfo` worked in the container with the cookie and was refused without it.
+- Deviation: not done from Step 5: the two OAuth paste checks need a real provider account and a browser, and the host half of the `xdpyinfo` check cannot be told apart on this machine, where the live host-network container owns the host abstract socket for display 99.
+

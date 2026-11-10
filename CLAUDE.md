@@ -22,6 +22,8 @@ cargo deny check advisories bans               # what CI's deny job runs
 cargo test -p zephyr --test real_rpi -- --ignored
 cargo test -p zephyr-policy --test rpi_load -- --ignored
 cargo test -p zephyr --test attach -- --ignored   # drives real `rpi --connect` via tests/drive-connect.py
+# Needs Docker and a side container (never the live one); the file's head says how to make it
+ZEPHYR_CONTAINER=zephyr-test cargo test -p zephyr --test net_floor -- --ignored
 
 cargo install --path crates/zephyr && zephyr up --build   # build deploy/Dockerfile and run it locally
 deploy/release.sh 0.2.1 | --cli                           # release from a clean main (README "Releasing")
@@ -117,6 +119,19 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   from `Store::activity` (one `UNION ALL` over audit, settings_log, command proposals, runs, tasks
   and procs, keyset-paged by `store::Cursor`), every text scrubbed at read (`gate::Scrub`, then
   `settings::one_line`). The model never writes it.
+- `egress.rs` (DESIGN §4.19): the network floor. In bridge mode (`ZEPHYR_NETWORK=bridge`, set by
+  `zephyr up` unless host.toml says `network = "host"`) the agent's uid has no route but its own
+  loopback and the proxy on `127.0.0.1:7792` (`serve`, in the router's `select!`). `public` (IPv4
+  denylist, IPv6 allowlist, so no IPv4-embedding form passes) and `decide` (ports 80 and 443, or
+  an exact `network.allow` entry; every resolved address checked, one bad one refuses the
+  request) are pure; the proxy connects only to the `SocketAddr`s `decide` returned. Every daemon
+  TCP listener binds `listen_addr(..)` and is listed in `published`, which is what `zephyr up`
+  publishes on host loopback. `ruleset`/`load_floor` are run by `supervise` before the first
+  daemon (NET_ADMIN and SETPCAP then dropped in the daemon's `pre_exec`); `verify` and the hidden
+  `zephyr __netcheck` (run as the agent, before the config is read) prove it at start and in
+  `doctor`. Agent processes get `agent::PROXY_ENV` through `agent::cmd`. Audit rows are session
+  `net`. Tests never set `ZEPHYR_NETWORK`; `tests/net_floor.rs` (ignored) checks a real side
+  container.
 - `browser_gate.rs`: `agent-browser` on the agent's PATH is the zephyr binary (`argv[0]`,
   dispatched in main.rs before any config is read), linked from root's `/opt/zephyr/gate/bin`, first
   on `agent::AGENT_PATH`; the real 0.41 binary is `/opt/zephyr/libexec/agent-browser`
