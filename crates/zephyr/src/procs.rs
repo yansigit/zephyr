@@ -739,7 +739,9 @@ fn strays(all: &HashMap<i32, Ps>, uid: u32, scope: i32, keep: &[i32]) -> Vec<(i3
                 under_desktop = true;
             }
             if p.ppid == 0 {
-                return named; // the top, or a parent outside the namespace: not under scope
+                // The top (pid 1), or a parent outside the namespace: not under scope, but a
+                // desktop program under a `docker exec` counts.
+                return named && pid != 1;
             }
             if p.ppid == scope {
                 return true;
@@ -1237,6 +1239,14 @@ mod tests {
                 (62, 7),
                 (80, 7)
             ]
+        );
+        // Swept below another pid (a test's scope), a desktop under the machine's own init is
+        // not in the namespace zephyr looks at: only one under a `docker exec` counts.
+        let mut found = strays(&all, 9, 10, &[]);
+        found.sort();
+        assert!(
+            !found.contains(&(50, 7)) && found.contains(&(62, 7)),
+            "{found:?}"
         );
     }
 
