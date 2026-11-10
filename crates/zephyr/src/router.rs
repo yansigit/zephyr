@@ -1410,10 +1410,10 @@ impl<'a> Router<'a> {
                 value,
                 until,
                 channel,
-                expect: _,
+                expect,
                 reply,
             } => {
-                let set = self.settings_set(&key, &value, until.as_deref(), channel);
+                let set = self.settings_set(&key, &value, until.as_deref(), channel, expect);
                 let _ = reply.send(set.await);
                 self.publish();
             }
@@ -1423,6 +1423,25 @@ impl<'a> Router<'a> {
             AttachRequest::Activity { query, reply } => {
                 let answer = crate::activity::answer(&self.cfg, &self.store, &query, crate::now());
                 let _ = reply.send(answer);
+            }
+            AttachRequest::Decide {
+                id,
+                verb,
+                channel,
+                expect,
+                reply,
+            } => {
+                let _ = reply.send(self.decide(id, &verb, channel, expect).await);
+                self.publish();
+            }
+            AttachRequest::Card { id, reply } => {
+                let _ = reply.send(self.card(id));
+            }
+            AttachRequest::Current { key, reply } => {
+                let _ = reply.send(match crate::settings::find(&key) {
+                    Some(s) => Ok(self.current(s, &key)),
+                    None => Err(format!("no setting {key}; /settings lists them")),
+                });
             }
             AttachRequest::WebNotice(text) => {
                 // An attached owner is shown the row by the flush, with every other client
@@ -1438,16 +1457,6 @@ impl<'a> Router<'a> {
                 if let Some((channel, to)) = last {
                     log(self.store.notify(&channel, &to, &text).map_err(Into::into));
                 }
-            }
-            AttachRequest::Decide {
-                id,
-                verb,
-                channel,
-                expect: _,
-                reply,
-            } => {
-                let _ = reply.send(self.decide(id, &verb, channel).await);
-                self.publish();
             }
         }
     }
@@ -1516,8 +1525,17 @@ impl<'a> Router<'a> {
         value: &str,
         until: Option<&str>,
         channel: &'static str,
+        expect: Option<Option<String>>,
     ) -> Value {
         let refused = |why: String| json!({"outcome": "refused", "reason": why});
+        // A signed change names the value it changes from: here, on the loop, nothing can
+        // move between this check and the change.
+        if let Some(seen) = expect {
+            let now = crate::settings::find(key).map(|s| self.current(s, key));
+            if now != Some(seen) {
+                return refused(format!("{key} changed; look at it again"));
+            }
+        }
         if key == "facts" {
             return refused("change private facts with /facts".into());
         }
@@ -1611,7 +1629,45 @@ impl<'a> Router<'a> {
     /// checks the chat commands make (stale, strong channel). `once` is `ok` for a setting.
     /// `channel` is who decides (`tui`, `web` or, signed, `passkey`); an approved command runs
     /// as a message on the client's own channel, since `passkey` has no rows.
-    async fn decide(&mut self, id: i64, verb: &str, channel: &'static str) -> Value {
+    async fn decide(
+        &mut self,
+        id: i64,
+        verb: &str,
+        channel: &'static str,
+        expect: Option<crate::attach::Expect>,
+    ) -> Value {
+        // A signed approval is for the proposal as it was stored and shown when signed: here,
+        // on the loop, nothing can change between this check and the effect.
+        if let Some(signed) = &expect {
+            let same = self.card(id).is_some_and(|(card, digest)| {
+                digest == signed.digest
+                    && crate::web::passkey::card_sha256(&card) == signed.card_sha256
+            });
+            if !same {
+                let text = "[zephyr] the card changed; look at it again";
+                return json!({"ok": false, "text": text});
+            }
+        }
+        let done = self.decide_as(id, verb, channel).await;
+        if expect.is_some() && done["ok"] == true {
+            // The audit has no channel column: a signed decision that ran gets its own row.
+            let what = format!("#{id} {verb}");
+            let logged = self.store.audit("web", "passkey", &what, "signed");
+            log(logged.map(drop).map_err(Into::into));
+        }
+        done
+    }
+
+    /// A waiting proposal's card, as `zephyr.proposals` gives it now, and its digest.
+    fn card(&self, id: i64) -> Option<(String, [u8; 32])> {
+        let all = self.proposals_json();
+        let card =
+            (all["proposals"].as_array()?.iter()).find(|p| p["id"] == id)?["card"].as_str()?;
+        let digest = self.store.proposal_digest(id).ok()??;
+        Some((card.to_string(), digest))
+    }
+
+    async fn decide_as(&mut self, id: i64, verb: &str, channel: &'static str) -> Value {
         if verb == "cancel" {
             let done = crate::actions::cancel(&self.cfg, &self.store, &self.waits, &id.to_string());
             self.settled_actions();

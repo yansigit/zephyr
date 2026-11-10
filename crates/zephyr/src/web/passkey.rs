@@ -44,6 +44,11 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// A card's hash as the page computes it: lowercase hex SHA-256 of the card text as sent.
+pub fn card_sha256(card: &str) -> String {
+    HEXLOWER.encode(&sha256(card.as_bytes()))
+}
+
 /// A base64url (no padding) field of a browser's result.
 fn field(v: &Value, key: &str) -> Result<Vec<u8>, &'static str> {
     let text = v.get(key).and_then(Value::as_str).ok_or("malformed")?;

@@ -574,7 +574,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - With one: the same steps with `Signed::Set`, then `SettingsSet { channel: "passkey", expect: Some(current) }`.
 - Router `decide` with `expect`: `proposal_digest(id)` and the card's hash must still match, else `{"ok": false, "text": "[zephyr] the card changed; look at it again"}`, and nothing runs. Router `settings_set` with `expect`: `current(s, key)` must equal it, else `refused "KEY changed; look at it again"`.
 
-- [ ] **Step 1: Write the failing tests** in `tests/web.rs`. Config: `[approvals] preset = "manual"`. Helper: hold a `himalaya` send with `store.hold_action(&NewAction{kind: Run, class: "messages", …})`, as `tests/router.rs:4744` does, with the payload `run_payload` of `himalaya message send …`. Helper `sign(ws, auth, op) -> Value`.
+- [x] **Step 1: Write the failing tests** in `tests/web.rs`. Config: `[approvals] preset = "manual"`. Helper: hold a `himalaya` send with `store.hold_action(&NewAction{kind: Run, class: "messages", …})`, as `tests/router.rs:4744` does, with the payload `run_payload` of `himalaya message send …`. Helper `sign(ws, auth, op) -> Value`.
   - `an_unsigned_ok_or_a_changed_card_is_refused`: `decide ok` without `assertion` → `approve with your passkey`; `web_challenge` with `card_sha256` of `"x"` → `the card changed`.
   - `a_signed_ok_runs_the_stored_command_and_is_audited_as_passkey`:
     - `log.jsonl` (or the procs log) shows the stored command;
@@ -598,10 +598,13 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
     - signed → `changed`;
     - `settings_log` channel `passkey`.
   - `a_signed_change_is_refused_when_the_value_moved`: sign `set tasks.parallel 3` at 2; `/set tasks.parallel 4` on chat; the signed `settings_set` → `tasks.parallel changed; look at it again`.
-- [ ] **Step 2: Run** `cargo test -p zephyr --test web` → FAIL.
-- [ ] **Step 3: Implement.** Write the docs.
-- [ ] **Step 4: Run** the same, then `cargo test -p zephyr` → PASS.
-- [ ] **Step 5: Commit** `feat(web): approve cards and strong settings only with a passkey signature over exactly what is shown`.
+- [x] **Step 2: Run** `cargo test -p zephyr --test web` → FAIL.
+- [x] **Step 3: Implement.** Write the docs.
+- [x] **Step 4: Run** the same, then `cargo test -p zephyr` → PASS.
+- [x] **Step 5: Commit** `feat(web): approve cards and strong settings only with a passkey signature over exactly what is shown`.
+- Deviation: the signing queue is reached through `Hub::sign` and `Hub::signed` (the field stays private to `web`), and the 10-a-minute limit on `zephyr.web_challenge` is a `Window` on the connection, so it is counted per socket rather than per session (`shortcut:` in the code).
+- Deviation: the test reads the approved command from the `procs` table (`command`, `action`), where `/ok` puts a `run` action's command, rather than from `log.jsonl`, which only fake-rpi writes.
+- Deviation: `web` is added to the settings registry as a read-only row (`fixed("web", …)`, test `the_web_table_is_read_only`), which is what "web joins the read-only row" needs in code. Added cases: a signature by another key with the same credential id, an assertion made for another challenge, another session using this one's challenge, an `ok` signature used for `once`, a changed `targets` column, and a signature for one value used for another.
 
 ### Task W-8: Web Push: subscriptions, cards, replies, notification buttons
 

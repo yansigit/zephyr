@@ -1260,3 +1260,388 @@ async fn web_devices_lists_this_session() {
     );
     gw.shutdown().await;
 }
+
+// ---- signed approvals and settings ----
+
+use zephyr::store::{ActionKind, NewAction, Origin};
+
+const SEND: &str = "himalaya message send --to a@x.org";
+
+impl Gateway {
+    /// Holds an action for the owner, as the gate stores one.
+    fn hold(&self, kind: ActionKind, class: &str, payload: String) -> i64 {
+        let action = NewAction {
+            kind,
+            class: class.into(),
+            targets: vec!["a@x.org".into()],
+            summary: format!("{class} to a@x.org"),
+            reason: Some("trust me".into()),
+            payload,
+            secrets: vec![],
+            origin: Origin {
+                channel: "chat".into(),
+                sender: "owner".into(),
+                session: "main".into(),
+                run: "main:1".into(),
+                call_id: Some("c1".into()),
+            },
+            due_at: None,
+        };
+        self.store().hold_action(&action).unwrap()
+    }
+
+    /// Holds the `himalaya` send.
+    fn hold_send(&self) -> i64 {
+        let payload = zephyr::store::run_payload(&json!({"command": SEND}));
+        self.hold(ActionKind::Run, "messages", payload)
+    }
+
+    fn status(&self, id: i64) -> String {
+        let db = rusqlite::Connection::open(self.home.join("state.db")).unwrap();
+        db.query_row("SELECT status FROM proposals WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    /// The commands started for approved actions: `(command, action)`.
+    fn ran(&self) -> Vec<(String, i64)> {
+        let db = rusqlite::Connection::open(self.home.join("state.db")).unwrap();
+        let mut stmt = db
+            .prepare("SELECT command, action FROM procs WHERE action IS NOT NULL ORDER BY id")
+            .unwrap();
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+}
+
+/// A gateway with approvals on, and a phone signed in with its own passkey.
+async fn signed_in(name: &str, extra: &str) -> (Gateway, Authenticator, Ws) {
+    let extra = format!("[approvals]\npreset = \"manual\"\n{extra}");
+    let gw = start_in(&new_home(name), free_port(), &extra, |_| {});
+    gw.up().await;
+    let phone = Authenticator::new("phone-cred");
+    let cookie = gw.enrol("phone", &phone).await;
+    let ws = gw.ws(&cookie).await;
+    (gw, phone, ws)
+}
+
+impl Ws {
+    /// The hex SHA-256 of proposal `id`'s card, as the app hashes what it shows.
+    async fn card_hash(&mut self, id: i64) -> String {
+        let all = self.rpc("zephyr.proposals", json!({})).await;
+        let list = all["result"]["proposals"].as_array().unwrap();
+        let card = list.iter().find(|p| p["id"] == id).expect("it waits")["card"]
+            .as_str()
+            .unwrap();
+        data_encoding::HEXLOWER.encode(&sha256(card.as_bytes()))
+    }
+
+    /// Asks for a challenge for `op` and signs it: `{challengeId, assertion}`.
+    async fn sign(&mut self, auth: &Authenticator, op: Value) -> Value {
+        let answer = self.rpc("zephyr.web_challenge", op).await;
+        let made = &answer["result"];
+        assert!(made.is_object(), "{answer}");
+        let options = &made["publicKey"];
+        assert_eq!(b64_decode(&options["challenge"]).len(), 32);
+        assert_eq!(options["timeout"], 120_000);
+        json!({"challengeId": made["challengeId"], "assertion": auth.get(options)})
+    }
+
+    /// A signed `ok` (or `once`) on proposal `id`: the challenge for the card now, signed.
+    async fn sign_decide(&mut self, auth: &Authenticator, id: i64, verb: &str) -> Value {
+        let card = self.card_hash(id).await;
+        let op = json!({"op": "decide", "id": id, "verb": verb, "card_sha256": card});
+        with(self.sign(auth, op).await, json!({"id": id, "verb": verb}))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unsigned_ok_or_a_changed_card_is_refused() {
+    let (gw, phone, mut ws) = signed_in("sign-unsigned", "").await;
+    let id = gw.hold_send();
+    for verb in ["ok", "once"] {
+        let answer = ws
+            .rpc("zephyr.decide", json!({"id": id, "verb": verb}))
+            .await;
+        assert_eq!(answer["error"]["code"], -32602, "{answer}");
+        assert_eq!(answer["error"]["message"], "approve with your passkey");
+    }
+    let op = |card: &str| json!({"op": "decide", "id": id, "verb": "ok", "card_sha256": card});
+    let stale = data_encoding::HEXLOWER.encode(&sha256(b"x"));
+    let answer = ws.rpc("zephyr.web_challenge", op(&stale)).await;
+    assert_eq!(
+        answer["error"]["message"], "the card changed; look at it again",
+        "{answer}"
+    );
+    let other = json!({"op": "decide", "id": id + 1, "verb": "ok", "card_sha256": stale});
+    let answer = ws.rpc("zephyr.web_challenge", other).await;
+    assert_eq!(
+        answer["error"]["message"],
+        format!("no proposal #{} is waiting", id + 1)
+    );
+    for bad in [
+        json!({"op": "decide", "id": id, "verb": "no", "card_sha256": stale}),
+        json!({"op": "nope"}),
+        json!({"op": "set", "key": "no.such.key", "value": "1"}),
+    ] {
+        assert_eq!(
+            ws.rpc("zephyr.web_challenge", bad).await["error"]["code"],
+            -32602
+        );
+    }
+    // The challenge names this session's own passkey, and no other.
+    let card = ws.card_hash(id).await;
+    let made = ws.rpc("zephyr.web_challenge", op(&card)).await["result"].take();
+    assert_eq!(
+        made["publicKey"]["allowCredentials"],
+        json!([{"type": "public-key", "id": b64(&phone.id)}])
+    );
+    assert_eq!(
+        (
+            &made["publicKey"]["rpId"],
+            &made["publicKey"]["userVerification"]
+        ),
+        (&json!(HOST), &json!("required"))
+    );
+    assert_eq!((gw.status(id), gw.ran()), ("pending".to_string(), vec![]));
+    // Refusing needs no signature.
+    let no = ws
+        .rpc("zephyr.decide", json!({"id": id, "verb": "no"}))
+        .await;
+    assert_eq!(no["result"]["ok"], true, "{no}");
+    assert_eq!(gw.status(id), "dropped");
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signed_ok_runs_the_stored_command_and_is_audited_as_passkey() {
+    let (gw, phone, mut ws) = signed_in("sign-ok", "").await;
+    let id = gw.hold_send();
+    let signed = ws.sign_decide(&phone, id, "ok").await;
+    let done = ws.rpc("zephyr.decide", signed).await;
+    assert_eq!(done["result"]["ok"], true, "{done}");
+    assert!(
+        done["result"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("[zephyr] approved #1"),
+        "{done}"
+    );
+    assert_eq!(gw.ran(), [(SEND.to_string(), id)]);
+    let audit = gw.store().audit_rows().unwrap();
+    let row = (
+        "web".to_string(),
+        "passkey".to_string(),
+        "#1 ok".to_string(),
+        "signed".to_string(),
+    );
+    assert!(audit.contains(&row), "{audit:?}");
+    assert!(gw.store().passkeys().unwrap()[0].last_used_at.is_some());
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_challenge_used_twice_is_refused() {
+    let (gw, phone, mut ws) = signed_in("sign-twice", "").await;
+    let (first, second) = (gw.hold_send(), gw.hold_send());
+    let signed = ws.sign_decide(&phone, first, "ok").await;
+    assert_eq!(
+        ws.rpc("zephyr.decide", signed.clone()).await["result"]["ok"],
+        true
+    );
+    let again = ws.rpc("zephyr.decide", signed).await;
+    assert_eq!(
+        again["error"]["message"], "that signature expired or was used; tap again",
+        "{again}"
+    );
+    // A signature made by another passkey, or by this one for another challenge.
+    let other = Authenticator::new("phone-cred");
+    let forged = ws.sign_decide(&other, second, "ok").await;
+    let answer = ws.rpc("zephyr.decide", forged).await;
+    assert_eq!(
+        answer["error"]["message"], "the passkey signature did not verify",
+        "{answer}"
+    );
+    let one = ws.sign_decide(&phone, second, "ok").await;
+    let two = ws.sign_decide(&phone, second, "ok").await;
+    let mixed = with(one, json!({"assertion": two["assertion"]}));
+    let answer = ws.rpc("zephyr.decide", mixed).await;
+    assert_eq!(
+        answer["error"]["message"], "the passkey signature did not verify",
+        "{answer}"
+    );
+    // Another session cannot use this one's challenge.
+    let mut ipad = gw.ws(&gw.cookie("ipad")).await;
+    let answer = ipad.rpc("zephyr.decide", two).await;
+    assert_eq!(
+        answer["error"]["message"],
+        "that signature expired or was used; tap again"
+    );
+    assert_eq!(
+        (gw.status(second), gw.ran().len()),
+        ("pending".to_string(), 1)
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signature_for_one_proposal_does_not_approve_another() {
+    let (gw, phone, mut ws) = signed_in("sign-other", "").await;
+    let (first, second) = (gw.hold_send(), gw.hold_send());
+    let signed = ws.sign_decide(&phone, first, "ok").await;
+    let replayed = with(signed.clone(), json!({"id": second}));
+    let answer = ws.rpc("zephyr.decide", replayed).await;
+    assert_eq!(
+        answer["error"]["message"], "that signature is for another request",
+        "{answer}"
+    );
+    // Its challenge is used up, so the first waits too.
+    let answer = ws.rpc("zephyr.decide", signed).await;
+    assert_eq!(
+        answer["error"]["message"],
+        "that signature expired or was used; tap again"
+    );
+    // Nor does an `ok` signature approve `once`.
+    let signed = ws.sign_decide(&phone, first, "ok").await;
+    let answer = ws
+        .rpc("zephyr.decide", with(signed, json!({"verb": "once"})))
+        .await;
+    assert_eq!(
+        answer["error"]["message"],
+        "that signature is for another request"
+    );
+    assert_eq!(
+        (gw.status(first), gw.status(second)),
+        ("pending".to_string(), "pending".to_string())
+    );
+    assert_eq!(gw.ran(), vec![]);
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signature_is_refused_after_the_payload_changes() {
+    let (gw, phone, mut ws) = signed_in("sign-changed", "").await;
+    let id = gw.hold_send();
+    let signed = ws.sign_decide(&phone, id, "ok").await;
+    let db = rusqlite::Connection::open(gw.home.join("state.db")).unwrap();
+    let swapped = r#"{"command":"himalaya message send --to b@x.org"}"#;
+    db.execute(
+        "UPDATE proposals SET payload = ?1 WHERE id = ?2",
+        rusqlite::params![swapped, id],
+    )
+    .unwrap();
+    let answer = ws.rpc("zephyr.decide", signed).await;
+    assert_eq!(
+        answer["result"],
+        json!({"ok": false, "text": "[zephyr] the card changed; look at it again"}),
+        "{answer}"
+    );
+    assert_eq!((gw.status(id), gw.ran()), ("pending".to_string(), vec![]));
+    // The targets are read by `/ok` too, though the card may not show them.
+    let signed = ws.sign_decide(&phone, id, "ok").await;
+    db.execute(
+        "UPDATE proposals SET targets = '[\"b@x.org\"]' WHERE id = ?1",
+        [id],
+    )
+    .unwrap();
+    let answer = ws.rpc("zephyr.decide", signed).await;
+    assert_eq!(answer["result"]["ok"], false, "{answer}");
+    assert_eq!((gw.status(id), gw.ran()), ("pending".to_string(), vec![]));
+    let audit = gw.store().audit_rows().unwrap();
+    assert!(audit.iter().all(|row| row.1 != "passkey"), "{audit:?}");
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn with_money_strong_only_a_payment_needs_the_signature() {
+    let strong = "strong_only = [\"loosen\", \"money\"]\n";
+    let (gw, phone, mut ws) = signed_in("sign-money", strong).await;
+    let payload = r#"{"server":"shop","tool":"pay","arguments":{"amount":5,"currency":"USD"}}"#;
+    let id = gw.hold(ActionKind::Pass, "money", payload.into());
+    let answer = ws
+        .rpc("zephyr.decide", json!({"id": id, "verb": "ok"}))
+        .await;
+    assert_eq!(
+        answer["error"]["message"], "approve with your passkey",
+        "{answer}"
+    );
+    let signed = ws.sign_decide(&phone, id, "ok").await;
+    let done = ws.rpc("zephyr.decide", signed).await;
+    assert_eq!(done["result"]["ok"], true, "{done}");
+    assert!(
+        done["result"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("[zephyr] approved #1"),
+        "{done}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_strong_loosening_is_refused_unsigned_and_applied_signed() {
+    let (gw, phone, mut ws) = signed_in("sign-set", "[budget]\ndaily_cost_usd = 5.0\n").await;
+    let change = json!({"key": "budget.daily_cost_usd", "value": "8"});
+    let unsigned = ws.rpc("zephyr.settings_set", change.clone()).await["result"].take();
+    assert_eq!(unsigned["outcome"], "refused", "{unsigned}");
+    assert_eq!(
+        unsigned["reason"],
+        "loosening budget.daily_cost_usd needs tui or chat or passkey"
+    );
+    let signed = ws
+        .sign(&phone, with(change.clone(), json!({"op": "set"})))
+        .await;
+    let done = ws
+        .rpc("zephyr.settings_set", with(signed, change.clone()))
+        .await["result"]
+        .take();
+    assert_eq!(
+        (&done["outcome"], &done["old"], &done["new"]),
+        (&json!("changed"), &json!("5"), &json!("8")),
+        "{done}"
+    );
+    let logged = gw
+        .store()
+        .last_setting_change("budget.daily_cost_usd")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (logged.actor.as_str(), logged.channel.as_deref()),
+        ("owner", Some("passkey"))
+    );
+    // A signature for one value does not set another.
+    let signed = ws
+        .sign(
+            &phone,
+            json!({"op": "set", "key": "budget.daily_cost_usd", "value": "9"}),
+        )
+        .await;
+    let other = with(
+        signed,
+        json!({"key": "budget.daily_cost_usd", "value": "900"}),
+    );
+    let answer = ws.rpc("zephyr.settings_set", other).await;
+    assert_eq!(
+        answer["error"]["message"], "that signature is for another request",
+        "{answer}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signed_change_is_refused_when_the_value_moved() {
+    let (gw, phone, mut ws) = signed_in("sign-moved", "").await;
+    let change = json!({"key": "tasks.parallel", "value": "3"});
+    let signed = ws
+        .sign(&phone, with(change.clone(), json!({"op": "set"})))
+        .await;
+    gw.say("chat", "/set tasks.parallel 4").await;
+    gw.sent("chat", |t| t.contains("tasks.parallel")).await;
+    let done = ws.rpc("zephyr.settings_set", with(signed, change)).await["result"].take();
+    assert_eq!(
+        done,
+        json!({"outcome": "refused", "reason": "tasks.parallel changed; look at it again"})
+    );
+    gw.shutdown().await;
+}

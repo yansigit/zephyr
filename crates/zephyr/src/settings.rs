@@ -556,6 +556,7 @@ pub static SETTINGS: &[Setting] = &[
     fixed("discord", "Discord", "The Discord adapter."),
     fixed("imessage", "iMessage", "The BlueBubbles adapter."),
     fixed("attach", "Attach", "The rpi --connect listener."),
+    fixed("web", "Web app", "The web app's listener."),
     fixed(
         "agent.env",
         "Agent environment",
@@ -1849,6 +1850,15 @@ mod tests {
             stale("tasks.parallel", Some("6")),
             "[zephyr] tasks.parallel is now 6; propose again"
         );
+    }
+
+    #[test]
+    fn the_web_table_is_read_only() {
+        let web = find("web").expect("listed");
+        assert_eq!((web.section, web.agent), (READ_ONLY, Access::Never));
+        let strong = Actor::Owner { channel: "tui" };
+        let refused = decide(web, &strong, false, &["tui".to_string()]);
+        assert!(matches!(refused, Verdict::Refuse(_)), "{refused:?}");
     }
 
     #[test]

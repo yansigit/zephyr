@@ -6,6 +6,7 @@ pub mod passkey;
 pub mod push;
 mod signin;
 
+pub(crate) use signin::random;
 pub use signin::{command, cookie, devices, Ceremony};
 
 use crate::attach::{Handles, MAX_LINE};
@@ -94,6 +95,8 @@ pub struct Hub {
     /// Enrolments and sign-ins between their start and finish: 2 min each, at most 16.
     ceremonies: passkey::Challenges<Ceremony>,
     limits: std::sync::Mutex<signin::Limits>,
+    /// What signed-in sessions are about to sign, each owned by its session.
+    signing: passkey::Challenges<passkey::Signed>,
 }
 
 /// How long a challenge waits for its signature.
@@ -108,6 +111,7 @@ impl Hub {
             revoked: watch::channel(0).0,
             ceremonies: passkey::Challenges::new(CHALLENGE_LIFE, MAX_CHALLENGES),
             limits: std::sync::Mutex::new(signin::Limits::new()),
+            signing: passkey::Challenges::new(CHALLENGE_LIFE, MAX_CHALLENGES),
         })
     }
 
@@ -123,6 +127,16 @@ impl Hub {
 
     pub fn revocations(&self) -> watch::Receiver<u64> {
         self.revoked.subscribe()
+    }
+
+    /// Keeps what `session` is about to sign under `challenge`, and names it.
+    pub fn sign(&self, session: [u8; 32], what: passkey::Signed, challenge: [u8; 32]) -> String {
+        self.signing.issue(session, what, challenge)
+    }
+
+    /// Takes a signing challenge out, for the session it was issued to, once.
+    pub fn signed(&self, id: &str, session: [u8; 32]) -> Option<(passkey::Signed, [u8; 32])> {
+        self.signing.take(id, session)
     }
 
     /// Counts a socket in until the guard is dropped; `None` when `MAX_SOCKETS` are open.

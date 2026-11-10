@@ -75,7 +75,7 @@ impl Limits {
     }
 }
 
-fn random<const N: usize>() -> [u8; N] {
+pub(crate) fn random<const N: usize>() -> [u8; N] {
     use ring::rand::SecureRandom;
     let mut out = [0; N];
     ring::rand::SystemRandom::new()
