@@ -10,7 +10,12 @@ use tokio::sync::{mpsc, oneshot};
 use zephyr::channel::{Channel, Inbound, Outbound};
 use zephyr::config::Config;
 
-const RPI: &str = "/home/user/Projects/.always-on/rpi-0.18.0/bin/rpi";
+/// The real binary: `$RPI_BIN` (CI's `rpi-bump` workflow sets it), else the pinned release at its
+/// fixed path.
+static RPI: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("RPI_BIN")
+        .unwrap_or_else(|_| "/home/user/Projects/.always-on/rpi-0.21.2/bin/rpi".into())
+});
 
 /// A test that needs the pinned rpi skips without it, unless ZEPHYR_REAL_RPI=1 (deploy/release.sh
 /// sets it): then it fails, so a run cannot go green without testing anything.
@@ -96,10 +101,11 @@ async fn stub_provider(hang: Arc<AtomicBool>, seen: Arc<Mutex<Vec<String>>>) -> 
 #[tokio::test]
 #[ignore = "needs the pinned rpi binary"]
 async fn real_rpi_round_trip_and_kill_mid_run() {
-    if !std::path::Path::new(RPI).exists() {
-        skip_without_rpi(RPI);
+    if !std::path::Path::new(&*RPI).exists() {
+        skip_without_rpi(&*RPI);
         return;
     }
+    let rpi: &str = &RPI;
     let hang = Arc::new(AtomicBool::new(false));
     let port = stub_provider(hang.clone(), Default::default()).await;
     let home = std::env::temp_dir().join(format!(
@@ -115,7 +121,7 @@ async fn real_rpi_round_trip_and_kill_mid_run() {
     )
     .unwrap();
     let cfg: Config = toml::from_str(&format!(
-        "rpi = {RPI:?}\nhome = {home:?}\nagent_dir = {agent:?}\nmodel = \"stub/m\"\n[owners]\nchat = [\"owner\"]\n"
+        "rpi = {rpi:?}\nhome = {home:?}\nagent_dir = {agent:?}\nmodel = \"stub/m\"\n[owners]\nchat = [\"owner\"]\n"
     ))
     .unwrap();
 
@@ -206,10 +212,11 @@ async fn rate_limited_provider(hits: Arc<std::sync::atomic::AtomicUsize>) -> u16
 #[tokio::test]
 #[ignore = "needs the pinned rpi binary"]
 async fn real_rpi_fails_over_to_the_next_account() {
-    if !std::path::Path::new(RPI).exists() {
-        skip_without_rpi(RPI);
+    if !std::path::Path::new(&*RPI).exists() {
+        skip_without_rpi(&*RPI);
         return;
     }
+    let rpi: &str = &RPI;
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let limited = rate_limited_provider(hits.clone()).await;
     let ok = stub_provider(Arc::new(AtomicBool::new(false)), Default::default()).await;
@@ -235,7 +242,7 @@ async fn real_rpi_fails_over_to_the_next_account() {
     )
     .unwrap();
     let cfg: Config = toml::from_str(&format!(
-        "rpi = {RPI:?}\nhome = {home:?}\nagent_dir = {agent:?}\n[owners]\nchat = [\"owner\"]\n[[account]]\nname = \"a\"\nmodel = \"pa/m\"\n[[account]]\nname = \"b\"\nmodel = \"pb/m\"\n"
+        "rpi = {rpi:?}\nhome = {home:?}\nagent_dir = {agent:?}\n[owners]\nchat = [\"owner\"]\n[[account]]\nname = \"a\"\nmodel = \"pa/m\"\n[[account]]\nname = \"b\"\nmodel = \"pb/m\"\n"
     ))
     .unwrap();
 
@@ -289,10 +296,11 @@ async fn real_rpi_fails_over_to_the_next_account() {
 #[tokio::test]
 #[ignore = "needs the pinned rpi binary"]
 async fn real_rpi_btw_runs_with_no_tools_and_no_session_mid_run() {
-    if !std::path::Path::new(RPI).exists() {
-        skip_without_rpi(RPI);
+    if !std::path::Path::new(&*RPI).exists() {
+        skip_without_rpi(&*RPI);
         return;
     }
+    let rpi: &str = &RPI;
     let (hang, seen) = (Arc::new(AtomicBool::new(false)), Arc::default());
     let port = stub_provider(hang.clone(), Arc::clone(&seen)).await;
     let home = std::env::temp_dir().join(format!(
@@ -317,7 +325,7 @@ async fn real_rpi_btw_runs_with_no_tools_and_no_session_mid_run() {
         false => String::new(),
     };
     let cfg: Config = toml::from_str(&format!(
-        "rpi = {RPI:?}\nhome = {home:?}\nagent_dir = {agent:?}\nmodel = \"stub/m\"\n{plugin}[owners]\nchat = [\"owner\"]\n"
+        "rpi = {rpi:?}\nhome = {home:?}\nagent_dir = {agent:?}\nmodel = \"stub/m\"\n{plugin}[owners]\nchat = [\"owner\"]\n"
     ))
     .unwrap();
 
@@ -422,10 +430,11 @@ async fn real_rpi_btw_runs_with_no_tools_and_no_session_mid_run() {
 #[tokio::test]
 #[ignore = "needs the pinned rpi binary"]
 async fn real_rpi_undo_retry_and_compact() {
-    if !std::path::Path::new(RPI).exists() {
-        skip_without_rpi(RPI);
+    if !std::path::Path::new(&*RPI).exists() {
+        skip_without_rpi(&*RPI);
         return;
     }
+    let rpi: &str = &RPI;
     let seen: Arc<Mutex<Vec<String>>> = Arc::default();
     let port = stub_provider(Arc::default(), Arc::clone(&seen)).await;
     let home = std::env::temp_dir().join(format!(
@@ -441,7 +450,7 @@ async fn real_rpi_undo_retry_and_compact() {
     )
     .unwrap();
     let cfg: Config = toml::from_str(&format!(
-        "rpi = {RPI:?}\nhome = {home:?}\nagent_dir = {agent:?}\nmodel = \"stub/m\"\n[owners]\nchat = [\"owner\"]\n"
+        "rpi = {rpi:?}\nhome = {home:?}\nagent_dir = {agent:?}\nmodel = \"stub/m\"\n[owners]\nchat = [\"owner\"]\n"
     ))
     .unwrap();
     // Every command zephyr sends is one this rpi supports (`doctor` checks the same).

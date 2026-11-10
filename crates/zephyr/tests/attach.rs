@@ -1,4 +1,4 @@
-//! `rpi --connect` attach (src/attach.rs), spoken frame by frame as the stock 0.18.0
+//! `rpi --connect` attach (src/attach.rs), spoken frame by frame as the stock 0.21.2
 //! client does, against the scripted fake child (tests/fake-rpi.py).
 
 use serde_json::{json, Value};
@@ -842,9 +842,11 @@ fn skip_without_rpi(rpi: impl std::fmt::Display) {
 /// The pinned stock client, typed into through a pty (its TUI needs a terminal; with piped
 /// stdin it only handshakes and exits). Needs python3 and the binary; no model is called.
 #[tokio::test]
-#[ignore = "drives the real rpi 0.18.0 --connect client"]
+#[ignore = "drives the real rpi 0.21.2 --connect client"]
 async fn stock_rpi_connect_attaches_chats_and_detaches() {
-    let rpi = Path::new("/home/user/Projects/.always-on/rpi-0.18.0/bin/rpi");
+    let rpi = std::env::var("RPI_BIN")
+        .unwrap_or_else(|_| "/home/user/Projects/.always-on/rpi-0.21.2/bin/rpi".into());
+    let rpi = Path::new(&rpi);
     if !rpi.exists() {
         skip_without_rpi(rpi.display());
         return;

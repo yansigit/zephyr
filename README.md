@@ -673,7 +673,7 @@ using a subscription unattended; check that your use fits them.
 
 `zephyr up --build` builds `deploy/Dockerfile` from pinned sources: this repo, `rpi-providers` from
 `yansigit/rpi-package`, the Cursor provider from `crates/zephyr-cursor`, `rpi-claude-agent` from
-`yansigit/rpi-provider-plugins`, and the upstream `rpi` 0.18.0 release (sha256 checked). Your `gh
+`yansigit/rpi-provider-plugins`, and the upstream `rpi` 0.21.2 release (sha256 checked). Your `gh
 auth token` goes in as the BuildKit secret `gh_token`, which is never stored in a layer. The
 provider sources are pinned to commit SHAs by the build args (`RPI_PACKAGE_REF`, `PLUGINS_REF`);
 local checkouts can stand in for them with `--build-context rpi-package=<dir> --build-context
@@ -721,3 +721,19 @@ Actions minutes run out, start the fallback runner on this machine once with
 Docker network with no Docker socket, no access to the host's files and no route to its
 localhost; services the host serves on all interfaces (SSH, ComfyUI, ...) are still reachable.
 `gh workflow run image.yml --ref <branch>` builds a test image (`:dev`) without pushing it.
+
+### Keeping rpi current
+
+`.github/workflows/rpi-bump.yml` runs each day (and on `gh workflow run rpi-bump.yml [-f
+version=X.Y.Z]`). When crates.io has a newer `rpi-tui` than the Dockerfile's `RPI_VERSION`,
+`deploy/bump-rpi.sh` moves every pin (the Dockerfile's version and both sha256s, from the release's
+own `.sha256` files and checked against the tarballs, `RPI_PIN`, the `=` Cargo pins and
+`Cargo.lock`, fake-rpi's `--version`, the real-rpi test path). The workflow runs fmt, clippy, the
+tests and the real-rpi suite against the new binary (`RPI_BIN`), opens a PR `rpi-bump/v<version>`,
+and merges it when all of that passed; when anything failed the PR stays open with the run linked,
+and later runs leave it alone. It never releases: tag as above to ship an image with the new rpi.
+The repo needs "Allow GitHub Actions to create and approve pull requests" (Settings > Actions >
+General). If `main` requires status checks, set secret `RPI_BUMP_TOKEN` (fine-grained, contents and
+pull-requests write on this repo) so `ci` runs on the PR, and allow auto-merge: the merge then waits
+for it. `deploy/bump-rpi.sh [version]` does the same edits locally; `release.sh` fetches the pinned
+binary when it is missing.
