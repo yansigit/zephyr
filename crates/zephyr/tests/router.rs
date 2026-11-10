@@ -3598,7 +3598,7 @@ async fn a_strong_loosening_is_refused_from_discord_and_accepted_from_chat() {
         "[budget]\ndaily_cost_usd = 5.0",
     ));
     wait(|| !log(&home, "start").is_empty()).await;
-    let refused = "[zephyr] loosening budget.daily_cost_usd needs tui or chat";
+    let refused = "[zephyr] loosening budget.daily_cost_usd needs tui or chat or passkey";
     gw.say_on("discord", "d1", "downer", "/set budget.daily_cost_usd 8")
         .await;
     assert_eq!(gw.wait_replies_on("discord", 1).await, [refused]);
@@ -3655,9 +3655,9 @@ async fn approvals_full_from_discord_is_refused_and_from_chat_applies() {
     assert_eq!(
         r[1..],
         [
-            "[zephyr] loosening approvals.preset needs tui or chat",
-            "[zephyr] loosening approvals.preset needs tui or chat",
-            "[zephyr] loosening approvals.messages needs tui or chat",
+            "[zephyr] loosening approvals.preset needs tui or chat or passkey",
+            "[zephyr] loosening approvals.preset needs tui or chat or passkey",
+            "[zephyr] loosening approvals.messages needs tui or chat or passkey",
         ]
     );
     let file = || Config::load(&home.join("zephyr.toml")).unwrap();
@@ -3787,7 +3787,7 @@ async fn the_agent_reads_approvals_tightens_a_class_and_proposes_a_loosening() {
     assert!(
         replies.iter().any(|r| r
             .starts_with("[zephyr] the agent proposes #1: approvals.messages ask → auto\n")
-            && r.ends_with("/ok 1 · /no 1 · this one needs tui or chat")),
+            && r.ends_with("/ok 1 · /no 1 · this one needs tui or chat or passkey")),
         "{replies:?}"
     );
     gw.shutdown().await;
@@ -3814,7 +3814,7 @@ async fn a_tool_moves_into_a_class_at_once_and_out_of_one_only_with_approval() {
     assert!(
         all.contains("gateway: proposed as #1")
             && all.contains("proposes #1: mcp.mail.classes.send_note messages → money\n")
-            && all.contains("/ok 1 · /no 1 · this one needs tui or chat"),
+            && all.contains("/ok 1 · /no 1 · this one needs tui or chat or passkey"),
         "{replies:?}"
     );
     assert!(
@@ -3830,7 +3830,7 @@ async fn a_tool_moves_into_a_class_at_once_and_out_of_one_only_with_approval() {
     gw.say_on("discord", "d1", "downer", set).await;
     assert_eq!(
         gw.wait_replies_on("discord", 1).await,
-        ["[zephyr] loosening mcp.mail.classes.send_note needs tui or chat"]
+        ["[zephyr] loosening mcp.mail.classes.send_note needs tui or chat or passkey"]
     );
     gw.say("m2", "owner", set).await;
     assert_eq!(
@@ -5753,7 +5753,7 @@ async fn a_payment_ok_from_discord_is_refused_when_money_is_strong_only() {
     assert_eq!(id, 1);
     gw.say_on("discord", "d1", "downer", "/ok 1").await;
     reply_where(&gw, "discord", |r| {
-        r == "[zephyr] approving a payment needs tui or chat"
+        r == "[zephyr] approving a payment needs tui or chat or passkey"
     })
     .await;
     assert_eq!(action_status(&home, 1), "pending", "it still waits");

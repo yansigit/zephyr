@@ -185,7 +185,7 @@ const fn fixed(key: &'static str, label: &'static str, help: &'static str) -> Se
 }
 
 /// The channels `settings.strong_channels` may name.
-pub const CHANNELS: &[&str] = &["tui", "chat", "discord", "imessage"];
+pub const CHANNELS: &[&str] = &["tui", "chat", "discord", "imessage", "web", "passkey"];
 
 /// rpi 0.18's thinking levels (`rpi_ai::ThinkingLevel`), off first. A model offers some of
 /// them: the router checks a level against the child's `get_available_thinking_levels`, which
@@ -1864,7 +1864,7 @@ mod tests {
         assert_eq!(value(&cfg, "auth.refresh_minutes").as_deref(), Some("10"));
         assert_eq!(
             value(&cfg, "settings.strong_channels").as_deref(),
-            Some("tui, chat")
+            Some("tui, chat, passkey")
         );
         assert_eq!(value(&cfg, "mcp.notes.enabled").as_deref(), Some("true"));
         assert_eq!(value(&cfg, "mcp.other.enabled"), None);

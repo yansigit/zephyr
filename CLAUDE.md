@@ -149,6 +149,14 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   and pay controls (and controls it cannot read) to the gate, waits on the open connection, reads
   the page again after `allow` and tells the gate whether it ran (`{"ran": …}`); typing goes to the
   gate for the facts only. `doctor` checks the layout.
+- `web/` (DESIGN §4.3.3): the web app. `mod.rs` is a hyper listener on 127.0.0.1 (`[web]`, port
+  7793) behind `tailscale serve`, beside `attach::serve` in the router's `select!` with the same
+  `attach::Handles`; `admit` checks Host, the Tailscale header (which only ever refuses, and is
+  never logged) and Origin before any route, and the files of `assets/web/` are embedded (no
+  inline code: a test reads them). `passkey.rs` (WebAuthn ES256) and `push.rs` (RFC 8291
+  aes128gcm, the VAPID token) are pure functions on `ring`, tested against the RFCs' vectors.
+  Two channels: `web` is the session cookie alone and weak; `passkey` is a signed decision and in
+  the default `strong_channels`.
 - `inbox.rs`: files the owner sends on Discord or iMessage (DESIGN §4.3). The adapter saves them as
   the agent into `<home>/inbox/` before the row goes to the router and appends a
   `[attached image: <path> ...]` line per file to its text; owners come from the router's live

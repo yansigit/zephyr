@@ -145,6 +145,36 @@ pub fn reply(body: &str) -> Value {
     json!({"kind": "reply", "body": cut(body, 120).unwrap_or(body)})
 }
 
+/// The VAPID key, `<state>/web/vapid.pk8` (0600 in a 0700 folder, the daemon's alone). `make`
+/// writes a new one when the file is missing; a file that does not load is an error either way,
+/// never replaced, since every subscription is bound to the key it was made with.
+pub fn vapid(cfg: &crate::config::Config, make: bool) -> anyhow::Result<EcdsaKeyPair> {
+    use anyhow::Context;
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let alg = &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING;
+    let rng = ring::rand::SystemRandom::new();
+    let dir = cfg.state_dir().join("web");
+    let path = dir.join("vapid.pk8");
+    if make && !path.exists() {
+        let made = EcdsaKeyPair::generate_pkcs8(alg, &rng)
+            .map_err(|_| anyhow::anyhow!("the system's random source failed"))?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)?;
+        let mut file = (std::fs::OpenOptions::new().write(true).create_new(true))
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        file.write_all(made.as_ref())?;
+        file.sync_all()?;
+    }
+    let pkcs8 = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    EcdsaKeyPair::from_pkcs8(alg, &pkcs8, &rng)
+        .map_err(|_| anyhow::anyhow!("{} is not a P-256 key", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +270,30 @@ mod tests {
             jwt_claims(rfc, &k).expect("the RFC's token verifies"),
             serde_json::json!({"aud": "https://push.example.net", "exp": 1_453_523_768,
                 "sub": "mailto:push@example.com"})
+        );
+    }
+
+    #[test]
+    fn the_vapid_key_is_made_once_private_and_loads() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_dir("web-vapid");
+        let cfg: crate::config::Config =
+            toml::from_str(&format!("rpi = 'r'\nhome = {dir:?}\n")).unwrap();
+        assert!(vapid(&cfg, false).is_err(), "not made by a read");
+        let made = vapid(&cfg, true).unwrap();
+        let again = vapid(&cfg, false).unwrap();
+        assert_eq!(made.public_key().as_ref(), again.public_key().as_ref());
+        assert_eq!(
+            vapid(&cfg, true).unwrap().public_key().as_ref(),
+            made.public_key().as_ref()
+        );
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let path = dir.join("web/vapid.pk8");
+        assert_eq!((mode(&dir.join("web")), mode(&path)), (0o700, 0o600));
+        std::fs::write(&path, b"junk").unwrap();
+        assert!(
+            vapid(&cfg, true).is_err(),
+            "a broken key is not replaced silently"
         );
     }
 

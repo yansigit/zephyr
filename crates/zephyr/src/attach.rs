@@ -106,14 +106,23 @@ pub fn token(a: &Attach) -> anyhow::Result<String> {
     Ok(token.to_string())
 }
 
+/// What a listener for attached clients (this one, and the web app's) needs of the router.
+#[derive(Clone)]
+pub struct Handles {
+    pub inbound: mpsc::Sender<Inbound>,
+    pub router: mpsc::Sender<AttachRequest>,
+    pub snap: watch::Receiver<Snapshot>,
+    pub cfgs: watch::Receiver<Arc<Config>>,
+}
+
 /// Serves attach clients until dropped. Pending forever when `[attach]` is not configured.
-pub async fn serve(
-    cfg: &Config,
-    inbound: mpsc::Sender<Inbound>,
-    router: mpsc::Sender<AttachRequest>,
-    snap: watch::Receiver<Snapshot>,
-    cfgs: watch::Receiver<Arc<Config>>,
-) -> anyhow::Result<()> {
+pub async fn serve(cfg: &Config, handles: Handles) -> anyhow::Result<()> {
+    let Handles {
+        inbound,
+        router,
+        snap,
+        cfgs,
+    } = handles;
     let Some(a) = &cfg.attach else {
         return std::future::pending().await;
     };

@@ -164,7 +164,7 @@ Changes apply by themselves; nothing needs `zephyr restart`. The commands above,
 | Budget, owners, time zone, `[auth]`, `[tasks]`, the pool order | at once |
 | The model, on the same provider | at once, or after the reply in progress (rpi's `set_model`) |
 | A model on another provider, the active account, extensions, connectors (`[[mcp]]`), subagents (`[[subagent]]`), a re-login | the agent restarts after the reply in progress; the conversation carries on |
-| Discord, iMessage, `[attach]`, `[agent]`, a secret | the daemon restarts itself in place once idle; waiting messages are kept |
+| Discord, iMessage, `[attach]`, `[web]`, `[agent]`, a secret | the daemon restarts itself in place once idle; waiting messages are kept |
 | The attach port, the iMessage webhook's port | `zephyr config set` and `zephyr channel` start the container again to publish it; after a hand edit you are told, a minute later, to run `zephyr up` |
 
 A file that does not load is not applied, and the daemon keeps its current settings.
@@ -178,7 +178,7 @@ goes back by itself and you are told. The agent can read all of them. What it ma
 |---|---|
 | `tasks.parallel`, `mcp.NAME.enabled` (a connector off), `settings.strong_channels` (remove a channel), the `budget.*` limits, the `approvals.*` modes and preset, `approvals.strong_only` (add `money`), `mcp.NAME.classes.TOOL` (put a tool in a class) | make it stricter at once (lower, off, fewer channels, a limit where there was none, a stricter mode or preset); you are told and `/set KEY OLD` puts it back. Its `/set` takes one word, so it can tighten approvals to `ask` but not to `delay 10` |
 | `model`, `thinking`, `tasks.model`, `timezone`, `auth.*`, `approvals.currency`, `network.allow`, subagents, rules, removing a private fact or allowing it a target, and any change of the above that loosens | propose it: a card shows `KEY old → new` (or the exact `/subagent` or `/rule` text, up to 1500 characters), and `/ok N` applies it, `/no N` drops it |
-| `owners`, `[discord]`, `[imessage]`, `[attach]`, `[agent]`, `extensions`, `policy_plugin`, `rpi`, `home`, `state`, the `[[account]]` pool | nothing; edit `zephyr.toml` |
+| `owners`, `[discord]`, `[imessage]`, `[attach]`, `[web]`, `[agent]`, `extensions`, `policy_plugin`, `rpi`, `home`, `state`, the `[[account]]` pool | nothing; edit `zephyr.toml` |
 
 The agent may also save a new private fact at once (it only makes the check stricter); you are told
 its name, and `/facts rm NAME` removes it.
@@ -412,6 +412,23 @@ out, and `zephyr doctor` and `/mcp` say so. zephyr's own secrets (`ZEPHYR_*`) an
 removes a connector, and `/mcp` lists them. The agent can use only these connectors: an MCP config
 it writes itself, or a server named by URL, is refused. A connector runs as the agent, so the
 agent can read its token.
+
+## Web app
+
+A phone-first app the daemon serves itself, reached over your tailnet through `tailscale serve`
+(never `tailscale funnel`). It is off until `zephyr.toml` has a `[web]` table:
+
+```toml
+[web]
+host = "box.tail1234.ts.net"       # this machine's tailnet name, alone: no https://, port or path
+port = 7793                        # the default; the daemon listens on 127.0.0.1 only
+# tailnet_users = ["owner@github"] # optional: only these tailnet logins get past the front door
+```
+
+The daemon refuses any request whose `Host` is not that name, that did not come through
+`tailscale serve`, or (for anything that changes something) that does not come from the app's own
+page. `zephyr status` says `web: listening`, and `zephyr doctor` checks the listener and the
+push key.
 
 ## Sending the agent files
 

@@ -325,7 +325,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
 - At start `serve` makes `<state>/web/` (0700) and `vapid.pk8` (0600, `EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING)`) if missing. A key that does not load is logged, and push stays off.
 - `doctor` lines: `web app listening on 127.0.0.1:P` (a TCP connect) and `the web push key loads`, only when `[web]` is set. `status`: `web: listening` or `web: not listening`.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `web/mod.rs` unit:
     - `admit_checks_host_then_tailnet_then_origin_fetch_site_and_type`: table over (method, headers) → 421/403/403/403/415/Ok, including `tailnet_users = ["owner@github"]` with `Owner@GitHub` → Ok and `x@y` → 403;
     - `a_window_allows_its_limit_then_refuses_until_it_rolls`;
@@ -338,10 +338,14 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - `tests/web.rs`: a harness copied from `tests/attach.rs:59-100`, with `[web]\nhost = "zephyr.test"\nport = P` and `cfg.tick = 200ms`, plus helper `req(gw, method, path)` (reqwest; sets `Host: zephyr.test`, `Origin: https://zephyr.test`, `Tailscale-User-Login: owner@github`).
     - `the_files_carry_the_security_headers`: `GET /` → 200 with the exact CSP string above, `X-Frame-Options: DENY`, `Cache-Control: no-cache`, `ETag`.
     - `GET /nope` → 404; `GET /` with `Host: evil.test` → 421; without the Tailscale header → 403.
-- [ ] **Step 2: Run** `cargo test -p zephyr --lib web:: config:: reload::` and `cargo test -p zephyr --test web` → FAIL.
-- [ ] **Step 3: Implement.** The accept loop is a copy of `imessage.rs:278-320` with `.with_upgrades()`. The placeholder `index.html` is `<!doctype html><title>zephyr</title><link rel=stylesheet href=/app.css><script src=/app.js defer></script>`. Make the PNGs once with a throwaway `python3 -I` script: a solid square, zlib + struct, not committed. Write the docs.
-- [ ] **Step 4: Run** the new tests, then `cargo test -p zephyr` (the attach exact-JSON test included) → PASS.
-- [ ] **Step 5: Commit** `feat(web): serve the web app's files behind Host, Origin and tailscale serve checks`.
+- [x] **Step 2: Run** `cargo test -p zephyr --lib web:: config:: reload::` and `cargo test -p zephyr --test web` → FAIL.
+- [x] **Step 3: Implement.** The accept loop is a copy of `imessage.rs:278-320` with `.with_upgrades()`. The placeholder `index.html` is `<!doctype html><title>zephyr</title><link rel=stylesheet href=/app.css><script src=/app.js defer></script>`. Make the PNGs once with a throwaway `python3 -I` script: a solid square, zlib + struct, not committed. Write the docs.
+- [x] **Step 4: Run** the new tests, then `cargo test -p zephyr` (the attach exact-JSON test included) → PASS.
+- [x] **Step 5: Commit** `feat(web): serve the web app's files behind Host, Origin and tailscale serve checks`.
+- Deviation: with `passkey` in the default `strong_channels`, every refusal and card that names the default list now reads `tui or chat or passkey` (the code joins with ` or `; the spec's example wording `tui, chat or passkey` would mean changing seven call sites). The tests and DESIGN examples that pin the default wording follow (gate.rs, settings.rs, tests/router.rs).
+- Deviation: `admit` wants `Content-Type: application/json` on a DELETE as well as a POST (`DELETE /api/push` has a JSON body), and every 403 carries the one body `open the app through tailscale serve`.
+- Deviation: `push::vapid(cfg, make)` loads (and at start makes) the key; `doctor` calls it with `make = false`. `Window` counts its span from the first hit, not from `new`. README gets a `Web app` section here (there is no single config reference), which later tasks extend.
+- Deviation: the README's and DESIGN's `[web]` text is written here; a second integration test `unknown_paths_hosts_and_callers_are_refused` holds the 404/421/403 cases.
 
 ### Task W-5: The WebSocket bridge into `attach::Conn` on channel `web`
 

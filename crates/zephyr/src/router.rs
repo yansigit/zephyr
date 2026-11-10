@@ -271,13 +271,21 @@ pub async fn run<C: Channel>(
     let (cfg_tx, cfg_rx) = watch::channel(Arc::new(cfg.clone()));
     let (snap, snap_rx) = watch::channel(Snapshot::default());
     let activity_rx = snap_rx.clone();
-    let (attach_cfgs, egress_cfgs) = (cfg_rx.clone(), cfg_rx.clone());
+    let egress_cfgs = cfg_rx.clone();
+    let handles = crate::attach::Handles {
+        inbound: tx.clone(),
+        router: attach_tx,
+        snap: snap_rx.clone(),
+        cfgs: cfg_rx.clone(),
+    };
+    let hub = crate::web::Hub::new();
     let (gate_cfgs, gate_snap) = (cfg_rx.clone(), snap_rx.clone());
     let names = channels.iter().map(|c| c.name().to_string()).collect();
     let mut router = Router::new(cfg, &jobs, attaches, cfg_tx, snap, names)?;
     // The gate's held notes for main's run, steered in before the plugin is answered (R51).
     let (gate_notes, notes_rx) = mpsc::channel(16);
     router.gate_notes = Some(notes_rx);
+    router.web = cfg.web.is_some().then(|| hub.clone());
     router.keep_upgraded_install_as_it_was().await;
     router.taint_cut_off();
     // Before the first child starts the desktop: one a daemon before this left is no child of
@@ -302,7 +310,8 @@ pub async fn run<C: Channel>(
         r = crate::gate::serve(gate_cfgs, gate_snap, waits, &jobs, gate_notes) => r.map(|()| Exit::Shutdown),
         // The agent's only way out, in bridge mode (DESIGN §4.20).
         r = crate::egress::serve(egress_cfgs, &jobs) => r.map(|()| Exit::Shutdown),
-        r = crate::attach::serve(cfg, tx, attach_tx, snap_rx, attach_cfgs) => r.map(|()| Exit::Shutdown),
+        r = crate::attach::serve(cfg, handles.clone()) => r.map(|()| Exit::Shutdown),
+        r = crate::web::serve(cfg, handles, hub) => r.map(|()| Exit::Shutdown),
         r = crate::scheduler::run(cfg_rx.clone(), &jobs) => r.map(|()| Exit::Shutdown),
         r = crate::tasks::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),
         r = show_activity(channels, activity_rx, cfg.tick) => r.map(|()| Exit::Shutdown),
@@ -488,6 +497,8 @@ struct Router<'a> {
     due_held: bool,
     /// The gate's held notes for main's run (R51), from `gate::serve`.
     gate_notes: Option<mpsc::Receiver<GateNote>>,
+    /// The web app's sockets and sessions (DESIGN §4.3.3), when `[web]` is set; `run` sets it.
+    pub(crate) web: Option<Arc<crate::web::Hub>>,
     /// Actions whose held note is in this run already, so the call's end steers it in no more.
     held_steered: HashSet<i64>,
     /// The newest note about an action main was woken for (R49).
@@ -645,6 +656,7 @@ impl<'a> Router<'a> {
             waits: Default::default(),
             due_held: false,
             gate_notes: None,
+            web: None,
             held_steered: HashSet::new(),
             action_woken: 0,
             compacting: None,
@@ -1286,6 +1298,8 @@ impl<'a> Router<'a> {
                     channels.push((known, "off"));
                 }
             }
+            let web = self.web.as_ref().is_some_and(|hub| hub.connected() > 0);
+            channels.push(("web", if web { "connected" } else { "off" }));
             // shortcut: adapters report no connection state, so a running one counts as
             // connected; add `reconnecting` once they do.
             Ok(Snapshot {

@@ -2872,7 +2872,7 @@ mod tests {
         let card = notices(&h.store).pop().unwrap();
         assert!(
             card.ends_with(&format!(
-                "\n/ok {id} · /no {id} · expires in 24 h · this one needs tui or chat"
+                "\n/ok {id} · /no {id} · expires in 24 h · this one needs tui or chat or passkey"
             )),
             "{card}"
         );
@@ -3138,7 +3138,10 @@ mod tests {
             )),
             "{card}"
         );
-        assert!(card.ends_with("· this one needs tui or chat"), "{card}");
+        assert!(
+            card.ends_with("· this one needs tui or chat or passkey"),
+            "{card}"
+        );
     }
 
     /// I3: Enter in a form's field submits the form through its default button, so the stricter

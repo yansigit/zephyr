@@ -480,6 +480,7 @@ async fn zephyr_hello_returns_the_snapshot() {
                 {"name": "chat", "state": "connected"},
                 {"name": "discord", "state": "off"},
                 {"name": "imessage", "state": "off"},
+                {"name": "web", "state": "off"},
             ],
             "spend": {"tokens": 0, "cost": 0.0, "daily_tokens_limit": null, "daily_cost_limit": null},
             "queue": [],

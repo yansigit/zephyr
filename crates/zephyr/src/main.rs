@@ -350,6 +350,17 @@ async fn status(cfg: &Config) -> anyhow::Result<()> {
     for line in zephyr::reload::status_lines(cfg, &store)? {
         println!("{line}");
     }
+    if let Some(web) = &cfg.web {
+        let up = tokio::net::TcpStream::connect(("127.0.0.1", web.port)).await;
+        println!(
+            "web: {}",
+            if up.is_ok() {
+                "listening"
+            } else {
+                "not listening"
+            }
+        );
+    }
     // The router's view, written with the heartbeat: `<unix> <main up> <failed starts>`.
     let file = std::fs::read_to_string(cfg.state_dir().join(HEARTBEAT)).unwrap_or_default();
     match file.split_whitespace().collect::<Vec<_>>()[..] {
@@ -498,6 +509,17 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
         let there = std::fs::symlink_metadata(&socket).is_ok_and(|m| m.file_type().is_socket());
         let label = format!("the approvals gate listens at {}", socket.display());
         ok &= check(&label, there);
+    }
+    if let Some(web) = &cfg.web {
+        let up = tokio::net::TcpStream::connect(("127.0.0.1", web.port)).await;
+        ok &= check(
+            &format!("web app listening on 127.0.0.1:{}", web.port),
+            up.is_ok(),
+        );
+        ok &= check(
+            "the web push key loads",
+            zephyr::web::push::vapid(cfg, false).is_ok(),
+        );
     }
     if let Some(d) = &cfg.discord {
         let label = format!("env {} is set (discord token)", d.token_env);
