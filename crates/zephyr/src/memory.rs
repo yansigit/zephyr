@@ -373,7 +373,7 @@ pub async fn commit(
     state: &Path,
     origin: Origin,
     digest: bool,
-    others: impl Fn() -> bool + Send + 'static,
+    others: impl Fn() -> Option<String> + Send + 'static,
 ) -> anyhow::Result<Committed> {
     let (home, state) = (home.to_path_buf(), state.to_path_buf());
     let commit = move || commit_checked(&home, &state, &origin, digest, &others);
@@ -387,7 +387,7 @@ pub fn commit_if_changed(
     origin: &Origin,
     digest: bool,
 ) -> anyhow::Result<Committed> {
-    commit_checked(home, state, origin, digest, &|| false)
+    commit_checked(home, state, origin, digest, &|| None)
 }
 
 /// Commits every change in the memory dir as `memory: <utc time>`. With `Origin::Owner`, a
@@ -395,14 +395,14 @@ pub fn commit_if_changed(
 /// else waits, and the notice (once per content) names where it came from. With `digest`
 /// (`memory.notify = digest`) nothing is told and nothing marked shown: the daily review lists
 /// it, and `/memory ok` shows the diff first until then.
-/// `others`, asked for an owner's run under the memory lock right before the commit, says whether
-/// other work of the agent's ran beside the run or a stray of its lives (`BESIDE`).
+/// `others`, asked for an owner's run under the memory lock right before the commit, names what
+/// else of the agent's ran beside the run (`BESIDE`) or lives on its own: the change then waits.
 pub fn commit_checked(
     home: &Path,
     state: &Path,
     origin: &Origin,
     digest: bool,
-    others: &dyn Fn() -> bool,
+    others: &dyn Fn() -> Option<String>,
 ) -> anyhow::Result<Committed> {
     let _guard = lock();
     // Under the lock and before any git call: a filter the agent configured would run inside it.
@@ -411,7 +411,10 @@ pub fn commit_checked(
         _ => None,
     };
     // Then whether anything else could have written: as late as zephyr can ask, before it reads.
-    let beside = matches!(origin, Origin::Owner { .. }) && tampered.is_none() && others();
+    let beside = match origin {
+        Origin::Owner { .. } if tampered.is_none() => others(),
+        _ => None,
+    };
     let sha = {
         let _fs = crate::agent::fs();
         commit_locked(home)?
@@ -444,8 +447,8 @@ pub fn commit_checked(
     }
     let working = working?;
     let mut label = origin.label();
-    if beside {
-        label = BESIDE.into();
+    if let Some(why) = beside {
+        label = why;
     } else if let Origin::Owner { base } = origin {
         let on_base = || -> anyhow::Result<bool> {
             let _fs = crate::agent::fs();
@@ -2366,7 +2369,7 @@ mod tests {
             // Asked while zephyr holds the memory lock, so no commit of its own comes between.
             assert!(GIT.try_lock().is_err(), "under the lock");
             asked.store(true, std::sync::atomic::Ordering::SeqCst);
-            true
+            Some(BESIDE.to_string())
         };
         let c = commit_checked(&home, &st, &Origin::Owner { base }, false, &others).unwrap();
         assert!(asked.load(std::sync::atomic::Ordering::SeqCst));

@@ -204,19 +204,26 @@ impl Procs {
 
     /// Whether `kill_strays` would find any (DESIGN §4.6: a stray can write memory, so an owner's
     /// change made while one lives waits). The agent-browser daemon counts.
-    /// A `/proc` that cannot be read whole counts as one.
     pub fn strays_alive(&self) -> bool {
-        let Some((uid, scope, keep)) = self.sweep() else {
-            return false;
-        };
-        let (all, complete) = processes_in(Path::new("/proc"));
-        !complete || !strays(&all, uid, scope, &keep, true).is_empty()
+        self.stray().is_some()
     }
 
-    /// `kill_strays`' search: `(pid, start ticks)` of each.
+    /// What one stray is (its command name), for the owner: `UNSEEN` when `/proc` cannot be read
+    /// whole, which counts as one. `None`: there is none.
+    pub fn stray(&self) -> Option<String> {
+        let (uid, scope, keep) = self.sweep()?;
+        let (all, complete) = processes_in(Path::new("/proc"));
+        if !complete {
+            return Some(UNSEEN.into());
+        }
+        named(&all, &strays(&all, uid, scope, &keep, true))
+    }
+
+    /// `kill_strays`' search: `(pid, start ticks)` of each, as strictly as `stray` looks, so
+    /// `/stop` ends whatever keeps memory from being saved at once.
     fn find_strays(&self) -> Vec<(i32, i64)> {
         match self.sweep() {
-            Some((uid, scope, keep)) => strays(&processes(), uid, scope, &keep, false),
+            Some((uid, scope, keep)) => strays(&processes(), uid, scope, &keep, true),
             None => Vec::new(),
         }
     }
@@ -655,6 +662,57 @@ fn processes_in(root: &Path) -> (HashMap<i32, Ps>, bool) {
 
 /// The desktop's programs (`desktop::ensure`), which a crashed daemon leaves running.
 const DESKTOP: [&str; 2] = ["Xvfb", "openbox"];
+
+/// `Procs::stray`'s answer when `/proc` cannot be read whole.
+pub const UNSEEN: &str = "processes zephyr could not read";
+
+/// The command name of the first of `found`.
+fn named(all: &HashMap<i32, Ps>, found: &[(i32, i64)]) -> Option<String> {
+    let (pid, _) = found.first()?;
+    Some(
+        all.get(pid)
+            .map_or_else(|| UNSEEN.into(), |p| p.comm.clone()),
+    )
+}
+
+/// The agent's desktop programs that do not descend from `me`, the daemon: a desktop a crashed
+/// daemon left, or a program of the agent's that takes the name.
+fn leftover_desktop(all: &HashMap<i32, Ps>, uid: u32, me: i32) -> Vec<(i32, i64)> {
+    let ours = |mut pid: i32| {
+        for _ in 0..all.len() {
+            match all.get(&pid) {
+                _ if pid == me => return true,
+                Some(p) => pid = p.ppid,
+                None => return false,
+            }
+        }
+        false
+    };
+    (all.iter())
+        .filter(|(pid, p)| p.uid == uid && !ours(**pid))
+        .filter(|(_, p)| DESKTOP.contains(&p.comm.as_str()))
+        .map(|(pid, p)| (*pid, p.ticks))
+        .collect()
+}
+
+/// At the daemon's start (`desktop::ensure`): ends a desktop it did not start, so the one the
+/// agent uses is always the daemon's own child and never a stray (DESIGN §4.6). Waits up to 2 s
+/// for each to go, so the new server can take the display.
+pub fn kill_leftover_desktop() {
+    let Some((uid, _)) = crate::agent::ids() else {
+        return;
+    };
+    let found = leftover_desktop(&processes(), uid, std::process::id() as i32);
+    for (pid, ticks) in found {
+        if kill_exact(pid, ticks) {
+            eprintln!("zephyr: ended a desktop program ({pid}) this daemon did not start");
+            let until = Instant::now() + Duration::from_secs(2);
+            while start_ticks(pid) == Some(ticks) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
 
 /// `(pid, start ticks)` of each process of `uid` whose parents lead to `scope` without passing
 /// one of `keep` or the desktop. A chain that breaks (a parent not in `all`) is spared.
@@ -1178,5 +1236,48 @@ mod tests {
         assert!(all.contains_key(&(me as i32)));
         std::fs::remove_dir_all(root.join("41")).unwrap();
         assert!(processes_in(&root).1, "a process that ended is not doubt");
+    }
+
+    #[test]
+    fn a_desktop_the_daemon_did_not_start_is_a_leftover() {
+        let ps = |ppid, uid, comm: &str| Ps {
+            ppid,
+            uid,
+            ticks: 7,
+            comm: comm.into(),
+        };
+        // 10 this daemon and the desktop it started; 50, 52 what a crashed one left; 60 a
+        // program of the agent's named like the desktop; 70 another user's.
+        let all = HashMap::from([
+            (1, ps(0, 0, "init")),
+            (10, ps(1, 0, "zephyr")),
+            (11, ps(10, 9, "Xvfb")),
+            (12, ps(10, 9, "openbox")),
+            (50, ps(1, 9, "Xvfb")),
+            (51, ps(50, 9, "xkbcomp")),
+            (52, ps(1, 9, "openbox")),
+            (60, ps(40, 9, "Xvfb")),
+            (40, ps(1, 9, "bash")),
+            (70, ps(1, 8, "Xvfb")),
+        ]);
+        let mut found = leftover_desktop(&all, 9, 10);
+        found.sort();
+        assert_eq!(found, [(50, 7), (52, 7), (60, 7)]);
+    }
+
+    #[test]
+    fn a_stray_is_named_for_the_owner() {
+        let ps = |ppid, comm: &str| Ps {
+            ppid,
+            uid: 9,
+            ticks: 7,
+            comm: comm.into(),
+        };
+        let all = HashMap::from([(1, ps(0, "init")), (40, ps(1, "chrome"))]);
+        assert_eq!(
+            named(&all, &strays(&all, 9, 1, &[], true)).as_deref(),
+            Some("chrome")
+        );
+        assert_eq!(named(&all, &[]), None);
     }
 }

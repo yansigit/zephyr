@@ -2014,14 +2014,18 @@ impl<'a> Router<'a> {
         }
         let failed = session.as_ref().and_then(|s| self.tainted.get(s)).cloned();
         let origin = session.map(|s| self.store.session_origin(&s));
+        let beside = match origin {
+            Some(Ok(SessionOrigin::Clean)) => self.beside(now),
+            _ => None,
+        };
         self.trust = match origin {
             _ if self.unplaced => Trust::Not(UNPLACED.into()),
             _ if failed.is_some() => Trust::Not(format!(
                 "this conversation, which {}",
                 failed.unwrap_or_default()
             )),
-            Some(Ok(SessionOrigin::Clean)) if self.writers_since(now) => {
-                Trust::Not(crate::memory::BESIDE.into())
+            Some(Ok(SessionOrigin::Clean)) if beside.is_some() => {
+                Trust::Not(beside.unwrap_or_default())
             }
             Some(Ok(SessionOrigin::Clean)) => {
                 match crate::memory::base(&self.cfg.home, self.cfg.state_dir()).await {
@@ -2036,10 +2040,21 @@ impl<'a> Router<'a> {
         };
     }
 
-    /// Whether other work of the agent's ran, or runs, since `since`, or a stray of its lives:
-    /// any of it could write memory. A failed read counts as yes.
-    fn writers_since(&self, since: i64) -> bool {
-        self.store.writers_since(since).unwrap_or(true) || self.procs.strays_alive()
+    /// What ran or runs beside a run of main since `since`, as its label: other work
+    /// (`BESIDE`), else a stray, named with what ends it.
+    fn beside(&self, since: i64) -> Option<String> {
+        self.procs_beside(since).map(|b| match b {
+            Beside::Work => crate::memory::BESIDE.into(),
+            Beside::Stray(comm) => stray_label(&comm),
+        })
+    }
+
+    /// What ran or runs beside since `since`: other work first, else a stray.
+    fn procs_beside(&self, since: i64) -> Option<Beside> {
+        if self.store.writers_since(since).unwrap_or(true) {
+            return Some(Beside::Work);
+        }
+        self.procs.stray().map(Beside::Stray)
     }
 
     /// The run's conversation took in text that is not the owner's: it is tainted for good, in
@@ -2108,11 +2123,23 @@ impl<'a> Router<'a> {
         let Some(seen) = self.session_seen(session) else {
             return;
         };
-        if since.is_none_or(|since| self.writers_since(since)) {
-            return self.taint_now(
-                session,
-                "was written while other work of the agent's was running",
-            );
+        let beside = since.map(|since| self.procs_beside(since));
+        match beside {
+            None | Some(Some(Beside::Work)) => {
+                return self.taint_now(
+                    session,
+                    "was written while other work of the agent's was running",
+                )
+            }
+            Some(Some(Beside::Stray(comm))) => {
+                let (what, cure) = stray_phrase(&comm);
+                let why = format!(
+                    "was written at {} while {what}; {cure}, then /new starts clean",
+                    self.clock(crate::now())
+                );
+                return self.record_taint(session.to_string(), &why);
+            }
+            Some(None) => {}
         }
         let dir = self.cfg.session_dir();
         let now = seen
@@ -2226,7 +2253,10 @@ impl<'a> Router<'a> {
         };
         let others = move || {
             let writers = Store::open(&db).and_then(|s| s.writers_since(since));
-            writers.unwrap_or(true) || procs.strays_alive()
+            match writers.unwrap_or(true) {
+                true => Some(crate::memory::BESIDE.to_string()),
+                false => procs.stray().map(|comm| stray_label(&comm)),
+            }
         };
         let (home, state, digest) = (&self.cfg.home, self.cfg.state_dir(), self.cfg.digest());
         let done = crate::memory::commit(home, state, origin, digest, others).await;
@@ -4476,6 +4506,45 @@ impl<'a> Router<'a> {
 }
 
 /// The first word of `s` and the rest, both trimmed; a line break ends a word too.
+/// The label of an owner's run while a stray of the agent's lives (`Procs::stray`): what it is,
+/// and that `/stop` ends it.
+fn stray_label(comm: &str) -> String {
+    let (what, cure) = stray_phrase(comm);
+    format!("your message, while {what}; {cure}")
+}
+
+/// A stray (`Procs::stray`) as the owner reads it, and what ends it.
+fn stray_phrase(comm: &str) -> (String, &'static str) {
+    if comm == crate::procs::UNSEEN {
+        return (
+            "zephyr could not see all of the agent's processes".into(),
+            "/stop ends what it can",
+        );
+    }
+    let lower = comm.to_ascii_lowercase();
+    if ["chrom", "agent-browser", "firefox", "camoufox"]
+        .iter()
+        .any(|b| lower.contains(b))
+    {
+        return (
+            "the agent's browser was still open".into(),
+            "/stop closes it",
+        );
+    }
+    (
+        format!("the agent's {comm} was still running on its own"),
+        "/stop ends it",
+    )
+}
+
+/// What else of the agent's could write while main's child or run did.
+enum Beside {
+    /// A job run, task or process (`Store::writers_since`).
+    Work,
+    /// A process of the agent's outside every tracked group, by command name.
+    Stray(String),
+}
+
 /// The id `/new` gives a conversation: `main-<unix seconds>`, past any id zephyr already gave
 /// one (a `/new` in the same second, or the one in use), so a second `/new` never reopens the
 /// first's file. A file for an id zephyr never gave is not skipped: `new_session` taints it.
@@ -5059,6 +5128,26 @@ mod tests {
             new_session_id(&r.store, 100),
             "main-103",
             "nor the current one"
+        );
+    }
+
+    #[test]
+    fn a_stray_is_named_with_what_ends_it() {
+        assert_eq!(
+            stray_label("chrome"),
+            "your message, while the agent's browser was still open; /stop closes it"
+        );
+        assert_eq!(
+            stray_label("agent-browser"),
+            "your message, while the agent's browser was still open; /stop closes it"
+        );
+        assert_eq!(
+            stray_label("sleep"),
+            "your message, while the agent's sleep was still running on its own; /stop ends it"
+        );
+        assert_eq!(
+            stray_label(crate::procs::UNSEEN),
+            "your message, while zephyr could not see all of the agent's processes; /stop ends what it can"
         );
     }
 }

@@ -41,6 +41,8 @@ pub fn ensure() -> Option<String> {
             let _ = c.wait();
         }
         running.clear();
+        // A desktop a crashed daemon left would keep the display and be no child of this one.
+        crate::procs::kill_leftover_desktop();
         let auth = auth.to_string_lossy().into_owned();
         let xvfb = [
             "-auth",

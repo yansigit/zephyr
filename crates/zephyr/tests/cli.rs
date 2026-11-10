@@ -370,7 +370,9 @@ fn a_stray_agent_process_keeps_an_owner_memory_change_waiting() {
     };
     assert!(
         notice.starts_with(
-            "[zephyr] memory change waiting (from your message, while other work of the agent's was running)"
+            "[zephyr] memory change waiting (from this conversation, which was written at "
+        ) && notice.contains(
+            " while the agent's sleep was still running on its own; /stop ends it, then /new starts clean); "
         ),
         "{notice}"
     );

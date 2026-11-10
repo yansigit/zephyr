@@ -287,7 +287,7 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
                 name: run.job.name.clone(),
             };
             let done =
-                crate::memory::commit(&cfg.home, cfg.state_dir(), origin, cfg.digest(), || false)
+                crate::memory::commit(&cfg.home, cfg.state_dir(), origin, cfg.digest(), || None)
                     .await;
             let memory = crate::memory::recorded(&store, done);
             let delivery = (output.trim() != SILENT).then_some(output.as_str());

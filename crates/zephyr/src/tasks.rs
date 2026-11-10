@@ -94,7 +94,7 @@ async fn one(cfg: Arc<Config>, mut store: Store, task: Task, wake: &Wake) {
     // The task's memory edits are committed as main's settle would commit them.
     let origin = crate::memory::Origin::Task(task.id);
     let done =
-        crate::memory::commit(&cfg.home, cfg.state_dir(), origin, cfg.digest(), || false).await;
+        crate::memory::commit(&cfg.home, cfg.state_dir(), origin, cfg.digest(), || None).await;
     if let Some(notice) = crate::memory::recorded(&store, done) {
         log(store.notify(channel, recipient, &notice));
     }
