@@ -570,6 +570,15 @@ impl std::fmt::Display for Cursor {
     }
 }
 
+/// A recipient the owner approved under `ask-new` (approvals spec §4.6); `n` is its rowid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownTarget {
+    pub n: i64,
+    pub class: String,
+    pub target: String,
+    pub added_at: i64,
+}
+
 /// The latest change recorded for a setting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingChange {
@@ -1736,6 +1745,42 @@ impl Store {
         Ok(())
     }
 
+    /// Every remembered target, by class and target; `n` is the row's id for `forget_target`.
+    pub fn known_targets(&self) -> rusqlite::Result<Vec<KnownTarget>> {
+        let mut stmt = self.db.prepare(
+            "SELECT rowid, class, target, added_at FROM known_targets ORDER BY class, target",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(KnownTarget {
+                n: r.get(0)?,
+                class: r.get(1)?,
+                target: r.get(2)?,
+                added_at: r.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Forgets remembered target `n`: `(class, target)`, or `None` when there is no such row.
+    pub fn forget_target(&self, n: i64) -> rusqlite::Result<Option<(String, String)>> {
+        self.db
+            .query_row(
+                "DELETE FROM known_targets WHERE rowid = ?1 RETURNING class, target",
+                params![n],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+    }
+
+    /// The turned-on jobs with when each was created (or last turned on), by id.
+    pub fn enabled_jobs(&self) -> rusqlite::Result<Vec<(Job, i64)>> {
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT {JOB_COLUMNS}, jobs.created_at FROM jobs WHERE enabled = 1 ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], |r| Ok((job_row(r, 0)?, r.get(7)?)))?;
+        rows.collect()
+    }
+
     /// Whether every target is known for `class`; any `unknown` target is not, nor is no target.
     pub fn all_known(&self, class: &str, targets: &[String]) -> rusqlite::Result<bool> {
         if targets.is_empty() {
@@ -1943,16 +1988,24 @@ impl Store {
         rows.collect()
     }
 
-    /// Deletes the job and its runs that have not started. Returns whether it existed.
+    /// Deletes the job and its runs that have not started. Returns whether it existed. Its other
+    /// runs stay, in the activity record as `(removed)` and keeping run ids from being reused,
+    /// so the key on `runs.job_id` (which the bundled SQLite enforces) is lifted for the delete;
+    /// the pragma cannot change inside a transaction.
     pub fn remove_job(&mut self, id: i64) -> rusqlite::Result<bool> {
-        let tx = self.db.transaction()?;
-        tx.execute(
-            "DELETE FROM runs WHERE job_id = ?1 AND status = 'claimed'",
-            params![id],
-        )?;
-        let n = tx.execute("DELETE FROM jobs WHERE id = ?1", params![id])?;
-        tx.commit()?;
-        Ok(n == 1)
+        self.db.pragma_update(None, "foreign_keys", false)?;
+        let removed = (|| {
+            let tx = self.db.transaction()?;
+            tx.execute(
+                "DELETE FROM runs WHERE job_id = ?1 AND status = 'claimed'",
+                params![id],
+            )?;
+            let n = tx.execute("DELETE FROM jobs WHERE id = ?1", params![id])?;
+            tx.commit()?;
+            Ok(n == 1)
+        })();
+        self.db.pragma_update(None, "foreign_keys", true)?;
+        removed
     }
 
     /// Queues a run now (`/job run`). `None` when there is no such job.
@@ -4055,5 +4108,65 @@ mod tests {
         assert_eq!(ids(&store, "runs"), [1, 2, 3]);
         assert_eq!(ids(&store, "tasks"), [1, 2, 3]);
         assert_eq!(ids(&store, "procs"), [1, 2]);
+    }
+
+    #[test]
+    fn forgetting_a_target_returns_it_once() {
+        let store = Store::open(&crate::test_dir("store-forget").join("state.db")).unwrap();
+        store
+            .remember_targets("messages", &["a@x.org".into(), "b@x.org".into()])
+            .unwrap();
+        let known = store.known_targets().unwrap();
+        let a = known.iter().find(|k| k.target == "a@x.org").unwrap();
+        assert_eq!(a.class, "messages");
+        assert_eq!(
+            store.forget_target(a.n).unwrap(),
+            Some(("messages".into(), "a@x.org".into()))
+        );
+        assert_eq!(store.forget_target(a.n).unwrap(), None);
+        assert!(!store.all_known("messages", &["a@x.org".into()]).unwrap());
+        assert!(store.all_known("messages", &["b@x.org".into()]).unwrap());
+        assert_eq!(store.known_targets().unwrap().len(), 1);
+    }
+
+    /// `/job rm`, the grants view's revoke for a job, works on a job that has run: its runs stay
+    /// in the activity record as `(removed)`, though the bundled SQLite enforces their key.
+    #[test]
+    fn removing_a_job_that_ran_keeps_its_runs() {
+        let mut store = Store::open(&crate::test_dir("store-rm-ran").join("state.db")).unwrap();
+        let job = store
+            .add_job("j", "0 7 * * *", "p", "chat", "1000")
+            .unwrap();
+        store.queue_run(job, 50).unwrap();
+        let run = store.start_next_run(50).unwrap().unwrap();
+        store.finish_run(&run, "completed", "", None, 50).unwrap();
+        store.queue_run(job, 60).unwrap();
+        assert!(store.remove_job(job).unwrap());
+        assert_eq!(
+            ids(&store, "runs"),
+            [run.id],
+            "the claimed run goes, the finished stays"
+        );
+        let runs = store.activity(0, &["job"], None, 10).unwrap();
+        assert_eq!(runs[0].text, "(removed)");
+        assert!(!store.remove_job(job).unwrap());
+        // The key is enforced again afterwards.
+        let fk: i64 = store
+            .db
+            .pragma_query_value(None, "foreign_keys", |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1);
+        let jobs = store.enabled_jobs().unwrap();
+        assert!(jobs.is_empty());
+        let on = store
+            .add_job("on", "0 7 * * *", "p", "chat", "1000")
+            .unwrap();
+        store
+            .propose_job("off", "0 7 * * *", "p", "chat", "1000")
+            .unwrap();
+        let jobs = store.enabled_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].0.id, on);
+        assert!(jobs[0].1 > 0);
     }
 }

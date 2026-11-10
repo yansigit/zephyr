@@ -204,13 +204,90 @@ fn noun(kind: Option<&str>) -> &'static str {
     }
 }
 
+/// What still lets something happen without asking, with the command that takes it back.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Grant {
+    /// When it was granted.
+    pub at: i64,
+    /// The class, the setting's key, or `#id` for a job.
+    pub subject: String,
+    /// The line every client shows, ending ` · REVOKE`.
+    pub line: String,
+    pub revoke: String,
+}
+
+/// The standing grants (DESIGN §4.19), current state: remembered targets, time limits, then
+/// turned-on jobs. Vault grants are `/vault`'s to list, one-time passes go by themselves.
+pub fn grants(cfg: &Config, store: &Store, now: i64) -> rusqlite::Result<Vec<Grant>> {
+    let tz = crate::scheduler::zone(cfg).unwrap_or(TimeZone::UTC);
+    let scrub = Scrub::load(cfg);
+    let clean = |s: &str| one_line(&scrub.text(s), 200);
+    let grant = |at: i64, subject: String, shown: String, revoke: String| Grant {
+        at,
+        subject,
+        line: format!("{shown} · {revoke}"),
+        revoke,
+    };
+    let mut out = Vec::new();
+    for t in store.known_targets()? {
+        let since = jiff::Timestamp::from_second(t.added_at)
+            .map(|s| s.to_zoned(tz.clone()).strftime("%m-%d").to_string())
+            .unwrap_or_default();
+        let shown = format!("{} {}, known since {since}", t.class, clean(&t.target));
+        out.push(grant(
+            t.added_at,
+            t.class,
+            shown,
+            format!("/approvals forget {}", t.n),
+        ));
+    }
+    for r in store.due_reverts(i64::MAX)? {
+        let value = clean(crate::settings::shown(r.value.as_deref()));
+        // A timed preset's value is a snapshot (`manual; messages=ask`); setting the preset its
+        // first item names is what takes the limit back.
+        let back = match r.key.as_str() {
+            "approvals.preset" => match value.split(';').next().unwrap_or_default().trim() {
+                "default" => "none".to_string(),
+                first => first.to_string(),
+            },
+            _ => value.clone(),
+        };
+        let shown = format!("{} until {}, then {value}", r.key, when(r.at, now, &tz));
+        let revoke = format!("/set {} {back}", r.key);
+        out.push(grant(r.since, r.key, shown, revoke));
+    }
+    for (job, created) in store.enabled_jobs()? {
+        let shown = format!(
+            "job #{} {}, {}, to {}",
+            job.id,
+            clean(&job.name),
+            one_line(&job.schedule, 200),
+            job.channel
+        );
+        out.push(grant(
+            created,
+            format!("#{}", job.id),
+            shown,
+            format!("/job rm {}", job.id),
+        ));
+    }
+    Ok(out)
+}
+
 /// The whole reply to `/activity ARG`, for the owner on any channel and the agent's `gateway`.
 pub fn chat(cfg: &Config, store: &Store, arg: &str, now: i64) -> String {
     let Some(q) = Query::words(arg) else {
         return USAGE.into();
     };
     if q.kind == Some("grants") {
-        return USAGE.into();
+        return match grants(cfg, store, now) {
+            Err(e) => format!("[zephyr] reading the activity failed: {e}"),
+            Ok(g) if g.is_empty() => "[zephyr] no standing grants".into(),
+            Ok(g) => std::iter::once("[zephyr] standing grants, each with what takes it back:")
+                .chain(g.iter().map(|g| g.line.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
     }
     let tz = crate::scheduler::zone(cfg).unwrap_or(TimeZone::UTC);
     let kinds: Vec<&str> = q.kind.into_iter().collect();
@@ -581,5 +658,110 @@ mod tests {
         assert_eq!(reply.lines().count(), 2);
         let reply = chat(&cfg, &store, "6h out", now);
         assert_eq!(reply, "[zephyr] nothing recorded in the last 6 h");
+    }
+
+    fn revert(key: &str, value: Option<&str>, at: i64) -> crate::store::Revert {
+        crate::store::Revert {
+            key: key.into(),
+            value: value.map(Into::into),
+            at,
+            since: at - 3600,
+            channel: Some("chat".into()),
+        }
+    }
+
+    #[test]
+    fn grants_list_each_with_its_revoke() {
+        let (cfg, store) = cfg("activity-grants");
+        assert_eq!(
+            chat(&cfg, &store, "grants", NOW),
+            "[zephyr] no standing grants"
+        );
+        store
+            .remember_targets("messages", &["bob@x.org".into()])
+            .unwrap();
+        // 2025-11-02 09:00 UTC.
+        store
+            .db_for_test()
+            .execute("UPDATE known_targets SET added_at = 1762074000", [])
+            .unwrap();
+        store
+            .set_revert(&revert("budget.daily_cost_usd", Some("5"), at(18, 0)))
+            .unwrap();
+        store
+            .add_job("morning-brief", "0 7 * * *", "p", "discord", "1")
+            .unwrap();
+        store
+            .propose_job("proposed", "0 8 * * *", "p", "discord", "1")
+            .unwrap();
+        let g = grants(&cfg, &store, NOW).unwrap();
+        let lines: Vec<&str> = g.iter().map(|g| g.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "messages bob@x.org, known since 11-02 · /approvals forget 1",
+                "budget.daily_cost_usd until 18:00, then 5 · /set budget.daily_cost_usd 5",
+                "job #1 morning-brief, 0 7 * * *, to discord · /job rm 1",
+            ]
+        );
+        let revokes: Vec<&str> = g.iter().map(|g| g.revoke.as_str()).collect();
+        assert_eq!(
+            revokes,
+            [
+                "/approvals forget 1",
+                "/set budget.daily_cost_usd 5",
+                "/job rm 1"
+            ]
+        );
+        let subjects: Vec<&str> = g.iter().map(|g| g.subject.as_str()).collect();
+        assert_eq!(subjects, ["messages", "budget.daily_cost_usd", "#1"]);
+        assert_eq!(g[0].at, 1762074000);
+        let reply = chat(&cfg, &store, "7d Grants", NOW);
+        assert_eq!(
+            reply,
+            format!(
+                "[zephyr] standing grants, each with what takes it back:\n{}",
+                lines.join("\n")
+            )
+        );
+    }
+
+    #[test]
+    fn a_timed_presets_revoke_is_a_working_command() {
+        let (cfg, store) = cfg("activity-grants-preset");
+        store
+            .set_revert(&revert(
+                "approvals.preset",
+                Some("manual; messages=ask"),
+                at(18, 0),
+            ))
+            .unwrap();
+        store
+            .set_revert(&revert("tasks.parallel", None, at(19, 0)))
+            .unwrap();
+        let g = grants(&cfg, &store, NOW).unwrap();
+        assert_eq!(
+            g[0].line,
+            "approvals.preset until 18:00, then manual; messages=ask · /set approvals.preset manual"
+        );
+        assert_eq!(g[0].revoke, "/set approvals.preset manual");
+        assert_eq!(
+            g[1].line,
+            "tasks.parallel until 19:00, then none · /set tasks.parallel none"
+        );
+        store
+            .set_revert(&revert(
+                "approvals.preset",
+                Some("default; posts=hold"),
+                at(18, 0),
+            ))
+            .unwrap();
+        let g = grants(&cfg, &store, NOW).unwrap();
+        assert_eq!(g[0].revoke, "/set approvals.preset none");
+        assert!(
+            g[0].line.contains("then default; posts=hold · "),
+            "{}",
+            g[0].line
+        );
     }
 }

@@ -5597,3 +5597,58 @@ async fn activity_scrubs_a_fact_saved_after_the_call() {
     assert!(!reply.contains("555010"), "{reply}");
     gw.shutdown().await;
 }
+
+/// `/activity grants` lists a recipient `/ok` remembered with its revoke, and `/approvals forget N`
+/// takes it back: logged as a setting change, and the next send to it waits for the owner again.
+#[tokio::test]
+async fn forgetting_a_known_target_asks_again() {
+    let home = home("forget-target");
+    let gw = start(on_file(&home, "[approvals]\npreset = \"semi\""));
+    gw.say("m1", "owner", SEND_TO_A).await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    gw.say("m2", "owner", "/ok 1").await;
+    reply_where(&gw, "chat", |r| {
+        r.contains("from now on a@x.org goes without asking")
+    })
+    .await;
+    assert!(to_main(&home, 1).await.starts_with("[action #1 done;"));
+
+    gw.say("m3", "owner", "/activity grants").await;
+    let grants = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] standing grants")).await;
+    let line = grants.lines().nth(1).unwrap_or_default();
+    assert!(
+        line.starts_with("messages a@x.org, known since ")
+            && line.ends_with(" · /approvals forget 1"),
+        "{grants}"
+    );
+    gw.say("m4", "owner", "/approvals forget 1").await;
+    reply_where(&gw, "chat", |r| {
+        r == "[zephyr] forgot a@x.org for messages; under ask-new a message to it waits for you again"
+    })
+    .await;
+    gw.say("m5", "owner", "/activity setting").await;
+    let settings = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] setting changes")).await;
+    assert!(
+        settings
+            .lines()
+            .any(|l| l.ends_with("setting owner on chat: approvals.known.messages a@x.org → none")),
+        "{settings}"
+    );
+
+    gw.say("m6", "owner", &format!("{SEND_TO_A} now")).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains("\nexec: held for the owner as #")
+    })
+    .await;
+    gw.say("m7", "owner", "/approvals forget 1").await;
+    reply_where(&gw, "chat", |r| {
+        r == "[zephyr] no remembered target #1; /activity grants lists them"
+    })
+    .await;
+    gw.say("m8", "owner", "/approvals forget x").await;
+    reply_where(&gw, "chat", |r| {
+        r.starts_with("[zephyr] usage: /approvals") && r.ends_with(", /approvals forget N")
+    })
+    .await;
+    gw.shutdown().await;
+}

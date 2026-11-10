@@ -508,7 +508,7 @@ const APPLIED: &str = "[zephyr] applied";
 const SET_USAGE: &str = "[zephyr] usage: /set KEY VALUE [for 2h]; /settings lists the keys";
 
 const APPROVALS_USAGE: &str = "[zephyr] usage: /approvals, /approvals manual|semi|full|on|off \
-    [for 2h], /approvals messages|posts|money|facts MODE [for 2h]";
+    [for 2h], /approvals messages|posts|money|facts MODE [for 2h], /approvals forget N";
 
 const SUBAGENT_USAGE: &str = "usage: /subagent, /subagent add NAME [PROVIDER/MODEL] PROMPT, \
     /subagent model NAME PROVIDER/MODEL|default, /subagent prompt NAME PROMPT, /subagent rm NAME";
@@ -2560,6 +2560,7 @@ impl<'a> Router<'a> {
             (p @ ("manual" | "semi" | "full"), "") => ("approvals.preset".to_string(), p),
             ("off", "") => ("approvals.preset".into(), "full"),
             ("on", "") => ("approvals.preset".into(), "manual"),
+            ("forget", n) if until.is_empty() => return self.forget_target(n, channel),
             (class @ ("messages" | "posts" | "money" | "facts"), mode) if !mode.is_empty() => {
                 (format!("approvals.{class}"), mode)
             }
@@ -2572,6 +2573,39 @@ impl<'a> Router<'a> {
             true => format!("{reply}\n{}", shown(&self.cfg)),
             false => reply,
         }
+    }
+
+    /// `/approvals forget N` (DESIGN §4.16): forgets remembered target `N`, so under `ask-new`
+    /// a call to it waits again. It only makes the gate stricter, so any owner channel may.
+    fn forget_target(&self, n: &str, channel: &str) -> String {
+        let Some(n) = n.parse::<i64>().ok().filter(|n| *n > 0) else {
+            return APPROVALS_USAGE.into();
+        };
+        let (class, target) = match self.store.forget_target(n) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                return format!("[zephyr] no remembered target #{n}; /activity grants lists them")
+            }
+            Err(e) => return format!("[zephyr] forgetting #{n} failed: {e}"),
+        };
+        let what = match class.as_str() {
+            "messages" => "a message",
+            "posts" => "a post",
+            _ => "a payment",
+        };
+        let mut reply = format!(
+            "[zephyr] forgot {target} for {class}; under ask-new {what} to it waits for you again"
+        );
+        let key = format!("approvals.known.{class}");
+        let logged =
+            self.store
+                .log_setting(&key, Some(&target), None, "owner", Some(channel), None);
+        if let Err(e) = logged {
+            reply.push_str(&format!(
+                "\n[zephyr] recording it in the activity failed: {e}"
+            ));
+        }
+        reply
     }
 
     /// `/settings [SECTION|KEY]`: the values in effect and where each came from.

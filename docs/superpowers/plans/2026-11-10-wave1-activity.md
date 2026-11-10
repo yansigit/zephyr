@@ -175,16 +175,19 @@ Deviation: the router test seeds its finished task and job run (a disabled job) 
 - Lines (text after `·` is `revoke`): `{class} {target}, known since {MM-DD} · /approvals forget {n}`; `{key} until {WHEN}, then {value|none} · /set {key} {value|none}`; for `approvals.preset`, `then {snapshot}` and revoke `/set approvals.preset {first item, default → none}`; `job #{id} {name}, {schedule}, to {channel} · /job rm {id}`. Targets, names and values go through `Scrub::text` and `one_line(…, 200)`. Subject: the class, the key, `#id`. Empty view: `[zephyr] no standing grants`.
 - `/approvals forget N` (any owner channel): `N` a positive `i64`, else `APPROVALS_USAGE`; logs `log_setting("approvals.known.<class>", Some(target), None, "owner", Some(channel), None)`; a failed log still forgets and appends `\n[zephyr] recording it in the activity failed: {e}`. `APPROVALS_USAGE` gains `, /approvals forget N`.
 
-- [ ] **Step 1: Write the failing tests.**
+- [x] **Step 1: Write the failing tests.**
   - `store.rs` `forgetting_a_target_returns_it_once`: remember two; `forget_target(n)` → `Some(("messages", "a@x.org"))`, again → `None`; `all_known` false for it, true for the other.
   - `activity.rs` `grants_list_each_with_its_revoke`: a known target, a revert of `budget.daily_cost_usd` to `5`, an enabled job, a disabled job → spec §4.4's three example lines exactly, no disabled job.
   - `activity.rs` `a_timed_presets_revoke_is_a_working_command` (Review Focus 2): a revert of `approvals.preset` valued `manual; messages=ask` → line contains `then manual; messages=ask`, revoke `/set approvals.preset manual`; valued `default; posts=hold` → revoke `/set approvals.preset none`.
   - router `forgetting_a_known_target_asks_again`: with `preset = "semi"`, `SEND_TO_A`, `/ok 1` (as `once_does_not_remember_and_ok_does`); `/activity grants` lists `messages a@x.org, known since … · /approvals forget 1`; `/approvals forget 1` → `[zephyr] forgot a@x.org for messages; under ask-new a message to it waits for you again`; `/activity setting` shows `approvals.known.messages a@x.org → none`; `SEND_TO_A` again is held (`held for the owner as #`); `/approvals forget 1` → the unknown text; `/approvals forget x` → usage.
-- [ ] **Step 2:** Run them → FAIL.
-- [ ] **Step 3: Implement** the store fns, `activity::grants`, the `grants` arm of `activity::chat`, and the `("forget", n)` arm in `Router::approvals` before the class arm.
-- [ ] **Step 4:** `cargo test -p zephyr` → PASS.
-- [ ] **Step 5:** Docs: DESIGN §4.16 `/approvals forget N` (stricter only, any owner channel, logged in `settings_log`); §4.19 the grants view; README `/approvals forget N` and `/activity grants`.
-- [ ] **Step 6:** Commit `feat(approvals): list every standing grant with what takes it back, and forget a remembered recipient`.
+- [x] **Step 2:** Run them → FAIL.
+- [x] **Step 3: Implement** the store fns, `activity::grants`, the `grants` arm of `activity::chat`, and the `("forget", n)` arm in `Router::approvals` before the class arm.
+- [x] **Step 4:** `cargo test -p zephyr` → PASS.
+- [x] **Step 5:** Docs: DESIGN §4.16 `/approvals forget N` (stricter only, any owner channel, logged in `settings_log`); §4.19 the grants view; README `/approvals forget N` and `/activity grants`.
+- [x] **Step 6:** Commit `feat(approvals): list every standing grant with what takes it back, and forget a remembered recipient`.
+
+Deviation: `/job rm N`, the grants view's revoke for a job, failed with `FOREIGN KEY constraint failed` on any job that had a finished run (the bundled SQLite enforces `runs.job_id REFERENCES jobs(id)`), so the revoke could not work. `Store::remove_job` now lifts `foreign_keys` around its transaction, keeping the job's finished runs (they read `(removed)`, spec §4.2, and keep run ids from being reused); test `store::tests::removing_a_job_that_ran_keeps_its_runs`.
+Deviation: the unit test's lines use rowid 1 and job #1 (spec §4.4's example uses 4 and 3), and a revert's grant `at` is its `since`.
 
 ### Task A4-6: The agent reads `/activity` through `gateway`
 
