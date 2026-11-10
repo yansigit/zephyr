@@ -1565,6 +1565,32 @@ async fn a_restart_between_messages_keeps_the_conversation_clean() {
     gw.shutdown().await;
 }
 
+/// Session ids are `main-<unix seconds>`: two `/new`s in one second still make two
+/// conversations, and the second is clean, not the first one's tainted file reopened.
+#[tokio::test]
+async fn two_news_in_one_second_make_two_clean_conversations() {
+    let home = home("memory-two-news");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "/new").await;
+    gw.wait_replies(1).await;
+    let first = main_id(&home);
+    Store::open(&home.join("state.db"))
+        .unwrap()
+        .taint(&first, "used exec at 00:00")
+        .unwrap();
+    gw.say("m2", "owner", "hi").await; // its file is on disk now
+    gw.wait_replies(2).await;
+    gw.say("m3", "owner", "/new").await;
+    gw.wait_replies(3).await;
+    let second = main_id(&home);
+    assert_ne!(first, second, "a second conversation");
+    let store = Store::open(&home.join("state.db")).unwrap();
+    assert_eq!(store.session_origin(&second).unwrap(), SessionOrigin::Clean);
+    gw.say("m4", "owner", "WRITE_MEMORY likes tea").await;
+    reply_starting(&gw, SAVED).await;
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn new_on_a_session_file_already_there_starts_tainted() {
     let home = home("memory-session-there");

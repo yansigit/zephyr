@@ -3554,7 +3554,7 @@ impl<'a> Router<'a> {
     /// and the rules carry over, since they are files. Long sessions are easier to steer
     /// (ClawSafety Table 3), so the owner can cut one off.
     async fn new_session(&mut self) -> String {
-        let id = format!("{MAIN_SESSION}-{}", crate::now());
+        let id = new_session_id(&self.store, crate::now());
         // Clean from its first message; `/switch` back to an older one never cleans it. A file
         // for the id already there was not rpi's for this conversation.
         if crate::rpc::session_print(&self.cfg.session_dir(), &id) != "none" {
@@ -4426,6 +4426,21 @@ impl<'a> Router<'a> {
 }
 
 /// The first word of `s` and the rest, both trimmed; a line break ends a word too.
+/// The id `/new` gives a conversation: `main-<unix seconds>`, past any id zephyr already gave
+/// one (a `/new` in the same second, or the one in use), so a second `/new` never reopens the
+/// first's file. A file for an id zephyr never gave is not skipped: `new_session` taints it.
+fn new_session_id(store: &Store, now: i64) -> String {
+    let current = store.main_session().ok();
+    let known = |id: &str| {
+        current.as_deref() == Some(id)
+            || !matches!(store.session_origin(id), Ok(SessionOrigin::Unknown))
+    };
+    (now..)
+        .map(|t| format!("{MAIN_SESSION}-{t}"))
+        .find(|id| !known(id))
+        .expect("an unused id")
+}
+
 /// Whether the current run of main is the owner's alone (DESIGN §4.6).
 #[derive(Debug)]
 enum Trust {
@@ -4977,6 +4992,23 @@ mod tests {
             matches!(&r.trust, Trust::Not(why) if why == UNPLACED),
             "{:?}",
             r.trust
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_session_id_skips_every_conversation_zephyr_knows() {
+        let cfg = on_file("router-session-ids", "");
+        let jobs = Default::default();
+        let r = router(&cfg, &jobs);
+        assert_eq!(new_session_id(&r.store, 100), "main-100");
+        r.store.mark_clean("main-100").unwrap();
+        r.store.taint("main-101", "used exec at 00:00").unwrap();
+        assert_eq!(new_session_id(&r.store, 100), "main-102");
+        r.store.set_main_session("main-102").unwrap();
+        assert_eq!(
+            new_session_id(&r.store, 100),
+            "main-103",
+            "nor the current one"
         );
     }
 }
