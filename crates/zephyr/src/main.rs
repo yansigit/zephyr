@@ -61,6 +61,10 @@ async fn zephyr_main() -> ExitCode {
     if cmd == "__file" {
         return file_cmd(&args.collect::<Vec<_>>());
     }
+    // Run as the agent, which cannot read the config: what its uid can reach (DESIGN §4.19).
+    if cmd == "__netcheck" {
+        return zephyr::egress::netcheck(&args.collect::<Vec<_>>());
+    }
     // Before the config: it only starts `zephyr run`, which reads it (and secrets.env) itself.
     if cmd == "supervise" {
         return zephyr::supervise::main().await;
@@ -194,6 +198,10 @@ async fn run(cfg: Config, from_file: &[String]) -> anyhow::Result<()> {
         anyhow::bail!(
             "refusing to run as root without ZEPHYR_AGENT_UID and ZEPHYR_AGENT_GID: the agent would run as root"
         );
+    }
+    if zephyr::egress::bridge() {
+        // Before anything is started for the agent: without the floor it does not run.
+        zephyr::egress::verify().await?;
     }
     let _lock = lock_home(cfg.state_dir())?;
     let mut channels = vec![AnyChannel::Chat(ChatChannel::new(cfg.socket_path()))];

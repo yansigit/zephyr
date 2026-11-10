@@ -578,6 +578,136 @@ async fn forward(
     Ok(sender.send_request(req).await?.map(BodyExt::boxed))
 }
 
+/// The rules that leave the agent's uid no route but its own loopback (DESIGN §4.19). The jump
+/// is on the agent's uid, so a packet with no socket (a kernel reset) falls through to accept;
+/// TCP is reset, so a connect fails at once instead of timing out; and there is no port list,
+/// because nothing of root's listens on loopback but the proxy.
+pub fn ruleset(agent_uid: u32) -> String {
+    format!(
+        "\
+table inet zephyr
+delete table inet zephyr
+table inet zephyr {{
+  chain output {{
+    type filter hook output priority filter; policy accept;
+    meta skuid {agent_uid} jump agent
+  }}
+  chain agent {{
+    ct state established accept           # replies on connections made to the agent (x11vnc, a dev server the owner opens)
+    ip daddr 127.0.0.11 reject            # Docker's embedded DNS: the agent gets no resolver
+    ip daddr 127.0.0.0/8 accept           # its own servers, and the proxy at 127.0.0.1:7792
+    ip6 daddr ::1 accept
+    meta l4proto tcp reject with tcp reset
+    reject with icmpx admin-prohibited
+  }}
+}}
+"
+    )
+}
+
+/// Loads the rules for the agent's uid (`ZEPHYR_AGENT_UID`) with root's own `nft`. `supervise`
+/// runs this once, before the first daemon: a container start is a fresh network namespace.
+pub fn load_floor() -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let uid = std::env::var("ZEPHYR_AGENT_UID").context("ZEPHYR_AGENT_UID is not set")?;
+    let uid: u32 = uid.parse().context("ZEPHYR_AGENT_UID is not a uid")?;
+    anyhow::ensure!(uid != 0, "ZEPHYR_AGENT_UID is root's");
+    let mut nft = Command::new("/usr/sbin/nft")
+        .args(["-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running /usr/sbin/nft")?;
+    let mut stdin = nft.stdin.take().context("nft's stdin")?;
+    stdin.write_all(ruleset(uid).as_bytes())?;
+    drop(stdin);
+    let out = nft.wait_with_output()?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    anyhow::ensure!(out.status.success(), "nft: {}", said.trim());
+    Ok(())
+}
+
+/// CAP_NET_ADMIN's number (linux/capability.h).
+const NET_ADMIN: u32 = 12;
+
+/// Drops NET_ADMIN from the calling thread's bounding set, so what it then executes as root
+/// cannot change the rules. For `pre_exec`: one syscall, nothing allocated.
+pub fn drop_net_admin() -> std::io::Result<()> {
+    // SAFETY: a plain syscall with integer arguments.
+    match unsafe { libc::prctl(libc::PR_CAPBSET_DROP, NET_ADMIN as libc::c_ulong, 0, 0, 0) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// Whether the process whose `/proc/<pid>/status` this is holds NET_ADMIN; `None` when the
+/// text does not say.
+fn net_admin(status: &str) -> Option<bool> {
+    let line = status.lines().find_map(|l| l.strip_prefix("CapEff:"))?;
+    let caps = u64::from_str_radix(line.trim(), 16).ok()?;
+    Some(caps >> NET_ADMIN & 1 == 1)
+}
+
+/// `Ok` only when a direct connection to `addr` is refused within `wait`, as the rules refuse
+/// the agent's. A connection, a timeout or an unreachable network all mean they are missing.
+pub fn direct_refused(addr: SocketAddr, wait: Duration) -> Result<(), String> {
+    match std::net::TcpStream::connect_timeout(&addr, wait) {
+        Ok(_) => Err(format!("connected to {addr}")),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => Ok(()),
+        Err(e) => Err(format!("{addr}: {e}")),
+    }
+}
+
+/// `zephyr __netcheck`: what the agent's uid can reach, one `ok|fail|warn <what>` line per check.
+/// Run as the agent, by the daemon at start and by `doctor`. Fails when any check does.
+pub fn netcheck(_args: &[String]) -> std::process::ExitCode {
+    let public: SocketAddr = (Ipv4Addr::new(1, 1, 1, 1), 443).into();
+    let checks = [(
+        "a direct connection to the internet is refused",
+        direct_refused(public, Duration::from_secs(2)),
+    )];
+    let mut code = std::process::ExitCode::SUCCESS;
+    for (what, result) in checks {
+        match result {
+            Ok(()) => println!("ok {what}"),
+            Err(e) => {
+                println!("fail {what}: {e}");
+                code = std::process::ExitCode::FAILURE;
+            }
+        }
+    }
+    code
+}
+
+/// Proves the floor before the daemon starts anything for the agent, in bridge mode: the
+/// container has an address of its own, the daemon cannot change the rules, and a process run
+/// as the agent is refused a direct connection.
+pub async fn verify() -> anyhow::Result<()> {
+    own_ip()?;
+    let status = std::fs::read_to_string("/proc/self/status").context("/proc/self/status")?;
+    // Dropping a capability from the bounding set does not take one already inherited.
+    anyhow::ensure!(
+        net_admin(&status) == Some(false),
+        "the daemon still holds NET_ADMIN"
+    );
+    let mut check = std::process::Command::new("/usr/local/bin/zephyr");
+    crate::agent::cmd(&mut check).arg("__netcheck");
+    let mut check = tokio::process::Command::from(check);
+    let out = tokio::time::timeout(Duration::from_secs(5), check.kill_on_drop(true).output())
+        .await
+        .context("the network floor check did not finish")?
+        .context("running the network floor check")?;
+    let said = String::from_utf8_lossy(&out.stdout);
+    anyhow::ensure!(
+        out.status.success(),
+        "the network floor is not in place: {}",
+        said.trim()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1181,5 +1311,52 @@ mod tests {
         assert_eq!(listen_addr(addr).unwrap(), addr);
         let tailnet: SocketAddr = "100.64.0.1:7791".parse().unwrap();
         assert_eq!(listen_addr(tailnet).unwrap(), tailnet);
+    }
+
+    #[test]
+    fn ruleset_matches_the_golden_text() {
+        let golden = "\
+table inet zephyr
+delete table inet zephyr
+table inet zephyr {
+  chain output {
+    type filter hook output priority filter; policy accept;
+    meta skuid 1000 jump agent
+  }
+  chain agent {
+    ct state established accept           # replies on connections made to the agent (x11vnc, a dev server the owner opens)
+    ip daddr 127.0.0.11 reject            # Docker's embedded DNS: the agent gets no resolver
+    ip daddr 127.0.0.0/8 accept           # its own servers, and the proxy at 127.0.0.1:7792
+    ip6 daddr ::1 accept
+    meta l4proto tcp reject with tcp reset
+    reject with icmpx admin-prohibited
+  }
+}
+";
+        assert_eq!(ruleset(1000), golden);
+        assert!(ruleset(4242).contains("    meta skuid 4242 jump agent\n"));
+    }
+
+    #[test]
+    fn direct_refused_accepts_only_a_refusal() {
+        let wait = Duration::from_secs(2);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let e = direct_refused(addr, wait).unwrap_err();
+        assert!(e.contains("connected"), "{e}");
+        drop(listener);
+        assert_eq!(direct_refused(addr, wait), Ok(()));
+    }
+
+    #[test]
+    fn net_admin_is_read_from_the_effective_set() {
+        // Docker's default set, and the same with NET_ADMIN (bit 12) added.
+        let status = |eff: &str| {
+            format!("Name:\tzephyr\nCapPrm:\t00000000a80435fb\nCapEff:\t{eff}\nCapBnd:\t0\n")
+        };
+        assert_eq!(net_admin(&status("00000000a80425fb")), Some(false));
+        assert_eq!(net_admin(&status("00000000a80435fb")), Some(true));
+        assert_eq!(net_admin("Name:\tzephyr\n"), None);
+        assert_eq!(net_admin("CapEff:\tnonsense\n"), None);
     }
 }

@@ -196,13 +196,15 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
 - `netcheck` with no argument runs probe (a) only: `direct_refused(1.1.1.1:443, 2 s)`. A connection, a timeout or `ENETUNREACH` is `fail`. A2-6 adds probes (b) to (d) when an address is given.
 - `verify` runs `own_ip()?`. It checks that `/proc/self/status` `CapEff` has bit 12 clear (`the daemon still holds NET_ADMIN`). PR_CAPBSET_DROP does not clear an inherited capability, so this is the check that proves the drop. Then it runs `agent::cmd(Command::new("/usr/local/bin/zephyr")).arg("__netcheck")`, which must exit 0 within 5 s. `main.rs` `run` calls it right after the root/uid check when `bridge()`, so a failure exits non-zero before any agent process starts. `__netcheck` is dispatched before the config is read: the agent cannot read the config.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `ruleset_matches_the_golden_text`: `ruleset(1000)` equals the spec §4.3 block verbatim, with its comments.
   - `direct_refused_accepts_only_a_refusal`: a just-closed local port gives Ok, and a listening `127.0.0.1:0` gives `Err` containing `connected`.
   - In `supervise.rs`, `a_floor_that_fails_to_load_never_starts_the_daemon`: `Policy { floor: Some(|| anyhow::bail!("nft: no")), ..quick() }` makes `run` return 1, and `counted`'s start count is 0.
-- [ ] **Step 2:** Run → FAIL. **Step 3:** Implement. Add `nftables` to the Dockerfile. **Step 4:** `cargo test -p zephyr --lib -- egress supervise` → PASS, then `cargo test -p zephyr`.
-- [ ] **Step 5: Docs.** DESIGN §4.4 item 1 "Network": the bridge network named after the container, `--hostname zephyr`, and `NET_ADMIN`, used once by `supervise` and dropped from the bounding set (the daemon checks `CapEff`). Only the attach port and the webhook are published, on host loopback. Point to §4.19. §4.11: the container has its own netns, so `@/tmp/.X11-unix/X99` is no longer the host's. The cookie stays.
-- [ ] **Step 6:** Commit `feat(supervise): load the agent's network floor before the daemon starts, and refuse to run without it`.
+- [x] **Step 2:** Run → FAIL. **Step 3:** Implement. Add `nftables` to the Dockerfile. **Step 4:** `cargo test -p zephyr --lib -- egress supervise` → PASS, then `cargo test -p zephyr`.
+- [x] **Step 5: Docs.** DESIGN §4.4 item 1 "Network": the bridge network named after the container, `--hostname zephyr`, and `NET_ADMIN`, used once by `supervise` and dropped from the bounding set (the daemon checks `CapEff`). Only the attach port and the webhook are published, on host loopback. Point to §4.19. §4.11: the container has its own netns, so `@/tmp/.X11-unix/X99` is no longer the host's. The cookie stays.
+- [x] **Step 6:** Commit `feat(supervise): load the agent's network floor before the daemon starts, and refuse to run without it`.
+- Deviation: `load_floor` only loads the rules; NET_ADMIN is dropped by `egress::drop_net_admin` in the daemon command `pre_exec`, between fork and exec. `PR_CAPBSET_DROP` changes one thread, and `supervise` runs on a multi-thread runtime, so a drop inside `load_floor` could miss the thread that later forks the daemon. `supervise` itself keeps the capability; it starts nothing but the daemon. `verify` still proves the result through `CapEff`.
+- Deviation: `verify` is async (`tokio::process` with a 5 s timeout), since `run` calls it on the runtime. A pure `net_admin(status)` reads `CapEff` and has its own test.
 
 ### Task A2-6: `doctor` proves the floor
 
