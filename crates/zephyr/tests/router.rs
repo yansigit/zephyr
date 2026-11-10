@@ -947,7 +947,7 @@ async fn a_memory_edit_waits_for_the_owner_who_sees_its_diff() {
     let replies = gw.wait_replies(2).await;
     assert_eq!(replies[0], "echo: [chat #1] WRITE_MEMORY likes tea");
     assert!(
-        replies[1].starts_with("[zephyr] memory change waiting; /memory ok keeps it")
+        replies[1].starts_with("[zephyr] memory change waiting (from a conversation from before zephyr kept track; /new starts a clean one); /memory ok keeps it")
             && replies[1].ends_with("+ remembered: [chat #1] WRITE_MEMORY likes tea"),
         "{}",
         replies[1]
@@ -1108,6 +1108,15 @@ async fn a_job_run_commits_its_memory_edits() {
     );
     let memory = std::fs::read_to_string(home.join("memory/MEMORY.md")).unwrap();
     assert!(memory.contains("remembered: say: WRITE_MEMORY nightly note"));
+    let commits = Store::open(&home.join("state.db"))
+        .unwrap()
+        .memory_commits_since(0)
+        .unwrap();
+    let last = commits.last().unwrap();
+    assert_eq!(
+        (last.origin.as_str(), last.auto),
+        ("job #1 (mem) run 1", false)
+    );
     gw.shutdown().await;
 }
 

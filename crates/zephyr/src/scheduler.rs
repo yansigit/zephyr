@@ -252,12 +252,13 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
             let (status, output, crossed) = execute(&cfg, &mut store, &spec).await;
             wake.running.store(false, Ordering::SeqCst);
             // The run's memory edits are committed as main's settle would commit them.
-            let memory = crate::memory::commit(&cfg.home, cfg.state_dir())
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("zephyr: memory commit failed: {e:#}");
-                    None
-                });
+            let origin = crate::memory::Origin::Job {
+                id: run.job.id,
+                run: run.id,
+                name: run.job.name.clone(),
+            };
+            let done = crate::memory::commit(&cfg.home, cfg.state_dir(), origin).await;
+            let memory = crate::memory::recorded(&store, done);
             let delivery = (output.trim() != SILENT).then_some(output.as_str());
             if let Err(e) = store.finish_run(&run, status, &output, delivery, crate::now()) {
                 eprintln!("zephyr: recording job run {} failed: {e}", run.id);

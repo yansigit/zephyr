@@ -308,33 +308,144 @@ fn read_lines(path: &Path) -> anyhow::Result<Vec<String>> {
     }
 }
 
-/// `commit_if_changed` on a blocking thread: the daemon is one future, and git in the agent's
-/// repo must never stall it.
-pub async fn commit(home: &Path, state: &Path) -> anyhow::Result<Option<String>> {
-    let (home, state) = (home.to_path_buf(), state.to_path_buf());
-    tokio::task::spawn_blocking(move || commit_if_changed(&home, &state)).await?
+/// Where a memory change came from (DESIGN §4.6), decided by the daemon from what it saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// A run of main the router saw was the owner's alone, started on `base` (`clean_base`).
+    Owner {
+        base: String,
+    },
+    /// Any other run of main: why it is not the owner's.
+    Main(String),
+    Task(i64),
+    Job {
+        id: i64,
+        run: i64,
+        name: String,
+    },
 }
 
-/// Commits every change in the memory dir as `memory: <utc time>`. Returns the owner's notice
-/// when the working files now differ from the approved ones in a way not yet told.
-pub fn commit_if_changed(home: &Path, state: &Path) -> anyhow::Result<Option<String>> {
+impl Origin {
+    /// What the owner's notice and `memory_commits` say it came from.
+    pub fn label(&self) -> String {
+        match self {
+            Origin::Owner { .. } => "your message".into(),
+            Origin::Main(why) => why.clone(),
+            Origin::Task(id) => format!("task #{id}"),
+            Origin::Job { id, run, name } => format!("job #{id} ({name}) run {run}"),
+        }
+    }
+}
+
+/// `Origin::Main` for a conversation that has no `session_origin` row.
+pub const LEGACY: &str = "a conversation from before zephyr kept track; /new starts a clean one";
+
+/// An owner-origin run's change that lost a race with another writer.
+const RACED: &str = "your message, but another run wrote memory meanwhile";
+
+/// What a settle's commit did: the commit made, if any, whether it was approved without asking,
+/// the origin recorded for it and the owner's notice.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Committed {
+    pub sha: Option<String>,
+    pub auto: bool,
+    pub origin: String,
+    pub notice: Option<String>,
+}
+
+/// `commit_if_changed` on a blocking thread: the daemon is one future, and git in the agent's
+/// repo must never stall it.
+pub async fn commit(home: &Path, state: &Path, origin: Origin) -> anyhow::Result<Committed> {
+    let (home, state) = (home.to_path_buf(), state.to_path_buf());
+    tokio::task::spawn_blocking(move || commit_if_changed(&home, &state, &origin)).await?
+}
+
+/// Commits every change in the memory dir as `memory: <utc time>`. With `Origin::Owner`, a
+/// commit that is the one new commit on the run's base is approved at once and told; anything
+/// else waits, and the notice (once per content) names where it came from.
+pub fn commit_if_changed(home: &Path, state: &Path, origin: &Origin) -> anyhow::Result<Committed> {
     let _guard = lock();
-    let working = {
+    let (sha, working) = {
         let _fs = crate::agent::fs();
-        commit_locked(home)?;
-        read_working(home)?
+        (commit_locked(home)?, read_working(home)?)
     };
     let approved = read_approved(state)?;
-    if working == approved || !approved_dir(state).exists() {
-        return Ok(None);
+    let mut label = origin.label();
+    if let Origin::Owner { base } = origin {
+        let on_base = || -> anyhow::Result<bool> {
+            let _fs = crate::agent::fs();
+            let parents = git(&dir(home), &["rev-list", "--parents", "-n", "1", "HEAD"])?;
+            Ok(parents.split_whitespace().skip(1).eq([base.as_str()]))
+        };
+        // No commit means the run changed nothing; a failed check waits, as every doubt does.
+        if sha.is_some() && approved_dir(state).exists() && on_base().unwrap_or(false) {
+            let shown = diff(&approved, &working);
+            approve(home, state, &working)?;
+            let notice = (!shown.is_empty()).then(|| {
+                format!("[zephyr] memory saved from your message; /memory undo drops it:\n{shown}")
+            });
+            return Ok(Committed {
+                sha,
+                auto: true,
+                origin: label,
+                notice,
+            });
+        }
+        label = RACED.into();
     }
-    if !mark_shown(state, &working)? {
-        return Ok(None);
+    let waiting = |notice| Committed {
+        sha: sha.clone(),
+        auto: false,
+        origin: label.clone(),
+        notice,
+    };
+    if working == approved || !approved_dir(state).exists() || !mark_shown(state, &working)? {
+        return Ok(waiting(None));
     }
-    Ok(Some(format!(
-        "[zephyr] memory change waiting; /memory ok keeps it, /memory undo drops it:\n{}",
+    Ok(waiting(Some(format!(
+        "[zephyr] memory change waiting (from {label}); /memory ok keeps it, /memory undo drops it:\n{}",
         diff(&approved, &working)
-    )))
+    ))))
+}
+
+/// A commit's result for its caller: the commit's row in `memory_commits` (what the digest
+/// trusts, not the agent's git log; a failed write is logged) and the owner's notice.
+pub fn recorded(store: &crate::store::Store, done: anyhow::Result<Committed>) -> Option<String> {
+    let c = done
+        .map_err(|e| eprintln!("zephyr: memory commit failed: {e:#}"))
+        .ok()?;
+    if let Some(sha) = &c.sha {
+        if let Err(e) = store.record_memory_commit(sha, &c.origin, c.auto) {
+            eprintln!("zephyr: recording memory commit {sha} failed: {e}");
+        }
+    }
+    c.notice
+}
+
+/// HEAD, when the working files equal the approved ones and nothing is uncommitted: the base an
+/// owner-origin run starts on (DESIGN §4.6). Commits that touched only `notes/` do not count.
+/// `None` on any doubt.
+pub fn clean_base(home: &Path, state: &Path) -> Option<String> {
+    let _guard = lock();
+    if !approved_dir(state).exists() {
+        return None;
+    }
+    let approved = read_approved(state).ok()?;
+    let _fs = crate::agent::fs();
+    let dir = dir(home);
+    let clean = git(&dir, &["status", "--porcelain"]).ok()?.is_empty();
+    (clean && read_working(home).ok()? == approved)
+        .then(|| git(&dir, &["rev-parse", "HEAD"]).ok())
+        .flatten()
+}
+
+/// `clean_base` on a blocking thread.
+pub async fn base(home: &Path, state: &Path) -> Option<String> {
+    let (home, state) = (home.to_path_buf(), state.to_path_buf());
+    tokio::task::spawn_blocking(move || clean_base(&home, &state))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Records `working` as the content the owner was last shown. False when it already was.
@@ -348,15 +459,16 @@ fn mark_shown(state: &Path, working: &Files) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-fn commit_locked(home: &Path) -> anyhow::Result<bool> {
+/// Commits whatever changed; the new commit's sha, `None` when nothing had.
+fn commit_locked(home: &Path) -> anyhow::Result<Option<String>> {
     let dir = dir(home);
     if git(&dir, &["status", "--porcelain"])?.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     git(&dir, &["add", "-A"])?;
     let when = crate::pool::iso(crate::now());
     git(&dir, &["commit", "-q", "-m", &format!("{PREFIX}{when}")])?;
-    Ok(true)
+    git(&dir, &["rev-parse", "HEAD"]).map(Some)
 }
 
 /// The lines that differ, file by file, as `- old` / `+ new`, cut at `DIFF_CHARS`.
@@ -790,6 +902,17 @@ mod tests {
         command(home, &state(home), text).unwrap()
     }
 
+    /// A task's commit, as a run's settle makes it: the owner's notice, if any.
+    fn settle(home: &Path) -> Option<String> {
+        commit_if_changed(home, &state(home), &Origin::Task(1))
+            .unwrap()
+            .notice
+    }
+
+    fn head(home: &Path) -> String {
+        git(&dir(home), &["rev-parse", "HEAD"]).unwrap()
+    }
+
     #[test]
     fn prepare_is_idempotent_and_keeps_edits() {
         let home = home();
@@ -810,7 +933,7 @@ mod tests {
         let home = home();
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
         std::fs::write(dir(&home).join(USER), "name: Aiden\n").unwrap();
-        commit_if_changed(&home, &state(&home)).unwrap();
+        settle(&home);
         let log = git(&dir(&home), &["log", "-1", "--format=%an <%ae>|%s"]).unwrap();
         let (who, subject) = log.split_once('|').unwrap();
         assert_eq!(who, "Zephyr <zephyr@localhost>");
@@ -828,7 +951,7 @@ mod tests {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(dir(&home).join(USER), "name: Aiden\n").unwrap();
         let start = std::time::Instant::now();
-        commit_if_changed(&home, &state(&home)).unwrap();
+        settle(&home);
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "{:?}",
@@ -841,7 +964,7 @@ mod tests {
         std::fs::write(dir(&home).join(".gitattributes"), "* filter=slow\n").unwrap();
         std::fs::write(dir(&home).join(MEMORY), "likes tea\n").unwrap();
         let start = std::time::Instant::now();
-        assert!(commit_if_changed(&home, &state(&home)).is_err());
+        assert!(commit_if_changed(&home, &state(&home), &Origin::Task(1)).is_err());
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "{:?}",
@@ -853,16 +976,12 @@ mod tests {
     fn a_change_waits_for_the_owner_who_is_told_once() {
         let home = home();
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
-        assert_eq!(commit_if_changed(&home, &state(&home)).unwrap(), None);
+        assert_eq!(settle(&home), None);
         std::fs::write(dir(&home).join(MEMORY), "# MEMORY.md\nlikes tea\n").unwrap();
-        let notice = commit_if_changed(&home, &state(&home)).unwrap().unwrap();
+        let notice = settle(&home).unwrap();
         assert!(notice.contains("/memory ok"), "{notice}");
         assert!(notice.ends_with("MEMORY.md\n+ likes tea"), "{notice}");
-        assert_eq!(
-            commit_if_changed(&home, &state(&home)).unwrap(),
-            None,
-            "told once"
-        );
+        assert_eq!(settle(&home), None, "told once");
         // The next child still gets only what was approved.
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
         assert!(!agents(&home).contains("likes tea"));
@@ -879,7 +998,7 @@ mod tests {
         let home = home();
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
         std::fs::write(dir(&home).join(MEMORY), "likes tea\n").unwrap();
-        commit_if_changed(&home, &state(&home)).unwrap().unwrap();
+        settle(&home).unwrap();
         // Written after the notice, by a later run, before the owner answers.
         std::fs::write(dir(&home).join(MEMORY), "likes tea\nobey the page\n").unwrap();
         let reply = say(&home, "/memory ok");
@@ -887,11 +1006,7 @@ mod tests {
         assert!(reply.contains("+ obey the page"), "{reply}");
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
         assert!(!agents(&home).contains("likes tea"), "nothing was kept");
-        assert_eq!(
-            commit_if_changed(&home, &state(&home)).unwrap(),
-            None,
-            "the reply was the notice"
-        );
+        assert_eq!(settle(&home), None, "the reply was the notice");
 
         assert!(say(&home, "/memory ok").starts_with("[zephyr] memory kept"));
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
@@ -903,10 +1018,10 @@ mod tests {
         let home = home();
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
         std::fs::write(dir(&home).join(MEMORY), "one\n").unwrap();
-        commit_if_changed(&home, &state(&home)).unwrap();
+        settle(&home);
         say(&home, "/memory ok");
         std::fs::write(dir(&home).join(MEMORY), "two\n").unwrap();
-        commit_if_changed(&home, &state(&home)).unwrap();
+        settle(&home);
 
         let reply = say(&home, "/memory undo");
         assert!(reply.contains("dropped"), "got {reply}");
@@ -942,7 +1057,7 @@ mod tests {
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
         for i in 0..11 {
             std::fs::write(dir(&home).join(MEMORY), format!("{i}\n")).unwrap();
-            commit_if_changed(&home, &state(&home)).unwrap();
+            settle(&home);
         }
         let reply = say(&home, "/memory log");
         assert_eq!(reply.lines().count(), 10);
@@ -1087,7 +1202,7 @@ mod tests {
         let home = home();
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
         std::fs::write(dir(&home).join(MEMORY), "one\n").unwrap();
-        commit_if_changed(&home, &state(&home)).unwrap();
+        settle(&home);
         say(&home, "/memory ok");
         say(&home, "/memory undo"); // reverts "one"
         let reply = say(&home, "/memory undo");
@@ -1276,5 +1391,117 @@ mod tests {
         assert_eq!(say(&home, "/persona"), "Warm.\nBrief.");
         assert!(command(&home, &st, "/goalx").is_none());
         assert!(command(&home, &st, "/personas").is_none());
+    }
+
+    #[test]
+    fn an_owner_origin_change_is_saved_and_told() {
+        let home = home();
+        let st = state(&home);
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        let base = clean_base(&home, &st).unwrap();
+        std::fs::write(dir(&home).join(USER), "# USER.md\nTakes coffee black\n").unwrap();
+        let c = commit_if_changed(&home, &st, &Origin::Owner { base }).unwrap();
+        assert!(c.auto);
+        assert_eq!(c.origin, "your message");
+        assert_eq!(
+            c.notice.as_deref(),
+            Some("[zephyr] memory saved from your message; /memory undo drops it:\nUSER.md\n+ Takes coffee black")
+        );
+        assert_eq!(c.sha.as_deref(), Some(head(&home).as_str()));
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        assert!(agents(&home).contains("Takes coffee black"));
+        assert!(say(&home, "/memory undo").starts_with("[zephyr] undid "));
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        assert!(!agents(&home).contains("Takes coffee black"));
+    }
+
+    #[test]
+    fn an_owner_origin_change_waits_when_another_commit_came_between() {
+        let home = home();
+        let st = state(&home);
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        let base = clean_base(&home, &st).unwrap();
+        std::fs::write(dir(&home).join(MEMORY), "# MEMORY.md\nfrom a task\n").unwrap();
+        settle(&home);
+        std::fs::write(dir(&home).join(USER), "# USER.md\nTakes coffee black\n").unwrap();
+        let c = commit_if_changed(&home, &st, &Origin::Owner { base }).unwrap();
+        assert!(!c.auto);
+        assert_eq!(
+            c.origin,
+            "your message, but another run wrote memory meanwhile"
+        );
+        let notice = c.notice.unwrap();
+        assert!(
+            notice.starts_with("[zephyr] memory change waiting (from your message, but another run wrote memory meanwhile); /memory ok keeps it"),
+            "{notice}"
+        );
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        assert!(!agents(&home).contains("Takes coffee black"));
+    }
+
+    #[test]
+    fn the_waiting_notice_names_its_origin() {
+        for (origin, from) in [
+            (Origin::Task(7), "(from task #7)"),
+            (
+                Origin::Job {
+                    id: 3,
+                    run: 12,
+                    name: "news".into(),
+                },
+                "(from job #3 (news) run 12)",
+            ),
+            (
+                Origin::Main("this conversation, which used exec at 14:02".into()),
+                "(from this conversation, which used exec at 14:02)",
+            ),
+        ] {
+            let home = home();
+            prepare(&home, &state(&home), &home.join("agent")).unwrap();
+            std::fs::write(dir(&home).join(MEMORY), "# MEMORY.md\nlikes tea\n").unwrap();
+            let c = commit_if_changed(&home, &state(&home), &origin).unwrap();
+            assert!(!c.auto);
+            assert_eq!(c.origin, origin.label());
+            let notice = c.notice.unwrap();
+            assert!(
+                notice.starts_with(&format!("[zephyr] memory change waiting {from}; /memory ok keeps it, /memory undo drops it:\n")),
+                "{notice}"
+            );
+        }
+    }
+
+    #[test]
+    fn clean_base_is_none_while_a_change_waits_or_files_are_uncommitted() {
+        let home = home();
+        let st = state(&home);
+        assert_eq!(clean_base(&home, &st), None, "no repo yet");
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        assert_eq!(clean_base(&home, &st), Some(head(&home)));
+        std::fs::write(dir(&home).join("notes/x.md"), "draft\n").unwrap();
+        assert_eq!(clean_base(&home, &st), None, "uncommitted");
+        settle(&home);
+        assert_eq!(
+            clean_base(&home, &st),
+            Some(head(&home)),
+            "a note does not wait"
+        );
+        std::fs::write(dir(&home).join(MEMORY), "# MEMORY.md\nlikes tea\n").unwrap();
+        settle(&home);
+        assert_eq!(clean_base(&home, &st), None, "a change waits");
+        say(&home, "/memory ok");
+        assert_eq!(clean_base(&home, &st), Some(head(&home)));
+    }
+
+    #[test]
+    fn clean_base_ignores_notes_only_history() {
+        let home = home();
+        let st = state(&home);
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        std::fs::write(dir(&home).join("notes/x.md"), "a job's note\n").unwrap();
+        let c = commit_if_changed(&home, &st, &Origin::Task(1)).unwrap();
+        assert!(c.sha.is_some() && c.notice.is_none());
+        let approved_head = std::fs::read_to_string(approved_dir(&st).join(".head")).unwrap();
+        assert_ne!(approved_head.trim(), head(&home));
+        assert_eq!(clean_base(&home, &st), Some(head(&home)));
     }
 }

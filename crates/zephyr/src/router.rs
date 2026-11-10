@@ -1966,12 +1966,9 @@ impl<'a> Router<'a> {
         // Before reconcile dispatches the next row, so that row runs on the new model.
         self.apply_model().await;
         self.backoff = FIRST_BACKOFF;
-        let memory = crate::memory::commit(&self.cfg.home, self.cfg.state_dir())
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("zephyr: memory commit failed: {e:#}");
-                None
-            });
+        let origin = crate::memory::Origin::Main(crate::memory::LEGACY.into());
+        let done = crate::memory::commit(&self.cfg.home, self.cfg.state_dir(), origin).await;
+        let memory = crate::memory::recorded(&self.store, done);
         let tally = std::mem::take(&mut self.tally);
         let crossed = self.record_spend(tally.used).unwrap_or_else(|e| {
             eprintln!("zephyr: recording spend failed: {e:#}");
