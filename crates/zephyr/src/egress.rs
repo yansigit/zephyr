@@ -72,7 +72,12 @@ const LISTENERS: &[Listener] = &[
     ("imessage.listen", |c| {
         c.imessage.as_ref().map(|i| i.listen.port())
     }),
+    // The web app (DESIGN §4.3.3): `tailscale serve` on the host forwards to this one.
+    ("web.port", |c| c.web.as_ref().map(|w| w.port)),
 ];
+
+/// `[web] port` when the table names only its host.
+const WEB_PORT: &str = "7793";
 
 /// The ports `cfg` has the daemon listen on, by key.
 pub fn published(cfg: &Config) -> Vec<(&'static str, u16)> {
@@ -84,7 +89,9 @@ pub fn published(cfg: &Config) -> Vec<(&'static str, u16)> {
 /// with one. The host reads the file this way, so a key this build does not know cannot stop it.
 pub fn published_from(get: impl Fn(&str) -> Option<String>) -> Vec<(&'static str, u16)> {
     let port = |(key, _): &Listener| {
-        let value = get(key)?;
+        // The one port with a default: `[web]` listens once it has a host.
+        let default = (*key == "web.port" && get("web.host").is_some()).then(|| WEB_PORT.into());
+        let value = get(key).or(default)?;
         let port = value.parse().ok();
         let port = port.or_else(|| Some(value.parse::<SocketAddr>().ok()?.port()));
         port.map(|p| (*key, p))
@@ -1907,6 +1914,26 @@ mod tests {
         );
         let bare: Config = toml::from_str("rpi = '/r'\nhome = '/h'\n").unwrap();
         assert_eq!(published(&bare), []);
+    }
+
+    #[test]
+    fn the_web_app_is_a_published_listener() {
+        let text = "rpi = '/r'\nhome = '/h'\n[web]\nhost = 'box.ts.net'\n";
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(published(&cfg), [("web.port", 7793)]);
+        let moved: Config = toml::from_str(&format!("{text}port = 8000\n")).unwrap();
+        assert_eq!(published(&moved), [("web.port", 8000)]);
+        // From the file's text: the default port when `[web]` names only its host.
+        let file = |port: Option<&'static str>| {
+            move |key: &str| match key {
+                "web.host" => Some("box.ts.net".to_string()),
+                "web.port" => port.map(String::from),
+                _ => None,
+            }
+        };
+        assert_eq!(published_from(file(None)), [("web.port", 7793)]);
+        assert_eq!(published_from(file(Some("8000"))), [("web.port", 8000)]);
+        assert_eq!(published_from(|_| None), []);
     }
 
     #[test]

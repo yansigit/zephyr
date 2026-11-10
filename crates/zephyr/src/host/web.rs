@@ -76,25 +76,29 @@ fn set(h: &Host, key: &str, value: &str) -> anyhow::Result<()> {
 }
 
 fn setup(h: &Host, yes: bool) -> anyhow::Result<()> {
-    let target = format!("http://127.0.0.1:{PORT}");
     // 1, 2: the name, and HTTPS on it. Nothing is changed before both are known.
     let name = tailnet_name()?;
     println!("this machine is {name} on your tailnet, with HTTPS certificates on");
 
     // 3: zephyr.toml.
+    // A port the owner chose is kept. Under the network floor `zephyr up` publishes it on this
+    // machine's loopback (`egress::published`), which is where `tailscale serve` forwards to;
+    // under host networking the daemon is on that loopback itself.
     let mut doc = h.data.load()?;
+    let port = conf::get(&doc, "web.port").unwrap_or_else(|| PORT.into());
+    let (port, target) = (port.as_str(), format!("http://127.0.0.1:{port}"));
     let same = conf::get(&doc, "web.host").as_deref() == Some(name.as_str())
-        && conf::get(&doc, "web.port").as_deref() == Some(PORT);
+        && conf::get(&doc, "web.port").as_deref() == Some(port);
     if !same {
         if !ask(
             h,
             yes,
-            &format!("Write [web] host = \"{name}\", port = {PORT} to zephyr.toml?"),
+            &format!("Write [web] host = \"{name}\", port = {port} to zephyr.toml?"),
         )? {
             return Ok(());
         }
         conf::set(&mut doc, "web.host", &name)?;
-        conf::set(&mut doc, "web.port", PORT)?;
+        conf::set(&mut doc, "web.port", port)?;
         toml::from_str::<crate::config::Config>(&doc.to_string())
             .map_err(anyhow::Error::from)
             .and_then(|c| c.validate())

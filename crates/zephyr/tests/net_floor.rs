@@ -106,10 +106,14 @@ fn the_agent_reaches_only_the_proxy() {
         .next()
         .expect("the container's address");
     let attach = format!("http://{own}:{port}/");
+    let web = format!("http://{own}:7793/");
     for url in [
         format!("http://127.0.0.1:{port}/").as_str(),
         "http://127.0.0.1:7790/",
         attach.as_str(),
+        // The web app's port (DESIGN §4.3.3), set or not: the agent's uid reaches neither end.
+        "http://127.0.0.1:7793/",
+        web.as_str(),
         "http://192.168.1.1/",
         "http://100.100.100.100/",
         "http://169.254.169.254/",

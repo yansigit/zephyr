@@ -373,7 +373,9 @@ async fn status(cfg: &Config) -> anyhow::Result<()> {
         println!("{line}");
     }
     if let Some(web) = &cfg.web {
-        let up = tokio::net::TcpStream::connect(("127.0.0.1", web.port)).await;
+        // Where the daemon binds it: this container's own address under the network floor.
+        let at = zephyr::egress::listen_addr(([127, 0, 0, 1], web.port).into())?;
+        let up = tokio::net::TcpStream::connect(at).await;
         println!(
             "web: {}",
             if up.is_ok() {
@@ -533,11 +535,10 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
         ok &= check(&label, there);
     }
     if let Some(web) = &cfg.web {
-        let up = tokio::net::TcpStream::connect(("127.0.0.1", web.port)).await;
-        ok &= check(
-            &format!("web app listening on 127.0.0.1:{}", web.port),
-            up.is_ok(),
-        );
+        // Where the daemon binds it: this container's own address under the network floor.
+        let at = zephyr::egress::listen_addr(([127, 0, 0, 1], web.port).into())?;
+        let up = tokio::net::TcpStream::connect(at).await;
+        ok &= check(&format!("web app listening on {at}"), up.is_ok());
         ok &= check(
             "the web push key loads",
             zephyr::web::push::vapid(cfg, false).is_ok(),

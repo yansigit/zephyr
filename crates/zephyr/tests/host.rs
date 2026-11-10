@@ -2937,3 +2937,56 @@ fn status_says_whether_tailscale_serve_forwards_the_port() {
         assert!(off.contains(line), "{off}");
     }
 }
+
+#[test]
+fn up_in_bridge_mode_publishes_the_web_port_on_loopback() {
+    let env = Env::new("web-bridge");
+    env.init(&["--no-start"]);
+    env.calls();
+    env.ok(&["up"]);
+    let calls = env.calls();
+    let run = find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
+    assert!(
+        !run.iter().any(|a| a.contains("7793")),
+        "no [web], no port: {run:?}"
+    );
+    // A port the owner chose is kept: setup serves and publishes that one.
+    let path = env.daemon().join("zephyr.toml");
+    let text = format!(
+        "{}\n[web]\nhost = \"old.ts.net\"\nport = 8000\n",
+        env.config()
+    );
+    std::fs::write(&path, text).unwrap();
+    let out = env.zephyr_env(&["web", "setup", "--yes"], &[("SHIM_TS_STATUS", TS_STATUS)]);
+    assert!(out.status.success(), "{out:?}");
+    let calls = env.calls();
+    find(
+        &calls,
+        &["tailscale", "serve", "--bg", "http://127.0.0.1:8000"],
+    );
+    let run = find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
+    assert!(
+        run.windows(2).any(|w| w == ["-p", "127.0.0.1:8000:8000"]),
+        "{run:?}"
+    );
+    assert!(
+        run.iter()
+            .any(|a| a.starts_with("ZEPHYR_PUBLISHED=") && a.contains("8000")),
+        "{run:?}"
+    );
+    let doc: toml::Table = toml::from_str(&env.config()).unwrap();
+    assert_eq!(doc["web"]["host"].as_str(), Some("box.tail1234.ts.net"));
+    assert_eq!(doc["web"]["port"].as_integer(), Some(8000));
+    // Under host networking nothing is published: the daemon is on the host's loopback itself.
+    let host = env.daemon().join("host.toml");
+    let text = std::fs::read_to_string(&host).unwrap_or_default();
+    let text = match text.contains("network = \"bridge\"") {
+        true => text.replace("network = \"bridge\"", "network = \"host\""),
+        false => format!("{text}\nnetwork = \"host\"\n"),
+    };
+    std::fs::write(&host, text).unwrap();
+    env.ok(&["up"]);
+    let calls = env.calls();
+    let run = find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
+    assert!(!run.iter().any(|a| a == "-p"), "{run:?}");
+}

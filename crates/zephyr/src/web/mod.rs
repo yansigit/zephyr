@@ -296,14 +296,17 @@ pub async fn serve(cfg: &Config, handles: Handles, hub: Arc<Hub>) -> anyhow::Res
     if let Err(e) = push::vapid(cfg, true) {
         eprintln!("zephyr: web push is off: {e:#}");
     }
-    let listener = match TcpListener::bind(("127.0.0.1", web.port)).await {
+    // Under the network floor the container's own address, which the agent's uid cannot reach
+    // and `zephyr up` publishes on the host's loopback; else the host's loopback itself.
+    let addr = crate::egress::listen_addr(([127, 0, 0, 1], web.port).into())?;
+    let listener = match TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(e) => {
             eprintln!("zephyr: web app not listening on port {}: {e}", web.port);
             return std::future::pending().await;
         }
     };
-    eprintln!("zephyr: web app listening on 127.0.0.1:{}", web.port);
+    eprintln!("zephyr: web app listening on {addr}");
     let app = Arc::new(App { web, handles, hub });
     // Anything on the host can connect (the agent too, under host networking): a cap, so idle
     // sockets cannot use up the daemon's file descriptors, and `HEAD_WAIT` for the head.
