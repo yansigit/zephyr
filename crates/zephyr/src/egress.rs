@@ -32,15 +32,21 @@ pub fn bridge() -> bool {
 /// The container's own address: the `zephyr` line Docker writes to /etc/hosts.
 pub fn own_ip() -> anyhow::Result<Ipv4Addr> {
     use std::net::ToSocketAddrs;
-    let mut addrs = ("zephyr", 0)
+    let addrs = ("zephyr", 0)
         .to_socket_addrs()
         .context("finding this container's address (zephyr in /etc/hosts)")?;
-    match addrs.next().map(|a| a.ip()) {
-        Some(IpAddr::V4(ip)) if !ip.is_loopback() => Ok(ip),
-        other => anyhow::bail!(
-            "this container's address (zephyr in /etc/hosts) is {other:?}, not an IPv4 address of its own"
-        ),
-    }
+    own_of(addrs.map(|a| a.ip()))
+        .context("this container has no IPv4 address of its own (zephyr in /etc/hosts)")
+}
+
+/// The first IPv4 address among `addrs`, whatever other families the name also has; `None` when
+/// there is none or it is loopback.
+fn own_of(addrs: impl Iterator<Item = IpAddr>) -> Option<Ipv4Addr> {
+    let first = addrs.into_iter().find_map(|ip| match ip {
+        IpAddr::V4(ip) => Some(ip),
+        IpAddr::V6(_) => None,
+    })?;
+    (!first.is_loopback()).then_some(first)
 }
 
 /// Where a daemon listener binds, and where clients inside the container connect: under the
@@ -1587,5 +1593,17 @@ table inet zephyr {
         let addr = closed.local_addr().unwrap();
         drop(closed);
         assert!(proxy_status(addr, "example.com:443").is_err());
+    }
+
+    #[test]
+    fn the_containers_address_is_its_first_ipv4_one() {
+        let of = |addrs: &[&str]| own_of(addrs.iter().map(|a| ip(a)));
+        let own = Some("172.18.0.2".parse().unwrap());
+        assert_eq!(of(&["fd00::2", "172.18.0.2", "172.19.0.2"]), own);
+        assert_eq!(of(&["172.18.0.2"]), own);
+        // Never loopback, and never an IPv6 address alone: the rules and the listeners are IPv4.
+        assert_eq!(of(&["127.0.0.1", "172.18.0.2"]), None);
+        assert_eq!(of(&["fd00::2"]), None);
+        assert_eq!(of(&[]), None);
     }
 }
