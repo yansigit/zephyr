@@ -1311,6 +1311,10 @@ impl<'a> Router<'a> {
             AttachRequest::Proposals(tx) => {
                 let _ = tx.send(self.proposals_json());
             }
+            AttachRequest::Activity { query, reply } => {
+                let answer = crate::activity::answer(&self.cfg, &self.store, &query, crate::now());
+                let _ = reply.send(answer);
+            }
             AttachRequest::Decide { id, verb, reply } => {
                 let _ = reply.send(self.decide(id, &verb).await);
                 self.publish();

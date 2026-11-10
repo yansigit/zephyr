@@ -73,6 +73,44 @@ impl Query {
     }
 }
 
+impl Query {
+    /// `zephyr.activity`'s params (DESIGN §4.3.1), each optional: `range` (`24h`), `kind` (all
+    /// but `tool`), `before` (a previous `next`) and `limit` (1 to 200, default 50), words read
+    /// as [`Query::words`] reads them. `Err` is the `-32602` message.
+    pub fn params(p: &serde_json::Value) -> Result<Query, String> {
+        use serde_json::Value;
+        let bad = || USAGE.to_string();
+        let text = |key: &str| match &p[key] {
+            Value::Null => Ok(None),
+            Value::String(s) => Ok(Some(s.to_ascii_lowercase())),
+            _ => Err(bad()),
+        };
+        let window = window(&text("range")?.unwrap_or_else(|| "24h".into())).ok_or_else(bad)?;
+        let kind = match text("kind")? {
+            Some(k) => Some(kind(&k).ok_or_else(bad)?),
+            None => None,
+        };
+        let before = match &p["before"] {
+            Value::Null => None,
+            Value::String(s) => Some(Cursor::parse(s).ok_or_else(bad)?),
+            _ => return Err(bad()),
+        };
+        let limit = match &p["limit"] {
+            Value::Null => 50,
+            v => v
+                .as_u64()
+                .filter(|n| (1..=200).contains(n))
+                .ok_or_else(bad)? as u32,
+        };
+        Ok(Query {
+            window,
+            kind,
+            before,
+            limit,
+        })
+    }
+}
+
 /// `today`, or `Nh`/`Nd` from 1 h to 90 d.
 fn window(w: &str) -> Option<Window> {
     if w == "today" {
@@ -272,6 +310,42 @@ pub fn grants(cfg: &Config, store: &Store, now: i64) -> rusqlite::Result<Vec<Gra
         ));
     }
     Ok(out)
+}
+
+/// `zephyr.activity`'s answer: a page of entries and the cursor of the next, or the grants.
+/// `Err` is the `-32000` message.
+pub fn answer(
+    cfg: &Config,
+    store: &Store,
+    q: &Query,
+    now: i64,
+) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let failed = |e: rusqlite::Error| format!("reading the activity failed: {e}");
+    if q.kind == Some("grants") {
+        let entries: Vec<serde_json::Value> = (grants(cfg, store, now).map_err(failed)?.iter())
+            .map(|g| {
+                json!({"at": g.at, "kind": "grant", "subject": g.subject, "line": g.line,
+                       "revoke": g.revoke})
+            })
+            .collect();
+        return Ok(json!({"since": null, "entries": entries, "next": null}));
+    }
+    let tz = crate::scheduler::zone(cfg).unwrap_or(TimeZone::UTC);
+    let since = since(&q.window, now, &tz);
+    let kinds: Vec<&str> = q.kind.into_iter().collect();
+    let mut records =
+        (store.activity(since, &kinds, q.before.as_ref(), q.limit + 1)).map_err(failed)?;
+    let more = records.len() > q.limit as usize;
+    records.truncate(q.limit as usize);
+    let next = (records.last())
+        .filter(|_| more)
+        .map(|r| Cursor::of(r).to_string());
+    let scrub = Scrub::load(cfg);
+    let entries: Vec<Entry> = (records.iter())
+        .map(|r| entry(r, &scrub, now, &tz))
+        .collect();
+    Ok(json!({"since": since, "entries": entries, "next": next}))
 }
 
 /// The whole reply to `/activity ARG`, for the owner on any channel and the agent's `gateway`.

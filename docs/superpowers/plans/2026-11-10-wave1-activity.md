@@ -240,15 +240,15 @@ Deviation: the unit test's lines use rowid 1 and job #1 (spec §4.4's example us
 - Response, `kind: "grants"`: `{"since": null, "entries": [{"at": …, "kind": "grant", "subject": "messages", "line": "messages bob@x.org, known since 11-02 · /approvals forget 4", "revoke": "/approvals forget 4"}], "next": null}`.
 - Errors: `-32602` with message `USAGE` for a bad `range`, `kind`, `before` (fails `Cursor::parse`) or `limit`; `-32000` `reading the activity failed: {e}` for a store error, `gateway is shutting down` when the router is gone.
 
-- [ ] **Step 1: Write the failing tests** in `tests/attach.rs`:
+- [x] **Step 1: Write the failing tests** in `tests/attach.rs`:
   - `activity_pages_by_cursor`: seed five audit rows (two in one second) in the gateway's state.db; `zephyr.activity {"kind": "tool", "limit": 2}` three times following `next` → 5 distinct entries in `at` order, the last page's `next` is `null`; each `line` matches its `text`.
   - `activity_grants_carry_their_revoke`: a remembered target → one entry with `kind: "grant"` and `revoke: "/approvals forget 1"`, `next: null`.
   - `activity_refuses_bad_params`: `{"range": "91d"}`, `{"kind": "inbox"}`, `{"before": "1.inbox.1"}`, `{"limit": 0}`, `{"limit": 201}`, `{"limit": "5"}` → each `-32602`.
-- [ ] **Step 2:** `cargo test -p zephyr --test attach activity_` → FAIL.
-- [ ] **Step 3: Implement** `Query::params`, `answer`, the dispatch arm and the router arm.
-- [ ] **Step 4:** `cargo test -p zephyr --test attach && cargo test -p zephyr` → PASS.
-- [ ] **Step 5:** Docs: DESIGN §4.3.1 `zephyr.activity` (request, both responses, errors, `stream` meaning the row comes from rpi's forgeable event stream); attach.rs module doc lists it.
-- [ ] **Step 6:** Commit `feat(attach): serve the activity record and the grants, paged, to attached clients`.
+- [x] **Step 2:** `cargo test -p zephyr --test attach activity_` → FAIL.
+- [x] **Step 3: Implement** `Query::params`, `answer`, the dispatch arm and the router arm.
+- [x] **Step 4:** `cargo test -p zephyr --test attach && cargo test -p zephyr` → PASS.
+- [x] **Step 5:** Docs: DESIGN §4.3.1 `zephyr.activity` (request, both responses, errors, `stream` meaning the row comes from rpi's forgeable event stream); attach.rs module doc lists it.
+- [x] **Step 6:** Commit `feat(attach): serve the activity record and the grants, paged, to attached clients`.
 
 ### Task A4-8: The TUI's Activity and Grants tabs
 

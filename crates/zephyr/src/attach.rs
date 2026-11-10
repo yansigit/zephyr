@@ -15,7 +15,9 @@
 //! owner's private facts (`crate::facts`), `zephyr.sessions`, the saved main
 //! sessions with their `/rename` names, and `zephyr.turns`, the exchanges `/undo N` counts, newest
 //! first, for the TUI's rewind picker, and `zephyr.dequeue`, which takes back the `tui` messages
-//! still waiting (a `send` prompt with `followUp: true` waits for the settle). `zephyr.login_start` answers once rpi's
+//! still waiting (a `send` prompt with `followUp: true` waits for the settle), and
+//! `zephyr.activity`, the daemon's activity record paged by cursor or its standing grants
+//! (`crate::activity`). `zephyr.login_start` answers once rpi's
 //! child has started, not at once: rpi may be asked for a model first, so the `loginId` can take a
 //! few seconds, and the sign-in URL follows on the daemon's 5 s tick rather than in the reply.
 
@@ -63,6 +65,11 @@ pub enum AttachRequest {
     },
     /// `zephyr.proposals`: the proposals still waiting.
     Proposals(oneshot::Sender<Value>),
+    /// `zephyr.activity`: a page of the activity record, or the grants (DESIGN §4.19).
+    Activity {
+        query: crate::activity::Query,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     /// `zephyr.decide`: `/ok N` (`ok`, `once`), `/no N` (`no`) or `/cancel N` (`cancel`) as the
     /// owner on the TUI.
     Decide {
@@ -355,6 +362,19 @@ impl Conn {
                 };
                 match (self.router.send(req).await, rx.await) {
                     (Ok(()), Ok(value)) => (vec![ok(id, value)], false),
+                    _ => (vec![error(id, -32000, "gateway is shutting down")], true),
+                }
+            }
+            "zephyr.activity" => {
+                let query = match crate::activity::Query::params(params) {
+                    Ok(q) => q,
+                    Err(why) => return (vec![error(id, -32602, &why)], false),
+                };
+                let (tx, rx) = oneshot::channel();
+                let req = AttachRequest::Activity { query, reply: tx };
+                match (self.router.send(req).await, rx.await) {
+                    (Ok(()), Ok(Ok(value))) => (vec![ok(id, value)], false),
+                    (Ok(()), Ok(Err(why))) => (vec![error(id, -32000, &why)], false),
                     _ => (vec![error(id, -32000, "gateway is shutting down")], true),
                 }
             }
