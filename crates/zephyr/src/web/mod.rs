@@ -741,6 +741,44 @@ mod tests {
     }
 
     #[test]
+    fn every_method_the_app_calls_is_open_on_web() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/web");
+        let js = std::fs::read_to_string(dir.join("app.js")).unwrap();
+        let name = |after: &str| after.split('"').next().unwrap_or_default().to_string();
+        // What `rpc("…")` is called with, and any other `"zephyr.…"` name in the file.
+        let mut called: Vec<String> = js.split("rpc(\"").skip(1).map(name).collect();
+        called.extend(
+            js.split("\"zephyr.")
+                .skip(1)
+                .map(|after| format!("zephyr.{}", name(after))),
+        );
+        for method in [
+            "zephyr.subscribe",
+            "send",
+            "zephyr.proposals",
+            "zephyr.decide",
+            "zephyr.web_challenge",
+        ] {
+            assert!(
+                called.iter().any(|c| c == method),
+                "the app never calls {method}"
+            );
+        }
+        for method in &called {
+            assert!(
+                crate::attach::WEB_METHODS.contains(&method.as_str()),
+                "{method} is closed to the web app"
+            );
+        }
+        // The service worker's one call is a route, with the JSON type `admit` asks for.
+        let sw = std::fs::read_to_string(dir.join("sw.js")).unwrap();
+        assert!(
+            sw.contains("\"/api/push/decide\"")
+                && sw.contains("\"Content-Type\": \"application/json\"")
+        );
+    }
+
+    #[test]
     fn the_app_holds_no_inline_code() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/web");
         let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();

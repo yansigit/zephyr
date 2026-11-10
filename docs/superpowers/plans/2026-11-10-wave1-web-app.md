@@ -715,10 +715,12 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - **Layout.** Phone-first; from 900 px the drawer is a side panel. Drawer tabs: Approvals (opens first when `proposals > 0`) and Upcoming (`Snapshot.jobs` and `scheduled` proposals). Activity and Goals tabs exist but stay hidden (W-11, W-12).
   - **Settings, Facts, Vault.** Settings edit each row by its `kind`, with an optional "for 2h"; a refusal shows the daemon's reason. Facts show names, kinds and targets only; Vault shows names, sites and grants. Both say "change these in the TUI or with zephyr facts / zephyr vault".
 
-- [ ] **Step 1: Write the failing test** `every_method_the_app_calls_is_open_on_web`, and run `cargo test -p zephyr --lib web::` → FAIL (the placeholder has no calls; assert that at least `zephyr.decide` is found).
-- [ ] **Step 2: Write the files** (about 1,200 lines of `app.js`). Run `node --check` on `app.js` and `sw.js` where node exists; it is optional and not a CI dependency.
+- [x] **Step 1: Write the failing test** `every_method_the_app_calls_is_open_on_web`, and run `cargo test -p zephyr --lib web::` → FAIL (the placeholder has no calls; assert that at least `zephyr.decide` is found).
+- [x] **Step 2: Write the files** (about 1,200 lines of `app.js`). Run `node --check` on `app.js` and `sw.js` where node exists; it is optional and not a CI dependency.
 - [ ] **Step 3: Run** `cargo test -p zephyr --lib web::` → PASS. Then bring up a side container (`ZEPHYR_CONTAINER=zephyr-test ZEPHYR_IMAGE=zephyr-dev:<sha> zephyr up --build`) with `[web]` set, and load the app in a desktop browser through `tailscale serve` on a test port: the sign-in page renders, and the console shows no CSP errors.
-- [ ] **Step 4: Commit** `feat(web): the phone app for chat, approvals, settings and devices`.
+- [x] **Step 4: Commit** `feat(web): the phone app for chat, approvals, settings and devices`.
+- Deviation: Step 3 is left unticked: its unit tests pass (and `node --check` passes on `app.js` and `sw.js`), but the side container and the browser check through `tailscale serve` were not run in this lane (no test tailnet here, and the live container is not to be touched). The app has not been seen in a real browser; README's manual check stands before release.
+- Deviation: `app.js` is about 900 lines, not 1,200. The Activity tab and the Goals screen are in the page and hidden, with no method call behind them yet (`zephyr.activity` and `zephyr.goals` are not in `WEB_METHODS` until W-11 and W-12). The test also checks that `sw.js` posts `/api/push/decide` as JSON. DESIGN §4.3.3 gains "The app" and the `sw.js` bullet (the plan lists only README for this task).
 
 ### Task W-10: Host CLI: `zephyr web setup | enrol`, and the status line
 

@@ -419,7 +419,20 @@ agent can read its token.
 ## Web app
 
 A phone-first app the daemon serves itself, reached over your tailnet through `tailscale serve`
-(never `tailscale funnel`). It is off until `zephyr.toml` has a `[web]` table:
+(never `tailscale funnel`). It has:
+
+- **Chat** with the live status line (`working · 0:24 · bash · 3 tools`), the reply as it is
+  written, a turn's tools folded into one line, "take back" for a message still waiting, and Stop.
+- **Approvals**: the same cards your other channels get, in full. Approve and Approve once take
+  your passkey, and what you sign is that exact card: if it changes before you sign, the signature
+  is refused and you are shown the new one. Deny needs no passkey. The agent's own stated reason
+  is folded away under "the agent's reason (not checked)".
+- **Upcoming**: scheduled jobs and delayed sends.
+- **Settings**, with an optional time limit; a protected setting is saved with your passkey.
+- **Private facts** and the **Vault**, names only. Secrets are never typed in the app.
+- **Devices**: notifications, sign out, remove a passkey.
+
+It is off until `zephyr.toml` has a `[web]` table:
 
 ```toml
 [web]
@@ -455,7 +468,13 @@ or the first 120 characters of a reply; never the agent's stated reason. On Andr
 card's notification has buttons: **Deny** always, and **Approve** only for a message or a post
 that your other channels could approve too. A payment, or anything that loosens a protected
 setting, opens the app, where approving takes your passkey. Up to 10 devices; `/web rm NAME`
-removes a passkey's devices with it.
+removes a passkey's devices with it. Swiping a card's notification away denies it, on Android only.
+
+**Before a release that touches `crates/zephyr/assets/web/`**, check by hand, on iOS Safari as a
+Home Screen app and on Android Chrome (a real browser is not part of the tests): enrol with
+`/web enrol`, sign in, chat, approve a held message with the passkey, deny one from a
+notification, swipe one away on Android (it is denied), and `/web rm` from another channel
+signs the phone out. The browser's console must show no Content-Security-Policy errors.
 
 ## Sending the agent files
 
