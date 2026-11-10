@@ -98,6 +98,11 @@ pub struct Config {
     /// tests set a fake.
     #[serde(skip, default = "agent_browser")]
     pub agent_browser: PathBuf,
+    /// Whether the agent runs under the network floor (DESIGN §4.19): `ZEPHYR_NETWORK=bridge`.
+    /// An OAuth sign-in then takes the address its callback could not reach. Not configurable;
+    /// tests set it.
+    #[serde(skip, default = "floor")]
+    pub floor: bool,
 }
 
 fn job_timeout() -> std::time::Duration {
@@ -118,6 +123,10 @@ fn tick() -> std::time::Duration {
 
 fn min_until() -> std::time::Duration {
     std::time::Duration::from_secs(30)
+}
+
+fn floor() -> bool {
+    crate::egress::bridge()
 }
 
 fn agent_browser() -> PathBuf {
@@ -351,6 +360,7 @@ impl Config {
         self.path = running.path.clone();
         self.projects = running.projects.clone();
         self.agent_browser = running.agent_browser.clone();
+        self.floor = running.floor;
     }
 
     /// Account names become directory names, so each must be a plain, unique path segment.

@@ -641,7 +641,7 @@ async fn zephyr_login_methods_report_providers_refuse_bad_input_and_cancel() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(polled["phase"], "need_input", "{polled}");
+    assert_eq!(polled["phase"], "waiting", "{polled}");
     assert_eq!(polled["url"], "https://example.test/login/antigravity");
     assert_eq!(polled["account"], "antigravity-1", "{polled}");
 

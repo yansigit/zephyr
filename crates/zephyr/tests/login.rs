@@ -429,8 +429,12 @@ async fn an_oauth_login_reports_its_url_then_finishes_when_the_browser_returns()
     assert_eq!(start.kind, zephyr::auth::Kind::Oauth);
 
     let waiting = until(&start.login_id, |l| !l["url"].is_null()).await;
-    // An OAuth login takes a line too: the address its callback could not reach (DESIGN §4.19).
-    assert_eq!(waiting["phase"], "need_input");
+    // Outside the network floor the callback reaches the login, so nothing is asked for.
+    assert_eq!(waiting["phase"], "waiting");
+    assert!(!zephyr::auth::input(
+        &start.login_id,
+        "http://127.0.0.1:1455/cb?code=X"
+    ));
     assert_eq!(waiting["url"], "https://example.test/login/antigravity");
 
     assert!(!home.join("login_go").exists());
@@ -660,13 +664,16 @@ async fn start_says_no_to_an_unknown_provider_and_a_config_with_no_file() {
 #[tokio::test]
 async fn a_pasted_callback_address_finishes_an_oauth_login_and_is_redacted() {
     const PASTED: &str = "http://127.0.0.1:1455/cb?code=SECRETCODE";
-    let (cfg, home) = setup("paste", "");
+    let (mut cfg, home) = setup("paste", "");
+    cfg.floor = true;
     std::fs::write(home.join("login_url"), "").unwrap();
     let model = Some("antigravity/gemini-3".into());
     let start = zephyr::auth::start(&cfg, "antigravity", None, model)
         .await
         .unwrap();
-    until(&start.login_id, |l| !l["url"].is_null()).await;
+    let asked = until(&start.login_id, |l| !l["url"].is_null()).await;
+    // An OAuth login takes a line under the floor: the address its callback could not reach.
+    assert_eq!(asked["phase"], "need_input");
     assert!(zephyr::auth::input(&start.login_id, PASTED));
     let mut leaked = false;
     let done = until(&start.login_id, |l| {
@@ -698,6 +705,7 @@ async fn a_channel_pastes_the_callback_into_its_own_oauth_login() {
     std::fs::write(&path, both).unwrap();
     let mut cfg2 = Config::load(&path).unwrap();
     cfg2.tick = cfg.tick;
+    cfg2.floor = true;
     let cfg = cfg2;
     std::fs::write(home.join("login_url"), "").unwrap();
     let (feed, rx) = tokio::sync::mpsc::channel(8);
@@ -931,6 +939,13 @@ async fn login_from_a_channel() {
         .expect("the channel's login is in the registry");
     let sign_in = until(&id, |l| !l["url"].is_null()).await;
     assert_eq!(sign_in["url"], "https://example.test/login/antigravity");
+    // Outside the network floor the browser's redirect finishes it: no paste is offered.
+    let url = |r: &[String]| r.iter().any(|x| x.contains("https://example.test/login"));
+    let got = replies_until(&sent, url, "the URL notice").await;
+    let notice = got
+        .iter()
+        .find(|x| x.contains("https://example.test/login"));
+    assert!(!notice.unwrap().contains("/login paste"), "{got:?}");
 
     // The browser comes back: the account joins the pool with no restart, and no prompt.
     std::fs::write(home.join("login_go"), "").unwrap();

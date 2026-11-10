@@ -3209,9 +3209,13 @@ impl<'a> Router<'a> {
                 }
                 _ => match login["url"].as_str() {
                     Some(url) => {
+                        // Only where the browser's redirect cannot reach the login.
+                        let paste = match phase {
+                            "need_input" => "\nIf the page then cannot open 127.0.0.1, send /login paste <its address>.",
+                            _ => "",
+                        };
                         let text = format!(
-                            "[zephyr] sign in to {provider} as {} at {url}\n\
-                             If the page then cannot open 127.0.0.1, send /login paste <its address>.",
+                            "[zephyr] sign in to {provider} as {} at {url}{paste}",
                             login["account"].as_str().unwrap_or_default()
                         );
                         self.login_notice(&text, &from);

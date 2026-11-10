@@ -186,8 +186,8 @@ enum Phase {
     /// The child is running and has not finished; it may still print a URL.
     #[default]
     Waiting,
-    /// The child takes a line on stdin (`zephyr.login_input`, `/login paste`): a key, or the
-    /// callback address of an OAuth sign-in.
+    /// The child takes a line on stdin (`zephyr.login_input`, `/login paste`): a key, or under
+    /// the network floor the callback address of an OAuth sign-in.
     NeedInput,
     /// `rpi auth check` passed and the `[[account]]` row is going into `zephyr.toml`: set under
     /// the login's own lock, immediately before `record` writes. A cancel that lands during the
@@ -520,10 +520,12 @@ pub async fn start(
         let mut inner = lock(&login.inner);
         inner.input = Some(input);
         // Now that there is a child to write to: a key provider is ready for the token from
-        // here on, and an OAuth one for the address its callback could not reach (under the
-        // network floor the browser's redirect to 127.0.0.1 never gets to the container, DESIGN
-        // §4.19). `input` refuses a line in any other phase.
-        inner.phase = Phase::NeedInput;
+        // here on. An OAuth one stays `waiting` for the browser, except under the network floor
+        // (DESIGN §4.19), where the redirect to 127.0.0.1 never gets to the container and the
+        // owner pastes its address instead. `input` refuses a line in any other phase.
+        if p.kind != Kind::Oauth || cfg.floor {
+            inner.phase = Phase::NeedInput;
+        }
         inner.child = Some(child);
         // From here the login releases the name when its phase turns terminal.
         inner.reserved = Some(reserved);
