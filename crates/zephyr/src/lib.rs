@@ -17,6 +17,7 @@ pub mod desktop;
 pub mod discord;
 pub mod dotenv;
 pub mod drafts;
+pub mod egress;
 pub mod facts;
 pub mod gate;
 pub mod host;

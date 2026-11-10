@@ -204,11 +204,23 @@ if args[:1] == ["auth"]:
             print("error: sign-in failed", file=sys.stderr); sys.exit(1)
         if os.path.exists(os.path.join(home, "login_url")):
             # An OAuth provider: print the URL and finish when the browser does (a test drops
-            # `login_go` in the home, as the browser coming back would).
+            # `login_go` in the home, as the browser coming back would), or when the address the
+            # browser could not open is pasted at the prompt, as rpi 0.18 takes it. The pasted
+            # text is never logged.
             print("To sign in, open this URL in a browser:\r\n\r\n\x1b[36mhttps://example.test/login/%s\x1b[0m\r\n" % provider)
+            print("Paste OAuth code or response:")
             sys.stdout.flush()
+            import select
+            reading = True
             while not os.path.exists(os.path.join(home, "login_go")):
-                time.sleep(0.05)
+                if not reading or not select.select([sys.stdin], [], [], 0.05)[0]:
+                    time.sleep(0 if reading else 0.05)
+                    continue
+                line = sys.stdin.readline()
+                reading = bool(line)  # an empty read is the end of stdin: only login_go is left
+                if line.strip():
+                    open(os.path.join(home, "log.jsonl"), "a").write(json.dumps({"type": "auth-paste"}) + "\n")
+                    break
         else:
             # A key or a setup token: paste it at the prompt.
             print("Paste the %s credential for \"%s\":" % (provider, provider)); sys.stdout.flush()

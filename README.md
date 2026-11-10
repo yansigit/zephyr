@@ -81,7 +81,11 @@ by hand that is looser than the preset is cleared); without it a non-interactive
 
 Sign in from the running gateway too, with no re-exec afterwards. In `zephyr attach`, `/login`
 lists the providers and Enter starts the one you pick: an OAuth provider (Antigravity,
-ChatGPT/Codex) prints a URL to open in a browser on your machine; nothing else is needed. The
+ChatGPT/Codex) prints a URL to open in a browser on your machine. After you sign in there, the
+browser is sent to an address on `127.0.0.1` that it cannot open (the sign-in runs in the
+container, behind the [network floor](#the-agents-network)): copy that address from the address
+bar and paste it into the panel's input row, or at the prompt of `zephyr login` on the host, or
+send `/login paste ADDRESS` on the channel you started it from. The
 others ask for a key or a token, which is typed masked, goes to the sign-in once and is never
 shown or kept. From any channel, `/login PROVIDER [ACCOUNT] [MODEL]` can start a sign-in too, but
 only an OAuth one: a `key` or a token provider is refused there, so use `zephyr login` on the host,
@@ -161,6 +165,7 @@ Changes apply by themselves; nothing needs `zephyr restart`. The commands above,
 | The model, on the same provider | at once, or after the reply in progress (rpi's `set_model`) |
 | A model on another provider, the active account, extensions, connectors (`[[mcp]]`), subagents (`[[subagent]]`), a re-login | the agent restarts after the reply in progress; the conversation carries on |
 | Discord, iMessage, `[attach]`, `[agent]`, a secret | the daemon restarts itself in place once idle; waiting messages are kept |
+| The attach port, the iMessage webhook's port | `zephyr config set` and `zephyr channel` start the container again to publish it; after a hand edit you are told, a minute later, to run `zephyr up` |
 
 A file that does not load is not applied, and the daemon keeps its current settings.
 
@@ -172,13 +177,20 @@ goes back by itself and you are told. The agent can read all of them. What it ma
 | Setting | The agent may |
 |---|---|
 | `tasks.parallel`, `mcp.NAME.enabled` (a connector off), `settings.strong_channels` (remove a channel), the `budget.*` limits, the `approvals.*` modes and preset, `approvals.strong_only` (add `money`), `mcp.NAME.classes.TOOL` (put a tool in a class) | make it stricter at once (lower, off, fewer channels, a limit where there was none, a stricter mode or preset); you are told and `/set KEY OLD` puts it back. Its `/set` takes one word, so it can tighten approvals to `ask` but not to `delay 10` |
-| `model`, `thinking`, `tasks.model`, `timezone`, `auth.*`, `approvals.currency`, subagents, rules, removing a private fact or allowing it a target, and any change of the above that loosens | propose it: a card shows `KEY old → new` (or the exact `/subagent` or `/rule` text, up to 1500 characters), and `/ok N` applies it, `/no N` drops it |
+| `model`, `thinking`, `tasks.model`, `timezone`, `auth.*`, `approvals.currency`, `network.allow`, subagents, rules, removing a private fact or allowing it a target, and any change of the above that loosens | propose it: a card shows `KEY old → new` (or the exact `/subagent` or `/rule` text, up to 1500 characters), and `/ok N` applies it, `/no N` drops it |
 | `owners`, `[discord]`, `[imessage]`, `[attach]`, `[agent]`, `extensions`, `policy_plugin`, `rpi`, `home`, `state`, the `[[account]]` pool | nothing; edit `zephyr.toml` |
 
 The agent may also save a new private fact at once (it only makes the check stricter); you are told
 its name, and `/facts rm NAME` removes it.
 
-The `budget.*` limits, `settings.strong_channels`, the `approvals.*` settings (the currency too: it
+`network.allow` lists what the agent may reach beyond public addresses on ports 80 and 443, which
+need no entry: exact `HOST:PORT` pairs, comma separated, with no wildcards, e.g.
+`/set network.allow imap.gmail.com:993, github.com:22, homeassistant.lan:8123`. A listed name may
+be on your LAN or tailnet; loopback, link-local addresses (cloud metadata) and the container itself
+are refused even when listed. The value is the whole list, so include the entries you keep. A
+change applies to the next connection.
+
+The `budget.*` limits, `network.allow`, `settings.strong_channels`, the `approvals.*` settings (the currency too: it
 changes what an `auto N` cap lets through), the connector tool classes and the private facts are
 protected: raising a limit, adding a channel, changing the currency, or loosening an approval or a
 fact is accepted only from a strong channel, by default `zephyr
@@ -209,7 +221,9 @@ agent to finish (or `/stop` it). `/usage [DAYS]` lists
 the spend per day and per account over the last 7 days, or `DAYS`.
 `/login` signs an account in from here: `/login` lists the provider ids, `/login PROVIDER [ACCOUNT]
 [MODEL]` starts an OAuth sign-in and needs no re-exec (a key or a token is refused — it is typed in
-`zephyr attach`, which masks it), and `/login cancel [ID|PROVIDER]` stops the ones you gave up on.
+`zephyr attach`, which masks it), `/login paste ADDRESS` finishes yours with the `127.0.0.1` address
+the browser could not open (never a token), and `/login cancel [ID|PROVIDER]` stops the ones you
+gave up on.
 The first account of an empty install does restart the agent once, when idle: there is nothing for
 it to start on until that account exists.
 
@@ -436,12 +450,18 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
 - **GPU.** When Docker has the NVIDIA runtime, `zephyr up` passes the GPU in, so the browser's
   WebGL is the real card instead of software rendering, which bot checks notice.
 - **Watching it, or signing it into a site.** Nothing listens by default. To look, start a one-shot
-  VNC server on 127.0.0.1:5900 and connect a VNC viewer; it exits when you disconnect:
+  VNC server on the container's own address, port 5900, and connect a VNC viewer on this machine to
+  that address; it exits when you disconnect (the address is reachable from this machine only):
 
   ```sh
+  ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' zephyr)
   docker exec -it -u "$(id -u)" zephyr x11vnc -storepasswd /zephyr/.vnc-passwd   # once
-  docker exec -d -u "$(id -u)" zephyr x11vnc -display :99 -auth /zephyr/.zephyr-xauthority -localhost -once -rfbauth /zephyr/.vnc-passwd
+  docker exec -d -u "$(id -u)" zephyr x11vnc -display :99 -auth /zephyr/.zephyr-xauthority -listen "$ip" -once -rfbauth /zephyr/.vnc-passwd
+  echo "connect to $ip:5900"
   ```
+
+  With `network = "host"` in host.toml, use `-localhost` in place of `-listen "$ip"` and connect
+  to 127.0.0.1:5900.
 
 - **Files and jobs.** The agent's `send_file` tool sends you a file (up to 10 MB: a screenshot, a
   PDF) with its reply. Its `schedule` tool only proposes a job: you are shown it, and it runs after
@@ -587,6 +607,44 @@ message.send.backend.auth.cmd = "printenv MAIL_PASSWORD"
 The first `himalaya` command run with `secrets: ["MAIL_PASSWORD"]` asks you to allow
 `MAIL_PASSWORD` for `himalaya`.
 
+## The agent's network
+
+The container runs on a Docker network of its own, and the agent has no direct route out of it. Its
+programs reach the internet only through a proxy in the daemon (`HTTP_PROXY` and friends are set
+for them): any public address on ports 80 and 443, and nothing else. Your machine's localhost, your
+LAN, your tailnet, cloud metadata addresses and every other port (SSH, SMTP, IMAP, databases) are
+refused at once, and the agent gets no DNS of its own. `git`, `curl`, `pip`, `npm`, `gh` and the
+browsers work as before; `ssh` and mail clients fail until you allow their destination, and `ping`
+never works.
+
+- **Allowing more.** `/set network.allow HOST:PORT, HOST:PORT` lists exact destinations beyond
+  that, e.g. `imap.gmail.com:993, github.com:22, homeassistant.lan:8123` (see
+  [Changing settings](#changing-settings)). The agent can only propose a change; `/ok N` from
+  `zephyr attach` or `zephyr chat` applies it. Within a few seconds a listed destination is
+  reachable two ways: through the proxy, and directly, by name, for programs that speak no proxy
+  (himalaya, `ssh`, a database client). Its name is the only one the agent can look up, and its
+  address is looked up again every hour. Remove the entry and both ways close. A refused request tells the agent which entry to ask
+  for, and `sqlite3 ~/.zephyr-daemon/state.db "select * from audit where session = 'net'"` (with
+  `sudo`) shows what it reached, once per destination and hour, and everything that was refused.
+- **A model server on this machine** (Ollama, a local proxy) is no longer reachable on localhost.
+  Have it listen on the Docker network's gateway address
+  (`docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' zephyr`) and list that
+  `ADDRESS:PORT` in `network.allow`.
+- **zephyr's own ports** (the attach port, the iMessage webhook) are published on this machine's
+  `127.0.0.1` only. `zephyr config set attach.port N` and `zephyr channel add|remove imessage`
+  start the container again to publish the change; after a hand edit of those keys, run
+  `zephyr up`.
+- **iMessage.** BlueBubbles posts to your Tailscale address, so forward that to the webhook once
+  (the `zephyr up` that moves an install over prints the line with your port): `sudo tailscale serve --bg --tcp 7791
+  tcp://127.0.0.1:7791`. `[imessage] listen` keeps naming the Tailscale address and port.
+- **Upgrading.** The first `zephyr up` or `zephyr upgrade` on a version with the network floor
+  moves the container over and says so once. Until `tailscale serve` forwards the webhook, iMessage
+  messages do not arrive (they are picked up from BlueBubbles when the daemon next starts).
+- **Going back.** `network = "host"` in `~/.zephyr-daemon/host.toml`, then `zephyr up`, runs the
+  container on the host's network as before: no proxy, no rules, and the agent can reach
+  everything this machine can. `zephyr doctor` says which of the two is in effect, and under the
+  floor proves it by trying the forbidden connections as the agent.
+
 ## Where things live
 
 - `~/.zephyr/` (mode 0700), seen as `/zephyr` in the container: the agent's home, with sessions,
@@ -607,7 +665,7 @@ The first `himalaya` command run with `secrets: ["MAIL_PASSWORD"]` asks you to a
     targets each may go to. `zephyr facts` edits it. A value is matched however it is written (case,
     spacing, `+1 (555) 010-2345` against `5550102345`, percent-encoded, base64); a digits fact
     needs 6 digits and a text one 4 characters or it never matches.
-  - `host.toml`: the projects folder, optionally `memory = "8g"` to cap the container's memory (75% of the machine's when unset),
+  - `host.toml`: the projects folder, `network` (`"bridge"`, the [network floor](#the-agents-network), or `"host"` to run without it), optionally `memory = "8g"` to cap the container's memory (75% of the machine's when unset),
     `packages`: the apt packages `zephyr packages` bakes into the local image, and `offered_extensions`: the image extensions `init`, `up` and `upgrade` have already added to `zephyr.toml`, so one you remove stays removed. The first `up` after upgrading to a zephyr that keeps this record adds once any image extension removed earlier, or every one if the config lists none; after that, a removal sticks.
     Used only on the host, at `zephyr up`.
   - `state.db`: inbox, outbox, jobs, spend, the actions waiting for your approval and the

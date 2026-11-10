@@ -54,14 +54,56 @@ pub fn ids() -> Option<(u32, u32)> {
 /// bin does not shadow the wrapper (approvals spec §4.4; doctor checks it).
 pub const AGENT_PATH: &str = "/opt/zephyr/gate/bin:/zephyr/.local/bin:/opt/zephyr/py/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-/// Prepares `cmd` to run for the agent: without the hidden variables, on [`AGENT_PATH`], and as
-/// the agent's uid.
+/// The daemon's proxy, the agent's only way out under the network floor (`egress::PORT`).
+const PROXY: &str = "http://127.0.0.1:7792";
+
+/// What points the agent's programs at the proxy (DESIGN §4.20). No `ALL_PROXY`: rpi 0.18
+/// refuses a proxy URL that is not HTTP. Node's `fetch` ignores the rest without the last one.
+pub const PROXY_ENV: &[(&str, &str)] = &[
+    ("HTTP_PROXY", PROXY),
+    ("HTTPS_PROXY", PROXY),
+    ("http_proxy", PROXY),
+    ("https_proxy", PROXY),
+    ("NO_PROXY", "localhost,127.0.0.1,::1"),
+    ("no_proxy", "localhost,127.0.0.1,::1"),
+    ("NODE_USE_ENV_PROXY", "1"),
+];
+
+/// `AGENT_BROWSER_ARGS` with the proxy flag after `current`, so Chromium does not depend on
+/// finding the variables itself.
+pub fn browser_args(current: Option<String>) -> String {
+    let flag = format!("--proxy-server={PROXY}");
+    match current.filter(|c| !c.is_empty()) {
+        Some(current) => format!("{current},{flag}"),
+        None => flag,
+    }
+}
+
+/// Everything that points a program at the proxy: [`PROXY_ENV`], and `AGENT_BROWSER_ARGS` with
+/// the proxy flag after `browser`, its value so far. The one list for the daemon's spawns and
+/// the host's `docker exec` as the agent.
+pub fn proxy_env(browser: Option<String>) -> Vec<(&'static str, String)> {
+    let vars = PROXY_ENV.iter().map(|(k, v)| (*k, v.to_string()));
+    vars.chain([("AGENT_BROWSER_ARGS", browser_args(browser))])
+        .collect()
+}
+
+/// Points `cmd` at the proxy ([`proxy_env`]).
+pub fn proxy(cmd: &mut Command) -> &mut Command {
+    cmd.envs(proxy_env(std::env::var("AGENT_BROWSER_ARGS").ok()))
+}
+
+/// Prepares `cmd` to run for the agent: without the hidden variables, on [`AGENT_PATH`], through
+/// the proxy in bridge mode, and as the agent's uid.
 pub fn cmd(cmd: &mut Command) -> &mut Command {
     use std::os::unix::process::CommandExt;
     for key in HIDDEN.get().into_iter().flatten() {
         cmd.env_remove(key);
     }
     cmd.env("PATH", AGENT_PATH);
+    if crate::egress::bridge() {
+        proxy(cmd);
+    }
     if let Some((uid, gid)) = ids() {
         // std drops supplementary groups and changes directory after these.
         cmd.uid(uid).gid(gid);
@@ -192,6 +234,47 @@ mod tests {
             .split(':')
             .position(|d| d == "/zephyr/.local/bin");
         assert_eq!(own, Some(1));
+    }
+
+    fn envs(cmd: &Command) -> Vec<(String, String)> {
+        let text = |s: &std::ffi::OsStr| s.to_str().unwrap().to_string();
+        cmd.get_envs()
+            .map(|(k, v)| (text(k), v.map(text).unwrap_or_default()))
+            .collect()
+    }
+
+    #[test]
+    fn bridge_mode_gives_the_agent_the_proxy_and_the_browser_flag() {
+        let at = format!("http://127.0.0.1:{}", crate::egress::PORT);
+        assert_eq!(PROXY_ENV[0], ("HTTP_PROXY", at.as_str()));
+        let mut c = Command::new("true");
+        let envs = envs(proxy(&mut c));
+        for (k, v) in PROXY_ENV {
+            assert!(envs.contains(&(k.to_string(), v.to_string())), "{k}");
+        }
+        for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            assert!(envs.contains(&(k.to_string(), at.clone())), "{k}");
+        }
+        // rpi 0.18 refuses a proxy URL that is not HTTP.
+        assert!(!envs
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("ALL_PROXY")));
+        let flag = format!("--proxy-server={at}");
+        assert!(envs.contains(&("AGENT_BROWSER_ARGS".into(), browser_args(None))));
+        assert_eq!(browser_args(None), flag);
+        assert_eq!(
+            browser_args(Some("--no-sandbox,--x".into())),
+            format!("--no-sandbox,--x,{flag}")
+        );
+        assert_eq!(browser_args(Some(String::new())), flag);
+    }
+
+    #[test]
+    fn outside_bridge_mode_the_agent_gets_no_proxy() {
+        let mut c = Command::new("true");
+        let envs = envs(cmd(&mut c));
+        let keys: Vec<&str> = envs.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["PATH"]);
     }
 
     /// B5: a program root starts or trusts (rpi, zephyr, the real agent-browser) is root's and

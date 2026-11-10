@@ -225,6 +225,21 @@ impl Data {
         self.write("host.toml", &doc.to_string())
     }
 
+    /// Writes `network = "bridge"` to host.toml when it names no network, so the owner can see
+    /// the line that turns the network floor off.
+    pub fn set_network_default(&self) -> anyhow::Result<()> {
+        let mut doc = self.host_doc()?.unwrap_or_default();
+        if doc.contains_key("network") {
+            return Ok(());
+        }
+        doc["network"] = value("bridge");
+        if let Some(mut key) = doc.key_mut("network") {
+            let note = "# \"host\" runs without the network floor (DESIGN §4.20)\n";
+            key.leaf_decor_mut().set_prefix(note);
+        }
+        self.write("host.toml", &doc.to_string())
+    }
+
     /// `packages` from `host.toml`: the apt packages `zephyr packages` bakes into a local image.
     pub fn packages(&self) -> anyhow::Result<Vec<String>> {
         let doc = self.host_doc()?.unwrap_or_default();

@@ -63,17 +63,18 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
 - `config.rs`: `#[derive(Default, …)] pub struct Network { #[serde(default)] pub allow: String }` and `#[serde(default)] pub network: Network` on `Config` (`deny_unknown_fields` as its neighbours). `validate` calls `egress::parse_allow(&self.network.allow)` and fails with `network.allow: <its error>`. `reload::diff` needs no change: `[network]` is `Plan::Live`, because the proxy reads `cfgs.borrow()` on each request.
 - `settings.rs` row, verbatim from spec §4.4: `row("network.allow", "Security", "Network exceptions", "Exact HOST:PORT the agent may reach beyond public ports 80 and 443, comma separated. No wildcards.", Kind::Text { max: 2000 }, Access::Propose, true, Stricter::NotOrdered, Apply::Toml)`.
 
-- [ ] **Step 1: Write the failing tests** in `egress.rs` `mod tests`:
+- [x] **Step 1: Write the failing tests** in `egress.rs` `mod tests`:
   - `public_refuses_every_special_range_and_embedded_ipv4`: every denied literal in spec §5's list, plus `::127.0.0.1`, gives `!public(ip)`. `1.1.1.1`, `8.8.8.8` and `2606:4700::1111` give `public(ip)`.
   - `targets_normalize_numeric_hosts_through_url`: `target("2130706433:443")`, `"0x7f.1:443"`, `"0177.0.0.1:443"` and `"127.1:443"` all give `Host::Ipv4(127.0.0.1)`. `"[::ffff:127.0.0.1]:443"` gives `Host::Ipv6(::ffff:7f00:1)`. `"example.com:80"` gives port 80. Take the port from the authority, never `Url::port()`, which drops a default port. `"example.com"` (no port), `"user@example.com:443"` and `"example.com:0"` give `Refusal::Bad`.
   - `parse_allow_takes_exact_host_ports_only`: `"imap.gmail.com:993, github.com:22,homeassistant.lan:8123"` gives 3 entries, and `""` gives `[]`. Errors for `*.x:443`, `x`, `x:0`, `x:65536`, `http://x:1`, `127.0.0.1:22`, `[::1]:22` and `169.254.169.254:80`.
   - `decide_applies_the_port_rule_and_the_allow_list`, with a test `Lookup` fn that matches on the name: `example.com:22` unlisted gives `Denied("port 22 needs network.allow")`, and listed gives Ok. `1.1.1.1:443` gives `Ok([1.1.1.1:443])`. `10.0.0.5:443` gives `Denied("private address 10.0.0.5")`. `homeassistant.lan:8123` listed (→ 192.168.1.10) gives Ok, and the same name on `:443` unlisted gives Denied. A mixed answer `[1.1.1.1, 10.0.0.5]` gives Denied. An empty answer gives `Unreachable`. Matching is case-insensitive through `url` (`IMAP.GMAIL.COM:993` matches `imap.gmail.com:993`).
   - `a_listed_name_never_reaches_loopback_link_local_or_this_container` (Review Focus 4): listed names resolving to 169.254.169.254, to 127.0.0.1 and to `own` are each Denied. The 127.0.0.1 one gives `loopback is never allowed`.
   - In `config.rs` tests, `a_wildcard_network_allow_is_refused`: `[network]\nallow = "*.gmail.com:993"` fails `validate`. In `settings.rs` tests, `network_allow_is_a_strong_proposal_only_row`: `find("network.allow")` is `Access::Propose` and `strong`, and `decide` for `Actor::Agent` gives `Verdict::Propose`.
-- [ ] **Step 2:** `cargo test -p zephyr --lib -- egress config settings` gives FAIL (module missing).
-- [ ] **Step 3: Implement.** `target` parses with `url::Url::parse(&format!("http://{authority}"))`. `decide` runs the port rule before any lookup. An IP literal skips the lookup. A name goes through `lookup` under `tokio::time::timeout(5 s)`. The check runs over every address before any is returned.
-- [ ] **Step 4:** Run the tests again: PASS. Then run `cargo test -p zephyr` (the registry's own table tests cover the new row).
-- [ ] **Step 5:** Commit `feat(egress): decide which addresses the agent may reach, and let the owner list exact exceptions in network.allow`.
+- [x] **Step 2:** `cargo test -p zephyr --lib -- egress config settings` gives FAIL (module missing).
+- [x] **Step 3: Implement.** `target` parses with `url::Url::parse(&format!("http://{authority}"))`. `decide` runs the port rule before any lookup. An IP literal skips the lookup. A name goes through `lookup` under `tokio::time::timeout(5 s)`. The check runs over every address before any is returned.
+- [x] **Step 4:** Run the tests again: PASS. Then run `cargo test -p zephyr` (the registry's own table tests cover the new row).
+- [x] **Step 5:** Commit `feat(egress): decide which addresses the agent may reach, and let the owner list exact exceptions in network.allow`.
+- Deviation: `settings::parse` also runs `egress::parse_allow` for `network.allow` and `settings::value` shows it, so `/set network.allow` refuses a bad entry before the file is written (spec §4.4: "the value is checked by `egress::parse_allow`"). `target` also refuses an authority with a path, a query or whitespace.
 
 ### Task A2-2: The proxy and its audit
 
@@ -100,7 +101,7 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
   - Anything else is 400. The store is `Store::open(&cfg.db_path())` held behind a mutex, as the gate's. Rows are written with `gate::audit_row(store, "net", tool, &facts::scrubbed(&cfg, args), outcome)`.
 - `Audit::note`: `allowed` once per `dest`'s `host:port` per `now / 3600`. Refusals count per `now / 60`, rows up to 60. The first note in a later minute first emits `("connect", "", "refused: N more")` when N > 0.
 
-- [ ] **Step 1: Write the failing tests** in `egress.rs` (tokio). Each test serves `serve_on` on `127.0.0.1:0` with a temp config and state dir. The `Floor` has `public = |ip| ip == 127.0.0.1`, `own = 10.255.255.1`, and a test `Lookup` mapping `upstream.test` to `127.0.0.1:<port>` and `rebind.test` to `[127.0.0.1:<port>, 127.0.0.2:<port>]`. The upstream is a local listener counting accepts. Allow entries carry the upstream's dynamic port (`upstream.test:<port>`).
+- [x] **Step 1: Write the failing tests** in `egress.rs` (tokio). Each test serves `serve_on` on `127.0.0.1:0` with a temp config and state dir. The `Floor` has `public = |ip| ip == 127.0.0.1`, `own = 10.255.255.1`, and a test `Lookup` mapping `upstream.test` to `127.0.0.1:<port>` and `rebind.test` to `[127.0.0.1:<port>, 127.0.0.2:<port>]`. The upstream is a local listener counting accepts. Allow entries carry the upstream's dynamic port (`upstream.test:<port>`).
   - `a_connect_tunnel_carries_bytes_both_ways`: listed, `CONNECT upstream.test:<port>` gives `200`, then `ping` goes up and `pong` comes back.
   - `an_absolute_get_arrives_in_origin_form_without_proxy_headers`: the upstream reads `GET /p?q HTTP/1.1`, a `Host` header, and no `Proxy-Authorization` or `Proxy-Connection`.
   - `a_name_with_one_refused_address_is_refused_whole` (Review Focus 2): `CONNECT rebind.test:<port>` (listed) gives `403`, and the upstream's accept count stays 0.
@@ -111,11 +112,15 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
   - `an_unfinished_head_is_closed`: `head_wait: 200 ms`, send `CONNECT x` with no blank line, and read EOF within 2 s.
   - `audit_lists_destinations_hourly_and_folds_refusal_floods` (pure `Audit`): two `Allowed` notes in one hour give 1 row, and the next hour gives 1 more. 61 `Refused` notes in minute 0 give 60 rows. The first note in minute 1 gives `refused: 1 more` and then its own row.
   - `audit_rows_carry_no_fact_value`: a fact saved through the crate's facts API (as `gate.rs`'s tests do), then `CONNECT <value>.example:443`. `store.audit_rows()` shows a `net` row whose args lack the value.
-- [ ] **Step 2:** `cargo test -p zephyr --lib egress` gives FAIL.
-- [ ] **Step 3: Implement** as in Interfaces. Add `"client"` to hyper's features. `cargo deny check advisories bans`.
-- [ ] **Step 4:** `cargo test -p zephyr --lib egress` passes, then `cargo test -p zephyr --test router` (the extra `select!` arm is pending outside bridge mode).
-- [ ] **Step 5: Docs.** DESIGN §4.4 item 3: "General egress is not blocked either" becomes "the agent's egress goes only through the proxy, to public ports 80 and 443 plus `network.allow` (§4.19)". The ClawSafety reasoning stays. §4.16: SMTP, IMAP and other non-HTTP protocols are closed by §4.19, and HTTPS to a mail API with a token the agent holds stays open (A3). README: the `network.allow` row and its typical entries (`imap.gmail.com:993`, `github.com:22`, `homeassistant.lan:8123`).
-- [ ] **Step 6:** Commit `feat(egress): serve the agent's only way out, a proxy that connects only to addresses it checked`.
+- [x] **Step 2:** `cargo test -p zephyr --lib egress` gives FAIL.
+- [x] **Step 3: Implement** as in Interfaces. Add `"client"` to hyper's features. `cargo deny check advisories bans`.
+- [x] **Step 4:** `cargo test -p zephyr --lib egress` passes, then `cargo test -p zephyr --test router` (the extra `select!` arm is pending outside bridge mode).
+- [x] **Step 5: Docs.** DESIGN §4.4 item 3: "General egress is not blocked either" becomes "the agent's egress goes only through the proxy, to public ports 80 and 443 plus `network.allow` (§4.19)". The ClawSafety reasoning stays. §4.16: SMTP, IMAP and other non-HTTP protocols are closed by §4.19, and HTTPS to a mail API with a token the agent holds stays open (A3). README: the `network.allow` row and its typical entries (`imap.gmail.com:993`, `github.com:22`, `homeassistant.lan:8123`).
+- [x] **Step 6:** Commit `feat(egress): serve the agent's only way out, a proxy that connects only to addresses it checked`.
+- Deviation: the embedded-IPv4 refusal reads `private address ::ffff:127.0.0.1`, not `::ffff:7f00:1`: Rust prints a mapped address in dotted form. The test also covers `::ffff:7f00:1`, NAT64, `::127.0.0.1`, a decimal host and the metadata address.
+- Deviation: forwarded requests always get `Host` from the URI the proxy checked, not only when it is missing (RFC 9112 §3.2.2), so a request cannot name one host to the proxy and another to the server.
+- Deviation: audit args and outcomes are scrubbed with `gate::Scrub` (vault, then facts; made `pub(crate)`) rather than `facts::scrubbed` alone, as spec §4.8 and the wave rule say. A refusal reason never repeats the agent text (400 and 502 reasons are fixed strings); the destination is in the row args. 400 and 502 are audited as `refused: …` too.
+- Deviation: connections are served with `keep_alive(false)`, as the webhook is, so the head deadline also bounds an idle connection and a slot cannot be held open for nothing. The upstream is connected before the `200` of a CONNECT, so a dead destination answers 502.
 
 ### Task A2-3: The agent's processes use the proxy
 
@@ -133,12 +138,13 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
   ```
   `cmd` calls `proxy` when `egress::bridge()`. There is no `ALL_PROXY` (rpi 0.18 refuses a non-HTTP proxy URL). `Host::bridge(&self) -> anyhow::Result<bool>` reads `host_get("network")`, validated as in Global Constraints. `exec_agent` adds each `PROXY_ENV` pair as `-e K=V` when `self.bridge().unwrap_or(true)`. That covers `zephyr shell`, `login` and `--list-models`.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `bridge_mode_gives_the_agent_the_proxy_and_the_browser_flag`: `proxy(&mut Command::new("true")).get_envs()` holds every `PROXY_ENV` pair, and `AGENT_BROWSER_ARGS` ends with `--proxy-server=http://127.0.0.1:7792`. `PROXY_ENV[0].1 == format!("http://127.0.0.1:{}", egress::PORT)`.
   - `outside_bridge_mode_the_agent_gets_no_proxy`: `cmd(&mut Command::new("true"))` sets none of the keys (the test process has no `ZEPHYR_NETWORK`).
   - `tests/host.rs`: the shell's `docker exec` has `-e HTTPS_PROXY=http://127.0.0.1:7792` with the default host.toml, and has no `HTTPS_PROXY` with `network = "host"`.
-- [ ] **Step 2:** Run → FAIL. **Step 3:** Implement. **Step 4:** `cargo test -p zephyr --lib agent` and `cargo test -p zephyr --test host` → PASS.
-- [ ] **Step 5:** Commit `feat(agent): send the agent's processes and its browser through the network proxy in bridge mode`.
+- [x] **Step 2:** Run → FAIL. **Step 3:** Implement. **Step 4:** `cargo test -p zephyr --lib agent` and `cargo test -p zephyr --test host` → PASS.
+- [x] **Step 5:** Commit `feat(agent): send the agent's processes and its browser through the network proxy in bridge mode`.
+- Deviation: `exec_agent` puts the `-e` proxy pairs straight after `PATH`, before the caller flags, so each existing call keeps its tail; the host tests match them through `find_agent`.
 
 ### Task A2-4: Listeners on the container's address
 
@@ -161,13 +167,14 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
 - Publish rule (A2-7): for each `(key, port)` in `published(&cfg)`, `zephyr up` passes `-p 127.0.0.1:<port>:<port>`. The owner fronts the webhook and the web app with `tailscale serve`.
 - `zephyr tui` connects to `listen_addr(127.0.0.1:<a.port>)`. In `reloaded`, when `bridge()`, the router calls `notify_last_owner` once for each key in `moved(old, new)`: `[zephyr] <key> changed; run zephyr up on the host to publish it`.
 
-- [ ] **Step 1: Write the failing tests** in `egress.rs`:
+- [x] **Step 1: Write the failing tests** in `egress.rs`:
   - `published_lists_the_configured_ports`: a config with `[attach] port = 7790` and `[imessage] listen = "100.64.0.1:7791"` gives `[("attach.port", 7790), ("imessage.listen", 7791)]`, and neither section gives `[]`.
   - `moved_names_a_changed_port_only`: attach 7790 → 7799 gives `["attach.port"]`, and a changed `imessage.server_url` gives `[]`.
   - `listen_addr_keeps_the_address_outside_bridge_mode`.
-- [ ] **Step 2:** Run → FAIL. **Step 3:** Implement and switch the three binds/connects. **Step 4:** `cargo test -p zephyr` → PASS (attach, imessage and tui tests unchanged).
-- [ ] **Step 5: Docs.** DESIGN §4.3, line 122: under the floor the agent cannot reach the attach port or the webhook. The caps stay for other users on the host. Both bind the container's own address, and in-container clients connect there.
-- [ ] **Step 6:** Commit `feat(egress): bind the daemon's listeners on the container's own address in bridge mode`.
+- [x] **Step 2:** Run → FAIL. **Step 3:** Implement and switch the three binds/connects. **Step 4:** `cargo test -p zephyr` → PASS (attach, imessage and tui tests unchanged).
+- [x] **Step 5: Docs.** DESIGN §4.3, line 122: under the floor the agent cannot reach the attach port or the webhook. The caps stay for other users on the host. Both bind the container's own address, and in-container clients connect there.
+- [x] **Step 6:** Commit `feat(egress): bind the daemon's listeners on the container's own address in bridge mode`.
+- Deviation: `moved` also names a listener that was added or removed, since that port is published or unpublished too.
 
 ### Task A2-5: The rule set, loaded once by `supervise`, checked by the daemon
 
@@ -189,13 +196,15 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
 - `netcheck` with no argument runs probe (a) only: `direct_refused(1.1.1.1:443, 2 s)`. A connection, a timeout or `ENETUNREACH` is `fail`. A2-6 adds probes (b) to (d) when an address is given.
 - `verify` runs `own_ip()?`. It checks that `/proc/self/status` `CapEff` has bit 12 clear (`the daemon still holds NET_ADMIN`). PR_CAPBSET_DROP does not clear an inherited capability, so this is the check that proves the drop. Then it runs `agent::cmd(Command::new("/usr/local/bin/zephyr")).arg("__netcheck")`, which must exit 0 within 5 s. `main.rs` `run` calls it right after the root/uid check when `bridge()`, so a failure exits non-zero before any agent process starts. `__netcheck` is dispatched before the config is read: the agent cannot read the config.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `ruleset_matches_the_golden_text`: `ruleset(1000)` equals the spec §4.3 block verbatim, with its comments.
   - `direct_refused_accepts_only_a_refusal`: a just-closed local port gives Ok, and a listening `127.0.0.1:0` gives `Err` containing `connected`.
   - In `supervise.rs`, `a_floor_that_fails_to_load_never_starts_the_daemon`: `Policy { floor: Some(|| anyhow::bail!("nft: no")), ..quick() }` makes `run` return 1, and `counted`'s start count is 0.
-- [ ] **Step 2:** Run → FAIL. **Step 3:** Implement. Add `nftables` to the Dockerfile. **Step 4:** `cargo test -p zephyr --lib -- egress supervise` → PASS, then `cargo test -p zephyr`.
-- [ ] **Step 5: Docs.** DESIGN §4.4 item 1 "Network": the bridge network named after the container, `--hostname zephyr`, and `NET_ADMIN`, used once by `supervise` and dropped from the bounding set (the daemon checks `CapEff`). Only the attach port and the webhook are published, on host loopback. Point to §4.19. §4.11: the container has its own netns, so `@/tmp/.X11-unix/X99` is no longer the host's. The cookie stays.
-- [ ] **Step 6:** Commit `feat(supervise): load the agent's network floor before the daemon starts, and refuse to run without it`.
+- [x] **Step 2:** Run → FAIL. **Step 3:** Implement. Add `nftables` to the Dockerfile. **Step 4:** `cargo test -p zephyr --lib -- egress supervise` → PASS, then `cargo test -p zephyr`.
+- [x] **Step 5: Docs.** DESIGN §4.4 item 1 "Network": the bridge network named after the container, `--hostname zephyr`, and `NET_ADMIN`, used once by `supervise` and dropped from the bounding set (the daemon checks `CapEff`). Only the attach port and the webhook are published, on host loopback. Point to §4.19. §4.11: the container has its own netns, so `@/tmp/.X11-unix/X99` is no longer the host's. The cookie stays.
+- [x] **Step 6:** Commit `feat(supervise): load the agent's network floor before the daemon starts, and refuse to run without it`.
+- Deviation: `load_floor` only loads the rules; NET_ADMIN is dropped by `egress::drop_net_admin` in the daemon command `pre_exec`, between fork and exec. `PR_CAPBSET_DROP` changes one thread, and `supervise` runs on a multi-thread runtime, so a drop inside `load_floor` could miss the thread that later forks the daemon. `supervise` itself keeps the capability; it starts nothing but the daemon. `verify` still proves the result through `CapEff`.
+- Deviation: `verify` is async (`tokio::process` with a 5 s timeout), since `run` calls it on the runtime. A pure `net_admin(status)` reads `CapEff` and has its own test.
 
 ### Task A2-6: `doctor` proves the floor
 
@@ -219,15 +228,19 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
 - In bridge mode, in-container `doctor` runs `__netcheck <own_ip>:<attach.port|0>` as the agent and prints its lines (a `fail` fails doctor). It prints `exposed` over `/proc/net/{tcp,tcp6,udp,udp6}` as `root listens on ADDR, where the agent can reach it`. In host mode it prints one warning: `network floor off (host networking): the agent can reach the host's loopback and private ranges`.
 - Host `doctor` reads `docker inspect -f '{{.HostConfig.NetworkMode}}' <container>` and warns `the container still runs host networking; zephyr up moves it to the network floor` when it says `host` while host.toml does not.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `exposed_names_root_listeners_the_agent_could_reach`, on fixture `/proc/net` lines:
     - listed: uid 0 LISTEN `0100007F:1F90` (127.0.0.1:8080), `00000000:1E6E` (0.0.0.0:7790), and tcp6 `00000000000000000000000001000000:1F90` (::1:8080);
     - not listed: `0100007F:1E70` (the proxy), uid 1000 on 127.0.0.1:3000, uid 0 on `020012AC:1E6E` (172.18.0.2), and uid 0 udp `0B00007F:…` (127.0.0.11).
   - `proxy_status_reads_the_status_code`: a local listener answering `HTTP/1.1 403 x\r\n\r\n` gives `Ok(403)`.
   - `tests/host.rs` `doctor_warns_about_a_container_on_host_networking`: the shim's `inspect` answers `${SHIM_NETMODE}` for a `NetworkMode` format, and with `SHIM_NETMODE=host` the output contains the warning.
-- [ ] **Step 2:** Run → FAIL. **Step 3:** Implement. **Step 4:** `cargo test -p zephyr --lib egress` and `cargo test -p zephyr --test host` → PASS.
-- [ ] **Step 5: Docs.** DESIGN §4.8 `doctor`: the probes run as the agent, the root-listener rule, and the host-mode warning.
-- [ ] **Step 6:** Commit `feat(doctor): prove the network floor by probing as the agent and refusing root listeners it could reach`.
+- [x] **Step 2:** Run → FAIL. **Step 3:** Implement. **Step 4:** `cargo test -p zephyr --lib egress` and `cargo test -p zephyr --test host` → PASS.
+- [x] **Step 5: Docs.** DESIGN §4.8 `doctor`: the probes run as the agent, the root-listener rule, and the host-mode warning.
+- [x] **Step 6:** Commit `feat(doctor): prove the network floor by probing as the agent and refusing root listeners it could reach`.
+- Deviation: `proxy_status(proxy, target)` takes the proxy address, so the test can point it at a local listener.
+- Deviation: `exposed` counts a root UDP socket only when it is unconnected (remote `0.0.0.0:0`): the daemon resolver holds connected sockets on loopback for a moment, which nobody else can send to, and they would fail doctor at random. A `/proc/net` line that cannot be read is listed, not skipped, and an IPv4-mapped loopback counts as loopback.
+- Deviation: a proxy that does not answer at all makes probe (d) a `warn`, not a `fail`: with the daemon stopped the agent has no way out, and `doctor` is also run then. Any status but 403 for the two refused targets is still a `fail`. Probe (b) is skipped when the port is 0 (no `[attach]`).
+- Deviation: `network_mode` (planned for A2-7) is added here, where the host `doctor` first needs it.
 
 ### Task A2-7: `zephyr up` in bridge mode, publishing, migration
 
@@ -253,7 +266,7 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
   4. With `[imessage]` in bridge mode it prints `the iMessage webhook is on this host's 127.0.0.1:<p> now; forward the Tailscale address to it once: sudo tailscale serve --bg --tcp <p> tcp://127.0.0.1:<p>`.
 - `uninstall` runs `docker network rm <container>` after `rm -f`. `attach --stock` passes `<container_ip>:<port>` in bridge mode. `config set` (file path) and `channel add|remove` call `apply_published` with the `published` list read before the edit. `init` calls `set_network_default`.
 
-- [ ] **Step 1: Write the failing tests** in `tests/host.rs`. The shim's `network` case exits `${SHIM_NO_NETWORK:-0}` for `inspect`. Its `inspect` answers `${SHIM_NETMODE:-$CONTAINER}` for `NetworkMode` and `${SHIM_IP:-172.18.0.2}` for `IPAddress` formats, and keeps `SHIM_STATE` otherwise.
+- [x] **Step 1: Write the failing tests** in `tests/host.rs`. The shim's `network` case exits `${SHIM_NO_NETWORK:-0}` for `inspect`. Its `inspect` answers `${SHIM_NETMODE:-$CONTAINER}` for `NetworkMode` and `${SHIM_IP:-172.18.0.2}` for `IPAddress` formats, and keeps `SHIM_STATE` otherwise.
   - Extend `init_non_interactive_builds_the_layout_and_starts_the_container`. The run has the pairs `["--network", CONTAINER]`, `["--hostname", "zephyr"]` and `["--cap-add", "NET_ADMIN"]`, and contains `ZEPHYR_NETWORK=bridge` and `["-p", "127.0.0.1:7790:7790"]`. There is no `["--network", "host"]`. host.toml contains `network = "bridge"`.
   - `up_creates_the_network_only_when_missing`: with `SHIM_NO_NETWORK=1` the calls hold `docker network create --driver bridge CONTAINER`, and without it they do not.
   - `host_networking_in_host_toml_keeps_todays_arguments`: `network = "host"` gives `["--network", "host"]`, with no `NET_ADMIN`, no `-p` and no `ZEPHYR_NETWORK`. `network = "none"` fails with the Global Constraints text.
@@ -261,14 +274,18 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
   - `config_set_of_a_published_port_recreates_the_container`: with the daemon down, `config set attach.port 7799` makes a new `docker run -d` with `-p 127.0.0.1:7799:7799`, and no `zephyr reload` exec.
   - `up_from_a_host_networking_container_explains_the_floor`: with `SHIM_NETMODE=host`, stdout contains `the agent now reaches the internet only through zephyr's proxy`.
   - `uninstall_removes_the_network` and `attach_stock_connects_to_the_container_address` (argv ends with `172.18.0.2:7790`).
-- [ ] **Step 2:** `cargo test -p zephyr --test host` → FAIL. **Step 3:** Implement. **Step 4:** Run → PASS. The existing `up`/`upgrade` tests stay green.
-- [ ] **Step 5: Docs.** README covers:
+- [x] **Step 2:** `cargo test -p zephyr --test host` → FAIL. **Step 3:** Implement. **Step 4:** Run → PASS. The existing `up`/`upgrade` tests stay green.
+- [x] **Step 5: Docs.** README covers:
   - `network` in host.toml and how to go back;
   - the migration notice;
   - the iMessage `tailscale serve --bg --tcp` step in the channel setup;
   - the x11vnc recipe with `-listen <container ip>` in place of `-localhost`, where `docker inspect` prints the IP and the viewer connects to it from the host;
   - model servers on host loopback, which bind the bridge gateway and are listed in `network.allow`.
-- [ ] **Step 6:** Commit `feat(host): run the container on its own bridge with only zephyr's ports published on loopback`.
+- [x] **Step 6:** Commit `feat(host): run the container on its own bridge with only zephyr's ports published on loopback`.
+- Deviation: `up` also passes `--cap-add SETPCAP`. The container runs with `--cap-drop ALL`, and `PR_CAPBSET_DROP` needs SETPCAP, so without it `supervise` could not take NET_ADMIN away from the daemon. `egress::drop_net_admin` drops NET_ADMIN and then SETPCAP from the daemon bounding set, so the daemon holds SETUID, SETGID and KILL as before.
+- Deviation (changed in review): the host reads the published ports from zephyr.toml key by key (`egress::published_from`, over the one `LISTENERS` table `egress::published` also uses), not through the strict `Config`, so a key from a newer zephyr cannot stop `up`, `config set` or `channel`. `up` passes `-e ZEPHYR_PUBLISHED=<ports>`; the daemon tells the owner `<key> changed; run zephyr up …` when it has listened for a minute on a port not among them (`egress::unpublished`, replacing `moved`), so a host `config set`, which makes the new container itself, causes no notice. The `tailscale serve` line is printed only by the `up` that moves a container off host networking.
+- Deviation: `apply_published` recreates only a running container; a stopped one publishes the port at its next `up`. The existing `config_get_and_set_check_the_daemon_schema` test now uses `owners.discord` as its unregistered key, since `attach.port` recreates the container.
+- Deviation: the README gets one section, "The agent network", for the host.toml line, the migration, `tailscale serve`, model servers and `network.allow`; the x11vnc recipe is changed in place.
 
 ### Task A2-8: Sign-ins by pasting the callback address
 
@@ -289,14 +306,17 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
 - Host `zephyr login`, before the interactive OAuth `run`, prints `if the browser then cannot open 127.0.0.1, paste its address here`.
 - fake-rpi: the `login_url` branch prints `Paste OAuth code or response:` after the URL, then finishes on `login_go` **or** on a non-empty stdin line. A non-empty line logs `{"type": "auth-paste"}` (never the text) to `log.jsonl`.
 
-- [ ] **Step 1: Write the failing tests** in `tests/login.rs`:
+- [x] **Step 1: Write the failing tests** in `tests/login.rs`:
   - `a_pasted_callback_address_finishes_an_oauth_login_and_is_redacted`: start `antigravity` with `login_url`, wait for the URL, `auth::input(id, "http://127.0.0.1:1455/cb?code=SECRETCODE")` is true, and the login gets to `done`. `log.jsonl` has `auth-paste`, and no poll's `lines` contains `SECRETCODE`.
   - In `an_oauth_login_reports_its_url_then_finishes_when_the_browser_returns`, the waiting phase is now `need_input`.
   - `a_channel_pastes_the_callback_into_its_own_oauth_login`: owner A on discord runs `/login antigravity`, and the notice contains `/login paste`. Owner B's `/login paste http://127.0.0.1:1455/cb?code=X` gets the no-sign-in reply. `/login paste sk-ant-abc` gets the refusal. A's paste gets `sent to the antigravity sign-in` and later `done`.
   - `tests/host.rs`: an interactive OAuth `zephyr login` prints the hint before the `docker exec -it`.
-- [ ] **Step 2:** `cargo test -p zephyr --test login` → FAIL. **Step 3:** Implement Rust and fake-rpi together. **Step 4:** Run `cargo test -p zephyr --test login --test host --test router` and `cargo test -p zephyr --lib tui` → PASS.
-- [ ] **Step 5: Docs.** DESIGN §4.7.1: the callback no longer reaches the container, so the owner pastes the address. The text is kept only to redact the echo, and a channel paste stays in that inbox row as any message does (a used, single-use code). README covers sign-ins.
-- [ ] **Step 6:** Commit `feat(auth): finish an OAuth sign-in from the address the browser could not open`.
+- [x] **Step 2:** `cargo test -p zephyr --test login` → FAIL. **Step 3:** Implement Rust and fake-rpi together. **Step 4:** Run `cargo test -p zephyr --test login --test host --test router` and `cargo test -p zephyr --lib tui` → PASS.
+- [x] **Step 5: Docs.** DESIGN §4.7.1: the callback no longer reaches the container, so the owner pastes the address. The text is kept only to redact the echo, and a channel paste stays in that inbox row as any message does (a used, single-use code). README covers sign-ins.
+- [x] **Step 6:** Commit `feat(auth): finish an OAuth sign-in from the address the browser could not open`.
+- Deviation: a posted login is not only pruned when it ends: the tick posts `signed in to …` or `signing in to … failed` for it first, so the owner who pasted on a channel hears how it ended.
+- Deviation: the host `zephyr login` prints its hint only when host.toml asks for the network floor; with `network = "host"` the callback still reaches the container. The channel test uses two senders on the `chat` channel, which is what the router keys a login on (channel and sender).
+- Deviation: seen once in a full run, unrelated to this lane: `tests/cli.rs` `status_shows_the_main_child_the_waiting_message_and_the_replies` read `101s ago` where it expects `100s ago` (a second ticked between its UPDATE and the status call). It passes alone and on the rerun.
 
 ### Task A2-9: §4.19, and the side-container check
 
@@ -308,9 +328,9 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
 - Consumes: everything above.
 - `net_floor.rs` panics at its start unless `ZEPHYR_CONTAINER` is set and is not `zephyr` (never the live install). Without Docker it skips, unless `ZEPHYR_REAL_RPI=1`. Agent commands are `docker exec -u <uid>:<gid> -e PATH=<AGENT_PATH>` plus each `agent::PROXY_ENV` pair, and `AGENT_BROWSER_ARGS` with the proxy flag (as `agent::proxy` builds it).
 
-- [ ] **Step 1: Docs.** DESIGN §4.19 Network floor: the rule set and why it looks as it does (spec §4.3), the proxy and its checks (§4.4), what the agent's processes get and what stops working (§4.5), listeners (§4.6, with decision 2's loopback publish and `tailscale serve`), sign-ins and X11 (§4.7), audit (§4.8), failure handling (§4.10, without the Tailscale boot-order case), and the owner's four decisions. §7: the host's own public address on a VPS stays open. CLAUDE.md: `egress.rs` (DESIGN §4.19): the proxy on 127.0.0.1:7792, `public`/`decide`, `listen_addr`/`published` for every daemon listener, `ruleset`/`load_floor` run by `supervise`, `verify`, and `__netcheck`.
-- [ ] **Step 2: Write `net_floor.rs`'s `the_agent_reaches_only_the_proxy`**, asserting each check in Step 4. It must compile and skip: `cargo test -p zephyr --test net_floor` → 0 run, 1 ignored.
-- [ ] **Step 3: Bring up the side container** (own HOME, own image, and attach on 17790 because the live install holds 7790):
+- [x] **Step 1: Docs.** DESIGN §4.19 Network floor: the rule set and why it looks as it does (spec §4.3), the proxy and its checks (§4.4), what the agent's processes get and what stops working (§4.5), listeners (§4.6, with decision 2's loopback publish and `tailscale serve`), sign-ins and X11 (§4.7), audit (§4.8), failure handling (§4.10, without the Tailscale boot-order case), and the owner's four decisions. §7: the host's own public address on a VPS stays open. CLAUDE.md: `egress.rs` (DESIGN §4.19): the proxy on 127.0.0.1:7792, `public`/`decide`, `listen_addr`/`published` for every daemon listener, `ruleset`/`load_floor` run by `supervise`, `verify`, and `__netcheck`.
+- [x] **Step 2: Write `net_floor.rs`'s `the_agent_reaches_only_the_proxy`**, asserting each check in Step 4. It must compile and skip: `cargo test -p zephyr --test net_floor` → 0 run, 1 ignored.
+- [x] **Step 3: Bring up the side container** (own HOME, own image, and attach on 17790 because the live install holds 7790):
   ```sh
   cargo build -p zephyr && Z=$PWD/target/debug/zephyr
   export ZEPHYR_CONTAINER=zephyr-test ZEPHYR_IMAGE=zephyr-dev:$(git rev-parse --short HEAD)
@@ -319,7 +339,7 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
   $Z config set attach.port 17790 && $Z up --build
   ```
   Expected: `docker inspect -f '{{.HostConfig.NetworkMode}}' zephyr-test` prints `zephyr-test`.
-- [ ] **Step 4: Run the checks:** `cargo test -p zephyr --test net_floor -- --ignored` (same env). It passes when all of these hold:
+- [x] **Step 4: Run the checks:** `cargo test -p zephyr --test net_floor -- --ignored` (same env). It passes when all of these hold:
   - As the agent, each of these fails at once and gets no answer:
     - `curl -m 5 http://127.0.0.1:17790/` and `curl -m 5 http://127.0.0.1:7790/`;
     - `curl -m 5 --noproxy '*'` to `http://192.168.1.1/`, `http://100.100.100.100/`, `http://169.254.169.254/` and `https://1.1.1.1`.
@@ -331,9 +351,29 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
   - `docker exec zephyr-test zephyr doctor` exits 0 with the floor lines `ok`.
   - The daemon's `CapEff` (`/proc/<pid of zephyr run>/status`) has bit 12 clear.
   - From the host, `curl -s -m 3 http://127.0.0.1:17790/` connects (the publish works).
-- [ ] **Step 5: Manual checks**, recorded in the PR body:
+- [x] **Step 5: Manual checks**, recorded in the PR body:
   - `docker exec -u $(id -u) -e DISPLAY=:99 -e XAUTHORITY=/zephyr/.zephyr-xauthority zephyr-test xdpyinfo` works, and `xdpyinfo -display :99` on the host does not reach it.
   - OAuth paste on the host: `$Z login openai-codex`. Open the URL in the host's browser, sign in, let the `127.0.0.1:1455` page fail, and paste its address at rpi's prompt. Then `$Z accounts` lists the account.
   - The same through the TUI: `$Z attach`, `/login antigravity`, and paste the failed address into the panel's input row. It reaches `done`.
-- [ ] **Step 6: Tear down:** `docker rm -f zephyr-test && docker network rm zephyr-test && rm -rf "$HOME"`.
-- [ ] **Step 7:** Commit `docs(egress): describe the network floor, and check it against a real container`.
+- [x] **Step 6: Tear down:** `docker rm -f zephyr-test && docker network rm zephyr-test && rm -rf "$HOME"`.
+- [x] **Step 7:** Commit `docs(egress): describe the network floor, and check it against a real container`.
+- Deviation: side-container run (image `zephyr-dev:a2-0932eae` built from this branch by `zephyr up --build`, container `zephyr-test` on its own bridge, attach on 17790, its own HOME; removed afterwards): `tests/net_floor.rs -- --ignored` passed. As the agent, direct connections to 127.0.0.1:7790, 127.0.0.1:17790, the container address on 17790, 192.168.1.1, 100.100.100.100, 169.254.169.254, 1.1.1.1:443 and the bridge gateway were each refused in about 0.1 s; the proxy answered 403 for the private and metadata addresses and for `[::ffff:127.0.0.1]`; `getent hosts example.com` failed; `curl https://example.com`, agent-browser and Camoufox each got `Example Domain`; the audit held `example.com:443 -> <ip>|allowed` and the refusals; the daemon `CapEff` was `e0` (SETUID, SETGID, KILL) while `supervise` kept `11e0`; the host reached 127.0.0.1:17790.
+- Deviation: `zephyr doctor` printed every floor line `ok` but exited 1 in the side container, because that install has no signed-in account (`rpi --mode rpc did not start: No API key`). The test asserts the floor lines, not the exit code.
+- Deviation: also checked by hand there: with the table deleted and the daemon killed, the restarted daemon refused to run (`the network floor is not in place: … connected to 1.1.1.1:443`), `supervise` gave up after 5 exits, Docker restarted the container and the rules were loaded again. `xdpyinfo` worked in the container with the cookie and was refused without it.
+- Deviation: not done from Step 5: the two OAuth paste checks need a real provider account and a browser, and the host half of the `xdpyinfo` check cannot be told apart on this machine, where the live host-network container owns the host abstract socket for display 99.
+
+### Review fixes (2026-11-10)
+
+After the branch review, on the same branch; the spec's "Changed in review" section lists what differs from its body.
+
+- [x] `own_ip` takes the first IPv4 address.
+- [x] The host CLI follows the running container's network, and passes one shared proxy env with the browser's flag.
+- [x] Published ports are read by key; the `tailscale serve` hint prints only on the move; the unpublished-port notice comes from `ZEPHYR_PUBLISHED`.
+- [x] Proxy timeouts: 30 min idle on tunnels and forwarded bodies, 5 min for a reply to start.
+- [x] The audit has one writer thread; the overflow row is flushed at the minute's end as tool `proxy`.
+- [x] `/login cancel` reaches posted sign-ins; `/login paste` takes `<…>`.
+- [x] OAuth is `need_input` only under the floor (`Config::floor`).
+- [x] `doctor`'s probe as the agent is bounded to 50 s.
+- [x] `network.allow` entries get a direct route (`egress::keep_allow`, run by `supervise`).
+- Deviation from the review's suggested approach for the last one: `supervise`, not the daemon, resolves the entries and loads the set, because the daemon holds no NET_ADMIN; names are resolved with a small DNS query of its own so `/etc/hosts` cannot answer the refresh; and the rule set also refuses the agent packets sent as 127.0.0.11.
+

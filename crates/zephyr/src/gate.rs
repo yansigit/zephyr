@@ -607,7 +607,7 @@ fn stored_request(a: &Action) -> Option<Request> {
 }
 
 /// One audit row, its arguments cut to 500 bytes.
-fn audit_row(store: &Store, session: &str, tool: &str, args: &str, outcome: &str) {
+pub(crate) fn audit_row(store: &Store, session: &str, tool: &str, args: &str, outcome: &str) {
     let end = (0..=AUDIT_ARGS.min(args.len()))
         .rev()
         .find(|&i| args.is_char_boundary(i))

@@ -271,7 +271,7 @@ pub async fn run<C: Channel>(
     let (cfg_tx, cfg_rx) = watch::channel(Arc::new(cfg.clone()));
     let (snap, snap_rx) = watch::channel(Snapshot::default());
     let activity_rx = snap_rx.clone();
-    let attach_cfgs = cfg_rx.clone();
+    let (attach_cfgs, egress_cfgs) = (cfg_rx.clone(), cfg_rx.clone());
     let (gate_cfgs, gate_snap) = (cfg_rx.clone(), snap_rx.clone());
     let names = channels.iter().map(|c| c.name().to_string()).collect();
     let mut router = Router::new(cfg, &jobs, attaches, cfg_tx, snap, names)?;
@@ -294,6 +294,8 @@ pub async fn run<C: Channel>(
         r = runs => r.map(|_| Exit::Shutdown),
         // Tasks' and jobs' sends, every connector call, the browser's clicks (approvals §4.2).
         r = crate::gate::serve(gate_cfgs, gate_snap, waits, &jobs, gate_notes) => r.map(|()| Exit::Shutdown),
+        // The agent's only way out, in bridge mode (DESIGN §4.20).
+        r = crate::egress::serve(egress_cfgs, &jobs) => r.map(|()| Exit::Shutdown),
         r = crate::attach::serve(cfg, tx, attach_tx, snap_rx, attach_cfgs) => r.map(|()| Exit::Shutdown),
         r = crate::scheduler::run(cfg_rx.clone(), &jobs) => r.map(|()| Exit::Shutdown),
         r = crate::tasks::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),
@@ -377,6 +379,9 @@ fn edits(cfg: &Config) -> Edits {
 /// starts, and waiting for it in the loop that reads the child would stop it from reading events,
 /// capping a run or flushing a channel, so the tick posts the notice instead. `from` is the
 /// channel and sender that asked: an attached client is reached by `show` alone.
+/// How long a port stays unpublished before the owner is told (`Router::unpublished_notice`).
+const UNPUBLISHED_WAIT: Duration = Duration::from_secs(60);
+
 struct Login {
     id: String,
     provider: &'static str,
@@ -410,6 +415,12 @@ struct Router<'a> {
     auth_stamp: Option<SystemTime>,
     /// Sign-ins `/login` started whose URL is not out yet.
     logins: Vec<Login>,
+    /// The `/login` sign-ins whose URL was posted and that have not ended: `/login paste` feeds
+    /// the sender's own, and the tick posts how each ended.
+    posted: Vec<Login>,
+    /// The keys whose port the container does not publish, since when, and whether the owner
+    /// was told (`unpublished_notice`).
+    unpublished: Option<(Vec<&'static str>, Instant, bool)>,
     /// `/login` starts still running: the tick drains them, so this loop never waits on rpi.
     starting: Vec<Starting>,
     /// The `/btw` side question being answered (`crate::btw::run`), one at a time.
@@ -569,6 +580,8 @@ impl<'a> Router<'a> {
             reexec: false,
             auth_stamp: None,
             logins: Vec::new(),
+            posted: Vec::new(),
+            unpublished: None,
             starting: Vec::new(),
             btw: None,
             store: Store::open(&cfg.db_path())?,
@@ -684,6 +697,7 @@ impl<'a> Router<'a> {
                     self.cap_run().await;
                     self.login_starts().await;
                     self.login_notices();
+                    self.unpublished_notice();
                     if self.cfg.path.is_some() && edits(&self.cfg) != self.edits {
                         let text = self.reload().await;
                         eprintln!("zephyr: zephyr.toml or secrets.env changed: {text}");
@@ -899,6 +913,32 @@ impl<'a> Router<'a> {
         self.action_woken = newest;
         self.jobs.inbox.notify_one();
         true
+    }
+
+    /// Tells the owner, once, when the daemon listens on a port its container does not publish
+    /// (DESIGN §4.20): zephyr.toml was edited by hand, and only `zephyr up` publishes a port. Not
+    /// before `UNPUBLISHED_WAIT`: the host's `config set` and `channel` commands make the new
+    /// container themselves, and that takes this daemon down before it has said anything.
+    fn unpublished_notice(&mut self) {
+        if !crate::egress::bridge() {
+            return;
+        }
+        let made_with = std::env::var("ZEPHYR_PUBLISHED").ok();
+        let keys = crate::egress::unpublished(&self.cfg, made_with.as_deref());
+        if self.unpublished.as_ref().map(|u| &u.0) != Some(&keys) {
+            self.unpublished = Some((keys, Instant::now(), false));
+        }
+        let Some((keys, since, told)) = &mut self.unpublished else {
+            return;
+        };
+        if *told || since.elapsed() < UNPUBLISHED_WAIT {
+            return;
+        }
+        *told = true;
+        for key in keys.iter() {
+            let text = format!("[zephyr] {key} changed; run zephyr up on the host to publish it");
+            log(self.store.notify_last_owner(&text).map_err(Into::into));
+        }
     }
 
     /// The tick's part for held actions (`actions::tick`): `held` while the gateway is paused,
@@ -2917,6 +2957,7 @@ impl<'a> Router<'a> {
             return format!(
                 "[zephyr] /login PROVIDER [ACCOUNT] [MODEL]\nproviders: {}\n\
                  /login cancel [ID|PROVIDER] stops a sign-in, so a refused one can be retried.\n\
+                 /login paste ADDRESS finishes one whose page could not open 127.0.0.1.\n\
                  A provider that takes a key or a setup token is signed in on the host: \
                  `zephyr login PROVIDER`. Never paste a token here.",
                 ids()
@@ -2926,6 +2967,9 @@ impl<'a> Router<'a> {
         let (verb, rest) = arg.split_once(' ').unwrap_or((arg, ""));
         if verb == "cancel" {
             return self.login_cancel(rest).await;
+        }
+        if verb == "paste" {
+            return self.login_paste(rest, from);
         }
         let mut words = arg.split_whitespace();
         let provider = words.next().unwrap_or_default();
@@ -2980,6 +3024,34 @@ impl<'a> Router<'a> {
         }
     }
 
+    /// `/login paste ADDRESS`: the address the owner's browser could not open goes to the stdin
+    /// of the sender's own newest sign-in, where rpi reads the code from it (DESIGN §4.7.1). Only
+    /// something that looks like that address is taken, so a token pasted by mistake goes nowhere.
+    fn login_paste(&mut self, text: &str, from: (&str, &str)) -> String {
+        // Discord wraps a link in angle brackets when its preview is off.
+        let text = text.trim();
+        let text = (text.strip_prefix('<').and_then(|t| t.strip_suffix('>'))).unwrap_or(text);
+        let address = ["http://127.0.0.1", "http://localhost"]
+            .iter()
+            .any(|start| text.starts_with(start))
+            || text.contains("code=");
+        if !address {
+            return "[zephyr] /login paste takes the address the browser could not open \
+                    (http://127.0.0.1:…?code=…). Never paste a token here."
+                .into();
+        }
+        let theirs = |l: &&Login| {
+            (l.from.as_ref())
+                .is_some_and(|(channel, sender)| (channel.as_str(), sender.as_str()) == from)
+        };
+        match self.posted.iter().rev().find(theirs) {
+            Some(login) if crate::auth::input(&login.id, text) => {
+                format!("[zephyr] sent to the {} sign-in", login.provider)
+            }
+            _ => "[zephyr] no sign-in of yours is waiting for a pasted address".into(),
+        }
+    }
+
     /// `/login cancel [ID|PROVIDER]`: stops sign-ins this daemon holds, so a chat that abandoned
     /// one can start another — nothing else a channel can send reaches them. With an `ID`, that
     /// login; with a `PROVIDER` id, the ones waiting for that provider (the notices still to be
@@ -3026,28 +3098,18 @@ impl<'a> Router<'a> {
                 }
             }
         }
-        let ids: Vec<String> = match provider {
-            // Only `/login` knows a login's provider for as long as it waits, so the ids of the
-            // ones it already announced are gone with the notice; `auth::logins` has them all.
-            // But only this router's own logins are cancelled: the registry is process-wide,
-            // and another daemon (or an attached TUI's `zephyr.login_*`) may hold a login with
-            // the same provider. A bare cancel takes every login this router started.
-            Some(p) => self
-                .logins
-                .iter()
-                .filter(|l| l.provider == p)
-                .map(|l| l.id.clone())
-                .collect(),
-            None if what.is_empty() => self.logins.iter().map(|l| l.id.clone()).collect(),
-            // An id names one login; only this router's own ids are honoured, so one channel
-            // cannot stop another daemon's (or an attached TUI's) sign-in by guessing its id.
-            None => vec![what.to_string()]
-                .into_iter()
-                .filter(|id| self.logins.iter().any(|l| &l.id == id))
-                .collect(),
+        // Only this router's own logins, the ones still waiting for their URL and the ones
+        // whose URL was posted: the registry is process-wide, and an attached TUI's
+        // `zephyr.login_*` may hold a login with the same provider, or an id a channel guessed.
+        let own = |l: &&Login| match provider {
+            Some(p) => l.provider == p,
+            None => what.is_empty() || l.id == what,
         };
-        for id in ids {
-            let provider = self.logins.iter().find(|l| l.id == id).map(|l| l.provider);
+        let mine: Vec<(String, &'static str)> = (self.logins.iter().chain(&self.posted))
+            .filter(own)
+            .map(|l| (l.id.clone(), l.provider))
+            .collect();
+        for (id, provider) in mine {
             // Read before the cancel: `cancel` takes the entry out of the registry.
             let account = crate::auth::poll(&id)
                 .and_then(|l| l["account"].as_str().map(str::to_string))
@@ -3057,11 +3119,10 @@ impl<'a> Router<'a> {
                 continue;
             }
             self.logins.retain(|l| l.id != id);
-            lines.push(match (provider, account) {
-                (Some(p), Some(a)) => format!("[zephyr] cancelled the sign-in to {p} as {a}"),
-                (Some(p), None) => format!("[zephyr] cancelled the sign-in to {p}"),
-                (None, Some(a)) => format!("[zephyr] cancelled the sign-in as {a}"),
-                (None, None) => "[zephyr] cancelled a sign-in".to_string(),
+            self.posted.retain(|l| l.id != id);
+            lines.push(match account {
+                Some(a) => format!("[zephyr] cancelled the sign-in to {provider} as {a}"),
+                None => format!("[zephyr] cancelled the sign-in to {provider}"),
             });
         }
         if lines.is_empty() {
@@ -3115,12 +3176,15 @@ impl<'a> Router<'a> {
         }
     }
 
-    /// Posts what each `/login` sign-in has to say — the URL, a failure, or the account once it
-    /// is recorded — and forgets it. On the 5 s config tick, so nothing here waits on a login and
-    /// a login that died without a word is dropped by the registry and forgotten with it.
+    /// Posts what each `/login` sign-in has to say: the URL once, then a failure or the account
+    /// once it is recorded, after which it is forgotten. On the 5 s config tick, so nothing here
+    /// waits on a login and a login that died without a word is dropped by the registry and
+    /// forgotten with it.
     fn login_notices(&mut self) {
-        let logins = std::mem::take(&mut self.logins);
-        for Login { id, provider, from } in logins {
+        let waiting = std::mem::take(&mut self.logins).into_iter();
+        let posted = std::mem::take(&mut self.posted).into_iter();
+        let all = waiting.map(|l| (l, false)).chain(posted.map(|l| (l, true)));
+        for (Login { id, provider, from }, announced) in all {
             let Some(login) = crate::auth::poll(&id) else {
                 continue; // finished long ago, or evicted: nothing left to say
             };
@@ -3138,11 +3202,26 @@ impl<'a> Router<'a> {
                     "[zephyr] signing in to {provider} failed: {}",
                     login["error"].as_str().unwrap_or("no reason given")
                 ),
+                // Its URL is out; the owner is signing in.
+                _ if announced => {
+                    self.posted.push(Login { id, provider, from });
+                    continue;
+                }
                 _ => match login["url"].as_str() {
-                    Some(url) => format!(
-                        "[zephyr] sign in to {provider} as {} at {url}",
-                        login["account"].as_str().unwrap_or_default()
-                    ),
+                    Some(url) => {
+                        // Only where the browser's redirect cannot reach the login.
+                        let paste = match phase {
+                            "need_input" => "\nIf the page then cannot open 127.0.0.1, send /login paste <its address>.",
+                            _ => "",
+                        };
+                        let text = format!(
+                            "[zephyr] sign in to {provider} as {} at {url}{paste}",
+                            login["account"].as_str().unwrap_or_default()
+                        );
+                        self.login_notice(&text, &from);
+                        self.posted.push(Login { id, provider, from });
+                        continue;
+                    }
                     None => {
                         // Still waiting for the URL.
                         self.logins.push(Login { id, provider, from });

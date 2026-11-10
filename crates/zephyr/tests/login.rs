@@ -429,7 +429,12 @@ async fn an_oauth_login_reports_its_url_then_finishes_when_the_browser_returns()
     assert_eq!(start.kind, zephyr::auth::Kind::Oauth);
 
     let waiting = until(&start.login_id, |l| !l["url"].is_null()).await;
+    // Outside the network floor the callback reaches the login, so nothing is asked for.
     assert_eq!(waiting["phase"], "waiting");
+    assert!(!zephyr::auth::input(
+        &start.login_id,
+        "http://127.0.0.1:1455/cb?code=X"
+    ));
     assert_eq!(waiting["url"], "https://example.test/login/antigravity");
 
     assert!(!home.join("login_go").exists());
@@ -653,6 +658,208 @@ async fn start_says_no_to_an_unknown_provider_and_a_config_with_no_file() {
     assert!(format!("{e:#}").contains("no zephyr.toml"), "{e:#}");
 }
 
+/// Under the network floor the provider's `127.0.0.1` callback never reaches the container, so
+/// the owner pastes the address the browser could not open: it goes to rpi's prompt, finishes
+/// the sign-in, and never comes back out of a poll.
+#[tokio::test]
+async fn a_pasted_callback_address_finishes_an_oauth_login_and_is_redacted() {
+    const PASTED: &str = "http://127.0.0.1:1455/cb?code=SECRETCODE";
+    let (mut cfg, home) = setup("paste", "");
+    cfg.floor = true;
+    std::fs::write(home.join("login_url"), "").unwrap();
+    let model = Some("antigravity/gemini-3".into());
+    let start = zephyr::auth::start(&cfg, "antigravity", None, model)
+        .await
+        .unwrap();
+    let asked = until(&start.login_id, |l| !l["url"].is_null()).await;
+    // An OAuth login takes a line under the floor: the address its callback could not reach.
+    assert_eq!(asked["phase"], "need_input");
+    assert!(zephyr::auth::input(&start.login_id, PASTED));
+    let mut leaked = false;
+    let done = until(&start.login_id, |l| {
+        leaked |= l.to_string().contains("SECRETCODE");
+        l["phase"] == "done"
+    })
+    .await;
+    assert!(
+        !leaked && !done.to_string().contains("SECRETCODE"),
+        "{done}"
+    );
+    assert!(
+        !home.join("login_go").exists(),
+        "only the paste finished it"
+    );
+    let log = std::fs::read_to_string(home.join("log.jsonl")).unwrap();
+    assert!(log.contains("\"auth-paste\""), "{log}");
+    assert!(!log.contains("SECRETCODE"), "{log}");
+    assert!(toml_at(&cfg).contains("name = \"antigravity-1\""));
+}
+
+/// `/login paste` from a channel reaches only the sender's own waiting sign-in, and takes an
+/// address, never a token.
+#[tokio::test]
+async fn a_channel_pastes_the_callback_into_its_own_oauth_login() {
+    let (cfg, home) = setup("channel-paste", "");
+    let path = cfg.path.clone().unwrap();
+    let both = toml_at(&cfg).replace("chat = [\"owner\"]", "chat = [\"owner\", \"other\"]");
+    std::fs::write(&path, both).unwrap();
+    let mut cfg2 = Config::load(&path).unwrap();
+    cfg2.tick = cfg.tick;
+    cfg2.floor = true;
+    let cfg = cfg2;
+    std::fs::write(home.join("login_url"), "").unwrap();
+    let (feed, rx) = tokio::sync::mpsc::channel(8);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let sent: Sent = Default::default();
+    let task = tokio::spawn({
+        let sent = sent.clone();
+        async move {
+            let feed = Feed {
+                rx: tokio::sync::Mutex::new(rx),
+                sent,
+            };
+            let stop = async {
+                let _ = stopped.await;
+            };
+            zephyr::router::run(&cfg, &[feed], stop).await
+        }
+    });
+    let mut n = 0;
+    let mut say = |sender: &str, text: &str| {
+        n += 1;
+        let msg = Inbound {
+            channel: "chat".into(),
+            platform_msg_id: format!("m{n}"),
+            sender: sender.into(),
+            text: text.into(),
+        };
+        let feed = feed.clone();
+        async move { feed.send(msg).await.unwrap() }
+    };
+    let told = |what: &'static str| {
+        let sent = sent.clone();
+        async move { replies_until(&sent, |r| r.iter().any(|x| x.contains(what)), what).await }
+    };
+
+    say(
+        "owner",
+        "/login antigravity antigravity-1 antigravity/gemini-3",
+    )
+    .await;
+    let got = told("https://example.test/login/antigravity").await;
+    let notice = got
+        .iter()
+        .find(|x| x.contains("https://example.test"))
+        .unwrap();
+    assert!(
+        notice.ends_with(
+            "\nIf the page then cannot open 127.0.0.1, send /login paste <its address>."
+        ),
+        "{notice}"
+    );
+
+    // Another owner has no sign-in waiting; theirs is not this one.
+    say("other", "/login paste http://127.0.0.1:1455/cb?code=X").await;
+    told("[zephyr] no sign-in of yours is waiting for a pasted address").await;
+    // A token is never taken here.
+    say("owner", "/login paste sk-ant-abc").await;
+    told(
+        "[zephyr] /login paste takes the address the browser could not open \
+         (http://127.0.0.1:…?code=…). Never paste a token here.",
+    )
+    .await;
+    assert!(!home.join("log.jsonl").exists() || !log_has_paste(&home));
+
+    say(
+        "owner",
+        // As Discord sends a link whose preview is off: in angle brackets.
+        "/login paste <http://127.0.0.1:1455/cb?state=1&c=SECRETCODE>",
+    )
+    .await;
+    told("[zephyr] sent to the antigravity sign-in").await;
+    let got = told("[zephyr] signed in to antigravity as antigravity-1").await;
+    assert!(log_has_paste(&home));
+    assert!(!got.iter().any(|x| x.contains("SECRETCODE")), "{got:?}");
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("name = \"antigravity-1\""));
+    // It is over: nothing is left to paste into.
+    say("owner", "/login paste http://127.0.0.1:1455/cb?code=AGAIN").await;
+    replies_until(
+        &sent,
+        |r| {
+            r.iter()
+                .filter(|x| x.contains("no sign-in of yours"))
+                .count()
+                == 2
+        },
+        "the second no-sign-in reply",
+    )
+    .await;
+
+    let _ = stop.send(());
+    task.await.unwrap().unwrap();
+}
+
+/// `/login cancel` reaches a sign-in whose URL was already posted, by itself and by provider, and
+/// the account name it held is free for the next one. (Not by id here: the registry is this
+/// whole test binary's, so the test cannot tell which id is its own.)
+#[tokio::test]
+async fn login_cancel_stops_a_sign_in_whose_url_was_posted() {
+    let (cfg, home) = setup("cancel-posted", "");
+    std::fs::write(home.join("login_url"), "").unwrap();
+    let (feed, rx) = tokio::sync::mpsc::channel(8);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let sent: Sent = Default::default();
+    let task = tokio::spawn({
+        let sent = sent.clone();
+        async move {
+            let feed = Feed {
+                rx: tokio::sync::Mutex::new(rx),
+                sent,
+            };
+            let stop = async {
+                let _ = stopped.await;
+            };
+            zephyr::router::run(&cfg, &[feed], stop).await
+        }
+    });
+    const URL: &str = "sign in to antigravity as antigravity-1 at https://example.test";
+    const CANCELLED: &str = "[zephyr] cancelled the sign-in to antigravity as antigravity-1";
+    let count = |r: &[String], what: &str| r.iter().filter(|x| x.contains(what)).count();
+    for (round, cancel) in ["/login cancel", "/login cancel antigravity"]
+        .into_iter()
+        .enumerate()
+    {
+        let n = round + 1;
+        let say = |text: String, id: String| {
+            let feed = feed.clone();
+            let msg = Inbound {
+                channel: "chat".into(),
+                platform_msg_id: id,
+                sender: "owner".into(),
+                text,
+            };
+            async move { feed.send(msg).await.unwrap() }
+        };
+        // No account named: the first free one, which is antigravity-1 again each round only
+        // if the cancel before freed it.
+        say("/login antigravity".into(), format!("l{n}")).await;
+        replies_until(&sent, |r| count(r, URL) == n, "the sign-in's URL").await;
+        say(cancel.into(), format!("c{n}")).await;
+        replies_until(&sent, |r| count(r, CANCELLED) == n, "the cancel's reply").await;
+    }
+    let _ = stop.send(());
+    task.await.unwrap().unwrap();
+}
+
+/// Whether fake rpi logged a pasted line.
+fn log_has_paste(home: &Path) -> bool {
+    std::fs::read_to_string(home.join("log.jsonl"))
+        .unwrap_or_default()
+        .contains("\"auth-paste\"")
+}
+
 /// `/login` from a channel, through the router: the reply carries the URL, `zephyr.toml` gains
 /// the account, and no reply ever carries a credential.
 #[tokio::test]
@@ -732,6 +939,13 @@ async fn login_from_a_channel() {
         .expect("the channel's login is in the registry");
     let sign_in = until(&id, |l| !l["url"].is_null()).await;
     assert_eq!(sign_in["url"], "https://example.test/login/antigravity");
+    // Outside the network floor the browser's redirect finishes it: no paste is offered.
+    let url = |r: &[String]| r.iter().any(|x| x.contains("https://example.test/login"));
+    let got = replies_until(&sent, url, "the URL notice").await;
+    let notice = got
+        .iter()
+        .find(|x| x.contains("https://example.test/login"));
+    assert!(!notice.unwrap().contains("/login paste"), "{got:?}");
 
     // The browser comes back: the account joins the pool with no restart, and no prompt.
     std::fs::write(home.join("login_go"), "").unwrap();

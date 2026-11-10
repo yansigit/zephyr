@@ -60,6 +60,7 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
         bail!("{} is not a directory", projects.display());
     }
     h.data.set_projects(&projects.canonicalize()?)?;
+    h.data.set_network_default()?;
 
     let mut doc = h.data.load()?;
     h.data.add_image_extensions(&mut doc)?;
@@ -427,6 +428,10 @@ fn login(
             bail!("the token was not stored for {name}");
         }
     } else {
+        if h.floored() {
+            // The provider's callback to 127.0.0.1 does not reach the container (DESIGN §4.20).
+            println!("if the browser then cannot open 127.0.0.1, paste its address here");
+        }
         run(&mut h.exec_agent(
             &["-it"],
             &env,
@@ -619,8 +624,9 @@ pub fn model(h: &Host, mut a: Args) -> anyhow::Result<()> {
 pub fn channel(h: &Host, a: Args) -> anyhow::Result<()> {
     match &a.rest()?[..] {
         [add, kind] if add == "add" && (kind == "discord" || kind == "imessage") => {
+            let before = h.published().unwrap_or_default();
             channel_add(h, kind)?;
-            h.apply()?;
+            h.apply_published(&before)?;
             run(&mut h.exec(&[], &[], &["zephyr", "doctor"]))
         }
         [rm, kind] if rm == "remove" && (kind == "discord" || kind == "imessage") => {
@@ -645,6 +651,7 @@ fn channel_list(h: &Host) -> anyhow::Result<()> {
 
 /// Removes a channel's table, its owners and the secrets `channel_add` wrote for it.
 fn channel_remove(h: &Host, kind: &str) -> anyhow::Result<()> {
+    let before = h.published().unwrap_or_default();
     let mut doc = h.data.load()?;
     if !conf::remove_channel(&mut doc, kind) {
         bail!("{kind} is not configured");
@@ -661,7 +668,7 @@ fn channel_remove(h: &Host, kind: &str) -> anyhow::Result<()> {
         h.data.unset_secret(key)?;
     }
     println!("removed {kind}");
-    h.apply()
+    h.apply_published(&before)
 }
 
 /// `zephyr skill add DIR | list | rm NAME`, carried out by the container's `zephyr skill`

@@ -29,6 +29,9 @@ pub struct Policy {
     pub check: Duration,
     pub grace: Duration,
     pub stale: Duration,
+    /// Loads the agent's network floor before the first start (DESIGN §4.20); `None` outside
+    /// bridge mode. When it fails, the daemon is never started.
+    pub floor: Option<fn() -> anyhow::Result<()>>,
 }
 
 /// The file in the state dir the router rewrites with the unix time on each tick.
@@ -56,6 +59,7 @@ impl Default for Policy {
             check: Duration::from_secs(15),
             grace: Duration::from_secs(120),
             stale: STALE,
+            floor: None,
         }
     }
 }
@@ -82,15 +86,29 @@ pub async fn main() -> ExitCode {
         });
     }
     // Its own process group, so a hung one is killed with whatever it started in it.
-    let daemon = || {
+    let bridge = crate::egress::bridge();
+    let daemon = move || {
         let mut cmd = tokio::process::Command::new(std::env::current_exe()?);
         cmd.as_std_mut().process_group(0);
+        if bridge {
+            // The daemon, and all it starts, cannot change the rules loaded below: NET_ADMIN
+            // leaves the bounding set of the process that becomes it (the daemon checks).
+            // SAFETY: one prctl syscall between fork and exec.
+            unsafe { cmd.pre_exec(crate::egress::drop_net_admin) };
+        }
         cmd.arg("run").spawn()
     };
+    if bridge {
+        // The agent's direct routes follow `network.allow`; only this process may change them.
+        tokio::spawn(crate::egress::keep_allow(
+            crate::config::Config::default_path(),
+        ));
+    }
     // Read once: with no readable config the daemon fails at start anyway.
     let config = crate::config::Config::load(&crate::config::Config::default_path());
     let policy = Policy {
         heartbeat: config.ok().map(|c| c.state_dir().join(HEARTBEAT)),
+        floor: bridge.then_some(crate::egress::load_floor),
         ..Policy::default()
     };
     ExitCode::from(run(&policy, daemon, rx).await)
@@ -103,6 +121,12 @@ pub async fn run(
     mut spawn: impl FnMut() -> std::io::Result<tokio::process::Child>,
     mut signals: mpsc::Receiver<i32>,
 ) -> u8 {
+    if let Some(Err(e)) = policy.floor.map(|load| load()) {
+        eprintln!(
+            "zephyr: network floor could not be loaded: {e:#}; network = \"host\" in host.toml runs without it"
+        );
+        return 1;
+    }
     let mut wait = policy.first;
     let mut exits = VecDeque::new();
     loop {
@@ -218,6 +242,18 @@ mod tests {
             cmd.as_std_mut().process_group(0);
             cmd.args(["-c", &script]).spawn()
         })
+    }
+
+    #[tokio::test]
+    async fn a_floor_that_fails_to_load_never_starts_the_daemon() {
+        let (n, spawn) = counted("exec sleep 30");
+        let (_tx, rx) = mpsc::channel(1);
+        let policy = Policy {
+            floor: Some(|| anyhow::bail!("nft: no")),
+            ..quick()
+        };
+        assert_eq!(run(&policy, spawn, rx).await, 1);
+        assert_eq!(n.load(Ordering::SeqCst), 0, "the daemon was started");
     }
 
     #[tokio::test]

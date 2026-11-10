@@ -171,8 +171,44 @@ impl Host {
         let user = format!("{}:{}", ids.0, ids.1);
         // The image's `ENV PATH` is root's; the agent's adds its own bin folder.
         let path = format!("PATH={}", crate::agent::AGENT_PATH);
-        let flags = [&["-u", &user, "-w", "/zephyr", "-e", &path], flags].concat();
-        self.exec(&flags, env, argv)
+        // Under the network floor the agent's uid has no route out but the proxy: the same
+        // variables the daemon gives its processes, the browser's flag after the image's own.
+        let env_now = self.container_env();
+        let browser = env_now
+            .iter()
+            .find_map(|v| v.strip_prefix("AGENT_BROWSER_ARGS="));
+        let proxy = match floored(&env_now) {
+            true => crate::agent::proxy_env(browser.map(String::from)),
+            false => Vec::new(),
+        };
+        let proxy: Vec<String> = proxy.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let mut all = vec!["-u", &user, "-w", "/zephyr", "-e", &path];
+        all.extend(proxy.iter().flat_map(|pair| ["-e", pair.as_str()]));
+        all.extend(flags);
+        self.exec(&all, env, argv)
+    }
+
+    /// The container's environment as `KEY=VALUE` lines: the image's, and what `up` passed.
+    fn container_env(&self) -> Vec<String> {
+        let env = inspect(&self.container, "{{range .Config.Env}}{{println .}}{{end}}");
+        env.unwrap_or_default().lines().map(String::from).collect()
+    }
+
+    /// Whether the container that runs now is under the network floor, whatever host.toml asks
+    /// the next one to be: an old host-networking container is still that until `zephyr up`.
+    pub(crate) fn floored(&self) -> bool {
+        floored(&self.container_env())
+    }
+
+    /// Whether host.toml asks for the network floor (DESIGN §4.20): `network = "bridge"`, the
+    /// default, or `"host"`, which runs without it. This is what `up` makes; what runs now is
+    /// `floored`.
+    pub(crate) fn bridge(&self) -> anyhow::Result<bool> {
+        match self.data.host_get("network")?.as_deref() {
+            None | Some("bridge") => Ok(true),
+            Some("host") => Ok(false),
+            Some(_) => anyhow::bail!("network in host.toml must be \"bridge\" or \"host\""),
+        }
     }
 
     /// `docker exec [flags] [-e K=V].. <container> argv..`
@@ -205,6 +241,11 @@ impl Host {
 
     fn running(&self) -> bool {
         self.state().as_deref() == Some("running")
+    }
+
+    /// The container's network: `host`, or the bridge network's name (DESIGN §4.20).
+    fn network_mode(&self) -> Option<String> {
+        inspect(&self.container, "{{.HostConfig.NetworkMode}}")
     }
 
     fn need_running(&self) -> anyhow::Result<()> {
@@ -311,6 +352,10 @@ impl Host {
     /// The daemon runs as root holding only SETUID, SETGID and KILL; the agent runs as this
     /// user, and cannot reach the daemon's files in `~/.zephyr-daemon` (DESIGN §4.4).
     fn up(&self) -> anyhow::Result<()> {
+        let bridge = self.bridge()?;
+        // Read while the old container is still there: one on host networking is being moved
+        // to the network floor, which the owner is told below.
+        let moved = bridge && self.network_mode().as_deref() == Some("host");
         // Before the first split the old container holds the files the migration moves, so it
         // goes first; otherwise it runs until the new one's arguments are all known.
         if self.data.direct() {
@@ -327,70 +372,64 @@ impl Host {
         let daemon = self.data.daemon.display();
         let projects = projects.display();
         let mut cmd = docker(&["run", "-d", "--name", &self.container, "--init"]);
-        cmd.args([
-            "--restart",
-            "unless-stopped",
-            "--stop-timeout",
-            "30",
-            "--network",
-            "host",
-        ])
-        // No file overrides, no setuid escalation, and no fork bomb.
-        .args([
-            "--cap-drop",
-            "ALL",
-            "--cap-add",
-            "SETUID",
-            "--cap-add",
-            "SETGID",
-        ])
-        .args(["--cap-add", "KILL", "--security-opt", "no-new-privileges"])
-        .args(["--pids-limit", "4096", "--user", "0:0"])
-        .args([
-            "-e",
-            "HOME=/zephyr",
-            "-e",
-            &format!("ZEPHYR_CONFIG={DAEMON_MOUNT}/zephyr.toml"),
-        ])
-        .args(["-e", "RPI_CODING_AGENT_DIR=/zephyr/.rpi/agent"])
-        .args(["-e", &format!("ZEPHYR_AGENT_UID={}", ids.0)])
-        .args(["-e", &format!("ZEPHYR_AGENT_GID={}", ids.1)])
-        // Turns on `/rollback`'s checkpoints of the projects folder (DESIGN §4.14).
-        .args(["-e", &format!("ZEPHYR_PROJECTS={projects}")])
-        .args(["--mount", &format!("type=bind,src={data},dst=/zephyr")])
-        .args([
-            "--mount",
-            &format!("type=bind,src={daemon},dst={DAEMON_MOUNT}"),
-        ])
-        .args([
-            "--mount",
-            &format!("type=bind,src={projects},dst={projects}"),
-        ])
-        .args(masks(&projects.to_string())?)
-        // Docker's json-file logs grow without end by default.
-        .args(["--log-opt", "max-size=20m", "--log-opt", "max-file=5"])
-        .args(["--ulimit", "nofile=65536:65536"])
-        .args(
-            (self.data.host_get("memory")?)
-                .or_else(default_memory)
-                .map(|m| ["--memory".to_string(), m])
-                .into_iter()
-                .flatten(),
-        )
-        // The agent's browser renders WebGL on the GPU; without one it is SwiftShader (§4.11).
-        .args(if nvidia_runtime() {
-            &[
-                "--gpus",
-                "all",
+        cmd.args(["--restart", "unless-stopped", "--stop-timeout", "30"])
+            // No file overrides, no setuid escalation, and no fork bomb.
+            .args([
+                "--cap-drop",
+                "ALL",
+                "--cap-add",
+                "SETUID",
+                "--cap-add",
+                "SETGID",
+            ])
+            .args(["--cap-add", "KILL", "--security-opt", "no-new-privileges"])
+            .args(["--pids-limit", "4096", "--user", "0:0"])
+            .args([
                 "-e",
-                "NVIDIA_DRIVER_CAPABILITIES=graphics,utility",
-            ][..]
-        } else {
-            &[]
-        })
-        // Root cannot enter the agent's 0700 home; the daemon starts each child there as the agent.
-        .args(["-w", "/", &image])
-        .stdout(Stdio::null());
+                "HOME=/zephyr",
+                "-e",
+                &format!("ZEPHYR_CONFIG={DAEMON_MOUNT}/zephyr.toml"),
+            ])
+            .args(["-e", "RPI_CODING_AGENT_DIR=/zephyr/.rpi/agent"])
+            .args(["-e", &format!("ZEPHYR_AGENT_UID={}", ids.0)])
+            .args(["-e", &format!("ZEPHYR_AGENT_GID={}", ids.1)])
+            // Turns on `/rollback`'s checkpoints of the projects folder (DESIGN §4.14).
+            .args(["-e", &format!("ZEPHYR_PROJECTS={projects}")])
+            .args(["--mount", &format!("type=bind,src={data},dst=/zephyr")])
+            .args([
+                "--mount",
+                &format!("type=bind,src={daemon},dst={DAEMON_MOUNT}"),
+            ])
+            .args([
+                "--mount",
+                &format!("type=bind,src={projects},dst={projects}"),
+            ])
+            .args(masks(&projects.to_string())?)
+            // Docker's json-file logs grow without end by default.
+            .args(["--log-opt", "max-size=20m", "--log-opt", "max-file=5"])
+            .args(["--ulimit", "nofile=65536:65536"])
+            .args(
+                (self.data.host_get("memory")?)
+                    .or_else(default_memory)
+                    .map(|m| ["--memory".to_string(), m])
+                    .into_iter()
+                    .flatten(),
+            )
+            // The agent's browser renders WebGL on the GPU; without one it is SwiftShader (§4.11).
+            .args(if nvidia_runtime() {
+                &[
+                    "--gpus",
+                    "all",
+                    "-e",
+                    "NVIDIA_DRIVER_CAPABILITIES=graphics,utility",
+                ][..]
+            } else {
+                &[]
+            })
+            .args(self.network_args(bridge)?)
+            // Root cannot enter the agent's 0700 home; the daemon starts each child there as the agent.
+            .args(["-w", "/", &image])
+            .stdout(Stdio::null());
 
         // The old container steps aside (stopped, so its daemon drains) and comes back if the new
         // one cannot be created.
@@ -429,7 +468,81 @@ impl Host {
         if aside {
             let _ = quiet(docker(&["rm", "-f", &old]));
         }
+        if moved {
+            println!("{FLOOR_NOTICE}");
+            // The webhook was on the Tailscale address BlueBubbles posts to; now it is not.
+            let webhook = self.published()?;
+            if let Some((_, p)) = webhook.iter().find(|(key, _)| *key == "imessage.listen") {
+                println!(
+                    "the iMessage webhook is on this host's 127.0.0.1:{p} now; forward the \
+                     Tailscale address to it once: sudo tailscale serve --bg --tcp {p} \
+                     tcp://127.0.0.1:{p}"
+                );
+            }
+        }
         self.wait_ready()
+    }
+
+    /// The container's network arguments. Under the network floor (DESIGN §4.20): a bridge
+    /// network of its own, made when missing; its address under the name `zephyr`; NET_ADMIN,
+    /// which `supervise` loads the agent's rules with, and SETPCAP, which lets it drop both from
+    /// the daemon it starts; and each of the daemon's ports published on this host's loopback
+    /// only. With `network = "host"`, host networking as before.
+    fn network_args(&self, bridge: bool) -> anyhow::Result<Vec<String>> {
+        if !bridge {
+            return Ok(vec!["--network".into(), "host".into()]);
+        }
+        if !quiet(docker(&["network", "inspect", &self.container])) {
+            let create = ["network", "create", "--driver", "bridge", &self.container];
+            run(docker(&create).stdout(Stdio::null()))?;
+        }
+        let mut args: Vec<String> = [
+            "--network",
+            &self.container,
+            "--hostname",
+            "zephyr",
+            "--cap-add",
+            "NET_ADMIN",
+            "--cap-add",
+            "SETPCAP",
+            "-e",
+            "ZEPHYR_NETWORK=bridge",
+        ]
+        .map(String::from)
+        .into();
+        let ports: Vec<String> = (self.published()?.iter())
+            .map(|(_, port)| port.to_string())
+            .collect();
+        for port in &ports {
+            args.extend(["-p".into(), format!("127.0.0.1:{port}:{port}")]);
+        }
+        // For the daemon, which tells the owner when it listens on a port not among these.
+        args.extend(["-e".into(), format!("ZEPHYR_PUBLISHED={}", ports.join(","))]);
+        Ok(args)
+    }
+
+    /// The daemon's ports that zephyr.toml asks for, by key (`egress::published`).
+    pub(crate) fn published(&self) -> anyhow::Result<Vec<(&'static str, u16)>> {
+        Ok(published_in(&self.data.load()?))
+    }
+
+    /// After a zephyr.toml edit: under the network floor a running container publishes only the
+    /// ports it was made with, so when those changed from `before` it is made again; any other
+    /// edit is the daemon's to reload.
+    pub(crate) fn apply_published(&self, before: &[(&'static str, u16)]) -> anyhow::Result<()> {
+        if self.running() && self.floored() && self.published()? != before {
+            println!("a published port changed: starting the container again to publish it");
+            return self.up_checked();
+        }
+        self.apply()
+    }
+
+    /// The container's address on its bridge network.
+    fn container_ip(&self) -> anyhow::Result<String> {
+        const FORMAT: &str = "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}";
+        inspect(&self.container, FORMAT)
+            .filter(|ip| !ip.is_empty())
+            .with_context(|| format!("container {} has no address", self.container))
     }
 
     /// `up`, backed up first as an upgrade is when the container runs another version.
@@ -583,7 +696,12 @@ impl Host {
             let agent = format!("{home}/agent");
             let env = [("HOME", home.as_str()), ("RPI_CODING_AGENT_DIR", &agent)];
             let mut cmd = self.exec(&flags, &env, &["rpi", "--connect"]);
-            cmd.arg(format!("127.0.0.1:{port}"));
+            // Under the network floor the daemon listens on the container's own address.
+            let at = match self.floored() {
+                true => self.container_ip()?,
+                false => "127.0.0.1".into(),
+            };
+            cmd.arg(format!("{at}:{port}"));
             cmd
         } else {
             // What the TUI reads to pick its colours and glyphs.
@@ -663,6 +781,9 @@ impl Host {
         }
         let running = self.running();
         ok &= check(&format!("container {} is running", self.container), running);
+        if running && self.network_mode().as_deref() == Some("host") && self.bridge()? {
+            println!("warn the container still runs host networking; zephyr up moves it to the network floor");
+        }
         if running {
             ok &= self
                 .exec(&[], &[], &["zephyr", "doctor"])
@@ -923,7 +1044,31 @@ fn fetch_cli(image: &str, target: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
 
 /// The container's state (`running`, `exited`, ...), or None when it does not exist.
 pub(crate) fn state(container: &str) -> Option<String> {
-    let out = docker(&["inspect", "-f", "{{.State.Status}}", container])
+    inspect(container, "{{.State.Status}}")
+}
+
+/// What `up` says once when it moves a container from host networking to the network floor.
+const FLOOR_NOTICE: &str =
+    "the agent now reaches the internet only through zephyr's proxy: ports 80 \
+    and 443 to public addresses (DESIGN §4.20). Other destinations: /set network.allow HOST:PORT. \
+    Sign-ins: paste the address the browser cannot open. To go back: network = \"host\" in \
+    host.toml, then zephyr up.";
+
+/// The daemon's ports the config in `doc` asks for, by key. Read key by key, as `attach` reads
+/// its port: a key from a newer zephyr than this CLI must not stop `up` or a `config set`.
+fn published_in(doc: &toml_edit::DocumentMut) -> Vec<(&'static str, u16)> {
+    crate::egress::published_from(|key| conf::get(doc, key))
+}
+
+/// Whether a container with this environment is under the network floor: `up` sets
+/// `ZEPHYR_NETWORK=bridge` when it makes one.
+fn floored(env: &[String]) -> bool {
+    env.iter().any(|v| v == "ZEPHYR_NETWORK=bridge")
+}
+
+/// `docker inspect -f FORMAT CONTAINER`, when there is such a container.
+fn inspect(container: &str, format: &str) -> Option<String> {
+    let out = docker(&["inspect", "-f", format, container])
         .stderr(Stdio::null())
         .output()
         .ok()?;
@@ -1248,6 +1393,7 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                 }
             }
             let mut doc = h.data.load()?;
+            let before = published_in(&doc);
             match args[..] {
                 ["get", key] => {
                     println!(
@@ -1272,7 +1418,7 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                     if daemon_down {
                         println!("saved; applies when zephyr starts (`zephyr up`)");
                     } else {
-                        h.apply()?;
+                        h.apply_published(&before)?;
                     }
                 }
                 _ => bail!("usage: zephyr config get KEY | config set KEY VALUE"),
@@ -1295,6 +1441,7 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                 bail!("not deleting {dir}: pass --keep-data or --yes");
             }
             let _ = quiet(docker(&["rm", "-f", &h.container]));
+            let _ = quiet(docker(&["network", "rm", &h.container]));
             if !keep && !h.data.direct() {
                 // The daemon's files are root's: give them back while the image is still here.
                 let ids = agent_ids();

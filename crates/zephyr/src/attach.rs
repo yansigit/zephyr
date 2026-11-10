@@ -114,7 +114,8 @@ pub async fn serve(
         return std::future::pending().await;
     };
     let token: Arc<str> = token(a).context("attach token")?.into();
-    let listener = TcpListener::bind(("127.0.0.1", a.port))
+    let addr = crate::egress::listen_addr(([127, 0, 0, 1], a.port).into())?;
+    let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding attach port {}", a.port))?;
     eprintln!("zephyr: attach listening on {}", listener.local_addr()?);

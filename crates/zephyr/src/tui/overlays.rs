@@ -1145,7 +1145,9 @@ fn running_rows(o: &Overlay, p: &Palette, width: usize) -> Vec<Row> {
             }));
         }
     }
-    out.push(Row::Line(p.text.fg(phase_text(&status))));
+    out.push(Row::Line(
+        p.text.fg(phase_text(&status, session.kind == "oauth")),
+    ));
     // The last few lines the provider printed: enough to see a prompt or a complaint. The child
     // is a pty, so a progress bar arrives as `\r` redraws and its control bytes would move the
     // terminal's cursor inside a drawn row; the transcript's own cleaning makes them safe.
@@ -1179,8 +1181,12 @@ fn one_line(text: &str) -> String {
 
 /// What the sign-in is waiting for, in one line. `done` and `failed` are drawn on the tick
 /// before the panel closes, so they must not claim to be waiting for anything.
-fn phase_text(status: &LoginStatus) -> &'static str {
+fn phase_text(status: &LoginStatus, oauth: bool) -> &'static str {
     match status.phase.as_str() {
+        // An OAuth sign-in under the network floor: the browser first.
+        "need_input" if oauth => {
+            "waiting for you to finish in the browser; if it then cannot open 127.0.0.1, paste its address here"
+        }
         "need_input" => "waiting for the code it asks for",
         "done" => "signed in",
         "failed" => "the sign-in failed",
@@ -3362,6 +3368,21 @@ mod tests {
             account: None,
             kind: "setup_token".into(),
         }
+    }
+
+    #[test]
+    fn an_oauth_sign_in_that_takes_a_line_still_points_at_the_browser() {
+        // Under the network floor an OAuth login is `need_input`: the browser first, the paste
+        // only if its last page cannot open. A setup token has a URL too, and wants its code.
+        let oauth = phase_text(&waiting("need_input"), true);
+        assert!(
+            oauth.contains("browser") && oauth.contains("paste its address"),
+            "{oauth}"
+        );
+        let token = phase_text(&waiting("need_input"), false);
+        assert_eq!(token, "waiting for the code it asks for");
+        let browser = "waiting for you to finish in the browser";
+        assert_eq!(phase_text(&waiting("waiting"), true), browser);
     }
 
     fn waiting(phase: &str) -> LoginStatus {
