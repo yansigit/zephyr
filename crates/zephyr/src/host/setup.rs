@@ -428,7 +428,7 @@ fn login(
             bail!("the token was not stored for {name}");
         }
     } else {
-        if h.bridge().unwrap_or(true) {
+        if h.floored() {
             // The provider's callback to 127.0.0.1 does not reach the container (DESIGN §4.19).
             println!("if the browser then cannot open 127.0.0.1, paste its address here");
         }

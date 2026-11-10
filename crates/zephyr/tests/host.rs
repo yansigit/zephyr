@@ -24,6 +24,8 @@ case "$1" in
   inspect) [ -n "$SHIM_NO_CONTAINER" ] && exit 1
     case "$*" in
       *NetworkMode*) echo "${SHIM_NETMODE:-$ZEPHYR_CONTAINER}" ;;
+      # The container's environment: the image's, and what `up` passed when it made it.
+      *Config.Env*) [ "$SHIM_NETMODE" = host ] || echo ZEPHYR_NETWORK=bridge; echo AGENT_BROWSER_ARGS=--no-sandbox ;;
       *IPAddress*) echo "${SHIM_IP:-172.18.0.2}" ;;
       *) echo "${SHIM_STATE:-running}" ;;
     esac; exit 0 ;;
@@ -320,8 +322,12 @@ fn ids() -> String {
 
 /// A `docker exec` as the agent (this user, in its home) whose argv starts with `rest`.
 fn find_agent<'a>(calls: &'a [Vec<String>], rest: &[&str]) -> &'a Vec<String> {
-    let proxy = zephyr::agent::PROXY_ENV.iter();
+    // The image's own browser flags (the shim's) come first, then the proxy's.
+    let proxy = zephyr::agent::proxy_env(Some("--no-sandbox".into())).into_iter();
     let proxy: Vec<String> = proxy.map(|(k, v)| format!("{k}={v}")).collect();
+    assert!(proxy.contains(
+        &"AGENT_BROWSER_ARGS=--no-sandbox,--proxy-server=http://127.0.0.1:7792".to_string()
+    ));
     let proxy: Vec<&str> = proxy.iter().flat_map(|p| ["-e", p.as_str()]).collect();
     find_agent_with(calls, &proxy, rest)
 }
@@ -1690,11 +1696,19 @@ fn shell_opens_a_login_shell_as_the_agent() {
             "{call:?}"
         );
     }
-    std::fs::write(env.daemon().join("host.toml"), "network = \"host\"\n").unwrap();
-    assert!(env.on_a_tty("shell", &[]).status.success());
+    // What counts is the container that runs, not what host.toml asks the next one to be: a
+    // host-networking container from before the floor has no proxy to point at ...
+    assert!(env
+        .on_a_tty("shell", &[("SHIM_NETMODE", "host")])
+        .status
+        .success());
     let calls = env.calls();
     let call = find_agent_with(&calls, &[], &["-it", "-e", "TERM"]);
-    assert!(!call.iter().any(|a| a.contains("_PROXY")), "{call:?}");
+    assert!(!call.iter().any(|a| a.contains("PROXY")), "{call:?}");
+    // ... and one under the floor keeps it until `zephyr up` makes the host-networking one.
+    std::fs::write(env.daemon().join("host.toml"), "network = \"host\"\n").unwrap();
+    assert!(env.on_a_tty("shell", &[]).status.success());
+    find_agent(&env.calls(), &["-it", "-e", "TERM"]);
     assert!(!env.zephyr(&["shell", "fish"]).status.success());
 }
 
@@ -1966,10 +1980,14 @@ fn host_networking_in_host_toml_keeps_todays_arguments() {
         assert!(!run.iter().any(|a| a == absent), "{absent} in {run:?}");
     }
     assert!(!calls.iter().any(|c| c[1] == "network"), "{calls:#?}");
-    env.ok(&["attach", "--stock"]);
-    let stock = env.calls();
-    let connect = stock.iter().find(|c| c.iter().any(|a| a == "--connect"));
-    assert_eq!(connect.unwrap().last().unwrap(), "127.0.0.1:7790");
+    // The container that runs decides where the daemon listens, not host.toml.
+    for (mode, at) in [("host", "127.0.0.1:7790"), ("", "172.18.0.2:7790")] {
+        let out = env.zephyr_env(&["attach", "--stock"], &[("SHIM_NETMODE", mode)]);
+        assert!(out.status.success());
+        let stock = env.calls();
+        let connect = stock.iter().find(|c| c.iter().any(|a| a == "--connect"));
+        assert_eq!(connect.unwrap().last().unwrap(), at);
+    }
 
     std::fs::write(&host, with("none")).unwrap();
     let out = env.zephyr(&["up"]);

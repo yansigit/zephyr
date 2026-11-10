@@ -79,12 +79,18 @@ pub fn browser_args(current: Option<String>) -> String {
     }
 }
 
-/// Points `cmd` at the proxy: [`PROXY_ENV`] and the browser's flag.
+/// Everything that points a program at the proxy: [`PROXY_ENV`], and `AGENT_BROWSER_ARGS` with
+/// the proxy flag after `browser`, its value so far. The one list for the daemon's spawns and
+/// the host's `docker exec` as the agent.
+pub fn proxy_env(browser: Option<String>) -> Vec<(&'static str, String)> {
+    let vars = PROXY_ENV.iter().map(|(k, v)| (*k, v.to_string()));
+    vars.chain([("AGENT_BROWSER_ARGS", browser_args(browser))])
+        .collect()
+}
+
+/// Points `cmd` at the proxy ([`proxy_env`]).
 pub fn proxy(cmd: &mut Command) -> &mut Command {
-    cmd.envs(PROXY_ENV.iter().copied()).env(
-        "AGENT_BROWSER_ARGS",
-        browser_args(std::env::var("AGENT_BROWSER_ARGS").ok()),
-    )
+    cmd.envs(proxy_env(std::env::var("AGENT_BROWSER_ARGS").ok()))
 }
 
 /// Prepares `cmd` to run for the agent: without the hidden variables, on [`AGENT_PATH`], through

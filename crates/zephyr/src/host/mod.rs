@@ -171,11 +171,15 @@ impl Host {
         let user = format!("{}:{}", ids.0, ids.1);
         // The image's `ENV PATH` is root's; the agent's adds its own bin folder.
         let path = format!("PATH={}", crate::agent::AGENT_PATH);
-        // Under the network floor the agent's uid has no route out but the proxy. An unreadable
-        // host.toml counts as bridge: the variables only point at a port nothing else serves.
-        let proxy: &[(&str, &str)] = match self.bridge().unwrap_or(true) {
-            true => crate::agent::PROXY_ENV,
-            false => &[],
+        // Under the network floor the agent's uid has no route out but the proxy: the same
+        // variables the daemon gives its processes, the browser's flag after the image's own.
+        let env_now = self.container_env();
+        let browser = env_now
+            .iter()
+            .find_map(|v| v.strip_prefix("AGENT_BROWSER_ARGS="));
+        let proxy = match floored(&env_now) {
+            true => crate::agent::proxy_env(browser.map(String::from)),
+            false => Vec::new(),
         };
         let proxy: Vec<String> = proxy.iter().map(|(k, v)| format!("{k}={v}")).collect();
         let mut all = vec!["-u", &user, "-w", "/zephyr", "-e", &path];
@@ -184,8 +188,21 @@ impl Host {
         self.exec(&all, env, argv)
     }
 
+    /// The container's environment as `KEY=VALUE` lines: the image's, and what `up` passed.
+    fn container_env(&self) -> Vec<String> {
+        let env = inspect(&self.container, "{{range .Config.Env}}{{println .}}{{end}}");
+        env.unwrap_or_default().lines().map(String::from).collect()
+    }
+
+    /// Whether the container that runs now is under the network floor, whatever host.toml asks
+    /// the next one to be: an old host-networking container is still that until `zephyr up`.
+    pub(crate) fn floored(&self) -> bool {
+        floored(&self.container_env())
+    }
+
     /// Whether host.toml asks for the network floor (DESIGN §4.19): `network = "bridge"`, the
-    /// default, or `"host"`, which runs without it.
+    /// default, or `"host"`, which runs without it. This is what `up` makes; what runs now is
+    /// `floored`.
     pub(crate) fn bridge(&self) -> anyhow::Result<bool> {
         match self.data.host_get("network")?.as_deref() {
             None | Some("bridge") => Ok(true),
@@ -506,7 +523,7 @@ impl Host {
     /// ports it was made with, so when those changed from `before` it is made again; any other
     /// edit is the daemon's to reload.
     pub(crate) fn apply_published(&self, before: &[(&'static str, u16)]) -> anyhow::Result<()> {
-        if self.running() && self.bridge()? && self.published()? != before {
+        if self.running() && self.floored() && self.published()? != before {
             println!("a published port changed: starting the container again to publish it");
             return self.up_checked();
         }
@@ -673,7 +690,7 @@ impl Host {
             let env = [("HOME", home.as_str()), ("RPI_CODING_AGENT_DIR", &agent)];
             let mut cmd = self.exec(&flags, &env, &["rpi", "--connect"]);
             // Under the network floor the daemon listens on the container's own address.
-            let at = match self.bridge()? {
+            let at = match self.floored() {
                 true => self.container_ip()?,
                 false => "127.0.0.1".into(),
             };
@@ -1035,6 +1052,12 @@ fn published_in(doc: &toml_edit::DocumentMut) -> anyhow::Result<Vec<(&'static st
     let cfg: crate::config::Config =
         toml::from_str(&doc.to_string()).context("zephyr.toml is not a config zephyr can run")?;
     Ok(crate::egress::published(&cfg))
+}
+
+/// Whether a container with this environment is under the network floor: `up` sets
+/// `ZEPHYR_NETWORK=bridge` when it makes one.
+fn floored(env: &[String]) -> bool {
+    env.iter().any(|v| v == "ZEPHYR_NETWORK=bridge")
 }
 
 /// `docker inspect -f FORMAT CONTAINER`, when there is such a container.
