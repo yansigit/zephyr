@@ -345,15 +345,34 @@ mod tests {
         let store = Store::open(&cfg.db_path()).unwrap();
         store.audit("main", "bash", "ls", "started").unwrap();
         store.audit("main", "bash", "pwd", "started").unwrap();
+        let mut store = store;
+        for goal in ["old", "new"] {
+            store.add_task(goal, None, None, "chat", "1000").unwrap();
+            let t = store.start_next_task(crate::now()).unwrap().unwrap();
+            store
+                .finish_task(&t, "completed", "done", crate::now())
+                .unwrap();
+        }
         let old = crate::now() - DB_AGE.as_secs() as i64 - 60;
-        rusqlite::Connection::open(cfg.db_path())
-            .unwrap()
-            .execute("UPDATE audit SET ts = ?1 WHERE args = 'ls'", [old])
+        let db = rusqlite::Connection::open(cfg.db_path()).unwrap();
+        db.execute("UPDATE audit SET ts = ?1 WHERE args = 'ls'", [old])
             .unwrap();
+        db.execute(
+            "UPDATE tasks SET created_at = ?1, ended_at = ?1 WHERE goal = 'old'",
+            [old],
+        )
+        .unwrap();
         sweep(&cfg, &store, AGE).unwrap();
         let rows = store.audit_rows().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].2, "pwd", "a fresh line stays");
+        let goals: Vec<String> = store
+            .tasks(10)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.goal)
+            .collect();
+        assert_eq!(goals, ["new"], "an old finished task goes");
     }
 
     #[test]

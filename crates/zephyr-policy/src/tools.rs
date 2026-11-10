@@ -148,6 +148,22 @@ pub fn gateway_kind(command: &str) -> Option<Gateway> {
             let words = arg.split(' ').all(ascii_word) && arg.len() <= 100;
             return words.then_some(Gateway::Read);
         }
+        // Zephyr's activity record, up to two words, but not the standing grants: they name who
+        // passes without asking, what an injected run would aim at (DESIGN §4.19).
+        "/activity" => {
+            let words: Vec<&str> = match arg.is_empty() {
+                true => vec![],
+                false => arg.split(' ').collect(),
+            };
+            let ok = command.len() <= 40
+                && words.len() <= 2
+                && words.iter().all(|w| {
+                    ascii_word(w)
+                        && !w.eq_ignore_ascii_case("grants")
+                        && !w.eq_ignore_ascii_case("grant")
+                });
+            return ok.then_some(Gateway::Read);
+        }
         "/set" => return set_shape(arg).then_some(Gateway::Set),
         // The card shows the whole command, `/rule ` and all, in CARD_CHARS.
         "/subagent" | "/rule" if command.chars().count() > CARD_CHARS => return None,
@@ -546,7 +562,8 @@ pub fn gateway(params: &Value) -> Result<String, String> {
     let command = text(params, "command")?.trim();
     if gateway_kind(command).is_none() {
         return Err(format!(
-            "{command} is not available to the agent; it can run {}, and propose \
+            "{command} is not available to the agent; it can run {}, read /activity [today|6h|7d] \
+             [KIND] (not grants), and propose \
              /model PROVIDER/MODEL, /new, /switch ID, /pause or /reload; /settings and /set KEY \
              VALUE [for D] read and change settings; /subagent and /rule changes are proposed, in at most {CARD_CHARS} characters",
             GATEWAY_COMMANDS.join(", ")
@@ -1796,5 +1813,36 @@ mod tests {
         assert_eq!(iso(0), "1970-01-01T00:00:00.000Z");
         assert_eq!(iso(951_782_400_000), "2000-02-29T00:00:00.000Z");
         assert_eq!(iso(1_793_520_958_111), "2026-11-01T08:15:58.111Z");
+    }
+
+    /// The agent reads zephyr's activity record, but never the standing grants: they name who
+    /// passes without asking, what an injected run would aim at.
+    #[test]
+    fn activity_is_a_read_but_grants_is_not() {
+        for read in [
+            "/activity",
+            "/activity today task",
+            "/activity 7d",
+            "/activity Today",
+        ] {
+            assert_eq!(gateway_kind(read), Some(Gateway::Read), "{read}");
+        }
+        let long = format!("/activity {}", "x".repeat(31));
+        assert_eq!(long.len(), 41);
+        for never in [
+            "/activity grants",
+            "/activity GRANTS",
+            "/activity 7d Grants",
+            "/activity grant",
+            "/activity a b c",
+            "/activity tödåy",
+            "/activity  7d",
+            "/activityx",
+            long.as_str(),
+        ] {
+            assert_eq!(gateway_kind(never), None, "{never}");
+        }
+        let err = gateway(&serde_json::json!({"command": "/activity grants"})).unwrap_err();
+        assert!(err.contains("/activity"), "{err}");
     }
 }

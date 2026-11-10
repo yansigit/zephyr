@@ -1596,3 +1596,121 @@ async fn settings_set_refuses_a_numeric_time_limit() {
     assert_eq!(std::fs::read(gw.home.join("zephyr.toml")).unwrap(), before);
     gw.shutdown().await;
 }
+
+/// `zephyr.activity` pages back by cursor: each page starts strictly before the last one's end,
+/// so two rows in one second are neither repeated nor skipped.
+#[tokio::test]
+async fn activity_pages_by_cursor() {
+    let gw = start("activity-pages");
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    let store = Store::open(&gw.home.join("state.db")).unwrap();
+    for n in 1..=5 {
+        store
+            .audit("main", "read", &n.to_string(), "started")
+            .unwrap();
+    }
+    // Rows 2 and 3 share a second.
+    rusqlite::Connection::open(gw.home.join("state.db"))
+        .unwrap()
+        .execute(
+            "UPDATE audit SET ts = unixepoch() - 100 * (6 - id) - iif(id = 3, 100, 0)",
+            [],
+        )
+        .unwrap();
+    let mut seen = Vec::new();
+    let mut before = Value::Null;
+    for page in 0..3 {
+        let got = c
+            .call(
+                "zephyr.activity",
+                json!({"kind": "tool", "limit": 2, "before": before}),
+            )
+            .await;
+        let result = &got["result"];
+        let entries = result["entries"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{got}"));
+        assert_eq!(entries.len(), if page < 2 { 2 } else { 1 }, "{got}");
+        assert!(result["since"].is_i64(), "{got}");
+        for e in entries {
+            assert_eq!(e["kind"], "tool");
+            assert_eq!(e["stream"], true);
+            let line = e["line"].as_str().unwrap();
+            assert!(
+                line.ends_with(&format!(": {}", e["text"].as_str().unwrap())),
+                "{line}"
+            );
+            seen.push((
+                e["at"].as_i64().unwrap(),
+                e["text"].as_str().unwrap().to_string(),
+            ));
+        }
+        before = result["next"].clone();
+        assert_eq!(before.is_null(), page == 2, "{got}");
+    }
+    let texts: Vec<&str> = seen.iter().map(|(_, t)| t.as_str()).collect();
+    assert_eq!(texts, ["read 5", "read 4", "read 3", "read 2", "read 1"]);
+    assert!(seen.windows(2).all(|w| w[0].0 >= w[1].0), "{seen:?}");
+    gw.shutdown().await;
+}
+
+/// With `kind: "grants"`, each entry is a standing grant with the command that takes it back.
+#[tokio::test]
+async fn activity_grants_carry_their_revoke() {
+    let gw = start("activity-grants");
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    let store = Store::open(&gw.home.join("state.db")).unwrap();
+    store
+        .remember_targets("messages", &["bob@x.org".into()])
+        .unwrap();
+    let got = c.call("zephyr.activity", json!({"kind": "grants"})).await;
+    let result = &got["result"];
+    assert_eq!(result["since"], Value::Null, "{got}");
+    assert_eq!(result["next"], Value::Null, "{got}");
+    let entries = result["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{got}");
+    assert_eq!(entries[0]["kind"], "grant");
+    assert_eq!(entries[0]["subject"], "messages");
+    assert_eq!(entries[0]["revoke"], "/approvals forget 1");
+    let line = entries[0]["line"].as_str().unwrap();
+    assert!(
+        line.starts_with("messages bob@x.org, known since ")
+            && line.ends_with(" · /approvals forget 1"),
+        "{line}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn activity_refuses_bad_params() {
+    let gw = start("activity-bad");
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    for params in [
+        json!({"range": "91d"}),
+        json!({"range": 6}),
+        json!({"kind": "inbox"}),
+        json!({"before": "1.inbox.1"}),
+        json!({"limit": 0}),
+        json!({"limit": 201}),
+        json!({"limit": "5"}),
+    ] {
+        let got = c.call("zephyr.activity", params.clone()).await;
+        assert_eq!(got["error"]["code"], -32602, "{params}: {got}");
+        let message = got["error"]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("[zephyr] usage: /activity"),
+            "{message}"
+        );
+    }
+    let got = c
+        .call(
+            "zephyr.activity",
+            json!({"range": "Today", "kind": "Tasks", "limit": null}),
+        )
+        .await;
+    assert_eq!(got["result"]["entries"], json!([]), "{got}");
+    gw.shutdown().await;
+}

@@ -1,0 +1,933 @@
+//! `/activity` (DESIGN §4.19): the daemon's own record of what ran, what left the machine, what
+//! waited and what was refused, read from root's `state.db` and rendered here, never by the model.
+//! Every text is scrubbed as it is read, with the vault and the facts as they are now.
+
+use crate::config::Config;
+use crate::gate::Scrub;
+use crate::settings::one_line;
+use crate::store::{Cursor, Record, Store};
+use jiff::tz::TimeZone;
+
+/// The kinds of record, as `/activity KIND` names them.
+pub const KINDS: [&str; 9] = [
+    "out", "gate", "refused", "setting", "proposal", "job", "task", "process", "tool",
+];
+
+pub const USAGE: &str = "[zephyr] usage: /activity [today|6h|7d] \
+    [out|gate|refused|setting|proposal|job|task|process|tool|grants]";
+
+/// The most records a chat answer shows; one more is asked for, to know there are more.
+const CHAT_LIMIT: u32 = 30;
+const DAY: i64 = 86_400;
+
+/// How far back to read: from local midnight, or the last so many seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    Today,
+    /// Seconds, 1 h to 90 d.
+    Last(i64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Query {
+    pub window: Window,
+    /// A [`KINDS`] entry or `grants`; `None` is every kind but `tool`.
+    pub kind: Option<&'static str>,
+    pub before: Option<Cursor>,
+    pub limit: u32,
+}
+
+impl Query {
+    /// The chat form: up to two words, a time and a kind, in either order, any case.
+    pub fn words(arg: &str) -> Option<Query> {
+        let mut q = Query {
+            window: Window::Last(DAY),
+            kind: None,
+            before: None,
+            limit: CHAT_LIMIT,
+        };
+        let words: Vec<String> = arg
+            .split_whitespace()
+            .map(str::to_ascii_lowercase)
+            .collect();
+        if words.len() > 2 {
+            return None;
+        }
+        let (mut timed, mut kinded) = (false, false);
+        for w in &words {
+            if let Some(window) = window(w) {
+                if std::mem::replace(&mut timed, true) {
+                    return None;
+                }
+                q.window = window;
+            } else if let Some(kind) = kind(w) {
+                if std::mem::replace(&mut kinded, true) {
+                    return None;
+                }
+                q.kind = Some(kind);
+            } else {
+                return None;
+            }
+        }
+        Some(q)
+    }
+}
+
+impl Query {
+    /// `zephyr.activity`'s params (DESIGN §4.3.1), each optional: `range` (`24h`), `kind` (all
+    /// but `tool`), `before` (a previous `next`) and `limit` (1 to 200, default 50), words read
+    /// as [`Query::words`] reads them. `Err` is the `-32602` message.
+    pub fn params(p: &serde_json::Value) -> Result<Query, String> {
+        use serde_json::Value;
+        let bad = || USAGE.to_string();
+        let text = |key: &str| match &p[key] {
+            Value::Null => Ok(None),
+            Value::String(s) => Ok(Some(s.to_ascii_lowercase())),
+            _ => Err(bad()),
+        };
+        let window = window(&text("range")?.unwrap_or_else(|| "24h".into())).ok_or_else(bad)?;
+        let kind = match text("kind")? {
+            Some(k) => Some(kind(&k).ok_or_else(bad)?),
+            None => None,
+        };
+        let before = match &p["before"] {
+            Value::Null => None,
+            Value::String(s) => Some(Cursor::parse(s).ok_or_else(bad)?),
+            _ => return Err(bad()),
+        };
+        let limit = match &p["limit"] {
+            Value::Null => 50,
+            v => v
+                .as_u64()
+                .filter(|n| (1..=200).contains(n))
+                .ok_or_else(bad)? as u32,
+        };
+        Ok(Query {
+            window,
+            kind,
+            before,
+            limit,
+        })
+    }
+}
+
+/// `today`, or `Nh`/`Nd` from 1 h to 90 d.
+fn window(w: &str) -> Option<Window> {
+    if w == "today" {
+        return Some(Window::Today);
+    }
+    if !w.ends_with(['h', 'd']) {
+        return None;
+    }
+    let secs = i64::try_from(crate::settings::duration(w).ok()?.as_secs()).ok()?;
+    (3600..=90 * DAY)
+        .contains(&secs)
+        .then_some(Window::Last(secs))
+}
+
+/// A kind, singular or plural, or `grants`.
+fn kind(w: &str) -> Option<&'static str> {
+    match w {
+        "grants" => Some("grants"),
+        "processes" => Some("process"),
+        "process" => Some("process"),
+        _ => (KINDS.iter().copied()).find(|k| *k != "process" && (w == *k || w == format!("{k}s"))),
+    }
+}
+
+/// One record as every client shows it: `line` is the chat line, so no client formats anything.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Entry {
+    pub at: i64,
+    pub kind: String,
+    pub subject: String,
+    pub status: String,
+    pub text: String,
+    pub line: String,
+    /// The row comes from rpi's event stream, which a hostile agent can forge (DESIGN §4.4).
+    pub stream: bool,
+}
+
+/// Where `w` starts, in unix seconds.
+pub fn since(w: &Window, now: i64, tz: &TimeZone) -> i64 {
+    match w {
+        Window::Last(secs) => now - secs,
+        Window::Today => jiff::Timestamp::from_second(now)
+            .ok()
+            .and_then(|t| t.to_zoned(tz.clone()).start_of_day().ok())
+            .map_or(now - DAY, |z| z.timestamp().as_second()),
+    }
+}
+
+/// `r` scrubbed and cut, with its line: `WHEN KIND SUBJECT[ STATUS]: TEXT`.
+pub(crate) fn entry(r: &Record, scrub: &Scrub, now: i64, tz: &TimeZone) -> Entry {
+    let audit = r.src == "audit";
+    let text = one_line(&scrub.text(&r.text), 200);
+    // `audit.session` is named by gate socket requests, which the agent can forge.
+    let subject = match audit {
+        true => one_line(&session(scrub, &r.subject), 40),
+        false => one_line(&r.subject, 40),
+    };
+    let status = match (r.kind.as_str(), r.status.as_str()) {
+        // An outbound command left only once its call ran: until then it is not confirmed.
+        ("out", "sent") => String::new(),
+        ("out", "started") => " unconfirmed".into(),
+        ("setting", _) | (_, "started") => String::new(),
+        ("refused", "refused") => " by the policy".into(),
+        ("refused", "denied") => " by the gate".into(),
+        (_, s) => format!(" {}", one_line(s, 40)),
+    };
+    let line = format!(
+        "{} {} {subject}{status}: {text}",
+        when(r.at, now, tz),
+        r.kind
+    );
+    Entry {
+        at: r.at,
+        kind: r.kind.clone(),
+        subject,
+        status: r.status.clone(),
+        text,
+        line,
+        stream: audit && (r.kind == "out" || r.kind == "tool" || r.status == "refused"),
+    }
+}
+
+/// An audit row's session, scrubbed. When the vault or the facts cannot be read, one of the
+/// daemon's own names (`main`, `task-12`, `job-3-88`) still shows, since it holds no value;
+/// anything else stays withheld.
+fn session(scrub: &Scrub, s: &str) -> String {
+    let clean = scrub.text(s);
+    let withheld = clean.starts_with("[output withheld:") || clean.starts_with("[withheld:");
+    let number = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+    // Fewer than 6 digits in all, the least a digits fact holds, so no fact passes as an id.
+    let digits = s.bytes().filter(u8::is_ascii_digit).count();
+    let own = s == "main"
+        || digits < 6
+            && s.split_once('-').is_some_and(|(word, ids)| {
+                matches!(word, "task" | "job" | "action") && ids.split('-').all(number)
+            });
+    match withheld && own {
+        true => s.into(),
+        false => clean,
+    }
+}
+
+/// `HH:MM` on `now`'s local day, else `MM-DD HH:MM`.
+fn when(at: i64, now: i64, tz: &TimeZone) -> String {
+    let local = |t: i64| jiff::Timestamp::from_second(t).map(|t| t.to_zoned(tz.clone()));
+    match (local(at), local(now)) {
+        (Ok(a), Ok(n)) if a.date() == n.date() => a.strftime("%H:%M").to_string(),
+        (Ok(a), _) => a.strftime("%m-%d %H:%M").to_string(),
+        _ => String::new(),
+    }
+}
+
+/// How the header and the empty answer name the window.
+fn window_words(w: &Window) -> String {
+    match *w {
+        Window::Today => "since 00:00 today".into(),
+        Window::Last(DAY) => "in the last 24 h".into(),
+        Window::Last(s) if s % DAY == 0 => format!("in the last {} d", s / DAY),
+        Window::Last(s) => format!("in the last {} h", s / 3600),
+    }
+}
+
+fn noun(kind: Option<&str>) -> &'static str {
+    match kind {
+        Some("out") => "outbound commands",
+        Some("gate") => "gate decisions",
+        Some("refused") => "refusals",
+        Some("setting") => "setting changes",
+        Some("proposal") => "proposals",
+        Some("job") => "job runs",
+        Some("task") => "tasks",
+        Some("process") => "processes",
+        Some("tool") => "tool calls",
+        _ => "activity",
+    }
+}
+
+/// What still lets something happen without asking, with the command that takes it back.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Grant {
+    /// When it was granted.
+    pub at: i64,
+    /// The class, the setting's key, or `#id` for a job.
+    pub subject: String,
+    /// The line every client shows, ending ` · REVOKE` (or saying to set it back by hand).
+    pub line: String,
+    /// The command that takes it back; `None` when the value it would send could not be shown
+    /// as it is (scrubbed or cut), so no command with a wrong value is ever offered.
+    pub revoke: Option<String>,
+}
+
+/// `/set KEY RAW`, only when `shown` (what the owner reads) is `raw` itself.
+fn revoke_for(key: &str, raw: &str, shown: &str) -> Option<String> {
+    (raw == shown).then(|| format!("/set {key} {raw}"))
+}
+
+/// The standing grants (DESIGN §4.19), current state: remembered targets, time limits, then
+/// turned-on jobs. Vault grants are `/vault`'s to list, one-time passes go by themselves.
+pub fn grants(cfg: &Config, store: &Store, now: i64) -> rusqlite::Result<Vec<Grant>> {
+    let tz = crate::scheduler::zone(cfg).unwrap_or(TimeZone::UTC);
+    let scrub = Scrub::load(cfg);
+    let clean = |s: &str| one_line(&scrub.text(s), 200);
+    let grant = |at: i64, subject: String, shown: String, revoke: Option<String>| Grant {
+        at,
+        line: match &revoke {
+            Some(r) => format!("{shown} · {r}"),
+            None => format!("{shown} · set {subject} back by hand"),
+        },
+        subject,
+        revoke,
+    };
+    let mut out = Vec::new();
+    for t in store.known_targets()? {
+        let since = jiff::Timestamp::from_second(t.added_at)
+            .map(|s| s.to_zoned(tz.clone()).strftime("%m-%d").to_string())
+            .unwrap_or_default();
+        let shown = format!("{} {}, known since {since}", t.class, clean(&t.target));
+        out.push(grant(
+            t.added_at,
+            t.class,
+            shown,
+            Some(format!("/approvals forget {}", t.n)),
+        ));
+    }
+    for r in store.due_reverts(i64::MAX)? {
+        let Some(setting) = crate::settings::find(&r.key) else {
+            continue;
+        };
+        // A timed preset's value is a snapshot (`manual; messages=ask`); setting the preset its
+        // first item names is what takes the limit back; an unset one (`default`) reads as manual.
+        let back =
+            match r.key.as_str() {
+                "approvals.preset" => r.value.as_deref().map(|v| {
+                    match v.split(';').next().unwrap_or_default().trim() {
+                        "default" => "manual".to_string(),
+                        first => first.to_string(),
+                    }
+                }),
+                _ => r.value.clone(),
+            };
+        // Only a limit that loosened something is a grant: going back must be stricter, by the
+        // registry's own order. An approval class going back to unset follows the preset.
+        let now_value = crate::settings::value(cfg, &r.key);
+        let back_value = back
+            .clone()
+            .or_else(|| crate::settings::cleared(cfg, &r.key));
+        let stricter =
+            crate::settings::tighter(setting, now_value.as_deref(), back_value.as_deref());
+        if stricter != Some(true) || now_value == back_value {
+            continue;
+        }
+        let value = clean(crate::settings::shown(r.value.as_deref()));
+        let raw = crate::settings::shown(back.as_deref());
+        let shown = format!("{} until {}, then {value}", r.key, when(r.at, now, &tz));
+        let revoke = revoke_for(&r.key, raw, &clean(raw));
+        out.push(grant(r.since, r.key, shown, revoke));
+    }
+    for (job, created) in store.enabled_jobs()? {
+        let shown = format!(
+            "job #{} {}, {}, to {}",
+            job.id,
+            clean(&job.name),
+            one_line(&job.schedule, 200),
+            job.channel
+        );
+        out.push(grant(
+            created,
+            format!("#{}", job.id),
+            shown,
+            Some(format!("/job rm {}", job.id)),
+        ));
+    }
+    Ok(out)
+}
+
+/// `zephyr.activity`'s answer: a page of entries and the cursor of the next, or the grants.
+/// `Err` is the `-32000` message.
+pub fn answer(
+    cfg: &Config,
+    store: &Store,
+    q: &Query,
+    now: i64,
+) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let failed = |e: rusqlite::Error| format!("reading the activity failed: {e}");
+    if q.kind == Some("grants") {
+        let entries: Vec<serde_json::Value> = (grants(cfg, store, now).map_err(failed)?.iter())
+            .map(|g| {
+                json!({"at": g.at, "kind": "grant", "subject": g.subject, "line": g.line,
+                       "revoke": g.revoke})
+            })
+            .collect();
+        return Ok(json!({"since": null, "entries": entries, "next": null}));
+    }
+    let tz = crate::scheduler::zone(cfg).unwrap_or(TimeZone::UTC);
+    let since = since(&q.window, now, &tz);
+    let kinds: Vec<&str> = q.kind.into_iter().collect();
+    let mut records =
+        (store.activity(since, &kinds, q.before.as_ref(), q.limit + 1)).map_err(failed)?;
+    let more = records.len() > q.limit as usize;
+    records.truncate(q.limit as usize);
+    let next = (records.last())
+        .filter(|_| more)
+        .map(|r| Cursor::of(r).to_string());
+    let scrub = Scrub::load(cfg);
+    let entries: Vec<Entry> = (records.iter())
+        .map(|r| entry(r, &scrub, now, &tz))
+        .collect();
+    Ok(json!({"since": since, "entries": entries, "next": next}))
+}
+
+/// The whole reply to `/activity ARG`, for the owner on any channel and the agent's `gateway`.
+pub fn chat(cfg: &Config, store: &Store, arg: &str, now: i64) -> String {
+    let Some(q) = Query::words(arg) else {
+        return USAGE.into();
+    };
+    if q.kind == Some("grants") {
+        return match grants(cfg, store, now) {
+            Err(e) => format!("[zephyr] reading the activity failed: {e}"),
+            Ok(g) if g.is_empty() => "[zephyr] no standing grants".into(),
+            Ok(g) => std::iter::once("[zephyr] standing grants, each with what takes it back:")
+                .chain(g.iter().map(|g| g.line.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+    }
+    let tz = crate::scheduler::zone(cfg).unwrap_or(TimeZone::UTC);
+    let kinds: Vec<&str> = q.kind.into_iter().collect();
+    let mut records = match store.activity(since(&q.window, now, &tz), &kinds, None, q.limit + 1) {
+        Ok(r) => r,
+        Err(e) => return format!("[zephyr] reading the activity failed: {e}"),
+    };
+    let window = window_words(&q.window);
+    if records.is_empty() {
+        return format!("[zephyr] nothing recorded {window}");
+    }
+    let more = records.len() > q.limit as usize;
+    records.truncate(q.limit as usize);
+    let scrub = Scrub::load(cfg);
+    let mut out = vec![format!("[zephyr] {} {window}, newest first:", noun(q.kind))];
+    out.extend(records.iter().map(|r| entry(r, &scrub, now, &tz).line));
+    if more {
+        out.push(format!(
+            "(only the newest {}; /activity KIND or a shorter time narrows it)",
+            q.limit
+        ));
+    }
+    out.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Record;
+    use jiff::tz::TimeZone;
+
+    fn cfg(name: &str) -> (Config, Store) {
+        let dir = crate::test_dir(name);
+        let cfg: Config =
+            toml::from_str(&format!("rpi = '/r'\nhome = {dir:?}\ntimezone = 'UTC'\n")).unwrap();
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let store = Store::open(&cfg.db_path()).unwrap();
+        (cfg, store)
+    }
+
+    fn rec(at: i64, src: &str, kind: &str, subject: &str, status: &str, text: &str) -> Record {
+        Record {
+            at,
+            src: src.into(),
+            id: 1,
+            kind: kind.into(),
+            subject: subject.into(),
+            status: status.into(),
+            text: text.into(),
+        }
+    }
+
+    /// 2025-11-10 14:30 UTC.
+    const NOW: i64 = 1_762_785_000;
+
+    fn at(hh: i64, mm: i64) -> i64 {
+        NOW - NOW % 86_400 + hh * 3600 + mm * 60
+    }
+
+    #[test]
+    fn words_parse_as_the_spec_says() {
+        let q = Query::words("").unwrap();
+        assert_eq!(
+            (q.window, q.kind, q.limit),
+            (Window::Last(86_400), None, 30)
+        );
+        assert_eq!(q.before, None);
+        assert_eq!(Query::words("today").unwrap().window, Window::Today);
+        assert_eq!(Query::words("6h").unwrap().window, Window::Last(6 * 3600));
+        assert_eq!(
+            Query::words("90d").unwrap().window,
+            Window::Last(90 * 86_400)
+        );
+        assert_eq!(
+            Query::words("2160h").unwrap().window,
+            Window::Last(90 * 86_400)
+        );
+        for (arg, window, kind) in [
+            ("tasks 7d", Window::Last(7 * 86_400), "task"),
+            ("7d tasks", Window::Last(7 * 86_400), "task"),
+            ("7D Tasks", Window::Last(7 * 86_400), "task"),
+            ("Today out", Window::Today, "out"),
+            ("processes", Window::Last(86_400), "process"),
+            ("grants", Window::Last(86_400), "grants"),
+            ("tool", Window::Last(86_400), "tool"),
+        ] {
+            let q = Query::words(arg).unwrap_or_else(|| panic!("{arg}"));
+            assert_eq!((q.window, q.kind), (window, Some(kind)), "{arg}");
+        }
+        assert_eq!(Query::words("Today").unwrap().window, Window::Today);
+        for bad in [
+            "91d",
+            "0h",
+            "30m",
+            "60s",
+            "6h 7d",
+            "task job",
+            "6h task x",
+            "nonsense",
+            "processs",
+        ] {
+            assert!(Query::words(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn each_kind_renders_its_golden_line() {
+        let (cfg, _store) = cfg("activity-golden");
+        let scrub = Scrub::load(&cfg);
+        let utc = TimeZone::UTC;
+        for (r, line) in [
+            (
+                rec(
+                    at(14, 5),
+                    "audit",
+                    "gate",
+                    "main",
+                    "approved",
+                    "exec #31 email to bob@x.org",
+                ),
+                "14:05 gate main approved: exec #31 email to bob@x.org",
+            ),
+            (
+                rec(
+                    at(14, 2),
+                    "audit",
+                    "out",
+                    "main",
+                    "sent",
+                    "curl POST api.example.com",
+                ),
+                "14:02 out main: curl POST api.example.com",
+            ),
+            // Started, its end not seen (the daemon died mid-call): never read as sent.
+            (
+                rec(
+                    at(14, 2),
+                    "audit",
+                    "out",
+                    "main",
+                    "started",
+                    "curl POST b.example.com",
+                ),
+                "14:02 out main unconfirmed: curl POST b.example.com",
+            ),
+            (
+                rec(
+                    at(14, 2),
+                    "audit",
+                    "out",
+                    "main",
+                    "held",
+                    "curl POST c.example.com",
+                ),
+                "14:02 out main held: curl POST c.example.com",
+            ),
+            (
+                rec(
+                    at(14, 1),
+                    "audit",
+                    "refused",
+                    "task-12",
+                    "refused",
+                    r#"bash {"command":"rm -rf /"}"#,
+                ),
+                r#"14:01 refused task-12 by the policy: bash {"command":"rm -rf /"}"#,
+            ),
+            (
+                rec(at(14, 0), "audit", "refused", "main", "denied", "exec {}"),
+                "14:00 refused main by the gate: exec {}",
+            ),
+            (
+                rec(
+                    at(13, 58),
+                    "settings_log",
+                    "setting",
+                    "agent on tui",
+                    "agent",
+                    "tasks.parallel 4 → 2",
+                ),
+                "13:58 setting agent on tui: tasks.parallel 4 → 2",
+            ),
+            (
+                rec(
+                    at(13, 40),
+                    "tasks",
+                    "task",
+                    "#12",
+                    "completed",
+                    "summarise the inbox",
+                ),
+                "13:40 task #12 completed: summarise the inbox",
+            ),
+            (
+                rec(
+                    at(13, 0),
+                    "runs",
+                    "job",
+                    "#3 run 88",
+                    "completed",
+                    "morning-brief",
+                ),
+                "13:00 job #3 run 88 completed: morning-brief",
+            ),
+            (
+                rec(
+                    at(12, 10),
+                    "procs",
+                    "process",
+                    "#7",
+                    "exited 0",
+                    "cargo build --release",
+                ),
+                "12:10 process #7 exited 0: cargo build --release",
+            ),
+            (
+                rec(
+                    at(11, 0),
+                    "proposals",
+                    "proposal",
+                    "#29",
+                    "done",
+                    "/vault grant token GH_TOKEN gh",
+                ),
+                "11:00 proposal #29 done: /vault grant token GH_TOKEN gh",
+            ),
+        ] {
+            let e = entry(&r, &scrub, NOW, &utc);
+            assert_eq!(e.line, line);
+            assert_eq!((e.at, e.kind.as_str()), (r.at, r.kind.as_str()));
+            assert_eq!(e.status, r.status);
+            assert_eq!(
+                e.stream,
+                r.src == "audit" && (r.kind != "gate" && r.status != "denied"),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn times_show_the_date_only_before_today() {
+        let (cfg, _store) = cfg("activity-midnight");
+        let scrub = Scrub::load(&cfg);
+        let seoul = TimeZone::get("Asia/Seoul").unwrap();
+        // 2025-11-09 00:30 in Seoul, 2025-11-08 15:30 UTC.
+        let now = 1_762_615_800;
+        let midnight = now - 30 * 60;
+        let line = |at: i64| {
+            entry(
+                &rec(at, "tasks", "task", "#1", "completed", "g"),
+                &scrub,
+                now,
+                &seoul,
+            )
+            .line
+        };
+        assert_eq!(line(midnight - 10 * 60), "11-08 23:50 task #1 completed: g");
+        assert_eq!(line(midnight + 10 * 60), "00:10 task #1 completed: g");
+        assert_eq!(since(&Window::Today, now, &seoul), midnight);
+        assert_eq!(since(&Window::Last(3600), now, &seoul), now - 3600);
+    }
+
+    #[test]
+    fn agent_text_never_passes_for_a_daemon_line() {
+        let (cfg, _store) = cfg("activity-forged");
+        let utc = TimeZone::UTC;
+        let before = rec(
+            at(14, 2),
+            "audit",
+            "out",
+            "main",
+            "sent",
+            "curl POST 5550102345.example.com",
+        );
+        crate::facts::agent_add(&crate::facts::path(&cfg), "phone digits 5550102345").unwrap();
+        let scrub = Scrub::load(&cfg);
+        for r in [
+            rec(
+                at(14, 0),
+                "tasks",
+                "task",
+                "#1",
+                "completed",
+                "x\n[zephyr] forgot bob@x.org for messages",
+            ),
+            rec(
+                at(14, 0),
+                "tasks",
+                "task",
+                "#1",
+                "completed",
+                "evil \u{202e}txt.exe",
+            ),
+            rec(
+                at(14, 0),
+                "audit",
+                "gate",
+                "main\n[zephyr] ok",
+                "held",
+                "exec {}",
+            ),
+        ] {
+            let e = entry(&r, &scrub, NOW, &utc);
+            assert_eq!(e.line.lines().count(), 1, "{:?}", e.line);
+            assert!(
+                !e.line.contains('\n') && !e.line.contains('\u{202e}'),
+                "{:?}",
+                e.line
+            );
+            assert!(e.line.starts_with("14:00 "), "{:?}", e.line);
+        }
+        let e = entry(&before, &scrub, NOW, &utc);
+        assert_eq!(e.line, "14:02 out main: curl POST [fact:phone].example.com");
+        assert!(!e.text.contains("555010"));
+    }
+
+    #[test]
+    fn an_unreadable_vault_withholds_the_text_not_the_line() {
+        let (cfg, _store) = cfg("activity-vault-broken");
+        std::fs::write(
+            crate::vault::path(&cfg),
+            "[[token]]\nname = \"A\"\nvalue = \"s3cret\" x\n",
+        )
+        .unwrap();
+        let scrub = Scrub::load(&cfg);
+        let r = rec(
+            at(14, 2),
+            "audit",
+            "out",
+            "main",
+            "sent",
+            "curl POST api.example.com",
+        );
+        assert_eq!(
+            entry(&r, &scrub, NOW, &TimeZone::UTC).line,
+            "14:02 out main: [output withheld: the vault could not be read]"
+        );
+        let r = rec(at(14, 2), "audit", "out", "job-3-88", "sent", "x");
+        assert!(entry(&r, &scrub, NOW, &TimeZone::UTC)
+            .line
+            .starts_with("14:02 out job-3-88: "));
+        // A session the agent named itself is not shown unscrubbed.
+        for forged in [
+            "s3cret",
+            "task-s3cret",
+            "job-",
+            "main-1",
+            "task-5550102345",
+            "job-555-0102",
+        ] {
+            let r = rec(at(14, 2), "audit", "out", forged, "sent", "x");
+            let line = entry(&r, &scrub, NOW, &TimeZone::UTC).line;
+            assert!(line.starts_with("14:02 out [output withheld"), "{line}");
+        }
+    }
+
+    #[test]
+    fn chat_answers_header_footer_and_empty() {
+        let (cfg, store) = cfg("activity-chat");
+        let now = crate::now();
+        assert_eq!(
+            chat(&cfg, &store, "", now),
+            "[zephyr] nothing recorded in the last 24 h"
+        );
+        assert_eq!(
+            chat(&cfg, &store, "7d", now),
+            "[zephyr] nothing recorded in the last 7 d"
+        );
+        assert_eq!(chat(&cfg, &store, "bogus words", now), USAGE);
+        for i in 0..31 {
+            store.audit("main", "exec", &i.to_string(), "held").unwrap();
+        }
+        let reply = chat(&cfg, &store, "", now);
+        let lines: Vec<&str> = reply.lines().collect();
+        assert_eq!(lines.len(), 32, "{reply}");
+        assert_eq!(
+            lines[0],
+            "[zephyr] activity in the last 24 h, newest first:"
+        );
+        assert!(
+            lines[1].ends_with("gate main held: exec 30"),
+            "{}",
+            lines[1]
+        );
+        assert_eq!(
+            lines[31],
+            "(only the newest 30; /activity KIND or a shorter time narrows it)"
+        );
+        store
+            .add_task("summarise", None, None, "chat", "1000")
+            .unwrap();
+        let reply = chat(&cfg, &store, "tasks today", now);
+        assert_eq!(
+            reply.lines().collect::<Vec<_>>()[..1],
+            ["[zephyr] tasks since 00:00 today, newest first:"]
+        );
+        assert!(reply.ends_with("task #1 queued: summarise"), "{reply}");
+        assert_eq!(reply.lines().count(), 2);
+        let reply = chat(&cfg, &store, "6h out", now);
+        assert_eq!(reply, "[zephyr] nothing recorded in the last 6 h");
+    }
+
+    fn revert(key: &str, value: Option<&str>, at: i64) -> crate::store::Revert {
+        crate::store::Revert {
+            key: key.into(),
+            value: value.map(Into::into),
+            at,
+            since: at - 3600,
+            channel: Some("chat".into()),
+        }
+    }
+
+    #[test]
+    fn grants_list_each_with_its_revoke() {
+        let (cfg, store) = cfg("activity-grants");
+        assert_eq!(
+            chat(&cfg, &store, "grants", NOW),
+            "[zephyr] no standing grants"
+        );
+        store
+            .remember_targets("messages", &["bob@x.org".into()])
+            .unwrap();
+        // 2025-11-02 09:00 UTC.
+        store
+            .db_for_test()
+            .execute("UPDATE known_targets SET added_at = 1762074000", [])
+            .unwrap();
+        store
+            .set_revert(&revert("budget.daily_cost_usd", Some("5"), at(18, 0)))
+            .unwrap();
+        store
+            .add_job("morning-brief", "0 7 * * *", "p", "discord", "1")
+            .unwrap();
+        store
+            .propose_job("proposed", "0 8 * * *", "p", "discord", "1")
+            .unwrap();
+        let g = grants(&cfg, &store, NOW).unwrap();
+        let lines: Vec<&str> = g.iter().map(|g| g.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "messages bob@x.org, known since 11-02 · /approvals forget 1",
+                "budget.daily_cost_usd until 18:00, then 5 · /set budget.daily_cost_usd 5",
+                "job #1 morning-brief, 0 7 * * *, to discord · /job rm 1",
+            ]
+        );
+        let revokes: Vec<&str> = g.iter().filter_map(|g| g.revoke.as_deref()).collect();
+        assert_eq!(
+            revokes,
+            [
+                "/approvals forget 1",
+                "/set budget.daily_cost_usd 5",
+                "/job rm 1"
+            ]
+        );
+        let subjects: Vec<&str> = g.iter().map(|g| g.subject.as_str()).collect();
+        assert_eq!(subjects, ["messages", "budget.daily_cost_usd", "#1"]);
+        assert_eq!(g[0].at, 1762074000);
+        let reply = chat(&cfg, &store, "7d Grants", NOW);
+        assert_eq!(
+            reply,
+            format!(
+                "[zephyr] standing grants, each with what takes it back:\n{}",
+                lines.join("\n")
+            )
+        );
+    }
+
+    /// A store and a config whose zephyr.toml holds `extra`: the values in effect now.
+    fn cfg_with(name: &str, extra: &str) -> (Config, Store) {
+        let (cfg, store) = cfg(name);
+        let cfg: Config = toml::from_str(&format!(
+            "rpi = '/r'\nhome = {:?}\ntimezone = 'UTC'\n{extra}",
+            cfg.home
+        ))
+        .unwrap();
+        (cfg, store)
+    }
+
+    #[test]
+    fn a_timed_presets_revoke_is_a_working_command() {
+        // `/approvals semi for 2h` over manual: semi now, manual back at 18:00.
+        let (cfg, store) = cfg_with(
+            "activity-grants-preset",
+            "[approvals]\npreset = 'semi'\n[budget]\ndaily_cost_usd = 1\n",
+        );
+        store
+            .set_revert(&revert(
+                "approvals.preset",
+                Some("manual; messages=ask"),
+                at(18, 0),
+            ))
+            .unwrap();
+        // PR #39 review: a timed tightening (`/set budget.daily_cost_usd 1 for 2h` over 5) is no
+        // grant, and its "take it back" would loosen at once.
+        store
+            .set_revert(&revert("budget.daily_cost_usd", Some("5"), at(19, 0)))
+            .unwrap();
+        let g = grants(&cfg, &store, NOW).unwrap();
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert_eq!(
+            g[0].line,
+            "approvals.preset until 18:00, then manual; messages=ask · /set approvals.preset manual"
+        );
+        assert_eq!(g[0].revoke.as_deref(), Some("/set approvals.preset manual"));
+        store
+            .set_revert(&revert(
+                "approvals.preset",
+                Some("default; posts=hold"),
+                at(18, 0),
+            ))
+            .unwrap();
+        let g = grants(&cfg, &store, NOW).unwrap();
+        // An unset preset reads as manual; `none` is no value approvals.preset takes.
+        assert_eq!(g[0].revoke.as_deref(), Some("/set approvals.preset manual"));
+        assert!(
+            g[0].line.contains("then default; posts=hold · "),
+            "{}",
+            g[0].line
+        );
+    }
+
+    /// PR #39 review: a revoke is offered only when the value it sends is the real one, not a
+    /// scrubbed or cut copy of it.
+    #[test]
+    fn a_revoke_is_offered_only_for_the_real_value() {
+        assert_eq!(
+            revoke_for("budget.daily_cost_usd", "5", "5").as_deref(),
+            Some("/set budget.daily_cost_usd 5")
+        );
+        assert_eq!(revoke_for("k", "s3cr3tvalue", "[vault:A]"), None);
+        let long = "x".repeat(250);
+        assert_eq!(revoke_for("k", &long, &one_line(&long, 200)), None);
+    }
+}

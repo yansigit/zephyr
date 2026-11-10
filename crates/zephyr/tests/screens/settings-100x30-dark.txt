@@ -7,8 +7,6 @@
  ▌ remind me to renew the domain on friday                                         discord · 14:02
 
  ≋ Done. I scheduled renew kimchigoose.com for Fri 09:00 KST.
-   ▸ schedule  add "renew domain" fri 09:00                                                  ✓ 0.2s
-
  ╭─ settings ─────────────────────────────────────────────────────────────────────────────────────╮
  │   Model              › Daily tokens      none · default                                        │
  │   Background tasks     Daily cost (USD)  5    · until 18:00                                    │
@@ -22,6 +20,8 @@
  │   Security                                                                                     │
  │   Read-only                                                                                    │
  │   Waiting (1)                                                                                  │
+ │   Activity                                                                                     │
+ │   Grants                                                                                       │
  │                                                                                                │
  │ budget.daily_tokens · Tokens per UTC day before the agent pauses; none is no limit.            │
  │ a whole number from 1, or none · the agent may tighten it                                      │

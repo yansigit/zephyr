@@ -1,0 +1,30 @@
+  .◠◠.◠◠.       zephyr v0.1.0                                                             2 waiting
+( ◦^ ᴗ ^◦ )~    main · claude-code-1 › claude-opus-5-5 · medium
+ `-.___.-'      discord ●  imessage ●  chat ○                          today 41.2k tok · $0.38 / $5
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+   ─────────────────────────────────────── Fri 30 Oct 2026 ───────────────────────────────────────
+
+ ▌ remind me to renew the domain on friday                                         discord · 14:02
+
+ ≋ Done. I scheduled renew kimchigoose.com for Fri 09:00 KST.
+   ▸ schedule  add "renew domain" fri 09:00                                                  ✓ 0.2s
+ ╭─ settings ─────────────────────────────────────────────────────────────────────────────────────╮
+ │   Model                14:05 gate main approved: exec #31 email to bob@x.org                   │
+ │   Background tasks     14:02 out main: curl POST api.example.com                               │
+ │   Budget               14:01 refused task-12 by the policy: bash {"command":"rm -rf /"}        │
+ │   General              13:58 setting agent on tui: tasks.parallel 4 → 2                        │
+ │   Accounts             13:40 task #12 completed: summarise the inbox                           │
+ │   Connectors           13:00 job #3 run 88 completed: morning-brief                            │
+ │   Rules                12:10 tool main: read {"path":"/var/log/backup.log"}                    │
+ │   Approvals                                                                                    │
+ │   Private facts                                                                                │
+ │   Security                                                                                     │
+ │   Read-only                                                                                    │
+ │   Waiting (2)                                                                                  │
+ │ › Activity                                                                                     │
+ │   Grants                                                                                       │
+ │                                                                                                │
+ │ Zephyr's own record of what ran, what left the machine, what waited and what was refused,      │
+ │ newest first. The agent never writes it.                                                       │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+  ↑↓ choose · → open · ? keys · esc close                                                   ctx 42%

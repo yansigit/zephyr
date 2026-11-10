@@ -88,6 +88,11 @@ pub struct JobRun {
     pub job: Job,
 }
 
+/// A new job's id: past every job and every run's job, so a removed job's runs (which stay,
+/// `remove_job`) never date a new job, which `claim_due` would otherwise fire at once.
+const NEW_JOB_ID: &str = "(SELECT coalesce(max(m), 0) + 1 FROM
+     (SELECT max(id) AS m FROM jobs UNION ALL SELECT max(job_id) FROM runs))";
+
 const JOB_COLUMNS: &str =
     "jobs.id, jobs.name, jobs.schedule, jobs.prompt, jobs.channel, jobs.recipient, jobs.enabled";
 
@@ -507,6 +512,158 @@ pub struct Revert {
     pub at: i64,
     pub since: i64,
     pub channel: Option<String>,
+}
+
+/// One entry of the activity record (DESIGN §4.19): `src` is the table it came from and `id` its
+/// row there, `at` its latest change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Record {
+    pub at: i64,
+    pub src: String,
+    pub id: i64,
+    pub kind: String,
+    pub subject: String,
+    pub status: String,
+    pub text: String,
+}
+
+/// Where a page of the activity record ends: the next page is what sorts strictly before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cursor {
+    pub at: i64,
+    pub src: String,
+    pub id: i64,
+}
+
+/// The tables the activity record reads, as a cursor names them.
+pub const ACTIVITY_SOURCES: [&str; 6] = [
+    "audit",
+    "settings_log",
+    "proposals",
+    "runs",
+    "tasks",
+    "procs",
+];
+
+impl Cursor {
+    /// `AT.SRC.ID`, strictly: an integer, one of [`ACTIVITY_SOURCES`], an integer.
+    pub fn parse(s: &str) -> Option<Cursor> {
+        let parts: Vec<&str> = s.split('.').collect();
+        let [at, src, id] = parts[..] else {
+            return None;
+        };
+        let src = ACTIVITY_SOURCES.iter().find(|t| **t == src)?;
+        Some(Cursor {
+            at: at.parse().ok()?,
+            src: (*src).to_string(),
+            id: id.parse().ok()?,
+        })
+    }
+
+    pub fn of(r: &Record) -> Cursor {
+        Cursor {
+            at: r.at,
+            src: r.src.clone(),
+            id: r.id,
+        }
+    }
+}
+
+impl std::fmt::Display for Cursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.at, self.src, self.id)
+    }
+}
+
+/// What `/job rm` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobRemoval {
+    Removed,
+    Missing,
+    /// A run of it is in progress: its restart notice needs the job, so it stays.
+    Running,
+}
+
+/// A recipient the owner approved under `ask-new` (approvals spec §4.6); `n` is its rowid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownTarget {
+    pub n: i64,
+    pub class: String,
+    pub target: String,
+    pub added_at: i64,
+}
+
+/// Each table the activity record reads, with the kinds it gives: a branch of the query, bounded
+/// by the window (`?1`) and the cursor (`?3..?5`) itself, so the union never carries rows a page
+/// would drop. `audit` has the index on `ts`, which `ts <= ?3` lets the cursor use too.
+const ACTIVITY_BRANCHES: [(&[&str], &str); 6] = [
+    (
+        &["out", "gate", "refused", "tool"],
+        "SELECT ts, 'audit', id,
+                CASE WHEN tool = 'outbound' THEN 'out'
+                     WHEN outcome IN ('refused', 'denied') THEN 'refused'
+                     WHEN outcome IN ('started', 'error') THEN 'tool' ELSE 'gate' END,
+                session, outcome, iif(tool = 'outbound', args, tool || ' ' || args)
+           FROM audit WHERE ts >= ?1 AND ts <= ?3 AND (ts, 'audit', id) < (?3, ?4, ?5)",
+    ),
+    (
+        &["setting"],
+        "SELECT at, 'settings_log', id, 'setting',
+                actor || coalesce(' on ' || channel, '') || coalesce(' (#' || proposal || ')', ''),
+                actor, key || ' ' || coalesce(old, 'none') || ' → ' || coalesce(new, 'none')
+           FROM settings_log WHERE at >= ?1 AND (at, 'settings_log', id) < (?3, ?4, ?5)",
+    ),
+    (
+        &["proposal"],
+        "SELECT coalesce(settled_at, created_at), 'proposals', id, 'proposal', '#' || id,
+                iif(status = 'pending' AND created_at <= unixepoch() - 86400, 'expired', status),
+                command
+           FROM proposals WHERE kind = 'command' AND coalesce(settled_at, created_at) >= ?1
+            AND (coalesce(settled_at, created_at), 'proposals', id) < (?3, ?4, ?5)",
+    ),
+    (
+        &["job"],
+        "SELECT coalesce(r.ended_at, r.started_at, r.due_at), 'runs', r.id, 'job',
+                '#' || r.job_id || ' run ' || r.id, r.status, coalesce(j.name, '(removed)')
+           FROM runs r LEFT JOIN jobs j ON j.id = r.job_id
+          WHERE coalesce(r.ended_at, r.started_at, r.due_at) >= ?1
+            AND (coalesce(r.ended_at, r.started_at, r.due_at), 'runs', r.id) < (?3, ?4, ?5)",
+    ),
+    (
+        &["task"],
+        "SELECT coalesce(ended_at, started_at, created_at), 'tasks', id, 'task', '#' || id,
+                status, goal
+           FROM tasks WHERE coalesce(ended_at, started_at, created_at) >= ?1
+            AND (coalesce(ended_at, started_at, created_at), 'tasks', id) < (?3, ?4, ?5)",
+    ),
+    (
+        &["process"],
+        "SELECT coalesce(ended_at, created_at), 'procs', id, 'process', '#' || id,
+                status || coalesce(' ' || exit_code, ''), command
+           FROM procs WHERE coalesce(ended_at, created_at) >= ?1
+            AND (coalesce(ended_at, created_at), 'procs', id) < (?3, ?4, ?5)",
+    ),
+];
+
+/// The activity query over only the tables `kinds` (empty: all but `tool`) come from; `None`
+/// when none does.
+fn activity_sql(kinds: &[&str]) -> Option<String> {
+    let asked = |gives: &[&str]| match kinds.is_empty() {
+        true => gives.iter().any(|k| *k != "tool"),
+        false => gives.iter().any(|k| kinds.contains(k)),
+    };
+    let branches: Vec<&str> = (ACTIVITY_BRANCHES.iter())
+        .filter(|(gives, _)| asked(gives))
+        .map(|(_, sql)| *sql)
+        .collect();
+    (!branches.is_empty()).then(|| {
+        format!(
+            "WITH a(at, src, id, kind, subject, status, text) AS ({})
+             SELECT * FROM a WHERE instr(?2, ',' || kind || ',')
+             ORDER BY at DESC, src DESC, id DESC LIMIT ?6",
+            branches.join(" UNION ALL ")
+        )
+    })
 }
 
 /// The latest change recorded for a setting.
@@ -1209,7 +1366,10 @@ impl Store {
         recipient: &str,
     ) -> rusqlite::Result<i64> {
         self.db.execute(
-            "INSERT INTO jobs(name, schedule, prompt, channel, recipient) VALUES (?1, ?2, ?3, ?4, ?5)",
+            &format!(
+                "INSERT INTO jobs(id, name, schedule, prompt, channel, recipient)
+                 VALUES ({NEW_JOB_ID}, ?1, ?2, ?3, ?4, ?5)"
+            ),
             params![name, schedule, prompt, channel, recipient],
         )?;
         Ok(self.db.last_insert_rowid())
@@ -1225,8 +1385,10 @@ impl Store {
         recipient: &str,
     ) -> rusqlite::Result<i64> {
         self.db.execute(
-            "INSERT INTO jobs(name, schedule, prompt, channel, recipient, enabled)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            &format!(
+                "INSERT INTO jobs(id, name, schedule, prompt, channel, recipient, enabled)
+                 VALUES ({NEW_JOB_ID}, ?1, ?2, ?3, ?4, ?5, 0)"
+            ),
             params![name, schedule, prompt, channel, recipient],
         )?;
         Ok(self.db.last_insert_rowid())
@@ -1363,7 +1525,7 @@ impl Store {
     pub fn settle_proposal(&self, id: i64, status: &str) -> rusqlite::Result<Option<String>> {
         self.db
             .query_row(
-                "UPDATE proposals SET status = ?2
+                "UPDATE proposals SET status = ?2, settled_at = unixepoch()
                  WHERE id = ?1 AND kind = 'command' AND status = 'pending'
                    AND created_at > unixepoch() - 86400
                  RETURNING command",
@@ -1675,6 +1837,42 @@ impl Store {
         Ok(())
     }
 
+    /// Every remembered target, by class and target; `n` is the row's id for `forget_target`.
+    pub fn known_targets(&self) -> rusqlite::Result<Vec<KnownTarget>> {
+        let mut stmt = self.db.prepare(
+            "SELECT rowid, class, target, added_at FROM known_targets ORDER BY class, target",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(KnownTarget {
+                n: r.get(0)?,
+                class: r.get(1)?,
+                target: r.get(2)?,
+                added_at: r.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Forgets remembered target `n`: `(class, target)`, or `None` when there is no such row.
+    pub fn forget_target(&self, n: i64) -> rusqlite::Result<Option<(String, String)>> {
+        self.db
+            .query_row(
+                "DELETE FROM known_targets WHERE rowid = ?1 RETURNING class, target",
+                params![n],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+    }
+
+    /// The turned-on jobs with when each was created (or last turned on), by id.
+    pub fn enabled_jobs(&self) -> rusqlite::Result<Vec<(Job, i64)>> {
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT {JOB_COLUMNS}, jobs.created_at FROM jobs WHERE enabled = 1 ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], |r| Ok((job_row(r, 0)?, r.get(7)?)))?;
+        rows.collect()
+    }
+
     /// Whether every target is known for `class`; any `unknown` target is not, nor is no target.
     pub fn all_known(&self, class: &str, targets: &[String]) -> rusqlite::Result<bool> {
         if targets.is_empty() {
@@ -1727,17 +1925,27 @@ impl Store {
         Ok(n == 1)
     }
 
-    /// One line of the daemon's tool-call audit (DESIGN §4.4).
+    /// One line of the daemon's tool-call audit (DESIGN §4.4). Returns its id.
     pub fn audit(
         &self,
         session: &str,
         tool: &str,
         args: &str,
         outcome: &str,
-    ) -> rusqlite::Result<()> {
+    ) -> rusqlite::Result<i64> {
         self.db.execute(
             "INSERT INTO audit(session, tool, args, outcome) VALUES (?1, ?2, ?3, ?4)",
             params![session, tool, args, outcome],
+        )?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    /// Sets how audit line `id`, written `started`, ended: an outbound command's row is
+    /// confirmed by its call's end, never by its start.
+    pub fn settle_audit(&self, id: i64, outcome: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE audit SET outcome = ?2 WHERE id = ?1 AND outcome = 'started'",
+            params![id, outcome],
         )?;
         Ok(())
     }
@@ -1748,6 +1956,39 @@ impl Store {
             .db
             .prepare("SELECT session, tool, args, outcome FROM audit ORDER BY id")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect()
+    }
+
+    /// The activity record (DESIGN §4.19), newest first: what is at or after `since`, of `kinds`
+    /// (empty: all but `tool`), strictly before `before`, at most `limit`.
+    pub fn activity(
+        &self,
+        since: i64,
+        kinds: &[&str],
+        before: Option<&Cursor>,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<Record>> {
+        let Some(sql) = activity_sql(kinds) else {
+            return Ok(vec![]);
+        };
+        let kinds = if kinds.is_empty() {
+            ",out,gate,refused,setting,proposal,job,task,process,".to_string()
+        } else {
+            format!(",{},", kinds.join(","))
+        };
+        let (at, src, id) = before.map_or((i64::MAX, "", 0), |c| (c.at, c.src.as_str(), c.id));
+        let mut stmt = self.db.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params![since, kinds, at, src, id, limit], |r| {
+            Ok(Record {
+                at: r.get(0)?,
+                src: r.get(1)?,
+                id: r.get(2)?,
+                kind: r.get(3)?,
+                subject: r.get(4)?,
+                status: r.get(5)?,
+                text: r.get(6)?,
+            })
+        })?;
         rows.collect()
     }
 
@@ -1784,7 +2025,27 @@ impl Store {
         let changes = self
             .db
             .execute("DELETE FROM settings_log WHERE at < ?1", params![before])?;
-        Ok(emptied + sent + audit + changes + passes + actions)
+        // Each job's latest run stays, or `claim_due` would date a one-shot job from its
+        // creation and fire it again; each table's highest id stays, or SQLite would reuse it
+        // and a new report's `task-<id>`/`proc-<id>` inbox row would be ignored as a duplicate.
+        let runs = self.db.execute(
+            "DELETE FROM runs WHERE status NOT IN ('claimed', 'running')
+               AND coalesce(ended_at, due_at) < ?1
+               AND due_at < (SELECT max(due_at) FROM runs r WHERE r.job_id = runs.job_id)
+               AND id < (SELECT max(id) FROM runs)",
+            params![before],
+        )?;
+        let tasks = self.db.execute(
+            "DELETE FROM tasks WHERE status NOT IN ('queued', 'running')
+               AND coalesce(ended_at, created_at) < ?1 AND id < (SELECT max(id) FROM tasks)",
+            params![before],
+        )?;
+        let procs = self.db.execute(
+            "DELETE FROM procs WHERE status != 'running'
+               AND coalesce(ended_at, created_at) < ?1 AND id < (SELECT max(id) FROM procs)",
+            params![before],
+        )?;
+        Ok(emptied + sent + audit + changes + passes + actions + runs + tasks + procs)
     }
 
     /// Job `id`, if there is one.
@@ -1806,16 +2067,36 @@ impl Store {
         rows.collect()
     }
 
-    /// Deletes the job and its runs that have not started. Returns whether it existed.
-    pub fn remove_job(&mut self, id: i64) -> rusqlite::Result<bool> {
-        let tx = self.db.transaction()?;
-        tx.execute(
-            "DELETE FROM runs WHERE job_id = ?1 AND status = 'claimed'",
-            params![id],
-        )?;
-        let n = tx.execute("DELETE FROM jobs WHERE id = ?1", params![id])?;
-        tx.commit()?;
-        Ok(n == 1)
+    /// Deletes the job and its runs that have not started, unless a run of it is in progress
+    /// (its restart notice joins `jobs`). Its other runs stay, in the activity record as
+    /// `(removed)` and keeping run ids from being reused, so the key on `runs.job_id` (which the
+    /// bundled SQLite enforces) is lifted for the delete; the pragma cannot change inside a
+    /// transaction.
+    pub fn remove_job(&mut self, id: i64) -> rusqlite::Result<JobRemoval> {
+        self.db.pragma_update(None, "foreign_keys", false)?;
+        let removed = (|| {
+            let tx = self.db.transaction()?;
+            let running: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE job_id = ?1 AND status = 'running')",
+                params![id],
+                |r| r.get(0),
+            )?;
+            if running {
+                return Ok(JobRemoval::Running);
+            }
+            tx.execute(
+                "DELETE FROM runs WHERE job_id = ?1 AND status = 'claimed'",
+                params![id],
+            )?;
+            let n = tx.execute("DELETE FROM jobs WHERE id = ?1", params![id])?;
+            tx.commit()?;
+            Ok(match n {
+                1 => JobRemoval::Removed,
+                _ => JobRemoval::Missing,
+            })
+        })();
+        self.db.pragma_update(None, "foreign_keys", true)?;
+        removed
     }
 
     /// Queues a run now (`/job run`). `None` when there is no such job.
@@ -3528,5 +3809,544 @@ mod tests {
             .unwrap();
         assert_eq!((mode.as_str(), sync), ("wal", 2));
         assert_eq!(store.inbox_with_status("new").unwrap().len(), 1);
+    }
+
+    fn kinds_of(rs: &[Record]) -> Vec<&str> {
+        rs.iter().map(|r| r.kind.as_str()).collect()
+    }
+
+    const ALL_KINDS: [&str; 9] = [
+        "out", "gate", "refused", "setting", "proposal", "job", "task", "process", "tool",
+    ];
+
+    #[test]
+    fn activity_lists_every_source_newest_first() {
+        let mut store =
+            Store::open(&crate::test_dir("store-activity-all").join("state.db")).unwrap();
+        store
+            .audit("main", "outbound", "curl POST api.example.com", "started")
+            .unwrap();
+        store
+            .audit("main", "exec", r#"{"command":"x"}"#, "held")
+            .unwrap();
+        store.audit("main", "read", "{}", "started").unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE audit SET ts = CASE id WHEN 1 THEN 10 WHEN 2 THEN 20 ELSE 25 END",
+                [],
+            )
+            .unwrap();
+        store
+            .log_setting(
+                "tasks.parallel",
+                Some("4"),
+                Some("2"),
+                "agent",
+                Some("tui"),
+                None,
+            )
+            .unwrap();
+        store
+            .db
+            .execute("UPDATE settings_log SET at = 30", [])
+            .unwrap();
+        store.propose_command("/vault grant x").unwrap();
+        store
+            .db
+            .execute("UPDATE proposals SET created_at = 40", [])
+            .unwrap();
+        let job = store
+            .add_job("brief", "0 7 * * *", "p", "chat", "1000")
+            .unwrap();
+        store.queue_run(job, 50).unwrap();
+        let run = store.start_next_run(50).unwrap().unwrap();
+        store.finish_run(&run, "completed", "", None, 50).unwrap();
+        store
+            .add_task("summarise", None, None, "chat", "1000")
+            .unwrap();
+        store
+            .db
+            .execute("UPDATE tasks SET created_at = 60", [])
+            .unwrap();
+        store.add_proc("cargo build", "chat", "1000").unwrap();
+        store
+            .db
+            .execute("UPDATE procs SET created_at = 70", [])
+            .unwrap();
+        let all = store.activity(0, &[], None, 100).unwrap();
+        assert_eq!(
+            kinds_of(&all),
+            ["process", "task", "job", "proposal", "setting", "gate", "out"]
+        );
+        let ats: Vec<i64> = all.iter().map(|r| r.at).collect();
+        assert_eq!(ats, [70, 60, 50, 40, 30, 20, 10]);
+        assert_eq!(all[2].text, "brief");
+        assert_eq!(all[2].subject, format!("#{job} run {}", run.id));
+        // A run whose job is gone (the bundled SQLite enforces the key, so set it up without).
+        store
+            .db
+            .execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM jobs;")
+            .unwrap();
+        let jobs = store.activity(0, &["job"], None, 100).unwrap();
+        assert_eq!(jobs[0].text, "(removed)");
+    }
+
+    #[test]
+    fn activity_maps_audit_outcomes_to_kinds() {
+        let store = Store::open(&crate::test_dir("store-activity-map").join("state.db")).unwrap();
+        for (tool, args, outcome) in [
+            ("outbound", "curl POST api.example.com", "started"),
+            ("bash", r#"{"command":"rm -rf /"}"#, "refused"),
+            ("exec", r#"{"command":"x"}"#, "denied"),
+            ("bash", r#"{"command":"false"}"#, "error"),
+            ("exec", r#"{"command":"send"}"#, "held"),
+        ] {
+            store.audit("main", tool, args, outcome).unwrap();
+        }
+        let mut rs = store.activity(0, &ALL_KINDS, None, 100).unwrap();
+        rs.reverse();
+        let got: Vec<(&str, &str, &str)> = rs
+            .iter()
+            .map(|r| (r.kind.as_str(), r.status.as_str(), r.text.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("out", "started", "curl POST api.example.com"),
+                ("refused", "refused", r#"bash {"command":"rm -rf /"}"#),
+                ("refused", "denied", r#"exec {"command":"x"}"#),
+                ("tool", "error", r#"bash {"command":"false"}"#),
+                ("gate", "held", r#"exec {"command":"send"}"#),
+            ]
+        );
+        assert!(rs.iter().all(|r| r.src == "audit" && r.subject == "main"));
+    }
+
+    #[test]
+    fn activity_filters_by_kind() {
+        let store = Store::open(&crate::test_dir("store-activity-kind").join("state.db")).unwrap();
+        store.audit("main", "read", "{}", "started").unwrap();
+        store.audit("main", "exec", "{}", "held").unwrap();
+        store.add_task("one", None, None, "chat", "1000").unwrap();
+        let tasks = store.activity(0, &["task"], None, 100).unwrap();
+        assert_eq!(kinds_of(&tasks), ["task"]);
+        assert_eq!(tasks[0].text, "one");
+        let tools = store.activity(0, &["tool"], None, 100).unwrap();
+        assert_eq!(kinds_of(&tools), ["tool"]);
+        assert_eq!(tools[0].status, "started");
+    }
+
+    fn page_through(store: &Store, size: u32) -> Vec<Record> {
+        let mut all = Vec::new();
+        let mut before: Option<Cursor> = None;
+        loop {
+            let page = store.activity(0, &[], before.as_ref(), size).unwrap();
+            if page.is_empty() {
+                return all;
+            }
+            before = Some(Cursor::of(page.last().unwrap()));
+            all.extend(page);
+        }
+    }
+
+    #[test]
+    fn keyset_pages_neither_overlap_nor_skip_within_one_second() {
+        let store =
+            Store::open(&crate::test_dir("store-activity-keyset").join("state.db")).unwrap();
+        for i in 0..5 {
+            store.audit("main", "exec", &i.to_string(), "held").unwrap();
+        }
+        store
+            .log_setting("k", None, Some("1"), "owner", None, None)
+            .unwrap();
+        store.db.execute("UPDATE audit SET ts = 100", []).unwrap();
+        store
+            .db
+            .execute("UPDATE settings_log SET at = 100", [])
+            .unwrap();
+        let whole = store.activity(0, &[], None, 100).unwrap();
+        assert_eq!(whole.len(), 6);
+        let paged = page_through(&store, 2);
+        let key = |r: &Record| (r.at, r.src.clone(), r.id);
+        assert_eq!(
+            paged.iter().map(key).collect::<Vec<_>>(),
+            whole.iter().map(key).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_row_written_between_pages_changes_neither_page() {
+        let store =
+            Store::open(&crate::test_dir("store-activity-between").join("state.db")).unwrap();
+        for i in 0..5 {
+            store.audit("main", "exec", &i.to_string(), "held").unwrap();
+        }
+        store
+            .db
+            .execute("UPDATE audit SET ts = 100 + id", [])
+            .unwrap();
+        let whole = store.activity(0, &[], None, 100).unwrap();
+        let page1 = store.activity(0, &[], None, 2).unwrap();
+        let cursor = Cursor::of(page1.last().unwrap());
+        store.audit("main", "exec", "new", "held").unwrap();
+        store
+            .log_setting("k", None, Some("1"), "owner", None, None)
+            .unwrap();
+        store
+            .db
+            .execute("UPDATE settings_log SET at = ?1", params![cursor.at])
+            .unwrap();
+        let page2 = store.activity(0, &[], Some(&cursor), 2).unwrap();
+        let key = |r: &Record| (r.at, r.src.clone(), r.id);
+        assert_eq!(
+            page2.iter().map(key).collect::<Vec<_>>(),
+            whole[2..4].iter().map(key).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_command_proposal_pending_a_day_reads_expired() {
+        let store =
+            Store::open(&crate::test_dir("store-activity-expired").join("state.db")).unwrap();
+        store.propose_command("/set x 1").unwrap();
+        store
+            .db
+            .execute("UPDATE proposals SET created_at = unixepoch() - 86401", [])
+            .unwrap();
+        let rs = store.activity(0, &["proposal"], None, 10).unwrap();
+        assert_eq!(rs[0].status, "expired");
+        assert_eq!(rs[0].text, "/set x 1");
+    }
+
+    #[test]
+    fn settling_a_proposal_dates_it() {
+        let store =
+            Store::open(&crate::test_dir("store-activity-settled").join("state.db")).unwrap();
+        let id = store.propose_command("/set x 1").unwrap();
+        store
+            .db
+            .execute("UPDATE proposals SET created_at = unixepoch() - 100", [])
+            .unwrap();
+        store.settle_proposal(id, "done").unwrap().unwrap();
+        let (created, settled): (i64, Option<i64>) = store
+            .db
+            .query_row(
+                "SELECT created_at, settled_at FROM proposals WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let settled = settled.expect("settled_at set");
+        assert!(settled >= created);
+        let rs = store.activity(0, &["proposal"], None, 10).unwrap();
+        assert_eq!((rs[0].at, rs[0].status.as_str()), (settled, "done"));
+    }
+
+    #[test]
+    fn cursors_round_trip_and_bad_ones_are_refused() {
+        let c = Cursor {
+            at: 1762693320,
+            src: "settings_log".into(),
+            id: 5512,
+        };
+        assert_eq!(c.to_string(), "1762693320.settings_log.5512");
+        assert_eq!(Cursor::parse(&c.to_string()), Some(c));
+        assert_eq!(
+            Cursor::parse("1762693320.audit.5512"),
+            Some(Cursor {
+                at: 1762693320,
+                src: "audit".into(),
+                id: 5512
+            })
+        );
+        for bad in [
+            "",
+            "1.audit",
+            "1.audit.2.3",
+            "x.audit.1",
+            "1.inbox.1",
+            "1.audit.y",
+        ] {
+            assert_eq!(Cursor::parse(bad), None, "{bad}");
+        }
+    }
+
+    const DAY: i64 = 86_400;
+
+    fn ids(store: &Store, table: &str) -> Vec<i64> {
+        let mut stmt = store
+            .db
+            .prepare(&format!("SELECT id FROM {table} ORDER BY id"))
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn inbox_count(store: &Store, platform_id: &str, holding: &str) -> i64 {
+        store
+            .db
+            .query_row(
+                "SELECT count(*) FROM inbox WHERE platform_msg_id = ?1 AND instr(text, ?2)",
+                params![platform_id, holding],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn pruning_never_refires_a_one_shot_job_or_reuses_an_id() {
+        use jiff::tz::TimeZone;
+        let mut store = Store::open(&crate::test_dir("store-prune-ids").join("state.db")).unwrap();
+        let now = crate::now();
+        let old = now - 91 * DAY;
+        let next = |s: &str, a: i64| crate::scheduler::next_after(s, a, &TimeZone::UTC);
+        let once = store
+            .add_job("once", "2025-01-01T00:00:00Z", "p", "chat", "1000")
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE jobs SET created_at = 1735000000 WHERE id = ?1",
+                params![once],
+            )
+            .unwrap();
+        assert_eq!(store.claim_due(now, next).unwrap().len(), 1);
+        let run = store.start_next_run(now).unwrap().unwrap();
+        store.finish_run(&run, "completed", "", None, now).unwrap();
+        // A yearly job, so only the pruning could make it due again.
+        let yearly = store
+            .add_job("yearly", "0 7 1 1 *", "p", "chat", "1000")
+            .unwrap();
+        for _ in 0..2 {
+            store.queue_run(yearly, now).unwrap();
+            let run = store.start_next_run(now).unwrap().unwrap();
+            store.finish_run(&run, "completed", "", None, now).unwrap();
+        }
+        for goal in ["first", "second"] {
+            store.add_task(goal, None, None, "chat", "1000").unwrap();
+            let t = store.start_next_task(now).unwrap().unwrap();
+            store.finish_task(&t, "completed", "done", now).unwrap();
+        }
+        for command in ["true", "false"] {
+            let p = store.add_proc(command, "chat", "1000").unwrap().unwrap();
+            store
+                .finish_proc(&p, "exited", Some(0), Some(("finished", "out")), now)
+                .unwrap();
+        }
+        store
+            .db
+            .execute_batch(&format!(
+                "UPDATE runs SET due_at = {old} + id, ended_at = {old} + id;
+                 UPDATE tasks SET created_at = {old}, ended_at = {old};
+                 UPDATE procs SET created_at = {old}, ended_at = {old};"
+            ))
+            .unwrap();
+        store.prune(now - 90 * DAY).unwrap();
+        assert_eq!(ids(&store, "runs"), [1, 3], "each job's latest run stays");
+        assert_eq!(store.claim_due(now, next).unwrap(), Vec::<i64>::new());
+        assert_eq!(ids(&store, "tasks"), [2]);
+        assert_eq!(ids(&store, "procs"), [2]);
+        let id = store
+            .add_task("third goal", None, None, "chat", "1000")
+            .unwrap()
+            .unwrap();
+        assert_eq!(id, 3);
+        let t = store.start_next_task(now).unwrap().unwrap();
+        store.finish_task(&t, "completed", "done", now).unwrap();
+        assert_eq!(inbox_count(&store, "task-3", "third goal"), 1);
+        let p = store.add_proc("echo new", "chat", "1000").unwrap().unwrap();
+        assert_eq!(p.id, 3);
+        store
+            .finish_proc(&p, "exited", Some(0), Some(("finished", "out")), now)
+            .unwrap();
+        assert_eq!(inbox_count(&store, "proc-3", "echo new"), 1);
+    }
+
+    #[test]
+    fn pruning_keeps_what_still_runs() {
+        let store = Store::open(&crate::test_dir("store-prune-running").join("state.db")).unwrap();
+        let now = crate::now();
+        let old = now - 91 * DAY;
+        let job = store
+            .add_job("j", "0 7 * * *", "p", "chat", "1000")
+            .unwrap();
+        for _ in 0..3 {
+            store.queue_run(job, now).unwrap();
+        }
+        store.start_next_run(now).unwrap().unwrap();
+        for _ in 0..3 {
+            store.add_task("t", None, None, "chat", "1000").unwrap();
+        }
+        store.start_next_task(now).unwrap().unwrap();
+        for _ in 0..2 {
+            store.add_proc("sleep 9", "chat", "1000").unwrap();
+        }
+        store
+            .db
+            .execute_batch(&format!(
+                "UPDATE runs SET due_at = {old}, started_at = NULL WHERE id < 3;
+                 UPDATE runs SET status = 'completed', ended_at = {now} WHERE id = 3;
+                 UPDATE tasks SET created_at = {old}, started_at = NULL WHERE id < 3;
+                 UPDATE tasks SET status = 'completed', ended_at = {now} WHERE id = 3;
+                 UPDATE procs SET created_at = {old} WHERE id = 1;
+                 UPDATE procs SET status = 'exited', ended_at = {now} WHERE id = 2;"
+            ))
+            .unwrap();
+        store.prune(now - 90 * DAY).unwrap();
+        assert_eq!(ids(&store, "runs"), [1, 2, 3]);
+        assert_eq!(ids(&store, "tasks"), [1, 2, 3]);
+        assert_eq!(ids(&store, "procs"), [1, 2]);
+    }
+
+    #[test]
+    fn forgetting_a_target_returns_it_once() {
+        let store = Store::open(&crate::test_dir("store-forget").join("state.db")).unwrap();
+        store
+            .remember_targets("messages", &["a@x.org".into(), "b@x.org".into()])
+            .unwrap();
+        let known = store.known_targets().unwrap();
+        let a = known.iter().find(|k| k.target == "a@x.org").unwrap();
+        assert_eq!(a.class, "messages");
+        assert_eq!(
+            store.forget_target(a.n).unwrap(),
+            Some(("messages".into(), "a@x.org".into()))
+        );
+        assert_eq!(store.forget_target(a.n).unwrap(), None);
+        assert!(!store.all_known("messages", &["a@x.org".into()]).unwrap());
+        assert!(store.all_known("messages", &["b@x.org".into()]).unwrap());
+        assert_eq!(store.known_targets().unwrap().len(), 1);
+    }
+
+    /// `/job rm`, the grants view's revoke for a job, works on a job that has run: its runs stay
+    /// in the activity record as `(removed)`, though the bundled SQLite enforces their key.
+    #[test]
+    fn removing_a_job_that_ran_keeps_its_runs() {
+        let mut store = Store::open(&crate::test_dir("store-rm-ran").join("state.db")).unwrap();
+        let job = store
+            .add_job("j", "0 7 * * *", "p", "chat", "1000")
+            .unwrap();
+        store.queue_run(job, 50).unwrap();
+        let run = store.start_next_run(50).unwrap().unwrap();
+        store.finish_run(&run, "completed", "", None, 50).unwrap();
+        store.queue_run(job, 60).unwrap();
+        assert_eq!(store.remove_job(job).unwrap(), JobRemoval::Removed);
+        assert_eq!(
+            ids(&store, "runs"),
+            [run.id],
+            "the claimed run goes, the finished stays"
+        );
+        let runs = store.activity(0, &["job"], None, 10).unwrap();
+        assert_eq!(runs[0].text, "(removed)");
+        assert_eq!(store.remove_job(job).unwrap(), JobRemoval::Missing);
+        // The key is enforced again afterwards.
+        let fk: i64 = store
+            .db
+            .pragma_query_value(None, "foreign_keys", |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1);
+        let jobs = store.enabled_jobs().unwrap();
+        assert!(jobs.is_empty());
+        let on = store
+            .add_job("on", "0 7 * * *", "p", "chat", "1000")
+            .unwrap();
+        store
+            .propose_job("off", "0 7 * * *", "p", "chat", "1000")
+            .unwrap();
+        let jobs = store.enabled_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].0.id, on);
+        assert!(jobs[0].1 > 0);
+    }
+
+    /// Review fix: a removed job's runs stay, so its id is never given to a new job, which
+    /// would otherwise be dated from them and could fire the moment it is added.
+    #[test]
+    fn a_new_job_never_takes_a_removed_jobs_id() {
+        let mut store = Store::open(&crate::test_dir("store-job-ids").join("state.db")).unwrap();
+        let old = store
+            .add_job("old", "0 7 * * *", "p", "chat", "1000")
+            .unwrap();
+        store.queue_run(old, 50).unwrap();
+        let run = store.start_next_run(50).unwrap().unwrap();
+        store.finish_run(&run, "completed", "", None, 50).unwrap();
+        assert_eq!(store.remove_job(old).unwrap(), JobRemoval::Removed);
+        let new = store
+            .add_job("new", "0 18 * * *", "p", "chat", "1000")
+            .unwrap();
+        assert_ne!(new, old);
+        let proposed = store
+            .propose_job("p", "0 9 * * *", "p", "chat", "1000")
+            .unwrap();
+        assert!(proposed > new);
+        let runs = store.activity(0, &["job"], None, 10).unwrap();
+        assert_eq!(runs[0].text, "(removed)");
+    }
+
+    /// PR #39 review: a job with a run in progress is not removed, or that run's restart notice
+    /// (which joins `jobs`) would be lost; the owner removes it once the run has ended.
+    #[test]
+    fn a_job_with_a_running_run_is_not_removed() {
+        let mut store = Store::open(&crate::test_dir("store-rm-running").join("state.db")).unwrap();
+        let job = store
+            .add_job("j", "0 7 * * *", "p", "chat", "1000")
+            .unwrap();
+        store.queue_run(job, 50).unwrap();
+        let run = store.start_next_run(50).unwrap().unwrap();
+        assert_eq!(store.remove_job(job).unwrap(), JobRemoval::Running);
+        assert!(store.job(job).unwrap().is_some());
+        assert_eq!(store.interrupt_running_runs(60).unwrap(), 1);
+        assert_eq!(
+            store.pending_outbox().unwrap().len(),
+            1,
+            "the restart notice"
+        );
+        assert_eq!(store.remove_job(job).unwrap(), JobRemoval::Removed);
+        assert_eq!(store.remove_job(job).unwrap(), JobRemoval::Missing);
+        let _ = run;
+    }
+
+    /// PR #39 review: a narrow ask reads only the tables it needs (`/activity task 90d` never
+    /// scans `audit` on the router loop), and the audit branch is bounded by its index.
+    #[test]
+    fn a_query_for_one_kind_reads_only_its_table() {
+        let store = Store::open(&crate::test_dir("store-activity-plan").join("state.db")).unwrap();
+        let plan = |kinds: &[&str]| -> String {
+            let sql = activity_sql(kinds).unwrap();
+            let mut stmt = store
+                .db
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let rows = stmt
+                .query_map(params![0, ",task,", i64::MAX, "", 0, 10], |r| {
+                    r.get::<_, String>(3)
+                })
+                .unwrap();
+            rows.map(Result::unwrap).collect::<Vec<_>>().join("\n")
+        };
+        let task = plan(&["task"]);
+        assert!(!task.contains("audit") && task.contains("tasks"), "{task}");
+        assert!(!plan(&["tool"]).contains("settings_log"));
+        let all = plan(&[]);
+        // `runs` is read as `r`.
+        for table in [
+            "audit",
+            "settings_log",
+            "proposals",
+            "SCAN r",
+            "tasks",
+            "procs",
+        ] {
+            assert!(all.contains(table), "{table}: {all}");
+        }
+        assert!(
+            plan(&["out"]).contains("INDEX audit_ts"),
+            "{}",
+            plan(&["out"])
+        );
+        assert_eq!(activity_sql(&["inbox"]), None);
+        assert!(store.activity(0, &["inbox"], None, 10).unwrap().is_empty());
     }
 }

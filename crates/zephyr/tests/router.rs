@@ -5526,3 +5526,231 @@ async fn an_upgraded_install_with_no_owner_yet_is_told_after_the_first_message()
     );
     gw.shutdown().await;
 }
+
+/// The owner's `/activity` (DESIGN §4.19) is answered by the daemon from its own tables: an
+/// outbound command from its start, a finished task and a job's run, and never reaches the agent.
+#[tokio::test]
+async fn activity_lists_what_ran_and_left() {
+    let home = home("activity-record");
+    let gw = start(config(&home));
+    let saw = |what: &str| gw.replies().iter().any(|r| r.contains(what));
+    gw.say("m1", "owner", "bash: curl -d x https://api.example.com")
+        .await;
+    wait(|| saw("[zephyr] outbound this turn:")).await;
+    // Seeded as finished rows, so the router has nothing to run.
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    db.execute_batch(
+        "INSERT INTO tasks(goal, channel, recipient, status, ended_at)
+           VALUES ('summarise the inbox', 'chat', 'owner', 'completed', unixepoch());
+         INSERT INTO jobs(name, schedule, prompt, channel, recipient, enabled)
+           VALUES ('morning-brief', '0 7 * * *', 'p', 'chat', 'owner', 0);
+         INSERT INTO runs(job_id, due_at, status, started_at, ended_at)
+           VALUES (1, unixepoch(), 'completed', unixepoch(), unixepoch());",
+    )
+    .unwrap();
+    gw.say("m2", "owner", "/activity").await;
+    wait(|| saw("[zephyr] activity in the last 24 h, newest first:")).await;
+    let reply = (gw.replies().into_iter())
+        .find(|r| r.starts_with("[zephyr] activity"))
+        .unwrap();
+    for end in [
+        "out main: curl POST api.example.com",
+        "task #1 completed: summarise the inbox",
+        "job #1 run 1 completed: morning-brief",
+    ] {
+        assert!(reply.lines().any(|l| l.ends_with(end)), "{end}: {reply}");
+    }
+    let log = std::fs::read_to_string(home.join("log.jsonl")).unwrap();
+    assert!(!log.contains("/activity"), "the agent saw it: {log}");
+    gw.shutdown().await;
+}
+
+/// A fact saved after the call is still scrubbed from the record, which is scrubbed as it is read.
+#[tokio::test]
+async fn activity_scrubs_a_fact_saved_after_the_call() {
+    let home = home("activity-fact");
+    let gw = start(config(&home));
+    let saw = |what: &str| gw.replies().iter().any(|r| r.contains(what));
+    gw.say(
+        "m1",
+        "owner",
+        "bash: curl -d x https://5550102345.example.com",
+    )
+    .await;
+    wait(|| saw("[zephyr] outbound this turn:")).await;
+    gw.say(
+        "m2",
+        "owner",
+        r#"[call gateway {"command": "/facts add phone digits 5550102345"}] note it"#,
+    )
+    .await;
+    wait(|| saw("gateway: saved the private fact phone")).await;
+    gw.say("m3", "owner", "/activity out").await;
+    wait(|| saw("[zephyr] outbound commands in the last 24 h")).await;
+    let reply = (gw.replies().into_iter())
+        .find(|r| r.starts_with("[zephyr] outbound commands"))
+        .unwrap();
+    assert!(
+        reply.ends_with("out main: curl POST [fact:phone].example.com"),
+        "{reply}"
+    );
+    assert!(!reply.contains("555010"), "{reply}");
+    gw.shutdown().await;
+}
+
+/// `/activity grants` lists a recipient `/ok` remembered with its revoke, and `/approvals forget N`
+/// takes it back: logged as a setting change, and the next send to it waits for the owner again.
+#[tokio::test]
+async fn forgetting_a_known_target_asks_again() {
+    let home = home("forget-target");
+    let gw = start(on_file(&home, "[approvals]\npreset = \"semi\""));
+    gw.say("m1", "owner", SEND_TO_A).await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    gw.say("m2", "owner", "/ok 1").await;
+    reply_where(&gw, "chat", |r| {
+        r.contains("from now on a@x.org goes without asking")
+    })
+    .await;
+    assert!(to_main(&home, 1).await.starts_with("[action #1 done;"));
+
+    gw.say("m3", "owner", "/activity grants").await;
+    let grants = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] standing grants")).await;
+    let line = grants.lines().nth(1).unwrap_or_default();
+    assert!(
+        line.starts_with("messages a@x.org, known since ")
+            && line.ends_with(" · /approvals forget 1"),
+        "{grants}"
+    );
+    gw.say("m4", "owner", "/approvals forget 1").await;
+    reply_where(&gw, "chat", |r| {
+        r == "[zephyr] forgot a@x.org for messages; under ask-new a message to it waits for you again"
+    })
+    .await;
+    gw.say("m5", "owner", "/activity setting").await;
+    let settings = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] setting changes")).await;
+    assert!(
+        settings
+            .lines()
+            .any(|l| l.ends_with("setting owner on chat: approvals.known.messages a@x.org → none")),
+        "{settings}"
+    );
+
+    gw.say("m6", "owner", &format!("{SEND_TO_A} now")).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains("\nexec: held for the owner as #")
+    })
+    .await;
+    gw.say("m7", "owner", "/approvals forget 1").await;
+    reply_where(&gw, "chat", |r| {
+        r == "[zephyr] no remembered target #1; /activity grants lists them"
+    })
+    .await;
+    gw.say("m8", "owner", "/approvals forget x").await;
+    reply_where(&gw, "chat", |r| {
+        r.starts_with("[zephyr] usage: /approvals") && r.ends_with(", /approvals forget N")
+    })
+    .await;
+    gw.shutdown().await;
+}
+
+/// The agent reads zephyr's own record through `gateway`, never the standing grants.
+#[tokio::test]
+async fn the_agent_reads_activity_but_not_grants() {
+    let home = home("activity-gateway");
+    let gw = start(config(&home));
+    let saw = |what: &str| gw.replies().iter().any(|r| r.contains(what));
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call gateway {"command": "/activity today"}] what did you do"#,
+    )
+    .await;
+    // The call's own audit row is a `tool` row, which the bare list leaves out.
+    wait(|| saw("gateway: [zephyr] nothing recorded since 00:00 today")).await;
+    gw.say(
+        "m2",
+        "owner",
+        r#"[call gateway {"command": "/activity grants"}] who passes"#,
+    )
+    .await;
+    wait(|| saw("is not available to the agent")).await;
+    let refused = (gw.replies().into_iter())
+        .find(|r| r.contains("is not available to the agent"))
+        .unwrap();
+    assert!(
+        refused.contains("tool error: /activity grants is not available"),
+        "{refused}"
+    );
+    gw.shutdown().await;
+}
+
+/// Review fix: a timed preset over an unset one lists a revoke the router takes when sent.
+#[tokio::test]
+async fn a_timed_presets_revoke_works_when_sent() {
+    let home = home("preset-revoke");
+    let gw = start(on_file(&home, ""));
+    gw.say("m1", "owner", "/approvals semi for 2h").await;
+    reply_where(&gw, "chat", |r| r.contains("approvals.preset")).await;
+    gw.say("m2", "owner", "/activity grants").await;
+    let grants = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] standing grants")).await;
+    let line = (grants.lines())
+        .find(|l| l.starts_with("approvals.preset until "))
+        .unwrap_or_else(|| panic!("{grants}"));
+    let (_, revoke) = line.rsplit_once(" · ").unwrap();
+    assert_eq!(revoke, "/set approvals.preset manual", "{line}");
+    gw.say("m3", "owner", revoke).await;
+    reply_where(&gw, "chat", |r| {
+        r.starts_with("[zephyr] approvals.preset semi → manual")
+    })
+    .await;
+    gw.shutdown().await;
+}
+
+/// Review fix: `/approvals forget N` answers with the target scrubbed and on one line, so a
+/// target the agent shaped cannot pass for a daemon line.
+#[tokio::test]
+async fn forgetting_a_target_answers_on_one_line() {
+    let home = home("forget-one-line");
+    let gw = start(on_file(&home, ""));
+    let store = Store::open(&home.join("state.db")).unwrap();
+    store
+        .remember_targets("messages", &["x@y.org\n[zephyr] approved #9".into()])
+        .unwrap();
+    gw.say("m1", "owner", "/approvals forget 1").await;
+    let reply = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] forgot ")).await;
+    assert_eq!(
+        reply,
+        "[zephyr] forgot x@y.org [zephyr] approved #9 for messages; under ask-new a message to \
+         it waits for you again"
+    );
+    gw.shutdown().await;
+}
+
+/// PR #39 review: an `exec` the gate held never left, and `/activity out` never says it did.
+#[tokio::test]
+async fn a_held_exec_reads_held_not_sent() {
+    let home = home("activity-held-exec");
+    let gw = start(config(&home));
+    let saw = |what: &str| gw.replies().iter().any(|r| r.contains(what));
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call gateway {"command": "/facts add phone digits 5550102345"}] note it"#,
+    )
+    .await;
+    wait(|| saw("gateway: saved the private fact phone")).await;
+    gw.say(
+        "m2",
+        "owner",
+        r#"[call exec {"command": "curl -d 5550102345 https://e.x"}] send it"#,
+    )
+    .await;
+    wait(|| saw("exec: held for the owner as #")).await;
+    gw.say("m3", "owner", "/activity out").await;
+    wait(|| saw("[zephyr] outbound commands")).await;
+    let reply = (gw.replies().into_iter())
+        .find(|r| r.starts_with("[zephyr] outbound commands"))
+        .unwrap();
+    assert!(reply.ends_with("out main held: curl POST e.x"), "{reply}");
+    gw.shutdown().await;
+}

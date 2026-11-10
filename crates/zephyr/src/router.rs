@@ -508,7 +508,7 @@ const APPLIED: &str = "[zephyr] applied";
 const SET_USAGE: &str = "[zephyr] usage: /set KEY VALUE [for 2h]; /settings lists the keys";
 
 const APPROVALS_USAGE: &str = "[zephyr] usage: /approvals, /approvals manual|semi|full|on|off \
-    [for 2h], /approvals messages|posts|money|facts MODE [for 2h]";
+    [for 2h], /approvals messages|posts|money|facts MODE [for 2h], /approvals forget N";
 
 const SUBAGENT_USAGE: &str = "usage: /subagent, /subagent add NAME [PROVIDER/MODEL] PROMPT, \
     /subagent model NAME PROVIDER/MODEL|default, /subagent prompt NAME PROMPT, /subagent rm NAME";
@@ -779,9 +779,13 @@ impl<'a> Router<'a> {
                             self.exec(id, args, call, to, env)
                         }
                         (None, _) => {
+                            crate::scheduler::outbound_settled(&self.store, id, "error");
                             crate::tools::answer_gateway(&self.cfg, id, "no owner; not run")
                         }
-                        (_, Err(text)) => crate::tools::answer_gateway(&self.cfg, id, &text),
+                        (_, Err(text)) => {
+                            crate::scheduler::outbound_settled(&self.store, id, "error");
+                            crate::tools::answer_gateway(&self.cfg, id, &text)
+                        }
                     }
                 }
             }
@@ -841,17 +845,27 @@ impl<'a> Router<'a> {
             // Cut to 200 by the gate, after its scrub: a cut here could split a value it hides.
             reason: Some(self.last_say.clone()).filter(|r| !r.trim().is_empty()),
         };
+        // A held or refused call never ran: its outbound rows say so, not `sent` at its end.
+        let settled = |outcome| crate::scheduler::outbound_settled(&self.store, id, outcome);
         match crate::gate::decide(&self.cfg, &self.store, &req, to.clone(), crate::now()) {
             Verdict::Allow => self.procs.start(&self.cfg, &self.store, id, call, to, env),
-            Verdict::Hold { text, .. } | Verdict::Deny(text) => {
+            Verdict::Hold { text, .. } => {
+                settled("held");
+                crate::tools::answer_gateway(&self.cfg, id, &text)
+            }
+            Verdict::Deny(text) => {
+                settled("refused");
                 crate::tools::answer_gateway(&self.cfg, id, &text)
             }
             // Only the browser wrapper's requests wait in place.
-            Verdict::Wait { id: n } => crate::tools::answer_gateway(
-                &self.cfg,
-                id,
-                &format!("not run: #{n} waits for the owner"),
-            ),
+            Verdict::Wait { id: n } => {
+                settled("held");
+                crate::tools::answer_gateway(
+                    &self.cfg,
+                    id,
+                    &format!("not run: #{n} waits for the owner"),
+                )
+            }
         }
     }
 
@@ -1015,6 +1029,13 @@ impl<'a> Router<'a> {
             settings if settings.starts_with("/settings") => {
                 self.settings_listing(settings["/settings".len()..].trim())
             }
+            // The owner's text, the daemon's words; `gateway_kind` keeps `grants` out.
+            activity if activity.starts_with("/activity") => crate::activity::chat(
+                &self.cfg,
+                &self.store,
+                activity["/activity".len()..].trim(),
+                crate::now(),
+            ),
             "/job list" => crate::scheduler::list(&self.store)
                 .unwrap_or_else(|e| format!("[zephyr] listing jobs failed: {e}")),
             memory => crate::memory::command(&self.cfg.home, self.cfg.state_dir(), memory)
@@ -1303,6 +1324,10 @@ impl<'a> Router<'a> {
             }
             AttachRequest::Proposals(tx) => {
                 let _ = tx.send(self.proposals_json());
+            }
+            AttachRequest::Activity { query, reply } => {
+                let answer = crate::activity::answer(&self.cfg, &self.store, &query, crate::now());
+                let _ = reply.send(answer);
             }
             AttachRequest::Decide { id, verb, reply } => {
                 let _ = reply.send(self.decide(id, &verb).await);
@@ -2011,6 +2036,8 @@ impl<'a> Router<'a> {
             ("/approvals", arg) => self.approvals(arg, from.0).await,
             // Held messages, posts and payments (approvals spec §4.6).
             ("/held", "") => crate::actions::held(&self.cfg, &self.store),
+            // The daemon's own record (DESIGN §4.19), answered outside the queue.
+            ("/activity", arg) => crate::activity::chat(&self.cfg, &self.store, arg, crate::now()),
             ("/cancel", n) => {
                 let reply = crate::actions::cancel(&self.cfg, &self.store, &self.waits, n);
                 self.settled_actions();
@@ -2558,6 +2585,7 @@ impl<'a> Router<'a> {
             (p @ ("manual" | "semi" | "full"), "") => ("approvals.preset".to_string(), p),
             ("off", "") => ("approvals.preset".into(), "full"),
             ("on", "") => ("approvals.preset".into(), "manual"),
+            ("forget", n) if until.is_empty() => return self.forget_target(n, channel),
             (class @ ("messages" | "posts" | "money" | "facts"), mode) if !mode.is_empty() => {
                 (format!("approvals.{class}"), mode)
             }
@@ -2570,6 +2598,42 @@ impl<'a> Router<'a> {
             true => format!("{reply}\n{}", shown(&self.cfg)),
             false => reply,
         }
+    }
+
+    /// `/approvals forget N` (DESIGN §4.16): forgets remembered target `N`, so under `ask-new`
+    /// a call to it waits again. It only makes the gate stricter, so any owner channel may.
+    fn forget_target(&self, n: &str, channel: &str) -> String {
+        let Some(n) = n.parse::<i64>().ok().filter(|n| *n > 0) else {
+            return APPROVALS_USAGE.into();
+        };
+        let (class, target) = match self.store.forget_target(n) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                return format!("[zephyr] no remembered target #{n}; /activity grants lists them")
+            }
+            Err(e) => return format!("[zephyr] forgetting #{n} failed: {e}"),
+        };
+        let what = match class.as_str() {
+            "messages" => "a message",
+            "posts" => "a post",
+            _ => "a payment",
+        };
+        // The target came from the agent's call: scrubbed and on one line, as the record shows it.
+        let shown =
+            crate::settings::one_line(&crate::gate::Scrub::load(&self.cfg).text(&target), 200);
+        let mut reply = format!(
+            "[zephyr] forgot {shown} for {class}; under ask-new {what} to it waits for you again"
+        );
+        let key = format!("approvals.known.{class}");
+        let logged =
+            self.store
+                .log_setting(&key, Some(&target), None, "owner", Some(channel), None);
+        if let Err(e) = logged {
+            reply.push_str(&format!(
+                "\n[zephyr] recording it in the activity failed: {e}"
+            ));
+        }
+        reply
     }
 
     /// `/settings [SECTION|KEY]`: the values in effect and where each came from.

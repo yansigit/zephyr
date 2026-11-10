@@ -524,13 +524,12 @@ async fn cancelling_a_waiting_login_kills_its_child_and_records_nothing() {
         "the cancelled login's processes to be gone",
     )
     .await;
-    for p in &children {
-        assert!(
-            dead(*p),
-            "process {p} outlived the cancel: {}",
-            cmdline_of(*p)
-        );
-    }
+    // An exiting process leaves the list (its environ goes) a moment before it is a zombie.
+    wait_for(
+        || children.iter().all(|p| dead(*p)),
+        "the cancelled login's processes to die",
+    )
+    .await;
     // The child died before rpi stored anything, and nothing was recorded.
     assert!(!dir.join("auth.json").exists());
     tokio::time::sleep(Duration::from_millis(300)).await;

@@ -257,6 +257,35 @@ fn proposals(scene: &str, changed: bool) -> Value {
 }
 
 /// `zephyr.facts_*` answers: names, kinds and where each may go, never a value.
+/// What `zephyr.activity` answers: made-up records, or the grants (the remembered recipient
+/// gone once `/approvals forget 4` was sent on this connection).
+fn activity(grants: bool, revoked: bool) -> Value {
+    let record = |at: i64, kind: &str, line: &str| {
+        json!({"at": at, "kind": kind, "subject": "main", "status": "started", "text": "",
+               "line": line, "stream": kind == "tool"})
+    };
+    if !grants {
+        return json!({"since": 1, "next": null, "entries": [
+            record(7, "gate", "14:05 gate main approved: exec #31 email to bob@x.org"),
+            record(6, "out", "14:02 out main: curl POST api.example.com"),
+            record(5, "refused", r#"14:01 refused task-12 by the policy: bash {"command":"rm -rf /"}"#),
+            record(4, "setting", "13:58 setting agent on tui: tasks.parallel 4 → 2"),
+            record(3, "task", "13:40 task #12 completed: summarise the inbox"),
+            record(2, "job", "13:00 job #3 run 88 completed: morning-brief"),
+            record(1, "tool", r#"12:10 tool main: read {"path":"/var/log/backup.log"}"#),
+        ]});
+    }
+    let mut entries = vec![];
+    if !revoked {
+        entries.push(json!({"at": 1, "kind": "grant", "subject": "messages",
+            "line": "messages bob@x.org, known since 11-02 · /approvals forget 4",
+            "revoke": "/approvals forget 4"}));
+    }
+    entries.push(json!({"at": 2, "kind": "grant", "subject": "#3",
+        "line": "job #3 morning-brief, 0 7 * * *, to discord · /job rm 3", "revoke": "/job rm 3"}));
+    json!({"since": null, "entries": entries, "next": null})
+}
+
 fn facts() -> Value {
     json!({"facts": [
         {"name": "home-address", "kind": "text", "allow": ["https://shop.example.com"]},
@@ -342,6 +371,8 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
             let mut lines = BufReader::new(read).lines();
             // A setting changed on this connection.
             let mut changed = false;
+            // A grant was taken back on this connection.
+            let mut revoked = false;
             let frame = |v: Value| format!("{v}\n");
             while let Ok(Some(line)) = lines.next_line().await {
                 let req: Value = serde_json::from_str(&line).unwrap();
@@ -404,10 +435,20 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
                         }
                     }
                     "zephyr.facts_list" => facts(),
+                    // Only the reload after a revoke is passed on: the panel asks for both tabs
+                    // each time it opens, which the other tests' sends would queue behind.
+                    "zephyr.activity" => {
+                        let grants = req["params"]["kind"] == "grants";
+                        if grants && revoked {
+                            let _ = sent.send("zephyr.activity grants".into());
+                        }
+                        activity(grants, revoked)
+                    }
                     "send" => {
                         let text = req["params"]["command"]["content"]
                             .as_str()
                             .unwrap_or_default();
+                        revoked |= text.starts_with("/approvals forget");
                         let _ = sent.send(text.to_string());
                         json!({"sessionId": "main", "status": "sent"})
                     }
@@ -423,6 +464,11 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
                     "/stop" => Some("[zephyr] stopped".to_string()),
                     t if t.starts_with("/model ") => Some(format!("[zephyr] now on {}", &t[7..])),
                     t if t.starts_with("/undo") => Some("[zephyr] undone".to_string()),
+                    t if t.starts_with("/approvals forget") => Some(
+                        "[zephyr] forgot bob@x.org for messages; under ask-new a message to it \
+                         waits for you again"
+                            .to_string(),
+                    ),
                     _ => None,
                 };
                 if let Some(reply) = reply {
@@ -1066,7 +1112,7 @@ async fn the_settings_panel_opens_from_slash_settings() {
     let changed = screen.wait_for("tasks.parallel 2 → 4").await;
     assert!(!changed.contains("› value"), "{changed}");
     // Waiting: the card in full, then `o` approves it.
-    screen.keys(&["Left", "End"]);
+    screen.keys(&["Left", "End", "Up", "Up"]);
     screen
         .wait_for("#12  /set budget.daily_cost_usd 8 for 2h")
         .await;
@@ -1104,7 +1150,7 @@ async fn the_waiting_tab_shows_a_held_message() {
     );
     screen.keys(&["=/settings", "Enter"]);
     screen.wait_for("Waiting (2)").await;
-    screen.keys(&["End", "Right"]);
+    screen.keys(&["End", "Up", "Up", "Right"]);
     // Newest first: the delayed post says when it goes, the message how long it has waited.
     let list = screen
         .wait_for("#7  message · email to alice@example.com")
@@ -1164,11 +1210,37 @@ async fn a_changed_setting_lists_the_held_actions_again() {
         "zephyr.settings_set approvals.messages ask"
     );
     screen.wait_for("approvals.messages ask-new → ask").await;
-    screen.keys(&["Left", "End", "Right", "Down", "Enter"]);
+    screen.keys(&["Left", "End", "Up", "Up", "Right", "Down", "Enter"]);
     let card = screen.wait_for("/ok 7 · /no 7 · expires in 24 h").await;
     assert!(card.contains("o ok · d drop · esc back"), "{card}");
     screen.keys(&["1"]);
     assert_eq!(screen.next_sent().await, "zephyr.decide 7 once");
+}
+
+/// `r` on a grant sends the command that takes it back, as typed on the TUI, with the panel
+/// left open; the daemon's reply to it lists the grants again.
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_a_grant_reloads_the_tab() {
+    if tmux_missing() {
+        return;
+    }
+    let mut screen = Screen::start("held", 100, 30, "dark").await;
+    screen.wait_for("^L model").await;
+    screen.keys(&["=/settings", "Enter"]);
+    screen.wait_for("Waiting (2)").await;
+    screen.keys(&["End"]);
+    screen
+        .wait_for("messages bob@x.org, known since 11-02 · /approvals forget 4")
+        .await;
+    screen.keys(&["Right", "r"]);
+    assert_eq!(screen.next_sent().await, "/approvals forget 4");
+    assert_eq!(screen.next_sent().await, "zephyr.activity grants");
+    let after = screen.wait_for("› job #3 morning-brief").await;
+    assert!(
+        after.contains("╭─ settings"),
+        "the panel stays open: {after}"
+    );
+    assert!(!after.contains("bob@x.org, known since"), "{after}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1206,6 +1278,8 @@ async fn screens_match_the_goldens() {
             "Enter",
             "~Waiting (1)",
             "End",
+            "Up",
+            "Up",
             "~#12",
             "Right",
             "Enter",
@@ -1238,6 +1312,8 @@ async fn screens_match_the_goldens() {
             "Enter",
             "~Waiting (2)",
             "End",
+            "Up",
+            "Up",
             "~#7",
             "Right",
             "Down",
@@ -1245,9 +1321,27 @@ async fn screens_match_the_goldens() {
         ][..],
         "held #7",
     );
+    // The Activity tab, its tool call muted; then Grants, each with its revoke.
+    let activity = (
+        "^L model",
+        &["=/settings", "Enter", "~Waiting (2)", "End", "Up"][..],
+        "12:10 tool main",
+    );
+    let grants = (
+        "^L model",
+        &[
+            "=/settings",
+            "Enter",
+            "~Waiting (2)",
+            "End",
+            "~/job rm 3",
+            "Right",
+        ][..],
+        "r take it back",
+    );
     // (golden name, scene, size, theme, (ready, keys, shown))
     #[allow(clippy::type_complexity)]
-    let shots: [(&str, &'static str, u16, u16, &str, (&str, &[&str], &str)); 31] = [
+    let shots: [(&str, &'static str, u16, u16, &str, (&str, &[&str], &str)); 33] = [
         ("busy", "busy", 80, 24, "dark", busy),
         ("busy", "busy", 80, 24, "light", busy),
         ("busy", "busy", 140, 40, "dark", busy),
@@ -1328,6 +1422,8 @@ async fn screens_match_the_goldens() {
         ("waiting", "waiting", 100, 30, "dark", card),
         ("approvals", "held", 100, 30, "dark", approvals),
         ("action", "held", 100, 30, "dark", action),
+        ("activity", "held", 100, 30, "dark", activity),
+        ("grants", "held", 100, 30, "dark", grants),
     ];
     let mut failures = vec![];
     for (name, scene, cols, rows, theme, steps) in shots {

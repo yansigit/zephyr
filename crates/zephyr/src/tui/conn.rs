@@ -18,6 +18,8 @@ const MAX_DELAY: Duration = Duration::from_secs(5);
 /// dropped by its idle deadline, or never started because the eight-pending cap was full. A
 /// refusal, not a silence, so the panel can end on it instead of waiting for an answer.
 const UNKNOWN_LOGIN: i64 = -32602;
+/// A method the daemon does not have: an older zephyr.
+const METHOD_NOT_FOUND: i64 = -32601;
 
 /// `zephyr.hello`'s result and every `zephyr_status` event: the daemon's own types, since the
 /// TUI always runs from the daemon's binary.
@@ -212,6 +214,14 @@ pub enum Ask {
     Proposals,
     /// `zephyr.decide` (`ok`, `once`, `no` or `cancel`), answered with [`Msg::Decided`].
     Decide { id: i64, verb: String },
+    /// `zephyr.activity`: the grants, or the record's page before `before` (the first page
+    /// without one). Answered with [`Msg::Activity`].
+    Activity {
+        grants: bool,
+        before: Option<String>,
+        /// The panel's opening that asks, handed back with the answer.
+        generation: u64,
+    },
     /// `zephyr.facts_list`; this and the two below are answered with [`Msg::Facts`].
     FactsList,
     /// `zephyr.facts_put`: the fact, value and all, for `facts.toml` only. An empty value keeps
@@ -278,6 +288,16 @@ impl std::fmt::Debug for Ask {
             // `Fact`'s own Debug prints only the value's length.
             Ask::FactsPut(fact) => f.debug_tuple("FactsPut").field(fact).finish(),
             Ask::FactsRm(name) => f.debug_tuple("FactsRm").field(name).finish(),
+            Ask::Activity {
+                grants,
+                before,
+                generation,
+            } => f
+                .debug_struct("Activity")
+                .field("grants", grants)
+                .field("before", before)
+                .field("generation", generation)
+                .finish(),
         }
     }
 }
@@ -326,6 +346,15 @@ pub enum Msg {
     Proposals(Value),
     /// `zephyr.decide`'s answer, `{"ok", "text"}`; an error answer is `ok: false` with its text.
     Decided(Value),
+    /// `zephyr.activity`'s answer, for the Grants tab or the Activity tab (`append`: a page
+    /// asked for with `before`). A daemon without it (`-32601`) answers `{"entries": [],
+    /// "next": null, "old": true}`, another error `{"error": why}`.
+    Activity {
+        grants: bool,
+        append: bool,
+        generation: u64,
+        answer: Value,
+    },
     /// The private facts, after a `zephyr.facts_*` call: names, kinds and allowed targets.
     Facts(Vec<FactEntry>),
     /// A facts call the daemon refused, and why (never with a value).
@@ -544,6 +573,26 @@ async fn session(
                     let id = rpc.request("zephyr.decide", params).await?;
                     pending.insert(id, Pending::Decide);
                 }
+                Some(Ask::Activity {
+                    grants,
+                    before,
+                    generation,
+                }) => {
+                    let params = match grants {
+                        true => json!({"kind": "grants"}),
+                        false => json!({"before": before}),
+                    };
+                    let id = rpc.request("zephyr.activity", params).await?;
+                    let append = before.is_some();
+                    pending.insert(
+                        id,
+                        Pending::Activity {
+                            grants,
+                            append,
+                            generation,
+                        },
+                    );
+                }
                 Some(Ask::FactsList) => {
                     let id = rpc.request("zephyr.facts_list", json!({})).await?;
                     pending.insert(id, Pending::Facts);
@@ -590,6 +639,11 @@ enum Pending {
     Decide,
     /// Any `zephyr.facts_*` call: the facts, or why not.
     Facts,
+    Activity {
+        grants: bool,
+        append: bool,
+        generation: u64,
+    },
 }
 
 /// An error answer to one of the login calls.
@@ -694,6 +748,20 @@ fn answer(what: Pending, mut v: Value) -> Option<Msg> {
         Pending::Facts => match error {
             Some(why) => Msg::FactsError(why),
             None => Msg::Facts(serde_json::from_value(result["facts"].take()).unwrap_or_default()),
+        },
+        Pending::Activity {
+            grants,
+            append,
+            generation,
+        } => Msg::Activity {
+            grants,
+            append,
+            generation,
+            answer: match (v["error"]["code"].as_i64(), error) {
+                (Some(METHOD_NOT_FOUND), _) => json!({"entries": [], "next": null, "old": true}),
+                (_, Some(why)) => json!({"error": why}),
+                _ => result,
+            },
         },
     })
 }

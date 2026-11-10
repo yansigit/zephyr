@@ -6,8 +6,6 @@
 
  ▌ remind me to renew the domain on friday                                         discord · 14:02
 
- ≋ Done. I scheduled renew kimchigoose.com for Fri 09:00 KST.
-   ▸ schedule  add "renew domain" fri 09:00                                                  ✓ 0.2s
  ╭─ settings ─────────────────────────────────────────────────────────────────────────────────────╮
  │   Model                Private facts  home-address, phone · you                                │
  │   Background tasks   › Preset         semi (modified)     · you                                │
@@ -21,6 +19,8 @@
  │   Security                                                                                     │
  │   Read-only                                                                                    │
  │   Waiting (2)                                                                                  │
+ │   Activity                                                                                     │
+ │   Grants                                                                                       │
  │                                                                                                │
  │ approvals.preset · manual asks before every message, post and payment; semi lets known         │
  │ recipients through and delays posts 5 minutes; full asks for nothing.                          │

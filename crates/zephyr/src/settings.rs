@@ -660,7 +660,7 @@ fn list_names(raw: &str) -> Vec<&str> {
 }
 
 /// `30s`, `5m`, `2h`, `1d`.
-fn duration(raw: &str) -> Result<Duration, String> {
+pub(crate) fn duration(raw: &str) -> Result<Duration, String> {
     let raw = raw.trim();
     let bad = || format!("{raw:?} is not a duration like 30s, 5m, 2h or 1d");
     let (num, unit) = [("s", 1), ("m", 60), ("h", 3600), ("d", 86_400)]

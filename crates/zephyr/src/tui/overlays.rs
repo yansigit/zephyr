@@ -640,6 +640,10 @@ pub enum Action {
     FactsPut(Box<crate::facts::Fact>),
     /// Delete this private fact.
     FactsRm(String),
+    /// Ask for the activity page before this cursor (`zephyr.activity` `before`).
+    ActivityPage(String),
+    /// Send this command as typed on the TUI: a standing grant's revoke.
+    Revoke(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1843,6 +1847,13 @@ mod tests {
         key(o, press(code), &rows)
     }
 
+    /// From the settings panel's left column to Waiting, above Activity and Grants.
+    fn to_waiting(o: &mut Overlay, s: &Snapshot) {
+        for code in [KeyCode::End, KeyCode::Up, KeyCode::Up] {
+            hit(o, s, code);
+        }
+    }
+
     #[test]
     fn the_model_picker_groups_by_account_and_sends_the_pick() {
         let s = snap();
@@ -2478,7 +2489,7 @@ mod tests {
         let mut o = settings_panel();
         o.settings.load_waiting(&proposals_answer());
         draw(&mut o, &s, 80, 20);
-        hit(&mut o, &s, KeyCode::End);
+        to_waiting(&mut o, &s);
         hit(&mut o, &s, KeyCode::Right);
         hit(&mut o, &s, KeyCode::Down);
         assert!(draw(&mut o, &s, 80, 20)[2].contains("› #11"));
@@ -2575,7 +2586,7 @@ mod tests {
         check(&o);
         hit(&mut o, &s, KeyCode::Esc);
         hit(&mut o, &s, KeyCode::Left);
-        hit(&mut o, &s, KeyCode::End);
+        to_waiting(&mut o, &s);
         hit(&mut o, &s, KeyCode::Right);
         check(&o);
         hit(&mut o, &s, KeyCode::Enter);
@@ -2594,7 +2605,7 @@ mod tests {
         let mut o = settings_panel();
         o.settings.load_waiting(&proposals_answer());
         draw(&mut o, &s, 80, 20);
-        hit(&mut o, &s, KeyCode::End);
+        to_waiting(&mut o, &s);
         // Newest first, each with how long it has waited.
         let got = draw(&mut o, &s, 80, 20);
         assert!(
@@ -2739,8 +2750,8 @@ mod tests {
         assert!(got[3].starts_with("│   Private facts  "), "{got:?}");
         assert!(got[4].starts_with("│   Read-only  "), "{got:?}");
         assert!(got[5].starts_with("│   Waiting (0)  "), "{got:?}");
-        // End still reaches Waiting, past the facts.
-        hit(&mut o, &s, KeyCode::End);
+        // Waiting still comes after the facts.
+        to_waiting(&mut o, &s);
         assert!(draw(&mut o, &s, 80, 20)[5].starts_with("│ › Waiting (0)"));
         hit(&mut o, &s, KeyCode::Home);
         hit(&mut o, &s, KeyCode::Down);
@@ -2849,7 +2860,7 @@ mod tests {
         let mut o = settings_panel();
         o.settings.load_waiting(&actions_answer());
         draw(&mut o, &s, 80, 20);
-        hit(&mut o, &s, KeyCode::End);
+        to_waiting(&mut o, &s);
         // An action's row says what it is and what it does; a delayed one when it goes.
         let got = draw(&mut o, &s, 80, 20);
         let at = crate::settings::clock(NOW / 1000 + 600, &jiff::tz::TimeZone::UTC);
@@ -2951,7 +2962,7 @@ mod tests {
              "age_secs": 60, "expires_in_secs": 86_340, "strong": false, "once": false},
         ]});
         o.settings.load_waiting(&answer);
-        hit(&mut o, &s, KeyCode::End);
+        to_waiting(&mut o, &s);
         hit(&mut o, &s, KeyCode::Right);
         assert!(!keys_named(&o).contains(&"1"), "{:?}", keys_named(&o));
         assert_eq!(
@@ -2978,7 +2989,7 @@ mod tests {
              "summary": "email to a@x.org", "card": card,
              "age_secs": 60, "expires_in_secs": 86_340, "strong": false, "once": false},
         ]}));
-        hit(&mut o, &s, KeyCode::End);
+        to_waiting(&mut o, &s);
         hit(&mut o, &s, KeyCode::Right);
         hit(&mut o, &s, KeyCode::Enter);
         let got = draw(&mut o, &s, 80, 20);
@@ -3636,5 +3647,194 @@ mod tests {
             .unwrap_or_else(|| panic!("no URL row: {got:?}"));
         assert!(visible_width(head) <= 10, "{got:?}");
         assert!(head.contains(glyph("…")), "{got:?}");
+    }
+
+    fn activity_answer() -> serde_json::Value {
+        serde_json::json!({"since": 1, "entries": [
+            {"at": 3, "kind": "out", "subject": "main", "status": "started",
+             "text": "curl POST api.example.com", "line": "14:02 out main: curl POST api.example.com",
+             "stream": true},
+            {"at": 2, "kind": "tool", "subject": "main", "status": "started", "text": "read {}",
+             "line": "14:01 tool main: read {}", "stream": true},
+            {"at": 1, "kind": "task", "subject": "#12", "status": "completed",
+             "text": "summarise the inbox", "line": "13:40 task #12 completed: summarise the inbox",
+             "stream": false},
+        ], "next": "5.audit.9"})
+    }
+
+    fn grants_answer() -> serde_json::Value {
+        serde_json::json!({"since": null, "entries": [
+            {"at": 1, "kind": "grant", "subject": "messages",
+             "line": "messages bob@x.org, known since 11-02 · /approvals forget 4",
+             "revoke": "/approvals forget 4"},
+            {"at": 2, "kind": "grant", "subject": "#3",
+             "line": "job #3 morning-brief, 0 7 * * *, to discord · /job rm 3", "revoke": "/job rm 3"},
+            {"at": 3, "kind": "grant", "subject": "k",
+             "line": "k until 18:00, then [vault:A] · set k back by hand", "revoke": null},
+        ], "next": null})
+    }
+
+    #[test]
+    fn activity_mutes_tool_rows_and_asks_for_the_next_page_at_the_bottom() {
+        let s = snap();
+        let mut o = settings_panel();
+        o.settings.load_activity(&activity_answer(), false, 0);
+        // Activity and Grants follow Waiting.
+        hit(&mut o, &s, KeyCode::End);
+        hit(&mut o, &s, KeyCode::Up);
+        let got = draw(&mut o, &s, 100, 20);
+        assert!(got[5].starts_with("│   Waiting"), "{got:?}");
+        assert!(got[6].starts_with("│ › Activity"), "{got:?}");
+        assert!(got[7].starts_with("│   Grants"), "{got:?}");
+        for (i, line) in [
+            "14:02 out main: curl POST api.example.com",
+            "14:01 tool main: read {}",
+            "13:40 task #12 completed: summarise the inbox",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(got[i + 1].contains(line), "{got:?}");
+        }
+        let rows = list(&o, &s);
+        let raw = |text: &str| {
+            (rows.iter())
+                .find_map(|r| match r {
+                    Row::Line(l) | Row::Focus(l) if l.contains(text) => Some(l.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(raw("read {}").contains(&DARK.muted.fg("14:01 tool main: read {}")));
+        assert!(!raw("curl POST").contains(&DARK.muted.fg("14:02 out main: curl POST")));
+        // Into the rows: reaching the last asks once for the page before the cursor.
+        hit(&mut o, &s, KeyCode::Right);
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::End),
+            Action::ActivityPage("5.audit.9".into())
+        );
+        assert_eq!(hit(&mut o, &s, KeyCode::End), Action::None);
+        hit(&mut o, &s, KeyCode::Up);
+        assert_eq!(hit(&mut o, &s, KeyCode::Down), Action::None, "asked once");
+        let mut page2 = activity_answer();
+        page2["entries"] = serde_json::json!([{"at": 0, "kind": "job", "subject": "#3 run 88",
+            "status": "completed", "text": "morning-brief",
+            "line": "13:00 job #3 run 88 completed: morning-brief", "stream": false}]);
+        page2["next"] = serde_json::Value::Null;
+        o.settings.load_activity(&page2, true, 0);
+        let got = draw(&mut o, &s, 100, 20);
+        assert!(
+            got[4].contains("13:00 job #3 run 88 completed: morning-brief"),
+            "{got:?}"
+        );
+        assert!(got[1].contains("14:02 out main"), "{got:?}");
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::End),
+            Action::None,
+            "no page after the last"
+        );
+    }
+
+    #[test]
+    fn r_on_a_grant_sends_its_revoke() {
+        let s = snap();
+        let mut o = settings_panel();
+        o.settings.load_grants(&grants_answer(), 0);
+        hit(&mut o, &s, KeyCode::End);
+        let got = draw(&mut o, &s, 100, 20);
+        assert!(got[7].starts_with("│ › Grants"), "{got:?}");
+        assert!(
+            got[1].contains("messages bob@x.org, known since 11-02 · "),
+            "{got:?}"
+        );
+        assert!(got[2].contains("job #3 morning-brief"), "{got:?}");
+        hit(&mut o, &s, KeyCode::Right);
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Char('r')),
+            Action::Revoke("/approvals forget 4".into())
+        );
+        hit(&mut o, &s, KeyCode::Down);
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Char('r')),
+            Action::Revoke("/job rm 3".into())
+        );
+        // A grant whose value could not be shown as it is offers no command to send.
+        hit(&mut o, &s, KeyCode::Down);
+        assert_eq!(hit(&mut o, &s, KeyCode::Char('r')), Action::None);
+        let hints = settings_panel::hints(&o);
+        assert!(hints.iter().any(|(k, _)| *k == "r"), "{hints:?}");
+        hit(&mut o, &s, KeyCode::Char('?'));
+        let help = draw(&mut o, &s, 100, 30);
+        assert!(
+            help.iter()
+                .any(|l| l.contains("r") && l.contains("Grants: take it back")),
+            "{help:?}"
+        );
+    }
+
+    #[test]
+    fn an_old_daemon_gives_an_empty_activity_tab() {
+        let s = snap();
+        let mut o = settings_panel();
+        let old = serde_json::json!({"entries": [], "next": null, "old": true});
+        o.settings.load_activity(&old, false, 0);
+        o.settings.load_grants(&old, 0);
+        hit(&mut o, &s, KeyCode::End);
+        hit(&mut o, &s, KeyCode::Up);
+        let got = draw(&mut o, &s, 100, 20);
+        assert!(
+            got[1].contains("this zephyr keeps no activity record; zephyr upgrade"),
+            "{got:?}"
+        );
+        assert_eq!(hit(&mut o, &s, KeyCode::Right), Action::None);
+        hit(&mut o, &s, KeyCode::Down);
+        let got = draw(&mut o, &s, 100, 20);
+        assert!(
+            got[1].contains("this zephyr keeps no activity record; zephyr upgrade"),
+            "{got:?}"
+        );
+    }
+
+    /// PR #39 review: a failed page keeps the cursor of the page it asked for, so reaching the
+    /// bottom again asks again; an answer to a panel opened before this one is dropped.
+    #[test]
+    fn a_failed_or_stale_activity_page_never_loses_or_mixes_rows() {
+        let s = snap();
+        let mut o = settings_panel();
+        o.settings.generation = 7;
+        o.settings.load_activity(&activity_answer(), false, 7);
+        hit(&mut o, &s, KeyCode::End);
+        hit(&mut o, &s, KeyCode::Up);
+        hit(&mut o, &s, KeyCode::Right);
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::End),
+            Action::ActivityPage("5.audit.9".into())
+        );
+        o.settings.load_activity(
+            &serde_json::json!({"error": "the gateway is busy"}),
+            true,
+            7,
+        );
+        hit(&mut o, &s, KeyCode::Up);
+        assert_eq!(
+            hit(&mut o, &s, KeyCode::Down),
+            Action::ActivityPage("5.audit.9".into()),
+            "asked again after the failure"
+        );
+        let got = draw(&mut o, &s, 100, 20);
+        assert!(
+            got.iter().any(|l| l.contains("the gateway is busy")),
+            "{got:?}"
+        );
+        // A page from the panel opened before this one is not this panel's.
+        let mut stale = activity_answer();
+        stale["entries"] = serde_json::json!([{"at": 0, "kind": "job", "subject": "#9",
+            "status": "completed", "text": "old", "line": "09:00 job #9 run 1 completed: old",
+            "stream": false}]);
+        o.settings.load_activity(&stale, true, 6);
+        o.settings.load_grants(&grants_answer(), 6);
+        let got = draw(&mut o, &s, 100, 20);
+        assert!(!got.iter().any(|l| l.contains("job #9 run 1")), "{got:?}");
+        assert_eq!(o.settings.grants, None, "{got:?}");
     }
 }
