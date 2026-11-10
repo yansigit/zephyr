@@ -359,8 +359,28 @@ using its usual tools; general network traffic is not limited.
   reaches the agent's context only after `/memory ok` (if it changed after you were sent the diff,
   you are shown the new one first); `/memory undo` drops it, `/memory diff` shows
   it again, `/memory log` lists commits. A web page cannot plant a lasting "preference" without you.
+- Every memory change waits for `/memory ok`, and its notice says where it came from (`from
+  your message`, `from task #7`, `from this conversation, which used exec at 14:02`). You can
+  have zephyr save a change at once when it saw the change came from you alone: `/set
+  memory.auto owner`, from the TUI or `zephyr chat` (Discord and iMessage cannot turn it on; the
+  agent can only turn it off). We recommend leaving it off. With it on, a change is saved without
+  asking only in a conversation started with `/new` that has read nothing but your messages (no
+  web page, command, file you sent, task report or tool other than reading and editing
+  `memory/USER.md` and `MEMORY.md`), with nothing else of the agent's running or alive, and
+  nothing waiting; you are still told (`[zephyr] memory saved from your message; /memory undo
+  drops it`), and `/memory undo` takes it back. Once a conversation has read anything else it
+  stays that way until the next `/new`; after the agent used its browser, `/stop` then `/new`.
+  What it cannot see: a program you start as the agent yourself (a `zephyr shell`, which reads
+  the agent's `~/.profile`; `docker exec -u agent x11vnc`, which reads `~/.x11vncrc`) runs what
+  the agent left there, and on a host whose `kernel.yama.ptrace_scope` is 0 an agent process can
+  attach to the desktop's programs. Leave it off if either applies.
   For the same reason rpi skills are off, only the image's extensions load, and a `SYSTEM.md`, `APPEND_SYSTEM.md`, `CLAUDE.md` or
   extra `AGENTS*.md` the agent writes is renamed `*.ignored-by-zephyr` before the next start.
+- `/forget TEXT` removes every memory line holding TEXT (at least 3 characters, any case), saves
+  that at once and lists what went; `/memory undo` puts it back. The reply says where the text is
+  still kept (the memory's git history, past conversations, the message log, your rules, goals or
+  persona). `/memory squash yes` then drops the memory's git history, keeping the files as they
+  are; `/memory undo` cannot go back past it.
 - When the agent drafts a skill or a connector, you get its diff the same way (below).
 
 ## Skills and connectors
@@ -416,6 +436,26 @@ rule or a removal; it never takes effect until you `/ok` the card, which shows t
 daemon, out of the agent's reach, and do not fade when a long conversation is summarised the way
 instructions given in chat can. `/new` starts a fresh conversation; rules and memory carry over, and `/switch` goes back to an earlier one.
 
+## Goals and persona
+
+`/goal add Ship zephyr 0.8` gives the agent a goal it keeps in mind in every run, from the next
+message on (at most 20, each up to 500 characters). `/goals` lists them; `/goal done 2` marks one
+done and `/goal rm 2` removes one, and both take it off the list. `/persona set TEXT` (several
+lines are fine, up to 4000 characters) says who the agent is with you; `/persona` shows it and
+`/persona clear` removes it. The persona comes before your rules, which still win. The agent can
+propose a goal, that one is done, or a persona, through a card you `/ok`; it never changes them
+itself. Both live with the daemon, beside the rules.
+
+`/set review.at 21:30` turns on a daily review at that time (in `timezone`): zephyr sends your
+goals, what was done since the last review, the day's activity and the memory changes, then the
+agent's short check-in on the goals (none when you have no goals). It goes to the channel you last
+wrote from. `/job list` shows it as a built-in job; `/job run N` sends one now, and
+`/set review.at none` turns it off.
+
+`/set memory.notify digest` (with `review.at` set) stops the memory notice after each run: the
+daily review lists every memory change since the last one, where each came from, and what is still
+waiting, and `/memory ok` after it keeps that. `/set memory.notify each` goes back.
+
 ## The agent's browser and desktop
 
 The image gives the agent a browser and a screen of its own (DESIGN §4.11):
@@ -468,13 +508,13 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   `/job ok N` (`/job rm N` drops it, though not while one of its runs is in progress; `/job list`
   marks the ones waiting).
 - **Commands.** The agent's `gateway` tool runs `/status`, `/model`, `/switch`, `/rules`,
-  `/memory diff`, `/memory log`, `/job list`, `/settings`, `/approvals` or `/facts` (the facts'
+  `/goals`, `/persona`, `/memory diff`, `/memory log`, `/job list`, `/settings`, `/approvals` or `/facts` (the facts'
   names and kinds, never a value) and reads the output in the same turn. It can save a private fact
   (`/facts add NAME KIND VALUE`; you are told its name) and propose removing one or allowing it a
   target. It
   can change a setting with `/set KEY VALUE [for D]` (stricter at once, else proposed; see
   [Changing settings](#changing-settings)), and propose `/model PROVIDER/MODEL`, `/new`, `/switch ID`,
-  `/pause`, `/reload`, `/subagent …` or `/rule …`: you are asked
+  `/pause`, `/reload`, `/subagent …`, `/rule …`, `/goal add|done|rm …` or `/persona set …|clear`: you are asked
   (`the agent asks to run /new (#3)`), `/ok 3` runs it exactly as if you had typed it, and `/no 3`
   drops it (a proposal lapses after 24 hours). Approvals (`/ok`, `/no`, `/cancel`, `/held`,
   `/memory ok`, `/job ok`, `/login`, `/resume`) and `/stop` are never proposable, so text the agent read cannot approve

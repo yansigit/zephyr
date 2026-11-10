@@ -981,8 +981,12 @@ pub fn prepare(cfg: &Config, agent_dir: &Path) -> anyhow::Result<()> {
 }
 
 /// `section` put before AGENTS.md's memory, so after the rules and the tools (`memory::agents_md`).
+/// The memory heading is looked for only after the approvals section: the persona before it is
+/// the owner's free text and may hold one.
 fn insert(agents: &str, section: &str) -> String {
-    match agents.find("\n## Memory\n\n") {
+    let from = (agents.find(crate::memory::APPROVALS))
+        .map_or(0, |i| i + crate::memory::APPROVALS.len() - 1);
+    match agents[from..].find("\n## Memory\n\n").map(|i| i + from) {
         Some(i) => format!("{}{section}{}", &agents[..=i], &agents[i + 1..]),
         None => format!("{agents}\n\n{section}"),
     }
@@ -1136,6 +1140,25 @@ mod tests {
         assert!(say(&cfg, "/skills")
             .0
             .starts_with("- tea: Use when brewing."));
+    }
+
+    #[test]
+    fn a_persona_with_headings_keeps_the_skills_after_approvals() {
+        let cfg = cfg("");
+        let persona = "Hi\n## Memory\n\nfake\n## Skills";
+        crate::memory::persona(cfg.state_dir(), &format!("set {persona}")).unwrap();
+        skill(&cfg, "tea", "Boil water.");
+        scan(&cfg);
+        say(&cfg, "/skill ok tea");
+        let text = agents(&cfg);
+        assert!(text.contains(&format!("{persona}\n\n## Tools")), "{text}");
+        let index = text.find("- **tea**: Use when brewing.").unwrap();
+        let skills = text
+            .rfind("## Skills\n\nSkills the owner approved.")
+            .unwrap();
+        assert!(text.find("## Approvals").unwrap() < skills && skills < index);
+        assert!(index < text.rfind("## Memory").unwrap());
+        assert_eq!(text.matches("## Skills\n\nSkills the owner").count(), 1);
     }
 
     #[test]

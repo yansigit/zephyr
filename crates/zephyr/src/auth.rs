@@ -26,6 +26,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+/// `script`, by full path: run as the agent, a program of that name on its PATH would be the
+/// daemon's child while a sign-in runs.
+const SCRIPT: &str = "/usr/bin/script";
+
 /// How a provider takes its credential; `zephyr.login_providers` reports it as `kind`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -828,7 +832,7 @@ fn spawn(cfg: &Config, provider: &str, dir: &Path) -> anyhow::Result<tokio::proc
     // `login_poll` reports. `-e` hands the command's exit status through — with `-f` it is
     // `script`'s own, which is always 0 — so the pump can tell a sign-in that ended badly from one
     // that finished (see `exit_note`).
-    let mut cmd = tokio::process::Command::new("script");
+    let mut cmd = tokio::process::Command::new(SCRIPT);
     cmd.arg("-qec")
         .arg(&shell)
         .arg("/dev/null")
@@ -1591,5 +1595,10 @@ mod tests {
     fn the_shell_sees_the_command_as_one_word() {
         assert_eq!(quote("/a b/rpi"), "'/a b/rpi'");
         assert_eq!(quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn a_sign_in_runs_script_by_full_path() {
+        assert_eq!(SCRIPT, "/usr/bin/script");
     }
 }

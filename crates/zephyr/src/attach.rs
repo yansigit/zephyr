@@ -65,11 +65,15 @@ pub enum AttachRequest {
     },
     /// `zephyr.proposals`: the proposals still waiting.
     Proposals(oneshot::Sender<Value>),
+    /// A note of zephyr's own for main (the vault's new entry): an inbox row that is no owner's.
+    Notice(Inbound),
     /// `zephyr.activity`: a page of the activity record, or the grants (DESIGN §4.19).
     Activity {
         query: crate::activity::Query,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    /// `zephyr.goals`: the open goals, then those done since the last review (read-only).
+    Goals(oneshot::Sender<Result<Value, String>>),
     /// `zephyr.decide`: `/ok N` (`ok`, `once`), `/no N` (`no`) or `/cancel N` (`cancel`) as the
     /// owner on the TUI.
     Decide {
@@ -379,6 +383,14 @@ impl Conn {
                     _ => (vec![error(id, -32000, "gateway is shutting down")], true),
                 }
             }
+            "zephyr.goals" => {
+                let (tx, rx) = oneshot::channel();
+                match (self.router.send(AttachRequest::Goals(tx)).await, rx.await) {
+                    (Ok(()), Ok(Ok(value))) => (vec![ok(id, value)], false),
+                    (Ok(()), Ok(Err(why))) => (vec![error(id, -32000, &why)], false),
+                    _ => (vec![error(id, -32000, "gateway is shutting down")], true),
+                }
+            }
             "zephyr.settings_set" => {
                 let (Some(key), Some(value)) = (
                     params["key"].as_str(),
@@ -513,7 +525,8 @@ impl Conn {
                 sender: "token".into(),
                 text,
             };
-            let _ = self.inbound.send(m).await;
+            // zephyr's words, not the owner's: never through `inbound`, which marks the owner's.
+            let _ = self.router.send(AttachRequest::Notice(m)).await;
         }
         let entries: Vec<Value> = vault.entries().iter().map(Entry::public).collect();
         (vec![ok(id, json!({ "entries": entries }))], false)

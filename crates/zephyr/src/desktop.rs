@@ -14,6 +14,15 @@ use std::sync::Mutex;
 
 static RUNNING: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 
+/// The desktop's programs, by full path: run as the agent, but never ones it left on its PATH,
+/// which would be the daemon's children and spared by the stray check (DESIGN §4.6).
+const XVFB: &str = "/usr/bin/Xvfb";
+const OPENBOX: &str = "/usr/bin/openbox";
+/// Root's config (`deploy/openbox/rc.xml`), never the agent's `~/.config/openbox/rc.xml`: it
+/// binds no key, shows no menu and starts nothing.
+const OPENBOX_RC: &str = "/opt/zephyr/openbox/rc.xml";
+const OPENBOX_ARGS: [&str; 2] = ["--config-file", OPENBOX_RC];
+
 /// The cookie file, in the agent's home: the agent's own clients read it through `XAUTHORITY`.
 pub(crate) const XAUTHORITY: &str = ".zephyr-xauthority";
 const COOKIE_NAME: &[u8] = b"MIT-MAGIC-COOKIE-1";
@@ -30,7 +39,8 @@ pub fn ensure() -> Option<String> {
     }
     let mut running = RUNNING.lock().unwrap();
     running.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
-    if running.len() < 2 {
+    // Without root's openbox config there is no window manager, and the server alone is whole.
+    if running.len() < wanted(std::path::Path::new(OPENBOX_RC).is_file()) {
         for c in running.iter_mut() {
             let _ = c.kill();
             let _ = c.wait();
@@ -46,12 +56,21 @@ pub fn ensure() -> Option<String> {
             "-nolisten",
             "tcp",
         ];
-        running.extend(start("Xvfb", &[&display], &xvfb));
+        running.extend(start(XVFB, &[&display], &xvfb));
         // The window manager needs the server up first.
         std::thread::sleep(std::time::Duration::from_millis(300));
-        running.extend(start("openbox", &[], &[]));
+        // Without root's config openbox would fall back to the agent's: then no window manager.
+        match std::path::Path::new(OPENBOX_RC).is_file() {
+            true => running.extend(start(OPENBOX, &OPENBOX_ARGS, &[])),
+            false => eprintln!("zephyr: {OPENBOX_RC} is missing; the desktop runs without openbox"),
+        }
     }
     Some(display)
+}
+
+/// How many programs a whole desktop runs: the server, and openbox when its config is there.
+fn wanted(rc: bool) -> usize {
+    1 + usize::from(rc)
 }
 
 /// Where the desktop's cookie is, when there is a desktop: set it as `XAUTHORITY` beside `DISPLAY`.
@@ -162,5 +181,41 @@ mod tests {
             parse(&entry("1", &[7; 16])[..10]).is_none(),
             "a cut file is refused"
         );
+    }
+
+    #[test]
+    fn the_desktop_runs_by_full_path() {
+        // Not looked up on the agent's PATH, where a program of its own of that name would be
+        // the daemon's child, spared by the stray check.
+        assert_eq!(XVFB, "/usr/bin/Xvfb");
+        assert_eq!(OPENBOX, "/usr/bin/openbox");
+    }
+
+    #[test]
+    fn openbox_reads_roots_config_that_runs_nothing() {
+        // Never `~/.config/openbox/rc.xml`, the agent's to write: its keys, menu and autostart
+        // could start a program as the desktop's child, which the stray check spares.
+        assert_eq!(
+            OPENBOX_ARGS,
+            ["--config-file", "/opt/zephyr/openbox/rc.xml"]
+        );
+        let rc = include_str!("../../../deploy/openbox/rc.xml");
+        let menu = include_str!("../../../deploy/openbox/menu.xml");
+        for text in [rc, menu] {
+            let lower = text.to_ascii_lowercase();
+            for word in ["execute", "autostart", "pipemenu", "<command", "showmenu"] {
+                assert!(!lower.contains(word), "{word} in {text}");
+            }
+        }
+        assert!(
+            rc.contains("<file>/opt/zephyr/openbox/menu.xml</file>"),
+            "{rc}"
+        );
+    }
+
+    #[test]
+    fn a_desktop_without_openbox_is_whole_with_its_server() {
+        // Else every `ensure` would kill the server and start another.
+        assert_eq!((wanted(false), wanted(true)), (1, 2));
     }
 }

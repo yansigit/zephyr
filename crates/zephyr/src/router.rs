@@ -4,7 +4,7 @@ use crate::channel::{Activity, Channel, Inbound, Outbound};
 use crate::config::{Account, Config, BUDGET_NOTICE};
 use crate::rpc::{message_text, Child, MAIN_SESSION};
 use crate::settings::{Actor, Apply, Outcome, Setting};
-use crate::store::{InboxRow, Store};
+use crate::store::{InboxRow, SessionOrigin, Store};
 use crate::tools::Decided;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -279,6 +279,12 @@ pub async fn run<C: Channel>(
     let (gate_notes, notes_rx) = mpsc::channel(16);
     router.gate_notes = Some(notes_rx);
     router.keep_upgraded_install_as_it_was().await;
+    router.taint_cut_off();
+    // Before the first child starts the desktop: one a daemon before this left is no child of
+    // this one, so it would be a stray for memory for good (DESIGN §4.6).
+    tokio::task::spawn_blocking(crate::procs::kill_leftover_desktop)
+        .await
+        .ok();
     // Commands a re-exec handed over alive are adopted; the rest a dead gateway left running
     // are reported, never re-run (DESIGN §4.13).
     router.procs.adopt(&router.cfg, &mut router.store)?;
@@ -449,6 +455,18 @@ struct Router<'a> {
     tally: crate::rpc::Tally,
     /// When the current run started, for `budget.run_minutes`.
     run_start: Option<Instant>,
+    /// Whether the current run of main is the owner's alone (DESIGN §4.6), decided at its start
+    /// and lost at the first text that is not the owner's.
+    trust: Trust,
+    /// The run's conversation was tainted already: one `session_origin` write per run.
+    run_taint: bool,
+    /// When the current run of main started (`begin_run`), for what ran beside it.
+    run_since: Option<i64>,
+    /// Taints `session_origin` could not take, by session: they hold for this process's life.
+    tainted: HashMap<String, String>,
+    /// A run cut off by a restart whose conversation could not be read: no run of main is the
+    /// owner's until the daemon starts again.
+    unplaced: bool,
     /// When the child last said anything, for stall detection (`cap_run`).
     last_event: Instant,
     /// `RESUME_NOTE` was steered into a resumed run and not delivered yet: taken back at the
@@ -598,7 +616,7 @@ impl<'a> Router<'a> {
             auth_at: Instant::now(),
             restart: false,
             account: None,
-            tally: Default::default(),
+            tally: crate::rpc::Tally::main(&cfg.home),
             snap,
             names,
             thinking: None,
@@ -612,6 +630,11 @@ impl<'a> Router<'a> {
             last_say: String::new(),
             run_completed: false,
             run_start: None,
+            trust: Trust::Not(crate::memory::LEGACY.into()),
+            run_taint: false,
+            run_since: None,
+            tainted: HashMap::new(),
+            unplaced: false,
             last_event: Instant::now(),
             note_pending: false,
             cut: None,
@@ -737,6 +760,9 @@ impl<'a> Router<'a> {
             let _ = self.tap.send(ev.clone()); // no receivers is fine
             self.last_event = Instant::now();
             self.tally.add(ev);
+            if let Some(reason) = self.tally.taint.clone() {
+                self.taint_session(&reason);
+            }
             let session = self.child.as_ref().and_then(|c| c.session.clone());
             if let Some(session) = &session {
                 crate::scheduler::audit(&self.store, &self.cfg, session, ev);
@@ -1043,10 +1069,13 @@ impl<'a> Router<'a> {
                 eprintln!("zephyr: gateway {shown:?} is not on the list; not run");
                 return None;
             }
-            // Subagents and rules are settings: proposed through `set_setting`, so the card and
-            // the owner's `/ok` check them by content (settings spec §4.4).
+            // Subagents, rules, goals and the persona are settings: proposed through
+            // `set_setting`, so the card and the owner's `/ok` check them by content (settings
+            // spec §4.4).
             Some(Gateway::Propose)
-                if command.starts_with("/subagent ") || command.starts_with("/rule ") =>
+                if ["/subagent ", "/rule ", "/goal ", "/persona "]
+                    .iter()
+                    .any(|p| command.starts_with(p)) =>
             {
                 return Some(self.agent_set(command).await)
             }
@@ -1353,6 +1382,15 @@ impl<'a> Router<'a> {
             AttachRequest::Settings(tx) => {
                 let _ = tx.send(self.settings_json());
             }
+            AttachRequest::Notice(m) => {
+                if let Err(e) = self.store.insert_inbox(&m) {
+                    eprintln!("zephyr: inbox write failed: {e}");
+                }
+                log(self.dispatch_new().await);
+            }
+            AttachRequest::Goals(tx) => {
+                let _ = tx.send(self.goals_json());
+            }
             AttachRequest::SettingsSet {
                 key,
                 value,
@@ -1415,6 +1453,23 @@ impl<'a> Router<'a> {
         json!({"sections": sections, "strong_channels": strong})
     }
 
+    /// `zephyr.goals`: the open goals in file order, then those done since the last review,
+    /// newest first. Changes go through the `/goal` commands, as text.
+    fn goals_json(&self) -> Result<Value, String> {
+        let failed = |e: String| format!("reading the goals failed: {e}");
+        let open = crate::memory::read_goals(self.cfg.state_dir())
+            .map_err(|e| failed(format!("{e:#}")))?;
+        let since = crate::review::since(&self.store, crate::now());
+        let done = self
+            .store
+            .goals_done_since(since)
+            .map_err(|e| failed(e.to_string()))?;
+        let open = (open.iter().enumerate())
+            .map(|(i, text)| json!({"n": i + 1, "text": text, "done": false}));
+        let done = (done.iter().rev()).map(|d| json!({"n": null, "text": d.text, "done": true}));
+        Ok(json!({"goals": open.chain(done).collect::<Vec<_>>()}))
+    }
+
     /// `zephyr.settings_set`: `/set KEY VALUE [for D]` as the owner on the TUI, answered as data.
     async fn settings_set(&mut self, key: &str, value: &str, until: Option<&str>) -> Value {
         let refused = |why: String| json!({"outcome": "refused", "reason": why});
@@ -1423,6 +1478,9 @@ impl<'a> Router<'a> {
         }
         if matches!(key, "subagent" | "rule") {
             return refused("change subagents with /subagent and rules with /rule".into());
+        }
+        if matches!(key, "goal" | "persona") {
+            return refused("change goals with /goal and the persona with /persona".into());
         }
         let min = self.cfg.min_until;
         let until = match until
@@ -1623,9 +1681,12 @@ impl<'a> Router<'a> {
             eprintln!("zephyr: reading the main session id failed: {e}");
             MAIN_SESSION.into()
         });
+        // What the new child loads must be what zephyr last saw.
+        let since = self.open_window(&session);
         match Child::spawn_as(&self.cfg, Some(&session), account.as_ref()).await {
             Ok(child) => {
                 eprintln!("zephyr: rpi child {:?} ready", child.pid());
+                self.settle_session(&session, since);
                 self.spawn_failures = 0;
                 if let Some(a) = &account {
                     eprintln!("zephyr: on account {} ({})", a.name, a.model);
@@ -1681,7 +1742,19 @@ impl<'a> Router<'a> {
 
     async fn child_exited(&mut self) {
         eprintln!("zephyr: rpi child exited; respawning in {:?}", self.backoff);
-        self.child = None;
+        // A run its agent died in may have read text whose events never came: its conversation
+        // is not the owner's alone. Nothing of the dead run's is carried into the next one.
+        let session = self.child.take().and_then(|c| c.session.clone());
+        if let (Some(session), Some(_)) = (session, self.run_start) {
+            let why = format!(
+                "was cut off when its agent stopped at {}",
+                self.clock(crate::now())
+            );
+            self.record_taint(session, &why);
+        }
+        self.tally.taint = None;
+        self.trust = Trust::Not(crate::memory::LEGACY.into());
+        self.run_taint = false;
         self.busy = false;
         update(&self.snap, |s| s.run = Run::default());
         self.run_start = None;
@@ -1767,6 +1840,8 @@ impl<'a> Router<'a> {
             sender: m.sender,
             text: m.text,
             tries: 0,
+            platform_id: m.platform_msg_id,
+            owner: true,
         };
         if reply.is_empty() {
             // A `/btw` whose answer its task posts.
@@ -1792,7 +1867,7 @@ impl<'a> Router<'a> {
         if let Some(at) = self.cut_at {
             if at.elapsed() >= WEDGED.min(self.cfg.stall_limit) {
                 eprintln!("zephyr: rpi never settled the stopped run; killing it");
-                self.child = None; // dropping it kills it
+                // `child_exited` takes the child, which kills it, and taints its conversation.
                 self.child_exited().await;
             }
             return;
@@ -1905,6 +1980,14 @@ impl<'a> Router<'a> {
             if !self.busy {
                 crate::checkpoint::before(&self.cfg, &row.text).await;
             }
+            if !self.busy {
+                self.begin_run().await;
+            }
+            // Only a row an owner sent on a channel is the owner's text; any other (a report, a
+            // result, anything zephyr wrote) is in the conversation from now on (DESIGN §4.6).
+            if !row.owner || !self.cfg.is_owner(&row.channel, &row.sender) {
+                self.taint_session(&daemon_row(&row.platform_id));
+            }
             // Durable before the child sees it, so recovery knows to look for it, and how.
             self.store.mark_dispatched_as(row.id, sent_as)?;
             let text = match again {
@@ -1923,10 +2006,233 @@ impl<'a> Router<'a> {
                     .await?;
                 self.busy = true;
                 self.user_turn(&row, &text, true);
-                self.run_start = Some(Instant::now());
             }
         }
         Ok(())
+    }
+
+    /// A run of main starts: whether it is the owner's alone is decided now (DESIGN §4.6), from
+    /// what the daemon saw, never from what the agent says. Every doubt is `Trust::Not`.
+    async fn begin_run(&mut self) {
+        self.run_start = Some(Instant::now());
+        self.run_taint = false;
+        let now = crate::now();
+        self.run_since = Some(now);
+        let session = self.child.as_ref().and_then(|c| c.session.clone());
+        let mut beside = None;
+        if let Some(session) = &session {
+            // What else of the agent's lives first, then the file: a stray may end before the
+            // settle, having written the file or memory, so the conversation is not the owner's
+            // alone from now on.
+            if let Ok(SessionOrigin::Clean) = self.store.session_origin(session) {
+                beside = self.procs_beside(now);
+            }
+            if let Some(Beside::Stray(comm)) = &beside {
+                self.taint_stray(session, "open", comm);
+            }
+            self.check_session(session);
+        }
+        let failed = session.as_ref().and_then(|s| self.tainted.get(s)).cloned();
+        let origin = session.map(|s| self.store.session_origin(&s));
+        let beside = beside.map(|b| match b {
+            Beside::Work => crate::memory::BESIDE.to_string(),
+            Beside::Stray(comm) => stray_label(&comm),
+        });
+        self.trust = match origin {
+            _ if self.unplaced => Trust::Not(UNPLACED.into()),
+            _ if failed.is_some() => Trust::Not(format!(
+                "this conversation, which {}",
+                failed.unwrap_or_default()
+            )),
+            Some(Ok(SessionOrigin::Clean)) | Some(Ok(SessionOrigin::Tainted(_)))
+                if beside.is_some() =>
+            {
+                Trust::Not(beside.unwrap_or_default())
+            }
+            Some(Ok(SessionOrigin::Clean)) => {
+                match crate::memory::base(&self.cfg.home, self.cfg.state_dir()).await {
+                    Ok(base) => Trust::Owner { base, since: now },
+                    Err(why) => Trust::Not(why.into()),
+                }
+            }
+            Some(Ok(SessionOrigin::Tainted(why))) => {
+                Trust::Not(format!("this conversation, which {why}"))
+            }
+            _ => Trust::Not(crate::memory::LEGACY.into()),
+        };
+    }
+
+    /// What ran or runs beside since `since`: other work first, else a stray.
+    fn procs_beside(&self, since: i64) -> Option<Beside> {
+        if self.store.writers_since(since).unwrap_or(true) {
+            return Some(Beside::Work);
+        }
+        self.procs.stray().map(Beside::Stray)
+    }
+
+    /// The run's conversation took in text that is not the owner's: it is tainted for good, in
+    /// `session_origin` before the run goes on (once per run), and this run is not the owner's
+    /// even if that write fails.
+    fn taint_session(&mut self, reason: &str) {
+        if self.run_taint {
+            return;
+        }
+        self.run_taint = true;
+        let why = format!("{reason} at {}", self.clock(crate::now()));
+        if let Some(session) = self.child.as_ref().and_then(|c| c.session.clone()) {
+            self.record_taint(session, &why);
+        }
+        if let Trust::Owner { .. } = self.trust {
+            self.trust = Trust::Not(format!("this conversation, which {why}"));
+        }
+    }
+
+    /// `session_origin` takes the taint; when it cannot, this process remembers it.
+    fn record_taint(&mut self, session: String, why: &str) {
+        if let Err(e) = self.store.taint(&session, why) {
+            eprintln!("zephyr: recording the conversation's taint failed: {e}");
+            self.tainted
+                .entry(session)
+                .or_insert_with(|| why.to_string());
+        }
+    }
+
+    /// What zephyr last recorded of a clean conversation's saved files: `None` when it is not
+    /// clean (nothing to look at), `Some(Err)` when the record cannot be read.
+    fn session_seen(&self, session: &str) -> Option<Result<crate::rpc::SessionPrint, ()>> {
+        if !matches!(self.store.session_origin(session), Ok(SessionOrigin::Clean)) {
+            return None;
+        }
+        Some(match self.store.session_file(session) {
+            Ok(None) => Ok(Default::default()),
+            Ok(Some(json)) => serde_json::from_str(&json).map_err(drop),
+            Err(_) => Err(()),
+        })
+    }
+
+    fn taint_now(&mut self, session: &str, what: &str) {
+        let why = format!("{what} at {}", self.clock(crate::now()));
+        self.record_taint(session.to_string(), &why);
+    }
+
+    /// Opens a window on a clean conversation's saved file, returning when: a stray of the
+    /// agent's alive now taints it at once (one that ends before the window closes would go
+    /// unseen there; work beside is seen there, as running or started since), then the file is
+    /// checked against its record.
+    fn open_window(&mut self, session: &str) -> i64 {
+        let since = crate::now();
+        if let Ok(SessionOrigin::Clean) = self.store.session_origin(session) {
+            if let Some(Beside::Stray(comm)) = self.procs_beside(since) {
+                self.taint_stray(session, "open", &comm);
+            }
+        }
+        self.check_session(session);
+        since
+    }
+
+    /// The conversation's saved file is what zephyr last recorded; anything else changed it
+    /// while rpi was idle, so it is tainted (DESIGN §4.6). Only a clean one is looked at. On a
+    /// match the fresh print is kept, so the next look hashes nothing it need not.
+    fn check_session(&mut self, session: &str) {
+        let Some(seen) = self.session_seen(session) else {
+            return;
+        };
+        let dir = self.cfg.session_dir();
+        let now =
+            (seen.as_ref().ok()).map(|s| crate::rpc::SessionPrint::now(&dir, session, Some(s)));
+        match (now, seen) {
+            // Nothing new to keep when not even the hash was taken again.
+            (Some(now), Ok(seen)) if !now.bad() && now == seen => {
+                if serde_json::to_string(&now).ok() != serde_json::to_string(&seen).ok() {
+                    self.record_session(session, &now)
+                }
+            }
+            _ => self.taint_now(session, "was changed on disk outside zephyr"),
+        }
+    }
+
+    /// After rpi wrote the file (a run, a start, a stop, an idle command, the window opened at
+    /// `since` by `check_session`): when other work of the agent's ran meanwhile, or a stray of
+    /// its lived, it could have written there too, so the conversation is tainted; else rpi may
+    /// only have added to the bytes recorded (`SessionPrint::follow`), and the print of exactly
+    /// the bytes so checked is recorded.
+    fn settle_session(&mut self, session: &str, since: i64) {
+        let Some(seen) = self.session_seen(session) else {
+            return;
+        };
+        match self.procs_beside(since) {
+            Some(Beside::Work) => {
+                return self.taint_now(
+                    session,
+                    "was written while other work of the agent's was running",
+                )
+            }
+            Some(Beside::Stray(comm)) => return self.taint_stray(session, "written", &comm),
+            None => {}
+        }
+        let dir = self.cfg.session_dir();
+        match seen.ok().and_then(|s| s.follow(&dir, session)) {
+            Some(now) => self.record_session(session, &now),
+            None => self.taint_now(session, "was changed on disk outside zephyr"),
+        }
+    }
+
+    /// A stray of the agent's lived while the conversation was open or written (`what`): it is
+    /// tainted, and the reason says what the stray was and how to end it.
+    fn taint_stray(&mut self, session: &str, what: &str, comm: &str) {
+        let (who, cure) = stray_phrase(comm);
+        let why = format!(
+            "was {what} at {} while {who}; {cure}, then /new starts clean",
+            self.clock(crate::now())
+        );
+        self.record_taint(session.to_string(), &why);
+    }
+
+    /// Records `print` as the clean conversation's saved files. A record that cannot be written
+    /// taints it: the next look would have nothing to trust.
+    fn record_session(&mut self, session: &str, print: &crate::rpc::SessionPrint) {
+        let json = serde_json::to_string(print).unwrap_or_default();
+        if let Err(e) = self.store.set_session_file(session, &json) {
+            eprintln!("zephyr: recording the conversation's file failed: {e}");
+            self.taint_now(session, "could not have its saved file recorded");
+        }
+    }
+
+    /// The child's session, if it has one.
+    fn child_session(&self) -> Option<String> {
+        self.child.as_ref().and_then(|c| c.session.clone())
+    }
+
+    /// An rpi command that writes the session while it is idle (`set_model`,
+    /// `set_thinking_level`, `navigate`): the file is checked before and recorded after.
+    async fn call_writing(&mut self, cmd: Value) -> anyhow::Result<Value> {
+        let session = self.child_session();
+        let since = session
+            .as_ref()
+            .map_or(crate::now(), |s| self.open_window(s));
+        let answer = self.call(cmd).await;
+        if let Some(s) = &session {
+            self.settle_session(s, since);
+        }
+        answer
+    }
+
+    /// At start: a run of main in flight when the daemon stopped may have read text whose events
+    /// were never read, so its conversation is not the owner's alone (DESIGN §4.6).
+    fn taint_cut_off(&mut self) {
+        let rows = self.store.inbox_with_status("dispatched");
+        if rows.as_ref().is_ok_and(|r| r.is_empty()) {
+            return;
+        }
+        let Ok(session) = self.store.main_session() else {
+            eprintln!(
+                "zephyr: a run was cut off by a restart in a conversation zephyr cannot read"
+            );
+            self.unplaced = true;
+            return;
+        };
+        let why = format!("was cut off by a restart at {}", self.clock(crate::now()));
+        self.record_taint(session, &why);
     }
 
     /// rpi 0.15 sends no message events for a prompt it accepts, so the router reports the user
@@ -1953,19 +2259,61 @@ impl<'a> Router<'a> {
     async fn settled(&mut self, ev: &Value) {
         self.busy = false;
         self.run_start = None;
+        // What rpi wrote in the run is the conversation now, if it only added to what was there
+        // and nothing else of the agent's ran beside it; else the conversation is tainted, and
+        // so is this run (DESIGN §4.6). A run zephyr did not see start saves nothing at once,
+        // and leaves the conversation as it is.
+        match (self.child_session(), self.run_since.take()) {
+            (Some(session), Some(since)) => {
+                self.settle_session(&session, since);
+                if let Trust::Owner { .. } = self.trust {
+                    let failed = self.tainted.get(&session).cloned();
+                    match (failed, self.store.session_origin(&session)) {
+                        (None, Ok(SessionOrigin::Clean)) => {}
+                        (Some(why), _) | (None, Ok(SessionOrigin::Tainted(why))) => {
+                            self.trust = Trust::Not(format!("this conversation, which {why}"));
+                        }
+                        _ => self.trust = Trust::Not(crate::memory::LEGACY.into()),
+                    }
+                }
+            }
+            _ => self.trust = Trust::Not(UNSEEN_RUN.into()),
+        }
         let cut = self.cut.take();
         self.cut_at = None;
         self.compacted(ev);
         // Before reconcile dispatches the next row, so that row runs on the new model.
         self.apply_model().await;
         self.backoff = FIRST_BACKOFF;
-        let memory = crate::memory::commit(&self.cfg.home, self.cfg.state_dir())
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("zephyr: memory commit failed: {e:#}");
-                None
-            });
-        let tally = std::mem::take(&mut self.tally);
+        let trust = std::mem::replace(&mut self.trust, Trust::Not(crate::memory::LEGACY.into()));
+        // Anything that ran beside the run, or a stray, could have written memory too: asked
+        // under the memory lock, right before the commit.
+        let (db, procs) = (self.cfg.db_path(), self.procs.clone());
+        let (origin, since) = match trust {
+            // `memory.auto` off (the default): the owner's change waits as any other, its
+            // origin named.
+            Trust::Owner { .. } if !self.cfg.auto_save() => {
+                (crate::memory::Origin::Main(OWNER_OFF.into()), 0)
+            }
+            Trust::Owner { base, since } => (crate::memory::Origin::Owner { base }, since),
+            Trust::Not(label) => (crate::memory::Origin::Main(label), 0),
+        };
+        let others = move || {
+            let writers = Store::open(&db).and_then(|s| s.writers_since(since));
+            match writers.unwrap_or(true) {
+                true => Some(crate::memory::BESIDE.to_string()),
+                false => procs.stray().map(|comm| stray_label(&comm)),
+            }
+        };
+        let (home, state, digest) = (&self.cfg.home, self.cfg.state_dir(), self.cfg.digest());
+        let done = crate::memory::commit(home, state, origin, digest, others).await;
+        // A change saved at once is in the next child's context, as a rule is.
+        if done.as_ref().is_ok_and(|c| c.auto && c.sha.is_some()) {
+            self.restart = true;
+        }
+        let memory = crate::memory::recorded(&self.store, done);
+        let main = crate::rpc::Tally::main(&self.cfg.home);
+        let tally = std::mem::replace(&mut self.tally, main);
         let crossed = self.record_spend(tally.used).unwrap_or_else(|e| {
             eprintln!("zephyr: recording spend failed: {e:#}");
             false
@@ -2086,6 +2434,25 @@ impl<'a> Router<'a> {
             // `/rule` alone and `/rules` are `memory::command`'s.
             ("/rule", rule) if !rule.is_empty() => {
                 self.owner_set("rule", rule, from.0, |a| a).await
+            }
+            // `/goals`, `/persona` alone and the usages are `memory::command`'s.
+            ("/goal", arg) if matches!(word(arg).0, "add" | "done" | "rm") => {
+                self.owner_set("goal", arg, from.0, |a| a).await
+            }
+            ("/persona", arg) if matches!(word(arg).0, "set" | "clear") => {
+                self.owner_set("persona", arg, from.0, |a| a).await
+            }
+            ("/forget", text) => self.forget(text).await,
+            ("/memory", "squash yes") => {
+                let squashed = crate::memory::squash(&self.cfg.home, self.cfg.state_dir()).await;
+                if squashed.is_ok() {
+                    log(self
+                        .store
+                        .clear_memory_commits()
+                        .map(drop)
+                        .map_err(Into::into));
+                }
+                squashed.unwrap_or_else(|refused| refused)
             }
             ("/new" | "/clear", "") => self.new_session().await,
             ("/switch", "") => self.list_sessions(),
@@ -2342,7 +2709,11 @@ impl<'a> Router<'a> {
         if s.apply == Apply::Facts {
             return Outcome::Refused("change private facts with /facts".into());
         }
-        let (raw, list) = (raw.trim(), matches!(s.apply, Apply::Subagent | Apply::Rule));
+        let list = matches!(
+            s.apply,
+            Apply::Subagent | Apply::Rule | Apply::Goal | Apply::Persona
+        );
+        let raw = raw.trim();
         if until.is_some() && list {
             return Outcome::Refused(format!("a change to {key} cannot be timed"));
         }
@@ -2391,6 +2762,8 @@ impl<'a> Router<'a> {
                 let command = match s.apply {
                     Apply::Subagent => format!("/subagent {raw}"),
                     Apply::Rule => format!("/rule {raw}"),
+                    Apply::Goal => format!("/goal {raw}"),
+                    Apply::Persona => format!("/persona {raw}"),
                     _ => {
                         let span = span.as_ref().map_or(String::new(), |d| format!(" for {d}"));
                         format!("/set {key} {raw}{span}")
@@ -2422,6 +2795,8 @@ impl<'a> Router<'a> {
         let mut before = None;
         // R31: the class time limits an owner's preset ends, as it changes or clears them.
         let mut ended: Vec<String> = Vec::new();
+        // A goal's or the persona's change logs what `memory::Change` says, never the persona.
+        let mut logged = None;
         let applied = match s.apply {
             Apply::Toml => {
                 let model =
@@ -2476,6 +2851,18 @@ impl<'a> Router<'a> {
                 self.restart = true;
                 Reloaded::done(reply)
             }),
+            Apply::Goal | Apply::Persona => {
+                let state = self.cfg.state_dir();
+                let change = match s.apply {
+                    Apply::Goal => crate::memory::goal(state, raw),
+                    _ => crate::memory::persona(state, raw),
+                };
+                change.map(|c| {
+                    self.restart = true;
+                    logged = Some((c.old, c.new));
+                    Reloaded::done(c.reply)
+                })
+            }
             Apply::Facts => Err("change private facts with /facts".into()),
         };
         let applied = match applied {
@@ -2501,6 +2888,7 @@ impl<'a> Router<'a> {
             true => format!("{who} (reload failed)"),
             false => who.to_string(),
         };
+        let (old, new) = logged.unwrap_or((old, new));
         let (o, n) = (old.as_deref(), new.as_deref());
         log((self.store.log_setting(key, o, n, &who, channel, proposal)).map_err(Into::into));
         // A change that did not take effect leaves the time limits as they were.
@@ -2585,6 +2973,9 @@ impl<'a> Router<'a> {
         }
         if matches!(key, "subagent" | "rule") {
             return "[zephyr] change subagents with /subagent and rules with /rule".into();
+        }
+        if matches!(key, "goal" | "persona") {
+            return "[zephyr] change goals with /goal and the persona with /persona".into();
         }
         let min = self.cfg.min_until;
         let until = match until
@@ -2752,6 +3143,15 @@ impl<'a> Router<'a> {
                 Ok(1) => Some("1 rule".into()),
                 Ok(n) => Some(format!("{n} rules")),
             },
+            "goal" => match crate::memory::read_goals(self.cfg.state_dir()).map(|g| g.len()) {
+                Ok(0) | Err(_) => None,
+                Ok(1) => Some("1 goal".into()),
+                Ok(n) => Some(format!("{n} goals")),
+            },
+            // Never the text: replies, the panel and settings_log say only whether there is one.
+            "persona" => (crate::memory::read_persona(self.cfg.state_dir()).ok())
+                .filter(|p| !p.is_empty())
+                .map(|_| "set".into()),
             _ => crate::settings::value(&self.cfg, key),
         }
     }
@@ -2773,6 +3173,15 @@ impl<'a> Router<'a> {
             Apply::Rule => {
                 let rules = crate::memory::read_rules(self.cfg.state_dir()).ok()?;
                 Some(crate::drafts::digest(rules.iter().map(|r| r.as_bytes())))
+            }
+            Apply::Goal | Apply::Persona => {
+                let name = if s.apply == Apply::Goal {
+                    "GOALS.md"
+                } else {
+                    "PERSONA.md"
+                };
+                let text = std::fs::read(self.cfg.state_dir().join(name)).unwrap_or_default();
+                Some(crate::drafts::digest([text.as_slice()]))
             }
             _ => self.shown(key),
         }
@@ -3248,11 +3657,39 @@ impl<'a> Router<'a> {
         let _ = self.store.notify(channel, recipient, text);
     }
 
+    /// `/forget TEXT`: its commit is the owner's, saved at once, and the child restarts at idle so
+    /// its context drops the lines.
+    async fn forget(&mut self, text: &str) -> String {
+        match crate::memory::forget(&self.cfg.home, self.cfg.state_dir(), text).await {
+            Ok(forgot) => {
+                if let Some(sha) = &forgot.sha {
+                    let recorded = self.store.record_memory_commit(sha, "you (/forget)", true);
+                    log(recorded.map_err(Into::into));
+                    self.restart = true;
+                    self.restart_if_idle().await;
+                }
+                forgot.reply
+            }
+            Err(refused) => refused,
+        }
+    }
+
     /// `/new`: a fresh main session from the next message. The old one stays on disk; memory
     /// and the rules carry over, since they are files. Long sessions are easier to steer
     /// (ClawSafety Table 3), so the owner can cut one off.
     async fn new_session(&mut self) -> String {
-        let id = format!("{MAIN_SESSION}-{}", crate::now());
+        let id = new_session_id(&self.store, crate::now());
+        // Clean from its first message; `/switch` back to an older one never cleans it. A file
+        // for the id already there was not rpi's for this conversation.
+        if crate::rpc::SessionPrint::now(&self.cfg.session_dir(), &id, None).exists() {
+            let why = format!(
+                "was already on disk when /new made it at {}",
+                self.clock(crate::now())
+            );
+            self.record_taint(id.clone(), &why);
+        } else if let Err(e) = self.store.mark_clean(&id) {
+            eprintln!("zephyr: marking {id} clean failed: {e}");
+        }
         match self.switch_main(&id).await {
             Ok(when) => format!("[zephyr] new conversation {when}; memory and rules are kept"),
             Err(e) => format!("[zephyr] no new conversation: {e}"),
@@ -3591,7 +4028,7 @@ impl<'a> Router<'a> {
 
     async fn set_thinking(&mut self, level: &str) -> anyhow::Result<()> {
         let set = json!({"type": "set_thinking_level", "level": level});
-        let v = self.call(set).await?;
+        let v = self.call_writing(set).await?;
         self.thinking = Some(v["thinkingLevel"].as_str().unwrap_or(level).into());
         Ok(())
     }
@@ -3602,7 +4039,7 @@ impl<'a> Router<'a> {
         self.child.as_ref()?; // a child that is down starts on the new model anyway
         let (provider, id) = model.split_once('/')?;
         let cmd = json!({"type": "set_model", "provider": provider, "modelId": id});
-        let Err(e) = self.call(cmd).await else {
+        let Err(e) = self.call_writing(cmd).await else {
             self.read_state().await; // the new model's context window
             return None;
         };
@@ -3637,7 +4074,15 @@ impl<'a> Router<'a> {
         }
         self.restart = false;
         if let Some(child) = self.child.take() {
+            // rpi may write the session as it stops: checked before, recorded after.
+            let session = child.session.clone();
+            let since = session
+                .as_ref()
+                .map_or(crate::now(), |s| self.open_window(s));
             child.stop().await;
+            if let Some(s) = &session {
+                self.settle_session(s, since);
+            }
             eprintln!("zephyr: restarting rpi");
         }
         self.respawn_at = Instant::now();
@@ -3657,6 +4102,8 @@ impl<'a> Router<'a> {
             }
             if self.resumes < MAX_RESUMES {
                 self.resumes += 1;
+                // Judged, and the file checked, before rpi starts writing it again.
+                self.begin_run().await;
                 self.call(json!({"type": "resume_pending"})).await?;
                 // Delivered at the resumed run's next step; `reconcile` never takes it for a row.
                 let note = crate::scheduler::RESUME_NOTE;
@@ -3664,7 +4111,6 @@ impl<'a> Router<'a> {
                 self.call(note).await?;
                 self.note_pending = true;
                 self.busy = true;
-                self.run_start = Some(Instant::now());
                 return Ok(());
             }
             for row in &rows {
@@ -3865,7 +4311,8 @@ impl<'a> Router<'a> {
         }
         if self.busy {
             // Cut off: book what the run did so far.
-            let tally = std::mem::take(&mut self.tally);
+            let main = crate::rpc::Tally::main(&self.cfg.home);
+            let tally = std::mem::replace(&mut self.tally, main);
             log(self.record_spend(tally.used).map(drop));
             let to = self.store.last_owner().ok().flatten();
             crate::tools::apply(&self.store, &self.cfg, &tally.requests, to);
@@ -3991,7 +4438,7 @@ impl<'a> Router<'a> {
         {
             navigate["targetId"] = json!(id);
         }
-        let moved = self.call(navigate).await.map_err(|e| failed(&e))?;
+        let moved = self.call_writing(navigate).await.map_err(|e| failed(&e))?;
         if moved["outcome"] != "completed" {
             return Err(failed(&format!("rpi answered {moved}")));
         }
@@ -4022,6 +4469,11 @@ impl<'a> Router<'a> {
                 Err(e) => return format!("[zephyr] undone, but not sent again: {e}"),
             }
         };
+        // The retried text is the original row's, so it is the owner's only if that row was; a
+        // failed copy leaves it zephyr's.
+        if let Err(e) = self.store.copy_owner(row.id, id) {
+            eprintln!("zephyr: marking the /retry row failed: {e}");
+        }
         // Dispatched from the loop, as a task's report is: this `/retry` row is still `new`.
         self.jobs.inbox.notify_one();
         format!("[zephyr] undone; sending your last message again as #{id}")
@@ -4037,11 +4489,14 @@ impl<'a> Router<'a> {
         if !instructions.is_empty() {
             cmd["customInstructions"] = json!(instructions);
         }
+        // The run's start is judged, and the file checked, before rpi starts writing it.
+        self.begin_run().await;
         if let Err(e) = self.call(cmd).await {
+            // `run_since` stays: rpi may have started the run before it answered.
+            self.run_start = None;
             return format!("[zephyr] /compact failed: {e:#}");
         }
         self.busy = true;
-        self.run_start = Some(Instant::now());
         self.compacting = Some((from.0.into(), from.1.into()));
         String::new()
     }
@@ -4099,6 +4554,90 @@ impl<'a> Router<'a> {
 }
 
 /// The first word of `s` and the rest, both trimmed; a line break ends a word too.
+/// The label of an owner's run while a stray of the agent's lives (`Procs::stray`): what it is,
+/// and that `/stop` ends it.
+fn stray_label(comm: &str) -> String {
+    let (what, cure) = stray_phrase(comm);
+    format!("your message, while {what}; {cure}")
+}
+
+/// A stray (`Procs::stray`) as the owner reads it, and what ends it.
+fn stray_phrase(comm: &str) -> (String, &'static str) {
+    if comm == crate::procs::UNSEEN {
+        return (
+            "zephyr could not see all of the agent's processes".into(),
+            "/stop ends what it can",
+        );
+    }
+    let lower = comm.to_ascii_lowercase();
+    if ["chrom", "agent-browser", "firefox", "camoufox"]
+        .iter()
+        .any(|b| lower.contains(b))
+    {
+        return (
+            "the agent's browser was still open".into(),
+            "/stop closes it",
+        );
+    }
+    (
+        format!("the agent's {comm} was still running on its own"),
+        "/stop ends it",
+    )
+}
+
+/// What else of the agent's could write while main's child or run did.
+enum Beside {
+    /// A job run, task or process (`Store::writers_since`).
+    Work,
+    /// A process of the agent's outside every tracked group, by command name.
+    Stray(String),
+}
+
+/// The id `/new` gives a conversation: `main-<unix seconds>`, past any id zephyr already gave
+/// one (a `/new` in the same second, or the one in use), so a second `/new` never reopens the
+/// first's file. A file for an id zephyr never gave is not skipped: `new_session` taints it.
+fn new_session_id(store: &Store, now: i64) -> String {
+    let current = store.main_session().ok();
+    let known = |id: &str| {
+        current.as_deref() == Some(id)
+            || !matches!(store.session_origin(id), Ok(SessionOrigin::Unknown))
+    };
+    (now..)
+        .map(|t| format!("{MAIN_SESSION}-{t}"))
+        .find(|id| !known(id))
+        .expect("an unused id")
+}
+
+/// Whether the current run of main is the owner's alone (DESIGN §4.6).
+#[derive(Debug)]
+enum Trust {
+    /// Started on a clean conversation, a clean memory base and nothing else running.
+    Owner { base: String, since: i64 },
+    /// Why it is not: the waiting notice's `(from …)`.
+    Not(String),
+}
+
+/// The label of an owner's run while `memory.auto` is off: it waits, from where it came.
+const OWNER_OFF: &str = "your message";
+
+/// `Trust::Not`'s label for a run zephyr did not see start (`begin_run`).
+const UNSEEN_RUN: &str = "your message, but zephyr did not see the run start";
+
+/// `Trust::Not`'s label while a run cut off by a restart could not be placed (`taint_cut_off`).
+const UNPLACED: &str =
+    "your message, but zephyr could not tell which conversation a restart cut off";
+
+/// What taking in an inbox row that is not the owner's means for the conversation, named by its
+/// platform id when zephyr knows what wrote it (a task's or process's report, an action's result).
+fn daemon_row(platform_id: &str) -> String {
+    match platform_id.split_once('-') {
+        Some(("task", n)) => format!("took in task #{n}'s report"),
+        Some(("proc", n)) => format!("took in process #{n}'s report"),
+        Some(("action", n)) => format!("took in action #{n}'s result"),
+        _ => "took in a message zephyr wrote".into(),
+    }
+}
+
 fn word(s: &str) -> (&str, &str) {
     let s = s.trim();
     s.split_once(char::is_whitespace)
@@ -4536,6 +5075,8 @@ mod tests {
             sender: "s".into(),
             text: text.into(),
             tries: 0,
+            platform_id: "p".into(),
+            owner: true,
         };
         for text in ["hi", "", "[a #1] nested\nlines"] {
             assert_eq!(
@@ -4590,5 +5131,77 @@ mod tests {
         assert_eq!(preview("a\n\n b"), "a b");
         assert_eq!(preview(&"é".repeat(61)), format!("{}…", "é".repeat(60)));
         assert_eq!(preview(&"é".repeat(60)), "é".repeat(60));
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_run_zephyr_cannot_place_stops_auto_approve_until_restart() {
+        let cfg = on_file("router-cut-off-unplaced", "");
+        let jobs = Default::default();
+        let mut r = router(&cfg, &jobs);
+        let m = Inbound {
+            channel: "chat".into(),
+            platform_msg_id: "a".into(),
+            sender: "owner".into(),
+            text: "in flight".into(),
+        };
+        let id = r.store.insert_inbox(&m).unwrap().unwrap();
+        r.store.mark_dispatched(id).unwrap();
+        // The main session's id cannot be read.
+        rusqlite::Connection::open(cfg.db_path())
+            .unwrap()
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('main_session', X'ff')",
+                [],
+            )
+            .unwrap();
+        r.taint_cut_off();
+        assert_eq!(
+            r.store.session_origin("main").unwrap(),
+            SessionOrigin::Clean,
+            "never a guess at main"
+        );
+        r.begin_run().await;
+        assert!(
+            matches!(&r.trust, Trust::Not(why) if why == UNPLACED),
+            "{:?}",
+            r.trust
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_session_id_skips_every_conversation_zephyr_knows() {
+        let cfg = on_file("router-session-ids", "");
+        let jobs = Default::default();
+        let r = router(&cfg, &jobs);
+        assert_eq!(new_session_id(&r.store, 100), "main-100");
+        r.store.mark_clean("main-100").unwrap();
+        r.store.taint("main-101", "used exec at 00:00").unwrap();
+        assert_eq!(new_session_id(&r.store, 100), "main-102");
+        r.store.set_main_session("main-102").unwrap();
+        assert_eq!(
+            new_session_id(&r.store, 100),
+            "main-103",
+            "nor the current one"
+        );
+    }
+
+    #[test]
+    fn a_stray_is_named_with_what_ends_it() {
+        assert_eq!(
+            stray_label("chrome"),
+            "your message, while the agent's browser was still open; /stop closes it"
+        );
+        assert_eq!(
+            stray_label("agent-browser"),
+            "your message, while the agent's browser was still open; /stop closes it"
+        );
+        assert_eq!(
+            stray_label("sleep"),
+            "your message, while the agent's sleep was still running on its own; /stop ends it"
+        );
+        assert_eq!(
+            stray_label(crate::procs::UNSEEN),
+            "your message, while zephyr could not see all of the agent's processes; /stop ends what it can"
+        );
     }
 }

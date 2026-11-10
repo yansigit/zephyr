@@ -28,6 +28,7 @@ pub mod pool;
 pub mod procs;
 pub mod reload;
 pub mod retention;
+pub mod review;
 pub mod router;
 pub mod rpc;
 pub mod scheduler;

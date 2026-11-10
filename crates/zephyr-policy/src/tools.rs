@@ -32,6 +32,8 @@ pub const GATEWAY_COMMANDS: &[&str] = &[
     "/model",
     "/switch",
     "/rules",
+    "/goals",
+    "/persona",
     "/memory diff",
     "/memory log",
     "/job list",
@@ -72,6 +74,23 @@ fn plain_text(s: &str) -> bool {
         && !s
             .chars()
             .any(|c| c.is_control() || turns(c) || matches!(c, '\u{2028}' | '\u{2029}'))
+}
+
+/// A persona the owner reads whole on a card: as [`plain_text`], but over several lines.
+fn persona_text(s: &str) -> bool {
+    !s.trim().is_empty()
+        && !s.chars().any(|c| {
+            (c.is_control() && c != '\n') || turns(c) || matches!(c, '\u{2028}' | '\u{2029}')
+        })
+}
+
+/// `/goal add TEXT`, `/goal done N` and `/goal rm N`.
+fn goal_shape(arg: &str) -> bool {
+    match arg.split_once(' ') {
+        Some(("add", text)) => plain_text(text),
+        Some(("done" | "rm", n)) => !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()),
+        _ => false,
+    }
 }
 
 /// `/set KEY VALUE` or `/set KEY VALUE for D`, with a registry-shaped key, one printable word of
@@ -134,7 +153,8 @@ fn facts_shape(arg: &str) -> bool {
 
 /// `Some` for a command the agent may send through `gateway`, in these exact shapes only:
 /// [`GATEWAY_COMMANDS`] and `/settings WORDS` are read; `/set KEY VALUE [for D]` is a [`Gateway::Set`];
-/// `/subagent add|prompt|model|rm …` and `/rule …` are proposed, `/facts add|rm|allow …` too (`add` the daemon applies at once), like `/model PROVIDER/MODEL`, `/new`, `/switch ID`, `/pause` and
+/// `/subagent add|prompt|model|rm …`, `/rule …`, `/goal add|done|rm …` and `/persona set …|clear`
+/// are proposed (a persona may span lines), `/facts add|rm|allow …` too (`add` the daemon applies at once), like `/model PROVIDER/MODEL`, `/new`, `/switch ID`, `/pause` and
 /// `/reload` are proposed. Approvals, and `/stop`, are neither. The argument is one printable
 /// ASCII word, so the owner's approval notice shows exactly what would run.
 pub fn gateway_kind(command: &str) -> Option<Gateway> {
@@ -166,7 +186,14 @@ pub fn gateway_kind(command: &str) -> Option<Gateway> {
         }
         "/set" => return set_shape(arg).then_some(Gateway::Set),
         // The card shows the whole command, `/rule ` and all, in CARD_CHARS.
-        "/subagent" | "/rule" if command.chars().count() > CARD_CHARS => return None,
+        "/subagent" | "/rule" | "/goal" | "/persona" if command.chars().count() > CARD_CHARS => {
+            return None
+        }
+        "/goal" => return goal_shape(arg).then_some(Gateway::Propose),
+        "/persona" => {
+            let ok = arg == "clear" || arg.strip_prefix("set ").is_some_and(persona_text);
+            return ok.then_some(Gateway::Propose);
+        }
         "/subagent" => return subagent_shape(arg).then_some(Gateway::Propose),
         "/rule" => return plain_text(arg).then_some(Gateway::Propose),
         // `add` is carried out at once by the daemon (it only makes calls stricter); `rm` and
@@ -1287,6 +1314,34 @@ mod tests {
             "/facts allow mail mum@example.com",
         ] {
             assert_eq!(gateway_kind(facts), Some(Gateway::Propose), "{facts}");
+        }
+    }
+
+    #[test]
+    fn gateway_reads_goals_and_persona_and_proposes_their_changes() {
+        for read in ["/goals", "/persona"] {
+            assert_eq!(gateway_kind(read), Some(Gateway::Read), "{read}");
+        }
+        for propose in [
+            "/goal add Run a 10k by June",
+            "/goal done 2",
+            "/goal rm 1",
+            "/persona set Warm.\nBrief.",
+            "/persona clear",
+        ] {
+            assert_eq!(gateway_kind(propose), Some(Gateway::Propose), "{propose:?}");
+        }
+        let long = format!("/persona set {}", "x".repeat(1490));
+        for refused in [
+            "/goal done two",
+            "/goal add",
+            "/goal add a\nb",
+            "/persona set a\u{202e}b",
+            long.as_str(),
+            "/forget tea",
+            "/memory squash yes",
+        ] {
+            assert_eq!(gateway_kind(refused), None, "{refused:?}");
         }
     }
 

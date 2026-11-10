@@ -519,7 +519,7 @@ async fn cancelling_a_waiting_login_kills_its_child_and_records_nothing() {
     assert!(
         children
             .iter()
-            .any(|p| cmdline_of(*p).starts_with("script")),
+            .any(|p| cmdline_of(*p).starts_with("/usr/bin/script")),
         "a login runs under a pty: {children:?}"
     );
 

@@ -96,6 +96,10 @@ pub enum Apply {
     Thinking,
     Subagent,
     Rule,
+    /// The owner's goals, `<state>/GOALS.md` (`memory::goal`).
+    Goal,
+    /// The owner's persona, `<state>/PERSONA.md` (`memory::persona`).
+    Persona,
     /// Private facts (approvals spec A1).
     Facts,
     /// `approvals.preset`: the preset and the hand-set values it drops, in one update
@@ -354,6 +358,64 @@ pub static SETTINGS: &[Setting] = &[
         false,
         Stricter::NotOrdered,
         Apply::Rule,
+    ),
+    row(
+        "goal",
+        "Goals and review",
+        "Goals",
+        "Goals the agent keeps in mind in every run: /goal add, done, rm.",
+        Kind::Text { max: 500 },
+        Access::Propose,
+        false,
+        Stricter::NotOrdered,
+        Apply::Goal,
+    ),
+    row(
+        "review.at",
+        "Goals and review",
+        "Daily review",
+        "When the daily review of the goals, the day's activity and memory is sent, HH:MM in \
+         the time zone; none is off.",
+        Kind::Optional(&Kind::Text { max: 5 }),
+        Access::Propose,
+        false,
+        Stricter::NotOrdered,
+        Apply::Toml,
+    ),
+    row(
+        "memory.auto",
+        "Memory",
+        "Save at once",
+        "off: every memory change waits for /memory ok; owner: one zephyr saw came only from \
+         you is saved at once. Off is the safer choice.",
+        Kind::Choice(&["off", "owner"]),
+        Access::Tighten,
+        true,
+        Stricter::Earlier,
+        Apply::Toml,
+    ),
+    row(
+        "memory.notify",
+        "Memory",
+        "Memory notices",
+        "each: you are sent each memory change after its run; digest: the daily review lists \
+         them instead (needs review.at).",
+        Kind::Choice(&["each", "digest"]),
+        Access::Tighten,
+        false,
+        Stricter::Earlier,
+        Apply::Toml,
+    ),
+    row(
+        "persona",
+        "Memory",
+        "Persona",
+        "Who the agent is with you, in every run: /persona set, clear.",
+        Kind::Text { max: 4000 },
+        Access::Propose,
+        false,
+        Stricter::NotOrdered,
+        Apply::Persona,
     ),
     row(
         "facts",
@@ -867,6 +929,9 @@ pub fn value(cfg: &Config, key: &str) -> Option<String> {
         "budget.run_turns" => budget?.run_turns.map(|v| v.to_string()),
         "budget.run_minutes" => budget?.run_minutes.map(|v| v.to_string()),
         "timezone" => cfg.timezone.clone(),
+        "review.at" => cfg.review_at().map(String::from),
+        "memory.notify" => Some(cfg.memory_notify().into()),
+        "memory.auto" => Some(cfg.memory_auto().into()),
         "auth.enabled" => Some(cfg.auth.enabled.to_string()),
         "auth.refresh_minutes" => Some(cfg.auth.refresh_minutes.to_string()),
         "settings.strong_channels" => Some(cfg.settings.strong_channels.join(", ")),
@@ -1203,6 +1268,8 @@ fn allowed(s: &Setting) -> String {
             "/subagent add NAME [PROVIDER/MODEL] PROMPT, model, prompt, rm".into()
         }
         (Apply::Rule, _) => "/rule TEXT, /rule rm N".into(),
+        (Apply::Goal, _) => "/goal add TEXT, /goal done N, /goal rm N".into(),
+        (Apply::Persona, _) => "/persona set TEXT, /persona clear".into(),
         (Apply::Facts, _) => {
             "/facts rm NAME, /facts allow NAME TARGET, /facts disallow NAME TARGET".into()
         }

@@ -24,7 +24,9 @@ A prompt containing WRITE_MEMORY first writes memory/MEMORY.md under the home.
 argv.json holds the argv of the latest start. With a `tool_sleep` file in the home, each start
 leaves a `sleep 300` running in its process group, as a tool would, its pid in `tool_pid`. With a
 `stray` file, each start leaves a `setsid sleep 300` that escaped through a shell that exited (an
-orphan in its own session, as an agent's `setsid cmd &` is), its pid in `stray_pid`.
+orphan in its own session, as an agent's `setsid cmd &` is), its pid in `stray_pid`. A `stray_soon`
+file (seconds) makes the next `get_messages` leave one that lives that long instead, the file
+removed and its pid in `stray_soon_pid`: a stray that comes between runs and ends before the next settles.
 A prompt containing `bash: CMD` first reports a bash tool call running CMD (tool_execution_start,
 then its tool_execution_end, as rpi does; nothing is run).
 With `--no-tools` (a /btw child) none of the tool markers below (`bash: `, `[tool]`, `[call ...]`)
@@ -127,7 +129,7 @@ if "--version" in args:
     print("rpi 0.21.2"); sys.exit(0)
 CATALOG = ["fake/m1", "fake/m2", "other/m3", "opencode-go/alpha"]
 # zephyr_policy::tools::GATEWAY_COMMANDS
-GATEWAY_COMMANDS = ["/status", "/model", "/switch", "/rules", "/memory diff", "/memory log", "/job list", "/settings", "/approvals", "/facts"]
+GATEWAY_COMMANDS = ["/status", "/model", "/switch", "/rules", "/goals", "/persona", "/memory diff", "/memory log", "/job list", "/settings", "/approvals", "/facts"]
 def gateway_kind(c):
     """zephyr_policy::tools::gateway_kind: "read", "set", "propose" or None."""
     if c in GATEWAY_COMMANDS:
@@ -155,8 +157,17 @@ def gateway_kind(c):
         ok = (len(w) == 2 and key(w[0]) and val(w[1])) or (
             len(w) == 4 and w[2] == "for" and key(w[0]) and val(w[1]) and span(w[3]))
         return "set" if ok else None
-    if cmd in ("/subagent", "/rule") and len(c) > 1500:
+    if cmd in ("/subagent", "/rule", "/goal", "/persona") and len(c) > 1500:
         return None
+    if cmd == "/goal":
+        verb, _, rest = arg.partition(" ")
+        ok = (verb == "add" and plain(rest)) or (
+            verb in ("done", "rm") and re.fullmatch(r"[0-9]+", rest) is not None)
+        return "propose" if ok else None
+    if cmd == "/persona":
+        text = arg[len("set "):] if arg.startswith("set ") else None
+        ok = arg == "clear" or (text is not None and plain(text.replace("\n", " ")))
+        return "propose" if ok else None
     if cmd == "/subagent":
         verb, _, rest = arg.partition(" ")
         rest = rest.lstrip(" ")
@@ -441,6 +452,13 @@ def quick(cmd, s):
     if refused(cmd):
         pass
     elif kind == "get_messages":
+        soon = os.path.join(home, "stray_soon")
+        if os.path.exists(soon):
+            import subprocess
+            secs = open(soon).read().strip() or "1"
+            os.remove(soon)
+            subprocess.run(["sh", "-c", "setsid sleep %s </dev/null >/dev/null 2>&1 & echo $! > stray_soon_pid" % secs],
+                           cwd=home, check=True)
         respond(cmd, {"messages": s["messages"], "total": len(s["messages"]), "pendingResume": s["pending"]})
     elif kind == "get_commands":
         names = ["zephyr-policy"] if extension and os.path.exists(extension) else []

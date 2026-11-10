@@ -180,6 +180,8 @@ COPY --from=browser /out/bin/agent-browser /opt/zephyr/libexec/agent-browser
 COPY --from=python /opt/zephyr/py/ /opt/zephyr/py/
 COPY --from=python /opt/zephyr/camoufox/ /opt/zephyr/camoufox/
 COPY --from=python /usr/local/bin/uv /usr/local/bin/uv
+# The desktop's window manager config, root's (DESIGN §4.6): openbox never reads the agent's.
+COPY deploy/openbox/ /opt/zephyr/openbox/
 # `/opt/zephyr/gate/bin` (root's, 0755, holding only the browser wrapper) is first on the
 # agent's PATH (agent::AGENT_PATH), so an agent-browser the agent drops in its own bin does
 # not shadow it; `zephyr doctor` checks the layout.

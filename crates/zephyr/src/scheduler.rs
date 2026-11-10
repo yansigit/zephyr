@@ -173,6 +173,14 @@ fn parse_cron(schedule: &str) -> Result<croner::Cron, String> {
     parser.parse(schedule).map_err(|e| e.to_string())
 }
 
+/// After a review run: `review.at` may have been turned off while it ran (`review::sync` could
+/// only turn the job off then), so the row goes now.
+fn resync_review(store: &mut Store, cfg: &Config) {
+    if let Err(e) = crate::review::sync(store, cfg) {
+        eprintln!("zephyr: keeping the daily review job in step failed: {e:#}");
+    }
+}
+
 /// Runs until an error opening the store; per-run errors are logged and the loop goes on.
 /// `cfgs` carries each reloaded config; a run started before a reload finishes on the old one.
 pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow::Result<()> {
@@ -181,6 +189,9 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
     let mut store = Store::open(&cfg.db_path())?;
     if store.interrupt_running_runs(crate::now())? > 0 {
         wake.outbox.notify_one();
+    }
+    if let Err(e) = crate::review::sync(&mut store, &cfg) {
+        eprintln!("zephyr: keeping the daily review job in step failed: {e:#}");
     }
     let mut tick = tokio::time::interval(TICK);
     let mut poll = tokio::time::interval(PAUSE_POLL);
@@ -196,6 +207,9 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
         if cfgs.has_changed().unwrap_or(false) {
             cfg = cfgs.borrow_and_update().clone();
             tz = zone(&cfg)?; // checked by Config::validate
+            if let Err(e) = crate::review::sync(&mut store, &cfg) {
+                eprintln!("zephyr: keeping the daily review job in step failed: {e:#}");
+            }
         }
         // Hourly, from the first tick on: leftovers older than 30 days (DESIGN §4.1).
         // On a blocking thread with its own connection, one at a time: it walks dirs and runs
@@ -225,7 +239,7 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
             eprintln!("zephyr: claiming job runs failed: {e}");
         }
         while !paused(&store) {
-            let run = match store.start_next_run(crate::now()) {
+            let mut run = match store.start_next_run(crate::now()) {
                 Ok(Some(run)) => run,
                 Ok(None) => break,
                 Err(e) => {
@@ -233,9 +247,33 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
                     break;
                 }
             };
+            // The daily review sends the daemon's block first; the model is asked only when
+            // there are goals (DESIGN §4.5).
+            let prompt = match run.job.builtin.as_deref() {
+                Some("review") => {
+                    match crate::review::prepare(&cfg, &mut store, &mut run, crate::now()) {
+                        crate::review::Step::Run(prompt) => prompt,
+                        step => {
+                            let (status, output) = match step {
+                                crate::review::Step::Failed(why) => ("failed", why),
+                                _ => ("completed", SILENT.to_string()),
+                            };
+                            if let Err(e) =
+                                store.finish_run(&run, status, &output, None, crate::now())
+                            {
+                                eprintln!("zephyr: recording job run {} failed: {e}", run.id);
+                            }
+                            resync_review(&mut store, &cfg);
+                            wake.outbox.notify_one();
+                            continue;
+                        }
+                    }
+                }
+                _ => run.job.prompt.clone(),
+            };
             wake.running.store(true, Ordering::SeqCst);
             let spec = Spec {
-                prompt: &run.job.prompt,
+                prompt: &prompt,
                 goal: &run.job.prompt,
                 label: format!(
                     "[zephyr] job #{} ({}) run {}",
@@ -252,15 +290,21 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
             let (status, output, crossed) = execute(&cfg, &mut store, &spec).await;
             wake.running.store(false, Ordering::SeqCst);
             // The run's memory edits are committed as main's settle would commit them.
-            let memory = crate::memory::commit(&cfg.home, cfg.state_dir())
-                .await
-                .unwrap_or_else(|e| {
-                    eprintln!("zephyr: memory commit failed: {e:#}");
-                    None
-                });
+            let origin = crate::memory::Origin::Job {
+                id: run.job.id,
+                run: run.id,
+                name: run.job.name.clone(),
+            };
+            let done =
+                crate::memory::commit(&cfg.home, cfg.state_dir(), origin, cfg.digest(), || None)
+                    .await;
+            let memory = crate::memory::recorded(&store, done);
             let delivery = (output.trim() != SILENT).then_some(output.as_str());
             if let Err(e) = store.finish_run(&run, status, &output, delivery, crate::now()) {
                 eprintln!("zephyr: recording job run {} failed: {e}", run.id);
+            }
+            if run.job.builtin.is_some() {
+                resync_review(&mut store, &cfg);
             }
             if let Some(notice) = memory {
                 if let Err(e) = store.notify(&run.job.channel, &run.job.recipient, &notice) {
@@ -912,6 +956,14 @@ pub fn command(store: &mut Store, cfg: &Config, m: &Inbound) -> Option<String> {
     let (verb, arg) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     let arg = arg.trim();
     let id = arg.parse::<i64>();
+    // The daily review is `review.at`'s: `/job run` runs it, nothing else here changes it.
+    if let (&Ok(id), "rm" | "ok") = (&id, verb) {
+        if matches!(store.job(id), Ok(Some(job)) if job.builtin.is_some()) {
+            return Some(format!(
+                "[zephyr] job #{id} is the daily review; /set review.at none turns it off"
+            ));
+        }
+    }
     let reply = match (verb, id) {
         ("add", _) => match zone(cfg) {
             Ok(tz) => add(store, &tz, m, arg),
@@ -978,6 +1030,12 @@ pub(crate) fn list(store: &Store) -> rusqlite::Result<String> {
     let lines: Vec<String> = jobs
         .iter()
         .map(|j| {
+            if j.builtin.is_some() {
+                // `M H * * *`, as `review::sync` writes it.
+                let mut f = j.schedule.split(' ').map(|n| n.parse::<u32>().unwrap_or(0));
+                let (m, h) = (f.next().unwrap_or(0), f.next().unwrap_or(0));
+                return format!("#{} {} (built-in, review.at {h:02}:{m:02})", j.id, j.name);
+            }
             format!(
                 "#{} {} | {} | {} | to {}{}",
                 j.id,

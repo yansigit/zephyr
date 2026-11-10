@@ -47,9 +47,11 @@ struct Gateway {
 /// block of 30, by pid.
 fn free_port() -> u16 {
     static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-    let block = 20_000 + (std::process::id() % 400) as u16 * 30;
+    // A block per test process, wider than this file's tests: a port handed out twice could go
+    // to a second gateway while the first has yet to bind it.
+    let block = 20_000 + (std::process::id() % 400) as u16 * 100;
     loop {
-        let port = block + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 30;
+        let port = block + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100;
         if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return port;
         }
@@ -124,7 +126,8 @@ impl Gateway {
         std::fs::read_to_string(self.home.join("log.jsonl"))
             .unwrap_or_default()
             .lines()
-            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            // The fake may be halfway through its last line.
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
             .filter(|v| v["type"] == kind)
             .collect()
     }
@@ -919,6 +922,16 @@ async fn zephyr_vault_methods_save_list_and_remove_without_echoing_a_value() {
     assert!(!std::fs::read_to_string(gw.home.join("log.jsonl"))
         .unwrap()
         .contains(PASSWORD));
+    // The notice is zephyr's text, not the owner's: its row is no owner's (DESIGN §4.6).
+    let owner: i64 = rusqlite::Connection::open(gw.home.join("state.db"))
+        .unwrap()
+        .query_row(
+            "SELECT owner FROM inbox WHERE text LIKE '%in the vault; you can use it now'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner, 0);
 
     // A refusal names the problem, never the value.
     let bad = json!({"kind": "token", "name": "lower", "value": PASSWORD});
@@ -1215,6 +1228,31 @@ async fn settings_name_each_connector_row() {
             row("mcp.notes.enabled", "Connector notes enabled"),
         ]
     );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn goals_lists_open_and_recently_done_goals() {
+    let gw = start("goals");
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    let empty = c.call("zephyr.goals", json!({})).await;
+    assert_eq!(empty["result"], json!({"goals": []}), "{empty}");
+    gw.say("m1", "/goal add Renew passport").await;
+    gw.say("m2", "/goal add Ship zephyr 0.8").await;
+    gw.say("m3", "/goal done 1").await;
+    let goals = gw.home.join("GOALS.md");
+    wait(|| std::fs::read_to_string(&goals).is_ok_and(|g| g == "Ship zephyr 0.8\n")).await;
+    let got = c.call("zephyr.goals", json!({})).await;
+    assert_eq!(
+        got,
+        json!({"jsonrpc": "2.0", "id": got["id"], "result": {"goals": [
+            {"n": 1, "text": "Ship zephyr 0.8", "done": false},
+            {"n": null, "text": "Renew passport", "done": true}]}})
+    );
+    // Params may be absent.
+    let bare = c.call("zephyr.goals", Value::Null).await;
+    assert_eq!(bare["result"], got["result"]);
     gw.shutdown().await;
 }
 

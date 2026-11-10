@@ -92,10 +92,11 @@ async fn one(cfg: Arc<Config>, mut store: Store, task: Task, wake: &Wake) {
     let report = cut(&cfg, task.id, &output);
     let (channel, recipient) = (&task.channel, &task.recipient);
     // The task's memory edits are committed as main's settle would commit them.
-    match crate::memory::commit(&cfg.home, cfg.state_dir()).await {
-        Ok(Some(notice)) => log(store.notify(channel, recipient, &notice)),
-        Ok(None) => {}
-        Err(e) => eprintln!("zephyr: memory commit failed: {e:#}"),
+    let origin = crate::memory::Origin::Task(task.id);
+    let done =
+        crate::memory::commit(&cfg.home, cfg.state_dir(), origin, cfg.digest(), || None).await;
+    if let Some(notice) = crate::memory::recorded(&store, done) {
+        log(store.notify(channel, recipient, &notice));
     }
     for notice in crate::drafts::scan(&cfg) {
         log(store.notify(channel, recipient, &notice));

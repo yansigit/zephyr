@@ -5,6 +5,7 @@ use crate::config::{Account, Config};
 use anyhow::{anyhow, bail, Context};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -108,6 +109,215 @@ fn session_file(dir: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
         .filter(|f| f.0 == id)
         .max_by_key(|f| f.2)
         .map(|f| f.1)
+}
+
+/// One saved file as zephyr last saw it: its length, inode, change and modification times and
+/// SHA-256. The change time cannot be set back by the agent, so a file whose length, inode and
+/// both times are as recorded is not hashed again.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FilePrint {
+    len: u64,
+    ino: u64,
+    ctime: (i64, i64),
+    mtime: (i64, i64),
+    hash: String,
+    /// When it was hashed, in unix seconds.
+    seen: i64,
+}
+
+/// The same file as seen, whenever it was hashed.
+impl PartialEq for FilePrint {
+    fn eq(&self, o: &FilePrint) -> bool {
+        (self.len, self.ino, self.ctime, self.mtime, &self.hash)
+            == (o.len, o.ino, o.ctime, o.mtime, &o.hash)
+    }
+}
+
+impl Eq for FilePrint {}
+
+/// A file that is there but not a plain file zephyr can read whole: a link, a folder, one that
+/// changed while it was read.
+#[derive(Debug)]
+struct Bad;
+
+/// `path`'s metadata, `None` when there is no file, `Bad` when it is not a plain file.
+fn plain(path: &std::path::Path) -> Result<Option<std::fs::Metadata>, Bad> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(m) if m.is_file() => Ok(Some(m)),
+        _ => Err(Bad),
+    }
+}
+
+/// `path`'s bytes, read whole between two looks that agree: what was read is what is there.
+fn read_whole(path: &std::path::Path, m: &std::fs::Metadata) -> Result<Vec<u8>, Bad> {
+    let bytes = std::fs::read(path).map_err(|_| Bad)?;
+    let after = plain(path)?.ok_or(Bad)?;
+    let key = |m: &std::fs::Metadata| {
+        use std::os::unix::fs::MetadataExt;
+        (m.len(), m.ino(), m.ctime(), m.ctime_nsec())
+    };
+    match bytes.len() as u64 == m.len() && key(m) == key(&after) {
+        true => Ok(bytes),
+        false => Err(Bad),
+    }
+}
+
+fn hex(ctx: ring::digest::Context) -> String {
+    data_encoding::HEXLOWER.encode(ctx.finish().as_ref())
+}
+
+impl FilePrint {
+    /// Whether the file `m` describes is the one this hashed, as far as its length, inode and
+    /// both times tell, and it was hashed more than a second after its last change.
+    fn unchanged(&self, m: &std::fs::Metadata) -> bool {
+        let now = FilePrint::with(m, String::new(), 0);
+        (self.len, self.ino, self.ctime, self.mtime) == (now.len, now.ino, now.ctime, now.mtime)
+            && self.seen > self.ctime.0 + 1
+    }
+
+    fn with(m: &std::fs::Metadata, hash: String, seen: i64) -> FilePrint {
+        use std::os::unix::fs::MetadataExt;
+        FilePrint {
+            len: m.len(),
+            ino: m.ino(),
+            ctime: (m.ctime(), m.ctime_nsec()),
+            mtime: (m.mtime(), m.mtime_nsec()),
+            hash,
+            seen,
+        }
+    }
+
+    /// `path` now (`None`: no file); `prior`'s hash is reused only when nothing else about the
+    /// file differs and it was hashed more than a second after its last change: file times tick
+    /// coarsely, so a write in the same tick as the one hashed would keep them.
+    fn of(path: &std::path::Path, prior: Option<&FilePrint>) -> Result<Option<FilePrint>, Bad> {
+        let Some(m) = plain(path)? else {
+            return Ok(None);
+        };
+        if let Some(p) = prior.filter(|p| p.unchanged(&m)) {
+            return Ok(Some(FilePrint::with(&m, p.hash.clone(), p.seen)));
+        }
+        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+        ctx.update(&read_whole(path, &m)?);
+        Ok(Some(FilePrint::with(&m, hex(ctx), crate::now())))
+    }
+}
+
+/// What session `id`'s saved files are (DESIGN §4.6): how many there are, the newest one's path,
+/// and its and its `.progress.jsonl`'s prints. No file at all is the `Default`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionPrint {
+    count: usize,
+    path: Option<String>,
+    file: Option<FilePrint>,
+    progress: Option<FilePrint>,
+    /// One of them is there but not a plain file zephyr could read whole.
+    #[serde(default)]
+    bad: bool,
+}
+
+impl SessionPrint {
+    /// Session `id`'s files, and the newest one's and its companion's paths.
+    fn files(
+        dir: &std::path::Path,
+        id: &str,
+    ) -> (usize, Option<(std::path::PathBuf, std::path::PathBuf)>) {
+        let files: Vec<_> = (main_files(dir).into_iter())
+            .filter(|f| f.0 == id)
+            .collect();
+        let newest = files.iter().max_by_key(|f| f.2).map(|f| {
+            let progress = format!("{}.progress.jsonl", f.1.display());
+            (f.1.clone(), std::path::PathBuf::from(progress))
+        });
+        (files.len(), newest)
+    }
+
+    /// Session `id` now, hashing only what differs from `prior`.
+    pub fn now(dir: &std::path::Path, id: &str, prior: Option<&SessionPrint>) -> SessionPrint {
+        let (count, newest) = SessionPrint::files(dir, id);
+        let Some((file, progress)) = newest else {
+            return SessionPrint::default();
+        };
+        let _fs = crate::agent::fs();
+        let path = file.display().to_string();
+        // A print of another file is no help.
+        let prior = prior.filter(|p| p.path.as_deref() == Some(path.as_str()));
+        let file = FilePrint::of(&file, prior.and_then(|p| p.file.as_ref()));
+        let progress = FilePrint::of(&progress, prior.and_then(|p| p.progress.as_ref()));
+        let bad = !matches!(file, Ok(Some(_))) || progress.is_err();
+        SessionPrint {
+            count,
+            path: Some(path),
+            file: file.ok().flatten(),
+            progress: progress.ok().flatten(),
+            bad,
+        }
+    }
+
+    /// Whether there is any file.
+    pub fn exists(&self) -> bool {
+        self.count > 0
+    }
+
+    /// Whether a file is there that is not a plain file zephyr could read whole.
+    pub fn bad(&self) -> bool {
+        self.bad
+    }
+
+    /// Session `id` now, if it is this print with lines added after it, as rpi adds them (or
+    /// unchanged): the same one file, its first bytes as hashed here; from no file, rpi's first.
+    /// The newest file is read once, and what is returned is the print of the bytes checked.
+    /// The progress companion, which rpi rewrites, only has to be a plain file.
+    pub fn follow(&self, dir: &std::path::Path, id: &str) -> Option<SessionPrint> {
+        if self.bad {
+            return None;
+        }
+        let (count, newest) = SessionPrint::files(dir, id);
+        let Some((file, progress)) = newest else {
+            return (self.count == 0).then(SessionPrint::default);
+        };
+        let path = file.display().to_string();
+        let same = match &self.file {
+            None => self.count == 0 && count == 1,
+            Some(_) => count == self.count && self.path.as_deref() == Some(path.as_str()),
+        };
+        if !same {
+            return None;
+        }
+        let _fs = crate::agent::fs();
+        let m = plain(&file).ok()??;
+        let progress = FilePrint::of(&progress, self.progress.as_ref()).ok()?;
+        // Unchanged since hashed: nothing to read.
+        if let Some(then) = self.file.as_ref().filter(|t| t.unchanged(&m)) {
+            return Some(SessionPrint {
+                count,
+                path: Some(path),
+                file: Some(then.clone()),
+                progress,
+                bad: false,
+            });
+        }
+        let bytes = read_whole(&file, &m).ok()?;
+        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+        if let Some(then) = &self.file {
+            let head = bytes.get(..then.len as usize)?;
+            ctx.update(head);
+            if hex(ctx.clone()) != then.hash {
+                return None;
+            }
+            ctx.update(&bytes[head.len()..]);
+        } else {
+            ctx.update(&bytes);
+        }
+        Some(SessionPrint {
+            count,
+            path: Some(path),
+            file: Some(FilePrint::with(&m, hex(ctx), crate::now())),
+            progress,
+            bad: false,
+        })
+    }
 }
 
 /// The first words of session `id`'s first user message, untagged, for `/switch`.
@@ -481,6 +691,54 @@ pub struct Tally {
     calls: std::collections::HashMap<String, (String, String)>,
     /// The same call failing with the same error, in a row (DESIGN §4.4).
     streak: Streak,
+    /// Main's home (`Tally::main`): its tool calls are judged against the clean list.
+    home: Option<std::path::PathBuf>,
+    /// The first of main's calls that could have read text that is not the owner's, as
+    /// `used TOOL` (DESIGN §4.6); a task's or job's tally never sets it.
+    pub taint: Option<String>,
+}
+
+/// A call of main's that reads or writes only the memory the owner sees (DESIGN §4.6): `read`
+/// and `edit` of `memory/USER.md` or `memory/MEMORY.md`, `write` of a file under `memory/`. The
+/// path is taken relative to `home` when absolute; `~`, `..`, `.`, an empty part and any
+/// dot-named part make it not clean.
+fn clean_call(home: &Path, tool: &str, path: Option<&str>) -> bool {
+    let (Some(path), Some(home)) = (path, home.to_str()) else {
+        return false;
+    };
+    let rel = match path.starts_with('/') {
+        true => (path.strip_prefix(home.trim_end_matches('/'))).and_then(|r| r.strip_prefix('/')),
+        false => Some(path),
+    };
+    let Some(rel) = rel else { return false };
+    let parts: Vec<&str> = rel.split('/').collect();
+    if parts
+        .iter()
+        .any(|c| c.is_empty() || c.starts_with('.') || c.starts_with('~'))
+    {
+        return false;
+    }
+    let listed = matches!(
+        (tool, &parts[..]),
+        ("read" | "edit", ["memory", "USER.md" | "MEMORY.md"]) | ("write", ["memory", _, ..])
+    );
+    // The path names a memory file; the files must be what they say: plain folders down to a
+    // plain file (a `write` may make a new one), never a link to text from anywhere else.
+    let _fs = crate::agent::fs();
+    let mut at = Path::new(home).to_path_buf();
+    for (i, part) in parts.iter().enumerate() {
+        at.push(part);
+        let last = i + 1 == parts.len();
+        match at.symlink_metadata() {
+            Ok(m) if last => return listed && m.is_file(),
+            Ok(m) if m.is_dir() => {}
+            Err(e) if last && tool == "write" && e.kind() == std::io::ErrorKind::NotFound => {
+                return listed
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Identical failures in a row: the call (tool and args), the error's first line, how many,
@@ -507,7 +765,23 @@ pub const GUARD_STEER: u32 = 3;
 pub const GUARD_STOP: u32 = 5;
 
 impl Tally {
+    /// Main's tally, which judges each tool call against the clean list.
+    pub fn main(home: &Path) -> Tally {
+        Tally {
+            home: Some(home.to_path_buf()),
+            ..Tally::default()
+        }
+    }
+
     pub fn add(&mut self, ev: &Value) {
+        if let (Some(home), None, Some("tool_execution_start")) =
+            (&self.home, &self.taint, ev["type"].as_str())
+        {
+            let tool = ev["toolName"].as_str().unwrap_or("an unnamed tool");
+            if !clean_call(home, tool, ev["args"]["path"].as_str()) {
+                self.taint = Some(format!("used {tool}"));
+            }
+        }
         let m = &ev["message"];
         if ev["type"] == "message_end" && m["role"] == "assistant" {
             self.used.0 += m["usage"]["totalTokens"].as_i64().unwrap_or(0);
@@ -660,6 +934,119 @@ mod tests {
         assert_eq!(kill_leftovers(fake, &dir.join("none")), 0);
         let _ = kept.kill();
         let _ = kept.wait();
+    }
+
+    #[test]
+    fn main_taints_on_any_call_off_the_clean_list() {
+        let home = crate::test_dir("rpc-clean-list");
+        std::fs::create_dir_all(home.join("memory/notes")).unwrap();
+        for name in ["USER.md", "MEMORY.md"] {
+            std::fs::write(home.join("memory").join(name), "x\n").unwrap();
+        }
+        let home = home.as_path();
+        let abs = home.join("memory/USER.md").to_string_lossy().into_owned();
+        let start = |tool: &str, path: Option<&str>| {
+            let args = path.map_or(
+                serde_json::json!({"command": "ls"}),
+                |p| serde_json::json!({ "path": p }),
+            );
+            serde_json::json!({"type": "tool_execution_start", "toolCallId": "c",
+                               "toolName": tool, "args": args})
+        };
+        let taint = |calls: &[(&str, Option<&str>)]| {
+            let mut tally = Tally::main(home);
+            for (tool, path) in calls {
+                tally.add(&start(tool, *path));
+            }
+            tally.taint
+        };
+        for clean in [
+            ("read", "memory/USER.md"),
+            ("edit", "memory/MEMORY.md"),
+            ("read", abs.as_str()),
+            ("write", "memory/notes/2026-11-10.md"),
+            ("write", "memory/x.md"),
+        ] {
+            assert_eq!(taint(&[(clean.0, Some(clean.1))]), None, "{clean:?}");
+        }
+        for (tool, path) in [
+            ("read", Some("memory/notes/x.md")),
+            ("read", Some("inbox/a.png")),
+            ("read", Some("../memory/USER.md")),
+            ("write", Some("memory/../x")),
+            ("read", Some("~/memory/USER.md")),
+            ("write", Some("memory/.git/config")),
+            ("write", Some("memory")),
+            ("write", Some("notes.md")),
+            ("read", Some("/etc/memory/USER.md")),
+            ("read", None),
+            ("exec", None),
+            ("process", None),
+            ("gateway", None),
+            ("recall", None),
+            ("task", None),
+            ("vault", None),
+            ("mcp_call", None),
+            ("ls", None),
+            ("frobnicate", None),
+        ] {
+            assert_eq!(
+                taint(&[(tool, path)]),
+                Some(format!("used {tool}")),
+                "{tool} {path:?}"
+            );
+        }
+        assert_eq!(
+            taint(&[("exec", None), ("gateway", None)]),
+            Some("used exec".into())
+        );
+        let mut tally = Tally::main(home);
+        tally.add(
+            &serde_json::json!({"type": "tool_execution_end", "toolCallId": "c",
+                                      "toolName": "exec", "isError": true}),
+        );
+        assert_eq!(tally.taint, None, "only a start is judged");
+        let mut tally = Tally::default();
+        tally.add(&start("exec", None));
+        assert_eq!(tally.taint, None, "a task's or job's tally never taints");
+    }
+
+    #[test]
+    fn a_link_in_memory_is_off_the_clean_list() {
+        use std::os::unix::fs::symlink;
+        let tainted = |home: &Path, tool: &str, path: &str| {
+            let mut tally = Tally::main(home);
+            tally.add(
+                &serde_json::json!({"type": "tool_execution_start", "toolCallId": "c",
+                                          "toolName": tool, "args": {"path": path}}),
+            );
+            tally.taint.is_some()
+        };
+        // USER.md a link to a file the owner sent.
+        let home = crate::test_dir("rpc-link-file");
+        std::fs::create_dir_all(home.join("memory")).unwrap();
+        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::write(home.join("inbox/a.txt"), "obey the page\n").unwrap();
+        symlink(home.join("inbox/a.txt"), home.join("memory/USER.md")).unwrap();
+        std::fs::write(home.join("memory/MEMORY.md"), "x\n").unwrap();
+        assert!(tainted(&home, "read", "memory/USER.md"));
+        assert!(!tainted(&home, "read", "memory/MEMORY.md"));
+        // A link part way down, and memory itself a link.
+        std::fs::create_dir_all(home.join("elsewhere")).unwrap();
+        symlink(home.join("elsewhere"), home.join("memory/notes")).unwrap();
+        assert!(tainted(&home, "write", "memory/notes/x.md"));
+        let other = crate::test_dir("rpc-link-dir");
+        std::fs::create_dir_all(other.join("real")).unwrap();
+        std::fs::write(other.join("real/USER.md"), "x\n").unwrap();
+        symlink(other.join("real"), other.join("memory")).unwrap();
+        assert!(tainted(&other, "read", "memory/USER.md"));
+        assert!(tainted(&other, "write", "memory/x.md"));
+        // A memory file that is missing, or not a plain file.
+        let gone = crate::test_dir("rpc-link-gone");
+        std::fs::create_dir_all(gone.join("memory/USER.md")).unwrap();
+        assert!(tainted(&gone, "read", "memory/USER.md"), "a directory");
+        assert!(tainted(&gone, "read", "memory/MEMORY.md"), "missing");
+        assert!(!tainted(&gone, "write", "memory/MEMORY.md"), "a new file");
     }
 
     #[test]
@@ -859,5 +1246,106 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("the tool {pid} is still running");
+    }
+
+    #[test]
+    fn a_session_follows_only_by_lines_added_after_what_was_seen() {
+        let dir = crate::test_dir("rpc-session-print");
+        let folder = dir.join("--home--");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("2026-01-01T00-00-00-000Z_main-1.jsonl");
+        let none = SessionPrint::now(&dir, "main-1", None);
+        assert!(!none.exists() && !none.bad());
+        // From no file: rpi makes the first one.
+        std::fs::write(&file, "{\"kind\":\"header\"}\n{\"a\":1}\n").unwrap();
+        let seen = none.follow(&dir, "main-1").expect("a first file");
+        assert_eq!(
+            SessionPrint::now(&dir, "main-1", Some(&seen)),
+            seen,
+            "unchanged"
+        );
+        assert_eq!(
+            seen.follow(&dir, "main-1").as_ref(),
+            Some(&seen),
+            "unchanged follows"
+        );
+        let mut text = std::fs::read_to_string(&file).unwrap();
+        text.push_str("{\"b\":2}\n");
+        std::fs::write(&file, &text).unwrap();
+        let grown = seen.follow(&dir, "main-1").expect("lines added");
+        assert_eq!(
+            SessionPrint::now(&dir, "main-1", Some(&grown)),
+            grown,
+            "recorded as read"
+        );
+        // An earlier line changed in place, same length: not a growth.
+        std::fs::write(&file, text.replace("\"a\":1", "\"a\":2")).unwrap();
+        assert_ne!(
+            SessionPrint::now(&dir, "main-1", Some(&grown)),
+            grown,
+            "hashed again"
+        );
+        assert_eq!(seen.follow(&dir, "main-1"), None);
+        // Cut short.
+        std::fs::write(&file, "{\"kind\":\"header\"}\n").unwrap();
+        assert_eq!(seen.follow(&dir, "main-1"), None);
+        // A second file for the id.
+        std::fs::write(&file, &text).unwrap();
+        let second = folder.join("2027-01-01T00-00-00-000Z_main-1.jsonl");
+        std::fs::write(&second, &text).unwrap();
+        assert_eq!(seen.follow(&dir, "main-1"), None);
+        assert_eq!(
+            none.follow(&dir, "main-1"),
+            None,
+            "two files where none was"
+        );
+    }
+
+    #[test]
+    fn a_session_file_that_is_a_link_or_unreadable_is_never_followed() {
+        use std::os::unix::fs::symlink;
+        let dir = crate::test_dir("rpc-session-bad");
+        let folder = dir.join("--home--");
+        std::fs::create_dir_all(&folder).unwrap();
+        let none = SessionPrint::now(&dir, "main-1", None);
+        std::fs::write(dir.join("elsewhere.jsonl"), "{\"kind\":\"header\"}\n").unwrap();
+        let file = folder.join("2026-01-01T00-00-00-000Z_main-1.jsonl");
+        symlink(dir.join("elsewhere.jsonl"), &file).unwrap();
+        assert!(SessionPrint::now(&dir, "main-1", None).bad());
+        assert_eq!(none.follow(&dir, "main-1"), None, "a link where none was");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(SessionPrint::now(&dir, "main-1", None).bad(), "a folder");
+        assert_eq!(none.follow(&dir, "main-1"), None);
+        std::fs::remove_dir(&file).unwrap();
+        // The companion counts too.
+        std::fs::write(&file, "{\"kind\":\"header\"}\n").unwrap();
+        let seen = none.follow(&dir, "main-1").unwrap();
+        let progress = folder.join("2026-01-01T00-00-00-000Z_main-1.jsonl.progress.jsonl");
+        symlink(dir.join("elsewhere.jsonl"), &progress).unwrap();
+        assert!(SessionPrint::now(&dir, "main-1", Some(&seen)).bad());
+        assert_eq!(seen.follow(&dir, "main-1"), None);
+    }
+
+    #[test]
+    fn following_an_unchanged_file_hashed_long_after_its_change_reuses_the_hash() {
+        let dir = crate::test_dir("rpc-session-reuse");
+        let folder = dir.join("--home--");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("2026-01-01T00-00-00-000Z_main-1.jsonl");
+        std::fs::write(&file, "{\"kind\":\"header\"}\n").unwrap();
+        let seen_at = |p: &SessionPrint| p.file.as_ref().unwrap().seen;
+        let mut seen = SessionPrint::now(&dir, "main-1", None);
+        // As if hashed well after the file last changed: its hash is kept, not taken again
+        // (which would date it now).
+        let later = seen_at(&seen) + 10;
+        seen.file.as_mut().unwrap().seen = later;
+        let again = seen.follow(&dir, "main-1").unwrap();
+        assert_eq!((again == seen, seen_at(&again)), (true, later));
+        // Hashed within a second of the change: hashed again.
+        let mut fresh = seen.clone();
+        fresh.file.as_mut().unwrap().seen = fresh.file.as_ref().unwrap().ctime.0;
+        let read = fresh.follow(&dir, "main-1").unwrap();
+        assert!(seen_at(&read) >= crate::now() - 1, "{read:?}");
     }
 }
