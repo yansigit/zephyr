@@ -92,16 +92,16 @@
 **Interfaces:**
 - Produces: audit rows `(session, "outbound", label, outcome)`, one per `zephyr_policy::policy::outbound(command)` label, written in the `tool_execution_start` branch for `bash` or `exec`, `outcome` the call's own (`started`/`refused`), label through `vault::scrubbed` then `facts::scrubbed`. `rpc::Tally` and `alert()` unchanged.
 
-- [ ] **Step 1: Write the failing tests** in `scheduler.rs` `mod tests`:
+- [x] **Step 1: Write the failing tests** in `scheduler.rs` `mod tests`:
   - `an_outbound_command_is_an_audit_row_from_its_start`: events `bash` and `exec` with `{"command": "curl -X POST https://api.example.com/v1"}` → rows include `("main", "outbound", "curl POST api.example.com", "started")` twice, each after its call's own row.
   - `an_outbound_label_is_scrubbed`: a vault entry whose secret is `s3cr3tvalue` (as the vault tests build one) and the command `curl -d x https://s3cr3tvalue.example.com` → the label is `curl POST [vault:NAME].example.com` (the label keeps only the host, so the value must sit there).
   - `a_vetoed_outbound_command_is_recorded_refused`: `curl -d x https://e.x; rm -rf /` → `("main", "outbound", "curl POST e.x", "refused")`.
   - `a_plain_get_writes_no_outbound_row`: `curl -s https://e.x` → no `outbound` row.
-- [ ] **Step 2:** `cargo test -p zephyr --lib scheduler::tests::outbound` etc. → FAIL.
-- [ ] **Step 3: Implement** in `audit`: take the command from `ev["args"]["command"]` as `Tally::add` does (rpc.rs:533); write the extra rows with the same 500-byte cut and error log.
-- [ ] **Step 4:** `cargo test -p zephyr` → PASS; fix any router test that lists the whole audit after an outbound command by adding the row (those filtering by tool, e.g. tests/router.rs:4490, stay as they are).
-- [ ] **Step 5:** Docs: DESIGN §4.4 item 3: each command `policy::outbound` lists is also an `audit` row (`tool = 'outbound'`, its label as args) from the call's start; the notice is unchanged.
-- [ ] **Step 6:** Commit `feat(audit): record each command that sends data off the machine when it starts, as the notice labels it`.
+- [x] **Step 2:** `cargo test -p zephyr --lib scheduler::tests::outbound` etc. → FAIL.
+- [x] **Step 3: Implement** in `audit`: take the command from `ev["args"]["command"]` as `Tally::add` does (rpc.rs:533); write the extra rows with the same 500-byte cut and error log.
+- [x] **Step 4:** `cargo test -p zephyr` → PASS; fix any router test that lists the whole audit after an outbound command by adding the row (those filtering by tool, e.g. tests/router.rs:4490, stay as they are).
+- [x] **Step 5:** Docs: DESIGN §4.4 item 3: each command `policy::outbound` lists is also an `audit` row (`tool = 'outbound'`, its label as args) from the call's start; the notice is unchanged.
+- [x] **Step 6:** Commit `feat(audit): record each command that sends data off the machine when it starts, as the notice labels it`.
 
 ### Task A4-4: `/activity` on every owner channel
 

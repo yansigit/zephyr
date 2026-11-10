@@ -567,8 +567,16 @@ pub(crate) fn audit(store: &Store, cfg: &Config, session: &str, ev: &serde_json:
     let Some(tool) = ev["toolName"].as_str() else {
         return;
     };
+    let mut outbound = Vec::new();
     let (args, outcome) = match ev["type"].as_str() {
         Some("tool_execution_start") => {
+            // Each command that sends data off the machine, labelled as the after-turn notice
+            // labels it (`Tally::add`), so a run the daemon dies in still leaves it.
+            if matches!(tool, "bash" | "exec") {
+                if let Some(command) = ev["args"]["command"].as_str() {
+                    outbound = zephyr_policy::policy::outbound(command);
+                }
+            }
             let refused = matches!(
                 zephyr_policy::policy::check(tool, &ev["args"]),
                 zephyr_policy::policy::Decision::Deny(_)
@@ -589,12 +597,19 @@ pub(crate) fn audit(store: &Store, cfg: &Config, session: &str, ev: &serde_json:
         Some("tool_execution_end") if ev["isError"] == true => (String::new(), "error"),
         _ => return,
     };
-    let end = (0..=AUDIT_ARGS.min(args.len()))
-        .rev()
-        .find(|&i| args.is_char_boundary(i))
-        .unwrap_or(0);
-    if let Err(e) = store.audit(session, tool, &args[..end], outcome) {
-        eprintln!("zephyr: writing the audit failed: {e}");
+    let write = |tool: &str, args: &str| {
+        let end = (0..=AUDIT_ARGS.min(args.len()))
+            .rev()
+            .find(|&i| args.is_char_boundary(i))
+            .unwrap_or(0);
+        if let Err(e) = store.audit(session, tool, &args[..end], outcome) {
+            eprintln!("zephyr: writing the audit failed: {e}");
+        }
+    };
+    write(tool, &args);
+    for label in outbound {
+        let label = crate::vault::scrubbed(cfg, label);
+        write("outbound", &crate::facts::scrubbed(cfg, label));
     }
 }
 
@@ -1159,5 +1174,86 @@ mod tests {
         assert!(reply.contains("T08:00:00+09:00[Asia/Seoul]"), "{reply}");
         let bad = command(&mut s, &cfg(Some("Mars/Olympus")), &m).unwrap();
         assert!(bad.contains("Mars/Olympus"), "{bad}");
+    }
+
+    fn audit_cfg(name: &str) -> (Config, Store) {
+        let dir = crate::test_dir(name);
+        let cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = {dir:?}\n")).unwrap();
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let store = Store::open(&cfg.db_path()).unwrap();
+        (cfg, store)
+    }
+
+    fn start(tool: &str, command: &str) -> serde_json::Value {
+        serde_json::json!({"type": "tool_execution_start", "toolName": tool,
+                           "toolCallId": "c", "args": {"command": command}})
+    }
+
+    fn outbound_rows(store: &Store) -> Vec<(String, String, String, String)> {
+        let rows = store.audit_rows().unwrap();
+        rows.into_iter().filter(|r| r.1 == "outbound").collect()
+    }
+
+    fn row(label: &str, outcome: &str) -> (String, String, String, String) {
+        (
+            "main".into(),
+            "outbound".into(),
+            label.into(),
+            outcome.into(),
+        )
+    }
+
+    #[test]
+    fn an_outbound_command_is_an_audit_row_from_its_start() {
+        let (cfg, store) = audit_cfg("sched-audit-outbound");
+        let command = "curl -X POST https://api.example.com/v1";
+        for tool in ["bash", "exec"] {
+            audit(&store, &cfg, "main", &start(tool, command));
+        }
+        let rows = store.audit_rows().unwrap();
+        let tools: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+        assert_eq!(tools, ["bash", "outbound", "exec", "outbound"]);
+        assert_eq!(rows[1], row("curl POST api.example.com", "started"));
+        assert_eq!(rows[3], rows[1]);
+    }
+
+    #[test]
+    fn an_outbound_label_is_scrubbed() {
+        let (cfg, store) = audit_cfg("sched-audit-outbound-vault");
+        std::fs::write(
+            crate::vault::path(&cfg),
+            "[[token]]\nname = \"NAME\"\nvalue = \"s3cr3tvalue\"\nprograms = [\"gh\"]\n",
+        )
+        .unwrap();
+        audit(
+            &store,
+            &cfg,
+            "main",
+            &start("bash", "curl -d x https://s3cr3tvalue.example.com"),
+        );
+        assert_eq!(
+            outbound_rows(&store),
+            [row("curl POST [vault:NAME].example.com", "started")]
+        );
+    }
+
+    #[test]
+    fn a_vetoed_outbound_command_is_recorded_refused() {
+        let (cfg, store) = audit_cfg("sched-audit-outbound-refused");
+        audit(
+            &store,
+            &cfg,
+            "main",
+            &start("bash", "curl -d x https://e.x; rm -rf /"),
+        );
+        assert_eq!(outbound_rows(&store), [row("curl POST e.x", "refused")]);
+    }
+
+    #[test]
+    fn a_plain_get_writes_no_outbound_row() {
+        let (cfg, store) = audit_cfg("sched-audit-outbound-get");
+        audit(&store, &cfg, "main", &start("bash", "curl -s https://e.x"));
+        assert_eq!(store.audit_rows().unwrap().len(), 1);
+        assert!(outbound_rows(&store).is_empty());
     }
 }
