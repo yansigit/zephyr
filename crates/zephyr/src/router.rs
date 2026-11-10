@@ -280,6 +280,11 @@ pub async fn run<C: Channel>(
     router.gate_notes = Some(notes_rx);
     router.keep_upgraded_install_as_it_was().await;
     router.taint_cut_off();
+    // Before the first child starts the desktop: one a daemon before this left is no child of
+    // this one, so it would be a stray for memory for good (DESIGN §4.6).
+    tokio::task::spawn_blocking(crate::procs::kill_leftover_desktop)
+        .await
+        .ok();
     // Commands a re-exec handed over alive are adopted; the rest a dead gateway left running
     // are reported, never re-run (DESIGN §4.13).
     router.procs.adopt(&router.cfg, &mut router.store)?;

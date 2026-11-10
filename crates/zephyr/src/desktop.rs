@@ -18,6 +18,10 @@ static RUNNING: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 /// which would be the daemon's children and spared by the stray check (DESIGN §4.6).
 const XVFB: &str = "/usr/bin/Xvfb";
 const OPENBOX: &str = "/usr/bin/openbox";
+/// Root's config (`deploy/openbox/rc.xml`), never the agent's `~/.config/openbox/rc.xml`: it
+/// binds no key, shows no menu and starts nothing.
+const OPENBOX_RC: &str = "/opt/zephyr/openbox/rc.xml";
+const OPENBOX_ARGS: [&str; 2] = ["--config-file", OPENBOX_RC];
 
 /// The cookie file, in the agent's home: the agent's own clients read it through `XAUTHORITY`.
 pub(crate) const XAUTHORITY: &str = ".zephyr-xauthority";
@@ -41,8 +45,6 @@ pub fn ensure() -> Option<String> {
             let _ = c.wait();
         }
         running.clear();
-        // A desktop a crashed daemon left would keep the display and be no child of this one.
-        crate::procs::kill_leftover_desktop();
         let auth = auth.to_string_lossy().into_owned();
         let xvfb = [
             "-auth",
@@ -56,7 +58,11 @@ pub fn ensure() -> Option<String> {
         running.extend(start(XVFB, &[&display], &xvfb));
         // The window manager needs the server up first.
         std::thread::sleep(std::time::Duration::from_millis(300));
-        running.extend(start(OPENBOX, &[], &[]));
+        // Without root's config openbox would fall back to the agent's: then no window manager.
+        match std::path::Path::new(OPENBOX_RC).is_file() {
+            true => running.extend(start(OPENBOX, &OPENBOX_ARGS, &[])),
+            false => eprintln!("zephyr: {OPENBOX_RC} is missing; the desktop runs without openbox"),
+        }
     }
     Some(display)
 }
@@ -177,5 +183,27 @@ mod tests {
         // the daemon's child, spared by the stray check.
         assert_eq!(XVFB, "/usr/bin/Xvfb");
         assert_eq!(OPENBOX, "/usr/bin/openbox");
+    }
+
+    #[test]
+    fn openbox_reads_roots_config_that_runs_nothing() {
+        // Never `~/.config/openbox/rc.xml`, the agent's to write: its keys, menu and autostart
+        // could start a program as the desktop's child, which the stray check spares.
+        assert_eq!(
+            OPENBOX_ARGS,
+            ["--config-file", "/opt/zephyr/openbox/rc.xml"]
+        );
+        let rc = include_str!("../../../deploy/openbox/rc.xml");
+        let menu = include_str!("../../../deploy/openbox/menu.xml");
+        for text in [rc, menu] {
+            let lower = text.to_ascii_lowercase();
+            for word in ["execute", "autostart", "pipemenu", "<command", "showmenu"] {
+                assert!(!lower.contains(word), "{word} in {text}");
+            }
+        }
+        assert!(
+            rc.contains("<file>/opt/zephyr/openbox/menu.xml</file>"),
+            "{rc}"
+        );
     }
 }

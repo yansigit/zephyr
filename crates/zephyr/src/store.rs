@@ -1975,8 +1975,6 @@ impl Store {
         Ok(n == 1)
     }
 
-    /// Turns a job on. Returns whether it exists. A job turned on now counts from now, so a
-    /// proposal approved after its first due time waits for the next one.
     /// Turns a job off: `claim_due` passes it by.
     pub fn disable_job(&self, id: i64) -> rusqlite::Result<()> {
         self.db
@@ -1984,6 +1982,8 @@ impl Store {
         Ok(())
     }
 
+    /// Turns a job on. Returns whether it exists. A job turned on now counts from now, so a
+    /// proposal approved after its first due time waits for the next one.
     pub fn enable_job(&self, id: i64) -> rusqlite::Result<bool> {
         let n = self.db.execute(
             "UPDATE jobs SET created_at = iif(enabled, created_at, unixepoch()), enabled = 1

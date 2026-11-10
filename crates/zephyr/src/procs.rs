@@ -202,28 +202,23 @@ impl Procs {
         killed
     }
 
-    /// Whether `kill_strays` would find any (DESIGN §4.6: a stray can write memory, so an owner's
-    /// change made while one lives waits). The agent-browser daemon counts.
-    pub fn strays_alive(&self) -> bool {
-        self.stray().is_some()
-    }
-
     /// What one stray is (its command name), for the owner: `UNSEEN` when `/proc` cannot be read
-    /// whole, which counts as one. `None`: there is none.
+    /// whole, which counts as one. `None`: there is none. A stray can write memory, so an owner's
+    /// change made while one lives waits (DESIGN §4.6); the agent-browser daemon counts.
     pub fn stray(&self) -> Option<String> {
         let (uid, scope, keep) = self.sweep()?;
         let (all, complete) = processes_in(Path::new("/proc"));
         if !complete {
             return Some(UNSEEN.into());
         }
-        named(&all, &strays(&all, uid, scope, &keep, true))
+        named(&all, &strays(&all, uid, scope, &keep))
     }
 
     /// `kill_strays`' search: `(pid, start ticks)` of each, as strictly as `stray` looks, so
     /// `/stop` ends whatever keeps memory from being saved at once.
     fn find_strays(&self) -> Vec<(i32, i64)> {
         match self.sweep() {
-            Some((uid, scope, keep)) => strays(&processes(), uid, scope, &keep, true),
+            Some((uid, scope, keep)) => strays(&processes(), uid, scope, &keep),
             None => Vec::new(),
         }
     }
@@ -675,13 +670,15 @@ fn named(all: &HashMap<i32, Ps>, found: &[(i32, i64)]) -> Option<String> {
     )
 }
 
-/// The agent's desktop programs that do not descend from `me`, the daemon: a desktop a crashed
-/// daemon left, or a program of the agent's that takes the name.
+/// The agent's desktop programs left over from before this daemon: reparented to pid 1 (tini,
+/// or the supervisor below it), not descending from `me`. One under a `docker exec` is left
+/// alone (a stray for memory all the same).
 fn leftover_desktop(all: &HashMap<i32, Ps>, uid: u32, me: i32) -> Vec<(i32, i64)> {
-    let ours = |mut pid: i32| {
+    let reparented = |mut pid: i32| {
         for _ in 0..all.len() {
             match all.get(&pid) {
-                _ if pid == me => return true,
+                _ if pid == me => return false,
+                Some(p) if p.ppid == 1 => return true,
                 Some(p) => pid = p.ppid,
                 None => return false,
             }
@@ -689,15 +686,15 @@ fn leftover_desktop(all: &HashMap<i32, Ps>, uid: u32, me: i32) -> Vec<(i32, i64)
         false
     };
     (all.iter())
-        .filter(|(pid, p)| p.uid == uid && !ours(**pid))
-        .filter(|(_, p)| DESKTOP.contains(&p.comm.as_str()))
+        .filter(|(_, p)| p.uid == uid && DESKTOP.contains(&p.comm.as_str()))
+        .filter(|(pid, _)| reparented(**pid))
         .map(|(pid, p)| (*pid, p.ticks))
         .collect()
 }
 
-/// At the daemon's start (`desktop::ensure`): ends a desktop it did not start, so the one the
-/// agent uses is always the daemon's own child and never a stray (DESIGN §4.6). Waits up to 2 s
-/// for each to go, so the new server can take the display.
+/// Once, at the daemon's start, before it starts a desktop: ends one left over from a daemon
+/// before it, so the one the agent uses is always this daemon's own child and never a stray
+/// (DESIGN §4.6). Waits up to 2 s for each to go, so the new server can take the display.
 pub fn kill_leftover_desktop() {
     let Some((uid, _)) = crate::agent::ids() else {
         return;
@@ -714,36 +711,42 @@ pub fn kill_leftover_desktop() {
     }
 }
 
-/// `(pid, start ticks)` of each process of `uid` whose parents lead to `scope` without passing
-/// one of `keep` or the desktop. A chain that breaks (a parent not in `all`) is spared.
-/// `strict` (whether memory can be trusted, DESIGN §4.6): only what descends from `keep` (the
-/// daemon, which starts the desktop, and the tracked commands) is spared; a desktop program it
-/// did not start, or a program that takes that name, is a stray, and so is a broken chain.
-fn strays(
-    all: &HashMap<i32, Ps>,
-    uid: u32,
-    scope: i32,
-    keep: &[i32],
-    strict: bool,
-) -> Vec<(i32, i64)> {
+/// What of the desktop is the desktop's own: the server, its keymap helper, the window manager.
+const DESKTOP_OWN: [&str; 3] = ["Xvfb", "xkbcomp", "openbox"];
+
+/// `(pid, start ticks)` of each process of `uid` that could write memory unseen (DESIGN §4.6):
+/// whose parents lead to `scope` without passing one of `keep` (the daemon, which starts the
+/// desktop, and the tracked commands); anything the desktop started but its own programs; a
+/// desktop program the daemon did not start, wherever it runs; and, as doubt, any whose parent
+/// chain breaks. A chain that ends outside the namespace (`docker exec`) is not under scope.
+fn strays(all: &HashMap<i32, Ps>, uid: u32, scope: i32, keep: &[i32]) -> Vec<(i32, i64)> {
     let stray = |start: i32| {
-        let mut pid = start;
+        let own = all
+            .get(&start)
+            .is_some_and(|p| DESKTOP_OWN.contains(&p.comm.as_str()));
+        let named = all
+            .get(&start)
+            .is_some_and(|p| DESKTOP.contains(&p.comm.as_str()));
+        let (mut pid, mut under_desktop) = (start, false);
         for _ in 0..all.len() {
             let Some(p) = all.get(&pid) else {
-                return strict;
+                return true;
             };
-            if keep.contains(&pid) || (!strict && DESKTOP.contains(&p.comm.as_str())) {
-                return false;
+            if keep.contains(&pid) {
+                return under_desktop && !own;
+            }
+            if pid != start && DESKTOP.contains(&p.comm.as_str()) {
+                under_desktop = true;
             }
             if p.ppid == 0 {
-                return false; // the top, or a parent outside the namespace: not under scope
+                return named; // the top, or a parent outside the namespace: not under scope
             }
             if p.ppid == scope {
                 return true;
             }
             pid = p.ppid;
         }
-        false
+        true
     };
     (all.iter())
         .filter(|(pid, p)| p.uid == uid && stray(**pid))
@@ -1155,9 +1158,10 @@ mod tests {
             (70, ps(1, 8, "someone")),
             (80, ps(99, 9, "orphan")), // its parent ended while /proc was read
         ]);
-        let mut found = strays(&all, 9, 1, &[10, 30], false);
+        let mut found = strays(&all, 9, 1, &[10, 30]);
         found.sort();
-        assert_eq!(found, [(40, 7), (41, 7)]);
+        // The leftover desktop and its helper, and the orphan whose chain broke, count too.
+        assert_eq!(found, [(40, 7), (41, 7), (50, 7), (51, 7), (80, 7)]);
     }
 
     #[test]
@@ -1193,33 +1197,47 @@ mod tests {
     }
 
     #[test]
-    fn for_memory_only_what_the_daemon_runs_is_spared_and_doubt_is_a_stray() {
+    fn only_what_the_daemon_runs_is_spared_and_doubt_is_a_stray() {
         let ps = |ppid, comm: &str| Ps {
             ppid,
             uid: 9,
             ticks: 7,
             comm: comm.into(),
         };
-        // 10 the daemon, 11 the desktop it started, 12 that desktop's helper; 50 a desktop a
-        // crashed daemon left (or a program that took its name), 80 a process whose parent ended.
+        // 10 the daemon; 11 and 15 the desktop it started, 12 the server's own helper, 13 and
+        // 16 anything else the desktop started; 50-52 a desktop a crashed daemon left; 60 a
+        // `docker exec` shell, 61 doctor's `__netcheck` under it, 62 a desktop program under it;
+        // 80 a process whose parent ended.
         let all = HashMap::from([
             (1, ps(0, "init")),
             (10, ps(1, "zephyr")),
             (11, ps(10, "Xvfb")),
             (12, ps(11, "xkbcomp")),
+            (13, ps(11, "sh")),
+            (15, ps(10, "openbox")),
+            (16, ps(15, "sh")),
             (50, ps(1, "Xvfb")),
             (51, ps(50, "xkbcomp")),
             (52, ps(1, "openbox")),
             (60, ps(0, "bash")),
-            (61, ps(60, "zephyr")), // doctor's `__netcheck`, run as the agent under a docker exec
+            (61, ps(60, "zephyr")),
+            (62, ps(60, "Xvfb")),
             (80, ps(99, "orphan")),
         ]);
-        let mut loose = strays(&all, 9, 1, &[10], false);
-        loose.sort();
-        assert_eq!(loose, [], "kill_strays spares the desktop by name");
-        let mut strict = strays(&all, 9, 1, &[10], true);
-        strict.sort();
-        assert_eq!(strict, [(50, 7), (51, 7), (52, 7), (80, 7)]);
+        let mut found = strays(&all, 9, 1, &[10]);
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                (13, 7),
+                (16, 7),
+                (50, 7),
+                (51, 7),
+                (52, 7),
+                (62, 7),
+                (80, 7)
+            ]
+        );
     }
 
     #[test]
@@ -1259,6 +1277,9 @@ mod tests {
             (60, ps(40, 9, "Xvfb")),
             (40, ps(1, 9, "bash")),
             (70, ps(1, 8, "Xvfb")),
+            // Under a `docker exec`: left alone here (a stray for memory all the same).
+            (90, ps(0, 0, "bash")),
+            (91, ps(90, 9, "Xvfb")),
         ]);
         let mut found = leftover_desktop(&all, 9, 10);
         found.sort();
@@ -1275,7 +1296,7 @@ mod tests {
         };
         let all = HashMap::from([(1, ps(0, "init")), (40, ps(1, "chrome"))]);
         assert_eq!(
-            named(&all, &strays(&all, 9, 1, &[], true)).as_deref(),
+            named(&all, &strays(&all, 9, 1, &[])).as_deref(),
             Some("chrome")
         );
         assert_eq!(named(&all, &[]), None);

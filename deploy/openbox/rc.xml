@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The agent's window manager config (DESIGN §4.6), root's: openbox reads it with
+     its config-file option, never ~/.config/openbox/rc.xml, which the agent could write. It binds no
+     key, shows no menu and starts no program, so nothing the desktop runs is the agent's choice. -->
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <resistance>
+    <strength>10</strength>
+    <screen_edge_strength>20</screen_edge_strength>
+  </resistance>
+  <focus>
+    <focusNew>yes</focusNew>
+    <followMouse>no</followMouse>
+  </focus>
+  <placement>
+    <policy>Smart</policy>
+  </placement>
+  <desktops>
+    <number>1</number>
+  </desktops>
+  <keyboard>
+  </keyboard>
+  <mouse>
+    <dragThreshold>8</dragThreshold>
+    <context name="Client">
+      <mousebind button="Left" action="Press">
+        <action name="Focus"/>
+        <action name="Raise"/>
+      </mousebind>
+    </context>
+    <context name="Titlebar">
+      <mousebind button="Left" action="Press">
+        <action name="Focus"/>
+        <action name="Raise"/>
+      </mousebind>
+      <mousebind button="Left" action="Drag">
+        <action name="Move"/>
+      </mousebind>
+    </context>
+  </mouse>
+  <menu>
+    <file>/opt/zephyr/openbox/menu.xml</file>
+  </menu>
+</openbox_config>
