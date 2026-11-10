@@ -174,7 +174,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
 - The signature is checked with `ring::signature::ECDSA_P256_SHA256_ASN1` over `auth_data ‖ SHA-256(client_data)`.
 - Sign count: a new count that is non-zero and at or below a non-zero `stored` is refused. Synced passkeys send 0.
 
-- [ ] **Step 1: Write the failing tests** in `passkey.rs` `mod tests`. The software authenticator is `EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING)`; helpers `client_data(type, challenge, origin)` and `auth_data(host, flags, count)`.
+- [x] **Step 1: Write the failing tests** in `passkey.rs` `mod tests`. The software authenticator is `EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING)`; helpers `client_data(type, challenge, origin)` and `auth_data(host, flags, count)`.
   - `the_rfc_6979_p256_sha256_signature_verifies`: RFC 6979 A.2.5 through the same path `verify` uses (factor it as `fn es256(point, msg, der) -> bool`):
     - point `04 ‖ 60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6 ‖ 7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299`;
     - message `b"sample"`;
@@ -196,10 +196,12 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
     - a second `take` → `None`;
     - after `ttl` → `None`;
     - the 17th `issue` evicts the first.
-- [ ] **Step 2: Run** `cargo test -p zephyr --lib web::passkey` → FAIL.
-- [ ] **Step 3: Implement** the signatures above. Use `data_encoding::BASE64URL_NOPAD`, `ring::digest`, `ring::signature`; no other crate.
-- [ ] **Step 4: Run** the same → PASS.
-- [ ] **Step 5: Commit** `feat(web): verify passkey sign-ins and signatures with ES256 on ring`.
+- [x] **Step 2: Run** `cargo test -p zephyr --lib web::passkey` → FAIL.
+- [x] **Step 3: Implement** the signatures above. Use `data_encoding::BASE64URL_NOPAD`, `ring::digest`, `ring::signature`; no other crate.
+- [x] **Step 4: Run** the same → PASS.
+- [x] **Step 5: Commit** `feat(web): verify passkey sign-ins and signatures with ES256 on ring`.
+- Deviation: `web/mod.rs` declares only `passkey` here; `push` joins it in W-3, when the file exists.
+- Deviation: `assertion` and `created` answer `"malformed"` for a missing or non-base64url field (the plan lists no reason for it), covered by the added test `browser_results_are_read_from_base64url_and_malformed_ones_refused`; `sha256` is public for W-6 and W-7.
 
 ### Task W-3: `web/push.rs`: aes128gcm, VAPID, the endpoint allowlist, payloads
 
