@@ -922,9 +922,10 @@ fn proxy_status(proxy: SocketAddr, target: &str) -> Result<u16, String> {
     let io = |e: std::io::Error| e.to_string();
     let mut stream =
         std::net::TcpStream::connect_timeout(&proxy, Duration::from_secs(2)).map_err(io)?;
-    // Past the proxy's own lookup and connect waits.
+    // The proxy refuses at once; this bounds a reachable target that is slow to connect, so
+    // all of `netcheck` stays under doctor's limit for it.
     stream
-        .set_read_timeout(Some(Duration::from_secs(20)))
+        .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(io)?;
     let head = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
     stream.write_all(head.as_bytes()).map_err(io)?;

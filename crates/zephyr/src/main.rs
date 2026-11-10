@@ -435,7 +435,7 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     // In the container: what root starts or trusts is root's, never the agent's to swap (B5).
     // SAFETY: getuid has no arguments and cannot fail.
     let binaries_ok = unsafe { libc::getuid() } != 0 || roots_binaries(cfg);
-    let floor_ok = network_floor(cfg);
+    let floor_ok = network_floor(cfg).await;
 
     // A throwaway home so doctor never touches the live `main` session.
     let mut probe = cfg.clone();
@@ -616,7 +616,7 @@ fn check(label: &str, ok: bool) -> bool {
 /// The network floor (DESIGN §4.19), proved by probing as the agent (`zephyr __netcheck`), and
 /// that nothing of root's listens where the agent's uid is let through. Under host networking,
 /// one warning.
-fn network_floor(cfg: &Config) -> bool {
+async fn network_floor(cfg: &Config) -> bool {
     if !zephyr::egress::bridge() {
         println!("warn network floor off (host networking): the agent can reach the host's loopback and private ranges");
         return true;
@@ -628,7 +628,17 @@ fn network_floor(cfg: &Config) -> bool {
     let port = cfg.attach.as_ref().map_or(0, |a| a.port);
     let mut probe = std::process::Command::new("/usr/local/bin/zephyr");
     probe.args(["__netcheck", &format!("{own}:{port}")]);
-    let mut ok = match zephyr::agent::cmd(&mut probe).output() {
+    // Each check has its own limit and they add up to 45 s; a probe stuck past that is a failure.
+    let mut probe = tokio::process::Command::from({
+        zephyr::agent::cmd(&mut probe);
+        probe
+    });
+    let ran = tokio::time::timeout(Duration::from_secs(50), probe.kill_on_drop(true).output());
+    let ran = match ran.await {
+        Ok(ran) => ran,
+        Err(_) => Err(std::io::Error::other("it did not finish in 50 s")),
+    };
+    let mut ok = match ran {
         Ok(out) => {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 match line.split_once(' ') {
