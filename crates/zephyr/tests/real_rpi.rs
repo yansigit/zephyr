@@ -188,6 +188,95 @@ async fn real_rpi_round_trip_and_kill_mid_run() {
     task.await.unwrap().unwrap();
 }
 
+/// DESIGN §4.6: zephyr records a clean conversation's saved file after each settle and around
+/// a restart, so what the real rpi writes itself never reads as a change made outside it.
+#[tokio::test]
+#[ignore = "needs the pinned rpi binary"]
+async fn real_rpi_keeps_a_conversation_clean_across_runs_and_a_restart() {
+    if !std::path::Path::new(RPI).exists() {
+        skip_without_rpi(RPI);
+        return;
+    }
+    let port = stub_provider(Default::default(), Default::default()).await;
+    let home = std::env::temp_dir().join(format!(
+        "zephyr-real-clean-{}-{}",
+        std::process::id(),
+        zephyr::unix_millis()
+    ));
+    let agent = home.join("rpi-agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(
+        agent.join("models.json"),
+        format!(r#"{{"providers":{{"stub":{{"api":"openai-completions","baseUrl":"http://127.0.0.1:{port}/v1","apiKey":"not-a-key","models":[{{"id":"m","name":"M"}}]}}}}}}"#),
+    )
+    .unwrap();
+    let cfg: Config = toml::from_str(&format!(
+        "rpi = {RPI:?}\nhome = {home:?}\nagent_dir = {agent:?}\nmodel = \"stub/m\"\n[owners]\nchat = [\"owner\"]\n"
+    ))
+    .unwrap();
+    let (feed, rx) = mpsc::channel(4);
+    let channel = Arc::new(TestChannel {
+        feed: tokio::sync::Mutex::new(rx),
+        sent: Mutex::default(),
+    });
+    let (stop, stopped) = oneshot::channel::<()>();
+    let ch = channel.clone();
+    let task = tokio::spawn(async move {
+        zephyr::router::run(&cfg, std::slice::from_ref(&*ch), async {
+            let _ = stopped.await;
+        })
+        .await
+    });
+    let say = |id: &str, text: &str| Inbound {
+        channel: "chat".into(),
+        platform_msg_id: id.into(),
+        sender: "owner".into(),
+        text: text.into(),
+    };
+    let replies = |n: usize| {
+        let channel = channel.clone();
+        async move {
+            for _ in 0..400 {
+                if channel.sent.lock().unwrap().len() >= n {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            channel.sent.lock().unwrap().len()
+        }
+    };
+    for (n, (id, text)) in [
+        ("m1", "/new"),
+        ("m2", "ping"),
+        ("m3", "ping"),
+        ("m4", "/rule be brief"),
+        ("m5", "ping"),
+        ("m6", "/thinking low"),
+        ("m7", "ping"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        feed.send(say(id, text)).await.unwrap();
+        assert_eq!(replies(n + 1).await, n + 1, "no answer to {text}");
+    }
+    let pongs = (channel.sent.lock().unwrap().iter())
+        .filter(|m| m.text == "pong")
+        .count();
+    assert_eq!(pongs, 4, "{:?}", channel.sent.lock().unwrap());
+    let store = zephyr::store::Store::open(&home.join("state.db")).unwrap();
+    let id = store.main_session().unwrap();
+    assert!(id.starts_with("main-"), "{id}");
+    assert_eq!(
+        store.session_origin(&id).unwrap(),
+        zephyr::store::SessionOrigin::Clean,
+        "{:?}",
+        channel.sent.lock().unwrap()
+    );
+    let _ = stop.send(());
+    task.await.unwrap().unwrap();
+}
+
 /// Answers every request with HTTP 429 and counts them.
 async fn rate_limited_provider(hits: Arc<std::sync::atomic::AtomicUsize>) -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

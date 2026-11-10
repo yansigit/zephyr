@@ -111,6 +111,35 @@ fn session_file(dir: &std::path::Path, id: &str) -> Option<std::path::PathBuf> {
         .map(|f| f.1)
 }
 
+/// What session `id`'s saved files are now, to tell whether anything but rpi changed them
+/// between two looks: how many files it has, the newest one's path, and the length and SHA-256
+/// of it and its `.progress.jsonl`. `none` when it has no file.
+pub fn session_print(dir: &std::path::Path, id: &str) -> String {
+    let files: Vec<_> = (main_files(dir).into_iter())
+        .filter(|f| f.0 == id)
+        .collect();
+    let Some(newest) = files.iter().max_by_key(|f| f.2) else {
+        return "none".into();
+    };
+    let _fs = crate::agent::fs();
+    let read = |p: &std::path::Path| match std::fs::read(p) {
+        Ok(bytes) => format!(
+            "{} {}",
+            bytes.len(),
+            crate::drafts::digest([bytes.as_slice()])
+        ),
+        Err(e) => format!("unreadable ({})", e.kind()),
+    };
+    let progress = std::path::PathBuf::from(format!("{}.progress.jsonl", newest.1.display()));
+    format!(
+        "{} {} {} {}",
+        files.len(),
+        newest.1.display(),
+        read(&newest.1),
+        read(&progress)
+    )
+}
+
 /// The first words of session `id`'s first user message, untagged, for `/switch`.
 pub fn opening(dir: &std::path::Path, id: &str) -> Option<String> {
     use std::io::BufRead;

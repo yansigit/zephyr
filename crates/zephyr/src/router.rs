@@ -1667,9 +1667,12 @@ impl<'a> Router<'a> {
             eprintln!("zephyr: reading the main session id failed: {e}");
             MAIN_SESSION.into()
         });
+        // What the new child loads must be what zephyr last saw.
+        self.check_session(&session);
         match Child::spawn_as(&self.cfg, Some(&session), account.as_ref()).await {
             Ok(child) => {
                 eprintln!("zephyr: rpi child {:?} ready", child.pid());
+                self.mark_session(&session);
                 self.spawn_failures = 0;
                 if let Some(a) = &account {
                     eprintln!("zephyr: on account {} ({})", a.name, a.model);
@@ -2001,6 +2004,9 @@ impl<'a> Router<'a> {
         self.run_taint = false;
         let now = crate::now();
         let session = self.child.as_ref().and_then(|c| c.session.clone());
+        if let Some(session) = &session {
+            self.check_session(session);
+        }
         let failed = session.as_ref().and_then(|s| self.tainted.get(s)).cloned();
         let origin = session.map(|s| self.store.session_origin(&s));
         self.trust = match origin {
@@ -2058,6 +2064,59 @@ impl<'a> Router<'a> {
         }
     }
 
+    /// The conversation's saved file is what zephyr last saw (`mark_session`); anything else
+    /// changed it while rpi was idle, so it is tainted (DESIGN §4.6). Only a clean one is looked at.
+    fn check_session(&mut self, session: &str) {
+        if !matches!(self.store.session_origin(session), Ok(SessionOrigin::Clean)) {
+            return;
+        }
+        let now = crate::rpc::session_print(&self.cfg.session_dir(), session);
+        let seen = self.store.session_file(session);
+        if seen.as_ref().ok().map(|s| s.as_deref().unwrap_or("none")) != Some(now.as_str()) {
+            let why = format!(
+                "was changed on disk outside zephyr at {}",
+                self.clock(crate::now())
+            );
+            self.record_taint(session.to_string(), &why);
+        }
+    }
+
+    /// Records the clean conversation's saved file as it is now, after rpi wrote it and with rpi
+    /// idle. A record that cannot be written taints it: the next look would have nothing to trust.
+    fn mark_session(&mut self, session: &str) {
+        if !matches!(self.store.session_origin(session), Ok(SessionOrigin::Clean)) {
+            return;
+        }
+        let now = crate::rpc::session_print(&self.cfg.session_dir(), session);
+        if let Err(e) = self.store.set_session_file(session, &now) {
+            eprintln!("zephyr: recording the conversation's file failed: {e}");
+            let why = format!(
+                "could not have its saved file recorded at {}",
+                self.clock(crate::now())
+            );
+            self.record_taint(session.to_string(), &why);
+        }
+    }
+
+    /// The child's session, if it has one.
+    fn child_session(&self) -> Option<String> {
+        self.child.as_ref().and_then(|c| c.session.clone())
+    }
+
+    /// An rpi command that writes the session while it is idle (`set_model`,
+    /// `set_thinking_level`, `navigate`): the file is checked before and recorded after.
+    async fn call_writing(&mut self, cmd: Value) -> anyhow::Result<Value> {
+        let session = self.child_session();
+        if let Some(s) = &session {
+            self.check_session(s);
+        }
+        let answer = self.call(cmd).await;
+        if let Some(s) = &session {
+            self.mark_session(s);
+        }
+        answer
+    }
+
     /// At start: a run of main in flight when the daemon stopped may have read text whose events
     /// were never read, so its conversation is not the owner's alone (DESIGN §4.6).
     fn taint_cut_off(&mut self) {
@@ -2100,6 +2159,10 @@ impl<'a> Router<'a> {
     async fn settled(&mut self, ev: &Value) {
         self.busy = false;
         self.run_start = None;
+        // What rpi wrote in the run is the conversation now.
+        if let Some(session) = self.child_session() {
+            self.mark_session(&session);
+        }
         let cut = self.cut.take();
         self.cut_at = None;
         self.compacted(ev);
@@ -3492,8 +3555,15 @@ impl<'a> Router<'a> {
     /// (ClawSafety Table 3), so the owner can cut one off.
     async fn new_session(&mut self) -> String {
         let id = format!("{MAIN_SESSION}-{}", crate::now());
-        // Clean from its first message; `/switch` back to an older one never cleans it.
-        if let Err(e) = self.store.mark_clean(&id) {
+        // Clean from its first message; `/switch` back to an older one never cleans it. A file
+        // for the id already there was not rpi's for this conversation.
+        if crate::rpc::session_print(&self.cfg.session_dir(), &id) != "none" {
+            let why = format!(
+                "was already on disk when /new made it at {}",
+                self.clock(crate::now())
+            );
+            self.record_taint(id.clone(), &why);
+        } else if let Err(e) = self.store.mark_clean(&id) {
             eprintln!("zephyr: marking {id} clean failed: {e}");
         }
         match self.switch_main(&id).await {
@@ -3834,7 +3904,7 @@ impl<'a> Router<'a> {
 
     async fn set_thinking(&mut self, level: &str) -> anyhow::Result<()> {
         let set = json!({"type": "set_thinking_level", "level": level});
-        let v = self.call(set).await?;
+        let v = self.call_writing(set).await?;
         self.thinking = Some(v["thinkingLevel"].as_str().unwrap_or(level).into());
         Ok(())
     }
@@ -3845,7 +3915,7 @@ impl<'a> Router<'a> {
         self.child.as_ref()?; // a child that is down starts on the new model anyway
         let (provider, id) = model.split_once('/')?;
         let cmd = json!({"type": "set_model", "provider": provider, "modelId": id});
-        let Err(e) = self.call(cmd).await else {
+        let Err(e) = self.call_writing(cmd).await else {
             self.read_state().await; // the new model's context window
             return None;
         };
@@ -3880,7 +3950,15 @@ impl<'a> Router<'a> {
         }
         self.restart = false;
         if let Some(child) = self.child.take() {
+            // rpi may write the session as it stops: checked before, recorded after.
+            let session = child.session.clone();
+            if let Some(s) = &session {
+                self.check_session(s);
+            }
             child.stop().await;
+            if let Some(s) = &session {
+                self.mark_session(s);
+            }
             eprintln!("zephyr: restarting rpi");
         }
         self.respawn_at = Instant::now();
@@ -4235,7 +4313,7 @@ impl<'a> Router<'a> {
         {
             navigate["targetId"] = json!(id);
         }
-        let moved = self.call(navigate).await.map_err(|e| failed(&e))?;
+        let moved = self.call_writing(navigate).await.map_err(|e| failed(&e))?;
         if moved["outcome"] != "completed" {
             return Err(failed(&format!("rpi answered {moved}")));
         }

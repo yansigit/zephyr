@@ -987,7 +987,7 @@ impl Store {
             // Where each conversation's text came from and who made each memory commit (DESIGN
             // §4.6); a fresh install's first conversation starts clean, an existing one does not.
             db.execute_batch(
-                "CREATE TABLE session_origin(session TEXT PRIMARY KEY, tainted TEXT, at INTEGER NOT NULL);
+                "CREATE TABLE session_origin(session TEXT PRIMARY KEY, tainted TEXT, at INTEGER NOT NULL, file TEXT);
                  CREATE TABLE memory_commits(sha TEXT PRIMARY KEY, at INTEGER NOT NULL, origin TEXT NOT NULL, auto INTEGER NOT NULL);
                  ALTER TABLE jobs ADD COLUMN builtin TEXT;
                  ALTER TABLE inbox ADD COLUMN owner INTEGER NOT NULL DEFAULT 0;
@@ -2128,6 +2128,28 @@ impl Store {
              ON CONFLICT(session) DO UPDATE SET tainted = coalesce(tainted, excluded.tainted),
                at = CASE WHEN tainted IS NULL THEN excluded.at ELSE at END",
             params![session, reason],
+        )?;
+        Ok(())
+    }
+
+    /// What the conversation's saved file was when zephyr last saw it idle (`rpc::session_print`);
+    /// `None` when it has no row or none was recorded.
+    pub fn session_file(&self, session: &str) -> rusqlite::Result<Option<String>> {
+        let row: Option<Option<String>> = self
+            .db
+            .query_row(
+                "SELECT file FROM session_origin WHERE session = ?1",
+                params![session],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row.flatten())
+    }
+
+    pub fn set_session_file(&self, session: &str, print: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE session_origin SET file = ?2 WHERE session = ?1",
+            params![session, print],
         )?;
         Ok(())
     }

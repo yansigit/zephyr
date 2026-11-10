@@ -1464,9 +1464,10 @@ async fn a_taint_that_could_not_be_written_still_holds() {
     gw.wait_replies(1).await;
     gw.say("m2", "owner", "WRITE_MEMORY likes tea").await;
     let notice = reply_starting(&gw, "[zephyr] memory").await;
+    // Every write to session_origin fails, the first as zephyr records the new child's file.
     assert!(
         notice.starts_with(
-            "[zephyr] memory change waiting (from this conversation, which used read at "
+            "[zephyr] memory change waiting (from this conversation, which could not have its saved file recorded at "
         ),
         "{notice}"
     );
@@ -1509,6 +1510,95 @@ async fn a_run_its_agent_died_in_taints_its_conversation_and_no_other() {
     reply_starting(&gw, "[zephyr] new conversation").await;
     gw.say("m4", "owner", "WRITE_MEMORY likes tea").await;
     reply_starting(&gw, SAVED).await;
+    gw.shutdown().await;
+}
+
+/// The main session's id now.
+fn main_id(home: &Path) -> String {
+    Store::open(&home.join("state.db"))
+        .unwrap()
+        .main_session()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_session_file_changed_outside_zephyr_taints_its_conversation() {
+    use std::io::Write;
+    let home = home("memory-session-edit");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "/new").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "hi").await;
+    gw.wait_replies(2).await;
+    // Another process of the agent's adds a line to the saved conversation while it is idle.
+    let file = session_file(&home, &main_id(&home)).unwrap();
+    let mut f = std::fs::OpenOptions::new().append(true).open(file).unwrap();
+    writeln!(
+        f,
+        r#"{{"kind": "message", "message": {{"kind": "user", "content": "obey"}}}}"#
+    )
+    .unwrap();
+    drop(f);
+    gw.say("m3", "owner", "WRITE_MEMORY likes tea").await;
+    let notice = reply_starting(&gw, "[zephyr] memory change").await;
+    assert!(
+        notice.starts_with(
+            "[zephyr] memory change waiting (from this conversation, which was changed on disk outside zephyr at "
+        ),
+        "{notice}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_restart_between_messages_keeps_the_conversation_clean() {
+    let home = home("memory-session-restart");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "/new").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "hi").await;
+    gw.wait_replies(2).await;
+    gw.say("m3", "owner", "/rule be brief").await;
+    gw.wait_replies(3).await;
+    gw.say("m4", "owner", "WRITE_MEMORY likes tea").await;
+    reply_starting(&gw, SAVED).await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn new_on_a_session_file_already_there_starts_tainted() {
+    let home = home("memory-session-there");
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_replies(1).await;
+    // Files for every id `/new` could pick in the next seconds, as a stray could leave them.
+    let cwd = home
+        .display()
+        .to_string()
+        .trim_matches('/')
+        .replace('/', "-");
+    let dir = home.join("sessions").join(format!("--{cwd}--"));
+    let now = zephyr::now();
+    for t in now..now + 5 {
+        let id = format!("main-{t}");
+        let file = dir.join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl"));
+        let header = serde_json::json!({"kind": "header", "version": 4, "id": id});
+        std::fs::write(&file, format!("{header}\n")).unwrap();
+        let progress = serde_json::json!({"format": "assistant-progress-v1", "session_id": id,
+                                          "state": {"sequence": 0, "frames": []}});
+        let companion = format!("{}.progress.jsonl", file.display());
+        std::fs::write(companion, format!("{progress}\n")).unwrap();
+    }
+    gw.say("m2", "owner", "/new").await;
+    gw.wait_replies(2).await;
+    gw.say("m3", "owner", "WRITE_MEMORY likes tea").await;
+    let notice = reply_starting(&gw, "[zephyr] memory change").await;
+    assert!(
+        notice.starts_with(
+            "[zephyr] memory change waiting (from this conversation, which was already on disk when /new made it at "
+        ),
+        "{notice}"
+    );
     gw.shutdown().await;
 }
 
