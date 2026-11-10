@@ -371,6 +371,18 @@ pub static SETTINGS: &[Setting] = &[
         Apply::Goal,
     ),
     row(
+        "review.at",
+        "Goals and review",
+        "Daily review",
+        "When the daily review of the goals, the day's activity and memory is sent, HH:MM in \
+         the time zone; none is off.",
+        Kind::Optional(&Kind::Text { max: 5 }),
+        Access::Propose,
+        false,
+        Stricter::NotOrdered,
+        Apply::Toml,
+    ),
+    row(
         "persona",
         "Memory",
         "Persona",
@@ -893,6 +905,7 @@ pub fn value(cfg: &Config, key: &str) -> Option<String> {
         "budget.run_turns" => budget?.run_turns.map(|v| v.to_string()),
         "budget.run_minutes" => budget?.run_minutes.map(|v| v.to_string()),
         "timezone" => cfg.timezone.clone(),
+        "review.at" => cfg.review_at().map(String::from),
         "auth.enabled" => Some(cfg.auth.enabled.to_string()),
         "auth.refresh_minutes" => Some(cfg.auth.refresh_minutes.to_string()),
         "settings.strong_channels" => Some(cfg.settings.strong_channels.join(", ")),

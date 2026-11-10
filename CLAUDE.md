@@ -84,7 +84,9 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   outage alert (`zephyr alert`, a systemd user timer posting to ntfy). Tasks interrupted by a crash or re-exec resume in their session (`scheduler::resume`, at most
   3 times), and runs with no rpi event for `stall_limit` are aborted. Mid-run messages are steered in (`queue_message` `deliverAs: steer`,
   DESIGN §4.1),
-  `memory.rs` (git-committed memory files; a change waits for `/memory ok` unless the router saw
+  `review.rs` (the built-in daily review, DESIGN §4.5: a `builtin = 'review'` job row kept in step
+  with `review.at` by `sync`; its run sends the daemon's block, then the model's check-in only when
+  there are goals), `memory.rs` (git-committed memory files; a change waits for `/memory ok` unless the router saw
   its run was the owner's alone, DESIGN §4.6: `session_origin` taint per conversation, daemon
   inbox rows, `Tally::main`'s clean list, `Store::writers_since` and strays, `clean_base`; each
   commit's origin in `memory_commits`), `checkpoint.rs` (DESIGN §4.14: snapshots of the

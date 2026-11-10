@@ -182,6 +182,9 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
     if store.interrupt_running_runs(crate::now())? > 0 {
         wake.outbox.notify_one();
     }
+    if let Err(e) = crate::review::sync(&mut store, &cfg) {
+        eprintln!("zephyr: keeping the daily review job in step failed: {e:#}");
+    }
     let mut tick = tokio::time::interval(TICK);
     let mut poll = tokio::time::interval(PAUSE_POLL);
     let mut was_paused = false;
@@ -196,6 +199,9 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
         if cfgs.has_changed().unwrap_or(false) {
             cfg = cfgs.borrow_and_update().clone();
             tz = zone(&cfg)?; // checked by Config::validate
+            if let Err(e) = crate::review::sync(&mut store, &cfg) {
+                eprintln!("zephyr: keeping the daily review job in step failed: {e:#}");
+            }
         }
         // Hourly, from the first tick on: leftovers older than 30 days (DESIGN §4.1).
         // On a blocking thread with its own connection, one at a time: it walks dirs and runs
@@ -225,7 +231,7 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
             eprintln!("zephyr: claiming job runs failed: {e}");
         }
         while !paused(&store) {
-            let run = match store.start_next_run(crate::now()) {
+            let mut run = match store.start_next_run(crate::now()) {
                 Ok(Some(run)) => run,
                 Ok(None) => break,
                 Err(e) => {
@@ -233,9 +239,32 @@ pub async fn run(mut cfgs: watch::Receiver<Arc<Config>>, wake: &Wake) -> anyhow:
                     break;
                 }
             };
+            // The daily review sends the daemon's block first; the model is asked only when
+            // there are goals (DESIGN §4.5).
+            let prompt = match run.job.builtin.as_deref() {
+                Some("review") => {
+                    match crate::review::prepare(&cfg, &mut store, &mut run, crate::now()) {
+                        crate::review::Step::Run(prompt) => prompt,
+                        step => {
+                            let (status, output) = match step {
+                                crate::review::Step::Failed(why) => ("failed", why),
+                                _ => ("completed", SILENT.to_string()),
+                            };
+                            if let Err(e) =
+                                store.finish_run(&run, status, &output, None, crate::now())
+                            {
+                                eprintln!("zephyr: recording job run {} failed: {e}", run.id);
+                            }
+                            wake.outbox.notify_one();
+                            continue;
+                        }
+                    }
+                }
+                _ => run.job.prompt.clone(),
+            };
             wake.running.store(true, Ordering::SeqCst);
             let spec = Spec {
-                prompt: &run.job.prompt,
+                prompt: &prompt,
                 goal: &run.job.prompt,
                 label: format!(
                     "[zephyr] job #{} ({}) run {}",
@@ -913,6 +942,14 @@ pub fn command(store: &mut Store, cfg: &Config, m: &Inbound) -> Option<String> {
     let (verb, arg) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     let arg = arg.trim();
     let id = arg.parse::<i64>();
+    // The daily review is `review.at`'s: `/job run` runs it, nothing else here changes it.
+    if let (&Ok(id), "rm" | "ok") = (&id, verb) {
+        if matches!(store.job(id), Ok(Some(job)) if job.builtin.is_some()) {
+            return Some(format!(
+                "[zephyr] job #{id} is the daily review; /set review.at none turns it off"
+            ));
+        }
+    }
     let reply = match (verb, id) {
         ("add", _) => match zone(cfg) {
             Ok(tz) => add(store, &tz, m, arg),
@@ -979,6 +1016,12 @@ pub(crate) fn list(store: &Store) -> rusqlite::Result<String> {
     let lines: Vec<String> = jobs
         .iter()
         .map(|j| {
+            if j.builtin.is_some() {
+                // `M H * * *`, as `review::sync` writes it.
+                let mut f = j.schedule.split(' ').map(|n| n.parse::<u32>().unwrap_or(0));
+                let (m, h) = (f.next().unwrap_or(0), f.next().unwrap_or(0));
+                return format!("#{} {} (built-in, review.at {h:02}:{m:02})", j.id, j.name);
+            }
             format!(
                 "#{} {} | {} | {} | to {}{}",
                 j.id,

@@ -103,6 +103,15 @@ pub struct Job {
     pub builtin: Option<String>,
 }
 
+/// A goal marked done (`settings_log` key `goal`, new `done`), for the daily review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalDone {
+    pub text: String,
+    pub actor: String,
+    pub proposal: Option<i64>,
+    pub at: i64,
+}
+
 /// A run taken off the queue, with what it needs from its job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobRun {
@@ -2187,6 +2196,83 @@ impl Store {
         rows.collect()
     }
 
+    /// The job zephyr keeps for `builtin` (`review`), if there is one.
+    pub fn builtin_job(&self, builtin: &str) -> rusqlite::Result<Option<Job>> {
+        self.db
+            .query_row(
+                &format!("SELECT {JOB_COLUMNS} FROM jobs WHERE builtin = ?1 ORDER BY id LIMIT 1"),
+                params![builtin],
+                |r| job_row(r, 0),
+            )
+            .optional()
+    }
+
+    /// A job zephyr keeps (`add_job` never makes one), on from its creation.
+    pub fn add_builtin_job(
+        &self,
+        builtin: &str,
+        name: &str,
+        schedule: &str,
+        prompt: &str,
+        channel: &str,
+        recipient: &str,
+    ) -> rusqlite::Result<i64> {
+        // As `add_job`: past every id a removed job's runs still name.
+        self.db.execute(
+            &format!(
+                "INSERT INTO jobs(id, name, schedule, prompt, channel, recipient, builtin)
+                 VALUES ({NEW_JOB_ID}, ?1, ?2, ?3, ?4, ?5, ?6)"
+            ),
+            params![name, schedule, prompt, channel, recipient, builtin],
+        )?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    /// A new schedule, counted from now (`claim_due`).
+    pub fn set_job_schedule(&self, id: i64, schedule: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE jobs SET schedule = ?2, created_at = unixepoch() WHERE id = ?1",
+            params![id, schedule],
+        )?;
+        Ok(())
+    }
+
+    /// Where the job's output goes from now on.
+    pub fn retarget_job(&self, id: i64, channel: &str, recipient: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE jobs SET channel = ?2, recipient = ?3 WHERE id = ?1",
+            params![id, channel, recipient],
+        )?;
+        Ok(())
+    }
+
+    /// When the newest completed run of the `builtin` job was due.
+    pub fn last_builtin_run(&self, builtin: &str) -> rusqlite::Result<Option<i64>> {
+        self.db.query_row(
+            "SELECT max(runs.due_at) FROM runs JOIN jobs ON jobs.id = runs.job_id
+             WHERE jobs.builtin = ?1 AND runs.status = 'completed'",
+            params![builtin],
+            |r| r.get(0),
+        )
+    }
+
+    /// Goals marked done at or after `since`, oldest first.
+    pub fn goals_done_since(&self, since: i64) -> rusqlite::Result<Vec<GoalDone>> {
+        let mut stmt = self.db.prepare(
+            "SELECT coalesce(old, ''), actor, proposal, at FROM settings_log
+             WHERE key = 'goal' AND new = 'done' AND at >= ?1 ORDER BY at, id",
+        )?;
+        let rows = stmt.query_map(params![since], |r| {
+            Ok(GoalDone {
+                text: r.get(0)?,
+                actor: r.get(1)?,
+                proposal: r.get(2)?,
+                at: r.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// Deletes the job and its runs that have not started, unless a run of it is in progress
     /// (its restart notice joins `jobs`). Its other runs stay, in the activity record as
     /// `(removed)` and keeping run ids from being reused, so the key on `runs.job_id` (which the
@@ -2241,7 +2327,10 @@ impl Store {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let due: Vec<i64> = {
             let mut stmt = tx.prepare(
-                "SELECT id, schedule, coalesce((SELECT max(due_at) FROM runs WHERE job_id = jobs.id), created_at)
+                // A job counts from its last run, or from its creation or its last move
+                // (`set_job_schedule`), whichever is later: a moved job never fires for a time
+                // that passed before the move.
+                "SELECT id, schedule, max(coalesce((SELECT max(due_at) FROM runs WHERE job_id = jobs.id), created_at), created_at)
                  FROM jobs WHERE enabled = 1",
             )?;
             let rows = stmt.query_map([], |r| {
@@ -4545,5 +4634,104 @@ mod tests {
         );
         assert_eq!(activity_sql(&["inbox"]), None);
         assert!(store.activity(0, &["inbox"], None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_moved_job_counts_from_its_move() {
+        let mut store = Store::open(&crate::test_dir("store-moved").join("state.db")).unwrap();
+        let utc =
+            |s: &str, after: i64| crate::scheduler::next_after(s, after, &jiff::tz::TimeZone::UTC);
+        let day = 1_762_732_800; // a midnight, UTC
+        let id = store.add_job("j", "30 21 * * *", "p", "chat", "o").unwrap();
+        let ago = day - 10 * 86400;
+        store
+            .db
+            .execute("UPDATE jobs SET created_at = ?1", [ago])
+            .unwrap();
+        // The last run was due yesterday at 21:30.
+        store.queue_run(id, day - 9000).unwrap();
+        store
+            .db
+            .execute("UPDATE runs SET status = 'completed'", [])
+            .unwrap();
+        let before = crate::now();
+        store.set_job_schedule(id, "0 6 * * *").unwrap();
+        let moved: i64 = (store.db)
+            .query_row("SELECT created_at FROM jobs WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(moved >= before, "the move dates the job");
+        assert_eq!(store.job(id).unwrap().unwrap().schedule, "0 6 * * *");
+        // Moved at 07:00: 06:00 today has passed, but it was before the move.
+        let seven = day + 7 * 3600;
+        store
+            .db
+            .execute("UPDATE jobs SET created_at = ?1", [seven])
+            .unwrap();
+        assert!(store.claim_due(seven, utc).unwrap().is_empty());
+        assert_eq!(store.claim_due(day + 30 * 3600, utc).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_builtin_review_job_is_kept_apart() {
+        let store = Store::open(&crate::test_dir("store-builtin").join("state.db")).unwrap();
+        assert_eq!(store.builtin_job("review").unwrap(), None);
+        store
+            .add_job("mine", "* * * * *", "p", "chat", "o")
+            .unwrap();
+        let id = (store.add_builtin_job("review", "review", "30 21 * * *", "P", "", "")).unwrap();
+        let job = store.builtin_job("review").unwrap().unwrap();
+        assert_eq!((job.id, job.builtin.as_deref()), (id, Some("review")));
+        assert_eq!(store.jobs().unwrap()[0].builtin, None);
+        store.retarget_job(id, "discord", "d1").unwrap();
+        let job = store.job(id).unwrap().unwrap();
+        assert_eq!(
+            (job.channel.as_str(), job.recipient.as_str()),
+            ("discord", "d1")
+        );
+        store
+            .log_setting(
+                "goal",
+                Some("Renew passport"),
+                Some("done"),
+                "owner",
+                Some("chat"),
+                None,
+            )
+            .unwrap();
+        store
+            .log_setting(
+                "goal",
+                Some("Other"),
+                Some("removed"),
+                "owner",
+                Some("chat"),
+                None,
+            )
+            .unwrap();
+        store
+            .log_setting(
+                "goal",
+                Some("Run"),
+                Some("done"),
+                "agent",
+                Some("chat"),
+                Some(3),
+            )
+            .unwrap();
+        let done = store.goals_done_since(0).unwrap();
+        let texts: Vec<_> = done
+            .iter()
+            .map(|d| (d.text.as_str(), d.actor.as_str(), d.proposal))
+            .collect();
+        assert_eq!(
+            texts,
+            [("Renew passport", "owner", None), ("Run", "agent", Some(3))]
+        );
+        assert!(store
+            .goals_done_since(crate::now() + 10)
+            .unwrap()
+            .is_empty());
     }
 }

@@ -439,6 +439,12 @@ lines are fine, up to 4000 characters) says who the agent is with you; `/persona
 propose a goal, that one is done, or a persona, through a card you `/ok`; it never changes them
 itself. Both live with the daemon, beside the rules.
 
+`/set review.at 21:30` turns on a daily review at that time (in `timezone`): zephyr sends your
+goals, what was done since the last review, the day's activity and the memory changes, then the
+agent's short check-in on the goals (none when you have no goals). It goes to the channel you last
+wrote from. `/job list` shows it as a built-in job; `/job run N` sends one now, and
+`/set review.at none` turns it off.
+
 ## The agent's browser and desktop
 
 The image gives the agent a browser and a screen of its own (DESIGN §4.11):

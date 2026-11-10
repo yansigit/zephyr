@@ -411,6 +411,42 @@ pub fn commit_if_changed(home: &Path, state: &Path, origin: &Origin) -> anyhow::
     ))))
 }
 
+/// The memory part of the daily review (DESIGN §4.5): one line per commit zephyr recorded since
+/// `since`, with its origin, then the change waiting, if any, which this marks shown so the
+/// owner's `/memory ok` keeps it at once. `None`: nothing to say.
+pub fn digest(
+    home: &Path,
+    state: &Path,
+    store: &crate::store::Store,
+    since: i64,
+    tz: &jiff::tz::TimeZone,
+) -> anyhow::Result<Option<String>> {
+    let mut lines: Vec<String> = (store.memory_commits_since(since)?.iter())
+        .map(|c| {
+            let short = c.sha.get(..7).unwrap_or(&c.sha);
+            let saved = if c.auto { "saved, " } else { "" };
+            let at = crate::settings::clock(c.at, tz);
+            format!("- {at} {short} {saved}from {}", c.origin)
+        })
+        .collect();
+    let _guard = lock();
+    if approved_dir(state).exists() {
+        let working = {
+            let _fs = crate::agent::fs();
+            read_working(home)?
+        };
+        let approved = read_approved(state)?;
+        if working != approved {
+            mark_shown(state, &working)?;
+            lines.push(format!(
+                "Waiting (/memory ok keeps it, /memory undo drops it):\n{}",
+                diff(&approved, &working)
+            ));
+        }
+    }
+    Ok((!lines.is_empty()).then(|| lines.join("\n")))
+}
+
 /// A commit's result for its caller: the commit's row in `memory_commits` (what the digest
 /// trusts, not the agent's git log; a failed write is logged) and the owner's notice.
 pub fn recorded(store: &crate::store::Store, done: anyhow::Result<Committed>) -> Option<String> {
@@ -1859,6 +1895,61 @@ mod tests {
             clean_base(&home, &st),
             Some(head(&home)),
             "approved as it is"
+        );
+    }
+
+    #[test]
+    fn digest_lists_commits_with_their_origin_then_the_waiting_diff() {
+        let home = home();
+        let st = state(&home);
+        std::fs::create_dir_all(&st).unwrap();
+        let store = crate::store::Store::open(&st.join("state.db")).unwrap();
+        let utc = jiff::tz::TimeZone::UTC;
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        assert_eq!(
+            digest(&home, &st, &store, 0, &utc).unwrap(),
+            None,
+            "nothing to say"
+        );
+        let base = clean_base(&home, &st).unwrap();
+        std::fs::write(dir(&home).join(USER), "# USER.md\nTakes coffee black\n").unwrap();
+        let saved = recorded(
+            &store,
+            commit_if_changed(&home, &st, &Origin::Owner { base }),
+        );
+        assert!(saved.is_some());
+        std::fs::write(dir(&home).join(MEMORY), "# MEMORY.md\nfrom a task\n").unwrap();
+        recorded(&store, commit_if_changed(&home, &st, &Origin::Task(7)));
+        // Changed again after that notice, so not shown yet.
+        std::fs::write(
+            dir(&home).join(MEMORY),
+            "# MEMORY.md\nfrom a task, then more\n",
+        )
+        .unwrap();
+        let commits = store.memory_commits_since(0).unwrap();
+        let line = |i: usize, what: &str| {
+            let c = &commits[i];
+            format!(
+                "- {} {} {what}",
+                crate::settings::clock(c.at, &utc),
+                &c.sha[..7]
+            )
+        };
+        assert_eq!(
+            digest(&home, &st, &store, 0, &utc).unwrap().unwrap(),
+            format!(
+                "{}\n{}\nWaiting (/memory ok keeps it, /memory undo drops it):\nMEMORY.md\n+ from a task, then more",
+                line(0, "saved, from your message"),
+                line(1, "from task #7")
+            )
+        );
+        assert!(
+            say(&home, "/memory ok").starts_with("[zephyr] memory kept"),
+            "shown by the digest"
+        );
+        assert_eq!(
+            digest(&home, &st, &store, crate::now() + 10, &utc).unwrap(),
+            None
         );
     }
 }

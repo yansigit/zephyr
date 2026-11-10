@@ -918,6 +918,12 @@ async fn a_paused_scheduler_claims_nothing_and_catches_up_once_on_resume() {
     let today = store.today().unwrap();
     store.set_paused(Some(&format!("budget:{today}"))).unwrap();
     drop(store);
+    // Made before that run, as a job that ran an hour ago was (a job counts from its creation
+    // or last move when that is later than its last run).
+    rusqlite::Connection::open(cfg.db_path())
+        .unwrap()
+        .execute("UPDATE jobs SET created_at = ?1", [zephyr::now() - 7200])
+        .unwrap();
 
     let gw = start(cfg);
     // The scheduler shares the router's task, and its first tick and pause poll are due at
@@ -1181,6 +1187,126 @@ async fn forget_restarts_the_agent_and_records_its_commit() {
     assert!(!agents.contains("likes tea"), "{agents}");
     assert_eq!(last_memory_commit(&home), ("you (/forget)".into(), true));
     gw.shutdown().await;
+}
+
+/// The built-in review job's row, once the scheduler has synced it.
+fn review_job(home: &Path) -> Option<zephyr::store::Job> {
+    Store::open(&home.join("state.db"))
+        .unwrap()
+        .builtin_job("review")
+        .unwrap()
+}
+
+/// Sets `review.at` and waits for the scheduler to bring the built-in job in step.
+async fn review_at(gw: &Gateway, home: &Path, n: &str, at: &str, schedule: Option<&str>) {
+    gw.say(n, "owner", &format!("/set review.at {at}")).await;
+    let want = schedule.map(String::from);
+    wait(|| review_job(home).map(|j| j.schedule) == want).await;
+}
+
+fn run_output(home: &Path) -> String {
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    db.query_row(
+        "SELECT coalesce(output, '') FROM runs ORDER BY id DESC LIMIT 1",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn review_at_creates_moves_and_removes_the_builtin_job() {
+    let home = home("review-sync");
+    let gw = start(on_file(&home, "timezone = \"UTC\""));
+    review_at(&gw, &home, "m1", "21:30", Some("30 21 * * *")).await;
+    gw.say("m2", "owner", "/job list").await;
+    assert_eq!(
+        reply_starting(&gw, "#1 ").await,
+        "#1 review (built-in, review.at 21:30)"
+    );
+    review_at(&gw, &home, "m3", "08:05", Some("5 8 * * *")).await;
+    review_at(&gw, &home, "m4", "none", None).await;
+    gw.say("m5", "owner", "/job list").await;
+    reply_starting(&gw, "[zephyr] no jobs").await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_review_sends_the_daemons_block_then_the_check_in() {
+    let home = home("review-run");
+    let gw = start(on_file(&home, "timezone = \"UTC\""));
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_replies(1).await;
+    gw.say("m2", "owner", "/goal add Ship zephyr 0.8").await;
+    gw.wait_replies(2).await;
+    review_at(&gw, &home, "m3", "21:30", Some("30 21 * * *")).await;
+    gw.say("m4", "owner", "/job run 1").await;
+    let block = reply_starting(&gw, "[zephyr] daily review, ").await;
+    assert!(block.contains("\nGoals\n1. Ship zephyr 0.8\n"), "{block}");
+    wait(|| {
+        gw.replies()
+            .iter()
+            .any(|r| r.contains("This is the owner's daily review"))
+    })
+    .await;
+    let replies = gw.replies();
+    let at = |p: &str| replies.iter().position(|r| r.contains(p)).unwrap();
+    assert!(at("[zephyr] daily review, ") < at("This is the owner's daily review"));
+    wait(|| run_status(&home, "completed") == 1).await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_review_with_no_goals_calls_no_model() {
+    let home = home("review-quiet");
+    let gw = start(on_file(&home, "timezone = \"UTC\""));
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_replies(1).await;
+    review_at(&gw, &home, "m2", "21:30", Some("30 21 * * *")).await;
+    let prompts = log(&home, "prompt").len();
+    gw.say("m3", "owner", "/job run 1").await;
+    wait(|| run_status(&home, "completed") == 1).await;
+    assert_eq!(run_output(&home), "[SILENT]");
+    assert_eq!(log(&home, "prompt").len(), prompts, "no model call");
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_review_is_not_removed_or_approved_through_job() {
+    let home = home("review-guard");
+    let gw = start(on_file(&home, "timezone = \"UTC\""));
+    review_at(&gw, &home, "m1", "21:30", Some("30 21 * * *")).await;
+    let said = "[zephyr] job #1 is the daily review; /set review.at none turns it off";
+    gw.say("m2", "owner", "/job rm 1").await;
+    reply_starting(&gw, said).await;
+    gw.say("m3", "owner", "/job ok 1").await;
+    wait(|| gw.replies().iter().filter(|r| *r == said).count() == 2).await;
+    assert!(review_job(&home).is_some());
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_review_before_any_message_fails_and_sends_nothing() {
+    let home = home("review-nobody");
+    let gw = start(on_file(&home, "timezone = \"UTC\""));
+    crate_goal(&home);
+    review_at(&gw, &home, "m1", "21:30", Some("30 21 * * *")).await;
+    gw.say("m2", "owner", "/job run 1").await;
+    wait(|| run_status(&home, "failed") == 1).await;
+    assert_eq!(run_output(&home), "no owner to send the review to");
+    assert!(
+        !gw.replies()
+            .iter()
+            .any(|r| r.starts_with("[zephyr] daily review")),
+        "{:?}",
+        gw.replies()
+    );
+    gw.shutdown().await;
+}
+
+/// A goal written as `/goal add` would, without a message the agent takes up.
+fn crate_goal(home: &Path) {
+    std::fs::write(home.join("GOALS.md"), "Ship zephyr 0.8\n").unwrap();
 }
 
 #[tokio::test]

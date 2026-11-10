@@ -83,6 +83,8 @@ pub struct Config {
     /// `[network]`: where the agent may connect beyond public ports 80 and 443 (DESIGN §4.20).
     #[serde(default)]
     pub network: Network,
+    /// `[review]`: the built-in daily review (DESIGN §4.5). Off when absent.
+    pub review: Option<Review>,
     /// `[approvals]`: how messages, posts and payments wait for the owner (approvals spec §4.3).
     /// Absent is the `manual` preset. `approvals::effective` reads it.
     pub approvals: Option<Approvals>,
@@ -171,6 +173,24 @@ impl Budget {
             .filter(|max| elapsed.as_secs_f64() >= max * 60.0)
             .map(|max| format!("{max} minutes (budget.run_minutes)"))
     }
+}
+
+/// `[review]` (DESIGN §4.5): `at`, `HH:MM` in `timezone`, the time of the daily review.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Review {
+    pub at: Option<String>,
+}
+
+/// `HH:MM` as `(hour, minute)`, 00:00 to 23:59, two digits each.
+pub fn hh_mm(at: &str) -> Option<(u32, u32)> {
+    let (h, m) = at.split_once(':')?;
+    let two = |s: &str| -> Option<u32> {
+        let digits = s.len() == 2 && s.bytes().all(|b| b.is_ascii_digit());
+        digits.then(|| s.parse().ok()).flatten()
+    };
+    let (h, m) = (two(h)?, two(m)?);
+    (h < 24 && m < 60).then_some((h, m))
 }
 
 /// `[tasks]` (DESIGN §4.12).
@@ -364,6 +384,11 @@ impl Config {
     }
 
     /// Account names become directory names, so each must be a plain, unique path segment.
+    /// `[review] at`, when the daily review is on.
+    pub fn review_at(&self) -> Option<&str> {
+        self.review.as_ref()?.at.as_deref()
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         let mut seen = std::collections::HashSet::new();
         for a in &self.accounts {
@@ -385,6 +410,11 @@ impl Config {
         for name in &self.agent.env {
             if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 anyhow::bail!("agent.env {name:?}: use a variable name (letters, digits, '_')");
+            }
+        }
+        if let Some(at) = self.review_at() {
+            if hh_mm(at).is_none() {
+                anyhow::bail!("[review] at must be HH:MM, e.g. 21:30");
             }
         }
         if !(1..=32).contains(&self.parallel_tasks()) {
@@ -739,5 +769,25 @@ prompt = "Build it."
                 PathBuf::from("/opt/zephyr/ext/libzephyr_cursor.so"),
             ]
         );
+    }
+
+    #[test]
+    fn a_review_time_must_be_hh_mm() {
+        let load = |at: &str| {
+            let cfg: Config = toml::from_str(&format!(
+                "rpi = \"/r\"\nhome = \"/h\"\n[review]\nat = \"{at}\"\n"
+            ))
+            .unwrap();
+            cfg.validate().map_err(|e| e.to_string())
+        };
+        assert!(load("21:30").is_ok());
+        assert!(load("00:00").is_ok() && load("23:59").is_ok());
+        for bad in ["25:00", "9:30", "21:5", "21:60", "2130", "ab:cd"] {
+            assert_eq!(
+                load(bad).unwrap_err(),
+                "[review] at must be HH:MM, e.g. 21:30",
+                "{bad}"
+            );
+        }
     }
 }

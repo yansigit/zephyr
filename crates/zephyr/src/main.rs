@@ -602,6 +602,12 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     if let Some(w) = zephyr::retention::backup_warning(cfg, std::time::SystemTime::now()) {
         println!("warn {w}");
     }
+    // A warning too: the scheduler makes the review job again at its next start or config change.
+    let review =
+        zephyr::store::Store::open(&cfg.db_path()).map(|s| zephyr::review::warning(cfg, &s));
+    if let Ok(Some(w)) = review {
+        println!("warn {w}");
+    }
     if !ok {
         anyhow::bail!("doctor found problems");
     }
