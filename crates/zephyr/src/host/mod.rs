@@ -4,6 +4,7 @@
 mod alert;
 pub mod conf;
 mod setup;
+mod web;
 
 use anyhow::{bail, Context};
 use conf::{Data, DAEMON_FILES, DAEMON_MOUNT};
@@ -30,6 +31,7 @@ pub const USAGE: &str = "usage: zephyr <command>   (zephyr --version: this CLI's
   chat | attach [--stock] | shell [bash|zsh] | pause | resume | reload
   doctor [--fix]
   alert setup TOPIC [--server URL] | check | test | off
+  web setup [--yes] | enrol [NAME]   (the web app behind tailscale serve, and a passkey for a device)
   uninstall [--keep-data] [--yes]
 env: ZEPHYR_CONTAINER (default zephyr), ZEPHYR_IMAGE, ZEPHYR_SRC (for --build); data in ~/.zephyr";
 
@@ -46,7 +48,7 @@ const ME: &str = env!("CARGO_PKG_VERSION");
 /// does not know.
 const ROLLED_BACK: [&str; 3] = ["zephyr.toml", "vault.toml", "host.toml"];
 
-const COMMANDS: [&str; 27] = [
+const COMMANDS: [&str; 28] = [
     "init",
     "up",
     "down",
@@ -74,6 +76,7 @@ const COMMANDS: [&str; 27] = [
     "facts",
     "subagent",
     "alert",
+    "web",
 ];
 
 /// The image sets ZEPHYR_IN_CONTAINER. ZEPHYR_CONFIG (set in the image and by tests) also points
@@ -1325,11 +1328,13 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                 h.container,
                 h.state().as_deref().unwrap_or("not created")
             );
+            web::status(&h);
             if h.running() {
                 run(&mut h.exec(&[], &[], &["zephyr", "status"]))?;
             }
             Ok(())
         }
+        "web" => web::main(&h, a),
         "doctor" => {
             let fix = a.flag("--fix");
             a.rest()?;

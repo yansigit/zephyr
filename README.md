@@ -57,6 +57,7 @@ by hand that is looser than the preset is cleared); without it a non-interactive
 | `zephyr accounts [list \| order NAME.. \| remove NAME]` | The failover pool |
 | `zephyr model [--account NAME] [PROVIDER/MODEL]` | An account's model (or the default without accounts); with no model, pick from `rpi --list-models` |
 | `zephyr channel add\|remove discord\|imessage \| list` | Channel settings (secrets are asked for hidden); `remove` drops the channel, its owners and secrets, `list` shows them. Discord shows typing while the agent works, and a progress note after 20 s (`discord.progress`, `discord.progress_after_secs`) |
+| `zephyr web setup [--yes]` / `web enrol [NAME]` | Put the [web app](#web-app) behind `tailscale serve` and add a first device; later, a one-time code for another device |
 | `zephyr skill add DIR \| list \| rm NAME` | Skills the agent may use (see [Skills and connectors](#skills-and-connectors)); one you add is approved at once |
 | `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}` |
 | `zephyr packages add NAME.. \| rm NAME.. \| list` | Ubuntu (apt) packages for the agent, baked into a local image (`zephyr-local:<version>-<hash>`) on the release one; `up` and `upgrade` build it, and `add`/`rm` rebuild and recreate the container once the agent is idle |
@@ -432,7 +433,25 @@ A phone-first app the daemon serves itself, reached over your tailnet through `t
 - **Private facts** and the **Vault**, names only. Secrets are never typed in the app.
 - **Devices**: notifications, sign out, remove a passkey.
 
-It is off until `zephyr.toml` has a `[web]` table:
+**Setting it up.** You need [Tailscale](https://tailscale.com/download) on this machine, with
+HTTPS certificates turned on for your tailnet (admin console, DNS, HTTPS Certificates). Then:
+
+```sh
+zephyr web setup
+```
+
+It asks before each step: it writes `[web]` to `zephyr.toml` with this machine's tailnet name, runs
+`tailscale serve --bg http://127.0.0.1:7793` (if that is refused, it prints the `sudo` form, or
+`sudo tailscale set --operator=$USER` to let your user manage serve), restarts zephyr, and prints
+a link with a one-time code. Open the link on your phone to add it. Once a passkey exists it
+offers to make payments wait for a passkey or the terminal (`approvals.strong_only =
+loosen,money`), so Discord or iMessage alone can no longer approve one.
+
+**Never point `tailscale funnel` at this port.** Serve keeps the app on your tailnet; a funnel
+would put it on the internet. The app refuses funnel traffic, but do not rely on that alone.
+`zephyr status` says whether `tailscale serve` forwards to the app.
+
+By hand, the app is off until `zephyr.toml` has a `[web]` table:
 
 ```toml
 [web]

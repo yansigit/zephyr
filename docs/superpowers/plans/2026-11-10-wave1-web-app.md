@@ -746,7 +746,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
 - `zephyr web enrol [NAME]` → `docker exec … zephyr web enrol [NAME]`.
 - Host `zephyr status`, when `web.host` is set: run `tailscale serve status`. If the output contains `http://127.0.0.1:<port>`, print `web: tailscale serve forwards https://HOST`; else `web: tailscale serve does not forward to 127.0.0.1:PORT; run zephyr web setup`.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `web_setup_writes_the_host_serves_the_port_and_enrols`:
     - `SHIM_TS_STATUS='{"BackendState":"Running","Self":{"DNSName":"box.tail1234.ts.net."},"CertDomains":["box.tail1234.ts.net"]}'`, with `--yes`;
     - zephyr.toml has `[web]`, `host = "box.tail1234.ts.net"`, `port = 7793`;
@@ -754,10 +754,14 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
     - `exec.log` has `zephyr web enrol`.
   - `web_setup_stops_without_https_certificates`: `CertDomains: []` → exit 1 with the text, and zephyr.toml unchanged.
   - `status_says_whether_tailscale_serve_forwards_the_port`: both lines.
-- [ ] **Step 2: Run** `cargo test -p zephyr --test host web_` → FAIL.
-- [ ] **Step 3: Implement.** Write the docs.
-- [ ] **Step 4: Run** the same, then `cargo test -p zephyr --test host` → PASS.
-- [ ] **Step 5: Commit** `feat(web): set up the web app from the host with tailscale serve and a first passkey`.
+- [x] **Step 2: Run** `cargo test -p zephyr --test host web_` → FAIL.
+- [x] **Step 3: Implement.** Write the docs.
+- [x] **Step 4: Run** the same, then `cargo test -p zephyr --test host` → PASS.
+- [x] **Step 5: Commit** `feat(web): set up the web app from the host with tailscale serve and a first passkey`.
+- Deviation: the command lives in a new file `src/host/web.rs` (`mod web;` in `host/mod.rs`, which gains the usage line, the `COMMANDS` entry, the `"web"` arm and the status call).
+- Deviation: the tests look for `docker exec … zephyr web enrol` in `calls.log`, where the docker shim logs every call; `exec.log` is written only by the image's CLI copy. The docker shim answers `zephyr web enrol` and `zephyr web` (`$SHIM_PASSKEYS`).
+- Deviation: with `--yes` step 9 does not wait for Enter (there is nobody to press it) and reads `zephyr web` at once; without `--yes` and without a terminal the command changes nothing and says to pass `--yes`. A refused `tailscale serve` prints the two `sudo` forms and stops with exit 1, whatever the refusal's wording. Step 6 is `ensure_image` then `up_checked`, as `zephyr up` itself. The status line matches the forward target as a whole word, so a line for port 77930 is not taken for 7793.
+- Deviation: added tests: `web_setup_adds_passkey_to_an_explicit_list_and_offers_money_once_enrolled`, and in `web_setup_stops_without_https_certificates` the logged-out, missing and operator-rights cases.
 
 ---
 
