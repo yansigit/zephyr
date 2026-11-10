@@ -369,6 +369,11 @@ using its usual tools; general network traffic is not limited.
   used its browser, `/stop` first (its browser keeps running in the background).
   For the same reason rpi skills are off, only the image's extensions load, and a `SYSTEM.md`, `APPEND_SYSTEM.md`, `CLAUDE.md` or
   extra `AGENTS*.md` the agent writes is renamed `*.ignored-by-zephyr` before the next start.
+- `/forget TEXT` removes every memory line holding TEXT (at least 3 characters, any case), saves
+  that at once and lists what went; `/memory undo` puts it back. The reply says where the text is
+  still kept (the memory's git history, past conversations, the message log, your rules, goals or
+  persona). `/memory squash yes` then drops the memory's git history, keeping the files as they
+  are; `/memory undo` cannot go back past it.
 - When the agent drafts a skill or a connector, you get its diff the same way (below).
 
 ## Skills and connectors

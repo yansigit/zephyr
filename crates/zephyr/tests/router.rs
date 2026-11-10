@@ -1159,6 +1159,31 @@ async fn a_note_committed_earlier_does_not_stop_a_save_after_new() {
 }
 
 #[tokio::test]
+async fn forget_restarts_the_agent_and_records_its_commit() {
+    let home = home("forget");
+    let cfg = config(&home);
+    taint(&cfg);
+    let gw = start(cfg);
+    gw.say("m1", "owner", "WRITE_MEMORY likes tea").await;
+    reply_starting(&gw, "[zephyr] memory change waiting").await;
+    gw.say("m2", "owner", "/memory ok").await;
+    reply_starting(&gw, "[zephyr] memory kept").await;
+    gw.say("m3", "owner", "/forget likes tea").await;
+    let forgot = reply_starting(&gw, "[zephyr] forgot").await;
+    assert!(
+        forgot.starts_with("[zephyr] forgot 1 line (commit "),
+        "{forgot}"
+    );
+    gw.say("m4", "owner", "again").await;
+    wait(|| gw.replies().iter().any(|r| r.contains("] again"))).await;
+    assert_eq!(log(&home, "start").len(), 2, "one restart");
+    let agents = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    assert!(!agents.contains("likes tea"), "{agents}");
+    assert_eq!(last_memory_commit(&home), ("you (/forget)".into(), true));
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_rule_restarts_the_agent_and_leads_its_context() {
     let home = home("rules");
     let gw = start(config(&home));

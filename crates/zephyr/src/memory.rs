@@ -532,7 +532,8 @@ pub fn command(home: &Path, state: &Path, text: &str) -> Option<String> {
         cmd,
         "/memory" | "/rule" | "/rules" | "/goal" | "/goals" | "/persona"
     );
-    if !ours || setting {
+    // The router's: it records the commits and clears their rows.
+    if !ours || setting || text == "/memory squash yes" {
         return None;
     }
     let _guard = lock();
@@ -554,7 +555,8 @@ pub fn command(home: &Path, state: &Path, text: &str) -> Option<String> {
         ("/memory", "diff") => waiting(home, state).map(|d| d.unwrap_or("nothing waiting".into())),
         ("/memory", "ok") => keep(home, state),
         ("/memory", "undo") => undo(home, state),
-        ("/memory", _) => Ok("usage: /memory log | diff | ok | undo".into()),
+        ("/memory", "squash") => Ok(SQUASH_ASK.into()),
+        ("/memory", _) => Ok("usage: /memory log | diff | ok | undo | squash".into()),
         ("/rules", "") => read_rules(state).map(|rules| {
             if rules.is_empty() {
                 "no rules; add one with /rule <text>".into()
@@ -788,6 +790,194 @@ fn undo(home: &Path, state: &Path) -> anyhow::Result<String> {
     drop(fs);
     approve(home, state, &working)?;
     Ok(reply)
+}
+
+/// `/forget TEXT`'s result: the owner's reply, and the commit it made (`None`: nothing held it).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Forgot {
+    pub reply: String,
+    pub sha: Option<String>,
+}
+
+const SQUASH_ASK: &str = "[zephyr] /memory squash yes drops the memory's git history, keeping the files as they are now; /memory undo cannot go back past it.";
+const STILL_KEPT: &str = "Still kept: the memory's git history (/memory squash yes drops it); past conversations, where recall can still find it (/new starts one without it); state.db's message log and audit (pruned at 90 days, backups 7 days); files elsewhere in /zephyr; the model provider's logs. Lines that say it in other words are untouched: ask the agent to find them, and review its change as usual.";
+
+/// Lower case, whitespace collapsed: how `/forget` compares text.
+fn folded(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn waiting_first(then: &str) -> String {
+    format!("[zephyr] a memory change is waiting; /memory ok or /memory undo it first, then {then}")
+}
+
+/// `forget_lines` on a blocking thread.
+pub async fn forget(home: &Path, state: &Path, text: &str) -> Result<Forgot, String> {
+    let (home, state, text) = (home.to_path_buf(), state.to_path_buf(), text.to_string());
+    (tokio::task::spawn_blocking(move || forget_lines(&home, &state, &text)).await)
+        .unwrap_or_else(|e| Err(format!("[zephyr] memory: {e}")))
+}
+
+/// `/forget TEXT` (DESIGN §4.6): every line of `USER.md`, `MEMORY.md` and `notes/*.md` holding
+/// TEXT (case and spacing aside) goes, in one commit that is approved at once. Refused while a
+/// change waits, which may be the very thing to forget. TEXT goes in no commit, log or row.
+pub fn forget_lines(home: &Path, state: &Path, text: &str) -> Result<Forgot, String> {
+    let needle = folded(text);
+    if needle.chars().count() < 3 {
+        return Err("[zephyr] usage: /forget TEXT (at least 3 characters) removes every memory line holding it".into());
+    }
+    let failed = |e: anyhow::Error| format!("[zephyr] memory: {e:#}");
+    // The owner's own files keep it in every prompt: said, never changed here.
+    let rules = read_rules(state).map_err(failed)?;
+    let goals = read_goals(state).map_err(failed)?;
+    let persona = read_persona(state).map_err(failed)?;
+    let holds = |lines: &[String]| lines.iter().any(|l| folded(l).contains(&needle));
+    let also: Vec<&str> = [
+        (holds(&rules), "rules (/rules)"),
+        (holds(&goals), "goals (/goals)"),
+        (folded(&persona).contains(&needle), "persona (/persona)"),
+    ]
+    .into_iter()
+    .filter_map(|(held, name)| held.then_some(name))
+    .collect();
+    let also = match also.is_empty() {
+        true => String::new(),
+        false => format!(
+            "\nAlso in your {}, which /forget does not change.",
+            also.join(", ")
+        ),
+    };
+    let _guard = lock();
+    let approved = read_approved(state).map_err(failed)?;
+    let fs = crate::agent::fs();
+    commit_locked(home).map_err(failed)?;
+    if read_working(home).map_err(failed)? != approved {
+        return Err(waiting_first("/forget"));
+    }
+    let dir = dir(home);
+    let mut names = vec![USER.to_string(), MEMORY.to_string()];
+    let mut notes: Vec<String> = std::fs::read_dir(dir.join("notes"))
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    notes.sort();
+    names.extend(
+        notes
+            .into_iter()
+            .filter(|n| n.ends_with(".md"))
+            .map(|n| format!("notes/{n}")),
+    );
+    let (mut gone, mut listed) = (0, String::new());
+    for name in names {
+        let path = dir.join(&name);
+        // Only plain files: a link the agent left could point anywhere.
+        if !path.symlink_metadata().is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path).map_err(|e| failed(e.into()))?;
+        let (dropped, kept): (Vec<&str>, Vec<&str>) =
+            body.lines().partition(|l| folded(l).contains(&needle));
+        if dropped.is_empty() {
+            continue;
+        }
+        gone += dropped.len();
+        listed.push_str(&format!("\n{name}"));
+        for line in dropped {
+            listed.push_str(&format!("\n- {line}"));
+        }
+        let mut text = kept.join("\n");
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        std::fs::write(&path, text).map_err(|e| failed(e.into()))?;
+    }
+    if gone == 0 {
+        return Ok(Forgot {
+            reply: format!("[zephyr] no memory line holds that{also}"),
+            sha: None,
+        });
+    }
+    let sha = commit_locked(home).map_err(failed)?;
+    let working = read_working(home).map_err(failed)?;
+    drop(fs);
+    approve(home, state, &working).map_err(failed)?;
+    let short = sha.as_deref().map_or("", |s| s.get(..7).unwrap_or(s));
+    let count = match gone {
+        1 => "1 line".to_string(),
+        n => format!("{n} lines"),
+    };
+    Ok(Forgot {
+        reply: format!(
+            "[zephyr] forgot {count} (commit {short}); /memory undo puts them back:{listed}\n{STILL_KEPT}{also}"
+        ),
+        sha,
+    })
+}
+
+/// `squash_history` on a blocking thread.
+pub async fn squash(home: &Path, state: &Path) -> Result<String, String> {
+    let (home, state) = (home.to_path_buf(), state.to_path_buf());
+    (tokio::task::spawn_blocking(move || squash_history(&home, &state)).await)
+        .unwrap_or_else(|e| Err(format!("[zephyr] memory: {e}")))
+}
+
+/// `/memory squash yes` (DESIGN §4.6): the memory repo becomes one root commit of the files as
+/// they are, every other ref and the reflog go, and `gc` prunes the rest. Refused while a change
+/// waits. The caller clears `memory_commits`.
+pub fn squash_history(home: &Path, state: &Path) -> Result<String, String> {
+    let failed = |e: anyhow::Error| format!("[zephyr] memory: {e:#}");
+    let _guard = lock();
+    let approved = read_approved(state).map_err(failed)?;
+    let fs = crate::agent::fs();
+    let dir = dir(home);
+    commit_locked(home).map_err(failed)?;
+    if read_working(home).map_err(failed)? != approved {
+        return Err(waiting_first("/memory squash yes"));
+    }
+    let branch = git(&dir, &["symbolic-ref", "--short", "HEAD"]).map_err(failed)?;
+    const ORPHAN: &str = "zephyr-squash";
+    let when = crate::pool::iso(crate::now());
+    let made = git(&dir, &["checkout", "-q", "--orphan", ORPHAN])
+        .and_then(|_| git(&dir, &["add", "-A"]))
+        .and_then(|_| {
+            git(
+                &dir,
+                &["commit", "-q", "-m", &format!("{PREFIX}{when} squashed")],
+            )
+        })
+        // The old branch's name moves onto the new root in one step, so a failure up to here
+        // leaves the old history whole.
+        .and_then(|_| git(&dir, &["branch", "-M", ORPHAN, &branch]));
+    if let Err(e) = made {
+        let _ = git(&dir, &["checkout", "-q", "-f", &branch]);
+        let _ = git(&dir, &["branch", "-D", ORPHAN]);
+        return Err(failed(
+            e.context("squashing the memory history failed; nothing changed"),
+        ));
+    }
+    let keep = format!("refs/heads/{branch}");
+    let refs = git(&dir, &["for-each-ref", "--format=%(refname)"]).map_err(failed)?;
+    for r in refs.lines().filter(|r| *r != keep) {
+        git(&dir, &["update-ref", "-d", r]).map_err(failed)?;
+    }
+    git(&dir, &["reflog", "expire", "--expire=now", "--all"]).map_err(failed)?;
+    for name in ["ORIG_HEAD", "FETCH_HEAD"] {
+        let _ = std::fs::remove_file(dir.join(".git").join(name));
+    }
+    let gc = git(&dir, &["gc", "-q", "--prune=now"]);
+    let working = read_working(home).map_err(failed)?;
+    drop(fs);
+    approve(home, state, &working).map_err(failed)?;
+    Ok(match gc {
+        Ok(_) => "[zephyr] memory history squashed into one commit; /memory undo cannot go back past it now. Copies made before (a push, a backup of /zephyr) are outside zephyr's reach.".into(),
+        Err(e) => format!("[zephyr] memory history squashed into one commit, but git gc failed ({e:#}): the old commits are unreachable but still on disk until the next git gc."),
+    })
 }
 
 /// `git revert`s the newest memory commit that has not been undone yet.
@@ -1506,5 +1696,169 @@ mod tests {
         let approved_head = std::fs::read_to_string(approved_dir(&st).join(".head")).unwrap();
         assert_ne!(approved_head.trim(), head(&home));
         assert_eq!(clean_base(&home, &st), Some(head(&home)));
+    }
+
+    const STILL_KEPT: &str = "Still kept: the memory's git history (/memory squash yes drops it); past conversations, where recall can still find it (/new starts one without it); state.db's message log and audit (pruned at 90 days, backups 7 days); files elsewhere in /zephyr; the model provider's logs. Lines that say it in other words are untouched: ask the agent to find them, and review its change as usual.";
+
+    #[test]
+    fn forget_removes_matching_lines_everywhere_and_undo_brings_them_back() {
+        let home = home();
+        let st = state(&home);
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        std::fs::write(
+            dir(&home).join(USER),
+            "# USER.md\nPrefers green tea after 3pm\n",
+        )
+        .unwrap();
+        std::fs::write(dir(&home).join(MEMORY), "# MEMORY.md\ncoffee\n").unwrap();
+        std::fs::write(
+            dir(&home).join("notes/2026-11-02.md"),
+            "went out\nbought  TEA at the shop\n",
+        )
+        .unwrap();
+        settle(&home);
+        say(&home, "/memory ok");
+        let f = forget_lines(&home, &st, "tea").unwrap();
+        let sha = f.sha.unwrap();
+        assert_eq!(
+            f.reply,
+            format!(
+                "[zephyr] forgot 2 lines (commit {}); /memory undo puts them back:\nUSER.md\n- Prefers green tea after 3pm\nnotes/2026-11-02.md\n- bought  TEA at the shop\n{STILL_KEPT}",
+                &sha[..7]
+            )
+        );
+        let messages = git(&dir(&home), &["log", "--format=%B"]).unwrap();
+        assert!(!messages.to_lowercase().contains("tea"), "{messages}");
+        assert_eq!(
+            std::fs::read_to_string(dir(&home).join("notes/2026-11-02.md")).unwrap(),
+            "went out\n"
+        );
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        assert!(!agents(&home).contains("green tea"));
+        assert!(agents(&home).contains("coffee"));
+        assert!(say(&home, "/memory undo").starts_with("[zephyr] undid "));
+        assert!(std::fs::read_to_string(dir(&home).join(USER))
+            .unwrap()
+            .contains("Prefers green tea after 3pm"));
+        assert!(
+            std::fs::read_to_string(dir(&home).join("notes/2026-11-02.md"))
+                .unwrap()
+                .contains("bought  TEA")
+        );
+    }
+
+    #[test]
+    fn forget_refuses_short_text_and_a_waiting_change() {
+        let home = home();
+        let st = state(&home);
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        assert_eq!(
+            forget_lines(&home, &st, " te ").unwrap_err(),
+            "[zephyr] usage: /forget TEXT (at least 3 characters) removes every memory line holding it"
+        );
+        let none = forget_lines(&home, &st, "zzz").unwrap();
+        assert_eq!(
+            (none.reply.as_str(), none.sha),
+            ("[zephyr] no memory line holds that", None)
+        );
+        std::fs::write(dir(&home).join(MEMORY), "# MEMORY.md\nlikes tea\n").unwrap();
+        assert_eq!(
+            forget_lines(&home, &st, "tea").unwrap_err(),
+            "[zephyr] a memory change is waiting; /memory ok or /memory undo it first, then /forget"
+        );
+        assert!(std::fs::read_to_string(dir(&home).join(MEMORY))
+            .unwrap()
+            .contains("likes tea"));
+    }
+
+    #[test]
+    fn forget_names_the_rules_goals_and_persona_that_hold_it_too() {
+        let home = home();
+        let st = state(&home);
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        std::fs::write(dir(&home).join(USER), "# USER.md\nlikes  Tea\n").unwrap();
+        settle(&home);
+        say(&home, "/memory ok");
+        rule(&st, "no tea after 3pm").unwrap();
+        goal(&st, "add Ship zephyr").unwrap();
+        persona(&st, "set Warm.\nlikes tea").unwrap();
+        let f = forget_lines(&home, &st, "TEA").unwrap();
+        assert!(
+            f.reply.starts_with("[zephyr] forgot 1 line (commit "),
+            "{}",
+            f.reply
+        );
+        assert!(
+            f.reply.ends_with(&format!(
+                "{STILL_KEPT}\nAlso in your rules (/rules), persona (/persona), which /forget does not change."
+            )),
+            "{}",
+            f.reply
+        );
+        // Nothing in the memory, but still in the persona: said too.
+        let f = forget_lines(&home, &st, "warm").unwrap();
+        assert_eq!(
+            f.reply,
+            "[zephyr] no memory line holds that\nAlso in your persona (/persona), which /forget does not change."
+        );
+    }
+
+    #[test]
+    fn squash_leaves_one_root_commit_and_undo_stops_there() {
+        let home = home();
+        let st = state(&home);
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        for i in 0..3 {
+            std::fs::write(dir(&home).join(MEMORY), format!("# MEMORY.md\n{i}\n")).unwrap();
+            settle(&home);
+            say(&home, "/memory ok");
+        }
+        assert_eq!(
+            say(&home, "/memory squash"),
+            "[zephyr] /memory squash yes drops the memory's git history, keeping the files as they are now; /memory undo cannot go back past it."
+        );
+        assert!(command(&home, &st, "/memory squash yes").is_none());
+        assert_eq!(
+            say(&home, "/memory x"),
+            "usage: /memory log | diff | ok | undo | squash"
+        );
+        std::fs::write(dir(&home).join(MEMORY), "# MEMORY.md\nwaiting\n").unwrap();
+        assert_eq!(
+            squash_history(&home, &st).unwrap_err(),
+            "[zephyr] a memory change is waiting; /memory ok or /memory undo it first, then /memory squash yes"
+        );
+        say(&home, "/memory undo");
+        let branch = git(&dir(&home), &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        assert_eq!(
+            squash_history(&home, &st).unwrap(),
+            "[zephyr] memory history squashed into one commit; /memory undo cannot go back past it now. Copies made before (a push, a backup of /zephyr) are outside zephyr's reach."
+        );
+        assert_eq!(
+            git(&dir(&home), &["rev-list", "--all", "--count"]).unwrap(),
+            "1"
+        );
+        assert_eq!(
+            git(&dir(&home), &["for-each-ref", "--format=%(refname)"]).unwrap(),
+            format!("refs/heads/{branch}")
+        );
+        assert_eq!(
+            git(&dir(&home), &["symbolic-ref", "--short", "HEAD"]).unwrap(),
+            branch
+        );
+        assert!(
+            commits(&home)[0].ends_with(" squashed"),
+            "{:?}",
+            commits(&home)
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir(&home).join(MEMORY)).unwrap(),
+            "# MEMORY.md\n2\n"
+        );
+        assert!(say(&home, "/memory undo").contains("seed"));
+        assert_eq!(
+            clean_base(&home, &st),
+            Some(head(&home)),
+            "approved as it is"
+        );
     }
 }

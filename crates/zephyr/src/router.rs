@@ -2176,6 +2176,18 @@ impl<'a> Router<'a> {
             ("/persona", arg) if matches!(word(arg).0, "set" | "clear") => {
                 self.owner_set("persona", arg, from.0, |a| a).await
             }
+            ("/forget", text) => self.forget(text).await,
+            ("/memory", "squash yes") => {
+                let squashed = crate::memory::squash(&self.cfg.home, self.cfg.state_dir()).await;
+                if squashed.is_ok() {
+                    log(self
+                        .store
+                        .clear_memory_commits()
+                        .map(drop)
+                        .map_err(Into::into));
+                }
+                squashed.unwrap_or_else(|refused| refused)
+            }
             ("/new" | "/clear", "") => self.new_session().await,
             ("/switch", "") => self.list_sessions(),
             ("/switch", id) => self.switch(id).await,
@@ -3377,6 +3389,23 @@ impl<'a> Router<'a> {
             return; // that sender is the attached client `show` has just reached
         }
         let _ = self.store.notify(channel, recipient, text);
+    }
+
+    /// `/forget TEXT`: its commit is the owner's, saved at once, and the child restarts at idle so
+    /// its context drops the lines.
+    async fn forget(&mut self, text: &str) -> String {
+        match crate::memory::forget(&self.cfg.home, self.cfg.state_dir(), text).await {
+            Ok(forgot) => {
+                if let Some(sha) = &forgot.sha {
+                    let recorded = self.store.record_memory_commit(sha, "you (/forget)", true);
+                    log(recorded.map_err(Into::into));
+                    self.restart = true;
+                    self.restart_if_idle().await;
+                }
+                forgot.reply
+            }
+            Err(refused) => refused,
+        }
     }
 
     /// `/new`: a fresh main session from the next message. The old one stays on disk; memory
