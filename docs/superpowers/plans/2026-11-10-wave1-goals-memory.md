@@ -34,7 +34,7 @@
 
 1. **Clean base** (§4.3 item 5, §4.4): `clean_base` requires working files = approved and `git status --porcelain` empty, not HEAD = `.head`; at settle the run's commit must be the one new commit on that base (HEAD's parent = base). The spec's HEAD = `.head` check never holds after a notes-only commit (Review Focus 2).
 2. **Other writers** (§4.3 item 4): `Store::writers_since(since)` (a job run, task or process running, or started at or after `since`) replaces `Wake::writers: AtomicU64`: one query, durable, no edits at three spawn sites, fails closed at second granularity.
-3. **Strays**: a run is not owner-origin while `Procs::strays_alive()` finds an agent process outside every tracked group (a `setsid` left from an earlier conversation can write memory too). Cost for the coordinator to confirm with the owner: agent-browser's detached daemon counts, so after browser use auto-approve needs `/stop` first. Dropping it is one condition in `begin_run`.
+3. **Strays**: a run is not owner-origin while `Procs::strays_alive()` finds an agent process outside every tracked group (a `setsid` left from an earlier conversation can write memory too). Cost for the coordinator to confirm with the owner: agent-browser's detached daemon counts, so after browser use auto-approve needs `/stop` first. Dropping it is one condition in `begin_run`. Strict version owner confirmed 2026-11-10.
 4. **Daemon rows** (§4.3 item 2): platform ids starting `task-`, `proc-` or `action-` are the daemon's; every other `new` row was written by an adapter after the owner allowlist and is the owner's. ("Unknown platform id" in §4.8 has no other reading.)
 5. **Clean mark**: `new_session` marks the new id clean, not `switch_main`, so `/switch` back never cleans.
 6. **Clean list paths**: an absolute path is accepted only under `cfg.home`; `~`, `..`, `.` and any dot-named component (`memory/.git/config`, `.gitattributes`) taint.
@@ -69,16 +69,18 @@
   ```
 - `prune` also deletes `memory_commits` with `at < ?1`; `session_origin` rows are kept.
 
-- [ ] **Step 1: Write the failing tests** in `store.rs` `mod tests`:
+- [x] **Step 1: Write the failing tests** in `store.rs` `mod tests`:
   - Extend `older_databases_migrate_in_order_and_keep_their_rows`: `const V17: &str = "DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin;"` prepended to every undo, a `(16, "")` case; per version assert `session_origin("main") == Unknown` (the db had a row), `record_memory_commit("a1", "task #1", false)` then `memory_commits_since(0)` has it, `jobs()[0].builtin == None`.
   - `a_brand_new_database_starts_its_first_conversation_clean`: fresh open → `session_origin("main") == Clean`.
   - `a_taint_keeps_its_first_reason_and_a_clean_mark_never_cleans_it`: `taint("s", "used exec at 14:02")`, `taint("s", "used read at 14:03")`, `mark_clean("s")` → `Tainted("used exec at 14:02")`; `mark_clean("n")` → `Clean`; `"x"` → `Unknown`.
   - `writers_since_sees_running_and_recently_started_work`: a running proc → `true` for any `since`; once it ended with `created_at` 100, `writers_since(101) == false`, `writers_since(100) == true`.
   - `prune_drops_old_memory_commits` and `inbox_rows_carry_their_platform_id` (`insert_inbox` id `"task-3"` → `inbox_with_status("new")[0].platform_id == "task-3"`).
-- [ ] **Step 2:** `cargo test -p zephyr --lib store` → FAIL (no such functions/columns).
-- [ ] **Step 3:** Implement: the v17 step exactly as Global Constraints, `SCHEMA_VERSION = 17`, the functions above.
-- [ ] **Step 4:** `cargo test -p zephyr --lib store` → PASS; `cargo test -p zephyr` → PASS.
-- [ ] **Step 5:** Commit `feat(store): record where each conversation's text came from and who made each memory commit`.
+- [x] **Step 2:** `cargo test -p zephyr --lib store` → FAIL (no such functions/columns).
+- [x] **Step 3:** Implement: the v17 step exactly as Global Constraints, `SCHEMA_VERSION = 17`, the functions above.
+- [x] **Step 4:** `cargo test -p zephyr --lib store` → PASS; `cargo test -p zephyr` → PASS.
+- [x] **Step 5:** Commit `feat(store): record where each conversation's text came from and who made each memory commit`.
+
+Deviation: the `upgraded_from` mark stays in the v16 step (it means "upgraded from before the approvals gate"; moving it would write `preset = "full"` into a 0.7 install), so the migration test expects it only for versions below 16; `tests/router.rs` `old_install` also undoes v17.
 
 ### Task B-2: Goals and persona, set by the owner
 

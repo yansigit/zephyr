@@ -1767,6 +1767,7 @@ impl<'a> Router<'a> {
             sender: m.sender,
             text: m.text,
             tries: 0,
+            platform_id: m.platform_msg_id,
         };
         if reply.is_empty() {
             // A `/btw` whose answer its task posts.
@@ -4536,6 +4537,7 @@ mod tests {
             sender: "s".into(),
             text: text.into(),
             tries: 0,
+            platform_id: "p".into(),
         };
         for text in ["hi", "", "[a #1] nested\nlines"] {
             assert_eq!(

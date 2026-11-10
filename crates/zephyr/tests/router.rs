@@ -386,6 +386,7 @@ async fn restart_with_dispatched_rows_resends_only_what_the_session_lacks() {
             sender: "owner".into(),
             text: text.into(),
             tries: 1,
+            platform_id: id.into(),
         });
     }
     // Row b is already in the session, answered.
@@ -570,6 +571,7 @@ async fn outbox_rows_for_unconfigured_channels_stay_pending() {
         sender: "owner".into(),
         text: "hi".into(),
         tries: 0,
+        platform_id: "x".into(),
     };
     store.reply(&row, "stranded", "done").unwrap();
     drop(store);
@@ -3169,6 +3171,7 @@ async fn a_message_sent_mid_tool_is_steered_in_and_answered_before_the_run_ends(
         sender: "owner".into(),
         text: "what are you doing?".into(),
         tries: 1,
+        platform_id: "m2".into(),
     };
     assert_eq!(
         gw.wait_replies(2).await,
@@ -5402,7 +5405,9 @@ fn old_install(home: &Path) {
          VALUES ('chat', 'old', 'owner', 'earlier', 'done', 'prompt');",
     )
     .unwrap();
-    db.execute_batch(&format!("{V16} PRAGMA user_version = 15;"))
+    db.execute_batch(&format!(
+        "DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin; {V16} PRAGMA user_version = 15;"
+    ))
         .unwrap();
 }
 

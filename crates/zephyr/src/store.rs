@@ -4,7 +4,7 @@ use crate::channel::Inbound;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 
 /// Queued and running tasks allowed at once (DESIGN §4.12); a start past this is refused.
 pub const MAX_OPEN_TASKS: i64 = 64;
@@ -20,6 +20,26 @@ pub struct InboxRow {
     pub sender: String,
     pub text: String,
     pub tries: i64,
+    /// The platform's message id: `task-N`, `proc-N` and `action-N` are the daemon's (B §4.3).
+    pub platform_id: String,
+}
+
+/// Where a conversation's text came from (DESIGN §4.6): `Unknown` when it has no row, which
+/// counts as tainted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOrigin {
+    Clean,
+    Tainted(String),
+    Unknown,
+}
+
+/// A memory commit zephyr made, and the origin it recorded for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryCommit {
+    pub sha: String,
+    pub at: i64,
+    pub origin: String,
+    pub auto: bool,
 }
 
 /// An outbox row waiting for delivery.
@@ -79,6 +99,8 @@ pub struct Job {
     pub recipient: String,
     /// False while a job the agent proposed waits for the owner's `/job ok` (§4.5).
     pub enabled: bool,
+    /// `Some("review")` for the daily review zephyr keeps; `None` for the owner's jobs.
+    pub builtin: Option<String>,
 }
 
 /// A run taken off the queue, with what it needs from its job.
@@ -93,8 +115,7 @@ pub struct JobRun {
 const NEW_JOB_ID: &str = "(SELECT coalesce(max(m), 0) + 1 FROM
      (SELECT max(id) AS m FROM jobs UNION ALL SELECT max(job_id) FROM runs))";
 
-const JOB_COLUMNS: &str =
-    "jobs.id, jobs.name, jobs.schedule, jobs.prompt, jobs.channel, jobs.recipient, jobs.enabled";
+const JOB_COLUMNS: &str = "jobs.id, jobs.name, jobs.schedule, jobs.prompt, jobs.channel, jobs.recipient, jobs.enabled, jobs.builtin";
 
 fn job_row(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Job> {
     Ok(Job {
@@ -105,6 +126,7 @@ fn job_row(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Job> {
         channel: r.get(at + 4)?,
         recipient: r.get(at + 5)?,
         enabled: r.get(at + 6)?,
+        builtin: r.get(at + 7)?,
     })
 }
 
@@ -938,15 +960,27 @@ impl Store {
                  ALTER TABLE proposals ADD COLUMN approved INTEGER NOT NULL DEFAULT 0; -- by /ok
                  PRAGMA user_version = 16;",
             )?;
-            // A db that had a version had rows: this is an upgrade, not a first start. The
-            // router reads the mark at its next start (`upgraded_from`) and clears it, so
-            // `zephyr status` or the gate opening the store first cannot lose it.
+            // A db that had a version had rows: this is an upgrade from before the approvals
+            // gate, not a first start. The router reads the mark at its next start
+            // (`upgraded_from`) and clears it, so `zephyr status` or the gate opening the store
+            // first cannot lose it.
             if version > 0 {
                 db.execute(
                     "INSERT OR REPLACE INTO meta(key, value) VALUES ('upgraded_from', ?1)",
                     params![version.to_string()],
                 )?;
             }
+        }
+        if version < 17 {
+            // Where each conversation's text came from and who made each memory commit (DESIGN
+            // §4.6); a fresh install's first conversation starts clean, an existing one does not.
+            db.execute_batch(
+                "CREATE TABLE session_origin(session TEXT PRIMARY KEY, tainted TEXT, at INTEGER NOT NULL);
+                 CREATE TABLE memory_commits(sha TEXT PRIMARY KEY, at INTEGER NOT NULL, origin TEXT NOT NULL, auto INTEGER NOT NULL);
+                 ALTER TABLE jobs ADD COLUMN builtin TEXT;
+                 INSERT INTO session_origin(session, tainted, at) SELECT 'main', NULL, unixepoch() WHERE NOT EXISTS (SELECT 1 FROM inbox);
+                 PRAGMA user_version = 17;",
+            )?;
         }
         db.commit()?;
         Ok(Self {
@@ -1093,7 +1127,7 @@ impl Store {
     /// prompt or a continuation), oldest first, each with the reply already sent to it.
     pub fn steered_into_run(&self) -> rusqlite::Result<Vec<(InboxRow, Option<String>)>> {
         let mut stmt = self.db.prepare(
-            "SELECT i.id, i.channel, i.sender, i.text, i.tries, o.text
+            "SELECT i.id, i.channel, i.sender, i.text, i.tries, o.text, i.platform_msg_id
              FROM inbox i LEFT JOIN outbox o ON o.inbox_id = i.id
              WHERE i.sent_as = 'steer' AND i.status IN ('dispatched', 'done')
                AND i.id > (SELECT max(id) FROM inbox
@@ -1108,6 +1142,7 @@ impl Store {
                     sender: r.get(2)?,
                     text: r.get(3)?,
                     tries: r.get(4)?,
+                    platform_id: r.get(6)?,
                 },
                 r.get(5)?,
             ))
@@ -1117,7 +1152,7 @@ impl Store {
 
     pub fn inbox_with_status(&self, status: &str) -> rusqlite::Result<Vec<InboxRow>> {
         let mut stmt = self.db.prepare(
-            "SELECT id, channel, sender, text, tries FROM inbox WHERE status = ?1 ORDER BY id",
+            "SELECT id, channel, sender, text, tries, platform_msg_id FROM inbox WHERE status = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map(params![status], |r| {
             Ok(InboxRow {
@@ -1126,6 +1161,7 @@ impl Store {
                 sender: r.get(2)?,
                 text: r.get(3)?,
                 tries: r.get(4)?,
+                platform_id: r.get(5)?,
             })
         })?;
         rows.collect()
@@ -2045,7 +2081,91 @@ impl Store {
                AND coalesce(ended_at, created_at) < ?1 AND id < (SELECT max(id) FROM procs)",
             params![before],
         )?;
-        Ok(emptied + sent + audit + changes + passes + actions + runs + tasks + procs)
+        let commits = self
+            .db
+            .execute("DELETE FROM memory_commits WHERE at < ?1", params![before])?;
+        Ok(emptied + sent + audit + changes + passes + actions + runs + tasks + procs + commits)
+    }
+
+    /// Marks a conversation clean (a `/new`); one that already has a row keeps it.
+    pub fn mark_clean(&self, session: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT OR IGNORE INTO session_origin(session, tainted, at) VALUES (?1, NULL, unixepoch())",
+            params![session],
+        )?;
+        Ok(())
+    }
+
+    /// Taints a conversation for good; its first reason is kept.
+    pub fn taint(&self, session: &str, reason: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO session_origin(session, tainted, at) VALUES (?1, ?2, unixepoch())
+             ON CONFLICT(session) DO UPDATE SET tainted = coalesce(tainted, excluded.tainted),
+               at = CASE WHEN tainted IS NULL THEN excluded.at ELSE at END",
+            params![session, reason],
+        )?;
+        Ok(())
+    }
+
+    pub fn session_origin(&self, session: &str) -> rusqlite::Result<SessionOrigin> {
+        let row: Option<Option<String>> = self
+            .db
+            .query_row(
+                "SELECT tainted FROM session_origin WHERE session = ?1",
+                params![session],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(match row {
+            None => SessionOrigin::Unknown,
+            Some(None) => SessionOrigin::Clean,
+            Some(Some(r)) => SessionOrigin::Tainted(r),
+        })
+    }
+
+    /// Whether a job run, task or process is running, or started at or after `since`: any of
+    /// them could have written to memory (DESIGN §4.6).
+    pub fn writers_since(&self, since: i64) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE status = 'running' OR started_at >= ?1)
+                 OR EXISTS(SELECT 1 FROM tasks WHERE status = 'running' OR started_at >= ?1)
+                 OR EXISTS(SELECT 1 FROM procs WHERE status = 'running' OR created_at >= ?1)",
+            params![since],
+            |r| r.get(0),
+        )
+    }
+
+    pub fn record_memory_commit(
+        &self,
+        sha: &str,
+        origin: &str,
+        auto: bool,
+    ) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO memory_commits(sha, at, origin, auto) VALUES (?1, unixepoch(), ?2, ?3)",
+            params![sha, origin, auto],
+        )?;
+        Ok(())
+    }
+
+    /// The memory commits recorded at or after `since`, oldest first.
+    pub fn memory_commits_since(&self, since: i64) -> rusqlite::Result<Vec<MemoryCommit>> {
+        let mut stmt = self.db.prepare(
+            "SELECT sha, at, origin, auto FROM memory_commits WHERE at >= ?1 ORDER BY at, rowid",
+        )?;
+        let rows = stmt.query_map(params![since], |r| {
+            Ok(MemoryCommit {
+                sha: r.get(0)?,
+                at: r.get(1)?,
+                origin: r.get(2)?,
+                auto: r.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn clear_memory_commits(&self) -> rusqlite::Result<usize> {
+        self.db.execute("DELETE FROM memory_commits", [])
     }
 
     /// Job `id`, if there is one.
@@ -2618,7 +2738,7 @@ impl Store {
     pub fn inbox_row(&self, id: i64) -> rusqlite::Result<Option<InboxRow>> {
         self.db
             .query_row(
-                "SELECT id, channel, sender, text, tries FROM inbox WHERE id = ?1",
+                "SELECT id, channel, sender, text, tries, platform_msg_id FROM inbox WHERE id = ?1",
                 params![id],
                 |r| {
                     Ok(InboxRow {
@@ -2627,6 +2747,7 @@ impl Store {
                         sender: r.get(2)?,
                         text: r.get(3)?,
                         tries: r.get(4)?,
+                        platform_id: r.get(5)?,
                     })
                 },
             )
@@ -3389,6 +3510,7 @@ mod tests {
     fn older_databases_migrate_in_order_and_keep_their_rows() {
         // Each case undoes the steps after `version`, as a db made by that build would look:
         // v14's first, while the tables its indexes are on still exist.
+        const V17: &str = "DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin;";
         const V16: &str = "DROP TABLE known_targets; DROP TABLE passes; ALTER TABLE proposals DROP COLUMN kind; ALTER TABLE proposals DROP COLUMN class; ALTER TABLE proposals DROP COLUMN targets; ALTER TABLE proposals DROP COLUMN summary; ALTER TABLE proposals DROP COLUMN reason; ALTER TABLE proposals DROP COLUMN payload; ALTER TABLE proposals DROP COLUMN secrets; ALTER TABLE proposals DROP COLUMN origin; ALTER TABLE proposals DROP COLUMN due_at; ALTER TABLE proposals DROP COLUMN settled_at; ALTER TABLE proposals DROP COLUMN result; ALTER TABLE procs DROP COLUMN action; ALTER TABLE proposals DROP COLUMN approved;";
         const V15: &str = "DROP TABLE settings_log; DROP TABLE setting_reverts; ALTER TABLE proposals DROP COLUMN key; ALTER TABLE proposals DROP COLUMN seen; ALTER TABLE proposals DROP COLUMN strong;";
         const V14: &str = "DROP TABLE audit; DROP INDEX inbox_status; DROP INDEX outbox_status; DROP INDEX tasks_status; DROP INDEX procs_status; DROP INDEX runs_job_due;";
@@ -3411,6 +3533,7 @@ mod tests {
             (13, ""),
             (14, ""),
             (15, ""),
+            (16, ""),
         ] {
             let dir = crate::test_dir(&format!("store-v{version}"));
             let path = dir.join("state.db");
@@ -3418,11 +3541,14 @@ mod tests {
             let db = Connection::open(&path).unwrap();
             let v14 = if version < 14 { V14 } else { "" };
             let v15 = if version < 15 { V15 } else { "" };
-            db.execute_batch(&format!("{V16} {v15} {v14} {undo} PRAGMA user_version = {version};"))
+            let v16 = if version < 16 { V16 } else { "" };
+            db.execute_batch(&format!("{V17} {v16} {v15} {v14} {undo} PRAGMA user_version = {version};"))
                 .unwrap();
             drop(db);
             let store = Store::open(&path).unwrap();
-            assert_eq!(store.upgraded_from(), Some(version), "an old db with rows is an upgrade");
+            // The mark is for the approvals gate's upgrade (v16), so a v16 db has none.
+            let from = (version < 16).then_some(version);
+            assert_eq!(store.upgraded_from(), from, "an old db with rows is an upgrade");
             store.clear_upgraded().unwrap();
             assert_eq!(store.upgraded_from(), None);
             assert_eq!(Store::open(&path).unwrap().upgraded_from(), None, "once");
@@ -3485,6 +3611,12 @@ mod tests {
             assert!(store.all_known("messages", &["a@b.c".into()]).unwrap());
             store.add_pass("d", a, 100).unwrap();
             assert!(store.use_pass("d", 50).unwrap());
+            // v17: an upgraded conversation is not clean; memory commits; built-in jobs.
+            assert_eq!(store.session_origin("main").unwrap(), SessionOrigin::Unknown);
+            store.record_memory_commit("a1", "task #1", false).unwrap();
+            let c = store.memory_commits_since(0).unwrap();
+            assert_eq!((c[0].sha.as_str(), c[0].origin.as_str(), c[0].auto), ("a1", "task #1", false));
+            assert_eq!(store.jobs().unwrap()[0].builtin, None);
             let now: i64 = store
                 .db
                 .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -3499,6 +3631,71 @@ mod tests {
             .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .unwrap();
         assert!(Store::open(&path).is_err(), "a newer schema is refused");
+    }
+
+    #[test]
+    fn a_brand_new_database_starts_its_first_conversation_clean() {
+        let store = Store::open(&crate::test_dir("store-clean").join("state.db")).unwrap();
+        assert_eq!(store.session_origin("main").unwrap(), SessionOrigin::Clean);
+    }
+
+    #[test]
+    fn a_taint_keeps_its_first_reason_and_a_clean_mark_never_cleans_it() {
+        let store = Store::open(&crate::test_dir("store-taint").join("state.db")).unwrap();
+        store.taint("s", "used exec at 14:02").unwrap();
+        store.taint("s", "used read at 14:03").unwrap();
+        store.mark_clean("s").unwrap();
+        assert_eq!(
+            store.session_origin("s").unwrap(),
+            SessionOrigin::Tainted("used exec at 14:02".into())
+        );
+        store.mark_clean("n").unwrap();
+        assert_eq!(store.session_origin("n").unwrap(), SessionOrigin::Clean);
+        assert_eq!(store.session_origin("x").unwrap(), SessionOrigin::Unknown);
+    }
+
+    #[test]
+    fn writers_since_sees_running_and_recently_started_work() {
+        let mut store = Store::open(&crate::test_dir("store-writers").join("state.db")).unwrap();
+        assert!(!store.writers_since(0).unwrap());
+        let p = store.add_proc("ls", "chat", "o").unwrap().unwrap();
+        store
+            .db
+            .execute("UPDATE procs SET created_at = 100", [])
+            .unwrap();
+        assert!(store.writers_since(i64::MAX).unwrap(), "running");
+        store.finish_proc(&p, "exited", Some(0), None, 150).unwrap();
+        assert!(!store.writers_since(101).unwrap());
+        assert!(store.writers_since(100).unwrap());
+    }
+
+    #[test]
+    fn prune_drops_old_memory_commits() {
+        let store = Store::open(&crate::test_dir("store-prune-mem").join("state.db")).unwrap();
+        store.record_memory_commit("old", "task #1", false).unwrap();
+        store
+            .record_memory_commit("new", "your message", true)
+            .unwrap();
+        store
+            .db
+            .execute("UPDATE memory_commits SET at = 10 WHERE sha = 'old'", [])
+            .unwrap();
+        assert_eq!(store.prune(100).unwrap(), 1);
+        let left = store.memory_commits_since(0).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!((left[0].sha.as_str(), left[0].auto), ("new", true));
+        assert_eq!(store.clear_memory_commits().unwrap(), 1);
+        assert!(store.memory_commits_since(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn inbox_rows_carry_their_platform_id() {
+        let store = Store::open(&crate::test_dir("store-pid").join("state.db")).unwrap();
+        store.insert_inbox(&msg("task-3")).unwrap();
+        assert_eq!(
+            store.inbox_with_status("new").unwrap()[0].platform_id,
+            "task-3"
+        );
     }
 
     #[test]
