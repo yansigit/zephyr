@@ -614,12 +614,16 @@ programs reach the internet only through a proxy in the daemon (`HTTP_PROXY` and
 for them): any public address on ports 80 and 443, and nothing else. Your machine's localhost, your
 LAN, your tailnet, cloud metadata addresses and every other port (SSH, SMTP, IMAP, databases) are
 refused at once, and the agent gets no DNS of its own. `git`, `curl`, `pip`, `npm`, `gh` and the
-browsers work as before; `ssh`, `ping` and mail clients fail until you allow their destination.
+browsers work as before; `ssh` and mail clients fail until you allow their destination, and `ping`
+never works.
 
 - **Allowing more.** `/set network.allow HOST:PORT, HOST:PORT` lists exact destinations beyond
   that, e.g. `imap.gmail.com:993, github.com:22, homeassistant.lan:8123` (see
   [Changing settings](#changing-settings)). The agent can only propose a change; `/ok N` from
-  `zephyr attach` or `zephyr chat` applies it. A refused request tells the agent which entry to ask
+  `zephyr attach` or `zephyr chat` applies it. Within a few seconds a listed destination is
+  reachable two ways: through the proxy, and directly, by name, for programs that speak no proxy
+  (himalaya, `ssh`, a database client). Its name is the only one the agent can look up, and its
+  address is looked up again every hour. Remove the entry and both ways close. A refused request tells the agent which entry to ask
   for, and `sqlite3 ~/.zephyr-daemon/state.db "select * from audit where session = 'net'"` (with
   `sudo`) shows what it reached, once per destination and hour, and everything that was refused.
 - **A model server on this machine** (Ollama, a local proxy) is no longer reachable on localhost.

@@ -362,3 +362,18 @@ The wave index's Global Constraints apply: commits, worktree, TDD order with fmt
 - Deviation: also checked by hand there: with the table deleted and the daemon killed, the restarted daemon refused to run (`the network floor is not in place: … connected to 1.1.1.1:443`), `supervise` gave up after 5 exits, Docker restarted the container and the rules were loaded again. `xdpyinfo` worked in the container with the cookie and was refused without it.
 - Deviation: not done from Step 5: the two OAuth paste checks need a real provider account and a browser, and the host half of the `xdpyinfo` check cannot be told apart on this machine, where the live host-network container owns the host abstract socket for display 99.
 
+### Review fixes (2026-11-10)
+
+After the branch review, on the same branch; the spec's "Changed in review" section lists what differs from its body.
+
+- [x] `own_ip` takes the first IPv4 address.
+- [x] The host CLI follows the running container's network, and passes one shared proxy env with the browser's flag.
+- [x] Published ports are read by key; the `tailscale serve` hint prints only on the move; the unpublished-port notice comes from `ZEPHYR_PUBLISHED`.
+- [x] Proxy timeouts: 30 min idle on tunnels and forwarded bodies, 5 min for a reply to start.
+- [x] The audit has one writer thread; the overflow row is flushed at the minute's end as tool `proxy`.
+- [x] `/login cancel` reaches posted sign-ins; `/login paste` takes `<…>`.
+- [x] OAuth is `need_input` only under the floor (`Config::floor`).
+- [x] `doctor`'s probe as the agent is bounded to 50 s.
+- [x] `network.allow` entries get a direct route (`egress::keep_allow`, run by `supervise`).
+- Deviation from the review's suggested approach for the last one: `supervise`, not the daemon, resolves the entries and loads the set, because the daemon holds no NET_ADMIN; names are resolved with a small DNS query of its own so `/etc/hosts` cannot answer the refresh; and the rule set also refuses the agent packets sent as 127.0.0.11.
+

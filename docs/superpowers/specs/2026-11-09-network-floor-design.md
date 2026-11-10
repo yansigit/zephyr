@@ -447,3 +447,30 @@ Each piece starts with a failing test (CLAUDE.md, DESIGN §6).
    already needs `tailscale serve`). §4 is amended to match when this is built.
 3. Only ports 80 and 443 without asking; anything else is a `network.allow` entry.
 4. The host's own public address on a VPS stays a non-goal.
+
+## Changed in review (2026-11-10)
+
+Built as above, with these differences, each described in DESIGN §4.19:
+
+1. **`network.allow` also opens a direct route** (§4.4 gave a listed entry the proxy only, which
+   himalaya, `ssh` and database clients do not speak). `supervise` resolves each entry under the
+   rule the proxy applies to a listed one, loads the `address . port` pairs into an nft set the
+   agent's uid may reach over TCP, and writes one `/etc/hosts` line per listed name; it refreshes
+   on a change and hourly. The rule set of §4.3 gains the set, its accept rule, and a first rule
+   that refuses the agent any packet sent as 127.0.0.11, so it cannot answer root's lookups.
+2. **NET_ADMIN stays with `supervise`** (§4.1 and §4.3 had it dropped after one step): it is
+   dropped from the bounding set of each daemon `supervise` starts, in `pre_exec`, together with
+   SETPCAP, which `up` adds because the drop needs it under `--cap-drop ALL`. `supervise` keeps it
+   for the set above.
+3. **The proxy has time limits** (§4.4 had only the head's): 30 minutes with nothing moving on a
+   tunnel or a forwarded reply, 5 minutes for a server to start its reply.
+4. **Audit** (§4.8): one thread writes the rows, the overflow row is written when its minute ends
+   with tool `proxy`, and a 400 or a 502 is a `refused:` row too.
+5. **Published ports** (§4.2): the host reads them from zephyr.toml by key; `up` passes them as
+   `ZEPHYR_PUBLISHED`, and the daemon's `run zephyr up` notice comes from comparing its ports with
+   that, a minute after they differ.
+6. **The host CLI follows the running container** (§4.5, §4.6): whether to pass the proxy
+   variables and where the attach port is come from the container's own environment, not from
+   host.toml, which only says what the next `up` makes.
+7. **OAuth paste only under the floor** (§4.7): a login is `need_input` for an OAuth provider
+   only in bridge mode; under host networking it waits for the browser as before.

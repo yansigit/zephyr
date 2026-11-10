@@ -127,7 +127,9 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   request) are pure; the proxy connects only to the `SocketAddr`s `decide` returned. Every daemon
   TCP listener binds `listen_addr(..)` and is a row of `LISTENERS`, which is what `zephyr up`
   publishes on host loopback (`published`; the host reads the same keys with `published_from`). `ruleset`/`load_floor` are run by `supervise` before the first
-  daemon (NET_ADMIN and SETPCAP then dropped in the daemon's `pre_exec`); `verify` and the hidden
+  daemon (NET_ADMIN and SETPCAP then dropped in the daemon's `pre_exec`), and `supervise` keeps
+  the direct routes of `network.allow` (`keep_allow`: an nft set of `address . port` pairs and its
+  own lines of `/etc/hosts`, refreshed on a change and hourly); `verify` and the hidden
   `zephyr __netcheck` (run as the agent, before the config is read) prove it at start and in
   `doctor`. Agent processes get `agent::PROXY_ENV` through `agent::cmd`. Audit rows are session
   `net`. Tests never set `ZEPHYR_NETWORK`; `tests/net_floor.rs` (ignored) checks a real side
