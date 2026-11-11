@@ -47,18 +47,28 @@ const ROOT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 const OK_FILE: &str = ".ok";
 const TRUST_FILE: &str = ".trust";
 
-/// signal-cli by full path, its environment cleared to what the JVM needs, on `dir`.
+/// signal-cli by full path, its environment cleared to what the JVM needs, on `dir`. Its
+/// temporary files go in `dir/tmp` (root's, 0700), never `/tmp`, which the agent can write to,
+/// and the JVM keeps no `hsperfdata` file at all.
 fn command(cli: &Path, dir: &Path) -> tokio::process::Command {
     let jre = cli
         .parent()
         .and_then(Path::parent)
         .unwrap_or(Path::new("/"))
         .join("jre");
+    let tmp = dir.join("tmp");
+    if let Err(e) = private_dir(&tmp) {
+        eprintln!("zephyr: signal: making {}: {e}", tmp.display());
+    }
+    let opts = format!(
+        "-Xmx256m -XX:+UseSerialGC -XX:-UsePerfData -Djava.io.tmpdir={}",
+        tmp.display()
+    );
     let mut cmd = tokio::process::Command::new(cli);
     cmd.env_clear()
         .env("PATH", ROOT_PATH)
         .env("JAVA_HOME", jre)
-        .env("JAVA_TOOL_OPTIONS", "-Xmx256m -XX:+UseSerialGC")
+        .env("JAVA_TOOL_OPTIONS", opts)
         .arg("--data-dir")
         .arg(dir)
         .kill_on_drop(true);
@@ -793,6 +803,29 @@ mod tests {
 
     const ACCOUNT: &str = "+15550001111";
     const OWNER: &str = "7f3c0000-aaaa-4bbb-8ccc-dddddddddddd";
+
+    #[test]
+    fn the_jvm_keeps_its_temporary_files_in_roots_folder() {
+        let home = crate::test_dir("signal-tmp");
+        let dir = home.join("signal");
+        let cmd = command(Path::new("/opt/zephyr/signal/bin/signal-cli"), &dir);
+        let env: HashMap<String, String> = (cmd.as_std().get_envs())
+            .filter_map(|(k, v)| Some((k.to_str()?.into(), v?.to_str()?.into())))
+            .collect();
+        let opts = &env["JAVA_TOOL_OPTIONS"];
+        let tmp = dir.join("tmp");
+        assert!(
+            opts.contains(&format!("-Djava.io.tmpdir={}", tmp.display())),
+            "{opts}"
+        );
+        assert!(opts.contains("-XX:-UsePerfData"), "{opts}");
+        let mode = std::fs::metadata(&tmp).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "made private, the agent cannot plant files there"
+        );
+    }
 
     #[tokio::test]
     async fn a_safety_number_counts_as_told_only_once_the_notice_is_stored() {
