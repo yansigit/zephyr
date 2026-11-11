@@ -962,6 +962,13 @@ impl<'a> Router<'a> {
                     crate::cards::agent(&self.cfg, &self.store, id, action, req, to, &self.desktop);
                 }
             }
+            if let Some((id, args)) = crate::procs::call(ev, "call") {
+                // Main only, like the vault; a call the plugin refused waits for nothing.
+                if zephyr_policy::tools::call_action(args).is_ok() {
+                    let text = self.phone(id, args);
+                    crate::tools::answer_gateway(&self.cfg, id, &text);
+                }
+            }
             if let Some((id, args)) = crate::procs::call(ev, "process") {
                 if let Ok(action) = zephyr_policy::tools::process_action(args) {
                     let text = self.procs.reply(&self.cfg, &self.store, action);
@@ -1032,6 +1039,33 @@ impl<'a> Router<'a> {
                     id,
                     &format!("not run: #{n} waits for the owner"),
                 )
+            }
+        }
+    }
+
+    /// Main's `call` call `id` (DESIGN §4.22): the gate refuses it or holds it for the owner,
+    /// and sends the card. What the agent is told either way.
+    fn phone(&self, id: &str, args: &Value) -> String {
+        use crate::gate::Verdict;
+        let Some(to) = self.origin() else {
+            return "no owner; not run".into();
+        };
+        let session = self.child.as_ref().and_then(|c| c.session.clone());
+        let since = self.snap.borrow().run.since_unix_ms.unwrap_or_default();
+        let req = crate::gate::Request {
+            session: session.unwrap_or_default(),
+            call_id: Some(id.into()),
+            tool: "call".into(),
+            args: args.clone(),
+            browser: None,
+            run: format!("main:{since}"),
+            reason: Some(self.last_say.clone()).filter(|r| !r.trim().is_empty()),
+        };
+        match crate::gate::decide(&self.cfg, &self.store, &req, to, crate::now()) {
+            Verdict::Hold { text, .. } | Verdict::Deny(text) => text,
+            // A phone call is never let through, and never waits in place.
+            Verdict::Allow | Verdict::Wait { .. } => {
+                "not run: every call waits for the owner".into()
             }
         }
     }

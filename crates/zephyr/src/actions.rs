@@ -164,6 +164,7 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
         ActionKind::Pass => pass(ctx, &a, by, now),
         ActionKind::Wait => wait(ctx, &a),
         ActionKind::Card => card(ctx, &a),
+        ActionKind::Call => Err("phone calls cannot be placed yet".into()),
     };
     let (n, s) = (a.id, summary(ctx.cfg, &a));
     Ok(match (started, by) {
@@ -338,6 +339,7 @@ fn audit(cfg: &Config, store: &Store, a: &Action, outcome: &str) {
         ActionKind::Pass => "mcp_call",
         ActionKind::Wait => "browser",
         ActionKind::Card => "card",
+        ActionKind::Call => "call",
     };
     let args = format!("#{} {}", a.id, summary(cfg, a));
     if let Err(e) = store.audit(&a.origin.session, tool, &args, outcome) {

@@ -382,6 +382,8 @@ pub enum ActionKind {
     Wait,
     /// A virtual card (DESIGN §4.25): `/ok` issues it.
     Card,
+    /// A phone call the daemon places (DESIGN §4.22).
+    Call,
 }
 
 impl ActionKind {
@@ -391,6 +393,7 @@ impl ActionKind {
             Self::Pass => "pass",
             Self::Wait => "wait",
             Self::Card => "card",
+            Self::Call => "call",
         }
     }
 
@@ -400,6 +403,7 @@ impl ActionKind {
             "pass" => Some(Self::Pass),
             "wait" => Some(Self::Wait),
             "card" => Some(Self::Card),
+            "call" => Some(Self::Call),
             _ => None,
         }
     }

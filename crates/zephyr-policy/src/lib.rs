@@ -40,7 +40,11 @@ event_handler! {
             return EVENT_HANDLER_ABORT;
         };
         let tool = call.tool_name.as_str();
+        // A phone call's agent only speaks (DESIGN §4.22): it was started with no tools, and
+        // this is the second wall.
+        let on_call = tools::call_session(&std::env::var(tools::SESSION_ENV).unwrap_or_default());
         let decision = match serde_json::from_str::<Value>(&call.params) {
+            _ if on_call => Decision::Deny("a phone call's agent has no tools"),
             Ok(args) => match check(tool, &args) {
                 Decision::Allow if policy::is_mcp(tool) => {
                     match policy::check_mcp(&args, connectors(), |p| std::fs::read(p).ok()) {
@@ -149,10 +153,13 @@ export_plugin!(|api| {
     // Optional, like the beacon: a host that cannot take them still gets the veto.
     if let Some(register_tool) = api.register_tool {
         let main = std::env::var(tools::EXEC_ENV).is_ok_and(|v| v == "1");
+        let on_call = tools::call_session(&std::env::var(tools::SESSION_ENV).unwrap_or_default());
         for (name, description, parameters, execute) in tools::TOOLS {
             // `exec` and `process` replace rpi's `bash` in the main child only (DESIGN §4.13),
-            // and the vault and the cards are main's alone (§4.15, §4.25).
-            if matches!(name, "exec" | "process" | "vault" | "card") && !main {
+            // and the vault, the cards and phone calls are main's alone (§4.15, §4.25, §4.22). A
+            // call's own agent gets none.
+            if on_call || (matches!(name, "exec" | "process" | "vault" | "card" | "call") && !main)
+            {
                 continue;
             }
             let schema = tools::schema(name, description, parameters);
