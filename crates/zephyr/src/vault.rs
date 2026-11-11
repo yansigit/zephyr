@@ -196,6 +196,63 @@ impl Entry {
     }
 }
 
+/// A provider's credentials (DESIGN §4.22): a `[[service]]` table. Never a token: it has no
+/// programs, no hosts and no surrogate, and only the daemon's own client reads it. `Debug`
+/// shows the key's length.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Service {
+    /// What it is for: one of [`SERVICES`].
+    pub name: String,
+    pub provider: String,
+    /// The API secret; empty when the provider has none (Link's tokens are its own file).
+    pub key: String,
+    /// A provider's own id: a Link client id, a telephony connection id.
+    pub account: String,
+}
+
+/// The services a vault may hold, one of each.
+pub const SERVICES: [&str; 2] = ["cards", "calls"];
+
+impl std::fmt::Debug for Service {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Service")
+            .field("name", &self.name)
+            .field("provider", &self.provider)
+            .field("key", &self.key.len())
+            .field("account", &self.account)
+            .finish()
+    }
+}
+
+impl Service {
+    fn check(&self) -> anyhow::Result<()> {
+        if !SERVICES.contains(&self.name.as_str()) {
+            bail!("a service is named {}", SERVICES.join(" or "));
+        }
+        let plain = |s: &str| s.chars().all(|c| c.is_ascii_graphic());
+        if self.provider.is_empty() || !login_name(&self.provider) {
+            bail!("service {}: the provider is a lowercase name", self.name);
+        }
+        if !plain(&self.key) || !plain(&self.account) {
+            bail!(
+                "service {}: the key and the account take no spaces",
+                self.name
+            );
+        }
+        Ok(())
+    }
+
+    /// One line for `/vault` and `zephyr vault list`: never the key.
+    pub fn line(&self) -> String {
+        let key = if self.key.is_empty() {
+            "no key"
+        } else {
+            "a key is saved"
+        };
+        format!("service {}: {}; {key}", self.name, self.provider)
+    }
+}
+
 /// A binding as the owner reads it: without the port every HTTPS host has.
 pub fn shown(host_port: &str) -> &str {
     host_port.strip_suffix(":443").unwrap_or(host_port)
@@ -267,7 +324,7 @@ impl Vault {
                 + 1;
             anyhow::anyhow!("vault.toml is not valid TOML (line {line})")
         })?;
-        for key in ["login", "token"] {
+        for key in ["login", "token", "service"] {
             if doc
                 .get(key)
                 .is_some_and(|i| i.as_array_of_tables().is_none())
@@ -281,6 +338,13 @@ impl Vault {
             e.check().context("vault.toml")?;
             if !seen.insert(e.name.clone()) {
                 bail!("vault.toml has two entries named {}", e.name);
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for s in v.services() {
+            s.check().context("vault.toml")?;
+            if !seen.insert(s.name.clone()) {
+                bail!("vault.toml has two services named {}", s.name);
             }
         }
         Ok(v)
@@ -309,6 +373,60 @@ impl Vault {
                     .map(move |t| read(kind, t))
             })
             .collect()
+    }
+
+    /// The providers' credentials, `[[service]]`.
+    pub fn services(&self) -> Vec<Service> {
+        let tables = self.doc.get("service").and_then(Item::as_array_of_tables);
+        let s = |t: &Table, k: &str| t.get(k).and_then(Item::as_str).unwrap_or("").to_string();
+        (tables.into_iter().flat_map(|a| a.iter()))
+            .map(|t| Service {
+                name: s(t, "name"),
+                provider: s(t, "provider"),
+                key: s(t, "key"),
+                account: s(t, "account"),
+            })
+            .collect()
+    }
+
+    pub fn service(&self, name: &str) -> Option<Service> {
+        self.services().into_iter().find(|s| s.name == name)
+    }
+
+    /// Adds or replaces the service of that name; an empty key keeps the one saved for the
+    /// same provider. Returns whether it is new.
+    pub fn put_service(&mut self, mut new: Service) -> anyhow::Result<bool> {
+        let old = self.service(&new.name);
+        if let Some(old) = old.as_ref().filter(|o| o.provider == new.provider) {
+            if new.key.is_empty() {
+                new.key.clone_from(&old.key);
+            }
+        }
+        new.check()?;
+        let list = self
+            .doc
+            .entry("service")
+            .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
+            .as_array_of_tables_mut()
+            .context("vault.toml")?;
+        list.retain(|t| t.get("name").and_then(Item::as_str) != Some(new.name.as_str()));
+        let mut t = Table::new();
+        set(&mut t, "name", &new.name);
+        set(&mut t, "provider", &new.provider);
+        set(&mut t, "key", &new.key);
+        set(&mut t, "account", &new.account);
+        list.push(t);
+        Ok(old.is_none())
+    }
+
+    pub fn remove_service(&mut self, name: &str) -> bool {
+        let Some(list) = (self.doc.get_mut("service")).and_then(Item::as_array_of_tables_mut)
+        else {
+            return false;
+        };
+        let before = list.len();
+        list.retain(|t| t.get("name").and_then(Item::as_str) != Some(name));
+        list.len() < before
     }
 
     pub fn get(&self, name: &str) -> Option<Entry> {
@@ -612,12 +730,14 @@ impl Vault {
                 Kind::Login => (e.name, e.password),
                 Kind::Token => (e.name, e.value),
             })
+            .chain(self.services().into_iter().map(|s| (s.name, s.key)))
             .collect()
     }
 
     /// Names, kinds, sites, usernames and grants; never a value.
     pub fn list(&self) -> String {
-        let lines: Vec<String> = self.entries().iter().map(Entry::line).collect();
+        let mut lines: Vec<String> = self.entries().iter().map(Entry::line).collect();
+        lines.extend(self.services().iter().map(Service::line));
         if lines.is_empty() {
             return "[zephyr] the vault is empty".into();
         }
@@ -1401,6 +1521,64 @@ programs = ["gh"]
         let broken = Vault::parse("[[token]]\nname = \"A\"\nvalue = \"s3cret\" x\n");
         let said = format!("{:#}", broken.err().unwrap());
         assert_eq!(said, "vault.toml is not valid TOML (line 3)");
+    }
+
+    const SERVICE: &str = "[[service]]\nname = \"cards\"\nprovider = \"link\"\n\
+                           key = \"sk_servicekey42\"\naccount = \"lwlpk_x\"\n";
+
+    #[test]
+    fn a_service_is_listed_by_name_and_provider_only() {
+        let v = Vault::parse(SERVICE).unwrap();
+        let s = v.service("cards").unwrap();
+        assert_eq!(
+            (s.provider.as_str(), s.account.as_str()),
+            ("link", "lwlpk_x")
+        );
+        assert_eq!(
+            v.list(),
+            "[zephyr] vault:\nservice cards: link; a key is saved"
+        );
+        assert!(!format!("{s:?}{}", v.list()).contains("sk_servicekey42"));
+        // Its key is scrubbed like any vault value.
+        assert_eq!(
+            scrub("x sk_servicekey42 y", &v.secrets()),
+            "x [vault:cards] y"
+        );
+        for bad in [
+            "[[service]]\nname = \"other\"\nprovider = \"link\"\n",
+            "[[service]]\nname = \"cards\"\n",
+            &format!("{SERVICE}{SERVICE}"),
+            "[service]\nname = \"cards\"\n",
+        ] {
+            assert!(Vault::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_service_is_never_a_token() {
+        let mut v = Vault::parse(SERVICE).unwrap();
+        assert!(
+            v.get("cards").is_none(),
+            "not an entry the agent's tools see"
+        );
+        assert!(v.grant(Kind::Token, "cards", &["curl"]).is_err());
+        assert!(v.bind("cards", &["api.link.com"]).is_err());
+        let dir = crate::test_dir("vault-service");
+        let path = dir.join("vault.toml");
+        std::fs::write(&path, SERVICE).unwrap();
+        // A chat can neither add nor change one: `/vault` has no word for it.
+        let said = command(&path, "add service cards", true, true);
+        assert!(said.is_err(), "{said:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SERVICE);
+        // A new key for the same provider replaces it; an empty one keeps it.
+        let again = Service {
+            name: "cards".into(),
+            provider: "link".into(),
+            ..Service::default()
+        };
+        assert!(!v.put_service(again).unwrap());
+        assert_eq!(v.service("cards").unwrap().key, "sk_servicekey42");
+        assert!(v.remove_service("cards") && v.service("cards").is_none());
     }
 
     #[test]
