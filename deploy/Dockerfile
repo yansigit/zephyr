@@ -255,7 +255,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && cmake --build /build -j"$(nproc)" --target whisper-cli \
     && install -D -m 755 -s /build/bin/whisper-cli /out/bin/whisper-cli
 
-# ffmpeg, static, with only what voice notes in and out need: the channels' audio containers and
+# ffmpeg, static, with only what voice notes in and out need (and μ-law out, for a phone call's speech): the channels' audio containers and
 # codecs, raw s16le in (Piper's PCM), and Opus, AAC and 16-bit WAV out.
 FROM ubuntu:24.04 AS voice-ffmpeg
 ARG FFMPEG_VERSION FFMPEG_SHA256
@@ -271,7 +271,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
        --enable-demuxer=ogg,mov,matroska,mp3,wav,flac,aac,caf,amr,pcm_s16le \
        --enable-decoder='opus,libopus,vorbis,aac,mp3,mp3float,flac,pcm_*,alac,amrnb,amrwb' \
        --enable-parser=aac,flac,mpegaudio,opus,vorbis \
-       --enable-encoder=libopus,aac,pcm_s16le --enable-muxer=ogg,ipod,wav --enable-filter=aresample \
+       --enable-encoder=libopus,aac,pcm_s16le,pcm_mulaw --enable-muxer=ogg,ipod,wav,mulaw --enable-filter=aresample \
     && make -j"$(nproc)" ffmpeg \
     && install -D -m 755 -s ffmpeg /out/bin/ffmpeg
 

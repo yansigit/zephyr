@@ -7,6 +7,8 @@ environment is cleared: {"prog", "uid", "argv", "sha256", "env", "start", "end"}
 of the input (the file an argument names, or stdin for Piper). Marker files in the voice folder:
 
   say         what whisper hears (default `hello from the fake`)
+  says        what whisper hears run by run: each run takes the file's first line (a phone call's
+              utterances); once it is empty, `say` again
   lang        the language whisper detects with `-l auto` (default `en`)
   secs        how long the decoded audio is (default 2), cut at ffmpeg's `-t`
   hang        whisper writes its pid to `hang.pid` and sleeps until it is killed
@@ -59,6 +61,8 @@ if prog == "ffmpeg":
     if "wav" in argv:
         secs = min(float(marker("secs", "2")), float(after("-t")))
         out = b"RIFF" + b"\0" * 40 + b"\0" * int(secs * 32000)
+    elif "mulaw" in argv:
+        out = b"ulaw:" + data
     else:
         out = (b"OggS" if "ogg" in argv else b"ftyp") + data
     if argv[-1] == "pipe:1":
@@ -97,7 +101,14 @@ elif prog == "whisper-cli":
     if after("-l") == "auto":
         print("whisper_full_with_state: auto-detected language: %s (p = 0.97)" % marker("lang", "en"),
               file=sys.stderr)
-    print(" " + marker("say", "hello from the fake"))
+    says = (marker("says") or "").split("\n")
+    if says != [""]:
+        # A phone call's utterances: each run hears the file's next line.
+        with open(os.path.join(root, "says"), "w") as f:
+            f.write("\n".join(says[1:]))
+        print(" " + says[0])
+    else:
+        print(" " + marker("say", "hello from the fake"))
     done(data)
 elif prog == "python":
     data = sys.stdin.buffer.read()
