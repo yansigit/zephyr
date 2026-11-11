@@ -261,6 +261,7 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
 - Deviation: one more test, `tests/cli.rs` `xdotool_is_the_wrapper_and_does_not_run_while_the_desktop_is_held`, runs the binary under the name `xdotool`, since the `argv[0]` dispatch is in `main.rs`, which no unit test reaches. `desktop.rs` also has `a_held_command_is_told_since_when_and_what_to_do` for the two texts.
 - Deviation: `vault::agent` takes the `Control` as a parameter (the fill itself is spawned there), and `vault::fill` is unchanged.
 - Review fix: `Control::take` publishes the hold before it writes `desktop-held` (it wrote the file first, so a wrapper could see the file, ask the gate, be told nothing was held and run), and takes it back when the write fails. The router's notes come from `Control::events`, an ordered queue, not from the `watch`, which folded a take and a quick hand back into nothing.
+- Review fix: a desktop wait no longer holds one of the gate's 32 connection slots for its 2 minutes: it gives the slot back once its request is read and takes one of 8 of its own; a wait over those is answered at once with the "owner has the desktop" text.
 
 ### Task C2-7: Take over, the ticket, `/api/vnc`, x11vnc, the notes and the timeouts
 

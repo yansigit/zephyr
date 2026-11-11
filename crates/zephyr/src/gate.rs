@@ -1083,6 +1083,7 @@ pub async fn serve(
     };
     let store = Arc::new(Mutex::new(store));
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
+    let desktop_waits = Arc::new(tokio::sync::Semaphore::new(DESKTOP_WAITS));
     let mut conns = FuturesUnordered::new();
     loop {
         tokio::select! {
@@ -1098,11 +1099,9 @@ pub async fn serve(
                         waits: waits.clone(),
                         main: main.clone(),
                         desktop: desktop.clone(),
+                        desktop_waits: desktop_waits.clone(),
                     };
-                    conns.push(async move {
-                        conn.run(stream, wake).await;
-                        drop(slot);
-                    });
+                    conns.push(conn.run(stream, wake, slot));
                 }
                 Err(e) => {
                     eprintln!("zephyr: gate accept failed: {e}");
@@ -1150,10 +1149,18 @@ struct Conn {
     main: mpsc::Sender<crate::router::GateNote>,
     /// Who holds the desktop, for the wrappers that wait on it.
     desktop: Arc<crate::desktop::Control>,
+    /// The places of the wrappers that wait on the desktop ([`DESKTOP_WAITS`]).
+    desktop_waits: Arc<tokio::sync::Semaphore>,
 }
 
+/// Wrappers that may wait on the desktop at once, each up to `Config::desktop_hold`. They wait
+/// outside the gate's own connections, so a burst of browser commands during a takeover never
+/// has the agent's other calls refused; one more is told at once that the owner has the desktop.
+const DESKTOP_WAITS: usize = 8;
+
 impl Conn {
-    async fn run(self, stream: UnixStream, wake: &Wake) {
+    /// `slot` is this connection's place among the gate's [`MAX_CONNS`], held to the end.
+    async fn run(self, stream: UnixStream, wake: &Wake, slot: tokio::sync::OwnedSemaphorePermit) {
         // Another uid is hung up on, unanswered.
         if !stream.peer_cred().is_ok_and(|c| c.uid() == agent_uid()) {
             return;
@@ -1174,8 +1181,14 @@ impl Conn {
             if what == "wait" && line.len() <= MAX_REQUEST {
                 // Never `allow`: the command does not run on a page the owner changed. Only an
                 // empty text (nothing was held after all) lets the wrapper go on.
-                let answer =
-                    serde_json::json!({ "verdict": "deny", "text": self.desktop_wait().await });
+                drop(slot);
+                let text = match self.desktop_waits.clone().try_acquire_owned() {
+                    Ok(_place) => self.desktop_wait().await,
+                    Err(_) => (self.desktop.held()).map_or_else(String::new, |held| {
+                        crate::desktop::still(&self.cfg, held.since)
+                    }),
+                };
+                let answer = serde_json::json!({ "verdict": "deny", "text": text });
                 let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
                 return;
             }
@@ -3478,6 +3491,67 @@ mod tests {
             answer["text"], "not run: the gate could not read the request",
             "{answer}"
         );
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
+    }
+
+    /// A burst of browser commands during a takeover waits in places of its own, 8 of them:
+    /// the gate's 32 stay free for the agent's other calls, which are decided at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn desktop_waits_do_not_take_the_gates_places() {
+        use futures_util::stream::FuturesUnordered;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let h = home("gate-desktop-burst", "");
+        let (socket, desktop) = serving_desktop(&h).await;
+        desktop.take([1; 32], 14 * 3600 + 4 * 60).unwrap();
+        let wait = json!({"v": 1, "desktop": "wait", "session": "main"});
+        let mut answers = FuturesUnordered::new();
+        for _ in 0..40 {
+            let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            let (read, mut write) = stream.into_split();
+            write
+                .write_all(format!("{wait}\n").as_bytes())
+                .await
+                .unwrap();
+            answers.push(async move {
+                let mut line = String::new();
+                let mut read = tokio::io::BufReader::new(read);
+                let _ = read.read_line(&mut line).await;
+                drop(write);
+                serde_json::from_str::<Value>(&line).ok()
+            });
+        }
+        let limit = Duration::from_secs(10);
+        // Over the 8: told at once that the owner has the desktop, as after the limit.
+        let still = "zephyr: the owner has the desktop (since 14:04); this command did not \
+                     run. Do other work, or try again later.";
+        for n in 0..32 {
+            let answer = tokio::time::timeout(limit, answers.next()).await;
+            let answer = answer.unwrap_or_else(|_| panic!("#{n} waits"));
+            assert_eq!(
+                answer.flatten(),
+                Some(json!({"verdict": "deny", "text": still})),
+                "#{n}"
+            );
+        }
+        // The other 8 wait, and a call of another kind is decided meanwhile.
+        let listing = json!({"v": 1, "session": "task-1", "call_id": "c1", "tool": "bash",
+                             "args": {"command": "ls"}});
+        let decided = tokio::time::timeout(Duration::from_secs(10), ask(&socket, &listing)).await;
+        assert_eq!(
+            decided.expect("decided while the waits wait").unwrap()["verdict"],
+            "allow"
+        );
+        assert_eq!(answers.len(), 8);
+        desktop.give(crate::now());
+        for _ in 0..8 {
+            let answer = tokio::time::timeout(limit, answers.next()).await;
+            let answer = answer.expect("answered at the hand back");
+            let text = answer.flatten().unwrap()["text"].to_string();
+            assert!(
+                text.contains("the owner used the desktop from 14:04"),
+                "{text}"
+            );
+        }
         let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
     }
 
