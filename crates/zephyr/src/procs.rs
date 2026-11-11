@@ -623,7 +623,7 @@ fn reap(fd: &OwnedFd) -> std::io::Result<std::process::ExitStatus> {
 /// The kernel start time of `pid` (field 22 of `/proc/<pid>/stat`, in clock ticks since boot),
 /// which tells a command from whatever later reuses its pid. After the last `)`, since the
 /// command name in field 2 may hold spaces and parentheses.
-fn start_ticks(pid: i32) -> Option<i64> {
+pub(crate) fn start_ticks(pid: i32) -> Option<i64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after = &stat[stat.rfind(')')? + 1..];
     after.split_whitespace().nth(19)?.parse().ok()

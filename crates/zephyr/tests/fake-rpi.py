@@ -635,7 +635,15 @@ catalog = set(CATALOG) | ({model} if model else set())
 lines = queues.Queue()  # stdin, read on a thread; None at EOF
 deferred = []  # commands a waiting gateway call left for the main loop
 def read_stdin():
+    # `arrived.jsonl`: each command as it reaches the fake, and whether a run was going then,
+    # so a test can tell what the router sent mid-run from what the fake later got round to.
     for l in sys.stdin:
+        try:
+            kind = json.loads(l).get("type")
+        except ValueError:
+            kind = None
+        with open(os.path.join(home, "arrived.jsonl"), "a") as f:
+            f.write(json.dumps({"type": kind, "running": running}) + "\n")
         lines.put(l)
     lines.put(None)
 threading.Thread(target=read_stdin, daemon=True).start()

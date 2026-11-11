@@ -185,7 +185,9 @@ const fn fixed(key: &'static str, label: &'static str, help: &'static str) -> Se
 }
 
 /// The channels `settings.strong_channels` may name.
-pub const CHANNELS: &[&str] = &["tui", "chat", "discord", "imessage", "web", "passkey"];
+pub const CHANNELS: &[&str] = &[
+    "tui", "chat", "discord", "imessage", "telegram", "signal", "web", "passkey",
+];
 
 /// rpi 0.18's thinking levels (`rpi_ai::ThinkingLevel`), off first. A model offers some of
 /// them: the router checks a level against the child's `get_available_thinking_levels`, which
@@ -577,6 +579,8 @@ pub static SETTINGS: &[Setting] = &[
     ),
     fixed("discord", "Discord", "The Discord adapter."),
     fixed("imessage", "iMessage", "The BlueBubbles adapter."),
+    fixed("telegram", "Telegram", "The Telegram bot."),
+    fixed("signal", "Signal", "The signal-cli adapter."),
     fixed("attach", "Attach", "The rpi --connect listener."),
     fixed("web", "Web app", "The web app's listener."),
     fixed(

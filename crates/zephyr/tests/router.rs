@@ -35,6 +35,23 @@ impl Channel for TestChannel {
         std::future::pending().await
     }
     async fn send(&self, msg: &Outbound) -> anyhow::Result<()> {
+        // A `going-<name>` file: the send is still going in the adapter, as Telegram's or
+        // Signal's detached send says (`channel::StillGoing`).
+        if self
+            .db
+            .with_file_name(format!("going-{}", self.name))
+            .exists()
+        {
+            return Err(zephyr::channel::StillGoing.into());
+        }
+        // A `paused-<name>` file: the channel's account is held (Signal's setup), and sends wait.
+        if self
+            .db
+            .with_file_name(format!("paused-{}", self.name))
+            .exists()
+        {
+            return Err(zephyr::channel::Paused.into());
+        }
         // A `stall-<name>` file in the home makes this channel's sends hang, like a stuck client.
         if self
             .db
@@ -101,11 +118,16 @@ fn config(home: &Path) -> Config {
 
 /// A gateway with a `chat` and a `discord` test channel, both feeding one router.
 fn start(cfg: Config) -> Gateway {
+    start_on(cfg, &["chat", "discord"])
+}
+
+/// A gateway with a test channel of each name, all feeding one router.
+fn start_on(cfg: Config, names: &[&'static str]) -> Gateway {
     let mut feeds = HashMap::new();
     let mut sent = HashMap::new();
     let mut acts = HashMap::new();
     let mut channels = Vec::new();
-    for name in ["chat", "discord"] {
+    for &name in names {
         let (feed, rx) = mpsc::channel(16);
         let s = Sent::default();
         feeds.insert(name, feed);
@@ -2355,6 +2377,387 @@ async fn a_job_whose_label_holds_429_failing_otherwise_cools_no_account() {
         ["pa/m", "pa/m"],
         "main, then the job, not re-run on b"
     );
+    gw.shutdown().await;
+}
+
+/// A gateway on a file-backed config with `[telegram]` (no real bot: the channel is a test one).
+fn paired_gateway(name: &str) -> (PathBuf, Gateway) {
+    let home = home(name);
+    let text = file_text(&home, "[telegram]\ntoken_env = \"T\"\n")
+        .replace("[owners]\n", "[owners]\ndiscord = [\"downer\"]\n");
+    std::fs::write(home.join("zephyr.toml"), text).unwrap();
+    let mut cfg = Config::load(&home.join("zephyr.toml")).unwrap();
+    cfg.web_lockout = Duration::from_secs(3600);
+    (home, start_on(cfg, &["chat", "telegram", "discord"]))
+}
+
+/// Asks for a code on chat and returns it as shown (`ABCDE-FGHJK`).
+async fn pair_code(gw: &Gateway, id: &str) -> String {
+    let codes = || {
+        let all = gw.replies().into_iter();
+        all.filter(|r| r.starts_with("[zephyr] send /pair "))
+            .collect::<Vec<_>>()
+    };
+    let before = codes().len();
+    gw.say(id, "owner", "/pair telegram").await;
+    wait(|| codes().len() > before).await;
+    let reply = codes().pop().unwrap();
+    let code = reply["[zephyr] send /pair ".len()..]
+        .split(' ')
+        .next()
+        .unwrap();
+    assert_eq!(
+        reply,
+        format!("[zephyr] send /pair {code} to the bot within 10 min; it works once")
+    );
+    assert!(code.len() == 11 && code.as_bytes()[5] == b'-', "{code}");
+    code.to_string()
+}
+
+fn telegram_owners(home: &Path) -> Vec<String> {
+    let cfg = Config::load(&home.join("zephyr.toml")).unwrap();
+    cfg.owners.get("telegram").cloned().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn pairing_makes_the_sender_an_owner() {
+    let (home, gw) = paired_gateway("pair-ok");
+    let code = pair_code(&gw, "p1").await;
+    gw.say_on(
+        "telegram",
+        "55-1",
+        "55",
+        &format!("/pair {}", code.to_lowercase()),
+    )
+    .await;
+    let paired = gw.wait_replies_on("telegram", 1).await;
+    assert_eq!(paired, ["[zephyr] paired: you are an owner of this zephyr"]);
+    assert_eq!(telegram_owners(&home), ["55"]);
+    reply_starting(
+        &gw,
+        "[zephyr] Telegram user 55 is now an owner; /unpair telegram 55 removes them",
+    )
+    .await;
+    // The code is never in state.db: the row reads `/pair`, dropped.
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let dropped = store.inbox_with_status("dropped").unwrap();
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0].text, "/pair");
+    assert!(store.meta("pair_telegram").unwrap().is_none());
+    // The new owner is read live: their next message reaches the agent.
+    gw.say_on("telegram", "55-2", "55", "hello").await;
+    wait(|| gw.replies_on("telegram").len() == 2).await;
+    assert!(gw.replies_on("telegram")[1].contains("hello"));
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_claim_taken_in_while_draining_is_still_a_claim() {
+    let (home, mut gw) = paired_gateway("pair-drain");
+    let code = pair_code(&gw, "p1").await;
+    // A run going, so the drain (shutdown or re-exec, one path) waits for it to settle and
+    // takes in what arrived meanwhile.
+    std::fs::write(home.join("slow"), "2").unwrap();
+    gw.say("p2", "owner", "keep busy").await;
+    wait(|| !log(&home, "prompt").is_empty()).await;
+    let _ = gw.stop.take().unwrap().send(());
+    gw.say_on("telegram", "55-1", "55", &format!("/pair {code}"))
+        .await;
+    gw.task.await.unwrap().unwrap();
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let texts: Vec<String> = (store.inbox_with_status("dropped").unwrap().into_iter())
+        .map(|r| r.text)
+        .collect();
+    assert_eq!(texts, ["/pair"], "the code never reaches state.db");
+    assert_eq!(telegram_owners(&home), ["55"]);
+}
+
+#[tokio::test]
+async fn a_pairing_code_works_once_and_expires() {
+    let (home, gw) = paired_gateway("pair-once");
+    let code = pair_code(&gw, "p1").await;
+    gw.say_on("telegram", "55-1", "55", &format!("/pair {code}"))
+        .await;
+    gw.wait_replies_on("telegram", 1).await;
+    // The same message again (a re-delivery) and the same code from someone else: nothing.
+    gw.say_on("telegram", "55-1", "55", &format!("/pair {code}"))
+        .await;
+    gw.say_on("telegram", "66-1", "66", &format!("/pair {code}"))
+        .await;
+    // A fresh code that has expired claims nothing either.
+    let late = pair_code(&gw, "p2").await;
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let mut row: Value =
+        serde_json::from_str(&store.meta("pair_telegram").unwrap().unwrap()).unwrap();
+    row["expires"] = 1.into();
+    store
+        .set_meta("pair_telegram", Some(&row.to_string()))
+        .unwrap();
+    gw.say_on("telegram", "77-1", "77", &format!("/pair {late}"))
+        .await;
+    wait(|| store.inbox_with_status("dropped").unwrap().len() == 3).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(gw.replies_on("telegram").len(), 1);
+    assert_eq!(telegram_owners(&home), ["55"]);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn wrong_codes_close_pairing_and_get_no_reply() {
+    let (home, gw) = paired_gateway("pair-wrong");
+    let code = pair_code(&gw, "p1").await;
+    for i in 0..5 {
+        gw.say_on("telegram", &format!("99-{i}"), "99", "/pair AAAAA-AAAAA")
+            .await;
+    }
+    reply_starting(
+        &gw,
+        "[zephyr] 5 wrong pairing codes; pairing is closed until ",
+    )
+    .await;
+    // While closed, even the right code claims nothing, and no stranger is ever answered.
+    gw.say_on("telegram", "55-1", "55", &format!("/pair {code}"))
+        .await;
+    let store = Store::open(&home.join("state.db")).unwrap();
+    wait(|| store.inbox_with_status("dropped").unwrap().len() == 6).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(gw.replies_on("telegram").is_empty());
+    assert!(telegram_owners(&home).is_empty());
+    gw.say("p2", "owner", "/pair telegram").await;
+    reply_starting(&gw, "[zephyr] pairing is closed until ").await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_send_still_going_past_the_window_is_neither_failed_nor_its_file_discarded() {
+    let home = home("still-going");
+    let mut cfg = config(&home);
+    cfg.tick = Duration::from_millis(200);
+    std::fs::write(home.join("shot.txt"), "SHOT").unwrap();
+    std::fs::write(home.join("going-chat"), "").unwrap();
+    let gw = start(cfg);
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call send_file {"path": "shot.txt"}] here"#,
+    )
+    .await;
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    let row = || -> Option<(String, Option<String>)> {
+        db.query_row(
+            "SELECT status, attachment FROM outbox WHERE attachment IS NOT NULL",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()
+    };
+    wait(|| row().is_some()).await;
+    // Past every retry window, while the adapter still says its send goes on.
+    db.execute("UPDATE outbox SET created_at = 0", []).unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await; // several flush passes
+    let (status, file) = row().unwrap();
+    assert_eq!(status, "pending");
+    assert!(
+        Path::new(&file.unwrap()).exists(),
+        "the file it sends is kept"
+    );
+    // The send ends: its true result is recorded.
+    std::fs::remove_file(home.join("going-chat")).unwrap();
+    wait(|| row().is_some_and(|(s, _)| s == "sent")).await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_reply_queued_while_its_channel_is_paused_is_sent_after_it() {
+    let home = home("paused");
+    let mut cfg = config(&home);
+    cfg.tick = Duration::from_millis(200);
+    std::fs::write(home.join("paused-chat"), "").unwrap();
+    let gw = start(cfg);
+    gw.say("m1", "owner", "hello").await;
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    let status = || -> Option<String> {
+        db.query_row(
+            "SELECT status FROM outbox WHERE inbox_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .ok()
+    };
+    wait(|| status().is_some()).await;
+    db.execute("UPDATE outbox SET created_at = 0", []).unwrap(); // past every window
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(status().as_deref(), Some("pending"));
+    std::fs::remove_file(home.join("paused-chat")).unwrap();
+    wait(|| status().as_deref() == Some("sent")).await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_live_pairing_code_never_reaches_state_db() {
+    let (home, gw) = paired_gateway("pair-unstored");
+    let code = pair_code(&gw, "p1").await; // the owner got the real code
+    gw.shutdown().await;
+    let mut bytes = Vec::new();
+    for name in ["state.db", "state.db-wal"] {
+        bytes.extend(std::fs::read(home.join(name)).unwrap_or_default());
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    for form in [code.clone(), code.replace('-', "")] {
+        assert!(!text.contains(&form), "{form} is in state.db");
+    }
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    let kept: String = db
+        .query_row("SELECT text FROM outbox WHERE channel = 'chat'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    drop(store);
+    assert_eq!(
+        kept,
+        "[zephyr] send /pair [code] to the bot within 10 min; it works once"
+    );
+}
+
+#[tokio::test]
+async fn every_way_of_sending_a_code_pairs_and_none_reaches_state_db() {
+    let (home, gw) = paired_gateway("pair-forms");
+    let mut codes = Vec::new();
+    let forms: [fn(&str) -> String; 3] = [
+        |c| format!("/pair@zephyr_bot {c}"),
+        |c| c.to_string(),
+        |c| format!("/pair{c}"),
+    ];
+    for (i, form) in forms.iter().enumerate() {
+        let code = pair_code(&gw, &format!("p{i}")).await;
+        let who = format!("{}", 70 + i);
+        // While a code is out, a stranger's other text is not kept as typed either.
+        gw.say_on(
+            "telegram",
+            &format!("{who}-0"),
+            &who,
+            &format!("my code is {code}"),
+        )
+        .await;
+        gw.say_on("telegram", &format!("{who}-1"), &who, &form(&code))
+            .await;
+        wait(|| telegram_owners(&home).contains(&who)).await;
+        codes.push(code);
+    }
+    gw.shutdown().await;
+    let mut bytes = Vec::new();
+    for name in ["state.db", "state.db-wal"] {
+        bytes.extend(std::fs::read(home.join(name)).unwrap_or_default());
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    for code in &codes {
+        for form in [code.clone(), code.replace('-', "")] {
+            assert!(!text.contains(&form), "{form} is in state.db");
+        }
+    }
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let texts: Vec<String> = (store.inbox_with_status("dropped").unwrap().into_iter())
+        .map(|r| r.text)
+        .collect();
+    assert!(
+        texts.contains(&"[message from someone not paired]".to_string()),
+        "{texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_near_miss_pair_text_is_stored_cut() {
+    let (home, gw) = paired_gateway("pair-near-miss");
+    let code = pair_code(&gw, "p1").await;
+    // A code missing its last character, and one with a word after it: neither is a claim's
+    // shape, and neither may reach state.db as typed.
+    let short = &code[..code.len() - 1];
+    gw.say_on("telegram", "99-1", "99", &format!("/pair {short}"))
+        .await;
+    gw.say_on("telegram", "99-2", "99", &format!("/PAIR {code} please"))
+        .await;
+    let store = Store::open(&home.join("state.db")).unwrap();
+    wait(|| store.inbox_with_status("dropped").unwrap().len() == 2).await;
+    let texts: Vec<String> = (store.inbox_with_status("dropped").unwrap().into_iter())
+        .map(|r| r.text)
+        .collect();
+    // A code is out, so neither is kept at all: the stranger's placeholder.
+    assert_eq!(
+        texts,
+        [zephyr::pairing::UNPAIRED, zephyr::pairing::UNPAIRED]
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn wrong_codes_with_no_code_out_close_nothing() {
+    let (home, gw) = paired_gateway("pair-none-out");
+    for i in 0..6 {
+        gw.say_on("telegram", &format!("99-{i}"), "99", "/pair AAAAA-AAAAA")
+            .await;
+    }
+    let store = Store::open(&home.join("state.db")).unwrap();
+    wait(|| store.inbox_with_status("dropped").unwrap().len() == 6).await;
+    // Pairing is still open, and no owner was told anything.
+    pair_code(&gw, "p1").await;
+    assert!(
+        !gw.replies()
+            .iter()
+            .any(|r| r.contains("wrong pairing codes")),
+        "{:?}",
+        gw.replies()
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_strong_telegram_owner_may_ask_for_a_code() {
+    let home = home("pair-strong-tg");
+    let text = file_text(
+        &home,
+        "[telegram]\ntoken_env = \"T\"\n[settings]\nstrong_channels = [\"tui\", \"chat\", \"telegram\"]\n",
+    )
+    .replace("[owners]\n", "[owners]\ntelegram = [\"55\"]\n");
+    std::fs::write(home.join("zephyr.toml"), text).unwrap();
+    let cfg = Config::load(&home.join("zephyr.toml")).unwrap();
+    let gw = start_on(cfg, &["chat", "telegram"]);
+    gw.say_on("telegram", "55-1", "55", "/pair telegram").await;
+    let replies = gw.wait_replies_on("telegram", 1).await;
+    assert!(
+        replies[0].starts_with("[zephyr] send /pair ") && replies[0].ends_with("it works once"),
+        "{replies:?}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn pair_needs_a_strong_channel_and_a_set_up_channel() {
+    let (_home, gw) = paired_gateway("pair-strong");
+    gw.say_on("discord", "d1", "downer", "/pair telegram").await;
+    let refused = gw.wait_replies_on("discord", 1).await;
+    assert_eq!(refused, ["[zephyr] /pair needs tui or chat"]);
+    gw.say("p1", "owner", "/pair signal").await;
+    reply_starting(
+        &gw,
+        "[zephyr] signal is not set up; zephyr channel add signal on the host",
+    )
+    .await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn unpair_removes_an_owner() {
+    let (home, gw) = paired_gateway("pair-rm");
+    let code = pair_code(&gw, "p1").await;
+    gw.say_on("telegram", "55-1", "55", &format!("/pair {code}"))
+        .await;
+    gw.wait_replies_on("telegram", 1).await;
+    gw.say("p2", "owner", "/unpair telegram 55").await;
+    reply_starting(&gw, "[zephyr] 55 is no longer an owner on telegram").await;
+    assert!(telegram_owners(&home).is_empty());
+    gw.say("p3", "owner", "/unpair telegram 55").await;
+    reply_starting(&gw, "[zephyr] 55 is not an owner on telegram").await;
     gw.shutdown().await;
 }
 

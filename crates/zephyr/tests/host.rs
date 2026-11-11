@@ -61,6 +61,8 @@ case "$1" in
       *" zephyr status "*) echo "daemon: ${SHIM_DAEMON:-running}"; [ -n "$SHIM_STATUS" ] && printf '%b\n' "$SHIM_STATUS"; exit "${SHIM_STATUS_EXIT:-0}" ;;
       *" zephyr --version "*) [ -n "$SHIM_VERSION" ] || exit 2; echo "zephyr $SHIM_VERSION" ;;
       *" zephyr tui "*) exit "${SHIM_TUI_EXIT:-0}" ;;
+      *" zephyr doctor "*) exit "${SHIM_DOCTOR_EXIT:-0}" ;;
+      *" zephyr signal-setup "*) exit "${SHIM_SETUP_EXIT:-0}" ;;
       # `zephyr web enrol [NAME]` and `zephyr web`: the daemon's replies over the chat socket.
       *" zephyr web enrol"*) echo "[zephyr] open https://box.tail1234.ts.net/#enrol=ABCDE-FGHJK on the phone within 10 min, or type the code there; it works once" ;;
       *" zephyr web "*) echo "[zephyr] web app https://box.tail1234.ts.net · passkeys: ${SHIM_PASSKEYS:-none} · 0 sessions · push on 0 devices" ;;
@@ -488,6 +490,8 @@ fn init_asks_for_a_preset_and_writes_it() {
             ("Providers", "\n"),
             ("Set up discord?", "n"),
             ("Set up imessage?", "n"),
+            ("Set up telegram?", "n"),
+            ("Set up signal?", "n"),
             // manual is first; semi is one down.
             ("Approvals: how much", &format!("{DOWN}\n")),
             ("Add private facts", "y"),
@@ -609,6 +613,8 @@ fn init_again_on_a_configured_install_changes_nothing() {
             ("Failover order", "\n"),
             ("Change the discord channel?", "\n"),
             ("Change the imessage channel?", "\n"),
+            ("Set up telegram?", "\n"),
+            ("Set up signal?", "\n"),
             ("Add private facts", "\n"),
             ("Change the web app?", "\n"),
         ],
@@ -658,6 +664,8 @@ fn init_adding_imessage_publishes_its_port_and_offers_the_forward() {
     steps.extend(IMESSAGE_STEPS);
     steps.extend([
         (FORWARD_Q, "y"),
+        ("Set up telegram?", "n"),
+        ("Set up signal?", "n"),
         ("Approvals: how much", "\n"),
         ("Add private facts", "n"),
         ("Set up the web app", "n"),
@@ -692,6 +700,8 @@ fn init_into_web_setup(restart: &'static str) -> Vec<(&'static str, &'static str
         ("Providers", "\n"),
         ("Set up discord?", "n"),
         ("Set up imessage?", "n"),
+        ("Set up telegram?", "n"),
+        ("Set up signal?", "n"),
         ("Approvals: how much", "\n"),
         ("Add private facts", "n"),
         ("Set up the web app", "y"),
@@ -759,6 +769,8 @@ fn init_under_host_networking_skips_the_web_app() {
             ("Providers", "\n"),
             ("Set up discord?", "n"),
             ("Set up imessage?", "n"),
+            ("Set up telegram?", "n"),
+            ("Set up signal?", "n"),
             ("Approvals: how much", "\n"),
             ("Add private facts", "n"),
         ],
@@ -2855,6 +2867,154 @@ fn channel_list_and_remove_edit_the_toml_and_secrets() {
     assert!(cfg.get("imessage").is_none() && cfg["owners"].get("imessage").is_none());
     assert_eq!(std::fs::read_to_string(&secrets).unwrap(), "OTHER=keep\n");
     assert_eq!(env.ok(&["channel", "list"]), "chat     owners: 0\n");
+}
+
+#[test]
+fn channel_list_and_remove_cover_telegram_and_signal() {
+    let env = Env::new("channel-tg-sig");
+    env.init(&["--no-start"]);
+    env.ok(&[
+        "config",
+        "set",
+        "telegram.token_env",
+        "ZEPHYR_TELEGRAM_TOKEN",
+    ]);
+    env.ok(&["config", "set", "owners.telegram", "[\"55\"]"]);
+    env.ok(&["config", "set", "signal.account", "\"+15550100\""]);
+    env.ok(&["config", "set", "owners.signal", "[\"7f3c\"]"]);
+    let secrets = env.daemon().join("secrets.env");
+    std::fs::write(&secrets, "ZEPHYR_TELEGRAM_TOKEN=t\nOTHER=keep\n").unwrap();
+    assert_eq!(
+        env.ok(&["channel", "list"]),
+        "chat     owners: 0\ntelegram owners: 55\nsignal   owners: 7f3c\n"
+    );
+
+    env.calls();
+    env.ok(&["channel", "remove", "telegram"]);
+    let cfg: toml::Value = toml::from_str(&env.config()).unwrap();
+    assert!(cfg.get("telegram").is_none() && cfg["owners"].get("telegram").is_none());
+    assert_eq!(std::fs::read_to_string(&secrets).unwrap(), "OTHER=keep\n");
+
+    // The account's keys go too: signal-cli unregisters, and its folder is deleted.
+    env.ok(&["channel", "remove", "signal"]);
+    let calls = env.calls();
+    find(&calls, &["docker", "exec", CONTAINER, "zephyr", "reload"]);
+    find(
+        &calls,
+        &[
+            "docker",
+            "exec",
+            CONTAINER,
+            "zephyr",
+            "signal-setup",
+            "remove",
+        ],
+    );
+    let cfg: toml::Value = toml::from_str(&env.config()).unwrap();
+    assert!(cfg.get("signal").is_none() && cfg["owners"].get("signal").is_none());
+
+    env.ok(&[
+        "channel",
+        "signal",
+        "trust",
+        "7f3c0000-0000-4000-8000-000000000000",
+    ]);
+    find(
+        &env.calls(),
+        &[
+            "docker",
+            "exec",
+            CONTAINER,
+            "zephyr",
+            "signal-setup",
+            "trust",
+            "7f3c0000-0000-4000-8000-000000000000",
+        ],
+    );
+}
+
+/// Whether a recorded call ends with `argv`.
+fn ends(call: &[String], argv: &[&str]) -> bool {
+    call.len() >= argv.len()
+        && call[call.len() - argv.len()..]
+            .iter()
+            .zip(argv)
+            .all(|(a, b)| a == b)
+}
+
+#[test]
+fn channel_add_fails_when_doctor_does() {
+    let env = Env::new("channel-add-doctor");
+    env.init(&["--no-start"]);
+    let fail = [("SHIM_DOCTOR_EXIT", "1")];
+    let discord = [
+        ("Your Discord user id", "1234\n"),
+        ("Discord bot token (hidden)", "tok\n"),
+    ];
+    let (code, shown) = env.on_a_driven_tty_env(&["channel", "add", "discord"], &discord, &fail);
+    assert_ne!(code, 0, "{shown}");
+    let telegram = [("Telegram bot token (hidden)", "tok\n")];
+    let (code, shown) = env.on_a_driven_tty_env(&["channel", "add", "telegram"], &telegram, &fail);
+    assert_ne!(code, 0, "{shown}");
+    // The pairing code is asked for first: doctor's verdict comes after it.
+    let calls = env.calls();
+    let at = |argv: &[&str]| calls.iter().rposition(|c| ends(c, argv)).unwrap();
+    assert!(at(&["zephyr", "pair", "telegram"]) < at(&["zephyr", "doctor"]));
+    let (code, shown) = env.on_a_driven_tty(&["channel", "add", "telegram"], &telegram);
+    assert_eq!(code, 0, "{shown}");
+}
+
+#[test]
+fn adding_signal_again_keeps_the_old_config_until_the_new_number_works() {
+    let env = Env::new("channel-add-signal-again");
+    env.init(&["--no-start"]);
+    env.ok(&["config", "set", "signal.account", "\"+15550100\""]);
+    env.calls();
+    let steps = [
+        ("Signal", "\n"),
+        ("Signal number", "+15550199\n"),
+        ("voice call", "n"),
+    ];
+    // The registration fails: nothing changed, and nothing was reloaded first.
+    let failing = [("SHIM_SETUP_EXIT", "1")];
+    let (code, shown) = env.on_a_driven_tty_env(&["channel", "add", "signal"], &steps, &failing);
+    assert_ne!(code, 0, "{shown}");
+    let calls = env.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|c| ends(c, &["zephyr", "signal-setup", "register", "+15550199"])),
+        "{calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|c| ends(c, &["zephyr", "reload"])),
+        "{calls:?}"
+    );
+    let cfg: toml::Value = toml::from_str(&env.config()).unwrap();
+    assert_eq!(cfg["signal"]["account"].as_str(), Some("+15550100"));
+    // It works: the new number is written after it.
+    let (code, shown) = env.on_a_driven_tty(&["channel", "add", "signal"], &steps);
+    assert_eq!(code, 0, "{shown}");
+    let cfg: toml::Value = toml::from_str(&env.config()).unwrap();
+    assert_eq!(cfg["signal"]["account"].as_str(), Some("+15550199"));
+}
+
+#[test]
+fn channel_add_of_telegram_or_signal_needs_a_terminal() {
+    let env = Env::new("channel-add-tty");
+    env.init(&["--no-start"]);
+    for kind in ["telegram", "signal"] {
+        let out = env.zephyr(&["channel", "add", kind]);
+        assert!(!out.status.success(), "{kind}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("run it in a terminal"), "{kind}: {err}");
+    }
+    let out = env.zephyr(&["channel", "add", "whatsapp"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("usage: zephyr channel add|remove discord|imessage|telegram|signal"),
+        "{err}"
+    );
 }
 
 #[test]

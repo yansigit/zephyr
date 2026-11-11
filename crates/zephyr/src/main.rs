@@ -16,7 +16,7 @@ use zephyr::store::Store;
 /// The rpi minor this build speaks (DESIGN §3).
 const RPI_PIN: &str = "rpi 0.21.";
 
-const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|resume|reload|skill|web>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
+const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|resume|reload|skill|web|pair|signal-setup>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
 
 fn main() -> ExitCode {
     // `agent-browser` on the agent's PATH is this binary (approvals spec §4.4): the wrapper runs
@@ -97,6 +97,10 @@ async fn zephyr_main() -> ExitCode {
             ("set", Ok(cfg)) => set(&cfg, &args.collect::<Vec<_>>()).await,
             ("skill", Ok(cfg)) => skill(&cfg, &args.collect::<Vec<_>>()).await,
             ("web", Ok(cfg)) => web(&cfg, &args.collect::<Vec<_>>()).await,
+            ("pair", Ok(cfg)) => pair(&cfg, &args.collect::<Vec<_>>()).await,
+            ("signal-setup", Ok(cfg)) => {
+                zephyr::signal::setup(&cfg, &args.collect::<Vec<_>>()).await
+            }
             _ => {
                 eprintln!("{USAGE}");
                 return ExitCode::from(2);
@@ -227,6 +231,15 @@ async fn run(mut cfg: Config, from_file: &[String]) -> anyhow::Result<()> {
         channels.push(AnyChannel::IMessage(zephyr::imessage::IMessage::new(
             imessage,
         )?));
+    }
+    if let Some(telegram) = &cfg.telegram {
+        channels.push(AnyChannel::Telegram(zephyr::telegram::Telegram::new(
+            telegram,
+            &cfg.telegram_api,
+        )?));
+    }
+    if cfg.signal.is_some() {
+        channels.push(AnyChannel::Signal(zephyr::signal::Signal::new(&cfg)?));
     }
     let shutdown = async {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -367,6 +380,47 @@ async fn web(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
     anyhow::ensure!(
         reply.contains("https://"),
         "the web app did not answer with its address"
+    );
+    Ok(())
+}
+
+/// `zephyr pair telegram|signal`: a pairing code from the daemon, over the chat socket (a strong
+/// channel), as `zephyr channel add` asks at its end. Its reload may still be re-execing the
+/// daemon onto the new channel, so a `not set up` or a missing socket is asked again for 30 s.
+async fn pair(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
+    let [kind] = args else {
+        anyhow::bail!("usage: zephyr pair telegram|signal");
+    };
+    anyhow::ensure!(
+        zephyr::pairing::CHANNELS.contains(&kind.as_str()),
+        "usage: zephyr pair telegram|signal"
+    );
+    // A code is no use before signal-cli holds the account; it starts a few seconds after the
+    // daemon (re-)starts. Doctor, run next, says if it never does.
+    if kind == "signal" {
+        let until = std::time::Instant::now() + Duration::from_secs(60);
+        while !zephyr::signal::holds(cfg) && std::time::Instant::now() < until {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    // After that wait, so the asking gets its own 30 s.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let reply = loop {
+        let reply = ask(cfg, &format!("/pair {kind}")).await?;
+        let early = std::time::Instant::now() < deadline;
+        match reply {
+            Some(r) if early && r.contains("is not set up") => {}
+            Some(r) => break r,
+            // The socket is there but takes nothing: a re-exec in progress.
+            None if early && cfg.socket_path().exists() => {}
+            None => return Err(NotRunning.into()),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+    println!("{reply}");
+    anyhow::ensure!(
+        reply.starts_with("[zephyr] send /pair "),
+        "the daemon gave no pairing code"
     );
     Ok(())
 }
@@ -567,6 +621,19 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
         let label = format!("env {} is set (discord token)", d.token_env);
         ok &= check(&label, env_set(&d.token_env));
     }
+    if let Some(t) = &cfg.telegram {
+        let label = format!("env {} is set (telegram token)", t.token_env);
+        ok &= check(&label, env_set(&t.token_env));
+        let me = async {
+            zephyr::telegram::Telegram::new(t, &cfg.telegram_api)?
+                .me()
+                .await
+        };
+        ok &= match me.await {
+            Ok(name) => check(&format!("telegram bot {name} answers getMe"), true),
+            Err(e) => check(&format!("telegram getMe: {e:#}"), false),
+        };
+    }
     if let Some(im) = &cfg.imessage {
         let label = format!("env {} is set (imessage password)", im.password_env);
         ok &= check(&label, env_set(&im.password_env));
@@ -584,6 +651,28 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
                 Ok(false) => println!("warn iMessage typing needs the BlueBubbles Private API with its helper connected; enable it on the Mac or set [imessage] typing = false"),
                 Err(e) => println!("warn could not read BlueBubbles server info for iMessage typing: {e:#}"),
             }
+        }
+    }
+    if let Some(signal) = &cfg.signal {
+        let dir = zephyr::signal::data_dir(cfg);
+        // SAFETY: getuid has no arguments and cannot fail.
+        let me = unsafe { libc::getuid() };
+        let private =
+            std::fs::metadata(&dir).is_ok_and(|m| m.uid() == me && m.mode() & 0o777 == 0o700);
+        let label = format!(
+            "{} is the daemon's and 0700 (signal-cli's keys)",
+            dir.display()
+        );
+        ok &= check(&label, private);
+        // The adapter writes it once signal-cli is up and `listAccounts` names the account.
+        let up = zephyr::signal::holds(cfg);
+        let label = format!("signal-cli is running and holds {}", signal.account);
+        ok &= check(&label, up);
+        if !cfg.signal_cli.exists() {
+            println!(
+                "warn {} is missing: signal: not in this image (built with SIGNAL=0)",
+                cfg.signal_cli.display()
+            );
         }
     }
     if let Some(path) = cfg.attach.as_ref().and_then(|a| a.token_file.as_ref()) {

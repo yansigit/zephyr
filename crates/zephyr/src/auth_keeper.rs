@@ -79,27 +79,62 @@ fn oauth_expiries(agent_dir: &Path) -> anyhow::Result<HashMap<String, i64>> {
         .collect())
 }
 
-/// One check. Asks the child which providers hold OAuth credentials, then runs
-/// `rpi auth refresh` for each one that expires within the window and that a loaded extension can
-/// refresh. Returns true when at least one credential was refreshed, so the caller restarts the child.
-pub async fn refresh(child: &mut Child, cfg: &Config, now: i64) -> anyhow::Result<bool> {
-    let agent_dir = agent_dir(cfg);
+/// A provider the child holds an OAuth credential for, as `get_auth_status` names it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Oauth {
+    pub provider: String,
+    /// A loaded extension can refresh it.
+    pub refreshable: bool,
+}
+
+/// Asks the child which providers hold OAuth credentials. It waits on the child, so the router
+/// asks only while main is idle and keeps the answer for the checks that come due mid-run.
+pub async fn oauth_providers(child: &mut Child) -> anyhow::Result<Vec<Oauth>> {
     let status = child.call(json!({"type": "get_auth_status"})).await?;
     let providers = status["providers"].as_array().cloned().unwrap_or_default();
-    let oauth: Vec<&serde_json::Value> = providers.iter().filter(|p| p["oauth"] == true).collect();
+    Ok((providers.iter())
+        .filter(|p| p["oauth"] == true)
+        .map(|p| Oauth {
+            provider: p["provider"].as_str().unwrap_or_default().to_string(),
+            refreshable: p["oauthAvailable"] == true,
+        })
+        .collect())
+}
+
+/// The OAuth credentials stored in main's agent dir, for a check made before the child could be
+/// asked (busy since the daemon started). Each counts as refreshable; one that is not fails its
+/// refresh, which is logged.
+pub fn stored_oauth(cfg: &Config) -> Vec<Oauth> {
+    let stored = oauth_expiries(&agent_dir(cfg)).unwrap_or_default();
+    let mut oauth: Vec<Oauth> = (stored.into_keys())
+        .map(|provider| Oauth {
+            provider,
+            refreshable: true,
+        })
+        .collect();
+    oauth.sort_by(|a, b| a.provider.cmp(&b.provider));
+    oauth
+}
+
+/// One check of `oauth` (from `oauth_providers`): runs `rpi auth refresh` for each credential
+/// that expires within the window and that a loaded extension can refresh. Needs no child, so it
+/// runs during a run too. Returns true when at least one credential was refreshed, so the caller
+/// restarts the child once it is idle.
+pub async fn refresh(cfg: &Config, oauth: &[Oauth], now: i64) -> anyhow::Result<bool> {
     if oauth.is_empty() {
         return Ok(false);
     }
+    let agent_dir = agent_dir(cfg);
     let expiries = oauth_expiries(&agent_dir)?;
     let mut refreshed = false;
     for entry in oauth {
-        let provider = entry["provider"].as_str().unwrap_or_default();
+        let provider = entry.provider.as_str();
         let expires = expiries.get(provider).copied().unwrap_or(0);
         // 0 means the expiry is unknown, so there is nothing to act on.
         if expires == 0 || expires - now > EXPIRY_WINDOW_SECS {
             continue;
         }
-        if entry["oauthAvailable"] != true {
+        if !entry.refreshable {
             eprintln!("zephyr: {provider} OAuth credential expires soon, but no loaded extension can refresh it");
             continue;
         }

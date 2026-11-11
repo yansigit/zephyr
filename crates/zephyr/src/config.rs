@@ -34,6 +34,10 @@ pub struct Config {
     pub discord: Option<crate::discord::Config>,
     /// The BlueBubbles iMessage adapter. Its owner list is `owners.imessage` (handles). Absent means no iMessage.
     pub imessage: Option<crate::imessage::Config>,
+    /// The Telegram bot. Its owner list is `owners.telegram` (user ids). Absent means no Telegram.
+    pub telegram: Option<crate::telegram::Config>,
+    /// The signal-cli adapter. Its owner list is `owners.signal` (ACIs). Absent means no Signal.
+    pub signal: Option<crate::signal::Config>,
     /// Owner allowlist per channel name. Senders not listed are dropped.
     #[serde(default)]
     pub owners: HashMap<String, Vec<String>>,
@@ -130,6 +134,20 @@ pub struct Config {
     /// tests set it.
     #[serde(skip, default = "floor")]
     pub floor: bool,
+    /// The Bot API's base URL. Not configurable; tests point it at a stub.
+    #[serde(skip, default = "telegram_api")]
+    pub telegram_api: String,
+    /// The signal-cli the daemon runs as root, by full path. Not configurable; tests set a fake.
+    #[serde(skip, default = "signal_cli")]
+    pub signal_cli: PathBuf,
+}
+
+fn telegram_api() -> String {
+    "https://api.telegram.org".into()
+}
+
+fn signal_cli() -> PathBuf {
+    PathBuf::from("/opt/zephyr/signal/bin/signal-cli")
 }
 
 fn web_lockout() -> std::time::Duration {
@@ -467,6 +485,8 @@ impl Config {
         self.web_off_floor = running.web_off_floor;
         self.web_lockout = running.web_lockout;
         self.web_ping = running.web_ping;
+        self.telegram_api = running.telegram_api.clone();
+        self.signal_cli = running.signal_cli.clone();
     }
 
     /// Account names become directory names, so each must be a plain, unique path segment.
@@ -709,6 +729,32 @@ mod tests {
     }
 
     #[test]
+    fn telegram_and_signal_tables_parse() {
+        let cfg: Config = toml::from_str(
+            "rpi = 'r'\nhome = 'h'\nstate = '/var/lib/zephyr'\n\
+             [telegram]\ntoken_env = 'ZEPHYR_TELEGRAM_TOKEN'\n\
+             [signal]\naccount = '+821012345678'\n\
+             [owners]\ntelegram = ['55']\nsignal = ['7f3c']\n",
+        )
+        .unwrap();
+        let tg = cfg.telegram.as_ref().unwrap();
+        assert_eq!(tg.token_env, "ZEPHYR_TELEGRAM_TOKEN");
+        assert!(tg.progress);
+        assert_eq!(cfg.signal.as_ref().unwrap().account, "+821012345678");
+        assert_eq!(cfg.telegram_api, "https://api.telegram.org");
+        assert_eq!(
+            cfg.signal_cli,
+            Path::new("/opt/zephyr/signal/bin/signal-cli")
+        );
+        assert_eq!(
+            crate::signal::data_dir(&cfg),
+            Path::new("/var/lib/zephyr/signal")
+        );
+        assert!(cfg.is_owner("telegram", "55") && cfg.is_owner("signal", "7f3c"));
+        assert!(toml::from_str::<Config>("rpi='a'\nhome='b'\n[signal]\nnumber='+1'").is_err());
+    }
+
+    #[test]
     fn a_wildcard_network_allow_is_refused() {
         let with = |allow: &str| -> Config {
             toml::from_str(&format!("rpi='a'\nhome='b'\n[network]\nallow = {allow:?}")).unwrap()
@@ -821,7 +867,7 @@ prompt = "Build it."
         with("[settings]\nstrong_channels = ['tui']\n")
             .validate()
             .unwrap();
-        for bad in ["['chat']", "[]", "['tui', 'telegram']"] {
+        for bad in ["['chat']", "[]", "['tui', 'whatsapp']"] {
             let cfg = with(&format!("[settings]\nstrong_channels = {bad}\n"));
             assert!(cfg.validate().is_err(), "{bad}");
         }

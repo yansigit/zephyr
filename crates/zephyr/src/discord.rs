@@ -1,6 +1,6 @@
 //! Discord channel adapter for Zephyr: DMs only. See DESIGN.md section 4.3.
 
-use crate::channel::{Activity, Channel, Inbound, Outbound};
+use crate::channel::{chunks, Activity, Channel, Inbound, Outbound};
 use anyhow::Context as _;
 use serde::Deserialize;
 use serenity::async_trait;
@@ -72,24 +72,36 @@ pub fn progress_text(elapsed: Duration, tools: &[String]) -> String {
 
 /// What a `Progress` tick does to the progress note.
 #[derive(Debug, PartialEq)]
-pub enum Step {
+pub enum Step<Id> {
     Wait,
     Post,
-    Edit(MessageId),
+    Edit(Id),
 }
 
-/// One run's progress note. A failed post is not retried and failures are logged once.
-#[derive(Debug, Default)]
-pub struct Progress {
+/// One run's progress note, whose message has an `Id` on its platform (Discord's, Telegram's).
+/// A failed post is not retried and failures are logged once.
+#[derive(Debug)]
+pub struct Progress<Id> {
     tried: bool,
-    msg: Option<MessageId>,
+    pub msg: Option<Id>,
     at: Option<Instant>,
     warned: bool,
 }
 
-impl Progress {
+impl<Id> Default for Progress<Id> {
+    fn default() -> Self {
+        Self {
+            tried: false,
+            msg: None,
+            at: None,
+            warned: false,
+        }
+    }
+}
+
+impl<Id: Copy> Progress<Id> {
     /// The step for a tick at `now`, `elapsed` into the run. `after` is `None` when progress is off.
-    pub fn step(&mut self, after: Option<Duration>, elapsed: Duration, now: Instant) -> Step {
+    pub fn step(&mut self, after: Option<Duration>, elapsed: Duration, now: Instant) -> Step<Id> {
         match self.msg {
             None if !self.tried && after.is_some_and(|a| elapsed >= a) => {
                 self.tried = true;
@@ -108,9 +120,10 @@ impl Progress {
         }
     }
 
-    fn warn(&mut self, what: &str, e: &serenity::Error) {
+    /// `what` names the channel and the step: `telegram post`.
+    pub fn warn(&mut self, what: &str, e: &dyn std::fmt::Display) {
         if !std::mem::replace(&mut self.warned, true) {
-            eprintln!("zephyr: discord progress {what} failed: {e}");
+            eprintln!("zephyr: {what} of the progress note failed: {e}");
         }
     }
 }
@@ -119,7 +132,7 @@ impl Progress {
 struct Run {
     dm: ChannelId,
     _typing: Typing,
-    progress: Progress,
+    progress: Progress<MessageId>,
 }
 
 pub struct Discord {
@@ -162,39 +175,10 @@ impl Discord {
         };
         if let Some(id) = run.progress.msg {
             if let Err(e) = run.dm.delete_message(&self.http, id).await {
-                run.progress.warn("delete", &e);
+                run.progress.warn("discord delete", &e);
             }
         }
     }
-}
-
-/// Splits `text` into pieces of at most `max` UTF-16 units, breaking after newlines where possible.
-/// UTF-16 is counted because it is never smaller than the code-point count, so a piece that fits
-/// here fits whichever way Discord counts. shortcut: a line longer than `max` is hard-split by char.
-pub fn chunks(text: &str, max: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut cur_len = 0;
-    for line in text.split_inclusive('\n') {
-        let line_len: usize = line.encode_utf16().count();
-        if cur_len > 0 && cur_len + line_len > max {
-            out.push(std::mem::take(&mut cur));
-            cur_len = 0;
-        }
-        for ch in line.chars() {
-            let n = ch.len_utf16();
-            if cur_len + n > max {
-                out.push(std::mem::take(&mut cur));
-                cur_len = 0;
-            }
-            cur.push(ch);
-            cur_len += n;
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
 }
 
 /// Nonce for chunk `index` of a reply. Stable for a given client id and chunking, so a retry
@@ -253,7 +237,7 @@ impl Handler {
             name: a.filename.clone(),
             mime: a.content_type.clone(),
             size: a.size.into(),
-            req: self.files.get(&a.url),
+            src: crate::inbox::Src::Get(self.files.get(&a.url)),
         });
         crate::inbox::append(&self.live, &mut inbound, files.collect()).await;
         Some(inbound)
@@ -376,13 +360,13 @@ impl Channel for Discord {
                         let msg = CreateMessage::new().content(text());
                         match run.dm.send_message(&self.http, msg).await {
                             Ok(m) => run.progress.msg = Some(m.id),
-                            Err(e) => run.progress.warn("post", &e),
+                            Err(e) => run.progress.warn("discord post", &e),
                         }
                     }
                     Step::Edit(id) => {
                         let msg = EditMessage::new().content(text());
                         if let Err(e) = run.dm.edit_message(&self.http, id, msg).await {
-                            run.progress.warn("edit", &e);
+                            run.progress.warn("discord edit", &e);
                         }
                     }
                 }
@@ -396,58 +380,6 @@ impl Channel for Discord {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn units(s: &str) -> usize {
-        s.encode_utf16().count()
-    }
-
-    #[test]
-    fn chunks_short_text_is_one_piece() {
-        assert_eq!(chunks("hello\nworld", 100), vec!["hello\nworld"]);
-    }
-
-    #[test]
-    fn chunks_empty_text_sends_nothing() {
-        assert!(chunks("", 10).is_empty());
-    }
-
-    #[test]
-    fn chunks_break_on_line_boundaries() {
-        // Each line is 10 units including its newline; two lines fit in 25, three do not.
-        let text = "aaaaaaaaa\nbbbbbbbbb\nccccccccc\nddddddddd\n";
-        assert_eq!(
-            chunks(text, 25),
-            vec!["aaaaaaaaa\nbbbbbbbbb\n", "ccccccccc\nddddddddd\n",]
-        );
-    }
-
-    #[test]
-    fn chunks_hard_split_a_long_line_without_newlines() {
-        let text = "x".repeat(25);
-        let pieces = chunks(&text, 10);
-        assert_eq!(
-            pieces.iter().map(|p| units(p)).collect::<Vec<_>>(),
-            vec![10, 10, 5]
-        );
-        assert_eq!(pieces.concat(), text);
-    }
-
-    #[test]
-    fn chunks_never_split_a_surrogate_pair() {
-        // Each emoji is 2 UTF-16 units, so a limit of 3 holds one per piece.
-        let text = "😀😀😀";
-        assert_eq!(chunks(text, 3), vec!["😀", "😀", "😀"]);
-    }
-
-    #[test]
-    fn chunks_unicode_pieces_fit_and_rejoin() {
-        let text = "가나다라마바사아자차카타파하\n한글 mixed 😀 text ".repeat(200);
-        assert!(units(&text) > MAX_CONTENT);
-        let pieces = chunks(&text, MAX_CONTENT);
-        assert!(pieces.len() > 1);
-        assert!(pieces.iter().all(|p| units(p) <= MAX_CONTENT));
-        assert_eq!(pieces.concat(), text);
-    }
 
     #[test]
     fn nonce_fits_within_discord_limit() {
@@ -536,7 +468,7 @@ mod tests {
         let t0 = Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
         let after = Some(Duration::from_secs(20));
-        let mut p = Progress::default();
+        let mut p = Progress::<MessageId>::default();
         assert_eq!(p.step(after, Duration::from_secs(19), at(19)), Step::Wait);
         assert_eq!(p.step(after, Duration::from_secs(20), at(20)), Step::Post);
         p.msg = Some(MessageId::new(7));
@@ -557,14 +489,14 @@ mod tests {
     fn progress_failed_post_is_not_retried_and_off_never_posts() {
         let now = Instant::now();
         let after = Some(Duration::from_secs(20));
-        let mut p = Progress::default();
+        let mut p = Progress::<MessageId>::default();
         assert_eq!(p.step(after, Duration::from_secs(20), now), Step::Post);
         // The post failed, so no message id was recorded.
         for s in 21..60 {
             let t = now + Duration::from_secs(s);
             assert_eq!(p.step(after, Duration::from_secs(s), t), Step::Wait);
         }
-        let mut off = Progress::default();
+        let mut off = Progress::<MessageId>::default();
         assert_eq!(off.step(None, Duration::from_secs(3600), now), Step::Wait);
     }
 

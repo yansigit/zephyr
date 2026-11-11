@@ -30,6 +30,8 @@ pub fn diff(old: &Config, new: &Config, active: Option<&Account>, next: Option<&
         || old.state != new.state
         || old.discord != new.discord
         || old.imessage != new.imessage
+        || old.telegram != new.telegram
+        || old.signal != new.signal
         || old.attach != new.attach
         || old.web != new.web
         || old.agent != new.agent
@@ -195,6 +197,8 @@ mod tests {
         for gone in [
             format!("{POOL}[discord]\ntoken_env = 'T'\n"),
             format!("{POOL}{im}"),
+            format!("{POOL}[telegram]\ntoken_env = 'T'\n"),
+            format!("{POOL}[signal]\naccount = '+1'\n"),
         ] {
             let with = cfg(&gone);
             assert_eq!(diff(&with, &old, first(&with), first(&old)), Plan::Reexec);

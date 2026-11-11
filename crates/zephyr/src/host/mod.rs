@@ -20,7 +20,7 @@ pub const USAGE: &str = "usage: zephyr <command>   (zephyr --version: this CLI's
   login <provider> [--account NAME] [--model P/M] [--no-verify]
   accounts [list | order NAME.. | remove NAME]
   model [--account NAME] [PROVIDER/MODEL]
-  channel add|remove discord|imessage | list
+  channel add|remove discord|imessage|telegram|signal | list | signal trust ACI
   skill add DIR | list | rm NAME
   mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. | list | rm NAME
   packages add NAME.. | rm NAME.. | list

@@ -34,6 +34,13 @@ ARG GH_SHA256_ARM64=ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306
 ARG HIMALAYA_VERSION=2.2.1
 ARG HIMALAYA_SHA256_AMD64=5c5ba2724c162f82d0a0c71b6c03224ed44f8bef7b14ace5da0635d3af2665a0
 ARG HIMALAYA_SHA256_ARM64=1dc21c3dd6d948929e22e5cae49b9d0b3b30ff88fafd4493fd4460c6252e9d90
+# The Signal channel (channels spec §4.8): signal-cli's JVM build and the Temurin JDK whose jlink
+# cuts its Java runtime. SIGNAL=0 leaves both out.
+ARG SIGNAL=1
+ARG SIGNAL_CLI_VERSION=0.14.10
+ARG SIGNAL_CLI_SHA256=706a57d9faae7525cf732936efdabf210146e3c83f9e8ae7e4e62f5946121c33
+ARG TEMURIN_VERSION=25.0.5+8
+ARG TEMURIN_SHA256_AMD64=68982529869257d0ee6b824ec5aa270ff8b118bb438670da0b97ebdab178d7fb
 
 # Rust plus node 24 (the plugin stage scripts use both). Bookworm's glibc (2.36) is older than
 # the final image's (2.39), so what is built here runs there.
@@ -168,6 +175,41 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && printf '#!/bin/sh\nXDG_CACHE_HOME=/opt/zephyr/camoufox/cache exec /opt/zephyr/py/bin/python "$@"\n' \
        > /opt/zephyr/camoufox/camoufox-python && chmod 755 /opt/zephyr/camoufox/camoufox-python
 
+# signal-cli with a Java runtime jlinked to just the modules its jars use. Root runs it, a child of
+# the daemon, by full path with its data in /var/lib/zephyr/signal, outside the agent's reach.
+# bin/signal-cli pins JAVA_HOME so it never runs on another Java; jlink's --strip-debug needs
+# binutils' objcopy. jdeps follows the main jar's references, since the full lib/ set does not
+# resolve as modules. The JVM build, not the GraalVM native one (408 MB, and its link and register
+# broke). libsignal's native library in its jars is x86_64 only, so arm64 builds nothing, as
+# SIGNAL=0 does: no /opt/zephyr/signal turns the channel off.
+FROM ubuntu:24.04 AS signal-1
+ARG SIGNAL_CLI_VERSION SIGNAL_CLI_SHA256 TEMURIN_VERSION TEMURIN_SHA256_AMD64 TARGETARCH
+RUN set -eu; mkdir /out; \
+    case "$TARGETARCH" in arm64) exit 0 ;; esac; \
+    apt-get update; apt-get install -y --no-install-recommends ca-certificates curl binutils; \
+    f="signal-cli-$SIGNAL_CLI_VERSION.tar.gz"; \
+    curl -fsSLo "/tmp/$f" "https://github.com/AsamK/signal-cli/releases/download/v$SIGNAL_CLI_VERSION/$f"; \
+    echo "$SIGNAL_CLI_SHA256  /tmp/$f" | sha256sum -c -; \
+    mkdir /out/signal; \
+    tar -xzf "/tmp/$f" --no-same-owner -C /out/signal --strip-components 1 \
+      "signal-cli-$SIGNAL_CLI_VERSION/bin/signal-cli" "signal-cli-$SIGNAL_CLI_VERSION/lib"; \
+    mv /out/signal/bin/signal-cli /out/signal/bin/signal-cli-jvm; \
+    j="OpenJDK25U-jdk_x64_linux_hotspot_$(echo "$TEMURIN_VERSION" | tr + _).tar.gz"; \
+    curl -fsSLo "/tmp/$j" "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-$TEMURIN_VERSION/$j"; \
+    echo "$TEMURIN_SHA256_AMD64  /tmp/$j" | sha256sum -c -; \
+    mkdir /tmp/jdk; tar -xzf "/tmp/$j" --no-same-owner -C /tmp/jdk --strip-components 1; \
+    m=$(/tmp/jdk/bin/jdeps -q --print-module-deps --ignore-missing-deps --multi-release 25 --recursive \
+      --class-path '/out/signal/lib/*' "/out/signal/lib/signal-cli-$SIGNAL_CLI_VERSION.jar"); \
+    /tmp/jdk/bin/jlink --add-modules "$m" --strip-debug --no-man-pages --no-header-files \
+      --compress=zip-6 --output /out/signal/jre; \
+    printf '#!/bin/sh\nJAVA_HOME=/opt/zephyr/signal/jre exec /opt/zephyr/signal/bin/signal-cli-jvm "$@"\n' \
+      > /out/signal/bin/signal-cli; \
+    chmod -R u=rwX,go=rX /out/signal; chmod 755 /out/signal/bin/*
+# Both stages hold /out: BuildKit caches a COPY from an empty stage as the last one it made.
+FROM scratch AS signal-0
+WORKDIR /out
+FROM signal-${SIGNAL} AS signal-out
+
 FROM ubuntu:24.04
 # Chromium's and Firefox's libraries, Vulkan/EGL for the GPU, the agent's desktop and its
 # everyday command-line tools (§4.11).
@@ -177,7 +219,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libdrm2 libxkbcommon0 libxcomposite1 \
       libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libxshmfence1 \
       libgtk-3-0t64 libdbus-glib-1-2 libx11-xcb1 libegl1 libgl1 libvulkan1 fonts-dejavu-core \
-      xvfb openbox xdotool x11-utils imagemagick x11vnc nftables libnss3-tools \
+      xvfb openbox xdotool x11-utils imagemagick x11vnc nftables libnss3-tools qrencode \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd
 COPY --from=node:24-bookworm-slim /usr/local/bin/node /usr/local/bin/node
@@ -195,6 +237,8 @@ COPY --from=browser /out/bin/agent-browser /opt/zephyr/libexec/agent-browser
 COPY --from=python /opt/zephyr/py/ /opt/zephyr/py/
 COPY --from=python /opt/zephyr/camoufox/ /opt/zephyr/camoufox/
 COPY --from=python /usr/local/bin/uv /usr/local/bin/uv
+# signal/ when built, else nothing: no empty /opt/zephyr/signal.
+COPY --from=signal-out /out/ /opt/zephyr/
 # The desktop's window manager config, root's (DESIGN §4.6): openbox never reads the agent's.
 COPY deploy/openbox/ /opt/zephyr/openbox/
 # `/opt/zephyr/gate/bin` (root's, 0755, holding only the browser wrapper) is first on the

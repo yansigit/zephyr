@@ -6,7 +6,7 @@ use super::{error, json, passkey, App, Res, Window, COOKIE};
 use crate::attach::AttachRequest;
 use crate::config::Config;
 use crate::store::{Store, MAX_PASSKEYS};
-use data_encoding::{BASE32_NOPAD, BASE64URL_NOPAD as B64, HEXLOWER};
+use data_encoding::{BASE64URL_NOPAD as B64, HEXLOWER};
 use hyper::header::{self, HeaderMap, HeaderValue};
 use hyper::StatusCode;
 use serde_json::{json, Value};
@@ -14,8 +14,6 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
-/// How long an enrolment code works.
-const CODE_LIFE: i64 = 10 * 60;
 /// Failed ceremonies within `FAILURE_SPAN` that close enrolment and sign-in.
 const MAX_FAILURES: usize = 5;
 const FAILURE_SPAN: Duration = Duration::from_secs(10 * 60);
@@ -36,7 +34,8 @@ pub enum Ceremony {
 }
 
 /// The limits on the two ceremonies. Global and in memory: every request comes from 127.0.0.1.
-pub(super) struct Limits {
+/// Pairing codes (`crate::pairing`) are counted the same way, on limits of their own.
+pub(crate) struct Limits {
     requests: Window,
     failures: VecDeque<Instant>,
     /// While sign-in is closed: until when, and that as a unix time for the owner.
@@ -44,7 +43,7 @@ pub(super) struct Limits {
 }
 
 impl Limits {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             requests: Window::new(20, Duration::from_secs(60)),
             failures: VecDeque::new(),
@@ -53,14 +52,14 @@ impl Limits {
     }
 
     /// When sign-in opens again, while it is closed.
-    fn closed(&mut self, now: Instant) -> Option<i64> {
+    pub(crate) fn closed(&mut self, now: Instant) -> Option<i64> {
         self.closed = self.closed.filter(|(until, _)| now < *until);
         self.closed.map(|(_, at)| at)
     }
 
     /// Counts a failed ceremony. The fifth within ten minutes closes sign-in for `lockout`;
     /// only that call answers, with the time it opens again.
-    fn failed(&mut self, now: Instant, lockout: Duration) -> Option<i64> {
+    pub(crate) fn failed(&mut self, now: Instant, lockout: Duration) -> Option<i64> {
         self.failures.push_back(now);
         while (self.failures.front()).is_some_and(|t| now.duration_since(*t) > FAILURE_SPAN) {
             self.failures.pop_front();
@@ -98,21 +97,12 @@ fn named(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// A code as typed: uppercase, without its hyphen or any space.
-fn typed(code: &str) -> String {
-    let kept = code.chars().filter(|c| *c != '-' && !c.is_whitespace());
-    kept.flat_map(char::to_uppercase).collect()
-}
-
 /// The enrolment code that still works: `meta`'s row as stored, the code's hash and the name
 /// it was made for.
 fn pending_code(store: &Store, now: i64) -> Option<(String, [u8; 32], Option<String>)> {
     let raw = store.meta("web_enrol").ok()??;
-    let v: Value = serde_json::from_str(&raw).ok()?;
-    let hash = HEXLOWER.decode(v["sha256"].as_str()?.as_bytes()).ok()?;
-    let live = v["expires"].as_i64()? > now;
-    let name = v["name"].as_str().map(str::to_string);
-    live.then_some((raw, hash.try_into().ok()?, name))
+    let (hash, name) = crate::pairing::live(&raw, now)?;
+    Some((raw, hash, name))
 }
 
 /// `secs` as the owner reads an age: `40s`, `5m`, `2h`, `3d`.
@@ -202,10 +192,7 @@ fn enrol(
     name: Option<&str>,
     channel: &str,
 ) -> rusqlite::Result<String> {
-    let strong: Vec<&str> = (cfg.settings.strong_channels.iter())
-        .map(String::as_str)
-        .filter(|c| *c != "passkey")
-        .collect();
+    let strong = crate::pairing::issuers(cfg);
     if !strong.contains(&channel) {
         return Ok(format!("[zephyr] /web enrol needs {}", strong.join(" or ")));
     }
@@ -220,19 +207,11 @@ fn enrol(
             "[zephyr] a passkey named {taken} exists; /web rm {taken} first"
         ));
     }
-    // 6 random bytes: 48 bits, 10 characters a phone can type.
-    let code = BASE32_NOPAD.encode(&random::<6>());
-    let row = json!({
-        "sha256": HEXLOWER.encode(&passkey::sha256(code.as_bytes())),
-        "name": name,
-        "expires": crate::now() + CODE_LIFE,
-    });
-    store.set_meta("web_enrol", Some(&row.to_string()))?;
+    let (code, row) = crate::pairing::issue(crate::now(), name);
+    store.set_meta("web_enrol", Some(&row))?;
     Ok(format!(
-        "[zephyr] open https://{}/#enrol={}-{} on the phone within 10 min, or type the code there; it works once",
+        "[zephyr] open https://{}/#enrol={code} on the phone within 10 min, or type the code there; it works once",
         web.host,
-        &code[..5],
-        &code[5..]
     ))
 }
 
@@ -342,7 +321,8 @@ impl App {
         let Some(store) = self.store() else {
             return error(StatusCode::INTERNAL_SERVER_ERROR, "try again");
         };
-        let code = passkey::sha256(typed(body["code"].as_str().unwrap_or_default()).as_bytes());
+        let typed = crate::pairing::typed(body["code"].as_str().unwrap_or_default());
+        let code = passkey::sha256(typed.as_bytes());
         let pending = pending_code(&store, crate::now());
         let Some((_, hash, _)) = pending.filter(|(_, hash, _)| bool::from(hash.ct_eq(&code)))
         else {
@@ -538,8 +518,6 @@ mod tests {
 
     #[test]
     fn a_typed_code_a_name_and_a_cookie_are_read_as_written() {
-        assert_eq!(typed(" abcde - fghjk\n"), "ABCDEFGHJK");
-        assert_eq!(typed("ABCDE-FGHJK"), "ABCDEFGHJK");
         for ok in ["phone", "my_iPad-2", "a", &"x".repeat(32)] {
             assert!(named(ok), "{ok}");
         }
