@@ -1265,6 +1265,16 @@ pub fn command(
         }
         ["done", n] => match found(n) {
             Err(e) => e,
+            // An issuer's card is closed at the issuer, and the owner hears how that went:
+            // marking it closed here alone would leave it open there.
+            Ok(card) if card.provider != "manual" => match LIVE.contains(&card.status.as_str()) {
+                true => {
+                    let id = card.id;
+                    ask_close(cfg, card, "the owner said it is done");
+                    format!("[zephyr] closing card #{id} at the issuer; you are told how it went")
+                }
+                false => format!("[zephyr] card #{} was {} already", card.id, card.status),
+            },
             Ok(card) => {
                 let from = ["waiting", "open", "charging", "unknown"];
                 match store.move_card(card.id, &from, "closed", now) {

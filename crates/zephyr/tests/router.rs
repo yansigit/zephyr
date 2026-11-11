@@ -8749,3 +8749,47 @@ async fn a_stop_during_a_fill_types_no_further_field() {
     );
     gw.shutdown().await;
 }
+
+/// `/card done N` on an issuer's card closes it at the issuer and says how that went; it is
+/// not just marked closed here.
+#[tokio::test]
+async fn done_closes_an_issuers_card_at_the_issuer() {
+    use zephyr::cards::Fake;
+    let (home, cfg) = card_home("card-done", "fake", "auto 100");
+    let script = cfg.clone();
+    let gw = start(cfg);
+    let closes = || {
+        Fake::script(&script, |s| {
+            s.log.iter().filter(|l| l.starts_with("close")).count()
+        })
+    };
+    gw.say("n1", "owner", &card_ask("10")).await;
+    wait(|| card_status(&home, 1) == "open").await;
+    gw.say("n2", "owner", "/card done 1").await;
+    let asked = reply_where(&gw, "chat", |r| {
+        r.contains("card #1") && r.contains("issuer;")
+    })
+    .await;
+    assert_eq!(
+        asked,
+        "[zephyr] closing card #1 at the issuer; you are told how it went"
+    );
+    let closed = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] card #1 is closed")).await;
+    assert_eq!(
+        closed,
+        "[zephyr] card #1 is closed: the owner said it is done"
+    );
+    assert_eq!(closes(), 1);
+    assert_eq!(card_status(&home, 1), "closed");
+    // One the issuer will not close is not called closed.
+    gw.say("n3", "owner", &card_ask("11")).await;
+    wait(|| card_status(&home, 2) == "open").await;
+    Fake::script(&script, |s| s.fail_close = true);
+    gw.say("n4", "owner", "/card done 2").await;
+    let failed = reply_where(&gw, "chat", |r| r.contains("card #2 could not be closed")).await;
+    assert!(failed.contains("the issuer did not answer"), "{failed}");
+    assert_ne!(card_status(&home, 2), "closed");
+    gw.say("n5", "owner", "/card done 1").await;
+    reply_where(&gw, "chat", |r| r == "[zephyr] card #1 was closed already").await;
+    gw.shutdown().await;
+}
