@@ -651,3 +651,13 @@ that log their uid, argv and an input hash):
   among them, is in `attach::WEB_METHODS`.
 - Manual, in README's release check: take over from iOS Safari and Android Chrome, type into the
   browser, hand back.
+
+## Decided with the owner (2026-11-11)
+
+Every open question above takes its recommended answer. Where this section and the body differ, this section wins. Specifically:
+
+- **Transcript:** file-derived (`inbox.derived`), never the owner's text.
+- **Whisper model:** small-q5_1 only.
+- **Korean Piper voice (`ko_KR-kss`, CC BY-NC-SA):** included only with the build arg `KO_VOICE=1`; without it, Korean replies stay text-only.
+- **signal-cli:** runs as root for now; a user of its own comes as a follow-up.
+- **Signal number:** zephyr registers its own second, VoIP or landline number, never the owner's account. The registration code is entered by the owner at `zephyr channel add signal` time; the build needs no number.

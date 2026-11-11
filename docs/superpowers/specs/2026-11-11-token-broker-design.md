@@ -513,3 +513,7 @@ Each piece starts with a failing test (CLAUDE.md, DESIGN §6).
 - **Manual, with the pinned rpi**: `gh pr list` and a `git push` over HTTPS with a bound
   `GH_TOKEN`; one remote connector (`url` and a `${NAME}` header) answering a call after the
   upgrade with no edit to its `[[mcp]]`.
+
+## Decided with the owner (2026-11-11)
+
+Every open question above takes its recommended answer. Where this section and the body differ, this section wins.

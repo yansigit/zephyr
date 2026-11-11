@@ -391,3 +391,7 @@ in one `docker restart`, as today. The one addition is the `Change the web app?`
   deploy/install.sh`.
 - `release.sh` and `runner/start.sh`: `bash -n`, plus a by-hand check that with `RPI_BIN` and
   `ZEPHYR_GH_REPO` unset the path and the repo are today's.
+
+## Decided with the owner (2026-11-11)
+
+Every open question above takes its recommended answer. Where this section and the body differ, this section wins.
