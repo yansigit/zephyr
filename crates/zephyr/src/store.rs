@@ -1124,15 +1124,6 @@ impl Store {
         Ok((n == 1).then(|| self.db.last_insert_rowid()))
     }
 
-    /// Whether this message is stored already: the inbox's dedupe key.
-    pub fn has_inbox(&self, channel: &str, platform_msg_id: &str) -> rusqlite::Result<bool> {
-        self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM inbox WHERE channel = ?1 AND platform_msg_id = ?2)",
-            params![channel, platform_msg_id],
-            |r| r.get(0),
-        )
-    }
-
     /// Row `to` is as much the owner's as row `from`, and as derived (a `/retry` of it).
     pub fn copy_owner(&self, from: i64, to: i64) -> rusqlite::Result<()> {
         self.db.execute(

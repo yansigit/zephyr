@@ -1055,6 +1055,30 @@ async fn pairing_over_telegram_names_the_user() {
     assert_eq!(texts, ["/pair", "/pair"], "no code is kept");
 }
 
+/// A message delivered again (a batch whose confirmation was lost) is a row the router drops:
+/// it costs no `getFile` and no download.
+#[tokio::test]
+async fn a_redelivered_message_asks_for_no_file_again() {
+    let home = home("redelivered");
+    let (api, bot) = stub().await;
+    bot.lock().unwrap().files.insert(
+        "v".into(),
+        ("voice/file_1.oga".into(), b"ogg-bytes".to_vec()),
+    );
+    let voice = json!({"voice": {"file_id": "v", "file_unique_id": "u", "duration": 3,
+        "mime_type": "audio/ogg", "file_size": 9}});
+    push(&bot, [message(1, 55, 7, voice.clone())]);
+    let gw = start(config(&home, &api, ""));
+    wait(|| said(&bot, 55).len() == 1).await;
+    // The same message under a new update, then one more to know the first was passed by.
+    push(&bot, [message(2, 55, 7, voice), text(3, 55, 8, "after")]);
+    wait(|| said(&bot, 55).len() == 2).await;
+    gw.shutdown().await;
+    assert_eq!(calls(&bot, "getFile").len(), 1);
+    assert_eq!(calls(&bot, "file").len(), 1);
+    assert_eq!(inbox_total(&home), 2);
+}
+
 /// A voice note (channels spec §4.4, §4.5): the bytes the daemon fetched from the Bot API are
 /// what is transcribed, the row is marked derived, and the reply is also spoken, sent with
 /// `sendVoice` after its text.

@@ -158,6 +158,7 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
 - Deviation: a file already saved is fetched again only when its declared type is `audio/*` (the served type is not known before a fetch); if that fetch fails the line under it is `transcription failed`.
 - Deviation: one more test, `with_transcription_off_or_no_voice_the_audio_line_stands_alone`; `a_file_in_the_inbox_with_no_message_is_never_heard` sends a typed message with no file, so that `append` runs.
 - Review fix: `inbox::append` asks the store first (`Store::has_inbox`) and does nothing for a message whose row is already there, so iMessage backfill no longer fetches and transcribes a stored voice note again at every start. A file found under the stem whose row is not stored is still fetched again for the transcript.
+- Review fix: the dedupe check is `inbox::stored`: a read-only connection and one `SELECT 1` through `spawn_blocking`, never `Store::open` on the adapter's task (`Store::has_inbox` is gone); no database, or one that cannot be read, means not stored. Telegram asks it before `getFile` (`a_redelivered_message_asks_for_no_file_again`).
 
 ### Task C2-4: A transcript taints and is never a command; the `voice.*` settings
 

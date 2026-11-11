@@ -53,17 +53,33 @@ pub fn owner(live: &Live, inbound: &Inbound) -> bool {
         .is_some_and(|rx| rx.borrow().is_owner(&inbound.channel, &inbound.sender))
 }
 
+/// Whether `inbound`'s row is in the inbox already (its dedupe key), so the router will drop
+/// it: asked before anything is fetched for it. Read-only and off the async threads: never
+/// `Store::open`, which may migrate and takes write locks. A database that is not there yet or
+/// cannot be read says "not stored".
+pub async fn stored(live: &Live, inbound: &Inbound) -> bool {
+    use rusqlite::{Connection, OpenFlags, OptionalExtension};
+    let Some(db) = live.get().map(|rx| rx.borrow().db_path()) else {
+        return false;
+    };
+    let key = [inbound.channel.clone(), inbound.platform_msg_id.clone()];
+    let ask = move || -> rusqlite::Result<bool> {
+        let db = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        db.busy_timeout(Duration::from_secs(2))?;
+        let sql = "SELECT 1 FROM inbox WHERE channel = ?1 AND platform_msg_id = ?2";
+        let row = db.query_row(sql, key, |_| Ok(())).optional()?;
+        Ok(row.is_some())
+    };
+    matches!(tokio::task::spawn_blocking(ask).await, Ok(Ok(true)))
+}
+
 /// Appends a line per file to `inbound.text`, saving each file first when the sender is an owner.
 pub async fn append(live: &Live, inbound: &mut Inbound, files: Vec<File>) {
     let cfg = live.get().map(|rx| rx.borrow().clone());
     let cfg = cfg.filter(|c| c.is_owner(&inbound.channel, &inbound.sender));
     // A message whose row is stored already (iMessage backfill re-reads the last day at every
     // start) is one the router drops as a duplicate: nothing is fetched or heard for it.
-    let stored = |c: &Config| {
-        let store = crate::store::Store::open(&c.db_path()).ok()?;
-        (store.has_inbox(&inbound.channel, &inbound.platform_msg_id)).ok()
-    };
-    if !files.is_empty() && cfg.as_deref().and_then(stored) == Some(true) {
+    if !files.is_empty() && cfg.is_some() && stored(live, inbound).await {
         return;
     }
     let dir = cfg.as_ref().map(|c| c.home.join("inbox"));
