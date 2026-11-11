@@ -405,6 +405,17 @@ impl ActionKind {
     }
 }
 
+/// What [`Store::pay_within`] did with a payment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Paid {
+    /// It is in the window, as this `payments` row.
+    Recorded(i64),
+    /// It would pass the count, or the known sum.
+    Over,
+    /// There is an amount limit and it has no amount in the currency.
+    Unread,
+}
+
 /// A card to record (DESIGN §4.22): what it is bound to and who asked. `proposal` is the held
 /// action it came from, `None` for one the mode let through.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1802,6 +1813,58 @@ impl Store {
             params![at, minor, currency, source, proposal],
         )?;
         Ok(())
+    }
+
+    /// Records one payment if the window has room for it, the look and the row in one
+    /// `BEGIN IMMEDIATE` transaction, so two connections deciding at once are taken one after
+    /// the other (DESIGN §4.22). The window is `effects` payments and, when there is a
+    /// `limit`, that sum of the amounts known in `currency`, after `since`. `force` records it
+    /// whatever the window says (the owner's `/ok` on a strong channel).
+    #[allow(clippy::too_many_arguments)]
+    pub fn pay_within(
+        &self,
+        since: i64,
+        effects: u32,
+        limit: Option<i64>,
+        at: i64,
+        minor: Option<i64>,
+        currency: &str,
+        source: &str,
+        proposal: Option<i64>,
+        force: bool,
+    ) -> rusqlite::Result<Paid> {
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let decided = (|| {
+            let (count, sum, _) = self.payments_since(since, currency)?;
+            let found = match (limit, minor) {
+                _ if count + 1 > effects => Paid::Over,
+                (Some(limit), Some(minor)) if sum + minor > limit => Paid::Over,
+                (Some(_), None) => Paid::Unread,
+                _ => Paid::Recorded(0),
+            };
+            if !force && !matches!(found, Paid::Recorded(_)) {
+                return Ok(found);
+            }
+            self.add_payment(at, minor, currency, source, proposal)?;
+            Ok(Paid::Recorded(self.db.last_insert_rowid()))
+        })();
+        let end = match &decided {
+            Ok(Paid::Recorded(_)) => "COMMIT",
+            _ => "ROLLBACK",
+        };
+        self.db.execute_batch(end)?;
+        decided
+    }
+
+    /// Puts an action `/ok` took back to waiting for the owner: its payment did not fit the
+    /// window after all. Returns whether it was this call that put it back.
+    pub fn untake_action(&self, id: i64) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
+            "UPDATE proposals SET status = 'pending', approved = 0, settled_at = NULL, due_at = NULL
+             WHERE id = ?1 AND kind != 'command' AND status = 'running'",
+            params![id],
+        )?;
+        Ok(n == 1)
     }
 
     /// The payments after `since`: how many, the sum of those in `currency` (minor units), and

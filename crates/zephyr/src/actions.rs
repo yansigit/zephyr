@@ -143,13 +143,22 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
         (_, true) => "once",
         _ => "approved",
     };
-    audit(ctx.cfg, store, &a, decision);
-    // What the window counts: every payment the owner approved or that came due.
-    let source = match by {
-        By::Owner { .. } => "ok",
-        By::Delay => "due",
+    // What the window counts: every payment the owner approved or that came due, recorded
+    // with the count that binds. One that no longer fits waits again, for a strong channel.
+    let (source, strong) = match by {
+        By::Owner { channel } => {
+            let strong = ctx
+                .cfg
+                .settings
+                .strong_channels
+                .iter()
+                .any(|c| c == channel);
+            ("ok", strong)
+        }
+        By::Delay => ("due", false),
     };
-    crate::gate::paid(ctx.cfg, store, &a, source, now);
+    crate::gate::paid(ctx.cfg, store, &a, source, strong, now)?;
+    audit(ctx.cfg, store, &a, decision);
     let started = match a.kind {
         ActionKind::Run => run(ctx, &a),
         ActionKind::Pass => pass(ctx, &a, by, now),
@@ -528,6 +537,8 @@ fn due_now(ctx: &Ctx, a: &Action, now: i64) {
     }
     match approve(ctx, a.id, false, By::Delay, now) {
         Ok(text) => tell(store, a, &text),
+        // One that no longer fits the payment window waits for the owner again, who is told.
+        Err(why) if store.action_strong(a.id).unwrap_or(false) => tell(store, a, &why),
         Err(why) => eprintln!("zephyr: delayed #{} did not go: {why}", a.id),
     }
 }

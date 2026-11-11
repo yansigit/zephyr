@@ -463,29 +463,47 @@ fn span(seconds: i64) -> String {
     }
 }
 
-/// One payment that went or was approved, for the window to count: its amount when it was read
-/// and names a currency.
-fn pay_row(
+/// Records one payment in the window if it fits (or whatever it does, with `force`): the look
+/// and the row are one transaction (`Store::pay_within`), so two decisions at the limit, on
+/// the router's connection and the gate socket's, are never both let go. `Ok` is its row.
+fn pay(
     cfg: &Config,
     store: &Store,
     amount: Option<&Amount>,
     source: &str,
     proposal: Option<i64>,
     now: i64,
-) -> rusqlite::Result<()> {
-    let (minor, currency) = match amount.filter(|a| !a.currency.is_empty()) {
-        Some(a) => (
-            Some(approvals::minor_of(a.value, &a.currency)),
-            a.currency.clone(),
-        ),
-        None => (None, approvals::currency(cfg)),
-    };
-    store.add_payment(now, minor, &currency, source, proposal)
+    force: bool,
+) -> rusqlite::Result<Result<i64, Window>> {
+    use crate::store::Paid;
+    let w = approvals::window(cfg);
+    let currency = approvals::currency(cfg);
+    // What the window can count: an amount in its own currency.
+    let minor = amount
+        .filter(|a| a.currency == currency)
+        .map(|a| approvals::minor_of(a.value, &currency));
+    let paid = store.pay_within(
+        now - w.seconds,
+        w.effects,
+        w.amount_minor,
+        now,
+        minor,
+        &currency,
+        source,
+        proposal,
+        force,
+    )?;
+    Ok(match paid {
+        Paid::Recorded(id) => Ok(id),
+        Paid::Over => Err(Window::Over(window_text(cfg))),
+        Paid::Unread => Err(Window::Unread),
+    })
 }
 
 /// What the owner's `/ok` of `a` on a channel that is `strong` or not must pass when `a` is a
-/// payment (DESIGN §4.22): one held for the window, or that would cross it now, needs a strong
-/// channel whatever `approvals.strong_only` says. `Err` is why it still waits.
+/// payment (DESIGN §4.22), before it is taken: one held for the window, or that would cross it
+/// now, needs a strong channel whatever `approvals.strong_only` says. `Err` is why it still
+/// waits. The count that binds is made when it is recorded ([`paid`]).
 pub fn window_check(
     cfg: &Config,
     store: &Store,
@@ -507,22 +525,45 @@ pub fn window_check(
         return Ok(());
     };
     store.set_strong(a.id).map_err(failed)?;
-    Err(format!(
-        "[zephyr] #{} is {why}; approving it needs {}",
-        a.id,
-        cfg.settings.strong_channels.join(" or ")
-    ))
+    Err(needs_strong(cfg, a.id, &why))
 }
 
-/// Records approved payment `a` for the window (`source` is `ok` or `due`).
-pub fn paid(cfg: &Config, store: &Store, a: &Action, source: &str, now: i64) {
+fn needs_strong(cfg: &Config, id: i64, why: &str) -> String {
+    format!(
+        "[zephyr] #{id} is {why}; approving it needs {}",
+        cfg.settings.strong_channels.join(" or ")
+    )
+}
+
+/// Records payment `a`, which `/ok` or its delay just took (`source` is `ok` or `due`), for
+/// the window. On a `strong` channel it is the owner's fresh say and is recorded whatever the
+/// window holds. Otherwise it must still fit, counted in the transaction that records it: one
+/// that no longer does goes back to waiting, marked strong, and `Err` says so.
+pub fn paid(
+    cfg: &Config,
+    store: &Store,
+    a: &Action,
+    source: &str,
+    strong: bool,
+    now: i64,
+) -> Result<(), String> {
     if a.class != "money" {
-        return;
+        return Ok(());
     }
+    let failed = |e: rusqlite::Error| format!("[zephyr] recording payment #{} failed: {e}", a.id);
     let amount = stored_amount(cfg, a);
-    if let Err(e) = pay_row(cfg, store, amount.as_ref(), source, Some(a.id), now) {
-        eprintln!("zephyr: recording payment #{} failed: {e}", a.id);
-    }
+    let record = |force| pay(cfg, store, amount.as_ref(), source, Some(a.id), now, force);
+    let why = match record(strong).map_err(failed)? {
+        Ok(_) => return Ok(()),
+        // Not counted by the window, and the owner said yes: recorded with no amount.
+        Err(Window::Unread) | Err(Window::Within) => {
+            return record(true).map_err(failed).map(drop);
+        }
+        Err(Window::Over(why)) => why,
+    };
+    store.untake_action(a.id).map_err(failed)?;
+    store.set_strong(a.id).map_err(failed)?;
+    Err(needs_strong(cfg, a.id, &why))
 }
 
 /// The amount of held payment `a`, read again from what was stored.
@@ -1160,9 +1201,22 @@ impl Gate<'_> {
         };
         match plan {
             Plan::Allow(outcome) => {
-                // In the statement that lets it go: what the window counts.
+                // In the transaction that lets it go: the window is looked at and the payment
+                // recorded as one, so another connection deciding now waits for this one.
                 if let Some(g) = call.gated.as_ref().filter(|g| g.class == Class::Money) {
-                    pay_row(self.cfg, store, g.amount.as_ref(), "auto", None, self.now)?;
+                    match pay(
+                        self.cfg,
+                        store,
+                        g.amount.as_ref(),
+                        "auto",
+                        None,
+                        self.now,
+                        false,
+                    )? {
+                        Ok(_) => {}
+                        Err(Window::Over(_)) => return self.hold(&found, None, "window"),
+                        Err(_) => return self.hold(&found, None, "held"),
+                    }
                 }
                 if let Found::Names(names) = &found {
                     let to = match call.targets.as_slice() {
@@ -5354,5 +5408,81 @@ mod tests {
         assert_eq!(window_check(&h.cfg, &h.store, &a, true, now), Ok(()));
         // Held for the window, it stays strong after the window has moved on.
         assert!(window_check(&h.cfg, &h.store, &a, false, now + 700).is_err());
+    }
+
+    /// Two decisions at the limit, on two connections at once (the router's and the gate
+    /// socket's): the check and the payment's row are one transaction, so only one goes.
+    #[test]
+    fn concurrent_decisions_at_the_limit_let_one_through() {
+        for round in 0..6 {
+            let h = home(&format!("gate-window-race-{round}"), AUTO_100);
+            let now = crate::now();
+            let gate = std::sync::Arc::new(std::sync::Barrier::new(12));
+            let allowed: usize = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..12)
+                    .map(|_| {
+                        let (cfg, gate) = (&h.cfg, gate.clone());
+                        scope.spawn(move || {
+                            let store = Store::open(&cfg.db_path()).unwrap();
+                            gate.wait();
+                            decide_card(cfg, &store, &card_of("60"), owner(), now).is_ok()
+                        })
+                    })
+                    .collect();
+                let went = workers.into_iter().map(|w| w.join().unwrap());
+                went.filter(|ok| *ok).count()
+            });
+            assert_eq!(allowed, 1, "round {round}: 60 + 60 is over 100");
+            assert_eq!(
+                h.store.payments_since(now - 600, "CAD").unwrap(),
+                (1, 6000, false)
+            );
+        }
+    }
+
+    /// An `/ok` on a channel that is not strong counts in the same transaction: of two at the
+    /// limit one is taken, and the other goes back to waiting, strong.
+    #[test]
+    fn an_ok_that_would_cross_the_window_goes_back_to_waiting() {
+        let h = home(
+            "gate-window-ok-race",
+            "[approvals]\ncurrency = 'CAD'\n[approvals.window]\namount = 100\n",
+        );
+        let now = crate::now();
+        let pay = |run: &str| {
+            let mut req = click("Pay now", "https://shop.example", run);
+            req.browser.as_mut().unwrap().amount = Some(PageAmount {
+                value: 60.0,
+                currency: "CAD".into(),
+            });
+            held(&decide(&h.cfg, &h.store, &req, owner(), now))
+        };
+        let (first, second) = (pay("main:1"), pay("main:2"));
+        let take = |id: i64| h.store.take_approved(id).unwrap().unwrap();
+        // Both passed the look before they were taken; the count is made as each is recorded.
+        let (a, b) = (take(first), take(second));
+        assert_eq!(paid(&h.cfg, &h.store, &a, "ok", false, now), Ok(()));
+        let refused = paid(&h.cfg, &h.store, &b, "ok", false, now).unwrap_err();
+        assert_eq!(
+            refused,
+            format!(
+                "[zephyr] #{second} is over your payment window (5 payments or 100.00 CAD per \
+                 10 min); approving it needs tui or chat or passkey"
+            )
+        );
+        let back = h.store.action(second).unwrap().unwrap();
+        assert_eq!(back.status, "pending");
+        assert!(h.store.action_strong(second).unwrap());
+        assert_eq!(
+            h.store.payments_since(now - 600, "CAD").unwrap(),
+            (1, 6000, false)
+        );
+        // From a strong channel it is the owner's fresh say, and it counts.
+        let b = take(second);
+        assert_eq!(paid(&h.cfg, &h.store, &b, "ok", true, now), Ok(()));
+        assert_eq!(
+            h.store.payments_since(now - 600, "CAD").unwrap(),
+            (2, 12000, false)
+        );
     }
 }
