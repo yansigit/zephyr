@@ -859,7 +859,8 @@ pub fn scrub(text: &str, secrets: &[(String, String)]) -> String {
         }
     }
     let all: Vec<String> = forms.into_iter().map(|(_, v)| v).collect();
-    crate::auth::redact(&out, &all)
+    // And the numbers of the cards in use, which no file holds (DESIGN §4.22).
+    crate::cards::scrub(&crate::auth::redact(&out, &all))
 }
 
 /// Every text a value shows up as, with its entry's name: itself and its base64 forms.
