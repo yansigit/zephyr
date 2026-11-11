@@ -37,6 +37,10 @@
 //! every scoped snapshot the wrapper takes is followed by a full one, so the agent's refs resolve
 //! as before (R54).
 //!
+//! Pacing (DESIGN §4.24): a navigation or a click ([`paced`]) first asks the gate for its slot on
+//! the site ([`site`]), closes the connection and sleeps until it, after the gate's verdict and
+//! before the page is read again; only then does it take its place on the desktop.
+//!
 //! What is not gated, by design: an unrecognized label (documented limit), `eval`, `mouse`,
 //! `select`, `drag` and the rest of the commands (spec §4.4's list), and the real binary run by
 //! its path or by a copy (a name check, like the plugin's: spec §2 non-goals).
@@ -509,8 +513,14 @@ fn decide(args: &[String], env: &Env) -> (Next, Place) {
     let flags = forwarded(&argv.globals);
     let page = Page::new(env, &flags);
     let act = what(&argv.rest);
+    let paced = paced(&argv.rest);
+    // A navigation, and a click the gate lets through at once: its slot, then its place.
+    let paced_go = |paced, url: &dyn Fn() -> String| match pace(env, paced, url) {
+        Ok(()) => go(env, None),
+        Err(text) => (Next::Refuse(text), None),
+    };
     match &act {
-        Act::Pass => return go(env, None),
+        Act::Pass => return paced_go(paced, &|| page.url()),
         Act::Refuse(text) => return (Next::Refuse((*text).into()), None),
         Act::Type { action, typed } => {
             let seen = Seen {
@@ -530,14 +540,14 @@ fn decide(args: &[String], env: &Env) -> (Next, Place) {
     }
     let url = page.url();
     let Some(Look { action, mut seen }) = look(&page, &act) else {
-        return go(env, None);
+        return paced_go(paced, &|| url.clone());
     };
     let class = gate::browser_class(&request(action, &url, &seen));
     // Through at once: a control read and no message, post or payment, with nothing typed that
     // could hold a private fact (I1: a line break typed anywhere sends what came before it).
     let typed = seen.typed.iter().any(|t| !t.trim().is_empty());
     if class.is_none() && !seen.role.trim().is_empty() && !typed {
-        return go(env, None);
+        return paced_go(paced, &|| url.clone());
     }
     if class == Some(Class::Money) {
         seen.amount = page.total();
@@ -552,6 +562,11 @@ fn decide(args: &[String], env: &Env) -> (Next, Place) {
         Ok(wait) => wait,
         Err(refused) => return (refused, None),
     };
+    // Its slot before the page is read again, so what runs is checked as close to it as before.
+    if let Err(text) = pace(env, paced, || url.clone()) {
+        said(wait, false);
+        return (Next::Refuse(text), None);
+    }
     // I4: up to 10 minutes went by; what the owner approved must still be what runs.
     let same = unchanged(&Page::new(env, &flags), &act, &url, &first, class);
     if !same {
@@ -1086,6 +1101,112 @@ fn batch(args: &[String]) -> Act {
         }
     }
     Act::Pass
+}
+
+// ---- pacing (DESIGN §4.24) ----
+
+/// Where a paced command's site comes from.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Paced {
+    /// The address it goes to.
+    Url(String),
+    /// The page it is on (`get url`).
+    Current,
+}
+
+/// The navigation or click `rest` (the agent's command after [`split`]) makes, as 0.41.2's
+/// parser reads it, and how many (a batch counts each); `None` for what is not paced.
+pub fn paced(rest: &[String]) -> Option<(Paced, u32)> {
+    let (cmd, args) = rest.split_first()?;
+    let first = |args: &[String], valued: &[&str]| {
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                f if valued.contains(&f) => i += 1,
+                f if f.starts_with("--") => {}
+                url => return Some(url.to_string()),
+            }
+            i += 1;
+        }
+        None
+    };
+    let url = |u: Option<String>| u.map(|u| (Paced::Url(u), 1));
+    match cmd.as_str() {
+        "open" | "goto" | "navigate" => url(first(args, &[])),
+        "tab" if args.first().is_some_and(|a| a == "new") => url(first(&args[1..], &["--label"])),
+        "read" => url(first(args, &["--llms", "--filter", "--timeout"])),
+        "back" | "forward" | "reload" => Some((Paced::Current, 1)),
+        "batch" => {
+            let commands = args
+                .iter()
+                .filter(|a| !matches!(a.as_str(), "--bail" | "--omit-command"));
+            let each = commands.filter_map(|c| paced(&split(&shell_words_split(c)).rest));
+            each.reduce(|(at, n), (_, m)| (at, n + m))
+        }
+        _ => matches!(what(rest), Act::Click(_) | Act::Key { .. }).then_some((Paced::Current, 1)),
+    }
+}
+
+/// The site `url` is on, as a site's own bot checks see it: its registrable domain (public
+/// suffix list), or the host itself for an IP address or a name with no known suffix. A bare
+/// name is read as `https://`, as 0.41 does; `file:`, `about:`, `data:` and `chrome:` pages
+/// are not paced (`None`).
+pub fn site(url: &str) -> Option<String> {
+    let url = url.trim();
+    let lower = url.to_ascii_lowercase();
+    let local = ["about:", "data:", "file:", "chrome:", "chrome-extension:"];
+    if local.iter().any(|s| lower.starts_with(s)) {
+        return None;
+    }
+    let full = match lower.starts_with("http://") || lower.starts_with("https://") {
+        true => url.to_string(),
+        false => format!("https://{url}"),
+    };
+    let parsed = url::Url::parse(&full).ok()?;
+    let host = parsed.host()?;
+    let url::Host::Domain(name) = host else {
+        return Some(host.to_string());
+    };
+    let name = name.trim_end_matches('.');
+    let domain = psl::domain(name.as_bytes()).filter(|d| d.suffix().is_known());
+    let domain = domain.and_then(|d| std::str::from_utf8(d.trim().as_bytes()).ok());
+    Some(domain.unwrap_or(name).to_string()).filter(|s| !s.is_empty())
+}
+
+/// How long the wrapper waits for the gate's slot before it runs unpaced.
+const PACE_ASK: Duration = Duration::from_secs(5);
+
+/// Waits out the command's slot on its site (`current` reads the page's address when it is
+/// the page's), asked of the gate, on a connection closed before the sleep. `Err` is the gate's
+/// refusal. No gate answering runs it unpaced: pacing is a courtesy to sites, not a guard.
+fn pace(
+    env: &Env,
+    paced: Option<(Paced, u32)>,
+    current: impl FnOnce() -> String,
+) -> Result<(), String> {
+    let Some((at, count)) = paced else {
+        return Ok(());
+    };
+    let url = match at {
+        Paced::Url(url) => url,
+        Paced::Current => current(),
+    };
+    let (Some(site), Some(socket)) = (site(&url), env.socket.as_ref()) else {
+        return Ok(());
+    };
+    let req = json!({"v": 1, "pace": site, "count": count, "session": env.session});
+    match zephyr_policy::gate_client::ask(socket, &req, PACE_ASK) {
+        Ok(a) if a["verdict"] == "allow" => {
+            let wait = Duration::from_millis(a["wait_ms"].as_u64().unwrap_or(0));
+            std::thread::sleep(wait.min(gate::PACE_MAX_WAIT));
+            Ok(())
+        }
+        Ok(a) if a["verdict"] == "deny" => {
+            let text = a["text"].as_str().filter(|t| !t.trim().is_empty());
+            Err(text.unwrap_or("not run: the gate did not allow it").into())
+        }
+        _ => Ok(()),
+    }
 }
 
 // ---- the page, read through the real binary ----
@@ -2189,8 +2310,25 @@ cat "$d/$f.json"
         }
 
         /// A gate on the socket: each request comes out with its connection, for the test to
-        /// answer, hold open or drop.
+        /// answer, hold open or drop. A request for a pacing slot is answered `allow` with no
+        /// wait, as the gate with pacing off answers it, and does not come out.
         fn gate(&self) -> mpsc::Receiver<(Value, UnixStream)> {
+            let (tx, rx) = mpsc::channel();
+            let all = self.gate_all();
+            std::thread::spawn(move || {
+                for (req, mut conn) in all {
+                    if req.get("pace").is_some() {
+                        answer(&mut conn, json!({"verdict": "allow"}));
+                    } else if tx.send((req, conn)).is_err() {
+                        return;
+                    }
+                }
+            });
+            rx
+        }
+
+        /// [`T::gate`], pacing requests too.
+        fn gate_all(&self) -> mpsc::Receiver<(Value, UnixStream)> {
             let listener = UnixListener::bind(self.env.socket.as_ref().unwrap()).unwrap();
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || {
@@ -2493,6 +2631,182 @@ cat "$d/$f.json"
         ("link", "Inbox"),
     ];
 
+    // ---- pacing (DESIGN §4.24) ----
+
+    fn paced_of(args: &[&str]) -> Option<(String, u32)> {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        paced(&split(&args).rest).map(|(p, n)| match p {
+            Paced::Url(u) => (u, n),
+            Paced::Current => ("current".into(), n),
+        })
+    }
+
+    #[test]
+    fn paced_reads_the_commands_in_the_spec_table() {
+        let url = |u: &str, n| Some((u.to_string(), n));
+        let current = Some(("current".to_string(), 1));
+        assert_eq!(paced_of(&["open", "example.com"]), url("example.com", 1));
+        assert_eq!(
+            paced_of(&["goto", "https://a.test/x"]),
+            url("https://a.test/x", 1)
+        );
+        assert_eq!(
+            paced_of(&["--headers", "{}", "navigate", "b.test"]),
+            url("b.test", 1)
+        );
+        assert_eq!(paced_of(&["open"]), None, "launches on about:blank");
+        assert_eq!(
+            paced_of(&["tab", "new", "--label", "x", "https://c.test"]),
+            url("https://c.test", 1)
+        );
+        assert_eq!(
+            paced_of(&["tab", "new", "c.test", "--label", "x"]),
+            url("c.test", 1)
+        );
+        assert_eq!(paced_of(&["tab", "new"]), None);
+        assert_eq!(paced_of(&["tab", "list"]), None);
+        assert_eq!(
+            paced_of(&["read", "--llms", "index", "d.test"]),
+            url("d.test", 1)
+        );
+        assert_eq!(paced_of(&["read"]), None, "the page as it is");
+        for args in [
+            &["back"][..],
+            &["forward"],
+            &["reload"],
+            &["click", "@e1"],
+            &["dblclick", "#x"],
+            &["tap", "@e2"],
+            &["find", "role", "button", "click", "--name", "Go"],
+            &["press", "Enter"],
+            &["key", "Space"],
+            &["type", "@e1", "hi\n"],
+        ] {
+            assert_eq!(paced_of(args), current, "{args:?}");
+        }
+        assert_eq!(
+            paced_of(&["batch", "open a.test", "open b.test", "snapshot -i"]),
+            url("a.test", 2)
+        );
+        assert_eq!(paced_of(&["batch", "snapshot -i", "back"]), current);
+        for args in [
+            &["snapshot", "-i"][..],
+            &["fill", "@e1", "hi"],
+            &["type", "@e1", "hi"],
+            &["get", "url"],
+            &["scroll", "down"],
+            &["eval", "location.href = 'x'"],
+            &["press", "Tab"],
+            &["batch", "snapshot -i"],
+            &[],
+        ] {
+            assert_eq!(paced_of(args), None, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn sites_are_registrable_domains() {
+        let site = |u: &str| super::site(u);
+        assert_eq!(
+            site("https://www.amazon.co.uk/x"),
+            Some("amazon.co.uk".into())
+        );
+        assert_eq!(site("smile.amazon.co.uk"), site("https://www.amazon.co.uk"));
+        assert_eq!(site("https://a.co.kr"), Some("a.co.kr".into()));
+        assert_ne!(site("https://a.co.kr"), site("https://b.co.kr"));
+        assert_eq!(
+            site("HTTP://Mail.Example.COM:8080/"),
+            Some("example.com".into())
+        );
+        assert_eq!(
+            site("http://192.168.0.1:8123/x"),
+            Some("192.168.0.1".into())
+        );
+        assert_eq!(site("http://[::1]/"), Some("[::1]".into()));
+        assert_eq!(site("localhost:3000"), Some("localhost".into()));
+        assert_eq!(
+            site("https://box.internal-name"),
+            Some("box.internal-name".into())
+        );
+        for unpaced in [
+            "file:///x",
+            "about:blank",
+            "data:text/html,x",
+            "chrome://settings",
+            "",
+        ] {
+            assert_eq!(site(unpaced), None, "{unpaced}");
+        }
+    }
+
+    /// No gate answering: pacing is a courtesy, so a navigation runs at once; a click the gate
+    /// must judge is refused as before.
+    #[test]
+    fn no_gate_runs_a_navigation_at_once_and_still_refuses_a_click() {
+        let t = T::new("bg-pace-no-gate");
+        t.page(MAIL, COMPOSE, "");
+        let started = Instant::now();
+        assert_eq!(t.run(&["open", "https://example.com"]), Next::Exec);
+        assert_eq!(
+            t.run(&["click", "@e4"]),
+            Next::Exec,
+            "a link the gate needs not judge"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(t.run(&["click", "@e3"]), Next::Refuse(NOT_ANSWERING.into()));
+        assert!(!t.clicked());
+    }
+
+    #[test]
+    fn a_paced_command_sleeps_what_the_gate_says() {
+        let t = T::new("bg-pace-sleep");
+        t.page(MAIL, COMPOSE, "");
+        let gate = t.gate_all();
+        let started = Instant::now();
+        let waiting = t.spawn(&["open", "https://www.example.com/x"]);
+        let (req, mut conn) = asked(&gate);
+        assert_eq!(
+            req,
+            json!({"v": 1, "pace": "example.com", "count": 1, "session": "main"})
+        );
+        answer(&mut conn, json!({"verdict": "allow", "wait_ms": 400}));
+        // The connection is closed before the sleep: a waiting command holds no gate place.
+        let mut rest = Vec::new();
+        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        conn.read_to_end(&mut rest).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(400), "held open");
+        assert_eq!(waiting.join().unwrap(), Next::Exec);
+        assert!(started.elapsed() >= Duration::from_millis(400));
+        // A click let through at once is paced on the page's own site.
+        let waiting = t.spawn(&["click", "@e4"]);
+        let (req, mut conn) = asked(&gate);
+        assert_eq!(req["pace"], "example.com", "{req}");
+        answer(&mut conn, json!({"verdict": "allow", "wait_ms": 0}));
+        assert_eq!(waiting.join().unwrap(), Next::Exec);
+        // A refusal is the command's.
+        let waiting = t.spawn(&["batch", "open a.test", "open b.test"]);
+        let (req, mut conn) = asked(&gate);
+        assert_eq!(
+            (req["pace"].as_str(), req["count"].as_u64()),
+            (Some("a.test"), Some(2))
+        );
+        answer(
+            &mut conn,
+            json!({"verdict": "deny", "text": "not run: one at a time"}),
+        );
+        assert_eq!(
+            waiting.join().unwrap(),
+            Next::Refuse("not run: one at a time".into())
+        );
+        // Not a site: nothing asked.
+        assert_eq!(t.run(&["open", "about:blank"]), Next::Exec);
+        assert!(gate.try_recv().is_err());
+    }
+
     #[test]
     fn a_navigation_passes_straight_through() {
         let t = T::new("bg-pass");
@@ -2506,7 +2820,6 @@ cat "$d/$f.json"
             &["--help"],
             &[],
             &["scroll", "down", "500"],
-            &["--session", "work", "back"],
             &["press", "Tab"],
             &["key", "ArrowDown"],
             &["hover", "@e3"],
@@ -2521,6 +2834,10 @@ cat "$d/$f.json"
         }
         // Nothing read the page, and the gate heard nothing.
         assert!(t.argv().is_empty(), "{:?}", t.argv());
+        assert!(gate.try_recv().is_err());
+        // Going back reads only the page's address, for its pace (DESIGN §4.24).
+        assert_eq!(t.run(&["--session", "work", "back"]), Next::Exec);
+        assert_eq!(t.argv(), ["--session work get url --json"]);
         assert!(gate.try_recv().is_err());
         // A click on a link reads the page (as the agent's own session), then goes unasked.
         assert_eq!(
