@@ -2075,6 +2075,19 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// The issuer made card `id` after its close was asked: its reference there is kept and
+    /// the card is `closing` (again, when the close was recorded with nothing there to close),
+    /// so it is closed at the issuer and tried until it is.
+    pub fn card_reclose(&self, id: i64, provider_ref: &str, now: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE cards SET provider_ref = ?2, status = 'closing',
+                    expires_at = min(expires_at, ?3)
+             WHERE id = ?1 AND status IN ('waiting', 'open', 'charging', 'closing', 'closed')",
+            params![id, provider_ref, now],
+        )?;
+        Ok(())
+    }
+
     /// The issuer's first charge on a card that is not settled: it is `used`, with who charged
     /// it. `false` when it was over already, so a charge is recorded and told once.
     #[allow(clippy::too_many_arguments)]

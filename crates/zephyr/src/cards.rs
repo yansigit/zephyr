@@ -1011,20 +1011,15 @@ pub async fn issue(
         card.approval_url.as_deref(),
     );
     if !landed.map_err(failed)? {
-        // Closed while the issuer was answering (a `/stop`): what it made is closed there
-        // too, and the card stays as the close left it.
-        let said = issuer.close(&card).await.map_err(|e| e.0);
-        audit(
-            cfg,
-            &db.get(),
-            &card,
-            "close",
-            said.as_ref()
-                .map_or_else(|e| e.as_str(), |()| "closed while it was being issued"),
-        );
-        return Err(format!(
-            "card #{id} was not issued: it was closed while it was being issued"
-        ));
+        // Its close was asked while the issuer was answering (a `/stop`): what the issuer made
+        // is closed there now, and the card is `closing` until the issuer takes that, tried
+        // again on the tick. The owner is never told to approve it.
+        let reference = card.provider_ref.as_deref().unwrap_or_default();
+        db.get().card_reclose(id, reference, now).map_err(failed)?;
+        let _ = poll_due(cfg, id);
+        let said = close_at_issuer(cfg, &card).await;
+        say(cfg, card, Word::Closed(LANDED.into(), said));
+        return Err(format!("card #{id} was not issued: {LANDED}"));
     }
     audit(cfg, &db.get(), &card, "issue", "ok");
     let scrub = crate::gate::Scrub::load(cfg);
@@ -1583,7 +1578,8 @@ fn say(cfg: &Config, card: Card, word: Word) {
 
 async fn close_at_issuer(cfg: &Config, card: &Card) -> Result<(), String> {
     // The issuer has not made it yet (its issue is still being answered): there is nothing
-    // there to close, and the issue closes what it makes once it finds the card closed.
+    // there to close. The close is kept in the card's status, and the issue closes what it
+    // makes when it lands (`issue`).
     if card.provider_ref.is_none() {
         return Ok(());
     }
@@ -1616,6 +1612,12 @@ pub fn ask_close(cfg: &Arc<Config>, store: &Store, card: Card, why: &str) {
 fn closed(cfg: &Config, store: &Store, card: &Card, why: &str, said: Result<(), String>, now: i64) {
     // Whatever the issuer said: the number is never filled again.
     live::forget(cfg.state_dir(), card.id, now);
+    // Asked before the issuer had made the card, so with nothing there to close: if the issue
+    // has landed since, the close it made is the one recorded (`issue`).
+    let landed = || store.card(card.id).ok().flatten()?.provider_ref;
+    if said.is_ok() && card.provider_ref.is_none() && landed().is_some() {
+        return;
+    }
     if let Err(e) = said {
         audit(cfg, store, card, "close", &e);
         log(store.card_closing(card.id, now));
@@ -1644,7 +1646,7 @@ fn closed(cfg: &Config, store: &Store, card: &Card, why: &str, said: Result<(), 
     audit(cfg, store, card, "close", why);
     let text = format!("{why}; the card is closed and cannot be filled");
     note(store, card, "closed", &text);
-    if why == RETRY {
+    if why == RETRY || why == LANDED {
         let text = format!("[zephyr] card #{} is closed at the issuer now", card.id);
         tell(store, card, &text);
     } else if to == "unknown" {
@@ -1719,6 +1721,8 @@ const LIVE: [&str; 3] = ["waiting", "open", "charging"];
 const UNSETTLED: [&str; 4] = ["waiting", "open", "charging", "closing"];
 /// Why a close is asked again: the issuer refused it before.
 const RETRY: &str = "the close was tried again";
+/// Why a card is closed as its issue lands: its close was asked meanwhile.
+const LANDED: &str = "it was closed while it was being issued";
 
 /// The router's tick for cards, on the router's own store. Numbers past their hour are
 /// dropped. What the issuers said since the last tick is recorded: a card opens once the owner

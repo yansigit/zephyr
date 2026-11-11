@@ -8874,3 +8874,51 @@ async fn a_pay_click_and_a_fill_right_after_stop_are_refused() {
     assert!(!log.iter().any(|l| l.starts_with("reveal")), "{log:?}");
     gw.shutdown().await;
 }
+
+/// A close asked while the issuer is still making the card is kept. When the issue lands the
+/// card is closed at the issuer at once, tried again until the issuer takes it, and the owner
+/// is never told to approve it.
+#[tokio::test]
+async fn a_close_asked_before_the_issue_landed_is_carried_out_when_it_lands() {
+    use zephyr::cards::Fake;
+    let (home, cfg) = card_home("card-close-asked", "fake", "auto 100");
+    let script = cfg.clone();
+    Fake::script(&script, |s| {
+        s.issue_delay = Duration::from_millis(1500);
+        s.asks_owner = true;
+        s.fail_close = true;
+    });
+    let gw = start(cfg);
+    gw.say("k1", "owner", &card_ask("42.50")).await;
+    let log = || Fake::script(&script, |s| s.log.clone());
+    let closes = || log().iter().filter(|l| *l == "close 1").count();
+    wait(|| log().iter().any(|l| l.starts_with("issue 1 "))).await;
+    gw.say("k2", "owner", "/stop").await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] stopped")).await;
+    assert_eq!(closes(), 0, "nothing at the issuer to close yet");
+    // The issue lands: closed there at once. The issuer refuses, so it is tried again, and
+    // the card is not called closed meanwhile.
+    wait(|| closes() >= 2).await;
+    assert_eq!(card_status(&home, 1), "closing");
+    let told = reply_where(&gw, "chat", |r| r.contains("could not be closed")).await;
+    assert!(
+        told.starts_with("[zephyr] card #1 could not be closed at the issuer"),
+        "{told}"
+    );
+    Fake::script(&script, |s| s.fail_close = false);
+    wait(|| card_status(&home, 1) == "closed").await;
+    reply_where(&gw, "chat", |r| {
+        r == "[zephyr] card #1 is closed at the issuer now"
+    })
+    .await;
+    let said = gw.replies();
+    assert!(
+        !said.iter().any(|r| r.contains("approve it in Link")),
+        "{said:?}"
+    );
+    assert!(
+        !said.iter().any(|r| r.contains("[card #1 issued")),
+        "{said:?}"
+    );
+    gw.shutdown().await;
+}
