@@ -666,7 +666,8 @@ reads it as two lines under your caption, if you typed one:
 ```
 
 - A transcript is not your typed text. Speech never runs a command: saying "slash ok 3"
-  approves nothing, so approvals stay typed.
+  approves nothing, so approvals stay typed. A command typed as a voice note's caption is not
+  run either (the whole message goes to the agent): send the command as a message of its own.
 - A note longer than `voice.max_secs` (300) is saved but not transcribed. One note is
   transcribed at a time; a minute of speech takes about 11 s on CPU.
 - A conversation that took in a voice note is no longer yours alone: with `memory.auto owner`,

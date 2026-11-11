@@ -2080,6 +2080,13 @@ impl<'a> Router<'a> {
         if after {
             log(self.store.deliver_after(id).map_err(Into::into));
         }
+        // A row that holds a transcript is never a command, whatever its typed caption says:
+        // `/job add`, `/task`, `/btw` and the like would carry the transcript under the caption
+        // into a run that `dispatch_new`'s taint never sees. All of it goes to the agent.
+        if m.derived.is_some() {
+            self.procs.yield_all();
+            return log(self.dispatch_new().await);
+        }
         let mut approving = None;
         // Every approval made in the web app is signed with a passkey, on its card
         // (`zephyr.decide`): typed over the socket, it would rest on the session cookie alone.

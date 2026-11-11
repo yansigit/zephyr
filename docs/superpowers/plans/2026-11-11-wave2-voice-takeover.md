@@ -178,6 +178,7 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
 - [x] **Step 5: Commit** `feat(router): treat a voice note's transcript as file-derived text that taints the conversation`.
 - Deviation: `reload.rs` needs no change: a `[voice]` edit is `Plan::Live`, and `inbox::append` reads the live config. One more test, `the_owner_sets_voice_settings_and_the_agent_only_proposes`, takes `/set voice.*` through the router and the file.
 - Deviation: the two "approves nothing" tests pass before the change (the row never starts with what was said, by C2-3's line format); they are kept as guards. Only the taint test failed first.
+- Review fix: a row with `derived` set is never read as a command or a decision (`Router::inbound`), so a caption like `/task do X` cannot carry the transcript under it into a job, a task or `/btw` past the taint. Neither of the review's two shapes: stricter than both, with one check at the one place commands are read (`a_command_typed_as_a_voice_notes_caption_is_not_run`).
 
 ### Task C2-5: Voice out, and the `voice` lines of doctor and status
 
