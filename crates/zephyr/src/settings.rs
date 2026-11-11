@@ -630,6 +630,84 @@ pub static SETTINGS: &[Setting] = &[
         Stricter::More,
         Apply::Toml,
     ),
+    row(
+        "approvals.window.effects",
+        "Approvals",
+        "Payments per window",
+        "Past this many payments in the window, the next waits for a strong channel whatever \
+         the mode.",
+        Kind::Int { min: 1, max: 100 },
+        Access::Tighten,
+        true,
+        Stricter::Lower,
+        Apply::Toml,
+    ),
+    row(
+        "approvals.window.amount",
+        "Approvals",
+        "Amount per window",
+        "Past this much in the currency in the window, a payment waits for a strong channel; \
+         none follows the auto N cap.",
+        Kind::Optional(&Kind::Float {
+            min: 0.01,
+            max: 1.0e9,
+        }),
+        Access::Tighten,
+        true,
+        Stricter::NoneIsLoosest,
+        Apply::Toml,
+    ),
+    row(
+        "approvals.window.seconds",
+        "Approvals",
+        "Window (seconds)",
+        "How far back the payment window looks.",
+        Kind::Int {
+            min: 60,
+            max: 86_400,
+        },
+        Access::Tighten,
+        true,
+        Stricter::Higher,
+        Apply::Toml,
+    ),
+    row(
+        "cards.provider",
+        "Cards",
+        "Card provider",
+        "manual: you make each card in your own card app and enter it with `zephyr card put`; \
+         link: Stripe's Link Agent Wallet, where you approve each card; none turns cards off.",
+        Kind::Optional(&Kind::Choice(&crate::cards::PROVIDERS)),
+        Access::Propose,
+        true,
+        Stricter::NotOrdered,
+        Apply::Toml,
+    ),
+    row(
+        "cards.max",
+        "Cards",
+        "Largest card",
+        "The most one virtual card may be for, in the approvals currency.",
+        Kind::Float {
+            min: 0.01,
+            max: 1.0e6,
+        },
+        Access::Tighten,
+        true,
+        Stricter::Lower,
+        Apply::Toml,
+    ),
+    row(
+        "cards.minutes",
+        "Cards",
+        "Card lifetime (minutes)",
+        "How long an issued card stays open before zephyr closes it and forgets its number.",
+        Kind::Int { min: 1, max: 60 },
+        Access::Tighten,
+        true,
+        Stricter::Lower,
+        Apply::Toml,
+    ),
     fixed(
         "owners",
         "Owners",
@@ -1028,6 +1106,12 @@ pub fn value(cfg: &Config, key: &str) -> Option<String> {
         "voice.languages" => Some(cfg.voice().languages.join(", ")),
         "voice.max_secs" => Some(cfg.voice().max_secs.to_string()),
         "browser.pace_ms" => Some(cfg.pace_ms().to_string()),
+        "cards.provider" => crate::cards::provider(cfg).map(String::from),
+        "cards.max" => {
+            let max = cfg.cards.as_ref().and_then(|c| c.max);
+            Some(max.unwrap_or(crate::cards::MAX).to_string())
+        }
+        "cards.minutes" => Some(crate::cards::minutes(cfg).to_string()),
         key if key.starts_with("approvals.") => {
             crate::approvals::value(cfg, &key["approvals.".len()..])
         }
