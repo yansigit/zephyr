@@ -2431,9 +2431,10 @@ fn call_lines(cfg: &Config, a: &Action, scrub: &Scrub) -> Vec<String> {
         return vec!["to: a number zephyr can no longer read; /ok will not place it".into()];
     };
     let quote = |text: &str| quoted_cut(&scrub.text(text), LINE_CHARS);
-    let language = match field("language") {
-        "ko" => "ko",
-        _ => "en",
+    let (language, named) = match field("language") {
+        "ko" => ("ko", "Korean"),
+        "fr" => ("fr", "French"),
+        _ => ("en", "English"),
     };
     let ask = crate::calls::Ask {
         number: n.clone(),
@@ -2448,11 +2449,7 @@ fn call_lines(cfg: &Config, a: &Action, scrub: &Scrub) -> Vec<String> {
             n.shown(),
             n.province,
             cfg.calls().max_minutes,
-            if language == "ko" {
-                "Korean"
-            } else {
-                "English"
-            }
+            named
         ),
         format!(
             "the call opens: \"{}\"",

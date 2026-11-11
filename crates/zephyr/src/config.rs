@@ -452,6 +452,12 @@ pub struct Calls {
     pub port: Option<u16>,
     /// That listener's public address as Telnyx reaches it: `wss://host[:port]`.
     pub media_url: Option<String>,
+    /// Who transcribes and speaks: `provider` (Telnyx, the default) or `local` (whisper and
+    /// Piper in the image). Either way the text passes through the daemon.
+    pub speech: String,
+    /// Whether toll-free numbers may be called. Off: they are shared with the US and the
+    /// Caribbean, and many are crisis or health lines.
+    pub toll_free: bool,
     /// A call is ended after this many minutes, 1 to 20.
     pub max_minutes: u64,
     /// Who the opening line says the call is for.
@@ -473,6 +479,8 @@ impl Default for Calls {
             provider: None,
             port: None,
             media_url: None,
+            speech: "provider".into(),
+            toll_free: false,
             max_minutes: 5,
             caller_name: None,
             contact_phone: None,
@@ -892,6 +900,9 @@ impl Config {
         let calls = self.calls();
         if calls.provider.as_deref().is_some_and(|p| p != "telnyx") {
             anyhow::bail!("[calls] provider must be telnyx");
+        }
+        if !crate::calls::SPEECH.contains(&calls.speech.as_str()) {
+            anyhow::bail!("[calls] speech must be provider or local");
         }
         if !(1..=20).contains(&calls.max_minutes) {
             anyhow::bail!("[calls] max_minutes must be 1 to 20");

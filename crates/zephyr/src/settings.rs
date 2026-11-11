@@ -512,6 +512,32 @@ pub static SETTINGS: &[Setting] = &[
         Apply::Toml,
     ),
     row(
+        "calls.speech",
+        "Phone calls",
+        "Speech",
+        "Who transcribes and speaks on a call. provider: Telnyx does both, quickly, in English, \
+         French and Korean, and hears the call's audio. local: whisper and Piper on this \
+         machine, slower, English (and Korean with KO_VOICE=1). The text passes through zephyr \
+         either way.",
+        Kind::Choice(&crate::calls::SPEECH),
+        Access::Propose,
+        false,
+        Stricter::NotOrdered,
+        Apply::Toml,
+    ),
+    row(
+        "calls.toll_free",
+        "Phone calls",
+        "Toll-free numbers",
+        "Whether toll-free numbers (800, 833, 844, 855, 866, 877, 888) may be called. They are \
+         shared with the US and the Caribbean, and many are crisis or health lines.",
+        Kind::Bool,
+        Access::Never,
+        true,
+        Stricter::FalseIsStricter,
+        Apply::Toml,
+    ),
+    row(
         "calls.max_minutes",
         "Phone calls",
         "Longest call",
@@ -1204,6 +1230,8 @@ pub fn value(cfg: &Config, key: &str) -> Option<String> {
         }
         "cards.minutes" => Some(crate::cards::minutes(cfg).to_string()),
         "calls.provider" => cfg.calls().provider,
+        "calls.speech" => Some(cfg.calls().speech),
+        "calls.toll_free" => Some(cfg.calls().toll_free.to_string()),
         "calls.max_minutes" => Some(cfg.calls().max_minutes.to_string()),
         "calls.caller_name" => cfg.calls().caller_name,
         "calls.contact_phone" => cfg.calls().contact_phone,
@@ -2068,6 +2096,26 @@ mod tests {
             );
             assert_eq!(value(&cfg, key).as_deref(), default, "{key}");
         }
+        // Speech is Telnyx's unless the owner says local; toll-free numbers are off, and only
+        // the owner turns them on, from a strong channel.
+        let speech = find("calls.speech").unwrap();
+        assert_eq!(value(&cfg, "calls.speech").as_deref(), Some("provider"));
+        assert!(parse(speech, "local").is_ok() && parse(speech, "cloud").is_err());
+        let toll_free = find("calls.toll_free").unwrap();
+        assert_eq!(value(&cfg, "calls.toll_free").as_deref(), Some("false"));
+        assert_eq!(
+            (toll_free.agent, toll_free.strong, toll_free.stricter),
+            (Access::Never, true, Stricter::FalseIsStricter)
+        );
+        let agent = Actor::Agent { session: "main" };
+        for loosens in [true, false] {
+            let got = decide(toll_free, &agent, loosens, &strong());
+            assert!(matches!(got, Verdict::Refuse(_)), "{got:?}");
+        }
+        let weak = Actor::Owner { channel: "discord" };
+        assert_ne!(decide(toll_free, &weak, true, &strong()), Verdict::Apply);
+        let tui = Actor::Owner { channel: "tui" };
+        assert_eq!(decide(toll_free, &tui, true, &strong()), Verdict::Apply);
         let minutes = find("calls.max_minutes").unwrap();
         assert!(parse(minutes, "20").is_ok() && parse(minutes, "21").is_err());
         assert_eq!(minutes.stricter, Stricter::Lower);
@@ -2084,6 +2132,7 @@ mod tests {
             "provider = 'twilio'",
             "media_url = 'wss://h/path'",
             "keep_days = 0",
+            "speech = 'cloud'",
         ] {
             let text = format!("rpi = '/r'\nhome = '/h'\n[calls]\n{bad}");
             let cfg: Config = toml::from_str(&text).unwrap();

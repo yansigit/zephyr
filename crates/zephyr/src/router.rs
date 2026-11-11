@@ -858,7 +858,9 @@ impl<'a> Router<'a> {
             self.flush(channels).await;
             self.publish();
             // Tasks are not waited for: they resume after the re-exec (DESIGN §4.12).
-            let background = self.jobs.running.load(Ordering::SeqCst);
+            // Nor under a phone call: its line would go dead mid-sentence (DESIGN §4.22).
+            let background =
+                self.jobs.running.load(Ordering::SeqCst) || !self.calls.live().is_empty();
             if self.reexec && !self.busy && self.btw.is_none() && !background {
                 eprintln!("zephyr: restarting itself to apply the new settings");
                 exit = Exit::Reexec;
@@ -5228,6 +5230,9 @@ impl<'a> Router<'a> {
     async fn drain<C: Channel>(&mut self, channels: &[C], rx: &mut mpsc::Receiver<Inbound>) {
         self.stopping = true;
         let deadline = Instant::now() + Duration::from_secs(20);
+        // A call in progress is closed, not dropped: its closing line, then the hang-up at
+        // the provider, while the turn below settles.
+        self.calls.stop_all();
         while self.busy {
             match tokio::time::timeout_at(deadline, next_event(&mut self.child)).await {
                 // As in `main`, so the run's spend and outbound list are booked.
@@ -5238,6 +5243,8 @@ impl<'a> Router<'a> {
                 _ => break, // child gone or out of time: recovery picks it up next start
             }
         }
+        let left = deadline.saturating_duration_since(Instant::now());
+        self.calls.drained(left.max(Duration::from_secs(5))).await;
         if self.busy {
             // Cut off: book what the run did so far.
             let main = crate::rpc::Tally::main(&self.cfg.home);

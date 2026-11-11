@@ -77,8 +77,12 @@ enum Event {
     Hangup(&'static str),
     /// What whisper made of one utterance.
     Heard(Heard),
-    /// One line Piper spoke, or could not.
+    /// One line Piper spoke, or could not; with Telnyx's speech, one it took (no audio).
     Spoken(Say, Option<Vec<u8>>),
+    /// Telnyx's `call.speak.ended`: the line it was speaking has played.
+    SpeakEnded,
+    /// The daemon is stopping: the call is closed properly first.
+    Stopping,
 }
 
 /// One line for Piper.
@@ -147,7 +151,9 @@ impl Calls {
         if calls.port.is_none() || calls.media_url.is_none() {
             return Err("set [calls] port and media_url, where Telnyx reaches zephyr".into());
         }
-        if !floored(cfg) || !crate::voice::floored(cfg) {
+        // The listener always; the voice programs only when they do the speech.
+        let local = calls.speech == "local";
+        if !floored(cfg) || (local && !crate::voice::floored(cfg)) {
             return Err(
                 "phone calls need the network floor (host.toml network = \"bridge\")".into(),
             );
@@ -226,18 +232,47 @@ impl Calls {
         Some(slot.tx.clone())
     }
 
-    /// A verified webhook about the provider's call `provider_ref`.
-    fn event(&self, provider_ref: &str, kind: &str) {
+    /// A verified webhook.
+    fn event(&self, hook: telnyx::Hook) {
         let live = self.lock();
-        let Some(slot) = (live.values()).find(|s| s.provider_ref.as_deref() == Some(provider_ref))
+        let Some(slot) = (live.values()).find(|s| s.provider_ref.as_deref() == Some(&hook.call))
         else {
             return;
         };
-        let _ = match kind {
-            "call.answered" => slot.tx.send(Event::Answered),
-            "call.hangup" => slot.tx.send(Event::TheirHangup),
+        let _ = match (hook.kind.as_str(), hook.transcript) {
+            ("call.answered", _) => slot.tx.send(Event::Answered),
+            ("call.hangup", _) => slot.tx.send(Event::TheirHangup),
+            ("call.speak.ended", _) => slot.tx.send(Event::SpeakEnded),
+            // What Telnyx heard the other party say: text, as whisper's would be.
+            ("call.transcription", Some(text)) => slot.tx.send(Event::Heard(Heard::Said {
+                lang: String::new(),
+                text,
+            })),
             _ => Ok(()),
         };
+    }
+
+    /// The provider's id of call `id`, once it was dialled.
+    fn provider_ref(&self, id: i64) -> Option<String> {
+        self.lock().get(&id)?.provider_ref.clone()
+    }
+
+    /// The daemon is stopping or about to re-exec: each call says its closing line and is
+    /// hung up. `drained` tells when they are all over.
+    pub fn stop_all(&self) {
+        for slot in self.lock().values() {
+            let _ = slot.tx.send(Event::Stopping);
+        }
+    }
+
+    /// Waits, at most `limit`, until no call is in progress.
+    pub async fn drained(&self, limit: Duration) {
+        let over = async {
+            while !self.lock().is_empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        let _ = tokio::time::timeout(limit, over).await;
     }
 
     fn set_ref(&self, id: i64, provider_ref: &str) {
@@ -357,6 +392,9 @@ async fn serve(cfgs: watch::Receiver<Arc<Config>>, calls: Calls) {
         }
     };
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
+    // One client for every request: it keeps Telnyx's public key until the vault changes, so
+    // a stranger's request costs no file read and no new HTTP client.
+    let telnyx = Telnyx::new(&cfg);
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -365,11 +403,14 @@ async fn serve(cfgs: watch::Receiver<Arc<Config>>, calls: Calls) {
         let Ok(slot) = slots.clone().try_acquire_owned() else {
             continue; // dropped, so closed at once
         };
-        let (cfgs, calls) = (cfgs.clone(), calls.clone());
+        let (cfgs, calls, telnyx) = (cfgs.clone(), calls.clone(), telnyx.clone());
         tokio::spawn(async move {
             let svc = hyper::service::service_fn(move |req| {
-                let (cfg, calls) = (cfgs.borrow().clone(), calls.clone());
-                async move { Ok::<_, std::convert::Infallible>(handle(req, &cfg, &calls).await) }
+                let (cfg, calls, telnyx) = (cfgs.borrow().clone(), calls.clone(), telnyx.clone());
+                async move {
+                    let res = handle(req, &cfg, &calls, &telnyx).await;
+                    Ok::<_, std::convert::Infallible>(res)
+                }
             });
             let _ = hyper::server::conn::http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())
@@ -384,16 +425,26 @@ async fn serve(cfgs: watch::Receiver<Arc<Config>>, calls: Calls) {
 
 /// One request: Telnyx's media socket for a waiting call, or one of its webhooks; anything
 /// else, and anything not signed by Telnyx, gets a status and nothing more.
-async fn handle(mut req: Request<Incoming>, cfg: &Config, calls: &Calls) -> Res {
+async fn handle(mut req: Request<Incoming>, cfg: &Config, calls: &Calls, telnyx: &Telnyx) -> Res {
     let path = req.uri().path().to_string();
+    // The path and the headers first: what is not for a waiting call or the events path, or
+    // carries no signature, is answered before anything is read or allocated for it.
+    let events = req.method() == Method::POST && path == "/calls/events";
+    let waiting = req.method() == Method::GET
+        && (path.strip_prefix("/calls/")).is_some_and(|token| calls.waiting(token));
+    if !events && !waiting {
+        return status(StatusCode::NOT_FOUND);
+    }
     let head = |name: &str| {
         let value = req.headers().get(name).and_then(|v| v.to_str().ok());
         value.unwrap_or_default().to_string()
     };
     let (stamp, signature) = (head("telnyx-timestamp"), head("telnyx-signature-ed25519"));
-    let telnyx = Telnyx::new(cfg);
+    if stamp.is_empty() || signature.is_empty() {
+        return status(StatusCode::FORBIDDEN);
+    }
     let now = crate::now();
-    if req.method() == Method::POST && path == "/calls/events" {
+    if events {
         let Ok(body) = Limited::new(req.into_body(), MAX_EVENT).collect().await else {
             return status(StatusCode::PAYLOAD_TOO_LARGE);
         };
@@ -401,8 +452,8 @@ async fn handle(mut req: Request<Incoming>, cfg: &Config, calls: &Calls) -> Res 
         if !telnyx.verify(&stamp, &signature, &body, now) {
             return status(StatusCode::FORBIDDEN);
         }
-        if let Some((kind, call)) = telnyx::event(&body) {
-            calls.event(&call, &kind);
+        if let Some(hook) = telnyx::event(&body) {
+            calls.event(hook);
         }
         return status(StatusCode::OK);
     }
@@ -502,6 +553,12 @@ struct Live<'a> {
     hearing: mpsc::UnboundedSender<Vec<i16>>,
     /// Lines given to Piper that have not come back.
     speaking: usize,
+    /// Telnyx transcribes and speaks (`calls.speech = "provider"`): no socket, no audio here.
+    provider: bool,
+    /// With Telnyx's speech, the lines it has not finished speaking, oldest first, and when
+    /// they should be over even if no `call.speak.ended` comes.
+    spoken_queue: std::collections::VecDeque<String>,
+    spoken_until: Instant,
     /// The marks Telnyx has not echoed: audio still playing. `true` for a line of the daemon's.
     playing: HashMap<String, bool>,
     marks: u64,
@@ -527,10 +584,20 @@ impl<'a> Live<'a> {
         let (hearing, mut utterances) = mpsc::unbounded_channel::<Vec<i16>>();
         // Piper and whisper each run in a task of their own, one line at a time, so the call's
         // own loop is never waiting on them when a hang-up comes.
+        let provider = cfg.calls().speech != "local";
         let (voice_cfg, lang, tx) = (cfg.clone(), s.ask.language.clone(), s.tx.clone());
+        let (telnyx, registry, id) = (Telnyx::new(&cfg), calls.clone(), s.id);
         tokio::spawn(async move {
             while let Some(say) = lines.recv().await {
-                let audio = crate::voice::say_call(&voice_cfg, &say.text, &lang).await;
+                let audio = match (provider, registry.provider_ref(id)) {
+                    (false, _) => crate::voice::say_call(&voice_cfg, &say.text, &lang).await,
+                    // Telnyx speaks it, after what it was given before: only text goes out.
+                    (true, Some(call)) => {
+                        let asked = telnyx.speak(&call, &say.text, &lang).await;
+                        asked.ok().map(|()| Vec::new())
+                    }
+                    (true, None) => None,
+                };
                 if tx.send(Event::Spoken(say, audio)).is_err() {
                     break;
                 }
@@ -572,6 +639,9 @@ impl<'a> Live<'a> {
             mouth,
             hearing,
             speaking: 0,
+            provider,
+            spoken_queue: Default::default(),
+            spoken_until: now,
             playing: HashMap::new(),
             marks: 0,
             closing_mark: None,
@@ -694,10 +764,23 @@ impl<'a> Live<'a> {
         let Some(base) = self.cfg.calls().media_url else {
             return ("failed", "calls.media_url is not set".into());
         };
+        // A `/hangup`, `/stop` or `/pause` that came while the agent was starting: nobody is
+        // rung for a call the owner already ended.
+        while let Ok(ev) = self.rx.try_recv() {
+            match ev {
+                Event::Hangup(why) => return ("ended", why.into()),
+                Event::Stopping => return ("ended", "zephyr stopping".into()),
+                _ => {}
+            }
+        }
+        if self.store.pause_reason().map_or(true, |p| p.is_some()) {
+            return ("ended", "a pause".into());
+        }
         let cap = self.cfg.calls_minute * self.cfg.calls().max_minutes as u32;
         let dial = Dial {
             to: n.e164.clone(),
-            stream_url: format!("{base}/calls/{}", self.token),
+            // With Telnyx's own speech no audio comes here: only its signed events do.
+            stream_url: (!self.provider).then(|| format!("{base}/calls/{}", self.token)),
             events_url: format!("{}/calls/events", base.replacen("wss://", "https://", 1)),
             // Telnyx's own limit, a little past the daemon's: a backstop if the daemon dies.
             limit_secs: cap.as_secs() + 30,
@@ -750,7 +833,8 @@ impl<'a> Live<'a> {
         if self.ending.is_some() {
             return None;
         }
-        if !closing || self.answered.is_none() || self.socket.is_none() {
+        let mute = !self.provider && self.socket.is_none();
+        if !closing || self.answered.is_none() || mute {
             return Some(("ended", by.to_string()));
         }
         self.ending = Some((by.to_string(), Instant::now() + CLOSING_WAIT));
@@ -786,6 +870,12 @@ impl<'a> Live<'a> {
                 self.last_sound = Instant::now();
                 let _ = self.store.call_answered(self.id);
                 self.audit("answered");
+                if let (true, Some(call)) = (self.provider, self.provider_ref.clone()) {
+                    // Telnyx hears for the daemon: without it the call would be deaf.
+                    if let Err(e) = self.telnyx.transcribe(&call, &self.ask.language).await {
+                        return Some(("failed", format!("Telnyx could not transcribe it: {e}")));
+                    }
+                }
                 // The daemon's words come first, whatever the agent goes on to say.
                 self.say("zephyr", super::opening(&self.cfg, &self.ask, true), false);
                 let brief = super::brief(&self.ask);
@@ -796,6 +886,11 @@ impl<'a> Live<'a> {
             // and the line going dead.
             Event::Hangup(why) => Some(("ended", why.into())),
             Event::TheirHangup => Some(("ended", "the other party".into())),
+            Event::Stopping => self.end("zephyr stopping", true),
+            Event::SpeakEnded => match self.spoken_queue.pop_front() {
+                Some(mark) => self.played(&mark),
+                None => None,
+            },
             Event::Heard(heard) => {
                 self.unheard = self.unheard.saturating_sub(1);
                 self.heard(heard).await
@@ -902,6 +997,11 @@ impl<'a> Live<'a> {
     /// has not allowed for this number (DESIGN §4.18): read with the end of what was said
     /// before it, so a value said in two halves is found too.
     async fn speak_checked(&mut self, sentence: String) {
+        // Exactly the text that will be spoken, whoever speaks it: markdown marks and
+        // addresses are gone before the check, so a number they split is whole again.
+        let Some(sentence) = crate::voice::speakable(&sentence) else {
+            return;
+        };
         let mode = crate::approvals::effective(&self.cfg).facts;
         let target = self.ask.number.target();
         let names: Result<Vec<String>, ()> = match mode {
@@ -975,22 +1075,41 @@ impl<'a> Live<'a> {
             };
         };
         self.line(say.who, &say.text, None);
-        for chunk in audio.chunks(CHUNK) {
-            self.send(telnyx::media(chunk)).await;
-        }
         self.marks += 1;
         let mark = format!("m{}", self.marks);
-        self.send(telnyx::mark(&mark)).await;
+        // How long the line takes to say: μ-law at 8 kHz is a byte a sample; Telnyx's own
+        // speech is guessed from the text, generously.
+        let length = match self.provider {
+            true => Duration::from_millis(100 * say.text.chars().count() as u64),
+            false => Duration::from_millis(audio.len() as u64 / 8),
+        } + Duration::from_secs(5);
+        if self.provider {
+            self.spoken_queue.push_back(mark.clone());
+            self.spoken_until = self.spoken_until.max(Instant::now()) + length;
+        } else {
+            for chunk in audio.chunks(CHUNK) {
+                self.send(telnyx::media(chunk)).await;
+            }
+            self.send(telnyx::mark(&mark)).await;
+        }
         self.playing.insert(mark.clone(), say.who == "zephyr");
         if say.closing {
-            // μ-law at 8 kHz is a byte a sample: the line's own length, and some slack.
-            let length = Duration::from_millis(audio.len() as u64 / 8) + Duration::from_secs(5);
             if let Some((_, at)) = self.ending.as_mut() {
                 *at = Instant::now() + length.min(CLOSING_WAIT);
             }
             self.closing_mark = Some(mark);
         }
         None
+    }
+
+    /// The line marked `name` has played: the closing line's end is the hang-up.
+    fn played(&mut self, name: &str) -> Option<End> {
+        self.playing.remove(name);
+        self.last_sound = Instant::now();
+        match self.closing_mark.as_deref() == Some(name) {
+            true => self.ending.take().map(|(by, _)| ("ended", by)),
+            false => None,
+        }
     }
 
     async fn send(&mut self, frame: String) {
@@ -1022,14 +1141,7 @@ impl<'a> Live<'a> {
         };
         match telnyx::frame(&text) {
             Some(Frame::Stop) => Some(("ended", "the other party".into())),
-            Some(Frame::Mark(name)) => {
-                self.playing.remove(&name);
-                self.last_sound = Instant::now();
-                match self.closing_mark.as_deref() == Some(name.as_str()) {
-                    true => self.ending.take().map(|(by, _)| ("ended", by)),
-                    false => None,
-                }
-            }
+            Some(Frame::Mark(name)) => self.played(&name),
             // Before the answer this is ringing, and once the call is ending nobody listens.
             Some(Frame::Media(audio)) if self.answered.is_some() && self.ending.is_none() => {
                 for sound in self.ear.push(&audio) {
@@ -1067,6 +1179,10 @@ impl<'a> Live<'a> {
         if self.last_flush.elapsed() >= self.cfg.tick {
             self.flush();
         }
+        // The cap is absolute: at it the line goes dead, a closing line half said or not.
+        if self.answered.is_some_and(|at| at.elapsed() >= cap) {
+            return Some(("ended", "the time cap".into()));
+        }
         if let Some((by, at)) = &self.ending {
             return (Instant::now() >= *at).then(|| ("ended", by.clone()));
         }
@@ -1075,11 +1191,13 @@ impl<'a> Live<'a> {
                 .then(|| ("failed", "nobody answered".into()));
         };
         let talked = answered.elapsed();
-        if self.socket.is_none() && talked >= SOCKET_WAIT {
+        if !self.provider && self.socket.is_none() && talked >= SOCKET_WAIT {
             return Some(("failed", "Telnyx did not connect the call's audio".into()));
         }
-        if talked >= cap {
-            return Some(("ended", "the time cap".into()));
+        // A `call.speak.ended` that never came does not keep the line "speaking" for ever.
+        if self.provider && !self.playing.is_empty() && Instant::now() >= self.spoken_until {
+            self.spoken_queue.clear();
+            self.playing.clear();
         }
         if talked + CLOSING_LEAD.min(cap / 2) >= cap {
             return self.end("the time cap", true);
@@ -1169,6 +1287,11 @@ impl<'a> Live<'a> {
         if let Some(child) = self.child.take() {
             child.stop().await;
         }
+        // The call's own session is not kept: it holds what the other party said as `user`
+        // messages and every sentence of the agent's as it wrote it, a held one with the
+        // private fact in it, in a folder the agent can read. The scrubbed transcript in
+        // state.db is the record.
+        crate::retention::remove_session(&self.cfg, &self.session());
     }
 }
 

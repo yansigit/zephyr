@@ -24,6 +24,22 @@
 //!   Mission Control Portal, API keys), "the same key pair Telnyx uses for webhook
 //!   signatures", where the signed string is `{timestamp}|{body}`.
 //!
+//! - Telnyx's own speech (`calls.speech = "provider"`), read on 2026-11-11:
+//!   - Speak: `POST /v2/calls/{call_control_id}/actions/speak`,
+//!     <https://developers.telnyx.com/api-reference/call-commands/speak-text>: `payload` (text,
+//!     at most 3000 characters), `voice` (`AWS.Polly.<VoiceId>`, `-Neural` for a neural
+//!     voice), `language` (`en-US`, `fr-CA`, `ko-KR` among them; ignored for a Polly voice,
+//!     which has its own). Consecutive speak commands are queued, not interrupted; the
+//!     webhooks are `call.speak.started` and `call.speak.ended`.
+//!   - Transcription: `POST /v2/calls/{call_control_id}/actions/transcription_start`,
+//!     <https://developers.telnyx.com/api-reference/call-commands/transcription-start>:
+//!     `transcription_engine` (`Telnyx` here: its config takes `language` `en`, `fr`, `ko`
+//!     and sends final results only), `transcription_tracks` (`inbound`). Results come as
+//!     `call.transcription` webhooks; transcription stops at the hang-up.
+//!
+//!   The text goes through the daemon both ways, exactly as with whisper and Piper: only who
+//!   turns sound into text and back changes. Telnyx then hears the call's audio.
+//!
 //! `ASSUMPTION(live)` marks what the documentation leaves open and a first real call must
 //! confirm.
 
@@ -58,6 +74,19 @@ pub trait Telephony {
     /// events to `events_url`. Returns the provider's id for the call.
     fn dial(&self, d: &Dial) -> impl std::future::Future<Output = Result<String, String>> + Send;
     fn hangup(&self, call: &str) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    /// Speaks `text` on the call in `language` (`en`, `fr`, `ko`), after what was asked before.
+    fn speak(
+        &self,
+        call: &str,
+        text: &str,
+        language: &str,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    /// Starts transcribing what the other party says, in `language`.
+    fn transcribe(
+        &self,
+        call: &str,
+        language: &str,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
     /// Presses one key (`0-9`, `*`, `#`) in a phone menu.
     fn dtmf(
         &self,
@@ -73,8 +102,9 @@ pub trait Telephony {
 pub struct Dial {
     /// `+14165550123`.
     pub to: String,
-    /// `wss://host/calls/<token>`: exactly what Telnyx signs.
-    pub stream_url: String,
+    /// `wss://host/calls/<token>`: exactly what Telnyx signs. `None` when Telnyx does the
+    /// speech itself: then no audio is streamed to the daemon at all.
+    pub stream_url: Option<String>,
     /// `https://host/calls/events`.
     pub events_url: String,
     /// The provider ends the call itself after this long: a backstop behind the daemon's cap.
@@ -87,6 +117,20 @@ pub struct Dial {
 pub struct Telnyx {
     vault: PathBuf,
     http: reqwest::Client,
+    /// The account's public key as the vault had it when the file was last changed: a request
+    /// on the public listener is checked without reading the vault again.
+    public_key: std::sync::Arc<Mutex<Option<(std::time::SystemTime, String)>>>,
+}
+
+/// The voice and the language tag Telnyx speaks a call's language with: Amazon Polly's neural
+/// voices, Canadian for French.
+/// ASSUMPTION(live): these voice ids are offered on the owner's Telnyx account.
+fn voice(language: &str) -> (&'static str, &'static str) {
+    match language {
+        "fr" => ("AWS.Polly.Gabrielle-Neural", "fr-CA"),
+        "ko" => ("AWS.Polly.Seoyeon-Neural", "ko-KR"),
+        _ => ("AWS.Polly.Joanna-Neural", "en-US"),
+    }
 }
 
 /// Why a call cannot be placed at all.
@@ -101,6 +145,7 @@ impl Telnyx {
             vault: crate::vault::path(cfg),
             // The builder fails only when the TLS backend cannot start, as `Client::new` would.
             http: http.unwrap_or_default(),
+            public_key: Default::default(),
         }
     }
 
@@ -119,6 +164,23 @@ impl Telnyx {
             && s.from.starts_with('+')
             && !s.public_key.is_empty();
         whole.then_some(s).ok_or_else(|| NOT_SET_UP.into())
+    }
+
+    /// The key Telnyx signs with, read from the vault only when the file changed since the
+    /// last time. `None` when there is no usable service.
+    fn public_key(&self) -> Option<String> {
+        let changed = std::fs::metadata(&self.vault)
+            .and_then(|m| m.modified())
+            .ok()?;
+        let mut cached = self.public_key.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, key)) = cached.as_ref() {
+            if *at == changed {
+                return Some(key.clone());
+            }
+        }
+        let key = self.service().ok()?.public_key;
+        *cached = Some((changed, key.clone()));
+        Some(key)
     }
 
     /// The caller id calls go out with.
@@ -163,20 +225,22 @@ impl Telnyx {
 impl Telephony for Telnyx {
     async fn dial(&self, d: &Dial) -> Result<String, String> {
         let s = self.service()?;
-        let body = json!({
+        let mut body = json!({
             "connection_id": s.account,
             "to": d.to,
             "from": s.from,
             "timeout_secs": RING_SECS,
             "time_limit_secs": d.limit_secs.max(30),
-            "stream_url": d.stream_url,
-            "stream_track": "inbound_track",
-            "stream_bidirectional_mode": "rtp",
-            "stream_bidirectional_codec": "PCMU",
             // ASSUMPTION(live): the call's events go to this address rather than the
             // connection's own webhook URL, and a POST is the default method.
             "webhook_url": d.events_url,
         });
+        if let Some(stream_url) = &d.stream_url {
+            body["stream_url"] = json!(stream_url);
+            body["stream_track"] = json!("inbound_track");
+            body["stream_bidirectional_mode"] = json!("rtp");
+            body["stream_bidirectional_codec"] = json!("PCMU");
+        }
         let answer = self.post(&["calls"], body).await?;
         (answer["data"]["call_control_id"].as_str())
             .filter(|id| !id.is_empty())
@@ -189,6 +253,30 @@ impl Telephony for Telnyx {
         self.post(&path, json!({})).await.map(|_| ())
     }
 
+    async fn speak(&self, call: &str, text: &str, language: &str) -> Result<(), String> {
+        let (voice, tag) = voice(language);
+        let path = ["calls", call, "actions", "speak"];
+        let body = json!({
+            "payload": text,
+            "payload_type": "text",
+            "voice": voice,
+            "language": tag,
+        });
+        self.post(&path, body).await.map(|_| ())
+    }
+
+    async fn transcribe(&self, call: &str, language: &str) -> Result<(), String> {
+        let path = ["calls", call, "actions", "transcription_start"];
+        let body = json!({
+            "transcription_engine": "Telnyx",
+            "transcription_engine_config": { "language": language },
+            // ASSUMPTION(live): on a dialled call `inbound` is what the other party says, as
+            // `inbound_track` is for a media stream.
+            "transcription_tracks": "inbound",
+        });
+        self.post(&path, body).await.map(|_| ())
+    }
+
     async fn dtmf(&self, call: &str, digit: char) -> Result<(), String> {
         let path = ["calls", call, "actions", "send_dtmf"];
         let body = json!({ "digits": digit.to_string() });
@@ -196,10 +284,14 @@ impl Telephony for Telnyx {
     }
 
     fn verify(&self, timestamp: &str, signature: &str, signed: &[u8], now: i64) -> bool {
-        let Ok(s) = self.service() else {
+        // Nothing is read for a request that carries no signature at all.
+        if timestamp.is_empty() || signature.is_empty() {
+            return false;
+        }
+        let Some(key) = self.public_key() else {
             return false;
         };
-        verify(&s.public_key, timestamp, signature, signed, now)
+        verify(&key, timestamp, signature, signed, now)
     }
 }
 
@@ -278,14 +370,33 @@ pub fn mark(name: &str) -> String {
 /// Stops what is playing and drops what is queued.
 pub const CLEAR: &str = r#"{"event":"clear"}"#;
 
-/// A webhook's `(event type, call id)`: `call.answered`, `call.hangup`.
+/// One webhook: its event type (`call.answered`, `call.hangup`, `call.speak.ended`,
+/// `call.transcription`), the call it is about, and for a transcription what was said.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Hook {
+    pub kind: String,
+    pub call: String,
+    /// A final transcript of something the other party said; `None` for an interim one.
+    pub transcript: Option<String>,
+}
+
+/// Reads a webhook's body.
 /// ASSUMPTION(live): the envelope is `data.event_type` and `data.payload.call_control_id`, as
-/// Telnyx's webhook examples show.
-pub fn event(body: &[u8]) -> Option<(String, String)> {
+/// Telnyx's webhook examples show, and a transcription carries
+/// `data.payload.transcription_data.{transcript, is_final}` (the transcription page does not
+/// print the payload).
+pub fn event(body: &[u8]) -> Option<Hook> {
     let v: Value = serde_json::from_slice(body).ok()?;
-    let kind = v["data"]["event_type"].as_str()?;
-    let call = v["data"]["payload"]["call_control_id"].as_str()?;
-    Some((kind.to_string(), call.to_string()))
+    let payload = &v["data"]["payload"];
+    let said = &payload["transcription_data"];
+    let transcript = (said["transcript"].as_str())
+        .filter(|t| said["is_final"] != false && !t.trim().is_empty())
+        .map(String::from);
+    Some(Hook {
+        kind: v["data"]["event_type"].as_str()?.to_string(),
+        call: payload["call_control_id"].as_str()?.to_string(),
+        transcript,
+    })
 }
 
 #[cfg(test)]
@@ -352,10 +463,22 @@ pub(crate) mod tests {
         let body =
             r#"{"data":{"event_type":"call.answered","payload":{"call_control_id":"v3:a"}}}"#;
         assert!(check(&stamp, &telnyx.sign(now, body), body));
+        let hook = event(body.as_bytes()).unwrap();
         assert_eq!(
-            event(body.as_bytes()),
-            Some(("call.answered".into(), "v3:a".into()))
+            (hook.kind.as_str(), hook.call.as_str(), hook.transcript),
+            ("call.answered", "v3:a", None)
         );
+        // A transcription carries what was said, once it is final.
+        let said = |is_final: bool| {
+            format!(
+                r#"{{"data":{{"event_type":"call.transcription","payload":{{"call_control_id":"v3:a","transcription_data":{{"transcript":"Seven is full","is_final":{is_final},"confidence":0.9}}}}}}}}"#
+            )
+        };
+        assert_eq!(
+            event(said(true).as_bytes()).unwrap().transcript.as_deref(),
+            Some("Seven is full")
+        );
+        assert_eq!(event(said(false).as_bytes()).unwrap().transcript, None);
         assert!(
             !verify("", &stamp, &telnyx.sign(now, "x"), b"x", now),
             "no key"
@@ -430,7 +553,7 @@ pub(crate) mod tests {
         let telnyx = Telnyx::load(&cfg).unwrap();
         let dial = Dial {
             to: "+14165550123".into(),
-            stream_url: URL.into(),
+            stream_url: Some(URL.into()),
             events_url: "https://box.example.ts.net/calls/events".into(),
             limit_secs: 330,
         };
@@ -484,6 +607,91 @@ pub(crate) mod tests {
         assert_eq!(telnyx.hangup("x").await.unwrap_err(), NOT_SET_UP);
         assert!(Telnyx::load(&cfg).is_err());
         assert!(!format!("{:?}", Telnyx::load(&cfg).err()).contains(KEY));
+    }
+
+    /// With Telnyx's own speech the dial asks for no stream, and speaking and transcribing
+    /// are two more Call Control requests that carry only text and a language.
+    #[tokio::test]
+    async fn provider_speech_dials_without_a_stream_and_speaks_by_request() {
+        let body_of = |request: String| -> Value {
+            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
+        };
+        let (api, served) = stub(200, r#"{"data":{"call_control_id":"v3:abc"}}"#).await;
+        let cfg = with_service("telnyx-speech-dial", &api, "cHVi");
+        let dial = Dial {
+            to: "+15145550123".into(),
+            stream_url: None,
+            events_url: "https://box.example.ts.net/calls/events".into(),
+            limit_secs: 330,
+        };
+        Telnyx::load(&cfg).unwrap().dial(&dial).await.unwrap();
+        let body = body_of(served.await.unwrap());
+        assert!(body.get("stream_url").is_none() && body.get("stream_track").is_none());
+        assert!(body.get("record").is_none());
+        assert_eq!(
+            body["webhook_url"],
+            "https://box.example.ts.net/calls/events"
+        );
+
+        let (api, served) = stub(200, r#"{"data":{"result":"ok"}}"#).await;
+        let cfg = with_service("telnyx-speech-speak", &api, "cHVi");
+        let telnyx = Telnyx::load(&cfg).unwrap();
+        telnyx.speak("v3:abc", "Bonjour.", "fr").await.unwrap();
+        let request = served.await.unwrap();
+        assert!(request.starts_with("POST /v2/calls/v3:abc/actions/speak HTTP/1.1"));
+        assert_eq!(
+            body_of(request),
+            json!({"payload": "Bonjour.", "payload_type": "text",
+                   "voice": "AWS.Polly.Gabrielle-Neural", "language": "fr-CA"})
+        );
+        assert_eq!(voice("en"), ("AWS.Polly.Joanna-Neural", "en-US"));
+        assert_eq!(voice("ko"), ("AWS.Polly.Seoyeon-Neural", "ko-KR"));
+
+        let (api, served) = stub(200, r#"{"data":{"result":"ok"}}"#).await;
+        let cfg = with_service("telnyx-speech-hear", &api, "cHVi");
+        let telnyx = Telnyx::load(&cfg).unwrap();
+        telnyx.transcribe("v3:abc", "ko").await.unwrap();
+        let request = served.await.unwrap();
+        assert!(request.starts_with("POST /v2/calls/v3:abc/actions/transcription_start HTTP/1.1"));
+        assert_eq!(
+            body_of(request),
+            json!({"transcription_engine": "Telnyx",
+                   "transcription_engine_config": {"language": "ko"},
+                   "transcription_tracks": "inbound"})
+        );
+    }
+
+    /// The listener's check reads the vault only when the file changed (review finding 10).
+    #[test]
+    fn the_public_key_is_read_again_only_when_the_vault_changes() {
+        let (first, second) = (Signer::new(), Signer::new());
+        let cfg = with_service("telnyx-key-cache", "", &first.public());
+        let telnyx = Telnyx::new(&cfg);
+        let now = 1_800_000_100;
+        let check =
+            |by: &Signer, at: i64| telnyx.verify(&at.to_string(), &by.sign(at, "x"), b"x", now);
+        assert!(check(&first, now));
+        // No signature: refused before anything is read.
+        assert!(!telnyx.verify("", "", b"x", now));
+        // The owner saves another key: the file changed, so it is read again.
+        let mut vault = crate::vault::Vault::load(&crate::vault::path(&cfg)).unwrap();
+        let mut service = vault.service(SERVICE).unwrap();
+        service.public_key = second.public();
+        vault.put_service(service).unwrap();
+        let path = crate::vault::path(&cfg);
+        std::fs::write(&path, vault.to_string()).unwrap();
+        let later = std::time::SystemTime::now() + Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert!(check(&second, now - 1));
+        assert!(!check(&first, now - 2), "the old key is no longer Telnyx's");
+        // The vault gone: nothing verifies.
+        std::fs::remove_file(&path).unwrap();
+        assert!(!check(&second, now - 3));
     }
 
     #[test]

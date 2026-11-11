@@ -57,9 +57,19 @@ pub fn sweep(cfg: &Config, store: &Store, age: Duration) -> rusqlite::Result<usi
     for d in std::iter::once(dir.clone()).chain(subdirs(&dir)) {
         gone += remove_old(&d, age, |name| {
             session_of(name).is_some_and(|s| {
-                let run = s.starts_with("job-") || s.starts_with("task-") || s.starts_with("call-");
+                let run = s.starts_with("job-") || s.starts_with("task-");
                 run && !sessions.contains(s)
             })
+        });
+    }
+    // A call's session a crash left behind (a call that ends removes its own): gone by
+    // `calls.keep_days`, as its transcript is, and never while its call is in progress.
+    let live: HashSet<i64> = (store.calls_open()?.iter()).map(|c| c.0).collect();
+    let kept = Duration::from_secs(cfg.calls().keep_days * 86_400).min(age);
+    for d in std::iter::once(dir.clone()).chain(subdirs(&dir)) {
+        gone += remove_old(&d, kept, |name| {
+            let call = session_of(name).and_then(|s| s.strip_prefix("call-"));
+            call.is_some_and(|id| id.parse().is_ok_and(|id: i64| !live.contains(&id)))
         });
     }
     gone += remove_old(&cfg.home.join(".procs"), age, |name| {
@@ -240,6 +250,18 @@ fn session_of(name: &str) -> Option<&str> {
     let name = name.strip_suffix(".lock").unwrap_or(name);
     let name = name.strip_suffix(".progress.jsonl").unwrap_or(name);
     Some(name.strip_suffix(".jsonl")?.split_once('_')?.1)
+}
+
+/// Removes session `id`'s file and its companions now, as the agent: a phone call's session
+/// (DESIGN §4.22), which is deleted when the call ends.
+pub fn remove_session(cfg: &Config, id: &str) -> usize {
+    let _fs = crate::agent::fs();
+    let dir = cfg.session_dir();
+    let mut gone = 0;
+    for d in std::iter::once(dir.clone()).chain(subdirs(&dir)) {
+        gone += remove_old(&d, Duration::ZERO, |name| session_of(name) == Some(id));
+    }
+    gone
 }
 
 /// The process id in `<id>.log`, `<id>.exit` or `<id>.exit.tmp` (`procs.rs`).

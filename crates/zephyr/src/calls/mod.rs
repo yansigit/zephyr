@@ -82,10 +82,13 @@ const AREAS: &[(&[u16], &str, Zones)] = &[
     // Toll-free: where it rings is unknown, so the whole country's clocks count.
     (
         &[800, 833, 844, 855, 866, 877, 888],
-        "toll-free",
+        TOLL_FREE,
         &[PACIFIC, NEWFOUNDLAND],
     ),
 ];
+
+/// The "province" of a toll-free number, which is refused unless `calls.toll_free` is on.
+const TOLL_FREE: &str = "toll-free";
 
 /// A number that may be called.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,33 +193,73 @@ pub fn hours(n: &Number, now: i64) -> Result<(), String> {
     Ok(())
 }
 
-/// Words that name an emergency service or a healthcare facility (s.4(a)): a call that says it
-/// is to one is refused. A clinic's number looks like a shop's, so this catches only the calls
-/// that say so; the card asks the owner, and the call child refuses too.
+/// Words that name an emergency service or a healthcare facility (s.4(a)), in English, French
+/// and Korean: a call that says it is to one is refused. A clinic's number looks like a shop's,
+/// so this catches only the calls that say so; the card asks the owner, and the call child
+/// refuses too. Compared after `fold`, so written here without accents.
 const HEALTH: &[&str] = &[
     "hospital",
+    "hopital",
+    "hospice",
     "clinic",
+    "clinique",
+    "clsc",
+    "chsld",
     "doctor",
+    "docteur",
+    "medecin",
     "physician",
+    "surgeon",
+    "surgery",
+    "nurse",
+    "infirmier",
     "dentist",
     "dental",
-    "pharmacy",
+    "pharmac",
     "medical",
     "health",
+    "sante",
     "ambulance",
     "paramedic",
-    "emergency",
-    "911",
+    "emergenc",
+    "urgence",
     "urgent care",
+    "911",
+    "crisis",
+    "suicide",
+    "poison",
+    "police",
+    "fire department",
+    "pompier",
     "병원",
     "의원",
     "약국",
     "응급",
     "치과",
+    "경찰",
+    "소방",
 ];
 
-/// The languages a call can be held in, when the image has the voice (`voice::call_voice`).
-pub const LANGUAGES: [&str; 2] = ["en", "ko"];
+/// `text` as the healthcare words are looked for in it: compatibility forms unfolded (fullwidth
+/// letters), accents and every invisible character dropped (a soft hyphen, a zero-width
+/// space), lower case. The same fold is applied to each word of `HEALTH`.
+fn fold(text: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let shown = |c: &char| {
+        !unicode_normalization::char::is_combining_mark(*c)
+            && *c != '\u{ad}'
+            && !crate::facts::invisible(*c)
+    };
+    text.nfkd().filter(shown).collect::<String>().to_lowercase()
+}
+
+/// The languages a call can be held in. With the daemon's own speech (`calls.speech =
+/// "local"`) a language also needs its Piper voice in the image (`voice::call_voice`), and
+/// there is none for French.
+pub const LANGUAGES: [&str; 3] = ["en", "fr", "ko"];
+
+/// `calls.speech`'s values: Telnyx transcribes and speaks, or whisper and Piper do here.
+pub const SPEECH: [&str; 2] = ["provider", "local"];
 
 /// What a call is for, said in the opening line in the daemon's words, never the agent's.
 const KINDS: [&str; 3] = ["question", "booking", "request"];
@@ -254,26 +297,37 @@ pub fn check(cfg: &Config, args: &Value, now: i64) -> Result<Ask, String> {
         ));
     }
     let n = number(field("number").unwrap_or_default()).map_err(not_run)?;
+    // Toll-free numbers are one pool for Canada, the US and the Caribbean, and many are crisis
+    // or health lines: none is called unless the owner turned them on.
+    if n.province == TOLL_FREE && !calls.toll_free {
+        return Err(not_run(
+            "toll-free numbers are not called: they are shared with the US and the Caribbean, \
+             and many are crisis or health lines. Only the owner can turn calls.toll_free on"
+                .into(),
+        ));
+    }
     let purpose = field("purpose").filter(|p| !p.is_empty());
     let purpose = purpose.ok_or_else(|| not_run("a call needs a purpose".into()))?;
     let business = field("business").filter(|b| !b.is_empty());
     let language = field("language").filter(|l| !l.is_empty()).unwrap_or("en");
     if !LANGUAGES.contains(&language) {
         return Err(not_run(format!(
-            "calls are held in English or Korean, not {:?}",
+            "calls are held in English, French or Korean, not {:?}",
             crate::settings::one_line(language, 20)
         )));
     }
-    if !crate::voice::call_voice(cfg, language) {
+    if calls.speech == "local" && !crate::voice::call_voice(cfg, language) {
         return Err(not_run(format!(
-            "this image has no voice for {language} (Korean needs KO_VOICE=1)"
+            "this image has no voice for {language}: with calls.speech = local a call is in \
+             English, or Korean in an image built with KO_VOICE=1; French needs calls.speech \
+             = provider"
         )));
     }
     let kind = field("kind")
         .filter(|k| KINDS.contains(k))
         .unwrap_or("question");
-    let said = format!("{purpose} {}", business.unwrap_or_default()).to_lowercase();
-    if HEALTH.iter().any(|w| said.contains(w)) {
+    let said = fold(&format!("{purpose} {}", business.unwrap_or_default()));
+    if HEALTH.iter().any(|w| said.contains(&fold(w))) {
         return Err(not_run(
             "zephyr never calls an emergency line or a healthcare facility (CRTC ADAD rule \
              4(a)); the owner makes that call"
@@ -295,7 +349,14 @@ pub fn status(cfg: &Config) -> String {
     let calls = cfg.calls();
     match calls.provider {
         None => "calls: off (calls.provider is not set)".into(),
-        Some(provider) => format!("calls: {provider}, up to {} min each", calls.max_minutes),
+        Some(provider) => format!(
+            "calls: {provider}, up to {} min each, speech by {}",
+            calls.max_minutes,
+            match calls.speech.as_str() {
+                "local" => "whisper and Piper here",
+                _ => "Telnyx",
+            }
+        ),
     }
 }
 
@@ -342,18 +403,27 @@ pub fn doctor(cfg: &Config) -> Vec<String> {
          on the host: Telnyx connects from the internet",
     );
     check(
-        live::floored(cfg) && crate::voice::floored(cfg),
+        live::floored(cfg),
         "the listener is out of the agent's reach",
         "phone calls need the network floor (host.toml network = \"bridge\")",
     );
-    check(
-        crate::voice::call_voice(cfg, "en"),
-        match crate::voice::call_voice(cfg, "ko") {
-            true => "English and Korean voices are in this image",
-            false => "the English voice is in this image (Korean needs KO_VOICE=1)",
-        },
-        "this image has no voice (built with VOICE=0), so a call cannot speak",
-    );
+    match calls.speech.as_str() {
+        "local" => check(
+            crate::voice::call_voice(cfg, "en") && crate::voice::floored(cfg),
+            match crate::voice::call_voice(cfg, "ko") {
+                true => "whisper and Piper speak here, in English and Korean",
+                false => "whisper and Piper speak here, in English (Korean needs KO_VOICE=1)",
+            },
+            "calls.speech is local, and this image has no voice (built with VOICE=0) or no \
+             network floor, so a call cannot speak",
+        ),
+        _ => check(
+            true,
+            "Telnyx transcribes and speaks, in English, French and Korean; the text passes \
+             through zephyr both ways",
+            "",
+        ),
+    }
     // Nothing zephyr can see: the owner sets it in Telnyx's portal.
     lines.push(
         "ok   calls: the caller id must reach you (CRTC ADAD rule 4(e)): forward the number's \
@@ -383,6 +453,18 @@ pub fn opening(cfg: &Config, ask: &Ask, spoken: bool) -> String {
     let phone = if spoken { spoken_phone(&phone) } else { phone };
     let contact = c.contact_email.or(c.contact_address).unwrap_or_default();
     match ask.language.as_str() {
+        "fr" => {
+            let what = match ask.kind.as_str() {
+                "booking" => "pour faire une réservation",
+                "request" => "pour une demande",
+                _ => "pour poser une question",
+            };
+            format!(
+                "Bonjour, ici un assistant d'intelligence artificielle qui appelle de la part \
+                 de {name} {what}. Cet appel est transmis à {name} sous forme de texte. Vous \
+                 pouvez joindre {name} au {phone} ou à {contact}."
+            )
+        }
         "ko" => {
             let what = match ask.kind.as_str() {
                 "booking" => "예약을 하려고",
@@ -417,6 +499,10 @@ pub fn closing(cfg: &Config, language: &str) -> String {
     let phone = spoken_phone(&c.contact_phone.unwrap_or_default());
     let contact = c.contact_email.or(c.contact_address).unwrap_or_default();
     match language {
+        "fr" => format!(
+            "C'était un assistant d'intelligence artificielle qui appelait de la part de \
+             {name}. Vous pouvez joindre {name} au {phone} ou à {contact}. Merci, au revoir."
+        ),
         "ko" => format!(
             "{name} 님을 대신해 전화드린 인공지능 비서였습니다. {name} 님께는 {phone} 번 또는 \
              {contact} 로 연락하실 수 있습니다. 감사합니다. 안녕히 계세요."
@@ -431,6 +517,7 @@ pub fn closing(cfg: &Config, language: &str) -> String {
 /// Spoken in place of a sentence that held a private fact.
 pub fn held_line(language: &str) -> &'static str {
     match language {
+        "fr" => "Je ne peux pas communiquer cette information pendant cet appel.",
         "ko" => "그 내용은 이 통화에서 말씀드릴 수 없습니다.",
         _ => "That is something I can't share on this call.",
     }
@@ -706,16 +793,69 @@ pub(crate) mod tests {
                 "{business} {purpose}"
             );
         }
-        let french =
-            ask(json!({"number": "514-555-0123", "purpose": "réserver", "language": "fr"}));
-        assert!(french
-            .unwrap_err()
-            .starts_with("not run: calls are held in English or Korean"));
-        // Korean only with the Korean voice in the image.
+        // However it is written: fullwidth letters, a soft hyphen or a zero-width space inside
+        // the word, no accents, capitals; in French too.
+        for purpose in [
+            "ask the ｈｏｓｐｉｔａｌ about parking",
+            "ask the hos\u{ad}pital about parking",
+            "ask the cli\u{200b}nic about parking",
+            "ask the PHARMACY about a refill",
+            "demander à l'hôpital",
+            "demander a l'HOPITAL",
+            "appeler la clinique",
+            "appeler le CLSC",
+            "joindre l'infirmière",
+            "prendre rendez-vous chez le dentiste",
+            "appeler la pharmacie",
+            "une urgence",
+            "question de santé",
+            "ask the nurse",
+            "call the crisis line",
+            "call poison control",
+            "call the police",
+        ] {
+            let got = ask(json!({"number": "416-555-0123", "purpose": purpose}));
+            assert!(got.is_err_and(|e| e.contains("healthcare")), "{purpose}");
+        }
+        // A word that only resembles one is not one.
+        let delivery = json!({"number": "416-555-0123", "purpose": "book the urgent delivery"});
+        assert!(ask(delivery).is_ok());
+        // Telnyx's speech (the default) takes English, French and Korean; nothing else.
+        let french = json!({"number": "514-555-0123", "purpose": "réserver", "language": "fr"});
         let korean = json!({"number": "416-555-0123", "purpose": "예약", "language": "ko"});
+        assert_eq!(ask(french.clone()).unwrap().language, "fr");
+        assert_eq!(ask(korean.clone()).unwrap().language, "ko");
+        let german = ask(json!({"number": "416-555-0123", "purpose": "x", "language": "de"}));
+        assert!(german
+            .unwrap_err()
+            .starts_with("not run: calls are held in English, French or Korean"));
+        // The daemon's own speech needs the language's Piper voice: none for French, and
+        // Korean only in an image built with it.
+        let mut local = cfg.clone();
+        local.calls = local.calls.map(|mut c| {
+            c.speech = "local".into();
+            c
+        });
+        let ask = |v: Value| check(&local, &v, noon());
+        assert!(ask(french)
+            .unwrap_err()
+            .contains("French needs calls.speech = provider"));
         assert!(ask(korean.clone()).unwrap_err().contains("KO_VOICE=1"));
         std::fs::write(cfg.voice_dir.join("voices/ko_KR-kss-medium.onnx"), "").unwrap();
         assert_eq!(ask(korean).unwrap().language, "ko");
+        let ask = |v: Value| check(&cfg, &v, noon());
+        // Toll-free numbers are refused until the owner turns them on.
+        let free = json!({"number": "1-800-555-0123", "purpose": "ask about an order"});
+        assert!(ask(free.clone()).unwrap_err().contains("calls.toll_free"));
+        let mut on = cfg.clone();
+        on.calls = on.calls.map(|mut c| {
+            c.toll_free = true;
+            c
+        });
+        assert_eq!(
+            check(&on, &free, noon()).unwrap().number.province,
+            "toll-free"
+        );
         let late = check(
             &cfg,
             &json!({"number": "416-555-0123", "purpose": "book"}),
@@ -773,6 +913,16 @@ pub(crate) mod tests {
         assert!(opening(&cfg, &ask, true).contains("4 1 6 5 5 5 0 1 9 9"));
         let end = closing(&cfg, "en");
         assert!(end.contains("Aiden Yoon") && end.contains("aiden@example.com"));
+        ask.language = "fr".into();
+        let fr = opening(&cfg, &ask, false);
+        assert!(
+            fr.contains("intelligence artificielle")
+                && fr.contains("de la part de Aiden Yoon pour faire une réservation")
+                && fr.contains("416-555-0199 ou à aiden@example.com"),
+            "{fr}"
+        );
+        assert!(closing(&cfg, "fr").contains("Merci, au revoir."));
+        assert!(held_line("fr").starts_with("Je ne peux pas"));
         ask.language = "ko".into();
         let ko = opening(&cfg, &ask, false);
         assert!(
@@ -792,7 +942,10 @@ pub(crate) mod tests {
         ))
         .unwrap();
         cfg.voice_dir = home.join("no-voice");
-        assert_eq!(status(&cfg), "calls: telnyx, up to 3 min each");
+        assert_eq!(
+            status(&cfg),
+            "calls: telnyx, up to 3 min each, speech by Telnyx"
+        );
         let lines = doctor(&cfg);
         for part in [
             "warn calls: no complete Telnyx service in the vault",
@@ -800,7 +953,7 @@ pub(crate) mod tests {
             "warn calls: set calls.contact_phone",
             "warn calls: set [calls] port and media_url",
             "warn calls: phone calls need the network floor",
-            "warn calls: this image has no voice",
+            "ok   calls: Telnyx transcribes and speaks",
             "ok   calls: the caller id must reach you",
         ] {
             assert!(
@@ -823,7 +976,20 @@ pub(crate) mod tests {
         assert!(lines.contains(
             &"ok   calls: Telnyx reaches zephyr at wss://box.example.ts.net, port 7794".to_string()
         ));
-        assert!(lines.iter().any(|l| l.contains("Korean needs KO_VOICE=1")));
+        // With the daemon's own speech, the image's voices are what matters.
+        cfg.calls = cfg.calls.clone().map(|mut c| {
+            c.speech = "local".into();
+            c
+        });
+        let local = doctor(&cfg);
+        assert!(
+            local.iter().any(|l| l.contains("Korean needs KO_VOICE=1")),
+            "{local:#?}"
+        );
+        cfg.voice_dir = cfg.home.join("no-voice");
+        assert!(doctor(&cfg)
+            .iter()
+            .any(|l| l.starts_with("warn calls: calls.speech is local")));
         assert!(!lines.join("\n").contains("KEY0123456789telnyx"));
     }
 

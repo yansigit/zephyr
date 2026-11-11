@@ -19,7 +19,9 @@ keeps its state in DIR:
 
 API: `POST /v2/calls` answers {"data": {"call_control_id": "fake-<n>", ...}} and starts the
 script; `POST /v2/calls/<id>/actions/hangup` ends the call (the socket closes, a `call.hangup`
-webhook follows); `.../actions/send_dtmf` is logged. A request whose `Authorization` is not a
+webhook follows); `.../actions/send_dtmf` is logged. `.../actions/transcription_start` is logged.
+`.../actions/speak` (Telnyx's own speech) appends `ulaw:pcm:<payload>` to heard.ulaw, as the voice
+stand-ins make a spoken line look, and posts `call.speak.ended` (not with a DIR/no_speak_ended file). A request whose `Authorization` is not a
 Bearer token gets 401. With a DIR/api_fail file every dial gets 422 with the file's text as
 the error's detail.
 
@@ -34,6 +36,8 @@ Script steps (default script: `stream`, `answer`):
   say SECS      SECS of loud audio (a square wave), sent at once
   quiet SECS    SECS of silence, sent at once
   play FILE     FILE's bytes (μ-law, 8 kHz) in real time, then nothing
+  said TEXT     Telnyx heard the other party say TEXT: a signed `call.transcription` webhook
+                (Telnyx's own speech, `calls.speech = "provider"`)
   wait SECS     sleep
   expect TEXT   wait (up to 60 s) until what zephyr said on the line holds TEXT
   hangup        the other party hangs up: `stop` on the socket, it closes, `call.hangup` is posted
@@ -127,9 +131,10 @@ def path_of(url):
 def host_of(url):
     return url.split("://", 1)[-1].split("/", 1)[0]
 
-def webhook(call, kind, how=""):
+def webhook(call, kind, how="", more=None):
+    payload = dict({"call_control_id": call["id"], "to": call["to"]}, **(more or {}))
     body = json.dumps({"data": {"record_type": "event", "event_type": kind, "id": "ev-%f" % time.time(),
-                                "payload": {"call_control_id": call["id"], "to": call["to"]}}}).encode()
+                                "payload": payload}}).encode()
     status = 0
     try:
         s = zephyr()
@@ -269,6 +274,9 @@ def run(call):
                 if call["over"].is_set():
                     break
                 stream.audio(data[i:i + 160]); time.sleep(0.02)
+        elif step[0] == "said":
+            webhook(call, "call.transcription", more={"transcription_data": {
+                "transcript": line.split(None, 1)[1], "is_final": True, "confidence": 0.93}})
         elif step[0] == "wait":
             call["over"].wait(float(step[1]))
         elif step[0] == "expect":
@@ -335,6 +343,11 @@ class Api(http.server.BaseHTTPRequestHandler):
                 call["over"].set()
             elif parts[4] == "send_dtmf":
                 log("events.jsonl", {"dtmf": body.get("digits")})
+            elif parts[4] == "speak":
+                with lock:
+                    open(os.path.join(DIR, "heard.ulaw"), "ab").write(b"ulaw:pcm:" + body.get("payload", "").encode())
+                if read("no_speak_ended") is None:
+                    threading.Thread(target=webhook, args=(call, "call.speak.ended"), daemon=True).start()
             return self.answer(200, {"data": {"result": "ok"}})
         self.answer(404, {"errors": [{"title": "Not found"}]})
 
