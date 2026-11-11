@@ -57,6 +57,15 @@ pub fn owner(live: &Live, inbound: &Inbound) -> bool {
 pub async fn append(live: &Live, inbound: &mut Inbound, files: Vec<File>) {
     let cfg = live.get().map(|rx| rx.borrow().clone());
     let cfg = cfg.filter(|c| c.is_owner(&inbound.channel, &inbound.sender));
+    // A message whose row is stored already (iMessage backfill re-reads the last day at every
+    // start) is one the router drops as a duplicate: nothing is fetched or heard for it.
+    let stored = |c: &Config| {
+        let store = crate::store::Store::open(&c.db_path()).ok()?;
+        (store.has_inbox(&inbound.channel, &inbound.platform_msg_id)).ok()
+    };
+    if !files.is_empty() && cfg.as_deref().and_then(stored) == Some(true) {
+        return;
+    }
     let dir = cfg.as_ref().map(|c| c.home.join("inbox"));
     // Whether a voice note is transcribed: the setting, in an image that has voice.
     let hear = cfg
@@ -509,6 +518,31 @@ pub(crate) mod tests {
         assert_eq!(seen.recv().await.unwrap(), "/v");
         assert!(seen.try_recv().is_err(), "fetched once");
         assert_eq!(std::fs::read(&planted).unwrap(), b"slash ok three");
+    }
+
+    /// iMessage backfill re-reads the last day at every start: a note whose row is stored is
+    /// a duplicate the router drops, so it costs no fetch and no whisper run.
+    #[tokio::test]
+    async fn a_voice_note_whose_row_is_stored_is_not_fetched_or_heard_again() {
+        let (cfg, live) = voice_live("inbox-backfill", "imessage = ['+1']");
+        let (base, mut seen) = file_stub(200, "audio/x-caf", b"caf-bytes").await;
+        let file = || note(&base, "Audio Message.caf", "audio/x-caf");
+        let mut first = from("imessage", "+1", "");
+        append(&live, &mut first, vec![file()]).await;
+        assert!(first.text.ends_with(SAID), "{}", first.text);
+        let store = crate::store::Store::open(&cfg.db_path()).unwrap();
+        store.insert_inbox_as(&first, "new").unwrap().unwrap();
+        let mut again = from("imessage", "+1", "");
+        append(&live, &mut again, vec![file()]).await;
+        assert_eq!(
+            store.insert_inbox_as(&again, "new").unwrap(),
+            None,
+            "a duplicate"
+        );
+        assert_eq!(seen.recv().await.unwrap(), "/v");
+        assert!(seen.try_recv().is_err(), "fetched once");
+        assert_eq!(crate::voice::tests::log(&cfg, "ffmpeg").len(), 1);
+        assert_eq!(crate::voice::tests::log(&cfg, "whisper-cli").len(), 1);
     }
 
     #[tokio::test]
