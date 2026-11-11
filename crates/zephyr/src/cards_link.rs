@@ -42,13 +42,30 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// An access token this close to its end is refreshed first ("Refresh ahead of expiration").
 const EARLY_SECS: i64 = 120;
 
-/// The tokens as kept on disk. No `Debug`: nothing prints them.
+/// The tokens as kept on disk, read fresh for each use and never kept: no `Link` holds them,
+/// nothing prints them (no `Debug`), and each copy is wiped when it is dropped.
 #[derive(Serialize, Deserialize)]
 struct Tokens {
     access_token: String,
     refresh_token: String,
     /// Unix seconds.
     expires_at: i64,
+}
+
+impl Drop for Tokens {
+    fn drop(&mut self) {
+        crate::vault::wipe_str(&mut self.access_token);
+        crate::vault::wipe_str(&mut self.refresh_token);
+    }
+}
+
+/// The access token for one call: wiped when the call is done. No `Debug`.
+struct Access(String);
+
+impl Drop for Access {
+    fn drop(&mut self) {
+        crate::vault::wipe_str(&mut self.0);
+    }
 }
 
 /// One refresh at a time: a refresh token is good once, so two at once would lose the grant.
@@ -110,15 +127,17 @@ impl Link {
     }
 
     fn save(&self, t: &Tokens) -> Result<(), ProviderError> {
-        let text = serde_json::to_string(t).unwrap_or_default();
-        crate::host::conf::replace_private(&self.tokens, &text)
-            .map_err(|_| ProviderError("Link's tokens could not be saved".into()))
+        let mut text = serde_json::to_string(t).unwrap_or_default();
+        let saved = crate::host::conf::replace_private(&self.tokens, &text);
+        crate::vault::wipe_str(&mut text);
+        saved.map_err(|_| ProviderError("Link's tokens could not be saved".into()))
     }
 
     fn read(&self) -> Result<Tokens, ProviderError> {
-        let text = std::fs::read_to_string(&self.tokens).ok();
-        text.and_then(|t| serde_json::from_str(&t).ok())
-            .ok_or_else(|| ProviderError(RECONNECT.trim_start_matches("not run: ").into()))
+        let mut text = std::fs::read_to_string(&self.tokens).unwrap_or_default();
+        let tokens = serde_json::from_str(&text).ok();
+        crate::vault::wipe_str(&mut text);
+        tokens.ok_or_else(|| ProviderError(RECONNECT.trim_start_matches("not run: ").into()))
     }
 
     /// One form POST to the sign-in host: its status and its JSON.
@@ -154,11 +173,11 @@ impl Link {
     /// "Refresh tokens rotate. Every response contains a new `refresh_token` and invalidates
     /// the one you sent, so persist the new value immediately": the file is written before
     /// the new access token is used.
-    async fn token(&self, force: bool) -> Result<String, ProviderError> {
+    async fn token(&self, force: bool) -> Result<Access, ProviderError> {
         let _one = REFRESH.lock().await;
-        let now = self.read()?;
+        let mut now = self.read()?;
         if !force && now.expires_at - EARLY_SECS > crate::now() {
-            return Ok(now.access_token);
+            return Ok(Access(std::mem::take(&mut now.access_token)));
         }
         // The device grant's token endpoint, as `link-cli` refreshes (auth-resource.ts
         // `refreshToken`). spike (1): a registered client refreshes at `/auth/token` with its
@@ -175,8 +194,9 @@ impl Link {
                 RECONNECT.trim_start_matches("not run: ").into(),
             ));
         };
+        let mut fresh = fresh;
         self.save(&fresh)?;
-        Ok(fresh.access_token)
+        Ok(Access(std::mem::take(&mut fresh.access_token)))
     }
 
     /// One API call with the owner's token, once more with a fresh one after a 401.
@@ -191,7 +211,7 @@ impl Link {
             let token = self.token(force).await?;
             let mut req = (self.http)
                 .request(method.clone(), format!("{}{path}", self.api))
-                .bearer_auth(token);
+                .bearer_auth(&token.0);
             if let Some(body) = body {
                 req = req.json(body);
             }
