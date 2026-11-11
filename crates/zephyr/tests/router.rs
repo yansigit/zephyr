@@ -168,6 +168,13 @@ impl Gateway {
     async fn wait_replies(&self, n: usize) -> Vec<String> {
         self.wait_replies_on("chat", n).await
     }
+    /// The newest chat reply holding `has`, once there is one: for replies whose order a slow
+    /// machine can change.
+    async fn wait_reply(&self, has: &str) -> String {
+        let found = || self.replies().into_iter().rev().find(|r| r.contains(has));
+        wait(|| found().is_some()).await;
+        found().unwrap()
+    }
     async fn shutdown(mut self) {
         let _ = self.stop.take().unwrap().send(());
         self.task.await.unwrap().unwrap();
@@ -5349,6 +5356,122 @@ async fn a_vault_use_waits_for_the_owners_ok_and_a_granted_token_comes_back_scru
     let replies = gw.wait_replies(8).await;
     assert!(replies[6].contains("with env, grep (#3)"), "{replies:?}");
     assert_eq!(proc_status(&home, "exited"), 1);
+    gw.shutdown().await;
+}
+
+/// Under the network floor a command gets a token's stand-in (DESIGN §4.21), never its value.
+fn brokered(home: &Path) -> Config {
+    let mut cfg = config(home);
+    cfg.floor = true;
+    cfg.tick = Duration::from_millis(200);
+    cfg
+}
+
+#[tokio::test]
+async fn an_exec_with_a_bound_token_runs_on_its_surrogate() {
+    let home = home("vault-surrogate");
+    let vault = VAULT.replace(
+        "programs = []",
+        "programs = [\"printenv\"]\nhosts = [\"api.github.com:443\"]",
+    );
+    std::fs::write(home.join("vault.toml"), vault).unwrap();
+    let gw = start(brokered(&home));
+    let exec = r#"[call exec {"command": "printenv GH_TOKEN", "secrets": ["GH_TOKEN"]}]"#;
+    gw.say("m1", "owner", exec).await;
+    let reply = gw.wait_replies(1).await[0].clone();
+    assert!(
+        reply.contains("\nexec: exited 0\n[vault:GH_TOKEN]"),
+        "{reply}"
+    );
+    // What the command held, before scrubbing: the stand-in.
+    let log = std::fs::read_to_string(home.join(".procs/1.log")).unwrap();
+    assert!(log.starts_with("zsur_") && log.trim().len() == 45, "{log}");
+    assert!(!log.contains("ghp_vaulttoken42"));
+    let session = main_session(&home);
+    assert!(!session.contains("zsur_") && !session.contains("ghp_vaulttoken42"));
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_token_bound_to_nothing_is_not_run_until_the_owner_binds_it() {
+    let home = home("vault-unbound");
+    let vault = VAULT.replace("programs = []", "programs = [\"printenv\"]");
+    std::fs::write(home.join("vault.toml"), vault).unwrap();
+    let gw = start(brokered(&home));
+    let exec = r#"[call exec {"command": "printenv GH_TOKEN", "secrets": ["GH_TOKEN"]}]"#;
+    gw.say("m1", "owner", exec).await;
+    let reply = gw.wait_reply("exec: not run").await;
+    assert!(
+        reply.contains(
+            "\nexec: not run: the token GH_TOKEN is bound to no host; ask the owner with vault bind"
+        ),
+        "{reply}"
+    );
+    assert_eq!(
+        proc_status(&home, "exited") + proc_status(&home, "running"),
+        0
+    );
+    // The upgrade's notice, once there is an owner to tell.
+    let told = gw.wait_reply("[zephyr] vault tokens now go").await;
+    assert!(told.contains("\n/vault bind GH_TOKEN HOST..\n"), "{told}");
+    assert!(
+        told.ends_with("To hand one out as before: /vault raw NAME on."),
+        "{told}"
+    );
+    // The agent may ask; a wildcard is not asked at all.
+    let bad = r#"[call vault {"action": "bind", "name": "GH_TOKEN", "hosts": ["*.github.com"]}]"#;
+    let bind = r#"[call vault {"action": "bind", "name": "GH_TOKEN", "hosts": ["api.github.com", "github.com"]}]"#;
+    gw.say("m2", "owner", &format!("{bad} {bind}")).await;
+    let asked = gw.wait_reply("[zephyr] the agent asks to send").await;
+    assert_eq!(
+        asked,
+        "[zephyr] the agent asks to send the token GH_TOKEN to api.github.com, github.com (#1); \
+         /ok 1 allows it from now on, /no 1 drops it"
+    );
+    let answer = gw.wait_reply("vault: not bound").await;
+    assert!(answer.contains("\nvault: not asked: "), "{answer}");
+    assert!(
+        answer.contains("\nvault: not bound: sending GH_TOKEN"),
+        "{answer}"
+    );
+    let saved = std::fs::read_to_string(home.join("vault.toml")).unwrap();
+    assert!(!saved.contains("hosts"), "{saved}");
+    gw.say("m3", "owner", "/ok 1").await;
+    let bound = gw.wait_reply("GH_TOKEN is now sent only to").await;
+    assert!(
+        bound.ends_with(
+            "[zephyr] GH_TOKEN is now sent only to api.github.com, github.com\n\
+             api.github.com is now decrypted by zephyr for every program the agent runs\n\
+             github.com is now decrypted by zephyr for every program the agent runs"
+        ),
+        "{bound}"
+    );
+    assert_eq!(
+        last_logged(&home, "vault.GH_TOKEN.hosts"),
+        (
+            Some(String::new()),
+            Some("api.github.com:443, github.com:443".into()),
+            "owner".into()
+        )
+    );
+    gw.say("m4", "owner", exec).await;
+    let ran = gw.wait_reply("exec: exited 0").await;
+    assert!(ran.contains("\nexec: exited 0\n[vault:GH_TOKEN]"), "{ran}");
+    gw.shutdown().await;
+
+    // The notice is not sent again by a later start.
+    let gw = start(brokered(&home));
+    gw.say("m5", "owner", "/vault unbind GH_TOKEN").await;
+    gw.wait_reply("bound to no host now").await;
+    gw.say("m6", "owner", "hi").await;
+    gw.wait_reply("echo: ").await;
+    // A tick or two later there is still none.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let replies = gw.replies();
+    assert!(
+        !replies.iter().any(|r| r.contains("vault tokens now go")),
+        "{replies:?}"
+    );
     gw.shutdown().await;
 }
 

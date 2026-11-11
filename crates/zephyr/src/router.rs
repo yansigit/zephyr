@@ -757,6 +757,7 @@ impl<'a> Router<'a> {
                     }
                     self.revert_due().await;
                     self.upgrade_notice();
+                    self.broker_notice();
                     // Delays that came due, and held actions nobody answered (approvals §4.6).
                     self.tick_actions();
                     // A budget pause ends at UTC midnight with nothing else to wake the router;
@@ -2734,8 +2735,27 @@ impl<'a> Router<'a> {
             // The owner's credentials (DESIGN §4.15); also an approved `/vault grant` proposal.
             ("/vault", arg) => {
                 let may_approve = from.0 != crate::attach::WEB;
-                let done = crate::vault::command(&crate::vault::path(&self.cfg), arg, may_approve);
-                done.unwrap_or_else(|refused| self.refused(refused))
+                match crate::vault::command(&crate::vault::path(&self.cfg), arg, may_approve) {
+                    Ok((done, change)) => {
+                        // A binding is the owner's change to what a token may reach (§4.21).
+                        if let Some(c) = change {
+                            let (old, new) = (Some(c.old.as_str()), Some(c.new.as_str()));
+                            let logged = (self.store).log_setting(
+                                &c.key,
+                                old,
+                                new,
+                                "owner",
+                                Some(from.0),
+                                None,
+                            );
+                            if let Err(e) = logged {
+                                eprintln!("zephyr: logging {}: {e}", c.key);
+                            }
+                        }
+                        done
+                    }
+                    Err(refused) => self.refused(refused),
+                }
             }
             // The owner's private facts (approvals spec §4.5): names only, never a value.
             ("/facts", arg) => {
@@ -2902,6 +2922,26 @@ impl<'a> Router<'a> {
                 .map_err(Into::into)),
             Err(e) => log(Err(e.into())),
         }
+    }
+
+    /// The once-only notice of the token broker's upgrade (DESIGN §4.21): the tokens and
+    /// connectors that cannot be used until the owner binds them. It waits for an owner to
+    /// tell, and is marked told even when there is nothing to say, so a later start is silent.
+    fn broker_notice(&self) {
+        const TOLD: &str = "broker.upgrade_told";
+        if !crate::broker::on(&self.cfg)
+            || !matches!(self.store.meta(TOLD), Ok(None))
+            || self.store.last_owner().ok().flatten().is_none()
+        {
+            return;
+        }
+        let told = match crate::broker::upgrade_notice(&self.cfg) {
+            Some(text) => self.store.notify_last_owner(&text),
+            None => Ok(()),
+        };
+        log(told
+            .and_then(|()| self.store.set_meta(TOLD, Some("1")))
+            .map_err(Into::into));
     }
 
     /// The one way a setting changes (settings spec §4.3), whoever asks: the key is looked up,

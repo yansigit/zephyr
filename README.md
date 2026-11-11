@@ -767,6 +767,11 @@ the agent cannot read them (DESIGN §4.15). The agent uses them by name and neve
   only. Each program a token is used with needs your OK once (`gh` for `GH_TOKEN`, say); after
   that the same use runs without asking. Wherever the value shows up in what the command prints,
   the agent gets `[vault:NAME]` instead.
+- **A token goes only to the hosts you bind it to.** The command does not get the token: it gets
+  a stand-in (`zsur_…`), and zephyr's proxy swaps the real token in only in HTTPS requests to the
+  hosts you named, exactly (`api.github.com` does not cover `github.com`; no wildcards). Sent
+  anywhere else the stand-in is worthless, and where zephyr can see it the request is refused and
+  you are told. A token bound to no host cannot be used.
 
 When the agent wants to use one, you are asked: `the agent asks to use the token GH_TOKEN with gh
 (#4); /ok 4 allows it from now on, /no 4 drops it`. When one is missing, the agent asks you to
@@ -780,6 +785,14 @@ save it and names the exact command. Save and manage entries:
 - On the host, `zephyr vault add login github --site https://github.com --user me [--totp]`,
   `zephyr vault add token GH_TOKEN`, `list`, `edit`, `rm` and `revoke NAME [PROGRAM]`. The agent
   is not told of these: tell it.
+- `/vault bind GH_TOKEN api.github.com github.com` binds a token to hosts (`HOST` or `HOST:PORT`).
+  `/vault url NAME on` also swaps it in a request's path and query, for APIs that want the token
+  in the URL (a server may repeat its URL back, so it is off by default). `/vault raw NAME on`
+  hands the real token to the command as before: for a token used in a request body, for signing
+  (AWS, webhooks), for gRPC, for a host with a private certificate or plain HTTP, or for a program
+  that does not use the proxy (`himalaya`, `ssh`). These three need a channel that may approve;
+  `/vault unbind NAME [HOST]`, `/vault url NAME off` and `/vault raw NAME off` work anywhere. The
+  agent can ask for a binding (`the agent asks to send the token GH_TOKEN to api.github.com (#5)`).
 - From any channel, `/vault` lists the names, `/vault rm NAME` deletes one, and `/vault revoke
   NAME [PROGRAM]` takes back a grant. A chat never takes a value: `/vault add` there is refused.
   Never paste a password into a chat.
@@ -792,12 +805,14 @@ command the agent runs; the vault is the better place for one.
 
 What it protects against: credentials stay out of chats, transcripts and the model's context in
 normal use; a login is filled only on its own site; and each new use needs your OK. What it does
-not: an agent set on misusing a value it was allowed to use can still read it (a filled field
-read back, its own command's log under `.procs/`, a program that prints its environment to a
-file). Grant a token only to programs you trust with it.
+not: an agent set on misusing a login, or a token you marked `raw`, can still read it (a filled
+field read back, its own command's log under `.procs/`, a program that prints its environment to
+a file). A bound token it cannot read at all; it can still use it on the hosts you bound, so bind
+a token only to the API it is for, and grant it only to programs you trust with it.
 
 **Mail.** There is no mail channel, but the agent can read and send mail with `himalaya`. Save the
-password as a token (`zephyr vault add token MAIL_PASSWORD`) and have the agent write
+password as a token (`zephyr vault add token MAIL_PASSWORD`, then `/vault raw MAIL_PASSWORD on`:
+himalaya speaks IMAP, which the proxy cannot swap a stand-in in) and have the agent write
 `/zephyr/.config/himalaya/config.toml` with the password taken from the environment:
 
 ```toml

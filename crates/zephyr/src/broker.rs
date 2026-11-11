@@ -482,6 +482,27 @@ pub fn secrets(cfg: &Config, vault: &Vault) -> Vec<(String, String)> {
     all
 }
 
+/// What the owner is told once after the upgrade: each token that cannot be used until it is
+/// bound. `None` when there is none, or the vault cannot be read.
+pub fn upgrade_notice(cfg: &Config) -> Option<String> {
+    let vault = Vault::load(&crate::vault::path(cfg)).ok()?;
+    let unbound = |e: &crate::vault::Entry| e.kind == Kind::Token && !e.raw && e.hosts.is_empty();
+    let mut lines: Vec<String> = (vault.entries().iter().filter(|e| unbound(e)))
+        .map(|e| format!("/vault bind {} HOST..", e.name))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    lines.insert(
+        0,
+        "[zephyr] vault tokens now go to the agent as stand-ins, swapped for the real token \
+         only on hosts you name. Until you bind one it cannot be used:"
+            .into(),
+    );
+    lines.push("To hand one out as before: /vault raw NAME on.".into());
+    Some(lines.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

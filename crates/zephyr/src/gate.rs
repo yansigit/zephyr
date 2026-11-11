@@ -466,7 +466,8 @@ impl Scrub {
     pub(crate) fn load(cfg: &Config) -> Scrub {
         let vault = crate::vault::Vault::load(&crate::vault::path(cfg));
         Scrub {
-            secrets: vault.ok().map(|v| v.secrets()),
+            // Surrogates too: a card or an audit row shows `[vault:NAME]` for either.
+            secrets: vault.ok().map(|v| crate::broker::secrets(cfg, &v)),
             facts: facts::load(&facts::path(cfg)),
         }
     }
