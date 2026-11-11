@@ -29,6 +29,7 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let account_flags = a.values("--account")?;
     let model = a.value("--model")?;
     let preset = a.value("--preset")?;
+    let network = a.value("--network")?;
     let rest = a.rest()?;
     if !rest.is_empty() {
         bail!("{USAGE}");
@@ -37,6 +38,13 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
         .map(|p| crate::approvals::Preset::parse(&p))
         .transpose()
         .map_err(|e| anyhow::anyhow!("--preset: {e}"))?;
+    // No prompt for it: the floor is the safe default, and a wizard should not offer the weaker one.
+    if network
+        .as_deref()
+        .is_some_and(|n| n != "bridge" && n != "host")
+    {
+        bail!("--network must be bridge or host");
+    }
 
     if !no_start && !super::quiet(super::docker(&["version"])) {
         bail!("docker is not reachable: install Docker and make sure `docker version` works");
@@ -60,7 +68,14 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
         bail!("{} is not a directory", projects.display());
     }
     h.data.set_projects(&projects.canonicalize()?)?;
-    h.data.set_network_default()?;
+    h.data.set_network(network.as_deref())?;
+    println!(
+        "{}",
+        match h.bridge()? {
+            true => "network: bridge (the agent's network floor)",
+            false => "network: host (no network floor; zephyr init --network bridge turns it on)",
+        }
+    );
 
     let mut doc = h.data.load()?;
     h.data.add_image_extensions(&mut doc)?;

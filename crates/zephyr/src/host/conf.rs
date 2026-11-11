@@ -225,15 +225,21 @@ impl Data {
         self.write("host.toml", &doc.to_string())
     }
 
-    /// Writes `network = "bridge"` to host.toml when it names no network, so the owner can see
-    /// the line that turns the network floor off.
-    pub fn set_network_default(&self) -> anyhow::Result<()> {
+    /// Writes host.toml's `network`: `Some` sets it (`init --network`); `None` writes `bridge`
+    /// only when it names no network. A new key gets the line that turns the network floor off.
+    pub fn set_network(&self, network: Option<&str>) -> anyhow::Result<()> {
         let mut doc = self.host_doc()?.unwrap_or_default();
-        if doc.contains_key("network") {
+        let new = !doc.contains_key("network");
+        let want = match network {
+            Some(v) => v,
+            None if new => "bridge",
+            None => return Ok(()),
+        };
+        if get(&doc, "network").as_deref() == Some(want) {
             return Ok(());
         }
-        doc["network"] = value("bridge");
-        if let Some(mut key) = doc.key_mut("network") {
+        doc["network"] = value(want);
+        if let Some(mut key) = doc.key_mut("network").filter(|_| new) {
             let note = "# \"host\" runs without the network floor (DESIGN §4.20)\n";
             key.leaf_decor_mut().set_prefix(note);
         }

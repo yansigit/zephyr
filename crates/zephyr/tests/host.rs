@@ -472,6 +472,51 @@ fn init_asks_for_a_preset_and_writes_it() {
     assert!(!format!("{:?}", env.calls()).contains(PIN), "value in argv");
 }
 
+/// `--network` is the one CLI way to set host.toml's network (after the first `up` the file is
+/// root's); without it a re-run keeps what is there.
+#[test]
+fn init_network_flag_sets_and_keeps_the_mode() {
+    let env = Env::new("init-network");
+    let host = || read(&env.daemon().join("host.toml"));
+    let projects = env.projects.display().to_string();
+    let init = |extra: &[&str]| {
+        let mut args = vec![
+            "init",
+            "--non-interactive",
+            "--no-start",
+            "--projects",
+            &projects,
+        ];
+        args.extend(extra);
+        env.zephyr(&args)
+    };
+    let out = init(&["--network", "host"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(host().contains("network = \"host\""), "{}", host());
+    assert!(stdout(&out)
+        .contains("network: host (no network floor; zephyr init --network bridge turns it on)"));
+    let out = init(&[]);
+    assert!(out.status.success());
+    assert!(host().contains("network = \"host\""), "kept: {}", host());
+    assert!(stdout(&out).contains("network: host"));
+
+    let before = host();
+    let out = init(&["--network", "foo"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--network must be bridge or host"), "{err}");
+    assert_eq!(host(), before, "refused before anything was written");
+
+    let out = init(&["--network", "bridge"]);
+    assert!(out.status.success());
+    assert!(host().contains("network = \"bridge\""), "{}", host());
+    assert!(stdout(&out).contains("network: bridge (the agent's network floor)"));
+}
+
 #[test]
 fn init_non_interactive_takes_preset_flag() {
     let env = Env::new("init-preset-flag");
