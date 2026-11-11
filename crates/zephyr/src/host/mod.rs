@@ -1161,7 +1161,7 @@ fn pull(image: &str) -> bool {
         return true;
     }
     // The gh token is this user's GitHub credential: no other registry may be handed it.
-    if !image.starts_with("ghcr.io/") {
+    if registry(image) != "ghcr.io" {
         println!(
             "{image} is not on ghcr.io: docker login {} first, if it needs a login",
             registry(image)
