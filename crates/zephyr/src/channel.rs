@@ -61,6 +61,54 @@ pub trait Channel: Send + Sync {
         let _ = sender;
         None
     }
+    /// Hands over the router's answers for the rows the adapter sends it, once before `run`:
+    /// an adapter that confirms a message to its platform (Telegram) waits for its row's. The
+    /// default ignores them.
+    fn acks(&self, acks: std::sync::Arc<Acks>) {
+        let _ = acks;
+    }
+}
+
+/// The router's answer for each row an adapter handed it: the row was stored, dropped or
+/// ignored, so the adapter may confirm it to its platform. `Router::inbound` answers on every
+/// path out of it (`Answer`), errors too, so an adapter never waits on a row for good.
+#[derive(Default)]
+pub struct Acks(
+    std::sync::Mutex<std::collections::HashMap<(String, String), tokio::sync::oneshot::Sender<()>>>,
+);
+
+impl Acks {
+    /// Registers `channel`'s row `id` before it is sent: the receiver answers once the router
+    /// is done with it.
+    pub fn expect(&self, channel: &str, id: &str) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        all.insert((channel.into(), id.into()), tx);
+        rx
+    }
+
+    /// The router is done with `channel`'s row `id`. Nothing waits on most rows.
+    pub fn done(&self, channel: &str, id: &str) {
+        let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tx) = all.remove(&(channel.to_string(), id.to_string())) {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Answers a row's ack when dropped, so every return of `Router::inbound` answers it.
+pub struct Answer(std::sync::Arc<Acks>, String, String);
+
+impl Answer {
+    pub fn new(acks: &std::sync::Arc<Acks>, m: &Inbound) -> Self {
+        Self(acks.clone(), m.channel.clone(), m.platform_msg_id.clone())
+    }
+}
+
+impl Drop for Answer {
+    fn drop(&mut self) {
+        self.0.done(&self.1, &self.2);
+    }
 }
 
 /// Splits `text` into pieces of at most `max` UTF-16 units, breaking after newlines where possible.
@@ -211,6 +259,15 @@ impl Channel for AnyChannel {
             Self::IMessage(c) => c.live(cfg),
             Self::Telegram(c) => c.live(cfg),
             Self::Signal(c) => c.live(cfg),
+        }
+    }
+    fn acks(&self, acks: std::sync::Arc<Acks>) {
+        match self {
+            Self::Chat(c) => c.acks(acks),
+            Self::Discord(c) => c.acks(acks),
+            Self::IMessage(c) => c.acks(acks),
+            Self::Telegram(c) => c.acks(acks),
+            Self::Signal(c) => c.acks(acks),
         }
     }
     fn known_as(&self, sender: &str) -> Option<String> {

@@ -30,8 +30,8 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const TYPING_EVERY: Duration = Duration::from_secs(4);
 const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const MAX_NAMES: usize = 1000;
-/// How long a batch's rows may take to be stored before it is fetched again.
-const STORED_WITHIN: Duration = Duration::from_secs(60);
+/// How long the router may take to answer for a batch's rows before it is fetched again.
+const ANSWERED_WITHIN: Duration = Duration::from_secs(60);
 
 /// The Bot API for one token. No `Debug`: it holds the token.
 #[derive(Clone)]
@@ -145,6 +145,8 @@ pub struct Telegram {
     names: Mutex<HashMap<String, String>>,
     /// Owners and home, for saving the files an owner sends (`inbox`).
     live: crate::inbox::Live,
+    /// The router's answers for the rows sent to it (`Channel::acks`).
+    acks: std::sync::OnceLock<Arc<crate::channel::Acks>>,
     /// Set by the first typing error, so later ones are not logged.
     typing_warned: Arc<AtomicBool>,
     /// How long a 409 (another client polling this bot) waits before the next poll.
@@ -173,6 +175,7 @@ impl Telegram {
             delivered: Default::default(),
             names: Default::default(),
             live: Default::default(),
+            acks: Default::default(),
             typing_warned: Default::default(),
             conflict_wait: Duration::from_secs(30),
             backoff: Duration::from_secs(5),
@@ -232,49 +235,34 @@ impl Telegram {
             "allowed_updates": ["message", "my_chat_member"],
         });
         let updates = self.api.json("getUpdates", body).await?;
-        let (mut next, mut rows) = (*offset, Vec::new());
+        let (mut next, mut answers) = (*offset, Vec::new());
         for u in updates.as_array().into_iter().flatten() {
             let Some(id) = u["update_id"].as_i64() else {
                 continue;
             };
-            rows.extend(self.take(u, tx).await);
+            answers.extend(self.take(u, tx).await);
             next = next.max(id + 1);
         }
         // Telegram counts the batch taken at the next call carrying `next`: only once the
-        // router stored every row of it, so a crash before then re-delivers it.
-        self.stored(rows).await?;
+        // router is done with every row of it, so a crash before then re-delivers it.
+        let all = futures_util::future::join_all(answers);
+        let answered = tokio::time::timeout(ANSWERED_WITHIN, all)
+            .await
+            .map_err(|_| anyhow::anyhow!("the router took no row of a batch in a minute"))?;
+        anyhow::ensure!(
+            answered.iter().all(Result::is_ok),
+            "the router stopped before it took a batch's rows; they come again"
+        );
         *offset = next;
         Ok(())
     }
 
-    /// Waits until the router stored each of `rows` (platform ids), for at most a minute. The
-    /// database is read on a blocking thread, never this one.
-    async fn stored(&self, rows: Vec<String>) -> anyhow::Result<()> {
-        let Some(db) = self.live.get().map(|rx| rx.borrow().db_path()) else {
-            return Ok(()); // before the router: nothing was sent to it
-        };
-        if rows.is_empty() {
-            return Ok(());
-        }
-        tokio::task::spawn_blocking(move || {
-            let store = crate::store::Store::open(&db)?;
-            let deadline = Instant::now() + STORED_WITHIN;
-            for id in &rows {
-                while !store.has_inbox("telegram", id)? {
-                    anyhow::ensure!(
-                        Instant::now() < deadline,
-                        "telegram message {id} was not stored within a minute; it comes again"
-                    );
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            }
-            Ok(())
-        })
-        .await?
-    }
-
-    /// The platform id of the row `u` became, if one went to the router.
-    async fn take(&self, u: &Value, tx: &mpsc::Sender<Inbound>) -> Option<String> {
+    /// The router's answer for the row `u` became, if one went to it.
+    async fn take(
+        &self,
+        u: &Value,
+        tx: &mpsc::Sender<Inbound>,
+    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
         let update = match Update::deserialize(u) {
             Ok(update) => update,
             Err(e) => {
@@ -298,9 +286,9 @@ impl Telegram {
                 self.remember(&row.sender, name);
                 let files = self.files(&row, docs).await;
                 crate::inbox::append(&self.live, &mut row, files).await;
-                let id = row.platform_msg_id.clone();
+                let answer = (self.acks.get()).map(|a| a.expect("telegram", &row.platform_msg_id));
                 // A closed receiver means run() is returning; the error comes from there.
-                tx.send(row).await.ok().map(|()| id)
+                tx.send(row).await.ok().and(answer)
             }
         }
     }
@@ -440,6 +428,10 @@ impl Channel for Telegram {
 
     fn live(&self, cfg: tokio::sync::watch::Receiver<Arc<crate::config::Config>>) {
         let _ = self.live.set(cfg);
+    }
+
+    fn acks(&self, acks: Arc<crate::channel::Acks>) {
+        let _ = self.acks.set(acks);
     }
 
     fn known_as(&self, sender: &str) -> Option<String> {

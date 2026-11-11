@@ -739,14 +739,16 @@ async fn the_token_never_shows() {
 }
 
 #[tokio::test]
-async fn an_update_is_confirmed_only_once_its_row_is_stored() {
+async fn an_update_is_confirmed_only_once_the_router_took_its_row() {
     let home = home("stored");
     let (api, bot) = stub().await;
     push(&bot, [text(10, 55, 1, "one")]);
     let cfg = config(&home, &api, "");
     let tg = Arc::new(adapter(&cfg));
     tg.live(tokio::sync::watch::channel(Arc::new(cfg.clone())).1);
-    // No router: the row reaches the channel, and nothing stores it until the test does.
+    let acks = Arc::new(zephyr::channel::Acks::default());
+    tg.acks(acks.clone());
+    // No router: the row reaches the channel, and nothing answers for it until the test does.
     let (tx, mut rx) = mpsc::channel(16);
     let run = {
         let tg = tg.clone();
@@ -761,12 +763,38 @@ async fn an_update_is_confirmed_only_once_its_row_is_stored() {
             .collect()
     };
     assert!(offsets(&bot).iter().all(|o| *o == 0), "{:?}", offsets(&bot));
-    Store::open(&cfg.db_path())
-        .unwrap()
-        .insert_inbox_as(&row, "new")
-        .unwrap();
+    acks.done(&row.channel, &row.platform_msg_id);
     wait(|| offsets(&bot).contains(&11)).await;
     run.abort();
+}
+
+#[tokio::test]
+async fn a_row_the_router_does_not_store_still_moves_the_offset_on() {
+    let home = home("unstored");
+    let (api, bot) = stub().await;
+    let cfg = config(&home, &api, "");
+    // An insert that fails: the router logs it, and the adapter must not wait on it for good.
+    let db = rusqlite::Connection::open(cfg.db_path()).unwrap();
+    zephyr::store::Store::open(&cfg.db_path()).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER boom BEFORE INSERT ON inbox WHEN NEW.text = 'boom'
+         BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+    )
+    .unwrap();
+    // A text of spaces, which the router trims to nothing and never stores, then the failing
+    // insert, then a message that must still be answered.
+    push(
+        &bot,
+        [
+            text(10, 55, 1, "   "),
+            text(11, 55, 2, "boom"),
+            text(12, 55, 3, "hi"),
+        ],
+    );
+    let gw = start(cfg);
+    wait(|| said(&bot, 55).iter().any(|t| t.contains("hi"))).await;
+    wait(|| calls(&bot, "getUpdates").iter().any(|b| b["offset"] == 13)).await;
+    gw.shutdown().await;
 }
 
 #[tokio::test]

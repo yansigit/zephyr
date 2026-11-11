@@ -311,6 +311,7 @@ pub async fn run<C: Channel>(
     crate::actions::restore(&router.cfg, &router.store, crate::now());
     for c in channels {
         c.live(cfg_rx.clone()); // owners for file downloads, kept current by reload
+        c.acks(router.acks.clone());
     }
     let waits = router.waits.clone();
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
@@ -434,6 +435,8 @@ struct Router<'a> {
     secrets: Vec<(String, String)>,
     /// A same-provider model switch, sent with `set_model` once the child is idle.
     pending_model: Option<String>,
+    /// The answers for the rows adapters hand over (`channel::Acks`).
+    acks: Arc<crate::channel::Acks>,
     /// Wrong pairing codes: five in ten minutes close pairing (DESIGN §4.3).
     pair_limits: crate::web::signin::Limits,
     /// Exit with `Exit::Reexec` once main and the jobs are idle.
@@ -683,6 +686,7 @@ impl<'a> Router<'a> {
             web: None,
             pushed_up_to: std::sync::atomic::AtomicI64::new(i64::MAX),
             pair_limits: crate::web::signin::Limits::new(),
+            acks: Arc::default(),
             pushed_replies: HashSet::new(),
             not_applied: false,
             held_steered: HashSet::new(),
@@ -1989,6 +1993,8 @@ impl<'a> Router<'a> {
     /// `after`: a follow-up, held until the run settles rather than steered into it.
     /// `name`: how the sender goes by on a pairing channel (`known`), for a claim's notice.
     async fn inbound(&mut self, m: Inbound, after: bool, name: Option<String>) {
+        // Answered however this returns: stored, dropped, a duplicate, ignored or an error.
+        let _answer = crate::channel::Answer::new(&self.acks, &m);
         if m.text.trim().is_empty() {
             return; // attachment-only messages are not handled in v1
         }
