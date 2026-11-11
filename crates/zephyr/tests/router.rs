@@ -2587,6 +2587,52 @@ async fn a_live_pairing_code_never_reaches_state_db() {
 }
 
 #[tokio::test]
+async fn every_way_of_sending_a_code_pairs_and_none_reaches_state_db() {
+    let (home, gw) = paired_gateway("pair-forms");
+    let mut codes = Vec::new();
+    let forms: [fn(&str) -> String; 3] = [
+        |c| format!("/pair@zephyr_bot {c}"),
+        |c| c.to_string(),
+        |c| format!("/pair{c}"),
+    ];
+    for (i, form) in forms.iter().enumerate() {
+        let code = pair_code(&gw, &format!("p{i}")).await;
+        let who = format!("{}", 70 + i);
+        // While a code is out, a stranger's other text is not kept as typed either.
+        gw.say_on(
+            "telegram",
+            &format!("{who}-0"),
+            &who,
+            &format!("my code is {code}"),
+        )
+        .await;
+        gw.say_on("telegram", &format!("{who}-1"), &who, &form(&code))
+            .await;
+        wait(|| telegram_owners(&home).contains(&who)).await;
+        codes.push(code);
+    }
+    gw.shutdown().await;
+    let mut bytes = Vec::new();
+    for name in ["state.db", "state.db-wal"] {
+        bytes.extend(std::fs::read(home.join(name)).unwrap_or_default());
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    for code in &codes {
+        for form in [code.clone(), code.replace('-', "")] {
+            assert!(!text.contains(&form), "{form} is in state.db");
+        }
+    }
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let texts: Vec<String> = (store.inbox_with_status("dropped").unwrap().into_iter())
+        .map(|r| r.text)
+        .collect();
+    assert!(
+        texts.contains(&"[message from someone not paired]".to_string()),
+        "{texts:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_near_miss_pair_text_is_stored_cut() {
     let (home, gw) = paired_gateway("pair-near-miss");
     let code = pair_code(&gw, "p1").await;
@@ -2602,7 +2648,11 @@ async fn a_near_miss_pair_text_is_stored_cut() {
     let texts: Vec<String> = (store.inbox_with_status("dropped").unwrap().into_iter())
         .map(|r| r.text)
         .collect();
-    assert_eq!(texts, ["/pair", "/pair"]);
+    // A code is out, so neither is kept at all: the stranger's placeholder.
+    assert_eq!(
+        texts,
+        [zephyr::pairing::UNPAIRED, zephyr::pairing::UNPAIRED]
+    );
     gw.shutdown().await;
 }
 

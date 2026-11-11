@@ -2004,17 +2004,25 @@ impl<'a> Router<'a> {
         if m.text.trim().is_empty() {
             return answer.stored(); // attachment-only messages are not handled in v1
         }
-        // A pairing claim, before the owner check would drop it, on every intake path.
-        if let Some(code) = crate::pairing::claim_on(&m.channel, &m.text) {
-            return self.claim(m, &code, name, answer).await;
-        }
         // Decided before the write: a crash in between must not leave a stranger's row `new`.
         let owner = self.cfg.is_owner(&m.channel, &m.sender);
+        let stranger_while_out = !owner && self.code_out(&m.channel);
+        // A pairing claim, before the owner check would drop it, on every intake path; a
+        // stranger's bare code too while one is out.
+        let claimed = crate::pairing::claim_on(&m.channel, &m.text)
+            .or_else(|| stranger_while_out.then(|| crate::pairing::bare(&m.text))?);
+        if let Some(code) = claimed {
+            return self.claim(m, &code, name, answer).await;
+        }
         let status = if owner { "new" } else { "dropped" };
         // A `/pair …` on Telegram or Signal is stored as `/pair`: a near miss holds most of a
-        // code. The command itself still reads what was sent.
-        let cut =
-            crate::pairing::stored(&m.channel, &m.text).map(|text| Inbound { text, ..m.clone() });
+        // code. While a code is out, a stranger's text there is not kept at all. The command
+        // itself still reads what was sent.
+        let kept = match stranger_while_out {
+            true => Some(crate::pairing::UNPAIRED.to_string()),
+            false => crate::pairing::stored(&m.channel, &m.text),
+        };
+        let cut = kept.map(|text| Inbound { text, ..m.clone() });
         let id = match self
             .store
             .insert_inbox_as(cut.as_ref().unwrap_or(&m), status)
@@ -3822,6 +3830,19 @@ impl<'a> Router<'a> {
         let told = notify_owners(&self.cfg, &self.store, &text, Some((channel, id)));
         log(told.map_err(Into::into));
         self.show(&text, None, None);
+    }
+
+    /// Whether a pairing code is out for `channel` (a pairing channel's), unexpired.
+    fn code_out(&self, channel: &str) -> bool {
+        let row = (crate::pairing::CHANNELS.contains(&channel))
+            .then(|| {
+                self.store
+                    .meta(&crate::pairing::meta_key(channel))
+                    .ok()
+                    .flatten()
+            })
+            .flatten();
+        row.is_some_and(|r| crate::pairing::live(&r, crate::now()).is_some())
     }
 
     /// `/unpair CHANNEL ID`, from any owner channel: it only takes away.

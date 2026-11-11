@@ -89,11 +89,36 @@ pub fn claim_on(channel: &str, text: &str) -> Option<String> {
     CHANNELS.contains(&channel).then(|| claimed(text)).flatten()
 }
 
-/// The code a message claims with, as typed: its whole text is `/pair CODE`, CODE a code's
-/// shape (ten base32 characters; case, the hyphen and spaces aside). `/pair telegram` is not a
-/// claim but the command, which a strong channel may send.
+/// What a stranger's text on a pairing channel is stored as while a code is out for it: never
+/// as typed, since it may hold the code in a form no claim reads.
+pub const UNPAIRED: &str = "[message from someone not paired]";
+
+/// The code a message claims with, as typed: `/pair CODE`, `/pair@bot CODE` (Telegram adds the
+/// bot's name to a command picked from its menu) or `/pairCODE`, CODE a code's shape (ten base32
+/// characters; case, the hyphen and spaces aside). `/pair telegram` is not a claim but the
+/// command, which a strong channel may send.
 pub fn claimed(text: &str) -> Option<String> {
-    let code = typed(text.trim().strip_prefix("/pair ")?);
+    let text = text.trim();
+    let (first, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+    let word = first.to_ascii_lowercase();
+    let code = match word.strip_prefix("/pair") {
+        Some("") => rest,
+        Some(bot) if bot.starts_with('@') => rest,
+        Some(_) if rest.is_empty() => &first["/pair".len()..],
+        _ => return None,
+    };
+    shaped(typed(code))
+}
+
+/// A text that is only a code (`ABCDE-FGHJK`): a claim when a stranger sends it while a code
+/// is out (the router checks both).
+pub fn bare(text: &str) -> Option<String> {
+    let text = text.trim();
+    let one_word = !text.contains(char::is_whitespace) && !text.starts_with('/');
+    (text.len() <= 12 && one_word).then(|| shaped(typed(text)))?
+}
+
+fn shaped(code: String) -> Option<String> {
     let base32 = |b: u8| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b);
     (code.len() == 10 && code.bytes().all(base32)).then_some(code)
 }
@@ -181,5 +206,16 @@ mod tests {
         assert_eq!(claimed("/pair ABCDE-FGHJ1"), None);
         assert_eq!(claimed("/pair ABCDE-FGHJKL"), None);
         assert_eq!(claim_on("telegram", "/pair telegram"), None);
+        // Telegram's menu form, and the code run on.
+        assert_eq!(
+            claimed("/pair@zephyr_bot abcde-fghjk"),
+            Some("ABCDEFGHJK".into())
+        );
+        assert_eq!(claimed("/pairABCDE-FGHJK"), Some("ABCDEFGHJK".into()));
+        assert_eq!(claimed("/pairing"), None);
+        assert_eq!(claimed("/pair@zephyr_bot telegram"), None);
+        assert_eq!(bare(" abcde-fghjk "), Some("ABCDEFGHJK".into()));
+        assert_eq!(bare("hello there"), None);
+        assert_eq!(bare("/pair ABCDE-FGHJK"), None);
     }
 }
