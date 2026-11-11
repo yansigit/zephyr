@@ -999,7 +999,7 @@ const MAX_REQUEST: usize = 1 << 20;
 const STEER_WAIT: Duration = Duration::from_secs(2);
 /// How long a wrapper the owner let go has to say whether it ran (M2): its reads of the page
 /// again (I4) take a few of its 20 s questions at most.
-const REPORT_WAIT: Duration = Duration::from_secs(180);
+pub const REPORT_WAIT: Duration = Duration::from_secs(180);
 /// The longest report read: `{"ran": true}`.
 const MAX_REPORT: u64 = 256;
 
@@ -1040,6 +1040,20 @@ struct Wire {
     /// `"wait"`: a browser or desktop wrapper found the owner holding the desktop (DESIGN §4.11).
     #[serde(default)]
     desktop: Option<String>,
+    /// A site: the browser wrapper asks for its next slot there (DESIGN §4.24), for `count`
+    /// navigations or clicks.
+    #[serde(default)]
+    pace: Option<String>,
+    #[serde(default)]
+    count: Option<u32>,
+    /// With `pace`: only whether the slot would be refused, reserving nothing (asked before the
+    /// owner is).
+    #[serde(default)]
+    check: bool,
+    /// With `pace`: the furthest slot taken (after the owner's `allow`, so the wrapper's report
+    /// arrives inside [`REPORT_WAIT`]).
+    #[serde(default)]
+    max_ms: Option<u64>,
     #[serde(default)]
     args: Value,
     #[serde(default)]
@@ -1084,6 +1098,7 @@ pub async fn serve(
     let store = Arc::new(Mutex::new(store));
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
     let desktop_waits = Arc::new(tokio::sync::Semaphore::new(DESKTOP_WAITS));
+    let pace = Arc::new(Pace::default());
     let mut conns = FuturesUnordered::new();
     loop {
         tokio::select! {
@@ -1100,6 +1115,7 @@ pub async fn serve(
                         main: main.clone(),
                         desktop: desktop.clone(),
                         desktop_waits: desktop_waits.clone(),
+                        pace: pace.clone(),
                     };
                     conns.push(conn.run(stream, wake, slot));
                 }
@@ -1151,6 +1167,135 @@ struct Conn {
     desktop: Arc<crate::desktop::Control>,
     /// The places of the wrappers that wait on the desktop ([`DESKTOP_WAITS`]).
     desktop_waits: Arc<tokio::sync::Semaphore>,
+    /// Every site's next slot for the browser wrappers (DESIGN §4.24).
+    pace: Arc<Pace>,
+}
+
+/// A site's next slot further off than this is refused (DESIGN §4.24).
+pub const PACE_MAX_WAIT: Duration = Duration::from_secs(120);
+
+const PACE_BATCH: &str = "not run: with browser pacing on, a batch takes at most one navigation \
+                          or click; run the others as separate commands";
+
+/// The most sites [`Pace`] keeps; past it the one due soonest goes.
+const PACE_SITES: usize = 4096;
+
+/// Each site's next free moment for the agent's browser navigations and clicks (DESIGN §4.24):
+/// one map for every wrapper process, made once in [`serve`].
+#[derive(Default)]
+pub struct Pace(Mutex<Slots>);
+
+/// [`Pace`]'s map, with the same entries ordered by moment, so that the passed and the soonest
+/// go without a scan: every request is O(log n) under the lock.
+#[derive(Default)]
+struct Slots {
+    next: std::collections::HashMap<String, std::time::Instant>,
+    due: std::collections::BTreeSet<(std::time::Instant, String)>,
+}
+
+impl Slots {
+    /// Drops up to two passed entries (as many as one request adds, and one more, so none piles
+    /// up), then, with no room for `site`, the entry due soonest.
+    fn trim(&mut self, site: &str, now: std::time::Instant) {
+        for _ in 0..2 {
+            if self.due.first().is_none_or(|(at, _)| *at > now) {
+                break;
+            }
+            self.pop();
+        }
+        if self.next.len() >= PACE_SITES && !self.next.contains_key(site) {
+            self.pop();
+        }
+    }
+
+    fn pop(&mut self) {
+        if let Some((_, site)) = self.due.pop_first() {
+            self.next.remove(&site);
+        }
+    }
+
+    fn set(&mut self, site: &str, at: std::time::Instant) {
+        if let Some(old) = self.next.insert(site.to_string(), at) {
+            self.due.remove(&(old, site.to_string()));
+        }
+        self.due.insert((at, site.to_string()));
+    }
+}
+
+impl Pace {
+    /// Reserves `site`'s next slot for `count` actions: the wait until it, or the refusal (a
+    /// slot further off than `max`, at most [`PACE_MAX_WAIT`], too). The slot after it is
+    /// `pace × (1 + r)` later, `r` in [0, 0.5). A pace of 0 stores nothing.
+    pub fn reserve(
+        &self,
+        site: &str,
+        count: u32,
+        pace: Duration,
+        max: Duration,
+        now: std::time::Instant,
+        r: f64,
+    ) -> Result<Duration, String> {
+        self.slot(site, count, pace, max, now, Some(r))
+    }
+
+    /// What [`Pace::reserve`] would refuse, reserving nothing: asked before the owner is, so
+    /// they never approve a click pacing would refuse. An empty `site` (not read yet) is
+    /// checked for the batch only.
+    pub fn check(
+        &self,
+        site: &str,
+        count: u32,
+        pace: Duration,
+        now: std::time::Instant,
+    ) -> Result<(), String> {
+        self.slot(site, count, pace, PACE_MAX_WAIT, now, None)
+            .map(|_| ())
+    }
+
+    fn slot(
+        &self,
+        site: &str,
+        count: u32,
+        pace: Duration,
+        max: Duration,
+        now: std::time::Instant,
+        reserve: Option<f64>,
+    ) -> Result<Duration, String> {
+        if pace.is_zero() {
+            return Ok(Duration::ZERO);
+        }
+        if count > 1 {
+            return Err(PACE_BATCH.into());
+        }
+        if site.is_empty() {
+            return Ok(Duration::ZERO);
+        }
+        let mut slots = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        slots.trim(site, now);
+        let slot = slots.next.get(site).map_or(now, |at| (*at).max(now));
+        let wait = slot - now;
+        if wait > max.min(PACE_MAX_WAIT) {
+            return Err(format!(
+                "zephyr: too many browser actions are queued for {site}; wait, then try again"
+            ));
+        }
+        if let Some(r) = reserve {
+            slots.set(site, slot + pace.mul_f64(1.0 + r));
+        }
+        Ok(wait)
+    }
+}
+
+/// A draw in [0, 0.5) for [`Pace::reserve`]; 0 if the system's randomness fails.
+fn pace_draw() -> f64 {
+    let mut b = [0u8; 8];
+    let ok = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut b).is_ok();
+    let x = (u64::from_le_bytes(b) >> 11) as f64 / (1u64 << 53) as f64;
+    if ok {
+        x / 2.0
+    } else {
+        0.0
+    }
 }
 
 /// Wrappers that may wait on the desktop at once, each up to `Config::desktop_hold`. They wait
@@ -1192,6 +1337,35 @@ impl Conn {
                 let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
                 return;
             }
+        }
+        if let Ok(Wire {
+            v: 1,
+            pace: Some(site),
+            count,
+            check,
+            max_ms,
+            ..
+        }) = serde_json::from_slice::<Wire>(&line)
+        {
+            // Answered at once and not audited: pacing decides nothing about what may run.
+            let pace = Duration::from_millis(self.cfg.pace_ms());
+            let now = std::time::Instant::now();
+            let count = count.unwrap_or(1);
+            let named = (check || !site.is_empty()) && site.len() <= 253;
+            let answer = match (named && line.len() <= MAX_REQUEST, check) {
+                (false, _) => Err("not run: the gate could not read the request".to_string()),
+                (true, true) => (self.pace.check(&site, count, pace, now))
+                    .map(|()| serde_json::json!({"verdict": "allow", "on": !pace.is_zero()})),
+                (true, false) => {
+                    let max = max_ms.map_or(PACE_MAX_WAIT, Duration::from_millis);
+                    let wait = (self.pace).reserve(&site, count, pace, max, now, pace_draw());
+                    wait.map(|w| serde_json::json!({"verdict": "allow", "wait_ms": w.as_millis() as u64}))
+                }
+            };
+            let answer =
+                answer.unwrap_or_else(|text| serde_json::json!({"verdict": "deny", "text": text}));
+            let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
+            return;
         }
         // Only what reaches the gate this way: main's `exec` is decided in the router.
         let served = |w: &Wire| matches!(w.tool.as_str(), "bash" | "mcp_call" | "browser");
@@ -1442,6 +1616,12 @@ fn ending(said: Option<Option<Value>>) -> Ending {
         Some(Some(v)) if v["ran"] == true => ("done", "the browser went on", None),
         // The wrapper found the owner holding the desktop after the `allow`.
         Some(Some(v)) if v["ran"] == false && v["held"] == true => HELD_ENDING,
+        // Pacing refused its slot after the `allow` (DESIGN §4.24).
+        Some(Some(v)) if v["ran"] == false && v["paced"] == true => (
+            "failed",
+            "not run: too many browser actions were queued for its site (pacing)",
+            Some(" did not run: too many browser actions were queued for its site (pacing)"),
+        ),
         Some(Some(v)) if v["ran"] == false => (
             "failed",
             "not run: the page changed while the owner decided",
@@ -3951,6 +4131,16 @@ mod tests {
                 ("failed", "not run: the owner had the desktop"),
                 Some("did not run: you had the desktop"),
             ),
+            // Pacing refused its slot after the `allow`: not a page that changed either.
+            (
+                5,
+                Some("{\"ran\": false, \"paced\": true}"),
+                (
+                    "failed",
+                    "not run: too many browser actions were queued for its site (pacing)",
+                ),
+                Some("did not run: too many browser actions were queued for its site (pacing)"),
+            ),
         ] {
             let req = json!({"v": 1, "session": "task-1", "tool": "browser",
                 "args": {"argv": ["click", "@e3"]},
@@ -4094,6 +4284,273 @@ mod tests {
         assert_eq!(
             (a.origin.channel.as_str(), a.origin.run.as_str()),
             ("", "main:0")
+        );
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
+    }
+
+    // ---- browser pacing (DESIGN §4.24) ----
+
+    const SEC: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn pace_gaps_on_one_site_lie_in_pace_to_one_and_a_half() {
+        let pace = Pace::default();
+        let now = std::time::Instant::now();
+        let mut last = None;
+        for r in [0.0, 0.49, 0.25, 0.0, 0.4999] {
+            let wait = pace
+                .reserve("example.com", 1, SEC, PACE_MAX_WAIT, now, r)
+                .unwrap();
+            if let Some(last) = last {
+                let gap: Duration = wait - last;
+                assert!(gap >= SEC && gap < SEC.mul_f64(1.5), "{gap:?}");
+            }
+            last = Some(wait);
+        }
+        assert_eq!(
+            pace.reserve("example.com", 1, SEC, PACE_MAX_WAIT, now, 0.0),
+            Ok(last.unwrap() + SEC.mul_f64(1.4999))
+        );
+    }
+
+    #[test]
+    fn two_sites_do_not_wait_on_each_other() {
+        let pace = Pace::default();
+        let now = std::time::Instant::now();
+        assert_eq!(
+            pace.reserve("example.com", 1, SEC, PACE_MAX_WAIT, now, 0.0),
+            Ok(Duration::ZERO)
+        );
+        assert_eq!(
+            pace.reserve("example.com", 1, SEC, PACE_MAX_WAIT, now, 0.0),
+            Ok(SEC)
+        );
+        assert_eq!(
+            pace.reserve("other.test", 1, SEC, PACE_MAX_WAIT, now, 0.0),
+            Ok(Duration::ZERO)
+        );
+        // A slot already passed is now.
+        let later = now + 5 * SEC;
+        assert_eq!(
+            pace.reserve("example.com", 1, SEC, PACE_MAX_WAIT, later, 0.0),
+            Ok(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn a_batch_of_two_and_a_slot_past_two_minutes_are_refused_and_reserve_nothing() {
+        let pace = Pace::default();
+        let now = std::time::Instant::now();
+        let batch = "not run: with browser pacing on, a batch takes at most one navigation or \
+                     click; run the others as separate commands";
+        assert_eq!(
+            pace.reserve("a.test", 2, SEC, PACE_MAX_WAIT, now, 0.0),
+            Err(batch.into())
+        );
+        assert_eq!(
+            pace.reserve("a.test", 1, SEC, PACE_MAX_WAIT, now, 0.0),
+            Ok(Duration::ZERO)
+        );
+        let minute = 60 * SEC;
+        let b = |at| pace.reserve("b.test", 1, minute, PACE_MAX_WAIT, at, 0.0);
+        assert_eq!(b(now), Ok(Duration::ZERO));
+        assert_eq!(b(now), Ok(minute));
+        assert_eq!(b(now), Ok(PACE_MAX_WAIT), "two minutes is still taken");
+        let queued = "zephyr: too many browser actions are queued for b.test; wait, then try again";
+        assert_eq!(b(now), Err(queued.into()));
+        assert_eq!(b(now), Err(queued.into()));
+        // Nothing was reserved: a minute on, the next slot is three minutes after the first.
+        assert_eq!(b(now + minute), Ok(PACE_MAX_WAIT));
+    }
+
+    /// A check (asked before the owner is) refuses what a reservation would and reserves
+    /// nothing; a reservation with a ceiling (after the owner's `allow`) refuses a slot past it
+    /// and reserves nothing either.
+    #[test]
+    fn a_check_reserves_nothing_and_a_ceiling_refuses_past_it() {
+        let pace = Pace::default();
+        let now = std::time::Instant::now();
+        let batch = Err(PACE_BATCH.to_string());
+        assert_eq!(pace.check("a.test", 2, SEC, now), batch);
+        assert_eq!(pace.check("", 2, SEC, now), batch, "the site not read yet");
+        assert_eq!(pace.check("a.test", 2, Duration::ZERO, now), Ok(()));
+        for _ in 0..3 {
+            assert_eq!(pace.check("a.test", 1, SEC, now), Ok(()));
+        }
+        assert!(pace.0.lock().unwrap().next.is_empty());
+        let minute = 60 * SEC;
+        let b = |max| pace.reserve("b.test", 1, minute, max, now, 0.0);
+        assert_eq!(b(PACE_MAX_WAIT), Ok(Duration::ZERO));
+        let queued = "zephyr: too many browser actions are queued for b.test; wait, then try again";
+        assert_eq!(b(30 * SEC), Err(queued.into()));
+        assert_eq!(b(PACE_MAX_WAIT), Ok(minute), "the refusal reserved nothing");
+        assert_eq!(pace.check("b.test", 1, minute, now), Ok(()));
+        assert_eq!(b(PACE_MAX_WAIT), Ok(PACE_MAX_WAIT));
+        assert_eq!(pace.check("b.test", 1, minute, now), Err(queued.into()));
+    }
+
+    #[test]
+    fn pace_zero_reserves_nothing() {
+        let pace = Pace::default();
+        let now = std::time::Instant::now();
+        for count in [1, 1, 2, 5] {
+            assert_eq!(
+                pace.reserve("a.test", count, Duration::ZERO, PACE_MAX_WAIT, now, 0.3),
+                Ok(Duration::ZERO)
+            );
+        }
+        assert!(pace.0.lock().unwrap().next.is_empty());
+        assert_eq!(
+            pace.reserve("a.test", 1, SEC, PACE_MAX_WAIT, now, 0.0),
+            Ok(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn passed_entries_are_dropped() {
+        let pace = Pace::default();
+        let now = std::time::Instant::now();
+        pace.reserve("a.test", 1, SEC, PACE_MAX_WAIT, now, 0.0)
+            .unwrap();
+        pace.reserve("b.test", 1, SEC, PACE_MAX_WAIT, now, 0.0)
+            .unwrap();
+        assert_eq!(pace.0.lock().unwrap().next.len(), 2);
+        pace.reserve("c.test", 1, SEC, PACE_MAX_WAIT, now + 2 * SEC, 0.0)
+            .unwrap();
+        let slots = pace.0.lock().unwrap();
+        let sites: Vec<&String> = slots.next.keys().collect();
+        assert_eq!(sites, ["c.test"]);
+        assert_eq!(slots.due.len(), 1);
+    }
+
+    /// The map never holds more than [`PACE_SITES`] sites: past it the one due soonest goes,
+    /// and its index by moment stays in step with it.
+    #[test]
+    fn the_pace_map_is_capped() {
+        let pace = Pace::default();
+        let now = std::time::Instant::now();
+        for i in 0..PACE_SITES + 500 {
+            let at = now + Duration::from_millis(i as u64);
+            let wait = pace.reserve(&format!("s{i}.test"), 1, 60 * SEC, PACE_MAX_WAIT, at, 0.0);
+            assert_eq!(wait, Ok(Duration::ZERO));
+            let slots = pace.0.lock().unwrap();
+            assert!(slots.next.len() <= PACE_SITES, "{}", slots.next.len());
+            assert_eq!(slots.next.len(), slots.due.len());
+        }
+        let slots = pace.0.lock().unwrap();
+        assert_eq!(slots.next.len(), PACE_SITES);
+        let last = format!("s{}.test", PACE_SITES + 499);
+        assert!(slots.next.contains_key(&last), "the newest went");
+        assert!(!slots.next.contains_key("s499.test"), "the soonest stayed");
+        drop(slots);
+        // A site already there takes no other's place.
+        pace.reserve(&last, 1, SEC, PACE_MAX_WAIT, now, 0.0)
+            .unwrap();
+        assert!(pace.0.lock().unwrap().next.contains_key("s500.test"));
+    }
+
+    /// Tens of thousands of pace requests on random sites never keep a plain request waiting:
+    /// each is answered within a generous bound while they go on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flood_of_pace_requests_does_not_slow_a_gated_request() {
+        let h = home("gate-pace-flood", "");
+        let (socket, _) = serving(&h).await;
+        let floods: Vec<_> = (0..4)
+            .map(|t| {
+                let socket = socket.clone();
+                std::thread::spawn(move || {
+                    use std::io::{BufRead, Write};
+                    let mut sent = 0;
+                    while sent < 10_000 {
+                        let site = format!("{:x}-{t}-{sent}.test", pace_draw().to_bits());
+                        let req = json!({"v": 1, "pace": site, "count": 1, "session": "t"});
+                        let Ok(mut conn) = std::os::unix::net::UnixStream::connect(&socket) else {
+                            continue;
+                        };
+                        let _ = conn.write_all(format!("{req}\n").as_bytes());
+                        let mut line = String::new();
+                        let _ = std::io::BufReader::new(conn).read_line(&mut line);
+                        sent += 1;
+                    }
+                    sent
+                })
+            })
+            .collect();
+        let ls = json!({"v": 1, "session": "task-1", "tool": "bash", "args": {"command": "ls"}});
+        let mut asked = 0;
+        while asked < 5 || !floods.iter().all(|f| f.is_finished()) {
+            let answered = tokio::time::timeout(10 * SEC, ask(&socket, &ls)).await;
+            let answer = answered.expect("the gate kept a plain request waiting");
+            assert_eq!(answer.unwrap()["verdict"], "allow");
+            asked += 1;
+        }
+        let sent: usize = floods.into_iter().map(|f| f.join().unwrap()).sum();
+        assert_eq!(sent, 40_000);
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
+    }
+
+    /// The wrapper asks for its slot and is answered at once, the wait for it to sleep; nothing
+    /// is audited.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_gate_answers_a_pace_request_at_once() {
+        let h = home("gate-pace", "");
+        let (socket, _) = serving(&h).await;
+        let req = |site: &str, count: u32| json!({"v": 1, "pace": site, "count": count, "session": "task-1"});
+        let started = std::time::Instant::now();
+        assert_eq!(
+            ask(&socket, &req("example.com", 1)).await.unwrap(),
+            json!({"verdict": "allow", "wait_ms": 0})
+        );
+        let second = ask(&socket, &req("example.com", 1)).await.unwrap();
+        assert_eq!(second["verdict"], "allow", "{second}");
+        let wait = second["wait_ms"].as_u64().unwrap();
+        assert!((1500..2250).contains(&wait), "{wait}");
+        assert!(started.elapsed() < SEC, "answered only after the wait");
+        let batch = ask(&socket, &req("example.com", 2)).await.unwrap();
+        assert_eq!(batch["verdict"], "deny", "{batch}");
+        assert!(batch["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("not run: with browser pacing on"));
+        let empty = ask(&socket, &req("", 1)).await.unwrap();
+        assert_eq!(empty["verdict"], "deny", "{empty}");
+        // A check, before the owner is asked: what a reservation would refuse, reserving nothing.
+        let mut check = req("example.com", 1);
+        check["check"] = json!(true);
+        assert_eq!(
+            ask(&socket, &check).await.unwrap(),
+            json!({"verdict": "allow", "on": true})
+        );
+        check["pace"] = json!("");
+        assert_eq!(
+            ask(&socket, &check).await.unwrap(),
+            json!({"verdict": "allow", "on": true}),
+            "the site not read yet: is pacing on?"
+        );
+        check["count"] = json!(2);
+        assert_eq!(ask(&socket, &check).await.unwrap()["verdict"], "deny");
+        // After the owner's `allow`: a slot past the ceiling is refused.
+        let mut within = req("example.com", 1);
+        within["max_ms"] = json!(1000);
+        let late = ask(&socket, &within).await.unwrap();
+        assert_eq!(late["verdict"], "deny", "{late}");
+        assert!(late["text"]
+            .as_str()
+            .unwrap()
+            .contains("too many browser actions"));
+        assert!(outcomes(&h.store).is_empty(), "{:?}", outcomes(&h.store));
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
+    }
+
+    /// With pacing off a check says so, so that a `back` need not read the page's address.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_check_with_pacing_off_says_it_is_off() {
+        let h = home("gate-pace-off", "[browser]\npace_ms = 0\n");
+        let (socket, _) = serving(&h).await;
+        let check = json!({"v": 1, "pace": "", "count": 2, "check": true, "session": "main"});
+        assert_eq!(
+            ask(&socket, &check).await.unwrap(),
+            json!({"verdict": "allow", "on": false})
         );
         let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
     }

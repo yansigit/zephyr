@@ -1,0 +1,28 @@
+about = "GitHub: issues, pull requests, code search (github/github-mcp-server 2.1.0, in the image)"
+
+[[secret]]
+name = "GITHUB_TOKEN"
+help = "a fine-grained personal access token: https://github.com/settings/personal-access-tokens/new"
+
+[server]
+command = "/usr/local/bin/github-mcp-server"
+args = ["stdio"]
+env = { GITHUB_PERSONAL_ACCESS_TOKEN = "${GITHUB_TOKEN}" }
+# Its REST, GraphQL and raw URLs (pkg/utils/api.go); uploads.github.com is release uploads only.
+hosts = "api.github.com, raw.githubusercontent.com"
+
+# What reaches other people or changes a repository where the tool's name does not say so
+# (add_issue_comment and create_pull_request already do).
+[server.classes]
+issue_write = "posts"
+sub_issue_write = "posts"
+update_issue_comment = "posts"
+update_pull_request = "posts"
+merge_pull_request = "posts"
+pull_request_review_write = "posts"
+add_comment_to_pending_review = "posts"
+create_gist = "posts"
+update_gist = "posts"
+create_repository = "posts"
+fork_repository = "posts"
+delete_repository = "posts"

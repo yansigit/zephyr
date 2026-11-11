@@ -1,0 +1,13 @@
+about = "Home Assistant: its MCP Server integration at /api/mcp, through mcp-remote 0.16.6. No approval class covers a lock or a garage door: expose only safe entities to Assist in Home Assistant"
+# The owner gives --url, e.g. https://home.example.com/api/mcp. An http:// one needs --plain (the
+# proxy swaps only on HTTPS) and a network.allow entry for HOST:8123.
+needs_url = true
+
+[[secret]]
+name = "HA_TOKEN"
+help = "a long-lived access token: your Home Assistant profile, Security, Long-lived access tokens"
+
+[server]
+command = "npx"
+args = ["-y", "mcp-remote@0.16.6", "{url}", "--transport", "http-only", "--enable-proxy", "--allow-http", "--header", "Authorization: Bearer ${HA_TOKEN}"]
+hosts = "{host}"

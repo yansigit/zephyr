@@ -58,6 +58,9 @@ case "$1" in
       [ -n "$SHIM_EDIT" ] && echo "$SHIM_EDIT" >> "$HOME/.zephyr-daemon/zephyr.toml" ;;
     esac
     case " $* " in
+      # The image's connector catalog (DESIGN §4.22), served from $SHIM_DIR/connectors.
+      *" /usr/bin/cat /opt/zephyr/connectors/"*) f="$SHIM_DIR/connectors/$(basename "${@: -1}")"; [ -f "$f" ] || { echo "cat: no such file" >&2; exit 1; }; cat "$f" ;;
+      *" /usr/bin/ls /opt/zephyr/connectors "*) ls "$SHIM_DIR/connectors" ;;
       *" --list-models "*) printf 'provider model context\nanthropic claude-sonnet-5 200K\nopenai-codex gpt-5.5 400K\nopenai-codex gpt-5.4 400K\n' ;;
       *" auth check "*) echo '{"ready":true,"provider":"claude-code","source":"auth.json"}' ;;
       *" zephyr status "*) echo "daemon: ${SHIM_DAEMON:-running}"; [ -n "$SHIM_STATUS" ] && printf '%b\n' "$SHIM_STATUS"; exit "${SHIM_STATUS_EXIT:-0}" ;;
@@ -989,6 +992,163 @@ fn mcp_add_takes_hosts_and_plain_and_keeps_them() {
     let out = env.zephyr(&["mcp", "add", "mail", "--host", "*.mail.test", "--", "x"]);
     assert!(!out.status.success());
     assert_eq!(env.config(), before);
+}
+
+/// The image's catalog, as the fake container serves it.
+fn with_catalog(env: &Env) {
+    let to = env.dir.join("connectors");
+    std::fs::create_dir_all(&to).unwrap();
+    let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/connectors");
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+    }
+}
+
+/// DESIGN §4.22: a catalog entry becomes an ordinary `[[mcp]]` table, read from the image's copy,
+/// and adding it again keeps where the owner sends its secret and the classes they gave.
+#[test]
+fn mcp_add_from_the_catalog_writes_the_entry_and_keeps_the_owners_choices() {
+    let env = Env::new("mcp-catalog");
+    env.init(&["--no-start"]);
+    with_catalog(&env);
+    let out = env.ok(&["mcp", "add", "--catalog", "github"]);
+    let config = env.config();
+    assert!(
+        config.contains("/usr/local/bin/github-mcp-server"),
+        "{config}"
+    );
+    assert!(
+        config.contains("GITHUB_PERSONAL_ACCESS_TOKEN = \"${GITHUB_TOKEN}\""),
+        "{config}"
+    );
+    assert!(
+        config.contains("hosts = \"api.github.com, raw.githubusercontent.com\""),
+        "{config}"
+    );
+    assert!(
+        config.contains("merge_pull_request = \"posts\""),
+        "{config}"
+    );
+    assert!(!config.contains("secrets ="), "{config}");
+    let said = out;
+    assert_eq!(
+        said.matches("zephyr mcp add github --secret GITHUB_TOKEN")
+            .count(),
+        1,
+        "{said}"
+    );
+    // The owner widens the hosts and lets a merge through; secrets.env gets the token.
+    let path = env.daemon().join("zephyr.toml");
+    let edited = config
+        .replace(
+            "hosts = \"api.github.com, raw.githubusercontent.com\"",
+            "hosts = \"api.github.com, evil.test\"",
+        )
+        .replace(
+            "merge_pull_request = \"posts\"",
+            "merge_pull_request = \"none\"",
+        );
+    std::fs::write(&path, edited).unwrap();
+    let secrets = env.daemon().join("secrets.env");
+    let mut text = std::fs::read_to_string(&secrets).unwrap_or_default();
+    text.push_str("GITHUB_TOKEN=x\n");
+    std::fs::write(&secrets, text).unwrap();
+    let out = env.ok(&["mcp", "add", "--catalog", "github"]);
+    let config = env.config();
+    // The class stays the owner's; the hosts are the entry's again, never an old table's.
+    assert!(
+        config.contains("hosts = \"api.github.com, raw.githubusercontent.com\""),
+        "{config}"
+    );
+    assert!(!config.contains("evil.test"), "{config}");
+    assert!(config.contains("merge_pull_request = \"none\""), "{config}");
+    assert!(config.contains("issue_write = \"posts\""), "{config}");
+    assert_eq!(config.matches("[[mcp]]").count(), 1, "{config}");
+    // Recorded as the catalog's, for doctor's note, in the daemon's own file (review of #53, 11).
+    let added =
+        || std::fs::read_to_string(env.daemon().join("catalog-added.json")).unwrap_or_default();
+    assert_eq!(added(), "[\"github\"]");
+    assert!(!config.contains("catalog"), "{config}");
+    assert!(!out.contains("GITHUB_TOKEN"), "{out}");
+    // An entry the image does not have, and a name that is no file name, are refused.
+    for name in ["nope", "../etc/passwd"] {
+        let out = env.zephyr(&["mcp", "add", "--catalog", name]);
+        assert!(!out.status.success(), "{name}");
+    }
+    // Written again by hand, it is the owner's own.
+    env.ok(&["mcp", "add", "github", "--", "my-github-server"]);
+    assert_eq!(added(), "[]");
+}
+
+/// DESIGN §4.22: an entry that can only hold its real key says why, and is written only once
+/// the owner accepts it with `--plain`.
+#[test]
+fn catalog_entries_that_hold_their_key_in_plain_need_plain() {
+    let env = Env::new("mcp-catalog-plain");
+    env.init(&["--no-start"]);
+    with_catalog(&env);
+    let refused = |args: &[&str]| {
+        let before = env.config();
+        let out = env.zephyr(args);
+        assert!(!out.status.success(), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(err.contains("add --plain"), "{err}");
+        assert_eq!(env.config(), before);
+    };
+    refused(&["mcp", "add", "--catalog", "brave-search"]);
+    let ha = ["mcp", "add", "--catalog", "home-assistant"];
+    let lan = [&ha[..], &["--url", "http://ha.lan:8123/api/mcp"]].concat();
+    refused(&lan);
+    // Without a URL it cannot be written at all.
+    assert!(!env.zephyr(&ha).status.success());
+    env.ok(&["mcp", "add", "--catalog", "brave-search", "--plain"]);
+    env.ok(&[&lan[..], &["--plain"]].concat());
+    let config = env.config();
+    assert_eq!(config.matches("secrets = \"plain\"").count(), 2, "{config}");
+    assert!(config.contains("http://ha.lan:8123/api/mcp"), "{config}");
+    assert!(config.contains("hosts = \"ha.lan:8123\""), "{config}");
+    // A `plain` written before is no consent for this add (review of #53).
+    refused(&["mcp", "add", "--catalog", "brave-search"]);
+    // Over HTTPS the stand-in works: no `--plain` needed, and the old `plain` goes, said.
+    let out = env.ok(&[&ha[..], &["--url", "https://ha.example.com/api/mcp"]].concat());
+    assert!(out.contains("now it holds a stand-in"), "{out}");
+    let config = env.config();
+    let ha = config
+        .split("[[mcp]]")
+        .find(|t| t.contains("home-assistant"))
+        .unwrap();
+    assert!(
+        !ha.contains("secrets") && ha.contains("hosts = \"ha.example.com\""),
+        "{config}"
+    );
+}
+
+#[test]
+fn mcp_catalog_lists_the_entries_and_needs_the_container() {
+    let env = Env::new("mcp-catalog-list");
+    env.init(&["--no-start"]);
+    with_catalog(&env);
+    let out = env.ok(&["mcp", "catalog"]);
+    let lines: Vec<String> = out.lines().map(String::from).collect();
+    let names: Vec<&str> = lines.iter().filter_map(|l| l.split(':').next()).collect();
+    assert_eq!(
+        names,
+        [
+            "brave-search",
+            "context7",
+            "github",
+            "home-assistant",
+            "linear",
+            "notion"
+        ]
+    );
+    let out = env.zephyr_env(
+        &["mcp", "add", "--catalog", "context7"],
+        &[("SHIM_STATE", "exited")],
+    );
+    assert!(!out.status.success());
+    assert!(!env.config().contains("context7"));
 }
 
 #[test]

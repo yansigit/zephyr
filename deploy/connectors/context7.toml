@@ -1,0 +1,4 @@
+about = "Context7: current documentation for libraries and frameworks (Upstash's remote server; no key needed)"
+
+[server]
+url = "https://mcp.context7.com/mcp"

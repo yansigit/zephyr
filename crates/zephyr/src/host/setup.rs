@@ -897,7 +897,13 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
     // Where its secrets are sent (DESIGN §4.21), or `--plain` to hand it the real ones.
     let hosts = a.values("--host")?;
     let plain = a.flag("--plain");
+    // A ready-made entry from the image's catalog (DESIGN §4.22).
+    let catalog = a.value("--catalog")?;
     let rest = a.rest()?;
+    // Whether this writes a connector's table by hand (not `add NAME --secret K` alone).
+    let by_hand = url.is_some() || !command.is_empty();
+    // The catalog entry's secrets secrets.env lacks, asked for (or named) once it is saved.
+    let mut wanted: Vec<crate::catalog::Secret> = Vec::new();
     let mut doc = h.data.load()?;
     let parse = |doc: &toml_edit::DocumentMut| -> anyhow::Result<Config> {
         let cfg: Config = toml::from_str(&doc.to_string())?;
@@ -905,8 +911,55 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
         Ok(cfg)
     };
     let was = parse(&doc).ok();
-    let usage = "usage: zephyr mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. [--host HOST].. [--plain] | list | rm NAME";
+    let usage = "usage: zephyr mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. [--host HOST].. [--plain] | add --catalog NAME [--url URL] [--host HOST].. [--plain] | catalog | list | rm NAME";
+    // The image's copy of an entry, read as root by full path (`valid_name` first: it becomes a path).
+    let entry_text = |name: &str| -> anyhow::Result<String> {
+        if !crate::drafts::valid_name(name) {
+            bail!("no catalog entry named {name:?}");
+        }
+        let path = format!("{}/{name}.toml", crate::catalog::DIR);
+        output(&mut h.exec(&[], &[], &["/usr/bin/cat", &path])).with_context(|| {
+            format!("no catalog entry named {name} (zephyr mcp catalog lists them)")
+        })
+    };
     match &rest[..] {
+        [list] if list == "catalog" && catalog.is_none() => {
+            h.need_running()?;
+            let names = output(&mut h.exec(&[], &[], &["/usr/bin/ls", crate::catalog::DIR]))?;
+            let mut names: Vec<&str> = names
+                .lines()
+                .filter_map(|n| n.strip_suffix(".toml"))
+                .collect();
+            names.sort();
+            for name in names {
+                let e = crate::catalog::parse(name, &entry_text(name)?)?;
+                println!("{name}: {}", e.about);
+            }
+            return Ok(());
+        }
+        [add] if add == "add" && catalog.is_some() => {
+            let name = catalog.as_deref().unwrap_or_default();
+            h.need_running()?;
+            let entry = crate::catalog::parse(name, &entry_text(name)?)?;
+            let old = parse(&doc)
+                .ok()
+                .and_then(|c| c.mcp.into_iter().find(|m| m.name == name));
+            // Only this add's `--plain`: an old table's is no consent for this one (DESIGN §4.22).
+            if let Some(why) = entry.plain_needed(url.as_deref()).filter(|_| !plain) {
+                bail!("{why}: add --plain to hand it the real key, which the agent can then read");
+            }
+            let m =
+                crate::catalog::merged(entry.to_mcp(url.as_deref())?, old.as_ref(), &hosts, plain);
+            if let Some(note) = crate::catalog::lost_plain(old.as_ref(), &m) {
+                println!("{name}: {note}");
+            }
+            conf::upsert_mcp(&mut doc, &m)?;
+            let set = crate::dotenv::parse(&h.data.read("secrets.env").unwrap_or_default());
+            let lacks = |s: &crate::catalog::Secret| !set.iter().any(|(k, _)| *k == s.name);
+            wanted = (entry.secrets.into_iter())
+                .filter(|s| lacks(s) && !secrets.contains(&s.name))
+                .collect();
+        }
         [list] if list == "list" => {
             for m in parse(&doc)?.mcp {
                 println!("{}: {}", m.name, m.url.or(m.command).unwrap_or_default());
@@ -998,8 +1051,45 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
             .interact()?;
         h.data.set_secret(key, value.trim())?;
     }
+    for s in &wanted {
+        println!("{}: {}", s.name, s.help);
+        if !h.interactive {
+            let name = catalog.as_deref().unwrap_or_default();
+            println!(
+                "set it in a terminal with: zephyr mcp add {name} --secret {}",
+                s.name
+            );
+            continue;
+        }
+        let value = Password::new()
+            .with_prompt(format!("{} (hidden)", s.name))
+            .interact()?;
+        h.data.set_secret(&s.name, value.trim())?;
+    }
     h.data.save(&doc)?;
-    println!("saved {}", rest.join(" "));
+    // Which connectors came from the catalog, for doctor's note (DESIGN §4.22): the daemon's
+    // file, never zephyr.toml.
+    let from_catalog = match (&catalog, &rest[..]) {
+        (Some(name), _) => Some((name.as_str(), true)),
+        (None, [verb, name]) if verb == "rm" || (verb == "add" && by_hand) => {
+            Some((name.as_str(), false))
+        }
+        _ => None,
+    };
+    if let Some((name, on)) = from_catalog {
+        let text = h.data.read(crate::catalog::ADDED).unwrap_or_default();
+        let new = crate::catalog::with_added(&text, name, on);
+        if new != text && (on || !text.is_empty()) {
+            // Only doctor's note hangs on it: an older image's `__file` refuses the name.
+            if let Err(e) = h.data.write(crate::catalog::ADDED, &new) {
+                eprintln!("warn {e:#}: zephyr doctor may not say when a newer catalog entry ships");
+            }
+        }
+    }
+    match &catalog {
+        Some(name) => println!("saved the catalog connector {name}"),
+        None => println!("saved {}", rest.join(" ")),
+    }
     h.apply()
 }
 

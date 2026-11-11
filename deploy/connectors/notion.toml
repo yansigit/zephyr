@@ -1,0 +1,16 @@
+about = "Notion: search, read and edit pages and databases (@notionhq/notion-mcp-server 2.6.1, fetched by npx on first use)"
+
+[[secret]]
+name = "NOTION_TOKEN"
+help = "an internal integration secret: https://www.notion.so/profile/integrations, then share the pages with it"
+
+[server]
+command = "npx"
+args = ["-y", "@notionhq/notion-mcp-server@2.6.1"]
+env = { NOTION_TOKEN = "${NOTION_TOKEN}" }
+hosts = "api.notion.com"
+
+# Tool names are API-<operationId>, so a search reads as a post to the verb rule.
+# API-post-page and API-create-a-comment stay posts by the rule.
+[server.classes]
+API-post-search = "none"

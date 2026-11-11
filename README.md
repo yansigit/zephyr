@@ -147,6 +147,7 @@ wrong](#when-something-goes-wrong) and `zephyr uninstall [--keep-data]`.
 | `zephyr web setup [--yes]` / `web enrol [NAME]` | Put the [web app](#web-app) behind `tailscale serve` and add a first device; later, a one-time code for another device |
 | `zephyr skill add DIR \| list \| rm NAME` | Skills the agent may use (see [Skills and connectors](#skills-and-connectors)); one you add is approved at once |
 | `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. [--host HOST].. [--plain] \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}`; `--host` names where a secret is sent, `--plain` hands the connector the real one |
+| `zephyr mcp add --catalog NAME [--url URL] [--host HOST].. [--plain] \| zephyr mcp catalog` | A ready-made connector from the image's catalog, its secret asked for hidden; `catalog` lists them |
 | `zephyr packages add NAME.. \| rm NAME.. \| list` | Ubuntu (apt) packages for the agent, baked into a local image (`zephyr-local:<version>-<hash>`) on the release one; `up` and `upgrade` build it, and `add`/`rm` rebuild and recreate the container once the agent is idle |
 | `zephyr facts list \| add NAME --kind text\|digits\|email \| rm NAME \| allow NAME TARGET \| disallow NAME TARGET` | Private facts (a phone number, an address) that must not leave in an outgoing call; the value is asked for hidden, or read from one stdin line when piped, never taken as an argument. They are kept in `facts.toml` (0600, with the daemon's files). `/facts` in a chat lists names, kinds and allowed targets and, from `tui` or `chat` only, `rm NAME` and `allow NAME TARGET`; a chat never takes a value. The agent may add a fact (you are told its name); removing one or allowing a target is only proposed |
 | `zephyr vault list \| add login NAME --site URL [--user U] [--totp] \| add token NAME [--host HOST].. \| edit NAME [--host HOST].. \| rm NAME \| revoke NAME [PROGRAM]` | Logins and tokens the agent uses by name (see [The vault](#the-vault)); values are asked for hidden, or read one per line from stdin when piped, never taken as arguments |
@@ -269,7 +270,7 @@ goes back by itself and you are told. The agent can read all of them. What it ma
 
 | Setting | The agent may |
 |---|---|
-| `tasks.parallel`, `mcp.NAME.enabled` (a connector off), `settings.strong_channels` (remove a channel), the `budget.*` limits, the `approvals.*` modes and preset, `approvals.strong_only` (add `money`), `mcp.NAME.classes.TOOL` (put a tool in a class) | make it stricter at once (lower, off, fewer channels, a limit where there was none, a stricter mode or preset); you are told and `/set KEY OLD` puts it back. Its `/set` takes one word, so it can tighten approvals to `ask` but not to `delay 10` |
+| `tasks.parallel`, `browser.pace_ms` (raise it), `mcp.NAME.enabled` (a connector off), `settings.strong_channels` (remove a channel), the `budget.*` limits, the `approvals.*` modes and preset, `approvals.strong_only` (add `money`), `mcp.NAME.classes.TOOL` (put a tool in a class) | make it stricter at once (lower, off, fewer channels, a limit where there was none, a stricter mode or preset); you are told and `/set KEY OLD` puts it back. Its `/set` takes one word, so it can tighten approvals to `ask` but not to `delay 10` |
 | `model`, `thinking`, `tasks.model`, `timezone`, `auth.*`, `approvals.currency`, `network.allow`, subagents, rules, removing a private fact or allowing it a target, and any change of the above that loosens | propose it: a card shows `KEY old → new` (or the exact `/subagent` or `/rule` text, up to 1500 characters), and `/ok N` applies it, `/no N` drops it |
 | `owners`, `[discord]`, `[imessage]`, `[telegram]`, `[signal]`, `[attach]`, `[web]`, `[agent]`, `extensions`, `policy_plugin`, `rpi`, `home`, `state`, the `[[account]]` pool | nothing; edit `zephyr.toml` |
 
@@ -489,6 +490,16 @@ NAME` shows it, `/skill rm NAME` removes an approved skill, and `/skill undo NAM
 last change to it (again to go further back). On the host, `zephyr skill add DIR` adds a skill
 folder of yours, approved at once (at most 32 files and 256 KB, regular files only).
 
+**Starter skills** come with the image and are approved at the first start that sees them, on a
+new install and on an upgrade alike, with a message saying so (and another when a later image adds or updates one): `report` (Markdown to a PDF, Korean
+included), `slides` (Markdown to a 16:9 PDF, or a `.pptx` when you ask), `pdf` (read, look at,
+merge, split, fill and encrypt PDFs) and `charts` (a PNG or SVG chart). Each writes files and sends
+them to you with `send_file`; none uploads anything. `slides`' PowerPoint and `charts` fetch their
+Python library on first use. `/skill rm NAME` (or `zephyr skill rm NAME`) removes one for good: no
+later start or image brings it back, though `/skill undo NAME` does. A newer image updates a starter
+skill you left as it was, never one you changed or replaced; a skill of yours with the same name
+is left alone. The agent's own edits to one are drafts, approved only with `/skill ok`.
+
 **Connectors** are MCP servers the agent may call. Add one on the host:
 
 ```sh
@@ -521,6 +532,31 @@ is left out:
 `zephyr mcp add NAME --host api.example.com ...`, or `/set mcp.NAME.hosts api.example.com`. For a
 secret that is not an HTTPS header (a database password, a signing key), `--plain` or
 `/set mcp.NAME.secrets plain` hands the connector the real one, which the agent can then read.
+
+**Ready-made connectors.** The image carries a catalog of six, each with its command, the secret
+it needs, the hosts that secret is sent to and the approval classes of its tools filled in
+(`zephyr mcp catalog` lists them):
+
+```sh
+zephyr mcp add --catalog github          # asks for GITHUB_TOKEN, hidden
+zephyr mcp add --catalog home-assistant --url https://home.example.com/api/mcp
+zephyr mcp add --catalog brave-search --plain
+```
+
+`github` (the image's github-mcp-server), `notion` and `linear` hold only a stand-in for their
+token; `linear` and `home-assistant` reach their remote server through `mcp-remote`, so their key
+is a stand-in too. `brave-search` sends its key in a header zephyr does not swap, and a
+`home-assistant` at an `http://` address is reached without TLS, so those need `--plain`, which
+hands the server the real key, readable by the agent. `context7` needs no key. The npm servers are
+fetched at their pinned version on first use. Adding an entry again keeps the class you gave any tool, and nothing else: its hosts are the
+entry's (set others with `/set mcp.NAME.hosts`), and it holds its real key only if you say
+`--plain` (or `plain`) in that add, even when it did before;
+`zephyr doctor` tells you when a newer entry ships than the one you added. The agent can read the
+catalog (`/opt/zephyr/connectors/`) and suggest an entry, but only you add one. In a chat or the
+TUI, `/mcp catalog` lists the entries, `/mcp catalog NAME` shows the table one writes and where
+its secret goes, and `/mcp catalog add NAME [URL] [plain]` adds it, from a strong channel only (it
+decides where a secret goes); it never takes the secret itself, and names the host command that
+sets it.
 
 ## Web app
 
@@ -767,6 +803,14 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   across restarts. It is the agent's, never yours, and holds only the sign-ins you give it: through
   [the vault](#the-vault), or by hand (below).
   A site that still blocks it gets Camoufox, a stealth Firefox, which keeps no sign-ins.
+- **Pacing.** The agent's navigations and clicks on one site (`www.amazon.co.uk` and
+  `smile.amazon.co.uk` are one) go at least `browser.pace_ms` apart, 1500 ms unless you set it,
+  plus up to half again at random, however many of its tasks browse at once: a burst of commands
+  is what gets accounts flagged as bots. `/set browser.pace_ms 3000` slows it, `0` turns it off;
+  the agent may slow it itself, and only propose speeding it up. With pacing on, a `batch` holds
+  at most one navigation. Upgrading writes nothing for it: `[browser]` is in `zephyr.toml` only
+  once you set the key, and a 0.9.0 image pinned back by hand refuses a file that has it
+  (`zephyr upgrade 0.9.0` restores the file it backed up).
 - **Python.** A read-only environment first on the agent's PATH (`/opt/zephyr/py`: requests,
   beautifulsoup4, pandas, pypdf, pillow, Camoufox), locked in `deploy/python/uv.lock`, plus `uv` for
   anything else (`uv run --with`, or a venv of its own; uv's cache lives in `~/.zephyr/.cache/uv`).

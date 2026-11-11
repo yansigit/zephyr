@@ -34,6 +34,10 @@ ARG GH_SHA256_ARM64=ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306
 ARG HIMALAYA_VERSION=2.2.1
 ARG HIMALAYA_SHA256_AMD64=5c5ba2724c162f82d0a0c71b6c03224ed44f8bef7b14ace5da0635d3af2665a0
 ARG HIMALAYA_SHA256_ARM64=1dc21c3dd6d948929e22e5cae49b9d0b3b30ff88fafd4493fd4460c6252e9d90
+# The catalog's github connector (DESIGN §4.22): github/github-mcp-server, a Go binary not on npm.
+ARG GITHUB_MCP_VERSION=2.1.0
+ARG GITHUB_MCP_SHA256_AMD64=a442f9db287cea01008bcb55fe6bc0292270301046c3edbd1a8b22d6e4157b2b
+ARG GITHUB_MCP_SHA256_ARM64=34d5a268f65cd1e9b7107fa976f3571ccd575f9df00cec489fec79a039923a22
 # The Signal channel (channels spec §4.8): signal-cli's JVM build and the Temurin JDK whose jlink
 # cuts its Java runtime. SIGNAL=0 leaves both out.
 ARG SIGNAL=1
@@ -139,14 +143,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && echo "$s  /tmp/$f" | sha256sum -c - \
     && tar -xzf "/tmp/$f" --no-same-owner -C /usr/local/bin ./rpi
 
-# gh and himalaya from their pinned releases, checked against their sha256s.
+# gh, himalaya and github-mcp-server from their pinned releases, checked against their sha256s.
 FROM ubuntu:24.04 AS tools
 ARG GH_VERSION GH_SHA256_AMD64 GH_SHA256_ARM64 HIMALAYA_VERSION HIMALAYA_SHA256_AMD64 \
-    HIMALAYA_SHA256_ARM64 TARGETARCH
+    HIMALAYA_SHA256_ARM64 GITHUB_MCP_VERSION GITHUB_MCP_SHA256_AMD64 GITHUB_MCP_SHA256_ARM64 TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && case "$TARGETARCH" in \
-       arm64) g=arm64 gs=$GH_SHA256_ARM64 h=aarch64 hs=$HIMALAYA_SHA256_ARM64 ;; \
-       *) g=amd64 gs=$GH_SHA256_AMD64 h=x86_64 hs=$HIMALAYA_SHA256_AMD64 ;; esac \
+       arm64) g=arm64 gs=$GH_SHA256_ARM64 h=aarch64 hs=$HIMALAYA_SHA256_ARM64 m=arm64 ms=$GITHUB_MCP_SHA256_ARM64 ;; \
+       *) g=amd64 gs=$GH_SHA256_AMD64 h=x86_64 hs=$HIMALAYA_SHA256_AMD64 m=x86_64 ms=$GITHUB_MCP_SHA256_AMD64 ;; esac \
     && d="gh_${GH_VERSION}_linux_$g" \
     && curl -fsSLo "/tmp/$d.tar.gz" "https://github.com/cli/cli/releases/download/v$GH_VERSION/$d.tar.gz" \
     && echo "$gs  /tmp/$d.tar.gz" | sha256sum -c - \
@@ -154,7 +158,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && f="himalaya.$h-linux.tgz" \
     && curl -fsSLo "/tmp/$f" "https://github.com/pimalaya/himalaya/releases/download/v$HIMALAYA_VERSION/$f" \
     && echo "$hs  /tmp/$f" | sha256sum -c - \
-    && tar -xzf "/tmp/$f" --no-same-owner -C /usr/local/bin himalaya
+    && tar -xzf "/tmp/$f" --no-same-owner -C /usr/local/bin himalaya \
+    && f="github-mcp-server_Linux_$m.tar.gz" \
+    && curl -fsSLo "/tmp/$f" "https://github.com/github/github-mcp-server/releases/download/v$GITHUB_MCP_VERSION/$f" \
+    && echo "$ms  /tmp/$f" | sha256sum -c - \
+    && tar -xzf "/tmp/$f" --no-same-owner -C /usr/local/bin github-mcp-server
 
 # The default browser and agent-browser, which drives it, both checked against pinned sha256s.
 FROM toolchain AS browser
@@ -318,12 +326,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libdrm2 libxkbcommon0 libxcomposite1 \
       libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libxshmfence1 \
       libgtk-3-0t64 libdbus-glib-1-2 libx11-xcb1 libegl1 libgl1 libvulkan1 fonts-dejavu-core \
+      fonts-nanum poppler-utils \
       xvfb openbox xdotool x11-utils imagemagick x11vnc nftables libnss3-tools qrencode \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd
 COPY --from=node:24-bookworm-slim /usr/local/bin/node /usr/local/bin/node
 COPY --from=node:24-bookworm-slim /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
-COPY --from=tools /usr/local/bin/gh /usr/local/bin/himalaya /usr/local/bin/
+COPY --from=tools /usr/local/bin/gh /usr/local/bin/himalaya /usr/local/bin/github-mcp-server /usr/local/bin/
 COPY --from=rpi /usr/local/bin/rpi /usr/local/bin/rpi
 COPY --from=rust /out/bin/zephyr /usr/local/bin/zephyr
 COPY --from=rust /out/lib/libzephyr_policy.so /usr/local/lib/libzephyr_policy.so
@@ -342,12 +351,17 @@ COPY --from=signal-out /out/ /opt/zephyr/
 COPY --from=voice-out /opt/zephyr/ /opt/zephyr/
 # The desktop's window manager config, root's (DESIGN §4.6): openbox never reads the agent's.
 COPY deploy/openbox/ /opt/zephyr/openbox/
+# The connector catalog and the starter skills (DESIGN §4.22, §4.23): root's, read by the agent,
+# written by nobody but the image.
+COPY deploy/connectors/ /opt/zephyr/connectors/
+COPY deploy/skills/ /opt/zephyr/skills/
 # `/opt/zephyr/gate/bin` (root's, 0755, holding only the agent-browser and xdotool wrappers) is
 # first on the agent's PATH (agent::AGENT_PATH), so one the agent drops in its own bin does not
 # shadow them; `zephyr doctor` checks the layout. The real xdotool stays at /usr/bin/xdotool.
 RUN ln -s /opt/zephyr/camoufox/camoufox-python /usr/local/bin/camoufox-python \
     && ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && chmod -R u=rwX,go=rX /opt/zephyr/connectors /opt/zephyr/skills \
     && mkdir -p /opt/zephyr/gate/bin \
     && chmod 755 /opt/zephyr/libexec /opt/zephyr/gate /opt/zephyr/gate/bin \
     && ln -s /usr/local/bin/zephyr /opt/zephyr/gate/bin/agent-browser \

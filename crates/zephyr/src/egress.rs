@@ -1667,6 +1667,54 @@ fn broker_reach(state: &Path, trust: &[&str]) -> Vec<(String, Check)> {
     checks
 }
 
+/// Fails when a file can be made anywhere in the tree under `dir`, or any file in it opened to
+/// write, or `dir` is not there. Links are not followed.
+fn unwritable(dir: &Path) -> Check {
+    if !dir.is_dir() {
+        return Check::Fail("it is not there".into());
+    }
+    let makes = |d: &Path| {
+        let probe = d.join(format!(".zephyr-probe-{}", std::process::id()));
+        let made = std::fs::File::create(&probe).is_ok();
+        let _ = std::fs::remove_file(&probe);
+        made
+    };
+    let opens = |p: &Path| std::fs::OpenOptions::new().append(true).open(p).is_ok();
+    let mut folders = vec![dir.to_path_buf()];
+    while let Some(d) = folders.pop() {
+        if makes(&d) {
+            return Check::Fail(format!("a file could be made in {}", d.display()));
+        }
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let path = e.path();
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.is_dir() => folders.push(path),
+                Ok(m) if m.is_file() && opens(&path) => {
+                    return Check::Fail(format!("{} could be written", path.display()))
+                }
+                _ => {}
+            }
+        }
+    }
+    Check::Ok
+}
+
+/// `zephyr __unwritable DIR..`, run as the agent by `doctor` whatever the network (DESIGN
+/// §4.22, §4.23): one `ok|fail` line per folder the agent must not change. Fails when any can be.
+pub fn unwritable_check(dirs: &[String]) -> std::process::ExitCode {
+    let mut code = std::process::ExitCode::SUCCESS;
+    for dir in dirs {
+        match unwritable(Path::new(dir)) {
+            Check::Ok => println!("ok the agent cannot write {dir}"),
+            Check::Warn(why) | Check::Fail(why) => {
+                println!("fail the agent cannot write {dir}: {why}");
+                code = std::process::ExitCode::FAILURE;
+            }
+        }
+    }
+    code
+}
+
 /// `zephyr __netcheck [OWN_IP:ATTACH_PORT]`: what the agent's uid can reach, one
 /// `ok|fail|warn <what>` line per check. Run as the agent: by the daemon at start with no
 /// argument (the direct connection alone), and by `doctor` with the daemon's address, which adds
@@ -1861,6 +1909,52 @@ pub async fn verify() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DESIGN §4.22, §4.23: doctor's check that the image's catalog and skills are not the
+    /// agent's, run here as the folders' owner (no root needed).
+    #[test]
+    fn unwritable_tells_a_folder_the_prober_can_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+        let dir = crate::test_dir("unwritable");
+        std::fs::create_dir_all(dir.join("report")).unwrap();
+        std::fs::write(dir.join("report/SKILL.md"), "x").unwrap();
+        std::fs::write(dir.join("github.toml"), "x").unwrap();
+        assert!(matches!(unwritable(&dir), Check::Fail(_)));
+        mode(&dir.join("report/SKILL.md"), 0o444).unwrap();
+        mode(&dir.join("github.toml"), 0o444).unwrap();
+        mode(&dir.join("report"), 0o555).unwrap();
+        mode(&dir, 0o555).unwrap();
+        assert!(matches!(unwritable(&dir), Check::Ok));
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
+            "no probe left behind"
+        );
+        mode(&dir.join("report"), 0o755).unwrap();
+        assert!(
+            matches!(unwritable(&dir), Check::Fail(_)),
+            "a folder a level down"
+        );
+        // The whole tree (review of #53, 6): a file or folder deeper down counts too.
+        std::fs::create_dir_all(dir.join("report/assets/fonts")).unwrap();
+        std::fs::write(dir.join("report/assets/fonts/a.ttf"), "x").unwrap();
+        mode(&dir.join("report/assets/fonts"), 0o555).unwrap();
+        mode(&dir.join("report/assets"), 0o555).unwrap();
+        mode(&dir.join("report"), 0o555).unwrap();
+        let deep = unwritable(&dir);
+        assert!(matches!(deep, Check::Fail(_)), "a file three levels down");
+        mode(&dir.join("report/assets/fonts/a.ttf"), 0o444).unwrap();
+        assert!(matches!(unwritable(&dir), Check::Ok));
+        mode(&dir.join("report/assets/fonts"), 0o755).unwrap();
+        let deep = unwritable(&dir);
+        assert!(matches!(deep, Check::Fail(_)), "a folder three levels down");
+        for d in ["report/assets/fonts", "report/assets", "report"] {
+            mode(&dir.join(d), 0o755).unwrap();
+        }
+        mode(&dir, 0o755).unwrap();
+        assert!(matches!(unwritable(&dir.join("gone")), Check::Fail(_)));
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()

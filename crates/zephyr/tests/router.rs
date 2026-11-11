@@ -5940,6 +5940,70 @@ async fn an_upgrade_with_nothing_to_settle_leaves_the_config_as_it_is() {
     gw.shutdown().await;
 }
 
+/// DESIGN §4.24: the default pace lives in code. Only the owner's `/set browser.pace_ms` writes
+/// `[browser]`; other settings written meanwhile never add it.
+#[tokio::test]
+async fn set_browser_pace_writes_the_table_and_nothing_else_does() {
+    let home = home("pace-set");
+    let path = home.join("zephyr.toml");
+    let gw = start(on_file(&home, ""));
+    wait(|| !log(&home, "start").is_empty()).await;
+    gw.say("m1", "owner", "/set tasks.parallel 3").await;
+    assert_eq!(gw.wait_replies(1).await, ["[zephyr] tasks.parallel 2 → 3"]);
+    let before = std::fs::read_to_string(&path).unwrap();
+    assert!(!before.contains("[browser]"), "{before}");
+    gw.say("m2", "owner", "/set browser.pace_ms 2000").await;
+    assert_eq!(
+        gw.wait_replies(2).await[1],
+        "[zephyr] browser.pace_ms 1500 → 2000"
+    );
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(after, format!("{before}\n[browser]\npace_ms = 2000\n"));
+    let cfg = Config::load(&path).unwrap();
+    assert_eq!(cfg.pace_ms(), 2000);
+    gw.shutdown().await;
+}
+
+/// Review Focus 5: an install from 0.9.0, with connectors and no `[browser]`, upgraded: the daemon
+/// starts, runs a turn and a reload, and zephyr.toml keeps every byte; the pace reads 1500.
+#[tokio::test]
+async fn an_upgrade_with_no_browser_key_leaves_zephyr_toml_as_it_is() {
+    let home = home("pace-upgrade");
+    let path = home.join("zephyr.toml");
+    let text = format!(
+        "# the owner's own comment\n{}\n[[mcp]]\nname = \"files\"\ncommand = \"fs-server\"\n\n\
+         [[mcp]]\nname = \"api\"\ncommand = \"api-server\"\nhosts = \"api.test\"\n\
+         env = {{ K = \"${{API_KEY}}\" }}\n",
+        file_text(&home, "[tasks]\nparallel = 2\n")
+    );
+    std::fs::write(&path, &text).unwrap();
+    std::fs::write(home.join("secrets.env"), "API_KEY=k\n").unwrap();
+    // The image's starter skills, seeded at this start (DESIGN §4.23): never into zephyr.toml.
+    let image = home.join("image-skills/report");
+    std::fs::create_dir_all(&image).unwrap();
+    let skill = "---\nname: report\ndescription: Use when reporting.\n---\nsteps\n";
+    std::fs::write(image.join("SKILL.md"), skill).unwrap();
+    let mut cfg = Config::load(&path).unwrap();
+    cfg.floor = true;
+    cfg.tick = Duration::from_millis(200);
+    cfg.starter_skills = home.join("image-skills");
+    let gw = start(cfg);
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_reply("echo: ").await;
+    gw.wait_reply("added the starter skills report").await;
+    gw.say("m2", "owner", "/reload").await;
+    gw.wait_reply("[zephyr] nothing changed").await;
+    ticks(&home, 3).await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    let cfg = Config::load(&path).unwrap();
+    assert_eq!(cfg.browser, None);
+    assert_eq!(
+        zephyr::settings::value(&cfg, "browser.pace_ms").as_deref(),
+        Some("1500")
+    );
+    gw.shutdown().await;
+}
+
 /// A first start, or a state.db made anew, has nothing of before to keep: a remote connector
 /// with a secret is not settled for the owner, nothing is written, and it is not published.
 #[tokio::test]
@@ -6026,6 +6090,151 @@ async fn a_draft_with_a_secret_is_not_approved_from_discord() {
     }
     assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     assert!(drafts.join("docs.json").exists());
+    gw.shutdown().await;
+}
+
+/// DESIGN §4.22: a catalog entry is added from a strong channel only; added, it restarts the
+/// agent, and is left out until secrets.env sets its secret, which the reply names.
+#[tokio::test]
+async fn mcp_catalog_add_from_discord_is_refused_and_from_chat_adds_the_connector() {
+    let home = home("mcp-catalog");
+    let mut cfg = on_file_with_discord(&home, "");
+    cfg.catalog_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/connectors");
+    let path = home.join("zephyr.toml");
+    let before = std::fs::read_to_string(&path).unwrap();
+    let gw = start(cfg);
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_replies(1).await;
+    gw.say_on("discord", "d1", "downer", "/mcp catalog add github")
+        .await;
+    let refused = gw.wait_replies_on("discord", 1).await[0].clone();
+    assert_eq!(
+        refused,
+        "adding a catalog connector decides where its secret goes; from tui, chat or passkey"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    gw.say("m2", "owner", "/mcp catalog add github").await;
+    let added = gw.wait_replies(2).await[1].clone();
+    assert!(
+        added.starts_with(
+            "[zephyr] connector github added to zephyr.toml; it is left out until secrets.env \
+             sets GITHUB_TOKEN: run `zephyr mcp add github --secret GITHUB_TOKEN` on the host"
+        ),
+        "{added}"
+    );
+    let config = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        config.contains("/usr/local/bin/github-mcp-server"),
+        "{config}"
+    );
+    // One that needs no secret is published at once. (A secrets.env edit re-execs the daemon,
+    // so the left-out connector's publishing is `drafts.rs`'s test.)
+    gw.say("m3", "owner", "/mcp catalog add context7").await;
+    gw.wait_replies(3).await;
+    gw.say("m4", "owner", "/mcp").await;
+    let listed = gw.wait_replies(4).await[3].clone();
+    let context7 = listed.lines().find(|l| l.starts_with("- context7: "));
+    assert_eq!(
+        context7,
+        Some("- context7: https://mcp.context7.com/mcp"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains(
+            "- github: /usr/local/bin/github-mcp-server (left out: secrets.env lacks GITHUB_TOKEN)"
+        ),
+        "{listed}"
+    );
+    gw.say("m5", "owner", "again").await;
+    gw.wait_replies(5).await;
+    assert_eq!(log(&home, "start").len(), 3, "the agent restarted for each");
+    let agents = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    assert!(agents.contains("- **context7**: remote (HTTP)"), "{agents}");
+    assert!(!agents.contains("**github**"), "{agents}");
+    gw.shutdown().await;
+}
+
+/// DESIGN §4.23: the image's starter skills are approved at start and listed to the agent; the
+/// owner is told once, and a later start says nothing more.
+#[tokio::test]
+async fn starter_skills_are_seeded_and_told_once() {
+    let home = home("starter-skills");
+    let image = home.join("image-skills/report");
+    std::fs::create_dir_all(&image).unwrap();
+    let text = "---\nname: report\ndescription: Use when reporting.\n---\nsteps\n";
+    std::fs::write(image.join("SKILL.md"), text).unwrap();
+    let cfg = || {
+        let mut cfg = config(&home);
+        cfg.starter_skills = home.join("image-skills");
+        cfg.tick = Duration::from_millis(200);
+        cfg
+    };
+    let gw = start(cfg());
+    gw.say("m1", "owner", "hi").await;
+    let replies = gw.wait_replies(2).await;
+    let told: Vec<&String> = replies
+        .iter()
+        .filter(|r| r.contains("starter skills"))
+        .collect();
+    assert_eq!(
+        told,
+        ["[zephyr] added the starter skills report; /skills lists them, /skill rm NAME removes one"],
+        "{replies:?}"
+    );
+    let agents = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    assert!(
+        agents.contains("- **report**: Use when reporting."),
+        "{agents}"
+    );
+    gw.shutdown().await;
+    let gw = start(cfg());
+    gw.say("m2", "owner", "again").await;
+    gw.wait_replies(1).await;
+    gw.say("m3", "owner", "/skills").await;
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        replies[1].contains("- report: Use when reporting."),
+        "{replies:?}"
+    );
+    assert!(
+        !replies.iter().any(|r| r.contains("starter skills")),
+        "{replies:?}"
+    );
+    gw.shutdown().await;
+    // A later image adds one and changes another (review of #53, 8): each is told, once.
+    let slides = home.join("image-skills/slides");
+    std::fs::create_dir_all(&slides).unwrap();
+    let text = "---\nname: slides\ndescription: Use for decks.\n---\nsteps\n";
+    std::fs::write(slides.join("SKILL.md"), text).unwrap();
+    let text = "---\nname: report\ndescription: Use when reporting, v2.\n---\nsteps\n";
+    std::fs::write(image.join("SKILL.md"), text).unwrap();
+    let tail = "/skills lists them, /skill rm NAME removes one";
+    let gw = start(cfg());
+    gw.say("m4", "owner", "hi").await;
+    let replies = gw.wait_replies(3).await;
+    let mut told: Vec<&String> = replies
+        .iter()
+        .filter(|r| r.contains("starter skills"))
+        .collect();
+    told.sort();
+    assert_eq!(
+        told,
+        [
+            &format!("[zephyr] added the starter skills slides; {tail}"),
+            &format!("[zephyr] updated the starter skills report; {tail}"),
+        ],
+        "{replies:?}"
+    );
+    gw.shutdown().await;
+    let gw = start(cfg());
+    gw.say("m5", "owner", "again").await;
+    gw.wait_replies(1).await;
+    gw.say("m6", "owner", "/skills").await;
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        !replies.iter().any(|r| r.contains("starter skills")),
+        "{replies:?}"
+    );
     gw.shutdown().await;
 }
 

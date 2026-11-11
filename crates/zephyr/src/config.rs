@@ -114,6 +114,9 @@ pub struct Config {
     pub approvals: Option<Approvals>,
     /// `[voice]`: voice notes in and spoken replies out (DESIGN §4.3). `Config::voice` reads it.
     pub voice: Option<Voice>,
+    /// `[browser]`: the agent's browser pacing (DESIGN §4.24). Absent unless the owner set a key:
+    /// `Config::pace_ms` reads the default.
+    pub browser: Option<Browser>,
     /// The image's voice folder (`voice::DIR`): ffmpeg, whisper-cli, Piper, models and voices.
     /// Not configurable; tests point it at small fakes.
     #[serde(skip, default = "voice_dir")]
@@ -137,6 +140,14 @@ pub struct Config {
     /// tests set a fake.
     #[serde(skip, default = "agent_browser")]
     pub agent_browser: PathBuf,
+    /// The connector catalog (DESIGN §4.22): the image's `/opt/zephyr/connectors`. Not
+    /// configurable; tests point it at their own folder.
+    #[serde(skip, default = "catalog_dir")]
+    pub catalog_dir: PathBuf,
+    /// The image's starter skills (DESIGN §4.23), seeded at start: `/opt/zephyr/skills`. Not
+    /// configurable; tests point it at their own folder.
+    #[serde(skip, default = "starter_skills")]
+    pub starter_skills: PathBuf,
     /// This binary, which a command's output goes through on its way to the log so that no
     /// vault value lands there (`zephyr __scrublog`, DESIGN §4.13). `None` writes the log
     /// directly; the daemon sets it at start, and tests of other things leave it out.
@@ -262,6 +273,14 @@ fn floor() -> bool {
     crate::egress::bridge()
 }
 
+fn catalog_dir() -> PathBuf {
+    PathBuf::from(crate::catalog::DIR)
+}
+
+fn starter_skills() -> PathBuf {
+    PathBuf::from(crate::drafts::STARTER)
+}
+
 fn agent_browser() -> PathBuf {
     PathBuf::from(crate::browser_gate::REAL)
 }
@@ -360,6 +379,18 @@ impl Default for Voice {
         }
     }
 }
+
+/// `[browser]` (DESIGN §4.24).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Browser {
+    /// The least time between two of the agent's navigations or clicks on one site, in ms;
+    /// 0 is off.
+    pub pace_ms: Option<u64>,
+}
+
+/// `browser.pace_ms` when the owner set none.
+pub const PACE_MS: u64 = 1500;
 
 /// `[tasks]` (DESIGN §4.12).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -581,6 +612,8 @@ impl Config {
         self.path = running.path.clone();
         self.projects = running.projects.clone();
         self.agent_browser = running.agent_browser.clone();
+        self.catalog_dir = running.catalog_dir.clone();
+        self.starter_skills = running.starter_skills.clone();
         self.scrubber = running.scrubber.clone();
         self.floor = running.floor;
         self.push_hosts = running.push_hosts.clone();
@@ -629,6 +662,13 @@ impl Config {
     /// `[voice]`, with its defaults when the table or a key is absent.
     pub fn voice(&self) -> Voice {
         self.voice.clone().unwrap_or_default()
+    }
+
+    /// `[browser] pace_ms`, [`PACE_MS`] when unset.
+    pub fn pace_ms(&self) -> u64 {
+        (self.browser.as_ref())
+            .and_then(|b| b.pace_ms)
+            .unwrap_or(PACE_MS)
     }
 
     /// `[review] at`, when the daily review is on.
@@ -691,6 +731,9 @@ impl Config {
         }
         if !(1..=32).contains(&self.parallel_tasks()) {
             anyhow::bail!("[tasks] parallel must be 1 to 32");
+        }
+        if self.pace_ms() > 60_000 {
+            anyhow::bail!("[browser] pace_ms must be 0 to 60000");
         }
         let shape = zephyr_policy::tools::model_shape;
         if let Some(m) = self.task_model().filter(|m| !shape(m)) {
@@ -857,6 +900,21 @@ mod tests {
         assert_eq!(cfg.discord.unwrap().token_env, "ZEPHYR_DISCORD_TOKEN");
         assert_eq!(cfg.imessage.unwrap().lookback_hours, 24);
         assert!(toml::from_str::<Config>("rpi='a'\nhome='b'\ntypo=1").is_err());
+    }
+
+    /// DESIGN §4.24: no `[browser]` reads the default pace; the table is the owner's to add.
+    #[test]
+    fn no_browser_table_reads_the_default_pace() {
+        let cfg: Config = toml::from_str("rpi = 'r'\nhome = 'h'\n").unwrap();
+        assert_eq!((cfg.browser.clone(), cfg.pace_ms()), (None, 1500));
+        let off: Config = toml::from_str("rpi='r'\nhome='h'\n[browser]\npace_ms = 0\n").unwrap();
+        off.validate().unwrap();
+        assert_eq!(off.pace_ms(), 0);
+        let over: Config =
+            toml::from_str("rpi='r'\nhome='h'\n[browser]\npace_ms = 60001\n").unwrap();
+        let err = over.validate().unwrap_err().to_string();
+        assert_eq!(err, "[browser] pace_ms must be 0 to 60000");
+        assert!(toml::from_str::<Config>("rpi='r'\nhome='h'\n[browser]\npace = 1\n").is_err());
     }
 
     #[test]

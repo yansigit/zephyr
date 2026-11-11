@@ -226,7 +226,14 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   `ZEPHYR_*` or a channel's) to `<state>-public/` and AGENTS.md (with `## Skills` and
   `## Connectors`) to root's `/AGENTS.md` in the container, both readable but not writable by the
   agent. zephyr-policy's `check_mcp` lets MCP calls use only that file (`ZEPHYR_MCP_CONFIG`),
-  byte-identical to what it read at load.
+  byte-identical to what it read at load. `drafts::seed` (DESIGN §4.23), once per start, commits
+  the image's starter skills (`deploy/skills/` → `/opt/zephyr/skills`, `Config::starter_skills`)
+  into `<state>/skills`, guided by `<state>/skills-seeded.json`, never again once the owner removed one.
+- `catalog.rs` (DESIGN §4.22, pure): the connector catalog, `deploy/connectors/NAME.toml` →
+  `/opt/zephyr/connectors` (`Config::catalog_dir`), each an `[[mcp]]` table with its secrets, hosts
+  and classes preset; `zephyr mcp add --catalog` (host, reads the image's copy with `docker exec cat`)
+  and `/mcp catalog add` (strong channel, `drafts::command`) write it. Pin each entry's package
+  version; never let an entry set `secrets`.
 - The agent's tools (DESIGN §4.11): the browser, Camoufox and the X desktop are CLIs in the image,
   run through `bash`. `desktop.rs` keeps Xvfb up when `ZEPHYR_DESKTOP` is set. `send_file`,
   `schedule`, `gateway`, `task` and `recall` are registered by zephyr-policy (`tools.rs`). The first
