@@ -375,3 +375,11 @@ It found no general path to a secret. Seven narrow fixes, each confirmed first; 
 - [x] **7.** `zephyr mcp add` checks the new config alone when the one before did not load.
 
 Results: `cargo test --no-fail-fast` 1252 passed, 0 failed, 20 ignored; `clippy -D warnings` clean; `cargo deny check advisories bans` ok; real rpi 0.21.2 `real_rpi` 6, `rpi_load` 10, ignored `attach` 1. The side container was not run again for these.
+
+## Follow-up: the settled mark leaves zephyr.toml (2026-11-11)
+
+`[broker] settled = 1` would have repeated the 0.7.0 incident: 0.8.0's `Config` refuses unknown fields, so a rollback would crash-loop on the new table, and every owner's file was edited on upgrade even with nothing to settle.
+
+- [x] The mark is `<state>/broker-settled` (root's, 0600, outside state.db), written once the settle edit succeeded or there was nothing to settle. The upgrade runs only while state.db has no `broker.born`, no `broker.remote_kept`, and the file is absent. `Config` has no `[broker]` table.
+- [x] `zephyr.toml` is written only when an undecided connector gets `secrets = "plain"`. Tests: `the_upgrade_keeps_remote_connectors_as_they_were_and_settles_no_later_one` (the restored state.db; the file differs from before only by that key), `an_upgrade_with_nothing_to_settle_leaves_the_config_as_it_is` (byte-identical).
+- **Flagged, not decided here:** 0.8.0's `[[mcp]]` does **not** accept `secrets` (nor `hosts`): its `Mcp` is `deny_unknown_fields` with `name, url, headers, command, args, cwd, env, timeout, enabled, classes`. So the one edit the upgrade still makes, `secrets = "plain"` on a remote connector that had a secret, is itself a key 0.8.0 refuses, as is any `hosts` or `secrets` the owner sets afterwards. `zephyr upgrade 0.8.0` restores the `zephyr.toml` backed up before the upgrade and so is unaffected; an image pinned back by hand is not.

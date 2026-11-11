@@ -101,9 +101,6 @@ pub struct Config {
     /// `[network]`: where the agent may connect beyond public ports 80 and 443 (DESIGN §4.20).
     #[serde(default)]
     pub network: Network,
-    /// `[broker]`: the daemon's own mark that the broker's upgrade was made (DESIGN §4.21).
-    #[serde(default)]
-    pub broker: Broker,
     /// `[memory]`: how memory changes are told (DESIGN §4.6). `each` when absent.
     pub memory: Option<MemorySettings>,
     /// `[review]`: the built-in daily review (DESIGN §4.5). Off when absent.
@@ -280,17 +277,6 @@ pub struct Network {
     /// Exact `HOST:PORT` entries, comma separated (`egress::parse_allow`).
     #[serde(default)]
     pub allow: String,
-}
-
-/// `[broker]`: the token broker's own record in the file (DESIGN §4.21).
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Broker {
-    /// Written by the daemon, once, with the upgrade that kept remote connectors as they
-    /// were (`Router::settle_remote_connectors`): that upgrade is done for this file,
-    /// whatever state.db is put beside it later.
-    #[serde(default)]
-    pub settled: u32,
 }
 
 /// `[settings]` (settings spec §2).

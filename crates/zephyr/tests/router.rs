@@ -5409,8 +5409,16 @@ async fn the_upgrade_keeps_remote_connectors_as_they_were_and_settles_no_later_o
     assert!(told.ends_with("cannot use a stand-in): docs"), "{told}");
     let saved = std::fs::read_to_string(&path).unwrap();
     assert!(saved.contains("secrets = \"plain\""), "{saved}");
-    // The file itself records that this was done.
-    assert!(saved.contains("[broker]\nsettled = 1"), "{saved}");
+    // Nothing but the connector's own key is written into the file: an older zephyr would
+    // not read a table it does not know. That it was done is a file of the daemon's own.
+    assert!(
+        !saved.contains("[broker]") && !saved.contains("settled"),
+        "{saved}"
+    );
+    assert_eq!(saved.replace("secrets = \"plain\"\n", ""), text);
+    use std::os::unix::fs::PermissionsExt;
+    let mark = std::fs::metadata(home.join("broker-settled")).expect("the mark");
+    assert_eq!(mark.permissions().mode() & 0o777, 0o600);
     assert_eq!(
         last_logged(&home, "mcp.docs.secrets"),
         (None, Some("plain".into()), "zephyr".into())
@@ -5425,7 +5433,7 @@ async fn the_upgrade_keeps_remote_connectors_as_they_were_and_settles_no_later_o
     gw.shutdown().await;
 
     // A remote connector added after the upgrade is not settled for the owner, also when a
-    // state.db from before the broker is put back: the file remembers.
+    // state.db from before the broker is put back: the mark is outside it.
     let later = format!(
         "{}{}",
         std::fs::read_to_string(&path).unwrap(),
@@ -5486,6 +5494,38 @@ async fn set_refuses_to_make_a_secret_both_plain_and_a_stand_in() {
         "{refused}"
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    gw.shutdown().await;
+}
+
+/// An upgrade with no remote connector to settle writes nothing into zephyr.toml: the file
+/// is the owner's, and an older zephyr must still read it.
+#[tokio::test]
+async fn an_upgrade_with_nothing_to_settle_leaves_the_config_as_it_is() {
+    let home = home("broker-remote-none");
+    let path = home.join("zephyr.toml");
+    let text = format!(
+        "# the owner's own comment\n{}\n[[mcp]]\nname = \"files\"\ncommand = \"fs-server\"\n",
+        file_text(&home, "")
+    );
+    std::fs::write(&path, &text).unwrap();
+    // A state.db from before the broker.
+    drop(Store::open(&home.join("state.db")).unwrap());
+    rusqlite::Connection::open(home.join("state.db"))
+        .unwrap()
+        .execute("DELETE FROM meta WHERE key = 'broker.born'", [])
+        .unwrap();
+    let mut cfg = Config::load(&path).unwrap();
+    cfg.floor = true;
+    cfg.tick = Duration::from_millis(200);
+    let gw = start(cfg);
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_reply("echo: ").await;
+    ticks(&home, 3).await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    assert!(
+        home.join("broker-settled").exists(),
+        "and it is done all the same"
+    );
     gw.shutdown().await;
 }
 
