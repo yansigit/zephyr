@@ -62,6 +62,12 @@ pub struct Entry {
     pub granted: bool,
     pub value: String,
     pub programs: Vec<String>,
+    /// The exact `host:port`s a token is swapped in on (DESIGN §4.21); nowhere else.
+    pub hosts: Vec<String>,
+    /// Also swapped in a request's path and query.
+    pub url: bool,
+    /// Handed to the program as its real value, as before the broker.
+    pub raw: bool,
 }
 
 impl std::fmt::Debug for Entry {
@@ -76,6 +82,9 @@ impl std::fmt::Debug for Entry {
             .field("granted", &self.granted)
             .field("value", &self.value.len())
             .field("programs", &self.programs)
+            .field("hosts", &self.hosts)
+            .field("url", &self.url)
+            .field("raw", &self.raw)
             .finish()
     }
 }
@@ -444,6 +453,11 @@ fn set(t: &mut Table, key: &str, v: impl Into<toml_edit::Value>) {
 
 fn read(kind: Kind, t: &Table) -> Entry {
     let s = |k: &str| t.get(k).and_then(Item::as_str).unwrap_or("").to_string();
+    let flag = |k: &str| t.get(k).and_then(Item::as_bool).unwrap_or(false);
+    let list = |k: &str| -> Vec<String> {
+        let items = t.get(k).and_then(Item::as_array).into_iter().flatten();
+        items.filter_map(|v| v.as_str().map(String::from)).collect()
+    };
     Entry {
         kind,
         name: s("name"),
@@ -451,17 +465,12 @@ fn read(kind: Kind, t: &Table) -> Entry {
         username: s("username"),
         password: s("password"),
         totp: s("totp"),
-        granted: t.get("granted").and_then(Item::as_bool).unwrap_or(false),
+        granted: flag("granted"),
         value: s("value"),
-        programs: t
-            .get("programs")
-            .and_then(Item::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        programs: list("programs"),
+        hosts: list("hosts"),
+        url: flag("url"),
+        raw: flag("raw"),
     }
 }
 

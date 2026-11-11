@@ -89,7 +89,7 @@ impl Kind {
 #[derive(Clone, Debug, PartialEq)]
 enum Content {
     Skill(Files),
-    Connector(Mcp),
+    Connector(Box<Mcp>),
 }
 
 impl Content {
@@ -271,7 +271,7 @@ fn draft(home: &Path, kind: Kind, name: &str) -> Option<Draft> {
     path.symlink_metadata().ok()?;
     let read = match kind {
         Kind::Skill => read_skill(&path, name).map(Content::Skill),
-        Kind::Connector => read_connector(&path, name).map(Content::Connector),
+        Kind::Connector => read_connector(&path, name).map(|m| Content::Connector(Box::new(m))),
     };
     Some(read.map_err(|e| format!("{e:#}")))
 }
@@ -313,7 +313,7 @@ fn approved(cfg: &Config, kind: Kind, name: &str) -> Option<Content> {
             .iter()
             .find(|m| m.name == name)
             .cloned()
-            .map(Content::Connector),
+            .map(|m| Content::Connector(Box::new(m))),
     }
 }
 
@@ -772,7 +772,7 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
 
 /// secrets.env as a connector may use it: never zephyr's own (`ZEPHYR_*`) or a channel's, which
 /// would land in the agent-readable mcp.json and let the agent post as the owner.
-fn secrets(cfg: &Config) -> Vec<(String, String)> {
+pub(crate) fn secrets(cfg: &Config) -> Vec<(String, String)> {
     let mut all = crate::dotenv::read(&cfg.secrets_path()).unwrap_or_default();
     all.retain(|(k, _)| !reserved(cfg, k));
     all
@@ -816,6 +816,9 @@ fn filled(m: &Mcp, secrets: &[(String, String)]) -> Result<Value, Vec<String>> {
         o.remove("name");
         // The gate's, not the adapter's (approvals spec §4.1).
         o.remove("classes");
+        // The broker's (DESIGN §4.21).
+        o.remove("hosts");
+        o.remove("secrets");
     }
     let mut missing = Vec::new();
     fill(&mut v, secrets, &mut missing);

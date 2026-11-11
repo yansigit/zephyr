@@ -7,6 +7,7 @@ pub mod approvals;
 pub mod attach;
 pub mod auth;
 pub mod auth_keeper;
+pub mod broker;
 pub mod browser_gate;
 pub mod btw;
 pub mod channel;

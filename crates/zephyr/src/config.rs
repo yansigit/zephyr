@@ -371,6 +371,13 @@ pub struct Mcp {
     /// out of `mcp.json`, and a draft cannot carry it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub classes: BTreeMap<String, String>,
+    /// The exact `HOST[:PORT]`s this connector's secrets are sent to, comma separated (DESIGN
+    /// §4.21). The daemon's: left out of `mcp.json`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hosts: String,
+    /// `surrogate` (the default): the connector holds stand-ins. `plain`: the real secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<String>,
 }
 
 impl Mcp {
@@ -385,6 +392,16 @@ impl Mcp {
         let blank = |v: &Option<String>| v.as_deref().is_none_or(|s| s.trim().is_empty());
         if blank(&self.url) == blank(&self.command) {
             anyhow::bail!("connector {:?}: set either url or command", self.name);
+        }
+        for host in self.hosts.split(',').filter(|h| !h.trim().is_empty()) {
+            crate::broker::parse_host(host)
+                .map_err(|e| anyhow::anyhow!("connector {:?}: hosts: {e}", self.name))?;
+        }
+        if !matches!(self.secrets.as_deref(), None | Some("surrogate" | "plain")) {
+            anyhow::bail!(
+                "connector {:?}: secrets is \"surrogate\" or \"plain\"",
+                self.name
+            );
         }
         Ok(())
     }
