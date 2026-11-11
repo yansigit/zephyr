@@ -1,4 +1,4 @@
-//! Virtual cards (DESIGN §4.22): the agent asks for a card for one checkout, the gate holds it as
+//! Virtual cards (DESIGN §4.25): the agent asks for a card for one checkout, the gate holds it as
 //! a payment, the daemon issues it through the owner's provider and fills it only on the
 //! checkout's origin. The number lives in memory only and never reaches the agent's text.
 
@@ -497,7 +497,7 @@ impl Issuer for Fake {
     }
 }
 
-/// The numbers of the cards in use, in the daemon's memory only (DESIGN §4.22): never on disk,
+/// The numbers of the cards in use, in the daemon's memory only (DESIGN §4.25): never on disk,
 /// so a restart forgets them. Process-wide and keyed by the state folder, because every scrub
 /// has only the text in hand.
 pub mod live {

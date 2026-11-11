@@ -120,7 +120,7 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
                 strong.join(" or ")
             ));
         }
-        // The payment window, whatever `strong_only` says (DESIGN §4.22).
+        // The payment window, whatever `strong_only` says (DESIGN §4.25).
         crate::gate::window_check(ctx.cfg, store, &a, is_strong, now)?;
     }
     // Before it is taken, so a full process table leaves the approval waiting (R44).
@@ -277,7 +277,7 @@ fn pass(ctx: &Ctx, a: &Action, by: By, now: i64) -> Result<String, String> {
     Ok("the agent may make exactly that call once in the next 30 min".into())
 }
 
-/// A card request (DESIGN §4.22): read again as the settings are now, then issued off the
+/// A card request (DESIGN §4.25): read again as the settings are now, then issued off the
 /// router's loop; the owner is told what to do next, and the agent when the card can be filled.
 fn card(ctx: &Ctx, a: &Action) -> Result<String, String> {
     let (checked, ask) = crate::gate::approved_card(ctx.cfg, ctx.store, a)?;

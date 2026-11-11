@@ -385,7 +385,7 @@ fn spawn(
                     .stdout(file)
                     .stderr(std::process::Stdio::null())
                     .process_group(0);
-                // The card numbers in use, which are in no file (DESIGN §4.22): the daemon's
+                // The card numbers in use, which are in no file (DESIGN §4.25): the daemon's
                 // list is close-on-exec, and only this child gets a copy of the descriptor.
                 if let Some(list) = crate::cards::live::shared() {
                     use std::os::unix::process::CommandExt;

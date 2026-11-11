@@ -532,7 +532,7 @@ pub struct CardFields {
     pub name: Option<String>,
 }
 
-/// A checked `card` call (DESIGN §4.22). The daemon reads a request's site, amount and currency
+/// A checked `card` call (DESIGN §4.25). The daemon reads a request's site, amount and currency
 /// itself (`gate::card_request`): what may be issued is its decision, not the plugin's.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CardAction {

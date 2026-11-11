@@ -1,4 +1,4 @@
-//! The Link issuer against a stub of `api.link.com` and `login.link.com` (DESIGN §4.22), and
+//! The Link issuer against a stub of `api.link.com` and `login.link.com` (DESIGN §4.25), and
 //! the ignored live test the owner runs with their own Link account.
 
 use http_body_util::{BodyExt, Full};

@@ -332,7 +332,7 @@ pub async fn run<C: Channel>(
     // a delay that came due while down waits for the owner (approvals spec §4.9).
     crate::actions::restore(&router.cfg, &router.store, crate::now());
     // A card's number was in the memory of the daemon before this one: what is still open is
-    // closed at its issuer, never filled again (DESIGN §4.22).
+    // closed at its issuer, never filled again (DESIGN §4.25).
     crate::cards::close_all(
         &router.cfg,
         &router.store,
@@ -833,7 +833,7 @@ impl<'a> Router<'a> {
                     self.broker_notice();
                     self.seed_notice();
                     self.window_notice();
-                    // Cards: their expiry, the issuer's word on them, reminders (DESIGN §4.22).
+                    // Cards: their expiry, the issuer's word on them, reminders (DESIGN §4.25).
                     crate::cards::tick(&self.cfg, &self.store, crate::now());
                     // Delays that came due, and held actions nobody answered (approvals §4.6).
                     self.tick_actions();
@@ -1930,7 +1930,7 @@ impl<'a> Router<'a> {
             self.jobs.runs.notify_one();
             return Some(reply);
         }
-        // The owner's cards (DESIGN §4.22): a number comes only with a chat line, from memory.
+        // The owner's cards (DESIGN §4.25): a number comes only with a chat line, from memory.
         let strong = self.cfg.settings.strong_channels.contains(&m.channel);
         let id = &m.platform_msg_id;
         if let Some(reply) = crate::cards::command(&self.cfg, &self.store, text, id, strong) {
@@ -2293,7 +2293,7 @@ impl<'a> Router<'a> {
                 // delayed ones wait for the owner again (R47).
                 self.procs.stop_all();
                 crate::actions::stop(&self.cfg, &self.store, &self.waits);
-                // Every card still open is closed at its issuer (DESIGN §4.22).
+                // Every card still open is closed at its issuer (DESIGN §4.25).
                 crate::cards::close_all(&self.cfg, &self.store, "the owner's /stop");
                 "[zephyr] stopped"
             }
@@ -3237,7 +3237,7 @@ impl<'a> Router<'a> {
     /// connectors that cannot be used until the owner binds them. It waits for an owner to
     /// tell, and is marked told even when there is nothing to say, so a later start is silent;
     /// not while the vault cannot be read, which says nothing about what is in it.
-    /// An install that was there before the payment window (DESIGN §4.22) is told of it once,
+    /// An install that was there before the payment window (DESIGN §4.25) is told of it once,
     /// as soon as there is an owner to tell: it changes what `auto N` lets through.
     fn window_notice(&self) {
         const KEY: &str = "window.notice";

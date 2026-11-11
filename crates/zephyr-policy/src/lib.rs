@@ -151,7 +151,7 @@ export_plugin!(|api| {
         let main = std::env::var(tools::EXEC_ENV).is_ok_and(|v| v == "1");
         for (name, description, parameters, execute) in tools::TOOLS {
             // `exec` and `process` replace rpi's `bash` in the main child only (DESIGN §4.13),
-            // and the vault and the cards are main's alone (§4.15, §4.22).
+            // and the vault and the cards are main's alone (§4.15, §4.25).
             if matches!(name, "exec" | "process" | "vault" | "card") && !main {
                 continue;
             }

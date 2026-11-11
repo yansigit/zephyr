@@ -259,7 +259,7 @@ fn decide_paid(
         return (Verdict::Deny(deny.into()), None);
     }
     // A card that could not be issued as asked is refused before anything is held (DESIGN
-    // §4.22): no amount, one over `cards.max`, another currency, a page that is not https.
+    // §4.25): no amount, one over `cards.max`, another currency, a page that is not https.
     if req.tool == "card" {
         if let Err(why) = card_request(cfg, &req.args) {
             let scrub = Scrub::load(cfg);
@@ -297,7 +297,7 @@ fn decide_paid(
     (verdict, gate.paid.get())
 }
 
-/// A card request as the gate read it (DESIGN §4.22): the checkout's origin, which the card is
+/// A card request as the gate read it (DESIGN §4.25): the checkout's origin, which the card is
 /// bound to and filled on, the agent's name for the merchant, and the cap in the currency's
 /// minor unit.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -414,7 +414,7 @@ pub fn approved_card(
     Ok((Checked(paid), ask))
 }
 
-/// What one more payment does to `[approvals.window]` (DESIGN §4.22).
+/// What one more payment does to `[approvals.window]` (DESIGN §4.25).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Window {
     Within,
@@ -531,7 +531,7 @@ fn pay(
 }
 
 /// What the owner's `/ok` of `a` on a channel that is `strong` or not must pass when `a` is a
-/// payment (DESIGN §4.22), before it is taken: one held for the window, or that would cross it
+/// payment (DESIGN §4.25), before it is taken: one held for the window, or that would cross it
 /// now, needs a strong channel whatever `approvals.strong_only` says. `Err` is why it still
 /// waits. The count that binds is made when it is recorded ([`paid`]).
 pub fn window_check(
@@ -692,7 +692,7 @@ impl Call {
         })
     }
 
-    /// Main's request for a virtual card (DESIGN §4.22): a payment to the checkout's origin, for
+    /// Main's request for a virtual card (DESIGN §4.25): a payment to the checkout's origin, for
     /// at most the amount asked. The facts are looked for in the agent's merchant and reason.
     fn card(cfg: &Config, req: &Request) -> Option<Call> {
         let ask = card_request(cfg, &req.args).ok()?;
@@ -1216,7 +1216,7 @@ impl Gate<'_> {
                 names => Found::Names(names),
             },
         };
-        // The one Pay click an open card covers (DESIGN §4.22): on the card's own origin, by
+        // The one Pay click an open card covers (DESIGN §4.25): on the card's own origin, by
         // the session that asked for it, with nothing of the owner's facts in it, for a total
         // the page shows within the card's cap. It uses the card, in one statement, so a
         // second click finds none and is decided as any payment below.
@@ -1282,7 +1282,7 @@ impl Gate<'_> {
     /// What the class's mode does with a gated call (spec §4.3).
     fn mode(&self, e: &Effective, g: &Gated) -> rusqlite::Result<Plan> {
         let plan = self.by_mode(e, g)?;
-        // The window, whatever the mode lets through (DESIGN §4.22): no grant, pass or
+        // The window, whatever the mode lets through (DESIGN §4.25): no grant, pass or
         // remembered target satisfies it.
         if g.class != Class::Money || matches!(plan, Plan::Hold(_)) {
             return Ok(plan);
@@ -2302,7 +2302,7 @@ fn render(a: &Action, cfg: &Config, store: &Store, countdown: bool) -> String {
     lines.join("\n")
 }
 
-/// A card request's lines (DESIGN §4.22). The payee is the origin, an identifier, which the
+/// A card request's lines (DESIGN §4.25). The payee is the origin, an identifier, which the
 /// fill checks; the agent's name for the merchant is on a line of its own, quoted. What the
 /// issuer binds is printed as it is.
 fn card_lines(cfg: &Config, a: &Action, scrub: &Scrub) -> Vec<String> {
@@ -3630,7 +3630,7 @@ mod tests {
             assert!(card.contains(&format!("\n{shown}\n")), "{card}");
             // A payment has no recipients to remember: no `once`. An amount that was not read,
             // or is in another currency, is held for an ordinary /ok: the window marks only
-            // what it knows to be over (DESIGN §4.22).
+            // what it knows to be over (DESIGN §4.25).
             assert!(
                 card.ends_with(&format!("\n/ok {id} · /no {id} · expires in 24 h")),
                 "{card}"
@@ -5159,7 +5159,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
     }
 
-    // ---- virtual cards and the payment window (DESIGN §4.22) ----
+    // ---- virtual cards and the payment window (DESIGN §4.25) ----
 
     const CARDS: &str = "[approvals]\ncurrency = 'CAD'\nstrong_only = ['loosen', 'money']\n\
                          [cards]\nprovider = 'manual'\n";

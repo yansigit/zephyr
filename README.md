@@ -1022,7 +1022,7 @@ The first `himalaya` command run with `secrets: ["MAIL_PASSWORD"]` asks you to a
 ## Virtual cards
 
 At a checkout the agent can ask for a virtual card instead of using a card of yours (DESIGN
-§4.22). It is off until you pick a provider. Set your currency first: the cap and the limits
+§4.25). It is off until you pick a provider. Set your currency first: the cap and the limits
 count in it.
 
 ```sh

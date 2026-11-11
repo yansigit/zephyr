@@ -411,7 +411,7 @@ async fn web(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
 }
 
 /// `zephyr card [list] | put N [new|prepaid|other] | done N | close N | link`, run by the
-/// host's `zephyr card` (DESIGN §4.22). `put` asks for the number, the expiry and the code
+/// host's `zephyr card` (DESIGN §4.25). `put` asks for the number, the expiry and the code
 /// (hidden on a terminal, else three lines on stdin), checks them here, and hands them to the
 /// daemon on the chat socket, a strong channel: they stay in its memory and reach no file.
 async fn card(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
@@ -820,7 +820,7 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     for line in zephyr::voice::doctor(cfg).await {
         println!("{line}");
     }
-    // Warnings too: virtual cards are the owner's to set up (DESIGN §4.22).
+    // Warnings too: virtual cards are the owner's to set up (DESIGN §4.25).
     for line in zephyr::cards::doctor(cfg) {
         println!("{line}");
     }

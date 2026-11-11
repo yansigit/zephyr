@@ -519,7 +519,7 @@ fn decide(args: &[String], env: &Env) -> (Next, Place) {
         Ok(()) => go(env, None),
         Err(text) => (Next::Refuse(text), None),
     };
-    // A card's number is in this page's fields (DESIGN §4.22): the page is not read back.
+    // A card's number is in this page's fields (DESIGN §4.25): the page is not read back.
     if reads_back(&argv.rest) {
         if let Some(text) = card_filled(env, &page) {
             return (Next::Refuse(text), None);
@@ -2994,7 +2994,7 @@ cat "$d/$f.json"
         assert!(worst < gate::REPORT_WAIT, "{worst:?}");
     }
 
-    /// DESIGN §4.22: while zephyr keeps the number of a card it typed into a page, the
+    /// DESIGN §4.25: while zephyr keeps the number of a card it typed into a page, the
     /// commands that read that page back are refused; what a checkout needs still runs.
     #[test]
     fn reading_a_page_back_is_refused_while_a_card_is_filled_on_it() {

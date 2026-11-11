@@ -117,7 +117,7 @@ pub struct Config {
     /// `[browser]`: the agent's browser pacing (DESIGN §4.24). Absent unless the owner set a key:
     /// `Config::pace_ms` reads the default.
     pub browser: Option<Browser>,
-    /// `[cards]`: virtual cards (DESIGN §4.22). Absent, or with no provider: off.
+    /// `[cards]`: virtual cards (DESIGN §4.25). Absent, or with no provider: off.
     pub cards: Option<Cards>,
     /// Lets `[cards] provider = "fake"` name the scripted test issuer. Not configurable.
     #[serde(skip)]
@@ -493,7 +493,7 @@ pub struct Approvals {
     pub window: Option<Window>,
 }
 
-/// `[approvals.window]` (DESIGN §4.22): past `effects` payments or `amount` (in
+/// `[approvals.window]` (DESIGN §4.25): past `effects` payments or `amount` (in
 /// `approvals.currency`) in `seconds`, a payment waits for a strong channel whatever the mode.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -506,7 +506,7 @@ pub struct Window {
     pub seconds: Option<u32>,
 }
 
-/// `[cards]` (DESIGN §4.22).
+/// `[cards]` (DESIGN §4.25).
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cards {

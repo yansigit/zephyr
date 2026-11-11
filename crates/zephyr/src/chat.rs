@@ -121,7 +121,7 @@ impl Channel for ChatChannel {
     }
 }
 
-/// A chat line's `card` (`{"number", "expiry", "cvc"}`, DESIGN §4.22), from `zephyr card put`:
+/// A chat line's `card` (`{"number", "expiry", "cvc"}`, DESIGN §4.25), from `zephyr card put`:
 /// kept in memory under the line's id for its `/card put` to claim (`cards::entered`), so the
 /// number is never in the inbox row made of the line's text.
 fn take_card(id: &str, line: &serde_json::Value) {

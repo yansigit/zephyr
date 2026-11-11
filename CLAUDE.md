@@ -121,7 +121,7 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   main), stores a 30-minute one-time pass, or answers the waiting wrapper (`Waits`); `/no`,
   `/cancel`, `/held`, and the tick's due delays and expiry (24 h, a browser wait 10 min). A delay
   never goes late: pause, `/resume`, `/stop` and start put it back to `pending` with its card.
-- `cards.rs` (DESIGN §4.22): virtual cards. Main's `card` tool asks for one (`request`); the gate
+- `cards.rs` (DESIGN §4.25): virtual cards. Main's `card` tool asks for one (`request`); the gate
   reads it as a payment of kind `card` (`gate::card_request`: an https origin, at most
   `cards.max`, in `approvals.currency`) and `cards::issue` takes a `gate::Checked`, so no card is
   issued without the gate. `Issuer` is the provider trait (`AnyIssuer`: `Manual`, the owner's own

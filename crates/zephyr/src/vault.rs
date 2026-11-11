@@ -196,7 +196,7 @@ impl Entry {
     }
 }
 
-/// A provider's credentials (DESIGN §4.22): a `[[service]]` table. Never a token: it has no
+/// A provider's credentials (DESIGN §4.25): a `[[service]]` table. Never a token: it has no
 /// programs, no hosts and no surrogate, and only the daemon's own client reads it. `Debug`
 /// shows the key's length.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -859,7 +859,7 @@ pub fn scrub(text: &str, secrets: &[(String, String)]) -> String {
         }
     }
     let all: Vec<String> = forms.into_iter().map(|(_, v)| v).collect();
-    // And the numbers of the cards in use, which no file holds (DESIGN §4.22).
+    // And the numbers of the cards in use, which no file holds (DESIGN §4.25).
     crate::cards::scrub(&crate::auth::redact(&out, &all))
 }
 
@@ -1472,7 +1472,7 @@ pub(crate) enum Typed {
     Failed(String),
 }
 
-/// The page script that types one value (DESIGN §4.15, §4.22). It runs in the page's top
+/// The page script that types one value (DESIGN §4.15, §4.25). It runs in the page's top
 /// document, checks that document's origin itself, and only then sets the field: the check
 /// and the typing are one step of the page, with no navigation between them. A field in a
 /// frame is not in the top document, so it is never found.

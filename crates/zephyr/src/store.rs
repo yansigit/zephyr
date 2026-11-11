@@ -380,7 +380,7 @@ pub enum ActionKind {
     Run,
     Pass,
     Wait,
-    /// A virtual card (DESIGN §4.22): `/ok` issues it.
+    /// A virtual card (DESIGN §4.25): `/ok` issues it.
     Card,
 }
 
@@ -416,7 +416,7 @@ pub enum Paid {
     Unread,
 }
 
-/// A card to record (DESIGN §4.22): what it is bound to and who asked. `proposal` is the held
+/// A card to record (DESIGN §4.25): what it is bound to and who asked. `proposal` is the held
 /// action it came from, `None` for one the mode let through.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NewCard {
@@ -1130,7 +1130,7 @@ impl Store {
             )?;
         }
         if version < 20 {
-            // Virtual cards and the payments the window counts (DESIGN §4.22). `spend` is the
+            // Virtual cards and the payments the window counts (DESIGN §4.25). `spend` is the
             // model budget's, so money effects are `payments`. No card number or code, ever.
             db.execute_batch(
                 "CREATE TABLE payments(id INTEGER PRIMARY KEY, at INTEGER NOT NULL,
@@ -1804,7 +1804,7 @@ impl Store {
             .optional()
     }
 
-    /// One money effect that went or was approved (DESIGN §4.22), written as it is let go:
+    /// One money effect that went or was approved (DESIGN §4.25), written as it is let go:
     /// what the payment window counts. `minor` is `None` for an amount that was not read.
     pub fn add_payment(
         &self,
@@ -1823,7 +1823,7 @@ impl Store {
 
     /// Records one payment if the window has room for it, the look and the row in one
     /// `BEGIN IMMEDIATE` transaction, so two connections deciding at once are taken one after
-    /// the other (DESIGN §4.22). The window is `effects` payments and, when there is a
+    /// the other (DESIGN §4.25). The window is `effects` payments and, when there is a
     /// `limit`, that sum of the amounts known in `currency`, after `since`. `force` records it
     /// whatever the window says (the owner's `/ok` on a strong channel).
     #[allow(clippy::too_many_arguments)]
@@ -1929,7 +1929,7 @@ impl Store {
         Ok(self.db.last_insert_rowid())
     }
 
-    /// The one Pay click an open card covers (DESIGN §4.22): the card goes from `open` to
+    /// The one Pay click an open card covers (DESIGN §4.25): the card goes from `open` to
     /// `charging` and its payment row, written at its cap when it was let go, becomes what the
     /// page said was paid, in one transaction. `false` when the card was not open any more:
     /// of two clicks only one is the card's.

@@ -494,7 +494,7 @@ pub fn currency(cfg: &Config) -> String {
         .map_or_else(|| "USD".into(), |c| c.trim().to_ascii_uppercase())
 }
 
-/// The payment window in effect (DESIGN §4.22): `amount_minor` in `approvals.currency`'s minor
+/// The payment window in effect (DESIGN §4.25): `amount_minor` in `approvals.currency`'s minor
 /// unit, `None` for no amount limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowNow {

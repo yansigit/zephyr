@@ -1199,7 +1199,7 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
             };
             format!("saved the token {name}; {sent}; the agent asks you before each new program uses it")
         }
-        // A provider's key (DESIGN §4.22): taken only here, never in a chat.
+        // A provider's key (DESIGN §4.25): taken only here, never in a chat.
         ["add", "service", name] => {
             let provider =
                 provider.with_context(|| format!("add service needs --provider\n{usage}"))?;

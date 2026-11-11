@@ -1,4 +1,4 @@
-//! Stripe's Link Agent Wallet as a card issuer (DESIGN §4.22): each card is a *spend request*
+//! Stripe's Link Agent Wallet as a card issuer (DESIGN §4.25): each card is a *spend request*
 //! the owner approves in Link with a biometric, and the daemon then fetches the one-time card.
 //! Plain HTTPS from the daemon (root, outside the network floor), never the Node `link-cli`:
 //! root runs no package the image did not pin.
