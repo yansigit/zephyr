@@ -344,3 +344,20 @@ Results (image `zephyr-dev:a3-cd25027`; container and network removed afterwards
 - `cargo test --no-fail-fast`: 1243 passed, 0 failed, 20 ignored. `clippy -D warnings` clean, `cargo deny check advisories bans` ok.
 - Real rpi 0.21.2: `real_rpi` 6, `rpi_load` 10, ignored `attach` 1, all passed.
 - `tests/token_broker.rs` and `tests/net_floor.rs`, ignored, both passed in `zephyr-test-a3`. Item 5: `curl -A "probe $ZSUR"` got `403 zephyr: A3_SECRET is not swapped in the header user-agent`, with its audit row. Item 4: a secret holding a quote and a slash, sent in `Authorization` and echoed JSON-escaped by httpbin, came back as its stand-in, with no trace of the secret.
+
+## Follow-up: the third review, of cd25027 (2026-11-11)
+
+Each finding was confirmed; none was skipped, and one was done another way than asked (3).
+
+- [x] **1, 2, 4. `/mcp ok` and secrets.** A draft whose connector names a `${SECRET}`, or that replaces a connector that does, is approved from a strong channel only, whatever it changes. A weak channel approves only drafts with no secret in them, old or new. An approval never writes `secrets = "plain"`. The `exposes`/`widens` logic and its host closure are gone. Tests: `drafts::tests::a_draft_that_carries_a_secret_is_approved_only_from_a_strong_channel` (the attacker-URL draft on a surrogate connector, a `User-Agent` header draft, a changed draft of an undecided connector, a command connector's command and environment, a dropped secret, a new connector; an identical draft of an undecided connector is "already approved as drafted", writes nothing and leaves it unpublished), and from Discord through the router, `a_draft_with_a_secret_is_not_approved_from_discord`.
+- [x] **3. `settle_remote_connectors` only on an upgrade. Deviation from what was asked:** it is not gated on `store.upgraded_from()`. That mark is written only when a database moves up from before schema v16, and the broker adds no schema step, so an install upgraded from 0.8.0 (v18) would never carry it: its remote connectors would go unpublished, the silent break this migration exists to prevent. Instead `Store::open` writes `broker.born` into `meta` when it makes a database, and the migration runs only where that mark is missing (`Store::made_with_broker`). A first start and a reset state.db both have the mark, so they settle nothing. Tests: `the_upgrade_keeps_remote_connectors_as_they_were_and_settles_no_later_one` (a database without the mark), `a_fresh_install_settles_no_remote_connector`.
+- [x] **5.** The refusal of a stand-in in a header that is no credential's says `in a header that is not a credential header` in the 403, the audit's outcome and the notice; the header's name is only in the audit's args. Notices are per token and host.
+- [x] **6.** `broker::json_forms`: one form per kind of encoder (slash three ways; HTML characters, line separators, non-ASCII and the quote each escaped or not; hex in either case), at most 96, tested with a worst-case value.
+- [x] **7.** A reply whose header name holds a bound value or a form of it is refused with 502 and an audit row; a trailer's ends the body there, with its row.
+- [x] **8.** `broker::creates_pair(old, new)` compares the pairs before and after, in `/set`, `zephyr config set`, `zephyr mcp add` and `/mcp ok`. An unrelated edit passes while an old pair exists.
+- [x] **9, 10.** DESIGN's step 4 no longer lists `Trailer`; §4.15 has `/vault header`, `/vault unheader` and `--header`; the `settings.rs` comment is corrected; the redundant `dedup` in `Vault::header` is gone.
+
+Results (image `zephyr-dev:a3-0195eac`; container and network removed afterwards):
+- `cargo test --no-fail-fast`: 1248 passed, 0 failed, 20 ignored. `clippy -D warnings` clean, `cargo deny check advisories bans` ok.
+- Real rpi 0.21.2: `real_rpi` 6, `rpi_load` 10, ignored `attach` 1, all passed.
+- `tests/token_broker.rs` and `tests/net_floor.rs`, ignored, both passed in `zephyr-test-a3`; its fresh state.db carried `broker.born` and an empty `broker.remote_kept`.
