@@ -55,6 +55,41 @@ pub trait Channel: Send + Sync {
     fn live(&self, cfg: tokio::sync::watch::Receiver<std::sync::Arc<crate::config::Config>>) {
         let _ = cfg;
     }
+    /// How `sender` last named themselves here (`"Aiden", @aiden`), for the pairing notice only:
+    /// never an identity. The default knows no names.
+    fn known_as(&self, sender: &str) -> Option<String> {
+        let _ = sender;
+        None
+    }
+}
+
+/// Splits `text` into pieces of at most `max` UTF-16 units, breaking after newlines where possible.
+/// UTF-16 is counted because it is never smaller than the code-point count, so a piece that fits
+/// here fits whichever way a platform counts (Discord, Telegram, Signal). shortcut: a line longer than `max` is hard-split by char.
+pub fn chunks(text: &str, max: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut cur_len = 0;
+    for line in text.split_inclusive('\n') {
+        let line_len: usize = line.encode_utf16().count();
+        if cur_len > 0 && cur_len + line_len > max {
+            out.push(std::mem::take(&mut cur));
+            cur_len = 0;
+        }
+        for ch in line.chars() {
+            let n = ch.len_utf16();
+            if cur_len + n > max {
+                out.push(std::mem::take(&mut cur));
+                cur_len = 0;
+            }
+            cur.push(ch);
+            cur_len += n;
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// The adapters `zephyr run` can build. `Channel` is not dyn-compatible, so this enum is the list's element type.
@@ -99,5 +134,62 @@ impl Channel for AnyChannel {
             Self::Discord(c) => c.live(cfg),
             Self::IMessage(c) => c.live(cfg),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn units(s: &str) -> usize {
+        s.encode_utf16().count()
+    }
+
+    #[test]
+    fn chunks_short_text_is_one_piece() {
+        assert_eq!(chunks("hello\nworld", 100), vec!["hello\nworld"]);
+    }
+
+    #[test]
+    fn chunks_empty_text_sends_nothing() {
+        assert!(chunks("", 10).is_empty());
+    }
+
+    #[test]
+    fn chunks_break_on_line_boundaries() {
+        // Each line is 10 units including its newline; two lines fit in 25, three do not.
+        let text = "aaaaaaaaa\nbbbbbbbbb\nccccccccc\nddddddddd\n";
+        assert_eq!(
+            chunks(text, 25),
+            vec!["aaaaaaaaa\nbbbbbbbbb\n", "ccccccccc\nddddddddd\n",]
+        );
+    }
+
+    #[test]
+    fn chunks_hard_split_a_long_line_without_newlines() {
+        let text = "x".repeat(25);
+        let pieces = chunks(&text, 10);
+        assert_eq!(
+            pieces.iter().map(|p| units(p)).collect::<Vec<_>>(),
+            vec![10, 10, 5]
+        );
+        assert_eq!(pieces.concat(), text);
+    }
+
+    #[test]
+    fn chunks_never_split_a_surrogate_pair() {
+        // Each emoji is 2 UTF-16 units, so a limit of 3 holds one per piece.
+        let text = "😀😀😀";
+        assert_eq!(chunks(text, 3), vec!["😀", "😀", "😀"]);
+    }
+
+    #[test]
+    fn chunks_unicode_pieces_fit_and_rejoin() {
+        let text = "가나다라마바사아자차카타파하\n한글 mixed 😀 text ".repeat(200);
+        assert!(units(&text) > 2000);
+        let pieces = chunks(&text, 2000);
+        assert!(pieces.len() > 1);
+        assert!(pieces.iter().all(|p| units(p) <= 2000));
+        assert_eq!(pieces.concat(), text);
     }
 }

@@ -359,7 +359,9 @@ impl IMessage {
                 name: a.transfer_name.unwrap_or_else(|| "file".into()),
                 mime: a.mime_type,
                 size: a.total_bytes.unwrap_or(0),
-                req: self.http.get(url).query(&[("password", &self.password)]),
+                src: crate::inbox::Src::Get(
+                    self.http.get(url).query(&[("password", &self.password)]),
+                ),
             }
         });
         crate::inbox::append(&self.live, &mut inbound, files.collect()).await;

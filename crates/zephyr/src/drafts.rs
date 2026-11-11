@@ -843,6 +843,7 @@ fn reserved(cfg: &Config, name: &str) -> bool {
         cfg.discord.as_ref().map(|d| &d.token_env),
         cfg.imessage.as_ref().map(|i| &i.password_env),
         cfg.imessage.as_ref().map(|i| &i.secret_env),
+        cfg.telegram.as_ref().map(|t| &t.token_env),
         cfg.attach.as_ref().and_then(|a| a.token_env.as_ref()),
     ];
     name.starts_with("ZEPHYR_") || channel.into_iter().flatten().any(|k| k == name)
@@ -1531,13 +1532,14 @@ mod tests {
     #[test]
     fn a_connector_never_gets_a_channel_secret() {
         let cfg = cfg("[discord]\ntoken_env = 'DISCORD_BOT'\n\
+             [telegram]\ntoken_env = 'TG_BOT'\n\
              [[mcp]]\nname = 'leak'\nurl = 'https://x/mcp'\n\
-             headers = { A = '${ZEPHYR_BB_PASSWORD}', B = '${DISCORD_BOT}' }\n\
+             headers = { A = '${ZEPHYR_BB_PASSWORD}', B = '${DISCORD_BOT}', C = '${TG_BOT}' }\n\
              [[mcp]]\nname = 'fine'\nurl = 'https://y/mcp'\nheaders = { A = '${DOCS}' }\n");
         std::fs::create_dir_all(cfg.state_dir()).unwrap();
         std::fs::write(
             cfg.secrets_path(),
-            "ZEPHYR_BB_PASSWORD=bbpass1\nDISCORD_BOT=dtoken1\nDOCS=d0cs\n",
+            "ZEPHYR_BB_PASSWORD=bbpass1\nDISCORD_BOT=dtoken1\nTG_BOT=ttoken1\nDOCS=d0cs\n",
         )
         .unwrap();
         agents(&cfg);
@@ -1546,11 +1548,11 @@ mod tests {
             text.contains("d0cs") && !text.contains("\"leak\""),
             "{text}"
         );
-        for value in ["bbpass1", "dtoken1"] {
+        for value in ["bbpass1", "dtoken1", "ttoken1"] {
             assert!(!text.contains(value), "{text}");
         }
         let missing = missing_secrets(&cfg, &cfg.mcp[0]);
-        assert_eq!(missing.len(), 2, "{missing:?}");
+        assert_eq!(missing.len(), 3, "{missing:?}");
         assert!(missing.iter().all(|m| m.contains("never a connector's")));
         assert!(say(&cfg, "/mcp").0.contains("DISCORD_BOT (zephyr's own"));
     }

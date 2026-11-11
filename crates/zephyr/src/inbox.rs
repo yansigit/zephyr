@@ -1,4 +1,4 @@
-//! Files the owner sends on Discord or iMessage (DESIGN §4.3). The adapter saves them as the
+//! Files the owner sends on Discord, iMessage, Telegram or Signal (DESIGN §4.3). The adapter saves them as the
 //! agent under `<home>/inbox/` before the row goes to the router, and appends one line per file
 //! to the row's text, so the inbox schema, dedupe and reconcile stay as they are. Only an owner's
 //! files are fetched: the adapter reads the live owner list, which a reload updates.
@@ -24,27 +24,48 @@ pub(crate) const IMAGES: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 /// no owners, so nothing is fetched.
 pub type Live = Arc<OnceLock<watch::Receiver<Arc<Config>>>>;
 
-/// One attachment as the platform describes it, and the request that fetches it.
+/// One attachment as the platform describes it, and where its bytes come from.
 pub struct File {
     pub name: String,
     pub mime: Option<String>,
     /// The platform's size, `0` when it gives none.
     pub size: u64,
-    pub req: reqwest::RequestBuilder,
+    pub src: Src,
+}
+
+/// Where an attachment's bytes are. A message holds at most a few, briefly: no need to box.
+#[allow(clippy::large_enum_variant)]
+pub enum Src {
+    /// A request that fetches it (Discord's CDN, BlueBubbles, the Bot API).
+    Get(reqwest::RequestBuilder),
+    /// A file of root's that a root child already downloaded (signal-cli's data dir), read as
+    /// root, at most `MAX_BYTES`.
+    Path(PathBuf),
+    /// Not to be fetched; an owner's file is listed with this reason (`too large, not downloaded`).
+    Skip(&'static str),
+}
+
+/// Whether `inbound`'s sender is an owner on the live config: whose files may be fetched.
+pub fn owner(live: &Live, inbound: &Inbound) -> bool {
+    live.get()
+        .is_some_and(|rx| rx.borrow().is_owner(&inbound.channel, &inbound.sender))
 }
 
 /// Appends a line per file to `inbound.text`, saving each file first when the sender is an owner.
 pub async fn append(live: &Live, inbound: &mut Inbound, files: Vec<File>) {
-    let cfg = live.get().map(|rx| rx.borrow().clone());
-    let dir = cfg
-        .filter(|c| c.is_owner(&inbound.channel, &inbound.sender))
-        .map(|c| c.home.join("inbox"));
+    let dir = owner(live, inbound)
+        .then(|| live.get().map(|rx| rx.borrow().home.join("inbox")))
+        .flatten();
     let id: String = inbound
         .platform_msg_id
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     for (i, f) in files.into_iter().enumerate() {
+        let skip = match f.src {
+            Src::Skip(why) => Some(why),
+            _ => None,
+        };
         let declared = f.mime.as_deref().unwrap_or("application/octet-stream");
         let not = |why: &str| {
             let kind = kind(declared.strip_prefix("image/").unwrap_or(""));
@@ -58,6 +79,7 @@ pub async fn append(live: &Live, inbound: &mut Inbound, files: Vec<File>) {
             None => not("not downloaded"),
             Some(_) if i >= MAX_FILES => not(&format!("over {MAX_FILES} files, not downloaded")),
             Some(_) if f.size > MAX_BYTES => not("too large, not downloaded"),
+            Some(_) if skip.is_some() => not(skip.unwrap_or_default()),
             Some(dir) => {
                 let stem = format!("{}-{id}-{}", inbound.channel, i + 1);
                 match save(dir, &stem, &f).await {
@@ -125,7 +147,11 @@ async fn save(dir: &Path, stem: &str, f: &File) -> anyhow::Result<(PathBuf, Stri
         let mime = f.mime.clone().unwrap_or_default();
         return Ok((path, mime, len));
     }
-    let (bytes, mime) = fetch(&f.req).await?;
+    let (bytes, mime) = match &f.src {
+        Src::Get(req) => fetch(req).await?,
+        Src::Path(path) => (read(path)?, None),
+        Src::Skip(why) => anyhow::bail!("{why}"),
+    };
     let mime = mime.or(f.mime.clone()).unwrap_or_default();
     // The type the platform served wins: BlueBubbles converts HEIC photos to JPEG on download.
     let ext = match mime.as_str() {
@@ -154,6 +180,17 @@ fn existing(dir: &Path, stem: &str) -> Option<PathBuf> {
         .flatten()
         .map(|e| e.path())
         .find(|p| p.file_stem().is_some_and(|s| s == stem))
+}
+
+/// A root-owned file's bytes, as root (before `agent::fs`), at most `MAX_BYTES`.
+fn read(path: &Path) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() as u64 <= MAX_BYTES, "larger than 25 MB");
+    Ok(bytes)
 }
 
 /// The body (at most `MAX_BYTES`) and the served `Content-Type`. Errors carry no URL, which for
@@ -256,7 +293,7 @@ pub(crate) mod tests {
             name: "IMG_1.HEIC".into(),
             mime: Some("image/heic".into()),
             size: 10,
-            req: reqwest::Client::new().get(format!("{base}/a")),
+            src: Src::Get(reqwest::Client::new().get(format!("{base}/a"))),
         };
         let row = || Inbound {
             channel: "discord".into(),
@@ -297,7 +334,7 @@ pub(crate) mod tests {
             name: "a.pdf".into(),
             mime: Some("application/pdf".into()),
             size: 2048,
-            req: reqwest::Client::new().get(format!("{base}/x")),
+            src: Src::Get(reqwest::Client::new().get(format!("{base}/x"))),
         };
         append(&live(&home, "imessage = ['+1']"), &mut row, vec![f]).await;
         assert_eq!(
@@ -305,5 +342,57 @@ pub(crate) mod tests {
             "look\n[attached file: a.pdf (application/pdf, 2 KB, download failed)]"
         );
         assert!(existing(&home.join("inbox"), "imessage-G-1").is_none());
+    }
+    #[tokio::test]
+    async fn a_local_file_is_copied_and_a_skipped_one_listed() {
+        let home = crate::test_dir("inbox-local");
+        let local = home.join("signal-data/attachments/abc.m4a");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, b"m4a-bytes").unwrap();
+        let files = || {
+            vec![
+                File {
+                    name: "voice.m4a".into(),
+                    mime: Some("audio/mp4".into()),
+                    size: 9,
+                    src: Src::Path(local.clone()),
+                },
+                File {
+                    name: "big.pdf".into(),
+                    mime: Some("application/pdf".into()),
+                    size: 30 * 1024 * 1024,
+                    src: Src::Skip("too large, not downloaded"),
+                },
+            ]
+        };
+        let row = |sender: &str| Inbound {
+            channel: "signal".into(),
+            platform_msg_id: "u-1".into(),
+            sender: sender.into(),
+            text: String::new(),
+        };
+        let live = live(&home, "signal = ['u']");
+        let mut stranger = row("x");
+        assert!(!owner(&live, &stranger));
+        append(&live, &mut stranger, files()).await;
+        assert_eq!(
+            stranger.text,
+            "[attached file: voice.m4a (audio/mp4, 1 KB, not downloaded)]\n\
+             [attached file: big.pdf (application/pdf, 30.0 MB, not downloaded)]"
+        );
+        assert!(!home.join("inbox").exists());
+        let mut mine = row("u");
+        assert!(owner(&live, &mine));
+        append(&live, &mut mine, files()).await;
+        let saved = home.join("inbox/signal-u-1-1.m4a");
+        assert_eq!(
+            mine.text,
+            format!(
+                "[attached file: {} (voice.m4a, audio/mp4, 1 KB)]\n\
+                 [attached file: big.pdf (application/pdf, 30.0 MB, too large, not downloaded)]",
+                saved.display()
+            )
+        );
+        assert_eq!(std::fs::read(&saved).unwrap(), b"m4a-bytes");
     }
 }

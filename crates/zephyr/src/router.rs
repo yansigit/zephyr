@@ -1353,7 +1353,7 @@ impl<'a> Router<'a> {
                 .iter()
                 .map(|n| (n.as_str(), "connected"))
                 .collect();
-            for known in ["chat", "discord", "imessage"] {
+            for known in ["chat", "discord", "imessage", "telegram", "signal"] {
                 if !self.names.iter().any(|n| n == known) {
                     channels.push((known, "off"));
                 }
