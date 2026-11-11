@@ -321,6 +321,7 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
 - Review fix: a start that finds `desktop-held` no longer ends that takeover silently: `Control::new` queues a hand back from the flag's start time (`Event::Gave`, `restart`), the owner is told `[zephyr] the desktop went back to the agent when zephyr restarted`, and main's note waits for its next prompt.
 - Review fix: a take by the session that holds the desktop ends its old `/api/vnc` socket and waits (5 s at most) for its place before answering the ticket; a reloaded page got 503 until the old socket died.
 - Review fix: input frames no longer wake the watchdog (hundreds a second in a drag); they move `seen.input`, which it reads again when its sleep ends. Only the socket opening or closing wakes it.
+- Review fix: the holder's new take ends an old socket that is stalled in a write too: the bridge selects on `again` (and the hand back) around each write, and subscribes to `again` before it marks the socket open. A stalled old socket made the new one 503 for up to 30 s.
 
 ### Task C2-8: The Desktop screen and noVNC in the app
 

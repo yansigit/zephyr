@@ -29,6 +29,8 @@ const MAX_TICKETS: usize = 16;
 const MAX_FRAME: usize = 1 << 20;
 /// How long one write may take, to x11vnc or to a phone that stopped reading.
 const WRITE_WAIT: Duration = Duration::from_secs(30);
+/// How long the closing frame may take to send.
+const CLOSE_WAIT: Duration = Duration::from_secs(2);
 /// How long a new take waits for the holder's old socket to end.
 const REPLACE_WAIT: Duration = Duration::from_secs(5);
 /// The subprotocol the app offers beside its ticket (`zt.<ticket>`), and the one answered.
@@ -270,6 +272,9 @@ pub(super) fn ws(mut req: Request<Incoming>, app: &Arc<App>) -> Res {
     {
         return super::text(StatusCode::UNAUTHORIZED, "");
     }
+    // Listening before the socket counts as open: a take that finds it open has then been
+    // heard, however early in the bridge's setup it comes.
+    let again = hub.vnc.again.subscribe();
     if !hub
         .vnc
         .open
@@ -278,8 +283,6 @@ pub(super) fn ws(mut req: Request<Incoming>, app: &Arc<App>) -> Res {
         return super::text(StatusCode::SERVICE_UNAVAILABLE, "");
     }
     let open = Open(hub.clone());
-    // From before the bridge is set up, so a take made meanwhile still ends it.
-    let again = hub.vnc.again.subscribe();
     hub.vnc.note(|seen| seen.closed = None);
     let (upgrade, app) = (hyper::upgrade::on(&mut req), app.clone());
     tokio::spawn(async move {
@@ -366,8 +369,16 @@ async fn bridge<S>(
                         if is_input(&bytes) {
                             hub.vnc.input();
                         }
-                        let sent = tokio::time::timeout(WRITE_WAIT, to_vnc.write_all(&bytes));
-                        if !matches!(sent.await, Ok(Ok(()))) {
+                        // A write can block for as long as x11vnc or the client does not
+                        // read: the holder's new take and the hand back cut it short.
+                        let sent = tokio::select! {
+                            sent = tokio::time::timeout(WRITE_WAIT, to_vnc.write_all(&bytes)) => {
+                                matches!(sent, Ok(Ok(())))
+                            }
+                            _ = again.changed() => false,
+                            _ = held.changed() => false,
+                        };
+                        if !sent {
                             break;
                         }
                     }
@@ -379,8 +390,14 @@ async fn bridge<S>(
                 read = from_vnc.read(&mut buf) => match read {
                     Ok(n) if n > 0 => {
                         let out = Message::Binary(buf[..n].to_vec());
-                        let sent = tokio::time::timeout(WRITE_WAIT, sink.send(out));
-                        if !matches!(sent.await, Ok(Ok(()))) {
+                        let sent = tokio::select! {
+                            sent = tokio::time::timeout(WRITE_WAIT, sink.send(out)) => {
+                                matches!(sent, Ok(Ok(())))
+                            }
+                            _ = again.changed() => false,
+                            _ = held.changed() => false,
+                        };
+                        if !sent {
                             break;
                         }
                     }
@@ -405,9 +422,10 @@ async fn bridge<S>(
         }
         drop(child); // killed
     }
-    // Before the close reaches the client: its next socket finds the place free.
+    // Before the close reaches the client: its next socket finds the place free. A client
+    // that stopped reading gets no long goodbye.
     drop(open);
-    let _ = tokio::time::timeout(WRITE_WAIT, sink.close()).await;
+    let _ = tokio::time::timeout(CLOSE_WAIT, sink.close()).await;
 }
 
 #[cfg(test)]

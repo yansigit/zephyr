@@ -204,7 +204,11 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   and the vault's fill share; a take writes root's `<state>-public/desktop-held`, and the
   `agent-browser` and `xdotool` wrappers (`browser_gate::held`, `xdotool` dispatched on `argv[0]`
   like `agent-browser`) then wait on the gate socket (`{"desktop": "wait"}`) and exit 1 without
-  running. `web/vnc.rs`: the passkey-signed `zephyr.desktop` take answers a one-use ticket,
+  running. The hold the daemon publishes is the truth, the file only the hint to ask. A wrapper
+  runs the real binary as its child (never `exec`) under a shared `flock` on root's
+  `<state>-public/desktop.lock` (`browser_gate::place`); `Control::drain` takes the exclusive
+  side before a ticket is issued (hidden `Config::desktop_drain`, 15 s, then it kills the
+  agent's processes that hold the lock) and keeps it until the hand back. `web/vnc.rs`: the passkey-signed `zephyr.desktop` take answers a one-use ticket,
   `/api/vnc` joins a WebSocket to an `x11vnc -inetd` on an unnamed socketpair (it listens
   nowhere, and runs as the agent), and `watchdog` gives the desktop back after 10 min idle, 60 min
   or 60 s after the socket closed (hidden `Config::desktop_*`). `Router::desktop_changed` steers

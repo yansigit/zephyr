@@ -2957,6 +2957,44 @@ async fn a_second_vnc_socket_is_refused_and_a_text_frame_closes_the_first() {
     gw.shutdown().await;
 }
 
+/// A phone that loaded the page anew while its old socket is stalled (its client stopped
+/// reading, so the bridge is blocked in a write): the old one is cut at once, and the new one
+/// is served, not refused as a second.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_old_socket_does_not_refuse_the_holders_new_one() {
+    let (gw, phone, mut ws, cookie) = with_desktop("desk-stall", |_| {}).await;
+    let ticket = ws.ticket(&phone).await;
+    let mut old = gw.vnc(&cookie, Some(&ticket)).await.expect("it opens");
+    // Sent and never read back: what x11vnc answers piles up until the bridge's write blocks,
+    // and then it takes no more from this side either.
+    let frame = vec![3u8; 1 << 16];
+    let mut stalled = false;
+    for _ in 0..4096 {
+        let sent = old.send(Message::Binary(frame.clone()));
+        if tokio::time::timeout(Duration::from_millis(500), sent)
+            .await
+            .is_err()
+        {
+            stalled = true;
+            break;
+        }
+    }
+    assert!(stalled, "the old socket never stalled");
+    let asked = std::time::Instant::now();
+    let ticket = ws.ticket(&phone).await;
+    let mut new = gw
+        .vnc(&cookie, Some(&ticket))
+        .await
+        .expect("the new socket is served");
+    assert!(
+        asked.elapsed() < Duration::from_secs(4),
+        "the take waited out the old socket: {:?}",
+        asked.elapsed()
+    );
+    assert_eq!(echoed(&mut new, b"here").await, b"here");
+    gw.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn bytes_go_to_x11vnc_and_back() {
     let (gw, phone, mut ws, cookie) = with_desktop("desk-bytes", |_| {}).await;
