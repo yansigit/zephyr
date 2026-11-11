@@ -166,6 +166,9 @@ impl Default for Vnc {
 /// page anew), is ended first, or the new one would be the second and get 503 until it died.
 pub async fn take(hub: &super::Hub, session: [u8; 32]) -> Result<String, &'static str> {
     hub.desktop.take(session, crate::now())?;
+    // The hold is published, so new commands wait; those already running end, or are ended,
+    // before the owner gets a ticket.
+    hub.desktop.drain().await;
     let mut open = hub.vnc.open.subscribe();
     if *open.borrow() {
         hub.vnc.again.send_modify(|n| *n += 1);

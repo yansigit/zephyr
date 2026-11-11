@@ -1198,7 +1198,17 @@ impl Conn {
         let (verdict, waiting, session) = match serde_json::from_slice::<Wire>(&line) {
             Ok(wire) if wire.v == 1 && line.len() <= MAX_REQUEST && served(&wire) => {
                 let session = wire.session.clone();
-                let (verdict, waiting) = self.decide(wire).await;
+                // Nothing of the agent's touches the page while the owner has it: not typing,
+                // not a click the gate would let through at once. Refused before it is
+                // decided, so nothing is recorded as allowed.
+                let held = (self.desktop.held()).filter(|_| wire.tool == "browser");
+                let (verdict, waiting) = match held {
+                    Some(held) => {
+                        let text = crate::desktop::still(&self.cfg, held.since);
+                        (Verdict::Deny(text), None)
+                    }
+                    None => self.decide(wire).await,
+                };
                 (verdict, waiting, session)
             }
             _ => {
@@ -3652,6 +3662,38 @@ mod tests {
             o.channel == "discord" && o.text.ends_with(" did not run: you had the desktop")
         });
         assert!(told, "the owner is not told");
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
+    }
+
+    /// Nothing of the agent's touches the page while the owner has it: a browser request the
+    /// gate would let through at once (typing with no private fact in it) is refused too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_browser_request_the_gate_would_allow_is_refused_while_held() {
+        let h = home("gate-desktop-allow", "");
+        let (socket, desktop) = serving_desktop(&h).await;
+        let typing = json!({"v": 1, "session": "main", "tool": "browser",
+            "args": {"argv": ["fill", "@e2", "hello"]},
+            "browser": {"action": "fill", "url": "https://mail.x/compose",
+                        "origin": "https://mail.x", "typed": ["hello"]}});
+        assert_eq!(
+            ask(&socket, &typing).await.unwrap(),
+            json!({"verdict": "allow"})
+        );
+        desktop.take([1; 32], 14 * 3600 + 4 * 60).unwrap();
+        assert_eq!(
+            ask(&socket, &typing).await.unwrap(),
+            json!({"verdict": "deny", "text": "zephyr: the owner has the desktop (since 14:04); \
+                   this command did not run. Do other work, or try again later."})
+        );
+        // A call that is not the browser's is decided as ever.
+        let listing = json!({"v": 1, "session": "task-1", "call_id": "c1", "tool": "bash",
+                             "args": {"command": "ls"}});
+        assert_eq!(ask(&socket, &listing).await.unwrap()["verdict"], "allow");
+        desktop.give(crate::now());
+        assert_eq!(
+            ask(&socket, &typing).await.unwrap(),
+            json!({"verdict": "allow"})
+        );
         let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
     }
 

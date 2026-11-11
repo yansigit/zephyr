@@ -3149,6 +3149,42 @@ async fn main_is_told_at_take_and_at_hand_back_and_stays_clean() {
     gw.shutdown().await;
 }
 
+/// The ticket is the owner's only once nothing of the agent's is on the desktop: a command
+/// still running after the wait is killed first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_still_running_is_killed_before_the_ticket_is_issued() {
+    use std::io::BufRead;
+    use std::os::unix::process::ExitStatusExt;
+    let (gw, phone, mut ws, _) = with_desktop("desk-drain", |cfg| {
+        cfg.desktop_drain = Duration::from_millis(300);
+    })
+    .await;
+    let lock = gw.held_flag().with_file_name("desktop.lock");
+    let script = "import fcntl, sys, time\nf = open(sys.argv[1])\n\
+                  fcntl.flock(f, fcntl.LOCK_SH)\nprint('placed', flush=True)\ntime.sleep(600)\n";
+    let mut stuck = std::process::Command::new("python3")
+        .args(["-I", "-c", script])
+        .arg(&lock)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(stuck.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(line.trim(), "placed");
+    ws.ticket(&phone).await;
+    // Already dead when the ticket is in hand.
+    let ended = stuck.try_wait().unwrap();
+    assert_eq!(
+        ended.and_then(|status| status.signal()),
+        Some(9),
+        "{ended:?}"
+    );
+    ws.rpc("zephyr.desktop", json!({"verb": "give"})).await;
+    gw.shutdown().await;
+}
+
 /// A restart or a re-exec ends a takeover: the owner and main are told, never left guessing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restart_during_a_takeover_tells_the_owner_and_main() {

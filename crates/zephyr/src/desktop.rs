@@ -160,6 +160,13 @@ fn start(program: &str, first: &[&str], rest: &[&str]) -> Option<Child> {
 /// it. The `agent-browser` and `xdotool` wrappers look for it before anything else.
 pub const HELD_FILE: &str = "desktop-held";
 
+/// The lock that keeps the agent's commands off the page while the owner has it (DESIGN §4.11),
+/// beside [`HELD_FILE`]: root's, 0644. Each `agent-browser` and `xdotool` wrapper holds a shared
+/// `flock` on it while the real binary runs; a take holds the exclusive one.
+pub const LOCK_FILE: &str = "desktop.lock";
+/// How long the processes a take killed have to go.
+const KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// state.db's `meta` row that holds a takeover's start while it lasts: the daemon's own record,
 /// which a start trusts where it does not trust the flag file.
 pub const TAKE_META: &str = "desktop_take";
@@ -186,6 +193,9 @@ pub struct Control {
     /// and a quick hand back into no change at all.
     events: mpsc::UnboundedSender<Event>,
     taken: Mutex<Option<mpsc::UnboundedReceiver<Event>>>,
+    /// The exclusive lock on [`LOCK_FILE`], kept from `drain` to the hand back. Taken and
+    /// dropped holding `fills`.
+    lock: Mutex<Option<std::fs::File>>,
 }
 
 /// What happened to the desktop, for whoever tells main and the owner (`Control::events`).
@@ -224,7 +234,11 @@ impl Control {
             held: watch::channel(None).0,
             events,
             taken: Mutex::new(Some(taken)),
+            lock: Mutex::new(None),
         };
+        if let Err(e) = control.make_lock() {
+            eprintln!("zephyr: {}: {e:#}", control.lock_path().display());
+        }
         let left = control.record(|store| {
             let left = store.meta(TAKE_META)?;
             store.set_meta(TAKE_META, None)?;
@@ -257,6 +271,79 @@ impl Control {
 
     fn flag(&self) -> PathBuf {
         crate::drafts::public_dir(&self.cfg).join(HELD_FILE)
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        crate::drafts::public_dir(&self.cfg).join(LOCK_FILE)
+    }
+
+    /// The lock file, for the agent to open for reading and lock, never to change or replace.
+    fn make_lock(&self) -> anyhow::Result<()> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        crate::drafts::ensure_public_dir(&self.cfg)?;
+        let mut open = std::fs::OpenOptions::new();
+        let file = open
+            .create(true)
+            .append(true)
+            .mode(0o644)
+            .open(self.lock_path())?;
+        Ok(file.set_permissions(PermissionsExt::from_mode(0o644))?)
+    }
+
+    /// After `take` and before the owner gets the desktop: waits for the agent's browser and
+    /// desktop commands that were already running to end (each holds a shared lock on
+    /// [`LOCK_FILE`]), `Config::desktop_drain` at most, then kills what still holds it. The
+    /// exclusive lock is then kept until the hand back, so no wrapper takes a place meanwhile.
+    pub async fn drain(self: &Arc<Self>) {
+        let this = self.clone();
+        let _ = tokio::task::spawn_blocking(move || this.drain_blocking()).await;
+    }
+
+    fn drain_blocking(&self) {
+        use std::os::fd::AsRawFd;
+        let Some(held) = self.held() else {
+            return;
+        };
+        if self
+            .lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            return; // this takeover has it already
+        }
+        let path = self.lock_path();
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(e) => return eprintln!("zephyr: {}: {e}", path.display()),
+        };
+        let alone = |wait: std::time::Duration| {
+            let until = std::time::Instant::now() + wait;
+            loop {
+                // SAFETY: a plain syscall on a descriptor this function owns.
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                    return true;
+                }
+                if std::time::Instant::now() >= until {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        let mut got = alone(self.cfg.desktop_drain);
+        if !got {
+            let killed = kill_holders(&path);
+            eprintln!("zephyr: ended {killed} of the agent's commands still on the desktop");
+            got = alone(KILL_WAIT);
+        }
+        if !got {
+            return eprintln!("zephyr: {} is still locked; handing over", path.display());
+        }
+        // Only for the takeover it was drained for: a hand back meanwhile drops it here.
+        let _fills = self.fills.lock().unwrap_or_else(|e| e.into_inner());
+        if self.held().as_ref() == Some(&held) {
+            *self.lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(file);
+        }
     }
 
     /// The owner takes the desktop. The session that holds it may take it again (a new ticket
@@ -310,6 +397,8 @@ impl Control {
         // The hold is the truth and ends here, whatever becomes of the flag: one that stays
         // only makes the wrappers ask the gate, which lets them run at once.
         let held = self.held.send_replace(None)?;
+        // The agent's commands may take their places again.
+        drop(self.lock.lock().unwrap_or_else(|e| e.into_inner()).take());
         self.record(|store| store.set_meta(TAKE_META, None));
         let removed = (0..3).find_map(|_| match std::fs::remove_file(self.flag()) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some(e),
@@ -343,6 +432,40 @@ impl Control {
     pub fn changes(&self) -> watch::Receiver<Option<Held>> {
         self.held.subscribe()
     }
+}
+
+/// SIGKILLs every process of the agent's (never this one) that holds a lock on `lock` through
+/// an open descriptor of its own, found in `/proc`: the wrappers that outlasted a take's wait,
+/// and anything of the agent's that took the lock itself to hold a take up. Returns how many.
+fn kill_holders(lock: &std::path::Path) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let lock = std::fs::canonicalize(lock).unwrap_or_else(|_| lock.to_path_buf());
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let uid = crate::agent::ids().map_or_else(|| unsafe { libc::geteuid() }, |(uid, _)| uid);
+    let me = std::process::id() as i32;
+    let holds = |pid: i32| {
+        let fds = std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .into_iter()
+            .flatten();
+        fds.flatten().any(|fd| {
+            let info = format!("/proc/{pid}/fdinfo/{}", fd.file_name().to_string_lossy());
+            std::fs::read_link(fd.path()).is_ok_and(|to| to == lock)
+                && std::fs::read_to_string(info).is_ok_and(|info| info.contains("\nlock:"))
+        })
+    };
+    let mut killed = 0;
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let theirs = entry.metadata().is_ok_and(|m| m.uid() == uid);
+        if pid != me && theirs && holds(pid) {
+            // SAFETY: a plain syscall; a pid that ended meanwhile is an error, ignored.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            killed += 1;
+        }
+    }
+    killed
 }
 
 /// What is wrong with the takeover as the image lays it out (doctor's `desktop` line, DESIGN
@@ -625,6 +748,104 @@ mod tests {
         assert!(control.held().is_none());
         assert!(control.fill().is_some(), "the vault still waits");
         assert!(Control::new(&cfg).events().try_recv().is_err());
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&cfg));
+    }
+
+    /// A shared lock on the control's lock file, as a wrapper holds one while its command runs.
+    fn place(cfg: &Config) -> std::fs::File {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open(crate::drafts::public_dir(cfg).join(LOCK_FILE)).unwrap();
+        // SAFETY: a plain syscall on a descriptor this function owns.
+        let got = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+        assert_eq!(got, 0, "no place to be had");
+        file
+    }
+
+    fn placed(cfg: &Config) -> bool {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open(crate::drafts::public_dir(cfg).join(LOCK_FILE)).unwrap();
+        // SAFETY: as in `place`.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) == 0 }
+    }
+
+    /// The owner gets the desktop only once the agent's commands already on it have ended,
+    /// and none takes a place while they have it.
+    #[test]
+    fn a_take_waits_for_the_commands_already_running() {
+        use std::os::unix::fs::PermissionsExt;
+        let (cfg, control) = control("desktop-drain");
+        let lock = crate::drafts::public_dir(&cfg).join(LOCK_FILE);
+        let mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "the agent may read and lock it, not change it");
+        let running = place(&cfg);
+        control.take([1; 32], 100).unwrap();
+        let (done, drained) = std::sync::mpsc::channel();
+        let draining = std::thread::spawn({
+            let control = control.clone();
+            move || {
+                control.drain_blocking();
+                done.send(()).unwrap();
+            }
+        });
+        // Still waiting while the command runs (15 s at most, far off).
+        assert!(drained
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err());
+        drop(running);
+        drained
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the take goes on once the command ended");
+        draining.join().unwrap();
+        assert!(
+            !placed(&cfg),
+            "a command took a place under the owner's hands"
+        );
+        // The holder's own take again changes nothing.
+        control.drain_blocking();
+        control.give(160);
+        assert!(placed(&cfg), "the hand back left the lock taken");
+        // A hand back before the wait ends leaves no lock behind.
+        let running = place(&cfg);
+        control.take([1; 32], 200).unwrap();
+        let draining = std::thread::spawn({
+            let control = control.clone();
+            move || control.drain_blocking()
+        });
+        control.give(201);
+        drop(running);
+        draining.join().unwrap();
+        assert!(placed(&cfg));
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&cfg));
+    }
+
+    /// A command that outlasts the wait (or anything of the agent's that took the lock to hold
+    /// a take up) is killed before the owner gets the desktop.
+    #[test]
+    fn a_command_that_outlasts_the_wait_is_killed() {
+        use std::io::BufRead;
+        use std::os::unix::process::ExitStatusExt;
+        let (mut cfg, _) = control("desktop-kill");
+        cfg.desktop_drain = std::time::Duration::from_millis(200);
+        let control = Control::new(&cfg);
+        let lock = crate::drafts::public_dir(&cfg).join(LOCK_FILE);
+        let script = "import fcntl, sys, time\nf = open(sys.argv[1])\n\
+                      fcntl.flock(f, fcntl.LOCK_SH)\nprint('placed', flush=True)\ntime.sleep(600)\n";
+        let mut stuck = Command::new("python3")
+            .args(["-I", "-c", script])
+            .arg(&lock)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(stuck.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "placed");
+        control.take([1; 32], 100).unwrap();
+        control.drain_blocking();
+        assert_eq!(stuck.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert!(!placed(&cfg), "the owner has no lock on the desktop");
+        control.give(101);
         let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&cfg));
     }
 

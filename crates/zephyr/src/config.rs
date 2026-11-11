@@ -173,6 +173,10 @@ pub struct Config {
     pub desktop_cap: std::time::Duration,
     #[serde(skip, default = "desktop_gone")]
     pub desktop_gone: std::time::Duration,
+    /// How long a take waits for the agent's browser and desktop commands already running to
+    /// end, before it kills them (DESIGN §4.11). Not configurable; tests shorten it.
+    #[serde(skip, default = "desktop_drain")]
+    pub desktop_drain: std::time::Duration,
 }
 
 fn telegram_api() -> String {
@@ -244,6 +248,10 @@ fn desktop_idle() -> std::time::Duration {
 
 fn desktop_cap() -> std::time::Duration {
     std::time::Duration::from_secs(60 * 60)
+}
+
+fn desktop_drain() -> std::time::Duration {
+    std::time::Duration::from_secs(15)
 }
 
 fn desktop_gone() -> std::time::Duration {
@@ -587,6 +595,7 @@ impl Config {
         self.desktop_idle = running.desktop_idle;
         self.desktop_cap = running.desktop_cap;
         self.desktop_gone = running.desktop_gone;
+        self.desktop_drain = running.desktop_drain;
         self.voice_dir = running.voice_dir.clone();
         self.voice_wait = running.voice_wait;
         self.voice_off_floor = running.voice_off_floor;
