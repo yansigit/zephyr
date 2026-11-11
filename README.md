@@ -147,6 +147,7 @@ wrong](#when-something-goes-wrong) and `zephyr uninstall [--keep-data]`.
 | `zephyr web setup [--yes]` / `web enrol [NAME]` | Put the [web app](#web-app) behind `tailscale serve` and add a first device; later, a one-time code for another device |
 | `zephyr skill add DIR \| list \| rm NAME` | Skills the agent may use (see [Skills and connectors](#skills-and-connectors)); one you add is approved at once |
 | `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. [--host HOST].. [--plain] \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}`; `--host` names where a secret is sent, `--plain` hands the connector the real one |
+| `zephyr mcp add --catalog NAME [--url URL] [--host HOST].. [--plain] \| zephyr mcp catalog` | A ready-made connector from the image's catalog, its secret asked for hidden; `catalog` lists them |
 | `zephyr packages add NAME.. \| rm NAME.. \| list` | Ubuntu (apt) packages for the agent, baked into a local image (`zephyr-local:<version>-<hash>`) on the release one; `up` and `upgrade` build it, and `add`/`rm` rebuild and recreate the container once the agent is idle |
 | `zephyr facts list \| add NAME --kind text\|digits\|email \| rm NAME \| allow NAME TARGET \| disallow NAME TARGET` | Private facts (a phone number, an address) that must not leave in an outgoing call; the value is asked for hidden, or read from one stdin line when piped, never taken as an argument. They are kept in `facts.toml` (0600, with the daemon's files). `/facts` in a chat lists names, kinds and allowed targets and, from `tui` or `chat` only, `rm NAME` and `allow NAME TARGET`; a chat never takes a value. The agent may add a fact (you are told its name); removing one or allowing a target is only proposed |
 | `zephyr vault list \| add login NAME --site URL [--user U] [--totp] \| add token NAME [--host HOST].. \| edit NAME [--host HOST].. \| rm NAME \| revoke NAME [PROGRAM]` | Logins and tokens the agent uses by name (see [The vault](#the-vault)); values are asked for hidden, or read one per line from stdin when piped, never taken as arguments |
@@ -521,6 +522,26 @@ is left out:
 `zephyr mcp add NAME --host api.example.com ...`, or `/set mcp.NAME.hosts api.example.com`. For a
 secret that is not an HTTPS header (a database password, a signing key), `--plain` or
 `/set mcp.NAME.secrets plain` hands the connector the real one, which the agent can then read.
+
+**Ready-made connectors.** The image carries a catalog of six, each with its command, the secret
+it needs, the hosts that secret is sent to and the approval classes of its tools filled in
+(`zephyr mcp catalog` lists them):
+
+```sh
+zephyr mcp add --catalog github          # asks for GITHUB_TOKEN, hidden
+zephyr mcp add --catalog home-assistant --url https://home.example.com/api/mcp
+zephyr mcp add --catalog brave-search --plain
+```
+
+`github` (the image's github-mcp-server), `notion` and `linear` hold only a stand-in for their
+token; `linear` and `home-assistant` reach their remote server through `mcp-remote`, so their key
+is a stand-in too. `brave-search` sends its key in a header zephyr does not swap, and a
+`home-assistant` at an `http://` address is reached without TLS, so those need `--plain`, which
+hands the server the real key, readable by the agent. `context7` needs no key. The npm servers are
+fetched at their pinned version on first use. Adding an entry again keeps the hosts you set
+(unless `--host` says otherwise), the class you gave any tool, and a `plain` you said before;
+`zephyr doctor` tells you when a newer entry ships than the one you added. The agent can read the
+catalog (`/opt/zephyr/connectors/`) and suggest an entry, but only you add one.
 
 ## Web app
 
