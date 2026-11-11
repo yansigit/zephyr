@@ -1682,13 +1682,14 @@ impl PushService {
                             async move {
                                 let (head, body) = req.into_parts();
                                 let body = body.collect().await.unwrap().to_bytes().to_vec();
+                                // Its answer is the one set when it arrived: a test that sees
+                                // this push and then changes `status` changes the next one only.
+                                let status = answer.load(Ordering::Relaxed);
                                 let _ = tx.send((head.headers, body));
                                 let mut res = hyper::Response::new(http_body_util::Full::new(
                                     hyper::body::Bytes::new(),
                                 ));
-                                *res.status_mut() =
-                                    hyper::StatusCode::from_u16(answer.load(Ordering::Relaxed))
-                                        .unwrap();
+                                *res.status_mut() = hyper::StatusCode::from_u16(status).unwrap();
                                 Ok::<_, std::convert::Infallible>(res)
                             }
                         },
