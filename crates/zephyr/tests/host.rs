@@ -35,6 +35,8 @@ case "$1" in
   network) [ "$2" = inspect ] && exit "${SHIM_NO_NETWORK:-0}"; exit 0 ;;
   image) exit "${SHIM_IMAGE_MISSING:-0}" ;;
   pull) exit "${SHIM_PULL_FAIL:-0}" ;;
+  # Reads the token as the real one does: exiting first would kill `gh auth token |` with SIGPIPE.
+  login) cat > /dev/null; exit 0 ;;
   # `docker build -t TAG -`: the Dockerfile on stdin goes to build.log.
   build) [ "${@: -1}" = - ] && cat >> "$SHIM_DIR/build.log"; exit "${SHIM_BUILD_FAIL:-0}" ;;
   run)
