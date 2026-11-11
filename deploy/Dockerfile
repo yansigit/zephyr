@@ -73,7 +73,7 @@ FROM toolchain AS rust
 ARG RPI_PACKAGE_REPO
 # The repository the image is published to, baked into its CLI (`zephyr upgrade` pulls from it);
 # unset or empty, the CLI's own default.
-ARG ZEPHYR_REPO
+ARG ZEPHYR_BUILD_REPO
 COPY Cargo.toml Cargo.lock /src/zephyr/
 COPY crates /src/zephyr/crates
 COPY --from=rpi-package / /src/rpi-package

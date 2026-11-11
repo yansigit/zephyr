@@ -34,7 +34,7 @@ deploy/bump-rpi.sh [0.22.0]                               # move every rpi pin; 
 
 `ZEPHYR_CONTAINER` / `ZEPHYR_IMAGE` point the host CLI at another container or image, to test beside a
 live install; `ZEPHYR_REPO` moves the repository it pulls `<repo>:<version>` from (default
-`ghcr.io/yansigit/zephyr`, also settable at build time). Pushing a `v*` tag publishes `ghcr.io/yansigit/zephyr:<version>` and `:latest` (`.github/workflows/image.yml`).
+`ghcr.io/yansigit/zephyr`; at build time `ZEPHYR_BUILD_REPO`). `deploy/release.sh` unsets all of them. Pushing a `v*` tag publishes `ghcr.io/yansigit/zephyr:<version>` and `:latest` (`.github/workflows/image.yml`).
 
 ## Architecture
 

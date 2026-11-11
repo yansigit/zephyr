@@ -79,8 +79,8 @@ web app and iMessage) and `gh` signed in (for a private image on ghcr.io).
 Otherwise build it: `zephyr up --build` builds `deploy/Dockerfile` here, and since the provider
 sources are public it needs no token. For a smaller image without the owner's provider sources, see
 [Building the image](#building-the-image) and what it leaves out. To use your own registry, build
-the CLI with it (`ZEPHYR_REPO=registry.example.com/you/zephyr cargo install --locked --path
-crates/zephyr`), build the image with `--build-arg ZEPHYR_REPO=registry.example.com/you/zephyr`,
+the CLI with it (`ZEPHYR_BUILD_REPO=registry.example.com/you/zephyr cargo install --locked --path
+crates/zephyr`), build the image with `--build-arg ZEPHYR_BUILD_REPO=registry.example.com/you/zephyr`,
 and push it there as `<repo>:<version>` and `<repo>:latest`. Run `docker login` for that registry
 yourself: your `gh` token only ever goes to ghcr.io.
 
@@ -115,13 +115,14 @@ wrong](#when-something-goes-wrong) and `zephyr uninstall [--keep-data]`.
 
 | Knob | Where | Default |
 |---|---|---|
-| `ZEPHYR_REPO` | environment, or baked in at `cargo install` and by the Dockerfile arg | `ghcr.io/yansigit/zephyr` |
+| `ZEPHYR_REPO` | environment, at run time | the build-time value, else `ghcr.io/yansigit/zephyr` |
+| `ZEPHYR_BUILD_REPO` | environment of `cargo install`, baked into the CLI | unset: `ghcr.io/yansigit/zephyr` |
 | `ZEPHYR_IMAGE` | environment | unset: `<repo>:<CLI version>`. Set, one exact image, with no versioned upgrades |
 | `ZEPHYR_CONTAINER` | environment | `zephyr` |
 | `ZEPHYR_SRC` | environment, for `zephyr up --build` | the source tree the CLI was built from |
 | `RPI_PACKAGE_REPO`, `RPI_PACKAGE_REF` | `deploy/Dockerfile` build args | `yansigit/rpi-package` at a pinned commit; an empty repo leaves it out |
 | `PLUGINS_REPO`, `PLUGINS_REF` | `deploy/Dockerfile` build args | `yansigit/rpi-provider-plugins` at a pinned commit; an empty repo leaves it out |
-| `ZEPHYR_REPO` | `deploy/Dockerfile` build arg | unset: the CLI's default (image.yml sets `ghcr.io/<repository>`) |
+| `ZEPHYR_BUILD_REPO` | `deploy/Dockerfile` build arg, baked into the image's CLI | unset: the CLI's default (image.yml sets `ghcr.io/<repository>`) |
 | `RPI_BIN` | `deploy/release.sh` and the ignored real-rpi tests | the pinned rpi path in `release.sh` |
 | `ZEPHYR_GH_REPO` | `deploy/runner/start.sh` | `yansigit/zephyr` |
 
@@ -971,8 +972,9 @@ Pushing a `v*` tag publishes `ghcr.io/yansigit/zephyr:<version>` (`.github/workf
 which tags `ghcr.io/<the repository it runs in>`, so a fork publishes to its own).
 
 The CLI runs and upgrades from `ghcr.io/yansigit/zephyr` unless `ZEPHYR_REPO` names another
-repository: in the environment for one shell, or at build time (`ZEPHYR_REPO=… cargo install …`,
-or `--build-arg ZEPHYR_REPO=…` for the image's own CLI), which the CLI keeps. `ZEPHYR_IMAGE`, one
+repository: in the environment for one shell, or at build time under its own name
+(`ZEPHYR_BUILD_REPO=… cargo install …`, or `--build-arg ZEPHYR_BUILD_REPO=…` for the image's own
+CLI), which the CLI keeps; a `ZEPHYR_REPO` exported while you build is not baked in. `ZEPHYR_IMAGE`, one
 exact image, wins over both. Your `gh` token only ever goes to ghcr.io; for another registry,
 `docker login` to it yourself.
 

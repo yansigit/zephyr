@@ -4,6 +4,9 @@
 #   deploy/release.sh --cli   a host-only change: test and install the CLI, nothing published
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# The owner's release: the CLI it installs and the container it upgrades are the defaults, never
+# a side install this shell may point at (or a repository `cargo install` would bake in).
+unset ZEPHYR_REPO ZEPHYR_BUILD_REPO ZEPHYR_IMAGE ZEPHYR_CONTAINER
 
 die() { echo "release: $*" >&2; exit 1; }
 step() { printf '\n== %s\n' "$*"; }

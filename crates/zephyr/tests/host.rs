@@ -2765,7 +2765,7 @@ fn the_image_workflow_tags_the_repository_it_runs_in() {
         "/../../.github/workflows/image.yml"
     )));
     assert!(yml.contains(r#"echo "image=ghcr.io/${GITHUB_REPOSITORY,,}""#));
-    assert!(yml.contains("ZEPHYR_REPO=${{ steps.v.outputs.image }}"));
+    assert!(yml.contains("ZEPHYR_BUILD_REPO=${{ steps.v.outputs.image }}"));
     assert!(yml.contains("${{ steps.v.outputs.image }}:${{ steps.v.outputs.version }}"));
     let tags = yml.lines().filter(|l| l.contains("ghcr.io/yansigit"));
     assert!(
@@ -3256,13 +3256,26 @@ fn the_dockerfile_skips_a_provider_source_only_for_an_empty_arg() {
     };
     for (name, arg, file) in [
         ("rust", "RPI_PACKAGE_REPO", "/src/rpi-package/Cargo.toml"),
-        ("plugins", "PLUGINS_REPO", "packages/rpi-claude-agent/scripts/stage.sh"),
+        (
+            "plugins",
+            "PLUGINS_REPO",
+            "packages/rpi-claude-agent/scripts/stage.sh",
+        ),
     ] {
         let stage = stage(name);
         assert!(stage.contains(&format!("\nARG {arg}\n")), "{name}: {stage}");
-        assert!(stage.contains(&format!("if [ -n \"${arg}\" ]; then")), "{name}: {stage}");
-        assert!(!stage.contains(&format!("[ -f {file} ]")), "{name}: {stage}");
-        assert!(!stage.contains(&format!("[ -e {file} ]")), "{name}: {stage}");
+        assert!(
+            stage.contains(&format!("if [ -n \"${arg}\" ]; then")),
+            "{name}: {stage}"
+        );
+        assert!(
+            !stage.contains(&format!("[ -f {file} ]")),
+            "{name}: {stage}"
+        );
+        assert!(
+            !stage.contains(&format!("[ -e {file} ]")),
+            "{name}: {stage}"
+        );
     }
 }
 
@@ -3284,6 +3297,12 @@ fn release_and_runner_scripts_keep_their_defaults() {
         "{release}"
     );
     assert!(release.contains("export RPI_BIN=\"$rpi\""), "{release}");
+    // The owner's release installs and upgrades the defaults, whatever this shell points at.
+    let unset = "\nunset ZEPHYR_REPO ZEPHYR_BUILD_REPO ZEPHYR_IMAGE ZEPHYR_CONTAINER\n";
+    let at = release
+        .find(unset)
+        .expect("release.sh unsets the CLI's knobs");
+    assert!(at < release.find("\ncargo install -q").unwrap(), "{release}");
     let runner = read(&deploy.join("runner/start.sh"));
     assert!(
         runner.contains("repo=${ZEPHYR_GH_REPO:-yansigit/zephyr}"),

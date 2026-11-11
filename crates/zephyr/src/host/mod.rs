@@ -40,13 +40,22 @@ env: ZEPHYR_CONTAINER (default zephyr), ZEPHYR_IMAGE, ZEPHYR_REPO (default ghcr.
 /// release).
 pub const DEFAULT_REPO: &str = "ghcr.io/yansigit/zephyr";
 
-/// The image repository: `ZEPHYR_REPO` from the environment, else as it was when this CLI was
-/// built (so a CLI copied out of an image upgrades from where it came), else `DEFAULT_REPO`.
-/// Empty counts as unset: an undefined Docker `ARG` still reaches the build as "".
+/// The image repository: `ZEPHYR_REPO` from the environment, else `ZEPHYR_BUILD_REPO` as it was
+/// when this CLI was built (so a CLI copied out of an image upgrades from where it came), else
+/// `DEFAULT_REPO`. The build reads a name of its own, so a `ZEPHYR_REPO` exported for a test is
+/// never baked in by `cargo install`.
 fn repo() -> String {
-    let set = |v: Option<String>| v.filter(|v| !v.is_empty());
-    set(std::env::var("ZEPHYR_REPO").ok())
-        .or_else(|| set(option_env!("ZEPHYR_REPO").map(String::from)))
+    repo_from(
+        std::env::var("ZEPHYR_REPO").ok(),
+        option_env!("ZEPHYR_BUILD_REPO"),
+    )
+}
+
+/// `repo` from its two inputs. Empty counts as unset: an undefined Docker `ARG` still reaches the
+/// build as "".
+fn repo_from(run: Option<String>, built: Option<&str>) -> String {
+    (run.filter(|v| !v.is_empty()))
+        .or_else(|| built.filter(|v| !v.is_empty()).map(String::from))
         .unwrap_or_else(|| DEFAULT_REPO.into())
 }
 
@@ -1643,6 +1652,25 @@ mod tests {
         );
         let other = local_image("zephyr:dev", &list(&["ffmpeg", "jq"])).unwrap();
         assert!(other.starts_with("zephyr-local:custom-") && other != tag);
+    }
+
+    #[test]
+    fn the_run_time_repo_wins_and_the_build_time_one_has_its_own_name() {
+        let run = |v: &str| Some(v.to_string());
+        assert_eq!(repo_from(None, None), DEFAULT_REPO);
+        assert_eq!(repo_from(run(""), Some("")), DEFAULT_REPO);
+        assert_eq!(repo_from(None, Some("b.example/z")), "b.example/z");
+        assert_eq!(
+            repo_from(run("r.example/z"), Some("b.example/z")),
+            "r.example/z"
+        );
+        assert_eq!(repo_from(run(""), Some("b.example/z")), "b.example/z");
+        // A shell's run-time ZEPHYR_REPO at `cargo install` must not become the CLI's default:
+        // the build reads only ZEPHYR_BUILD_REPO.
+        let source = include_str!("mod.rs");
+        let run_time = concat!("option_env!(\"ZEPHYR_", "REPO\")");
+        assert!(!source.contains(run_time));
+        assert!(source.contains("option_env!(\"ZEPHYR_BUILD_REPO\")"));
     }
 
     #[test]

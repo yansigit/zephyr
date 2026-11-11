@@ -1,6 +1,6 @@
 # Publishes ghcr.io/<this repository>:<version> and :latest for each v* tag (here
 # ghcr.io/yansigit/zephyr; a fork publishes to its own); `zephyr init` and `zephyr upgrade` pull it.
-# The name also goes in as build arg ZEPHYR_REPO, so the image's CLI upgrades from where it came.
+# The name also goes in as build arg ZEPHYR_BUILD_REPO, so the image's CLI upgrades from where it came.
 # A manual run (`gh workflow run image.yml --ref <branch>`) builds :dev without pushing anything;
 # with `-f providers=none` it builds :dev-minimal, the image without the owner's provider sources
 # (both repo args empty, DESIGN §4.4 item 1), also never pushed.
@@ -70,7 +70,7 @@ jobs:
           tags: zephyr-smoke:ci
           # An empty line (the full image) is dropped.
           build-args: |
-            ZEPHYR_REPO=${{ steps.v.outputs.image }}
+            ZEPHYR_BUILD_REPO=${{ steps.v.outputs.image }}
             ${{ env.MINIMAL == 'true' && 'RPI_PACKAGE_REPO=' || '' }}
             ${{ env.MINIMAL == 'true' && 'PLUGINS_REPO=' || '' }}
           secrets: |
@@ -116,7 +116,7 @@ jobs:
             ${{ steps.v.outputs.image }}:${{ steps.v.outputs.version }}
             ${{ github.event_name == 'push' && format('{0}:latest', steps.v.outputs.image) || '' }}
           build-args: |
-            ZEPHYR_REPO=${{ steps.v.outputs.image }}
+            ZEPHYR_BUILD_REPO=${{ steps.v.outputs.image }}
             ${{ env.MINIMAL == 'true' && 'RPI_PACKAGE_REPO=' || '' }}
             ${{ env.MINIMAL == 'true' && 'PLUGINS_REPO=' || '' }}
           secrets: |
