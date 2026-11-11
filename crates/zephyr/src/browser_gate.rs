@@ -520,7 +520,18 @@ fn decide(args: &[String], env: &Env) -> (Next, Place) {
         Err(text) => (Next::Refuse(text), None),
     };
     match &act {
-        Act::Pass => return paced_go(paced, &|| page.url()),
+        Act::Pass => {
+            // `back`, `forward` and `reload` read the page's address only for its pace: only
+            // once the gate says pacing is on.
+            let paced = match &paced {
+                Some((Paced::Current, count)) => match pace_check(env, "", *count) {
+                    Ok(on) => paced.filter(|_| on),
+                    Err(text) => return (Next::Refuse(text), None),
+                },
+                _ => paced,
+            };
+            return paced_go(paced, &|| page.url());
+        }
         Act::Refuse(text) => return (Next::Refuse((*text).into()), None),
         Act::Type { action, typed } => {
             let seen = Seen {
@@ -1193,16 +1204,18 @@ const PACE_AFTER_WAIT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const REREADS: u32 = 6;
 
-/// Whether the gate would refuse the command's slot on `site` (a batch, or a queue too long),
-/// reserving nothing. No gate answering refuses nothing.
-fn pace_check(env: &Env, site: &str, count: u32) -> Result<(), String> {
+/// Whether the gate would refuse the command's slot on `site` (a batch, or a queue too long;
+/// an empty `site`, not read yet, the batch only), reserving nothing: `Ok` says whether pacing
+/// is on. No gate answering refuses nothing and paces nothing.
+fn pace_check(env: &Env, site: &str, count: u32) -> Result<bool, String> {
     let Some(socket) = env.socket.as_ref() else {
-        return Ok(());
+        return Ok(false);
     };
     let req = json!({"v": 1, "pace": site, "count": count, "check": true, "session": env.session});
     match zephyr_policy::gate_client::ask(socket, &req, PACE_ASK) {
         Ok(a) if a["verdict"] == "deny" => Err(refusal(&a)),
-        _ => Ok(()),
+        Ok(a) if a["verdict"] == "allow" => Ok(a["on"] != false),
+        _ => Ok(false),
     }
 }
 
@@ -2348,15 +2361,19 @@ cat "$d/$f.json"
         }
 
         /// A gate on the socket: each request comes out with its connection, for the test to
-        /// answer, hold open or drop. A request for a pacing slot is answered `allow` with no
-        /// wait, as the gate with pacing off answers it, and does not come out.
+        /// answer, hold open or drop. A pacing request is answered as the gate with pacing off
+        /// answers it, and does not come out.
         fn gate(&self) -> mpsc::Receiver<(Value, UnixStream)> {
             let (tx, rx) = mpsc::channel();
             let all = self.gate_all();
             std::thread::spawn(move || {
                 for (req, mut conn) in all {
                     if req.get("pace").is_some() {
-                        answer(&mut conn, json!({"verdict": "allow"}));
+                        let off = match req["check"] == true {
+                            true => json!({"verdict": "allow", "on": false}),
+                            false => json!({"verdict": "allow", "wait_ms": 0}),
+                        };
+                        answer(&mut conn, off);
                     } else if tx.send((req, conn)).is_err() {
                         return;
                     }
@@ -2840,6 +2857,19 @@ cat "$d/$f.json"
             waiting.join().unwrap(),
             Next::Refuse("not run: one at a time".into())
         );
+        // Going back asks first whether pacing is on, and only then reads the page's address.
+        let read = t.argv().len();
+        let waiting = t.spawn(&["back"]);
+        let (req, mut conn) = asked(&gate);
+        let check = json!({"v": 1, "pace": "", "count": 1, "check": true, "session": "main"});
+        assert_eq!(req, check);
+        assert_eq!(t.argv().len(), read, "read before it knew");
+        answer(&mut conn, json!({"verdict": "allow", "on": true}));
+        let (req, mut conn) = asked(&gate);
+        assert_eq!(req["pace"], "example.com", "{req}");
+        assert_eq!(t.argv()[read..], ["get url --json"]);
+        answer(&mut conn, json!({"verdict": "allow", "wait_ms": 0}));
+        assert_eq!(waiting.join().unwrap(), Next::Exec);
         // Not a site: nothing asked.
         assert_eq!(t.run(&["open", "about:blank"]), Next::Exec);
         assert!(gate.try_recv().is_err());
@@ -2935,9 +2965,15 @@ cat "$d/$f.json"
         // Nothing read the page, and the gate heard nothing.
         assert!(t.argv().is_empty(), "{:?}", t.argv());
         assert!(gate.try_recv().is_err());
-        // Going back reads only the page's address, for its pace (DESIGN §4.24).
-        assert_eq!(t.run(&["--session", "work", "back"]), Next::Exec);
-        assert_eq!(t.argv(), ["--session work get url --json"]);
+        // With pacing off, going back reads nothing of the page either (DESIGN §4.24).
+        for args in [
+            &["back"][..],
+            &["forward"],
+            &["--session", "work", "reload"],
+        ] {
+            assert_eq!(t.run(args), Next::Exec, "{args:?}");
+        }
+        assert!(t.argv().is_empty(), "{:?}", t.argv());
         assert!(gate.try_recv().is_err());
         // A click on a link reads the page (as the agent's own session), then goes unasked.
         assert_eq!(

@@ -1281,6 +1281,46 @@ fn pacing_spaces_navigations_across_wrapper_processes() {
     }
     // example.com's last ran at least 1.2 s after its first: other.test did not queue behind it.
     assert!(other[0] < example[4], "{log:?}");
+    // Going back reads the page's address for its site.
+    let back = |wrapper: &Path| {
+        let ok = Command::new(wrapper)
+            .arg("back")
+            .env("ZEPHYR_AGENT_BROWSER", &real)
+            .env("ZEPHYR_GATE_SOCKET", public.join("gate.sock"))
+            .env("ZEPHYR_SESSION", "main")
+            .status()
+            .unwrap();
+        assert!(ok.success());
+    };
+    back(&wrapper);
+    let argv: Vec<String> = ab_log(&dir).into_iter().skip(8).map(|(_, a)| a).collect();
+    assert_eq!(argv, ["get url --json", "back"]);
+}
+
+/// DESIGN §4.24: with `pace_ms = 0` the daemon's gate says pacing is off, so `back`, `forward`
+/// and `reload` read nothing of the page, as before pacing.
+#[test]
+fn with_pacing_off_going_back_reads_nothing_of_the_page() {
+    let (home, cfg) = setup("pacing-off", "[browser]\npace_ms = 0\n");
+    let dir = home.parent().unwrap().to_path_buf();
+    let _d = daemon(&cfg, &home);
+    let public = dir.join("home-public");
+    wait_for("the gate and the desktop lock", || {
+        public.join("gate.sock").exists() && public.join("desktop.lock").exists()
+    });
+    let (wrapper, real) = browser_wrapper(&dir);
+    for cmd in ["back", "forward", "reload"] {
+        let ok = Command::new(&wrapper)
+            .arg(cmd)
+            .env("ZEPHYR_AGENT_BROWSER", &real)
+            .env("ZEPHYR_GATE_SOCKET", public.join("gate.sock"))
+            .env("ZEPHYR_SESSION", "main")
+            .status()
+            .unwrap();
+        assert!(ok.success(), "{cmd}");
+    }
+    let argv: Vec<String> = ab_log(&dir).into_iter().map(|(_, a)| a).collect();
+    assert_eq!(argv, ["back", "forward", "reload"]);
 }
 
 /// Review Focus 4 (DESIGN §4.24): a wrapper sleeping out its pace holds no place on the desktop,

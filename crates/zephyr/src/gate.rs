@@ -1355,7 +1355,7 @@ impl Conn {
             let answer = match (named && line.len() <= MAX_REQUEST, check) {
                 (false, _) => Err("not run: the gate could not read the request".to_string()),
                 (true, true) => (self.pace.check(&site, count, pace, now))
-                    .map(|()| serde_json::json!({"verdict": "allow"})),
+                    .map(|()| serde_json::json!({"verdict": "allow", "on": !pace.is_zero()})),
                 (true, false) => {
                     let max = max_ms.map_or(PACE_MAX_WAIT, Duration::from_millis);
                     let wait = (self.pace).reserve(&site, count, pace, max, now, pace_draw());
@@ -4519,7 +4519,13 @@ mod tests {
         check["check"] = json!(true);
         assert_eq!(
             ask(&socket, &check).await.unwrap(),
-            json!({"verdict": "allow"})
+            json!({"verdict": "allow", "on": true})
+        );
+        check["pace"] = json!("");
+        assert_eq!(
+            ask(&socket, &check).await.unwrap(),
+            json!({"verdict": "allow", "on": true}),
+            "the site not read yet: is pacing on?"
         );
         check["count"] = json!(2);
         assert_eq!(ask(&socket, &check).await.unwrap()["verdict"], "deny");
@@ -4533,6 +4539,19 @@ mod tests {
             .unwrap()
             .contains("too many browser actions"));
         assert!(outcomes(&h.store).is_empty(), "{:?}", outcomes(&h.store));
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
+    }
+
+    /// With pacing off a check says so, so that a `back` need not read the page's address.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_check_with_pacing_off_says_it_is_off() {
+        let h = home("gate-pace-off", "[browser]\npace_ms = 0\n");
+        let (socket, _) = serving(&h).await;
+        let check = json!({"v": 1, "pace": "", "count": 2, "check": true, "session": "main"});
+        assert_eq!(
+            ask(&socket, &check).await.unwrap(),
+            json!({"verdict": "allow", "on": false})
+        );
         let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
     }
 }
