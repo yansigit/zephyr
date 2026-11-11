@@ -3615,6 +3615,42 @@ fn vault_add_list_and_rm_reach_roots_file_and_never_put_a_value_in_argv() {
         assert!(!output.contains(value), "{value} printed");
     }
 
+    // A provider's key for the daemon's own use (DESIGN §4.22): from the prompt, never argv.
+    const API_KEY: &str = "KEY0123456789telnyx";
+    let service = [
+        "vault",
+        "add",
+        "service",
+        "calls",
+        "--provider",
+        "telnyx",
+        "--account",
+        "1494404757140276705",
+        "--from",
+        "+14165550100",
+        "--public-key",
+        "cHVibGlj",
+    ];
+    let out = env.zephyr_input(&service, &format!("{API_KEY}\n"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let saved = std::fs::read_to_string(files.join("vault.toml")).unwrap();
+    assert!(saved.contains("[[service]]") && saved.contains(API_KEY));
+    let list = env.ok(&["vault", "list"]);
+    assert!(
+        list.contains("service calls: telnyx; a key is saved"),
+        "{list}"
+    );
+    let output = std::fs::read_to_string(env.dir.join("output.log")).unwrap();
+    assert!(!format!("{:?}", env.calls()).contains(API_KEY) && !output.contains(API_KEY));
+    assert!(!env
+        .zephyr_input(&["vault", "add", "service", "cards"], "k\n")
+        .status
+        .success());
+
     // A token's hosts are taken where the owner saves it (DESIGN §4.21), normalized; a wildcard
     // saves nothing; a new value keeps them.
     let add = [

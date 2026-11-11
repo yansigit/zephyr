@@ -1110,13 +1110,19 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let mut hosts = a.values("--host")?;
     // And the request headers it is swapped in besides Authorization.
     let headers = a.values("--header")?;
+    // A provider's own ids (DESIGN §4.25, §4.26); its key comes from the prompt like any secret.
     let provider = a.value("--provider")?;
     let account = a.value("--account")?;
+    let from = a.value("--from")?;
+    let public_key = a.value("--public-key")?;
+    let api = a.value("--api")?;
     let rest = a.rest()?;
     let usage = "usage: zephyr vault list | add login NAME --site URL [--user U] [--totp] | \
                  add token NAME [--host HOST].. [--header HEADER].. | edit NAME [--site URL] \
                  [--user U] [--totp] [--host HOST].. [--header HEADER].. | rm NAME | \
-                 revoke NAME [PROGRAM] | add service cards --provider NAME [--account ID]";
+                 revoke NAME [PROGRAM] | add service cards --provider NAME [--account ID] | \
+                 add service calls --provider telnyx --account CONNECTION_ID --from +1NUMBER \
+                 --public-key KEY";
     let text = match h.data.read(crate::vault::FILE) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         r => r?,
@@ -1209,6 +1215,9 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
                 provider: provider.clone(),
                 key,
                 account: account.unwrap_or_default(),
+                from: from.unwrap_or_default(),
+                public_key: public_key.unwrap_or_default(),
+                api: api.unwrap_or_default(),
             })?;
             format!("saved the {name} service ({provider}); only zephyr's own client reads it")
         }

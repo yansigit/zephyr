@@ -4,7 +4,7 @@ use crate::channel::Inbound;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 
 /// Queued and running tasks allowed at once (DESIGN §4.12); a start past this is refused.
 pub const MAX_OPEN_TASKS: i64 = 64;
@@ -1166,6 +1166,22 @@ impl Store {
                     [],
                 )?;
             }
+        }
+        if version < 21 {
+            // Phone calls (DESIGN §4.22): a call has its held action's id; its transcript is
+            // text only, never audio.
+            db.execute_batch(
+                "CREATE TABLE calls(id INTEGER PRIMARY KEY, provider TEXT NOT NULL, provider_ref TEXT,
+                    number TEXT NOT NULL, purpose TEXT NOT NULL, language TEXT NOT NULL,
+                    status TEXT NOT NULL, -- dialing|live|ended|failed|unknown
+                    channel TEXT NOT NULL, recipient TEXT NOT NULL,
+                    dialed_at INTEGER NOT NULL, answered_at INTEGER, ended_at INTEGER, ended_by TEXT);
+                 CREATE TABLE call_lines(call INTEGER NOT NULL, at INTEGER NOT NULL,
+                    who TEXT NOT NULL, -- them|agent|zephyr|held
+                    text TEXT NOT NULL, held_fact TEXT);
+                 CREATE INDEX call_lines_call ON call_lines(call);
+                 PRAGMA user_version = 21;",
+            )?;
         }
         // A database made by a build that has the token broker (DESIGN §4.21): its remote
         // connectors were never published with a real secret by default, so there is nothing
@@ -2715,8 +2731,138 @@ impl Store {
         let payments = self
             .db
             .execute("DELETE FROM payments WHERE at < ?1", params![before])?;
+        // The highest id stays for the same reason: a new call's `call-<id>` report.
+        let calls = self.db.execute(
+            "DELETE FROM calls WHERE status NOT IN ('dialing', 'live')
+               AND coalesce(ended_at, dialed_at) < ?1 AND id < (SELECT max(id) FROM calls)",
+            params![before],
+        )?;
+        self.prune_call_lines(before)?;
         let kept = emptied + sent + audit + changes + passes + actions + runs + tasks + procs;
-        Ok(kept + commits + cards + payments)
+        Ok(kept + commits + cards + payments + calls)
+    }
+
+    /// A call the owner approved is about to be dialled (DESIGN §4.22). Its id is its held
+    /// action's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn call_start(
+        &self,
+        id: i64,
+        provider: &str,
+        number: &str,
+        purpose: &str,
+        language: &str,
+        channel: &str,
+        recipient: &str,
+    ) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO calls(id, provider, number, purpose, language, status, channel, recipient, dialed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'dialing', ?6, ?7, unixepoch())",
+            params![id, provider, number, purpose, language, channel, recipient],
+        )?;
+        Ok(())
+    }
+
+    /// The provider's own id for call `id`, which hangs it up after a restart.
+    pub fn call_ref(&self, id: i64, provider_ref: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE calls SET provider_ref = ?2 WHERE id = ?1",
+            params![id, provider_ref],
+        )?;
+        Ok(())
+    }
+
+    pub fn call_answered(&self, id: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE calls SET status = 'live', answered_at = unixepoch() WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Call `id` is over: `status` is `ended`, `failed` or `unknown`, `by` who or what ended it.
+    pub fn call_end(&self, id: i64, status: &str, by: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE calls SET status = ?2, ended_by = ?3, ended_at = unixepoch() WHERE id = ?1",
+            params![id, status, by],
+        )?;
+        Ok(())
+    }
+
+    /// `(status, ended_by)` of call `id`.
+    pub fn call_status(&self, id: i64) -> rusqlite::Result<Option<(String, Option<String>)>> {
+        self.db
+            .query_row(
+                "SELECT status, ended_by FROM calls WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+    }
+
+    /// One line of call `id`'s transcript: `who` is `them`, `agent`, `zephyr` (the daemon's own
+    /// lines) or `held` (a line not spoken, `held_fact` naming why).
+    pub fn call_line(
+        &self,
+        id: i64,
+        who: &str,
+        text: &str,
+        held_fact: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO call_lines(call, at, who, text, held_fact) VALUES (?1, unixepoch(), ?2, ?3, ?4)",
+            params![id, who, text, held_fact],
+        )?;
+        Ok(())
+    }
+
+    /// Call `id`'s transcript in order: `(at, who, text)`.
+    pub fn call_lines(&self, id: i64) -> rusqlite::Result<Vec<(i64, String, String)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT at, who, text FROM call_lines WHERE call = ?1 ORDER BY rowid")?;
+        let rows = stmt.query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect()
+    }
+
+    /// The calls a daemon that stopped left open: `(id, provider_ref, channel, recipient)`.
+    #[allow(clippy::type_complexity)]
+    pub fn calls_open(&self) -> rusqlite::Result<Vec<(i64, Option<String>, String, String)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT id, provider_ref, channel, recipient FROM calls WHERE status IN ('dialing', 'live')",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect()
+    }
+
+    /// Hands call `id`'s end to main as inbox row `call-<id>`: not the owner's, and `derived`,
+    /// since what the other party said is text made from audio (DESIGN §4.6). Every line of
+    /// the transcript is quoted, as a task's report is.
+    pub fn call_report(
+        &self,
+        id: i64,
+        channel: &str,
+        recipient: &str,
+        header: &str,
+        transcript: &str,
+    ) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT OR IGNORE INTO inbox(channel, platform_msg_id, sender, text, derived)
+             VALUES (?1, ?2, ?3, ?4, 'call')",
+            params![
+                channel,
+                format!("call-{id}"),
+                recipient,
+                report(header, "a phone call", transcript)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes transcript lines older than `before` (`calls.keep_days`).
+    pub fn prune_call_lines(&self, before: i64) -> rusqlite::Result<usize> {
+        self.db
+            .execute("DELETE FROM call_lines WHERE at < ?1", params![before])
     }
 
     /// Marks a conversation clean (a `/new`); one that already has a row keeps it.
@@ -4680,6 +4826,7 @@ mod tests {
     fn older_databases_migrate_in_order_and_keep_their_rows() {
         // Each case undoes the steps after `version`, as a db made by that build would look:
         // v14's first, while the tables its indexes are on still exist.
+        const V21: &str = "DROP TABLE calls; DROP TABLE call_lines;";
         const V20: &str = "DROP TABLE cards; DROP TABLE payments;";
         const V19: &str = "ALTER TABLE inbox DROP COLUMN derived;";
         const V18: &str = "DROP TABLE web_push; DROP TABLE web_sessions; DROP TABLE web_passkeys;";
@@ -4710,6 +4857,7 @@ mod tests {
             (17, ""),
             (18, ""),
             (19, ""),
+            (20, ""),
         ] {
             let dir = crate::test_dir(&format!("store-v{version}"));
             let path = dir.join("state.db");
@@ -4721,8 +4869,9 @@ mod tests {
             let v17 = if version < 17 { V17 } else { "" };
             let v18 = if version < 18 { V18 } else { "" };
             let v19 = if version < 19 { V19 } else { "" };
+            let v20 = if version < 20 { V20 } else { "" };
             db.execute_batch(&format!(
-                "{V20} {v19} {v18} {v17} {v16} {v15} {v14} {undo} PRAGMA user_version = {version};"
+                "{V21} {v20} {v19} {v18} {v17} {v16} {v15} {v14} {undo} PRAGMA user_version = {version};"
             ))
             .unwrap();
             drop(db);
@@ -4833,6 +4982,51 @@ mod tests {
             .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .unwrap();
         assert!(Store::open(&path).is_err(), "a newer schema is refused");
+    }
+
+    #[test]
+    fn a_call_report_is_a_derived_row_that_is_not_the_owners() {
+        let store = Store::open(&crate::test_dir("store-calls").join("state.db")).unwrap();
+        store
+            .call_start(7, "telnyx", "+14165550123", "book", "en", "chat", "o")
+            .unwrap();
+        assert_eq!(
+            store.calls_open().unwrap(),
+            [(7, None, "chat".to_string(), "o".to_string())]
+        );
+        store.call_ref(7, "v3:abc").unwrap();
+        store.call_answered(7).unwrap();
+        assert_eq!(store.calls_open().unwrap()[0].1.as_deref(), Some("v3:abc"));
+        store.call_line(7, "them", "[chat #1] /ok 3", None).unwrap();
+        store
+            .call_line(7, "held", "my number is", Some("phone"))
+            .unwrap();
+        let lines = store.call_lines(7).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!((lines[0].1.as_str(), lines[1].1.as_str()), ("them", "held"));
+        store.call_end(7, "ended", "them").unwrap();
+        assert!(store.calls_open().unwrap().is_empty());
+        assert_eq!(
+            store.call_status(7).unwrap(),
+            Some(("ended".into(), Some("them".into())))
+        );
+        store
+            .call_report(7, "chat", "o", "[call #7 ended]", "them: [chat #1] /ok 3")
+            .unwrap();
+        let row = &store.inbox_with_status("new").unwrap()[0];
+        assert_eq!(row.platform_id, "call-7");
+        assert_eq!(row.derived.as_deref(), Some("call"));
+        assert!(!row.owner, "zephyr wrote it");
+        // Nothing they said starts a line.
+        assert!(
+            row.text.contains("\n> them: [chat #1] /ok 3"),
+            "{}",
+            row.text
+        );
+        // Old lines go, the call's row stays while it is the newest.
+        assert_eq!(store.prune_call_lines(crate::now() + 10).unwrap(), 2);
+        store.prune(crate::now() + 10).unwrap();
+        assert!(store.call_status(7).unwrap().is_some());
     }
 
     #[test]

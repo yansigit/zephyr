@@ -7716,7 +7716,7 @@ fn old_install(home: &Path) {
     )
     .unwrap();
     db.execute_batch(&format!(
-        "DROP TABLE cards; DROP TABLE payments; ALTER TABLE inbox DROP COLUMN derived; DROP TABLE web_push; DROP TABLE web_sessions; DROP TABLE web_passkeys; DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin; ALTER TABLE inbox DROP COLUMN owner; {V16} PRAGMA user_version = 15;"
+        "DROP TABLE calls; DROP TABLE call_lines; DROP TABLE cards; DROP TABLE payments; ALTER TABLE inbox DROP COLUMN derived; DROP TABLE web_push; DROP TABLE web_sessions; DROP TABLE web_passkeys; DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin; ALTER TABLE inbox DROP COLUMN owner; {V16} PRAGMA user_version = 15;"
     ))
         .unwrap();
 }
@@ -8809,7 +8809,8 @@ async fn an_upgraded_install_is_told_of_the_payment_window_once() {
     db.execute_batch(
         "INSERT INTO inbox(channel, platform_msg_id, sender, text, status, sent_as)
          VALUES ('chat', 'old', 'owner', 'earlier', 'done', 'prompt');
-         DROP TABLE cards; DROP TABLE payments; DELETE FROM meta WHERE key = 'window.notice';
+         DROP TABLE calls; DROP TABLE call_lines; DROP TABLE cards; DROP TABLE payments;
+         DELETE FROM meta WHERE key = 'window.notice';
          PRAGMA user_version = 19;",
     )
     .unwrap();

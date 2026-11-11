@@ -196,7 +196,7 @@ impl Entry {
     }
 }
 
-/// A provider's credentials (DESIGN §4.25): a `[[service]]` table. Never a token: it has no
+/// A provider's credentials (DESIGN §4.25, §4.26): a `[[service]]` table. Never a token: it has no
 /// programs, no hosts and no surrogate, and only the daemon's own client reads it. `Debug`
 /// shows the key's length.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -206,8 +206,15 @@ pub struct Service {
     pub provider: String,
     /// The API secret; empty when the provider has none (Link's tokens are its own file).
     pub key: String,
-    /// A provider's own id: a Link client id, a telephony connection id.
+    /// A provider's own id: a Link client id, a Telnyx Call Control connection.
     pub account: String,
+    /// The caller id the provider assigned, `+1…` (calls).
+    pub from: String,
+    /// The key the provider signs its webhooks and media connections with (Telnyx: the
+    /// account's ed25519 public key, base64).
+    pub public_key: String,
+    /// The API's base address; empty is the provider's own. A test's stand-in sets it.
+    pub api: String,
 }
 
 /// The services a vault may hold, one of each.
@@ -220,7 +227,8 @@ impl std::fmt::Debug for Service {
             .field("provider", &self.provider)
             .field("key", &self.key.len())
             .field("account", &self.account)
-            .finish()
+            .field("from", &self.from)
+            .finish_non_exhaustive()
     }
 }
 
@@ -233,11 +241,15 @@ impl Service {
         if self.provider.is_empty() || !login_name(&self.provider) {
             bail!("service {}: the provider is a lowercase name", self.name);
         }
-        if !plain(&self.key) || !plain(&self.account) {
-            bail!(
-                "service {}: the key and the account take no spaces",
-                self.name
-            );
+        let values = [
+            &self.key,
+            &self.account,
+            &self.from,
+            &self.public_key,
+            &self.api,
+        ];
+        if !values.iter().all(|v| plain(v)) {
+            bail!("service {}: its values take no spaces", self.name);
         }
         Ok(())
     }
@@ -385,6 +397,9 @@ impl Vault {
                 provider: s(t, "provider"),
                 key: s(t, "key"),
                 account: s(t, "account"),
+                from: s(t, "from"),
+                public_key: s(t, "public_key"),
+                api: s(t, "api"),
             })
             .collect()
     }
@@ -403,6 +418,14 @@ impl Vault {
             }
         }
         new.check()?;
+        // A call is placed and verified with each of these (DESIGN §4.26).
+        let telnyx = [&new.key, &new.account, &new.from, &new.public_key];
+        if new.name == "calls" && (new.provider != "telnyx" || telnyx.iter().any(|v| v.is_empty()))
+        {
+            bail!(
+                "the calls service is telnyx, with its API key, --account, --from and --public-key"
+            );
+        }
         let list = self
             .doc
             .entry("service")
@@ -415,6 +438,15 @@ impl Vault {
         set(&mut t, "provider", &new.provider);
         set(&mut t, "key", &new.key);
         set(&mut t, "account", &new.account);
+        for (key, value) in [
+            ("from", &new.from),
+            ("public_key", &new.public_key),
+            ("api", &new.api),
+        ] {
+            if !value.is_empty() {
+                set(&mut t, key, value);
+            }
+        }
         list.push(t);
         Ok(old.is_none())
     }
@@ -1731,6 +1763,77 @@ name = "GH_TOKEN"
 value = "ghp_secret123"
 programs = ["gh"]
 "#;
+
+    #[test]
+    fn a_calls_service_keeps_telnyx_ids_and_is_never_a_token() {
+        const KEY: &str = "KEY0123456789telnyx";
+        let mut v = Vault::parse(SAMPLE).unwrap();
+        assert_eq!(v.service("calls"), None);
+        let service = Service {
+            name: "calls".into(),
+            provider: "telnyx".into(),
+            key: KEY.into(),
+            account: "1494".into(),
+            from: "+14165550100".into(),
+            public_key: "cHVi".into(),
+            api: String::new(),
+        };
+        v.put_service(service.clone()).unwrap();
+        // A call needs each of Telnyx's ids.
+        for bad in [
+            Service {
+                provider: "link".into(),
+                ..service.clone()
+            },
+            Service {
+                public_key: String::new(),
+                ..service.clone()
+            },
+            Service {
+                name: "other".into(),
+                ..service.clone()
+            },
+        ] {
+            assert!(v.clone_for_test().put_service(bad).is_err());
+        }
+        let v = Vault::parse(&v.to_string()).unwrap();
+        assert_eq!(v.service("calls"), Some(service.clone()));
+        // Not an entry: nothing grants it or hands it to a command, and its line has no key.
+        assert_eq!(v.entries().len(), 2);
+        assert_eq!(v.get("calls"), None);
+        assert!(v.list().contains("service calls: telnyx; a key is saved"));
+        assert!(!v.list().contains(KEY));
+        let mut granted = v.clone_for_test();
+        assert!(granted.grant(Kind::Token, "calls", &["curl"]).is_err());
+        assert!(granted.bind("calls", &["api.telnyx.com"]).is_err());
+        // Its key is scrubbed wherever a vault value is, and never printed.
+        assert_eq!(
+            scrub(&format!("401 for {KEY}"), &v.secrets()),
+            "401 for [vault:calls]"
+        );
+        assert!(!format!("{service:?}").contains(KEY));
+        // An empty key keeps the one saved; the comments of the file stay.
+        let mut again = v.clone_for_test();
+        let other = Service {
+            key: String::new(),
+            from: "+16045550100".into(),
+            ..service
+        };
+        again.put_service(other).unwrap();
+        let saved = again.service("calls").unwrap();
+        assert_eq!(
+            (saved.key.as_str(), saved.from.as_str()),
+            (KEY, "+16045550100")
+        );
+        assert!(again.to_string().contains("# my logins"));
+        assert_eq!(again.to_string().matches("[[service]]").count(), 1);
+    }
+
+    impl Vault {
+        fn clone_for_test(&self) -> Vault {
+            Vault::parse(&self.to_string()).unwrap()
+        }
+    }
 
     #[test]
     fn parses_checks_and_lists_without_values() {
