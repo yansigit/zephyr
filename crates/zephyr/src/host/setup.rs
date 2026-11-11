@@ -900,6 +900,8 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
     // A ready-made entry from the image's catalog (DESIGN §4.22).
     let catalog = a.value("--catalog")?;
     let rest = a.rest()?;
+    // Whether this writes a connector's table by hand (not `add NAME --secret K` alone).
+    let by_hand = url.is_some() || !command.is_empty();
     // The catalog entry's secrets secrets.env lacks, asked for (or named) once it is saved.
     let mut wanted: Vec<crate::catalog::Secret> = Vec::new();
     let mut doc = h.data.load()?;
@@ -1065,6 +1067,22 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
         h.data.set_secret(&s.name, value.trim())?;
     }
     h.data.save(&doc)?;
+    // Which connectors came from the catalog, for doctor's note (DESIGN §4.22): the daemon's
+    // file, never zephyr.toml.
+    let from_catalog = match (&catalog, &rest[..]) {
+        (Some(name), _) => Some((name.as_str(), true)),
+        (None, [verb, name]) if verb == "rm" || (verb == "add" && by_hand) => {
+            Some((name.as_str(), false))
+        }
+        _ => None,
+    };
+    if let Some((name, on)) = from_catalog {
+        let text = h.data.read(crate::catalog::ADDED).unwrap_or_default();
+        let new = crate::catalog::with_added(&text, name, on);
+        if new != text && (on || !text.is_empty()) {
+            h.data.write(crate::catalog::ADDED, &new)?;
+        }
+    }
     match &catalog {
         Some(name) => println!("saved the catalog connector {name}"),
         None => println!("saved {}", rest.join(" ")),

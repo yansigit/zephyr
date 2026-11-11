@@ -638,6 +638,7 @@ fn catalog_add(cfg: &Config, name: &str, rest: &[&str]) -> anyhow::Result<(Strin
     }
     let m = crate::catalog::merged(entry.to_mcp(url)?, old, &[], plain);
     write_config(cfg, |doc| crate::host::conf::upsert_mcp(doc, &m))?;
+    crate::catalog::mark(cfg.state_dir(), name, true);
     let mut reply = format!("[zephyr] connector {name} added to zephyr.toml");
     if let Some(note) = crate::catalog::lost_plain(old, &m) {
         reply += &format!("; {note}");
@@ -767,6 +768,7 @@ fn ok(cfg: &Config, kind: Kind, name: &str, strong: bool) -> anyhow::Result<(Str
                 );
             }
             write_config(cfg, |doc| crate::host::conf::upsert_mcp(doc, &m))?;
+            crate::catalog::mark(cfg.state_dir(), name, false);
             let missing = missing(cfg, &m);
             let mut reply = format!("[zephyr] connector {name} added to zephyr.toml");
             if crate::broker::on(cfg) && crate::broker::undecided(&m) {
@@ -814,6 +816,7 @@ fn rm(cfg: &Config, kind: Kind, name: &str) -> anyhow::Result<(String, After)> {
                 crate::host::conf::remove_mcp(doc, name);
                 Ok(())
             })?;
+            crate::catalog::mark(cfg.state_dir(), name, false);
             Ok((format!("[zephyr] removed connector {name}"), After::Reload))
         }
     }
@@ -2401,6 +2404,8 @@ mod tests {
             "Ready-made connectors are described in `/opt/zephyr/connectors/`; to suggest one, \
              ask the owner to run `/mcp catalog add NAME`."
         ));
+        let added = std::fs::read_to_string(cfg.state_dir().join(crate::catalog::ADDED)).unwrap();
+        assert_eq!(added, "[\"github\"]", "recorded for doctor's note");
         let catalog = say(&cfg, "/mcp catalog").0;
         let line = |name: &str| {
             catalog

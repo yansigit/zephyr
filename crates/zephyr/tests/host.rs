@@ -1065,12 +1065,20 @@ fn mcp_add_from_the_catalog_writes_the_entry_and_keeps_the_owners_choices() {
     assert!(config.contains("merge_pull_request = \"none\""), "{config}");
     assert!(config.contains("issue_write = \"posts\""), "{config}");
     assert_eq!(config.matches("[[mcp]]").count(), 1, "{config}");
+    // Recorded as the catalog's, for doctor's note, in the daemon's own file (review of #53, 11).
+    let added =
+        || std::fs::read_to_string(env.daemon().join("catalog-added.json")).unwrap_or_default();
+    assert_eq!(added(), "[\"github\"]");
+    assert!(!config.contains("catalog"), "{config}");
     assert!(!out.contains("GITHUB_TOKEN"), "{out}");
     // An entry the image does not have, and a name that is no file name, are refused.
     for name in ["nope", "../etc/passwd"] {
         let out = env.zephyr(&["mcp", "add", "--catalog", name]);
         assert!(!out.status.success(), "{name}");
     }
+    // Written again by hand, it is the owner's own.
+    env.ok(&["mcp", "add", "github", "--", "my-github-server"]);
+    assert_eq!(added(), "[]");
 }
 
 /// DESIGN §4.22: an entry that can only hold its real key says why, and is written only once

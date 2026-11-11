@@ -193,11 +193,47 @@ pub fn list(dir: &Path) -> Vec<Entry> {
     names.iter().filter_map(read).collect()
 }
 
-/// `doctor`'s notes: each connector of a catalog entry's name that no longer runs what the
-/// entry ships.
+/// `<state>/catalog-added.json`: the connectors last written from the catalog, a JSON list of
+/// names. The daemon's, never zephyr.toml (an older zephyr refuses a key it does not know).
+pub const ADDED: &str = "catalog-added.json";
+
+/// The names in a [`ADDED`] file's text; none when it is absent or unreadable.
+pub fn added(text: &str) -> std::collections::BTreeSet<String> {
+    serde_json::from_str(text).unwrap_or_default()
+}
+
+/// [`ADDED`]'s text with `name` in it (`on`, a catalog add) or not (any other add, a removal).
+pub fn with_added(text: &str, name: &str, on: bool) -> String {
+    let mut names = added(text);
+    match on {
+        true => names.insert(name.to_string()),
+        false => names.remove(name),
+    };
+    serde_json::to_string(&names).unwrap_or_default()
+}
+
+/// Updates `<state>/catalog-added.json` for `name`, as the daemon; a failure is logged, since
+/// the record only steers doctor's note.
+pub fn mark(state: &Path, name: &str, on: bool) {
+    let path = state.join(ADDED);
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let new = with_added(&text, name, on);
+    if (on || !text.is_empty()) && new != text {
+        if let Err(e) = crate::host::conf::replace_private(&path, &new) {
+            eprintln!("zephyr: recording the catalog's connectors failed: {e:#}");
+        }
+    }
+}
+
+/// `doctor`'s notes: each connector added from the catalog whose entry no longer ships what it
+/// runs.
 pub fn newer(cfg: &crate::config::Config) -> Vec<String> {
     let entries = list(&cfg.catalog_dir);
-    let stale = |m: &&Mcp| entries.iter().any(|e| e.name == m.name && !e.same_as(m));
+    let text = std::fs::read_to_string(cfg.state_dir().join(ADDED)).unwrap_or_default();
+    let from = added(&text);
+    let stale = |m: &&Mcp| {
+        from.contains(&m.name) && entries.iter().any(|e| e.name == m.name && !e.same_as(m))
+    };
     (cfg.mcp.iter().filter(stale))
         .map(|m| {
             format!(
@@ -350,6 +386,18 @@ mod tests {
         assert!(!github.same_as(&m));
         let mut cfg = config_with(m);
         cfg.catalog_dir = shipped();
+        cfg.state = Some(crate::test_dir("catalog-newer"));
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        // Review of #53, 11: only a connector added from the catalog is told of a newer entry;
+        // the owner's own `github`, by hand, is theirs.
+        assert!(newer(&cfg).is_empty());
+        let added = with_added("", "github", true);
+        assert_eq!(with_added(&added, "github", true), added, "once");
+        std::fs::write(cfg.state_dir().join(ADDED), &added).unwrap();
+        assert_eq!(
+            with_added(&with_added(&added, "notion", true), "github", false),
+            with_added("", "notion", true)
+        );
         assert_eq!(
             newer(&cfg),
             ["a newer catalog entry for github ships: zephyr mcp add --catalog github"]
