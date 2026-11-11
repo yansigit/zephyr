@@ -4,7 +4,7 @@ use crate::channel::Inbound;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 /// Queued and running tasks allowed at once (DESIGN §4.12); a start past this is refused.
 pub const MAX_OPEN_TASKS: i64 = 64;
@@ -993,6 +993,24 @@ impl Store {
                  ALTER TABLE inbox ADD COLUMN owner INTEGER NOT NULL DEFAULT 0;
                  INSERT INTO session_origin(session, tainted, at) SELECT 'main', NULL, unixepoch() WHERE NOT EXISTS (SELECT 1 FROM inbox);
                  PRAGMA user_version = 17;",
+            )?;
+        }
+        if version < 18 {
+            // The web app (DESIGN §4.3.3); v17 is the goals lane's. Foreign keys are not
+            // enforced here, so `remove_passkey` deletes a passkey's sessions and pushes itself.
+            db.execute_batch(
+                "CREATE TABLE web_passkeys(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+                    cred_id BLOB NOT NULL UNIQUE, public_key BLOB NOT NULL,  -- the 65-byte P-256 point
+                    sign_count INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch()), last_used_at INTEGER);
+                 CREATE TABLE web_sessions(token_hash BLOB PRIMARY KEY,
+                    passkey INTEGER NOT NULL REFERENCES web_passkeys(id) ON DELETE CASCADE,
+                    created_at INTEGER NOT NULL, seen_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+                 CREATE TABLE web_push(id INTEGER PRIMARY KEY, endpoint TEXT NOT NULL UNIQUE,
+                    p256dh BLOB NOT NULL, auth BLOB NOT NULL,
+                    passkey INTEGER NOT NULL REFERENCES web_passkeys(id) ON DELETE CASCADE,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch()));
+                 PRAGMA user_version = 18;",
             )?;
         }
         db.commit()?;
@@ -2940,6 +2958,345 @@ impl Store {
     }
 }
 
+/// A web session lasts this long from sign-in (DESIGN §4.3.3), and ends once unused for
+/// `SESSION_IDLE`.
+pub const SESSION_LIFE: i64 = 30 * 86_400;
+pub const SESSION_IDLE: i64 = 7 * 86_400;
+pub const MAX_SESSIONS: i64 = 20;
+pub const MAX_PASSKEYS: usize = 10;
+pub const MAX_PUSH: i64 = 10;
+
+/// An enrolled passkey: its credential id and P-256 point.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Passkey {
+    pub id: i64,
+    pub name: String,
+    pub cred_id: Vec<u8>,
+    pub public_key: Vec<u8>,
+    pub sign_count: u32,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+}
+
+/// A signed-in browser, by the SHA-256 of its cookie.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WebSession {
+    pub token_hash: [u8; 32],
+    pub passkey: i64,
+    pub created_at: i64,
+    pub seen_at: i64,
+    pub expires_at: i64,
+}
+
+/// A device's Web Push subscription.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WebPush {
+    pub id: i64,
+    pub endpoint: String,
+    pub p256dh: Vec<u8>,
+    pub auth: Vec<u8>,
+    pub passkey: i64,
+    pub created_at: i64,
+}
+
+/// Prints as `N bytes`: a credential id, a cookie's hash and a push endpoint stay out of any log.
+struct Len(usize);
+
+impl std::fmt::Debug for Len {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} bytes", self.0)
+    }
+}
+
+impl std::fmt::Debug for Passkey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Passkey")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("cred_id", &Len(self.cred_id.len()))
+            .field("public_key", &Len(self.public_key.len()))
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for WebSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSession")
+            .field("token_hash", &Len(self.token_hash.len()))
+            .field("passkey", &self.passkey)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for WebPush {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebPush")
+            .field("id", &self.id)
+            .field("endpoint", &Len(self.endpoint.len()))
+            .field("p256dh", &Len(self.p256dh.len()))
+            .field("auth", &Len(self.auth.len()))
+            .field("passkey", &self.passkey)
+            .finish_non_exhaustive()
+    }
+}
+
+fn passkey_row(r: &rusqlite::Row) -> rusqlite::Result<Passkey> {
+    Ok(Passkey {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        cred_id: r.get(2)?,
+        public_key: r.get(3)?,
+        sign_count: r.get(4)?,
+        created_at: r.get(5)?,
+        last_used_at: r.get(6)?,
+    })
+}
+
+fn session_row(r: &rusqlite::Row) -> rusqlite::Result<WebSession> {
+    Ok(WebSession {
+        token_hash: r.get(0)?,
+        passkey: r.get(1)?,
+        created_at: r.get(2)?,
+        seen_at: r.get(3)?,
+        expires_at: r.get(4)?,
+    })
+}
+
+const PASSKEY_COLS: &str = "id, name, cred_id, public_key, sign_count, created_at, last_used_at";
+const SESSION_COLS: &str = "token_hash, passkey, created_at, seen_at, expires_at";
+
+/// The web app's rows (DESIGN §4.3.3).
+impl Store {
+    pub fn meta(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        self.db
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+            .optional()
+    }
+
+    /// `None` deletes the key.
+    pub fn set_meta(&self, key: &str, value: Option<&str>) -> rusqlite::Result<()> {
+        match value {
+            Some(v) => self.db.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)",
+                params![key, v],
+            ),
+            None => self.db.execute("DELETE FROM meta WHERE key = ?1", [key]),
+        }
+        .map(drop)
+    }
+
+    /// Deletes `key` if it still holds `value`: of two takers, one gets `true`.
+    pub fn take_meta(&self, key: &str, value: &str) -> rusqlite::Result<bool> {
+        let n = (self.db).execute(
+            "DELETE FROM meta WHERE key = ?1 AND value = ?2",
+            params![key, value],
+        )?;
+        Ok(n == 1)
+    }
+
+    pub fn add_passkey(&self, name: &str, cred_id: &[u8], point: &[u8]) -> rusqlite::Result<i64> {
+        self.db.execute(
+            "INSERT INTO web_passkeys(name, cred_id, public_key) VALUES (?1, ?2, ?3)",
+            params![name, cred_id, point],
+        )?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    /// Oldest first.
+    pub fn passkeys(&self) -> rusqlite::Result<Vec<Passkey>> {
+        let sql = format!("SELECT {PASSKEY_COLS} FROM web_passkeys ORDER BY id");
+        let mut stmt = self.db.prepare(&sql)?;
+        let rows = stmt.query_map([], passkey_row)?;
+        rows.collect()
+    }
+
+    pub fn passkey(&self, id: i64) -> rusqlite::Result<Option<Passkey>> {
+        let sql = format!("SELECT {PASSKEY_COLS} FROM web_passkeys WHERE id = ?1");
+        self.db.query_row(&sql, [id], passkey_row).optional()
+    }
+
+    pub fn passkey_by_cred(&self, cred_id: &[u8]) -> rusqlite::Result<Option<Passkey>> {
+        let sql = format!("SELECT {PASSKEY_COLS} FROM web_passkeys WHERE cred_id = ?1");
+        self.db.query_row(&sql, [cred_id], passkey_row).optional()
+    }
+
+    pub fn passkey_used(&self, id: i64, sign_count: u32, now: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE web_passkeys SET sign_count = ?2, last_used_at = ?3 WHERE id = ?1",
+            params![id, sign_count, now],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a passkey with its pushes and sessions, in one transaction. The number of
+    /// sessions ended; `None` when no passkey has that name.
+    pub fn remove_passkey(&self, name: &str) -> rusqlite::Result<Option<usize>> {
+        // Immediate: a deferred one that reads first fails at once ("database is locked"),
+        // without the busy timeout, when another connection writes before its first write.
+        let behavior = rusqlite::TransactionBehavior::Immediate;
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, behavior)?;
+        let id: Option<i64> = tx
+            .query_row("SELECT id FROM web_passkeys WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        tx.execute("DELETE FROM web_push WHERE passkey = ?1", [id])?;
+        let sessions = tx.execute("DELETE FROM web_sessions WHERE passkey = ?1", [id])?;
+        tx.execute("DELETE FROM web_passkeys WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(Some(sessions))
+    }
+
+    /// Starts a session and drops all but the newest `MAX_SESSIONS`.
+    pub fn add_web_session(
+        &self,
+        token_hash: &[u8; 32],
+        passkey: i64,
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO web_sessions(token_hash, passkey, created_at, seen_at, expires_at)
+             VALUES (?1, ?2, ?3, ?3, ?4)",
+            params![token_hash, passkey, now, now + SESSION_LIFE],
+        )?;
+        self.db.execute(
+            "DELETE FROM web_sessions WHERE rowid NOT IN
+             (SELECT rowid FROM web_sessions ORDER BY created_at DESC, rowid DESC LIMIT ?1)",
+            [MAX_SESSIONS],
+        )?;
+        Ok(())
+    }
+
+    /// The live session for a cookie's hash: `None` past its 30 days or 7 days unused. Marks it
+    /// seen, at most once a minute.
+    pub fn web_session(
+        &self,
+        token_hash: &[u8; 32],
+        now: i64,
+    ) -> rusqlite::Result<Option<WebSession>> {
+        let sql = format!(
+            "SELECT {SESSION_COLS} FROM web_sessions
+             WHERE token_hash = ?1 AND expires_at >= ?2 AND ?2 - seen_at <= ?3"
+        );
+        let found = (self.db)
+            .query_row(&sql, params![token_hash, now, SESSION_IDLE], session_row)
+            .optional()?;
+        let Some(mut s) = found else {
+            return Ok(None);
+        };
+        if now - s.seen_at >= 60 {
+            self.db.execute(
+                "UPDATE web_sessions SET seen_at = ?2 WHERE token_hash = ?1",
+                params![token_hash, now],
+            )?;
+            s.seen_at = now;
+        }
+        Ok(Some(s))
+    }
+
+    pub fn web_sessions(&self) -> rusqlite::Result<Vec<WebSession>> {
+        let sql = format!("SELECT {SESSION_COLS} FROM web_sessions ORDER BY created_at, rowid");
+        let mut stmt = self.db.prepare(&sql)?;
+        let rows = stmt.query_map([], session_row)?;
+        rows.collect()
+    }
+
+    pub fn end_web_session(&self, token_hash: &[u8; 32]) -> rusqlite::Result<()> {
+        (self.db).execute(
+            "DELETE FROM web_sessions WHERE token_hash = ?1",
+            [token_hash],
+        )?;
+        Ok(())
+    }
+
+    pub fn end_web_sessions(&self) -> rusqlite::Result<usize> {
+        self.db.execute("DELETE FROM web_sessions", [])
+    }
+
+    /// Deletes the sessions `web_session` would refuse.
+    pub fn expire_web_sessions(&self, now: i64) -> rusqlite::Result<usize> {
+        self.db.execute(
+            "DELETE FROM web_sessions WHERE expires_at < ?1 OR ?1 - seen_at > ?2",
+            params![now, SESSION_IDLE],
+        )
+    }
+
+    /// Saves a subscription, replacing one with the same endpoint. `false` when `MAX_PUSH`
+    /// others exist.
+    pub fn add_push(
+        &self,
+        endpoint: &str,
+        p256dh: &[u8],
+        auth: &[u8],
+        passkey: i64,
+    ) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
+            "INSERT INTO web_push(endpoint, p256dh, auth, passkey)
+             SELECT ?1, ?2, ?3, ?4
+             WHERE (SELECT count(*) FROM web_push WHERE endpoint != ?1) < ?5
+             ON CONFLICT(endpoint) DO UPDATE SET
+                p256dh = excluded.p256dh, auth = excluded.auth, passkey = excluded.passkey",
+            params![endpoint, p256dh, auth, passkey, MAX_PUSH],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn pushes(&self) -> rusqlite::Result<Vec<WebPush>> {
+        let mut stmt = self.db.prepare(
+            "SELECT id, endpoint, p256dh, auth, passkey, created_at FROM web_push ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(WebPush {
+                id: r.get(0)?,
+                endpoint: r.get(1)?,
+                p256dh: r.get(2)?,
+                auth: r.get(3)?,
+                passkey: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn drop_push(&self, endpoint: &str) -> rusqlite::Result<()> {
+        (self.db).execute("DELETE FROM web_push WHERE endpoint = ?1", [endpoint])?;
+        Ok(())
+    }
+
+    /// SHA-256 over every column `/ok` reads of a proposal, as stored: what a passkey signature
+    /// commits to. `None` when there is no such row.
+    pub fn proposal_digest(&self, id: i64) -> rusqlite::Result<Option<[u8; 32]>> {
+        let cols: Option<[Option<String>; 8]> = (self.db)
+            .query_row(
+                "SELECT kind, class, command, targets, payload, secrets, key, seen
+                 FROM proposals WHERE id = ?1",
+                [id],
+                |r| {
+                    Ok([
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ])
+                },
+            )
+            .optional()?;
+        Ok(cols.map(|c| {
+            let bytes = serde_json::to_vec(&c).unwrap_or_default();
+            let mut out = [0; 32];
+            out.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref());
+            out
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3645,6 +4002,7 @@ mod tests {
     fn older_databases_migrate_in_order_and_keep_their_rows() {
         // Each case undoes the steps after `version`, as a db made by that build would look:
         // v14's first, while the tables its indexes are on still exist.
+        const V18: &str = "DROP TABLE web_push; DROP TABLE web_sessions; DROP TABLE web_passkeys;";
         const V17: &str = "DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin; ALTER TABLE inbox DROP COLUMN owner;";
         const V16: &str = "DROP TABLE known_targets; DROP TABLE passes; ALTER TABLE proposals DROP COLUMN kind; ALTER TABLE proposals DROP COLUMN class; ALTER TABLE proposals DROP COLUMN targets; ALTER TABLE proposals DROP COLUMN summary; ALTER TABLE proposals DROP COLUMN reason; ALTER TABLE proposals DROP COLUMN payload; ALTER TABLE proposals DROP COLUMN secrets; ALTER TABLE proposals DROP COLUMN origin; ALTER TABLE proposals DROP COLUMN due_at; ALTER TABLE proposals DROP COLUMN settled_at; ALTER TABLE proposals DROP COLUMN result; ALTER TABLE procs DROP COLUMN action; ALTER TABLE proposals DROP COLUMN approved;";
         const V15: &str = "DROP TABLE settings_log; DROP TABLE setting_reverts; ALTER TABLE proposals DROP COLUMN key; ALTER TABLE proposals DROP COLUMN seen; ALTER TABLE proposals DROP COLUMN strong;";
@@ -3669,6 +4027,7 @@ mod tests {
             (14, ""),
             (15, ""),
             (16, ""),
+            (17, ""),
         ] {
             let dir = crate::test_dir(&format!("store-v{version}"));
             let path = dir.join("state.db");
@@ -3677,8 +4036,11 @@ mod tests {
             let v14 = if version < 14 { V14 } else { "" };
             let v15 = if version < 15 { V15 } else { "" };
             let v16 = if version < 16 { V16 } else { "" };
-            db.execute_batch(&format!("{V17} {v16} {v15} {v14} {undo} PRAGMA user_version = {version};"))
-                .unwrap();
+            let v17 = if version < 17 { V17 } else { "" };
+            db.execute_batch(&format!(
+                "{V18} {v17} {v16} {v15} {v14} {undo} PRAGMA user_version = {version};"
+            ))
+            .unwrap();
             drop(db);
             let store = Store::open(&path).unwrap();
             // The mark is for the approvals gate's upgrade (v16), so a v16 db has none.
@@ -3746,12 +4108,19 @@ mod tests {
             assert!(store.all_known("messages", &["a@b.c".into()]).unwrap());
             store.add_pass("d", a, 100).unwrap();
             assert!(store.use_pass("d", 50).unwrap());
-            // v17: an upgraded conversation is not clean; memory commits; built-in jobs.
-            assert_eq!(store.session_origin("main").unwrap(), SessionOrigin::Unknown);
+            // v17: an upgraded conversation is not clean (a database made at v17 has its own,
+            // clean one); memory commits; built-in jobs.
+            if version < 17 {
+                assert_eq!(store.session_origin("main").unwrap(), SessionOrigin::Unknown);
+            }
             store.record_memory_commit("a1", "task #1", false).unwrap();
             let c = store.memory_commits_since(0).unwrap();
             assert_eq!((c[0].sha.as_str(), c[0].origin.as_str(), c[0].auto), ("a1", "task #1", false));
             assert_eq!(store.jobs().unwrap()[0].builtin, None);
+            // v18: the web app's passkeys, sessions and pushes.
+            let k = store.add_passkey("phone", &[1], &[4; 65]).unwrap();
+            store.add_web_session(&[7; 32], k, 0).unwrap();
+            assert!(store.add_push("https://p/x", &[1], &[2], k).unwrap());
             let now: i64 = store
                 .db
                 .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -4808,5 +5177,200 @@ mod tests {
             .goals_done_since(crate::now() + 10)
             .unwrap()
             .is_empty());
+    }
+
+    fn web_store(name: &str) -> Store {
+        Store::open(&crate::test_dir(name).join("state.db")).unwrap()
+    }
+
+    /// With passkeys 1 and 2: a session or a push needs its passkey (foreign keys are on).
+    fn keyed(name: &str) -> Store {
+        let store = web_store(name);
+        store.add_passkey("one", &[1], &[4; 65]).unwrap();
+        store.add_passkey("two", &[2], &[4; 65]).unwrap();
+        store
+    }
+
+    #[test]
+    fn a_session_ends_30_days_after_sign_in_or_7_days_unused() {
+        let store = keyed("store-web-life");
+        let h = [1u8; 32];
+        store.add_web_session(&h, 1, 0).unwrap();
+        assert!(store.web_session(&h, 6 * 86_400).unwrap().is_some());
+        let g = [2u8; 32];
+        store.add_web_session(&g, 1, 0).unwrap();
+        assert!(store.web_session(&g, 100).unwrap().is_some());
+        assert!(
+            store
+                .web_session(&g, 100 + SESSION_IDLE + 1)
+                .unwrap()
+                .is_none(),
+            "idle"
+        );
+        let k = [3u8; 32];
+        store.add_web_session(&k, 1, 0).unwrap();
+        for day in (6..=30).step_by(6) {
+            assert!(
+                store.web_session(&k, day * 86_400).unwrap().is_some(),
+                "day {day}"
+            );
+        }
+        assert!(
+            store.web_session(&k, SESSION_LIFE + 1).unwrap().is_none(),
+            "absolute"
+        );
+        // The sweep deletes what a read would refuse, and nothing else.
+        store.add_web_session(&[4; 32], 1, SESSION_LIFE).unwrap();
+        assert_eq!(store.expire_web_sessions(SESSION_LIFE + 1).unwrap(), 3);
+        assert_eq!(store.web_sessions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn seen_at_is_written_at_most_once_a_minute() {
+        let store = keyed("store-web-seen");
+        let h = [1u8; 32];
+        store.add_web_session(&h, 1, 0).unwrap();
+        store.web_session(&h, 10).unwrap().unwrap();
+        store.web_session(&h, 59).unwrap().unwrap();
+        assert_eq!(store.web_sessions().unwrap()[0].seen_at, 0);
+        assert_eq!(store.web_session(&h, 60).unwrap().unwrap().seen_at, 60);
+        assert_eq!(store.web_sessions().unwrap()[0].seen_at, 60);
+    }
+
+    #[test]
+    fn the_21st_session_drops_the_oldest() {
+        let store = keyed("store-web-cap");
+        for i in 0..21u8 {
+            store.add_web_session(&[i; 32], 1, i as i64).unwrap();
+        }
+        let all = store.web_sessions().unwrap();
+        assert_eq!(all.len() as i64, MAX_SESSIONS);
+        assert!(
+            all.iter().all(|s| s.token_hash != [0; 32]),
+            "the oldest went"
+        );
+        assert!(store.web_session(&[20; 32], 21).unwrap().is_some());
+        store.end_web_session(&[20; 32]).unwrap();
+        assert!(store.web_session(&[20; 32], 21).unwrap().is_none());
+        assert_eq!(store.end_web_sessions().unwrap(), 19);
+    }
+
+    #[test]
+    fn removing_a_passkey_removes_its_sessions_and_pushes() {
+        let store = web_store("store-web-rm");
+        let phone = store.add_passkey("phone", &[1, 2, 3], &[4; 65]).unwrap();
+        let ipad = store.add_passkey("ipad", &[9], &[4; 65]).unwrap();
+        store.add_web_session(&[1; 32], phone, 0).unwrap();
+        store.add_web_session(&[2; 32], ipad, 0).unwrap();
+        assert!(store
+            .add_push("https://p/phone", &[1], &[2], phone)
+            .unwrap());
+        assert!(store.add_push("https://p/ipad", &[1], &[2], ipad).unwrap());
+        assert_eq!(store.remove_passkey("phone").unwrap(), Some(1));
+        assert_eq!(store.remove_passkey("nope").unwrap(), None);
+        let names: Vec<_> = store
+            .passkeys()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["ipad"]);
+        assert_eq!(store.web_sessions().unwrap()[0].passkey, ipad);
+        assert_eq!(store.pushes().unwrap()[0].endpoint, "https://p/ipad");
+        assert_eq!(store.pushes().unwrap().len(), 1);
+        // Reads and the use mark.
+        assert_eq!(store.passkey_by_cred(&[9]).unwrap().unwrap().id, ipad);
+        assert!(store.passkey_by_cred(&[1, 2, 3]).unwrap().is_none());
+        store.passkey_used(ipad, 7, 50).unwrap();
+        let p = store.passkey(ipad).unwrap().unwrap();
+        assert_eq!((p.sign_count, p.last_used_at), (7, Some(50)));
+    }
+
+    #[test]
+    fn a_push_endpoint_is_saved_once_and_the_eleventh_is_refused() {
+        let store = keyed("store-web-push");
+        for i in 0..10 {
+            assert!(store
+                .add_push(&format!("https://p/{i}"), &[1], &[2], 1)
+                .unwrap());
+        }
+        assert!(
+            store.add_push("https://p/3", &[5], &[6], 2).unwrap(),
+            "the same endpoint again"
+        );
+        let all = store.pushes().unwrap();
+        assert_eq!(all.len() as i64, MAX_PUSH);
+        let third = all.iter().find(|p| p.endpoint == "https://p/3").unwrap();
+        assert_eq!((third.p256dh.as_slice(), third.passkey), (&[5u8][..], 2));
+        assert!(!store.add_push("https://p/new", &[1], &[2], 1).unwrap());
+        store.drop_push("https://p/0").unwrap();
+        assert!(store.add_push("https://p/new", &[1], &[2], 1).unwrap());
+    }
+
+    #[test]
+    fn proposal_digest_changes_with_every_column_ok_reads() {
+        let store = web_store("store-web-digest");
+        let id = store.hold_action(&new_action("run", None)).unwrap();
+        assert_eq!(store.proposal_digest(id + 1).unwrap(), None);
+        let mut last = store.proposal_digest(id).unwrap().unwrap();
+        for col in [
+            "kind", "class", "command", "targets", "payload", "secrets", "key", "seen",
+        ] {
+            let sql = format!("UPDATE proposals SET {col} = 'changed' WHERE id = ?1");
+            store.db.execute(&sql, params![id]).unwrap();
+            let now = store.proposal_digest(id).unwrap().unwrap();
+            assert_ne!(now, last, "{col}");
+            last = now;
+        }
+        for col in ["summary", "reason"] {
+            let sql = format!("UPDATE proposals SET {col} = 'changed' WHERE id = ?1");
+            store.db.execute(&sql, params![id]).unwrap();
+            assert_eq!(store.proposal_digest(id).unwrap().unwrap(), last, "{col}");
+        }
+    }
+
+    #[test]
+    fn meta_values_are_set_read_and_deleted() {
+        let store = web_store("store-web-meta");
+        assert_eq!(store.meta("web_user").unwrap(), None);
+        store.set_meta("web_user", Some("ab")).unwrap();
+        store.set_meta("web_user", Some("cd")).unwrap();
+        assert_eq!(store.meta("web_user").unwrap().as_deref(), Some("cd"));
+        store.set_meta("web_user", None).unwrap();
+        assert_eq!(store.meta("web_user").unwrap(), None);
+        // Taken once, and only as it was read.
+        store.set_meta("web_enrol", Some("one")).unwrap();
+        assert!(!store.take_meta("web_enrol", "two").unwrap());
+        assert!(store.take_meta("web_enrol", "one").unwrap());
+        assert!(!store.take_meta("web_enrol", "one").unwrap());
+    }
+
+    #[test]
+    fn debug_of_web_rows_prints_lengths_only() {
+        let store = web_store("store-web-debug");
+        let id = store
+            .add_passkey("phone", &[201, 202, 203], &[77; 65])
+            .unwrap();
+        store.add_web_session(&[99; 32], id, 0).unwrap();
+        store
+            .add_push("https://p/secret-path", &[88; 65], &[66; 16], id)
+            .unwrap();
+        let p = format!("{:?}", store.passkeys().unwrap()[0]);
+        assert!(
+            p.contains("cred_id: 3 bytes") && p.contains("public_key: 65 bytes"),
+            "{p}"
+        );
+        assert!(!p.contains("201") && !p.contains("77"), "{p}");
+        let s = format!("{:?}", store.web_sessions().unwrap()[0]);
+        assert!(
+            s.contains("token_hash: 32 bytes") && !s.contains("99"),
+            "{s}"
+        );
+        let w = format!("{:?}", store.pushes().unwrap()[0]);
+        assert!(
+            w.contains("endpoint: 21 bytes") && !w.contains("secret-path"),
+            "{w}"
+        );
+        assert!(!w.contains("88") && !w.contains("66"), "{w}");
     }
 }

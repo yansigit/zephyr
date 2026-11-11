@@ -2037,8 +2037,8 @@ mod tests {
                 .replace("<text>", "x");
             let answered = match *group {
                 "Memory" => {
-                    crate::memory::command(&dir, &dir, &text).is_some()
-                        || crate::drafts::command(&cfg, &text).is_some()
+                    crate::memory::command(&dir, &dir, &text, true).is_some()
+                        || crate::drafts::command(&cfg, &text, true).is_some()
                         // A rule is a setting: the router's `set_setting` calls `memory::rule`.
                         || (text.strip_prefix("/rule "))
                             .is_some_and(|arg| crate::memory::rule(&dir, arg).is_ok())
@@ -2050,7 +2050,7 @@ mod tests {
                         sender: "me".into(),
                         text: text.clone(),
                     };
-                    crate::scheduler::command(&mut store, &cfg, &m)
+                    crate::scheduler::command(&mut store, &cfg, &m, true)
                         .is_some_and(|r| !r.contains("usage:"))
                 }
                 _ => continue,

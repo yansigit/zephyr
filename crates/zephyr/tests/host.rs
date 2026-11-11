@@ -60,6 +60,9 @@ case "$1" in
       *" zephyr status "*) echo "daemon: ${SHIM_DAEMON:-running}"; [ -n "$SHIM_STATUS" ] && printf '%b\n' "$SHIM_STATUS"; exit "${SHIM_STATUS_EXIT:-0}" ;;
       *" zephyr --version "*) [ -n "$SHIM_VERSION" ] || exit 2; echo "zephyr $SHIM_VERSION" ;;
       *" zephyr tui "*) exit "${SHIM_TUI_EXIT:-0}" ;;
+      # `zephyr web enrol [NAME]` and `zephyr web`: the daemon's replies over the chat socket.
+      *" zephyr web enrol"*) echo "[zephyr] open https://box.tail1234.ts.net/#enrol=ABCDE-FGHJK on the phone within 10 min, or type the code there; it works once" ;;
+      *" zephyr web "*) echo "[zephyr] web app https://box.tail1234.ts.net · passkeys: ${SHIM_PASSKEYS:-none} · 0 sessions · push on 0 devices" ;;
       # `zephyr set KEY VALUE`: the daemon's reply, a refusal when SHIM_SET_REFUSE is set.
       *" zephyr set "*) [ -n "$SHIM_SET_DOWN" ] && { echo "zephyr: the daemon is not running" >&2; exit 3; }; [ -n "$SHIM_SET_REFUSE" ] && { echo "[zephyr] $SHIM_SET_REFUSE"; exit 1; }; echo "[zephyr] ${@: -2:1} 1 → ${@: -1}" ;;
     esac ;;
@@ -84,6 +87,19 @@ const SYSTEMCTL: &str = r#"#!/bin/bash
 const LOGINCTL: &str = r#"#!/bin/bash
 (IFS=$'\x1f'; echo "loginctl$IFS$*") >> "$SHIM_DIR/calls.log"
 echo "Linger=${SHIM_LINGER:-no}"
+"#;
+
+/// `tailscale`: logged like `docker`. `status --json` prints `$SHIM_TS_STATUS` (unset: tailscale
+/// is not logged in), `serve status` prints `$SHIM_TS_SERVE`, and `serve --bg` is refused for
+/// want of operator rights when `$SHIM_TS_DENIED` is set.
+const TAILSCALE: &str = r#"#!/bin/bash
+(IFS=$'\x1f'; echo "tailscale$IFS$*") >> "$SHIM_DIR/calls.log"
+case "$1 $2" in
+  "status --json") [ -n "$SHIM_TS_STATUS" ] || exit 1; echo "$SHIM_TS_STATUS" ;;
+  "serve status") echo "$SHIM_TS_SERVE" ;;
+  "serve --bg") [ -n "$SHIM_TS_DENIED" ] && { echo "Access denied: serve config denied" >&2; exit 1; } ;;
+esac
+exit 0
 "#;
 
 const CURL: &str = r#"#!/bin/bash
@@ -116,6 +132,7 @@ impl Env {
             ("systemctl", SYSTEMCTL),
             ("loginctl", LOGINCTL),
             ("curl", CURL),
+            ("tailscale", TAILSCALE),
         ] {
             std::fs::write(bin.join(name), body).unwrap();
             std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
@@ -2743,4 +2760,260 @@ fn every_copy_in_the_dockerfile_is_in_the_build_context() {
         }
     }
     assert!(checked >= 4, "{checked}");
+}
+
+const TS_STATUS: &str = r#"{"BackendState":"Running","Self":{"DNSName":"box.tail1234.ts.net."},"CertDomains":["box.tail1234.ts.net"]}"#;
+
+#[test]
+fn web_setup_writes_the_host_serves_the_port_and_enrols() {
+    let env = Env::new("web-setup");
+    env.init(&["--no-start"]);
+    env.calls();
+    let out = env.zephyr_env(&["web", "setup", "--yes"], &[("SHIM_TS_STATUS", TS_STATUS)]);
+    assert!(out.status.success(), "{out:?}");
+    let doc: toml::Table = toml::from_str(&env.config()).unwrap();
+    assert_eq!(doc["web"]["host"].as_str(), Some("box.tail1234.ts.net"));
+    assert_eq!(doc["web"]["port"].as_integer(), Some(7793));
+    let calls = env.calls();
+    find(&calls, &["tailscale", "status", "--json"]);
+    find(
+        &calls,
+        &["tailscale", "serve", "--bg", "http://127.0.0.1:7793"],
+    );
+    find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
+    find(
+        &calls,
+        &["docker", "exec", CONTAINER, "zephyr", "web", "enrol"],
+    );
+    let order = |prefix: &[&str]| {
+        calls
+            .iter()
+            .position(|c| c.starts_with(&prefix.iter().map(|s| s.to_string()).collect::<Vec<_>>()))
+            .unwrap()
+    };
+    assert!(
+        order(&["tailscale", "serve"]) < order(&["docker", "run", "-d"]),
+        "serve, then up"
+    );
+    assert!(
+        order(&["docker", "run", "-d"])
+            < order(&["docker", "exec", CONTAINER, "zephyr", "web", "enrol"])
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("#enrol=ABCDE-FGHJK"),
+        "the code is shown: {text}"
+    );
+    assert!(text.contains("never point tailscale funnel at this port: the web app refuses funnel traffic, and a funnel would put it on the internet"), "{text}");
+    // The default strong channels already hold passkey, and no passkey is enrolled yet.
+    assert!(
+        !calls.iter().any(|c| c.contains(&"set".to_string())),
+        "{calls:#?}"
+    );
+    // Asked again, it changes nothing it has no need to, and asks before each change: with
+    // neither a terminal nor --yes it stops before the first.
+    let before = env.config();
+    let out = env.zephyr_env(&["web", "setup"], &[("SHIM_TS_STATUS", TS_STATUS)]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--yes"),
+        "{out:?}"
+    );
+    assert_eq!(env.config(), before);
+    // `zephyr web enrol NAME` asks the daemon in the container.
+    env.calls();
+    let out = env.zephyr(&["web", "enrol", "ipad"]);
+    assert!(
+        out.status.success() && stdout(&out).contains("#enrol="),
+        "{out:?}"
+    );
+    find(
+        &env.calls(),
+        &[
+            "docker", "exec", CONTAINER, "zephyr", "web", "enrol", "ipad",
+        ],
+    );
+    assert_eq!(env.zephyr(&["web", "nope"]).status.code(), Some(1));
+}
+
+#[test]
+fn web_setup_adds_passkey_to_an_explicit_list_and_offers_money_once_enrolled() {
+    let env = Env::new("web-setup-strong");
+    env.init(&["--no-start"]);
+    let path = env.daemon().join("zephyr.toml");
+    let text = format!(
+        "{}\n[settings]\nstrong_channels = [\"tui\", \"chat\"]\n",
+        env.config()
+    );
+    std::fs::write(&path, text).unwrap();
+    env.calls();
+    let out = env.zephyr_env(
+        &["web", "setup", "--yes"],
+        &[
+            ("SHIM_TS_STATUS", TS_STATUS),
+            ("SHIM_PASSKEYS", "phone (used 1m ago)"),
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let calls = env.calls();
+    let set = ["docker", "exec", CONTAINER, "zephyr", "set"];
+    find(
+        &calls,
+        &[&set[..], &["settings.strong_channels", "tui,chat,passkey"]].concat(),
+    );
+    find(
+        &calls,
+        &[&set[..], &["approvals.strong_only", "loosen,money"]].concat(),
+    );
+}
+
+#[test]
+fn web_setup_stops_without_https_certificates() {
+    let env = Env::new("web-setup-certs");
+    env.init(&["--no-start"]);
+    let before = env.config();
+    env.calls();
+    let no_certs = TS_STATUS.replace(r#"["box.tail1234.ts.net"]"#, "[]");
+    let stopped = |status: &[(&str, &str)], said: &str| {
+        let out = env.zephyr_env(&["web", "setup", "--yes"], status);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let text = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains(said), "{text}");
+        assert_eq!(env.config(), before, "zephyr.toml is unchanged");
+        let calls = env.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.len() > 1 && c[0] == "tailscale" && c[1] == "serve"),
+            "{calls:#?}"
+        );
+    };
+    stopped(
+        &[("SHIM_TS_STATUS", &no_certs)],
+        "turn on HTTPS certificates in the Tailscale admin console (DNS → HTTPS Certificates)",
+    );
+    let logged_out = TS_STATUS.replace("Running", "NeedsLogin");
+    stopped(&[("SHIM_TS_STATUS", &logged_out)], "tailscale up");
+    stopped(&[], "tailscale up");
+    // Without operator rights `serve` is refused: the sudo forms are printed, and nothing is started.
+    let out = env.zephyr_env(
+        &["web", "setup", "--yes"],
+        &[("SHIM_TS_STATUS", TS_STATUS), ("SHIM_TS_DENIED", "1")],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let text = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+    assert!(
+        text.contains("sudo tailscale serve --bg http://127.0.0.1:7793"),
+        "{text}"
+    );
+    assert!(
+        text.contains("sudo tailscale set --operator=$USER"),
+        "{text}"
+    );
+    assert!(!env
+        .calls()
+        .iter()
+        .any(|c| c.len() > 2 && c[1] == "run" && c[2] == "-d"));
+}
+
+#[test]
+fn status_says_whether_tailscale_serve_forwards_the_port() {
+    let env = Env::new("web-status");
+    env.init(&["--no-start"]);
+    let quiet = stdout(&env.zephyr(&["status"]));
+    assert!(!quiet.contains("web:"), "no [web], no line: {quiet}");
+    let out = env.zephyr_env(&["web", "setup", "--yes"], &[("SHIM_TS_STATUS", TS_STATUS)]);
+    assert!(out.status.success(), "{out:?}");
+    let serve = "https://box.tail1234.ts.net (tailnet only)\n|-- / proxy http://127.0.0.1:7793\n";
+    let on = stdout(&env.zephyr_env(&["status"], &[("SHIM_TS_SERVE", serve)]));
+    assert!(
+        on.contains("web: tailscale serve forwards https://box.tail1234.ts.net\n"),
+        "{on}"
+    );
+    for other in ["", "|-- / proxy http://127.0.0.1:8080\n"] {
+        let off = stdout(&env.zephyr_env(&["status"], &[("SHIM_TS_SERVE", other)]));
+        let line =
+            "web: tailscale serve does not forward to 127.0.0.1:7793; run zephyr web setup\n";
+        assert!(off.contains(line), "{off}");
+    }
+}
+
+#[test]
+fn up_in_bridge_mode_publishes_the_web_port_on_loopback() {
+    let env = Env::new("web-bridge");
+    env.init(&["--no-start"]);
+    env.calls();
+    env.ok(&["up"]);
+    let calls = env.calls();
+    let run = find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
+    assert!(
+        !run.iter().any(|a| a.contains("7793")),
+        "no [web], no port: {run:?}"
+    );
+    // A port the owner chose is kept: setup serves and publishes that one.
+    let path = env.daemon().join("zephyr.toml");
+    let text = format!(
+        "{}\n[web]\nhost = \"old.ts.net\"\nport = 8000\n",
+        env.config()
+    );
+    std::fs::write(&path, text).unwrap();
+    let out = env.zephyr_env(&["web", "setup", "--yes"], &[("SHIM_TS_STATUS", TS_STATUS)]);
+    assert!(out.status.success(), "{out:?}");
+    let calls = env.calls();
+    find(
+        &calls,
+        &["tailscale", "serve", "--bg", "http://127.0.0.1:8000"],
+    );
+    let run = find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
+    assert!(
+        run.windows(2).any(|w| w == ["-p", "127.0.0.1:8000:8000"]),
+        "{run:?}"
+    );
+    assert!(
+        run.iter()
+            .any(|a| a.starts_with("ZEPHYR_PUBLISHED=") && a.contains("8000")),
+        "{run:?}"
+    );
+    let doc: toml::Table = toml::from_str(&env.config()).unwrap();
+    assert_eq!(doc["web"]["host"].as_str(), Some("box.tail1234.ts.net"));
+    assert_eq!(doc["web"]["port"].as_integer(), Some(8000));
+    // Under host networking nothing is published: the daemon is on the host's loopback itself.
+    let host = env.daemon().join("host.toml");
+    let text = std::fs::read_to_string(&host).unwrap_or_default();
+    let text = match text.contains("network = \"bridge\"") {
+        true => text.replace("network = \"bridge\"", "network = \"host\""),
+        false => format!("{text}\nnetwork = \"host\"\n"),
+    };
+    std::fs::write(&host, text).unwrap();
+    env.ok(&["up"]);
+    let calls = env.calls();
+    let run = find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
+    assert!(!run.iter().any(|a| a == "-p"), "{run:?}");
+}
+
+#[test]
+fn web_setup_needs_the_network_floor() {
+    let env = Env::new("web-host-net");
+    env.init(&["--no-start"]);
+    let host = env.daemon().join("host.toml");
+    let text = std::fs::read_to_string(&host).unwrap_or_default();
+    let text = match text.contains("network = \"bridge\"") {
+        true => text.replace("network = \"bridge\"", "network = \"host\""),
+        false => format!("{text}\nnetwork = \"host\"\n"),
+    };
+    std::fs::write(&host, text).unwrap();
+    let before = env.config();
+    env.calls();
+    let out = env.zephyr_env(&["web", "setup", "--yes"], &[("SHIM_TS_STATUS", TS_STATUS)]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("the web app needs the network floor; host.toml network = \"bridge\""),
+        "{said}"
+    );
+    assert_eq!(env.config(), before);
+    assert!(
+        !env.calls().iter().any(|c| c[0] == "tailscale"),
+        "nothing was asked of tailscale"
+    );
 }

@@ -27,6 +27,11 @@ pub fn sweep(cfg: &Config, store: &Store, age: Duration) -> rusqlite::Result<usi
         Ok(n) => eprintln!("zephyr: pruned {n} state.db rows older than 90 days"),
         Err(e) => eprintln!("zephyr: pruning state.db failed: {e}"),
     }
+    match store.expire_web_sessions(crate::now()) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("zephyr: ended {n} expired web sessions"),
+        Err(e) => eprintln!("zephyr: ending expired web sessions failed: {e}"),
+    }
     // As root, before the agent's identity below: the backups are root's.
     match backup(cfg, store) {
         Ok(false) => {}
@@ -373,6 +378,27 @@ mod tests {
             .map(|t| t.goal)
             .collect();
         assert_eq!(goals, ["new"], "an old finished task goes");
+    }
+
+    #[test]
+    fn the_sweep_ends_expired_web_sessions() {
+        let home = crate::test_dir("retention-web");
+        let cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = {home:?}\n")).unwrap();
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let key = store.add_passkey("phone", &[1], &[4; 65]).unwrap();
+        let now = crate::now();
+        store.add_web_session(&[1; 32], key, now).unwrap();
+        store
+            .add_web_session(&[2; 32], key, now - crate::store::SESSION_IDLE - 60)
+            .unwrap();
+        store
+            .add_web_session(&[3; 32], key, now - crate::store::SESSION_LIFE - 60)
+            .unwrap();
+        sweep(&cfg, &store, AGE).unwrap();
+        let left = store.web_sessions().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].token_hash, [1; 32]);
     }
 
     #[test]

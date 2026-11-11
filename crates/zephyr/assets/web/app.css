@@ -1,0 +1,114 @@
+/* The zephyr web app. Phone-first; from 900px the drawer is a side panel. */
+:root {
+  --bg: #101418;
+  --panel: #1a2027;
+  --line: #2b343d;
+  --text: #e6e9ec;
+  --muted: #8b97a3;
+  --accent: #7cc4ff;
+  --warn: #ffb86b;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; margin: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+[hidden] { display: none !important; }
+
+button, input, select, textarea {
+  font: inherit;
+  color: inherit;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.55rem 0.8rem;
+  min-height: 44px;
+}
+
+button { cursor: pointer; }
+button:disabled { opacity: 0.45; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #06121c; font-weight: 600; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+code, pre { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.9rem; }
+pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+h1, h2, h3 { margin: 0.6rem 0; font-weight: 600; }
+h2 { font-size: 1.15rem; }
+h3 { font-size: 0.85rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+
+.hint, .when, .empty, .band { color: var(--muted); font-size: 0.85rem; }
+.note { color: var(--warn); min-height: 1.2rem; margin: 0.4rem 0; white-space: pre-wrap; }
+.buttons { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.6rem 0; }
+.badge { font-size: 0.8rem; min-height: 32px; padding: 0.2rem 0.6rem; border-radius: 999px; border-color: var(--warn); color: var(--warn); }
+
+/* Sign-in */
+#signin { max-width: 26rem; margin: 0 auto; padding: 3rem 1.2rem; display: flex; flex-direction: column; gap: 0.8rem; }
+#signin label { display: flex; flex-direction: column; gap: 0.3rem; margin: 0.6rem 0; color: var(--muted); font-size: 0.85rem; }
+#enrol summary { cursor: pointer; padding: 0.6rem 0; color: var(--accent); }
+
+/* The app */
+#app { height: 100%; display: flex; flex-direction: column; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+header { display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--line); }
+#status { flex: 1; text-align: left; border: 0; background: none; padding-left: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#screens { display: flex; flex-wrap: wrap; gap: 0.4rem; padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--line); }
+
+.screen { flex: 1; min-height: 0; overflow-y: auto; padding: 0.7rem; }
+#chat { display: flex; flex-direction: column; padding: 0; }
+#transcript { flex: 1; min-height: 0; overflow-y: auto; padding: 0.7rem; }
+
+.msg { margin: 0 0 0.9rem; }
+.msg .prose { margin: 0 0 0.5rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.user { border-left: 3px solid var(--accent); padding-left: 0.6rem; }
+.msg.notice { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 0.6rem; }
+.tools { color: var(--muted); font-size: 0.85rem; margin: 0 0 0.9rem; }
+.code { position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 0.6rem; margin: 0 0 0.5rem; }
+.code .copy { position: absolute; top: 0.3rem; right: 0.3rem; min-height: 28px; padding: 0.1rem 0.5rem; font-size: 0.75rem; }
+
+#queue { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.7rem; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.85rem; }
+#queue-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#composer { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; padding: 0.6rem 0.7rem; border-top: 1px solid var(--line); }
+#draft { flex: 1 1 100%; resize: vertical; max-height: 40vh; }
+.follow { flex: 1; color: var(--muted); font-size: 0.85rem; }
+.follow input { min-height: 0; }
+
+/* Lists */
+.rows { list-style: none; margin: 0; padding: 0; }
+.rows li { border-bottom: 1px solid var(--line); }
+.row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem 0.8rem; width: 100%; padding: 0.7rem 0.2rem; text-align: left; overflow-wrap: anywhere; }
+button.row { border: 0; border-radius: 0; background: none; }
+.row .what { flex: 1 1 60%; }
+.empty { padding: 0.9rem 0.2rem; }
+.row.tool { color: var(--muted); font-size: 0.85rem; }
+.row.done .what { color: var(--muted); text-decoration: line-through; }
+.setting { border-bottom: 1px solid var(--line); padding: 0.2rem 0; }
+.setting summary { display: flex; flex-wrap: wrap; gap: 0.3rem 0.8rem; padding: 0.6rem 0.2rem; cursor: pointer; }
+.setting summary .what { flex: 1 1 50%; }
+
+/* The drawer */
+#drawer { position: fixed; inset: 0; background: var(--bg); display: flex; flex-direction: column; padding: 0.7rem; overflow-y: auto; z-index: 2; }
+.tabs { display: flex; gap: 0.4rem; margin-bottom: 0.5rem; }
+.tabs [aria-selected="true"] { border-color: var(--accent); color: var(--accent); }
+#drawer-close { margin-left: auto; }
+
+/* The card sheet */
+dialog { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 12px; width: min(40rem, calc(100vw - 1.2rem)); max-height: calc(100vh - 2rem); padding: 1rem; }
+dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
+#sheet-card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 0.7rem; }
+#sheet-reason { margin-top: 0.6rem; color: var(--muted); }
+#sheet-reason p { white-space: pre-wrap; overflow-wrap: anywhere; }
+#sheet.stale #sheet-card, #sheet.stale #sheet-reason { opacity: 0.45; }
+
+@media (min-width: 900px) {
+  #app { padding-right: 24rem; }
+  #drawer { display: flex !important; left: auto; width: 24rem; border-left: 1px solid var(--line); }
+  #drawer-close { display: none; }
+}

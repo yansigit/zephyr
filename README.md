@@ -57,6 +57,7 @@ by hand that is looser than the preset is cleared); without it a non-interactive
 | `zephyr accounts [list \| order NAME.. \| remove NAME]` | The failover pool |
 | `zephyr model [--account NAME] [PROVIDER/MODEL]` | An account's model (or the default without accounts); with no model, pick from `rpi --list-models` |
 | `zephyr channel add\|remove discord\|imessage \| list` | Channel settings (secrets are asked for hidden); `remove` drops the channel, its owners and secrets, `list` shows them. Discord shows typing while the agent works, and a progress note after 20 s (`discord.progress`, `discord.progress_after_secs`) |
+| `zephyr web setup [--yes]` / `web enrol [NAME]` | Put the [web app](#web-app) behind `tailscale serve` and add a first device; later, a one-time code for another device |
 | `zephyr skill add DIR \| list \| rm NAME` | Skills the agent may use (see [Skills and connectors](#skills-and-connectors)); one you add is approved at once |
 | `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}` |
 | `zephyr packages add NAME.. \| rm NAME.. \| list` | Ubuntu (apt) packages for the agent, baked into a local image (`zephyr-local:<version>-<hash>`) on the release one; `up` and `upgrade` build it, and `add`/`rm` rebuild and recreate the container once the agent is idle |
@@ -69,6 +70,9 @@ by hand that is looser than the preset is cleared); without it a non-interactive
 | `/approvals [manual\|semi\|full\|on\|off] [for D]`, `/approvals messages\|posts\|money\|facts MODE [for D]`, `/approvals forget N` | From any channel: what waits for you before the agent sends a message, posts or pays (see [Approvals and presets](#approvals-and-presets)). Alone it shows the modes in effect, `preset semi (modified) · messages ask-new · posts delay 5 · money ask · facts hold`; `off` is `full`, `on` is `manual`. Loosening is accepted only from a strong channel (`zephyr attach` or the chat socket, by default). `forget N` makes zephyr forget remembered recipient #N (`/activity grants` lists them), so under `ask-new` the next send to it waits for you again |
 | `/held` | The messages, posts and payments waiting for you or for their delay, newest first |
 | `/activity [today\|6h\|7d] [KIND]` | Zephyr's own record of what ran, what left the machine, what waited and what was refused, newest first (the last 24 h unless a time is given, up to 90 d; at most 30 lines). KIND narrows it: `out`, `gate`, `refused`, `setting`, `proposal`, `job`, `task`, `process`, or `tool` for every tool call, which the bare list leaves out. `/activity grants` lists what still goes without asking (remembered recipients, time limits, turned-on jobs), each with the command that takes it back. Read from zephyr's tables, never written by the agent, and scrubbed of vault and fact values as it is read |
+| `/web` | The [web app](#web-app): its address, passkeys, sessions and push devices |
+| `/web enrol [NAME]` | From the terminal chat or `zephyr attach` only: a one-time code (10 minutes) that adds a passkey for a phone or laptop |
+| `/web rm NAME` / `/web signout` | From any channel: remove a passkey with its sessions, or end every web session (a lost phone) |
 | `/ok N [once]` / `/no N` | Approve or drop proposal or held action #N. `/ok N` runs exactly what its card showed; under `ask-new` it also remembers the new recipients, and `/ok N once` approves without remembering them |
 | `/cancel N` | Stop an action waiting out its delay (`sending at 14:05 unless /cancel 7`) before it goes |
 | `/facts [rm NAME \| allow NAME TARGET \| disallow NAME TARGET]` | From any channel: your private facts' names, kinds and allowed targets, never a value. `rm` and `allow` loosen the check, so only a strong channel may; a value is entered only in `zephyr attach` or with `zephyr facts add` |
@@ -164,7 +168,7 @@ Changes apply by themselves; nothing needs `zephyr restart`. The commands above,
 | Budget, owners, time zone, `[auth]`, `[tasks]`, the pool order | at once |
 | The model, on the same provider | at once, or after the reply in progress (rpi's `set_model`) |
 | A model on another provider, the active account, extensions, connectors (`[[mcp]]`), subagents (`[[subagent]]`), a re-login | the agent restarts after the reply in progress; the conversation carries on |
-| Discord, iMessage, `[attach]`, `[agent]`, a secret | the daemon restarts itself in place once idle; waiting messages are kept |
+| Discord, iMessage, `[attach]`, `[web]`, `[agent]`, a secret | the daemon restarts itself in place once idle; waiting messages are kept |
 | The attach port, the iMessage webhook's port | `zephyr config set` and `zephyr channel` start the container again to publish it; after a hand edit you are told, a minute later, to run `zephyr up` |
 
 A file that does not load is not applied, and the daemon keeps its current settings.
@@ -178,7 +182,7 @@ goes back by itself and you are told. The agent can read all of them. What it ma
 |---|---|
 | `tasks.parallel`, `mcp.NAME.enabled` (a connector off), `settings.strong_channels` (remove a channel), the `budget.*` limits, the `approvals.*` modes and preset, `approvals.strong_only` (add `money`), `mcp.NAME.classes.TOOL` (put a tool in a class) | make it stricter at once (lower, off, fewer channels, a limit where there was none, a stricter mode or preset); you are told and `/set KEY OLD` puts it back. Its `/set` takes one word, so it can tighten approvals to `ask` but not to `delay 10` |
 | `model`, `thinking`, `tasks.model`, `timezone`, `auth.*`, `approvals.currency`, `network.allow`, subagents, rules, removing a private fact or allowing it a target, and any change of the above that loosens | propose it: a card shows `KEY old → new` (or the exact `/subagent` or `/rule` text, up to 1500 characters), and `/ok N` applies it, `/no N` drops it |
-| `owners`, `[discord]`, `[imessage]`, `[attach]`, `[agent]`, `extensions`, `policy_plugin`, `rpi`, `home`, `state`, the `[[account]]` pool | nothing; edit `zephyr.toml` |
+| `owners`, `[discord]`, `[imessage]`, `[attach]`, `[web]`, `[agent]`, `extensions`, `policy_plugin`, `rpi`, `home`, `state`, the `[[account]]` pool | nothing; edit `zephyr.toml` |
 
 The agent may also save a new private fact at once (it only makes the check stricter); you are told
 its name, and `/facts rm NAME` removes it.
@@ -412,6 +416,90 @@ out, and `zephyr doctor` and `/mcp` say so. zephyr's own secrets (`ZEPHYR_*`) an
 removes a connector, and `/mcp` lists them. The agent can use only these connectors: an MCP config
 it writes itself, or a server named by URL, is refused. A connector runs as the agent, so the
 agent can read its token.
+
+## Web app
+
+A phone-first app the daemon serves itself, reached over your tailnet through `tailscale serve`
+(never `tailscale funnel`). It has:
+
+- **Chat** with the live status line (`working · 0:24 · bash · 3 tools`), the reply as it is
+  written, a turn's tools folded into one line, "take back" for a message still waiting, and Stop.
+- **Approvals**: the same cards your other channels get, in full. Approvals are made on the
+  card: a `/ok` typed into the app's chat is refused. Approve and Approve once take
+  your passkey, and what you sign is that exact card: if it changes before you sign, the signature
+  is refused and you are shown the new one. Deny needs no passkey. The agent's own stated reason
+  is folded away under "the agent's reason (not checked)".
+- **Activity**: zephyr's own record of what ran, what left the machine, what waited and what was
+  refused, and the standing grants, each with a Revoke button.
+- **Upcoming**: scheduled jobs and delayed sends.
+- **Goals**: your goals, with Add, Done and Remove.
+- **Settings**, with an optional time limit; a protected setting is saved with your passkey.
+- **Private facts** and the **Vault**, names only. Secrets are never typed in the app.
+- **Devices**: notifications, sign out, remove a passkey.
+
+**Setting it up.** The web app needs the network floor (the default; `network = "host"` in
+`host.toml` turns the app off, and `zephyr status` says so). You need
+[Tailscale](https://tailscale.com/download) on this machine, with
+HTTPS certificates turned on for your tailnet (admin console, DNS, HTTPS Certificates). Then:
+
+```sh
+zephyr web setup
+```
+
+It asks before each step: it writes `[web]` to `zephyr.toml` with this machine's tailnet name, runs
+`tailscale serve --bg http://127.0.0.1:7793` (if that is refused, it prints the `sudo` form, or
+`sudo tailscale set --operator=$USER` to let your user manage serve), restarts zephyr, and prints
+a link with a one-time code. Open the link on your phone to add it. Once a passkey exists it
+offers to make payments wait for a passkey or the terminal (`approvals.strong_only =
+loosen,money`), so Discord or iMessage alone can no longer approve one.
+
+**Never point `tailscale funnel` at this port.** Serve keeps the app on your tailnet; a funnel
+would put it on the internet. The app refuses funnel traffic, but do not rely on that alone.
+`zephyr status` says whether `tailscale serve` forwards to the app.
+
+By hand, the app is off until `zephyr.toml` has a `[web]` table:
+
+```toml
+[web]
+host = "box.tail1234.ts.net"       # this machine's tailnet name, alone: no https://, port or path
+port = 7793                        # the default; the daemon listens on 127.0.0.1 only
+# tailnet_users = ["owner@github"] # optional: only these tailnet logins get past the front door
+```
+
+The daemon refuses any request whose `Host` is not that name, that did not come through
+`tailscale serve`, or (for anything that changes something) that does not come from the app's own
+page. `zephyr status` says `web: listening`, and `zephyr doctor` checks the listener and the
+push key.
+
+**Signing in.** The app has no password. Each device signs in with a passkey (Face ID, a
+fingerprint, the device PIN), and a new device needs a one-time code that only you can make:
+
+1. Type `/web enrol phone` in `zephyr chat` or `zephyr attach` (not Discord or iMessage), or run
+   `zephyr web enrol phone` on the host. The reply is a link, `https://HOST/#enrol=ABCDE-FGHJK`.
+2. Open the link on the phone within 10 minutes, or open the app and type the code. It works once.
+3. You are told on your usual channel that `passkey phone was added`. If you did not do that,
+   `/web rm phone` at once.
+
+A session lasts 30 days, or 7 days unused. `/web` lists the passkeys and sessions, `/web rm NAME`
+removes a passkey and signs its devices out (from any channel: use it for a lost phone), and
+`/web signout` ends every session. Five failed sign-in attempts in ten minutes close sign-in for
+15 minutes and you are told; devices already signed in keep working.
+
+**Notifications.** On the app's Devices screen, "Turn on notifications" subscribes that device
+(on an iPhone, add the app to the Home Screen first: iOS offers notifications only there). You
+then get a push when something waits for your approval, and when a reply arrives while the app
+is closed. A push says no more than a Discord message would: the kind of action and its summary,
+or the first 120 characters of a reply; never the agent's stated reason. On Android and desktop a
+card's notification has buttons: **Deny** always, and **Approve** only for a message or a post
+that your other channels could approve too. A payment, or anything that loosens a protected
+setting, opens the app, where approving takes your passkey. Up to 10 devices; `/web rm NAME`
+removes a passkey's devices with it. Swiping a card's notification away denies it, on Android only.
+
+**Before a release that touches `crates/zephyr/assets/web/`**, check by hand, on iOS Safari as a
+Home Screen app and on Android Chrome (a real browser is not part of the tests): enrol with
+`/web enrol`, sign in, chat, approve a held message with the passkey, deny one from a
+notification, swipe one away on Android (it is denied), and `/web rm` from another channel
+signs the phone out. The browser's console must show no Content-Security-Policy errors.
 
 ## Sending the agent files
 

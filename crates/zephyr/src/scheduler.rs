@@ -947,7 +947,7 @@ impl Drop for Notes {
 }
 
 /// An owner's `/job …` command. `None` when the text is not one; otherwise the reply.
-pub fn command(store: &mut Store, cfg: &Config, m: &Inbound) -> Option<String> {
+pub fn command(store: &mut Store, cfg: &Config, m: &Inbound, may_approve: bool) -> Option<String> {
     let rest = m.text.trim().strip_prefix("/job")?;
     if !(rest.is_empty() || rest.starts_with(char::is_whitespace)) {
         return None;
@@ -955,6 +955,10 @@ pub fn command(store: &mut Store, cfg: &Config, m: &Inbound) -> Option<String> {
     let rest = rest.trim();
     let (verb, arg) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     let arg = arg.trim();
+    // Turning a job on, adding one, and running one that may not be on yet, are approvals.
+    if !may_approve && matches!(verb, "ok" | "add" | "run") {
+        return Some(crate::tools::NEEDS_PASSKEY.into());
+    }
     let id = arg.parse::<i64>();
     // The daily review is `review.at`'s: `/job run` runs it, nothing else here changes it.
     if let (&Ok(id), "rm" | "ok") = (&id, verb) {
@@ -1092,7 +1096,7 @@ mod tests {
             sender: "owner".into(),
             text: text.into(),
         };
-        command(store, &cfg(None), &m).expect("a /job command")
+        command(store, &cfg(None), &m, true).expect("a /job command")
     }
 
     /// B1: the agent's `/facts add` never puts its value in the audit, however it is spaced: the
@@ -1174,7 +1178,7 @@ mod tests {
             sender: "o".into(),
             text: "/jobs please".into(),
         };
-        assert_eq!(command(&mut s, &cfg(None), &not_job), None);
+        assert_eq!(command(&mut s, &cfg(None), &not_job, true), None);
         assert!(say(&mut s, "/job add a | 61 * * * * | hi").contains("bad schedule"));
         assert!(say(&mut s, "/job add a | 0 * * * * * | hi").contains("five fields"));
         assert!(say(&mut s, "/job add a | not cron | hi").contains("bad schedule"));
@@ -1274,9 +1278,9 @@ mod tests {
             sender: "o".into(),
             text: "/job add d | 0 8 * * * | hi".into(),
         };
-        let reply = command(&mut s, &cfg(Some("Asia/Seoul")), &m).unwrap();
+        let reply = command(&mut s, &cfg(Some("Asia/Seoul")), &m, true).unwrap();
         assert!(reply.contains("T08:00:00+09:00[Asia/Seoul]"), "{reply}");
-        let bad = command(&mut s, &cfg(Some("Mars/Olympus")), &m).unwrap();
+        let bad = command(&mut s, &cfg(Some("Mars/Olympus")), &m, true).unwrap();
         assert!(bad.contains("Mars/Olympus"), "{bad}");
     }
 

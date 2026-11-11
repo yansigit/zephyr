@@ -16,7 +16,7 @@ use zephyr::store::Store;
 /// The rpi minor this build speaks (DESIGN §3).
 const RPI_PIN: &str = "rpi 0.21.";
 
-const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|resume|reload|skill>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
+const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|resume|reload|skill|web>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
 
 fn main() -> ExitCode {
     // `agent-browser` on the agent's PATH is this binary (approvals spec §4.4): the wrapper runs
@@ -89,6 +89,7 @@ async fn zephyr_main() -> ExitCode {
             ("reload", Ok(cfg)) => control(&cfg, "/reload").await,
             ("set", Ok(cfg)) => set(&cfg, &args.collect::<Vec<_>>()).await,
             ("skill", Ok(cfg)) => skill(&cfg, &args.collect::<Vec<_>>()).await,
+            ("web", Ok(cfg)) => web(&cfg, &args.collect::<Vec<_>>()).await,
             _ => {
                 eprintln!("{USAGE}");
                 return ExitCode::from(2);
@@ -302,7 +303,7 @@ async fn skill(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
     let reply = match ask(cfg, &text).await? {
         Some(reply) => reply,
         // No daemon: the next child start reads `<state>/skills` anyway.
-        None => zephyr::drafts::command(cfg, &text).map_or_else(String::new, |(r, _)| r),
+        None => zephyr::drafts::command(cfg, &text, true).map_or_else(String::new, |(r, _)| r),
     };
     println!("{reply}");
     Ok(())
@@ -333,6 +334,27 @@ async fn set(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `zephyr web` and `zephyr web enrol [NAME]`: `/web` and `/web enrol` as the owner on the chat
+/// socket, a strong channel, so the first passkey can be enrolled from the host. Fails when the
+/// reply names no address: the app is not set up, or the code was refused.
+async fn web(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
+    let text = match args {
+        [] => "/web".to_string(),
+        [verb] if verb == "enrol" => "/web enrol".to_string(),
+        [verb, name] if verb == "enrol" => format!("/web enrol {name}"),
+        _ => anyhow::bail!("usage: zephyr web [enrol [NAME]]"),
+    };
+    let Some(reply) = ask(cfg, &text).await? else {
+        return Err(NotRunning.into());
+    };
+    println!("{reply}");
+    anyhow::ensure!(
+        reply.contains("https://"),
+        "the web app did not answer with its address"
+    );
+    Ok(())
+}
+
 /// Fails when the daemon does not answer or its heartbeat is stale: the image's HEALTHCHECK.
 async fn status(cfg: &Config) -> anyhow::Result<()> {
     use zephyr::supervise::{heartbeat_age, HEARTBEAT, STALE};
@@ -349,6 +371,16 @@ async fn status(cfg: &Config) -> anyhow::Result<()> {
     let store = Store::open(&cfg.db_path())?;
     for line in zephyr::reload::status_lines(cfg, &store)? {
         println!("{line}");
+    }
+    if let Some(web) = &cfg.web {
+        // Where the daemon binds it; a line of its own, whatever is wrong with it.
+        let _ = web;
+        let state = match zephyr::web::address(cfg) {
+            Ok(at) if tokio::net::TcpStream::connect(at).await.is_ok() => "listening".into(),
+            Ok(_) => "not listening".into(),
+            Err(why) => why,
+        };
+        println!("web: {state}");
     }
     // The router's view, written with the heartbeat: `<unix> <main up> <failed starts>`.
     let file = std::fs::read_to_string(cfg.state_dir().join(HEARTBEAT)).unwrap_or_default();
@@ -498,6 +530,20 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
         let there = std::fs::symlink_metadata(&socket).is_ok_and(|m| m.file_type().is_socket());
         let label = format!("the approvals gate listens at {}", socket.display());
         ok &= check(&label, there);
+    }
+    if let Some(web) = &cfg.web {
+        let _ = web;
+        ok &= match zephyr::web::address(cfg) {
+            Ok(at) => {
+                let up = tokio::net::TcpStream::connect(at).await;
+                check(&format!("web app listening on {at}"), up.is_ok())
+            }
+            Err(why) => check(&format!("web app: {why}"), false),
+        };
+        ok &= check(
+            "the web push key loads",
+            zephyr::web::push::vapid(cfg, false).is_ok(),
+        );
     }
     if let Some(d) = &cfg.discord {
         let label = format!("env {} is set (discord token)", d.token_env);

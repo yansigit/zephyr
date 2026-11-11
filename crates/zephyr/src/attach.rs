@@ -25,21 +25,51 @@ use crate::channel::Inbound;
 use crate::config::{Attach, Config};
 use crate::router::{untag, Snapshot};
 use crate::rpc::{message_text, MAIN_SESSION};
+use crate::web::passkey::{self, Signed};
 use anyhow::{bail, Context};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 /// The inbox channel name for messages typed in an attached client.
 pub const CHANNEL: &str = "tui";
+/// The inbox channel name for messages typed in the web app (DESIGN §4.3.3).
+pub const WEB: &str = "web";
+
+/// Whether `channel` is a client on one of the daemon's own ports (the TUI's or the web app's),
+/// which reads the router's replies from the event stream rather than from an adapter.
+pub fn attached(channel: &str) -> bool {
+    channel == CHANNEL || channel == WEB
+}
+
+/// The methods open to the web app. The rest answer `-32601`: sign-ins, the vault's and the
+/// facts' values and the saved sessions stay on the TUI.
+pub const WEB_METHODS: &[&str] = &[
+    "zephyr.hello",
+    "zephyr.subscribe",
+    "send",
+    "zephyr.models",
+    "zephyr.dequeue",
+    "zephyr.turns",
+    "zephyr.settings",
+    "zephyr.settings_set",
+    "zephyr.proposals",
+    "zephyr.decide",
+    "zephyr.facts_list",
+    "zephyr.vault_list",
+    "zephyr.activity",
+    "zephyr.goals",
+    "ping",
+    "zephyr.web_challenge",
+    "zephyr.web_devices",
+];
 /// One subscription per connection, so the id is fixed.
 const SUB_ID: u64 = 1;
-const MAX_LINE: u64 = 1 << 20;
+pub(crate) const MAX_LINE: u64 = 1 << 20;
 const UNAUTHORIZED: i64 = -32001;
 /// Connections served at once; one more is closed as it arrives.
 const MAX_CONNS: usize = 32;
@@ -53,14 +83,20 @@ pub enum AttachRequest {
     /// A prompt sent with `followUp: true`: held until the run settles (DESIGN §4.1).
     FollowUp(Inbound),
     /// `zephyr.dequeue`: the texts of this channel's messages still waiting, withdrawn.
-    Dequeue(oneshot::Sender<Vec<String>>),
+    Dequeue {
+        channel: &'static str,
+        reply: oneshot::Sender<Vec<String>>,
+    },
     /// `zephyr.settings`: every setting as it stands now.
     Settings(oneshot::Sender<Value>),
-    /// `zephyr.settings_set`: a change by the owner on the TUI, answered as the outcome.
+    /// `zephyr.settings_set`: a change by the owner on `channel`, answered as the outcome.
+    /// `expect` is a passkey-signed change's: the value the owner saw, which must still stand.
     SettingsSet {
         key: String,
         value: String,
         until: Option<String>,
+        channel: &'static str,
+        expect: Option<Option<String>>,
         reply: oneshot::Sender<Value>,
     },
     /// `zephyr.proposals`: the proposals still waiting.
@@ -74,13 +110,84 @@ pub enum AttachRequest {
     },
     /// `zephyr.goals`: the open goals, then those done since the last review (read-only).
     Goals(oneshot::Sender<Result<Value, String>>),
+    /// A waiting proposal's card as `zephyr.proposals` gives it now, and its digest
+    /// (`Store::proposal_digest`): what a passkey is about to sign. `None` when none waits.
+    Card {
+        id: i64,
+        reply: oneshot::Sender<Option<(String, [u8; 32])>>,
+    },
+    /// A setting's value now, as a signed change records it; `Err` for a key that is not one.
+    Current {
+        key: String,
+        reply: oneshot::Sender<Result<Option<String>, String>>,
+    },
+    /// A notice from the web app's listener (a passkey was added, sign-in was closed), for
+    /// every attached client and the owner last answered.
+    WebNotice(String),
     /// `zephyr.decide`: `/ok N` (`ok`, `once`), `/no N` (`no`) or `/cancel N` (`cancel`) as the
-    /// owner on the TUI.
+    /// owner on `channel`. `expect` is a passkey-signed decision's: what was signed, which the
+    /// proposal must still be.
     Decide {
         id: i64,
         verb: String,
+        channel: &'static str,
+        expect: Option<Expect>,
         reply: oneshot::Sender<Value>,
     },
+}
+
+/// What a passkey signature committed to: the proposal as stored (`Store::proposal_digest`) and
+/// the hex SHA-256 of the card the owner was shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expect {
+    pub digest: [u8; 32],
+    pub card_sha256: String,
+}
+
+/// Where a connection comes from: the attach port with its token, or the web app's socket,
+/// whose cookie the listener already checked.
+pub enum Origin {
+    Tui {
+        token: Arc<str>,
+    },
+    Web {
+        session: [u8; 32],
+        passkey: i64,
+        hub: Arc<crate::web::Hub>,
+    },
+}
+
+/// Serves one client on `stream` until it goes.
+pub async fn serve_stream<S>(stream: S, origin: Origin, handles: Handles)
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    let (token, web) = match origin {
+        Origin::Tui { token } => (token, None),
+        Origin::Web {
+            session,
+            passkey,
+            hub,
+        } => ("".into(), Some((session, passkey, hub))),
+    };
+    let conn = Conn {
+        token,
+        channel: if web.is_some() { WEB } else { CHANNEL },
+        // The cookie was checked at the upgrade.
+        authed: web.is_some(),
+        web,
+        snap: handles.snap,
+        cfgs: handles.cfgs,
+        inbound: handles.inbound,
+        router: handles.router,
+        live: None,
+        zephyr: false,
+        models: None,
+        late: mpsc::channel(4),
+        // shortcut: counted per socket, so a session's four sockets could ask for 40 a minute.
+        signatures: crate::web::Window::new(10, std::time::Duration::from_secs(60)),
+    };
+    conn.run(stream).await;
 }
 
 /// Reads the attach token. Never log the result.
@@ -106,14 +213,17 @@ pub fn token(a: &Attach) -> anyhow::Result<String> {
     Ok(token.to_string())
 }
 
+/// What a listener for attached clients (this one, and the web app's) needs of the router.
+#[derive(Clone)]
+pub struct Handles {
+    pub inbound: mpsc::Sender<Inbound>,
+    pub router: mpsc::Sender<AttachRequest>,
+    pub snap: watch::Receiver<Snapshot>,
+    pub cfgs: watch::Receiver<Arc<Config>>,
+}
+
 /// Serves attach clients until dropped. Pending forever when `[attach]` is not configured.
-pub async fn serve(
-    cfg: &Config,
-    inbound: mpsc::Sender<Inbound>,
-    router: mpsc::Sender<AttachRequest>,
-    snap: watch::Receiver<Snapshot>,
-    cfgs: watch::Receiver<Arc<Config>>,
-) -> anyhow::Result<()> {
+pub async fn serve(cfg: &Config, handles: Handles) -> anyhow::Result<()> {
     let Some(a) = &cfg.attach else {
         return std::future::pending().await;
     };
@@ -132,20 +242,12 @@ pub async fn serve(
                 let Ok(slot) = slots.clone().try_acquire_owned() else {
                     continue; // dropped, so closed at once
                 };
-                let conn = Conn {
+                let origin = Origin::Tui {
                     token: token.clone(),
-                    snap: snap.clone(),
-                    cfgs: cfgs.clone(),
-                    inbound: inbound.clone(),
-                    router: router.clone(),
-                    authed: false,
-                    live: None,
-                    zephyr: false,
-                    models: None,
-                    late: mpsc::channel(4),
                 };
+                let handles = handles.clone();
                 tokio::spawn(async move {
-                    conn.run(stream).await;
+                    serve_stream(stream, origin, handles).await;
                     drop(slot);
                 });
             }
@@ -156,6 +258,10 @@ pub async fn serve(
 
 struct Conn {
     token: Arc<str>,
+    /// The inbox channel this client's messages and decisions are on: `tui` or `web`.
+    channel: &'static str,
+    /// A web app's socket: its session's hash, its passkey's row and the listener's hub.
+    web: Option<([u8; 32], i64, Arc<crate::web::Hub>)>,
     snap: watch::Receiver<Snapshot>,
     /// The live config, for `zephyr.models`.
     cfgs: watch::Receiver<Arc<Config>>,
@@ -172,21 +278,48 @@ struct Conn {
     /// asks rpi for its models — as frames to write. The sender lives with the conn, so a task
     /// may outlive one reply without ending the connection.
     late: (mpsc::Sender<Reply>, mpsc::Receiver<Reply>),
+    /// `zephyr.web_challenge` calls this minute: at most 10.
+    signatures: crate::web::Window,
+}
+
+const OTHER_REQUEST: &str = "that signature is for another request";
+const NOT_VERIFIED: &str = "the passkey signature did not verify";
+
+/// A setting's value as a client sends it: text, or a number or a flag as such.
+fn value_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        v @ (Value::Number(_) | Value::Bool(_)) => Some(v.to_string()),
+        _ => None,
+    }
+}
+
+/// A change's time limit. A number would read as "no limit": refused rather than loosen for good.
+fn until_text(v: &Value) -> Result<Option<String>, &'static str> {
+    match v {
+        Value::Null => Ok(None),
+        Value::String(s) => Ok(Some(s.clone())),
+        _ => Err("until must be text like 30m, 2h or 1d"),
+    }
 }
 
 /// What to do after a request: write these frames, then maybe hang up.
 type Reply = (Vec<Value>, bool);
 
 impl Conn {
-    async fn run(self, stream: TcpStream) {
-        let (read, write) = stream.into_split();
+    async fn run<S: AsyncRead + AsyncWrite + Send + 'static>(self, stream: S) {
+        let (read, write) = tokio::io::split(stream);
         let (tx, lines) = mpsc::channel(16);
         let reader = tokio::spawn(read_lines(read, tx));
         self.talk(write, lines).await;
         reader.abort(); // its half holds the socket open until the client sends again
     }
 
-    async fn talk(mut self, mut write: OwnedWriteHalf, mut lines: mpsc::Receiver<Vec<u8>>) {
+    async fn talk(
+        mut self,
+        mut write: impl AsyncWrite + Unpin,
+        mut lines: mpsc::Receiver<Vec<u8>>,
+    ) {
         let deadline = tokio::time::Instant::now() + AUTH_WAIT;
         loop {
             let (frames, close) = tokio::select! {
@@ -196,6 +329,9 @@ impl Conn {
                     None => return, // client gone; the run carries on
                 },
                 ev = next_live(&mut self.live) => match ev {
+                    // A command's reply is drawn where it was typed; a notice (no channel) everywhere.
+                    Ok(ev) if ev["type"] == "zephyr_reply"
+                        && ev["channel"].as_str().is_some_and(|c| c != self.channel) => (vec![], false),
                     Ok(ev) if self.zephyr => (raw(ev).into_iter().map(event).collect(), false),
                     Ok(ev) => (live(ev), false),
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -242,6 +378,12 @@ impl Conn {
         let id = &req["id"];
         let params = &req["params"];
         let method = req["method"].as_str().unwrap_or_default();
+        if self.channel == WEB && !WEB_METHODS.contains(&method) {
+            return (
+                vec![error(id, -32601, "not available in the web app")],
+                false,
+            );
+        }
         if method == "authenticate" {
             let given = params["token"].as_str().unwrap_or_default();
             if !same(given, &self.token) {
@@ -352,7 +494,11 @@ impl Conn {
             }
             "zephyr.dequeue" => {
                 let (tx, rx) = oneshot::channel();
-                let asked = self.router.send(AttachRequest::Dequeue(tx)).await;
+                let req = AttachRequest::Dequeue {
+                    channel: self.channel,
+                    reply: tx,
+                };
+                let asked = self.router.send(req).await;
                 match (asked, rx.await) {
                     (Ok(()), Ok(texts)) => (vec![ok(id, json!({ "texts": texts }))], false),
                     _ => (vec![error(id, -32000, "gateway is shutting down")], true),
@@ -391,32 +537,39 @@ impl Conn {
                     _ => (vec![error(id, -32000, "gateway is shutting down")], true),
                 }
             }
+            "zephyr.web_challenge" if self.web.is_some() => self.web_challenge(id, params).await,
             "zephyr.settings_set" => {
-                let (Some(key), Some(value)) = (
-                    params["key"].as_str(),
-                    // A client may send a number or a flag as such.
-                    match &params["value"] {
-                        Value::String(s) => Some(s.clone()),
-                        v @ (Value::Number(_) | Value::Bool(_)) => Some(v.to_string()),
-                        _ => None,
-                    },
-                ) else {
+                // A client may send a number or a flag as such.
+                let (Some(key), Some(value)) =
+                    (params["key"].as_str(), value_text(&params["value"]))
+                else {
                     return (vec![error(id, -32602, "key and value are required")], false);
                 };
-                // A number would read as "no limit": refuse it rather than loosen for good.
-                let until = match &params["until"] {
-                    Value::Null => None,
-                    Value::String(s) => Some(s.clone()),
-                    _ => {
-                        let why = "until must be text like 30m, 2h or 1d";
-                        return (vec![error(id, -32602, why)], false);
-                    }
+                let until = match until_text(&params["until"]) {
+                    Ok(until) => until,
+                    Err(why) => return (vec![error(id, -32602, why)], false),
                 };
+                // The web app signs a change to a strong setting: the signature must be for
+                // this change, and then acts as `passkey`. Unsigned, the change is `web`'s.
+                let mut by = (self.channel, None);
+                if self.web.is_some() && !params["assertion"].is_null() {
+                    let same = |s: &Signed| {
+                        matches!(s, Signed::Set { key: k, value: v, until: u, .. }
+                            if k == key && *v == value && *u == until)
+                    };
+                    match self.signed(params, same) {
+                        Ok(Signed::Set { current, .. }) => by = ("passkey", Some(current)),
+                        Ok(_) => return (vec![error(id, -32602, OTHER_REQUEST)], false),
+                        Err(why) => return (vec![error(id, -32602, why)], false),
+                    }
+                }
                 let (tx, rx) = oneshot::channel();
                 let req = AttachRequest::SettingsSet {
                     key: key.into(),
                     value,
                     until,
+                    channel: by.0,
+                    expect: by.1,
                     reply: tx,
                 };
                 match (self.router.send(req).await, rx.await) {
@@ -432,10 +585,37 @@ impl Conn {
                     let why = "verb is ok, once, no or cancel";
                     return (vec![error(id, -32602, why)], false);
                 }
+                // Every approval made in the web app is signed with a passkey, over this
+                // proposal as stored and as shown; it then acts as `passkey`. Refusing and
+                // cancelling only take away, so the cookie (`web`) is enough.
+                let mut by = (self.channel, None);
+                if self.web.is_some() && matches!(verb, "ok" | "once") {
+                    if params["assertion"].is_null() {
+                        return (vec![error(id, -32602, "approve with your passkey")], false);
+                    }
+                    let same = |s: &Signed| matches!(s, Signed::Decide { id: i, verb: v, .. } if *i == n && v == verb);
+                    match self.signed(params, same) {
+                        Ok(Signed::Decide {
+                            digest,
+                            card_sha256,
+                            ..
+                        }) => {
+                            let expect = Expect {
+                                digest,
+                                card_sha256,
+                            };
+                            by = ("passkey", Some(expect));
+                        }
+                        Ok(_) => return (vec![error(id, -32602, OTHER_REQUEST)], false),
+                        Err(why) => return (vec![error(id, -32602, why)], false),
+                    }
+                }
                 let (tx, rx) = oneshot::channel();
                 let req = AttachRequest::Decide {
                     id: n,
                     verb: verb.into(),
+                    channel: by.0,
+                    expect: by.1,
                     reply: tx,
                 };
                 match (self.router.send(req).await, rx.await) {
@@ -449,6 +629,11 @@ impl Conn {
             | "zephyr.vault_revoke" => self.vault(id, method, params).await,
             "zephyr.facts_list" | "zephyr.facts_put" | "zephyr.facts_rm" => {
                 self.facts(id, method, params)
+            }
+            "zephyr.web_devices" if self.web.is_some() => {
+                let cfg = self.cfgs.borrow().clone();
+                let session = self.web.as_ref().map_or([0; 32], |w| w.0);
+                (vec![ok(id, crate::web::devices(&cfg, &session))], false)
             }
             "zephyr.sessions" => {
                 let cfg = self.cfgs.borrow().clone();
@@ -591,6 +776,129 @@ impl Conn {
         }
     }
 
+    /// `zephyr.web_challenge` (DESIGN §4.3.3): what the owner is about to sign in the web app,
+    /// `{"op": "decide", "id", "verb": "ok" | "once", "card_sha256"}` or `{"op": "set", "key",
+    /// "value", "until"?}`, as a WebAuthn challenge that commits to it: the SHA-256 of
+    /// `passkey::preimage`, which holds the proposal's digest and the hash of the card on
+    /// screen (which must be the card the router would show now), or the setting's current
+    /// value, and a nonce. The challenge is kept for this session, 2 minutes, one use.
+    async fn web_challenge(&mut self, id: &Value, params: &Value) -> Reply {
+        let refuse = |why: &str| (vec![error(id, -32602, why)], false);
+        let gone = || (vec![error(id, -32000, "gateway is shutting down")], true);
+        let Some((session, key, hub)) = self.web.clone() else {
+            return refuse("not available here");
+        };
+        if !self.signatures.hit(std::time::Instant::now()) {
+            return refuse("too many signatures; wait a minute");
+        }
+        let signed = match params["op"].as_str() {
+            Some("decide") => {
+                let (Some(n), Some(verb @ ("ok" | "once")), Some(shown)) = (
+                    params["id"].as_i64(),
+                    params["verb"].as_str(),
+                    params["card_sha256"].as_str(),
+                ) else {
+                    return refuse("id, verb (ok or once) and card_sha256 are required");
+                };
+                let (tx, rx) = oneshot::channel();
+                let asked = AttachRequest::Card { id: n, reply: tx };
+                let card = match (self.router.send(asked).await, rx.await) {
+                    (Ok(()), Ok(card)) => card,
+                    _ => return gone(),
+                };
+                let Some((card, digest)) = card else {
+                    return refuse(&format!("no proposal #{n} is waiting"));
+                };
+                // The page and the daemon must agree on what is signed.
+                if passkey::card_sha256(&card) != shown {
+                    return refuse("the card changed; look at it again");
+                }
+                Signed::Decide {
+                    id: n,
+                    verb: verb.into(),
+                    digest,
+                    card_sha256: shown.into(),
+                }
+            }
+            Some("set") => {
+                let (Some(key), Some(value)) =
+                    (params["key"].as_str(), value_text(&params["value"]))
+                else {
+                    return refuse("key and value are required");
+                };
+                let until = match until_text(&params["until"]) {
+                    Ok(until) => until,
+                    Err(why) => return refuse(why),
+                };
+                let (tx, rx) = oneshot::channel();
+                let asked = AttachRequest::Current {
+                    key: key.into(),
+                    reply: tx,
+                };
+                let current = match (self.router.send(asked).await, rx.await) {
+                    (Ok(()), Ok(Ok(current))) => current,
+                    (Ok(()), Ok(Err(why))) => return refuse(&why),
+                    _ => return gone(),
+                };
+                Signed::Set {
+                    key: key.into(),
+                    value,
+                    until,
+                    current,
+                }
+            }
+            _ => return refuse("op is decide or set"),
+        };
+        let cfg = self.cfgs.borrow().clone();
+        // Only this session's own passkey may sign for it.
+        let own = (crate::store::Store::open(&cfg.db_path()).ok())
+            .and_then(|store| store.passkey(key).ok().flatten());
+        let (Some(own), Some(web)) = (own, &cfg.web) else {
+            return refuse("this session's passkey is gone; sign in again");
+        };
+        let challenge = passkey::sha256(&passkey::preimage(&signed, &crate::web::random()));
+        let b64 = |bytes: &[u8]| data_encoding::BASE64URL_NOPAD.encode(bytes);
+        let result = json!({"challengeId": hub.sign(session, signed, challenge), "publicKey": {
+            "challenge": b64(&challenge), "rpId": web.host, "timeout": 120_000,
+            "userVerification": "required",
+            "allowCredentials": [{"type": "public-key", "id": b64(&own.cred_id)}]}});
+        (vec![ok(id, result)], false)
+    }
+
+    /// What a signed request's `challengeId` was issued for, once its `assertion` verifies
+    /// under this session's own passkey. The challenge is used up either way; `same` says
+    /// whether it was issued for this request.
+    fn signed(
+        &self,
+        params: &Value,
+        same: impl Fn(&Signed) -> bool,
+    ) -> Result<Signed, &'static str> {
+        let (session, key, hub) = self.web.as_ref().ok_or(NOT_VERIFIED)?;
+        let challenge = params["challengeId"].as_str().unwrap_or_default();
+        let (signed, challenge) = (hub.signed(challenge, *session))
+            .ok_or("that signature expired or was used; tap again")?;
+        if !same(&signed) {
+            return Err(OTHER_REQUEST);
+        }
+        let cfg = self.cfgs.borrow().clone();
+        let host = cfg
+            .web
+            .as_ref()
+            .map(|w| w.host.as_str())
+            .ok_or(NOT_VERIFIED)?;
+        let store = crate::store::Store::open(&cfg.db_path()).map_err(|_| NOT_VERIFIED)?;
+        let own = (store.passkey(*key).ok().flatten()).ok_or(NOT_VERIFIED)?;
+        let a = passkey::assertion(&params["assertion"]).map_err(|_| NOT_VERIFIED)?;
+        if a.id != own.cred_id {
+            return Err(NOT_VERIFIED);
+        }
+        let count = passkey::verify(host, &challenge, &own.public_key, own.sign_count, &a)
+            .inspect_err(|reason| eprintln!("zephyr: a web app signature was refused: {reason}"))
+            .map_err(|_| NOT_VERIFIED)?;
+        (store.passkey_used(own.id, count, crate::now())).map_err(|_| NOT_VERIFIED)?;
+        Ok(signed)
+    }
+
     /// Replays the session from `get_messages`, then streams live events.
     async fn subscribe(&mut self, id: &Value) -> Reply {
         let history = match self.history().await {
@@ -674,9 +982,9 @@ impl Conn {
             }
         };
         let m = Inbound {
-            channel: CHANNEL.into(),
+            channel: self.channel.into(),
             platform_msg_id: next_msg_id(),
-            sender: "token".into(),
+            sender: sender(self.channel).into(),
             text: text.into(),
         };
         let sent = match cmd["followUp"] == true {
@@ -699,6 +1007,25 @@ async fn next_live(
     match live {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+/// The channel whose rows a decision made on `channel` belongs to: `passkey`, a signed decision
+/// in the web app, has no inbox or outbox rows of its own, so its notices are `web`'s.
+pub fn rows(channel: &str) -> &str {
+    if channel == "passkey" {
+        WEB
+    } else {
+        channel
+    }
+}
+
+/// Who an attached client's messages are from: the attach token's holder, or the web session's.
+pub fn sender(channel: &str) -> &'static str {
+    if channel == WEB {
+        WEB
+    } else {
+        "token"
     }
 }
 
@@ -778,7 +1105,7 @@ fn role(m: &Value) -> Option<&str> {
 }
 
 /// Reads newline-delimited requests; a line over `MAX_LINE` ends the connection.
-async fn read_lines(read: OwnedReadHalf, tx: mpsc::Sender<Vec<u8>>) {
+async fn read_lines(read: impl AsyncRead + Unpin, tx: mpsc::Sender<Vec<u8>>) {
     let mut read = BufReader::new(read);
     loop {
         let mut line = Vec::new();

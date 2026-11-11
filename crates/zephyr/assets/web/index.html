@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101418">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>zephyr</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+
+<main id="signin" hidden>
+  <h1>zephyr</h1>
+  <p id="signin-note" class="note" role="status"></p>
+  <button id="signin-go" type="button" class="primary">Sign in with passkey</button>
+  <details id="enrol">
+    <summary>Add this device</summary>
+    <p class="hint">Type <code>/web enrol</code> in <code>zephyr chat</code> or <code>zephyr attach</code>, then open its link here or type its code.</p>
+    <label>Code
+      <input id="enrol-code" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCDE-FGHJK">
+    </label>
+    <label>Name for this device
+      <input id="enrol-name" autocomplete="off" spellcheck="false" maxlength="32" placeholder="phone">
+    </label>
+    <button id="enrol-go" type="button" class="primary">Add this device</button>
+  </details>
+</main>
+
+<div id="app" hidden>
+  <header>
+    <button id="status" type="button" aria-controls="drawer">idle</button>
+    <span id="paused" class="badge" hidden>paused</span>
+    <button id="waiting" type="button" class="badge" aria-controls="drawer" hidden></button>
+    <button id="menu" type="button" aria-controls="screens" aria-label="Menu">&#9776;</button>
+  </header>
+
+  <nav id="screens" hidden>
+    <button type="button" data-screen="chat">Chat</button>
+    <button type="button" data-screen="settings">Settings</button>
+    <button type="button" data-screen="facts">Private facts</button>
+    <button type="button" data-screen="vault">Vault</button>
+    <button type="button" data-screen="goals">Goals</button>
+    <button type="button" data-screen="devices">Devices</button>
+  </nav>
+
+  <section id="chat" class="screen">
+    <div id="transcript" aria-live="polite"></div>
+    <div id="queue" hidden>
+      <span id="queue-text"></span>
+      <button id="queue-back" type="button">take back</button>
+    </div>
+    <div id="composer">
+      <textarea id="draft" rows="1" placeholder="Message" aria-label="Message"></textarea>
+      <label class="follow"><input id="follow" type="checkbox"> after this run</label>
+      <button id="stop" type="button" hidden>Stop</button>
+      <button id="send" type="button" class="primary">Send</button>
+    </div>
+  </section>
+
+  <section id="settings" class="screen" hidden>
+    <h2>Settings</h2>
+    <p id="settings-note" class="note" role="status"></p>
+    <div id="settings-list"></div>
+  </section>
+
+  <section id="facts" class="screen" hidden>
+    <h2>Private facts</h2>
+    <p class="hint">Names, kinds and allowed targets only. Change these in the TUI or with <code>zephyr facts</code>.</p>
+    <ul id="facts-list" class="rows"></ul>
+  </section>
+
+  <section id="vault" class="screen" hidden>
+    <h2>Vault</h2>
+    <p class="hint">Names, sites and grants only. Change these in the TUI or with <code>zephyr vault</code>.</p>
+    <ul id="vault-list" class="rows"></ul>
+  </section>
+
+  <section id="goals" class="screen" hidden>
+    <h2>Goals</h2>
+    <p id="goals-note" class="note" role="status"></p>
+    <ul id="goals-list" class="rows"></ul>
+    <div class="buttons">
+      <input id="goal-text" maxlength="500" placeholder="A new goal" aria-label="A new goal">
+      <button id="goal-add" type="button" class="primary">Add</button>
+    </div>
+  </section>
+
+  <section id="devices" class="screen" hidden>
+    <h2>Devices</h2>
+    <p id="devices-note" class="note" role="status"></p>
+    <div class="buttons">
+      <button id="push-on" type="button">Turn on notifications</button>
+      <button id="push-off" type="button" hidden>Turn off notifications</button>
+      <button id="signout" type="button">Sign out</button>
+    </div>
+    <h3>Passkeys</h3>
+    <ul id="passkeys-list" class="rows"></ul>
+    <h3>Sessions</h3>
+    <ul id="sessions-list" class="rows"></ul>
+    <h3>Notifications</h3>
+    <ul id="push-list" class="rows"></ul>
+  </section>
+
+  <aside id="drawer" hidden>
+    <div class="tabs" role="tablist">
+      <button type="button" role="tab" data-tab="approvals">Approvals</button>
+      <button type="button" role="tab" data-tab="activity">Activity</button>
+      <button type="button" role="tab" data-tab="upcoming">Upcoming</button>
+      <button id="drawer-close" type="button" aria-label="Close">&#10005;</button>
+    </div>
+    <ul id="approvals" class="rows" role="tabpanel"></ul>
+    <ul id="activity" class="rows" role="tabpanel" hidden></ul>
+    <ul id="upcoming" class="rows" role="tabpanel" hidden></ul>
+  </aside>
+
+  <dialog id="sheet" aria-labelledby="sheet-title">
+    <h2 id="sheet-title"></h2>
+    <pre id="sheet-card"></pre>
+    <details id="sheet-reason" hidden>
+      <summary>the agent's reason (not checked)</summary>
+      <p id="sheet-reason-text"></p>
+    </details>
+    <p id="sheet-note" class="note" role="status"></p>
+    <div class="buttons">
+      <button id="sheet-ok" type="button" class="primary">Approve</button>
+      <button id="sheet-once" type="button" hidden>Approve once</button>
+      <button id="sheet-no" type="button">Deny</button>
+      <button id="sheet-cancel" type="button" hidden>Cancel it</button>
+      <button id="sheet-close" type="button">Close</button>
+    </div>
+  </dialog>
+</div>
+
+</body>
+</html>

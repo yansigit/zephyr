@@ -195,7 +195,15 @@ pub enum Decided {
     Action { id: i64, once: bool },
 }
 
-/// The owner's `/ok N [once]` or `/no N`. `Some(Ok(_))` is what was approved; `Some(Err(reply))`
+/// What a command that approves, grants, adds or undoes answers when it is typed in the web
+/// app (DESIGN §4.3.3): there an approval is made on its card and signed with a passkey, since
+/// typed it would rest on the session cookie alone. Each handler that takes such a verb is told
+/// whether its caller may approve (`may_approve`) and refuses with this itself, so a new verb
+/// or an alias cannot slip past a list kept elsewhere.
+pub const NEEDS_PASSKEY: &str = "[zephyr] approve with your passkey: the web app takes an \
+    approval only on its card. This command is taken on your other channels";
+
+/// The owner's `/ok N [once]` or `/no N`. Without `may_approve`, `/ok` is refused. `Some(Ok(_))` is what was approved; `Some(Err(reply))`
 /// is the whole answer (a `/no`, or why nothing was approved); `None` for any other text. Before
 /// an `/ok` settles a proposed command, `check` sees it and may hold it back. A held action is
 /// only looked up here: `actions::approve` takes it, once, and `/no` drops it through
@@ -204,10 +212,12 @@ pub fn decide(
     cfg: &crate::config::Config,
     store: &Store,
     text: &str,
+    may_approve: bool,
     check: impl FnOnce(&crate::store::PendingProposal) -> Option<NotNow>,
 ) -> Option<Result<Decided, String>> {
     let (verb, rest) = text.split_once(' ').unwrap_or((text, ""));
     let status = match verb {
+        "/ok" if !may_approve => return Some(Err(NEEDS_PASSKEY.into())),
         "/ok" => "done",
         "/no" => "dropped",
         _ => return None,

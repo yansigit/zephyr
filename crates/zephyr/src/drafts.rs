@@ -463,7 +463,7 @@ fn line_diff(a: &str, b: &str) -> String {
 
 /// The owner's `/skills`, `/skill ...` and `/mcp ...`. `None` for any other text; otherwise the
 /// reply, and what the router must do next.
-pub fn command(cfg: &Config, text: &str) -> Option<(String, After)> {
+pub fn command(cfg: &Config, text: &str, may_approve: bool) -> Option<(String, After)> {
     let words: Vec<&str> = text.split_whitespace().collect();
     let kind = match words.first()? {
         &"/skills" | &"/skill" => Kind::Skill,
@@ -478,6 +478,10 @@ pub fn command(cfg: &Config, text: &str) -> Option<(String, After)> {
     let result = match (kind, &words[1..]) {
         (_, []) => list(cfg, kind).map(|r| (r, After::Nothing)),
         (_, [verb, name]) if valid_name(name) => match (kind, *verb) {
+            // Approving a draft, and bringing a skill back, are approvals.
+            (_, "ok") | (Kind::Skill, "undo" | "add") if !may_approve => {
+                Ok((crate::tools::NEEDS_PASSKEY.into(), After::Nothing))
+            }
             (_, "ok") => ok(cfg, kind, name),
             (_, "no") => Ok((
                 if remove_draft(&cfg.home, kind, name) {
@@ -1092,7 +1096,7 @@ mod tests {
     }
 
     fn say(cfg: &Config, text: &str) -> (String, After) {
-        command(cfg, text).unwrap()
+        command(cfg, text, true).unwrap()
     }
 
     fn agents(cfg: &Config) -> String {
@@ -1297,7 +1301,7 @@ mod tests {
         assert!(agents(&cfg).contains("**tea**"));
         assert!(say(&cfg, "/skill").0.contains("- tea:"));
         assert!(say(&cfg, "/skill frob tea").0.starts_with("usage"));
-        assert!(command(&cfg, "/skillful").is_none());
+        assert!(command(&cfg, "/skillful", true).is_none());
     }
 
     #[test]

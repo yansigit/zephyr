@@ -31,6 +31,7 @@ pub fn diff(old: &Config, new: &Config, active: Option<&Account>, next: Option<&
         || old.discord != new.discord
         || old.imessage != new.imessage
         || old.attach != new.attach
+        || old.web != new.web
         || old.agent != new.agent
     {
         return Plan::Reexec;
@@ -148,6 +149,16 @@ mod tests {
 
     fn first(c: &Config) -> Option<&Account> {
         c.accounts.first()
+    }
+
+    #[test]
+    fn a_web_change_reexecs() {
+        let old = cfg(POOL);
+        let on = cfg(&format!("{POOL}[web]\nhost = 'box.ts.net'\n"));
+        let moved = cfg(&format!("{POOL}[web]\nhost = 'box.ts.net'\nport = 8000\n"));
+        assert_eq!(diff(&old, &on, first(&old), first(&on)), Plan::Reexec);
+        assert_eq!(diff(&on, &moved, first(&on), first(&moved)), Plan::Reexec);
+        assert_eq!(diff(&on, &on.clone(), first(&on), first(&on)), Plan::Same);
     }
 
     #[test]

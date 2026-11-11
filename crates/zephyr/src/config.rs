@@ -39,6 +39,8 @@ pub struct Config {
     pub owners: HashMap<String, Vec<String>>,
     /// The `rpi --connect` attach listener (DESIGN §4.3). Off when absent.
     pub attach: Option<Attach>,
+    /// The web app's listener (DESIGN §4.3.3). Off when absent.
+    pub web: Option<Web>,
     /// Daily limits on rpi's reported usage (DESIGN §4.4). Off when absent.
     pub budget: Option<Budget>,
     /// `[tasks]`: how many background tasks run at once (DESIGN §4.12). Default 2 when absent.
@@ -68,6 +70,22 @@ pub struct Config {
     /// shorten it.
     #[serde(skip, default = "min_until")]
     pub min_until: std::time::Duration,
+    /// Origins a Web Push subscription may also name, over `http` too (DESIGN §4.3.3). Not
+    /// configurable, and empty; tests point it at a fake push service.
+    #[serde(skip)]
+    pub push_hosts: Vec<String>,
+    /// Lets the web app start outside the network floor. Not configurable, and off; the tests'
+    /// process is not a container, and sets it.
+    #[serde(skip)]
+    pub web_off_floor: bool,
+    /// How long five failed passkey attempts close the web app's sign-in. Not configurable;
+    /// tests shorten it.
+    #[serde(skip, default = "web_lockout")]
+    pub web_lockout: std::time::Duration,
+    /// How often a web socket is pinged; one silent for twice this is closed. Not configurable;
+    /// tests shorten it.
+    #[serde(skip, default = "web_ping")]
+    pub web_ping: std::time::Duration,
     /// `[agent]`: what the agent's processes get (DESIGN §4.4).
     #[serde(default)]
     pub agent: Agent,
@@ -107,6 +125,18 @@ pub struct Config {
     /// tests set it.
     #[serde(skip, default = "floor")]
     pub floor: bool,
+}
+
+fn web_lockout() -> std::time::Duration {
+    std::time::Duration::from_secs(15 * 60)
+}
+
+fn web_ping() -> std::time::Duration {
+    std::time::Duration::from_secs(30)
+}
+
+fn web_port() -> u16 {
+    7793
 }
 
 fn job_timeout() -> std::time::Duration {
@@ -263,7 +293,7 @@ impl Default for Settings {
 }
 
 fn strong_default() -> Vec<String> {
-    vec!["tui".into(), "chat".into()]
+    vec!["tui".into(), "chat".into(), "passkey".into()]
 }
 
 /// `[approvals]` (approvals spec §4.3), kept as the file says it: `Config::validate` refuses a
@@ -371,6 +401,21 @@ pub struct Attach {
     pub token_file: Option<PathBuf>,
 }
 
+/// `[web]`: the web app, on 127.0.0.1 behind `tailscale serve` (DESIGN §4.3.3).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Web {
+    /// The name `tailscale serve` answers on. Host and Origin must match it, and it is the
+    /// passkeys' relying party.
+    pub host: String,
+    #[serde(default = "web_port")]
+    pub port: u16,
+    /// When set, `Tailscale-User-Login` must be one of these. It turns strangers on a shared
+    /// tailnet away; it never signs anyone in.
+    #[serde(default)]
+    pub tailnet_users: Vec<String>,
+}
+
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -383,7 +428,8 @@ impl Config {
 
     /// A reloaded file keeps the running daemon's values of the fields no file sets (`tick`,
     /// `stall_limit`, `min_until`, `job_timeout`, `exec_backstop`, `path`, `projects`,
-    /// `agent_browser`): a reload changes settings, never these (R30).
+    /// `agent_browser`, `push_hosts`, `web_lockout`, `web_ping`): a reload changes settings,
+    /// never these (R30).
     pub fn keep_hidden(&mut self, running: &Config) {
         self.job_timeout = running.job_timeout;
         self.exec_backstop = running.exec_backstop;
@@ -394,6 +440,10 @@ impl Config {
         self.projects = running.projects.clone();
         self.agent_browser = running.agent_browser.clone();
         self.floor = running.floor;
+        self.push_hosts = running.push_hosts.clone();
+        self.web_off_floor = running.web_off_floor;
+        self.web_lockout = running.web_lockout;
+        self.web_ping = running.web_ping;
     }
 
     /// Account names become directory names, so each must be a plain, unique path segment.
@@ -528,6 +578,19 @@ impl Config {
         }
         crate::egress::parse_allow(&self.network.allow)
             .map_err(|e| anyhow::anyhow!("network.allow: {e}"))?;
+        if let Some(web) = &self.web {
+            // A bare name: it is compared with Host and put in the CSP and the cookie's origin.
+            let label = |l: &str| {
+                !l.is_empty()
+                    && (l.bytes())
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            };
+            anyhow::ensure!(
+                web.host.split('.').all(label),
+                "[web] host is the tailnet name alone, like box.tail1234.ts.net: lowercase, \
+                 no scheme, port, path or trailing dot"
+            );
+        }
         crate::scheduler::zone(self)?;
         Ok(())
     }
@@ -560,8 +623,8 @@ impl Config {
     }
 
     pub fn is_owner(&self, channel: &str, sender: &str) -> bool {
-        // The attach token already proved the sender is the owner.
-        channel == crate::attach::CHANNEL
+        // The attach token, or the web app's session cookie, already proved the sender is the owner.
+        crate::attach::attached(channel)
             || self
                 .owners
                 .get(channel)
@@ -727,10 +790,10 @@ prompt = "Build it."
     }
 
     #[test]
-    fn strong_channels_default_to_the_tui_and_chat_and_keep_the_tui() {
+    fn strong_channels_default_to_the_tui_chat_and_passkey_and_keep_the_tui() {
         let base = "rpi = 'a'\nhome = 'b'\n";
         let cfg: Config = toml::from_str(base).unwrap();
-        assert_eq!(cfg.settings.strong_channels, ["tui", "chat"]);
+        assert_eq!(cfg.settings.strong_channels, ["tui", "chat", "passkey"]);
         let with = |text: &str| -> Config { toml::from_str(&format!("{base}{text}")).unwrap() };
         with("[settings]\nstrong_channels = ['tui']\n")
             .validate()
@@ -740,6 +803,52 @@ prompt = "Build it."
             assert!(cfg.validate().is_err(), "{bad}");
         }
         assert!(toml::from_str::<Config>(&format!("{base}[settings]\ntypo = 1\n")).is_err());
+    }
+
+    #[test]
+    fn strong_channels_may_name_web_and_passkey() {
+        let cfg: Config = toml::from_str(
+            "rpi = 'a'\nhome = 'b'\n[settings]\nstrong_channels = ['tui', 'web', 'passkey']\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn a_web_section_needs_a_bare_host() {
+        let base = "rpi = 'a'\nhome = 'b'\n";
+        let with = |text: &str| -> Config { toml::from_str(&format!("{base}{text}")).unwrap() };
+        let cfg = with("[web]\nhost = 'box.tail1234.ts.net'\n");
+        cfg.validate().unwrap();
+        let web = cfg.web.unwrap();
+        assert_eq!((web.port, web.tailnet_users.len()), (7793, 0));
+        let cfg = with("[web]\nhost = 'h'\nport = 8000\ntailnet_users = ['owner@github']\n");
+        cfg.validate().unwrap();
+        assert_eq!(cfg.web.unwrap().port, 8000);
+        for bad in [
+            "https://x",
+            "x:443",
+            "x/",
+            "x.",
+            "",
+            "X.ts.net",
+            "x y",
+            "x_y",
+            "exämple.net",
+        ] {
+            let cfg = with(&format!("[web]\nhost = {bad:?}\n"));
+            assert!(cfg.validate().is_err(), "{bad}");
+        }
+        assert!(toml::from_str::<Config>(&format!("{base}[web]\nhost = 'h'\ntypo = 1\n")).is_err());
+        assert!(
+            toml::from_str::<Config>(&format!("{base}[web]\nport = 1\n")).is_err(),
+            "no host"
+        );
+        // The fields no file sets.
+        let cfg: Config = toml::from_str(base).unwrap();
+        assert!(cfg.web.is_none() && cfg.push_hosts.is_empty());
+        assert_eq!(cfg.web_lockout, std::time::Duration::from_secs(15 * 60));
+        assert_eq!(cfg.web_ping, std::time::Duration::from_secs(30));
     }
 
     #[test]

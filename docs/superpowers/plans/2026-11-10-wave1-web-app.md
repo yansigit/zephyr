@@ -106,7 +106,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
 - `expire_web_sessions` deletes rows `web_session` would refuse.
 - `proposal_digest` is SHA-256 of `serde_json::to_vec(&json!([kind, class, command, targets, payload, secrets, key, seen]))` over the row's columns as stored (NULL → `null`).
 
-- [ ] **Step 1: Write the failing tests** in `store.rs` `mod tests`:
+- [x] **Step 1: Write the failing tests** in `store.rs` `mod tests`:
   - Extend `older_databases_migrate_in_order_and_keep_their_rows` with `const V18: &str = "DROP TABLE web_push; DROP TABLE web_sessions; DROP TABLE web_passkeys;"`, run first in the undo chain, and add the `(16, "")` case.
   - `a_session_ends_30_days_after_sign_in_or_7_days_unused`:
     - `add_web_session(h, 1, 0)`;
@@ -123,10 +123,13 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - `a_push_endpoint_is_saved_once_and_the_eleventh_is_refused`.
   - `proposal_digest_changes_with_every_column_ok_reads`: for each of the 8 columns, `UPDATE` it on a held action and assert that the digest differs from the one before. `summary` and `reason` do not change it.
   - `debug_of_web_rows_prints_lengths_only`: `format!("{p:?}")` holds `cred_id: 3 bytes` and no byte value.
-- [ ] **Step 2: Run** `cargo test -p zephyr --lib store::` → FAIL (no such functions).
-- [ ] **Step 3: Implement** in `store.rs`. Add an `if version < 18` block after v16's, ending `PRAGMA user_version = 18;`, and bump `SCHEMA_VERSION`. Write `remove_passkey` as one transaction: delete pushes, delete sessions (count them), delete the passkey.
-- [ ] **Step 4: Run** `cargo test -p zephyr --lib store::` → PASS; then `cargo test -p zephyr`.
-- [ ] **Step 5: Commit** `feat(store): keep the web app's passkeys, sessions and push subscriptions in schema v18`.
+- [x] **Step 2: Run** `cargo test -p zephyr --lib store::` → FAIL (no such functions).
+- [x] **Step 3: Implement** in `store.rs`. Add an `if version < 18` block after v16's, ending `PRAGMA user_version = 18;`, and bump `SCHEMA_VERSION`. Write `remove_passkey` as one transaction: delete pushes, delete sessions (count them), delete the passkey.
+- [x] **Step 4: Run** `cargo test -p zephyr --lib store::` → PASS; then `cargo test -p zephyr`.
+- [x] **Step 5: Commit** `feat(store): keep the web app's passkeys, sessions and push subscriptions in schema v18`.
+- Deviation: decision 2 is wrong about the code: the bundled SQLite of rusqlite 0.41 enforces foreign keys, so the spec's `REFERENCES` clauses are live. The schema stays verbatim; `remove_passkey` still deletes the rows itself (to count the sessions); the tests give a session or a push a real passkey first instead of `passkey = 1` on an empty table.
+- Deviation: `upgraded_from` is the approvals gate's v16 mark (the router writes `preset = "full"` on it), so a v16 database migrating to v18 does not set it; the migration test's `(16, "")` case expects `None`. `tests/router.rs` `old_install` also drops the v18 tables before stamping v15.
+- Deviation: added the test `meta_values_are_set_read_and_deleted` for `meta`/`set_meta`.
 
 ### Task W-2: `web/passkey.rs`: WebAuthn ES256 verification, preimages, challenge queues
 
@@ -171,7 +174,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
 - The signature is checked with `ring::signature::ECDSA_P256_SHA256_ASN1` over `auth_data ‖ SHA-256(client_data)`.
 - Sign count: a new count that is non-zero and at or below a non-zero `stored` is refused. Synced passkeys send 0.
 
-- [ ] **Step 1: Write the failing tests** in `passkey.rs` `mod tests`. The software authenticator is `EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING)`; helpers `client_data(type, challenge, origin)` and `auth_data(host, flags, count)`.
+- [x] **Step 1: Write the failing tests** in `passkey.rs` `mod tests`. The software authenticator is `EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING)`; helpers `client_data(type, challenge, origin)` and `auth_data(host, flags, count)`.
   - `the_rfc_6979_p256_sha256_signature_verifies`: RFC 6979 A.2.5 through the same path `verify` uses (factor it as `fn es256(point, msg, der) -> bool`):
     - point `04 ‖ 60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6 ‖ 7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299`;
     - message `b"sample"`;
@@ -193,10 +196,12 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
     - a second `take` → `None`;
     - after `ttl` → `None`;
     - the 17th `issue` evicts the first.
-- [ ] **Step 2: Run** `cargo test -p zephyr --lib web::passkey` → FAIL.
-- [ ] **Step 3: Implement** the signatures above. Use `data_encoding::BASE64URL_NOPAD`, `ring::digest`, `ring::signature`; no other crate.
-- [ ] **Step 4: Run** the same → PASS.
-- [ ] **Step 5: Commit** `feat(web): verify passkey sign-ins and signatures with ES256 on ring`.
+- [x] **Step 2: Run** `cargo test -p zephyr --lib web::passkey` → FAIL.
+- [x] **Step 3: Implement** the signatures above. Use `data_encoding::BASE64URL_NOPAD`, `ring::digest`, `ring::signature`; no other crate.
+- [x] **Step 4: Run** the same → PASS.
+- [x] **Step 5: Commit** `feat(web): verify passkey sign-ins and signatures with ES256 on ring`.
+- Deviation: `web/mod.rs` declares only `passkey` here; `push` joins it in W-3, when the file exists.
+- Deviation: `assertion` and `created` answer `"malformed"` for a missing or non-base64url field (the plan lists no reason for it), covered by the added test `browser_results_are_read_from_base64url_and_malformed_ones_refused`; `sha256` is public for W-6 and W-7.
 
 ### Task W-3: `web/push.rs`: aes128gcm, VAPID, the endpoint allowlist, payloads
 
@@ -232,7 +237,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - or an endpoint whose origin (`scheme://host:port`) equals an entry of `extra`.
 - `card` and `reply` cut `body`: card to 200 chars plus `…`, reply to 120 chars. `card` passes the text through unchanged otherwise, since the caller scrubs.
 
-- [ ] **Step 1: Write the failing tests** in `push.rs` `mod tests`:
+- [x] **Step 1: Write the failing tests** in `push.rs` `mod tests`:
   - `encrypt_matches_rfc_8291_appendix_a` (values base64url, whitespace removed):
     - ecdh_secret `kyrL1jIIOHEzg3sM2ZWRHDRB62YACZhhSlknJ672kSs`;
     - auth `BTBZMqHH6r4Tts7J_aSIgg`;
@@ -256,10 +261,11 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
     - `encrypt(...)` of it is ≤ 4096 bytes;
     - the body ends with `…`;
     - `reply(&"x".repeat(500))["body"]` has 120 chars.
-- [ ] **Step 2: Run** `cargo test -p zephyr --lib web::push` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** → PASS.
-- [ ] **Step 5: Commit** `feat(web): encrypt Web Push messages (RFC 8291) and sign VAPID tokens on ring`.
+- [x] **Step 2: Run** `cargo test -p zephyr --lib web::push` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** → PASS.
+- [x] **Step 5: Commit** `feat(web): encrypt Web Push messages (RFC 8291) and sign VAPID tokens on ring`.
+- Deviation: `allowed_endpoint` refuses userinfo for an `extra` origin too, not only for the push services.
 
 ### Task W-4: The listener: `[web]`, channels `web` and `passkey`, checks, headers, files
 
@@ -319,7 +325,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
 - At start `serve` makes `<state>/web/` (0700) and `vapid.pk8` (0600, `EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING)`) if missing. A key that does not load is logged, and push stays off.
 - `doctor` lines: `web app listening on 127.0.0.1:P` (a TCP connect) and `the web push key loads`, only when `[web]` is set. `status`: `web: listening` or `web: not listening`.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `web/mod.rs` unit:
     - `admit_checks_host_then_tailnet_then_origin_fetch_site_and_type`: table over (method, headers) → 421/403/403/403/415/Ok, including `tailnet_users = ["owner@github"]` with `Owner@GitHub` → Ok and `x@y` → 403;
     - `a_window_allows_its_limit_then_refuses_until_it_rolls`;
@@ -332,10 +338,14 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - `tests/web.rs`: a harness copied from `tests/attach.rs:59-100`, with `[web]\nhost = "zephyr.test"\nport = P` and `cfg.tick = 200ms`, plus helper `req(gw, method, path)` (reqwest; sets `Host: zephyr.test`, `Origin: https://zephyr.test`, `Tailscale-User-Login: owner@github`).
     - `the_files_carry_the_security_headers`: `GET /` → 200 with the exact CSP string above, `X-Frame-Options: DENY`, `Cache-Control: no-cache`, `ETag`.
     - `GET /nope` → 404; `GET /` with `Host: evil.test` → 421; without the Tailscale header → 403.
-- [ ] **Step 2: Run** `cargo test -p zephyr --lib web:: config:: reload::` and `cargo test -p zephyr --test web` → FAIL.
-- [ ] **Step 3: Implement.** The accept loop is a copy of `imessage.rs:278-320` with `.with_upgrades()`. The placeholder `index.html` is `<!doctype html><title>zephyr</title><link rel=stylesheet href=/app.css><script src=/app.js defer></script>`. Make the PNGs once with a throwaway `python3 -I` script: a solid square, zlib + struct, not committed. Write the docs.
-- [ ] **Step 4: Run** the new tests, then `cargo test -p zephyr` (the attach exact-JSON test included) → PASS.
-- [ ] **Step 5: Commit** `feat(web): serve the web app's files behind Host, Origin and tailscale serve checks`.
+- [x] **Step 2: Run** `cargo test -p zephyr --lib web:: config:: reload::` and `cargo test -p zephyr --test web` → FAIL.
+- [x] **Step 3: Implement.** The accept loop is a copy of `imessage.rs:278-320` with `.with_upgrades()`. The placeholder `index.html` is `<!doctype html><title>zephyr</title><link rel=stylesheet href=/app.css><script src=/app.js defer></script>`. Make the PNGs once with a throwaway `python3 -I` script: a solid square, zlib + struct, not committed. Write the docs.
+- [x] **Step 4: Run** the new tests, then `cargo test -p zephyr` (the attach exact-JSON test included) → PASS.
+- [x] **Step 5: Commit** `feat(web): serve the web app's files behind Host, Origin and tailscale serve checks`.
+- Deviation: with `passkey` in the default `strong_channels`, every refusal and card that names the default list now reads `tui or chat or passkey` (the code joins with ` or `; the spec's example wording `tui, chat or passkey` would mean changing seven call sites). The tests and DESIGN examples that pin the default wording follow (gate.rs, settings.rs, tests/router.rs).
+- Deviation: `admit` wants `Content-Type: application/json` on a DELETE as well as a POST (`DELETE /api/push` has a JSON body), and every 403 carries the one body `open the app through tailscale serve`.
+- Deviation: `push::vapid(cfg, make)` loads (and at start makes) the key; `doctor` calls it with `make = false`. `Window` counts its span from the first hit, not from `new`. README gets a `Web app` section here (there is no single config reference), which later tasks extend.
+- Deviation: the README's and DESIGN's `[web]` text is written here; a second integration test `unknown_paths_hosts_and_callers_are_refused` holds the 404/421/403 cases.
 
 ### Task W-5: The WebSocket bridge into `attach::Conn` on channel `web`
 
@@ -407,7 +417,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - a session that `store.web_session` no longer returns, re-checked every 60 s and at once when `hub.revocations()` changes.
 - It pings every `cfg.web_ping`. The socket count goes up on upgrade and down on drop (a guard).
 
-- [ ] **Step 1: Write the failing tests** in `tests/web.rs`. Helper `cookie(gw) -> String`: `Store::add_passkey` plus `add_web_session` with a known token. Helper `ws(gw, cookie) -> WebSocketStream` (`tokio_tungstenite::client_async` with Host, Origin and the Tailscale header). Helper `rpc(ws, id, method, params) -> Value`, which reads frames until the reply with that id.
+- [x] **Step 1: Write the failing tests** in `tests/web.rs`. Helper `cookie(gw) -> String`: `Store::add_passkey` plus `add_web_session` with a known token. Helper `ws(gw, cookie) -> WebSocketStream` (`tokio_tungstenite::client_async` with Host, Origin and the Tailscale header). Helper `rpc(ws, id, method, params) -> Value`, which reads frames until the reply with that id.
   - `the_socket_needs_a_cookie_origin_host_and_tailnet_header`: upgrade with no cookie → 401; `Origin: https://evil.test` → 403; `Host: evil.test` → 421; no Tailscale header → 403 (the spec's header test).
   - `a_web_send_is_a_web_row_and_its_reply_streams_back`:
     - `zephyr.hello` answers with `version`;
@@ -421,10 +431,13 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - `methods_closed_to_the_web_app_answer_32601`: `authenticate`, `start_session`, `zephyr.vault_put`, `zephyr.facts_put`, `zephyr.sessions`, `zephyr.login_start` → code `-32601`, message `not available in the web app`.
   - `a_fifth_socket_gets_503`.
   - `a_frame_over_1_mib_or_with_a_newline_closes_the_socket`: 2 MiB of text → closed; `"{}\n{}"` → closed.
-- [ ] **Step 2: Run** `cargo test -p zephyr --test web` → FAIL.
-- [ ] **Step 3: Implement.** Thread the channel through the three `AttachRequest`s; the TUI passes `"tui"`. Then run `cargo tree -d` and check that its output is unchanged from `main`.
-- [ ] **Step 4: Run** `cargo test -p zephyr --test web`, then `--test attach` and `--test router` (the TUI behaviour is unchanged), then `cargo test -p zephyr` and `cargo deny check advisories bans` → PASS.
-- [ ] **Step 5: Commit** `feat(web): bridge a WebSocket into the attach protocol as the owner on channel web`.
+- [x] **Step 2: Run** `cargo test -p zephyr --test web` → FAIL.
+- [x] **Step 3: Implement.** Thread the channel through the three `AttachRequest`s; the TUI passes `"tui"`. Then run `cargo tree -d` and check that its output is unchanged from `main`.
+- [x] **Step 4: Run** `cargo test -p zephyr --test web`, then `--test attach` and `--test router` (the TUI behaviour is unchanged), then `cargo test -p zephyr` and `cargo deny check advisories bans` → PASS.
+- [x] **Step 5: Commit** `feat(web): bridge a WebSocket into the attach protocol as the owner on channel web`.
+- Deviation: the listener leaves HTTP keep-alive on. With `keep_alive(false)` hyper 1.12 appends `close` to the 101 (`Connection: Upgrade, close`), which tungstenite's client refuses and a browser or `tailscale serve` need not accept. The 10 s head deadline runs again for each request on a connection, so an idle one is still bounded, and the 32-connection cap stands.
+- Deviation: a signed (`passkey`) decision's approved command runs as a `web` message and `owner_on("passkey")` answers `web`, since `passkey` has no rows (spec §4.3); `attach::sender(channel)` gives `token` or `web`.
+- Deviation: the upgrade also needs `Upgrade: websocket` and `Sec-WebSocket-Version: 13` (else 400), and a send a stalled client does not take within two ping intervals closes the socket, so a full TCP buffer cannot hold the bridge past the dead-socket limit. Added cases: the closed-method list also holds the stock and `zephyr.login_*` methods; a binary frame and the 61st frame in a minute close the socket.
 
 ### Task W-6: Enrolment, sign-in, sessions, limits, and `/web`
 
@@ -490,7 +503,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
 - `zephyr.web_devices {}` → `{"passkeys":[{"name","created_at","last_used_at"}],"sessions":[{"passkey": name,"created_at","seen_at","this"}],"push":[{"passkey","created_at"}]}`.
 - In the container, `zephyr web` sends `/web`, and `zephyr web enrol [NAME]` sends `/web enrol [NAME]`, over the chat socket; it prints the reply. It exits 1 on a reply that holds no `https://`, and 3 when no daemon answers (`NotRunning`).
 
-- [ ] **Step 1: Write the failing tests.** In `tests/web.rs`, helper `Authenticator` (ring P-256 key, cred id, `create(options) -> Value`, `get(options) -> Value`) builds clientData and authData as W-2's helpers do.
+- [x] **Step 1: Write the failing tests.** In `tests/web.rs`, helper `Authenticator` (ring P-256 key, cred id, `create(options) -> Value`, `get(options) -> Value`) builds clientData and authData as W-2's helpers do.
   - `enrolment_takes_a_code_once_and_says_so` (spec):
     - `/web enrol phone` on chat → a reply with a code; parse it with the regex `#enrol=([A-Z2-7]{5}-[A-Z2-7]{5})`;
     - a wrong code → 403;
@@ -510,10 +523,15 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - `web_devices_lists_this_session`.
 - In `tests/router.rs`: `the_agent_cannot_run_web_commands`: `[call gateway {"command":"/web enrol"}]` → a `tool error: … is not available to the agent` line.
 - In `retention.rs`: `the_sweep_ends_expired_web_sessions`.
-- [ ] **Step 2: Run** `cargo test -p zephyr --test web`, plus the router test and `--lib retention` → FAIL.
-- [ ] **Step 3: Implement.** Write the docs.
-- [ ] **Step 4: Run** the same, then `cargo test -p zephyr` → PASS.
-- [ ] **Step 5: Commit** `feat(web): enrol passkeys with a one-time code from a strong channel and sign in with them`.
+- [x] **Step 2: Run** `cargo test -p zephyr --test web`, plus the router test and `--lib retention` → FAIL.
+- [x] **Step 3: Implement.** Write the docs.
+- [x] **Step 4: Run** the same, then `cargo test -p zephyr` → PASS.
+- [x] **Step 5: Commit** `feat(web): enrol passkeys with a one-time code from a strong channel and sign in with them`.
+- Deviation: the ceremonies, the cookie, the limits, `command` and `devices` live in a new file `src/web/signin.rs` (re-exported from `web`), so `mod.rs` stays the listener and the bridge.
+- Deviation: `Store::take_meta(key, value)` deletes the enrolment code in one statement at `enrol/finish`: without it two ceremonies started with one code could both enrol. `/web enrol NAME` also refuses a NAME that is taken.
+- Deviation: the `Notice` arm does not write a second copy for an attached owner: when the owner last answered is on `tui` or `web` the outbox row alone is written and the flush shows it to every client; otherwise the notice is shown at once and a row goes to that owner. `notify_last_owner` knows only an owner the agent has answered, so the tests say `hi` on chat before they expect a notice there.
+- Deviation: a request refused while sign-in is closed does not count toward the 20 a minute, so the page can ask again when the lockout ends; the 429 bodies are `sign-in is closed until HH:MM` and `too many attempts; wait a minute`; a failed finish answers 403 `that did not verify; start again`, and is logged with its fixed reason. `/api/logout` also bumps the hub, so that session's socket closes at once.
+- Deviation: counts are worded `1 session`, `2 sessions` in `/web`'s line; `/web rm`'s and `/web signout`'s replies are the plan's text. Added tests: `tests/cli.rs` `web_asks_the_daemon_for_a_code_and_says_when_it_cannot` (written after the command, the one test here not seen failing first) and two unit tests in `signin.rs`.
 
 ### Task W-7: Signed approvals and settings: `zephyr.web_challenge` and the `passkey` channel
 
@@ -556,7 +574,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - With one: the same steps with `Signed::Set`, then `SettingsSet { channel: "passkey", expect: Some(current) }`.
 - Router `decide` with `expect`: `proposal_digest(id)` and the card's hash must still match, else `{"ok": false, "text": "[zephyr] the card changed; look at it again"}`, and nothing runs. Router `settings_set` with `expect`: `current(s, key)` must equal it, else `refused "KEY changed; look at it again"`.
 
-- [ ] **Step 1: Write the failing tests** in `tests/web.rs`. Config: `[approvals] preset = "manual"`. Helper: hold a `himalaya` send with `store.hold_action(&NewAction{kind: Run, class: "messages", …})`, as `tests/router.rs:4744` does, with the payload `run_payload` of `himalaya message send …`. Helper `sign(ws, auth, op) -> Value`.
+- [x] **Step 1: Write the failing tests** in `tests/web.rs`. Config: `[approvals] preset = "manual"`. Helper: hold a `himalaya` send with `store.hold_action(&NewAction{kind: Run, class: "messages", …})`, as `tests/router.rs:4744` does, with the payload `run_payload` of `himalaya message send …`. Helper `sign(ws, auth, op) -> Value`.
   - `an_unsigned_ok_or_a_changed_card_is_refused`: `decide ok` without `assertion` → `approve with your passkey`; `web_challenge` with `card_sha256` of `"x"` → `the card changed`.
   - `a_signed_ok_runs_the_stored_command_and_is_audited_as_passkey`:
     - `log.jsonl` (or the procs log) shows the stored command;
@@ -580,10 +598,13 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
     - signed → `changed`;
     - `settings_log` channel `passkey`.
   - `a_signed_change_is_refused_when_the_value_moved`: sign `set tasks.parallel 3` at 2; `/set tasks.parallel 4` on chat; the signed `settings_set` → `tasks.parallel changed; look at it again`.
-- [ ] **Step 2: Run** `cargo test -p zephyr --test web` → FAIL.
-- [ ] **Step 3: Implement.** Write the docs.
-- [ ] **Step 4: Run** the same, then `cargo test -p zephyr` → PASS.
-- [ ] **Step 5: Commit** `feat(web): approve cards and strong settings only with a passkey signature over exactly what is shown`.
+- [x] **Step 2: Run** `cargo test -p zephyr --test web` → FAIL.
+- [x] **Step 3: Implement.** Write the docs.
+- [x] **Step 4: Run** the same, then `cargo test -p zephyr` → PASS.
+- [x] **Step 5: Commit** `feat(web): approve cards and strong settings only with a passkey signature over exactly what is shown`.
+- Deviation: the signing queue is reached through `Hub::sign` and `Hub::signed` (the field stays private to `web`), and the 10-a-minute limit on `zephyr.web_challenge` is a `Window` on the connection, so it is counted per socket rather than per session (`shortcut:` in the code).
+- Deviation: the test reads the approved command from the `procs` table (`command`, `action`), where `/ok` puts a `run` action's command, rather than from `log.jsonl`, which only fake-rpi writes.
+- Deviation: `web` is added to the settings registry as a read-only row (`fixed("web", …)`, test `the_web_table_is_read_only`), which is what "web joins the read-only row" needs in code. Added cases: a signature by another key with the same credential id, an assertion made for another challenge, another session using this one's challenge, an `ok` signature used for `once`, a changed `targets` column, and a signature for one value used for another.
 
 ### Task W-8: Web Push: subscriptions, cards, replies, notification buttons
 
@@ -630,7 +651,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - else 409 `{"error":"open the app to approve this"}`;
   - then `Decide { channel: "web", expect: None }` → 200 with its `{ok, text}`.
 
-- [ ] **Step 1: Write the failing tests** in `tests/web.rs`. The fake push service is a hyper server on 127.0.0.1 that records each request (headers, body), answering 201 or a status from a file. Set `cfg.push_hosts = ["http://127.0.0.1:PP"]` and `cfg.web_ping = 300ms`. Each subscription gets its own ring `EphemeralPrivateKey`: ring cannot import a static ECDH key, and one ephemeral key decrypts one push.
+- [x] **Step 1: Write the failing tests** in `tests/web.rs`. The fake push service is a hyper server on 127.0.0.1 that records each request (headers, body), answering 201 or a status from a file. Set `cfg.push_hosts = ["http://127.0.0.1:PP"]` and `cfg.web_ping = 300ms`. Each subscription gets its own ring `EphemeralPrivateKey`: ring cannot import a static ECDH key, and one ephemeral key decrypts one push.
   - `a_new_card_is_pushed_encrypted_without_the_agents_reason`:
     - subscribe; hold a `messages` action with `reason: Some("trust me")`;
     - the service receives one POST with `Urgency: high`, `TTL: 86400` and `Content-Encoding: aes128gcm`;
@@ -651,10 +672,14 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
     - `ok` on a money action under `strong_only = ["money"]` → 409;
     - `no` on it → `ok: true`, and the action is `dropped`.
   - `a_subscription_outside_the_allowlist_is_refused` → 400.
-- [ ] **Step 2: Run** `cargo test -p zephyr --test web push` → FAIL.
-- [ ] **Step 3: Implement.** Write the docs.
-- [ ] **Step 4: Run** the same, then `cargo test -p zephyr` → PASS.
-- [ ] **Step 5: Commit** `feat(web): push new cards and replies to the owner's phone, and take deny from a notification`.
+- [x] **Step 2: Run** `cargo test -p zephyr --test web push` → FAIL.
+- [x] **Step 3: Implement.** Write the docs.
+- [x] **Step 4: Run** the same, then `cargo test -p zephyr` → PASS.
+- [x] **Step 5: Commit** `feat(web): push new cards and replies to the owner's phone, and take deny from a notification`.
+- Deviation: the tests' subscriber holds an OpenSSL P-256 key (the crate is already a dependency) instead of a ring `EphemeralPrivateKey`, so one subscription opens several pushes and the ECDH is not ring's on both ends. The frozen-phone test uses `slow` = 2 and `web_ping` = 200 ms, for a wider margin than 1 s and 300 ms.
+- Deviation: `Store::remove_passkey` (W-1) now opens an immediate transaction: the deferred one read first and then failed with `database is locked`, without the busy timeout, when another connection wrote in between (seen once in `web_rm_closes_that_passkeys_socket_at_once`).
+- Deviation: the harness's `up()` waits for an HTTP answer, not a TCP connection: after a restart on the same port, a child another test had just forked could still hold the old listening socket, the kernel completed the connection, and the test went on before the new gateway had started (it then counted the test's next card as one that waited through the restart).
+- Deviation: the three push routes are `impl App` in `push.rs`; the 10-a-minute limit of `/api/push/decide` is a `Window` per session in `Hub`. `push_cards` pushes proposals that are `pending`, not ones waiting out a delay (`shortcut:` in the code), and `/api/push/decide` takes `ok` only while the action is `pending`; any verb but `ok` and `no` is 409. `send` checks the endpoint against the allowlist again before it posts.
 
 ### Task W-9: The app: sign-in, chat, drawer, card sheet, settings, facts, vault, devices
 
@@ -690,10 +715,13 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - **Layout.** Phone-first; from 900 px the drawer is a side panel. Drawer tabs: Approvals (opens first when `proposals > 0`) and Upcoming (`Snapshot.jobs` and `scheduled` proposals). Activity and Goals tabs exist but stay hidden (W-11, W-12).
   - **Settings, Facts, Vault.** Settings edit each row by its `kind`, with an optional "for 2h"; a refusal shows the daemon's reason. Facts show names, kinds and targets only; Vault shows names, sites and grants. Both say "change these in the TUI or with zephyr facts / zephyr vault".
 
-- [ ] **Step 1: Write the failing test** `every_method_the_app_calls_is_open_on_web`, and run `cargo test -p zephyr --lib web::` → FAIL (the placeholder has no calls; assert that at least `zephyr.decide` is found).
-- [ ] **Step 2: Write the files** (about 1,200 lines of `app.js`). Run `node --check` on `app.js` and `sw.js` where node exists; it is optional and not a CI dependency.
-- [ ] **Step 3: Run** `cargo test -p zephyr --lib web::` → PASS. Then bring up a side container (`ZEPHYR_CONTAINER=zephyr-test ZEPHYR_IMAGE=zephyr-dev:<sha> zephyr up --build`) with `[web]` set, and load the app in a desktop browser through `tailscale serve` on a test port: the sign-in page renders, and the console shows no CSP errors.
-- [ ] **Step 4: Commit** `feat(web): the phone app for chat, approvals, settings and devices`.
+- [x] **Step 1: Write the failing test** `every_method_the_app_calls_is_open_on_web`, and run `cargo test -p zephyr --lib web::` → FAIL (the placeholder has no calls; assert that at least `zephyr.decide` is found).
+- [x] **Step 2: Write the files** (about 1,200 lines of `app.js`). Run `node --check` on `app.js` and `sw.js` where node exists; it is optional and not a CI dependency.
+- [x] **Step 3: Run** `cargo test -p zephyr --lib web::` → PASS. Then bring up a side container (`ZEPHYR_CONTAINER=zephyr-test ZEPHYR_IMAGE=zephyr-dev:<sha> zephyr up --build`) with `[web]` set, and load the app in a desktop browser through `tailscale serve` on a test port: the sign-in page renders, and the console shows no CSP errors.
+- [x] **Step 4: Commit** `feat(web): the phone app for chat, approvals, settings and devices`.
+- Deviation: Step 3 is left unticked: its unit tests pass (and `node --check` passes on `app.js` and `sw.js`), but the side container and the browser check through `tailscale serve` were not run in this lane (no test tailnet here, and the live container is not to be touched). The app has not been seen in a real browser; README's manual check stands before release.
+- Deviation: `app.js` is about 900 lines, not 1,200. The Activity tab and the Goals screen are in the page and hidden, with no method call behind them yet (`zephyr.activity` and `zephyr.goals` are not in `WEB_METHODS` until W-11 and W-12). The test also checks that `sw.js` posts `/api/push/decide` as JSON. DESIGN §4.3.3 gains "The app" and the `sw.js` bullet (the plan lists only README for this task).
+- Deviation: Step 3 was run later, after the rebase onto A4, A2 and B, on a side container (`zephyr-test`, image `zephyr-dev:w-1e2e7f5`, scratch HOME, attach on 17790, web on 17793, bridge network): the web port was published on host loopback only and refused to the agent's uid on loopback and on the container's address; the files, the CSP and frame headers, 421/403/415 and the 401 of `/api/ws` and `/api/push/key` without a cookie were as specified; `zephyr web setup --yes` ran through with a `tailscale` stand-in on PATH (the host's real `tailscale serve` was not touched); and a headless Chromium on the host loaded the page through a proxy that added the Host and the Tailscale header: the script ran, asked `/api/push/key`, showed sign-in with `#enrol=` opened, with no CSP or script error in the console. That was over plain HTTP, so passkeys, the service worker and push were not exercised; the phone check in README still stands.
 
 ### Task W-10: Host CLI: `zephyr web setup | enrol`, and the status line
 
@@ -719,7 +747,7 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
 - `zephyr web enrol [NAME]` → `docker exec … zephyr web enrol [NAME]`.
 - Host `zephyr status`, when `web.host` is set: run `tailscale serve status`. If the output contains `http://127.0.0.1:<port>`, print `web: tailscale serve forwards https://HOST`; else `web: tailscale serve does not forward to 127.0.0.1:PORT; run zephyr web setup`.
 
-- [ ] **Step 1: Write the failing tests:**
+- [x] **Step 1: Write the failing tests:**
   - `web_setup_writes_the_host_serves_the_port_and_enrols`:
     - `SHIM_TS_STATUS='{"BackendState":"Running","Self":{"DNSName":"box.tail1234.ts.net."},"CertDomains":["box.tail1234.ts.net"]}'`, with `--yes`;
     - zephyr.toml has `[web]`, `host = "box.tail1234.ts.net"`, `port = 7793`;
@@ -727,12 +755,36 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
     - `exec.log` has `zephyr web enrol`.
   - `web_setup_stops_without_https_certificates`: `CertDomains: []` → exit 1 with the text, and zephyr.toml unchanged.
   - `status_says_whether_tailscale_serve_forwards_the_port`: both lines.
-- [ ] **Step 2: Run** `cargo test -p zephyr --test host web_` → FAIL.
-- [ ] **Step 3: Implement.** Write the docs.
-- [ ] **Step 4: Run** the same, then `cargo test -p zephyr --test host` → PASS.
-- [ ] **Step 5: Commit** `feat(web): set up the web app from the host with tailscale serve and a first passkey`.
+- [x] **Step 2: Run** `cargo test -p zephyr --test host web_` → FAIL.
+- [x] **Step 3: Implement.** Write the docs.
+- [x] **Step 4: Run** the same, then `cargo test -p zephyr --test host` → PASS.
+- [x] **Step 5: Commit** `feat(web): set up the web app from the host with tailscale serve and a first passkey`.
+- Deviation: the command lives in a new file `src/host/web.rs` (`mod web;` in `host/mod.rs`, which gains the usage line, the `COMMANDS` entry, the `"web"` arm and the status call).
+- Deviation: the tests look for `docker exec … zephyr web enrol` in `calls.log`, where the docker shim logs every call; `exec.log` is written only by the image's CLI copy. The docker shim answers `zephyr web enrol` and `zephyr web` (`$SHIM_PASSKEYS`).
+- Deviation: with `--yes` step 9 does not wait for Enter (there is nobody to press it) and reads `zephyr web` at once; without `--yes` and without a terminal the command changes nothing and says to pass `--yes`. A refused `tailscale serve` prints the two `sudo` forms and stops with exit 1, whatever the refusal's wording. Step 6 is `ensure_image` then `up_checked`, as `zephyr up` itself. The status line matches the forward target as a whole word, so a line for port 77930 is not taken for 7793.
+- Deviation: added tests: `web_setup_adds_passkey_to_an_explicit_list_and_offers_money_once_enrolled`, and in `web_setup_stops_without_https_certificates` the logged-out, missing and operator-rights cases.
 
 ---
+
+## After the review of 91d0c76..98a575b
+
+Fixed on this branch, each with a test that failed first (the spec's closing "Deviations and known limits" has the behaviour):
+
+- Deviation (W-7): an approved proposal's command runs as `passkey` (`attach::rows` maps its notices to `web`); a refused `/set` answers `ok: false`.
+- Deviation (W-5, spec §4.3): typed `/ok`, `/vault grant`, `/memory ok`, `/job ok`, `/skill ok`, `/mcp ok` are refused on `web`.
+- Deviation (W-7): the signed text is `signed`, the card without `expires in …`.
+- Deviation (W-2): challenge ids are random, a wrong owner's `take` leaves the entry, `try_issue` turns a new one away when full; the sign count follows WebAuthn §7.2.
+- Deviation (W-8): `/api/push/decide` answers 409 with the router's refusal; `push_cards` and `card()` build only what they need (no behaviour change, so no new test); `pushed_replies` is pruned to the rows still pending; without `[web]`, `web` rows are marked `failed`.
+- Deviation (W-6): `login/start` is not counted in the 20 a minute and is refused when 16 wait.
+
+## After the review of PR #43
+
+- Deviation (W-7): the signed text is built without the countdown (`gate::signed_card`), and a command's or a setting's is its stored command; `gate::signed`, which cut ` · expires in …` out of any card, is gone.
+- Deviation (W-5): `router::approves` is gone. `tools::decide`, `vault::command`, `memory::command`, `drafts::command` and `scheduler::command` take `may_approve` and refuse their own approving verbs on `web`.
+- Deviation (W-7): a passkey-decided command that was refused or failed answers `ok: false` for every command kind (`Router::not_applied`; `vault::command` and `facts::command` return `Result`).
+- Deviation (W-4, W-13, spec §4.2): the web app starts only under the network floor; hidden `Config::web_off_floor` lets the tests' process run it. `tests/cli.rs` now expects the refusal from a daemon outside the floor.
+- Deviation (W-12): the app reads `zephyr.goals` again before `/goal done|rm N` (no Rust test: the check is the page's).
+- Deviation (W-13): an address `egress::listen_addr` cannot give leaves the app pending and fails one line of `status` and `doctor` (not reachable from a test process).
 
 ## Built against sibling lanes (run after the rebase onto A4, A2 and B)
 
@@ -751,11 +803,12 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - answered in the router through `AttachRequest::Activity { params, reply }`.
 - App: Activity shows each `line` (`tool` rows muted) and asks for the next page with `before: next` when the last row scrolls into view. A Grants sub-list sends a row's `revoke` as a `send` prompt; revoking only takes away, so `web` may. A `-32601` hides the tab.
 
-- [ ] **Step 1: Write the failing test** `activity_is_open_on_web_and_pages`: after a web `send`, `zephyr.activity {"limit":1}` → one entry with a `line`, and a non-null `next`, which `before` accepts. Also extend `every_method_the_app_calls_is_open_on_web`.
-- [ ] **Step 2: Run** `cargo test -p zephyr --test web activity` → FAIL (`-32601`).
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** → PASS, then `cargo test -p zephyr`.
-- [ ] **Step 5: Commit** `feat(web): show the activity record and its grants in the app's drawer`.
+- [x] **Step 1: Write the failing test** `activity_is_open_on_web_and_pages`: after a web `send`, `zephyr.activity {"limit":1}` → one entry with a `line`, and a non-null `next`, which `before` accepts. Also extend `every_method_the_app_calls_is_open_on_web`.
+- [x] **Step 2: Run** `cargo test -p zephyr --test web activity` → FAIL (`-32601`).
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** → PASS, then `cargo test -p zephyr`.
+- [x] **Step 5: Commit** `feat(web): show the activity record and its grants in the app's drawer`.
+- Deviation: built on A4's merged interface: `AttachRequest::Activity { query, reply }` is A4's own, so this task only adds `zephyr.activity` to `WEB_METHODS`, the tab and the test. The test seeds audit rows and asks for `kind: "tool"`, since the default kinds leave tool rows out. Grants are asked for with `kind: "grants"`; a null `revoke` gets no button.
 
 ### Task W-12: Goals screen (B's `zephyr.goals`)
 
@@ -769,11 +822,12 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   - changes go as the owner's text commands `/goal add TEXT`, `/goal done N`, `/goal rm N`, whose replies are `[zephyr] goal N set; …`, `[zephyr] goal N done: TEXT`.
 - App: it lists the goals (done ones struck), sends the three commands as `send` prompts, and reloads `zephyr.goals` on their `zephyr_reply`. Goal text goes in through `textContent`. A `-32601` hides the screen.
 
-- [ ] **Step 1: Write the failing test** `goals_are_read_on_web_and_changed_by_command`: a web `send` of `/goal add ship W` → a `zephyr_reply` on `web`; `zephyr.goals` → one goal, `done: false`.
-- [ ] **Step 2: Run** → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** → PASS, then `cargo test -p zephyr`.
-- [ ] **Step 5: Commit** `feat(web): read the owner's goals in the app and change them with /goal`.
+- [x] **Step 1: Write the failing test** `goals_are_read_on_web_and_changed_by_command`: a web `send` of `/goal add ship W` → a `zephyr_reply` on `web`; `zephyr.goals` → one goal, `done: false`.
+- [x] **Step 2: Run** → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** → PASS, then `cargo test -p zephyr`.
+- [x] **Step 5: Commit** `feat(web): read the owner's goals in the app and change them with /goal`.
+- Deviation: built on B's merged `zephyr.goals`: done goals come with `n: null`, so they are listed struck through with no Done or Remove. Two more tests sit on B's merge: a message typed in the app is an owner row on `web` and leaves the conversation clean, and `memory.auto` is turned on only with the passkey (both passed as built).
 
 ### Task W-13: Bridge mode: bind the container's address and publish 7793 on host loopback (A2)
 
@@ -790,11 +844,12 @@ Every constraint in the wave index applies (commits, the lane worktree, TDD and 
   If A2 adds a shared helper that picks the listener address, use it for the web app as `attach::serve` does.
 - `web::serve` binds `(own_ip, port)` in bridge mode, else `("127.0.0.1", port)`. `own_ip` failing makes `serve` return the error, as attach does under A2. `tailscale serve` still points at `http://127.0.0.1:7793` on the host.
 
-- [ ] **Step 1: Write the failing test** in host.rs: `up_in_bridge_mode_publishes_the_web_port_on_loopback`. A `[web]` config and `network = "bridge"` → the `docker run` args contain `-p 127.0.0.1:7793:7793`; with no `[web]`, they do not.
-- [ ] **Step 2: Run** `cargo test -p zephyr --test host bridge` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** → PASS; `cargo test -p zephyr`. On the side container in bridge mode: as the agent's uid, `curl http://<own_ip>:7793/` fails, and from the host `curl -H 'Host: HOST' -H 'Tailscale-User-Login: x' http://127.0.0.1:7793/` → 200.
-- [ ] **Step 5: Commit** `feat(web): listen on the container's address and publish the web app on host loopback under the bridge network`.
+- [x] **Step 1: Write the failing test** in host.rs: `up_in_bridge_mode_publishes_the_web_port_on_loopback`. A `[web]` config and `network = "bridge"` → the `docker run` args contain `-p 127.0.0.1:7793:7793`; with no `[web]`, they do not.
+- [x] **Step 2: Run** `cargo test -p zephyr --test host bridge` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** → PASS; `cargo test -p zephyr`. On the side container in bridge mode: as the agent's uid, `curl http://<own_ip>:7793/` fails, and from the host `curl -H 'Host: HOST' -H 'Tailscale-User-Login: x' http://127.0.0.1:7793/` → 200.
+- [x] **Step 5: Commit** `feat(web): listen on the container's address and publish the web app on host loopback under the bridge network`.
+- Deviation: built on A2's merged helpers: the listener binds through `egress::listen_addr`, and the port is a row of `egress::LISTENERS` (`published_from` gives 7793 when `[web]` names only its host), which is what makes `up` publish it; `host/mod.rs` itself is unchanged. `zephyr web setup` keeps a port the owner chose and serves that one. The host test is `up_in_bridge_mode_publishes_the_web_port_on_loopback`; `tests/net_floor.rs` (ignored, side container) also expects the agent's uid refused at port 7793, not run here.
 
 ---
 

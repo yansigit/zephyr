@@ -271,13 +271,25 @@ pub async fn run<C: Channel>(
     let (cfg_tx, cfg_rx) = watch::channel(Arc::new(cfg.clone()));
     let (snap, snap_rx) = watch::channel(Snapshot::default());
     let activity_rx = snap_rx.clone();
-    let (attach_cfgs, egress_cfgs) = (cfg_rx.clone(), cfg_rx.clone());
+    let egress_cfgs = cfg_rx.clone();
+    let handles = crate::attach::Handles {
+        inbound: tx.clone(),
+        router: attach_tx,
+        snap: snap_rx.clone(),
+        cfgs: cfg_rx.clone(),
+    };
+    let hub = crate::web::Hub::new();
     let (gate_cfgs, gate_snap) = (cfg_rx.clone(), snap_rx.clone());
     let names = channels.iter().map(|c| c.name().to_string()).collect();
     let mut router = Router::new(cfg, &jobs, attaches, cfg_tx, snap, names)?;
     // The gate's held notes for main's run, steered in before the plugin is answered (R51).
     let (gate_notes, notes_rx) = mpsc::channel(16);
     router.gate_notes = Some(notes_rx);
+    router.web = cfg.web.is_some().then(|| hub.clone());
+    // Cards that waited through the restart were pushed before it: only newer ones go out.
+    let waiting = router.store.pending_proposals();
+    let newest = waiting.map_or(i64::MAX, |all| all.iter().map(|p| p.id).max().unwrap_or(0));
+    router.pushed_up_to = std::sync::atomic::AtomicI64::new(newest);
     router.keep_upgraded_install_as_it_was().await;
     router.taint_cut_off();
     // Before the first child starts the desktop: one a daemon before this left is no child of
@@ -302,7 +314,8 @@ pub async fn run<C: Channel>(
         r = crate::gate::serve(gate_cfgs, gate_snap, waits, &jobs, gate_notes) => r.map(|()| Exit::Shutdown),
         // The agent's only way out, in bridge mode (DESIGN §4.20).
         r = crate::egress::serve(egress_cfgs, &jobs) => r.map(|()| Exit::Shutdown),
-        r = crate::attach::serve(cfg, tx, attach_tx, snap_rx, attach_cfgs) => r.map(|()| Exit::Shutdown),
+        r = crate::attach::serve(cfg, handles.clone()) => r.map(|()| Exit::Shutdown),
+        r = crate::web::serve(cfg, handles, hub) => r.map(|()| Exit::Shutdown),
         r = crate::scheduler::run(cfg_rx.clone(), &jobs) => r.map(|()| Exit::Shutdown),
         r = crate::tasks::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),
         r = show_activity(channels, activity_rx, cfg.tick) => r.map(|()| Exit::Shutdown),
@@ -488,6 +501,17 @@ struct Router<'a> {
     due_held: bool,
     /// The gate's held notes for main's run (R51), from `gate::serve`.
     gate_notes: Option<mpsc::Receiver<GateNote>>,
+    /// The web app's sockets and sessions (DESIGN §4.3.3), when `[web]` is set; `run` sets it.
+    pub(crate) web: Option<Arc<crate::web::Hub>>,
+    /// The newest proposal a Web Push went out for (DESIGN §4.3.3). Atomic, so `push_cards`
+    /// takes `&self` as `publish` does.
+    pushed_up_to: std::sync::atomic::AtomicI64,
+    /// The `web` replies pushed while no web socket was open.
+    /// shortcut: in memory, so a restart may push a reply twice.
+    pushed_replies: HashSet<i64>,
+    /// Set by a handler that refused or failed the owner's command, so that an approval made
+    /// through `zephyr.decide` never answers `ok` with nothing applied.
+    not_applied: bool,
     /// Actions whose held note is in this run already, so the call's end steers it in no more.
     held_steered: HashSet<i64>,
     /// The newest note about an action main was woken for (R49).
@@ -645,6 +669,10 @@ impl<'a> Router<'a> {
             waits: Default::default(),
             due_held: false,
             gate_notes: None,
+            web: None,
+            pushed_up_to: std::sync::atomic::AtomicI64::new(i64::MAX),
+            pushed_replies: HashSet::new(),
+            not_applied: false,
             held_steered: HashSet::new(),
             action_woken: 0,
             compacting: None,
@@ -721,6 +749,8 @@ impl<'a> Router<'a> {
                     self.login_starts().await;
                     self.login_notices();
                     self.unpublished_notice();
+                    // A card the gate stored off this loop goes out within a tick.
+                    self.push_cards();
                     if self.cfg.path.is_some() && edits(&self.cfg) != self.edits {
                         let text = self.reload().await;
                         eprintln!("zephyr: zephyr.toml or secrets.env changed: {text}");
@@ -1107,7 +1137,7 @@ impl<'a> Router<'a> {
             ),
             "/job list" => crate::scheduler::list(&self.store)
                 .unwrap_or_else(|e| format!("[zephyr] listing jobs failed: {e}")),
-            memory => crate::memory::command(&self.cfg.home, self.cfg.state_dir(), memory)
+            memory => crate::memory::command(&self.cfg.home, self.cfg.state_dir(), memory, true)
                 .unwrap_or_default(),
         })
     }
@@ -1269,8 +1299,48 @@ impl<'a> Router<'a> {
         self.held_steered.clear();
     }
 
+    /// A Web Push for each proposal that began to wait since the last call (DESIGN §4.3.3):
+    /// its class and summary, facts scrubbed as `zephyr.proposals` gives them, or a setting's
+    /// or command's first line. Never the agent's reason. `quick` says a lock-screen button
+    /// may approve it: a held message or post that needs no strong channel.
+    /// shortcut: a delayed action that comes back to `pending` later is not pushed again.
+    fn push_cards(&self) {
+        use std::sync::atomic::Ordering;
+        let after = self.pushed_up_to.load(Ordering::Relaxed);
+        if self.web.is_none() || after == i64::MAX {
+            return;
+        }
+        // Called on every publish and tick: nothing is built unless something new waits.
+        let Ok(waiting) = self.store.pending_proposals() else {
+            return;
+        };
+        let newest = waiting.iter().map(|p| p.id).max().unwrap_or(0);
+        if newest <= after {
+            return;
+        }
+        let modes = self.modes();
+        for p in waiting {
+            if p.id <= after || p.status != "pending" {
+                continue;
+            }
+            let (id, p) = (p.id, self.proposal_json(p, &modes));
+            let (class, summary) = (p["class"].as_str(), p["summary"].as_str());
+            let body = match (class, summary) {
+                (Some(class), Some(summary)) => format!("{class}: {summary}"),
+                _ => (p["card"].as_str().unwrap_or_default().lines().next())
+                    .unwrap_or_default()
+                    .to_string(),
+            };
+            let quick = matches!(class, Some("messages" | "posts")) && p["strong"] == false;
+            let card = crate::web::push::card(id, &body, quick);
+            crate::web::push::spawn(self.cfg_tx.borrow().clone(), card, "high", 86_400);
+        }
+        self.pushed_up_to.store(newest, Ordering::Relaxed);
+    }
+
     /// Rebuilds the snapshot from the store and config, keeping `run`. Pushed only on change.
     fn publish(&self) {
+        self.push_cards();
         let built = (|| -> anyhow::Result<Snapshot> {
             let day = self.store.today()?;
             let (tokens, cost) = self.store.spend(&day)?;
@@ -1286,6 +1356,8 @@ impl<'a> Router<'a> {
                     channels.push((known, "off"));
                 }
             }
+            let web = self.web.as_ref().is_some_and(|hub| hub.connected() > 0);
+            channels.push(("web", if web { "connected" } else { "off" }));
             // shortcut: adapters report no connection state, so a running one counts as
             // connected; add `reconnecting` once they do.
             Ok(Snapshot {
@@ -1373,8 +1445,8 @@ impl<'a> Router<'a> {
                 let _ = tx.send((history, self.tap.subscribe()));
             }
             AttachRequest::FollowUp(m) => self.inbound(m, true).await,
-            AttachRequest::Dequeue(tx) => {
-                let _ = tx.send(self.dequeue().unwrap_or_else(|e| {
+            AttachRequest::Dequeue { channel, reply } => {
+                let _ = reply.send(self.dequeue(channel).unwrap_or_else(|e| {
                     eprintln!("zephyr: dequeue failed: {e}");
                     vec![]
                 }));
@@ -1395,9 +1467,12 @@ impl<'a> Router<'a> {
                 key,
                 value,
                 until,
+                channel,
+                expect,
                 reply,
             } => {
-                let _ = reply.send(self.settings_set(&key, &value, until.as_deref()).await);
+                let set = self.settings_set(&key, &value, until.as_deref(), channel, expect);
+                let _ = reply.send(set.await);
                 self.publish();
             }
             AttachRequest::Proposals(tx) => {
@@ -1407,9 +1482,39 @@ impl<'a> Router<'a> {
                 let answer = crate::activity::answer(&self.cfg, &self.store, &query, crate::now());
                 let _ = reply.send(answer);
             }
-            AttachRequest::Decide { id, verb, reply } => {
-                let _ = reply.send(self.decide(id, &verb).await);
+            AttachRequest::Decide {
+                id,
+                verb,
+                channel,
+                expect,
+                reply,
+            } => {
+                let _ = reply.send(self.decide(id, &verb, channel, expect).await);
                 self.publish();
+            }
+            AttachRequest::Card { id, reply } => {
+                let _ = reply.send(self.card(id));
+            }
+            AttachRequest::Current { key, reply } => {
+                let _ = reply.send(match crate::settings::find(&key) {
+                    Some(s) => Ok(self.current(s, &key)),
+                    None => Err(format!("no setting {key}; /settings lists them")),
+                });
+            }
+            AttachRequest::WebNotice(text) => {
+                // An attached owner is shown the row by the flush, with every other client
+                // (a web row waits for a socket); anyone else gets a row, and the clients see
+                // it now.
+                let last = self.store.last_owner().ok().flatten();
+                if !last
+                    .as_ref()
+                    .is_some_and(|(c, _)| crate::attach::attached(c))
+                {
+                    self.show(&text, None, None);
+                }
+                if let Some((channel, to)) = last {
+                    log(self.store.notify(&channel, &to, &text).map_err(Into::into));
+                }
             }
         }
     }
@@ -1470,9 +1575,25 @@ impl<'a> Router<'a> {
         Ok(json!({"goals": open.chain(done).collect::<Vec<_>>()}))
     }
 
-    /// `zephyr.settings_set`: `/set KEY VALUE [for D]` as the owner on the TUI, answered as data.
-    async fn settings_set(&mut self, key: &str, value: &str, until: Option<&str>) -> Value {
+    /// `zephyr.settings_set`: `/set KEY VALUE [for D]` as the owner on `channel` (`tui`, `web`
+    /// or, signed, `passkey`), answered as data.
+    async fn settings_set(
+        &mut self,
+        key: &str,
+        value: &str,
+        until: Option<&str>,
+        channel: &'static str,
+        expect: Option<Option<String>>,
+    ) -> Value {
         let refused = |why: String| json!({"outcome": "refused", "reason": why});
+        // A signed change names the value it changes from: here, on the loop, nothing can
+        // move between this check and the change.
+        if let Some(seen) = expect {
+            let now = crate::settings::find(key).map(|s| self.current(s, key));
+            if now != Some(seen) {
+                return refused(format!("{key} changed; look at it again"));
+            }
+        }
         if key == "facts" {
             return refused("change private facts with /facts".into());
         }
@@ -1490,9 +1611,7 @@ impl<'a> Router<'a> {
             Ok(until) => until,
             Err(e) => return refused(e),
         };
-        let owner = Actor::Owner {
-            channel: crate::attach::CHANNEL,
-        };
+        let owner = Actor::Owner { channel };
         match self.set_setting(key, value, owner, until, None).await {
             Outcome::Changed { old, new, applied } => {
                 let at = until
@@ -1511,62 +1630,122 @@ impl<'a> Router<'a> {
     /// `once` says whether `/ok N once` differs from `/ok N` for it now (its class asks only
     /// about new targets), and `strong` whether only a strong channel may approve it.
     fn proposals_json(&self) -> Value {
-        let now = crate::now();
         let list = self.store.pending_proposals().unwrap_or_else(|e| {
             eprintln!("zephyr: reading proposals failed: {e}");
             vec![]
         });
-        let e = crate::approvals::effective(&self.cfg);
-        let money_strong = (crate::approvals::strong_only(&self.cfg).iter()).any(|s| s == "money");
+        let modes = self.modes();
         let proposals: Vec<Value> = (list.into_iter())
-            .map(|p| {
-                // An action's stored summary, until its card is read below (R70).
-                let card = match p.kind.as_str() {
-                    "command" => p.command.clone(),
-                    _ => crate::facts::scrubbed(&self.cfg, p.command.clone()),
-                };
-                let mut v = json!({
-                    "id": p.id,
-                    "card": card,
-                    "kind": if p.kind != "command" {
-                        p.kind.as_str()
-                    } else if p.key.is_some() {
-                        "setting"
-                    } else {
-                        "command"
-                    },
-                    "status": p.status,
-                    "due_at": p.due_at,
-                    "key": p.key,
-                    "age_secs": (now - p.created_at).max(0),
-                    "expires_in_secs": (p.created_at + 86_400 - now).max(0),
-                    "strong": p.strong,
-                });
-                let action = (p.kind != "command")
-                    .then(|| self.store.action(p.id).ok().flatten())
-                    .flatten();
-                if let Some(a) = action {
-                    // A browser action waits 10 minutes, not a day (spec §4.6).
-                    if a.kind == crate::store::ActionKind::Wait {
-                        let wait = 60 * i64::from(crate::gate::WAIT_MINUTES);
-                        v["expires_in_secs"] = json!((a.created_at + wait - now).max(0));
-                    }
-                    v["card"] = json!(crate::gate::card(&a, &self.cfg, &self.store));
-                    // R70: the summary as the private facts are now.
-                    v["summary"] = json!(crate::facts::scrubbed(&self.cfg, a.summary.clone()));
-                    v["strong"] = json!(a.class == "money" && money_strong);
-                    v["once"] = json!(crate::gate::asks_new(&e, &a.class));
-                    v["class"] = json!(a.class);
-                }
-                v
-            })
+            .map(|p| self.proposal_json(p, &modes))
             .collect();
         json!({"proposals": proposals})
     }
 
-    /// `zephyr.decide`: `/ok N`, `/no N` or `/cancel N` from the TUI, through the checks the chat
-    /// commands make (stale, strong channel). `once` is `ok` for a setting.
-    async fn decide(&mut self, id: i64, verb: &str) -> Value {
+    /// One waiting proposal, as `zephyr.proposals` lists it. `signed` is its card without the
+    /// time left (`gate::signed`): what the web app shows as the card and a passkey signs.
+    /// The approval modes in effect, and whether a payment needs a strong channel: read once
+    /// for a whole listing.
+    fn modes(&self) -> (crate::approvals::Effective, bool) {
+        let money = (crate::approvals::strong_only(&self.cfg).iter()).any(|s| s == "money");
+        (crate::approvals::effective(&self.cfg), money)
+    }
+
+    fn proposal_json(
+        &self,
+        p: crate::store::PendingProposal,
+        (e, money_strong): &(crate::approvals::Effective, bool),
+    ) -> Value {
+        let now = crate::now();
+        // An action's stored summary, until its card is read below (R70).
+        let card = match p.kind.as_str() {
+            "command" => p.command.clone(),
+            _ => crate::facts::scrubbed(&self.cfg, p.command.clone()),
+        };
+        let mut v = json!({
+            "id": p.id,
+            "card": card,
+            "kind": if p.kind != "command" {
+                p.kind.as_str()
+            } else if p.key.is_some() {
+                "setting"
+            } else {
+                "command"
+            },
+            "status": p.status,
+            "due_at": p.due_at,
+            "key": p.key,
+            "age_secs": (now - p.created_at).max(0),
+            "expires_in_secs": (p.created_at + 86_400 - now).max(0),
+            "strong": p.strong,
+        });
+        let action = (p.kind != "command")
+            .then(|| self.store.action(p.id).ok().flatten())
+            .flatten();
+        if let Some(a) = action {
+            // A browser action waits 10 minutes, not a day (spec §4.6).
+            if a.kind == crate::store::ActionKind::Wait {
+                let wait = 60 * i64::from(crate::gate::WAIT_MINUTES);
+                v["expires_in_secs"] = json!((a.created_at + wait - now).max(0));
+            }
+            v["card"] = json!(crate::gate::card(&a, &self.cfg, &self.store));
+            v["signed"] = json!(crate::gate::signed_card(&a, &self.cfg, &self.store));
+            // R70: the summary as the private facts are now.
+            v["summary"] = json!(crate::facts::scrubbed(&self.cfg, a.summary.clone()));
+            v["strong"] = json!(a.class == "money" && *money_strong);
+            v["once"] = json!(crate::gate::asks_new(e, &a.class));
+            v["class"] = json!(a.class);
+        }
+        // A command's or a setting's card is the stored command, and so is what is signed:
+        // whole, whatever its text looks like.
+        if v["signed"].is_null() {
+            v["signed"] = v["card"].clone();
+        }
+        v
+    }
+
+    /// `zephyr.decide`: `/ok N`, `/no N` or `/cancel N` from an attached client, through the
+    /// checks the chat commands make (stale, strong channel). `once` is `ok` for a setting.
+    /// `channel` is who decides (`tui`, `web` or, signed, `passkey`); an approved command runs
+    /// as a message on the client's own channel, since `passkey` has no rows.
+    async fn decide(
+        &mut self,
+        id: i64,
+        verb: &str,
+        channel: &'static str,
+        expect: Option<crate::attach::Expect>,
+    ) -> Value {
+        // A signed approval is for the proposal as it was stored and shown when signed: here,
+        // on the loop, nothing can change between this check and the effect.
+        if let Some(signed) = &expect {
+            let same = self.card(id).is_some_and(|(card, digest)| {
+                digest == signed.digest
+                    && crate::web::passkey::card_sha256(&card) == signed.card_sha256
+            });
+            if !same {
+                let text = "[zephyr] the card changed; look at it again";
+                return json!({"ok": false, "text": text});
+            }
+        }
+        let done = self.decide_as(id, verb, channel).await;
+        if expect.is_some() && done["ok"] == true {
+            // The audit has no channel column: a signed decision that ran gets its own row.
+            let what = format!("#{id} {verb}");
+            let logged = self.store.audit("web", "passkey", &what, "signed");
+            log(logged.map(drop).map_err(Into::into));
+        }
+        done
+    }
+
+    /// What a passkey signs of a waiting proposal: its card as `zephyr.proposals` gives it
+    /// now, less the time left (`signed`), and its digest. Only that proposal is built.
+    fn card(&self, id: i64) -> Option<(String, [u8; 32])> {
+        let waiting = self.store.pending_proposals().ok()?;
+        let p = self.proposal_json(waiting.into_iter().find(|p| p.id == id)?, &self.modes());
+        let digest = self.store.proposal_digest(id).ok()??;
+        Some((p["signed"].as_str()?.to_string(), digest))
+    }
+
+    async fn decide_as(&mut self, id: i64, verb: &str, channel: &'static str) -> Value {
         if verb == "cancel" {
             let done = crate::actions::cancel(&self.cfg, &self.store, &self.waits, &id.to_string());
             self.settled_actions();
@@ -1581,20 +1760,25 @@ impl<'a> Router<'a> {
             "once" => format!("/ok {id} once"),
             _ => format!("/ok {id}"),
         };
+        // An approved command runs as whoever approved it: a signed approval as `passkey`,
+        // or its `/set` or `/facts rm` would be refused as the weak `web` after the proposal
+        // was settled. The commands an agent can propose write no rows of their own.
         let m = Inbound {
-            channel: crate::attach::CHANNEL.into(),
+            channel: channel.into(),
             platform_msg_id: String::new(),
-            sender: "token".into(),
+            sender: crate::attach::sender(crate::attach::rows(channel)).into(),
             text: text.clone(),
         };
+        // The caller has decided who may approve here: a signature, or (the notification's
+        // button, the TUI) what that client may do unsigned.
         let mut approving = None;
-        let decided = crate::tools::decide(&self.cfg, &self.store, &text, |p| {
+        let decided = crate::tools::decide(&self.cfg, &self.store, &text, true, |p| {
             approving = Some(p.id);
-            self.not_now(p, &m.channel)
+            self.not_now(p, channel)
         });
         let (ok, reply) = match decided {
             Some(Ok(Decided::Action { id, once })) => {
-                let done = self.approve(id, once, &m.channel);
+                let done = self.approve(id, once, channel);
                 self.settled_actions();
                 match done {
                     Ok(reply) => (true, reply),
@@ -1607,11 +1791,20 @@ impl<'a> Router<'a> {
                     text: command.clone(),
                     ..m.clone()
                 };
+                self.not_applied = false;
                 let reply = self.owner_command(&command, &run).await;
                 self.approving = None;
                 let reply = reply.unwrap_or_default();
                 self.restart_if_idle().await;
-                (true, format!("[zephyr] {text} approved {command}\n{reply}"))
+                // Never `ok` with nothing applied: whatever the command was, the handler that
+                // refused or failed it said so (`not_applied`).
+                match self.not_applied {
+                    true => (
+                        false,
+                        format!("[zephyr] {text} did not apply {command}\n{reply}"),
+                    ),
+                    false => (true, format!("[zephyr] {text} approved {command}\n{reply}")),
+                }
             }
             Some(Err(reply)) => {
                 self.settled_actions();
@@ -1624,10 +1817,14 @@ impl<'a> Router<'a> {
 
     /// An approved or typed command that the daemon answers itself; `None` is a message for the agent.
     async fn owner_command(&mut self, text: &str, m: &Inbound) -> Option<String> {
-        if let Some(reply) = crate::memory::command(&self.cfg.home, self.cfg.state_dir(), text) {
+        // In the web app an approval is made on its card and signed; each handler refuses its
+        // own approving verbs when it is typed there instead (`tools::NEEDS_PASSKEY`).
+        let may_approve = m.channel != crate::attach::WEB;
+        let (home, state) = (&self.cfg.home, self.cfg.state_dir());
+        if let Some(reply) = crate::memory::command(home, state, text, may_approve) {
             return Some(reply);
         }
-        if let Some(reply) = crate::scheduler::command(&mut self.store, &self.cfg, m) {
+        if let Some(reply) = crate::scheduler::command(&mut self.store, &self.cfg, m, may_approve) {
             self.jobs.runs.notify_one();
             return Some(reply);
         }
@@ -1640,12 +1837,13 @@ impl<'a> Router<'a> {
         None
     }
 
-    /// `zephyr.dequeue` (DESIGN §4.1): the attached client's messages rpi has not been sent yet,
-    /// oldest first, withdrawn so the owner can edit them. Steered ones are already rpi's.
-    fn dequeue(&mut self) -> rusqlite::Result<Vec<String>> {
+    /// `zephyr.dequeue` (DESIGN §4.1): the attached client's messages (its own channel's) rpi
+    /// has not been sent yet, oldest first, withdrawn so the owner can edit them. Steered ones
+    /// are already rpi's.
+    fn dequeue(&mut self, channel: &str) -> rusqlite::Result<Vec<String>> {
         let mut texts = vec![];
         for row in self.store.inbox_with_status("new")? {
-            if row.channel == crate::attach::CHANNEL && row.tries == 0 {
+            if row.channel == channel && row.tries == 0 {
                 self.store.set_status(row.id, "withdrawn")?;
                 texts.push(row.text);
             }
@@ -1796,7 +1994,11 @@ impl<'a> Router<'a> {
             log(self.store.deliver_after(id).map_err(Into::into));
         }
         let mut approving = None;
-        let decided = crate::tools::decide(&self.cfg, &self.store, m.text.trim(), |p| {
+        // Every approval made in the web app is signed with a passkey, on its card
+        // (`zephyr.decide`): typed over the socket, it would rest on the session cookie alone.
+        let may_approve = m.channel != crate::attach::WEB;
+        let text = m.text.trim();
+        let decided = crate::tools::decide(&self.cfg, &self.store, text, may_approve, |p| {
             approving = Some(p.id);
             self.not_now(p, &m.channel)
         });
@@ -1849,8 +2051,8 @@ impl<'a> Router<'a> {
         } else {
             log(self.store.reply(&row, &reply, "done").map_err(Into::into));
         }
-        if row.channel == crate::attach::CHANNEL && !reply.is_empty() {
-            self.show(&reply, Some(row.text.trim()));
+        if crate::attach::attached(&row.channel) && !reply.is_empty() {
+            self.show(&reply, Some(row.text.trim()), Some(&row.channel));
         }
         self.restart_if_idle().await;
         // A run in progress settles first; its settle reconciles and dispatches.
@@ -2421,6 +2623,13 @@ impl<'a> Router<'a> {
             ("/thinking", level) => self.thinking_level(level, from.0).await,
             ("/set", arg) => self.set_command(arg, from.0).await,
             ("/settings", arg) => self.settings_listing(arg),
+            ("/web", _) => {
+                let (reply, ended) = crate::web::command(&self.cfg, &self.store, text, from.0)?;
+                if let (true, Some(hub)) = (ended, &self.web) {
+                    hub.revoke(); // open sockets check their sessions at once
+                }
+                reply
+            }
             ("/approvals", arg) => self.approvals(arg, from.0).await,
             // Held messages, posts and payments (approvals spec §4.6).
             ("/held", "") => crate::actions::held(&self.cfg, &self.store),
@@ -2523,7 +2732,11 @@ impl<'a> Router<'a> {
                 crate::checkpoint::command(&self.cfg, arg, busy.as_deref()).await
             }
             // The owner's credentials (DESIGN §4.15); also an approved `/vault grant` proposal.
-            ("/vault", arg) => crate::vault::command(&crate::vault::path(&self.cfg), arg),
+            ("/vault", arg) => {
+                let may_approve = from.0 != crate::attach::WEB;
+                let done = crate::vault::command(&crate::vault::path(&self.cfg), arg, may_approve);
+                done.unwrap_or_else(|refused| self.refused(refused))
+            }
             // The owner's private facts (approvals spec §4.5): names only, never a value.
             ("/facts", arg) => {
                 let strong = self
@@ -2532,12 +2745,14 @@ impl<'a> Router<'a> {
                     .strong_channels
                     .iter()
                     .any(|c| c == from.0);
-                crate::facts::command(&crate::facts::path(&self.cfg), arg, strong)
+                let done = crate::facts::command(&crate::facts::path(&self.cfg), arg, strong);
+                done.unwrap_or_else(|refused| self.refused(refused))
             }
             // Skills and connectors the agent drafted (DESIGN §4.6).
             ("/skills" | "/skill" | "/mcp", _) => {
                 use crate::drafts::After;
-                let (reply, after) = crate::drafts::command(&self.cfg, text)?;
+                let may_approve = from.0 != crate::attach::WEB;
+                let (reply, after) = crate::drafts::command(&self.cfg, text, may_approve)?;
                 match after {
                     After::Nothing => reply,
                     // rpi reads AGENTS.md once, at start.
@@ -2695,6 +2910,27 @@ impl<'a> Router<'a> {
     /// else), applied, logged and, with `until`, given its revert. `reason` is the agent's,
     /// quoted on the owner's notice or card.
     async fn set_setting(
+        &mut self,
+        key: &str,
+        raw: &str,
+        actor: Actor<'_>,
+        until: Option<Duration>,
+        reason: Option<&str>,
+    ) -> Outcome {
+        let outcome = self.change_setting(key, raw, actor, until, reason).await;
+        if matches!(outcome, Outcome::Refused(_)) {
+            self.not_applied = true;
+        }
+        outcome
+    }
+
+    /// A command's reply that says it was refused or failed, noted for `zephyr.decide`.
+    fn refused(&mut self, reply: String) -> String {
+        self.not_applied = true;
+        reply
+    }
+
+    async fn change_setting(
         &mut self,
         key: &str,
         raw: &str,
@@ -3273,11 +3509,13 @@ impl<'a> Router<'a> {
         }
     }
 
-    /// The owner on `channel`, as a notice there is addressed. On the TUI's channel the
-    /// attached client is the owner (`attach` sends as `token`).
+    /// The owner on `channel`, as a notice there is addressed. On an attached client's channel
+    /// the client is the owner (`attach` sends as `token`, or as `web`); a passkey-signed
+    /// change was made in the web app.
     fn owner_on(&self, channel: &str) -> Option<(String, String)> {
-        if channel == crate::attach::CHANNEL {
-            return Some((channel.into(), "token".into()));
+        let channel = crate::attach::rows(channel);
+        if crate::attach::attached(channel) {
+            return Some((channel.into(), crate::attach::sender(channel).into()));
         }
         let owner = self.cfg.owners.get(channel)?.first()?;
         Some((channel.into(), owner.clone()))
@@ -3647,11 +3885,11 @@ impl<'a> Router<'a> {
     /// sender, not to whoever spoke last in the inbox: a second owner must not see the first
     /// one's sign-in URL. Both writes, neither waits.
     fn login_notice(&self, text: &str, from: &Option<(String, String)>) {
-        self.show(text, None);
+        self.show(text, None, None);
         let Some((channel, recipient)) = from else {
             return;
         };
-        if channel == crate::attach::CHANNEL {
+        if crate::attach::attached(channel) {
             return; // that sender is the attached client `show` has just reached
         }
         let _ = self.store.notify(channel, recipient, text);
@@ -3812,7 +4050,7 @@ impl<'a> Router<'a> {
         }
         let saved = crate::rpc::saved_sessions(&self.cfg.session_dir());
         if !saved.iter().any(|(s, _)| s == id) {
-            return format!("[zephyr] no conversation {id}; /switch lists them");
+            return self.refused(format!("[zephyr] no conversation {id}; /switch lists them"));
         }
         match self.switch_main(id).await {
             Ok(when) => format!("[zephyr] back to {id} {when}"),
@@ -4215,14 +4453,35 @@ impl<'a> Router<'a> {
         // job output go to the clients attached now, or wait for the next one; so do the
         // router's own `[zephyr]` answers to a turn (a failed or empty run), which no agent
         // event carries.
-        for row in rows.iter().filter(|r| r.channel == crate::attach::CHANNEL) {
+        //
+        // The web app's rows are handled the same way while one of its sockets is open, and
+        // wait otherwise: its client may be a phone in a pocket.
+        let web_open = self.web.as_ref().is_some_and(|hub| hub.connected() > 0);
+        // Only rows that still wait need remembering as pushed.
+        let pending: HashSet<i64> = rows.iter().map(|r| r.id).collect();
+        self.pushed_replies.retain(|id| pending.contains(id));
+        for row in (rows.iter()).filter(|r| crate::attach::attached(&r.channel)) {
+            if row.channel == crate::attach::WEB && self.web.is_none() {
+                // `[web]` is not set (any more): no socket will open to show this row, so it
+                // does not sit pending for its week.
+                log((self.store.set_outbox_status(row.id, "failed")).map_err(Into::into));
+                continue;
+            }
+            if row.channel == crate::attach::WEB && !web_open {
+                // Nobody is looking: one push, and the row waits for the next socket.
+                if self.pushed_replies.insert(row.id) {
+                    let reply = crate::web::push::reply(&row.text);
+                    crate::web::push::spawn(self.cfg_tx.borrow().clone(), reply, "normal", 3600);
+                }
+                continue;
+            }
             let command =
                 (row.prompt.as_deref().map(str::trim)).is_some_and(|p| p.starts_with('/'));
             if !row.client_id.starts_with('z') || (!command && row.text.starts_with("[zephyr]")) {
                 if self.tap.receiver_count() == 0 {
                     continue;
                 }
-                self.show(&row.text, None);
+                self.show(&row.text, None, None);
             }
             log(self
                 .store
@@ -4231,7 +4490,7 @@ impl<'a> Router<'a> {
         }
         for row in rows
             .into_iter()
-            .filter(|r| r.channel != crate::attach::CHANNEL)
+            .filter(|r| !crate::attach::attached(&r.channel))
         {
             if self
                 .stuck
@@ -4288,9 +4547,12 @@ impl<'a> Router<'a> {
     }
 
     /// Shows `text`, the router's own (a command reply, a notice), to attached clients:
-    /// `attach` draws it for stock clients as an assistant message, the TUI as a reply card.
-    fn show(&self, text: &str, command: Option<&str>) {
-        let reply = json!({"type": "zephyr_reply", "text": text, "command": command});
+    /// `attach` draws it for stock clients as an assistant message, the TUI and the web app as
+    /// a reply card. `channel` is where a command's reply belongs (only that channel's clients
+    /// draw it); `None` is a notice, drawn by all.
+    fn show(&self, text: &str, command: Option<&str>, channel: Option<&str>) {
+        let reply =
+            json!({"type": "zephyr_reply", "text": text, "command": command, "channel": channel});
         let _ = self.tap.send(reply); // no receivers is fine
     }
 

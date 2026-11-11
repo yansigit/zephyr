@@ -185,7 +185,7 @@ const fn fixed(key: &'static str, label: &'static str, help: &'static str) -> Se
 }
 
 /// The channels `settings.strong_channels` may name.
-pub const CHANNELS: &[&str] = &["tui", "chat", "discord", "imessage"];
+pub const CHANNELS: &[&str] = &["tui", "chat", "discord", "imessage", "web", "passkey"];
 
 /// rpi 0.18's thinking levels (`rpi_ai::ThinkingLevel`), off first. A model offers some of
 /// them: the router checks a level against the child's `get_available_thinking_levels`, which
@@ -556,6 +556,7 @@ pub static SETTINGS: &[Setting] = &[
     fixed("discord", "Discord", "The Discord adapter."),
     fixed("imessage", "iMessage", "The BlueBubbles adapter."),
     fixed("attach", "Attach", "The rpi --connect listener."),
+    fixed("web", "Web app", "The web app's listener."),
     fixed(
         "agent.env",
         "Agent environment",
@@ -1852,6 +1853,15 @@ mod tests {
     }
 
     #[test]
+    fn the_web_table_is_read_only() {
+        let web = find("web").expect("listed");
+        assert_eq!((web.section, web.agent), (READ_ONLY, Access::Never));
+        let strong = Actor::Owner { channel: "tui" };
+        let refused = decide(web, &strong, false, &["tui".to_string()]);
+        assert!(matches!(refused, Verdict::Refuse(_)), "{refused:?}");
+    }
+
+    #[test]
     fn values_show_defaults_and_the_file_is_read_and_written_by_key() {
         let cfg: Config = toml::from_str(
             "rpi = 'a'\nhome = 'b'\n[budget]\ndaily_cost_usd = 5.0\n\
@@ -1864,7 +1874,7 @@ mod tests {
         assert_eq!(value(&cfg, "auth.refresh_minutes").as_deref(), Some("10"));
         assert_eq!(
             value(&cfg, "settings.strong_channels").as_deref(),
-            Some("tui, chat")
+            Some("tui, chat, passkey")
         );
         assert_eq!(value(&cfg, "mcp.notes.enabled").as_deref(), Some("true"));
         assert_eq!(value(&cfg, "mcp.other.enabled"), None);
