@@ -922,6 +922,34 @@ fn mcp_add_again_keeps_the_owners_classes() {
     );
 }
 
+/// DESIGN §4.21: where a connector's secrets go is set where the owner adds it, and kept when
+/// it is added again.
+#[test]
+fn mcp_add_takes_hosts_and_plain_and_keeps_them() {
+    let env = Env::new("mcp-hosts");
+    env.init(&["--no-start"]);
+    let add = ["mcp", "add", "mail", "--host", "api.mail.test"];
+    env.ok(&[&add[..], &["--host", "mail.test:8443", "--", "mail-server"]].concat());
+    let config = env.config();
+    assert!(
+        config.contains("hosts = \"api.mail.test, mail.test:8443\""),
+        "{config}"
+    );
+    env.ok(&["mcp", "add", "mail", "--plain", "--", "other-server"]);
+    let config = env.config();
+    assert!(
+        config.contains("api.mail.test") && config.contains("secrets = \"plain\""),
+        "{config}"
+    );
+    env.ok(&["mcp", "add", "mail", "--", "third-server"]);
+    assert!(env.config().contains("secrets = \"plain\""));
+    // A wildcard is refused and nothing is written.
+    let before = env.config();
+    let out = env.zephyr(&["mcp", "add", "mail", "--host", "*.mail.test", "--", "x"]);
+    assert!(!out.status.success());
+    assert_eq!(env.config(), before);
+}
+
 #[test]
 fn init_writes_the_parsed_preset_name() {
     let env = Env::new("init-preset-trim");

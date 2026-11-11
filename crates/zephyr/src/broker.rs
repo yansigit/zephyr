@@ -175,6 +175,39 @@ pub fn connector_hosts(m: &Mcp) -> Vec<String> {
     own.into_iter().collect()
 }
 
+/// Whether `m` names a secret and has nowhere to send it: a `command` connector, or one on
+/// plain `http`, with no `hosts`. Such a connector is left out until the owner lists hosts or
+/// says `secrets = "plain"`.
+fn nowhere(m: &Mcp) -> bool {
+    m.secrets.as_deref() != Some("plain")
+        && !connector_names(m).0.is_empty()
+        && connector_hosts(m).is_empty()
+}
+
+/// What `drafts::filled` fills `m`'s `${NAME}`s with, from secrets.env (`env`): surrogates
+/// under the network floor, the real values for a `plain` connector and under host networking,
+/// where no proxy could swap anything. `Err` says why the connector is left out; a real value
+/// never stands in for a surrogate that cannot be made.
+pub fn connector_secrets(
+    cfg: &Config,
+    m: &Mcp,
+    env: &[(String, String)],
+) -> Result<Vec<(String, String)>, String> {
+    if !on(cfg) || m.secrets.as_deref() == Some("plain") || connector_names(m).0.is_empty() {
+        return Ok(env.to_vec());
+    }
+    if nowhere(m) {
+        return Err(format!(
+            "it names a secret and no host to send it to: /set mcp.{0}.hosts HOST.., or /set \
+             mcp.{0}.secrets plain to hand it the real one",
+            m.name
+        ));
+    }
+    let key = key(cfg).map_err(|_| "the token broker's key could not be read".to_string())?;
+    let stand_in = |(name, _): &(String, String)| (name.clone(), surrogate(&key, "env", name));
+    Ok(env.iter().map(stand_in).collect())
+}
+
 impl Map {
     fn insert(&mut self, key: &[u8; 32], kind: &str, name: &str, value: &str) -> &mut Secret {
         let surrogate = surrogate(key, kind, name);
@@ -490,13 +523,22 @@ pub fn upgrade_notice(cfg: &Config) -> Option<String> {
     let mut lines: Vec<String> = (vault.entries().iter().filter(|e| unbound(e)))
         .map(|e| format!("/vault bind {} HOST..", e.name))
         .collect();
+    let left_out = cfg.mcp.iter().filter(|m| nowhere(m));
+    lines.extend(left_out.map(|m| {
+        format!(
+            "/set mcp.{0}.hosts HOST.. (the connector {0} is left out until then; or /set \
+             mcp.{0}.secrets plain)",
+            m.name
+        )
+    }));
     if lines.is_empty() {
         return None;
     }
     lines.insert(
         0,
-        "[zephyr] vault tokens now go to the agent as stand-ins, swapped for the real token \
-         only on hosts you name. Until you bind one it cannot be used:"
+        "[zephyr] vault tokens and connector secrets now go to the agent as stand-ins, swapped for \
+         the real one only on hosts you name. Until you bind one it cannot be \
+         used:"
             .into(),
     );
     lines.push("To hand one out as before: /vault raw NAME on.".into());

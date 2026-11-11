@@ -3352,9 +3352,12 @@ impl<'a> Router<'a> {
     /// `s`'s rows for `/settings`: one per connector for a connector's setting.
     fn setting_rows(&self, s: &Setting) -> Vec<crate::settings::Row> {
         let keys: Vec<String> = match s.key {
-            "mcp.<name>.enabled" => (self.cfg.mcp.iter())
-                .map(|m| format!("mcp.{}.enabled", m.name))
-                .collect(),
+            "mcp.<name>.enabled" | "mcp.<name>.hosts" | "mcp.<name>.secrets" => {
+                let field = s.key.rsplit('.').next().unwrap_or_default();
+                (self.cfg.mcp.iter())
+                    .map(|m| format!("mcp.{}.{field}", m.name))
+                    .collect()
+            }
             // The tools the owner gave a class.
             "mcp.<name>.classes.<tool>" => (self.cfg.mcp.iter())
                 .flat_map(|m| (m.classes.keys()).map(|t| format!("mcp.{}.classes.{t}", m.name)))

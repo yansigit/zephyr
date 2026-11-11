@@ -850,6 +850,9 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let url = a.value("--url")?;
     let headers = a.values("--header")?;
     let secrets = a.values("--secret")?;
+    // Where its secrets are sent (DESIGN §4.21), or `--plain` to hand it the real ones.
+    let hosts = a.values("--host")?;
+    let plain = a.flag("--plain");
     let rest = a.rest()?;
     let mut doc = h.data.load()?;
     let parse = |doc: &toml_edit::DocumentMut| -> anyhow::Result<Config> {
@@ -857,7 +860,7 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
         cfg.validate()?;
         Ok(cfg)
     };
-    let usage = "usage: zephyr mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. | list | rm NAME";
+    let usage = "usage: zephyr mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. [--host HOST].. [--plain] | list | rm NAME";
     match &rest[..] {
         [list] if list == "list" => {
             for m in parse(&doc)?.mcp {
@@ -880,12 +883,14 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
                 })
                 .collect::<anyhow::Result<_>>()?;
             // D4: added again, a connector keeps the classes the owner gave its tools.
-            let classes = || {
+            let existing = || {
                 let cfg = parse(&doc).ok();
-                let existing = cfg.and_then(|c| c.mcp.into_iter().find(|m| m.name == *name));
-                existing.map(|m| m.classes).unwrap_or_default()
+                cfg.and_then(|c| c.mcp.into_iter().find(|m| m.name == *name))
             };
-            let m = match (url, command.split_first()) {
+            let classes = || existing().map(|m| m.classes).unwrap_or_default();
+            // And where its secrets go, unless this call says.
+            let old = existing().unwrap_or_default();
+            let mut m = match (url, command.split_first()) {
                 (Some(_), Some(_)) => bail!("give --url or a command after --, not both"),
                 (Some(url), None) => Mcp {
                     name: name.clone(),
@@ -907,6 +912,14 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
                     .into_iter()
                     .find(|m| m.name == *name)
                     .with_context(|| format!("no connector named {name}\n{usage}"))?,
+            };
+            m.hosts = match hosts.is_empty() {
+                true => old.hosts,
+                false => hosts.join(", "),
+            };
+            m.secrets = match plain {
+                true => Some("plain".into()),
+                false => old.secrets,
             };
             conf::upsert_mcp(&mut doc, &m)?;
         }

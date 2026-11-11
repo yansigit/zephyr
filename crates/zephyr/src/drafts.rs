@@ -110,6 +110,7 @@ impl Content {
                     o.remove("name");
                     // The owner's, kept through an approval: not the draft's to change.
                     o.remove("classes");
+                    o.remove("secrets");
                 }
                 serde_json::to_string_pretty(&v).unwrap_or_default()
             }
@@ -253,6 +254,10 @@ fn read_connector(path: &Path, name: &str) -> anyhow::Result<Mcp> {
     // A tool's approval class is the owner's to set (approvals spec §4.1), never a draft's.
     if spec.contains_key("classes") {
         bail!("a connector draft cannot set classes; the owner sets them with /set");
+    }
+    // Handing a connector its real secrets is the owner's choice too (DESIGN §4.21).
+    if spec.contains_key("secrets") {
+        bail!("a connector draft cannot set secrets; the owner sets it with /set");
     }
     let m: Mcp = serde_json::from_value(v).context("it is not a server spec")?;
     m.check()?;
@@ -530,11 +535,9 @@ fn list(cfg: &Config, kind: Kind) -> anyhow::Result<String> {
                     (Some(url), _) => url.clone(),
                     (_, command) => command.clone().unwrap_or_default(),
                 };
-                let missing = missing(cfg, m);
-                let note = if missing.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (left out: secrets.env lacks {})", missing.join(", "))
+                let note = match left_out(cfg, m) {
+                    Some(why) => format!(" (left out: {why})"),
+                    None => String::new(),
                 };
                 lines.push(format!("- {}: {what}{note}", m.name));
             }
@@ -597,8 +600,13 @@ fn ok(cfg: &Config, kind: Kind, name: &str) -> anyhow::Result<(String, After)> {
         }
         Content::Connector(mut m) => {
             // The owner's tool classes stay through an update: a draft cannot carry them.
+            // So do `secrets`, and the hosts when the draft lists none.
             if let Some(old) = cfg.mcp.iter().find(|o| o.name == m.name) {
                 m.classes = old.classes.clone();
+                m.secrets = old.secrets.clone();
+                if m.hosts.is_empty() {
+                    m.hosts = old.hosts.clone();
+                }
             }
             write_config(cfg, |doc| crate::host::conf::upsert_mcp(doc, &m))?;
             let missing = missing(cfg, &m);
@@ -608,6 +616,8 @@ fn ok(cfg: &Config, kind: Kind, name: &str) -> anyhow::Result<(String, After)> {
                     "; it is left out until secrets.env sets {}: run `zephyr mcp add {name} --secret NAME` on the host",
                     missing.join(", ")
                 );
+            } else if let Some(why) = left_out(cfg, &m) {
+                reply += &format!("; it is left out: {why}");
             }
             (reply, After::Reload)
         }
@@ -850,6 +860,20 @@ fn expand(text: &str, secrets: &[(String, String)], missing: &mut Vec<String>) -
     out
 }
 
+/// `m` as `mcp.json` gets it, or why it is left out: secrets.env lacks a name it uses, or it
+/// names a secret with no host to send it to (`broker::connector_secrets`).
+fn published(cfg: &Config, m: &Mcp, secrets: &[(String, String)]) -> Result<Value, String> {
+    let lacks = |_| format!("secrets.env lacks {}", missing(cfg, m).join(", "));
+    filled(m, secrets).map_err(lacks)?;
+    let fill = crate::broker::connector_secrets(cfg, m, secrets)?;
+    filled(m, &fill).map_err(lacks)
+}
+
+/// Why `m` is not in `mcp.json`, if it is not.
+pub fn left_out(cfg: &Config, m: &Mcp) -> Option<String> {
+    published(cfg, m, &secrets(cfg)).err()
+}
+
 /// The secrets.env keys a connector needs that are not set; `doctor` warns about them.
 pub fn missing_secrets(cfg: &Config, m: &Mcp) -> Vec<String> {
     missing(cfg, m)
@@ -945,16 +969,13 @@ pub fn prepare(cfg: &Config, agent_dir: &Path) -> anyhow::Result<()> {
     let mut servers = serde_json::Map::new();
     let mut listed = Vec::new();
     for m in &cfg.mcp {
-        match filled(m, &secrets) {
+        // Stand-ins for its secrets under the network floor (DESIGN §4.21), never the values.
+        match published(cfg, m, &secrets) {
             Ok(spec) => {
                 servers.insert(m.name.clone(), spec);
                 listed.push(m);
             }
-            Err(_) => eprintln!(
-                "zephyr: connector {} left out: secrets.env lacks {}",
-                m.name,
-                missing(cfg, m).join(", ")
-            ),
+            Err(why) => eprintln!("zephyr: connector {} left out: {why}", m.name),
         }
     }
     let mcp = mcp_path(cfg);
@@ -1053,7 +1074,9 @@ fn sections(
         "\nTo propose a connector, write `{h}/connectors/drafts/<name>.json` holding one server: \
          `{{\"url\": \"https://...\", \"headers\": {{...}}}}` or `{{\"command\": \"...\", \"args\": \
          [...], \"env\": {{...}}}}`. Write a secret only as `${{NAME}}`, never its value: the owner \
-         sets it. It is used only after the owner approves it with /mcp ok.\n\n"
+         sets it, and it is sent only to the connector's own `url` host, or to the exact hosts a \
+         `\"hosts\": \"api.example.com, example.com\"` lists (a `command` connector that uses a \
+         secret needs them). It is used only after the owner approves it with /mcp ok.\n\n"
     ));
     if !subagents.is_empty() {
         out.push_str(
@@ -1488,5 +1511,140 @@ mod tests {
         let mut missing = vec![];
         assert_eq!(expand("x${A}y${B}z${", &secrets, &mut missing), "x1yz${");
         assert_eq!(missing, ["B"]);
+    }
+
+    /// A config under the network floor, where connectors hold stand-ins (DESIGN §4.21).
+    fn brokered(extra: &str) -> Config {
+        let mut cfg = cfg(extra);
+        cfg.floor = true;
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        cfg
+    }
+
+    const BROKERED: &str = "[[mcp]]\nname = 'docs'\nurl = 'https://docs.test/mcp'\nheaders = { Authorization = 'Bearer ${DOCS_TOKEN}' }\n\
+        [[mcp]]\nname = 'local'\ncommand = 'srv'\nenv = { KEY = '${LOCAL_KEY}' }\n\
+        [[mcp]]\nname = 'bound'\ncommand = 'srv'\nenv = { KEY = '${LOCAL_KEY}' }\nhosts = 'api.l.test'\n\
+        [[mcp]]\nname = 'db'\ncommand = 'db'\nenv = { PASSWORD = '${DB_PASSWORD}' }\nsecrets = 'plain'\n\
+        [[mcp]]\nname = 'lan'\nurl = 'http://lan.test/mcp'\nheaders = { K = '${LOCAL_KEY}' }\n\
+        [[mcp]]\nname = 'open'\ncommand = 'fs-server'\n";
+    const ENV: &str =
+        "DOCS_TOKEN=real-docs-token\nLOCAL_KEY=real-local-key\nDB_PASSWORD=real-db-password\n";
+
+    #[test]
+    fn mcp_json_holds_stand_ins_and_never_a_brokered_secret() {
+        let cfg = brokered(BROKERED);
+        std::fs::write(cfg.secrets_path(), ENV).unwrap();
+        let text = agents(&cfg);
+        let file = std::fs::read_to_string(mcp_path(&cfg)).unwrap();
+        let json: Value = serde_json::from_str(&file).unwrap();
+        let key = crate::broker::key(&cfg).unwrap();
+        let stand_in = |name: &str| crate::broker::surrogate(&key, "env", name);
+        let servers = &json["mcpServers"];
+        assert_eq!(
+            servers["docs"]["headers"]["Authorization"],
+            format!("Bearer {}", stand_in("DOCS_TOKEN"))
+        );
+        assert_eq!(servers["bound"]["env"]["KEY"], stand_in("LOCAL_KEY"));
+        // The owner said so: the real one, and only there.
+        assert_eq!(servers["db"]["env"]["PASSWORD"], "real-db-password");
+        assert!(
+            !file.contains("real-docs-token") && !file.contains("real-local-key"),
+            "{file}"
+        );
+        // The broker's own fields are not the adapter's.
+        assert!(servers["bound"].get("hosts").is_none() && servers["db"].get("secrets").is_none());
+        // A secret with nowhere to go: a command with no hosts, and plain http.
+        assert!(
+            servers.get("local").is_none() && servers.get("lan").is_none(),
+            "{file}"
+        );
+        assert!(servers.get("open").is_some(), "no secret, so untouched");
+        assert!(
+            !text.contains("**local**") && text.contains("**bound**"),
+            "{text}"
+        );
+        let listed = say(&cfg, "/mcp").0;
+        assert!(
+            listed.contains(
+                "- local: srv (left out: it names a secret and no host to send it to: /set \
+                 mcp.local.hosts HOST.., or /set mcp.local.secrets plain"
+            ),
+            "{listed}"
+        );
+        // Byte for byte the same at the next start: the policy plugin compares what it loaded.
+        prepare(&cfg, &cfg.home.join("agent")).unwrap();
+        assert_eq!(std::fs::read_to_string(mcp_path(&cfg)).unwrap(), file);
+        // What the proxy will swap is exactly what the file holds.
+        let map = crate::broker::Map::load(&cfg).unwrap();
+        assert_eq!(map.hosts(), ["api.l.test:443", "docs.test:443"]);
+        let notice = crate::broker::upgrade_notice(&cfg).unwrap();
+        assert!(
+            notice.contains("\n/set mcp.local.hosts HOST.. (the connector local is left out"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("/set mcp.lan.hosts") && !notice.contains("mcp.db."),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn without_the_floor_connectors_hold_their_secrets_as_before() {
+        let mut cfg = brokered(BROKERED);
+        cfg.floor = false;
+        std::fs::write(cfg.secrets_path(), ENV).unwrap();
+        agents(&cfg);
+        let file = std::fs::read_to_string(mcp_path(&cfg)).unwrap();
+        assert!(
+            file.contains("Bearer real-docs-token") && !file.contains("zsur_"),
+            "{file}"
+        );
+        let json: Value = serde_json::from_str(&file).unwrap();
+        assert_eq!(json["mcpServers"]["local"]["env"]["KEY"], "real-local-key");
+    }
+
+    #[test]
+    fn a_stand_in_that_cannot_be_made_leaves_the_connector_out() {
+        let cfg = brokered(BROKERED);
+        std::fs::write(cfg.secrets_path(), ENV).unwrap();
+        std::fs::write(cfg.state_dir().join(crate::broker::KEY_FILE), "broken").unwrap();
+        agents(&cfg);
+        let file = std::fs::read_to_string(mcp_path(&cfg)).unwrap();
+        let json: Value = serde_json::from_str(&file).unwrap();
+        assert!(json["mcpServers"].get("docs").is_none(), "{file}");
+        assert!(!file.contains("real-docs-token") && !file.contains("real-local-key"));
+    }
+
+    #[test]
+    fn a_draft_carries_hosts_and_never_the_owners_choice_of_plain() {
+        let cfg = brokered(
+            "[[mcp]]\nname = 'mail'\ncommand = 'old'\nsecrets = 'plain'\nhosts = 'old.test'\n",
+        );
+        let drafts = Kind::Connector.drafts(&cfg.home);
+        std::fs::create_dir_all(&drafts).unwrap();
+        let draft = drafts.join("mail.json");
+        std::fs::write(&draft, r#"{"command": "new", "secrets": "plain"}"#).unwrap();
+        assert!(scan(&cfg)[0].contains("cannot set secrets"));
+        std::fs::write(&draft, r#"{"command": "new", "hosts": "*.mail.test"}"#).unwrap();
+        assert!(scan(&cfg)[0].contains("can't be approved"));
+        std::fs::write(
+            &draft,
+            r#"{"command": "new", "env": {"K": "${MAIL_KEY}"}, "hosts": "api.mail.test"}"#,
+        )
+        .unwrap();
+        let notices = scan(&cfg);
+        // The owner sees where the secret would go before approving.
+        assert!(
+            notices[0].contains("\"hosts\": \"api.mail.test\""),
+            "{notices:?}"
+        );
+        say(&cfg, "/mcp ok mail");
+        let new = Config::load(cfg.path.as_ref().unwrap()).unwrap();
+        assert_eq!(new.mcp[0].hosts, "api.mail.test");
+        assert_eq!(
+            new.mcp[0].secrets.as_deref(),
+            Some("plain"),
+            "the owner's, kept"
+        );
     }
 }

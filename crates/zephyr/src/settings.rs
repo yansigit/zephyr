@@ -349,6 +349,28 @@ pub static SETTINGS: &[Setting] = &[
         Apply::Toml,
     ),
     row(
+        "mcp.<name>.hosts",
+        "Connectors",
+        "Connector hosts",
+        "Exact HOST[:PORT] this connector's secrets are sent to, comma separated. No wildcards.",
+        Kind::Text { max: 1000 },
+        Access::Propose,
+        true,
+        Stricter::NotOrdered,
+        Apply::Toml,
+    ),
+    row(
+        "mcp.<name>.secrets",
+        "Connectors",
+        "Connector secrets",
+        "surrogate: the connector holds stand-ins and zephyr sends the real secret only to its hosts. plain: it holds the real ones.",
+        Kind::Choice(&["surrogate", "plain"]),
+        Access::Propose,
+        true,
+        Stricter::Earlier,
+        Apply::Toml,
+    ),
+    row(
         "rule",
         "Rules",
         "Standing rules",
@@ -587,13 +609,9 @@ pub fn find(key: &str) -> Option<&'static Setting> {
     if classes_key(key).is_some() {
         return SETTINGS.iter().find(|s| s.key == CLASSES_KEY);
     }
-    if let Some(name) = key
-        .strip_prefix("mcp.")
-        .and_then(|k| k.strip_suffix(".enabled"))
-    {
-        return (!name.is_empty() && !name.contains('.'))
-            .then(|| SETTINGS.iter().find(|s| s.key == "mcp.<name>.enabled"))
-            .flatten();
+    if key.starts_with("mcp.") {
+        let (_, field) = connector(key)?;
+        return (SETTINGS.iter()).find(|s| s.key.strip_prefix("mcp.<name>.") == Some(field));
     }
     SETTINGS.iter().find(|s| s.key == key)
 }
@@ -625,6 +643,11 @@ pub fn parse(s: &Setting, raw: &str) -> Result<Value, String> {
     }
     if s.key == "network.allow" {
         crate::egress::parse_allow(raw)?;
+    }
+    if s.key == "mcp.<name>.hosts" {
+        for host in raw.split(',') {
+            crate::broker::parse_host(host)?;
+        }
     }
     Ok(value)
 }
@@ -887,10 +910,11 @@ pub fn cleared(cfg: &Config, key: &str) -> Option<String> {
     crate::approvals::cleared(cfg, key.strip_prefix("approvals.")?)
 }
 
-/// The connector a `mcp.NAME.enabled` key names.
-fn connector(key: &str) -> Option<&str> {
-    let name = key.strip_prefix("mcp.")?.strip_suffix(".enabled")?;
-    (!name.is_empty() && !name.contains('.')).then_some(name)
+/// The connector and field a `mcp.NAME.enabled`, `.hosts` or `.secrets` key names.
+fn connector(key: &str) -> Option<(&str, &str)> {
+    let (name, field) = key.strip_prefix("mcp.")?.rsplit_once('.')?;
+    let known = matches!(field, "enabled" | "hosts" | "secrets");
+    (known && !name.is_empty() && !name.contains('.')).then_some((name, field))
 }
 
 /// The connector and tool a `mcp.NAME.classes.TOOL` key names.
@@ -949,11 +973,18 @@ pub fn value(cfg: &Config, key: &str) -> Option<String> {
                     None => crate::approvals::verb_class(name, tool).into(),
                 });
             }
-            let m = cfg
-                .mcp
-                .iter()
-                .find(|m| Some(m.name.as_str()) == connector(key))?;
-            Some(m.enabled.unwrap_or(true).to_string())
+            let (name, field) = connector(key)?;
+            let m = cfg.mcp.iter().find(|m| m.name == name)?;
+            match field {
+                // Where its secrets go: a `url` connector's own host when it lists none.
+                "hosts" => {
+                    let hosts = crate::broker::connector_hosts(m);
+                    let hosts: Vec<&str> = hosts.iter().map(|h| crate::vault::shown(h)).collect();
+                    (!hosts.is_empty()).then(|| hosts.join(", "))
+                }
+                "secrets" => Some(m.secrets.clone().unwrap_or_else(|| "surrogate".into())),
+                _ => Some(m.enabled.unwrap_or(true).to_string()),
+            }
         }
     }
 }
@@ -979,13 +1010,11 @@ pub fn read(doc: &DocumentMut, key: &str) -> Option<String> {
         let classes = mcp_table(doc, name)?.get("classes")?.as_table_like()?;
         return classes.get(tool)?.as_str().map(String::from);
     }
-    let Some(name) = connector(key) else {
+    let Some((name, field)) = connector(key) else {
         return crate::host::conf::get(doc, key);
     };
-    mcp_table(doc, name)?
-        .get("enabled")?
-        .as_bool()
-        .map(|b| b.to_string())
+    let value = mcp_table(doc, name)?.get(field)?;
+    (value.as_bool().map(|b| b.to_string())).or_else(|| value.as_str().map(String::from))
 }
 
 /// Sets `key` to `value` in `doc`, or removes it (`None`, back to its default). A value already
@@ -1011,11 +1040,11 @@ pub fn write(doc: &mut DocumentMut, key: &str, value: Option<&Value>) -> anyhow:
         classes.insert(tool, Item::Value(v.clone()));
         return Ok(());
     }
-    if let Some(name) = connector(key) {
+    if let Some((name, field)) = connector(key) {
         let t = mcp_table_mut(doc, name)?;
         match value {
-            Some(v) => t["enabled"] = Item::Value(v.clone()),
-            None => drop(t.remove("enabled")),
+            Some(v) => t[field] = Item::Value(v.clone()),
+            None => drop(t.remove(field)),
         }
         return Ok(());
     }
@@ -1229,7 +1258,7 @@ pub fn label(s: &Setting, key: &str) -> String {
         return format!("Connector {name}: {tool}");
     }
     match connector(key) {
-        Some(name) => format!("Connector {name} enabled"),
+        Some((name, field)) => format!("Connector {name} {field}"),
         None => s.label.to_string(),
     }
 }
@@ -1922,5 +1951,68 @@ mod tests {
         assert!(listing("owners", &strong, rows).contains("read-only"));
         assert!(listing("", &strong, rows).contains("read-only (edit zephyr.toml): owners,"));
         assert!(listing("nope", &strong, rows).starts_with("[zephyr] no setting or section nope"));
+    }
+
+    #[test]
+    fn connector_hosts_and_secrets_are_strong_proposal_rows() {
+        for (key, row) in [
+            ("mcp.notes.hosts", "mcp.<name>.hosts"),
+            ("mcp.notes.secrets", "mcp.<name>.secrets"),
+        ] {
+            let s = find(key).unwrap();
+            assert_eq!(s.key, row);
+            assert!(s.strong && matches!(s.agent, Access::Propose), "{key}");
+        }
+        assert!(find("mcp.notes.nope").is_none() && find("mcp..hosts").is_none());
+        assert_eq!(
+            label(find("mcp.notes.hosts").unwrap(), "mcp.notes.hosts"),
+            "Connector notes hosts"
+        );
+        let hosts = find("mcp.notes.hosts").unwrap();
+        assert!(parse(hosts, "api.x.test, x.test:8443").is_ok());
+        for bad in ["*.x.test", "https://x.test", "1.2.3.4", "x.test,,y.test"] {
+            assert!(parse(hosts, bad).is_err(), "{bad}");
+        }
+        let secrets = find("mcp.notes.secrets").unwrap();
+        assert!(parse(secrets, "plain").is_ok() && parse(secrets, "raw").is_err());
+        // `plain` hands the secret over: it is the looser of the two.
+        assert_eq!(
+            tighter(secrets, Some("plain"), Some("surrogate")),
+            Some(true)
+        );
+        assert!(loosens(secrets, Some("surrogate"), Some("plain")));
+        assert!(loosens(secrets, None, Some("plain")));
+        assert!(loosens(hosts, Some("a.test"), Some("b.test")));
+    }
+
+    #[test]
+    fn connector_hosts_and_secrets_read_and_write_their_table() {
+        let text = "[[mcp]]\nname = \"notes\"\nurl = \"https://n.test/mcp\"\n\
+                    [[mcp]]\nname = \"local\"\ncommand = \"srv\"\n";
+        let cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = '/h'\n{text}")).unwrap();
+        // A `url` connector's secrets go to its own host unless it lists others.
+        assert_eq!(value(&cfg, "mcp.notes.hosts").as_deref(), Some("n.test"));
+        assert_eq!(value(&cfg, "mcp.local.hosts"), None);
+        assert_eq!(
+            value(&cfg, "mcp.local.secrets").as_deref(),
+            Some("surrogate")
+        );
+        let mut doc: DocumentMut = text.parse().unwrap();
+        assert_eq!(read(&doc, "mcp.local.hosts"), None);
+        write(
+            &mut doc,
+            "mcp.local.hosts",
+            Some(&Value::from("api.l.test")),
+        )
+        .unwrap();
+        write(&mut doc, "mcp.local.secrets", Some(&Value::from("plain"))).unwrap();
+        assert_eq!(read(&doc, "mcp.local.hosts").as_deref(), Some("api.l.test"));
+        assert_eq!(read(&doc, "mcp.local.secrets").as_deref(), Some("plain"));
+        let cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = '/h'\n{doc}")).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.mcp[1].hosts, "api.l.test");
+        write(&mut doc, "mcp.local.hosts", None).unwrap();
+        assert_eq!(read(&doc, "mcp.local.hosts"), None);
+        assert!(write(&mut doc, "mcp.nope.hosts", Some(&Value::from("x.test"))).is_err());
     }
 }

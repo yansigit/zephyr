@@ -5412,7 +5412,9 @@ async fn a_token_bound_to_nothing_is_not_run_until_the_owner_binds_it() {
         0
     );
     // The upgrade's notice, once there is an owner to tell.
-    let told = gw.wait_reply("[zephyr] vault tokens now go").await;
+    let told = gw
+        .wait_reply("[zephyr] vault tokens and connector secrets now go")
+        .await;
     assert!(told.contains("\n/vault bind GH_TOKEN HOST..\n"), "{told}");
     assert!(
         told.ends_with("To hand one out as before: /vault raw NAME on."),
@@ -5469,7 +5471,9 @@ async fn a_token_bound_to_nothing_is_not_run_until_the_owner_binds_it() {
     tokio::time::sleep(Duration::from_millis(600)).await;
     let replies = gw.replies();
     assert!(
-        !replies.iter().any(|r| r.contains("vault tokens now go")),
+        !replies
+            .iter()
+            .any(|r| r.contains("vault tokens and connector secrets now go")),
         "{replies:?}"
     );
     gw.shutdown().await;

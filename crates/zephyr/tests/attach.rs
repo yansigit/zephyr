@@ -1227,6 +1227,10 @@ async fn settings_name_each_connector_row() {
         [
             row("mcp.mail.enabled", "Connector mail enabled"),
             row("mcp.notes.enabled", "Connector notes enabled"),
+            row("mcp.mail.hosts", "Connector mail hosts"),
+            row("mcp.notes.hosts", "Connector notes hosts"),
+            row("mcp.mail.secrets", "Connector mail secrets"),
+            row("mcp.notes.secrets", "Connector notes secrets"),
         ]
     );
     gw.shutdown().await;

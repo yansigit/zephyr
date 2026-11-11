@@ -145,7 +145,7 @@ wrong](#when-something-goes-wrong) and `zephyr uninstall [--keep-data]`.
 | `zephyr channel add\|remove discord\|imessage \| list` | Channel settings (secrets are asked for hidden); `remove` drops the channel, its owners and secrets, `list` shows them. Discord shows typing while the agent works, and a progress note after 20 s (`discord.progress`, `discord.progress_after_secs`) |
 | `zephyr web setup [--yes]` / `web enrol [NAME]` | Put the [web app](#web-app) behind `tailscale serve` and add a first device; later, a one-time code for another device |
 | `zephyr skill add DIR \| list \| rm NAME` | Skills the agent may use (see [Skills and connectors](#skills-and-connectors)); one you add is approved at once |
-| `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}` |
+| `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. [--host HOST].. [--plain] \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}`; `--host` names where a secret is sent, `--plain` hands the connector the real one |
 | `zephyr packages add NAME.. \| rm NAME.. \| list` | Ubuntu (apt) packages for the agent, baked into a local image (`zephyr-local:<version>-<hash>`) on the release one; `up` and `upgrade` build it, and `add`/`rm` rebuild and recreate the container once the agent is idle |
 | `zephyr facts list \| add NAME --kind text\|digits\|email \| rm NAME \| allow NAME TARGET \| disallow NAME TARGET` | Private facts (a phone number, an address) that must not leave in an outgoing call; the value is asked for hidden, or read from one stdin line when piped, never taken as an argument. They are kept in `facts.toml` (0600, with the daemon's files). `/facts` in a chat lists names, kinds and allowed targets and, from `tui` or `chat` only, `rm NAME` and `allow NAME TARGET`; a chat never takes a value. The agent may add a fact (you are told its name); removing one or allowing a target is only proposed |
 | `zephyr vault list \| add login NAME --site URL [--user U] [--totp] \| add token NAME \| edit NAME \| rm NAME \| revoke NAME [PROGRAM]` | Logins and tokens the agent uses by name (see [The vault](#the-vault)); values are asked for hidden, or read one per line from stdin when piped, never taken as arguments |
@@ -500,8 +500,14 @@ tools. `${NAME}` is filled in from `secrets.env`; a connector whose secret is mi
 out, and `zephyr doctor` and `/mcp` say so. zephyr's own secrets (`ZEPHYR_*`) and the channels' tokens can never be filled into a connector. The agent may also propose one in
 `connectors/drafts/<name>.json`: `/mcp ok NAME` adds it, `/mcp no NAME` drops it, `/mcp rm NAME`
 removes a connector, and `/mcp` lists them. The agent can use only these connectors: an MCP config
-it writes itself, or a server named by URL, is refused. A connector runs as the agent, so the
-agent can read its token.
+it writes itself, or a server named by URL, is refused.
+
+A connector does not hold its secrets: `mcp.json` has a stand-in for each `${NAME}`, and zephyr's
+proxy sends the real one only to the connector's hosts. A `url` connector's host is its own URL's.
+A connector that runs a command and uses a secret must say where it goes, or it is left out:
+`zephyr mcp add NAME --host api.example.com ...`, or `/set mcp.NAME.hosts api.example.com`. For a
+secret that is not an HTTPS header (a database password, a signing key), `--plain` or
+`/set mcp.NAME.secrets plain` hands the connector the real one, which the agent can then read.
 
 ## Web app
 
