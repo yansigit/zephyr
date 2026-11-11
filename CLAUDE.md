@@ -192,6 +192,14 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   and refuses its own verbs with `tools::NEEDS_PASSKEY`: give a new such verb the same check.
   Two channels: `web` is the session cookie alone and weak; `passkey` is a signed decision and in
   the default `strong_channels`.
+- `voice.rs` (DESIGN §4.3): an owner's voice note is transcribed by whisper.cpp and a reply to it
+  spoken by Piper, both from the image's root-owned `/opt/zephyr/voice` (`Config::voice_dir` in
+  tests, where `tests/fixtures/voice` holds the fakes), as uid 65534 on sealed memfds, one note at
+  a time, on the CPU. `inbox::append` hands it only the bytes it fetched in that call, never a file
+  saved in `inbox/`, and marks the row `derived = "voice"` (schema v19), which taints main's
+  conversation at dispatch; the transcript line starts with `[`, so speech is never a command. The
+  real binaries' argv and output shapes are in `decode_args`, `whisper_args`, `detected`,
+  `piper_args` and `encode_args` alone: change them with the fakes.
 - Desktop takeover (DESIGN §4.3.3, §4.11): `desktop::Control` is the one lock the owner's takeover
   and the vault's fill share; a take writes root's `<state>-public/desktop-held`, and the
   `agent-browser` and `xdotool` wrappers (`browser_gate::held`, `xdotool` dispatched on `argv[0]`

@@ -359,16 +359,60 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
 
 ### Task C2-10: Measure and check in a side container
 
-- [ ] **Step 1:** Build `zephyr-dev:c2-<sha>` from the integrated branch. Record `docker image inspect` sizes against the same tree built with `VOICE=0`, and against `ghcr.io/yansigit/zephyr:0.8.0` if it is local.
-- [ ] **Step 2:** In the image: English (Piper's own speech) and Korean (a Korean sample; the Korean voice fetched into a scratch folder for this check only, never into the image) transcribe to their words. Record wall time on CPU and whether Vulkan found the GPU.
-- [ ] **Step 3:** Run the ignored tests in the image where they apply (`the_images_binaries_hear_what_piper_says`).
-- [ ] **Step 4:** Side container `zephyr-test-c2` (scratch HOME, ports 20790 and 20793, bridge network):
+- [x] **Step 1:** Build `zephyr-dev:c2-<sha>` from the integrated branch. Record `docker image inspect` sizes against the same tree built with `VOICE=0`, and against `ghcr.io/yansigit/zephyr:0.8.0` if it is local.
+- [x] **Step 2:** In the image: English (Piper's own speech) and Korean (a Korean sample; the Korean voice fetched into a scratch folder for this check only, never into the image) transcribe to their words. Record wall time on CPU and whether Vulkan found the GPU.
+- [x] **Step 3:** Run the ignored tests in the image where they apply (`the_images_binaries_hear_what_piper_says`).
+- [x] **Step 4:** Side container `zephyr-test-c2` (scratch HOME, ports 20790 and 20793, bridge network):
   - a voice-note file through the inbox path (a stub file server on the bridge, a Discord-shaped inbound over the test hook or the adapter's own code path) is transcribed, and the decoders' uid is 65534;
   - during a takeover, as the agent's uid: no x11vnc listening socket in `/proc/net/tcp` or `/proc/net/unix`, connects to `127.0.0.1:5900-5999` refused, the web port on the container's address refused;
   - Take over (a software passkey over the attach protocol on `/api/ws`, as `tests/web.rs` does) → `agent-browser snapshot` as the agent waits → Hand back → it exits 1 with the hand-back text; `xdotool key a` the same.
-- [ ] **Step 5:** `docker rm -f zephyr-test-c2`; keep the image. Record the results below.
-- [ ] **Step 6: Commit** `docs(plans): record the voice and takeover lane's measurements and deviations`.
+- [x] **Step 5:** `docker rm -f zephyr-test-c2`; keep the image. Record the results below.
+- [x] **Step 6: Commit** `docs(plans): record the voice and takeover lane's measurements and deviations`.
 
 ## Results and deviations
 
-(filled in during execution)
+Run on 2026-11-10 on the integrated branch (image `zephyr-dev:c2-150d1c9`, kept; side container `zephyr-test-c2`, scratch HOME, attach 20790, web 20793, its own bridge; container, network and HOME removed afterwards). The live `zephyr` container, `~/.zephyr*` and the host's tailscale were not touched.
+
+**How it was built.** The three parts ran in parallel in their own worktrees (voice C2-1 to C2-5, takeover C2-6 to C2-8, image C2-9) and were cherry-picked onto this branch in the order takeover, image, voice. The one conflict was `Config::keep_hidden` (both sides kept).
+
+**Tests.** `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` clean; `cargo test`: 1211 passed, 0 failed, 20 ignored.
+
+**Image size** (`docker image inspect`, bytes):
+
+| image | size |
+|---|---|
+| `zephyr-dev:c2-150d1c9` (`VOICE=1`, `KO_VOICE=0`) | 6,226,179,903 |
+| the same tree with `VOICE=0` (`c2-img-4cb4119-voice0`) | 5,391,497,964 |
+| `ghcr.io/yansigit/zephyr:0.8.0` | 5,404,300,917 |
+
+Growth: **+835 MB** (+15.5%) for voice, against the spec's estimate of about 520 MB. `/opt/zephyr/voice` is 470 MB on disk (models 183, Piper's venv 186, the English voice 61, whisper-cli 39, ffmpeg 5); the image layer is 493 MB, and this Docker's inspect size counts more than the layer. noVNC adds 0.6 MB to the binary.
+
+**In the image, with the real binaries** (as root with the daemon's capabilities, no network):
+- `the_images_binaries_hear_what_piper_says` passes: Piper's English speech, encoded as Ogg Opus and as M4A, is transcribed to its words as `en`, and the decoders' uid is 65534.
+- With a Korean sample beside it (Piper's `ko_KR-kss-medium` fetched to a scratch folder, never in the image or the repo), the same test hears it as `ko` with its words.
+- `a_real_voice_note_is_heard_and_a_planted_one_is_not` passes: through `inbox::append`, the transcript is of the fetched note and the file planted under its name is left as it was.
+- whisper small-q5_1 on the CPU: 7.8 to 8.4 s for a 9.3 s clip (8 threads).
+
+**In the side container:**
+- `doctor`: `voice: whisper small on CPU`, the models and the English voice are there, `the decoders run as uid 65534`, `a silent sample is transcribed`, `desktop: the web app can take it over`. `state.db` is at `user_version` 19.
+- The inbox test above passes there too, under the floor. As uid 65534, a direct connection and one through the proxy at 127.0.0.1:7792 both fail; the rule set holds `meta skuid 65534 reject`.
+- Take over, driven by a software passkey over `/api/ws` (a Python stand-in for `tests/web.rs`'s `Authenticator`): an unsigned take is `-32602 approve with your passkey`; the signed one answers a ticket; `/api/vnc` without a ticket and with the used one is 401; with it, the real x11vnc answers `RFB 003.008` through the socket.
+- During the takeover, as the agent's uid: x11vnc runs as the agent with `-inetd` and no listening socket (`/proc/net/tcp` lists only the proxy, Docker's DNS and the daemon's two ports on the container's address; `/proc/net/unix` names no VNC socket); 127.0.0.1:5900-5999 has nothing open; the container's address on 5900, 20793 and 20790 is refused. `desktop-held` is root's, 0644.
+- `agent-browser snapshot` and `xdotool key a` as the agent wait; no real binary starts. At the hand back both exit 1 with `zephyr: the owner used the desktop from 05:32 to 05:32; this command did not run. The page may have changed: take a fresh snapshot before acting.`, the VNC socket closes, x11vnc is gone and the flag is removed. Afterwards `xdotool getmouselocation` and `agent-browser --version` run as before.
+
+**Deviations of the lane as a whole** (each task's own are under the task):
+- Deviation: whisper runs on the CPU only (`-ng`). As `nobody` with a cleared environment the NVIDIA driver recompiles its shaders on every run, which made Vulkan slower than the CPU (12 s against 8 s for a 9 s clip; 0.9 s once a shader cache folder is given). `voice::gpu` and the "on GPU" doctor line are not built; the spec's "on the GPU when there is one" waits for a cache folder that only `nobody` can write.
+- Deviation: the spec's whisper argv is wrong for 1.9.5: `-np` also hides the detected language, so it is not passed and the language is read from stderr.
+- Deviation: a bug found in review after integration, fixed with its test in `150d1c9`: Piper's sample rate was given to ffmpeg as an output option, so a spoken reply would have played at twice its speed.
+- Deviation: the voice outbox row has no inbox id (`outbox.inbox_id` is UNIQUE), where the spec asks for the same one.
+- Deviation: the fakes are reached through `Config::voice_dir`, not PATH (decision 1), against the task brief's "fakes on PATH".
+- Deviation: the "voice note through the inbox path" check in the side container is the ignored test run inside it, not a message through a live Discord or iMessage adapter: the side container has no channel account.
+- Deviation: no Korean fixture is committed (no clean CC0 clip was found), so the ignored test's Korean half runs only when `tests/fixtures/voice/ko.ogg` is put there.
+- Deviation: noVNC 1.7.0 does not work whole under the unchanged CSP (`img-src 'self'` blocks its `data:` images), so `app.js` drops the encodings that need them.
+
+**Not verified:**
+- The Desktop screen in a real browser: noVNC drawing the screen, the pointer, the phone keyboard field (Hangul, Backspace on Android), and a console free of CSP errors. Only the daemon side and the RFB banner were driven. README's manual check on iOS Safari and Android Chrome stands before release.
+- A voice note through a real Discord or iMessage message, and the spoken reply arriving as a voice message there.
+- The take and hand-back notes reaching a real rpi run: the side container had no signed-in account, so main never ran. The tests cover it against `fake-rpi.py`.
+- The GPU path, arm64, and `KO_VOICE=1` in a full image (the stage alone was built with it).
+- `tests/net_floor.rs` was not extended or run for uid 65534 or `/api/vnc`; the same facts were checked by hand above.
