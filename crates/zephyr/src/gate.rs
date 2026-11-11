@@ -4120,6 +4120,7 @@ mod tests {
             main: mpsc::channel(1).0,
             desktop: crate::desktop::Control::new(&h.cfg),
             desktop_waits: Arc::new(tokio::sync::Semaphore::new(1)),
+            pace: Arc::new(Pace::default()),
         };
         let wake = crate::scheduler::Wake::default();
         let db = rusqlite::Connection::open(h.cfg.db_path()).unwrap();
