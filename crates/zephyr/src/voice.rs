@@ -61,17 +61,29 @@ const VAD_MODEL: &str = "models/ggml-silero-v5.1.2.bin";
 /// What came of one voice note.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Heard {
-    Said { lang: String, text: String },
+    Said {
+        lang: String,
+        text: String,
+    },
     Silence,
     TooLong,
     Failed,
     TimedOut,
+    /// Nothing ran: there is no network floor (`floored`).
+    NoFloor,
 }
 
 /// Why a process gave nothing.
 enum Stop {
     Failed,
     TimedOut,
+}
+
+/// Whether the voice programs may run at all: only under the network floor (DESIGN §4.20),
+/// whose rules are what keep `nobody` off the network. Under `network = "host"` a decoder fed a
+/// crafted file would be on the host's network, so nothing is decoded, transcribed or spoken.
+pub fn floored(cfg: &Config) -> bool {
+    crate::egress::bridge() || cfg.voice_off_floor
 }
 
 /// Whether this image has voice (built with `VOICE=1`).
@@ -99,6 +111,7 @@ pub fn line(heard: &Heard, max_secs: u64) -> String {
         ),
         Heard::Failed => "[voice note above: transcription failed]".into(),
         Heard::TimedOut => "[voice note above: transcription timed out]".into(),
+        Heard::NoFloor => "[transcript skipped: needs the network floor]".into(),
     }
 }
 
@@ -294,6 +307,9 @@ async fn run(
 /// seconds (0 when ffmpeg could not read it). One note at a time, so the browser and the agent
 /// keep their cores and a channel's rows keep their order.
 pub async fn transcribe(cfg: &Config, audio: &[u8]) -> (Heard, u64) {
+    if !floored(cfg) {
+        return (Heard::NoFloor, 0);
+    }
     static ONE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
     let _one = ONE.acquire().await;
     let mut secs = 0;
@@ -365,7 +381,9 @@ pub fn replies_aloud(cfg: &Config, channel: &str, derived: Option<&str>) -> bool
         "mirror" => derived == Some("voice"),
         _ => false,
     };
-    on && SPOKEN_ON.contains(&channel) && cfg.voice_dir.join("py/bin/python").exists()
+    on && SPOKEN_ON.contains(&channel)
+        && floored(cfg)
+        && cfg.voice_dir.join("py/bin/python").exists()
 }
 
 /// `text` as it is spoken: markdown marks and URLs gone. `None` for what is read, never heard:
@@ -453,6 +471,9 @@ fn encode_args(codec: &str) -> Vec<String> {
 /// `text` spoken, as the file `channel` takes (`format_for`), or `None`: not speakable, no
 /// voice for its language in this image, or Piper or ffmpeg failed. Both run as the decoders do.
 pub async fn speak(cfg: &Config, text: &str, channel: &str) -> Option<Vec<u8>> {
+    if !floored(cfg) {
+        return None;
+    }
     let text = speakable(text)?;
     let dir = &cfg.voice_dir;
     let voice = voice_for(dir, &text)?;
@@ -503,12 +524,18 @@ pub fn status(cfg: &Config) -> String {
     if !present(cfg) {
         return "voice: not in this image (built with VOICE=0)".into();
     }
+    if !floored(cfg) {
+        return "voice: off without the network floor (host.toml network = \"bridge\")".into();
+    }
     "voice: whisper small on CPU".into()
 }
 
 /// `doctor`'s lines, each `ok|warn <what>`: the models and voices that are there, the uid the
 /// decoders get, and a one-second silent sample through ffmpeg and whisper within 30 s.
 pub async fn doctor(cfg: &Config) -> Vec<String> {
+    if present(cfg) && !floored(cfg) {
+        return vec![format!("warn {}", status(cfg))];
+    }
     let mut lines = vec![format!("ok   {}", status(cfg))];
     if !present(cfg) {
         return lines;
@@ -578,6 +605,8 @@ pub(crate) mod tests {
             toml::from_str(&format!("rpi = '/r'\nhome = {home:?}\n{toml}")).unwrap();
         cfg.validate().unwrap();
         cfg.voice_dir = dir;
+        // The test process is not a container under the network floor, which voice needs.
+        cfg.voice_off_floor = true;
         cfg
     }
 
@@ -907,6 +936,27 @@ pub(crate) mod tests {
             assert!(at("-ar") < at("-i"), "{args:?}");
             assert_eq!(args[at("-ar") + 1], PIPER_RATE);
         }
+    }
+
+    /// The rule that gives `nobody` no network exists only under the floor: without it a
+    /// decoder would be on the host's network, so nothing is decoded or spoken.
+    #[tokio::test]
+    async fn without_the_floor_nothing_is_decoded_or_spoken() {
+        let mut cfg = fakes("voice-no-floor", "[voice]\nreply = 'always'");
+        cfg.voice_off_floor = false;
+        let (heard, secs) = transcribe(&cfg, b"ogg-bytes").await;
+        assert_eq!((&heard, secs), (&Heard::NoFloor, 0));
+        assert_eq!(
+            line(&heard, 300),
+            "[transcript skipped: needs the network floor]"
+        );
+        assert_eq!(speak(&cfg, "hello there", "discord").await, None);
+        assert!(!replies_aloud(&cfg, "discord", Some("voice")));
+        let off = "voice: off without the network floor (host.toml network = \"bridge\")";
+        assert_eq!(status(&cfg), off);
+        assert_eq!(doctor(&cfg).await, [format!("warn {off}")]);
+        let log = std::fs::read_to_string(cfg.voice_dir.join("log")).unwrap();
+        assert_eq!(log, "", "no ffmpeg, no whisper, no Piper");
     }
 
     #[test]

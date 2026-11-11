@@ -683,6 +683,9 @@ reads it as two lines under your caption, if you typed one:
   (that voice's licence is CC BY-NC-SA 4.0, non-commercial).
 - `zephyr status` says `voice: whisper small on CPU`, and `zephyr doctor` checks the models and
   transcribes a silent sample.
+- Voice needs the network floor (`network = "bridge"` in host.toml, the default): the programs
+  that read your audio get no network there. With `network = "host"` notes are saved but not
+  transcribed, nothing is spoken, and `zephyr status` says so.
 - An image built with `--build-arg VOICE=0` has no voice: notes are saved as files only.
 
 ## Signal

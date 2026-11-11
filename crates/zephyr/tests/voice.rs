@@ -65,6 +65,8 @@ fn start(name: &str, extra: &str, tweak: impl FnOnce(&mut Config)) -> Gateway {
     cfg.tick = Duration::from_millis(200);
     // Never the machine's own /opt/zephyr/voice.
     cfg.voice_dir = home.join("no-voice");
+    // The test process is not a container under the network floor, which voice needs.
+    cfg.voice_off_floor = true;
     tweak(&mut cfg);
     let (say, feed) = mpsc::channel(16);
     let sent = Sent::default();
@@ -298,7 +300,9 @@ async fn the_images_binaries_hear_what_piper_says() {
         );
         return eprintln!("skipped: no {}", voice::DIR);
     }
-    let cfg: Config = toml::from_str("rpi = '/r'\nhome = '/tmp'").unwrap();
+    let mut cfg: Config = toml::from_str("rpi = '/r'\nhome = '/tmp'").unwrap();
+    // The binaries are what is under test, wherever the image is run.
+    cfg.voice_off_floor = true;
     let said = "The meeting is tomorrow morning at nine.";
     let ogg = voice::speak(&cfg, said, "discord")
         .await

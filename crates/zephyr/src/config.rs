@@ -121,6 +121,10 @@ pub struct Config {
     /// How long one whisper run may take before it is killed. Not configurable; tests shorten it.
     #[serde(skip, default = "voice_wait")]
     pub voice_wait: std::time::Duration,
+    /// Lets voice run outside the network floor. Not configurable, and off; the tests' process
+    /// is not a container, and sets it.
+    #[serde(skip)]
+    pub voice_off_floor: bool,
     /// The file this was loaded from, which a reload reads again. `None` when built in memory.
     #[serde(skip)]
     pub path: Option<PathBuf>,
@@ -585,6 +589,7 @@ impl Config {
         self.desktop_gone = running.desktop_gone;
         self.voice_dir = running.voice_dir.clone();
         self.voice_wait = running.voice_wait;
+        self.voice_off_floor = running.voice_off_floor;
     }
 
     /// Account names become directory names, so each must be a plain, unique path segment.
