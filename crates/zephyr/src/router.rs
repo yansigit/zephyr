@@ -529,9 +529,8 @@ struct Router<'a> {
     waits: crate::actions::Waits,
     /// Who holds the desktop: the owner's takeover, or the vault's fill (DESIGN §4.11).
     desktop: Arc<crate::desktop::Control>,
-    /// `desktop`'s changes, and the hold last seen.
-    desktop_rx: watch::Receiver<Option<crate::desktop::Held>>,
-    desktop_was: Option<crate::desktop::Held>,
+    /// `desktop`'s takes and hand backs, each once and in order.
+    desktop_events: mpsc::UnboundedReceiver<crate::desktop::Event>,
     /// The hand-back note main has not been given yet: it goes in front of the next prompt.
     desktop_note: Option<String>,
     /// The last tick found the gateway paused: the next one holds what came due (I1).
@@ -707,8 +706,7 @@ impl<'a> Router<'a> {
             stopping: false,
             procs: Default::default(),
             waits: Default::default(),
-            desktop_rx: desktop.changes(),
-            desktop_was: None,
+            desktop_events: desktop.events(),
             desktop_note: None,
             desktop,
             due_held: false,
@@ -756,7 +754,7 @@ impl<'a> Router<'a> {
                 Some((session, note)) = next_gate_note(&mut self.gate_notes) => {
                     self.gate_note(&session, note).await
                 }
-                Ok(()) = self.desktop_rx.changed() => self.desktop_changed().await,
+                Some(ev) = self.desktop_events.recv() => self.desktop_changed(ev).await,
                 _ = self.jobs.outbox.notified() => {} // a job's output: flush below
                 // The `/btw` answer is in the outbox: flush below.
                 r = async { self.btw.as_mut().expect("guarded").await }, if self.btw.is_some() => {
@@ -5137,31 +5135,30 @@ impl<'a> Router<'a> {
     /// daemon's own notes, steered like the gate's, so they do not taint. At the take only a
     /// run in progress is told; the hand back is steered into a run, or waits for the next
     /// prompt. The snapshot moves last, so whoever sees it knows the note was given.
-    async fn desktop_changed(&mut self) {
-        let held = self.desktop_rx.borrow_and_update().clone();
-        let was = std::mem::replace(&mut self.desktop_was, held.clone());
-        match (was, &held) {
-            (None, Some(now)) if self.busy => {
+    async fn desktop_changed(&mut self, event: crate::desktop::Event) {
+        use crate::desktop::Event;
+        match event {
+            Event::Took(held) if self.busy => {
                 let note = format!(
                     "[zephyr] the owner took over the desktop at {}; browser and desktop \
                      commands wait until they hand it back. Do other work meanwhile.",
-                    self.clock(now.since)
+                    self.clock(held.since)
                 );
                 self.steer_note(note).await;
             }
-            (Some(was), None) => {
+            Event::Took(_) => {}
+            Event::Gave { since, until } => {
                 let note = format!(
                     "[zephyr] the owner used the desktop from {} to {}. The page may have \
                      changed: take a fresh snapshot before acting.",
-                    self.clock(was.since),
-                    self.clock(crate::now())
+                    self.clock(since),
+                    self.clock(until)
                 );
                 match self.busy {
                     true => drop(self.steer_note(note).await),
                     false => self.desktop_note = Some(note),
                 }
             }
-            _ => {}
         }
         let state = self.desktop_state();
         update(&self.snap, |s| s.desktop = state);

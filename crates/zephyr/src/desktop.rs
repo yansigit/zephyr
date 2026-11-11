@@ -12,7 +12,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 static RUNNING: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 
@@ -178,6 +178,21 @@ pub struct Control {
     /// Fills running now. Every change to `held` is made holding this lock.
     fills: Mutex<usize>,
     held: watch::Sender<Option<Held>>,
+    /// Every take and hand back, in order, for the router's notes: a `watch` would fold a take
+    /// and a quick hand back into no change at all.
+    events: mpsc::UnboundedSender<Event>,
+    taken: Mutex<Option<mpsc::UnboundedReceiver<Event>>>,
+}
+
+/// What happened to the desktop, for whoever tells main and the owner (`Control::events`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    Took(Held),
+    /// Handed back, by the owner or by itself: held from `since` to `until`.
+    Gave {
+        since: i64,
+        until: i64,
+    },
 }
 
 /// A fill in progress; the desktop cannot be taken until it is dropped.
@@ -193,23 +208,47 @@ impl Control {
     /// Nobody holds the desktop at a start: a flag a crash left is removed. The wrappers that
     /// waited on the old daemon's socket have already exited 1.
     pub fn new(cfg: &Config) -> Arc<Control> {
+        let (events, taken) = mpsc::unbounded_channel();
         let control = Control {
             cfg: cfg.clone(),
             fills: Mutex::new(0),
             held: watch::channel(None).0,
+            events,
+            taken: Mutex::new(Some(taken)),
         };
         let _ = std::fs::remove_file(control.flag());
         Arc::new(control)
+    }
+
+    /// The takes and hand backs from now on, each once and in order. The router's, taken once.
+    pub fn events(&self) -> mpsc::UnboundedReceiver<Event> {
+        let taken = self.taken.lock().unwrap_or_else(|e| e.into_inner()).take();
+        taken.unwrap_or_else(|| mpsc::unbounded_channel().1)
     }
 
     fn flag(&self) -> PathBuf {
         crate::drafts::public_dir(&self.cfg).join(HELD_FILE)
     }
 
-    /// The owner takes the desktop: the flag is written before anyone hears of it. The session
-    /// that holds it may take it again (a new ticket after its socket dropped).
+    /// The owner takes the desktop. The session that holds it may take it again (a new ticket
+    /// after its socket dropped).
     pub fn take(&self, session: [u8; 32], now: i64) -> Result<(), &'static str> {
         use std::os::unix::fs::PermissionsExt;
+        self.take_writing(session, now, |flag| {
+            std::fs::write(flag, format!("{now}\n"))?;
+            std::fs::set_permissions(flag, PermissionsExt::from_mode(0o644))
+        })
+    }
+
+    /// `take`, the flag written by `write`. The hold is published first: a wrapper that sees the
+    /// flag asks the gate, which must already see the hold, or it would answer "go on". The
+    /// flag is there whenever the hold is, never the other way round.
+    fn take_writing(
+        &self,
+        session: [u8; 32],
+        now: i64,
+        write: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+    ) -> Result<(), &'static str> {
         let fills = self.fills.lock().unwrap_or_else(|e| e.into_inner());
         match self.held() {
             Some(held) if held.session == session => return Ok(()),
@@ -217,25 +256,21 @@ impl Control {
             None if *fills > 0 => return Err(FILLING),
             None => {}
         }
+        let held = Held {
+            since: now,
+            session,
+        };
+        self.held.send_replace(Some(held.clone()));
         // Without the flag the wrappers would not wait: then there is no takeover.
         let flag = self.flag();
-        let written = crate::drafts::ensure_public_dir(&self.cfg)
-            .and_then(|_| Ok(std::fs::write(&flag, format!("{now}\n"))?))
-            .and_then(|()| {
-                Ok(std::fs::set_permissions(
-                    &flag,
-                    PermissionsExt::from_mode(0o644),
-                )?)
-            });
+        let written = crate::drafts::ensure_public_dir(&self.cfg).and_then(|_| Ok(write(&flag)?));
         if let Err(e) = written {
             eprintln!("zephyr: writing {}: {e:#}", flag.display());
             let _ = std::fs::remove_file(&flag);
+            self.held.send_replace(None);
             return Err(NO_FLAG);
         }
-        self.held.send_replace(Some(Held {
-            since: now,
-            session,
-        }));
+        let _ = self.events.send(Event::Took(held));
         Ok(())
     }
 
@@ -247,6 +282,10 @@ impl Control {
             // The wrappers then still ask the gate, which lets them run at once.
             eprintln!("zephyr: removing {}: {e}", self.flag().display());
         }
+        let _ = self.events.send(Event::Gave {
+            since: held.since,
+            until: now,
+        });
         Some((held.since, now))
     }
 
@@ -398,6 +437,60 @@ mod tests {
         assert!(control.fill().is_none());
         control.give(101);
         assert!(control.fill().is_some());
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&cfg));
+    }
+
+    /// A wrapper that sees the flag asks the gate at once: the gate must see the hold by then.
+    #[test]
+    fn the_hold_is_published_before_the_flag_is_written() {
+        let (cfg, control) = control("desktop-order");
+        let mut changes = control.changes();
+        let seen = control.take_writing([1; 32], 100, |flag| {
+            assert_eq!(control.held().map(|h| h.since), Some(100));
+            std::fs::write(flag, "100\n")
+        });
+        assert_eq!(seen, Ok(()));
+        // A flag that cannot be written is no takeover, and nobody is told of one.
+        control.give(101);
+        let mut events = control.events();
+        while events.try_recv().is_ok() {}
+        let failed = control.take_writing([1; 32], 102, |_| Err(std::io::Error::other("full")));
+        assert_eq!(failed, Err(NO_FLAG));
+        assert!(control.held().is_none() && !flag(&cfg).exists());
+        assert!(events.try_recv().is_err());
+        assert!(changes.borrow_and_update().is_none());
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&cfg));
+    }
+
+    /// The router must hear of both, however fast the second follows the first.
+    #[test]
+    fn a_take_and_a_give_back_to_back_are_two_events_in_order() {
+        let (cfg, control) = control("desktop-events");
+        let mut events = control.events();
+        control.take([1; 32], 100).unwrap();
+        control.give(160);
+        control.take([2; 32], 170).unwrap();
+        // Its own session again is no new takeover.
+        control.take([2; 32], 175).unwrap();
+        control.give(180);
+        assert_eq!(control.give(181), None);
+        let held = |since, session| Held { since, session };
+        let got: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(
+            got,
+            [
+                Event::Took(held(100, [1; 32])),
+                Event::Gave {
+                    since: 100,
+                    until: 160
+                },
+                Event::Took(held(170, [2; 32])),
+                Event::Gave {
+                    since: 170,
+                    until: 180
+                },
+            ]
+        );
         let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&cfg));
     }
 

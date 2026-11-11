@@ -2758,6 +2758,15 @@ impl Gateway {
     }
 }
 
+/// Waits until `done` holds, looking again every 20 ms.
+async fn eventually(what: &str, done: impl Fn() -> bool) {
+    let until = std::time::Instant::now() + WAIT;
+    while !done() {
+        assert!(std::time::Instant::now() < until, "never: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Sends `bytes` and reads as many back.
 async fn echoed(sock: &mut Vnc, bytes: &[u8]) -> Vec<u8> {
     sock.send(Message::Binary(bytes.to_vec())).await.unwrap();
@@ -3115,6 +3124,16 @@ async fn main_is_told_at_take_and_at_hand_back_and_stays_clean() {
     assert_eq!(notes.len(), 3, "{notes:?}");
     assert!(
         notes[2].starts_with("[zephyr] the owner used the desktop from "),
+        "{notes:?}"
+    );
+    // A take and a hand back made back to back are still two notes, in that order.
+    ws.ticket(&phone).await;
+    ws.rpc("zephyr.desktop", json!({"verb": "give"})).await;
+    eventually("both notes", || steers(&gw).len() == 5).await;
+    let notes = steers(&gw);
+    assert!(
+        notes[3].starts_with("[zephyr] the owner took over the desktop at ")
+            && notes[4].starts_with("[zephyr] the owner used the desktop from "),
         "{notes:?}"
     );
     ws.say("/stop").await;

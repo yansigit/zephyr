@@ -260,6 +260,7 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
 - Deviation: `Control::take` by the session that already holds the desktop succeeds and changes nothing (it needs a fresh ticket after its socket dropped, C2-7), and has a third refusal, `the desktop could not be held; zephyr doctor says why`, when the flag cannot be written: without the flag the wrappers would not wait.
 - Deviation: one more test, `tests/cli.rs` `xdotool_is_the_wrapper_and_does_not_run_while_the_desktop_is_held`, runs the binary under the name `xdotool`, since the `argv[0]` dispatch is in `main.rs`, which no unit test reaches. `desktop.rs` also has `a_held_command_is_told_since_when_and_what_to_do` for the two texts.
 - Deviation: `vault::agent` takes the `Control` as a parameter (the fill itself is spawned there), and `vault::fill` is unchanged.
+- Review fix: `Control::take` publishes the hold before it writes `desktop-held` (it wrote the file first, so a wrapper could see the file, ask the gate, be told nothing was held and run), and takes it back when the write fails. The router's notes come from `Control::events`, an ordered queue, not from the `watch`, which folded a take and a quick hand back into nothing.
 
 ### Task C2-7: Take over, the ticket, `/api/vnc`, x11vnc, the notes and the timeouts
 
