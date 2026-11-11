@@ -204,24 +204,30 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
     }
     init_approvals(h, preset)?;
     // After the preset, so web setup's strong-channel and money offers come after it.
-    let started = init_web(h)?;
-    if started {
-        // web setup started the container itself, with every port.
-    } else if h.published()? != published {
-        println!("a published port changed: starting the container again to publish it");
-        h.up_checked()?;
-    } else {
-        run(&mut super::docker(&["restart", &h.container]))?;
+    use super::web::Restart;
+    match init_web(h)? {
+        // web setup made the container again, with every port.
+        Restart::Done => {}
+        Restart::Declined => {
+            println!("not starting zephyr again, as you asked; zephyr up applies the changes");
+        }
+        // A restart cannot publish a port this run added; `republish` makes it again for that.
+        Restart::NotAsked => {
+            if !h.republish(&published)? {
+                run(&mut super::docker(&["restart", &h.container]))?;
+            }
+        }
     }
     h.doctor(false)
 }
 
-/// Init's web app step (DESIGN §4.8): offered, default no. True when `zephyr web setup` started
-/// the container; an error is printed and init carries on, as a failed sign-in does.
-fn init_web(h: &Host) -> anyhow::Result<bool> {
+/// Init's web app step (DESIGN §4.8): offered, default no. What web setup did about restarting
+/// zephyr; an error is printed and init carries on, as a failed sign-in does.
+fn init_web(h: &Host) -> anyhow::Result<super::web::Restart> {
+    use super::web::Restart;
     if !h.bridge()? {
         println!("web app: {}", crate::web::NEEDS_FLOOR);
-        return Ok(false);
+        return Ok(Restart::NotAsked);
     }
     let prompt = match conf::get(&h.data.load()?, "web.host") {
         Some(host) => {
@@ -235,15 +241,13 @@ fn init_web(h: &Host) -> anyhow::Result<bool> {
         .default(false)
         .interact()?
     {
-        return Ok(false);
+        return Ok(Restart::NotAsked);
     }
-    match super::web::setup(h, false) {
-        Ok(started) => Ok(started),
-        Err(e) => {
-            println!("web app: {e:#}");
-            Ok(false)
-        }
+    let mut restart = Restart::NotAsked;
+    if let Err(e) = super::web::setup(h, false, &mut restart) {
+        println!("web app: {e:#}");
     }
+    Ok(restart)
 }
 
 /// Writes `preset` as `/approvals PRESET` does (D11, `approvals::preset_edits`): the preset, and

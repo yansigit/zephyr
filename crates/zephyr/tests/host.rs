@@ -684,6 +684,69 @@ fn init_adding_imessage_publishes_its_port_and_offers_the_forward() {
     assert_eq!(at(&calls, &["docker", "restart"], ""), None, "{calls:#?}");
 }
 
+/// init's prompts up to web setup's restart question, for a fresh install that sets up the web app.
+fn init_into_web_setup(restart: &'static str) -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("Projects folder", "\n"),
+        ("Providers", "\n"),
+        ("Set up discord?", "n"),
+        ("Set up imessage?", "n"),
+        ("Approvals: how much", "\n"),
+        ("Add private facts", "n"),
+        ("Set up the web app", "y"),
+        ("Write [web] host", "y"),
+        ("Run `tailscale serve", "y"),
+        ("Start zephyr again", restart),
+    ]
+}
+
+/// The owner declined web setup's restart: init neither makes the container again nor restarts it.
+#[test]
+fn init_leaves_the_container_alone_when_the_web_restart_is_declined() {
+    let env = Env::new("init-web-declined");
+    env.init(&["--no-start"]);
+    let steps = init_into_web_setup("n");
+    let (code, shown) =
+        env.on_a_driven_tty_env(&["init"], &steps, &[("SHIM_TS_STATUS", TS_STATUS)]);
+    assert!(
+        shown.contains("LEFT 0"),
+        "every prompt was answered: {shown}"
+    );
+    assert_eq!(code, 0, "{shown}");
+    let calls = env.calls();
+    let runs = calls.iter().filter(|c| c.starts_with(&s(RUN))).count();
+    assert_eq!(runs, 1, "only init's first up: {calls:#?}");
+    assert_eq!(at(&calls, &["docker", "restart"], ""), None, "{calls:#?}");
+    assert!(shown.contains("zephyr up applies the changes"), "{shown}");
+}
+
+/// web setup started the container, then failed: init prints the error and starts nothing again.
+#[test]
+fn init_does_not_restart_again_after_web_setup_fails_past_its_restart() {
+    let env = Env::new("init-web-error");
+    env.init(&["--no-start"]);
+    let path = env.daemon().join("zephyr.toml");
+    let text = format!(
+        "{}\n[settings]\nstrong_channels = [\"tui\", \"chat\"]\n",
+        env.config()
+    );
+    std::fs::write(&path, text).unwrap();
+    let mut steps = init_into_web_setup("y");
+    steps.push(("Let an approval signed with a passkey", "y"));
+    let vars = [("SHIM_TS_STATUS", TS_STATUS), ("SHIM_SET_REFUSE", "no")];
+    let (code, shown) = env.on_a_driven_tty_env(&["init"], &steps, &vars);
+    assert!(
+        shown.contains("LEFT 0"),
+        "every prompt was answered: {shown}"
+    );
+    assert_eq!(code, 0, "{shown}");
+    assert!(shown.contains("web app: "), "the error is shown: {shown}");
+    let calls = env.calls();
+    let runs = calls.iter().filter(|c| c.starts_with(&s(RUN))).count();
+    assert_eq!(runs, 2, "init's first up and web setup's: {calls:#?}");
+    assert_eq!(at(&calls, &["docker", "restart"], ""), None, "{calls:#?}");
+}
+
 /// Under host networking the web app cannot run (DESIGN §4.3.3), so init does not offer it.
 #[test]
 fn init_under_host_networking_skips_the_web_app() {

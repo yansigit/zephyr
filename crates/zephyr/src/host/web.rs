@@ -12,7 +12,7 @@ pub(super) fn main(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let yes = a.flag("--yes");
     let rest = a.rest()?;
     match rest.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        ["setup"] => setup(h, yes).map(|_| ()),
+        ["setup"] => setup(h, yes, &mut Restart::NotAsked),
         ["enrol"] if !yes => enrol(h, None),
         ["enrol", name] if !yes => enrol(h, Some(name)),
         _ => bail!("usage: zephyr web setup [--yes] | web enrol [NAME]"),
@@ -105,8 +105,19 @@ fn set(h: &Host, key: &str, value: &str) -> anyhow::Result<()> {
     run(&mut h.exec(&[], &[], &["zephyr", "set", key, value]))
 }
 
-/// True once it has started the container again (step 6), which `init` then need not.
-pub(super) fn setup(h: &Host, yes: bool) -> anyhow::Result<bool> {
+/// What `setup` did about starting zephyr again (step 6), set as it happens so that it holds
+/// even when a later step fails: `init` decides its own last step from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Restart {
+    /// Setup stopped (or failed) before the question.
+    NotAsked,
+    /// The owner said no: nothing may start the container again now.
+    Declined,
+    /// The container was made again, with every port zephyr.toml asks for.
+    Done,
+}
+
+pub(super) fn setup(h: &Host, yes: bool, restart: &mut Restart) -> anyhow::Result<()> {
     // Under host networking the agent could reach the port; the daemon would not start the app.
     if !h.bridge()? {
         bail!("{}", crate::web::NEEDS_FLOOR);
@@ -130,7 +141,7 @@ pub(super) fn setup(h: &Host, yes: bool) -> anyhow::Result<bool> {
             yes,
             &format!("Write [web] host = \"{name}\", port = {port} to zephyr.toml?"),
         )? {
-            return Ok(false);
+            return Ok(());
         }
         conf::set(&mut doc, "web.host", &name)?;
         conf::set(&mut doc, "web.port", port)?;
@@ -147,7 +158,7 @@ pub(super) fn setup(h: &Host, yes: bool) -> anyhow::Result<bool> {
         yes,
         &format!("Run `tailscale serve --bg {target}` (HTTPS on your tailnet only)?"),
     )? {
-        return Ok(false);
+        return Ok(());
     }
     serve(&["--bg", &target], "zephyr web setup")?;
     // 5
@@ -162,10 +173,12 @@ pub(super) fn setup(h: &Host, yes: bool) -> anyhow::Result<bool> {
         yes,
         "Start zephyr again so the web app listens (`zephyr up`)?",
     )? {
-        return Ok(false);
+        *restart = Restart::Declined;
+        return Ok(());
     }
     h.ensure_image(false, false)?;
     h.up_checked()?;
+    *restart = Restart::Done;
 
     // 7: a list the owner wrote keeps what it has; passkey is offered.
     let strong = doc.get("settings").and_then(|s| s.get("strong_channels"));
@@ -205,7 +218,7 @@ pub(super) fn setup(h: &Host, yes: bool) -> anyhow::Result<bool> {
         }
     }
     println!("the web app is at https://{name}");
-    Ok(true)
+    Ok(())
 }
 
 /// The host's part of `zephyr status`: whether `tailscale serve` forwards to the web app. Nothing

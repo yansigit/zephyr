@@ -552,11 +552,22 @@ impl Host {
     /// ports it was made with, so when those changed from `before` it is made again; any other
     /// edit is the daemon's to reload.
     pub(crate) fn apply_published(&self, before: &[(&'static str, u16)]) -> anyhow::Result<()> {
-        if self.running() && self.floored() && self.published()? != before {
-            println!("a published port changed: starting the container again to publish it");
-            return self.up_checked();
+        if self.republish(before)? {
+            return Ok(());
         }
         self.apply()
+    }
+
+    /// Makes the container again when it must be, to publish zephyr.toml's ports: it runs, under
+    /// the network floor (which publishes only the ports a container was made with), and those
+    /// differ from `before`. True when it did.
+    pub(crate) fn republish(&self, before: &[(&'static str, u16)]) -> anyhow::Result<bool> {
+        if !(self.running() && self.floored() && self.published()? != before) {
+            return Ok(false);
+        }
+        println!("a published port changed: starting the container again to publish it");
+        self.up_checked()?;
+        Ok(true)
     }
 
     /// The container's address on its bridge network.
