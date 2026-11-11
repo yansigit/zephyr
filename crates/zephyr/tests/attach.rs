@@ -489,11 +489,17 @@ async fn zephyr_hello_returns_the_snapshot() {
             "failed_replies": 0,
             "run": {"busy": false, "since_unix_ms": null, "origin": null, "current_tool": null, "tools_done": 0},
             "proposals": 0,
+            // No `$ZEPHYR_DESKTOP` here.
+            "desktop": null,
             // No auth.json in the account's dir.
             "accounts": [{"name": "a", "model": "fake/m1", "state": "needs login", "until_unix": null}],
             "jobs": [],
         })
     );
+
+    // The desktop's takeover is the web app's, signed with its passkey: not open here.
+    let take = c.call("zephyr.desktop", json!({"verb": "give"})).await;
+    assert_eq!(take["error"]["code"], -32601, "{take}");
 
     // Jobs come by their next run.
     gw.say("j1", "/job add later | 2999-01-01T00:00:00Z | hi")

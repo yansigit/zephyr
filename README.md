@@ -574,7 +574,7 @@ port = 7793                        # the default; the daemon listens on 127.0.0.
 The daemon refuses any request whose `Host` is not that name, that did not come through
 `tailscale serve`, or (for anything that changes something) that does not come from the app's own
 page. `zephyr status` says `web: listening`, and `zephyr doctor` checks the listener and the
-push key.
+push key, and in its `desktop` line whether the app can take the agent's desktop over.
 
 **Signing in.** The app has no password. Each device signs in with a passkey (Face ID, a
 fingerprint, the device PIN), and a new device needs a one-time code that only you can make:

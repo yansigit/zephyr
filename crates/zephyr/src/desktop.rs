@@ -269,6 +269,46 @@ impl Control {
     }
 }
 
+/// What is wrong with the takeover as the image lays it out (doctor's `desktop` line, DESIGN
+/// §4.3.3); empty when it is ready. `up` is whether the daemon runs: it removes a flag a crash
+/// left when it starts, so one found beside a running daemon is a takeover in progress.
+pub fn check(cfg: &Config, up: bool) -> Vec<String> {
+    let flag = crate::drafts::public_dir(cfg).join(HELD_FILE);
+    let link = std::path::Path::new(crate::browser_gate::GATE_BIN).join("xdotool");
+    let me = std::fs::canonicalize("/proc/self/exe").unwrap_or_default();
+    problems(&cfg.x11vnc, &flag, up, &link, &me, 0)
+}
+
+fn problems(
+    x11vnc: &std::path::Path,
+    flag: &std::path::Path,
+    up: bool,
+    link: &std::path::Path,
+    me: &std::path::Path,
+    owner: u32,
+) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut found = Vec::new();
+    if !x11vnc.is_file() {
+        found.push(format!("{} is missing", x11vnc.display()));
+    }
+    if !up && flag.symlink_metadata().is_ok() {
+        let flag = flag.display();
+        found.push(format!(
+            "{flag} is left from a crash (the next start removes it)"
+        ));
+    }
+    // The link itself is root's, in root's folder (doctor checks the folder), and names zephyr.
+    let roots = link.symlink_metadata().is_ok_and(|m| m.uid() == owner);
+    if !roots || std::fs::canonicalize(link).ok().as_deref() != Some(me) {
+        let link = link.display();
+        found.push(format!(
+            "{link} is not root's link to zephyr, so xdotool does not wait"
+        ));
+    }
+    found
+}
+
 /// `at` as `HH:MM` in the owner's time zone.
 pub fn clock(cfg: &Config, at: i64) -> String {
     let tz = crate::scheduler::zone(cfg).unwrap_or(jiff::tz::TimeZone::UTC);
@@ -370,6 +410,51 @@ mod tests {
         let again = Control::new(&cfg);
         assert!(again.held().is_none() && !flag(&cfg).exists());
         let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&cfg));
+    }
+
+    #[test]
+    fn doctor_names_what_the_takeover_lacks() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::test_dir("desktop-doctor");
+        let (x11vnc, flag, link, me) = (
+            dir.join("x11vnc"),
+            dir.join(HELD_FILE),
+            dir.join("xdotool"),
+            dir.join("zephyr"),
+        );
+        let mine = std::fs::metadata(&dir).unwrap().uid();
+        let found = |up: bool| problems(&x11vnc, &flag, up, &link, &me, mine);
+        assert_eq!(found(true).len(), 2, "{:?}", found(true));
+        std::fs::write(&x11vnc, "").unwrap();
+        std::fs::write(&me, "").unwrap();
+        std::fs::write(dir.join("other"), "").unwrap();
+        std::os::unix::fs::symlink(dir.join("other"), &link).unwrap();
+        assert_eq!(
+            found(true),
+            [format!(
+                "{} is not root's link to zephyr, so xdotool does not wait",
+                link.display()
+            )]
+        );
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&me, &link).unwrap();
+        assert_eq!(found(true), [""; 0]);
+        // Another owner's link, even to zephyr, is not root's.
+        assert_eq!(
+            problems(&x11vnc, &flag, true, &link, &me, mine + 1).len(),
+            1
+        );
+        // A flag beside a running daemon is a takeover; beside none, a crash left it.
+        std::fs::write(&flag, "100\n").unwrap();
+        assert_eq!(found(true), [""; 0]);
+        assert_eq!(
+            found(false),
+            [format!(
+                "{} is left from a crash (the next start removes it)",
+                flag.display()
+            )]
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

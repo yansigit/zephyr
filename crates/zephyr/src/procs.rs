@@ -1263,6 +1263,8 @@ mod tests {
             (13, ps(11, "sh")),
             (15, ps(10, "openbox")),
             (16, ps(15, "sh")),
+            // The takeover's x11vnc: the daemon's own child, so no stray.
+            (17, ps(10, "x11vnc")),
             (50, ps(1, "Xvfb")),
             (51, ps(50, "xkbcomp")),
             (52, ps(1, "openbox")),

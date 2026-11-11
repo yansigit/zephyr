@@ -723,6 +723,12 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
                 _ => println!("warn {what} does not run ({program})"),
             }
         }
+        // The takeover from the web app (DESIGN §4.3.3).
+        let up = std::os::unix::net::UnixStream::connect(cfg.socket_path()).is_ok();
+        match zephyr::desktop::check(cfg, up).as_slice() {
+            [] => println!("ok   desktop: the web app can take it over"),
+            wrong => println!("warn desktop: {}", wrong.join("; ")),
+        }
         if !Path::new("/dev/nvidia0").exists() {
             println!("warn no GPU in the container: the browser's WebGL is software (SwiftShader)");
         }

@@ -265,7 +265,7 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
 - x11vnc: `cfg.x11vnc` with `-inetd -once -norc -nocmds -noremote -nossl -quiet -display $ZEPHYR_DESKTOP -auth <home>/.zephyr-xauthority`, through `agent::cmd`, its stdin and stdout one socketpair, killed when the socket ends.
 - Notes to main through the gate-note path: at take `[zephyr] the owner took over the desktop at 14:04; browser and desktop commands wait until they hand it back. Do other work meanwhile.`; after the hand back the "used the desktop from … to …" sentence, steered into a run or put in front of the next prompt. An automatic hand back tells the owner `[zephyr] the desktop went back to the agent after 10 min without input` (or `after 60 min`, or `after the app closed`).
 
-- [ ] **Step 1: Failing tests** in `tests/web.rs` (a fake x11vnc script that echoes its stdin, on `cfg.x11vnc`; Review Focus 3, 4, 5):
+- [x] **Step 1: Failing tests** in `tests/web.rs` (a fake x11vnc script that echoes its stdin, on `cfg.x11vnc`; Review Focus 3, 4, 5):
   - `take_over_needs_a_passkey_signature_and_give_does_not`;
   - `a_ticket_works_once_for_its_session_within_30_s` (no ticket, a used one, another session's, one made 31 s ago: each 401);
   - `a_second_vnc_socket_is_refused_and_a_text_frame_closes_the_first`;
@@ -276,10 +276,18 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
   - `a_fill_during_a_takeover_is_refused`;
   - `snapshot_shows_who_holds_the_desktop`;
   - `every_method_the_app_calls_is_open_to_it` already exists: it must pass with `zephyr.desktop`.
-- [ ] **Step 2: Run** `cargo test -p zephyr --test web` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** → PASS; `cargo test -p zephyr`.
-- [ ] **Step 5: Commit** `feat(web): let the owner take the desktop over with a passkey, over an x11vnc that listens nowhere`.
+- [x] **Step 2: Run** `cargo test -p zephyr --test web` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** → PASS; `cargo test -p zephyr`.
+- [x] **Step 5: Commit** `feat(web): let the owner take the desktop over with a passkey, over an x11vnc that listens nowhere`.
+- Deviation: one more hidden `Config` field than decision 8 lists, `desktop` (`$ZEPHYR_DESKTOP`): the tests cannot set the variable, which would make every child start try to run Xvfb, and the takeover needs to know there is a desktop and its display.
+- Deviation: the 30 s of `a_ticket_works_once_for_its_session_within_30_s` are checked in `web/vnc.rs` (`a_ticket_is_its_sessions_for_30_s_and_only_its_hash_is_kept`, with the clock passed in), not in `tests/web.rs`, which cannot age a ticket without a 31 s wait. A ticket is spent by whoever presents it.
+- Deviation: the 60 s after a closed socket count only once a socket has been open; a take whose socket never opens goes back after the 10 idle minutes. Counting from the take would race the app's own first connect, and made the test's 200 ms a coin toss.
+- Deviation: "no input" is no RFB KeyEvent or PointerEvent, read from the first byte of each client frame (noVNC sends one message per frame), since noVNC's screen requests would otherwise keep a forgotten tab's takeover alive. `shortcut:` in `vnc::is_input`.
+- Deviation: the notes do not go through `GateNote` (decision 5), whose path drops a note for a run that is not busy and needs the session's name; the router watches `Control::changes` itself and calls the same `steer_note`. The hand-back note "in front of the next prompt" is a steer queued just before that `prompt`, which rpi (and fake-rpi) delivers as the run starts; putting it into the prompt's own text would break `untag` and `reconcile`. Its text drops "this command did not run", which is true only of a held command.
+- Deviation: the idle and cap tests are named `an_idle_takeover_gives_the_desktop_back` and `a_takeover_ends_at_its_cap`, and their arithmetic is `vnc::the_desktop_goes_back_after_no_input_the_cap_or_a_closed_socket`. Added: `without_a_desktop_there_is_nothing_to_take`, the cross-signature checks in `take_over_needs_a_passkey_signature_and_give_does_not`, the TUI's `-32601` in `tests/attach.rs`, and `desktop::doctor_names_what_the_takeover_lacks`.
+- Deviation: `procs.rs` needed no change: x11vnc is the daemon's own child, which `strays` already spares; its test has a row for it. doctor's `desktop` line is a warning, like the block it is in, so an image without the `xdotool` link (before C2-9) does not fail doctor.
+- Deviation: README gets only the doctor line here; "Take over the desktop" comes with the screen in C2-8.
 
 ### Task C2-8: The Desktop screen and noVNC in the app
 

@@ -189,6 +189,15 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   and refuses its own verbs with `tools::NEEDS_PASSKEY`: give a new such verb the same check.
   Two channels: `web` is the session cookie alone and weak; `passkey` is a signed decision and in
   the default `strong_channels`.
+- Desktop takeover (DESIGN §4.3.3, §4.11): `desktop::Control` is the one lock the owner's takeover
+  and the vault's fill share; a take writes root's `<state>-public/desktop-held`, and the
+  `agent-browser` and `xdotool` wrappers (`browser_gate::held`, `xdotool` dispatched on `argv[0]`
+  like `agent-browser`) then wait on the gate socket (`{"desktop": "wait"}`) and exit 1 without
+  running. `web/vnc.rs`: the passkey-signed `zephyr.desktop` take answers a one-use ticket,
+  `/api/vnc` joins a WebSocket to an `x11vnc -inetd` on an unnamed socketpair (it listens
+  nowhere, and runs as the agent), and `watchdog` gives the desktop back after 10 min idle, 60 min
+  or 60 s after the socket closed (hidden `Config::desktop_*`). `Router::desktop_changed` steers
+  the take and hand-back notes into main, which do not taint.
 - `inbox.rs`: files the owner sends on Discord or iMessage (DESIGN §4.3). The adapter saves them as
   the agent into `<home>/inbox/` before the row goes to the router and appends a
   `[attached image: <path> ...]` line per file to its text; owners come from the router's live

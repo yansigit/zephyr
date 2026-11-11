@@ -66,6 +66,7 @@ pub const WEB_METHODS: &[&str] = &[
     "ping",
     "zephyr.web_challenge",
     "zephyr.web_devices",
+    "zephyr.desktop",
 ];
 /// One subscription per connection, so the id is fixed.
 const SUB_ID: u64 = 1;
@@ -630,6 +631,7 @@ impl Conn {
             "zephyr.facts_list" | "zephyr.facts_put" | "zephyr.facts_rm" => {
                 self.facts(id, method, params)
             }
+            "zephyr.desktop" if self.web.is_some() => self.desktop(id, params),
             "zephyr.web_devices" if self.web.is_some() => {
                 let cfg = self.cfgs.borrow().clone();
                 let session = self.web.as_ref().map_or([0; 32], |w| w.0);
@@ -847,7 +849,8 @@ impl Conn {
                     current,
                 }
             }
-            _ => return refuse("op is decide or set"),
+            Some("desktop") if params["verb"] == "take" => Signed::Desktop,
+            _ => return refuse("op is decide, set or desktop"),
         };
         let cfg = self.cfgs.borrow().clone();
         // Only this session's own passkey may sign for it.
@@ -863,6 +866,39 @@ impl Conn {
             "userVerification": "required",
             "allowCredentials": [{"type": "public-key", "id": b64(&own.cred_id)}]}});
         (vec![ok(id, result)], false)
+    }
+
+    /// `zephyr.desktop` (DESIGN §4.3.3), the web app's alone: `{"verb": "take", challengeId,
+    /// assertion}` takes the agent's desktop over and answers the ticket that opens `/api/vnc`.
+    /// It is signed with the passkey, over a preimage of its own: the desktop holds the agent's
+    /// signed-in browser. `{"verb": "give"}` hands it back, unsigned: that only takes away.
+    fn desktop(&mut self, id: &Value, params: &Value) -> Reply {
+        let refuse = |why: &str| (vec![error(id, -32602, why)], false);
+        let Some((session, _, hub)) = self.web.clone() else {
+            return refuse("not available here");
+        };
+        match params["verb"].as_str() {
+            Some("take") => {
+                if params["assertion"].is_null() {
+                    return refuse("approve with your passkey");
+                }
+                if let Err(why) = self.signed(params, |s| *s == Signed::Desktop) {
+                    return refuse(why);
+                }
+                if self.cfgs.borrow().desktop.is_none() {
+                    return refuse("there is no desktop");
+                }
+                match crate::web::vnc::take(&hub, session) {
+                    Ok(ticket) => (vec![ok(id, json!({ "ticket": ticket }))], false),
+                    Err(why) => refuse(why),
+                }
+            }
+            Some("give") => {
+                hub.desktop.give(crate::now());
+                (vec![ok(id, json!({}))], false)
+            }
+            _ => refuse("verb is take or give"),
+        }
     }
 
     /// What a signed request's `challengeId` was issued for, once its `assertion` verifies

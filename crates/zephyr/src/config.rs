@@ -144,6 +144,22 @@ pub struct Config {
     /// desktop (DESIGN §4.11). Not configurable; tests shorten it.
     #[serde(skip, default = "desktop_hold")]
     pub desktop_hold: std::time::Duration,
+    /// The agent's display, which the owner may take over from the web app (DESIGN §4.3.3):
+    /// `$ZEPHYR_DESKTOP`. `None` is no desktop, so no takeover. Not configurable; tests set it.
+    #[serde(skip, default = "desktop")]
+    pub desktop: Option<String>,
+    /// x11vnc, by full path, started for each takeover. Not configurable; tests set a fake.
+    #[serde(skip, default = "x11vnc")]
+    pub x11vnc: PathBuf,
+    /// A takeover ends by itself after this long with no key or pointer from the owner, after
+    /// `desktop_cap` in all, and `desktop_gone` after its socket closed. Not configurable (no
+    /// registry rows until the owner asks for one); tests shorten them.
+    #[serde(skip, default = "desktop_idle")]
+    pub desktop_idle: std::time::Duration,
+    #[serde(skip, default = "desktop_cap")]
+    pub desktop_cap: std::time::Duration,
+    #[serde(skip, default = "desktop_gone")]
+    pub desktop_gone: std::time::Duration,
 }
 
 fn telegram_api() -> String {
@@ -188,6 +204,29 @@ fn min_until() -> std::time::Duration {
 
 fn desktop_hold() -> std::time::Duration {
     std::time::Duration::from_secs(2 * 60)
+}
+
+fn desktop() -> Option<String> {
+    std::env::var("ZEPHYR_DESKTOP")
+        .ok()
+        .filter(|d| !d.is_empty())
+}
+
+fn x11vnc() -> PathBuf {
+    PathBuf::from("/usr/bin/x11vnc")
+}
+
+// shortcut: constants, with no registry rows until the owner asks for one.
+fn desktop_idle() -> std::time::Duration {
+    std::time::Duration::from_secs(10 * 60)
+}
+
+fn desktop_cap() -> std::time::Duration {
+    std::time::Duration::from_secs(60 * 60)
+}
+
+fn desktop_gone() -> std::time::Duration {
+    std::time::Duration::from_secs(60)
 }
 
 fn floor() -> bool {
@@ -496,6 +535,11 @@ impl Config {
         self.telegram_api = running.telegram_api.clone();
         self.signal_cli = running.signal_cli.clone();
         self.desktop_hold = running.desktop_hold;
+        self.desktop = running.desktop.clone();
+        self.x11vnc = running.x11vnc.clone();
+        self.desktop_idle = running.desktop_idle;
+        self.desktop_cap = running.desktop_cap;
+        self.desktop_gone = running.desktop_gone;
     }
 
     /// Account names become directory names, so each must be a plain, unique path segment.

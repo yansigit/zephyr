@@ -5,6 +5,7 @@
 pub mod passkey;
 pub mod push;
 pub(crate) mod signin;
+pub mod vnc;
 
 pub(crate) use signin::random;
 pub use signin::{command, cookie, devices, Ceremony};
@@ -99,6 +100,9 @@ pub struct Hub {
     signing: passkey::Challenges<passkey::Signed>,
     /// Each session's notification-button presses this minute: at most 10.
     decides: std::sync::Mutex<std::collections::HashMap<[u8; 32], Window>>,
+    /// Who holds the agent's desktop, and the takeover's tickets and one socket.
+    pub(crate) desktop: Arc<crate::desktop::Control>,
+    pub(crate) vnc: vnc::Vnc,
 }
 
 /// How long a challenge waits for its signature.
@@ -107,8 +111,10 @@ const CHALLENGE_LIFE: Duration = Duration::from_secs(120);
 const MAX_CHALLENGES: usize = 16;
 
 impl Hub {
-    pub fn new() -> Arc<Hub> {
+    pub fn new(desktop: Arc<crate::desktop::Control>) -> Arc<Hub> {
         Arc::new(Hub {
+            desktop,
+            vnc: vnc::Vnc::new(),
             sockets: AtomicUsize::new(0),
             revoked: watch::channel(0).0,
             ceremonies: passkey::Challenges::new(CHALLENGE_LIFE, MAX_CHALLENGES),
@@ -214,7 +220,7 @@ pub fn admit(method: &Method, path: &str, h: &HeaderMap, web: &Web) -> Result<()
         return Err(StatusCode::FORBIDDEN);
     }
     let changes = method == Method::POST || method == Method::DELETE;
-    if changes || path == "/api/ws" {
+    if changes || path == "/api/ws" || path == "/api/vnc" {
         let own = get("origin") == Some(&format!("https://{}", web.host));
         if !own || get("sec-fetch-site").is_some_and(|site| site != "same-origin") {
             return Err(StatusCode::FORBIDDEN);
@@ -336,8 +342,15 @@ pub async fn serve(cfg: &Config, handles: Handles, hub: Arc<Hub>) -> anyhow::Res
     // Anything on the host can connect (the agent too, under host networking): a cap, so idle
     // sockets cannot use up the daemon's file descriptors, and `HEAD_WAIT` for the head.
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
+    // Beside the listener: a takeover nobody ends goes back by itself.
+    let watchdog = vnc::watchdog(app.clone());
+    tokio::pin!(watchdog);
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            () = &mut watchdog => continue,
+        };
+        let Ok((stream, _)) = accepted else {
             // shortcut: a persistent accept error (e.g. out of fds) retries every 100 ms with no backoff.
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
@@ -386,6 +399,7 @@ async fn route(req: Request<Incoming>, path: &str, app: &Arc<App>) -> Res {
     const POST: &Method = &Method::POST;
     match (req.method(), path) {
         (&Method::GET, "/api/ws") => ws(req, app),
+        (&Method::GET, "/api/vnc") => vnc::ws(req, app),
         (
             POST,
             "/api/enrol/start" | "/api/enrol/finish" | "/api/login/start" | "/api/login/finish",
@@ -458,27 +472,28 @@ fn file(req: &Request<Incoming>, path: &str) -> Res {
     }
 }
 
-/// `GET /api/ws`: the attach protocol over a WebSocket, for a signed-in browser (`admit` has
-/// checked its Origin). Answers the handshake, then bridges the socket once hyper hands it over.
-fn ws(mut req: Request<Incoming>, app: &Arc<App>) -> Res {
-    let Some(session) = app.session(req.headers()) else {
-        return text(StatusCode::UNAUTHORIZED, "");
-    };
-    let h = req.headers();
+/// What answers a WebSocket handshake (`Sec-WebSocket-Accept`); `None` when it is not one.
+fn accept_key(h: &HeaderMap) -> Option<HeaderValue> {
     let asks = |name: header::HeaderName, want: &str| {
         (h.get(name).and_then(|v| v.to_str().ok())).is_some_and(|v| {
             v.split(',')
                 .any(|part| part.trim().eq_ignore_ascii_case(want))
         })
     };
-    let key = h
-        .get(header::SEC_WEBSOCKET_KEY)
-        .map(|k| derive_accept_key(k.as_bytes()));
-    let (Some(accept), true, true) = (
-        key.and_then(|k| HeaderValue::from_str(&k).ok()),
-        asks(header::UPGRADE, "websocket"),
-        asks(header::SEC_WEBSOCKET_VERSION, "13"),
-    ) else {
+    if !asks(header::UPGRADE, "websocket") || !asks(header::SEC_WEBSOCKET_VERSION, "13") {
+        return None;
+    }
+    let key = derive_accept_key(h.get(header::SEC_WEBSOCKET_KEY)?.as_bytes());
+    HeaderValue::from_str(&key).ok()
+}
+
+/// `GET /api/ws`: the attach protocol over a WebSocket, for a signed-in browser (`admit` has
+/// checked its Origin). Answers the handshake, then bridges the socket once hyper hands it over.
+fn ws(mut req: Request<Incoming>, app: &Arc<App>) -> Res {
+    let Some(session) = app.session(req.headers()) else {
+        return text(StatusCode::UNAUTHORIZED, "");
+    };
+    let Some(accept) = accept_key(req.headers()) else {
         return text(StatusCode::BAD_REQUEST, "");
     };
     let Some(socket) = app.hub.open() else {
@@ -666,6 +681,14 @@ mod tests {
             (&get, "/", &[TS], Err(421)),
             (&get, "/", &[HOST], Err(403)),
             (&get, "/", &[("host", "evil.test")], Err(421)),
+            (&get, "/api/vnc", &[HOST, TS, ORIGIN], Ok(())),
+            (&get, "/api/vnc", &[HOST, TS], Err(403)),
+            (
+                &get,
+                "/api/vnc",
+                &[HOST, TS, ("origin", "https://evil.test")],
+                Err(403),
+            ),
             (&post, "/api/logout", &[HOST, TS, ORIGIN, JSON], Ok(())),
             (&post, "/api/logout", &[HOST, TS, JSON], Err(403)),
             (

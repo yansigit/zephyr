@@ -107,6 +107,16 @@ pub struct Snapshot {
     pub jobs: Vec<NextJob>,
     /// Proposals waiting for the owner's `/ok` or `/no`.
     pub proposals: u32,
+    /// The agent's desktop, which the web app can take over; `None` without one.
+    pub desktop: Option<DesktopState>,
+}
+
+/// Who has the agent's desktop: the owner since `since_unix`, or (`owner` false, 0) the agent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DesktopState {
+    pub owner: bool,
+    pub since_unix: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -283,13 +293,13 @@ pub async fn run<C: Channel>(
         snap: snap_rx.clone(),
         cfgs: cfg_rx.clone(),
     };
-    let hub = crate::web::Hub::new();
     let (gate_cfgs, gate_snap) = (cfg_rx.clone(), snap_rx.clone());
     let names = channels.iter().map(|c| c.name().to_string()).collect();
     let mut router = Router::new(cfg, &jobs, attaches, cfg_tx, snap, names)?;
     // The gate's held notes for main's run, steered in before the plugin is answered (R51).
     let (gate_notes, notes_rx) = mpsc::channel(16);
     router.gate_notes = Some(notes_rx);
+    let hub = crate::web::Hub::new(router.desktop.clone());
     router.web = cfg.web.is_some().then(|| hub.clone());
     // Cards that waited through the restart were pushed before it: only newer ones go out.
     let waiting = router.store.pending_proposals();
@@ -519,6 +529,11 @@ struct Router<'a> {
     waits: crate::actions::Waits,
     /// Who holds the desktop: the owner's takeover, or the vault's fill (DESIGN §4.11).
     desktop: Arc<crate::desktop::Control>,
+    /// `desktop`'s changes, and the hold last seen.
+    desktop_rx: watch::Receiver<Option<crate::desktop::Held>>,
+    desktop_was: Option<crate::desktop::Held>,
+    /// The hand-back note main has not been given yet: it goes in front of the next prompt.
+    desktop_note: Option<String>,
     /// The last tick found the gateway paused: the next one holds what came due (I1).
     due_held: bool,
     /// The gate's held notes for main's run (R51), from `gate::serve`.
@@ -636,6 +651,7 @@ impl<'a> Router<'a> {
         names: Vec<String>,
     ) -> anyhow::Result<Self> {
         let shared = cfg_tx.borrow().clone();
+        let desktop = crate::desktop::Control::new(cfg);
         Ok(Router {
             cfg: shared,
             edits: edits(cfg),
@@ -691,7 +707,10 @@ impl<'a> Router<'a> {
             stopping: false,
             procs: Default::default(),
             waits: Default::default(),
-            desktop: crate::desktop::Control::new(cfg),
+            desktop_rx: desktop.changes(),
+            desktop_was: None,
+            desktop_note: None,
+            desktop,
             due_held: false,
             gate_notes: None,
             web: None,
@@ -737,6 +756,7 @@ impl<'a> Router<'a> {
                 Some((session, note)) = next_gate_note(&mut self.gate_notes) => {
                     self.gate_note(&session, note).await
                 }
+                Ok(()) = self.desktop_rx.changed() => self.desktop_changed().await,
                 _ = self.jobs.outbox.notified() => {} // a job's output: flush below
                 // The `/btw` answer is in the outbox: flush below.
                 r = async { self.btw.as_mut().expect("guarded").await }, if self.btw.is_some() => {
@@ -1444,6 +1464,7 @@ impl<'a> Router<'a> {
                     })
                     .collect(),
                 proposals: self.store.pending_proposals()?.len() as u32,
+                desktop: self.desktop_state(),
                 jobs: {
                     let tz = crate::scheduler::zone(&self.cfg)?;
                     let mut jobs: Vec<NextJob> = (self.store.jobs()?.into_iter())
@@ -2276,6 +2297,11 @@ impl<'a> Router<'a> {
                 self.steered_texts.insert(text);
                 self.steered.push((row, false));
             } else {
+                // rpi delivers a steer queued while idle as the run starts, before its first
+                // step: the page may not be what the agent last saw.
+                if let Some(note) = self.desktop_note.take() {
+                    self.steer_note(note).await;
+                }
                 self.call(json!({"type": "prompt", "message": text}))
                     .await?;
                 self.busy = true;
@@ -5055,6 +5081,50 @@ impl<'a> Router<'a> {
         // takes it back, as it does the resume note.
         self.note_pending = true;
         took
+    }
+
+    /// The agent's desktop for the snapshot; `None` without one.
+    fn desktop_state(&self) -> Option<DesktopState> {
+        self.cfg.desktop.as_ref()?;
+        let held = self.desktop.held();
+        Some(DesktopState {
+            owner: held.is_some(),
+            since_unix: held.map_or(0, |h| h.since),
+        })
+    }
+
+    /// The owner took the desktop over, or it went back (DESIGN §4.11): main is told with the
+    /// daemon's own notes, steered like the gate's, so they do not taint. At the take only a
+    /// run in progress is told; the hand back is steered into a run, or waits for the next
+    /// prompt. The snapshot moves last, so whoever sees it knows the note was given.
+    async fn desktop_changed(&mut self) {
+        let held = self.desktop_rx.borrow_and_update().clone();
+        let was = std::mem::replace(&mut self.desktop_was, held.clone());
+        match (was, &held) {
+            (None, Some(now)) if self.busy => {
+                let note = format!(
+                    "[zephyr] the owner took over the desktop at {}; browser and desktop \
+                     commands wait until they hand it back. Do other work meanwhile.",
+                    self.clock(now.since)
+                );
+                self.steer_note(note).await;
+            }
+            (Some(was), None) => {
+                let note = format!(
+                    "[zephyr] the owner used the desktop from {} to {}. The page may have \
+                     changed: take a fresh snapshot before acting.",
+                    self.clock(was.since),
+                    self.clock(crate::now())
+                );
+                match self.busy {
+                    true => drop(self.steer_note(note).await),
+                    false => self.desktop_note = Some(note),
+                }
+            }
+            _ => {}
+        }
+        let state = self.desktop_state();
+        update(&self.snap, |s| s.desktop = state);
     }
 
     /// The gate's held note for main's run (R51), before it answers the plugin `hold`: steered
