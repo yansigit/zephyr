@@ -589,6 +589,7 @@ fn stored_request(a: &Action) -> Option<Request> {
             ("exec", args, None)
         }
         ActionKind::Pass => ("mcp_call", payload?, None),
+        ActionKind::Card => ("card", payload?, None),
         ActionKind::Wait => {
             let payload = payload?;
             let b: Browser = serde_json::from_value(payload.get("browser")?.clone()).ok()?;
@@ -1772,6 +1773,7 @@ fn render(a: &Action, cfg: &Config, store: &Store, countdown: bool) -> String {
         }
         ActionKind::Pass => pass_lines(a, class, &targets, &scrub),
         ActionKind::Wait => wait_lines(class, &targets, browser.as_ref(), &scrub),
+        ActionKind::Card => Vec::new(),
     });
     if e.facts != FactsMode::Off {
         match &scrub.facts {
@@ -1853,6 +1855,7 @@ fn what(class: Option<Class>, kind: ActionKind, browser: Option<&Browser>) -> St
                 }
                 ActionKind::Wait if unread => "a click the gate could not read (browser)",
                 ActionKind::Wait => "click in the browser",
+                ActionKind::Card => "virtual card",
             }
             .into();
         }
@@ -1863,6 +1866,7 @@ fn what(class: Option<Class>, kind: ActionKind, browser: Option<&Browser>) -> St
         (ActionKind::Run, _) => "command",
         (ActionKind::Pass, _) => "connector",
         (ActionKind::Wait, _) => "browser",
+        (ActionKind::Card, _) => "virtual card",
     };
     format!("{noun} ({medium})")
 }
@@ -1872,7 +1876,7 @@ fn what(class: Option<Class>, kind: ActionKind, browser: Option<&Browser>) -> St
 fn checked_text(a: &Action) -> String {
     match a.kind {
         ActionKind::Run => a.command(),
-        ActionKind::Pass => match serde_json::from_str::<Value>(&a.payload) {
+        ActionKind::Pass | ActionKind::Card => match serde_json::from_str::<Value>(&a.payload) {
             Ok(v) => decoded(&v),
             Err(_) => a.payload.clone(),
         },

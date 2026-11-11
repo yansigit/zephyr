@@ -7514,7 +7514,7 @@ fn old_install(home: &Path) {
     )
     .unwrap();
     db.execute_batch(&format!(
-        "ALTER TABLE inbox DROP COLUMN derived; DROP TABLE web_push; DROP TABLE web_sessions; DROP TABLE web_passkeys; DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin; ALTER TABLE inbox DROP COLUMN owner; {V16} PRAGMA user_version = 15;"
+        "DROP TABLE cards; DROP TABLE payments; ALTER TABLE inbox DROP COLUMN derived; DROP TABLE web_push; DROP TABLE web_sessions; DROP TABLE web_passkeys; DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin; ALTER TABLE inbox DROP COLUMN owner; {V16} PRAGMA user_version = 15;"
     ))
         .unwrap();
 }
