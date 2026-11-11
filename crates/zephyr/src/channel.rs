@@ -98,6 +98,7 @@ pub enum AnyChannel {
     Discord(crate::discord::Discord),
     IMessage(crate::imessage::IMessage),
     Telegram(crate::telegram::Telegram),
+    Signal(crate::signal::Signal),
 }
 
 impl Channel for AnyChannel {
@@ -107,6 +108,7 @@ impl Channel for AnyChannel {
             Self::Discord(c) => c.name(),
             Self::IMessage(c) => c.name(),
             Self::Telegram(c) => c.name(),
+            Self::Signal(c) => c.name(),
         }
     }
     async fn run(&self, tx: tokio::sync::mpsc::Sender<Inbound>) -> anyhow::Result<()> {
@@ -115,6 +117,7 @@ impl Channel for AnyChannel {
             Self::Discord(c) => c.run(tx).await,
             Self::IMessage(c) => c.run(tx).await,
             Self::Telegram(c) => c.run(tx).await,
+            Self::Signal(c) => c.run(tx).await,
         }
     }
     async fn send(&self, msg: &Outbound) -> anyhow::Result<()> {
@@ -123,6 +126,7 @@ impl Channel for AnyChannel {
             Self::Discord(c) => c.send(msg).await,
             Self::IMessage(c) => c.send(msg).await,
             Self::Telegram(c) => c.send(msg).await,
+            Self::Signal(c) => c.send(msg).await,
         }
     }
     async fn activity(&self, to: &str, a: &Activity) -> anyhow::Result<()> {
@@ -131,6 +135,7 @@ impl Channel for AnyChannel {
             Self::Discord(c) => c.activity(to, a).await,
             Self::IMessage(c) => c.activity(to, a).await,
             Self::Telegram(c) => c.activity(to, a).await,
+            Self::Signal(c) => c.activity(to, a).await,
         }
     }
     fn live(&self, cfg: tokio::sync::watch::Receiver<std::sync::Arc<crate::config::Config>>) {
@@ -139,6 +144,7 @@ impl Channel for AnyChannel {
             Self::Discord(c) => c.live(cfg),
             Self::IMessage(c) => c.live(cfg),
             Self::Telegram(c) => c.live(cfg),
+            Self::Signal(c) => c.live(cfg),
         }
     }
     fn known_as(&self, sender: &str) -> Option<String> {
@@ -147,6 +153,7 @@ impl Channel for AnyChannel {
             Self::Discord(c) => c.known_as(sender),
             Self::IMessage(c) => c.known_as(sender),
             Self::Telegram(c) => c.known_as(sender),
+            Self::Signal(c) => c.known_as(sender),
         }
     }
 }

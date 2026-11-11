@@ -16,7 +16,7 @@ use zephyr::store::Store;
 /// The rpi minor this build speaks (DESIGN §3).
 const RPI_PIN: &str = "rpi 0.21.";
 
-const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|resume|reload|skill|web|pair>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
+const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|resume|reload|skill|web|pair|signal-setup>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
 
 fn main() -> ExitCode {
     // `agent-browser` on the agent's PATH is this binary (approvals spec §4.4): the wrapper runs
@@ -98,6 +98,9 @@ async fn zephyr_main() -> ExitCode {
             ("skill", Ok(cfg)) => skill(&cfg, &args.collect::<Vec<_>>()).await,
             ("web", Ok(cfg)) => web(&cfg, &args.collect::<Vec<_>>()).await,
             ("pair", Ok(cfg)) => pair(&cfg, &args.collect::<Vec<_>>()).await,
+            ("signal-setup", Ok(cfg)) => {
+                zephyr::signal::setup(&cfg, &args.collect::<Vec<_>>()).await
+            }
             _ => {
                 eprintln!("{USAGE}");
                 return ExitCode::from(2);
@@ -234,6 +237,9 @@ async fn run(mut cfg: Config, from_file: &[String]) -> anyhow::Result<()> {
             telegram,
             &cfg.telegram_api,
         )?));
+    }
+    if cfg.signal.is_some() {
+        channels.push(AnyChannel::Signal(zephyr::signal::Signal::new(&cfg)?));
     }
     let shutdown = async {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -636,6 +642,28 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
                 Ok(false) => println!("warn iMessage typing needs the BlueBubbles Private API with its helper connected; enable it on the Mac or set [imessage] typing = false"),
                 Err(e) => println!("warn could not read BlueBubbles server info for iMessage typing: {e:#}"),
             }
+        }
+    }
+    if let Some(signal) = &cfg.signal {
+        let dir = zephyr::signal::data_dir(cfg);
+        // SAFETY: getuid has no arguments and cannot fail.
+        let me = unsafe { libc::getuid() };
+        let private =
+            std::fs::metadata(&dir).is_ok_and(|m| m.uid() == me && m.mode() & 0o777 == 0o700);
+        let label = format!(
+            "{} is the daemon's and 0700 (signal-cli's keys)",
+            dir.display()
+        );
+        ok &= check(&label, private);
+        // The adapter writes it once signal-cli is up and `listAccounts` names the account.
+        let up = std::fs::read_to_string(dir.join(".ok")).is_ok_and(|a| a == signal.account);
+        let label = format!("signal-cli is running and holds {}", signal.account);
+        ok &= check(&label, up);
+        if !cfg.signal_cli.exists() {
+            println!(
+                "warn {} is missing: signal: not in this image (built with SIGNAL=0)",
+                cfg.signal_cli.display()
+            );
         }
     }
     if let Some(path) = cfg.attach.as_ref().and_then(|a| a.token_file.as_ref()) {

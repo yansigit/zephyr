@@ -633,12 +633,46 @@ zephyr: a second one polling the same bot (a side container) waits until the fir
 
 ## Sending the agent files
 
-Images and files you send on Discord, iMessage or Telegram are saved for the agent in
+Images and files you send on Discord, iMessage, Telegram or Signal are saved for the agent in
 `~/.zephyr/inbox/` (`/zephyr/inbox/` in the container), and your message tells it each file's path;
 it opens images with `read`. A message with only a photo works. Up to 10 files a message, 25 MB
 each (20 MB on Telegram, its limit for bots): anything beyond is listed but not downloaded. Only
 owners' files are downloaded. iPhone photos arrive as JPEG (BlueBubbles converts HEIC). A voice
 note is saved as a file; nothing transcribes it. Files are deleted after 30 days.
+
+## Signal
+
+Zephyr can talk to you over Signal on **a number of its own**: a second SIM or eSIM, or a VoIP or
+landline number (`--voice` takes the code by call). **Never your own Signal account**: a device
+linked to it receives every conversation you have, and its keys speak as you to all of your
+contacts. (Linked to your own account by mistake, zephyr hears nothing: it takes only direct
+messages from other accounts.)
+
+`zephyr channel add signal` asks for the number and whether to register it (you paste the
+`signalcaptcha://` token from signalcaptchas.org, then type the SMS or call code) or to link it to
+an account on a spare phone (it shows a QR code to scan). It then writes the table and prints a
+pairing code: send `/pair CODE` to zephyr's number from your own Signal account within 10 minutes,
+and that account is the owner. `/pair signal` in `zephyr chat` or `zephyr attach` gives a new code.
+
+```toml
+[signal]
+account = "+821012345678"   # zephyr's own number; not a secret
+
+[owners]
+signal = ["7f3c…"]          # your ACI (Signal's account UUID), written by /pair; never a number
+```
+
+Group messages, stories, reactions and edits are ignored; files you send are saved as on Discord.
+signal-cli runs as root in the container, its keys in `/var/lib/zephyr/signal` (0700, out of the
+agent's reach, not backed up: if it is lost, register or link again). `zephyr doctor` checks that
+it is running and holds the account. When your safety number changes (a new phone), replies to you
+stop and you are told once on your other channels; compare it, then
+`zephyr channel signal trust <ACI>`. `zephyr channel remove signal` unregisters the number and
+deletes the keys. In an image built with `SIGNAL=0`, or on arm64, there is no Signal.
+
+**A gap:** signal-cli confirms a message to Signal's server when it reads it, before zephyr has
+saved it, so a message that arrives in the instant the daemon dies is lost. Send it again if no
+reply comes.
 
 ## Limits
 

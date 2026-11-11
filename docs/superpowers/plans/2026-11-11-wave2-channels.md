@@ -138,6 +138,8 @@
 - [ ] **Step 4:** Same → PASS; `cargo test` → PASS.
 - [ ] **Step 5:** DESIGN §4.3 Telegram bullet, §4.20 (its connections are the daemon's own); README "Telegram". Commit `feat(telegram): talk to the owner through a Telegram bot in private chats`.
 
+Deviations: `Telegram` has two hidden public fields, `conflict_wait` (30 s) and `backoff` (5 s), so tests need not wait 30 s. `the_token_never_shows` checks the errors `me()` and `send()` return (against a stub whose error text holds the token, and an unreachable API) rather than captured log lines: the adapter logs to the test's own stderr, and every log line prints one of those scrubbed errors. The token's secret half (after `:`) is redacted too. `/start PAYLOAD` is kept; only a bare `/start` is dropped. Downloads get 120 s. The 409 is logged once per run of conflicts (the flag resets after a good poll). The names map is cleared at 1000 senders (`shortcut:`). `pairing_over_telegram_names_the_user` was added at integration, with the claim from C1-2.
+
 ### Task C1-4: The Signal adapter
 
 **Files:**
@@ -183,6 +185,8 @@
 - [ ] **Step 2:** `docker build -t zephyr-dev:c1-<sha> -f deploy/Dockerfile --secret id=gh_token,env=GH_TOKEN .` succeeds; `docker run --rm zephyr-dev:c1-<sha> /opt/zephyr/signal/bin/signal-cli --version` prints `signal-cli 0.14.10`; the image size is recorded below.
 - [ ] **Step 3:** Side container `zephyr-test-c1` (scratch HOME, ports 19790/19793, bridge) with `[telegram]` against an unreachable `api` and `[signal]` on an unregistered number: the daemon runs, `zephyr status` and `doctor` answer, the logs show the adapters retrying, the log holds no token. Remove the container, keep the image.
 - [ ] **Step 4:** Commit `build(image): ship signal-cli and its own Java runtime behind the SIGNAL build arg`.
+
+Deviations: pins `SIGNAL_CLI_SHA256=706a57d9…121c33` and Temurin `25.0.5+8` (`68982529…78d7fb`). BuildKit reuses the cached layer of a `COPY --from` an empty stage, so a `SIGNAL=0` build after a `SIGNAL=1` one still had the folder: both stages hold `/out` and the final stage copies `/out/` to `/opt/zephyr/`. `jdeps` follows the main jar (`--recursive --class-path 'lib/*'`), since the whole `lib/` does not resolve as modules; `jlink --strip-debug` needs binutils in the build stage. Upstream's start script is kept as `bin/signal-cli-jvm`, and `bin/signal-cli` is a two-line wrapper pinning `JAVA_HOME`. Measured: `/opt/zephyr/signal` 190 MB (jars 126 MB, runtime 64 MB); the image's `docker image inspect` size grows by 365 MB, the content to pull from 1.45 GB to 1.61 GB. `signal-cli link` with no account fetched a `sgnl://linkdevice` URI from Signal's servers on the trimmed runtime.
 
 ## Owner checks (not verifiable here)
 
