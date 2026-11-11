@@ -145,10 +145,10 @@ wrong](#when-something-goes-wrong) and `zephyr uninstall [--keep-data]`.
 | `zephyr channel add\|remove discord\|imessage \| list` | Channel settings (secrets are asked for hidden); `remove` drops the channel, its owners and secrets, `list` shows them. Discord shows typing while the agent works, and a progress note after 20 s (`discord.progress`, `discord.progress_after_secs`) |
 | `zephyr web setup [--yes]` / `web enrol [NAME]` | Put the [web app](#web-app) behind `tailscale serve` and add a first device; later, a one-time code for another device |
 | `zephyr skill add DIR \| list \| rm NAME` | Skills the agent may use (see [Skills and connectors](#skills-and-connectors)); one you add is approved at once |
-| `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}` |
+| `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. [--host HOST].. [--plain] \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}`; `--host` names where a secret is sent, `--plain` hands the connector the real one |
 | `zephyr packages add NAME.. \| rm NAME.. \| list` | Ubuntu (apt) packages for the agent, baked into a local image (`zephyr-local:<version>-<hash>`) on the release one; `up` and `upgrade` build it, and `add`/`rm` rebuild and recreate the container once the agent is idle |
 | `zephyr facts list \| add NAME --kind text\|digits\|email \| rm NAME \| allow NAME TARGET \| disallow NAME TARGET` | Private facts (a phone number, an address) that must not leave in an outgoing call; the value is asked for hidden, or read from one stdin line when piped, never taken as an argument. They are kept in `facts.toml` (0600, with the daemon's files). `/facts` in a chat lists names, kinds and allowed targets and, from `tui` or `chat` only, `rm NAME` and `allow NAME TARGET`; a chat never takes a value. The agent may add a fact (you are told its name); removing one or allowing a target is only proposed |
-| `zephyr vault list \| add login NAME --site URL [--user U] [--totp] \| add token NAME \| edit NAME \| rm NAME \| revoke NAME [PROGRAM]` | Logins and tokens the agent uses by name (see [The vault](#the-vault)); values are asked for hidden, or read one per line from stdin when piped, never taken as arguments |
+| `zephyr vault list \| add login NAME --site URL [--user U] [--totp] \| add token NAME [--host HOST].. \| edit NAME [--host HOST].. \| rm NAME \| revoke NAME [PROGRAM]` | Logins and tokens the agent uses by name (see [The vault](#the-vault)); values are asked for hidden, or read one per line from stdin when piped, never taken as arguments |
 | `zephyr subagent list \| add NAME [--model P/M] [--prompt TEXT] \| edit NAME [--model P/M\|default] [--prompt TEXT] \| rm NAME` | The named subagents the agent starts background tasks as (see [Background tasks](#the-agents-browser-and-desktop)); without `--prompt`, the prompt is read from stdin when piped |
 | `zephyr config get\|set KEY [VALUE]` | Read or edit `zephyr.toml` (comments are kept; a change that would make it invalid is refused), e.g. `config set tasks.parallel 16` or `config set tasks.model PROVIDER/MODEL`. A key in the [settings list](#changing-settings) goes through the running daemon, which checks it, logs it and applies it. Any other key prints a warning that it is saved without checking, and is saved. With no daemon running, the file is edited directly and applies at the next start |
 | `/settings [SECTION\|KEY]` | From any channel: every setting by section with its value and where it came from (`default`, `you`, `agent (#N)`, `until HH:MM`); with a section or a key, its help line, what it takes and who may change it. In `zephyr attach` it opens the settings panel |
@@ -489,7 +489,7 @@ folder of yours, approved at once (at most 32 files and 256 KB, regular files on
 **Connectors** are MCP servers the agent may call. Add one on the host:
 
 ```sh
-zephyr mcp add docs --url https://example.com/mcp --header 'Authorization=Bearer ${DOCS_TOKEN}' --secret DOCS_TOKEN
+zephyr mcp add docs --url https://example.com/mcp --header 'Authorization=Bearer ${DOCS_TOKEN}' --secret DOCS_TOKEN --plain
 zephyr mcp add files -- npx -y @modelcontextprotocol/server-filesystem /zephyr/projects
 ```
 
@@ -500,8 +500,24 @@ tools. `${NAME}` is filled in from `secrets.env`; a connector whose secret is mi
 out, and `zephyr doctor` and `/mcp` say so. zephyr's own secrets (`ZEPHYR_*`) and the channels' tokens can never be filled into a connector. The agent may also propose one in
 `connectors/drafts/<name>.json`: `/mcp ok NAME` adds it, `/mcp no NAME` drops it, `/mcp rm NAME`
 removes a connector, and `/mcp` lists them. The agent can use only these connectors: an MCP config
-it writes itself, or a server named by URL, is refused. A connector runs as the agent, so the
-agent can read its token.
+it writes itself, or a server named by URL, is refused.
+
+A connector that runs a command does not hold its secrets: `mcp.json` has a stand-in for each
+`${NAME}`, and zephyr's proxy sends the real one only to the connector's hosts, in the
+`Authorization` header. A remote (`--url`) connector cannot work that way: its requests are made
+by rpi's own MCP client, which does not trust zephyr's certificate. So a remote connector with a
+secret holds the real one, which the agent can read, and only once you say so: `--plain` when you
+add it (`zephyr mcp add docs --url … --header 'Authorization=Bearer ${DOCS_TOKEN}' --secret
+DOCS_TOKEN --plain`), or `/set mcp.NAME.secrets plain` from a strong channel. A connector the
+agent drafts that uses a secret, or changes one that does, is approved (`/mcp ok`) from a strong
+channel only, and approving it never hands out the real secret by itself. Until then it is left
+out, and `/mcp` and `zephyr doctor` say why. Remote connectors you had before this version keep
+working: the upgrade writes `secrets = "plain"` for them and tells you. One secret cannot be a
+plain connector's and another connector's stand-in at once; give each its own. A connector that runs a command and uses a secret must say where it goes, or it
+is left out:
+`zephyr mcp add NAME --host api.example.com ...`, or `/set mcp.NAME.hosts api.example.com`. For a
+secret that is not an HTTPS header (a database password, a signing key), `--plain` or
+`/set mcp.NAME.secrets plain` hands the connector the real one, which the agent can then read.
 
 ## Web app
 
@@ -767,6 +783,11 @@ the agent cannot read them (DESIGN §4.15). The agent uses them by name and neve
   only. Each program a token is used with needs your OK once (`gh` for `GH_TOKEN`, say); after
   that the same use runs without asking. Wherever the value shows up in what the command prints,
   the agent gets `[vault:NAME]` instead.
+- **A token goes only to the hosts you bind it to.** The command does not get the token: it gets
+  a stand-in (`zsur_…`), and zephyr's proxy swaps the real token in only in HTTPS requests to the
+  hosts you named, exactly (`api.github.com` does not cover `github.com`; no wildcards). Sent
+  anywhere else the stand-in is worthless, and where zephyr can see it the request is refused and
+  you are told. A token bound to no host cannot be used.
 
 When the agent wants to use one, you are asked: `the agent asks to use the token GH_TOKEN with gh
 (#4); /ok 4 allows it from now on, /no 4 drops it`. When one is missing, the agent asks you to
@@ -774,15 +795,40 @@ save it and names the exact command. Save and manage entries:
 
 - In `zephyr attach`, `/vault` opens a panel: `a` adds a login, `t` a token, `e` edits, `d`
   deletes, `r` takes back what an entry is allowed for. `/vault add login NAME SITE` and
-  `/vault add token NAME` open the form filled in. Values are typed masked. Each save shows a
+  `/vault add token NAME` open the form filled in. Values are typed masked; a token's form
+  ends with the hosts it is sent to. Each save shows a
   card of what was saved and what it may be used for, never the value. A new entry saved here is
   told to the agent, so it can carry on.
 - On the host, `zephyr vault add login github --site https://github.com --user me [--totp]`,
-  `zephyr vault add token GH_TOKEN`, `list`, `edit`, `rm` and `revoke NAME [PROGRAM]`. The agent
+  `zephyr vault add token GH_TOKEN --host api.github.com --host github.com` (asked for when
+  left out; `edit NAME --host ..` replaces them; `--header X-Api-Key` names a header it is
+  swapped in besides `Authorization`), `list`, `edit`, `rm` and `revoke NAME [PROGRAM]`. The agent
   is not told of these: tell it.
+- `/vault bind GH_TOKEN api.github.com github.com` binds a token to hosts (`HOST` or `HOST:PORT`).
+  The token is put into the `Authorization` header only; for an API that wants it elsewhere,
+  `/vault header NAME X-Api-Key` adds a header (`/vault unheader NAME [HEADER]` takes it back).
+  In any other header the request is refused and you are told.
+  `/vault url NAME on` also swaps it in a request's path and query, for APIs that want the token
+  in the URL (a server may repeat its URL back, so it is off by default). `/vault raw NAME on`
+  hands the real token to the command as before: for a token used in a request body, for signing
+  (AWS, webhooks), for gRPC, for a host with a private certificate or plain HTTP, or for a program
+  that does not use the proxy (`himalaya`, `ssh`). `bind`, `header`, `url on` and `raw on` need a strong channel (`tui`,
+  `chat` or a passkey unless you changed `settings.strong_channels`; in the web app always a
+  passkey), also as the `/ok` of the agent's request;
+  `/vault unbind NAME [HOST]`, `/vault url NAME off` and `/vault raw NAME off` work anywhere. The
+  agent can ask for a binding (`the agent asks to send the token GH_TOKEN to api.github.com (#5)`).
 - From any channel, `/vault` lists the names, `/vault rm NAME` deletes one, and `/vault revoke
   NAME [PROGRAM]` takes back a grant. A chat never takes a value: `/vault add` there is refused.
   Never paste a password into a chat.
+
+**A certificate error on a bound host.** For the hosts tokens are bound to, zephyr's proxy
+answers in the host's place, with a certificate from a CA that exists only in this container and
+that the agent's tools are set up to trust (`zephyr doctor` lists the hosts and checks the CA). A
+program that brings its own roots or pins certificates fails there at once, and nothing leaks.
+For such a program mark the token `raw`, or bind it to a host that program does not use. If one
+that used to work fails after a long uptime, restart with `zephyr up`: the CA is renewed only
+when the container starts. Never bind a token to a model provider's host: the agent's own
+connection to the provider would stop.
 
 Names: a login is lowercase (`github`, `my-bank`), a token is an environment variable name
 (`GH_TOKEN`). The vault is for the main conversation; background tasks and jobs cannot use it.
@@ -792,12 +838,20 @@ command the agent runs; the vault is the better place for one.
 
 What it protects against: credentials stay out of chats, transcripts and the model's context in
 normal use; a login is filled only on its own site; and each new use needs your OK. What it does
-not: an agent set on misusing a value it was allowed to use can still read it (a filled field
-read back, its own command's log under `.procs/`, a program that prints its environment to a
-file). Grant a token only to programs you trust with it.
+not: an agent set on misusing a login, or a token you marked `raw`, can still read it (a filled
+field read back, its own command's log under `.procs/`, a program that prints its environment to
+a file; what a command prints is scrubbed from its log, what it writes to a file of its own is
+not). A bound token it cannot read: if the host sends the token back (an echo or debug endpoint,
+an error page), zephyr turns it into the stand-in again before the agent's program sees the
+reply (as it is, in base64 as `curl -u` sends it, JSON-escaped or percent-encoded), and what a command prints reaches its log
+already scrubbed. What is left: a host that sends the token back in another form (another case, HTML
+entities, hex, a hash) is not caught; a bound host that needs a websocket, a range request or a compressed reply cannot
+be used (the request fails, nothing leaks); a remote connector's secret is still in `mcp.json`; and the agent can still *use* a bound token on the hosts you bound. So
+bind a token only to the API it is for, and grant it only to programs you trust with it.
 
 **Mail.** There is no mail channel, but the agent can read and send mail with `himalaya`. Save the
-password as a token (`zephyr vault add token MAIL_PASSWORD`) and have the agent write
+password as a token (`zephyr vault add token MAIL_PASSWORD`, then `/vault raw MAIL_PASSWORD on`:
+himalaya speaks IMAP, which the proxy cannot swap a stand-in in) and have the agent write
 `/zephyr/.config/himalaya/config.toml` with the password taken from the environment:
 
 ```toml

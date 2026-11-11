@@ -127,6 +127,28 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   from `Store::activity` (one `UNION ALL` over audit, settings_log, command proposals, runs, tasks
   and procs, keyset-paged by `store::Cursor`), every text scrubbed at read (`gate::Scrub`, then
   `settings::one_line`). The model never writes it.
+- `broker.rs`, `ca.rs` (DESIGN §4.21): the token broker. The agent holds a surrogate (`zsur_` +
+  40 hex, HMAC-derived from `<state>/broker.key`) for each vault token and connector secret:
+  `vault::exec_env` and `drafts::prepare` hand it out under the floor (`broker::on`), never the
+  value in its place. `broker.rs` is pure: `parse_host` (exact names, no wildcard), `Map`
+  (surrogate to value and hosts), `swap` (only credential headers: `Authorization` and the ones the owner listed; Basic;
+  the target only with `url`; never a body), `scan` (a surrogate where nothing is swapped). `egress.rs` decrypts a `CONNECT` only
+  to a bound `host:port` (`serve_tls`, `Decrypted`): a leaf from `ca::Authority`, the upstream
+  verified against `ca::public_roots` (webpki-roots compiled in; nothing the agent can plant),
+  one `Host`, HTTP/1.1 only, hop-by-hop headers, `Range` and upgrades stripped (a 101, a 206 and an
+  encoded reply are refused); the reply's headers and body get each value bound to that host turned
+  back into its surrogate (`Map::unswapper`, `Replacer`; `Accept-Encoding: identity` is forced
+  and an encoded reply refused), and `procs::spawn` sends a command's output through
+  `zephyr __scrublog` so its agent-readable log holds no vault value. `ca.rs` keeps the container-only CA in `<state>/ca/`, made and
+  renewed only by `supervise` at a container start (`ca::start`), and installs it for the
+  agent's tools (system bundle, `agent::CA_ENV`, the agent's NSS store, Camoufox's policies).
+  Bindings come only from the owner on a strong channel (`/vault bind`, the strong rows
+  `mcp.<name>.hosts` and `.secrets`; never from a connector draft, and `/mcp ok` of a draft that carries a
+  `${SECRET}` needs a strong channel). `plain` is never implied (`broker::plain`): a
+  `url` connector with a secret is not published until the owner settles it (rpi's own MCP
+  client cannot reach a decrypted host), and the upgrade writes `secrets = "plain"` for
+  those that were there (`Router::settle_remote_connectors`). A surrogate, a token and a key never reach a log, `Debug`, an audit row or a
+  notice.
 - `egress.rs` (DESIGN §4.20): the network floor. In bridge mode (`ZEPHYR_NETWORK=bridge`, set by
   `zephyr up` unless host.toml says `network = "host"`) the agent's uid has no route but its own
   loopback and the proxy on `127.0.0.1:7792` (`serve`, in the router's `select!`). `public` (IPv4

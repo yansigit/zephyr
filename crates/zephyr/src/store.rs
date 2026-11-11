@@ -1013,6 +1013,16 @@ impl Store {
                  PRAGMA user_version = 18;",
             )?;
         }
+        // A database made by a build that has the token broker (DESIGN §4.21): its remote
+        // connectors were never published with a real secret by default, so there is nothing
+        // of before to keep (`made_with_broker`). The broker adds no schema step, so this
+        // mark, not a version, tells an upgrade from a first start or a reset state.db.
+        if version == 0 {
+            db.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES ('broker.born', '1')",
+                [],
+            )?;
+        }
         db.commit()?;
         Ok(Self {
             db: conn,
@@ -1033,6 +1043,22 @@ impl Store {
             .ok()
             .flatten()
             .and_then(|v| v.parse().ok())
+    }
+
+    /// Whether this database was first made by a build with the token broker, so that no
+    /// install from before it stands behind it.
+    /// A database that cannot be read counts as made with it: the upgrade that hands remote
+    /// connectors their real secrets must not run on a guess.
+    pub fn made_with_broker(&self) -> bool {
+        match self.meta("broker.born") {
+            Ok(mark) => mark.is_some(),
+            Err(e) => {
+                eprintln!(
+                    "zephyr: reading state.db's broker mark failed, so nothing is settled: {e}"
+                );
+                true
+            }
+        }
     }
 
     /// Whether the owner still has to be told that an upgrade kept approvals off.
@@ -5372,5 +5398,16 @@ mod tests {
             "{w}"
         );
         assert!(!w.contains("88") && !w.contains("66"), "{w}");
+    }
+    /// A state.db whose mark cannot be read is not taken for one from before the broker.
+    #[test]
+    fn an_unreadable_broker_mark_reads_as_made_with_the_broker() {
+        let dir = crate::test_dir("store-broker-mark");
+        let store = Store::open(&dir.join("state.db")).unwrap();
+        assert!(store.made_with_broker(), "a new database is made with it");
+        store.set_meta("broker.born", None).unwrap();
+        assert!(!store.made_with_broker(), "one from before has no mark");
+        store.db.execute_batch("DROP TABLE meta").unwrap();
+        assert!(store.made_with_broker(), "no guess when it cannot be read");
     }
 }

@@ -12,6 +12,7 @@ use hyper_util::rt::TokioIo;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
@@ -320,7 +321,7 @@ pub async fn decide(
 }
 
 /// What the proxy runs with. Tests pass their own.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Floor {
     pub public: fn(IpAddr) -> bool,
     /// This container's address, never a destination.
@@ -337,6 +338,13 @@ pub struct Floor {
     pub reply_wait: Duration,
     /// How long a tunnel, or a forwarded reply's body, may go with nothing moving.
     pub idle: Duration,
+    /// How the proxy speaks TLS to the upstream of a decrypted host (DESIGN §4.21), built
+    /// once: it verifies against the roots compiled into this binary (`ca::public_roots`),
+    /// which no file or variable of the agent's reaches.
+    pub upstream: Arc<rustls::ClientConfig>,
+    /// What signs the leaf a decrypted host is served with. `None` when the CA could not be
+    /// loaded: hosts with a token bound then answer 502, and the rest are tunnelled as ever.
+    pub ca: Option<Arc<crate::ca::Authority>>,
 }
 
 impl Floor {
@@ -353,6 +361,8 @@ impl Floor {
             // Websockets and event streams ping far more often; an IMAP IDLE is renewed within
             // 29 minutes. A dead peer's slot comes back after this.
             idle: Duration::from_secs(30 * 60),
+            upstream: crate::ca::client(crate::ca::public_roots())?,
+            ca: None,
         })
     }
 }
@@ -410,8 +420,12 @@ impl Audit {
                     self.hour = now / 3600;
                     self.seen.clear();
                 }
-                let host_port = dest.split(" -> ").next().unwrap_or(dest);
-                (self.seen.insert(host_port.into())).then(|| "allowed".to_string())
+                // A destination once an hour, and each token on each host (`NAME -> host`).
+                let key = match tool {
+                    "swap" => format!("swap {dest}"),
+                    _ => dest.split(" -> ").next().unwrap_or(dest).to_string(),
+                };
+                (self.seen.insert(key)).then(|| "allowed".to_string())
             }
             Outcome::Refused(reason) => {
                 self.refused += 1;
@@ -436,6 +450,8 @@ struct Conn {
     cfgs: watch::Receiver<Arc<Config>>,
     floor: Floor,
     log: std::sync::mpsc::Sender<Note>,
+    /// The token broker's map of what is swapped where (DESIGN §4.21).
+    maps: Arc<crate::broker::Maps>,
     /// Held until the connection and its tunnel are both over.
     slot: Arc<OwnedSemaphorePermit>,
 }
@@ -450,8 +466,26 @@ pub async fn serve(
         return std::future::pending().await;
     }
     let db = cfgs.borrow().db_path();
+    let state = cfgs.borrow().state_dir().to_path_buf();
     let run = async {
-        let floor = Floor::live()?;
+        let mut floor = Floor::live()?;
+        // The CA `supervise` made when the container started. Without it nothing is decrypted,
+        // and no token is handed out in its place.
+        match crate::ca::Authority::load(&state) {
+            Ok(ca) => floor.ca = Some(Arc::new(ca)),
+            Err(e) => {
+                eprintln!("zephyr: the token broker is down, so vault tokens do not work: {e:#}");
+                let notice = format!(
+                    "[zephyr] the token broker is down, so vault tokens do not work: {e:#}"
+                );
+                if Store::open(&db)
+                    .and_then(|s| s.notify_last_owner(&notice))
+                    .is_ok()
+                {
+                    wake.outbox.notify_one();
+                }
+            }
+        }
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, PORT))
             .await
             .with_context(|| format!("binding 127.0.0.1:{PORT}"))?;
@@ -479,6 +513,8 @@ pub async fn serve_on(
     let cfg = cfgs.borrow().clone();
     std::thread::spawn(move || write_audit(store, notes, cfg));
     let slots = Arc::new(Semaphore::new(floor.conns));
+    let maps = Arc::new(crate::broker::Maps::default());
+    let head_wait = floor.head_wait;
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             // shortcut: a persistent accept error (e.g. out of fds) retries every 100 ms with no backoff.
@@ -490,8 +526,9 @@ pub async fn serve_on(
         };
         let conn = Conn {
             cfgs: cfgs.clone(),
-            floor,
+            floor: floor.clone(),
             log: log.clone(),
+            maps: maps.clone(),
             slot: Arc::new(slot),
         };
         tokio::spawn(async move {
@@ -502,7 +539,7 @@ pub async fn serve_on(
             // One request per connection, so the head deadline bounds an idle one too.
             let _ = hyper::server::conn::http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(floor.head_wait)
+                .header_read_timeout(head_wait)
                 .keep_alive(false)
                 .serve_connection(TokioIo::new(stream), svc)
                 .with_upgrades()
@@ -526,6 +563,22 @@ impl Conn {
             },
             _ => ("http", String::new()),
         };
+        // A stand-in is carried nowhere it is not swapped (DESIGN §4.21): not in a host name,
+        // and nowhere in a plain request, which is never swapped. Before any lookup or connect.
+        let map = self.maps.current(&cfg);
+        let whole = uri.to_string();
+        let mut seen: Vec<&[u8]> = vec![authority.as_bytes()];
+        if tool == "http" {
+            seen.push(whole.as_bytes());
+            seen.extend(req.headers().values().map(|v| v.as_bytes()));
+        }
+        if let Err(refused) = crate::broker::scan(&seen, &map) {
+            let dest = match authority.is_empty() {
+                true => whole.as_str(),
+                false => authority.as_str(),
+            };
+            return self.refuse_token(&cfg, dest, &refused);
+        }
         let checked = match target(&authority) {
             Ok((host, port)) => {
                 // Malformed entries were refused when the file loaded; none means none.
@@ -546,27 +599,189 @@ impl Conn {
                 return self.refuse(&cfg, tool, &dest, e);
             }
         };
+        // A host some token is bound to is decrypted, and only such a host.
+        let leaf = match tool == "connect" && map.bound(&dest) {
+            true => match self.leaf(&map, &dest) {
+                Ok(leaf) => Some(leaf),
+                Err(why) => return self.refuse(&cfg, tool, &dest, Refusal::Unreachable(why)),
+            },
+            false => None,
+        };
         // Only the addresses just checked, never the name again.
         let Some((upstream, addr)) = connect(&addrs, self.floor.connect_wait).await else {
             let e = Refusal::Unreachable("no address answered".into());
             return self.refuse(&cfg, tool, &dest, e);
         };
-        let dest = format!("{dest} -> {}", addr.ip());
+        let went = format!("{dest} -> {}", addr.ip());
         if tool == "connect" {
-            self.record(&cfg, tool, &dest, Outcome::Allowed);
-            tokio::spawn(self.tunnel(req, upstream));
+            self.record(&cfg, tool, &went, Outcome::Allowed);
+            match leaf {
+                Some(leaf) => drop(tokio::spawn(self.serve_tls(req, upstream, dest, leaf))),
+                None => drop(tokio::spawn(self.tunnel(req, upstream))),
+            }
             return Response::new(body(""));
         }
         match forward(req, upstream, &self.floor).await {
             Ok(reply) => {
-                self.record(&cfg, tool, &dest, Outcome::Allowed);
+                self.record(&cfg, tool, &went, Outcome::Allowed);
                 reply
             }
             Err(_) => {
                 let e = Refusal::Unreachable("the server did not answer".into());
-                self.refuse(&cfg, tool, &dest, e)
+                self.refuse(&cfg, tool, &went, e)
             }
         }
+    }
+
+    /// What a decrypted host is served with, or why it cannot be: no CA, or a vault that could
+    /// not be read. Either way the host is not tunnelled instead.
+    fn leaf(
+        &self,
+        map: &crate::broker::Map,
+        dest: &str,
+    ) -> Result<Arc<rustls::ServerConfig>, String> {
+        let down = || "the token broker is down".to_string();
+        let ca = self.floor.ca.as_ref().ok_or_else(down)?;
+        if map.unreadable {
+            return Err("the vault could not be read".into());
+        }
+        let name = dest.rsplit_once(':').map_or(dest, |(name, _)| name);
+        ca.leaf(name, crate::now()).map_err(|_| down())
+    }
+
+    /// Serves a `CONNECT` to a bound host (`dest`, `host:port`) decrypted: TLS to the client
+    /// with the host's leaf, TLS to the address already checked and connected, verified for
+    /// that name against `Floor::roots`, and HTTP/1.1 between them, each request's stand-ins
+    /// swapped (`Decrypted::answer`). A client that names another host in its handshake, or an
+    /// upstream that does not prove the name, gets that as the answer to every request.
+    async fn serve_tls(
+        self,
+        req: Request<Incoming>,
+        upstream: TcpStream,
+        dest: String,
+        leaf: Arc<rustls::ServerConfig>,
+    ) {
+        let cfg = self.cfgs.borrow().clone();
+        let name = dest
+            .rsplit_once(':')
+            .map_or(dest.as_str(), |(name, _)| name);
+        let name = name.to_string();
+        let Ok(client) = hyper::upgrade::on(req).await else {
+            return;
+        };
+        let accept = tokio_rustls::TlsAcceptor::from(leaf).accept(TokioIo::new(client));
+        let Ok(Ok(client)) = tokio::time::timeout(self.floor.head_wait, accept).await else {
+            return;
+        };
+        // Dropped when the upstream connection ends, so the client's ends with it and the
+        // next request starts with a new CONNECT, checked afresh.
+        let (ended, upstream_ended) = tokio::sync::oneshot::channel::<()>();
+        let mut ended = Some(ended);
+        let sni = client
+            .get_ref()
+            .1
+            .server_name()
+            .map(str::to_ascii_lowercase);
+        let sender = if sni.is_some_and(|sni| sni != name) {
+            Err((StatusCode::FORBIDDEN, format!("Host does not match {name}")))
+        } else {
+            let unproven = || {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("{name} did not prove it is {name}"),
+                )
+            };
+            let tls = async {
+                let config = self.floor.upstream.clone();
+                let server = rustls::pki_types::ServerName::try_from(name.clone()).ok()?;
+                let tls = tokio_rustls::TlsConnector::from(config).connect(server, upstream);
+                let tls = tokio::time::timeout(self.floor.connect_wait, tls).await;
+                hyper::client::conn::http1::handshake(TokioIo::new(tls.ok()?.ok()?))
+                    .await
+                    .ok()
+            };
+            match tls.await {
+                Some((sender, conn)) => {
+                    let ended = ended.take();
+                    tokio::spawn(async move {
+                        let _ = conn.with_upgrades().await;
+                        drop(ended);
+                    });
+                    Ok(tokio::sync::Mutex::new(sender))
+                }
+                None => Err(unproven()),
+            }
+        };
+        if let Err((_, why)) = &sender {
+            self.record(&cfg, "swap", &dest, Outcome::Refused(why.clone()));
+        }
+        let this = Arc::new(Decrypted {
+            conn: self,
+            name,
+            dest,
+            sender,
+        });
+        let svc = hyper::service::service_fn(move |req| {
+            let this = this.clone();
+            async move { Ok::<_, std::convert::Infallible>(this.answer(req).await) }
+        });
+        // shortcut: one timer for a request head and for the wait between two requests, 90 s;
+        // split them if a slow head ever holds slots.
+        let serving = hyper::server::conn::http1::Builder::new()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(KEEP_ALIVE)
+            .serve_connection(TokioIo::new(client), svc)
+            .with_upgrades();
+        tokio::pin!(serving);
+        tokio::select! {
+            _ = &mut serving => {}
+            _ = upstream_ended => {
+                serving.as_mut().graceful_shutdown();
+                let _ = serving.await;
+            }
+        }
+        drop(ended);
+    }
+
+    /// The reply to a request that carries a stand-in where it is not swapped: 403, an audit
+    /// row by the token's name, and for a token that exists a notice to the owner. Nothing was
+    /// sent on in any form.
+    fn refuse_token(
+        &self,
+        cfg: &Arc<Config>,
+        dest: &str,
+        refused: &crate::broker::Refused,
+    ) -> Response<Body> {
+        // Neither the reply nor the row quotes a stand-in, which a host name may hold.
+        let shown = match dest.contains(crate::broker::PREFIX) {
+            true => "that host",
+            false => dest,
+        };
+        let args = match (refused.token(), refused.place()) {
+            (Some(name), Some(place)) => format!("{name} -> {dest} ({place})"),
+            (Some(name), None) => format!("{name} -> {dest}"),
+            (None, _) => dest.to_string(),
+        };
+        let note = Note {
+            cfg: cfg.clone(),
+            at: crate::now(),
+            tool: "swap",
+            dest: args,
+            // The row's reason never repeats the agent's text: the destination is in its args.
+            outcome: Outcome::Refused(refused.reason("this host")),
+            notice: (refused
+                .token()
+                .zip(refused.notice(crate::vault::shown(dest))))
+            // One notice for a token and a host an hour, however it was tried.
+            .map(|(token, text)| (token.to_string(), dest.into(), text)),
+        };
+        let _ = self.log.send(note);
+        answer(
+            StatusCode::FORBIDDEN,
+            &refused.reason(shown),
+            "zephyr sends a vault token only to the hosts its owner bound it to; ask with the \
+             vault tool's bind\n",
+        )
     }
 
     /// Carries bytes between the client and `upstream` (`relay`), then frees the slot.
@@ -590,12 +805,7 @@ impl Conn {
             Refusal::Denied(r) => (StatusCode::FORBIDDEN, r, HINT.into()),
             Refusal::Unreachable(r) => (StatusCode::BAD_GATEWAY, r, String::new()),
         };
-        let mut reply = Response::new(body(&text));
-        *reply.status_mut() = status;
-        // The reason is in the status line, where curl -v and a library's error show it.
-        if let Ok(phrase) = hyper::ext::ReasonPhrase::try_from(format!("zephyr: {reason}")) {
-            reply.extensions_mut().insert(phrase);
-        }
+        let reply = answer(status, &reason, &text);
         self.record(cfg, tool, dest, Outcome::Refused(reason));
         reply
     }
@@ -608,6 +818,7 @@ impl Conn {
             tool,
             dest: dest.into(),
             outcome,
+            notice: None,
         };
         // The writer is gone only when the proxy is.
         let _ = self.log.send(note);
@@ -621,6 +832,298 @@ struct Note {
     tool: &'static str,
     dest: String,
     outcome: Outcome,
+    /// A token the agent put where it does not go: the token and the host, which make it
+    /// the same attempt, and what the owner is told.
+    notice: Option<(String, String, String)>,
+}
+
+/// A reply of the proxy's own, its reason in the status line, where `curl -v` and a library's
+/// error show it.
+fn answer(status: StatusCode, reason: &str, text: &str) -> Response<Body> {
+    let mut reply = Response::new(body(text));
+    *reply.status_mut() = status;
+    if let Ok(phrase) = hyper::ext::ReasonPhrase::try_from(format!("zephyr: {reason}")) {
+        reply.extensions_mut().insert(phrase);
+    }
+    reply
+}
+
+/// How long a decrypted connection may wait for its next request.
+const KEEP_ALIVE: Duration = Duration::from_secs(90);
+
+/// One decrypted connection to a bound host (DESIGN §4.21).
+struct Decrypted {
+    conn: Conn,
+    /// The bound host, and it with its port, as the owner bound it.
+    name: String,
+    dest: String,
+    /// The one upstream connection; or why there is none, which answers every request.
+    sender: Result<
+        tokio::sync::Mutex<hyper::client::conn::http1::SendRequest<Incoming>>,
+        (StatusCode, String),
+    >,
+}
+
+impl Decrypted {
+    /// Whether the request names the bound host and no other: one `Host`, the name with or
+    /// without its port. Without this a bound host on a shared CDN would carry the token to
+    /// another customer's origin.
+    fn for_this_host(&self, req: &Request<Incoming>) -> bool {
+        let named = |h: &str| {
+            let h = h.to_ascii_lowercase();
+            h == self.name || h == self.dest
+        };
+        let mut hosts = req.headers().get_all(HOST).iter();
+        let (Some(host), None) = (hosts.next(), hosts.next()) else {
+            return false;
+        };
+        host.to_str().is_ok_and(named) && req.uri().authority().is_none_or(|a| named(a.as_str()))
+    }
+
+    fn refuse(&self, cfg: &Arc<Config>, status: StatusCode, why: String) -> Response<Body> {
+        let reply = answer(status, &why, "");
+        (self.conn).record(cfg, "swap", &self.dest, Outcome::Refused(why));
+        reply
+    }
+
+    /// One request on the decrypted connection: checked to be for this host, its stand-ins
+    /// swapped for the tokens bound here (by the map as it is now, so an unbinding holds for
+    /// the next request), sent on this connection's own upstream connection (made for it at
+    /// its `CONNECT`, never pooled or shared with another client's), and the reply turned
+    /// back. Bodies pass as frames, never collected.
+    async fn answer(&self, req: Request<Incoming>) -> Response<Body> {
+        let cfg = self.conn.cfgs.borrow().clone();
+        let sender = match &self.sender {
+            Ok(sender) => sender,
+            // Audited once, when the connection was made.
+            Err((status, why)) => return answer(*status, why, ""),
+        };
+        let map = self.conn.maps.current(&cfg);
+        if map.unreadable {
+            let why = "the vault could not be read".to_string();
+            return self.refuse(&cfg, StatusCode::BAD_GATEWAY, why);
+        }
+        if !self.for_this_host(&req) {
+            let why = format!("Host does not match {}", self.name);
+            return self.refuse(&cfg, StatusCode::FORBIDDEN, why);
+        }
+        let (mut parts, body_in) = req.into_parts();
+        // Origin form, whatever form the client wrote the target in.
+        let target = parts.uri.path_and_query().map_or("/", |p| p.as_str());
+        parts.uri = target.parse().unwrap_or_default();
+        // What is between the client and this proxy stays here (`hop_by_hop`): an `Upgrade`
+        // among it, so no websocket is carried on a decrypted host, whose frames nobody
+        // would read. And the whole reply is asked for, as it is: a range of a body could cut
+        // a value in a place of the client's choosing, and an encoded one cannot be read.
+        hop_by_hop(&mut parts.headers);
+        // This hop's own: the proxy takes a reply's trailers, and passes them on.
+        (parts.headers).insert(hyper::header::TE, HeaderValue::from_static("trailers"));
+        parts.headers.remove(hyper::header::RANGE);
+        parts.headers.remove(hyper::header::IF_RANGE);
+        let swapped =
+            match crate::broker::swap(&mut parts.uri, &mut parts.headers, &map, &self.dest) {
+                Ok(swapped) => swapped,
+                Err(refused) => return self.conn.refuse_token(&cfg, &self.dest, &refused),
+            };
+        let identity = HeaderValue::from_static("identity");
+        parts
+            .headers
+            .insert(hyper::header::ACCEPT_ENCODING, identity);
+        let no_body = parts.method == Method::HEAD;
+        for name in &swapped.used {
+            let dest = format!("{name} -> {}", self.dest);
+            self.conn.record(&cfg, "swap", &dest, Outcome::Allowed);
+        }
+        let floor = &self.conn.floor;
+        let sent = async {
+            let mut sender = sender.lock().await;
+            sender.ready().await.ok()?;
+            let reply = sender.send_request(Request::from_parts(parts, body_in));
+            tokio::time::timeout(floor.reply_wait, reply)
+                .await
+                .ok()?
+                .ok()
+        };
+        let Some(mut reply) = sent.await else {
+            let why = "the server did not answer".to_string();
+            return self.refuse(&cfg, StatusCode::BAD_GATEWAY, why);
+        };
+        // A reply that is not the whole body as the server wrote it is not passed on unread:
+        // another protocol, a part of a body, or an encoded one.
+        let unreadable = match reply.status() {
+            StatusCode::SWITCHING_PROTOCOLS => Some("switched protocols"),
+            StatusCode::PARTIAL_CONTENT => Some("sent a part of a reply"),
+            _ if encoded(reply.headers()) => Some("sent a reply zephyr cannot read (compressed)"),
+            _ => None,
+        };
+        // Nor one whose header names hold a value bound here: a name cannot become a stand-in.
+        let named = map.in_names(&self.dest, reply.headers());
+        let unreadable = unreadable.or(named.then_some("named a header after a vault token"));
+        if let Some(what) = unreadable {
+            let why = format!("{} {what}", self.name);
+            return self.refuse(&cfg, StatusCode::BAD_GATEWAY, why);
+        }
+        // A host that sends back what it was sent (an echo, an error page that prints the
+        // request) must not hand the agent the token: every value bound here goes back to its
+        // stand-in, in the reply's headers and in its body, and so does a credential this
+        // request carried encoded. The status line's own text is the server's to choose, so
+        // it is left out: the client gets the status's usual words.
+        // A server that ends its connection with this reply leaves the proxy none to send the
+        // client's next request on: the client is told its own ends too, so it reconnects
+        // (a new `CONNECT`, checked afresh) and does not write into a closed one.
+        let closing = (reply.headers().get_all(hyper::header::CONNECTION).iter())
+            .flat_map(|v| v.to_str().unwrap_or_default().split(','))
+            .any(|token| token.trim().eq_ignore_ascii_case("close"));
+        hop_by_hop(reply.headers_mut());
+        if closing || sender.lock().await.is_closed() {
+            let close = HeaderValue::from_static("close");
+            reply.headers_mut().insert(hyper::header::CONNECTION, close);
+        }
+        reply.extensions_mut().remove::<hyper::ext::ReasonPhrase>();
+        crate::broker::unswap(reply.headers_mut(), &map, &self.dest, &swapped.sent);
+        let idle = |body| Idle {
+            body,
+            wait: floor.idle,
+            timer: Box::pin(tokio::time::sleep(floor.idle)),
+        };
+        let replacer = map.unswapper(&self.dest, &swapped.sent);
+        let bodiless = matches!(
+            reply.status(),
+            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+        );
+        if no_body || bodiless || replacer.is_empty() {
+            return reply.map(|body| idle(body).boxed_unsync());
+        }
+        // A stand-in is not as long as its value, so the length is no longer known ahead.
+        reply.headers_mut().remove(hyper::header::CONTENT_LENGTH);
+        // A trailer whose name holds one ends the reply there, with its row.
+        let (conn, dest, name) = (self.conn.clone(), self.dest.clone(), self.name.clone());
+        let (names, host) = (map.clone(), self.dest.clone());
+        let bad_trailers = move |trailers: &hyper::HeaderMap| -> bool {
+            let bad = names.in_names(&host, trailers);
+            if bad {
+                let why = format!("{name} named a trailer after a vault token");
+                conn.record(&cfg, "swap", &dest, Outcome::Refused(why));
+            }
+            bad
+        };
+        reply.map(|body| {
+            let body = Unswapped {
+                body: idle(body),
+                replacer,
+                trailers: None,
+                done: false,
+                bad_trailers: Box::new(bad_trailers),
+            };
+            body.boxed_unsync()
+        })
+    }
+}
+
+/// Removes what RFC 9110 §7.6.1 says goes no further than one connection: `Connection` and
+/// every header it names, and the ones a proxy never passes on. On the decrypted path each
+/// side's are its own: a client cannot have the proxy carry a header it named as hop-by-hop
+/// past the checks, nor keep a say in how the upstream connection is used.
+fn hop_by_hop(headers: &mut hyper::HeaderMap) {
+    use hyper::header::{HeaderName, CONNECTION};
+    // Not `Trailer`: it describes the message, and goes with it end to end.
+    const ALWAYS: [&str; 6] = [
+        "connection",
+        "keep-alive",
+        "te",
+        "upgrade",
+        "proxy-authorization",
+        "proxy-connection",
+    ];
+    let named: Vec<HeaderName> = (headers.get_all(CONNECTION).iter())
+        .flat_map(|v| v.to_str().unwrap_or_default().split(','))
+        .filter_map(|name| HeaderName::from_bytes(name.trim().as_bytes()).ok())
+        // The body's framing is hyper's to keep right on each side.
+        .filter(|name| {
+            ![
+                hyper::header::TRANSFER_ENCODING,
+                hyper::header::CONTENT_LENGTH,
+                HOST,
+            ]
+            .contains(name)
+        })
+        .collect();
+    for name in named {
+        headers.remove(name);
+    }
+    for name in ALWAYS {
+        headers.remove(name);
+    }
+}
+
+/// Whether a reply's body is anything but the bytes the server meant: a `Content-Encoding`
+/// other than `identity`, or a `Transfer-Encoding` beyond `chunked` (which hyper has undone).
+fn encoded(headers: &hyper::HeaderMap) -> bool {
+    let other = |name, plain: &str| {
+        let values = headers.get_all(name).iter();
+        let mut codings = values.flat_map(|v| v.to_str().unwrap_or("?").split(','));
+        codings.any(|c| !c.trim().is_empty() && !c.trim().eq_ignore_ascii_case(plain))
+    };
+    other(hyper::header::CONTENT_ENCODING, "identity")
+        || other(hyper::header::TRANSFER_ENCODING, "chunked")
+}
+
+/// A decrypted host's reply body with each real value bound there turned back into its
+/// stand-in, as it streams: a value cut across two frames is held until it is whole.
+struct Unswapped {
+    body: Idle,
+    replacer: crate::broker::Replacer,
+    /// Trailers, waiting for the data held back before them.
+    trailers: Option<hyper::body::Frame<Bytes>>,
+    done: bool,
+    /// Whether a trailer's name holds a bound value (and notes the refusal).
+    bad_trailers: Box<dyn Fn(&hyper::HeaderMap) -> bool + Send>,
+}
+
+impl hyper::body::Body for Unswapped {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+        use hyper::body::Frame;
+        let this = &mut *self;
+        loop {
+            if let Some(trailers) = this.trailers.take() {
+                return Poll::Ready(Some(Ok(trailers)));
+            }
+            if this.done {
+                return Poll::Ready(None);
+            }
+            let out = match std::task::ready!(Pin::new(&mut this.body).poll_frame(cx)) {
+                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                Some(Ok(frame)) => match frame.into_data() {
+                    Ok(data) => this.replacer.push(&data),
+                    Err(trailers) => {
+                        let out = this.replacer.finish();
+                        let mut trailers = trailers.into_trailers().unwrap_or_default();
+                        if (this.bad_trailers)(&trailers) {
+                            this.done = true;
+                            let e = "a trailer was named after a vault token";
+                            return Poll::Ready(Some(Err(e.into())));
+                        }
+                        (trailers.values_mut()).for_each(|v| this.replacer.header(v));
+                        this.trailers = Some(Frame::trailers(trailers));
+                        out
+                    }
+                },
+                None => {
+                    this.done = true;
+                    this.replacer.finish()
+                }
+            };
+            if !out.is_empty() {
+                return Poll::Ready(Some(Ok(Frame::data(Bytes::from(out)))));
+            }
+        }
+    }
 }
 
 /// The audit's one writer, on a thread of its own, so reading the vault and the facts and
@@ -630,21 +1133,33 @@ struct Note {
 fn write_audit(store: Store, notes: std::sync::mpsc::Receiver<Note>, mut cfg: Arc<Config>) {
     use std::sync::mpsc::RecvTimeoutError;
     let mut audit = Audit::default();
+    let mut notices = crate::broker::Notices::default();
     loop {
+        let mut tell = None;
         let rows = match notes.recv_timeout(Duration::from_secs(1)) {
             Ok(note) => {
                 cfg = note.cfg;
+                tell = (note.notice).filter(|(what, host, _)| notices.due(note.at, what, host));
                 audit.note(note.at, note.tool, &note.dest, note.outcome)
             }
             Err(RecvTimeoutError::Timeout) => audit.flush(crate::now()).into_iter().collect(),
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        if rows.is_empty() {
+        if rows.is_empty() && tell.is_none() {
             continue;
         }
         let scrub = crate::gate::Scrub::load(&cfg);
         for (tool, args, outcome) in rows {
             crate::gate::audit_row(&store, "net", &tool, &scrub.text(&args), &outcome);
+        }
+        // It names no command: the answer to an attack should not be one tap from allowing it.
+        // shortcut: sent with the router's next tick (5 s), not at once.
+        if let Some((_, _, text)) = tell {
+            // Scrubbed like a row: a host name may hold a stand-in or a private fact.
+            let told = store.notify_last_owner(&scrub.text(&text));
+            if let Err(e) = told {
+                eprintln!("zephyr: telling the owner of a refused token failed: {e}");
+            }
         }
     }
 }
@@ -1118,6 +1633,37 @@ impl From<Result<(), String>> for Check {
     }
 }
 
+/// What the token broker keeps from the agent (DESIGN §4.21), tried as whoever runs this: its
+/// keys under `state` must not open, and nothing may be put into the folders `trust` that the
+/// agent's tools take their roots from.
+fn broker_reach(state: &Path, trust: &[&str]) -> Vec<(String, Check)> {
+    let mut checks = Vec::new();
+    let keys = [state.join("ca/ca.key"), state.join(crate::broker::KEY_FILE)];
+    for key in keys {
+        let check = match std::fs::File::open(&key) {
+            Err(_) => Check::Ok,
+            Ok(_) => Check::Fail("it opened".into()),
+        };
+        checks.push((format!("the agent cannot read {}", key.display()), check));
+    }
+    for dir in trust {
+        let probe = Path::new(dir).join(format!(".zephyr-probe-{}", std::process::id()));
+        let made = std::fs::File::create(&probe).is_ok();
+        let _ = std::fs::remove_file(&probe);
+        // A certificate already there must not be the agent's to rewrite either.
+        let rewrite = |name: &str| {
+            let file = Path::new(dir).join(name);
+            std::fs::OpenOptions::new().append(true).open(file).is_ok()
+        };
+        let check = match made || rewrite("ca.pem") || rewrite("ca-certificates.crt") {
+            false => Check::Ok,
+            true => Check::Fail("a file could be written there".into()),
+        };
+        checks.push((format!("the agent cannot add trust in {dir}"), check));
+    }
+    checks
+}
+
 /// `zephyr __netcheck [OWN_IP:ATTACH_PORT]`: what the agent's uid can reach, one
 /// `ok|fail|warn <what>` line per check. Run as the agent: by the daemon at start with no
 /// argument (the direct connection alone), and by `doctor` with the daemon's address, which adds
@@ -1159,6 +1705,14 @@ pub fn netcheck(args: &[String]) -> std::process::ExitCode {
             Err(e) => Check::Warn(format!("the proxy did not answer: {e}")),
         };
         checks.push(("the proxy reaches example.com:443".into(), check));
+    }
+    if let (Some(state), Some(public)) = (args.get(1), args.get(2)) {
+        let trust = [
+            "/usr/local/share/ca-certificates",
+            "/etc/ssl/certs",
+            public.as_str(),
+        ];
+        checks.extend(broker_reach(Path::new(state), &trust));
     }
     let mut code = std::process::ExitCode::SUCCESS;
     for (what, check) in checks {
@@ -1549,6 +2103,8 @@ mod tests {
             connect_wait: WAIT,
             reply_wait: WAIT,
             idle: WAIT,
+            upstream: crate::ca::client(crate::ca::public_roots()).unwrap(),
+            ca: None,
         }
     }
 
@@ -2279,6 +2835,1311 @@ table inet zephyr {
         assert_eq!(dns_answers(&nxdomain, 0xbeef), None);
         for cut in 0..reply.len() {
             assert_eq!(dns_answers(&reply[..cut], 0xbeef), None, "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn the_brokers_keys_and_trust_are_checked_as_the_caller() {
+        let dir = crate::test_dir("egress-broker-reach");
+        let (state, open, closed) = (dir.join("state"), dir.join("open"), dir.join("nope"));
+        std::fs::create_dir_all(state.join("ca")).unwrap();
+        std::fs::create_dir_all(&open).unwrap();
+        let fails = |checks: Vec<(String, Check)>| -> Vec<bool> {
+            let failed = |c: &(String, Check)| matches!(c.1, Check::Fail(_));
+            checks.iter().map(failed).collect()
+        };
+        // Keys that are not there cannot be read; a folder that is not there takes no file.
+        let none = broker_reach(&state, &[closed.to_str().unwrap()]);
+        assert_eq!(fails(none), [false, false, false]);
+        // A key this user can open, and a folder it can write: both are failures.
+        std::fs::write(state.join("ca/ca.key"), "k").unwrap();
+        let reached = broker_reach(&state, &[open.to_str().unwrap()]);
+        assert_eq!(fails(reached), [true, false, true]);
+        assert_eq!(
+            std::fs::read_dir(&open).unwrap().count(),
+            0,
+            "the probe is removed"
+        );
+    }
+
+    /// The token broker's path through the proxy (DESIGN §4.21): a host a token is bound to is
+    /// decrypted and swapped, and a stand-in is refused wherever else the proxy can see it.
+    mod decrypted {
+        use super::*;
+        use crate::broker;
+        use crate::ca::tests::test_ca;
+        use rustls::pki_types::ServerName;
+        use tokio::io::{AsyncRead, AsyncWrite};
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+        const A: &str = "real-token-A-123456";
+        const B: &str = "real-token-B-654321";
+        type Roots = Arc<rustls::RootCertStore>;
+        type Stream = tokio_rustls::client::TlsStream<TcpStream>;
+
+        static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+
+        /// Every `.test` name is 127.0.0.1; `rebind.test` also has an address that is refused,
+        /// and lookups of `counted.test` are counted.
+        fn names(host: String, port: u16) -> BoxFuture<'static, std::io::Result<Vec<SocketAddr>>> {
+            if host == "counted.test" {
+                LOOKUPS.fetch_add(1, Ordering::SeqCst);
+            }
+            let ips: &[&str] = match host.as_str() {
+                "rebind.test" => &["127.0.0.1", "127.0.0.2"],
+                h if h.ends_with(".test") => &["127.0.0.1"],
+                _ => &[],
+            };
+            let addrs = ips.iter().map(|i| SocketAddr::new(ip(i), port)).collect();
+            Box::pin(async move { Ok(addrs) })
+        }
+
+        /// Reads up to the blank line that ends a head; `None` when the stream ends first.
+        async fn read_head<S: AsyncRead + Unpin>(s: &mut S) -> Option<String> {
+            let mut got = Vec::new();
+            while !got.ends_with(b"\r\n\r\n") {
+                let byte = tokio::time::timeout(WAIT, s.read_u8()).await.ok()?.ok()?;
+                got.push(byte);
+            }
+            String::from_utf8(got).ok()
+        }
+
+        /// Reads until what came holds `want`.
+        async fn read_until<S: AsyncRead + Unpin>(s: &mut S, want: &str) -> String {
+            let mut got = Vec::new();
+            while !String::from_utf8_lossy(&got).contains(want) {
+                let byte = tokio::time::timeout(WAIT, s.read_u8()).await;
+                got.push(byte.expect("nothing more came").expect("the stream ended"));
+            }
+            String::from_utf8_lossy(&got).into_owned()
+        }
+
+        /// A TLS server on 127.0.0.1 standing for a host on the internet. It hands back each
+        /// request's head. `/events` sends three events, the next only once `go` is notified;
+        /// `/upload` hands back a chunked body as it arrives; `/ws` switches protocols and
+        /// answers in upper case; `/redirect` repeats its target in `Location`.
+        struct Server {
+            port: u16,
+            accepts: Arc<AtomicUsize>,
+            heads: tokio::sync::mpsc::UnboundedReceiver<String>,
+            bodies: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+            go: Arc<tokio::sync::Notify>,
+        }
+
+        async fn serve_one<S: AsyncRead + AsyncWrite + Unpin>(
+            mut s: S,
+            heads: tokio::sync::mpsc::UnboundedSender<String>,
+            bodies: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+            go: Arc<tokio::sync::Notify>,
+        ) -> Option<()> {
+            loop {
+                let head = read_head(&mut s).await?;
+                let _ = heads.send(head.clone());
+                let path = head.split(' ').nth(1).unwrap_or("/").to_string();
+                if path.starts_with("/events") {
+                    let start = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                                 transfer-encoding: chunked\r\n\r\n";
+                    s.write_all(start.as_bytes()).await.ok()?;
+                    for n in 1..=3 {
+                        let event = format!("data: {n}\n\n");
+                        let chunk = format!("{:x}\r\n{event}\r\n", event.len());
+                        s.write_all(chunk.as_bytes()).await.ok()?;
+                        s.flush().await.ok()?;
+                        if n < 3 {
+                            go.notified().await;
+                        }
+                    }
+                    s.write_all(b"0\r\n\r\n").await.ok()?;
+                    continue;
+                }
+                // What the request's `x-key` header held, sent back: cut in two chunks in the
+                // middle of it, the second only once `go` is notified.
+                let named = |name: &str| head.lines().find_map(|l| l.strip_prefix(name));
+                let sent = named("x-key: ").or(named("authorization: "));
+                let sent = sent.unwrap_or_default().to_string();
+                // The same in the status line's own words, in headers of this hop only, and
+                // as a part of a body.
+                let other = match path.as_str() {
+                    "/reason" => Some(format!(
+                        "HTTP/1.1 200 {sent}\r\ncontent-length: 2\r\n\r\nok"
+                    )),
+                    "/hop" => Some(format!(
+                        "HTTP/1.1 200 OK\r\nconnection: x-hop\r\nx-hop: {sent}\r\n\
+                         keep-alive: timeout=5\r\ncontent-length: 2\r\n\r\nok"
+                    )),
+                    "/partial" => Some(
+                        "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes 0-1/9\r\n\
+                         content-length: 2\r\n\r\nre"
+                            .to_string(),
+                    ),
+                    _ => None,
+                };
+                if let Some(reply) = other {
+                    s.write_all(reply.as_bytes()).await.ok()?;
+                    s.flush().await.ok()?;
+                    continue;
+                }
+                // A reply that ends its connection, and one with a trailer after its body.
+                if path == "/close" {
+                    let reply =
+                        "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\nok";
+                    s.write_all(reply.as_bytes()).await.ok()?;
+                    s.flush().await.ok()?;
+                    return None;
+                }
+                // The value in a header's own name, and in a trailer's.
+                if path == "/named" {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nx-meta-{}: 1\r\ncontent-length: 2\r\n\r\nok",
+                        sent.to_lowercase()
+                    );
+                    s.write_all(reply.as_bytes()).await.ok()?;
+                    s.flush().await.ok()?;
+                    continue;
+                }
+                if path == "/trailer-named" {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n\
+                         2\r\nok\r\n0\r\nx-meta-{}: 1\r\n\r\n",
+                        sent.to_lowercase()
+                    );
+                    s.write_all(reply.as_bytes()).await.ok()?;
+                    s.flush().await.ok()?;
+                    continue;
+                }
+                if path == "/trailers" {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ntrailer: x-sum\r\n\r\n\
+                         2\r\nok\r\n0\r\nx-sum: {sent}\r\n\r\n"
+                    );
+                    s.write_all(reply.as_bytes()).await.ok()?;
+                    s.flush().await.ok()?;
+                    continue;
+                }
+                if path.starts_with("/echo-chunked") {
+                    let start = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n";
+                    s.write_all(start.as_bytes()).await.ok()?;
+                    let (one, two) = sent.split_at(sent.len() / 2);
+                    for (i, part) in [format!("you sent {one}"), format!("{two} ok")]
+                        .iter()
+                        .enumerate()
+                    {
+                        let chunk = format!("{:x}\r\n{part}\r\n", part.len());
+                        s.write_all(chunk.as_bytes()).await.ok()?;
+                        s.flush().await.ok()?;
+                        if i == 0 {
+                            go.notified().await;
+                        }
+                    }
+                    s.write_all(b"0\r\n\r\n").await.ok()?;
+                    continue;
+                }
+                if path.starts_with("/echo-length") || path.starts_with("/gzip") {
+                    let coding = match path.starts_with("/gzip") {
+                        true => "content-encoding: gzip\r\n",
+                        false => "",
+                    };
+                    let text = format!("key={sent}");
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nx-echo: {sent}\r\n{coding}content-length: {}\r\n\r\n{text}",
+                        text.len()
+                    );
+                    s.write_all(reply.as_bytes()).await.ok()?;
+                    s.flush().await.ok()?;
+                    continue;
+                }
+                if path.starts_with("/ws") {
+                    let switch = "HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\n\
+                                  upgrade: websocket\r\n\r\n";
+                    s.write_all(switch.as_bytes()).await.ok()?;
+                    let mut buf = [0u8; 64];
+                    loop {
+                        let n = s.read(&mut buf).await.ok().filter(|n| *n > 0)?;
+                        s.write_all(&buf[..n].to_ascii_uppercase()).await.ok()?;
+                        s.flush().await.ok()?;
+                    }
+                }
+                if path.starts_with("/upload") {
+                    let (mut all, mut buf) = (Vec::new(), [0u8; 1024]);
+                    while !all.ends_with(b"0\r\n\r\n") {
+                        let n = s.read(&mut buf).await.ok().filter(|n| *n > 0)?;
+                        all.extend_from_slice(&buf[..n]);
+                        let _ = bodies.send(buf[..n].to_vec());
+                    }
+                }
+                let reply = match path.starts_with("/redirect") {
+                    true => format!(
+                        "HTTP/1.1 302 Found\r\nlocation: https://bound.test{path}\r\n\
+                         content-length: 0\r\n\r\n"
+                    ),
+                    false => "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok".to_string(),
+                };
+                s.write_all(reply.as_bytes()).await.ok()?;
+                s.flush().await.ok()?;
+            }
+        }
+
+        async fn server(tls: Arc<rustls::ServerConfig>) -> Server {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let accepts = Arc::new(AtomicUsize::new(0));
+            let (heads_tx, heads) = tokio::sync::mpsc::unbounded_channel();
+            let (bodies_tx, bodies) = tokio::sync::mpsc::unbounded_channel();
+            let go = Arc::new(tokio::sync::Notify::new());
+            let (count, wait) = (accepts.clone(), go.clone());
+            tokio::spawn(async move {
+                loop {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let (tls, heads, bodies) = (tls.clone(), heads_tx.clone(), bodies_tx.clone());
+                    let go = wait.clone();
+                    tokio::spawn(async move {
+                        if let Ok(s) = TlsAcceptor::from(tls).accept(tcp).await {
+                            serve_one(s, heads, bodies, go).await;
+                        }
+                    });
+                }
+            });
+            Server {
+                port,
+                accepts,
+                heads,
+                bodies,
+                go,
+            }
+        }
+
+        /// The proxy with a CA of its own, a server that is `bound.test` under roots standing
+        /// for the public web's, and what the agent's tools trust (the proxy's CA).
+        struct Net {
+            proxy: Proxy,
+            up: Server,
+            /// `bound.test:<port>`.
+            dest: String,
+            /// What the agent's tools trust: the proxy's CA.
+            trust: Roots,
+            /// What the proxy trusts upstream: roots standing for the public web.
+            web_roots: Roots,
+        }
+
+        impl Net {
+            /// `allow` lists further `host:port`s; `{port}` in it is the bound server's.
+            async fn start(name: &str, allow: &str, with_ca: bool) -> Net {
+                let (web, web_roots) = test_ca(&format!("{name}-web"));
+                let (ca, trust) = test_ca(&format!("{name}-ca"));
+                let up = server(web.leaf("bound.test", crate::now()).unwrap()).await;
+                let dest = format!("bound.test:{}", up.port);
+                let floor = Floor {
+                    lookup: names,
+                    upstream: crate::ca::client(web_roots.clone()).unwrap(),
+                    ca: with_ca.then(|| Arc::new(ca)),
+                    ..floor()
+                };
+                let allow = format!("{dest},{allow}").replace("{port}", &up.port.to_string());
+                let proxy = Proxy::start(name, allow.trim_end_matches(','), floor).await;
+                Net {
+                    proxy,
+                    up,
+                    dest,
+                    trust,
+                    web_roots,
+                }
+            }
+
+            /// Saves the vault's tokens, `(name, value, hosts, url)`, and returns their
+            /// stand-ins.
+            fn vault(&self, tokens: &[(&str, &str, &[&str], bool)]) -> Vec<String> {
+                let mut text = String::new();
+                for (name, value, hosts, url) in tokens {
+                    text += &format!(
+                        "[[token]]\nname = {name:?}\nvalue = {value:?}\nhosts = {hosts:?}\nurl = {url}\nheaders = [\"X-Key\"]\n"
+                    );
+                }
+                std::fs::write(self.proxy.dir.join("vault.toml"), text).unwrap();
+                let key = broker::key(&config(&self.proxy.dir, "")).unwrap();
+                let stand_in =
+                    |t: &(&str, &str, &[&str], bool)| broker::surrogate(&key, "token", t.0);
+                tokens.iter().map(stand_in).collect()
+            }
+
+            /// `CONNECT dest`, then TLS as `sni` with `config`.
+            async fn connect(
+                &self,
+                dest: &str,
+                sni: &str,
+                config: Arc<rustls::ClientConfig>,
+            ) -> Result<Stream, String> {
+                let ask = format!("CONNECT {dest} HTTP/1.1\r\n\r\n");
+                let (tcp, reply) = self.proxy.ask(&ask).await;
+                if !reply.starts_with("HTTP/1.1 200") {
+                    return Err(reply);
+                }
+                let name = ServerName::try_from(sni.to_string()).unwrap();
+                let tls = TlsConnector::from(config).connect(name, tcp).await;
+                tls.map_err(|e| e.to_string())
+            }
+
+            /// A decrypted connection to the bound server, as a tool of the agent's makes it.
+            async fn bound(&self) -> Stream {
+                let config = crate::ca::client(self.trust.clone()).unwrap();
+                self.connect(&self.dest, "bound.test", config)
+                    .await
+                    .unwrap()
+            }
+
+            /// The head the bound server read next.
+            async fn head(&mut self) -> String {
+                let head = tokio::time::timeout(WAIT, self.up.heads.recv()).await;
+                head.expect("the server read no request").unwrap()
+            }
+
+            fn rows(&self) -> Vec<(String, String, String)> {
+                let store = Store::open(&config(&self.proxy.dir, "").db_path()).unwrap();
+                let rows = store.audit_rows().unwrap().into_iter();
+                (rows.filter(|r| r.0 == "net"))
+                    .map(|r| (r.1, r.2, r.3))
+                    .collect()
+            }
+        }
+
+        /// Sends `request` and returns the reply's head. A body with a length is read too, so
+        /// the connection is ready for the next request.
+        async fn ask<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S, request: &str) -> String {
+            s.write_all(request.as_bytes()).await.unwrap();
+            let head = read_head(s).await.expect("no reply came");
+            let length = head.lines().find_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                (name.eq_ignore_ascii_case("content-length")).then(|| value.trim().parse().ok())?
+            });
+            let mut body = vec![0u8; length.unwrap_or(0)];
+            s.read_exact(&mut body).await.unwrap();
+            head
+        }
+
+        /// A chunked body to its end, without the framing.
+        async fn chunked<S: AsyncRead + Unpin>(s: &mut S) -> String {
+            let mut text = String::new();
+            loop {
+                let size = read_until(s, "\r\n").await;
+                let size = usize::from_str_radix(size.trim(), 16).expect("a chunk size");
+                let mut chunk = vec![0u8; size + 2];
+                s.read_exact(&mut chunk).await.unwrap();
+                text.push_str(&String::from_utf8_lossy(&chunk[..size]));
+                if size == 0 {
+                    return text;
+                }
+            }
+        }
+
+        /// `GET target` for the bound server with `headers`, and the reply's head.
+        async fn get(s: &mut Stream, net: &Net, target: &str, headers: &str) -> String {
+            let (head, _) = get_body(s, net, target, headers).await;
+            head
+        }
+
+        /// As `get`, with the reply's body. A decrypted host's reply comes chunked: its length
+        /// is not known once values in it may be turned back into stand-ins.
+        async fn get_body(
+            s: &mut Stream,
+            net: &Net,
+            target: &str,
+            headers: &str,
+        ) -> (String, String) {
+            let request = format!(
+                "GET {target} HTTP/1.1\r\nHost: {}\r\n{headers}\r\n",
+                net.dest
+            );
+            let head = ask(s, &request).await;
+            let body = match head.to_lowercase().contains("transfer-encoding: chunked") {
+                true => chunked(s).await,
+                false => String::new(),
+            };
+            (head, body)
+        }
+
+        #[tokio::test]
+        async fn a_bound_host_gets_the_real_token_and_never_the_stand_in() {
+            let mut net = Net::start("broker-swap", "", true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[
+                ("A", A, &[dest.as_str()], false),
+                ("B", B, &[dest.as_str()], true),
+            ]);
+            let mut tls = net.bound().await;
+            let reply = get(
+                &mut tls,
+                &net,
+                "/repos",
+                &format!("Authorization: Bearer {}\r\n", s[0]),
+            )
+            .await;
+            assert!(reply.starts_with("HTTP/1.1 200 "), "{reply}");
+            let head = net.head().await;
+            assert!(
+                head.contains(&format!("authorization: Bearer {A}\r\n")),
+                "{head}"
+            );
+            assert!(!head.contains("zsur_"), "{head}");
+            // The same connection again: `git` sends its token as a Basic password.
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let basic = b64.encode(format!("x-access-token:{}", s[0]));
+            get(
+                &mut tls,
+                &net,
+                "/info/refs",
+                &format!("Authorization: Basic {basic}\r\n"),
+            )
+            .await;
+            let head = net.head().await;
+            let want = b64.encode(format!("x-access-token:{A}"));
+            assert!(
+                head.contains(&format!("authorization: Basic {want}\r\n")),
+                "{head}"
+            );
+            // A token with `url` goes into the target, and a reply that repeats it gets the
+            // stand-in back.
+            let reply = get(&mut tls, &net, &format!("/redirect?key={}", s[1]), "").await;
+            let head = net.head().await;
+            assert!(
+                head.starts_with(&format!("GET /redirect?key={B} HTTP/1.1")),
+                "{head}"
+            );
+            assert!(
+                reply.contains(&format!(
+                    "location: https://bound.test/redirect?key={}\r\n",
+                    s[1]
+                )),
+                "{reply}"
+            );
+            assert!(!reply.contains(B), "{reply}");
+            // Three requests, one connection to the server.
+            assert_eq!(net.up.accepts.load(Ordering::SeqCst), 1);
+            // One row for where it went, and one per token there, by name, for the hour.
+            let rows = net.proxy.net_rows(3).await;
+            let row = |tool: &str, args: String| (tool.to_string(), args, "allowed".to_string());
+            assert_eq!(
+                rows,
+                [
+                    row("connect", format!("{dest} -> 127.0.0.1")),
+                    row("swap", format!("A -> {dest}")),
+                    row("swap", format!("B -> {dest}")),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unbound_host_is_a_plain_tunnel_that_carries_the_stand_in_as_it_is() {
+            let net = Net::start("broker-unbound", "other.test:{port}", true).await;
+            let s = net.vault(&[("A", A, &["elsewhere.test:443"], false)]);
+            // The same server, asked for by a name nothing is bound to.
+            let other = format!("other.test:{}", net.up.port);
+            // Not decrypted: the proxy's CA is not what signed what the client sees.
+            let ours = crate::ca::client(net.trust.clone()).unwrap();
+            assert!(net.connect(&other, "bound.test", ours).await.is_err());
+            // It is the server's own certificate, end to end.
+            let webs = crate::ca::client(net.web_roots.clone()).unwrap();
+            let mut tls = net.connect(&other, "bound.test", webs).await.unwrap();
+            let request = format!(
+                "GET / HTTP/1.1\r\nHost: other.test\r\nX-Key: {}\r\n\r\n",
+                s[0]
+            );
+            assert!(ask(&mut tls, &request).await.starts_with("HTTP/1.1 200 "));
+            // What the proxy cannot see arrives: the stand-in, worth nothing there, and never
+            // the token (§4.6 of the spec).
+            let mut net = net;
+            let head = loop {
+                let head = net.head().await;
+                if head.contains("x-key") || head.contains("X-Key") {
+                    break head;
+                }
+            };
+            assert!(head.contains(&s[0]) && !head.contains(A), "{head}");
+        }
+
+        #[tokio::test]
+        async fn a_chunked_upload_and_an_event_stream_pass_unbuffered() {
+            let mut net = Net::start("broker-stream", "", true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[("A", A, &[dest.as_str()], false)]);
+            let mut tls = net.bound().await;
+            let head = format!(
+                "POST /upload HTTP/1.1\r\nHost: {dest}\r\nX-Key: {}\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n",
+                s[0]
+            );
+            tls.write_all(head.as_bytes()).await.unwrap();
+            // The first chunk is at the server before the second is sent at all.
+            let mut got = Vec::new();
+            while !String::from_utf8_lossy(&got).contains("first") {
+                let part = tokio::time::timeout(WAIT, net.up.bodies.recv()).await;
+                got.extend(part.expect("the upload was held back").unwrap());
+            }
+            assert!(!String::from_utf8_lossy(&got).contains("second"));
+            let reply = ask(&mut tls, "6\r\nsecond\r\n0\r\n\r\n").await;
+            assert!(reply.starts_with("HTTP/1.1 200 "), "{reply}");
+            assert_eq!(chunked(&mut tls).await, "ok");
+            assert!(net.head().await.contains(&format!("x-key: {A}\r\n")));
+            // Each event reaches the client while the server still waits to send the next.
+            let events = format!("GET /events HTTP/1.1\r\nHost: {dest}\r\n\r\n");
+            let reply = ask(&mut tls, &events).await;
+            assert!(reply.contains("text/event-stream"), "{reply}");
+            read_until(&mut tls, "data: 1\n\n").await;
+            net.up.go.notify_one();
+            let more = read_until(&mut tls, "data: 2\n\n").await;
+            assert!(!more.contains("data: 3"), "{more}");
+            net.up.go.notify_one();
+            read_until(&mut tls, "data: 3\n\n").await;
+        }
+
+        /// A websocket's frames would pass unread, so none is carried on a decrypted host: the
+        /// `Upgrade` is this hop's and goes no further, and a server that switches protocols
+        /// all the same is refused.
+        #[tokio::test]
+        async fn no_websocket_is_carried_on_a_bound_host() {
+            let mut net = Net::start("broker-ws", "", true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[("A", A, &[dest.as_str()], false)]);
+            let mut tls = net.bound().await;
+            let headers = format!(
+                "Connection: Upgrade\r\nUpgrade: websocket\r\nAuthorization: Bearer {}\r\n",
+                s[0]
+            );
+            let reply = get(&mut tls, &net, "/ws", &headers).await;
+            let want = "HTTP/1.1 502 zephyr: bound.test switched protocols\r\n";
+            assert!(reply.starts_with(want), "{reply}");
+            let head = net.head().await.to_lowercase();
+            assert!(
+                !head.contains("upgrade") && !head.contains("connection"),
+                "{head}"
+            );
+        }
+
+        /// The ways a host can send a token back other than as it is, each of which the
+        /// review of the first build found open: a Basic credential (base64 of the value), the
+        /// status line's own words, a part of a body, and headers meant for one hop.
+        #[tokio::test]
+        async fn a_token_sent_back_in_another_form_does_not_reach_the_agent() {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let mut net = Net::start("broker-forms", "", true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[("A", A, &[dest.as_str()], false)]);
+            let mut tls = net.bound().await;
+            let leaked = |text: &str| {
+                let forms = crate::vault::base64_forms(A);
+                text.contains(A) || forms.iter().any(|f| text.contains(f.as_str()))
+            };
+
+            // `curl -u x:$TOKEN`: the server gets the token inside a Basic credential, and an
+            // echo of that credential comes back as the one the agent's program wrote.
+            let written = b64.encode(format!("x:{}", s[0]));
+            let basic = format!("Authorization: Basic {written}\r\n");
+            let (head, body) = get_body(&mut tls, &net, "/echo-length", &basic).await;
+            let sent = net.head().await;
+            let real = b64.encode(format!("x:{A}"));
+            assert!(
+                sent.contains(&format!("authorization: Basic {real}\r\n")),
+                "{sent}"
+            );
+            assert_eq!(body, format!("key=Basic {written}"));
+            assert!(
+                head.contains(&format!("x-echo: Basic {written}\r\n")),
+                "{head}"
+            );
+            assert!(!leaked(&head) && !leaked(&body), "{head}{body}");
+
+            // The token in base64 at another offset, as a server that keeps it might send it.
+            let blob = b64.encode(format!("{{\"k\":\"{A}\"}}"));
+            let (head, body) = get_body(
+                &mut tls,
+                &net,
+                "/echo-length",
+                &format!("X-Key: {blob}\r\n"),
+            )
+            .await;
+            net.head().await;
+            assert!(!leaked(&head) && !leaked(&body), "{head}{body}");
+            assert!(body.contains(&s[0]), "{body}");
+
+            // The status line's own text is the server's: the client gets the usual words.
+            let key = format!("X-Key: {}\r\n", s[0]);
+            let head = get(&mut tls, &net, "/reason", &key).await;
+            net.head().await;
+            assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+            assert!(!leaked(&head), "{head}");
+
+            // A range is not asked for, so no value is cut where the client chose.
+            let ranged = format!("{key}Range: bytes=4-9\r\nIf-Range: \"x\"\r\n");
+            let (_, body) = get_body(&mut tls, &net, "/echo-length", &ranged).await;
+            let sent = net.head().await.to_lowercase();
+            assert!(!sent.contains("range"), "{sent}");
+            assert_eq!(body, format!("key={}", s[0]));
+
+            // What is one hop's stays on that hop, both ways: a header the client names in
+            // `Connection` is not carried past the checks, nor the server's to the client.
+            let hop = format!(
+                "{key}Connection: x-internal, content-length, host\r\nX-Internal: {}\r\nKeep-Alive: timeout=9\r\n\
+                 TE: gzip\r\nProxy-Authorization: Bearer {}\r\n",
+                s[0], s[0]
+            );
+            let (head, _) = get_body(&mut tls, &net, "/hop", &hop).await;
+            let sent = net.head().await.to_lowercase();
+            for gone in [
+                "x-internal",
+                "keep-alive",
+                "te: gzip",
+                "proxy-authorization",
+                "connection",
+            ] {
+                assert!(!sent.contains(gone), "{gone} in {sent}");
+            }
+            assert!(sent.contains("\r\nhost: bound.test"), "{sent}");
+            let head = head.to_lowercase();
+            assert!(
+                !head.contains("x-hop") && !head.contains("keep-alive"),
+                "{head}"
+            );
+            assert!(!leaked(&head), "{head}");
+
+            // A part of a body is not passed on: last, since the reply is dropped unread.
+            let head = get(&mut tls, &net, "/partial", &key).await;
+            let want = "HTTP/1.1 502 zephyr: bound.test sent a part of a reply\r\n";
+            assert!(head.starts_with(want), "{head}");
+            let row = (
+                "swap".to_string(),
+                dest.clone(),
+                "refused: bound.test sent a part of a reply".to_string(),
+            );
+            let deadline = tokio::time::Instant::now() + WAIT;
+            while !net.rows().contains(&row) {
+                assert!(tokio::time::Instant::now() < deadline, "{:?}", net.rows());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        /// When the server ends its connection the client's ends with that reply, and says so:
+        /// the proxy has no upstream left to send a next request on, so the client must not
+        /// be told the connection is kept.
+        #[tokio::test]
+        async fn a_reply_that_closes_upstream_closes_the_clients_connection() {
+            let mut net = Net::start("broker-close", "", true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[("A", A, &[dest.as_str()], false)]);
+            let mut tls = net.bound().await;
+            let request = format!(
+                "GET /close HTTP/1.1\r\nHost: {dest}\r\nX-Key: {}\r\n\r\n",
+                s[0]
+            );
+            let head = ask(&mut tls, &request).await.to_lowercase();
+            assert!(head.starts_with("http/1.1 200 "), "{head}");
+            assert!(head.contains("\r\nconnection: close\r\n"), "{head}");
+            // The body, and then the end: nothing waits for a request that could not be sent.
+            let mut rest = Vec::new();
+            let ended = tokio::time::timeout(Duration::from_secs(3), tls.read_to_end(&mut rest));
+            assert!(ended.await.is_ok(), "the client's connection stayed open");
+            assert!(String::from_utf8_lossy(&rest).contains("ok"));
+            net.head().await;
+            // The next request is a new connection, checked afresh, and works.
+            let mut again = net.bound().await;
+            assert!(get(&mut again, &net, "/", "")
+                .await
+                .starts_with("HTTP/1.1 200 "));
+        }
+
+        /// A trailer is the message's, not one hop's: it reaches the client, with a value in
+        /// it turned back like any header's.
+        #[tokio::test]
+        async fn trailers_reach_the_client_with_their_values_turned_back() {
+            let mut net = Net::start("broker-trailers", "", true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[("A", A, &[dest.as_str()], false)]);
+            let mut tls = net.bound().await;
+            let request = format!(
+                "GET /trailers HTTP/1.1\r\nHost: {dest}\r\nTE: trailers\r\nX-Key: {}\r\n\r\n",
+                s[0]
+            );
+            let head = ask(&mut tls, &request).await.to_lowercase();
+            assert!(head.contains("\r\ntrailer: x-sum\r\n"), "{head}");
+            let rest = read_until(&mut tls, "\r\n\r\n").await;
+            assert!(rest.contains(&format!("x-sum: {}\r\n", s[0])), "{rest}");
+            assert!(!rest.contains(A), "{rest}");
+            net.head().await;
+        }
+
+        /// A header's or trailer's name cannot be turned into a stand-in and stay a name, so a
+        /// reply that puts a bound value there is not passed on.
+        #[tokio::test]
+        async fn a_reply_that_names_a_header_after_a_token_is_refused() {
+            let mut net = Net::start("broker-named", "", true).await;
+            let dest = net.dest.clone();
+            // Lower case, as a header's name is on the wire.
+            let value = "real-token-named-1";
+            let s = net.vault(&[("A", value, &[dest.as_str()], false)]);
+            let key = format!("X-Key: {}\r\n", s[0]);
+            let rows = |net: &Net, outcome: &str| {
+                let row = ("swap".to_string(), dest.clone(), outcome.to_string());
+                net.rows().contains(&row)
+            };
+            let mut tls = net.bound().await;
+            let head = get(&mut tls, &net, "/named", &key).await;
+            let want = "HTTP/1.1 502 zephyr: bound.test named a header after a vault token\r\n";
+            assert!(head.starts_with(want), "{head}");
+            assert!(!head.contains(value), "{head}");
+            net.head().await;
+            // In a trailer the body has gone out by then: the reply ends there, unfinished,
+            // and the trailer is never sent.
+            let mut tls = net.bound().await;
+            let request =
+                format!("GET /trailer-named HTTP/1.1\r\nHost: {dest}\r\nTE: trailers\r\n{key}\r\n");
+            ask(&mut tls, &request).await;
+            let mut rest = Vec::new();
+            let _ = tokio::time::timeout(WAIT, tls.read_to_end(&mut rest)).await;
+            let rest = String::from_utf8_lossy(&rest);
+            assert!(!rest.contains(value) && !rest.contains("x-meta"), "{rest}");
+            let deadline = tokio::time::Instant::now() + WAIT;
+            let named = "refused: bound.test named a header after a vault token";
+            let trailer = "refused: bound.test named a trailer after a vault token";
+            while !(rows(&net, named) && rows(&net, trailer)) {
+                assert!(tokio::time::Instant::now() < deadline, "{:?}", net.rows());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        /// A request shaped to be read two ways (a length and a chunked body) reaches the
+        /// server as one well-formed request, and what follows it is a request of its own,
+        /// checked like any other.
+        #[tokio::test]
+        async fn a_request_with_two_framings_reaches_the_server_as_one() {
+            let mut net = Net::start("broker-smuggle", "", true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[("A", A, &[dest.as_str()], false)]);
+            let mut tls = net.bound().await;
+            let two = format!(
+                "POST /upload HTTP/1.1\r\nHost: {dest}\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n\
+                 0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: attacker.test\r\nX-Key: {}\r\n\r\n",
+                s[0]
+            );
+            tls.write_all(two.as_bytes()).await.unwrap();
+            let first = read_head(&mut tls).await.expect("no reply");
+            if first.starts_with("HTTP/1.1 400 ") {
+                // Refused outright: nothing reached the server.
+                assert!(net.up.heads.try_recv().is_err());
+                return;
+            }
+            let sent = net.head().await.to_lowercase();
+            assert!(sent.starts_with("post /upload "), "{sent}");
+            assert!(!sent.contains("content-length"), "{sent}");
+            // What followed it was either never read (the connection is closed after a request
+            // framed two ways) or read as a request of its own and refused: it names another
+            // host. Either way the server read one request, and no token went out.
+            let mut rest = Vec::new();
+            let _ = tokio::time::timeout(WAIT, tls.read_to_end(&mut rest)).await;
+            let rest = String::from_utf8_lossy(&rest);
+            assert!(
+                !rest.contains(" 200 ") || rest.contains("Host does not match"),
+                "{rest}"
+            );
+            assert!(
+                net.up.heads.try_recv().is_err(),
+                "the server read no second request"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_client_offering_h2_gets_http1() {
+            let net = Net::start("broker-alpn", "", true).await;
+            net.vault(&[("A", A, &[net.dest.as_str()], false)]);
+            let mut config = (*crate::ca::client(net.trust.clone()).unwrap()).clone();
+            config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            let tls = net
+                .connect(&net.dest, "bound.test", Arc::new(config))
+                .await
+                .unwrap();
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+        }
+
+        /// A bound host that sends back what it was sent must not hand the agent the token:
+        /// in the reply the agent's program reads, every value bound to that host is its
+        /// stand-in again, in a header, in a body with a length, and in a chunked body that
+        /// cuts the value in two. A reply that cannot be read is not passed on.
+        #[tokio::test]
+        async fn an_echo_from_a_bound_host_shows_the_stand_in_never_the_token() {
+            let mut net = Net::start("broker-echo", "", true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[
+                ("A", A, &[dest.as_str()], false),
+                ("B", B, &[dest.as_str()], false),
+            ]);
+            let mut tls = net.bound().await;
+            let key = format!("X-Key: {}\r\nAccept-Encoding: gzip, br\r\n", s[0]);
+
+            // A body with a length, and a header.
+            let (head, body) = get_body(&mut tls, &net, "/echo-length", &key).await;
+            let sent = net.head().await;
+            assert!(sent.contains(&format!("x-key: {A}\r\n")), "{sent}");
+            // The server is asked for the bytes as they are, whatever the client offered.
+            assert!(sent.contains("accept-encoding: identity\r\n"), "{sent}");
+            assert!(!sent.contains("gzip"), "{sent}");
+            assert!(head.contains(&format!("x-echo: {}\r\n", s[0])), "{head}");
+            assert_eq!(body, format!("key={}", s[0]));
+            // Its length changed with it, so the old one is gone.
+            assert!(!head.to_lowercase().contains("content-length"), "{head}");
+            assert!(!head.contains(A) && !body.contains(A));
+
+            // Chunked, the value cut in two: the first half does not come ahead of the rest.
+            let request = format!("GET /echo-chunked HTTP/1.1\r\nHost: {dest}\r\n{key}\r\n");
+            let head = ask(&mut tls, &request).await;
+            assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+            let early = read_until(&mut tls, "you sent \r\n").await;
+            let mut more = [0u8; 64];
+            let waited = tokio::time::timeout(Duration::from_millis(300), tls.read(&mut more));
+            assert!(waited.await.is_err(), "half a token was passed on");
+            net.up.go.notify_one();
+            let rest = read_until(&mut tls, "0\r\n\r\n").await;
+            let all = format!("{early}{rest}");
+            assert!(all.contains(&s[0]) && all.contains(" ok"), "{all}");
+            assert!(
+                !all.contains(A) && !all.contains(&A[..A.len() / 2]),
+                "{all}"
+            );
+            net.head().await;
+
+            // The other token bound here comes back as its stand-in too, though this request
+            // did not carry it: the server may have it from an earlier one.
+            let (_, body) = get_body(
+                &mut tls,
+                &net,
+                "/echo-length",
+                &format!("X-Key: was {B}\r\n"),
+            )
+            .await;
+            assert_eq!(body, format!("key=was {}", s[1]));
+            net.head().await;
+
+            // Compressed all the same: refused, with a row, and none of it passed on.
+            let (head, body) = get_body(&mut tls, &net, "/gzip", &key).await;
+            let want =
+                "HTTP/1.1 502 zephyr: bound.test sent a reply zephyr cannot read (compressed)\r\n";
+            assert!(head.starts_with(want), "{head}");
+            assert!(!head.contains(A) && !body.contains(A), "{head}{body}");
+            let refused = "refused: bound.test sent a reply zephyr cannot read (compressed)";
+            let row = ("swap".to_string(), dest.clone(), refused.to_string());
+            let deadline = tokio::time::Instant::now() + WAIT;
+            while !net.rows().contains(&row) {
+                assert!(tokio::time::Instant::now() < deadline, "{:?}", net.rows());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let printed = format!("{:?}", net.rows());
+            assert!(
+                !printed.contains(A) && !printed.contains("zsur_"),
+                "{printed}"
+            );
+        }
+
+        /// Makes `owner-1` on `discord` the owner last answered, so a notice has someone to go to.
+        fn an_owner(dir: &std::path::Path) -> Store {
+            let store = Store::open(&config(dir, "").db_path()).unwrap();
+            let said = crate::channel::Inbound {
+                channel: "discord".into(),
+                platform_msg_id: "m1".into(),
+                sender: "owner-1".into(),
+                text: "hi".into(),
+            };
+            store.insert_inbox(&said).unwrap();
+            let row = store.inbox_with_status("new").unwrap().remove(0);
+            store.mark_dispatched_as(row.id, "prompt").unwrap();
+            store
+        }
+
+        /// Review Focus 1: a stand-in on its way to a host it is not bound to, in any place the
+        /// proxy can see, is refused before anything is connected, audited by the token's name
+        /// and told to the owner once.
+        #[tokio::test]
+        async fn a_stand_in_on_plain_http_is_refused_audited_and_told_once() {
+            let up = upstream().await;
+            let attacker = format!("attacker.test:{}", up.port);
+            let net = Net::start("broker-plain", &attacker, true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[("A", A, &[dest.as_str()], true)]);
+            let store = an_owner(&net.proxy.dir);
+            use base64::Engine;
+            let basic = base64::engine::general_purpose::STANDARD.encode(format!("u:{}", s[0]));
+            let refused =
+                format!("HTTP/1.1 403 zephyr: the vault token A is not sent to {attacker}\r\n");
+            for (target, header) in [
+                ("/".to_string(), format!("X-Key: {}\r\n", s[0])),
+                (format!("/?key={}", s[0]), String::new()),
+                ("/".to_string(), format!("Authorization: Basic {basic}\r\n")),
+                // Once more: no second notice within the hour.
+                (
+                    "/again".to_string(),
+                    format!("Authorization: Bearer {}\r\n", s[0]),
+                ),
+            ] {
+                let request = format!(
+                    "GET http://{attacker}{target} HTTP/1.1\r\nHost: {attacker}\r\n{header}\r\n"
+                );
+                let (_, reply) = net.proxy.ask(&request).await;
+                assert!(reply.starts_with(&refused), "{target} {header}: {reply}");
+                assert!(!reply.contains("zsur_"), "{reply}");
+            }
+            // In the host name, where a lookup alone would carry it out.
+            let hosted = format!("CONNECT {}.attacker.test:443 HTTP/1.1\r\n\r\n", s[0]);
+            let (_, reply) = net.proxy.ask(&hosted).await;
+            let want = "HTTP/1.1 403 zephyr: the vault token A is not sent to that host\r\n";
+            assert!(reply.starts_with(want), "{reply}");
+            // One that is no token: refused, and nobody is told.
+            let fake = format!(
+                "GET http://{attacker}/ HTTP/1.1\r\nX-Key: zsur_{}\r\n\r\n",
+                "0".repeat(40)
+            );
+            let (_, reply) = net.proxy.ask(&fake).await;
+            assert!(
+                reply.starts_with("HTTP/1.1 403 zephyr: unknown vault surrogate\r\n"),
+                "{reply}"
+            );
+            assert_eq!(
+                up.accepts.load(Ordering::SeqCst),
+                0,
+                "nothing was connected"
+            );
+
+            let rows = net.proxy.net_rows(6).await;
+            let by_name = "refused: the vault token A is not sent to this host";
+            let row = |args: String, outcome: &str| ("swap".to_string(), args, outcome.to_string());
+            assert_eq!(
+                rows[..4],
+                std::array::from_fn::<_, 4, _>(|_| row(format!("A -> {attacker}"), by_name))
+            );
+            assert_eq!(
+                rows[4],
+                row("A -> [vault:A].attacker.test:443".into(), by_name)
+            );
+            assert_eq!(
+                rows[5],
+                row(attacker.clone(), "refused: unknown vault surrogate")
+            );
+            let printed = format!("{rows:?}");
+            assert!(
+                !printed.contains("zsur_") && !printed.contains(A),
+                "{printed}"
+            );
+            // The owner hears of each place once, and never of a command to allow it.
+            let deadline = tokio::time::Instant::now() + WAIT;
+            let notices = loop {
+                let out = store.pending_outbox().unwrap();
+                if out.len() >= 2 || tokio::time::Instant::now() > deadline {
+                    break out;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            let texts: Vec<&str> = notices.iter().map(|o| o.text.as_str()).collect();
+            assert_eq!(
+                texts,
+                [
+                    format!("[zephyr] the agent tried to send the vault token A to {attacker}, where it is not bound. Nothing was sent."),
+                    "[zephyr] the agent tried to send the vault token A to [vault:A].attacker.test, where it is not bound. Nothing was sent.".to_string(),
+                ]
+            );
+        }
+
+        /// Review Focus 1, on a decrypted connection: only what is bound to this very host is
+        /// swapped, and the server reads none of the rest.
+        #[tokio::test]
+        async fn on_a_bound_host_another_token_another_host_and_a_url_are_refused() {
+            let mut net = Net::start("broker-other", "", true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[
+                ("A", A, &[dest.as_str()], false),
+                ("B", B, &["elsewhere.test:443"], true),
+            ]);
+            let mut tls = net.bound().await;
+            // Token B's stand-in, to the host token A is bound to.
+            let reply = get(&mut tls, &net, "/", &format!("X-Key: {}\r\n", s[1])).await;
+            let want = format!("HTTP/1.1 403 zephyr: the vault token B is not sent to {dest}\r\n");
+            assert!(reply.starts_with(&want), "{reply}");
+            // The bound host's connection, asked to carry a request for another origin.
+            let request = format!(
+                "GET / HTTP/1.1\r\nHost: attacker.test\r\nX-Key: {}\r\n\r\n",
+                s[0]
+            );
+            let reply = ask(&mut tls, &request).await;
+            assert!(
+                reply.starts_with("HTTP/1.1 403 zephyr: Host does not match bound.test\r\n"),
+                "{reply}"
+            );
+            let twice = format!(
+                "GET / HTTP/1.1\r\nHost: {dest}\r\nHost: attacker.test\r\nX-Key: {}\r\n\r\n",
+                s[0]
+            );
+            let reply = ask(&mut tls, &twice).await;
+            assert!(
+                reply.starts_with("HTTP/1.1 403 zephyr: Host does not match bound.test\r\n"),
+                "{reply}"
+            );
+            // A token the owner did not allow in URLs.
+            let reply = get(&mut tls, &net, &format!("/?key={}", s[0]), "").await;
+            assert!(
+                reply.starts_with("HTTP/1.1 403 zephyr: A is not swapped in URLs\r\n"),
+                "{reply}"
+            );
+            // A stand-in in a header that is not a credential's: never swapped into it, and
+            // not sent on as it is either.
+            let probe = format!("User-Agent: probe {}\r\n", s[0]);
+            let reply = get(&mut tls, &net, "/", &probe).await;
+            let want =
+                "HTTP/1.1 403 zephyr: A is not swapped in a header that is not a credential header\r\n";
+            assert!(reply.starts_with(want), "{reply}");
+            // The connection still works, and the server read only this.
+            get(&mut tls, &net, "/fine", "").await;
+            assert!(net.head().await.starts_with("GET /fine "));
+            assert!(net.up.heads.try_recv().is_err());
+            let rows = net.proxy.net_rows(6).await;
+            assert!(
+                rows.contains(&(
+                    "swap".into(),
+                    format!("A -> {dest} (header user-agent)"),
+                    "refused: A is not swapped in a header that is not a credential header".into()
+                )),
+                "{rows:?}"
+            );
+            assert!(
+                rows.contains(&(
+                    "swap".into(),
+                    format!("B -> {dest}"),
+                    "refused: the vault token B is not sent to this host".into()
+                )),
+                "{rows:?}"
+            );
+            assert!(
+                rows.contains(&(
+                    "swap".into(),
+                    dest.clone(),
+                    "refused: Host does not match bound.test".into()
+                )),
+                "{rows:?}"
+            );
+        }
+
+        /// Takes any certificate: a client that does not check, so the proxy's own check of
+        /// the name the client asked for is what the test sees.
+        #[derive(Debug)]
+        struct AnyCert(Arc<rustls::crypto::CryptoProvider>);
+
+        impl rustls::client::danger::ServerCertVerifier for AnyCert {
+            fn verify_server_cert(
+                &self,
+                _: &rustls::pki_types::CertificateDer<'_>,
+                _: &[rustls::pki_types::CertificateDer<'_>],
+                _: &ServerName<'_>,
+                _: &[u8],
+                _: rustls::pki_types::UnixTime,
+            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                message: &[u8],
+                cert: &rustls::pki_types::CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                let algs = &self.0.signature_verification_algorithms;
+                rustls::crypto::verify_tls12_signature(message, cert, dss, algs)
+            }
+            fn verify_tls13_signature(
+                &self,
+                message: &[u8],
+                cert: &rustls::pki_types::CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                let algs = &self.0.signature_verification_algorithms;
+                rustls::crypto::verify_tls13_signature(message, cert, dss, algs)
+            }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                self.0.signature_verification_algorithms.supported_schemes()
+            }
+        }
+
+        /// Review Focus 1: a CONNECT to the bound name whose TLS then asks for another.
+        #[tokio::test]
+        async fn a_client_sni_for_another_name_is_refused() {
+            let mut net = Net::start("broker-sni", "", true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[("A", A, &[dest.as_str()], false)]);
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let careless = rustls::ClientConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AnyCert(provider)))
+                .with_no_client_auth();
+            let mut tls = net
+                .connect(&dest, "attacker.test", Arc::new(careless))
+                .await
+                .unwrap();
+            let reply = get(&mut tls, &net, "/", &format!("X-Key: {}\r\n", s[0])).await;
+            assert!(
+                reply.starts_with("HTTP/1.1 403 zephyr: Host does not match bound.test\r\n"),
+                "{reply}"
+            );
+            assert!(
+                net.up.heads.try_recv().is_err(),
+                "the server read no request"
+            );
+            let rows = net.proxy.net_rows(2).await;
+            assert_eq!(
+                rows[1],
+                (
+                    "swap".into(),
+                    dest,
+                    "refused: Host does not match bound.test".into()
+                )
+            );
+        }
+
+        /// Review Focus 1: DNS that answers something else for a bound name. A private address
+        /// in the answer refuses it whole, as for any host; an address that is public but not
+        /// the host's cannot prove the name, so no request is read; and a name is resolved once.
+        #[tokio::test]
+        async fn a_bound_name_that_resolves_elsewhere_gets_no_token() {
+            let allow = "rebind.test:{port},counted.test:{port}";
+            let mut net = Net::start("broker-rebind", allow, true).await;
+            let port = net.up.port;
+            let (rebind, counted) = (
+                format!("rebind.test:{port}"),
+                format!("counted.test:{port}"),
+            );
+            let s = net.vault(&[("A", A, &[rebind.as_str(), counted.as_str()], false)]);
+            let (_, reply) = net
+                .proxy
+                .ask(&format!("CONNECT {rebind} HTTP/1.1\r\n\r\n"))
+                .await;
+            assert!(
+                reply.starts_with("HTTP/1.1 403 zephyr: loopback is never allowed"),
+                "{reply}"
+            );
+            assert_eq!(net.up.accepts.load(Ordering::SeqCst), 0);
+            // The server at the answered address holds a valid certificate, for another name.
+            let config = crate::ca::client(net.trust.clone()).unwrap();
+            let mut tls = net.connect(&counted, "counted.test", config).await.unwrap();
+            let request = format!(
+                "GET / HTTP/1.1\r\nHost: {counted}\r\nX-Key: {}\r\n\r\n",
+                s[0]
+            );
+            let reply = ask(&mut tls, &request).await;
+            let want = "HTTP/1.1 502 zephyr: counted.test did not prove it is counted.test\r\n";
+            assert!(reply.starts_with(want), "{reply}");
+            // A second request gets the same, and nothing is looked up again.
+            assert!(ask(&mut tls, &request).await.starts_with(want));
+            assert_eq!(LOOKUPS.load(Ordering::SeqCst), 1);
+            assert!(
+                net.up.heads.try_recv().is_err(),
+                "the server read no request"
+            );
+        }
+
+        /// Review Focus 2: a CA made in the container, the agent's own included, is not what
+        /// the proxy checks an upstream against. Only `Floor::roots` counts, which `live` takes
+        /// from the binary (`ca::public_roots`); no file or variable is read on this path.
+        #[tokio::test]
+        async fn a_ca_the_agent_planted_gains_no_trust() {
+            // A server whose certificate for the bound name a CA made here signed.
+            let (planted, _) = test_ca("broker-planted-theirs");
+            let mut theirs = server(planted.leaf("planted.test", crate::now()).unwrap()).await;
+            let dest = format!("planted.test:{}", theirs.port);
+            let net = Net::start("broker-planted", &dest, true).await;
+            let s = net.vault(&[("A", A, &[dest.as_str()], false)]);
+            let config = crate::ca::client(net.trust.clone()).unwrap();
+            let mut tls = net.connect(&dest, "planted.test", config).await.unwrap();
+            let request = format!(
+                "GET / HTTP/1.1\r\nHost: {dest}\r\nAuthorization: Bearer {}\r\n\r\n",
+                s[0]
+            );
+            let reply = ask(&mut tls, &request).await;
+            let want = "HTTP/1.1 502 zephyr: planted.test did not prove it is planted.test\r\n";
+            assert!(reply.starts_with(want), "{reply}");
+            assert!(
+                theirs.heads.try_recv().is_err(),
+                "the server read no request"
+            );
+            let rows = net.proxy.net_rows(2).await;
+            let outcome = "refused: planted.test did not prove it is planted.test";
+            assert_eq!(rows[1], ("swap".into(), dest, outcome.into()));
+            // Nor is the proxy's own CA, which the agent's tools trust, a public one.
+            let (ours, _) = test_ca("broker-planted-ours");
+            let leaf = ours.leaf("bound.test", crate::now()).unwrap();
+            let checked = crate::ca::tests::handshake(
+                leaf,
+                net.web_roots.clone(),
+                "bound.test",
+                &["http/1.1"],
+            );
+            assert!(checked.await.is_err());
+        }
+
+        /// Review Focus 4: the map is read for each request, so an unbinding holds on a
+        /// connection that was open before it.
+        #[tokio::test]
+        async fn an_unbind_stops_the_next_request_on_an_open_connection() {
+            let mut net = Net::start("broker-unbind", "", true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[("A", A, &[dest.as_str()], false)]);
+            let mut tls = net.bound().await;
+            let header = format!("X-Key: {}\r\n", s[0]);
+            assert!(get(&mut tls, &net, "/", &header)
+                .await
+                .starts_with("HTTP/1.1 200 "));
+            net.head().await;
+            net.vault(&[("A", A, &[], false)]);
+            let reply = get(&mut tls, &net, "/", &header).await;
+            let want = format!("HTTP/1.1 403 zephyr: the vault token A is not sent to {dest}\r\n");
+            assert!(reply.starts_with(&want), "{reply}");
+            assert!(net.up.heads.try_recv().is_err());
+        }
+
+        /// Review Focus 5: a vault that stops reading does not turn a decrypted host back into
+        /// a plain tunnel, and nothing is swapped from what was read before.
+        #[tokio::test]
+        async fn an_unreadable_vault_answers_502_on_bound_hosts() {
+            let mut net = Net::start("broker-unreadable", "", true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[("A", A, &[dest.as_str()], false)]);
+            let mut tls = net.bound().await;
+            let header = format!("X-Key: {}\r\n", s[0]);
+            assert!(get(&mut tls, &net, "/", &header)
+                .await
+                .starts_with("HTTP/1.1 200 "));
+            net.head().await;
+            std::fs::write(net.proxy.dir.join("vault.toml"), "[[token]\nbroken").unwrap();
+            let want = "HTTP/1.1 502 zephyr: the vault could not be read\r\n";
+            let reply = get(&mut tls, &net, "/", &header).await;
+            assert!(reply.starts_with(want), "{reply}");
+            let (_, reply) = net
+                .proxy
+                .ask(&format!("CONNECT {dest} HTTP/1.1\r\n\r\n"))
+                .await;
+            assert!(reply.starts_with(want), "{reply}");
+            assert!(net.up.heads.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn without_a_ca_bound_hosts_answer_502_and_others_still_tunnel() {
+            let net = Net::start("broker-no-ca", "other.test:{port}", false).await;
+            net.vault(&[("A", A, &[net.dest.as_str()], false)]);
+            let (_, reply) = net
+                .proxy
+                .ask(&format!("CONNECT {} HTTP/1.1\r\n\r\n", net.dest))
+                .await;
+            assert!(
+                reply.starts_with("HTTP/1.1 502 zephyr: the token broker is down\r\n"),
+                "{reply}"
+            );
+            let other = format!("CONNECT other.test:{} HTTP/1.1\r\n\r\n", net.up.port);
+            let (_, reply) = net.proxy.ask(&other).await;
+            assert!(reply.starts_with("HTTP/1.1 200 "), "{reply}");
+            assert!(net.rows().is_empty() || !format!("{:?}", net.rows()).contains(A));
         }
     }
 }

@@ -32,6 +32,11 @@ pub struct Policy {
     /// Loads the agent's network floor before the first start (DESIGN §4.20); `None` outside
     /// bridge mode. When it fails, the daemon is never started.
     pub floor: Option<fn() -> anyhow::Result<()>>,
+    /// Makes or renews the token broker's CA and installs it for the agent's tools (DESIGN
+    /// §4.21), after the floor and before the first start; `None` outside bridge mode. When it
+    /// fails the daemon starts all the same: the floor does not depend on it, and bound hosts
+    /// then answer 502.
+    pub ca: Option<fn() -> anyhow::Result<()>>,
 }
 
 /// The file in the state dir the router rewrites with the unix time on each tick.
@@ -60,6 +65,7 @@ impl Default for Policy {
             grace: Duration::from_secs(120),
             stale: STALE,
             floor: None,
+            ca: None,
         }
     }
 }
@@ -109,6 +115,7 @@ pub async fn main() -> ExitCode {
     let policy = Policy {
         heartbeat: config.ok().map(|c| c.state_dir().join(HEARTBEAT)),
         floor: bridge.then_some(crate::egress::load_floor),
+        ca: bridge.then_some(crate::ca::start),
         ..Policy::default()
     };
     ExitCode::from(run(&policy, daemon, rx).await)
@@ -126,6 +133,9 @@ pub async fn run(
             "zephyr: network floor could not be loaded: {e:#}; network = \"host\" in host.toml runs without it"
         );
         return 1;
+    }
+    if let Some(Err(e)) = policy.ca.map(|start| start()) {
+        eprintln!("zephyr: the token broker's CA could not be set up, so vault tokens will not work: {e:#}");
     }
     let mut wait = policy.first;
     let mut exits = VecDeque::new();
@@ -242,6 +252,29 @@ mod tests {
             cmd.as_std_mut().process_group(0);
             cmd.args(["-c", &script]).spawn()
         })
+    }
+
+    #[tokio::test]
+    async fn a_ca_that_cannot_be_set_up_does_not_stop_the_daemon() {
+        // DESIGN §4.21: the floor does not depend on the broker's CA.
+        let policy = Policy {
+            ca: Some(|| anyhow::bail!("update-ca-certificates: no")),
+            ..Policy::default()
+        };
+        let (tx, rx) = mpsc::channel(1);
+        let mut started = 0;
+        let spawn = || {
+            started += 1;
+            // The daemon runs until it is told to stop.
+            tokio::process::Command::new("sleep").arg("30").spawn()
+        };
+        let stop = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            tx.send(libc::SIGTERM).await.unwrap();
+        };
+        let (code, ()) = tokio::join!(run(&policy, spawn, rx), stop);
+        // Started once, and ended by the signal, as any daemon is.
+        assert_eq!((started, code), (1, 128 + libc::SIGTERM as u8));
     }
 
     #[tokio::test]

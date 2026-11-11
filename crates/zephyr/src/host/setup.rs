@@ -850,6 +850,9 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let url = a.value("--url")?;
     let headers = a.values("--header")?;
     let secrets = a.values("--secret")?;
+    // Where its secrets are sent (DESIGN §4.21), or `--plain` to hand it the real ones.
+    let hosts = a.values("--host")?;
+    let plain = a.flag("--plain");
     let rest = a.rest()?;
     let mut doc = h.data.load()?;
     let parse = |doc: &toml_edit::DocumentMut| -> anyhow::Result<Config> {
@@ -857,7 +860,8 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
         cfg.validate()?;
         Ok(cfg)
     };
-    let usage = "usage: zephyr mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. | list | rm NAME";
+    let was = parse(&doc).ok();
+    let usage = "usage: zephyr mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. [--host HOST].. [--plain] | list | rm NAME";
     match &rest[..] {
         [list] if list == "list" => {
             for m in parse(&doc)?.mcp {
@@ -880,12 +884,14 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
                 })
                 .collect::<anyhow::Result<_>>()?;
             // D4: added again, a connector keeps the classes the owner gave its tools.
-            let classes = || {
+            let existing = || {
                 let cfg = parse(&doc).ok();
-                let existing = cfg.and_then(|c| c.mcp.into_iter().find(|m| m.name == *name));
-                existing.map(|m| m.classes).unwrap_or_default()
+                cfg.and_then(|c| c.mcp.into_iter().find(|m| m.name == *name))
             };
-            let m = match (url, command.split_first()) {
+            let classes = || existing().map(|m| m.classes).unwrap_or_default();
+            // And where its secrets go, unless this call says.
+            let old = existing().unwrap_or_default();
+            let mut m = match (url, command.split_first()) {
                 (Some(_), Some(_)) => bail!("give --url or a command after --, not both"),
                 (Some(url), None) => Mcp {
                     name: name.clone(),
@@ -908,11 +914,34 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
                     .find(|m| m.name == *name)
                     .with_context(|| format!("no connector named {name}\n{usage}"))?,
             };
+            m.hosts = match hosts.is_empty() {
+                true => old.hosts,
+                false => hosts.join(", "),
+            };
+            m.secrets = match plain {
+                true => Some("plain".into()),
+                false => old.secrets,
+            };
+            // A remote connector can only hold its real secret (rpi's own client cannot use a
+            // stand-in, DESIGN §4.21), which the agent can then read: said here, not implied.
+            if crate::broker::undecided(&m) {
+                bail!(
+                    "a remote connector's secret is handed to it as it is, where the agent can \
+                     read it (rpi's own client cannot use a stand-in): add --plain to accept that"
+                );
+            }
             conf::upsert_mcp(&mut doc, &m)?;
         }
         _ => bail!("{usage}"),
     }
-    parse(&doc)?;
+    let now = parse(&doc)?;
+    // As `/set`: this may not make one secret a connector's own and another's stand-in.
+    // With no config that read before, the new one alone must hold none.
+    let made = match &was {
+        Some(was) => crate::broker::creates_pair(was, &now),
+        None => crate::broker::shared_notice(&now).map_or(Ok(()), Err),
+    };
+    made.map_err(anyhow::Error::msg)?;
     if !secrets.is_empty() && !h.interactive {
         bail!("--secret asks for the value: run it in a terminal");
     }
@@ -930,8 +959,9 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
     h.apply()
 }
 
-/// `zephyr vault list | add login NAME --site URL [--user U] [--totp] | add token NAME |
-/// edit NAME [--site URL] [--user U] [--totp] | rm NAME | revoke NAME [PROGRAM]`: `vault.toml`,
+/// `zephyr vault list | add login NAME --site URL [--user U] [--totp] | add token NAME
+/// [--host HOST].. | edit NAME [--site URL] [--user U] [--totp] [--host HOST].. | rm NAME |
+/// revoke NAME [PROGRAM]`: `vault.toml`,
 /// one of the daemon's files (DESIGN §4.15), which the daemon reads on every use. Values are
 /// asked at hidden prompts, or read one per line from stdin when it is not a terminal; never
 /// taken as arguments. Grants are only the owner's `/ok` or `/vault grant` in a chat. A save here
@@ -941,9 +971,15 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let site = a.value("--site")?;
     let user = a.value("--user")?;
     let totp = a.flag("--totp");
+    // The hosts a token is sent to (DESIGN §4.21): the owner's own surface, so they are taken
+    // here as `/vault bind` takes them.
+    let mut hosts = a.values("--host")?;
+    // And the request headers it is swapped in besides Authorization.
+    let headers = a.values("--header")?;
     let rest = a.rest()?;
     let usage = "usage: zephyr vault list | add login NAME --site URL [--user U] [--totp] | \
-                 add token NAME | edit NAME [--site URL] [--user U] [--totp] | rm NAME | \
+                 add token NAME [--host HOST].. [--header HEADER].. | edit NAME [--site URL] \
+                 [--user U] [--totp] [--host HOST].. [--header HEADER].. | rm NAME | \
                  revoke NAME [PROGRAM]";
     let text = match h.data.read(crate::vault::FILE) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -988,13 +1024,40 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
         }
         ["add", "token", name] => {
             let value = secret(name)?;
+            if hosts.is_empty() && h.interactive {
+                let asked: String = dialoguer::Input::new()
+                    .with_prompt(format!(
+                        "hosts {name} is sent to, e.g. api.github.com github.com (empty: bind it later)"
+                    ))
+                    .allow_empty(true)
+                    .interact_text()?;
+                hosts = asked
+                    .split([' ', ','])
+                    .filter(|h| !h.is_empty())
+                    .map(String::from)
+                    .collect();
+            }
             vault.put(Entry {
                 kind: Kind::Token,
                 name: name.into(),
                 value,
+                hosts,
+                headers,
                 ..Entry::default()
             })?;
-            format!("saved the token {name}; the agent asks you before each new program uses it")
+            let sent = match vault
+                .get(name)
+                .map(|e| e.hosts)
+                .unwrap_or_default()
+                .as_slice()
+            {
+                [] => format!("it is bound to no host yet: /vault bind {name} HOST.. in a chat"),
+                bound => {
+                    let bound: Vec<&str> = bound.iter().map(|h| crate::vault::shown(h)).collect();
+                    format!("it is sent only to {}", bound.join(", "))
+                }
+            };
+            format!("saved the token {name}; {sent}; the agent asks you before each new program uses it")
         }
         ["edit", name] => {
             let mut e = vault
@@ -1011,7 +1074,12 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
                         false => String::new(),
                     };
                 }
-                Kind::Token => e.value = secret("new value, empty keeps it")?,
+                Kind::Token => {
+                    e.value = secret("new value, empty keeps it")?;
+                    // None given keeps the ones saved.
+                    e.hosts = hosts;
+                    e.headers = headers;
+                }
             }
             vault.put(e)?;
             format!("saved {name}")

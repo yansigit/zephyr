@@ -922,6 +922,61 @@ fn mcp_add_again_keeps_the_owners_classes() {
     );
 }
 
+/// DESIGN §4.21: where a connector's secrets go is set where the owner adds it, and kept when
+/// it is added again.
+#[test]
+fn mcp_add_takes_hosts_and_plain_and_keeps_them() {
+    let env = Env::new("mcp-hosts");
+    env.init(&["--no-start"]);
+    let add = ["mcp", "add", "mail", "--host", "api.mail.test"];
+    env.ok(&[&add[..], &["--host", "mail.test:8443", "--", "mail-server"]].concat());
+    let config = env.config();
+    assert!(
+        config.contains("hosts = \"api.mail.test, mail.test:8443\""),
+        "{config}"
+    );
+    env.ok(&["mcp", "add", "mail", "--plain", "--", "other-server"]);
+    let config = env.config();
+    assert!(
+        config.contains("api.mail.test") && config.contains("secrets = \"plain\""),
+        "{config}"
+    );
+    env.ok(&["mcp", "add", "mail", "--", "third-server"]);
+    assert!(env.config().contains("secrets = \"plain\""));
+    // A remote connector can only hold its real secret, where the agent can read it: adding
+    // one with a secret says so and asks for `--plain`; without a secret there is nothing to say.
+    let remote = [
+        "mcp",
+        "add",
+        "docs",
+        "--url",
+        "https://docs.example.com/mcp",
+    ];
+    let header = ["--header", "Authorization=Bearer ${DOCS_TOKEN}"];
+    let with_secret = [&remote[..], &header[..]].concat();
+    let out = env.zephyr(&with_secret);
+    assert!(!out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(said.contains("add --plain to accept that"), "{said}");
+    assert!(!env.config().contains("docs.example.com"));
+    env.ok(&[&with_secret[..], &["--plain"]].concat());
+    let config = env.config();
+    let docs = config.split("[[mcp]]").find(|t| t.contains("\"docs\""));
+    assert!(docs.unwrap().contains("secrets = \"plain\""), "{config}");
+    env.ok(&[
+        "mcp",
+        "add",
+        "open",
+        "--url",
+        "https://open.example.com/mcp",
+    ]);
+    // A wildcard is refused and nothing is written.
+    let before = env.config();
+    let out = env.zephyr(&["mcp", "add", "mail", "--host", "*.mail.test", "--", "x"]);
+    assert!(!out.status.success());
+    assert_eq!(env.config(), before);
+}
+
 #[test]
 fn init_writes_the_parsed_preset_name() {
     let env = Env::new("init-preset-trim");
@@ -1829,6 +1884,128 @@ fn config_set_while_stopped_edits_the_file_as_before() {
         .calls()
         .iter()
         .any(|c| c.contains(&"set".to_string()) && c.contains(&"zephyr".to_string())));
+}
+
+/// A connector's rows (`mcp.NAME.hosts`, `.secrets`, `.enabled`) live in its `[[mcp]]` table:
+/// with the container stopped the host edits that table, checked as the daemon would.
+#[test]
+fn config_set_while_stopped_reaches_a_connectors_table() {
+    let env = Env::new("config-stopped-mcp");
+    env.init(&["--no-start"]);
+    env.ok(&["mcp", "add", "mail", "--", "mail-server"]);
+    env.ok(&[
+        "mcp",
+        "add",
+        "docs",
+        "--url",
+        "https://docs.example.com/mcp",
+    ]);
+    let stopped = [("SHIM_STATE", "exited")];
+    let set = |key: &str, value: &str| env.zephyr_env(&["config", "set", key, value], &stopped);
+    for (key, value) in [
+        ("mcp.mail.hosts", "API.mail.test, mail.test:8443"),
+        ("mcp.mail.secrets", "plain"),
+        ("mcp.docs.secrets", "surrogate"),
+        ("mcp.docs.enabled", "off"),
+    ] {
+        let out = set(key, value);
+        assert!(out.status.success(), "{key}: {out:?}");
+        assert!(
+            stdout(&out).contains("applies when zephyr starts"),
+            "{out:?}"
+        );
+    }
+    let config = env.config();
+    let mail = config
+        .split("[[mcp]]")
+        .find(|t| t.contains("\"mail\""))
+        .unwrap();
+    assert!(
+        mail.contains("hosts = \"API.mail.test, mail.test:8443\""),
+        "{config}"
+    );
+    assert!(mail.contains("secrets = \"plain\""), "{config}");
+    let docs = config
+        .split("[[mcp]]")
+        .find(|t| t.contains("\"docs\""))
+        .unwrap();
+    assert!(
+        docs.contains("secrets = \"surrogate\"") && docs.contains("enabled = false"),
+        "{config}"
+    );
+    assert_eq!(
+        env.ok(&["config", "get", "mcp.mail.secrets"]).trim(),
+        "plain"
+    );
+    // What the daemon would refuse is refused here, and nothing is written.
+    for (key, value) in [
+        ("mcp.mail.hosts", "*.mail.test"),
+        ("mcp.mail.secrets", "raw"),
+        ("mcp.nope.hosts", "x.test"),
+    ] {
+        assert!(!set(key, value).status.success(), "{key} = {value}");
+    }
+    assert_eq!(env.config(), config);
+    // One secret cannot be a plain connector's and another's stand-in: the command that would
+    // make it so is refused, here as in the daemon.
+    env.ok(&["mcp", "add", "db", "--plain", "--", "db", "${SHARED}"]);
+    let pair = [
+        "mcp",
+        "add",
+        "api",
+        "--host",
+        "api.test",
+        "--",
+        "api",
+        "${SHARED}",
+    ];
+    let out = env.zephyr(&pair);
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !out.status.success() && said.contains("one name cannot be both"),
+        "{said}"
+    );
+    env.ok(&[
+        "mcp", "add", "api", "--host", "api.test", "--", "api", "${OTHER}",
+    ]);
+    let out = set("mcp.api.secrets", "plain");
+    assert!(out.status.success(), "{out:?}");
+    env.ok(&[
+        "mcp", "add", "api2", "--host", "api.test", "--", "api", "${THIRD}",
+    ]);
+    // When the config as it is does not load, there is no "before" to compare with: the new
+    // one alone must hold no pair.
+    let good = env.config();
+    let broken = good.replace(
+        "name = \"api2\"",
+        "name = \"api2\"\nurl = \"https://both.test\" # and a command: not a connector",
+    );
+    assert!(broken != good);
+    std::fs::write(env.daemon().join("zephyr.toml"), &broken).unwrap();
+    let mend = [
+        "mcp",
+        "add",
+        "api2",
+        "--host",
+        "api.test",
+        "--",
+        "api",
+        "${SHARED}",
+    ];
+    let out = env.zephyr(&mend);
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !out.status.success() && said.contains("one name cannot be both"),
+        "{said}"
+    );
+    std::fs::write(env.daemon().join("zephyr.toml"), &good).unwrap();
+    // A pair that is there already (a hand edit) does not stop an unrelated change.
+    let path = env.daemon().join("zephyr.toml");
+    let paired = env.config().replace("\"${THIRD}\"", "\"${SHARED}\"");
+    assert!(paired.contains("api2") && paired != env.config());
+    std::fs::write(&path, paired).unwrap();
+    assert!(set("budget.daily_tokens", "7000").status.success());
+    assert!(set("mcp.mail.enabled", "off").status.success());
 }
 
 #[test]
@@ -3115,6 +3292,57 @@ fn vault_add_list_and_rm_reach_roots_file_and_never_put_a_value_in_argv() {
         assert!(!format!("{calls:?}").contains(value), "{value} in argv");
         assert!(!output.contains(value), "{value} printed");
     }
+
+    // A token's hosts are taken where the owner saves it (DESIGN §4.21), normalized; a wildcard
+    // saves nothing; a new value keeps them.
+    let add = [
+        "vault",
+        "add",
+        "token",
+        "API_KEY",
+        "--host",
+        "API.example.com",
+    ];
+    let out = env.zephyr_input(
+        &[
+            &add[..],
+            &["--host", "example.com:8443", "--header", "X-Api-Key"],
+        ]
+        .concat(),
+        "k-123456\n",
+    );
+    let said = stdout(&out);
+    assert!(
+        said.contains("it is sent only to api.example.com, example.com:8443"),
+        "{said}"
+    );
+    let saved = std::fs::read_to_string(files.join("vault.toml")).unwrap();
+    assert!(
+        saved.contains("hosts = [\"api.example.com:443\", \"example.com:8443\"]"),
+        "{saved}"
+    );
+    // And the headers it is swapped in besides Authorization.
+    assert!(saved.contains("headers = [\"x-api-key\"]"), "{saved}");
+    let wild = ["vault", "add", "token", "WILD", "--host", "*.example.com"];
+    assert!(!env.zephyr_input(&wild, "k-123456\n").status.success());
+    assert!(!std::fs::read_to_string(files.join("vault.toml"))
+        .unwrap()
+        .contains("WILD"));
+    assert!(env
+        .zephyr_input(&["vault", "edit", "API_KEY"], "k-rotated\n")
+        .status
+        .success());
+    let saved = std::fs::read_to_string(files.join("vault.toml")).unwrap();
+    assert!(
+        saved.contains("k-rotated") && saved.contains("example.com:8443"),
+        "{saved}"
+    );
+    let list = env.ok(&["vault", "list"]);
+    assert!(list.contains("token API_KEY: not allowed for any program yet; sent only to api.example.com, example.com:8443"), "{list}");
+    assert!(
+        list.contains("token GH_TOKEN: not allowed for any program yet; bound to no host yet"),
+        "{list}"
+    );
 
     // A value never goes in an argument, and a bad one names only the problem.
     assert!(!env

@@ -926,6 +926,37 @@ fn a_background_command_outlives_a_reexec_and_reports() {
     drop(running);
 }
 
+/// DESIGN §4.13: what a command prints goes to its log through the daemon's scrubber, so the
+/// log the agent can read holds `[vault:NAME]`, never a vault value.
+#[test]
+fn a_commands_log_never_holds_a_vault_value() {
+    let (home, cfg) = setup("log-scrub", "");
+    let uid = std::fs::metadata(&home).unwrap().uid();
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(&cfg, format!("{text}[owners]\nchat = [\"{uid}\"]\n")).unwrap();
+    std::fs::write(
+        home.join("vault.toml"),
+        "[[token]]\nname = \"SCRUB_TOKEN\"\nvalue = \"tok_cli_value_42\"\nprograms = [\"printenv\", \"echo\"]\n",
+    )
+    .unwrap();
+    let _running = daemon(&cfg, &home);
+    let mut chat = std::os::unix::net::UnixStream::connect(home.join("zephyr.sock")).unwrap();
+    chat.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let call = r#"[call exec {\"command\": \"printenv SCRUB_TOKEN; echo done\", \"secrets\": [\"SCRUB_TOKEN\"]}] go"#;
+    writeln!(chat, r#"{{"id": "scrub-1", "text": "{call}"}}"#).unwrap();
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(&chat));
+    let reply = lines.find(|l| l.as_ref().map_or(true, |l| l.contains("exec: exited 0")));
+    let reply = reply.expect("no reply").expect("the chat closed");
+    assert!(
+        reply.contains("[vault:SCRUB_TOKEN]") && reply.contains("done"),
+        "{reply}"
+    );
+    // All of it is there by the time the command has ended, and none of it is the value.
+    let log = std::fs::read_to_string(home.join(".procs/1.log")).unwrap();
+    assert_eq!(log, "[vault:SCRUB_TOKEN]\ndone\n");
+}
+
 #[test]
 fn a_reexec_waits_for_the_running_reply() {
     let (home, cfg) = setup("reexec-busy", "[agent]\nenv = [\"ZEPHYR_CLI_RELOAD\"]\n");

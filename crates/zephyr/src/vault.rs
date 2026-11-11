@@ -62,6 +62,14 @@ pub struct Entry {
     pub granted: bool,
     pub value: String,
     pub programs: Vec<String>,
+    /// The exact `host:port`s a token is swapped in on (DESIGN §4.21); nowhere else.
+    pub hosts: Vec<String>,
+    /// The request headers a token is swapped in besides `Authorization`, lower case.
+    pub headers: Vec<String>,
+    /// Also swapped in a request's path and query.
+    pub url: bool,
+    /// Handed to the program as its real value, as before the broker.
+    pub raw: bool,
 }
 
 impl std::fmt::Debug for Entry {
@@ -76,6 +84,10 @@ impl std::fmt::Debug for Entry {
             .field("granted", &self.granted)
             .field("value", &self.value.len())
             .field("programs", &self.programs)
+            .field("hosts", &self.hosts)
+            .field("headers", &self.headers)
+            .field("url", &self.url)
+            .field("raw", &self.raw)
             .finish()
     }
 }
@@ -108,6 +120,14 @@ impl Entry {
                 if self.value.is_empty() {
                     bail!("token {name} has no value");
                 }
+                for host in &self.hosts {
+                    crate::broker::parse_host(host)
+                        .map_err(|e| anyhow::anyhow!("token {name}: {e}"))?;
+                }
+                for header in &self.headers {
+                    crate::broker::header_name(header)
+                        .map_err(|e| anyhow::anyhow!("token {name}: {e}"))?;
+                }
             }
         }
         Ok(())
@@ -123,6 +143,10 @@ impl Entry {
             "totp": !self.totp.is_empty(),
             "granted": self.granted,
             "programs": self.programs,
+            "hosts": self.hosts,
+            "headers": self.headers,
+            "url": self.url,
+            "raw": self.raw,
         })
     }
 
@@ -146,12 +170,44 @@ impl Entry {
                 };
                 format!("login {}: {user}{}{code}; {grant}", self.name, self.site)
             }
-            Kind::Token => match self.programs.as_slice() {
-                [] => format!("token {}: not allowed for any program yet", self.name),
-                p => format!("token {}: allowed for {}", self.name, p.join(", ")),
-            },
+            Kind::Token => {
+                let programs = match self.programs.as_slice() {
+                    [] => "not allowed for any program yet".to_string(),
+                    p => format!("allowed for {}", p.join(", ")),
+                };
+                let hosts: Vec<&str> = self.hosts.iter().map(|h| shown(h)).collect();
+                let sent = match (self.raw, hosts.is_empty()) {
+                    (true, _) => "handed out as its real value (raw)".to_string(),
+                    (false, true) => "bound to no host yet".into(),
+                    (false, false) => format!("sent only to {}", hosts.join(", ")),
+                };
+                let url = if self.url && !self.raw {
+                    ", also in URLs"
+                } else {
+                    ""
+                };
+                let headers = match (self.headers.is_empty(), self.raw) {
+                    (false, false) => format!(", also in the headers {}", self.headers.join(", ")),
+                    _ => String::new(),
+                };
+                format!("token {}: {programs}; {sent}{headers}{url}", self.name)
+            }
         }
     }
+}
+
+/// A binding as the owner reads it: without the port every HTTPS host has.
+pub fn shown(host_port: &str) -> &str {
+    host_port.strip_suffix(":443").unwrap_or(host_port)
+}
+
+/// A change to a token's binding, for `settings_log` (host names are not secrets).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Change {
+    /// `vault.NAME.hosts`, `.url` or `.raw`.
+    pub key: String,
+    pub old: String,
+    pub new: String,
 }
 
 /// `[a-z0-9][a-z0-9_-]{0,63}`
@@ -288,13 +344,24 @@ impl Vault {
                 }
                 new.granted = old.granted && same_origin(&old.site, &new.site);
                 new.programs.clone_from(&old.programs);
+                // A changed value keeps its hosts; `url` and `raw` are `/vault`'s alone.
+                if new.hosts.is_empty() {
+                    new.hosts.clone_from(&old.hosts);
+                }
+                if new.headers.is_empty() {
+                    new.headers.clone_from(&old.headers);
+                }
+                (new.url, new.raw) = (old.url, old.raw);
             }
             None => {
                 new.granted = false;
                 new.programs.clear();
+                (new.url, new.raw) = (false, false);
             }
         }
         new.check()?;
+        new.hosts = hosts_of(&new.hosts.iter().map(String::as_str).collect::<Vec<_>>())?;
+        new.headers = headers_of(&new.headers.iter().map(String::as_str).collect::<Vec<_>>())?;
         let kind = new.kind;
         let t = match self.table(kind, &new.name) {
             Some(t) => t,
@@ -324,6 +391,8 @@ impl Vault {
             Kind::Token => {
                 set(t, "value", &new.value);
                 set(t, "programs", Array::from_iter(new.programs.iter()));
+                set_hosts(t, &new.hosts);
+                set_list(t, "headers", &new.headers);
             }
         }
         Ok(old.is_none())
@@ -406,6 +475,135 @@ impl Vault {
         }
     }
 
+    fn token(&self, name: &str) -> anyhow::Result<Entry> {
+        let token = self.get(name).filter(|e| e.kind == Kind::Token);
+        token.with_context(|| format!("no token named {name} in the vault"))
+    }
+
+    /// The owner binds a token to `hosts` (added to those it has): the only places the proxy
+    /// swaps it in (DESIGN §4.21).
+    pub fn bind(&mut self, name: &str, hosts: &[&str]) -> anyhow::Result<(String, Change)> {
+        let e = self.token(name)?;
+        let mut all = e.hosts.clone();
+        let mut added = Vec::new();
+        for host in hosts_of(hosts)? {
+            if !all.contains(&host) {
+                added.push(format!(
+                    "{} is now decrypted by zephyr for every program the agent runs",
+                    shown(&host)
+                ));
+                all.push(host);
+            }
+        }
+        set_hosts(self.table(Kind::Token, name).expect("found above"), &all);
+        let list: Vec<&str> = all.iter().map(|h| shown(h)).collect();
+        let mut text = format!("{name} is now sent only to {}", list.join(", "));
+        for line in added {
+            text.push_str(&format!("\n{line}"));
+        }
+        let change = change(name, "hosts", e.hosts.join(", "), all.join(", "));
+        Ok((text, change))
+    }
+
+    /// Takes a token's binding back: to one host, or to all of them.
+    pub fn unbind(&mut self, name: &str, host: Option<&str>) -> anyhow::Result<(String, Change)> {
+        let e = self.token(name)?;
+        let left: Vec<String> = match host {
+            None => Vec::new(),
+            Some(host) => {
+                let host = crate::broker::parse_host(host).map_err(anyhow::Error::msg)?;
+                if !e.hosts.contains(&host) {
+                    bail!("{name} was not bound to {}", shown(&host));
+                }
+                e.hosts.iter().filter(|h| **h != host).cloned().collect()
+            }
+        };
+        set_hosts(self.table(Kind::Token, name).expect("found above"), &left);
+        let text = match left.as_slice() {
+            [] => format!("{name} is bound to no host now, so it cannot be used"),
+            l => {
+                let list: Vec<&str> = l.iter().map(|h| shown(h)).collect();
+                format!("{name} is now sent only to {}", list.join(", "))
+            }
+        };
+        let change = change(name, "hosts", e.hosts.join(", "), left.join(", "));
+        Ok((text, change))
+    }
+
+    /// The owner names request headers a token is swapped in besides `Authorization` (added to
+    /// those it has), or takes one back (all of them with `None`).
+    pub fn header(
+        &mut self,
+        name: &str,
+        add: &[&str],
+        remove: Option<Option<&str>>,
+    ) -> anyhow::Result<(String, Change)> {
+        let e = self.token(name)?;
+        let mut all = e.headers.clone();
+        all.extend(headers_of(add)?);
+        let mut unique: Vec<String> = Vec::new();
+        for header in all {
+            if !unique.contains(&header) {
+                unique.push(header);
+            }
+        }
+        match remove {
+            Some(None) => unique.clear(),
+            Some(Some(header)) => {
+                let header = crate::broker::header_name(header).map_err(anyhow::Error::msg)?;
+                if !unique.contains(&header) {
+                    bail!("{name} was not swapped in the header {header}");
+                }
+                unique.retain(|h| *h != header);
+            }
+            None => {}
+        }
+        set_list(
+            self.table(Kind::Token, name).expect("found above"),
+            "headers",
+            &unique,
+        );
+        let text = match unique.as_slice() {
+            [] => format!("{name} is swapped in the Authorization header only"),
+            list => format!(
+                "{name} is swapped in the Authorization header and in {}",
+                list.join(", ")
+            ),
+        };
+        let change = change(name, "headers", e.headers.join(", "), unique.join(", "));
+        Ok((text, change))
+    }
+
+    /// Sets a token's `url` (also swapped in the path and query) or `raw` (handed out as its
+    /// real value).
+    pub fn set_flag(
+        &mut self,
+        name: &str,
+        flag: &str,
+        on: bool,
+    ) -> anyhow::Result<(String, Change)> {
+        let e = self.token(name)?;
+        let old = if flag == "raw" { e.raw } else { e.url };
+        let t = self.table(Kind::Token, name).expect("found above");
+        match on {
+            true => set(t, flag, true),
+            false => drop(t.remove(flag)),
+        }
+        let text = match (flag, on) {
+            ("raw", true) => format!(
+                "{name} is now handed to the agent's programs as its real value, which they can \
+                 read and send anywhere"
+            ),
+            ("raw", false) => format!("{name} reaches the agent only as a stand-in again"),
+            (_, true) => format!(
+                "{name} is now also swapped in a request's path and query; a server may repeat \
+                 its URL back"
+            ),
+            (_, false) => format!("{name} is swapped in headers only"),
+        };
+        Ok((text, change(name, flag, old.to_string(), on.to_string())))
+    }
+
     /// Every value a command or a page could echo back, by entry name, for [`scrub`].
     pub fn secrets(&self) -> Vec<(String, String)> {
         self.entries()
@@ -442,8 +640,59 @@ fn set(t: &mut Table, key: &str, v: impl Into<toml_edit::Value>) {
     t[key] = Item::Value(v);
 }
 
+/// `hosts` as bindings, each checked and once.
+fn hosts_of(hosts: &[&str]) -> anyhow::Result<Vec<String>> {
+    let mut all = Vec::new();
+    for host in hosts {
+        let host = crate::broker::parse_host(host).map_err(anyhow::Error::msg)?;
+        if !all.contains(&host) {
+            all.push(host);
+        }
+    }
+    Ok(all)
+}
+
+/// Writes a token's `hosts`; none leaves no key.
+fn set_hosts(t: &mut Table, hosts: &[String]) {
+    set_list(t, "hosts", hosts)
+}
+
+/// Writes a list of a token's; an empty one leaves no key.
+fn set_list(t: &mut Table, key: &str, items: &[String]) {
+    match items.is_empty() {
+        true => drop(t.remove(key)),
+        false => set(t, key, Array::from_iter(items.iter())),
+    }
+}
+
+/// `headers` as a token keeps them, each checked and once. `Authorization` is every token's
+/// already.
+fn headers_of(headers: &[&str]) -> anyhow::Result<Vec<String>> {
+    let mut all = Vec::new();
+    for header in headers {
+        let header = crate::broker::header_name(header).map_err(anyhow::Error::msg)?;
+        if header != "authorization" && !all.contains(&header) {
+            all.push(header);
+        }
+    }
+    Ok(all)
+}
+
+fn change(name: &str, what: &str, old: String, new: String) -> Change {
+    Change {
+        key: format!("vault.{name}.{what}"),
+        old,
+        new,
+    }
+}
+
 fn read(kind: Kind, t: &Table) -> Entry {
     let s = |k: &str| t.get(k).and_then(Item::as_str).unwrap_or("").to_string();
+    let flag = |k: &str| t.get(k).and_then(Item::as_bool).unwrap_or(false);
+    let list = |k: &str| -> Vec<String> {
+        let items = t.get(k).and_then(Item::as_array).into_iter().flatten();
+        items.filter_map(|v| v.as_str().map(String::from)).collect()
+    };
     Entry {
         kind,
         name: s("name"),
@@ -451,17 +700,13 @@ fn read(kind: Kind, t: &Table) -> Entry {
         username: s("username"),
         password: s("password"),
         totp: s("totp"),
-        granted: t.get("granted").and_then(Item::as_bool).unwrap_or(false),
+        granted: flag("granted"),
         value: s("value"),
-        programs: t
-            .get("programs")
-            .and_then(Item::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        programs: list("programs"),
+        hosts: list("hosts"),
+        headers: list("headers"),
+        url: flag("url"),
+        raw: flag("raw"),
     }
 }
 
@@ -485,11 +730,7 @@ const MIN_SCRUB: usize = 4;
 /// base64 forms (`curl -u x:$TOKEN -v` prints one); then any run of 8 or more characters of
 /// either, as a cut-off or partial print leaves, masked as `auth::redact` masks a login's echo.
 pub fn scrub(text: &str, secrets: &[(String, String)]) -> String {
-    let mut forms: Vec<(&str, String)> = Vec::new();
-    for (name, v) in secrets.iter().filter(|(_, v)| v.len() >= MIN_SCRUB) {
-        forms.push((name.as_str(), v.clone()));
-        forms.extend(base64_forms(v).into_iter().map(|f| (name.as_str(), f)));
-    }
+    let mut forms = forms(secrets);
     forms.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
     let mut out = text.to_string();
     for (name, v) in &forms {
@@ -499,6 +740,96 @@ pub fn scrub(text: &str, secrets: &[(String, String)]) -> String {
     }
     let all: Vec<String> = forms.into_iter().map(|(_, v)| v).collect();
     crate::auth::redact(&out, &all)
+}
+
+/// Every text a value shows up as, with its entry's name: itself and its base64 forms.
+fn forms(secrets: &[(String, String)]) -> Vec<(&str, String)> {
+    let mut forms: Vec<(&str, String)> = Vec::new();
+    for (name, v) in secrets.iter().filter(|(_, v)| v.len() >= MIN_SCRUB) {
+        forms.push((name.as_str(), v.clone()));
+        forms.extend(base64_forms(v).into_iter().map(|f| (name.as_str(), f)));
+    }
+    forms
+}
+
+/// Copies `input` to `log` with every value of the vault at `vault`, and its base64 forms,
+/// replaced by `[vault:NAME]`: what a command prints, on its way to its log (DESIGN §4.13), so
+/// the log the agent can read holds none. A value cut across two reads is still found; after a
+/// quarter of a second with nothing more, what was held back as the possible start of one goes
+/// out as it is. The vault is read again when its file changes, and while it cannot be read the
+/// output is withheld, as `scrubbed` withholds it.
+fn scrub_stream(vault: &Path, mut input: std::fs::File, mut log: impl std::io::Write) {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    const PAUSE_MS: i32 = 250;
+    let stamp = || {
+        let m = std::fs::metadata(vault).ok()?;
+        Some((m.modified().ok()?, m.len()))
+    };
+    let mut put = |bytes: Vec<u8>| {
+        // A log that cannot be written (a full disk) drops output; the command runs on.
+        let _ = log.write_all(&bytes).and_then(|()| log.flush());
+    };
+    // `None`: the vault could not be read.
+    let mut replacer: Option<crate::broker::Replacer> = None;
+    let (mut seen, mut withheld) = (None, false);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        if replacer.as_ref().is_some_and(|r| r.holds()) {
+            let mut wait = libc::pollfd {
+                fd: input.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one pollfd of ours, for the length given.
+            if unsafe { libc::poll(&mut wait, 1, PAUSE_MS) } == 0 {
+                put(replacer.as_mut().map(|r| r.finish()).unwrap_or_default());
+                continue;
+            }
+        }
+        let n = match input.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let now = Some(stamp());
+        if now != seen {
+            put(replacer.as_mut().map(|r| r.finish()).unwrap_or_default());
+            replacer = Vault::load(vault).ok().map(|v| {
+                let pair = |(name, form): (&str, String)| {
+                    (form.into_bytes(), format!("[vault:{name}]").into_bytes())
+                };
+                crate::broker::Replacer::new(forms(&v.secrets()).into_iter().map(pair).collect())
+            });
+            seen = now;
+        }
+        match &mut replacer {
+            Some(r) => {
+                withheld = false;
+                put(r.push(&buf[..n]));
+            }
+            None if !withheld => {
+                withheld = true;
+                put(b"[output withheld: the vault could not be read]\n".to_vec());
+            }
+            None => {}
+        }
+    }
+    put(replacer.as_mut().map(|r| r.finish()).unwrap_or_default());
+}
+
+/// `zephyr __scrublog VAULT`: `scrub_stream` from stdin to stdout. The daemon starts it, as
+/// itself, between a command and its log (`procs::spawn`); it ends when the command, and all
+/// it left running, have closed their output.
+pub fn scrub_log(vault: &Path) -> std::process::ExitCode {
+    use std::os::fd::FromRawFd;
+    // It holds the vault's values, as the daemon does.
+    crate::agent::undumpable();
+    // SAFETY: this process's own stdin and stdout, used by nothing else here.
+    let (input, log) = unsafe { (std::fs::File::from_raw_fd(0), std::fs::File::from_raw_fd(1)) };
+    scrub_stream(vault, input, log);
+    std::process::ExitCode::SUCCESS
 }
 
 /// The base64 text `value` always turns into, standard and URL-safe, wherever it sits in the
@@ -528,7 +859,7 @@ pub(crate) fn base64_forms(value: &str) -> Vec<String> {
 /// cannot be checked against is not shown.
 pub fn scrubbed(cfg: &Config, text: String) -> String {
     match Vault::load(&path(cfg)) {
-        Ok(v) => scrub(&text, &v.secrets()),
+        Ok(v) => scrub(&text, &crate::broker::secrets(cfg, &v)),
         Err(_) => "[output withheld: the vault could not be read]".into(),
     }
 }
@@ -572,17 +903,40 @@ pub fn totp(seed_text: &str, unix: u64) -> anyhow::Result<String> {
 
 /// The owner's `/vault …`, on any channel (DESIGN §4.15). An approved proposal arrives here as
 /// the owner's own `/vault grant …`. Values are never taken in a chat message.
-pub fn command(path: &Path, arg: &str, may_approve: bool) -> Result<String, String> {
+pub fn command(
+    path: &Path,
+    arg: &str,
+    may_approve: bool,
+    strong: bool,
+) -> Result<(String, Option<Change>), String> {
     let words: Vec<&str> = arg.split_whitespace().collect();
     let edit = |f: &dyn Fn(&mut Vault) -> anyhow::Result<String>| match edit(path, f) {
-        Ok(text) => Ok(format!("[zephyr] {text}")),
+        Ok(text) => Ok((format!("[zephyr] {text}"), None)),
+        Err(e) => Err(format!("[zephyr] {e:#}")),
+    };
+    // A binding: its change goes to settings_log.
+    type Bound<'a> = &'a dyn Fn(&mut Vault) -> anyhow::Result<(String, Change)>;
+    let bound = |f: Bound| match self::edit(path, f) {
+        Ok((text, change)) => Ok((format!("[zephyr] {text}"), Some(change))),
         Err(e) => Err(format!("[zephyr] {e:#}")),
     };
     match words[..] {
         [] | ["list"] => {
-            (Vault::load(path).map(|v| v.list())).map_err(|e| format!("[zephyr] {e:#}"))
+            (Vault::load(path).map(|v| (v.list(), None))).map_err(|e| format!("[zephyr] {e:#}"))
         }
+        // In the web app every approval is on its card, signed with a passkey: a grant, and
+        // whatever loosens where a token goes, whatever `strong_channels` says.
         ["grant", ..] if !may_approve => Err(crate::tools::NEEDS_PASSKEY.into()),
+        _ if !may_approve && loosens(&format!("/vault {arg}")) => {
+            Err(crate::tools::NEEDS_PASSKEY.into())
+        }
+        // Where a token goes, or handing out the value itself: from a strong channel only
+        // (`strong`), as the connectors' `hosts` and `secrets` are (DESIGN §4.21).
+        _ if !strong && loosens(&format!("/vault {arg}")) => Err(
+            "[zephyr] sending a vault token to more hosts, in more headers, in URLs or as its real \
+             value needs a strong channel"
+                .into(),
+        ),
         ["rm", name] => edit(&|v| match v.remove(name) {
             true => Ok(format!("removed {name} from the vault")),
             false => bail!("no entry named {name} in the vault"),
@@ -593,18 +947,42 @@ pub fn command(path: &Path, arg: &str, may_approve: bool) -> Result<String, Stri
         ["grant", "token", name, ref programs @ ..] if !programs.is_empty() => {
             edit(&|v| v.grant(Kind::Token, name, programs))
         }
+        ["bind", name, ref hosts @ ..] if !hosts.is_empty() => bound(&|v| v.bind(name, hosts)),
+        ["unbind", name] => bound(&|v| v.unbind(name, None)),
+        ["unbind", name, host] => bound(&|v| v.unbind(name, Some(host))),
+        ["header", name, ref headers @ ..] if !headers.is_empty() => {
+            bound(&|v| v.header(name, headers, None))
+        }
+        ["unheader", name] => bound(&|v| v.header(name, &[], Some(None))),
+        ["unheader", name, header] => bound(&|v| v.header(name, &[], Some(Some(header)))),
+        [flag @ ("raw" | "url"), name, on @ ("on" | "off")] => {
+            bound(&|v| v.set_flag(name, flag, on == "on"))
+        }
         ["add" | "edit", ..] => Err(
             "[zephyr] values never go through a chat: in zephyr attach, \
             /vault opens a form; on the host, run `zephyr vault add login NAME --site URL` or \
-            `zephyr vault add token NAME`"
+            `zephyr vault add token NAME --host HOST`"
                 .into(),
         ),
         _ => Err(
             "[zephyr] usage: /vault, /vault rm NAME, /vault revoke NAME [PROGRAM], \
-              /vault grant login NAME, /vault grant token NAME PROGRAM.."
+              /vault grant login NAME, /vault grant token NAME PROGRAM.., \
+              /vault bind NAME HOST.., /vault unbind NAME [HOST], /vault header NAME HEADER.., \
+              /vault unheader NAME [HEADER], /vault url NAME on|off, \
+              /vault raw NAME on|off"
                 .into(),
         ),
     }
+}
+
+/// Whether the owner's command `text` loosens where a token goes: `/vault bind`, `/vault
+/// header`, `/vault url NAME on` and `/vault raw NAME on`. Taking any of them back does not.
+pub fn loosens(text: &str) -> bool {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    matches!(
+        words[..],
+        ["/vault", "bind" | "header", ..] | ["/vault", "raw" | "url", _, "on"]
+    )
 }
 
 /// What `/ok` does to a vault proposal, in the owner's notice.
@@ -643,7 +1021,8 @@ pub fn exec_env(
             .map(String::as_str)
             .collect();
         if missing.is_empty() {
-            env.push((token.name, token.value));
+            let value = value_for(cfg, &token)?;
+            env.push((token.name, value));
             continue;
         }
         let command = format!("/vault grant token {name} {}", missing.join(" "));
@@ -663,6 +1042,26 @@ pub fn exec_env(
     }
 }
 
+/// What a command gets for a token it may use (DESIGN §4.21): under the network floor its
+/// stand-in, which the proxy swaps on the token's hosts; the real value for a `raw` token, and
+/// under host networking, where there is no proxy to swap anything. Never the real value in
+/// place of a stand-in that cannot be made.
+fn value_for(cfg: &Config, token: &Entry) -> Result<String, String> {
+    if token.raw || !crate::broker::on(cfg) {
+        return Ok(token.value.clone());
+    }
+    if token.hosts.is_empty() {
+        return Err(format!(
+            "not run: the token {} is bound to no host; ask the owner with vault bind",
+            token.name
+        ));
+    }
+    match crate::broker::key(cfg) {
+        Ok(key) => Ok(crate::broker::surrogate(&key, "token", &token.name)),
+        Err(_) => Err("not run: the token broker's key could not be read".into()),
+    }
+}
+
 /// The agent's `vault` call `call_id` (main only), answered through the gateway file: at once,
 /// except a fill, which runs the browser from a task of its own.
 pub fn agent(cfg: &Arc<Config>, store: &Store, call_id: &str, action: VaultAction) {
@@ -679,6 +1078,7 @@ pub fn agent(cfg: &Arc<Config>, store: &Store, call_id: &str, action: VaultActio
             site,
             why,
         } => answer(&request(store, &name, &kind, site.as_deref(), &why)),
+        VaultAction::Bind { name, hosts } => answer(&propose_bind(store, &vault, &name, &hosts)),
         VaultAction::Fill {
             name,
             user,
@@ -707,6 +1107,29 @@ pub fn agent(cfg: &Arc<Config>, store: &Store, call_id: &str, action: VaultActio
                 crate::tools::answer_gateway(&cfg, &id, &text);
             });
         }
+    }
+}
+
+/// The agent's `bind`: a proposal `/vault bind NAME HOST..` for the owner, hosts first. The
+/// agent can ask; only the owner's `/ok`, on a channel that may approve, binds.
+fn propose_bind(store: &Store, vault: &Vault, name: &str, hosts: &[String]) -> String {
+    if vault.token(name).is_err() {
+        return format!("no token named {name} in the vault; `request` it from the owner");
+    }
+    let hosts = match hosts_of(&hosts.iter().map(String::as_str).collect::<Vec<_>>()) {
+        Ok(hosts) => hosts,
+        Err(e) => return format!("not asked: {e:#}"),
+    };
+    let hosts: Vec<&str> = hosts.iter().map(|h| shown(h)).collect();
+    let command = format!("/vault bind {name} {}", hosts.join(" "));
+    let ask = format!("to send the token {name} to {}", hosts.join(", "));
+    match crate::tools::ask_owner(store, &command, &ask, ALLOWS) {
+        Ok(id) => format!(
+            "not bound: sending {name} to {} needs the owner's OK, asked as #{id}. Tell the owner \
+             and end your turn; use it once they allow it.",
+            hosts.join(", ")
+        ),
+        Err(e) => format!("not bound: asking the owner failed: {e}"),
     }
 }
 
@@ -1168,15 +1591,16 @@ programs = ["gh"]
         let dir = crate::test_dir("vault-cmd");
         let path = dir.join(FILE);
         std::fs::write(&path, SAMPLE).unwrap();
-        let said = |arg: &str| command(&path, arg, true).unwrap_or_else(|refused| refused);
+        let said =
+            |arg: &str| command(&path, arg, true, true).map_or_else(|refused| refused, |d| d.0);
         assert!(said("").contains("token GH_TOKEN"));
         // Typed in the web app, a grant is refused and nothing is granted; the rest is not.
-        let web = command(&path, "grant token GH_TOKEN curl", false).unwrap_err();
+        let web = command(&path, "grant token GH_TOKEN curl", false, true).unwrap_err();
         assert_eq!(web, crate::tools::NEEDS_PASSKEY);
-        assert!(command(&path, "grant login github", false).is_err());
-        assert!(command(&path, "", false).is_ok_and(|list| !list.contains("curl")));
+        assert!(command(&path, "grant login github", false, true).is_err());
+        assert!(command(&path, "", false, false).is_ok_and(|list| !list.0.contains("curl")));
         assert!(
-            command(&path, "rm nosuch", true).is_err(),
+            command(&path, "rm nosuch", true, true).is_err(),
             "a failure is an Err"
         );
         assert!(said("grant token GH_TOKEN jq").contains("gh, jq"));
@@ -1215,5 +1639,291 @@ programs = ["gh"]
         };
         let err = fields(&dashed, &[None, sel("#p"), None], 0).unwrap_err();
         assert!(err.contains("password") && !err.contains("--json"), "{err}");
+    }
+
+    fn brokered(name: &str, vault: &str) -> (Config, Store) {
+        let dir = crate::test_dir(name);
+        std::fs::write(dir.join(FILE), vault).unwrap();
+        let mut cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = {dir:?}\n")).unwrap();
+        cfg.floor = true;
+        let store = Store::open(&cfg.db_path()).unwrap();
+        (cfg, store)
+    }
+
+    const TOKENS: &str = "[[token]]\nname = \"BOUND\"\nvalue = \"real-bound-1\"\nprograms = [\"curl\"]\nhosts = [\"api.x.test:443\"]\n\
+        [[token]]\nname = \"RAW\"\nvalue = \"real-raw-12\"\nprograms = [\"curl\"]\nraw = true\n\
+        [[token]]\nname = \"LOOSE\"\nvalue = \"real-loose-1\"\nprograms = [\"curl\"]\n";
+
+    #[test]
+    fn exec_env_gives_a_surrogate_a_raw_value_or_nothing() {
+        let (mut cfg, store) = brokered("vault-env", TOKENS);
+        let env = |cfg: &Config, name: &str| exec_env(cfg, &store, "curl x", &[name.to_string()]);
+        let key = crate::broker::key(&cfg).unwrap();
+        let surrogate = crate::broker::surrogate(&key, "token", "BOUND");
+        assert_eq!(
+            env(&cfg, "BOUND").unwrap(),
+            [("BOUND".to_string(), surrogate)]
+        );
+        assert_eq!(env(&cfg, "RAW").unwrap()[0].1, "real-raw-12");
+        assert_eq!(
+            env(&cfg, "LOOSE").unwrap_err(),
+            "not run: the token LOOSE is bound to no host; ask the owner with vault bind"
+        );
+        // A key that cannot be read gives no value in its place.
+        std::fs::write(cfg.state_dir().join(crate::broker::KEY_FILE), "broken").unwrap();
+        let refused = env(&cfg, "BOUND").unwrap_err();
+        assert!(
+            refused.starts_with("not run: ") && !refused.contains("real-"),
+            "{refused}"
+        );
+        // Under host networking nothing can swap: every token is handed out as before.
+        cfg.floor = false;
+        assert_eq!(env(&cfg, "BOUND").unwrap()[0].1, "real-bound-1");
+        assert_eq!(env(&cfg, "LOOSE").unwrap()[0].1, "real-loose-1");
+    }
+
+    #[test]
+    fn put_keeps_hosts_across_a_new_value() {
+        let mut v = Vault::parse(TOKENS).unwrap();
+        v.set_flag("BOUND", "url", true).unwrap();
+        let put = |v: &mut Vault, value: &str, hosts: &[&str], raw: bool| {
+            v.put(Entry {
+                kind: Kind::Token,
+                name: "BOUND".into(),
+                value: value.into(),
+                hosts: hosts.iter().map(|h| h.to_string()).collect(),
+                raw,
+                ..Entry::default()
+            })
+        };
+        // A new value keeps the hosts; a form never sets `raw` or `url`.
+        put(&mut v, "rotated-value", &[], true).unwrap();
+        let e = v.get("BOUND").unwrap();
+        assert_eq!(
+            (e.value.as_str(), e.url, e.raw),
+            ("rotated-value", true, false)
+        );
+        assert_eq!(e.hosts, ["api.x.test:443"]);
+        // The owner's own form replaces them, normalized; a wildcard saves nothing.
+        put(
+            &mut v,
+            "",
+            &["API.Y.test", "y.test:8443", "api.y.test:443"],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            v.get("BOUND").unwrap().hosts,
+            ["api.y.test:443", "y.test:8443"]
+        );
+        assert!(put(&mut v, "", &["*.y.test"], false).is_err());
+        assert_eq!(v.get("BOUND").unwrap().hosts.len(), 2);
+        // A new entry starts with what its form said, and neither flag.
+        v.put(Entry {
+            kind: Kind::Token,
+            name: "NEW".into(),
+            value: "new-value".into(),
+            hosts: vec!["n.test".into()],
+            url: true,
+            raw: true,
+            ..Entry::default()
+        })
+        .unwrap();
+        let e = v.get("NEW").unwrap();
+        assert_eq!(
+            (e.hosts, e.url, e.raw),
+            (vec!["n.test:443".to_string()], false, false)
+        );
+        assert!(
+            Vault::parse("[[token]]\nname = \"X\"\nvalue = \"v\"\nhosts = [\"1.2.3.4\"]\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bind_raw_and_url_need_a_strong_channel_and_tightening_does_not() {
+        let dir = crate::test_dir("vault-bind");
+        let path = dir.join(FILE);
+        std::fs::write(&path, TOKENS).unwrap();
+        // On a channel that is not strong (Discord, say), whatever else it may approve.
+        let weak = |arg: &str| command(&path, arg, true, false);
+        let strong = |arg: &str| command(&path, arg, true, true);
+        for loosening in ["bind LOOSE api.x.test", "raw LOOSE on", "url LOOSE on"] {
+            let refused = weak(loosening).unwrap_err();
+            assert!(
+                refused.ends_with("needs a strong channel"),
+                "{loosening}: {refused}"
+            );
+            assert!(loosens(&format!("/vault {loosening}")), "{loosening}");
+        }
+        // In the web app each of them is approved on its card with a passkey, whatever
+        // `strong_channels` says: typed there, it is refused even when `web` is a strong one.
+        for loosening in [
+            "bind LOOSE api.x.test",
+            "raw LOOSE on",
+            "url LOOSE on",
+            "header LOOSE X-Api-Key",
+            "grant token LOOSE gh",
+        ] {
+            let refused = command(&path, loosening, false, true).unwrap_err();
+            assert_eq!(refused, crate::tools::NEEDS_PASSKEY, "{loosening}");
+        }
+        assert!(command(&path, "unbind BOUND", false, false).is_ok());
+        std::fs::write(&path, TOKENS).unwrap();
+        // The headers a token is swapped in besides Authorization are the owner's to list.
+        assert!(weak("header LOOSE X-Api-Key")
+            .unwrap_err()
+            .ends_with("needs a strong channel"));
+        let (said, change) = strong("header LOOSE X-Api-Key x-goog-api-key Authorization").unwrap();
+        assert_eq!(
+            said,
+            "[zephyr] LOOSE is swapped in the Authorization header and in x-api-key, x-goog-api-key"
+        );
+        assert_eq!(change.unwrap().key, "vault.LOOSE.headers");
+        assert!(strong("header LOOSE bad:name").is_err());
+        let list = weak("").unwrap().0;
+        assert!(
+            list.contains("also in the headers x-api-key, x-goog-api-key"),
+            "{list}"
+        );
+        let (said, _) = weak("unheader LOOSE x-api-key").unwrap();
+        assert!(said.ends_with("and in x-goog-api-key"), "{said}");
+        assert!(weak("unheader LOOSE x-api-key").is_err());
+        let (said, _) = weak("unheader LOOSE").unwrap();
+        assert_eq!(
+            said,
+            "[zephyr] LOOSE is swapped in the Authorization header only"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), TOKENS);
+        let (said, change) = strong("bind LOOSE API.x.test gist.x.test:8443").unwrap();
+        assert_eq!(
+            said,
+            "[zephyr] LOOSE is now sent only to api.x.test, gist.x.test:8443\n\
+             api.x.test is now decrypted by zephyr for every program the agent runs\n\
+             gist.x.test:8443 is now decrypted by zephyr for every program the agent runs"
+        );
+        let change = change.unwrap();
+        assert_eq!(
+            (
+                change.key.as_str(),
+                change.old.as_str(),
+                change.new.as_str()
+            ),
+            ("vault.LOOSE.hosts", "", "api.x.test:443, gist.x.test:8443")
+        );
+        for bad in [
+            "bind LOOSE *.x.test",
+            "bind LOOSE https://x.test",
+            "bind LOOSE 1.2.3.4",
+            "bind NOPE x.test",
+            "bind LOOSE",
+        ] {
+            assert!(strong(bad).is_err(), "{bad}");
+        }
+        assert!(strong("raw LOOSE on").unwrap().0.contains("real value"));
+        assert!(strong("url LOOSE on").unwrap().1.is_some());
+        let list = weak("").unwrap().0;
+        assert!(
+            list.contains("token LOOSE: allowed for curl; handed out as its real value (raw)"),
+            "{list}"
+        );
+        assert!(
+            list.contains("token BOUND: allowed for curl; sent only to api.x.test"),
+            "{list}"
+        );
+        // Tightening is taken from any channel.
+        for tightening in ["unbind LOOSE", "raw LOOSE off", "url LOOSE off"] {
+            assert!(!loosens(&format!("/vault {tightening}")), "{tightening}");
+        }
+        let (_, change) = weak("raw LOOSE off").unwrap();
+        assert_eq!(change.unwrap().key, "vault.LOOSE.raw");
+        weak("url LOOSE off").unwrap();
+        let (said, _) = weak("unbind LOOSE gist.x.test:8443").unwrap();
+        assert_eq!(said, "[zephyr] LOOSE is now sent only to api.x.test");
+        assert!(weak("unbind LOOSE gist.x.test:8443").is_err());
+        let (said, _) = weak("unbind LOOSE").unwrap();
+        assert!(said.contains("bound to no host"), "{said}");
+        let e = Vault::load(&path).unwrap().get("LOOSE").unwrap();
+        assert_eq!(
+            (e.hosts.len(), e.url, e.raw, e.programs),
+            (0, false, false, vec!["curl".to_string()])
+        );
+    }
+
+    #[test]
+    fn the_agents_bind_is_a_proposal_and_never_a_binding() {
+        let (cfg, store) = brokered("vault-propose", TOKENS);
+        let vault = Vault::load(&path(&cfg)).unwrap();
+        let hosts = ["api.x.test".to_string(), "x.test".to_string()];
+        let said = propose_bind(&store, &vault, "LOOSE", &hosts);
+        assert!(
+            said.starts_with(
+                "not bound: sending LOOSE to api.x.test, x.test needs the owner's OK, asked as #1"
+            ),
+            "{said}"
+        );
+        assert_eq!(std::fs::read_to_string(path(&cfg)).unwrap(), TOKENS);
+        assert!(propose_bind(&store, &vault, "NOPE", &hosts).contains("no token named NOPE"));
+        assert!(
+            propose_bind(&store, &vault, "LOOSE", &["*.x.test".to_string()])
+                .starts_with("not asked")
+        );
+    }
+
+    #[test]
+    fn scrubbed_output_hides_a_surrogate() {
+        let (cfg, _store) = brokered("vault-scrub-surrogate", TOKENS);
+        let key = crate::broker::key(&cfg).unwrap();
+        let surrogate = crate::broker::surrogate(&key, "token", "BOUND");
+        let clean = scrubbed(&cfg, format!("BOUND={surrogate} and real-bound-1"));
+        assert_eq!(clean, "BOUND=[vault:BOUND] and [vault:BOUND]");
+        assert!(!format!("{:?}", Vault::load(&path(&cfg)).unwrap().get("BOUND")).contains("real-"));
+    }
+
+    #[test]
+    fn a_commands_output_reaches_its_log_without_a_vault_value() {
+        use base64::Engine;
+        use std::io::Write;
+        let dir = crate::test_dir("vault-scrub-stream");
+        let vault = dir.join(FILE);
+        std::fs::write(&vault, TOKENS).unwrap();
+        let run = |writes: &[&[u8]], pause: Duration| -> String {
+            let (rx, mut tx) = std::io::pipe().unwrap();
+            let log = dir.join("out.log");
+            let out = std::fs::File::create(&log).unwrap();
+            let vault = vault.clone();
+            let input = std::fs::File::from(std::os::fd::OwnedFd::from(rx));
+            let filter = std::thread::spawn(move || scrub_stream(&vault, input, out));
+            for part in writes {
+                tx.write_all(part).unwrap();
+                std::thread::sleep(pause);
+            }
+            drop(tx);
+            filter.join().unwrap();
+            std::fs::read_to_string(log).unwrap()
+        };
+        let basic = base64::engine::general_purpose::STANDARD.encode("x:real-bound-1");
+        let text =
+            format!("key=real-bound-1 raw=real-raw-12\nAuthorization: Basic {basic}\ndone\n");
+        let clean = run(&[text.as_bytes()], Duration::ZERO);
+        assert!(clean.starts_with("key=[vault:BOUND] raw=[vault:RAW]\nAuthorization: Basic "));
+        assert!(
+            clean.ends_with("\ndone\n") && clean.contains("Basic eDp[vault:BOUND]"),
+            "{clean}"
+        );
+        assert!(
+            !clean.contains("real-") && !clean.contains(&basic),
+            "{clean}"
+        );
+        // Cut in the middle of a value, as a pipe may cut it.
+        let clean = run(&[b"key=real-bo", b"und-1\n"], Duration::ZERO);
+        assert_eq!(clean, "key=[vault:BOUND]\n");
+        // A prompt that ends like the start of a value is not held for ever.
+        let clean = run(&[b"so real-", b"ly\n"], Duration::from_millis(600));
+        assert_eq!(clean, "so real-ly\n");
+        // A vault that cannot be read: nothing of the output is written.
+        std::fs::write(&vault, "[[token]\nbroken").unwrap();
+        let clean = run(&[b"key=real-bound-1\n", b"more\n"], Duration::ZERO);
+        assert_eq!(clean, "[output withheld: the vault could not be read]\n");
     }
 }

@@ -336,11 +336,15 @@ pub const TOOLS: [(&str, &str, &str, ToolExecuteFn); 8] = [
          selectors for any of `user`, `password` and `totp` (a one-time code made now); it fills \
          only when the page is on the login's own site. The first fill of a login needs the \
          owner's OK: then you are told so; tell the owner and end your turn. Tokens are used \
-         through `exec` with `secrets`. When a credential is missing, `request` it with a \
+         through `exec` with `secrets`: the command gets a stand-in, which zephyr swaps for the \
+         real token only in HTTPS requests to the hosts the owner bound it to (`list` shows \
+         them), and only in the `Authorization` header (Bearer or Basic) or a header the owner \
+         listed for it: in any other header the request is refused. To use a token on another host, `bind` it with `name` and `hosts` (exact names, \
+         no wildcards): the owner is asked, and you end your turn. When a credential is missing, `request` it with a \
          `name` (logins: lowercase like github; tokens: an env var name like GH_TOKEN), its \
          `kind`, the `site` for a login, and `why`: the owner is asked to save it, and you get a \
          message when they do. Never ask the owner to paste a password or token into the chat.",
-        r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","request","fill"]},"name":{"type":"string"},"kind":{"type":"string","enum":["login","token"]},"site":{"type":"string","description":"For request of a login: the site's address, e.g. https://github.com"},"why":{"type":"string"},"user":{"type":"string","description":"For fill: CSS selector of the username field"},"password":{"type":"string","description":"For fill: CSS selector of the password field"},"totp":{"type":"string","description":"For fill: CSS selector of the one-time code field"}},"required":["action"]}"#,
+        r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","request","fill","bind"]},"name":{"type":"string"},"hosts":{"type":"array","items":{"type":"string"},"description":"For bind: the exact host names the token is sent to, e.g. api.github.com"},"kind":{"type":"string","enum":["login","token"]},"site":{"type":"string","description":"For request of a login: the site's address, e.g. https://github.com"},"why":{"type":"string"},"user":{"type":"string","description":"For fill: CSS selector of the username field"},"password":{"type":"string","description":"For fill: CSS selector of the password field"},"totp":{"type":"string","description":"For fill: CSS selector of the one-time code field"}},"required":["action"]}"#,
         vault_execute,
     ),
     (
@@ -421,6 +425,11 @@ pub enum VaultAction {
         site: Option<String>,
         why: String,
     },
+    /// Asks the owner to bind a token to hosts: the only places it is then sent (DESIGN §4.21).
+    Bind {
+        name: String,
+        hosts: Vec<String>,
+    },
     /// CSS selectors of the fields to fill; at least one is given.
     Fill {
         name: String,
@@ -470,8 +479,24 @@ pub fn vault_action(params: &Value) -> Result<VaultAction, String> {
                 totp,
             })
         }
+        "bind" => {
+            let listed = params["hosts"].as_array().map_or(&[][..], Vec::as_slice);
+            let hosts: Vec<String> = (listed.iter())
+                .filter_map(|h| h.as_str().map(str::trim).map(String::from))
+                .filter(|h| !h.is_empty())
+                .collect();
+            if hosts.is_empty() || hosts.len() != listed.len() || hosts.len() > 16 {
+                return Err(
+                    "`hosts` is a list of 1 to 16 host names, e.g. [\"api.github.com\"]".into(),
+                );
+            }
+            Ok(VaultAction::Bind {
+                name: name()?,
+                hosts,
+            })
+        }
         other => Err(format!(
-            "unknown action {other:?}; use list, request or fill"
+            "unknown action {other:?}; use list, request, fill or bind"
         )),
     }
 }
@@ -1439,6 +1464,24 @@ mod tests {
             Ok(VaultAction::List)
         );
         assert!(vault_action(&json!({ "action": "fill", "name": "github" })).is_err());
+        assert_eq!(
+            vault_action(
+                &json!({ "action": "bind", "name": "GH_TOKEN", "hosts": [" api.github.com "] })
+            ),
+            Ok(VaultAction::Bind {
+                name: "GH_TOKEN".into(),
+                hosts: vec!["api.github.com".into()]
+            })
+        );
+        for bad in [
+            json!({ "action": "bind", "name": "GH_TOKEN" }),
+            json!({ "action": "bind", "name": "GH_TOKEN", "hosts": [] }),
+            json!({ "action": "bind", "name": "GH_TOKEN", "hosts": "api.github.com" }),
+            json!({ "action": "bind", "name": "GH_TOKEN", "hosts": ["a.test", 1] }),
+            json!({ "action": "bind", "hosts": ["a.test"] }),
+        ] {
+            assert!(vault_action(&bad).is_err(), "{bad}");
+        }
         assert!(
             vault_action(&json!({ "action": "request", "name": "x", "kind": "login" })).is_err()
         );

@@ -291,6 +291,7 @@ pub async fn run<C: Channel>(
     let newest = waiting.map_or(i64::MAX, |all| all.iter().map(|p| p.id).max().unwrap_or(0));
     router.pushed_up_to = std::sync::atomic::AtomicI64::new(newest);
     router.keep_upgraded_install_as_it_was().await;
+    router.settle_remote_connectors().await;
     router.taint_cut_off();
     // Before the first child starts the desktop: one a daemon before this left is no child of
     // this one, so it would be a stray for memory for good (DESIGN §4.6).
@@ -757,6 +758,7 @@ impl<'a> Router<'a> {
                     }
                     self.revert_due().await;
                     self.upgrade_notice();
+                    self.broker_notice();
                     // Delays that came due, and held actions nobody answered (approvals §4.6).
                     self.tick_actions();
                     // A budget pause ends at UTC midnight with nothing else to wake the router;
@@ -2734,8 +2736,30 @@ impl<'a> Router<'a> {
             // The owner's credentials (DESIGN §4.15); also an approved `/vault grant` proposal.
             ("/vault", arg) => {
                 let may_approve = from.0 != crate::attach::WEB;
-                let done = crate::vault::command(&crate::vault::path(&self.cfg), arg, may_approve);
-                done.unwrap_or_else(|refused| self.refused(refused))
+                // Where a token goes is loosened only from a strong channel (DESIGN §4.21).
+                let strong = (self.cfg.settings.strong_channels.iter()).any(|c| c == from.0);
+                let path = crate::vault::path(&self.cfg);
+                match crate::vault::command(&path, arg, may_approve, strong) {
+                    Ok((done, change)) => {
+                        // A binding is the owner's change to what a token may reach (§4.21).
+                        if let Some(c) = change {
+                            let (old, new) = (Some(c.old.as_str()), Some(c.new.as_str()));
+                            let logged = (self.store).log_setting(
+                                &c.key,
+                                old,
+                                new,
+                                "owner",
+                                Some(from.0),
+                                None,
+                            );
+                            if let Err(e) = logged {
+                                eprintln!("zephyr: logging {}: {e}", c.key);
+                            }
+                        }
+                        done
+                    }
+                    Err(refused) => self.refused(refused),
+                }
             }
             // The owner's private facts (approvals spec §4.5): names only, never a value.
             ("/facts", arg) => {
@@ -2752,7 +2776,8 @@ impl<'a> Router<'a> {
             ("/skills" | "/skill" | "/mcp", _) => {
                 use crate::drafts::After;
                 let may_approve = from.0 != crate::attach::WEB;
-                let (reply, after) = crate::drafts::command(&self.cfg, text, may_approve)?;
+                let strong = (self.cfg.settings.strong_channels.iter()).any(|c| c == from.0);
+                let (reply, after) = crate::drafts::command(&self.cfg, text, may_approve, strong)?;
                 match after {
                     After::Nothing => reply,
                     // rpi reads AGENTS.md once, at start.
@@ -2834,9 +2859,14 @@ impl<'a> Router<'a> {
         if let Some(m) = model.filter(|m| *m != "default") {
             check_model(&self.cfg, m).await?;
         }
+        // An edit may not make one secret both a connector's own and another's stand-in
+        // (`broker::shared`); one that was there already is not this edit's to answer for.
+        let old = self.cfg.clone();
         crate::host::conf::update(&path, |doc| {
             edit(doc)?;
-            toml::from_str::<Config>(&doc.to_string())?.validate()
+            let new: Config = toml::from_str(&doc.to_string())?;
+            new.validate()?;
+            crate::broker::creates_pair(&old, &new).map_err(anyhow::Error::msg)
         })
         .map_err(|e| format!("not changed: {e:#}"))?;
         Ok(self.reloaded().await)
@@ -2902,6 +2932,114 @@ impl<'a> Router<'a> {
                 .map_err(Into::into)),
             Err(e) => log(Err(e.into())),
         }
+    }
+
+    /// The broker's upgrade for remote connectors (DESIGN §4.21), once (`meta`
+    /// `broker.remote_kept`, which then lists them), and only for a state.db from before the
+    /// broker (`Store::made_with_broker`; the broker has no schema step to tell by): each `url` connector that names a secret
+    /// and says nothing of how it holds it gets `secrets = "plain"` written, which is what it
+    /// had before the broker and all rpi's own MCP client can use. From then on a remote
+    /// connector with a secret is published only once the owner has said so. Each edit is in
+    /// `settings_log` as the upgrade's, and the owner is told with the rest (`broker_notice`).
+    /// If the file cannot be written nothing is marked, and the next start tries again.
+    /// Then, at every start: a secret one connector holds as it is and another as a stand-in
+    /// is told to the owner, since neither connector is published.
+    async fn settle_remote_connectors(&mut self) {
+        const KEPT: &str = "broker.remote_kept";
+        // `<state>/broker-settled`: the daemon's own file, outside state.db, so a state.db
+        // from before the broker that is put back later does not bring the upgrade back. Not
+        // in zephyr.toml: an older zephyr would refuse a table it does not know.
+        let mark = self.cfg.state_dir().join("broker-settled");
+        if matches!(self.store.meta(KEPT), Ok(None)) {
+            // Only an install from before the broker has anything to keep, and only once:
+            // the state.db was not made with the broker, it has no record of this having
+            // been done, and neither has the mark. On a first start, or with a state.db made
+            // anew, a remote connector waits for the owner's word.
+            let upgrade = !self.store.made_with_broker() && !mark.exists();
+            let names = match upgrade {
+                true => crate::broker::unsettled(&self.cfg),
+                false => Vec::new(),
+            };
+            // zephyr.toml is written only when a connector gets its `secrets = "plain"`.
+            let written = match (names.is_empty(), self.cfg.path.clone()) {
+                (true, _) => true,
+                (false, None) => false,
+                (false, Some(path)) => {
+                    let edit = crate::host::conf::update(&path, |doc| {
+                        for name in &names {
+                            let key = format!("mcp.{name}.secrets");
+                            crate::settings::write(doc, &key, Some(&"plain".into()))?;
+                        }
+                        toml::from_str::<Config>(&doc.to_string())?.validate()
+                    });
+                    match edit {
+                        Ok(()) => {
+                            self.reloaded().await;
+                            true
+                        }
+                        Err(e) => {
+                            eprintln!("zephyr: keeping remote connectors as they were: {e:#}");
+                            false
+                        }
+                    }
+                }
+            };
+            // Done, or nothing to do: marked either way, and only then.
+            if written && !mark.exists() {
+                log(crate::host::conf::replace_private(&mark, "1\n"));
+            }
+            if written {
+                for name in &names {
+                    let key = format!("mcp.{name}.secrets");
+                    let logged =
+                        (self.store).log_setting(&key, None, Some("plain"), "zephyr", None, None);
+                    log(logged.map_err(Into::into));
+                }
+                log((self.store.set_meta(KEPT, Some(&names.join(",")))).map_err(Into::into));
+            }
+        }
+        if let Some(why) = crate::broker::shared_notice(&self.cfg) {
+            let told = self.store.notify_last_owner(&format!(
+                "[zephyr] {why}. Neither connector is published until then."
+            ));
+            log(told.map_err(Into::into));
+        }
+    }
+
+    /// The once-only notice of the token broker's upgrade (DESIGN §4.21): the tokens and
+    /// connectors that cannot be used until the owner binds them. It waits for an owner to
+    /// tell, and is marked told even when there is nothing to say, so a later start is silent;
+    /// not while the vault cannot be read, which says nothing about what is in it.
+    fn broker_notice(&self) {
+        const TOLD: &str = "broker.upgrade_told";
+        const KEPT: &str = "broker.remote_kept";
+        // The upgrade's own edit comes first (`settle_remote_connectors`): until it is made,
+        // what it kept is not known.
+        if !matches!(self.store.meta(KEPT), Ok(Some(_))) {
+            return;
+        }
+        if !crate::broker::on(&self.cfg)
+            || !matches!(self.store.meta(TOLD), Ok(None))
+            || self.store.last_owner().ok().flatten().is_none()
+        {
+            return;
+        }
+        // Marked told only once the vault was read and what there was to say is stored: while
+        // it cannot be read, a later tick looks again.
+        let kept = self.store.meta(KEPT).ok().flatten().unwrap_or_default();
+        let kept: Vec<String> = kept
+            .split(',')
+            .filter(|n| !n.is_empty())
+            .map(String::from)
+            .collect();
+        let told = match crate::broker::upgrade_notice(&self.cfg, &kept) {
+            Ok(Some(text)) => self.store.notify_last_owner(&text),
+            Ok(None) => Ok(()),
+            Err(_) => return,
+        };
+        log(told
+            .and_then(|()| self.store.set_meta(TOLD, Some("1")))
+            .map_err(Into::into));
     }
 
     /// The one way a setting changes (settings spec §4.3), whoever asks: the key is looked up,
@@ -3312,9 +3450,12 @@ impl<'a> Router<'a> {
     /// `s`'s rows for `/settings`: one per connector for a connector's setting.
     fn setting_rows(&self, s: &Setting) -> Vec<crate::settings::Row> {
         let keys: Vec<String> = match s.key {
-            "mcp.<name>.enabled" => (self.cfg.mcp.iter())
-                .map(|m| format!("mcp.{}.enabled", m.name))
-                .collect(),
+            "mcp.<name>.enabled" | "mcp.<name>.hosts" | "mcp.<name>.secrets" => {
+                let field = s.key.rsplit('.').next().unwrap_or_default();
+                (self.cfg.mcp.iter())
+                    .map(|m| format!("mcp.{}.{field}", m.name))
+                    .collect()
+            }
             // The tools the owner gave a class.
             "mcp.<name>.classes.<tool>" => (self.cfg.mcp.iter())
                 .flat_map(|m| (m.classes.keys()).map(|t| format!("mcp.{}.classes.{t}", m.name)))
@@ -3435,6 +3576,17 @@ impl<'a> Router<'a> {
         // A fact's removal or new allowed target loosens the check: from a strong channel only.
         let facts = p.command.starts_with("/facts rm ") || p.command.starts_with("/facts allow ");
         let strong = &self.cfg.settings.strong_channels;
+        // So does a token's binding to more hosts, which the agent may only propose.
+        if p.key.is_none()
+            && crate::vault::loosens(&p.command)
+            && !strong.iter().any(|c| c == channel)
+        {
+            return Some(NotNow::Weak(format!(
+                "[zephyr] #{} sends a vault token to more hosts: approve it from {}",
+                p.id,
+                strong.join(" or ")
+            )));
+        }
         if p.key.is_none() && facts && !strong.iter().any(|c| c == channel) {
             return Some(NotNow::Weak(format!(
                 "[zephyr] #{} loosens the check for a private fact: approve it from {}",

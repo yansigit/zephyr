@@ -168,6 +168,13 @@ impl Gateway {
     async fn wait_replies(&self, n: usize) -> Vec<String> {
         self.wait_replies_on("chat", n).await
     }
+    /// The newest chat reply holding `has`, once there is one: for replies whose order a slow
+    /// machine can change.
+    async fn wait_reply(&self, has: &str) -> String {
+        let found = || self.replies().into_iter().rev().find(|r| r.contains(has));
+        wait(|| found().is_some()).await;
+        found().unwrap()
+    }
     async fn shutdown(mut self) {
         let _ = self.stop.take().unwrap().send(());
         self.task.await.unwrap().unwrap();
@@ -5349,6 +5356,460 @@ async fn a_vault_use_waits_for_the_owners_ok_and_a_granted_token_comes_back_scru
     let replies = gw.wait_replies(8).await;
     assert!(replies[6].contains("with env, grep (#3)"), "{replies:?}");
     assert_eq!(proc_status(&home, "exited"), 1);
+    gw.shutdown().await;
+}
+
+/// Waits until the router has ticked `n` more times: each tick rewrites its heartbeat.
+async fn ticks(home: &Path, n: usize) {
+    let written = || {
+        std::fs::metadata(home.join("heartbeat"))
+            .and_then(|m| m.modified())
+            .ok()
+    };
+    for _ in 0..n {
+        let last = written();
+        wait(|| written() != last).await;
+    }
+}
+
+/// The broker's upgrade for remote connectors (DESIGN §4.21): one that was there before, with
+/// a secret and no word on how it holds it, keeps the real secret it had, written into the
+/// file once, logged as the upgrade's and told to the owner. One added later is not settled
+/// for the owner: it is not published until they say.
+#[tokio::test]
+async fn the_upgrade_keeps_remote_connectors_as_they_were_and_settles_no_later_one() {
+    let home = home("broker-remote");
+    let path = home.join("zephyr.toml");
+    let remote = |name: &str| {
+        format!(
+            "\n[[mcp]]\nname = \"{name}\"\nurl = \"https://{name}.test/mcp\"\n\
+             headers = {{ Authorization = \"Bearer ${{DOCS_TOKEN}}\" }}\n"
+        )
+    };
+    let text = format!("{}{}", file_text(&home, ""), remote("docs"));
+    std::fs::write(&path, &text).unwrap();
+    std::fs::write(home.join("secrets.env"), "DOCS_TOKEN=real-docs-token\n").unwrap();
+    // A state.db from before the broker: it has no mark of having been made with it.
+    drop(Store::open(&home.join("state.db")).unwrap());
+    rusqlite::Connection::open(home.join("state.db"))
+        .unwrap()
+        .execute("DELETE FROM meta WHERE key = 'broker.born'", [])
+        .unwrap();
+    let on_file = |home: &Path| {
+        let mut cfg = Config::load(&home.join("zephyr.toml")).unwrap();
+        cfg.floor = true;
+        cfg.tick = Duration::from_millis(200);
+        cfg
+    };
+    let gw = start(on_file(&home));
+    gw.say("m1", "owner", "hi").await;
+    let told = gw
+        .wait_reply("Remote connectors keep their real secret")
+        .await;
+    assert!(told.ends_with("cannot use a stand-in): docs"), "{told}");
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("secrets = \"plain\""), "{saved}");
+    // Nothing but the connector's own key is written into the file: an older zephyr would
+    // not read a table it does not know. That it was done is a file of the daemon's own.
+    assert!(
+        !saved.contains("[broker]") && !saved.contains("settled"),
+        "{saved}"
+    );
+    assert_eq!(saved.replace("secrets = \"plain\"\n", ""), text);
+    use std::os::unix::fs::PermissionsExt;
+    let mark = std::fs::metadata(home.join("broker-settled")).expect("the mark");
+    assert_eq!(mark.permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        last_logged(&home, "mcp.docs.secrets"),
+        (None, Some("plain".into()), "zephyr".into())
+    );
+    // It works as before: its real secret is what the agent's MCP client is given.
+    let public = home.with_file_name(format!(
+        "{}-public",
+        home.file_name().unwrap().to_string_lossy()
+    ));
+    let published = std::fs::read_to_string(public.join("mcp.json")).unwrap();
+    assert!(published.contains("Bearer real-docs-token"), "{published}");
+    gw.shutdown().await;
+
+    // A remote connector added after the upgrade is not settled for the owner, also when a
+    // state.db from before the broker is put back: the mark is outside it.
+    let later = format!(
+        "{}{}",
+        std::fs::read_to_string(&path).unwrap(),
+        remote("later")
+    );
+    std::fs::write(&path, &later).unwrap();
+    rusqlite::Connection::open(home.join("state.db"))
+        .unwrap()
+        .execute("DELETE FROM meta WHERE key LIKE 'broker.%'", [])
+        .unwrap();
+    let gw = start(on_file(&home));
+    gw.say("m2", "owner", "/mcp").await;
+    let listed = gw.wait_reply("- later:").await;
+    assert!(
+        listed.contains(
+            "- later: https://later.test/mcp (left out: it is a remote connector with a secret"
+        ),
+        "{listed}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        later,
+        "nothing more is written"
+    );
+    let published = std::fs::read_to_string(public.join("mcp.json")).unwrap();
+    assert!(!published.contains("later"), "{published}");
+    gw.shutdown().await;
+}
+
+/// One secrets.env name cannot be one connector's own and another's stand-in: `/set` refuses
+/// the change that would make it so, and nothing is written.
+#[tokio::test]
+async fn set_refuses_to_make_a_secret_both_plain_and_a_stand_in() {
+    let home = home("broker-shared");
+    let path = home.join("zephyr.toml");
+    let connector = |name: &str| {
+        format!(
+            "\n[[mcp]]\nname = \"{name}\"\ncommand = \"{name}\"\nhosts = \"{name}.test\"\n\
+             env = {{ K = \"${{SHARED}}\" }}\n"
+        )
+    };
+    let text = format!(
+        "{}{}{}",
+        file_text(&home, ""),
+        connector("db"),
+        connector("api")
+    );
+    std::fs::write(&path, &text).unwrap();
+    let mut cfg = Config::load(&path).unwrap();
+    cfg.floor = true;
+    let gw = start(cfg);
+    gw.say("m1", "owner", "/set mcp.api.secrets plain").await;
+    let refused = gw.wait_reply("one name cannot be both").await;
+    assert!(
+        refused.contains(
+            "the secret SHARED would be held as it is by the connector api and as a stand-in by db"
+        ),
+        "{refused}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    gw.shutdown().await;
+}
+
+/// An upgrade with no remote connector to settle writes nothing into zephyr.toml: the file
+/// is the owner's, and an older zephyr must still read it.
+#[tokio::test]
+async fn an_upgrade_with_nothing_to_settle_leaves_the_config_as_it_is() {
+    let home = home("broker-remote-none");
+    let path = home.join("zephyr.toml");
+    let text = format!(
+        "# the owner's own comment\n{}\n[[mcp]]\nname = \"files\"\ncommand = \"fs-server\"\n",
+        file_text(&home, "")
+    );
+    std::fs::write(&path, &text).unwrap();
+    // A state.db from before the broker.
+    drop(Store::open(&home.join("state.db")).unwrap());
+    rusqlite::Connection::open(home.join("state.db"))
+        .unwrap()
+        .execute("DELETE FROM meta WHERE key = 'broker.born'", [])
+        .unwrap();
+    let mut cfg = Config::load(&path).unwrap();
+    cfg.floor = true;
+    cfg.tick = Duration::from_millis(200);
+    let gw = start(cfg);
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_reply("echo: ").await;
+    ticks(&home, 3).await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    assert!(
+        home.join("broker-settled").exists(),
+        "and it is done all the same"
+    );
+    gw.shutdown().await;
+}
+
+/// A first start, or a state.db made anew, has nothing of before to keep: a remote connector
+/// with a secret is not settled for the owner, nothing is written, and it is not published.
+#[tokio::test]
+async fn a_fresh_install_settles_no_remote_connector() {
+    let home = home("broker-remote-fresh");
+    let path = home.join("zephyr.toml");
+    let text = format!(
+        "{}\n[[mcp]]\nname = \"docs\"\nurl = \"https://docs.test/mcp\"\n\
+         headers = {{ Authorization = \"Bearer ${{DOCS_TOKEN}}\" }}\n",
+        file_text(&home, "")
+    );
+    std::fs::write(&path, &text).unwrap();
+    std::fs::write(home.join("secrets.env"), "DOCS_TOKEN=real-docs-token\n").unwrap();
+    let mut cfg = Config::load(&path).unwrap();
+    cfg.floor = true;
+    cfg.tick = Duration::from_millis(200);
+    let gw = start(cfg);
+    gw.say("m1", "owner", "/mcp").await;
+    let listed = gw.wait_reply("- docs:").await;
+    assert!(
+        listed.contains("left out: it is a remote connector with a secret"),
+        "{listed}"
+    );
+    ticks(&home, 3).await;
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        text,
+        "nothing is written"
+    );
+    let public = home.with_file_name(format!(
+        "{}-public",
+        home.file_name().unwrap().to_string_lossy()
+    ));
+    let published = std::fs::read_to_string(public.join("mcp.json")).unwrap_or_default();
+    assert!(!published.contains("real-docs-token"), "{published}");
+    assert!(!gw
+        .replies()
+        .iter()
+        .any(|r| r.contains("Remote connectors keep")));
+    gw.shutdown().await;
+}
+
+/// `/mcp ok` from a channel that is not strong (Discord) approves no draft that carries a
+/// secret: the draft decides where the secret goes.
+#[tokio::test]
+async fn a_draft_with_a_secret_is_not_approved_from_discord() {
+    let home = home("broker-draft-weak");
+    let path = home.join("zephyr.toml");
+    let text = format!(
+        "{}\n[[mcp]]\nname = \"docs\"\nurl = \"https://docs.test/mcp\"\nsecrets = \"surrogate\"\n\
+         headers = {{ Authorization = \"Bearer ${{DOCS_TOKEN}}\" }}\n",
+        file_text(&home, "").replace(
+            "chat = [\"owner\"]",
+            "chat = [\"owner\"]\ndiscord = [\"downer\"]"
+        )
+    );
+    std::fs::write(&path, &text).unwrap();
+    std::fs::write(home.join("secrets.env"), "DOCS_TOKEN=real-docs-token\n").unwrap();
+    let drafts = home.join("connectors/drafts");
+    std::fs::create_dir_all(&drafts).unwrap();
+    let mut cfg = Config::load(&path).unwrap();
+    cfg.floor = true;
+    let gw = start(cfg);
+    let mut asked = 0;
+    for draft in [
+        // The attacker's host; a header that is echoed or logged.
+        r#"{"url": "https://attacker.test/mcp", "headers": {"Authorization": "Bearer ${DOCS_TOKEN}"}}"#,
+        r#"{"url": "https://docs.test/mcp", "headers": {"User-Agent": "${DOCS_TOKEN}"}}"#,
+    ] {
+        std::fs::write(drafts.join("docs.json"), draft).unwrap();
+        // The first `/mcp ok` of a draft the owner has not been shown shows it; the next decides.
+        for _ in 0..2 {
+            asked += 1;
+            gw.say_on("discord", &format!("d{asked}"), "downer", "/mcp ok docs")
+                .await;
+        }
+        let replies = gw.wait_replies_on("discord", asked).await;
+        let last = replies.last().unwrap();
+        assert!(
+            last.contains("connector docs carries a secret (DOCS_TOKEN)")
+                && last.contains("approve it from a strong channel"),
+            "{replies:?}"
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    assert!(drafts.join("docs.json").exists());
+    gw.shutdown().await;
+}
+
+/// Under the network floor a command gets a token's stand-in (DESIGN §4.21), never its value.
+fn brokered(home: &Path) -> Config {
+    let mut cfg = config(home);
+    cfg.floor = true;
+    cfg.tick = Duration::from_millis(200);
+    cfg
+}
+
+#[tokio::test]
+async fn an_exec_with_a_bound_token_runs_on_its_surrogate() {
+    let home = home("vault-surrogate");
+    let vault = VAULT.replace(
+        "programs = []",
+        "programs = [\"printenv\"]\nhosts = [\"api.github.com:443\"]",
+    );
+    std::fs::write(home.join("vault.toml"), vault).unwrap();
+    let gw = start(brokered(&home));
+    let exec = r#"[call exec {"command": "printenv GH_TOKEN", "secrets": ["GH_TOKEN"]}]"#;
+    gw.say("m1", "owner", exec).await;
+    let reply = gw.wait_replies(1).await[0].clone();
+    assert!(
+        reply.contains("\nexec: exited 0\n[vault:GH_TOKEN]"),
+        "{reply}"
+    );
+    // What the command held, before scrubbing: the stand-in.
+    let log = std::fs::read_to_string(home.join(".procs/1.log")).unwrap();
+    assert!(log.starts_with("zsur_") && log.trim().len() == 45, "{log}");
+    assert!(!log.contains("ghp_vaulttoken42"));
+    let session = main_session(&home);
+    assert!(!session.contains("zsur_") && !session.contains("ghp_vaulttoken42"));
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_token_bound_to_nothing_is_not_run_until_the_owner_binds_it() {
+    let home = home("vault-unbound");
+    let vault = VAULT.replace("programs = []", "programs = [\"printenv\"]");
+    std::fs::write(home.join("vault.toml"), vault).unwrap();
+    let gw = start(brokered(&home));
+    let exec = r#"[call exec {"command": "printenv GH_TOKEN", "secrets": ["GH_TOKEN"]}]"#;
+    gw.say("m1", "owner", exec).await;
+    let reply = gw.wait_reply("exec: not run").await;
+    assert!(
+        reply.contains(
+            "\nexec: not run: the token GH_TOKEN is bound to no host; ask the owner with vault bind"
+        ),
+        "{reply}"
+    );
+    assert_eq!(
+        proc_status(&home, "exited") + proc_status(&home, "running"),
+        0
+    );
+    // The upgrade's notice, once there is an owner to tell.
+    let told = gw
+        .wait_reply("[zephyr] vault tokens and connector secrets now go")
+        .await;
+    assert!(told.contains("\n/vault bind GH_TOKEN HOST..\n"), "{told}");
+    assert!(
+        told.ends_with("To hand one out as before: /vault raw NAME on."),
+        "{told}"
+    );
+    // The agent may ask; a wildcard is not asked at all.
+    let bad = r#"[call vault {"action": "bind", "name": "GH_TOKEN", "hosts": ["*.github.com"]}]"#;
+    let bind = r#"[call vault {"action": "bind", "name": "GH_TOKEN", "hosts": ["api.github.com", "github.com"]}]"#;
+    gw.say("m2", "owner", &format!("{bad} {bind}")).await;
+    let asked = gw.wait_reply("[zephyr] the agent asks to send").await;
+    assert_eq!(
+        asked,
+        "[zephyr] the agent asks to send the token GH_TOKEN to api.github.com, github.com (#1); \
+         /ok 1 allows it from now on, /no 1 drops it"
+    );
+    let answer = gw.wait_reply("vault: not bound").await;
+    assert!(answer.contains("\nvault: not asked: "), "{answer}");
+    assert!(
+        answer.contains("\nvault: not bound: sending GH_TOKEN"),
+        "{answer}"
+    );
+    let saved = std::fs::read_to_string(home.join("vault.toml")).unwrap();
+    assert!(!saved.contains("hosts"), "{saved}");
+    gw.say("m3", "owner", "/ok 1").await;
+    let bound = gw.wait_reply("GH_TOKEN is now sent only to").await;
+    assert!(
+        bound.ends_with(
+            "[zephyr] GH_TOKEN is now sent only to api.github.com, github.com\n\
+             api.github.com is now decrypted by zephyr for every program the agent runs\n\
+             github.com is now decrypted by zephyr for every program the agent runs"
+        ),
+        "{bound}"
+    );
+    assert_eq!(
+        last_logged(&home, "vault.GH_TOKEN.hosts"),
+        (
+            Some(String::new()),
+            Some("api.github.com:443, github.com:443".into()),
+            "owner".into()
+        )
+    );
+    gw.say("m4", "owner", exec).await;
+    let ran = gw.wait_reply("exec: exited 0").await;
+    assert!(ran.contains("\nexec: exited 0\n[vault:GH_TOKEN]"), "{ran}");
+    gw.shutdown().await;
+
+    // The notice is not sent again by a later start.
+    let gw = start(brokered(&home));
+    gw.say("m5", "owner", "/vault unbind GH_TOKEN").await;
+    gw.wait_reply("bound to no host now").await;
+    gw.say("m6", "owner", "hi").await;
+    gw.wait_reply("echo: ").await;
+    // A few ticks later there is still none.
+    ticks(&home, 3).await;
+    let replies = gw.replies();
+    assert!(
+        !replies
+            .iter()
+            .any(|r| r.contains("vault tokens and connector secrets now go")),
+        "{replies:?}"
+    );
+    gw.shutdown().await;
+}
+
+/// DESIGN §4.21: where a token goes is loosened only from a strong channel, as the connectors'
+/// `hosts` are: typed, or as the `/ok` of the agent's proposal. Taking it back works anywhere.
+#[tokio::test]
+async fn a_tokens_binding_is_loosened_only_from_a_strong_channel() {
+    let home = home("vault-strong");
+    let vault = VAULT.replace("programs = []", "programs = [\"printenv\"]");
+    std::fs::write(home.join("vault.toml"), vault).unwrap();
+    let gw = start(brokered(&home));
+    let saved = || std::fs::read_to_string(home.join("vault.toml")).unwrap();
+    // Discord is an owner's channel, and not a strong one.
+    for (id, loosening) in [
+        ("d1", "/vault bind GH_TOKEN api.github.com"),
+        ("d2", "/vault raw GH_TOKEN on"),
+        ("d3", "/vault url GH_TOKEN on"),
+    ] {
+        gw.say_on("discord", id, "downer", loosening).await;
+    }
+    let refused = gw.wait_replies_on("discord", 3).await;
+    for reply in &refused {
+        assert!(reply.ends_with("needs a strong channel"), "{refused:?}");
+    }
+    assert!(
+        !saved().contains("hosts") && !saved().contains("raw"),
+        "{}",
+        saved()
+    );
+    // The agent's proposal waits for a strong channel too.
+    let bind =
+        r#"[call vault {"action": "bind", "name": "GH_TOKEN", "hosts": ["api.github.com"]}]"#;
+    gw.say("m1", "owner", bind).await;
+    gw.wait_reply("[zephyr] the agent asks to send").await;
+    gw.say_on("discord", "d4", "downer", "/ok 1").await;
+    let waits = gw.wait_replies_on("discord", 4).await;
+    assert_eq!(
+        waits[3],
+        "[zephyr] #1 sends a vault token to more hosts: approve it from tui or chat or passkey"
+    );
+    assert!(!saved().contains("hosts"), "{}", saved());
+    gw.say("m2", "owner", "/ok 1").await;
+    gw.wait_reply("GH_TOKEN is now sent only to api.github.com")
+        .await;
+    assert!(
+        saved().contains("hosts = [\"api.github.com:443\"]"),
+        "{}",
+        saved()
+    );
+    // Tightening, from anywhere.
+    gw.say_on("discord", "d5", "downer", "/vault unbind GH_TOKEN")
+        .await;
+    let replies = gw.wait_replies_on("discord", 5).await;
+    assert!(replies[4].contains("bound to no host now"), "{replies:?}");
+    assert!(!saved().contains("hosts"), "{}", saved());
+    gw.shutdown().await;
+}
+
+/// A vault that cannot be read says nothing about what is in it: the upgrade's notice is not
+/// marked told then, and comes once the vault reads again.
+#[tokio::test]
+async fn the_upgrade_notice_waits_for_a_vault_it_can_read() {
+    let home = home("vault-notice-later");
+    std::fs::write(home.join("vault.toml"), "[[token]\nbroken").unwrap();
+    let gw = start(brokered(&home));
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_reply("echo: ").await;
+    // A few ticks with an owner to tell and nothing readable.
+    ticks(&home, 3).await;
+    let vault = VAULT.replace("programs = []", "programs = [\"printenv\"]");
+    std::fs::write(home.join("vault.toml"), vault).unwrap();
+    let told = gw
+        .wait_reply("[zephyr] vault tokens and connector secrets now go")
+        .await;
+    assert!(told.contains("\n/vault bind GH_TOKEN HOST..\n"), "{told}");
     gw.shutdown().await;
 }
 

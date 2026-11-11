@@ -380,9 +380,12 @@ impl Form {
                 ("password", true, String::new()),
                 ("totp seed", true, String::new()),
             ],
-            crate::vault::Kind::Token => {
-                vec![("name", false, name), ("value", true, String::new())]
-            }
+            // A token's second known thing is where it is sent (DESIGN §4.21).
+            crate::vault::Kind::Token => vec![
+                ("name", false, name),
+                ("value", true, String::new()),
+                ("hosts", false, site),
+            ],
         };
         // The first field still to type.
         let at = fields.iter().position(|f| f.2.is_empty()).unwrap_or(0);
@@ -421,7 +424,12 @@ impl Form {
             "token" => crate::vault::Kind::Token,
             _ => crate::vault::Kind::Login,
         };
-        let mut form = Form::new(kind, [&e.name, &e.site, &e.username]);
+        let hosts: Vec<&str> = e.hosts.iter().map(|h| crate::vault::shown(h)).collect();
+        let second = match kind {
+            crate::vault::Kind::Token => hosts.join(" "),
+            crate::vault::Kind::Login => e.site.clone(),
+        };
+        let mut form = Form::new(kind, [&e.name, &second, &e.username]);
         form.editing = true;
         form.at = form.fields.iter().position(|f| f.1).unwrap_or(1);
         form
@@ -442,6 +450,11 @@ impl Form {
             password: self.get("password"),
             totp: self.get("totp seed"),
             value: self.get("value"),
+            // Exact hosts, space or comma separated; none keeps the ones saved.
+            hosts: (self.get("hosts").split([' ', ',']))
+                .filter(|h| !h.is_empty())
+                .map(String::from)
+                .collect(),
             ..Default::default()
         }
     }
@@ -1237,8 +1250,8 @@ fn vault_rows(o: &Overlay, p: &Palette) -> Vec<Row> {
     for e in entries {
         let note = match e.kind.as_str() {
             "token" => match e.programs.as_slice() {
-                [] => "token, no program allowed yet".to_string(),
-                progs => format!("token, allowed for {}", progs.join(", ")),
+                [] => format!("token, no program allowed yet; {}", e.sent()),
+                progs => format!("token, allowed for {}; {}", progs.join(", "), e.sent()),
             },
             _ => {
                 let user = match e.username.as_str() {
@@ -2038,7 +2051,7 @@ mod tests {
             let answered = match *group {
                 "Memory" => {
                     crate::memory::command(&dir, &dir, &text, true).is_some()
-                        || crate::drafts::command(&cfg, &text, true).is_some()
+                        || crate::drafts::command(&cfg, &text, true, true).is_some()
                         // A rule is a setting: the router's `set_setting` calls `memory::rule`.
                         || (text.strip_prefix("/rule "))
                             .is_some_and(|arg| crate::memory::rule(&dir, arg).is_ok())
@@ -2074,7 +2087,7 @@ mod tests {
                 username: "aiden".into(),
                 totp: true,
                 granted: true,
-                programs: vec![],
+                ..Default::default()
             },
             VaultEntry {
                 kind: "token".into(),
@@ -3188,6 +3201,19 @@ mod tests {
             (t.kind, t.fields[t.at].0),
             (crate::vault::Kind::Token, "value")
         );
+        // The hosts it is sent to are a field of the token's form, after the value.
+        let mut t = t;
+        t.at = t.fields.iter().position(|f| f.0 == "hosts").unwrap();
+        t.type_text("api.github.com, GitHub.com:8443");
+        assert!(!t.fields[t.at].1, "host names are not secret");
+        assert_eq!(t.entry().hosts, ["api.github.com", "GitHub.com:8443"]);
+        let saved = VaultEntry {
+            kind: "token".into(),
+            name: "GH_TOKEN".into(),
+            hosts: vec!["api.github.com:443".into()],
+            ..Default::default()
+        };
+        assert_eq!(Form::edit(&saved).get("hosts"), "api.github.com");
         assert!(Form::from_command("/vault add token GH_TOKEN ghp_pasted").is_none());
         assert!(Form::from_command("/vault rm x").is_none());
     }

@@ -25,7 +25,7 @@ pub const USAGE: &str = "usage: zephyr <command>   (zephyr --version: this CLI's
   mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. | list | rm NAME
   packages add NAME.. | rm NAME.. | list
   subagent list | add NAME [--model P/M] [--prompt TEXT] | edit NAME [--model P/M|default] [--prompt TEXT] | rm NAME
-  vault list | add login NAME --site URL [--user U] [--totp] | add token NAME | edit NAME | rm NAME | revoke NAME [PROGRAM]
+  vault list | add login NAME --site URL [--user U] [--totp] | add token NAME [--host HOST].. | edit NAME [--host HOST].. | rm NAME | revoke NAME [PROGRAM]
   facts list | add NAME --kind text|digits|email | rm NAME | allow NAME TARGET | disallow NAME TARGET
   config get KEY | set KEY VALUE   (a known setting goes through the daemon while it runs)
   chat | attach [--stock] | shell [bash|zsh] | pause | resume | reload
@@ -1452,18 +1452,39 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                 ["get", key] => {
                     println!(
                         "{}",
-                        conf::get(&doc, key).with_context(|| format!("{key} is not set"))?
+                        // A connector's rows are read from its `[[mcp]]` table, by name.
+                        crate::settings::read(&doc, key)
+                            .with_context(|| format!("{key} is not set"))?
                     );
                 }
                 ["set", key, value] => {
                     if crate::settings::find(key).is_none() {
                         eprintln!("warn: {key} is not a known setting; saved without checking");
                     }
-                    conf::set(&mut doc, key, value)?;
-                    // Refuse what the daemon would refuse (unknown keys, a bad time zone).
+                    let was = toml::from_str::<crate::config::Config>(&doc.to_string()).ok();
+                    // A connector's rows (`mcp.NAME.hosts`, `.secrets`, `.enabled`, a tool's
+                    // class) are in its `[[mcp]]` table, which only the registry finds by name.
+                    match crate::settings::find(key).filter(|_| key.starts_with("mcp.")) {
+                        Some(s) => {
+                            let parsed = crate::settings::parse(s, value)
+                                .map_err(|e| anyhow::anyhow!("{}", e.replace(s.key, key)))?;
+                            crate::settings::write(&mut doc, key, Some(&parsed))?;
+                        }
+                        None => conf::set(&mut doc, key, value)?,
+                    }
+                    // Refuse what the daemon would refuse (unknown keys, a bad time zone, one
+                    // secret held two ways).
                     toml::from_str::<crate::config::Config>(&doc.to_string())
                         .map_err(anyhow::Error::from)
-                        .and_then(|c| c.validate())
+                        .and_then(|c| {
+                            c.validate()?;
+                            // As the daemon's `/set`: no new pair of a secret held two ways.
+                            let made = match &was {
+                                Some(was) => crate::broker::creates_pair(was, &c),
+                                None => crate::broker::shared_notice(&c).map_or(Ok(()), Err),
+                            };
+                            made.map_err(anyhow::Error::msg)
+                        })
                         .with_context(|| {
                             format!("{key} = {value} would make the config invalid")
                         })?;

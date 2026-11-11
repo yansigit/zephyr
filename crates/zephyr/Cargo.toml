@@ -32,6 +32,12 @@ tokio-tungstenite = { version = "=0.21.0", default-features = false, features = 
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+# The token broker (DESIGN §4.21): its CA, and TLS on both legs of a decrypted host. rustls,
+# tokio-rustls and webpki-roots are already in the tree through reqwest.
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
 subtle = "2"
 url = "2"
 # Already in the tree (rustls, serenity): TOTP for vault logins (DESIGN §4.15) and the local
