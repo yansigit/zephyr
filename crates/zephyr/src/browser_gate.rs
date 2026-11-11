@@ -515,7 +515,7 @@ fn decide(args: &[String], env: &Env) -> (Next, Place) {
     let act = what(&argv.rest);
     let paced = paced(&argv.rest);
     // A navigation, and a click the gate lets through at once: its slot, then its place.
-    let paced_go = |paced, url: &dyn Fn() -> String| match pace(env, paced, url) {
+    let paced_go = |paced, url: &dyn Fn() -> String| match pace(env, paced, url, None) {
         Ok(()) => go(env, None),
         Err(text) => (Next::Refuse(text), None),
     };
@@ -554,6 +554,12 @@ fn decide(args: &[String], env: &Env) -> (Next, Place) {
         seen.title = page.title();
     }
     let first = Look { action, seen };
+    // What pacing would refuse is refused before the owner is asked to approve it.
+    if let (Some((_, count)), Some(site)) = (&paced, site(&url)) {
+        if let Err(text) = pace_check(env, &site, *count) {
+            return (Next::Refuse(text), None);
+        }
+    }
     let wait = match ask_gate(env, args, &request(action, &url, &first.seen)) {
         (Next::Exec, wait) => wait,
         (refused, _) => return (refused, None),
@@ -562,9 +568,11 @@ fn decide(args: &[String], env: &Env) -> (Next, Place) {
         Ok(wait) => wait,
         Err(refused) => return (refused, None),
     };
-    // Its slot before the page is read again, so what runs is checked as close to it as before.
-    if let Err(text) = pace(env, paced, || url.clone()) {
-        said(wait, false);
+    // Its slot before the page is read again, so what runs is checked as close to it as before;
+    // after a wait, one near enough that the report still reaches the gate in time.
+    let within = wait.as_ref().map(|_| PACE_AFTER_WAIT);
+    if let Err(text) = pace(env, paced, || url.clone(), within) {
+        say(wait, json!({"ran": false, "paced": true}));
         return (Next::Refuse(text), None);
     }
     // I4: up to 10 minutes went by; what the owner approved must still be what runs.
@@ -1176,13 +1184,43 @@ pub fn site(url: &str) -> Option<String> {
 /// How long the wrapper waits for the gate's slot before it runs unpaced.
 const PACE_ASK: Duration = Duration::from_secs(5);
 
+/// The furthest slot a click the owner let go after a wait takes: its sleep, then the page read
+/// again, must leave its report inside the gate's `REPORT_WAIT`.
+const PACE_AFTER_WAIT: Duration = Duration::from_secs(30);
+
+/// The most questions [`unchanged`] asks of the page: its address, a scoped snapshot and the
+/// full one after it, two scripts and the total.
+#[cfg(test)]
+const REREADS: u32 = 6;
+
+/// Whether the gate would refuse the command's slot on `site` (a batch, or a queue too long),
+/// reserving nothing. No gate answering refuses nothing.
+fn pace_check(env: &Env, site: &str, count: u32) -> Result<(), String> {
+    let Some(socket) = env.socket.as_ref() else {
+        return Ok(());
+    };
+    let req = json!({"v": 1, "pace": site, "count": count, "check": true, "session": env.session});
+    match zephyr_policy::gate_client::ask(socket, &req, PACE_ASK) {
+        Ok(a) if a["verdict"] == "deny" => Err(refusal(&a)),
+        _ => Ok(()),
+    }
+}
+
+/// The text of the gate's pacing refusal `a`.
+fn refusal(a: &Value) -> String {
+    let text = a["text"].as_str().filter(|t| !t.trim().is_empty());
+    text.unwrap_or("not run: the gate did not allow it").into()
+}
+
 /// Waits out the command's slot on its site (`current` reads the page's address when it is
-/// the page's), asked of the gate, on a connection closed before the sleep. `Err` is the gate's
-/// refusal. No gate answering runs it unpaced: pacing is a courtesy to sites, not a guard.
+/// the page's), asked of the gate, on a connection closed before the sleep; a slot further off
+/// than `within` is refused. `Err` is the gate's refusal. No gate answering runs it unpaced:
+/// pacing is a courtesy to sites, not a guard.
 fn pace(
     env: &Env,
     paced: Option<(Paced, u32)>,
     current: impl FnOnce() -> String,
+    within: Option<Duration>,
 ) -> Result<(), String> {
     let Some((at, count)) = paced else {
         return Ok(());
@@ -1194,17 +1232,17 @@ fn pace(
     let (Some(site), Some(socket)) = (site(&url), env.socket.as_ref()) else {
         return Ok(());
     };
-    let req = json!({"v": 1, "pace": site, "count": count, "session": env.session});
+    let mut req = json!({"v": 1, "pace": site, "count": count, "session": env.session});
+    if let Some(within) = within {
+        req["max_ms"] = json!(within.as_millis() as u64);
+    }
     match zephyr_policy::gate_client::ask(socket, &req, PACE_ASK) {
         Ok(a) if a["verdict"] == "allow" => {
             let wait = Duration::from_millis(a["wait_ms"].as_u64().unwrap_or(0));
-            std::thread::sleep(wait.min(gate::PACE_MAX_WAIT));
+            std::thread::sleep(wait.min(within.unwrap_or(gate::PACE_MAX_WAIT)));
             Ok(())
         }
-        Ok(a) if a["verdict"] == "deny" => {
-            let text = a["text"].as_str().filter(|t| !t.trim().is_empty());
-            Err(text.unwrap_or("not run: the gate did not allow it").into())
-        }
+        Ok(a) if a["verdict"] == "deny" => Err(refusal(&a)),
         _ => Ok(()),
     }
 }
@@ -2805,6 +2843,68 @@ cat "$d/$f.json"
         // Not a site: nothing asked.
         assert_eq!(t.run(&["open", "about:blank"]), Next::Exec);
         assert!(gate.try_recv().is_err());
+    }
+
+    const QUEUED: &str =
+        "zephyr: too many browser actions are queued for example.com; wait, then try again";
+
+    /// A click pacing would refuse is refused before the gate is asked about it, so the owner
+    /// never approves what could not run.
+    #[test]
+    fn a_click_pacing_would_refuse_never_reaches_the_owner() {
+        let t = T::new("bg-pace-first");
+        t.page(MAIL, COMPOSE, "");
+        let gate = t.gate_all();
+        let waiting = t.spawn(&["click", "@e3"]);
+        let (req, mut conn) = asked(&gate);
+        let check = json!({"v": 1, "pace": "example.com", "count": 1, "check": true,
+                           "session": "main"});
+        assert_eq!(req, check);
+        answer(&mut conn, json!({"verdict": "deny", "text": QUEUED}));
+        assert_eq!(waiting.join().unwrap(), Next::Refuse(QUEUED.into()));
+        assert!(gate.try_recv().is_err(), "the owner was asked");
+        assert!(!t.clicked());
+    }
+
+    /// After the owner's `allow` the slot is asked for with a ceiling that leaves the report in
+    /// the gate's time, and a refusal then is told to the gate as pacing's, not a page that
+    /// changed.
+    #[test]
+    fn a_pacing_refusal_after_the_owners_allow_is_told_as_pacing() {
+        let t = T::new("bg-pace-after");
+        t.page(MAIL, COMPOSE, "");
+        let gate = t.gate_all();
+        let waiting = t.spawn(&["click", "@e3"]);
+        let (req, mut conn) = asked(&gate);
+        assert_eq!(req["check"], true, "{req}");
+        answer(&mut conn, json!({"verdict": "allow"}));
+        let (req, mut conn) = asked(&gate);
+        assert_eq!(req["browser"]["name"], "Send", "{req}");
+        answer(&mut conn, json!({"verdict": "allow", "id": 7}));
+        let (req, mut slot) = asked(&gate);
+        let ceiling = PACE_AFTER_WAIT.as_millis() as u64;
+        let want = json!({"v": 1, "pace": "example.com", "count": 1, "max_ms": ceiling,
+                          "session": "main"});
+        assert_eq!(req, want);
+        answer(&mut slot, json!({"verdict": "deny", "text": QUEUED}));
+        let mut said = String::new();
+        BufReader::new(conn.try_clone().unwrap())
+            .read_line(&mut said)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&said).unwrap(),
+            json!({"ran": false, "paced": true})
+        );
+        assert_eq!(waiting.join().unwrap(), Next::Refuse(QUEUED.into()));
+        assert!(!t.clicked());
+    }
+
+    /// The slot asked for after the owner's `allow`, at its longest, and the page read again
+    /// with every read at its longest, still leave the wrapper's report inside the gate's wait.
+    #[test]
+    fn a_paced_sleep_after_an_allow_leaves_the_report_in_time() {
+        let worst = PACE_ASK + PACE_AFTER_WAIT + REREADS * FACT_WAIT;
+        assert!(worst < gate::REPORT_WAIT, "{worst:?}");
     }
 
     #[test]

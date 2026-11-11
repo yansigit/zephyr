@@ -999,7 +999,7 @@ const MAX_REQUEST: usize = 1 << 20;
 const STEER_WAIT: Duration = Duration::from_secs(2);
 /// How long a wrapper the owner let go has to say whether it ran (M2): its reads of the page
 /// again (I4) take a few of its 20 s questions at most.
-const REPORT_WAIT: Duration = Duration::from_secs(180);
+pub const REPORT_WAIT: Duration = Duration::from_secs(180);
 /// The longest report read: `{"ran": true}`.
 const MAX_REPORT: u64 = 256;
 
@@ -1046,6 +1046,14 @@ struct Wire {
     pace: Option<String>,
     #[serde(default)]
     count: Option<u32>,
+    /// With `pace`: only whether the slot would be refused, reserving nothing (asked before the
+    /// owner is).
+    #[serde(default)]
+    check: bool,
+    /// With `pace`: the furthest slot taken (after the owner's `allow`, so the wrapper's report
+    /// arrives inside [`REPORT_WAIT`]).
+    #[serde(default)]
+    max_ms: Option<u64>,
     #[serde(default)]
     args: Value,
     #[serde(default)]
@@ -1215,15 +1223,43 @@ impl Slots {
 }
 
 impl Pace {
-    /// Reserves `site`'s next slot for `count` actions: the wait until it, or the refusal. The
-    /// slot after it is `pace × (1 + r)` later, `r` in [0, 0.5). A pace of 0 stores nothing.
+    /// Reserves `site`'s next slot for `count` actions: the wait until it, or the refusal (a
+    /// slot further off than `max`, at most [`PACE_MAX_WAIT`], too). The slot after it is
+    /// `pace × (1 + r)` later, `r` in [0, 0.5). A pace of 0 stores nothing.
     pub fn reserve(
         &self,
         site: &str,
         count: u32,
         pace: Duration,
+        max: Duration,
         now: std::time::Instant,
         r: f64,
+    ) -> Result<Duration, String> {
+        self.slot(site, count, pace, max, now, Some(r))
+    }
+
+    /// What [`Pace::reserve`] would refuse, reserving nothing: asked before the owner is, so
+    /// they never approve a click pacing would refuse. An empty `site` (not read yet) is
+    /// checked for the batch only.
+    pub fn check(
+        &self,
+        site: &str,
+        count: u32,
+        pace: Duration,
+        now: std::time::Instant,
+    ) -> Result<(), String> {
+        self.slot(site, count, pace, PACE_MAX_WAIT, now, None)
+            .map(|_| ())
+    }
+
+    fn slot(
+        &self,
+        site: &str,
+        count: u32,
+        pace: Duration,
+        max: Duration,
+        now: std::time::Instant,
+        reserve: Option<f64>,
     ) -> Result<Duration, String> {
         if pace.is_zero() {
             return Ok(Duration::ZERO);
@@ -1231,16 +1267,21 @@ impl Pace {
         if count > 1 {
             return Err(PACE_BATCH.into());
         }
+        if site.is_empty() {
+            return Ok(Duration::ZERO);
+        }
         let mut slots = self.0.lock().unwrap_or_else(|e| e.into_inner());
         slots.trim(site, now);
         let slot = slots.next.get(site).map_or(now, |at| (*at).max(now));
         let wait = slot - now;
-        if wait > PACE_MAX_WAIT {
+        if wait > max.min(PACE_MAX_WAIT) {
             return Err(format!(
                 "zephyr: too many browser actions are queued for {site}; wait, then try again"
             ));
         }
-        slots.set(site, slot + pace.mul_f64(1.0 + r));
+        if let Some(r) = reserve {
+            slots.set(site, slot + pace.mul_f64(1.0 + r));
+        }
         Ok(wait)
     }
 }
@@ -1301,23 +1342,28 @@ impl Conn {
             v: 1,
             pace: Some(site),
             count,
+            check,
+            max_ms,
             ..
         }) = serde_json::from_slice::<Wire>(&line)
         {
             // Answered at once and not audited: pacing decides nothing about what may run.
             let pace = Duration::from_millis(self.cfg.pace_ms());
             let now = std::time::Instant::now();
-            let named = !site.is_empty() && site.len() <= 253 && line.len() <= MAX_REQUEST;
-            let answer = match named {
-                false => Err("not run: the gate could not read the request".to_string()),
-                true => (self.pace).reserve(&site, count.unwrap_or(1), pace, now, pace_draw()),
-            };
-            let answer = match answer {
-                Ok(wait) => {
-                    serde_json::json!({"verdict": "allow", "wait_ms": wait.as_millis() as u64})
+            let count = count.unwrap_or(1);
+            let named = (check || !site.is_empty()) && site.len() <= 253;
+            let answer = match (named && line.len() <= MAX_REQUEST, check) {
+                (false, _) => Err("not run: the gate could not read the request".to_string()),
+                (true, true) => (self.pace.check(&site, count, pace, now))
+                    .map(|()| serde_json::json!({"verdict": "allow"})),
+                (true, false) => {
+                    let max = max_ms.map_or(PACE_MAX_WAIT, Duration::from_millis);
+                    let wait = (self.pace).reserve(&site, count, pace, max, now, pace_draw());
+                    wait.map(|w| serde_json::json!({"verdict": "allow", "wait_ms": w.as_millis() as u64}))
                 }
-                Err(text) => serde_json::json!({"verdict": "deny", "text": text}),
             };
+            let answer =
+                answer.unwrap_or_else(|text| serde_json::json!({"verdict": "deny", "text": text}));
             let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
             return;
         }
@@ -1570,6 +1616,12 @@ fn ending(said: Option<Option<Value>>) -> Ending {
         Some(Some(v)) if v["ran"] == true => ("done", "the browser went on", None),
         // The wrapper found the owner holding the desktop after the `allow`.
         Some(Some(v)) if v["ran"] == false && v["held"] == true => HELD_ENDING,
+        // Pacing refused its slot after the `allow` (DESIGN §4.24).
+        Some(Some(v)) if v["ran"] == false && v["paced"] == true => (
+            "failed",
+            "not run: too many browser actions were queued for its site (pacing)",
+            Some(" did not run: too many browser actions were queued for its site (pacing)"),
+        ),
         Some(Some(v)) if v["ran"] == false => (
             "failed",
             "not run: the page changed while the owner decided",
@@ -4079,6 +4131,16 @@ mod tests {
                 ("failed", "not run: the owner had the desktop"),
                 Some("did not run: you had the desktop"),
             ),
+            // Pacing refused its slot after the `allow`: not a page that changed either.
+            (
+                5,
+                Some("{\"ran\": false, \"paced\": true}"),
+                (
+                    "failed",
+                    "not run: too many browser actions were queued for its site (pacing)",
+                ),
+                Some("did not run: too many browser actions were queued for its site (pacing)"),
+            ),
         ] {
             let req = json!({"v": 1, "session": "task-1", "tool": "browser",
                 "args": {"argv": ["click", "@e3"]},
@@ -4236,7 +4298,9 @@ mod tests {
         let now = std::time::Instant::now();
         let mut last = None;
         for r in [0.0, 0.49, 0.25, 0.0, 0.4999] {
-            let wait = pace.reserve("example.com", 1, SEC, now, r).unwrap();
+            let wait = pace
+                .reserve("example.com", 1, SEC, PACE_MAX_WAIT, now, r)
+                .unwrap();
             if let Some(last) = last {
                 let gap: Duration = wait - last;
                 assert!(gap >= SEC && gap < SEC.mul_f64(1.5), "{gap:?}");
@@ -4244,7 +4308,7 @@ mod tests {
             last = Some(wait);
         }
         assert_eq!(
-            pace.reserve("example.com", 1, SEC, now, 0.0),
+            pace.reserve("example.com", 1, SEC, PACE_MAX_WAIT, now, 0.0),
             Ok(last.unwrap() + SEC.mul_f64(1.4999))
         );
     }
@@ -4254,18 +4318,21 @@ mod tests {
         let pace = Pace::default();
         let now = std::time::Instant::now();
         assert_eq!(
-            pace.reserve("example.com", 1, SEC, now, 0.0),
+            pace.reserve("example.com", 1, SEC, PACE_MAX_WAIT, now, 0.0),
             Ok(Duration::ZERO)
         );
-        assert_eq!(pace.reserve("example.com", 1, SEC, now, 0.0), Ok(SEC));
         assert_eq!(
-            pace.reserve("other.test", 1, SEC, now, 0.0),
+            pace.reserve("example.com", 1, SEC, PACE_MAX_WAIT, now, 0.0),
+            Ok(SEC)
+        );
+        assert_eq!(
+            pace.reserve("other.test", 1, SEC, PACE_MAX_WAIT, now, 0.0),
             Ok(Duration::ZERO)
         );
         // A slot already passed is now.
         let later = now + 5 * SEC;
         assert_eq!(
-            pace.reserve("example.com", 1, SEC, later, 0.0),
+            pace.reserve("example.com", 1, SEC, PACE_MAX_WAIT, later, 0.0),
             Ok(Duration::ZERO)
         );
     }
@@ -4276,10 +4343,16 @@ mod tests {
         let now = std::time::Instant::now();
         let batch = "not run: with browser pacing on, a batch takes at most one navigation or \
                      click; run the others as separate commands";
-        assert_eq!(pace.reserve("a.test", 2, SEC, now, 0.0), Err(batch.into()));
-        assert_eq!(pace.reserve("a.test", 1, SEC, now, 0.0), Ok(Duration::ZERO));
+        assert_eq!(
+            pace.reserve("a.test", 2, SEC, PACE_MAX_WAIT, now, 0.0),
+            Err(batch.into())
+        );
+        assert_eq!(
+            pace.reserve("a.test", 1, SEC, PACE_MAX_WAIT, now, 0.0),
+            Ok(Duration::ZERO)
+        );
         let minute = 60 * SEC;
-        let b = |at| pace.reserve("b.test", 1, minute, at, 0.0);
+        let b = |at| pace.reserve("b.test", 1, minute, PACE_MAX_WAIT, at, 0.0);
         assert_eq!(b(now), Ok(Duration::ZERO));
         assert_eq!(b(now), Ok(minute));
         assert_eq!(b(now), Ok(PACE_MAX_WAIT), "two minutes is still taken");
@@ -4290,28 +4363,60 @@ mod tests {
         assert_eq!(b(now + minute), Ok(PACE_MAX_WAIT));
     }
 
+    /// A check (asked before the owner is) refuses what a reservation would and reserves
+    /// nothing; a reservation with a ceiling (after the owner's `allow`) refuses a slot past it
+    /// and reserves nothing either.
+    #[test]
+    fn a_check_reserves_nothing_and_a_ceiling_refuses_past_it() {
+        let pace = Pace::default();
+        let now = std::time::Instant::now();
+        let batch = Err(PACE_BATCH.to_string());
+        assert_eq!(pace.check("a.test", 2, SEC, now), batch);
+        assert_eq!(pace.check("", 2, SEC, now), batch, "the site not read yet");
+        assert_eq!(pace.check("a.test", 2, Duration::ZERO, now), Ok(()));
+        for _ in 0..3 {
+            assert_eq!(pace.check("a.test", 1, SEC, now), Ok(()));
+        }
+        assert!(pace.0.lock().unwrap().next.is_empty());
+        let minute = 60 * SEC;
+        let b = |max| pace.reserve("b.test", 1, minute, max, now, 0.0);
+        assert_eq!(b(PACE_MAX_WAIT), Ok(Duration::ZERO));
+        let queued = "zephyr: too many browser actions are queued for b.test; wait, then try again";
+        assert_eq!(b(30 * SEC), Err(queued.into()));
+        assert_eq!(b(PACE_MAX_WAIT), Ok(minute), "the refusal reserved nothing");
+        assert_eq!(pace.check("b.test", 1, minute, now), Ok(()));
+        assert_eq!(b(PACE_MAX_WAIT), Ok(PACE_MAX_WAIT));
+        assert_eq!(pace.check("b.test", 1, minute, now), Err(queued.into()));
+    }
+
     #[test]
     fn pace_zero_reserves_nothing() {
         let pace = Pace::default();
         let now = std::time::Instant::now();
         for count in [1, 1, 2, 5] {
             assert_eq!(
-                pace.reserve("a.test", count, Duration::ZERO, now, 0.3),
+                pace.reserve("a.test", count, Duration::ZERO, PACE_MAX_WAIT, now, 0.3),
                 Ok(Duration::ZERO)
             );
         }
         assert!(pace.0.lock().unwrap().next.is_empty());
-        assert_eq!(pace.reserve("a.test", 1, SEC, now, 0.0), Ok(Duration::ZERO));
+        assert_eq!(
+            pace.reserve("a.test", 1, SEC, PACE_MAX_WAIT, now, 0.0),
+            Ok(Duration::ZERO)
+        );
     }
 
     #[test]
     fn passed_entries_are_dropped() {
         let pace = Pace::default();
         let now = std::time::Instant::now();
-        pace.reserve("a.test", 1, SEC, now, 0.0).unwrap();
-        pace.reserve("b.test", 1, SEC, now, 0.0).unwrap();
+        pace.reserve("a.test", 1, SEC, PACE_MAX_WAIT, now, 0.0)
+            .unwrap();
+        pace.reserve("b.test", 1, SEC, PACE_MAX_WAIT, now, 0.0)
+            .unwrap();
         assert_eq!(pace.0.lock().unwrap().next.len(), 2);
-        pace.reserve("c.test", 1, SEC, now + 2 * SEC, 0.0).unwrap();
+        pace.reserve("c.test", 1, SEC, PACE_MAX_WAIT, now + 2 * SEC, 0.0)
+            .unwrap();
         let slots = pace.0.lock().unwrap();
         let sites: Vec<&String> = slots.next.keys().collect();
         assert_eq!(sites, ["c.test"]);
@@ -4326,7 +4431,7 @@ mod tests {
         let now = std::time::Instant::now();
         for i in 0..PACE_SITES + 500 {
             let at = now + Duration::from_millis(i as u64);
-            let wait = pace.reserve(&format!("s{i}.test"), 1, 60 * SEC, at, 0.0);
+            let wait = pace.reserve(&format!("s{i}.test"), 1, 60 * SEC, PACE_MAX_WAIT, at, 0.0);
             assert_eq!(wait, Ok(Duration::ZERO));
             let slots = pace.0.lock().unwrap();
             assert!(slots.next.len() <= PACE_SITES, "{}", slots.next.len());
@@ -4339,7 +4444,8 @@ mod tests {
         assert!(!slots.next.contains_key("s499.test"), "the soonest stayed");
         drop(slots);
         // A site already there takes no other's place.
-        pace.reserve(&last, 1, SEC, now, 0.0).unwrap();
+        pace.reserve(&last, 1, SEC, PACE_MAX_WAIT, now, 0.0)
+            .unwrap();
         assert!(pace.0.lock().unwrap().next.contains_key("s500.test"));
     }
 
@@ -4408,6 +4514,24 @@ mod tests {
             .starts_with("not run: with browser pacing on"));
         let empty = ask(&socket, &req("", 1)).await.unwrap();
         assert_eq!(empty["verdict"], "deny", "{empty}");
+        // A check, before the owner is asked: what a reservation would refuse, reserving nothing.
+        let mut check = req("example.com", 1);
+        check["check"] = json!(true);
+        assert_eq!(
+            ask(&socket, &check).await.unwrap(),
+            json!({"verdict": "allow"})
+        );
+        check["count"] = json!(2);
+        assert_eq!(ask(&socket, &check).await.unwrap()["verdict"], "deny");
+        // After the owner's `allow`: a slot past the ceiling is refused.
+        let mut within = req("example.com", 1);
+        within["max_ms"] = json!(1000);
+        let late = ask(&socket, &within).await.unwrap();
+        assert_eq!(late["verdict"], "deny", "{late}");
+        assert!(late["text"]
+            .as_str()
+            .unwrap()
+            .contains("too many browser actions"));
         assert!(outcomes(&h.store).is_empty(), "{:?}", outcomes(&h.store));
         let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
     }
