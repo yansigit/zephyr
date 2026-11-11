@@ -1432,29 +1432,22 @@ mod tests {
         let home = home();
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
         let hook = dir(&home).join(".git/hooks/pre-commit");
-        std::fs::write(&hook, "#!/bin/sh\nsleep 30\n").unwrap();
+        let ran = home.join("hook-ran");
+        let script = format!("#!/bin/sh\ntouch {ran:?}\nexit 1\n");
+        std::fs::write(&hook, script).unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(dir(&home).join(USER), "name: Aiden\n").unwrap();
-        let start = std::time::Instant::now();
         settle(&home);
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "{:?}",
-            start.elapsed()
-        );
+        // Run, it would have left its mark and refused the commit.
+        assert!(!ran.exists(), "the agent's hook ran");
         assert_eq!(commits(&home).len(), 2);
 
         // A clean filter is the repo's own config, so it runs; the call is cut off instead.
         git(&dir(&home), &["config", "filter.slow.clean", "sleep 30"]).unwrap();
         std::fs::write(dir(&home).join(".gitattributes"), "* filter=slow\n").unwrap();
         std::fs::write(dir(&home).join(MEMORY), "likes tea\n").unwrap();
-        let start = std::time::Instant::now();
-        assert!(commit_if_changed(&home, &state(&home), &Origin::Task(1), false).is_err());
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "{:?}",
-            start.elapsed()
-        );
+        let err = commit_if_changed(&home, &state(&home), &Origin::Task(1), false).unwrap_err();
+        assert!(format!("{err:#}").contains("no answer in"), "{err:#}");
     }
 
     #[test]

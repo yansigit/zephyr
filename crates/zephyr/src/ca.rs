@@ -416,15 +416,8 @@ pub(crate) mod tests {
         let update = state.join("update");
         let ran = state.join("ran");
         let script = format!("#!/bin/sh\necho \"$@ $PATH\" > {}\n", ran.display());
-        std::fs::write(&update, script).unwrap();
-        std::fs::set_permissions(&update, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // A script written a moment ago can be "busy" while another test's fork holds it open.
-        let publish = || loop {
-            match publish(&state, &public, &system, &update) {
-                Err(e) if format!("{e:#}").contains("Text file busy") => continue,
-                done => break done,
-            }
-        };
+        crate::test_exe(&update, &script);
+        let publish = || publish(&state, &public, &system, &update);
         publish().unwrap();
         let pem = pem(&state).unwrap();
         assert_eq!(std::fs::read_to_string(public.join("ca.pem")).unwrap(), pem);

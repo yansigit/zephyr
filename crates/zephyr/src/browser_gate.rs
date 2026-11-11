@@ -2286,11 +2286,9 @@ cat "$d/$f.json"
 
     impl T {
         fn new(name: &str) -> T {
-            use std::os::unix::fs::PermissionsExt;
             let dir = crate::test_dir(name);
             let real = dir.join("real-agent-browser");
-            std::fs::write(&real, FAKE).unwrap();
-            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_exe(&real, FAKE);
             let env = Env {
                 real,
                 socket: Some(dir.join("gate.sock")),
@@ -2623,9 +2621,7 @@ cat "$d/$f.json"
         let slow = "#!/bin/sh\nd=$(dirname \"$0\")\n\
                     case \" $* \" in *\" get url \"*) cat \"$d/url.pipe\"; exit 0 ;; esac\n\
                     exec \"$d/fake\" \"$@\"\n";
-        std::fs::write(&t.env.real, slow).unwrap();
-        let mode = std::os::unix::fs::PermissionsExt::from_mode(0o755);
-        std::fs::set_permissions(&t.env.real, mode).unwrap();
+        crate::test_exe(&t.env.real, slow);
         let path = std::ffi::CString::new(url.to_str().unwrap()).unwrap();
         // SAFETY: a plain syscall with a path this test owns.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);

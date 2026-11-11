@@ -1766,6 +1766,17 @@ impl Store {
         rows.collect()
     }
 
+    /// Runs `f` as one transaction: what it writes lands together, or none of it when it fails.
+    pub fn atomically<T>(
+        &self,
+        f: impl FnOnce(&Store) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        let tx = self.db.unchecked_transaction()?;
+        let out = f(self)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
     /// Records how a taken action ended (`done`, `failed`, ...) and its output, only for a row
     /// still `running` or `unknown`: a finished run never overwrites `dropped`, `cancelled` or
     /// `expired`. Returns whether a row changed.

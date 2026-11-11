@@ -69,3 +69,28 @@ pub(crate) fn test_dir(name: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
+
+/// Writes `text` to `path` as an executable for a test to run. A child writes it, never this
+/// process: another test's thread can fork while a descriptor open for writing is held here,
+/// and until that fork execs, running the file fails with ETXTBSY ("Text file busy").
+#[cfg(test)]
+pub(crate) fn test_exe(path: &std::path::Path, text: &str) {
+    use std::io::Write;
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+    assert!(
+        child.wait().unwrap().success(),
+        "writing {}",
+        path.display()
+    );
+}

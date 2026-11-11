@@ -581,12 +581,16 @@ fn ask(cfg: &Config, store: &Store, actions: &[Action]) {
 /// gate socket tells this way of a browser action the owner let go that did not run. What it
 /// says shows `a`'s summary as [`summary`] gives it (R70).
 pub(crate) fn tell(store: &Store, a: &Action, text: &str) {
-    let told = match a.origin.channel.is_empty() {
+    if let Err(e) = told(store, a, text) {
+        eprintln!("zephyr: telling the owner about #{} failed: {e}", a.id);
+    }
+}
+
+/// [`tell`], its failure the caller's.
+pub(crate) fn told(store: &Store, a: &Action, text: &str) -> rusqlite::Result<()> {
+    match a.origin.channel.is_empty() {
         true => store.notify_last_owner(text),
         false => store.notify(&a.origin.channel, &a.origin.sender, text),
-    };
-    if let Err(e) = told {
-        eprintln!("zephyr: telling the owner about #{} failed: {e}", a.id);
     }
 }
 
