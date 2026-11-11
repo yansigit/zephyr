@@ -271,7 +271,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
        --enable-demuxer=ogg,mov,matroska,mp3,wav,flac,aac,caf,amr,pcm_s16le \
        --enable-decoder='opus,libopus,vorbis,aac,mp3,mp3float,flac,pcm_*,alac,amrnb,amrwb' \
        --enable-parser=aac,flac,mpegaudio,opus,vorbis \
-       --enable-encoder=libopus,aac,pcm_s16le,pcm_mulaw --enable-muxer=ogg,ipod,wav,mulaw --enable-filter=aresample \
+       --enable-encoder=libopus,aac,pcm_s16le,pcm_mulaw --enable-muxer=ogg,ipod,wav,pcm_mulaw --enable-filter=aresample \
     && make -j"$(nproc)" ffmpeg \
     && install -D -m 755 -s ffmpeg /out/bin/ffmpeg
 
