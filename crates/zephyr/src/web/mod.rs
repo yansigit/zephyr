@@ -4,7 +4,7 @@
 
 pub mod passkey;
 pub mod push;
-mod signin;
+pub(crate) mod signin;
 
 pub(crate) use signin::random;
 pub use signin::{command, cookie, devices, Ceremony};

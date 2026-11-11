@@ -159,6 +159,8 @@ wrong](#when-something-goes-wrong) and `zephyr uninstall [--keep-data]`.
 | `/web` | The [web app](#web-app): its address, passkeys, sessions and push devices |
 | `/web enrol [NAME]` | From the terminal chat or `zephyr attach` only: a one-time code (10 minutes) that adds a passkey for a phone or laptop |
 | `/web rm NAME` / `/web signout` | From any channel: remove a passkey with its sessions, or end every web session (a lost phone) |
+| `/pair telegram\|signal` | From the terminal chat or `zephyr attach` only: a one-time code (10 minutes). Send `/pair CODE` to the bot or to zephyr's Signal number, and whoever sent it becomes an owner there; every owner channel is told who. `zephyr channel add` asks for it at its end. Wrong codes get no answer, and five close pairing for 15 minutes |
+| `/unpair telegram\|signal ID` | From any channel: that Telegram user id or Signal ACI is no longer an owner |
 | `/ok N [once]` / `/no N` | Approve or drop proposal or held action #N. `/ok N` runs exactly what its card showed; under `ask-new` it also remembers the new recipients, and `/ok N once` approves without remembering them |
 | `/cancel N` | Stop an action waiting out its delay (`sending at 14:05 unless /cancel 7`) before it goes |
 | `/facts [rm NAME \| allow NAME TARGET \| disallow NAME TARGET]` | From any channel: your private facts' names, kinds and allowed targets, never a value. `rm` and `allow` loosen the check, so only a strong channel may; a value is entered only in `zephyr attach` or with `zephyr facts add` |

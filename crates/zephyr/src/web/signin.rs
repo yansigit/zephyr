@@ -36,7 +36,8 @@ pub enum Ceremony {
 }
 
 /// The limits on the two ceremonies. Global and in memory: every request comes from 127.0.0.1.
-pub(super) struct Limits {
+/// Pairing codes (`crate::pairing`) are counted the same way, on limits of their own.
+pub(crate) struct Limits {
     requests: Window,
     failures: VecDeque<Instant>,
     /// While sign-in is closed: until when, and that as a unix time for the owner.
@@ -44,7 +45,7 @@ pub(super) struct Limits {
 }
 
 impl Limits {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             requests: Window::new(20, Duration::from_secs(60)),
             failures: VecDeque::new(),
@@ -53,14 +54,14 @@ impl Limits {
     }
 
     /// When sign-in opens again, while it is closed.
-    fn closed(&mut self, now: Instant) -> Option<i64> {
+    pub(crate) fn closed(&mut self, now: Instant) -> Option<i64> {
         self.closed = self.closed.filter(|(until, _)| now < *until);
         self.closed.map(|(_, at)| at)
     }
 
     /// Counts a failed ceremony. The fifth within ten minutes closes sign-in for `lockout`;
     /// only that call answers, with the time it opens again.
-    fn failed(&mut self, now: Instant, lockout: Duration) -> Option<i64> {
+    pub(crate) fn failed(&mut self, now: Instant, lockout: Duration) -> Option<i64> {
         self.failures.push_back(now);
         while (self.failures.front()).is_some_and(|t| now.duration_since(*t) > FAILURE_SPAN) {
             self.failures.pop_front();
@@ -99,7 +100,7 @@ fn named(name: &str) -> bool {
 }
 
 /// A code as typed: uppercase, without its hyphen or any space.
-fn typed(code: &str) -> String {
+pub(crate) fn typed(code: &str) -> String {
     let kept = code.chars().filter(|c| *c != '-' && !c.is_whitespace());
     kept.flat_map(char::to_uppercase).collect()
 }

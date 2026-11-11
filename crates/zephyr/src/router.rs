@@ -429,6 +429,8 @@ struct Router<'a> {
     secrets: Vec<(String, String)>,
     /// A same-provider model switch, sent with `set_model` once the child is idle.
     pending_model: Option<String>,
+    /// Wrong pairing codes: five in ten minutes close pairing (DESIGN §4.3).
+    pair_limits: crate::web::signin::Limits,
     /// Exit with `Exit::Reexec` once main and the jobs are idle.
     reexec: bool,
     /// The child's `auth.json` mtime at spawn; a newer one (a re-login) restarts the child.
@@ -672,6 +674,7 @@ impl<'a> Router<'a> {
             gate_notes: None,
             web: None,
             pushed_up_to: std::sync::atomic::AtomicI64::new(i64::MAX),
+            pair_limits: crate::web::signin::Limits::new(),
             pushed_replies: HashSet::new(),
             not_applied: false,
             held_steered: HashSet::new(),
@@ -702,7 +705,17 @@ impl<'a> Router<'a> {
                 _ = tokio::time::sleep_until(self.respawn_at), if self.child.is_none() => {
                     self.spawn().await;
                 }
-                Some(m) = rx.recv() => self.inbound(m, false).await,
+                Some(m) = rx.recv() => {
+                    // A pairing claim is taken before the owner check would drop it; the
+                    // adapter knows the name the sender goes by, for the notice.
+                    if let Some(code) = crate::pairing::claim_on(&m.channel, &m.text) {
+                        let name = (channels.iter().find(|c| c.name() == m.channel))
+                            .and_then(|c| c.known_as(&m.sender));
+                        self.claim(m, &code, name).await;
+                    } else {
+                        self.inbound(m, false).await;
+                    }
+                }
                 Some(req) = self.attaches.recv() => self.attach(req).await,
                 Some((session, note)) = next_gate_note(&mut self.gate_notes) => {
                     self.gate_note(&session, note).await
@@ -2633,6 +2646,8 @@ impl<'a> Router<'a> {
                 reply
             }
             ("/approvals", arg) => self.approvals(arg, from.0).await,
+            ("/pair", kind) => self.pair(kind, from.0),
+            ("/unpair", arg) => self.unpair(arg).await,
             // Held messages, posts and payments (approvals spec §4.6).
             ("/held", "") => crate::actions::held(&self.cfg, &self.store),
             // The daemon's own record (DESIGN §4.19), answered outside the queue.
@@ -3658,6 +3673,130 @@ impl<'a> Router<'a> {
                 None => self.store.notify_last_owner(&text),
             };
             log(told.map_err(Into::into));
+        }
+    }
+
+    /// `/pair telegram|signal` (DESIGN §4.3): a new one-time code, only to a strong channel
+    /// that is not the passkey, as `/web enrol` is. Only its hash is kept.
+    fn pair(&mut self, kind: &str, channel: &str) -> String {
+        let set = match kind {
+            "telegram" => self.cfg.telegram.is_some(),
+            "signal" => self.cfg.signal.is_some(),
+            _ => return "[zephyr] usage: /pair telegram|signal".into(),
+        };
+        let strong: Vec<&str> = (self.cfg.settings.strong_channels.iter())
+            .map(String::as_str)
+            .filter(|c| *c != "passkey")
+            .collect();
+        if !strong.contains(&channel) {
+            return format!("[zephyr] /pair needs {}", strong.join(" or "));
+        }
+        if !set {
+            return format!("[zephyr] {kind} is not set up; zephyr channel add {kind} on the host");
+        }
+        if let Some(at) = self.pair_limits.closed(std::time::Instant::now()) {
+            return format!("[zephyr] pairing is closed until {}", self.clock(at));
+        }
+        let (code, row) = crate::pairing::issue(crate::now());
+        let key = crate::pairing::meta_key(kind);
+        if let Err(e) = self.store.set_meta(&key, Some(&row)) {
+            return format!("[zephyr] the pairing code could not be saved: {e}");
+        }
+        let to = match kind {
+            "telegram" => "the bot",
+            _ => "zephyr's Signal number",
+        };
+        format!("[zephyr] send /pair {code} to {to} within 10 min; it works once")
+    }
+
+    /// A message on `telegram` or `signal` whose whole text is `/pair CODE`, from anyone. Its row
+    /// is stored `dropped` and cut to `/pair`, so the code is never in state.db; a re-delivered
+    /// one is a duplicate and claims nothing. A wrong code gets no reply (no oracle).
+    async fn claim(&mut self, m: Inbound, code: &str, name: Option<String>) {
+        let row = Inbound {
+            text: "/pair".into(),
+            ..m.clone()
+        };
+        match self.store.insert_inbox_as(&row, "dropped") {
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(e) => return eprintln!("zephyr: inbox write failed: {e}"),
+        }
+        let (channel, id) = (m.channel.as_str(), m.sender.as_str());
+        let now = std::time::Instant::now();
+        if self.pair_limits.closed(now).is_some() {
+            return eprintln!("zephyr: a pairing claim on {channel} while pairing is closed");
+        }
+        let key = crate::pairing::meta_key(channel);
+        let stored = self.store.meta(&key).ok().flatten();
+        let ok = stored.filter(|r| crate::pairing::matches(r, code, crate::now()));
+        // Taken in one statement: of two claims at once, one wins.
+        if !ok.is_some_and(|r| self.store.take_meta(&key, &r).unwrap_or(false)) {
+            eprintln!("zephyr: a wrong pairing code on {channel}");
+            if let Some(at) = self.pair_limits.failed(now, self.cfg.web_lockout) {
+                let text = format!(
+                    "[zephyr] 5 wrong pairing codes; pairing is closed until {}",
+                    self.clock(at)
+                );
+                log(notify_owners(&self.cfg, &self.store, &text, None).map_err(Into::into));
+                self.show(&text, None, None);
+            }
+            return;
+        }
+        let list = format!("owners.{channel}");
+        let add = |doc: &mut toml_edit::DocumentMut| {
+            owner_list(doc, channel, |a| {
+                if !a.iter().any(|v| v.as_str() == Some(id)) {
+                    a.push(id);
+                }
+            })
+        };
+        if let Err(why) = self.edit_config(None, add).await {
+            let text = format!("[zephyr] pairing {channel} user {id} failed: {why}");
+            return log(notify_owners(&self.cfg, &self.store, &text, None).map_err(Into::into));
+        }
+        log((self.store)
+            .log_setting(&list, None, Some(id), "pairing", Some(channel), None)
+            .map_err(Into::into));
+        let paired = "[zephyr] paired: you are an owner of this zephyr";
+        log(self.store.notify(channel, id, paired).map_err(Into::into));
+        let label = if channel == "telegram" {
+            "Telegram"
+        } else {
+            "Signal"
+        };
+        let name = name.map_or(String::new(), |n| format!(" ({n})"));
+        let text = format!(
+            "[zephyr] {label} user {id}{name} is now an owner; /unpair {channel} {id} removes them"
+        );
+        let told = notify_owners(&self.cfg, &self.store, &text, Some((channel, id)));
+        log(told.map_err(Into::into));
+        self.show(&text, None, None);
+    }
+
+    /// `/unpair CHANNEL ID`, from any owner channel: it only takes away.
+    async fn unpair(&mut self, arg: &str) -> String {
+        let (channel, id) = word(arg);
+        if !crate::pairing::CHANNELS.contains(&channel) || id.is_empty() || id.contains(' ') {
+            return "[zephyr] usage: /unpair telegram|signal ID".into();
+        }
+        if !self.cfg.is_owner(channel, id) {
+            return format!("[zephyr] {id} is not an owner on {channel}");
+        }
+        let rm = |doc: &mut toml_edit::DocumentMut| {
+            owner_list(doc, channel, |a| {
+                a.retain(|v| v.as_str() != Some(id));
+            })
+        };
+        match self.edit_config(None, rm).await {
+            Ok(_) => {
+                let list = format!("owners.{channel}");
+                log((self.store)
+                    .log_setting(&list, Some(id), None, "owner", None, None)
+                    .map_err(Into::into));
+                format!("[zephyr] {id} is no longer an owner on {channel}")
+            }
+            Err(why) => format!("[zephyr] {why}"),
         }
     }
 
@@ -5174,6 +5313,26 @@ fn unspoof(text: &str) -> String {
         }
     });
     lines.collect::<Vec<_>>().join("\n")
+}
+
+/// Edits `owners.<channel>` in `doc`, made an empty list first when absent.
+fn owner_list(
+    doc: &mut toml_edit::DocumentMut,
+    channel: &str,
+    edit: impl FnOnce(&mut toml_edit::Array),
+) -> anyhow::Result<()> {
+    let owners = doc.entry("owners").or_insert(toml_edit::table());
+    let owners = owners
+        .as_table_like_mut()
+        .ok_or_else(|| anyhow::anyhow!("owners is not a table"))?;
+    let list = owners
+        .entry(channel)
+        .or_insert(toml_edit::value(toml_edit::Array::new()));
+    let list = list
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("owners.{channel} is not a list"))?;
+    edit(list);
+    Ok(())
 }
 
 /// Writes `text` to every owner on `chat` and on each channel whose table is set, except

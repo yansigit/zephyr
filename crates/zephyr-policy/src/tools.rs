@@ -1271,6 +1271,10 @@ mod tests {
             "/job run 1",
             "/login",
             "/login anthropic",
+            // A pairing code goes only to the channel that asked (DESIGN §4.3).
+            "/pair telegram",
+            "/pair signal",
+            "/unpair telegram 55",
             "/resume",
             "/ok 1",
             "/no 1",

@@ -26,6 +26,7 @@ pub mod host;
 pub mod imessage;
 pub mod inbox;
 pub mod memory;
+pub mod pairing;
 pub mod pool;
 pub mod procs;
 pub mod reload;
