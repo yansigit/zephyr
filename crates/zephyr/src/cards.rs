@@ -21,6 +21,10 @@ pub const MAX: f64 = 100.0;
 const KEEP_SECS: i64 = 3600;
 /// How long a number the owner typed waits for its `/card put` to claim it.
 const ENTER_SECS: i64 = 60;
+/// The file beside the gate socket (root's, world-readable) that lists the origins of the
+/// pages a card is typed into, one a line, for as long as zephyr keeps the card's number: the
+/// browser wrapper refuses to read those pages back (`browser_gate`).
+pub const FILLED_FILE: &str = "cards-filled";
 /// What every card tool answers when no provider can be reached.
 pub const NOT_SET_UP: &str = "not run: the card provider is not set up";
 
@@ -505,6 +509,9 @@ pub mod live {
         pan: Pan,
         /// Set once the card closed: no longer filled, still scrubbed until then.
         drop_at: Option<i64>,
+        /// Once the number was typed into a page: the flag file that says so, and the page's
+        /// origin ([`filled`]).
+        filled: Option<(PathBuf, String)>,
     }
 
     static LIVE: Mutex<Vec<Held>> = Mutex::new(Vec::new());
@@ -576,12 +583,14 @@ pub mod live {
     /// Keeps card `card`'s number, replacing one kept before.
     pub fn put(state: &std::path::Path, card: i64, pan: Pan) {
         let mut all = lock();
-        all.retain(|h| !(h.state == state && h.card == card));
+        let old = all.iter().position(|h| h.state == state && h.card == card);
+        let filled = old.and_then(|i| all.remove(i).filled);
         all.push(Held {
             state: state.to_path_buf(),
             card,
             pan,
             drop_at: None,
+            filled,
         });
         publish(&all);
     }
@@ -605,10 +614,51 @@ pub mod live {
     /// Drops the numbers whose hour is over.
     pub fn sweep(now: i64) {
         let mut all = lock();
+        let gone = |h: &Held| h.drop_at.is_some_and(|at| at <= now);
+        let flags: Vec<PathBuf> = (all.iter().filter(|h| gone(h)))
+            .filter_map(|h| h.filled.as_ref().map(|(flag, _)| flag.clone()))
+            .collect();
         let before = all.len();
-        all.retain(|h| h.drop_at.is_none_or(|at| at > now));
+        all.retain(|h| !gone(h));
         if all.len() != before {
             publish(&all);
+        }
+        flags.iter().for_each(|flag| write_flag(flag, &all));
+    }
+
+    /// Card `card`'s number is about to be typed into a page on `origin`: from now until the
+    /// number is dropped, the browser wrapper refuses to read that origin's pages back
+    /// (`FILLED_FILE`, in the daemon's public folder: root's, readable by the agent).
+    pub fn filled(cfg: &Config, card: i64, origin: &str) {
+        let flag = crate::drafts::public_dir(cfg).join(FILLED_FILE);
+        let mut all = lock();
+        let state = cfg.state_dir();
+        if let Some(h) = all.iter_mut().find(|h| h.state == state && h.card == card) {
+            h.filled = Some((flag.clone(), origin.to_string()));
+        }
+        write_flag(&flag, &all);
+    }
+
+    /// The origins of the pages whose fields hold a kept number, one a line; no file for none.
+    fn write_flag(flag: &std::path::Path, all: &[Held]) {
+        let mut origins: Vec<&str> = (all.iter())
+            .filter_map(|h| h.filled.as_ref())
+            .filter(|(f, _)| f == flag)
+            .map(|(_, origin)| origin.as_str())
+            .collect();
+        origins.sort_unstable();
+        origins.dedup();
+        if origins.is_empty() {
+            let _ = std::fs::remove_file(flag);
+            return;
+        }
+        if let Some(dir) = flag.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let text = origins.join("\n") + "\n";
+        let tmp = flag.with_extension("tmp");
+        if let Err(e) = crate::host::conf::replace_durably(flag, &tmp, text.as_bytes()) {
+            eprintln!("zephyr: writing {}: {e}", flag.display());
         }
     }
 
@@ -1406,6 +1456,9 @@ async fn fill(cfg: &Arc<Config>, id: i64, fields: CardFields) -> String {
             card.origin
         )
     };
+    // From here the page's fields hold the number: the browser wrapper reads it back to no
+    // one until the number is dropped.
+    live::filled(cfg, id, &card.origin);
     let mut done: Vec<&str> = Vec::new();
     for (label, sel) in selectors {
         let Some(sel) = sel else { continue };

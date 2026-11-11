@@ -519,6 +519,12 @@ fn decide(args: &[String], env: &Env) -> (Next, Place) {
         Ok(()) => go(env, None),
         Err(text) => (Next::Refuse(text), None),
     };
+    // A card's number is in this page's fields (DESIGN §4.22): the page is not read back.
+    if reads_back(&argv.rest) {
+        if let Some(text) = card_filled(env, &page) {
+            return (Next::Refuse(text), None);
+        }
+    }
     match &act {
         Act::Pass => {
             // `back`, `forward` and `reload` read the page's address only for its pace: only
@@ -966,6 +972,57 @@ fn what(rest: &[String]) -> Act {
         _ => Act::Pass,
     }
 }
+
+/// Whether `rest` reads the page's contents back to the agent: a field's value, the page's
+/// HTML, a script's answer, a picture or a recording of it, the clipboard, the browser's own
+/// debugging port. `snapshot`, `get text` and `get url` are not: a checkout needs them, and
+/// what main reads of them is scrubbed.
+fn reads_back(rest: &[String]) -> bool {
+    let Some((cmd, args)) = rest.split_first() else {
+        return false;
+    };
+    let sub = args.first().map(String::as_str);
+    match cmd.as_str() {
+        "eval" | "screenshot" | "pdf" | "record" | "clipboard" | "stream" | "inspect"
+        | "connect" | "console" => true,
+        "get" => matches!(sub, Some("value" | "html" | "attr" | "cdp-url")),
+        "diff" => sub == Some("screenshot"),
+        "batch" => args.iter().any(|c| {
+            let words = shell_words_split(c);
+            reads_back(&words) || reads_back(&split(&words).rest)
+        }),
+        _ => false,
+    }
+}
+
+/// Why the page may not be read back now: its origin is one a card was typed into, and
+/// zephyr still keeps that card's number (root's `cards-filled`, beside the gate socket,
+/// written by `cards::live`). No file is no card; one that cannot be read refuses.
+fn card_filled(env: &Env, page: &Page) -> Option<String> {
+    let flag = public(env).join(crate::cards::FILLED_FILE);
+    let listed = match std::fs::read_to_string(&flag) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(CARD_UNREAD.into()),
+        Ok(listed) => listed,
+    };
+    if listed.trim().is_empty() {
+        return None;
+    }
+    let url = page.url();
+    let Some(origin) = crate::vault::origin(&url).map(|o| o.ascii_serialization()) else {
+        return Some(CARD_UNREAD.into());
+    };
+    listed.lines().any(|l| l.trim() == origin).then(|| {
+        format!(
+            "not run: a virtual card is filled on {origin}; reading that page back (a field's \
+             value, its HTML, a script, a picture of it) is refused until zephyr has forgotten \
+             the card's number. Clicking, `snapshot` and `get text` still work."
+        )
+    })
+}
+
+const CARD_UNREAD: &str = "not run: zephyr could not tell whether a virtual card is filled on \
+                           this page, so the page is not read back; try again";
 
 /// Typing `typed`: with a line break where Enter would go (`enter_in`), a key press there, which
 /// 0.41 sends as a real Enter for each `\n` or `\r` (`type_text_into_active_context`), however
@@ -2935,6 +2992,58 @@ cat "$d/$f.json"
     fn a_paced_sleep_after_an_allow_leaves_the_report_in_time() {
         let worst = PACE_ASK + PACE_AFTER_WAIT + REREADS * FACT_WAIT;
         assert!(worst < gate::REPORT_WAIT, "{worst:?}");
+    }
+
+    /// DESIGN §4.22: while zephyr keeps the number of a card it typed into a page, the
+    /// commands that read that page back are refused; what a checkout needs still runs.
+    #[test]
+    fn reading_a_page_back_is_refused_while_a_card_is_filled_on_it() {
+        let t = T::new("bg-card");
+        t.page(MAIL, COMPOSE, "");
+        let flag = t.dir.join(crate::cards::FILLED_FILE);
+        let reads: [&[&str]; 9] = [
+            &["get", "value", "@e1"],
+            &["get", "html", "body"],
+            &["get", "attr", "value", "@e1"],
+            &["eval", "document.querySelector('input').value"],
+            &["screenshot", "/tmp/page.png"],
+            &["pdf", "/tmp/page.pdf"],
+            &["--session", "work", "eval", "1"],
+            &["batch", "snapshot -i", "get value @e1"],
+            &["clipboard", "read"],
+        ];
+        // No card anywhere: nothing is asked and everything runs.
+        for args in reads {
+            assert_eq!(t.run(args), Next::Exec, "{args:?}");
+        }
+        std::fs::write(&flag, "https://other.example\nhttps://mail.example.com\n").unwrap();
+        for args in reads {
+            match t.run(args) {
+                Next::Refuse(text) => assert!(
+                    text.starts_with(
+                        "not run: a virtual card is filled on https://mail.example.com;"
+                    ),
+                    "{args:?}: {text}"
+                ),
+                Next::Exec => panic!("{args:?} ran"),
+            }
+        }
+        for args in [
+            &["snapshot", "-i"][..],
+            &["get", "url"],
+            &["get", "text", "@e1"],
+            &["scroll", "down", "200"],
+            &["hover", "@e3"],
+        ] {
+            assert_eq!(t.run(args), Next::Exec, "{args:?}");
+        }
+        // A card filled on another site refuses nothing here.
+        std::fs::write(&flag, "https://other.example\n").unwrap();
+        assert_eq!(t.run(&["eval", "1"]), Next::Exec);
+        // A flag that cannot be read is no leave to read the page.
+        std::fs::remove_file(&flag).unwrap();
+        std::fs::create_dir(&flag).unwrap();
+        assert!(matches!(t.run(&["eval", "1"]), Next::Refuse(_)));
     }
 
     #[test]

@@ -8157,6 +8157,17 @@ async fn a_manual_card_is_approved_entered_filled_on_its_origin_and_forgotten() 
     let leaked = |l: &String| l.contains("4242") || l.contains("06/29") || l.ends_with(" 123");
     assert!(!argv.iter().any(leaked), "{argv:?}");
 
+    // While zephyr keeps the number, the browser's own read-backs of that page are refused.
+    let peek = format!(
+        r#"[call exec {{"command": "{} eval 1"}}]"#,
+        home.join("bin/agent-browser").display()
+    );
+    gw.say("c7b", "owner", &peek).await;
+    let refused = reply_where(&gw, "chat", |r| r.contains("a virtual card is filled on")).await;
+    assert!(
+        refused.contains("not run: a virtual card is filled on https://shop.example;"),
+        "{refused}"
+    );
     // Review Focus 1: a read-back the agent echoes comes back as the card's label.
     std::fs::write(
         home.join("readback.txt"),
@@ -8168,7 +8179,10 @@ async fn a_manual_card_is_approved_entered_filled_on_its_origin_and_forgotten() 
         home.join("readback.txt").display()
     );
     gw.say("c8", "owner", &echo).await;
-    let echoed = reply_where(&gw, "chat", |r| r.contains("\nexec: exited")).await;
+    let echoed = reply_where(&gw, "chat", |r| {
+        r.contains("readback.txt") && r.contains("\nexec: exited")
+    })
+    .await;
     assert!(
         echoed.contains("[card:#1] or [card:#1], code [card:#1]"),
         "{echoed}"
