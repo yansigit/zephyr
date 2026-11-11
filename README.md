@@ -62,6 +62,69 @@ zephyr login openai-codex --account codex-main
 by hand that is looser than the preset is cleared); without it a non-interactive `init` leaves
 `[approvals]` out (which is `manual`) and asks for no facts.
 
+## Self-hosting
+
+Zephyr runs on your own machine with nothing of this project's owner in it but the defaults below,
+each of which you can change.
+
+**What you need.** Linux on x86_64 (arm64 only from source: the published image is amd64, and the
+Claude Agent SDK path in the image is the x64 one), Docker with BuildKit that you run as your own
+user (`docker version` works without `sudo`), and about 20 GB of disk. Optional: Tailscale (for the
+web app and iMessage) and `gh` signed in (for a private image on ghcr.io).
+
+**Get the CLI.** From a clone, `deploy/install.sh` (see [Quick start](#quick-start)), or
+`cargo install --locked --path crates/zephyr`.
+
+**Get the image.** `zephyr init` pulls `<repo>:<CLI version>` if you can read the registry.
+Otherwise build it: `zephyr up --build` builds `deploy/Dockerfile` here, and since the provider
+sources are public it needs no token. For a smaller image without the owner's provider sources, see
+[Building the image](#building-the-image) and what it leaves out. To use your own registry, build
+the CLI with it (`ZEPHYR_REPO=registry.example.com/you/zephyr cargo install --locked --path
+crates/zephyr`), build the image with `--build-arg ZEPHYR_REPO=registry.example.com/you/zephyr`,
+and push it there as `<repo>:<version>` and `<repo>:latest`. Run `docker login` for that registry
+yourself: your `gh` token only ever goes to ghcr.io.
+
+**`zephyr init`, step by step.**
+
+1. *Projects folder*: the one folder of yours the agent may work in (besides its own home).
+2. *Providers and failover*: pick the providers to sign in. Each sign-in is an account, and when
+   there are several you set the order they take over in.
+3. *Discord*: create an application in the Discord Developer Portal, add a bot, and copy its
+   token (init asks for it at a hidden prompt). Invite the bot to a server you are in, so you can
+   send it direct messages; it reads DMs only. Your user id comes from Developer Mode, then Copy
+   User ID.
+4. *iMessage*: a Mac running the BlueBubbles server, on your tailnet. Init asks for the webhook
+   address (this machine's Tailscale IP and a port), the server URL, your iMessage handles and the
+   server password, then offers the Tailscale forward to the webhook and prints the webhook URL to
+   register in BlueBubbles.
+5. *Approvals preset*: how much the agent may send without asking you ([Approvals and
+   presets](#approvals-and-presets)).
+6. *Private facts*: values the agent may not send unasked.
+7. *Web app*: needs Tailscale with HTTPS certificates; a yes runs `zephyr web setup`
+   ([Web app](#web-app)).
+8. *Network*: the agent's network floor is on by default; `zephyr init --network host` turns it
+   off, and `--network bridge` turns it back on ([The agent's network](#the-agents-network)).
+
+**Upgrading.** With a registry: `zephyr upgrade`. From source: `git pull && cargo install --locked
+--path crates/zephyr && zephyr up --build`.
+
+**Your data, backups, removal.** See [Where things live](#where-things-live), [When something goes
+wrong](#when-something-goes-wrong) and `zephyr uninstall [--keep-data]`.
+
+**The knobs**, each with its default:
+
+| Knob | Where | Default |
+|---|---|---|
+| `ZEPHYR_REPO` | environment, or baked in at `cargo install` and by the Dockerfile arg | `ghcr.io/yansigit/zephyr` |
+| `ZEPHYR_IMAGE` | environment | unset: `<repo>:<CLI version>`. Set, one exact image, with no versioned upgrades |
+| `ZEPHYR_CONTAINER` | environment | `zephyr` |
+| `ZEPHYR_SRC` | environment, for `zephyr up --build` | the source tree the CLI was built from |
+| `RPI_PACKAGE_REPO`, `RPI_PACKAGE_REF` | `deploy/Dockerfile` build args | `yansigit/rpi-package` at a pinned commit; an empty repo leaves it out |
+| `PLUGINS_REPO`, `PLUGINS_REF` | `deploy/Dockerfile` build args | `yansigit/rpi-provider-plugins` at a pinned commit; an empty repo leaves it out |
+| `ZEPHYR_REPO` | `deploy/Dockerfile` build arg | unset: the CLI's default (image.yml sets `ghcr.io/<repository>`) |
+| `RPI_BIN` | `deploy/release.sh` and the ignored real-rpi tests | the pinned rpi path in `release.sh` |
+| `ZEPHYR_GH_REPO` | `deploy/runner/start.sh` | `yansigit/zephyr` |
+
 ## Everyday commands
 
 | Command | What it does |
