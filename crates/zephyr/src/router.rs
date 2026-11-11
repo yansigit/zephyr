@@ -4868,6 +4868,8 @@ impl<'a> Router<'a> {
             };
             let status = match sent {
                 Ok(()) => "sent",
+                // Its send goes on in the adapter: pending, whatever the window, its file kept.
+                Err(e) if e.downcast_ref::<crate::channel::StillGoing>().is_some() => continue,
                 Err(e) if crate::now() - row.created_at > retry_window(&row.channel) => {
                     eprintln!(
                         "zephyr: reply {} to {} failed for good: {e:#}",

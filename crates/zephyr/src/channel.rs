@@ -142,11 +142,18 @@ pub fn chunks(text: &str, max: usize) -> Vec<String> {
 
 /// What a channel with no client nonce (Telegram, Signal) delivered of each reply, so a retry
 /// starts after it. The router stops waiting on a send after its timeout, but the platform may
-/// still take what was asked: so a send runs in a task of its own (`Sending` moves into it) and
-/// records each piece the platform took, and a retry while it goes is refused rather than run
-/// beside it. Kept for the router's `retry_window` of the channel.
+/// still take what was asked: so a send runs in a task of its own (`detach`; `Sending` moves into
+/// it) and records each piece the platform took. While it goes, a retry of that reply answers
+/// `StillGoing` rather than run beside it, and the router neither fails the row nor drops its
+/// file, whatever the window. Sends to one chat take turns, so two replies never interleave.
+/// Kept for the router's `retry_window` of the channel once no send of it goes.
 #[derive(Default)]
-pub struct Delivered(std::sync::Mutex<std::collections::HashMap<String, Sent>>);
+pub struct Delivered {
+    sent: std::sync::Mutex<std::collections::HashMap<String, Sent>>,
+    /// One turn per `(channel, chat)`: a fair lock, so later replies queue behind the first.
+    turns:
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+}
 
 struct Sent {
     pieces: usize,
@@ -154,35 +161,67 @@ struct Sent {
     going: bool,
 }
 
+/// A send of this reply is still going in a task of its own: not a failure. The router keeps
+/// the row pending, whatever its window, and records the true result at a later retry.
+#[derive(Debug)]
+pub struct StillGoing;
+
+impl std::fmt::Display for StillGoing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a send of this reply is still going")
+    }
+}
+
+impl std::error::Error for StillGoing {}
+
+/// How long `detach` waits for its task before it answers `StillGoing`; well inside the
+/// router's own send timeout, so the router never cuts one off itself.
+const DETACH_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// One send of a reply, from `Delivered::begin` until it is dropped.
 pub struct Sending {
     of: std::sync::Arc<Delivered>,
     id: String,
+    turn: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// The pieces an earlier send delivered: this one starts after them.
     pub before: usize,
 }
 
 impl Delivered {
-    /// Starts a send of `client_id` on `channel`, or refuses while an earlier one still goes.
+    /// Starts a send of `client_id` to `chat` on `channel`, or answers `StillGoing` while an
+    /// earlier one still goes.
     pub fn begin(
         self: &std::sync::Arc<Self>,
         channel: &str,
+        chat: &str,
         client_id: &str,
     ) -> anyhow::Result<Sending> {
         let window = std::time::Duration::from_secs(crate::router::retry_window(channel) as u64);
-        let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = self.sent.lock().unwrap_or_else(|e| e.into_inner());
         all.retain(|_, s| s.going || s.at.elapsed() < window);
         let sent = all.entry(client_id.to_string()).or_insert(Sent {
             pieces: 0,
             at: std::time::Instant::now(),
             going: false,
         });
-        anyhow::ensure!(!sent.going, "an earlier send of this reply is still going");
+        if sent.going {
+            return Err(StillGoing.into());
+        }
         sent.going = true;
+        let before = sent.pieces;
+        drop(all);
+        let mut turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
+        // A chat's lock goes once no send holds or waits for it.
+        turns.retain(|_, t| std::sync::Arc::strong_count(t) > 1);
+        let turn = turns
+            .entry(format!("{channel} {chat}"))
+            .or_default()
+            .clone();
         Ok(Sending {
             of: self.clone(),
             id: client_id.to_string(),
-            before: sent.pieces,
+            turn,
+            before,
         })
     }
 }
@@ -190,7 +229,7 @@ impl Delivered {
 impl Sending {
     /// The platform took the first `pieces` pieces.
     pub fn sent(&self, pieces: usize) {
-        let mut all = self.of.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = self.of.sent.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(s) = all.get_mut(&self.id) {
             (s.pieces, s.at) = (pieces, std::time::Instant::now());
         }
@@ -199,10 +238,29 @@ impl Sending {
 
 impl Drop for Sending {
     fn drop(&mut self) {
-        let mut all = self.of.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = self.of.sent.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(s) = all.get_mut(&self.id) {
             (s.going, s.at) = (false, std::time::Instant::now());
         }
+    }
+}
+
+/// Runs `send` in a task of its own, in its chat's turn, holding `sending` until it ends. Waits
+/// for it at most `DETACH_AFTER`, then answers `StillGoing` while it carries on.
+pub async fn detach<T, F, Fut>(sending: Sending, send: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Sending) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<T>> + Send,
+{
+    let task = tokio::spawn(async move {
+        let turn = sending.turn.clone();
+        let _turn = turn.lock_owned().await;
+        send(sending).await
+    });
+    match tokio::time::timeout(DETACH_AFTER, task).await {
+        Ok(done) => done?,
+        Err(_) => Err(StillGoing.into()),
     }
 }
 
@@ -288,20 +346,21 @@ mod tests {
     #[test]
     fn a_retry_starts_after_what_went_and_waits_for_a_send_still_going() {
         let d = std::sync::Arc::new(Delivered::default());
-        let first = d.begin("telegram", "z1").unwrap();
+        let first = d.begin("telegram", "55", "z1").unwrap();
         assert_eq!(first.before, 0);
         first.sent(2);
-        assert!(d.begin("telegram", "z1").is_err(), "still going");
-        assert_eq!(d.begin("telegram", "z2").unwrap().before, 0);
+        let going = d.begin("telegram", "55", "z1").err().unwrap();
+        assert!(going.downcast_ref::<StillGoing>().is_some(), "still going");
+        assert_eq!(d.begin("telegram", "55", "z2").unwrap().before, 0);
         drop(first);
-        let again = d.begin("telegram", "z1").unwrap();
+        let again = d.begin("telegram", "55", "z1").unwrap();
         assert_eq!(again.before, 2);
         drop(again);
         // Forgotten after the channel's retry window, as the router stops retrying then.
         let window = std::time::Duration::from_secs(crate::router::retry_window("telegram") as u64);
         if let Some(old) = std::time::Instant::now().checked_sub(window) {
-            d.0.lock().unwrap().get_mut("z1").unwrap().at = old;
-            assert_eq!(d.begin("telegram", "z1").unwrap().before, 0);
+            d.sent.lock().unwrap().get_mut("z1").unwrap().at = old;
+            assert_eq!(d.begin("telegram", "55", "z1").unwrap().before, 0);
         }
     }
 

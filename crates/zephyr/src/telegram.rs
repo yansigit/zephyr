@@ -376,7 +376,9 @@ impl Channel for Telegram {
             .parse()
             .context("recipient is not a Telegram user id")?;
         let parts = chunks(&msg.text, MAX_TEXT);
-        let sending = self.delivered.begin("telegram", &msg.client_id)?;
+        let sending = self
+            .delivered
+            .begin("telegram", &msg.recipient, &msg.client_id)?;
         let file = match msg
             .attachment
             .as_ref()
@@ -398,7 +400,7 @@ impl Channel for Telegram {
         // In a task of its own: the router stops waiting after its timeout, but a piece
         // Telegram took then is recorded, so no retry sends it again (`channel::Delivered`).
         let api = self.api.clone();
-        let send = async move {
+        let send = move |sending: crate::channel::Sending| async move {
             for (i, text) in parts.iter().enumerate().skip(sending.before) {
                 let body = json!({"chat_id": chat, "text": text});
                 api.json("sendMessage", body).await?;
@@ -423,7 +425,7 @@ impl Channel for Telegram {
             }
             anyhow::Ok(())
         };
-        tokio::spawn(send).await?
+        crate::channel::detach(sending, send).await
     }
 
     fn live(&self, cfg: tokio::sync::watch::Receiver<Arc<crate::config::Config>>) {

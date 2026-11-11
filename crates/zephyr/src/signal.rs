@@ -532,7 +532,9 @@ impl Channel for Signal {
             parts.push(String::new());
         }
         let last = parts.len().saturating_sub(1);
-        let sending = self.delivered.begin("signal", &msg.client_id)?;
+        let sending = self
+            .delivered
+            .begin("signal", &msg.recipient, &msg.client_id)?;
         // In a task of its own: the router stops waiting after its timeout, but signal-cli sends
         // what it was handed (up to its 60 s), and that is recorded, so no retry sends it again.
         let (rpc, to, file) = (
@@ -540,7 +542,7 @@ impl Channel for Signal {
             msg.recipient.clone(),
             msg.attachment.clone(),
         );
-        let send = async move {
+        let send = move |sending: crate::channel::Sending| async move {
             for (i, text) in parts.into_iter().enumerate().skip(sending.before) {
                 let mut params = json!({"recipient": [to], "message": text});
                 if let (true, Some(file)) = (i == last, &file) {
@@ -560,7 +562,7 @@ impl Channel for Signal {
             }
             Ok(true)
         };
-        if !tokio::spawn(send).await?? {
+        if !crate::channel::detach(sending, send).await? {
             self.changed_identity(&msg.recipient).await;
             anyhow::bail!("signal send failed: IDENTITY_FAILURE");
         }

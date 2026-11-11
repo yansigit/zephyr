@@ -654,6 +654,51 @@ async fn a_send_the_router_stopped_waiting_for_never_sends_a_piece_twice() {
 }
 
 #[tokio::test]
+async fn a_second_reply_waits_for_the_first_to_the_same_chat() {
+    let home = home("in-turn");
+    let (api, bot) = stub().await;
+    bot.lock()
+        .unwrap()
+        .slow
+        .insert("sendMessage".into(), Duration::from_millis(400));
+    let tg = adapter(&config(&home, &api, "progress = false"));
+    let reply = |id: &str, text: String| Outbound {
+        channel: "telegram".into(),
+        recipient: "55".into(),
+        client_id: id.into(),
+        text,
+        attachment: None,
+        reply_to: None,
+    };
+    let first = reply("z1", format!("{}{}", "a".repeat(4096), "a".repeat(10)));
+    let second = reply("z2", "b".into());
+    // The first is cut off by the router's wait, and goes on; the second must not cut in.
+    let _ = tokio::time::timeout(Duration::from_millis(100), tg.send(&first)).await;
+    let mut done = [false, false];
+    for _ in 0..100 {
+        for (i, m) in [&first, &second].into_iter().enumerate() {
+            if !done[i] {
+                done[i] = tg.send(m).await.is_ok();
+            }
+        }
+        if done == [true, true] {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(done, [true, true]);
+    let order: Vec<char> = calls(&bot, "sendMessage")
+        .iter()
+        .map(|b| b["text"].as_str().unwrap().chars().next().unwrap())
+        .collect();
+    assert_eq!(
+        order,
+        ['a', 'a', 'b'],
+        "the first reply whole, then the second"
+    );
+}
+
+#[tokio::test]
 async fn a_conflict_backs_off() {
     let home = home("conflict");
     let (api, bot) = stub().await;

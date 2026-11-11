@@ -35,6 +35,15 @@ impl Channel for TestChannel {
         std::future::pending().await
     }
     async fn send(&self, msg: &Outbound) -> anyhow::Result<()> {
+        // A `going-<name>` file: the send is still going in the adapter, as Telegram's or
+        // Signal's detached send says (`channel::StillGoing`).
+        if self
+            .db
+            .with_file_name(format!("going-{}", self.name))
+            .exists()
+        {
+            return Err(zephyr::channel::StillGoing.into());
+        }
         // A `stall-<name>` file in the home makes this channel's sends hang, like a stuck client.
         if self
             .db
@@ -2508,6 +2517,45 @@ async fn wrong_codes_close_pairing_and_get_no_reply() {
     assert!(telegram_owners(&home).is_empty());
     gw.say("p2", "owner", "/pair telegram").await;
     reply_starting(&gw, "[zephyr] pairing is closed until ").await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_send_still_going_past_the_window_is_neither_failed_nor_its_file_discarded() {
+    let home = home("still-going");
+    let mut cfg = config(&home);
+    cfg.tick = Duration::from_millis(200);
+    std::fs::write(home.join("shot.txt"), "SHOT").unwrap();
+    std::fs::write(home.join("going-chat"), "").unwrap();
+    let gw = start(cfg);
+    gw.say(
+        "m1",
+        "owner",
+        r#"[call send_file {"path": "shot.txt"}] here"#,
+    )
+    .await;
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    let row = || -> Option<(String, Option<String>)> {
+        db.query_row(
+            "SELECT status, attachment FROM outbox WHERE attachment IS NOT NULL",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()
+    };
+    wait(|| row().is_some()).await;
+    // Past every retry window, while the adapter still says its send goes on.
+    db.execute("UPDATE outbox SET created_at = 0", []).unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await; // several flush passes
+    let (status, file) = row().unwrap();
+    assert_eq!(status, "pending");
+    assert!(
+        Path::new(&file.unwrap()).exists(),
+        "the file it sends is kept"
+    );
+    // The send ends: its true result is recorded.
+    std::fs::remove_file(home.join("going-chat")).unwrap();
+    wait(|| row().is_some_and(|(s, _)| s == "sent")).await;
     gw.shutdown().await;
 }
 
