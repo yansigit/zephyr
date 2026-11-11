@@ -1430,6 +1430,8 @@ fn ending(said: Option<Option<Value>>) -> Ending {
             Some(": zephyr could not tell whether it ran"),
         ),
         Some(Some(v)) if v["ran"] == true => ("done", "the browser went on", None),
+        // The wrapper found the owner holding the desktop after the `allow`.
+        Some(Some(v)) if v["ran"] == false && v["held"] == true => HELD_ENDING,
         Some(Some(v)) if v["ran"] == false => (
             "failed",
             "not run: the page changed while the owner decided",
@@ -3899,6 +3901,13 @@ mod tests {
                 None,
                 ("failed", "the browser did not go on"),
                 Some("did not run: the browser did not go on"),
+            ),
+            // The owner took the desktop over after the `allow`: not a page that changed.
+            (
+                4,
+                Some("{\"ran\": false, \"held\": true}"),
+                ("failed", "not run: the owner had the desktop"),
+                Some("did not run: you had the desktop"),
             ),
         ] {
             let req = json!({"v": 1, "session": "task-1", "tool": "browser",

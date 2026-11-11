@@ -470,7 +470,7 @@ fn taken(
     let Some(text) = held(env) else {
         return Ok(wait);
     };
-    said(wait, false);
+    say(wait, json!({"ran": false, "held": true}));
     Err(Next::Refuse(text))
 }
 
@@ -479,11 +479,18 @@ fn taken(
 /// before the command runs, `{"ran": false}` when it will not. Returns whether it was said (or
 /// there was nothing to say): what the gate cannot be told ran is not run.
 fn said(wait: Option<std::os::unix::net::UnixStream>, ran: bool) -> bool {
+    say(wait, json!({ "ran": ran }))
+}
+
+/// [`said`], in full: `{"ran": false, "held": true}` when the action did not run because the
+/// owner has the desktop, which the gate records and tells the owner as such, not as a page
+/// that changed.
+fn say(wait: Option<std::os::unix::net::UnixStream>, report: Value) -> bool {
     use std::io::Write;
     let Some(mut conn) = wait else {
         return true;
     };
-    let line = format!("{}\n", json!({ "ran": ran }));
+    let line = format!("{report}\n");
     conn.set_write_timeout(Some(FACT_WAIT)).is_ok() && conn.write_all(line.as_bytes()).is_ok()
 }
 
@@ -2184,7 +2191,7 @@ cat "$d/$f.json"
             .unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&said).unwrap(),
-            json!({"ran": false})
+            json!({"ran": false, "held": true})
         );
         assert_eq!(waiting.join().unwrap(), Next::Refuse(back.into()));
         assert_eq!(
