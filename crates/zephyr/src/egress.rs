@@ -768,7 +768,10 @@ impl Conn {
             dest: args,
             // The row's reason never repeats the agent's text: the destination is in its args.
             outcome: Outcome::Refused(refused.reason("this host")),
-            notice: refused.token().map(|t| (t.to_string(), dest.to_string())),
+            notice: (refused
+                .token()
+                .zip(refused.notice(crate::vault::shown(dest))))
+            .map(|(token, text)| (format!("{token} {}", refused.reason("")), dest.into(), text)),
         };
         let _ = self.log.send(note);
         answer(
@@ -827,8 +830,9 @@ struct Note {
     tool: &'static str,
     dest: String,
     outcome: Outcome,
-    /// A token the agent tried to send to a host it is not bound to: `(token, host)`.
-    notice: Option<(String, String)>,
+    /// A token the agent put where it does not go: what makes it the same attempt (the token
+    /// and how, and the host), and what the owner is told.
+    notice: Option<(String, String, String)>,
 }
 
 /// A reply of the proxy's own, its reason in the status line, where `curl -v` and a library's
@@ -910,6 +914,8 @@ impl Decrypted {
         // would read. And the whole reply is asked for, as it is: a range of a body could cut
         // a value in a place of the client's choosing, and an encoded one cannot be read.
         hop_by_hop(&mut parts.headers);
+        // This hop's own: the proxy takes a reply's trailers, and passes them on.
+        (parts.headers).insert(hyper::header::TE, HeaderValue::from_static("trailers"));
         parts.headers.remove(hyper::header::RANGE);
         parts.headers.remove(hyper::header::IF_RANGE);
         let swapped =
@@ -957,7 +963,17 @@ impl Decrypted {
         // stand-in, in the reply's headers and in its body, and so does a credential this
         // request carried encoded. The status line's own text is the server's to choose, so
         // it is left out: the client gets the status's usual words.
+        // A server that ends its connection with this reply leaves the proxy none to send the
+        // client's next request on: the client is told its own ends too, so it reconnects
+        // (a new `CONNECT`, checked afresh) and does not write into a closed one.
+        let closing = (reply.headers().get_all(hyper::header::CONNECTION).iter())
+            .flat_map(|v| v.to_str().unwrap_or_default().split(','))
+            .any(|token| token.trim().eq_ignore_ascii_case("close"));
         hop_by_hop(reply.headers_mut());
+        if closing || sender.lock().await.is_closed() {
+            let close = HeaderValue::from_static("close");
+            reply.headers_mut().insert(hyper::header::CONNECTION, close);
+        }
         reply.extensions_mut().remove::<hyper::ext::ReasonPhrase>();
         crate::broker::unswap(reply.headers_mut(), &map, &self.dest, &swapped.sent);
         let idle = |body| Idle {
@@ -993,11 +1009,11 @@ impl Decrypted {
 /// past the checks, nor keep a say in how the upstream connection is used.
 fn hop_by_hop(headers: &mut hyper::HeaderMap) {
     use hyper::header::{HeaderName, CONNECTION};
-    const ALWAYS: [&str; 7] = [
+    // Not `Trailer`: it describes the message, and goes with it end to end.
+    const ALWAYS: [&str; 6] = [
         "connection",
         "keep-alive",
         "te",
-        "trailer",
         "upgrade",
         "proxy-authorization",
         "proxy-connection",
@@ -1099,7 +1115,7 @@ fn write_audit(store: Store, notes: std::sync::mpsc::Receiver<Note>, mut cfg: Ar
         let rows = match notes.recv_timeout(Duration::from_secs(1)) {
             Ok(note) => {
                 cfg = note.cfg;
-                tell = (note.notice).filter(|(token, host)| notices.due(note.at, token, host));
+                tell = (note.notice).filter(|(what, host, _)| notices.due(note.at, what, host));
                 audit.note(note.at, note.tool, &note.dest, note.outcome)
             }
             Err(RecvTimeoutError::Timeout) => audit.flush(crate::now()).into_iter().collect(),
@@ -1114,12 +1130,9 @@ fn write_audit(store: Store, notes: std::sync::mpsc::Receiver<Note>, mut cfg: Ar
         }
         // It names no command: the answer to an attack should not be one tap from allowing it.
         // shortcut: sent with the router's next tick (5 s), not at once.
-        if let Some((token, host)) = tell {
-            let host = scrub.text(crate::vault::shown(&host));
-            let told = store.notify_last_owner(&format!(
-                "[zephyr] the agent tried to send the vault token {token} to {host}, where it \
-                 is not bound. Nothing was sent."
-            ));
+        if let Some((_, _, text)) = tell {
+            // Scrubbed like a row: a host name may hold a stand-in or a private fact.
+            let told = store.notify_last_owner(&scrub.text(&text));
             if let Err(e) = told {
                 eprintln!("zephyr: telling the owner of a refused token failed: {e}");
             }
@@ -2942,6 +2955,23 @@ table inet zephyr {
                     s.flush().await.ok()?;
                     continue;
                 }
+                // A reply that ends its connection, and one with a trailer after its body.
+                if path == "/close" {
+                    let reply =
+                        "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\nok";
+                    s.write_all(reply.as_bytes()).await.ok()?;
+                    s.flush().await.ok()?;
+                    return None;
+                }
+                if path == "/trailers" {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ntrailer: x-sum\r\n\r\n\
+                         2\r\nok\r\n0\r\nx-sum: {sent}\r\n\r\n"
+                    );
+                    s.write_all(reply.as_bytes()).await.ok()?;
+                    s.flush().await.ok()?;
+                    continue;
+                }
                 if path.starts_with("/echo-chunked") {
                     let start = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n";
                     s.write_all(start.as_bytes()).await.ok()?;
@@ -3078,7 +3108,7 @@ table inet zephyr {
                 let mut text = String::new();
                 for (name, value, hosts, url) in tokens {
                     text += &format!(
-                        "[[token]]\nname = {name:?}\nvalue = {value:?}\nhosts = {hosts:?}\nurl = {url}\n"
+                        "[[token]]\nname = {name:?}\nvalue = {value:?}\nhosts = {hosts:?}\nurl = {url}\nheaders = [\"X-Key\"]\n"
                     );
                 }
                 std::fs::write(self.proxy.dir.join("vault.toml"), text).unwrap();
@@ -3405,7 +3435,7 @@ table inet zephyr {
             // `Connection` is not carried past the checks, nor the server's to the client.
             let hop = format!(
                 "{key}Connection: x-internal, content-length, host\r\nX-Internal: {}\r\nKeep-Alive: timeout=9\r\n\
-                 TE: trailers\r\nProxy-Authorization: Bearer {}\r\n",
+                 TE: gzip\r\nProxy-Authorization: Bearer {}\r\n",
                 s[0], s[0]
             );
             let (head, _) = get_body(&mut tls, &net, "/hop", &hop).await;
@@ -3413,7 +3443,7 @@ table inet zephyr {
             for gone in [
                 "x-internal",
                 "keep-alive",
-                "\r\nte:",
+                "te: gzip",
                 "proxy-authorization",
                 "connection",
             ] {
@@ -3441,6 +3471,55 @@ table inet zephyr {
                 assert!(tokio::time::Instant::now() < deadline, "{:?}", net.rows());
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+        }
+
+        /// When the server ends its connection the client's ends with that reply, and says so:
+        /// the proxy has no upstream left to send a next request on, so the client must not
+        /// be told the connection is kept.
+        #[tokio::test]
+        async fn a_reply_that_closes_upstream_closes_the_clients_connection() {
+            let mut net = Net::start("broker-close", "", true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[("A", A, &[dest.as_str()], false)]);
+            let mut tls = net.bound().await;
+            let request = format!(
+                "GET /close HTTP/1.1\r\nHost: {dest}\r\nX-Key: {}\r\n\r\n",
+                s[0]
+            );
+            let head = ask(&mut tls, &request).await.to_lowercase();
+            assert!(head.starts_with("http/1.1 200 "), "{head}");
+            assert!(head.contains("\r\nconnection: close\r\n"), "{head}");
+            // The body, and then the end: nothing waits for a request that could not be sent.
+            let mut rest = Vec::new();
+            let ended = tokio::time::timeout(Duration::from_secs(3), tls.read_to_end(&mut rest));
+            assert!(ended.await.is_ok(), "the client's connection stayed open");
+            assert!(String::from_utf8_lossy(&rest).contains("ok"));
+            net.head().await;
+            // The next request is a new connection, checked afresh, and works.
+            let mut again = net.bound().await;
+            assert!(get(&mut again, &net, "/", "")
+                .await
+                .starts_with("HTTP/1.1 200 "));
+        }
+
+        /// A trailer is the message's, not one hop's: it reaches the client, with a value in
+        /// it turned back like any header's.
+        #[tokio::test]
+        async fn trailers_reach_the_client_with_their_values_turned_back() {
+            let mut net = Net::start("broker-trailers", "", true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[("A", A, &[dest.as_str()], false)]);
+            let mut tls = net.bound().await;
+            let request = format!(
+                "GET /trailers HTTP/1.1\r\nHost: {dest}\r\nTE: trailers\r\nX-Key: {}\r\n\r\n",
+                s[0]
+            );
+            let head = ask(&mut tls, &request).await.to_lowercase();
+            assert!(head.contains("\r\ntrailer: x-sum\r\n"), "{head}");
+            let rest = read_until(&mut tls, "\r\n\r\n").await;
+            assert!(rest.contains(&format!("x-sum: {}\r\n", s[0])), "{rest}");
+            assert!(!rest.contains(A), "{rest}");
+            net.head().await;
         }
 
         /// A request shaped to be read two ways (a length and a chunked body) reaches the
@@ -3721,11 +3800,25 @@ table inet zephyr {
                 reply.starts_with("HTTP/1.1 403 zephyr: A is not swapped in URLs\r\n"),
                 "{reply}"
             );
+            // A stand-in in a header that is not a credential's: never swapped into it, and
+            // not sent on as it is either.
+            let probe = format!("User-Agent: probe {}\r\n", s[0]);
+            let reply = get(&mut tls, &net, "/", &probe).await;
+            let want = "HTTP/1.1 403 zephyr: A is not swapped in the header user-agent\r\n";
+            assert!(reply.starts_with(want), "{reply}");
             // The connection still works, and the server read only this.
             get(&mut tls, &net, "/fine", "").await;
             assert!(net.head().await.starts_with("GET /fine "));
             assert!(net.up.heads.try_recv().is_err());
-            let rows = net.proxy.net_rows(5).await;
+            let rows = net.proxy.net_rows(6).await;
+            assert!(
+                rows.contains(&(
+                    "swap".into(),
+                    format!("A -> {dest}"),
+                    "refused: A is not swapped in the header user-agent".into()
+                )),
+                "{rows:?}"
+            );
             assert!(
                 rows.contains(&(
                     "swap".into(),

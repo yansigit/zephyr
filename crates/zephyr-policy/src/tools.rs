@@ -338,7 +338,8 @@ pub const TOOLS: [(&str, &str, &str, ToolExecuteFn); 8] = [
          owner's OK: then you are told so; tell the owner and end your turn. Tokens are used \
          through `exec` with `secrets`: the command gets a stand-in, which zephyr swaps for the \
          real token only in HTTPS requests to the hosts the owner bound it to (`list` shows \
-         them). To use a token on another host, `bind` it with `name` and `hosts` (exact names, \
+         them), and only in the `Authorization` header (Bearer or Basic) or a header the owner \
+         listed for it: in any other header the request is refused. To use a token on another host, `bind` it with `name` and `hosts` (exact names, \
          no wildcards): the owner is asked, and you end your turn. When a credential is missing, `request` it with a \
          `name` (logins: lowercase like github; tokens: an env var name like GH_TOKEN), its \
          `kind`, the `site` for a login, and `why`: the owner is asked to save it, and you get a \

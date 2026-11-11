@@ -1997,10 +1997,13 @@ mod tests {
         let text = "[[mcp]]\nname = \"notes\"\nurl = \"https://n.test/mcp\"\n\
                     [[mcp]]\nname = \"local\"\ncommand = \"srv\"\n";
         let cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = '/h'\n{text}")).unwrap();
-        // A `url` connector holds its real secrets (rpi's own client makes its requests), so
-        // nothing of it is swapped anywhere.
-        assert_eq!(value(&cfg, "mcp.notes.hosts"), None);
-        assert_eq!(value(&cfg, "mcp.notes.secrets").as_deref(), Some("plain"));
+        // Plain is never implied: a connector holds stand-ins until the owner says otherwise,
+        // and a remote one's would go to its own URL's host.
+        assert_eq!(value(&cfg, "mcp.notes.hosts").as_deref(), Some("n.test"));
+        assert_eq!(
+            value(&cfg, "mcp.notes.secrets").as_deref(),
+            Some("surrogate")
+        );
         assert_eq!(value(&cfg, "mcp.local.hosts"), None);
         assert_eq!(
             value(&cfg, "mcp.local.secrets").as_deref(),

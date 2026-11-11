@@ -131,8 +131,8 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   40 hex, HMAC-derived from `<state>/broker.key`) for each vault token and connector secret:
   `vault::exec_env` and `drafts::prepare` hand it out under the floor (`broker::on`), never the
   value in its place. `broker.rs` is pure: `parse_host` (exact names, no wildcard), `Map`
-  (surrogate to value and hosts), `swap` (headers, Basic, the target only with `url`; never a
-  body), `scan` (a surrogate where nothing is swapped). `egress.rs` decrypts a `CONNECT` only
+  (surrogate to value and hosts), `swap` (only credential headers: `Authorization` and the ones the owner listed; Basic;
+  the target only with `url`; never a body), `scan` (a surrogate where nothing is swapped). `egress.rs` decrypts a `CONNECT` only
   to a bound `host:port` (`serve_tls`, `Decrypted`): a leaf from `ca::Authority`, the upstream
   verified against `ca::public_roots` (webpki-roots compiled in; nothing the agent can plant),
   one `Host`, HTTP/1.1 only, hop-by-hop headers, `Range` and upgrades stripped (a 101, a 206 and an
@@ -143,9 +143,10 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   renewed only by `supervise` at a container start (`ca::start`), and installs it for the
   agent's tools (system bundle, `agent::CA_ENV`, the agent's NSS store, Camoufox's policies).
   Bindings come only from the owner on a strong channel (`/vault bind`, the strong rows
-  `mcp.<name>.hosts` and `.secrets`; never from a connector draft). A `url` connector keeps
-  its real secret in `mcp.json` (`broker::plain`): rpi's own MCP client cannot reach a
-  decrypted host. A surrogate, a token and a key never reach a log, `Debug`, an audit row or a
+  `mcp.<name>.hosts` and `.secrets`; never from a connector draft). `plain` is never implied (`broker::plain`): a
+  `url` connector with a secret is not published until the owner settles it (rpi's own MCP
+  client cannot reach a decrypted host), and the upgrade writes `secrets = "plain"` for
+  those that were there (`Router::settle_remote_connectors`). A surrogate, a token and a key never reach a log, `Debug`, an audit row or a
   notice.
 - `egress.rs` (DESIGN §4.20): the network floor. In bridge mode (`ZEPHYR_NETWORK=bridge`, set by
   `zephyr up` unless host.toml says `network = "host"`) the agent's uid has no route but its own

@@ -12,10 +12,13 @@
 //! zephyr init --non-interactive --no-start --projects "$HOME/p" --provider anthropic --model anthropic/claude-sonnet-5
 //! zephyr config set attach.port 18790
 //! echo 'A3_SECRET=a3-secret-value-0123456789' >> "$HOME/.zephyr-daemon/secrets.env"
-//! zephyr mcp add echo --url 'https://httpbin.org/get?key=${A3_SECRET}' --header 'X-Key=${A3_SECRET}'
-//! # A `url` connector holds its real secret unless told otherwise (rpi's own MCP client cannot
-//! # reach a decrypted host); the test only needs a stand-in bound to the echo host.
-//! sed -i 's/^name = "echo"/name = "echo"\nsecrets = "surrogate"/' "$HOME/.zephyr-daemon/zephyr.toml"
+//! echo 'A3_QUOTED=a3"quoted/secret-0123456789' >> "$HOME/.zephyr-daemon/secrets.env"
+//! # A remote connector holds a real secret or a stand-in as the owner says; rpi's own MCP client
+//! # could not use the stand-in, and the test only needs one bound to the echo host.
+//! zephyr mcp add echo --url 'https://httpbin.org/get?key=${A3_SECRET}' --header 'X-Key=${A3_SECRET}' --plain
+//! zephyr config set mcp.echo.secrets surrogate
+//! # A second secret, with characters JSON escapes, sent in `Authorization`.
+//! zephyr mcp add quoted --host httpbin.org -- true '${A3_QUOTED}'
 //! zephyr up --build
 //! cargo test -p zephyr --test token_broker -- --ignored
 //! ```
@@ -92,8 +95,14 @@ fn the_agent_holds_stand_ins_and_the_proxy_swaps_them_only_where_bound() {
     // What the agent can read holds a stand-in for the connector's secret, never the secret.
     let published = side.sh("cat /var/lib/zephyr-public/mcp.json");
     assert!(!published.contains(&secret), "{published}");
-    let at = published.find("zsur_").expect("a stand-in in mcp.json");
-    let stand_in = &published[at..at + 45];
+    let servers: serde_json::Value = serde_json::from_str(&published).expect("mcp.json");
+    let stand_in = servers["mcpServers"]["echo"]["headers"]["X-Key"]
+        .as_str()
+        .expect("the echo connector's stand-in");
+    let quoted = servers["mcpServers"]["quoted"]["args"][0]
+        .as_str()
+        .expect("the quoted connector's stand-in");
+    assert!(stand_in.starts_with("zsur_") && stand_in.len() == 45 && quoted != stand_in);
     assert!(
         stand_in[5..].bytes().all(|b| b.is_ascii_hexdigit()),
         "{stand_in}"
@@ -154,6 +163,28 @@ fn the_agent_holds_stand_ins_and_the_proxy_swaps_them_only_where_bound() {
     assert!(
         !basic.contains(&b64.encode(format!("x:{secret}"))),
         "{basic}"
+    );
+    // A stand-in goes into a credential header only: in any other the request is refused, not
+    // swapped and not sent on.
+    let stray = side.sh(&format!(
+        "curl -sS -m 30 -o /dev/null -D - -A 'probe {stand_in}' 'https://{echo}/get'"
+    ));
+    assert!(
+        stray.contains("403 zephyr: A3_SECRET is not swapped in the header user-agent"),
+        "{stray}"
+    );
+    // A secret the server sends back JSON-escaped (`\"`, and `\/` from some) is turned back
+    // too: this one holds a quote and a slash, and goes in `Authorization`.
+    let escaped = side.sh(&format!(
+        "curl -sS -m 60 -H 'Authorization: Bearer {quoted}' 'https://{echo}/get'"
+    ));
+    assert!(
+        escaped.contains(&format!("\"Authorization\": \"Bearer {quoted}\"")),
+        "{escaped}"
+    );
+    assert!(
+        !escaped.contains("quoted/secret") && !escaped.contains("a3\\\"quoted"),
+        "{escaped}"
     );
     // A part of a reply is not asked for, whatever the client says.
     let ranged = side.sh(&format!(

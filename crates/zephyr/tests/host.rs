@@ -943,6 +943,33 @@ fn mcp_add_takes_hosts_and_plain_and_keeps_them() {
     );
     env.ok(&["mcp", "add", "mail", "--", "third-server"]);
     assert!(env.config().contains("secrets = \"plain\""));
+    // A remote connector can only hold its real secret, where the agent can read it: adding
+    // one with a secret says so and asks for `--plain`; without a secret there is nothing to say.
+    let remote = [
+        "mcp",
+        "add",
+        "docs",
+        "--url",
+        "https://docs.example.com/mcp",
+    ];
+    let header = ["--header", "Authorization=Bearer ${DOCS_TOKEN}"];
+    let with_secret = [&remote[..], &header[..]].concat();
+    let out = env.zephyr(&with_secret);
+    assert!(!out.status.success());
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(said.contains("add --plain to accept that"), "{said}");
+    assert!(!env.config().contains("docs.example.com"));
+    env.ok(&[&with_secret[..], &["--plain"]].concat());
+    let config = env.config();
+    let docs = config.split("[[mcp]]").find(|t| t.contains("\"docs\""));
+    assert!(docs.unwrap().contains("secrets = \"plain\""), "{config}");
+    env.ok(&[
+        "mcp",
+        "add",
+        "open",
+        "--url",
+        "https://open.example.com/mcp",
+    ]);
     // A wildcard is refused and nothing is written.
     let before = env.config();
     let out = env.zephyr(&["mcp", "add", "mail", "--host", "*.mail.test", "--", "x"]);
@@ -3217,7 +3244,11 @@ fn vault_add_list_and_rm_reach_roots_file_and_never_put_a_value_in_argv() {
         "API.example.com",
     ];
     let out = env.zephyr_input(
-        &[&add[..], &["--host", "example.com:8443"]].concat(),
+        &[
+            &add[..],
+            &["--host", "example.com:8443", "--header", "X-Api-Key"],
+        ]
+        .concat(),
         "k-123456\n",
     );
     let said = stdout(&out);
@@ -3230,6 +3261,8 @@ fn vault_add_list_and_rm_reach_roots_file_and_never_put_a_value_in_argv() {
         saved.contains("hosts = [\"api.example.com:443\", \"example.com:8443\"]"),
         "{saved}"
     );
+    // And the headers it is swapped in besides Authorization.
+    assert!(saved.contains("headers = [\"x-api-key\"]"), "{saved}");
     let wild = ["vault", "add", "token", "WILD", "--host", "*.example.com"];
     assert!(!env.zephyr_input(&wild, "k-123456\n").status.success());
     assert!(!std::fs::read_to_string(files.join("vault.toml"))

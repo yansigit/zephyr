@@ -2051,7 +2051,7 @@ mod tests {
             let answered = match *group {
                 "Memory" => {
                     crate::memory::command(&dir, &dir, &text, true).is_some()
-                        || crate::drafts::command(&cfg, &text, true).is_some()
+                        || crate::drafts::command(&cfg, &text, true, true).is_some()
                         // A rule is a setting: the router's `set_setting` calls `memory::rule`.
                         || (text.strip_prefix("/rule "))
                             .is_some_and(|arg| crate::memory::rule(&dir, arg).is_ok())

@@ -97,6 +97,12 @@ pub struct Secret {
     surrogate: String,
     pub hosts: Vec<String>,
     pub url: bool,
+    /// The request headers it is swapped in, lower case: `authorization`, and those the owner
+    /// listed. In any other header a surrogate is refused, never swapped: a server may send a
+    /// header it does not know back, or log it.
+    pub headers: Vec<String>,
+    /// Every other text the value turns into (`encodings`), worked out once.
+    forms: Vec<String>,
 }
 
 impl std::fmt::Debug for Secret {
@@ -105,8 +111,76 @@ impl std::fmt::Debug for Secret {
             .field("name", &self.name)
             .field("hosts", &self.hosts)
             .field("url", &self.url)
+            .field("headers", &self.headers)
             .finish()
     }
+}
+
+/// The header every secret is swapped in.
+const CREDENTIAL: &str = "authorization";
+
+/// A header name as bindings keep it: lower case, and a name HTTP takes.
+pub fn header_name(name: &str) -> Result<String, String> {
+    let name = name.trim().to_ascii_lowercase();
+    match hyper::header::HeaderName::from_bytes(name.as_bytes()) {
+        Ok(_) if !name.is_empty() => Ok(name),
+        _ => Err(format!("{name:?} is not a header name")),
+    }
+}
+
+/// The texts a value turns into when a server sends it back encoded: its base64 at every
+/// alignment (`vault::base64_forms`), JSON string escapes (`\/`, `\uXXXX` for what is not
+/// ASCII, in either case of hex) and percent-encoding (of everything but unreserved
+/// characters, or as a URI component or a form field, in either case of hex). The value
+/// itself is not among them. What is not: other cases, HTML entities, line-wrapped base64,
+/// anything derived from the value (DESIGN §4.21 "What it does not stop").
+fn encodings(value: &str) -> Vec<String> {
+    let mut out = crate::vault::base64_forms(value);
+    let json = serde_json::to_string(value).unwrap_or_default();
+    let json = json.trim_matches('"').to_string();
+    let ascii = |text: &str, upper: bool| -> String {
+        let mut out = String::new();
+        for c in text.chars() {
+            match c.is_ascii() {
+                true => out.push(c),
+                false => {
+                    for unit in c.encode_utf16(&mut [0; 2]) {
+                        out.push_str(&match upper {
+                            true => format!("\\u{unit:04X}"),
+                            false => format!("\\u{unit:04x}"),
+                        });
+                    }
+                }
+            }
+        }
+        out
+    };
+    for text in [json.clone(), json.replace('/', "\\/")] {
+        out.extend([ascii(&text, false), ascii(&text, true), text]);
+    }
+    let percent = |keep: &str, plus: bool, upper: bool| -> String {
+        let mut out = String::new();
+        for b in value.bytes() {
+            match b {
+                b' ' if plus => out.push('+'),
+                b if b.is_ascii_alphanumeric() || keep.as_bytes().contains(&b) => {
+                    out.push(b as char)
+                }
+                b if upper => out.push_str(&format!("%{b:02X}")),
+                b => out.push_str(&format!("%{b:02x}")),
+            }
+        }
+        out
+    };
+    for upper in [true, false] {
+        out.push(percent("-._~", false, upper));
+        out.push(percent("-._~!*'()", false, upper));
+        out.push(percent("-._*", true, upper));
+    }
+    out.retain(|form| form != value && form.len() >= MIN_UNSWAP);
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Surrogate to secret, for every brokered token and connector secret. The values live here, in
@@ -175,25 +249,71 @@ pub fn connector_hosts(m: &Mcp) -> Vec<String> {
     own.into_iter().collect()
 }
 
-/// Whether `m` holds its real secrets. A `command` connector holds stand-ins unless the owner
-/// says `secrets = "plain"`. A `url` connector holds the real ones unless the owner says
-/// `secrets = "surrogate"`: its requests are made by rpi's own MCP client, which trusts only
-/// the roots compiled into it and so cannot reach a host the proxy decrypts (checked against
-/// rpi 0.21.2; DESIGN §4.21). Binding it would break it, so it stays as it was before the
-/// broker, and `doctor` says so.
+/// Whether `m` holds its real secrets: only when the owner wrote `secrets = "plain"`.
 pub fn plain(m: &Mcp) -> bool {
-    match m.secrets.as_deref() {
-        Some("plain") => true,
-        Some(_) => false,
-        None => m.url.is_some(),
-    }
+    m.secrets.as_deref() == Some("plain")
 }
 
-/// Whether `m` names a secret and has nowhere to send it: a `command` connector, or one on
-/// plain `http`, with no `hosts`. Such a connector is left out until the owner lists hosts or
-/// says `secrets = "plain"`.
+/// A remote (`url`) connector that names a secret and for which nobody has said how it holds
+/// it. Its requests are made by rpi's own MCP client, which trusts only the roots compiled
+/// into it and so cannot reach a host the proxy decrypts (checked against rpi 0.21.2; DESIGN
+/// §4.21): a stand-in would break it, and the real secret in `mcp.json` is the owner's to
+/// choose, never a default. Until they do (`secrets = "plain"`, or `"surrogate"` to bind it
+/// all the same) it is not published. The upgrade writes `plain` for those that were there
+/// before the broker (`unsettled`), which is what they had.
+pub fn undecided(m: &Mcp) -> bool {
+    m.url.is_some() && m.secrets.is_none() && !connector_names(m).0.is_empty()
+}
+
+/// The connectors the upgrade settles as `plain`: every `undecided` one.
+pub fn unsettled(cfg: &Config) -> Vec<String> {
+    let names = cfg
+        .mcp
+        .iter()
+        .filter(|m| undecided(m))
+        .map(|m| m.name.clone());
+    names.collect()
+}
+
+/// Whether `m` holds stand-ins.
+fn stands_in(m: &Mcp) -> bool {
+    !plain(m) && !undecided(m)
+}
+
+/// Whether `m` holds stand-ins, names a secret and has nowhere to send it: a `command`
+/// connector, or one on plain `http`, with no `hosts`. Such a connector is left out until the
+/// owner lists hosts or says `secrets = "plain"`.
 fn nowhere(m: &Mcp) -> bool {
-    !plain(m) && !connector_names(m).0.is_empty() && connector_hosts(m).is_empty()
+    stands_in(m) && !connector_names(m).0.is_empty() && connector_hosts(m).is_empty()
+}
+
+/// Each secrets.env name that one connector holds as it is (`plain`) and another as a
+/// stand-in, as `(name, the plain connector, the other)`. One name cannot be both: the agent
+/// would read from the first what the second is there to keep from it. Neither connector is
+/// published, `/set` refuses to make one, and `doctor` fails.
+pub fn shared(cfg: &Config) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for p in cfg.mcp.iter().filter(|m| plain(m)) {
+        for name in connector_names(p).0 {
+            let other =
+                (cfg.mcp.iter()).find(|m| stands_in(m) && connector_names(m).0.contains(&name));
+            if let Some(other) = other {
+                out.push((name, p.name.clone(), other.name.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// `shared`, as the one line a refusal says.
+pub fn shared_refusal(cfg: &Config) -> Result<(), String> {
+    match shared(cfg).first() {
+        Some((name, plain, other)) => Err(format!(
+            "the secret {name} would be held as it is by the connector {plain} and as a stand-in by \
+             {other}; one name cannot be both: give one of them a secret of its own"
+        )),
+        None => Ok(()),
+    }
 }
 
 /// What `drafts::filled` fills `m`'s `${NAME}`s with, from secrets.env (`env`): surrogates
@@ -205,8 +325,26 @@ pub fn connector_secrets(
     m: &Mcp,
     env: &[(String, String)],
 ) -> Result<Vec<(String, String)>, String> {
-    if !on(cfg) || plain(m) || connector_names(m).0.is_empty() {
+    if !on(cfg) || connector_names(m).0.is_empty() {
         return Ok(env.to_vec());
+    }
+    let clash =
+        |(_, plain, other): &&(String, String, String)| *plain == m.name || *other == m.name;
+    if let Some((name, plain, other)) = shared(cfg).iter().find(clash) {
+        return Err(format!(
+            "the secret {name} is held as it is by the connector {plain} and as a stand-in by \
+             {other}; one name cannot be both"
+        ));
+    }
+    if plain(m) {
+        return Ok(env.to_vec());
+    }
+    if undecided(m) {
+        return Err(format!(
+            "it is a remote connector with a secret, which rpi's own client can only use as it \
+             is: /set mcp.{0}.secrets plain, from a strong channel, hands it the real one",
+            m.name
+        ));
     }
     if nowhere(m) {
         return Err(format!(
@@ -229,6 +367,8 @@ impl Map {
             surrogate,
             hosts: Vec::new(),
             url: false,
+            headers: vec![CREDENTIAL.into()],
+            forms: encodings(value),
         })
     }
 
@@ -241,10 +381,19 @@ impl Map {
             let secret = map.insert(key, "token", &e.name, &e.value);
             secret.hosts = e.hosts.iter().filter_map(|h| parse_host(h).ok()).collect();
             secret.url = e.url;
+            secret
+                .headers
+                .extend(e.headers.iter().filter_map(|h| header_name(h).ok()));
         }
-        for m in cfg.mcp.iter().filter(|m| !plain(m)) {
+        for m in cfg.mcp.iter().filter(|m| stands_in(m)) {
             let (names, in_url) = connector_names(m);
             let hosts = connector_hosts(m);
+            // A connector's secret is also swapped in the headers its own config puts it in.
+            let own = |name: &str| -> Vec<String> {
+                let naming = |(_, v): &(&String, &String)| v.contains(&format!("${{{name}}}"));
+                let keys = m.headers.iter().filter(naming).map(|(k, _)| k);
+                keys.filter_map(|k| header_name(k).ok()).collect()
+            };
             for name in names {
                 let Some((_, value)) = env.iter().find(|(k, _)| *k == name) else {
                     continue;
@@ -256,6 +405,11 @@ impl Map {
                     }
                 }
                 secret.url |= in_url.contains(&name);
+                for header in own(&name) {
+                    if !secret.headers.contains(&header) {
+                        secret.headers.push(header);
+                    }
+                }
             }
         }
         for surrogate in map.by.keys() {
@@ -378,6 +532,8 @@ pub enum Refused {
     NotInUrl(String),
     /// The real value cannot be written into a header or a URL.
     Unsendable(String),
+    /// In a request header other than the ones this token is swapped in: `(token, header)`.
+    NotInHeader(String, String),
 }
 
 impl Refused {
@@ -388,13 +544,31 @@ impl Refused {
             Refused::Unknown => "unknown vault surrogate".into(),
             Refused::NotInUrl(name) => format!("{name} is not swapped in URLs"),
             Refused::Unsendable(name) => format!("the vault token {name} cannot be sent as it is"),
+            Refused::NotInHeader(name, header) => {
+                format!("{name} is not swapped in the header {header}")
+            }
+        }
+    }
+
+    /// What the owner is told: the agent put a token that exists where it does not go.
+    pub fn notice(&self, host: &str) -> Option<String> {
+        match self {
+            Refused::NotBound(name) => Some(format!(
+                "[zephyr] the agent tried to send the vault token {name} to {host}, where it is \
+                 not bound. Nothing was sent."
+            )),
+            Refused::NotInHeader(name, header) => Some(format!(
+                "[zephyr] the agent tried to send the vault token {name} to {host} in the header \
+                 {header}, where it is not swapped. Nothing was sent."
+            )),
+            _ => None,
         }
     }
 
     /// The token the owner is told about: one that exists and was sent where it is not bound.
     pub fn token(&self) -> Option<&str> {
         match self {
-            Refused::NotBound(name) => Some(name),
+            Refused::NotBound(name) | Refused::NotInHeader(name, _) => Some(name),
             _ => None,
         }
     }
@@ -487,14 +661,19 @@ pub fn swap(
     fn real(
         s: &Secret,
         host: &str,
-        in_url: bool,
+        // The header it stands in, or `None` for the path and query.
+        header: Option<&str>,
         used: &mut Vec<String>,
     ) -> Result<Vec<u8>, Refused> {
         if !s.hosts.iter().any(|h| h == host) {
             return Err(Refused::NotBound(s.name.clone()));
         }
-        if in_url && !s.url {
-            return Err(Refused::NotInUrl(s.name.clone()));
+        match header {
+            None if !s.url => return Err(Refused::NotInUrl(s.name.clone())),
+            Some(h) if !s.headers.iter().any(|own| own == h) => {
+                return Err(Refused::NotInHeader(s.name.clone(), h.to_string()))
+            }
+            _ => {}
         }
         if !used.contains(&s.name) {
             used.push(s.name.clone());
@@ -504,7 +683,7 @@ pub fn swap(
     let mut used: Vec<String> = Vec::new();
     let target = uri.path_and_query().map_or("/", |p| p.as_str()).to_string();
     encoded(target.as_bytes(), map, Some(host))?;
-    let new_uri = match replace(target.as_bytes(), map, |s| real(s, host, true, &mut used))? {
+    let new_uri = match replace(target.as_bytes(), map, |s| real(s, host, None, &mut used))? {
         Some(bytes) => {
             let unsendable = || Refused::Unsendable(used.first().cloned().unwrap_or_default());
             let mut parts = uri.clone().into_parts();
@@ -521,7 +700,7 @@ pub fn swap(
             .then(|| basic(value.as_bytes()))
             .flatten();
         let in_basic = match &decoded {
-            Some((_, d)) => replace(d, map, |s| real(s, host, false, &mut used))?,
+            Some((_, d)) => replace(d, map, |s| real(s, host, Some(name.as_str()), &mut used))?,
             None => None,
         };
         let swapped = match (in_basic, &decoded) {
@@ -530,7 +709,9 @@ pub fn swap(
                 sent.push((payload.clone().into_bytes(), written.as_bytes().to_vec()));
                 Some(format!("Basic {payload}").into_bytes())
             }
-            _ => replace(value.as_bytes(), map, |s| real(s, host, false, &mut used))?,
+            _ => replace(value.as_bytes(), map, |s| {
+                real(s, host, Some(name.as_str()), &mut used)
+            })?,
         };
         let Some(bytes) = swapped else {
             encoded(value.as_bytes(), map, Some(host))?;
@@ -646,8 +827,8 @@ const MIN_UNSWAP: usize = 4;
 impl Map {
     /// What turns the real values bound to `host` back into their surrogates in a reply from
     /// it: every secret the proxy would put into a request there, used by this request or not,
-    /// and the base64 text each always turns into (`vault::base64_forms`: inside a Basic
-    /// credential, a JSON blob, a token of tokens). `sent` are the encoded credentials this
+    /// and every other text each turns into when encoded (`encodings`: base64, JSON escapes,
+    /// percent-encoding), worked out when the map was built. `sent` are the encoded credentials this
     /// request carried (`Swapped::sent`), which go back to exactly what the agent's program
     /// wrote; being longer, they are tried first.
     pub fn unswapper(&self, host: &str, sent: &[(Vec<u8>, Vec<u8>)]) -> Replacer {
@@ -656,7 +837,7 @@ impl Map {
         for s in self.by.values().filter(here) {
             let surrogate = s.surrogate.clone().into_bytes();
             pairs.push((s.value.clone().into_bytes(), surrogate.clone()));
-            let forms = crate::vault::base64_forms(&s.value).into_iter();
+            let forms = s.forms.iter().cloned();
             pairs.extend(forms.map(|f| (f.into_bytes(), surrogate.clone())));
         }
         Replacer::new(pairs)
@@ -724,7 +905,7 @@ pub fn secrets(cfg: &Config, vault: &Vault) -> Vec<(String, String)> {
 
 /// What the owner is told once after the upgrade: each token that cannot be used until it is
 /// bound. `None` when there is none, or the vault cannot be read.
-pub fn upgrade_notice(cfg: &Config) -> anyhow::Result<Option<String>> {
+pub fn upgrade_notice(cfg: &Config, kept: &[String]) -> anyhow::Result<Option<String>> {
     let vault = Vault::load(&crate::vault::path(cfg))?;
     let unbound = |e: &crate::vault::Entry| e.kind == Kind::Token && !e.raw && e.hosts.is_empty();
     let mut lines: Vec<String> = (vault.entries().iter().filter(|e| unbound(e)))
@@ -738,18 +919,26 @@ pub fn upgrade_notice(cfg: &Config) -> anyhow::Result<Option<String>> {
             m.name
         )
     }));
-    if lines.is_empty() {
+    if lines.is_empty() && kept.is_empty() {
         return Ok(None);
     }
-    lines.insert(
-        0,
-        "[zephyr] vault tokens and connector secrets now go to the agent as stand-ins, swapped for \
-         the real one only on hosts you name. Until you bind one it cannot be \
-         used:"
-            .into(),
-    );
-    lines.push("To hand one out as before: /vault raw NAME on.".into());
-    Ok(Some(lines.join("\n")))
+    let mut text = "[zephyr] vault tokens and connector secrets now go to the agent as stand-ins, \
+                    swapped for the real one only on hosts you name."
+        .to_string();
+    if !lines.is_empty() {
+        text += " Until you bind one it cannot be used:\n";
+        text += &lines.join("\n");
+        text += "\nTo hand one out as before: /vault raw NAME on.";
+    }
+    if !kept.is_empty() {
+        text += &format!(
+            "\nRemote connectors keep their real secret, as before, which the agent can read \
+             (secrets = \"plain\", written by this upgrade: rpi's own client cannot use a \
+             stand-in): {}",
+            kept.join(", ")
+        );
+    }
+    Ok(Some(text))
 }
 
 /// How a line of `doctor` reads.
@@ -878,7 +1067,9 @@ pub fn doctor(
     for m in &cfg.mcp {
         let name = &m.name;
         let names = connector_names(m).0;
-        if plain(m) && !names.is_empty() && m.secrets.is_none() {
+        if undecided(m) {
+            say(Level::Fail, format!("the connector {name} is left out: it is a remote connector with a secret ({}), which rpi's own client can only use as it is: /set mcp.{name}.secrets plain from a strong channel", names.join(", ")));
+        } else if plain(m) && !names.is_empty() && m.url.is_some() {
             say(Level::Warn, format!("the connector {name} holds its real secrets ({}), which the agent can read: rpi's own MCP client cannot reach a host zephyr decrypts", names.join(", ")));
         } else if plain(m) && !names.is_empty() {
             say(
@@ -895,6 +1086,9 @@ pub fn doctor(
                 ),
             );
         }
+    }
+    for (secret, plain, other) in shared(cfg) {
+        say(Level::Fail, format!("the secret {secret} is held as it is by the connector {plain} and as a stand-in by {other}: neither is published until one of them has a secret of its own"));
     }
     if !cfg.agent.env.is_empty() {
         let names = cfg.agent.env.join(", ");
@@ -938,8 +1132,8 @@ mod tests {
     /// A on a.test (headers only), B on b.test:8443 (URLs too), C bound nowhere.
     fn vault() -> Vault {
         Vault::parse(&format!(
-            "[[token]]\nname = \"A\"\nvalue = \"{A_VALUE}\"\nhosts = [\"a.test:443\"]\n\
-             [[token]]\nname = \"B\"\nvalue = \"{B_VALUE}\"\nhosts = [\"b.test:8443\", \"a.test:443\"]\nurl = true\n\
+            "[[token]]\nname = \"A\"\nvalue = \"{A_VALUE}\"\nhosts = [\"a.test:443\"]\nheaders = [\"X-Api-Key\", \"x-a\", \"x-key\"]\n\
+             [[token]]\nname = \"B\"\nvalue = \"{B_VALUE}\"\nhosts = [\"b.test:8443\", \"a.test:443\"]\nurl = true\nheaders = [\"x-b\"]\n\
              [[token]]\nname = \"C\"\nvalue = \"unbound-value-1\"\n\
              [[token]]\nname = \"R\"\nvalue = \"raw-value-12345\"\nraw = true\nhosts = [\"a.test:443\"]\n"
         ))
@@ -1113,7 +1307,7 @@ mod tests {
     #[test]
     fn a_value_that_cannot_be_a_header_is_refused_by_name() {
         let vault = Vault::parse(
-            "[[token]]\nname = \"NL\"\nvalue = \"line1\\nline2\"\nhosts = [\"a.test:443\"]\nurl = true\n",
+            "[[token]]\nname = \"NL\"\nvalue = \"line1\\nline2\"\nhosts = [\"a.test:443\"]\nurl = true\nheaders = [\"x-key\"]\n",
         )
         .unwrap();
         let map = Map::build(&config(""), &vault, &[], &KEY);
@@ -1291,7 +1485,7 @@ mod tests {
         let cfg: Config = toml::from_str(&format!(
             "rpi = '/r'\nhome = {dir:?}\nstate = {state:?}\n[agent]\nenv = ['OPENAI_API_KEY']\n\
              [[mcp]]\nname = 'docs'\nurl = 'https://docs.test/mcp'\nheaders = {{ A = '${{DOCS_TOKEN}}' }}\nsecrets = 'surrogate'\n\
-             [[mcp]]\nname = 'remote'\nurl = 'https://remote.test/mcp'\nheaders = {{ A = '${{DB_PASSWORD}}' }}\n\
+             [[mcp]]\nname = 'remote'\nurl = 'https://remote.test/mcp'\nheaders = {{ A = '${{REMOTE_KEY}}' }}\nsecrets = 'plain'\n\
              [[mcp]]\nname = 'db'\ncommand = 'db'\nenv = {{ P = '${{DB_PASSWORD}}' }}\nsecrets = 'plain'\n\
              [[mcp]]\nname = 'local'\ncommand = 'srv'\nenv = {{ K = '${{DOCS_TOKEN}}' }}\n"
         ))
@@ -1352,7 +1546,7 @@ mod tests {
             "Warn the token URL is also swapped in URLs",
             "Warn the token LOOSE is bound to no host, so it cannot be used: /vault bind LOOSE HOST..\n",
             "Warn the connector db holds its real secrets (secrets = \"plain\")\n",
-            "Warn the connector remote holds its real secrets (DB_PASSWORD), which the agent can read: rpi's own MCP client cannot reach a host zephyr decrypts\n",
+            "Warn the connector remote holds its real secrets (REMOTE_KEY), which the agent can read: rpi's own MCP client cannot reach a host zephyr decrypts\n",
             "Warn the connector docs holds stand-ins (secrets = \"surrogate\"), but rpi's own MCP client cannot reach a host zephyr decrypts: its calls will fail\n",
             "Warn the connector local is left out: it names a secret and no host to send it to\n",
             "Warn [agent] env hands every command of the agent the real OPENAI_API_KEY\n",
@@ -1493,20 +1687,141 @@ mod tests {
     }
 
     #[test]
-    fn a_url_connector_keeps_its_secret_and_a_command_connector_holds_a_stand_in() {
+    fn a_remote_connector_holds_a_secret_only_as_the_owner_said() {
         let cfg = config(
             "[[mcp]]\nname = \"remote\"\nurl = \"https://r.test/mcp\"\nheaders = { A = \"${K}\" }\n\
-             [[mcp]]\nname = \"asked\"\nurl = \"https://s.test/mcp\"\nheaders = { A = \"${K}\" }\nsecrets = \"surrogate\"\n\
-             [[mcp]]\nname = \"local\"\ncommand = \"srv\"\nenv = { A = \"${K}\" }\nhosts = \"l.test\"\n\
-             [[mcp]]\nname = \"db\"\ncommand = \"db\"\nenv = { A = \"${K}\" }\nsecrets = \"plain\"\n",
+             [[mcp]]\nname = \"asked\"\nurl = \"https://s.test/mcp\"\nheaders = { X-Token = \"${K2}\" }\nsecrets = \"surrogate\"\n\
+             [[mcp]]\nname = \"local\"\ncommand = \"srv\"\nenv = { A = \"${K2}\" }\nhosts = \"l.test\"\n\
+             [[mcp]]\nname = \"db\"\ncommand = \"db\"\nenv = { A = \"${K3}\" }\nsecrets = \"plain\"\n\
+             [[mcp]]\nname = \"open\"\nurl = \"https://o.test/mcp\"\n",
         );
+        // Plain is never implied: only the owner's word makes a connector hold a real secret.
         let plain: Vec<bool> = cfg.mcp.iter().map(plain).collect();
-        // rpi's own MCP client makes a `url` connector's requests, and it cannot reach a host
-        // the proxy decrypts: such a connector is as it was before the broker.
-        assert_eq!(plain, [true, false, false, true]);
-        let env = vec![("K".to_string(), "value-of-K".to_string())];
+        assert_eq!(plain, [false, false, false, true, false]);
+        // rpi's own MCP client makes a remote connector's requests and cannot reach a host
+        // the proxy decrypts, so one with a secret and no word of the owner's is held back.
+        let undecided: Vec<bool> = cfg.mcp.iter().map(undecided).collect();
+        assert_eq!(undecided, [true, false, false, false, false]);
+        assert_eq!(unsettled(&cfg), ["remote"]);
+        let env: Vec<(String, String)> = ["K", "K2", "K3"]
+            .iter()
+            .map(|k| (k.to_string(), format!("value-of-{k}")))
+            .collect();
         let map = Map::build(&cfg, &Vault::parse("").unwrap(), &env, &KEY);
         assert_eq!(map.hosts(), ["l.test:443", "s.test:443"]);
         assert!(!map.bound("r.test:443"));
+        // A connector's secret is swapped in `Authorization` and in the headers its own
+        // config puts it in.
+        let k2 = &map.by[&surrogate(&KEY, "env", "K2")];
+        assert_eq!(k2.headers, ["authorization", "x-token"]);
+        let mut brokered = cfg.clone();
+        brokered.floor = true;
+        let why = connector_secrets(&brokered, &cfg.mcp[0], &env).unwrap_err();
+        assert!(
+            why.contains("/set mcp.remote.secrets plain, from a strong channel"),
+            "{why}"
+        );
+        assert!(shared(&cfg).is_empty());
+    }
+
+    /// A stand-in goes into a credential header and nowhere else: a server may send any other
+    /// header back, or log it, so there it is refused, not swapped and not forwarded.
+    #[test]
+    fn a_stand_in_is_swapped_only_in_a_credential_header() {
+        let map = map();
+        let (a, b) = (sur("A"), sur("B"));
+        // `Authorization` for every token; the headers the owner listed for this one.
+        for header in ["authorization", "x-api-key", "X-A"] {
+            let (mut uri, mut h) = request("/", &[(header, &a)]);
+            assert_eq!(
+                swap(&mut uri, &mut h, &map, "a.test:443").unwrap().used,
+                ["A"]
+            );
+        }
+        for (header, token, stand_in) in [
+            ("x-forwarded-for", "A", &a),
+            ("user-agent", "A", &a),
+            ("referer", "A", &a),
+            ("cookie", "A", &a),
+            // Another token's header is not this one's.
+            ("x-b", "A", &a),
+            ("x-api-key", "B", &b),
+        ] {
+            let (mut uri, mut h) = request("/", &[(header, stand_in), ("authorization", &a)]);
+            let refused = swap(&mut uri, &mut h, &map, "a.test:443").unwrap_err();
+            assert_eq!(refused, Refused::NotInHeader(token.into(), header.into()));
+            // Refused whole: nothing was swapped, in that header or the good one.
+            assert_eq!(h[header], *stand_in);
+            assert_eq!(h["authorization"], a);
+            assert_eq!(refused.token(), Some(token));
+            let reason = refused.reason("a.test:443");
+            assert_eq!(
+                reason,
+                format!("{token} is not swapped in the header {header}")
+            );
+            let told = refused.notice("a.test").unwrap();
+            assert!(told.contains(&format!("in the header {header}, where it is not swapped")));
+            assert!(!format!("{reason}{told}").contains("zsur_"));
+        }
+        assert_eq!(header_name(" X-Api-Key ").unwrap(), "x-api-key");
+        assert!(header_name("x api").is_err() && header_name("").is_err());
+    }
+
+    /// Every form a value is looked for in a reply, worked out once when the map is built.
+    #[test]
+    fn a_value_sent_back_escaped_or_percent_encoded_is_turned_back() {
+        let value = "tok/é+a b:\"q\"&=1";
+        let vault = Vault::parse(&format!(
+            "[[token]]\nname = \"E\"\nvalue = {}\nhosts = [\"a.test:443\"]\n",
+            serde_json::to_string(value).unwrap()
+        ));
+        let map = Map::build(&config(""), &vault.unwrap(), &[], &KEY);
+        let forms = &map.by[&sur("E")].forms;
+        for form in [
+            // JSON, as serde and as PHP or Python write it.
+            r#"tok/é+a b:\"q\"&=1"#,
+            r#"tok\/é+a b:\"q\"&=1"#,
+            r#"tok/\u00e9+a b:\"q\"&=1"#,
+            r#"tok\/\u00E9+a b:\"q\"&=1"#,
+            // Percent-encoded: everything, a URI component, a form field; either case.
+            "tok%2F%C3%A9%2Ba%20b%3A%22q%22%26%3D1",
+            "tok%2f%c3%a9%2ba%20b%3a%22q%22%26%3d1",
+            "tok%2F%C3%A9%2Ba+b%3A%22q%22%26%3D1",
+        ] {
+            assert!(forms.iter().any(|f| f == form), "{form} not in {forms:?}");
+            let mut r = map.unswapper("a.test:443", &[]);
+            let mut out = r.push(format!("{{\"echo\": \"{form}\"}}").as_bytes());
+            out.extend(r.finish());
+            let out = String::from_utf8(out).unwrap();
+            assert_eq!(out, format!("{{\"echo\": \"{}\"}}", sur("E")), "{form}");
+        }
+        assert!(
+            !forms.iter().any(|f| f == value),
+            "the value itself is not a form"
+        );
+        // A plain value has no escaped form to add: only its base64.
+        let plain = &self::map().by[&sur("A")].forms;
+        assert_eq!(plain.len(), crate::vault::base64_forms(A_VALUE).len());
+        assert!(!format!("{:?}", map.by[&sur("E")]).contains("tok"));
+    }
+
+    #[test]
+    fn doctor_fails_for_an_unsettled_remote_connector_and_a_secret_held_two_ways() {
+        let dir = crate::test_dir("broker-doctor-connectors");
+        let cfg: Config = toml::from_str(&format!(
+            "rpi = '/r'\nhome = {dir:?}\n\
+             [[mcp]]\nname = 'remote'\nurl = 'https://r.test/mcp'\nheaders = {{ A = '${{K}}' }}\n\
+             [[mcp]]\nname = 'db'\ncommand = 'db'\nenv = {{ P = '${{S}}' }}\nsecrets = 'plain'\n\
+             [[mcp]]\nname = 'api'\ncommand = 'api'\nenv = {{ P = '${{S}}' }}\nhosts = 'api.test'\n"
+        ))
+        .unwrap();
+        let lines = doctor(&cfg, true, crate::now(), &dir.join("none.crt"));
+        let said: String = lines.iter().map(|(l, t)| format!("{l:?} {t}\n")).collect();
+        for line in [
+            "Fail the connector remote is left out: it is a remote connector with a secret (K), which rpi's own client can only use as it is: /set mcp.remote.secrets plain from a strong channel\n",
+            "Fail the secret S is held as it is by the connector db and as a stand-in by api: neither is published until one of them has a secret of its own\n",
+        ] {
+            assert!(said.contains(line), "{line} not in:\n{said}");
+        }
     }
 }

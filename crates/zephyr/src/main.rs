@@ -317,7 +317,9 @@ async fn skill(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
     let reply = match ask(cfg, &text).await? {
         Some(reply) => reply,
         // No daemon: the next child start reads `<state>/skills` anyway.
-        None => zephyr::drafts::command(cfg, &text, true).map_or_else(String::new, |(r, _)| r),
+        None => {
+            zephyr::drafts::command(cfg, &text, true, true).map_or_else(String::new, |(r, _)| r)
+        }
     };
     println!("{reply}");
     Ok(())

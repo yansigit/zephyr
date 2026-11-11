@@ -64,6 +64,8 @@ pub struct Entry {
     pub programs: Vec<String>,
     /// The exact `host:port`s a token is swapped in on (DESIGN §4.21); nowhere else.
     pub hosts: Vec<String>,
+    /// The request headers a token is swapped in besides `Authorization`, lower case.
+    pub headers: Vec<String>,
     /// Also swapped in a request's path and query.
     pub url: bool,
     /// Handed to the program as its real value, as before the broker.
@@ -83,6 +85,7 @@ impl std::fmt::Debug for Entry {
             .field("value", &self.value.len())
             .field("programs", &self.programs)
             .field("hosts", &self.hosts)
+            .field("headers", &self.headers)
             .field("url", &self.url)
             .field("raw", &self.raw)
             .finish()
@@ -121,6 +124,10 @@ impl Entry {
                     crate::broker::parse_host(host)
                         .map_err(|e| anyhow::anyhow!("token {name}: {e}"))?;
                 }
+                for header in &self.headers {
+                    crate::broker::header_name(header)
+                        .map_err(|e| anyhow::anyhow!("token {name}: {e}"))?;
+                }
             }
         }
         Ok(())
@@ -137,6 +144,7 @@ impl Entry {
             "granted": self.granted,
             "programs": self.programs,
             "hosts": self.hosts,
+            "headers": self.headers,
             "url": self.url,
             "raw": self.raw,
         })
@@ -178,7 +186,11 @@ impl Entry {
                 } else {
                     ""
                 };
-                format!("token {}: {programs}; {sent}{url}", self.name)
+                let headers = match (self.headers.is_empty(), self.raw) {
+                    (false, false) => format!(", also in the headers {}", self.headers.join(", ")),
+                    _ => String::new(),
+                };
+                format!("token {}: {programs}; {sent}{headers}{url}", self.name)
             }
         }
     }
@@ -336,6 +348,9 @@ impl Vault {
                 if new.hosts.is_empty() {
                     new.hosts.clone_from(&old.hosts);
                 }
+                if new.headers.is_empty() {
+                    new.headers.clone_from(&old.headers);
+                }
                 (new.url, new.raw) = (old.url, old.raw);
             }
             None => {
@@ -346,6 +361,7 @@ impl Vault {
         }
         new.check()?;
         new.hosts = hosts_of(&new.hosts.iter().map(String::as_str).collect::<Vec<_>>())?;
+        new.headers = headers_of(&new.headers.iter().map(String::as_str).collect::<Vec<_>>())?;
         let kind = new.kind;
         let t = match self.table(kind, &new.name) {
             Some(t) => t,
@@ -376,6 +392,7 @@ impl Vault {
                 set(t, "value", &new.value);
                 set(t, "programs", Array::from_iter(new.programs.iter()));
                 set_hosts(t, &new.hosts);
+                set_list(t, "headers", &new.headers);
             }
         }
         Ok(old.is_none())
@@ -513,6 +530,51 @@ impl Vault {
         Ok((text, change))
     }
 
+    /// The owner names request headers a token is swapped in besides `Authorization` (added to
+    /// those it has), or takes one back (all of them with `None`).
+    pub fn header(
+        &mut self,
+        name: &str,
+        add: &[&str],
+        remove: Option<Option<&str>>,
+    ) -> anyhow::Result<(String, Change)> {
+        let e = self.token(name)?;
+        let mut all = e.headers.clone();
+        all.extend(headers_of(add)?);
+        all.dedup();
+        let mut unique: Vec<String> = Vec::new();
+        for header in all {
+            if !unique.contains(&header) {
+                unique.push(header);
+            }
+        }
+        match remove {
+            Some(None) => unique.clear(),
+            Some(Some(header)) => {
+                let header = crate::broker::header_name(header).map_err(anyhow::Error::msg)?;
+                if !unique.contains(&header) {
+                    bail!("{name} was not swapped in the header {header}");
+                }
+                unique.retain(|h| *h != header);
+            }
+            None => {}
+        }
+        set_list(
+            self.table(Kind::Token, name).expect("found above"),
+            "headers",
+            &unique,
+        );
+        let text = match unique.as_slice() {
+            [] => format!("{name} is swapped in the Authorization header only"),
+            list => format!(
+                "{name} is swapped in the Authorization header and in {}",
+                list.join(", ")
+            ),
+        };
+        let change = change(name, "headers", e.headers.join(", "), unique.join(", "));
+        Ok((text, change))
+    }
+
     /// Sets a token's `url` (also swapped in the path and query) or `raw` (handed out as its
     /// real value).
     pub fn set_flag(
@@ -593,10 +655,28 @@ fn hosts_of(hosts: &[&str]) -> anyhow::Result<Vec<String>> {
 
 /// Writes a token's `hosts`; none leaves no key.
 fn set_hosts(t: &mut Table, hosts: &[String]) {
-    match hosts.is_empty() {
-        true => drop(t.remove("hosts")),
-        false => set(t, "hosts", Array::from_iter(hosts.iter())),
+    set_list(t, "hosts", hosts)
+}
+
+/// Writes a list of a token's; an empty one leaves no key.
+fn set_list(t: &mut Table, key: &str, items: &[String]) {
+    match items.is_empty() {
+        true => drop(t.remove(key)),
+        false => set(t, key, Array::from_iter(items.iter())),
     }
+}
+
+/// `headers` as a token keeps them, each checked and once. `Authorization` is every token's
+/// already.
+fn headers_of(headers: &[&str]) -> anyhow::Result<Vec<String>> {
+    let mut all = Vec::new();
+    for header in headers {
+        let header = crate::broker::header_name(header).map_err(anyhow::Error::msg)?;
+        if header != "authorization" && !all.contains(&header) {
+            all.push(header);
+        }
+    }
+    Ok(all)
 }
 
 fn change(name: &str, what: &str, old: String, new: String) -> Change {
@@ -625,6 +705,7 @@ fn read(kind: Kind, t: &Table) -> Entry {
         value: s("value"),
         programs: list("programs"),
         hosts: list("hosts"),
+        headers: list("headers"),
         url: flag("url"),
         raw: flag("raw"),
     }
@@ -844,12 +925,17 @@ pub fn command(
         [] | ["list"] => {
             (Vault::load(path).map(|v| (v.list(), None))).map_err(|e| format!("[zephyr] {e:#}"))
         }
+        // In the web app every approval is on its card, signed with a passkey: a grant, and
+        // whatever loosens where a token goes, whatever `strong_channels` says.
         ["grant", ..] if !may_approve => Err(crate::tools::NEEDS_PASSKEY.into()),
+        _ if !may_approve && loosens(&format!("/vault {arg}")) => {
+            Err(crate::tools::NEEDS_PASSKEY.into())
+        }
         // Where a token goes, or handing out the value itself: from a strong channel only
         // (`strong`), as the connectors' `hosts` and `secrets` are (DESIGN §4.21).
         _ if !strong && loosens(&format!("/vault {arg}")) => Err(
-            "[zephyr] sending a vault token to more hosts, in URLs or as its real value needs a \
-             strong channel"
+            "[zephyr] sending a vault token to more hosts, in more headers, in URLs or as its real \
+             value needs a strong channel"
                 .into(),
         ),
         ["rm", name] => edit(&|v| match v.remove(name) {
@@ -865,6 +951,11 @@ pub fn command(
         ["bind", name, ref hosts @ ..] if !hosts.is_empty() => bound(&|v| v.bind(name, hosts)),
         ["unbind", name] => bound(&|v| v.unbind(name, None)),
         ["unbind", name, host] => bound(&|v| v.unbind(name, Some(host))),
+        ["header", name, ref headers @ ..] if !headers.is_empty() => {
+            bound(&|v| v.header(name, headers, None))
+        }
+        ["unheader", name] => bound(&|v| v.header(name, &[], Some(None))),
+        ["unheader", name, header] => bound(&|v| v.header(name, &[], Some(Some(header)))),
         [flag @ ("raw" | "url"), name, on @ ("on" | "off")] => {
             bound(&|v| v.set_flag(name, flag, on == "on"))
         }
@@ -877,20 +968,21 @@ pub fn command(
         _ => Err(
             "[zephyr] usage: /vault, /vault rm NAME, /vault revoke NAME [PROGRAM], \
               /vault grant login NAME, /vault grant token NAME PROGRAM.., \
-              /vault bind NAME HOST.., /vault unbind NAME [HOST], /vault url NAME on|off, \
+              /vault bind NAME HOST.., /vault unbind NAME [HOST], /vault header NAME HEADER.., \
+              /vault unheader NAME [HEADER], /vault url NAME on|off, \
               /vault raw NAME on|off"
                 .into(),
         ),
     }
 }
 
-/// Whether the owner's command `text` loosens where a token goes: `/vault bind`, `/vault url
-/// NAME on` and `/vault raw NAME on`. Taking any of them back does not.
+/// Whether the owner's command `text` loosens where a token goes: `/vault bind`, `/vault
+/// header`, `/vault url NAME on` and `/vault raw NAME on`. Taking any of them back does not.
 pub fn loosens(text: &str) -> bool {
     let words: Vec<&str> = text.split_whitespace().collect();
     matches!(
         words[..],
-        ["/vault", "bind", ..] | ["/vault", "raw" | "url", _, "on"]
+        ["/vault", "bind" | "header", ..] | ["/vault", "raw" | "url", _, "on"]
     )
 }
 
@@ -1665,6 +1757,44 @@ programs = ["gh"]
             );
             assert!(loosens(&format!("/vault {loosening}")), "{loosening}");
         }
+        // In the web app each of them is approved on its card with a passkey, whatever
+        // `strong_channels` says: typed there, it is refused even when `web` is a strong one.
+        for loosening in [
+            "bind LOOSE api.x.test",
+            "raw LOOSE on",
+            "url LOOSE on",
+            "header LOOSE X-Api-Key",
+            "grant token LOOSE gh",
+        ] {
+            let refused = command(&path, loosening, false, true).unwrap_err();
+            assert_eq!(refused, crate::tools::NEEDS_PASSKEY, "{loosening}");
+        }
+        assert!(command(&path, "unbind BOUND", false, false).is_ok());
+        std::fs::write(&path, TOKENS).unwrap();
+        // The headers a token is swapped in besides Authorization are the owner's to list.
+        assert!(weak("header LOOSE X-Api-Key")
+            .unwrap_err()
+            .ends_with("needs a strong channel"));
+        let (said, change) = strong("header LOOSE X-Api-Key x-goog-api-key Authorization").unwrap();
+        assert_eq!(
+            said,
+            "[zephyr] LOOSE is swapped in the Authorization header and in x-api-key, x-goog-api-key"
+        );
+        assert_eq!(change.unwrap().key, "vault.LOOSE.headers");
+        assert!(strong("header LOOSE bad:name").is_err());
+        let list = weak("").unwrap().0;
+        assert!(
+            list.contains("also in the headers x-api-key, x-goog-api-key"),
+            "{list}"
+        );
+        let (said, _) = weak("unheader LOOSE x-api-key").unwrap();
+        assert!(said.ends_with("and in x-goog-api-key"), "{said}");
+        assert!(weak("unheader LOOSE x-api-key").is_err());
+        let (said, _) = weak("unheader LOOSE").unwrap();
+        assert_eq!(
+            said,
+            "[zephyr] LOOSE is swapped in the Authorization header only"
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), TOKENS);
         let (said, change) = strong("bind LOOSE API.x.test gist.x.test:8443").unwrap();
         assert_eq!(

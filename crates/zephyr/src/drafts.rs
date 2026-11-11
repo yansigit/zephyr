@@ -475,7 +475,12 @@ fn line_diff(a: &str, b: &str) -> String {
 
 /// The owner's `/skills`, `/skill ...` and `/mcp ...`. `None` for any other text; otherwise the
 /// reply, and what the router must do next.
-pub fn command(cfg: &Config, text: &str, may_approve: bool) -> Option<(String, After)> {
+pub fn command(
+    cfg: &Config,
+    text: &str,
+    may_approve: bool,
+    strong: bool,
+) -> Option<(String, After)> {
     let words: Vec<&str> = text.split_whitespace().collect();
     let kind = match words.first()? {
         &"/skills" | &"/skill" => Kind::Skill,
@@ -494,7 +499,7 @@ pub fn command(cfg: &Config, text: &str, may_approve: bool) -> Option<(String, A
             (_, "ok") | (Kind::Skill, "undo" | "add") if !may_approve => {
                 Ok((crate::tools::NEEDS_PASSKEY.into(), After::Nothing))
             }
-            (_, "ok") => ok(cfg, kind, name),
+            (_, "ok") => ok(cfg, kind, name, strong),
             (_, "no") => Ok((
                 if remove_draft(&cfg.home, kind, name) {
                     let _ = forget(cfg.state_dir(), &key(kind, name));
@@ -572,7 +577,7 @@ fn list(cfg: &Config, kind: Kind) -> anyhow::Result<String> {
 
 /// `/skill ok` or `/mcp ok`: the draft becomes approved, if it is what the owner was last shown.
 /// A run may have changed it since; then the owner is shown that instead.
-fn ok(cfg: &Config, kind: Kind, name: &str) -> anyhow::Result<(String, After)> {
+fn ok(cfg: &Config, kind: Kind, name: &str, strong: bool) -> anyhow::Result<(String, After)> {
     let (w, noun) = (kind.word(), kind.noun());
     let draft =
         draft(&cfg.home, kind, name).with_context(|| format!("no {noun} draft named {name}"))?;
@@ -608,11 +613,46 @@ fn ok(cfg: &Config, kind: Kind, name: &str) -> anyhow::Result<(String, After)> {
         Content::Connector(mut m) => {
             // The owner's tool classes stay through an update: a draft cannot carry them.
             // So do `secrets` and `hosts`, which a draft cannot carry either.
-            if let Some(old) = cfg.mcp.iter().find(|o| o.name == m.name) {
+            let old = cfg.mcp.iter().find(|o| o.name == m.name);
+            if let Some(old) = old {
                 m.classes = old.classes.clone();
                 m.secrets = old.secrets.clone();
                 m.hosts = old.hosts.clone();
             }
+            // A connector that holds its real secrets hands them to the agent and to wherever
+            // it sends them. A remote one can hold them no other way (rpi's own client cannot
+            // use a stand-in, DESIGN §4.21), so approving a new one, one that names a further
+            // secret, or one whose URL moved to another host is a loosening: from a strong
+            // channel only, as `/set mcp.NAME.secrets plain` is. The draft stays until then.
+            let names = crate::broker::connector_names(&m).0;
+            let remote = m.url.is_some() && m.secrets.is_none() && !names.is_empty();
+            let exposes = remote || (crate::broker::plain(&m) && !names.is_empty());
+            let host = |m: &Mcp| {
+                let url = url::Url::parse(m.url.as_deref()?).ok()?;
+                Some(format!(
+                    "{}:{}",
+                    url.host_str()?,
+                    url.port_or_known_default()?
+                ))
+            };
+            let widens = match old {
+                None => true,
+                Some(old) => {
+                    let had = crate::broker::connector_names(old).0;
+                    names.iter().any(|n| !had.contains(n)) || host(old) != host(&m)
+                }
+            };
+            if exposes && widens && !strong {
+                bail!(
+                    "connector {name} would hold the real secret {} and send it to {}; approve \
+                     it from a strong channel ({})",
+                    names.join(", "),
+                    host(&m).unwrap_or_else(|| "the command it runs".into()),
+                    cfg.settings.strong_channels.join(" or ")
+                );
+            }
+            // Approved there, a new remote connector's secret is the real one: said, not implied.
+            let settled = remote.then(|| m.secrets = Some("plain".into()));
             write_config(cfg, |doc| crate::host::conf::upsert_mcp(doc, &m))?;
             let missing = missing(cfg, &m);
             let mut reply = format!("[zephyr] connector {name} added to zephyr.toml");
@@ -623,6 +663,10 @@ fn ok(cfg: &Config, kind: Kind, name: &str) -> anyhow::Result<(String, After)> {
                 );
             } else if let Some(why) = left_out(cfg, &m) {
                 reply += &format!("; it is left out: {why}");
+            }
+            if settled.is_some() {
+                reply += "; it holds its real secret (secrets = \"plain\"), which the agent can \
+                          read: rpi's own client cannot use a stand-in";
             }
             (reply, After::Reload)
         }
@@ -1127,7 +1171,7 @@ mod tests {
     }
 
     fn say(cfg: &Config, text: &str) -> (String, After) {
-        command(cfg, text, true).unwrap()
+        command(cfg, text, true, true).unwrap()
     }
 
     fn agents(cfg: &Config) -> String {
@@ -1332,7 +1376,7 @@ mod tests {
         assert!(agents(&cfg).contains("**tea**"));
         assert!(say(&cfg, "/skill").0.contains("- tea:"));
         assert!(say(&cfg, "/skill frob tea").0.starts_with("usage"));
-        assert!(command(&cfg, "/skillful", true).is_none());
+        assert!(command(&cfg, "/skillful", true, true).is_none());
     }
 
     #[test]
@@ -1526,14 +1570,14 @@ mod tests {
         cfg
     }
 
-    const BROKERED: &str = "[[mcp]]\nname = 'docs'\nurl = 'https://docs.test/mcp'\nheaders = { Authorization = 'Bearer ${DOCS_TOKEN}' }\n\
+    const BROKERED: &str = "[[mcp]]\nname = 'docs'\nurl = 'https://docs.test/mcp'\nheaders = { Authorization = 'Bearer ${DOCS_TOKEN}' }\nsecrets = 'plain'\n\
         [[mcp]]\nname = 'local'\ncommand = 'srv'\nenv = { KEY = '${LOCAL_KEY}' }\n\
         [[mcp]]\nname = 'bound'\ncommand = 'srv'\nenv = { KEY = '${LOCAL_KEY}' }\nhosts = 'api.l.test'\n\
         [[mcp]]\nname = 'db'\ncommand = 'db'\nenv = { PASSWORD = '${DB_PASSWORD}' }\nsecrets = 'plain'\n\
-        [[mcp]]\nname = 'lan'\nurl = 'http://lan.test/mcp'\nheaders = { K = '${LOCAL_KEY}' }\n\
+        [[mcp]]\nname = 'lan'\nurl = 'http://lan.test/mcp'\nheaders = { K = '${LAN_KEY}' }\n\
         [[mcp]]\nname = 'open'\ncommand = 'fs-server'\n";
-    const ENV: &str =
-        "DOCS_TOKEN=real-docs-token\nLOCAL_KEY=real-local-key\nDB_PASSWORD=real-db-password\n";
+    const ENV: &str = "DOCS_TOKEN=real-docs-token\nLOCAL_KEY=real-local-key\n\
+        DB_PASSWORD=real-db-password\nLAN_KEY=real-lan-key\n";
 
     #[test]
     fn mcp_json_holds_stand_ins_and_never_a_brokered_secret() {
@@ -1548,14 +1592,15 @@ mod tests {
         assert_eq!(servers["bound"]["env"]["KEY"], stand_in("LOCAL_KEY"));
         // The owner said so: the real one, and only there.
         assert_eq!(servers["db"]["env"]["PASSWORD"], "real-db-password");
-        // A `url` connector is as it was before the broker, on an upgrade too: rpi's own MCP
-        // client makes its requests and cannot reach a host the proxy decrypts, so a stand-in
-        // would only break it.
+        // A remote connector the owner settled as `plain` holds its real secret: rpi's own
+        // MCP client makes its requests and cannot reach a host the proxy decrypts.
         assert_eq!(
             servers["docs"]["headers"]["Authorization"],
             "Bearer real-docs-token"
         );
-        assert_eq!(servers["lan"]["headers"]["K"], "real-local-key");
+        // One nobody has settled is not published at all: the real secret is never a default.
+        assert!(servers.get("lan").is_none(), "{file}");
+        assert!(!file.contains("real-lan-key"), "{file}");
         // The broker's own fields are not the adapter's.
         assert!(servers["bound"].get("hosts").is_none() && servers["db"].get("secrets").is_none());
         // A command with a secret and nowhere to send it is left out.
@@ -1579,12 +1624,21 @@ mod tests {
         // What the proxy will swap is exactly what the file holds.
         let map = crate::broker::Map::load(&cfg).unwrap();
         assert_eq!(map.hosts(), ["api.l.test:443"]);
-        let notice = crate::broker::upgrade_notice(&cfg).unwrap().unwrap();
+        assert!(
+            listed.contains(
+                "- lan: http://lan.test/mcp (left out: it is a remote connector with a secret"
+            ),
+            "{listed}"
+        );
+        assert_eq!(crate::broker::unsettled(&cfg), ["lan"]);
+        let kept = ["old".to_string()];
+        let notice = crate::broker::upgrade_notice(&cfg, &kept).unwrap().unwrap();
+        assert!(notice.ends_with("cannot use a stand-in): old"), "{notice}");
         assert!(
             notice.contains("\n/set mcp.local.hosts HOST.. (the connector local is left out"),
             "{notice}"
         );
-        for untouched in ["mcp.db.", "mcp.docs.", "mcp.lan."] {
+        for untouched in ["mcp.db.", "mcp.docs."] {
             assert!(!notice.contains(untouched), "{untouched}: {notice}");
         }
     }
@@ -1670,6 +1724,117 @@ mod tests {
             new.mcp[0].secrets.as_deref(),
             Some("plain"),
             "the owner's, kept"
+        );
+    }
+    /// One secrets.env name held as it is by one connector and as a stand-in by another: the
+    /// agent would read from the first what the second keeps from it, so neither is published.
+    #[test]
+    fn a_secret_cannot_be_one_connectors_own_and_anothers_stand_in() {
+        let cfg = brokered(
+            "[[mcp]]\nname = 'db'\ncommand = 'db'\nenv = { P = '${SHARED}' }\nsecrets = 'plain'\n\
+             [[mcp]]\nname = 'api'\ncommand = 'api'\nenv = { K = '${SHARED}' }\nhosts = 'api.test'\n\
+             [[mcp]]\nname = 'other'\ncommand = 'o'\nenv = { K = '${OTHER}' }\nhosts = 'o.test'\n",
+        );
+        std::fs::write(
+            cfg.secrets_path(),
+            "SHARED=real-shared-1\nOTHER=real-other-1\n",
+        )
+        .unwrap();
+        agents(&cfg);
+        let file = std::fs::read_to_string(mcp_path(&cfg)).unwrap();
+        let json: Value = serde_json::from_str(&file).unwrap();
+        let servers = &json["mcpServers"];
+        assert!(
+            servers.get("db").is_none() && servers.get("api").is_none(),
+            "{file}"
+        );
+        assert!(
+            servers.get("other").is_some() && !file.contains("real-shared-1"),
+            "{file}"
+        );
+        let listed = say(&cfg, "/mcp").0;
+        assert!(
+            listed.contains(
+                "the secret SHARED is held as it is by the connector db and as a stand-in by api"
+            ),
+            "{listed}"
+        );
+        assert_eq!(
+            crate::broker::shared(&cfg),
+            [("SHARED".to_string(), "db".to_string(), "api".to_string())]
+        );
+        assert!(crate::broker::shared_refusal(&cfg)
+            .unwrap_err()
+            .contains("one name cannot be both"));
+    }
+
+    /// `/mcp ok` is taken on any channel, so it may not hand out a real secret, or send one
+    /// somewhere new: a remote connector with a secret is approved from a strong channel only,
+    /// and so is a draft that moves one to another host or names a further secret.
+    #[test]
+    fn a_draft_that_exposes_a_secret_is_approved_only_from_a_strong_channel() {
+        let cfg = brokered(
+            "[[mcp]]\nname = 'docs'\nurl = 'https://docs.test/mcp'\nsecrets = 'plain'\n\
+             headers = { Authorization = 'Bearer ${DOCS_TOKEN}' }\n",
+        );
+        std::fs::write(cfg.secrets_path(), ENV).unwrap();
+        let drafts = Kind::Connector.drafts(&cfg.home);
+        std::fs::create_dir_all(&drafts).unwrap();
+        let weak = |text: &str| command(&cfg, text, true, false).unwrap().0;
+        let saved = || std::fs::read_to_string(cfg.path.as_ref().unwrap()).unwrap();
+        let before = saved();
+        // An existing connector's URL moved to another host.
+        let moved = r#"{"url": "https://attacker.test/mcp", "headers": {"Authorization": "Bearer ${DOCS_TOKEN}"}}"#;
+        std::fs::write(drafts.join("docs.json"), moved).unwrap();
+        scan(&cfg);
+        let refused = weak("/mcp ok docs");
+        assert!(
+            refused.contains("would hold the real secret DOCS_TOKEN and send it to attacker.test:443; approve it from a strong channel (tui or chat"),
+            "{refused}"
+        );
+        // A further secret on the same host.
+        let more = r#"{"url": "https://docs.test/mcp", "headers": {"Authorization": "Bearer ${DOCS_TOKEN}", "X": "${DB_PASSWORD}"}}"#;
+        std::fs::write(drafts.join("docs.json"), more).unwrap();
+        scan(&cfg);
+        assert!(weak("/mcp ok docs").contains("approve it from a strong channel"));
+        // A new remote connector that carries one.
+        let new = r#"{"url": "https://new.test/mcp", "headers": {"K": "${LOCAL_KEY}"}}"#;
+        std::fs::write(drafts.join("fresh.json"), new).unwrap();
+        scan(&cfg);
+        assert!(weak("/mcp ok fresh").contains("would hold the real secret LOCAL_KEY"));
+        assert_eq!(saved(), before, "nothing was written");
+        assert!(drafts.join("fresh.json").exists(), "the draft waits");
+        // The same host and secrets, on any channel: a change of path, say.
+        let same = r#"{"url": "https://docs.test/v2/mcp", "headers": {"Authorization": "Bearer ${DOCS_TOKEN}"}}"#;
+        std::fs::write(drafts.join("docs.json"), same).unwrap();
+        scan(&cfg);
+        assert!(weak("/mcp ok docs").contains("connector docs added"));
+        // From a strong channel the new one is approved, and what that means is said.
+        let cfg = Config::load(cfg.path.as_ref().unwrap()).map(|mut c| {
+            c.floor = true;
+            c
+        });
+        let cfg = cfg.unwrap();
+        let reply = say(&cfg, "/mcp ok fresh").0;
+        assert!(
+            reply.contains(
+                "it holds its real secret (secrets = \"plain\"), which the agent can read"
+            ),
+            "{reply}"
+        );
+        let new = Config::load(cfg.path.as_ref().unwrap()).unwrap();
+        let fresh = new.mcp.iter().find(|m| m.name == "fresh").unwrap();
+        assert_eq!(fresh.secrets.as_deref(), Some("plain"));
+        // A connector that runs a command and holds stand-ins exposes nothing: any channel.
+        let local = r#"{"command": "srv", "env": {"K": "${LOCAL_KEY}"}}"#;
+        std::fs::write(drafts.join("local.json"), local).unwrap();
+        let mut new = new;
+        new.floor = true;
+        scan(&new);
+        let reply = command(&new, "/mcp ok local", true, false).unwrap().0;
+        assert!(
+            reply.contains("connector local added") && reply.contains("left out"),
+            "{reply}"
         );
     }
 }

@@ -5359,6 +5359,123 @@ async fn a_vault_use_waits_for_the_owners_ok_and_a_granted_token_comes_back_scru
     gw.shutdown().await;
 }
 
+/// Waits until the router has ticked `n` more times: each tick rewrites its heartbeat.
+async fn ticks(home: &Path, n: usize) {
+    let written = || {
+        std::fs::metadata(home.join("heartbeat"))
+            .and_then(|m| m.modified())
+            .ok()
+    };
+    for _ in 0..n {
+        let last = written();
+        wait(|| written() != last).await;
+    }
+}
+
+/// The broker's upgrade for remote connectors (DESIGN §4.21): one that was there before, with
+/// a secret and no word on how it holds it, keeps the real secret it had, written into the
+/// file once, logged as the upgrade's and told to the owner. One added later is not settled
+/// for the owner: it is not published until they say.
+#[tokio::test]
+async fn the_upgrade_keeps_remote_connectors_as_they_were_and_settles_no_later_one() {
+    let home = home("broker-remote");
+    let path = home.join("zephyr.toml");
+    let remote = |name: &str| {
+        format!(
+            "\n[[mcp]]\nname = \"{name}\"\nurl = \"https://{name}.test/mcp\"\n\
+             headers = {{ Authorization = \"Bearer ${{DOCS_TOKEN}}\" }}\n"
+        )
+    };
+    let text = format!("{}{}", file_text(&home, ""), remote("docs"));
+    std::fs::write(&path, &text).unwrap();
+    std::fs::write(home.join("secrets.env"), "DOCS_TOKEN=real-docs-token\n").unwrap();
+    let on_file = |home: &Path| {
+        let mut cfg = Config::load(&home.join("zephyr.toml")).unwrap();
+        cfg.floor = true;
+        cfg.tick = Duration::from_millis(200);
+        cfg
+    };
+    let gw = start(on_file(&home));
+    gw.say("m1", "owner", "hi").await;
+    let told = gw
+        .wait_reply("Remote connectors keep their real secret")
+        .await;
+    assert!(told.ends_with("cannot use a stand-in): docs"), "{told}");
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("secrets = \"plain\""), "{saved}");
+    assert_eq!(
+        last_logged(&home, "mcp.docs.secrets"),
+        (None, Some("plain".into()), "zephyr".into())
+    );
+    // It works as before: its real secret is what the agent's MCP client is given.
+    let public = home.with_file_name(format!(
+        "{}-public",
+        home.file_name().unwrap().to_string_lossy()
+    ));
+    let published = std::fs::read_to_string(public.join("mcp.json")).unwrap();
+    assert!(published.contains("Bearer real-docs-token"), "{published}");
+    gw.shutdown().await;
+
+    // A remote connector added after the upgrade is not settled for the owner.
+    let later = format!(
+        "{}{}",
+        std::fs::read_to_string(&path).unwrap(),
+        remote("later")
+    );
+    std::fs::write(&path, &later).unwrap();
+    let gw = start(on_file(&home));
+    gw.say("m2", "owner", "/mcp").await;
+    let listed = gw.wait_reply("- later:").await;
+    assert!(
+        listed.contains(
+            "- later: https://later.test/mcp (left out: it is a remote connector with a secret"
+        ),
+        "{listed}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        later,
+        "nothing more is written"
+    );
+    let published = std::fs::read_to_string(public.join("mcp.json")).unwrap();
+    assert!(!published.contains("later"), "{published}");
+    gw.shutdown().await;
+}
+
+/// One secrets.env name cannot be one connector's own and another's stand-in: `/set` refuses
+/// the change that would make it so, and nothing is written.
+#[tokio::test]
+async fn set_refuses_to_make_a_secret_both_plain_and_a_stand_in() {
+    let home = home("broker-shared");
+    let path = home.join("zephyr.toml");
+    let connector = |name: &str| {
+        format!(
+            "\n[[mcp]]\nname = \"{name}\"\ncommand = \"{name}\"\nhosts = \"{name}.test\"\n\
+             env = {{ K = \"${{SHARED}}\" }}\n"
+        )
+    };
+    let text = format!(
+        "{}{}{}",
+        file_text(&home, ""),
+        connector("db"),
+        connector("api")
+    );
+    std::fs::write(&path, &text).unwrap();
+    let mut cfg = Config::load(&path).unwrap();
+    cfg.floor = true;
+    let gw = start(cfg);
+    gw.say("m1", "owner", "/set mcp.api.secrets plain").await;
+    let refused = gw.wait_reply("one name cannot be both").await;
+    assert!(
+        refused.contains(
+            "the secret SHARED would be held as it is by the connector api and as a stand-in by db"
+        ),
+        "{refused}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    gw.shutdown().await;
+}
+
 /// Under the network floor a command gets a token's stand-in (DESIGN §4.21), never its value.
 fn brokered(home: &Path) -> Config {
     let mut cfg = config(home);
@@ -5467,8 +5584,8 @@ async fn a_token_bound_to_nothing_is_not_run_until_the_owner_binds_it() {
     gw.wait_reply("bound to no host now").await;
     gw.say("m6", "owner", "hi").await;
     gw.wait_reply("echo: ").await;
-    // A tick or two later there is still none.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // A few ticks later there is still none.
+    ticks(&home, 3).await;
     let replies = gw.replies();
     assert!(
         !replies
@@ -5544,7 +5661,7 @@ async fn the_upgrade_notice_waits_for_a_vault_it_can_read() {
     gw.say("m1", "owner", "hi").await;
     gw.wait_reply("echo: ").await;
     // A few ticks with an owner to tell and nothing readable.
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    ticks(&home, 3).await;
     let vault = VAULT.replace("programs = []", "programs = [\"printenv\"]");
     std::fs::write(home.join("vault.toml"), vault).unwrap();
     let told = gw

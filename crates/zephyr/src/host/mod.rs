@@ -1471,10 +1471,14 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                         }
                         None => conf::set(&mut doc, key, value)?,
                     }
-                    // Refuse what the daemon would refuse (unknown keys, a bad time zone).
+                    // Refuse what the daemon would refuse (unknown keys, a bad time zone, one
+                    // secret held two ways).
                     toml::from_str::<crate::config::Config>(&doc.to_string())
                         .map_err(anyhow::Error::from)
-                        .and_then(|c| c.validate())
+                        .and_then(|c| {
+                            c.validate()?;
+                            crate::broker::shared_refusal(&c).map_err(anyhow::Error::msg)
+                        })
                         .with_context(|| {
                             format!("{key} = {value} would make the config invalid")
                         })?;

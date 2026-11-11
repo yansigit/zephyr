@@ -921,6 +921,14 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
                 true => Some("plain".into()),
                 false => old.secrets,
             };
+            // A remote connector can only hold its real secret (rpi's own client cannot use a
+            // stand-in, DESIGN §4.21), which the agent can then read: said here, not implied.
+            if crate::broker::undecided(&m) {
+                bail!(
+                    "a remote connector's secret is handed to it as it is, where the agent can \
+                     read it (rpi's own client cannot use a stand-in): add --plain to accept that"
+                );
+            }
             conf::upsert_mcp(&mut doc, &m)?;
         }
         _ => bail!("{usage}"),
@@ -958,10 +966,13 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
     // The hosts a token is sent to (DESIGN §4.21): the owner's own surface, so they are taken
     // here as `/vault bind` takes them.
     let mut hosts = a.values("--host")?;
+    // And the request headers it is swapped in besides Authorization.
+    let headers = a.values("--header")?;
     let rest = a.rest()?;
     let usage = "usage: zephyr vault list | add login NAME --site URL [--user U] [--totp] | \
-                 add token NAME [--host HOST].. | edit NAME [--site URL] [--user U] [--totp] \
-                 [--host HOST].. | rm NAME | revoke NAME [PROGRAM]";
+                 add token NAME [--host HOST].. [--header HEADER].. | edit NAME [--site URL] \
+                 [--user U] [--totp] [--host HOST].. [--header HEADER].. | rm NAME | \
+                 revoke NAME [PROGRAM]";
     let text = match h.data.read(crate::vault::FILE) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         r => r?,
@@ -1023,6 +1034,7 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
                 name: name.into(),
                 value,
                 hosts,
+                headers,
                 ..Entry::default()
             })?;
             let sent = match vault
@@ -1058,6 +1070,7 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
                     e.value = secret("new value, empty keeps it")?;
                     // None given keeps the ones saved.
                     e.hosts = hosts;
+                    e.headers = headers;
                 }
             }
             vault.put(e)?;
