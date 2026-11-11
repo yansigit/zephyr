@@ -64,15 +64,15 @@ pub fn list(dir: &Path) -> Vec<Entry>;                            // sorted; one
 ```
 Entries as spec §4.1.2: `github` (command `/usr/local/bin/github-mcp-server stdio`, `env.GITHUB_PERSONAL_ACCESS_TOKEN = "${GITHUB_TOKEN}"`, hosts `api.github.com, raw.githubusercontent.com`, the twelve `posts` classes); `notion` (`npx -y @notionhq/notion-mcp-server@2.6.1`, `env.NOTION_TOKEN = "${NOTION_TOKEN}"`, hosts `api.notion.com`, `API-post-search = "none"`); `linear` (`npx -y mcp-remote@0.16.6 https://mcp.linear.app/mcp --transport http-only --enable-proxy --header "Authorization: Bearer ${LINEAR_API_KEY}"`, hosts `mcp.linear.app`); `home-assistant` (`needs_url`, mcp-remote with `{url}`, `--allow-http`, hosts `{host}`, `HA_TOKEN`); `brave-search` (`npx -y @brave/brave-search-mcp-server@2.1.4`, `env.BRAVE_API_KEY`, `plain_reason`); `context7` (`url = "https://mcp.context7.com/mcp"`, no secret).
 
-- [ ] **Step 1: failing tests** in `catalog.rs`:
+- [x] **Step 1: failing tests** in `catalog.rs`:
   - `every_shipped_entry_parses_and_validates`: for each file in `deploy/connectors/` (via `CARGO_MANIFEST_DIR/../../deploy/connectors`): parses; name valid; `to_mcp` (with `https://ha.example.com:8123` for `needs_url`) passes `Mcp::check` and `Config::validate` inside a config; no entry sets `secrets`; every `command` entry naming a secret has hosts or a `plain_reason`; no secret is `ZEPHYR_*`; `{url}` appears exactly in `needs_url` entries; there are six.
   - `an_unknown_key_and_a_secrets_key_are_refused`.
   - `to_mcp_fills_url_and_host_and_refuses_the_wrong_shape`: `home-assistant` with `https://ha.example.com:8123/api/mcp` gives hosts `ha.example.com:8123`; without a URL errors; `github` with a URL errors.
   - `same_as_tells_a_newer_entry`: changed args → false.
-- [ ] **Step 2:** `cargo test -p zephyr --lib catalog` fails (no module).
-- [ ] **Step 3: implement.** `[server]` deserialized as `Mcp` with `name` inserted from the file name before `serde` sees it.
-- [ ] **Step 4:** tests pass; full `cargo test`.
-- [ ] **Step 5:** commit `feat(catalog): ship six curated connectors with their hosts and gate classes preset`.
+- [x] **Step 2:** `cargo test -p zephyr --lib catalog` fails (no module).
+- [x] **Step 3: implement.** `[server]` deserialized as `Mcp` with `name` inserted from the file name before `serde` sees it.
+- [x] **Step 4:** tests pass; full `cargo test`.
+- [x] **Step 5:** commit `feat(catalog): ship six curated connectors with their hosts and gate classes preset`.
 
 ### Task 2: `zephyr mcp add --catalog` and `zephyr mcp catalog` on the host
 
@@ -82,9 +82,9 @@ Entries as spec §4.1.2: `github` (command `/usr/local/bin/github-mcp-server std
 **Interfaces:** consumes `catalog::parse`, `Entry::to_mcp`.
 
 - `--catalog NAME [--url URL] [--plain] [--host HOST]..`, before the `[add, name]` arm: `h.need_running()`, `h.exec(&[], &[], &["/usr/bin/cat", &format!("{}/{NAME}.toml", catalog::DIR)])` after `valid_name`; refuses a `plain_reason` entry or an `http://` URL without `--plain` with `NAME sends its key in a header zephyr does not swap: add --plain to hand it the real key, which the agent can then read` (the entry's `plain_reason` when it has one); merges with an existing connector (hosts kept unless `--host`; classes the entry's with the owner's winning per tool; `secrets` kept unless `--plain`); then the existing path (`creates_pair`, save, `apply`). Each `[[secret]]` that secrets.env lacks: interactive, its `help` printed and asked hidden; not interactive, `set it with: zephyr mcp add NAME --secret SECRET` printed. `zephyr mcp catalog`: `NAME: about` per entry.
-- [ ] **Step 1: failing tests** in `tests/host.rs`: `mcp_add_from_the_catalog_writes_the_entry_and_keeps_the_owners_choices` (github: table with command, env, hosts, `merge_pull_request = "posts"`; the output names `GITHUB_TOKEN` once; with the owner's `hosts` and `merge_pull_request = "none"` edited in, a second add keeps both); `catalog_entries_that_hold_their_key_in_plain_need_plain` (`brave-search`, and `home-assistant --url http://ha.lan:8123/api/mcp`, refused and nothing written; with `--plain` written with `secrets = "plain"`); `mcp_catalog_lists_the_entries`; a stopped container refuses.
-- [ ] **Step 2:** fails. **Step 3:** implement; README (`zephyr mcp add --catalog`, `zephyr mcp catalog`). **Step 4:** tests, full `cargo test`.
-- [ ] **Step 5:** commit `feat(mcp): add a catalog connector from the host with zephyr mcp add --catalog`.
+- [x] **Step 1: failing tests** in `tests/host.rs`: `mcp_add_from_the_catalog_writes_the_entry_and_keeps_the_owners_choices` (github: table with command, env, hosts, `merge_pull_request = "posts"`; the output names `GITHUB_TOKEN` once; with the owner's `hosts` and `merge_pull_request = "none"` edited in, a second add keeps both); `catalog_entries_that_hold_their_key_in_plain_need_plain` (`brave-search`, and `home-assistant --url http://ha.lan:8123/api/mcp`, refused and nothing written; with `--plain` written with `secrets = "plain"`); `mcp_catalog_lists_the_entries`; a stopped container refuses.
+- [x] **Step 2:** fails. **Step 3:** implement; README (`zephyr mcp add --catalog`, `zephyr mcp catalog`). **Step 4:** tests, full `cargo test`.
+- [x] **Step 5:** commit `feat(mcp): add a catalog connector from the host with zephyr mcp add --catalog`.
 
 ### Task 3: `/mcp catalog` in chat and the TUI
 
@@ -96,12 +96,12 @@ Entries as spec §4.1.2: `github` (command `/usr/local/bin/github-mcp-server std
 - `/mcp catalog NAME`: the `[[mcp]]` TOML it would write (`toml::to_string` of the table), its secrets with `help`, and `held as a stand-in, swapped only for HOSTS` / `held in plain: <plain_reason>` / `no secret`.
 - `/mcp catalog add NAME [URL] [plain]`: `!may_approve` → `NEEDS_PASSKEY`; `!strong` → the exact refusal; else merged as on the host, written through `write_config`, `After::Reload`; reply `[zephyr] connector NAME added to zephyr.toml` plus, when secrets.env lacks a secret, `; it is left out until secrets.env sets X: run \`zephyr mcp add NAME --secret X\` on the host`.
 
-- [ ] **Step 1: failing tests:**
+- [x] **Step 1: failing tests:**
   - `drafts::tests::a_catalog_connectors_secret_reaches_the_agent_only_as_a_stand_in` (Review Focus 1).
   - `drafts::tests::catalog_add_needs_a_strong_channel_and_never_writes_plain_by_itself` (weak: the refusal and nothing written; strong `brave-search` without `plain`: refused; with `plain`: `secrets = "plain"`).
   - `router::mcp_catalog_add_from_discord_is_refused_and_from_chat_adds_the_connector` (cfg `catalog_dir` at a test folder with `github.toml`; Discord: refused; chat: the table is in `zephyr.toml`, the child restarts, the reply names `GITHUB_TOKEN`; with the secret written to secrets.env and `/reload`, `/mcp` lists `github` without `left out`).
-- [ ] **Step 2:** fail. **Step 3:** implement; the AGENTS.md sentence. **Step 4:** tests, full `cargo test`.
-- [ ] **Step 5:** commit `feat(mcp): add a catalog connector from a strong channel with /mcp catalog add`.
+- [x] **Step 2:** fail. **Step 3:** implement; the AGENTS.md sentence. **Step 4:** tests, full `cargo test`.
+- [x] **Step 5:** commit `feat(mcp): add a catalog connector from a strong channel with /mcp catalog add`.
 
 ### Task 4: doctor
 
@@ -110,7 +110,7 @@ Runs after Task 6, which defines `drafts::STARTER`.
 **Files:** Modify `crates/zephyr/src/main.rs` (doctor), `crates/zephyr/src/egress.rs` (`broker_reach` gets the two image folders), `tests/cli.rs`.
 
 - One `warn` per connector whose name is a catalog entry and `!entry.same_as(m)`: `a newer catalog entry for NAME ships: zephyr mcp add --catalog NAME`. `__netcheck`'s third and fourth arguments (when given) add `the agent cannot write /opt/zephyr/connectors` and `…/skills` checks, by the same create/append probe; doctor passes `catalog::DIR` and `drafts::STARTER`.
-- [ ] **Step 1: failing test:** `catalog::tests::doctor_notes_a_newer_entry` on a pure `catalog::newer(cfg) -> Vec<String>` (the lines). **Step 2–4.** **Step 5:** commit `feat(doctor): say when a newer catalog entry ships, and check the image's catalog and skills are root's`.
+- [x] **Step 1: failing test:** `catalog::tests::doctor_notes_a_newer_entry` on a pure `catalog::newer(cfg) -> Vec<String>` (the lines). **Step 2–4.** **Step 5:** commit `feat(doctor): say when a newer catalog entry ships, and check the image's catalog and skills are root's`.
 
 ### Task 5: The starter skills (`deploy/skills/`)
 
@@ -119,9 +119,9 @@ Runs after Task 6, which defines `drafts::STARTER`.
 - Modify: `deploy/python/pyproject.toml` (`markdown-it-py`), `deploy/python/uv.lock` (`uv lock`)
 
 - `render.py IN.md OUT.pdf [--slides]`: markdown-it-py `commonmark` with `table` and `strikethrough`, `style.css` inlined (NanumGothic first, then DejaVu), local images resolved against IN's folder; `--slides` splits on lines that are exactly `---`, one `<section>` per slide with `@page { size: 13.333in 7.5in }`; prints with `$AGENT_BROWSER_EXECUTABLE_PATH --headless --no-sandbox --disable-gpu --user-data-dir=<mktemp> --no-pdf-header-footer --print-to-pdf=OUT file://<html>`. `make_pptx.py` and `chart.py` run under `uv run --with python-pptx==1.0.2` / `--with matplotlib==3.11.2`. Each SKILL.md: frontmatter `name`, one-line `description`; the steps; "deliver with `send_file`; never upload a result anywhere to share it".
-- [ ] **Step 1: failing test:** `drafts::tests::every_starter_skill_passes_the_approval_checks` (`read_skill` on each folder in `deploy/skills/`; four of them).
-- [ ] **Step 2–4.** Run `render.py` on the host once against a Korean markdown file with a table (Chromium from the host or the image, Task 12) where available.
-- [ ] **Step 5:** commit `feat(skills): ship report, slides, pdf and charts skills that write files and deliver them with send_file`.
+- [x] **Step 1: failing test:** `drafts::tests::every_starter_skill_passes_the_approval_checks` (`read_skill` on each folder in `deploy/skills/`; four of them).
+- [x] **Step 2–4.** Run `render.py` on the host once against a Korean markdown file with a table (Chromium from the host or the image, Task 12) where available.
+- [x] **Step 5:** commit `feat(skills): ship report, slides, pdf and charts skills that write files and deliver them with send_file`.
 
 ### Task 6: Seeding (`drafts::seed`)
 
@@ -134,14 +134,14 @@ pub const STARTER: &str = "/opt/zephyr/skills";
 pub fn seed(cfg: &Config) -> Vec<String>;
 ```
 Record `<state>/skills-seeded.json` (`replace_private`, `{NAME: digest}`; `digest` over `SKILL` + each path and bytes, as `fingerprint` does for a skill). Commits `skill: seed NAME` and `skill: seed-update NAME`. Router: after `settle_remote_connectors`, `seed`; non-empty and meta `skills.seed_told` unset → meta `skills.seed_pending` = names; `upgrade_notice`'s tick sends the notice once there is an owner, then sets `skills.seed_told`.
-- [ ] **Step 1: failing tests** (`drafts::tests`): `seed_commits_each_starter_skill_once`; `a_removed_starter_skill_stays_removed_and_undo_brings_it_back`; `a_new_image_updates_an_untouched_copy_and_leaves_the_owners`; `a_name_the_owner_already_has_is_left_alone`; `a_starter_skill_that_fails_the_checks_is_not_seeded`; `a_starter_skill_the_agent_edits_is_not_trusted` (Review Focus 2). Router: `router::starter_skills_are_seeded_and_told_once` (two starts, one notice).
-- [ ] **Step 2–4.** **Step 5:** commit `feat(skills): seed the image's starter skills at start, once, and never again after the owner removes one`.
+- [x] **Step 1: failing tests** (`drafts::tests`): `seed_commits_each_starter_skill_once`; `a_removed_starter_skill_stays_removed_and_undo_brings_it_back`; `a_new_image_updates_an_untouched_copy_and_leaves_the_owners`; `a_name_the_owner_already_has_is_left_alone`; `a_starter_skill_that_fails_the_checks_is_not_seeded`; `a_starter_skill_the_agent_edits_is_not_trusted` (Review Focus 2). Router: `router::starter_skills_are_seeded_and_told_once` (two starts, one notice).
+- [x] **Step 2–4.** **Step 5:** commit `feat(skills): seed the image's starter skills at start, once, and never again after the owner removes one`.
 
 ### Task 7: `browser.pace_ms` (config and registry)
 
 **Files:** Modify `crates/zephyr/src/config.rs` (`pub browser: Option<Browser>`, `Browser { pace_ms: Option<u64> }` `deny_unknown_fields`; `Config::pace_ms() -> u64`, 1500 when unset; validate 0..=60000), `crates/zephyr/src/settings.rs` (row: key `browser.pace_ms`, section `Browser`, `Kind::Int { min: 0, max: 60000 }`, `Access::Tighten`, strong false, `Stricter::Higher`, `Apply::Toml`; `value`), `DESIGN.md` §4.17 row and §4.24, `README.md` (the setting and the upgrade note).
-- [ ] **Step 1: failing tests:** `config::tests::no_browser_table_reads_the_default_pace`; `settings::tests::the_pace_row_parses_and_the_agent_only_raises_it` (agent raising applies, lowering proposes); `router::set_browser_pace_writes_the_table_and_nothing_else_does`; `router::an_upgrade_with_no_browser_key_leaves_zephyr_toml_as_it_is` (Review Focus 5); `reload::tests::a_pace_change_is_live`.
-- [ ] **Step 2–4.** **Step 5:** commit `feat(browser): add the browser.pace_ms setting, 1500 ms unless the owner sets it`.
+- [x] **Step 1: failing tests:** `config::tests::no_browser_table_reads_the_default_pace`; `settings::tests::the_pace_row_parses_and_the_agent_only_raises_it` (agent raising applies, lowering proposes); `router::set_browser_pace_writes_the_table_and_nothing_else_does`; `router::an_upgrade_with_no_browser_key_leaves_zephyr_toml_as_it_is` (Review Focus 5); `reload::tests::a_pace_change_is_live`.
+- [x] **Step 2–4.** **Step 5:** commit `feat(browser): add the browser.pace_ms setting, 1500 ms unless the owner sets it`.
 
 ### Task 8: The gate's pace (`gate::Pace`)
 
@@ -157,8 +157,8 @@ impl Pace {
 }
 ```
 Wire: `{"v": 1, "pace": SITE, "count": N, "session": S}` → `{"verdict": "allow", "wait_ms": N}` or `{"verdict": "deny", "text": …}`, answered at once, unaudited; `Pace` made once in `serve` and shared by its `Conn`s; `pace` from the connection's `cfg.pace_ms()`; `r` from `ring::rand::SystemRandom`.
-- [ ] **Step 1: failing tests:** `pace_gaps_on_one_site_lie_in_pace_to_one_and_a_half`; `two_sites_do_not_wait_on_each_other`; `a_batch_of_two_and_a_slot_past_two_minutes_are_refused_and_reserve_nothing`; `pace_zero_reserves_nothing`; `passed_entries_are_dropped`; `the_gate_answers_a_pace_request_at_once` (over the socket, as the desktop tests do).
-- [ ] **Step 2–4.** **Step 5:** commit `feat(gate): reserve each site's next browser slot for every wrapper alike`.
+- [x] **Step 1: failing tests:** `pace_gaps_on_one_site_lie_in_pace_to_one_and_a_half`; `two_sites_do_not_wait_on_each_other`; `a_batch_of_two_and_a_slot_past_two_minutes_are_refused_and_reserve_nothing`; `pace_zero_reserves_nothing`; `passed_entries_are_dropped`; `the_gate_answers_a_pace_request_at_once` (over the socket, as the desktop tests do).
+- [x] **Step 2–4.** **Step 5:** commit `feat(gate): reserve each site's next browser slot for every wrapper alike`.
 
 ### Task 9: The wrapper paces (`browser_gate::paced`)
 
@@ -173,28 +173,28 @@ pub fn paced(rest: &[String]) -> Option<(Paced, u32)>;
 pub fn site(url: &str) -> Option<String>;
 ```
 In `decide`: after `held` and the gate's verdict and `taken`, before `unchanged` and `go`: `pace(env, site, count)` asks the gate (`ask_open` with a 5 s wait), drops the connection, sleeps `wait_ms`; `deny` refuses with its text; no gate or no answer runs unpaced. `Act::Pass` commands that `paced` names run `pace` then `go`; clicks the gate lets through at once, likewise.
-- [ ] **Step 1: failing tests:** `paced_reads_the_commands_in_the_spec_table` (`open example.com`, `goto`, `navigate`, `tab new --label x URL`, `read URL`, `read` alone, `back`, `reload`, `click @e1`, `find role button click`, `batch "open a.test" "open b.test"` → count 2, `snapshot` and `fill` → None); `sites_are_registrable_domains` (`www.amazon.co.uk` = `smile.amazon.co.uk`; `a.co.kr` and `b.co.kr` are two sites; `192.168.0.1`; `file:///x` → None); `no_gate_runs_a_navigation_at_once_and_still_refuses_a_click`; `a_paced_command_sleeps_what_the_gate_says`.
-- [ ] **Step 2–4;** `cargo deny check advisories bans`. **Step 5:** commit `feat(browser): space the agent's navigations and clicks on one site by the gate's slot`.
+- [x] **Step 1: failing tests:** `paced_reads_the_commands_in_the_spec_table` (`open example.com`, `goto`, `navigate`, `tab new --label x URL`, `read URL`, `read` alone, `back`, `reload`, `click @e1`, `find role button click`, `batch "open a.test" "open b.test"` → count 2, `snapshot` and `fill` → None); `sites_are_registrable_domains` (`www.amazon.co.uk` = `smile.amazon.co.uk`; `a.co.kr` and `b.co.kr` are two sites; `192.168.0.1`; `file:///x` → None); `no_gate_runs_a_navigation_at_once_and_still_refuses_a_click`; `a_paced_command_sleeps_what_the_gate_says`.
+- [x] **Step 2–4;** `cargo deny check advisories bans`. **Step 5:** commit `feat(browser): space the agent's navigations and clicks on one site by the gate's slot`.
 
 ### Task 10: Pacing end to end
 
 **Files:** Modify `crates/zephyr/tests/cli.rs`, `DESIGN.md` §4.11 bullet.
-- [ ] **Step 1: failing tests:** `cli::pacing_spaces_navigations_across_wrapper_processes` (Review Focus 3); `cli::a_wrapper_sleeping_out_its_pace_never_delays_a_take` (Review Focus 4).
-- [ ] **Step 2–4.** **Step 5:** commit `test(browser): pacing holds across wrapper processes and never delays a takeover`.
+- [x] **Step 1: failing tests:** `cli::pacing_spaces_navigations_across_wrapper_processes` (Review Focus 3); `cli::a_wrapper_sleeping_out_its_pace_never_delays_a_take` (Review Focus 4).
+- [x] **Step 2–4.** **Step 5:** commit `test(browser): pacing holds across wrapper processes and never delays a takeover`.
 
 ### Task 11: The image
 
 **Files:** Modify `deploy/Dockerfile` (`tools` stage: `GITHUB_MCP_VERSION=2.1.0`, `GITHUB_MCP_SHA256_AMD64`, `GITHUB_MCP_SHA256_ARM64`, to `/usr/local/bin/github-mcp-server`; apt `fonts-nanum poppler-utils`; `COPY deploy/connectors/ /opt/zephyr/connectors/`, `COPY deploy/skills/ /opt/zephyr/skills/`, chmod 0755/0644), `.dockerignore`, `DESIGN.md` §4.11 command-line tools, `CLAUDE.md` (`catalog.rs`; `deploy/connectors/`, `deploy/skills/`).
-- [ ] **Step 1:** `every_copy_in_the_dockerfile_is_in_the_build_context` fails until `.dockerignore` lists both folders. **Step 2–4.** **Step 5:** commit `build(image): add github-mcp-server, Korean fonts, poppler and the catalog and skills folders`.
+- [x] **Step 1:** `every_copy_in_the_dockerfile_is_in_the_build_context` fails until `.dockerignore` lists both folders. **Step 2–4.** **Step 5:** commit `build(image): add github-mcp-server, Korean fonts, poppler and the catalog and skills folders`.
 
 ### Task 12: Image and side container
 
-- [ ] `docker build -t zephyr-dev:d1-<sha> -f deploy/Dockerfile --secret id=gh_token,env=GH_TOKEN .`; in it: `/opt/zephyr/connectors/*.toml` (6), `/opt/zephyr/skills/*/SKILL.md` (4), `github-mcp-server --version`, `fc-list | grep -i nanum`, `pdftotext -v`.
-- [ ] `zephyr-test-d1` (scratch HOME, bridge, attach 21790, web 21793): `zephyr mcp add --catalog context7` and an `mcp_list` through it; a catalog command connector with a dummy secret: `mcp.json` and the server's environment hold only the stand-in; `/skills` lists the four; two `agent-browser open` to one site, as the agent, are ≥ 1500 ms apart. Remove the container and network; keep the image.
+- [x] `docker build -t zephyr-dev:d1-<sha> -f deploy/Dockerfile --secret id=gh_token,env=GH_TOKEN .`; in it: `/opt/zephyr/connectors/*.toml` (6), `/opt/zephyr/skills/*/SKILL.md` (4), `github-mcp-server --version`, `fc-list | grep -i nanum`, `pdftotext -v`.
+- [x] `zephyr-test-d1` (scratch HOME, bridge, attach 21790, web 21793): `zephyr mcp add --catalog context7` and an `mcp_list` through it; a catalog command connector with a dummy secret: `mcp.json` and the server's environment hold only the stand-in; `/skills` lists the four; two `agent-browser open` to one site, as the agent, are ≥ 1500 ms apart. Remove the container and network; keep the image.
 
 ### Task 13: Real rpi
 
-- [ ] `ZEPHYR_REAL_RPI=1 cargo test -p zephyr --test real_rpi -- --ignored`, `-p zephyr-policy --test rpi_load -- --ignored`, `-p zephyr --test attach -- --ignored`.
+- [x] `ZEPHYR_REAL_RPI=1 cargo test -p zephyr --test real_rpi -- --ignored`, `-p zephyr-policy --test rpi_load -- --ignored`, `-p zephyr --test attach -- --ignored`.
 
 ## Deviations
 
@@ -209,3 +209,19 @@ In `decide`: after `held` and the gate's verdict and `taken`, before `unchanged`
 - Task 9: `browser_gate::tests::a_navigation_passes_straight_through` now expects `back` to read the page's address (`get url`), as §4.3.2 says it must for its site; the test's fake gate (`T::gate`) answers pacing requests `allow` with no wait, so the tests that check the gate heard nothing still check exactly that (`T::gate_all` sees them).
 - Task 10: `cli::a_wrapper_sleeping_out_its_pace_never_delays_a_take` runs the wrapper process against a gate the test serves, not the daemon's: a take is only reachable through the web app's passkey-signed `desktop` op. The daemon's side of a take is `gate.rs`'s and `desktop.rs`'s tests. Both Task 10 tests passed on their first run, the behaviour being Tasks 8 and 9's; with `pace_ms = 0` the first fails.
 - Task 10: `cli::pacing_spaces_navigations_across_wrapper_processes` asserts that a site's k-th command ran at least (k − 1) × 300 ms after the wrappers were started, not that each two neighbours ran ≥ 300 ms apart. The gate's slots are ≥ pace apart and each wrapper sleeps at least to its slot, but a neighbour's own gap can come out shorter by however late the earlier wrapper was scheduled after its sleep: the pairwise form failed once in four full `cargo test` runs. The cumulative form is the bound the design guarantees, and a slow machine cannot break it. (Strictly pairwise spacing would need the wrapper to tell the gate when it ran; not done.)
+- **How it was built.** Tasks 7–10 (pacing) ran in parallel in their own worktree (`claude/d1-pacing`) and were cherry-picked onto this branch after Task 4; the conflicts were DESIGN.md (§4.23 and §4.24 both kept) and this list.
+- **Not done:** `linear`'s tool names were not listed live (no Linear key), so it presets no classes; rpi's own `mcp_list` through a catalog connector was not driven (it needs a model); the ignored real-container test `tests/token_broker.rs` was not extended with `ZEPHYR_TEST_GITHUB_TOKEN` / `ZEPHYR_TEST_LINEAR_KEY` cases, the side container checked the same by hand below.
+
+## Results (2026-11-11, image `zephyr-dev:d1-295cfa3`, container `zephyr-test-d1`, attach 21790, bridge)
+
+- `cargo test --no-fail-fast`: 1466 passed, 0 failed, 22 ignored. `clippy --all-targets -D warnings` clean. `cargo deny check advisories bans`: advisories ok, bans ok (`psl` 2.1.251, `psl-types` 2.0.11). Flakes seen once each and passing on rerun, in code this lane did not touch: `browser_gate::tests::a_command_runs_in_a_place_the_take_waits_for`, `voice::tests::a_hung_whisper_is_killed_and_the_next_note_is_heard`, `cli::status_fails_without_a_daemon_or_with_a_stale_heartbeat` (400 s against 401 s).
+- Real rpi 0.21.2 (`ZEPHYR_REAL_RPI=1`): `real_rpi` 6, `rpi_load` 10, ignored `attach` 1, all passed.
+- Image: `/opt/zephyr/connectors` (6 entries) and `/opt/zephyr/skills` (4) root's, 0755/0644; `github-mcp-server --version` 2.1.0 (commit 4bcdcdf); 12 Nanum fonts in `fc-list`; `pdftotext` 24.02.0; markdown-it-py 4.2.0 in `/opt/zephyr/py`.
+- Side container (scratch HOME, its own bridge network; the live `zephyr`, `~/.zephyr*` and tailscale untouched):
+  - First start seeded `charts`, `pdf`, `report`, `slides` (`skill: seed …` commits, `skills-seeded.json` root 0600); `zephyr skill list` and AGENTS.md list them.
+  - `zephyr mcp catalog` listed the six; `zephyr mcp add --catalog context7` wrote the table, restarted the agent and published `{"url": "https://mcp.context7.com/mcp"}` in `mcp.json`. As the agent, through the proxy, an MCP `initialize` and `tools/list` to it answered (Context7 4.5.0; `resolve-library-id`, `query-docs`).
+  - `zephyr mcp add --catalog github` with a dummy `GITHUB_TOKEN` in secrets.env: `mcp.json` holds `zsur_135b…` and not the value; the server, run as the agent with that env, has only the stand-in in `/proc/<pid>/environ`; its `get_me` reached GitHub with the dummy swapped in (`401 Bad credentials`), audited `net|swap|GITHUB_TOKEN -> api.github.com:443|allowed`; `grep -r` over `/zephyr` finds no value.
+  - Pacing at the default 1500 ms, as the agent: three `agent-browser open https://www.example.com/?n=…` in a row took 0.66 s, 1.49 s and 1.61 s (the first unpaced, the others waiting out their slot); two started together from separate processes to `iana.org` and `www.iana.org` finished 2.0 s apart.
+  - The skills in the image: `report` rendered Korean Markdown with a table to a PDF whose `pdftotext` holds the Hangul; `slides` gave 3 pages at 960 × 540 pt; pypdf merged them into 4; `charts` (matplotlib fetched by uv) wrote a 1350 × 750 PNG; `make_pptx.py` (python-pptx fetched by uv) wrote a `.pptx`.
+  - `zephyr doctor`: `ok the agent cannot write /opt/zephyr/connectors`, `… /opt/zephyr/skills`, no failure.
+  - Container and network removed; the image kept.
