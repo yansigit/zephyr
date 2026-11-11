@@ -1303,17 +1303,20 @@ impl Conn {
         let (cfg, store) = (self.cfg.clone(), self.store.clone());
         let recorded = tokio::task::spawn_blocking(move || {
             let store = store.lock().unwrap_or_else(|e| e.into_inner());
-            // Told only of a row this ended, on the action's channel, as its other outcomes.
-            if store.finish_action(id, status, result)? {
-                if let (Some(tail), Some(a)) = (told, store.action(id)?) {
-                    // R70: the summary as the private facts are now.
-                    let summary = crate::facts::scrubbed(&cfg, a.summary.clone());
-                    let text = format!("[zephyr] #{id} ({summary}){tail}");
-                    crate::actions::tell(&store, &a, &text);
-                    return Ok(true);
+            // The ending and its notice land together: never over with the owner never told.
+            store.atomically(|store| {
+                // Told only of a row this ended, on the action's channel, as its other outcomes.
+                if store.finish_action(id, status, result)? {
+                    if let (Some(tail), Some(a)) = (told, store.action(id)?) {
+                        // R70: the summary as the private facts are now.
+                        let summary = crate::facts::scrubbed(&cfg, a.summary.clone());
+                        let text = format!("[zephyr] #{id} ({summary}){tail}");
+                        crate::actions::told(store, &a, &text)?;
+                        return Ok(true);
+                    }
                 }
-            }
-            Ok::<_, rusqlite::Error>(false)
+                Ok(false)
+            })
         });
         match recorded.await {
             Ok(Ok(true)) => wake.outbox.notify_one(),
@@ -3902,6 +3905,56 @@ mod tests {
         assert_eq!(status(), "dropped");
         assert!(!waits.answer(2, true), "its wait is gone");
         let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
+    }
+
+    /// How a let-go action ended and the owner's notice of it are one write: when the notice
+    /// cannot be written (here an outbox that takes no row; a crash between the two), the
+    /// ending is not recorded either, so the action is never over with the owner never told.
+    #[tokio::test]
+    async fn an_ending_is_recorded_only_with_its_notice() {
+        let h = home("gate-ending-told", "");
+        let id = (h.store.hold_action(&crate::store::NewAction {
+            kind: ActionKind::Wait,
+            class: "messages".into(),
+            targets: vec![],
+            summary: "click \"Send\" on https://mail.x".into(),
+            reason: None,
+            payload: "{}".into(),
+            secrets: vec![],
+            origin: Origin {
+                channel: "discord".into(),
+                sender: "owner-1".into(),
+                session: "task-1".into(),
+                run: "task-1".into(),
+                call_id: None,
+            },
+            due_at: None,
+        }))
+        .unwrap();
+        assert!(h.store.take_action(id, "running").unwrap().is_some());
+        let conn = Conn {
+            cfg: Arc::new(h.cfg.clone()),
+            snap: Snapshot::default(),
+            store: Arc::new(Mutex::new(Store::open(&h.cfg.db_path()).unwrap())),
+            waits: crate::actions::Waits::default(),
+            main: mpsc::channel(1).0,
+            desktop: crate::desktop::Control::new(&h.cfg),
+            desktop_waits: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let wake = crate::scheduler::Wake::default();
+        let db = rusqlite::Connection::open(h.cfg.db_path()).unwrap();
+        let block = "CREATE TRIGGER no_outbox BEFORE INSERT ON outbox \
+                     BEGIN SELECT RAISE(ABORT, 'no outbox'); END";
+        db.execute_batch(block).unwrap();
+        conn.finish(id, HELD_ENDING, &wake).await;
+        let status = || h.store.action(id).unwrap().unwrap().status;
+        assert_eq!(status(), "running", "ended, and the owner never told");
+        db.execute_batch("DROP TRIGGER no_outbox").unwrap();
+        conn.finish(id, HELD_ENDING, &wake).await;
+        assert_eq!(status(), "failed");
+        let told = (h.store.pending_outbox().unwrap().into_iter())
+            .any(|o| o.text.ends_with(" did not run: you had the desktop"));
+        assert!(told, "the owner is not told");
     }
 
     /// M2: a click the owner let go ends as its wrapper says once it read the page again (I4):
