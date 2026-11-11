@@ -1,10 +1,10 @@
-//! Pairing codes (DESIGN §4.3): how a Telegram or Signal owner is learned. A strong channel asks
-//! for a one-time code (`/pair telegram`), and the sender of the message that carries it back
-//! becomes an owner of that channel. Only the code's SHA-256 is kept. Pure: the router stores
-//! the row, counts wrong codes and edits the owner list.
+//! One-time codes: pairing a Telegram or Signal owner (DESIGN §4.3) and enrolling a web app
+//! passkey (§4.3.3). A strong channel asks for a code (`/pair telegram`, `/web enrol`), and what
+//! carries it back is trusted as that channel was. Only the code's SHA-256 is kept, in a `meta`
+//! row with its expiry. Pure: callers store the row, count wrong codes and act on a match.
 
 use crate::web::passkey::sha256;
-use crate::web::signin::{random, typed};
+use crate::web::signin::random;
 use data_encoding::{BASE32_NOPAD, HEXLOWER};
 use subtle::ConstantTimeEq;
 
@@ -18,15 +18,40 @@ pub fn meta_key(channel: &str) -> String {
     format!("pair_{channel}")
 }
 
-/// A new code, as shown (`ABCDE-FGHJK`), and the `meta` row to keep: its hash and expiry.
-pub fn issue(now: i64) -> (String, String) {
+/// A new code, as shown (`ABCDE-FGHJK`), and the `meta` row to keep: its hash, its expiry and
+/// the name it was made for (a passkey's), if any.
+pub fn issue(now: i64, name: Option<&str>) -> (String, String) {
     // 6 random bytes: 48 bits, 10 characters a phone can type.
     let code = BASE32_NOPAD.encode(&random::<6>());
     let row = serde_json::json!({
         "sha256": HEXLOWER.encode(&sha256(code.as_bytes())),
+        "name": name,
         "expires": now + LIFE,
     });
     (format!("{}-{}", &code[..5], &code[5..]), row.to_string())
+}
+
+/// The code `row` holds, while it still works: its hash and the name it was made for.
+pub fn live(row: &str, now: i64) -> Option<([u8; 32], Option<String>)> {
+    let v: serde_json::Value = serde_json::from_str(row).ok()?;
+    let hash = HEXLOWER.decode(v["sha256"].as_str()?.as_bytes()).ok()?;
+    let name = v["name"].as_str().map(str::to_string);
+    (v["expires"].as_i64()? > now).then_some((hash.try_into().ok()?, name))
+}
+
+/// A code as typed: uppercase, without its hyphen or any space.
+pub fn typed(code: &str) -> String {
+    let kept = code.chars().filter(|c| *c != '-' && !c.is_whitespace());
+    kept.flat_map(char::to_uppercase).collect()
+}
+
+/// The channels that may ask for a code: the strong ones but the passkey, since what a code
+/// lets in is as strong as what vouched for it.
+pub fn issuers(cfg: &crate::config::Config) -> Vec<&str> {
+    (cfg.settings.strong_channels.iter())
+        .map(String::as_str)
+        .filter(|c| *c != "passkey")
+        .collect()
 }
 
 /// The code a message on `channel` claims with, when it is a pairing channel's.
@@ -43,23 +68,9 @@ pub fn claimed(text: &str) -> Option<String> {
     (code.len() == 10 && code.bytes().all(base32)).then_some(code)
 }
 
-/// Whether `row` holds a code that still works: only then is a wrong one counted.
-pub fn outstanding(row: &str, now: i64) -> bool {
-    serde_json::from_str::<serde_json::Value>(row)
-        .is_ok_and(|v| v["expires"].as_i64().is_some_and(|at| at > now))
-}
-
 /// Whether `code` (as `claimed` gives it) is the unexpired one `row` was issued for.
 pub fn matches(row: &str, code: &str, now: i64) -> bool {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(row) else {
-        return false;
-    };
-    let hash = v["sha256"]
-        .as_str()
-        .and_then(|h| HEXLOWER.decode(h.as_bytes()).ok());
-    let live = v["expires"].as_i64().is_some_and(|at| at > now);
-    let same = hash.is_some_and(|h| bool::from(h.ct_eq(&sha256(code.as_bytes()))));
-    live && same
+    live(row, now).is_some_and(|(hash, _)| bool::from(hash.ct_eq(&sha256(code.as_bytes()))))
 }
 
 #[cfg(test)]
@@ -68,7 +79,7 @@ mod tests {
 
     #[test]
     fn a_code_matches_typed_any_way() {
-        let (shown, row) = issue(1000);
+        let (shown, row) = issue(1000, None);
         assert!(shown.len() == 11 && shown.as_bytes()[5] == b'-', "{shown}");
         for typed in [shown.clone(), shown.to_lowercase(), shown.replace('-', " ")] {
             let code = claimed(&format!("/pair {typed}")).unwrap();
@@ -84,10 +95,18 @@ mod tests {
 
     #[test]
     fn a_code_expires() {
-        let (shown, row) = issue(1000);
+        let (shown, row) = issue(1000, Some("phone"));
+        assert_eq!(live(&row, 1000).unwrap().1.as_deref(), Some("phone"));
+        assert!(live(&row, 1000 + LIFE).is_none());
         let code = claimed(&format!("/pair {shown}")).unwrap();
         assert!(matches(&row, &code, 1000 + LIFE - 1));
         assert!(!matches(&row, &code, 1000 + LIFE));
+    }
+
+    #[test]
+    fn typed_drops_case_hyphens_and_spaces() {
+        assert_eq!(typed(" abcde - fghjk\n"), "ABCDEFGHJK");
+        assert_eq!(typed("ABCDE-FGHJK"), "ABCDEFGHJK");
     }
 
     #[test]

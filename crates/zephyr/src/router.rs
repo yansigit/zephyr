@@ -3686,10 +3686,7 @@ impl<'a> Router<'a> {
             "signal" => self.cfg.signal.is_some(),
             _ => return "[zephyr] usage: /pair telegram|signal".into(),
         };
-        let strong: Vec<&str> = (self.cfg.settings.strong_channels.iter())
-            .map(String::as_str)
-            .filter(|c| *c != "passkey")
-            .collect();
+        let strong = crate::pairing::issuers(&self.cfg);
         if !strong.contains(&channel) {
             return format!("[zephyr] /pair needs {}", strong.join(" or "));
         }
@@ -3699,7 +3696,7 @@ impl<'a> Router<'a> {
         if let Some(at) = self.pair_limits.closed(std::time::Instant::now()) {
             return format!("[zephyr] pairing is closed until {}", self.clock(at));
         }
-        let (code, row) = crate::pairing::issue(crate::now());
+        let (code, row) = crate::pairing::issue(crate::now(), None);
         let key = crate::pairing::meta_key(kind);
         if let Err(e) = self.store.set_meta(&key, Some(&row)) {
             return format!("[zephyr] the pairing code could not be saved: {e}");
@@ -3734,9 +3731,10 @@ impl<'a> Router<'a> {
         let at = crate::now();
         // With no code out there is nothing to guess: no count, so a stranger cannot keep
         // pairing closed or have the owner told.
-        if !stored
+        if stored
             .as_deref()
-            .is_some_and(|r| crate::pairing::outstanding(r, at))
+            .and_then(|r| crate::pairing::live(r, at))
+            .is_none()
         {
             return eprintln!("zephyr: a pairing claim on {channel} with no code out");
         }

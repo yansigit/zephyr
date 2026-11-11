@@ -753,7 +753,7 @@ async fn pairing_over_telegram_names_the_user() {
     cfg.telegram_api = api.clone();
     cfg.tick = Duration::from_millis(200);
     // The code `/pair telegram` would have given on chat (tested in tests/router.rs).
-    let (code, row) = zephyr::pairing::issue(zephyr::now());
+    let (code, row) = zephyr::pairing::issue(zephyr::now(), None);
     Store::open(&cfg.db_path())
         .unwrap()
         .set_meta("pair_telegram", Some(&row))

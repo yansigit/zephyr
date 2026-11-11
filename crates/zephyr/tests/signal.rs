@@ -316,7 +316,7 @@ async fn pairing_works_by_source_uuid() {
     cfg.signal_cli = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-signal-cli.py").into();
     cfg.tick = Duration::from_millis(200);
     // The code `/pair signal` would have given on chat (tested in tests/router.rs).
-    let (code, row) = zephyr::pairing::issue(zephyr::now());
+    let (code, row) = zephyr::pairing::issue(zephyr::now(), None);
     let store = Store::open(&cfg.db_path()).unwrap();
     store.set_meta("pair_signal", Some(&row)).unwrap();
     let gw = start(cfg);
