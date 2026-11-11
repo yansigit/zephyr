@@ -5978,12 +5978,19 @@ async fn an_upgrade_with_no_browser_key_leaves_zephyr_toml_as_it_is() {
     );
     std::fs::write(&path, &text).unwrap();
     std::fs::write(home.join("secrets.env"), "API_KEY=k\n").unwrap();
+    // The image's starter skills, seeded at this start (DESIGN §4.23): never into zephyr.toml.
+    let image = home.join("image-skills/report");
+    std::fs::create_dir_all(&image).unwrap();
+    let skill = "---\nname: report\ndescription: Use when reporting.\n---\nsteps\n";
+    std::fs::write(image.join("SKILL.md"), skill).unwrap();
     let mut cfg = Config::load(&path).unwrap();
     cfg.floor = true;
     cfg.tick = Duration::from_millis(200);
+    cfg.starter_skills = home.join("image-skills");
     let gw = start(cfg);
     gw.say("m1", "owner", "hi").await;
     gw.wait_reply("echo: ").await;
+    gw.wait_reply("added the starter skills report").await;
     gw.say("m2", "owner", "/reload").await;
     gw.wait_reply("[zephyr] nothing changed").await;
     ticks(&home, 3).await;
