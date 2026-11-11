@@ -8708,3 +8708,28 @@ async fn a_frame_or_a_page_that_moved_gets_no_number_and_a_move_closes_the_card(
     wait(|| card_status(&home, 2) == "closed").await;
     gw.shutdown().await;
 }
+
+/// `/stop` while a card is being typed: the fill is stopped between two fields, so the
+/// fields after the one in hand are never typed.
+#[tokio::test]
+async fn a_stop_during_a_fill_types_no_further_field() {
+    let (home, cfg) = card_home("card-fill-stop", "fake", "auto 100");
+    let gw = start(cfg);
+    gw.say("x1", "owner", &card_ask("10")).await;
+    wait(|| card_status(&home, 1) == "open").await;
+    reply_where(&gw, "chat", |r| r.contains("[card #1 issued")).await;
+    // Each field takes the browser two seconds.
+    std::fs::write(home.join("ab-slow"), "2").unwrap();
+    gw.say("x2", "owner", CARD_FILL).await;
+    wait(|| fills(&home).len() == 1).await;
+    gw.say("x3", "owner", "/stop").await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] stopped")).await;
+    wait(|| card_status(&home, 1) == "closed").await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        fills(&home),
+        ["fill #n 4000009990001984"],
+        "the expiry and the code were not typed"
+    );
+    gw.shutdown().await;
+}

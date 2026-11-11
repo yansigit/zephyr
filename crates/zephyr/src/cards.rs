@@ -156,6 +156,18 @@ pub struct Pan {
     pub name: Option<String>,
 }
 
+/// A number is wiped when its copy is dropped: the daemon keeps one in `live` and makes
+/// another for each fill, and none is left in freed memory.
+impl Drop for Pan {
+    fn drop(&mut self) {
+        crate::vault::wipe_str(&mut self.number);
+        crate::vault::wipe_str(&mut self.cvc);
+        if let Some(name) = &mut self.name {
+            crate::vault::wipe_str(name);
+        }
+    }
+}
+
 impl std::fmt::Debug for Pan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Pan(…{})", self.last4())
@@ -948,8 +960,18 @@ pub fn agent(
                 return answer(crate::vault::HELD);
             };
             let (cfg, call) = (cfg.clone(), call_id.to_string());
+            let stop = fills::start(cfg.state_dir(), id);
             tokio::spawn(async move {
-                let text = fill(&cfg, id, fields).await;
+                let text = tokio::select! {
+                    text = fill(&cfg, id, fields) => text,
+                    // The card was closed (`/stop`, `/pause`, a close): dropping the fill
+                    // here ends its browser command and wipes its copy of the number.
+                    () = stop.notified() => format!(
+                        "stopped: card #{id} was closed while it was being filled; nothing \
+                         more was typed"
+                    ),
+                };
+                fills::end(cfg.state_dir(), id, &stop);
                 drop(filling);
                 crate::tools::answer_gateway(&cfg, &call, &text);
             });
@@ -1310,6 +1332,38 @@ async fn fill(cfg: &Arc<Config>, id: i64, fields: CardFields) -> String {
     )
 }
 
+/// The fills in progress, so that closing a card stops one between two fields.
+mod fills {
+    use super::*;
+    use tokio::sync::Notify;
+
+    static FILLS: Mutex<Vec<(PathBuf, i64, Arc<Notify>)>> = Mutex::new(Vec::new());
+
+    fn lock() -> std::sync::MutexGuard<'static, Vec<(PathBuf, i64, Arc<Notify>)>> {
+        FILLS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A fill of `card` starts: what `stop` wakes.
+    pub fn start(state: &std::path::Path, card: i64) -> Arc<Notify> {
+        let stop = Arc::new(Notify::new());
+        lock().push((state.to_path_buf(), card, stop.clone()));
+        stop
+    }
+
+    pub fn end(state: &std::path::Path, card: i64, stop: &Arc<Notify>) {
+        lock().retain(|(s, c, n)| !(s == state && *c == card && Arc::ptr_eq(n, stop)));
+    }
+
+    /// Stops every fill of `card`: one that has not reached its wait yet finds the wake stored.
+    pub fn stop(state: &std::path::Path, card: i64) {
+        for (s, c, stop) in lock().iter() {
+            if s == state && *c == card {
+                stop.notify_one();
+            }
+        }
+    }
+}
+
 /// What an issuer said about a card. It is asked off the router's loop, and what it said is
 /// recorded on the router's next tick with the router's own store ([`tick`]): the tick opens
 /// no connection of its own, and every write of a card's life after its issue is made there,
@@ -1339,6 +1393,7 @@ async fn close_at_issuer(cfg: &Config, card: &Card) -> Result<(), String> {
 /// Closes `card`: its number is forgotten now, the issuer is asked off the caller's loop, and
 /// the router's next tick records what it said ([`closed`]).
 pub fn ask_close(cfg: &Arc<Config>, card: Card, why: &str) {
+    fills::stop(cfg.state_dir(), card.id);
     live::forget(cfg.state_dir(), card.id, crate::now());
     let (cfg, why) = (cfg.clone(), why.to_string());
     tokio::spawn(async move {
