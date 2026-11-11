@@ -6201,6 +6201,41 @@ async fn starter_skills_are_seeded_and_told_once() {
         "{replies:?}"
     );
     gw.shutdown().await;
+    // A later image adds one and changes another (review of #53, 8): each is told, once.
+    let slides = home.join("image-skills/slides");
+    std::fs::create_dir_all(&slides).unwrap();
+    let text = "---\nname: slides\ndescription: Use for decks.\n---\nsteps\n";
+    std::fs::write(slides.join("SKILL.md"), text).unwrap();
+    let text = "---\nname: report\ndescription: Use when reporting, v2.\n---\nsteps\n";
+    std::fs::write(image.join("SKILL.md"), text).unwrap();
+    let tail = "/skills lists them, /skill rm NAME removes one";
+    let gw = start(cfg());
+    gw.say("m4", "owner", "hi").await;
+    let replies = gw.wait_replies(3).await;
+    let mut told: Vec<&String> = replies
+        .iter()
+        .filter(|r| r.contains("starter skills"))
+        .collect();
+    told.sort();
+    assert_eq!(
+        told,
+        [
+            &format!("[zephyr] added the starter skills slides; {tail}"),
+            &format!("[zephyr] updated the starter skills report; {tail}"),
+        ],
+        "{replies:?}"
+    );
+    gw.shutdown().await;
+    let gw = start(cfg());
+    gw.say("m5", "owner", "again").await;
+    gw.wait_replies(1).await;
+    gw.say("m6", "owner", "/skills").await;
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        !replies.iter().any(|r| r.contains("starter skills")),
+        "{replies:?}"
+    );
+    gw.shutdown().await;
 }
 
 /// Under the network floor a command gets a token's stand-in (DESIGN §4.21), never its value.

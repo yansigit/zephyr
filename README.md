@@ -491,7 +491,7 @@ last change to it (again to go further back). On the host, `zephyr skill add DIR
 folder of yours, approved at once (at most 32 files and 256 KB, regular files only).
 
 **Starter skills** come with the image and are approved at the first start that sees them, on a
-new install and on an upgrade alike, with one message saying so: `report` (Markdown to a PDF, Korean
+new install and on an upgrade alike, with a message saying so (and another when a later image adds or updates one): `report` (Markdown to a PDF, Korean
 included), `slides` (Markdown to a 16:9 PDF, or a `.pptx` when you ask), `pdf` (read, look at,
 merge, split, fill and encrypt PDFs) and `charts` (a PNG or SVG chart). Each writes files and sends
 them to you with `send_file`; none uploads anything. `slides`' PowerPoint and `charts` fetch their

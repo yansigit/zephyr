@@ -891,11 +891,20 @@ pub const STARTER: &str = "/opt/zephyr/skills";
 /// `<state>/skills-seeded.json`: each starter skill's digest as last seeded.
 const SEEDED: &str = "skills-seeded.json";
 
+/// A starter skill `seed` committed: new, or a newer image's copy of one left untouched.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Seeded {
+    pub name: String,
+    /// What was committed, so each is told once (`Router::seed_notice`).
+    pub digest: String,
+    pub updated: bool,
+}
+
 /// Commits each of the image's starter skills into `<state>/skills` (DESIGN §4.23): once, again
 /// when a new image changes one the owner left as it was, and never after the owner removed or
-/// changed it. Reads only `Config::starter_skills` and `<state>`, never the agent's home. The
-/// names seeded for the first time.
-pub fn seed(cfg: &Config) -> Vec<String> {
+/// changed it. Reads only `Config::starter_skills` and `<state>`, never the agent's home. What
+/// it committed.
+pub fn seed(cfg: &Config) -> Vec<Seeded> {
     let _guard = lock();
     let state = cfg.state_dir();
     let path = state.join(SEEDED);
@@ -929,6 +938,9 @@ pub fn seed(cfg: &Config) -> Vec<String> {
             (None, None) => Some("seed"),
             // The owner's own skill of that name: theirs, left alone for good.
             (None, Some(_)) => None,
+            // Already the image's copy, the record behind it: a crash between a commit and
+            // the record (review of #53, 7). Recorded as it is, so it stays untouched.
+            (Some(r), Some(h)) if *r != digest && h == digest => None,
             // A new image, and the copy is as it was seeded.
             (Some(r), Some(h)) if *r != digest && h == *r => Some("seed-update"),
             // Unchanged, or the owner changed or removed it.
@@ -939,9 +951,11 @@ pub fn seed(cfg: &Config) -> Vec<String> {
                 eprintln!("zephyr: seeding starter skill {name} failed: {e:#}");
                 continue;
             }
-            if verb == "seed" {
-                seeded.push(name.clone());
-            }
+            seeded.push(Seeded {
+                name: name.clone(),
+                digest: digest.clone(),
+                updated: verb == "seed-update",
+            });
         }
         record.insert(name, digest);
     }
@@ -2150,6 +2164,11 @@ mod tests {
         std::fs::write(dir.join("SKILL.md"), text).unwrap();
     }
 
+    /// The names `seed` committed.
+    fn seeded(cfg: &Config) -> Vec<String> {
+        seed(cfg).into_iter().map(|s| s.name).collect()
+    }
+
     fn commits(cfg: &Config) -> usize {
         let repo = skills_repo(cfg.state_dir());
         let n = git(&repo, &["rev-list", "--count", "HEAD"]).unwrap_or_default();
@@ -2166,7 +2185,7 @@ mod tests {
         let cfg = with_starter("");
         starter(&cfg, "report", "Use when reporting.");
         starter(&cfg, "charts", "Use when charting.");
-        assert_eq!(seed(&cfg), ["charts", "report"]);
+        assert_eq!(seeded(&cfg), ["charts", "report"]);
         assert_eq!(commits(&cfg), 2);
         let log = git(&skills_repo(cfg.state_dir()), &["log", "--format=%s"]).unwrap();
         assert!(
@@ -2221,7 +2240,9 @@ mod tests {
         say(&cfg, "/skill add pdf");
         starter(&cfg, "report", "Use when reporting, v2.");
         starter(&cfg, "pdf", "Use for PDFs, v2.");
-        assert!(seed(&cfg).is_empty(), "an update is not a first seed");
+        let updated = seed(&cfg);
+        assert_eq!(updated.len(), 1, "{updated:?}");
+        assert!(updated[0].name == "report" && updated[0].updated);
         assert_eq!(
             approved_description(&cfg, "report").as_deref(),
             Some("Use when reporting, v2.")
@@ -2233,6 +2254,30 @@ mod tests {
         let log = git(&skills_repo(cfg.state_dir()), &["log", "--format=%s"]).unwrap();
         assert!(log.contains("skill: seed-update report"), "{log}");
         assert!(!log.contains("seed-update pdf"), "{log}");
+    }
+
+    /// Review of #53, 7: a crash after a seed-update's commit and before its record leaves the
+    /// copy as the image ships it; the next start takes it as untouched, not as the owner's.
+    #[test]
+    fn a_crash_between_a_seed_update_and_its_record_is_reconciled() {
+        let cfg = with_starter("");
+        starter(&cfg, "report", "Use when reporting.");
+        seed(&cfg);
+        starter(&cfg, "report", "Use when reporting, v2.");
+        let v2 = read_skill(&cfg.starter_skills.join("report"), "report").unwrap();
+        // The commit lands; the daemon dies before `skills-seeded.json` is written.
+        commit(cfg.state_dir(), "report", Some(&v2), "seed-update").unwrap();
+        let before = commits(&cfg);
+        assert!(seed(&cfg).is_empty());
+        assert_eq!(commits(&cfg), before, "nothing to commit again");
+        starter(&cfg, "report", "Use when reporting, v3.");
+        let updated = seed(&cfg);
+        assert_eq!(updated.len(), 1, "{updated:?}");
+        assert!(updated[0].updated);
+        assert_eq!(
+            approved_description(&cfg, "report").as_deref(),
+            Some("Use when reporting, v3.")
+        );
     }
 
     #[test]
@@ -2260,7 +2305,7 @@ mod tests {
         let bad = cfg.starter_skills.join("broken");
         std::fs::create_dir_all(&bad).unwrap();
         std::fs::write(bad.join("SKILL.md"), "no frontmatter\n").unwrap();
-        assert_eq!(seed(&cfg), ["report"]);
+        assert_eq!(seeded(&cfg), ["report"]);
         assert_eq!(approved_description(&cfg, "broken"), None);
     }
 

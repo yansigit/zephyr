@@ -18,9 +18,16 @@ use tokio::time::Instant;
 
 /// rpi's own cap (`MAX_RESUME_ATTEMPTS`); after that we tell the sender.
 const MAX_RESUMES: u32 = 3;
-/// `meta`: the starter skills seeded and not told yet, and that they were told (DESIGN §4.23).
+/// `meta`, each a JSON object of starter skill to `added|updated DIGEST` (DESIGN §4.23): those
+/// seeded and not told yet, and what the owner was told of each.
 const SEED_PENDING: &str = "skills.seed_pending";
 const SEED_TOLD: &str = "skills.seed_told";
+
+/// A `meta` value that is a JSON object of strings; empty when absent or another shape.
+fn meta_map(store: &Store, key: &str) -> std::collections::BTreeMap<String, String> {
+    let text = store.meta(key).ok().flatten().unwrap_or_default();
+    serde_json::from_str(&text).unwrap_or_default()
+}
 const FIRST_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// A channel send that takes longer fails, and that channel is skipped for `STUCK_PAUSE`, so
@@ -3124,34 +3131,67 @@ impl<'a> Router<'a> {
         }
     }
 
-    /// The image's starter skills, committed into `<state>/skills` (DESIGN §4.23). What is seeded
-    /// for the first time ever is told once, when there is an owner to tell (`seed_notice`).
+    /// The image's starter skills, committed into `<state>/skills` (DESIGN §4.23). Each one
+    /// seeded or updated waits in `SEED_PENDING` until there is an owner to tell (`seed_notice`).
     async fn seed_starter_skills(&mut self) {
         let cfg = self.cfg.clone();
         let seeded = tokio::task::spawn_blocking(move || crate::drafts::seed(&cfg))
             .await
             .unwrap_or_default();
-        if !seeded.is_empty() && matches!(self.store.meta(SEED_TOLD), Ok(None)) {
-            let pending = self.store.set_meta(SEED_PENDING, Some(&seeded.join(", ")));
-            log(pending.map_err(Into::into));
+        if !seeded.is_empty() {
+            let mut pending = meta_map(&self.store, SEED_PENDING);
+            for s in seeded {
+                let kind = if s.updated { "updated" } else { "added" };
+                pending.insert(s.name, format!("{kind} {}", s.digest));
+            }
+            let text = serde_json::to_string(&pending).unwrap_or_default();
+            log((self.store.set_meta(SEED_PENDING, Some(&text))).map_err(Into::into));
         }
         self.seed_notice();
     }
 
+    /// Tells the owner last answered of each starter skill seeded or updated, once for each
+    /// skill and copy (`SEED_TOLD`: name to what was told), in one line for the added and one
+    /// for the updated.
     fn seed_notice(&self) {
-        let Ok(Some(names)) = self.store.meta(SEED_PENDING) else {
-            return;
-        };
-        if self.store.last_owner().ok().flatten().is_none() {
+        let pending = meta_map(&self.store, SEED_PENDING);
+        if pending.is_empty() || self.store.last_owner().ok().flatten().is_none() {
             return;
         }
-        let told = self.store.notify_last_owner(&format!(
-            "[zephyr] added the starter skills {names}; /skills lists them, /skill rm NAME removes one"
-        ));
-        let marked = told.and_then(|()| {
-            self.store.set_meta(SEED_TOLD, Some("1"))?;
-            self.store.set_meta(SEED_PENDING, None)
-        });
+        let mut told = meta_map(&self.store, SEED_TOLD);
+        let (mut added, mut updated) = (Vec::new(), Vec::new());
+        for (name, what) in &pending {
+            if told.get(name) == Some(what) {
+                continue;
+            }
+            match what.starts_with("updated ") {
+                true => updated.push(name.as_str()),
+                false => added.push(name.as_str()),
+            }
+        }
+        let tail = "/skills lists them, /skill rm NAME removes one";
+        let mut lines = Vec::new();
+        if !added.is_empty() {
+            lines.push(format!(
+                "[zephyr] added the starter skills {}; {tail}",
+                added.join(", ")
+            ));
+        }
+        if !updated.is_empty() {
+            lines.push(format!(
+                "[zephyr] updated the starter skills {}; {tail}",
+                updated.join(", ")
+            ));
+        }
+        for line in &lines {
+            if let Err(e) = self.store.notify_last_owner(line) {
+                return log(Err(e.into()));
+            }
+        }
+        told.extend(pending);
+        let text = serde_json::to_string(&told).unwrap_or_default();
+        let marked = (self.store.set_meta(SEED_TOLD, Some(&text)))
+            .and_then(|()| self.store.set_meta(SEED_PENDING, None));
         log(marked.map_err(Into::into));
     }
 
