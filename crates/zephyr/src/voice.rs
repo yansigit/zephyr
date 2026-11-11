@@ -803,10 +803,10 @@ pub(crate) mod tests {
             line(&heard, 300),
             "[voice note above: transcription timed out]"
         );
-        let pid = std::fs::read_to_string(cfg.voice_dir.join("hang.pid")).unwrap();
-        // Safety: signal 0 only asks whether the process is there.
-        let gone = unsafe { libc::kill(pid.trim().parse().unwrap(), 0) } != 0;
-        assert!(gone, "the hung whisper was killed and reaped");
+        // Killed and reaped wherever the limit found it, asleep in its hang or (on a loaded
+        // machine) still starting: no child of this thread is left, running or a zombie.
+        let left = std::fs::read_to_string("/proc/thread-self/children").unwrap();
+        assert_eq!(left, "", "the hung whisper was not killed and reaped");
         std::fs::remove_file(hang).unwrap();
         cfg.voice_wait = Duration::from_secs(30);
         assert_eq!(
