@@ -267,12 +267,19 @@ fn status_shows_the_main_child_the_waiting_message_and_the_replies() {
     let text = stdout(&zephyr(&cfg, &["status"]));
     for line in [
         "main: down, 3 failed starts in a row",
-        "oldest new message: 100s ago",
-        "replies: 2 pending (oldest 50s ago), 1 failed",
         "inbox   new         1",
     ] {
         assert!(text.contains(line), "{line}\n{text}");
     }
+    // The ages were set a moment before `status` ran, so a second may have ticked over meanwhile.
+    let aged = |prefix: &str, age: u64, suffix: &str| {
+        (age..=age + 2).any(|a| text.contains(&format!("{prefix}{a}s ago{suffix}")))
+    };
+    assert!(aged("oldest new message: ", 100, ""), "{text}");
+    assert!(
+        aged("replies: 2 pending (oldest ", 50, "), 1 failed"),
+        "{text}"
+    );
 }
 
 /// Runs `zephyr run` under a subreaper (python) that names itself the daemon's stray scope, so
