@@ -164,6 +164,19 @@ pub const HELD_FILE: &str = "desktop-held";
 /// beside [`HELD_FILE`]: root's, 0644. Each `agent-browser` and `xdotool` wrapper holds a shared
 /// `flock` on it while the real binary runs; a take holds the exclusive one.
 pub const LOCK_FILE: &str = "desktop.lock";
+
+/// A `flock` on [`LOCK_FILE`], shared or exclusive, that ends when this is dropped. Closing the
+/// file is not enough: a fork of this process that has yet to exec shares the descriptor, and
+/// the lock would last until it does.
+pub struct Locked(pub std::fs::File);
+
+impl Drop for Locked {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a plain syscall on a descriptor this owns.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
 /// How long the processes a take killed have to go.
 const KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -195,7 +208,7 @@ pub struct Control {
     taken: Mutex<Option<mpsc::UnboundedReceiver<Event>>>,
     /// The exclusive lock on [`LOCK_FILE`], kept from `drain` to the hand back. Taken and
     /// dropped holding `fills`.
-    lock: Mutex<Option<std::fs::File>>,
+    lock: Mutex<Option<Locked>>,
 }
 
 /// What happened to the desktop, for whoever tells main and the owner (`Control::events`).
@@ -314,14 +327,14 @@ impl Control {
         }
         let path = self.lock_path();
         let file = match std::fs::File::open(&path) {
-            Ok(file) => file,
+            Ok(file) => Locked(file),
             Err(e) => return eprintln!("zephyr: {}: {e}", path.display()),
         };
         let alone = |wait: std::time::Duration| {
             let until = std::time::Instant::now() + wait;
             loop {
                 // SAFETY: a plain syscall on a descriptor this function owns.
-                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                if unsafe { libc::flock(file.0.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                     return true;
                 }
                 if std::time::Instant::now() >= until {
@@ -852,11 +865,12 @@ mod tests {
     }
 
     /// A shared lock on the control's lock file, as a wrapper holds one while its command runs.
-    fn place(cfg: &Config) -> std::fs::File {
+    fn place(cfg: &Config) -> Locked {
         use std::os::fd::AsRawFd;
         let file = std::fs::File::open(crate::drafts::public_dir(cfg).join(LOCK_FILE)).unwrap();
+        let file = Locked(file);
         // SAFETY: a plain syscall on a descriptor this function owns.
-        let got = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+        let got = unsafe { libc::flock(file.0.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
         assert_eq!(got, 0, "no place to be had");
         file
     }
@@ -864,8 +878,9 @@ mod tests {
     fn placed(cfg: &Config) -> bool {
         use std::os::fd::AsRawFd;
         let file = std::fs::File::open(crate::drafts::public_dir(cfg).join(LOCK_FILE)).unwrap();
+        let file = Locked(file);
         // SAFETY: as in `place`.
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) == 0 }
+        unsafe { libc::flock(file.0.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) == 0 }
     }
 
     /// The owner gets the desktop only once the agent's commands already on it have ended,
@@ -902,8 +917,12 @@ mod tests {
         );
         // The holder's own take again changes nothing.
         control.drain_blocking();
+        // A fork of the daemon that has yet to exec shares the lock's descriptor, as this copy
+        // does: the hand back ends the lock all the same.
+        let fork = (control.lock.lock().unwrap().as_ref()).map(|l| l.0.try_clone().unwrap());
         control.give(160);
         assert!(placed(&cfg), "the hand back left the lock taken");
+        drop(fork);
         // A hand back before the wait ends leaves no lock behind.
         let running = place(&cfg);
         control.take([1; 32], 200).unwrap();
