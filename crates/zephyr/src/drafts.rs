@@ -2013,6 +2013,33 @@ mod tests {
         );
     }
 
+    /// DESIGN §4.23: what the image seeds is checked as any draft is.
+    #[test]
+    fn every_starter_skill_passes_the_approval_checks() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/skills");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["charts", "pdf", "report", "slides"]);
+        for name in &names {
+            let files =
+                read_skill(&dir.join(name), name).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            let text = String::from_utf8(files["SKILL.md"].clone()).unwrap();
+            assert!(text.contains("send_file"), "{name}");
+            assert!(
+                text.contains("Never upload"),
+                "{name}: it publishes nothing"
+            );
+            // Libraries fetched on first use are pinned to the exact version.
+            for with in text.split("--with ").skip(1) {
+                let spec = with.split_whitespace().next().unwrap();
+                assert!(spec.contains("=="), "{name}: {spec} is not pinned");
+            }
+        }
+    }
+
     /// The image's catalog, as the tests read it.
     fn with_catalog(mut cfg: Config) -> Config {
         cfg.catalog_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/connectors");
