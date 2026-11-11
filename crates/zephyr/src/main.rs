@@ -65,6 +65,13 @@ async fn zephyr_main() -> ExitCode {
     if cmd == "__netcheck" {
         return zephyr::egress::netcheck(&args.collect::<Vec<_>>());
     }
+    // A command's output on its way to its log (DESIGN §4.13): the vault's path is its argument.
+    if cmd == "__scrublog" {
+        return match args.next() {
+            Some(vault) => zephyr::vault::scrub_log(Path::new(&vault)),
+            None => ExitCode::from(2),
+        };
+    }
     // Before the config: it only starts `zephyr run`, which reads it (and secrets.env) itself.
     if cmd == "supervise" {
         return zephyr::supervise::main().await;
@@ -192,8 +199,11 @@ fn lock_home(home: &Path) -> anyhow::Result<std::fs::File> {
 }
 
 /// `from_file`: the variables secrets.env set, dropped before a re-exec so it reads them anew.
-async fn run(cfg: Config, from_file: &[String]) -> anyhow::Result<()> {
+async fn run(mut cfg: Config, from_file: &[String]) -> anyhow::Result<()> {
     zephyr::agent::undumpable();
+    // What a command prints is scrubbed of vault values before it reaches its log.
+    // This binary as each child finds it, also once its file was replaced (as the re-exec below).
+    cfg.scrubber = Some("/proc/self/exe".into());
     // SAFETY: getuid has no arguments and cannot fail.
     if unsafe { libc::getuid() } == 0 && zephyr::agent::ids().is_none() {
         anyhow::bail!(

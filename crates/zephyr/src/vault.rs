@@ -650,11 +650,7 @@ const MIN_SCRUB: usize = 4;
 /// base64 forms (`curl -u x:$TOKEN -v` prints one); then any run of 8 or more characters of
 /// either, as a cut-off or partial print leaves, masked as `auth::redact` masks a login's echo.
 pub fn scrub(text: &str, secrets: &[(String, String)]) -> String {
-    let mut forms: Vec<(&str, String)> = Vec::new();
-    for (name, v) in secrets.iter().filter(|(_, v)| v.len() >= MIN_SCRUB) {
-        forms.push((name.as_str(), v.clone()));
-        forms.extend(base64_forms(v).into_iter().map(|f| (name.as_str(), f)));
-    }
+    let mut forms = forms(secrets);
     forms.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
     let mut out = text.to_string();
     for (name, v) in &forms {
@@ -664,6 +660,96 @@ pub fn scrub(text: &str, secrets: &[(String, String)]) -> String {
     }
     let all: Vec<String> = forms.into_iter().map(|(_, v)| v).collect();
     crate::auth::redact(&out, &all)
+}
+
+/// Every text a value shows up as, with its entry's name: itself and its base64 forms.
+fn forms(secrets: &[(String, String)]) -> Vec<(&str, String)> {
+    let mut forms: Vec<(&str, String)> = Vec::new();
+    for (name, v) in secrets.iter().filter(|(_, v)| v.len() >= MIN_SCRUB) {
+        forms.push((name.as_str(), v.clone()));
+        forms.extend(base64_forms(v).into_iter().map(|f| (name.as_str(), f)));
+    }
+    forms
+}
+
+/// Copies `input` to `log` with every value of the vault at `vault`, and its base64 forms,
+/// replaced by `[vault:NAME]`: what a command prints, on its way to its log (DESIGN §4.13), so
+/// the log the agent can read holds none. A value cut across two reads is still found; after a
+/// quarter of a second with nothing more, what was held back as the possible start of one goes
+/// out as it is. The vault is read again when its file changes, and while it cannot be read the
+/// output is withheld, as `scrubbed` withholds it.
+fn scrub_stream(vault: &Path, mut input: std::fs::File, mut log: impl std::io::Write) {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    const PAUSE_MS: i32 = 250;
+    let stamp = || {
+        let m = std::fs::metadata(vault).ok()?;
+        Some((m.modified().ok()?, m.len()))
+    };
+    let mut put = |bytes: Vec<u8>| {
+        // A log that cannot be written (a full disk) drops output; the command runs on.
+        let _ = log.write_all(&bytes).and_then(|()| log.flush());
+    };
+    // `None`: the vault could not be read.
+    let mut replacer: Option<crate::broker::Replacer> = None;
+    let (mut seen, mut withheld) = (None, false);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        if replacer.as_ref().is_some_and(|r| r.holds()) {
+            let mut wait = libc::pollfd {
+                fd: input.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one pollfd of ours, for the length given.
+            if unsafe { libc::poll(&mut wait, 1, PAUSE_MS) } == 0 {
+                put(replacer.as_mut().map(|r| r.finish()).unwrap_or_default());
+                continue;
+            }
+        }
+        let n = match input.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let now = Some(stamp());
+        if now != seen {
+            put(replacer.as_mut().map(|r| r.finish()).unwrap_or_default());
+            replacer = Vault::load(vault).ok().map(|v| {
+                let pair = |(name, form): (&str, String)| {
+                    (form.into_bytes(), format!("[vault:{name}]").into_bytes())
+                };
+                crate::broker::Replacer::new(forms(&v.secrets()).into_iter().map(pair).collect())
+            });
+            seen = now;
+        }
+        match &mut replacer {
+            Some(r) => {
+                withheld = false;
+                put(r.push(&buf[..n]));
+            }
+            None if !withheld => {
+                withheld = true;
+                put(b"[output withheld: the vault could not be read]\n".to_vec());
+            }
+            None => {}
+        }
+    }
+    put(replacer.as_mut().map(|r| r.finish()).unwrap_or_default());
+}
+
+/// `zephyr __scrublog VAULT`: `scrub_stream` from stdin to stdout. The daemon starts it, as
+/// itself, between a command and its log (`procs::spawn`); it ends when the command, and all
+/// it left running, have closed their output.
+pub fn scrub_log(vault: &Path) -> std::process::ExitCode {
+    use std::os::fd::FromRawFd;
+    // It holds the vault's values, as the daemon does.
+    crate::agent::undumpable();
+    // SAFETY: this process's own stdin and stdout, used by nothing else here.
+    let (input, log) = unsafe { (std::fs::File::from_raw_fd(0), std::fs::File::from_raw_fd(1)) };
+    scrub_stream(vault, input, log);
+    std::process::ExitCode::SUCCESS
 }
 
 /// The base64 text `value` always turns into, standard and URL-safe, wherever it sits in the
@@ -1641,5 +1727,52 @@ programs = ["gh"]
         let clean = scrubbed(&cfg, format!("BOUND={surrogate} and real-bound-1"));
         assert_eq!(clean, "BOUND=[vault:BOUND] and [vault:BOUND]");
         assert!(!format!("{:?}", Vault::load(&path(&cfg)).unwrap().get("BOUND")).contains("real-"));
+    }
+
+    #[test]
+    fn a_commands_output_reaches_its_log_without_a_vault_value() {
+        use base64::Engine;
+        use std::io::Write;
+        let dir = crate::test_dir("vault-scrub-stream");
+        let vault = dir.join(FILE);
+        std::fs::write(&vault, TOKENS).unwrap();
+        let run = |writes: &[&[u8]], pause: Duration| -> String {
+            let (rx, mut tx) = std::io::pipe().unwrap();
+            let log = dir.join("out.log");
+            let out = std::fs::File::create(&log).unwrap();
+            let vault = vault.clone();
+            let input = std::fs::File::from(std::os::fd::OwnedFd::from(rx));
+            let filter = std::thread::spawn(move || scrub_stream(&vault, input, out));
+            for part in writes {
+                tx.write_all(part).unwrap();
+                std::thread::sleep(pause);
+            }
+            drop(tx);
+            filter.join().unwrap();
+            std::fs::read_to_string(log).unwrap()
+        };
+        let basic = base64::engine::general_purpose::STANDARD.encode("x:real-bound-1");
+        let text =
+            format!("key=real-bound-1 raw=real-raw-12\nAuthorization: Basic {basic}\ndone\n");
+        let clean = run(&[text.as_bytes()], Duration::ZERO);
+        assert!(clean.starts_with("key=[vault:BOUND] raw=[vault:RAW]\nAuthorization: Basic "));
+        assert!(
+            clean.ends_with("\ndone\n") && clean.contains("Basic eDp[vault:BOUND]"),
+            "{clean}"
+        );
+        assert!(
+            !clean.contains("real-") && !clean.contains(&basic),
+            "{clean}"
+        );
+        // Cut in the middle of a value, as a pipe may cut it.
+        let clean = run(&[b"key=real-bo", b"und-1\n"], Duration::ZERO);
+        assert_eq!(clean, "key=[vault:BOUND]\n");
+        // A prompt that ends like the start of a value is not held for ever.
+        let clean = run(&[b"so real-", b"ly\n"], Duration::from_millis(600));
+        assert_eq!(clean, "so real-ly\n");
+        // A vault that cannot be read: nothing of the output is written.
+        std::fs::write(&vault, "[[token]\nbroken").unwrap();
+        let clean = run(&[b"key=real-bound-1\n", b"more\n"], Duration::ZERO);
+        assert_eq!(clean, "[output withheld: the vault could not be read]\n");
     }
 }

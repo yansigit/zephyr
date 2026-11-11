@@ -324,6 +324,9 @@ const LOG_CAP: u64 = 50 * 1024 * 1024;
 /// Runs `$0` (the command) and records its exit code in `$1` once it ends, so a daemon that is not
 /// its parent (after a crash) still learns it. All are arguments, never spliced into the script.
 /// The outer `bash` stays the process-group leader and keeps the command's exit code.
+/// When the output goes through the daemon's scrubber (`spawn`), `$3` is its pid: the wrapper
+/// closes its own output and waits, at most a second, for the scrubber to have written the
+/// last of it, so whoever reads the log once the command has ended reads all of it.
 /// The output goes through `head`, so the log stays within `$2` bytes (`LOG_CAP`): what is past
 /// it is counted and dropped, and the command keeps running. Unbuffered (`stdbuf`), so the log
 /// shows output as it comes. A process substitution, not a pipe: a server the command leaves in
@@ -333,6 +336,7 @@ const WRAPPER: &str = concat!(
     r#"printf '\n[zephyr: the log stops here; %s more bytes of output were dropped]\n' "$n"); "#,
     r#"o=$!; bash -c "$0" >&3 2>&3 3>&-; s=$?; exec 3>&-; "#,
     r#"for _ in {1..50}; do kill -0 "$o" 2>/dev/null || break; sleep 0.02; done; "#,
+    r#"exec >&- 2>&-; [ -n "$3" ] && for _ in {1..50}; do [ -d "/proc/$3" ] || break; sleep 0.02; done; "#,
     r#"echo "$s" > "$1.tmp" && mv -f "$1.tmp" "$1"; exit "$s""#,
 );
 
@@ -348,6 +352,13 @@ fn recorded_exit(log: &Path) -> Option<i32> {
 
 /// The command through `WRAPPER`, as the agent, in its home, leading its own process group, with
 /// stdout and stderr in `log`, its exit code recorded next to it, and `env` set.
+///
+/// The output reaches the log through `zephyr __scrublog` (`cfg.scrubber`), run as the daemon
+/// in a group of its own: the log is the agent's to read, so no vault value may land in it
+/// (`vault::scrub_stream`). It is a process, not a task of the daemon's, so a command outlives
+/// a re-exec or a crash of the daemon with its output still going somewhere.
+/// shortcut: a scrubber that ends after a re-exec stays a zombie until the daemon exits, and
+/// the wrapper then waits its full second; reap it in `adopt` if commands often span one.
 fn spawn(
     cfg: &Config,
     command: &str,
@@ -362,14 +373,34 @@ fn spawn(
         let _ = std::fs::remove_file(&exit);
         std::fs::File::create(log)?
     };
+    let (out, err, scrubber): (std::process::Stdio, std::process::Stdio, String) =
+        match &cfg.scrubber {
+            Some(exe) => {
+                let (rx, tx) = std::io::pipe()?;
+                let mut scrubber = std::process::Command::new(exe)
+                    .arg("__scrublog")
+                    .arg(crate::vault::path(cfg))
+                    .stdin(rx)
+                    .stdout(file)
+                    .stderr(std::process::Stdio::null())
+                    .process_group(0)
+                    .spawn()?;
+                let pid = scrubber.id().to_string();
+                // It ends when the command and all it left running have closed their output.
+                std::thread::spawn(move || scrubber.wait());
+                (tx.try_clone()?.into(), tx.into(), pid)
+            }
+            None => (file.try_clone()?.into(), file.into(), String::new()),
+        };
     let mut cmd = tokio::process::Command::new("bash");
     cmd.args(["-c", WRAPPER, command])
         .arg(&exit)
         .arg(LOG_CAP.to_string())
+        .arg(scrubber)
         .current_dir(&cfg.home)
         .stdin(std::process::Stdio::null())
-        .stdout(file.try_clone()?)
-        .stderr(file)
+        .stdout(out)
+        .stderr(err)
         .envs(env);
     // No kill_on_drop: a command outlives a re-exec of the daemon, which adopts it (`adopt`).
     for_agent(cmd.as_std_mut());
