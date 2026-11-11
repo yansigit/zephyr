@@ -319,3 +319,28 @@ Results (image `zephyr-dev:a3-2a41270`; container and network removed afterwards
 - `cargo test --no-fail-fast`: 1233 passed, 0 failed, 20 ignored. `clippy -D warnings` clean, `cargo deny check advisories bans` ok.
 - Real rpi 0.21.2: `real_rpi` 6, `rpi_load` 10, ignored `attach` 1, all passed.
 - `tests/token_broker.rs` and `tests/net_floor.rs`, ignored, both passed in the side container. `curl -u x:$ZSUR https://httpbin.org/get` showed the Basic credential as the agent wrote it and no trace of the real one; `/basic-auth` still answered 200 for the real secret behind the stand-in; a request with `Upgrade: websocket` was answered as a plain request.
+
+## Follow-up: the final review of 2a41270 (2026-11-11)
+
+Each finding was confirmed first; none was skipped. Failing tests came first for the proxy's behaviour (`a_reply_that_closes_upstream_closes_the_clients_connection`, `trailers_reach_the_client_with_their_values_turned_back`); the rest changed signatures or types, so their tests were written with the fix. One commit, as the changes share `broker.rs`.
+
+Deviations from the spec made here, on the review's word:
+- **Spec §4.3 "Any request header value: always swapped" no longer holds.** A stand-in is swapped only in `Authorization`, in the headers the owner listed for a token (`headers` on `[[token]]`, `/vault header`, `--header`), and for a connector's secret in the headers its own `[[mcp]] headers` put it in. In any other header the request is refused (`403 zephyr: NAME is not swapped in the header HEADER`), audited and told to the owner. A `command` connector whose program sends its secret in another header must be `plain`: there is no per-connector list.
+- **Spec §4.2 "A `url` connector with no `hosts` is bound to its URL's host … needs nothing from the owner" no longer holds**, and neither does the implicit `plain` of the commit before. `plain` is only ever the owner's written word; a remote connector with a secret and none is not published; the upgrade writes `plain` once for those that were there.
+- `/mcp ok` takes a `strong` argument: a draft that would make a connector hold a real secret, when it is new, names a further secret or moves its URL to another host, is approved from a strong channel only.
+- `broker::shared`: one secrets.env name cannot be a plain connector's and another's stand-in. It is not a hard config error (the daemon still starts on a hand-edited file): neither connector is published, `/set` and `zephyr config set` refuse to make it so, `doctor` fails, and the owner is told at each start.
+
+- [x] **1–3. Connector secrets**, as above; `Router::settle_remote_connectors`, `broker::{plain, undecided, unsettled, shared}`; `zephyr mcp add --url` with a secret asks for `--plain`.
+- [x] **4, 9. Encoded echoes.** `broker::encodings`, worked out once per secret in `Map::build`: base64, JSON escapes (`\/`, `\uXXXX` in either case), percent-encoding (everything, a URI component, a form field; either case). The limits are in DESIGN §4.21.
+- [x] **5.** Credential headers only, as above.
+- [x] **6.** The web app needs a passkey for `/vault bind`, `header`, `url on` and `raw on` whatever `strong_channels` says.
+- [x] **7.** A reply whose server closes says `Connection: close` to the client too.
+- [x] **8.** `Trailer` is no longer stripped; trailers reach the client with their values turned back (the proxy sends its own `TE: trailers`).
+- [x] **10.** The router tests wait on the heartbeat's ticks (`ticks`), in both places a sleep stood.
+
+Not done with these: a hosts or headers field for the new `headers` list in the TUI's token form (the chat command and the host CLI set it).
+
+Results (image `zephyr-dev:a3-cd25027`; container and network removed afterwards):
+- `cargo test --no-fail-fast`: 1243 passed, 0 failed, 20 ignored. `clippy -D warnings` clean, `cargo deny check advisories bans` ok.
+- Real rpi 0.21.2: `real_rpi` 6, `rpi_load` 10, ignored `attach` 1, all passed.
+- `tests/token_broker.rs` and `tests/net_floor.rs`, ignored, both passed in `zephyr-test-a3`. Item 5: `curl -A "probe $ZSUR"` got `403 zephyr: A3_SECRET is not swapped in the header user-agent`, with its audit row. Item 4: a secret holding a quote and a slash, sent in `Authorization` and echoed JSON-escaped by httpbin, came back as its stand-in, with no trace of the secret.
