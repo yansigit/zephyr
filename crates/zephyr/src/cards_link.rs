@@ -19,7 +19,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::cards::{Caps, CardSpec, CardState, Charge, Issued, Issuer, Pan, ProviderError};
@@ -42,23 +41,6 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// An access token this close to its end is refreshed first ("Refresh ahead of expiration").
 const EARLY_SECS: i64 = 120;
 
-/// The tokens as kept on disk, read fresh for each use and never kept: no `Link` holds them,
-/// nothing prints them (no `Debug`), and each copy is wiped when it is dropped.
-#[derive(Serialize, Deserialize)]
-struct Tokens {
-    access_token: String,
-    refresh_token: String,
-    /// Unix seconds.
-    expires_at: i64,
-}
-
-impl Drop for Tokens {
-    fn drop(&mut self) {
-        crate::vault::wipe_str(&mut self.access_token);
-        crate::vault::wipe_str(&mut self.refresh_token);
-    }
-}
-
 /// The access token for one call: wiped when the call is done. No `Debug`.
 struct Access(String);
 
@@ -66,6 +48,32 @@ impl Drop for Access {
     fn drop(&mut self) {
         crate::vault::wipe_str(&mut self.0);
     }
+}
+
+/// Wipes every string in a JSON value: the tokens are in them, so a value that held one is wiped
+/// when it is done with, never just dropped.
+fn wipe_value(v: &mut Value) {
+    match v {
+        Value::String(s) => crate::vault::wipe_str(s),
+        Value::Array(a) => a.iter_mut().for_each(wipe_value),
+        Value::Object(o) => o.values_mut().for_each(wipe_value),
+        _ => {}
+    }
+}
+
+/// Whether Link's answer, or the token file, holds both tokens as strings.
+fn has_tokens(v: &Value) -> bool {
+    v["access_token"].is_string() && v["refresh_token"].is_string()
+}
+
+/// The token file's JSON for Link's answer, which `has_tokens`: its two tokens, moved out of
+/// `answer` (no copy is left in it), and when the access token ends. Nothing else is kept.
+fn file_of(answer: &mut Value) -> Value {
+    let expires_at = crate::now() + answer["expires_in"].as_i64().unwrap_or(3600);
+    let mut file = json!({"expires_at": expires_at});
+    file["access_token"] = answer["access_token"].take();
+    file["refresh_token"] = answer["refresh_token"].take();
+    file
 }
 
 /// One refresh at a time: a refresh token is good once, so two at once would lose the grant.
@@ -126,18 +134,37 @@ impl Link {
         })
     }
 
-    fn save(&self, t: &Tokens) -> Result<(), ProviderError> {
-        let mut text = serde_json::to_string(t).unwrap_or_default();
+    /// Writes Link's answer to the token file and returns its access token for the call. Both the
+    /// answer and the file's text are wiped; `answer` must hold both tokens (`has_tokens`).
+    fn save(&self, mut answer: Value) -> Result<Access, ProviderError> {
+        let mut file = file_of(&mut answer);
+        wipe_value(&mut answer);
+        let access = Access(
+            file["access_token"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+        let mut text = serde_json::to_string(&file).unwrap_or_default();
         let saved = crate::host::conf::replace_private(&self.tokens, &text);
         crate::vault::wipe_str(&mut text);
-        saved.map_err(|_| ProviderError("Link's tokens could not be saved".into()))
+        wipe_value(&mut file);
+        saved.map_err(|_| ProviderError("Link's tokens could not be saved".into()))?;
+        Ok(access)
     }
 
-    fn read(&self) -> Result<Tokens, ProviderError> {
+    /// The token file as JSON, read fresh for each use. The caller wipes it when done.
+    fn read(&self) -> Result<Value, ProviderError> {
         let mut text = std::fs::read_to_string(&self.tokens).unwrap_or_default();
-        let tokens = serde_json::from_str(&text).ok();
+        let mut file = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
         crate::vault::wipe_str(&mut text);
-        tokens.ok_or_else(|| ProviderError(RECONNECT.trim_start_matches("not run: ").into()))
+        if has_tokens(&file) && file["expires_at"].is_i64() {
+            return Ok(file);
+        }
+        wipe_value(&mut file);
+        Err(ProviderError(
+            RECONNECT.trim_start_matches("not run: ").into(),
+        ))
     }
 
     /// One form POST to the sign-in host: its status and its JSON.
@@ -161,14 +188,6 @@ impl Link {
         Ok((status, sent.json().await.unwrap_or(Value::Null)))
     }
 
-    fn tokens_of(v: &Value) -> Option<Tokens> {
-        Some(Tokens {
-            access_token: v["access_token"].as_str()?.to_string(),
-            refresh_token: v["refresh_token"].as_str()?.to_string(),
-            expires_at: crate::now() + v["expires_in"].as_i64().unwrap_or(3600),
-        })
-    }
-
     /// The access token, refreshed first when it is near its end (or `force`d, after a 401).
     /// "Refresh tokens rotate. Every response contains a new `refresh_token` and invalidates
     /// the one you sent, so persist the new value immediately": the file is written before
@@ -176,27 +195,37 @@ impl Link {
     async fn token(&self, force: bool) -> Result<Access, ProviderError> {
         let _one = REFRESH.lock().await;
         let mut now = self.read()?;
-        if !force && now.expires_at - EARLY_SECS > crate::now() {
-            return Ok(Access(std::mem::take(&mut now.access_token)));
+        if !force && now["expires_at"].as_i64().unwrap_or_default() - EARLY_SECS > crate::now() {
+            let access = Access(now["access_token"].as_str().unwrap_or_default().to_string());
+            wipe_value(&mut now);
+            return Ok(access);
         }
+        let answer = self.refresh(&now).await;
+        wipe_value(&mut now);
+        self.save(answer?)
+    }
+
+    /// Link's answer to a refresh, which holds the new tokens.
+    async fn refresh(&self, now: &Value) -> Result<Value, ProviderError> {
         // The device grant's token endpoint, as `link-cli` refreshes (auth-resource.ts
         // `refreshToken`). spike (1): a registered client refreshes at `/auth/token` with its
         // secret instead.
         let fields = [
             ("grant_type", "refresh_token"),
-            ("refresh_token", now.refresh_token.as_str()),
+            (
+                "refresh_token",
+                now["refresh_token"].as_str().unwrap_or_default(),
+            ),
             ("client_id", self.client_id.as_str()),
         ];
-        let (status, v) = self.form("/device/token", &fields).await?;
-        let fresh = (status / 100 == 2).then(|| Self::tokens_of(&v)).flatten();
-        let Some(fresh) = fresh else {
-            return Err(ProviderError(
-                RECONNECT.trim_start_matches("not run: ").into(),
-            ));
-        };
-        let mut fresh = fresh;
-        self.save(&fresh)?;
-        Ok(Access(std::mem::take(&mut fresh.access_token)))
+        let (status, mut answer) = self.form("/device/token", &fields).await?;
+        if status / 100 == 2 && has_tokens(&answer) {
+            return Ok(answer);
+        }
+        wipe_value(&mut answer);
+        Err(ProviderError(
+            RECONNECT.trim_start_matches("not run: ").into(),
+        ))
     }
 
     /// One API call with the owner's token, once more with a fresh one after a 401.
@@ -480,9 +509,9 @@ pub async fn login(cfg: &Config) -> anyhow::Result<()> {
             ("device_code", code),
             ("client_id", link.client_id.as_str()),
         ];
-        let (status, v) = link.form("/device/token", &fields).await.map_err(failed)?;
-        if let Some(tokens) = (status / 100 == 2).then(|| Link::tokens_of(&v)).flatten() {
-            link.save(&tokens).map_err(failed)?;
+        let (status, mut v) = link.form("/device/token", &fields).await.map_err(failed)?;
+        if status / 100 == 2 && has_tokens(&v) {
+            link.save(v).map_err(failed)?;
             println!("connected: zephyr may ask Link for cards; you approve each one in Link");
             return Ok(());
         }
@@ -491,8 +520,11 @@ pub async fn login(cfg: &Config) -> anyhow::Result<()> {
             Some("authorization_pending" | "slow_down")
         );
         if status != 400 || !pending {
-            anyhow::bail!("{}", problem("finish the sign-in", status, &v));
+            let refused = problem("finish the sign-in", status, &v);
+            wipe_value(&mut v);
+            anyhow::bail!("{}", refused);
         }
+        wipe_value(&mut v);
     }
     anyhow::bail!("the sign-in was not approved in time; run zephyr card link again")
 }
@@ -520,6 +552,19 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    #[test]
+    fn the_token_file_keeps_the_two_tokens_and_their_expiry_and_nothing_else() {
+        let mut answer = json!({
+            "access_token": "liwltoken_a2", "refresh_token": "liwlrefresh_r2",
+            "expires_in": 60, "token_type": "Bearer",
+        });
+        let file = file_of(&mut answer);
+        assert_eq!(file["access_token"], "liwltoken_a2");
+        assert_eq!(file["refresh_token"], "liwlrefresh_r2");
+        assert!((file["expires_at"].as_i64().unwrap() - crate::now() - 60).abs() <= 2);
+        assert_eq!(file.as_object().unwrap().len(), 3);
     }
 
     #[test]
