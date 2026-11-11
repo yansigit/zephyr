@@ -421,12 +421,19 @@ fn encode_args(codec: &str) -> Vec<String> {
             "ipod",
         ],
     };
-    let input = "-hide_banner -nostdin -loglevel error -f s16le -ac 1 -i /proc/self/fd/3 -ar";
-    (input
-        .split(' ')
-        .chain([PIPER_RATE])
-        .chain(out.iter().copied())
-        .chain(["pipe:1"]))
+    // The rate before `-i` is the input's: raw PCM carries none of its own.
+    ([
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-f",
+        "s16le",
+    ]
+    .into_iter())
+    .chain(["-ar", PIPER_RATE, "-ac", "1", "-i", "/proc/self/fd/3"])
+    .chain(out.iter().copied())
+    .chain(["pipe:1"])
     .map(String::from)
     .collect()
 }
@@ -853,6 +860,18 @@ pub(crate) mod tests {
             doctor(&none).await,
             ["ok   voice: not in this image (built with VOICE=0)"]
         );
+    }
+
+    #[test]
+    fn pipers_rate_is_given_for_the_input_not_the_output() {
+        // After `-i` it would be the output's rate, the raw PCM would be read at ffmpeg's default
+        // 44100 Hz, and the reply would be spoken at twice its speed.
+        for codec in ["opus", "aac"] {
+            let args = encode_args(codec);
+            let at = |a: &str| args.iter().position(|x| x == a).unwrap();
+            assert!(at("-ar") < at("-i"), "{args:?}");
+            assert_eq!(args[at("-ar") + 1], PIPER_RATE);
+        }
     }
 
     #[test]
