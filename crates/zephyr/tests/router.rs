@@ -8628,8 +8628,10 @@ async fn a_stop_during_a_slow_issue_leaves_the_card_closed() {
     gw.say("i2", "owner", "/stop").await;
     reply_where(&gw, "chat", |r| r.starts_with("[zephyr] stopped")).await;
     wait(|| card_status(&home, 1) == "closed").await;
-    // The issue answers after that: the card it made is closed at the issuer as well.
-    wait(|| log().iter().filter(|l| *l == "close 1").count() == 2).await;
+    // The issue answers after that: the card it made is closed at the issuer, by the issue
+    // itself (before, there was nothing at the issuer to close).
+    assert!(!log().contains(&"close 1".to_string()), "{:?}", log());
+    wait(|| log().contains(&"close 1".to_string())).await;
     ticks(&home, 12).await;
     assert_eq!(card_status(&home, 1), "closed", "{:?}", log());
     let said = gw.replies();

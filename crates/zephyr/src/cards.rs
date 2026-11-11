@@ -1495,6 +1495,11 @@ fn say(cfg: &Config, card: Card, word: Word) {
 }
 
 async fn close_at_issuer(cfg: &Config, card: &Card) -> Result<(), String> {
+    // The issuer has not made it yet (its issue is still being answered): there is nothing
+    // there to close, and the issue closes what it makes once it finds the card closed.
+    if card.provider_ref.is_none() {
+        return Ok(());
+    }
     match issuer(cfg) {
         Ok(issuer) => issuer.close(card).await.map_err(|e| e.0),
         Err(e) => Err(e),
@@ -1650,7 +1655,8 @@ pub fn tick(cfg: &Arc<Config>, store: &Store, now: i64) {
             // Forgotten at once; the issuer is asked to close it at its own pace.
             live::forget(cfg.state_dir(), card.id, now);
         }
-        if !poll_due(cfg, card.id) {
+        // A card the issuer has not made yet is not asked about: its issue is in hand.
+        if (card.provider_ref.is_none() && !expired) || !poll_due(cfg, card.id) {
             continue;
         }
         // Only an issuer that reports charges can say a card went unused.
