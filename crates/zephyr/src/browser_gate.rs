@@ -70,6 +70,10 @@ const PUBLIC: &str = "/var/lib/zephyr-public";
 const HELD_WAIT: Duration = Duration::from_secs(3 * 60);
 /// What the agent reads when the gate cannot be asked or does not answer.
 pub const NOT_ANSWERING: &str = "the gate is not answering; not run";
+/// What the agent reads when the owner took the desktop while its command waited at the gate,
+/// and handed it back before the wrapper could ask since when.
+pub const TAKEN: &str = "not run: the owner used the desktop meanwhile; take a fresh snapshot \
+                         before acting";
 /// What the agent reads when the control or the page is not what the owner approved (I4).
 pub const CHANGED: &str = "the page changed while the owner decided; not run";
 
@@ -356,18 +360,22 @@ pub fn xdotool(env: &Env) -> Next {
     held(env).map_or(Next::Exec, Next::Refuse)
 }
 
+/// Whether root's `desktop-held` is there. Only a file that is not there is no hold: one that
+/// cannot be read is asked about.
+fn flagged(env: &Env) -> bool {
+    let dir = env.socket.as_deref().and_then(std::path::Path::parent);
+    let flag = dir
+        .unwrap_or(std::path::Path::new(PUBLIC))
+        .join(crate::desktop::HELD_FILE);
+    !matches!(std::fs::symlink_metadata(flag), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Whether the owner holds the desktop (DESIGN §4.11): `Some(text)` means do not run, and exit 1
 /// with it. Root's `desktop-held`, beside the gate socket, says so; the wrapper then waits on
 /// the gate, which answers at the hand back or after 2 minutes with the words to print, or with
 /// none when the desktop is not held after all. Held with no gate answering is refused.
 pub fn held(env: &Env) -> Option<String> {
-    let dir = env.socket.as_deref().and_then(std::path::Path::parent);
-    let flag = dir
-        .unwrap_or(std::path::Path::new(PUBLIC))
-        .join(crate::desktop::HELD_FILE);
-    // Only a file that is not there is no hold: one that cannot be read is asked about.
-    if matches!(std::fs::symlink_metadata(flag), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
-    {
+    if !flagged(env) {
         return None;
     }
     let socket = env.socket.as_ref();
@@ -408,10 +416,16 @@ pub fn run(args: &[String], env: &Env) -> Next {
                 ..Seen::default()
             };
             let (next, wait) = ask_gate(env, args, &request(action, &page.url(), &seen));
-            if next == Next::Exec && !said(wait, true) {
-                return Next::Refuse(NOT_ANSWERING.into());
+            if next != Next::Exec {
+                return next;
             }
-            return next;
+            return match taken(env, wait) {
+                Ok(wait) => match said(wait, true) {
+                    true => Next::Exec,
+                    false => Next::Refuse(NOT_ANSWERING.into()),
+                },
+                Err(refused) => refused,
+            };
         }
         Act::Click(_) | Act::Key { .. } => {}
     }
@@ -435,6 +449,10 @@ pub fn run(args: &[String], env: &Env) -> Next {
         (Next::Exec, wait) => wait,
         (refused, _) => return refused,
     };
+    let wait = match taken(env, wait) {
+        Ok(wait) => wait,
+        Err(refused) => return refused,
+    };
     // I4: up to 10 minutes went by; what the owner approved must still be what runs.
     let same = unchanged(&Page::new(env, &flags), &act, &url, &first, class);
     match (same, said(wait, same)) {
@@ -442,6 +460,21 @@ pub fn run(args: &[String], env: &Env) -> Next {
         (true, false) => Next::Refuse(NOT_ANSWERING.into()),
         (false, _) => Next::Refuse(CHANGED.into()),
     }
+}
+
+/// Defence in depth, after any `allow` and before the page is read again: the command waited
+/// at the gate, maybe for minutes, and the owner may have taken the desktop over meanwhile (the
+/// gate refuses such an `allow` itself). Then the gate is told the action did not run, and the
+/// wrapper waits on the desktop like any command, which never ends in a run.
+fn taken(
+    env: &Env,
+    wait: Option<std::os::unix::net::UnixStream>,
+) -> Result<Option<std::os::unix::net::UnixStream>, Next> {
+    if !flagged(env) {
+        return Ok(wait);
+    }
+    said(wait, false);
+    Err(Next::Refuse(held(env).unwrap_or_else(|| TAKEN.into())))
 }
 
 /// M2: an action the owner let go (an `allow` after a wait, with its number) is recorded by the
@@ -2124,6 +2157,57 @@ cat "$d/$f.json"
         let waiting = t.spawn(&["snapshot", "-i"]);
         answer(&mut asked(&gate).1, json!({"verdict": "deny", "text": ""}));
         assert_eq!(waiting.join().unwrap(), Next::Exec);
+    }
+
+    /// Defence in depth: the owner took the desktop while the click waited at the gate for
+    /// their `/ok`. Whatever the gate then says, the wrapper looks again before it reads the
+    /// page, does not run, and tells the gate so.
+    #[test]
+    fn an_allowed_click_does_not_run_once_the_owner_holds_the_desktop() {
+        let t = T::new("bg-held-after");
+        t.page(MAIL, COMPOSE, "");
+        let gate = t.gate();
+        let waiting = t.spawn(&["click", "@e3"]);
+        let (req, mut conn) = asked(&gate);
+        assert_eq!(req["browser"]["name"], "Send", "{req}");
+        let read = t.argv().len();
+        // Taken over while it waits; then the owner's `/ok` reaches the wrapper as `allow`.
+        std::fs::write(t.dir.join(crate::desktop::HELD_FILE), "100\n").unwrap();
+        answer(&mut conn, json!({"verdict": "allow", "id": 7}));
+        let mut said = String::new();
+        BufReader::new(conn.try_clone().unwrap())
+            .read_line(&mut said)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&said).unwrap(),
+            json!({"ran": false})
+        );
+        // It then waits on the desktop like any command, and exits with the gate's words.
+        let (req, mut conn) = asked(&gate);
+        assert_eq!(req, json!({"v": 1, "desktop": "wait", "session": "main"}));
+        let back = "zephyr: the owner used the desktop from 14:04 to 14:08; this command did \
+                    not run. The page may have changed: take a fresh snapshot before acting.";
+        answer(&mut conn, json!({"verdict": "deny", "text": back}));
+        assert_eq!(waiting.join().unwrap(), Next::Refuse(back.into()));
+        assert_eq!(
+            t.argv().len(),
+            read,
+            "the page was read again: {:?}",
+            t.argv()
+        );
+        // Typing that the gate let through is held the same way.
+        let flag = t.dir.join(crate::desktop::HELD_FILE);
+        std::fs::remove_file(&flag).unwrap();
+        let waiting = t.spawn(&["fill", "@e2", "hello"]);
+        let (req, mut conn) = asked(&gate);
+        assert_eq!(req["tool"], "browser", "{req}");
+        std::fs::write(&flag, "100\n").unwrap();
+        answer(&mut conn, json!({"verdict": "allow"}));
+        let (req, mut conn) = asked(&gate);
+        assert_eq!(req["desktop"], "wait", "{req}");
+        // Handed back just then: still not run, on a page the owner may have changed.
+        answer(&mut conn, json!({"verdict": "deny", "text": ""}));
+        assert_eq!(waiting.join().unwrap(), Next::Refuse(TAKEN.into()));
     }
 
     #[test]

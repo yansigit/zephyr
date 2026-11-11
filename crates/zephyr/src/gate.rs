@@ -1222,9 +1222,19 @@ impl Conn {
                 let read = reader.into_inner();
                 let clean = read.buffer().is_empty();
                 let mut read = read.into_inner();
-                let Some(answer) = self.wait(id, verdict, &mut read, clean).await else {
+                let Some(mut answer) = self.wait(id, verdict, &mut read, clean).await else {
                     return; // nobody left to answer
                 };
+                // Let go while the owner holds the desktop (taken over since the click was
+                // read): never `allow`. The page it was approved on is under the owner's hands,
+                // so it is refused, not kept waiting, and recorded as not run.
+                if let (true, Some(held)) = (answer["verdict"] == "allow", self.desktop.held()) {
+                    let text = crate::desktop::still(&self.cfg, held.since);
+                    answer = serde_json::json!({ "verdict": "deny", "id": id, "text": text });
+                    let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
+                    self.finish(id, HELD_ENDING, wake).await;
+                    return;
+                }
                 let sent = write.write_all(format!("{answer}\n").as_bytes()).await;
                 if answer["verdict"] == "allow" {
                     let told = sent.is_ok();
@@ -1274,7 +1284,12 @@ impl Conn {
             }
             None => Some(None),
         };
-        let (status, result, told) = ending(said);
+        self.finish(id, ending(said), wake).await
+    }
+
+    /// Records how taken action `id` ended, and tells the owner of one that did not run.
+    async fn finish(&self, id: i64, ending: Ending, wake: &Wake) {
+        let (status, result, told) = ending;
         let (cfg, store) = (self.cfg.clone(), self.store.clone());
         let recorded = tokio::task::spawn_blocking(move || {
             let store = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -1392,11 +1407,22 @@ impl Conn {
     }
 }
 
+/// How a taken action ended: its status, the record's words, and what the owner is told after
+/// `[zephyr] #N (summary)` when it did not run.
+type Ending = (&'static str, &'static str, Option<&'static str>);
+
+/// An action let go while the owner held the desktop: its wrapper was refused.
+const HELD_ENDING: Ending = (
+    "failed",
+    "not run: the owner had the desktop",
+    Some(" did not run: you had the desktop"),
+);
+
 /// How a browser action the owner let go ended, from what its wrapper said (`None`: nothing in
 /// [`REPORT_WAIT`]; `Some(None)`: gone, or nothing it could read): its status, the record's
 /// words, and, when it did not run (or may not have), what the owner is told after
 /// `[zephyr] #N (summary)`: at `/ok` they read that the browser goes on (round 3).
-fn ending(said: Option<Option<Value>>) -> (&'static str, &'static str, Option<&'static str>) {
+fn ending(said: Option<Option<Value>>) -> Ending {
     match said {
         None => (
             "unknown",
@@ -3552,6 +3578,78 @@ mod tests {
                 "{text}"
             );
         }
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
+    }
+
+    /// A click that waited for the owner's `/ok` is not made under the owner's hands: let go
+    /// while the owner holds the desktop, its wrapper is refused with the desktop's words, and
+    /// the action is recorded as not run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_click_let_go_while_the_owner_holds_the_desktop_does_not_run() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let h = home("gate-desktop-ok", "");
+        let desktop = crate::desktop::Control::new(&h.cfg);
+        let (socket, waits, _) = serving_all(&h, desktop.clone()).await;
+        (h.store.add_task("g", None, None, "discord", "owner-1"))
+            .unwrap()
+            .unwrap();
+        let req = json!({"v": 1, "session": "task-1", "tool": "browser",
+            "args": {"argv": ["click", "@e3"]},
+            "browser": {"action": "click", "url": "https://mail.x/compose",
+                        "origin": "https://mail.x",
+                        "element": {"role": "button", "name": "Send"}}});
+        let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        write
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            if h.store.action(1).unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The owner takes the desktop over, and then says `/ok`.
+        desktop.take([1; 32], 14 * 3600 + 4 * 60).unwrap();
+        assert!(h.store.take_action(1, "running").unwrap().is_some());
+        for _ in 0..200 {
+            if waits.answer(1, true) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut line = String::new();
+        let mut read = tokio::io::BufReader::new(read);
+        read.read_line(&mut line).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap(),
+            json!({"verdict": "deny", "id": 1, "text": "zephyr: the owner has the desktop \
+                   (since 14:04); this command did not run. Do other work, or try again later."})
+        );
+        let ended = || -> (String, String) {
+            let db = rusqlite::Connection::open(h.cfg.db_path()).unwrap();
+            let row = "SELECT status, coalesce(result, '') FROM proposals WHERE id = 1";
+            db.query_row(row, [], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+        };
+        for _ in 0..200 {
+            if ended().0 != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            ended(),
+            (
+                "failed".to_string(),
+                "not run: the owner had the desktop".to_string()
+            )
+        );
+        let told = (h.store.pending_outbox().unwrap().into_iter()).any(|o| {
+            o.channel == "discord" && o.text.ends_with(" did not run: you had the desktop")
+        });
+        assert!(told, "the owner is not told");
         let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
     }
 

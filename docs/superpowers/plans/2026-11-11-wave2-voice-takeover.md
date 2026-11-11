@@ -262,6 +262,7 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
 - Deviation: `vault::agent` takes the `Control` as a parameter (the fill itself is spawned there), and `vault::fill` is unchanged.
 - Review fix: `Control::take` publishes the hold before it writes `desktop-held` (it wrote the file first, so a wrapper could see the file, ask the gate, be told nothing was held and run), and takes it back when the write fails. The router's notes come from `Control::events`, an ordered queue, not from the `watch`, which folded a take and a quick hand back into nothing.
 - Review fix: a desktop wait no longer holds one of the gate's 32 connection slots for its 2 minutes: it gives the slot back once its request is read and takes one of 8 of its own; a wait over those is answered at once with the "owner has the desktop" text.
+- Review fix: a click that waited at the gate for `/ok` no longer runs under the owner's hands: the gate answers its `allow` as `deny` with the desktop's text while the desktop is held and records the action `failed`, `not run: the owner had the desktop` (denied, not kept waiting: the page it was approved on is gone); the wrapper checks `desktop-held` again after `allow`.
 
 ### Task C2-7: Take over, the ticket, `/api/vnc`, x11vnc, the notes and the timeouts
 
