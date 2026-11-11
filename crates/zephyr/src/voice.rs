@@ -15,7 +15,6 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
@@ -115,39 +114,29 @@ fn clean(text: &str) -> String {
     words.join(" ").chars().take(MAX_TEXT).collect()
 }
 
-/// ffmpeg's argv to decode fd 3 into the WAV whisper reads, on fd 4, at most `secs` of it.
+/// ffmpeg's argv to decode fd 3 into the WAV whisper reads, on stdout, at most `secs` of it (as
+/// measured with the image's static ffmpeg 7.1).
 fn decode_args(secs: u64) -> Vec<String> {
     let secs = secs.to_string();
-    [
-        "-nostdin",
-        "-loglevel",
-        "error",
-        "-y",
-        "-i",
-        "/proc/self/fd/3",
-        "-t",
-        &secs,
-        "-vn",
-        "-ar",
-        "16000",
-        "-ac",
-        "1",
-        "-f",
-        "wav",
-        "/proc/self/fd/4",
-    ]
-    .map(String::from)
-    .to_vec()
+    let args = "-hide_banner -nostdin -loglevel error -i /proc/self/fd/3 -vn -ar 16000 -ac 1 \
+                -c:a pcm_s16le -f wav -t";
+    (args.split(' ').chain([secs.as_str(), "pipe:1"]))
+        .map(String::from)
+        .collect()
 }
 
-/// whisper-cli's argv for the WAV on fd 3; `lang` is a code or `auto`. No `-np`: it would also
-/// drop the detected-language line, and the text is all that goes to stdout either way.
-fn whisper_args(dir: &Path, lang: &str, gpu: bool) -> Vec<String> {
+/// whisper-cli's argv for the WAV on fd 3 (`-f -` does not work); `lang` is a code or `auto`.
+/// As measured with 1.9.5: no `-np`, which would also drop the detected-language line, and with
+/// `-nt` the text is all that goes to stdout either way (nothing at all when the VAD finds no
+/// speech).
+fn whisper_args(dir: &Path, lang: &str) -> Vec<String> {
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
     let threads = (cores / 2).clamp(1, 8).to_string();
     let path = |p: &str| dir.join(p).to_string_lossy().into_owned();
     let (model, vad) = (path(MODEL), path(VAD_MODEL));
-    let mut args = vec![
+    // shortcut: CPU only; the GPU needs a shader cache folder for nobody
+    // (__GL_SHADER_DISK_CACHE_PATH), then drop -ng
+    [
         "-m",
         &model,
         "--vad",
@@ -158,13 +147,12 @@ fn whisper_args(dir: &Path, lang: &str, gpu: bool) -> Vec<String> {
         "-nt",
         "-t",
         &threads,
+        "-ng",
         "-f",
         "/proc/self/fd/3",
-    ];
-    if !gpu {
-        args.push("-ng");
-    }
-    args.into_iter().map(String::from).collect()
+    ]
+    .map(String::from)
+    .to_vec()
 }
 
 /// The language whisper-cli says it detected under `-l auto`, from its stderr:
@@ -179,31 +167,12 @@ fn detected(stderr: &[u8]) -> Option<String> {
     LANGUAGES.contains(&lang.as_str()).then_some(lang)
 }
 
-/// Whether whisper is given the GPU: a device is there, and no run on it has failed since the
-/// daemon started.
-pub fn gpu() -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let found = *FOUND.get_or_init(|| {
-        // An NVIDIA device, or a render node `nobody` may open.
-        let open = |e: std::fs::DirEntry| {
-            e.file_name().to_string_lossy().starts_with("renderD")
-                && e.metadata()
-                    .is_ok_and(|m| m.permissions().mode() & 0o006 == 0o006)
-        };
-        Path::new("/dev/nvidia0").exists()
-            || std::fs::read_dir("/dev/dri").is_ok_and(|d| d.flatten().any(open))
-    });
-    found && !GPU_FAILED.load(Ordering::Relaxed)
-}
-
-static GPU_FAILED: AtomicBool = AtomicBool::new(false);
-
 /// An anonymous file in memory: what a decoder reads or writes instead of a path.
 struct Mem(std::fs::File);
 
 impl Mem {
-    fn new(bytes: &[u8]) -> std::io::Result<Mem> {
+    /// Holding `bytes`, with no write, growth or cut from here on, by anyone.
+    fn sealed(bytes: &[u8]) -> std::io::Result<Mem> {
         let flags = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
         // Safety: a C string literal and plain flags; the result is checked.
         let fd = unsafe { libc::memfd_create(c"zephyr-voice".as_ptr(), flags) };
@@ -221,28 +190,13 @@ impl Mem {
         // Safety: as above.
         let mem = Mem(unsafe { std::fs::File::from_raw_fd(fd) });
         mem.0.write_all_at(bytes, 0)?;
-        Ok(mem)
-    }
-
-    /// No write, growth or cut from here on, by anyone.
-    fn seal(&self) -> std::io::Result<()> {
         let seals =
             libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
         // Safety: a valid fd; the result is checked.
-        match unsafe { libc::fcntl(self.0.as_raw_fd(), libc::F_ADD_SEALS, seals) } {
-            0 => Ok(()),
+        match unsafe { libc::fcntl(mem.0.as_raw_fd(), libc::F_ADD_SEALS, seals) } {
+            0 => Ok(mem),
             _ => Err(std::io::Error::last_os_error()),
         }
-    }
-
-    fn sealed(bytes: &[u8]) -> std::io::Result<Mem> {
-        let mem = Mem::new(bytes)?;
-        mem.seal()?;
-        Ok(mem)
-    }
-
-    fn len(&self) -> u64 {
-        self.0.metadata().map_or(0, |m| m.len())
     }
 }
 
@@ -348,22 +302,19 @@ fn mem<T>(made: std::io::Result<T>) -> Result<T, Stop> {
 
 async fn hear(cfg: &Config, audio: &[u8], secs: &mut u64) -> Result<Heard, Stop> {
     let (voice, dir) = (cfg.voice(), &cfg.voice_dir);
-    let (input, wav) = (mem(Mem::sealed(audio))?, mem(Mem::new(&[]))?);
+    let input = mem(Mem::sealed(audio))?;
     // One second over the limit shows the note is too long without decoding the rest of it.
     let args = decode_args(voice.max_secs + 1);
-    let fds = [(&input, 3), (&wav, 4)];
     let ffmpeg = dir.join("bin/ffmpeg");
-    if !run(&ffmpeg, &args, &fds, Stdio::null(), FFMPEG_LIMIT)
-        .await?
-        .ok
-    {
+    let decoded = run(&ffmpeg, &args, &[(&input, 3)], Stdio::null(), FFMPEG_LIMIT).await?;
+    if !decoded.ok {
         return Err(Stop::Failed);
     }
-    *secs = wav.len().saturating_sub(WAV_HEADER) / WAV_BYTES_PER_SEC;
+    *secs = (decoded.stdout.len() as u64).saturating_sub(WAV_HEADER) / WAV_BYTES_PER_SEC;
     if *secs > voice.max_secs {
         return Ok(Heard::TooLong);
     }
-    mem(wav.seal())?;
+    let wav = mem(Mem::sealed(&decoded.stdout))?;
     let first = voice.languages[0].clone();
     let (lang, out) = if voice.languages.len() == 1 {
         (first.clone(), whisper(cfg, &wav, &first).await?)
@@ -382,25 +333,15 @@ async fn hear(cfg: &Config, audio: &[u8], secs: &mut u64) -> Result<Heard, Stop>
     })
 }
 
-/// One whisper run of `wav` as `lang`. A run that fails on the GPU is the last one there: it is
-/// done again on the CPU, as every later one is.
+/// One whisper run of `wav` as `lang`.
 async fn whisper(cfg: &Config, wav: &Mem, lang: &str) -> Result<Out, Stop> {
     let prog = cfg.voice_dir.join("bin/whisper-cli");
-    let mut tries = vec![false];
-    if gpu() {
-        tries.insert(0, true);
+    let args = whisper_args(&cfg.voice_dir, lang);
+    let out = run(&prog, &args, &[(wav, 3)], Stdio::null(), cfg.voice_wait).await?;
+    match out.ok {
+        true => Ok(out),
+        false => Err(Stop::Failed),
     }
-    for gpu in tries {
-        let args = whisper_args(&cfg.voice_dir, lang, gpu);
-        let out = run(&prog, &args, &[(wav, 3)], Stdio::null(), cfg.voice_wait).await?;
-        if out.ok {
-            return Ok(out);
-        }
-        if gpu {
-            GPU_FAILED.store(true, Ordering::Relaxed);
-        }
-    }
-    Err(Stop::Failed)
 }
 
 /// Whether a reply to a row on `channel` is also spoken (`voice.reply`): under `mirror` one to
@@ -543,8 +484,7 @@ pub fn status(cfg: &Config) -> String {
     if !present(cfg) {
         return "voice: not in this image (built with VOICE=0)".into();
     }
-    let on = if gpu() { "GPU (Vulkan)" } else { "CPU" };
-    format!("voice: whisper small on {on}")
+    "voice: whisper small on CPU".into()
 }
 
 /// `doctor`'s lines, each `ok|warn <what>`: the models and voices that are there, the uid the
@@ -732,6 +672,10 @@ pub(crate) mod tests {
         let model = cfg.voice_dir.join(MODEL);
         assert!(argv.contains(model.to_str().unwrap()), "{argv}");
         assert!(argv.contains(r#""-l","auto""#), "{argv}");
+        assert!(
+            argv.contains(r#""-ng""#) && !argv.contains(r#""-np""#),
+            "{argv}"
+        );
     }
 
     /// Review Focus 6: a decoder hung on a crafted file costs its limit, not the voice.
@@ -779,7 +723,9 @@ pub(crate) mod tests {
         let (heard, secs) = transcribe(&cfg, b"long").await;
         assert_eq!((heard, secs), (Heard::TooLong, 21));
         let ffmpeg = log(&cfg, "ffmpeg");
-        assert!(ffmpeg[0]["argv"].to_string().contains(r#""-t","21""#));
+        assert!(ffmpeg[0]["argv"]
+            .to_string()
+            .contains(r#""-t","21","pipe:1""#));
         assert!(log(&cfg, "whisper-cli").is_empty());
     }
 
