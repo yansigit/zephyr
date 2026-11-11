@@ -25,6 +25,7 @@ cargo test -p zephyr --test attach -- --ignored   # drives real `rpi --connect` 
 # Needs Docker and a side container (never the live one); the file's head says how to make it
 ZEPHYR_CONTAINER=zephyr-test cargo test -p zephyr --test net_floor -- --ignored
 
+deploy/install.sh [--from-image|--from-source] [--no-init]   # install the CLI on a fresh machine, then zephyr init
 cargo install --path crates/zephyr && zephyr up --build   # build deploy/Dockerfile and run it locally
 deploy/release.sh 0.2.1 | --cli                           # release from a clean main (README "Releasing")
 deploy/runner/start.sh up|down                            # self-hosted fallback runner (README "Releasing")

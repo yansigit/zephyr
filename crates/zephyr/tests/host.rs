@@ -14,6 +14,7 @@ const CLAUDE_TOKEN: &str = "sk-ant-oat01-FAKE-CLAUDE-TOKEN";
 const DOCKER: &str = r#"#!/bin/bash
 log="$SHIM_DIR/calls.log"
 (IFS=$'\x1f'; echo "docker$IFS$*") >> "$log"
+[ -n "$SHIM_DOCKER_DOWN" ] && exit 1
 # `zephyr __file` in the container serves the daemon's files from $SHIM_DIR/files.
 case " $* " in
   *" __file get "*) f="$SHIM_DIR/files/${@: -1}"; [ -f "$f" ] || exit 3; cat "$f"; exit 0 ;;
@@ -107,6 +108,24 @@ const CURL: &str = r#"#!/bin/bash
 exit "${SHIM_CURL_FAIL:-0}"
 "#;
 
+/// `cargo`: logged like `docker`. `install` writes a fake `~/.cargo/bin/zephyr` that logs how it
+/// was run to exec.log, as the image's CLI does.
+const CARGO: &str = r#"#!/bin/bash
+(IFS=$'\x1f'; echo "cargo$IFS$*") >> "$SHIM_DIR/calls.log"
+case "$1" in
+  --version) echo "cargo 1.95.0 (abc 2026-01-01)" ;;
+  install) mkdir -p "$HOME/.cargo/bin"
+    printf '#!/bin/bash\necho "$@" >> "%s/exec.log"\n' "$SHIM_DIR" > "$HOME/.cargo/bin/zephyr"
+    chmod 755 "$HOME/.cargo/bin/zephyr" ;;
+esac
+"#;
+
+/// `sudo` and `wget`: logged and refused, for tests that check they are never called.
+const REFUSED: &str = r#"#!/bin/bash
+(IFS=$'\x1f'; echo "$(basename "$0")$IFS$*") >> "$SHIM_DIR/calls.log"
+exit 1
+"#;
+
 struct Env {
     dir: PathBuf,
     home: PathBuf,
@@ -133,6 +152,9 @@ impl Env {
             ("loginctl", LOGINCTL),
             ("curl", CURL),
             ("tailscale", TAILSCALE),
+            ("cargo", CARGO),
+            ("sudo", REFUSED),
+            ("wget", REFUSED),
         ] {
             std::fs::write(bin.join(name), body).unwrap();
             std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
@@ -223,6 +245,13 @@ impl Env {
 
     /// `zephyr <args>` with a terminal as stdin and stdout, through script(1). Its output is
     /// what the terminal received.
+    /// `bash deploy/install.sh <args>`, with the same environment as the CLI.
+    fn install(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/install.sh");
+        let args: Vec<&str> = [script].into_iter().chain(args.iter().copied()).collect();
+        self.run_input(Path::new("bash"), &args, env, None)
+    }
+
     fn on_a_tty(&self, args: &str, env: &[(&str, &str)]) -> Output {
         let path = format!(
             "{}:{}",
@@ -3316,4 +3345,167 @@ fn web_setup_needs_the_network_floor() {
         !env.calls().iter().any(|c| c[0] == "tailscale"),
         "nothing was asked of tailscale"
     );
+}
+
+/// What every install.sh run leaves out: no sudo, and nothing fetched off the web.
+fn fetches_nothing(calls: &[Vec<String>]) {
+    let bad = calls
+        .iter()
+        .find(|c| ["sudo", "curl", "wget"].contains(&c[0].as_str()));
+    assert!(bad.is_none(), "{bad:?}");
+}
+
+/// The files in `~/.local/bin`, sorted.
+fn local_bin(env: &Env) -> Vec<String> {
+    let dir = std::fs::read_dir(env.home.join(".local/bin"));
+    let mut names: Vec<String> = dir
+        .into_iter()
+        .flatten()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A new CLI and `init` would upgrade a live container through `up_checked`, so install.sh never
+/// goes on where zephyr already is, even when only its files are left after `zephyr down`.
+#[test]
+fn install_refuses_an_existing_install() {
+    let env = Env::new("install-refuses");
+    for vars in [&[][..], &[("SHIM_NO_CONTAINER", "1")]] {
+        if !vars.is_empty() {
+            std::fs::create_dir_all(env.daemon()).unwrap();
+        }
+        let out = env.install(&[], vars);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            said.contains("zephyr is installed here; upgrade with zephyr upgrade"),
+            "{said}"
+        );
+        let calls = env.calls();
+        let wrote = calls.iter().find(|c| {
+            c.starts_with(&s(&["docker", "pull"])) || c.starts_with(&s(&["cargo", "install"]))
+        });
+        assert!(wrote.is_none(), "{wrote:?}");
+        fetches_nothing(&calls);
+        assert!(local_bin(&env).is_empty(), "{:?}", local_bin(&env));
+    }
+}
+
+#[test]
+fn install_from_the_image_writes_the_cli_and_runs_init() {
+    let image = "ghcr.io/yansigit/zephyr:latest";
+    let none = [("SHIM_NO_CONTAINER", "1")];
+    let env = Env::new("install-image");
+    let out = env.install(&["--from-image", "--", "--non-interactive"], &none);
+    assert!(out.status.success(), "{out:?}");
+    let calls = env.calls();
+    find(&calls, &["docker", "pull", image]);
+    let cat = ["docker", "run", "--rm", "--entrypoint", "cat", image];
+    let want = s(&[&cat[..], &["/usr/local/bin/zephyr"]].concat());
+    assert_eq!(find(&calls, &cat), &want);
+    fetches_nothing(&calls);
+    assert_eq!(mode(&env.home.join(".local/bin/zephyr")), 0o755);
+    assert_eq!(local_bin(&env), ["zephyr"], "no temp file left");
+    assert_eq!(read(&env.dir.join("exec.log")), "init --non-interactive\n");
+
+    let env = Env::new("install-image-no-init");
+    let out = env.install(&["--from-image", "--no-init"], &none);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(mode(&env.home.join(".local/bin/zephyr")), 0o755);
+    assert_eq!(local_bin(&env), ["zephyr"], "no temp file left");
+    assert!(!env.dir.join("exec.log").exists(), "init did not run");
+    fetches_nothing(&env.calls());
+}
+
+/// A private ghcr.io package is pulled after a login as the gh user, the token on stdin; any
+/// other registry gets no login and no token.
+#[test]
+fn install_logs_in_only_at_ghcr_when_the_pull_fails() {
+    let env = Env::new("install-pull-fail");
+    let failing = [("SHIM_NO_CONTAINER", "1"), ("SHIM_PULL_FAIL", "1")];
+    let out = env.install(&["--from-image", "--no-init"], &failing);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let calls = env.calls();
+    let login = find(&calls, &["docker", "login"]);
+    let want = s(&[
+        "docker",
+        "login",
+        "ghcr.io",
+        "-u",
+        "tester",
+        "--password-stdin",
+    ]);
+    assert_eq!(login, &want);
+    let pulls = calls
+        .iter()
+        .filter(|c| c.starts_with(&s(&["docker", "pull"])));
+    assert_eq!(pulls.count(), 2, "pulled again after the login: {calls:#?}");
+    assert!(!format!("{calls:?}").contains(GH_TOKEN));
+    fetches_nothing(&calls);
+    assert!(local_bin(&env).is_empty(), "{:?}", local_bin(&env));
+
+    let mut vars = failing.to_vec();
+    vars.push(("ZEPHYR_REPO", "registry.example.com/me/zephyr"));
+    let out = env.install(&["--from-image", "--no-init"], &vars);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let calls = env.calls();
+    find(
+        &calls,
+        &["docker", "pull", "registry.example.com/me/zephyr:latest"],
+    );
+    let login = calls
+        .iter()
+        .find(|c| c.starts_with(&s(&["docker", "login"])) || c[0] == "gh");
+    assert!(login.is_none(), "{login:?}");
+    fetches_nothing(&calls);
+    assert!(local_bin(&env).is_empty(), "{:?}", local_bin(&env));
+}
+
+#[test]
+fn install_from_source_runs_cargo_install() {
+    let env = Env::new("install-source");
+    let out = env.install(
+        &["--from-source", "--no-init"],
+        &[("SHIM_NO_CONTAINER", "1")],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let calls = env.calls();
+    find(
+        &calls,
+        &["cargo", "install", "--locked", "--path", "crates/zephyr"],
+    );
+    find(&calls, &["docker", "buildx", "version"]);
+    let pulled = calls.iter().any(|c| c.starts_with(&s(&["docker", "pull"])));
+    assert!(!pulled, "{calls:#?}");
+    fetches_nothing(&calls);
+    assert!(env.home.join(".cargo/bin/zephyr").exists());
+    assert!(local_bin(&env).is_empty(), "{:?}", local_bin(&env));
+    assert!(!env.dir.join("exec.log").exists(), "init did not run");
+}
+
+#[test]
+fn install_without_docker_names_its_install_page() {
+    let env = Env::new("install-no-docker");
+    let out = env.install(&[], &[("SHIM_DOCKER_DOWN", "1")]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let said = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+    assert!(
+        said.contains("https://docs.docker.com/engine/install/"),
+        "{said}"
+    );
+    let calls = env.calls();
+    assert!(!calls.iter().any(|c| c[0] == "cargo"), "{calls:#?}");
+    fetches_nothing(&calls);
+}
+
+#[test]
+fn install_sh_defaults_to_the_clis_repo() {
+    let script = read(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/install.sh"
+    )));
+    let default = format!("${{ZEPHYR_REPO:-{}}}", zephyr::host::DEFAULT_REPO);
+    assert!(script.contains(&default), "{default}");
 }

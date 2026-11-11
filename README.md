@@ -7,14 +7,30 @@ It talks to you through its own terminal UI (or the stock rpi TUI), a line chat,
 
 You need Docker and, for the image from GitHub, the `gh` CLI signed in to an account that can read `yansigit/zephyr`.
 
+From a clone, as your own user (no `sudo`):
+
+```sh
+deploy/install.sh                    # installs the CLI, then runs zephyr init
+```
+
+It copies the CLI out of `ghcr.io/yansigit/zephyr:latest` into `~/.local/bin/zephyr` (Linux
+x86_64; a failed pull logs in to ghcr.io with your `gh` token), or builds it with
+`cargo install --locked --path crates/zephyr` when the pull fails and `cargo` (1.89 or newer) is
+there; `--from-image` or `--from-source` picks one, `--no-init` stops before the wizard, and
+arguments after `--` go to `zephyr init`. It checks Docker answers as you and warns when Docker's
+disk has under 20 GB free. It installs no Docker or Rust (it names their install pages), never
+runs `sudo`, `curl` or `wget`, and writes nothing but the one binary. On a machine that already
+has zephyr (the container, or `~/.zephyr-daemon`), it refuses: `zephyr upgrade` is the way there.
+
+Or by hand, either of:
+
 ```sh
 cargo install --path crates/zephyr   # the same binary runs on the host and in the container
 zephyr init                          # the wizard; safe to run again, it offers the current values
 ```
 
-Install without Rust (Linux x86_64; while the package is private, `docker login ghcr.io` first):
-
 ```sh
+# Without Rust (Linux x86_64; while the package is private, `docker login ghcr.io` first)
 docker run --rm --entrypoint cat ghcr.io/yansigit/zephyr:latest /usr/local/bin/zephyr > ~/.local/bin/zephyr && chmod +x ~/.local/bin/zephyr
 ```
 
