@@ -2930,14 +2930,19 @@ async fn a_ticket_works_once_for_its_session_within_30_s() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_vnc_socket_is_refused_and_a_text_frame_closes_the_first() {
     let (gw, phone, mut ws, cookie) = with_desktop("desk-one", |_| {}).await;
-    let ticket = ws.ticket(&phone).await;
+    // Two tickets, asked for before any socket opened: the second opens no second socket.
+    let (ticket, spare) = (ws.ticket(&phone).await, ws.ticket(&phone).await);
     let mut first = gw.vnc(&cookie, Some(&ticket)).await.expect("it opens");
-    // The session that holds the desktop may ask again; its ticket still opens no second one.
-    let ticket = ws.ticket(&phone).await;
-    assert_eq!(gw.vnc(&cookie, Some(&ticket)).await.err(), Some(503));
+    assert_eq!(gw.vnc(&cookie, Some(&spare)).await.err(), Some(503));
     assert_eq!(echoed(&mut first, b"still here").await, b"still here");
-    first.send(Message::Text("hello".into())).await.unwrap();
+    // The holder takes over again (a phone that loaded the page anew, its old socket not yet
+    // dead): the old socket is ended, and the new ticket's is served.
+    let ticket = ws.ticket(&phone).await;
+    let mut second = gw.vnc(&cookie, Some(&ticket)).await.expect("it opens");
     vnc_closed(&mut first).await;
+    assert_eq!(echoed(&mut second, b"again").await, b"again");
+    second.send(Message::Text("hello".into())).await.unwrap();
+    vnc_closed(&mut second).await;
     // Its place is free again.
     let ticket = ws.ticket(&phone).await;
     let mut next = gw.vnc(&cookie, Some(&ticket)).await.expect("it opens");

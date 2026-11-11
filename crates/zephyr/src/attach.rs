@@ -631,7 +631,7 @@ impl Conn {
             "zephyr.facts_list" | "zephyr.facts_put" | "zephyr.facts_rm" => {
                 self.facts(id, method, params)
             }
-            "zephyr.desktop" if self.web.is_some() => self.desktop(id, params),
+            "zephyr.desktop" if self.web.is_some() => self.desktop(id, params).await,
             "zephyr.web_devices" if self.web.is_some() => {
                 let cfg = self.cfgs.borrow().clone();
                 let session = self.web.as_ref().map_or([0; 32], |w| w.0);
@@ -873,7 +873,7 @@ impl Conn {
     /// assertion}` takes the agent's desktop over and answers the ticket that opens `/api/vnc`.
     /// It is signed with the passkey, over a preimage of its own: the desktop holds the agent's
     /// signed-in browser. `{"verb": "give"}` hands it back, unsigned: that only takes away.
-    fn desktop(&mut self, id: &Value, params: &Value) -> Reply {
+    async fn desktop(&mut self, id: &Value, params: &Value) -> Reply {
         let refuse = |why: &str| (vec![error(id, -32602, why)], false);
         let Some((session, _, hub)) = self.web.clone() else {
             return refuse("not available here");
@@ -889,7 +889,7 @@ impl Conn {
                 if self.cfgs.borrow().desktop.is_none() {
                     return refuse("there is no desktop");
                 }
-                match crate::web::vnc::take(&hub, session) {
+                match crate::web::vnc::take(&hub, session).await {
                     Ok(ticket) => (vec![ok(id, json!({ "ticket": ticket }))], false),
                     Err(why) => refuse(why),
                 }

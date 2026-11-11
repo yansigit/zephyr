@@ -12,11 +12,11 @@ use hyper::header::{self, HeaderValue};
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -29,6 +29,8 @@ const MAX_TICKETS: usize = 16;
 const MAX_FRAME: usize = 1 << 20;
 /// How long one write may take, to x11vnc or to a phone that stopped reading.
 const WRITE_WAIT: Duration = Duration::from_secs(30);
+/// How long a new take waits for the holder's old socket to end.
+const REPLACE_WAIT: Duration = Duration::from_secs(5);
 /// The subprotocol the app offers beside its ticket (`zt.<ticket>`), and the one answered.
 const PROTOCOL: &str = "zephyr-vnc";
 /// x11vnc speaks on its stdin and listens nowhere (`-inetd`), serves that one client (`-once`),
@@ -92,7 +94,10 @@ impl Tickets {
 /// and what the watchdog counts from.
 pub struct Vnc {
     pub tickets: Tickets,
-    open: AtomicBool,
+    /// Whether the one socket is open.
+    open: watch::Sender<bool>,
+    /// Moves when the holder takes over again: its old socket, if any, ends.
+    again: watch::Sender<u64>,
     seen: Mutex<Seen>,
     moved: tokio::sync::Notify,
 }
@@ -112,7 +117,7 @@ impl Drop for Open {
     fn drop(&mut self) {
         let vnc = &self.0.vnc;
         vnc.note(|seen| seen.closed = Some(Instant::now()));
-        vnc.open.store(false, Ordering::Release);
+        vnc.open.send_replace(false);
     }
 }
 
@@ -124,7 +129,8 @@ impl Vnc {
         };
         Vnc {
             tickets: Tickets::default(),
-            open: AtomicBool::new(false),
+            open: watch::channel(false).0,
+            again: watch::channel(0).0,
             seen: Mutex::new(seen),
             moved: tokio::sync::Notify::new(),
         }
@@ -148,9 +154,15 @@ impl Default for Vnc {
 
 /// The owner (signed, `attach`) takes the desktop: the ticket that opens `/api/vnc` for this
 /// session, or why not. A session that holds it already gets a fresh ticket, and the wait for
-/// its closed socket starts over.
-pub fn take(hub: &super::Hub, session: [u8; 32]) -> Result<String, &'static str> {
+/// its closed socket starts over. Its old socket, if one is still open (a phone that loaded the
+/// page anew), is ended first, or the new one would be the second and get 503 until it died.
+pub async fn take(hub: &super::Hub, session: [u8; 32]) -> Result<String, &'static str> {
     hub.desktop.take(session, crate::now())?;
+    let mut open = hub.vnc.open.subscribe();
+    if *open.borrow() {
+        hub.vnc.again.send_modify(|n| *n += 1);
+        let _ = tokio::time::timeout(REPLACE_WAIT, open.wait_for(|open| !open)).await;
+    }
     hub.vnc.note(|seen| seen.closed = None);
     Ok(hub.vnc.tickets.issue(session))
 }
@@ -247,16 +259,22 @@ pub(super) fn ws(mut req: Request<Incoming>, app: &Arc<App>) -> Res {
     {
         return super::text(StatusCode::UNAUTHORIZED, "");
     }
-    if hub.vnc.open.swap(true, Ordering::AcqRel) {
+    if !hub
+        .vnc
+        .open
+        .send_if_modified(|open| !std::mem::replace(open, true))
+    {
         return super::text(StatusCode::SERVICE_UNAVAILABLE, "");
     }
     let open = Open(hub.clone());
+    // From before the bridge is set up, so a take made meanwhile still ends it.
+    let again = hub.vnc.again.subscribe();
     hub.vnc.note(|seen| seen.closed = None);
     let (upgrade, app) = (hyper::upgrade::on(&mut req), app.clone());
     tokio::spawn(async move {
         // Fails when the client went away before the 101 reached it.
         match upgrade.await {
-            Ok(upgraded) => bridge(TokioIo::new(upgraded), session, &app, open).await,
+            Ok(upgraded) => bridge(TokioIo::new(upgraded), session, &app, open, again).await,
             Err(_) => drop(open),
         }
     });
@@ -294,9 +312,14 @@ fn x11vnc(cfg: &Config) -> std::io::Result<(tokio::process::Child, tokio::net::U
 
 /// Joins the WebSocket's binary frames to x11vnc, with no cap on how many (a pointer drag sends
 /// hundreds). Closed by a text frame, a frame over 1 MiB, x11vnc ending, the session ending,
-/// and the hand back; x11vnc is killed with it.
-async fn bridge<S>(io: S, session: WebSession, app: &App, open: Open)
-where
+/// the hand back, and the holder taking over again (`again`); x11vnc is killed with it.
+async fn bridge<S>(
+    io: S,
+    session: WebSession,
+    app: &App,
+    open: Open,
+    mut again: watch::Receiver<u64>,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let limits = WebSocketConfig {
@@ -341,6 +364,7 @@ where
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                     _ => break, // text, a close, an oversized frame, the end
                 },
+                _ = again.changed() => break,
                 read = from_vnc.read(&mut buf) => match read {
                     Ok(n) if n > 0 => {
                         let out = Message::Binary(buf[..n].to_vec());
