@@ -396,6 +396,14 @@ async fn pair(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
         "usage: zephyr pair telegram|signal"
     );
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    // A code is no use before signal-cli holds the account; it starts a few seconds after the
+    // daemon (re-)starts. Doctor, run next, says if it never does.
+    if kind == "signal" {
+        let until = std::time::Instant::now() + Duration::from_secs(60);
+        while !zephyr::signal::holds(cfg) && std::time::Instant::now() < until {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
     let reply = loop {
         let reply = ask(cfg, &format!("/pair {kind}")).await?;
         let early = std::time::Instant::now() < deadline;
@@ -656,7 +664,7 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
         );
         ok &= check(&label, private);
         // The adapter writes it once signal-cli is up and `listAccounts` names the account.
-        let up = std::fs::read_to_string(dir.join(".ok")).is_ok_and(|a| a == signal.account);
+        let up = zephyr::signal::holds(cfg);
         let label = format!("signal-cli is running and holds {}", signal.account);
         ok &= check(&label, up);
         if !cfg.signal_cli.exists() {

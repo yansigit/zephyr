@@ -175,7 +175,7 @@ Deviations: `link` runs without `-a` (signal-cli 0.14.10 refuses an account ther
 - [x] **Step 4:** Same → PASS; `cargo test` → PASS.
 - [x] **Step 5:** README channel commands. Commit `feat(host): add and remove the Telegram and Signal channels, and pair their owner`.
 
-Deviations: `channel add` no longer stops on a failing `zephyr doctor` before pairing (a channel still connecting is no reason to skip the code; doctor's verdict is printed). `add signal` checks the number's form on the host and needs the container running. `init` asks `Set up telegram?` and `Set up signal?` after iMessage and pairs each one set up after its final doctor; the driven-tty test `init_asks_for_a_preset_and_writes_it` answers the two new prompts. A `zephyr pair` test covers its usage and the missing daemon (exit 3); the code path itself is the router's, tested in C1-2.
+Deviations: `channel add` of a paired kind asks for the code before running doctor, and a failed doctor fails the command for every kind, as before (review fix: no doctor check depends on pairing). `zephyr pair signal` first waits up to 60 s for signal-cli to hold the account. Adding Signal again drops `[signal]` and reloads first, so the daemon's signal-cli lets the account go (review fix). `add signal` checks the number's form on the host and needs the container running. `init` asks `Set up telegram?` and `Set up signal?` after iMessage and pairs each one set up after its final doctor; the driven-tty test `init_asks_for_a_preset_and_writes_it` answers the two new prompts. A `zephyr pair` test covers its usage and the missing daemon (exit 3); the code path itself is the router's, tested in C1-2.
 
 ### Task C1-6: The image: signal-cli behind `SIGNAL`
 

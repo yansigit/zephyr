@@ -61,6 +61,7 @@ case "$1" in
       *" zephyr status "*) echo "daemon: ${SHIM_DAEMON:-running}"; [ -n "$SHIM_STATUS" ] && printf '%b\n' "$SHIM_STATUS"; exit "${SHIM_STATUS_EXIT:-0}" ;;
       *" zephyr --version "*) [ -n "$SHIM_VERSION" ] || exit 2; echo "zephyr $SHIM_VERSION" ;;
       *" zephyr tui "*) exit "${SHIM_TUI_EXIT:-0}" ;;
+      *" zephyr doctor "*) exit "${SHIM_DOCTOR_EXIT:-0}" ;;
       # `zephyr web enrol [NAME]` and `zephyr web`: the daemon's replies over the chat socket.
       *" zephyr web enrol"*) echo "[zephyr] open https://box.tail1234.ts.net/#enrol=ABCDE-FGHJK on the phone within 10 min, or type the code there; it works once" ;;
       *" zephyr web "*) echo "[zephyr] web app https://box.tail1234.ts.net · passkeys: ${SHIM_PASSKEYS:-none} · 0 sessions · push on 0 devices" ;;
@@ -2929,6 +2930,58 @@ fn channel_list_and_remove_cover_telegram_and_signal() {
             "7f3c0000-0000-4000-8000-000000000000",
         ],
     );
+}
+
+/// Whether a recorded call ends with `argv`.
+fn ends(call: &[String], argv: &[&str]) -> bool {
+    call.len() >= argv.len()
+        && call[call.len() - argv.len()..]
+            .iter()
+            .zip(argv)
+            .all(|(a, b)| a == b)
+}
+
+#[test]
+fn channel_add_fails_when_doctor_does() {
+    let env = Env::new("channel-add-doctor");
+    env.init(&["--no-start"]);
+    let fail = [("SHIM_DOCTOR_EXIT", "1")];
+    let discord = [
+        ("Your Discord user id", "1234\n"),
+        ("Discord bot token (hidden)", "tok\n"),
+    ];
+    let (code, shown) = env.on_a_driven_tty_env(&["channel", "add", "discord"], &discord, &fail);
+    assert_ne!(code, 0, "{shown}");
+    let telegram = [("Telegram bot token (hidden)", "tok\n")];
+    let (code, shown) = env.on_a_driven_tty_env(&["channel", "add", "telegram"], &telegram, &fail);
+    assert_ne!(code, 0, "{shown}");
+    // The pairing code is asked for first: doctor's verdict comes after it.
+    let calls = env.calls();
+    let at = |argv: &[&str]| calls.iter().rposition(|c| ends(c, argv)).unwrap();
+    assert!(at(&["zephyr", "pair", "telegram"]) < at(&["zephyr", "doctor"]));
+    let (code, shown) = env.on_a_driven_tty(&["channel", "add", "telegram"], &telegram);
+    assert_eq!(code, 0, "{shown}");
+}
+
+#[test]
+fn adding_signal_again_stops_the_daemons_signal_cli_first() {
+    let env = Env::new("channel-add-signal-again");
+    env.init(&["--no-start"]);
+    env.ok(&["config", "set", "signal.account", "\"+15550100\""]);
+    env.calls();
+    let steps = [
+        ("Signal", "\n"),
+        ("Signal number", "+15550100\n"),
+        ("voice call", "n"),
+    ];
+    let (code, shown) = env.on_a_driven_tty(&["channel", "add", "signal"], &steps);
+    assert_eq!(code, 0, "{shown}");
+    let calls = env.calls();
+    let at = |argv: &[&str]| calls.iter().position(|c| ends(c, argv)).unwrap();
+    let setup = at(&["zephyr", "signal-setup", "register", "+15550100"]);
+    assert!(at(&["zephyr", "reload"]) < setup, "{calls:?}");
+    let cfg: toml::Value = toml::from_str(&env.config()).unwrap();
+    assert_eq!(cfg["signal"]["account"].as_str(), Some("+15550100"));
 }
 
 #[test]

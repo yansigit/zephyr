@@ -712,12 +712,12 @@ pub fn channel(h: &Host, a: Args) -> anyhow::Result<()> {
             let before = h.published().unwrap_or_default();
             channel_add(h, kind)?;
             h.apply_published(&before)?;
-            // doctor's verdict is printed; a channel still connecting is no reason to stop.
-            let _ = run(&mut h.exec(&[], &[], &["zephyr", "doctor"]));
-            match PAIRED.contains(&kind.as_str()) {
-                true => pair(h, kind),
-                false => Ok(()),
+            // The pairing code first (`zephyr pair` waits for the channel to come up), then
+            // doctor, whose failure fails the command as before.
+            if PAIRED.contains(&kind.as_str()) {
+                pair(h, kind)?;
             }
+            run(&mut h.exec(&[], &[], &["zephyr", "doctor"]))
         }
         [rm, kind] if rm == "remove" && CHANNELS.contains(&kind.as_str()) => {
             channel_remove(h, kind)
@@ -1361,6 +1361,14 @@ fn signal_add(
     h.need_running()?;
     if !super::quiet(h.exec(&[], &[], &["test", "-d", "/opt/zephyr/signal"])) {
         bail!("signal: not in this image (built with SIGNAL=0)");
+    }
+    // The daemon's signal-cli holds the account's lock, which a second one would wait on for
+    // good: the table goes first (its owners stay), and the reload stops it.
+    let mut doc = h.data.load()?;
+    if doc.remove("signal").is_some() {
+        println!("stopping zephyr's signal-cli first: it holds the account");
+        h.data.save(&doc)?;
+        h.apply()?;
     }
     println!(
         "Zephyr needs a Signal number of its own: a second SIM or eSIM, or a VoIP or landline \

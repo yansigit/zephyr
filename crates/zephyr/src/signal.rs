@@ -22,6 +22,14 @@ pub struct Config {
     pub account: String,
 }
 
+/// Whether the daemon's signal-cli is up and holds `[signal] account` (the adapter's `.ok`).
+pub fn holds(cfg: &crate::config::Config) -> bool {
+    let Some(signal) = &cfg.signal else {
+        return false;
+    };
+    std::fs::read_to_string(data_dir(cfg).join(OK_FILE)).is_ok_and(|a| a == signal.account)
+}
+
 /// signal-cli's data dir: the account's keys, password and sessions. Root's, 0700, in `<state>`
 /// and so out of the agent's reach (DESIGN §4.4); not in the daily backup.
 pub fn data_dir(cfg: &crate::config::Config) -> PathBuf {
@@ -45,6 +53,9 @@ const NAMES: usize = 256;
 const ROOT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 /// Written in the data dir while the child is up and holds `account`; doctor reads it.
 const OK_FILE: &str = ".ok";
+/// The most a setup step's signal-cli may take; `link` waits for a scan, so it gets 10 min.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(120);
+const LINK_TIMEOUT: Duration = Duration::from_secs(600);
 const TRUST_FILE: &str = ".trust";
 
 /// signal-cli by full path, its environment cleared to what the JVM needs, on `dir`. Its
@@ -650,9 +661,23 @@ async fn setup_run(
     if let Some(account) = account {
         cmd.args(["-a", account]);
     }
-    let status = cmd.args(args).status().await?;
+    // Bounded: a signal-cli waiting on the account's lock would otherwise wait for good.
+    let status = tokio::time::timeout(SETUP_TIMEOUT, cmd.args(args).status())
+        .await
+        .map_err(|_| anyhow::anyhow!("signal-cli {} did not finish in 2 min", args[0]))??;
     anyhow::ensure!(status.success(), "signal-cli {} failed ({status})", args[0]);
     Ok(())
+}
+
+/// Waits until the daemon's signal-cli let the account go (`.ok` gone), for at most 30 s.
+async fn released(dir: &Path) -> anyhow::Result<()> {
+    for _ in 0..60 {
+        if !dir.join(OK_FILE).exists() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    anyhow::bail!("zephyr's signal-cli still holds the account; zephyr channel remove signal first")
 }
 
 /// `zephyr signal-setup`, run as root in the container by the host's `zephyr channel add|remove
@@ -693,6 +718,7 @@ pub async fn setup(cfg: &crate::config::Config, args: &[String]) -> anyhow::Resu
                 )
                 .interact_text()?;
             private_dir(&dir)?;
+            released(&dir).await?;
             let mut rpc = Registrar::start(cfg)?;
             let asked = json!({"captcha": captcha.trim(), "voice": voice});
             rpc.call("register", number, asked).await?;
@@ -714,19 +740,27 @@ pub async fn setup(cfg: &crate::config::Config, args: &[String]) -> anyhow::Resu
         ["link"] => {
             println!("{WARNING}");
             private_dir(&dir)?;
+            released(&dir).await?;
             // `link` takes no account: signal-cli learns it from the phone.
             let mut child = command(&cfg.signal_cli, &dir)
                 .args(["link", "-n", "zephyr"])
                 .stdout(std::process::Stdio::piped())
                 .spawn()?;
             let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-            let uri = loop {
-                match lines.next_line().await? {
-                    Some(l) if l.trim().starts_with("sgnl://") => break l.trim().to_string(),
-                    Some(l) => println!("{l}"),
-                    None => anyhow::bail!("signal-cli link printed no sgnl:// link"),
+            let first = async {
+                loop {
+                    match lines.next_line().await? {
+                        Some(l) if l.trim().starts_with("sgnl://") => {
+                            break anyhow::Ok(l.trim().to_string())
+                        }
+                        Some(l) => println!("{l}"),
+                        None => anyhow::bail!("signal-cli link printed no sgnl:// link"),
+                    }
                 }
             };
+            let uri = tokio::time::timeout(SETUP_TIMEOUT, first)
+                .await
+                .map_err(|_| anyhow::anyhow!("signal-cli link gave no link in 2 min"))??;
             println!("Scan this on zephyr's own phone: Signal, Settings, Linked devices.");
             let shown = std::process::Command::new("/usr/bin/qrencode")
                 .env_clear()
@@ -736,10 +770,15 @@ pub async fn setup(cfg: &crate::config::Config, args: &[String]) -> anyhow::Resu
             if !shown {
                 println!("{uri}");
             }
-            while let Some(l) = lines.next_line().await? {
-                println!("{l}");
-            }
-            let status = child.wait().await?;
+            let rest = async {
+                while let Some(l) = lines.next_line().await? {
+                    println!("{l}");
+                }
+                anyhow::Ok(child.wait().await?)
+            };
+            let status = tokio::time::timeout(LINK_TIMEOUT, rest)
+                .await
+                .map_err(|_| anyhow::anyhow!("the link was not scanned within 10 min"))??;
             anyhow::ensure!(status.success(), "signal-cli link failed ({status})");
         }
         ["trust", aci] => {
