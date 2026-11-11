@@ -2167,13 +2167,14 @@ impl Store {
         )
     }
 
-    /// Expires `pending` and `scheduled` actions older than 24 h and pending browser waits older than 10 min.
+    /// Expires `pending` and `scheduled` actions older than 24 h, and pending browser waits and
+    /// card requests older than 10 min (a checkout does not wait longer).
     pub fn expire_actions(&self, now: i64) -> rusqlite::Result<Vec<Action>> {
         let mut stmt = self.db.prepare(&format!(
             "UPDATE proposals SET status = 'expired', settled_at = ?1
              WHERE kind != 'command' AND status IN ('pending', 'scheduled')
                AND (created_at <= ?1 - 86400
-                    OR (status = 'pending' AND kind = 'wait' AND created_at <= ?1 - 600))
+                    OR (status = 'pending' AND kind IN ('wait', 'card') AND created_at <= ?1 - 600))
              RETURNING {ACTION_COLS}"
         ))?;
         let rows = stmt.query_map(params![now], action_row)?;

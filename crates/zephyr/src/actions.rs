@@ -113,12 +113,15 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
     if let By::Owner { channel } = by {
         let strong = &ctx.cfg.settings.strong_channels;
         let money_strong = approvals::strong_only(ctx.cfg).iter().any(|s| s == "money");
-        if a.class == "money" && money_strong && !strong.iter().any(|c| c == channel) {
+        let is_strong = strong.iter().any(|c| c == channel);
+        if a.class == "money" && money_strong && !is_strong {
             return Err(format!(
                 "[zephyr] approving a payment needs {}",
                 strong.join(" or ")
             ));
         }
+        // The payment window, whatever `strong_only` says (DESIGN §4.22).
+        crate::gate::window_check(ctx.cfg, store, &a, is_strong, now)?;
     }
     // Before it is taken, so a full process table leaves the approval waiting (R44).
     if a.kind == ActionKind::Run && !store.proc_slot_free().map_err(failed)? {
@@ -141,6 +144,12 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
         _ => "approved",
     };
     audit(ctx.cfg, store, &a, decision);
+    // What the window counts: every payment the owner approved or that came due.
+    let source = match by {
+        By::Owner { .. } => "ok",
+        By::Delay => "due",
+    };
+    crate::gate::paid(ctx.cfg, store, &a, source, now);
     let started = match a.kind {
         ActionKind::Run => run(ctx, &a),
         ActionKind::Pass => pass(ctx, &a, by, now),
@@ -446,7 +455,7 @@ pub fn tick(ctx: &Ctx, now: i64, held: bool) {
                 audit(ctx.cfg, store, &a, "expired");
                 ctx.waits.answer(a.id, false);
                 let within = match a.kind {
-                    ActionKind::Wait => "10 min",
+                    ActionKind::Wait | ActionKind::Card => "10 min",
                     _ => "a day",
                 };
                 let text = format!(
