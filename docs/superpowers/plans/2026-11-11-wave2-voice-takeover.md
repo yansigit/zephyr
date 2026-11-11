@@ -128,6 +128,7 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
 - Deviation: `[voice] languages` takes only whisper's own codes (`voice::LANGUAGES`), checked in `Config::validate`, since each goes into argv.
 - Deviation (pinned later from the image part's measurements, commit `fix(voice)`): whisper always gets `-ng` and `voice::gpu` is gone, against spec §4.4: Vulkan as `nobody` with a cleared environment is slower than the CPU (12 s against 8 s for a 9 s clip), since the NVIDIA driver recompiles shaders on every run without a writable cache. `status` and `doctor` read `voice: whisper small on CPU`.
 - Deviation (same commit): ffmpeg writes the WAV to its stdout (`-c:a pcm_s16le -f wav -t N pipe:1`), which the daemon puts into the second sealed memfd; the length is read from that output. Nothing is written through `/proc/self/fd/4`, and every memfd is sealed when it is made.
+- Review fix: `voice::run` kills the process group when its first process ends, not only at the limit, so a decoder that forks and exits leaves no child running as `nobody` (`a_decoders_child_does_not_outlive_it`).
 
 ### Task C2-3: `inbox::append` transcribes what it fetched
 

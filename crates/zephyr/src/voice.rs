@@ -248,6 +248,20 @@ async fn run(
         eprintln!("zephyr: voice: starting {}: {e}", prog.display());
         Stop::Failed
     })?;
+    let pid = child.id().expect("not waited on yet") as i32;
+    // Safety: the group is the child's own (`process_group(0)`), and each call below is made
+    // while the child is not reaped, so the pid cannot have gone to another process.
+    let kill = move || unsafe { libc::killpg(pid, libc::SIGKILL) };
+    // The child's end, seen without reaping it.
+    let exited = tokio::task::spawn_blocking(move || loop {
+        // Safety: `info` is plain data the call fills in; the pid is our child's.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let flags = libc::WEXITED | libc::WNOWAIT;
+        let r = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) };
+        if r == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            break;
+        }
+    });
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let (o, e) = (child.stdout.take(), child.stderr.take());
     let (mut o, mut e) = (
@@ -255,22 +269,20 @@ async fn run(
         e.expect("piped").take(MAX_OUT),
     );
     let all = async {
-        tokio::join!(
-            o.read_to_end(&mut out),
-            e.read_to_end(&mut err),
-            child.wait()
-        )
-        .2
+        tokio::join!(o.read_to_end(&mut out), e.read_to_end(&mut err), async {
+            let _ = exited.await;
+            // Whatever it forked goes with it: nothing is left running as `nobody`, and a
+            // child holding the pipes open does not keep the reads waiting.
+            kill();
+        })
     };
-    let status = tokio::time::timeout(limit, all).await;
-    let Ok(status) = status else {
-        if let Some(pid) = child.id() {
-            // Safety: the child is not reaped yet, so the pid, its group's id, is still its own.
-            unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
-        }
-        let _ = child.wait().await;
+    let timed_out = tokio::time::timeout(limit, all).await.is_err();
+    // At the limit this is what stops it; otherwise the group is already gone.
+    kill();
+    let status = child.wait().await;
+    if timed_out {
         return Err(Stop::TimedOut);
-    };
+    }
     Ok(Out {
         ok: status.is_ok_and(|s| s.success()),
         stdout: out,
@@ -706,6 +718,29 @@ pub(crate) mod tests {
             transcribe(&cfg, b"next").await.0,
             said("en", "hello from the fake")
         );
+    }
+
+    /// A decoder that forks and exits leaves nothing behind running as `nobody`.
+    #[tokio::test]
+    async fn a_decoders_child_does_not_outlive_it() {
+        let cfg = fakes("voice-fork", "");
+        mark(&cfg, "fork", "");
+        assert_eq!(
+            transcribe(&cfg, b"crafted").await.0,
+            said("en", "hello from the fake")
+        );
+        let pid = std::fs::read_to_string(cfg.voice_dir.join("fork.pid")).unwrap();
+        // Killed by now, though it may still be dying, or a zombie its new parent has yet to
+        // reap: both are gone for good.
+        let stat = || std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()));
+        let gone = || stat().map_or(true, |s| s.contains(") Z ") || s.contains(") X "));
+        for _ in 0..200 {
+            if gone() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the decoder's child is still there: {:?}", stat());
     }
 
     #[tokio::test]
