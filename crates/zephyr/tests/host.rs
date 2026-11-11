@@ -62,6 +62,7 @@ case "$1" in
       *" zephyr --version "*) [ -n "$SHIM_VERSION" ] || exit 2; echo "zephyr $SHIM_VERSION" ;;
       *" zephyr tui "*) exit "${SHIM_TUI_EXIT:-0}" ;;
       *" zephyr doctor "*) exit "${SHIM_DOCTOR_EXIT:-0}" ;;
+      *" zephyr signal-setup "*) exit "${SHIM_SETUP_EXIT:-0}" ;;
       # `zephyr web enrol [NAME]` and `zephyr web`: the daemon's replies over the chat socket.
       *" zephyr web enrol"*) echo "[zephyr] open https://box.tail1234.ts.net/#enrol=ABCDE-FGHJK on the phone within 10 min, or type the code there; it works once" ;;
       *" zephyr web "*) echo "[zephyr] web app https://box.tail1234.ts.net · passkeys: ${SHIM_PASSKEYS:-none} · 0 sessions · push on 0 devices" ;;
@@ -2964,24 +2965,38 @@ fn channel_add_fails_when_doctor_does() {
 }
 
 #[test]
-fn adding_signal_again_stops_the_daemons_signal_cli_first() {
+fn adding_signal_again_keeps_the_old_config_until_the_new_number_works() {
     let env = Env::new("channel-add-signal-again");
     env.init(&["--no-start"]);
     env.ok(&["config", "set", "signal.account", "\"+15550100\""]);
     env.calls();
     let steps = [
         ("Signal", "\n"),
-        ("Signal number", "+15550100\n"),
+        ("Signal number", "+15550199\n"),
         ("voice call", "n"),
     ];
-    let (code, shown) = env.on_a_driven_tty(&["channel", "add", "signal"], &steps);
-    assert_eq!(code, 0, "{shown}");
+    // The registration fails: nothing changed, and nothing was reloaded first.
+    let failing = [("SHIM_SETUP_EXIT", "1")];
+    let (code, shown) = env.on_a_driven_tty_env(&["channel", "add", "signal"], &steps, &failing);
+    assert_ne!(code, 0, "{shown}");
     let calls = env.calls();
-    let at = |argv: &[&str]| calls.iter().position(|c| ends(c, argv)).unwrap();
-    let setup = at(&["zephyr", "signal-setup", "register", "+15550100"]);
-    assert!(at(&["zephyr", "reload"]) < setup, "{calls:?}");
+    assert!(
+        calls
+            .iter()
+            .any(|c| ends(c, &["zephyr", "signal-setup", "register", "+15550199"])),
+        "{calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|c| ends(c, &["zephyr", "reload"])),
+        "{calls:?}"
+    );
     let cfg: toml::Value = toml::from_str(&env.config()).unwrap();
     assert_eq!(cfg["signal"]["account"].as_str(), Some("+15550100"));
+    // It works: the new number is written after it.
+    let (code, shown) = env.on_a_driven_tty(&["channel", "add", "signal"], &steps);
+    assert_eq!(code, 0, "{shown}");
+    let cfg: toml::Value = toml::from_str(&env.config()).unwrap();
+    assert_eq!(cfg["signal"]["account"].as_str(), Some("+15550199"));
 }
 
 #[test]

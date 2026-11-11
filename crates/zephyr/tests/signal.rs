@@ -388,6 +388,28 @@ async fn a_send_the_router_stopped_waiting_for_never_sends_a_piece_twice() {
 }
 
 #[tokio::test]
+async fn a_hold_stops_signal_cli_until_it_is_lifted_and_a_dead_one_is_ignored() {
+    let home = dir("hold");
+    let gw = start(config(&home, None, &[OWNER]));
+    gw.up().await;
+    let starts = || gw.log("start").len();
+    // A dead setup's hold (its pid is gone) holds nothing.
+    std::fs::write(gw.d.join(".hold"), "999999999").unwrap();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(std::fs::read_to_string(gw.d.join(".ok")).is_ok_and(|a| a == ACCOUNT));
+    assert_eq!(starts(), 1);
+    // A live one (this process's): signal-cli stops and lets the account go, and stays down.
+    std::fs::write(gw.d.join(".hold"), std::process::id().to_string()).unwrap();
+    wait(|| !gw.d.join(".ok").exists()).await;
+    tokio::time::sleep(Duration::from_millis(6000)).await; // past its 5 s restart backoff
+    assert_eq!(starts(), 1, "not started again while held");
+    std::fs::remove_file(gw.d.join(".hold")).unwrap();
+    gw.up().await;
+    assert_eq!(starts(), 2);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn sync_messages_and_our_own_are_ignored() {
     let home = dir("sync");
     // Even with our own ACI an owner, as when linked to the owner's own account.

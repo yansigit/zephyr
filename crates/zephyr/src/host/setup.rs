@@ -1362,14 +1362,9 @@ fn signal_add(
     if !super::quiet(h.exec(&[], &[], &["test", "-d", "/opt/zephyr/signal"])) {
         bail!("signal: not in this image (built with SIGNAL=0)");
     }
-    // The daemon's signal-cli holds the account's lock, which a second one would wait on for
-    // good: the table goes first (its owners stay), and the reload stops it.
-    let mut doc = h.data.load()?;
-    if doc.remove("signal").is_some() {
-        println!("stopping zephyr's signal-cli first: it holds the account");
-        h.data.save(&doc)?;
-        h.apply()?;
-    }
+    // Every question first; the config changes only once the new number works (the caller
+    // writes it), so a failure or Ctrl-C leaves the old one. The daemon's signal-cli lets the
+    // account go while `signal-setup` runs (its hold), and comes back after it.
     println!(
         "Zephyr needs a Signal number of its own: a second SIM or eSIM, or a VoIP or landline \
          number. Never your own Signal account: a device linked to it receives every \

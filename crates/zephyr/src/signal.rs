@@ -53,6 +53,9 @@ const NAMES: usize = 256;
 const ROOT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 /// Written in the data dir while the child is up and holds `account`; doctor reads it.
 const OK_FILE: &str = ".ok";
+/// Written by `zephyr signal-setup` while it registers or links, holding its pid: the daemon's
+/// signal-cli stops and lets the account go meanwhile.
+const HOLD_FILE: &str = ".hold";
 /// The most a setup step's signal-cli may take; `link` waits for a scan, so it gets 10 min.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(120);
 const LINK_TIMEOUT: Duration = Duration::from_secs(600);
@@ -330,7 +333,8 @@ impl Signal {
         let side = async {
             self.started().await;
             let mut every = tokio::time::interval(TRUST_EVERY);
-            loop {
+            // Until a setup holds the account: then this signal-cli goes.
+            while !held(&self.dir) {
                 every.tick().await;
                 self.trust().await;
             }
@@ -338,7 +342,10 @@ impl Signal {
         tokio::select! {
             (r, ()) = async { tokio::join!(reader, taker) } => r?,
             r = writer => r?,
-            () = side => {}
+            () = side => {
+                eprintln!("zephyr: signal-cli stops while zephyr signal-setup holds the account");
+                let _ = child.start_kill();
+            }
         }
         let status = child.wait().await?;
         eprintln!("zephyr: signal-cli exited ({status})");
@@ -522,6 +529,12 @@ impl Channel for Signal {
             );
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(BACKOFF_MAX);
+            while held(&self.dir) {
+                tokio::select! {
+                    _ = tokio::time::sleep(TRUST_EVERY) => {},
+                    _ = tx.closed() => return Ok(()),
+                }
+            }
         }
     }
 
@@ -702,6 +715,46 @@ async fn setup_run(
     Ok(())
 }
 
+/// Whether a live setup holds the account (`HOLD_FILE`). A hold whose setup is gone (killed with
+/// Ctrl-C) holds nothing and is removed, so it can never keep Signal down.
+fn held(dir: &Path) -> bool {
+    let file = dir.join(HOLD_FILE);
+    let Ok(pid) = std::fs::read_to_string(&file) else {
+        return false;
+    };
+    let live =
+        (pid.trim().parse::<u32>().ok()).is_some_and(|p| Path::new(&format!("/proc/{p}")).exists());
+    if !live {
+        let _ = std::fs::remove_file(&file);
+    }
+    live
+}
+
+/// Setup's hold on the account, from taking it until it is dropped.
+struct Hold(PathBuf);
+
+impl Hold {
+    fn take(dir: &Path) -> anyhow::Result<Self> {
+        let file = dir.join(HOLD_FILE);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&file)
+            .and_then(|mut f| {
+                std::io::Write::write_all(&mut f, std::process::id().to_string().as_bytes())
+            })?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Waits until the daemon's signal-cli let the account go (`.ok` gone), for at most 30 s.
 async fn released(dir: &Path) -> anyhow::Result<()> {
     for _ in 0..60 {
@@ -751,6 +804,9 @@ pub async fn setup(cfg: &crate::config::Config, args: &[String]) -> anyhow::Resu
                 )
                 .interact_text()?;
             private_dir(&dir)?;
+            // After every prompt but the code's: the daemon's signal-cli lets the account go
+            // for as long as this runs, and comes back when it ends, however it ends.
+            let _hold = Hold::take(&dir)?;
             released(&dir).await?;
             let mut rpc = Registrar::start(cfg)?;
             let asked = json!({"captcha": captcha.trim(), "voice": voice});
@@ -773,6 +829,7 @@ pub async fn setup(cfg: &crate::config::Config, args: &[String]) -> anyhow::Resu
         ["link"] => {
             println!("{WARNING}");
             private_dir(&dir)?;
+            let _hold = Hold::take(&dir)?;
             released(&dir).await?;
             // `link` takes no account: signal-cli learns it from the phone.
             let mut child = command(&cfg.signal_cli, &dir)
