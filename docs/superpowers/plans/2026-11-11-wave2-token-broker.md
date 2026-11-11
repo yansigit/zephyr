@@ -271,5 +271,29 @@ Each is in the code and in DESIGN §4.21 as built.
 - `ca.key` and `broker.key`: `Permission denied`. Writing to `/usr/local/share/ca-certificates`, `/etc/ssl/certs` and `/var/lib/zephyr-public/ca.pem`: `Permission denied`. `doctor`'s broker lines were all `ok`, and it listed the decrypted host.
 - The CA's key was the same after a container restart.
 - rpi's own client: with `api.anthropic.com` decrypted, `rpi -p` failed with `http transport error`; tunnelled again it got the provider's `401` for the dummy key. So spec open question 3(b) stays closed.
-- Seen and written down in §4.21 "What it does not stop": the echo host returned the real token in its reply body, which `exec`'s answer scrubbed and the command's `.procs` log did not.
+- Seen and written down in §4.21 "What it does not stop": the echo host returned the real token in its reply body, which `exec`'s answer scrubbed and the command's `.procs` log did not. Closed in the follow-up below.
 - The side container and its network were removed; the image was kept.
+
+## Follow-up: the echo leak (2026-11-11, asked for by the coordinator after the first report)
+
+The first build left a bound host that sends the token back as a documented limit. It defeats the broker's purpose, so it was closed instead. Spec §4.3 ("Reply bodies stream through untouched") no longer holds.
+
+- [x] **Replies from a decrypted host are swapped back** (`broker::Replacer`, `Map::unswapper`, `egress::Unswapped`): every value bound to that host, in headers, body and trailers, carried by this request or not. `Accept-Encoding: identity` replaces the client's; a reply that is encoded all the same is refused (`502 zephyr: HOST sent a reply zephyr cannot read (compressed)`, an audit row). The body streams, holding back only an end that could be the start of a value; `Content-Length` is dropped, so such replies reach the client chunked. Tests: `broker::tests::a_replacer_finds_a_value_however_the_stream_is_cut` (every cut point), `a_reply_gets_back_only_the_values_bound_to_its_host`, `egress::tests::decrypted::an_echo_from_a_bound_host_shows_the_stand_in_never_the_token` (a header, a body with a length, a chunked body cutting the value in two, a value this request did not carry, a gzip reply refused). The failing run came first, and it caught a real fault: a short value that is the start of a longer one was replaced too early.
+- [x] **A command's log is scrubbed as it is written** (`vault::scrub_stream`, `zephyr __scrublog`, `procs::spawn`, the hidden `Config::scrubber`). A process of the daemon's, not a task in it, so a command still outlives a re-exec or a crash. Tests: `vault::tests::a_commands_output_reaches_its_log_without_a_vault_value`, and against the real binary `tests/cli.rs` `a_commands_log_never_holds_a_vault_value`. The gateway answers, `process log` and the reports were already scrubbed where they are written; the log was the only agent-readable file holding raw output.
+- [x] **`tests/net_floor.rs`** finds the daemon after a re-exec too (`/proc/self/exe run`).
+- [x] DESIGN §4.13, §4.15, §4.21 and the README say what is still not covered.
+
+Deviations and limits of the follow-up:
+- In-process tests (`tests/router.rs`, the unit tests) leave `Config::scrubber` unset and write logs directly, as before; the scrubber is exercised by the real binary in `tests/cli.rs` and in the side container. The router test `an_exec_with_a_bound_token_runs_on_its_surrogate` still reads the stand-in from the log, which is not a vault value.
+- A held-back start of a value is let go after 250 ms with nothing more, in the log only; in a reply body it waits for the next frame or the end.
+- A scrubber that ends after a daemon re-exec stays a zombie until the daemon exits, and the wrapper then waits its full second (`shortcut:`).
+- Websocket frames after a `101` are still relayed unread, and a value sent back transformed (base64 in a page, hex, escaped) is not found by the proxy: both are in §4.21 "What it does not stop".
+- The docs of both fixes are in the first commit of the three.
+
+Results (image `zephyr-dev:a3-dc0115b`, container `zephyr-test-a3`, attach 18790, bridge; removed afterwards with its network, both images kept):
+- `cargo test --no-fail-fast`: 1199 passed, 0 failed, 19 ignored. `clippy -D warnings` clean, `cargo deny check advisories bans` ok.
+- `tests/token_broker.rs -- --ignored` passed: httpbin's `/basic-auth` answered 200 only for the real secret behind the stand-in, and `/get` showed the agent's curl, Node, Python and Chromium the stand-in where it used to show the secret.
+- The agent's `curl -H 'Accept-Encoding: gzip'` on the echo: `"X-Key": "zsur_…"`, `"key": "zsur_…"`, and the server saw `Accept-Encoding: identity`.
+- `https://httpbin.org/gzip`, which compresses whatever is asked: `502 zephyr: httpbin.org sent a reply zephyr cannot read (compressed)`, with a `swap … refused` audit row.
+- `exec` with the bound vault token (scripted rpi stand-in): the answer showed `[vault:A3_TOKEN]`, the `.procs` logs held `A3_TOKEN=zsur_…` and `"X-Key": "zsur_…"`, and no file under `/zephyr` held either real value.
+- `tests/net_floor.rs -- --ignored` passed twice: on a fresh daemon, and after the daemon had re-exec'd itself.

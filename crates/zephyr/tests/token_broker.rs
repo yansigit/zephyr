@@ -17,8 +17,9 @@
 //! cargo test -p zephyr --test token_broker -- --ignored
 //! ```
 //!
-//! `ZEPHYR_TEST_ECHO` names another echo host than httpbin.org (one answering `/get` with the
-//! request's `args` and `headers`), and `ZEPHYR_TEST_SECRET` another value.
+//! `ZEPHYR_TEST_ECHO` names another httpbin than httpbin.org (`/get` answers with the request's
+//! `args` and `headers`, `/basic-auth/USER/PASSWORD` checks a Basic credential), and
+//! `ZEPHYR_TEST_SECRET` another value.
 
 use std::process::{Command, Output};
 
@@ -115,26 +116,43 @@ fn the_agent_holds_stand_ins_and_the_proxy_swaps_them_only_where_bound() {
     let rewritten = side.agent(&["sh", "-c", "echo x >> /var/lib/zephyr-public/ca.pem"]);
     assert!(!rewritten.status.success());
 
-    // On the bound host the echo sees the real secret, in a header and in the URL, and the
-    // certificate the client saw is the broker's. Each client finds the CA its own way.
+    // On the bound host the server gets the real secret: it checks a Basic password against
+    // its path, and says yes only when the proxy put the secret in for the stand-in.
+    let checked = |password: &str| {
+        side.sh(&format!(
+            "curl -sS -m 60 -o /dev/null -w '%{{http_code}}' -u 'user:{stand_in}' 'https://{echo}/basic-auth/user/{password}'"
+        ))
+    };
+    assert_eq!(checked(&secret).trim(), "200");
+    assert_eq!(checked("another-password").trim(), "401");
+    // And the agent never sees it, though this server sends back all it was sent, in a header
+    // and in the URL: in the reply the secret is the stand-in again. The certificate the
+    // client saw is the broker's. Each client finds the CA its own way.
     let url = format!("https://{echo}/get?key={stand_in}");
     let curl = side.sh(&format!("curl -sS -m 60 -v -H 'X-Key: {stand_in}' '{url}'"));
     assert!(curl.contains("zephyr token broker"), "{curl}");
-    assert_eq!(
-        curl.matches(&secret).count(),
-        3,
-        "header, args and url: {curl}"
+    assert!(
+        curl.contains(&format!("\"X-Key\": \"{stand_in}\"")),
+        "{curl}"
     );
+    assert!(curl.contains(&format!("\"key\": \"{stand_in}\"")), "{curl}");
+    assert!(!curl.contains(&secret), "{curl}");
     let node = format!(
         "node -e \"fetch('{url}', {{headers: {{'x-key': '{stand_in}'}}}}).then(r => r.text()).then(console.log)\""
     );
     let node = side.sh(&node);
-    assert!(node.contains(&secret), "node: {node}");
+    assert!(
+        node.contains(stand_in) && !node.contains(&secret),
+        "node: {node}"
+    );
     let python = format!(
         "python3 -c \"import urllib.request as u; print(u.urlopen(u.Request('{url}', headers={{'X-Key': '{stand_in}'}}), timeout=60).read().decode())\""
     );
     let python = side.sh(&python);
-    assert!(python.contains(&secret), "python: {python}");
+    assert!(
+        python.contains(stand_in) && !python.contains(&secret),
+        "python: {python}"
+    );
     // git has no repository there; what matters is that it got an HTTP answer, not a
     // certificate error.
     let git = side.sh(&format!(
@@ -152,7 +170,10 @@ fn the_agent_holds_stand_ins_and_the_proxy_swaps_them_only_where_bound() {
     let opened = side.sh(&format!("agent-browser open '{url}' 2>&1"));
     let page = side.sh("agent-browser get text body 2>&1");
     let _ = side.sh("agent-browser close 2>&1");
-    assert!(page.contains(&secret), "chromium: {opened}\n{page}");
+    assert!(
+        page.contains(stand_in) && !page.contains(&secret),
+        "chromium: {opened}\n{page}"
+    );
 
     // Anywhere else the stand-in is refused, by name, and audited; nothing is sent.
     let refused = side.sh(&format!(
