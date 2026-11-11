@@ -1461,8 +1461,9 @@ pub(crate) fn moved(site: &str, now: Option<&str>, done: &[&str]) -> Option<Stri
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Typed {
     Ok,
-    /// The page was not on the site when the value was about to be typed: its origin then.
-    /// Nothing was typed.
+    /// The page was not on the site when the value was about to be typed: its origin then
+    /// (a card: nothing was typed), or its address (a login, [`fill_login`]: the value may
+    /// have reached it).
     Moved(String),
     /// No field in the page's own document matches the selector: it is not there, or it is
     /// inside a frame, which is never typed into (a frame is another site's document).
@@ -1529,31 +1530,13 @@ pub(crate) async fn type_into(cfg: &Config, site: &str, selector: &str, value: &
         return Typed::Failed("the site is no http(s) address".into());
     };
     let mut script = type_script(&want, selector, value);
-    let mut input = json!([["frame", "main"], ["eval", script]])
-        .to_string()
-        .into_bytes();
+    let steps = batch(cfg, &(("frame", "main"), ("eval", &script)), value).await;
     wipe_str(&mut script);
-    let args = ["batch", "--json", "--omit-command", "--bail"];
-    let out = browser_with(cfg, &args, Some(&input)).await;
-    wipe(&mut input);
-    let out = match out {
-        Ok(out) => out,
-        Err(e) => return Typed::Failed(e.replace(value, "[the value]")),
+    let steps = match steps {
+        Ok(steps) => steps,
+        Err(e) => return Typed::Failed(e),
     };
-    let steps: Vec<Value> = serde_json::from_str(out.trim()).unwrap_or_default();
-    let said = |i: usize| -> Result<&Value, String> {
-        let step = steps.get(i).ok_or("agent-browser gave no answer")?;
-        match step["success"].as_bool() {
-            Some(true) => Ok(&step["result"]),
-            _ => Err(step["error"]
-                .as_str()
-                .unwrap_or("it failed")
-                .chars()
-                .take(300)
-                .collect()),
-        }
-    };
-    let typed = said(0).and_then(|_| said(1));
+    let typed = said(&steps, 0).and_then(|_| said(&steps, 1));
     match typed.map(|r| r["result"].as_str().unwrap_or_default().to_string()) {
         Ok(r) if r == "ok" => Typed::Ok,
         Ok(r) if r == "missing" || r == "frame" => Typed::Missing,
@@ -1562,7 +1545,51 @@ pub(crate) async fn type_into(cfg: &Config, site: &str, selector: &str, value: &
             Some(on) => Typed::Moved(on.chars().take(200).collect()),
             None => Typed::Failed("agent-browser gave no answer".into()),
         },
-        Err(e) => Typed::Failed(e.replace(value, "[the value]")),
+        Err(e) => Typed::Failed(e.into()),
+    }
+}
+
+/// Types a login's `value` into `selector` with agent-browser's own `fill`, which takes its
+/// refs (`@e2`), Playwright selectors and fields in a shadow root, as [`type_into`] does: on
+/// standard input, `[["get","url"],["fill",SELECTOR,VALUE]]`. The address read right before
+/// the fill, in the same batch, is the origin check; off the site it is `Moved`, its address.
+async fn fill_login(cfg: &Config, site: &str, selector: &str, value: &str) -> Typed {
+    let steps = match batch(cfg, &(("get", "url"), ("fill", selector, value)), value).await {
+        Ok(steps) => steps,
+        Err(e) => return Typed::Failed(e),
+    };
+    let url = match said(&steps, 0) {
+        Ok(r) => r["url"].as_str().unwrap_or_default(),
+        Err(e) => return Typed::Failed(e.into()),
+    };
+    if !same_origin(site, url) {
+        return Typed::Moved(url.into());
+    }
+    match said(&steps, 1) {
+        Ok(_) => Typed::Ok,
+        Err(e) => Typed::Failed(e.into()),
+    }
+}
+
+/// Runs `commands` (which hold `value`) as one agent-browser 0.41 `batch` on its standard
+/// input, stopping at a failed step (`--bail`); `--omit-command` keeps the commands out of
+/// what it prints. Its steps' answers, or why it did not run, the value replaced.
+async fn batch(cfg: &Config, commands: &impl Serialize, value: &str) -> Result<Vec<Value>, String> {
+    let mut input = serde_json::to_vec(commands).map_err(|e| e.to_string())?;
+    let args = ["batch", "--json", "--omit-command", "--bail"];
+    let out = browser_with(cfg, &args, Some(&input)).await;
+    wipe(&mut input);
+    let out = out.map_err(|e| e.replace(value, "[the value]"))?;
+    Ok(serde_json::from_str(out.trim()).unwrap_or_default())
+}
+
+/// Step `i`'s result. A failed step's error is the browser's or the page's to word, so the
+/// agent is told only that it failed.
+fn said(steps: &[Value], i: usize) -> Result<&Value, &'static str> {
+    let step = steps.get(i).ok_or("agent-browser gave no answer")?;
+    match step["success"].as_bool() {
+        Some(true) => Ok(&step["result"]),
+        _ => Err("the page refused the value"),
     }
 }
 
@@ -1581,9 +1608,9 @@ pub(crate) fn not_typed(typed: &Typed, label: &str) -> Option<String> {
 }
 
 /// Types the login's fields into the page open in agent-browser, once the page is on its site.
-/// Each value is typed by a script that checks the page's origin itself first (`type_into`),
-/// so a redirect in the moment before a fill gets nothing; the address is read again after
-/// each field, so a page that moves away gets no further field.
+/// Each value is typed by agent-browser's own `fill` right after the page's address is read,
+/// in one batch (`fill_login`); the address is read again after each field, so a page that
+/// moves away gets no further field.
 async fn fill(cfg: &Config, login: &Entry, selectors: [Option<String>; 3]) -> String {
     let fields = match fields(login, &selectors, crate::now() as u64) {
         Ok(f) => f,
@@ -1612,7 +1639,11 @@ async fn fill(cfg: &Config, login: &Entry, selectors: [Option<String>; 3]) -> St
     let mut done: Vec<&str> = Vec::new();
     for (label, sel, value) in &fields {
         // On standard input, never an argument: any uid can read a process's arguments.
-        let typed = type_into(cfg, &login.site, sel, value).await;
+        let typed = fill_login(cfg, &login.site, sel, value).await;
+        if let Typed::Moved(now) = &typed {
+            done.push(label);
+            return moved(&login.site, Some(now), &done).unwrap_or_default();
+        }
         if let Some(e) = not_typed(&typed, label) {
             let done = match done.is_empty() {
                 true => String::new(),
