@@ -249,6 +249,7 @@ fn status_shows_the_main_child_the_waiting_message_and_the_replies() {
         platform_msg_id: "1".into(),
         sender: "owner".into(),
         text: "hi".into(),
+        derived: None,
     };
     store.insert_inbox(&m).unwrap();
     for text in ["one", "two", "three"] {

@@ -1826,6 +1826,7 @@ impl<'a> Router<'a> {
             platform_msg_id: String::new(),
             sender: crate::attach::sender(crate::attach::rows(channel)).into(),
             text: text.clone(),
+            derived: None,
         };
         // The caller has decided who may approve here: a signature, or (the notification's
         // button, the TUI) what that client may do unsigned.
@@ -2129,6 +2130,7 @@ impl<'a> Router<'a> {
             tries: 0,
             platform_id: m.platform_msg_id,
             owner: true,
+            derived: None,
         };
         if reply.is_empty() {
             // A `/btw` whose answer its task posts.
@@ -5204,6 +5206,7 @@ impl<'a> Router<'a> {
                 platform_msg_id: format!("retry-{}-{n}", row.id),
                 sender: row.sender.clone(),
                 text: row.text.clone(),
+                derived: None,
             };
             match self.store.insert_inbox(&again) {
                 Ok(Some(id)) => break id,
@@ -5781,6 +5784,7 @@ mod tests {
             platform_msg_id: format!("ok-{id}"),
             sender: "owner".into(),
             text: format!("/ok {id}"),
+            derived: None,
         };
         r.inbound(m, false, None).await;
         let sent = r.store.pending_outbox().unwrap();
@@ -5904,6 +5908,7 @@ mod tests {
             tries: 0,
             platform_id: "p".into(),
             owner: true,
+            derived: None,
         };
         for text in ["hi", "", "[a #1] nested\nlines"] {
             assert_eq!(
@@ -5970,6 +5975,7 @@ mod tests {
             platform_msg_id: "a".into(),
             sender: "owner".into(),
             text: "in flight".into(),
+            derived: None,
         };
         let id = r.store.insert_inbox(&m).unwrap().unwrap();
         r.store.mark_dispatched(id).unwrap();

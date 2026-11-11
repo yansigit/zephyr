@@ -168,6 +168,7 @@ impl Gateway {
             platform_msg_id: id.into(),
             sender: sender.into(),
             text: text.into(),
+            derived: None,
         };
         self.feeds[channel].send(m).await.unwrap();
     }
@@ -406,6 +407,7 @@ async fn restart_with_dispatched_rows_resends_only_what_the_session_lacks() {
                 platform_msg_id: id.into(),
                 sender: "owner".into(),
                 text: text.into(),
+                derived: None,
             })
             .unwrap()
             .unwrap();
@@ -418,6 +420,7 @@ async fn restart_with_dispatched_rows_resends_only_what_the_session_lacks() {
             tries: 1,
             platform_id: id.into(),
             owner: false,
+            derived: None,
         });
     }
     // Row b is already in the session, answered.
@@ -593,6 +596,7 @@ async fn outbox_rows_for_unconfigured_channels_stay_pending() {
             platform_msg_id: "x".into(),
             sender: "owner".into(),
             text: "hi".into(),
+            derived: None,
         })
         .unwrap()
         .unwrap();
@@ -604,6 +608,7 @@ async fn outbox_rows_for_unconfigured_channels_stay_pending() {
         tries: 0,
         platform_id: "x".into(),
         owner: false,
+        derived: None,
     };
     store.reply(&row, "stranded", "done").unwrap();
     drop(store);
@@ -1456,6 +1461,7 @@ async fn a_run_cut_off_by_a_restart_taints_its_conversation() {
             platform_msg_id: "a".into(),
             sender: "owner".into(),
             text: "in flight".into(),
+            derived: None,
         })
         .unwrap()
         .unwrap();
@@ -4595,6 +4601,7 @@ async fn a_message_sent_mid_tool_is_steered_in_and_answered_before_the_run_ends(
         tries: 1,
         platform_id: "m2".into(),
         owner: true,
+        derived: None,
     };
     assert_eq!(
         gw.wait_replies(2).await,
@@ -4864,6 +4871,7 @@ async fn a_continuation_waiting_at_a_restart_still_goes_as_one() {
             platform_msg_id: "m1".into(),
             sender: "owner".into(),
             text: "[unfinished] research".into(),
+            derived: None,
         })
         .unwrap()
         .unwrap();
@@ -7297,7 +7305,7 @@ fn old_install(home: &Path) {
     )
     .unwrap();
     db.execute_batch(&format!(
-        "DROP TABLE web_push; DROP TABLE web_sessions; DROP TABLE web_passkeys; DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin; ALTER TABLE inbox DROP COLUMN owner; {V16} PRAGMA user_version = 15;"
+        "ALTER TABLE inbox DROP COLUMN derived; DROP TABLE web_push; DROP TABLE web_sessions; DROP TABLE web_passkeys; DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin; ALTER TABLE inbox DROP COLUMN owner; {V16} PRAGMA user_version = 15;"
     ))
         .unwrap();
 }

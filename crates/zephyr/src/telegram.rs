@@ -634,6 +634,7 @@ fn sort(u: Update) -> Sorted {
         platform_msg_id: format!("{}-{}", m.chat.id, m.message_id),
         sender: from.id.to_string(),
         text,
+        derived: None,
     };
     Sorted::Row(row, docs, name(&from))
 }
@@ -691,6 +692,7 @@ mod tests {
                 platform_msg_id: "55-7".into(),
                 sender: "55".into(),
                 text: "hi".into(),
+                derived: None,
             }
         );
         assert!(docs.is_empty());

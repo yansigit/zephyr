@@ -164,6 +164,7 @@ fn to_inbound(env: &Value, account: &str, own: Option<&str>) -> Option<(Inbound,
         platform_msg_id: format!("{from}-{ts}"),
         sender: from.into(),
         text: text.into(),
+        derived: None,
     };
     Some((row, files))
 }

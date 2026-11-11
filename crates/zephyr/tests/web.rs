@@ -751,6 +751,7 @@ impl Gateway {
             platform_msg_id: format!("m{n}"),
             sender: "owner".into(),
             text: text.into(),
+            derived: None,
         };
         self.say.send(m).await.unwrap();
     }

@@ -3744,6 +3744,7 @@ table inet zephyr {
                 platform_msg_id: "m1".into(),
                 sender: "owner-1".into(),
                 text: "hi".into(),
+                derived: None,
             };
             store.insert_inbox(&said).unwrap();
             let row = store.inbox_with_status("new").unwrap().remove(0);

@@ -73,6 +73,7 @@ impl Channel for ChatChannel {
                         platform_msg_id: id.into(),
                         sender: uid.clone(),
                         text: text.into(),
+                        derived: None,
                     };
                     if tx.send(m).await.is_err() {
                         break;

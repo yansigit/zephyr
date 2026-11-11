@@ -300,6 +300,7 @@ pub(crate) mod tests {
             platform_msg_id: "7".into(),
             sender: "2".into(),
             text: String::new(),
+            derived: None,
         };
         let (mut first, mut again) = (row(), row());
         append(&live, &mut first, vec![file()]).await;
@@ -329,6 +330,7 @@ pub(crate) mod tests {
             platform_msg_id: "G".into(),
             sender: "+1".into(),
             text: "look".into(),
+            derived: None,
         };
         let f = File {
             name: "a.pdf".into(),
@@ -370,6 +372,7 @@ pub(crate) mod tests {
             platform_msg_id: "u-1".into(),
             sender: sender.into(),
             text: String::new(),
+            derived: None,
         };
         let live = live(&home, "signal = ['u']");
         let mut stranger = row("x");

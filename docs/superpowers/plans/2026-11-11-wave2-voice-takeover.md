@@ -70,14 +70,14 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
   ```
 - `insert_inbox_as` stores `m.derived`. `/retry`'s `copy_owner` also copies `derived`.
 
-- [ ] **Step 1: Failing tests** in `store.rs`:
+- [x] **Step 1: Failing tests** in `store.rs`:
   - extend `older_databases_migrate_in_order_and_keep_their_rows`: `const V19: &str = "ALTER TABLE inbox DROP COLUMN derived;"` first in the undo chain, the case `(18, "")`, and after the reopen assert a row inserted with `derived: Some("voice".into())` reads back so and one without reads `None`;
   - `a_retried_voice_row_is_still_derived`.
   - `old_install` in `tests/router.rs` drops `derived` before stamping v15.
-- [ ] **Step 2: Run** `cargo test -p zephyr --lib store::` → FAIL.
-- [ ] **Step 3: Implement** the `if version < 19` block and the field; add `derived: None` to every literal.
-- [ ] **Step 4: Run** `cargo test -p zephyr` → PASS.
-- [ ] **Step 5: Commit** `feat(store): mark an inbox row whose text holds a transcript, in schema v19`.
+- [x] **Step 2: Run** `cargo test -p zephyr --lib store::` → FAIL.
+- [x] **Step 3: Implement** the `if version < 19` block and the field; add `derived: None` to every literal.
+- [x] **Step 4: Run** `cargo test -p zephyr` → PASS.
+- [x] **Step 5: Commit** `feat(store): mark an inbox row whose text holds a transcript, in schema v19`.
 
 ### Task C2-2: `voice.rs`: the transcription pipeline, as `nobody`
 

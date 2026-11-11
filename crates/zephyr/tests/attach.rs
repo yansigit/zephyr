@@ -109,6 +109,7 @@ impl Gateway {
             platform_msg_id: id.into(),
             sender: "owner".into(),
             text: text.into(),
+            derived: None,
         };
         self.chat.send(m).await.unwrap();
     }
