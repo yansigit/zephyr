@@ -358,7 +358,7 @@ fn finish(name: &str, (next, place): (Next, Place), env: &Env, args: &[String]) 
 
 /// A wrapper's shared lock on the desktop while its command runs; `None` only for what takes
 /// none (help, the version, a refusal).
-type Place = Option<std::fs::File>;
+type Place = Option<crate::desktop::Locked>;
 
 /// What a command is refused with when root's lock file is not there: with no place to hold, a
 /// take would have nothing to wait for, so nothing runs, as with no gate.
@@ -384,7 +384,7 @@ fn place(env: &Env) -> Result<Place, String> {
         Err(_) => Err(()),
         // SAFETY: a plain syscall on a descriptor this closure owns.
         Ok(f) => match unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } {
-            0 => Ok(Some(f)),
+            0 => Ok(Some(crate::desktop::Locked(f))),
             _ => Err(()),
         },
     };
@@ -2307,8 +2307,12 @@ cat "$d/$f.json"
         // Help and the version touch no page, and take none.
         assert!(decide(&["--version".to_string()], &t.env).1.is_none());
         assert!(!alone(libc::LOCK_EX));
+        // A fork that has yet to exec (a thread of this process starting a program) shares the
+        // place's descriptor, as this copy does: the place ends with its command all the same.
+        let fork = place.as_ref().map(|p| p.0.try_clone().unwrap());
         drop(place);
         assert!(alone(libc::LOCK_EX), "the place outlived its command");
+        drop(fork);
         assert!(gate.try_recv().is_err(), "the gate was asked");
         // The owner has the desktop: no place, with no flag to say so either; the gate does.
         let env = t.env.clone();
