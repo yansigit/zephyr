@@ -1115,6 +1115,16 @@ impl Store {
         Ok((n == 1).then(|| self.db.last_insert_rowid()))
     }
 
+    /// Whether the inbox holds `channel`'s message `platform_msg_id`, whatever its status: an
+    /// adapter confirms a message to its platform only once the router stored it.
+    pub fn has_inbox(&self, channel: &str, platform_msg_id: &str) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM inbox WHERE channel = ?1 AND platform_msg_id = ?2)",
+            params![channel, platform_msg_id],
+            |r| r.get(0),
+        )
+    }
+
     /// Row `to` is as much the owner's as row `from` (a `/retry` of it).
     pub fn copy_owner(&self, from: i64, to: i64) -> rusqlite::Result<()> {
         self.db.execute(

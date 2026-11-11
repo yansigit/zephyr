@@ -30,6 +30,8 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const TYPING_EVERY: Duration = Duration::from_secs(4);
 const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const MAX_NAMES: usize = 1000;
+/// How long a batch's rows may take to be stored before it is fetched again.
+const STORED_WITHIN: Duration = Duration::from_secs(60);
 
 /// The Bot API for one token. No `Debug`: it holds the token.
 #[derive(Clone)]
@@ -230,23 +232,58 @@ impl Telegram {
             "allowed_updates": ["message", "my_chat_member"],
         });
         let updates = self.api.json("getUpdates", body).await?;
+        let (mut next, mut rows) = (*offset, Vec::new());
         for u in updates.as_array().into_iter().flatten() {
             let Some(id) = u["update_id"].as_i64() else {
                 continue;
             };
-            self.take(u, tx).await;
-            *offset = (*offset).max(id + 1);
+            rows.extend(self.take(u, tx).await);
+            next = next.max(id + 1);
         }
+        // Telegram counts the batch taken at the next call carrying `next`: only once the
+        // router stored every row of it, so a crash before then re-delivers it.
+        self.stored(rows).await?;
+        *offset = next;
         Ok(())
     }
 
-    async fn take(&self, u: &Value, tx: &mpsc::Sender<Inbound>) {
+    /// Waits until the router stored each of `rows` (platform ids), for at most a minute. The
+    /// database is read on a blocking thread, never this one.
+    async fn stored(&self, rows: Vec<String>) -> anyhow::Result<()> {
+        let Some(db) = self.live.get().map(|rx| rx.borrow().db_path()) else {
+            return Ok(()); // before the router: nothing was sent to it
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        tokio::task::spawn_blocking(move || {
+            let store = crate::store::Store::open(&db)?;
+            let deadline = Instant::now() + STORED_WITHIN;
+            for id in &rows {
+                while !store.has_inbox("telegram", id)? {
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "telegram message {id} was not stored within a minute; it comes again"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            Ok(())
+        })
+        .await?
+    }
+
+    /// The platform id of the row `u` became, if one went to the router.
+    async fn take(&self, u: &Value, tx: &mpsc::Sender<Inbound>) -> Option<String> {
         let update = match Update::deserialize(u) {
             Ok(update) => update,
-            Err(e) => return eprintln!("zephyr: telegram update not understood: {e}"),
+            Err(e) => {
+                eprintln!("zephyr: telegram update not understood: {e}");
+                return None;
+            }
         };
         match sort(update) {
-            Sorted::Skip => {}
+            Sorted::Skip => None,
             Sorted::Leave(chat) => {
                 let left = self.api.json("leaveChat", json!({"chat_id": chat})).await;
                 match left {
@@ -255,13 +292,15 @@ impl Telegram {
                     ),
                     Err(e) => eprintln!("zephyr: telegram: could not leave group {chat}: {e:#}"),
                 }
+                None
             }
             Sorted::Row(mut row, docs, name) => {
                 self.remember(&row.sender, name);
                 let files = self.files(&row, docs).await;
                 crate::inbox::append(&self.live, &mut row, files).await;
+                let id = row.platform_msg_id.clone();
                 // A closed receiver means run() is returning; the error comes from there.
-                let _ = tx.send(row).await;
+                tx.send(row).await.ok().map(|()| id)
             }
         }
     }

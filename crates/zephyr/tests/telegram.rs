@@ -461,6 +461,7 @@ async fn an_owner_is_answered_in_chunks_with_files() {
     let order = methods(&bot);
     let at = |m: &str| order.iter().position(|x| x == m).unwrap();
     let typing = calls(&bot, "sendChatAction");
+    assert!(!typing.is_empty(), "no typing: {order:?}");
     assert_eq!(typing[0], json!({"chat_id": 55, "action": "typing"}));
     let notes: Vec<Value> = calls(&bot, "sendMessage")
         .into_iter()
@@ -735,6 +736,37 @@ async fn the_token_never_shows() {
     let e = Telegram::new(&gone, &api).err().unwrap();
     assert!(e.to_string().contains("ZEPHYR_TELEGRAM_IT_UNSET"));
     assert_eq!(up.me().await.unwrap(), "@zephyr_test_bot");
+}
+
+#[tokio::test]
+async fn an_update_is_confirmed_only_once_its_row_is_stored() {
+    let home = home("stored");
+    let (api, bot) = stub().await;
+    push(&bot, [text(10, 55, 1, "one")]);
+    let cfg = config(&home, &api, "");
+    let tg = Arc::new(adapter(&cfg));
+    tg.live(tokio::sync::watch::channel(Arc::new(cfg.clone())).1);
+    // No router: the row reaches the channel, and nothing stores it until the test does.
+    let (tx, mut rx) = mpsc::channel(16);
+    let run = {
+        let tg = tg.clone();
+        tokio::spawn(async move { tg.run(tx).await })
+    };
+    let row = rx.recv().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let offsets = |bot: &Stub| -> Vec<i64> {
+        calls(bot, "getUpdates")
+            .iter()
+            .map(|b| b["offset"].as_i64().unwrap())
+            .collect()
+    };
+    assert!(offsets(&bot).iter().all(|o| *o == 0), "{:?}", offsets(&bot));
+    Store::open(&cfg.db_path())
+        .unwrap()
+        .insert_inbox_as(&row, "new")
+        .unwrap();
+    wait(|| offsets(&bot).contains(&11)).await;
+    run.abort();
 }
 
 #[tokio::test]
