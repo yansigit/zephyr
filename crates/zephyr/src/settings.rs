@@ -488,6 +488,18 @@ pub static SETTINGS: &[Setting] = &[
         Apply::Toml,
     ),
     row(
+        "browser.pace_ms",
+        "Browser",
+        "Pace (ms)",
+        "The least time between two of the agent's navigations or clicks on one site, in \
+         milliseconds, with up to half again at random; 0 is off.",
+        Kind::Int { min: 0, max: 60000 },
+        Access::Tighten,
+        false,
+        Stricter::Higher,
+        Apply::Toml,
+    ),
+    row(
         "facts",
         "Approvals",
         "Private facts",
@@ -1015,6 +1027,7 @@ pub fn value(cfg: &Config, key: &str) -> Option<String> {
         "voice.reply" => Some(cfg.voice().reply),
         "voice.languages" => Some(cfg.voice().languages.join(", ")),
         "voice.max_secs" => Some(cfg.voice().max_secs.to_string()),
+        "browser.pace_ms" => Some(cfg.pace_ms().to_string()),
         key if key.starts_with("approvals.") => {
             crate::approvals::value(cfg, &key["approvals.".len()..])
         }
@@ -1831,6 +1844,24 @@ mod tests {
             decide(cost, &Actor::Internal, true, &strong()),
             Verdict::Apply
         );
+    }
+
+    /// DESIGN §4.24: the agent may slow its own browsing at once, and only propose speeding up.
+    #[test]
+    fn the_pace_row_parses_and_the_agent_only_raises_it() {
+        let s = find("browser.pace_ms").unwrap();
+        assert_eq!((s.section, s.strong), ("Browser", false));
+        assert!(parse(s, "0").is_ok() && parse(s, "60000").is_ok());
+        assert!(parse(s, "60001").is_err() && parse(s, "-1").is_err());
+        let cfg: Config = toml::from_str("rpi = '/r'\nhome = '/h'").unwrap();
+        assert_eq!(value(&cfg, "browser.pace_ms").as_deref(), Some("1500"));
+        let agent = Actor::Agent { session: "main" };
+        let raise = loosens(s, Some("1500"), Some("3000"));
+        assert_eq!(decide(s, &agent, raise, &strong()), Verdict::Apply);
+        let lower = loosens(s, Some("1500"), Some("0"));
+        assert_eq!(decide(s, &agent, lower, &strong()), Verdict::Propose);
+        let discord = Actor::Owner { channel: "discord" };
+        assert_eq!(decide(s, &discord, lower, &strong()), Verdict::Apply);
     }
 
     #[test]

@@ -270,7 +270,7 @@ goes back by itself and you are told. The agent can read all of them. What it ma
 
 | Setting | The agent may |
 |---|---|
-| `tasks.parallel`, `mcp.NAME.enabled` (a connector off), `settings.strong_channels` (remove a channel), the `budget.*` limits, the `approvals.*` modes and preset, `approvals.strong_only` (add `money`), `mcp.NAME.classes.TOOL` (put a tool in a class) | make it stricter at once (lower, off, fewer channels, a limit where there was none, a stricter mode or preset); you are told and `/set KEY OLD` puts it back. Its `/set` takes one word, so it can tighten approvals to `ask` but not to `delay 10` |
+| `tasks.parallel`, `browser.pace_ms` (raise it), `mcp.NAME.enabled` (a connector off), `settings.strong_channels` (remove a channel), the `budget.*` limits, the `approvals.*` modes and preset, `approvals.strong_only` (add `money`), `mcp.NAME.classes.TOOL` (put a tool in a class) | make it stricter at once (lower, off, fewer channels, a limit where there was none, a stricter mode or preset); you are told and `/set KEY OLD` puts it back. Its `/set` takes one word, so it can tighten approvals to `ask` but not to `delay 10` |
 | `model`, `thinking`, `tasks.model`, `timezone`, `auth.*`, `approvals.currency`, `network.allow`, subagents, rules, removing a private fact or allowing it a target, and any change of the above that loosens | propose it: a card shows `KEY old → new` (or the exact `/subagent` or `/rule` text, up to 1500 characters), and `/ok N` applies it, `/no N` drops it |
 | `owners`, `[discord]`, `[imessage]`, `[telegram]`, `[signal]`, `[attach]`, `[web]`, `[agent]`, `extensions`, `policy_plugin`, `rpi`, `home`, `state`, the `[[account]]` pool | nothing; edit `zephyr.toml` |
 
@@ -802,6 +802,14 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   across restarts. It is the agent's, never yours, and holds only the sign-ins you give it: through
   [the vault](#the-vault), or by hand (below).
   A site that still blocks it gets Camoufox, a stealth Firefox, which keeps no sign-ins.
+- **Pacing.** The agent's navigations and clicks on one site (`www.amazon.co.uk` and
+  `smile.amazon.co.uk` are one) go at least `browser.pace_ms` apart, 1500 ms unless you set it,
+  plus up to half again at random, however many of its tasks browse at once: a burst of commands
+  is what gets accounts flagged as bots. `/set browser.pace_ms 3000` slows it, `0` turns it off;
+  the agent may slow it itself, and only propose speeding it up. With pacing on, a `batch` holds
+  at most one navigation. Upgrading writes nothing for it: `[browser]` is in `zephyr.toml` only
+  once you set the key, and a 0.9.0 image pinned back by hand refuses a file that has it
+  (`zephyr upgrade 0.9.0` restores the file it backed up).
 - **Python.** A read-only environment first on the agent's PATH (`/opt/zephyr/py`: requests,
   beautifulsoup4, pandas, pypdf, pillow, Camoufox), locked in `deploy/python/uv.lock`, plus `uv` for
   anything else (`uv run --with`, or a venv of its own; uv's cache lives in `~/.zephyr/.cache/uv`).

@@ -945,6 +945,7 @@ One registry (`settings.rs`, a static table `SETTINGS`) describes every setting 
   | `voice.reply` | Voice | `off`, `mirror` (default: a reply to a voice note is also spoken) or `always` (§4.3) | propose | no |
   | `voice.languages` | Voice | a list of whisper's language codes, default `ko, en`; a note detected as another is run again as the first | propose | no |
   | `voice.max_secs` | Voice | 10 to 900, default 300: a longer note is not transcribed | propose | no |
+  | `browser.pace_ms` | Browser | 0 to 60000, default 1500, 0 is off; higher is stricter: the least gap between the agent's navigations or clicks on one site (§4.24) | tighten | no |
   | `approvals.preset` | Approvals | `manual`, `semi`, `full`, strictest first; written with the hand-set classes it drops (§4.16) | tighten | yes |
   | `approvals.messages`, `approvals.posts` | Approvals | `ask`, `ask-new`, `delay N` (1 to 60), `auto`, or `none` for the preset's | tighten | yes |
   | `approvals.money` | Approvals | `ask`, `delay N`, `auto N` (a cap), `auto`, or `none` | tighten | yes |
@@ -1162,6 +1163,13 @@ No pandoc (194.6 MB); `fonts-nanum` (33.3 MB) also fixes Hangul in the browser's
 - **Removing one:** `/skill rm NAME` commits the removal; the record stays, so no later start or image adds it back. `/skill undo NAME` brings it back (a `skill: seed …` commit starts with `skill: `, so undo walks it), and an untouched copy then takes later updates again.
 - **The agent editing one is not trusted:** `prepare` rewrites `~/.approved/skills/` from `<state>/skills` at every child start, and `seed` reads only `Config::starter_skills` and `<state>`, never the agent's home. An improvement the agent writes in `skills/drafts/NAME/` is a draft like any other: shown as a diff against the seeded copy, approved only by `/skill ok`.
 - `zephyr.toml` is never written; no schema version.
+
+### 4.24 Browser pacing
+
+A per-site least gap between the agent's browser navigations and clicks, so that a loop, a script or a batch never hits a site faster than a person would: sites' bot checks shut accounts for less. A courtesy to sites, not a guard (§4.16 is the guard).
+
+- **The setting.** `browser.pace_ms` (`[browser] pace_ms`, `Config::browser`, `deny_unknown_fields`; §4.17's row): 0 to 60000 ms, 0 is off, higher is stricter, the agent may raise it at once and only propose lowering it. Unset reads 1500 (`config::PACE_MS`, `Config::pace_ms`). The gate reads it from the live config on each request, so a change is `Plan::Live`.
+- **Rollback.** The default lives in code and nothing but the owner's `/set browser.pace_ms` writes `[browser]`: no upgrade, start or reload adds the table. A 0.9.0 image pinned back by hand refuses a `zephyr.toml` that has it (its `Config` is strict); `zephyr upgrade 0.9.0` restores the file it backed up and is unaffected.
 
 ## 5. Repo layout
 

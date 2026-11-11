@@ -5940,6 +5940,63 @@ async fn an_upgrade_with_nothing_to_settle_leaves_the_config_as_it_is() {
     gw.shutdown().await;
 }
 
+/// DESIGN §4.24: the default pace lives in code. Only the owner's `/set browser.pace_ms` writes
+/// `[browser]`; other settings written meanwhile never add it.
+#[tokio::test]
+async fn set_browser_pace_writes_the_table_and_nothing_else_does() {
+    let home = home("pace-set");
+    let path = home.join("zephyr.toml");
+    let gw = start(on_file(&home, ""));
+    wait(|| !log(&home, "start").is_empty()).await;
+    gw.say("m1", "owner", "/set tasks.parallel 3").await;
+    assert_eq!(gw.wait_replies(1).await, ["[zephyr] tasks.parallel 2 → 3"]);
+    let before = std::fs::read_to_string(&path).unwrap();
+    assert!(!before.contains("[browser]"), "{before}");
+    gw.say("m2", "owner", "/set browser.pace_ms 2000").await;
+    assert_eq!(
+        gw.wait_replies(2).await[1],
+        "[zephyr] browser.pace_ms 1500 → 2000"
+    );
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(after, format!("{before}\n[browser]\npace_ms = 2000\n"));
+    let cfg = Config::load(&path).unwrap();
+    assert_eq!(cfg.pace_ms(), 2000);
+    gw.shutdown().await;
+}
+
+/// Review Focus 5: an install from 0.9.0, with connectors and no `[browser]`, upgraded: the daemon
+/// starts, runs a turn and a reload, and zephyr.toml keeps every byte; the pace reads 1500.
+#[tokio::test]
+async fn an_upgrade_with_no_browser_key_leaves_zephyr_toml_as_it_is() {
+    let home = home("pace-upgrade");
+    let path = home.join("zephyr.toml");
+    let text = format!(
+        "# the owner's own comment\n{}\n[[mcp]]\nname = \"files\"\ncommand = \"fs-server\"\n\n\
+         [[mcp]]\nname = \"api\"\ncommand = \"api-server\"\nhosts = \"api.test\"\n\
+         env = {{ K = \"${{API_KEY}}\" }}\n",
+        file_text(&home, "[tasks]\nparallel = 2\n")
+    );
+    std::fs::write(&path, &text).unwrap();
+    std::fs::write(home.join("secrets.env"), "API_KEY=k\n").unwrap();
+    let mut cfg = Config::load(&path).unwrap();
+    cfg.floor = true;
+    cfg.tick = Duration::from_millis(200);
+    let gw = start(cfg);
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_reply("echo: ").await;
+    gw.say("m2", "owner", "/reload").await;
+    gw.wait_reply("[zephyr] nothing changed").await;
+    ticks(&home, 3).await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    let cfg = Config::load(&path).unwrap();
+    assert_eq!(cfg.browser, None);
+    assert_eq!(
+        zephyr::settings::value(&cfg, "browser.pace_ms").as_deref(),
+        Some("1500")
+    );
+    gw.shutdown().await;
+}
+
 /// A first start, or a state.db made anew, has nothing of before to keep: a remote connector
 /// with a secret is not settled for the owner, nothing is written, and it is not published.
 #[tokio::test]

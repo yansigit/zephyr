@@ -163,6 +163,15 @@ mod tests {
         assert_eq!(diff(&on, &on.clone(), first(&on), first(&on)), Plan::Same);
     }
 
+    /// The gate reads the pace from the live config on each request: no restart.
+    #[test]
+    fn a_pace_change_is_live() {
+        let old = cfg(POOL);
+        let paced = cfg(&format!("{POOL}[browser]\npace_ms = 3000\n"));
+        assert_eq!(diff(&old, &paced, first(&old), first(&paced)), Plan::Live);
+        assert_eq!(diff(&paced, &old, first(&paced), first(&old)), Plan::Live);
+    }
+
     #[test]
     fn each_change_gets_the_least_disruptive_plan() {
         let old = cfg(POOL);
