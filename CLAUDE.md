@@ -135,14 +135,17 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   body), `scan` (a surrogate where nothing is swapped). `egress.rs` decrypts a `CONNECT` only
   to a bound `host:port` (`serve_tls`, `Decrypted`): a leaf from `ca::Authority`, the upstream
   verified against `ca::public_roots` (webpki-roots compiled in; nothing the agent can plant),
-  one `Host`, HTTP/1.1 only; the reply's headers and body get each value bound to that host turned
+  one `Host`, HTTP/1.1 only, hop-by-hop headers, `Range` and upgrades stripped (a 101, a 206 and an
+  encoded reply are refused); the reply's headers and body get each value bound to that host turned
   back into its surrogate (`Map::unswapper`, `Replacer`; `Accept-Encoding: identity` is forced
   and an encoded reply refused), and `procs::spawn` sends a command's output through
   `zephyr __scrublog` so its agent-readable log holds no vault value. `ca.rs` keeps the container-only CA in `<state>/ca/`, made and
   renewed only by `supervise` at a container start (`ca::start`), and installs it for the
   agent's tools (system bundle, `agent::CA_ENV`, the agent's NSS store, Camoufox's policies).
-  Bindings come only from the owner (`/vault bind`, the strong rows `mcp.<name>.hosts` and
-  `.secrets`). A surrogate, a token and a key never reach a log, `Debug`, an audit row or a
+  Bindings come only from the owner on a strong channel (`/vault bind`, the strong rows
+  `mcp.<name>.hosts` and `.secrets`; never from a connector draft). A `url` connector keeps
+  its real secret in `mcp.json` (`broker::plain`): rpi's own MCP client cannot reach a
+  decrypted host. A surrogate, a token and a key never reach a log, `Debug`, an audit row or a
   notice.
 - `egress.rs` (DESIGN §4.20): the network floor. In bridge mode (`ZEPHYR_NETWORK=bridge`, set by
   `zephyr up` unless host.toml says `network = "host"`) the agent's uid has no route but its own

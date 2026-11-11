@@ -2735,7 +2735,10 @@ impl<'a> Router<'a> {
             // The owner's credentials (DESIGN §4.15); also an approved `/vault grant` proposal.
             ("/vault", arg) => {
                 let may_approve = from.0 != crate::attach::WEB;
-                match crate::vault::command(&crate::vault::path(&self.cfg), arg, may_approve) {
+                // Where a token goes is loosened only from a strong channel (DESIGN §4.21).
+                let strong = (self.cfg.settings.strong_channels.iter()).any(|c| c == from.0);
+                let path = crate::vault::path(&self.cfg);
+                match crate::vault::command(&path, arg, may_approve, strong) {
                     Ok((done, change)) => {
                         // A binding is the owner's change to what a token may reach (§4.21).
                         if let Some(c) = change {
@@ -2926,7 +2929,8 @@ impl<'a> Router<'a> {
 
     /// The once-only notice of the token broker's upgrade (DESIGN §4.21): the tokens and
     /// connectors that cannot be used until the owner binds them. It waits for an owner to
-    /// tell, and is marked told even when there is nothing to say, so a later start is silent.
+    /// tell, and is marked told even when there is nothing to say, so a later start is silent;
+    /// not while the vault cannot be read, which says nothing about what is in it.
     fn broker_notice(&self) {
         const TOLD: &str = "broker.upgrade_told";
         if !crate::broker::on(&self.cfg)
@@ -2935,9 +2939,12 @@ impl<'a> Router<'a> {
         {
             return;
         }
+        // Marked told only once the vault was read and what there was to say is stored: while
+        // it cannot be read, a later tick looks again.
         let told = match crate::broker::upgrade_notice(&self.cfg) {
-            Some(text) => self.store.notify_last_owner(&text),
-            None => Ok(()),
+            Ok(Some(text)) => self.store.notify_last_owner(&text),
+            Ok(None) => Ok(()),
+            Err(_) => return,
         };
         log(told
             .and_then(|()| self.store.set_meta(TOLD, Some("1")))
@@ -3478,6 +3485,17 @@ impl<'a> Router<'a> {
         // A fact's removal or new allowed target loosens the check: from a strong channel only.
         let facts = p.command.starts_with("/facts rm ") || p.command.starts_with("/facts allow ");
         let strong = &self.cfg.settings.strong_channels;
+        // So does a token's binding to more hosts, which the agent may only propose.
+        if p.key.is_none()
+            && crate::vault::loosens(&p.command)
+            && !strong.iter().any(|c| c == channel)
+        {
+            return Some(NotNow::Weak(format!(
+                "[zephyr] #{} sends a vault token to more hosts: approve it from {}",
+                p.id,
+                strong.join(" or ")
+            )));
+        }
         if p.key.is_none() && facts && !strong.iter().any(|c| c == channel) {
             return Some(NotNow::Weak(format!(
                 "[zephyr] #{} loosens the check for a private fact: approve it from {}",

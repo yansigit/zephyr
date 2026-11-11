@@ -976,13 +976,20 @@ pub fn value(cfg: &Config, key: &str) -> Option<String> {
             let (name, field) = connector(key)?;
             let m = cfg.mcp.iter().find(|m| m.name == name)?;
             match field {
-                // Where its secrets go: a `url` connector's own host when it lists none.
+                // Where its stand-ins are swapped; none for a connector that holds none.
                 "hosts" => {
-                    let hosts = crate::broker::connector_hosts(m);
+                    let hosts = match crate::broker::plain(m) {
+                        true => Vec::new(),
+                        false => crate::broker::connector_hosts(m),
+                    };
                     let hosts: Vec<&str> = hosts.iter().map(|h| crate::vault::shown(h)).collect();
                     (!hosts.is_empty()).then(|| hosts.join(", "))
                 }
-                "secrets" => Some(m.secrets.clone().unwrap_or_else(|| "surrogate".into())),
+                // What is in effect: a `url` connector holds its real secrets unless told not to.
+                "secrets" => Some(match crate::broker::plain(m) {
+                    true => "plain".into(),
+                    false => "surrogate".into(),
+                }),
                 _ => Some(m.enabled.unwrap_or(true).to_string()),
             }
         }
@@ -1990,8 +1997,10 @@ mod tests {
         let text = "[[mcp]]\nname = \"notes\"\nurl = \"https://n.test/mcp\"\n\
                     [[mcp]]\nname = \"local\"\ncommand = \"srv\"\n";
         let cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = '/h'\n{text}")).unwrap();
-        // A `url` connector's secrets go to its own host unless it lists others.
-        assert_eq!(value(&cfg, "mcp.notes.hosts").as_deref(), Some("n.test"));
+        // A `url` connector holds its real secrets (rpi's own client makes its requests), so
+        // nothing of it is swapped anywhere.
+        assert_eq!(value(&cfg, "mcp.notes.hosts"), None);
+        assert_eq!(value(&cfg, "mcp.notes.secrets").as_deref(), Some("plain"));
         assert_eq!(value(&cfg, "mcp.local.hosts"), None);
         assert_eq!(
             value(&cfg, "mcp.local.secrets").as_deref(),

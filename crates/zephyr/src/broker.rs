@@ -175,13 +175,25 @@ pub fn connector_hosts(m: &Mcp) -> Vec<String> {
     own.into_iter().collect()
 }
 
+/// Whether `m` holds its real secrets. A `command` connector holds stand-ins unless the owner
+/// says `secrets = "plain"`. A `url` connector holds the real ones unless the owner says
+/// `secrets = "surrogate"`: its requests are made by rpi's own MCP client, which trusts only
+/// the roots compiled into it and so cannot reach a host the proxy decrypts (checked against
+/// rpi 0.21.2; DESIGN §4.21). Binding it would break it, so it stays as it was before the
+/// broker, and `doctor` says so.
+pub fn plain(m: &Mcp) -> bool {
+    match m.secrets.as_deref() {
+        Some("plain") => true,
+        Some(_) => false,
+        None => m.url.is_some(),
+    }
+}
+
 /// Whether `m` names a secret and has nowhere to send it: a `command` connector, or one on
 /// plain `http`, with no `hosts`. Such a connector is left out until the owner lists hosts or
 /// says `secrets = "plain"`.
 fn nowhere(m: &Mcp) -> bool {
-    m.secrets.as_deref() != Some("plain")
-        && !connector_names(m).0.is_empty()
-        && connector_hosts(m).is_empty()
+    !plain(m) && !connector_names(m).0.is_empty() && connector_hosts(m).is_empty()
 }
 
 /// What `drafts::filled` fills `m`'s `${NAME}`s with, from secrets.env (`env`): surrogates
@@ -193,7 +205,7 @@ pub fn connector_secrets(
     m: &Mcp,
     env: &[(String, String)],
 ) -> Result<Vec<(String, String)>, String> {
-    if !on(cfg) || m.secrets.as_deref() == Some("plain") || connector_names(m).0.is_empty() {
+    if !on(cfg) || plain(m) || connector_names(m).0.is_empty() {
         return Ok(env.to_vec());
     }
     if nowhere(m) {
@@ -230,7 +242,7 @@ impl Map {
             secret.hosts = e.hosts.iter().filter_map(|h| parse_host(h).ok()).collect();
             secret.url = e.url;
         }
-        for m in (cfg.mcp.iter()).filter(|m| m.secrets.as_deref() != Some("plain")) {
+        for m in cfg.mcp.iter().filter(|m| !plain(m)) {
             let (names, in_url) = connector_names(m);
             let hosts = connector_hosts(m);
             for name in names {
@@ -283,14 +295,17 @@ pub struct Maps {
     last: std::sync::Mutex<Option<(Stamp, std::sync::Arc<Map>)>>,
 }
 
-/// What a map was built from: each file's time and size, and the connectors.
-type Stamp = (Vec<Option<(std::time::SystemTime, u64)>>, Vec<Mcp>);
+/// What a map was built from: each file as it is (its inode, both times and its size, so a
+/// file replaced within one tick of the clock still counts as changed), and the live config,
+/// held so that "the same" is the same allocation.
+type Stamp = (Vec<Option<[i64; 6]>>, std::sync::Arc<Config>);
 
 impl Maps {
     /// The map as the files are now. When they cannot be read, the last one, marked
     /// `unreadable`: it still says which hosts are decrypted, so none of them falls back to a
     /// plain tunnel, and nothing is swapped from it.
-    pub fn current(&self, cfg: &Config) -> std::sync::Arc<Map> {
+    pub fn current(&self, cfg: &std::sync::Arc<Config>) -> std::sync::Arc<Map> {
+        use std::os::unix::fs::MetadataExt;
         let files = [
             crate::vault::path(cfg),
             cfg.secrets_path(),
@@ -298,11 +313,22 @@ impl Maps {
         ];
         let seen = |p: &std::path::PathBuf| {
             let m = std::fs::metadata(p).ok()?;
-            Some((m.modified().ok()?, m.len()))
+            let (size, inode) = (m.size() as i64, m.ino() as i64);
+            Some([
+                inode,
+                size,
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            ])
         };
-        let stamp: Stamp = (files.iter().map(seen).collect(), cfg.mcp.clone());
+        let files: Vec<_> = files.iter().map(seen).collect();
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, map)) = last.as_ref().filter(|(old, _)| *old == stamp) {
+        let same = |(old, _): &&(Stamp, std::sync::Arc<Map>)| {
+            old.0 == files && std::sync::Arc::ptr_eq(&old.1, cfg)
+        };
+        if let Some((_, map)) = last.as_ref().filter(same) {
             return map.clone();
         }
         let map = match Map::load(cfg) {
@@ -316,7 +342,7 @@ impl Maps {
             },
         };
         let map = std::sync::Arc::new(map);
-        *last = Some((stamp, map.clone()));
+        *last = Some(((files, cfg.clone()), map.clone()));
         map
     }
 }
@@ -417,25 +443,44 @@ fn encoded(text: &[u8], map: &Map, host: Option<&str>) -> Result<(), Refused> {
     Ok(())
 }
 
-/// The payload of `Basic <base64>`, decoded.
-fn basic(value: &[u8]) -> Option<Vec<u8>> {
+/// The payload of `Basic <base64>`, as written and decoded.
+fn basic(value: &[u8]) -> Option<(&str, Vec<u8>)> {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
     let text = std::str::from_utf8(value).ok()?;
     let (scheme, payload) = text.trim().split_once(' ')?;
-    (scheme.eq_ignore_ascii_case("basic")).then(|| STANDARD.decode(payload.trim()).ok())?
+    let payload = payload.trim();
+    let decoded = (scheme.eq_ignore_ascii_case("basic")).then(|| STANDARD.decode(payload).ok())?;
+    Some((payload, decoded?))
+}
+
+/// What `swap` did to a request.
+#[derive(Default)]
+pub struct Swapped {
+    /// The names of the secrets put in, in order, each once.
+    pub used: Vec<String>,
+    /// Each credential that went upstream in another form than the value itself, with what the
+    /// agent's program had written in its place: a Basic payload, which holds the value in
+    /// base64. A server that sends it back must not hand it over either (`Map::unswapper`).
+    pub sent: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl std::fmt::Debug for Swapped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Swapped").field("used", &self.used).finish()
+    }
 }
 
 /// Puts the real values into a request the proxy decrypted for `host` (`host:port`): in any
 /// header value, in a Basic credential after decoding, and in the path and query only for a
-/// token with `url`. Returns the names used. On a refusal nothing is changed. The body is not
+/// token with `url`. Returns what was put in. On a refusal nothing is changed. The body is not
 /// this function's to see: a host that stores what it is sent would hand the token back.
 pub fn swap(
     uri: &mut Uri,
     headers: &mut HeaderMap,
     map: &Map,
     host: &str,
-) -> Result<Vec<String>, Refused> {
+) -> Result<Swapped, Refused> {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
     /// The value of `s` for this host and place, noted in `used`.
@@ -469,14 +514,22 @@ pub fn swap(
         None => None,
     };
     let mut new_values = Vec::with_capacity(headers.len());
+    let mut sent = Vec::new();
     for (name, value) in headers.iter() {
         let before = used.len();
         let decoded = (name == AUTHORIZATION)
             .then(|| basic(value.as_bytes()))
             .flatten();
-        let swapped = match decoded.map(|d| replace(&d, map, |s| real(s, host, false, &mut used))) {
-            Some(Ok(Some(d))) => Some(format!("Basic {}", STANDARD.encode(d)).into_bytes()),
-            Some(Err(e)) => return Err(e),
+        let in_basic = match &decoded {
+            Some((_, d)) => replace(d, map, |s| real(s, host, false, &mut used))?,
+            None => None,
+        };
+        let swapped = match (in_basic, &decoded) {
+            (Some(d), Some((written, _))) => {
+                let payload = STANDARD.encode(d);
+                sent.push((payload.clone().into_bytes(), written.as_bytes().to_vec()));
+                Some(format!("Basic {payload}").into_bytes())
+            }
             _ => replace(value.as_bytes(), map, |s| real(s, host, false, &mut used))?,
         };
         let Some(bytes) = swapped else {
@@ -503,7 +556,7 @@ pub fn swap(
     if let Some(new_uri) = new_uri {
         *uri = new_uri;
     }
-    Ok(used)
+    Ok(Swapped { used, sent })
 }
 
 /// Replaces byte strings in a stream, a chunk at a time: a string split across two chunks is
@@ -592,23 +645,28 @@ const MIN_UNSWAP: usize = 4;
 
 impl Map {
     /// What turns the real values bound to `host` back into their surrogates in a reply from
-    /// it: every secret the proxy would put into a request there, used by this request or not.
-    pub fn unswapper(&self, host: &str) -> Replacer {
+    /// it: every secret the proxy would put into a request there, used by this request or not,
+    /// and the base64 text each always turns into (`vault::base64_forms`: inside a Basic
+    /// credential, a JSON blob, a token of tokens). `sent` are the encoded credentials this
+    /// request carried (`Swapped::sent`), which go back to exactly what the agent's program
+    /// wrote; being longer, they are tried first.
+    pub fn unswapper(&self, host: &str, sent: &[(Vec<u8>, Vec<u8>)]) -> Replacer {
         let here = |s: &&Secret| s.value.len() >= MIN_UNSWAP && s.hosts.iter().any(|h| h == host);
-        let pair = |s: &Secret| {
-            (
-                s.value.clone().into_bytes(),
-                s.surrogate.clone().into_bytes(),
-            )
-        };
-        Replacer::new(self.by.values().filter(here).map(pair).collect())
+        let mut pairs = sent.to_vec();
+        for s in self.by.values().filter(here) {
+            let surrogate = s.surrogate.clone().into_bytes();
+            pairs.push((s.value.clone().into_bytes(), surrogate.clone()));
+            let forms = crate::vault::base64_forms(&s.value).into_iter();
+            pairs.extend(forms.map(|f| (f.into_bytes(), surrogate.clone())));
+        }
+        Replacer::new(pairs)
     }
 }
 
 /// Turns each real value bound to `host` in a reply's headers back into its surrogate, so a
 /// `Location` or `Link` that repeats the request's URL does not hand the token over.
-pub fn unswap(headers: &mut HeaderMap, map: &Map, host: &str) {
-    let mut replacer = map.unswapper(host);
+pub fn unswap(headers: &mut HeaderMap, map: &Map, host: &str, sent: &[(Vec<u8>, Vec<u8>)]) {
+    let mut replacer = map.unswapper(host, sent);
     headers.values_mut().for_each(|v| replacer.header(v));
 }
 
@@ -633,7 +691,7 @@ pub fn scan(texts: &[&[u8]], map: &Map) -> Result<(), Refused> {
     for text in texts {
         look(text)?;
         if let Some(decoded) = basic(text) {
-            look(&decoded)?;
+            look(&decoded.1)?;
         }
     }
     match unknown {
@@ -666,8 +724,8 @@ pub fn secrets(cfg: &Config, vault: &Vault) -> Vec<(String, String)> {
 
 /// What the owner is told once after the upgrade: each token that cannot be used until it is
 /// bound. `None` when there is none, or the vault cannot be read.
-pub fn upgrade_notice(cfg: &Config) -> Option<String> {
-    let vault = Vault::load(&crate::vault::path(cfg)).ok()?;
+pub fn upgrade_notice(cfg: &Config) -> anyhow::Result<Option<String>> {
+    let vault = Vault::load(&crate::vault::path(cfg))?;
     let unbound = |e: &crate::vault::Entry| e.kind == Kind::Token && !e.raw && e.hosts.is_empty();
     let mut lines: Vec<String> = (vault.entries().iter().filter(|e| unbound(e)))
         .map(|e| format!("/vault bind {} HOST..", e.name))
@@ -681,7 +739,7 @@ pub fn upgrade_notice(cfg: &Config) -> Option<String> {
         )
     }));
     if lines.is_empty() {
-        return None;
+        return Ok(None);
     }
     lines.insert(
         0,
@@ -691,7 +749,7 @@ pub fn upgrade_notice(cfg: &Config) -> Option<String> {
             .into(),
     );
     lines.push("To hand one out as before: /vault raw NAME on.".into());
-    Some(lines.join("\n"))
+    Ok(Some(lines.join("\n")))
 }
 
 /// How a line of `doctor` reads.
@@ -766,7 +824,7 @@ pub fn doctor(
     let env = crate::drafts::secrets(cfg);
     let published = std::fs::read_to_string(crate::drafts::mcp_path(cfg)).unwrap_or_default();
     let mut leaked = Vec::new();
-    for m in (cfg.mcp.iter()).filter(|m| m.secrets.as_deref() != Some("plain")) {
+    for m in cfg.mcp.iter().filter(|m| !plain(m)) {
         for name in connector_names(m).0 {
             let value = env.iter().find(|(k, _)| *k == name).map(|(_, v)| v);
             if value.is_some_and(|v| v.len() >= 4 && published.contains(v.as_str())) {
@@ -819,11 +877,16 @@ pub fn doctor(
     }
     for m in &cfg.mcp {
         let name = &m.name;
-        if m.secrets.as_deref() == Some("plain") && !connector_names(m).0.is_empty() {
+        let names = connector_names(m).0;
+        if plain(m) && !names.is_empty() && m.secrets.is_none() {
+            say(Level::Warn, format!("the connector {name} holds its real secrets ({}), which the agent can read: rpi's own MCP client cannot reach a host zephyr decrypts", names.join(", ")));
+        } else if plain(m) && !names.is_empty() {
             say(
                 Level::Warn,
                 format!("the connector {name} holds its real secrets (secrets = \"plain\")"),
             );
+        } else if m.url.is_some() && !names.is_empty() {
+            say(Level::Warn, format!("the connector {name} holds stand-ins (secrets = \"surrogate\"), but rpi's own MCP client cannot reach a host zephyr decrypts: its calls will fail"));
         } else if nowhere(m) {
             say(
                 Level::Warn,
@@ -954,7 +1017,10 @@ mod tests {
             "/repos?x=1",
             &[("authorization", &format!("Bearer {a}")), ("x-api-key", &a)],
         );
-        assert_eq!(swap(&mut uri, &mut h, &map, "a.test:443").unwrap(), ["A"]);
+        assert_eq!(
+            swap(&mut uri, &mut h, &map, "a.test:443").unwrap().used,
+            ["A"]
+        );
         assert_eq!(h["authorization"], format!("Bearer {A_VALUE}"));
         assert_eq!(h["x-api-key"], A_VALUE);
         assert!(h["x-api-key"].is_sensitive());
@@ -968,7 +1034,7 @@ mod tests {
         // Two tokens in one request, both bound here.
         let (mut uri, mut h) = request("/", &[("x-a", &a), ("x-b", &format!("k={b};"))]);
         assert_eq!(
-            swap(&mut uri, &mut h, &map, "a.test:443").unwrap(),
+            swap(&mut uri, &mut h, &map, "a.test:443").unwrap().used,
             ["A", "B"]
         );
         assert_eq!(h["x-b"], format!("k={B_VALUE};"));
@@ -976,6 +1042,7 @@ mod tests {
         let (mut uri, mut h) = request("/plain", &[("accept", "*/*")]);
         assert!(swap(&mut uri, &mut h, &map, "a.test:443")
             .unwrap()
+            .used
             .is_empty());
         assert!(!h["accept"].is_sensitive());
     }
@@ -984,7 +1051,10 @@ mod tests {
     fn the_target_is_swapped_only_for_a_token_with_url() {
         let map = map();
         let (mut uri, mut h) = request(&format!("/bot{}/send?key={0}", sur("B")), &[]);
-        assert_eq!(swap(&mut uri, &mut h, &map, "b.test:8443").unwrap(), ["B"]);
+        assert_eq!(
+            swap(&mut uri, &mut h, &map, "b.test:8443").unwrap().used,
+            ["B"]
+        );
         assert_eq!(uri, format!("/bot{B_VALUE}/send?key={B_VALUE}").as_str());
         let (mut uri, mut h) = request(&format!("/x?key={}", sur("A")), &[("x-a", &sur("A"))]);
         let refused = swap(&mut uri, &mut h, &map, "a.test:443").unwrap_err();
@@ -1067,12 +1137,12 @@ mod tests {
                 ("x-other", A_VALUE),
             ],
         );
-        unswap(&mut h, &map, "b.test:8443");
+        unswap(&mut h, &map, "b.test:8443", &[]);
         assert_eq!(h["location"], format!("https://b.test/bot{}/x", sur("B")));
         // Only what is bound to this host: A is not sent here, so it did not come from here.
         assert_eq!(h["x-other"], A_VALUE);
         // On a host both are bound to, both go back, whichever the request carried.
-        unswap(&mut h, &map, "a.test:443");
+        unswap(&mut h, &map, "a.test:443", &[]);
         assert_eq!(h["x-other"], sur("A"));
     }
 
@@ -1181,11 +1251,11 @@ mod tests {
     fn the_map_binds_connector_secrets_to_their_hosts() {
         let cfg = config(
             "[[mcp]]\nname = \"notes\"\nurl = \"https://n.test/mcp?key=${URL_KEY}\"\n\
-             headers = { Authorization = \"Bearer ${SHARED}\" }\n\
+             headers = { Authorization = \"Bearer ${SHARED}\" }\nsecrets = \"surrogate\"\n\
              [[mcp]]\nname = \"local\"\ncommand = \"srv\"\nenv = { K = \"${SHARED}\", P = \"${PLAINLY}\" }\n\
              hosts = \"api.l.test, l.test:8443\"\n\
              [[mcp]]\nname = \"db\"\ncommand = \"db\"\nenv = { P = \"${PLAINLY}\" }\nsecrets = \"plain\"\n\
-             [[mcp]]\nname = \"lan\"\nurl = \"http://lan.test/mcp\"\nheaders = { K = \"${LAN}\" }\n",
+             [[mcp]]\nname = \"lan\"\nurl = \"http://lan.test/mcp\"\nheaders = { K = \"${LAN}\" }\nsecrets = \"surrogate\"\n",
         );
         let env: Vec<(String, String)> = ["URL_KEY", "SHARED", "PLAINLY", "LAN"]
             .iter()
@@ -1220,7 +1290,8 @@ mod tests {
         std::fs::create_dir_all(&state).unwrap();
         let cfg: Config = toml::from_str(&format!(
             "rpi = '/r'\nhome = {dir:?}\nstate = {state:?}\n[agent]\nenv = ['OPENAI_API_KEY']\n\
-             [[mcp]]\nname = 'docs'\nurl = 'https://docs.test/mcp'\nheaders = {{ A = '${{DOCS_TOKEN}}' }}\n\
+             [[mcp]]\nname = 'docs'\nurl = 'https://docs.test/mcp'\nheaders = {{ A = '${{DOCS_TOKEN}}' }}\nsecrets = 'surrogate'\n\
+             [[mcp]]\nname = 'remote'\nurl = 'https://remote.test/mcp'\nheaders = {{ A = '${{DB_PASSWORD}}' }}\n\
              [[mcp]]\nname = 'db'\ncommand = 'db'\nenv = {{ P = '${{DB_PASSWORD}}' }}\nsecrets = 'plain'\n\
              [[mcp]]\nname = 'local'\ncommand = 'srv'\nenv = {{ K = '${{DOCS_TOKEN}}' }}\n"
         ))
@@ -1281,6 +1352,8 @@ mod tests {
             "Warn the token URL is also swapped in URLs",
             "Warn the token LOOSE is bound to no host, so it cannot be used: /vault bind LOOSE HOST..\n",
             "Warn the connector db holds its real secrets (secrets = \"plain\")\n",
+            "Warn the connector remote holds its real secrets (DB_PASSWORD), which the agent can read: rpi's own MCP client cannot reach a host zephyr decrypts\n",
+            "Warn the connector docs holds stand-ins (secrets = \"surrogate\"), but rpi's own MCP client cannot reach a host zephyr decrypts: its calls will fail\n",
             "Warn the connector local is left out: it names a secret and no host to send it to\n",
             "Warn [agent] env hands every command of the agent the real OPENAI_API_KEY\n",
         ] {
@@ -1355,7 +1428,7 @@ mod tests {
         let map = map();
         let both = format!("{A_VALUE} {B_VALUE} unbound-value-1 raw-value-12345");
         let run = |host: &str| {
-            let mut r = map.unswapper(host);
+            let mut r = map.unswapper(host, &[]);
             let mut out = r.push(both.as_bytes());
             out.extend(r.finish());
             String::from_utf8(out).unwrap()
@@ -1374,6 +1447,66 @@ mod tests {
         let short =
             Vault::parse("[[token]]\nname = \"S\"\nvalue = \"abc\"\nhosts = [\"a.test:443\"]\n");
         let map = Map::build(&config(""), &short.unwrap(), &[], &KEY);
-        assert!(map.unswapper("a.test:443").is_empty());
+        assert!(map.unswapper("a.test:443", &[]).is_empty());
+    }
+
+    /// A Basic credential holds the value in base64, so a server that sends the credential
+    /// back would hand it over: what went upstream goes back to what the agent's program
+    /// wrote, and so does the value's base64 wherever else it turns up.
+    #[test]
+    fn an_encoded_credential_sent_upstream_is_turned_back_too() {
+        let map = map();
+        let written = STANDARD.encode(format!("x:{}", sur("A")));
+        let (mut uri, mut h) = request("/", &[("authorization", &format!("Basic {written}"))]);
+        let swapped = swap(&mut uri, &mut h, &map, "a.test:443").unwrap();
+        let real = STANDARD.encode(format!("x:{A_VALUE}"));
+        assert_eq!(h["authorization"], format!("Basic {real}"));
+        assert_eq!(
+            swapped.sent,
+            [(real.clone().into_bytes(), written.clone().into_bytes())]
+        );
+        assert!(!format!("{swapped:?}").contains(&real), "{swapped:?}");
+        let back = |text: &str, sent: &[(Vec<u8>, Vec<u8>)]| {
+            let mut r = map.unswapper("a.test:443", sent);
+            let mut out = r.push(text.as_bytes());
+            out.extend(r.finish());
+            String::from_utf8(out).unwrap()
+        };
+        // The echo of the credential is the agent's own again, byte for byte.
+        let echo = format!("{{\"Authorization\": \"Basic {real}\"}}");
+        assert_eq!(
+            back(&echo, &swapped.sent),
+            format!("{{\"Authorization\": \"Basic {written}\"}}")
+        );
+        // Without this request having sent it (a server that kept it), and at any offset, the
+        // value's base64 does not come through either.
+        for prefix in ["", "u", "us", "user:"] {
+            let blob = STANDARD.encode(format!("{prefix}{A_VALUE}"));
+            let out = back(&format!("blob={blob}"), &[]);
+            let forms = crate::vault::base64_forms(A_VALUE);
+            assert!(
+                !forms.iter().any(|f| out.contains(f.as_str())),
+                "{prefix:?}: {out}"
+            );
+            assert!(out.contains(&sur("A")), "{out}");
+        }
+    }
+
+    #[test]
+    fn a_url_connector_keeps_its_secret_and_a_command_connector_holds_a_stand_in() {
+        let cfg = config(
+            "[[mcp]]\nname = \"remote\"\nurl = \"https://r.test/mcp\"\nheaders = { A = \"${K}\" }\n\
+             [[mcp]]\nname = \"asked\"\nurl = \"https://s.test/mcp\"\nheaders = { A = \"${K}\" }\nsecrets = \"surrogate\"\n\
+             [[mcp]]\nname = \"local\"\ncommand = \"srv\"\nenv = { A = \"${K}\" }\nhosts = \"l.test\"\n\
+             [[mcp]]\nname = \"db\"\ncommand = \"db\"\nenv = { A = \"${K}\" }\nsecrets = \"plain\"\n",
+        );
+        let plain: Vec<bool> = cfg.mcp.iter().map(plain).collect();
+        // rpi's own MCP client makes a `url` connector's requests, and it cannot reach a host
+        // the proxy decrypts: such a connector is as it was before the broker.
+        assert_eq!(plain, [true, false, false, true]);
+        let env = vec![("K".to_string(), "value-of-K".to_string())];
+        let map = Map::build(&cfg, &Vault::parse("").unwrap(), &env, &KEY);
+        assert_eq!(map.hosts(), ["l.test:443", "s.test:443"]);
+        assert!(!map.bound("r.test:443"));
     }
 }

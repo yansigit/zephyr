@@ -827,6 +827,7 @@ pub fn command(
     path: &Path,
     arg: &str,
     may_approve: bool,
+    strong: bool,
 ) -> Result<(String, Option<Change>), String> {
     let words: Vec<&str> = arg.split_whitespace().collect();
     let edit = |f: &dyn Fn(&mut Vault) -> anyhow::Result<String>| match edit(path, f) {
@@ -843,10 +844,14 @@ pub fn command(
         [] | ["list"] => {
             (Vault::load(path).map(|v| (v.list(), None))).map_err(|e| format!("[zephyr] {e:#}"))
         }
-        // What loosens: a grant, a host, the value itself, the URL.
-        ["grant" | "bind", ..] | ["raw" | "url", _, "on"] if !may_approve => {
-            Err(crate::tools::NEEDS_PASSKEY.into())
-        }
+        ["grant", ..] if !may_approve => Err(crate::tools::NEEDS_PASSKEY.into()),
+        // Where a token goes, or handing out the value itself: from a strong channel only
+        // (`strong`), as the connectors' `hosts` and `secrets` are (DESIGN §4.21).
+        _ if !strong && loosens(&format!("/vault {arg}")) => Err(
+            "[zephyr] sending a vault token to more hosts, in URLs or as its real value needs a \
+             strong channel"
+                .into(),
+        ),
         ["rm", name] => edit(&|v| match v.remove(name) {
             true => Ok(format!("removed {name} from the vault")),
             false => bail!("no entry named {name} in the vault"),
@@ -877,6 +882,16 @@ pub fn command(
                 .into(),
         ),
     }
+}
+
+/// Whether the owner's command `text` loosens where a token goes: `/vault bind`, `/vault url
+/// NAME on` and `/vault raw NAME on`. Taking any of them back does not.
+pub fn loosens(text: &str) -> bool {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    matches!(
+        words[..],
+        ["/vault", "bind", ..] | ["/vault", "raw" | "url", _, "on"]
+    )
 }
 
 /// What `/ok` does to a vault proposal, in the owner's notice.
@@ -1485,15 +1500,16 @@ programs = ["gh"]
         let dir = crate::test_dir("vault-cmd");
         let path = dir.join(FILE);
         std::fs::write(&path, SAMPLE).unwrap();
-        let said = |arg: &str| command(&path, arg, true).map_or_else(|refused| refused, |d| d.0);
+        let said =
+            |arg: &str| command(&path, arg, true, true).map_or_else(|refused| refused, |d| d.0);
         assert!(said("").contains("token GH_TOKEN"));
         // Typed in the web app, a grant is refused and nothing is granted; the rest is not.
-        let web = command(&path, "grant token GH_TOKEN curl", false).unwrap_err();
+        let web = command(&path, "grant token GH_TOKEN curl", false, true).unwrap_err();
         assert_eq!(web, crate::tools::NEEDS_PASSKEY);
-        assert!(command(&path, "grant login github", false).is_err());
-        assert!(command(&path, "", false).is_ok_and(|list| !list.0.contains("curl")));
+        assert!(command(&path, "grant login github", false, true).is_err());
+        assert!(command(&path, "", false, false).is_ok_and(|list| !list.0.contains("curl")));
         assert!(
-            command(&path, "rm nosuch", true).is_err(),
+            command(&path, "rm nosuch", true, true).is_err(),
             "a failure is an Err"
         );
         assert!(said("grant token GH_TOKEN jq").contains("gh, jq"));
@@ -1634,17 +1650,23 @@ programs = ["gh"]
     }
 
     #[test]
-    fn bind_raw_and_url_need_an_approving_channel_and_tightening_does_not() {
+    fn bind_raw_and_url_need_a_strong_channel_and_tightening_does_not() {
         let dir = crate::test_dir("vault-bind");
         let path = dir.join(FILE);
         std::fs::write(&path, TOKENS).unwrap();
+        // On a channel that is not strong (Discord, say), whatever else it may approve.
+        let weak = |arg: &str| command(&path, arg, true, false);
+        let strong = |arg: &str| command(&path, arg, true, true);
         for loosening in ["bind LOOSE api.x.test", "raw LOOSE on", "url LOOSE on"] {
-            let refused = command(&path, loosening, false).unwrap_err();
-            assert_eq!(refused, crate::tools::NEEDS_PASSKEY, "{loosening}");
+            let refused = weak(loosening).unwrap_err();
+            assert!(
+                refused.ends_with("needs a strong channel"),
+                "{loosening}: {refused}"
+            );
+            assert!(loosens(&format!("/vault {loosening}")), "{loosening}");
         }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), TOKENS);
-        let (said, change) =
-            command(&path, "bind LOOSE API.x.test gist.x.test:8443", true).unwrap();
+        let (said, change) = strong("bind LOOSE API.x.test gist.x.test:8443").unwrap();
         assert_eq!(
             said,
             "[zephyr] LOOSE is now sent only to api.x.test, gist.x.test:8443\n\
@@ -1667,14 +1689,11 @@ programs = ["gh"]
             "bind NOPE x.test",
             "bind LOOSE",
         ] {
-            assert!(command(&path, bad, true).is_err(), "{bad}");
+            assert!(strong(bad).is_err(), "{bad}");
         }
-        assert!(command(&path, "raw LOOSE on", true)
-            .unwrap()
-            .0
-            .contains("real value"));
-        assert!(command(&path, "url LOOSE on", true).unwrap().1.is_some());
-        let list = command(&path, "", false).unwrap().0;
+        assert!(strong("raw LOOSE on").unwrap().0.contains("real value"));
+        assert!(strong("url LOOSE on").unwrap().1.is_some());
+        let list = weak("").unwrap().0;
         assert!(
             list.contains("token LOOSE: allowed for curl; handed out as its real value (raw)"),
             "{list}"
@@ -1684,13 +1703,16 @@ programs = ["gh"]
             "{list}"
         );
         // Tightening is taken from any channel.
-        let (_, change) = command(&path, "raw LOOSE off", false).unwrap();
+        for tightening in ["unbind LOOSE", "raw LOOSE off", "url LOOSE off"] {
+            assert!(!loosens(&format!("/vault {tightening}")), "{tightening}");
+        }
+        let (_, change) = weak("raw LOOSE off").unwrap();
         assert_eq!(change.unwrap().key, "vault.LOOSE.raw");
-        command(&path, "url LOOSE off", false).unwrap();
-        let (said, _) = command(&path, "unbind LOOSE gist.x.test:8443", false).unwrap();
+        weak("url LOOSE off").unwrap();
+        let (said, _) = weak("unbind LOOSE gist.x.test:8443").unwrap();
         assert_eq!(said, "[zephyr] LOOSE is now sent only to api.x.test");
-        assert!(command(&path, "unbind LOOSE gist.x.test:8443", false).is_err());
-        let (said, _) = command(&path, "unbind LOOSE", false).unwrap();
+        assert!(weak("unbind LOOSE gist.x.test:8443").is_err());
+        let (said, _) = weak("unbind LOOSE").unwrap();
         assert!(said.contains("bound to no host"), "{said}");
         let e = Vault::load(&path).unwrap().get("LOOSE").unwrap();
         assert_eq!(

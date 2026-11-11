@@ -502,9 +502,12 @@ out, and `zephyr doctor` and `/mcp` say so. zephyr's own secrets (`ZEPHYR_*`) an
 removes a connector, and `/mcp` lists them. The agent can use only these connectors: an MCP config
 it writes itself, or a server named by URL, is refused.
 
-A connector does not hold its secrets: `mcp.json` has a stand-in for each `${NAME}`, and zephyr's
-proxy sends the real one only to the connector's hosts. A `url` connector's host is its own URL's.
-A connector that runs a command and uses a secret must say where it goes, or it is left out:
+A connector that runs a command does not hold its secrets: `mcp.json` has a stand-in for each
+`${NAME}`, and zephyr's proxy sends the real one only to the connector's hosts. A remote (`--url`)
+connector still holds its real secret, which the agent can read: its requests are made by rpi's
+own MCP client, which does not trust zephyr's certificate, so it works as before and `zephyr
+doctor` names it. A connector that runs a command and uses a secret must say where it goes, or it
+is left out:
 `zephyr mcp add NAME --host api.example.com ...`, or `/set mcp.NAME.hosts api.example.com`. For a
 secret that is not an HTTPS header (a database password, a signing key), `--plain` or
 `/set mcp.NAME.secrets plain` hands the connector the real one, which the agent can then read.
@@ -798,7 +801,9 @@ save it and names the exact command. Save and manage entries:
   in the URL (a server may repeat its URL back, so it is off by default). `/vault raw NAME on`
   hands the real token to the command as before: for a token used in a request body, for signing
   (AWS, webhooks), for gRPC, for a host with a private certificate or plain HTTP, or for a program
-  that does not use the proxy (`himalaya`, `ssh`). These three need a channel that may approve;
+  that does not use the proxy (`himalaya`, `ssh`). These three need a strong channel (`tui`,
+  `chat` or a passkey unless you changed `settings.strong_channels`), also as the `/ok` of the
+  agent's request;
   `/vault unbind NAME [HOST]`, `/vault url NAME off` and `/vault raw NAME off` work anywhere. The
   agent can ask for a binding (`the agent asks to send the token GH_TOKEN to api.github.com (#5)`).
 - From any channel, `/vault` lists the names, `/vault rm NAME` deletes one, and `/vault revoke
@@ -827,10 +832,10 @@ field read back, its own command's log under `.procs/`, a program that prints it
 a file; what a command prints is scrubbed from its log, what it writes to a file of its own is
 not). A bound token it cannot read: if the host sends the token back (an echo or debug endpoint,
 an error page), zephyr turns it into the stand-in again before the agent's program sees the
-reply, and what a command prints reaches its log already scrubbed. What is left: a host that
-sends the token back in another form (base64, escaped) or in a websocket message is not caught;
-a bound host that compresses its replies even when asked not to cannot be used (the request
-fails, nothing leaks); and the agent can still *use* a bound token on the hosts you bound. So
+reply (as it is, or in base64, as `curl -u` sends it), and what a command prints reaches its log
+already scrubbed. What is left: a host that sends the token back in another form (hex, escaped)
+is not caught; a bound host that needs a websocket, a range request or a compressed reply cannot
+be used (the request fails, nothing leaks); a remote connector's secret is still in `mcp.json`; and the agent can still *use* a bound token on the hosts you bound. So
 bind a token only to the API it is for, and grant it only to programs you trust with it.
 
 **Mail.** There is no mail channel, but the agent can read and send mail with `himalaya`. Save the

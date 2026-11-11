@@ -13,6 +13,9 @@
 //! zephyr config set attach.port 18790
 //! echo 'A3_SECRET=a3-secret-value-0123456789' >> "$HOME/.zephyr-daemon/secrets.env"
 //! zephyr mcp add echo --url 'https://httpbin.org/get?key=${A3_SECRET}' --header 'X-Key=${A3_SECRET}'
+//! # A `url` connector holds its real secret unless told otherwise (rpi's own MCP client cannot
+//! # reach a decrypted host); the test only needs a stand-in bound to the echo host.
+//! zephyr config set mcp.echo.secrets surrogate
 //! zephyr up --build
 //! cargo test -p zephyr --test token_broker -- --ignored
 //! ```
@@ -137,6 +140,29 @@ fn the_agent_holds_stand_ins_and_the_proxy_swaps_them_only_where_bound() {
     );
     assert!(curl.contains(&format!("\"key\": \"{stand_in}\"")), "{curl}");
     assert!(!curl.contains(&secret), "{curl}");
+    // `curl -u x:TOKEN` sends the secret inside a Basic credential, which this server sends
+    // back: what the agent reads is the credential it wrote, not the one that went out.
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let basic = side.sh(&format!(
+        "curl -sS -m 60 -u 'x:{stand_in}' 'https://{echo}/get'"
+    ));
+    assert!(
+        basic.contains(&b64.encode(format!("x:{stand_in}"))),
+        "{basic}"
+    );
+    assert!(
+        !basic.contains(&b64.encode(format!("x:{secret}"))),
+        "{basic}"
+    );
+    // A part of a reply is not asked for, whatever the client says.
+    let ranged = side.sh(&format!(
+        "curl -sS -m 60 -r 0-40 -H 'X-Key: {stand_in}' 'https://{echo}/get'"
+    ));
+    assert!(
+        ranged.contains(stand_in) && !ranged.contains(&secret),
+        "{ranged}"
+    );
     let node = format!(
         "node -e \"fetch('{url}', {{headers: {{'x-key': '{stand_in}'}}}}).then(r => r.text()).then(console.log)\""
     );

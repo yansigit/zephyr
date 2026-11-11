@@ -5479,6 +5479,81 @@ async fn a_token_bound_to_nothing_is_not_run_until_the_owner_binds_it() {
     gw.shutdown().await;
 }
 
+/// DESIGN §4.21: where a token goes is loosened only from a strong channel, as the connectors'
+/// `hosts` are: typed, or as the `/ok` of the agent's proposal. Taking it back works anywhere.
+#[tokio::test]
+async fn a_tokens_binding_is_loosened_only_from_a_strong_channel() {
+    let home = home("vault-strong");
+    let vault = VAULT.replace("programs = []", "programs = [\"printenv\"]");
+    std::fs::write(home.join("vault.toml"), vault).unwrap();
+    let gw = start(brokered(&home));
+    let saved = || std::fs::read_to_string(home.join("vault.toml")).unwrap();
+    // Discord is an owner's channel, and not a strong one.
+    for (id, loosening) in [
+        ("d1", "/vault bind GH_TOKEN api.github.com"),
+        ("d2", "/vault raw GH_TOKEN on"),
+        ("d3", "/vault url GH_TOKEN on"),
+    ] {
+        gw.say_on("discord", id, "downer", loosening).await;
+    }
+    let refused = gw.wait_replies_on("discord", 3).await;
+    for reply in &refused {
+        assert!(reply.ends_with("needs a strong channel"), "{refused:?}");
+    }
+    assert!(
+        !saved().contains("hosts") && !saved().contains("raw"),
+        "{}",
+        saved()
+    );
+    // The agent's proposal waits for a strong channel too.
+    let bind =
+        r#"[call vault {"action": "bind", "name": "GH_TOKEN", "hosts": ["api.github.com"]}]"#;
+    gw.say("m1", "owner", bind).await;
+    gw.wait_reply("[zephyr] the agent asks to send").await;
+    gw.say_on("discord", "d4", "downer", "/ok 1").await;
+    let waits = gw.wait_replies_on("discord", 4).await;
+    assert_eq!(
+        waits[3],
+        "[zephyr] #1 sends a vault token to more hosts: approve it from tui or chat or passkey"
+    );
+    assert!(!saved().contains("hosts"), "{}", saved());
+    gw.say("m2", "owner", "/ok 1").await;
+    gw.wait_reply("GH_TOKEN is now sent only to api.github.com")
+        .await;
+    assert!(
+        saved().contains("hosts = [\"api.github.com:443\"]"),
+        "{}",
+        saved()
+    );
+    // Tightening, from anywhere.
+    gw.say_on("discord", "d5", "downer", "/vault unbind GH_TOKEN")
+        .await;
+    let replies = gw.wait_replies_on("discord", 5).await;
+    assert!(replies[4].contains("bound to no host now"), "{replies:?}");
+    assert!(!saved().contains("hosts"), "{}", saved());
+    gw.shutdown().await;
+}
+
+/// A vault that cannot be read says nothing about what is in it: the upgrade's notice is not
+/// marked told then, and comes once the vault reads again.
+#[tokio::test]
+async fn the_upgrade_notice_waits_for_a_vault_it_can_read() {
+    let home = home("vault-notice-later");
+    std::fs::write(home.join("vault.toml"), "[[token]\nbroken").unwrap();
+    let gw = start(brokered(&home));
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_reply("echo: ").await;
+    // A few ticks with an owner to tell and nothing readable.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let vault = VAULT.replace("programs = []", "programs = [\"printenv\"]");
+    std::fs::write(home.join("vault.toml"), vault).unwrap();
+    let told = gw
+        .wait_reply("[zephyr] vault tokens and connector secrets now go")
+        .await;
+    assert!(told.contains("\n/vault bind GH_TOKEN HOST..\n"), "{told}");
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_vault_request_asks_the_owner_with_the_commands_that_save_it() {
     let home = home("vault-request");

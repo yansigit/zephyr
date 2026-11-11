@@ -338,9 +338,10 @@ pub struct Floor {
     pub reply_wait: Duration,
     /// How long a tunnel, or a forwarded reply's body, may go with nothing moving.
     pub idle: Duration,
-    /// What the upstream of a decrypted host must verify against (DESIGN §4.21): the roots
-    /// compiled into this binary, which no file or variable of the agent's reaches.
-    pub roots: Arc<rustls::RootCertStore>,
+    /// How the proxy speaks TLS to the upstream of a decrypted host (DESIGN §4.21), built
+    /// once: it verifies against the roots compiled into this binary (`ca::public_roots`),
+    /// which no file or variable of the agent's reaches.
+    pub upstream: Arc<rustls::ClientConfig>,
     /// What signs the leaf a decrypted host is served with. `None` when the CA could not be
     /// loaded: hosts with a token bound then answer 502, and the rest are tunnelled as ever.
     pub ca: Option<Arc<crate::ca::Authority>>,
@@ -360,7 +361,7 @@ impl Floor {
             // Websockets and event streams ping far more often; an IMAP IDLE is renewed within
             // 29 minutes. A dead peer's slot comes back after this.
             idle: Duration::from_secs(30 * 60),
-            roots: crate::ca::public_roots(),
+            upstream: crate::ca::client(crate::ca::public_roots())?,
             ca: None,
         })
     }
@@ -691,7 +692,7 @@ impl Conn {
                 )
             };
             let tls = async {
-                let config = crate::ca::client(self.floor.roots.clone()).ok()?;
+                let config = self.floor.upstream.clone();
                 let server = rustls::pki_types::ServerName::try_from(name.clone()).ok()?;
                 let tls = tokio_rustls::TlsConnector::from(config).connect(server, upstream);
                 let tls = tokio::time::timeout(self.floor.connect_wait, tls).await;
@@ -881,7 +882,8 @@ impl Decrypted {
 
     /// One request on the decrypted connection: checked to be for this host, its stand-ins
     /// swapped for the tokens bound here (by the map as it is now, so an unbinding holds for
-    /// the next request), sent on the one upstream connection, and the reply's headers turned
+    /// the next request), sent on this connection's own upstream connection (made for it at
+    /// its `CONNECT`, never pooled or shared with another client's), and the reply turned
     /// back. Bodies pass as frames, never collected.
     async fn answer(&self, req: Request<Incoming>) -> Response<Body> {
         let cfg = self.conn.cfgs.borrow().clone();
@@ -900,21 +902,27 @@ impl Decrypted {
             return self.refuse(&cfg, StatusCode::FORBIDDEN, why);
         }
         let (mut parts, body_in) = req.into_parts();
-        let upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
         // Origin form, whatever form the client wrote the target in.
         let target = parts.uri.path_and_query().map_or("/", |p| p.as_str());
         parts.uri = target.parse().unwrap_or_default();
-        let used = match crate::broker::swap(&mut parts.uri, &mut parts.headers, &map, &self.dest) {
-            Ok(used) => used,
-            Err(refused) => return self.conn.refuse_token(&cfg, &self.dest, &refused),
-        };
-        // The reply is read for the values bound here (below), so it must come as it is.
+        // What is between the client and this proxy stays here (`hop_by_hop`): an `Upgrade`
+        // among it, so no websocket is carried on a decrypted host, whose frames nobody
+        // would read. And the whole reply is asked for, as it is: a range of a body could cut
+        // a value in a place of the client's choosing, and an encoded one cannot be read.
+        hop_by_hop(&mut parts.headers);
+        parts.headers.remove(hyper::header::RANGE);
+        parts.headers.remove(hyper::header::IF_RANGE);
+        let swapped =
+            match crate::broker::swap(&mut parts.uri, &mut parts.headers, &map, &self.dest) {
+                Ok(swapped) => swapped,
+                Err(refused) => return self.conn.refuse_token(&cfg, &self.dest, &refused),
+            };
         let identity = HeaderValue::from_static("identity");
         parts
             .headers
             .insert(hyper::header::ACCEPT_ENCODING, identity);
         let no_body = parts.method == Method::HEAD;
-        for name in &used {
+        for name in &swapped.used {
             let dest = format!("{name} -> {}", self.dest);
             self.conn.record(&cfg, "swap", &dest, Outcome::Allowed);
         }
@@ -932,35 +940,32 @@ impl Decrypted {
             let why = "the server did not answer".to_string();
             return self.refuse(&cfg, StatusCode::BAD_GATEWAY, why);
         };
-        // A host that sends back what it was sent (an echo, an error page that prints the
-        // request) must not hand the agent the token: every value bound here goes back to its
-        // stand-in, in the reply's headers and in its body.
-        crate::broker::unswap(reply.headers_mut(), &map, &self.dest);
-        if reply.status() == StatusCode::SWITCHING_PROTOCOLS {
-            // A websocket: the handshake was swapped like any request; the frames are not read.
-            if let Some(client) = upgrade {
-                let server = hyper::upgrade::on(&mut reply);
-                let (idle, slot) = (floor.idle, self.conn.slot.clone());
-                tokio::spawn(async move {
-                    if let (Ok(client), Ok(server)) = tokio::join!(client, server) {
-                        relay(TokioIo::new(client), TokioIo::new(server), idle).await;
-                    }
-                    drop(slot);
-                });
-            }
-            return reply.map(|_| body(""));
-        }
-        // A body that cannot be read as it is, is not passed on unread.
-        if encoded(reply.headers()) {
-            let why = format!("{} sent a reply zephyr cannot read (compressed)", self.name);
+        // A reply that is not the whole body as the server wrote it is not passed on unread:
+        // another protocol, a part of a body, or an encoded one.
+        let unreadable = match reply.status() {
+            StatusCode::SWITCHING_PROTOCOLS => Some("switched protocols"),
+            StatusCode::PARTIAL_CONTENT => Some("sent a part of a reply"),
+            _ if encoded(reply.headers()) => Some("sent a reply zephyr cannot read (compressed)"),
+            _ => None,
+        };
+        if let Some(what) = unreadable {
+            let why = format!("{} {what}", self.name);
             return self.refuse(&cfg, StatusCode::BAD_GATEWAY, why);
         }
+        // A host that sends back what it was sent (an echo, an error page that prints the
+        // request) must not hand the agent the token: every value bound here goes back to its
+        // stand-in, in the reply's headers and in its body, and so does a credential this
+        // request carried encoded. The status line's own text is the server's to choose, so
+        // it is left out: the client gets the status's usual words.
+        hop_by_hop(reply.headers_mut());
+        reply.extensions_mut().remove::<hyper::ext::ReasonPhrase>();
+        crate::broker::unswap(reply.headers_mut(), &map, &self.dest, &swapped.sent);
         let idle = |body| Idle {
             body,
             wait: floor.idle,
             timer: Box::pin(tokio::time::sleep(floor.idle)),
         };
-        let replacer = map.unswapper(&self.dest);
+        let replacer = map.unswapper(&self.dest, &swapped.sent);
         let bodiless = matches!(
             reply.status(),
             StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
@@ -979,6 +984,42 @@ impl Decrypted {
             };
             body.boxed_unsync()
         })
+    }
+}
+
+/// Removes what RFC 9110 §7.6.1 says goes no further than one connection: `Connection` and
+/// every header it names, and the ones a proxy never passes on. On the decrypted path each
+/// side's are its own: a client cannot have the proxy carry a header it named as hop-by-hop
+/// past the checks, nor keep a say in how the upstream connection is used.
+fn hop_by_hop(headers: &mut hyper::HeaderMap) {
+    use hyper::header::{HeaderName, CONNECTION};
+    const ALWAYS: [&str; 7] = [
+        "connection",
+        "keep-alive",
+        "te",
+        "trailer",
+        "upgrade",
+        "proxy-authorization",
+        "proxy-connection",
+    ];
+    let named: Vec<HeaderName> = (headers.get_all(CONNECTION).iter())
+        .flat_map(|v| v.to_str().unwrap_or_default().split(','))
+        .filter_map(|name| HeaderName::from_bytes(name.trim().as_bytes()).ok())
+        // The body's framing is hyper's to keep right on each side.
+        .filter(|name| {
+            ![
+                hyper::header::TRANSFER_ENCODING,
+                hyper::header::CONTENT_LENGTH,
+                HOST,
+            ]
+            .contains(name)
+        })
+        .collect();
+    for name in named {
+        headers.remove(name);
+    }
+    for name in ALWAYS {
+        headers.remove(name);
     }
 }
 
@@ -2025,7 +2066,7 @@ mod tests {
             connect_wait: WAIT,
             reply_wait: WAIT,
             idle: WAIT,
-            roots: crate::ca::public_roots(),
+            upstream: crate::ca::client(crate::ca::public_roots()).unwrap(),
             ca: None,
         }
     }
@@ -2876,8 +2917,31 @@ table inet zephyr {
                 }
                 // What the request's `x-key` header held, sent back: cut in two chunks in the
                 // middle of it, the second only once `go` is notified.
-                let sent = head.lines().find_map(|l| l.strip_prefix("x-key: "));
+                let named = |name: &str| head.lines().find_map(|l| l.strip_prefix(name));
+                let sent = named("x-key: ").or(named("authorization: "));
                 let sent = sent.unwrap_or_default().to_string();
+                // The same in the status line's own words, in headers of this hop only, and
+                // as a part of a body.
+                let other = match path.as_str() {
+                    "/reason" => Some(format!(
+                        "HTTP/1.1 200 {sent}\r\ncontent-length: 2\r\n\r\nok"
+                    )),
+                    "/hop" => Some(format!(
+                        "HTTP/1.1 200 OK\r\nconnection: x-hop\r\nx-hop: {sent}\r\n\
+                         keep-alive: timeout=5\r\ncontent-length: 2\r\n\r\nok"
+                    )),
+                    "/partial" => Some(
+                        "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes 0-1/9\r\n\
+                         content-length: 2\r\n\r\nre"
+                            .to_string(),
+                    ),
+                    _ => None,
+                };
+                if let Some(reply) = other {
+                    s.write_all(reply.as_bytes()).await.ok()?;
+                    s.flush().await.ok()?;
+                    continue;
+                }
                 if path.starts_with("/echo-chunked") {
                     let start = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n";
                     s.write_all(start.as_bytes()).await.ok()?;
@@ -2993,7 +3057,7 @@ table inet zephyr {
                 let dest = format!("bound.test:{}", up.port);
                 let floor = Floor {
                     lookup: names,
-                    roots: web_roots.clone(),
+                    upstream: crate::ca::client(web_roots.clone()).unwrap(),
                     ca: with_ca.then(|| Arc::new(ca)),
                     ..floor()
                 };
@@ -3253,8 +3317,11 @@ table inet zephyr {
             read_until(&mut tls, "data: 3\n\n").await;
         }
 
+        /// A websocket's frames would pass unread, so none is carried on a decrypted host: the
+        /// `Upgrade` is this hop's and goes no further, and a server that switches protocols
+        /// all the same is refused.
         #[tokio::test]
-        async fn a_websocket_handshake_is_swapped_and_frames_pass() {
+        async fn no_websocket_is_carried_on_a_bound_host() {
             let mut net = Net::start("broker-ws", "", true).await;
             let dest = net.dest.clone();
             let s = net.vault(&[("A", A, &[dest.as_str()], false)]);
@@ -3264,15 +3331,156 @@ table inet zephyr {
                 s[0]
             );
             let reply = get(&mut tls, &net, "/ws", &headers).await;
-            assert!(reply.starts_with("HTTP/1.1 101 "), "{reply}");
-            assert!(net
-                .head()
-                .await
-                .contains(&format!("authorization: Bearer {A}\r\n")));
-            for frame in ["hello", "again"] {
-                tls.write_all(frame.as_bytes()).await.unwrap();
-                read_until(&mut tls, &frame.to_uppercase()).await;
+            let want = "HTTP/1.1 502 zephyr: bound.test switched protocols\r\n";
+            assert!(reply.starts_with(want), "{reply}");
+            let head = net.head().await.to_lowercase();
+            assert!(
+                !head.contains("upgrade") && !head.contains("connection"),
+                "{head}"
+            );
+        }
+
+        /// The ways a host can send a token back other than as it is, each of which the
+        /// review of the first build found open: a Basic credential (base64 of the value), the
+        /// status line's own words, a part of a body, and headers meant for one hop.
+        #[tokio::test]
+        async fn a_token_sent_back_in_another_form_does_not_reach_the_agent() {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let mut net = Net::start("broker-forms", "", true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[("A", A, &[dest.as_str()], false)]);
+            let mut tls = net.bound().await;
+            let leaked = |text: &str| {
+                let forms = crate::vault::base64_forms(A);
+                text.contains(A) || forms.iter().any(|f| text.contains(f.as_str()))
+            };
+
+            // `curl -u x:$TOKEN`: the server gets the token inside a Basic credential, and an
+            // echo of that credential comes back as the one the agent's program wrote.
+            let written = b64.encode(format!("x:{}", s[0]));
+            let basic = format!("Authorization: Basic {written}\r\n");
+            let (head, body) = get_body(&mut tls, &net, "/echo-length", &basic).await;
+            let sent = net.head().await;
+            let real = b64.encode(format!("x:{A}"));
+            assert!(
+                sent.contains(&format!("authorization: Basic {real}\r\n")),
+                "{sent}"
+            );
+            assert_eq!(body, format!("key=Basic {written}"));
+            assert!(
+                head.contains(&format!("x-echo: Basic {written}\r\n")),
+                "{head}"
+            );
+            assert!(!leaked(&head) && !leaked(&body), "{head}{body}");
+
+            // The token in base64 at another offset, as a server that keeps it might send it.
+            let blob = b64.encode(format!("{{\"k\":\"{A}\"}}"));
+            let (head, body) = get_body(
+                &mut tls,
+                &net,
+                "/echo-length",
+                &format!("X-Key: {blob}\r\n"),
+            )
+            .await;
+            net.head().await;
+            assert!(!leaked(&head) && !leaked(&body), "{head}{body}");
+            assert!(body.contains(&s[0]), "{body}");
+
+            // The status line's own text is the server's: the client gets the usual words.
+            let key = format!("X-Key: {}\r\n", s[0]);
+            let head = get(&mut tls, &net, "/reason", &key).await;
+            net.head().await;
+            assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+            assert!(!leaked(&head), "{head}");
+
+            // A range is not asked for, so no value is cut where the client chose.
+            let ranged = format!("{key}Range: bytes=4-9\r\nIf-Range: \"x\"\r\n");
+            let (_, body) = get_body(&mut tls, &net, "/echo-length", &ranged).await;
+            let sent = net.head().await.to_lowercase();
+            assert!(!sent.contains("range"), "{sent}");
+            assert_eq!(body, format!("key={}", s[0]));
+
+            // What is one hop's stays on that hop, both ways: a header the client names in
+            // `Connection` is not carried past the checks, nor the server's to the client.
+            let hop = format!(
+                "{key}Connection: x-internal, content-length, host\r\nX-Internal: {}\r\nKeep-Alive: timeout=9\r\n\
+                 TE: trailers\r\nProxy-Authorization: Bearer {}\r\n",
+                s[0], s[0]
+            );
+            let (head, _) = get_body(&mut tls, &net, "/hop", &hop).await;
+            let sent = net.head().await.to_lowercase();
+            for gone in [
+                "x-internal",
+                "keep-alive",
+                "\r\nte:",
+                "proxy-authorization",
+                "connection",
+            ] {
+                assert!(!sent.contains(gone), "{gone} in {sent}");
             }
+            assert!(sent.contains("\r\nhost: bound.test"), "{sent}");
+            let head = head.to_lowercase();
+            assert!(
+                !head.contains("x-hop") && !head.contains("keep-alive"),
+                "{head}"
+            );
+            assert!(!leaked(&head), "{head}");
+
+            // A part of a body is not passed on: last, since the reply is dropped unread.
+            let head = get(&mut tls, &net, "/partial", &key).await;
+            let want = "HTTP/1.1 502 zephyr: bound.test sent a part of a reply\r\n";
+            assert!(head.starts_with(want), "{head}");
+            let row = (
+                "swap".to_string(),
+                dest.clone(),
+                "refused: bound.test sent a part of a reply".to_string(),
+            );
+            let deadline = tokio::time::Instant::now() + WAIT;
+            while !net.rows().contains(&row) {
+                assert!(tokio::time::Instant::now() < deadline, "{:?}", net.rows());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        /// A request shaped to be read two ways (a length and a chunked body) reaches the
+        /// server as one well-formed request, and what follows it is a request of its own,
+        /// checked like any other.
+        #[tokio::test]
+        async fn a_request_with_two_framings_reaches_the_server_as_one() {
+            let mut net = Net::start("broker-smuggle", "", true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[("A", A, &[dest.as_str()], false)]);
+            let mut tls = net.bound().await;
+            let two = format!(
+                "POST /upload HTTP/1.1\r\nHost: {dest}\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n\
+                 0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: attacker.test\r\nX-Key: {}\r\n\r\n",
+                s[0]
+            );
+            tls.write_all(two.as_bytes()).await.unwrap();
+            let first = read_head(&mut tls).await.expect("no reply");
+            if first.starts_with("HTTP/1.1 400 ") {
+                // Refused outright: nothing reached the server.
+                assert!(net.up.heads.try_recv().is_err());
+                return;
+            }
+            let sent = net.head().await.to_lowercase();
+            assert!(sent.starts_with("post /upload "), "{sent}");
+            assert!(!sent.contains("content-length"), "{sent}");
+            // What followed it was either never read (the connection is closed after a request
+            // framed two ways) or read as a request of its own and refused: it names another
+            // host. Either way the server read one request, and no token went out.
+            let mut rest = Vec::new();
+            let _ = tokio::time::timeout(WAIT, tls.read_to_end(&mut rest)).await;
+            let rest = String::from_utf8_lossy(&rest);
+            assert!(
+                !rest.contains(" 200 ") || rest.contains("Host does not match"),
+                "{rest}"
+            );
+            assert!(
+                net.up.heads.try_recv().is_err(),
+                "the server read no second request"
+            );
         }
 
         #[tokio::test]
