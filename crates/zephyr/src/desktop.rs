@@ -160,6 +160,10 @@ fn start(program: &str, first: &[&str], rest: &[&str]) -> Option<Child> {
 /// it. The `agent-browser` and `xdotool` wrappers look for it before anything else.
 pub const HELD_FILE: &str = "desktop-held";
 
+/// state.db's `meta` row that holds a takeover's start while it lasts: the daemon's own record,
+/// which a start trusts where it does not trust the flag file.
+pub const TAKE_META: &str = "desktop_take";
+
 pub const OTHER_DEVICE: &str = "another device has the desktop";
 pub const FILLING: &str = "the vault is signing in; try again in a moment";
 const NO_FLAG: &str = "the desktop could not be held; zephyr doctor says why";
@@ -207,9 +211,11 @@ impl Drop for Fill {
 }
 
 impl Control {
-    /// Nobody holds the desktop at a start: a flag a crash, a restart or a re-exec left is
-    /// removed, and that takeover is over, which the first event says (its start is the flag's).
-    /// The wrappers that waited on the old daemon's socket have already exited 1.
+    /// Nobody holds the desktop at a start: a flag left behind is removed. When the daemon's
+    /// own record ([`TAKE_META`]) shows a takeover that a crash, a restart or a re-exec ended,
+    /// the first event says so, with its real start; a flag alone says nothing (a hand back
+    /// that could not remove it), and what it holds is not read. The wrappers that waited on
+    /// the old daemon's socket have already exited 1.
     pub fn new(cfg: &Config) -> Arc<Control> {
         let (events, taken) = mpsc::unbounded_channel();
         let control = Control {
@@ -219,16 +225,28 @@ impl Control {
             events,
             taken: Mutex::new(Some(taken)),
         };
-        if let Ok(left) = std::fs::read_to_string(control.flag()) {
-            let until = crate::now();
+        let left = control.record(|store| {
+            let left = store.meta(TAKE_META)?;
+            store.set_meta(TAKE_META, None)?;
+            Ok(left)
+        });
+        if let Some(since) = left.flatten().and_then(|since| since.parse().ok()) {
             let _ = control.events.send(Event::Gave {
-                since: left.trim().parse().unwrap_or(until),
-                until,
+                since,
+                until: crate::now(),
                 restart: true,
             });
         }
         let _ = std::fs::remove_file(control.flag());
         Arc::new(control)
+    }
+
+    /// Reads or writes the takeover's record in state.db; a failure is logged, never fatal.
+    fn record<T>(&self, f: impl FnOnce(&crate::store::Store) -> rusqlite::Result<T>) -> Option<T> {
+        crate::store::Store::open(&self.cfg.db_path())
+            .and_then(|store| f(&store))
+            .map_err(|e| eprintln!("zephyr: the takeover's record in state.db: {e}"))
+            .ok()
     }
 
     /// The takes and hand backs from now on, each once and in order. The router's, taken once.
@@ -281,6 +299,7 @@ impl Control {
             self.held.send_replace(None);
             return Err(NO_FLAG);
         }
+        self.record(|store| store.set_meta(TAKE_META, Some(&now.to_string())));
         let _ = self.events.send(Event::Took(held));
         Ok(())
     }
@@ -288,9 +307,15 @@ impl Control {
     /// The desktop goes back to the agent: `(since, until)` when it was held.
     pub fn give(&self, now: i64) -> Option<(i64, i64)> {
         let _fills = self.fills.lock().unwrap_or_else(|e| e.into_inner());
+        // The hold is the truth and ends here, whatever becomes of the flag: one that stays
+        // only makes the wrappers ask the gate, which lets them run at once.
         let held = self.held.send_replace(None)?;
-        if let Err(e) = std::fs::remove_file(self.flag()) {
-            // The wrappers then still ask the gate, which lets them run at once.
+        self.record(|store| store.set_meta(TAKE_META, None));
+        let removed = (0..3).find_map(|_| match std::fs::remove_file(self.flag()) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some(e),
+            _ => None,
+        });
+        if let Some(e) = removed {
             eprintln!("zephyr: removing {}: {e}", self.flag().display());
         }
         let _ = self.events.send(Event::Gave {
@@ -511,12 +536,21 @@ mod tests {
     #[test]
     fn a_start_removes_a_stale_flag() {
         let (cfg, control) = control("desktop-stale");
+        // A flag with no take on record (a hand back that could not remove it): removed, and
+        // nobody is told of a takeover that was not one. What the file says is not read.
+        crate::drafts::ensure_public_dir(&cfg).unwrap();
+        std::fs::write(flag(&cfg), "100\n").unwrap();
+        let clean = Control::new(&cfg);
+        assert!(!flag(&cfg).exists());
+        assert!(clean.events().try_recv().is_err());
         control.take([1; 32], 100).unwrap();
         assert!(flag(&cfg).exists());
+        std::fs::write(flag(&cfg), "7\n").unwrap();
         // The daemon crashed and starts again.
         let again = Control::new(&cfg);
         assert!(again.held().is_none() && !flag(&cfg).exists());
-        // That takeover is over, and whoever listens is told since when it ran.
+        // That takeover is over, and whoever listens is told since when it ran, from the
+        // daemon's own record.
         let told = again.events().try_recv();
         assert!(
             matches!(
@@ -577,6 +611,21 @@ mod tests {
             )]
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The hold is the truth, the flag only the hint to ask: a hand back whose flag stays
+    /// (here it became a folder) still ends the hold, and leaves no take on record.
+    #[test]
+    fn a_flag_that_cannot_be_removed_still_ends_the_hold() {
+        let (cfg, control) = control("desktop-stuck");
+        control.take([1; 32], 100).unwrap();
+        std::fs::remove_file(flag(&cfg)).unwrap();
+        std::fs::create_dir(flag(&cfg)).unwrap();
+        assert_eq!(control.give(160), Some((100, 160)));
+        assert!(control.held().is_none());
+        assert!(control.fill().is_some(), "the vault still waits");
+        assert!(Control::new(&cfg).events().try_recv().is_err());
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&cfg));
     }
 
     #[test]

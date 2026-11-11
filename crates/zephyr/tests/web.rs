@@ -3159,8 +3159,18 @@ async fn a_restart_during_a_takeover_tells_the_owner_and_main() {
     gw.sent("chat", |t| t.contains("echo: ")).await;
     let flag = gw.held_flag();
     gw.shutdown().await;
-    // The daemon went down while the owner held the desktop: the flag is still there.
+    // A flag with no take on record ends no takeover: it is removed, and nothing is said.
     std::fs::write(&flag, "50400\n").unwrap();
+    let gw = start_in(&home, free_port(), "", |_| {});
+    gw.up().await;
+    gw.say("chat", "idle").await;
+    gw.sent("chat", |t| t.contains("echo: ")).await;
+    assert!(!flag.exists());
+    assert_eq!(gw.rpi_log("queue_message").len(), 0);
+    // The daemon went down while the owner held the desktop: its own record says since when.
+    gw.store().set_meta("desktop_take", Some("50400")).unwrap();
+    gw.shutdown().await;
+    std::fs::write(&flag, "1\n").unwrap();
     let gw = start_in(&home, free_port(), "", |_| {});
     gw.sent("chat", |t| {
         t == "[zephyr] the desktop went back to the agent when zephyr restarted"
@@ -3177,6 +3187,7 @@ async fn a_restart_during_a_takeover_tells_the_owner_and_main() {
             && note.ends_with(". The page may have changed: take a fresh snapshot before acting."),
         "{note}"
     );
+    assert_eq!(gw.store().meta("desktop_take").unwrap(), None);
     gw.shutdown().await;
 }
 

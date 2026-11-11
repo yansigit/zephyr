@@ -70,10 +70,6 @@ const PUBLIC: &str = "/var/lib/zephyr-public";
 const HELD_WAIT: Duration = Duration::from_secs(3 * 60);
 /// What the agent reads when the gate cannot be asked or does not answer.
 pub const NOT_ANSWERING: &str = "the gate is not answering; not run";
-/// What the agent reads when the owner took the desktop while its command waited at the gate,
-/// and handed it back before the wrapper could ask since when.
-pub const TAKEN: &str = "not run: the owner used the desktop meanwhile; take a fresh snapshot \
-                         before acting";
 /// What the agent reads when the control or the page is not what the owner approved (I4).
 pub const CHANGED: &str = "the page changed while the owner decided; not run";
 
@@ -464,17 +460,18 @@ pub fn run(args: &[String], env: &Env) -> Next {
 
 /// Defence in depth, after any `allow` and before the page is read again: the command waited
 /// at the gate, maybe for minutes, and the owner may have taken the desktop over meanwhile (the
-/// gate refuses such an `allow` itself). Then the gate is told the action did not run, and the
-/// wrapper waits on the desktop like any command, which never ends in a run.
+/// gate refuses such an `allow` itself). The wrapper then waits on the desktop like any command,
+/// and when the gate says the owner has (or had) it, tells the gate the action did not run.
 fn taken(
     env: &Env,
     wait: Option<std::os::unix::net::UnixStream>,
 ) -> Result<Option<std::os::unix::net::UnixStream>, Next> {
-    if !flagged(env) {
+    // The flag is only the hint to ask: a stale one, with no hold behind it, refuses nothing.
+    let Some(text) = held(env) else {
         return Ok(wait);
-    }
+    };
     said(wait, false);
-    Err(Next::Refuse(held(env).unwrap_or_else(|| TAKEN.into())))
+    Err(Next::Refuse(text))
 }
 
 /// M2: an action the owner let go (an `allow` after a wait, with its number) is recorded by the
@@ -2174,6 +2171,13 @@ cat "$d/$f.json"
         // Taken over while it waits; then the owner's `/ok` reaches the wrapper as `allow`.
         std::fs::write(t.dir.join(crate::desktop::HELD_FILE), "100\n").unwrap();
         answer(&mut conn, json!({"verdict": "allow", "id": 7}));
+        // It waits on the desktop like any command, tells the gate that the click did not run,
+        // and exits with the gate's words.
+        let (req, mut desk) = asked(&gate);
+        assert_eq!(req, json!({"v": 1, "desktop": "wait", "session": "main"}));
+        let back = "zephyr: the owner used the desktop from 14:04 to 14:08; this command did \
+                    not run. The page may have changed: take a fresh snapshot before acting.";
+        answer(&mut desk, json!({"verdict": "deny", "text": back}));
         let mut said = String::new();
         BufReader::new(conn.try_clone().unwrap())
             .read_line(&mut said)
@@ -2182,12 +2186,6 @@ cat "$d/$f.json"
             serde_json::from_str::<Value>(&said).unwrap(),
             json!({"ran": false})
         );
-        // It then waits on the desktop like any command, and exits with the gate's words.
-        let (req, mut conn) = asked(&gate);
-        assert_eq!(req, json!({"v": 1, "desktop": "wait", "session": "main"}));
-        let back = "zephyr: the owner used the desktop from 14:04 to 14:08; this command did \
-                    not run. The page may have changed: take a fresh snapshot before acting.";
-        answer(&mut conn, json!({"verdict": "deny", "text": back}));
         assert_eq!(waiting.join().unwrap(), Next::Refuse(back.into()));
         assert_eq!(
             t.argv().len(),
@@ -2205,9 +2203,35 @@ cat "$d/$f.json"
         answer(&mut conn, json!({"verdict": "allow"}));
         let (req, mut conn) = asked(&gate);
         assert_eq!(req["desktop"], "wait", "{req}");
-        // Handed back just then: still not run, on a page the owner may have changed.
+        // The flag is only the hint to ask: the gate says nothing is held, so it goes on.
         answer(&mut conn, json!({"verdict": "deny", "text": ""}));
-        assert_eq!(waiting.join().unwrap(), Next::Refuse(TAKEN.into()));
+        assert_eq!(waiting.join().unwrap(), Next::Exec);
+    }
+
+    /// A flag left with no hold behind it (a hand back that could not remove it) refuses
+    /// nothing: what the gate answers decides, each time the wrapper asks.
+    #[test]
+    fn a_stale_flag_with_no_hold_refuses_nothing() {
+        let t = T::new("bg-stale-flag");
+        t.page(MAIL, COMPOSE, "");
+        std::fs::write(t.dir.join(crate::desktop::HELD_FILE), "100\n").unwrap();
+        let gate = t.gate();
+        let free = json!({"verdict": "deny", "text": ""});
+        let waiting = t.spawn(&["click", "@e3"]);
+        answer(&mut asked(&gate).1, free.clone());
+        let (req, mut conn) = asked(&gate);
+        assert_eq!(req["browser"]["name"], "Send", "{req}");
+        answer(&mut conn, json!({"verdict": "allow", "id": 7}));
+        answer(&mut asked(&gate).1, free);
+        let mut said = String::new();
+        BufReader::new(conn.try_clone().unwrap())
+            .read_line(&mut said)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&said).unwrap(),
+            json!({"ran": true})
+        );
+        assert_eq!(waiting.join().unwrap(), Next::Exec);
     }
 
     #[test]
