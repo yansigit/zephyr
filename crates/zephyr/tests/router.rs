@@ -7867,3 +7867,574 @@ async fn a_held_exec_reads_held_not_sent() {
     assert!(reply.ends_with("out main held: curl POST e.x"), "{reply}");
     gw.shutdown().await;
 }
+
+// ---- virtual cards (DESIGN §4.22) ----
+
+const SHOP: &str = "https://shop.example/checkout";
+
+/// A browser home open on the shop's checkout, with cards on `provider` in CAD and the money
+/// mode `money` (`ask` when empty).
+fn card_home(name: &str, provider: &str, money: &str) -> (PathBuf, Config) {
+    let (home, mut cfg) = browser_home(name, SHOP);
+    let mode = match money {
+        "" => String::new(),
+        m => format!("money = '{m}'\n"),
+    };
+    let approvals = format!("currency = 'CAD'\nstrong_only = ['loosen', 'money']\n{mode}");
+    cfg.approvals = Some(toml::from_str(&approvals).unwrap());
+    cfg.cards = Some(toml::from_str(&format!("provider = '{provider}'")).unwrap());
+    cfg.cards_fake = true;
+    cfg.tick = Duration::from_millis(200);
+    cfg.validate().unwrap();
+    (home, cfg)
+}
+
+fn card_ask(amount: &str) -> String {
+    format!(
+        r#"[call card {{"action": "request", "site": "{SHOP}", "merchant": "Shop", "amount": "{amount}", "currency": "CAD", "reason": "the owner asked for rice"}}]"#
+    )
+}
+
+const CARD_FILL: &str =
+    r##"[call card {"action": "fill", "id": 1, "number": "#n", "expiry": "#e", "cvc": "#c"}]"##;
+
+fn card_status(home: &Path, id: i64) -> String {
+    let store = Store::open(&home.join("state.db")).unwrap();
+    store.card(id).unwrap().map_or("none".into(), |c| c.status)
+}
+
+fn set_page(home: &Path, url: &str) {
+    std::fs::write(home.join("ab-url.txt"), format!("{url}\n")).unwrap();
+    let ok = serde_json::json!({"success": true, "data": {"url": url}}).to_string();
+    std::fs::write(home.join("ab-url.json"), ok).unwrap();
+}
+
+fn fills(home: &Path) -> Vec<String> {
+    let all = browser_argv(home).into_iter();
+    all.filter(|l| l.starts_with("fill")).collect()
+}
+
+/// Every place the daemon writes: no outbox, inbox or audit row, and no session file, holds
+/// `number`.
+fn nowhere(home: &Path, gw: &Gateway, number: &str) {
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    for (table, column) in [
+        ("outbox", "text"),
+        ("inbox", "text"),
+        ("audit", "args"),
+        ("audit", "outcome"),
+        ("proposals", "payload"),
+        ("proposals", "summary"),
+        ("cards", "provider_ref"),
+        ("procs", "command"),
+    ] {
+        let hits: i64 = db
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE {column} LIKE ?1"),
+                [format!("%{number}%")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 0, "{table}.{column} holds the number");
+    }
+    assert!(
+        !main_session(home).contains(number),
+        "the session holds the number"
+    );
+    for channel in ["chat", "discord"] {
+        let said = gw.replies_on(channel);
+        assert!(!said.iter().any(|r| r.contains(number)), "{said:?}");
+    }
+}
+
+/// Review Focus 1, 2 and 6, and the whole of a hand-made card's life: held as a payment,
+/// approved only from a strong channel, its number taken from memory, filled only on its
+/// origin, scrubbed wherever it is echoed, and forgotten at its expiry.
+#[tokio::test]
+async fn a_manual_card_is_approved_entered_filled_on_its_origin_and_forgotten() {
+    let (home, cfg) = card_home("card-manual", "manual", "");
+    let service = "[[service]]\nname = \"cards\"\nprovider = \"link\"\nkey = \"sk_servicekey42\"\n";
+    std::fs::write(home.join("vault.toml"), service).unwrap();
+    let gw = start(cfg);
+    gw.say("c1", "owner", &card_ask("42.50")).await;
+    let card = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    assert!(
+        card.starts_with(
+            "[zephyr] approve #1: payment (virtual card)\n\
+             pays: https://shop.example · the number is filled only there\n\
+             card: one you make for this purchase · up to 42.50 CAD · forgotten 15 min after \
+             you enter it\n\
+             merchant (the agent's words): \"Shop\"\n\
+             the agent says: \"the owner asked for rice\"\n"
+        ),
+        "{card}"
+    );
+    assert!(
+        card.ends_with("this one needs tui or chat or passkey"),
+        "{card}"
+    );
+    let held =
+        "\ncard: held for the owner as #1 (a card for up to 42.50 CAD on https://shop.example)";
+    reply_where(&gw, "chat", |r| r.contains(held)).await;
+
+    // Not from Discord: a payment's /ok needs a strong channel.
+    gw.say_on("discord", "d1", "downer", "/ok 1").await;
+    let refused = reply_where(&gw, "discord", |r| r.contains("approving a payment")).await;
+    assert_eq!(
+        refused,
+        "[zephyr] approving a payment needs tui or chat or passkey"
+    );
+    assert_eq!(action_status(&home, 1), "pending");
+    assert_eq!(card_status(&home, 1), "none");
+
+    gw.say("c2", "owner", "/ok 1").await;
+    let approved = reply_where(&gw, "chat", |r| r.contains("approved #1")).await;
+    assert!(
+        approved.ends_with(": issuing the card; what to do next follows"),
+        "{approved}"
+    );
+    let make = reply_where(&gw, "chat", |r| {
+        r.starts_with("[zephyr] card #1: make a card")
+    })
+    .await;
+    assert!(
+        make.contains("zephyr card put 1") && make.contains("42.50 CAD"),
+        "{make}"
+    );
+    // Issued once: a second /ok finds nothing waiting.
+    gw.say("c3", "owner", "/ok 1").await;
+    reply_where(&gw, "chat", |r| r.contains("no proposal #1 is waiting")).await;
+    wait(|| action_status(&home, 1) == "done").await;
+    assert_eq!(card_status(&home, 1), "waiting");
+    assert_eq!(card_status(&home, 2), "none");
+
+    // Before the owner entered it there is nothing to fill.
+    gw.say("c4", "owner", CARD_FILL).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains("\ncard: not filled: card #1 still waits")
+    })
+    .await;
+
+    // The number comes with a chat line, in memory; a strong channel only, and never as text.
+    let pan = || zephyr::cards::Pan::parse("4242 4242 4242 4242", "06/29", "123").unwrap();
+    zephyr::cards::enter("card-manual-d2", pan());
+    gw.say_on("discord", "card-manual-d2", "downer", "/card put 1 new")
+        .await;
+    let refused = reply_where(&gw, "discord", |r| r.contains("entering a card")).await;
+    assert_eq!(
+        refused,
+        "[zephyr] entering a card needs tui or chat or passkey"
+    );
+    assert!(
+        zephyr::cards::entered("card-manual-d2").is_none(),
+        "dropped, not kept"
+    );
+    gw.say("c5", "owner", "/card put 1 new").await;
+    reply_where(&gw, "chat", |r| r.contains("never typed into a chat")).await;
+    assert_eq!(card_status(&home, 1), "waiting");
+    zephyr::cards::enter("card-manual-c6", pan());
+    gw.say("card-manual-c6", "owner", "/card put 1 new").await;
+    let ready = reply_where(&gw, "chat", |r| r.contains("is ready")).await;
+    assert!(
+        ready.starts_with(
+            "[zephyr] card #1 (…4242) is ready: filled only on https://shop.example, forgotten at "
+        ),
+        "{ready}"
+    );
+    assert_eq!(
+        inbox_text(&home, "card-manual-c6").as_deref(),
+        Some("/card put 1 new")
+    );
+    // The agent is told, as a note of zephyr's.
+    reply_where(&gw, "chat", |r| {
+        r.contains("[card #1 issued; zephyr's note")
+    })
+    .await;
+
+    // Review Focus 2: a look-alike origin gets nothing typed.
+    let refusals = || -> Vec<String> {
+        let all = gw.replies().into_iter();
+        all.filter(|r| r.contains("\ncard: not filled: the open page is on "))
+            .collect()
+    };
+    for (n, page) in [
+        "https://shop.example.evil.test/checkout",
+        "http://shop.example/checkout",
+        "https://shop.example:8443/checkout",
+        "https://evil.test/?https://shop.example/checkout",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        set_page(&home, page);
+        let fill = format!("{CARD_FILL} {n}");
+        gw.say(&format!("look-{n}"), "owner", &fill).await;
+        wait(|| refusals().len() > n).await;
+        let refused = &refusals()[n];
+        assert!(
+            refused.contains("but card #1 is only for https://shop.example"),
+            "{page}: {refused}"
+        );
+    }
+    assert!(fills(&home).is_empty(), "{:?}", browser_argv(&home));
+
+    set_page(&home, SHOP);
+    gw.say("c7", "owner", &format!("{CARD_FILL} now")).await;
+    let filled = reply_where(&gw, "chat", |r| r.contains("\ncard: filled")).await;
+    assert!(
+        filled.contains(
+            "\ncard: filled the number and expiry and code of card #1 (…4242) on \
+             https://shop.example/checkout"
+        ),
+        "{filled}"
+    );
+    assert_eq!(
+        fills(&home),
+        ["fill #n 4242424242424242", "fill #e 06/29", "fill #c 123"]
+    );
+
+    // Review Focus 1: a read-back the agent echoes comes back as the card's label.
+    std::fs::write(
+        home.join("readback.txt"),
+        "4242424242424242 or 4242 4242 4242 4242, code 123\n",
+    )
+    .unwrap();
+    let echo = format!(
+        r#"[call exec {{"command": "cat {}; env; cat \"$ZEPHYR_MCP_CONFIG\" 2>/dev/null"}}]"#,
+        home.join("readback.txt").display()
+    );
+    gw.say("c8", "owner", &echo).await;
+    let echoed = reply_where(&gw, "chat", |r| r.contains("\nexec: exited")).await;
+    assert!(
+        echoed.contains("[card:#1] or [card:#1], code [card:#1]"),
+        "{echoed}"
+    );
+    // Review Focus 6: the provider's key is not in the agent's environment or mcp.json (the
+    // command's own log, which nothing scrubs in a test, holds what it really printed).
+    let logs = std::fs::read_dir(home.join(".procs")).unwrap();
+    let printed: String = logs
+        .flatten()
+        .filter_map(|f| std::fs::read_to_string(f.path()).ok())
+        .collect();
+    assert!(
+        printed.contains("ZEPHYR_"),
+        "the environment was printed: {printed}"
+    );
+    assert!(!printed.contains("sk_servicekey42"), "{printed}");
+    gw.say("c9", "owner", "/vault").await;
+    let listed = reply_where(&gw, "chat", |r| r.contains("service cards")).await;
+    assert!(
+        listed.contains("service cards: link; a key is saved"),
+        "{listed}"
+    );
+    nowhere(&home, &gw, "4242424242424242");
+    nowhere(&home, &gw, "sk_servicekey42");
+
+    // Past its time the number is forgotten with no word from the owner, and still scrubbed.
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    db.execute("UPDATE cards SET expires_at = 1", []).unwrap();
+    let forgot = reply_where(&gw, "chat", |r| r.contains("zephyr forgot its number")).await;
+    assert!(
+        forgot.starts_with("[zephyr] card #1 (…4242): expired unused, and zephyr forgot its number. No charge data: check your card app"),
+        "{forgot}"
+    );
+    assert_eq!(card_status(&home, 1), "unknown");
+    gw.say("c10", "owner", &format!("{CARD_FILL} late")).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains("\ncard: not filled: card #1 is unknown")
+    })
+    .await;
+    assert_eq!(fills(&home).len(), 3, "nothing more was typed");
+    gw.say("c11", "owner", "/card done 1").await;
+    reply_where(&gw, "chat", |r| r == "[zephyr] card #1 is closed").await;
+    assert_eq!(card_status(&home, 1), "closed");
+    nowhere(&home, &gw, "4242424242424242");
+    gw.shutdown().await;
+}
+
+/// The page the agent's browser is on, with a labelled total and a Pay button, `@e3`.
+fn pay_page(home: &Path, total: &str) {
+    let tree = format!("- StaticText \"Order total: {total}\"\n- button \"Pay now\" [ref=e3]");
+    let refs = serde_json::json!({"e3": {"role": "button", "name": "Pay now"}});
+    let data = serde_json::json!({"snapshot": tree, "origin": SHOP, "refs": refs});
+    let snapshot = serde_json::json!({"success": true, "data": data}).to_string();
+    std::fs::write(home.join("ab-snapshot.json"), snapshot).unwrap();
+}
+
+fn audit_outcomes(home: &Path, tool: &str) -> Vec<String> {
+    let rows = Store::open(&home.join("state.db"))
+        .unwrap()
+        .audit_rows()
+        .unwrap();
+    let of_tool = rows.into_iter().filter(|r| r.1 == tool);
+    of_tool.map(|r| r.3).collect()
+}
+
+/// Review Focus 4 and 5: no card without zephyr's checks; an issued card lets its own Pay
+/// click through within its cap and nothing else; the issuer's charge closes it and names the
+/// payee by id.
+#[tokio::test]
+async fn an_issued_card_passes_its_pay_click_and_closes_at_its_charge() {
+    use zephyr::cards::{CardState, Charge, Fake};
+    let (home, cfg) = card_home("card-fake", "fake", "");
+    let script = cfg.clone();
+    let gw = start(cfg);
+    // Refused before any hold, and held before any issue: the issuer hears nothing.
+    gw.say("f0", "owner", &card_ask("500")).await;
+    let refused = reply_where(&gw, "chat", |r| r.contains("\ncard: not run")).await;
+    assert!(
+        refused.contains(
+            "\ncard: not run: a card is for more than 0 and at most 100.00 CAD (cards.max)"
+        ),
+        "{refused}"
+    );
+    gw.say("f1", "owner", &card_ask("42.50")).await;
+    let card = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    assert!(
+        card.contains("\ncard: single use · up to 42.50 CAD · closes 15 min after it is issued or after one charge\n"),
+        "{card}"
+    );
+    assert!(Fake::script(&script, |s| s.log.clone()).is_empty());
+    assert_eq!(card_status(&home, 1), "none");
+
+    gw.say("f2", "owner", "/ok 1").await;
+    reply_where(&gw, "chat", |r| {
+        r.contains("[card #1 issued; zephyr's note")
+    })
+    .await;
+    let log = Fake::script(&script, |s| s.log.clone());
+    assert_eq!(log[0], "issue 1 4250 CAD https://shop.example");
+    assert!(
+        !log.iter().any(|l| l.starts_with("reveal")),
+        "not before a fill: {log:?}"
+    );
+    assert_eq!(card_status(&home, 1), "open");
+
+    // The Pay click on the card's origin, for a total within its cap, goes.
+    pay_page(&home, "CA$42.50");
+    // Each click's turn is over before the next is asked: a message that arrives mid-turn is
+    // steered in, and the stand-in agent runs no tool for those.
+    let turns = || {
+        let all = gw.replies().into_iter();
+        all.filter(|r| r.contains("click @e3\"}]\nexec:")).count()
+    };
+    gw.say("f3", "owner", &click_send(&home)).await;
+    wait(|| clicks(&home).len() == 1 && turns() == 1).await;
+    assert_eq!(audit_outcomes(&home, "browser"), ["card"]);
+    // Over the cap it is held like any payment.
+    pay_page(&home, "CA$50.00");
+    gw.say("f4", "owner", &click_send(&home)).await;
+    let over = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #2:")).await;
+    assert!(
+        over.starts_with("[zephyr] approve #2: payment (browser)"),
+        "{over}"
+    );
+    gw.say("f5", "owner", "/no 2").await;
+    reply_where(&gw, "chat", |r| r.contains("[process #2 exited")).await;
+    wait(|| turns() == 2).await;
+    assert_eq!(clicks(&home).len(), 1);
+
+    // The issuer reports the charge: the card closes, and the payee is named by its id.
+    Fake::script(&script, |s| {
+        s.state = CardState::Used(vec![Charge {
+            minor: 4250,
+            currency: "CAD".into(),
+            merchant_id: Some("4445123456".into()),
+            descriptor: Some("AMAZON.CA".into()),
+            mcc: Some("5999".into()),
+        }])
+    });
+    let charged = reply_where(&gw, "chat", |r| {
+        r.starts_with("[zephyr] card #1 was charged")
+    })
+    .await;
+    assert_eq!(
+        charged,
+        "[zephyr] card #1 was charged 42.50 CAD by merchant id 4445123456 (\"AMAZON.CA\", MCC \
+         5999); the card is closed"
+    );
+    reply_where(&gw, "chat", |r| r.contains("[card #1 used; zephyr's note")).await;
+    assert_eq!(card_status(&home, 1), "used");
+    assert!(Fake::script(&script, |s| s
+        .log
+        .contains(&"close 1".to_string())));
+    // A used card passes nothing more and fills nothing.
+    pay_page(&home, "CA$42.50");
+    gw.say("f6", "owner", &click_send(&home)).await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #3:")).await;
+    gw.say("f6n", "owner", "/no 3").await;
+    reply_where(&gw, "chat", |r| r.contains("[process #3 exited")).await;
+    wait(|| turns() == 3).await;
+    gw.say("f7", "owner", CARD_FILL).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains("\ncard: not filled: card #1 is used")
+    })
+    .await;
+    assert!(fills(&home).is_empty());
+    gw.shutdown().await;
+}
+
+/// An issuer that asks the owner itself (Link): zephyr's checks run, then its approval is
+/// the approval. No `/ok` of zephyr's is offered, and the number is fetched only once the
+/// issuer says the owner approved.
+#[tokio::test]
+async fn an_asking_issuers_card_needs_no_ok_and_is_revealed_only_once_approved() {
+    use zephyr::cards::{CardState, Fake};
+    let (home, cfg) = card_home("card-asks", "fake", "");
+    let script = cfg.clone();
+    Fake::script(&script, |s| {
+        s.asks_owner = true;
+        s.state = CardState::Waiting;
+    });
+    let gw = start(cfg);
+    gw.say("a1", "owner", &card_ask("42.50")).await;
+    let notice = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] card #1:")).await;
+    assert_eq!(
+        notice,
+        "[zephyr] card #1: payment (virtual card)\n\
+         pays: https://shop.example · the number is filled only there\n\
+         card: single use · up to 42.50 CAD · closes 15 min after it is issued or after one \
+         charge\n\
+         merchant (the agent's words): \"Shop\"\n\
+         the agent says: \"the owner asked for rice\"\n\
+         approve it in Link: https://issuer.example/approve/1 · /card close 1 cancels it"
+    );
+    let told = reply_where(&gw, "chat", |r| r.contains("\ncard: card #1 waits")).await;
+    assert!(
+        told.contains("waits for the owner's approval at the issuer"),
+        "{told}"
+    );
+    assert!(
+        !gw.replies().iter().any(|r| r.contains("/ok 1")),
+        "{:?}",
+        gw.replies()
+    );
+    // It counts in the window from the moment zephyr let it go.
+    let store = Store::open(&home.join("state.db")).unwrap();
+    assert_eq!(store.payments_since(0, "CAD").unwrap(), (1, 4250, false));
+    gw.say("a2", "owner", CARD_FILL).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains("\ncard: not filled: card #1 still waits")
+    })
+    .await;
+    assert!(!Fake::script(&script, |s| s
+        .log
+        .iter()
+        .any(|l| l.starts_with("reveal"))));
+
+    Fake::script(&script, |s| s.state = CardState::Open);
+    reply_where(&gw, "chat", |r| {
+        r.contains("[card #1 issued; zephyr's note")
+    })
+    .await;
+    gw.say("a3", "owner", &format!("{CARD_FILL} now")).await;
+    let filled = reply_where(&gw, "chat", |r| r.contains("\ncard: filled")).await;
+    assert!(
+        filled.contains("of card #1 (…1984) on https://shop.example/checkout"),
+        "{filled}"
+    );
+    assert!(Fake::script(&script, |s| s
+        .log
+        .contains(&"reveal 1".to_string())));
+    nowhere(&home, &gw, "4000009990001984");
+
+    // A second card the owner denies at the issuer fails, and the agent is told.
+    Fake::script(&script, |s| {
+        s.state = CardState::Failed("the owner denied it".into())
+    });
+    gw.say("a4", "owner", &card_ask("10")).await;
+    let failed = reply_where(&gw, "chat", |r| {
+        r.starts_with("[zephyr] card #2 was not issued")
+    })
+    .await;
+    assert_eq!(
+        failed,
+        "[zephyr] card #2 was not issued: the owner denied it"
+    );
+    reply_where(&gw, "chat", |r| {
+        r.contains("[card #2 failed; zephyr's note")
+    })
+    .await;
+    assert_eq!(card_status(&home, 2), "failed");
+    gw.shutdown().await;
+}
+
+/// `/stop` closes every open card; a close the issuer refuses is tried again and told once;
+/// a start closes what a daemon before it left open.
+#[tokio::test]
+async fn stop_and_a_start_close_open_cards_and_a_failed_close_is_told_once() {
+    use zephyr::cards::Fake;
+    let (home, cfg) = card_home("card-stop", "fake", "auto 100");
+    let script = cfg.clone();
+    // Left open by a daemon before this one: closed at the start, its number being gone.
+    let left = zephyr::store::NewCard {
+        provider: "fake".into(),
+        origin: "https://old.example".into(),
+        merchant: "Old".into(),
+        cap_minor: 500,
+        currency: "CAD".into(),
+        uses: "single".into(),
+        channel: "chat".into(),
+        sender: "owner".into(),
+        session: "main".into(),
+        expires_at: zephyr::now() + 900,
+        ..Default::default()
+    };
+    Store::open(&home.join("state.db"))
+        .unwrap()
+        .add_card(&left)
+        .unwrap();
+    let gw = start(cfg);
+    let closed = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] card #1 is closed")).await;
+    assert_eq!(
+        closed,
+        "[zephyr] card #1 is closed: zephyr restarted and forgot its number"
+    );
+    assert_eq!(card_status(&home, 1), "closed");
+
+    // Under `auto 100` a card within the cap is issued with no /ok, and the owner is told.
+    gw.say("s1", "owner", &card_ask("42.50")).await;
+    let issued = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] card #2")).await;
+    assert!(
+        issued.starts_with("[zephyr] card #2 is issued: single use, up to 42.50 CAD"),
+        "{issued}"
+    );
+    wait(|| card_status(&home, 2) == "open").await;
+    Fake::script(&script, |s| s.fail_close = true);
+    gw.say("s2", "owner", "/stop").await;
+    let failed = reply_where(&gw, "chat", |r| r.contains("could not be closed")).await;
+    assert_eq!(
+        failed,
+        "[zephyr] card #2 could not be closed at the issuer: the issuer did not answer; close \
+         it in the provider's app"
+    );
+    // Tried again on later ticks, told once, and never filled meanwhile.
+    wait(|| {
+        Fake::script(&script, |s| {
+            s.log.iter().filter(|l| *l == "close 2").count() >= 3
+        })
+    })
+    .await;
+    gw.say(
+        "s3",
+        "owner",
+        r##"[call card {"action": "fill", "id": 2, "number": "#n"}]"##,
+    )
+    .await;
+    reply_where(&gw, "chat", |r| {
+        r.contains("\ncard: not filled: card #2 has expired")
+    })
+    .await;
+    Fake::script(&script, |s| s.fail_close = false);
+    wait(|| card_status(&home, 2) == "closed").await;
+    let told = gw.replies();
+    assert_eq!(
+        told.iter()
+            .filter(|r| r.contains("could not be closed"))
+            .count(),
+        1,
+        "{told:?}"
+    );
+    assert!(fills(&home).is_empty());
+    gw.shutdown().await;
+}

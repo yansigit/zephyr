@@ -331,6 +331,9 @@ pub async fn run<C: Channel>(
     // After the adoption, so an approved action whose command is still running stays running;
     // a delay that came due while down waits for the owner (approvals spec §4.9).
     crate::actions::restore(&router.cfg, &router.store, crate::now());
+    // A card's number was in the memory of the daemon before this one: what is still open is
+    // closed at its issuer, never filled again (DESIGN §4.22).
+    crate::cards::close_all(&router.cfg, "zephyr restarted and forgot its number");
     for c in channels {
         c.live(cfg_rx.clone()); // owners for file downloads, kept current by reload
         c.acks(router.acks.clone());
@@ -825,6 +828,8 @@ impl<'a> Router<'a> {
                     self.upgrade_notice();
                     self.broker_notice();
                     self.seed_notice();
+                    // Cards: their expiry, the issuer's word on them, reminders (DESIGN §4.22).
+                    crate::cards::tick_off(&self.cfg, &self.store);
                     // Delays that came due, and held actions nobody answered (approvals §4.6).
                     self.tick_actions();
                     // A budget pause ends at UTC midnight with nothing else to wake the router;
@@ -931,6 +936,25 @@ impl<'a> Router<'a> {
                 // Main only, like `exec`; a call the plugin refused waits for nothing.
                 if let Ok(action) = zephyr_policy::tools::vault_action(args) {
                     crate::vault::agent(&self.cfg, &self.store, id, action, &self.desktop);
+                }
+            }
+            if let Some((id, args)) = crate::procs::call(ev, "card") {
+                // Main only, like the vault; a call the plugin refused waits for nothing.
+                if let Ok(action) = zephyr_policy::tools::card_action(args) {
+                    let since = self.snap.borrow().run.since_unix_ms.unwrap_or_default();
+                    let reason = args.get("reason").and_then(Value::as_str);
+                    let req = crate::gate::Request {
+                        session: session.clone().unwrap_or_default(),
+                        call_id: Some(id.into()),
+                        tool: "card".into(),
+                        args: args.clone(),
+                        browser: None,
+                        run: format!("main:{since}"),
+                        // The reason the agent gave for the card, which its card quotes.
+                        reason: reason.map(String::from).filter(|r| !r.trim().is_empty()),
+                    };
+                    let to = self.origin();
+                    crate::cards::agent(&self.cfg, &self.store, id, action, req, to, &self.desktop);
                 }
             }
             if let Some((id, args)) = crate::procs::call(ev, "process") {
@@ -1901,6 +1925,12 @@ impl<'a> Router<'a> {
             self.jobs.runs.notify_one();
             return Some(reply);
         }
+        // The owner's cards (DESIGN §4.22): a number comes only with a chat line, from memory.
+        let strong = self.cfg.settings.strong_channels.contains(&m.channel);
+        let id = &m.platform_msg_id;
+        if let Some(reply) = crate::cards::command(&self.cfg, &self.store, text, id, strong) {
+            return Some(reply);
+        }
         if let Some(reply) = self.command(text, (&m.channel, &m.sender)).await {
             return Some(reply);
         }
@@ -2238,6 +2268,7 @@ impl<'a> Router<'a> {
                     self.abort().await;
                 }
                 self.procs.stop_all();
+                crate::cards::close_all(&self.cfg, "the gateway was paused");
                 "[zephyr] paused: messages wait in the inbox until /resume"
             }
             "/resume" => {
@@ -2257,6 +2288,8 @@ impl<'a> Router<'a> {
                 // delayed ones wait for the owner again (R47).
                 self.procs.stop_all();
                 crate::actions::stop(&self.cfg, &self.store, &self.waits);
+                // Every card still open is closed at its issuer (DESIGN §4.22).
+                crate::cards::close_all(&self.cfg, "the owner's /stop");
                 "[zephyr] stopped"
             }
         };

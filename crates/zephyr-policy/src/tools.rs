@@ -258,7 +258,7 @@ enum Step {
 
 static HANDLES: ToolHandles<Step> = ToolHandles::new();
 
-pub const TOOLS: [(&str, &str, &str, ToolExecuteFn); 8] = [
+pub const TOOLS: [(&str, &str, &str, ToolExecuteFn); 9] = [
     (
         "send_file",
         "Send a file of up to 10 MB (a screenshot, a PDF) to the owner, on the channel you are \
@@ -346,6 +346,21 @@ pub const TOOLS: [(&str, &str, &str, ToolExecuteFn); 8] = [
          message when they do. Never ask the owner to paste a password or token into the chat.",
         r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","request","fill","bind"]},"name":{"type":"string"},"hosts":{"type":"array","items":{"type":"string"},"description":"For bind: the exact host names the token is sent to, e.g. api.github.com"},"kind":{"type":"string","enum":["login","token"]},"site":{"type":"string","description":"For request of a login: the site's address, e.g. https://github.com"},"why":{"type":"string"},"user":{"type":"string","description":"For fill: CSS selector of the username field"},"password":{"type":"string","description":"For fill: CSS selector of the password field"},"totp":{"type":"string","description":"For fill: CSS selector of the one-time code field"}},"required":["action"]}"#,
         vault_execute,
+    ),
+    (
+        "card",
+        "A virtual card for one checkout, so the owner's real card is never used. `request` it \
+         once the checkout page shows the total: give the page's address as `site`, the \
+         `merchant`'s name, the `amount` as a decimal string in the owner's currency, and a \
+         one-line `reason`. The owner approves each card, so you are told it is held or \
+         waiting: tell the owner and end your turn; a message comes when the card can be \
+         filled. Then `fill` it with its `id` and CSS selectors for the `number`, the `cvc`, \
+         and either `expiry` (one MM/YY field) or `month` and `year`, and `name` if the form \
+         asks: zephyr types it into the page open in agent-browser, only on the site it was \
+         approved for. You never see the number and must not try to read it back. `list` \
+         shows your cards.",
+        r#"{"type":"object","properties":{"action":{"type":"string","enum":["request","fill","list"]},"site":{"type":"string","description":"For request: the checkout page's https address"},"merchant":{"type":"string"},"amount":{"type":"string","description":"For request: the total, e.g. 42.50"},"currency":{"type":"string","description":"For request, optional: ISO 4217, e.g. CAD"},"reason":{"type":"string"},"id":{"type":"integer","description":"For fill: the card's number"},"number":{"type":"string","description":"For fill: CSS selector of the card number field"},"expiry":{"type":"string","description":"For fill: CSS selector of a single MM/YY field"},"month":{"type":"string"},"year":{"type":"string"},"cvc":{"type":"string"},"name":{"type":"string"}},"required":["action"]}"#,
+        card_execute,
     ),
     (
         "recall",
@@ -503,6 +518,79 @@ pub fn vault_action(params: &Value) -> Result<VaultAction, String> {
 
 fn vault(params: &Value) -> Result<String, String> {
     vault_action(params).map(|_| String::new())
+}
+
+/// The CSS selectors of the fields a card fill types into.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CardFields {
+    pub number: Option<String>,
+    /// One `MM/YY` field.
+    pub expiry: Option<String>,
+    pub month: Option<String>,
+    pub year: Option<String>,
+    pub cvc: Option<String>,
+    pub name: Option<String>,
+}
+
+/// A checked `card` call (DESIGN §4.22). The daemon reads a request's site, amount and currency
+/// itself (`gate::card_request`): what may be issued is its decision, not the plugin's.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CardAction {
+    Request,
+    Fill { id: i64, fields: CardFields },
+    List,
+}
+
+/// `card`'s check, in the plugin and again in the daemon before it acts.
+pub fn card_action(params: &Value) -> Result<CardAction, String> {
+    let word = |key: &str| -> Option<String> {
+        params[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    match text(params, "action")? {
+        "list" => Ok(CardAction::List),
+        "request" => {
+            for key in ["site", "merchant"] {
+                word(key).ok_or_else(|| format!("a card request needs `{key}`"))?;
+            }
+            if params["amount"].as_str().is_none() && !params["amount"].is_number() {
+                return Err("a card request needs the `amount`, e.g. \"42.50\"".into());
+            }
+            Ok(CardAction::Request)
+        }
+        "fill" => {
+            let id = params["id"]
+                .as_i64()
+                .filter(|id| *id > 0)
+                .ok_or("a fill needs the card's `id`")?;
+            let fields = CardFields {
+                number: word("number"),
+                expiry: word("expiry"),
+                month: word("month"),
+                year: word("year"),
+                cvc: word("cvc"),
+                name: word("name"),
+            };
+            if fields == CardFields::default() {
+                return Err(
+                    "give the CSS selector of at least one of number, expiry, month, year, cvc, \
+                     name"
+                        .into(),
+                );
+            }
+            Ok(CardAction::Fill { id, fields })
+        }
+        other => Err(format!(
+            "unknown action {other:?}; use request, fill or list"
+        )),
+    }
+}
+
+fn card(params: &Value) -> Result<String, String> {
+    card_action(params).map(|_| String::new())
 }
 
 /// A checked `process` call.
@@ -1062,6 +1150,15 @@ extern "C" fn vault_execute(
     waiting(call_id, params, free, vault, Duration::from_secs(90))
 }
 
+extern "C" fn card_execute(
+    call_id: StbStringRef,
+    params: StbString,
+    free: Option<FreeStringFn>,
+) -> StepHandle {
+    // A fill starts the browser's commands, as the vault's does.
+    waiting(call_id, params, free, card, Duration::from_secs(90))
+}
+
 extern "C" fn recall_execute(
     _: StbStringRef,
     params: StbString,
@@ -1439,6 +1536,45 @@ mod tests {
         assert_eq!(gateway_kind(&long), None);
         assert!(gateway(&json!({ "command": "/set tasks.parallel 1" })).is_ok());
         assert!(gateway(&json!({ "command": "/ok 1" })).is_err());
+    }
+
+    #[test]
+    fn card_checks_its_arguments() {
+        assert_eq!(
+            card_action(&json!({ "action": "list" })),
+            Ok(CardAction::List)
+        );
+        let ask = json!({
+            "action": "request", "site": "https://shop.example/checkout", "merchant": "Shop",
+            "amount": "42.50", "currency": "CAD", "reason": "the owner asked",
+        });
+        assert_eq!(card_action(&ask), Ok(CardAction::Request));
+        for missing in ["site", "merchant", "amount"] {
+            let mut bad = ask.clone();
+            bad.as_object_mut().unwrap().remove(missing);
+            assert!(card_action(&bad).is_err(), "{missing}");
+        }
+        let fill = json!({ "action": "fill", "id": 7, "number": "#card", "cvc": " #cvc " });
+        assert_eq!(
+            card_action(&fill),
+            Ok(CardAction::Fill {
+                id: 7,
+                fields: CardFields {
+                    number: Some("#card".into()),
+                    cvc: Some("#cvc".into()),
+                    ..CardFields::default()
+                }
+            })
+        );
+        for bad in [
+            json!({ "action": "fill", "id": 7 }),
+            json!({ "action": "fill", "number": "#card" }),
+            json!({ "action": "fill", "id": 0, "number": "#card" }),
+            json!({ "action": "reveal", "id": 7 }),
+            json!({}),
+        ] {
+            assert!(card_action(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

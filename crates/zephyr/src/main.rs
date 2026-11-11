@@ -16,7 +16,7 @@ use zephyr::store::Store;
 /// The rpi minor this build speaks (DESIGN §3).
 const RPI_PIN: &str = "rpi 0.21.";
 
-const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|resume|reload|skill|web|pair|signal-setup>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
+const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|resume|reload|skill|web|pair|card|signal-setup>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
 
 fn main() -> ExitCode {
     // `agent-browser` on the agent's PATH is this binary (approvals spec §4.4): the wrapper runs
@@ -107,6 +107,7 @@ async fn zephyr_main() -> ExitCode {
             ("skill", Ok(cfg)) => skill(&cfg, &args.collect::<Vec<_>>()).await,
             ("web", Ok(cfg)) => web(&cfg, &args.collect::<Vec<_>>()).await,
             ("pair", Ok(cfg)) => pair(&cfg, &args.collect::<Vec<_>>()).await,
+            ("card", Ok(cfg)) => card(&cfg, &args.collect::<Vec<_>>()).await,
             ("signal-setup", Ok(cfg)) => {
                 zephyr::signal::setup(&cfg, &args.collect::<Vec<_>>()).await
             }
@@ -279,12 +280,25 @@ async fn run(mut cfg: Config, from_file: &[String]) -> anyhow::Result<()> {
 /// The running daemon's reply to `text`, sent as the owner over its chat socket. `None` when no
 /// daemon listens.
 async fn ask(cfg: &Config, text: &str) -> anyhow::Result<Option<String>> {
+    ask_with(cfg, text, None).await
+}
+
+/// [`ask`] with a `card` beside the text: the daemon keeps it in memory, out of the inbox.
+async fn ask_with(
+    cfg: &Config,
+    text: &str,
+    card: Option<serde_json::Value>,
+) -> anyhow::Result<Option<String>> {
     let Ok(stream) = tokio::net::UnixStream::connect(cfg.socket_path()).await else {
         return Ok(None);
     };
     let (read, mut write) = stream.into_split();
     let id = format!("cli-{}-{}", std::process::id(), zephyr::unix_millis());
-    let mut line = serde_json::to_vec(&json!({"id": id, "text": text}))?;
+    let mut line = json!({"id": id, "text": text});
+    if let Some(card) = card {
+        line["card"] = card;
+    }
+    let mut line = serde_json::to_vec(&line)?;
     line.push(b'\n');
     write.write_all(&line).await?;
     let mut lines = BufReader::new(read).lines();
@@ -390,6 +404,59 @@ async fn web(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
         reply.contains("https://"),
         "the web app did not answer with its address"
     );
+    Ok(())
+}
+
+/// `zephyr card [list] | put N [new|prepaid|other] | done N | close N | link`, run by the
+/// host's `zephyr card` (DESIGN §4.22). `put` asks for the number, the expiry and the code
+/// (hidden on a terminal, else three lines on stdin), checks them here, and hands them to the
+/// daemon on the chat socket, a strong channel: they stay in its memory and reach no file.
+async fn card(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let usage = "usage: zephyr card [list] | put N [new|prepaid|other] | done N | close N | link";
+    let (text, card) = match args[..] {
+        [] | ["list"] => ("/card".to_string(), None),
+        ["done", n] => (format!("/card done {n}"), None),
+        ["close", n] => (format!("/card close {n}"), None),
+        ["link"] => return zephyr::cards_link::login(cfg).await,
+        ["put", n, ref kind @ ..] if kind.len() <= 1 => {
+            let terminal = std::io::stdin().is_terminal();
+            let mut lines = std::io::stdin().lines();
+            let mut field = |prompt: &str| -> anyhow::Result<String> {
+                if terminal {
+                    let p = dialoguer::Password::new().with_prompt(format!("{prompt} (hidden)"));
+                    return Ok(p.interact()?);
+                }
+                Ok(lines.next().transpose()?.unwrap_or_default())
+            };
+            let number = field("card number")?;
+            let expiry = field("expiry, MM/YY")?;
+            let cvc = field("security code")?;
+            let kind = match (kind.first(), terminal) {
+                (Some(kind), _) => kind.to_string(),
+                (None, false) => "other".into(),
+                (None, true) => {
+                    let items = [
+                        "a new card made for this purchase",
+                        "a prepaid card loaded to the amount",
+                        "something else",
+                    ];
+                    let prompt = "What is this card? Never enter your main card";
+                    let picked = dialoguer::Select::new().with_prompt(prompt).items(items);
+                    zephyr::cards::KINDS[picked.default(0).interact()?].to_string()
+                }
+            };
+            zephyr::cards::Pan::parse(&number, &expiry, &cvc).map_err(anyhow::Error::msg)?;
+            let card = json!({"number": number, "expiry": expiry, "cvc": cvc});
+            (format!("/card put {n} {kind}"), Some(card))
+        }
+        _ => anyhow::bail!("{usage}"),
+    };
+    let Some(reply) = ask_with(cfg, &text, card).await? else {
+        return Err(NotRunning.into());
+    };
+    println!("{reply}");
     Ok(())
 }
 

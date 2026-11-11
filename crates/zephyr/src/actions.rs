@@ -154,7 +154,7 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
         ActionKind::Run => run(ctx, &a),
         ActionKind::Pass => pass(ctx, &a, by, now),
         ActionKind::Wait => wait(ctx, &a),
-        ActionKind::Card => Err("cards are not set up".into()),
+        ActionKind::Card => card(ctx, &a),
     };
     let (n, s) = (a.id, summary(ctx.cfg, &a));
     Ok(match (started, by) {
@@ -266,6 +266,19 @@ fn pass(ctx: &Ctx, a: &Action, by: By, now: i64) -> Result<String, String> {
         note(store, a, &word, &text);
     }
     Ok("the agent may make exactly that call once in the next 30 min".into())
+}
+
+/// A card request (DESIGN §4.22): read again as the settings are now, then issued off the
+/// router's loop; the owner is told what to do next, and the agent when the card can be filled.
+fn card(ctx: &Ctx, a: &Action) -> Result<String, String> {
+    let (checked, ask) = crate::gate::approved_card(ctx.cfg, a)?;
+    if crate::cards::caps(ctx.cfg).is_none() {
+        return Err(crate::cards::NOT_SET_UP
+            .trim_start_matches("not run: ")
+            .into());
+    }
+    crate::cards::issue_approved(ctx.cfg, checked, ask, a);
+    Ok("issuing the card; what to do next follows".into())
 }
 
 /// A browser action: the wrapper waiting on it goes on, if it still waits. It stays `running`

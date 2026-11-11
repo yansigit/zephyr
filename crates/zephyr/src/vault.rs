@@ -1364,19 +1364,19 @@ fn fields(
 }
 
 /// The first http(s) address in agent-browser's `get url` output.
-fn page_address(out: &str) -> Option<&str> {
+pub(crate) fn page_address(out: &str) -> Option<&str> {
     out.split_whitespace().find(|w| origin(w).is_some())
 }
 
 /// Where the browser's page is now, as `get url` says: `None` when that fails or is no http(s) page.
-async fn page_now(cfg: &Config) -> Option<String> {
+pub(crate) async fn page_now(cfg: &Config) -> Option<String> {
     let out = browser(cfg, &["get", "url"]).await.ok()?;
     page_address(&out).map(String::from)
 }
 
 /// Why a fill stops after typing `done` because the page left `site` (`now`), or `None` while the
 /// page is still on it.
-fn moved(site: &str, now: Option<&str>, done: &[&str]) -> Option<String> {
+pub(crate) fn moved(site: &str, now: Option<&str>, done: &[&str]) -> Option<String> {
     if now.is_some_and(|p| same_origin(site, p)) {
         return None;
     }
@@ -1443,7 +1443,7 @@ const BROWSER_WAIT: Duration = Duration::from_secs(20);
 /// `agent-browser ARGS` as the agent, as `exec` runs it: its stdout, or why it failed. The real
 /// binary, by full path (`cfg.agent_browser`): the daemon's own fill never goes through the
 /// approvals gate's wrapper that `agent-browser` on the agent's PATH is (approvals spec §4.4).
-async fn browser(cfg: &Config, args: &[&str]) -> Result<String, String> {
+pub(crate) async fn browser(cfg: &Config, args: &[&str]) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new(&cfg.agent_browser);
     cmd.args(args)
         .current_dir(&cfg.home)

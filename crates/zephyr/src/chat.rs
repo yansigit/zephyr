@@ -68,6 +68,7 @@ impl Channel for ChatChannel {
                     let (Some(id), Some(text)) = (v["id"].as_str(), v["text"].as_str()) else {
                         continue;
                     };
+                    take_card(id, &v);
                     let m = Inbound {
                         channel: NAME.into(),
                         platform_msg_id: id.into(),
@@ -120,6 +121,17 @@ impl Channel for ChatChannel {
     }
 }
 
+/// A chat line's `card` (`{"number", "expiry", "cvc"}`, DESIGN §4.22), from `zephyr card put`:
+/// kept in memory under the line's id for its `/card put` to claim (`cards::entered`), so the
+/// number is never in the inbox row made of the line's text.
+fn take_card(id: &str, line: &serde_json::Value) {
+    let Some(card) = line.get("card") else { return };
+    let field = |k: &str| card[k].as_str().unwrap_or_default();
+    if let Ok(pan) = crate::cards::Pan::parse(field("number"), field("expiry"), field("cvc")) {
+        crate::cards::enter(id, pan);
+    }
+}
+
 /// `zephyr chat`: stdin lines out, replies printed as they arrive.
 pub async fn client(path: &Path) -> anyhow::Result<()> {
     let stream = UnixStream::connect(path)
@@ -150,6 +162,37 @@ pub async fn client(path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_card_rides_a_line_into_memory_and_not_into_the_row() {
+        let dir = crate::test_dir("chat-card");
+        let chat = Arc::new(ChatChannel::new(dir.join("chat.sock")));
+        let (tx, mut rx) = mpsc::channel(1);
+        let server = chat.clone();
+        tokio::spawn(async move { server.run(tx).await });
+        let mut client = loop {
+            match UnixStream::connect(dir.join("chat.sock")).await {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        };
+        let card = json!({"number": "4111 1111 1111 1111", "expiry": "06/29", "cvc": "123"});
+        let line = json!({"id": "chat-card-1", "text": "/card put 7 new", "card": card});
+        client
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
+        let m = rx.recv().await.unwrap();
+        assert_eq!(
+            (m.platform_msg_id.as_str(), m.text.as_str()),
+            ("chat-card-1", "/card put 7 new")
+        );
+        assert!(!format!("{m:?}").contains("4111"));
+        assert_eq!(
+            crate::cards::entered("chat-card-1").unwrap().last4(),
+            "1111"
+        );
+    }
 
     #[tokio::test]
     async fn a_client_that_stops_reading_is_dropped() {

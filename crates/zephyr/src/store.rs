@@ -1918,7 +1918,8 @@ impl Store {
         Ok(n == 1)
     }
 
-    /// Main's note about card `id`, once per `word` (inbox row `card-<id>-<word>`): `[card #N
+    /// Main's note about card `id`, once per `word` (inbox row `action-card-<id>-<word>`, so
+    /// the router wakes main for it as for a held action's note): `[card #N
     /// WORD; zephyr's note, not the owner's words] TEXT`, on the channel of the run that asked.
     pub fn card_note(&self, id: i64, word: &str, text: &str) -> rusqlite::Result<bool> {
         let Some(c) = self.card(id)? else {
@@ -1934,7 +1935,7 @@ impl Store {
         let text = format!("[card #{id} {word}; zephyr's note, not the owner's words] {text}");
         let n = self.db.execute(
             "INSERT OR IGNORE INTO inbox(channel, platform_msg_id, sender, text) VALUES (?1, ?2, ?3, ?4)",
-            params![channel, format!("card-{id}-{word}"), sender, text],
+            params![channel, format!("action-card-{id}-{word}"), sender, text],
         )?;
         Ok(n == 1)
     }
