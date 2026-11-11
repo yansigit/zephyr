@@ -1053,6 +1053,13 @@ stays: zephyr, the policy plugin, Cursor and rpi's own providers (the Anthropic 
 config still lists every extension; the agent starts without the missing ones and `zephyr doctor`
 names each. `gh workflow run image.yml -f providers=none` builds and checks this variant in CI
 (`:dev-minimal`, never pushed).
+
+The build arg `SIGNAL` (default 1) puts signal-cli 0.14.10 and a Java 25 runtime cut to its needs
+by `jlink` in `/opt/zephyr/signal`, for the Signal channel: 190 MB on disk (126 MB of jars, a 64 MB
+runtime), 160 MB more to pull. `--build-arg SIGNAL=0`
+leaves them out, and an arm64 build has none (libsignal's native library ships for x86_64 only);
+without `/opt/zephyr/signal` the Signal channel is off.
+
 Pushing a `v*` tag publishes `ghcr.io/yansigit/zephyr:<version>` (`.github/workflows/image.yml`,
 which tags `ghcr.io/<the repository it runs in>`, so a fork publishes to its own).
 
