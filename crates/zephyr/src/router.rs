@@ -438,6 +438,8 @@ struct Router<'a> {
     pair_limits: crate::web::signin::Limits,
     /// Exit with `Exit::Reexec` once main and the jobs are idle.
     reexec: bool,
+    /// The OAuth providers main's child named at its last idle auth check (`auth_check`).
+    oauth: Vec<crate::auth_keeper::Oauth>,
     /// The child's `auth.json` mtime at spawn; a newer one (a re-login) restarts the child.
     auth_stamp: Option<SystemTime>,
     /// Sign-ins `/login` started whose URL is not out yet.
@@ -646,6 +648,7 @@ impl<'a> Router<'a> {
             attaches,
             jobs,
             auth_at: Instant::now(),
+            oauth: Vec::new(),
             restart: false,
             account: None,
             tally: crate::rpc::Tally::main(&cfg.home),
@@ -736,10 +739,7 @@ impl<'a> Router<'a> {
                     self.procs.yield_all();
                     log(self.dispatch_new().await)
                 }
-                // Never during a run: the check waits on the child and on a refresh's
-                // subprocess, which would hold every event of the run (its typing and progress
-                // note too), and a refreshed token binds only at an idle restart anyway.
-                _ = tokio::time::sleep_until(self.auth_at), if !self.busy && (self.child.is_some() || !self.cfg.accounts.is_empty()) && self.cfg.auth.enabled => {
+                _ = tokio::time::sleep_until(self.auth_at), if (self.child.is_some() || !self.cfg.accounts.is_empty()) && self.cfg.auth.enabled => {
                     self.auth_check().await
                 }
                 ev = next_event(&mut self.child) => match self.tapped(ev).await {
@@ -4600,8 +4600,17 @@ impl<'a> Router<'a> {
         if !self.cfg.accounts.is_empty() {
             self.restart |=
                 crate::auth_keeper::refresh_accounts(&self.cfg, self.account.as_ref(), now).await;
-        } else if let Some(child) = self.child.as_mut() {
-            match crate::auth_keeper::refresh(child, &self.cfg, now).await {
+        } else {
+            // Asking the child waits on it, which mid-run would hold every event of the run
+            // (its typing and progress note too): only while idle, its answer kept for the
+            // checks that come due during a run. The refresh itself needs no child.
+            if let (false, Some(child)) = (self.busy, self.child.as_mut()) {
+                match crate::auth_keeper::oauth_providers(child).await {
+                    Ok(oauth) => self.oauth = oauth,
+                    Err(e) => eprintln!("zephyr: auth check failed: {e:#}"),
+                }
+            }
+            match crate::auth_keeper::refresh(&self.cfg, &self.oauth, now).await {
                 Ok(refreshed) => self.restart |= refreshed,
                 Err(e) => eprintln!("zephyr: auth check failed: {e:#}"),
             }

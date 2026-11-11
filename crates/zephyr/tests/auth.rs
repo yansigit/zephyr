@@ -218,13 +218,19 @@ async fn an_auth_check_due_during_a_run_waits_for_its_settle() {
     gw.shutdown().await;
 }
 
-/// The refresh is due while a run is in progress. The check, and so the refresh and the
-/// restart, wait for the settle: the run's reply is reconciled from the old child first.
+/// The refresh is due while a run is in progress: it runs then, from the providers the last
+/// idle check named, and only the restart waits for the settle, so the run's reply is
+/// reconciled from the old child before the new one starts.
 #[tokio::test]
 async fn refresh_while_busy_restarts_only_after_the_settle() {
-    let gw = start("busy", None, "[auth]\nrefresh_minutes = 0.02\n");
+    let gw = start(
+        "busy",
+        Some(expiring_in(3600)),
+        "[auth]\nrefresh_minutes = 0.02\n",
+    );
     std::fs::write(gw.home.join("slow"), "4").unwrap(); // each prompt takes 4s
     wait(|| pid(&gw.home).is_some()).await;
+    wait(|| !of_type(&gw.home, "get_auth_status").is_empty()).await; // an idle check first
     let first = pid(&gw.home);
 
     gw.say("m1", "hello").await;
@@ -241,13 +247,16 @@ async fn refresh_while_busy_restarts_only_after_the_settle() {
     let prompt_at = commands.iter().position(|c| c == "prompt").unwrap();
     let refresh_at = commands.iter().position(|c| c == "auth-refresh").unwrap();
     let stop_at = commands.iter().rposition(|c| c == "stop").unwrap();
-    let settle_read = commands[prompt_at..refresh_at]
+    let during = !commands[prompt_at..refresh_at]
+        .iter()
+        .any(|c| c == "get_messages");
+    let settle_read = commands[refresh_at..stop_at]
         .iter()
         .any(|c| c == "get_messages");
     assert!(
-        settle_read && refresh_at < stop_at,
-        "the run was reconciled (get_messages after its settle) before the refresh, and the \
-         restart came after it: {commands:?}"
+        during && settle_read,
+        "refreshed during the run, and the old child reconciled (get_messages after the \
+         settle) before its stop: {commands:?}"
     );
     gw.shutdown().await;
 }
@@ -311,6 +320,36 @@ async fn disabled_means_the_child_is_never_asked() {
     round_trip(&gw).await;
     assert!(of_type(&gw.home, "get_auth_status").is_empty());
     assert!(refreshes(&gw.home).is_empty());
+    gw.shutdown().await;
+}
+
+/// A pool account's credential is refreshed when due, main busy or not: it needs no child.
+#[tokio::test]
+async fn a_pool_account_is_refreshed_while_main_is_busy() {
+    let accounts = "[auth]\nrefresh_minutes = 0.02\n[[account]]\nname = 'a'\nmodel = 'anthropic/m'\n[[account]]\nname = 'b'\nmodel = 'openai-codex/m'\n";
+    let (cfg, home, agent) = setup("pool-busy", None, accounts);
+    let gw = run(cfg, home.clone(), agent);
+    wait(|| pid(&home).is_some()).await;
+    std::fs::write(home.join("slow"), "4").unwrap();
+    gw.say("m1", "hello").await;
+    wait(|| !of_type(&home, "prompt").is_empty()).await;
+    let dir = home.join("accounts/b");
+    std::fs::create_dir_all(&dir).unwrap();
+    let soon = json!({"openai-codex": {"type": "oauth", "access": "old", "refresh": "r", "expires": now() + 60}});
+    std::fs::write(dir.join("auth.json"), soon.to_string()).unwrap();
+    wait(|| !refreshes(&home).is_empty()).await;
+    let commands: Vec<String> = log(&home)
+        .iter()
+        .map(|c| c["type"].as_str().unwrap().to_string())
+        .collect();
+    let prompt_at = commands.iter().position(|c| c == "prompt").unwrap();
+    let refresh_at = commands.iter().position(|c| c == "auth-refresh").unwrap();
+    assert!(
+        !commands[prompt_at..refresh_at]
+            .iter()
+            .any(|c| c == "get_messages"),
+        "refreshed while the run was going: {commands:?}"
+    );
     gw.shutdown().await;
 }
 
