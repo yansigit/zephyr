@@ -333,7 +333,11 @@ pub async fn run<C: Channel>(
     crate::actions::restore(&router.cfg, &router.store, crate::now());
     // A card's number was in the memory of the daemon before this one: what is still open is
     // closed at its issuer, never filled again (DESIGN §4.22).
-    crate::cards::close_all(&router.cfg, "zephyr restarted and forgot its number");
+    crate::cards::close_all(
+        &router.cfg,
+        &router.store,
+        "zephyr restarted and forgot its number",
+    );
     for c in channels {
         c.live(cfg_rx.clone()); // owners for file downloads, kept current by reload
         c.acks(router.acks.clone());
@@ -830,7 +834,7 @@ impl<'a> Router<'a> {
                     self.seed_notice();
                     self.window_notice();
                     // Cards: their expiry, the issuer's word on them, reminders (DESIGN §4.22).
-                    crate::cards::tick_off(&self.cfg, &self.store);
+                    crate::cards::tick(&self.cfg, &self.store, crate::now());
                     // Delays that came due, and held actions nobody answered (approvals §4.6).
                     self.tick_actions();
                     // A budget pause ends at UTC midnight with nothing else to wake the router;
@@ -2269,7 +2273,7 @@ impl<'a> Router<'a> {
                     self.abort().await;
                 }
                 self.procs.stop_all();
-                crate::cards::close_all(&self.cfg, "the gateway was paused");
+                crate::cards::close_all(&self.cfg, &self.store, "the gateway was paused");
                 "[zephyr] paused: messages wait in the inbox until /resume"
             }
             "/resume" => {
@@ -2290,7 +2294,7 @@ impl<'a> Router<'a> {
                 self.procs.stop_all();
                 crate::actions::stop(&self.cfg, &self.store, &self.waits);
                 // Every card still open is closed at its issuer (DESIGN §4.22).
-                crate::cards::close_all(&self.cfg, "the owner's /stop");
+                crate::cards::close_all(&self.cfg, &self.store, "the owner's /stop");
                 "[zephyr] stopped"
             }
         };

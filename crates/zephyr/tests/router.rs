@@ -8560,3 +8560,39 @@ async fn an_upgraded_install_is_told_of_the_payment_window_once() {
     assert!(!gw.replies().iter().any(|r| r.starts_with(NEW)));
     gw.shutdown().await;
 }
+
+/// A `/stop` while the issuer is still answering closes the card for good: the issue's own
+/// late answer never puts it back to waiting, and what the issuer made meanwhile is closed.
+#[tokio::test]
+async fn a_stop_during_a_slow_issue_leaves_the_card_closed() {
+    use zephyr::cards::Fake;
+    let (home, cfg) = card_home("card-slow-issue", "fake", "auto 100");
+    let script = cfg.clone();
+    Fake::script(&script, |s| s.issue_delay = Duration::from_millis(1500));
+    let gw = start(cfg);
+    gw.say("i1", "owner", &card_ask("42.50")).await;
+    let log = || Fake::script(&script, |s| s.log.clone());
+    wait(|| log().iter().any(|l| l.starts_with("issue 1 "))).await;
+    assert_eq!(card_status(&home, 1), "waiting");
+    gw.say("i2", "owner", "/stop").await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] stopped")).await;
+    wait(|| card_status(&home, 1) == "closed").await;
+    // The issue answers after that: the card it made is closed at the issuer as well.
+    wait(|| log().iter().filter(|l| *l == "close 1").count() == 2).await;
+    ticks(&home, 12).await;
+    assert_eq!(card_status(&home, 1), "closed", "{:?}", log());
+    let said = gw.replies();
+    assert!(
+        !said.iter().any(|r| r.contains("card #1 is issued")),
+        "{said:?}"
+    );
+    assert!(
+        !said.iter().any(|r| r.contains("[card #1 issued")),
+        "{said:?}"
+    );
+    assert!(
+        !log().iter().any(|l| l.starts_with("state")),
+        "a closed card is not asked about"
+    );
+    gw.shutdown().await;
+}

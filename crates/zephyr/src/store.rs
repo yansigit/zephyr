@@ -1991,32 +1991,102 @@ impl Store {
         rows.collect()
     }
 
-    /// Writes back what changes in a card's life.
-    pub fn update_card(&self, c: &Card) -> rusqlite::Result<()> {
+    // A card's row is never written back whole: each change names the columns it sets and the
+    // status it expects, so a close, a `/stop` or an expiry that happened while an issuer was
+    // being asked is never undone by a row read before.
+
+    /// The issuer made the card: its reference there and where the owner approves it. Only a
+    /// card still `waiting`: `false` when it was closed meanwhile.
+    pub fn card_issued(
+        &self,
+        id: i64,
+        provider_ref: &str,
+        approval_url: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
+            "UPDATE cards SET provider_ref = ?2, approval_url = ?3
+             WHERE id = ?1 AND status = 'waiting'",
+            params![id, provider_ref, approval_url],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// A `waiting` card opens until `expires_at`, with its last four digits and what the owner
+    /// said it is when they are known. `false` when it was not waiting any more.
+    pub fn open_card(
+        &self,
+        id: i64,
+        last4: Option<&str>,
+        kind: Option<&str>,
+        expires_at: i64,
+    ) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
+            "UPDATE cards SET status = 'open', expires_at = ?4,
+                    last4 = coalesce(?2, last4), kind = coalesce(?3, kind)
+             WHERE id = ?1 AND status = 'waiting'",
+            params![id, last4, kind, expires_at],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// The last four digits of a card whose number was just fetched.
+    pub fn card_last4(&self, id: i64, last4: &str) -> rusqlite::Result<()> {
         self.db.execute(
-            "UPDATE cards SET provider_ref = ?2, last4 = ?3, kind = ?4, status = ?5,
-                    expires_at = ?6, closed_at = ?7, charged_minor = ?8, charged_currency = ?9,
-                    merchant_id = ?10, descriptor = ?11, mcc = ?12, approval_url = ?13,
-                    told_at = ?14
-             WHERE id = ?1",
-            params![
-                c.id,
-                c.provider_ref,
-                c.last4,
-                c.kind,
-                c.status,
-                c.expires_at,
-                c.closed_at,
-                c.charged_minor,
-                c.charged_currency,
-                c.merchant_id,
-                c.descriptor,
-                c.mcc,
-                c.approval_url,
-                c.told_at
-            ],
+            "UPDATE cards SET last4 = ?2 WHERE id = ?1",
+            params![id, last4],
         )?;
         Ok(())
+    }
+
+    /// The owner was told about card `id` at `at`.
+    pub fn card_told(&self, id: i64, at: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE cards SET told_at = ?2 WHERE id = ?1",
+            params![id, at],
+        )?;
+        Ok(())
+    }
+
+    /// Marks card `id` as told at `at` if the owner was never told about it: `true` for the
+    /// one call that gets to tell.
+    pub fn card_told_once(&self, id: i64, at: i64) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
+            "UPDATE cards SET told_at = ?2 WHERE id = ?1 AND told_at IS NULL",
+            params![id, at],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// A card that is not over is past its time from `now` on: no fill takes it.
+    pub fn card_expire_now(&self, id: i64, now: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE cards SET expires_at = min(expires_at, ?2)
+             WHERE id = ?1 AND status IN ('waiting', 'open', 'charging')",
+            params![id, now],
+        )?;
+        Ok(())
+    }
+
+    /// The issuer's first charge on a card that is not over: it is `used`, with who charged
+    /// it. `false` when it was over already, so a charge is recorded and told once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn card_charged(
+        &self,
+        id: i64,
+        minor: i64,
+        currency: &str,
+        merchant_id: Option<&str>,
+        descriptor: Option<&str>,
+        mcc: Option<&str>,
+        now: i64,
+    ) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
+            "UPDATE cards SET status = 'used', closed_at = ?7, charged_minor = ?2,
+                    charged_currency = ?3, merchant_id = ?4, descriptor = ?5, mcc = ?6
+             WHERE id = ?1 AND status IN ('waiting', 'open', 'charging')",
+            params![id, minor, currency, merchant_id, descriptor, mcc, now],
+        )?;
+        Ok(n == 1)
     }
 
     /// Moves card `id` from one of `from` to `to` in one statement, so of two closes only one

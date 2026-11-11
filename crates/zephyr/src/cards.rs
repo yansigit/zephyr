@@ -377,6 +377,8 @@ pub struct FakeScript {
     pub state: CardState,
     pub pan: Pan,
     pub fail_issue: Option<String>,
+    /// How long `issue` takes to answer.
+    pub issue_delay: std::time::Duration,
     pub fail_close: bool,
     pub asks_owner: bool,
 }
@@ -394,6 +396,7 @@ impl Default for FakeScript {
                 name: None,
             },
             fail_issue: None,
+            issue_delay: std::time::Duration::ZERO,
             fail_close: false,
             asks_owner: false,
         }
@@ -438,19 +441,21 @@ impl Issuer for Fake {
         Self::caps(&self.state)
     }
     async fn issue(&self, spec: &CardSpec) -> Result<Issued, ProviderError> {
-        Self::with(&self.state, |s| {
+        let delay = Self::with(&self.state, |s| {
             s.log.push(format!(
                 "issue {} {} {} {}",
                 spec.card, spec.cap_minor, spec.currency, spec.origin
             ));
-            match &s.fail_issue {
-                Some(why) => Err(ProviderError(why.clone())),
-                None => Ok(Issued {
-                    provider_ref: format!("fake-{}", spec.card),
-                    approval_url: (s.asks_owner)
-                        .then(|| format!("https://issuer.example/approve/{}", spec.card)),
-                }),
-            }
+            s.issue_delay
+        });
+        tokio::time::sleep(delay).await;
+        Self::with(&self.state, |s| match &s.fail_issue {
+            Some(why) => Err(ProviderError(why.clone())),
+            None => Ok(Issued {
+                provider_ref: format!("fake-{}", spec.card),
+                approval_url: (s.asks_owner)
+                    .then(|| format!("https://issuer.example/approve/{}", spec.card)),
+            }),
         })
     }
     async fn reveal(&self, card: &Card) -> Result<Pan, ProviderError> {
@@ -749,12 +754,6 @@ fn note(store: &Store, card: &Card, word: &str, text: &str) {
     }
 }
 
-fn update(store: &Store, card: &Card) {
-    if let Err(e) = store.update_card(card) {
-        eprintln!("zephyr: recording card #{} failed: {e}", card.id);
-    }
-}
-
 /// `14:20`, in the owner's time zone.
 fn clock(cfg: &Config, at: i64) -> String {
     let tz = crate::scheduler::zone(cfg).unwrap_or(jiff::tz::TimeZone::UTC);
@@ -828,7 +827,27 @@ pub async fn issue(
     };
     card.provider_ref = Some(issued.provider_ref);
     card.approval_url = issued.approval_url;
-    update(&db.get(), &card);
+    let landed = db.get().card_issued(
+        id,
+        card.provider_ref.as_deref().unwrap_or_default(),
+        card.approval_url.as_deref(),
+    );
+    if !landed.map_err(failed)? {
+        // Closed while the issuer was answering (a `/stop`): what it made is closed there
+        // too, and the card stays as the close left it.
+        let said = issuer.close(&card).await.map_err(|e| e.0);
+        audit(
+            cfg,
+            &db.get(),
+            &card,
+            "close",
+            said.as_ref()
+                .map_or_else(|e| e.as_str(), |()| "closed while it was being issued"),
+        );
+        return Err(format!(
+            "card #{id} was not issued: it was closed while it was being issued"
+        ));
+    }
     audit(cfg, &db.get(), &card, "issue", "ok");
     let scrub = crate::gate::Scrub::load(cfg);
     let cap = crate::approvals::money(card.cap_minor, &card.currency);
@@ -1082,12 +1101,7 @@ pub fn command(
                 format!("[zephyr] card #{} was {} already", card.id, card.status)
             }
             Ok(card) => {
-                let cfg = cfg.clone();
-                tokio::spawn(async move {
-                    if let Ok(db) = Db::open(&cfg) {
-                        close(&cfg, &db, &card, "the owner closed it", crate::now()).await;
-                    }
-                });
+                ask_close(cfg, card, "the owner closed it");
                 format!("[zephyr] closing card {n}")
             }
         },
@@ -1104,8 +1118,14 @@ fn put(cfg: &Config, store: &Store, mut card: Card, pan: Pan, kind: &str, now: i
     card.kind = Some(kind.into());
     card.status = "open".into();
     card.expires_at = now + 60 * i64::from(minutes(cfg));
+    let opened = store.open_card(card.id, card.last4.as_deref(), Some(kind), card.expires_at);
+    if !opened.unwrap_or(false) {
+        return format!(
+            "[zephyr] card #{} is not waiting for a number any more",
+            card.id
+        );
+    }
     live::put(cfg.state_dir(), card.id, pan);
-    update(store, &card);
     audit(cfg, store, &card, "reveal", "entered by the owner");
     note(store, &card, "issued", &ready(cfg, &card));
     // What the owner said it is decides what bounds a leaked number.
@@ -1204,7 +1224,7 @@ async fn fill(cfg: &Config, id: i64, fields: CardFields) -> String {
                 Ok(pan) => {
                     live::put(cfg.state_dir(), id, pan.clone());
                     card.last4 = Some(pan.last4());
-                    update(&db.get(), &card);
+                    let _ = db.get().card_last4(id, &pan.last4());
                     audit(cfg, &db.get(), &card, "reveal", "ok");
                     pan
                 }
@@ -1259,32 +1279,58 @@ async fn fill(cfg: &Config, id: i64, fields: CardFields) -> String {
     )
 }
 
-/// Closes `card` at the issuer and forgets its number. A close the issuer refuses leaves the
-/// card as it is, to be tried again on a later tick, and the owner is told once.
-async fn close(cfg: &Config, db: &Db, card: &Card, why: &str, now: i64) {
-    let closed = match issuer(cfg) {
+/// What an issuer said about a card. It is asked off the router's loop, and what it said is
+/// recorded on the router's next tick with the router's own store ([`tick`]): the tick opens
+/// no connection of its own, and every write of a card's life after its issue is made there,
+/// one at a time.
+enum Word {
+    State(Result<CardState, String>),
+    /// The answer to a close asked because of `why`.
+    Closed(String, Result<(), String>),
+    /// The answer to the close that follows a charge, with the charge as the owner reads it.
+    UsedClosed(String, Result<(), String>),
+}
+
+static WORDS: Mutex<Vec<(PathBuf, Card, Word)>> = Mutex::new(Vec::new());
+
+fn say(cfg: &Config, card: Card, word: Word) {
+    let mut words = WORDS.lock().unwrap_or_else(|e| e.into_inner());
+    words.push((cfg.state_dir().to_path_buf(), card, word));
+}
+
+async fn close_at_issuer(cfg: &Config, card: &Card) -> Result<(), String> {
+    match issuer(cfg) {
         Ok(issuer) => issuer.close(card).await.map_err(|e| e.0),
         Err(e) => Err(e),
-    };
-    // Whatever the issuer said, the number is never filled again.
-    live::forget(cfg.state_dir(), card.id, now);
-    if let Err(e) = closed {
-        audit(cfg, &db.get(), card, "close", &e);
-        // Past its time from now on: no fill fetches its number again, and each later tick
-        // tries the close again.
-        let mut told = card.clone();
-        told.expires_at = card.expires_at.min(now);
-        update(&db.get(), &told);
-        if card.told_at.is_none() {
-            told.told_at = Some(now);
-            update(&db.get(), &told);
+    }
+}
+
+/// Closes `card`: its number is forgotten now, the issuer is asked off the caller's loop, and
+/// the router's next tick records what it said ([`closed`]).
+pub fn ask_close(cfg: &Arc<Config>, card: Card, why: &str) {
+    live::forget(cfg.state_dir(), card.id, crate::now());
+    let (cfg, why) = (cfg.clone(), why.to_string());
+    tokio::spawn(async move {
+        let said = close_at_issuer(&cfg, &card).await;
+        say(&cfg, card, Word::Closed(why, said));
+    });
+}
+
+/// Records how a close of `card` went. One the issuer refused leaves the card as it is, past
+/// its time, so that no fill fetches its number and each later tick tries again; the owner is
+/// told once.
+fn closed(cfg: &Config, store: &Store, card: &Card, why: &str, said: Result<(), String>, now: i64) {
+    if let Err(e) = said {
+        audit(cfg, store, card, "close", &e);
+        log(store.card_expire_now(card.id, now));
+        if store.card_told_once(card.id, now).unwrap_or(false) {
             let e = crate::vault::scrubbed(cfg, e);
             let text = format!(
                 "[zephyr] card #{} could not be closed at the issuer: {e}; close it in the \
                  provider's app",
                 card.id
             );
-            tell(&db.get(), card, &text);
+            tell(store, card, &text);
         }
         return;
     }
@@ -1293,31 +1339,18 @@ async fn close(cfg: &Config, db: &Db, card: &Card, why: &str, now: i64) {
         true => "unknown",
         false => "closed",
     };
-    if !db
-        .get()
-        .move_card(card.id, &["waiting", "open", "charging"], to, now)
-        .unwrap_or(false)
-    {
+    if !store.move_card(card.id, &LIVE, to, now).unwrap_or(false) {
         return;
     }
-    audit(cfg, &db.get(), card, "close", why);
-    note(
-        &db.get(),
-        card,
-        "closed",
-        &format!("{why}; the card is closed and cannot be filled"),
-    );
+    audit(cfg, store, card, "close", why);
+    let text = format!("{why}; the card is closed and cannot be filled");
+    note(store, card, "closed", &text);
     if to == "unknown" {
-        let mut told = card.clone();
-        (told.status, told.told_at, told.closed_at) = ("unknown".into(), Some(now), Some(now));
-        update(&db.get(), &told);
-        tell(&db.get(), card, &delete_it(card, why));
+        log(store.card_told(card.id, now));
+        tell(store, card, &delete_it(card, why));
     } else {
-        tell(
-            &db.get(),
-            card,
-            &format!("[zephyr] card #{} is closed: {why}", card.id),
-        );
+        let text = format!("[zephyr] card #{} is closed: {why}", card.id);
+        tell(store, card, &text);
     }
 }
 
@@ -1378,124 +1411,151 @@ fn poll_due(cfg: &Config, id: i64) -> bool {
     }
 }
 
-/// The router's tick for cards: numbers past their hour are dropped; a card past its expiry is
-/// closed; every 30 s each waiting or open card's issuer is asked, and the card is opened once
-/// the owner approved it, or closed at the first charge it reports; a hand-made card the
-/// owner has not confirmed deleted is recalled once a day.
-pub async fn tick(cfg: &Config, now: i64) {
+/// The statuses of a card that is not over: it may still be filled, charged or closed.
+const LIVE: [&str; 3] = ["waiting", "open", "charging"];
+
+/// The router's tick for cards, on the router's own store. Numbers past their hour are
+/// dropped. What the issuers said since the last tick is recorded: a card opens once the owner
+/// approved it at the issuer, and closes at the first charge the issuer reports. A hand-made
+/// card the owner has not confirmed deleted is recalled once a day. Then each card that is
+/// past its expiry, or due (every 30 s), has its issuer asked, off the loop.
+pub fn tick(cfg: &Arc<Config>, store: &Store, now: i64) {
     live::sweep(now);
-    let Ok(db) = Db::open(cfg) else { return };
-    let forgotten = db.get().cards_in(&["unknown"]).unwrap_or_default();
-    for card in forgotten {
-        if card.provider == "manual" && card.told_at.is_none_or(|at| at + 86_400 <= now) {
-            let mut told = card.clone();
-            told.told_at = Some(now);
-            update(&db.get(), &told);
-            tell(&db.get(), &card, &delete_it(&card, "it is past its time"));
+    let words: Vec<(Card, Word)> = {
+        let mut all = WORDS.lock().unwrap_or_else(|e| e.into_inner());
+        let state = cfg.state_dir();
+        let (mine, rest) = std::mem::take(&mut *all)
+            .into_iter()
+            .partition(|(s, ..)| s == state);
+        *all = rest;
+        let mine: Vec<(PathBuf, Card, Word)> = mine;
+        mine.into_iter()
+            .map(|(_, card, word)| (card, word))
+            .collect()
+    };
+    for (card, word) in words {
+        match word {
+            Word::State(state) => stated(cfg, store, card, state, now),
+            Word::Closed(why, said) => closed(cfg, store, &card, &why, said, now),
+            Word::UsedClosed(what, said) => used_closed(cfg, store, &card, &what, said),
         }
     }
-    let live = db
-        .get()
-        .cards_in(&["waiting", "open", "charging"])
-        .unwrap_or_default();
-    for mut card in live {
-        if now >= card.expires_at {
+    for card in store.cards_in(&["unknown"]).unwrap_or_default() {
+        if card.provider == "manual" && card.told_at.is_none_or(|at| at + 86_400 <= now) {
+            log(store.card_told(card.id, now));
+            tell(store, &card, &delete_it(&card, "it is past its time"));
+        }
+    }
+    let mut asks: Vec<(Card, Option<&'static str>)> = Vec::new();
+    for card in store.cards_in(&LIVE).unwrap_or_default() {
+        let expired = now >= card.expires_at;
+        if expired {
             // Forgotten at once; the issuer is asked to close it at its own pace.
             live::forget(cfg.state_dir(), card.id, now);
-            if poll_due(cfg, card.id) {
-                // Only an issuer that reports charges can say it went unused.
-                let why = match caps(cfg).is_some_and(|c| c.charges) {
-                    true => "expired unused",
-                    false => "it is past its time",
-                };
-                close(cfg, &db, &card, why, now).await;
-            }
-            continue;
         }
         if !poll_due(cfg, card.id) {
             continue;
         }
-        let state = match issuer(cfg) {
-            Ok(issuer) => issuer.state(&card).await,
-            Err(e) => Err(ProviderError(e)),
+        // Only an issuer that reports charges can say a card went unused.
+        let why = match caps(cfg).is_some_and(|c| c.charges) {
+            true => "expired unused",
+            false => "it is past its time",
         };
-        match (state, card.status.as_str()) {
-            (Ok(CardState::Open), "waiting") if card.provider != "manual" => {
-                card.status = "open".into();
-                card.expires_at = now + 60 * i64::from(minutes(cfg));
-                update(&db.get(), &card);
-                audit(cfg, &db.get(), &card, "issue", "approved at the issuer");
-                note(&db.get(), &card, "issued", &ready(cfg, &card));
-            }
-            (Ok(CardState::Used(charges)), _) => used(cfg, &db, card, &charges, now).await,
-            (Ok(CardState::Closed), _) => {
-                live::forget(cfg.state_dir(), card.id, now);
-                if db
-                    .get()
-                    .move_card(card.id, &["waiting", "open", "charging"], "closed", now)
-                    .unwrap_or(false)
-                {
-                    audit(cfg, &db.get(), &card, "close", "closed at the issuer");
-                    note(
-                        &db.get(),
-                        &card,
-                        "closed",
-                        "the issuer closed it; it cannot be filled",
-                    );
-                }
-            }
-            (Ok(CardState::Failed(why)), _) => {
-                live::forget(cfg.state_dir(), card.id, now);
-                if db
-                    .get()
-                    .move_card(card.id, &["waiting", "open", "charging"], "failed", now)
-                    .unwrap_or(false)
-                {
-                    let why = crate::vault::scrubbed(cfg, why);
-                    audit(cfg, &db.get(), &card, "issue", &why);
-                    note(
-                        &db.get(),
-                        &card,
-                        "failed",
-                        &format!("no card: {why}; ask again if it is still wanted"),
-                    );
-                    tell(
-                        &db.get(),
-                        &card,
-                        &format!("[zephyr] card #{} was not issued: {why}", card.id),
-                    );
-                }
-            }
-            (Ok(_), _) => {}
-            (Err(e), _) => eprintln!(
-                "zephyr: asking the issuer about card #{} failed: {e}",
-                card.id
-            ),
+        asks.push((card, expired.then_some(why)));
+    }
+    if asks.is_empty() {
+        return;
+    }
+    let cfg = cfg.clone();
+    tokio::spawn(async move {
+        for (card, close) in asks {
+            let word = match close {
+                Some(why) => Word::Closed(why.into(), close_at_issuer(&cfg, &card).await),
+                None => Word::State(match issuer(&cfg) {
+                    Ok(issuer) => issuer.state(&card).await.map_err(|e| e.0),
+                    Err(e) => Err(e),
+                }),
+            };
+            say(&cfg, card, word);
         }
+    });
+}
+
+/// Records what the issuer said `card`'s state is.
+fn stated(
+    cfg: &Arc<Config>,
+    store: &Store,
+    card: Card,
+    state: Result<CardState, String>,
+    now: i64,
+) {
+    match state {
+        Ok(CardState::Open) if card.status == "waiting" && card.provider != "manual" => {
+            let until = now + 60 * i64::from(minutes(cfg));
+            // Only a card still waiting opens: one closed meanwhile stays closed.
+            if store.open_card(card.id, None, None, until).unwrap_or(false) {
+                let card = Card {
+                    expires_at: until,
+                    ..card
+                };
+                audit(cfg, store, &card, "issue", "approved at the issuer");
+                note(store, &card, "issued", &ready(cfg, &card));
+            }
+        }
+        Ok(CardState::Used(charges)) => used(cfg, store, card, &charges, now),
+        Ok(CardState::Closed) => {
+            live::forget(cfg.state_dir(), card.id, now);
+            if store
+                .move_card(card.id, &LIVE, "closed", now)
+                .unwrap_or(false)
+            {
+                audit(cfg, store, &card, "close", "closed at the issuer");
+                let text = "the issuer closed it; it cannot be filled";
+                note(store, &card, "closed", text);
+            }
+        }
+        Ok(CardState::Failed(why)) => {
+            live::forget(cfg.state_dir(), card.id, now);
+            if store
+                .move_card(card.id, &LIVE, "failed", now)
+                .unwrap_or(false)
+            {
+                let why = crate::vault::scrubbed(cfg, why);
+                audit(cfg, store, &card, "issue", &why);
+                let text = format!("no card: {why}; ask again if it is still wanted");
+                note(store, &card, "failed", &text);
+                let text = format!("[zephyr] card #{} was not issued: {why}", card.id);
+                tell(store, &card, &text);
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!(
+            "zephyr: asking the issuer about card #{} failed: {e}",
+            card.id
+        ),
     }
 }
 
-/// The issuer reported `charges` on `card`: recorded, the card closed, the owner and the agent
-/// told who charged it; a charge the card should not have taken is told at once.
-async fn used(cfg: &Config, db: &Db, mut card: Card, charges: &[Charge], now: i64) {
+/// The issuer reported `charges` on `card`: recorded once, and a charge the card should not
+/// have taken is told at once. The card is then closed at the issuer too, and the owner and
+/// the agent are told who charged it when that answer is in ([`used_closed`]).
+fn used(cfg: &Arc<Config>, store: &Store, card: Card, charges: &[Charge], now: i64) {
     let Some(first) = charges.first() else { return };
-    if !db
-        .get()
-        .move_card(card.id, &["waiting", "open", "charging"], "used", now)
-        .unwrap_or(false)
-    {
+    live::forget(cfg.state_dir(), card.id, now);
+    let charge = store.card_charged(
+        card.id,
+        first.minor,
+        &first.currency,
+        first.merchant_id.as_deref(),
+        first.descriptor.as_deref(),
+        first.mcc.as_deref(),
+        now,
+    );
+    if !charge.unwrap_or(false) {
         return;
     }
-    card.status = "used".into();
-    card.closed_at = Some(now);
-    card.charged_minor = Some(first.minor);
-    card.charged_currency = Some(first.currency.clone());
-    card.merchant_id.clone_from(&first.merchant_id);
-    card.descriptor.clone_from(&first.descriptor);
-    card.mcc.clone_from(&first.mcc);
-    update(&db.get(), &card);
     let what = charged(first);
-    audit(cfg, &db.get(), &card, "charge", &what);
+    audit(cfg, store, &card, "charge", &what);
     let over = first.minor > card.cap_minor || first.currency != card.currency;
     if over || charges.len() > 1 {
         let all: Vec<String> = charges.iter().map(charged).collect();
@@ -1506,77 +1566,42 @@ async fn used(cfg: &Config, db: &Db, mut card: Card, charges: &[Charge], now: i6
             crate::approvals::money(card.cap_minor, &card.currency),
             all.join("; ")
         );
-        tell(&db.get(), &card, &text);
+        tell(store, &card, &text);
     }
-    // Closed at the issuer too; a refusal there is told and tried no further: it is used.
-    let closed = match issuer(cfg) {
-        Ok(issuer) => issuer.close(&card).await.map_err(|e| e.0),
-        Err(e) => Err(e),
-    };
-    live::forget(cfg.state_dir(), card.id, now);
-    let end = match closed {
+    let cfg = cfg.clone();
+    tokio::spawn(async move {
+        let said = close_at_issuer(&cfg, &card).await;
+        say(&cfg, card, Word::UsedClosed(what, said));
+    });
+}
+
+/// The close after a charge is in: a refusal there is told and tried no further, the card
+/// being used.
+fn used_closed(cfg: &Config, store: &Store, card: &Card, what: &str, said: Result<(), String>) {
+    let end = match said {
         Ok(()) => "the card is closed".to_string(),
         Err(e) => {
-            audit(cfg, &db.get(), &card, "close", &e);
+            audit(cfg, store, card, "close", &e);
             "closing it at the issuer failed; close it in the provider's app".to_string()
         }
     };
-    tell(
-        &db.get(),
-        &card,
-        &format!("[zephyr] card #{} was {what}; {end}", card.id),
-    );
-    note(&db.get(), &card, "used", &format!("{what}; {end}"));
+    let text = format!("[zephyr] card #{} was {what}; {end}", card.id);
+    tell(store, card, &text);
+    note(store, card, "used", &format!("{what}; {end}"));
 }
 
-/// `/stop`, `/pause` and a start: every card still waiting or open is closed, off the router's
-/// loop. Their numbers are forgotten before this returns.
-pub fn close_all(cfg: &Arc<Config>, why: &'static str) {
-    let Ok(store) = open_store(cfg) else { return };
-    let cards = store
-        .cards_in(&["waiting", "open", "charging"])
-        .unwrap_or_default();
-    if cards.is_empty() {
-        return;
+/// `/stop`, `/pause` and a start: every card that is not over is closed. Their numbers are
+/// forgotten before this returns; the issuers are asked off the router's loop.
+pub fn close_all(cfg: &Arc<Config>, store: &Store, why: &'static str) {
+    for card in store.cards_in(&LIVE).unwrap_or_default() {
+        ask_close(cfg, card, why);
     }
-    let now = crate::now();
-    for card in &cards {
-        live::forget(cfg.state_dir(), card.id, now);
-    }
-    let cfg = cfg.clone();
-    tokio::spawn(async move {
-        let Ok(db) = Db::open(&cfg) else { return };
-        for card in cards {
-            close(&cfg, &db, &card, why, now).await;
-        }
-    });
 }
 
-static TICKING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-
-/// The router's tick: runs [`tick`] off its loop when there is a card to look at, one run at a
-/// time for a gateway.
-pub fn tick_off(cfg: &Arc<Config>, store: &Store) {
-    let now = crate::now();
-    live::sweep(now);
-    let live = ["waiting", "open", "charging", "unknown"];
-    if store.cards_in(&live).map_or(true, |c| c.is_empty()) {
-        return;
+fn log<T>(done: rusqlite::Result<T>) {
+    if let Err(e) = done {
+        eprintln!("zephyr: recording a card failed: {e}");
     }
-    let state = cfg.state_dir().to_path_buf();
-    {
-        let mut ticking = TICKING.lock().unwrap_or_else(|e| e.into_inner());
-        if ticking.contains(&state) {
-            return;
-        }
-        ticking.push(state.clone());
-    }
-    let cfg = cfg.clone();
-    tokio::spawn(async move {
-        tick(&cfg, now).await;
-        let mut ticking = TICKING.lock().unwrap_or_else(|e| e.into_inner());
-        ticking.retain(|s| *s != state);
-    });
 }
 
 #[cfg(test)]
