@@ -96,6 +96,30 @@ fn start(name: &str, extra: &str, tweak: impl FnOnce(&mut Config)) -> Gateway {
     }
 }
 
+/// A copy of the fake ffmpeg, whisper and Piper (`tests/fixtures/voice`) in `home`, as the
+/// image lays its voice folder out, with the English voice and a log `nobody` can append to.
+fn fakes(home: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = home.join("voice");
+    let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/voice");
+    for file in ["bin/ffmpeg", "bin/whisper-cli", "py/bin/python"] {
+        std::fs::create_dir_all(dir.join(file).parent().unwrap()).unwrap();
+        std::fs::copy(from.join(file), dir.join(file)).unwrap();
+    }
+    std::fs::create_dir_all(dir.join("voices")).unwrap();
+    std::fs::write(dir.join("voices/en_US-lessac-medium.onnx"), "").unwrap();
+    std::fs::write(dir.join("log"), "").unwrap();
+    std::fs::set_permissions(dir.join("log"), std::fs::Permissions::from_mode(0o666)).unwrap();
+    dir
+}
+
+/// How often the fake `prog` ran.
+fn ran(home: &Path, prog: &str) -> usize {
+    let log = std::fs::read_to_string(home.join("voice/log")).unwrap();
+    let mark = format!("\"prog\": \"{prog}\"");
+    log.lines().filter(|l| l.contains(&mark)).count()
+}
+
 async fn wait(mut done: impl FnMut() -> bool) {
     for _ in 0..400 {
         if done() {
@@ -174,6 +198,144 @@ fn prompts(home: &Path) -> Vec<String> {
         .filter(|v| v["type"] == "prompt" || v["type"] == "queue_message")
         .map(|v| v["message"].as_str().unwrap_or_default().to_string())
         .collect()
+}
+
+fn with_fakes(cfg: &mut Config) {
+    cfg.voice_dir = fakes(&cfg.home);
+}
+
+#[tokio::test]
+async fn a_reply_to_a_voice_note_is_also_spoken() {
+    let gw = start("spoken", "", with_fakes);
+    gw.spoken("v1", "what is on tomorrow").await;
+    wait(|| gw.sent().len() == 2).await;
+    let sent = gw.sent();
+    let (text, voice) = (&sent[0].0, &sent[1].0);
+    assert!(text.text.contains("what is on tomorrow"), "{}", text.text);
+    assert_eq!(text.attachment, None);
+    assert_eq!(voice.client_id, format!("{}-v", text.client_id));
+    assert_eq!(
+        (voice.channel.as_str(), voice.text.as_str()),
+        ("discord", "")
+    );
+    assert_eq!(voice.recipient, text.recipient);
+    let file = voice.attachment.as_ref().unwrap();
+    assert_eq!(file.file_name().unwrap(), "voice.ogg");
+    assert!(file.to_string_lossy().contains("/files/"), "{file:?}");
+    let audio = sent[1].1.as_ref().unwrap();
+    assert!(
+        audio.starts_with(b"OggSpcm:"),
+        "the fake Piper's speech, encoded by the fake ffmpeg"
+    );
+    assert_eq!(ran(&gw.home, "python"), 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_typed_message_gets_no_voice_under_mirror() {
+    let gw = start("typed", "", with_fakes);
+    gw.send("discord", "m1", "hello", None).await;
+    gw.reply_with("hello").await;
+    // A spoken one after it is: by then the typed one's voice would have been made too.
+    gw.spoken("v1", "and this").await;
+    wait(|| gw.sent().len() == 3).await;
+    assert_eq!(ran(&gw.home, "python"), 1);
+    let voices = gw
+        .sent()
+        .iter()
+        .filter(|(m, _)| m.attachment.is_some())
+        .count();
+    assert_eq!(voices, 1);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn always_speaks_a_typed_reply_but_never_a_notice_or_on_chat() {
+    let gw = start("always", "[voice]\nreply = \"always\"", with_fakes);
+    gw.typed("m1", "on chat").await;
+    gw.reply_with("on chat").await;
+    gw.send("discord", "m2", "/status", None).await;
+    gw.reply_with("paused: no").await;
+    gw.send("discord", "m3", "hello", None).await;
+    wait(|| gw.sent().iter().any(|(m, _)| m.attachment.is_some())).await;
+    assert_eq!(
+        ran(&gw.home, "python"),
+        1,
+        "only the agent's reply on Discord"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_failed_piper_leaves_the_text_reply_sent() {
+    let gw = start("piper-fails", "", |cfg| {
+        with_fakes(cfg);
+        std::fs::write(cfg.voice_dir.join("piper_fail"), "").unwrap();
+    });
+    gw.spoken("v1", "what is on tomorrow").await;
+    gw.reply_with("what is on tomorrow").await;
+    wait(|| ran(&gw.home, "python") == 1).await;
+    // A second exchange: whatever the first would still send has gone out by its end.
+    gw.typed("m2", "again").await;
+    gw.reply_with("again").await;
+    assert!(gw.sent().iter().all(|(m, _)| m.attachment.is_none()));
+    assert_eq!(ran(&gw.home, "ffmpeg"), 0, "nothing to encode");
+    gw.shutdown().await;
+}
+
+/// The image's own whisper, ffmpeg and Piper (`/opt/zephyr/voice`), as root in the image:
+/// `cargo test -p zephyr --test voice -- --ignored`. Skips when the folder is absent, unless
+/// `ZEPHYR_REAL_VOICE=1`.
+#[tokio::test]
+#[ignore]
+async fn the_images_binaries_hear_what_piper_says() {
+    use zephyr::voice::{self, Heard};
+    if !Path::new(voice::DIR).exists() {
+        assert!(
+            std::env::var("ZEPHYR_REAL_VOICE").as_deref() != Ok("1"),
+            "ZEPHYR_REAL_VOICE=1 but {} is absent",
+            voice::DIR
+        );
+        return eprintln!("skipped: no {}", voice::DIR);
+    }
+    let cfg: Config = toml::from_str("rpi = '/r'\nhome = '/tmp'").unwrap();
+    let said = "The meeting is tomorrow morning at nine.";
+    let ogg = voice::speak(&cfg, said, "discord")
+        .await
+        .expect("Piper and ffmpeg");
+    assert!(ogg.starts_with(b"OggS"));
+    let (heard, secs) = voice::transcribe(&cfg, &ogg).await;
+    let Heard::Said { lang, text } = heard else {
+        panic!("{heard:?}");
+    };
+    let text = text.to_lowercase();
+    assert_eq!(lang, "en");
+    assert!(
+        text.contains("meeting") && text.contains("tomorrow"),
+        "{text}"
+    );
+    assert!((1..=10).contains(&secs), "{secs}");
+    let m4a = voice::speak(&cfg, said, "imessage")
+        .await
+        .expect("AAC in M4A");
+    assert!(matches!(
+        voice::transcribe(&cfg, &m4a).await.0,
+        Heard::Said { .. }
+    ));
+    // Safety: geteuid cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        assert_eq!(voice::uid().await, Some(voice::NOBODY));
+    }
+    // A Korean sample, when one is beside the fakes (and its words in `ko.txt`).
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/voice");
+    if let Ok(ko) = std::fs::read(fixtures.join("ko.ogg")) {
+        let Heard::Said { lang, text } = voice::transcribe(&cfg, &ko).await.0 else {
+            panic!("the Korean sample was not heard");
+        };
+        assert_eq!(lang, "ko");
+        let words = std::fs::read_to_string(fixtures.join("ko.txt")).unwrap_or_default();
+        assert!(text.contains(words.trim()), "{text}");
+    }
 }
 
 /// Review Focus 2: speech approves nothing. The agent's proposal stays pending and the row

@@ -4,8 +4,11 @@
 //! could ptrace them and rewrite the text. They read sealed memfds, never a path the agent can
 //! write, and the floor gives uid 65534 no network (`egress::ruleset`).
 //!
-//! The real binaries' argv and output shapes are in `decode_args`, `whisper_args` and
-//! `detected` alone; `tests/fixtures/voice/bin/ffmpeg` is their stand-in and reads the same.
+//! A reply can also be spoken: Piper makes the speech and ffmpeg encodes it, the same way.
+//!
+//! The real binaries' argv and output shapes are in `decode_args`, `whisper_args`, `detected`,
+//! `piper_args` and `encode_args` alone; `tests/fixtures/voice/bin/ffmpeg` is their stand-in
+//! and reads the same.
 
 use crate::config::Config;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -35,6 +38,17 @@ pub const LANGUAGES: &[&str] = &[
 ];
 
 const FFMPEG_LIMIT: Duration = Duration::from_secs(30);
+/// Piper's limit, and its encode's.
+const SPEAK_LIMIT: Duration = Duration::from_secs(60);
+/// A reply longer than this, once marks and URLs are gone, is not spoken: about two minutes.
+const MAX_SPOKEN: usize = 1500;
+/// The channels that can carry a voice note back.
+const SPOKEN_ON: [&str; 4] = ["telegram", "signal", "discord", "imessage"];
+const VOICE_EN: &str = "voices/en_US-lessac-medium.onnx";
+/// In the image only with `KO_VOICE=1` (CC BY-NC-SA 4.0); without it Korean replies stay text.
+const VOICE_KO: &str = "voices/ko_KR-kss-medium.onnx";
+/// What Piper's `medium` voices write with `--output-raw`: s16le mono at this rate.
+const PIPER_RATE: &str = "22050";
 /// A transcript longer than this is cut.
 const MAX_TEXT: usize = 4000;
 /// What is kept of a process's output; one that writes more blocks and is killed at its limit.
@@ -389,6 +403,198 @@ async fn whisper(cfg: &Config, wav: &Mem, lang: &str) -> Result<Out, Stop> {
     Err(Stop::Failed)
 }
 
+/// Whether a reply to a row on `channel` is also spoken (`voice.reply`): under `mirror` one to
+/// a voice note (`derived`), under `always` every one, where a voice note can be sent and the
+/// image has Piper.
+pub fn replies_aloud(cfg: &Config, channel: &str, derived: Option<&str>) -> bool {
+    let on = match cfg.voice().reply.as_str() {
+        "always" => true,
+        "mirror" => derived == Some("voice"),
+        _ => false,
+    };
+    on && SPOKEN_ON.contains(&channel) && cfg.voice_dir.join("py/bin/python").exists()
+}
+
+/// `text` as it is spoken: markdown marks and URLs gone. `None` for what is read, never heard:
+/// a notice of the daemon's, a reply with a code block, one over `MAX_SPOKEN` characters, or
+/// nothing left to say.
+pub fn speakable(text: &str) -> Option<String> {
+    if text.trim_start().starts_with("[zephyr]") || text.contains("```") {
+        return None;
+    }
+    let line = |line: &str| -> String {
+        // A link's address becomes a word of its own, and goes with the other URLs.
+        let line = line.replace("](", "] (");
+        let words: Vec<String> = line
+            .split_whitespace()
+            .filter(|w| !w.contains("://"))
+            .map(|w| w.chars().filter(|c| !"*_`#~>|[]".contains(*c)).collect())
+            // A list's dash or a rule: nothing to say.
+            .filter(|w: &String| w.chars().any(char::is_alphanumeric))
+            .collect();
+        words.join(" ")
+    };
+    let lines: Vec<String> = (text.lines().map(line)).filter(|l| !l.is_empty()).collect();
+    let said = lines.join("\n");
+    (!said.is_empty() && said.chars().count() <= MAX_SPOKEN).then_some(said)
+}
+
+/// The file name a channel's voice note has, and its codec: Ogg Opus where the platform shows
+/// that as a voice message, AAC in M4A elsewhere.
+pub fn format_for(channel: &str) -> (&'static str, &'static str) {
+    match channel {
+        "telegram" | "discord" => ("voice.ogg", "opus"),
+        _ => ("voice.m4a", "aac"),
+    }
+}
+
+/// The Piper voice for `text`: Korean when Hangul is at least 30% of its letters, else English.
+/// `None` when the image does not have it.
+fn voice_for(dir: &Path, text: &str) -> Option<std::path::PathBuf> {
+    let hangul = |c: &char| matches!(c, '\u{ac00}'..='\u{d7a3}' | '\u{1100}'..='\u{11ff}' | '\u{3130}'..='\u{318f}');
+    let letters = text.chars().filter(|c| c.is_alphabetic()).count();
+    let korean = text.chars().filter(hangul).count() * 10 >= letters * 3 && letters > 0;
+    let voice = dir.join(if korean { VOICE_KO } else { VOICE_EN });
+    voice.exists().then_some(voice)
+}
+
+/// Piper's argv: the text comes on stdin, raw PCM goes to stdout.
+fn piper_args(voice: &Path) -> Vec<String> {
+    let voice = voice.to_string_lossy();
+    ["-m", "piper", "-m", &voice, "--output-raw"]
+        .map(String::from)
+        .to_vec()
+}
+
+/// ffmpeg's argv to encode Piper's PCM on fd 3 to stdout, as measured with the image's static
+/// ffmpeg 7.1. M4A to a pipe has to be fragmented: the muxer cannot seek back.
+fn encode_args(codec: &str) -> Vec<String> {
+    let out: &[&str] = match codec {
+        "opus" => &["-c:a", "libopus", "-b:a", "32k", "-f", "ogg"],
+        _ => &[
+            "-c:a",
+            "aac",
+            "-movflags",
+            "frag_keyframe+empty_moov",
+            "-f",
+            "ipod",
+        ],
+    };
+    let input = "-hide_banner -nostdin -loglevel error -f s16le -ac 1 -i /proc/self/fd/3 -ar";
+    (input
+        .split(' ')
+        .chain([PIPER_RATE])
+        .chain(out.iter().copied())
+        .chain(["pipe:1"]))
+    .map(String::from)
+    .collect()
+}
+
+/// `text` spoken, as the file `channel` takes (`format_for`), or `None`: not speakable, no
+/// voice for its language in this image, or Piper or ffmpeg failed. Both run as the decoders do.
+pub async fn speak(cfg: &Config, text: &str, channel: &str) -> Option<Vec<u8>> {
+    let text = speakable(text)?;
+    let dir = &cfg.voice_dir;
+    let voice = voice_for(dir, &text)?;
+    let made = async {
+        let said = mem(Mem::sealed(text.as_bytes()))?;
+        let stdin = Stdio::from(mem(said.0.try_clone())?);
+        let python = dir.join("py/bin/python");
+        let piper = run(&python, &piper_args(&voice), &[], stdin, SPEAK_LIMIT).await?;
+        // Piper's stderr is never empty (onnxruntime warns): the exit code and the PCM count.
+        if !piper.ok || piper.stdout.is_empty() {
+            return Err(Stop::Failed);
+        }
+        let pcm = mem(Mem::sealed(&piper.stdout))?;
+        let args = encode_args(format_for(channel).1);
+        let ffmpeg = dir.join("bin/ffmpeg");
+        let out = run(&ffmpeg, &args, &[(&pcm, 3)], Stdio::null(), SPEAK_LIMIT).await?;
+        match out.ok {
+            true => Ok(out.stdout),
+            false => Err(Stop::Failed),
+        }
+    };
+    match made.await {
+        Ok(audio) if !audio.is_empty() => Some(audio),
+        Ok(_) | Err(Stop::Failed) => {
+            eprintln!("zephyr: voice: a reply could not be spoken");
+            None
+        }
+        Err(Stop::TimedOut) => {
+            eprintln!("zephyr: voice: speaking a reply timed out");
+            None
+        }
+    }
+}
+
+/// The uid a decoder gets: `/usr/bin/id -u`, run as they are. For `doctor` and the in-image
+/// test.
+pub async fn uid() -> Option<u32> {
+    let id = Path::new("/usr/bin/id");
+    let out = run(id, &["-u".into()], &[], Stdio::null(), FFMPEG_LIMIT).await;
+    String::from_utf8_lossy(&out.ok()?.stdout)
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// `status`'s line, and `doctor`'s first.
+pub fn status(cfg: &Config) -> String {
+    if !present(cfg) {
+        return "voice: not in this image (built with VOICE=0)".into();
+    }
+    let on = if gpu() { "GPU (Vulkan)" } else { "CPU" };
+    format!("voice: whisper small on {on}")
+}
+
+/// `doctor`'s lines, each `ok|warn <what>`: the models and voices that are there, the uid the
+/// decoders get, and a one-second silent sample through ffmpeg and whisper within 30 s.
+pub async fn doctor(cfg: &Config) -> Vec<String> {
+    let mut lines = vec![format!("ok   {}", status(cfg))];
+    if !present(cfg) {
+        return lines;
+    }
+    let there = |files: &[&str]| -> (Vec<String>, Vec<String>) {
+        (files.iter().map(|f| f.to_string())).partition(|f| cfg.voice_dir.join(f).exists())
+    };
+    let (have, missing) = there(&["bin/ffmpeg", MODEL, VAD_MODEL, VOICE_EN]);
+    match missing.is_empty() {
+        true => lines.push(format!("ok   voice: {} are there", have.join(", "))),
+        false => lines.push(format!("warn voice: {} missing", missing.join(", "))),
+    }
+    if !cfg.voice_dir.join(VOICE_KO).exists() {
+        let note = "ok   voice: no Korean voice (built with KO_VOICE=0): Korean replies are text";
+        lines.push(note.into());
+    }
+    // Safety: geteuid cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        lines.push(match uid().await {
+            Some(NOBODY) => "ok   voice: the decoders run as uid 65534".into(),
+            other => format!("warn voice: the decoders run as {other:?}, not uid 65534"),
+        });
+    }
+    // One second of silence, as the WAV whisper itself reads.
+    let mut wav = Vec::from(*b"RIFF");
+    let data = WAV_BYTES_PER_SEC as u32;
+    wav.extend((36 + data).to_le_bytes());
+    wav.extend(b"WAVEfmt ");
+    for n in [16u32, 0x0001_0001, 16000, 32000, 0x0010_0002] {
+        wav.extend(n.to_le_bytes());
+    }
+    wav.extend(b"data");
+    wav.extend(data.to_le_bytes());
+    wav.resize(wav.len() + data as usize, 0);
+    let sample = tokio::time::timeout(Duration::from_secs(30), transcribe(cfg, &wav)).await;
+    lines.push(match sample {
+        Ok((Heard::Silence | Heard::Said { .. }, _)) => {
+            "ok   voice: a silent sample is transcribed".into()
+        }
+        Ok((heard, _)) => format!("warn voice: a silent sample gave {heard:?}"),
+        Err(_) => "warn voice: a silent sample took over 30 s".into(),
+    });
+    lines
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -405,6 +611,8 @@ pub(crate) mod tests {
             std::fs::create_dir_all(dir.join(file).parent().unwrap()).unwrap();
             std::fs::copy(from.join(file), dir.join(file)).unwrap();
         }
+        std::fs::create_dir_all(dir.join("voices")).unwrap();
+        std::fs::write(dir.join(VOICE_EN), "").unwrap();
         std::fs::write(dir.join("log"), "").unwrap();
         std::fs::set_permissions(dir.join("log"), std::fs::Permissions::from_mode(0o666)).unwrap();
         let mut cfg: Config =
@@ -601,6 +809,104 @@ pub(crate) mod tests {
         assert_eq!(transcribe(&cfg, b"a").await.0, Heard::Silence);
         std::fs::remove_file(cfg.voice_dir.join("bin/ffmpeg")).unwrap();
         assert_eq!(transcribe(&cfg, b"a").await, (Heard::Failed, 0));
+    }
+
+    #[test]
+    fn notices_code_and_long_replies_are_not_spoken() {
+        assert_eq!(speakable("[zephyr] paused"), None);
+        assert_eq!(speakable("run this:\n```sh\nls\n```"), None);
+        assert_eq!(speakable(&"word ".repeat(301)), None, "1504 characters");
+        assert!(speakable(&"word ".repeat(300)).is_some(), "1499");
+        assert_eq!(speakable("https://example.com/a"), None, "nothing left");
+        assert_eq!(
+            speakable("**Done.** See [the docs](https://example.com/a) or https://x.test\n\n- `one`\n- two"),
+            Some("Done. See the docs or\none\ntwo".into())
+        );
+    }
+
+    #[test]
+    fn hangul_picks_the_korean_voice_and_a_missing_one_speaks_nothing() {
+        let cfg = fakes("voice-pick", "");
+        let dir = &cfg.voice_dir;
+        assert_eq!(voice_for(dir, "hello there"), Some(dir.join(VOICE_EN)));
+        // Built with KO_VOICE=0: a Korean reply stays text.
+        assert_eq!(voice_for(dir, "내일 아침 9시에 알려 드릴게요"), None);
+        std::fs::write(dir.join(VOICE_KO), "").unwrap();
+        let ko = Some(dir.join(VOICE_KO));
+        assert_eq!(voice_for(dir, "내일 아침 9시에 알려 드릴게요"), ko);
+        assert_eq!(voice_for(dir, "네, OK"), ko, "1 of 3 letters");
+        assert_eq!(
+            voice_for(dir, "the word 네 means yes"),
+            Some(dir.join(VOICE_EN))
+        );
+        std::fs::remove_file(dir.join(VOICE_EN)).unwrap();
+        assert_eq!(voice_for(dir, "hello"), None);
+    }
+
+    #[tokio::test]
+    async fn discord_gets_ogg_and_imessage_m4a() {
+        assert_eq!(format_for("discord"), ("voice.ogg", "opus"));
+        assert_eq!(format_for("telegram"), ("voice.ogg", "opus"));
+        assert_eq!(format_for("imessage"), ("voice.m4a", "aac"));
+        assert_eq!(format_for("signal"), ("voice.m4a", "aac"));
+        let cfg = fakes("voice-speak", "");
+        let ogg = speak(&cfg, "**hello** there", "discord").await.unwrap();
+        assert_eq!(ogg, b"OggSpcm:hello there");
+        let m4a = speak(&cfg, "hello there", "imessage").await.unwrap();
+        assert_eq!(m4a, b"ftyppcm:hello there");
+        let piper = &log(&cfg, "python")[0];
+        assert_eq!(piper["sha256"], sha256(b"hello there"));
+        let argv = piper["argv"].to_string();
+        assert!(argv.contains("en_US-lessac-medium.onnx") && argv.contains("--output-raw"));
+        assert!(!piper["env"].to_string().contains("HOME"));
+        let encodes = log(&cfg, "ffmpeg");
+        assert!(encodes[0]["argv"].to_string().contains("libopus"));
+        assert!(encodes[1]["argv"].to_string().contains("ipod"));
+        mark(&cfg, "piper_fail", "");
+        assert_eq!(speak(&cfg, "hello", "discord").await, None);
+        assert_eq!(speak(&cfg, "[zephyr] paused", "discord").await, None);
+    }
+
+    #[test]
+    fn a_reply_is_spoken_only_where_the_setting_and_the_channel_allow() {
+        let cfg = fakes("voice-aloud", "");
+        assert!(replies_aloud(&cfg, "discord", Some("voice")));
+        assert!(!replies_aloud(&cfg, "discord", None), "mirror: a typed row");
+        assert!(!replies_aloud(&cfg, "chat", Some("voice")));
+        let always = fakes("voice-aloud-always", "[voice]\nreply = 'always'");
+        assert!(replies_aloud(&always, "imessage", None));
+        assert!(!replies_aloud(&always, "web", None));
+        let off = fakes("voice-aloud-off", "[voice]\nreply = 'off'");
+        assert!(!replies_aloud(&off, "discord", Some("voice")));
+        let mut none = cfg.clone();
+        none.voice_dir = cfg.home.join("no-voice");
+        assert!(!replies_aloud(&none, "discord", Some("voice")), "VOICE=0");
+    }
+
+    #[tokio::test]
+    async fn doctor_names_what_is_there_and_hears_a_silent_sample() {
+        let cfg = fakes("voice-doctor", "");
+        mark(&cfg, "say", "");
+        let lines = doctor(&cfg).await;
+        assert!(
+            lines[0].starts_with("ok   voice: whisper small on "),
+            "{lines:?}"
+        );
+        // The fakes have no models.
+        assert!(
+            lines[1].starts_with("warn voice: models/ggml-small-q5_1.bin, "),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.last().unwrap(),
+            "ok   voice: a silent sample is transcribed"
+        );
+        let mut none = cfg.clone();
+        none.voice_dir = cfg.home.join("no-voice");
+        assert_eq!(
+            doctor(&none).await,
+            ["ok   voice: not in this image (built with VOICE=0)"]
+        );
     }
 
     #[test]

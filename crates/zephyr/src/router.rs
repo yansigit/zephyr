@@ -1325,6 +1325,7 @@ impl<'a> Router<'a> {
                         .store
                         .reply(&row, &unspoof(&text), "done")
                         .map_err(Into::into));
+                    self.speak(&row, &text);
                     self.steer_sent.push(text);
                     self.steer_replied = true;
                 }
@@ -4839,7 +4840,10 @@ impl<'a> Router<'a> {
                 Some(Some(reply)) if self.steer_sent.contains(reply) => {
                     self.store.set_status(row.id, "done")?
                 }
-                Some(Some(reply)) => self.store.reply(&row, &unspoof(reply), "done")?,
+                Some(Some(reply)) => {
+                    self.store.reply(&row, &unspoof(reply), "done")?;
+                    self.speak(&row, reply);
+                }
                 Some(None) if steers && !requeue && row.tries < 2 => {
                     self.store.requeue_as_continue(row.id)?
                 }
@@ -4872,6 +4876,29 @@ impl<'a> Router<'a> {
             return Ok(());
         }
         self.dispatch_new().await
+    }
+
+    /// Also speaks the agent's reply to `row` when `voice.reply` says so (DESIGN §4.3). Only an
+    /// agent's reply comes here, never a notice, a card or job output: those are read, not
+    /// heard. On a task of its own, after the text row is written, so the text never waits; the
+    /// voice is a second outbox row, and a crash meanwhile loses only that.
+    fn speak(&self, row: &InboxRow, text: &str) {
+        let cfg = self.cfg.clone();
+        if !crate::voice::replies_aloud(&cfg, &row.channel, row.derived.as_deref()) {
+            return;
+        }
+        let (row, text) = (row.clone(), text.to_string());
+        tokio::spawn(async move {
+            let Some(audio) = crate::voice::speak(&cfg, &text, &row.channel).await else {
+                return;
+            };
+            let name = crate::voice::format_for(&row.channel).0;
+            let queued = crate::tools::keep(&cfg, name.as_ref(), &audio).and_then(|file| {
+                let store = Store::open(&cfg.db_path())?;
+                Ok(store.voice_reply(&row, &file.to_string_lossy())?)
+            });
+            log(queued.map_err(|e| e.context("queueing a spoken reply")));
+        });
     }
 
     async fn flush<C: Channel>(&mut self, channels: &[C]) {

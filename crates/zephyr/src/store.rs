@@ -1432,6 +1432,23 @@ impl Store {
         self.notify_file(channel, recipient, text, None)
     }
 
+    /// The spoken form of the reply to `row` (DESIGN §4.3): a second outbox row to the same
+    /// recipient, client id `<the reply's>-v`, no text, the audio at `path`. It has no inbox id,
+    /// which is the reply's alone; written once, whatever is retried.
+    pub fn voice_reply(&self, row: &InboxRow, path: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT OR IGNORE INTO outbox(channel, recipient, client_id, text, attachment)
+             VALUES (?1, ?2, ?3, '', ?4)",
+            params![
+                row.channel,
+                row.sender,
+                format!("{}-v", client_id(row.id)),
+                path
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Writes a notice to `channel`/`recipient`, with a file to send along, if any.
     pub fn notify_file(
         &self,
@@ -4271,6 +4288,24 @@ mod tests {
             store.inbox_row(retry).unwrap().unwrap().owner,
             "a retry is what it retries"
         );
+    }
+
+    #[test]
+    fn a_spoken_reply_is_a_second_row_written_once() {
+        let mut store = Store::open(&crate::test_dir("store-voice").join("state.db")).unwrap();
+        store.insert_inbox_as(&msg("a"), "new").unwrap();
+        let row = store.inbox_with_status("new").unwrap().remove(0);
+        store.reply(&row, "hi", "done").unwrap();
+        store.voice_reply(&row, "/f/voice.ogg").unwrap();
+        store.voice_reply(&row, "/f/again.ogg").unwrap();
+        let out = store.pending_outbox().unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].client_id, format!("{}-v", out[0].client_id));
+        assert_eq!(
+            (out[1].text.as_str(), out[1].recipient.as_str()),
+            ("", "1000")
+        );
+        assert_eq!(out[1].attachment.as_deref(), Some("/f/voice.ogg"));
     }
 
     #[test]

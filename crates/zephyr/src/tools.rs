@@ -125,6 +125,15 @@ fn send_file(
     if bytes.len() as u64 > MAX_FILE {
         bail!("{given} is larger than {MAX_FILE} bytes");
     }
+    let copy = keep(cfg, &name, &bytes)?;
+    let caption = args["caption"].as_str().unwrap_or("").trim();
+    store.notify_file(channel, recipient, caption, copy.to_str())?;
+    Ok(())
+}
+
+/// Writes `bytes` as `<state>/files/<millis>-<seq>/<name>`, the daemon's own copy of a file an
+/// outbox row sends; it is deleted once the row is sent or given up.
+pub fn keep(cfg: &Config, name: &std::ffi::OsStr, bytes: &[u8]) -> anyhow::Result<PathBuf> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = cfg.state_dir().join("files").join(format!(
         "{}-{}",
@@ -134,9 +143,7 @@ fn send_file(
     std::fs::create_dir_all(&dir)?;
     let copy = dir.join(name);
     std::fs::write(&copy, bytes)?;
-    let caption = args["caption"].as_str().unwrap_or("").trim();
-    store.notify_file(channel, recipient, caption, copy.to_str())?;
-    Ok(())
+    Ok(copy)
 }
 
 /// Adds the job switched off and asks the owner.

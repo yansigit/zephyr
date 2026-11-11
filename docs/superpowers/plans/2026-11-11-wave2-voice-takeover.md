@@ -194,14 +194,19 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
 - It runs on a task of its own after the text row is written; the file goes to `<state>/files/<millis>-<seq>/voice.ogg` as `send_file`'s copies do.
 - `doctor`: `voice: whisper small on CPU|GPU (…)`, the models and voices present, a one-second silent sample transcribed within 30 s; `voice: not in this image (built with VOICE=0)` when `DIR` is missing. `status` prints the first form.
 
-- [ ] **Step 1: Failing tests:**
+- [x] **Step 1: Failing tests:**
   - `voice.rs`: `notices_code_and_long_replies_are_not_spoken`; `hangul_picks_the_korean_voice_and_a_missing_one_speaks_nothing`; `discord_gets_ogg_and_imessage_m4a`;
   - `tests/voice.rs`: `a_reply_to_a_voice_note_is_also_spoken` (two outbox rows, the second `…-v` with `voice.ogg`, after the text); `a_typed_message_gets_no_voice_under_mirror`; `a_failed_piper_leaves_the_text_reply_sent`;
   - an `#[ignore]` test `the_images_binaries_hear_what_piper_says`: with `DIR` present, `speak` an English sentence, `transcribe` the result, expect its words and `lang == "en"`, and the fake-free processes' uid 65534; with `tests/fixtures/voice/ko.ogg` present, expect its words in Korean.
-- [ ] **Step 2: Run** → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** → PASS; `cargo test -p zephyr`.
-- [ ] **Step 5: Commit** `feat(voice): speak the reply to a voice note with Piper, as a second attachment`.
+- [x] **Step 2: Run** → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** → PASS; `cargo test -p zephyr`.
+- [x] **Step 5: Commit** `feat(voice): speak the reply to a voice note with Piper, as a second attachment`.
+- Deviation: the second outbox row has no inbox id: `outbox.inbox_id` is UNIQUE and is the text reply's. It has the same channel and recipient and the client id `<client id>-v`.
+- Deviation: ffmpeg encodes to its stdout (`pipe:1`), not into a memfd, as the image part measured it; M4A to a pipe needs `-movflags frag_keyframe+empty_moov`.
+- Deviation: `doctor`'s voice lines are warnings, like the other extras, and do not include the spec's "the floor refuses uid 65534" probe (the plan does not list it; `the_floor_refuses_nobody` checks the rule text). `doctor` also prints the uid the decoders get (`voice::uid`, `/usr/bin/id -u` run as they are), which the ignored test uses too.
+- Deviation: `speak` runs on a tokio task, not a blocking one (its work is two child processes). More tests than listed: `always_speaks_a_typed_reply_but_never_a_notice_or_on_chat`, `a_reply_is_spoken_only_where_the_setting_and_the_channel_allow`, `doctor_names_what_is_there_and_hears_a_silent_sample`, `a_spoken_reply_is_a_second_row_written_once`.
+- Deviation: no Korean sample is committed, so the ignored test's Korean half runs only when `tests/fixtures/voice/ko.ogg` (and its words in `ko.txt`) is there. CLAUDE.md is left to C2-9.
 
 ## Desktop takeover
 

@@ -59,8 +59,12 @@ if prog == "ffmpeg":
         out = b"RIFF" + b"\0" * 40 + b"\0" * int(secs * 32000)
     else:
         out = (b"OggS" if "ogg" in argv else b"ftyp") + data
-    with open(argv[-1], "wb") as f:
-        f.write(out)
+    if argv[-1] == "pipe:1":
+        sys.stdout.buffer.write(out)
+        sys.stdout.buffer.flush()
+    else:
+        with open(argv[-1], "wb") as f:
+            f.write(out)
     done(data)
 elif prog == "whisper-cli":
     with open(after("-f"), "rb") as f:

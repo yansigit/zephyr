@@ -457,6 +457,7 @@ async fn status(cfg: &Config) -> anyhow::Result<()> {
         };
         println!("web: {state}");
     }
+    println!("{}", zephyr::voice::status(cfg));
     // The router's view, written with the heartbeat: `<unix> <main up> <failed starts>`.
     let file = std::fs::read_to_string(cfg.state_dir().join(HEARTBEAT)).unwrap_or_default();
     match file.split_whitespace().collect::<Vec<_>>()[..] {
@@ -732,6 +733,10 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
         if !Path::new("/dev/nvidia0").exists() {
             println!("warn no GPU in the container: the browser's WebGL is software (SwiftShader)");
         }
+    }
+    // Warnings, not failures: voice is an extra the image brings (DESIGN §4.3).
+    for line in zephyr::voice::doctor(cfg).await {
+        println!("{line}");
     }
     // Warnings, not failures: the agent's command-line tools from the image (DESIGN §4.11).
     for program in ["gh", "himalaya"] {
