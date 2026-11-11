@@ -1142,7 +1142,7 @@ impl Store {
                     minor INTEGER, -- NULL: the amount was not read
                     currency TEXT NOT NULL, source TEXT NOT NULL, proposal INTEGER);
                  CREATE TABLE cards(id INTEGER PRIMARY KEY, proposal INTEGER,
-                    payment INTEGER, -- its row in payments: the cap, then what its click paid
+                    payment INTEGER, -- its row in payments: the cap, or a charge over it
                     provider TEXT NOT NULL, provider_ref TEXT, last4 TEXT,
                     origin TEXT NOT NULL, merchant TEXT NOT NULL,
                     cap_minor INTEGER NOT NULL, currency TEXT NOT NULL, uses TEXT NOT NULL,
@@ -1936,31 +1936,27 @@ impl Store {
     }
 
     /// The one Pay click an open card covers (DESIGN §4.25): the card goes from `open` to
-    /// `charging` and its payment row, written at its cap when it was let go, becomes what the
-    /// page said was paid, in one transaction. `false` when the card was not open any more:
-    /// of two clicks only one is the card's.
-    pub fn use_card(&self, id: i64, paid_minor: i64) -> rusqlite::Result<bool> {
-        self.db.execute_batch("BEGIN IMMEDIATE")?;
-        let used = (|| {
-            let n = self.db.execute(
-                "UPDATE cards SET status = 'charging' WHERE id = ?1 AND status = 'open'",
-                params![id],
-            )?;
-            if n == 1 {
-                self.db.execute(
-                    "UPDATE payments SET minor = ?2
-                     WHERE id = (SELECT payment FROM cards WHERE id = ?1)",
-                    params![id, paid_minor],
-                )?;
-            }
-            Ok(n == 1)
-        })();
-        self.db.execute_batch(if matches!(used, Ok(true)) {
-            "COMMIT"
-        } else {
-            "ROLLBACK"
-        })?;
-        used
+    /// `charging` in one statement, so of two clicks only one is the card's. Its payment row
+    /// stays at the card's cap, the amount the owner approved, whatever the page said was
+    /// paid. `false` when the card was not open any more.
+    pub fn use_card(&self, id: i64) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
+            "UPDATE cards SET status = 'charging' WHERE id = ?1 AND status = 'open'",
+            params![id],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// The issuer charged card `id` `minor` in `currency`: its payment row is raised to that
+    /// when it is more, never lowered below what was approved.
+    pub fn card_paid(&self, id: i64, minor: i64, currency: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE payments SET minor = ?2
+             WHERE id = (SELECT payment FROM cards WHERE id = ?1) AND currency = ?3
+               AND minor < ?2",
+            params![id, minor, currency],
+        )?;
+        Ok(())
     }
 
     /// The `payments` row written when the owner approved action `proposal`.

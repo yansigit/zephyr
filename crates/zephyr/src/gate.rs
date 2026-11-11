@@ -1222,8 +1222,8 @@ impl Gate<'_> {
         // second click finds none and is decided as any payment below.
         if call.kind == ActionKind::Wait && !call.unread && matches!(found, Found::Nothing) {
             let money = call.gated.as_ref().filter(|g| g.class == Class::Money);
-            if let Some((card, paid)) = money.map(|g| self.card_for(g)).transpose()?.flatten() {
-                if store.use_card(card, paid)? {
+            if let Some(card) = money.map(|g| self.card_for(g)).transpose()?.flatten() {
+                if store.use_card(card)? {
                     self.audit("card");
                     return Ok(Verdict::Allow);
                 }
@@ -1303,7 +1303,7 @@ impl Gate<'_> {
     /// total that was not read is covered by none, and so is a click with no fill before it.
     /// The session a request names is the agent's to forge (a task can say `main`), so this
     /// narrows which click is the card's and is no wall: the wall is that the card pays once.
-    fn card_for(&self, g: &Gated) -> rusqlite::Result<Option<(i64, i64)>> {
+    fn card_for(&self, g: &Gated) -> rusqlite::Result<Option<i64>> {
         let Some(a) = g.amount.as_ref().filter(|a| !a.currency.is_empty()) else {
             return Ok(None);
         };
@@ -1322,7 +1322,7 @@ impl Gate<'_> {
                 && minor <= c.cap_minor
                 && c.expires_at > self.now
         });
-        Ok(card.map(|c| (c.id, minor)))
+        Ok(card.map(|c| c.id))
     }
 
     fn by_mode(&self, e: &Effective, g: &Gated) -> rusqlite::Result<Plan> {
@@ -5597,7 +5597,7 @@ mod tests {
         assert_eq!(status(), "charging");
         assert_eq!(outcomes(&h.store).last().unwrap(), "card");
         let after = h.store.payments_since(now - 600, "CAD").unwrap();
-        assert_eq!(after, (2, 8000, false), "the card's row is now its 40.00");
+        assert_eq!(after, before, "the card's row stays at its cap");
         // A second Buy-now click on that origin is decided normally: over the window, held.
         let again = held(&pay("main", 40.0, &[]));
         assert!(h.store.action_strong(again).unwrap());

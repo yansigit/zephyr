@@ -9061,3 +9061,40 @@ async fn a_pay_click_with_no_fill_of_the_card_is_held() {
     assert_eq!(card_status(&home, 1), "open", "the card is not used");
     gw.shutdown().await;
 }
+
+/// The window counts a card at its cap, the amount the owner approved, whatever its page says
+/// was paid: a Pay button edited to read 0.01 still counts 42.50. A charge the issuer reports
+/// may only raise it.
+#[tokio::test]
+async fn a_card_counts_in_the_window_at_its_cap_whatever_the_page_says() {
+    use zephyr::cards::{CardState, Charge, Fake};
+    let (home, cfg) = card_home("card-window-cap", "fake", "");
+    let script = cfg.clone();
+    let gw = start(cfg);
+    gw.say("w1", "owner", &card_ask("42.50")).await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    gw.say("w2", "owner", "/ok 1").await;
+    reply_where(&gw, "chat", |r| r.contains("[card #1 issued")).await;
+    gw.say("w3", "owner", CARD_FILL).await;
+    reply_where(&gw, "chat", |r| r.contains("\ncard: filled")).await;
+    pay_page(&home, "CA$0.01");
+    gw.say("w4", "owner", &click_send(&home)).await;
+    wait(|| clicks(&home).len() == 1).await;
+    assert_eq!(card_status(&home, 1), "charging");
+    let counted = || {
+        let store = Store::open(&home.join("state.db")).unwrap();
+        store.payments_since(0, "CAD").unwrap()
+    };
+    assert_eq!(counted(), (1, 4250, false), "the card's cap");
+    // The issuer says it took more: the window counts that.
+    Fake::script(&script, |s| {
+        s.state = CardState::Used(vec![Charge {
+            minor: 4300,
+            currency: "CAD".into(),
+            ..Charge::default()
+        }])
+    });
+    wait(|| card_status(&home, 1) == "used").await;
+    assert_eq!(counted(), (1, 4300, false));
+    gw.shutdown().await;
+}
