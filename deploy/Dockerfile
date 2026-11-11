@@ -67,9 +67,10 @@ RUN --mount=type=secret,id=gh_token fetch "$PLUGINS_REPO" "$PLUGINS_REF"
 FROM scratch AS provider-plugins
 COPY --from=provider-plugins-git /src /
 
-# zephyr, zephyr-policy, zephyr-cursor, and from rpi-package (when it is there)
-# librpi_providers.so and librpi_mcp_adapter.so.
+# zephyr, zephyr-policy, zephyr-cursor, and from rpi-package librpi_providers.so and
+# librpi_mcp_adapter.so, unless RPI_PACKAGE_REPO is empty. Set, a tree that lacks them fails here.
 FROM toolchain AS rust
+ARG RPI_PACKAGE_REPO
 # The repository the image is published to, baked into its CLI (`zephyr upgrade` pulls from it);
 # unset or empty, the CLI's own default.
 ARG ZEPHYR_REPO
@@ -83,7 +84,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && cp /src/zephyr/target/release/zephyr /out/bin/ \
     && cp /src/zephyr/target/release/libzephyr_policy.so /out/lib/ \
     && cp /src/zephyr/target/release/libzephyr_cursor.so /out/ext/ \
-    && if [ -f /src/rpi-package/Cargo.toml ]; then \
+    && if [ -n "$RPI_PACKAGE_REPO" ]; then \
          cd /src/rpi-package && cargo build --release --locked -p rpi-providers -p rpi-mcp-adapter \
          && cp /src/rpi-package/target/release/librpi_providers.so /out/ext/ \
          && cp /src/rpi-package/target/release/librpi_mcp_adapter.so /out/ext/; \
@@ -92,11 +93,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # rpi-claude-agent: its stage.sh builds the cdylib and worker and installs the lockfile-pinned
 # node_modules (npm ci --ignore-scripts, checked against the lockfiles' hashes). Cursor is not a
 # staged package any more: crates/zephyr-cursor builds libzephyr_cursor.so in the rust stage.
+# Left out only when PLUGINS_REPO is empty; set, a tree without stage.sh fails here.
 FROM toolchain AS plugins
+ARG PLUGINS_REPO
 COPY --from=provider-plugins / /src/plugins
 WORKDIR /src/plugins
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked --mount=type=cache,target=/root/.npm \
-    if [ -e packages/rpi-claude-agent/scripts/stage.sh ]; then \
+    if [ -n "$PLUGINS_REPO" ]; then \
       packages/rpi-claude-agent/scripts/stage.sh /out/ext/rpi-claude-agent; \
     else mkdir -p /out/ext; fi
 

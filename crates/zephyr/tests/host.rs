@@ -3241,6 +3241,31 @@ fn host_edits_keep_what_the_daemon_wrote_meanwhile() {
     assert!(env.config().contains(edit), "{}", env.config());
 }
 
+/// A provider source is left out only when its repo arg is empty: with the arg set, a tree
+/// without the expected file fails the build instead of shipping an image without the providers.
+#[test]
+fn the_dockerfile_skips_a_provider_source_only_for_an_empty_arg() {
+    let text = read(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/Dockerfile"
+    )));
+    let stage = |name: &str| {
+        let start = text.find(&format!(" AS {name}\n")).unwrap();
+        let rest = &text[start..];
+        rest[..rest[1..].find("\nFROM ").map_or(rest.len(), |i| i + 1)].to_string()
+    };
+    for (name, arg, file) in [
+        ("rust", "RPI_PACKAGE_REPO", "/src/rpi-package/Cargo.toml"),
+        ("plugins", "PLUGINS_REPO", "packages/rpi-claude-agent/scripts/stage.sh"),
+    ] {
+        let stage = stage(name);
+        assert!(stage.contains(&format!("\nARG {arg}\n")), "{name}: {stage}");
+        assert!(stage.contains(&format!("if [ -n \"${arg}\" ]; then")), "{name}: {stage}");
+        assert!(!stage.contains(&format!("[ -f {file} ]")), "{name}: {stage}");
+        assert!(!stage.contains(&format!("[ -e {file} ]")), "{name}: {stage}");
+    }
+}
+
 /// release.sh takes the rpi binary from `RPI_BIN` and the runner its repo from `ZEPHYR_GH_REPO`;
 /// unset, each is today's value, and bump-rpi.sh's rewrite of the pinned path still matches.
 #[test]
