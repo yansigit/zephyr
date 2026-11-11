@@ -1155,10 +1155,19 @@ fn ready(cfg: &Config, card: &Card) -> String {
     )
 }
 
-/// Types card `id` into the page open in agent-browser, once that page is on the card's own
-/// origin: the address is read before the number is fetched and again after each field, as the
-/// vault's fill does. The answer names the fields and the last four digits, never a value.
-async fn fill(cfg: &Config, id: i64, fields: CardFields) -> String {
+/// Types card `id` into the page open in agent-browser, only on the card's own origin
+/// (scheme, host and port). The answer names the fields and the last four digits, never a value.
+///
+/// - The page's address is read first, so a page elsewhere fetches no number.
+/// - The number is fetched then (for Link, a call to the issuer), before any field is typed:
+///   nothing slow stands between a check and the typing it guards.
+/// - Each field is typed by a page script that checks the top document's origin itself, in the
+///   same step (`vault::type_into`): a page that moved, or a field inside a frame, gets
+///   nothing. The address is read again after each field.
+/// - A page that moved away closes the card.
+/// - No value is ever a process's argument; each copy made here is wiped when it is done with.
+async fn fill(cfg: &Arc<Config>, id: i64, fields: CardFields) -> String {
+    use crate::vault::Typed;
     let db = match Db::open(cfg) {
         Ok(s) => s,
         Err(e) => return format!("not filled: {e}"),
@@ -1182,37 +1191,29 @@ async fn fill(cfg: &Config, id: i64, fields: CardFields) -> String {
         ("code", &fields.cvc),
         ("name", &fields.name),
     ];
-    if selectors
-        .iter()
-        .any(|(_, s)| s.as_deref().is_some_and(|s| s.starts_with('-')))
-    {
-        return "not filled: a selector cannot start with '-'".into();
+    if selectors.iter().all(|(_, s)| s.is_none()) {
+        return "not filled: give the CSS selector of at least one of number, expiry, month, \
+                year, cvc, name"
+            .into();
     }
     let page = match crate::vault::browser(cfg, &["get", "url"]).await {
         Ok(out) => crate::vault::page_address(&out).map(String::from),
         Err(e) => return format!("not filled: reading the page's address failed: {e}"),
     };
-    let Some(page) = page
-        .clone()
-        .filter(|p| crate::vault::same_origin(&card.origin, p))
-    else {
+    let on_site = |p: &String| crate::vault::same_origin(&card.origin, p);
+    let Some(page) = page.clone().filter(on_site) else {
         let on = page
             .as_deref()
             .and_then(crate::vault::origin)
             .map_or("no http(s) page".into(), |o| o.ascii_serialization());
-        audit(
-            cfg,
-            &db.get(),
-            &card,
-            "refused",
-            &format!("the page was on {on}"),
-        );
+        let why = format!("the page was on {on}");
+        audit(cfg, &db.get(), &card, "refused", &why);
         return format!(
             "not filled: the open page is on {on}, but card #{id} is only for {}",
             card.origin
         );
     };
-    // Only now, on the card's own origin, is the number fetched.
+    // On the card's own origin: now the number is fetched, before any field's own check.
     let pan = match live::get(cfg.state_dir(), id) {
         Some(pan) => pan,
         None => {
@@ -1245,31 +1246,61 @@ async fn fill(cfg: &Config, id: i64, fields: CardFields) -> String {
             _ => pan.name.clone()?,
         })
     };
+    // The page left the card's site: nothing more is typed, and the card is closed.
+    let moved = |done: &[&str], on: &str| -> String {
+        audit(
+            cfg,
+            &db.get(),
+            &card,
+            "fill",
+            &format!("the page moved to {on}"),
+        );
+        ask_close(
+            cfg,
+            card.clone(),
+            "the page left its site while it was being filled",
+        );
+        let typed = match done.is_empty() {
+            true => "nothing was typed".to_string(),
+            false => format!(
+                "the {} had been typed and may have reached that page",
+                done.join(" and ")
+            ),
+        };
+        format!(
+            "stopped: the page was on {on}, not {}; {typed}. Card #{id} is closed. Submit \
+             nothing there, and tell the owner",
+            card.origin
+        )
+    };
     let mut done: Vec<&str> = Vec::new();
     for (label, sel) in selectors {
         let Some(sel) = sel else { continue };
-        let Some(value) = value(label) else {
+        let Some(mut value) = value(label) else {
             return format!("not filled: card #{id} has no {label}; leave `{label}` out");
         };
-        if let Err(e) = crate::vault::browser(cfg, &["fill", sel, &value]).await {
+        let typed = crate::vault::type_into(cfg, &card.origin, sel, &value).await;
+        crate::vault::wipe_str(&mut value);
+        if let Typed::Moved(on) = &typed {
+            return moved(&done, on);
+        }
+        if let Some(why) = crate::vault::not_typed(&typed, label) {
             let done = match done.is_empty() {
                 true => String::new(),
                 false => format!("filled the {}, ", done.join(" and ")),
             };
             audit(cfg, &db.get(), &card, "fill", "failed");
-            return crate::vault::scrubbed(cfg, format!("{done}but not the {label}: {e}"));
+            return crate::vault::scrubbed(cfg, format!("{done}but not the {label}: {why}"));
         }
         done.push(label);
         let now = crate::vault::page_now(cfg).await;
-        if let Some(stop) = crate::vault::moved(&card.origin, now.as_deref(), &done) {
-            audit(cfg, &db.get(), &card, "fill", "the page moved away");
-            return stop;
+        if !now.as_ref().is_some_and(on_site) {
+            let on = now
+                .as_deref()
+                .and_then(crate::vault::origin)
+                .map_or("an unknown page".into(), |o| o.ascii_serialization());
+            return moved(&done, &on);
         }
-    }
-    if done.is_empty() {
-        return "not filled: give the CSS selector of at least one of number, expiry, month, \
-                year, cvc, name"
-            .into();
     }
     audit(cfg, &db.get(), &card, "fill", "ok");
     format!(

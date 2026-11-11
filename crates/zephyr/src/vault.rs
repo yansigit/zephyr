@@ -1412,10 +1412,133 @@ pub(crate) fn moved(site: &str, now: Option<&str>, done: &[&str]) -> Option<Stri
     ))
 }
 
+/// What typing one secret into the page came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Typed {
+    Ok,
+    /// The page was not on the site when the value was about to be typed: its origin then.
+    /// Nothing was typed.
+    Moved(String),
+    /// No field in the page's own document matches the selector: it is not there, or it is
+    /// inside a frame, which is never typed into (a frame is another site's document).
+    Missing,
+    /// What the selector names takes no text.
+    NotField,
+    Failed(String),
+}
+
+/// The page script that types one value (DESIGN §4.15, §4.22). It runs in the page's top
+/// document, checks that document's origin itself, and only then sets the field: the check
+/// and the typing are one step of the page, with no navigation between them. A field in a
+/// frame is not in the top document, so it is never found.
+fn type_script(origin: &str, selector: &str, value: &str) -> String {
+    let json = |s: &str| serde_json::Value::String(s.to_string()).to_string();
+    format!(
+        "(() => {{\nconst want = {};\nconst sel = {};\nconst value = {};\n{TYPE_BODY}\n}})()",
+        json(origin),
+        json(selector),
+        json(value)
+    )
+}
+
+const TYPE_BODY: &str = r#"if (window.top !== window) return "frame";
+if (location.origin !== want) return "moved:" + location.origin;
+let el = null;
+try { el = document.querySelector(sel); } catch (e) { return "missing"; }
+if (!el) return "missing";
+const proto = el instanceof HTMLInputElement ? HTMLInputElement.prototype
+  : el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype
+  : el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : null;
+if (!proto) return "notfield";
+el.focus();
+Object.getOwnPropertyDescriptor(proto, "value").set.call(el, value);
+el.dispatchEvent(new Event("input", { bubbles: true }));
+el.dispatchEvent(new Event("change", { bubbles: true }));
+return location.origin === want ? "ok" : "moved:" + location.origin;"#;
+
+/// Overwrites a secret's bytes before its buffer is freed: a copy the daemon made to hand a
+/// value on is not left in freed memory.
+pub(crate) fn wipe(bytes: &mut [u8]) {
+    for b in bytes.iter_mut() {
+        // SAFETY: a valid, exclusive reference to one byte; the volatile write is not elided.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// [`wipe`] for a string: zero bytes are valid UTF-8.
+pub(crate) fn wipe_str(s: &mut str) {
+    // SAFETY: every byte becomes 0, which is valid UTF-8.
+    wipe(unsafe { s.as_bytes_mut() });
+}
+
+/// Types `value` into the field `selector` of the page open in agent-browser, if that page's
+/// top document is on `site`'s origin (`Typed`).
+///
+/// The value never is an argument of any process: `/proc/<pid>/cmdline` is readable by every
+/// uid, the agent's included. It goes to agent-browser 0.41 on the standard input of its
+/// `batch` command (a JSON array of commands), which first goes back to the main frame and
+/// then runs [`type_script`]; `--omit-command` keeps the commands out of what it prints.
+pub(crate) async fn type_into(cfg: &Config, site: &str, selector: &str, value: &str) -> Typed {
+    let Some(want) = origin(site).map(|o| o.ascii_serialization()) else {
+        return Typed::Failed("the site is no http(s) address".into());
+    };
+    let mut script = type_script(&want, selector, value);
+    let mut input = json!([["frame", "main"], ["eval", script]])
+        .to_string()
+        .into_bytes();
+    wipe_str(&mut script);
+    let args = ["batch", "--json", "--omit-command", "--bail"];
+    let out = browser_with(cfg, &args, Some(&input)).await;
+    wipe(&mut input);
+    let out = match out {
+        Ok(out) => out,
+        Err(e) => return Typed::Failed(e.replace(value, "[the value]")),
+    };
+    let steps: Vec<Value> = serde_json::from_str(out.trim()).unwrap_or_default();
+    let said = |i: usize| -> Result<&Value, String> {
+        let step = steps.get(i).ok_or("agent-browser gave no answer")?;
+        match step["success"].as_bool() {
+            Some(true) => Ok(&step["result"]),
+            _ => Err(step["error"]
+                .as_str()
+                .unwrap_or("it failed")
+                .chars()
+                .take(300)
+                .collect()),
+        }
+    };
+    let typed = said(0).and_then(|_| said(1));
+    match typed.map(|r| r["result"].as_str().unwrap_or_default().to_string()) {
+        Ok(r) if r == "ok" => Typed::Ok,
+        Ok(r) if r == "missing" || r == "frame" => Typed::Missing,
+        Ok(r) if r == "notfield" => Typed::NotField,
+        Ok(r) => match r.strip_prefix("moved:") {
+            Some(on) => Typed::Moved(on.chars().take(200).collect()),
+            None => Typed::Failed("agent-browser gave no answer".into()),
+        },
+        Err(e) => Typed::Failed(e.replace(value, "[the value]")),
+    }
+}
+
+/// Why a field was not typed, for the agent: `None` when it was.
+pub(crate) fn not_typed(typed: &Typed, label: &str) -> Option<String> {
+    Some(match typed {
+        Typed::Ok => return None,
+        Typed::Moved(on) => format!("the page was on {on} when the {label} was to be typed"),
+        Typed::Missing => format!(
+            "no field for the {label} matches that selector in the page's own document; a \
+             field inside a frame (an embedded form from another site) is never filled"
+        ),
+        Typed::NotField => format!("what the selector for the {label} names takes no text"),
+        Typed::Failed(e) => e.clone(),
+    })
+}
+
 /// Types the login's fields into the page open in agent-browser, once the page is on its site.
-/// The address is read again after each field, so a page that moves away gets no further field.
-/// shortcut: agent-browser has no fill-if-origin, so a redirect in the moment before a fill still
-/// gets that one value; then the agent is told, and submits nothing.
+/// Each value is typed by a script that checks the page's origin itself first (`type_into`),
+/// so a redirect in the moment before a fill gets nothing; the address is read again after
+/// each field, so a page that moves away gets no further field.
 async fn fill(cfg: &Config, login: &Entry, selectors: [Option<String>; 3]) -> String {
     let fields = match fields(login, &selectors, crate::now() as u64) {
         Ok(f) => f,
@@ -1443,7 +1566,9 @@ async fn fill(cfg: &Config, login: &Entry, selectors: [Option<String>; 3]) -> St
     };
     let mut done: Vec<&str> = Vec::new();
     for (label, sel, value) in &fields {
-        if let Err(e) = browser(cfg, &["fill", sel, value]).await {
+        // On standard input, never an argument: any uid can read a process's arguments.
+        let typed = type_into(cfg, &login.site, sel, value).await;
+        if let Some(e) = not_typed(&typed, label) {
             let done = match done.is_empty() {
                 true => String::new(),
                 false => format!("filled the {}, ", done.join(" and ")),
@@ -1466,14 +1591,34 @@ const BROWSER_WAIT: Duration = Duration::from_secs(20);
 /// binary, by full path (`cfg.agent_browser`): the daemon's own fill never goes through the
 /// approvals gate's wrapper that `agent-browser` on the agent's PATH is (approvals spec §4.4).
 pub(crate) async fn browser(cfg: &Config, args: &[&str]) -> Result<String, String> {
+    browser_with(cfg, args, None).await
+}
+
+/// [`browser`], with `input` written to the command's standard input: how a secret reaches
+/// agent-browser without being an argument.
+async fn browser_with(cfg: &Config, args: &[&str], input: Option<&[u8]>) -> Result<String, String> {
+    use tokio::io::AsyncWriteExt;
     let mut cmd = tokio::process::Command::new(&cfg.agent_browser);
     cmd.args(args)
         .current_dir(&cfg.home)
         .env("HOME", &cfg.home)
-        .stdin(std::process::Stdio::null())
+        .stdin(match input {
+            Some(_) => std::process::Stdio::piped(),
+            None => std::process::Stdio::null(),
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     crate::procs::for_agent(cmd.as_std_mut());
-    let out = tokio::time::timeout(BROWSER_WAIT, cmd.output())
+    let run = async {
+        let mut child = cmd.spawn()?;
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            stdin.write_all(input).await?;
+            stdin.shutdown().await?;
+        }
+        child.wait_with_output().await
+    };
+    let out = tokio::time::timeout(BROWSER_WAIT, run)
         .await
         .map_err(|_| {
             format!(
@@ -1602,6 +1747,29 @@ programs = ["gh"]
         assert!(!v.put_service(again).unwrap());
         assert_eq!(v.service("cards").unwrap().key, "sk_servicekey42");
         assert!(v.remove_service("cards") && v.service("cards").is_none());
+    }
+
+    #[test]
+    fn the_typing_script_checks_the_origin_and_the_frame_before_it_types() {
+        let script = type_script("https://shop.example", "#n\"; alert(1); \"", "4242 \"x\"");
+        // The selector and the value are JSON literals: neither can end the statement.
+        assert!(
+            script.contains(r##"const sel = "#n\"; alert(1); \"";"##),
+            "{script}"
+        );
+        assert!(
+            script.contains(r##"const value = "4242 \"x\"";"##),
+            "{script}"
+        );
+        let (frame, origin, set) = (
+            script.find("window.top !== window").unwrap(),
+            script.find("location.origin !== want").unwrap(),
+            script.find(".set.call(el, value)").unwrap(),
+        );
+        assert!(frame < origin && origin < set, "checked before it is typed");
+        let mut secret = String::from("4242424242424242");
+        wipe_str(&mut secret);
+        assert_eq!(secret, "\0".repeat(16));
     }
 
     #[test]

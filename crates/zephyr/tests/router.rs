@@ -7306,7 +7306,11 @@ async fn a_pass_is_steered_into_the_task_that_asked_while_it_runs() {
 
 /// A stand-in for the real agent-browser: it appends each argv to `ab-argv.log` beside it and
 /// answers `get url`, `get title`, `snapshot` and `eval` with `ab-<what>.json` (with `--json`) or
-/// `ab-<what>.txt` (without); anything else prints `done: <argv>`.
+/// `ab-<what>.txt` (without); anything else prints `done: <argv>`. A `batch` reads its commands
+/// (a JSON array) from standard input into `ab-stdin.log`, one batch a line, and answers as
+/// 0.41 does for `[["frame","main"],["eval",SCRIPT]]`: the script's result is `ok`, or what
+/// `ab-fill.txt` holds (`missing`, `moved:<origin>`). With `ab-slow` it first sleeps that many
+/// seconds; with `ab-move-after` the page's address becomes that file's once it has answered.
 const FAKE_BROWSER: &str = r#"#!/bin/sh
 d=$(dirname "$0")
 printf '%s\n' "$*" >> "$d/ab-argv.log"
@@ -7316,6 +7320,13 @@ case " $* " in
   *" get title "*) f=title ;;
   *" snapshot "*) f=snapshot ;;
   *" eval "*) f=eval ;;
+  *" batch "*)
+    { cat; echo; } >> "$d/ab-stdin.log"
+    [ -f "$d/ab-slow" ] && sleep "$(cat "$d/ab-slow")"
+    r=ok; [ -f "$d/ab-fill.txt" ] && r=$(cat "$d/ab-fill.txt")
+    [ -f "$d/ab-move-after" ] && cp "$d/ab-move-after" "$d/ab-url.txt"
+    printf '[{"error":null,"index":0,"result":{"frame":"main"},"success":true},{"error":null,"index":1,"result":{"result":"%s"},"success":true}]\n' "$r"
+    exit 0 ;;
   *) echo "done: $*"; exit 0 ;;
 esac
 [ -f "$d/ab-$f.$ext" ] || { echo "no $f" >&2; exit 1; }
@@ -7352,6 +7363,33 @@ fn browser_home(name: &str, url: &str) -> (PathBuf, Config) {
     let mut cfg = config(&home);
     cfg.agent_browser = real;
     (home, cfg)
+}
+
+/// Each value typed through `vault::type_into`, as `fill <selector> <value>`: the selector and
+/// the value are the script's own `const sel` and `const value` lines.
+fn typed(home: &Path) -> Vec<String> {
+    let log = std::fs::read_to_string(home.join("ab-stdin.log")).unwrap_or_default();
+    let batches = log.lines().filter(|l| !l.trim().is_empty());
+    batches
+        .map(|line| {
+            let batch: Value = serde_json::from_str(line).expect("a JSON batch");
+            assert_eq!(
+                batch[0],
+                serde_json::json!(["frame", "main"]),
+                "the main frame first"
+            );
+            let script = batch[1][1].as_str().expect("an eval script").to_string();
+            let literal = |name: &str| -> String {
+                let start = format!("const {name} = ");
+                let line = script
+                    .lines()
+                    .find(|l| l.starts_with(&start))
+                    .expect("a const");
+                serde_json::from_str(line[start.len()..].trim_end_matches(';')).unwrap()
+            };
+            format!("fill {} {}", literal("sel"), literal("value"))
+        })
+        .collect()
 }
 
 /// Each command the fake real agent-browser ran.
@@ -7494,10 +7532,17 @@ async fn the_vaults_fill_runs_the_real_browser_by_its_path() {
         reply.contains("\nvault: filled the password on https://github.com/login"),
         "{reply}"
     );
+    // The password reached the browser on standard input: it is in no process's arguments,
+    // which any uid can read.
+    assert_eq!(typed(&home), ["fill #pw hunter2-secret"]);
+    let argv = browser_argv(&home);
     assert!(
-        browser_argv(&home).contains(&"fill #pw hunter2-secret".to_string()),
-        "{:?}",
-        browser_argv(&home)
+        !argv.iter().any(|l| l.contains("hunter2-secret")),
+        "{argv:?}"
+    );
+    assert!(
+        argv.contains(&"batch --json --omit-command --bail".to_string()),
+        "{argv:?}"
     );
     gw.shutdown().await;
 }
@@ -7922,9 +7967,10 @@ fn set_page(home: &Path, url: &str) {
     std::fs::write(home.join("ab-url.json"), ok).unwrap();
 }
 
+/// Each value the daemon typed into the page, as `fill <selector> <value>`, read from what
+/// the stand-in browser got on standard input.
 fn fills(home: &Path) -> Vec<String> {
-    let all = browser_argv(home).into_iter();
-    all.filter(|l| l.starts_with("fill")).collect()
+    typed(home)
 }
 
 /// Every place the daemon writes: no outbox, inbox or audit row, and no session file, holds
@@ -8105,6 +8151,11 @@ async fn a_manual_card_is_approved_entered_filled_on_its_origin_and_forgotten() 
         fills(&home),
         ["fill #n 4242424242424242", "fill #e 06/29", "fill #c 123"]
     );
+    // Nothing of the card is an argument of any process (`/proc/<pid>/cmdline` is everyone's
+    // to read): each value went to the browser on standard input.
+    let argv = browser_argv(&home);
+    let leaked = |l: &String| l.contains("4242") || l.contains("06/29") || l.ends_with(" 123");
+    assert!(!argv.iter().any(leaked), "{argv:?}");
 
     // Review Focus 1: a read-back the agent echoes comes back as the card's label.
     std::fs::write(
@@ -8594,5 +8645,66 @@ async fn a_stop_during_a_slow_issue_leaves_the_card_closed() {
         !log().iter().any(|l| l.starts_with("state")),
         "a closed card is not asked about"
     );
+    gw.shutdown().await;
+}
+
+/// A field inside a frame gets nothing, a page that is elsewhere when a field is to be typed
+/// gets nothing and closes the card, and so does a page that leaves after a field.
+#[tokio::test]
+async fn a_frame_or_a_page_that_moved_gets_no_number_and_a_move_closes_the_card() {
+    let (home, cfg) = card_home("card-moved", "fake", "auto 100");
+    let gw = start(cfg);
+    let said = |has: &'static str| reply_where(&gw, "chat", move |r| r.contains(has));
+    gw.say("v1", "owner", &card_ask("10")).await;
+    wait(|| card_status(&home, 1) == "open").await;
+    said("[card #1 issued").await;
+    // The page's own document has no such field: it is in an injected frame.
+    std::fs::write(home.join("ab-fill.txt"), "missing").unwrap();
+    gw.say("v2", "owner", &format!("{CARD_FILL} frame")).await;
+    let framed = said("\ncard: but not the number").await;
+    assert!(
+        framed.contains(
+            "a field inside a frame (an embedded form from another site) is never filled"
+        ),
+        "{framed}"
+    );
+    assert_eq!(card_status(&home, 1), "open");
+    // The page is elsewhere at the moment the number is to be typed: the script types nothing.
+    std::fs::write(home.join("ab-fill.txt"), "moved:https://evil.example").unwrap();
+    gw.say("v3", "owner", &format!("{CARD_FILL} moved")).await;
+    let moved = said("\ncard: stopped").await;
+    assert!(
+        moved.contains(
+            "\ncard: stopped: the page was on https://evil.example, not https://shop.example; \
+             nothing was typed. Card #1 is closed."
+        ),
+        "{moved}"
+    );
+    wait(|| card_status(&home, 1) == "closed").await;
+    said("[card #1 closed").await;
+
+    // A second card: the page leaves right after the number was typed. No further field.
+    std::fs::remove_file(home.join("ab-fill.txt")).unwrap();
+    gw.say("v4", "owner", &card_ask("11")).await;
+    wait(|| card_status(&home, 2) == "open").await;
+    said("[card #2 issued").await;
+    let before = fills(&home).len();
+    std::fs::write(home.join("ab-move-after"), "https://evil.example/thanks\n").unwrap();
+    let fill = CARD_FILL.replace("\"id\": 1", "\"id\": 2");
+    gw.say("v5", "owner", &fill).await;
+    let left = said("the number had been typed").await;
+    assert!(
+        left.contains(
+            "\ncard: stopped: the page was on https://evil.example, not https://shop.example; \
+             the number had been typed and may have reached that page. Card #2 is closed."
+        ),
+        "{left}"
+    );
+    assert_eq!(
+        fills(&home).len(),
+        before + 1,
+        "the expiry and the code were not typed"
+    );
+    wait(|| card_status(&home, 2) == "closed").await;
     gw.shutdown().await;
 }
