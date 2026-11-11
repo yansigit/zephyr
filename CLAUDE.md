@@ -209,7 +209,7 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   nowhere, and runs as the agent), and `watchdog` gives the desktop back after 10 min idle, 60 min
   or 60 s after the socket closed (hidden `Config::desktop_*`). `Router::desktop_changed` steers
   the take and hand-back notes into main, which do not taint.
-- `inbox.rs`: files the owner sends on Discord or iMessage (DESIGN §4.3). The adapter saves them as
+- `inbox.rs`: files the owner sends on Discord, iMessage, Telegram or Signal (DESIGN §4.3). The adapter saves them as
   the agent into `<home>/inbox/` before the row goes to the router and appends a
   `[attached image: <path> ...]` line per file to its text; owners come from the router's live
   config (`Channel::live`), so a stranger's files are never fetched. 10 files, 25 MB each.

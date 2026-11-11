@@ -426,6 +426,11 @@ Growth: **+835 MB** (+15.5%) for voice, against the spec's estimate of about 520
 - Deviation: finding 1 is a deny, not a longer wait: a click the owner approves (or whose delay ends) while they hold the desktop is refused with the desktop's text and recorded `failed`, `not run: the owner had the desktop`. It is tested at the gate and in the wrapper, not through a whole-router `/ok`.
 - Deviation: finding 4's check covers every attachment of a message whose row is stored, not only audio.
 
+**After C1 merged** (rebased onto `origin/main` with E, A3 and C1, 2026-11-11): Telegram's and Signal's voice notes reach `inbox::append` through C1's `Src::Get` and `Src::Path`, so they are transcribed and marked derived with no change to either adapter; `save`'s two fetches go through one `bytes_of`. `tests/telegram.rs` and `tests/signal.rs` each have `a_voice_note_is_heard_and_answered_aloud`, on C1's stub Bot API and fake signal-cli with the voice fakes (`tests/fixtures/voice/fakes.rs`, shared with `tests/voice.rs`).
+- Review fix: a spoken reply never goes before its text. The outbox pass skips a `-v` row while its text row still waits; before, a text whose send failed once let its voice out first (`a_spoken_reply_never_goes_before_its_text`).
+- Deviation: the two channel tests passed as written: C1's seams already carried the type and the bytes, so there was no failing state to start from. The ordering test failed first.
+- Deviation: no test pins the `/pair` cut together with the transcript rule. By reading: the claim and the cut run before the insert, the transcript check after it, so a voice note captioned `/pair …` is stored as `/pair` (no code in `state.db`), is never a claim (its text is more than a code) and is never run as a command.
+
 **Not verified:**
 - The Desktop screen in a real browser: noVNC drawing the screen, the pointer, the phone keyboard field (Hangul, Backspace on Android), and a console free of CSP errors. Only the daemon side and the RFB banner were driven. README's manual check on iOS Safari and Android Chrome stands before release.
 - A voice note through a real Discord or iMessage message, and the spoken reply arriving as a voice message there.

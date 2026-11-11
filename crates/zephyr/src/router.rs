@@ -4954,6 +4954,11 @@ impl<'a> Router<'a> {
                 .set_outbox_status(row.id, "sent")
                 .map_err(Into::into));
         }
+        // The replies still to go: a spoken reply (`<client id>-v`) never goes before its text.
+        let mut unsent: HashSet<String> = (rows.iter())
+            .filter(|r| !crate::attach::attached(&r.channel))
+            .map(|r| r.client_id.clone())
+            .collect();
         for row in rows
             .into_iter()
             .filter(|r| !crate::attach::attached(&r.channel))
@@ -4964,6 +4969,10 @@ impl<'a> Router<'a> {
                 .is_some_and(|t| Instant::now() < *t)
             {
                 continue;
+            }
+            let text_of = row.client_id.strip_suffix("-v");
+            if text_of.is_some_and(|text| unsent.contains(text)) {
+                continue; // after its text, on a later pass
             }
             let Some(channel) = channels.iter().find(|c| c.name() == row.channel) else {
                 if self.unrouted.insert(row.channel.clone()) {
@@ -5011,6 +5020,7 @@ impl<'a> Router<'a> {
                 Err(_) => continue, // retried on the next pass
             };
             self.unstored.remove(&msg.client_id);
+            unsent.remove(&msg.client_id);
             log(self
                 .store
                 .set_outbox_status(row.id, status)

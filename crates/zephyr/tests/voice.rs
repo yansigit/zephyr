@@ -10,6 +10,10 @@ use zephyr::channel::{Channel, Inbound, Outbound};
 use zephyr::config::Config;
 use zephyr::store::{SessionOrigin, Store};
 
+#[path = "fixtures/voice/fakes.rs"]
+mod voice_fakes;
+use voice_fakes::fakes;
+
 /// Each reply as it was sent, with its attachment's bytes read then.
 type Sent = Arc<Mutex<Vec<(Outbound, Option<Vec<u8>>)>>>;
 
@@ -18,6 +22,14 @@ struct Stub {
     name: &'static str,
     feed: tokio::sync::Mutex<mpsc::Receiver<Inbound>>,
     sent: Sent,
+    hold: Arc<Hold>,
+}
+
+/// While `on`, a reply with text fails to send (and is tried again); `tries` counts those.
+#[derive(Default)]
+struct Hold {
+    on: std::sync::atomic::AtomicBool,
+    tries: std::sync::atomic::AtomicUsize,
 }
 
 impl Channel for Stub {
@@ -32,6 +44,11 @@ impl Channel for Stub {
         std::future::pending().await
     }
     async fn send(&self, msg: &Outbound) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if !msg.text.is_empty() && self.hold.on.load(SeqCst) {
+            self.hold.tries.fetch_add(1, SeqCst);
+            anyhow::bail!("the platform is down");
+        }
         let file = msg.attachment.as_ref().and_then(|p| std::fs::read(p).ok());
         self.sent.lock().unwrap().push((msg.clone(), file));
         Ok(())
@@ -42,6 +59,7 @@ struct Gateway {
     home: PathBuf,
     say: mpsc::Sender<Inbound>,
     sent: Sent,
+    hold: Arc<Hold>,
     stop: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<anyhow::Result<zephyr::router::Exit>>,
 }
@@ -72,17 +90,21 @@ fn start(name: &str, extra: &str, tweak: impl FnOnce(&mut Config)) -> Gateway {
     let sent = Sent::default();
     let (stop, stopped) = oneshot::channel::<()>();
     let theirs = sent.clone();
+    let hold = Arc::new(Hold::default());
+    let held = hold.clone();
     let task = tokio::spawn(async move {
         let chat = Stub {
             name: "chat",
             feed: tokio::sync::Mutex::new(feed),
             sent: theirs.clone(),
+            hold: held.clone(),
         };
         // Discord's rows are fed through chat's queue: the router reads the row's own channel.
         let discord = Stub {
             name: "discord",
             feed: tokio::sync::Mutex::new(mpsc::channel(1).1),
             sent: theirs,
+            hold: held,
         };
         zephyr::router::run(&cfg, &[chat, discord], async {
             let _ = stopped.await;
@@ -93,26 +115,10 @@ fn start(name: &str, extra: &str, tweak: impl FnOnce(&mut Config)) -> Gateway {
         home,
         say,
         sent,
+        hold,
         stop,
         task,
     }
-}
-
-/// A copy of the fake ffmpeg, whisper and Piper (`tests/fixtures/voice`) in `home`, as the
-/// image lays its voice folder out, with the English voice and a log `nobody` can append to.
-fn fakes(home: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = home.join("voice");
-    let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/voice");
-    for file in ["bin/ffmpeg", "bin/whisper-cli", "py/bin/python"] {
-        std::fs::create_dir_all(dir.join(file).parent().unwrap()).unwrap();
-        std::fs::copy(from.join(file), dir.join(file)).unwrap();
-    }
-    std::fs::create_dir_all(dir.join("voices")).unwrap();
-    std::fs::write(dir.join("voices/en_US-lessac-medium.onnx"), "").unwrap();
-    std::fs::write(dir.join("log"), "").unwrap();
-    std::fs::set_permissions(dir.join("log"), std::fs::Permissions::from_mode(0o666)).unwrap();
-    dir
 }
 
 /// How often the fake `prog` ran.
@@ -230,6 +236,36 @@ async fn a_reply_to_a_voice_note_is_also_spoken() {
         "the fake Piper's speech, encoded by the fake ffmpeg"
     );
     assert_eq!(ran(&gw.home, "python"), 1);
+    gw.shutdown().await;
+}
+
+/// The spoken reply is a row of its own, written after the text: while the text cannot be sent,
+/// the voice waits behind it, and never arrives first.
+#[tokio::test]
+async fn a_spoken_reply_never_goes_before_its_text() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let gw = start("order", "", with_fakes);
+    gw.hold.on.store(true, SeqCst);
+    gw.spoken("v1", "what is on tomorrow").await;
+    // The voice is queued, and the text has been tried again since.
+    let queued = || {
+        let rows = Store::open(&gw.home.join("state.db")).unwrap();
+        let rows = rows.pending_outbox().unwrap();
+        rows.iter().any(|r| r.client_id.ends_with("-v"))
+    };
+    wait(queued).await;
+    let tries = gw.hold.tries.load(SeqCst);
+    wait(|| gw.hold.tries.load(SeqCst) >= tries + 3).await;
+    assert!(
+        gw.sent().is_empty(),
+        "sent before its text: {:?}",
+        gw.sent()
+    );
+    gw.hold.on.store(false, SeqCst);
+    wait(|| gw.sent().len() == 2).await;
+    let sent = gw.sent();
+    assert!(sent[0].0.text.contains("what is on tomorrow"));
+    assert_eq!(sent[1].0.client_id, format!("{}-v", sent[0].0.client_id));
     gw.shutdown().await;
 }
 

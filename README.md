@@ -677,7 +677,7 @@ reads it as two lines under your caption, if you typed one:
   transcribed again as the first), `voice.max_secs` (10 to 900). The agent can only propose a
   change to them.
 - The reply to a voice note is also spoken (Piper, also on the machine): the text comes first,
-  then a voice message. `/set voice.reply always` speaks every reply on Discord and iMessage,
+  then a voice message. `/set voice.reply always` speaks every reply on Discord, iMessage, Telegram and Signal,
   `off` none. Notices, approval cards, replies with code and replies over 1500 characters are
   never spoken. Korean replies are spoken only by an image built with `--build-arg KO_VOICE=1`
   (that voice's licence is CC BY-NC-SA 4.0, non-commercial).
