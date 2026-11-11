@@ -1,0 +1,214 @@
+# Token broker (A3) Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** A vault token or connector secret reaches the agent only as a surrogate (`zsur_` + 40 hex); the network floor's proxy decrypts the hosts the owner bound it to, checks the upstream against roots compiled into the binary, and puts the real value in there and nowhere else.
+
+**Architecture:** `broker.rs` (new, pure) derives surrogates with HMAC-SHA256 from `<state>/broker.key`, parses bindings, builds the surrogate map from `vault.toml`, secrets.env and the config, and swaps or refuses on a request's head. `ca.rs` (new) keeps a container-only CA in `<state>/ca/`, rotated only by `supervise` at a container start, and signs one leaf per bound host. `egress.rs` sends a `CONNECT` to a bound `host:port` through `serve_tls` (TLS both legs, HTTP/1.1, one upstream connection) in place of the plain tunnel, and refuses a surrogate it sees anywhere else. `vault.rs` and `drafts.rs` hand out surrogates; `agent.rs`, `supervise.rs` and the image make the agent's tools trust the CA.
+
+**Tech Stack:** Rust; `rcgen` (new), `rustls` 0.23 and `tokio-rustls` 0.26 (in Cargo.lock through reqwest, now direct, `ring` provider), `webpki-roots` 1 (in Cargo.lock, now direct), hyper 1 server and client, `ring` HMAC, `libnss3-tools` in the image.
+
+**Spec:** `docs/superpowers/specs/2026-11-11-token-broker-design.md`. Its "Decided with the owner (2026-11-11)" section wins: (1) unbound tokens and `command` connectors are refused until bound or marked `raw`/`plain`, with one notice; (2) no body swaps; (3) provider credentials stay out of scope; (4) the CA lives 398 days and is renewed at a container start with under 180 left; (5) private-CA and plain-HTTP hosts are `raw` only. Wave index: `docs/superpowers/plans/2026-11-11-wave2.md`.
+
+## Global Constraints
+
+The wave index's Global Constraints (and wave 1's, which it keeps) apply: commit style with no trailers, failing test first, `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, the task's tests, then the full `cargo test` before each commit, event waits, root's binaries by full path, published files in `<state>-public`, docs in the same task, side containers only. In addition, for this lane:
+
+- Branch `claude/token-broker`, cut from `origin/docs/wave2-specs`. **No schema change** (`SCHEMA_VERSION` stays 18). No push, no PR.
+- New crates: `rcgen` only. `rustls`, `tokio-rustls` and `webpki-roots` become direct dependencies at the versions already locked. `cargo deny check advisories bans` after the change.
+- **A surrogate, a real token, `broker.key` and a CA or leaf private key never appear in a log, `Debug`, an audit row, a notice or an error.** Refusals name the token; every type that holds one has a hand-written `Debug`.
+- Surrogate: `zsur_` + hex of the first 20 bytes of HMAC-SHA256(key, `kind` ‖ 0x00 ‖ `name`); `kind` is `token` or `env`. Key: 32 random bytes in `<state>/broker.key`, root, 0600, made on first use.
+- Binding entries: `host` or `host:port` (443 when absent), a name through `egress::target`, never an IP literal, no `*`, scheme or path. Exact match only.
+- Swapped: any request header value; `Authorization: Basic` after decoding; path and query only with `url = true`. Never a body. Reply headers get each real value this request carried turned back.
+- Exact copy:
+  - `403 zephyr: the vault token NAME is not sent to HOST`; `403 zephyr: unknown vault surrogate`; `403 zephyr: NAME is not swapped in URLs`; `403 zephyr: Host does not match HOST`; `502 zephyr: HOST did not prove it is HOST`; `502 zephyr: the vault could not be read`; `502 zephyr: the token broker is down`.
+  - `not run: the token NAME is bound to no host; ask the owner with vault bind`.
+  - `/vault bind` answers `HOST is now decrypted by zephyr for every program the agent runs` per host.
+  - Notice, once per token and host per hour, 10 an hour in all: `[zephyr] the agent tried to send the vault token NAME to HOST, where it is not bound. Nothing was sent.`
+  - Broker down, once: `[zephyr] the token broker is down, so vault tokens do not work: <error>`.
+  - Upgrade, once (`meta` key `broker.upgrade_told`): `[zephyr] vault tokens now go to the agent as stand-ins, swapped for the real token only on hosts you name. Bind each: /vault bind NAME HOST... To hand one out as before: /vault raw NAME on.` followed by the tokens, and the left-out connectors with `/set mcp.NAME.hosts` and `/set mcp.NAME.secrets plain`.
+  - Doctor under host networking: `token broker off (host networking): vault tokens reach the agent in plain`.
+- Audit: session `net`, tool `swap`, args `NAME -> host:port`; `allowed` once per token and host per hour; refusals under the proxy's cap of 60 a minute.
+- CA: `<state>/ca/` 0700, `ca.key` 0600, ECDSA P-256, `CA:TRUE` path length 0, 398 days, subject `zephyr token broker (this container only)`; replaced at a container start when absent or under 180 days left. Leaf: one P-256 key per daemon run, one SAN, from a day ago for 30 days, made again within a day of expiry.
+- Brokering is on only under the floor (`egress::bridge()`), or when a test sets the hidden `Config::brokered`. Under host networking tokens and connector secrets are handed out as before.
+- Side container: `ZEPHYR_CONTAINER=zephyr-test-a3`, image `zephyr-dev:a3-<sha>`, attach port 18790, web port 18793, a scratch HOME, the bridge network. Never `zephyr`, `zephyr-test`, `~/.zephyr*` or the host's tailscale. Remove the container and its network afterwards; keep the image.
+
+## Review Focus
+
+1. **A surrogate sent to an unbound host or a bound host's look-alike** is never swapped, and refused and audited where the proxy can see it. Tests in A3-5: plain `http://attacker/` with the surrogate in a header, in the query, as base64 in `Basic` and in the host name (403, zero accepts, a `refused` row by name, one notice); token B's surrogate to token A's host; `Host: attacker` on a decrypted connection; a client `SNI` for another name on a CONNECT to the bound name; a rebinding `lookup` that answers the attacker's address, where a certificate for another name is valid; a CONNECT tunnel to an unbound host carries the surrogate and never the value. Pure cases in A3-1 (`swap` table).
+2. **A CA the agent planted** gains no trust in the proxy's upstream check. Test in A3-5: the upstream's certificate is from a CA that is in the test process's `SSL_CERT_FILE` and not in `Floor::roots`: `502`, the upstream reads no request. Test in A3-2: `Floor::live`'s roots are `webpki-roots` alone, whatever `SSL_CERT_FILE` says. In the side container (A3-8): as the agent, `ca.key` and `broker.key` cannot be read and the three trust locations cannot be written.
+3. **A token whose value cannot go in a header** (a newline, a control byte): refused with the token's name, never sent cut or raw. Test in A3-1.
+4. **A keep-alive connection that outlives an `/vault unbind`**: the next request on it is refused, because the map is read per request. Test in A3-5.
+5. **`vault.toml` unreadable while the daemon runs**: bound hosts stay decrypted and answer `502`, never a plain tunnel that would carry a later real value. Test in A3-5.
+
+---
+
+### Task A3-1: Surrogates, bindings and the swap (`broker.rs`, pure)
+
+**Files:**
+- Create: `crates/zephyr/src/broker.rs` (`pub mod broker;` in `lib.rs`)
+- Modify: `crates/zephyr/src/vault.rs` (`Entry` gains `hosts: Vec<String>`, `url: bool`, `raw: bool`, read by `read`, shown in `Debug`), `crates/zephyr/src/config.rs` (`Mcp` gains `hosts: Vec<String>`, `secrets: Option<String>`; hidden `brokered: bool` beside `tick`), `DESIGN.md` (new §4.21, its first paragraphs)
+
+**Interfaces (produces):**
+```rust
+pub const PREFIX: &str = "zsur_";
+pub fn key(cfg: &Config) -> anyhow::Result<[u8; 32]>;           // <state>/broker.key, made 0600 on first use
+pub fn surrogate(key: &[u8; 32], kind: &str, name: &str) -> String;
+pub fn parse_host(entry: &str) -> Result<String, String>;        // normalized "host:port"
+pub fn on(cfg: &Config) -> bool;                                 // egress::bridge() || cfg.brokered
+pub struct Secret { pub name: String, value: String, pub hosts: Vec<String>, pub url: bool }  // Debug: no value
+pub struct Map { /* surrogate -> Secret, base64 forms, unreadable: bool */ }                 // Debug: names only
+impl Map {
+    pub fn build(cfg: &Config, vault: &Vault, env: &[(String, String)], key: &[u8; 32]) -> Map;
+    pub fn load(cfg: &Config) -> anyhow::Result<Map>;            // reads vault.toml, secrets.env, broker.key
+    pub fn bound(&self, host_port: &str) -> bool;
+    pub fn hosts(&self) -> Vec<String>;                          // every decrypted host:port, sorted
+}
+pub enum Refused { NotBound(String), Unknown, NotInUrl(String), Unsendable(String) }
+impl Refused { pub fn reason(&self, host: &str) -> String; pub fn token(&self) -> Option<&str> }
+/// Swaps in place for a request the proxy decrypted for `host`; the names used, in order, each once.
+pub fn swap(uri: &mut hyper::Uri, headers: &mut hyper::HeaderMap, map: &Map, host: &str) -> Result<Vec<String>, Refused>;
+/// Turns each of `used`'s real values in reply headers back into its surrogate.
+pub fn unswap(headers: &mut hyper::HeaderMap, map: &Map, used: &[String]);
+/// A request that is never swapped (plain http, a host name): any surrogate refuses it.
+pub fn scan(text: &[&[u8]], map: &Map) -> Result<(), Refused>;
+pub fn secrets(cfg: &Config, vault: &Vault) -> Vec<(String, String)>; // Vault::secrets() + (name, surrogate)
+pub fn connector_names(m: &Mcp) -> (Vec<String>, Vec<String>);        // ${NAME}s anywhere, and those in `url`
+```
+`Map::build`: every token that is not `raw` (one with no hosts is known and bound nowhere); for every `[[mcp]]` not `secrets = "plain"`, each `${NAME}` it uses that secrets.env sets, bound to the connector's `hosts`, or its `https` URL's `host:port` when it lists none, the union over connectors, `url` when the name is in a connector's `url`.
+
+- [ ] **Step 1: failing tests** in `broker.rs`:
+  - `surrogates_are_stable_and_differ_by_name_kind_and_key`: matches `^zsur_[0-9a-f]{40}$`.
+  - `parse_host_takes_exact_names_only`: `api.github.com` → `api.github.com:443`, `X.io:8443` → `x.io:8443`; errors for `*.x.io`, `https://x.io`, `x.io/path`, `1.2.3.4`, `[::1]`, `x.io:0`, ``.
+  - `swap_table`: Bearer; a custom header; `Basic` (decoded, swapped, encoded again); two tokens in one request; the target with `url` and without (`NotInUrl`); a body is not an argument at all; token B on token A's host (`NotBound("B")`); a made-up `zsur_` + 40 hex (`Unknown`); a base64 form of an unbound token's surrogate in a header (`NotBound`); `unswap` turns a `Location` back.
+  - `a_value_that_cannot_be_a_header_is_refused_by_name` (Review Focus 3): value `a\nb` gives `Unsendable`, headers unchanged.
+  - `scan_refuses_any_surrogate`: header, query, host name, base64.
+  - `nothing_printed_holds_a_value_or_a_surrogate`: `format!("{map:?}")` and every `Refused::reason` hold neither.
+  - `secrets_scrub_a_surrogate_and_its_base64_form`: `vault::scrub(text, &secrets(..))` gives `[vault:NAME]`.
+  - `the_map_binds_connector_secrets_to_their_hosts`: a `url` connector to its URL's host, `hosts` when listed, the union for a shared name, none for `plain`, `url` only when named in the URL.
+  - `the_key_is_made_once_and_private`: 0600, the same bytes on a second call.
+- [ ] **Step 2:** `cargo test -p zephyr --lib broker` fails (no module).
+- [ ] **Step 3: implement.** One left-to-right pass finds `zsur_` followed by 40 lowercase hex; base64 forms come from `vault::base64_forms`.
+- [ ] **Step 4:** the tests pass; full `cargo test`.
+- [ ] **Step 5:** commit `feat(broker): derive a stand-in for each vault token and swap it only on the hosts it is bound to`.
+
+### Task A3-2: The CA (`ca.rs`)
+
+**Files:**
+- Create: `crates/zephyr/src/ca.rs`
+- Modify: `crates/zephyr/Cargo.toml` (`rcgen`, `rustls`, `tokio-rustls`, `webpki-roots`), `Cargo.lock`, `DESIGN.md` §4.21
+
+**Interfaces (produces):**
+```rust
+pub const DAYS: i64 = 398; pub const RENEW_UNDER: i64 = 180;
+pub fn dir(state: &Path) -> PathBuf;                             // <state>/ca
+/// Makes or renews the CA; `true` when a new one was made.
+pub fn ensure(state: &Path, now: i64) -> anyhow::Result<bool>;
+pub fn days_left(state: &Path, now: i64) -> anyhow::Result<i64>;
+pub fn pem(state: &Path) -> anyhow::Result<String>;
+pub struct Authority { /* issuer, the run's leaf key, leaves by host */ }  // Debug: nothing
+impl Authority {
+    pub fn load(state: &Path) -> anyhow::Result<Authority>;
+    pub fn leaf(&self, host: &str, now: i64) -> anyhow::Result<Arc<rustls::ServerConfig>>;  // ALPN http/1.1 only
+}
+pub fn public_roots() -> Arc<rustls::RootCertStore>;            // webpki-roots, nothing from a file or a variable
+pub fn client(roots: Arc<rustls::RootCertStore>) -> Arc<rustls::ClientConfig>;              // ALPN http/1.1 only
+```
+The expiry is kept as unix seconds in `<state>/ca/expires`, written with the certificate; a missing or unreadable one reads as expired.
+
+- [ ] **Step 1: failing tests:** `ensure_makes_a_private_folder_and_key` (0700, 0600); `ensure_keeps_a_ca_with_200_days_left_and_replaces_one_with_100` (the key file's bytes change only in the second case); `a_leaf_verifies_for_its_host_and_no_other` (a TLS handshake over `tokio::io::duplex` with the CA as the client's only root: `api.x.test` succeeds, `other.test` fails); `the_same_leaf_is_served_until_a_day_before_it_expires` (`Arc::ptr_eq`, then a new one at 29 days); `leaves_offer_http1_only` (a client offering `h2, http/1.1` negotiates `http/1.1`); `the_proxys_roots_ignore_ssl_cert_file` (Review Focus 2: with `SSL_CERT_FILE` naming the test CA, `public_roots()` does not verify its leaf).
+- [ ] **Step 2:** fails. **Step 3:** implement; `cargo deny check advisories bans`. **Step 4:** tests, full `cargo test`.
+- [ ] **Step 5:** commit `feat(ca): keep a container-only CA and sign one leaf per bound host`.
+
+### Task A3-3: The vault hands out surrogates and takes bindings
+
+**Files:**
+- Modify: `crates/zephyr/src/vault.rs` (`put`, `public`, `line`, `bind`/`unbind`/`set_flag`, `command`, `exec_env`, `agent`, `scrubbed`), `crates/zephyr/src/gate.rs` (`Scrub::load`), `crates/zephyr/src/router.rs` (`/vault` logs to `settings_log`), `crates/zephyr-policy/src/tools.rs` (`VaultAction::Bind`, the tool's schema text), `DESIGN.md` §4.13, §4.15, `README.md`
+- Test: `vault.rs`, `tools.rs`, `crates/zephyr/tests/router.rs`
+
+**Interfaces:**
+- Consumes: A3-1 `broker::{key, surrogate, parse_host, on, secrets}`.
+- Produces: `vault::command(path, arg, may_approve) -> Result<(String, Option<Change>), String>` with `pub struct Change { pub key: String, pub old: String, pub new: String }` (`vault.NAME.hosts|url|raw`); `VaultAction::Bind { name, hosts: Vec<String>, why }`; `exec_env` unchanged in signature.
+- `put`: `hosts` from the new entry when it lists any, else the old ones; `url` and `raw` always the old ones (false on a new entry).
+- `bind`, `raw on`, `url on` need `may_approve`; `unbind [HOST]`, `raw off`, `url off` do not.
+- The agent's `bind` checks the token exists and every host parses, stores `/vault bind NAME HOST..` with `ask_owner` (the ask reads `to send NAME to HOST, HOST`), and answers that it waits.
+
+- [ ] **Step 1: failing tests:** `exec_env_gives_a_surrogate_a_raw_value_or_nothing` (brokered config: bound → `zsur_…`, `raw` → the value, unbound → the `not run` copy; not brokered → the value); `put_keeps_hosts_across_a_new_value`; `bind_raw_and_url_need_an_approving_channel_and_tightening_does_not`; `the_agents_bind_is_a_proposal_the_owner_approves` (`/ok N` applies it); `each_binding_change_is_a_settings_log_row`; `scrubbed_output_hides_a_surrogate`; in `tools.rs`, `vault_bind_needs_a_name_and_hosts`; in `tests/router.rs`, `an_exec_with_a_bound_token_runs_on_its_surrogate` (the answer shows `[vault:GH_TOKEN]`, the `.procs` log holds `zsur_` and not the value), `a_token_bound_to_nothing_is_not_run`, and `the_upgrade_notice_is_sent_once`.
+- [ ] **Step 2–4:** fail, implement, pass, full `cargo test`.
+- [ ] **Step 5:** commit `feat(vault): hand the agent a stand-in for a bound token, and let only the owner bind it to hosts`.
+
+### Task A3-4: Connectors hold surrogates
+
+**Files:**
+- Modify: `crates/zephyr/src/drafts.rs` (`prepare`, the draft's `hosts`, `/mcp ok`'s card), `crates/zephyr/src/config.rs` (`Mcp::check`), `crates/zephyr/src/settings.rs` (two rows, `find`, `value`, `read`, `write`, `parse`), `crates/zephyr/src/broker.rs` (`connector_secrets`), `DESIGN.md` §4.4 item 1, §4.6, §4.17, §7
+
+**Interfaces:**
+- Produces: `broker::connector_secrets(cfg: &Config, m: &Mcp, env: &[(String, String)]) -> Result<Vec<(String, String)>, String>`: the list `drafts::filled` gets. Real values when brokering is off or the connector is `plain`; surrogates otherwise; `Err(why)` for a connector that names a secret and has nowhere to send it (a `command` connector with no `hosts`, or an `http://` URL with none).
+- Rows, verbatim from spec §4.11: `mcp.<name>.hosts` (`Kind::Text { max: 1000 }`, `Access::Propose`, strong, `Stricter::NotOrdered`) checked by `broker::parse_host`, and `mcp.<name>.secrets` (`Kind::Choice(&["surrogate", "plain"])`, `Access::Propose`, strong, `Stricter::Earlier`).
+
+- [ ] **Step 1: failing tests:** `mcp_json_holds_the_surrogate_and_never_the_secret`; `a_command_connector_without_hosts_is_left_out`; `a_plain_connector_holds_the_value`; `mcp_json_is_byte_identical_across_two_prepares`; `without_the_floor_connectors_hold_their_secrets_as_before`; `a_draft_carries_hosts_and_the_card_shows_them`; in `settings.rs`, `connector_hosts_and_secrets_are_strong_proposal_rows` and `a_wildcard_connector_host_is_refused`.
+- [ ] **Step 2–4:** fail, implement, pass, full `cargo test`.
+- [ ] **Step 5:** commit `feat(drafts): publish connectors with stand-ins for their secrets, bound to the connector's hosts`.
+
+### Task A3-5: The proxy decrypts bound hosts and refuses a surrogate anywhere else
+
+**Files:**
+- Modify: `crates/zephyr/src/egress.rs` (`Floor` gains `roots: Arc<rustls::RootCertStore>` and `ca: Option<Arc<ca::Authority>>`, so it is `Clone`, not `Copy`; `Conn::answer`; `serve_tls`; `forward` scans; `Audit::note`; `write_audit` sends notices), `crates/zephyr/src/broker.rs` (`Maps`, the notice limiter), `DESIGN.md` §4.20 "Not done", §4.21
+
+**Interfaces:**
+- Consumes: A3-1 `Map`, `swap`, `unswap`, `scan`, `Refused`; A3-2 `Authority::leaf`, `client`, `public_roots`.
+- Produces: `broker::Maps` (`current(&self, cfg: &Arc<Config>) -> Arc<Map>`: one `stat` of `vault.toml` and secrets.env per call; a load that fails keeps the last map with `unreadable` set); `broker::Notices` (`fn due(&mut self, now: i64, token: &str, host: &str) -> bool`: once per pair per hour, 10 an hour).
+- `Conn::answer`, after `decide` and `connect`: any surrogate in the authority refuses; a `CONNECT` to a bound `host:port` answers `502 zephyr: the token broker is down` with no CA, `502 zephyr: the vault could not be read` with an unreadable map, else `200` and `serve_tls`. `forward` runs `scan` over the target and every header first.
+- `serve_tls`: accept TLS with `leaf(host)`; a client SNI that is not the bound host answers every request `403 zephyr: Host does not match HOST`; TLS to the connected address with SNI the bound host and `Floor::roots`, a failure answering every request `502 zephyr: HOST did not prove it is HOST`; then hyper `http1` on both sides with keep-alive, 10 s for a head, an idle connection closed after 90 s. Per request: the current map (unbound now → `403 … is not sent to HOST`), `Host` equal to the bound host with or without its port, `swap`, send, `unswap` the reply's headers, bodies as frames; an `Upgrade` answered `101` is relayed by `relay`.
+- Audit: `swap` rows `NAME -> host:port`, `allowed` keyed on the whole pair per hour; refusals as `refused: <reason>`.
+
+- [ ] **Step 1: failing tests** (tokio, a test CA as `Floor::roots`, a TLS upstream on 127.0.0.1 with a leaf for `bound.test`, `lookup` passed in, the client trusting the proxy's CA):
+  - `a_bound_host_gets_the_real_token_and_never_the_surrogate`; `an_unbound_host_is_a_plain_tunnel_with_its_own_certificate`.
+  - `two_requests_share_one_upstream_connection`; `a_chunked_upload_and_an_event_stream_pass_unbuffered` (the second event is read before the upstream sends the third); `a_websocket_handshake_is_swapped_and_frames_pass`; `a_client_offering_h2_gets_http1`.
+  - `a_swap_is_audited_once_an_hour_by_name`.
+  - Review Focus 1: `a_surrogate_on_plain_http_is_refused_audited_and_told_once` (header, query, `Basic`, host name: 403, zero accepts, one `refused` row naming the token, one notice, none for a second try); `another_tokens_surrogate_on_a_bound_host_is_refused` (the upstream reads no request); `a_host_header_for_another_name_is_refused`; `a_client_sni_for_another_name_is_refused`; `a_tunnel_to_an_unbound_host_carries_the_surrogate_not_the_value`; `a_rebound_name_with_a_private_address_is_refused` (and `lookup` is called once); `an_attackers_address_with_another_names_certificate_gets_502` (the attacker reads no request).
+  - Review Focus 2: `a_ca_the_agent_planted_gains_no_trust` (`SSL_CERT_FILE` set to the planted CA's bundle: `502 … did not prove it is …`, the upstream reads no request, a `refused` row).
+  - Review Focus 4: `an_unbind_stops_the_next_request_on_an_open_connection`. Review Focus 5: `an_unreadable_vault_answers_502_on_bound_hosts`.
+  - `without_a_ca_bound_hosts_answer_502_and_others_still_tunnel`.
+- [ ] **Step 2–4:** fail, implement, pass, full `cargo test`.
+- [ ] **Step 5:** commit `feat(egress): decrypt only the hosts a token is bound to and swap its stand-in there, refusing it everywhere else`.
+
+### Task A3-6: The agent's tools trust the CA; supervise, doctor and the image
+
+**Files:**
+- Modify: `crates/zephyr/src/agent.rs` (`CA_ENV`, `proxy_env`), `crates/zephyr/src/ca.rs` (`publish`, `trust_chromium`), `crates/zephyr/src/supervise.rs` (`Policy::ca`), `crates/zephyr/src/main.rs` (`run` loads the `Authority`, runs `certutil` as the agent, sends the upgrade and broker-down notices; `doctor`), `crates/zephyr/src/egress.rs` (`netcheck`: `ca.key` and `broker.key` unreadable, the trust locations unwritable), `deploy/Dockerfile` (`libnss3-tools`, Camoufox `distribution/policies.json`), `crates/zephyr/tests/host.rs`, `DESIGN.md` §4.8, §4.21, `README.md`, `CLAUDE.md`
+
+**Interfaces:**
+- `agent::CA_ENV: &[(&str, &str)]` = `NODE_EXTRA_CA_CERTS=/var/lib/zephyr-public/ca.pem`, `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` = `/etc/ssl/certs/ca-certificates.crt`, part of `proxy_env`.
+- `ca::publish(state: &Path, public: &Path) -> anyhow::Result<()>`: `/usr/local/share/ca-certificates/zephyr.crt`, root's `/usr/sbin/update-ca-certificates --fresh`, `<public>/ca.pem` 0644.
+- `Policy { ca: Option<fn() -> anyhow::Result<()>> }`: run after the floor; an error is printed and the daemon starts.
+- `broker::doctor(cfg, now) -> Vec<(Level, String)>` with `Level::{Ok, Warn, Fail}`: spec §4.10's list.
+
+- [ ] **Step 1: failing tests:** `the_proxy_env_points_tools_at_the_ca`; `host.rs` `shell_…` expects the three variables in bridge mode and none in host mode; `a_failing_ca_does_not_stop_the_daemon` (supervise); `doctor_lists_decrypted_hosts_and_warns_about_plain_secrets` (raw, url, plain, unbound, `[agent] env` names); `doctor_fails_when_mcp_json_holds_a_brokered_secret`; `every_copy_in_the_dockerfile_is_in_the_build_context` still passes.
+- [ ] **Step 2–4:** fail, implement, pass, full `cargo test`.
+- [ ] **Step 5:** commit `feat(ca): have the agent's tools trust the broker's CA, renew it only at a container start, and show the broker in doctor`.
+
+### Task A3-7: The owner's forms and the host CLI
+
+**Files:**
+- Modify: `crates/zephyr/src/host/setup.rs` (`vault add token NAME --host HOST..`, `edit NAME --host`, `init`'s token step), `crates/zephyr/src/tui/overlays.rs` and `tui/conn.rs` (a hosts field on the token form, hosts on the entry's card), `README.md`, `DESIGN.md` §4.15
+- Test: `crates/zephyr/tests/host.rs`, `tui/overlays.rs` tests, `crates/zephyr/tests/attach.rs`
+
+- [ ] **Step 1: failing tests:** `vault_add_token_takes_hosts` (`vault.toml` holds the normalized hosts; a wildcard fails and writes nothing); `the_token_form_saves_its_hosts`; `vault_put_over_attach_keeps_url_and_raw`.
+- [ ] **Step 2–4:** fail, implement, pass, full `cargo test`.
+- [ ] **Step 5:** commit `feat(vault): take a token's hosts where the owner saves it, in the TUI and on the host`.
+
+### Task A3-8: The real container, the real rpi
+
+**Files:**
+- Create: `crates/zephyr/tests/token_broker.rs` (ignored; skips without `ZEPHYR_CONTAINER`, refuses `zephyr`)
+- Modify: `crates/zephyr/tests/real_rpi.rs` (does rpi's own client connect through a decrypted host?), `DESIGN.md` §4.21 "Tested" and the pinning table, this plan (results)
+
+- [ ] **Step 1:** write the ignored test: as the agent in the side container, `env` under an `exec` with `secrets` holds `zsur_`; `mcp.json` holds no secrets.env value; `ca.key` and `broker.key` cannot be read; `/usr/local/share/ca-certificates`, `/etc/ssl/certs` and `<state>-public/ca.pem` cannot be written; `curl`, `git ls-remote`, Node `fetch`, Python `requests` and agent-browser reach a bound host whose echo shows the real token; the same token to another host is refused and audited; an unbound host shows its own certificate's issuer; `doctor` passes and lists the host.
+- [ ] **Step 2:** `docker build -f deploy/Dockerfile -t zephyr-dev:a3-<sha> .`; `zephyr up` as `zephyr-test-a3` with a scratch HOME, attach 18790, web 18793; run the test; remove the container and its network.
+- [ ] **Step 3:** `ZEPHYR_REAL_RPI=1 cargo test -p zephyr --test real_rpi -- --ignored`, `-p zephyr-policy --test rpi_load -- --ignored`, `--test attach -- --ignored`.
+- [ ] **Step 4:** record the results and every deviation here; commit `test(broker): check the token broker in a real container and with the real rpi`.
+
+## Deviations
+
+Recorded as they happen, one line each, under the task they belong to.
