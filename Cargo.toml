@@ -6,7 +6,7 @@ resolver = "2"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
-version = "0.8.0"
+version = "0.9.0"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "sync", "io-util", "signal", "fs", "net"] }
