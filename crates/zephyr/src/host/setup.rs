@@ -29,6 +29,7 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let account_flags = a.values("--account")?;
     let model = a.value("--model")?;
     let preset = a.value("--preset")?;
+    let network = a.value("--network")?;
     let rest = a.rest()?;
     if !rest.is_empty() {
         bail!("{USAGE}");
@@ -37,6 +38,13 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
         .map(|p| crate::approvals::Preset::parse(&p))
         .transpose()
         .map_err(|e| anyhow::anyhow!("--preset: {e}"))?;
+    // No prompt for it: the floor is the safe default, and a wizard should not offer the weaker one.
+    if network
+        .as_deref()
+        .is_some_and(|n| n != "bridge" && n != "host")
+    {
+        bail!("--network must be bridge or host");
+    }
 
     if !no_start && !super::quiet(super::docker(&["version"])) {
         bail!("docker is not reachable: install Docker and make sure `docker version` works");
@@ -60,7 +68,14 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
         bail!("{} is not a directory", projects.display());
     }
     h.data.set_projects(&projects.canonicalize()?)?;
-    h.data.set_network_default()?;
+    h.data.set_network(network.as_deref())?;
+    println!(
+        "{}",
+        match h.bridge()? {
+            true => "network: bridge (the agent's network floor)",
+            false => "network: host (no network floor; zephyr init --network bridge turns it on)",
+        }
+    );
 
     let mut doc = h.data.load()?;
     h.data.add_image_extensions(&mut doc)?;
@@ -110,6 +125,12 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
                 );
             }
         }
+        if doc.get("discord").is_none() && doc.get("imessage").is_none() {
+            println!("  add a channel: zephyr channel add discord|imessage");
+        }
+        if conf::get(&doc, "web.host").is_none() && h.bridge()? {
+            println!("  web app: zephyr web setup");
+        }
         if !no_start {
             h.ensure_image(false, false)?;
             h.up_checked()?;
@@ -121,6 +142,8 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
     // Logins run in the container, so it starts before them.
     h.ensure_image(false, false)?;
     h.up_checked()?;
+    // A restart cannot publish a port added from here on (the iMessage webhook): see the end.
+    let published = h.published()?;
     let have: Vec<String> = conf::accounts(&doc)
         .iter()
         .map(|(_, m)| provider_of(m).to_string())
@@ -180,8 +203,51 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
         }
     }
     init_approvals(h, preset)?;
-    run(&mut super::docker(&["restart", &h.container]))?;
+    // After the preset, so web setup's strong-channel and money offers come after it.
+    use super::web::Restart;
+    match init_web(h)? {
+        // web setup made the container again, with every port.
+        Restart::Done => {}
+        Restart::Declined => {
+            println!("not starting zephyr again, as you asked; zephyr up applies the changes");
+        }
+        // A restart cannot publish a port this run added; `republish` makes it again for that.
+        Restart::NotAsked => {
+            if !h.republish(&published)? {
+                run(&mut super::docker(&["restart", &h.container]))?;
+            }
+        }
+    }
     h.doctor(false)
+}
+
+/// Init's web app step (DESIGN §4.8): offered, default no. What web setup did about restarting
+/// zephyr; an error is printed and init carries on, as a failed sign-in does.
+fn init_web(h: &Host) -> anyhow::Result<super::web::Restart> {
+    use super::web::Restart;
+    if !h.bridge()? {
+        println!("web app: {}", crate::web::NEEDS_FLOOR);
+        return Ok(Restart::NotAsked);
+    }
+    let prompt = match conf::get(&h.data.load()?, "web.host") {
+        Some(host) => {
+            println!("web app: https://{host}");
+            "Change the web app?"
+        }
+        None => "Set up the web app (needs Tailscale with HTTPS certificates)?",
+    };
+    if !Confirm::new()
+        .with_prompt(prompt)
+        .default(false)
+        .interact()?
+    {
+        return Ok(Restart::NotAsked);
+    }
+    let mut restart = Restart::NotAsked;
+    if let Err(e) = super::web::setup(h, false, &mut restart) {
+        println!("web app: {e:#}");
+    }
+    Ok(restart)
 }
 
 /// Writes `preset` as `/approvals PRESET` does (D11, `approvals::preset_edits`): the preset, and
@@ -1126,7 +1192,43 @@ fn channel_add(h: &Host, kind: &str) -> anyhow::Result<()> {
     for (key, raw) in sets {
         conf::set(&mut doc, key, &raw)?;
     }
-    h.data.save(&doc)
+    h.data.save(&doc)?;
+    if kind == "imessage" {
+        imessage_forward(h)?;
+    }
+    Ok(())
+}
+
+/// Under the network floor the webhook is published on this host's loopback, and BlueBubbles
+/// posts to the Tailscale address: `tailscale serve` joins them. Asked only when the forward is
+/// missing, default yes, since the channel does not work without it. A missed detection only means
+/// the question comes again; the same mapping twice is harmless.
+fn imessage_forward(h: &Host) -> anyhow::Result<()> {
+    let webhook = h
+        .published()?
+        .into_iter()
+        .find(|(k, _)| *k == "imessage.listen");
+    let (Some((_, port)), true) = (webhook, h.bridge()?) else {
+        return Ok(());
+    };
+    let (port, target) = (port.to_string(), format!("tcp://127.0.0.1:{port}"));
+    if super::web::forwarded(&target) {
+        return Ok(());
+    }
+    let question = format!("Forward this machine's Tailscale port {port} to the webhook?");
+    if !Confirm::new()
+        .with_prompt(question)
+        .default(true)
+        .interact()?
+    {
+        println!("forward it later: sudo tailscale serve --bg --tcp {port} {target}");
+        return Ok(());
+    }
+    let args = ["--bg", "--tcp", &port, &target];
+    if let Err(e) = super::web::serve(&args, "zephyr channel add imessage") {
+        println!("{e:#}");
+    }
+    Ok(())
 }
 
 const TOKEN_PREFIX: &[u8] = b"sk-ant-oat01-";

@@ -7,7 +7,10 @@
 # The provider sources are pinned to commit SHAs by the build args below. To build against
 # working trees instead, point the build at local checkouts, which replace the clone stage of the
 # same name:
-#   --build-context rpi-package=../rpi-package--codex --build-context provider-plugins=../rpi-provider-plugins--claude
+#   --build-context rpi-package=<dir> --build-context provider-plugins=<dir>
+# An empty repo arg leaves that source out (DESIGN §4.4 item 1): with
+#   --build-arg RPI_PACKAGE_REPO= --build-arg PLUGINS_REPO=
+# the image has zephyr, the policy plugin, Cursor and rpi's built-in providers only.
 
 ARG RPI_VERSION=0.21.2
 ARG RPI_SHA256_AMD64=f4477ded68eb49f069d2ec4e197371812d33cafbc7985a3531c4d3cd09ace657
@@ -37,11 +40,12 @@ ARG HIMALAYA_SHA256_ARM64=1dc21c3dd6d948929e22e5cae49b9d0b3b30ff88fafd4493fd4460
 FROM rust:1.95-bookworm AS toolchain
 COPY --from=node:24-bookworm-slim /usr/local/ /usr/local/
 
-# Fetches REPO at REF (a branch, tag or commit) into /src.
+# Fetches REPO at REF (a branch, tag or commit) into /src; an empty REPO leaves /src empty.
 FROM toolchain AS fetch
 RUN cat > /usr/local/bin/fetch <<'EOF' && chmod +x /usr/local/bin/fetch
 #!/bin/sh
 set -eu
+[ -n "$1" ] || { mkdir -p /src; exit 0; }
 token="$(cat /run/secrets/gh_token 2>/dev/null || true)"
 if [ -n "$token" ]; then
   # Only in this process's environment: never written to .git/config or a layer.
@@ -63,30 +67,41 @@ RUN --mount=type=secret,id=gh_token fetch "$PLUGINS_REPO" "$PLUGINS_REF"
 FROM scratch AS provider-plugins
 COPY --from=provider-plugins-git /src /
 
-# zephyr, zephyr-policy, zephyr-cursor, librpi_providers.so and librpi_mcp_adapter.so.
+# zephyr, zephyr-policy, zephyr-cursor, and from rpi-package librpi_providers.so and
+# librpi_mcp_adapter.so, unless RPI_PACKAGE_REPO is empty. Set, a tree that lacks them fails here.
 FROM toolchain AS rust
+ARG RPI_PACKAGE_REPO
+# The repository the image is published to, baked into its CLI (`zephyr upgrade` pulls from it);
+# unset or empty, the CLI's own default.
+ARG ZEPHYR_BUILD_REPO
 COPY Cargo.toml Cargo.lock /src/zephyr/
 COPY crates /src/zephyr/crates
 COPY --from=rpi-package / /src/rpi-package
 # sharing=locked: the rust and plugins stages run at once and would unpack the same crate into this cache together.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cd /src/zephyr && cargo build --release --locked -p zephyr -p zephyr-policy -p zephyr-cursor \
-    && cd /src/rpi-package && cargo build --release --locked -p rpi-providers -p rpi-mcp-adapter \
     && mkdir -p /out/bin /out/lib /out/ext \
     && cp /src/zephyr/target/release/zephyr /out/bin/ \
     && cp /src/zephyr/target/release/libzephyr_policy.so /out/lib/ \
     && cp /src/zephyr/target/release/libzephyr_cursor.so /out/ext/ \
-    && cp /src/rpi-package/target/release/librpi_providers.so /out/ext/ \
-    && cp /src/rpi-package/target/release/librpi_mcp_adapter.so /out/ext/
+    && if [ -n "$RPI_PACKAGE_REPO" ]; then \
+         cd /src/rpi-package && cargo build --release --locked -p rpi-providers -p rpi-mcp-adapter \
+         && cp /src/rpi-package/target/release/librpi_providers.so /out/ext/ \
+         && cp /src/rpi-package/target/release/librpi_mcp_adapter.so /out/ext/; \
+       fi
 
 # rpi-claude-agent: its stage.sh builds the cdylib and worker and installs the lockfile-pinned
 # node_modules (npm ci --ignore-scripts, checked against the lockfiles' hashes). Cursor is not a
 # staged package any more: crates/zephyr-cursor builds libzephyr_cursor.so in the rust stage.
+# Left out only when PLUGINS_REPO is empty; set, a tree without stage.sh fails here.
 FROM toolchain AS plugins
+ARG PLUGINS_REPO
 COPY --from=provider-plugins / /src/plugins
 WORKDIR /src/plugins
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked --mount=type=cache,target=/root/.npm \
-    packages/rpi-claude-agent/scripts/stage.sh /out/ext/rpi-claude-agent
+    if [ -n "$PLUGINS_REPO" ]; then \
+      packages/rpi-claude-agent/scripts/stage.sh /out/ext/rpi-claude-agent; \
+    else mkdir -p /out/ext; fi
 
 # The pinned upstream rpi release, checked against its published sha256.
 FROM ubuntu:24.04 AS rpi

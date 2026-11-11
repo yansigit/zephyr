@@ -14,6 +14,7 @@ const CLAUDE_TOKEN: &str = "sk-ant-oat01-FAKE-CLAUDE-TOKEN";
 const DOCKER: &str = r#"#!/bin/bash
 log="$SHIM_DIR/calls.log"
 (IFS=$'\x1f'; echo "docker$IFS$*") >> "$log"
+[ -n "$SHIM_DOCKER_DOWN" ] && exit 1
 # `zephyr __file` in the container serves the daemon's files from $SHIM_DIR/files.
 case " $* " in
   *" __file get "*) f="$SHIM_DIR/files/${@: -1}"; [ -f "$f" ] || exit 3; cat "$f"; exit 0 ;;
@@ -107,6 +108,25 @@ const CURL: &str = r#"#!/bin/bash
 exit "${SHIM_CURL_FAIL:-0}"
 "#;
 
+/// `cargo`: logged like `docker`. `install` writes a fake `~/.cargo/bin/zephyr` that logs how it
+/// was run to exec.log, as the image's CLI does.
+const CARGO: &str = r#"#!/bin/bash
+(IFS=$'\x1f'; echo "cargo$IFS$*") >> "$SHIM_DIR/calls.log"
+case "$1" in
+  --version) echo "cargo 1.95.0 (abc 2026-01-01)" ;;
+  install) mkdir -p "$HOME/.cargo/bin"
+    echo "ZEPHYR_BUILD_REPO=${ZEPHYR_BUILD_REPO-unset}" >> "$SHIM_DIR/cargo-env.log"
+    printf '#!/bin/bash\necho "$@" >> "%s/exec.log"\n' "$SHIM_DIR" > "$HOME/.cargo/bin/zephyr"
+    chmod 755 "$HOME/.cargo/bin/zephyr" ;;
+esac
+"#;
+
+/// `sudo` and `wget`: logged and refused, for tests that check they are never called.
+const REFUSED: &str = r#"#!/bin/bash
+(IFS=$'\x1f'; echo "$(basename "$0")$IFS$*") >> "$SHIM_DIR/calls.log"
+exit 1
+"#;
+
 struct Env {
     dir: PathBuf,
     home: PathBuf,
@@ -133,6 +153,9 @@ impl Env {
             ("loginctl", LOGINCTL),
             ("curl", CURL),
             ("tailscale", TAILSCALE),
+            ("cargo", CARGO),
+            ("sudo", REFUSED),
+            ("wget", REFUSED),
         ] {
             std::fs::write(bin.join(name), body).unwrap();
             std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
@@ -223,6 +246,13 @@ impl Env {
 
     /// `zephyr <args>` with a terminal as stdin and stdout, through script(1). Its output is
     /// what the terminal received.
+    /// `bash deploy/install.sh <args>`, with the same environment as the CLI.
+    fn install(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/install.sh");
+        let args: Vec<&str> = [script].into_iter().chain(args.iter().copied()).collect();
+        self.run_input(Path::new("bash"), &args, env, None)
+    }
+
     fn on_a_tty(&self, args: &str, env: &[(&str, &str)]) -> Output {
         let path = format!(
             "{}:{}",
@@ -320,6 +350,11 @@ impl Drop for Env {
     }
 }
 
+/// Owned strings, to compare with a recorded call.
+fn s(words: &[&str]) -> Vec<String> {
+    words.iter().map(|w| w.to_string()).collect()
+}
+
 fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
@@ -407,6 +442,16 @@ sys.exit(os.waitstatus_to_exitcode(status))
 impl Env {
     /// `zephyr <args>` on a terminal answering `steps` (see `PTY_DRIVER`): `(code, output)`.
     fn on_a_driven_tty(&self, args: &[&str], steps: &[(&str, &str)]) -> (i32, String) {
+        self.on_a_driven_tty_env(args, steps, &[])
+    }
+
+    /// `on_a_driven_tty` with `env` set too.
+    fn on_a_driven_tty_env(
+        &self,
+        args: &[&str],
+        steps: &[(&str, &str)],
+        env: &[(&str, &str)],
+    ) -> (i32, String) {
         let path = format!(
             "{}:{}",
             self.dir.join("bin").display(),
@@ -423,6 +468,7 @@ impl Env {
             .env("ZEPHYR_CONTAINER", CONTAINER)
             .env("ZEPHYR_IMAGE", "zephyr-lanetest")
             .env("TERM", "xterm")
+            .envs(env.iter().copied())
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap();
@@ -449,6 +495,10 @@ fn init_asks_for_a_preset_and_writes_it() {
             ("Kind", &format!("{DOWN}\n")),
             ("value of pin (hidden)", &format!("{PIN}\n")),
             ("Add another fact?", "n"),
+            (
+                "Set up the web app (needs Tailscale with HTTPS certificates)?",
+                "n",
+            ),
         ],
     );
     assert!(
@@ -465,6 +515,313 @@ fn init_asks_for_a_preset_and_writes_it() {
     assert!(facts.contains(PIN) && facts.contains("digits"), "{facts}");
     assert!(!shown.contains(PIN), "the value was echoed");
     assert!(!format!("{:?}", env.calls()).contains(PIN), "value in argv");
+}
+
+/// `--network` is the one CLI way to set host.toml's network (after the first `up` the file is
+/// root's); without it a re-run keeps what is there.
+#[test]
+fn init_network_flag_sets_and_keeps_the_mode() {
+    let env = Env::new("init-network");
+    let host = || read(&env.daemon().join("host.toml"));
+    let projects = env.projects.display().to_string();
+    let init = |extra: &[&str]| {
+        let mut args = vec![
+            "init",
+            "--non-interactive",
+            "--no-start",
+            "--projects",
+            &projects,
+        ];
+        args.extend(extra);
+        env.zephyr(&args)
+    };
+    let out = init(&["--network", "host"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(host().contains("network = \"host\""), "{}", host());
+    assert!(stdout(&out)
+        .contains("network: host (no network floor; zephyr init --network bridge turns it on)"));
+    let out = init(&[]);
+    assert!(out.status.success());
+    assert!(host().contains("network = \"host\""), "kept: {}", host());
+    assert!(stdout(&out).contains("network: host"));
+
+    let before = host();
+    let out = init(&["--network", "foo"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--network must be bridge or host"), "{err}");
+    assert_eq!(host(), before, "refused before anything was written");
+
+    let out = init(&["--network", "bridge"]);
+    assert!(out.status.success());
+    assert!(host().contains("network = \"bridge\""), "{}", host());
+    assert!(stdout(&out).contains("network: bridge (the agent's network floor)"));
+}
+
+/// What an owner's install holds: two accounts, Discord, iMessage, the web app and a preset.
+fn configure_an_install(env: &Env) {
+    env.init(&[
+        "--no-start",
+        "--account",
+        "codex-a=openai-codex/gpt-5.5",
+        "--account",
+        "claude-a=anthropic/claude-sonnet-5",
+    ]);
+    env.ok(&["config", "set", "owners.discord", "[\"1234\"]"]);
+    env.ok(&["config", "set", "discord.token_env", "ZEPHYR_DISCORD_TOKEN"]);
+    env.ok(&["config", "set", "owners.imessage", "[\"+15550100\"]"]);
+    let mut cfg = env.config();
+    cfg.push_str(
+        "\n[imessage]\nlisten = \"100.64.0.1:7791\"\nserver_url = \"http://100.64.0.2:1234\"\n\
+         password_env = \"ZEPHYR_BB_PASSWORD\"\nsecret_env = \"ZEPHYR_BB_SECRET\"\n\
+         \n[web]\nhost = \"box.tail1234.ts.net\"\nport = 7793\n\
+         \n[approvals]\npreset = \"semi\"\n",
+    );
+    std::fs::write(env.daemon().join("zephyr.toml"), cfg).unwrap();
+}
+
+/// Review Focus 2: `init` again on the owner's install, Enter at every prompt, changes nothing:
+/// the same files byte for byte, no `tailscale serve`, and one `docker restart` at the end.
+#[test]
+fn init_again_on_a_configured_install_changes_nothing() {
+    let env = Env::new("init-rerun");
+    configure_an_install(&env);
+    // After the first `up` the daemon's files are root's, reached through the container.
+    env.split();
+    let files = env.dir.join("files");
+    let snapshot = || ["zephyr.toml", "host.toml"].map(|f| std::fs::read(files.join(f)).unwrap());
+    let before = snapshot();
+    env.calls();
+    let forwards =
+        "https://box.tail1234.ts.net (tailnet only)\n|-- / proxy http://127.0.0.1:7793\n\n\
+                    tcp://box.tail1234.ts.net:7791 (tailnet only)\n|--> tcp://127.0.0.1:7791";
+    let (_, shown) = env.on_a_driven_tty_env(
+        &["init"],
+        &[
+            ("Projects folder", "\n"),
+            ("Providers", "\n"),
+            ("Add another", "\n"),
+            ("Add another", "\n"),
+            ("Failover order", "\n"),
+            ("Change the discord channel?", "\n"),
+            ("Change the imessage channel?", "\n"),
+            ("Add private facts", "\n"),
+            ("Change the web app?", "\n"),
+        ],
+        &[("SHIM_TS_SERVE", forwards)],
+    );
+    env.unsplit();
+    assert!(
+        shown.contains("LEFT 0"),
+        "every prompt was answered: {shown}"
+    );
+    assert!(
+        shown.contains("web app: https://box.tail1234.ts.net"),
+        "{shown}"
+    );
+    assert!(!shown.contains("Forward this machine"), "{shown}");
+    // The one failure is doctor's: the shim cannot make the daemon's dir root's.
+    assert!(shown.contains("is root's and private"), "{shown}");
+    let after = snapshot();
+    for (i, name) in ["zephyr.toml", "host.toml"].iter().enumerate() {
+        assert!(
+            before[i] == after[i],
+            "{name} changed:\n{}\n---\n{}",
+            String::from_utf8_lossy(&before[i]),
+            String::from_utf8_lossy(&after[i])
+        );
+    }
+    let calls = env.calls();
+    let count = |prefix: &[&str]| (calls.iter()).filter(|c| c.starts_with(&s(prefix))).count();
+    assert_eq!(count(&["tailscale", "serve", "--bg"]), 0, "{calls:#?}");
+    assert_eq!(count(&["docker", "restart"]), 1, "{calls:#?}");
+    // The `up` init always starts with, and none after it.
+    assert_eq!(count(RUN), 1, "{calls:#?}");
+}
+
+/// A port init added (the iMessage webhook) is published by making the container again: a
+/// restart cannot add one.
+#[test]
+fn init_adding_imessage_publishes_its_port_and_offers_the_forward() {
+    let env = Env::new("init-imessage");
+    env.init(&["--no-start"]);
+    let mut steps = vec![
+        ("Projects folder", "\n"),
+        ("Providers", "\n"),
+        ("Set up discord?", "n"),
+        ("Set up imessage?", "y"),
+    ];
+    steps.extend(IMESSAGE_STEPS);
+    steps.extend([
+        (FORWARD_Q, "y"),
+        ("Approvals: how much", "\n"),
+        ("Add private facts", "n"),
+        ("Set up the web app", "n"),
+    ]);
+    let (code, shown) = env.on_a_driven_tty(&["init"], &steps);
+    assert!(
+        shown.contains("LEFT 0"),
+        "every prompt was answered: {shown}"
+    );
+    assert_eq!(code, 0, "{shown}");
+    let calls = env.calls();
+    find(&calls, &FORWARD);
+    let runs: Vec<&Vec<String>> = (calls.iter()).filter(|c| c.starts_with(&s(RUN))).collect();
+    assert_eq!(runs.len(), 2, "{calls:#?}");
+    assert!(
+        has_pair(runs[1], "-p", "127.0.0.1:7791:7791"),
+        "{:?}",
+        runs[1]
+    );
+    assert!(
+        !has_pair(runs[0], "-p", "127.0.0.1:7791:7791"),
+        "{:?}",
+        runs[0]
+    );
+    assert_eq!(at(&calls, &["docker", "restart"], ""), None, "{calls:#?}");
+}
+
+/// init's prompts up to web setup's restart question, for a fresh install that sets up the web app.
+fn init_into_web_setup(restart: &'static str) -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("Projects folder", "\n"),
+        ("Providers", "\n"),
+        ("Set up discord?", "n"),
+        ("Set up imessage?", "n"),
+        ("Approvals: how much", "\n"),
+        ("Add private facts", "n"),
+        ("Set up the web app", "y"),
+        ("Write [web] host", "y"),
+        ("Run `tailscale serve", "y"),
+        ("Start zephyr again", restart),
+    ]
+}
+
+/// The owner declined web setup's restart: init neither makes the container again nor restarts it.
+#[test]
+fn init_leaves_the_container_alone_when_the_web_restart_is_declined() {
+    let env = Env::new("init-web-declined");
+    env.init(&["--no-start"]);
+    let steps = init_into_web_setup("n");
+    let (code, shown) =
+        env.on_a_driven_tty_env(&["init"], &steps, &[("SHIM_TS_STATUS", TS_STATUS)]);
+    assert!(
+        shown.contains("LEFT 0"),
+        "every prompt was answered: {shown}"
+    );
+    assert_eq!(code, 0, "{shown}");
+    let calls = env.calls();
+    let runs = calls.iter().filter(|c| c.starts_with(&s(RUN))).count();
+    assert_eq!(runs, 1, "only init's first up: {calls:#?}");
+    assert_eq!(at(&calls, &["docker", "restart"], ""), None, "{calls:#?}");
+    assert!(shown.contains("zephyr up applies the changes"), "{shown}");
+}
+
+/// web setup started the container, then failed: init prints the error and starts nothing again.
+#[test]
+fn init_does_not_restart_again_after_web_setup_fails_past_its_restart() {
+    let env = Env::new("init-web-error");
+    env.init(&["--no-start"]);
+    let path = env.daemon().join("zephyr.toml");
+    let text = format!(
+        "{}\n[settings]\nstrong_channels = [\"tui\", \"chat\"]\n",
+        env.config()
+    );
+    std::fs::write(&path, text).unwrap();
+    let mut steps = init_into_web_setup("y");
+    steps.push(("Let an approval signed with a passkey", "y"));
+    let vars = [("SHIM_TS_STATUS", TS_STATUS), ("SHIM_SET_REFUSE", "no")];
+    let (code, shown) = env.on_a_driven_tty_env(&["init"], &steps, &vars);
+    assert!(
+        shown.contains("LEFT 0"),
+        "every prompt was answered: {shown}"
+    );
+    assert_eq!(code, 0, "{shown}");
+    assert!(shown.contains("web app: "), "the error is shown: {shown}");
+    let calls = env.calls();
+    let runs = calls.iter().filter(|c| c.starts_with(&s(RUN))).count();
+    assert_eq!(runs, 2, "init's first up and web setup's: {calls:#?}");
+    assert_eq!(at(&calls, &["docker", "restart"], ""), None, "{calls:#?}");
+}
+
+/// Under host networking the web app cannot run (DESIGN §4.3.3), so init does not offer it.
+#[test]
+fn init_under_host_networking_skips_the_web_app() {
+    let env = Env::new("init-host-web");
+    let projects = env.projects.display().to_string();
+    let (code, shown) = env.on_a_driven_tty(
+        &["init", "--network", "host", "--projects", &projects],
+        &[
+            ("Providers", "\n"),
+            ("Set up discord?", "n"),
+            ("Set up imessage?", "n"),
+            ("Approvals: how much", "\n"),
+            ("Add private facts", "n"),
+        ],
+    );
+    assert!(
+        shown.contains("LEFT 0"),
+        "every prompt was answered: {shown}"
+    );
+    assert_eq!(code, 0, "{shown}");
+    assert!(!shown.contains("Set up the web app"), "{shown}");
+    assert!(
+        shown.contains("web app: the web app needs the network floor"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn non_interactive_init_hints_at_channels_and_the_web_app() {
+    const CHANNEL: &str = "add a channel: zephyr channel add discord|imessage";
+    const WEB: &str = "web app: zephyr web setup";
+    let env = Env::new("init-hints");
+    let projects = env.projects.display().to_string();
+    let args = [
+        "init",
+        "--non-interactive",
+        "--no-start",
+        "--projects",
+        &projects,
+    ];
+    let text = env.ok(&args);
+    assert!(text.contains(CHANNEL) && text.contains(WEB), "{text}");
+    configure_an_install(&env);
+    let text = env.ok(&args);
+    assert!(!text.contains(CHANNEL) && !text.contains(WEB), "{text}");
+    // Under host networking there is no web app to set up.
+    let host = Env::new("init-hints-host");
+    let projects = host.projects.display().to_string();
+    let mut args = args.to_vec();
+    args[4] = &projects;
+    args.extend(["--network", "host"]);
+    let text = host.ok(&args);
+    assert!(text.contains(CHANNEL) && !text.contains(WEB), "{text}");
+}
+
+/// The owner's comments on host.toml's lines survive init writing them again.
+#[test]
+fn init_keeps_the_comments_on_the_lines_it_writes() {
+    let env = Env::new("init-decor");
+    env.init(&["--no-start"]);
+    let path = env.daemon().join("host.toml");
+    let projects = env.projects.canonicalize().unwrap().display().to_string();
+    std::fs::write(
+        &path,
+        format!("projects = {projects:?} # where I work\nnetwork = \"host\" # for now\n"),
+    )
+    .unwrap();
+    env.init(&["--no-start", "--network", "bridge"]);
+    let text = read(&path);
+    assert!(
+        text.contains(&format!("projects = {projects:?} # where I work\n")),
+        "{text}"
+    );
+    assert!(text.contains("network = \"bridge\" # for now\n"), "{text}");
 }
 
 #[test]
@@ -822,6 +1179,8 @@ fn up_build_passes_the_gh_token_as_a_secret_only() {
         .unwrap()
         .contains("GH_TOKEN set"));
     assert!(!format!("{calls:?}").contains(GH_TOKEN));
+    // The image's defaults, the full provider set: no build arg moves them.
+    assert!(!build.iter().any(|a| a == "--build-arg"), "{build:?}");
 
     // A missing image is pulled; a failed pull logs in with gh's token on stdin.
     let out = env.zephyr_env(&["up"], &[("SHIM_IMAGE_MISSING", "1")]);
@@ -837,6 +1196,59 @@ fn up_build_passes_the_gh_token_as_a_secret_only() {
         !calls.iter().any(|c| c[1] == "build"),
         "pull succeeded, so no build"
     );
+}
+
+/// This user's GitHub token goes only to ghcr.io: any other registry an image names (or Docker
+/// Hub, which `user/zephyr` is) would be handed it by `docker login`.
+#[test]
+fn pull_logs_in_with_the_gh_token_only_at_ghcr() {
+    let env = Env::new("pull-registry");
+    env.init(&["--no-start"]);
+    let failing = [
+        ("SHIM_IMAGE_MISSING", "1"),
+        ("SHIM_PULL_FAIL", "1"),
+        ("SHIM_BUILD_FAIL", "1"),
+    ];
+    let logins = |calls: &[Vec<String>]| {
+        calls
+            .iter()
+            .filter(|c| {
+                c.starts_with(&s(&["docker", "login"])) || c.starts_with(&s(&["gh", "api", "user"]))
+            })
+            .count()
+    };
+    for image in [
+        "registry.example.com/me/zephyr:1",
+        "user/zephyr:1",
+        "ghcr.io.evil.com/x:1",
+        "localhost:5000/z:1",
+    ] {
+        let mut vars = failing.to_vec();
+        vars.push(("ZEPHYR_IMAGE", image));
+        let out = env.zephyr_env(&["up"], &vars);
+        assert!(!out.status.success(), "{image}");
+        let calls = env.calls();
+        find(&calls, &["docker", "pull", image]);
+        assert_eq!(logins(&calls), 0, "{image}: {calls:#?}");
+        assert!(
+            stdout(&out).contains(&format!("{image} is not on ghcr.io: docker login")),
+            "{}",
+            stdout(&out)
+        );
+    }
+    let image = "ghcr.io/someone/zephyr:1";
+    let mut vars = failing.to_vec();
+    vars.push(("ZEPHYR_IMAGE", image));
+    env.zephyr_env(&["up"], &vars);
+    let calls = env.calls();
+    let login = find(&calls, &["docker", "login", "ghcr.io"]);
+    assert!(has_pair(login, "-u", "tester"), "{login:?}");
+    assert!(login.contains(&"--password-stdin".to_string()), "{login:?}");
+    let pulls = calls
+        .iter()
+        .filter(|c| c.starts_with(&s(&["docker", "pull", image])));
+    assert_eq!(pulls.count(), 2, "pulled again after the login: {calls:#?}");
+    assert!(!format!("{calls:?}").contains(GH_TOKEN));
 }
 
 #[test]
@@ -2142,6 +2554,75 @@ fn version_names_the_cli_and_the_running_container() {
     assert_eq!(stdout(&stopped), format!("zephyr {me}\n"));
 }
 
+/// The prompts `channel add imessage` asks, answered for a webhook on port 7791.
+const IMESSAGE_STEPS: [(&str, &str); 4] = [
+    ("Webhook listen address", "100.64.0.1:7791\n"),
+    ("BlueBubbles server URL", "http://100.64.0.2:1234\n"),
+    ("Your iMessage handles", "me@icloud.com\n"),
+    ("BlueBubbles server password (hidden)", "pw\n"),
+];
+const FORWARD_Q: &str = "Forward this machine's Tailscale port 7791 to the webhook?";
+const FORWARD: [&str; 6] = [
+    "tailscale",
+    "serve",
+    "--bg",
+    "--tcp",
+    "7791",
+    "tcp://127.0.0.1:7791",
+];
+
+/// Under the network floor BlueBubbles reaches the webhook only through `tailscale serve`, so
+/// `channel add imessage` offers the forward when it is missing, and only then.
+#[test]
+fn channel_add_imessage_offers_the_tailscale_forward() {
+    let env = Env::new("channel-forward");
+    env.init(&["--no-start"]);
+    let add = |answer: Option<&str>, vars: &[(&str, &str)]| {
+        let mut steps = IMESSAGE_STEPS.to_vec();
+        steps.extend(answer.map(|a| (FORWARD_Q, a)));
+        let (code, shown) = env.on_a_driven_tty_env(&["channel", "add", "imessage"], &steps, vars);
+        assert!(
+            shown.contains("LEFT 0"),
+            "every prompt was answered: {shown}"
+        );
+        (code, shown, env.calls())
+    };
+    let serves = |calls: &[Vec<String>]| at(calls, &["tailscale", "serve", "--bg"], "");
+
+    let (code, shown, calls) = add(Some("y"), &[]);
+    assert_eq!(code, 0, "{shown}");
+    find(&calls, &FORWARD);
+    assert!(env.config().contains("listen = \"100.64.0.1:7791\""));
+
+    // Already forwarded: not asked, not run.
+    let status = "tcp://box.tail1234.ts.net:7791 (tailnet only)\n|--> tcp://127.0.0.1:7791";
+    let (code, shown, calls) = add(None, &[("SHIM_TS_SERVE", status)]);
+    assert_eq!(code, 0, "{shown}");
+    assert!(!shown.contains(FORWARD_Q), "{shown}");
+    assert_eq!(serves(&calls), None, "{calls:#?}");
+
+    // Refused for want of operator rights: the sudo form, and the channel stays saved.
+    let (code, shown, calls) = add(Some("y"), &[("SHIM_TS_DENIED", "1")]);
+    assert_eq!(code, 0, "{shown}");
+    find(&calls, &FORWARD);
+    assert!(
+        shown.contains("sudo tailscale serve --bg --tcp 7791 tcp://127.0.0.1:7791"),
+        "{shown}"
+    );
+    assert!(env.config().contains("[imessage]"));
+
+    // Declined: the command to run later.
+    let (code, shown, calls) = add(Some("n"), &[]);
+    assert_eq!(code, 0, "{shown}");
+    assert_eq!(serves(&calls), None, "{calls:#?}");
+    assert!(
+        shown.contains(
+            "forward it later: sudo tailscale serve --bg --tcp 7791 tcp://127.0.0.1:7791"
+        ),
+        "{shown}"
+    );
+}
+
 #[test]
 fn channel_list_and_remove_edit_the_toml_and_secrets() {
     let env = Env::new("channel");
@@ -2289,6 +2770,121 @@ fn upgrade_replaces_the_cli_from_the_newer_image_first() {
         .contains("could not pull ghcr.io/yansigit/zephyr:latest"));
     assert_eq!(at(&env.calls(), &["docker", "build"], ""), None);
     assert!(!env.zephyr(&["upgrade", "v1.2"]).status.success());
+}
+
+/// With nothing set, the CLI runs this owner's published release, as it always has.
+#[test]
+fn default_image_is_the_owners_release() {
+    let env = Env::new("default-image");
+    let projects = env.projects.display().to_string();
+    let args = ["init", "--non-interactive", "--projects", &projects];
+    let out = env.zephyr_env(&args, &[("ZEPHYR_IMAGE", "")]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let image = format!("ghcr.io/yansigit/zephyr:{}", env!("CARGO_PKG_VERSION"));
+    let calls = env.calls();
+    find(&calls, &["docker", "image", "inspect", &image]);
+    assert_eq!(find(&calls, RUN).last(), Some(&image));
+}
+
+#[test]
+fn zephyr_repo_moves_the_image_and_keeps_the_gh_token_at_ghcr() {
+    let env = Env::new("zephyr-repo");
+    let cli = env.cli_copy();
+    let me = env!("CARGO_PKG_VERSION");
+    let repo = "registry.example.com/me/zephyr";
+    let vars = [
+        ("ZEPHYR_IMAGE", ""),
+        ("ZEPHYR_REPO", repo),
+        ("SHIM_LATEST", "99.0.0"),
+        ("SHIM_VERSION", me),
+    ];
+    let out = env.run_cli(&cli, &["upgrade"], &vars);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = env.calls();
+    find(&calls, &["docker", "pull", &format!("{repo}:latest")]);
+    let cat = ["docker", "run", "--rm", "--entrypoint", "cat"];
+    assert_eq!(find(&calls, &cat)[5], format!("{repo}:99.0.0"));
+
+    // Another registry is never handed the gh token: the owner logs in to it.
+    let _ = std::fs::remove_file(env.dir.join("env.log"));
+    let failing = [vars[0], vars[1], ("SHIM_PULL_FAIL", "1")];
+    let out = env.zephyr_env(&["upgrade"], &failing);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!("could not pull {repo}:latest")),
+        "{err}"
+    );
+    assert!(err.contains("docker login registry.example.com"), "{err}");
+    let calls = env.calls();
+    assert_eq!(at(&calls, &["docker", "login"], ""), None, "{calls:#?}");
+    assert_eq!(at(&calls, &["gh", "api", "user"], ""), None, "{calls:#?}");
+    let env_log = std::fs::read_to_string(env.dir.join("env.log")).unwrap_or_default();
+    assert!(!env_log.contains("GH_TOKEN"), "{env_log}");
+
+    // Empty is unset: the default repository.
+    let out = env.zephyr_env(
+        &["upgrade"],
+        &[vars[0], ("ZEPHYR_REPO", ""), ("SHIM_PULL_FAIL", "1")],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("could not pull ghcr.io/yansigit/zephyr:latest"),
+        "{err}"
+    );
+}
+
+/// image.yml publishes to this repository's own package, and tells the image's CLI so.
+#[test]
+fn the_image_workflow_tags_the_repository_it_runs_in() {
+    let yml = read(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../.github/workflows/image.yml"
+    )));
+    assert!(yml.contains(r#"echo "image=ghcr.io/${GITHUB_REPOSITORY,,}""#));
+    assert!(yml.contains("ZEPHYR_BUILD_REPO=${{ steps.v.outputs.image }}"));
+    assert!(yml.contains("${{ steps.v.outputs.image }}:${{ steps.v.outputs.version }}"));
+    let tags = yml.lines().filter(|l| l.contains("ghcr.io/yansigit"));
+    assert!(
+        tags.clone().all(|l| l.trim_start().starts_with('#')),
+        "{:?}",
+        tags.collect::<Vec<_>>()
+    );
+}
+
+/// The tag build smoke-tests every extension the CLI lists; a manual `providers: none` run builds
+/// the image without the owner's provider sources and checks that they are absent.
+#[test]
+fn the_image_workflow_smoke_tests_every_extension() {
+    let yml = read(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../.github/workflows/image.yml"
+    )));
+    assert!(yml.contains("test -f /usr/local/lib/libzephyr_policy.so"));
+    for ext in zephyr::host::conf::EXTENSIONS {
+        assert!(yml.contains(&format!("test -f {ext}")), "{ext}");
+    }
+    for want in [
+        "providers:",
+        "type: choice",
+        "default: full",
+        "options: [full, none]",
+        "RPI_PACKAGE_REPO=",
+        "PLUGINS_REPO=",
+        "test ! -e /opt/zephyr/ext/librpi_providers.so",
+        "test ! -e /opt/zephyr/ext/librpi_mcp_adapter.so",
+        "test ! -e /opt/zephyr/ext/rpi-claude-agent",
+    ] {
+        assert!(yml.contains(want), "{want}");
+    }
 }
 
 #[test]
@@ -2730,6 +3326,79 @@ fn host_edits_keep_what_the_daemon_wrote_meanwhile() {
     assert!(env.config().contains(edit), "{}", env.config());
 }
 
+/// A provider source is left out only when its repo arg is empty: with the arg set, a tree
+/// without the expected file fails the build instead of shipping an image without the providers.
+#[test]
+fn the_dockerfile_skips_a_provider_source_only_for_an_empty_arg() {
+    let text = read(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/Dockerfile"
+    )));
+    let stage = |name: &str| {
+        let start = text.find(&format!(" AS {name}\n")).unwrap();
+        let rest = &text[start..];
+        rest[..rest[1..].find("\nFROM ").map_or(rest.len(), |i| i + 1)].to_string()
+    };
+    for (name, arg, file) in [
+        ("rust", "RPI_PACKAGE_REPO", "/src/rpi-package/Cargo.toml"),
+        (
+            "plugins",
+            "PLUGINS_REPO",
+            "packages/rpi-claude-agent/scripts/stage.sh",
+        ),
+    ] {
+        let stage = stage(name);
+        assert!(stage.contains(&format!("\nARG {arg}\n")), "{name}: {stage}");
+        assert!(
+            stage.contains(&format!("if [ -n \"${arg}\" ]; then")),
+            "{name}: {stage}"
+        );
+        assert!(
+            !stage.contains(&format!("[ -f {file} ]")),
+            "{name}: {stage}"
+        );
+        assert!(
+            !stage.contains(&format!("[ -e {file} ]")),
+            "{name}: {stage}"
+        );
+    }
+}
+
+/// release.sh takes the rpi binary from `RPI_BIN` and the runner its repo from `ZEPHYR_GH_REPO`;
+/// unset, each is today's value, and bump-rpi.sh's rewrite of the pinned path still matches.
+#[test]
+fn release_and_runner_scripts_keep_their_defaults() {
+    let deploy = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy"));
+    for script in ["release.sh", "runner/start.sh", "bump-rpi.sh"] {
+        let ok = Command::new("bash")
+            .arg("-n")
+            .arg(deploy.join(script))
+            .status();
+        assert!(ok.unwrap().success(), "{script}");
+    }
+    let release = read(&deploy.join("release.sh"));
+    assert!(
+        release.contains("rpi=${RPI_BIN:-/home/user/Projects/.always-on/rpi-0.21.2/bin/rpi}"),
+        "{release}"
+    );
+    assert!(release.contains("export RPI_BIN=\"$rpi\""), "{release}");
+    // The owner's release installs and upgrades the defaults, whatever this shell points at.
+    let unset = "\nunset ZEPHYR_REPO ZEPHYR_BUILD_REPO ZEPHYR_IMAGE ZEPHYR_CONTAINER\n";
+    let at = release
+        .find(unset)
+        .expect("release.sh unsets the CLI's knobs");
+    assert!(
+        at < release.find("\ncargo install -q").unwrap(),
+        "{release}"
+    );
+    let runner = read(&deploy.join("runner/start.sh"));
+    assert!(
+        runner.contains("repo=${ZEPHYR_GH_REPO:-yansigit/zephyr}"),
+        "{runner}"
+    );
+    assert!(read(&deploy.join("bump-rpi.sh")).contains("rpi-$old/bin/rpi"));
+}
+
 /// Every file the image copies from the build context is let back in by `.dockerignore`
 /// (`*`, then `!PATH` per allowed path): one left out fails `docker build` at that COPY.
 #[test]
@@ -3016,4 +3685,254 @@ fn web_setup_needs_the_network_floor() {
         !env.calls().iter().any(|c| c[0] == "tailscale"),
         "nothing was asked of tailscale"
     );
+}
+
+/// What every install.sh run leaves out: no sudo, and nothing fetched off the web.
+fn fetches_nothing(calls: &[Vec<String>]) {
+    let bad = calls
+        .iter()
+        .find(|c| ["sudo", "curl", "wget"].contains(&c[0].as_str()));
+    assert!(bad.is_none(), "{bad:?}");
+}
+
+/// The files in `~/.local/bin`, sorted.
+fn local_bin(env: &Env) -> Vec<String> {
+    let dir = std::fs::read_dir(env.home.join(".local/bin"));
+    let mut names: Vec<String> = dir
+        .into_iter()
+        .flatten()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A new CLI and `init` would upgrade a live container through `up_checked`, so install.sh never
+/// goes on where zephyr already is, even when only its files are left after `zephyr down`.
+#[test]
+fn install_refuses_an_existing_install() {
+    let none = [("SHIM_NO_CONTAINER", "1")];
+    // The container; then each thing an install leaves, alone.
+    for (name, left) in [
+        ("container", ""),
+        ("daemon", ".zephyr-daemon"),
+        ("home", ".zephyr"),
+        ("cli", ".local/bin/zephyr"),
+    ] {
+        let env = Env::new(&format!("install-refuses-{name}"));
+        let vars: &[(&str, &str)] = if left.is_empty() { &[] } else { &none };
+        match left {
+            "" => {}
+            ".local/bin/zephyr" => {
+                std::fs::create_dir_all(env.home.join(".local/bin")).unwrap();
+                std::fs::write(env.home.join(left), "mine").unwrap();
+            }
+            _ => std::fs::create_dir_all(env.home.join(left)).unwrap(),
+        }
+        let out = env.install(&[], vars);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            said.contains("zephyr is installed here; upgrade with zephyr upgrade"),
+            "{said}"
+        );
+        let calls = env.calls();
+        let wrote = calls.iter().find(|c| {
+            c.starts_with(&s(&["docker", "pull"])) || c.starts_with(&s(&["cargo", "install"]))
+        });
+        assert!(wrote.is_none(), "{wrote:?}");
+        fetches_nothing(&calls);
+        match left {
+            ".local/bin/zephyr" => assert_eq!(read(&env.home.join(left)), "mine"),
+            _ => assert!(local_bin(&env).is_empty(), "{:?}", local_bin(&env)),
+        }
+    }
+}
+
+#[test]
+fn install_from_the_image_writes_the_cli_and_runs_init() {
+    let image = "ghcr.io/yansigit/zephyr:latest";
+    // The image's `zephyr --version`, which the copied CLI (the shim's: `zephyr <tag>`) must say.
+    let none = [("SHIM_NO_CONTAINER", "1"), ("SHIM_LATEST", "latest")];
+    let env = Env::new("install-image");
+    let out = env.install(&["--from-image", "--", "--non-interactive"], &none);
+    assert!(out.status.success(), "{out:?}");
+    let calls = env.calls();
+    find(&calls, &["docker", "pull", image]);
+    let cat = ["docker", "run", "--rm", "--entrypoint", "cat", image];
+    let want = s(&[&cat[..], &["/usr/local/bin/zephyr"]].concat());
+    assert_eq!(find(&calls, &cat), &want);
+    fetches_nothing(&calls);
+    assert_eq!(mode(&env.home.join(".local/bin/zephyr")), 0o755);
+    assert_eq!(local_bin(&env), ["zephyr"], "no temp file left");
+    assert_eq!(read(&env.dir.join("exec.log")), "init --non-interactive\n");
+
+    let env = Env::new("install-image-no-init");
+    let out = env.install(&["--from-image", "--no-init"], &none);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(mode(&env.home.join(".local/bin/zephyr")), 0o755);
+    assert_eq!(local_bin(&env), ["zephyr"], "no temp file left");
+    assert!(!env.dir.join("exec.log").exists(), "init did not run");
+    fetches_nothing(&env.calls());
+}
+
+/// A private ghcr.io package is pulled after a login as the gh user, the token on stdin; any
+/// other registry gets no login and no token.
+#[test]
+fn install_logs_in_only_at_ghcr_when_the_pull_fails() {
+    let env = Env::new("install-pull-fail");
+    let failing = [("SHIM_NO_CONTAINER", "1"), ("SHIM_PULL_FAIL", "1")];
+    let out = env.install(&["--from-image", "--no-init"], &failing);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let calls = env.calls();
+    let login = find(&calls, &["docker", "login"]);
+    let want = s(&[
+        "docker",
+        "login",
+        "ghcr.io",
+        "-u",
+        "tester",
+        "--password-stdin",
+    ]);
+    assert_eq!(login, &want);
+    let pulls = calls
+        .iter()
+        .filter(|c| c.starts_with(&s(&["docker", "pull"])));
+    assert_eq!(pulls.count(), 2, "pulled again after the login: {calls:#?}");
+    assert!(!format!("{calls:?}").contains(GH_TOKEN));
+    fetches_nothing(&calls);
+    assert!(local_bin(&env).is_empty(), "{:?}", local_bin(&env));
+
+    let mut vars = failing.to_vec();
+    vars.push(("ZEPHYR_REPO", "registry.example.com/me/zephyr"));
+    let out = env.install(&["--from-image", "--no-init"], &vars);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let calls = env.calls();
+    find(
+        &calls,
+        &["docker", "pull", "registry.example.com/me/zephyr:latest"],
+    );
+    let login = calls
+        .iter()
+        .find(|c| c.starts_with(&s(&["docker", "login"])) || c[0] == "gh");
+    assert!(login.is_none(), "{login:?}");
+    fetches_nothing(&calls);
+    assert!(local_bin(&env).is_empty(), "{:?}", local_bin(&env));
+}
+
+/// The CLI copied out must be the image's own: the same `zephyr --version` (as `fetch_cli` checks).
+#[test]
+fn install_refuses_a_copied_cli_that_is_not_the_images() {
+    let env = Env::new("install-version");
+    let vars = [("SHIM_NO_CONTAINER", "1"), ("SHIM_LATEST", "9.9.9")];
+    let out = env.install(&["--from-image", "--no-init"], &vars);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("zephyr 9.9.9"), "{said}");
+    find(
+        &env.calls(),
+        &["docker", "run", "--rm", "--entrypoint", "zephyr"],
+    );
+    assert!(local_bin(&env).is_empty(), "{:?}", local_bin(&env));
+}
+
+/// Arguments for `zephyr init` with `--no-init` would be dropped: a usage error instead.
+#[test]
+fn install_refuses_init_arguments_with_no_init() {
+    let env = Env::new("install-no-init-args");
+    let args = ["--no-init", "--", "--non-interactive"];
+    let out = env.install(&args, &[("SHIM_NO_CONTAINER", "1")]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("usage:"));
+    let calls = env.calls();
+    let went = calls
+        .iter()
+        .find(|c| c[0] == "cargo" || c.starts_with(&s(&["docker", "pull"])));
+    assert!(went.is_none(), "{went:?}");
+}
+
+/// Installed from another repository: from source the CLI is built to upgrade from it; from the
+/// image, whose CLI upgrades from where that image was built for, install.sh says to keep
+/// ZEPHYR_REPO set.
+#[test]
+fn install_from_another_repo_says_how_upgrade_finds_it() {
+    let repo = "registry.example.com/me/zephyr";
+    let env = Env::new("install-repo-source");
+    let vars = [("SHIM_NO_CONTAINER", "1"), ("ZEPHYR_REPO", repo)];
+    let out = env.install(&["--from-source", "--no-init"], &vars);
+    assert!(out.status.success(), "{out:?}");
+    let baked = read(&env.dir.join("cargo-env.log"));
+    assert_eq!(baked, format!("ZEPHYR_BUILD_REPO={repo}\n"));
+
+    let env = Env::new("install-repo-image");
+    let vars = [
+        ("SHIM_NO_CONTAINER", "1"),
+        ("SHIM_LATEST", "latest"),
+        ("ZEPHYR_REPO", repo),
+    ];
+    let out = env.install(&["--from-image", "--no-init"], &vars);
+    assert!(out.status.success(), "{out:?}");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains(&format!("keep ZEPHYR_REPO={repo} set")),
+        "{said}"
+    );
+
+    // The default repository needs neither.
+    let env = Env::new("install-repo-default");
+    let out = env.install(
+        &["--from-source", "--no-init"],
+        &[("SHIM_NO_CONTAINER", "1")],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let baked = read(&env.dir.join("cargo-env.log"));
+    assert_eq!(baked, "ZEPHYR_BUILD_REPO=unset\n");
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("keep ZEPHYR_REPO"));
+}
+
+#[test]
+fn install_from_source_runs_cargo_install() {
+    let env = Env::new("install-source");
+    let out = env.install(
+        &["--from-source", "--no-init"],
+        &[("SHIM_NO_CONTAINER", "1")],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let calls = env.calls();
+    find(
+        &calls,
+        &["cargo", "install", "--locked", "--path", "crates/zephyr"],
+    );
+    find(&calls, &["docker", "buildx", "version"]);
+    let pulled = calls.iter().any(|c| c.starts_with(&s(&["docker", "pull"])));
+    assert!(!pulled, "{calls:#?}");
+    fetches_nothing(&calls);
+    assert!(env.home.join(".cargo/bin/zephyr").exists());
+    assert!(local_bin(&env).is_empty(), "{:?}", local_bin(&env));
+    assert!(!env.dir.join("exec.log").exists(), "init did not run");
+}
+
+#[test]
+fn install_without_docker_names_its_install_page() {
+    let env = Env::new("install-no-docker");
+    let out = env.install(&[], &[("SHIM_DOCKER_DOWN", "1")]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let said = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+    assert!(
+        said.contains("https://docs.docker.com/engine/install/"),
+        "{said}"
+    );
+    let calls = env.calls();
+    assert!(!calls.iter().any(|c| c[0] == "cargo"), "{calls:#?}");
+    fetches_nothing(&calls);
+}
+
+#[test]
+fn install_sh_defaults_to_the_clis_repo() {
+    let script = read(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/install.sh"
+    )));
+    let default = format!("${{ZEPHYR_REPO:-{}}}", zephyr::host::DEFAULT_REPO);
+    assert!(script.contains(&default), "{default}");
 }

@@ -677,7 +677,8 @@ fn doctor_warns_when_an_extension_path_is_missing() {
     let text = stdout(&zephyr(&cfg, &["doctor"]));
     assert!(
         text.contains(&format!(
-            "warn {} does not exist: no child can load it",
+            "warn {} does not exist: no child can load it (the CLI and the image are out of \
+             step, or the image was built without it)",
             gone.display()
         )),
         "{text}"

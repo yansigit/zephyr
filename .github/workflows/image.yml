@@ -1,6 +1,9 @@
-# Publishes ghcr.io/yansigit/zephyr:<version> and :latest for each v* tag; `zephyr init` and
-# `zephyr upgrade` pull it. A manual run (`gh workflow run image.yml --ref <branch>`) builds :dev
-# without pushing anything.
+# Publishes ghcr.io/<this repository>:<version> and :latest for each v* tag (here
+# ghcr.io/yansigit/zephyr; a fork publishes to its own); `zephyr init` and `zephyr upgrade` pull it.
+# The name also goes in as build arg ZEPHYR_BUILD_REPO, so the image's CLI upgrades from where it came.
+# A manual run (`gh workflow run image.yml --ref <branch>`) builds :dev without pushing anything;
+# with `-f providers=none` it builds :dev-minimal, the image without the owner's provider sources
+# (both repo args empty, DESIGN §4.4 item 1), also never pushed.
 # Secret PROVIDER_REPOS_TOKEN: a fine-grained token with contents:read on yansigit/rpi-package and
 # yansigit/rpi-provider-plugins, passed to the build as the gh_token secret. It is only needed while
 # one of them is private; the build works without it when both are public.
@@ -11,6 +14,13 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      # A tag push has no inputs: empty reads as full.
+      providers:
+        description: "full: every provider source; none: without the owner's provider repos"
+        type: choice
+        default: full
+        options: [full, none]
 permissions:
   contents: read
   packages: write
@@ -19,6 +29,8 @@ jobs:
     runs-on: ${{ vars.ZEPHYR_RUNNER || 'ubuntu-24.04' }}
     # A hung build fails after an hour instead of burning GitHub's 6-hour limit in minutes.
     timeout-minutes: 60
+    env:
+      MINIMAL: ${{ inputs.providers == 'none' }}
     steps:
       # GitHub's runners have ~14 GB free, too little for this image's build; their preinstalled
       # SDKs free ~30 GB more. df shows the room in the log either way.
@@ -31,7 +43,9 @@ jobs:
       - id: v
         run: |
           case $GITHUB_REF in refs/tags/v*) v=${GITHUB_REF_NAME#v} ;; *) v=dev ;; esac
+          if [ "$MINIMAL" = true ]; then v=dev-minimal; fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
       - if: vars.ZEPHYR_RUNNER == ''
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - if: vars.ZEPHYR_RUNNER != ''
@@ -54,12 +68,17 @@ jobs:
           file: deploy/Dockerfile
           load: true
           tags: zephyr-smoke:ci
+          # An empty line (the full image) is dropped.
+          build-args: |
+            ZEPHYR_BUILD_REPO=${{ steps.v.outputs.image }}
+            ${{ env.MINIMAL == 'true' && 'RPI_PACKAGE_REPO=' || '' }}
+            ${{ env.MINIMAL == 'true' && 'PLUGINS_REPO=' || '' }}
           secrets: |
             gh_token=${{ secrets.PROVIDER_REPOS_TOKEN }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       # The paths are the image's extensions (EXTENSIONS in crates/zephyr/src/host/conf.rs) and the policy plugin.
-      - if: vars.ZEPHYR_RUNNER == ''
+      - if: vars.ZEPHYR_RUNNER == '' && env.MINIMAL != 'true'
         run: |
           docker run --rm zephyr-smoke:ci sh -c '
             set -e
@@ -72,15 +91,34 @@ jobs:
             test -f /opt/zephyr/ext/libzephyr_cursor.so
             test -f /opt/zephyr/ext/rpi-claude-agent/librpi_claude_agent.so
           '
+      # The minimal image: what stays, and none of what the two provider sources bring.
+      - if: vars.ZEPHYR_RUNNER == '' && env.MINIMAL == 'true'
+        run: |
+          docker run --rm zephyr-smoke:ci sh -c '
+            set -e
+            zephyr --version
+            rpi --version
+            test -x /usr/local/bin/zephyr
+            test -f /usr/local/lib/libzephyr_policy.so
+            test -f /opt/zephyr/ext/libzephyr_cursor.so
+            test ! -e /opt/zephyr/ext/librpi_providers.so
+            test ! -e /opt/zephyr/ext/librpi_mcp_adapter.so
+            test ! -e /opt/zephyr/ext/rpi-claude-agent
+          '
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: deploy/Dockerfile
-          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          # A tag push only, and never the minimal image.
+          push: ${{ startsWith(github.ref, 'refs/tags/v') && env.MINIMAL != 'true' }}
           # :latest only from a tag push, so a manual run on an old tag can't move it back.
           tags: |
-            ghcr.io/yansigit/zephyr:${{ steps.v.outputs.version }}
-            ${{ github.event_name == 'push' && 'ghcr.io/yansigit/zephyr:latest' || '' }}
+            ${{ steps.v.outputs.image }}:${{ steps.v.outputs.version }}
+            ${{ github.event_name == 'push' && format('{0}:latest', steps.v.outputs.image) || '' }}
+          build-args: |
+            ZEPHYR_BUILD_REPO=${{ steps.v.outputs.image }}
+            ${{ env.MINIMAL == 'true' && 'RPI_PACKAGE_REPO=' || '' }}
+            ${{ env.MINIMAL == 'true' && 'PLUGINS_REPO=' || '' }}
           secrets: |
             gh_token=${{ secrets.PROVIDER_REPOS_TOKEN }}
           # Hosted runners only: the fallback's remote BuildKit runs outside the job, without an Actions cache token.
