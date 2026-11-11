@@ -942,13 +942,15 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
             let old = parse(&doc)
                 .ok()
                 .and_then(|c| c.mcp.into_iter().find(|m| m.name == name));
-            // Said once, by the owner: `--plain` now, or a `plain` they wrote before.
-            let said = plain || old.as_ref().is_some_and(crate::broker::plain);
-            if let Some(why) = entry.plain_needed(url.as_deref()).filter(|_| !said) {
+            // Only this add's `--plain`: an old table's is no consent for this one (DESIGN §4.22).
+            if let Some(why) = entry.plain_needed(url.as_deref()).filter(|_| !plain) {
                 bail!("{why}: add --plain to hand it the real key, which the agent can then read");
             }
             let m =
                 crate::catalog::merged(entry.to_mcp(url.as_deref())?, old.as_ref(), &hosts, plain);
+            if let Some(note) = crate::catalog::lost_plain(old.as_ref(), &m) {
+                println!("{name}: {note}");
+            }
             conf::upsert_mcp(&mut doc, &m)?;
             let set = crate::dotenv::parse(&h.data.read("secrets.env").unwrap_or_default());
             let lacks = |s: &crate::catalog::Secret| !set.iter().any(|(k, _)| *k == s.name);

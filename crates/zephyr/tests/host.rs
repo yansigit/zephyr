@@ -1038,12 +1038,12 @@ fn mcp_add_from_the_catalog_writes_the_entry_and_keeps_the_owners_choices() {
         1,
         "{said}"
     );
-    // The owner narrows the hosts and lets a merge through; secrets.env gets the token.
+    // The owner widens the hosts and lets a merge through; secrets.env gets the token.
     let path = env.daemon().join("zephyr.toml");
     let edited = config
         .replace(
             "hosts = \"api.github.com, raw.githubusercontent.com\"",
-            "hosts = \"api.github.com\"",
+            "hosts = \"api.github.com, evil.test\"",
         )
         .replace(
             "merge_pull_request = \"posts\"",
@@ -1056,7 +1056,12 @@ fn mcp_add_from_the_catalog_writes_the_entry_and_keeps_the_owners_choices() {
     std::fs::write(&secrets, text).unwrap();
     let out = env.ok(&["mcp", "add", "--catalog", "github"]);
     let config = env.config();
-    assert!(config.contains("hosts = \"api.github.com\"\n"), "{config}");
+    // The class stays the owner's; the hosts are the entry's again, never an old table's.
+    assert!(
+        config.contains("hosts = \"api.github.com, raw.githubusercontent.com\""),
+        "{config}"
+    );
+    assert!(!config.contains("evil.test"), "{config}");
     assert!(config.contains("merge_pull_request = \"none\""), "{config}");
     assert!(config.contains("issue_write = \"posts\""), "{config}");
     assert_eq!(config.matches("[[mcp]]").count(), 1, "{config}");
@@ -1095,8 +1100,20 @@ fn catalog_entries_that_hold_their_key_in_plain_need_plain() {
     assert_eq!(config.matches("secrets = \"plain\"").count(), 2, "{config}");
     assert!(config.contains("http://ha.lan:8123/api/mcp"), "{config}");
     assert!(config.contains("hosts = \"ha.lan:8123\""), "{config}");
-    // Over HTTPS the stand-in works: no `--plain` needed.
-    env.ok(&[&ha[..], &["--url", "https://ha.example.com/api/mcp"]].concat());
+    // A `plain` written before is no consent for this add (review of #53).
+    refused(&["mcp", "add", "--catalog", "brave-search"]);
+    // Over HTTPS the stand-in works: no `--plain` needed, and the old `plain` goes, said.
+    let out = env.ok(&[&ha[..], &["--url", "https://ha.example.com/api/mcp"]].concat());
+    assert!(out.contains("now it holds a stand-in"), "{out}");
+    let config = env.config();
+    let ha = config
+        .split("[[mcp]]")
+        .find(|t| t.contains("home-assistant"))
+        .unwrap();
+    assert!(
+        !ha.contains("secrets") && ha.contains("hosts = \"ha.example.com\""),
+        "{config}"
+    );
 }
 
 #[test]

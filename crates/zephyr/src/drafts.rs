@@ -629,8 +629,8 @@ fn catalog_add(cfg: &Config, name: &str, rest: &[&str]) -> anyhow::Result<(Strin
         }
     }
     let old = cfg.mcp.iter().find(|m| m.name == name);
-    let said = plain || old.is_some_and(crate::broker::plain);
-    if let Some(why) = entry.plain_needed(url).filter(|_| !said) {
+    // Only this add's word: an old table's `plain` is no consent for this one (DESIGN §4.22).
+    if let Some(why) = entry.plain_needed(url).filter(|_| !plain) {
         bail!(
             "{why}: /mcp catalog add {name}{} plain hands it the real key, which the agent can then read",
             url.map(|u| format!(" {u}")).unwrap_or_default()
@@ -639,6 +639,9 @@ fn catalog_add(cfg: &Config, name: &str, rest: &[&str]) -> anyhow::Result<(Strin
     let m = crate::catalog::merged(entry.to_mcp(url)?, old, &[], plain);
     write_config(cfg, |doc| crate::host::conf::upsert_mcp(doc, &m))?;
     let mut reply = format!("[zephyr] connector {name} added to zephyr.toml");
+    if let Some(note) = crate::catalog::lost_plain(old, &m) {
+        reply += &format!("; {note}");
+    }
     let missing = missing(cfg, &m);
     if !missing.is_empty() {
         reply += &format!(
@@ -2341,6 +2344,61 @@ mod tests {
         };
         assert!(line("github").unwrap().ends_with("(added)"), "{catalog}");
         assert!(!line("context7").unwrap().ends_with("(added)"), "{catalog}");
+    }
+
+    /// Review of #53, 1: `plain` is the owner's word in this add, never an old table's.
+    #[test]
+    fn a_catalog_add_never_carries_plain_over_from_an_old_table() {
+        let cfg = with_catalog(brokered(
+            "[[mcp]]\nname = 'notion'\ncommand = 'old-notion'\nenv = { NOTION_TOKEN = '${NOTION_TOKEN}' }\nsecrets = 'plain'\n",
+        ));
+        let (reply, _) = say(&cfg, "/mcp catalog add notion");
+        let config = std::fs::read_to_string(cfg.path.as_ref().unwrap()).unwrap();
+        let notion = config
+            .split("[[mcp]]")
+            .find(|t| t.contains("\"notion\""))
+            .unwrap();
+        assert!(!notion.contains("secrets"), "{config}");
+        assert!(
+            reply.contains("it held its real secret before; now it holds a stand-in"),
+            "{reply}"
+        );
+        // Said in this add, it is plain.
+        say(&cfg, "/mcp catalog add notion plain");
+        let config = std::fs::read_to_string(cfg.path.as_ref().unwrap()).unwrap();
+        assert!(config.contains("secrets = \"plain\""), "{config}");
+        // An old plain is no consent for an entry that can only hold its real key.
+        let cfg = with_catalog(brokered(
+            "[[mcp]]\nname = 'brave-search'\ncommand = 'x'\nsecrets = 'plain'\n",
+        ));
+        let refused = say(&cfg, "/mcp catalog add brave-search").0;
+        assert!(refused.contains("X-Subscription-Token"), "{refused}");
+    }
+
+    /// Review of #53, 2 and 9: hosts come from the entry and its URL, never an old table; the
+    /// scheme is read as a URL's, in any case.
+    #[test]
+    fn a_catalog_add_binds_the_entrys_hosts_and_not_an_old_tables() {
+        let cfg = with_catalog(brokered(
+            "[[mcp]]\nname = 'github'\ncommand = 'x'\nhosts = 'api.github.com, evil.test'\n\
+             [[mcp]]\nname = 'home-assistant'\ncommand = 'x'\nhosts = 'old.home.test'\n",
+        ));
+        say(&cfg, "/mcp catalog add github");
+        say(
+            &cfg,
+            "/mcp catalog add home-assistant https://new.home.test/api/mcp",
+        );
+        let cfg = Config::load(cfg.path.as_ref().unwrap()).unwrap();
+        let hosts = |n: &str| cfg.mcp.iter().find(|m| m.name == n).unwrap().hosts.clone();
+        assert_eq!(hosts("github"), "api.github.com, raw.githubusercontent.com");
+        assert_eq!(hosts("home-assistant"), "new.home.test");
+        let cfg = with_catalog(cfg);
+        let upper = say(
+            &cfg,
+            "/mcp catalog add home-assistant HTTP://ha.lan:8123/api/mcp",
+        )
+        .0;
+        assert!(upper.contains("only over HTTPS"), "{upper}");
     }
 
     /// DESIGN §4.22: only a strong channel adds a catalog entry, a web decision needs a passkey,

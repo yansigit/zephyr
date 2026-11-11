@@ -131,7 +131,8 @@ impl Entry {
         if let Some(why) = &self.plain_reason {
             return Some(why.clone());
         }
-        let http = url.is_some_and(|u| u.starts_with("http://"));
+        let parsed = url.and_then(|u| url::Url::parse(u).ok());
+        let http = parsed.is_some_and(|u| u.scheme() == "http");
         (http && !self.secrets.is_empty()).then(|| {
             format!(
                 "{} at an http:// URL gets its key as it is: zephyr swaps a stand-in only over HTTPS",
@@ -142,15 +143,13 @@ impl Entry {
 }
 
 /// The connector to write for `entry`'s table `new`, over the owner's `old` one of that name (D4):
-/// the owner's hosts stay unless `hosts` names some, the owner's class wins per tool, and
-/// `secrets = "plain"` is written only when `plain` says so (an old `plain` stays).
+/// the owner's class wins per tool, and nothing else of the old table is kept. Its hosts are
+/// the entry's (`{host}` from this add's URL) unless `hosts`, given in this same add, names
+/// others, and `secrets = "plain"` is written only when `plain`, this add's word, says so: an
+/// old table's binding or `plain` is never consent for what this one is.
 pub fn merged(mut new: Mcp, old: Option<&Mcp>, hosts: &[String], plain: bool) -> Mcp {
     if let Some(old) = old {
-        if !old.hosts.trim().is_empty() {
-            new.hosts = old.hosts.clone();
-        }
         new.classes.extend(old.classes.clone());
-        new.secrets = old.secrets.clone();
     }
     if !hosts.is_empty() {
         new.hosts = hosts.join(", ");
@@ -159,6 +158,13 @@ pub fn merged(mut new: Mcp, old: Option<&Mcp>, hosts: &[String], plain: bool) ->
         new.secrets = Some("plain".into());
     }
     new
+}
+
+/// What the owner is told when the connector `new` replaced was `plain` and `new` is not.
+pub fn lost_plain(old: Option<&Mcp>, new: &Mcp) -> Option<&'static str> {
+    (old.is_some_and(crate::broker::plain) && !crate::broker::plain(new)).then_some(
+        "it held its real secret before; now it holds a stand-in (say plain in the add to hand it the real one)",
+    )
 }
 
 /// The entry `dir/NAME.toml`.
