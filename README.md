@@ -737,8 +737,9 @@ what is said as it is said.
   10:00 to 18:00 on weekends, their time) `/ok` answers when it can go and the call keeps waiting.
 - **Only Canadian local and toll-free numbers.** Never an emergency or short code (911, 811, 988),
   a 900 number, a US or Caribbean number, or anything the agent says is a hospital, clinic or
-  pharmacy: make those calls yourself. Calls are in English, or Korean in an image built with
-  `KO_VOICE=1`.
+  pharmacy: make those calls yourself. Toll-free numbers are refused too (they are shared with
+  the US and many are crisis or health lines) unless you turn them on yourself:
+  `/set calls.toll_free true` in the TUI or `zephyr chat`. Calls are in English, French or Korean.
 - **During the call** you get the transcript on the channel you asked on, a few lines at a time:
   `[call #9 0:42] them: "Seven is full, we have seven thirty" · agent: "Seven thirty, please."`.
   `/hangup` (or `/hangup 9`) ends it at once from any channel; so do `/stop` and `/pause`. A call
@@ -747,7 +748,11 @@ what is said as it is said.
 - **Private facts are not said.** A sentence holding one of your private facts is replaced by
   "That is something I can't share on this call", and you are told which fact. To let one be said
   to a number: `/facts allow NAME tel:+14165550123`.
-- **Nothing is recorded.** Speech is transcribed and spoken on this machine; only the text is
+- **Speech is Telnyx's by default** (`calls.speech = provider`): it transcribes the other party
+  and speaks zephyr's lines, quickly, and so hears the call. Every line still passes through
+  zephyr as text first. `/set calls.speech local` keeps speech on this machine (whisper and
+  Piper: English, Korean with `KO_VOICE=1`, no French), at several seconds a turn.
+- **Nothing is recorded.** zephyr keeps no audio and never asks Telnyx to record; only the text is
   kept, for `calls.keep_days` (30). What the other party said is treated like a file someone sent
   you: the agent reads it as data, and a memory change after a call waits for `/memory ok`.
 
