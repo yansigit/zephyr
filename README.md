@@ -1019,6 +1019,56 @@ message.send.backend.auth.cmd = "printenv MAIL_PASSWORD"
 The first `himalaya` command run with `secrets: ["MAIL_PASSWORD"]` asks you to allow
 `MAIL_PASSWORD` for `himalaya`.
 
+## Virtual cards
+
+At a checkout the agent can ask for a virtual card instead of using a card of yours (DESIGN
+§4.22). It is off until you pick a provider. Set your currency first: the cap and the limits
+count in it.
+
+```sh
+zephyr config set approvals.currency CAD
+zephyr config set approvals.strong_only loosen,money    # needed for manual
+zephyr config set cards.provider manual                 # or link
+```
+
+- **What you approve.** The card names what it pays by its address, the thing zephyr checks
+  when it fills the card, and shows the agent's name for the shop on a line of its own:
+
+  ```
+  [zephyr] approve #7: payment (virtual card)
+  pays: https://www.amazon.ca · the number is filled only there
+  card: one you make for this purchase · up to 42.50 CAD · forgotten 15 min after you enter it
+  merchant (the agent's words): "Amazon.ca"
+  the agent says: "the 2 kg bag of rice from your list"
+  window: 1 of 5 payments in the last 10 min
+  /ok 7 · /no 7 · expires in 10 min · this one needs tui or chat or passkey
+  ```
+
+- **`manual`**: after your `/ok` (from the TUI, the host or the web app's passkey), make a
+  card for this purchase in your own card app: a new digital card with about that much behind
+  it, or a prepaid card loaded to the amount. Never your main card: zephyr cannot limit a card
+  it did not issue, so the balance behind it is the cap. Enter it on the host with
+  `zephyr card put 7`, which asks for the number, the expiry and the code without showing them.
+  The number stays in zephyr's memory, is typed only into a page on the approved address, and
+  is forgotten after `cards.minutes` (15). zephyr sees no charge on such a card: check your card
+  app, delete the card there, then `/card done 7` (it reminds you once a day until you do).
+- **`link`** (Stripe's Link Agent Wallet): `zephyr vault add service cards --provider link
+  --account CLIENT_ID`, then `zephyr card link` to sign in. Each card is then a request you
+  approve in Link with your fingerprint or passkey: zephyr checks it first (the cap, the address,
+  the payment window) and sends you Link's approval link, with no `/ok` of its own. The card is
+  single use and closed when Link reports the charge. This provider is built from Link's
+  published documents and has not yet been run with a real account.
+- **The number never reaches the agent.** Wherever it would show in a command's output or a
+  reply it reads `[card:#7]`. `/card` lists your cards; `/card close 7` closes one early. `/stop`
+  and `/pause` close every open card.
+- **Limits** (`/settings`): `cards.max` (100) is the most one card may be for. The **payment
+  window** covers every payment, not only cards: past `approvals.window.effects` payments (5)
+  or `approvals.window.amount` (your `auto N` cap, when you set one) in
+  `approvals.window.seconds` (600), the next payment waits for a strong channel whatever your
+  approval mode, so a purchase split into several small ones is caught.
+- A checkout that writes its total with a bare `$` is read as US dollars. With cards in another
+  dollar, its Pay click is then asked about again rather than let through on the card.
+
 ## The agent's network
 
 The container runs on a Docker network of its own, and the agent has no direct route out of it. Its

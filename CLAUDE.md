@@ -121,6 +121,20 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   main), stores a 30-minute one-time pass, or answers the waiting wrapper (`Waits`); `/no`,
   `/cancel`, `/held`, and the tick's due delays and expiry (24 h, a browser wait 10 min). A delay
   never goes late: pause, `/resume`, `/stop` and start put it back to `pending` with its card.
+- `cards.rs` (DESIGN §4.22): virtual cards. Main's `card` tool asks for one (`request`); the gate
+  reads it as a payment of kind `card` (`gate::card_request`: an https origin, at most
+  `cards.max`, in `approvals.currency`) and `cards::issue` takes a `gate::Checked`, so no card is
+  issued without the gate. `Issuer` is the provider trait (`AnyIssuer`: `Manual`, the owner's own
+  card typed in with `zephyr card put N`; `Link`, `cards_link.rs`, Stripe's Link Agent Wallet,
+  whose own approval replaces zephyr's `/ok`; `Fake` for tests, behind the hidden
+  `Config::cards_fake`). A number lives only in `cards::live` (memory, keyed by the state folder)
+  and `vault::scrub` turns it into `[card:#N]` in everything the daemon scrubs; it reaches the
+  daemon in a chat line's `card` field (`chat::take_card` → `cards::enter`), never an inbox row.
+  `cards::fill` types it only on the card's origin; an open card lets its own Pay click through
+  within its cap (`Gate::card_covers`). The tick closes a card at its charge or its expiry, and
+  `/stop`, `/pause` and a start close what is open. **The payment window** (`gate::window_over`,
+  `[approvals.window]`, the `payments` table): past N payments or an amount in S seconds, any
+  payment is held `strong` (its `/ok` needs a strong channel whatever `strong_only` says).
 - `facts.rs` (DESIGN §4.18): private facts in `<state>/facts.toml` (root, 0600, read fresh).
   `found`/`scrub` match a value however it is written (NFKC, case, spacing, invisible characters,
   digit runs, percent and base64 forms; at least 6 digits or 4 characters); a fact's `allow` is
@@ -274,6 +288,8 @@ router's 5 s housekeeping tick) is a hidden field like `stall_limit`; tests that
 reorder (a task's report may be steered into main's running turn). CI (`.github/workflows/ci.yml`)
 runs fmt, clippy and the tests on Rust 1.95 and `cargo deny check advisories bans`;
 `ZEPHYR_REAL_RPI=1` makes the ignored real-rpi tests fail instead of skip when the binary is missing.
+`tests/cards_link.rs` runs the Link issuer against a stub of Link's API; its ignored
+`a_real_link_card_for_one_dollar` is the owner's spike (`ZEPHYR_LINK_LIVE=1`, after `zephyr card link`).
 
 ## Conventions
 

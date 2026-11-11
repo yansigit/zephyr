@@ -256,7 +256,7 @@ pub fn decide(
                 &req.session,
                 &req.tool,
                 &scrub.json(&req.args),
-                "refused",
+                "denied",
             );
             return Verdict::Deny(why);
         }
@@ -5074,7 +5074,7 @@ mod tests {
         }
         assert!(h.store.held_actions().unwrap().is_empty());
         assert!(notices(&h.store).is_empty());
-        assert!(outcomes(&h.store).iter().all(|o| o == "refused"));
+        assert!(outcomes(&h.store).iter().all(|o| o == "denied"));
         assert_eq!(h.store.payments_since(0, "CAD").unwrap().0, 0);
         // The largest card is cards.max itself, and an amount as a number reads the same.
         let mut top = card_of("100");

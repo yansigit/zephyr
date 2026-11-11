@@ -50,6 +50,67 @@ pub fn caps(cfg: &Config) -> Option<Caps> {
     }
 }
 
+/// `status`'s line: the provider, and for Link whether the daemon is signed in. Never a key.
+pub fn status(cfg: &Config) -> String {
+    match provider(cfg) {
+        None => "cards: off".into(),
+        Some("link") => match cfg.state_dir().join(crate::cards_link::TOKENS).exists() {
+            true => "cards: link, connected".into(),
+            false => "cards: link, not connected (zephyr card link)".into(),
+        },
+        Some(other) => format!("cards: {other}"),
+    }
+}
+
+/// `doctor`'s lines, each `ok|warn <what>`: whether the provider can be reached at all, and
+/// the currency cards count in. A key is named as saved or not, never shown.
+pub fn doctor(cfg: &Config) -> Vec<String> {
+    let Some(provider) = provider(cfg) else {
+        return vec!["ok   cards: off".into()];
+    };
+    let mut lines = Vec::new();
+    match provider {
+        "link" => {
+            let vault = crate::vault::Vault::load(&crate::vault::path(cfg)).ok();
+            let service = vault
+                .and_then(|v| v.service("cards"))
+                .filter(|s| s.provider == "link");
+            lines.push(match service.is_some_and(|s| !s.account.is_empty()) {
+                true => "ok   cards: link, its client id is saved".into(),
+                false => "warn cards: link has no client id: zephyr vault add service cards \
+                          --provider link --account CLIENT_ID"
+                    .into(),
+            });
+            lines.push(
+                match cfg.state_dir().join(crate::cards_link::TOKENS).exists() {
+                    true => "ok   cards: zephyr is signed in to Link; you approve each card there"
+                        .into(),
+                    false => "warn cards: not signed in to Link: zephyr card link".into(),
+                },
+            );
+        }
+        "manual" => lines.push(
+            "ok   cards: manual, no key needed: you make each card and enter it with zephyr \
+             card put N"
+                .into(),
+        ),
+        other => lines.push(format!("ok   cards: {other}")),
+    }
+    let currency = crate::approvals::currency(cfg);
+    let set = cfg.approvals.as_ref().is_some_and(|a| a.currency.is_some());
+    lines.push(match set {
+        true => format!(
+            "ok   cards: up to {} each, open {} min",
+            crate::approvals::money(max_minor(cfg), &currency),
+            minutes(cfg)
+        ),
+        false => "warn cards: approvals.currency is unset, so cards and their caps are in USD; \
+                  set it, e.g. zephyr config set approvals.currency CAD"
+            .into(),
+    });
+    lines
+}
+
 /// What a provider can bind and report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Caps {
@@ -1517,6 +1578,53 @@ mod tests {
         assert!(entered("cli-1-2").is_none());
         assert_eq!(entered("cli-1-1").unwrap().last4(), "4242");
         assert!(entered("cli-1-1").is_none());
+    }
+
+    #[test]
+    fn doctor_and_status_name_the_provider_and_never_a_key() {
+        let dir = crate::test_dir("cards-doctor");
+        let cfg = |extra: &str| -> Config {
+            toml::from_str(&format!("rpi = '/r'\nhome = {dir:?}\n{extra}")).unwrap()
+        };
+        assert_eq!(doctor(&cfg("")), ["ok   cards: off"]);
+        assert_eq!(status(&cfg("")), "cards: off");
+        let manual = cfg("[approvals]\ncurrency = 'CAD'\nstrong_only = ['loosen', 'money']\n[cards]\nprovider = 'manual'\n");
+        assert_eq!(
+            doctor(&manual),
+            [
+                "ok   cards: manual, no key needed: you make each card and enter it with zephyr card put N",
+                "ok   cards: up to 100.00 CAD each, open 15 min",
+            ]
+        );
+        let link = cfg("[cards]\nprovider = 'link'\n");
+        assert_eq!(
+            status(&link),
+            "cards: link, not connected (zephyr card link)"
+        );
+        let lines = doctor(&link);
+        assert!(
+            lines[0].starts_with("warn cards: link has no client id"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[1],
+            "warn cards: not signed in to Link: zephyr card link"
+        );
+        assert!(
+            lines[2].starts_with("warn cards: approvals.currency is unset"),
+            "{lines:?}"
+        );
+        let service = "[[service]]\nname = \"cards\"\nprovider = \"link\"\nkey = \"sk_doctorkey42\"\naccount = \"lwlpk_x\"\n";
+        std::fs::write(dir.join("vault.toml"), service).unwrap();
+        std::fs::write(dir.join(crate::cards_link::TOKENS), "{}").unwrap();
+        let lines = doctor(&link);
+        assert_eq!(lines[0], "ok   cards: link, its client id is saved");
+        assert_eq!(
+            lines[1],
+            "ok   cards: zephyr is signed in to Link; you approve each card there"
+        );
+        assert_eq!(status(&link), "cards: link, connected");
+        assert!(!format!("{lines:?}").contains("sk_doctorkey42"));
     }
 
     #[tokio::test]

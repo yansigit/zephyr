@@ -529,6 +529,7 @@ async fn status(cfg: &Config) -> anyhow::Result<()> {
         println!("web: {state}");
     }
     println!("{}", zephyr::voice::status(cfg));
+    println!("{}", zephyr::cards::status(cfg));
     // The router's view, written with the heartbeat: `<unix> <main up> <failed starts>`.
     let file = std::fs::read_to_string(cfg.state_dir().join(HEARTBEAT)).unwrap_or_default();
     match file.split_whitespace().collect::<Vec<_>>()[..] {
@@ -814,6 +815,10 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     }
     // Warnings, not failures: voice is an extra the image brings (DESIGN §4.3).
     for line in zephyr::voice::doctor(cfg).await {
+        println!("{line}");
+    }
+    // Warnings too: virtual cards are the owner's to set up (DESIGN §4.22).
+    for line in zephyr::cards::doctor(cfg) {
         println!("{line}");
     }
     // Warnings, not failures: the agent's command-line tools from the image (DESIGN §4.11).
