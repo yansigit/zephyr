@@ -112,6 +112,15 @@ pub struct Config {
     /// `[approvals]`: how messages, posts and payments wait for the owner (approvals spec §4.3).
     /// Absent is the `manual` preset. `approvals::effective` reads it.
     pub approvals: Option<Approvals>,
+    /// `[voice]`: voice notes in and spoken replies out (DESIGN §4.3). `Config::voice` reads it.
+    pub voice: Option<Voice>,
+    /// The image's voice folder (`voice::DIR`): ffmpeg, whisper-cli, Piper, models and voices.
+    /// Not configurable; tests point it at small fakes.
+    #[serde(skip, default = "voice_dir")]
+    pub voice_dir: PathBuf,
+    /// How long one whisper run may take before it is killed. Not configurable; tests shorten it.
+    #[serde(skip, default = "voice_wait")]
+    pub voice_wait: std::time::Duration,
     /// The file this was loaded from, which a reload reads again. `None` when built in memory.
     #[serde(skip)]
     pub path: Option<PathBuf>,
@@ -168,6 +177,14 @@ fn telegram_api() -> String {
 
 fn signal_cli() -> PathBuf {
     PathBuf::from("/opt/zephyr/signal/bin/signal-cli")
+}
+
+fn voice_dir() -> PathBuf {
+    PathBuf::from(crate::voice::DIR)
+}
+
+fn voice_wait() -> std::time::Duration {
+    std::time::Duration::from_secs(3 * 60)
 }
 
 fn web_lockout() -> std::time::Duration {
@@ -304,6 +321,32 @@ pub fn hh_mm(at: &str) -> Option<(u32, u32)> {
     };
     let (h, m) = (two(h)?, two(m)?);
     (h < 24 && m < 60).then_some((h, m))
+}
+
+/// `[voice]` (DESIGN §4.3).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Voice {
+    /// Whether an owner's voice note is transcribed.
+    pub transcribe: bool,
+    /// `off`, `mirror` (a reply to a voice note is also spoken) or `always`.
+    pub reply: String,
+    /// whisper's language codes. A note detected as another is run again as the first; with
+    /// one entry nothing is detected.
+    pub languages: Vec<String>,
+    /// A longer note is not transcribed, 10 to 900.
+    pub max_secs: u64,
+}
+
+impl Default for Voice {
+    fn default() -> Self {
+        Self {
+            transcribe: true,
+            reply: "mirror".into(),
+            languages: vec!["ko".into(), "en".into()],
+            max_secs: 300,
+        }
+    }
 }
 
 /// `[tasks]` (DESIGN §4.12).
@@ -515,7 +558,7 @@ impl Config {
 
     /// A reloaded file keeps the running daemon's values of the fields no file sets (`tick`,
     /// `stall_limit`, `min_until`, `job_timeout`, `exec_backstop`, `path`, `projects`,
-    /// `agent_browser`, `push_hosts`, `web_lockout`, `web_ping`): a reload changes settings,
+    /// `agent_browser`, `push_hosts`, `web_lockout`, `web_ping`, `voice_dir`, `voice_wait`): a reload changes settings,
     /// never these (R30).
     pub fn keep_hidden(&mut self, running: &Config) {
         self.job_timeout = running.job_timeout;
@@ -540,6 +583,8 @@ impl Config {
         self.desktop_idle = running.desktop_idle;
         self.desktop_cap = running.desktop_cap;
         self.desktop_gone = running.desktop_gone;
+        self.voice_dir = running.voice_dir.clone();
+        self.voice_wait = running.voice_wait;
     }
 
     /// Account names become directory names, so each must be a plain, unique path segment.
@@ -565,6 +610,11 @@ impl Config {
         (self.memory.as_ref())
             .and_then(|m| m.notify.as_deref())
             .unwrap_or("each")
+    }
+
+    /// `[voice]`, with its defaults when the table or a key is absent.
+    pub fn voice(&self) -> Voice {
+        self.voice.clone().unwrap_or_default()
     }
 
     /// `[review] at`, when the daily review is on.
@@ -609,6 +659,20 @@ impl Config {
         if self.digest() && self.review_at().is_none() {
             anyhow::bail!(
                 "[memory] notify = \"digest\" needs [review] at: the digest goes in the daily review"
+            );
+        }
+        let voice = self.voice();
+        if !crate::voice::REPLIES.contains(&voice.reply.as_str()) {
+            anyhow::bail!("[voice] reply must be off, mirror or always");
+        }
+        if !(10..=900).contains(&voice.max_secs) {
+            anyhow::bail!("[voice] max_secs must be 10 to 900");
+        }
+        // Each goes into whisper's argv, so only its own codes.
+        let known = |l: &String| crate::voice::LANGUAGES.contains(&l.as_str());
+        if voice.languages.is_empty() || !voice.languages.iter().all(known) {
+            anyhow::bail!(
+                "[voice] languages must be whisper's language codes, e.g. [\"ko\", \"en\"]"
             );
         }
         if !(1..=32).contains(&self.parallel_tasks()) {

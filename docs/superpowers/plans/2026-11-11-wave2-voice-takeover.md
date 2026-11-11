@@ -107,7 +107,7 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
 - The fake scripts append one JSON line per run to `voice_dir/log` (their environment is cleared, so no variable can name it; they find the folder from their own path): `{"prog", "uid", "argv", "sha256"}`, the hash being of their stdin or fd 3. Tests copy the fixture folder into a temp dir first. The fake whisper prints the text found in `voice_dir/say` (default `hello from the fake`), sleeps when `voice_dir/hang` exists, and prints its language line as the real binary does (C2-9 pins that shape against 1.9.5).
 - `egress::ruleset` gains `meta skuid 65534 reject` in the `output` chain, after the agent's jump.
 
-- [ ] **Step 1: Failing tests** in `voice.rs` and `egress.rs`:
+- [x] **Step 1: Failing tests** in `voice.rs` and `egress.rs`:
   - `lines_read_as_the_spec_writes_them` (the five strings above, `300` → `5:00`);
   - `a_transcript_is_one_clean_line_cut_at_4000` (input with `\n`, `\u{202e}`, `\u{0007}` and 5000 characters);
   - `the_decoders_get_the_fetched_bytes_on_fd_3_and_a_cleared_environment` (the log's sha256 equals the input's; argv holds `/proc/self/fd/3`; no `HOME` in the fake's environment);
@@ -116,10 +116,16 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
   - `a_note_over_max_secs_is_not_given_to_whisper`;
   - `a_language_outside_the_list_is_run_again_as_the_first`;
   - `the_floor_refuses_nobody` (`ruleset(1000)` contains `meta skuid 65534 reject`).
-- [ ] **Step 2: Run** `cargo test -p zephyr --lib voice::` → FAIL.
-- [ ] **Step 3: Implement.** memfds through `libc::memfd_create` with `MFD_ALLOW_SEALING`, sealed after the write; `pre_exec` does `dup2` to fd 3, `setgroups(0)`, `setgid`, `setuid` when root, and `setpgid(0, 0)`; `nice(10)`; a `tokio::sync::Semaphore` of 1; threads `min(8, nproc / 2)`. A timeout kills the process group.
-- [ ] **Step 4: Run** the same → PASS; then `cargo test -p zephyr`.
-- [ ] **Step 5: Commit** `feat(voice): transcribe audio with whisper as nobody, one note at a time`.
+- [x] **Step 2: Run** `cargo test -p zephyr --lib voice::` → FAIL.
+- [x] **Step 3: Implement.** memfds through `libc::memfd_create` with `MFD_ALLOW_SEALING`, sealed after the write; `pre_exec` does `dup2` to fd 3, `setgroups(0)`, `setgid`, `setuid` when root, and `setpgid(0, 0)`; `nice(10)`; a `tokio::sync::Semaphore` of 1; threads `min(8, nproc / 2)`. A timeout kills the process group.
+- [x] **Step 4: Run** the same → PASS; then `cargo test -p zephyr`.
+- [x] **Step 5: Commit** `feat(voice): transcribe audio with whisper as nobody, one note at a time`.
+- Deviation: the drop to `nobody` is `Command::uid`/`gid` (std also calls `setgroups(0)` when root), not hand-written calls in `pre_exec`; `pre_exec` does only the `dup2`s and `nice(10)`, and the process group is `process_group(0)`.
+- Deviation: whisper-cli runs without `-np`: as far as is known that flag also drops the `auto-detected language` line, and with `-nt` only the text goes to stdout either way. C2-9 pins this against 1.9.5 (`voice::whisper_args`, `voice::detected`).
+- Deviation: one more hidden field, `Config::voice_wait` (3 min, whisper's limit), which the hang test shortens; decision 8 does not list it.
+- Deviation: `voice::gpu` is the device check plus "a failed run on the GPU is done again with `-ng`, as every later one is". It does not read the Vulkan device's name or spot `llvmpipe`: whisper's output for that is unknown until C2-9.
+- Deviation: the fakes are one script, `bin/ffmpeg`, with `bin/whisper-cli` and `py/bin/python` as links to it; it also logs `env`, `start` and `end`, and has the markers `lang`, `secs`, `slow` and `piper_fail`.
+- Deviation: `[voice] languages` takes only whisper's own codes (`voice::LANGUAGES`), checked in `Config::validate`, since each goes into argv.
 
 ### Task C2-3: `inbox::append` transcribes what it fetched
 
