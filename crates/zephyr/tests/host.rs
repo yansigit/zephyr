@@ -494,6 +494,10 @@ fn init_asks_for_a_preset_and_writes_it() {
             ("Kind", &format!("{DOWN}\n")),
             ("value of pin (hidden)", &format!("{PIN}\n")),
             ("Add another fact?", "n"),
+            (
+                "Set up the web app (needs Tailscale with HTTPS certificates)?",
+                "n",
+            ),
         ],
     );
     assert!(
@@ -555,6 +559,184 @@ fn init_network_flag_sets_and_keeps_the_mode() {
     assert!(out.status.success());
     assert!(host().contains("network = \"bridge\""), "{}", host());
     assert!(stdout(&out).contains("network: bridge (the agent's network floor)"));
+}
+
+/// What an owner's install holds: two accounts, Discord, iMessage, the web app and a preset.
+fn configure_an_install(env: &Env) {
+    env.init(&[
+        "--no-start",
+        "--account",
+        "codex-a=openai-codex/gpt-5.5",
+        "--account",
+        "claude-a=anthropic/claude-sonnet-5",
+    ]);
+    env.ok(&["config", "set", "owners.discord", "[\"1234\"]"]);
+    env.ok(&["config", "set", "discord.token_env", "ZEPHYR_DISCORD_TOKEN"]);
+    env.ok(&["config", "set", "owners.imessage", "[\"+15550100\"]"]);
+    let mut cfg = env.config();
+    cfg.push_str(
+        "\n[imessage]\nlisten = \"100.64.0.1:7791\"\nserver_url = \"http://100.64.0.2:1234\"\n\
+         password_env = \"ZEPHYR_BB_PASSWORD\"\nsecret_env = \"ZEPHYR_BB_SECRET\"\n\
+         \n[web]\nhost = \"box.tail1234.ts.net\"\nport = 7793\n\
+         \n[approvals]\npreset = \"semi\"\n",
+    );
+    std::fs::write(env.daemon().join("zephyr.toml"), cfg).unwrap();
+}
+
+/// Review Focus 2: `init` again on the owner's install, Enter at every prompt, changes nothing:
+/// the same files byte for byte, no `tailscale serve`, and one `docker restart` at the end.
+#[test]
+fn init_again_on_a_configured_install_changes_nothing() {
+    let env = Env::new("init-rerun");
+    configure_an_install(&env);
+    // After the first `up` the daemon's files are root's, reached through the container.
+    env.split();
+    let files = env.dir.join("files");
+    let snapshot = || ["zephyr.toml", "host.toml"].map(|f| std::fs::read(files.join(f)).unwrap());
+    let before = snapshot();
+    env.calls();
+    let forwards =
+        "https://box.tail1234.ts.net (tailnet only)\n|-- / proxy http://127.0.0.1:7793\n\n\
+                    tcp://box.tail1234.ts.net:7791 (tailnet only)\n|--> tcp://127.0.0.1:7791";
+    let (_, shown) = env.on_a_driven_tty_env(
+        &["init"],
+        &[
+            ("Projects folder", "\n"),
+            ("Providers", "\n"),
+            ("Add another", "\n"),
+            ("Add another", "\n"),
+            ("Failover order", "\n"),
+            ("Change the discord channel?", "\n"),
+            ("Change the imessage channel?", "\n"),
+            ("Add private facts", "\n"),
+            ("Change the web app?", "\n"),
+        ],
+        &[("SHIM_TS_SERVE", forwards)],
+    );
+    env.unsplit();
+    assert!(
+        shown.contains("LEFT 0"),
+        "every prompt was answered: {shown}"
+    );
+    assert!(
+        shown.contains("web app: https://box.tail1234.ts.net"),
+        "{shown}"
+    );
+    assert!(!shown.contains("Forward this machine"), "{shown}");
+    // The one failure is doctor's: the shim cannot make the daemon's dir root's.
+    assert!(shown.contains("is root's and private"), "{shown}");
+    let after = snapshot();
+    for (i, name) in ["zephyr.toml", "host.toml"].iter().enumerate() {
+        assert!(
+            before[i] == after[i],
+            "{name} changed:\n{}\n---\n{}",
+            String::from_utf8_lossy(&before[i]),
+            String::from_utf8_lossy(&after[i])
+        );
+    }
+    let calls = env.calls();
+    let count = |prefix: &[&str]| (calls.iter()).filter(|c| c.starts_with(&s(prefix))).count();
+    assert_eq!(count(&["tailscale", "serve", "--bg"]), 0, "{calls:#?}");
+    assert_eq!(count(&["docker", "restart"]), 1, "{calls:#?}");
+    // The `up` init always starts with, and none after it.
+    assert_eq!(count(RUN), 1, "{calls:#?}");
+}
+
+/// A port init added (the iMessage webhook) is published by making the container again: a
+/// restart cannot add one.
+#[test]
+fn init_adding_imessage_publishes_its_port_and_offers_the_forward() {
+    let env = Env::new("init-imessage");
+    env.init(&["--no-start"]);
+    let mut steps = vec![
+        ("Projects folder", "\n"),
+        ("Providers", "\n"),
+        ("Set up discord?", "n"),
+        ("Set up imessage?", "y"),
+    ];
+    steps.extend(IMESSAGE_STEPS);
+    steps.extend([
+        (FORWARD_Q, "y"),
+        ("Approvals: how much", "\n"),
+        ("Add private facts", "n"),
+        ("Set up the web app", "n"),
+    ]);
+    let (code, shown) = env.on_a_driven_tty(&["init"], &steps);
+    assert!(
+        shown.contains("LEFT 0"),
+        "every prompt was answered: {shown}"
+    );
+    assert_eq!(code, 0, "{shown}");
+    let calls = env.calls();
+    find(&calls, &FORWARD);
+    let runs: Vec<&Vec<String>> = (calls.iter()).filter(|c| c.starts_with(&s(RUN))).collect();
+    assert_eq!(runs.len(), 2, "{calls:#?}");
+    assert!(
+        has_pair(runs[1], "-p", "127.0.0.1:7791:7791"),
+        "{:?}",
+        runs[1]
+    );
+    assert!(
+        !has_pair(runs[0], "-p", "127.0.0.1:7791:7791"),
+        "{:?}",
+        runs[0]
+    );
+    assert_eq!(at(&calls, &["docker", "restart"], ""), None, "{calls:#?}");
+}
+
+/// Under host networking the web app cannot run (DESIGN §4.3.3), so init does not offer it.
+#[test]
+fn init_under_host_networking_skips_the_web_app() {
+    let env = Env::new("init-host-web");
+    let projects = env.projects.display().to_string();
+    let (code, shown) = env.on_a_driven_tty(
+        &["init", "--network", "host", "--projects", &projects],
+        &[
+            ("Providers", "\n"),
+            ("Set up discord?", "n"),
+            ("Set up imessage?", "n"),
+            ("Approvals: how much", "\n"),
+            ("Add private facts", "n"),
+        ],
+    );
+    assert!(
+        shown.contains("LEFT 0"),
+        "every prompt was answered: {shown}"
+    );
+    assert_eq!(code, 0, "{shown}");
+    assert!(!shown.contains("Set up the web app"), "{shown}");
+    assert!(
+        shown.contains("web app: the web app needs the network floor"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn non_interactive_init_hints_at_channels_and_the_web_app() {
+    const CHANNEL: &str = "add a channel: zephyr channel add discord|imessage";
+    const WEB: &str = "web app: zephyr web setup";
+    let env = Env::new("init-hints");
+    let projects = env.projects.display().to_string();
+    let args = [
+        "init",
+        "--non-interactive",
+        "--no-start",
+        "--projects",
+        &projects,
+    ];
+    let text = env.ok(&args);
+    assert!(text.contains(CHANNEL) && text.contains(WEB), "{text}");
+    configure_an_install(&env);
+    let text = env.ok(&args);
+    assert!(!text.contains(CHANNEL) && !text.contains(WEB), "{text}");
+    // Under host networking there is no web app to set up.
+    let host = Env::new("init-hints-host");
+    let projects = host.projects.display().to_string();
+    let mut args = args.to_vec();
+    args[4] = &projects;
+    args.extend(["--network", "host"]);
+    let text = host.ok(&args);
+    assert!(text.contains(CHANNEL) && !text.contains(WEB), "{text}");
 }
 
 #[test]

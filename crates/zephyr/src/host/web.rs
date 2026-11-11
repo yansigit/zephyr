@@ -12,7 +12,7 @@ pub(super) fn main(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let yes = a.flag("--yes");
     let rest = a.rest()?;
     match rest.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-        ["setup"] => setup(h, yes),
+        ["setup"] => setup(h, yes).map(|_| ()),
         ["enrol"] if !yes => enrol(h, None),
         ["enrol", name] if !yes => enrol(h, Some(name)),
         _ => bail!("usage: zephyr web setup [--yes] | web enrol [NAME]"),
@@ -105,7 +105,8 @@ fn set(h: &Host, key: &str, value: &str) -> anyhow::Result<()> {
     run(&mut h.exec(&[], &[], &["zephyr", "set", key, value]))
 }
 
-fn setup(h: &Host, yes: bool) -> anyhow::Result<()> {
+/// True once it has started the container again (step 6), which `init` then need not.
+pub(super) fn setup(h: &Host, yes: bool) -> anyhow::Result<bool> {
     // Under host networking the agent could reach the port; the daemon would not start the app.
     if !h.bridge()? {
         bail!("{}", crate::web::NEEDS_FLOOR);
@@ -129,7 +130,7 @@ fn setup(h: &Host, yes: bool) -> anyhow::Result<()> {
             yes,
             &format!("Write [web] host = \"{name}\", port = {port} to zephyr.toml?"),
         )? {
-            return Ok(());
+            return Ok(false);
         }
         conf::set(&mut doc, "web.host", &name)?;
         conf::set(&mut doc, "web.port", port)?;
@@ -146,7 +147,7 @@ fn setup(h: &Host, yes: bool) -> anyhow::Result<()> {
         yes,
         &format!("Run `tailscale serve --bg {target}` (HTTPS on your tailnet only)?"),
     )? {
-        return Ok(());
+        return Ok(false);
     }
     serve(&["--bg", &target], "zephyr web setup")?;
     // 5
@@ -161,7 +162,7 @@ fn setup(h: &Host, yes: bool) -> anyhow::Result<()> {
         yes,
         "Start zephyr again so the web app listens (`zephyr up`)?",
     )? {
-        return Ok(());
+        return Ok(false);
     }
     h.ensure_image(false, false)?;
     h.up_checked()?;
@@ -204,7 +205,7 @@ fn setup(h: &Host, yes: bool) -> anyhow::Result<()> {
         }
     }
     println!("the web app is at https://{name}");
-    Ok(())
+    Ok(true)
 }
 
 /// The host's part of `zephyr status`: whether `tailscale serve` forwards to the web app. Nothing

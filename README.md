@@ -38,8 +38,11 @@ docker run --rm --entrypoint cat ghcr.io/yansigit/zephyr:latest /usr/local/bin/z
 (`docker login ghcr.io` with your `gh` token when needed; it builds locally when it cannot pull),
 starts the container, signs in the providers you pick, sets the failover order and the channels,
 asks which approvals preset to start in (`manual`, `semi` or `full`; `[approvals] preset` in
-`zephyr.toml`) and whether to add private facts (hidden prompts, as `zephyr facts add`), then runs
-`zephyr doctor`. A new install without a preset starts in `manual`. An install made before approvals
+`zephyr.toml`), whether to add private facts (hidden prompts, as `zephyr facts add`) and whether to
+set up the [web app](#web-app) (it needs Tailscale with HTTPS certificates), then runs `zephyr
+doctor`. Adding iMessage offers the Tailscale forward to its webhook, and a port init added is
+published by starting the container again. It prints the network mode (`--network host` turns
+the agent's network floor off). Run again with Enter at every prompt, it changes nothing. A new install without a preset starts in `manual`. An install made before approvals
 keeps sending as it did: its first start on this version writes `preset = "full"` and tells you once;
 `/approvals manual` turns them on.
 
