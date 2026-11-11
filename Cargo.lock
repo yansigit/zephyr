@@ -3197,7 +3197,7 @@ dependencies = [
 
 [[package]]
 name = "zephyr"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3232,7 +3232,7 @@ dependencies = [
 
 [[package]]
 name = "zephyr-cursor"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3257,7 +3257,7 @@ dependencies = [
 
 [[package]]
 name = "zephyr-policy"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "libc",
  "rpi-plugin-sdk",
