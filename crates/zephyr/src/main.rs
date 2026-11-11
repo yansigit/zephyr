@@ -395,7 +395,6 @@ async fn pair(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
         zephyr::pairing::CHANNELS.contains(&kind.as_str()),
         "usage: zephyr pair telegram|signal"
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     // A code is no use before signal-cli holds the account; it starts a few seconds after the
     // daemon (re-)starts. Doctor, run next, says if it never does.
     if kind == "signal" {
@@ -404,6 +403,8 @@ async fn pair(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
+    // After that wait, so the asking gets its own 30 s.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let reply = loop {
         let reply = ask(cfg, &format!("/pair {kind}")).await?;
         let early = std::time::Instant::now() < deadline;
