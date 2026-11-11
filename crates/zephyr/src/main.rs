@@ -824,6 +824,11 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     for line in zephyr::cards::doctor(cfg) {
         println!("{line}");
     }
+    // A fill types secrets into the browser: the program at its socket must be the real one.
+    match zephyr::vault::browser_daemon(cfg) {
+        Ok(()) => println!("ok   agent-browser: no other program holds the browser's socket"),
+        Err(why) => println!("warn agent-browser: {why}"),
+    }
     // Warnings, not failures: the agent's command-line tools from the image (DESIGN §4.11).
     for program in ["gh", "himalaya"] {
         let mut cmd = std::process::Command::new(program);

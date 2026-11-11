@@ -338,6 +338,9 @@ pub async fn run<C: Channel>(
         &router.store,
         "zephyr restarted and forgot its number",
     );
+    if let Err(why) = crate::vault::browser_daemon(&router.cfg) {
+        eprintln!("zephyr: {why}");
+    }
     for c in channels {
         c.live(cfg_rx.clone()); // owners for file downloads, kept current by reload
         c.acks(router.acks.clone());
