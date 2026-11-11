@@ -34,10 +34,19 @@ pub fn claim_on(channel: &str, text: &str) -> Option<String> {
     CHANNELS.contains(&channel).then(|| claimed(text)).flatten()
 }
 
-/// The code a message claims with, as typed: its whole text is `/pair CODE`.
+/// The code a message claims with, as typed: its whole text is `/pair CODE`, CODE a code's
+/// shape (ten base32 characters; case, the hyphen and spaces aside). `/pair telegram` is not a
+/// claim but the command, which a strong channel may send.
 pub fn claimed(text: &str) -> Option<String> {
     let code = typed(text.trim().strip_prefix("/pair ")?);
-    (!code.is_empty() && code.len() <= 32).then_some(code)
+    let base32 = |b: u8| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b);
+    (code.len() == 10 && code.bytes().all(base32)).then_some(code)
+}
+
+/// Whether `row` holds a code that still works: only then is a wrong one counted.
+pub fn outstanding(row: &str, now: i64) -> bool {
+    serde_json::from_str::<serde_json::Value>(row)
+        .is_ok_and(|v| v["expires"].as_i64().is_some_and(|at| at > now))
 }
 
 /// Whether `code` (as `claimed` gives it) is the unexpired one `row` was issued for.
@@ -89,5 +98,11 @@ mod tests {
         assert_eq!(claimed("please /pair ABCDE-FGHJK"), None);
         assert_eq!(claimed("/paired ABCDE"), None);
         assert_eq!(claimed(&format!("/pair {}", "A".repeat(33))), None);
+        // Only a code's shape is a claim: ten base32 characters. Anything else is `/pair` itself.
+        assert_eq!(claimed("/pair telegram"), None);
+        assert_eq!(claimed("/pair signal"), None);
+        assert_eq!(claimed("/pair ABCDE-FGHJ1"), None);
+        assert_eq!(claimed("/pair ABCDE-FGHJKL"), None);
+        assert_eq!(claim_on("telegram", "/pair telegram"), None);
     }
 }

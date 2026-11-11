@@ -3731,10 +3731,20 @@ impl<'a> Router<'a> {
         }
         let key = crate::pairing::meta_key(channel);
         let stored = self.store.meta(&key).ok().flatten();
-        let ok = stored.filter(|r| crate::pairing::matches(r, code, crate::now()));
+        let at = crate::now();
+        // With no code out there is nothing to guess: no count, so a stranger cannot keep
+        // pairing closed or have the owner told.
+        if !stored
+            .as_deref()
+            .is_some_and(|r| crate::pairing::outstanding(r, at))
+        {
+            return eprintln!("zephyr: a pairing claim on {channel} with no code out");
+        }
+        let ok = stored.filter(|r| crate::pairing::matches(r, code, at));
         // Taken in one statement: of two claims at once, one wins.
         if !ok.is_some_and(|r| self.store.take_meta(&key, &r).unwrap_or(false)) {
             eprintln!("zephyr: a wrong pairing code on {channel}");
+            // Some only for the fifth, once per lockout: claims while closed are not counted.
             if let Some(at) = self.pair_limits.failed(now, self.cfg.web_lockout) {
                 let text = format!(
                     "[zephyr] 5 wrong pairing codes; pairing is closed until {}",

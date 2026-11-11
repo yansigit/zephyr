@@ -2512,6 +2512,47 @@ async fn wrong_codes_close_pairing_and_get_no_reply() {
 }
 
 #[tokio::test]
+async fn wrong_codes_with_no_code_out_close_nothing() {
+    let (home, gw) = paired_gateway("pair-none-out");
+    for i in 0..6 {
+        gw.say_on("telegram", &format!("99-{i}"), "99", "/pair AAAAA-AAAAA")
+            .await;
+    }
+    let store = Store::open(&home.join("state.db")).unwrap();
+    wait(|| store.inbox_with_status("dropped").unwrap().len() == 6).await;
+    // Pairing is still open, and no owner was told anything.
+    pair_code(&gw, "p1").await;
+    assert!(
+        !gw.replies()
+            .iter()
+            .any(|r| r.contains("wrong pairing codes")),
+        "{:?}",
+        gw.replies()
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_strong_telegram_owner_may_ask_for_a_code() {
+    let home = home("pair-strong-tg");
+    let text = file_text(
+        &home,
+        "[telegram]\ntoken_env = \"T\"\n[settings]\nstrong_channels = [\"tui\", \"chat\", \"telegram\"]\n",
+    )
+    .replace("[owners]\n", "[owners]\ntelegram = [\"55\"]\n");
+    std::fs::write(home.join("zephyr.toml"), text).unwrap();
+    let cfg = Config::load(&home.join("zephyr.toml")).unwrap();
+    let gw = start_on(cfg, &["chat", "telegram"]);
+    gw.say_on("telegram", "55-1", "55", "/pair telegram").await;
+    let replies = gw.wait_replies_on("telegram", 1).await;
+    assert!(
+        replies[0].starts_with("[zephyr] send /pair ") && replies[0].ends_with("it works once"),
+        "{replies:?}"
+    );
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn pair_needs_a_strong_channel_and_a_set_up_channel() {
     let (_home, gw) = paired_gateway("pair-strong");
     gw.say_on("discord", "d1", "downer", "/pair telegram").await;
