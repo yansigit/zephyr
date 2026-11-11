@@ -824,8 +824,9 @@ What it protects against: credentials stay out of chats, transcripts and the mod
 normal use; a login is filled only on its own site; and each new use needs your OK. What it does
 not: an agent set on misusing a login, or a token you marked `raw`, can still read it (a filled
 field read back, its own command's log under `.procs/`, a program that prints its environment to
-a file). A bound token it cannot read at all; it can still use it on the hosts you bound, so bind
-a token only to the API it is for, and grant it only to programs you trust with it.
+a file). A bound token it cannot read; it can still use it on the hosts you bound, and a host
+that sends back what it was sent (an echo or debug endpoint) shows it the token in the reply. So
+bind a token only to the API it is for, and grant it only to programs you trust with it.
 
 **Mail.** There is no mail channel, but the agent can read and send mail with `himalaya`. Save the
 password as a token (`zephyr vault add token MAIL_PASSWORD`, then `/vault raw MAIL_PASSWORD on`:

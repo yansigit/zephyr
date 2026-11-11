@@ -418,7 +418,14 @@ pub(crate) mod tests {
         let script = format!("#!/bin/sh\necho \"$@ $PATH\" > {}\n", ran.display());
         std::fs::write(&update, script).unwrap();
         std::fs::set_permissions(&update, std::fs::Permissions::from_mode(0o755)).unwrap();
-        publish(&state, &public, &system, &update).unwrap();
+        // A script written a moment ago can be "busy" while another test's fork holds it open.
+        let publish = || loop {
+            match publish(&state, &public, &system, &update) {
+                Err(e) if format!("{e:#}").contains("Text file busy") => continue,
+                done => break done,
+            }
+        };
+        publish().unwrap();
         let pem = pem(&state).unwrap();
         assert_eq!(std::fs::read_to_string(public.join("ca.pem")).unwrap(), pem);
         assert_eq!(std::fs::read_to_string(&system).unwrap(), pem);
@@ -435,7 +442,7 @@ pub(crate) mod tests {
         assert!(!pem.contains("PRIVATE KEY"));
         // A failing update is an error, not a silent half-install.
         std::fs::write(&update, "#!/bin/sh\necho no >&2\nexit 1\n").unwrap();
-        let e = publish(&state, &public, &system, &update).unwrap_err();
+        let e = publish().unwrap_err();
         assert!(format!("{e:#}").ends_with(": no"), "{e:#}");
     }
 }
