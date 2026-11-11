@@ -440,6 +440,7 @@ Growth: **+835 MB** (+15.5%) for voice, against the spec's estimate of about 520
 **After the second review** (of the PR, 2026-11-11): its findings were each confirmed and fixed with a test; the `- Review fix:` lines are under the tasks that own the code.
 - Review fix: a missing `desktop.lock` fails closed. A wrapper with no lock file refuses with `browser_gate::NO_LOCK` and runs nothing; before, it ran with no place, which a take could not wait for (`without_the_lock_file_nothing_runs`). `doctor` checks the lock, its owner and its folder.
 - Review fix: the sweep of `nobody`'s processes goes by uid only as root in the floored container; a root daemon on a host never kills that machine's other `nobody` processes. No test: it cannot be exercised outside the container.
+- Review fix, found in the side container: a command still running when the wait ended was not killed. The daemon there is root with no capabilities and cannot read the agent's `/proc/PID/fd`, which the holder search used, so it found nobody and handed the desktop over with the command still going. The holders are now read from `/proc/locks`, the kernel's own list, which it can read (`the_lockers_of_a_file_are_read_from_proc_locks`); the unit tests had passed because a test runs as the uid it searches.
 - Deviation: the review's "an `/ok once` pass is refused while held" has no test: passes exist only for connector calls, never for a browser request. The immediate allow that does exist for the browser (typing the gate lets through) is tested.
 
 **Not verified:**

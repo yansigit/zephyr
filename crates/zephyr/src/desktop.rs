@@ -453,19 +453,43 @@ fn kill_holders(lock: &std::path::Path) -> usize {
                 && std::fs::read_to_string(info).is_ok_and(|info| info.contains("\nlock:"))
         })
     };
+    // The kernel's own list first: in the container the daemon is root with no capabilities,
+    // and cannot read the agent's /proc/PID/fd, which `holds` needs.
+    let listed = match (
+        std::fs::metadata(&lock),
+        std::fs::read_to_string("/proc/locks"),
+    ) {
+        (Ok(file), Ok(locks)) => lockers(&locks, file.ino()),
+        _ => Vec::new(),
+    };
     let mut killed = 0;
     for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
             continue;
         };
         let theirs = entry.metadata().is_ok_and(|m| m.uid() == uid);
-        if pid != me && theirs && holds(pid) {
+        if pid != me && theirs && (listed.contains(&pid) || holds(pid)) {
             // SAFETY: a plain syscall; a pid that ended meanwhile is an error, ignored.
             unsafe { libc::kill(pid, libc::SIGKILL) };
             killed += 1;
         }
     }
     killed
+}
+
+/// The pids `/proc/locks` lists as holding or waiting for a `flock` on the file with inode
+/// `ino`: `1: FLOCK  ADVISORY  READ  2020 00:2f:51492591 0 EOF`. By inode alone: a filesystem's
+/// device number there need not be the one `stat` gives (btrfs), and only the agent's own
+/// processes are killed on it.
+fn lockers(locks: &str, ino: u64) -> Vec<i32> {
+    let line = |l: &str| {
+        let mut words = l.split_whitespace().skip(1).skip_while(|w| *w == "->");
+        let kind = words.next()?;
+        let pid = words.nth(2)?.parse::<i32>().ok()?;
+        let inode = words.next()?.rsplit(':').next()?.parse::<u64>().ok()?;
+        (kind == "FLOCK" && pid > 0 && inode == ino).then_some(pid)
+    };
+    locks.lines().filter_map(line).collect()
 }
 
 /// What is wrong with the takeover as the image lays it out (doctor's `desktop` line, DESIGN
@@ -630,6 +654,22 @@ mod tests {
     }
 
     /// A wrapper that sees the flag asks the gate at once: the gate must see the hold by then.
+    #[test]
+    fn the_lockers_of_a_file_are_read_from_proc_locks() {
+        // As the kernel lists them: the daemon, root with no capabilities, cannot read another
+        // uid's /proc/PID/fd, but this file it can.
+        let locks = "1: FLOCK  ADVISORY  READ  2020 00:2f:51492591 0 EOF\n\
+                     2: POSIX  ADVISORY  WRITE 77 00:2f:51492591 0 EOF\n\
+                     3: FLOCK  ADVISORY  WRITE 31 00:2f:9 0 EOF\n\
+                     4: OFDLCK ADVISORY  READ  -1 00:2f:51492591 0 EOF\n\
+                     5: FLOCK  ADVISORY  READ  2044 08:01:51492591 0 EOF\n\
+                     6: -> FLOCK  ADVISORY  WRITE 2050 00:2f:51492591 0 EOF\n\
+                     junk\n";
+        assert_eq!(lockers(locks, 51492591), [2020, 2044, 2050]);
+        assert_eq!(lockers(locks, 9), [31]);
+        assert_eq!(lockers(locks, 1), [0i32; 0]);
+    }
+
     #[test]
     fn the_hold_is_published_before_the_flag_is_written() {
         let (cfg, control) = control("desktop-order");
