@@ -2512,6 +2512,33 @@ async fn wrong_codes_close_pairing_and_get_no_reply() {
 }
 
 #[tokio::test]
+async fn a_live_pairing_code_never_reaches_state_db() {
+    let (home, gw) = paired_gateway("pair-unstored");
+    let code = pair_code(&gw, "p1").await; // the owner got the real code
+    gw.shutdown().await;
+    let mut bytes = Vec::new();
+    for name in ["state.db", "state.db-wal"] {
+        bytes.extend(std::fs::read(home.join(name)).unwrap_or_default());
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    for form in [code.clone(), code.replace('-', "")] {
+        assert!(!text.contains(&form), "{form} is in state.db");
+    }
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    let kept: String = db
+        .query_row("SELECT text FROM outbox WHERE channel = 'chat'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    drop(store);
+    assert_eq!(
+        kept,
+        "[zephyr] send /pair [code] to the bot within 10 min; it works once"
+    );
+}
+
+#[tokio::test]
 async fn a_near_miss_pair_text_is_stored_cut() {
     let (home, gw) = paired_gateway("pair-near-miss");
     let code = pair_code(&gw, "p1").await;

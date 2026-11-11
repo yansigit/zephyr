@@ -435,6 +435,9 @@ struct Router<'a> {
     secrets: Vec<(String, String)>,
     /// A same-provider model switch, sent with `set_model` once the child is idle.
     pending_model: Option<String>,
+    /// Replies whose stored text is redacted (`pairing::redacted`), by client id: what `flush`
+    /// sends in its place.
+    unstored: HashMap<String, String>,
     /// The answers for the rows adapters hand over (`channel::Acks`).
     acks: Arc<crate::channel::Acks>,
     /// Wrong pairing codes: five in ten minutes close pairing (DESIGN §4.3).
@@ -687,6 +690,7 @@ impl<'a> Router<'a> {
             pushed_up_to: std::sync::atomic::AtomicI64::new(i64::MAX),
             pair_limits: crate::web::signin::Limits::new(),
             acks: Arc::default(),
+            unstored: HashMap::new(),
             pushed_replies: HashSet::new(),
             not_applied: false,
             held_steered: HashSet::new(),
@@ -2083,7 +2087,15 @@ impl<'a> Router<'a> {
             // A `/btw` whose answer its task posts.
             log(self.store.set_status(id, "done").map_err(Into::into));
         } else {
-            log(self.store.reply(&row, &reply, "done").map_err(Into::into));
+            // A live code goes only to the asking channel: state.db keeps `[code]`, and the
+            // real text waits in memory for `flush` (after a crash it goes out redacted).
+            let stored = crate::pairing::redacted(&reply);
+            if stored.is_some() {
+                let id = crate::store::client_id(row.id);
+                self.unstored.insert(id, reply.clone());
+            }
+            let text = stored.as_deref().unwrap_or(&reply);
+            log(self.store.reply(&row, text, "done").map_err(Into::into));
         }
         if crate::attach::attached(&row.channel) && !reply.is_empty() {
             self.show(&reply, Some(row.text.trim()), Some(&row.channel));
@@ -4810,6 +4822,7 @@ impl<'a> Router<'a> {
                 }
                 self.show(&row.text, None, None);
             }
+            self.unstored.remove(&row.client_id);
             log(self
                 .store
                 .set_outbox_status(row.id, "sent")
@@ -4835,11 +4848,12 @@ impl<'a> Router<'a> {
                 }
                 continue;
             };
+            let text = (self.unstored.get(&row.client_id).cloned()).unwrap_or(row.text);
             let msg = Outbound {
                 channel: row.channel.clone(),
                 recipient: row.recipient,
                 client_id: row.client_id,
-                text: row.text,
+                text,
                 attachment: row.attachment.clone().map(Into::into),
                 reply_to: row.reply_to,
             };
@@ -4863,6 +4877,7 @@ impl<'a> Router<'a> {
                 }
                 Err(_) => continue, // retried on the next pass
             };
+            self.unstored.remove(&msg.client_id);
             log(self
                 .store
                 .set_outbox_status(row.id, status)

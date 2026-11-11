@@ -54,6 +54,29 @@ pub fn issuers(cfg: &crate::config::Config) -> Vec<&str> {
         .collect()
 }
 
+/// `text` with a live code (`/pair telegram`'s, `/web enrol`'s) cut to `[code]`: what is stored of
+/// a reply that hands one out, the real text going only to the channel that asked. `None` when
+/// it holds none.
+pub fn redacted(text: &str) -> Option<String> {
+    let shown = |s: &str| {
+        let b = s.as_bytes();
+        let base32 = |c: u8| c.is_ascii_uppercase() || (b'2'..=b'7').contains(&c);
+        b.len() == 11 && b[5] == b'-' && b[..5].iter().chain(&b[6..]).all(|c| base32(*c))
+    };
+    let mut out = text.to_string();
+    let mut cut = false;
+    for mark in ["send /pair ", "#enrol="] {
+        let Some(at) = out.find(mark).map(|i| i + mark.len()) else {
+            continue;
+        };
+        if out.get(at..at + 11).is_some_and(shown) {
+            out.replace_range(at..at + 11, "[code]");
+            cut = true;
+        }
+    }
+    cut.then_some(out)
+}
+
 /// What a pairing channel's `/pair …` text is stored as: `/pair`, whatever follows it, so a code
 /// typed a little wrong never reaches state.db either. `None` keeps the text as it is.
 pub fn stored(channel: &str, text: &str) -> Option<String> {
@@ -108,6 +131,22 @@ mod tests {
         let code = claimed(&format!("/pair {shown}")).unwrap();
         assert!(matches(&row, &code, 1000 + LIFE - 1));
         assert!(!matches(&row, &code, 1000 + LIFE));
+    }
+
+    #[test]
+    fn a_reply_holding_a_live_code_is_stored_redacted() {
+        let pair = "[zephyr] send /pair ABCDE-FGHJK to the bot within 10 min; it works once";
+        assert_eq!(
+            redacted(pair).as_deref(),
+            Some("[zephyr] send /pair [code] to the bot within 10 min; it works once")
+        );
+        let web = "[zephyr] open https://box.ts.net/#enrol=ABCDE-FGHJK on the phone within 10 min, or type the code there; it works once";
+        assert_eq!(
+            redacted(web).as_deref(),
+            Some("[zephyr] open https://box.ts.net/#enrol=[code] on the phone within 10 min, or type the code there; it works once")
+        );
+        assert_eq!(redacted("[zephyr] /pair needs tui or chat"), None);
+        assert_eq!(redacted("[zephyr] send /pair later"), None);
     }
 
     #[test]
