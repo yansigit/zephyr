@@ -219,6 +219,65 @@ struct Out {
     stderr: Vec<u8>,
 }
 
+fn root() -> bool {
+    // Safety: geteuid cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// The one variable a decoder gets when the daemon is not root, and so cannot drop to
+/// `nobody`: this process's own mark, by which `sweep` finds what its runs left.
+fn mark() -> (&'static str, &'static str) {
+    static MARK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let value = MARK.get_or_init(|| format!("{}-{}", std::process::id(), crate::unix_millis()));
+    ("ZEPHYR_VOICE_RUN", value)
+}
+
+/// Kills whatever the voice programs left running. A process group does not hold a decoder
+/// that calls `setsid`, so this goes by what it cannot shed: as root, every process whose real
+/// uid is 65534, which runs nothing but these programs, one run at a time (`Turn`). When the
+/// daemon is not root nothing was dropped to `nobody`, and it is every process of the daemon's
+/// own uid that carries this process's `mark` in its environment: enough for a test, which
+/// must never kill a stranger's process, and no boundary, since a process can rewrite its own.
+fn sweep() {
+    let (name, value) = mark();
+    let mark = format!("{name}={value}");
+    // Safety: getuid cannot fail.
+    let me = unsafe { libc::getuid() };
+    let marked = |pid: i32| {
+        std::fs::read(format!("/proc/{pid}/environ"))
+            .is_ok_and(|env| env.split(|b| *b == 0).any(|v| v == mark.as_bytes()))
+    };
+    let left = |pid: i32, uid: u32| match root() {
+        true => uid == NOBODY,
+        false => uid == me && pid != std::process::id() as i32 && marked(pid),
+    };
+    // Again while something was found: a process may fork as it is killed.
+    for _ in 0..3 {
+        if crate::procs::kill_all(left) == 0 {
+            break;
+        }
+    }
+}
+
+/// The one turn the voice programs run in, transcription and speech alike: `sweep` kills
+/// every process of `nobody`, so no other run of theirs may be going. When the turn ends, also
+/// by its future being dropped mid-run (the adapter's task aborted, a timeout around it), what
+/// it left is swept before the next one starts.
+struct Turn(#[allow(dead_code)] tokio::sync::SemaphorePermit<'static>);
+
+impl Turn {
+    async fn take() -> Turn {
+        static ONE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        Turn(ONE.acquire().await.expect("never closed"))
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        sweep();
+    }
+}
+
 /// Runs `prog` as `nobody` (when the daemon is root: decision 2 of the lane's plan) with a
 /// cleared environment, in `/`, in its own process group, at nice 10, each of `fds` at its
 /// number, and kills the group at `limit`.
@@ -238,10 +297,14 @@ async fn run(
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
-    // Safety: geteuid cannot fail.
-    if unsafe { libc::geteuid() } == 0 {
+    if root() {
         // std also drops the supplementary groups, and with the uid go the capabilities.
         cmd.uid(NOBODY).gid(NOBODY);
+    } else {
+        // No uid to tell the run's processes by (a test, a daemon that is not root): the
+        // sweep finds them by this instead.
+        let (name, value) = mark();
+        cmd.env(name, value);
     }
     let dups: Vec<(i32, i32)> = fds.iter().map(|(m, n)| (m.0.as_raw_fd(), *n)).collect();
     // Safety: dup2 and nice are async-signal-safe and allocate nothing. `dup2` clears
@@ -310,8 +373,7 @@ pub async fn transcribe(cfg: &Config, audio: &[u8]) -> (Heard, u64) {
     if !floored(cfg) {
         return (Heard::NoFloor, 0);
     }
-    static ONE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-    let _one = ONE.acquire().await;
+    let _turn = Turn::take().await;
     let mut secs = 0;
     let heard = match hear(cfg, audio, &mut secs).await {
         Ok(heard) => heard,
@@ -477,6 +539,7 @@ pub async fn speak(cfg: &Config, text: &str, channel: &str) -> Option<Vec<u8>> {
     let text = speakable(text)?;
     let dir = &cfg.voice_dir;
     let voice = voice_for(dir, &text)?;
+    let _turn = Turn::take().await;
     let made = async {
         let said = mem(Mem::sealed(text.as_bytes()))?;
         let stdin = Stdio::from(mem(said.0.try_clone())?);
@@ -512,6 +575,7 @@ pub async fn speak(cfg: &Config, text: &str, channel: &str) -> Option<Vec<u8>> {
 /// test.
 pub async fn uid() -> Option<u32> {
     let id = Path::new("/usr/bin/id");
+    let _turn = Turn::take().await;
     let out = run(id, &["-u".into()], &[], Stdio::null(), FFMPEG_LIMIT).await;
     String::from_utf8_lossy(&out.ok()?.stdout)
         .trim()
@@ -758,9 +822,13 @@ pub(crate) mod tests {
             transcribe(&cfg, b"crafted").await.0,
             said("en", "hello from the fake")
         );
-        let pid = std::fs::read_to_string(cfg.voice_dir.join("fork.pid")).unwrap();
-        // Killed by now, though it may still be dying, or a zombie its new parent has yet to
-        // reap: both are gone for good.
+        gone(&cfg, "fork.pid").await;
+    }
+
+    /// Waits until the process whose pid the fake wrote to `file` is gone: killed, though it
+    /// may be a zombie its new parent has yet to reap.
+    async fn gone(cfg: &Config, file: &str) {
+        let pid = std::fs::read_to_string(cfg.voice_dir.join(file)).unwrap();
         let stat = || std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()));
         let gone = || stat().map_or(true, |s| s.contains(") Z ") || s.contains(") X "));
         for _ in 0..200 {
@@ -769,7 +837,52 @@ pub(crate) mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        panic!("the decoder's child is still there: {:?}", stat());
+        panic!("{file}: the process is still there: {:?}", stat());
+    }
+
+    /// A session of its own takes a child out of the decoder's process group: it is swept all
+    /// the same when the run ends.
+    #[tokio::test]
+    async fn a_child_in_a_session_of_its_own_does_not_outlive_the_decoder() {
+        let cfg = fakes("voice-setsid", "");
+        mark(&cfg, "setsid", "");
+        assert_eq!(
+            transcribe(&cfg, b"crafted").await.0,
+            said("en", "hello from the fake")
+        );
+        gone(&cfg, "setsid.pid").await;
+    }
+
+    /// The adapter's task aborted mid-run, or a timeout around it: the decoder and what it
+    /// left still go.
+    #[tokio::test]
+    async fn a_dropped_transcription_leaves_nothing_running() {
+        let cfg = fakes("voice-dropped", "");
+        mark(&cfg, "setsid", "");
+        mark(&cfg, "hang", "");
+        let theirs = cfg.clone();
+        let run = tokio::spawn(async move { transcribe(&theirs, b"crafted").await });
+        let (hung, left) = (
+            cfg.voice_dir.join("hang.pid"),
+            cfg.voice_dir.join("setsid.pid"),
+        );
+        for _ in 0..400 {
+            if hung.exists() && left.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        run.abort();
+        assert!(run.await.unwrap_err().is_cancelled());
+        gone(&cfg, "hang.pid").await;
+        gone(&cfg, "setsid.pid").await;
+        // And the turn is free again.
+        std::fs::remove_file(cfg.voice_dir.join("hang")).unwrap();
+        std::fs::remove_file(cfg.voice_dir.join("setsid")).unwrap();
+        assert_eq!(
+            transcribe(&cfg, b"next").await.0,
+            said("en", "hello from the fake")
+        );
     }
 
     #[tokio::test]

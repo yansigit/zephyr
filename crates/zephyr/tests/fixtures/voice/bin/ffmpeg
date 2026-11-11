@@ -11,6 +11,7 @@ of the input (the file an argument names, or stdin for Piper). Marker files in t
   secs        how long the decoded audio is (default 2), cut at ffmpeg's `-t`
   hang        whisper writes its pid to `hang.pid` and sleeps until it is killed
   fork        whisper leaves a child behind, asleep, its pid in `fork.pid`
+  setsid      the same in a session of its own, out of the process group; `setsid.pid`
   slow        whisper takes 0.3 s, so two runs would overlap if they could
   piper_fail  Piper exits 1
 
@@ -70,23 +71,27 @@ if prog == "ffmpeg":
 elif prog == "whisper-cli":
     with open(after("-f"), "rb") as f:
         data = f.read()
-    if marker("hang") is not None:
-        with open(os.path.join(root, "hang.pid"), "w") as f:
-            f.write(str(os.getpid()))
-        time.sleep(600)
-    if marker("fork") is not None:
+    for name in ("fork", "setsid"):
+        if marker(name) is None:
+            continue
         r, w = os.pipe()
         if os.fork() == 0:
+            if name == "setsid":
+                os.setsid()
             # Its own stdio closed, so nothing waits on it; the parent goes on once it is asleep.
             for fd in (0, 1, 2, r):
                 os.close(fd)
-            with open(os.path.join(root, "fork.pid"), "w") as f:
+            with open(os.path.join(root, name + ".pid"), "w") as f:
                 f.write(str(os.getpid()))
             os.close(w)
             time.sleep(600)
             os._exit(0)
         os.close(w)
         os.read(r, 1)
+    if marker("hang") is not None:
+        with open(os.path.join(root, "hang.pid"), "w") as f:
+            f.write(str(os.getpid()))
+        time.sleep(600)
     if marker("slow") is not None:
         time.sleep(0.3)
     if after("-l") == "auto":
