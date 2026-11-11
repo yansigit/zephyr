@@ -41,6 +41,25 @@ ARG SIGNAL_CLI_VERSION=0.14.10
 ARG SIGNAL_CLI_SHA256=706a57d9faae7525cf732936efdabf210146e3c83f9e8ae7e4e62f5946121c33
 ARG TEMURIN_VERSION=25.0.5+8
 ARG TEMURIN_SHA256_AMD64=68982529869257d0ee6b824ec5aa270ff8b118bb438670da0b97ebdab178d7fb
+# Voice (DESIGN §4.4): whisper.cpp, a cut-down ffmpeg, Piper and their models in /opt/zephyr/voice.
+# VOICE=0 leaves the folder out, which turns voice off. KO_VOICE=1 adds Piper's Korean voice,
+# ko_KR-kss-medium, trained on the KSS dataset under CC BY-NC-SA 4.0: non-commercial use only.
+ARG VOICE=1
+ARG KO_VOICE=0
+ARG WHISPER_VERSION=1.9.5
+ARG WHISPER_SHA256=ff1a9053feb509ff9d7729703355541ae9690073a6b1c40eb692c962e0dc1720
+ARG FFMPEG_VERSION=7.1
+ARG FFMPEG_SHA256=40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6
+# Hugging Face revisions of ggerganov/whisper.cpp, ggml-org/whisper-vad and rhasspy/piper-voices.
+ARG WHISPER_MODELS_REV=5359861c739e955e79d9a303bcbc70fb988958b1
+ARG WHISPER_SMALL_SHA256=ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb
+ARG VAD_REV=9ffd54a1e1ee413ddf265af9913beaf518d1639b
+ARG VAD_SHA256=29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf
+ARG PIPER_VOICES_REV=cf910fb59f1d79ab3b625a63993a108751c6c25d
+ARG EN_VOICE_SHA256=5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f
+ARG EN_VOICE_JSON_SHA256=efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0
+ARG KO_VOICE_SHA256=624fd774e26895f24bebae1bd9a3379e3394baeade4b584924f83e414096e2c9
+ARG KO_VOICE_JSON_SHA256=153b5619d0580f824a59108d83ca19434de410eb8e4fe80325b58684fdc8a1df
 
 # Rust plus node 24 (the plugin stage scripts use both). Bookworm's glibc (2.36) is older than
 # the final image's (2.39), so what is built here runs there.
@@ -210,6 +229,86 @@ FROM scratch AS signal-0
 WORKDIR /out
 FROM signal-${SIGNAL} AS signal-out
 
+# whisper-cli with Vulkan, built on ubuntu 24.04 so its glibc is the final image's; glslc and the
+# Vulkan and SPIR-V headers stay in this stage. ggml and libstdc++ are linked in: it needs
+# libvulkan1 and libgomp1 (in the final image) and runs on the CPU with no GPU. GGML_NATIVE=OFF
+# builds for AVX2-class x86 (or plain armv8), not for the build host's CPU.
+FROM ubuntu:24.04 AS voice-whisper
+ARG WHISPER_VERSION WHISPER_SHA256
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl build-essential \
+      cmake glslc libvulkan-dev spirv-headers \
+    && curl -fsSLo /tmp/whisper.tar.gz \
+       "https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v$WHISPER_VERSION.tar.gz" \
+    && echo "$WHISPER_SHA256  /tmp/whisper.tar.gz" | sha256sum -c - \
+    && mkdir /src && tar -xzf /tmp/whisper.tar.gz -C /src --strip-components 1 \
+    && cmake -S /src -B /build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF \
+       -DGGML_VULKAN=ON -DGGML_CCACHE=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_SDL2=OFF \
+       -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
+    && cmake --build /build -j"$(nproc)" --target whisper-cli \
+    && install -D -m 755 -s /build/bin/whisper-cli /out/bin/whisper-cli
+
+# ffmpeg, static, with only what voice notes in and out need: the channels' audio containers and
+# codecs, raw s16le in (Piper's PCM), and Opus, AAC and 16-bit WAV out.
+FROM ubuntu:24.04 AS voice-ffmpeg
+ARG FFMPEG_VERSION FFMPEG_SHA256
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+      build-essential nasm pkg-config libopus-dev \
+    && curl -fsSLo /tmp/ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" \
+    && echo "$FFMPEG_SHA256  /tmp/ffmpeg.tar.xz" | sha256sum -c - \
+    && mkdir /src && tar -xJf /tmp/ffmpeg.tar.xz -C /src --strip-components 1 && cd /src \
+    && ./configure --disable-everything --disable-autodetect --disable-network --disable-doc \
+       --disable-debug --disable-ffplay --disable-ffprobe --disable-avdevice \
+       --pkg-config-flags=--static --extra-ldflags=-static --enable-libopus \
+       --enable-protocol=file,pipe \
+       --enable-demuxer=ogg,mov,matroska,mp3,wav,flac,aac,caf,amr,pcm_s16le \
+       --enable-decoder='opus,libopus,vorbis,aac,mp3,mp3float,flac,pcm_*,alac,amrnb,amrwb' \
+       --enable-parser=aac,flac,mpegaudio,opus,vorbis \
+       --enable-encoder=libopus,aac,pcm_s16le --enable-muxer=ogg,ipod,wav --enable-filter=aresample \
+    && make -j"$(nproc)" ffmpeg \
+    && install -D -m 755 -s ffmpeg /out/bin/ffmpeg
+
+# Piper: deploy/voice's locked packages in a venv on the final image's python3, its bytecode
+# compiled here since nobody, who runs it, cannot write __pycache__.
+FROM ubuntu:24.04 AS voice-py
+COPY --from=ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 /uv /usr/local/bin/uv
+COPY deploy/voice/pyproject.toml deploy/voice/uv.lock /src/voice/
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates python3 \
+    && UV_PROJECT_ENVIRONMENT=/opt/zephyr/voice/py UV_PYTHON=/usr/bin/python3.12 UV_PYTHON_DOWNLOADS=never \
+       uv sync --project /src/voice --frozen --no-install-project --no-cache --link-mode copy \
+       --compile-bytecode \
+    && chmod -R go-w /opt/zephyr/voice/py
+
+# whisper's model, Silero VAD and Piper's voices, each checked against its pinned sha256.
+FROM ubuntu:24.04 AS voice-models
+ARG KO_VOICE WHISPER_MODELS_REV WHISPER_SMALL_SHA256 VAD_REV VAD_SHA256 PIPER_VOICES_REV \
+    EN_VOICE_SHA256 EN_VOICE_JSON_SHA256 KO_VOICE_SHA256 KO_VOICE_JSON_SHA256
+RUN set -eu; apt-get update && apt-get install -y --no-install-recommends ca-certificates curl; \
+    get() { curl -fsSLo "/out/$1" "https://huggingface.co/$2/resolve/$3"; echo "$4  /out/$1" | sha256sum -c -; }; \
+    mkdir -p /out/models /out/voices; \
+    get models/ggml-small-q5_1.bin ggerganov/whisper.cpp "$WHISPER_MODELS_REV/ggml-small-q5_1.bin" \
+      "$WHISPER_SMALL_SHA256"; \
+    get models/ggml-silero-v5.1.2.bin ggml-org/whisper-vad "$VAD_REV/ggml-silero-v5.1.2.bin" "$VAD_SHA256"; \
+    v="rhasspy/piper-voices"; en="$PIPER_VOICES_REV/en/en_US/lessac/medium/en_US-lessac-medium"; \
+    get voices/en_US-lessac-medium.onnx "$v" "$en.onnx" "$EN_VOICE_SHA256"; \
+    get voices/en_US-lessac-medium.onnx.json "$v" "$en.onnx.json" "$EN_VOICE_JSON_SHA256"; \
+    if [ "$KO_VOICE" = 1 ]; then \
+      ko="$PIPER_VOICES_REV/ko/ko_KR/kss/medium/ko_KR-kss-medium"; \
+      get voices/ko_KR-kss-medium.onnx "$v" "$ko.onnx" "$KO_VOICE_SHA256"; \
+      get voices/ko_KR-kss-medium.onnx.json "$v" "$ko.onnx.json" "$KO_VOICE_JSON_SHA256"; \
+    fi; \
+    chmod -R a+rX,go-w /out
+
+FROM scratch AS voice-1
+COPY --from=voice-whisper /out/bin/ /opt/zephyr/voice/bin/
+COPY --from=voice-ffmpeg /out/bin/ /opt/zephyr/voice/bin/
+COPY --from=voice-models /out/ /opt/zephyr/voice/
+COPY --from=voice-py /opt/zephyr/voice/py/ /opt/zephyr/voice/py/
+# An /opt/zephyr with nothing in it: the final stage copies this folder's contents, so VOICE=0
+# leaves no /opt/zephyr/voice at all.
+FROM scratch AS voice-0
+WORKDIR /opt/zephyr
+FROM voice-${VOICE} AS voice-out
+
 FROM ubuntu:24.04
 # Chromium's and Firefox's libraries, Vulkan/EGL for the GPU, the agent's desktop and its
 # everyday command-line tools (§4.11).
@@ -239,17 +338,20 @@ COPY --from=python /opt/zephyr/camoufox/ /opt/zephyr/camoufox/
 COPY --from=python /usr/local/bin/uv /usr/local/bin/uv
 # signal/ when built, else nothing: no empty /opt/zephyr/signal.
 COPY --from=signal-out /out/ /opt/zephyr/
+# ffmpeg, whisper-cli, Piper and their models (DESIGN §4.4), run as nobody; none with VOICE=0.
+COPY --from=voice-out /opt/zephyr/ /opt/zephyr/
 # The desktop's window manager config, root's (DESIGN §4.6): openbox never reads the agent's.
 COPY deploy/openbox/ /opt/zephyr/openbox/
-# `/opt/zephyr/gate/bin` (root's, 0755, holding only the browser wrapper) is first on the
-# agent's PATH (agent::AGENT_PATH), so an agent-browser the agent drops in its own bin does
-# not shadow it; `zephyr doctor` checks the layout.
+# `/opt/zephyr/gate/bin` (root's, 0755, holding only the agent-browser and xdotool wrappers) is
+# first on the agent's PATH (agent::AGENT_PATH), so one the agent drops in its own bin does not
+# shadow them; `zephyr doctor` checks the layout. The real xdotool stays at /usr/bin/xdotool.
 RUN ln -s /opt/zephyr/camoufox/camoufox-python /usr/local/bin/camoufox-python \
     && ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
     && mkdir -p /opt/zephyr/gate/bin \
     && chmod 755 /opt/zephyr/libexec /opt/zephyr/gate /opt/zephyr/gate/bin \
-    && ln -s /usr/local/bin/zephyr /opt/zephyr/gate/bin/agent-browser
+    && ln -s /usr/local/bin/zephyr /opt/zephyr/gate/bin/agent-browser \
+    && ln -s /usr/local/bin/zephyr /opt/zephyr/gate/bin/xdotool
 # The token broker's CA (DESIGN §4.21) is made when a container starts, so the image only says
 # where it will be: Camoufox installs the certificate its policies name (Chromium takes it from
 # the agent's NSS store, with certutil from libnss3-tools; everything else from the system bundle).

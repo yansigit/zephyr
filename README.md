@@ -1099,6 +1099,18 @@ runtime), 160 MB more to pull. `--build-arg SIGNAL=0`
 leaves them out, and an arm64 build has none (libsignal's native library ships for x86_64 only);
 without `/opt/zephyr/signal` the Signal channel is off.
 
+Voice notes (whisper.cpp with Vulkan, a cut-down static ffmpeg, Piper and their models, about
+490 MB in `/opt/zephyr/voice`) are in the image by default. `zephyr up --build` passes no build
+args, so build by hand to change that, then point `ZEPHYR_IMAGE` at the tag:
+- `--build-arg VOICE=0` leaves voice out; `zephyr doctor` then reads `voice: not in this image`.
+- `--build-arg KO_VOICE=1` adds Piper's Korean voice (`ko_KR-kss-medium`), so replies in Korean
+  are spoken too; without it they stay text. Its training data, the KSS dataset, is licensed CC
+  BY-NC-SA 4.0: non-commercial use only. Whisper hears Korean either way.
+
+```sh
+docker build -t zephyr-local:ko --build-arg KO_VOICE=1 -f deploy/Dockerfile .
+```
+
 Pushing a `v*` tag publishes `ghcr.io/yansigit/zephyr:<version>` (`.github/workflows/image.yml`,
 which tags `ghcr.io/<the repository it runs in>`, so a fork publishes to its own).
 
