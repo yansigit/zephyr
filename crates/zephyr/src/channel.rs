@@ -69,45 +69,62 @@ pub trait Channel: Send + Sync {
     }
 }
 
-/// The router's answer for each row an adapter handed it: the row was stored, dropped or
-/// ignored, so the adapter may confirm it to its platform. `Router::inbound` answers on every
-/// path out of it (`Answer`), errors too, so an adapter never waits on a row for good.
+/// The router's answer for each row an adapter handed it, given as soon as the row is stored
+/// (or deliberately left out: a text of spaces, a duplicate): `true`, and the adapter may
+/// confirm it to its platform; `false` when it could not be stored (a write error, a panic),
+/// and the platform must give it again. `Answer` gives `false` if dropped unanswered.
 #[derive(Default)]
 pub struct Acks(
-    std::sync::Mutex<std::collections::HashMap<(String, String), tokio::sync::oneshot::Sender<()>>>,
+    std::sync::Mutex<
+        std::collections::HashMap<(String, String), tokio::sync::oneshot::Sender<bool>>,
+    >,
 );
 
 impl Acks {
     /// Registers `channel`'s row `id` before it is sent: the receiver answers once the router
     /// is done with it.
-    pub fn expect(&self, channel: &str, id: &str) -> tokio::sync::oneshot::Receiver<()> {
+    pub fn expect(&self, channel: &str, id: &str) -> tokio::sync::oneshot::Receiver<bool> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
         all.insert((channel.into(), id.into()), tx);
         rx
     }
 
-    /// The router is done with `channel`'s row `id`. Nothing waits on most rows.
-    pub fn done(&self, channel: &str, id: &str) {
+    /// The router is done with `channel`'s row `id`: `stored`, or not. Nothing waits on most.
+    pub fn done(&self, channel: &str, id: &str, stored: bool) {
         let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(tx) = all.remove(&(channel.to_string(), id.to_string())) {
-            let _ = tx.send(());
+            let _ = tx.send(stored);
         }
     }
 }
 
-/// Answers a row's ack when dropped, so every return of `Router::inbound` answers it.
-pub struct Answer(std::sync::Arc<Acks>, String, String);
+/// A row's answer, from its arrival in `Router::inbound`: `stored` once it is, and "not stored"
+/// if it is dropped unanswered (an error or a panic before the write).
+pub struct Answer(Option<(std::sync::Arc<Acks>, String, String)>);
 
 impl Answer {
     pub fn new(acks: &std::sync::Arc<Acks>, m: &Inbound) -> Self {
-        Self(acks.clone(), m.channel.clone(), m.platform_msg_id.clone())
+        Self(Some((
+            acks.clone(),
+            m.channel.clone(),
+            m.platform_msg_id.clone(),
+        )))
+    }
+
+    /// The row is stored, or deliberately left out: the platform may forget it.
+    pub fn stored(mut self) {
+        if let Some((acks, channel, id)) = self.0.take() {
+            acks.done(&channel, &id, true);
+        }
     }
 }
 
 impl Drop for Answer {
     fn drop(&mut self) {
-        self.0.done(&self.1, &self.2);
+        if let Some((acks, channel, id)) = self.0.take() {
+            acks.done(&channel, &id, false);
+        }
     }
 }
 

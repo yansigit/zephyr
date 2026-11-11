@@ -1998,13 +1998,15 @@ impl<'a> Router<'a> {
     /// `name`: how the sender goes by on a pairing channel (`known`), for a claim's notice.
     async fn inbound(&mut self, m: Inbound, after: bool, name: Option<String>) {
         // Answered however this returns: stored, dropped, a duplicate, ignored or an error.
-        let _answer = crate::channel::Answer::new(&self.acks, &m);
+        // Answered as soon as the row is stored, not when this returns (a command may take
+        // long), and "not stored" if it never is.
+        let answer = crate::channel::Answer::new(&self.acks, &m);
         if m.text.trim().is_empty() {
-            return; // attachment-only messages are not handled in v1
+            return answer.stored(); // attachment-only messages are not handled in v1
         }
         // A pairing claim, before the owner check would drop it, on every intake path.
         if let Some(code) = crate::pairing::claim_on(&m.channel, &m.text) {
-            return self.claim(m, &code, name).await;
+            return self.claim(m, &code, name, answer).await;
         }
         // Decided before the write: a crash in between must not leave a stranger's row `new`.
         let owner = self.cfg.is_owner(&m.channel, &m.sender);
@@ -2017,8 +2019,11 @@ impl<'a> Router<'a> {
             .store
             .insert_inbox_as(cut.as_ref().unwrap_or(&m), status)
         {
-            Ok(Some(id)) => id,
-            Ok(None) => return, // duplicate platform id
+            Ok(Some(id)) => {
+                answer.stored();
+                id
+            }
+            Ok(None) => return answer.stored(), // duplicate platform id: stored before
             Err(e) => return eprintln!("zephyr: inbox write failed: {e}"),
         };
         if !owner {
@@ -3740,14 +3745,20 @@ impl<'a> Router<'a> {
     /// A message on `telegram` or `signal` whose whole text is `/pair CODE`, from anyone. Its row
     /// is stored `dropped` and cut to `/pair`, so the code is never in state.db; a re-delivered
     /// one is a duplicate and claims nothing. A wrong code gets no reply (no oracle).
-    async fn claim(&mut self, m: Inbound, code: &str, name: Option<String>) {
+    async fn claim(
+        &mut self,
+        m: Inbound,
+        code: &str,
+        name: Option<String>,
+        answer: crate::channel::Answer,
+    ) {
         let row = Inbound {
             text: "/pair".into(),
             ..m.clone()
         };
         match self.store.insert_inbox_as(&row, "dropped") {
-            Ok(Some(_)) => {}
-            Ok(None) => return,
+            Ok(Some(_)) => answer.stored(),
+            Ok(None) => return answer.stored(),
             Err(e) => return eprintln!("zephyr: inbox write failed: {e}"),
         }
         let (channel, id) = (m.channel.as_str(), m.sender.as_str());

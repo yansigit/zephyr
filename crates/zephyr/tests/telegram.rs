@@ -241,6 +241,11 @@ impl Channel for Ch {
             Ch::Tg(t) => t.known_as(sender),
         }
     }
+    fn acks(&self, acks: Arc<zephyr::channel::Acks>) {
+        if let Ch::Tg(t) = self {
+            t.acks(acks)
+        }
+    }
 }
 
 struct Gateway {
@@ -289,7 +294,14 @@ fn adapter(cfg: &Config) -> Telegram {
 }
 
 fn start(cfg: Config) -> Gateway {
-    let tg = Arc::new(adapter(&cfg));
+    start_tuned(cfg, |_| {})
+}
+
+/// `start`, the adapter changed by `tune` first.
+fn start_tuned(cfg: Config, tune: impl FnOnce(&mut Telegram)) -> Gateway {
+    let mut tg = adapter(&cfg);
+    tune(&mut tg);
+    let tg = Arc::new(tg);
     let channels = vec![
         Ch::Chat(Chat {
             sent: Default::default(),
@@ -808,17 +820,29 @@ async fn an_update_is_confirmed_only_once_the_router_took_its_row() {
             .collect()
     };
     assert!(offsets(&bot).iter().all(|o| *o == 0), "{:?}", offsets(&bot));
-    acks.done(&row.channel, &row.platform_msg_id);
+    acks.done(&row.channel, &row.platform_msg_id, true);
     wait(|| offsets(&bot).contains(&11)).await;
     run.abort();
 }
 
 #[tokio::test]
-async fn a_row_the_router_does_not_store_still_moves_the_offset_on() {
+async fn a_row_the_router_ignores_moves_the_offset_on() {
+    let home = home("ignored");
+    let (api, bot) = stub().await;
+    // A text of spaces, which the router trims to nothing and never stores, then a message
+    // that must still be answered.
+    push(&bot, [text(10, 55, 1, "   "), text(11, 55, 2, "hi")]);
+    let gw = start(config(&home, &api, ""));
+    wait(|| said(&bot, 55).iter().any(|t| t.contains("hi"))).await;
+    wait(|| calls(&bot, "getUpdates").iter().any(|b| b["offset"] == 12)).await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_row_whose_insert_failed_comes_again_once_the_database_recovers() {
     let home = home("unstored");
     let (api, bot) = stub().await;
     let cfg = config(&home, &api, "");
-    // An insert that fails: the router logs it, and the adapter must not wait on it for good.
     let db = rusqlite::Connection::open(cfg.db_path()).unwrap();
     zephyr::store::Store::open(&cfg.db_path()).unwrap();
     db.execute_batch(
@@ -826,19 +850,38 @@ async fn a_row_the_router_does_not_store_still_moves_the_offset_on() {
          BEGIN SELECT RAISE(ABORT, 'boom'); END;",
     )
     .unwrap();
-    // A text of spaces, which the router trims to nothing and never stores, then the failing
-    // insert, then a message that must still be answered.
-    push(
-        &bot,
-        [
-            text(10, 55, 1, "   "),
-            text(11, 55, 2, "boom"),
-            text(12, 55, 3, "hi"),
-        ],
-    );
+    push(&bot, [text(10, 55, 1, "boom")]);
     let gw = start(cfg);
-    wait(|| said(&bot, 55).iter().any(|t| t.contains("hi"))).await;
-    wait(|| calls(&bot, "getUpdates").iter().any(|b| b["offset"] == 13)).await;
+    // Not stored: the batch is not confirmed, and Telegram gives it again.
+    wait(|| {
+        let polls = calls(&bot, "getUpdates");
+        polls.iter().filter(|b| b["offset"] == 0).count() >= 3
+    })
+    .await;
+    assert!(!calls(&bot, "getUpdates").iter().any(|b| b["offset"] == 11));
+    db.execute_batch("DROP TRIGGER boom;").unwrap();
+    wait(|| said(&bot, 55).iter().any(|t| t.contains("boom"))).await;
+    wait(|| calls(&bot, "getUpdates").iter().any(|b| b["offset"] == 11)).await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_slow_command_does_not_time_its_batch_out() {
+    let home = home("slow-command");
+    let (api, bot) = stub().await;
+    // `/model` asks rpi for its models, held while `list_wait` exists: the router is busy long
+    // after it stored the row.
+    std::fs::write(home.join("list_wait"), "").unwrap();
+    push(&bot, [text(10, 55, 1, "/model fake/m2")]);
+    let gw = start_tuned(config(&home, &api, ""), |tg| {
+        tg.answered_within = Duration::from_millis(500)
+    });
+    wait(|| calls(&bot, "getUpdates").iter().any(|b| b["offset"] == 11)).await;
+    assert!(
+        home.join("list_wait").exists(),
+        "confirmed while the command ran"
+    );
+    std::fs::remove_file(home.join("list_wait")).unwrap();
     gw.shutdown().await;
 }
 

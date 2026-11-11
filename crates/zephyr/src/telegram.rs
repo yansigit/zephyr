@@ -30,8 +30,6 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const TYPING_EVERY: Duration = Duration::from_secs(4);
 const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const MAX_NAMES: usize = 1000;
-/// How long the router may take to answer for a batch's rows before it is fetched again.
-const ANSWERED_WITHIN: Duration = Duration::from_secs(60);
 
 /// The Bot API for one token. No `Debug`: it holds the token.
 #[derive(Clone)]
@@ -155,6 +153,10 @@ pub struct Telegram {
     /// The first wait after a failed poll; it doubles up to 5 minutes.
     #[doc(hidden)]
     pub backoff: Duration,
+    /// How long the router may take to answer for a batch's rows (it answers once each is
+    /// stored) before the batch is fetched again.
+    #[doc(hidden)]
+    pub answered_within: Duration,
 }
 
 impl Telegram {
@@ -179,6 +181,7 @@ impl Telegram {
             typing_warned: Default::default(),
             conflict_wait: Duration::from_secs(30),
             backoff: Duration::from_secs(5),
+            answered_within: Duration::from_secs(60),
         })
     }
 
@@ -246,12 +249,12 @@ impl Telegram {
         // Telegram counts the batch taken at the next call carrying `next`: only once the
         // router is done with every row of it, so a crash before then re-delivers it.
         let all = futures_util::future::join_all(answers);
-        let answered = tokio::time::timeout(ANSWERED_WITHIN, all)
+        let answered = tokio::time::timeout(self.answered_within, all)
             .await
-            .map_err(|_| anyhow::anyhow!("the router took no row of a batch in a minute"))?;
+            .map_err(|_| anyhow::anyhow!("the router took no row of a batch in time"))?;
         anyhow::ensure!(
-            answered.iter().all(Result::is_ok),
-            "the router stopped before it took a batch's rows; they come again"
+            answered.iter().all(|a| matches!(a, Ok(true))),
+            "the router could not store a row of a batch; it comes again"
         );
         *offset = next;
         Ok(())
@@ -262,7 +265,7 @@ impl Telegram {
         &self,
         u: &Value,
         tx: &mpsc::Sender<Inbound>,
-    ) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    ) -> Option<tokio::sync::oneshot::Receiver<bool>> {
         let update = match Update::deserialize(u) {
             Ok(update) => update,
             Err(e) => {
