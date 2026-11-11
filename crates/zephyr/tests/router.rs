@@ -5409,6 +5409,8 @@ async fn the_upgrade_keeps_remote_connectors_as_they_were_and_settles_no_later_o
     assert!(told.ends_with("cannot use a stand-in): docs"), "{told}");
     let saved = std::fs::read_to_string(&path).unwrap();
     assert!(saved.contains("secrets = \"plain\""), "{saved}");
+    // The file itself records that this was done.
+    assert!(saved.contains("[broker]\nsettled = 1"), "{saved}");
     assert_eq!(
         last_logged(&home, "mcp.docs.secrets"),
         (None, Some("plain".into()), "zephyr".into())
@@ -5422,13 +5424,18 @@ async fn the_upgrade_keeps_remote_connectors_as_they_were_and_settles_no_later_o
     assert!(published.contains("Bearer real-docs-token"), "{published}");
     gw.shutdown().await;
 
-    // A remote connector added after the upgrade is not settled for the owner.
+    // A remote connector added after the upgrade is not settled for the owner, also when a
+    // state.db from before the broker is put back: the file remembers.
     let later = format!(
         "{}{}",
         std::fs::read_to_string(&path).unwrap(),
         remote("later")
     );
     std::fs::write(&path, &later).unwrap();
+    rusqlite::Connection::open(home.join("state.db"))
+        .unwrap()
+        .execute("DELETE FROM meta WHERE key LIKE 'broker.%'", [])
+        .unwrap();
     let gw = start(on_file(&home));
     gw.say("m2", "owner", "/mcp").await;
     let listed = gw.wait_reply("- later:").await;

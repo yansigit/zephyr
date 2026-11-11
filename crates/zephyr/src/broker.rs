@@ -129,17 +129,20 @@ pub fn header_name(name: &str) -> Result<String, String> {
 }
 
 /// A value as each kind of JSON encoder writes it inside a string. What an encoder must
-/// escape (`"`, `\`, controls) it does; what it may, each does or does not as a whole: `/`
-/// (raw, `\/` or `\u002f`), the HTML characters `& < > '` (Go and others: `\u0026` …), the
-/// line separators U+2028 and U+2029 (Go, JavaScript), everything not ASCII (`ensure_ascii`),
-/// and `"` as `\u0022`; with the hex of every `\uXXXX` in one case or the other. One form per
-/// such encoder, at most 96, and for a value with none of those characters only itself.
+/// escape (`"`, `\`, controls) it does; what it may, each does or does not as a whole, and
+/// every combination is a form, so serde's and JavaScript's (none of these), Python's
+/// (`ensure_ascii`), PHP's (`\/`, and its HEX flags), Go's (`& < >` and the line separators,
+/// never `'`) and .NET's (all of them, upper case) are each among them: `/` (raw, `\/` or
+/// `\u002f`); `& < >`; `'` with `+` and a backtick; everything not ASCII, with DEL; the line
+/// separators U+2028 and U+2029; `"` as `\u0022`; the hex of every `\uXXXX` in one case or the
+/// other. At most 192 forms, and for a value with none of those characters only itself.
 fn json_forms(value: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for profile in 0..96u8 {
-        // slash: 0 raw, 1 `\/`, 2 `\u002f`; then one bit each.
+    for profile in 0..192u8 {
+        // slash: 0 raw, 1 `\/`, 2 `\u002f`; then one bit for each thing an encoder may do.
         let (slash, rest) = (profile % 3, profile / 3);
-        let [html, wide, lines, quote, upper] = [0, 1, 2, 3, 4].map(|bit| rest >> bit & 1 == 1);
+        let [amp, apos, wide, lines, quote, upper] =
+            [0, 1, 2, 3, 4, 5].map(|bit| rest >> bit & 1 == 1);
         let unit = |unit: u16| match upper {
             true => format!("\\u{unit:04X}"),
             false => format!("\\u{unit:04x}"),
@@ -163,10 +166,14 @@ fn json_forms(value: &str) -> Vec<String> {
                 '\t' => text.push_str("\\t"),
                 '\u{8}' => text.push_str("\\b"),
                 '\u{c}' => text.push_str("\\f"),
-                c if (c as u32) < 0x20 || c == '\u{7f}' => text.push_str(&escaped(c)),
-                '&' | '<' | '>' | '\'' if html => text.push_str(&escaped(c)),
+                c if (c as u32) < 0x20 => text.push_str(&escaped(c)),
+                // Go, and PHP's and .NET's HTML-safe modes.
+                '&' | '<' | '>' if amp => text.push_str(&escaped(c)),
+                // Not Go: PHP's JSON_HEX_APOS, .NET (which also escapes `+` and a backtick).
+                '\'' | '+' | '`' if apos => text.push_str(&escaped(c)),
                 '\u{2028}' | '\u{2029}' if lines || wide => text.push_str(&escaped(c)),
-                c if !c.is_ascii() && wide => text.push_str(&escaped(c)),
+                // DEL goes with what is not ASCII: serde, Go and JavaScript leave it as it is.
+                c if (!c.is_ascii() || c == '\u{7f}') && wide => text.push_str(&escaped(c)),
                 c => text.push(c),
             }
         }
@@ -337,8 +344,10 @@ pub fn shared(cfg: &Config) -> Vec<(String, String, String)> {
 /// `zephyr mcp add` and `/mcp ok`. A pair that was there already is not this change's to
 /// answer for, so an unrelated edit passes while one exists.
 pub fn creates_pair(old: &Config, new: &Config) -> Result<(), String> {
-    let had = shared(old);
-    match shared(new).into_iter().find(|pair| !had.contains(pair)) {
+    // By the secret's name, not by which connectors hold it: a change that leaves a name
+    // held two ways as it was (one of several stand-ins fixed or removed) makes nothing new.
+    let had: Vec<String> = shared(old).into_iter().map(|pair| pair.0).collect();
+    match shared(new).into_iter().find(|pair| !had.contains(&pair.0)) {
         Some((name, plain, other)) => Err(format!(
             "the secret {name} would be held as it is by the connector {plain} and as a stand-in by \
              {other}; one name cannot be both: give one of them a secret of its own"
@@ -899,11 +908,15 @@ impl Map {
     /// of one (as a server would write it, lower case): a name cannot be rewritten into a
     /// stand-in and stay a name, so such a reply is refused whole.
     pub fn in_names(&self, host: &str, headers: &HeaderMap) -> bool {
-        let here = |s: &&Secret| s.value.len() >= MIN_UNSWAP && s.hosts.iter().any(|h| h == host);
+        // A short value would turn up in ordinary names (`type` in `content-type`), and a
+        // refusal here costs the whole reply: only what is long enough to mean the value.
+        const MIN_NAME: usize = 8;
+        let here = |s: &&Secret| s.value.len() >= MIN_NAME && s.hosts.iter().any(|h| h == host);
         let secrets: Vec<&Secret> = self.by.values().filter(here).collect();
         headers.keys().any(|name| {
             let name = name.as_str();
-            let holds = |form: &str| name.contains(&form.to_ascii_lowercase());
+            let holds =
+                |form: &str| form.len() >= MIN_NAME && name.contains(&form.to_ascii_lowercase());
             (secrets.iter()).any(|s| holds(&s.value) || s.forms.iter().any(|f| holds(f)))
         })
     }
@@ -1918,9 +1931,9 @@ mod tests {
         // Bounded: one form per kind of encoder, however many such characters a value holds.
         let worst = "\"\\/&<>'\u{2028}é\u{1}".repeat(8);
         let forms = json_forms(&worst);
-        assert!(forms.len() <= 96, "{}", forms.len());
+        assert!(forms.len() <= 192, "{}", forms.len());
         assert!(
-            encodings(&worst).len() <= 96 + 6 + 6,
+            encodings(&worst).len() <= 192 + 6 + 6,
             "{}",
             encodings(&worst).len()
         );
@@ -1947,5 +1960,81 @@ mod tests {
         let name = hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap();
         h.insert(name, HeaderValue::from_static("1"));
         assert!(!map.in_names("b.test:8443", &h));
+    }
+    /// Each encoder's own form is among them: Go escapes `& < >` and never `'`; serde and
+    /// JavaScript leave DEL as it is.
+    #[test]
+    fn json_forms_hold_each_encoders_own() {
+        let forms = json_forms("p&ss'w0rd-xyz");
+        for form in [
+            r"p\u0026ss'w0rd-xyz",      // Go
+            r"p\u0026ss\u0027w0rd-xyz", // PHP with its HEX flags, .NET (lower case here)
+            "p&ss'w0rd-xyz",            // serde, JavaScript, Python
+        ] {
+            assert!(forms.iter().any(|f| f == form), "{form} not in {forms:?}");
+        }
+        let del = json_forms("a\u{7f}b\u{e9}");
+        assert!(del.iter().any(|f| f == "a\u{7f}b\u{e9}"), "{del:?}");
+        assert!(del.iter().any(|f| f == "a\\u007fb\\u00e9"), "{del:?}");
+        assert!(
+            !del.iter().any(|f| f == "a\\u007fb\u{e9}"),
+            "DEL alone is nobody's: {del:?}"
+        );
+        let worst = "\"\\/&<>'+`\u{2028}é\u{7f}\u{1}".repeat(8);
+        assert!(
+            json_forms(&worst).len() <= 192,
+            "{}",
+            json_forms(&worst).len()
+        );
+    }
+
+    /// The pair check goes by the secret's name: with a name already held two ways, taking
+    /// one of several stand-ins away makes nothing new; another name held two ways does.
+    #[test]
+    fn a_change_is_refused_only_for_a_name_newly_held_two_ways() {
+        let with = |extra: &str| {
+            config(&format!(
+                "[[mcp]]\nname = \"db\"\ncommand = \"db\"\nenv = {{ P = \"${{S}}\" }}\nsecrets = \"plain\"\n\
+                 [[mcp]]\nname = \"api\"\ncommand = \"a\"\nenv = {{ K = \"${{S}}\" }}\nhosts = \"a.test\"\n{extra}"
+            ))
+        };
+        let second = "[[mcp]]\nname = \"api2\"\ncommand = \"a\"\nenv = { K = \"${S}\" }\nhosts = \"a.test\"\n";
+        let (old, both) = (with(""), with(second));
+        // `shared` names the first stand-in it finds: removing that one changes the tuple.
+        let without_first: Config = {
+            let mut cfg = both.clone();
+            cfg.mcp.retain(|m| m.name != "api");
+            cfg
+        };
+        assert_ne!(shared(&both), shared(&without_first));
+        assert!(creates_pair(&both, &without_first).is_ok());
+        assert!(
+            creates_pair(&old, &both).is_ok(),
+            "one more stand-in of the same name"
+        );
+        let other = "[[mcp]]\nname = \"x\"\ncommand = \"x\"\nenv = { K = \"${T}\" }\nsecrets = \"plain\"\n\
+                     [[mcp]]\nname = \"y\"\ncommand = \"y\"\nenv = { K = \"${T}\" }\nhosts = \"y.test\"\n";
+        let refused = creates_pair(&old, &with(other)).unwrap_err();
+        assert!(
+            refused.starts_with("the secret T would be held"),
+            "{refused}"
+        );
+    }
+
+    /// A short value is not looked for in header names: it would refuse ordinary replies.
+    #[test]
+    fn a_short_value_does_not_refuse_ordinary_header_names() {
+        let vault = Vault::parse(
+            "[[token]]\nname = \"S\"\nvalue = \"Type\"\nhosts = [\"a.test:443\"]\n\
+             [[token]]\nname = \"L\"\nvalue = \"Longer-Value-1\"\nhosts = [\"a.test:443\"]\n",
+        );
+        let map = Map::build(&config(""), &vault.unwrap(), &[], &KEY);
+        let named = |name: &'static str| {
+            let mut h = HeaderMap::new();
+            h.insert(name, HeaderValue::from_static("1"));
+            map.in_names("a.test:443", &h)
+        };
+        assert!(!named("content-type") && !named("x-content-type-options"));
+        assert!(named("x-longer-value-1"));
     }
 }

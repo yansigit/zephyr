@@ -2947,21 +2947,28 @@ impl<'a> Router<'a> {
     async fn settle_remote_connectors(&mut self) {
         const KEPT: &str = "broker.remote_kept";
         if matches!(self.store.meta(KEPT), Ok(None)) {
-            // Only an install from before the broker has anything to keep: on a first start,
-            // or with a state.db made anew, a remote connector waits for the owner's word.
-            let names = match self.store.made_with_broker() {
-                true => Vec::new(),
-                false => crate::broker::unsettled(&self.cfg),
+            // Only an install from before the broker has anything to keep, and only once:
+            // the state.db was not made with the broker, it has no record of this having
+            // been done, and neither has the file (`[broker] settled`), which is what a
+            // state.db restored from before cannot undo. On a first start, or with a
+            // state.db made anew, a remote connector waits for the owner's word.
+            let upgrade = !self.store.made_with_broker() && self.cfg.broker.settled == 0;
+            let names = match upgrade {
+                true => crate::broker::unsettled(&self.cfg),
+                false => Vec::new(),
             };
-            let written = match (names.is_empty(), self.cfg.path.clone()) {
-                (true, _) => true,
-                (false, None) => false,
-                (false, Some(path)) => {
+            let written = match (upgrade, self.cfg.path.clone()) {
+                (false, _) => true,
+                // No file to mark: there is nothing to settle in it either.
+                (true, None) => names.is_empty(),
+                (true, Some(path)) => {
                     let edit = crate::host::conf::update(&path, |doc| {
                         for name in &names {
                             let key = format!("mcp.{name}.secrets");
                             crate::settings::write(doc, &key, Some(&"plain".into()))?;
                         }
+                        // In the same edit: done, for this file.
+                        crate::host::conf::set(doc, "broker.settled", "1")?;
                         toml::from_str::<Config>(&doc.to_string())?.validate()
                     });
                     match edit {

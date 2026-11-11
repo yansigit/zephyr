@@ -361,3 +361,17 @@ Results (image `zephyr-dev:a3-0195eac`; container and network removed afterwards
 - `cargo test --no-fail-fast`: 1248 passed, 0 failed, 20 ignored. `clippy -D warnings` clean, `cargo deny check advisories bans` ok.
 - Real rpi 0.21.2: `real_rpi` 6, `rpi_load` 10, ignored `attach` 1, all passed.
 - `tests/token_broker.rs` and `tests/net_floor.rs`, ignored, both passed in `zephyr-test-a3`; its fresh state.db carried `broker.born` and an empty `broker.remote_kept`.
+
+## Follow-up: the fourth review (2026-11-11)
+
+It found no general path to a secret. Seven narrow fixes, each confirmed first; the failing tests came first for 2, 3, 5 and 6.
+
+- [x] **1.** The upgrade that settles remote connectors also writes `[broker] settled = 1` into `zephyr.toml`, in the same edit, and runs only while state.db lacks `broker.born`, lacks `broker.remote_kept` and the file lacks the mark. A state.db from before the broker put back later settles nothing more (`the_upgrade_keeps_remote_connectors_as_they_were_and_settles_no_later_one` now deletes every `broker.*` mark before its second start). On an upgrade with nothing to settle the file still gets the mark.
+- [x] **2.** `json_forms`: `& < >` and `'` are separate choices, so Go's form (`p\u0026ss'w0rd-xyz`) is among them; DEL is escaped only with what is not ASCII. Every combination is generated, at most 192, rather than a list of named encoders: the named ones (serde, JavaScript, Python, PHP, Go, .NET) are each one of the combinations, and an encoder not thought of is likelier to be one too.
+- [x] **3.** `creates_pair` compares the secrets' names held two ways, not the connector tuples.
+- [x] **4.** After a strong `/mcp ok` of a remote connector that is still unsettled, the reply names `/set mcp.NAME.secrets plain` and `zephyr mcp add NAME --plain`, not `zephyr mcp add NAME --secret X`, which is refused for it.
+- [x] **5.** `Store::made_with_broker` counts a mark it cannot read as there, and logs it.
+- [x] **6.** `Map::in_names` looks only for values, and forms, of 8 characters or more.
+- [x] **7.** `zephyr mcp add` checks the new config alone when the one before did not load.
+
+Results: `cargo test --no-fail-fast` 1252 passed, 0 failed, 20 ignored; `clippy -D warnings` clean; `cargo deny check advisories bans` ok; real rpi 0.21.2 `real_rpi` 6, `rpi_load` 10, ignored `attach` 1. The side container was not run again for these.

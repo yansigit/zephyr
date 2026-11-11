@@ -646,7 +646,19 @@ fn ok(cfg: &Config, kind: Kind, name: &str, strong: bool) -> anyhow::Result<(Str
             write_config(cfg, |doc| crate::host::conf::upsert_mcp(doc, &m))?;
             let missing = missing(cfg, &m);
             let mut reply = format!("[zephyr] connector {name} added to zephyr.toml");
-            if !missing.is_empty() {
+            if crate::broker::on(cfg) && crate::broker::undecided(&m) {
+                // Not `zephyr mcp add NAME --secret X` alone, which is refused for it too.
+                let secret = match missing.is_empty() {
+                    true => String::new(),
+                    false => format!(" --secret {}", missing.join(" --secret ")),
+                };
+                reply += &format!(
+                    "; it is left out: it is a remote connector with a secret, which rpi's own \
+                     client can only use as it is, where the agent can read it, and only you can \
+                     allow that: /set mcp.{name}.secrets plain from a strong channel, or `zephyr \
+                     mcp add {name} --plain{secret}` on the host"
+                );
+            } else if !missing.is_empty() {
                 reply += &format!(
                     "; it is left out until secrets.env sets {}: run `zephyr mcp add {name} --secret NAME` on the host",
                     missing.join(", ")
@@ -1851,6 +1863,16 @@ mod tests {
         let said = say(&cfg, "/mcp ok fresh").0;
         assert!(
             said.contains("it is left out: it is a remote connector with a secret"),
+            "{said}"
+        );
+        // The reply names what works: not `mcp add NAME --secret X` alone, which is refused.
+        assert!(
+            said.contains("/set mcp.fresh.secrets plain from a strong channel"),
+            "{said}"
+        );
+        assert!(said.contains("`zephyr mcp add fresh --plain`"), "{said}");
+        assert!(
+            !said.contains("run `zephyr mcp add fresh --secret"),
             "{said}"
         );
         let mut new = Config::load(cfg.path.as_ref().unwrap()).unwrap();

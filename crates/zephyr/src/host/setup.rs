@@ -936,9 +936,12 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
     }
     let now = parse(&doc)?;
     // As `/set`: this may not make one secret a connector's own and another's stand-in.
-    if let Some(was) = &was {
-        crate::broker::creates_pair(was, &now).map_err(anyhow::Error::msg)?;
-    }
+    // With no config that read before, the new one alone must hold none.
+    let made = match &was {
+        Some(was) => crate::broker::creates_pair(was, &now),
+        None => crate::broker::shared_notice(&now).map_or(Ok(()), Err),
+    };
+    made.map_err(anyhow::Error::msg)?;
     if !secrets.is_empty() && !h.interactive {
         bail!("--secret asks for the value: run it in a terminal");
     }

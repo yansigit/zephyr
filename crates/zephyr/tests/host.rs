@@ -1973,6 +1973,32 @@ fn config_set_while_stopped_reaches_a_connectors_table() {
     env.ok(&[
         "mcp", "add", "api2", "--host", "api.test", "--", "api", "${THIRD}",
     ]);
+    // When the config as it is does not load, there is no "before" to compare with: the new
+    // one alone must hold no pair.
+    let good = env.config();
+    let broken = good.replace(
+        "name = \"api2\"",
+        "name = \"api2\"\nurl = \"https://both.test\" # and a command: not a connector",
+    );
+    assert!(broken != good);
+    std::fs::write(env.daemon().join("zephyr.toml"), &broken).unwrap();
+    let mend = [
+        "mcp",
+        "add",
+        "api2",
+        "--host",
+        "api.test",
+        "--",
+        "api",
+        "${SHARED}",
+    ];
+    let out = env.zephyr(&mend);
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !out.status.success() && said.contains("one name cannot be both"),
+        "{said}"
+    );
+    std::fs::write(env.daemon().join("zephyr.toml"), &good).unwrap();
     // A pair that is there already (a hand edit) does not stop an unrelated change.
     let path = env.daemon().join("zephyr.toml");
     let paired = env.config().replace("\"${THIRD}\"", "\"${SHARED}\"");
