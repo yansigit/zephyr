@@ -500,6 +500,97 @@ pub static SETTINGS: &[Setting] = &[
         Apply::Toml,
     ),
     row(
+        "calls.provider",
+        "Phone calls",
+        "Provider",
+        "The telephony provider the daemon places calls with; none turns phone calls off. Its \
+         key is saved with zephyr vault add service calls.",
+        Kind::Optional(&Kind::Choice(&["telnyx"])),
+        Access::Propose,
+        true,
+        Stricter::NotOrdered,
+        Apply::Toml,
+    ),
+    row(
+        "calls.max_minutes",
+        "Phone calls",
+        "Longest call",
+        "A call is ended after this many minutes, with a closing line 30 seconds before.",
+        Kind::Int { min: 1, max: 20 },
+        Access::Propose,
+        true,
+        Stricter::Lower,
+        Apply::Toml,
+    ),
+    row(
+        "calls.caller_name",
+        "Phone calls",
+        "Caller name",
+        "Who the opening line says the call is for. A call cannot run without it.",
+        Kind::Optional(&Kind::Text { max: 40 }),
+        Access::Propose,
+        false,
+        Stricter::NotOrdered,
+        Apply::Toml,
+    ),
+    row(
+        "calls.contact_phone",
+        "Phone calls",
+        "Contact number",
+        "The local or toll-free number the opening line gives for reaching you (CRTC ADAD \
+         rule 4(d)).",
+        Kind::Optional(&Kind::Text { max: 30 }),
+        Access::Propose,
+        false,
+        Stricter::NotOrdered,
+        Apply::Toml,
+    ),
+    row(
+        "calls.contact_email",
+        "Phone calls",
+        "Contact email",
+        "The email address the opening line gives; this or a postal address is required.",
+        Kind::Optional(&Kind::Text { max: 100 }),
+        Access::Propose,
+        false,
+        Stricter::NotOrdered,
+        Apply::Toml,
+    ),
+    row(
+        "calls.contact_address",
+        "Phone calls",
+        "Contact address",
+        "The postal address the opening line gives when there is no email.",
+        Kind::Optional(&Kind::Text { max: 200 }),
+        Access::Propose,
+        false,
+        Stricter::NotOrdered,
+        Apply::Toml,
+    ),
+    row(
+        "calls.model",
+        "Phone calls",
+        "Call model",
+        "The model that speaks on a call; a fast one, since each turn is a model turn. None \
+         follows the task model, then the account.",
+        Kind::Optional(&Kind::Model),
+        Access::Propose,
+        false,
+        Stricter::NotOrdered,
+        Apply::Toml,
+    ),
+    row(
+        "calls.keep_days",
+        "Phone calls",
+        "Keep transcripts",
+        "A call's transcript is deleted after this many days. No audio is ever kept.",
+        Kind::Int { min: 1, max: 90 },
+        Access::Propose,
+        false,
+        Stricter::Lower,
+        Apply::Toml,
+    ),
+    row(
         "facts",
         "Approvals",
         "Private facts",
@@ -1112,6 +1203,14 @@ pub fn value(cfg: &Config, key: &str) -> Option<String> {
             Some(max.unwrap_or(crate::cards::MAX).to_string())
         }
         "cards.minutes" => Some(crate::cards::minutes(cfg).to_string()),
+        "calls.provider" => cfg.calls().provider,
+        "calls.max_minutes" => Some(cfg.calls().max_minutes.to_string()),
+        "calls.caller_name" => cfg.calls().caller_name,
+        "calls.contact_phone" => cfg.calls().contact_phone,
+        "calls.contact_email" => cfg.calls().contact_email,
+        "calls.contact_address" => cfg.calls().contact_address,
+        "calls.model" => cfg.calls().model,
+        "calls.keep_days" => Some(cfg.calls().keep_days.to_string()),
         key if key.starts_with("approvals.") => {
             crate::approvals::value(cfg, &key["approvals.".len()..])
         }
@@ -1946,6 +2045,50 @@ mod tests {
         assert_eq!(decide(s, &agent, lower, &strong()), Verdict::Propose);
         let discord = Actor::Owner { channel: "discord" };
         assert_eq!(decide(s, &discord, lower, &strong()), Verdict::Apply);
+    }
+
+    #[test]
+    fn the_calls_rows_parse_and_default() {
+        let cfg: Config = toml::from_str("rpi = '/r'\nhome = '/h'").unwrap();
+        for (key, default, strong) in [
+            ("calls.provider", None, true),
+            ("calls.max_minutes", Some("5"), true),
+            ("calls.caller_name", None, false),
+            ("calls.contact_phone", None, false),
+            ("calls.contact_email", None, false),
+            ("calls.contact_address", None, false),
+            ("calls.model", None, false),
+            ("calls.keep_days", Some("30"), false),
+        ] {
+            let s = find(key).unwrap();
+            assert_eq!(
+                (s.agent, s.strong, s.apply),
+                (Access::Propose, strong, Apply::Toml),
+                "{key}"
+            );
+            assert_eq!(value(&cfg, key).as_deref(), default, "{key}");
+        }
+        let minutes = find("calls.max_minutes").unwrap();
+        assert!(parse(minutes, "20").is_ok() && parse(minutes, "21").is_err());
+        assert_eq!(minutes.stricter, Stricter::Lower);
+        let provider = find("calls.provider").unwrap();
+        assert!(parse(provider, "telnyx").is_ok() && parse(provider, "twilio").is_err());
+        let cfg: Config = toml::from_str(
+            "rpi = '/r'\nhome = '/h'\n[calls]\nprovider = 'telnyx'\nmax_minutes = 3\nmedia_url = 'wss://box.example.ts.net'",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(value(&cfg, "calls.max_minutes").as_deref(), Some("3"));
+        for bad in [
+            "max_minutes = 21",
+            "provider = 'twilio'",
+            "media_url = 'wss://h/path'",
+            "keep_days = 0",
+        ] {
+            let text = format!("rpi = '/r'\nhome = '/h'\n[calls]\n{bad}");
+            let cfg: Config = toml::from_str(&text).unwrap();
+            assert!(cfg.validate().is_err(), "{bad}");
+        }
     }
 
     #[test]

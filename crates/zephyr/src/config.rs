@@ -127,6 +127,25 @@ pub struct Config {
     pub link_api: String,
     #[serde(skip, default = "link_auth")]
     pub link_auth: String,
+    /// `[calls]`: phone calls (DESIGN §4.22). Off without a `provider`. `Config::calls` reads it.
+    pub calls: Option<Calls>,
+    /// Lets the calls listener run outside the network floor. Not configurable, and off; the
+    /// tests' process is not a container, and sets it.
+    #[serde(skip)]
+    pub calls_off_floor: bool,
+    /// How long a dialled call may go unanswered: Telnyx rings for 30 s. Not configurable; tests
+    /// shorten it.
+    #[serde(skip, default = "calls_ring")]
+    pub calls_ring: std::time::Duration,
+    /// A call on which nobody has spoken for this long is ended. Not configurable; tests shorten it.
+    #[serde(skip, default = "calls_silence")]
+    pub calls_silence: std::time::Duration,
+    /// The clock the calling hours are read from. Not configurable, and the real one; tests fix it.
+    #[serde(skip)]
+    pub calls_now: Option<i64>,
+    /// What a call's cap is counted in: a minute. Not configurable; tests shorten it.
+    #[serde(skip, default = "calls_minute")]
+    pub calls_minute: std::time::Duration,
     /// The image's voice folder (`voice::DIR`): ffmpeg, whisper-cli, Piper, models and voices.
     /// Not configurable; tests point it at small fakes.
     #[serde(skip, default = "voice_dir")]
@@ -206,6 +225,18 @@ fn link_api() -> String {
 
 fn link_auth() -> String {
     crate::cards_link::AUTH.into()
+}
+
+fn calls_ring() -> std::time::Duration {
+    std::time::Duration::from_secs(45)
+}
+
+fn calls_silence() -> std::time::Duration {
+    std::time::Duration::from_secs(20)
+}
+
+fn calls_minute() -> std::time::Duration {
+    std::time::Duration::from_secs(60)
 }
 
 fn telegram_api() -> String {
@@ -409,6 +440,49 @@ pub struct Browser {
 
 /// `browser.pace_ms` when the owner set none.
 pub const PACE_MS: u64 = 1500;
+
+/// `[calls]` (DESIGN §4.22).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Calls {
+    /// `telnyx`; absent, calls are off.
+    pub provider: Option<String>,
+    /// The port Telnyx's media connection and webhooks come in on, behind the owner's
+    /// `tailscale funnel` (DESIGN §4.20).
+    pub port: Option<u16>,
+    /// That listener's public address as Telnyx reaches it: `wss://host[:port]`.
+    pub media_url: Option<String>,
+    /// A call is ended after this many minutes, 1 to 20.
+    pub max_minutes: u64,
+    /// Who the opening line says the call is for.
+    pub caller_name: Option<String>,
+    /// Where the other party can reach the owner (CRTC ADAD rule 4(d)): a number, and an email
+    /// or a postal address.
+    pub contact_phone: Option<String>,
+    pub contact_email: Option<String>,
+    pub contact_address: Option<String>,
+    /// `provider/model` for the call's own agent; `None` follows `[tasks] model`, then the account.
+    pub model: Option<String>,
+    /// A transcript is deleted after this many days, 1 to 90.
+    pub keep_days: u64,
+}
+
+impl Default for Calls {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            port: None,
+            media_url: None,
+            max_minutes: 5,
+            caller_name: None,
+            contact_phone: None,
+            contact_email: None,
+            contact_address: None,
+            model: None,
+            keep_days: 30,
+        }
+    }
+}
 
 /// `[tasks]` (DESIGN §4.12).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -680,6 +754,11 @@ impl Config {
         self.cards_fake = running.cards_fake;
         self.link_api = running.link_api.clone();
         self.link_auth = running.link_auth.clone();
+        self.calls_off_floor = running.calls_off_floor;
+        self.calls_ring = running.calls_ring;
+        self.calls_silence = running.calls_silence;
+        self.calls_now = running.calls_now;
+        self.calls_minute = running.calls_minute;
     }
 
     /// Account names become directory names, so each must be a plain, unique path segment.
@@ -717,6 +796,16 @@ impl Config {
         (self.browser.as_ref())
             .and_then(|b| b.pace_ms)
             .unwrap_or(PACE_MS)
+    }
+
+    /// `[calls]`, with its defaults when the table or a key is absent.
+    pub fn calls(&self) -> Calls {
+        self.calls.clone().unwrap_or_default()
+    }
+
+    /// The clock the calling hours are read from.
+    pub fn calls_clock(&self) -> i64 {
+        self.calls_now.unwrap_or_else(crate::now)
     }
 
     /// `[review] at`, when the daily review is on.
@@ -799,6 +888,31 @@ impl Config {
             if c.provider.as_deref() == Some("manual") && !strong {
                 anyhow::bail!("[cards] needs approvals.strong_only to include money");
             }
+        }
+        let calls = self.calls();
+        if calls.provider.as_deref().is_some_and(|p| p != "telnyx") {
+            anyhow::bail!("[calls] provider must be telnyx");
+        }
+        if !(1..=20).contains(&calls.max_minutes) {
+            anyhow::bail!("[calls] max_minutes must be 1 to 20");
+        }
+        if !(1..=90).contains(&calls.keep_days) {
+            anyhow::bail!("[calls] keep_days must be 1 to 90");
+        }
+        // Telnyx signs this exact address, so it has no path, query or trailing slash of its own.
+        let host = |u: &str| {
+            u.strip_prefix("wss://").is_some_and(|h| {
+                !h.is_empty()
+                    && h.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-.:".contains(c))
+            })
+        };
+        if calls.media_url.as_deref().is_some_and(|u| !host(u)) {
+            anyhow::bail!("[calls] media_url must be wss://HOST[:PORT], with no path");
+        }
+        let shaped = zephyr_policy::tools::model_shape;
+        if let Some(m) = calls.model.as_deref().filter(|m| !shaped(m)) {
+            anyhow::bail!("[calls] model {m:?}: use PROVIDER/MODEL");
         }
         if !(1..=32).contains(&self.parallel_tasks()) {
             anyhow::bail!("[tasks] parallel must be 1 to 32");

@@ -91,6 +91,16 @@ pub fn present(cfg: &Config) -> bool {
     cfg.voice_dir.join("bin/whisper-cli").exists()
 }
 
+/// Whether the image has the Piper voice a call in `lang` is spoken with (`en`, `ko`).
+pub fn call_voice(cfg: &Config, lang: &str) -> bool {
+    let voice = match lang {
+        "en" => VOICE_EN,
+        "ko" => VOICE_KO,
+        _ => return false,
+    };
+    cfg.voice_dir.join(voice).exists()
+}
+
 /// `5:00`.
 pub fn m_ss(secs: u64) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
