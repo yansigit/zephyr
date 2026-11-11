@@ -94,15 +94,19 @@ pub const NOT_SET_UP: &str = "not run: the call provider is not set up (zephyr v
                               service calls on the host)";
 
 impl Telnyx {
+    /// The client. Whether the vault has a usable `calls` service is found at each request.
+    pub fn new(cfg: &Config) -> Telnyx {
+        let http = reqwest::Client::builder().timeout(HTTP_WAIT).build();
+        Telnyx {
+            vault: crate::vault::path(cfg),
+            // The builder fails only when the TLS backend cannot start, as `Client::new` would.
+            http: http.unwrap_or_default(),
+        }
+    }
+
     /// The client, once the vault has a usable `calls` service.
     pub fn load(cfg: &Config) -> Result<Telnyx, String> {
-        let telnyx = Telnyx {
-            vault: crate::vault::path(cfg),
-            http: reqwest::Client::builder()
-                .timeout(HTTP_WAIT)
-                .build()
-                .map_err(|e| format!("the HTTP client could not start: {e}"))?,
-        };
+        let telnyx = Telnyx::new(cfg);
         telnyx.service().map(|_| telnyx)
     }
 

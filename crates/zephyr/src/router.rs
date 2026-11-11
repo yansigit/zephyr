@@ -343,6 +343,8 @@ pub async fn run<C: Channel>(
         c.acks(router.acks.clone());
     }
     let waits = router.waits.clone();
+    let calls = router.calls.clone();
+    let call_starts = router.call_starts.take().expect("taken once, here");
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
         r = runs => r.map(|_| Exit::Shutdown),
@@ -353,6 +355,8 @@ pub async fn run<C: Channel>(
         r = crate::attach::serve(cfg, handles.clone()) => r.map(|()| Exit::Shutdown),
         r = crate::web::serve(cfg, handles, hub) => r.map(|()| Exit::Shutdown),
         r = crate::scheduler::run(cfg_rx.clone(), &jobs) => r.map(|()| Exit::Shutdown),
+        // Telnyx's listener and the calls in progress (DESIGN §4.22).
+        r = crate::calls::live::run(cfg_rx.clone(), &jobs, calls, call_starts) => r.map(|()| Exit::Shutdown),
         r = crate::tasks::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),
         r = show_activity(channels, activity_rx, cfg.tick) => r.map(|()| Exit::Shutdown),
         r = router.main(rx, channels, shutdown) => r,
@@ -546,6 +550,9 @@ struct Router<'a> {
     procs: crate::procs::Procs,
     /// Browser actions waiting in place for the owner's answer (approvals spec §4.4).
     waits: crate::actions::Waits,
+    /// The phone calls in progress (DESIGN §4.22), and the starts `calls::live::run` takes.
+    calls: crate::calls::live::Calls,
+    call_starts: Option<mpsc::UnboundedReceiver<crate::calls::live::Start>>,
     /// Who holds the desktop: the owner's takeover, or the vault's fill (DESIGN §4.11).
     desktop: Arc<crate::desktop::Control>,
     /// `desktop`'s takes and hand backs, each once and in order.
@@ -670,6 +677,7 @@ impl<'a> Router<'a> {
     ) -> anyhow::Result<Self> {
         let shared = cfg_tx.borrow().clone();
         let desktop = crate::desktop::Control::new(cfg);
+        let (calls, call_starts) = crate::calls::live::Calls::new();
         Ok(Router {
             cfg: shared,
             edits: edits(cfg),
@@ -725,6 +733,8 @@ impl<'a> Router<'a> {
             stopping: false,
             procs: Default::default(),
             waits: Default::default(),
+            calls,
+            call_starts: Some(call_starts),
             desktop_events: desktop.events(),
             desktop_note: None,
             desktop,
@@ -1078,6 +1088,7 @@ impl<'a> Router<'a> {
             procs: &self.procs,
             waits: &self.waits,
             steers: &self.jobs.steers,
+            calls: &self.calls,
         }
     }
 
@@ -2308,6 +2319,7 @@ impl<'a> Router<'a> {
                 }
                 self.procs.stop_all();
                 crate::cards::close_all(&self.cfg, &self.store, "the gateway was paused");
+                self.calls.hangup_all("the owner (/pause)");
                 "[zephyr] paused: messages wait in the inbox until /resume"
             }
             "/resume" => {
@@ -2329,6 +2341,8 @@ impl<'a> Router<'a> {
                 crate::actions::stop(&self.cfg, &self.store, &self.waits);
                 // Every card still open is closed at its issuer (DESIGN §4.25).
                 crate::cards::close_all(&self.cfg, &self.store, "the owner's /stop");
+                // A call in progress is hung up at once.
+                self.calls.hangup_all("the owner (/stop)");
                 "[zephyr] stopped"
             }
         };
@@ -2832,6 +2846,8 @@ impl<'a> Router<'a> {
             ("/unpair", arg) => self.unpair(arg).await,
             // Held messages, posts and payments (approvals spec §4.6).
             ("/held", "") => crate::actions::held(&self.cfg, &self.store),
+            // Ends a phone call (DESIGN §4.22). It only tightens, so any owner channel may.
+            ("/hangup", n) => self.calls.hangup(n),
             // The daemon's own record (DESIGN §4.19), answered outside the queue.
             ("/activity", arg) => crate::activity::chat(&self.cfg, &self.store, arg, crate::now()),
             ("/cancel", n) => {
@@ -5601,6 +5617,7 @@ fn daemon_row(platform_id: &str) -> String {
         Some(("task", n)) => format!("took in task #{n}'s report"),
         Some(("proc", n)) => format!("took in process #{n}'s report"),
         Some(("action", n)) => format!("took in action #{n}'s result"),
+        Some(("call", n)) => format!("took in phone call #{n}'s transcript"),
         _ => "took in a message zephyr wrote".into(),
     }
 }

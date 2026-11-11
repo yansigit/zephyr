@@ -85,6 +85,8 @@ pub struct Ctx<'a> {
     pub waits: &'a Waits,
     /// The task and job runs in progress, which a pass's note is steered into.
     pub steers: &'a Steers,
+    /// The phone calls in progress (DESIGN §4.22).
+    pub calls: &'a crate::calls::live::Calls,
 }
 
 /// Who approves an action: the owner on a channel, or its delay running out (the tick).
@@ -122,6 +124,15 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
         }
         // The payment window, whatever `strong_only` says (DESIGN §4.25).
         crate::gate::window_check(ctx.cfg, store, &a, is_strong, now)?;
+    }
+    // A phone call is checked again as things are now (DESIGN §4.22): approved out of the
+    // calling hours where it rings, it stays waiting for an `/ok` inside them.
+    if a.kind == ActionKind::Call {
+        let args: Value = serde_json::from_str(&a.payload).unwrap_or_default();
+        if let Err(why) = crate::calls::check(ctx.cfg, &args, ctx.cfg.calls_clock()) {
+            let why = why.trim_start_matches("not run: ");
+            return Err(format!("[zephyr] {why}; /ok {id} again then"));
+        }
     }
     // Before it is taken, so a full process table leaves the approval waiting (R44).
     if a.kind == ActionKind::Run && !store.proc_slot_free().map_err(failed)? {
@@ -164,7 +175,7 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
         ActionKind::Pass => pass(ctx, &a, by, now),
         ActionKind::Wait => wait(ctx, &a),
         ActionKind::Card => card(ctx, &a),
-        ActionKind::Call => Err("phone calls cannot be placed yet".into()),
+        ActionKind::Call => call(ctx, &a),
     };
     let (n, s) = (a.id, summary(ctx.cfg, &a));
     Ok(match (started, by) {
@@ -186,6 +197,10 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
 /// Under `ask-new` the approved action's targets are known from now on (spec §4.3): what the
 /// owner's answer adds, the targets that were new.
 fn remember(cfg: &Config, store: &Store, a: &Action) -> String {
+    // A number is never remembered: every call waits for the owner.
+    if a.kind == ActionKind::Call {
+        return String::new();
+    }
     let e = approvals::effective(cfg);
     let mode = match a.class.as_str() {
         "messages" => e.messages,
@@ -289,6 +304,13 @@ fn card(ctx: &Ctx, a: &Action) -> Result<String, String> {
     }
     crate::cards::issue_approved(ctx.cfg, checked, ask, a);
     Ok("issuing the card; what to do next follows".into())
+}
+
+/// A phone call: the daemon dials it now (`calls::live`). It stays `running` until the call
+/// ends, which closes it and hands main the transcript.
+fn call(ctx: &Ctx, a: &Action) -> Result<String, String> {
+    let to = origin(ctx.store, a).ok_or("there is no owner to report to")?;
+    ctx.calls.start(ctx.cfg, a, to)
 }
 
 /// A browser action: the wrapper waiting on it goes on, if it still waits. It stays `running`
@@ -724,6 +746,75 @@ mod tests {
         assert!(cancel(&cfg, &store, &waits, "x").is_err());
     }
 
+    /// DESIGN §4.22: a call approved outside the calling hours where it rings stays waiting.
+    #[test]
+    fn an_ok_out_of_hours_leaves_the_call_pending() {
+        use crate::calls::tests::{noon, toronto};
+        let (cfg, store) = setup(
+            "actions-call",
+            "[calls]\nprovider = 'telnyx'\ncaller_name = 'A'\ncontact_phone = '416-555-0199'\n\
+             contact_email = 'a@example.com'\n",
+        );
+        let mut at_noon = (*cfg).clone();
+        at_noon.voice_dir = cfg.home.join("voice");
+        std::fs::create_dir_all(at_noon.voice_dir.join("voices")).unwrap();
+        std::fs::write(
+            at_noon.voice_dir.join("voices/en_US-lessac-medium.onnx"),
+            "",
+        )
+        .unwrap();
+        at_noon.calls_now = Some(noon());
+        let req = crate::gate::Request {
+            session: "main".into(),
+            call_id: Some("c1".into()),
+            tool: "call".into(),
+            args: serde_json::json!({"number": "416-555-0123", "purpose": "book a table"}),
+            browser: None,
+            run: "main:1".into(),
+            reason: None,
+        };
+        let owner = ("chat".to_string(), "o".to_string());
+        let held = crate::gate::decide(&at_noon, &store, &req, owner, crate::now());
+        let crate::gate::Verdict::Hold { id, .. } = held else {
+            panic!("{held:?}")
+        };
+        let (procs, waits, steers) = (Procs::default(), Waits::default(), Steers::default());
+        let calls = crate::calls::live::Calls::idle();
+        let ctx = |cfg| Ctx {
+            cfg,
+            store: &store,
+            procs: &procs,
+            waits: &waits,
+            steers: &steers,
+            calls: &calls,
+        };
+        let by = By::Owner { channel: "chat" };
+        // 21:45 on a Tuesday in Toronto.
+        let late = Arc::new(Config {
+            calls_now: Some(toronto("2026-11-10", "21:45")),
+            ..at_noon.clone()
+        });
+        assert_eq!(
+            approve(&ctx(&late), id, false, by, crate::now()).unwrap_err(),
+            format!(
+                "[zephyr] not after 21:30 their time (calls only 9:00–21:30 weekdays, \
+                 10:00–18:00 weekends their time); /ok {id} again then"
+            )
+        );
+        assert_eq!(store.action(id).unwrap().unwrap().status, "pending");
+        // Inside the hours it is taken; with nowhere for Telnyx to reach zephyr it does not
+        // start, and says why. Its number is never remembered.
+        let at_noon = Arc::new(at_noon);
+        let said = approve(&ctx(&at_noon), id, false, by, crate::now()).unwrap();
+        assert!(
+            said.contains("but it did not start: set [calls] port and media_url"),
+            "{said}"
+        );
+        assert_eq!(store.action(id).unwrap().unwrap().status, "failed");
+        let number = ["tel:+14165550123".to_string()];
+        assert!(!store.all_known("messages", &number).unwrap());
+    }
+
     /// R46: a target becomes known only once its action started.
     #[test]
     fn a_target_is_remembered_only_when_its_action_starts() {
@@ -735,6 +826,7 @@ mod tests {
             procs: &procs,
             waits: &waits,
             steers: &steers,
+            calls: &crate::calls::live::Calls::idle(),
         };
         // Its token is not in the vault: it cannot start.
         let id = hold(&store, ActionKind::Run, SEND, &["NOPE"], None);
@@ -763,6 +855,7 @@ mod tests {
             procs: &procs,
             waits: &waits,
             steers: &steers,
+            calls: &crate::calls::live::Calls::idle(),
         };
         let now = crate::now();
         let pass = r#"{"server": "mail", "tool": "send", "arguments": {"to": "a@x.org"}}"#;
@@ -815,6 +908,7 @@ mod tests {
             procs: &procs,
             waits: &waits,
             steers: &steers,
+            calls: &crate::calls::live::Calls::idle(),
         };
         let pass = r#"{"server": "mail", "tool": "send", "arguments": {"to": "a@x.org"}}"#;
         let from = |session: &str| {
@@ -912,6 +1006,7 @@ mod tests {
             procs: &procs,
             waits: &waits,
             steers: &steers,
+            calls: &crate::calls::live::Calls::idle(),
         };
         tick(&ctx, now + 301, false);
         assert_eq!(
@@ -1002,6 +1097,7 @@ mod tests {
             procs: &procs,
             waits: &waits,
             steers: &steers,
+            calls: &crate::calls::live::Calls::idle(),
         };
         tick(&ctx, now + 301, false);
         assert_eq!(store.action(due).unwrap().unwrap().status, "pending");
@@ -1120,6 +1216,7 @@ mod tests {
             procs: &procs,
             waits: &waits,
             steers: &steers,
+            calls: &crate::calls::live::Calls::idle(),
         };
         tick(&ctx, now + 301, false);
         let told = told(&store);
@@ -1177,12 +1274,14 @@ mod tests {
             .unwrap();
         let ask_new = again(&held_cfg, "[approvals]\nmessages = 'ask-new'\n");
         let (procs, waits, steers) = (Procs::default(), Waits::default(), Steers::default());
+        let calls = crate::calls::live::Calls::idle();
         let ctx = |cfg| Ctx {
             cfg,
             store: &store,
             procs: &procs,
             waits: &waits,
             steers: &steers,
+            calls: &calls,
         };
         // Only the first two are due by now + 301 if the third is pushed back: tick them alone.
         let db = rusqlite::Connection::open(ask_new.db_path()).unwrap();
@@ -1278,6 +1377,7 @@ mod tests {
             procs: &procs,
             waits: &waits,
             steers: &steers,
+            calls: &crate::calls::live::Calls::idle(),
         };
         let now = crate::now();
         let pass = r#"{"server": "mail", "tool": "send", "arguments": {"to": "a@x.org"}}"#;

@@ -21,7 +21,7 @@ Accounts: each start logs {"type": "start", "agentDir", "model"} to ./log.jsonl.
 `rate_limited` file in $RPI_CODING_AGENT_DIR holds an error text: every prompt then ends with
 that error (stopReason "error", settle outcome "failed"), as a rate-limited provider does.
 A prompt containing WRITE_MEMORY first writes memory/MEMORY.md under the home.
-argv.json holds the argv of the latest start. With a `tool_sleep` file in the home, each start
+argv.json holds the argv of the latest start, and `env-<session id>.json` the environment of that session's latest start. With a `tool_sleep` file in the home, each start
 leaves a `sleep 300` running in its process group, as a tool would, its pid in `tool_pid`. With a
 `stray` file, each start leaves a `setsid sleep 300` that escaped through a shell that exited (an
 orphan in its own session, as an agent's `setsid cmd &` is), its pid in `stray_pid`. A `stray_soon`
@@ -268,6 +268,8 @@ extension = opt("--extension")
 if not ephemeral:  # `pid` is main's, for the tests that kill it
     open(os.path.join(home, "pid"), "w").write(str(os.getpid()))
 json.dump(args, open(os.path.join(home, "argv.json"), "w"))  # the flags this child was started with
+# What it was started with, per session: `env-<session id>.json`.
+json.dump(dict(os.environ), open(os.path.join(home, "env-%s.json" % (opt("--session-id") or "none")), "w"))
 open(os.path.join(home, "log.jsonl"), "a").write(json.dumps(
     {"type": "start", "agentDir": os.environ.get("RPI_CODING_AGENT_DIR"), "model": opt("--model"),
      "sessionId": opt("--session-id"), "noSession": ephemeral, "noTools": not tools}) + "\n")
@@ -750,10 +752,10 @@ for line in iter(next_line, None):
         script = os.path.join(home, "call_script")
         if (opt("--session-id") or "").startswith("call-") and os.path.exists(script):
             # A phone call's agent: each turn says the script's next line (the last one again).
-            said = open(script).read().split("\n")
-            if len(said) > 1:
-                open(script, "w").write("\n".join(said[1:]))
-            finish(s, said[0]); continue
+            turns = open(script).read().split("\n")
+            if len(turns) > 1:
+                open(script, "w").write("\n".join(turns[1:]))
+            finish(s, turns[0]); continue
         if "[stop-after-steer]" in cmd["message"] and steered_this_run:
             finish(s, ""); continue
         if "reply with exactly NO_REPLY" in cmd["message"] and "[unfinished]" not in cmd["message"]:

@@ -2456,7 +2456,7 @@ fn call_lines(cfg: &Config, a: &Action, scrub: &Scrub) -> Vec<String> {
         ),
         format!(
             "the call opens: \"{}\"",
-            quoted(&crate::calls::opening(cfg, &ask, false))
+            quoted_cut(&crate::calls::opening(cfg, &ask, false), BODY_CHARS)
         ),
     ];
     if !field("business").trim().is_empty() {
@@ -3456,6 +3456,7 @@ mod tests {
             procs: &procs,
             waits: &waits,
             steers: &steers,
+            calls: &crate::calls::live::Calls::idle(),
         };
         let now = crate::now();
         let send = |run: &str| {

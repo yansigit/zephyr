@@ -98,7 +98,7 @@ pub struct Proposal {
 impl Proposal {
     /// A held message, post or payment, not a command or a setting.
     fn action(&self) -> bool {
-        matches!(self.kind.as_str(), "run" | "pass" | "wait")
+        matches!(self.kind.as_str(), "run" | "pass" | "wait" | "call")
     }
 
     /// An action waiting out its delay: `c` cancels it before it goes.
