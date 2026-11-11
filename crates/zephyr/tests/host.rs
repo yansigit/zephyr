@@ -827,6 +827,8 @@ fn up_build_passes_the_gh_token_as_a_secret_only() {
         .unwrap()
         .contains("GH_TOKEN set"));
     assert!(!format!("{calls:?}").contains(GH_TOKEN));
+    // The image's defaults, the full provider set: no build arg moves them.
+    assert!(!build.iter().any(|a| a == "--build-arg"), "{build:?}");
 
     // A missing image is pulled; a failed pull logs in with gh's token on stdin.
     let out = env.zephyr_env(&["up"], &[("SHIM_IMAGE_MISSING", "1")]);
@@ -2435,6 +2437,33 @@ fn the_image_workflow_tags_the_repository_it_runs_in() {
         "{:?}",
         tags.collect::<Vec<_>>()
     );
+}
+
+/// The tag build smoke-tests every extension the CLI lists; a manual `providers: none` run builds
+/// the image without the owner's provider sources and checks that they are absent.
+#[test]
+fn the_image_workflow_smoke_tests_every_extension() {
+    let yml = read(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../.github/workflows/image.yml"
+    )));
+    assert!(yml.contains("test -f /usr/local/lib/libzephyr_policy.so"));
+    for ext in zephyr::host::conf::EXTENSIONS {
+        assert!(yml.contains(&format!("test -f {ext}")), "{ext}");
+    }
+    for want in [
+        "providers:",
+        "type: choice",
+        "default: full",
+        "options: [full, none]",
+        "RPI_PACKAGE_REPO=",
+        "PLUGINS_REPO=",
+        "test ! -e /opt/zephyr/ext/librpi_providers.so",
+        "test ! -e /opt/zephyr/ext/librpi_mcp_adapter.so",
+        "test ! -e /opt/zephyr/ext/rpi-claude-agent",
+    ] {
+        assert!(yml.contains(want), "{want}");
+    }
 }
 
 #[test]

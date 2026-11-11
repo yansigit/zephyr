@@ -188,6 +188,78 @@ async fn real_rpi_round_trip_and_kill_mid_run() {
     task.await.unwrap().unwrap();
 }
 
+/// The image built without the owner's provider sources (DESIGN §4.4 item 1): zephyr.toml still
+/// lists every image extension, and the child starts anyway, skipping what it cannot load.
+#[tokio::test]
+#[ignore = "needs the pinned rpi binary"]
+async fn a_missing_extension_does_not_stop_the_child() {
+    if !std::path::Path::new(&*RPI).exists() {
+        skip_without_rpi(&*RPI);
+        return;
+    }
+    let rpi: &str = &RPI;
+    let port = stub_provider(Arc::default(), Arc::default()).await;
+    let home = std::env::temp_dir().join(format!(
+        "zephyr-real-noext-{}-{}",
+        std::process::id(),
+        zephyr::unix_millis()
+    ));
+    let agent = home.join("rpi-agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(
+        agent.join("models.json"),
+        format!(r#"{{"providers":{{"stub":{{"api":"openai-completions","baseUrl":"http://127.0.0.1:{port}/v1","apiKey":"not-a-key","models":[{{"id":"m","name":"M"}}]}}}}}}"#),
+    )
+    .unwrap();
+    // Beside the policy plugin, when this checkout has built it, as in the image.
+    let plugin = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/debug/libzephyr_policy.so"
+    );
+    let plugin = match std::path::Path::new(plugin).exists() {
+        true => format!("policy_plugin = {plugin:?}\n"),
+        false => String::new(),
+    };
+    let cfg: Config = toml::from_str(&format!(
+        "rpi = {rpi:?}\nhome = {home:?}\nagent_dir = {agent:?}\nmodel = \"stub/m\"\n{plugin}\
+         extensions = [\"/nonexistent/librpi_providers.so\"]\n[owners]\nchat = [\"owner\"]\n"
+    ))
+    .unwrap();
+    let (feed, rx) = mpsc::channel(4);
+    let channel = Arc::new(TestChannel {
+        feed: tokio::sync::Mutex::new(rx),
+        sent: Mutex::default(),
+    });
+    let (stop, stopped) = oneshot::channel::<()>();
+    let ch = channel.clone();
+    let task = tokio::spawn(async move {
+        zephyr::router::run(&cfg, std::slice::from_ref(&*ch), async {
+            let _ = stopped.await;
+        })
+        .await
+    });
+    feed.send(Inbound {
+        channel: "chat".into(),
+        platform_msg_id: "m1".into(),
+        sender: "owner".into(),
+        text: "ping".into(),
+    })
+    .await
+    .unwrap();
+    for _ in 0..400 {
+        if !channel.sent.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let sent: Vec<String> = (channel.sent.lock().unwrap().iter())
+        .map(|m| m.text.clone())
+        .collect();
+    assert_eq!(sent, ["pong"]);
+    let _ = stop.send(());
+    task.await.unwrap().unwrap();
+}
+
 /// DESIGN §4.6: zephyr records a clean conversation's saved file after each settle and around
 /// a restart, so what the real rpi writes itself never reads as a change made outside it.
 #[tokio::test]

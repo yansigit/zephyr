@@ -576,11 +576,13 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
         );
     }
     // Warnings, not failures: a path that is not there means the CLI and the image are out of
-    // step, and the child would still start (rpi skips an extension it cannot load).
+    // step, or the image was built without that provider source (DESIGN §4.4 item 1), and the
+    // child still starts (rpi skips an extension it cannot load; tests/real_rpi.rs).
     for path in cfg.policy_plugin.iter().chain(&cfg.extensions) {
         if !path.exists() {
             println!(
-                "warn {} does not exist: no child can load it (the CLI and the image are out of step)",
+                "warn {} does not exist: no child can load it (the CLI and the image are out of \
+                 step, or the image was built without it)",
                 path.display()
             );
         }

@@ -866,7 +866,22 @@ using a subscription unattended; check that your use fits them.
 auth token` goes in as the BuildKit secret `gh_token`, which is never stored in a layer. The
 provider sources are pinned to commit SHAs by the build args (`RPI_PACKAGE_REF`, `PLUGINS_REF`);
 local checkouts can stand in for them with `--build-context rpi-package=<dir> --build-context
-provider-plugins=<dir>` (see the Dockerfile).
+provider-plugins=<dir>` (see the Dockerfile). Both provider repos are public, so no token is needed.
+
+A smaller image leaves the owner's provider sources out: an empty repo arg skips that source.
+
+```sh
+docker build -f deploy/Dockerfile --build-arg RPI_PACKAGE_REPO= --build-arg PLUGINS_REPO= \
+  -t ghcr.io/yansigit/zephyr:$(zephyr --version | cut -d' ' -f2) .   # or your ZEPHYR_REPO
+zephyr up    # finds the image locally and runs it
+```
+
+Without `RPI_PACKAGE_REPO` you lose OpenCode Go, Antigravity, ChatGPT/Codex and every `[[mcp]]`
+connector; without `PLUGINS_REPO`, Claude through the Agent SDK (`zephyr login claude-code`). What
+stays: zephyr, the policy plugin, Cursor and rpi's own providers (the Anthropic API key). The
+config still lists every extension; the agent starts without the missing ones and `zephyr doctor`
+names each. `gh workflow run image.yml -f providers=none` builds and checks this variant in CI
+(`:dev-minimal`, never pushed).
 Pushing a `v*` tag publishes `ghcr.io/yansigit/zephyr:<version>` (`.github/workflows/image.yml`,
 which tags `ghcr.io/<the repository it runs in>`, so a fork publishes to its own).
 
