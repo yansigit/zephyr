@@ -48,11 +48,11 @@
 ### Task E-2: `ZEPHYR_REPO`
 
 **Files:**
-- Modify: `crates/zephyr/src/host/mod.rs` (`REPO` → `DEFAULT_REPO` + `repo()`; callers `:126-159, 824, 964-966, 1548, 1602`; `USAGE` env line), `deploy/Dockerfile` (`rust` stage `ARG ZEPHYR_REPO`), `.github/workflows/image.yml` (`v` step `image=`, tags, `build-args`), `DESIGN.md` §4.8, `README.md` ("Building the image"), `CLAUDE.md` (the `ZEPHYR_CONTAINER` line)
+- Modify: `crates/zephyr/src/host/mod.rs` (`REPO` → `DEFAULT_REPO` + `repo()`; callers `:126-159, 824, 964-966, 1548, 1602`; `USAGE` env line), `deploy/Dockerfile` (`rust` stage `ARG ZEPHYR_BUILD_REPO`, named `ZEPHYR_REPO` until the review), `.github/workflows/image.yml` (`v` step `image=`, tags, `build-args`), `DESIGN.md` §4.8, `README.md` ("Building the image"), `CLAUDE.md` (the `ZEPHYR_CONTAINER` line)
 - Test: `crates/zephyr/tests/host.rs`, `host/mod.rs` unit tests
 
 **Interfaces:**
-- Produces: `pub const DEFAULT_REPO: &str = "ghcr.io/yansigit/zephyr";` and `fn repo() -> String` exactly as spec §4.2 (env `ZEPHYR_REPO`, else `option_env!("ZEPHYR_REPO")`, else default; empty counts as unset). Images are `format!("{}:{v}", repo())`. `latest()`'s error names `registry(&image)`.
+- Produces: `pub const DEFAULT_REPO: &str = "ghcr.io/yansigit/zephyr";` and `fn repo() -> String` exactly as spec §4.2 (env `ZEPHYR_REPO`, else `option_env!("ZEPHYR_BUILD_REPO")` since the review, else default; empty counts as unset). Images are `format!("{}:{v}", repo())`. `latest()`'s error names `registry(&image)`.
 
 - [x] **Step 1: Write the failing tests.**
   - unit: `DEFAULT_REPO == "ghcr.io/yansigit/zephyr"`; the pinned `local_image` test uses `format!("{DEFAULT_REPO}:0.4.0")` and still gives `zephyr-local:0.4.0-90531f12`.
@@ -60,7 +60,7 @@
   - `zephyr_repo_moves_the_image_and_keeps_the_gh_token_at_ghcr`: `ZEPHYR_IMAGE=""`, `ZEPHYR_REPO=registry.example.com/me/zephyr`, `SHIM_LATEST=99.0.0`: `upgrade` pulls `registry.example.com/me/zephyr:latest`. With `SHIM_PULL_FAIL=1`: it fails saying `could not pull registry.example.com/me/zephyr:latest` and `docker login registry.example.com`, no `docker login` call, no `gh api user`, and `env.log` has no `GH_TOKEN set`. With `ZEPHYR_REPO=""` and `SHIM_PULL_FAIL=1`: the error names `ghcr.io/yansigit/zephyr:latest`.
   - `the_image_workflow_tags_the_repository_it_runs_in` (reads image.yml): `image=ghcr.io/${GITHUB_REPOSITORY,,}`, `ZEPHYR_REPO=${{ steps.v.outputs.image }}`, and no literal `ghcr.io/yansigit` in a tag line.
 - [x] **Step 2:** run them → FAIL (no `ZEPHYR_REPO`, `DEFAULT_REPO` undefined).
-- [x] **Step 3: Implement.** Dockerfile: `ARG ZEPHYR_REPO` after `FROM toolchain AS rust` (the `RUN cargo build` sees it as an env var). image.yml: the `v` step writes `image=ghcr.io/${GITHUB_REPOSITORY,,}`; both build steps pass `build-args: ZEPHYR_REPO=${{ steps.v.outputs.image }}`; tags use it.
+- [x] **Step 3: Implement.** Dockerfile: `ARG ZEPHYR_BUILD_REPO` (named `ZEPHYR_REPO` until the review) after `FROM toolchain AS rust` (the `RUN cargo build` sees it as an env var). image.yml: the `v` step writes `image=ghcr.io/${GITHUB_REPOSITORY,,}`; both build steps pass `build-args: ZEPHYR_BUILD_REPO=${{ steps.v.outputs.image }}`; tags use it.
 - [x] **Step 4:** the tests, then the full suite → PASS.
 - [x] **Step 5:** Commit `feat(host): read the image repository from ZEPHYR_REPO at run or build time, defaulting to today's`.
 
@@ -184,3 +184,22 @@
 5. **E-8 was written code-and-test together**, then checked failing-first by running its five tests against the E-7 code (all five fail), then passing.
 6. **Image checks** (E-3 step 6) were built from `git archive d8dfc3e`, not the worktree, which held later work by then, and with no gh token, which proves the public build. A third build of the `rust` stage alone with `--build-arg ZEPHYR_REPO=registry.example.com/me/zephyr` proved the build-time value bakes in, and that the run-time one overrides it. rpi's start was checked with `rpi --mode rpc` (a dummy `ANTHROPIC_API_KEY`, `get_state` answered) as well as `--list-models`. All three images were removed.
 7. **Known flakes, not this lane's:** `cli.rs` tests that compare wall-clock seconds (`status_shows_the_main_child_the_waiting_message_and_the_replies`, `status_fails_without_a_daemon_or_with_a_stale_heartbeat`, `a_reexec_waits_for_the_running_reply`) and, once each, `attach.rs` `facts_put_answers_without_values` and `tui.rs` `panels_pick_a_model_list_commands_and_close` failed in full runs while four lanes and a docker build loaded the machine (load average 30 to 42). Each passed alone; none touches host code. The subagent also reported `up_in_bridge_mode_publishes_the_web_port_on_loopback` matching `7793` in the temp path, worth fixing separately.
+
+## Review fixes (PR #46)
+
+`/code-review high` found ten issues; each was confirmed, none skipped, each fixed failing test
+first (item 8 is a refactor with the same behaviour, so its tests stay as they were):
+
+| # | Finding | Commit |
+|---|---|---|
+| 1 | Provider sources were skipped when a file was missing, not when the arg was empty | `0f64864` |
+| 2 | `option_env!("ZEPHYR_REPO")` baked a run-time override in; now `ZEPHYR_BUILD_REPO`, and `release.sh` unsets the CLI's knobs | `f409f48` |
+| 8 | The gh login is gated on `registry(image) == "ghcr.io"` | `8be9125` |
+| 9 | `set_network` (and `set_projects`) dropped an inline comment | `b08ff5f` |
+| 4, 7 | init restarted after a declined web restart, or twice after a web error; `Host::republish` shared, with its `floored()` check | `4df37aa` |
+| 3, 5, 6, 10 | install.sh: upgrade repo (source build bakes `ZEPHYR_BUILD_REPO`; the image path prints to keep `ZEPHYR_REPO` set), more refusals and `mv -n`, version check against the image, `--no-init` with init args | `d50c9b2` |
+
+Checks: a default `docker build` at `f409f48` (full set, the CLI defaulting to
+`ghcr.io/yansigit/zephyr`), the minimal build (the three paths absent), and a `plugins`-stage build
+with the arg set over an empty tree, which now fails. A `cargo build` with `ZEPHYR_REPO` exported
+still defaults; with `ZEPHYR_BUILD_REPO` it bakes that in. Full suite: 1171 passed, 0 failed.

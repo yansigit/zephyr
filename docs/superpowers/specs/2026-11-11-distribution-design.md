@@ -77,7 +77,7 @@ across all tracked files, together with a read of `deploy/`, `.github/` and `hos
 
 | # | Where | Value | Becomes | Why |
 |---|---|---|---|---|
-| 1 | `host/mod.rs:39` `REPO` | `ghcr.io/yansigit/zephyr:` | `fn repo()`: env `ZEPHYR_REPO`, else build-time `option_env!("ZEPHYR_REPO")`, else `DEFAULT_REPO` (unchanged) | §4.2. Not host.toml (non-goals) |
+| 1 | `host/mod.rs:39` `REPO` | `ghcr.io/yansigit/zephyr:` | `fn repo()`: env `ZEPHYR_REPO`, else build-time `option_env!("ZEPHYR_BUILD_REPO")`, else `DEFAULT_REPO` (unchanged) | §4.2. Not host.toml (non-goals) |
 | 2 | `host/mod.rs:126-129, 152-159, 824, 964, 1548` | uses of `REPO` | call `repo()` | same |
 | 3 | `host/mod.rs:966` | ``docker login ghcr.io`` in the error | names `repo()`'s registry | text |
 | 4 | `host/mod.rs:1145` `pull` | logs in to *any* image's registry with the `gh` token | logs in only when the registry is `ghcr.io` | today a `ZEPHYR_IMAGE` on another registry is sent this user's GitHub token, and `user/zephyr` (Docker Hub) parses as registry `user` |
@@ -86,8 +86,8 @@ across all tracked files, together with a read of `deploy/`, `.github/` and `hos
 | 7 | `deploy/Dockerfile:15, 17` | `RPI_PACKAGE_REPO`, `PLUGINS_REPO` (the owner's forks) | already build args; same defaults; empty now means "leave it out" (§4.3) | — |
 | 8 | `deploy/Dockerfile:16, 18` | `RPI_PACKAGE_REF`, `PLUGINS_REF` | left | commit SHAs in public repos; see open question 2 |
 | 9 | `deploy/Dockerfile:10` | `../rpi-package--codex`, `../rpi-provider-plugins--claude` | `<dir>` in the comment | the owner's checkout names |
-| 10 | `deploy/Dockerfile` `rust` stage | — | new `ARG ZEPHYR_REPO` | the image's own CLI gets the repo it was published to (§4.2) |
-| 11 | `.github/workflows/image.yml:82-83` | `ghcr.io/yansigit/zephyr` tags | `ghcr.io/${GITHUB_REPOSITORY,,}` from the `v` step, also passed as build arg `ZEPHYR_REPO` | here that is the same name; a fork publishes to its own |
+| 10 | `deploy/Dockerfile` `rust` stage | — | new `ARG ZEPHYR_BUILD_REPO` | the image's own CLI gets the repo it was published to (§4.2) |
+| 11 | `.github/workflows/image.yml:82-83` | `ghcr.io/yansigit/zephyr` tags | `ghcr.io/${GITHUB_REPOSITORY,,}` from the `v` step, also passed as build arg `ZEPHYR_BUILD_YR_REPO` | here that is the same name; a fork publishes to its own |
 | 12 | `image.yml:4-5, 58, 85` | `PROVIDER_REPOS_TOKEN` | left | not needed while both repos are public; harmless, and a private pin keeps working |
 | 13 | `deploy/release.sh:31` | `rpi=/home/user/Projects/.always-on/rpi-0.21.2/bin/rpi` | `rpi=${RPI_BIN:-<same path>}`, and `export RPI_BIN="$rpi"` before the ignored run | the tests read `RPI_BIN` already; `bump-rpi.sh:354` still matches the literal |
 | 14 | `release.sh:55, 62` | `ghcr.io/yansigit/zephyr` in a comment and a message | left | text; the workflow decides the real name |
@@ -112,7 +112,7 @@ const DEFAULT_REPO: &str = "ghcr.io/yansigit/zephyr";
 fn repo() -> String {
     let set = |v: Option<String>| v.filter(|v| !v.is_empty());
     set(std::env::var("ZEPHYR_REPO").ok())
-        .or_else(|| set(option_env!("ZEPHYR_REPO").map(String::from)))
+        .or_else(|| set(option_env!("ZEPHYR_BUILD_REPO").map(String::from)))
         .unwrap_or_else(|| DEFAULT_REPO.into())
 }
 ```
@@ -120,8 +120,9 @@ fn repo() -> String {
 - The value has no trailing `:`, and callers write `format!("{}:{v}", repo())`. `running_version`
   and `local_image` strip `format!("{}:", repo())`. An empty value counts as unset, because an
   undefined Docker `ARG` can still reach the build as an empty string.
-- Setting it **at build time** (`ZEPHYR_REPO=… cargo install`, or the Dockerfile's `ARG` in the
-  `rust` stage) bakes it into the CLI. The CLI that `zephyr upgrade` copies out of the image
+- Setting it **at build time**, under its own name so that a `ZEPHYR_REPO` exported for a test is
+  never baked in (`ZEPHYR_BUILD_REPO=… cargo install`, or the Dockerfile's `ARG
+  ZEPHYR_BUILD_REPO` in the `rust` stage), bakes it into the CLI. The CLI that `zephyr upgrade` copies out of the image
   (`docker run --entrypoint cat`) therefore pulls from the same place on its next upgrade.
 - Setting it **at run time** overrides the build-time value for one shell or one test.
   `ZEPHYR_IMAGE` still wins over both, as today, and still turns versioned upgrades off
@@ -171,7 +172,7 @@ opt-out, not an add-in secret: an add-in would flip the default, and the sources
 
 - `image.yml`: the `v` step also writes `image=ghcr.io/${GITHUB_REPOSITORY,,}`, which here is
   `ghcr.io/yansigit/zephyr`. Both build steps tag with it and pass `build-args:
-  ZEPHYR_REPO=<image>`. Expect one cold `rust` layer on the first build, since the arg is new.
+  ZEPHYR_BUILD_REPO=<image>`. Expect one cold `rust` layer on the first build, since the arg is new.
 - A new `workflow_dispatch` input, `providers: full|none` (default `full`). `none` adds the two
   empty build args, tags `:dev-minimal` and never pushes; push stays limited to `refs/tags/v*`.
   Its smoke test asserts `zephyr --version`, `rpi --version`, the policy plugin and
@@ -281,7 +282,7 @@ in one `docker restart`, as today. The one addition is the `Change the web app?`
 5. **Upgrading.** With a registry: `zephyr upgrade`. From source: `git pull && cargo install …
    && zephyr up --build`.
 6. **Where your data lives, backups, uninstall**: links to the existing sections.
-7. **The knobs**: `ZEPHYR_REPO`, `ZEPHYR_IMAGE`, `ZEPHYR_CONTAINER`, `ZEPHYR_SRC`, the Dockerfile
+7. **The knobs**: `ZEPHYR_REPO`, `ZEPHYR_BUILD_REPO`, `ZEPHYR_IMAGE`, `ZEPHYR_CONTAINER`, `ZEPHYR_SRC`, the Dockerfile
    args, `RPI_BIN`, `ZEPHYR_GH_REPO`, each with its default.
 
 ### 4.8 Failure handling
@@ -395,3 +396,24 @@ in one `docker restart`, as today. The one addition is the `Change the web app?`
 ## Decided with the owner (2026-11-11)
 
 Every open question above takes its recommended answer. Where this section and the body differ, this section wins.
+
+## Changed in review (PR #46, 2026-11-11)
+
+The body above is updated where a name changed; the rest is recorded here.
+
+- The build-time repository is `ZEPHYR_BUILD_REPO` (env at `cargo install`, Dockerfile `ARG`,
+  image.yml `build-args`): `option_env!("ZEPHYR_REPO")` baked a shell's run-time override into the
+  CLI. `release.sh` unsets `ZEPHYR_REPO`, `ZEPHYR_BUILD_REPO`, `ZEPHYR_IMAGE` and `ZEPHYR_CONTAINER`.
+- §4.3: the `rust` and `plugins` stages test their repo arg (`ARG RPI_PACKAGE_REPO`,
+  `ARG PLUGINS_REPO`), never a file in the tree; with the arg set, a tree without `Cargo.toml` or
+  `stage.sh` fails the build.
+- §4.5: install.sh also refuses `~/.zephyr` and an existing `~/.local/bin/zephyr` (never moved over,
+  `mv -n`), checks the copied CLI's `--version` against the image's own `zephyr --version`, and
+  refuses init arguments with `--no-init`. With `ZEPHYR_REPO` set, `--from-source` builds with
+  `ZEPHYR_BUILD_REPO` set to it, and `--from-image` says to keep `ZEPHYR_REPO` set for `zephyr
+  upgrade` (a host.toml key stays out, as in the non-goals).
+- §4.6: `web::setup` reports `Restart::{NotAsked, Declined, Done}` as it happens; init starts
+  nothing after a declined restart or after web setup's own, even when a later setup step fails.
+  `Host::republish` (running, under the floor, ports changed) is shared with `apply_published`.
+  `init` keeps the comments on host.toml's `projects` and `network` lines.
+- §4.1 #4: the gh login is decided by `registry(image) == "ghcr.io"`, the one parser.
