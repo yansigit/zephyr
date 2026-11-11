@@ -887,13 +887,6 @@ fn scrub_stream(
     mut log: impl std::io::Write,
 ) {
     use std::io::Read;
-    use std::os::unix::fs::FileExt;
-    // The whole list, small: a few numbers at most.
-    let cards_now = || -> String {
-        let mut text = vec![0u8; 4096];
-        let n = cards.as_ref().and_then(|f| f.read_at(&mut text, 0).ok());
-        String::from_utf8_lossy(&text[..n.unwrap_or(0)]).into_owned()
-    };
     use std::os::fd::AsRawFd;
     const PAUSE_MS: i32 = 250;
     let stamp = || {
@@ -906,10 +899,16 @@ fn scrub_stream(
     };
     // `None`: the vault could not be read.
     let mut replacer: Option<crate::broker::Replacer> = None;
+    // A card's code and expiry are replaced only where they stand alone, which needs the
+    // byte on either side: done on whole lines, after the replacer.
+    let mut lines = Lines::default();
+    // The cards' list as last read whole: one being rewritten is read again at the next
+    // chunk, and the list in hand is kept meanwhile, never an empty one.
+    let mut list = String::new();
     let (mut seen, mut withheld) = (None, false);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        if replacer.as_ref().is_some_and(|r| r.holds()) {
+        if replacer.as_ref().is_some_and(|r| r.holds()) || lines.holds() {
             let mut wait = libc::pollfd {
                 fd: input.as_raw_fd(),
                 events: libc::POLLIN,
@@ -917,7 +916,9 @@ fn scrub_stream(
             };
             // SAFETY: one pollfd of ours, for the length given.
             if unsafe { libc::poll(&mut wait, 1, PAUSE_MS) } == 0 {
-                put(replacer.as_mut().map(|r| r.finish()).unwrap_or_default());
+                let held = replacer.as_mut().map(|r| r.finish()).unwrap_or_default();
+                put(lines.push(held));
+                put(lines.finish());
                 continue;
             }
         }
@@ -927,24 +928,29 @@ fn scrub_stream(
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
-        let now = Some((stamp(), cards_now()));
+        if let Some(now) = cards.as_ref().and_then(crate::cards::read_shared) {
+            list = now;
+        }
+        let now = Some((stamp(), list.clone()));
         if now != seen {
-            put(replacer.as_mut().map(|r| r.finish()).unwrap_or_default());
-            let numbers = now.as_ref().map_or("", |(_, cards)| cards.as_str());
+            let held = replacer.as_mut().map(|r| r.finish()).unwrap_or_default();
+            put(lines.push(held));
+            put(lines.finish());
             replacer = Vault::load(vault).ok().map(|v| {
                 let pair = |(name, form): (&str, String)| {
                     (form.into_bytes(), format!("[vault:{name}]").into_bytes())
                 };
                 let mut pairs: Vec<_> = forms(&v.secrets()).into_iter().map(pair).collect();
-                pairs.extend(crate::cards::stream_pairs(numbers));
+                pairs.extend(crate::cards::stream_pairs(&list));
                 crate::broker::Replacer::new(pairs)
             });
+            lines.tokens = crate::cards::stream_tokens(&list);
             seen = now;
         }
         match &mut replacer {
             Some(r) => {
                 withheld = false;
-                put(r.push(&buf[..n]));
+                put(lines.push(r.push(&buf[..n])));
             }
             None if !withheld => {
                 withheld = true;
@@ -953,7 +959,46 @@ fn scrub_stream(
             None => {}
         }
     }
-    put(replacer.as_mut().map(|r| r.finish()).unwrap_or_default());
+    let held = replacer.as_mut().map(|r| r.finish()).unwrap_or_default();
+    put(lines.push(held));
+    put(lines.finish());
+}
+
+/// The second pass of a command's log: a card's code and expiry, replaced where no digit
+/// stands beside them (`cards::scrub_tokens`). It works on whole lines, holding back what
+/// follows the last newline, so a token is never judged with half of its neighbours.
+/// shortcut: what is held back goes out after the 250 ms pause as it is then, so a code cut
+/// across that pause is judged in two halves; buffer by time if a slow printer ever shows one.
+#[derive(Default)]
+struct Lines {
+    tokens: Vec<(Vec<u8>, Vec<u8>)>,
+    held: Vec<u8>,
+}
+
+impl Lines {
+    fn holds(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// The whole lines `bytes` completes, scrubbed.
+    fn push(&mut self, bytes: Vec<u8>) -> Vec<u8> {
+        if self.tokens.is_empty() && self.held.is_empty() {
+            return bytes;
+        }
+        self.held.extend(bytes);
+        let Some(end) = self.held.iter().rposition(|b| *b == b'\n') else {
+            return Vec::new();
+        };
+        let rest = self.held.split_off(end + 1);
+        let whole = std::mem::replace(&mut self.held, rest);
+        crate::cards::scrub_tokens(&whole, &self.tokens)
+    }
+
+    /// What was held back, scrubbed as it is.
+    fn finish(&mut self) -> Vec<u8> {
+        let held = std::mem::take(&mut self.held);
+        crate::cards::scrub_tokens(&held, &self.tokens)
+    }
 }
 
 /// The descriptor a scrubber finds the daemon's card numbers on, when it is given `cards`.
@@ -2309,7 +2354,8 @@ programs = ["gh"]
         // list, again at each chunk, so a card issued while the command runs is covered.
         let clean = run(&[b"n=5555555555554444\n"], Duration::ZERO);
         assert_eq!(clean, "n=5555555555554444\n", "no list, nothing to find");
-        std::fs::write(dir.join("cards"), "7\t5555555555554444\n").unwrap();
+        let list = crate::cards::shared_bytes("7\t5555555555554444\t987\t11\t2030\n");
+        std::fs::write(dir.join("cards"), &list).unwrap();
         let clean = run(
             &[
                 b"n=55555555",
@@ -2318,6 +2364,27 @@ programs = ["gh"]
             Duration::ZERO,
         );
         assert_eq!(clean, "n=[card:#7] or [card:#7]\nkey=[vault:BOUND]\n");
+        // Its code and its expiry too, where they stand alone, cut across reads or not.
+        let clean = run(
+            &[
+                b"exp 11/3",
+                b"0 cvc 98",
+                b"7 port 9870 on 2011/30\nlast 987",
+            ],
+            Duration::ZERO,
+        );
+        assert_eq!(
+            clean,
+            "exp [card:#7] cvc [card:#7] port 9870 on 2011/30\nlast [card:#7]"
+        );
+        // A list that is being rewritten (its sequence odd) is not read as an empty one: the
+        // scrubber has none yet here, so it reads again at the next chunk.
+        let mut torn = list.clone();
+        torn[0] = 3;
+        std::fs::write(dir.join("cards"), &torn).unwrap();
+        let clean = run(&[b"n=5555555555554444\n"], Duration::ZERO);
+        assert_eq!(clean, "n=5555555555554444\n", "no list was ever read whole");
+        std::fs::write(dir.join("cards"), &list).unwrap();
         // A vault that cannot be read: nothing of the output is written.
         std::fs::write(&vault, "[[token]\nbroken").unwrap();
         let clean = run(&[b"key=real-bound-1\n", b"more\n"], Duration::ZERO);

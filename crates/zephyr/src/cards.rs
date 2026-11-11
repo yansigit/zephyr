@@ -538,18 +538,39 @@ pub mod live {
         shared.as_ref().map(|f| f.as_raw_fd())
     }
 
-    /// Rewrites the shared list after a change: one `card<TAB>number` line per kept number.
-    fn publish(all: &[Held]) {
+    /// The shared list's layout: a sequence number (8 bytes, odd while the list is being
+    /// written), the text's length (8 bytes), then the text. Nothing is ever truncated: a
+    /// reader that finds the sequence odd, or changed while it read, reads again
+    /// ([`super::read_shared`]), so it sees the list before the change or after it, whole.
+    pub(super) fn write_shared(file: &std::fs::File, text: &str, seq: u64) {
         use std::os::unix::fs::FileExt;
+        let put = |bytes: &[u8], at: u64| file.write_all_at(bytes, at);
+        let _ = put(&(seq + 1).to_le_bytes(), 0)
+            .and_then(|()| put(text.as_bytes(), 16))
+            .and_then(|()| put(&(text.len() as u64).to_le_bytes(), 8))
+            .and_then(|()| put(&(seq + 2).to_le_bytes(), 0));
+    }
+
+    /// Even: the sequence of the list as last written.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Rewrites the shared list after a change: one line per kept card, its number, its code
+    /// and its expiry month and year, tab separated.
+    fn publish(all: &[Held]) {
         let shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
         let Some(file) = shared.as_ref() else { return };
-        let text: String = (all.iter())
-            .map(|h| format!("{}\t{}\n", h.card, h.pan.number))
+        let mut text: String = (all.iter())
+            .map(|h| {
+                let p = &h.pan;
+                format!(
+                    "{}\t{}\t{}\t{}\t{}\n",
+                    h.card, p.number, p.cvc, p.exp_month, p.exp_year
+                )
+            })
             .collect();
-        // Shorter first, so a reader never takes an old tail for a number.
-        let _ = file
-            .set_len(0)
-            .and_then(|()| file.write_all_at(text.as_bytes(), 0));
+        let seq = SEQ.fetch_add(2, std::sync::atomic::Ordering::SeqCst);
+        write_shared(file, &text, seq);
+        crate::vault::wipe_str(&mut text);
     }
 
     /// Keeps card `card`'s number, replacing one kept before.
@@ -618,28 +639,131 @@ pub fn scrub(text: &str) -> String {
         .collect();
     let label = |name: &str| format!("[card:{name}]");
     let withheld = |name: &str| format!("[withheld: it holds the number of card {name}]");
-    let mut out = crate::facts::scrub_as(&facts, text, &label, &withheld);
-    for (card, pan) in &all {
-        out = scrub_code(&out, &pan.cvc, &format!("[card:#{card}]"));
-    }
-    out
+    let out = crate::facts::scrub_as(&facts, text, &label, &withheld);
+    let tokens: Vec<_> = (all.iter())
+        .flat_map(|(card, pan)| tokens(*card, &pan.cvc, pan.exp_month, pan.exp_year))
+        .collect();
+    let clean = scrub_tokens(out.as_bytes(), &tokens);
+    // Only ASCII was replaced by ASCII, so it is text still.
+    String::from_utf8(clean).unwrap_or(out)
 }
 
-/// What a log scrubber replaces, from the shared list's text (`live::shared`): each number as
-/// plain digits, in groups of four with spaces or dashes, and its base64 forms, to its card's
-/// label.
-/// shortcut: a stream cannot tell a three-digit code from part of a longer number, so the
-/// code alone is left in a log; the answer the agent gets has it scrubbed (`scrub`).
-pub fn stream_pairs(shared: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut pairs = Vec::new();
-    for line in shared.lines() {
-        let Some((card, number)) = line.split_once('\t') else {
-            continue;
-        };
-        let digits = number.bytes().all(|b| b.is_ascii_digit());
-        if !digits || number.len() < 12 || card.parse::<i64>().is_err() {
+/// The shared list as a log scrubber reads it ([`live::write_shared`]'s layout): `None` when
+/// it is being rewritten and stays so for 50 tries, or cannot be read; the reader then keeps
+/// the list it had. Never an empty or a partial list.
+pub fn read_shared(file: &std::fs::File) -> Option<String> {
+    use std::os::unix::fs::FileExt;
+    let word = |at: u64| -> Option<u64> {
+        let mut b = [0u8; 8];
+        file.read_exact_at(&mut b, at).ok()?;
+        Some(u64::from_le_bytes(b))
+    };
+    for _ in 0..50 {
+        let seq = word(0)?;
+        if seq % 2 == 1 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
             continue;
         }
+        let len = word(8)?;
+        if len > 1 << 20 {
+            return None;
+        }
+        let mut text = vec![0u8; len as usize];
+        if file.read_exact_at(&mut text, 16).is_ok() && word(0) == Some(seq) {
+            return String::from_utf8(text).ok();
+        }
+    }
+    None
+}
+
+/// The shared list's bytes for `text`, as a test hands a scrubber a list in a file.
+#[cfg(test)]
+pub(crate) fn shared_bytes(text: &str) -> Vec<u8> {
+    let mut bytes = 2u64.to_le_bytes().to_vec();
+    bytes.extend((text.len() as u64).to_le_bytes());
+    bytes.extend(text.as_bytes());
+    bytes
+}
+
+/// A card's code and its expiry in the ways a page or a form prints them (`06/29`, `06/2029`,
+/// `6/29`, `06-29`, `06 / 29`, `06.29`, `0629`, `2029-06`, ...), each to the card's label.
+fn tokens(card: i64, cvc: &str, month: u8, year: u16) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let label = format!("[card:#{card}]").into_bytes();
+    let mut forms: Vec<String> = Vec::new();
+    if !cvc.is_empty() {
+        forms.push(cvc.to_string());
+    }
+    let (yy, yyyy) = (format!("{:02}", year % 100), year.to_string());
+    let mut months = vec![format!("{month:02}")];
+    if month < 10 {
+        months.push(month.to_string());
+    }
+    for m in &months {
+        for y in [&yy, &yyyy] {
+            for sep in ["/", "-", " / ", ".", " "] {
+                forms.push(format!("{m}{sep}{y}"));
+            }
+        }
+    }
+    let mm = &months[0];
+    forms.extend([format!("{mm}{yy}"), format!("{mm}{yyyy}")]);
+    forms.extend([format!("{yyyy}-{mm}"), format!("{yyyy}/{mm}")]);
+    forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
+    forms.dedup();
+    (forms.into_iter())
+        .map(|f| (f.into_bytes(), label.clone()))
+        .collect()
+}
+
+/// `bytes` with each token replaced where no digit stands beside it: a three-digit code
+/// inside a longer number is that number, and `06/29` inside `2006/29` is a date of its own.
+pub fn scrub_tokens(bytes: &[u8], tokens: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let mut text = bytes.to_vec();
+    for (from, to) in tokens.iter().filter(|(from, _)| !from.is_empty()) {
+        if text.len() < from.len() {
+            continue;
+        }
+        let (mut out, mut at, mut i) = (Vec::with_capacity(text.len()), 0, 0);
+        while i + from.len() <= text.len() {
+            let alone = text[i..].starts_with(from)
+                && !(i > 0 && text[i - 1].is_ascii_digit())
+                && !text.get(i + from.len()).is_some_and(u8::is_ascii_digit);
+            if alone {
+                out.extend_from_slice(&text[at..i]);
+                out.extend_from_slice(to);
+                i += from.len();
+                at = i;
+            } else {
+                i += 1;
+            }
+        }
+        out.extend_from_slice(&text[at..]);
+        text = out;
+    }
+    text
+}
+
+/// A line of the shared list: the card, its number, its code, its expiry month and year.
+fn shared_lines(shared: &str) -> Vec<(i64, &str, &str, u8, u16)> {
+    fn line(l: &str) -> Option<(i64, &str, &str, u8, u16)> {
+        let mut cols = l.split('\t');
+        let card = cols.next()?.parse().ok()?;
+        let number = cols.next()?;
+        let digits = number.bytes().all(|b| b.is_ascii_digit());
+        let cvc = cols.next().unwrap_or_default();
+        let month = cols.next().and_then(|m| m.parse().ok()).unwrap_or(0);
+        let year = cols.next().and_then(|y| y.parse().ok()).unwrap_or(0);
+        (digits && number.len() >= 12).then_some((card, number, cvc, month, year))
+    }
+    shared.lines().filter_map(line).collect()
+}
+
+/// What a log scrubber replaces wherever it stands, from the shared list's text
+/// (`live::shared`): each number as plain digits, in groups of four with spaces or dashes,
+/// and its base64 forms, to its card's label.
+pub fn stream_pairs(shared: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut pairs = Vec::new();
+    for (card, number, ..) in shared_lines(shared) {
         let label = format!("[card:#{card}]").into_bytes();
         let grouped = |sep: &str| -> String {
             let groups: Vec<&str> = (0..number.len())
@@ -655,29 +779,16 @@ pub fn stream_pairs(shared: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     pairs
 }
 
-/// `code` replaced where no digit stands beside it: a three-digit code inside a longer number
-/// is that number, not the code.
-fn scrub_code(text: &str, code: &str, label: &str) -> String {
-    if code.is_empty() || !text.contains(code) {
-        return text.to_string();
-    }
-    let digit = |c: Option<char>| c.is_some_and(|c| c.is_ascii_digit());
-    let (mut out, mut at) = (String::new(), 0);
-    for (i, _) in text.match_indices(code) {
-        if i < at {
-            continue;
-        }
-        let before = text[..i].chars().next_back();
-        let after = text[i + code.len()..].chars().next();
-        if digit(before) || digit(after) {
-            continue;
-        }
-        out.push_str(&text[at..i]);
-        out.push_str(label);
-        at = i + code.len();
-    }
-    out.push_str(&text[at..]);
-    out
+/// What a log scrubber replaces only where it stands alone ([`scrub_tokens`]): each card's
+/// code and expiry.
+pub fn stream_tokens(shared: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let lines = shared_lines(shared);
+    let cards = lines
+        .iter()
+        .filter(|(.., month, _)| (1..=12).contains(month));
+    cards
+        .flat_map(|(card, _, cvc, month, year)| tokens(*card, cvc, *month, *year))
+        .collect()
 }
 
 static ENTERED: Mutex<Vec<(String, Pan, i64)>> = Mutex::new(Vec::new());
@@ -1772,7 +1883,17 @@ mod tests {
 
     #[test]
     fn the_shared_list_gives_a_log_scrubber_each_numbers_forms() {
-        let pairs = stream_pairs("7\t5555555555554444\nbroken\nx\t4242424242424242\n3\t12\n");
+        let list = "7\t5555555555554444\t987\t11\t2030\nbroken\nx\t4242424242424242\n3\t12\n";
+        let pairs = stream_pairs(list);
+        let codes = stream_tokens(list);
+        assert!(
+            codes.contains(&(b"987".to_vec(), b"[card:#7]".to_vec())),
+            "its code"
+        );
+        assert!(
+            codes.contains(&(b"11/30".to_vec(), b"[card:#7]".to_vec())),
+            "its expiry"
+        );
         let froms: Vec<String> = (pairs.iter())
             .map(|(from, _)| String::from_utf8(from.clone()).unwrap())
             .collect();
@@ -1793,12 +1914,91 @@ mod tests {
         // Safety: reading the descriptor's flags.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         assert!(flags & libc::FD_CLOEXEC != 0, "close-on-exec");
-        let text = std::fs::read_to_string(format!("/proc/self/fd/{fd}")).unwrap();
-        assert!(text.contains("9\t6011000990139424\n"), "{text}");
+        let read = || {
+            let file = std::fs::File::open(format!("/proc/self/fd/{fd}")).unwrap();
+            read_shared(&file).expect("a whole list")
+        };
+        let text = read();
+        assert!(
+            text.contains("9\t6011000990139424\t111\t6\t2029\n"),
+            "{text}"
+        );
         live::forget(&state, 9, -KEEP_SECS);
         live::sweep(1);
-        let text = std::fs::read_to_string(format!("/proc/self/fd/{fd}")).unwrap();
+        let text = read();
         assert!(!text.contains("6011000990139424"), "{text}");
+    }
+
+    /// A scrubber reading the shared list while the daemon rewrites it sees the old list or
+    /// the new one, never an empty or a half-written one.
+    #[test]
+    fn a_reader_of_the_shared_list_never_sees_it_half_written() {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        // Safety: a C string literal and no flags; the result is checked.
+        let fd = unsafe { libc::memfd_create(c"zephyr-cards-test".as_ptr(), 0) };
+        assert!(fd >= 0);
+        // Safety: `fd` is ours and open.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let long: String = (1..40)
+            .map(|n| format!("{n}\t4000009990001984\t123\t6\t2029\n"))
+            .collect();
+        let short = "7\t5555555555554444\t987\t11\t2030\n".to_string();
+        live::write_shared(&file, &short, 0);
+        let reader = file.try_clone().unwrap();
+        let (a, b) = (long.clone(), short.clone());
+        let writer = std::thread::spawn(move || {
+            for round in 1..3000u64 {
+                let text = if round % 2 == 0 { &a } else { &b };
+                live::write_shared(&file, text, round * 2);
+            }
+            file.into_raw_fd()
+        });
+        let mut reads = 0;
+        while !writer.is_finished() {
+            // `None` is "ask again"; what is read is always one list, whole.
+            if let Some(text) = read_shared(&reader) {
+                assert!(
+                    text == long || text == short,
+                    "a torn list: {} bytes",
+                    text.len()
+                );
+                reads += 1;
+            }
+        }
+        assert!(reads > 0);
+        // Safety: the descriptor the writer thread gave back, closed once.
+        drop(unsafe { std::fs::File::from_raw_fd(writer.join().unwrap()) });
+    }
+
+    #[test]
+    fn the_code_and_the_expiry_scrub_where_they_stand_alone() {
+        // Its own expiry and code: the numbers kept are the process's, and the tests run at once.
+        let state = crate::test_dir("cards-codes");
+        live::put(
+            &state,
+            8,
+            Pan::parse("3530 1113 3330 0000", "03/31", "731").unwrap(),
+        );
+        for (text, want) in [
+            ("exp 03/31, code 731", "exp [card:#8], code [card:#8]"),
+            (
+                "03/2031 3/31 03-31 03 / 31 0331 2031-03",
+                "[card:#8] [card:#8] [card:#8] [card:#8] [card:#8] [card:#8]",
+            ),
+            (
+                "{\"exp_month\":3,\"cvc\":\"731\"}",
+                "{\"exp_month\":3,\"cvc\":\"[card:#8]\"}",
+            ),
+            // Inside a longer number neither is the card's.
+            (
+                "17310 2003/31 103/310 port 8731",
+                "17310 2003/31 103/310 port 8731",
+            ),
+        ] {
+            assert_eq!(scrub(text), want, "{text}");
+        }
+        live::forget(&state, 8, -KEEP_SECS);
+        live::sweep(1);
     }
 
     #[test]
