@@ -1311,7 +1311,13 @@ fn put(cfg: &Config, store: &Store, mut card: Card, pan: Pan, kind: &str, now: i
     card.kind = Some(kind.into());
     card.status = "open".into();
     card.expires_at = now + 60 * i64::from(minutes(cfg));
-    let opened = store.open_card(card.id, card.last4.as_deref(), Some(kind), card.expires_at);
+    let opened = store.open_card(
+        card.id,
+        card.last4.as_deref(),
+        Some(kind),
+        card.expires_at,
+        now,
+    );
     if !opened.unwrap_or(false) {
         return format!(
             "[zephyr] card #{} is not waiting for a number any more",
@@ -1758,8 +1764,12 @@ fn stated(
     match state {
         Ok(CardState::Open) if card.status == "waiting" && card.provider != "manual" => {
             let until = now + 60 * i64::from(minutes(cfg));
-            // Only a card still waiting opens: one closed meanwhile stays closed.
-            if store.open_card(card.id, None, None, until).unwrap_or(false) {
+            // Only a card still waiting and in its time opens: one whose close was asked
+            // meanwhile stays as the close left it, and the tick closes it at the issuer again.
+            if store
+                .open_card(card.id, None, None, until, now)
+                .unwrap_or(false)
+            {
                 let card = Card {
                     expires_at: until,
                     ..card
@@ -2143,5 +2153,41 @@ mod tests {
         assert_eq!(manual.reveal(&card).await.unwrap().last4(), "0005");
         live::forget(&state, 2, -KEEP_SECS);
         live::sweep(1);
+    }
+
+    /// The issuer refused a close, and a poll made before the close then says the card is
+    /// open: it is not opened again, its time is not extended, and the agent is told nothing.
+    #[tokio::test]
+    async fn an_open_that_arrives_after_a_close_does_not_reopen_the_card() {
+        let dir = crate::test_dir("cards-stale-open");
+        let text = format!("rpi = '/r'\nhome = {dir:?}\n[cards]\nprovider = 'fake'\n");
+        let mut cfg: Config = toml::from_str(&text).unwrap();
+        cfg.cards_fake = true;
+        let cfg = Arc::new(cfg);
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let now = crate::now();
+        let new = NewCard {
+            provider: "fake".into(),
+            origin: "https://shop.example".into(),
+            currency: "CAD".into(),
+            cap_minor: 1000,
+            expires_at: now + 900,
+            ..NewCard::default()
+        };
+        let id = store.add_card(&new).unwrap();
+        assert!(store.card_issued(id, "fake-1", None).unwrap());
+        // What a poll that started before the close has in hand.
+        let polled = store.card(id).unwrap().unwrap();
+        let why = "the owner's /stop";
+        closed(&cfg, &store, &polled, why, Err("no answer".into()), now);
+        stated(&cfg, &store, polled, Ok(CardState::Open), now);
+        let after = store.card(id).unwrap().unwrap();
+        assert_ne!(after.status, "open");
+        assert!(after.expires_at <= now, "its time is not extended");
+        let notes = store.inbox_with_status("new").unwrap();
+        assert!(
+            notes.iter().all(|n| !n.text.contains("issued")),
+            "the agent is told nothing"
+        );
     }
 }

@@ -2012,19 +2012,22 @@ impl Store {
     }
 
     /// A `waiting` card opens until `expires_at`, with its last four digits and what the owner
-    /// said it is when they are known. `false` when it was not waiting any more.
+    /// said it is when they are known. Only one still in its time at `now`: a close puts a card
+    /// past its time first, so a card whose close was asked is never opened, nor its time
+    /// extended, whatever an answer read before the close says. `false` when it did not open.
     pub fn open_card(
         &self,
         id: i64,
         last4: Option<&str>,
         kind: Option<&str>,
         expires_at: i64,
+        now: i64,
     ) -> rusqlite::Result<bool> {
         let n = self.db.execute(
             "UPDATE cards SET status = 'open', expires_at = ?4,
                     last4 = coalesce(?2, last4), kind = coalesce(?3, kind)
-             WHERE id = ?1 AND status = 'waiting'",
-            params![id, last4, kind, expires_at],
+             WHERE id = ?1 AND status = 'waiting' AND expires_at > ?5",
+            params![id, last4, kind, expires_at, now],
         )?;
         Ok(n == 1)
     }
