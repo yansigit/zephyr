@@ -1058,14 +1058,23 @@ zephyr config set cards.provider manual                 # or link
   the payment window) and sends you Link's approval link, with no `/ok` of its own. The card is
   single use and closed when Link reports the charge. This provider is built from Link's
   published documents and has not yet been run with a real account.
-- **The number never reaches the agent.** Wherever it would show in a command's output or a
-  reply it reads `[card:#7]`. `/card` lists your cards; `/card close 7` closes one early. `/stop`
-  and `/pause` close every open card.
+- **The number never reaches the agent.** Wherever the number, its code or its expiry would show
+  in a command's output, its log or a reply, it reads `[card:#7]`. zephyr types the card into
+  the page itself, only into fields of the approved address's own page (not a frame from
+  another site, so an embedded payment form cannot be filled), and closes the card if the page
+  moves away while it types. Until an hour after the card closed, the agent's browser refuses to
+  read that page back (a field's value, the HTML, a script, a screenshot). `/card` lists your
+  cards; `/card close 7` (or `/card done 7`) closes one early, at the issuer too. `/stop` and
+  `/pause` close every open card and stop a fill in hand.
+- **One purchase per card.** The card lets one Pay click through, on its own address, for a
+  total the page shows within the cap. A second click there is asked about like any payment.
 - **Limits** (`/settings`): `cards.max` (100) is the most one card may be for. The **payment
   window** covers every payment, not only cards: past `approvals.window.effects` payments (5)
   or `approvals.window.amount` (your `auto N` cap, when you set one) in
   `approvals.window.seconds` (600), the next payment waits for a strong channel whatever your
-  approval mode, so a purchase split into several small ones is caught.
+  approval mode, so a purchase split into several small ones is caught. A payment whose amount
+  zephyr could not read is not counted against the amount: it waits for an ordinary `/ok`, as
+  before. An install from before this version is told of the window once.
 - A checkout that writes its total with a bare `$` is read as US dollars. With cards in another
   dollar, its Pay click is then asked about again rather than let through on the card.
 

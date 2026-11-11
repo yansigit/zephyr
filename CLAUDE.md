@@ -130,11 +130,18 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   `Config::cards_fake`). A number lives only in `cards::live` (memory, keyed by the state folder)
   and `vault::scrub` turns it into `[card:#N]` in everything the daemon scrubs; it reaches the
   daemon in a chat line's `card` field (`chat::take_card` → `cards::enter`), never an inbox row.
-  `cards::fill` types it only on the card's origin; an open card lets its own Pay click through
-  within its cap (`Gate::card_covers`). The tick closes a card at its charge or its expiry, and
-  `/stop`, `/pause` and a start close what is open. **The payment window** (`gate::window_over`,
-  `[approvals.window]`, the `payments` table): past N payments or an amount in S seconds, any
-  payment is held `strong` (its `/ok` needs a strong channel whatever `strong_only` says).
+  `cards::fill` types it only on the card's origin, through `vault::type_into`: the value goes
+  to agent-browser on stdin (`batch`), never argv, in a script that checks the top document's
+  origin itself; a page that moved closes the card, a field in a frame is never filled. While
+  a number is kept, the wrapper refuses read-backs of that origin (`cards-filled`,
+  `browser_gate::reads_back`). An open card covers exactly one Pay click (`Gate::card_for`,
+  `Store::use_card`: `open` → `charging`). `cards::tick` runs on the router's store; issuers
+  are asked off the loop and their answers (`Word`) recorded on the next tick; a card's row is
+  changed only by conditional, per-column updates. `/stop`, `/pause` and a start close what is
+  open and stop a fill in hand. **The payment window** (`gate::window_over`,
+  `[approvals.window]`, the `payments` table): past N payments or a known amount in S seconds,
+  a payment is held `strong`; one with no readable amount is held for an ordinary `/ok`. The
+  look and the row are one `BEGIN IMMEDIATE` transaction (`Store::pay_within`).
 - `facts.rs` (DESIGN §4.18): private facts in `<state>/facts.toml` (root, 0600, read fresh).
   `found`/`scrub` match a value however it is written (NFKC, case, spacing, invisible characters,
   digit runs, percent and base64 forms; at least 6 digits or 4 characters); a fact's `allow` is
