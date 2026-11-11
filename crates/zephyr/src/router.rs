@@ -5176,6 +5176,32 @@ fn unspoof(text: &str) -> String {
     lines.collect::<Vec<_>>().join("\n")
 }
 
+/// Writes `text` to every owner on `chat` and on each channel whose table is set, except
+/// `except` (`(channel, id)`): what every owner channel is told (a new pairing, a changed Signal
+/// safety number). Attached clients are the router's to show.
+pub fn notify_owners(
+    cfg: &Config,
+    store: &Store,
+    text: &str,
+    except: Option<(&str, &str)>,
+) -> rusqlite::Result<()> {
+    let on = [
+        ("chat", true),
+        ("discord", cfg.discord.is_some()),
+        ("imessage", cfg.imessage.is_some()),
+        ("telegram", cfg.telegram.is_some()),
+        ("signal", cfg.signal.is_some()),
+    ];
+    for (channel, _) in on.into_iter().filter(|(_, set)| *set) {
+        for id in cfg.owners.get(channel).into_iter().flatten() {
+            if except != Some((channel, id.as_str())) {
+                store.notify(channel, id, text)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn log(r: anyhow::Result<()>) {
     if let Err(e) = r {
         eprintln!("zephyr: {e:#}");
@@ -5208,6 +5234,23 @@ mod tests {
 
     const OWNER: Actor = Actor::Owner { channel: "chat" };
     const AGENT: Actor = Actor::Agent { session: "main" };
+
+    #[test]
+    fn every_owner_on_a_running_channel_is_told_but_the_one_left_out() {
+        let cfg = on_file("notify-owners", "[telegram]\ntoken_env = 'T'\n");
+        let mut cfg = cfg;
+        cfg.owners
+            .insert("telegram".into(), vec!["55".into(), "66".into()]);
+        cfg.owners.insert("discord".into(), vec!["d".into()]); // no [discord]: not running
+        let store = Store::open(&cfg.db_path()).unwrap();
+        notify_owners(&cfg, &store, "hi", Some(("telegram", "66"))).unwrap();
+        let mut to: Vec<(String, String)> = (store.pending_outbox().unwrap().into_iter())
+            .map(|r| (r.channel, r.recipient))
+            .collect();
+        to.sort();
+        let want = [("chat", "owner"), ("telegram", "55")];
+        assert_eq!(to, want.map(|(c, r)| (c.to_string(), r.to_string())));
+    }
 
     #[tokio::test]
     async fn the_agent_never_cancels_or_replaces_the_owners_time_limit() {
