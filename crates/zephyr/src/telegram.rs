@@ -157,6 +157,9 @@ pub struct Telegram {
     /// stored) before the batch is fetched again.
     #[doc(hidden)]
     pub answered_within: Duration,
+    /// The most one send may take (`channel::SEND_CAP`).
+    #[doc(hidden)]
+    pub send_cap: Duration,
 }
 
 impl Telegram {
@@ -182,6 +185,7 @@ impl Telegram {
             conflict_wait: Duration::from_secs(30),
             backoff: Duration::from_secs(5),
             answered_within: Duration::from_secs(60),
+            send_cap: crate::channel::SEND_CAP,
         })
     }
 
@@ -379,9 +383,8 @@ impl Channel for Telegram {
             .parse()
             .context("recipient is not a Telegram user id")?;
         let parts = chunks(&msg.text, MAX_TEXT);
-        let sending = self
-            .delivered
-            .begin("telegram", &msg.recipient, &msg.client_id)?;
+        let parts_total = parts.len() + usize::from(msg.attachment.is_some());
+        let mut sending = (self.delivered).begin("telegram", &msg.recipient, &msg.client_id)?;
         let file = match msg
             .attachment
             .as_ref()
@@ -428,7 +431,8 @@ impl Channel for Telegram {
             }
             anyhow::Ok(())
         };
-        crate::channel::detach(sending, send).await
+        sending.total = parts_total;
+        crate::channel::detach(sending, self.send_cap, send).await
     }
 
     fn live(&self, cfg: tokio::sync::watch::Receiver<Arc<crate::config::Config>>) {

@@ -162,7 +162,10 @@ pub fn chunks(text: &str, max: usize) -> Vec<String> {
 /// still take what was asked: so a send runs in a task of its own (`detach`; `Sending` moves into
 /// it) and records each piece the platform took. While it goes, a retry of that reply answers
 /// `StillGoing` rather than run beside it, and the router neither fails the row nor drops its
-/// file, whatever the window. Sends to one chat take turns, so two replies never interleave.
+/// file. A send has `SEND_CAP` in all (429 waits too); its error, if the router never saw it, is
+/// what the next retry answers, so the row then takes the normal failure path. Replies to one
+/// chat take turns, and one left part-sent keeps its chat's turn: later replies to that chat
+/// answer `StillGoing` until it is done or its retry window lapses, so replies never interleave.
 /// Kept for the router's `retry_window` of the channel once no send of it goes.
 #[derive(Default)]
 pub struct Delivered {
@@ -170,12 +173,16 @@ pub struct Delivered {
     /// One turn per `(channel, chat)`: a fair lock, so later replies queue behind the first.
     turns:
         std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// Per `(channel, chat)`, the reply left part-sent, and when: it goes on first.
+    owed: std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
 }
 
 struct Sent {
     pieces: usize,
     at: std::time::Instant,
     going: bool,
+    /// The error of a send the router stopped waiting for: the next retry answers it.
+    failed: Option<String>,
 }
 
 /// A send of this reply is still going in a task of its own: not a failure. The router keeps
@@ -207,19 +214,25 @@ impl std::error::Error for Paused {}
 /// How long `detach` waits for its task before it answers `StillGoing`; well inside the
 /// router's own send timeout, so the router never cuts one off itself.
 const DETACH_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+/// The most one send may take, its waits for a rate limit included.
+pub const SEND_CAP: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// One send of a reply, from `Delivered::begin` until it is dropped.
 pub struct Sending {
     of: std::sync::Arc<Delivered>,
     id: String,
+    chat: String,
     turn: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// The pieces an earlier send delivered: this one starts after them.
     pub before: usize,
+    /// The reply's pieces in all (its file counts as one): fewer delivered leaves it owed.
+    pub total: usize,
 }
 
 impl Delivered {
-    /// Starts a send of `client_id` to `chat` on `channel`, or answers `StillGoing` while an
-    /// earlier one still goes.
+    /// Starts a send of `client_id` to `chat` on `channel`. Answers `StillGoing` while an
+    /// earlier send of it goes, or while an earlier reply to `chat` is owed; the error of a send
+    /// the router stopped waiting for, once.
     pub fn begin(
         self: &std::sync::Arc<Self>,
         channel: &str,
@@ -227,15 +240,27 @@ impl Delivered {
         client_id: &str,
     ) -> anyhow::Result<Sending> {
         let window = std::time::Duration::from_secs(crate::router::retry_window(channel) as u64);
+        let key = format!("{channel} {chat}");
+        {
+            let mut owed = self.owed.lock().unwrap_or_else(|e| e.into_inner());
+            owed.retain(|_, (_, at)| at.elapsed() < window);
+            if owed.get(&key).is_some_and(|(id, _)| id != client_id) {
+                return Err(StillGoing.into());
+            }
+        }
         let mut all = self.sent.lock().unwrap_or_else(|e| e.into_inner());
         all.retain(|_, s| s.going || s.at.elapsed() < window);
         let sent = all.entry(client_id.to_string()).or_insert(Sent {
             pieces: 0,
             at: std::time::Instant::now(),
             going: false,
+            failed: None,
         });
         if sent.going {
             return Err(StillGoing.into());
+        }
+        if let Some(e) = sent.failed.take() {
+            return Err(anyhow::anyhow!(e));
         }
         sent.going = true;
         let before = sent.pieces;
@@ -243,15 +268,14 @@ impl Delivered {
         let mut turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
         // A chat's lock goes once no send holds or waits for it.
         turns.retain(|_, t| std::sync::Arc::strong_count(t) > 1);
-        let turn = turns
-            .entry(format!("{channel} {chat}"))
-            .or_default()
-            .clone();
+        let turn = turns.entry(key.clone()).or_default().clone();
         Ok(Sending {
             of: self.clone(),
             id: client_id.to_string(),
+            chat: key,
             turn,
             before,
+            total: 0,
         })
     }
 }
@@ -268,28 +292,62 @@ impl Sending {
 
 impl Drop for Sending {
     fn drop(&mut self) {
-        let mut all = self.of.sent.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(s) = all.get_mut(&self.id) {
+        let pieces = {
+            let mut all = self.of.sent.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(s) = all.get_mut(&self.id) else {
+                return;
+            };
             (s.going, s.at) = (false, std::time::Instant::now());
+            s.pieces
+        };
+        let mut owed = self.of.owed.lock().unwrap_or_else(|e| e.into_inner());
+        if pieces < self.total {
+            owed.insert(
+                self.chat.clone(),
+                (self.id.clone(), std::time::Instant::now()),
+            );
+        } else if owed.get(&self.chat).is_some_and(|(id, _)| *id == self.id) {
+            owed.remove(&self.chat);
         }
     }
 }
 
-/// Runs `send` in a task of its own, in its chat's turn, holding `sending` until it ends. Waits
-/// for it at most `DETACH_AFTER`, then answers `StillGoing` while it carries on.
-pub async fn detach<T, F, Fut>(sending: Sending, send: F) -> anyhow::Result<T>
+/// Runs `send` in a task of its own, in its chat's turn, holding `sending` until it ends, for at
+/// most `cap`. Waits for it at most `DETACH_AFTER`, then answers `StillGoing` while it carries
+/// on; an error it ends with after that is kept for the next retry to answer.
+pub async fn detach<T, F, Fut>(
+    sending: Sending,
+    cap: std::time::Duration,
+    send: F,
+) -> anyhow::Result<T>
 where
     T: Send + 'static,
     F: FnOnce(Sending) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = anyhow::Result<T>> + Send,
 {
-    let task = tokio::spawn(async move {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (of, id) = (sending.of.clone(), sending.id.clone());
+    tokio::spawn(async move {
         let turn = sending.turn.clone();
         let _turn = turn.lock_owned().await;
-        send(sending).await
+        let ended = tokio::time::timeout(cap, send(sending)).await;
+        let ended = ended.unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "the send took over {} min; it is given up",
+                cap.as_secs_f64() / 60.0
+            ))
+        });
+        // Nobody waits for it any more: its error is the next retry's answer.
+        if let Err(Err(e)) = tx.send(ended) {
+            let mut all = of.sent.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(s) = all.get_mut(&id) {
+                s.failed = Some(format!("{e:#}"));
+            }
+        }
     });
-    match tokio::time::timeout(DETACH_AFTER, task).await {
-        Ok(done) => done?,
+    match tokio::time::timeout(DETACH_AFTER, rx).await {
+        Ok(Ok(done)) => done,
+        Ok(Err(_)) => Err(anyhow::anyhow!("the send's task ended without a result")),
         Err(_) => Err(StillGoing.into()),
     }
 }

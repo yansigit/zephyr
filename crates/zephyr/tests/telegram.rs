@@ -710,6 +710,75 @@ async fn a_second_reply_waits_for_the_first_to_the_same_chat() {
     );
 }
 
+fn reply_to_55(id: &str, text: String) -> Outbound {
+    Outbound {
+        channel: "telegram".into(),
+        recipient: "55".into(),
+        client_id: id.into(),
+        text,
+        attachment: None,
+        reply_to: None,
+    }
+}
+
+fn still_going(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<zephyr::channel::StillGoing>().is_some()
+}
+
+#[tokio::test]
+async fn a_send_stuck_on_rate_limits_fails_at_its_cap() {
+    let home = home("cap");
+    let (api, bot) = stub().await;
+    let limited = json!({"ok": false, "error_code": 429, "description": "Too Many Requests",
+        "parameters": {"retry_after": 1}});
+    bot.lock().unwrap().script.insert(
+        "sendMessage".into(),
+        (0..100).map(|_| Some((429, limited.clone()))).collect(),
+    );
+    let mut tg = adapter(&config(&home, &api, "progress = false"));
+    tg.send_cap = Duration::from_millis(4500);
+    let msg = reply_to_55("z1", "a".into());
+    let began = Instant::now();
+    let failed = loop {
+        match tg.send(&msg).await {
+            Err(e) if still_going(&e) => tokio::time::sleep(Duration::from_millis(100)).await,
+            done => break done,
+        }
+        assert!(began.elapsed() < Duration::from_secs(20), "never ended");
+    };
+    assert!(
+        failed.is_err(),
+        "it failed, and the router's failure path takes it"
+    );
+    assert!(began.elapsed() >= Duration::from_millis(4500));
+}
+
+#[tokio::test]
+async fn a_reply_that_failed_partway_goes_on_before_the_next_to_its_chat() {
+    let home = home("owed");
+    let (api, bot) = stub().await;
+    let broken = json!({"ok": false, "error_code": 500, "description": "Internal Server Error"});
+    bot.lock().unwrap().script.insert(
+        "sendMessage".into(),
+        VecDeque::from([None, Some((500, broken))]),
+    );
+    let tg = adapter(&config(&home, &api, "progress = false"));
+    let first = reply_to_55("z1", "a".repeat(4100));
+    let second = reply_to_55("z2", "b".into());
+    let cut = tg.send(&first).await.unwrap_err();
+    assert!(!still_going(&cut), "{cut:#}");
+    // Its rest goes before anything else to that chat.
+    let waits = tg.send(&second).await.unwrap_err();
+    assert!(still_going(&waits), "{waits:#}");
+    tg.send(&first).await.unwrap();
+    tg.send(&second).await.unwrap();
+    let order: Vec<char> = calls(&bot, "sendMessage")
+        .iter()
+        .map(|b| b["text"].as_str().unwrap().chars().next().unwrap())
+        .collect();
+    assert_eq!(order, ['a', 'a', 'a', 'b']);
+}
+
 #[tokio::test]
 async fn a_conflict_backs_off() {
     let home = home("conflict");

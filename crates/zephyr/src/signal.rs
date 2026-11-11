@@ -555,9 +555,8 @@ impl Channel for Signal {
             parts.push(String::new());
         }
         let last = parts.len().saturating_sub(1);
-        let sending = self
-            .delivered
-            .begin("signal", &msg.recipient, &msg.client_id)?;
+        let mut sending = (self.delivered).begin("signal", &msg.recipient, &msg.client_id)?;
+        sending.total = parts.len();
         // In a task of its own: the router stops waiting after its timeout, but signal-cli sends
         // what it was handed (up to its 60 s), and that is recorded, so no retry sends it again.
         let (rpc, to, file) = (
@@ -585,7 +584,7 @@ impl Channel for Signal {
             }
             Ok(true)
         };
-        if !crate::channel::detach(sending, send).await? {
+        if !crate::channel::detach(sending, crate::channel::SEND_CAP, send).await? {
             self.changed_identity(&msg.recipient).await;
             anyhow::bail!("signal send failed: IDENTITY_FAILURE");
         }
