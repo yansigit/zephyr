@@ -1186,3 +1186,164 @@ fn xdotool_is_the_wrapper_and_does_not_run_while_the_desktop_is_held() {
         .unwrap();
     assert_eq!(out.status.code(), Some(127));
 }
+
+/// `<dir>/agent-browser`, the wrapper (this binary by that name), and a fake real agent-browser
+/// that logs `<unix ns> <argv>` per command to `<dir>/ab.log`.
+fn browser_wrapper(dir: &Path) -> (PathBuf, PathBuf) {
+    let wrapper = dir.join("agent-browser");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_zephyr"), &wrapper).unwrap();
+    let real = dir.join("real-agent-browser");
+    std::fs::write(
+        &real,
+        "#!/bin/sh\nprintf '%s %s\\n' \"$(date +%s%N)\" \"$*\" >> \"$(dirname \"$0\")/ab.log\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (wrapper, real)
+}
+
+/// What the fake real agent-browser ran: (unix ns, argv).
+fn ab_log(dir: &Path) -> Vec<(u128, String)> {
+    let log = std::fs::read_to_string(dir.join("ab.log")).unwrap_or_default();
+    (log.lines())
+        .map(|l| {
+            let (at, argv) = l.split_once(' ').unwrap();
+            (at.parse().unwrap(), argv.to_string())
+        })
+        .collect()
+}
+
+/// Review Focus 3 (DESIGN §4.24): the daemon's gate holds one slot per site for every wrapper
+/// process, so eight started at once on two sites run each site's commands one pace after
+/// another, and one site never waits behind the other. Only lower bounds are asserted.
+#[test]
+fn pacing_spaces_navigations_across_wrapper_processes() {
+    let (home, cfg) = setup("pacing", "[browser]\npace_ms = 300\n");
+    let dir = home.parent().unwrap().to_path_buf();
+    let _d = daemon(&cfg, &home);
+    let public = dir.join("home-public");
+    wait_for("the gate and the desktop lock", || {
+        public.join("gate.sock").exists() && public.join("desktop.lock").exists()
+    });
+    let (wrapper, real) = browser_wrapper(&dir);
+    let urls = [
+        "https://a.example.com/1",
+        "https://other.test/1",
+        "https://www.example.com/2",
+        "https://a.example.com/3",
+        "other.test/2",
+        "https://www.example.com/4",
+        "https://other.test/3",
+        "example.com/5",
+    ];
+    let since_epoch = || {
+        let now = std::time::SystemTime::now();
+        now.duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    };
+    let started = since_epoch();
+    let children: Vec<Child> = (urls.iter())
+        .map(|url| {
+            Command::new(&wrapper)
+                .args(["open", url])
+                .env("ZEPHYR_AGENT_BROWSER", &real)
+                .env("ZEPHYR_GATE_SOCKET", public.join("gate.sock"))
+                .env("ZEPHYR_SESSION", "main")
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for mut c in children {
+        assert!(c.wait().unwrap().success());
+    }
+    let log = ab_log(&dir);
+    assert_eq!(log.len(), 8, "{log:?}");
+    let times = |site: &str| {
+        let mut at: Vec<u128> = (log.iter())
+            .filter(|(_, argv)| argv.contains(site))
+            .map(|(at, _)| *at)
+            .collect();
+        at.sort();
+        at
+    };
+    let (example, other) = (times("example.com"), times("other.test"));
+    assert_eq!((example.len(), other.len()), (5, 3));
+    // Each wrapper sleeps at least to its slot, and a site's slots are at least the pace apart,
+    // so its k-th command runs no sooner than (k - 1) paces after the start. (Two neighbours'
+    // own gap can come out shorter by however late the earlier one was scheduled after its
+    // sleep, so that is not asserted.)
+    for site in [&example, &other] {
+        for (k, at) in site.iter().enumerate() {
+            let after = (at - started) / 1_000_000;
+            assert!(after >= 300 * k as u128, "#{k} after {after} ms: {log:?}");
+        }
+    }
+    // example.com's last ran at least 1.2 s after its first: other.test did not queue behind it.
+    assert!(other[0] < example[4], "{log:?}");
+}
+
+/// Review Focus 4 (DESIGN §4.24): a wrapper sleeping out its pace holds no place on the desktop,
+/// so a take's exclusive lock is had at once; when it wakes to the owner holding the desktop it
+/// exits 1 with the gate's words, and the real binary never runs.
+#[test]
+fn a_wrapper_sleeping_out_its_pace_never_delays_a_take() {
+    use std::io::BufRead;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+    let (home, _) = setup("pacing-take", "");
+    let dir = home.parent().unwrap().to_path_buf();
+    let public = dir.join("public");
+    std::fs::create_dir_all(&public).unwrap();
+    std::fs::write(public.join("desktop.lock"), "").unwrap();
+    const HELD: &str = "zephyr: the owner has had the desktop since 14:04; this command did not \
+                        run. Try again after they hand it back.";
+    // The gate, as the daemon answers: a long slot, then the owner's hold.
+    let listener = UnixListener::bind(public.join("gate.sock")).unwrap();
+    let (tx, asked) = mpsc::channel();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { return };
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(&conn).read_line(&mut line);
+            let req: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+            let answer = match req.get("pace") {
+                Some(_) => serde_json::json!({"verdict": "allow", "wait_ms": 3000}),
+                None => serde_json::json!({"verdict": "deny", "text": HELD}),
+            };
+            let _ = conn.write_all(format!("{answer}\n").as_bytes());
+            let _ = tx.send(req);
+        }
+    });
+    let (wrapper, real) = browser_wrapper(&dir);
+    let started = Instant::now();
+    let child = Command::new(&wrapper)
+        .args(["open", "https://www.example.com"])
+        .env("ZEPHYR_AGENT_BROWSER", &real)
+        .env("ZEPHYR_GATE_SOCKET", public.join("gate.sock"))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let req = asked.recv_timeout(Duration::from_secs(20)).unwrap();
+    assert_eq!(req["pace"], "example.com", "{req}");
+    // The take: its exclusive lock at once, while the wrapper sleeps.
+    let take = std::fs::File::open(public.join("desktop.lock")).unwrap();
+    // SAFETY: a plain syscall on a descriptor this test owns.
+    let got = unsafe { libc::flock(take.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    assert!(got, "a pacing wrapper held a place on the desktop");
+    std::fs::write(public.join("desktop-held"), "100\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_secs(3),
+        "it slept out its slot"
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), HELD);
+    let wait = asked.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(wait["desktop"], "wait", "{wait}");
+    assert!(
+        ab_log(&dir).is_empty(),
+        "the real binary ran: {:?}",
+        ab_log(&dir)
+    );
+}
