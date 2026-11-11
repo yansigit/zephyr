@@ -8245,17 +8245,29 @@ async fn an_issued_card_passes_its_pay_click_and_closes_at_its_charge() {
     gw.say("f3", "owner", &click_send(&home)).await;
     wait(|| clicks(&home).len() == 1 && turns() == 1).await;
     assert_eq!(audit_outcomes(&home, "browser"), ["card"]);
+    // That click used the card: a second one on the same page is asked about like any payment.
+    assert_eq!(card_status(&home, 1), "charging");
+    gw.say("f3b", "owner", &click_send(&home)).await;
+    let second = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #2:")).await;
+    assert!(
+        second.starts_with("[zephyr] approve #2: payment (browser)"),
+        "{second}"
+    );
+    gw.say("f3c", "owner", "/no 2").await;
+    reply_where(&gw, "chat", |r| r.contains("[process #2 exited")).await;
+    wait(|| turns() == 2).await;
+    assert_eq!(clicks(&home).len(), 1);
     // Over the cap it is held like any payment.
     pay_page(&home, "CA$50.00");
     gw.say("f4", "owner", &click_send(&home)).await;
-    let over = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #2:")).await;
+    let over = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #3:")).await;
     assert!(
-        over.starts_with("[zephyr] approve #2: payment (browser)"),
+        over.starts_with("[zephyr] approve #3: payment (browser)"),
         "{over}"
     );
-    gw.say("f5", "owner", "/no 2").await;
-    reply_where(&gw, "chat", |r| r.contains("[process #2 exited")).await;
-    wait(|| turns() == 2).await;
+    gw.say("f5", "owner", "/no 3").await;
+    reply_where(&gw, "chat", |r| r.contains("[process #3 exited")).await;
+    wait(|| turns() == 3).await;
     assert_eq!(clicks(&home).len(), 1);
 
     // The issuer reports the charge: the card closes, and the payee is named by its id.
@@ -8285,10 +8297,10 @@ async fn an_issued_card_passes_its_pay_click_and_closes_at_its_charge() {
     // A used card passes nothing more and fills nothing.
     pay_page(&home, "CA$42.50");
     gw.say("f6", "owner", &click_send(&home)).await;
-    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #3:")).await;
-    gw.say("f6n", "owner", "/no 3").await;
-    reply_where(&gw, "chat", |r| r.contains("[process #3 exited")).await;
-    wait(|| turns() == 3).await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #4:")).await;
+    gw.say("f6n", "owner", "/no 4").await;
+    reply_where(&gw, "chat", |r| r.contains("[process #4 exited")).await;
+    wait(|| turns() == 4).await;
     gw.say("f7", "owner", CARD_FILL).await;
     reply_where(&gw, "chat", |r| {
         r.contains("\ncard: not filled: card #1 is used")

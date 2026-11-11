@@ -280,7 +280,7 @@ fn pass(ctx: &Ctx, a: &Action, by: By, now: i64) -> Result<String, String> {
 /// A card request (DESIGN §4.22): read again as the settings are now, then issued off the
 /// router's loop; the owner is told what to do next, and the agent when the card can be filled.
 fn card(ctx: &Ctx, a: &Action) -> Result<String, String> {
-    let (checked, ask) = crate::gate::approved_card(ctx.cfg, a)?;
+    let (checked, ask) = crate::gate::approved_card(ctx.cfg, ctx.store, a)?;
     if crate::cards::caps(ctx.cfg).is_none() {
         return Err(crate::cards::NOT_SET_UP
             .trim_start_matches("not run: ")

@@ -234,6 +234,17 @@ pub fn decide(
     origin: (String, String),
     now: i64,
 ) -> Verdict {
+    decide_paid(cfg, store, req, origin, now).0
+}
+
+/// [`decide`], with the `payments` row of a payment it let go.
+fn decide_paid(
+    cfg: &Config,
+    store: &Store,
+    req: &Request,
+    origin: (String, String),
+    now: i64,
+) -> (Verdict, Option<i64>) {
     // What the wrapper sends always carries the page: without it, nothing could be checked.
     if req.tool == "browser" && req.browser.is_none() {
         let scrub = Scrub::load(cfg);
@@ -244,7 +255,8 @@ pub fn decide(
             &scrub.json(&req.args),
             "denied",
         );
-        return Verdict::Deny("not run: the gate could not read the browser request".into());
+        let deny = "not run: the gate could not read the browser request";
+        return (Verdict::Deny(deny.into()), None);
     }
     // A card that could not be issued as asked is refused before anything is held (DESIGN
     // §4.22): no amount, one over `cards.max`, another currency, a page that is not https.
@@ -258,13 +270,13 @@ pub fn decide(
                 &scrub.json(&req.args),
                 "denied",
             );
-            return Verdict::Deny(why);
+            return (Verdict::Deny(why), None);
         }
     }
     // A browser action's summary quotes the page's button, scrubbed before it is cut (D9).
     let early = req.browser.is_some().then(|| Scrub::load(cfg));
     let Some(call) = Call::of(cfg, req, early.as_ref()) else {
-        return Verdict::Allow;
+        return (Verdict::Allow, None);
     };
     let scrub = early.unwrap_or_else(|| Scrub::load(cfg));
     let gate = Gate {
@@ -275,12 +287,14 @@ pub fn decide(
         scrub: &scrub,
         origin: &origin,
         now,
+        paid: std::cell::Cell::new(None),
     };
-    gate.judge().unwrap_or_else(|e| {
+    let verdict = gate.judge().unwrap_or_else(|e| {
         eprintln!("zephyr: the gate could not decide a {} call: {e}", req.tool);
         gate.audit("denied");
         Verdict::Deny("not run: the gate could not read its records".into())
-    })
+    });
+    (verdict, gate.paid.get())
 }
 
 /// A card request as the gate read it (DESIGN §4.22): the checkout's origin, which the card is
@@ -354,7 +368,14 @@ pub fn card_request(cfg: &Config, args: &Value) -> Result<CardAsk, String> {
 /// Proof that a card request passed the gate: made only here, by `decide_card` letting it
 /// through and by `approved_card` for an action the owner's `/ok` took. `cards::issue` takes
 /// one, so no card is issued without zephyr's checks.
-pub struct Checked(());
+pub struct Checked(Option<i64>);
+
+impl Checked {
+    /// The `payments` row the window counts for this card, written when it was let go.
+    pub fn payment(&self) -> Option<i64> {
+        self.0
+    }
+}
 
 /// [`decide`] for main's `card` request: `Ok` when the card may be issued now.
 pub fn decide_card(
@@ -365,8 +386,9 @@ pub fn decide_card(
     now: i64,
 ) -> Result<(Checked, CardAsk), Verdict> {
     let ask = card_request(cfg, &req.args).map_err(Verdict::Deny);
-    match (decide(cfg, store, req, origin, now), ask) {
-        (Verdict::Allow, Ok(ask)) if req.tool == "card" => Ok((Checked(()), ask)),
+    let (verdict, paid) = decide_paid(cfg, store, req, origin, now);
+    match (verdict, ask) {
+        (Verdict::Allow, Ok(ask)) if req.tool == "card" => Ok((Checked(paid), ask)),
         (Verdict::Allow, _) => Err(Verdict::Deny("not run: that is no card request".into())),
         (other, _) => Err(other),
     }
@@ -374,14 +396,22 @@ pub fn decide_card(
 
 /// The card request of action `a`, which `/ok` took (`running`), read again as the settings are
 /// now: a `cards.max` lowered since refuses it.
-pub fn approved_card(cfg: &Config, a: &Action) -> Result<(Checked, CardAsk), String> {
+pub fn approved_card(
+    cfg: &Config,
+    store: &Store,
+    a: &Action,
+) -> Result<(Checked, CardAsk), String> {
     if a.kind != ActionKind::Card || a.status != "running" {
         return Err("it is not an approved card request".into());
     }
     let args: Value = serde_json::from_str(&a.payload).map_err(|_| "it could not be read")?;
     let ask =
         card_request(cfg, &args).map_err(|e| e.trim_start_matches("not run: ").to_string())?;
-    Ok((Checked(()), ask))
+    // What the window counted when the `/ok` was recorded (`paid`).
+    let paid = store
+        .payment_of(a.id)
+        .map_err(|e| format!("its payment could not be read: {e}"))?;
+    Ok((Checked(paid), ask))
 }
 
 /// What one more payment does to `[approvals.window]` (DESIGN §4.22).
@@ -917,6 +947,7 @@ pub fn due_check(cfg: &Config, store: &Store, a: &Action) -> Option<String> {
         scrub: &scrub,
         origin: &origin,
         now: crate::now(),
+        paid: std::cell::Cell::new(None),
     };
     let stricter = match gate.mode(&e, g) {
         Ok(Plan::Allow(_)) => false,
@@ -1141,6 +1172,8 @@ struct Gate<'a> {
     scrub: &'a Scrub,
     origin: &'a (String, String),
     now: i64,
+    /// The `payments` row of a payment this decision let go.
+    paid: std::cell::Cell<Option<i64>>,
 }
 
 impl Gate<'_> {
@@ -1175,15 +1208,6 @@ impl Gate<'_> {
                 }
             }
         }
-        // The Pay click on an open card's own origin, for a total within the card's cap: the
-        // owner approved that payment when the card was issued (DESIGN §4.22).
-        if call.kind == ActionKind::Wait && !call.unread {
-            let money = call.gated.as_ref().filter(|g| g.class == Class::Money);
-            if money.is_some_and(|g| self.card_covers(g).unwrap_or(false)) {
-                self.audit("card");
-                return Ok(Verdict::Allow);
-            }
-        }
         let found = match (e.facts, &self.scrub.facts) {
             (FactsMode::Off, _) => Found::Nothing,
             (_, Err(_)) => Found::Unreadable,
@@ -1192,6 +1216,19 @@ impl Gate<'_> {
                 names => Found::Names(names),
             },
         };
+        // The one Pay click an open card covers (DESIGN §4.22): on the card's own origin, by
+        // the session that asked for it, with nothing of the owner's facts in it, for a total
+        // the page shows within the card's cap. It uses the card, in one statement, so a
+        // second click finds none and is decided as any payment below.
+        if call.kind == ActionKind::Wait && !call.unread && matches!(found, Found::Nothing) {
+            let money = call.gated.as_ref().filter(|g| g.class == Class::Money);
+            if let Some((card, paid)) = money.map(|g| self.card_for(g)).transpose()?.flatten() {
+                if store.use_card(card, paid)? {
+                    self.audit("card");
+                    return Ok(Verdict::Allow);
+                }
+            }
+        }
         let plan = match (&found, &call.gated) {
             (Found::Unreadable, _) => Plan::Hold("fact-hold"),
             (Found::Names(_), _) if e.facts == FactsMode::Hold => Plan::Hold("fact-hold"),
@@ -1213,7 +1250,7 @@ impl Gate<'_> {
                         self.now,
                         false,
                     )? {
-                        Ok(_) => {}
+                        Ok(row) => self.paid.set(Some(row)),
                         Err(Window::Over(_)) => return self.hold(&found, None, "window"),
                         Err(_) => return self.hold(&found, None, "held"),
                     }
@@ -1260,20 +1297,25 @@ impl Gate<'_> {
         )
     }
 
-    /// Whether an open card covers this browser payment: bound to its origin, in its currency,
-    /// for at least its total. A total that was not read is covered by none.
-    fn card_covers(&self, g: &Gated) -> rusqlite::Result<bool> {
+    /// The open card that covers this browser payment, and the total it pays in the card's
+    /// minor unit: bound to the page's origin, asked for by this session, in its currency, for
+    /// at least the total. A total that was not read is covered by none.
+    /// The session a request names is the agent's to forge (a task can say `main`), so this
+    /// narrows which click is the card's and is no wall: the wall is that the card pays once.
+    fn card_for(&self, g: &Gated) -> rusqlite::Result<Option<(i64, i64)>> {
         let Some(a) = g.amount.as_ref().filter(|a| !a.currency.is_empty()) else {
-            return Ok(false);
+            return Ok(None);
         };
         let minor = approvals::minor_of(a.value, &a.currency);
         let open = self.store.cards_in(&["open"])?;
-        Ok(open.iter().any(|c| {
+        let card = open.iter().find(|c| {
             g.targets == [c.origin.clone()]
+                && c.session == self.req.session
                 && c.currency == a.currency
                 && minor <= c.cap_minor
                 && c.expires_at > self.now
-        }))
+        });
+        Ok(card.map(|c| (c.id, minor)))
     }
 
     fn by_mode(&self, e: &Effective, g: &Gated) -> rusqlite::Result<Plan> {
@@ -5484,5 +5526,71 @@ mod tests {
             h.store.payments_since(now - 600, "CAD").unwrap(),
             (2, 12000, false)
         );
+    }
+
+    /// An open card covers exactly one Pay click: its own session's, after the facts check,
+    /// for a read total within its cap. That click uses the card and is what the window
+    /// counts for it; every later click on that origin is decided as any payment.
+    #[test]
+    fn a_card_covers_one_pay_click_of_its_own_session_after_the_facts() {
+        let h = home(
+            "gate-card-click",
+            "[approvals]\ncurrency = 'CAD'\nmoney = 'auto 100'\nfacts = 'hold'\n\
+             strong_only = ['loosen', 'money']\n[cards]\nprovider = 'manual'\n",
+        );
+        std::fs::write(crate::facts::path(&h.cfg), PHONE).unwrap();
+        let now = crate::now();
+        let (checked, _) = decide_card(&h.cfg, &h.store, &card_of("42.50"), owner(), now)
+            .unwrap_or_else(|v| panic!("{v:?}"));
+        let card = crate::store::NewCard {
+            provider: "fake".into(),
+            origin: "https://www.amazon.ca".into(),
+            merchant: "Amazon.ca".into(),
+            cap_minor: 4250,
+            currency: "CAD".into(),
+            uses: "single".into(),
+            session: "main".into(),
+            expires_at: now + 900,
+            payment: checked.payment(),
+            ..Default::default()
+        };
+        let id = h.store.add_card(&card).unwrap();
+        assert!(h.store.move_card(id, &["waiting"], "open", now).unwrap());
+        let status = || h.store.card(id).unwrap().unwrap().status;
+        let pay = |session: &str, total: f64, typed: &[&str]| {
+            let mut req = click("Buy now", "https://www.amazon.ca", "main:1");
+            req.session = session.into();
+            let b = req.browser.as_mut().unwrap();
+            b.typed = typed.iter().map(|t| t.to_string()).collect();
+            b.amount = Some(PageAmount {
+                value: total,
+                currency: "CAD".into(),
+            });
+            decide(&h.cfg, &h.store, &req, owner(), now + 1)
+        };
+        // Another session's click is not the card's, nor one that carries a private fact.
+        assert!(
+            matches!(pay("task-3", 40.0, &[]), Verdict::Allow),
+            "auto 100 lets it go"
+        );
+        assert_eq!(status(), "open", "decided by the mode, not by the card");
+        held(&pay("main", 40.0, &["call 555 010 2345"]));
+        assert_eq!(status(), "open");
+        // The card's own click: it goes, uses the card, and the window counts what was paid.
+        let before = h.store.payments_since(now - 600, "CAD").unwrap();
+        assert_eq!(
+            before,
+            (2, 8250, false),
+            "the card at its cap, and the task's 40"
+        );
+        assert_eq!(pay("main", 40.0, &[]), Verdict::Allow);
+        assert_eq!(status(), "charging");
+        assert_eq!(outcomes(&h.store).last().unwrap(), "card");
+        let after = h.store.payments_since(now - 600, "CAD").unwrap();
+        assert_eq!(after, (2, 8000, false), "the card's row is now its 40.00");
+        // A second Buy-now click on that origin is decided normally: over the window, held.
+        let again = held(&pay("main", 40.0, &[]));
+        assert!(h.store.action_strong(again).unwrap());
+        assert_eq!(status(), "charging");
     }
 }

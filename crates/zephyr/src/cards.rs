@@ -773,7 +773,7 @@ pub fn refuses_currency(cfg: &Config, currency: &str) -> Option<String> {
 /// issued. Nothing is retried by itself.
 pub async fn issue(
     cfg: &Config,
-    _: Checked,
+    checked: Checked,
     ask: &CardAsk,
     asker: &Asker,
     proposal: Option<i64>,
@@ -785,6 +785,7 @@ pub async fn issue(
     let now = crate::now();
     let new = NewCard {
         proposal,
+        payment: checked.payment(),
         provider: issuer.name().into(),
         origin: ask.origin.clone(),
         merchant: ask.merchant.clone(),
@@ -983,6 +984,7 @@ pub fn lines(cfg: &Config, store: &Store, limit: u32) -> Vec<String> {
                 }
                 "waiting" => format!("waiting for you to make it (zephyr card put {})", c.id),
                 "open" => format!("open until {}", clock(cfg, c.expires_at)),
+                "charging" => "its Pay click went; waiting for the charge".into(),
                 "used" => match (c.charged_minor, c.charged_currency.as_deref()) {
                     (Some(m), Some(cur)) => format!("charged {}", crate::approvals::money(m, cur)),
                     _ => "used".into(),
@@ -1062,7 +1064,7 @@ pub fn command(
         ["done", n] => match found(n) {
             Err(e) => e,
             Ok(card) => {
-                let from = ["waiting", "open", "unknown"];
+                let from = ["waiting", "open", "charging", "unknown"];
                 match store.move_card(card.id, &from, "closed", now) {
                     Ok(true) => {
                         live::forget(cfg.state_dir(), card.id, now);
@@ -1076,7 +1078,7 @@ pub fn command(
         },
         ["close", n] => match found(n) {
             Err(e) => e,
-            Ok(card) if !matches!(card.status.as_str(), "waiting" | "open") => {
+            Ok(card) if !matches!(card.status.as_str(), "waiting" | "open" | "charging") => {
                 format!("[zephyr] card #{} was {} already", card.id, card.status)
             }
             Ok(card) => {
@@ -1149,6 +1151,7 @@ async fn fill(cfg: &Config, id: i64, fields: CardFields) -> String {
         "open" if now < card.expires_at => {}
         "open" => return format!("not filled: card #{id} has expired"),
         "waiting" => return format!("not filled: card #{id} still waits for the owner"),
+        "charging" => return format!("not filled: card #{id} was used for its payment already"),
         other => return format!("not filled: card #{id} is {other}"),
     }
     let selectors = [
@@ -1292,7 +1295,7 @@ async fn close(cfg: &Config, db: &Db, card: &Card, why: &str, now: i64) {
     };
     if !db
         .get()
-        .move_card(card.id, &["waiting", "open"], to, now)
+        .move_card(card.id, &["waiting", "open", "charging"], to, now)
         .unwrap_or(false)
     {
         return;
@@ -1391,7 +1394,10 @@ pub async fn tick(cfg: &Config, now: i64) {
             tell(&db.get(), &card, &delete_it(&card, "it is past its time"));
         }
     }
-    let live = db.get().cards_in(&["waiting", "open"]).unwrap_or_default();
+    let live = db
+        .get()
+        .cards_in(&["waiting", "open", "charging"])
+        .unwrap_or_default();
     for mut card in live {
         if now >= card.expires_at {
             // Forgotten at once; the issuer is asked to close it at its own pace.
@@ -1426,7 +1432,7 @@ pub async fn tick(cfg: &Config, now: i64) {
                 live::forget(cfg.state_dir(), card.id, now);
                 if db
                     .get()
-                    .move_card(card.id, &["waiting", "open"], "closed", now)
+                    .move_card(card.id, &["waiting", "open", "charging"], "closed", now)
                     .unwrap_or(false)
                 {
                     audit(cfg, &db.get(), &card, "close", "closed at the issuer");
@@ -1442,7 +1448,7 @@ pub async fn tick(cfg: &Config, now: i64) {
                 live::forget(cfg.state_dir(), card.id, now);
                 if db
                     .get()
-                    .move_card(card.id, &["waiting", "open"], "failed", now)
+                    .move_card(card.id, &["waiting", "open", "charging"], "failed", now)
                     .unwrap_or(false)
                 {
                     let why = crate::vault::scrubbed(cfg, why);
@@ -1475,7 +1481,7 @@ async fn used(cfg: &Config, db: &Db, mut card: Card, charges: &[Charge], now: i6
     let Some(first) = charges.first() else { return };
     if !db
         .get()
-        .move_card(card.id, &["waiting", "open"], "used", now)
+        .move_card(card.id, &["waiting", "open", "charging"], "used", now)
         .unwrap_or(false)
     {
         return;
@@ -1527,7 +1533,9 @@ async fn used(cfg: &Config, db: &Db, mut card: Card, charges: &[Charge], now: i6
 /// loop. Their numbers are forgotten before this returns.
 pub fn close_all(cfg: &Arc<Config>, why: &'static str) {
     let Ok(store) = open_store(cfg) else { return };
-    let cards = store.cards_in(&["waiting", "open"]).unwrap_or_default();
+    let cards = store
+        .cards_in(&["waiting", "open", "charging"])
+        .unwrap_or_default();
     if cards.is_empty() {
         return;
     }
@@ -1551,7 +1559,7 @@ static TICKING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 pub fn tick_off(cfg: &Arc<Config>, store: &Store) {
     let now = crate::now();
     live::sweep(now);
-    let live = ["waiting", "open", "unknown"];
+    let live = ["waiting", "open", "charging", "unknown"];
     if store.cards_in(&live).map_or(true, |c| c.is_empty()) {
         return;
     }

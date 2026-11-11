@@ -421,6 +421,8 @@ pub enum Paid {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NewCard {
     pub proposal: Option<i64>,
+    /// The `payments` row the gate wrote when it let the card go.
+    pub payment: Option<i64>,
     pub provider: String,
     pub origin: String,
     pub merchant: String,
@@ -465,13 +467,15 @@ pub struct Card {
     pub approval_url: Option<String>,
     /// When the owner was last told about it (a reminder, a failed close).
     pub told_at: Option<i64>,
+    /// The `payments` row the window counts for it.
+    pub payment: Option<i64>,
 }
 
 const CARD_COLS: &str =
     "id, proposal, provider, provider_ref, last4, origin, merchant, cap_minor, \
                          currency, uses, kind, status, channel, sender, session, created_at, \
                          expires_at, closed_at, charged_minor, charged_currency, merchant_id, \
-                         descriptor, mcc, approval_url, told_at";
+                         descriptor, mcc, approval_url, told_at, payment";
 
 fn card_row(r: &rusqlite::Row) -> rusqlite::Result<Card> {
     Ok(Card {
@@ -500,6 +504,7 @@ fn card_row(r: &rusqlite::Row) -> rusqlite::Result<Card> {
         mcc: r.get(22)?,
         approval_url: r.get(23)?,
         told_at: r.get(24)?,
+        payment: r.get(25)?,
     })
 }
 
@@ -1132,6 +1137,7 @@ impl Store {
                     minor INTEGER, -- NULL: the amount was not read
                     currency TEXT NOT NULL, source TEXT NOT NULL, proposal INTEGER);
                  CREATE TABLE cards(id INTEGER PRIMARY KEY, proposal INTEGER,
+                    payment INTEGER, -- its row in payments: the cap, then what its click paid
                     provider TEXT NOT NULL, provider_ref TEXT, last4 TEXT,
                     origin TEXT NOT NULL, merchant TEXT NOT NULL,
                     cap_minor INTEGER NOT NULL, currency TEXT NOT NULL, uses TEXT NOT NULL,
@@ -1903,8 +1909,8 @@ impl Store {
     pub fn add_card(&self, c: &NewCard) -> rusqlite::Result<i64> {
         self.db.execute(
             "INSERT INTO cards(proposal, provider, origin, merchant, cap_minor, currency, uses,
-                               status, channel, sender, session, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'waiting', ?8, ?9, ?10, ?11)",
+                               status, channel, sender, session, expires_at, payment)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'waiting', ?8, ?9, ?10, ?11, ?12)",
             params![
                 c.proposal,
                 c.provider,
@@ -1916,10 +1922,48 @@ impl Store {
                 c.channel,
                 c.sender,
                 c.session,
-                c.expires_at
+                c.expires_at,
+                c.payment
             ],
         )?;
         Ok(self.db.last_insert_rowid())
+    }
+
+    /// The one Pay click an open card covers (DESIGN §4.22): the card goes from `open` to
+    /// `charging` and its payment row, written at its cap when it was let go, becomes what the
+    /// page said was paid, in one transaction. `false` when the card was not open any more:
+    /// of two clicks only one is the card's.
+    pub fn use_card(&self, id: i64, paid_minor: i64) -> rusqlite::Result<bool> {
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let used = (|| {
+            let n = self.db.execute(
+                "UPDATE cards SET status = 'charging' WHERE id = ?1 AND status = 'open'",
+                params![id],
+            )?;
+            if n == 1 {
+                self.db.execute(
+                    "UPDATE payments SET minor = ?2
+                     WHERE id = (SELECT payment FROM cards WHERE id = ?1)",
+                    params![id, paid_minor],
+                )?;
+            }
+            Ok(n == 1)
+        })();
+        self.db.execute_batch(if matches!(used, Ok(true)) {
+            "COMMIT"
+        } else {
+            "ROLLBACK"
+        })?;
+        used
+    }
+
+    /// The `payments` row written when the owner approved action `proposal`.
+    pub fn payment_of(&self, proposal: i64) -> rusqlite::Result<Option<i64>> {
+        self.db.query_row(
+            "SELECT max(id) FROM payments WHERE proposal = ?1",
+            params![proposal],
+            |r| r.get(0),
+        )
     }
 
     pub fn card(&self, id: i64) -> rusqlite::Result<Option<Card>> {
@@ -2544,7 +2588,7 @@ impl Store {
             .execute("DELETE FROM memory_commits WHERE at < ?1", params![before])?;
         // The highest card id stays, as above: `card-<id>-…` inbox rows are once per id.
         let cards = self.db.execute(
-            "DELETE FROM cards WHERE status NOT IN ('waiting', 'open')
+            "DELETE FROM cards WHERE status NOT IN ('waiting', 'open', 'charging')
                AND coalesce(closed_at, created_at) < ?1 AND id < (SELECT max(id) FROM cards)",
             params![before],
         )?;
