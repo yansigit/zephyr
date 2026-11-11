@@ -398,3 +398,13 @@ moment, made once in `gate::serve` and shared by its `Conn`s, as `desktop` is.
 - `settings.rs`: the row parses; the agent raising `browser.pace_ms` applies at once and lowering
   it is a proposal. `config.rs`: no `[browser]` reads the default; `/set browser.pace_ms 2000`
   writes the table, and nothing else does.
+
+## Decided with the owner (2026-11-12)
+
+Every open question above takes its recommended answer. Where this section and the body differ, this section wins:
+
+- **Pacing:** on by default at 1500 ms.
+- **Slides and charts:** Python libraries are fetched on first use (`uv run --with`).
+- **Gmail and Google Calendar:** left out of the catalog.
+- **Starter skills:** seeded on an upgraded install at first start, with one notice.
+- **Remote catalog connectors:** run through `mcp-remote`, so their keys are surrogates.
