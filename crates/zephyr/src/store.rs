@@ -1013,6 +1013,16 @@ impl Store {
                  PRAGMA user_version = 18;",
             )?;
         }
+        // A database made by a build that has the token broker (DESIGN §4.21): its remote
+        // connectors were never published with a real secret by default, so there is nothing
+        // of before to keep (`made_with_broker`). The broker adds no schema step, so this
+        // mark, not a version, tells an upgrade from a first start or a reset state.db.
+        if version == 0 {
+            db.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES ('broker.born', '1')",
+                [],
+            )?;
+        }
         db.commit()?;
         Ok(Self {
             db: conn,
@@ -1033,6 +1043,12 @@ impl Store {
             .ok()
             .flatten()
             .and_then(|v| v.parse().ok())
+    }
+
+    /// Whether this database was first made by a build with the token broker, so that no
+    /// install from before it stands behind it.
+    pub fn made_with_broker(&self) -> bool {
+        matches!(self.meta("broker.born"), Ok(Some(_)))
     }
 
     /// Whether the owner still has to be told that an upgrade kept approvals off.

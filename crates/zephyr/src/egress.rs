@@ -757,9 +757,10 @@ impl Conn {
             true => "that host",
             false => dest,
         };
-        let args = match refused.token() {
-            Some(name) => format!("{name} -> {dest}"),
-            None => dest.to_string(),
+        let args = match (refused.token(), refused.place()) {
+            (Some(name), Some(place)) => format!("{name} -> {dest} ({place})"),
+            (Some(name), None) => format!("{name} -> {dest}"),
+            (None, _) => dest.to_string(),
         };
         let note = Note {
             cfg: cfg.clone(),
@@ -771,7 +772,8 @@ impl Conn {
             notice: (refused
                 .token()
                 .zip(refused.notice(crate::vault::shown(dest))))
-            .map(|(token, text)| (format!("{token} {}", refused.reason("")), dest.into(), text)),
+            // One notice for a token and a host an hour, however it was tried.
+            .map(|(token, text)| (token.to_string(), dest.into(), text)),
         };
         let _ = self.log.send(note);
         answer(
@@ -830,8 +832,8 @@ struct Note {
     tool: &'static str,
     dest: String,
     outcome: Outcome,
-    /// A token the agent put where it does not go: what makes it the same attempt (the token
-    /// and how, and the host), and what the owner is told.
+    /// A token the agent put where it does not go: the token and the host, which make it
+    /// the same attempt, and what the owner is told.
     notice: Option<(String, String, String)>,
 }
 
@@ -954,6 +956,9 @@ impl Decrypted {
             _ if encoded(reply.headers()) => Some("sent a reply zephyr cannot read (compressed)"),
             _ => None,
         };
+        // Nor one whose header names hold a value bound here: a name cannot become a stand-in.
+        let named = map.in_names(&self.dest, reply.headers());
+        let unreadable = unreadable.or(named.then_some("named a header after a vault token"));
         if let Some(what) = unreadable {
             let why = format!("{} {what}", self.name);
             return self.refuse(&cfg, StatusCode::BAD_GATEWAY, why);
@@ -991,12 +996,24 @@ impl Decrypted {
         }
         // A stand-in is not as long as its value, so the length is no longer known ahead.
         reply.headers_mut().remove(hyper::header::CONTENT_LENGTH);
+        // A trailer whose name holds one ends the reply there, with its row.
+        let (conn, dest, name) = (self.conn.clone(), self.dest.clone(), self.name.clone());
+        let (names, host) = (map.clone(), self.dest.clone());
+        let bad_trailers = move |trailers: &hyper::HeaderMap| -> bool {
+            let bad = names.in_names(&host, trailers);
+            if bad {
+                let why = format!("{name} named a trailer after a vault token");
+                conn.record(&cfg, "swap", &dest, Outcome::Refused(why));
+            }
+            bad
+        };
         reply.map(|body| {
             let body = Unswapped {
                 body: idle(body),
                 replacer,
                 trailers: None,
                 done: false,
+                bad_trailers: Box::new(bad_trailers),
             };
             body.boxed_unsync()
         })
@@ -1059,6 +1076,8 @@ struct Unswapped {
     /// Trailers, waiting for the data held back before them.
     trailers: Option<hyper::body::Frame<Bytes>>,
     done: bool,
+    /// Whether a trailer's name holds a bound value (and notes the refusal).
+    bad_trailers: Box<dyn Fn(&hyper::HeaderMap) -> bool + Send>,
 }
 
 impl hyper::body::Body for Unswapped {
@@ -1085,6 +1104,11 @@ impl hyper::body::Body for Unswapped {
                     Err(trailers) => {
                         let out = this.replacer.finish();
                         let mut trailers = trailers.into_trailers().unwrap_or_default();
+                        if (this.bad_trailers)(&trailers) {
+                            this.done = true;
+                            let e = "a trailer was named after a vault token";
+                            return Poll::Ready(Some(Err(e.into())));
+                        }
                         (trailers.values_mut()).for_each(|v| this.replacer.header(v));
                         this.trailers = Some(Frame::trailers(trailers));
                         out
@@ -2963,6 +2987,26 @@ table inet zephyr {
                     s.flush().await.ok()?;
                     return None;
                 }
+                // The value in a header's own name, and in a trailer's.
+                if path == "/named" {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nx-meta-{}: 1\r\ncontent-length: 2\r\n\r\nok",
+                        sent.to_lowercase()
+                    );
+                    s.write_all(reply.as_bytes()).await.ok()?;
+                    s.flush().await.ok()?;
+                    continue;
+                }
+                if path == "/trailer-named" {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n\
+                         2\r\nok\r\n0\r\nx-meta-{}: 1\r\n\r\n",
+                        sent.to_lowercase()
+                    );
+                    s.write_all(reply.as_bytes()).await.ok()?;
+                    s.flush().await.ok()?;
+                    continue;
+                }
                 if path == "/trailers" {
                     let reply = format!(
                         "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ntrailer: x-sum\r\n\r\n\
@@ -3522,6 +3566,45 @@ table inet zephyr {
             net.head().await;
         }
 
+        /// A header's or trailer's name cannot be turned into a stand-in and stay a name, so a
+        /// reply that puts a bound value there is not passed on.
+        #[tokio::test]
+        async fn a_reply_that_names_a_header_after_a_token_is_refused() {
+            let mut net = Net::start("broker-named", "", true).await;
+            let dest = net.dest.clone();
+            // Lower case, as a header's name is on the wire.
+            let value = "real-token-named-1";
+            let s = net.vault(&[("A", value, &[dest.as_str()], false)]);
+            let key = format!("X-Key: {}\r\n", s[0]);
+            let rows = |net: &Net, outcome: &str| {
+                let row = ("swap".to_string(), dest.clone(), outcome.to_string());
+                net.rows().contains(&row)
+            };
+            let mut tls = net.bound().await;
+            let head = get(&mut tls, &net, "/named", &key).await;
+            let want = "HTTP/1.1 502 zephyr: bound.test named a header after a vault token\r\n";
+            assert!(head.starts_with(want), "{head}");
+            assert!(!head.contains(value), "{head}");
+            net.head().await;
+            // In a trailer the body has gone out by then: the reply ends there, unfinished,
+            // and the trailer is never sent.
+            let mut tls = net.bound().await;
+            let request =
+                format!("GET /trailer-named HTTP/1.1\r\nHost: {dest}\r\nTE: trailers\r\n{key}\r\n");
+            ask(&mut tls, &request).await;
+            let mut rest = Vec::new();
+            let _ = tokio::time::timeout(WAIT, tls.read_to_end(&mut rest)).await;
+            let rest = String::from_utf8_lossy(&rest);
+            assert!(!rest.contains(value) && !rest.contains("x-meta"), "{rest}");
+            let deadline = tokio::time::Instant::now() + WAIT;
+            let named = "refused: bound.test named a header after a vault token";
+            let trailer = "refused: bound.test named a trailer after a vault token";
+            while !(rows(&net, named) && rows(&net, trailer)) {
+                assert!(tokio::time::Instant::now() < deadline, "{:?}", net.rows());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
         /// A request shaped to be read two ways (a length and a chunked body) reaches the
         /// server as one well-formed request, and what follows it is a request of its own,
         /// checked like any other.
@@ -3804,7 +3887,8 @@ table inet zephyr {
             // not sent on as it is either.
             let probe = format!("User-Agent: probe {}\r\n", s[0]);
             let reply = get(&mut tls, &net, "/", &probe).await;
-            let want = "HTTP/1.1 403 zephyr: A is not swapped in the header user-agent\r\n";
+            let want =
+                "HTTP/1.1 403 zephyr: A is not swapped in a header that is not a credential header\r\n";
             assert!(reply.starts_with(want), "{reply}");
             // The connection still works, and the server read only this.
             get(&mut tls, &net, "/fine", "").await;
@@ -3814,8 +3898,8 @@ table inet zephyr {
             assert!(
                 rows.contains(&(
                     "swap".into(),
-                    format!("A -> {dest}"),
-                    "refused: A is not swapped in the header user-agent".into()
+                    format!("A -> {dest} (header user-agent)"),
+                    "refused: A is not swapped in a header that is not a credential header".into()
                 )),
                 "{rows:?}"
             );

@@ -1946,6 +1946,40 @@ fn config_set_while_stopped_reaches_a_connectors_table() {
         assert!(!set(key, value).status.success(), "{key} = {value}");
     }
     assert_eq!(env.config(), config);
+    // One secret cannot be a plain connector's and another's stand-in: the command that would
+    // make it so is refused, here as in the daemon.
+    env.ok(&["mcp", "add", "db", "--plain", "--", "db", "${SHARED}"]);
+    let pair = [
+        "mcp",
+        "add",
+        "api",
+        "--host",
+        "api.test",
+        "--",
+        "api",
+        "${SHARED}",
+    ];
+    let out = env.zephyr(&pair);
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !out.status.success() && said.contains("one name cannot be both"),
+        "{said}"
+    );
+    env.ok(&[
+        "mcp", "add", "api", "--host", "api.test", "--", "api", "${OTHER}",
+    ]);
+    let out = set("mcp.api.secrets", "plain");
+    assert!(out.status.success(), "{out:?}");
+    env.ok(&[
+        "mcp", "add", "api2", "--host", "api.test", "--", "api", "${THIRD}",
+    ]);
+    // A pair that is there already (a hand edit) does not stop an unrelated change.
+    let path = env.daemon().join("zephyr.toml");
+    let paired = env.config().replace("\"${THIRD}\"", "\"${SHARED}\"");
+    assert!(paired.contains("api2") && paired != env.config());
+    std::fs::write(&path, paired).unwrap();
+    assert!(set("budget.daily_tokens", "7000").status.success());
+    assert!(set("mcp.mail.enabled", "off").status.success());
 }
 
 #[test]

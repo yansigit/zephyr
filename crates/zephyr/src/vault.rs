@@ -541,7 +541,6 @@ impl Vault {
         let e = self.token(name)?;
         let mut all = e.headers.clone();
         all.extend(headers_of(add)?);
-        all.dedup();
         let mut unique: Vec<String> = Vec::new();
         for header in all {
             if !unique.contains(&header) {

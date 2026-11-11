@@ -1461,6 +1461,7 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                     if crate::settings::find(key).is_none() {
                         eprintln!("warn: {key} is not a known setting; saved without checking");
                     }
+                    let was = toml::from_str::<crate::config::Config>(&doc.to_string()).ok();
                     // A connector's rows (`mcp.NAME.hosts`, `.secrets`, `.enabled`, a tool's
                     // class) are in its `[[mcp]]` table, which only the registry finds by name.
                     match crate::settings::find(key).filter(|_| key.starts_with("mcp.")) {
@@ -1477,7 +1478,12 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                         .map_err(anyhow::Error::from)
                         .and_then(|c| {
                             c.validate()?;
-                            crate::broker::shared_refusal(&c).map_err(anyhow::Error::msg)
+                            // As the daemon's `/set`: no new pair of a secret held two ways.
+                            let made = match &was {
+                                Some(was) => crate::broker::creates_pair(was, &c),
+                                None => crate::broker::shared_notice(&c).map_or(Ok(()), Err),
+                            };
+                            made.map_err(anyhow::Error::msg)
                         })
                         .with_context(|| {
                             format!("{key} = {value} would make the config invalid")

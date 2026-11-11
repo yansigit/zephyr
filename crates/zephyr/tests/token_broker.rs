@@ -170,7 +170,9 @@ fn the_agent_holds_stand_ins_and_the_proxy_swaps_them_only_where_bound() {
         "curl -sS -m 30 -o /dev/null -D - -A 'probe {stand_in}' 'https://{echo}/get'"
     ));
     assert!(
-        stray.contains("403 zephyr: A3_SECRET is not swapped in the header user-agent"),
+        stray.contains(
+            "403 zephyr: A3_SECRET is not swapped in a header that is not a credential header"
+        ),
         "{stray}"
     );
     // A secret the server sends back JSON-escaped (`\"`, and `\/` from some) is turned back

@@ -860,6 +860,7 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
         cfg.validate()?;
         Ok(cfg)
     };
+    let was = parse(&doc).ok();
     let usage = "usage: zephyr mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. [--host HOST].. [--plain] | list | rm NAME";
     match &rest[..] {
         [list] if list == "list" => {
@@ -933,7 +934,11 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
         }
         _ => bail!("{usage}"),
     }
-    parse(&doc)?;
+    let now = parse(&doc)?;
+    // As `/set`: this may not make one secret a connector's own and another's stand-in.
+    if let Some(was) = &was {
+        crate::broker::creates_pair(was, &now).map_err(anyhow::Error::msg)?;
+    }
     if !secrets.is_empty() && !h.interactive {
         bail!("--secret asks for the value: run it in a terminal");
     }

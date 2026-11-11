@@ -508,7 +508,9 @@ A connector that runs a command does not hold its secrets: `mcp.json` has a stan
 by rpi's own MCP client, which does not trust zephyr's certificate. So a remote connector with a
 secret holds the real one, which the agent can read, and only once you say so: `--plain` when you
 add it (`zephyr mcp add docs --url … --header 'Authorization=Bearer ${DOCS_TOKEN}' --secret
-DOCS_TOKEN --plain`), or `/set mcp.NAME.secrets plain` from a strong channel. Until then it is left
+DOCS_TOKEN --plain`), or `/set mcp.NAME.secrets plain` from a strong channel. A connector the
+agent drafts that uses a secret, or changes one that does, is approved (`/mcp ok`) from a strong
+channel only, and approving it never hands out the real secret by itself. Until then it is left
 out, and `/mcp` and `zephyr doctor` say why. Remote connectors you had before this version keep
 working: the upgrade writes `secrets = "plain"` for them and tells you. One secret cannot be a
 plain connector's and another connector's stand-in at once; give each its own. A connector that runs a command and uses a secret must say where it goes, or it
@@ -799,7 +801,8 @@ save it and names the exact command. Save and manage entries:
   told to the agent, so it can carry on.
 - On the host, `zephyr vault add login github --site https://github.com --user me [--totp]`,
   `zephyr vault add token GH_TOKEN --host api.github.com --host github.com` (asked for when
-  left out; `edit NAME --host ..` replaces them), `list`, `edit`, `rm` and `revoke NAME [PROGRAM]`. The agent
+  left out; `edit NAME --host ..` replaces them; `--header X-Api-Key` names a header it is
+  swapped in besides `Authorization`), `list`, `edit`, `rm` and `revoke NAME [PROGRAM]`. The agent
   is not told of these: tell it.
 - `/vault bind GH_TOKEN api.github.com github.com` binds a token to hosts (`HOST` or `HOST:PORT`).
   The token is put into the `Authorization` header only; for an API that wants it elsewhere,

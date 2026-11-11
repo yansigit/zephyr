@@ -985,7 +985,7 @@ pub fn value(cfg: &Config, key: &str) -> Option<String> {
                     let hosts: Vec<&str> = hosts.iter().map(|h| crate::vault::shown(h)).collect();
                     (!hosts.is_empty()).then(|| hosts.join(", "))
                 }
-                // What is in effect: a `url` connector holds its real secrets unless told not to.
+                // What is in effect: the real secrets only when the owner wrote `plain`.
                 "secrets" => Some(match crate::broker::plain(m) {
                     true => "plain".into(),
                     false => "surrogate".into(),

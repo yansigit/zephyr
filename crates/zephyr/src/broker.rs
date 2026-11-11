@@ -128,36 +128,63 @@ pub fn header_name(name: &str) -> Result<String, String> {
     }
 }
 
+/// A value as each kind of JSON encoder writes it inside a string. What an encoder must
+/// escape (`"`, `\`, controls) it does; what it may, each does or does not as a whole: `/`
+/// (raw, `\/` or `\u002f`), the HTML characters `& < > '` (Go and others: `\u0026` …), the
+/// line separators U+2028 and U+2029 (Go, JavaScript), everything not ASCII (`ensure_ascii`),
+/// and `"` as `\u0022`; with the hex of every `\uXXXX` in one case or the other. One form per
+/// such encoder, at most 96, and for a value with none of those characters only itself.
+fn json_forms(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for profile in 0..96u8 {
+        // slash: 0 raw, 1 `\/`, 2 `\u002f`; then one bit each.
+        let (slash, rest) = (profile % 3, profile / 3);
+        let [html, wide, lines, quote, upper] = [0, 1, 2, 3, 4].map(|bit| rest >> bit & 1 == 1);
+        let unit = |unit: u16| match upper {
+            true => format!("\\u{unit:04X}"),
+            false => format!("\\u{unit:04x}"),
+        };
+        let escaped = |c: char| -> String {
+            c.encode_utf16(&mut [0; 2])
+                .iter()
+                .map(|u| unit(*u))
+                .collect()
+        };
+        let mut text = String::new();
+        for c in value.chars() {
+            match c {
+                '"' if quote => text.push_str(&escaped(c)),
+                '"' => text.push_str("\\\""),
+                '\\' => text.push_str("\\\\"),
+                '/' if slash == 1 => text.push_str("\\/"),
+                '/' if slash == 2 => text.push_str(&escaped(c)),
+                '\n' => text.push_str("\\n"),
+                '\r' => text.push_str("\\r"),
+                '\t' => text.push_str("\\t"),
+                '\u{8}' => text.push_str("\\b"),
+                '\u{c}' => text.push_str("\\f"),
+                c if (c as u32) < 0x20 || c == '\u{7f}' => text.push_str(&escaped(c)),
+                '&' | '<' | '>' | '\'' if html => text.push_str(&escaped(c)),
+                '\u{2028}' | '\u{2029}' if lines || wide => text.push_str(&escaped(c)),
+                c if !c.is_ascii() && wide => text.push_str(&escaped(c)),
+                c => text.push(c),
+            }
+        }
+        if !out.contains(&text) {
+            out.push(text);
+        }
+    }
+    out
+}
+
 /// The texts a value turns into when a server sends it back encoded: its base64 at every
-/// alignment (`vault::base64_forms`), JSON string escapes (`\/`, `\uXXXX` for what is not
-/// ASCII, in either case of hex) and percent-encoding (of everything but unreserved
+/// alignment (`vault::base64_forms`), JSON string escapes (`json_forms`) and percent-encoding (of everything but unreserved
 /// characters, or as a URI component or a form field, in either case of hex). The value
 /// itself is not among them. What is not: other cases, HTML entities, line-wrapped base64,
 /// anything derived from the value (DESIGN §4.21 "What it does not stop").
 fn encodings(value: &str) -> Vec<String> {
     let mut out = crate::vault::base64_forms(value);
-    let json = serde_json::to_string(value).unwrap_or_default();
-    let json = json.trim_matches('"').to_string();
-    let ascii = |text: &str, upper: bool| -> String {
-        let mut out = String::new();
-        for c in text.chars() {
-            match c.is_ascii() {
-                true => out.push(c),
-                false => {
-                    for unit in c.encode_utf16(&mut [0; 2]) {
-                        out.push_str(&match upper {
-                            true => format!("\\u{unit:04X}"),
-                            false => format!("\\u{unit:04x}"),
-                        });
-                    }
-                }
-            }
-        }
-        out
-    };
-    for text in [json.clone(), json.replace('/', "\\/")] {
-        out.extend([ascii(&text, false), ascii(&text, true), text]);
-    }
+    out.extend(json_forms(value));
     let percent = |keep: &str, plus: bool, upper: bool| -> String {
         let mut out = String::new();
         for b in value.bytes() {
@@ -305,15 +332,28 @@ pub fn shared(cfg: &Config) -> Vec<(String, String, String)> {
     out
 }
 
-/// `shared`, as the one line a refusal says.
-pub fn shared_refusal(cfg: &Config) -> Result<(), String> {
-    match shared(cfg).first() {
+/// Refuses a change of config from `old` to `new` that makes a secret held two ways
+/// (`shared`) where it was not before: the one check for `/set`, `zephyr config set`,
+/// `zephyr mcp add` and `/mcp ok`. A pair that was there already is not this change's to
+/// answer for, so an unrelated edit passes while one exists.
+pub fn creates_pair(old: &Config, new: &Config) -> Result<(), String> {
+    let had = shared(old);
+    match shared(new).into_iter().find(|pair| !had.contains(pair)) {
         Some((name, plain, other)) => Err(format!(
             "the secret {name} would be held as it is by the connector {plain} and as a stand-in by \
              {other}; one name cannot be both: give one of them a secret of its own"
         )),
         None => Ok(()),
     }
+}
+
+/// A pair that is there, as the one line the owner is told.
+pub fn shared_notice(cfg: &Config) -> Option<String> {
+    let (name, plain, other) = shared(cfg).into_iter().next()?;
+    Some(format!(
+        "the secret {name} is held as it is by the connector {plain} and as a stand-in by {other}; \
+         one name cannot be both: give one of them a secret of its own"
+    ))
 }
 
 /// What `drafts::filled` fills `m`'s `${NAME}`s with, from secrets.env (`env`): surrogates
@@ -544,8 +584,10 @@ impl Refused {
             Refused::Unknown => "unknown vault surrogate".into(),
             Refused::NotInUrl(name) => format!("{name} is not swapped in URLs"),
             Refused::Unsendable(name) => format!("the vault token {name} cannot be sent as it is"),
-            Refused::NotInHeader(name, header) => {
-                format!("{name} is not swapped in the header {header}")
+            // Not the header's name: it is the agent's text, and this goes to the owner, the
+            // audit's outcome and the status line. The audit's args keep it (`place`).
+            Refused::NotInHeader(name, _) => {
+                format!("{name} is not swapped in a header that is not a credential header")
             }
         }
     }
@@ -557,10 +599,18 @@ impl Refused {
                 "[zephyr] the agent tried to send the vault token {name} to {host}, where it is \
                  not bound. Nothing was sent."
             )),
-            Refused::NotInHeader(name, header) => Some(format!(
-                "[zephyr] the agent tried to send the vault token {name} to {host} in the header \
-                 {header}, where it is not swapped. Nothing was sent."
+            Refused::NotInHeader(name, _) => Some(format!(
+                "[zephyr] the agent tried to send the vault token {name} to {host} in a header \
+                 that is not a credential header. Nothing was sent."
             )),
+            _ => None,
+        }
+    }
+
+    /// Where in the request it was, for the audit's args, which are scrubbed and cut like any.
+    pub fn place(&self) -> Option<String> {
+        match self {
+            Refused::NotInHeader(_, header) => Some(format!("header {header}")),
             _ => None,
         }
     }
@@ -841,6 +891,21 @@ impl Map {
             pairs.extend(forms.map(|f| (f.into_bytes(), surrogate.clone())));
         }
         Replacer::new(pairs)
+    }
+}
+
+impl Map {
+    /// Whether a reply header's or trailer's *name* holds a value bound to `host`, or a form
+    /// of one (as a server would write it, lower case): a name cannot be rewritten into a
+    /// stand-in and stay a name, so such a reply is refused whole.
+    pub fn in_names(&self, host: &str, headers: &HeaderMap) -> bool {
+        let here = |s: &&Secret| s.value.len() >= MIN_UNSWAP && s.hosts.iter().any(|h| h == host);
+        let secrets: Vec<&Secret> = self.by.values().filter(here).collect();
+        headers.keys().any(|name| {
+            let name = name.as_str();
+            let holds = |form: &str| name.contains(&form.to_ascii_lowercase());
+            (secrets.iter()).any(|s| holds(&s.value) || s.forms.iter().any(|f| holds(f)))
+        })
     }
 }
 
@@ -1754,14 +1819,24 @@ mod tests {
             assert_eq!(h[header], *stand_in);
             assert_eq!(h["authorization"], a);
             assert_eq!(refused.token(), Some(token));
+            // What is said names the token and never the header: its name is the agent's text.
             let reason = refused.reason("a.test:443");
             assert_eq!(
                 reason,
-                format!("{token} is not swapped in the header {header}")
+                format!("{token} is not swapped in a header that is not a credential header")
             );
             let told = refused.notice("a.test").unwrap();
-            assert!(told.contains(&format!("in the header {header}, where it is not swapped")));
+            assert!(
+                told.contains("in a header that is not a credential header"),
+                "{told}"
+            );
+            assert!(
+                !format!("{reason}{told}").contains(header),
+                "{reason}{told}"
+            );
             assert!(!format!("{reason}{told}").contains("zsur_"));
+            // The audit's args may keep it.
+            assert_eq!(refused.place().unwrap(), format!("header {header}"));
         }
         assert_eq!(header_name(" X-Api-Key ").unwrap(), "x-api-key");
         assert!(header_name("x api").is_err() && header_name("").is_err());
@@ -1823,5 +1898,54 @@ mod tests {
         ] {
             assert!(said.contains(line), "{line} not in:\n{said}");
         }
+    }
+
+    /// The escapes of every kind of JSON encoder, and no more forms than there are kinds.
+    #[test]
+    fn json_forms_cover_each_kind_of_encoder_and_are_bounded() {
+        // Go's HTML-safe escapes, the line separators, a quote as `\u0022`, upper-case hex.
+        let html = "a&b<c>d'e\u{2028}f\"g/h";
+        let forms = encodings(html);
+        for form in [
+            r#"a\u0026b\u003cc\u003ed\u0027e\u2028f\"g/h"#,
+            r#"a\u0026b\u003Cc\u003Ed\u0027e\u2028f\"g/h"#,
+            r#"a&b<c>d'e\u2028f\"g/h"#,
+            r#"a&b<c>d'e\u2028f\u0022g\u002fh"#,
+            r#"a\u0026b\u003Cc\u003Ed\u0027e\u2028f\u0022g\u002Fh"#,
+        ] {
+            assert!(forms.iter().any(|f| f == form), "{form} not in {forms:?}");
+        }
+        // Bounded: one form per kind of encoder, however many such characters a value holds.
+        let worst = "\"\\/&<>'\u{2028}é\u{1}".repeat(8);
+        let forms = json_forms(&worst);
+        assert!(forms.len() <= 96, "{}", forms.len());
+        assert!(
+            encodings(&worst).len() <= 96 + 6 + 6,
+            "{}",
+            encodings(&worst).len()
+        );
+        assert_eq!(json_forms("plain-token_123"), ["plain-token_123"]);
+    }
+
+    /// A reply header's or trailer's name is not rewritten: one that holds a bound value, or a
+    /// form of it, as a server writes names (lower case), refuses the reply.
+    #[test]
+    fn a_value_in_a_reply_headers_name_is_found() {
+        let map = map();
+        let named = |name: &str| {
+            let mut h = HeaderMap::new();
+            let name = hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap();
+            h.insert(name, HeaderValue::from_static("1"));
+            map.in_names("a.test:443", &h)
+        };
+        assert!(named(&format!("x-meta-{}", A_VALUE.to_lowercase())));
+        assert!(named(&format!("x-{}", B_VALUE.to_lowercase())));
+        assert!(!named("x-request-id") && !named("content-type"));
+        // Only what is bound to this host is looked for.
+        let mut h = HeaderMap::new();
+        let name = format!("x-{}", A_VALUE.to_lowercase());
+        let name = hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap();
+        h.insert(name, HeaderValue::from_static("1"));
+        assert!(!map.in_names("b.test:8443", &h));
     }
 }

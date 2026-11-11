@@ -143,7 +143,8 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   renewed only by `supervise` at a container start (`ca::start`), and installs it for the
   agent's tools (system bundle, `agent::CA_ENV`, the agent's NSS store, Camoufox's policies).
   Bindings come only from the owner on a strong channel (`/vault bind`, the strong rows
-  `mcp.<name>.hosts` and `.secrets`; never from a connector draft). `plain` is never implied (`broker::plain`): a
+  `mcp.<name>.hosts` and `.secrets`; never from a connector draft, and `/mcp ok` of a draft that carries a
+  `${SECRET}` needs a strong channel). `plain` is never implied (`broker::plain`): a
   `url` connector with a secret is not published until the owner settles it (rpi's own MCP
   client cannot reach a decrypted host), and the upgrade writes `secrets = "plain"` for
   those that were there (`Router::settle_remote_connectors`). A surrogate, a token and a key never reach a log, `Debug`, an audit row or a

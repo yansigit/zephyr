@@ -2861,15 +2861,12 @@ impl<'a> Router<'a> {
         }
         // An edit may not make one secret both a connector's own and another's stand-in
         // (`broker::shared`); one that was there already is not this edit's to answer for.
-        let had = crate::broker::shared(&self.cfg).len();
+        let old = self.cfg.clone();
         crate::host::conf::update(&path, |doc| {
             edit(doc)?;
             let new: Config = toml::from_str(&doc.to_string())?;
             new.validate()?;
-            match crate::broker::shared(&new).len() > had {
-                true => crate::broker::shared_refusal(&new).map_err(anyhow::Error::msg),
-                false => Ok(()),
-            }
+            crate::broker::creates_pair(&old, &new).map_err(anyhow::Error::msg)
         })
         .map_err(|e| format!("not changed: {e:#}"))?;
         Ok(self.reloaded().await)
@@ -2938,7 +2935,8 @@ impl<'a> Router<'a> {
     }
 
     /// The broker's upgrade for remote connectors (DESIGN §4.21), once (`meta`
-    /// `broker.remote_kept`, which then lists them): each `url` connector that names a secret
+    /// `broker.remote_kept`, which then lists them), and only for a state.db from before the
+    /// broker (`Store::made_with_broker`; the broker has no schema step to tell by): each `url` connector that names a secret
     /// and says nothing of how it holds it gets `secrets = "plain"` written, which is what it
     /// had before the broker and all rpi's own MCP client can use. From then on a remote
     /// connector with a secret is published only once the owner has said so. Each edit is in
@@ -2949,7 +2947,12 @@ impl<'a> Router<'a> {
     async fn settle_remote_connectors(&mut self) {
         const KEPT: &str = "broker.remote_kept";
         if matches!(self.store.meta(KEPT), Ok(None)) {
-            let names = crate::broker::unsettled(&self.cfg);
+            // Only an install from before the broker has anything to keep: on a first start,
+            // or with a state.db made anew, a remote connector waits for the owner's word.
+            let names = match self.store.made_with_broker() {
+                true => Vec::new(),
+                false => crate::broker::unsettled(&self.cfg),
+            };
             let written = match (names.is_empty(), self.cfg.path.clone()) {
                 (true, _) => true,
                 (false, None) => false,
@@ -2983,7 +2986,7 @@ impl<'a> Router<'a> {
                 log((self.store.set_meta(KEPT, Some(&names.join(",")))).map_err(Into::into));
             }
         }
-        if let Err(why) = crate::broker::shared_refusal(&self.cfg) {
+        if let Some(why) = crate::broker::shared_notice(&self.cfg) {
             let told = self.store.notify_last_owner(&format!(
                 "[zephyr] {why}. Neither connector is published until then."
             ));
