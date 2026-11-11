@@ -739,6 +739,27 @@ fn non_interactive_init_hints_at_channels_and_the_web_app() {
     assert!(text.contains(CHANNEL) && !text.contains(WEB), "{text}");
 }
 
+/// The owner's comments on host.toml's lines survive init writing them again.
+#[test]
+fn init_keeps_the_comments_on_the_lines_it_writes() {
+    let env = Env::new("init-decor");
+    env.init(&["--no-start"]);
+    let path = env.daemon().join("host.toml");
+    let projects = env.projects.canonicalize().unwrap().display().to_string();
+    std::fs::write(
+        &path,
+        format!("projects = {projects:?} # where I work\nnetwork = \"host\" # for now\n"),
+    )
+    .unwrap();
+    env.init(&["--no-start", "--network", "bridge"]);
+    let text = read(&path);
+    assert!(
+        text.contains(&format!("projects = {projects:?} # where I work\n")),
+        "{text}"
+    );
+    assert!(text.contains("network = \"bridge\" # for now\n"), "{text}");
+}
+
 #[test]
 fn init_non_interactive_takes_preset_flag() {
     let env = Env::new("init-preset-flag");
@@ -3302,7 +3323,10 @@ fn release_and_runner_scripts_keep_their_defaults() {
     let at = release
         .find(unset)
         .expect("release.sh unsets the CLI's knobs");
-    assert!(at < release.find("\ncargo install -q").unwrap(), "{release}");
+    assert!(
+        at < release.find("\ncargo install -q").unwrap(),
+        "{release}"
+    );
     let runner = read(&deploy.join("runner/start.sh"));
     assert!(
         runner.contains("repo=${ZEPHYR_GH_REPO:-yansigit/zephyr}"),

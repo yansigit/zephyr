@@ -221,7 +221,7 @@ impl Data {
 
     pub fn set_projects(&self, path: &Path) -> anyhow::Result<()> {
         let mut doc = self.host_doc()?.unwrap_or_default();
-        doc["projects"] = value(path.display().to_string());
+        set_keeping_decor(&mut doc, "projects", &path.display().to_string());
         self.write("host.toml", &doc.to_string())
     }
 
@@ -238,7 +238,7 @@ impl Data {
         if get(&doc, "network").as_deref() == Some(want) {
             return Ok(());
         }
-        doc["network"] = value(want);
+        set_keeping_decor(&mut doc, "network", want);
         if let Some(mut key) = doc.key_mut("network").filter(|_| new) {
             let note = "# \"host\" runs without the network floor (DESIGN §4.20)\n";
             key.leaf_decor_mut().set_prefix(note);
@@ -289,6 +289,16 @@ impl Data {
             r => Ok(Some(r?.parse().context("parsing host.toml")?)),
         }
     }
+}
+
+/// Sets top-level `key` to the string `v`, keeping the spacing and comment around an existing
+/// value (`network = "host" # for now`), which assigning a new item would drop.
+fn set_keeping_decor(doc: &mut DocumentMut, key: &str, v: &str) {
+    let mut new = toml_edit::Value::from(v);
+    if let Some(old) = doc.get(key).and_then(Item::as_value) {
+        *new.decor_mut() = old.decor().clone();
+    }
+    doc[key] = Item::Value(new);
 }
 
 /// Whole or not at all: the running daemon reloads the file when its mtime changes.
