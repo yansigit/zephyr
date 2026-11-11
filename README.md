@@ -1066,8 +1066,9 @@ zephyr config set cards.provider manual                 # or link
   read that page back (a field's value, the HTML, a script, a screenshot). `/card` lists your
   cards; `/card close 7` (or `/card done 7`) closes one early, at the issuer too. `/stop` and
   `/pause` close every open card and stop a fill in hand.
-- **One purchase per card.** The card lets one Pay click through, on its own address, for a
-  total the page shows within the cap. A second click there is asked about like any payment.
+- **One purchase per card.** The card lets one Pay click through, on the page zephyr filled it
+  in, for a total the page shows within the cap. A Pay click with no fill before it is asked
+  about like any payment. A second click there is asked about like any payment.
 - **Limits** (`/settings`): `cards.max` (100) is the most one card may be for. The **payment
   window** covers every payment, not only cards: past `approvals.window.effects` payments (5)
   or `approvals.window.amount` (your `auto N` cap, when you set one) in

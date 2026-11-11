@@ -1298,8 +1298,9 @@ impl Gate<'_> {
     }
 
     /// The open card that covers this browser payment, and the total it pays in the card's
-    /// minor unit: bound to the page's origin, asked for by this session, in its currency, for
-    /// at least the total. A total that was not read is covered by none.
+    /// minor unit: bound to the page's origin, filled on this very page (a `card fill` went
+    /// through there), asked for by this session, in its currency, for at least the total. A
+    /// total that was not read is covered by none, and so is a click with no fill before it.
     /// The session a request names is the agent's to forge (a task can say `main`), so this
     /// narrows which click is the card's and is no wall: the wall is that the card pays once.
     fn card_for(&self, g: &Gated) -> rusqlite::Result<Option<(i64, i64)>> {
@@ -1307,9 +1308,15 @@ impl Gate<'_> {
             return Ok(None);
         };
         let minor = approvals::minor_of(a.value, &a.currency);
+        let page = |url: &str| url.split('#').next().unwrap_or_default().to_string();
+        let here = (self.req.browser.as_ref()).map(|b| page(&b.url));
         let open = self.store.cards_in(&["open"])?;
         let card = open.iter().find(|c| {
-            g.targets == [c.origin.clone()]
+            c.filled
+                .as_deref()
+                .map(page)
+                .is_some_and(|f| here == Some(f))
+                && g.targets == [c.origin.clone()]
                 && c.session == self.req.session
                 && c.currency == a.currency
                 && minor <= c.cap_minor
@@ -5556,6 +5563,9 @@ mod tests {
         };
         let id = h.store.add_card(&card).unwrap();
         assert!(h.store.move_card(id, &["waiting"], "open", now).unwrap());
+        h.store
+            .card_filled(id, "https://www.amazon.ca/compose")
+            .unwrap();
         let status = || h.store.card(id).unwrap().unwrap().status;
         let pay = |session: &str, total: f64, typed: &[&str]| {
             let mut req = click("Buy now", "https://www.amazon.ca", "main:1");

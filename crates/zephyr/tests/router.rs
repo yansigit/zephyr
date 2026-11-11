@@ -8413,8 +8413,11 @@ async fn an_issued_card_passes_its_pay_click_and_closes_at_its_charge() {
     );
     assert_eq!(card_status(&home, 1), "open");
 
-    // The Pay click on the card's origin, for a total within its cap, goes. It is paced like
-    // any click (DESIGN §4.24, on by default), and is still the card's one covered click.
+    // Once the card is filled on the page, its Pay click on the card's origin, for a total
+    // within its cap, goes. It is paced like any click (DESIGN §4.24, on by default), and is
+    // still the card's one covered click.
+    gw.say("f2b", "owner", CARD_FILL).await;
+    reply_where(&gw, "chat", |r| r.contains("\ncard: filled")).await;
     assert_eq!(script.pace_ms(), 1500);
     pay_page(&home, "CA$42.50");
     // Each click's turn is over before the next is asked: a message that arrives mid-turn is
@@ -8487,7 +8490,7 @@ async fn an_issued_card_passes_its_pay_click_and_closes_at_its_charge() {
         r.contains("\ncard: not filled: card #1 is used")
     })
     .await;
-    assert!(fills(&home).is_empty());
+    assert_eq!(fills(&home).len(), 3, "only the one fill typed");
     gw.shutdown().await;
 }
 
@@ -9034,5 +9037,27 @@ async fn a_close_asked_before_the_issue_landed_is_carried_out_when_it_lands() {
         !said.iter().any(|r| r.contains("[card #1 issued")),
         "{said:?}"
     );
+    gw.shutdown().await;
+}
+
+/// An open card covers a Pay click only once it was filled on that page: with no fill the
+/// click is decided as any payment, and the card is not used.
+#[tokio::test]
+async fn a_pay_click_with_no_fill_of_the_card_is_held() {
+    let (home, cfg) = card_home("card-no-fill", "fake", "");
+    let gw = start(cfg);
+    gw.say("n1", "owner", &card_ask("42.50")).await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    gw.say("n2", "owner", "/ok 1").await;
+    reply_where(&gw, "chat", |r| r.contains("[card #1 issued")).await;
+    pay_page(&home, "CA$42.50");
+    gw.say("n3", "owner", &click_send(&home)).await;
+    let held = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #2:")).await;
+    assert!(
+        held.starts_with("[zephyr] approve #2: payment (browser)"),
+        "{held}"
+    );
+    assert!(clicks(&home).is_empty());
+    assert_eq!(card_status(&home, 1), "open", "the card is not used");
     gw.shutdown().await;
 }

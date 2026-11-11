@@ -471,13 +471,15 @@ pub struct Card {
     pub told_at: Option<i64>,
     /// The `payments` row the window counts for it.
     pub payment: Option<i64>,
+    /// The page a fill of its number went through on: the one page whose Pay click it covers.
+    pub filled: Option<String>,
 }
 
 const CARD_COLS: &str =
     "id, proposal, provider, provider_ref, last4, origin, merchant, cap_minor, \
                          currency, uses, kind, status, channel, sender, session, created_at, \
                          expires_at, closed_at, charged_minor, charged_currency, merchant_id, \
-                         descriptor, mcc, approval_url, told_at, payment";
+                         descriptor, mcc, approval_url, told_at, payment, filled";
 
 fn card_row(r: &rusqlite::Row) -> rusqlite::Result<Card> {
     Ok(Card {
@@ -507,6 +509,7 @@ fn card_row(r: &rusqlite::Row) -> rusqlite::Result<Card> {
         approval_url: r.get(23)?,
         told_at: r.get(24)?,
         payment: r.get(25)?,
+        filled: r.get(26)?,
     })
 }
 
@@ -1148,7 +1151,8 @@ impl Store {
                     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
                     expires_at INTEGER NOT NULL, closed_at INTEGER,
                     charged_minor INTEGER, charged_currency TEXT, merchant_id TEXT,
-                    descriptor TEXT, mcc TEXT, approval_url TEXT, told_at INTEGER);
+                    descriptor TEXT, mcc TEXT, approval_url TEXT, told_at INTEGER,
+                    filled TEXT); -- the page a fill of its number went through on
                  PRAGMA user_version = 20;",
             )?;
             // An install from before the payment window is told of it once (`Router`'s tick).
@@ -2032,6 +2036,15 @@ impl Store {
             params![id, last4, kind, expires_at, now],
         )?;
         Ok(n == 1)
+    }
+
+    /// A fill of open card `id` went through on `page`: the page whose Pay click it covers.
+    pub fn card_filled(&self, id: i64, page: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE cards SET filled = ?2 WHERE id = ?1 AND status = 'open'",
+            params![id, page],
+        )?;
+        Ok(())
     }
 
     /// The last four digits of a card whose number was just fetched.

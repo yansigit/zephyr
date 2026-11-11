@@ -1489,6 +1489,7 @@ async fn fill(cfg: &Arc<Config>, id: i64, fields: CardFields) -> String {
     // one until the number is dropped.
     live::filled(cfg, id, &card.origin);
     let mut done: Vec<&str> = Vec::new();
+    let mut last = page.clone();
     for (label, sel) in selectors {
         let Some(sel) = sel else { continue };
         let Some(mut value) = value(label) else {
@@ -1509,14 +1510,19 @@ async fn fill(cfg: &Arc<Config>, id: i64, fields: CardFields) -> String {
         }
         done.push(label);
         let now = crate::vault::page_now(cfg).await;
-        if !now.as_ref().is_some_and(on_site) {
-            let on = now
-                .as_deref()
-                .and_then(crate::vault::origin)
-                .map_or("an unknown page".into(), |o| o.ascii_serialization());
-            return moved(&done, &on);
+        match now {
+            Some(now) if on_site(&now) => last = now,
+            _ => {
+                let on = now
+                    .as_deref()
+                    .and_then(crate::vault::origin)
+                    .map_or("an unknown page".into(), |o| o.ascii_serialization());
+                return moved(&done, &on);
+            }
         }
     }
+    // The page it went through on is the one whose Pay click the card covers.
+    log(db.get().card_filled(id, &last));
     audit(cfg, &db.get(), &card, "fill", "ok");
     format!(
         "filled the {} of card #{id} (…{}) on {page}",
