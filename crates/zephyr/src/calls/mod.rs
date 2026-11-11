@@ -290,6 +290,79 @@ pub fn check(cfg: &Config, args: &Value, now: i64) -> Result<Ask, String> {
     })
 }
 
+/// `status`'s line.
+pub fn status(cfg: &Config) -> String {
+    let calls = cfg.calls();
+    match calls.provider {
+        None => "calls: off (calls.provider is not set)".into(),
+        Some(provider) => format!("calls: {provider}, up to {} min each", calls.max_minutes),
+    }
+}
+
+/// `doctor`'s lines, each `ok|warn <what>`: what a call still needs before one can be placed.
+/// Nothing without a provider. Whether a credential is there, never what it is.
+pub fn doctor(cfg: &Config) -> Vec<String> {
+    let calls = cfg.calls();
+    if calls.provider.is_none() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut check = |ok: bool, good: &str, bad: &str| {
+        lines.push(match ok {
+            true => format!("ok   calls: {good}"),
+            false => format!("warn calls: {bad}"),
+        });
+    };
+    check(
+        telnyx::Telnyx::load(cfg).is_ok(),
+        "the Telnyx key, connection, number and public key are saved",
+        "no complete Telnyx service in the vault: zephyr vault add service calls --provider \
+         telnyx --account CONNECTION_ID --from +1NUMBER --public-key KEY, on the host",
+    );
+    check(
+        calls.caller_name.is_some(),
+        "the opening line names who the call is for",
+        "set calls.caller_name: the opening line must say who the call is for",
+    );
+    check(
+        calls.contact_phone.is_some()
+            && (calls.contact_email.is_some() || calls.contact_address.is_some()),
+        "the opening line gives a number and an email or address",
+        "set calls.contact_phone and calls.contact_email or calls.contact_address (CRTC ADAD \
+         rule 4(d))",
+    );
+    let reach = match (&calls.media_url, calls.port) {
+        (Some(url), Some(port)) => format!("Telnyx reaches zephyr at {url}, port {port}"),
+        _ => String::new(),
+    };
+    check(
+        !reach.is_empty(),
+        &reach,
+        "set [calls] port and media_url (wss://HOST), and front the port with tailscale funnel \
+         on the host: Telnyx connects from the internet",
+    );
+    check(
+        live::floored(cfg) && crate::voice::floored(cfg),
+        "the listener is out of the agent's reach",
+        "phone calls need the network floor (host.toml network = \"bridge\")",
+    );
+    check(
+        crate::voice::call_voice(cfg, "en"),
+        match crate::voice::call_voice(cfg, "ko") {
+            true => "English and Korean voices are in this image",
+            false => "the English voice is in this image (Korean needs KO_VOICE=1)",
+        },
+        "this image has no voice (built with VOICE=0), so a call cannot speak",
+    );
+    // Nothing zephyr can see: the owner sets it in Telnyx's portal.
+    lines.push(
+        "ok   calls: the caller id must reach you (CRTC ADAD rule 4(e)): forward the number's \
+         incoming calls to your phone in Telnyx's portal; zephyr cannot check this"
+            .into(),
+    );
+    lines
+}
+
 /// A phone number as Piper should read it: digit by digit.
 fn spoken_phone(phone: &str) -> String {
     let digits: Vec<String> = (phone.chars())
@@ -706,6 +779,52 @@ pub(crate) mod tests {
             ko.contains("인공지능") && ko.contains("Aiden Yoon") && ko.contains("416-555-0199")
         );
         assert!(closing(&cfg, "ko").contains("인공지능"));
+    }
+
+    #[test]
+    fn doctor_names_what_a_call_still_needs() {
+        let bare: Config = toml::from_str("rpi = '/r'\nhome = '/h'").unwrap();
+        assert!(doctor(&bare).is_empty());
+        assert_eq!(status(&bare), "calls: off (calls.provider is not set)");
+        let home = crate::test_dir("calls-doctor");
+        let mut cfg: Config = toml::from_str(&format!(
+            "rpi = '/r'\nhome = {home:?}\n[calls]\nprovider = 'telnyx'\nmax_minutes = 3"
+        ))
+        .unwrap();
+        cfg.voice_dir = home.join("no-voice");
+        assert_eq!(status(&cfg), "calls: telnyx, up to 3 min each");
+        let lines = doctor(&cfg);
+        for part in [
+            "warn calls: no complete Telnyx service in the vault",
+            "warn calls: set calls.caller_name",
+            "warn calls: set calls.contact_phone",
+            "warn calls: set [calls] port and media_url",
+            "warn calls: phone calls need the network floor",
+            "warn calls: this image has no voice",
+            "ok   calls: the caller id must reach you",
+        ] {
+            assert!(
+                lines.iter().any(|l| l.starts_with(part)),
+                "{part} in {lines:#?}"
+            );
+        }
+        // Set up: every line is ok, and none holds the key.
+        let mut cfg = telnyx::tests::with_service("calls-doctor-ok", "", "cHVi");
+        cfg.calls = cfg.calls.clone().map(|mut c| {
+            (c.port, c.media_url) = (Some(7794), Some("wss://box.example.ts.net".into()));
+            c
+        });
+        (cfg.calls_off_floor, cfg.voice_off_floor) = (true, true);
+        let lines = doctor(&cfg);
+        assert!(
+            lines.iter().all(|l| l.starts_with("ok   calls: ")),
+            "{lines:#?}"
+        );
+        assert!(lines.contains(
+            &"ok   calls: Telnyx reaches zephyr at wss://box.example.ts.net, port 7794".to_string()
+        ));
+        assert!(lines.iter().any(|l| l.contains("Korean needs KO_VOICE=1")));
+        assert!(!lines.join("\n").contains("KEY0123456789telnyx"));
     }
 
     #[test]

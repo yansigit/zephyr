@@ -660,6 +660,19 @@ typing = true
 }
 
 #[test]
+fn doctor_and_status_say_what_phone_calls_need() {
+    let (_, cfg) = setup("doctor-calls", "[calls]\nprovider = \"telnyx\"\n");
+    let text = stdout(&zephyr(&cfg, &["doctor"]));
+    assert!(
+        text.contains("warn calls: no complete Telnyx service in the vault"),
+        "{text}"
+    );
+    assert!(text.contains("warn calls: set calls.caller_name"), "{text}");
+    let (_, off) = setup("doctor-no-calls", "");
+    assert!(!stdout(&zephyr(&off, &["doctor"])).contains("calls:"));
+}
+
+#[test]
 fn doctor_warns_when_agent_dir_has_extensions() {
     let warning = "rpi children ignore it (--local-only); providers come from the image";
     let (_, cfg) = setup("doctor-ext", "");

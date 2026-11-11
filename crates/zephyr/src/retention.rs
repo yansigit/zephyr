@@ -27,6 +27,13 @@ pub fn sweep(cfg: &Config, store: &Store, age: Duration) -> rusqlite::Result<usi
         Ok(n) => eprintln!("zephyr: pruned {n} state.db rows older than 90 days"),
         Err(e) => eprintln!("zephyr: pruning state.db failed: {e}"),
     }
+    // A call's transcript goes sooner, when the owner says (`calls.keep_days`, DESIGN §4.22).
+    let kept = cfg.calls().keep_days as i64 * 86_400;
+    match store.prune_call_lines(crate::now() - kept) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("zephyr: pruned {n} lines of old call transcripts"),
+        Err(e) => eprintln!("zephyr: pruning call transcripts failed: {e}"),
+    }
     match store.expire_web_sessions(crate::now()) {
         Ok(0) => {}
         Ok(n) => eprintln!("zephyr: ended {n} expired web sessions"),
@@ -50,7 +57,8 @@ pub fn sweep(cfg: &Config, store: &Store, age: Duration) -> rusqlite::Result<usi
     for d in std::iter::once(dir.clone()).chain(subdirs(&dir)) {
         gone += remove_old(&d, age, |name| {
             session_of(name).is_some_and(|s| {
-                (s.starts_with("job-") || s.starts_with("task-")) && !sessions.contains(s)
+                let run = s.starts_with("job-") || s.starts_with("task-") || s.starts_with("call-");
+                run && !sessions.contains(s)
             })
         });
     }
