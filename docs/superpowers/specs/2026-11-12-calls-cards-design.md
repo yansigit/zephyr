@@ -912,3 +912,12 @@ in `strong_only` fails `Config::check`.
   the owner's own phone, in English and, with `KO_VOICE=1`, in Korean, that plays the opening
   line, holds a fact, shows the transcript in the TUI and ends at `/hangup`; and the local speech
   turn time, measured and written into §4.9.
+
+## Decided with the owner (2026-11-12)
+
+The owner lives in Canada. Where this section and the body differ, this section wins.
+
+- **Cards:** build the issuer trait, `Manual` and a test `Fake`, then `Link` (Stripe Link Agent Wallet) as the first real issuer, built against its documented API. The five open points of the Link spike are settled with the owner's own Link account later, through an ignored live test. Until then, `Manual` is the working path.
+- **Card approval with Link:** zephyr's own checks first (the cap, the checkout-origin binding, the payment window), then Link's biometric is the approval. There is no second zephyr `/ok`.
+- **Calls:** build now, on Telnyx, with Canadian local and toll-free numbers only. Speech runs locally (whisper and Piper): English, Korean with `KO_VOICE=1`, French refused for now. Every call is held for approval, capped at 5 minutes, with a live transcript and `/hangup`. The CRTC-derived rules in the body apply in full.
+- **Schema:** cards takes v20, calls takes v21. The connector catalog lane needs none.
