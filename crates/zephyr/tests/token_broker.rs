@@ -15,7 +15,7 @@
 //! zephyr mcp add echo --url 'https://httpbin.org/get?key=${A3_SECRET}' --header 'X-Key=${A3_SECRET}'
 //! # A `url` connector holds its real secret unless told otherwise (rpi's own MCP client cannot
 //! # reach a decrypted host); the test only needs a stand-in bound to the echo host.
-//! zephyr config set mcp.echo.secrets surrogate
+//! sed -i 's/^name = "echo"/name = "echo"\nsecrets = "surrogate"/' "$HOME/.zephyr-daemon/zephyr.toml"
 //! zephyr up --build
 //! cargo test -p zephyr --test token_broker -- --ignored
 //! ```

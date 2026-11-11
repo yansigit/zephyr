@@ -297,3 +297,25 @@ Results (image `zephyr-dev:a3-dc0115b`, container `zephyr-test-a3`, attach 18790
 - `https://httpbin.org/gzip`, which compresses whatever is asked: `502 zephyr: httpbin.org sent a reply zephyr cannot read (compressed)`, with a `swap … refused` audit row.
 - `exec` with the bound vault token (scripted rpi stand-in): the answer showed `[vault:A3_TOKEN]`, the `.procs` logs held `A3_TOKEN=zsur_…` and `"X-Key": "zsur_…"`, and no file under `/zephyr` held either real value.
 - `tests/net_floor.rs -- --ignored` passed twice: on a fresh daemon, and after the daemon had re-exec'd itself.
+
+## Follow-up: the review of PR #48 (2026-11-11)
+
+Each finding was confirmed against the code before it was changed; none was skipped. The failing tests came first for the leaks (`egress::tests::decrypted::a_token_sent_back_in_another_form_does_not_reach_the_agent`, `no_websocket_is_carried_on_a_bound_host`, `a_request_with_two_framings_reaches_the_server_as_one`); the rest were written with their fix. All of it is one commit, since the changes share `broker.rs`, `egress.rs` and `router.rs`.
+
+- [x] **1. Basic echo.** `swap` returns what it sent in another form (`Swapped::sent`: the Basic payload, with the one the agent's program wrote), and a reply's unswap set is those, each bound value, and each value's `vault::base64_forms`.
+- [x] **2. Reason phrase.** A decrypted reply's own status text is dropped.
+- [x] **3. `/vault bind`, `url on`, `raw on`** need a channel in `settings.strong_channels`, and so does the `/ok` of the agent's `bind` proposal (`Router::not_now`). Tightening is taken anywhere.
+- [x] **4. Drafts.** A connector draft can no longer set `hosts` (nor `secrets`); an approved update keeps the owner's. The agent proposes hosts with `gateway /set mcp.NAME.hosts`, which already needs a strong channel.
+- [x] **5. `url` connectors.** Tested for real in `zephyr-test-a3` with rpi 0.21.2 and a scripted model that had rpi call `mcp_list`: against an HTTPS connector on a decrypted host the tool answered `MCP HTTP request failed: error sending request`; with the host a tunnel again it reached the server (`MCP message must use JSON-RPC 2.0`, httpbin not being an MCP server). So rpi's MCP client does not trust the CA. A `url` connector now keeps its real secret in `mcp.json` and its host stays a tunnel, as before the broker, unless the owner sets `secrets = "surrogate"`; `doctor` warns either way. An upgrade changes nothing for it.
+- [x] **6. Range.** `Range` and `If-Range` are removed, and a `206` is refused (`502`, an audit row).
+- [x] **7. Hop-by-hop.** Removed on the request and the reply; an `Upgrade` goes no further and a `101` is refused, so no websocket is carried on a decrypted host (which also closes the unread-frames gap). The upstream connection is one per client connection, made at its `CONNECT`, not from a pool. A request with both a length and a chunked body reaches the server as one request, and hyper closes the client connection after it.
+- [x] **8.** `broker.upgrade_told` is set only once the vault was read and the notice stored.
+- [x] **9.** `Maps::current` also keys on inode and ctime.
+- [x] **10.** The upstream `ClientConfig` is built once (`Floor::upstream`, in place of `Floor::roots`); the live config is compared by pointer.
+
+Changed with these: `settings::value` shows `mcp.NAME.secrets` and `.hosts` as they are in effect; the real-container test sets its `url` connector to `surrogate` to have a stand-in bound to the echo host.
+
+Results (image `zephyr-dev:a3-2a41270`; container and network removed afterwards):
+- `cargo test --no-fail-fast`: 1233 passed, 0 failed, 20 ignored. `clippy -D warnings` clean, `cargo deny check advisories bans` ok.
+- Real rpi 0.21.2: `real_rpi` 6, `rpi_load` 10, ignored `attach` 1, all passed.
+- `tests/token_broker.rs` and `tests/net_floor.rs`, ignored, both passed in the side container. `curl -u x:$ZSUR https://httpbin.org/get` showed the Basic credential as the agent wrote it and no trace of the real one; `/basic-auth` still answered 200 for the real secret behind the stand-in; a request with `Upgrade: websocket` was answered as a plain request.
