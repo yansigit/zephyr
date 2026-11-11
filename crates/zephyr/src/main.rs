@@ -27,6 +27,11 @@ fn main() -> ExitCode {
         let args = argv.map(|a| a.to_string_lossy().into_owned()).collect();
         return zephyr::browser_gate::main(args);
     }
+    // `xdotool` there too: it waits while the owner holds the desktop (DESIGN §4.11).
+    if Path::new(&zero).file_name() == Some(std::ffi::OsStr::new("xdotool")) {
+        let args = argv.map(|a| a.to_string_lossy().into_owned()).collect();
+        return zephyr::browser_gate::xdotool_main(args);
+    }
     zephyr_main()
 }
 

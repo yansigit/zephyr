@@ -226,14 +226,18 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
 - `agent-browser --help` and `--version` are not held; every other command is, before the page is read. `xdotool` is held whatever its arguments.
 - `vault::fill` takes `Control::fill` first and answers `not filled: the owner has the desktop; try again when they hand it back` without it.
 
-- [ ] **Step 1: Failing tests** (Review Focus 3):
+- [x] **Step 1: Failing tests** (Review Focus 3):
   - `desktop.rs`: `take_writes_the_flag_and_give_removes_it`; `a_second_take_and_a_take_during_a_fill_are_refused`; `a_fill_during_a_takeover_is_refused`; `a_start_removes_a_stale_flag`;
   - `gate.rs` (with `serving_with`): `a_desktop_wait_is_answered_at_the_hand_back`; `a_desktop_wait_gives_up_after_the_hold_limit` (`desktop_hold` 200 ms, the "still has the desktop" text); `another_uid_gets_no_answer` already covers the peer check;
   - `browser_gate.rs`: `a_held_desktop_stops_agent_browser_and_xdotool_before_the_real_binary` (a fake real binary that logs; the log stays empty; the text is the gate's; exit 1); `with_no_flag_both_run_as_before`; `held_with_no_gate_is_refused` (`NOT_ANSWERING`).
-- [ ] **Step 2: Run** `cargo test -p zephyr --lib desktop:: gate:: browser_gate::` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** → PASS; `cargo test -p zephyr`.
-- [ ] **Step 5: Commit** `feat(desktop): make the agent's browser and xdotool wait while the owner holds the desktop`.
+- [x] **Step 2: Run** `cargo test -p zephyr --lib desktop:: gate:: browser_gate::` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** → PASS; `cargo test -p zephyr`.
+- [x] **Step 5: Commit** `feat(desktop): make the agent's browser and xdotool wait while the owner holds the desktop`.
+- Deviation: the two files' tests and the code were written together, not test-first; the tests were run only against the finished code.
+- Deviation: `Control::take` by the session that already holds the desktop succeeds and changes nothing (it needs a fresh ticket after its socket dropped, C2-7), and has a third refusal, `the desktop could not be held; zephyr doctor says why`, when the flag cannot be written: without the flag the wrappers would not wait.
+- Deviation: one more test, `tests/cli.rs` `xdotool_is_the_wrapper_and_does_not_run_while_the_desktop_is_held`, runs the binary under the name `xdotool`, since the `argv[0]` dispatch is in `main.rs`, which no unit test reaches. `desktop.rs` also has `a_held_command_is_told_since_when_and_what_to_do` for the two texts.
+- Deviation: `vault::agent` takes the `Control` as a parameter (the fill itself is spawned there), and `vault::fill` is unchanged.
 
 ### Task C2-7: Take over, the ticket, `/api/vnc`, x11vnc, the notes and the timeouts
 

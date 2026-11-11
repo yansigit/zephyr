@@ -7,10 +7,12 @@
 //! there could watch or drive the agent's signed-in browser. The server keeps holding that name,
 //! so nobody else can claim it and have the agent's clients (which try it first) draw on theirs.
 
+use crate::config::Config;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use tokio::sync::watch;
 
 static RUNNING: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 
@@ -153,9 +155,237 @@ fn start(program: &str, first: &[&str], rest: &[&str]) -> Option<Child> {
         .ok()
 }
 
+/// The file that says the owner holds the desktop (DESIGN §4.11), in `drafts::public_dir`:
+/// root's, 0644, holding the start time. Never in the agent's home, where the agent could remove
+/// it. The `agent-browser` and `xdotool` wrappers look for it before anything else.
+pub const HELD_FILE: &str = "desktop-held";
+
+pub const OTHER_DEVICE: &str = "another device has the desktop";
+pub const FILLING: &str = "the vault is signing in; try again in a moment";
+const NO_FLAG: &str = "the desktop could not be held; zephyr doctor says why";
+
+/// The owner's hold on the desktop: since when (unix seconds), and the web session that took it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Held {
+    pub since: i64,
+    pub session: [u8; 32],
+}
+
+/// The one lock a takeover and the vault's fill share, so they never overlap. Made once by the
+/// daemon and handed to the web hub, the gate server and the vault.
+pub struct Control {
+    cfg: Config,
+    /// Fills running now. Every change to `held` is made holding this lock.
+    fills: Mutex<usize>,
+    held: watch::Sender<Option<Held>>,
+}
+
+/// A fill in progress; the desktop cannot be taken until it is dropped.
+pub struct Fill(Arc<Control>);
+
+impl Drop for Fill {
+    fn drop(&mut self) {
+        *self.0.fills.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+    }
+}
+
+impl Control {
+    /// Nobody holds the desktop at a start: a flag a crash left is removed. The wrappers that
+    /// waited on the old daemon's socket have already exited 1.
+    pub fn new(cfg: &Config) -> Arc<Control> {
+        let control = Control {
+            cfg: cfg.clone(),
+            fills: Mutex::new(0),
+            held: watch::channel(None).0,
+        };
+        let _ = std::fs::remove_file(control.flag());
+        Arc::new(control)
+    }
+
+    fn flag(&self) -> PathBuf {
+        crate::drafts::public_dir(&self.cfg).join(HELD_FILE)
+    }
+
+    /// The owner takes the desktop: the flag is written before anyone hears of it. The session
+    /// that holds it may take it again (a new ticket after its socket dropped).
+    pub fn take(&self, session: [u8; 32], now: i64) -> Result<(), &'static str> {
+        use std::os::unix::fs::PermissionsExt;
+        let fills = self.fills.lock().unwrap_or_else(|e| e.into_inner());
+        match self.held() {
+            Some(held) if held.session == session => return Ok(()),
+            Some(_) => return Err(OTHER_DEVICE),
+            None if *fills > 0 => return Err(FILLING),
+            None => {}
+        }
+        // Without the flag the wrappers would not wait: then there is no takeover.
+        let flag = self.flag();
+        let written = crate::drafts::ensure_public_dir(&self.cfg)
+            .and_then(|_| Ok(std::fs::write(&flag, format!("{now}\n"))?))
+            .and_then(|()| {
+                Ok(std::fs::set_permissions(
+                    &flag,
+                    PermissionsExt::from_mode(0o644),
+                )?)
+            });
+        if let Err(e) = written {
+            eprintln!("zephyr: writing {}: {e:#}", flag.display());
+            let _ = std::fs::remove_file(&flag);
+            return Err(NO_FLAG);
+        }
+        self.held.send_replace(Some(Held {
+            since: now,
+            session,
+        }));
+        Ok(())
+    }
+
+    /// The desktop goes back to the agent: `(since, until)` when it was held.
+    pub fn give(&self, now: i64) -> Option<(i64, i64)> {
+        let _fills = self.fills.lock().unwrap_or_else(|e| e.into_inner());
+        let held = self.held.send_replace(None)?;
+        if let Err(e) = std::fs::remove_file(self.flag()) {
+            // The wrappers then still ask the gate, which lets them run at once.
+            eprintln!("zephyr: removing {}: {e}", self.flag().display());
+        }
+        Some((held.since, now))
+    }
+
+    pub fn held(&self) -> Option<Held> {
+        self.held.borrow().clone()
+    }
+
+    /// The vault is about to type into the page; `None` while the owner holds the desktop.
+    pub fn fill(self: &Arc<Self>) -> Option<Fill> {
+        let mut fills = self.fills.lock().unwrap_or_else(|e| e.into_inner());
+        if self.held().is_some() {
+            return None;
+        }
+        *fills += 1;
+        Some(Fill(self.clone()))
+    }
+
+    pub fn changes(&self) -> watch::Receiver<Option<Held>> {
+        self.held.subscribe()
+    }
+}
+
+/// `at` as `HH:MM` in the owner's time zone.
+pub fn clock(cfg: &Config, at: i64) -> String {
+    let tz = crate::scheduler::zone(cfg).unwrap_or(jiff::tz::TimeZone::UTC);
+    crate::settings::clock(at, &tz)
+}
+
+/// What a held command reads when the owner still has the desktop after the gate's wait.
+pub fn still(cfg: &Config, since: i64) -> String {
+    format!(
+        "zephyr: the owner has the desktop (since {}); this command did not run. Do other work, \
+         or try again later.",
+        clock(cfg, since)
+    )
+}
+
+/// What a held command reads at the hand back. It never runs: a click planned on the page as it
+/// was is not made on the page as the owner left it.
+pub fn used(cfg: &Config, since: i64, until: i64) -> String {
+    format!(
+        "zephyr: the owner used the desktop from {} to {}; this command did not run. The page \
+         may have changed: take a fresh snapshot before acting.",
+        clock(cfg, since),
+        clock(cfg, until)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn control(name: &str) -> (Config, Arc<Control>) {
+        let dir = crate::test_dir(name);
+        let cfg: Config =
+            toml::from_str(&format!("rpi = '/r'\nhome = {dir:?}\ntimezone = 'UTC'\n")).unwrap();
+        let control = Control::new(&cfg);
+        (cfg, control)
+    }
+
+    fn flag(cfg: &Config) -> PathBuf {
+        crate::drafts::public_dir(cfg).join(HELD_FILE)
+    }
+
+    #[test]
+    fn take_writes_the_flag_and_give_removes_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let (cfg, control) = control("desktop-take");
+        let mut changes = control.changes();
+        assert!(control.held().is_none() && !flag(&cfg).exists());
+        control.take([1; 32], 100).unwrap();
+        // In root's public folder, never the agent's home, which the agent could clear.
+        assert!(!flag(&cfg).starts_with(&cfg.home), "{:?}", flag(&cfg));
+        assert_eq!(std::fs::read_to_string(flag(&cfg)).unwrap(), "100\n");
+        let mode = std::fs::metadata(flag(&cfg)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+        let held = Held {
+            since: 100,
+            session: [1; 32],
+        };
+        assert_eq!(control.held(), Some(held.clone()));
+        assert_eq!(*changes.borrow_and_update(), Some(held));
+        assert_eq!(control.give(160), Some((100, 160)));
+        assert!(control.held().is_none() && !flag(&cfg).exists());
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(control.give(170), None, "nothing was held");
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&cfg));
+    }
+
+    #[test]
+    fn a_second_take_and_a_take_during_a_fill_are_refused() {
+        let (cfg, control) = control("desktop-second");
+        let fill = control.fill().expect("nobody holds the desktop");
+        assert_eq!(control.take([1; 32], 100), Err(FILLING));
+        assert!(!flag(&cfg).exists());
+        drop(fill);
+        control.take([1; 32], 100).unwrap();
+        assert_eq!(control.take([2; 32], 101), Err(OTHER_DEVICE));
+        // Its own session again: still held since the first take.
+        control.take([1; 32], 105).unwrap();
+        assert_eq!(control.held().unwrap().since, 100);
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&cfg));
+    }
+
+    #[test]
+    fn a_fill_during_a_takeover_is_refused() {
+        let (cfg, control) = control("desktop-fill");
+        control.take([1; 32], 100).unwrap();
+        assert!(control.fill().is_none());
+        control.give(101);
+        assert!(control.fill().is_some());
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&cfg));
+    }
+
+    #[test]
+    fn a_start_removes_a_stale_flag() {
+        let (cfg, control) = control("desktop-stale");
+        control.take([1; 32], 100).unwrap();
+        assert!(flag(&cfg).exists());
+        // The daemon crashed and starts again.
+        let again = Control::new(&cfg);
+        assert!(again.held().is_none() && !flag(&cfg).exists());
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&cfg));
+    }
+
+    #[test]
+    fn a_held_command_is_told_since_when_and_what_to_do() {
+        let (cfg, _) = control("desktop-text");
+        assert_eq!(
+            still(&cfg, 14 * 3600 + 4 * 60),
+            "zephyr: the owner has the desktop (since 14:04); this command did not run. Do \
+             other work, or try again later."
+        );
+        assert_eq!(
+            used(&cfg, 14 * 3600 + 4 * 60, 14 * 3600 + 8 * 60),
+            "zephyr: the owner used the desktop from 14:04 to 14:08; this command did not run. \
+             The page may have changed: take a fresh snapshot before acting."
+        );
+    }
 
     #[test]
     fn the_cookie_file_is_one_private_entry_and_is_kept() {

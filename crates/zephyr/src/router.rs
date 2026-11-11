@@ -318,7 +318,7 @@ pub async fn run<C: Channel>(
     tokio::select! {
         r = runs => r.map(|_| Exit::Shutdown),
         // Tasks' and jobs' sends, every connector call, the browser's clicks (approvals §4.2).
-        r = crate::gate::serve(gate_cfgs, gate_snap, waits, &jobs, gate_notes) => r.map(|()| Exit::Shutdown),
+        r = crate::gate::serve(gate_cfgs, gate_snap, waits, &jobs, gate_notes, router.desktop.clone()) => r.map(|()| Exit::Shutdown),
         // The agent's only way out, in bridge mode (DESIGN §4.20).
         r = crate::egress::serve(egress_cfgs, &jobs) => r.map(|()| Exit::Shutdown),
         r = crate::attach::serve(cfg, handles.clone()) => r.map(|()| Exit::Shutdown),
@@ -517,6 +517,8 @@ struct Router<'a> {
     procs: crate::procs::Procs,
     /// Browser actions waiting in place for the owner's answer (approvals spec §4.4).
     waits: crate::actions::Waits,
+    /// Who holds the desktop: the owner's takeover, or the vault's fill (DESIGN §4.11).
+    desktop: Arc<crate::desktop::Control>,
     /// The last tick found the gateway paused: the next one holds what came due (I1).
     due_held: bool,
     /// The gate's held notes for main's run (R51), from `gate::serve`.
@@ -689,6 +691,7 @@ impl<'a> Router<'a> {
             stopping: false,
             procs: Default::default(),
             waits: Default::default(),
+            desktop: crate::desktop::Control::new(cfg),
             due_held: false,
             gate_notes: None,
             web: None,
@@ -896,7 +899,7 @@ impl<'a> Router<'a> {
             if let Some((id, args)) = crate::procs::call(ev, "vault") {
                 // Main only, like `exec`; a call the plugin refused waits for nothing.
                 if let Ok(action) = zephyr_policy::tools::vault_action(args) {
-                    crate::vault::agent(&self.cfg, &self.store, id, action);
+                    crate::vault::agent(&self.cfg, &self.store, id, action, &self.desktop);
                 }
             }
             if let Some((id, args)) = crate::procs::call(ev, "process") {

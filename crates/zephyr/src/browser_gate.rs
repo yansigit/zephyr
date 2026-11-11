@@ -59,6 +59,15 @@ pub const REAL_ENV: &str = "ZEPHYR_AGENT_BROWSER";
 pub const REAL: &str = "/opt/zephyr/libexec/agent-browser";
 /// The root-owned folder whose `agent-browser` is this wrapper, first on the agent's PATH.
 pub const GATE_BIN: &str = "/opt/zephyr/gate/bin";
+/// Where the image keeps the real xdotool; `xdotool` in [`GATE_BIN`] is this wrapper.
+pub const XDOTOOL: &str = "/usr/bin/xdotool";
+/// Names another xdotool for the wrapper (tests' fake).
+pub const XDOTOOL_ENV: &str = "ZEPHYR_XDOTOOL";
+/// Where the daemon's public folder is in the image, for a wrapper told of no gate socket.
+const PUBLIC: &str = "/var/lib/zephyr-public";
+/// How long a wrapper waits on the gate while the owner holds the desktop: past the gate's own
+/// limit (`Config::desktop_hold`, 2 minutes).
+const HELD_WAIT: Duration = Duration::from_secs(3 * 60);
 /// What the agent reads when the gate cannot be asked or does not answer.
 pub const NOT_ANSWERING: &str = "the gate is not answering; not run";
 /// What the agent reads when the control or the page is not what the owner approved (I4).
@@ -308,17 +317,67 @@ pub fn main(args: Vec<String>) -> ExitCode {
         eprintln!("agent-browser: {e}");
         return ExitCode::from(127);
     }
-    match run(&args, &env) {
+    finish("agent-browser", run(&args, &env), &env, &args)
+}
+
+/// Runs the real binary in this process's place, or refuses with exit 1.
+fn finish(name: &str, next: Next, env: &Env, args: &[String]) -> ExitCode {
+    match next {
         Next::Exec => {
             use std::os::unix::process::CommandExt;
-            let e = Command::new(&env.real).args(&args).exec();
-            eprintln!("agent-browser: running {}: {e}", env.real.display());
+            let e = Command::new(&env.real).args(args).exec();
+            eprintln!("{name}: running {}: {e}", env.real.display());
             ExitCode::from(127)
         }
         Next::Refuse(text) => {
             eprintln!("{text}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `xdotool ARGS` as the agent runs it (DESIGN §4.11): the real one in this process's place,
+/// unless the owner holds the desktop. Held whatever its arguments.
+pub fn xdotool_main(args: Vec<String>) -> ExitCode {
+    let mut env = Env::from_process();
+    let named = std::env::var_os(XDOTOOL_ENV).filter(|v| !v.is_empty());
+    env.real = named.map_or_else(|| PathBuf::from(XDOTOOL), PathBuf::from);
+    // A bare name would be looked up on the PATH, where `xdotool` is this wrapper.
+    let me = std::fs::canonicalize("/proc/self/exe").ok();
+    if !env.real.is_absolute() || std::fs::canonicalize(&env.real).ok() == me {
+        eprintln!("xdotool: {} is not the real xdotool", env.real.display());
+        return ExitCode::from(127);
+    }
+    finish("xdotool", xdotool(&env), &env, &args)
+}
+
+/// What the `xdotool` wrapper does with any command.
+pub fn xdotool(env: &Env) -> Next {
+    held(env).map_or(Next::Exec, Next::Refuse)
+}
+
+/// Whether the owner holds the desktop (DESIGN §4.11): `Some(text)` means do not run, and exit 1
+/// with it. Root's `desktop-held`, beside the gate socket, says so; the wrapper then waits on
+/// the gate, which answers at the hand back or after 2 minutes with the words to print, or with
+/// none when the desktop is not held after all. Held with no gate answering is refused.
+pub fn held(env: &Env) -> Option<String> {
+    let dir = env.socket.as_deref().and_then(std::path::Path::parent);
+    let flag = dir
+        .unwrap_or(std::path::Path::new(PUBLIC))
+        .join(crate::desktop::HELD_FILE);
+    // Only a file that is not there is no hold: one that cannot be read is asked about.
+    if matches!(std::fs::symlink_metadata(flag), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    {
+        return None;
+    }
+    let socket = env.socket.as_ref();
+    let req = json!({"v": 1, "desktop": "wait", "session": env.session});
+    match socket.map(|s| zephyr_policy::gate_client::ask_open(s, &req, HELD_WAIT)) {
+        Some(Ok((a, _))) if a["verdict"] == "deny" && a["text"].is_string() => {
+            let text = a["text"].as_str().unwrap_or_default();
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        _ => Some(NOT_ANSWERING.into()),
     }
 }
 
@@ -331,6 +390,10 @@ pub fn run(args: &[String], env: &Env) -> Next {
     let only_says = |a: &String| matches!(a.as_str(), "--help" | "-h" | "--version" | "-V");
     if args.iter().any(only_says) {
         return Next::Exec;
+    }
+    // Before the page is read: the owner has the desktop, and nothing of the agent's touches it.
+    if let Some(text) = held(env) {
+        return Next::Refuse(text);
     }
     let argv = split(args);
     let flags = forwarded(&argv.globals);
@@ -2023,6 +2086,68 @@ cat "$d/$f.json"
 
     fn answer(conn: &mut UnixStream, v: Value) {
         conn.write_all(format!("{v}\n").as_bytes()).unwrap();
+    }
+
+    /// Review Focus 3: while the owner holds the desktop, neither wrapper reads the page or runs
+    /// the real binary; each waits on the gate and exits 1 with its words.
+    #[test]
+    fn a_held_desktop_stops_agent_browser_and_xdotool_before_the_real_binary() {
+        let t = T::new("bg-held");
+        t.page(MAIL, COMPOSE, "");
+        std::fs::write(t.dir.join(crate::desktop::HELD_FILE), "100\n").unwrap();
+        let gate = t.gate();
+        let back = "zephyr: the owner used the desktop from 14:04 to 14:08; this command did \
+                    not run. The page may have changed: take a fresh snapshot before acting.";
+        // One at a time: each answer goes to the wrapper that asked.
+        for which in 0..3 {
+            let env = t.env.clone();
+            let waiting = match which {
+                0 => t.spawn(&["snapshot", "-i"]),
+                1 => t.spawn(&["click", "@e4"]),
+                _ => std::thread::spawn(move || xdotool(&env)),
+            };
+            let (req, mut conn) = asked(&gate);
+            assert_eq!(req, json!({"v": 1, "desktop": "wait", "session": "main"}));
+            answer(&mut conn, json!({"verdict": "deny", "text": back}));
+            assert_eq!(waiting.join().unwrap(), Next::Refuse(back.into()));
+        }
+        // An `allow` is not the gate's answer to a wait: nothing runs on it.
+        let waiting = t.spawn(&["open", "https://example.com"]);
+        answer(&mut asked(&gate).1, json!({"verdict": "allow"}));
+        assert_eq!(waiting.join().unwrap(), Next::Refuse(NOT_ANSWERING.into()));
+        assert!(t.argv().is_empty(), "the real binary ran: {:?}", t.argv());
+        // Help and the version touch no page.
+        assert_eq!(t.run(&["--version"]), Next::Exec);
+        assert_eq!(t.run(&["click", "@e3", "--help"]), Next::Exec);
+        assert!(gate.try_recv().is_err());
+        // Handed back between the wrapper's look and the gate's: an empty text, and it goes on.
+        let waiting = t.spawn(&["snapshot", "-i"]);
+        answer(&mut asked(&gate).1, json!({"verdict": "deny", "text": ""}));
+        assert_eq!(waiting.join().unwrap(), Next::Exec);
+    }
+
+    #[test]
+    fn with_no_flag_both_run_as_before() {
+        let t = T::new("bg-not-held");
+        t.page(MAIL, COMPOSE, "");
+        let gate = t.gate();
+        assert_eq!(t.run(&["snapshot", "-i"]), Next::Exec);
+        assert_eq!(xdotool(&t.env), Next::Exec);
+        assert!(gate.try_recv().is_err(), "the gate was asked");
+        assert!(held(&t.env).is_none());
+    }
+
+    #[test]
+    fn held_with_no_gate_is_refused() {
+        let t = T::new("bg-held-alone");
+        std::fs::write(t.dir.join(crate::desktop::HELD_FILE), "100\n").unwrap();
+        // No gate listens on the socket.
+        assert_eq!(
+            t.run(&["snapshot", "-i"]),
+            Next::Refuse(NOT_ANSWERING.into())
+        );
+        assert_eq!(xdotool(&t.env), Next::Refuse(NOT_ANSWERING.into()));
+        assert!(t.argv().is_empty());
     }
 
     const MAIL: &str = "https://mail.example.com/compose";

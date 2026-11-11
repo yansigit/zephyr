@@ -140,6 +140,10 @@ pub struct Config {
     /// The signal-cli the daemon runs as root, by full path. Not configurable; tests set a fake.
     #[serde(skip, default = "signal_cli")]
     pub signal_cli: PathBuf,
+    /// How long the gate lets a browser or desktop command wait while the owner holds the
+    /// desktop (DESIGN §4.11). Not configurable; tests shorten it.
+    #[serde(skip, default = "desktop_hold")]
+    pub desktop_hold: std::time::Duration,
 }
 
 fn telegram_api() -> String {
@@ -180,6 +184,10 @@ fn tick() -> std::time::Duration {
 
 fn min_until() -> std::time::Duration {
     std::time::Duration::from_secs(30)
+}
+
+fn desktop_hold() -> std::time::Duration {
+    std::time::Duration::from_secs(2 * 60)
 }
 
 fn floor() -> bool {
@@ -487,6 +495,7 @@ impl Config {
         self.web_ping = running.web_ping;
         self.telegram_api = running.telegram_api.clone();
         self.signal_cli = running.signal_cli.clone();
+        self.desktop_hold = running.desktop_hold;
     }
 
     /// Account names become directory names, so each must be a plain, unique path segment.
