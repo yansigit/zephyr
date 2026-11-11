@@ -8525,7 +8525,7 @@ async fn stop_and_a_start_close_open_cards_and_a_failed_close_is_told_once() {
     )
     .await;
     reply_where(&gw, "chat", |r| {
-        r.contains("\ncard: not filled: card #2 has expired")
+        r.contains("\ncard: not filled: card #2 is closing")
     })
     .await;
     Fake::script(&script, |s| s.fail_close = false);
@@ -8829,5 +8829,48 @@ async fn a_card_fill_never_waits_for_a_pace_slot() {
     );
     gw.say("p4", "owner", &again).await;
     reply_where(&gw, "chat", |r| r.contains("gave-up=124")).await;
+    gw.shutdown().await;
+}
+
+/// A close is immediate here, whatever the issuer takes to answer: right after `/stop` the
+/// card covers no Pay click and is not filled.
+#[tokio::test]
+async fn a_pay_click_and_a_fill_right_after_stop_are_refused() {
+    use zephyr::cards::Fake;
+    let (home, cfg) = card_home("card-closing", "fake", "");
+    let script = cfg.clone();
+    let gw = start(cfg);
+    gw.say("q1", "owner", &card_ask("42.50")).await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    gw.say("q2", "owner", "/ok 1").await;
+    reply_where(&gw, "chat", |r| r.contains("[card #1 issued")).await;
+    gw.say("q3", "owner", CARD_FILL).await;
+    reply_where(&gw, "chat", |r| r.contains("\ncard: filled")).await;
+    // The issuer takes half a minute to answer a close.
+    Fake::script(&script, |s| s.close_delay = Duration::from_secs(30));
+    gw.say("q4", "owner", "/stop").await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] stopped")).await;
+    assert_eq!(card_status(&home, 1), "closing", "closed here at once");
+    // Its Pay click is asked about like any payment.
+    pay_page(&home, "CA$42.50");
+    gw.say("q5", "owner", &click_send(&home)).await;
+    let held = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #2:")).await;
+    assert!(
+        held.starts_with("[zephyr] approve #2: payment (browser)"),
+        "{held}"
+    );
+    assert!(clicks(&home).is_empty());
+    gw.say("q6", "owner", "/no 2").await;
+    reply_where(&gw, "chat", |r| r.contains("[process #1 exited")).await;
+    // And it is not filled again: its number is not fetched.
+    let before = Fake::script(&script, |s| s.log.len());
+    gw.say("q7", "owner", &format!("{CARD_FILL} again")).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains("\ncard: not filled: card #1 is closing")
+    })
+    .await;
+    assert_eq!(fills(&home).len(), 3, "only the first fill typed");
+    let log = Fake::script(&script, |s| s.log[before..].to_vec());
+    assert!(!log.iter().any(|l| l.starts_with("reveal")), "{log:?}");
     gw.shutdown().await;
 }

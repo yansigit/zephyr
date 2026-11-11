@@ -437,7 +437,9 @@ pub struct NewCard {
 }
 
 /// A card as stored: never its number or code. `status` is `waiting` (for the owner to make
-/// it, or to approve it at the issuer), `open`, `used`, `closed`, `failed` or `unknown`.
+/// it, or to approve it at the issuer), `open`, `charging` (its Pay click went), `closing` (a
+/// close was asked and the issuer has not confirmed it), `used`, `closed`, `failed` or
+/// `unknown`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Card {
     pub id: i64,
@@ -2060,17 +2062,20 @@ impl Store {
         Ok(n == 1)
     }
 
-    /// A card that is not over is past its time from `now` on: no fill takes it.
-    pub fn card_expire_now(&self, id: i64, now: i64) -> rusqlite::Result<()> {
-        self.db.execute(
-            "UPDATE cards SET expires_at = min(expires_at, ?2)
+    /// A close of card `id` was asked (`/stop`, `/pause`, a start, `/card close`, its expiry):
+    /// from this statement on it is `closing` and past its time, so it covers no Pay click and
+    /// is neither filled nor opened, whatever the issuer takes to answer. `false` when it was
+    /// over or closing already.
+    pub fn card_closing(&self, id: i64, now: i64) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
+            "UPDATE cards SET status = 'closing', expires_at = min(expires_at, ?2)
              WHERE id = ?1 AND status IN ('waiting', 'open', 'charging')",
             params![id, now],
         )?;
-        Ok(())
+        Ok(n == 1)
     }
 
-    /// The issuer's first charge on a card that is not over: it is `used`, with who charged
+    /// The issuer's first charge on a card that is not settled: it is `used`, with who charged
     /// it. `false` when it was over already, so a charge is recorded and told once.
     #[allow(clippy::too_many_arguments)]
     pub fn card_charged(
@@ -2086,7 +2091,7 @@ impl Store {
         let n = self.db.execute(
             "UPDATE cards SET status = 'used', closed_at = ?7, charged_minor = ?2,
                     charged_currency = ?3, merchant_id = ?4, descriptor = ?5, mcc = ?6
-             WHERE id = ?1 AND status IN ('waiting', 'open', 'charging')",
+             WHERE id = ?1 AND status IN ('waiting', 'open', 'charging', 'closing')",
             params![id, minor, currency, merchant_id, descriptor, mcc, now],
         )?;
         Ok(n == 1)
@@ -2661,7 +2666,7 @@ impl Store {
             .execute("DELETE FROM memory_commits WHERE at < ?1", params![before])?;
         // The highest card id stays, as above: `card-<id>-…` inbox rows are once per id.
         let cards = self.db.execute(
-            "DELETE FROM cards WHERE status NOT IN ('waiting', 'open', 'charging')
+            "DELETE FROM cards WHERE status NOT IN ('waiting', 'open', 'charging', 'closing')
                AND coalesce(closed_at, created_at) < ?1 AND id < (SELECT max(id) FROM cards)",
             params![before],
         )?;
