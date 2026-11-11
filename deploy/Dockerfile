@@ -57,6 +57,11 @@ ARG FFMPEG_SHA256=40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7ab
 # Hugging Face revisions of ggerganov/whisper.cpp, ggml-org/whisper-vad and rhasspy/piper-voices.
 ARG WHISPER_MODELS_REV=5359861c739e955e79d9a303bcbc70fb988958b1
 ARG WHISPER_SMALL_SHA256=ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb
+# The smaller whisper model a phone call's utterances are transcribed with when calls.speech is
+# local (DESIGN §4.22): 57 MB, about a third of the small model's time. CALL_STT=0 leaves it out,
+# and such calls use the small model.
+ARG CALL_STT=1
+ARG WHISPER_BASE_SHA256=422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898
 ARG VAD_REV=9ffd54a1e1ee413ddf265af9913beaf518d1639b
 ARG VAD_SHA256=29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf
 ARG PIPER_VOICES_REV=cf910fb59f1d79ab3b625a63993a108751c6c25d
@@ -288,7 +293,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 # whisper's model, Silero VAD and Piper's voices, each checked against its pinned sha256.
 FROM ubuntu:24.04 AS voice-models
-ARG KO_VOICE WHISPER_MODELS_REV WHISPER_SMALL_SHA256 VAD_REV VAD_SHA256 PIPER_VOICES_REV \
+ARG KO_VOICE CALL_STT WHISPER_BASE_SHA256 WHISPER_MODELS_REV WHISPER_SMALL_SHA256 VAD_REV VAD_SHA256 PIPER_VOICES_REV \
     EN_VOICE_SHA256 EN_VOICE_JSON_SHA256 KO_VOICE_SHA256 KO_VOICE_JSON_SHA256
 RUN set -eu; apt-get update && apt-get install -y --no-install-recommends ca-certificates curl; \
     get() { curl -fsSLo "/out/$1" "https://huggingface.co/$2/resolve/$3"; echo "$4  /out/$1" | sha256sum -c -; }; \
@@ -296,6 +301,10 @@ RUN set -eu; apt-get update && apt-get install -y --no-install-recommends ca-cer
     get models/ggml-small-q5_1.bin ggerganov/whisper.cpp "$WHISPER_MODELS_REV/ggml-small-q5_1.bin" \
       "$WHISPER_SMALL_SHA256"; \
     get models/ggml-silero-v5.1.2.bin ggml-org/whisper-vad "$VAD_REV/ggml-silero-v5.1.2.bin" "$VAD_SHA256"; \
+    if [ "$CALL_STT" = 1 ]; then \
+      get models/ggml-base-q5_1.bin ggerganov/whisper.cpp "$WHISPER_MODELS_REV/ggml-base-q5_1.bin" \
+        "$WHISPER_BASE_SHA256"; \
+    fi; \
     v="rhasspy/piper-voices"; en="$PIPER_VOICES_REV/en/en_US/lessac/medium/en_US-lessac-medium"; \
     get voices/en_US-lessac-medium.onnx "$v" "$en.onnx" "$EN_VOICE_SHA256"; \
     get voices/en_US-lessac-medium.onnx.json "$v" "$en.onnx.json" "$EN_VOICE_JSON_SHA256"; \

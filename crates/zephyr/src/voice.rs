@@ -56,6 +56,11 @@ const MAX_OUT: u64 = 64 * 1024 * 1024;
 const WAV_HEADER: u64 = 44;
 const WAV_BYTES_PER_SEC: u64 = 32000;
 const MODEL: &str = "models/ggml-small-q5_1.bin";
+/// The smaller model a phone call's utterances are transcribed with, when the image has it
+/// (`CALL_STT=1`): a turn of a call cannot wait for the small one. Measured on this project's
+/// machine for a 3 s sentence, a process a run: small 3.8 s, base 1.1 s, with the same words
+/// in English and Korean (DESIGN §4.22).
+const CALL_MODEL: &str = "models/ggml-base-q5_1.bin";
 const VAD_MODEL: &str = "models/ggml-silero-v5.1.2.bin";
 
 /// What came of one voice note.
@@ -152,11 +157,11 @@ fn decode_args(secs: u64) -> Vec<String> {
 /// As measured with 1.9.5: no `-np`, which would also drop the detected-language line, and with
 /// `-nt` the text is all that goes to stdout either way (nothing at all when the VAD finds no
 /// speech).
-fn whisper_args(dir: &Path, lang: &str) -> Vec<String> {
+fn whisper_args(dir: &Path, model: &str, lang: &str) -> Vec<String> {
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
     let threads = (cores / 2).clamp(1, 8).to_string();
     let path = |p: &str| dir.join(p).to_string_lossy().into_owned();
-    let (model, vad) = (path(MODEL), path(VAD_MODEL));
+    let (model, vad) = (path(model), path(VAD_MODEL));
     // shortcut: CPU only; the GPU needs a shader cache folder for nobody
     // (__GL_SHADER_DISK_CACHE_PATH), then drop -ng
     [
@@ -437,8 +442,13 @@ async fn hear(cfg: &Config, audio: &[u8], secs: &mut u64) -> Result<Heard, Stop>
 
 /// One whisper run of `wav` as `lang`.
 async fn whisper(cfg: &Config, wav: &Mem, lang: &str) -> Result<Out, Stop> {
+    whisper_with(cfg, wav, MODEL, lang).await
+}
+
+/// One whisper run of `wav` as `lang`, with `model`.
+async fn whisper_with(cfg: &Config, wav: &Mem, model: &str, lang: &str) -> Result<Out, Stop> {
     let prog = cfg.voice_dir.join("bin/whisper-cli");
-    let args = whisper_args(&cfg.voice_dir, lang);
+    let args = whisper_args(&cfg.voice_dir, model, lang);
     let out = run(&prog, &args, &[(wav, 3)], Stdio::null(), cfg.voice_wait).await?;
     match out.ok {
         true => Ok(out),
@@ -622,7 +632,7 @@ pub async fn hear_call(cfg: &Config, pcm: &[i16], lang: &str) -> Heard {
     let _turn = Turn::take().await;
     let heard = async {
         let wav = mem(Mem::sealed(&call_wav(pcm)))?;
-        let out = whisper(cfg, &wav, lang).await?;
+        let out = whisper_with(cfg, &wav, call_model(cfg), lang).await?;
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
     match heard.await {
@@ -633,6 +643,14 @@ pub async fn hear_call(cfg: &Config, pcm: &[i16], lang: &str) -> Heard {
         },
         Err(Stop::Failed) => Heard::Failed,
         Err(Stop::TimedOut) => Heard::TimedOut,
+    }
+}
+
+/// The model a call's utterances are transcribed with: the smaller one when the image has it.
+pub fn call_model(cfg: &Config) -> &'static str {
+    match cfg.voice_dir.join(CALL_MODEL).exists() {
+        true => CALL_MODEL,
+        false => MODEL,
     }
 }
 
@@ -848,6 +866,32 @@ pub(crate) mod tests {
             .collect();
         let lang = argv.iter().position(|a| *a == "-l").unwrap();
         assert_eq!(argv[lang + 1], "en");
+        let model = argv.iter().position(|a| *a == "-m").unwrap();
+        assert!(
+            argv[model + 1].ends_with("models/ggml-small-q5_1.bin"),
+            "{argv:?}"
+        );
+        // With the smaller model in the image, a call's utterances go to it; a voice note's
+        // still go to the small one.
+        std::fs::create_dir_all(cfg.voice_dir.join("models")).unwrap();
+        std::fs::write(cfg.voice_dir.join(CALL_MODEL), "").unwrap();
+        assert_eq!(call_model(&cfg), CALL_MODEL);
+        hear_call(&cfg, &pcm, "en").await;
+        let last = log(&cfg, "whisper-cli").pop().unwrap();
+        assert!(
+            last["argv"]
+                .to_string()
+                .contains("models/ggml-base-q5_1.bin"),
+            "{last}"
+        );
+        transcribe(&cfg, b"a voice note").await;
+        let last = log(&cfg, "whisper-cli").pop().unwrap();
+        assert!(
+            last["argv"]
+                .to_string()
+                .contains("models/ggml-small-q5_1.bin"),
+            "{last}"
+        );
         // Each utterance takes the next line of what the other party says.
         mark(&cfg, "says", "first\nsecond\n");
         assert_eq!(hear_call(&cfg, &pcm, "en").await, said("en", "first"));

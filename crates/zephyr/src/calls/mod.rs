@@ -411,8 +411,11 @@ pub fn doctor(cfg: &Config) -> Vec<String> {
         "local" => check(
             crate::voice::call_voice(cfg, "en") && crate::voice::floored(cfg),
             match crate::voice::call_voice(cfg, "ko") {
-                true => "whisper and Piper speak here, in English and Korean",
-                false => "whisper and Piper speak here, in English (Korean needs KO_VOICE=1)",
+                true => "whisper and Piper speak here, in English and Korean, a few seconds a turn",
+                false => {
+                    "whisper and Piper speak here, in English (Korean needs KO_VOICE=1), a few \
+                     seconds a turn"
+                }
             },
             "calls.speech is local, and this image has no voice (built with VOICE=0) or no \
              network floor, so a call cannot speak",
