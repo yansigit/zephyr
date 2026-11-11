@@ -6029,6 +6029,67 @@ async fn a_draft_with_a_secret_is_not_approved_from_discord() {
     gw.shutdown().await;
 }
 
+/// DESIGN §4.22: a catalog entry is added from a strong channel only; added, it restarts the
+/// agent, and is left out until secrets.env sets its secret, which the reply names.
+#[tokio::test]
+async fn mcp_catalog_add_from_discord_is_refused_and_from_chat_adds_the_connector() {
+    let home = home("mcp-catalog");
+    let mut cfg = on_file_with_discord(&home, "");
+    cfg.catalog_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/connectors");
+    let path = home.join("zephyr.toml");
+    let before = std::fs::read_to_string(&path).unwrap();
+    let gw = start(cfg);
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_replies(1).await;
+    gw.say_on("discord", "d1", "downer", "/mcp catalog add github")
+        .await;
+    let refused = gw.wait_replies_on("discord", 1).await[0].clone();
+    assert_eq!(
+        refused,
+        "adding a catalog connector decides where its secret goes; from tui, chat or passkey"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    gw.say("m2", "owner", "/mcp catalog add github").await;
+    let added = gw.wait_replies(2).await[1].clone();
+    assert!(
+        added.starts_with(
+            "[zephyr] connector github added to zephyr.toml; it is left out until secrets.env \
+             sets GITHUB_TOKEN: run `zephyr mcp add github --secret GITHUB_TOKEN` on the host"
+        ),
+        "{added}"
+    );
+    let config = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        config.contains("/usr/local/bin/github-mcp-server"),
+        "{config}"
+    );
+    // One that needs no secret is published at once. (A secrets.env edit re-execs the daemon,
+    // so the left-out connector's publishing is `drafts.rs`'s test.)
+    gw.say("m3", "owner", "/mcp catalog add context7").await;
+    gw.wait_replies(3).await;
+    gw.say("m4", "owner", "/mcp").await;
+    let listed = gw.wait_replies(4).await[3].clone();
+    let context7 = listed.lines().find(|l| l.starts_with("- context7: "));
+    assert_eq!(
+        context7,
+        Some("- context7: https://mcp.context7.com/mcp"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains(
+            "- github: /usr/local/bin/github-mcp-server (left out: secrets.env lacks GITHUB_TOKEN)"
+        ),
+        "{listed}"
+    );
+    gw.say("m5", "owner", "again").await;
+    gw.wait_replies(5).await;
+    assert_eq!(log(&home, "start").len(), 3, "the agent restarted for each");
+    let agents = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    assert!(agents.contains("- **context7**: remote (HTTP)"), "{agents}");
+    assert!(!agents.contains("**github**"), "{agents}");
+    gw.shutdown().await;
+}
+
 /// Under the network floor a command gets a token's stand-in (DESIGN §4.21), never its value.
 fn brokered(home: &Path) -> Config {
     let mut cfg = config(home);

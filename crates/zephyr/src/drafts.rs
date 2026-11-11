@@ -489,11 +489,31 @@ pub fn command(
     };
     let usage = match kind {
         Kind::Skill => "usage: /skills | /skill ok|no|diff|rm|undo NAME",
-        Kind::Connector => "usage: /mcp | /mcp ok|no|diff|rm NAME",
+        Kind::Connector => {
+            "usage: /mcp | /mcp ok|no|diff|rm NAME | /mcp catalog [NAME | add NAME [URL] [plain]]"
+        }
     };
     let _guard = lock();
     let result = match (kind, &words[1..]) {
         (_, []) => list(cfg, kind).map(|r| (r, After::Nothing)),
+        // The image's ready-made connectors (DESIGN §4.22).
+        (Kind::Connector, ["catalog"]) => Ok((catalog_list(cfg), After::Nothing)),
+        (Kind::Connector, ["catalog", "add", name, rest @ ..]) => match (may_approve, strong) {
+            // Like `/mcp ok`, an approval; and always a strong channel's, since it decides
+            // where a secret goes (DESIGN §4.21).
+            (false, _) => Ok((crate::tools::NEEDS_PASSKEY.into(), After::Nothing)),
+            (_, false) => Ok((
+                format!(
+                    "adding a catalog connector decides where its secret goes; from {}",
+                    either(&cfg.settings.strong_channels)
+                ),
+                After::Nothing,
+            )),
+            (true, true) => catalog_add(cfg, name, rest),
+        },
+        (Kind::Connector, ["catalog", name]) => {
+            catalog_show(cfg, name).map(|r| (r, After::Nothing))
+        }
         (_, [verb, name]) if valid_name(name) => match (kind, *verb) {
             // Approving a draft, and bringing a skill back, are approvals.
             (_, "ok") | (Kind::Skill, "undo" | "add") if !may_approve => {
@@ -528,6 +548,106 @@ pub fn command(
         _ => Ok((usage.into(), After::Nothing)),
     };
     Some(result.unwrap_or_else(|e| (format!("[zephyr] {}: {e:#}", kind.word()), After::Nothing)))
+}
+
+/// `a, b or c`.
+fn either(names: &[String]) -> String {
+    match names.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
+/// `/mcp catalog`: each entry, and whether a connector of its name is there.
+fn catalog_list(cfg: &Config) -> String {
+    let entries = crate::catalog::list(&cfg.catalog_dir);
+    if entries.is_empty() {
+        return "no connector catalog in this image".into();
+    }
+    let mut lines: Vec<String> = (entries.iter())
+        .map(|e| {
+            let added = cfg.mcp.iter().any(|m| m.name == e.name);
+            format!(
+                "- {}: {}{}",
+                e.name,
+                e.about,
+                if added { " (added)" } else { "" }
+            )
+        })
+        .collect();
+    lines.push("/mcp catalog NAME shows one; /mcp catalog add NAME adds it".into());
+    lines.join("\n")
+}
+
+/// `/mcp catalog NAME`: the table it would write, its secrets and why each is held as it is.
+/// Never a secret's value: only whether secrets.env sets it.
+fn catalog_show(cfg: &Config, name: &str) -> anyhow::Result<String> {
+    let e = crate::catalog::read(&cfg.catalog_dir, name)?;
+    let table = toml::to_string(&serde_json::json!({ "mcp": [e.template()] }))?;
+    let mut out = format!("{name}: {}\n\n{}", e.about, table.trim_end());
+    let set = secrets(cfg);
+    for s in &e.secrets {
+        let state = match set.iter().any(|(k, _)| *k == s.name) {
+            true => "set in secrets.env".to_string(),
+            false => format!(
+                "not set: `zephyr mcp add {name} --secret {}` on the host",
+                s.name
+            ),
+        };
+        out += &format!("\n- {}: {} ({state})", s.name, s.help);
+    }
+    let hosts = match e.needs_url {
+        true => "the URL's host".to_string(),
+        false => e.template().hosts.clone(),
+    };
+    out += &match (&e.plain_reason, e.secrets.is_empty()) {
+        (_, true) => "\nno secret".to_string(),
+        (Some(why), _) => format!("\nheld in plain, so the agent can read it: {why}"),
+        (None, _) => {
+            format!("\nheld as a stand-in, swapped for the real secret only in requests to {hosts}")
+        }
+    };
+    out += &format!(
+        "\n/mcp catalog add {name}{} adds it",
+        if e.needs_url { " URL" } else { "" }
+    );
+    Ok(out)
+}
+
+/// `/mcp catalog add NAME [URL] [plain]`, from a strong channel: the entry written as `zephyr mcp
+/// add --catalog` writes it. It never takes a secret's value: the reply names what secrets.env
+/// lacks, and the host command that sets it.
+fn catalog_add(cfg: &Config, name: &str, rest: &[&str]) -> anyhow::Result<(String, After)> {
+    let entry = crate::catalog::read(&cfg.catalog_dir, name)?;
+    let (mut url, mut plain) = (None, false);
+    for w in rest {
+        match *w {
+            "plain" => plain = true,
+            w if url.is_none() && w.contains("://") => url = Some(w),
+            w => bail!("{w:?}: usage: /mcp catalog add NAME [URL] [plain]"),
+        }
+    }
+    let old = cfg.mcp.iter().find(|m| m.name == name);
+    let said = plain || old.is_some_and(crate::broker::plain);
+    if let Some(why) = entry.plain_needed(url).filter(|_| !said) {
+        bail!(
+            "{why}: /mcp catalog add {name}{} plain hands it the real key, which the agent can then read",
+            url.map(|u| format!(" {u}")).unwrap_or_default()
+        );
+    }
+    let m = crate::catalog::merged(entry.to_mcp(url)?, old, &[], plain);
+    write_config(cfg, |doc| crate::host::conf::upsert_mcp(doc, &m))?;
+    let mut reply = format!("[zephyr] connector {name} added to zephyr.toml");
+    let missing = missing(cfg, &m);
+    if !missing.is_empty() {
+        reply += &format!(
+            "; it is left out until secrets.env sets {}: run `zephyr mcp add {name} --secret {}` on the host",
+            missing.join(", "),
+            missing.join(" --secret ")
+        );
+    }
+    Ok((reply, After::Reload))
 }
 
 /// `/skills` or `/mcp`: what is approved, and the drafts waiting.
@@ -1127,7 +1247,9 @@ fn sections(
          [...], \"env\": {{...}}}}`. Write a secret only as `${{NAME}}`, never its value: the owner \
          sets it. A `command` connector that uses a secret gets a stand-in for it, which zephyr \
          swaps for the real one only in HTTPS requests to the hosts the owner lists: propose \
-         them with `gateway` `/set mcp.<name>.hosts api.example.com`. It is used only after the owner approves it with /mcp ok.\n\n"
+         them with `gateway` `/set mcp.<name>.hosts api.example.com`. It is used only after the owner approves it with /mcp ok. \
+         Ready-made connectors are described in `{}/`; to suggest one, ask the owner to run `/mcp catalog add NAME`.\n\n",
+        crate::catalog::DIR
     ));
     if !subagents.is_empty() {
         out.push_str(
@@ -1889,5 +2011,110 @@ mod tests {
             !published.contains("later") && !published.contains("real-local-key"),
             "{published}"
         );
+    }
+
+    /// The image's catalog, as the tests read it.
+    fn with_catalog(mut cfg: Config) -> Config {
+        cfg.catalog_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/connectors");
+        cfg
+    }
+
+    /// Review Focus 1 (DESIGN §4.22): a catalog `command` connector holds a stand-in for its
+    /// token, and nothing the owner or the agent reads holds the token itself.
+    #[test]
+    fn a_catalog_connectors_secret_reaches_the_agent_only_as_a_stand_in() {
+        let cfg = with_catalog(brokered(""));
+        std::fs::write(cfg.secrets_path(), "GITHUB_TOKEN=real-gh-token\n").unwrap();
+        let shown = say(&cfg, "/mcp catalog github").0;
+        let (added, after) = say(&cfg, "/mcp catalog add github");
+        assert_eq!(after, After::Reload, "{added}");
+        assert_eq!(added, "[zephyr] connector github added to zephyr.toml");
+        let mut cfg = with_catalog(Config::load(cfg.path.as_ref().unwrap()).unwrap());
+        cfg.floor = true;
+        let text = agents(&cfg);
+        let file = std::fs::read_to_string(mcp_path(&cfg)).unwrap();
+        let json: Value = serde_json::from_str(&file).unwrap();
+        let key = crate::broker::key(&cfg).unwrap();
+        let env = &json["mcpServers"]["github"]["env"];
+        assert_eq!(
+            env["GITHUB_PERSONAL_ACCESS_TOKEN"],
+            crate::broker::surrogate(&key, "env", "GITHUB_TOKEN")
+        );
+        let listed = say(&cfg, "/mcp").0;
+        let config = std::fs::read_to_string(cfg.path.as_ref().unwrap()).unwrap();
+        for seen in [&file, &text, &shown, &added, &listed, &config] {
+            assert!(!seen.contains("real-gh-token"), "{seen}");
+        }
+        assert!(shown.contains("GITHUB_TOKEN: a fine-grained"), "{shown}");
+        assert!(shown.contains("(set in secrets.env)"), "{shown}");
+        let held = "held as a stand-in, swapped for the real secret only in requests to \
+                    api.github.com, raw.githubusercontent.com";
+        assert!(shown.contains(held), "{shown}");
+        assert!(
+            listed.starts_with("- github: /usr/local/bin/github-mcp-server"),
+            "{listed}"
+        );
+        assert!(!listed.contains("left out"), "{listed}");
+        // What the proxy will swap: the token, on its two hosts only.
+        let map = crate::broker::Map::load(&cfg).unwrap();
+        assert_eq!(
+            map.hosts(),
+            ["api.github.com:443", "raw.githubusercontent.com:443"]
+        );
+        assert!(text.contains(
+            "Ready-made connectors are described in `/opt/zephyr/connectors/`; to suggest one, \
+             ask the owner to run `/mcp catalog add NAME`."
+        ));
+        let catalog = say(&cfg, "/mcp catalog").0;
+        let line = |name: &str| {
+            catalog
+                .lines()
+                .find(|l| l.starts_with(&format!("- {name}: ")))
+        };
+        assert!(line("github").unwrap().ends_with("(added)"), "{catalog}");
+        assert!(!line("context7").unwrap().ends_with("(added)"), "{catalog}");
+    }
+
+    /// DESIGN §4.22: only a strong channel adds a catalog entry, a web decision needs a passkey,
+    /// and an entry that can only hold its real key is written only when the owner says `plain`.
+    #[test]
+    fn catalog_add_needs_a_strong_channel_and_never_writes_plain_by_itself() {
+        let cfg = with_catalog(brokered(""));
+        let path = cfg.path.clone().unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let (weak, _) = command(&cfg, "/mcp catalog add github", true, false).unwrap();
+        assert_eq!(
+            weak,
+            "adding a catalog connector decides where its secret goes; from tui, chat or passkey"
+        );
+        let (web, _) = command(&cfg, "/mcp catalog add github", false, true).unwrap();
+        assert_eq!(web, crate::tools::NEEDS_PASSKEY);
+        let brave = say(&cfg, "/mcp catalog add brave-search").0;
+        assert!(
+            brave.contains("X-Subscription-Token") && brave.contains("plain"),
+            "{brave}"
+        );
+        let ha = say(&cfg, "/mcp catalog add home-assistant").0;
+        assert!(ha.contains("needs the server's URL"), "{ha}");
+        let lan = say(
+            &cfg,
+            "/mcp catalog add home-assistant http://ha.lan:8123/api/mcp",
+        )
+        .0;
+        assert!(lan.contains("only over HTTPS"), "{lan}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let (ok, after) = say(&cfg, "/mcp catalog add brave-search plain");
+        assert_eq!(after, After::Reload);
+        assert!(
+            ok.contains(
+                "left out until secrets.env sets BRAVE_API_KEY: run `zephyr mcp add brave-search \
+                 --secret BRAVE_API_KEY` on the host"
+            ),
+            "{ok}"
+        );
+        let config = std::fs::read_to_string(&path).unwrap();
+        assert!(config.contains("secrets = \"plain\""), "{config}");
+        let nope = say(&cfg, "/mcp catalog nope").0;
+        assert!(nope.contains("no catalog entry named nope"), "{nope}");
     }
 }

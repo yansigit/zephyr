@@ -541,7 +541,11 @@ hands the server the real key, readable by the agent. `context7` needs no key. T
 fetched at their pinned version on first use. Adding an entry again keeps the hosts you set
 (unless `--host` says otherwise), the class you gave any tool, and a `plain` you said before;
 `zephyr doctor` tells you when a newer entry ships than the one you added. The agent can read the
-catalog (`/opt/zephyr/connectors/`) and suggest an entry, but only you add one.
+catalog (`/opt/zephyr/connectors/`) and suggest an entry, but only you add one. In a chat or the
+TUI, `/mcp catalog` lists the entries, `/mcp catalog NAME` shows the table one writes and where
+its secret goes, and `/mcp catalog add NAME [URL] [plain]` adds it, from a strong channel only (it
+decides where a secret goes); it never takes the secret itself, and names the host command that
+sets it.
 
 ## Web app
 

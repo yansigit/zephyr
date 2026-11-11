@@ -120,6 +120,11 @@ impl Entry {
 }
 
 impl Entry {
+    /// The table as the file has it, `{url}` and `{host}` unfilled.
+    pub fn template(&self) -> &Mcp {
+        &self.server
+    }
+
     /// Why this entry, at `url`, can only hold its real key, which the owner must accept with
     /// `plain`: its own `plain_reason`, or an `http://` URL, where the proxy swaps nothing.
     pub fn plain_needed(&self, url: Option<&str>) -> Option<String> {

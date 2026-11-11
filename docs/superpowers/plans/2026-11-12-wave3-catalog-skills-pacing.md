@@ -199,3 +199,7 @@ In `decide`: after `held` and the gate's verdict and `taken`, before `unchanged`
 ## Deviations
 
 (Recorded here as they are made.)
+
+- **Task 1.** Spec §4.1.2 says none of the `github` preset names hits the verb rule; two do (`add_comment_to_pending_review`, `update_issue_comment`). They stay preset, so the entry carries the gh gate's list whole; `catalog::tests::presets_change_only_what_the_verb_rule_gets_wrong` pins which two. Task 4's pure part (`catalog::newer`, the doctor lines) landed with Task 1, where `same_as` is.
+- **Task 2.** Without a terminal (`h.interactive` false, as in tests) `zephyr mcp add --catalog` cannot ask for a secret, so it prints the secret's `help` and `set it in a terminal with: zephyr mcp add NAME --secret X`, and still writes the connector, left out until then. `--secret NAME` alongside asks for that one as before and is not asked twice.
+- **Task 3.** The router test cannot set the secret and `/reload`: a secrets.env change re-execs the daemon (`reload::diff`), which ends the test's gateway. It adds `github` (left out, the missing secret named) and `context7` (published, the child restarted for each); `drafts::tests::a_catalog_connectors_secret_reaches_the_agent_only_as_a_stand_in` covers a catalog connector published with its secret set.
