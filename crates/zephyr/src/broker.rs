@@ -111,7 +111,7 @@ impl std::fmt::Debug for Secret {
 
 /// Surrogate to secret, for every brokered token and connector secret. The values live here, in
 /// the daemon's memory, and nowhere the agent can read.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Map {
     by: HashMap<String, Secret>,
     /// The base64 text a surrogate turns into (`vault::base64_forms`), with the surrogate.
@@ -273,6 +273,71 @@ impl Map {
         all.sort();
         all.dedup();
         all
+    }
+}
+
+/// The map the proxy swaps from, rebuilt when `vault.toml`, secrets.env, `broker.key` or the
+/// connectors change: three `stat`s a look, and the files are read again only after an edit.
+#[derive(Default)]
+pub struct Maps {
+    last: std::sync::Mutex<Option<(Stamp, std::sync::Arc<Map>)>>,
+}
+
+/// What a map was built from: each file's time and size, and the connectors.
+type Stamp = (Vec<Option<(std::time::SystemTime, u64)>>, Vec<Mcp>);
+
+impl Maps {
+    /// The map as the files are now. When they cannot be read, the last one, marked
+    /// `unreadable`: it still says which hosts are decrypted, so none of them falls back to a
+    /// plain tunnel, and nothing is swapped from it.
+    pub fn current(&self, cfg: &Config) -> std::sync::Arc<Map> {
+        let files = [
+            crate::vault::path(cfg),
+            cfg.secrets_path(),
+            cfg.state_dir().join(KEY_FILE),
+        ];
+        let seen = |p: &std::path::PathBuf| {
+            let m = std::fs::metadata(p).ok()?;
+            Some((m.modified().ok()?, m.len()))
+        };
+        let stamp: Stamp = (files.iter().map(seen).collect(), cfg.mcp.clone());
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, map)) = last.as_ref().filter(|(old, _)| *old == stamp) {
+            return map.clone();
+        }
+        let map = match Map::load(cfg) {
+            Ok(map) => map,
+            Err(_) => Map {
+                unreadable: true,
+                ..last
+                    .as_ref()
+                    .map(|(_, m)| (**m).clone())
+                    .unwrap_or_default()
+            },
+        };
+        let map = std::sync::Arc::new(map);
+        *last = Some((stamp, map.clone()));
+        map
+    }
+}
+
+/// Which refused tokens the owner is told about: each token and host once an hour, and ten
+/// notices an hour in all, so a looping agent cannot fill a chat.
+#[derive(Default)]
+pub struct Notices {
+    hour: i64,
+    told: std::collections::HashSet<(String, String)>,
+}
+
+impl Notices {
+    const AN_HOUR: usize = 10;
+
+    pub fn due(&mut self, now: i64, token: &str, host: &str) -> bool {
+        if now / 3600 != self.hour {
+            self.hour = now / 3600;
+            self.told.clear();
+        }
+        self.told.len() < Self::AN_HOUR && self.told.insert((token.into(), host.into()))
     }
 }
 
