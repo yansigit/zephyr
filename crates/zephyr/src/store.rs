@@ -382,7 +382,7 @@ pub enum ActionKind {
     Wait,
     /// A virtual card (DESIGN §4.25): `/ok` issues it.
     Card,
-    /// A phone call the daemon places (DESIGN §4.22).
+    /// A phone call the daemon places (DESIGN §4.26).
     Call,
 }
 
@@ -1172,7 +1172,7 @@ impl Store {
             }
         }
         if version < 21 {
-            // Phone calls (DESIGN §4.22): a call has its held action's id; its transcript is
+            // Phone calls (DESIGN §4.26): a call has its held action's id; its transcript is
             // text only, never audio.
             db.execute_batch(
                 "CREATE TABLE calls(id INTEGER PRIMARY KEY, provider TEXT NOT NULL, provider_ref TEXT,
@@ -2746,7 +2746,7 @@ impl Store {
         Ok(kept + commits + cards + payments + calls)
     }
 
-    /// A call the owner approved is about to be dialled (DESIGN §4.22). Its id is its held
+    /// A call the owner approved is about to be dialled (DESIGN §4.26). Its id is its held
     /// action's.
     #[allow(clippy::too_many_arguments)]
     pub fn call_start(

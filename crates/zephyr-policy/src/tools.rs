@@ -607,7 +607,7 @@ fn card(params: &Value) -> Result<String, String> {
     card_action(params).map(|_| String::new())
 }
 
-/// `call`'s check (DESIGN §4.22): a number and a purpose, each a short text. Whether the number
+/// `call`'s check (DESIGN §4.26): a number and a purpose, each a short text. Whether the number
 /// may be called, and when, is the daemon's to say (`zephyr::calls::check`).
 pub fn call_action(params: &Value) -> Result<(), String> {
     for (key, max) in [("number", 40), ("purpose", 1000)] {
@@ -1082,7 +1082,7 @@ fn session_files(dir: &Path, all: bool) -> Vec<(String, PathBuf)> {
             let id = stem.rsplit_once('_').map_or(stem, |(_, id)| id).to_string();
             let background = id.starts_with("job-") || id.starts_with("task-");
             // A phone call's session is never read, `all` or not: its `user` messages are the
-            // other party's words (DESIGN §4.22), which main gets only as the quoted report.
+            // other party's words (DESIGN §4.26), which main gets only as the quoted report.
             (!call_session(&id) && (all || !background)).then_some((id, path))
         })
         .collect()
@@ -2092,7 +2092,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A phone call's session (DESIGN §4.22) is never the owner's conversation: its `user`
+    /// A phone call's session (DESIGN §4.26) is never the owner's conversation: its `user`
     /// messages are what the other party said. `recall` never searches or reads one.
     #[test]
     fn recall_never_reads_a_phone_calls_session() {

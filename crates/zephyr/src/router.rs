@@ -355,7 +355,7 @@ pub async fn run<C: Channel>(
         r = crate::attach::serve(cfg, handles.clone()) => r.map(|()| Exit::Shutdown),
         r = crate::web::serve(cfg, handles, hub) => r.map(|()| Exit::Shutdown),
         r = crate::scheduler::run(cfg_rx.clone(), &jobs) => r.map(|()| Exit::Shutdown),
-        // Telnyx's listener and the calls in progress (DESIGN §4.22).
+        // Telnyx's listener and the calls in progress (DESIGN §4.26).
         r = crate::calls::live::run(cfg_rx.clone(), &jobs, calls, call_starts) => r.map(|()| Exit::Shutdown),
         r = crate::tasks::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),
         r = show_activity(channels, activity_rx, cfg.tick) => r.map(|()| Exit::Shutdown),
@@ -550,7 +550,7 @@ struct Router<'a> {
     procs: crate::procs::Procs,
     /// Browser actions waiting in place for the owner's answer (approvals spec §4.4).
     waits: crate::actions::Waits,
-    /// The phone calls in progress (DESIGN §4.22), and the starts `calls::live::run` takes.
+    /// The phone calls in progress (DESIGN §4.26), and the starts `calls::live::run` takes.
     calls: crate::calls::live::Calls,
     call_starts: Option<mpsc::UnboundedReceiver<crate::calls::live::Start>>,
     /// Who holds the desktop: the owner's takeover, or the vault's fill (DESIGN §4.11).
@@ -858,7 +858,7 @@ impl<'a> Router<'a> {
             self.flush(channels).await;
             self.publish();
             // Tasks are not waited for: they resume after the re-exec (DESIGN §4.12).
-            // Nor under a phone call: its line would go dead mid-sentence (DESIGN §4.22).
+            // Nor under a phone call: its line would go dead mid-sentence (DESIGN §4.26).
             let background =
                 self.jobs.running.load(Ordering::SeqCst) || !self.calls.live().is_empty();
             if self.reexec && !self.busy && self.btw.is_none() && !background {
@@ -1055,7 +1055,7 @@ impl<'a> Router<'a> {
         }
     }
 
-    /// Main's `call` call `id` (DESIGN §4.22): the gate refuses it or holds it for the owner,
+    /// Main's `call` call `id` (DESIGN §4.26): the gate refuses it or holds it for the owner,
     /// and sends the card. What the agent is told either way.
     fn phone(&self, id: &str, args: &Value) -> String {
         use crate::gate::Verdict;
@@ -2848,7 +2848,7 @@ impl<'a> Router<'a> {
             ("/unpair", arg) => self.unpair(arg).await,
             // Held messages, posts and payments (approvals spec §4.6).
             ("/held", "") => crate::actions::held(&self.cfg, &self.store),
-            // Ends a phone call (DESIGN §4.22). It only tightens, so any owner channel may.
+            // Ends a phone call (DESIGN §4.26). It only tightens, so any owner channel may.
             ("/hangup", n) => self.calls.hangup(n),
             // The daemon's own record (DESIGN §4.19), answered outside the queue.
             ("/activity", arg) => crate::activity::chat(&self.cfg, &self.store, arg, crate::now()),

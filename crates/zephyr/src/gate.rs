@@ -273,7 +273,7 @@ fn decide_paid(
             return (Verdict::Deny(why), None);
         }
     }
-    // A phone call that may not be placed is refused before anything is held (DESIGN §4.22):
+    // A phone call that may not be placed is refused before anything is held (DESIGN §4.26):
     // the number, the hours where it rings, the language, the owner's contact details.
     if req.tool == "call" {
         if let Err(why) = crate::calls::check(cfg, &req.args, cfg.calls_clock()) {
@@ -746,7 +746,7 @@ impl Call {
         })
     }
 
-    /// A phone call (DESIGN §4.22): a message to one number, in the daemon's words. The facts
+    /// A phone call (DESIGN §4.26): a message to one number, in the daemon's words. The facts
     /// are looked for in what the agent wrote, the purpose and the business. `None` for a call
     /// that may not be placed, which `decide` has refused already.
     fn phone(cfg: &Config, req: &Request) -> Option<Call> {
@@ -2421,7 +2421,7 @@ fn window_usage(cfg: &Config, store: &Store, a: &Action) -> Option<String> {
     ))
 }
 
-/// A phone call's lines (DESIGN §4.22). The number, the province and the opening line are the
+/// A phone call's lines (DESIGN §4.26). The number, the province and the opening line are the
 /// daemon's, read again from the stored arguments; what the agent wrote is labelled as its
 /// own, quoted, scrubbed and cut.
 fn call_lines(cfg: &Config, a: &Action, scrub: &Scrub) -> Vec<String> {

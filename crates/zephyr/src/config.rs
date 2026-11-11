@@ -127,7 +127,7 @@ pub struct Config {
     pub link_api: String,
     #[serde(skip, default = "link_auth")]
     pub link_auth: String,
-    /// `[calls]`: phone calls (DESIGN §4.22). Off without a `provider`. `Config::calls` reads it.
+    /// `[calls]`: phone calls (DESIGN §4.26). Off without a `provider`. `Config::calls` reads it.
     pub calls: Option<Calls>,
     /// Lets the calls listener run outside the network floor. Not configurable, and off; the
     /// tests' process is not a container, and sets it.
@@ -441,7 +441,7 @@ pub struct Browser {
 /// `browser.pace_ms` when the owner set none.
 pub const PACE_MS: u64 = 1500;
 
-/// `[calls]` (DESIGN §4.22).
+/// `[calls]` (DESIGN §4.26).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Calls {

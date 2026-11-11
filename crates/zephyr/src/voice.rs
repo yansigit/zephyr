@@ -59,7 +59,7 @@ const MODEL: &str = "models/ggml-small-q5_1.bin";
 /// The smaller model a phone call's utterances are transcribed with, when the image has it
 /// (`CALL_STT=1`): a turn of a call cannot wait for the small one. Measured on this project's
 /// machine for a 3 s sentence, a process a run: small 3.8 s, base 1.1 s, with the same words
-/// in English and Korean (DESIGN §4.22).
+/// in English and Korean (DESIGN §4.26).
 const CALL_MODEL: &str = "models/ggml-base-q5_1.bin";
 const VAD_MODEL: &str = "models/ggml-silero-v5.1.2.bin";
 
@@ -593,7 +593,7 @@ pub async fn speak(cfg: &Config, text: &str, channel: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// One utterance of a phone call (DESIGN §4.22) as whisper reads it: 8 kHz samples doubled to
+/// One utterance of a phone call (DESIGN §4.26) as whisper reads it: 8 kHz samples doubled to
 /// the 16 kHz mono WAV it takes, each new sample halfway between its neighbours.
 fn call_wav(pcm: &[i16]) -> Vec<u8> {
     let bytes = (pcm.len() * 4) as u32;

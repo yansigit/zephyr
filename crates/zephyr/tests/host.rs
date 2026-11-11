@@ -3615,7 +3615,7 @@ fn vault_add_list_and_rm_reach_roots_file_and_never_put_a_value_in_argv() {
         assert!(!output.contains(value), "{value} printed");
     }
 
-    // A provider's key for the daemon's own use (DESIGN §4.22): from the prompt, never argv.
+    // A provider's key for the daemon's own use (DESIGN §4.26): from the prompt, never argv.
     const API_KEY: &str = "KEY0123456789telnyx";
     let service = [
         "vault",

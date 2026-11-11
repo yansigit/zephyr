@@ -58,7 +58,7 @@ ARG FFMPEG_SHA256=40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7ab
 ARG WHISPER_MODELS_REV=5359861c739e955e79d9a303bcbc70fb988958b1
 ARG WHISPER_SMALL_SHA256=ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb
 # The smaller whisper model a phone call's utterances are transcribed with when calls.speech is
-# local (DESIGN §4.22): 57 MB, about a third of the small model's time. CALL_STT=0 leaves it out,
+# local (DESIGN §4.26): 57 MB, about a third of the small model's time. CALL_STT=0 leaves it out,
 # and such calls use the small model.
 ARG CALL_STT=1
 ARG WHISPER_BASE_SHA256=422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898

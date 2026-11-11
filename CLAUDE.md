@@ -234,7 +234,7 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   nowhere, and runs as the agent), and `watchdog` gives the desktop back after 10 min idle, 60 min
   or 60 s after the socket closed (hidden `Config::desktop_*`). `Router::desktop_changed` steers
   the take and hand-back notes into main, which do not taint.
-- `calls/` (DESIGN §4.22): phone calls. `mod.rs` is pure: `check` (Canadian local numbers only,
+- `calls/` (DESIGN §4.26): phone calls. `mod.rs` is pure: `check` (Canadian local numbers only,
   toll-free only with `calls.toll_free`, the CRTC's hours in the recipient's zones, `en`/`fr`/`ko`,
   no emergency or healthcare call (`fold` first), the owner's contact details), the daemon's `opening`/`closing` lines, `said` (a reply's
   sentences, `[press 1]`, `[hang up]`) and the energy `Endpointer`. `telnyx.rs` is the one

@@ -27,7 +27,7 @@ pub fn sweep(cfg: &Config, store: &Store, age: Duration) -> rusqlite::Result<usi
         Ok(n) => eprintln!("zephyr: pruned {n} state.db rows older than 90 days"),
         Err(e) => eprintln!("zephyr: pruning state.db failed: {e}"),
     }
-    // A call's transcript goes sooner, when the owner says (`calls.keep_days`, DESIGN §4.22).
+    // A call's transcript goes sooner, when the owner says (`calls.keep_days`, DESIGN §4.26).
     let kept = cfg.calls().keep_days as i64 * 86_400;
     match store.prune_call_lines(crate::now() - kept) {
         Ok(0) => {}
@@ -253,7 +253,7 @@ fn session_of(name: &str) -> Option<&str> {
 }
 
 /// Removes session `id`'s file and its companions now, as the agent: a phone call's session
-/// (DESIGN §4.22), which is deleted when the call ends.
+/// (DESIGN §4.26), which is deleted when the call ends.
 pub fn remove_session(cfg: &Config, id: &str) -> usize {
     let _fs = crate::agent::fs();
     let dir = cfg.session_dir();

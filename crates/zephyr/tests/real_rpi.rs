@@ -731,7 +731,7 @@ async fn real_rpi_undo_retry_and_compact() {
     task.await.unwrap().unwrap();
 }
 
-/// A phone call's own agent on the real rpi (DESIGN §4.22): `--no-tools` and the appended call
+/// A phone call's own agent on the real rpi (DESIGN §4.26): `--no-tools` and the appended call
 /// prompt are taken, the policy plugin loads and registers no tool for a `call-` session, and
 /// the model is sent no tool at all.
 #[tokio::test]

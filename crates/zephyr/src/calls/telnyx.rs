@@ -1,4 +1,4 @@
-//! Telnyx, the one telephony provider built (DESIGN §4.22): Call Control over the daemon's own
+//! Telnyx, the one telephony provider built (DESIGN §4.26): Call Control over the daemon's own
 //! HTTPS client, and the check that a media connection or a webhook is Telnyx's.
 //!
 //! Written against Telnyx's published documentation, read on 2026-11-11:

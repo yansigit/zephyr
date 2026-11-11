@@ -85,7 +85,7 @@ pub struct Ctx<'a> {
     pub waits: &'a Waits,
     /// The task and job runs in progress, which a pass's note is steered into.
     pub steers: &'a Steers,
-    /// The phone calls in progress (DESIGN §4.22).
+    /// The phone calls in progress (DESIGN §4.26).
     pub calls: &'a crate::calls::live::Calls,
 }
 
@@ -125,7 +125,7 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
         // The payment window, whatever `strong_only` says (DESIGN §4.25).
         crate::gate::window_check(ctx.cfg, store, &a, is_strong, now)?;
     }
-    // A phone call is checked again as things are now (DESIGN §4.22): approved out of the
+    // A phone call is checked again as things are now (DESIGN §4.26): approved out of the
     // calling hours where it rings, it stays waiting for an `/ok` inside them.
     if a.kind == ActionKind::Call {
         let args: Value = serde_json::from_str(&a.payload).unwrap_or_default();
@@ -746,7 +746,7 @@ mod tests {
         assert!(cancel(&cfg, &store, &waits, "x").is_err());
     }
 
-    /// DESIGN §4.22: a call approved outside the calling hours where it rings stays waiting.
+    /// DESIGN §4.26: a call approved outside the calling hours where it rings stays waiting.
     #[test]
     fn an_ok_out_of_hours_leaves_the_call_pending() {
         use crate::calls::tests::{noon, toronto};

@@ -1,4 +1,4 @@
-//! Phone calls (DESIGN §4.22): the agent asks to call a Canadian number for a purpose, the owner
+//! Phone calls (DESIGN §4.26): the agent asks to call a Canadian number for a purpose, the owner
 //! approves each call on a card, and the daemon places it. This file is the rules, all pure:
 //! which numbers may be called and when, what the daemon itself says on the line, and how a
 //! reply of the call child is read. `telnyx` is the provider; `live` runs a call.

@@ -1,4 +1,4 @@
-//! Phone calls through the router (DESIGN §4.22): the scripted fake child (tests/fake-rpi.py)
+//! Phone calls through the router (DESIGN §4.26): the scripted fake child (tests/fake-rpi.py)
 //! asks for a call and speaks on it, tests/fake-telnyx.py plays Telnyx and the other party, and
 //! the voice stand-ins (tests/fixtures/voice) pass text through, so what reaches the line can
 //! be read back from what the fake Telnyx heard.

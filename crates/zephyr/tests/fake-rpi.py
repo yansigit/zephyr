@@ -53,7 +53,7 @@ run settles "aborted" with no reply. A `task` call waits for its answer the same
 `task: <answer>`); one the plugin would refuse (an action other than start with a goal, list, or
 stop with an id) gets "tool error: bad task call" at once. `exec` and `process` calls wait the same
 way (up to 30 s for `exec`, whose answer comes when its command ends or yields), and so do `card`, `vault`
-and `call` calls (a phone call, DESIGN §4.22; its own child `--session-id call-<id>` answers each
+and `call` calls (a phone call, DESIGN §4.26; its own child `--session-id call-<id>` answers each
 prompt with the next line of a `call_script` file in the home, when there is one, keeping the last); an `exec` with an empty command gets "tool error: `command` is empty" at once.
 `queue_message` with `deliverAs: "steer"` is held (answering `queue: "steer"`) and delivered, as rpi
 does, after the running tool's result: `turn_start`, the user message's `message_start`/

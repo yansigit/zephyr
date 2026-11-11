@@ -75,7 +75,7 @@ const LISTENERS: &[Listener] = &[
     }),
     // The web app (DESIGN §4.3.3): `tailscale serve` on the host forwards to this one.
     ("web.port", |c| c.web.as_ref().map(|w| w.port)),
-    // Telnyx's media connection and webhooks (DESIGN §4.22): the one listener the owner fronts
+    // Telnyx's media connection and webhooks (DESIGN §4.26): the one listener the owner fronts
     // with `tailscale funnel`, since Telnyx connects from the internet. It answers two paths,
     // each only when Telnyx signed the request (`calls::live`).
     ("calls.port", |c| c.calls().port),

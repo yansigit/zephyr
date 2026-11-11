@@ -1,4 +1,4 @@
-//! A phone call in progress (DESIGN §4.22): the listener Telnyx reaches, the registry of live
+//! A phone call in progress (DESIGN §4.26): the listener Telnyx reaches, the registry of live
 //! calls, and one task per call that joins Telnyx's media socket, whisper, an rpi child with
 //! no tools (`call-<id>`) and Piper.
 //!

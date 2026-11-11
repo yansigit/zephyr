@@ -833,7 +833,7 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     for line in zephyr::cards::doctor(cfg) {
         println!("{line}");
     }
-    // Warnings, not failures: what a phone call still needs (DESIGN §4.22).
+    // Warnings, not failures: what a phone call still needs (DESIGN §4.26).
     for line in zephyr::calls::doctor(cfg) {
         println!("{line}");
     }
