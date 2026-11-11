@@ -144,6 +144,10 @@ pub fn command(cfg: &Config, store: &Store, text: &str, channel: &str) -> Option
         |e: rusqlite::Error| format!("[zephyr] reading the web app's passkeys failed: {e}");
     let words: Vec<&str> = arg.split_whitespace().collect();
     let done = match words[..] {
+        // Nothing listens without the floor: say so rather than hand out a link to nowhere.
+        [] | ["enrol", ..] if !super::floored(cfg) => {
+            Ok((format!("[zephyr] {}", super::NEEDS_FLOOR), false))
+        }
         [] => listing(web, store).map(|line| (line, false)),
         ["enrol"] => enrol(cfg, web, store, None, channel).map(|line| (line, false)),
         ["enrol", name] if named(name) => {

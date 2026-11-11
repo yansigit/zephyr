@@ -76,6 +76,10 @@ fn set(h: &Host, key: &str, value: &str) -> anyhow::Result<()> {
 }
 
 fn setup(h: &Host, yes: bool) -> anyhow::Result<()> {
+    // Under host networking the agent could reach the port; the daemon would not start the app.
+    if !h.bridge()? {
+        bail!("{}", crate::web::NEEDS_FLOOR);
+    }
     // 1, 2: the name, and HTTPS on it. Nothing is changed before both are known.
     let name = tailnet_name()?;
     println!("this machine is {name} on your tailnet, with HTTPS certificates on");
@@ -193,6 +197,9 @@ pub(super) fn status(h: &Host) {
     let Some(host) = conf::get(&doc, "web.host") else {
         return;
     };
+    if !h.bridge().unwrap_or(true) {
+        return println!("web: {}", crate::web::NEEDS_FLOOR);
+    }
     let port = conf::get(&doc, "web.port").unwrap_or_else(|| PORT.into());
     let serve = Command::new("tailscale").args(["serve", "status"]).output();
     let serve = serve

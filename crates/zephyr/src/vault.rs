@@ -572,14 +572,17 @@ pub fn totp(seed_text: &str, unix: u64) -> anyhow::Result<String> {
 
 /// The owner's `/vault …`, on any channel (DESIGN §4.15). An approved proposal arrives here as
 /// the owner's own `/vault grant …`. Values are never taken in a chat message.
-pub fn command(path: &Path, arg: &str) -> String {
+pub fn command(path: &Path, arg: &str, may_approve: bool) -> Result<String, String> {
     let words: Vec<&str> = arg.split_whitespace().collect();
     let edit = |f: &dyn Fn(&mut Vault) -> anyhow::Result<String>| match edit(path, f) {
-        Ok(text) => format!("[zephyr] {text}"),
-        Err(e) => format!("[zephyr] {e:#}"),
+        Ok(text) => Ok(format!("[zephyr] {text}")),
+        Err(e) => Err(format!("[zephyr] {e:#}")),
     };
     match words[..] {
-        [] | ["list"] => Vault::load(path).map_or_else(|e| format!("[zephyr] {e:#}"), |v| v.list()),
+        [] | ["list"] => {
+            (Vault::load(path).map(|v| v.list())).map_err(|e| format!("[zephyr] {e:#}"))
+        }
+        ["grant", ..] if !may_approve => Err(crate::tools::NEEDS_PASSKEY.into()),
         ["rm", name] => edit(&|v| match v.remove(name) {
             true => Ok(format!("removed {name} from the vault")),
             false => bail!("no entry named {name} in the vault"),
@@ -590,13 +593,17 @@ pub fn command(path: &Path, arg: &str) -> String {
         ["grant", "token", name, ref programs @ ..] if !programs.is_empty() => {
             edit(&|v| v.grant(Kind::Token, name, programs))
         }
-        ["add" | "edit", ..] => "[zephyr] values never go through a chat: in zephyr attach, \
+        ["add" | "edit", ..] => Err(
+            "[zephyr] values never go through a chat: in zephyr attach, \
             /vault opens a form; on the host, run `zephyr vault add login NAME --site URL` or \
             `zephyr vault add token NAME`"
-            .into(),
-        _ => "[zephyr] usage: /vault, /vault rm NAME, /vault revoke NAME [PROGRAM], \
+                .into(),
+        ),
+        _ => Err(
+            "[zephyr] usage: /vault, /vault rm NAME, /vault revoke NAME [PROGRAM], \
               /vault grant login NAME, /vault grant token NAME PROGRAM.."
-            .into(),
+                .into(),
+        ),
     }
 }
 
@@ -1161,12 +1168,22 @@ programs = ["gh"]
         let dir = crate::test_dir("vault-cmd");
         let path = dir.join(FILE);
         std::fs::write(&path, SAMPLE).unwrap();
-        assert!(command(&path, "").contains("token GH_TOKEN"));
-        assert!(command(&path, "grant token GH_TOKEN jq").contains("gh, jq"));
-        assert!(command(&path, "revoke GH_TOKEN").contains("no longer"));
-        assert!(command(&path, "rm github").contains("removed"));
-        assert!(command(&path, "rm github").contains("no entry"));
-        assert!(command(&path, "add token X hunter2").contains("never go through a chat"));
+        let said = |arg: &str| command(&path, arg, true).unwrap_or_else(|refused| refused);
+        assert!(said("").contains("token GH_TOKEN"));
+        // Typed in the web app, a grant is refused and nothing is granted; the rest is not.
+        let web = command(&path, "grant token GH_TOKEN curl", false).unwrap_err();
+        assert_eq!(web, crate::tools::NEEDS_PASSKEY);
+        assert!(command(&path, "grant login github", false).is_err());
+        assert!(command(&path, "", false).is_ok_and(|list| !list.contains("curl")));
+        assert!(
+            command(&path, "rm nosuch", true).is_err(),
+            "a failure is an Err"
+        );
+        assert!(said("grant token GH_TOKEN jq").contains("gh, jq"));
+        assert!(said("revoke GH_TOKEN").contains("no longer"));
+        assert!(said("rm github").contains("removed"));
+        assert!(said("rm github").contains("no entry"));
+        assert!(said("add token X hunter2").contains("never go through a chat"));
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             !text.contains("github") && text.contains("programs = []"),

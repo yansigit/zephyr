@@ -160,7 +160,9 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   card's hash (`zephyr.web_challenge`), and the router compares both again on its loop before
   `/ok`. `push::spawn` posts new cards (`Router::push_cards`) and, while no web socket is open,
   replies, to the allowlisted push services only; `/api/push/decide` (a notification button)
-  approves only what `web` may.
+  approves only what `web` may. The app starts only under the network floor (`web::floored`).
+  A command that approves, grants, adds or undoes takes `may_approve` (false on channel `web`)
+  and refuses its own verbs with `tools::NEEDS_PASSKEY`: give a new such verb the same check.
   Two channels: `web` is the session cookie alone and weak; `passkey` is a signed decision and in
   the default `strong_channels`.
 - `inbox.rs`: files the owner sends on Discord or iMessage (DESIGN §4.3). The adapter saves them as

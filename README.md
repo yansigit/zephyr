@@ -437,7 +437,9 @@ A phone-first app the daemon serves itself, reached over your tailnet through `t
 - **Private facts** and the **Vault**, names only. Secrets are never typed in the app.
 - **Devices**: notifications, sign out, remove a passkey.
 
-**Setting it up.** You need [Tailscale](https://tailscale.com/download) on this machine, with
+**Setting it up.** The web app needs the network floor (the default; `network = "host"` in
+`host.toml` turns the app off, and `zephyr status` says so). You need
+[Tailscale](https://tailscale.com/download) on this machine, with
 HTTPS certificates turned on for your tailnet (admin console, DNS, HTTPS Certificates). Then:
 
 ```sh

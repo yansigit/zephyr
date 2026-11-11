@@ -287,6 +287,26 @@ impl App {
     }
 }
 
+/// Why the web app does not start under host networking (`floored`).
+pub const NEEDS_FLOOR: &str = "the web app needs the network floor; host.toml network = \"bridge\"";
+
+/// Whether the web app may run: only under the network floor (DESIGN §4.20), where the agent's
+/// uid cannot reach its port. Under host networking the agent could, and the sign-in limits,
+/// which cannot tell one client at the port from another, would be its to use against the owner.
+pub fn floored(cfg: &Config) -> bool {
+    crate::egress::bridge() || cfg.web_off_floor
+}
+
+/// Where the web app listens: the container's own address, which `zephyr up` publishes on the
+/// host's loopback for `tailscale serve`. `Err` says why it cannot listen; `None` without `[web]`.
+pub fn address(cfg: &Config) -> Result<std::net::SocketAddr, String> {
+    let port = cfg.web.as_ref().map_or(0, |web| web.port);
+    if !floored(cfg) {
+        return Err(NEEDS_FLOOR.into());
+    }
+    crate::egress::listen_addr(([127, 0, 0, 1], port).into()).map_err(|e| format!("{e:#}"))
+}
+
 /// Serves the web app until dropped. Pending forever without `[web]`, and when the port cannot
 /// be bound: the daemon runs on without the app, and `doctor` says so.
 pub async fn serve(cfg: &Config, handles: Handles, hub: Arc<Hub>) -> anyhow::Result<()> {
@@ -296,9 +316,14 @@ pub async fn serve(cfg: &Config, handles: Handles, hub: Arc<Hub>) -> anyhow::Res
     if let Err(e) = push::vapid(cfg, true) {
         eprintln!("zephyr: web push is off: {e:#}");
     }
-    // Under the network floor the container's own address, which the agent's uid cannot reach
-    // and `zephyr up` publishes on the host's loopback; else the host's loopback itself.
-    let addr = crate::egress::listen_addr(([127, 0, 0, 1], web.port).into())?;
+    // An address that cannot be had is the web app's trouble, not the daemon's: it runs on.
+    let addr = match address(cfg) {
+        Ok(addr) => addr,
+        Err(why) => {
+            eprintln!("zephyr: web app not started: {why}");
+            return std::future::pending().await;
+        }
+    };
     let listener = match TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(e) => {

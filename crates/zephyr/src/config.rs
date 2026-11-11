@@ -74,6 +74,10 @@ pub struct Config {
     /// configurable, and empty; tests point it at a fake push service.
     #[serde(skip)]
     pub push_hosts: Vec<String>,
+    /// Lets the web app start outside the network floor. Not configurable, and off; the tests'
+    /// process is not a container, and sets it.
+    #[serde(skip)]
+    pub web_off_floor: bool,
     /// How long five failed passkey attempts close the web app's sign-in. Not configurable;
     /// tests shorten it.
     #[serde(skip, default = "web_lockout")]
@@ -437,6 +441,7 @@ impl Config {
         self.agent_browser = running.agent_browser.clone();
         self.floor = running.floor;
         self.push_hosts = running.push_hosts.clone();
+        self.web_off_floor = running.web_off_floor;
         self.web_lockout = running.web_lockout;
         self.web_ping = running.web_ping;
     }

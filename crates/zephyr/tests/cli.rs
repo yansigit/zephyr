@@ -136,18 +136,19 @@ fn web_asks_the_daemon_for_a_code_and_says_when_it_cannot() {
         "{out:?}"
     );
     drop(running);
-    // Port 1 cannot be bound: the daemon runs on without the listener, and still makes codes.
+    // This daemon is not under the network floor, so the web app does not start, and it says so
+    // rather than hand out a link (the app itself is tested in tests/web.rs).
     let (home, cfg) = owned("web-on", "[web]\nhost = \"box.ts.net\"\nport = 1\n");
     let _running = daemon(&cfg, &home);
-    let out = zephyr(&cfg, &["web", "enrol", "phone"]);
-    assert_eq!(out.status.code(), Some(0), "{out:?}");
-    assert!(
-        stdout(&out).starts_with("[zephyr] open https://box.ts.net/#enrol="),
-        "{out:?}"
-    );
-    let out = zephyr(&cfg, &["web"]);
-    assert_eq!(out.status.code(), Some(0), "{out:?}");
-    assert!(stdout(&out).contains("passkeys: none"), "{out:?}");
+    for args in [&["web", "enrol", "phone"][..], &["web"][..]] {
+        let out = zephyr(&cfg, args);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let floor = "[zephyr] the web app needs the network floor; host.toml network = \"bridge\"";
+        assert_eq!(stdout(&out), floor, "{out:?}");
+    }
+    let out = zephyr(&cfg, &["status"]);
+    let line = "web: the web app needs the network floor; host.toml network = \"bridge\"";
+    assert!(stdout(&out).lines().any(|l| l == line), "{out:?}");
 }
 
 #[test]

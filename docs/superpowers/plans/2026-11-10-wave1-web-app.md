@@ -777,6 +777,15 @@ Fixed on this branch, each with a test that failed first (the spec's closing "De
 - Deviation (W-8): `/api/push/decide` answers 409 with the router's refusal; `push_cards` and `card()` build only what they need (no behaviour change, so no new test); `pushed_replies` is pruned to the rows still pending; without `[web]`, `web` rows are marked `failed`.
 - Deviation (W-6): `login/start` is not counted in the 20 a minute and is refused when 16 wait.
 
+## After the review of PR #43
+
+- Deviation (W-7): the signed text is built without the countdown (`gate::signed_card`), and a command's or a setting's is its stored command; `gate::signed`, which cut ` · expires in …` out of any card, is gone.
+- Deviation (W-5): `router::approves` is gone. `tools::decide`, `vault::command`, `memory::command`, `drafts::command` and `scheduler::command` take `may_approve` and refuse their own approving verbs on `web`.
+- Deviation (W-7): a passkey-decided command that was refused or failed answers `ok: false` for every command kind (`Router::not_applied`; `vault::command` and `facts::command` return `Result`).
+- Deviation (W-4, W-13, spec §4.2): the web app starts only under the network floor; hidden `Config::web_off_floor` lets the tests' process run it. `tests/cli.rs` now expects the refusal from a daemon outside the floor.
+- Deviation (W-12): the app reads `zephyr.goals` again before `/goal done|rm N` (no Rust test: the check is the page's).
+- Deviation (W-13): an address `egress::listen_addr` cannot give leaves the app pending and fails one line of `status` and `doctor` (not reachable from a test process).
+
 ## Built against sibling lanes (run after the rebase onto A4, A2 and B)
 
 ### Task W-11: Activity tab (A4's `zephyr.activity`)

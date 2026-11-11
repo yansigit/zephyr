@@ -303,7 +303,7 @@ async fn skill(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
     let reply = match ask(cfg, &text).await? {
         Some(reply) => reply,
         // No daemon: the next child start reads `<state>/skills` anyway.
-        None => zephyr::drafts::command(cfg, &text).map_or_else(String::new, |(r, _)| r),
+        None => zephyr::drafts::command(cfg, &text, true).map_or_else(String::new, |(r, _)| r),
     };
     println!("{reply}");
     Ok(())
@@ -373,17 +373,14 @@ async fn status(cfg: &Config) -> anyhow::Result<()> {
         println!("{line}");
     }
     if let Some(web) = &cfg.web {
-        // Where the daemon binds it: this container's own address under the network floor.
-        let at = zephyr::egress::listen_addr(([127, 0, 0, 1], web.port).into())?;
-        let up = tokio::net::TcpStream::connect(at).await;
-        println!(
-            "web: {}",
-            if up.is_ok() {
-                "listening"
-            } else {
-                "not listening"
-            }
-        );
+        // Where the daemon binds it; a line of its own, whatever is wrong with it.
+        let _ = web;
+        let state = match zephyr::web::address(cfg) {
+            Ok(at) if tokio::net::TcpStream::connect(at).await.is_ok() => "listening".into(),
+            Ok(_) => "not listening".into(),
+            Err(why) => why,
+        };
+        println!("web: {state}");
     }
     // The router's view, written with the heartbeat: `<unix> <main up> <failed starts>`.
     let file = std::fs::read_to_string(cfg.state_dir().join(HEARTBEAT)).unwrap_or_default();
@@ -535,10 +532,14 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
         ok &= check(&label, there);
     }
     if let Some(web) = &cfg.web {
-        // Where the daemon binds it: this container's own address under the network floor.
-        let at = zephyr::egress::listen_addr(([127, 0, 0, 1], web.port).into())?;
-        let up = tokio::net::TcpStream::connect(at).await;
-        ok &= check(&format!("web app listening on {at}"), up.is_ok());
+        let _ = web;
+        ok &= match zephyr::web::address(cfg) {
+            Ok(at) => {
+                let up = tokio::net::TcpStream::connect(at).await;
+                check(&format!("web app listening on {at}"), up.is_ok())
+            }
+            Err(why) => check(&format!("web app: {why}"), false),
+        };
         ok &= check(
             "the web push key loads",
             zephyr::web::push::vapid(cfg, false).is_ok(),

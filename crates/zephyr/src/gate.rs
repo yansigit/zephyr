@@ -1446,6 +1446,17 @@ fn canonical(v: &Value) -> String {
 /// there is `/ok N once` offered (the example's class is `ask-new`); a delayed action says when
 /// it goes; one that needs a strong channel to approve says so.
 pub fn card(a: &Action, cfg: &Config, store: &Store) -> String {
+    render(a, cfg, store, true)
+}
+
+/// What a passkey signs of a held action (DESIGN §4.3.3): its card made without the time left,
+/// which changes by itself and would undo a signature made a moment earlier. Made that way, not
+/// cut out of the card's text: a card quotes the agent and pages, and a quote may say anything.
+pub fn signed_card(a: &Action, cfg: &Config, store: &Store) -> String {
+    render(a, cfg, store, false)
+}
+
+fn render(a: &Action, cfg: &Config, store: &Store, countdown: bool) -> String {
     let scrub = Scrub::load(cfg);
     let clean = |text: &str| scrub.text(text);
     let e = approvals::effective(cfg);
@@ -1526,7 +1537,7 @@ pub fn card(a: &Action, cfg: &Config, store: &Store) -> String {
             lines.push(format!("the agent says: \"{reason}\""));
         }
     }
-    lines.push(footer(a, cfg, class));
+    lines.push(footer(a, cfg, class, countdown));
     lines.join("\n")
 }
 
@@ -1754,7 +1765,7 @@ fn wait_lines(
 }
 
 /// The last line: how to answer and when the action expires, or when a delayed one goes.
-fn footer(a: &Action, cfg: &Config, class: Option<Class>) -> String {
+fn footer(a: &Action, cfg: &Config, class: Option<Class>, countdown: bool) -> String {
     let id = a.id;
     if a.status == "scheduled" {
         let tz = crate::scheduler::zone(cfg).unwrap_or(jiff::tz::TimeZone::UTC);
@@ -1779,31 +1790,16 @@ fn footer(a: &Action, cfg: &Config, class: Option<Class>) -> String {
             format!("{} h", (s + 3599) / 3600)
         }
     };
-    let mut line = format!("/ok {id}{once} · /no {id} · expires in {left}");
+    let mut line = format!("/ok {id}{once} · /no {id}");
+    if countdown {
+        line += &format!(" · expires in {left}");
+    }
     let money_strong = approvals::strong_only(cfg).iter().any(|s| s == "money");
     if class == Some(Class::Money) && money_strong {
         let strong = cfg.settings.strong_channels.join(" or ");
         line += &format!(" · this one needs {strong}");
     }
     line
-}
-
-/// What a passkey signs of a card (DESIGN §4.3.3): the card without the time left on its last
-/// line, which changes by itself and would undo a signature made a moment earlier. Only the
-/// last line, the daemon's own, is touched.
-pub fn signed(card: &str) -> String {
-    let (head, last) = match card.rsplit_once('\n') {
-        Some((head, last)) => (Some(head), last),
-        None => (None, card),
-    };
-    let kept: Vec<&str> = (last.split(" · "))
-        .filter(|part| !part.starts_with("expires in "))
-        .collect();
-    let last = kept.join(" · ");
-    match head {
-        Some(head) => format!("{head}\n{last}"),
-        None => last,
-    }
 }
 
 /// The subject and the first lines of the message a send carries in its own text: a heredoc's
@@ -2833,22 +2829,22 @@ mod tests {
             "{card}"
         );
         assert!(card.ends_with("expires in 10 min"), "{card}");
-        // What a passkey signs is the card without the time left, which changes by itself.
-        let signed = signed(&card);
+        // What a passkey signs is the same card made without the time left, which changes by
+        // itself. It is built that way, never cut out of the text: a target that holds the
+        // countdown's words stays whole.
+        let action = h.store.action(id).unwrap().unwrap();
+        let (cfg, store) = (&h.cfg, &h.store);
+        let signed = signed_card(&action, cfg, store);
         assert!(!signed.contains("expires in"), "{signed}");
         assert_eq!(format!("{signed} · expires in 10 min"), card);
-        let strong = "a\n/ok 6 · /no 6 · expires in 24 h · this one needs tui or chat";
-        assert_eq!(
-            super::signed(strong),
-            "a\n/ok 6 · /no 6 · this one needs tui or chat"
+        let mut odd = action.clone();
+        odd.targets = vec!["https://shop.example.com/ · expires in 1 h".into()];
+        let (card, signed) = (super::card(&odd, cfg, store), signed_card(&odd, cfg, store));
+        assert!(
+            signed.contains("https://shop.example.com/ · expires in 1 h"),
+            "{signed}"
         );
-        // Only the daemon's own last line is touched; a one-line command card not at all.
-        let quoted = "said: \"x · expires in 1 h\"\n/ok 6 · /no 6 · expires in 2 h";
-        assert_eq!(
-            super::signed(quoted),
-            "said: \"x · expires in 1 h\"\n/ok 6 · /no 6"
-        );
-        assert_eq!(super::signed("/new"), "/new");
+        assert_eq!(format!("{signed} · expires in 10 min"), card);
         assert_eq!(
             outcomes(&h.store),
             ["auto", "auto", "auto", "held", "held", "held", "held", "held", "held"]

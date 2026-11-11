@@ -797,7 +797,7 @@ fn diff(old: &Files, new: &Files) -> String {
 /// The owner's `/memory` commands, `/rules` and `/rule`'s usage. `None` for any other text,
 /// `/rule TEXT` and `/rule rm N` included: those are settings, changed through the router's
 /// `set_setting`, which calls `rule`.
-pub fn command(home: &Path, state: &Path, text: &str) -> Option<String> {
+pub fn command(home: &Path, state: &Path, text: &str, may_approve: bool) -> Option<String> {
     let text = text.trim();
     let (cmd, arg) = text.split_once(' ').unwrap_or((text, ""));
     let arg = arg.trim();
@@ -815,6 +815,10 @@ pub fn command(home: &Path, state: &Path, text: &str) -> Option<String> {
     // The router's: it records the commits and clears their rows.
     if !ours || setting || text == "/memory squash yes" {
         return None;
+    }
+    // Keeping or undoing what the agent wrote is an approval (`tools::NEEDS_PASSKEY`).
+    if !may_approve && cmd == "/memory" && matches!(arg, "ok" | "undo") {
+        return Some(crate::tools::NEEDS_PASSKEY.into());
     }
     let _guard = lock();
     let reply = match (cmd, arg) {
@@ -1380,7 +1384,7 @@ mod tests {
     }
 
     fn say(home: &Path, text: &str) -> String {
-        command(home, &state(home), text).unwrap()
+        command(home, &state(home), text, true).unwrap()
     }
 
     /// A task's commit, as a run's settle makes it: the owner's notice, if any.
@@ -1590,7 +1594,7 @@ mod tests {
         // The first start approves what is there.
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
         let st = state(&home);
-        assert!(command(&home, &st, "/rule never email bob").is_none());
+        assert!(command(&home, &st, "/rule never email bob", true).is_none());
         assert_eq!(
             rule(&st, "never email bob").unwrap(),
             "[zephyr] rule 1 set; it applies from the next message"
@@ -1667,13 +1671,13 @@ mod tests {
     fn other_text_is_not_a_memory_command() {
         let home = home();
         let state = state(&home);
-        assert!(command(&home, &state, "hello /memory log").is_none());
-        assert!(command(&home, &state, "/memoryx").is_none());
-        assert!(command(&home, &state, "/ruler").is_none());
-        assert!(command(&home, &state, "/memory")
+        assert!(command(&home, &state, "hello /memory log", true).is_none());
+        assert!(command(&home, &state, "/memoryx", true).is_none());
+        assert!(command(&home, &state, "/ruler", true).is_none());
+        assert!(command(&home, &state, "/memory", true)
             .unwrap()
             .starts_with("usage"));
-        assert!(command(&home, &state, "/rule")
+        assert!(command(&home, &state, "/rule", true)
             .unwrap()
             .starts_with("usage"));
     }
@@ -1852,9 +1856,9 @@ mod tests {
         );
         assert_eq!(say(&home, "/goal"), GOAL_USAGE);
         assert_eq!(say(&home, "/goal ship it"), GOAL_USAGE);
-        assert!(command(&home, &st, "/goal add Ship it").is_none());
-        assert!(command(&home, &st, "/goal done 1").is_none());
-        assert!(command(&home, &st, "/goal rm 1").is_none());
+        assert!(command(&home, &st, "/goal add Ship it", true).is_none());
+        assert!(command(&home, &st, "/goal done 1", true).is_none());
+        assert!(command(&home, &st, "/goal rm 1", true).is_none());
         goal(&st, "add Ship it").unwrap();
         goal(&st, "add Rest").unwrap();
         assert_eq!(say(&home, "/goals"), "1. Ship it\n2. Rest");
@@ -1862,16 +1866,16 @@ mod tests {
             say(&home, "/persona"),
             "no persona; set one with /persona set <text>"
         );
-        assert!(command(&home, &st, "/persona set Warm.").is_none());
-        assert!(command(&home, &st, "/persona clear").is_none());
+        assert!(command(&home, &st, "/persona set Warm.", true).is_none());
+        assert!(command(&home, &st, "/persona clear", true).is_none());
         assert_eq!(
             say(&home, "/persona warm"),
             "usage: /persona set <text> | /persona clear | /persona"
         );
         persona(&st, "set Warm.\nBrief.").unwrap();
         assert_eq!(say(&home, "/persona"), "Warm.\nBrief.");
-        assert!(command(&home, &st, "/goalx").is_none());
-        assert!(command(&home, &st, "/personas").is_none());
+        assert!(command(&home, &st, "/goalx", true).is_none());
+        assert!(command(&home, &st, "/personas", true).is_none());
     }
 
     #[test]
@@ -2105,7 +2109,7 @@ mod tests {
             say(&home, "/memory squash"),
             "[zephyr] /memory squash yes drops the memory's git history, keeping the files as they are now; /memory undo cannot go back past it."
         );
-        assert!(command(&home, &st, "/memory squash yes").is_none());
+        assert!(command(&home, &st, "/memory squash yes", true).is_none());
         assert_eq!(
             say(&home, "/memory x"),
             "usage: /memory log | diff | ok | undo | squash"

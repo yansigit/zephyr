@@ -277,10 +277,7 @@ impl<T> Challenges<T> {
         challenge: [u8; 32],
     ) -> String {
         // 128 random bits: the name tells nothing of how many were issued or to whom.
-        let mut name = [0; 16];
-        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut name)
-            .expect("the system's random source");
-        let id = HEXLOWER.encode(&name);
+        let id = HEXLOWER.encode(&crate::web::random::<16>());
         waiting.push_back(Pending {
             id: id.clone(),
             owner,

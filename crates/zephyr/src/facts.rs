@@ -653,28 +653,32 @@ pub fn list(facts: &[Fact]) -> String {
 /// The owner's `/facts …`, on any channel. A value is never taken in a chat message. Letting a
 /// fact go somewhere, and removing one, loosen the check, so they need a strong channel
 /// (`strong`); an approved proposal arrives here as the owner's own command.
-pub fn command(path: &Path, arg: &str, strong: bool) -> String {
+pub fn command(path: &Path, arg: &str, strong: bool) -> Result<String, String> {
     let words: Vec<&str> = arg.split_whitespace().collect();
     let edit = |f: &dyn Fn(&mut Vec<Fact>) -> anyhow::Result<String>| match edit(path, f) {
-        Ok(text) => format!("[zephyr] {text}"),
-        Err(e) => format!("[zephyr] {e:#}"),
+        Ok(text) => Ok(format!("[zephyr] {text}")),
+        Err(e) => Err(format!("[zephyr] {e:#}")),
     };
     let weak = "[zephyr] loosening the check for a private fact needs a strong channel";
     match words[..] {
-        [] | ["list"] => load(path).map_or_else(|e| format!("[zephyr] {e:#}"), |f| list(&f)),
-        ["rm" | "allow", ..] if !strong => weak.into(),
+        [] | ["list"] => (load(path).map(|f| list(&f))).map_err(|e| format!("[zephyr] {e:#}")),
+        ["rm" | "allow", ..] if !strong => Err(weak.into()),
         ["rm", name] => edit(&|f| match remove(f, name) {
             true => Ok(format!("removed the fact {name}")),
             false => bail!("no fact named {name}"),
         }),
         ["allow", name, target] => edit(&|f| allow(f, name, target, true)),
         ["disallow", name, target] => edit(&|f| allow(f, name, target, false)),
-        ["add" | "edit", ..] => "[zephyr] values never go through a chat: in zephyr attach, \
+        ["add" | "edit", ..] => Err(
+            "[zephyr] values never go through a chat: in zephyr attach, \
             /facts opens a form; on the host, run `zephyr facts add NAME --kind text|digits|email`"
-            .into(),
-        _ => "[zephyr] usage: /facts, /facts rm NAME, /facts allow NAME TARGET, \
+                .into(),
+        ),
+        _ => Err(
+            "[zephyr] usage: /facts, /facts rm NAME, /facts allow NAME TARGET, \
               /facts disallow NAME TARGET"
-            .into(),
+                .into(),
+        ),
     }
 }
 

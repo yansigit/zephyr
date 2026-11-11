@@ -864,13 +864,33 @@
         for (const [label, verb] of [["Done", "done"], ["Remove", "rm"]]) {
           const button = el("button", "", label);
           button.type = "button";
-          button.addEventListener("click", () => goalCommand("/goal " + verb + " " + goal.n));
+          button.addEventListener("click", () => actOnGoal(goal, verb));
           item.append(button);
         }
       }
       rows.append(item);
     }
     if (!rows.firstChild) rows.append(el("li", "empty", "no goals yet"));
+  }
+
+  // `/goal done N` and `/goal rm N` name a position, and the list may have changed since it
+  // was drawn (another device, the agent's proposal). So the list is read again first, and the
+  // command is sent only if goal N is still the one that was tapped.
+  async function actOnGoal(goal, verb) {
+    let now;
+    try {
+      now = (await rpc("zephyr.goals", {})).goals || [];
+    } catch (error) {
+      $("goals-note").textContent = clean(said(error));
+      return;
+    }
+    const same = now.some((g) => !g.done && g.n === goal.n && g.text === goal.text);
+    if (!same) {
+      await loadGoals();
+      $("goals-note").textContent = "the list changed; look again";
+      return;
+    }
+    goalCommand("/goal " + verb + " " + goal.n);
   }
 
   function addGoal() {

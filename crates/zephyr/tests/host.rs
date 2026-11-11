@@ -2990,3 +2990,30 @@ fn up_in_bridge_mode_publishes_the_web_port_on_loopback() {
     let run = find(&calls, &["docker", "run", "-d", "--name", CONTAINER]);
     assert!(!run.iter().any(|a| a == "-p"), "{run:?}");
 }
+
+#[test]
+fn web_setup_needs_the_network_floor() {
+    let env = Env::new("web-host-net");
+    env.init(&["--no-start"]);
+    let host = env.daemon().join("host.toml");
+    let text = std::fs::read_to_string(&host).unwrap_or_default();
+    let text = match text.contains("network = \"bridge\"") {
+        true => text.replace("network = \"bridge\"", "network = \"host\""),
+        false => format!("{text}\nnetwork = \"host\"\n"),
+    };
+    std::fs::write(&host, text).unwrap();
+    let before = env.config();
+    env.calls();
+    let out = env.zephyr_env(&["web", "setup", "--yes"], &[("SHIM_TS_STATUS", TS_STATUS)]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("the web app needs the network floor; host.toml network = \"bridge\""),
+        "{said}"
+    );
+    assert_eq!(env.config(), before);
+    assert!(
+        !env.calls().iter().any(|c| c[0] == "tailscale"),
+        "nothing was asked of tailscale"
+    );
+}
