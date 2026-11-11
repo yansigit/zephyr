@@ -45,6 +45,7 @@
     <button type="button" data-screen="vault">Vault</button>
     <button type="button" data-screen="goals">Goals</button>
     <button type="button" data-screen="devices">Devices</button>
+    <button type="button" data-screen="desktop" hidden>Desktop</button>
   </nav>
 
   <section id="chat" class="screen">
@@ -103,6 +104,19 @@
     <ul id="sessions-list" class="rows"></ul>
     <h3>Notifications</h3>
     <ul id="push-list" class="rows"></ul>
+  </section>
+
+  <section id="desktop" class="screen" hidden>
+    <h2>Desktop</h2>
+    <p id="desktop-note" class="note" role="status"></p>
+    <div class="buttons">
+      <button id="desktop-take" type="button" class="primary">Take over</button>
+      <button id="desktop-give" type="button" hidden>Hand back</button>
+      <button id="desktop-keys" type="button" hidden>Keyboard</button>
+    </div>
+    <p class="hint">The screen is the agent's: it sees what is shown and can read what you type there. Use the vault to sign in without giving it a password.</p>
+    <input id="desktop-typed" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Type here to send keys" aria-label="Keys for the agent's desktop" hidden>
+    <div id="desktop-screen"></div>
   </section>
 
   <aside id="drawer" hidden>

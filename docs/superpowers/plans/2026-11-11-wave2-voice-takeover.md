@@ -300,11 +300,16 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
 - The drawer shows Desktop while `snapshot.desktop` is not null. The screen has Take over (signed), Hand back, a keyboard button whose text field sends keys with `rfb.sendKey`, the canvas scaled to fit, and under the button: "The screen is the agent's: it sees what is shown and can read what you type there. Use the vault to sign in without giving it a password."
 - noVNC is imported as a module from `/novnc/core/rfb.js`; `new RFB(el, url, {wsProtocols: ["zephyr-vnc", "zt." + ticket]})`.
 
-- [ ] **Step 1: Failing tests** in `web/mod.rs`: the existing file tests (no `innerHTML`, `eval(`, inline script) now walk every `FILES` row; `every_novnc_file_is_served_as_javascript`; `the_novnc_tree_is_the_pinned_one` (the file count and a SHA-256 over the sorted paths and bytes, written into the test from the v1.7.0 tag).
-- [ ] **Step 2: Run** `cargo test -p zephyr --lib web::` → FAIL.
-- [ ] **Step 3: Implement.** Fetch the tag with `gh api repos/novnc/noVNC/tarball/v1.7.0`.
-- [ ] **Step 4: Run** → PASS; `cargo test -p zephyr`.
-- [ ] **Step 5: Commit** `feat(web): add the Desktop screen, with noVNC 1.7.0 served by the app itself`.
+- [x] **Step 1: Failing tests** in `web/mod.rs`: the existing file tests (no `innerHTML`, `eval(`, inline script) now walk every `FILES` row; `every_novnc_file_is_served_as_javascript`; `the_novnc_tree_is_the_pinned_one` (the file count and a SHA-256 over the sorted paths and bytes, written into the test from the v1.7.0 tag).
+- [x] **Step 2: Run** `cargo test -p zephyr --lib web::` → FAIL.
+- [x] **Step 3: Implement.** Fetch the tag with `gh api repos/novnc/noVNC/tarball/v1.7.0`.
+- [x] **Step 4: Run** → PASS; `cargo test -p zephyr`.
+- [x] **Step 5: Commit** `feat(web): add the Desktop screen, with noVNC 1.7.0 served by the app itself`.
+- Deviation: v1.7.0's `core/` and `vendor/pako` pass the app's file tests as they are (no `innerHTML`, `eval(`, `new Function`), so nothing is exempted. But they do not work whole under the unchanged CSP, which the spec missed: `img-src 'self'` refuses the `data:` URLs noVNC draws Tight's JPEG tiles, TightPNG and the pointer's shape through. Neither the CSP nor noVNC's files change; `app.js` wraps `RFB.messages.clientEncodings` and drops those encodings (JPEG, TightPNG, the quality levels, both cursor encodings), so the server sends lossless Tight and draws the pointer itself. Test `the_app_asks_novnc_for_no_data_images` pins this to v1.7.0's files. Costs bandwidth on photos; a CSP `img-src 'self' data:` for `/` would be the other way, and is the owner's call.
+- Deviation: the tree is 57 files, not 56: the tag's `LICENSE.txt` is copied with it, as the task says. The two licences are served as `text/plain`; pako's `README.md` is in the folder and not served.
+- Deviation: `FILES` keeps its rows, and noVNC's scripts are a second const list, `NOVNC`, written through a macro (one row per file, the path once); `embedded` looks in both.
+- Deviation: noVNC is loaded with a dynamic `import()` when the Desktop screen is first used, since `app.js` is a classic script and 400 KB should not load with every chat.
+- Not verified: no browser ran this. The Rust side (ticket, socket, x11vnc's argv and socketpair) is tested with a fake x11vnc; that noVNC completes its handshake with a real x11vnc through `/api/vnc`, the look of the screen, the phone keyboard field (Hangul composition, Backspace on Android) and the absence of CSP errors are for C2-10's side container and the README's manual check.
 
 ## Image
 

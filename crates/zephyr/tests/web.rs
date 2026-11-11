@@ -200,10 +200,23 @@ async fn the_files_carry_the_security_headers() {
         ("/manifest.webmanifest", "application/manifest+json"),
         ("/icon-192.png", "image/png"),
         ("/icon-512.png", "image/png"),
+        // noVNC, for the Desktop screen: served by the app itself, under the same policy.
+        ("/novnc/core/rfb.js", "text/javascript; charset=utf-8"),
+        (
+            "/novnc/vendor/pako/lib/zlib/inflate.js",
+            "text/javascript; charset=utf-8",
+        ),
+        ("/novnc/LICENSE.txt", "text/plain; charset=utf-8"),
     ] {
         let res = gw.get(path).await;
         assert_eq!(res.status(), 200, "{path}");
         assert_eq!(res.headers()["content-type"], kind, "{path}");
+        assert_eq!(res.headers()["content-security-policy"], CSP, "{path}");
+    }
+    let page = gw.get("/").await.text().await.unwrap();
+    assert!(page.contains(r#"data-screen="desktop" hidden"#), "{page}");
+    for path in ["/novnc/", "/novnc/core/", "/novnc/vendor/pako/README.md"] {
+        assert_eq!(gw.get(path).await.status(), 404, "{path}");
     }
     gw.shutdown().await;
 }

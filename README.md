@@ -600,11 +600,26 @@ that your other channels could approve too. A payment, or anything that loosens 
 setting, opens the app, where approving takes your passkey. Up to 10 devices; `/web rm NAME`
 removes a passkey's devices with it. Swiping a card's notification away denies it, on Android only.
 
+**Take over the desktop.** The menu's **Desktop** screen (there when the agent has a desktop)
+lets you use the agent's screen yourself: tap **Take over** and approve with your passkey. While
+you hold it the agent's browser and `xdotool` commands wait, and each one that waited is refused
+when you hand back, since the page may have changed under it; the agent is told to take a fresh
+look first. **Hand back** returns the desktop. It also goes back by itself after 10 minutes
+without a key or a tap, after 60 minutes, or a minute after the app closes, and you are told. On
+a phone, **Keyboard** opens a field, and what you type in it is typed on the agent's screen. One
+device at a time; another can still hand it back.
+
+The screen is the agent's: it sees what is shown and can read what you type there. Sign in to
+sites through [the vault](#the-vault) rather than by typing a password. The picture comes through
+the app's own connection; nothing listens for a VNC viewer, inside the container or out.
+
 **Before a release that touches `crates/zephyr/assets/web/`**, check by hand, on iOS Safari as a
 Home Screen app and on Android Chrome (a real browser is not part of the tests): enrol with
 `/web enrol`, sign in, chat, approve a held message with the passkey, deny one from a
-notification, swipe one away on Android (it is denied), and `/web rm` from another channel
-signs the phone out. The browser's console must show no Content-Security-Policy errors.
+notification, swipe one away on Android (it is denied), take over the desktop, type into the
+agent's browser with **Keyboard** (English and Korean), hand back, and `/web rm` from another
+channel signs the phone out. The browser's console must show no Content-Security-Policy errors,
+on the Desktop screen too, with a photo on the agent's screen.
 
 ## Telegram
 
@@ -741,19 +756,9 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   through screenshots and drives it with `xdotool`.
 - **GPU.** When Docker has the NVIDIA runtime, `zephyr up` passes the GPU in, so the browser's
   WebGL is the real card instead of software rendering, which bot checks notice.
-- **Watching it, or signing it into a site.** Nothing listens by default. To look, start a one-shot
-  VNC server on the container's own address, port 5900, and connect a VNC viewer on this machine to
-  that address; it exits when you disconnect (the address is reachable from this machine only):
-
-  ```sh
-  ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' zephyr)
-  docker exec -it -u "$(id -u)" zephyr x11vnc -storepasswd /zephyr/.vnc-passwd   # once
-  docker exec -d -u "$(id -u)" zephyr x11vnc -display :99 -auth /zephyr/.zephyr-xauthority -listen "$ip" -once -rfbauth /zephyr/.vnc-passwd
-  echo "connect to $ip:5900"
-  ```
-
-  With `network = "host"` in host.toml, use `-localhost` in place of `-listen "$ip"` and connect
-  to 127.0.0.1:5900.
+- **Watching it, or signing it into a site.** Open the [web app](#web-app)'s **Desktop** screen and
+  tap **Take over** ("Take over the desktop" below that heading). No VNC server listens, and none
+  needs starting by hand. With `network = "host"` in host.toml there is no web app, so no takeover.
 
 - **Files and jobs.** The agent's `send_file` tool sends you a file (up to 10 MB: a screenshot, a
   PDF) with its reply. Its `schedule` tool only proposes a job: you are shown it, and it runs after

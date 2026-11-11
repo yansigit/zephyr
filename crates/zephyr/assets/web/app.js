@@ -1,5 +1,5 @@
-// The zephyr web app (DESIGN §4.3.3): chat, approvals, settings and devices over the attach
-// protocol on a WebSocket. Plain ES2020, no build step. Everything the daemon sends is put on
+// The zephyr web app (DESIGN §4.3.3): chat, approvals, settings, devices and the agent's desktop
+// (noVNC, from /novnc/) over the attach protocol on a WebSocket. Plain ES2020, no build step. Everything the daemon sends is put on
 // the page as text (`textContent`), never as markup.
 "use strict";
 
@@ -431,6 +431,7 @@
     $("queue").hidden = mine.length === 0;
     $("queue-text").textContent = clean(mine.length + " waiting: " + (mine[0] ? mine[0].preview : ""));
     renderUpcoming();
+    renderDesktop();
     if (waiting !== before) loadProposals();
   }
 
@@ -971,6 +972,117 @@
     showSignin("signed out");
   }
 
+  // ---- the agent's desktop ----
+
+  const desk = { RFB: null, rfb: null };
+
+  // noVNC, loaded when the screen is first used. The page's CSP (img-src 'self') refuses the
+  // `data:` images noVNC builds for JPEG and PNG tiles and for the pointer's shape, so the
+  // server is asked for none: tiles come lossless, and it draws the pointer into the screen.
+  async function loadRFB() {
+    if (!desk.RFB) {
+      const RFB = (await import("/novnc/core/rfb.js")).default;
+      const send = RFB.messages.clientEncodings;
+      const dataImage = (e) => e === 21 || e === -260 || e === -239 || e === 0x574d5664 || (e >= -32 && e <= -23);
+      RFB.messages.clientEncodings = (sock, encodings) => send(sock, encodings.filter((e) => !dataImage(e)));
+      desk.RFB = RFB;
+    }
+    return desk.RFB;
+  }
+
+  function renderDesktop() {
+    const desktop = state.snapshot ? state.snapshot.desktop : null;
+    document.querySelector('#screens [data-screen="desktop"]').hidden = !desktop;
+    const held = Boolean(desktop && desktop.owner);
+    // The daemon closes the socket at the hand back, which clears `desk.rfb`.
+    const shown = Boolean(desk.rfb);
+    $("desktop-take").hidden = shown;
+    $("desktop-give").hidden = !held;
+    $("desktop-keys").hidden = !shown;
+    $("desktop-typed").hidden = !shown;
+    const taken = "taken over since ";
+    if (held) {
+      const since = new Date(desktop.since_unix * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      $("desktop-note").textContent = taken + since + "; the agent's browser waits";
+    } else if ($("desktop-note").textContent.startsWith(taken)) {
+      $("desktop-note").textContent = "";
+    }
+  }
+
+  // "Take over" is signed with the passkey; its ticket opens the socket, once.
+  async function takeDesktop() {
+    $("desktop-note").textContent = "";
+    try {
+      const RFB = await loadRFB();
+      const signed = await sign({ op: "desktop", verb: "take" });
+      const took = await rpc("zephyr.desktop", Object.assign({ verb: "take" }, signed));
+      const scheme = location.protocol === "https:" ? "wss://" : "ws://";
+      const rfb = new RFB($("desktop-screen"), scheme + location.host + "/api/vnc", {
+        wsProtocols: ["zephyr-vnc", "zt." + took.ticket],
+      });
+      rfb.scaleViewport = true;
+      rfb.addEventListener("disconnect", () => {
+        if (desk.rfb === rfb) desk.rfb = null;
+        renderDesktop();
+      });
+      desk.rfb = rfb;
+      renderDesktop();
+    } catch (error) {
+      $("desktop-note").textContent = clean(String((error && error.message) || "the desktop was not taken over"));
+    }
+  }
+
+  async function giveDesktop() {
+    try {
+      await rpc("zephyr.desktop", { verb: "give" });
+    } catch (error) {
+      $("desktop-note").textContent = clean(String((error && error.message) || "the desktop was not handed back"));
+    }
+  }
+
+  // A phone has no keys until a text field has the focus: what is typed into this one goes out
+  // as key presses, a composed character (Hangul, an accent) once it is whole.
+  const KEYSYMS = {
+    Enter: 0xff0d,
+    Backspace: 0xff08,
+    Tab: 0xff09,
+    Escape: 0xff1b,
+    Delete: 0xffff,
+    ArrowLeft: 0xff51,
+    ArrowUp: 0xff52,
+    ArrowRight: 0xff53,
+    ArrowDown: 0xff54,
+  };
+
+  function sendTyped() {
+    const field = $("desktop-typed");
+    if (desk.rfb) {
+      for (const char of field.value) {
+        const point = char.codePointAt(0);
+        // X11's keysym for a character: Latin-1 as it is, the rest by its Unicode number.
+        desk.rfb.sendKey(point < 0x100 ? point : 0x01000000 + point, null);
+      }
+    }
+    field.value = "";
+  }
+
+  function wireDesktop() {
+    const field = $("desktop-typed");
+    $("desktop-take").addEventListener("click", takeDesktop);
+    $("desktop-give").addEventListener("click", giveDesktop);
+    $("desktop-keys").addEventListener("click", () => field.focus());
+    field.addEventListener("input", (event) => {
+      if (!event.isComposing) sendTyped();
+    });
+    field.addEventListener("compositionend", sendTyped);
+    field.addEventListener("keydown", (event) => {
+      const keysym = KEYSYMS[event.key];
+      if (!keysym || event.isComposing || !desk.rfb) return;
+      event.preventDefault();
+      desk.rfb.sendKey(keysym, null);
+    });
+  }
+
   // ---- screens and wiring ----
 
   const loaders = {
@@ -1029,6 +1141,7 @@
     $("push-on").addEventListener("click", pushOn);
     $("push-off").addEventListener("click", () => unsubscribe().then(loadDevices, loadDevices));
     $("signout").addEventListener("click", signOut);
+    wireDesktop();
   }
 
   function boot() {

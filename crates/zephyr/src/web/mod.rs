@@ -83,7 +83,93 @@ pub(crate) const FILES: &[(&str, &str, &[u8])] = &[
         "image/png",
         include_bytes!("../../assets/web/icon-512.png"),
     ),
+    (
+        "/novnc/LICENSE.txt",
+        "text/plain; charset=utf-8",
+        include_bytes!("../../assets/web/novnc/LICENSE.txt"),
+    ),
+    (
+        "/novnc/vendor/pako/LICENSE",
+        "text/plain; charset=utf-8",
+        include_bytes!("../../assets/web/novnc/vendor/pako/LICENSE"),
+    ),
 ];
+
+/// noVNC 1.7.0's `core/` and `vendor/pako` (MPL-2.0 and MIT), as its tag has them, for the
+/// Desktop screen (DESIGN §4.3.3): path and bytes, one row per file, each served as JavaScript.
+macro_rules! novnc {
+    ($($path:literal),* $(,)?) => {
+        &[$((
+            concat!("/novnc/", $path),
+            include_bytes!(concat!("../../assets/web/novnc/", $path)) as &[u8],
+        )),*]
+    };
+}
+
+pub(crate) const NOVNC: &[(&str, &[u8])] = novnc![
+    "core/base64.js",
+    "core/crypto/aes.js",
+    "core/crypto/bigint.js",
+    "core/crypto/crypto.js",
+    "core/crypto/des.js",
+    "core/crypto/dh.js",
+    "core/crypto/md5.js",
+    "core/crypto/rsa.js",
+    "core/decoders/copyrect.js",
+    "core/decoders/h264.js",
+    "core/decoders/hextile.js",
+    "core/decoders/jpeg.js",
+    "core/decoders/raw.js",
+    "core/decoders/rre.js",
+    "core/decoders/tight.js",
+    "core/decoders/tightpng.js",
+    "core/decoders/zlib.js",
+    "core/decoders/zrle.js",
+    "core/deflator.js",
+    "core/display.js",
+    "core/encodings.js",
+    "core/inflator.js",
+    "core/input/domkeytable.js",
+    "core/input/fixedkeys.js",
+    "core/input/gesturehandler.js",
+    "core/input/keyboard.js",
+    "core/input/keysym.js",
+    "core/input/keysymdef.js",
+    "core/input/util.js",
+    "core/input/vkeys.js",
+    "core/input/xtscancodes.js",
+    "core/ra2.js",
+    "core/rfb.js",
+    "core/util/browser.js",
+    "core/util/cursor.js",
+    "core/util/element.js",
+    "core/util/events.js",
+    "core/util/eventtarget.js",
+    "core/util/int.js",
+    "core/util/logging.js",
+    "core/util/strings.js",
+    "core/websock.js",
+    "vendor/pako/lib/utils/common.js",
+    "vendor/pako/lib/zlib/adler32.js",
+    "vendor/pako/lib/zlib/constants.js",
+    "vendor/pako/lib/zlib/crc32.js",
+    "vendor/pako/lib/zlib/deflate.js",
+    "vendor/pako/lib/zlib/gzheader.js",
+    "vendor/pako/lib/zlib/inffast.js",
+    "vendor/pako/lib/zlib/inflate.js",
+    "vendor/pako/lib/zlib/inftrees.js",
+    "vendor/pako/lib/zlib/messages.js",
+    "vendor/pako/lib/zlib/trees.js",
+    "vendor/pako/lib/zlib/zstream.js",
+];
+
+const JS: &str = "text/javascript; charset=utf-8";
+
+/// The embedded file at `path`: its content type and bytes.
+fn embedded(path: &str) -> Option<(&'static str, &'static [u8])> {
+    let app = FILES.iter().find(|f| f.0 == path).map(|f| (f.1, f.2));
+    app.or_else(|| NOVNC.iter().find(|f| f.0 == path).map(|f| (JS, f.1)))
+}
 
 /// The files' ETag: they change only with the binary.
 const ETAG: &str = concat!("\"", env!("CARGO_PKG_VERSION"), "\"");
@@ -453,8 +539,8 @@ async fn body(req: Request<Incoming>) -> Option<serde_json::Value> {
 }
 
 fn file(req: &Request<Incoming>, path: &str) -> Res {
-    match FILES.iter().find(|f| f.0 == path) {
-        Some(&(_, kind, bytes)) => {
+    match embedded(path) {
+        Some((kind, bytes)) => {
             let fresh = req
                 .headers()
                 .get(header::IF_NONE_MATCH)
@@ -811,6 +897,7 @@ mod tests {
             "zephyr.proposals",
             "zephyr.decide",
             "zephyr.web_challenge",
+            "zephyr.desktop",
         ] {
             assert!(
                 called.iter().any(|c| c == method),
@@ -835,8 +922,12 @@ mod tests {
     fn the_app_holds_no_inline_code() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/web");
         let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
-        for name in ["app.js", "sw.js"] {
-            let js = read(name);
+        // Every script that is served, noVNC's too.
+        let app = FILES.iter().filter(|f| f.1 == JS).map(|f| (f.0, f.2));
+        let scripts: Vec<_> = app.chain(NOVNC.iter().copied()).collect();
+        assert_eq!(scripts.len(), 2 + NOVNC.len());
+        for (name, js) in scripts {
+            let js = std::str::from_utf8(js).unwrap();
             for banned in [
                 "innerHTML",
                 "insertAdjacentHTML",
@@ -854,15 +945,107 @@ mod tests {
             assert!(open.contains("src="), "an inline script: <script{open}>");
         }
         // Every embedded file is one of the folder's, and the other way round.
-        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| format!("/{}", e.unwrap().file_name().to_string_lossy()))
-            .collect();
-        on_disk.sort();
+        let mut on_disk = tree(&dir);
         let mut served: Vec<String> = FILES.iter().map(|f| f.0.to_string()).collect();
+        served.extend(NOVNC.iter().map(|f| f.0.to_string()));
         served.retain(|p| p != "/");
         served.sort();
-        on_disk.retain(|p| p != "/index.html");
+        // pako's README is kept with its tree and not served.
+        on_disk.retain(|p| p != "/index.html" && p != "/novnc/vendor/pako/README.md");
         assert_eq!(served, on_disk);
+    }
+
+    /// Every file under `dir`, as `/path` from it, sorted.
+    fn tree(dir: &std::path::Path) -> Vec<String> {
+        fn walk(dir: &std::path::Path, under: &str, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = format!("{under}/{}", entry.file_name().to_string_lossy());
+                match entry.file_type().unwrap().is_dir() {
+                    true => walk(&entry.path(), &path, out),
+                    false => out.push(path),
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, "", &mut out);
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn every_novnc_file_is_served_as_javascript() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/web");
+        let scripts: Vec<String> = (tree(&dir).into_iter())
+            .filter(|p| p.starts_with("/novnc/") && p.ends_with(".js"))
+            .collect();
+        assert_eq!(scripts.len(), 54);
+        for path in &scripts {
+            let (kind, bytes) = embedded(path).unwrap_or_else(|| panic!("{path} is not served"));
+            assert_eq!(kind, "text/javascript; charset=utf-8", "{path}");
+            assert_eq!(
+                bytes,
+                std::fs::read(dir.join(&path[1..])).unwrap(),
+                "{path}"
+            );
+        }
+        assert_eq!(NOVNC.len(), scripts.len());
+        // The licences go with them, as text.
+        for path in ["/novnc/LICENSE.txt", "/novnc/vendor/pako/LICENSE"] {
+            assert_eq!(embedded(path).unwrap().0, "text/plain; charset=utf-8");
+        }
+        assert!(embedded("/novnc/core/../../app.js").is_none());
+        assert!(embedded("/novnc/").is_none());
+    }
+
+    /// noVNC is the v1.7.0 tag's `core/`, `vendor/pako/` and `LICENSE.txt`, byte for byte: 57
+    /// files. The hash is that of `sha256sum`'s lines for them, sorted by path, as
+    /// `find * -type f | LC_ALL=C sort | xargs sha256sum | sha256sum` prints in the folder.
+    #[test]
+    fn the_novnc_tree_is_the_pinned_one() {
+        use data_encoding::HEXLOWER;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/web/novnc");
+        let files = tree(&dir);
+        assert_eq!(files.len(), 57);
+        let mut lines = String::new();
+        for path in &files {
+            let bytes = std::fs::read(dir.join(&path[1..])).unwrap();
+            let sum = HEXLOWER.encode(&passkey::sha256(&bytes));
+            lines.push_str(&format!("{sum}  {}\n", &path[1..]));
+        }
+        assert_eq!(
+            HEXLOWER.encode(&passkey::sha256(lines.as_bytes())),
+            "9921ed08026b78e6f851aa3f3f5bb9afe1715ac558f8fd905b9e5747affefeb3"
+        );
+    }
+
+    /// The CSP's `img-src 'self'` refuses a `data:` image, which is how noVNC 1.7.0 draws JPEG
+    /// and PNG tiles (`display.js` `imageRect`) and the pointer's shape (`util/cursor.js`). The
+    /// CSP stays as it is and noVNC's files too: the app asks the server for none of them, by
+    /// dropping those encodings from the one message that lists them.
+    #[test]
+    fn the_app_asks_novnc_for_no_data_images() {
+        let novnc = |path: &str| std::str::from_utf8(embedded(path).unwrap().1).unwrap();
+        let encodings = novnc("/novnc/core/encodings.js");
+        for line in [
+            "encodingTightPNG: -260,",
+            "encodingJPEG: 21,",
+            "pseudoEncodingQualityLevel9: -23,",
+            "pseudoEncodingQualityLevel0: -32,",
+            "pseudoEncodingCursor: -239,",
+            "pseudoEncodingVMwareCursor: 0x574d5664,",
+        ] {
+            assert!(encodings.contains(line), "{line}");
+        }
+        // The one place the encodings are sent from, and the two that build a `data:` URL.
+        let rfb = novnc("/novnc/core/rfb.js");
+        assert_eq!(rfb.matches("RFB.messages.clientEncodings(").count(), 1);
+        assert!(novnc("/novnc/core/display.js").contains(r#"img.src = "data: " + mime"#));
+        assert!(novnc("/novnc/core/util/cursor.js").contains("this._canvas.toDataURL()"));
+        let app = std::str::from_utf8(embedded("/app.js").unwrap().1).unwrap();
+        assert!(app.contains(
+            "e === 21 || e === -260 || e === -239 || e === 0x574d5664 || (e >= -32 && e <= -23)"
+        ));
+        assert!(app.contains("RFB.messages.clientEncodings = "));
     }
 }
