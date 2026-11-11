@@ -195,10 +195,11 @@ fn the_agent_reaches_only_the_proxy() {
         assert!(doctor.contains(line), "{line}\n{doctor}");
     }
     assert!(!doctor.contains("network floor off"), "{doctor}");
-    // The daemon alone, by its whole command line: `supervise` and this shell keep both.
+    // The daemon alone, by its whole command line: `supervise` and this shell keep both. After
+    // it re-execs itself (a changed setting) it is `/proc/self/exe run`.
     const DAEMON_CAPS: &str = "for d in /proc/[0-9]*; do \
-        [ \"$(tr '\\0' ' ' < $d/cmdline 2>/dev/null)\" = '/usr/local/bin/zephyr run ' ] \
-        && grep CapEff $d/status; done; true";
+        case \"$(tr '\\0' ' ' < $d/cmdline 2>/dev/null)\" in \
+        '/usr/local/bin/zephyr run '|'/proc/self/exe run ') grep CapEff $d/status;; esac; done; true";
     let caps = text(&side.root(&["sh", "-c", DAEMON_CAPS]));
     let caps: Vec<&str> = caps.split_whitespace().collect();
     assert_eq!(caps.len(), 2, "one daemon: {caps:?}");
