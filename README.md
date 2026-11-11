@@ -490,6 +490,16 @@ NAME` shows it, `/skill rm NAME` removes an approved skill, and `/skill undo NAM
 last change to it (again to go further back). On the host, `zephyr skill add DIR` adds a skill
 folder of yours, approved at once (at most 32 files and 256 KB, regular files only).
 
+**Starter skills** come with the image and are approved at the first start that sees them, on a
+new install and on an upgrade alike, with one message saying so: `report` (Markdown to a PDF, Korean
+included), `slides` (Markdown to a 16:9 PDF, or a `.pptx` when you ask), `pdf` (read, look at,
+merge, split, fill and encrypt PDFs) and `charts` (a PNG or SVG chart). Each writes files and sends
+them to you with `send_file`; none uploads anything. `slides`' PowerPoint and `charts` fetch their
+Python library on first use. `/skill rm NAME` (or `zephyr skill rm NAME`) removes one for good: no
+later start or image brings it back, though `/skill undo NAME` does. A newer image updates a starter
+skill you left as it was, never one you changed or replaced; a skill of yours with the same name
+is left alone. The agent's own edits to one are drafts, approved only with `/skill ok`.
+
 **Connectors** are MCP servers the agent may call. Add one on the host:
 
 ```sh

@@ -6090,6 +6090,55 @@ async fn mcp_catalog_add_from_discord_is_refused_and_from_chat_adds_the_connecto
     gw.shutdown().await;
 }
 
+/// DESIGN §4.23: the image's starter skills are approved at start and listed to the agent; the
+/// owner is told once, and a later start says nothing more.
+#[tokio::test]
+async fn starter_skills_are_seeded_and_told_once() {
+    let home = home("starter-skills");
+    let image = home.join("image-skills/report");
+    std::fs::create_dir_all(&image).unwrap();
+    let text = "---\nname: report\ndescription: Use when reporting.\n---\nsteps\n";
+    std::fs::write(image.join("SKILL.md"), text).unwrap();
+    let cfg = || {
+        let mut cfg = config(&home);
+        cfg.starter_skills = home.join("image-skills");
+        cfg.tick = Duration::from_millis(200);
+        cfg
+    };
+    let gw = start(cfg());
+    gw.say("m1", "owner", "hi").await;
+    let replies = gw.wait_replies(2).await;
+    let told: Vec<&String> = replies
+        .iter()
+        .filter(|r| r.contains("starter skills"))
+        .collect();
+    assert_eq!(
+        told,
+        ["[zephyr] added the starter skills report; /skills lists them, /skill rm NAME removes one"],
+        "{replies:?}"
+    );
+    let agents = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+    assert!(
+        agents.contains("- **report**: Use when reporting."),
+        "{agents}"
+    );
+    gw.shutdown().await;
+    let gw = start(cfg());
+    gw.say("m2", "owner", "again").await;
+    gw.wait_replies(1).await;
+    gw.say("m3", "owner", "/skills").await;
+    let replies = gw.wait_replies(2).await;
+    assert!(
+        replies[1].contains("- report: Use when reporting."),
+        "{replies:?}"
+    );
+    assert!(
+        !replies.iter().any(|r| r.contains("starter skills")),
+        "{replies:?}"
+    );
+    gw.shutdown().await;
+}
+
 /// Under the network floor a command gets a token's stand-in (DESIGN §4.21), never its value.
 fn brokered(home: &Path) -> Config {
     let mut cfg = config(home);

@@ -141,6 +141,10 @@ pub struct Config {
     /// configurable; tests point it at their own folder.
     #[serde(skip, default = "catalog_dir")]
     pub catalog_dir: PathBuf,
+    /// The image's starter skills (DESIGN §4.23), seeded at start: `/opt/zephyr/skills`. Not
+    /// configurable; tests point it at their own folder.
+    #[serde(skip, default = "starter_skills")]
+    pub starter_skills: PathBuf,
     /// This binary, which a command's output goes through on its way to the log so that no
     /// vault value lands there (`zephyr __scrublog`, DESIGN §4.13). `None` writes the log
     /// directly; the daemon sets it at start, and tests of other things leave it out.
@@ -268,6 +272,10 @@ fn floor() -> bool {
 
 fn catalog_dir() -> PathBuf {
     PathBuf::from(crate::catalog::DIR)
+}
+
+fn starter_skills() -> PathBuf {
+    PathBuf::from(crate::drafts::STARTER)
 }
 
 fn agent_browser() -> PathBuf {
@@ -590,6 +598,7 @@ impl Config {
         self.projects = running.projects.clone();
         self.agent_browser = running.agent_browser.clone();
         self.catalog_dir = running.catalog_dir.clone();
+        self.starter_skills = running.starter_skills.clone();
         self.scrubber = running.scrubber.clone();
         self.floor = running.floor;
         self.push_hosts = running.push_hosts.clone();

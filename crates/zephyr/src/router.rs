@@ -18,6 +18,9 @@ use tokio::time::Instant;
 
 /// rpi's own cap (`MAX_RESUME_ATTEMPTS`); after that we tell the sender.
 const MAX_RESUMES: u32 = 3;
+/// `meta`: the starter skills seeded and not told yet, and that they were told (DESIGN §4.23).
+const SEED_PENDING: &str = "skills.seed_pending";
+const SEED_TOLD: &str = "skills.seed_told";
 const FIRST_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// A channel send that takes longer fails, and that channel is skipped for `STUCK_PAUSE`, so
@@ -307,6 +310,8 @@ pub async fn run<C: Channel>(
     router.pushed_up_to = std::sync::atomic::AtomicI64::new(newest);
     router.keep_upgraded_install_as_it_was().await;
     router.settle_remote_connectors().await;
+    // Before the first child: its `prepare` publishes what is approved (DESIGN §4.23).
+    router.seed_starter_skills().await;
     router.taint_cut_off();
     // Before the first child starts the desktop: one a daemon before this left is no child of
     // this one, so it would be a stray for memory for good (DESIGN §4.6).
@@ -812,6 +817,7 @@ impl<'a> Router<'a> {
                     self.revert_due().await;
                     self.upgrade_notice();
                     self.broker_notice();
+                    self.seed_notice();
                     // Delays that came due, and held actions nobody answered (approvals §4.6).
                     self.tick_actions();
                     // A budget pause ends at UTC midnight with nothing else to wake the router;
@@ -3116,6 +3122,37 @@ impl<'a> Router<'a> {
             ));
             log(told.map_err(Into::into));
         }
+    }
+
+    /// The image's starter skills, committed into `<state>/skills` (DESIGN §4.23). What is seeded
+    /// for the first time ever is told once, when there is an owner to tell (`seed_notice`).
+    async fn seed_starter_skills(&mut self) {
+        let cfg = self.cfg.clone();
+        let seeded = tokio::task::spawn_blocking(move || crate::drafts::seed(&cfg))
+            .await
+            .unwrap_or_default();
+        if !seeded.is_empty() && matches!(self.store.meta(SEED_TOLD), Ok(None)) {
+            let pending = self.store.set_meta(SEED_PENDING, Some(&seeded.join(", ")));
+            log(pending.map_err(Into::into));
+        }
+        self.seed_notice();
+    }
+
+    fn seed_notice(&self) {
+        let Ok(Some(names)) = self.store.meta(SEED_PENDING) else {
+            return;
+        };
+        if self.store.last_owner().ok().flatten().is_none() {
+            return;
+        }
+        let told = self.store.notify_last_owner(&format!(
+            "[zephyr] added the starter skills {names}; /skills lists them, /skill rm NAME removes one"
+        ));
+        let marked = told.and_then(|()| {
+            self.store.set_meta(SEED_TOLD, Some("1"))?;
+            self.store.set_meta(SEED_PENDING, None)
+        });
+        log(marked.map_err(Into::into));
     }
 
     /// The once-only notice of the token broker's upgrade (DESIGN §4.21): the tokens and
