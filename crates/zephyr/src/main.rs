@@ -203,6 +203,10 @@ async fn run(cfg: Config, from_file: &[String]) -> anyhow::Result<()> {
     if zephyr::egress::bridge() {
         // Before anything is started for the agent: without the floor it does not run.
         zephyr::egress::verify().await?;
+        // The agent's Chromium trusts the token broker's CA from its own store (DESIGN §4.21).
+        if let Err(e) = zephyr::ca::trust_chromium(&cfg) {
+            eprintln!("zephyr: the browser does not trust the token broker's CA: {e:#}");
+        }
     }
     let _lock = lock_home(cfg.state_dir())?;
     let mut channels = vec![AnyChannel::Chat(ChatChannel::new(cfg.socket_path()))];
@@ -468,6 +472,7 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     // SAFETY: getuid has no arguments and cannot fail.
     let binaries_ok = unsafe { libc::getuid() } != 0 || roots_binaries(cfg);
     let floor_ok = network_floor(cfg).await;
+    let broker_ok = token_broker(cfg);
 
     // A throwaway home so doctor never touches the live `main` session.
     let mut probe = cfg.clone();
@@ -518,7 +523,8 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     }
 
     // Names and presence only: a secret's value is never printed.
-    let mut ok = version_ok && split_ok && wrapper_ok && binaries_ok && floor_ok && commands_ok;
+    let mut ok =
+        version_ok && split_ok && wrapper_ok && binaries_ok && floor_ok && broker_ok && commands_ok;
     // While the daemon is up, its gate socket is there: without it every send is refused
     // (approvals spec §4.9).
     if tokio::net::UnixStream::connect(cfg.socket_path())
@@ -667,6 +673,23 @@ fn check(label: &str, ok: bool) -> bool {
     ok
 }
 
+/// The token broker (DESIGN §4.21): its CA, what is decrypted, and what still reaches the agent
+/// in plain.
+fn token_broker(cfg: &Config) -> bool {
+    use zephyr::broker::Level;
+    let bundle = Path::new("/etc/ssl/certs/ca-certificates.crt");
+    let lines = zephyr::broker::doctor(cfg, zephyr::egress::bridge(), zephyr::now(), bundle);
+    let mut ok = true;
+    for (level, text) in lines {
+        match level {
+            Level::Ok => println!("ok   {text}"),
+            Level::Warn => println!("warn {text}"),
+            Level::Fail => ok = check(&text, false),
+        }
+    }
+    ok
+}
+
 /// The network floor (DESIGN §4.20), proved by probing as the agent (`zephyr __netcheck`), and
 /// that nothing of root's listens where the agent's uid is let through. Under host networking,
 /// one warning.
@@ -682,6 +705,9 @@ async fn network_floor(cfg: &Config) -> bool {
     let port = cfg.attach.as_ref().map_or(0, |a| a.port);
     let mut probe = std::process::Command::new("/usr/local/bin/zephyr");
     probe.args(["__netcheck", &format!("{own}:{port}")]);
+    // And that the token broker's keys and trust are out of its reach (DESIGN §4.21).
+    probe.arg(cfg.state_dir());
+    probe.arg(zephyr::drafts::public_dir(cfg));
     // Each check has its own limit and they add up to 45 s; a probe stuck past that is a failure.
     let mut probe = tokio::process::Command::from({
         zephyr::agent::cmd(&mut probe);

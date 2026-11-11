@@ -941,7 +941,7 @@ fn daemons_dir(dir: &Path) -> anyhow::Result<()> {
 
 /// Writes `text` to `path` as the daemon, readable by all (0644), in a folder only the daemon may
 /// write: what the agent may read but must not change.
-fn write_public(path: &Path, text: &str) -> anyhow::Result<()> {
+pub(crate) fn write_public(path: &Path, text: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = path.parent().context("no folder")?;
     daemons_dir(dir)?;

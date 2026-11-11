@@ -69,6 +69,22 @@ pub const PROXY_ENV: &[(&str, &str)] = &[
     ("NODE_USE_ENV_PROXY", "1"),
 ];
 
+/// The token broker's CA certificate as the daemon publishes it (DESIGN §4.21): in root's
+/// public folder, where the agent can read it and never replace it.
+pub const CA_PEM: &str = "/var/lib/zephyr-public/ca.pem";
+/// The system bundle, which holds that CA once `supervise` has installed it.
+const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+
+/// What makes the programs that carry their own roots trust the broker's CA: Node, and Python
+/// and Rust tools (requests, pip, httpx, uv). curl, git, gh and OpenSSL read the system bundle
+/// without being told. A program that points itself elsewhere only intercepts itself: the
+/// proxy's own check of a server never reads any of this.
+pub const CA_ENV: &[(&str, &str)] = &[
+    ("NODE_EXTRA_CA_CERTS", CA_PEM),
+    ("SSL_CERT_FILE", CA_BUNDLE),
+    ("REQUESTS_CA_BUNDLE", CA_BUNDLE),
+];
+
 /// `AGENT_BROWSER_ARGS` with the proxy flag after `current`, so Chromium does not depend on
 /// finding the variables itself.
 pub fn browser_args(current: Option<String>) -> String {
@@ -79,11 +95,15 @@ pub fn browser_args(current: Option<String>) -> String {
     }
 }
 
-/// Everything that points a program at the proxy: [`PROXY_ENV`], and `AGENT_BROWSER_ARGS` with
+/// Everything that points a program at the proxy: [`PROXY_ENV`], [`CA_ENV`] for the hosts the
+/// proxy decrypts, and `AGENT_BROWSER_ARGS` with
 /// the proxy flag after `browser`, its value so far. The one list for the daemon's spawns and
 /// the host's `docker exec` as the agent.
 pub fn proxy_env(browser: Option<String>) -> Vec<(&'static str, String)> {
-    let vars = PROXY_ENV.iter().map(|(k, v)| (*k, v.to_string()));
+    let vars = PROXY_ENV
+        .iter()
+        .chain(CA_ENV)
+        .map(|(k, v)| (*k, v.to_string()));
     vars.chain([("AGENT_BROWSER_ARGS", browser_args(browser))])
         .collect()
 }
@@ -342,5 +362,26 @@ mod tests {
         // Root's own dirs are no one else's.
         assert!(writable_dirs("/usr/bin:/bin", me + 1, group + 1).is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    /// DESIGN §4.21: under the floor every agent process is told where the broker's CA is; the
+    /// host's `docker exec` as the agent passes the same list (`proxy_env`).
+    #[test]
+    fn the_proxy_env_points_tools_at_the_ca() {
+        let mut c = Command::new("true");
+        let envs = envs(proxy(&mut c));
+        let has = |k: &str, v: &str| envs.contains(&(k.to_string(), v.to_string()));
+        assert!(has("NODE_EXTRA_CA_CERTS", "/var/lib/zephyr-public/ca.pem"));
+        assert!(has("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt"));
+        assert!(has(
+            "REQUESTS_CA_BUNDLE",
+            "/etc/ssl/certs/ca-certificates.crt"
+        ));
+        // Outside bridge mode `cmd` sets none of them.
+        let mut plain = Command::new("true");
+        let envs = self::envs(cmd(&mut plain));
+        assert!(!crate::egress::bridge());
+        assert!(!envs
+            .iter()
+            .any(|(k, _)| k.contains("CERT") || k.contains("CA_")));
     }
 }

@@ -803,6 +803,15 @@ save it and names the exact command. Save and manage entries:
   NAME [PROGRAM]` takes back a grant. A chat never takes a value: `/vault add` there is refused.
   Never paste a password into a chat.
 
+**A certificate error on a bound host.** For the hosts tokens are bound to, zephyr's proxy
+answers in the host's place, with a certificate from a CA that exists only in this container and
+that the agent's tools are set up to trust (`zephyr doctor` lists the hosts and checks the CA). A
+program that brings its own roots or pins certificates fails there at once, and nothing leaks.
+For such a program mark the token `raw`, or bind it to a host that program does not use. If one
+that used to work fails after a long uptime, restart with `zephyr up`: the CA is renewed only
+when the container starts. Never bind a token to a model provider's host: the agent's own
+connection to the provider would stop.
+
 Names: a login is lowercase (`github`, `my-bank`), a token is an environment variable name
 (`GH_TOKEN`). The vault is for the main conversation; background tasks and jobs cannot use it.
 The file is not encrypted (a passphrase would stop unattended restarts), and the daemon reads it

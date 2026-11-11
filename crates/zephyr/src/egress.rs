@@ -12,6 +12,7 @@ use hyper_util::rt::TokioIo;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
@@ -1459,6 +1460,37 @@ impl From<Result<(), String>> for Check {
     }
 }
 
+/// What the token broker keeps from the agent (DESIGN §4.21), tried as whoever runs this: its
+/// keys under `state` must not open, and nothing may be put into the folders `trust` that the
+/// agent's tools take their roots from.
+fn broker_reach(state: &Path, trust: &[&str]) -> Vec<(String, Check)> {
+    let mut checks = Vec::new();
+    let keys = [state.join("ca/ca.key"), state.join(crate::broker::KEY_FILE)];
+    for key in keys {
+        let check = match std::fs::File::open(&key) {
+            Err(_) => Check::Ok,
+            Ok(_) => Check::Fail("it opened".into()),
+        };
+        checks.push((format!("the agent cannot read {}", key.display()), check));
+    }
+    for dir in trust {
+        let probe = Path::new(dir).join(format!(".zephyr-probe-{}", std::process::id()));
+        let made = std::fs::File::create(&probe).is_ok();
+        let _ = std::fs::remove_file(&probe);
+        // A certificate already there must not be the agent's to rewrite either.
+        let rewrite = |name: &str| {
+            let file = Path::new(dir).join(name);
+            std::fs::OpenOptions::new().append(true).open(file).is_ok()
+        };
+        let check = match made || rewrite("ca.pem") || rewrite("ca-certificates.crt") {
+            false => Check::Ok,
+            true => Check::Fail("a file could be written there".into()),
+        };
+        checks.push((format!("the agent cannot add trust in {dir}"), check));
+    }
+    checks
+}
+
 /// `zephyr __netcheck [OWN_IP:ATTACH_PORT]`: what the agent's uid can reach, one
 /// `ok|fail|warn <what>` line per check. Run as the agent: by the daemon at start with no
 /// argument (the direct connection alone), and by `doctor` with the daemon's address, which adds
@@ -1500,6 +1532,14 @@ pub fn netcheck(args: &[String]) -> std::process::ExitCode {
             Err(e) => Check::Warn(format!("the proxy did not answer: {e}")),
         };
         checks.push(("the proxy reaches example.com:443".into(), check));
+    }
+    if let (Some(state), Some(public)) = (args.get(1), args.get(2)) {
+        let trust = [
+            "/usr/local/share/ca-certificates",
+            "/etc/ssl/certs",
+            public.as_str(),
+        ];
+        checks.extend(broker_reach(Path::new(state), &trust));
     }
     let mut code = std::process::ExitCode::SUCCESS;
     for (what, check) in checks {
@@ -2623,6 +2663,30 @@ table inet zephyr {
         for cut in 0..reply.len() {
             assert_eq!(dns_answers(&reply[..cut], 0xbeef), None, "cut at {cut}");
         }
+    }
+
+    #[test]
+    fn the_brokers_keys_and_trust_are_checked_as_the_caller() {
+        let dir = crate::test_dir("egress-broker-reach");
+        let (state, open, closed) = (dir.join("state"), dir.join("open"), dir.join("nope"));
+        std::fs::create_dir_all(state.join("ca")).unwrap();
+        std::fs::create_dir_all(&open).unwrap();
+        let fails = |checks: Vec<(String, Check)>| -> Vec<bool> {
+            let failed = |c: &(String, Check)| matches!(c.1, Check::Fail(_));
+            checks.iter().map(failed).collect()
+        };
+        // Keys that are not there cannot be read; a folder that is not there takes no file.
+        let none = broker_reach(&state, &[closed.to_str().unwrap()]);
+        assert_eq!(fails(none), [false, false, false]);
+        // A key this user can open, and a folder it can write: both are failures.
+        std::fs::write(state.join("ca/ca.key"), "k").unwrap();
+        let reached = broker_reach(&state, &[open.to_str().unwrap()]);
+        assert_eq!(fails(reached), [true, false, true]);
+        assert_eq!(
+            std::fs::read_dir(&open).unwrap().count(),
+            0,
+            "the probe is removed"
+        );
     }
 
     /// The token broker's path through the proxy (DESIGN §4.21): a host a token is bound to is

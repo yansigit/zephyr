@@ -98,6 +98,88 @@ pub fn ensure(state: &Path, now: i64) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// Where the system's trust store takes a local CA from, and what rebuilds the bundle.
+const SYSTEM_CA: &str = "/usr/local/share/ca-certificates/zephyr.crt";
+const UPDATE: &str = "/usr/sbin/update-ca-certificates";
+
+/// At a container start, before the first daemon (`supervise`): the CA is made or renewed, and
+/// installed where the agent's tools look, all of it root's. The system bundle is rebuilt from
+/// scratch, so a replaced CA is dropped from it; `<state>-public/ca.pem` is for the programs
+/// that take one file (`agent::CA_ENV`).
+pub fn start() -> anyhow::Result<()> {
+    let cfg = crate::config::Config::load(&crate::config::Config::default_path())?;
+    ensure(cfg.state_dir(), crate::now())?;
+    let public = crate::drafts::ensure_public_dir(&cfg)?;
+    publish(
+        cfg.state_dir(),
+        &public,
+        Path::new(SYSTEM_CA),
+        Path::new(UPDATE),
+    )
+}
+
+/// Copies the CA's certificate to `<public>/ca.pem` and to `system`, then runs root's own
+/// `update` (by full path, with a PATH of root's folders only).
+pub fn publish(state: &Path, public: &Path, system: &Path, update: &Path) -> anyhow::Result<()> {
+    let pem = pem(state)?;
+    crate::drafts::write_public(&public.join("ca.pem"), &pem)?;
+    std::fs::write(system, &pem).with_context(|| format!("writing {}", system.display()))?;
+    let out = std::process::Command::new(update)
+        .arg("--fresh")
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .output()
+        .with_context(|| format!("running {}", update.display()))?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    anyhow::ensure!(
+        out.status.success(),
+        "{}: {}",
+        update.display(),
+        said.trim()
+    );
+    Ok(())
+}
+
+/// Chromium keeps its own trust: the NSS store in the agent's home, which root never writes.
+/// Once per daemon start `certutil` adds the CA there, run as the agent; a root added there is
+/// exempt from Chromium's built-in pins. A failure only means a certificate error in the
+/// browser on a bound host.
+pub fn trust_chromium(cfg: &crate::config::Config) -> anyhow::Result<()> {
+    const CERTUTIL: &str = "/usr/bin/certutil";
+    let db = cfg.home.join(".pki/nssdb");
+    let fresh = {
+        let _fs = crate::agent::fs();
+        std::fs::create_dir_all(&db).with_context(|| format!("making {}", db.display()))?;
+        !db.join("cert9.db").exists()
+    };
+    let store = format!("sql:{}", db.display());
+    let pem = crate::drafts::public_dir(cfg).join("ca.pem");
+    let run = |args: &[&str]| -> anyhow::Result<bool> {
+        let mut cmd = std::process::Command::new(CERTUTIL);
+        cmd.args(["-d", &store]).args(args).env("HOME", &cfg.home);
+        let out = crate::agent::cmd(&mut cmd)
+            .output()
+            .context("running certutil")?;
+        Ok(out.status.success())
+    };
+    if fresh {
+        run(&["-N", "--empty-password"])?;
+    }
+    // The one before a renewal goes first; there is none on a first start.
+    run(&["-D", "-n", "zephyr"])?;
+    let added = run(&[
+        "-A",
+        "-n",
+        "zephyr",
+        "-t",
+        "C,,",
+        "-i",
+        &pem.to_string_lossy(),
+    ])?;
+    anyhow::ensure!(added, "certutil did not add the CA to {}", db.display());
+    Ok(())
+}
+
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
@@ -323,5 +405,37 @@ pub(crate) mod tests {
         let leaf = planted.leaf("api.github.com", crate::now()).unwrap();
         let refused = handshake(leaf, public_roots(), "api.github.com", &["http/1.1"]).await;
         assert!(refused.is_err());
+    }
+    #[test]
+    fn publish_installs_the_certificate_and_rebuilds_the_bundle() {
+        let state = crate::test_dir("ca-publish");
+        ensure(&state, NOW).unwrap();
+        let public = state.join("public");
+        let system = state.join("zephyr.crt");
+        // A stand-in for update-ca-certificates: it records how it was run.
+        let update = state.join("update");
+        let ran = state.join("ran");
+        let script = format!("#!/bin/sh\necho \"$@ $PATH\" > {}\n", ran.display());
+        std::fs::write(&update, script).unwrap();
+        std::fs::set_permissions(&update, std::fs::Permissions::from_mode(0o755)).unwrap();
+        publish(&state, &public, &system, &update).unwrap();
+        let pem = pem(&state).unwrap();
+        assert_eq!(std::fs::read_to_string(public.join("ca.pem")).unwrap(), pem);
+        assert_eq!(std::fs::read_to_string(&system).unwrap(), pem);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            (mode(&public), mode(&public.join("ca.pem"))),
+            (0o755, 0o644)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ran).unwrap().trim(),
+            "--fresh /usr/sbin:/usr/bin:/sbin:/bin"
+        );
+        // The key is published nowhere.
+        assert!(!pem.contains("PRIVATE KEY"));
+        // A failing update is an error, not a silent half-install.
+        std::fs::write(&update, "#!/bin/sh\necho no >&2\nexit 1\n").unwrap();
+        let e = publish(&state, &public, &system, &update).unwrap_err();
+        assert!(format!("{e:#}").ends_with(": no"), "{e:#}");
     }
 }

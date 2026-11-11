@@ -610,11 +610,175 @@ pub fn upgrade_notice(cfg: &Config) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// How a line of `doctor` reads.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Level {
+    Ok,
+    Warn,
+    Fail,
+}
+
+/// `doctor`'s lines for the broker: the CA and where it is installed, that `mcp.json` holds no
+/// brokered secret, which hosts are decrypted, and everything that still reaches the agent in
+/// plain. `floor` is whether the container runs under the network floor; `bundle` is the
+/// system's trust bundle.
+pub fn doctor(
+    cfg: &Config,
+    floor: bool,
+    now: i64,
+    bundle: &std::path::Path,
+) -> Vec<(Level, String)> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut out = Vec::new();
+    let mut say = |level: Level, text: String| out.push((level, text));
+    if !floor {
+        say(
+            Level::Warn,
+            "token broker off (host networking): vault tokens reach the agent in plain".into(),
+        );
+        return out;
+    }
+    let state = cfg.state_dir();
+    let mode = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.permissions().mode() & 0o777);
+    let ca = crate::ca::dir(state);
+    let private = matches!(mode(&ca), Ok(0o700)) && matches!(mode(&ca.join("ca.key")), Ok(0o600));
+    match (crate::ca::days_left(state, now), private) {
+        (Err(e), _) => say(Level::Fail, format!("the token broker has no CA: {e:#}")),
+        (Ok(_), false) => say(
+            Level::Fail,
+            format!("{} must be 0700 and its ca.key 0600", ca.display()),
+        ),
+        (Ok(days), true) if days < 30 => say(
+            Level::Warn,
+            format!("the token broker's CA has {days} days left: restart with zephyr up"),
+        ),
+        (Ok(days), true) => say(
+            Level::Ok,
+            format!("the token broker's CA is the daemon's alone and has {days} days left"),
+        ),
+    }
+    if let Ok(pem) = crate::ca::pem(state) {
+        let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+        let holds = |p: &std::path::Path| {
+            let text = std::fs::read_to_string(p).unwrap_or_default();
+            let joined: String = text.lines().collect();
+            !body.is_empty() && joined.contains(&body)
+        };
+        let public = crate::drafts::public_dir(cfg).join("ca.pem");
+        for (path, what) in [(bundle, "the system bundle"), (public.as_path(), "ca.pem")] {
+            let level = if holds(path) { Level::Ok } else { Level::Fail };
+            let not = if level == Level::Ok { "" } else { " not" };
+            say(
+                level,
+                format!("the CA is{not} in {what} ({})", path.display()),
+            );
+        }
+    }
+    let key = cfg.state_dir().join(KEY_FILE);
+    if key.exists() && !matches!(mode(&key), Ok(0o600)) {
+        say(Level::Fail, format!("{} must be 0600", key.display()));
+    }
+    // What the agent can read must hold no secret the proxy is there to keep from it.
+    let env = crate::drafts::secrets(cfg);
+    let published = std::fs::read_to_string(crate::drafts::mcp_path(cfg)).unwrap_or_default();
+    let mut leaked = Vec::new();
+    for m in (cfg.mcp.iter()).filter(|m| m.secrets.as_deref() != Some("plain")) {
+        for name in connector_names(m).0 {
+            let value = env.iter().find(|(k, _)| *k == name).map(|(_, v)| v);
+            if value.is_some_and(|v| v.len() >= 4 && published.contains(v.as_str())) {
+                leaked.push(format!("{name} ({})", m.name));
+            }
+        }
+    }
+    match leaked.is_empty() {
+        true => say(Level::Ok, "mcp.json holds no brokered secret".into()),
+        false => say(
+            Level::Fail,
+            format!("mcp.json holds the real secret {}", leaked.join(", ")),
+        ),
+    }
+    let vault = match Vault::load(&crate::vault::path(cfg)) {
+        Ok(vault) => vault,
+        Err(e) => {
+            say(Level::Fail, format!("{e:#}"));
+            return out;
+        }
+    };
+    match key_for_doctor(cfg, &vault, &env) {
+        Ok(hosts) if hosts.is_empty() => {
+            say(Level::Ok, "no host is decrypted: no token is bound".into())
+        }
+        Ok(hosts) => say(
+            Level::Ok,
+            format!(
+                "zephyr decrypts, for every program of the agent's: {}",
+                hosts.join(", ")
+            ),
+        ),
+        Err(e) => say(Level::Fail, format!("{e:#}")),
+    }
+    for e in vault.entries().iter().filter(|e| e.kind == Kind::Token) {
+        let name = &e.name;
+        if e.raw {
+            say(
+                Level::Warn,
+                format!("the token {name} is raw: the agent's programs get the real value"),
+            );
+        } else if e.hosts.is_empty() {
+            say(Level::Warn, format!("the token {name} is bound to no host, so it cannot be used: /vault bind {name} HOST.."));
+        } else if e.url {
+            say(
+                Level::Warn,
+                format!("the token {name} is also swapped in URLs, which a server may repeat back"),
+            );
+        }
+    }
+    for m in &cfg.mcp {
+        let name = &m.name;
+        if m.secrets.as_deref() == Some("plain") && !connector_names(m).0.is_empty() {
+            say(
+                Level::Warn,
+                format!("the connector {name} holds its real secrets (secrets = \"plain\")"),
+            );
+        } else if nowhere(m) {
+            say(
+                Level::Warn,
+                format!(
+                    "the connector {name} is left out: it names a secret and no host to send it to"
+                ),
+            );
+        }
+    }
+    if !cfg.agent.env.is_empty() {
+        let names = cfg.agent.env.join(", ");
+        say(
+            Level::Warn,
+            format!("[agent] env hands every command of the agent the real {names}"),
+        );
+    }
+    out
+}
+
+/// The decrypted hosts, for `doctor`; a key that cannot be read is its own failure.
+fn key_for_doctor(
+    cfg: &Config,
+    vault: &Vault,
+    env: &[(String, String)],
+) -> anyhow::Result<Vec<String>> {
+    let key = key(cfg).context("the token broker's key")?;
+    let hosts = Map::build(cfg, vault, env, &key).hosts();
+    Ok(hosts
+        .iter()
+        .map(|h| crate::vault::shown(h).to_string())
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
+    use std::os::unix::fs::PermissionsExt;
 
     const KEY: [u8; 32] = [7; 32];
     const A_VALUE: &str = "ghp_realA0123456789";
@@ -880,7 +1044,6 @@ mod tests {
 
     #[test]
     fn the_key_is_made_once_and_private() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = crate::test_dir("broker-key");
         let cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = {dir:?}\n")).unwrap();
         let vault = vault();
@@ -962,5 +1125,107 @@ mod tests {
                 vec!["URL_KEY".to_string()]
             )
         );
+    }
+    #[test]
+    fn doctor_lists_decrypted_hosts_and_warns_about_plain_secrets() {
+        let dir = crate::test_dir("broker-doctor");
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let cfg: Config = toml::from_str(&format!(
+            "rpi = '/r'\nhome = {dir:?}\nstate = {state:?}\n[agent]\nenv = ['OPENAI_API_KEY']\n\
+             [[mcp]]\nname = 'docs'\nurl = 'https://docs.test/mcp'\nheaders = {{ A = '${{DOCS_TOKEN}}' }}\n\
+             [[mcp]]\nname = 'db'\ncommand = 'db'\nenv = {{ P = '${{DB_PASSWORD}}' }}\nsecrets = 'plain'\n\
+             [[mcp]]\nname = 'local'\ncommand = 'srv'\nenv = {{ K = '${{DOCS_TOKEN}}' }}\n"
+        ))
+        .unwrap();
+        let bundle = dir.join("bundle.crt");
+        let text = |lines: &[(Level, String)]| -> String {
+            let line = |(l, t): &(Level, String)| format!("{l:?} {t}\n");
+            lines.iter().map(line).collect()
+        };
+        // Under host networking: the one line, and nothing else is looked at.
+        assert_eq!(
+            doctor(&cfg, false, 0, &bundle),
+            [(
+                Level::Warn,
+                "token broker off (host networking): vault tokens reach the agent in plain".into()
+            )]
+        );
+        // No CA yet: a failure, by name.
+        let now = crate::now();
+        assert!(
+            text(&doctor(&cfg, true, now, &bundle)).starts_with("Fail the token broker has no CA")
+        );
+        crate::ca::ensure(&state, now).unwrap();
+        let pem = crate::ca::pem(&state).unwrap();
+        std::fs::write(
+            &bundle,
+            format!("-----BEGIN CERTIFICATE-----\nother\n-----END CERTIFICATE-----\n{pem}"),
+        )
+        .unwrap();
+        let public = crate::drafts::ensure_public_dir(&cfg).unwrap();
+        std::fs::write(public.join("ca.pem"), &pem).unwrap();
+        std::fs::write(
+            cfg.secrets_path(),
+            "DOCS_TOKEN=real-docs-token\nDB_PASSWORD=real-db-password\n",
+        )
+        .unwrap();
+        std::fs::write(
+            crate::vault::path(&cfg),
+            "[[token]]\nname = \"BOUND\"\nvalue = \"v-bound-1\"\nhosts = [\"api.x.test:443\", \"x.test:8443\"]\n\
+             [[token]]\nname = \"RAW\"\nvalue = \"v-raw-12\"\nraw = true\n\
+             [[token]]\nname = \"URL\"\nvalue = \"v-url-12\"\nhosts = [\"u.test:443\"]\nurl = true\n\
+             [[token]]\nname = \"LOOSE\"\nvalue = \"v-loose-1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            crate::drafts::mcp_path(&cfg),
+            "{\"mcpServers\": {\"db\": \"real-db-password\"}}",
+        )
+        .unwrap();
+        let said = text(&doctor(&cfg, true, now, &bundle));
+        for line in [
+            "Ok the token broker's CA is the daemon's alone and has 397 days left\n",
+            "Ok the CA is in the system bundle (",
+            "Ok the CA is in ca.pem (",
+            "Ok mcp.json holds no brokered secret\n",
+            "Ok zephyr decrypts, for every program of the agent's: api.x.test, docs.test, u.test, x.test:8443\n",
+            "Warn the token RAW is raw: the agent's programs get the real value\n",
+            "Warn the token URL is also swapped in URLs",
+            "Warn the token LOOSE is bound to no host, so it cannot be used: /vault bind LOOSE HOST..\n",
+            "Warn the connector db holds its real secrets (secrets = \"plain\")\n",
+            "Warn the connector local is left out: it names a secret and no host to send it to\n",
+            "Warn [agent] env hands every command of the agent the real OPENAI_API_KEY\n",
+        ] {
+            assert!(said.contains(line), "{line} not in:\n{said}");
+        }
+        assert!(!said.contains("Fail"), "{said}");
+        for hidden in [
+            "v-bound-1",
+            "v-raw-12",
+            "real-docs-token",
+            "real-db-password",
+            "zsur_",
+        ] {
+            assert!(!said.contains(hidden), "{hidden} in:\n{said}");
+        }
+        // The published file holding a brokered secret is a failure; so is a CA that is not
+        // installed, or a key folder others may enter.
+        std::fs::write(crate::drafts::mcp_path(&cfg), "Bearer real-docs-token").unwrap();
+        std::fs::write(&bundle, "").unwrap();
+        std::fs::set_permissions(
+            crate::ca::dir(&state),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let said = text(&doctor(&cfg, true, now, &bundle));
+        for line in [
+            "Fail mcp.json holds the real secret DOCS_TOKEN (docs)",
+            "Fail the CA is not in the system bundle (",
+            "must be 0700 and its ca.key 0600\n",
+        ] {
+            assert!(said.contains(line), "{line} not in:\n{said}");
+        }
+        assert!(!said.contains("real-docs-token"), "{said}");
     }
 }
