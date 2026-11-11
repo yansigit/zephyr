@@ -2107,6 +2107,26 @@ mod tests {
                 text.contains("Never upload"),
                 "{name}: it publishes nothing"
             );
+            // Review of #53, 5: what renders Markdown escapes its raw HTML, and Chromium prints
+            // it with no network and no JavaScript (the behaviour is checked in the image).
+            for (path, bytes) in &files {
+                let code = String::from_utf8_lossy(bytes);
+                if code.contains("MarkdownIt(") {
+                    assert!(
+                        code.contains(r#"MarkdownIt("commonmark", {"html": False})"#),
+                        "{path}"
+                    );
+                }
+                if code.contains("--print-to-pdf") {
+                    for flag in [
+                        "--proxy-server=127.0.0.1:9",
+                        "--host-resolver-rules=MAP * ~NOTFOUND",
+                        "--blink-settings=scriptEnabled=false",
+                    ] {
+                        assert!(code.contains(flag), "{name}/{path}: no {flag}");
+                    }
+                }
+            }
             // Libraries fetched on first use are pinned to the exact version.
             for with in text.split("--with ").skip(1) {
                 let spec = with.split_whitespace().next().unwrap();

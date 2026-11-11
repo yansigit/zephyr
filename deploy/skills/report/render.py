@@ -3,6 +3,10 @@
 Markdown (headings, tables, code, strikethrough, local images) becomes HTML with markdown-it-py
 and this folder's style.css, then Chromium prints it. With --slides, each part between lines
 that are exactly `---` is one 16:9 page.
+
+The Markdown is not trusted (it may hold text from a web page): raw HTML in it is escaped, never
+passed through, and Chromium prints with JavaScript off and no network, so a `<script>` does not
+run and a remote image is not fetched. Local images still print.
 """
 
 import html
@@ -30,7 +34,7 @@ def slides_of(text):
 
 
 def page(source, slides):
-    md = MarkdownIt("commonmark").enable(["table", "strikethrough"])
+    md = MarkdownIt("commonmark", {"html": False}).enable(["table", "strikethrough"])
     text = source.read_text(encoding="utf-8")
     title = html.escape(source.stem)
     if slides:
@@ -70,6 +74,12 @@ def main(argv):
                 "--disable-gpu",
                 f"--user-data-dir={tmp}/profile",
                 "--no-pdf-header-footer",
+                # No network at all: a proxy that refuses, and no name resolves.
+                "--proxy-server=127.0.0.1:9",
+                "--proxy-bypass-list=<-loopback>",
+                "--host-resolver-rules=MAP * ~NOTFOUND",
+                "--disable-background-networking",
+                "--blink-settings=scriptEnabled=false",
                 f"--print-to-pdf={out}",
                 doc.as_uri(),
             ],
