@@ -136,9 +136,17 @@ impl Vnc {
         }
     }
 
+    /// The socket opened or closed, or a take started the wait over: the watchdog is woken, as
+    /// its next time may now be sooner.
     fn note(&self, f: impl FnOnce(&mut Seen)) {
         f(&mut self.seen.lock().unwrap_or_else(|e| e.into_inner()));
         self.moved.notify_one();
+    }
+
+    /// The owner sent a key or the pointer, hundreds of times a second in a drag: only the time
+    /// moves. It can only put the watchdog's next time later, which it sees when its sleep ends.
+    fn input(&self) {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).input = Instant::now();
     }
 
     fn seen(&self) -> Seen {
@@ -353,7 +361,7 @@ async fn bridge<S>(
                 frame = frames.next() => match frame {
                     Some(Ok(Message::Binary(bytes))) => {
                         if is_input(&bytes) {
-                            hub.vnc.note(|seen| seen.input = Instant::now());
+                            hub.vnc.input();
                         }
                         let sent = tokio::time::timeout(WRITE_WAIT, to_vnc.write_all(&bytes));
                         if !matches!(sent.await, Ok(Ok(()))) {
@@ -499,6 +507,24 @@ mod tests {
             due(&cfg, started, seen(59, Some(59))),
             (started + min * 60, CAP)
         );
+    }
+
+    #[tokio::test]
+    async fn input_moves_the_idle_time_without_waking_the_watchdog() {
+        use futures_util::FutureExt;
+        let cfg: Config = toml::from_str("rpi = '/r'\nhome = '/h'\n").unwrap();
+        let vnc = Vnc::new();
+        let started = Instant::now();
+        let first = due(&cfg, started, vnc.seen());
+        vnc.input();
+        // The watchdog's sleep is not cut short, and when it ends it finds a later time.
+        assert!(vnc.moved.notified().now_or_never().is_none(), "woken");
+        let moved = due(&cfg, started, vnc.seen());
+        assert!(moved.0 >= first.0 && moved.1 == IDLE, "{moved:?}");
+        // The socket closing can make it sooner: that wakes it.
+        vnc.note(|seen| seen.closed = Some(Instant::now()));
+        assert!(vnc.moved.notified().now_or_never().is_some());
+        assert_eq!(due(&cfg, started, vnc.seen()).1, GONE);
     }
 
     #[test]
