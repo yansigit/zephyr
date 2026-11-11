@@ -925,7 +925,8 @@ deploy/release.sh --cli   # only the host CLI changed: reinstall it, publish not
 Every PR runs fmt, clippy (`-D warnings`, Rust 1.95 as the image) and the tests, and `cargo deny check
 advisories bans` (`.github/workflows/ci.yml`). The script stops at the first problem. It runs fmt,
 clippy and the tests, then the real-rpi suite (`ZEPHYR_REAL_RPI=1 cargo test -- --ignored`, which
-fails rather than skips when the pinned binary is missing) when the binary is on this machine, sets the version in
+fails rather than skips when the pinned binary is missing) when the binary is on this machine
+(`RPI_BIN=<path>` points it at another copy; the default is the pinned path), sets the version in
 `Cargo.toml` (the CLI pulls `ghcr.io/yansigit/zephyr:<version>`), commits and tags `v<version>`,
 pushes, and waits for the image workflow. Then it installs the CLI into `~/.cargo/bin` (from the
 clean tree, so nothing uncommitted ships) and runs `zephyr upgrade <version>`.
@@ -950,7 +951,8 @@ before it pushes, and tags `:<version>` and `:latest` and runs on GitHub-hosted 
 Actions minutes run out, start the fallback runner on this machine once with
 `deploy/runner/start.sh up`, then `gh variable set ZEPHYR_RUNNER --body zephyr-local` and
 `gh run rerun <id>`; `gh variable delete ZEPHYR_RUNNER` switches back, and
-`deploy/runner/start.sh down` removes it. The runner and its rootless BuildKit sit on their own
+`deploy/runner/start.sh down` removes it. The runners register with `yansigit/zephyr`, or with
+`ZEPHYR_GH_REPO=<owner/repo>` for a fork. The runner and its rootless BuildKit sit on their own
 Docker network with no Docker socket, no access to the host's files and no route to its
 localhost; services the host serves on all interfaces (SSH, ComfyUI, ...) are still reachable.
 `gh workflow run image.yml --ref <branch>` builds a test image (`:dev`) without pushing it.

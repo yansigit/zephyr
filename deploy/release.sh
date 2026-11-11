@@ -27,8 +27,8 @@ cargo clippy -q --all-targets -- -D warnings
 cargo test -q
 
 step "testing against the pinned rpi"
-# The ignored tests drive the real binary at this fixed path (the tests' RPI consts).
-rpi=/home/user/Projects/.always-on/rpi-0.21.2/bin/rpi
+# The ignored tests drive the real binary: $RPI_BIN, else this fixed path (the tests' RPI consts).
+rpi=${RPI_BIN:-/home/user/Projects/.always-on/rpi-0.21.2/bin/rpi}
 if [ ! -x "$rpi" ] && [ "$(uname -m)" = x86_64 ]; then
   # The pin moves with each rpi-bump merge: fetch the Dockerfile's release, checked as it checks it.
   v=$(sed -n 's/^ARG RPI_VERSION=//p' deploy/Dockerfile)
@@ -42,6 +42,7 @@ if [ ! -x "$rpi" ] && [ "$(uname -m)" = x86_64 ]; then
   rm -rf "$t"
 fi
 if [ -x "$rpi" ]; then
+  export RPI_BIN="$rpi"
   ZEPHYR_REAL_RPI=1 cargo test --workspace -- --ignored
 else
   echo "warning: $rpi is missing, so the real-rpi tests did not run" >&2

@@ -9,7 +9,8 @@
 # stop there: never switch to a privileged builder.
 set -euo pipefail
 
-repo=yansigit/zephyr
+# The repository the runners register with; a fork names its own.
+repo=${ZEPHYR_GH_REPO:-yansigit/zephyr}
 net=zephyr-ci
 builder=zephyr-buildkitd
 cache=zephyr-buildkit-cache

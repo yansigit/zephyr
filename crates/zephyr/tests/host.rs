@@ -3241,6 +3241,32 @@ fn host_edits_keep_what_the_daemon_wrote_meanwhile() {
     assert!(env.config().contains(edit), "{}", env.config());
 }
 
+/// release.sh takes the rpi binary from `RPI_BIN` and the runner its repo from `ZEPHYR_GH_REPO`;
+/// unset, each is today's value, and bump-rpi.sh's rewrite of the pinned path still matches.
+#[test]
+fn release_and_runner_scripts_keep_their_defaults() {
+    let deploy = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy"));
+    for script in ["release.sh", "runner/start.sh", "bump-rpi.sh"] {
+        let ok = Command::new("bash")
+            .arg("-n")
+            .arg(deploy.join(script))
+            .status();
+        assert!(ok.unwrap().success(), "{script}");
+    }
+    let release = read(&deploy.join("release.sh"));
+    assert!(
+        release.contains("rpi=${RPI_BIN:-/home/user/Projects/.always-on/rpi-0.21.2/bin/rpi}"),
+        "{release}"
+    );
+    assert!(release.contains("export RPI_BIN=\"$rpi\""), "{release}");
+    let runner = read(&deploy.join("runner/start.sh"));
+    assert!(
+        runner.contains("repo=${ZEPHYR_GH_REPO:-yansigit/zephyr}"),
+        "{runner}"
+    );
+    assert!(read(&deploy.join("bump-rpi.sh")).contains("rpi-$old/bin/rpi"));
+}
+
 /// Every file the image copies from the build context is let back in by `.dockerignore`
 /// (`*`, then `!PATH` per allowed path): one left out fails `docker build` at that COPY.
 #[test]
