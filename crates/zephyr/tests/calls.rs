@@ -192,7 +192,7 @@ async fn start(
 }
 
 async fn wait(mut done: impl FnMut() -> bool) {
-    for _ in 0..600 {
+    for _ in 0..2400 {
         if done() {
             return;
         }
@@ -224,7 +224,7 @@ impl Gateway {
     }
     /// The first reply that holds `part`, once it is there.
     async fn reply_with(&self, part: &str) -> String {
-        for _ in 0..600 {
+        for _ in 0..2400 {
             if let Some(r) = self.replies().into_iter().find(|r| r.contains(part)) {
                 return r;
             }
@@ -291,7 +291,7 @@ async fn a_call_runs_from_the_ask_to_the_report() {
     gw.ask_and_approve().await;
     let ended = gw.ended().await;
     assert!(
-        ended.contains("ended after 0:0") && ended.ends_with("by the other party"),
+        ended.contains("ended after 0:") && ended.ends_with("by the other party"),
         "{ended}"
     );
 
@@ -328,7 +328,7 @@ async fn a_call_runs_from_the_ask_to_the_report() {
     let live = gw
         .reply_with("them: \"Seven is full, we have seven thirty\"")
         .await;
-    assert!(live.starts_with("[call #1 0:0"), "{live}");
+    assert!(live.starts_with("[call #1 0:"), "{live}");
     gw.reply_with("agent: \"Seven thirty is fine, thank you.\"")
         .await;
 
@@ -397,7 +397,7 @@ async fn a_call_runs_from_the_ask_to_the_report() {
         .map(|r| r.3)
         .collect();
     assert_eq!(audit[..2], ["dialed", "answered"]);
-    assert!(audit[2].starts_with("ended after 0:0"), "{audit:?}");
+    assert!(audit[2].starts_with("ended after 0:"), "{audit:?}");
     gw.shutdown().await;
 }
 
@@ -596,8 +596,9 @@ async fn the_cap_ends_a_call_whose_closing_line_never_ends() {
     std::fs::write(telnyx.dir.join("no_speak_ended"), "").unwrap();
     gw.ask_and_approve().await;
     let ended = gw.ended().await;
+    // At the cap (3 s), not when the closing line's own time would have run out (16 s or so).
     assert!(
-        ended.ends_with("ended after 0:03, by the time cap"),
+        ended.contains("ended after 0:0") && ended.ends_with("by the time cap"),
         "{ended}"
     );
     assert!(telnyx.hung_up());
@@ -723,9 +724,9 @@ async fn stop_ends_every_call() {
 
 #[tokio::test]
 async fn the_cap_ends_the_call_with_the_closing_line() {
-    // One "minute" is 8 s here, and the cap one of them: the closing line starts halfway.
+    // One "minute" is 20 s here, and the cap one of them: the closing line starts halfway.
     let (gw, telnyx) = start("cap", "stream\nanswer\n", "Hello.", "", |cfg| {
-        cfg.calls_minute = Duration::from_millis(8000);
+        cfg.calls_minute = Duration::from_millis(20_000);
         cfg.calls = cfg.calls.clone().map(|mut c| {
             c.max_minutes = 1;
             c

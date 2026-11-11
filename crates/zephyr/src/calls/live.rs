@@ -117,7 +117,14 @@ pub struct Start {
 pub struct Calls {
     live: Arc<Mutex<HashMap<i64, Slot>>>,
     starts: mpsc::UnboundedSender<Start>,
+    /// Webhooks that came for a call whose dial has not answered the daemon yet: Telnyx can
+    /// post `call.answered` before its answer to the dial is read. Given to the call once its
+    /// id is known (`set_ref`).
+    early: Arc<Mutex<Vec<telnyx::Hook>>>,
 }
+
+/// The most early webhooks kept.
+const MAX_EARLY: usize = 32;
 
 impl Calls {
     /// A registry nothing runs: a start is refused.
@@ -132,6 +139,7 @@ impl Calls {
         let calls = Calls {
             live: Arc::default(),
             starts,
+            early: Arc::default(),
         };
         (calls, rx)
     }
@@ -237,8 +245,17 @@ impl Calls {
         let live = self.lock();
         let Some(slot) = (live.values()).find(|s| s.provider_ref.as_deref() == Some(&hook.call))
         else {
+            // Maybe for the call being dialled right now: kept until its id is known.
+            let mut early = self.early.lock().unwrap_or_else(|e| e.into_inner());
+            if live.values().any(|s| s.provider_ref.is_none()) && early.len() < MAX_EARLY {
+                early.push(hook);
+            }
             return;
         };
+        Self::deliver(slot, hook);
+    }
+
+    fn deliver(slot: &Slot, hook: telnyx::Hook) {
         let _ = match (hook.kind.as_str(), hook.transcript) {
             ("call.answered", _) => slot.tx.send(Event::Answered),
             ("call.hangup", _) => slot.tx.send(Event::TheirHangup),
@@ -275,9 +292,17 @@ impl Calls {
         let _ = tokio::time::timeout(limit, over).await;
     }
 
+    /// Call `id` was dialled and is `provider_ref` at the provider. Webhooks that came for
+    /// it before this are delivered now, in order; the rest of the early ones are dropped.
     fn set_ref(&self, id: i64, provider_ref: &str) {
-        if let Some(slot) = self.lock().get_mut(&id) {
-            slot.provider_ref = Some(provider_ref.to_string());
+        let mut live = self.lock();
+        let Some(slot) = live.get_mut(&id) else {
+            return;
+        };
+        slot.provider_ref = Some(provider_ref.to_string());
+        let early = std::mem::take(&mut *self.early.lock().unwrap_or_else(|e| e.into_inner()));
+        for hook in early.into_iter().filter(|h| h.call == provider_ref) {
+            Self::deliver(slot, hook);
         }
     }
 
@@ -1310,5 +1335,48 @@ async fn next_event(child: &mut Option<Child>) -> Option<Value> {
     match child.as_mut() {
         Some(child) => child.events.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hook(kind: &str, call: &str) -> telnyx::Hook {
+        telnyx::Hook {
+            kind: kind.into(),
+            call: call.into(),
+            transcript: None,
+        }
+    }
+
+    /// Telnyx may post `call.answered` before the daemon has read the dial's answer and knows
+    /// the call's id (seen in the side container): the webhook is kept and given to the call
+    /// once it does, never lost; one for another call is not.
+    #[test]
+    fn a_webhook_that_beats_the_dials_answer_is_kept_for_the_call() {
+        let (calls, _starts) = Calls::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let slot = Slot {
+            token: "t".into(),
+            taken: false,
+            provider_ref: None,
+            tx,
+        };
+        calls.lock().insert(7, slot);
+        calls.event(hook("call.answered", "v3:abc"));
+        calls.event(hook("call.hangup", "v3:someone-else"));
+        assert!(rx.try_recv().is_err(), "nothing is known of v3:abc yet");
+        calls.set_ref(7, "v3:abc");
+        assert!(matches!(rx.try_recv(), Ok(Event::Answered)));
+        assert!(
+            rx.try_recv().is_err(),
+            "the other call's hang-up is not this one's"
+        );
+        // From here on its webhooks go straight to it, and none is kept.
+        calls.event(hook("call.hangup", "v3:abc"));
+        assert!(matches!(rx.try_recv(), Ok(Event::TheirHangup)));
+        calls.event(hook("call.answered", "v3:late"));
+        assert!(calls.early.lock().unwrap().is_empty());
     }
 }

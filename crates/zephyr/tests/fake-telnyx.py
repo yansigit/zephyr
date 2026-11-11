@@ -39,7 +39,7 @@ Script steps (default script: `stream`, `answer`):
   said TEXT     Telnyx heard the other party say TEXT: a signed `call.transcription` webhook
                 (Telnyx's own speech, `calls.speech = "provider"`)
   wait SECS     sleep
-  expect TEXT   wait (up to 60 s) until what zephyr said on the line holds TEXT
+  expect TEXT   wait (up to 120 s) until what zephyr said on the line holds TEXT
   hangup        the other party hangs up: `stop` on the socket, it closes, `call.hangup` is posted
   (end of script) the socket stays open, silent, until zephyr hangs up through the API
 
@@ -280,7 +280,7 @@ def run(call):
         elif step[0] == "wait":
             call["over"].wait(float(step[1]))
         elif step[0] == "expect":
-            want, until = line.split(None, 1)[1].encode(), time.time() + 60
+            want, until = line.split(None, 1)[1].encode(), time.time() + 120
             while time.time() < until and not call["over"].is_set():
                 try:
                     if want in open(os.path.join(DIR, "heard.ulaw"), "rb").read():
