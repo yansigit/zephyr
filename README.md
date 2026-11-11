@@ -652,8 +652,24 @@ Images and files you send on Discord, iMessage, Telegram or Signal are saved for
 `~/.zephyr/inbox/` (`/zephyr/inbox/` in the container), and your message tells it each file's path;
 it opens images with `read`. A message with only a photo works. Up to 10 files a message, 25 MB
 each (20 MB on Telegram, its limit for bots): anything beyond is listed but not downloaded. Only
-owners' files are downloaded. iPhone photos arrive as JPEG (BlueBubbles converts HEIC). A voice
-note is saved as a file; nothing transcribes it. Files are deleted after 30 days.
+owners' files are downloaded. iPhone photos arrive as JPEG (BlueBubbles converts HEIC). Files are deleted after 30 days.
+
+## Voice
+
+A voice note you send on Discord, iMessage, Telegram or Signal is saved like any file and transcribed on the
+machine itself, by whisper.cpp (the `small` model; nothing leaves the container). The agent
+reads it as two lines under your caption, if you typed one:
+
+```
+[attached audio: /zephyr/inbox/discord-55-1.ogg (voice note, audio/ogg, 0:12, 18 KB)]
+[transcript of the voice note above, by zephyr (ko), may be wrong: "내일 아침 9시 회의 알려줘"]
+```
+
+- A transcript is not your typed text. Speech never runs a command: saying "slash ok 3"
+  approves nothing, so approvals stay typed.
+- A note longer than `voice.max_secs` (300) is saved but not transcribed. One note is
+  transcribed at a time; a minute of speech takes about 11 s on CPU.
+- An image built with `--build-arg VOICE=0` has no voice: notes are saved as files only.
 
 ## Signal
 

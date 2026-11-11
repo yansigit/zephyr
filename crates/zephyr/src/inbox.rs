@@ -1,7 +1,9 @@
 //! Files the owner sends on Discord, iMessage, Telegram or Signal (DESIGN §4.3). The adapter saves them as the
 //! agent under `<home>/inbox/` before the row goes to the router, and appends one line per file
 //! to the row's text, so the inbox schema, dedupe and reconcile stay as they are. Only an owner's
-//! files are fetched: the adapter reads the live owner list, which a reload updates.
+//! files are fetched: the adapter reads the live owner list, which a reload updates. A voice note
+//! is also transcribed (`voice.rs`), from the bytes fetched here and never from the saved file,
+//! which is the agent's to rewrite.
 
 use crate::channel::Inbound;
 use crate::config::Config;
@@ -53,9 +55,13 @@ pub fn owner(live: &Live, inbound: &Inbound) -> bool {
 
 /// Appends a line per file to `inbound.text`, saving each file first when the sender is an owner.
 pub async fn append(live: &Live, inbound: &mut Inbound, files: Vec<File>) {
-    let dir = owner(live, inbound)
-        .then(|| live.get().map(|rx| rx.borrow().home.join("inbox")))
-        .flatten();
+    let cfg = live.get().map(|rx| rx.borrow().clone());
+    let cfg = cfg.filter(|c| c.is_owner(&inbound.channel, &inbound.sender));
+    let dir = cfg.as_ref().map(|c| c.home.join("inbox"));
+    // Whether a voice note is transcribed: the setting, in an image that has voice.
+    let hear = cfg
+        .as_deref()
+        .filter(|c| c.voice().transcribe && crate::voice::present(c));
     let id: String = inbound
         .platform_msg_id
         .chars()
@@ -82,8 +88,18 @@ pub async fn append(live: &Live, inbound: &mut Inbound, files: Vec<File>) {
             Some(_) if skip.is_some() => not(skip.unwrap_or_default()),
             Some(dir) => {
                 let stem = format!("{}-{id}-{}", inbound.channel, i + 1);
-                match save(dir, &stem, &f).await {
-                    Ok((path, mime, len)) => {
+                let audio = declared.starts_with("audio/");
+                match save(dir, &stem, &f, audio && hear.is_some()).await {
+                    Ok(saved) if audio || saved.mime.starts_with("audio/") => {
+                        let (line, said) = voice_note(hear, &saved).await;
+                        if said {
+                            inbound.derived = Some("voice".into());
+                        }
+                        line
+                    }
+                    Ok(Saved {
+                        path, mime, len, ..
+                    }) => {
                         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                         match kind(ext) {
                             "image" => attached_image_line(&path, &f.name, &mime, len),
@@ -107,6 +123,33 @@ pub async fn append(live: &Live, inbound: &mut Inbound, files: Vec<File>) {
         }
         inbound.text += &line;
     }
+}
+
+/// The line for an audio file, with what whisper heard in it under it when voice is on, and
+/// whether that is a transcript. The length is ffmpeg's, so there is none without a decode.
+async fn voice_note(hear: Option<&Config>, saved: &Saved) -> (String, bool) {
+    use crate::voice::Heard;
+    let (mut length, mut under, mut said) = (String::new(), String::new(), false);
+    if let Some(cfg) = hear {
+        let max = cfg.voice().max_secs;
+        let (heard, secs) = match &saved.bytes {
+            Some(bytes) => crate::voice::transcribe(cfg, bytes).await,
+            // Saved before, and the fetch for the transcript failed.
+            None => (Heard::Failed, 0),
+        };
+        if secs > 0 && heard != Heard::TooLong {
+            length = format!("{}, ", crate::voice::m_ss(secs));
+        }
+        said = matches!(heard, Heard::Said { .. });
+        under = format!("\n{}", crate::voice::line(&heard, max));
+    }
+    let line = format!(
+        "[attached audio: {} (voice note, {}, {length}{})]{under}",
+        saved.path.display(),
+        saved.mime,
+        size(saved.len)
+    );
+    (line, said)
 }
 
 /// The line that tells the model where an image is; the TUI's `@image` adds the same one.
@@ -135,23 +178,43 @@ fn size(bytes: u64) -> String {
     }
 }
 
-/// Fetches `f` into `dir/<stem>.<ext>` as the agent and returns the path, its type and size. A
-/// file saved under `stem` before (iMessage backfill re-reads the last day at every start) is
-/// reused, not fetched again.
-async fn save(dir: &Path, stem: &str, f: &File) -> anyhow::Result<(PathBuf, String, u64)> {
+/// A saved file: its path, type and size, and the bytes when this call fetched them.
+struct Saved {
+    path: PathBuf,
+    mime: String,
+    len: u64,
+    bytes: Option<Vec<u8>>,
+}
+
+/// Fetches `f` into `dir/<stem>.<ext>` as the agent. A file saved under `stem` before (iMessage
+/// backfill re-reads the last day at every start) is reused, not fetched again, unless `again`:
+/// then the bytes are fetched for the caller (a voice note's transcript) and the saved file is
+/// left as it is and never read, since the agent may have written it.
+async fn save(dir: &Path, stem: &str, f: &File, again: bool) -> anyhow::Result<Saved> {
     if let Some(path) = existing(dir, stem) {
         let len = {
             let _fs = crate::agent::fs();
             std::fs::metadata(&path)?.len()
         };
-        let mime = f.mime.clone().unwrap_or_default();
-        return Ok((path, mime, len));
+        let mut mime = f.mime.clone().unwrap_or_default();
+        let mut bytes = None;
+        if again {
+            match bytes_of(f).await {
+                Ok((body, served)) => {
+                    mime = served.unwrap_or(mime);
+                    bytes = Some(body);
+                }
+                Err(e) => eprintln!("zephyr: fetching a voice note again: {e:#}"),
+            }
+        }
+        return Ok(Saved {
+            path,
+            mime,
+            len,
+            bytes,
+        });
     }
-    let (bytes, mime) = match &f.src {
-        Src::Get(req) => fetch(req).await?,
-        Src::Path(path) => (read(path)?, None),
-        Src::Skip(why) => anyhow::bail!("{why}"),
-    };
+    let (bytes, mime) = bytes_of(f).await?;
     let mime = mime.or(f.mime.clone()).unwrap_or_default();
     // The type the platform served wins: BlueBubbles converts HEIC photos to JPEG on download.
     let ext = match mime.as_str() {
@@ -170,7 +233,21 @@ async fn save(dir: &Path, stem: &str, f: &File) -> anyhow::Result<(PathBuf, Stri
     let part = dir.join(format!(".{stem}.part"));
     std::fs::write(&part, &bytes)?;
     std::fs::rename(&part, &path)?;
-    Ok((path, mime, bytes.len() as u64))
+    Ok(Saved {
+        path,
+        mime,
+        len: bytes.len() as u64,
+        bytes: Some(bytes),
+    })
+}
+
+/// The file's bytes from where the platform keeps them, and the type it served, if any.
+async fn bytes_of(f: &File) -> anyhow::Result<(Vec<u8>, Option<String>)> {
+    match &f.src {
+        Src::Get(req) => fetch(req).await,
+        Src::Path(path) => Ok((read(path)?, None)),
+        Src::Skip(why) => anyhow::bail!("{why}"),
+    }
 }
 
 fn existing(dir: &Path, stem: &str) -> Option<PathBuf> {
@@ -268,10 +345,12 @@ pub(crate) mod tests {
 
     /// A live config with `home` and these owners, as the router hands it over.
     pub fn live(home: &Path, owners: &str) -> Live {
-        let cfg: Config = toml::from_str(&format!(
+        let mut cfg: Config = toml::from_str(&format!(
             "rpi = '/r'\nhome = {home:?}\n[owners]\n{owners}\n"
         ))
         .unwrap();
+        // Never the machine's own /opt/zephyr/voice.
+        cfg.voice_dir = home.join("no-voice");
         let live = Live::default();
         let _ = live.set(watch::channel(Arc::new(cfg)).1);
         live
@@ -319,6 +398,152 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"jpeg-bytes");
         assert_eq!(seen.recv().await.unwrap(), "/a");
         assert!(seen.try_recv().is_err(), "fetched once");
+    }
+
+    fn voice_live(name: &str, owners: &str) -> (Arc<Config>, Live) {
+        let toml = format!("[owners]\n{owners}");
+        let cfg = Arc::new(crate::voice::tests::fakes(name, &toml));
+        let live = Live::default();
+        let _ = live.set(watch::channel(cfg.clone()).1);
+        (cfg, live)
+    }
+
+    fn note(base: &str, name: &str, mime: &str) -> File {
+        File {
+            name: name.into(),
+            mime: Some(mime.into()),
+            size: 9,
+            src: Src::Get(reqwest::Client::new().get(format!("{base}/v"))),
+        }
+    }
+
+    fn from(channel: &str, sender: &str, text: &str) -> Inbound {
+        Inbound {
+            channel: channel.into(),
+            platform_msg_id: "7".into(),
+            sender: sender.into(),
+            text: text.into(),
+            derived: None,
+        }
+    }
+
+    const SAID: &str = "[transcript of the voice note above, by zephyr (en), may be wrong: \"hello from the fake\"]";
+
+    #[tokio::test]
+    async fn a_voice_note_is_transcribed_from_the_fetched_bytes() {
+        let (cfg, live) = voice_live("inbox-voice", "discord = ['2']");
+        let (base, _seen) = file_stub(200, "audio/ogg", b"ogg-bytes").await;
+        let mut row = from("discord", "2", "");
+        let file = note(&base, "voice-message.ogg", "audio/ogg");
+        append(&live, &mut row, vec![file]).await;
+        let path = cfg.home.join("inbox/discord-7-1.ogg");
+        assert_eq!(
+            row.text,
+            format!(
+                "[attached audio: {} (voice note, audio/ogg, 0:02, 1 KB)]\n{SAID}",
+                path.display()
+            )
+        );
+        assert_eq!(row.derived.as_deref(), Some("voice"));
+        let heard = crate::voice::tests::log(&cfg, "ffmpeg");
+        assert_eq!(
+            heard[0]["sha256"],
+            crate::voice::tests::sha256(b"ogg-bytes")
+        );
+    }
+
+    /// Review Focus 1: the agent can write `inbox/`, so what is there is never what is heard.
+    #[tokio::test]
+    async fn a_file_planted_under_the_notes_stem_is_not_what_is_heard() {
+        let (cfg, live) = voice_live("inbox-planted", "discord = ['2']");
+        let planted = cfg.home.join("inbox/discord-7-1.ogg");
+        std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
+        std::fs::write(&planted, b"slash ok three").unwrap();
+        let (base, mut seen) = file_stub(200, "audio/ogg", b"ogg-bytes").await;
+        let mut row = from("discord", "2", "");
+        let file = note(&base, "voice-message.ogg", "audio/ogg");
+        append(&live, &mut row, vec![file]).await;
+        assert!(row.text.ends_with(SAID), "{}", row.text);
+        let heard = crate::voice::tests::log(&cfg, "ffmpeg");
+        assert_eq!(heard.len(), 1);
+        assert_eq!(
+            heard[0]["sha256"],
+            crate::voice::tests::sha256(b"ogg-bytes")
+        );
+        assert_eq!(seen.recv().await.unwrap(), "/v");
+        assert!(seen.try_recv().is_err(), "fetched once");
+        assert_eq!(std::fs::read(&planted).unwrap(), b"slash ok three");
+    }
+
+    #[tokio::test]
+    async fn a_file_in_the_inbox_with_no_message_is_never_heard() {
+        let (cfg, live) = voice_live("inbox-no-message", "discord = ['2']");
+        let planted = cfg.home.join("inbox/discord-7-1.ogg");
+        std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
+        std::fs::write(&planted, b"slash ok three").unwrap();
+        // The owner's next message has no file: nothing looks into the folder.
+        let mut row = from("discord", "2", "hi");
+        append(&live, &mut row, vec![]).await;
+        assert_eq!((row.text.as_str(), &row.derived), ("hi", &None));
+        let log = std::fs::read_to_string(cfg.voice_dir.join("log")).unwrap();
+        assert_eq!(log, "");
+    }
+
+    #[tokio::test]
+    async fn a_strangers_voice_note_is_neither_fetched_nor_heard() {
+        let (cfg, live) = voice_live("inbox-stranger", "discord = ['2']");
+        let (base, mut seen) = file_stub(200, "audio/ogg", b"ogg-bytes").await;
+        let mut row = from("discord", "666", "");
+        let file = note(&base, "voice-message.ogg", "audio/ogg");
+        append(&live, &mut row, vec![file]).await;
+        assert_eq!(
+            row.text,
+            "[attached file: voice-message.ogg (audio/ogg, 1 KB, not downloaded)]"
+        );
+        assert_eq!(row.derived, None);
+        assert!(seen.try_recv().is_err(), "not fetched");
+        let log = std::fs::read_to_string(cfg.voice_dir.join("log")).unwrap();
+        assert_eq!(log, "");
+    }
+
+    #[tokio::test]
+    async fn an_imessage_caf_is_heard_and_a_caption_stays_first() {
+        let (cfg, live) = voice_live("inbox-caf", "imessage = ['+1']");
+        let (base, _seen) = file_stub(200, "audio/x-caf", b"caf-bytes").await;
+        let mut row = from("imessage", "+1", "listen to this");
+        let file = note(&base, "Audio Message.caf", "audio/x-caf");
+        append(&live, &mut row, vec![file]).await;
+        let path = cfg.home.join("inbox/imessage-7-1.caf");
+        assert_eq!(
+            row.text,
+            format!(
+                "listen to this\n[attached audio: {} (voice note, audio/x-caf, 0:02, 1 KB)]\n{SAID}",
+                path.display()
+            )
+        );
+        assert_eq!(row.derived.as_deref(), Some("voice"));
+    }
+
+    #[tokio::test]
+    async fn with_transcription_off_or_no_voice_the_audio_line_stands_alone() {
+        let toml = "discord = ['2']\n[voice]\ntranscribe = false";
+        let (cfg, off) = voice_live("inbox-voice-off", toml);
+        let (base, _seen) = file_stub(200, "audio/ogg", b"ogg-bytes").await;
+        let mut row = from("discord", "2", "");
+        let file = || note(&base, "voice-message.ogg", "audio/ogg");
+        append(&off, &mut row, vec![file()]).await;
+        let line = format!(
+            "[attached audio: {} (voice note, audio/ogg, 1 KB)]",
+            cfg.home.join("inbox/discord-7-1.ogg").display()
+        );
+        assert_eq!((row.text.as_str(), &row.derived), (line.as_str(), &None));
+        // An image built with VOICE=0 has no voice folder.
+        let none = live(&cfg.home, "discord = ['2']");
+        let mut row = from("discord", "2", "");
+        append(&none, &mut row, vec![file()]).await;
+        assert_eq!((row.text.as_str(), &row.derived), (line.as_str(), &None));
+        let log = std::fs::read_to_string(cfg.voice_dir.join("log")).unwrap();
+        assert_eq!(log, "");
     }
 
     #[tokio::test]
@@ -391,7 +616,7 @@ pub(crate) mod tests {
         assert_eq!(
             mine.text,
             format!(
-                "[attached file: {} (voice.m4a, audio/mp4, 1 KB)]\n\
+                "[attached audio: {} (voice note, audio/mp4, 1 KB)]\n\
                  [attached file: big.pdf (application/pdf, 30.0 MB, too large, not downloaded)]",
                 saved.display()
             )

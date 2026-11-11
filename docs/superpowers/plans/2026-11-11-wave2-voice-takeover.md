@@ -139,16 +139,19 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
   `[attached audio: PATH (voice note, MIME, M:SS, SIZE)]` and followed by `voice::line`. `inbound.derived = Some("voice")` only when the line is a transcript.
 - With `voice.transcribe` off or no voice in the image, the audio line stands alone and nothing runs.
 
-- [ ] **Step 1: Failing tests** in `inbox.rs` (Review Focus 1):
+- [x] **Step 1: Failing tests** in `inbox.rs` (Review Focus 1):
   - `a_voice_note_is_transcribed_from_the_fetched_bytes`: discord `audio/ogg`; the text is the two lines; `derived == Some("voice")`; the fake's sha256 is the stub body's;
   - `a_file_planted_under_the_notes_stem_is_not_what_is_heard`: write `inbox/discord-7-1.ogg` with other bytes first; the logged sha256 is the stub's, the stub was asked once, and the planted file is left as it was (never read as root);
   - `a_file_in_the_inbox_with_no_message_is_never_heard`: a planted `.ogg` and no `append`: the fake's log is empty;
   - `a_strangers_voice_note_is_neither_fetched_nor_heard`;
   - `an_imessage_caf_is_heard_and_a_caption_stays_first` (the row's text starts with the caption).
-- [ ] **Step 2: Run** `cargo test -p zephyr --lib inbox::` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** → PASS; `cargo test -p zephyr`.
-- [ ] **Step 5: Commit** `feat(inbox): append a transcript of an owner's voice note, from the bytes the daemon fetched`.
+- [x] **Step 2: Run** `cargo test -p zephyr --lib inbox::` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** → PASS; `cargo test -p zephyr`.
+- [x] **Step 5: Commit** `feat(inbox): append a transcript of an owner's voice note, from the bytes the daemon fetched`.
+- Deviation: the audio line carries `M:SS` only when ffmpeg decoded the note: with transcription off, no voice in the image, a failed decode or a note over `max_secs` (cut at `-t`, so its real length is unknown) it reads `(voice note, MIME, SIZE)`.
+- Deviation: a file already saved is fetched again only when its declared type is `audio/*` (the served type is not known before a fetch); if that fetch fails the line under it is `transcription failed`.
+- Deviation: one more test, `with_transcription_off_or_no_voice_the_audio_line_stands_alone`; `a_file_in_the_inbox_with_no_message_is_never_heard` sends a typed message with no file, so that `append` runs.
 
 ### Task C2-4: A transcript taints and is never a command; the `voice.*` settings
 
