@@ -412,6 +412,16 @@ sys.exit(os.waitstatus_to_exitcode(status))
 impl Env {
     /// `zephyr <args>` on a terminal answering `steps` (see `PTY_DRIVER`): `(code, output)`.
     fn on_a_driven_tty(&self, args: &[&str], steps: &[(&str, &str)]) -> (i32, String) {
+        self.on_a_driven_tty_env(args, steps, &[])
+    }
+
+    /// `on_a_driven_tty` with `env` set too.
+    fn on_a_driven_tty_env(
+        &self,
+        args: &[&str],
+        steps: &[(&str, &str)],
+        env: &[(&str, &str)],
+    ) -> (i32, String) {
         let path = format!(
             "{}:{}",
             self.dir.join("bin").display(),
@@ -428,6 +438,7 @@ impl Env {
             .env("ZEPHYR_CONTAINER", CONTAINER)
             .env("ZEPHYR_IMAGE", "zephyr-lanetest")
             .env("TERM", "xterm")
+            .envs(env.iter().copied())
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap();
@@ -2245,6 +2256,75 @@ fn version_names_the_cli_and_the_running_container() {
     assert_eq!(old.lines().count(), 2, "{old}");
     let stopped = env.zephyr_env(&["--version"], &[("SHIM_STATE", "exited")]);
     assert_eq!(stdout(&stopped), format!("zephyr {me}\n"));
+}
+
+/// The prompts `channel add imessage` asks, answered for a webhook on port 7791.
+const IMESSAGE_STEPS: [(&str, &str); 4] = [
+    ("Webhook listen address", "100.64.0.1:7791\n"),
+    ("BlueBubbles server URL", "http://100.64.0.2:1234\n"),
+    ("Your iMessage handles", "me@icloud.com\n"),
+    ("BlueBubbles server password (hidden)", "pw\n"),
+];
+const FORWARD_Q: &str = "Forward this machine's Tailscale port 7791 to the webhook?";
+const FORWARD: [&str; 6] = [
+    "tailscale",
+    "serve",
+    "--bg",
+    "--tcp",
+    "7791",
+    "tcp://127.0.0.1:7791",
+];
+
+/// Under the network floor BlueBubbles reaches the webhook only through `tailscale serve`, so
+/// `channel add imessage` offers the forward when it is missing, and only then.
+#[test]
+fn channel_add_imessage_offers_the_tailscale_forward() {
+    let env = Env::new("channel-forward");
+    env.init(&["--no-start"]);
+    let add = |answer: Option<&str>, vars: &[(&str, &str)]| {
+        let mut steps = IMESSAGE_STEPS.to_vec();
+        steps.extend(answer.map(|a| (FORWARD_Q, a)));
+        let (code, shown) = env.on_a_driven_tty_env(&["channel", "add", "imessage"], &steps, vars);
+        assert!(
+            shown.contains("LEFT 0"),
+            "every prompt was answered: {shown}"
+        );
+        (code, shown, env.calls())
+    };
+    let serves = |calls: &[Vec<String>]| at(calls, &["tailscale", "serve", "--bg"], "");
+
+    let (code, shown, calls) = add(Some("y"), &[]);
+    assert_eq!(code, 0, "{shown}");
+    find(&calls, &FORWARD);
+    assert!(env.config().contains("listen = \"100.64.0.1:7791\""));
+
+    // Already forwarded: not asked, not run.
+    let status = "tcp://box.tail1234.ts.net:7791 (tailnet only)\n|--> tcp://127.0.0.1:7791";
+    let (code, shown, calls) = add(None, &[("SHIM_TS_SERVE", status)]);
+    assert_eq!(code, 0, "{shown}");
+    assert!(!shown.contains(FORWARD_Q), "{shown}");
+    assert_eq!(serves(&calls), None, "{calls:#?}");
+
+    // Refused for want of operator rights: the sudo form, and the channel stays saved.
+    let (code, shown, calls) = add(Some("y"), &[("SHIM_TS_DENIED", "1")]);
+    assert_eq!(code, 0, "{shown}");
+    find(&calls, &FORWARD);
+    assert!(
+        shown.contains("sudo tailscale serve --bg --tcp 7791 tcp://127.0.0.1:7791"),
+        "{shown}"
+    );
+    assert!(env.config().contains("[imessage]"));
+
+    // Declined: the command to run later.
+    let (code, shown, calls) = add(Some("n"), &[]);
+    assert_eq!(code, 0, "{shown}");
+    assert_eq!(serves(&calls), None, "{calls:#?}");
+    assert!(
+        shown.contains(
+            "forward it later: sudo tailscale serve --bg --tcp 7791 tcp://127.0.0.1:7791"
+        ),
+        "{shown}"
+    );
 }
 
 #[test]

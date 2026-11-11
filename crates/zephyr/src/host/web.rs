@@ -70,6 +70,36 @@ fn tailnet_name() -> anyhow::Result<String> {
     Ok(name)
 }
 
+/// Whether `tailscale serve status` forwards to `target` (`http://127.0.0.1:P`,
+/// `tcp://127.0.0.1:P`). The target as a whole word: 7793 is not forwarded by a line for 77930.
+pub(super) fn forwarded(target: &str) -> bool {
+    let serve = Command::new("tailscale").args(["serve", "status"]).output();
+    let serve = serve
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    serve.split_whitespace().any(|word| word == target)
+}
+
+/// `tailscale serve ARGS`. When it is refused (this user may not manage serve), tailscale's error
+/// is printed and the error names the commands that do it, then `run AGAIN again`.
+pub(super) fn serve(args: &[&str], again: &str) -> anyhow::Result<()> {
+    let out = Command::new("tailscale")
+        .arg("serve")
+        .args(args)
+        .output()
+        .context("running tailscale serve")?;
+    if !out.status.success() {
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        bail!(
+            "tailscale serve was refused. Run it once as root, or let this user manage serve:\n  \
+             sudo tailscale serve {}\n  sudo tailscale set --operator=$USER\n\
+             then run {again} again",
+            args.join(" ")
+        );
+    }
+    Ok(())
+}
+
 /// The daemon's `zephyr set KEY VALUE`, over the chat socket: its checks, its change log.
 fn set(h: &Host, key: &str, value: &str) -> anyhow::Result<()> {
     run(&mut h.exec(&[], &[], &["zephyr", "set", key, value]))
@@ -118,18 +148,7 @@ fn setup(h: &Host, yes: bool) -> anyhow::Result<()> {
     )? {
         return Ok(());
     }
-    let serve = Command::new("tailscale")
-        .args(["serve", "--bg", &target])
-        .output()
-        .context("running tailscale serve")?;
-    if !serve.status.success() {
-        eprint!("{}", String::from_utf8_lossy(&serve.stderr));
-        bail!(
-            "tailscale serve was refused. Run it once as root, or let this user manage serve:\n  \
-             sudo tailscale serve --bg {target}\n  sudo tailscale set --operator=$USER\n\
-             then run zephyr web setup again"
-        );
-    }
+    serve(&["--bg", &target], "zephyr web setup")?;
     // 5
     println!(
         "never point tailscale funnel at this port: the web app refuses funnel traffic, and a \
@@ -201,14 +220,7 @@ pub(super) fn status(h: &Host) {
         return println!("web: {}", crate::web::NEEDS_FLOOR);
     }
     let port = conf::get(&doc, "web.port").unwrap_or_else(|| PORT.into());
-    let serve = Command::new("tailscale").args(["serve", "status"]).output();
-    let serve = serve
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default();
-    let target = format!("http://127.0.0.1:{port}");
-    // The port as a whole word: 7793 is not forwarded by a line for 77930.
-    let forwards = serve.split_whitespace().any(|word| word == target);
-    match forwards {
+    match forwarded(&format!("http://127.0.0.1:{port}")) {
         true => println!("web: tailscale serve forwards https://{host}"),
         false => println!(
             "web: tailscale serve does not forward to 127.0.0.1:{port}; run zephyr web setup"

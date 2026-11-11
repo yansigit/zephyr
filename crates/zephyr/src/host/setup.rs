@@ -1141,7 +1141,43 @@ fn channel_add(h: &Host, kind: &str) -> anyhow::Result<()> {
     for (key, raw) in sets {
         conf::set(&mut doc, key, &raw)?;
     }
-    h.data.save(&doc)
+    h.data.save(&doc)?;
+    if kind == "imessage" {
+        imessage_forward(h)?;
+    }
+    Ok(())
+}
+
+/// Under the network floor the webhook is published on this host's loopback, and BlueBubbles
+/// posts to the Tailscale address: `tailscale serve` joins them. Asked only when the forward is
+/// missing, default yes, since the channel does not work without it. A missed detection only means
+/// the question comes again; the same mapping twice is harmless.
+fn imessage_forward(h: &Host) -> anyhow::Result<()> {
+    let webhook = h
+        .published()?
+        .into_iter()
+        .find(|(k, _)| *k == "imessage.listen");
+    let (Some((_, port)), true) = (webhook, h.bridge()?) else {
+        return Ok(());
+    };
+    let (port, target) = (port.to_string(), format!("tcp://127.0.0.1:{port}"));
+    if super::web::forwarded(&target) {
+        return Ok(());
+    }
+    let question = format!("Forward this machine's Tailscale port {port} to the webhook?");
+    if !Confirm::new()
+        .with_prompt(question)
+        .default(true)
+        .interact()?
+    {
+        println!("forward it later: sudo tailscale serve --bg --tcp {port} {target}");
+        return Ok(());
+    }
+    let args = ["--bg", "--tcp", &port, &target];
+    if let Err(e) = super::web::serve(&args, "zephyr channel add imessage") {
+        println!("{e:#}");
+    }
+    Ok(())
 }
 
 const TOKEN_PREFIX: &[u8] = b"sk-ant-oat01-";

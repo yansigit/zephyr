@@ -762,9 +762,12 @@ never works.
   `127.0.0.1` only. `zephyr config set attach.port N` and `zephyr channel add|remove imessage`
   start the container again to publish the change; after a hand edit of those keys, run
   `zephyr up`.
-- **iMessage.** BlueBubbles posts to your Tailscale address, so forward that to the webhook once
-  (the `zephyr up` that moves an install over prints the line with your port): `sudo tailscale serve --bg --tcp 7791
-  tcp://127.0.0.1:7791`. `[imessage] listen` keeps naming the Tailscale address and port.
+- **iMessage.** BlueBubbles posts to your Tailscale address, so forward that to the webhook once:
+  `sudo tailscale serve --bg --tcp 7791 tcp://127.0.0.1:7791`. `zephyr channel add imessage` (and
+  `init`'s iMessage step) offers to run it for you when `tailscale serve status` does not show it
+  yet, and prints the `sudo` form when this user may not manage serve; the `zephyr up` that moves an
+  install over prints the line with your port. `[imessage] listen` keeps naming the Tailscale
+  address and port.
 - **Upgrading.** The first `zephyr up` or `zephyr upgrade` on a version with the network floor
   moves the container over and says so once. Until `tailscale serve` forwards the webhook, iMessage
   messages do not arrive (they are picked up from BlueBubbles when the daemon next starts).
