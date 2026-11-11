@@ -5,3 +5,5 @@
 !deploy/python
 !deploy/openbox
 !deploy/voice
+!deploy/connectors
+!deploy/skills
