@@ -14,6 +14,9 @@ use zephyr::config::Config;
 use zephyr::store::Store;
 use zephyr::telegram::Telegram;
 
+#[path = "fixtures/voice/fakes.rs"]
+mod voice_fakes;
+
 const TOKEN: &str = "123456:tg-SECRET-token-value";
 const SECRET: &str = "tg-SECRET-token-value";
 const ENV: &str = "ZEPHYR_TELEGRAM_IT_TOKEN";
@@ -1050,4 +1053,82 @@ async fn pairing_over_telegram_names_the_user() {
     );
     let texts: Vec<String> = rows(&home, "dropped").into_iter().map(|r| r.text).collect();
     assert_eq!(texts, ["/pair", "/pair"], "no code is kept");
+}
+
+/// A message delivered again (a batch whose confirmation was lost) is a row the router drops:
+/// it costs no `getFile` and no download.
+#[tokio::test]
+async fn a_redelivered_message_asks_for_no_file_again() {
+    let home = home("redelivered");
+    let (api, bot) = stub().await;
+    bot.lock().unwrap().files.insert(
+        "v".into(),
+        ("voice/file_1.oga".into(), b"ogg-bytes".to_vec()),
+    );
+    let voice = json!({"voice": {"file_id": "v", "file_unique_id": "u", "duration": 3,
+        "mime_type": "audio/ogg", "file_size": 9}});
+    push(&bot, [message(1, 55, 7, voice.clone())]);
+    let gw = start(config(&home, &api, ""));
+    wait(|| said(&bot, 55).len() == 1).await;
+    // The same message under a new update, then one more to know the first was passed by.
+    push(&bot, [message(2, 55, 7, voice), text(3, 55, 8, "after")]);
+    wait(|| said(&bot, 55).len() == 2).await;
+    gw.shutdown().await;
+    assert_eq!(calls(&bot, "getFile").len(), 1);
+    assert_eq!(calls(&bot, "file").len(), 1);
+    assert_eq!(inbox_total(&home), 2);
+}
+
+/// A voice note (channels spec §4.4, §4.5): the bytes the daemon fetched from the Bot API are
+/// what is transcribed, the row is marked derived, and the reply is also spoken, sent with
+/// `sendVoice` after its text.
+#[tokio::test]
+async fn a_voice_note_is_heard_and_answered_aloud() {
+    let home = home("voice");
+    let (api, bot) = stub().await;
+    bot.lock().unwrap().files.insert(
+        "v".into(),
+        ("voice/file_1.oga".into(), b"ogg-bytes".to_vec()),
+    );
+    let voice = json!({"file_id": "v", "file_unique_id": "u", "duration": 3,
+        "mime_type": "audio/ogg", "file_size": 9});
+    push(&bot, [message(1, 55, 7, json!({"voice": voice}))]);
+    let mut cfg = config(&home, &api, "");
+    cfg.voice_dir = voice_fakes::fakes(&home);
+    cfg.voice_off_floor = true;
+    let gw = start(cfg);
+    wait(|| !calls(&bot, "sendVoice").is_empty()).await;
+    gw.shutdown().await;
+
+    // Heard from what the Bot API served, once.
+    assert_eq!(calls(&bot, "file"), vec![json!("voice/file_1.oga")]);
+    let decoded = voice_fakes::ran(&home, "ffmpeg");
+    assert_eq!(decoded[0]["sha256"], voice_fakes::sha256(b"ogg-bytes"));
+    assert_eq!(voice_fakes::ran(&home, "whisper-cli").len(), 1);
+    let row = &rows(&home, "done")[0];
+    assert_eq!(row.derived.as_deref(), Some("voice"));
+    let saved = home.join("inbox/telegram-55-7-1.ogg");
+    assert!(
+        row.text.starts_with(&format!(
+            "[attached audio: {} (voice note, audio/ogg",
+            saved.display()
+        )),
+        "{}",
+        row.text
+    );
+    let heard = "[transcript of the voice note above, by zephyr (en), may be wrong: \"hello from the fake\"]";
+    assert!(row.text.ends_with(heard), "{}", row.text);
+
+    // The text, then the voice: a voice note, not a document.
+    let order = methods(&bot);
+    let at = |m: &str| order.iter().rposition(|x| x == m).unwrap();
+    assert!(said(&bot, 55)[0].contains("hello from the fake"));
+    assert!(at("sendMessage") < at("sendVoice"), "{order:?}");
+    assert!(calls(&bot, "sendDocument").is_empty());
+    let sent = calls(&bot, "sendVoice");
+    let form = sent[0]["multipart"].as_str().unwrap();
+    assert!(
+        form.contains("name=\"voice\"; filename=\"voice.ogg\"") && form.contains("OggSpcm:"),
+        "{form}"
+    );
 }

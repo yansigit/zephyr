@@ -303,6 +303,10 @@ impl Telegram {
     /// The row's files for `inbox::append`. `getFile` is called for an owner's only, so a
     /// stranger's file costs no call.
     async fn files(&self, row: &Inbound, docs: Vec<Doc>) -> Vec<File> {
+        // A redelivered message is a row the router drops: no `getFile`, nothing fetched.
+        if crate::inbox::stored(&self.live, row).await {
+            return Vec::new();
+        }
         let owner = crate::inbox::owner(&self.live, row);
         let mut out = Vec::new();
         for d in docs {
@@ -634,6 +638,7 @@ fn sort(u: Update) -> Sorted {
         platform_msg_id: format!("{}-{}", m.chat.id, m.message_id),
         sender: from.id.to_string(),
         text,
+        derived: None,
     };
     Sorted::Row(row, docs, name(&from))
 }
@@ -691,6 +696,7 @@ mod tests {
                 platform_msg_id: "55-7".into(),
                 sender: "55".into(),
                 text: "hi".into(),
+                derived: None,
             }
         );
         assert!(docs.is_empty());

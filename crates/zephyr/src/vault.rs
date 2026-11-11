@@ -1062,9 +1062,18 @@ fn value_for(cfg: &Config, token: &Entry) -> Result<String, String> {
     }
 }
 
+/// What a fill answers while the owner holds the desktop (DESIGN §4.11).
+pub const HELD: &str = "not filled: the owner has the desktop; try again when they hand it back";
+
 /// The agent's `vault` call `call_id` (main only), answered through the gateway file: at once,
 /// except a fill, which runs the browser from a task of its own.
-pub fn agent(cfg: &Arc<Config>, store: &Store, call_id: &str, action: VaultAction) {
+pub fn agent(
+    cfg: &Arc<Config>,
+    store: &Store,
+    call_id: &str,
+    action: VaultAction,
+    desktop: &Arc<crate::desktop::Control>,
+) {
     let answer = |text: &str| crate::tools::answer_gateway(cfg, call_id, text);
     let vault = match Vault::load(&path(cfg)) {
         Ok(v) => v,
@@ -1101,9 +1110,14 @@ pub fn agent(cfg: &Arc<Config>, store: &Store, call_id: &str, action: VaultActio
                     Err(e) => format!("not filled: asking the owner failed: {e}"),
                 });
             }
+            // A fill and a takeover never overlap: the owner's hands are on the page.
+            let Some(filling) = desktop.fill() else {
+                return answer(HELD);
+            };
             let (cfg, id) = (cfg.clone(), call_id.to_string());
             tokio::spawn(async move {
                 let text = fill(&cfg, &login, [user, password, totp]).await;
+                drop(filling);
                 crate::tools::answer_gateway(&cfg, &id, &text);
             });
         }

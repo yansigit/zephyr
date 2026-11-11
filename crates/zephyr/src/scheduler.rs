@@ -1095,6 +1095,7 @@ mod tests {
             platform_msg_id: "x".into(),
             sender: "owner".into(),
             text: text.into(),
+            derived: None,
         };
         command(store, &cfg(None), &m, true).expect("a /job command")
     }
@@ -1177,6 +1178,7 @@ mod tests {
             platform_msg_id: "x".into(),
             sender: "o".into(),
             text: "/jobs please".into(),
+            derived: None,
         };
         assert_eq!(command(&mut s, &cfg(None), &not_job, true), None);
         assert!(say(&mut s, "/job add a | 61 * * * * | hi").contains("bad schedule"));
@@ -1277,6 +1279,7 @@ mod tests {
             platform_msg_id: "x".into(),
             sender: "o".into(),
             text: "/job add d | 0 8 * * * | hi".into(),
+            derived: None,
         };
         let reply = command(&mut s, &cfg(Some("Asia/Seoul")), &m, true).unwrap();
         assert!(reply.contains("T08:00:00+09:00[Asia/Seoul]"), "{reply}");

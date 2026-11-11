@@ -1,0 +1,111 @@
+#!/usr/bin/python3
+"""Stand-ins for the image's ffmpeg, whisper-cli and Piper's python (DESIGN §4.3, voice.rs).
+
+One script under three names (`bin/whisper-cli` and `py/bin/python` are links to it). Each run
+appends one JSON line to `log` in the voice folder, found from the script's own path since the
+environment is cleared: {"prog", "uid", "argv", "sha256", "env", "start", "end"}, the hash being
+of the input (the file an argument names, or stdin for Piper). Marker files in the voice folder:
+
+  say         what whisper hears (default `hello from the fake`)
+  lang        the language whisper detects with `-l auto` (default `en`)
+  secs        how long the decoded audio is (default 2), cut at ffmpeg's `-t`
+  hang        whisper writes its pid to `hang.pid` and sleeps until it is killed
+  fork        whisper leaves a child behind, asleep, its pid in `fork.pid`
+  setsid      the same in a session of its own, out of the process group; `setsid.pid`
+  slow        whisper takes 0.3 s, so two runs would overlap if they could
+  piper_fail  Piper exits 1
+
+Keep the argv this reads and the lines it prints in step with voice.rs (`whisper_args`,
+`detected`, `piper_args`, `decode_args`, `encode_args`).
+"""
+import hashlib
+import json
+import os
+import sys
+import time
+
+prog = os.path.basename(sys.argv[0])
+here = os.path.dirname(os.path.abspath(sys.argv[0]))
+root = os.path.dirname(os.path.dirname(here) if prog == "python" else here)
+argv = sys.argv[1:]
+start = time.time()
+
+
+def marker(name, default=None):
+    try:
+        with open(os.path.join(root, name)) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def after(flag):
+    return argv[argv.index(flag) + 1]
+
+
+def done(data):
+    line = json.dumps({
+        "prog": prog, "uid": os.getuid(), "argv": argv, "env": sorted(os.environ),
+        "sha256": hashlib.sha256(data).hexdigest(), "start": start, "end": time.time(),
+    })
+    fd = os.open(os.path.join(root, "log"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o666)
+    os.write(fd, (line + "\n").encode())
+    os.close(fd)
+
+
+if prog == "ffmpeg":
+    with open(after("-i"), "rb") as f:
+        data = f.read()
+    if "wav" in argv:
+        secs = min(float(marker("secs", "2")), float(after("-t")))
+        out = b"RIFF" + b"\0" * 40 + b"\0" * int(secs * 32000)
+    else:
+        out = (b"OggS" if "ogg" in argv else b"ftyp") + data
+    if argv[-1] == "pipe:1":
+        sys.stdout.buffer.write(out)
+        sys.stdout.buffer.flush()
+    else:
+        with open(argv[-1], "wb") as f:
+            f.write(out)
+    done(data)
+elif prog == "whisper-cli":
+    with open(after("-f"), "rb") as f:
+        data = f.read()
+    for name in ("fork", "setsid"):
+        if marker(name) is None:
+            continue
+        r, w = os.pipe()
+        if os.fork() == 0:
+            if name == "setsid":
+                os.setsid()
+            # Its own stdio closed, so nothing waits on it; the parent goes on once it is asleep.
+            for fd in (0, 1, 2, r):
+                os.close(fd)
+            with open(os.path.join(root, name + ".pid"), "w") as f:
+                f.write(str(os.getpid()))
+            os.close(w)
+            time.sleep(600)
+            os._exit(0)
+        os.close(w)
+        os.read(r, 1)
+    if marker("hang") is not None:
+        with open(os.path.join(root, "hang.pid"), "w") as f:
+            f.write(str(os.getpid()))
+        time.sleep(600)
+    if marker("slow") is not None:
+        time.sleep(0.3)
+    if after("-l") == "auto":
+        print("whisper_full_with_state: auto-detected language: %s (p = 0.97)" % marker("lang", "en"),
+              file=sys.stderr)
+    print(" " + marker("say", "hello from the fake"))
+    done(data)
+elif prog == "python":
+    data = sys.stdin.buffer.read()
+    if marker("piper_fail") is not None:
+        done(data)
+        sys.exit(1)
+    sys.stdout.buffer.write(b"pcm:" + data)
+    sys.stdout.buffer.flush()
+    done(data)
+else:
+    sys.exit("fake voice: unknown name " + prog)

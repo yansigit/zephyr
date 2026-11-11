@@ -574,7 +574,7 @@ port = 7793                        # the default; the daemon listens on 127.0.0.
 The daemon refuses any request whose `Host` is not that name, that did not come through
 `tailscale serve`, or (for anything that changes something) that does not come from the app's own
 page. `zephyr status` says `web: listening`, and `zephyr doctor` checks the listener and the
-push key.
+push key, and in its `desktop` line whether the app can take the agent's desktop over.
 
 **Signing in.** The app has no password. Each device signs in with a passkey (Face ID, a
 fingerprint, the device PIN), and a new device needs a one-time code that only you can make:
@@ -600,11 +600,26 @@ that your other channels could approve too. A payment, or anything that loosens 
 setting, opens the app, where approving takes your passkey. Up to 10 devices; `/web rm NAME`
 removes a passkey's devices with it. Swiping a card's notification away denies it, on Android only.
 
+**Take over the desktop.** The menu's **Desktop** screen (there when the agent has a desktop)
+lets you use the agent's screen yourself: tap **Take over** and approve with your passkey. While
+you hold it the agent's browser and `xdotool` commands wait, and each one that waited is refused
+when you hand back, since the page may have changed under it; the agent is told to take a fresh
+look first. **Hand back** returns the desktop. It also goes back by itself after 10 minutes
+without a key or a tap, after 60 minutes, or a minute after the app closes, and you are told. On
+a phone, **Keyboard** opens a field, and what you type in it is typed on the agent's screen. One
+device at a time; another can still hand it back.
+
+The screen is the agent's: it sees what is shown and can read what you type there. Sign in to
+sites through [the vault](#the-vault) rather than by typing a password. The picture comes through
+the app's own connection; nothing listens for a VNC viewer, inside the container or out.
+
 **Before a release that touches `crates/zephyr/assets/web/`**, check by hand, on iOS Safari as a
 Home Screen app and on Android Chrome (a real browser is not part of the tests): enrol with
 `/web enrol`, sign in, chat, approve a held message with the passkey, deny one from a
-notification, swipe one away on Android (it is denied), and `/web rm` from another channel
-signs the phone out. The browser's console must show no Content-Security-Policy errors.
+notification, swipe one away on Android (it is denied), take over the desktop, type into the
+agent's browser with **Keyboard** (English and Korean), hand back, and `/web rm` from another
+channel signs the phone out. The browser's console must show no Content-Security-Policy errors,
+on the Desktop screen too, with a photo on the agent's screen.
 
 ## Telegram
 
@@ -637,8 +652,41 @@ Images and files you send on Discord, iMessage, Telegram or Signal are saved for
 `~/.zephyr/inbox/` (`/zephyr/inbox/` in the container), and your message tells it each file's path;
 it opens images with `read`. A message with only a photo works. Up to 10 files a message, 25 MB
 each (20 MB on Telegram, its limit for bots): anything beyond is listed but not downloaded. Only
-owners' files are downloaded. iPhone photos arrive as JPEG (BlueBubbles converts HEIC). A voice
-note is saved as a file; nothing transcribes it. Files are deleted after 30 days.
+owners' files are downloaded. iPhone photos arrive as JPEG (BlueBubbles converts HEIC). Files are deleted after 30 days.
+
+## Voice
+
+A voice note you send on Discord, iMessage, Telegram or Signal is saved like any file and transcribed on the
+machine itself, by whisper.cpp (the `small` model; nothing leaves the container). The agent
+reads it as two lines under your caption, if you typed one:
+
+```
+[attached audio: /zephyr/inbox/discord-55-1.ogg (voice note, audio/ogg, 0:12, 18 KB)]
+[transcript of the voice note above, by zephyr (ko), may be wrong: "내일 아침 9시 회의 알려줘"]
+```
+
+- A transcript is not your typed text. Speech never runs a command: saying "slash ok 3"
+  approves nothing, so approvals stay typed. A command typed as a voice note's caption is not
+  run either (the whole message goes to the agent): send the command as a message of its own.
+- A note longer than `voice.max_secs` (300) is saved but not transcribed. One note is
+  transcribed at a time; a minute of speech takes about 11 s on CPU.
+- A conversation that took in a voice note is no longer yours alone: with `memory.auto owner`,
+  its memory changes wait for `/memory ok` until `/new`.
+- Settings (`[voice]` in `zephyr.toml`, or `/set`): `voice.transcribe` (`true`),
+  `voice.languages` (`ko, en`; whisper's codes, and a note heard as another language is
+  transcribed again as the first), `voice.max_secs` (10 to 900). The agent can only propose a
+  change to them.
+- The reply to a voice note is also spoken (Piper, also on the machine): the text comes first,
+  then a voice message. `/set voice.reply always` speaks every reply on Discord, iMessage, Telegram and Signal,
+  `off` none. Notices, approval cards, replies with code and replies over 1500 characters are
+  never spoken. Korean replies are spoken only by an image built with `--build-arg KO_VOICE=1`
+  (that voice's licence is CC BY-NC-SA 4.0, non-commercial).
+- `zephyr status` says `voice: whisper small on CPU`, and `zephyr doctor` checks the models and
+  transcribes a silent sample.
+- Voice needs the network floor (`network = "bridge"` in host.toml, the default): the programs
+  that read your audio get no network there. With `network = "host"` notes are saved but not
+  transcribed, nothing is spoken, and `zephyr status` says so.
+- An image built with `--build-arg VOICE=0` has no voice: notes are saved as files only.
 
 ## Signal
 
@@ -741,19 +789,9 @@ The image gives the agent a browser and a screen of its own (DESIGN §4.11):
   through screenshots and drives it with `xdotool`.
 - **GPU.** When Docker has the NVIDIA runtime, `zephyr up` passes the GPU in, so the browser's
   WebGL is the real card instead of software rendering, which bot checks notice.
-- **Watching it, or signing it into a site.** Nothing listens by default. To look, start a one-shot
-  VNC server on the container's own address, port 5900, and connect a VNC viewer on this machine to
-  that address; it exits when you disconnect (the address is reachable from this machine only):
-
-  ```sh
-  ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' zephyr)
-  docker exec -it -u "$(id -u)" zephyr x11vnc -storepasswd /zephyr/.vnc-passwd   # once
-  docker exec -d -u "$(id -u)" zephyr x11vnc -display :99 -auth /zephyr/.zephyr-xauthority -listen "$ip" -once -rfbauth /zephyr/.vnc-passwd
-  echo "connect to $ip:5900"
-  ```
-
-  With `network = "host"` in host.toml, use `-localhost` in place of `-listen "$ip"` and connect
-  to 127.0.0.1:5900.
+- **Watching it, or signing it into a site.** Open the [web app](#web-app)'s **Desktop** screen and
+  tap **Take over** ("Take over the desktop" below that heading). No VNC server listens, and none
+  needs starting by hand. With `network = "host"` in host.toml there is no web app, so no takeover.
 
 - **Files and jobs.** The agent's `send_file` tool sends you a file (up to 10 MB: a screenshot, a
   PDF) with its reply. Its `schedule` tool only proposes a job: you are shown it, and it runs after
@@ -1093,6 +1131,18 @@ by `jlink` in `/opt/zephyr/signal`, for the Signal channel: 190 MB on disk (126 
 runtime), 160 MB more to pull. `--build-arg SIGNAL=0`
 leaves them out, and an arm64 build has none (libsignal's native library ships for x86_64 only);
 without `/opt/zephyr/signal` the Signal channel is off.
+
+Voice notes (whisper.cpp with Vulkan, a cut-down static ffmpeg, Piper and their models, about
+490 MB in `/opt/zephyr/voice`) are in the image by default. `zephyr up --build` passes no build
+args, so build by hand to change that, then point `ZEPHYR_IMAGE` at the tag:
+- `--build-arg VOICE=0` leaves voice out; `zephyr doctor` then reads `voice: not in this image`.
+- `--build-arg KO_VOICE=1` adds Piper's Korean voice (`ko_KR-kss-medium`), so replies in Korean
+  are spoken too; without it they stay text. Its training data, the KSS dataset, is licensed CC
+  BY-NC-SA 4.0: non-commercial use only. Whisper hears Korean either way.
+
+```sh
+docker build -t zephyr-local:ko --build-arg KO_VOICE=1 -f deploy/Dockerfile .
+```
 
 Pushing a `v*` tag publishes `ghcr.io/yansigit/zephyr:<version>` (`.github/workflows/image.yml`,
 which tags `ghcr.io/<the repository it runs in>`, so a fork publishes to its own).

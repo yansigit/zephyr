@@ -3821,6 +3821,21 @@ fn every_copy_in_the_dockerfile_is_in_the_build_context() {
     assert!(checked >= 4, "{checked}");
 }
 
+/// Both wrappers on the agent's PATH (`agent-browser`, and `xdotool` for a desktop takeover) are
+/// links to this binary in root's gate bin; the real ones stay out of that folder.
+#[test]
+fn the_gate_bin_holds_both_wrappers() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dockerfile = std::fs::read_to_string(root.join("deploy/Dockerfile")).unwrap();
+    for name in ["agent-browser", "xdotool"] {
+        let link = format!("ln -s /usr/local/bin/zephyr /opt/zephyr/gate/bin/{name}");
+        assert!(
+            dockerfile.contains(&link),
+            "no `{link}` in deploy/Dockerfile"
+        );
+    }
+}
+
 const TS_STATUS: &str = r#"{"BackendState":"Running","Self":{"DNSName":"box.tail1234.ts.net."},"CertDomains":["box.tail1234.ts.net"]}"#;
 
 #[test]

@@ -1285,6 +1285,7 @@ async fn forward(
 /// `address . port` pairs of `network.allow` (`keep_allow`), the only direct routes there are.
 /// The first rule keeps the agent from sending as Docker's resolver (127.0.0.11, an address any
 /// local process may bind): a lookup root makes there must not be answerable by the agent.
+/// `nobody`, which the voice decoders run as (`voice.rs`), gets no network at all.
 pub fn ruleset(agent_uid: u32) -> String {
     format!(
         "\
@@ -1297,6 +1298,7 @@ table inet zephyr {{
   chain output {{
     type filter hook output priority filter; policy accept;
     meta skuid {agent_uid} jump agent
+    meta skuid {nobody} reject                   # the voice decoders (voice.rs) get no network
   }}
   chain agent {{
     ip saddr 127.0.0.11 reject            # never as Docker's DNS: root's lookups cannot be answered by the agent
@@ -1309,7 +1311,8 @@ table inet zephyr {{
     reject with icmpx admin-prohibited
   }}
 }}
-"
+",
+        nobody = crate::voice::NOBODY
     )
 }
 
@@ -2545,6 +2548,7 @@ table inet zephyr {
   chain output {
     type filter hook output priority filter; policy accept;
     meta skuid 1000 jump agent
+    meta skuid 65534 reject                   # the voice decoders (voice.rs) get no network
   }
   chain agent {
     ip saddr 127.0.0.11 reject            # never as Docker's DNS: root's lookups cannot be answered by the agent
@@ -2560,6 +2564,13 @@ table inet zephyr {
 ";
         assert_eq!(ruleset(1000), golden);
         assert!(ruleset(4242).contains("    meta skuid 4242 jump agent\n"));
+    }
+
+    #[test]
+    fn the_floor_refuses_nobody() {
+        let rules = ruleset(1000);
+        let (jump, reject) = ("meta skuid 1000 jump agent", "meta skuid 65534 reject");
+        assert!(rules.find(jump).unwrap() < rules.find(reject).unwrap());
     }
 
     #[test]
@@ -3744,6 +3755,7 @@ table inet zephyr {
                 platform_msg_id: "m1".into(),
                 sender: "owner-1".into(),
                 text: "hi".into(),
+                derived: None,
             };
             store.insert_inbox(&said).unwrap();
             let row = store.inbox_with_status("new").unwrap().remove(0);

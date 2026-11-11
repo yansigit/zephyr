@@ -198,6 +198,7 @@ fn message_to_inbound(m: Message) -> Option<(Inbound, Vec<Attachment>)> {
         platform_msg_id: m.guid,
         sender: handle.address,
         text,
+        derived: None,
     };
     Some((inbound, files))
 }
@@ -620,6 +621,7 @@ mod tests {
                 platform_msg_id: "AAAA-1111-2222".into(),
                 sender: "+15551234567".into(),
                 text: "hello from my phone".into(),
+                derived: None,
             }
         );
     }

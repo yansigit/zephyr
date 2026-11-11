@@ -249,6 +249,7 @@ fn status_shows_the_main_child_the_waiting_message_and_the_replies() {
         platform_msg_id: "1".into(),
         sender: "owner".into(),
         text: "hi".into(),
+        derived: None,
     };
     store.insert_inbox(&m).unwrap();
     for text in ["one", "two", "three"] {
@@ -1123,4 +1124,65 @@ fn a_background_command_outlives_a_daemon_crash_under_supervise() {
         report.contains("process #1 exited 0") && report.contains("survived-crash"),
         "{report}"
     );
+}
+
+/// DESIGN §4.11: `xdotool` on the agent's PATH is this binary, by that name. It runs the real one
+/// as it was, and while the owner holds the desktop (root's `desktop-held`, beside the gate
+/// socket) it does not: with no gate answering it exits 1.
+#[test]
+fn xdotool_is_the_wrapper_and_does_not_run_while_the_desktop_is_held() {
+    let (home, _) = setup("xdotool", "");
+    let dir = home.parent().unwrap();
+    let wrapper = dir.join("xdotool");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_zephyr"), &wrapper).unwrap();
+    let real = dir.join("real-xdotool");
+    std::fs::write(
+        &real,
+        "#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/xdotool.log\"\necho ran\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let public = dir.join("public");
+    std::fs::create_dir_all(&public).unwrap();
+    let run = || {
+        Command::new(&wrapper)
+            .args(["key", "ctrl+l"])
+            .env("ZEPHYR_XDOTOOL", &real)
+            .env("ZEPHYR_GATE_SOCKET", public.join("gate.sock"))
+            .output()
+            .unwrap()
+    };
+    let log = || std::fs::read_to_string(dir.join("xdotool.log")).unwrap_or_default();
+    // Without root's lock beside the socket, which the daemon makes at each start, nothing runs.
+    let out = run();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        zephyr::browser_gate::NO_LOCK
+    );
+    assert_eq!(log(), "", "the real xdotool ran with no lock");
+    std::fs::write(public.join("desktop.lock"), "").unwrap();
+    let out = run();
+    assert_eq!(
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).trim()
+        ),
+        (Some(0), "ran")
+    );
+    assert_eq!(log(), "key ctrl+l\n");
+    std::fs::write(public.join("desktop-held"), "100\n").unwrap();
+    let out = run();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "the gate is not answering; not run"
+    );
+    assert_eq!(log(), "key ctrl+l\n", "the real xdotool ran while held");
+    // A bare name would find this wrapper again on the PATH.
+    let out = Command::new(&wrapper)
+        .env("ZEPHYR_XDOTOOL", "xdotool")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(127));
 }

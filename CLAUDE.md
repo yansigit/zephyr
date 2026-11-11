@@ -35,6 +35,9 @@ deploy/bump-rpi.sh [0.22.0]                               # move every rpi pin; 
 `ZEPHYR_CONTAINER` / `ZEPHYR_IMAGE` point the host CLI at another container or image, to test beside a
 live install; `ZEPHYR_REPO` moves the repository it pulls `<repo>:<version>` from (default
 `ghcr.io/yansigit/zephyr`; at build time `ZEPHYR_BUILD_REPO`). `deploy/release.sh` unsets all of them. Pushing a `v*` tag publishes `ghcr.io/yansigit/zephyr:<version>` and `:latest` (`.github/workflows/image.yml`).
+The Dockerfile's `voice-*` stages fill `/opt/zephyr/voice` (whisper-cli, ffmpeg, Piper's venv from
+`deploy/voice/uv.lock`, models and voices, the layout `voice.rs` reads); build arg `VOICE=0` leaves
+it out, `KO_VOICE=1` adds the CC BY-NC-SA Korean voice. `--target voice-out` builds only that tree.
 
 ## Architecture
 
@@ -189,7 +192,28 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   and refuses its own verbs with `tools::NEEDS_PASSKEY`: give a new such verb the same check.
   Two channels: `web` is the session cookie alone and weak; `passkey` is a signed decision and in
   the default `strong_channels`.
-- `inbox.rs`: files the owner sends on Discord or iMessage (DESIGN §4.3). The adapter saves them as
+- `voice.rs` (DESIGN §4.3): an owner's voice note is transcribed by whisper.cpp and a reply to it
+  spoken by Piper, both from the image's root-owned `/opt/zephyr/voice` (`Config::voice_dir` in
+  tests, where `tests/fixtures/voice` holds the fakes), as uid 65534 on sealed memfds, one note at
+  a time, on the CPU. `inbox::append` hands it only the bytes it fetched in that call, never a file
+  saved in `inbox/`, and marks the row `derived = "voice"` (schema v19), which taints main's
+  conversation at dispatch; the transcript line starts with `[`, so speech is never a command. The
+  real binaries' argv and output shapes are in `decode_args`, `whisper_args`, `detected`,
+  `piper_args` and `encode_args` alone: change them with the fakes.
+- Desktop takeover (DESIGN §4.3.3, §4.11): `desktop::Control` is the one lock the owner's takeover
+  and the vault's fill share; a take writes root's `<state>-public/desktop-held`, and the
+  `agent-browser` and `xdotool` wrappers (`browser_gate::held`, `xdotool` dispatched on `argv[0]`
+  like `agent-browser`) then wait on the gate socket (`{"desktop": "wait"}`) and exit 1 without
+  running. The hold the daemon publishes is the truth, the file only the hint to ask. A wrapper
+  runs the real binary as its child (never `exec`) under a shared `flock` on root's
+  `<state>-public/desktop.lock` (`browser_gate::place`); `Control::drain` takes the exclusive
+  side before a ticket is issued (hidden `Config::desktop_drain`, 15 s, then it kills the
+  agent's processes that hold the lock) and keeps it until the hand back. `web/vnc.rs`: the passkey-signed `zephyr.desktop` take answers a one-use ticket,
+  `/api/vnc` joins a WebSocket to an `x11vnc -inetd` on an unnamed socketpair (it listens
+  nowhere, and runs as the agent), and `watchdog` gives the desktop back after 10 min idle, 60 min
+  or 60 s after the socket closed (hidden `Config::desktop_*`). `Router::desktop_changed` steers
+  the take and hand-back notes into main, which do not taint.
+- `inbox.rs`: files the owner sends on Discord, iMessage, Telegram or Signal (DESIGN §4.3). The adapter saves them as
   the agent into `<home>/inbox/` before the row goes to the router and appends a
   `[attached image: <path> ...]` line per file to its text; owners come from the router's live
   config (`Channel::live`), so a stranger's files are never fetched. 10 files, 25 MB each.

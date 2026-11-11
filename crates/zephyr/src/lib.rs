@@ -44,6 +44,7 @@ pub mod telegram;
 pub mod tools;
 pub mod tui;
 pub mod vault;
+pub mod voice;
 pub mod web;
 
 pub fn unix_millis() -> u128 {

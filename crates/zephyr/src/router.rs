@@ -107,6 +107,16 @@ pub struct Snapshot {
     pub jobs: Vec<NextJob>,
     /// Proposals waiting for the owner's `/ok` or `/no`.
     pub proposals: u32,
+    /// The agent's desktop, which the web app can take over; `None` without one.
+    pub desktop: Option<DesktopState>,
+}
+
+/// Who has the agent's desktop: the owner since `since_unix`, or (`owner` false, 0) the agent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DesktopState {
+    pub owner: bool,
+    pub since_unix: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -283,13 +293,13 @@ pub async fn run<C: Channel>(
         snap: snap_rx.clone(),
         cfgs: cfg_rx.clone(),
     };
-    let hub = crate::web::Hub::new();
     let (gate_cfgs, gate_snap) = (cfg_rx.clone(), snap_rx.clone());
     let names = channels.iter().map(|c| c.name().to_string()).collect();
     let mut router = Router::new(cfg, &jobs, attaches, cfg_tx, snap, names)?;
     // The gate's held notes for main's run, steered in before the plugin is answered (R51).
     let (gate_notes, notes_rx) = mpsc::channel(16);
     router.gate_notes = Some(notes_rx);
+    let hub = crate::web::Hub::new(router.desktop.clone());
     router.web = cfg.web.is_some().then(|| hub.clone());
     // Cards that waited through the restart were pushed before it: only newer ones go out.
     let waiting = router.store.pending_proposals();
@@ -318,7 +328,7 @@ pub async fn run<C: Channel>(
     tokio::select! {
         r = runs => r.map(|_| Exit::Shutdown),
         // Tasks' and jobs' sends, every connector call, the browser's clicks (approvals §4.2).
-        r = crate::gate::serve(gate_cfgs, gate_snap, waits, &jobs, gate_notes) => r.map(|()| Exit::Shutdown),
+        r = crate::gate::serve(gate_cfgs, gate_snap, waits, &jobs, gate_notes, router.desktop.clone()) => r.map(|()| Exit::Shutdown),
         // The agent's only way out, in bridge mode (DESIGN §4.20).
         r = crate::egress::serve(egress_cfgs, &jobs) => r.map(|()| Exit::Shutdown),
         r = crate::attach::serve(cfg, handles.clone()) => r.map(|()| Exit::Shutdown),
@@ -517,6 +527,12 @@ struct Router<'a> {
     procs: crate::procs::Procs,
     /// Browser actions waiting in place for the owner's answer (approvals spec §4.4).
     waits: crate::actions::Waits,
+    /// Who holds the desktop: the owner's takeover, or the vault's fill (DESIGN §4.11).
+    desktop: Arc<crate::desktop::Control>,
+    /// `desktop`'s takes and hand backs, each once and in order.
+    desktop_events: mpsc::UnboundedReceiver<crate::desktop::Event>,
+    /// The hand-back note main has not been given yet: it goes in front of the next prompt.
+    desktop_note: Option<String>,
     /// The last tick found the gateway paused: the next one holds what came due (I1).
     due_held: bool,
     /// The gate's held notes for main's run (R51), from `gate::serve`.
@@ -634,6 +650,7 @@ impl<'a> Router<'a> {
         names: Vec<String>,
     ) -> anyhow::Result<Self> {
         let shared = cfg_tx.borrow().clone();
+        let desktop = crate::desktop::Control::new(cfg);
         Ok(Router {
             cfg: shared,
             edits: edits(cfg),
@@ -689,6 +706,9 @@ impl<'a> Router<'a> {
             stopping: false,
             procs: Default::default(),
             waits: Default::default(),
+            desktop_events: desktop.events(),
+            desktop_note: None,
+            desktop,
             due_held: false,
             gate_notes: None,
             web: None,
@@ -734,6 +754,7 @@ impl<'a> Router<'a> {
                 Some((session, note)) = next_gate_note(&mut self.gate_notes) => {
                     self.gate_note(&session, note).await
                 }
+                Some(ev) = self.desktop_events.recv() => self.desktop_changed(ev).await,
                 _ = self.jobs.outbox.notified() => {} // a job's output: flush below
                 // The `/btw` answer is in the outbox: flush below.
                 r = async { self.btw.as_mut().expect("guarded").await }, if self.btw.is_some() => {
@@ -896,7 +917,7 @@ impl<'a> Router<'a> {
             if let Some((id, args)) = crate::procs::call(ev, "vault") {
                 // Main only, like `exec`; a call the plugin refused waits for nothing.
                 if let Ok(action) = zephyr_policy::tools::vault_action(args) {
-                    crate::vault::agent(&self.cfg, &self.store, id, action);
+                    crate::vault::agent(&self.cfg, &self.store, id, action, &self.desktop);
                 }
             }
             if let Some((id, args)) = crate::procs::call(ev, "process") {
@@ -1302,6 +1323,7 @@ impl<'a> Router<'a> {
                         .store
                         .reply(&row, &unspoof(&text), "done")
                         .map_err(Into::into));
+                    self.speak(&row, &text);
                     self.steer_sent.push(text);
                     self.steer_replied = true;
                 }
@@ -1441,6 +1463,7 @@ impl<'a> Router<'a> {
                     })
                     .collect(),
                 proposals: self.store.pending_proposals()?.len() as u32,
+                desktop: self.desktop_state(),
                 jobs: {
                     let tz = crate::scheduler::zone(&self.cfg)?;
                     let mut jobs: Vec<NextJob> = (self.store.jobs()?.into_iter())
@@ -1535,21 +1558,23 @@ impl<'a> Router<'a> {
                     None => Err(format!("no setting {key}; /settings lists them")),
                 });
             }
-            AttachRequest::WebNotice(text) => {
-                // An attached owner is shown the row by the flush, with every other client
-                // (a web row waits for a socket); anyone else gets a row, and the clients see
-                // it now.
-                let last = self.store.last_owner().ok().flatten();
-                if !last
-                    .as_ref()
-                    .is_some_and(|(c, _)| crate::attach::attached(c))
-                {
-                    self.show(&text, None, None);
-                }
-                if let Some((channel, to)) = last {
-                    log(self.store.notify(&channel, &to, &text).map_err(Into::into));
-                }
-            }
+            AttachRequest::WebNotice(text) => self.notice(&text),
+        }
+    }
+
+    /// A notice of the daemon's own for every attached client and the owner last answered. An
+    /// attached owner is shown the row by the flush, with every other client (a web row waits
+    /// for a socket); anyone else gets a row, and the clients see it now.
+    fn notice(&mut self, text: &str) {
+        let last = self.store.last_owner().ok().flatten();
+        if !last
+            .as_ref()
+            .is_some_and(|(c, _)| crate::attach::attached(c))
+        {
+            self.show(text, None, None);
+        }
+        if let Some((channel, to)) = last {
+            log(self.store.notify(&channel, &to, text).map_err(Into::into));
         }
     }
 
@@ -1802,6 +1827,7 @@ impl<'a> Router<'a> {
             platform_msg_id: String::new(),
             sender: crate::attach::sender(crate::attach::rows(channel)).into(),
             text: text.clone(),
+            derived: None,
         };
         // The caller has decided who may approve here: a signature, or (the notification's
         // button, the TUI) what that client may do unsigned.
@@ -2054,6 +2080,13 @@ impl<'a> Router<'a> {
         if after {
             log(self.store.deliver_after(id).map_err(Into::into));
         }
+        // A row that holds a transcript is never a command, whatever its typed caption says:
+        // `/job add`, `/task`, `/btw` and the like would carry the transcript under the caption
+        // into a run that `dispatch_new`'s taint never sees. All of it goes to the agent.
+        if m.derived.is_some() {
+            self.procs.yield_all();
+            return log(self.dispatch_new().await);
+        }
         let mut approving = None;
         // Every approval made in the web app is signed with a passkey, on its card
         // (`zephyr.decide`): typed over the socket, it would rest on the session cookie alone.
@@ -2105,6 +2138,7 @@ impl<'a> Router<'a> {
             tries: 0,
             platform_id: m.platform_msg_id,
             owner: true,
+            derived: None,
         };
         if reply.is_empty() {
             // A `/btw` whose answer its task posts.
@@ -2258,6 +2292,10 @@ impl<'a> Router<'a> {
             // result, anything zephyr wrote) is in the conversation from now on (DESIGN §4.6).
             if !row.owner || !self.cfg.is_owner(&row.channel, &row.sender) {
                 self.taint_session(&daemon_row(&row.platform_id));
+            } else if row.derived.is_some() {
+                // The platform vouches for the account that sent the audio, not for the voice
+                // in it, and whisper makes text up on noise: a transcript is file-derived.
+                self.taint_session("took in a voice note's transcript");
             }
             // Durable before the child sees it, so recovery knows to look for it, and how.
             self.store.mark_dispatched_as(row.id, sent_as)?;
@@ -2273,6 +2311,11 @@ impl<'a> Router<'a> {
                 self.steered_texts.insert(text);
                 self.steered.push((row, false));
             } else {
+                // rpi delivers a steer queued while idle as the run starts, before its first
+                // step: the page may not be what the agent last saw.
+                if let Some(note) = self.desktop_note.take() {
+                    self.steer_note(note).await;
+                }
                 self.call(json!({"type": "prompt", "message": text}))
                     .await?;
                 self.busy = true;
@@ -4804,7 +4847,10 @@ impl<'a> Router<'a> {
                 Some(Some(reply)) if self.steer_sent.contains(reply) => {
                     self.store.set_status(row.id, "done")?
                 }
-                Some(Some(reply)) => self.store.reply(&row, &unspoof(reply), "done")?,
+                Some(Some(reply)) => {
+                    self.store.reply(&row, &unspoof(reply), "done")?;
+                    self.speak(&row, reply);
+                }
                 Some(None) if steers && !requeue && row.tries < 2 => {
                     self.store.requeue_as_continue(row.id)?
                 }
@@ -4837,6 +4883,29 @@ impl<'a> Router<'a> {
             return Ok(());
         }
         self.dispatch_new().await
+    }
+
+    /// Also speaks the agent's reply to `row` when `voice.reply` says so (DESIGN §4.3). Only an
+    /// agent's reply comes here, never a notice, a card or job output: those are read, not
+    /// heard. On a task of its own, after the text row is written, so the text never waits; the
+    /// voice is a second outbox row, and a crash meanwhile loses only that.
+    fn speak(&self, row: &InboxRow, text: &str) {
+        let cfg = self.cfg.clone();
+        if !crate::voice::replies_aloud(&cfg, &row.channel, row.derived.as_deref()) {
+            return;
+        }
+        let (row, text) = (row.clone(), text.to_string());
+        tokio::spawn(async move {
+            let Some(audio) = crate::voice::speak(&cfg, &text, &row.channel).await else {
+                return;
+            };
+            let name = crate::voice::format_for(&row.channel).0;
+            let queued = crate::tools::keep(&cfg, name.as_ref(), &audio).and_then(|file| {
+                let store = Store::open(&cfg.db_path())?;
+                Ok(store.voice_reply(&row, &file.to_string_lossy())?)
+            });
+            log(queued.map_err(|e| e.context("queueing a spoken reply")));
+        });
     }
 
     async fn flush<C: Channel>(&mut self, channels: &[C]) {
@@ -4885,6 +4954,11 @@ impl<'a> Router<'a> {
                 .set_outbox_status(row.id, "sent")
                 .map_err(Into::into));
         }
+        // The replies still to go: a spoken reply (`<client id>-v`) never goes before its text.
+        let mut unsent: HashSet<String> = (rows.iter())
+            .filter(|r| !crate::attach::attached(&r.channel))
+            .map(|r| r.client_id.clone())
+            .collect();
         for row in rows
             .into_iter()
             .filter(|r| !crate::attach::attached(&r.channel))
@@ -4895,6 +4969,10 @@ impl<'a> Router<'a> {
                 .is_some_and(|t| Instant::now() < *t)
             {
                 continue;
+            }
+            let text_of = row.client_id.strip_suffix("-v");
+            if text_of.is_some_and(|text| unsent.contains(text)) {
+                continue; // after its text, on a later pass
             }
             let Some(channel) = channels.iter().find(|c| c.name() == row.channel) else {
                 if self.unrouted.insert(row.channel.clone()) {
@@ -4942,6 +5020,7 @@ impl<'a> Router<'a> {
                 Err(_) => continue, // retried on the next pass
             };
             self.unstored.remove(&msg.client_id);
+            unsent.remove(&msg.client_id);
             log(self
                 .store
                 .set_outbox_status(row.id, status)
@@ -5054,6 +5133,58 @@ impl<'a> Router<'a> {
         took
     }
 
+    /// The agent's desktop for the snapshot; `None` without one.
+    fn desktop_state(&self) -> Option<DesktopState> {
+        self.cfg.desktop.as_ref()?;
+        let held = self.desktop.held();
+        Some(DesktopState {
+            owner: held.is_some(),
+            since_unix: held.map_or(0, |h| h.since),
+        })
+    }
+
+    /// The owner took the desktop over, or it went back (DESIGN §4.11): main is told with the
+    /// daemon's own notes, steered like the gate's, so they do not taint. At the take only a
+    /// run in progress is told; the hand back is steered into a run, or waits for the next
+    /// prompt. The snapshot moves last, so whoever sees it knows the note was given.
+    async fn desktop_changed(&mut self, event: crate::desktop::Event) {
+        use crate::desktop::Event;
+        match event {
+            Event::Took(held) if self.busy => {
+                let note = format!(
+                    "[zephyr] the owner took over the desktop at {}; browser and desktop \
+                     commands wait until they hand it back. Do other work meanwhile.",
+                    self.clock(held.since)
+                );
+                self.steer_note(note).await;
+            }
+            Event::Took(_) => {}
+            Event::Gave {
+                since,
+                until,
+                restart,
+            } => {
+                if restart {
+                    self.notice(
+                        "[zephyr] the desktop went back to the agent when zephyr restarted",
+                    );
+                }
+                let note = format!(
+                    "[zephyr] the owner used the desktop from {} to {}. The page may have \
+                     changed: take a fresh snapshot before acting.",
+                    self.clock(since),
+                    self.clock(until)
+                );
+                match self.busy {
+                    true => drop(self.steer_note(note).await),
+                    false => self.desktop_note = Some(note),
+                }
+            }
+        }
+        let state = self.desktop_state();
+        update(&self.snap, |s| s.desktop = state);
+    }
+
     /// The gate's held note for main's run (R51), before it answers the plugin `hold`: steered
     /// in now, while rpi still waits on the call, so the step after the refused call reads it
     /// (rpi takes its steers as the tool batch ends). `note.queued` is told once rpi has it; a
@@ -5131,6 +5262,7 @@ impl<'a> Router<'a> {
                 platform_msg_id: format!("retry-{}-{n}", row.id),
                 sender: row.sender.clone(),
                 text: row.text.clone(),
+                derived: None,
             };
             match self.store.insert_inbox(&again) {
                 Ok(Some(id)) => break id,
@@ -5708,6 +5840,7 @@ mod tests {
             platform_msg_id: format!("ok-{id}"),
             sender: "owner".into(),
             text: format!("/ok {id}"),
+            derived: None,
         };
         r.inbound(m, false, None).await;
         let sent = r.store.pending_outbox().unwrap();
@@ -5831,6 +5964,7 @@ mod tests {
             tries: 0,
             platform_id: "p".into(),
             owner: true,
+            derived: None,
         };
         for text in ["hi", "", "[a #1] nested\nlines"] {
             assert_eq!(
@@ -5897,6 +6031,7 @@ mod tests {
             platform_msg_id: "a".into(),
             sender: "owner".into(),
             text: "in flight".into(),
+            derived: None,
         };
         let id = r.store.insert_inbox(&m).unwrap().unwrap();
         r.store.mark_dispatched(id).unwrap();

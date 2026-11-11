@@ -1,0 +1,8 @@
+# Piper, the voice of spoken replies (DESIGN §4.4): a venv of its own at /opt/zephyr/voice/py on
+# the final image's python3, root's and run as nobody, never on the agent's PATH.
+# After an edit, run `uv lock` here and commit uv.lock.
+[project]
+name = "zephyr-voice"
+version = "0"
+requires-python = "==3.12.*" # ubuntu 24.04's python3, which the venv links to
+dependencies = ["piper-tts==1.8.0"]

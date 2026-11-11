@@ -27,6 +27,11 @@ fn main() -> ExitCode {
         let args = argv.map(|a| a.to_string_lossy().into_owned()).collect();
         return zephyr::browser_gate::main(args);
     }
+    // `xdotool` there too: it waits while the owner holds the desktop (DESIGN §4.11).
+    if Path::new(&zero).file_name() == Some(std::ffi::OsStr::new("xdotool")) {
+        let args = argv.map(|a| a.to_string_lossy().into_owned()).collect();
+        return zephyr::browser_gate::xdotool_main(args);
+    }
     zephyr_main()
 }
 
@@ -452,6 +457,7 @@ async fn status(cfg: &Config) -> anyhow::Result<()> {
         };
         println!("web: {state}");
     }
+    println!("{}", zephyr::voice::status(cfg));
     // The router's view, written with the heartbeat: `<unix> <main up> <failed starts>`.
     let file = std::fs::read_to_string(cfg.state_dir().join(HEARTBEAT)).unwrap_or_default();
     match file.split_whitespace().collect::<Vec<_>>()[..] {
@@ -718,9 +724,19 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
                 _ => println!("warn {what} does not run ({program})"),
             }
         }
+        // The takeover from the web app (DESIGN §4.3.3).
+        let up = std::os::unix::net::UnixStream::connect(cfg.socket_path()).is_ok();
+        match zephyr::desktop::check(cfg, up).as_slice() {
+            [] => println!("ok   desktop: the web app can take it over"),
+            wrong => println!("warn desktop: {}", wrong.join("; ")),
+        }
         if !Path::new("/dev/nvidia0").exists() {
             println!("warn no GPU in the container: the browser's WebGL is software (SwiftShader)");
         }
+    }
+    // Warnings, not failures: voice is an extra the image brings (DESIGN §4.3).
+    for line in zephyr::voice::doctor(cfg).await {
+        println!("{line}");
     }
     // Warnings, not failures: the agent's command-line tools from the image (DESIGN §4.11).
     for program in ["gh", "himalaya"] {

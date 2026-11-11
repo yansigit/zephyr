@@ -200,10 +200,23 @@ async fn the_files_carry_the_security_headers() {
         ("/manifest.webmanifest", "application/manifest+json"),
         ("/icon-192.png", "image/png"),
         ("/icon-512.png", "image/png"),
+        // noVNC, for the Desktop screen: served by the app itself, under the same policy.
+        ("/novnc/core/rfb.js", "text/javascript; charset=utf-8"),
+        (
+            "/novnc/vendor/pako/lib/zlib/inflate.js",
+            "text/javascript; charset=utf-8",
+        ),
+        ("/novnc/LICENSE.txt", "text/plain; charset=utf-8"),
     ] {
         let res = gw.get(path).await;
         assert_eq!(res.status(), 200, "{path}");
         assert_eq!(res.headers()["content-type"], kind, "{path}");
+        assert_eq!(res.headers()["content-security-policy"], CSP, "{path}");
+    }
+    let page = gw.get("/").await.text().await.unwrap();
+    assert!(page.contains(r#"data-screen="desktop" hidden"#), "{page}");
+    for path in ["/novnc/", "/novnc/core/", "/novnc/vendor/pako/README.md"] {
+        assert_eq!(gw.get(path).await.status(), 404, "{path}");
     }
     gw.shutdown().await;
 }
@@ -738,6 +751,7 @@ impl Gateway {
             platform_msg_id: format!("m{n}"),
             sender: "owner".into(),
             text: text.into(),
+            derived: None,
         };
         self.say.send(m).await.unwrap();
     }
@@ -2607,6 +2621,700 @@ async fn without_the_network_floor_the_web_app_does_not_start() {
         gw.store().meta("web_enrol").unwrap(),
         None,
         "and no code was made"
+    );
+    gw.shutdown().await;
+}
+
+// ---- desktop takeover ----
+
+/// A stand-in for x11vnc: it logs its argv, its PATH and what its stdin and stdout are, then
+/// sends back whatever it is sent.
+const X11VNC: &str = r#"#!/bin/sh
+d=$(dirname "$0")
+fds="$(readlink /proc/$$/fd/0) $(readlink /proc/$$/fd/1)"
+{
+  printf 'pid %s\n' "$$"
+  printf 'argv %s\n' "$*"
+  printf 'path %s\n' "$PATH"
+  printf 'fds %s\n' "$fds"
+} >> "$d/x11vnc.log"
+exec cat
+"#;
+
+type Vnc = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+/// A gateway with a desktop (`:99`, never started: only the fake x11vnc is run for it), and a
+/// phone signed in with its own passkey: its socket, subscribed, and its cookie.
+async fn with_desktop(
+    name: &str,
+    tweak: impl FnOnce(&mut Config),
+) -> (Gateway, Authenticator, Ws, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let home = new_home(name);
+    let fake = home.join("x11vnc");
+    std::fs::write(&fake, X11VNC).unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let extra = "[approvals]\npreset = \"manual\"\n";
+    let gw = start_in(&home, free_port(), extra, |cfg| {
+        cfg.desktop = Some(":99".into());
+        cfg.x11vnc = fake;
+        tweak(cfg);
+    });
+    gw.up().await;
+    let phone = Authenticator::new("phone-cred");
+    let cookie = gw.enrol("phone", &phone).await;
+    let mut ws = gw.ws(&cookie).await;
+    ws.rpc("zephyr.subscribe", json!({})).await;
+    (gw, phone, ws, cookie)
+}
+
+impl Ws {
+    /// A signed "Take over": the whole answer.
+    async fn take(&mut self, auth: &Authenticator) -> Value {
+        let signed = self
+            .sign(auth, json!({"op": "desktop", "verb": "take"}))
+            .await;
+        self.rpc("zephyr.desktop", with(signed, json!({"verb": "take"})))
+            .await
+    }
+
+    /// A signed "Take over" that works: its ticket.
+    async fn ticket(&mut self, auth: &Authenticator) -> String {
+        let took = self.take(auth).await;
+        let ticket = took["result"]["ticket"].as_str();
+        ticket.unwrap_or_else(|| panic!("{took}")).to_string()
+    }
+
+    /// Waits for the snapshot to say who holds the desktop. What came before is dropped, so a
+    /// later wait never reads an older state.
+    async fn desktop(&mut self, owner: bool) -> Value {
+        let status = self
+            .event(|e| e["type"] == "zephyr_status" && e["snapshot"]["desktop"]["owner"] == owner)
+            .await;
+        self.events.clear();
+        status["snapshot"]["desktop"].clone()
+    }
+
+    /// Waits for a notice that holds `text`.
+    async fn told(&mut self, text: &str) {
+        self.event(|e| e.to_string().contains(text)).await;
+    }
+}
+
+impl Gateway {
+    /// Asks for the takeover's socket as the app does, the ticket in the subprotocols.
+    async fn vnc(&self, cookie: &str, ticket: Option<&str>) -> Result<Vnc, u16> {
+        let mut req = format!("ws://{HOST}/api/vnc")
+            .into_client_request()
+            .unwrap();
+        let protocols = match ticket {
+            Some(ticket) => format!("zephyr-vnc, zt.{ticket}"),
+            None => "zephyr-vnc".to_string(),
+        };
+        for (name, value) in [
+            ("Origin", ORIGIN),
+            ("Tailscale-User-Login", LOGIN),
+            ("Cookie", cookie),
+            ("Sec-WebSocket-Protocol", protocols.as_str()),
+        ] {
+            let name: reqwest::header::HeaderName = name.parse().unwrap();
+            req.headers_mut().insert(name, value.parse().unwrap());
+        }
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", self.port))
+            .await
+            .unwrap();
+        match tokio_tungstenite::client_async(req, tcp).await {
+            Ok((sock, res)) => {
+                assert_eq!(res.headers()["sec-websocket-protocol"], "zephyr-vnc");
+                Ok(sock)
+            }
+            Err(WsError::Http(res)) => Err(res.status().as_u16()),
+            Err(e) => panic!("the upgrade failed oddly: {e}"),
+        }
+    }
+
+    /// Root's flag that makes the agent's browser and xdotool wait.
+    fn held_flag(&self) -> PathBuf {
+        let name = self.home.file_name().unwrap().to_string_lossy();
+        (self.home).with_file_name(format!("{name}-public/desktop-held"))
+    }
+
+    /// The fake x11vnc's lines that start with `key `, less the key.
+    fn x11vnc(&self, key: &str) -> Vec<String> {
+        let log = std::fs::read_to_string(self.home.join("x11vnc.log")).unwrap_or_default();
+        log.lines()
+            .filter_map(|l| l.strip_prefix(key)?.strip_prefix(' '))
+            .map(String::from)
+            .collect()
+    }
+
+    /// The fake rpi's commands of `kind`, in the order it got them.
+    fn rpi_log(&self, kind: &str) -> Vec<Value> {
+        let log = std::fs::read_to_string(self.home.join("log.jsonl")).unwrap_or_default();
+        log.lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|v| kind.is_empty() || v["type"] == kind)
+            .collect()
+    }
+}
+
+/// Waits until `done` holds, looking again every 20 ms.
+async fn eventually(what: &str, done: impl Fn() -> bool) {
+    let until = std::time::Instant::now() + WAIT;
+    while !done() {
+        assert!(std::time::Instant::now() < until, "never: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Sends `bytes` and reads as many back.
+async fn echoed(sock: &mut Vnc, bytes: &[u8]) -> Vec<u8> {
+    sock.send(Message::Binary(bytes.to_vec())).await.unwrap();
+    let mut back = Vec::new();
+    while back.len() < bytes.len() {
+        let next = tokio::time::timeout(WAIT, sock.next()).await;
+        match next.expect("bytes back in time") {
+            Some(Ok(Message::Binary(part))) => back.extend(part),
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+            other => panic!("the socket ended: {other:?}"),
+        }
+    }
+    back
+}
+
+/// Waits for the server to close the takeover's socket.
+async fn vnc_closed(sock: &mut Vnc) {
+    loop {
+        let next = tokio::time::timeout(WAIT, sock.next()).await;
+        match next.expect("the socket closes in time") {
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+            Some(Ok(_)) => {}
+        }
+    }
+}
+
+const OTHER: &str = "that signature is for another request";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn take_over_needs_a_passkey_signature_and_give_does_not() {
+    let (gw, phone, mut ws, _) = with_desktop("desk-sign", |_| {}).await;
+    let unsigned = ws.rpc("zephyr.desktop", json!({"verb": "take"})).await;
+    assert_eq!(
+        unsigned["error"],
+        json!({"code": -32602, "message": "approve with your passkey"})
+    );
+    // A signature for a setting or for a card does not take the desktop.
+    let setting = json!({"op": "set", "key": "tasks.parallel", "value": "3"});
+    let signed = ws.sign(&phone, setting).await;
+    let answer = ws
+        .rpc("zephyr.desktop", with(signed, json!({"verb": "take"})))
+        .await;
+    assert_eq!(answer["error"]["message"], OTHER, "{answer}");
+    let card = gw.hold_send();
+    let signed = ws.sign_decide(&phone, card, "ok").await;
+    let answer = ws
+        .rpc("zephyr.desktop", with(signed, json!({"verb": "take"})))
+        .await;
+    assert_eq!(answer["error"]["message"], OTHER, "{answer}");
+    let hello = ws.rpc("zephyr.hello", json!({})).await;
+    assert_eq!(
+        hello["result"]["desktop"],
+        json!({"owner": false, "since_unix": 0})
+    );
+    assert!(!gw.held_flag().exists());
+    // Nor does one for the desktop approve a card or change a setting.
+    let desk = json!({"op": "desktop", "verb": "take"});
+    let signed = ws.sign(&phone, desk.clone()).await;
+    let answer = ws
+        .rpc(
+            "zephyr.decide",
+            with(signed, json!({"id": card, "verb": "ok"})),
+        )
+        .await;
+    assert_eq!(answer["error"]["message"], OTHER, "{answer}");
+    assert_eq!(gw.status(card), "pending");
+    let signed = ws.sign(&phone, desk.clone()).await;
+    let change = json!({"key": "tasks.parallel", "value": "3"});
+    let answer = ws.rpc("zephyr.settings_set", with(signed, change)).await;
+    assert_eq!(answer["error"]["message"], OTHER, "{answer}");
+    // Another passkey's signature takes nothing.
+    let forged = ws
+        .sign(&Authenticator::new("phone-cred"), desk.clone())
+        .await;
+    let answer = ws
+        .rpc("zephyr.desktop", with(forged, json!({"verb": "take"})))
+        .await;
+    assert_eq!(
+        answer["error"]["message"],
+        "the passkey signature did not verify"
+    );
+    // Signed: a ticket, and root's flag is there. The same signature does not work again.
+    let signed = with(ws.sign(&phone, desk).await, json!({"verb": "take"}));
+    let took = ws.rpc("zephyr.desktop", signed.clone()).await;
+    let ticket = took["result"]["ticket"].as_str().expect("a ticket");
+    assert_eq!(b64_decode(&json!(ticket)).len(), 32, "{took}");
+    assert!(ws.desktop(true).await["since_unix"].as_i64().unwrap() > 0);
+    assert!(gw.held_flag().exists());
+    let again = ws.rpc("zephyr.desktop", signed).await;
+    assert_eq!(
+        again["error"]["message"],
+        "that signature expired or was used; tap again"
+    );
+    // Another device is told who has it, and may hand it back: that only takes away.
+    let mut ipad = gw.ws(&gw.cookie("ipad")).await;
+    let give = ipad.rpc("zephyr.desktop", json!({"verb": "give"})).await;
+    assert!(give["result"].is_object(), "{give}");
+    ws.desktop(false).await;
+    assert!(!gw.held_flag().exists());
+    let odd = ws.rpc("zephyr.desktop", json!({"verb": "keep"})).await;
+    assert_eq!(odd["error"]["message"], "verb is take or give");
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_desktop_there_is_nothing_to_take() {
+    let (gw, phone, mut ws) = signed_in("desk-none", "").await;
+    let hello = ws.rpc("zephyr.hello", json!({})).await;
+    assert!(hello["result"]["desktop"].is_null(), "{hello}");
+    let took = ws.take(&phone).await;
+    assert_eq!(took["error"]["message"], "there is no desktop", "{took}");
+    gw.shutdown().await;
+}
+
+/// Review Focus 4. The 30 s are `web::vnc`'s own test: no ticket here is that old.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ticket_works_once_for_its_session_within_30_s() {
+    let (gw, phone, mut ws, cookie) = with_desktop("desk-ticket", |_| {}).await;
+    let ticket = ws.ticket(&phone).await;
+    assert_eq!(gw.vnc(&cookie, None).await.err(), Some(401), "no ticket");
+    let made_up = b64(&[7; 32]);
+    assert_eq!(gw.vnc(&cookie, Some(&made_up)).await.err(), Some(401));
+    // No cookie: refused before the ticket is looked at.
+    assert_eq!(gw.vnc("", Some(&ticket)).await.err(), Some(401));
+    // Another signed-in session with this one's ticket, which is then spent.
+    let tablet = gw.cookie("tablet");
+    assert_eq!(gw.vnc(&tablet, Some(&ticket)).await.err(), Some(401));
+    assert_eq!(gw.vnc(&cookie, Some(&ticket)).await.err(), Some(401));
+    let ticket = ws.ticket(&phone).await;
+    let mut sock = gw.vnc(&cookie, Some(&ticket)).await.expect("it opens");
+    assert_eq!(echoed(&mut sock, b"hi").await, b"hi");
+    sock.close(None).await.unwrap();
+    vnc_closed(&mut sock).await;
+    assert_eq!(
+        gw.vnc(&cookie, Some(&ticket)).await.err(),
+        Some(401),
+        "used"
+    );
+    // After the hand back a ticket opens nothing.
+    let ticket = ws.ticket(&phone).await;
+    ws.rpc("zephyr.desktop", json!({"verb": "give"})).await;
+    assert_eq!(gw.vnc(&cookie, Some(&ticket)).await.err(), Some(401));
+    // And the socket is the app's own origin's, like `/api/ws`.
+    let mut req = format!("ws://{HOST}/api/vnc")
+        .into_client_request()
+        .unwrap();
+    for (name, value) in [("Tailscale-User-Login", LOGIN), ("Cookie", cookie.as_str())] {
+        let name: reqwest::header::HeaderName = name.parse().unwrap();
+        req.headers_mut().insert(name, value.parse().unwrap());
+    }
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", gw.port))
+        .await
+        .unwrap();
+    match tokio_tungstenite::client_async(req, tcp).await {
+        Err(WsError::Http(res)) => assert_eq!(res.status(), 403),
+        other => panic!("{:?}", other.map(drop)),
+    }
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_vnc_socket_is_refused_and_a_text_frame_closes_the_first() {
+    let (gw, phone, mut ws, cookie) = with_desktop("desk-one", |_| {}).await;
+    // Two tickets, asked for before any socket opened: the second opens no second socket.
+    let (ticket, spare) = (ws.ticket(&phone).await, ws.ticket(&phone).await);
+    let mut first = gw.vnc(&cookie, Some(&ticket)).await.expect("it opens");
+    assert_eq!(gw.vnc(&cookie, Some(&spare)).await.err(), Some(503));
+    assert_eq!(echoed(&mut first, b"still here").await, b"still here");
+    // The holder takes over again (a phone that loaded the page anew, its old socket not yet
+    // dead): the old socket is ended, and the new ticket's is served.
+    let ticket = ws.ticket(&phone).await;
+    let mut second = gw.vnc(&cookie, Some(&ticket)).await.expect("it opens");
+    vnc_closed(&mut first).await;
+    assert_eq!(echoed(&mut second, b"again").await, b"again");
+    second.send(Message::Text("hello".into())).await.unwrap();
+    vnc_closed(&mut second).await;
+    // Its place is free again.
+    let ticket = ws.ticket(&phone).await;
+    let mut next = gw.vnc(&cookie, Some(&ticket)).await.expect("it opens");
+    // A frame over 1 MiB closes it too, maybe before the whole of it is sent.
+    let _ = next.send(Message::Binary(vec![0; (1 << 20) + 1])).await;
+    vnc_closed(&mut next).await;
+    // And so does the hand back.
+    let ticket = ws.ticket(&phone).await;
+    let mut last = gw.vnc(&cookie, Some(&ticket)).await.expect("it opens");
+    ws.rpc("zephyr.desktop", json!({"verb": "give"})).await;
+    vnc_closed(&mut last).await;
+    gw.shutdown().await;
+}
+
+/// A phone that loaded the page anew while its old socket is stalled (its client stopped
+/// reading, so the bridge is blocked in a write): the old one is cut at once, and the new one
+/// is served, not refused as a second.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_old_socket_does_not_refuse_the_holders_new_one() {
+    let (gw, phone, mut ws, cookie) = with_desktop("desk-stall", |_| {}).await;
+    let ticket = ws.ticket(&phone).await;
+    let mut old = gw.vnc(&cookie, Some(&ticket)).await.expect("it opens");
+    // Sent and never read back: what x11vnc answers piles up until the bridge's write blocks,
+    // and then it takes no more from this side either.
+    let frame = vec![3u8; 1 << 16];
+    let mut stalled = false;
+    for _ in 0..4096 {
+        let sent = old.send(Message::Binary(frame.clone()));
+        if tokio::time::timeout(Duration::from_millis(500), sent)
+            .await
+            .is_err()
+        {
+            stalled = true;
+            break;
+        }
+    }
+    assert!(stalled, "the old socket never stalled");
+    let asked = std::time::Instant::now();
+    let ticket = ws.ticket(&phone).await;
+    let mut new = gw
+        .vnc(&cookie, Some(&ticket))
+        .await
+        .expect("the new socket is served");
+    assert!(
+        asked.elapsed() < Duration::from_secs(4),
+        "the take waited out the old socket: {:?}",
+        asked.elapsed()
+    );
+    assert_eq!(echoed(&mut new, b"here").await, b"here");
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bytes_go_to_x11vnc_and_back() {
+    let (gw, phone, mut ws, cookie) = with_desktop("desk-bytes", |_| {}).await;
+    let ticket = ws.ticket(&phone).await;
+    let mut sock = gw.vnc(&cookie, Some(&ticket)).await.expect("it opens");
+    assert_eq!(echoed(&mut sock, b"RFB 003.008\n").await, b"RFB 003.008\n");
+    // No cap on how many: a pointer drag sends hundreds, where `/api/ws` closes at 60 a minute.
+    for i in 0..200u8 {
+        let frame = [5, 1, 0, i, 0, i];
+        assert_eq!(echoed(&mut sock, &frame).await, frame);
+    }
+    assert_eq!(
+        ws.rpc("zephyr.hello", json!({})).await["result"]["desktop"]["owner"],
+        true
+    );
+    // The session ending closes it at once, like the chat socket.
+    gw.say("chat", "/web signout").await;
+    vnc_closed(&mut sock).await;
+    gw.shutdown().await;
+}
+
+/// Review Focus 3: nothing for the agent to connect to.
+#[tokio::test(flavor = "multi_thread")]
+async fn x11vnc_is_started_with_inetd_and_listens_nowhere() {
+    let (gw, phone, mut ws, cookie) = with_desktop("desk-inetd", |_| {}).await;
+    let ticket = ws.ticket(&phone).await;
+    let mut sock = gw.vnc(&cookie, Some(&ticket)).await.expect("it opens");
+    assert_eq!(echoed(&mut sock, b"up").await, b"up");
+    let argv = gw.x11vnc("argv");
+    let auth = gw.home.join(".zephyr-xauthority");
+    assert_eq!(
+        argv,
+        [format!(
+            "-inetd -once -norc -nocmds -noremote -nossl -quiet -display :99 -auth {}",
+            auth.display()
+        )]
+    );
+    for listens in ["-listen", "-rfbport", "-autoport", "-unixsock", "-connect"] {
+        assert!(!argv[0].contains(listens), "{argv:?}");
+    }
+    // Run for the agent (`agent::cmd`), and its stdin and stdout are one unnamed socket.
+    assert_eq!(gw.x11vnc("path"), [zephyr::agent::AGENT_PATH]);
+    let fds = gw.x11vnc("fds").remove(0);
+    let (stdin, stdout) = fds.split_once(' ').unwrap();
+    assert!(stdin.starts_with("socket:[") && stdin == stdout, "{fds}");
+    // It is killed when the socket ends: gone, or waiting to be reaped.
+    let stat = format!("/proc/{}/stat", gw.x11vnc("pid")[0]);
+    let running = || {
+        let stat = std::fs::read_to_string(&stat).unwrap_or_default();
+        let state = stat.rsplit_once(") ").map(|(_, rest)| rest.chars().next());
+        !matches!(state, None | Some(Some('Z')))
+    };
+    assert!(running());
+    drop(sock);
+    let until = std::time::Instant::now() + WAIT;
+    while running() {
+        assert!(
+            std::time::Instant::now() < until,
+            "x11vnc outlived its socket"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    gw.shutdown().await;
+}
+
+/// Review Focus 5: a phone that locks mid-takeover does not stop the agent's browser for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_socket_gives_the_desktop_back_after_the_wait() {
+    let (gw, phone, mut ws, cookie) = with_desktop("desk-gone", |cfg| {
+        cfg.desktop_gone = Duration::from_millis(200);
+    })
+    .await;
+    let ticket = ws.ticket(&phone).await;
+    ws.desktop(true).await;
+    let sock = gw.vnc(&cookie, Some(&ticket)).await.expect("it opens");
+    assert!(gw.held_flag().exists());
+    drop(sock); // no close frame: the phone just went
+    ws.told("[zephyr] the desktop went back to the agent after the app closed")
+        .await;
+    ws.desktop(false).await;
+    assert!(!gw.held_flag().exists(), "the wrappers would still wait");
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_takeover_gives_the_desktop_back() {
+    let (gw, phone, mut ws, _) = with_desktop("desk-idle", |cfg| {
+        cfg.desktop_idle = Duration::from_millis(200);
+    })
+    .await;
+    ws.ticket(&phone).await;
+    ws.told("[zephyr] the desktop went back to the agent after 10 min without input")
+        .await;
+    ws.desktop(false).await;
+    assert!(!gw.held_flag().exists());
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_takeover_ends_at_its_cap() {
+    let (gw, phone, mut ws, _) = with_desktop("desk-cap", |cfg| {
+        cfg.desktop_cap = Duration::from_millis(200);
+    })
+    .await;
+    ws.ticket(&phone).await;
+    ws.told("[zephyr] the desktop went back to the agent after 60 min")
+        .await;
+    ws.desktop(false).await;
+    assert!(!gw.held_flag().exists());
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn main_is_told_at_take_and_at_hand_back_and_stays_clean() {
+    let (gw, phone, mut ws, _) = with_desktop("desk-notes", |_| {}).await;
+    let settled = |e: &Value| e["type"] == "agent_settled";
+    let steers = |gw: &Gateway| -> Vec<String> {
+        gw.rpi_log("queue_message")
+            .iter()
+            .map(|c| {
+                assert_eq!(c["deliverAs"], "steer");
+                c["message"].as_str().unwrap().to_string()
+            })
+            .collect()
+    };
+    ws.say("one").await;
+    ws.event(settled).await;
+    // Main is idle: nothing is steered at the take, and the hand-back note waits.
+    ws.ticket(&phone).await;
+    ws.desktop(true).await;
+    ws.rpc("zephyr.desktop", json!({"verb": "give"})).await;
+    ws.desktop(false).await;
+    assert_eq!(steers(&gw), [""; 0]);
+    // It goes in front of the next prompt: rpi delivers a steer queued while idle as the run
+    // starts.
+    ws.say("two").await;
+    ws.event(settled).await;
+    let notes = steers(&gw);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].starts_with("[zephyr] the owner used the desktop from ")
+            && notes[0]
+                .ends_with(". The page may have changed: take a fresh snapshot before acting."),
+        "{notes:?}"
+    );
+    let order: Vec<String> = (gw.rpi_log("").iter())
+        .filter(|c| c["type"] == "queue_message" || c["type"] == "prompt")
+        .map(|c| c["type"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(order, ["prompt", "queue_message", "prompt"]);
+    // In a run: both notes are steered in as they happen.
+    ws.say("[hang] three").await;
+    ws.event(|e| e["type"] == "message_start" && e.to_string().contains("[hang] three"))
+        .await;
+    ws.ticket(&phone).await;
+    ws.desktop(true).await;
+    let notes = steers(&gw);
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(
+        notes[1].starts_with("[zephyr] the owner took over the desktop at ")
+            && notes[1].ends_with(
+                "; browser and desktop commands wait until they hand it back. Do other work \
+                 meanwhile."
+            ),
+        "{notes:?}"
+    );
+    ws.rpc("zephyr.desktop", json!({"verb": "give"})).await;
+    ws.desktop(false).await;
+    let notes = steers(&gw);
+    assert_eq!(notes.len(), 3, "{notes:?}");
+    assert!(
+        notes[2].starts_with("[zephyr] the owner used the desktop from "),
+        "{notes:?}"
+    );
+    // A take and a hand back made back to back are still two notes, in that order.
+    ws.ticket(&phone).await;
+    ws.rpc("zephyr.desktop", json!({"verb": "give"})).await;
+    eventually("both notes", || steers(&gw).len() == 5).await;
+    let notes = steers(&gw);
+    assert!(
+        notes[3].starts_with("[zephyr] the owner took over the desktop at ")
+            && notes[4].starts_with("[zephyr] the owner used the desktop from "),
+        "{notes:?}"
+    );
+    ws.say("/stop").await;
+    ws.event(settled).await;
+    // The daemon's own notes: the conversation is still the owner's alone.
+    let origin = gw.store().session_origin("main").unwrap();
+    assert_eq!(origin, zephyr::store::SessionOrigin::Clean);
+    gw.shutdown().await;
+}
+
+/// The ticket is the owner's only once nothing of the agent's is on the desktop: a command
+/// still running after the wait is killed first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_still_running_is_killed_before_the_ticket_is_issued() {
+    use std::io::BufRead;
+    use std::os::unix::process::ExitStatusExt;
+    let (gw, phone, mut ws, _) = with_desktop("desk-drain", |cfg| {
+        cfg.desktop_drain = Duration::from_millis(300);
+    })
+    .await;
+    let lock = gw.held_flag().with_file_name("desktop.lock");
+    let script = "import fcntl, sys, time\nf = open(sys.argv[1])\n\
+                  fcntl.flock(f, fcntl.LOCK_SH)\nprint('placed', flush=True)\ntime.sleep(600)\n";
+    let mut stuck = std::process::Command::new("python3")
+        .args(["-I", "-c", script])
+        .arg(&lock)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(stuck.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(line.trim(), "placed");
+    ws.ticket(&phone).await;
+    // Already dead when the ticket is in hand.
+    let ended = stuck.try_wait().unwrap();
+    assert_eq!(
+        ended.and_then(|status| status.signal()),
+        Some(9),
+        "{ended:?}"
+    );
+    ws.rpc("zephyr.desktop", json!({"verb": "give"})).await;
+    gw.shutdown().await;
+}
+
+/// A restart or a re-exec ends a takeover: the owner and main are told, never left guessing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_during_a_takeover_tells_the_owner_and_main() {
+    let home = new_home("desk-restart");
+    let gw = start_in(&home, free_port(), "", |_| {});
+    gw.up().await;
+    gw.say("chat", "one").await;
+    gw.sent("chat", |t| t.contains("echo: ")).await;
+    let flag = gw.held_flag();
+    gw.shutdown().await;
+    // A flag with no take on record ends no takeover: it is removed, and nothing is said.
+    std::fs::write(&flag, "50400\n").unwrap();
+    let gw = start_in(&home, free_port(), "", |_| {});
+    gw.up().await;
+    gw.say("chat", "idle").await;
+    gw.sent("chat", |t| t.contains("echo: ")).await;
+    assert!(!flag.exists());
+    assert_eq!(gw.rpi_log("queue_message").len(), 0);
+    // The daemon went down while the owner held the desktop: its own record says since when.
+    gw.store().set_meta("desktop_take", Some("50400")).unwrap();
+    gw.shutdown().await;
+    std::fs::write(&flag, "1\n").unwrap();
+    let gw = start_in(&home, free_port(), "", |_| {});
+    gw.sent("chat", |t| {
+        t == "[zephyr] the desktop went back to the agent when zephyr restarted"
+    })
+    .await;
+    assert!(!flag.exists());
+    gw.say("chat", "two").await;
+    gw.sent("chat", |t| t.contains("echo: ")).await;
+    let notes = gw.rpi_log("queue_message");
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    let note = notes[0]["message"].as_str().unwrap();
+    assert!(
+        note.starts_with("[zephyr] the owner used the desktop from ")
+            && note.ends_with(". The page may have changed: take a fresh snapshot before acting."),
+        "{note}"
+    );
+    assert_eq!(gw.store().meta("desktop_take").unwrap(), None);
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fill_during_a_takeover_is_refused() {
+    let (gw, phone, mut ws, _) = with_desktop("desk-fill", |_| {}).await;
+    let vault = "[[login]]\nname = \"github\"\nsite = \"https://github.com\"\n\
+                 username = \"aiden\"\npassword = \"hunter2-secret\"\ngranted = true\n";
+    std::fs::write(gw.home.join("vault.toml"), vault).unwrap();
+    ws.ticket(&phone).await;
+    ws.desktop(true).await;
+    ws.say(r##"[call vault {"action": "fill", "name": "github", "password": "#pw"}]"##)
+        .await;
+    let reply = ws
+        .event(|e| e["type"] == "message_end" && e.to_string().contains("vault: "))
+        .await;
+    assert!(
+        reply.to_string().contains(
+            "vault: not filled: the owner has the desktop; try again when they hand it back"
+        ),
+        "{reply}"
+    );
+    // The fake browser was never asked: nothing typed into the page under the owner's hands.
+    ws.rpc("zephyr.desktop", json!({"verb": "give"})).await;
+    ws.desktop(false).await;
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_shows_who_holds_the_desktop() {
+    let (gw, phone, mut ws, _) = with_desktop("desk-snap", |_| {}).await;
+    let hello = ws.rpc("zephyr.hello", json!({})).await;
+    assert_eq!(
+        hello["result"]["desktop"],
+        json!({"owner": false, "since_unix": 0})
+    );
+    let before = zephyr::now();
+    ws.ticket(&phone).await;
+    let held = ws.desktop(true).await;
+    let since = held["since_unix"].as_i64().unwrap();
+    assert!(since >= before && since <= zephyr::now(), "{held}");
+    // A second device is told another has it.
+    let tablet = Authenticator::new("tablet-cred");
+    let mut other = gw.ws(&gw.enrol("tablet", &tablet).await).await;
+    let refused = other.take(&tablet).await;
+    assert_eq!(
+        refused["error"]["message"], "another device has the desktop",
+        "{refused}"
+    );
+    ws.rpc("zephyr.desktop", json!({"verb": "give"})).await;
+    assert_eq!(
+        ws.desktop(false).await,
+        json!({"owner": false, "since_unix": 0})
     );
     gw.shutdown().await;
 }

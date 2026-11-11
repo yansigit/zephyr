@@ -783,6 +783,14 @@ fn strays(all: &HashMap<i32, Ps>, uid: u32, scope: i32, keep: &[i32]) -> Vec<(i3
         .collect()
 }
 
+/// SIGKILLs every process `is` picks by its pid and real uid, each only while it is still the
+/// process that was read. The voice decoders' sweep (`voice::sweep`). Returns how many.
+pub(crate) fn kill_all(is: impl Fn(i32, u32) -> bool) -> usize {
+    (processes().iter())
+        .filter(|(pid, p)| is(**pid, p.uid) && kill_exact(**pid, p.ticks))
+        .count()
+}
+
 /// SIGKILLs `pid` only if it still has the start time `ticks`: a reused pid is left alone.
 fn kill_exact(pid: i32, ticks: i64) -> bool {
     // The pidfd first, as in `adopt`: it pins the process the start-time check is about.
@@ -1263,6 +1271,8 @@ mod tests {
             (13, ps(11, "sh")),
             (15, ps(10, "openbox")),
             (16, ps(15, "sh")),
+            // The takeover's x11vnc: the daemon's own child, so no stray.
+            (17, ps(10, "x11vnc")),
             (50, ps(1, "Xvfb")),
             (51, ps(50, "xkbcomp")),
             (52, ps(1, "openbox")),

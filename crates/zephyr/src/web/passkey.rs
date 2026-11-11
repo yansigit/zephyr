@@ -197,6 +197,8 @@ pub enum Signed {
         until: Option<String>,
         current: Option<String>,
     },
+    /// Taking the agent's desktop over. A signature for a card or a setting is none for this.
+    Desktop,
 }
 
 /// The bytes whose SHA-256 is the WebAuthn challenge: a JSON array, so the order is fixed.
@@ -223,6 +225,7 @@ pub fn preimage(s: &Signed, nonce: &[u8; 16]) -> Vec<u8> {
             until,
             current,
         } => json!(["zephyr-web/1", "set", key, value, until, current, nonce]),
+        Signed::Desktop => json!(["zephyr-web/1", "desktop", "take", nonce]),
     };
     v.to_string().into_bytes()
 }
@@ -603,6 +606,10 @@ mod tests {
             (set("k", "v", None, Some("2h")), [0; 16]),
             (set("k", "v", None, Some("null")), [0; 16]),
             (set("k", "v", None, None), [1; 16]),
+            (Signed::Desktop, [0; 16]),
+            (Signed::Desktop, [1; 16]),
+            // A setting named to look like the takeover is still a `set`.
+            (set("desktop", "take", None, None), [0; 16]),
         ];
         let hashes: std::collections::HashSet<_> = cases
             .iter()
@@ -623,6 +630,14 @@ mod tests {
                 r#"["zephyr-web/1","set","k","v","2h",null,"{}"]"#,
                 "00".repeat(16)
             )
+        );
+    }
+
+    #[test]
+    fn the_takeover_has_a_preimage_of_its_own() {
+        assert_eq!(
+            String::from_utf8(preimage(&Signed::Desktop, &[0xab; 16])).unwrap(),
+            format!(r#"["zephyr-web/1","desktop","take","{}"]"#, "ab".repeat(16))
         );
     }
 

@@ -210,6 +210,7 @@ pub fn to_inbound(
         platform_msg_id: msg_id.to_string(),
         sender: author_id.to_string(),
         text: text.into(),
+        derived: None,
     })
 }
 
@@ -408,6 +409,7 @@ mod tests {
                 platform_msg_id: "111".into(),
                 sender: "222".into(),
                 text: "hi".into(),
+                derived: None,
             }
         );
     }

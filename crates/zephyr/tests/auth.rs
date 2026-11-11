@@ -93,6 +93,7 @@ impl Gateway {
             platform_msg_id: id.into(),
             sender: "owner".into(),
             text: text.into(),
+            derived: None,
         };
         self.feed.send(m).await.unwrap();
     }
@@ -373,6 +374,7 @@ async fn a_daemon_busy_from_its_start_still_refreshes_a_due_credential() {
         platform_msg_id: "m1".into(),
         sender: "owner".into(),
         text: "hello".into(),
+        derived: None,
     };
     zephyr::store::Store::open(&cfg.db_path())
         .unwrap()

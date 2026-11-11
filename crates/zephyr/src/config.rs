@@ -112,6 +112,19 @@ pub struct Config {
     /// `[approvals]`: how messages, posts and payments wait for the owner (approvals spec §4.3).
     /// Absent is the `manual` preset. `approvals::effective` reads it.
     pub approvals: Option<Approvals>,
+    /// `[voice]`: voice notes in and spoken replies out (DESIGN §4.3). `Config::voice` reads it.
+    pub voice: Option<Voice>,
+    /// The image's voice folder (`voice::DIR`): ffmpeg, whisper-cli, Piper, models and voices.
+    /// Not configurable; tests point it at small fakes.
+    #[serde(skip, default = "voice_dir")]
+    pub voice_dir: PathBuf,
+    /// How long one whisper run may take before it is killed. Not configurable; tests shorten it.
+    #[serde(skip, default = "voice_wait")]
+    pub voice_wait: std::time::Duration,
+    /// Lets voice run outside the network floor. Not configurable, and off; the tests' process
+    /// is not a container, and sets it.
+    #[serde(skip)]
+    pub voice_off_floor: bool,
     /// The file this was loaded from, which a reload reads again. `None` when built in memory.
     #[serde(skip)]
     pub path: Option<PathBuf>,
@@ -140,6 +153,30 @@ pub struct Config {
     /// The signal-cli the daemon runs as root, by full path. Not configurable; tests set a fake.
     #[serde(skip, default = "signal_cli")]
     pub signal_cli: PathBuf,
+    /// How long the gate lets a browser or desktop command wait while the owner holds the
+    /// desktop (DESIGN §4.11). Not configurable; tests shorten it.
+    #[serde(skip, default = "desktop_hold")]
+    pub desktop_hold: std::time::Duration,
+    /// The agent's display, which the owner may take over from the web app (DESIGN §4.3.3):
+    /// `$ZEPHYR_DESKTOP`. `None` is no desktop, so no takeover. Not configurable; tests set it.
+    #[serde(skip, default = "desktop")]
+    pub desktop: Option<String>,
+    /// x11vnc, by full path, started for each takeover. Not configurable; tests set a fake.
+    #[serde(skip, default = "x11vnc")]
+    pub x11vnc: PathBuf,
+    /// A takeover ends by itself after this long with no key or pointer from the owner, after
+    /// `desktop_cap` in all, and `desktop_gone` after its socket closed. Not configurable (no
+    /// registry rows until the owner asks for one); tests shorten them.
+    #[serde(skip, default = "desktop_idle")]
+    pub desktop_idle: std::time::Duration,
+    #[serde(skip, default = "desktop_cap")]
+    pub desktop_cap: std::time::Duration,
+    #[serde(skip, default = "desktop_gone")]
+    pub desktop_gone: std::time::Duration,
+    /// How long a take waits for the agent's browser and desktop commands already running to
+    /// end, before it kills them (DESIGN §4.11). Not configurable; tests shorten it.
+    #[serde(skip, default = "desktop_drain")]
+    pub desktop_drain: std::time::Duration,
 }
 
 fn telegram_api() -> String {
@@ -148,6 +185,14 @@ fn telegram_api() -> String {
 
 fn signal_cli() -> PathBuf {
     PathBuf::from("/opt/zephyr/signal/bin/signal-cli")
+}
+
+fn voice_dir() -> PathBuf {
+    PathBuf::from(crate::voice::DIR)
+}
+
+fn voice_wait() -> std::time::Duration {
+    std::time::Duration::from_secs(3 * 60)
 }
 
 fn web_lockout() -> std::time::Duration {
@@ -180,6 +225,37 @@ fn tick() -> std::time::Duration {
 
 fn min_until() -> std::time::Duration {
     std::time::Duration::from_secs(30)
+}
+
+fn desktop_hold() -> std::time::Duration {
+    std::time::Duration::from_secs(2 * 60)
+}
+
+fn desktop() -> Option<String> {
+    std::env::var("ZEPHYR_DESKTOP")
+        .ok()
+        .filter(|d| !d.is_empty())
+}
+
+fn x11vnc() -> PathBuf {
+    PathBuf::from("/usr/bin/x11vnc")
+}
+
+// shortcut: constants, with no registry rows until the owner asks for one.
+fn desktop_idle() -> std::time::Duration {
+    std::time::Duration::from_secs(10 * 60)
+}
+
+fn desktop_cap() -> std::time::Duration {
+    std::time::Duration::from_secs(60 * 60)
+}
+
+fn desktop_drain() -> std::time::Duration {
+    std::time::Duration::from_secs(15)
+}
+
+fn desktop_gone() -> std::time::Duration {
+    std::time::Duration::from_secs(60)
 }
 
 fn floor() -> bool {
@@ -257,6 +333,32 @@ pub fn hh_mm(at: &str) -> Option<(u32, u32)> {
     };
     let (h, m) = (two(h)?, two(m)?);
     (h < 24 && m < 60).then_some((h, m))
+}
+
+/// `[voice]` (DESIGN §4.3).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Voice {
+    /// Whether an owner's voice note is transcribed.
+    pub transcribe: bool,
+    /// `off`, `mirror` (a reply to a voice note is also spoken) or `always`.
+    pub reply: String,
+    /// whisper's language codes. A note detected as another is run again as the first; with
+    /// one entry nothing is detected.
+    pub languages: Vec<String>,
+    /// A longer note is not transcribed, 10 to 900.
+    pub max_secs: u64,
+}
+
+impl Default for Voice {
+    fn default() -> Self {
+        Self {
+            transcribe: true,
+            reply: "mirror".into(),
+            languages: vec!["ko".into(), "en".into()],
+            max_secs: 300,
+        }
+    }
 }
 
 /// `[tasks]` (DESIGN §4.12).
@@ -468,7 +570,7 @@ impl Config {
 
     /// A reloaded file keeps the running daemon's values of the fields no file sets (`tick`,
     /// `stall_limit`, `min_until`, `job_timeout`, `exec_backstop`, `path`, `projects`,
-    /// `agent_browser`, `push_hosts`, `web_lockout`, `web_ping`): a reload changes settings,
+    /// `agent_browser`, `push_hosts`, `web_lockout`, `web_ping`, `voice_dir`, `voice_wait`): a reload changes settings,
     /// never these (R30).
     pub fn keep_hidden(&mut self, running: &Config) {
         self.job_timeout = running.job_timeout;
@@ -487,6 +589,16 @@ impl Config {
         self.web_ping = running.web_ping;
         self.telegram_api = running.telegram_api.clone();
         self.signal_cli = running.signal_cli.clone();
+        self.desktop_hold = running.desktop_hold;
+        self.desktop = running.desktop.clone();
+        self.x11vnc = running.x11vnc.clone();
+        self.desktop_idle = running.desktop_idle;
+        self.desktop_cap = running.desktop_cap;
+        self.desktop_gone = running.desktop_gone;
+        self.desktop_drain = running.desktop_drain;
+        self.voice_dir = running.voice_dir.clone();
+        self.voice_wait = running.voice_wait;
+        self.voice_off_floor = running.voice_off_floor;
     }
 
     /// Account names become directory names, so each must be a plain, unique path segment.
@@ -512,6 +624,11 @@ impl Config {
         (self.memory.as_ref())
             .and_then(|m| m.notify.as_deref())
             .unwrap_or("each")
+    }
+
+    /// `[voice]`, with its defaults when the table or a key is absent.
+    pub fn voice(&self) -> Voice {
+        self.voice.clone().unwrap_or_default()
     }
 
     /// `[review] at`, when the daily review is on.
@@ -556,6 +673,20 @@ impl Config {
         if self.digest() && self.review_at().is_none() {
             anyhow::bail!(
                 "[memory] notify = \"digest\" needs [review] at: the digest goes in the daily review"
+            );
+        }
+        let voice = self.voice();
+        if !crate::voice::REPLIES.contains(&voice.reply.as_str()) {
+            anyhow::bail!("[voice] reply must be off, mirror or always");
+        }
+        if !(10..=900).contains(&voice.max_secs) {
+            anyhow::bail!("[voice] max_secs must be 10 to 900");
+        }
+        // Each goes into whisper's argv, so only its own codes.
+        let known = |l: &String| crate::voice::LANGUAGES.contains(&l.as_str());
+        if voice.languages.is_empty() || !voice.languages.iter().all(known) {
+            anyhow::bail!(
+                "[voice] languages must be whisper's language codes, e.g. [\"ko\", \"en\"]"
             );
         }
         if !(1..=32).contains(&self.parallel_tasks()) {

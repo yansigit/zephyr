@@ -1035,7 +1035,11 @@ struct Wire {
     session: String,
     #[serde(default)]
     call_id: Option<String>,
+    #[serde(default)]
     tool: String,
+    /// `"wait"`: a browser or desktop wrapper found the owner holding the desktop (DESIGN §4.11).
+    #[serde(default)]
+    desktop: Option<String>,
     #[serde(default)]
     args: Value,
     #[serde(default)]
@@ -1058,6 +1062,7 @@ pub async fn serve(
     waits: Waits,
     wake: &Wake,
     main: mpsc::Sender<crate::router::GateNote>,
+    desktop: Arc<crate::desktop::Control>,
 ) -> anyhow::Result<()> {
     let cfg = cfgs.borrow().clone();
     let started = Store::open(&cfg.db_path())
@@ -1078,6 +1083,7 @@ pub async fn serve(
     };
     let store = Arc::new(Mutex::new(store));
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
+    let desktop_waits = Arc::new(tokio::sync::Semaphore::new(DESKTOP_WAITS));
     let mut conns = FuturesUnordered::new();
     loop {
         tokio::select! {
@@ -1092,11 +1098,10 @@ pub async fn serve(
                         store: store.clone(),
                         waits: waits.clone(),
                         main: main.clone(),
+                        desktop: desktop.clone(),
+                        desktop_waits: desktop_waits.clone(),
                     };
-                    conns.push(async move {
-                        conn.run(stream, wake).await;
-                        drop(slot);
-                    });
+                    conns.push(conn.run(stream, wake, slot));
                 }
                 Err(e) => {
                     eprintln!("zephyr: gate accept failed: {e}");
@@ -1142,10 +1147,20 @@ struct Conn {
     waits: Waits,
     /// Into the router, for main's held notes.
     main: mpsc::Sender<crate::router::GateNote>,
+    /// Who holds the desktop, for the wrappers that wait on it.
+    desktop: Arc<crate::desktop::Control>,
+    /// The places of the wrappers that wait on the desktop ([`DESKTOP_WAITS`]).
+    desktop_waits: Arc<tokio::sync::Semaphore>,
 }
 
+/// Wrappers that may wait on the desktop at once, each up to `Config::desktop_hold`. They wait
+/// outside the gate's own connections, so a burst of browser commands during a takeover never
+/// has the agent's other calls refused; one more is told at once that the owner has the desktop.
+const DESKTOP_WAITS: usize = 8;
+
 impl Conn {
-    async fn run(self, stream: UnixStream, wake: &Wake) {
+    /// `slot` is this connection's place among the gate's [`MAX_CONNS`], held to the end.
+    async fn run(self, stream: UnixStream, wake: &Wake, slot: tokio::sync::OwnedSemaphorePermit) {
         // Another uid is hung up on, unanswered.
         if !stream.peer_cred().is_ok_and(|c| c.uid() == agent_uid()) {
             return;
@@ -1157,12 +1172,43 @@ impl Conn {
             Ok(Ok(n)) if n > 0 => {}
             _ => return, // idle, gone or broken
         }
+        if let Ok(Wire {
+            v: 1,
+            desktop: Some(what),
+            ..
+        }) = serde_json::from_slice::<Wire>(&line)
+        {
+            if what == "wait" && line.len() <= MAX_REQUEST {
+                // Never `allow`: the command does not run on a page the owner changed. Only an
+                // empty text (nothing was held after all) lets the wrapper go on.
+                drop(slot);
+                let text = match self.desktop_waits.clone().try_acquire_owned() {
+                    Ok(_place) => self.desktop_wait().await,
+                    Err(_) => (self.desktop.held()).map_or_else(String::new, |held| {
+                        crate::desktop::still(&self.cfg, held.since)
+                    }),
+                };
+                let answer = serde_json::json!({ "verdict": "deny", "text": text });
+                let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
+                return;
+            }
+        }
         // Only what reaches the gate this way: main's `exec` is decided in the router.
         let served = |w: &Wire| matches!(w.tool.as_str(), "bash" | "mcp_call" | "browser");
         let (verdict, waiting, session) = match serde_json::from_slice::<Wire>(&line) {
             Ok(wire) if wire.v == 1 && line.len() <= MAX_REQUEST && served(&wire) => {
                 let session = wire.session.clone();
-                let (verdict, waiting) = self.decide(wire).await;
+                // Nothing of the agent's touches the page while the owner has it: not typing,
+                // not a click the gate would let through at once. Refused before it is
+                // decided, so nothing is recorded as allowed.
+                let held = (self.desktop.held()).filter(|_| wire.tool == "browser");
+                let (verdict, waiting) = match held {
+                    Some(held) => {
+                        let text = crate::desktop::still(&self.cfg, held.since);
+                        (Verdict::Deny(text), None)
+                    }
+                    None => self.decide(wire).await,
+                };
                 (verdict, waiting, session)
             }
             _ => {
@@ -1186,9 +1232,19 @@ impl Conn {
                 let read = reader.into_inner();
                 let clean = read.buffer().is_empty();
                 let mut read = read.into_inner();
-                let Some(answer) = self.wait(id, verdict, &mut read, clean).await else {
+                let Some(mut answer) = self.wait(id, verdict, &mut read, clean).await else {
                     return; // nobody left to answer
                 };
+                // Let go while the owner holds the desktop (taken over since the click was
+                // read): never `allow`. The page it was approved on is under the owner's hands,
+                // so it is refused, not kept waiting, and recorded as not run.
+                if let (true, Some(held)) = (answer["verdict"] == "allow", self.desktop.held()) {
+                    let text = crate::desktop::still(&self.cfg, held.since);
+                    answer = serde_json::json!({ "verdict": "deny", "id": id, "text": text });
+                    let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
+                    self.finish(id, HELD_ENDING, wake).await;
+                    return;
+                }
                 let sent = write.write_all(format!("{answer}\n").as_bytes()).await;
                 if answer["verdict"] == "allow" {
                     let told = sent.is_ok();
@@ -1198,6 +1254,27 @@ impl Conn {
             }
         };
         let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
+    }
+
+    /// What a wrapper that found `desktop-held` is told (DESIGN §4.11): nothing when the desktop
+    /// is not held (any more), the hand-back text once the owner gives it back, or after
+    /// `desktop_hold`, well under the run's `stall_limit`, that the owner still has it.
+    async fn desktop_wait(&self) -> String {
+        let mut changes = self.desktop.changes();
+        let Some(held) = changes.borrow_and_update().clone() else {
+            return String::new();
+        };
+        let back = async {
+            while changes.changed().await.is_ok() {
+                if changes.borrow().as_ref() != Some(&held) {
+                    break;
+                }
+            }
+        };
+        match tokio::time::timeout(self.cfg.desktop_hold, back).await {
+            Ok(()) => crate::desktop::used(&self.cfg, held.since, crate::now()),
+            Err(_) => crate::desktop::still(&self.cfg, held.since),
+        }
     }
 
     /// M2: a browser action the owner let go ends as its wrapper says, once it read the page
@@ -1217,7 +1294,12 @@ impl Conn {
             }
             None => Some(None),
         };
-        let (status, result, told) = ending(said);
+        self.finish(id, ending(said), wake).await
+    }
+
+    /// Records how taken action `id` ended, and tells the owner of one that did not run.
+    async fn finish(&self, id: i64, ending: Ending, wake: &Wake) {
+        let (status, result, told) = ending;
         let (cfg, store) = (self.cfg.clone(), self.store.clone());
         let recorded = tokio::task::spawn_blocking(move || {
             let store = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -1335,11 +1417,22 @@ impl Conn {
     }
 }
 
+/// How a taken action ended: its status, the record's words, and what the owner is told after
+/// `[zephyr] #N (summary)` when it did not run.
+type Ending = (&'static str, &'static str, Option<&'static str>);
+
+/// An action let go while the owner held the desktop: its wrapper was refused.
+const HELD_ENDING: Ending = (
+    "failed",
+    "not run: the owner had the desktop",
+    Some(" did not run: you had the desktop"),
+);
+
 /// How a browser action the owner let go ended, from what its wrapper said (`None`: nothing in
 /// [`REPORT_WAIT`]; `Some(None)`: gone, or nothing it could read): its status, the record's
 /// words, and, when it did not run (or may not have), what the owner is told after
 /// `[zephyr] #N (summary)`: at `/ok` they read that the browser goes on (round 3).
-fn ending(said: Option<Option<Value>>) -> (&'static str, &'static str, Option<&'static str>) {
+fn ending(said: Option<Option<Value>>) -> Ending {
     match said {
         None => (
             "unknown",
@@ -1347,6 +1440,8 @@ fn ending(said: Option<Option<Value>>) -> (&'static str, &'static str, Option<&'
             Some(": zephyr could not tell whether it ran"),
         ),
         Some(Some(v)) if v["ran"] == true => ("done", "the browser went on", None),
+        // The wrapper found the owner holding the desktop after the `allow`.
+        Some(Some(v)) if v["ran"] == false && v["held"] == true => HELD_ENDING,
         Some(Some(v)) if v["ran"] == false => (
             "failed",
             "not run: the page changed while the owner decided",
@@ -3322,9 +3417,27 @@ mod tests {
         (socket, waits)
     }
 
-    /// `serving`, with the wake the gate notifies.
+    /// `serving`, with the desktop's lock the gate reads.
+    async fn serving_desktop(h: &Home) -> (PathBuf, Arc<crate::desktop::Control>) {
+        let desktop = crate::desktop::Control::new(&h.cfg);
+        let (socket, _, _) = serving_all(h, desktop.clone()).await;
+        (socket, desktop)
+    }
+
     async fn serving_with(
         h: &Home,
+    ) -> (
+        PathBuf,
+        crate::actions::Waits,
+        &'static crate::scheduler::Wake,
+    ) {
+        serving_all(h, crate::desktop::Control::new(&h.cfg)).await
+    }
+
+    /// `serving`, with the wake the gate notifies.
+    async fn serving_all(
+        h: &Home,
+        desktop: Arc<crate::desktop::Control>,
     ) -> (
         PathBuf,
         crate::actions::Waits,
@@ -3335,7 +3448,7 @@ mod tests {
         let (_, snap) = tokio::sync::watch::channel(crate::router::Snapshot::default());
         let wake: &'static crate::scheduler::Wake = Box::leak(Box::default());
         let (main, _) = mpsc::channel(1);
-        tokio::spawn(serve(cfgs, snap, waits.clone(), wake, main));
+        tokio::spawn(serve(cfgs, snap, waits.clone(), wake, main, desktop));
         let socket = socket_path(&h.cfg);
         for _ in 0..200 {
             if tokio::net::UnixStream::connect(&socket).await.is_ok() {
@@ -3379,6 +3492,228 @@ mod tests {
         let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
     }
 
+    /// DESIGN §4.11: a wrapper that found `desktop-held` waits on the gate, and is told at the
+    /// hand back that its command did not run. Nothing held is an empty text: it goes on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_desktop_wait_is_answered_at_the_hand_back() {
+        let h = home("gate-desktop-back", "");
+        let (socket, desktop) = serving_desktop(&h).await;
+        let wait = json!({"v": 1, "desktop": "wait", "session": "task-1"});
+        assert_eq!(
+            ask(&socket, &wait).await.unwrap(),
+            json!({"verdict": "deny", "text": ""})
+        );
+        desktop.take([1; 32], 14 * 3600 + 4 * 60).unwrap();
+        let asked = tokio::spawn({
+            let (socket, wait) = (socket.clone(), wait.clone());
+            async move { ask(&socket, &wait).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!asked.is_finished(), "answered while the owner holds it");
+        desktop.give(crate::now());
+        let answer = asked.await.unwrap().unwrap();
+        assert_eq!(answer["verdict"], "deny", "{answer}");
+        let text = answer["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("zephyr: the owner used the desktop from 14:04 to ")
+                && text.ends_with(
+                    "; this command did not run. The page may have changed: take a fresh \
+                     snapshot before acting."
+                ),
+            "{text}"
+        );
+        // A request the gate cannot read is refused with words, never an empty text.
+        let odd = json!({"v": 1, "desktop": "take", "session": "task-1"});
+        let answer = ask(&socket, &odd).await.unwrap();
+        assert_eq!(
+            answer["text"], "not run: the gate could not read the request",
+            "{answer}"
+        );
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
+    }
+
+    /// A burst of browser commands during a takeover waits in places of its own, 8 of them:
+    /// the gate's 32 stay free for the agent's other calls, which are decided at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn desktop_waits_do_not_take_the_gates_places() {
+        use futures_util::stream::FuturesUnordered;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let h = home("gate-desktop-burst", "");
+        let (socket, desktop) = serving_desktop(&h).await;
+        desktop.take([1; 32], 14 * 3600 + 4 * 60).unwrap();
+        let wait = json!({"v": 1, "desktop": "wait", "session": "main"});
+        let mut answers = FuturesUnordered::new();
+        for _ in 0..40 {
+            let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            let (read, mut write) = stream.into_split();
+            write
+                .write_all(format!("{wait}\n").as_bytes())
+                .await
+                .unwrap();
+            answers.push(async move {
+                let mut line = String::new();
+                let mut read = tokio::io::BufReader::new(read);
+                let _ = read.read_line(&mut line).await;
+                drop(write);
+                serde_json::from_str::<Value>(&line).ok()
+            });
+        }
+        let limit = Duration::from_secs(10);
+        // Over the 8: told at once that the owner has the desktop, as after the limit.
+        let still = "zephyr: the owner has the desktop (since 14:04); this command did not \
+                     run. Do other work, or try again later.";
+        for n in 0..32 {
+            let answer = tokio::time::timeout(limit, answers.next()).await;
+            let answer = answer.unwrap_or_else(|_| panic!("#{n} waits"));
+            assert_eq!(
+                answer.flatten(),
+                Some(json!({"verdict": "deny", "text": still})),
+                "#{n}"
+            );
+        }
+        // The other 8 wait, and a call of another kind is decided meanwhile.
+        let listing = json!({"v": 1, "session": "task-1", "call_id": "c1", "tool": "bash",
+                             "args": {"command": "ls"}});
+        let decided = tokio::time::timeout(Duration::from_secs(10), ask(&socket, &listing)).await;
+        assert_eq!(
+            decided.expect("decided while the waits wait").unwrap()["verdict"],
+            "allow"
+        );
+        assert_eq!(answers.len(), 8);
+        desktop.give(crate::now());
+        for _ in 0..8 {
+            let answer = tokio::time::timeout(limit, answers.next()).await;
+            let answer = answer.expect("answered at the hand back");
+            let text = answer.flatten().unwrap()["text"].to_string();
+            assert!(
+                text.contains("the owner used the desktop from 14:04"),
+                "{text}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
+    }
+
+    /// A click that waited for the owner's `/ok` is not made under the owner's hands: let go
+    /// while the owner holds the desktop, its wrapper is refused with the desktop's words, and
+    /// the action is recorded as not run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_click_let_go_while_the_owner_holds_the_desktop_does_not_run() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let h = home("gate-desktop-ok", "");
+        let desktop = crate::desktop::Control::new(&h.cfg);
+        let (socket, waits, _) = serving_all(&h, desktop.clone()).await;
+        (h.store.add_task("g", None, None, "discord", "owner-1"))
+            .unwrap()
+            .unwrap();
+        let req = json!({"v": 1, "session": "task-1", "tool": "browser",
+            "args": {"argv": ["click", "@e3"]},
+            "browser": {"action": "click", "url": "https://mail.x/compose",
+                        "origin": "https://mail.x",
+                        "element": {"role": "button", "name": "Send"}}});
+        let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        write
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            if h.store.action(1).unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The owner takes the desktop over, and then says `/ok`.
+        desktop.take([1; 32], 14 * 3600 + 4 * 60).unwrap();
+        assert!(h.store.take_action(1, "running").unwrap().is_some());
+        for _ in 0..200 {
+            if waits.answer(1, true) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut line = String::new();
+        let mut read = tokio::io::BufReader::new(read);
+        read.read_line(&mut line).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap(),
+            json!({"verdict": "deny", "id": 1, "text": "zephyr: the owner has the desktop \
+                   (since 14:04); this command did not run. Do other work, or try again later."})
+        );
+        let ended = || -> (String, String) {
+            let db = rusqlite::Connection::open(h.cfg.db_path()).unwrap();
+            let row = "SELECT status, coalesce(result, '') FROM proposals WHERE id = 1";
+            db.query_row(row, [], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+        };
+        for _ in 0..200 {
+            if ended().0 != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            ended(),
+            (
+                "failed".to_string(),
+                "not run: the owner had the desktop".to_string()
+            )
+        );
+        let told = (h.store.pending_outbox().unwrap().into_iter()).any(|o| {
+            o.channel == "discord" && o.text.ends_with(" did not run: you had the desktop")
+        });
+        assert!(told, "the owner is not told");
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
+    }
+
+    /// Nothing of the agent's touches the page while the owner has it: a browser request the
+    /// gate would let through at once (typing with no private fact in it) is refused too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_browser_request_the_gate_would_allow_is_refused_while_held() {
+        let h = home("gate-desktop-allow", "");
+        let (socket, desktop) = serving_desktop(&h).await;
+        let typing = json!({"v": 1, "session": "main", "tool": "browser",
+            "args": {"argv": ["fill", "@e2", "hello"]},
+            "browser": {"action": "fill", "url": "https://mail.x/compose",
+                        "origin": "https://mail.x", "typed": ["hello"]}});
+        assert_eq!(
+            ask(&socket, &typing).await.unwrap(),
+            json!({"verdict": "allow"})
+        );
+        desktop.take([1; 32], 14 * 3600 + 4 * 60).unwrap();
+        assert_eq!(
+            ask(&socket, &typing).await.unwrap(),
+            json!({"verdict": "deny", "text": "zephyr: the owner has the desktop (since 14:04); \
+                   this command did not run. Do other work, or try again later."})
+        );
+        // A call that is not the browser's is decided as ever.
+        let listing = json!({"v": 1, "session": "task-1", "call_id": "c1", "tool": "bash",
+                             "args": {"command": "ls"}});
+        assert_eq!(ask(&socket, &listing).await.unwrap()["verdict"], "allow");
+        desktop.give(crate::now());
+        assert_eq!(
+            ask(&socket, &typing).await.unwrap(),
+            json!({"verdict": "allow"})
+        );
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
+    }
+
+    /// The wait ends by itself, well before the run's stall limit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_desktop_wait_gives_up_after_the_hold_limit() {
+        let mut h = home("gate-desktop-limit", "");
+        h.cfg.desktop_hold = Duration::from_millis(200);
+        let (socket, desktop) = serving_desktop(&h).await;
+        desktop.take([1; 32], 14 * 3600 + 4 * 60).unwrap();
+        let wait = json!({"v": 1, "desktop": "wait", "session": "main"});
+        assert_eq!(
+            ask(&socket, &wait).await.unwrap(),
+            json!({"verdict": "deny", "text": "zephyr: the owner has the desktop (since 14:04); \
+                   this command did not run. Do other work, or try again later."})
+        );
+        assert!(desktop.held().is_some(), "the owner still has it");
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
+    }
+
     /// R52: a gate that cannot start (no store, or a public folder others may write) says so and
     /// serves nothing, never ending the daemon: every call the plugin would ask about is refused.
     #[tokio::test(flavor = "multi_thread")]
@@ -3390,7 +3725,8 @@ mod tests {
             let wake: &'static crate::scheduler::Wake = Box::leak(Box::default());
             let waits = crate::actions::Waits::default();
             let (main, _) = mpsc::channel(1);
-            tokio::spawn(serve(cfgs, snap, waits, wake, main))
+            let desktop = crate::desktop::Control::new(cfg);
+            tokio::spawn(serve(cfgs, snap, waits, wake, main, desktop))
         };
         // No store: state.db is a folder.
         let h = home("gate-no-store", "");
@@ -3411,6 +3747,7 @@ mod tests {
             platform_msg_id: "m1".into(),
             sender: "owner-1".into(),
             text: "hi".into(),
+            derived: None,
         };
         store.insert_inbox(&said).unwrap();
         let row = store.inbox_with_status("new").unwrap().remove(0);
@@ -3606,6 +3943,13 @@ mod tests {
                 None,
                 ("failed", "the browser did not go on"),
                 Some("did not run: the browser did not go on"),
+            ),
+            // The owner took the desktop over after the `allow`: not a page that changed.
+            (
+                4,
+                Some("{\"ran\": false, \"held\": true}"),
+                ("failed", "not run: the owner had the desktop"),
+                Some("did not run: you had the desktop"),
             ),
         ] {
             let req = json!({"v": 1, "session": "task-1", "tool": "browser",

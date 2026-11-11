@@ -442,6 +442,52 @@ pub static SETTINGS: &[Setting] = &[
         Apply::Persona,
     ),
     row(
+        "voice.transcribe",
+        "Voice",
+        "Transcribe voice notes",
+        "Whether a voice note you send is transcribed on this machine for the agent to read.",
+        Kind::Bool,
+        Access::Propose,
+        false,
+        Stricter::NotOrdered,
+        Apply::Toml,
+    ),
+    row(
+        "voice.reply",
+        "Voice",
+        "Spoken replies",
+        "off: replies are text only; mirror: a reply to a voice note is also spoken; always: \
+         every reply on Discord and iMessage is.",
+        Kind::Choice(&crate::voice::REPLIES),
+        Access::Propose,
+        false,
+        Stricter::NotOrdered,
+        Apply::Toml,
+    ),
+    row(
+        "voice.languages",
+        "Voice",
+        "Languages",
+        "The languages you speak, as whisper's codes, comma separated. A note heard as another \
+         is transcribed again as the first.",
+        Kind::List(crate::voice::LANGUAGES),
+        Access::Propose,
+        false,
+        Stricter::NotOrdered,
+        Apply::Toml,
+    ),
+    row(
+        "voice.max_secs",
+        "Voice",
+        "Longest voice note",
+        "A voice note longer than this many seconds is saved but not transcribed.",
+        Kind::Int { min: 10, max: 900 },
+        Access::Propose,
+        false,
+        Stricter::NotOrdered,
+        Apply::Toml,
+    ),
+    row(
         "facts",
         "Approvals",
         "Private facts",
@@ -965,6 +1011,10 @@ pub fn value(cfg: &Config, key: &str) -> Option<String> {
         "auth.refresh_minutes" => Some(cfg.auth.refresh_minutes.to_string()),
         "settings.strong_channels" => Some(cfg.settings.strong_channels.join(", ")),
         "network.allow" => Some(cfg.network.allow.clone()).filter(|a| !a.is_empty()),
+        "voice.transcribe" => Some(cfg.voice().transcribe.to_string()),
+        "voice.reply" => Some(cfg.voice().reply),
+        "voice.languages" => Some(cfg.voice().languages.join(", ")),
+        "voice.max_secs" => Some(cfg.voice().max_secs.to_string()),
         key if key.starts_with("approvals.") => {
             crate::approvals::value(cfg, &key["approvals.".len()..])
         }
@@ -1781,6 +1831,41 @@ mod tests {
             decide(cost, &Actor::Internal, true, &strong()),
             Verdict::Apply
         );
+    }
+
+    #[test]
+    fn the_voice_rows_are_the_agents_to_propose_only() {
+        let cfg: Config = toml::from_str("rpi = '/r'\nhome = '/h'").unwrap();
+        let agent = Actor::Agent { session: "main" };
+        for (key, default) in [
+            ("voice.transcribe", "true"),
+            ("voice.reply", "mirror"),
+            ("voice.languages", "ko, en"),
+            ("voice.max_secs", "300"),
+        ] {
+            let s = find(key).unwrap();
+            assert_eq!(
+                (s.agent, s.strong, s.apply),
+                (Access::Propose, false, Apply::Toml)
+            );
+            assert_eq!(value(&cfg, key).as_deref(), Some(default), "{key}");
+            assert!(parse(s, default).is_ok(), "{key}");
+            assert_eq!(decide(s, &agent, false, &strong()), Verdict::Propose);
+            assert_eq!(decide(s, &agent, true, &strong()), Verdict::Propose);
+        }
+        assert!(matches!(find("voice.transcribe").unwrap().kind, Kind::Bool));
+        let reply = find("voice.reply").unwrap();
+        assert!(matches!(reply.kind, Kind::Choice(o) if o == ["off", "mirror", "always"]));
+        assert!(parse(reply, "always").is_ok() && parse(reply, "loud").is_err());
+        let langs = find("voice.languages").unwrap();
+        assert!(parse(langs, "en,ja").is_ok() && parse(langs, "klingon").is_err());
+        let secs = find("voice.max_secs").unwrap();
+        assert!(matches!(secs.kind, Kind::Int { min: 10, max: 900 }));
+        let cfg: Config =
+            toml::from_str("rpi = '/r'\nhome = '/h'\n[voice]\nreply = 'off'\nlanguages = ['en']")
+                .unwrap();
+        assert_eq!(value(&cfg, "voice.reply").as_deref(), Some("off"));
+        assert_eq!(value(&cfg, "voice.languages").as_deref(), Some("en"));
     }
 
     #[test]

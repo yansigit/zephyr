@@ -10,6 +10,9 @@ use tokio::sync::{mpsc, oneshot};
 use zephyr::channel::{Activity, Channel, Inbound, Outbound};
 use zephyr::config::Config;
 use zephyr::signal::Signal;
+
+#[path = "fixtures/voice/fakes.rs"]
+mod voice_fakes;
 use zephyr::store::Store;
 
 const ACCOUNT: &str = "+15550001111";
@@ -657,5 +660,67 @@ async fn the_child_gets_a_clean_environment() {
             "--ignore-stickers"
         ])
     );
+    gw.shutdown().await;
+}
+
+/// A voice note (channels spec §4.4, §4.5): the file signal-cli downloaded is read as root and
+/// transcribed, the row is marked derived, and the reply is also spoken, as an audio file after
+/// its text.
+#[tokio::test]
+async fn a_voice_note_is_heard_and_answered_aloud() {
+    let home = dir("voice");
+    let mut cfg = config(&home, None, &[OWNER]);
+    cfg.voice_dir = voice_fakes::fakes(&home);
+    cfg.voice_off_floor = true;
+    let gw = start(cfg);
+    gw.up().await;
+    let mut note = with_file(&gw, OWNER, 1700000000456, "", "v1.aac", b"aac-bytes");
+    note["dataMessage"]["attachments"][0] = json!({
+        "contentType": "audio/aac", "filename": null, "id": "v1.aac",
+        "size": 9, "isVoiceNote": true, "isGif": false, "isBorderless": false
+    });
+    gw.feed(note);
+    let spoken = |gw: &Gw| {
+        let sends = gw.to("send", OWNER);
+        sends.iter().any(|s| s["attachments"].is_array())
+    };
+    wait(|| spoken(&gw)).await;
+
+    // Heard from signal-cli's own download, which is then removed.
+    let decoded = voice_fakes::ran(&home, "ffmpeg");
+    assert_eq!(decoded[0]["sha256"], voice_fakes::sha256(b"aac-bytes"));
+    assert!(!gw.d.join("attachments/v1.aac").exists());
+    let rows = Store::open(&home.join("state.db")).unwrap();
+    let row = &rows.inbox_with_status("done").unwrap()[0];
+    assert_eq!(row.derived.as_deref(), Some("voice"));
+    let saved = home.join(format!("inbox/signal-{OWNER}-1700000000456-1.aac"));
+    assert!(
+        row.text.starts_with(&format!(
+            "[attached audio: {} (voice note, audio/aac",
+            saved.display()
+        )),
+        "{}",
+        row.text
+    );
+    assert!(
+        row.text.contains("may be wrong: \"hello from the fake\"]"),
+        "{}",
+        row.text
+    );
+
+    // The text first, then the voice as a file of root's.
+    let sends = gw.to("send", OWNER);
+    assert_eq!(sends.len(), 2, "{sends:?}");
+    assert!(sends[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("hello from the fake"));
+    assert!(sends[0].get("attachments").is_none(), "{sends:?}");
+    let file = sends[1]["attachments"][0].as_str().unwrap();
+    assert!(
+        file.ends_with("/voice.m4a") && file.contains("/files/"),
+        "{file}"
+    );
+    assert_eq!(sends[1]["message"], "");
     gw.shutdown().await;
 }

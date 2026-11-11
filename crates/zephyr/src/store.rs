@@ -4,7 +4,7 @@ use crate::channel::Inbound;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 
 /// Queued and running tasks allowed at once (DESIGN §4.12); a start past this is refused.
 pub const MAX_OPEN_TASKS: i64 = 64;
@@ -25,6 +25,8 @@ pub struct InboxRow {
     /// Written by the router from an owner on a channel (`insert_inbox_as` with `new`), or a
     /// `/retry` of one; every row zephyr writes itself is not (DESIGN §4.6).
     pub owner: bool,
+    /// `voice` when the text holds a transcript: file-derived text, not the owner's (DESIGN §4.6).
+    pub derived: Option<String>,
 }
 
 /// Where a conversation's text came from (DESIGN §4.6): `Unknown` when it has no row, which
@@ -1013,6 +1015,13 @@ impl Store {
                  PRAGMA user_version = 18;",
             )?;
         }
+        if version < 19 {
+            // A row whose text holds a voice note's transcript (DESIGN §4.6).
+            db.execute_batch(
+                "ALTER TABLE inbox ADD COLUMN derived TEXT;
+                 PRAGMA user_version = 19;",
+            )?;
+        }
         // A database made by a build that has the token broker (DESIGN §4.21): its remote
         // connectors were never published with a real secret by default, so there is nothing
         // of before to keep (`made_with_broker`). The broker adds no schema step, so this
@@ -1108,17 +1117,18 @@ impl Store {
     /// The router's write of a channel's message; a `new` one is an owner's (`InboxRow::owner`).
     pub fn insert_inbox_as(&self, m: &Inbound, status: &str) -> rusqlite::Result<Option<i64>> {
         let n = self.db.execute(
-            "INSERT OR IGNORE INTO inbox(channel, platform_msg_id, sender, text, status, owner)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5 = 'new')",
-            params![m.channel, m.platform_msg_id, m.sender, m.text, status],
+            "INSERT OR IGNORE INTO inbox(channel, platform_msg_id, sender, text, status, owner, derived)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5 = 'new', ?6)",
+            params![m.channel, m.platform_msg_id, m.sender, m.text, status, m.derived],
         )?;
         Ok((n == 1).then(|| self.db.last_insert_rowid()))
     }
 
-    /// Row `to` is as much the owner's as row `from` (a `/retry` of it).
+    /// Row `to` is as much the owner's as row `from`, and as derived (a `/retry` of it).
     pub fn copy_owner(&self, from: i64, to: i64) -> rusqlite::Result<()> {
         self.db.execute(
-            "UPDATE inbox SET owner = coalesce((SELECT owner FROM inbox WHERE id = ?1), 0) WHERE id = ?2",
+            "UPDATE inbox SET owner = coalesce((SELECT owner FROM inbox WHERE id = ?1), 0),
+                              derived = (SELECT derived FROM inbox WHERE id = ?1) WHERE id = ?2",
             params![from, to],
         )?;
         Ok(())
@@ -1194,7 +1204,7 @@ impl Store {
     /// prompt or a continuation), oldest first, each with the reply already sent to it.
     pub fn steered_into_run(&self) -> rusqlite::Result<Vec<(InboxRow, Option<String>)>> {
         let mut stmt = self.db.prepare(
-            "SELECT i.id, i.channel, i.sender, i.text, i.tries, o.text, i.platform_msg_id, i.owner
+            "SELECT i.id, i.channel, i.sender, i.text, i.tries, o.text, i.platform_msg_id, i.owner, i.derived
              FROM inbox i LEFT JOIN outbox o ON o.inbox_id = i.id
              WHERE i.sent_as = 'steer' AND i.status IN ('dispatched', 'done')
                AND i.id > (SELECT max(id) FROM inbox
@@ -1211,6 +1221,7 @@ impl Store {
                     tries: r.get(4)?,
                     platform_id: r.get(6)?,
                     owner: r.get(7)?,
+                    derived: r.get(8)?,
                 },
                 r.get(5)?,
             ))
@@ -1220,7 +1231,7 @@ impl Store {
 
     pub fn inbox_with_status(&self, status: &str) -> rusqlite::Result<Vec<InboxRow>> {
         let mut stmt = self.db.prepare(
-            "SELECT id, channel, sender, text, tries, platform_msg_id, owner FROM inbox WHERE status = ?1 ORDER BY id",
+            "SELECT id, channel, sender, text, tries, platform_msg_id, owner, derived FROM inbox WHERE status = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map(params![status], |r| {
             Ok(InboxRow {
@@ -1231,6 +1242,7 @@ impl Store {
                 tries: r.get(4)?,
                 platform_id: r.get(5)?,
                 owner: r.get(6)?,
+                derived: r.get(7)?,
             })
         })?;
         rows.collect()
@@ -1418,6 +1430,23 @@ impl Store {
     /// Writes a notice to `channel`/`recipient`.
     pub fn notify(&self, channel: &str, recipient: &str, text: &str) -> rusqlite::Result<()> {
         self.notify_file(channel, recipient, text, None)
+    }
+
+    /// The spoken form of the reply to `row` (DESIGN §4.3): a second outbox row to the same
+    /// recipient, client id `<the reply's>-v`, no text, the audio at `path`. It has no inbox id,
+    /// which is the reply's alone; written once, whatever is retried.
+    pub fn voice_reply(&self, row: &InboxRow, path: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT OR IGNORE INTO outbox(channel, recipient, client_id, text, attachment)
+             VALUES (?1, ?2, ?3, '', ?4)",
+            params![
+                row.channel,
+                row.sender,
+                format!("{}-v", client_id(row.id)),
+                path
+            ],
+        )?;
+        Ok(())
     }
 
     /// Writes a notice to `channel`/`recipient`, with a file to send along, if any.
@@ -2916,7 +2945,7 @@ impl Store {
     pub fn inbox_row(&self, id: i64) -> rusqlite::Result<Option<InboxRow>> {
         self.db
             .query_row(
-                "SELECT id, channel, sender, text, tries, platform_msg_id, owner FROM inbox WHERE id = ?1",
+                "SELECT id, channel, sender, text, tries, platform_msg_id, owner, derived FROM inbox WHERE id = ?1",
                 params![id],
                 |r| {
                     Ok(InboxRow {
@@ -2927,6 +2956,7 @@ impl Store {
                         tries: r.get(4)?,
                         platform_id: r.get(5)?,
                         owner: r.get(6)?,
+                        derived: r.get(7)?,
                     })
                 },
             )
@@ -3333,6 +3363,7 @@ mod tests {
             platform_msg_id: id.into(),
             sender: "1000".into(),
             text: "hi".into(),
+            derived: None,
         }
     }
 
@@ -4028,6 +4059,7 @@ mod tests {
     fn older_databases_migrate_in_order_and_keep_their_rows() {
         // Each case undoes the steps after `version`, as a db made by that build would look:
         // v14's first, while the tables its indexes are on still exist.
+        const V19: &str = "ALTER TABLE inbox DROP COLUMN derived;";
         const V18: &str = "DROP TABLE web_push; DROP TABLE web_sessions; DROP TABLE web_passkeys;";
         const V17: &str = "DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin; ALTER TABLE inbox DROP COLUMN owner;";
         const V16: &str = "DROP TABLE known_targets; DROP TABLE passes; ALTER TABLE proposals DROP COLUMN kind; ALTER TABLE proposals DROP COLUMN class; ALTER TABLE proposals DROP COLUMN targets; ALTER TABLE proposals DROP COLUMN summary; ALTER TABLE proposals DROP COLUMN reason; ALTER TABLE proposals DROP COLUMN payload; ALTER TABLE proposals DROP COLUMN secrets; ALTER TABLE proposals DROP COLUMN origin; ALTER TABLE proposals DROP COLUMN due_at; ALTER TABLE proposals DROP COLUMN settled_at; ALTER TABLE proposals DROP COLUMN result; ALTER TABLE procs DROP COLUMN action; ALTER TABLE proposals DROP COLUMN approved;";
@@ -4054,6 +4086,7 @@ mod tests {
             (15, ""),
             (16, ""),
             (17, ""),
+            (18, ""),
         ] {
             let dir = crate::test_dir(&format!("store-v{version}"));
             let path = dir.join("state.db");
@@ -4063,8 +4096,9 @@ mod tests {
             let v15 = if version < 15 { V15 } else { "" };
             let v16 = if version < 16 { V16 } else { "" };
             let v17 = if version < 17 { V17 } else { "" };
+            let v18 = if version < 18 { V18 } else { "" };
             db.execute_batch(&format!(
-                "{V18} {v17} {v16} {v15} {v14} {undo} PRAGMA user_version = {version};"
+                "{V19} {v18} {v17} {v16} {v15} {v14} {undo} PRAGMA user_version = {version};"
             ))
             .unwrap();
             drop(db);
@@ -4147,6 +4181,15 @@ mod tests {
             let k = store.add_passkey("phone", &[1], &[4; 65]).unwrap();
             store.add_web_session(&[7; 32], k, 0).unwrap();
             assert!(store.add_push("https://p/x", &[1], &[2], k).unwrap());
+            // v19: a row whose text holds a transcript says so.
+            let voice = Inbound {
+                derived: Some("voice".into()),
+                ..msg("v")
+            };
+            let v = store.insert_inbox_as(&voice, "new").unwrap().unwrap();
+            let derived = |id| store.inbox_row(id).unwrap().unwrap().derived;
+            assert_eq!(derived(v).as_deref(), Some("voice"));
+            assert_eq!(derived(1), None, "a row from before v19");
             let now: i64 = store
                 .db
                 .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -4245,6 +4288,45 @@ mod tests {
             store.inbox_row(retry).unwrap().unwrap().owner,
             "a retry is what it retries"
         );
+    }
+
+    #[test]
+    fn a_spoken_reply_is_a_second_row_written_once() {
+        let mut store = Store::open(&crate::test_dir("store-voice").join("state.db")).unwrap();
+        store.insert_inbox_as(&msg("a"), "new").unwrap();
+        let row = store.inbox_with_status("new").unwrap().remove(0);
+        store.reply(&row, "hi", "done").unwrap();
+        store.voice_reply(&row, "/f/voice.ogg").unwrap();
+        store.voice_reply(&row, "/f/again.ogg").unwrap();
+        let out = store.pending_outbox().unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].client_id, format!("{}-v", out[0].client_id));
+        assert_eq!(
+            (out[1].text.as_str(), out[1].recipient.as_str()),
+            ("", "1000")
+        );
+        assert_eq!(out[1].attachment.as_deref(), Some("/f/voice.ogg"));
+    }
+
+    #[test]
+    fn a_retried_voice_row_is_still_derived() {
+        let store = Store::open(&crate::test_dir("store-derived").join("state.db")).unwrap();
+        let voice = Inbound {
+            derived: Some("voice".into()),
+            ..msg("a")
+        };
+        let said = store.insert_inbox_as(&voice, "new").unwrap().unwrap();
+        let retry = store.insert_inbox(&msg("retry-1-1")).unwrap().unwrap();
+        store.copy_owner(said, retry).unwrap();
+        let rows = store.inbox_with_status("new").unwrap();
+        assert_eq!(rows[0].derived.as_deref(), Some("voice"));
+        assert_eq!(
+            rows[1].derived.as_deref(),
+            Some("voice"),
+            "a retry is what it retries"
+        );
+        let typed = store.insert_inbox_as(&msg("b"), "new").unwrap().unwrap();
+        assert_eq!(store.inbox_row(typed).unwrap().unwrap().derived, None);
     }
 
     #[test]

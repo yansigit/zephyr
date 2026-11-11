@@ -9,6 +9,9 @@ pub struct Inbound {
     pub platform_msg_id: String,
     pub sender: String,
     pub text: String,
+    /// `voice` when `inbox::append` added a transcript to `text` (DESIGN §4.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived: Option<String>,
 }
 
 /// A reply to send. `client_id` lets the platform drop a retried duplicate.
