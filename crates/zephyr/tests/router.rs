@@ -7575,7 +7575,7 @@ async fn an_upgraded_install_keeps_sending_and_is_told_once() {
     let home = home("upgraded");
     old_install(&home);
     let gw = start(on_file(&home, ""));
-    // An install this old is also told of the payment window, once (DESIGN §4.22).
+    // An install this old is also told of the payment window, once (DESIGN §4.25).
     let told = gw.wait_replies(2).await;
     assert_eq!(told[0], OFF_NOTICE);
     assert!(
@@ -7681,7 +7681,7 @@ async fn an_upgraded_install_with_no_owner_yet_is_told_after_the_first_message()
     assert!(text.contains("preset = \"full\""), "{text}");
     assert!(gw.replies().is_empty(), "no owner to tell yet");
     gw.say("m1", "owner", "hi").await;
-    // The reply, the approvals notice and the payment window's (DESIGN §4.22).
+    // The reply, the approvals notice and the payment window's (DESIGN §4.25).
     wait(|| gw.replies().len() >= 3).await;
     let r = gw.replies();
     assert!(
@@ -7926,7 +7926,7 @@ async fn a_held_exec_reads_held_not_sent() {
     gw.shutdown().await;
 }
 
-// ---- virtual cards (DESIGN §4.22) ----
+// ---- virtual cards (DESIGN §4.25) ----
 
 const SHOP: &str = "https://shop.example/checkout";
 
@@ -8299,7 +8299,9 @@ async fn an_issued_card_passes_its_pay_click_and_closes_at_its_charge() {
     );
     assert_eq!(card_status(&home, 1), "open");
 
-    // The Pay click on the card's origin, for a total within its cap, goes.
+    // The Pay click on the card's origin, for a total within its cap, goes. It is paced like
+    // any click (DESIGN §4.24, on by default), and is still the card's one covered click.
+    assert_eq!(script.pace_ms(), 1500);
     pay_page(&home, "CA$42.50");
     // Each click's turn is over before the next is asked: a message that arrives mid-turn is
     // steered in, and the stand-in agent runs no tool for those.
@@ -8791,5 +8793,41 @@ async fn done_closes_an_issuers_card_at_the_issuer() {
     assert_ne!(card_status(&home, 2), "closed");
     gw.say("n5", "owner", "/card done 1").await;
     reply_where(&gw, "chat", |r| r == "[zephyr] card #1 was closed already").await;
+    gw.shutdown().await;
+}
+
+/// Pacing (DESIGN §4.24) and a card fill (§4.25): the daemon types a card itself, with the
+/// real browser, so a fill never waits for a site's pace slot, however far off that slot is.
+#[tokio::test]
+async fn a_card_fill_never_waits_for_a_pace_slot() {
+    let (home, mut cfg) = card_home("card-paced", "fake", "auto 100");
+    cfg.browser = Some(toml::from_str("pace_ms = 60000").unwrap());
+    let gw = start(cfg);
+    gw.say("p1", "owner", &card_ask("10")).await;
+    wait(|| card_status(&home, 1) == "open").await;
+    reply_where(&gw, "chat", |r| r.contains("[card #1 issued")).await;
+    // A navigation takes the site's slot: its next paced action is a minute or more away.
+    let wrapper = home.join("bin/agent-browser");
+    let open = format!(
+        r#"[call exec {{"command": "{} open {SHOP}"}}]"#,
+        wrapper.display()
+    );
+    gw.say("p2", "owner", &open).await;
+    reply_where(&gw, "chat", |r| r.contains("\nexec: exited 0\ndone: open")).await;
+    // The fill goes at once (this wait gives up after ten seconds), all three fields.
+    gw.say("p3", "owner", CARD_FILL).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains("\ncard: filled the number and expiry and code")
+    })
+    .await;
+    assert_eq!(fills(&home).len(), 3);
+    // The slot really was taken: the agent's own next navigation there is still waiting for
+    // it three seconds on, and is given up on.
+    let again = format!(
+        r#"[call exec {{"command": "timeout 3 {} open {SHOP}; echo gave-up=$?"}}]"#,
+        wrapper.display()
+    );
+    gw.say("p4", "owner", &again).await;
+    reply_where(&gw, "chat", |r| r.contains("gave-up=124")).await;
     gw.shutdown().await;
 }
