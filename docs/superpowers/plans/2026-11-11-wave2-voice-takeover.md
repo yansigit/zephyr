@@ -437,6 +437,11 @@ Growth: **+835 MB** (+15.5%) for voice, against the spec's estimate of about 520
 - Deviation: the two channel tests passed as written: C1's seams already carried the type and the bytes, so there was no failing state to start from. The ordering test failed first.
 - Deviation: no test pins the `/pair` cut together with the transcript rule. By reading: the claim and the cut run before the insert, the transcript check after it, so a voice note captioned `/pair …` is stored as `/pair` (no code in `state.db`), is never a claim (its text is more than a code) and is never run as a command.
 
+**After the second review** (of the PR, 2026-11-11): its findings were each confirmed and fixed with a test; the `- Review fix:` lines are under the tasks that own the code.
+- Review fix: a missing `desktop.lock` fails closed. A wrapper with no lock file refuses with `browser_gate::NO_LOCK` and runs nothing; before, it ran with no place, which a take could not wait for (`without_the_lock_file_nothing_runs`). `doctor` checks the lock, its owner and its folder.
+- Review fix: the sweep of `nobody`'s processes goes by uid only as root in the floored container; a root daemon on a host never kills that machine's other `nobody` processes. No test: it cannot be exercised outside the container.
+- Deviation: the review's "an `/ok once` pass is refused while held" has no test: passes exist only for connector calls, never for a browser request. The immediate allow that does exist for the browser (typing the gate lets through) is tested.
+
 **Not verified:**
 - The Desktop screen in a real browser: noVNC drawing the screen, the pointer, the phone keyboard field (Hangul, Backspace on Android), and a console free of CSP errors. Only the daemon side and the RFB banner were driven. README's manual check on iOS Safari and Android Chrome stands before release.
 - A voice note through a real Discord or iMessage message, and the spoken reply arriving as a voice message there.

@@ -1145,6 +1145,16 @@ fn xdotool_is_the_wrapper_and_does_not_run_while_the_desktop_is_held() {
             .output()
             .unwrap()
     };
+    let log = || std::fs::read_to_string(dir.join("xdotool.log")).unwrap_or_default();
+    // Without root's lock beside the socket, which the daemon makes at each start, nothing runs.
+    let out = run();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        zephyr::browser_gate::NO_LOCK
+    );
+    assert_eq!(log(), "", "the real xdotool ran with no lock");
+    std::fs::write(public.join("desktop.lock"), "").unwrap();
     let out = run();
     assert_eq!(
         (
@@ -1153,7 +1163,6 @@ fn xdotool_is_the_wrapper_and_does_not_run_while_the_desktop_is_held() {
         ),
         (Some(0), "ran")
     );
-    let log = || std::fs::read_to_string(dir.join("xdotool.log")).unwrap_or_default();
     assert_eq!(log(), "key ctrl+l\n");
     std::fs::write(public.join("desktop-held"), "100\n").unwrap();
     let out = run();

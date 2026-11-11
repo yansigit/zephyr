@@ -475,7 +475,36 @@ pub fn check(cfg: &Config, up: bool) -> Vec<String> {
     let flag = crate::drafts::public_dir(cfg).join(HELD_FILE);
     let link = std::path::Path::new(crate::browser_gate::GATE_BIN).join("xdotool");
     let me = std::fs::canonicalize("/proc/self/exe").unwrap_or_default();
-    problems(&cfg.x11vnc, &flag, up, &link, &me, 0)
+    let mut found = problems(&cfg.x11vnc, &flag, up, &link, &me, 0);
+    // The daemon makes the lock when it starts: beside none, there is nothing to check yet.
+    if up {
+        found.extend(lock_problem(
+            &crate::drafts::public_dir(cfg).join(LOCK_FILE),
+            0,
+        ));
+    }
+    found
+}
+
+/// What is wrong with the lock the wrappers run under (`browser_gate::place`): it must be
+/// there, a plain file of `owner`'s (root's) that no one else can write, in a folder of
+/// `owner`'s that no one else can write, so the agent can lock it but never replace or remove
+/// it. Without it the wrappers run nothing.
+fn lock_problem(lock: &std::path::Path, owner: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let own = |m: &std::fs::Metadata| m.uid() == owner && m.mode() & 0o022 == 0;
+    let file = lock.symlink_metadata();
+    let dir = lock.parent().and_then(|d| d.symlink_metadata().ok());
+    let why = match (&file, &dir) {
+        (Err(_), _) => "is missing",
+        (Ok(m), _) if !m.is_file() || !own(m) => "is not root's own file",
+        (_, Some(d)) if d.is_dir() && own(d) => return None,
+        _ => "is in a folder the agent could change",
+    };
+    let lock = lock.display();
+    Some(format!(
+        "{lock} {why}, so the agent's browser and xdotool do not run"
+    ))
 }
 
 fn problems(
@@ -718,6 +747,37 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&me, &link).unwrap();
         assert_eq!(found(true), [""; 0]);
+        // The lock: there, its owner's alone, in a folder that is its owner's alone.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path, m| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        let lock = dir.join(LOCK_FILE);
+        mode(&dir, 0o755);
+        let wrong = |why: &str| {
+            let lock = lock.display();
+            Some(format!(
+                "{lock} {why}, so the agent's browser and xdotool do not run"
+            ))
+        };
+        assert_eq!(lock_problem(&lock, mine), wrong("is missing"));
+        std::fs::write(&lock, "").unwrap();
+        mode(&lock, 0o644);
+        assert_eq!(lock_problem(&lock, mine), None);
+        assert_eq!(
+            lock_problem(&lock, mine + 1),
+            wrong("is not root's own file")
+        );
+        mode(&lock, 0o666);
+        assert_eq!(lock_problem(&lock, mine), wrong("is not root's own file"));
+        mode(&lock, 0o644);
+        mode(&dir, 0o777);
+        let folder = wrong("is in a folder the agent could change");
+        assert_eq!(lock_problem(&lock, mine), folder);
+        mode(&dir, 0o755);
+        std::fs::remove_file(&lock).unwrap();
+        std::os::unix::fs::symlink(&me, &lock).unwrap();
+        assert_eq!(lock_problem(&lock, mine), wrong("is not root's own file"));
         // Another owner's link, even to zephyr, is not root's.
         assert_eq!(
             problems(&x11vnc, &flag, true, &link, &me, mine + 1).len(),

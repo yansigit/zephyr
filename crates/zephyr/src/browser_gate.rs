@@ -356,9 +356,14 @@ fn finish(name: &str, (next, place): (Next, Place), env: &Env, args: &[String]) 
     ExitCode::FAILURE
 }
 
-/// A wrapper's shared lock on the desktop while its command runs; `None` where there is no
-/// lock file (outside the image).
+/// A wrapper's shared lock on the desktop while its command runs; `None` only for what takes
+/// none (help, the version, a refusal).
 type Place = Option<std::fs::File>;
+
+/// What a command is refused with when root's lock file is not there: with no place to hold, a
+/// take would have nothing to wait for, so nothing runs, as with no gate.
+pub const NO_LOCK: &str = "not run: zephyr's desktop lock is missing, so the owner could not \
+                           take the desktop over safely; zephyr doctor says why";
 
 /// How often a wrapper tries for its place while the lock is taken and the gate says nothing
 /// is held (a take just beginning or ending), 50 ms apart.
@@ -374,9 +379,8 @@ const PLACE_TRIES: usize = 40;
 fn place(env: &Env) -> Result<Place, String> {
     use std::os::fd::AsRawFd;
     let path = public(env).join(crate::desktop::LOCK_FILE);
-    // `Ok(None)`: no lock file at all. `Err(())`: the place is taken, or the file unreadable.
+    // `Err(())`: the place is taken, or the file cannot be opened.
     let shared = || match std::fs::File::open(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(()),
         // SAFETY: a plain syscall on a descriptor this closure owns.
         Ok(f) => match unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } {
@@ -385,6 +389,10 @@ fn place(env: &Env) -> Result<Place, String> {
         },
     };
     for _ in 0..PLACE_TRIES {
+        let gone = |e: std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+        if std::fs::symlink_metadata(&path).is_err_and(gone) {
+            return Err(NO_LOCK.into());
+        }
         match shared() {
             Ok(place) if !flagged(env) => return Ok(place),
             // Never asked from a place the take would wait for: the gate may take minutes.
@@ -412,7 +420,8 @@ fn go(env: &Env, wait: Option<std::os::unix::net::UnixStream>) -> (Next, Place) 
             false => (Next::Refuse(NOT_ANSWERING.into()), None),
         },
         Err(text) => {
-            say(wait, json!({"ran": false, "held": text != NOT_ANSWERING}));
+            let held = text != NOT_ANSWERING && text != NO_LOCK;
+            say(wait, json!({"ran": false, "held": held}));
             (Next::Refuse(text), None)
         }
     }
@@ -2115,6 +2124,8 @@ cat "$d/$f.json"
                 socket: Some(dir.join("gate.sock")),
                 session: "main".into(),
             };
+            // Root's lock, which the daemon makes at each start.
+            std::fs::write(dir.join(crate::desktop::LOCK_FILE), "").unwrap();
             T { dir, env }
         }
 
@@ -2257,6 +2268,23 @@ cat "$d/$f.json"
         // Asked once more as it takes its place to run.
         answer(&mut asked(&gate).1, json!({"verdict": "deny", "text": ""}));
         assert_eq!(waiting.join().unwrap(), Next::Exec);
+    }
+
+    /// Without root's lock file there is no place to run in, and a take would have nothing to
+    /// wait for: nothing runs, as with no gate.
+    #[test]
+    fn without_the_lock_file_nothing_runs() {
+        let t = T::new("bg-no-lock");
+        t.page(MAIL, COMPOSE, "");
+        let _ = std::fs::remove_file(t.dir.join(crate::desktop::LOCK_FILE));
+        let missing = "not run: zephyr's desktop lock is missing, so the owner could not take \
+                       the desktop over safely; zephyr doctor says why";
+        let (next, place) = decide(&["snapshot".to_string(), "-i".to_string()], &t.env);
+        assert_eq!(next, Next::Refuse(missing.into()));
+        assert!(place.is_none());
+        assert_eq!(xdotool(&t.env), Next::Refuse(missing.into()));
+        // Help and the version touch no page and need no place.
+        assert_eq!(decide(&["--version".to_string()], &t.env).0, Next::Exec);
     }
 
     /// The structure that closes the race: the command runs in a shared place on root's lock,
@@ -2511,11 +2539,17 @@ cat "$d/$f.json"
         );
         assert!(!t.clicked(), "the wrapper itself never clicks: {argv:?}");
         assert!(gate.try_recv().is_err());
-        // Without a gate at all, what needs none still runs.
+        // With no gate named, the lock is looked for in root's own folder: outside the image
+        // there is none, and nothing runs.
         let mut alone = t.env.clone();
         alone.socket = None;
         let args = ["click".to_string(), "@e4".to_string()];
-        assert_eq!(run(&args, &alone), Next::Exec);
+        if !std::path::Path::new(PUBLIC)
+            .join(crate::desktop::LOCK_FILE)
+            .exists()
+        {
+            assert_eq!(run(&args, &alone), Next::Refuse(NO_LOCK.into()));
+        }
     }
 
     #[test]
