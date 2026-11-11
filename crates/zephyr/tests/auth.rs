@@ -323,6 +323,78 @@ async fn disabled_means_the_child_is_never_asked() {
     gw.shutdown().await;
 }
 
+/// A refresh runs off the router's loop: one that hangs during a run does not hold the run's
+/// events, so its settle (and reply) come on time.
+#[tokio::test]
+async fn a_hanging_refresh_during_a_run_does_not_hold_its_events() {
+    let gw = start(
+        "refresh-hangs",
+        Some(expiring_in(3600)),
+        "[auth]\nrefresh_minutes = 0.02\n",
+    );
+    wait(|| !of_type(&gw.home, "get_auth_status").is_empty()).await; // providers known
+    std::fs::write(gw.home.join("slow"), "3").unwrap();
+    std::fs::write(gw.home.join("refresh_hang"), "").unwrap();
+    gw.say("m1", "hello").await;
+    wait(|| !of_type(&gw.home, "prompt").is_empty()).await;
+    std::fs::write(gw.agent.join("auth.json"), expiring_in(60).to_string()).unwrap();
+    wait(|| gw.home.join("refresh_pid").exists()).await; // it hangs, mid-run
+    let since = std::time::Instant::now();
+    let settled = || {
+        let commands = log(&gw.home);
+        let prompt = commands.iter().position(|c| c["type"] == "prompt");
+        prompt.is_some_and(|at| commands[at..].iter().any(|c| c["type"] == "get_messages"))
+    };
+    wait(&settled).await;
+    assert!(
+        since.elapsed() < Duration::from_secs(8),
+        "the settle waited on the refresh"
+    );
+    if let Ok(pid) = std::fs::read_to_string(gw.home.join("refresh_pid")) {
+        // SAFETY: a plain kill of the fake's own hanging subprocess.
+        unsafe { libc::kill(pid.trim().parse().unwrap(), libc::SIGKILL) };
+    }
+    gw.shutdown().await;
+}
+
+/// Busy from its first moment, main's child is never asked which credentials it holds: a due
+/// one is still refreshed during that run, found in the agent dir.
+#[tokio::test]
+async fn a_daemon_busy_from_its_start_still_refreshes_a_due_credential() {
+    let (cfg, home, agent) = setup(
+        "busy-at-start",
+        Some(expiring_in(300)),
+        "[auth]\nrefresh_minutes = 0.02\n",
+    );
+    std::fs::write(home.join("slow"), "4").unwrap();
+    // Waiting in the inbox: the child's first reconcile sends it, before any check.
+    let m = Inbound {
+        channel: "chat".into(),
+        platform_msg_id: "m1".into(),
+        sender: "owner".into(),
+        text: "hello".into(),
+    };
+    zephyr::store::Store::open(&cfg.db_path())
+        .unwrap()
+        .insert_inbox_as(&m, "new")
+        .unwrap();
+    let gw = run(cfg, home.clone(), agent);
+    wait(|| !refreshes(&home).is_empty()).await;
+    let commands: Vec<String> = log(&home)
+        .iter()
+        .map(|c| c["type"].as_str().unwrap().to_string())
+        .collect();
+    let prompt_at = commands.iter().position(|c| c == "prompt").unwrap();
+    let refresh_at = commands.iter().position(|c| c == "auth-refresh").unwrap();
+    assert!(
+        !commands[prompt_at..refresh_at]
+            .iter()
+            .any(|c| c == "get_messages"),
+        "refreshed during the first run: {commands:?}"
+    );
+    gw.shutdown().await;
+}
+
 /// A pool account's credential is refreshed when due, main busy or not: it needs no child.
 #[tokio::test]
 async fn a_pool_account_is_refreshed_while_main_is_busy() {

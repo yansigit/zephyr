@@ -101,6 +101,21 @@ pub async fn oauth_providers(child: &mut Child) -> anyhow::Result<Vec<Oauth>> {
         .collect())
 }
 
+/// The OAuth credentials stored in main's agent dir, for a check made before the child could be
+/// asked (busy since the daemon started). Each counts as refreshable; one that is not fails its
+/// refresh, which is logged.
+pub fn stored_oauth(cfg: &Config) -> Vec<Oauth> {
+    let stored = oauth_expiries(&agent_dir(cfg)).unwrap_or_default();
+    let mut oauth: Vec<Oauth> = (stored.into_keys())
+        .map(|provider| Oauth {
+            provider,
+            refreshable: true,
+        })
+        .collect();
+    oauth.sort_by(|a, b| a.provider.cmp(&b.provider));
+    oauth
+}
+
 /// One check of `oauth` (from `oauth_providers`): runs `rpi auth refresh` for each credential
 /// that expires within the window and that a loaded extension can refresh. Needs no child, so it
 /// runs during a run too. Returns true when at least one credential was refreshed, so the caller

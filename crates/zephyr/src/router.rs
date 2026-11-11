@@ -444,8 +444,12 @@ struct Router<'a> {
     pair_limits: crate::web::signin::Limits,
     /// Exit with `Exit::Reexec` once main and the jobs are idle.
     reexec: bool,
-    /// The OAuth providers main's child named at its last idle auth check (`auth_check`).
-    oauth: Vec<crate::auth_keeper::Oauth>,
+    /// The OAuth providers main's child named at its last idle auth check (`auth_check`);
+    /// `None` until it was first asked.
+    oauth: Option<Vec<crate::auth_keeper::Oauth>>,
+    /// The credential refresh under way, in a task of its own: `true` when it refreshed the
+    /// running child's, which then restarts once idle.
+    refreshing: Option<tokio::task::JoinHandle<bool>>,
     /// The child's `auth.json` mtime at spawn; a newer one (a re-login) restarts the child.
     auth_stamp: Option<SystemTime>,
     /// Sign-ins `/login` started whose URL is not out yet.
@@ -654,7 +658,8 @@ impl<'a> Router<'a> {
             attaches,
             jobs,
             auth_at: Instant::now(),
-            oauth: Vec::new(),
+            oauth: None,
+            refreshing: None,
             restart: false,
             account: None,
             tally: crate::rpc::Tally::main(&cfg.home),
@@ -749,6 +754,11 @@ impl<'a> Router<'a> {
                 }
                 _ = tokio::time::sleep_until(self.auth_at), if (self.child.is_some() || !self.cfg.accounts.is_empty()) && self.cfg.auth.enabled => {
                     self.auth_check().await
+                }
+                r = async { self.refreshing.as_mut().expect("guarded").await }, if self.refreshing.is_some() => {
+                    self.refreshing = None;
+                    self.restart |= r.unwrap_or(false);
+                    self.restart_if_idle().await;
                 }
                 ev = next_event(&mut self.child) => match self.tapped(ev).await {
                     Some(ev) if ev["type"] == "agent_settled" => self.settled(&ev).await,
@@ -4653,26 +4663,41 @@ impl<'a> Router<'a> {
     async fn auth_check(&mut self) {
         let every = Duration::from_secs_f64((self.cfg.auth.refresh_minutes * 60.0).max(1.0));
         self.auth_at = Instant::now() + every;
+        if self.refreshing.is_some() {
+            return; // one at a time: a rotating refresh token must not race itself
+        }
         let now = crate::now();
-        if !self.cfg.accounts.is_empty() {
-            self.restart |=
-                crate::auth_keeper::refresh_accounts(&self.cfg, self.account.as_ref(), now).await;
-        } else {
-            // Asking the child waits on it, which mid-run would hold every event of the run
-            // (its typing and progress note too): only while idle, its answer kept for the
-            // checks that come due during a run. The refresh itself needs no child.
-            if let (false, Some(child)) = (self.busy, self.child.as_mut()) {
-                match crate::auth_keeper::oauth_providers(child).await {
-                    Ok(oauth) => self.oauth = oauth,
-                    Err(e) => eprintln!("zephyr: auth check failed: {e:#}"),
+        let oauth = match self.cfg.accounts.is_empty() {
+            true => {
+                // Asking the child waits on it, which mid-run would hold every event of the
+                // run (its typing and progress note too): only while idle, its answer kept for
+                // the checks that come due during a run.
+                if let (false, Some(child)) = (self.busy, self.child.as_mut()) {
+                    match crate::auth_keeper::oauth_providers(child).await {
+                        Ok(oauth) => self.oauth = Some(oauth),
+                        Err(e) => eprintln!("zephyr: auth check failed: {e:#}"),
+                    }
+                }
+                // Never asked yet (busy since the start): the stored credentials stand in.
+                (self.oauth.clone()).unwrap_or_else(|| crate::auth_keeper::stored_oauth(&self.cfg))
+            }
+            false => Vec::new(),
+        };
+        // The refresh runs `rpi auth refresh`, up to a minute each: off the router's loop, its
+        // answer taken in `main` (a restart still waits for idle).
+        let (cfg, current) = (self.cfg.clone(), self.account.clone());
+        self.refreshing = Some(tokio::spawn(async move {
+            if !cfg.accounts.is_empty() {
+                return crate::auth_keeper::refresh_accounts(&cfg, current.as_ref(), now).await;
+            }
+            match crate::auth_keeper::refresh(&cfg, &oauth, now).await {
+                Ok(refreshed) => refreshed,
+                Err(e) => {
+                    eprintln!("zephyr: auth check failed: {e:#}");
+                    false
                 }
             }
-            match crate::auth_keeper::refresh(&self.cfg, &self.oauth, now).await {
-                Ok(refreshed) => self.restart |= refreshed,
-                Err(e) => eprintln!("zephyr: auth check failed: {e:#}"),
-            }
-        }
-        self.restart_if_idle().await;
+        }));
     }
 
     /// rpi binds credentials and the model when a session starts, so a refreshed token or a
