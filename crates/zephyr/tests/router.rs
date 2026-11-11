@@ -8282,6 +8282,16 @@ async fn a_manual_card_is_approved_entered_filled_on_its_origin_and_forgotten() 
         refused.contains("not run: a virtual card is filled on https://shop.example;"),
         "{refused}"
     );
+    // So is a snapshot of the page it was just typed into.
+    let snap = format!(
+        r#"[call exec {{"command": "{} snapshot -i"}}]"#,
+        home.join("bin/agent-browser").display()
+    );
+    gw.say("c7c", "owner", &snap).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains("not run: a virtual card was just typed into this page")
+    })
+    .await;
     // Review Focus 1: a read-back the agent echoes comes back as the card's label.
     std::fs::write(
         home.join("readback.txt"),

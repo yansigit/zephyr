@@ -1063,7 +1063,8 @@ zephyr config set cards.provider manual                 # or link
   the page itself, only into fields of the approved address's own page (not a frame from
   another site, so an embedded payment form cannot be filled), and closes the card if the page
   moves away while it types. Until an hour after the card closed, the agent's browser refuses to
-  read that page back (a field's value, the HTML, a script, a screenshot). `/card` lists your
+  read that page back (a field's value, the HTML, a script, a screenshot), and a `snapshot` of
+  the page it typed into is refused until the page moves on. `/card` lists your
   cards; `/card close 7` (or `/card done 7`) closes one early, at the issuer too. `/stop` and
   `/pause` close every open card and stop a fill in hand.
 - **One purchase per card.** The card lets one Pay click through, on the page zephyr filled it

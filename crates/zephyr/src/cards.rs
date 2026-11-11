@@ -514,8 +514,8 @@ pub mod live {
         pan: Pan,
         /// Set once the card closed: no longer filled, still scrubbed until then.
         drop_at: Option<i64>,
-        /// Once the number was typed into a page: the flag file that says so, and the page's
-        /// origin ([`filled`]).
+        /// Once the number was typed into a page: the flag file that says so, and its line,
+        /// the page's origin and address ([`filled`]).
         filled: Option<(PathBuf, String)>,
     }
 
@@ -631,25 +631,28 @@ pub mod live {
         flags.iter().for_each(|flag| write_flag(flag, &all));
     }
 
-    /// Card `card`'s number is about to be typed into a page on `origin`: from now until the
-    /// number is dropped, the browser wrapper refuses to read that origin's pages back
-    /// (`FILLED_FILE`, in the daemon's public folder: root's, readable by the agent).
-    pub fn filled(cfg: &Config, card: i64, origin: &str) {
+    /// Card `card`'s number is about to be typed into `page`, on `origin`: from now until the
+    /// number is dropped, the browser wrapper refuses to read that origin's pages back, and
+    /// to snapshot that page until it moves on (`FILLED_FILE`, in the daemon's public folder:
+    /// root's, readable by the agent).
+    pub fn filled(cfg: &Config, card: i64, origin: &str, page: &str) {
         let flag = crate::drafts::public_dir(cfg).join(FILLED_FILE);
         let mut all = lock();
         let state = cfg.state_dir();
         if let Some(h) = all.iter_mut().find(|h| h.state == state && h.card == card) {
-            h.filled = Some((flag.clone(), origin.to_string()));
+            // A page's address holds no tab or line break, as `get url` prints it.
+            let page: String = page.chars().filter(|c| !c.is_control()).collect();
+            h.filled = Some((flag.clone(), format!("{origin}\t{page}")));
         }
         write_flag(&flag, &all);
     }
 
-    /// The origins of the pages whose fields hold a kept number, one a line; no file for none.
+    /// The pages whose fields hold a kept number, `origin<TAB>page` a line; no file for none.
     fn write_flag(flag: &std::path::Path, all: &[Held]) {
         let mut origins: Vec<&str> = (all.iter())
             .filter_map(|h| h.filled.as_ref())
             .filter(|(f, _)| f == flag)
-            .map(|(_, origin)| origin.as_str())
+            .map(|(_, line)| line.as_str())
             .collect();
         origins.sort_unstable();
         origins.dedup();
@@ -1487,7 +1490,7 @@ async fn fill(cfg: &Arc<Config>, id: i64, fields: CardFields) -> String {
     };
     // From here the page's fields hold the number: the browser wrapper reads it back to no
     // one until the number is dropped.
-    live::filled(cfg, id, &card.origin);
+    live::filled(cfg, id, &card.origin, &page);
     let mut done: Vec<&str> = Vec::new();
     let mut last = page.clone();
     for (label, sel) in selectors {
