@@ -828,6 +828,7 @@ impl<'a> Router<'a> {
                     self.upgrade_notice();
                     self.broker_notice();
                     self.seed_notice();
+                    self.window_notice();
                     // Cards: their expiry, the issuer's word on them, reminders (DESIGN §4.22).
                     crate::cards::tick_off(&self.cfg, &self.store);
                     // Delays that came due, and held actions nobody answered (approvals §4.6).
@@ -3232,6 +3233,23 @@ impl<'a> Router<'a> {
     /// connectors that cannot be used until the owner binds them. It waits for an owner to
     /// tell, and is marked told even when there is nothing to say, so a later start is silent;
     /// not while the vault cannot be read, which says nothing about what is in it.
+    /// An install that was there before the payment window (DESIGN §4.22) is told of it once,
+    /// as soon as there is an owner to tell: it changes what `auto N` lets through.
+    fn window_notice(&self) {
+        const KEY: &str = "window.notice";
+        if !matches!(self.store.meta(KEY), Ok(Some(_)))
+            || self.store.last_owner().ok().flatten().is_none()
+        {
+            return;
+        }
+        let told = self
+            .store
+            .notify_last_owner(&crate::gate::window_notice(&self.cfg));
+        log(told
+            .and_then(|()| self.store.set_meta(KEY, None))
+            .map_err(Into::into));
+    }
+
     fn broker_notice(&self) {
         const TOLD: &str = "broker.upgrade_told";
         const KEPT: &str = "broker.remote_kept";

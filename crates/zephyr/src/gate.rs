@@ -384,26 +384,62 @@ pub fn approved_card(cfg: &Config, a: &Action) -> Result<(Checked, CardAsk), Str
     Ok((Checked(()), ask))
 }
 
-/// `over your payment window (5 payments or 200.00 CAD per 10 min)`, when one more payment of
-/// `amount` would cross `[approvals.window]` (DESIGN §4.22): more than `effects` payments in
-/// the last `seconds`, or more than `amount` in all. An amount that was not read, or in another
-/// currency, this one's or an earlier one's, counts as over the amount.
+/// What one more payment does to `[approvals.window]` (DESIGN §4.22).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Window {
+    Within,
+    /// It would make the count pass `effects`, or the known sum pass `amount`: `over your
+    /// payment window (5 payments or 200.00 CAD per 10 min)`. Only this is strong.
+    Over(String),
+    /// There is an amount limit and this payment's amount was not read, or is in another
+    /// currency: the window cannot count it, so it waits for an ordinary `/ok`.
+    Unread,
+}
+
+/// Where one more payment of `amount` puts the window: over it only by what is known, the
+/// count of payments in the last `seconds` and the sum of those whose amount was read in
+/// `approvals.currency`.
 pub fn window_over(
     cfg: &Config,
     store: &Store,
     amount: Option<&Amount>,
     now: i64,
-) -> rusqlite::Result<Option<String>> {
+) -> rusqlite::Result<Window> {
     let w = approvals::window(cfg);
     let currency = approvals::currency(cfg);
-    let (count, sum, unread) = store.payments_since(now - w.seconds, &currency)?;
+    let (count, sum, _) = store.payments_since(now - w.seconds, &currency)?;
     let this = amount
         .filter(|a| a.currency == currency)
         .map(|a| approvals::minor_of(a.value, &currency));
-    let over_amount = w
-        .amount_minor
-        .is_some_and(|limit| unread || this.is_none_or(|m| sum + m > limit));
-    Ok((count + 1 > w.effects || over_amount).then(|| window_text(cfg)))
+    if count + 1 > w.effects {
+        return Ok(Window::Over(window_text(cfg)));
+    }
+    Ok(match (w.amount_minor, this) {
+        (Some(limit), Some(this)) if sum + this > limit => Window::Over(window_text(cfg)),
+        (Some(_), None) => Window::Unread,
+        _ => Window::Within,
+    })
+}
+
+/// What an install from before the window is told once (the router's tick): the limits as
+/// they are for it, and how to change them.
+pub fn window_notice(cfg: &Config) -> String {
+    let w = approvals::window(cfg);
+    let amount = w.amount_minor.map_or(String::new(), |m| {
+        format!(
+            ", or {} in all,",
+            approvals::money(m, &approvals::currency(cfg))
+        )
+    });
+    format!(
+        "[zephyr] new in this version: a payment window. Past {} payments{amount} within {}, \
+         the next payment waits for you and its /ok needs {}, whatever approvals.money lets \
+         through. Tune it with /set approvals.window.effects, approvals.window.amount and \
+         approvals.window.seconds",
+        w.effects,
+        span(w.seconds),
+        cfg.settings.strong_channels.join(" or ")
+    )
 }
 
 fn window_text(cfg: &Config) -> String {
@@ -463,10 +499,11 @@ pub fn window_check(
     let failed = |e: rusqlite::Error| format!("[zephyr] reading proposal #{} failed: {e}", a.id);
     let amount = stored_amount(cfg, a);
     let over = match store.action_strong(a.id).map_err(failed)? {
-        true => Some(window_text(cfg)),
+        true => Window::Over(window_text(cfg)),
         false => window_over(cfg, store, amount.as_ref(), now).map_err(failed)?,
     };
-    let Some(why) = over else {
+    // An amount the window cannot count is the owner's to approve from any channel.
+    let Window::Over(why) = over else {
         return Ok(());
     };
     store.set_strong(a.id).map_err(failed)?;
@@ -814,8 +851,13 @@ pub fn due_check(cfg: &Config, store: &Store, a: &Action) -> Option<String> {
     let g = call.gated.as_ref()?;
     if g.class == Class::Money {
         match window_over(cfg, store, g.amount.as_ref(), crate::now()) {
-            Ok(None) => {}
-            Ok(Some(why)) => {
+            Ok(Window::Within) => {}
+            Ok(Window::Unread) => {
+                return Some(
+                    "its amount was not read, so your payment window cannot count it".into(),
+                )
+            }
+            Ok(Window::Over(why)) => {
                 // From now on its `/ok` needs a strong channel: no delay runs it out.
                 if let Err(e) = store.set_strong(a.id) {
                     eprintln!("zephyr: marking #{} strong failed: {e}", a.id);
@@ -1151,15 +1193,17 @@ impl Gate<'_> {
         let plan = self.by_mode(e, g)?;
         // The window, whatever the mode lets through (DESIGN §4.22): no grant, pass or
         // remembered target satisfies it.
-        let goes = !matches!(plan, Plan::Hold(_));
-        let money = g.class == Class::Money;
-        if money
-            && goes
-            && window_over(self.cfg, self.store, g.amount.as_ref(), self.now)?.is_some()
-        {
-            return Ok(Plan::Hold("window"));
+        if g.class != Class::Money || matches!(plan, Plan::Hold(_)) {
+            return Ok(plan);
         }
-        Ok(plan)
+        Ok(
+            match window_over(self.cfg, self.store, g.amount.as_ref(), self.now)? {
+                Window::Within => plan,
+                Window::Over(_) => Plan::Hold("window"),
+                // Not counted, so not let go by itself; and not strong.
+                Window::Unread => Plan::Hold("held"),
+            },
+        )
     }
 
     /// Whether an open card covers this browser payment: bound to its origin, in its currency,
@@ -1279,7 +1323,8 @@ impl Gate<'_> {
         let id = self.store.hold_action(&new)?;
         // A payment held while the window is crossed needs a strong channel to approve.
         if let Some(g) = call.gated.as_ref().filter(|g| g.class == Class::Money) {
-            if window_over(self.cfg, self.store, g.amount.as_ref(), self.now)?.is_some() {
+            let over = window_over(self.cfg, self.store, g.amount.as_ref(), self.now)?;
+            if matches!(over, Window::Over(_)) {
                 self.store.set_strong(id)?;
             }
         }
@@ -3487,14 +3532,14 @@ mod tests {
                 "{card}"
             );
             assert!(card.contains(&format!("\n{shown}\n")), "{card}");
-            // A payment has no recipients to remember: no `once`. One whose amount is not in
-            // the currency, or was not read, is also over the window's amount (DESIGN §4.22).
-            let footer = format!("\n/ok {id} · /no {id} · expires in 24 h");
-            let strong = " · this one needs tui or chat or passkey";
-            match shown.ends_with("USD") {
-                true => assert!(card.ends_with(&footer), "{card}"),
-                false => assert!(card.ends_with(&format!("{footer}{strong}")), "{card}"),
-            }
+            // A payment has no recipients to remember: no `once`. An amount that was not read,
+            // or is in another currency, is held for an ordinary /ok: the window marks only
+            // what it knows to be over (DESIGN §4.22).
+            assert!(
+                card.ends_with(&format!("\n/ok {id} · /no {id} · expires in 24 h")),
+                "{card}"
+            );
+            assert!(!h.store.action_strong(id).unwrap(), "{card}");
         }
         // A checkout button has no amount the gate can read: over the cap.
         let v = decide(
@@ -3516,12 +3561,7 @@ mod tests {
             )),
             "{card}"
         );
-        // Its total was not read, so it is over the window's amount too: strong.
-        let strong = " · this one needs tui or chat or passkey";
-        assert!(
-            card.ends_with(&format!("expires in 10 min{strong}")),
-            "{card}"
-        );
+        assert!(card.ends_with("expires in 10 min"), "{card}");
         // What a passkey signs is the same card made without the time left, which changes by
         // itself. It is built that way, never cut out of the text: a target that holds the
         // countdown's words stays whole.
@@ -3529,8 +3569,7 @@ mod tests {
         let (cfg, store) = (&h.cfg, &h.store);
         let signed = signed_card(&action, cfg, store);
         assert!(!signed.contains("expires in"), "{signed}");
-        let timed = signed.replace(strong, &format!(" · expires in 10 min{strong}"));
-        assert_eq!(timed, card);
+        assert_eq!(format!("{signed} · expires in 10 min"), card);
         let mut odd = action.clone();
         odd.targets = vec!["https://shop.example.com/ · expires in 1 h".into()];
         let (card, signed) = (super::card(&odd, cfg, store), signed_card(&odd, cfg, store));
@@ -3538,8 +3577,7 @@ mod tests {
             signed.contains("https://shop.example.com/ · expires in 1 h"),
             "{signed}"
         );
-        let timed = signed.replace(strong, &format!(" · expires in 10 min{strong}"));
-        assert_eq!(timed, card);
+        assert_eq!(format!("{signed} · expires in 10 min"), card);
         assert_eq!(
             outcomes(&h.store),
             ["auto", "auto", "auto", "held", "held", "held", "held", "held", "held"]
@@ -5193,24 +5231,52 @@ mod tests {
         assert!(h.store.action_strong(id).unwrap());
     }
 
+    /// Only what the window knows to be over is strong: a total that was not read, or is in
+    /// another currency, waits for an ordinary /ok, as it did before there was a window.
     #[test]
-    fn an_unread_amount_counts_as_over_the_window() {
-        let h = home("gate-card-unread", AUTO_100);
+    fn an_unread_or_foreign_total_is_held_for_an_ordinary_ok_not_strong() {
+        // `strong_only` does not name money here: only the window could ask for strong.
+        let h = home(
+            "gate-window-unread",
+            "[approvals]\ncurrency = 'CAD'\nmoney = 'auto 100'\n",
+        );
         let now = crate::now();
+        let unread = click("Pay now", "https://shop.example", "main:1");
+        let mut foreign = click("Pay now", "https://shop.example", "main:2");
+        foreign.browser.as_mut().unwrap().amount = Some(PageAmount {
+            value: 20.0,
+            currency: "EUR".into(),
+        });
+        for req in [unread, foreign] {
+            let id = held(&decide(&h.cfg, &h.store, &req, owner(), now));
+            assert!(!h.store.action_strong(id).unwrap());
+            let card = notices(&h.store).pop().unwrap();
+            assert!(!card.contains("over your payment window"), "{card}");
+            assert!(!card.contains("this one needs"), "{card}");
+            // Its /ok is taken from any owner channel, and then it counts with no amount.
+            let a = h.store.action(id).unwrap().unwrap();
+            assert_eq!(window_check(&h.cfg, &h.store, &a, false, now), Ok(()));
+        }
+        // A payment with no amount in the window makes no later one strong: a known 10 goes.
         h.store
             .add_payment(now - 5, None, "CAD", "ok", None)
             .unwrap();
-        let id = held(&decide(&h.cfg, &h.store, &card_of("10"), owner(), now));
-        assert!(h.store.action_strong(id).unwrap());
-        // With no amount limit only the count is looked at.
-        let plain = home("gate-card-unread-plain", CARDS);
-        plain
-            .store
-            .add_payment(now - 5, None, "CAD", "ok", None)
-            .unwrap();
+        assert!(decide_card(&h.cfg, &h.store, &card_of("10"), owner(), now).is_ok());
+        // With an amount limit and no cap (plain `auto`), an unread total is held, not let go
+        // uncounted, and not strong.
+        let extra =
+            "[approvals]\ncurrency = 'CAD'\nmoney = 'auto'\n[approvals.window]\namount = 100\n";
+        let auto = home("gate-window-unread-auto", extra);
+        let req = click("Pay now", "https://shop.example", "main:3");
+        let id = held(&decide(&auto.cfg, &auto.store, &req, owner(), now));
+        assert!(!auto.store.action_strong(id).unwrap());
+        assert_eq!(outcomes(&auto.store), ["held"]);
+        // With no amount limit at all only the count is looked at.
+        let plain = home("gate-window-unread-plain", "[approvals]\nmoney = 'auto'\n");
+        let req = click("Pay now", "https://shop.example", "main:4");
         assert_eq!(
-            window_over(&plain.cfg, &plain.store, None, now).unwrap(),
-            None
+            decide(&plain.cfg, &plain.store, &req, owner(), now),
+            Verdict::Allow
         );
     }
 

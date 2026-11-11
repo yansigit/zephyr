@@ -1132,6 +1132,13 @@ impl Store {
                     descriptor TEXT, mcc TEXT, approval_url TEXT, told_at INTEGER);
                  PRAGMA user_version = 20;",
             )?;
+            // An install from before the payment window is told of it once (`Router`'s tick).
+            if version > 0 {
+                db.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES ('window.notice', '1')",
+                    [],
+                )?;
+            }
         }
         // A database made by a build that has the token broker (DESIGN §4.21): its remote
         // connectors were never published with a real secret by default, so there is nothing

@@ -7530,7 +7530,13 @@ async fn an_upgraded_install_keeps_sending_and_is_told_once() {
     let home = home("upgraded");
     old_install(&home);
     let gw = start(on_file(&home, ""));
-    assert_eq!(gw.wait_replies(1).await, [OFF_NOTICE]);
+    // An install this old is also told of the payment window, once (DESIGN §4.22).
+    let told = gw.wait_replies(2).await;
+    assert_eq!(told[0], OFF_NOTICE);
+    assert!(
+        told[1].starts_with("[zephyr] new in this version: a payment window"),
+        "{told:?}"
+    );
     let text = std::fs::read_to_string(home.join("zephyr.toml")).unwrap();
     assert!(
         text.lines()
@@ -7547,7 +7553,7 @@ async fn an_upgraded_install_keeps_sending_and_is_told_once() {
     assert_eq!(change.actor, "zephyr");
     gw.say("m1", "owner", "/approvals").await;
     assert_eq!(
-        gw.wait_replies(2).await[1],
+        gw.wait_replies(3).await[2],
         "[zephyr] preset full · messages auto · posts auto · money auto · facts warn"
     );
     gw.shutdown().await;
@@ -7576,7 +7582,13 @@ async fn an_upgrade_leaves_an_approvals_table_the_owner_wrote() {
     .unwrap();
     let gw = start(Config::load(&path).unwrap());
     gw.say("m1", "owner", "hi").await;
-    assert_eq!(gw.wait_replies(1).await, ["echo: [chat #2] hi"]);
+    // Nothing about approvals; the payment window's notice is every upgraded install's.
+    let said = gw.wait_replies(2).await;
+    assert!(said.contains(&"echo: [chat #2] hi".to_string()), "{said:?}");
+    assert!(
+        !said.iter().any(|r| r.contains("approvals are off")),
+        "{said:?}"
+    );
     gw.shutdown().await;
     let cfg = Config::load(&path).unwrap();
     assert_eq!(cfg.approvals.unwrap().preset.as_deref(), Some("semi"));
@@ -7624,7 +7636,8 @@ async fn an_upgraded_install_with_no_owner_yet_is_told_after_the_first_message()
     assert!(text.contains("preset = \"full\""), "{text}");
     assert!(gw.replies().is_empty(), "no owner to tell yet");
     gw.say("m1", "owner", "hi").await;
-    wait(|| gw.replies().len() >= 2).await;
+    // The reply, the approvals notice and the payment window's (DESIGN §4.22).
+    wait(|| gw.replies().len() >= 3).await;
     let r = gw.replies();
     assert!(
         r.contains(&OFF_NOTICE.to_string()) && r.contains(&"echo: [chat #1] hi".to_string()),
@@ -7632,8 +7645,8 @@ async fn an_upgraded_install_with_no_owner_yet_is_told_after_the_first_message()
     );
     gw.say("m2", "owner", "again").await;
     assert_eq!(
-        gw.wait_replies(3).await.len(),
-        3,
+        gw.wait_replies(4).await.len(),
+        4,
         "told once, not again: {:?}",
         gw.replies()
     );
@@ -8482,5 +8495,56 @@ async fn a_charge_over_the_cap_is_told_at_once() {
         "[zephyr] card #1 was charged 50.00 USD; no merchant id from the issuer; the card is closed"
     );
     assert_eq!(card_status(&home, 1), "used");
+    gw.shutdown().await;
+}
+
+/// An install from before the payment window is told of it once, with its own limits and how
+/// to tune them; a new install is not.
+#[tokio::test]
+async fn an_upgraded_install_is_told_of_the_payment_window_once() {
+    const NEW: &str = "[zephyr] new in this version: a payment window";
+    let home = home("window-notice");
+    // As a database of the version before cards looked.
+    let path = home.join("state.db");
+    drop(Store::open(&path).unwrap());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch(
+        "INSERT INTO inbox(channel, platform_msg_id, sender, text, status, sent_as)
+         VALUES ('chat', 'old', 'owner', 'earlier', 'done', 'prompt');
+         DROP TABLE cards; DROP TABLE payments; DELETE FROM meta WHERE key = 'window.notice';
+         PRAGMA user_version = 19;",
+    )
+    .unwrap();
+    drop(db);
+    let extra = "[approvals]\nmoney = \"auto 50\"\ncurrency = \"CAD\"";
+    let mut cfg = on_file(&home, extra);
+    cfg.tick = Duration::from_millis(200);
+    let gw = start(cfg);
+    let told = reply_where(&gw, "chat", |r| r.starts_with(NEW)).await;
+    assert_eq!(
+        told,
+        "[zephyr] new in this version: a payment window. Past 5 payments, or 50.00 CAD in \
+         all, within 10 min, the next payment waits for you and its /ok needs tui or chat or \
+         passkey, whatever approvals.money lets through. Tune it with /set \
+         approvals.window.effects, approvals.window.amount and approvals.window.seconds"
+    );
+    ticks(&home, 3).await;
+    gw.shutdown().await;
+    let mut cfg = on_file_keep(&home);
+    cfg.tick = Duration::from_millis(200);
+    let gw = start(cfg);
+    ticks(&home, 3).await;
+    let again = gw.replies().iter().filter(|r| r.starts_with(NEW)).count();
+    assert_eq!(again, 0, "once");
+    gw.shutdown().await;
+    // A new install has nothing to be told.
+    let fresh = self::home("window-notice-fresh");
+    let mut cfg = on_file(&fresh, extra);
+    cfg.tick = Duration::from_millis(200);
+    let gw = start(cfg);
+    gw.say("m1", "owner", "hi").await;
+    gw.wait_replies(1).await;
+    ticks(&fresh, 3).await;
+    assert!(!gw.replies().iter().any(|r| r.starts_with(NEW)));
     gw.shutdown().await;
 }
