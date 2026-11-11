@@ -1080,7 +1080,10 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
         let text = h.data.read(crate::catalog::ADDED).unwrap_or_default();
         let new = crate::catalog::with_added(&text, name, on);
         if new != text && (on || !text.is_empty()) {
-            h.data.write(crate::catalog::ADDED, &new)?;
+            // Only doctor's note hangs on it: an older image's `__file` refuses the name.
+            if let Err(e) = h.data.write(crate::catalog::ADDED, &new) {
+                eprintln!("warn {e:#}: zephyr doctor may not say when a newer catalog entry ships");
+            }
         }
     }
     match &catalog {
