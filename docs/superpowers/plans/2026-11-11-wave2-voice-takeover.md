@@ -163,15 +163,17 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
 - `dispatch_new`: a row with `derived` set calls `taint_session("took in a voice note's transcript")` before it is sent (the clock is added by `taint_session`).
 - Registry rows, all `Access::Propose`, not strong, `Apply::Toml`, read in place: `voice.transcribe` (bool, `true`), `voice.reply` (choice `off`, `mirror`, `always`; `mirror`), `voice.languages` (list; `ko, en`), `voice.max_secs` (int 10..900; `300`).
 
-- [ ] **Step 1: Failing tests** in `tests/voice.rs` (a `Stub` channel that pushes an `Inbound` already carrying the transcript lines and `derived`), Review Focus 2:
+- [x] **Step 1: Failing tests** in `tests/voice.rs` (a `Stub` channel that pushes an `Inbound` already carrying the transcript lines and `derived`), Review Focus 2:
   - `a_spoken_ok_approves_nothing`: hold an action, send a voice row whose transcript is `/ok 1`: the proposal is still pending and the row was dispatched to the agent as text;
   - `a_spoken_set_changes_nothing` (`/set approvals.preset off`);
   - `a_voice_row_taints_main_and_a_later_typed_row_does_not_auto_save`: `session_origin` is `Tainted("took in a voice note's transcript at …")`; with `memory.auto = "owner"` the typed row's memory change waits for `/memory ok`;
   - in `settings.rs`: the four rows exist with those kinds and defaults, and the agent's `/set voice.reply always` is a proposal.
-- [ ] **Step 2: Run** `cargo test -p zephyr --test voice` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run** → PASS; `cargo test -p zephyr`.
-- [ ] **Step 5: Commit** `feat(router): treat a voice note's transcript as file-derived text that taints the conversation`.
+- [x] **Step 2: Run** `cargo test -p zephyr --test voice` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run** → PASS; `cargo test -p zephyr`.
+- [x] **Step 5: Commit** `feat(router): treat a voice note's transcript as file-derived text that taints the conversation`.
+- Deviation: `reload.rs` needs no change: a `[voice]` edit is `Plan::Live`, and `inbox::append` reads the live config. One more test, `the_owner_sets_voice_settings_and_the_agent_only_proposes`, takes `/set voice.*` through the router and the file.
+- Deviation: the two "approves nothing" tests pass before the change (the row never starts with what was said, by C2-3's line format); they are kept as guards. Only the taint test failed first.
 
 ### Task C2-5: Voice out, and the `voice` lines of doctor and status
 

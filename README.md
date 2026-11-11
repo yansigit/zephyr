@@ -669,6 +669,12 @@ reads it as two lines under your caption, if you typed one:
   approves nothing, so approvals stay typed.
 - A note longer than `voice.max_secs` (300) is saved but not transcribed. One note is
   transcribed at a time; a minute of speech takes about 11 s on CPU.
+- A conversation that took in a voice note is no longer yours alone: with `memory.auto owner`,
+  its memory changes wait for `/memory ok` until `/new`.
+- Settings (`[voice]` in `zephyr.toml`, or `/set`): `voice.transcribe` (`true`),
+  `voice.languages` (`ko, en`; whisper's codes, and a note heard as another language is
+  transcribed again as the first), `voice.max_secs` (10 to 900). The agent can only propose a
+  change to them.
 - An image built with `--build-arg VOICE=0` has no voice: notes are saved as files only.
 
 ## Signal

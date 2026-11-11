@@ -2284,6 +2284,10 @@ impl<'a> Router<'a> {
             // result, anything zephyr wrote) is in the conversation from now on (DESIGN §4.6).
             if !row.owner || !self.cfg.is_owner(&row.channel, &row.sender) {
                 self.taint_session(&daemon_row(&row.platform_id));
+            } else if row.derived.is_some() {
+                // The platform vouches for the account that sent the audio, not for the voice
+                // in it, and whisper makes text up on noise: a transcript is file-derived.
+                self.taint_session("took in a voice note's transcript");
             }
             // Durable before the child sees it, so recovery knows to look for it, and how.
             self.store.mark_dispatched_as(row.id, sent_as)?;
