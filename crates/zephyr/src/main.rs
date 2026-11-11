@@ -77,7 +77,10 @@ async fn zephyr_main() -> ExitCode {
     // A command's output on its way to its log (DESIGN §4.13): the vault's path is its argument.
     if cmd == "__scrublog" {
         return match args.next() {
-            Some(vault) => zephyr::vault::scrub_log(Path::new(&vault)),
+            Some(vault) => {
+                let cards = args.next().as_deref() == Some("cards");
+                zephyr::vault::scrub_log(Path::new(&vault), cards)
+            }
             None => ExitCode::from(2),
         };
     }

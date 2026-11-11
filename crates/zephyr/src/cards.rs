@@ -496,6 +496,45 @@ pub mod live {
         LIVE.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The kept numbers as the log scrubbers read them (`vault::scrub_stream`): a memfd, so
+    /// still memory, close-on-exec, so no command of the agent's inherits it. `procs::spawn`
+    /// hands it to the scrubber alone.
+    static SHARED: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+    /// The descriptor of the shared list, made on first use. `None` when it cannot be made:
+    /// then a log is scrubbed of the vault's values only, as before.
+    pub fn shared() -> Option<std::os::fd::RawFd> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let mut shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+        if shared.is_none() {
+            // Safety: a C string literal and a plain flag; the result is checked.
+            let fd = unsafe { libc::memfd_create(c"zephyr-cards".as_ptr(), libc::MFD_CLOEXEC) };
+            if fd < 0 {
+                return None;
+            }
+            // Safety: `fd` is ours and open.
+            *shared = Some(unsafe { std::fs::File::from_raw_fd(fd) });
+            drop(shared);
+            publish(&lock());
+            shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+        }
+        shared.as_ref().map(|f| f.as_raw_fd())
+    }
+
+    /// Rewrites the shared list after a change: one `card<TAB>number` line per kept number.
+    fn publish(all: &[Held]) {
+        use std::os::unix::fs::FileExt;
+        let shared = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(file) = shared.as_ref() else { return };
+        let text: String = (all.iter())
+            .map(|h| format!("{}\t{}\n", h.card, h.pan.number))
+            .collect();
+        // Shorter first, so a reader never takes an old tail for a number.
+        let _ = file
+            .set_len(0)
+            .and_then(|()| file.write_all_at(text.as_bytes(), 0));
+    }
+
     /// Keeps card `card`'s number, replacing one kept before.
     pub fn put(state: &std::path::Path, card: i64, pan: Pan) {
         let mut all = lock();
@@ -506,6 +545,7 @@ pub mod live {
             pan,
             drop_at: None,
         });
+        publish(&all);
     }
 
     /// The number of a card still in use.
@@ -526,7 +566,12 @@ pub mod live {
 
     /// Drops the numbers whose hour is over.
     pub fn sweep(now: i64) {
-        lock().retain(|h| h.drop_at.is_none_or(|at| at > now));
+        let mut all = lock();
+        let before = all.len();
+        all.retain(|h| h.drop_at.is_none_or(|at| at > now));
+        if all.len() != before {
+            publish(&all);
+        }
     }
 
     /// Every number kept, with its card: what [`super::scrub`] hides.
@@ -539,9 +584,8 @@ pub mod live {
 /// base64: `facts::scrub`'s matching), and its code where it stands as a number of its own,
 /// replaced by `[card:#N]`. Called from `vault::scrub`, so every answer, audit row, card and
 /// notice the daemon scrubs is covered.
-/// shortcut: a command's log file is scrubbed by another process that has no numbers
-/// (`vault::scrub_stream`); what the agent is shown of it is scrubbed here. Hand that process
-/// the numbers if a read-back in a log on disk ever matters.
+/// A command's log is scrubbed by another process, which reads the numbers from
+/// `live::shared` (`stream_pairs`).
 pub fn scrub(text: &str) -> String {
     let all = live::all();
     if all.is_empty() {
@@ -562,6 +606,36 @@ pub fn scrub(text: &str) -> String {
         out = scrub_code(&out, &pan.cvc, &format!("[card:#{card}]"));
     }
     out
+}
+
+/// What a log scrubber replaces, from the shared list's text (`live::shared`): each number as
+/// plain digits, in groups of four with spaces or dashes, and its base64 forms, to its card's
+/// label.
+/// shortcut: a stream cannot tell a three-digit code from part of a longer number, so the
+/// code alone is left in a log; the answer the agent gets has it scrubbed (`scrub`).
+pub fn stream_pairs(shared: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut pairs = Vec::new();
+    for line in shared.lines() {
+        let Some((card, number)) = line.split_once('\t') else {
+            continue;
+        };
+        let digits = number.bytes().all(|b| b.is_ascii_digit());
+        if !digits || number.len() < 12 || card.parse::<i64>().is_err() {
+            continue;
+        }
+        let label = format!("[card:#{card}]").into_bytes();
+        let grouped = |sep: &str| -> String {
+            let groups: Vec<&str> = (0..number.len())
+                .step_by(4)
+                .map(|i| &number[i..(i + 4).min(number.len())])
+                .collect();
+            groups.join(sep)
+        };
+        let mut forms = vec![number.to_string(), grouped(" "), grouped("-")];
+        forms.extend(crate::vault::base64_forms(number));
+        pairs.extend(forms.into_iter().map(|f| (f.into_bytes(), label.clone())));
+    }
+    pairs
 }
 
 /// `code` replaced where no digit stands beside it: a three-digit code inside a longer number
@@ -1323,7 +1397,12 @@ pub async fn tick(cfg: &Config, now: i64) {
             // Forgotten at once; the issuer is asked to close it at its own pace.
             live::forget(cfg.state_dir(), card.id, now);
             if poll_due(cfg, card.id) {
-                close(cfg, &db, &card, "expired unused", now).await;
+                // Only an issuer that reports charges can say it went unused.
+                let why = match caps(cfg).is_some_and(|c| c.charges) {
+                    true => "expired unused",
+                    false => "it is past its time",
+                };
+                close(cfg, &db, &card, why, now).await;
             }
             continue;
         }
@@ -1570,6 +1649,37 @@ mod tests {
         assert_eq!(scrub("6011111111111117"), "[card:#3]", "still scrubbed");
         live::sweep(1000 + KEEP_SECS);
         assert_eq!(scrub("6011111111111117"), "6011111111111117");
+    }
+
+    #[test]
+    fn the_shared_list_gives_a_log_scrubber_each_numbers_forms() {
+        let pairs = stream_pairs("7\t5555555555554444\nbroken\nx\t4242424242424242\n3\t12\n");
+        let froms: Vec<String> = (pairs.iter())
+            .map(|(from, _)| String::from_utf8(from.clone()).unwrap())
+            .collect();
+        assert_eq!(
+            froms[..3],
+            [
+                "5555555555554444",
+                "5555 5555 5555 4444",
+                "5555-5555-5555-4444"
+            ]
+        );
+        assert!(froms.len() > 3, "and its base64 forms");
+        assert!(pairs.iter().all(|(_, to)| to == b"[card:#7]"));
+        // The daemon's own list is a descriptor no child inherits by itself.
+        let state = crate::test_dir("cards-shared");
+        live::put(&state, 9, pan("6011 0009 9013 9424", "111"));
+        let fd = live::shared().expect("a memfd");
+        // Safety: reading the descriptor's flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags & libc::FD_CLOEXEC != 0, "close-on-exec");
+        let text = std::fs::read_to_string(format!("/proc/self/fd/{fd}")).unwrap();
+        assert!(text.contains("9\t6011000990139424\n"), "{text}");
+        live::forget(&state, 9, -KEEP_SECS);
+        live::sweep(1);
+        let text = std::fs::read_to_string(format!("/proc/self/fd/{fd}")).unwrap();
+        assert!(!text.contains("6011000990139424"), "{text}");
     }
 
     #[test]

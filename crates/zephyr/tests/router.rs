@@ -8135,7 +8135,7 @@ async fn a_manual_card_is_approved_entered_filled_on_its_origin_and_forgotten() 
     db.execute("UPDATE cards SET expires_at = 1", []).unwrap();
     let forgot = reply_where(&gw, "chat", |r| r.contains("zephyr forgot its number")).await;
     assert!(
-        forgot.starts_with("[zephyr] card #1 (…4242): expired unused, and zephyr forgot its number. No charge data: check your card app"),
+        forgot.starts_with("[zephyr] card #1 (…4242): it is past its time, and zephyr forgot its number. No charge data: check your card app"),
         "{forgot}"
     );
     assert_eq!(card_status(&home, 1), "unknown");

@@ -878,9 +878,22 @@ fn forms(secrets: &[(String, String)]) -> Vec<(&str, String)> {
 /// the log the agent can read holds none. A value cut across two reads is still found; after a
 /// quarter of a second with nothing more, what was held back as the possible start of one goes
 /// out as it is. The vault is read again when its file changes, and while it cannot be read the
-/// output is withheld, as `scrubbed` withholds it.
-fn scrub_stream(vault: &Path, mut input: std::fs::File, mut log: impl std::io::Write) {
+/// output is withheld, as `scrubbed` withholds it. `cards` is the daemon's list of the card
+/// numbers in use (`cards::live::shared`), read again at each chunk: they become `[card:#N]`.
+fn scrub_stream(
+    vault: &Path,
+    cards: Option<std::fs::File>,
+    mut input: std::fs::File,
+    mut log: impl std::io::Write,
+) {
     use std::io::Read;
+    use std::os::unix::fs::FileExt;
+    // The whole list, small: a few numbers at most.
+    let cards_now = || -> String {
+        let mut text = vec![0u8; 4096];
+        let n = cards.as_ref().and_then(|f| f.read_at(&mut text, 0).ok());
+        String::from_utf8_lossy(&text[..n.unwrap_or(0)]).into_owned()
+    };
     use std::os::fd::AsRawFd;
     const PAUSE_MS: i32 = 250;
     let stamp = || {
@@ -914,14 +927,17 @@ fn scrub_stream(vault: &Path, mut input: std::fs::File, mut log: impl std::io::W
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
-        let now = Some(stamp());
+        let now = Some((stamp(), cards_now()));
         if now != seen {
             put(replacer.as_mut().map(|r| r.finish()).unwrap_or_default());
+            let numbers = now.as_ref().map_or("", |(_, cards)| cards.as_str());
             replacer = Vault::load(vault).ok().map(|v| {
                 let pair = |(name, form): (&str, String)| {
                     (form.into_bytes(), format!("[vault:{name}]").into_bytes())
                 };
-                crate::broker::Replacer::new(forms(&v.secrets()).into_iter().map(pair).collect())
+                let mut pairs: Vec<_> = forms(&v.secrets()).into_iter().map(pair).collect();
+                pairs.extend(crate::cards::stream_pairs(numbers));
+                crate::broker::Replacer::new(pairs)
             });
             seen = now;
         }
@@ -940,16 +956,22 @@ fn scrub_stream(vault: &Path, mut input: std::fs::File, mut log: impl std::io::W
     put(replacer.as_mut().map(|r| r.finish()).unwrap_or_default());
 }
 
-/// `zephyr __scrublog VAULT`: `scrub_stream` from stdin to stdout. The daemon starts it, as
-/// itself, between a command and its log (`procs::spawn`); it ends when the command, and all
-/// it left running, have closed their output.
-pub fn scrub_log(vault: &Path) -> std::process::ExitCode {
+/// The descriptor a scrubber finds the daemon's card numbers on, when it is given `cards`.
+pub const CARDS_FD: i32 = 3;
+
+/// `zephyr __scrublog VAULT [cards]`: `scrub_stream` from stdin to stdout. The daemon starts
+/// it, as itself, between a command and its log (`procs::spawn`); it ends when the command,
+/// and all it left running, have closed their output. With `cards`, descriptor 3 is the
+/// daemon's list of card numbers.
+pub fn scrub_log(vault: &Path, cards: bool) -> std::process::ExitCode {
     use std::os::fd::FromRawFd;
     // It holds the vault's values, as the daemon does.
     crate::agent::undumpable();
     // SAFETY: this process's own stdin and stdout, used by nothing else here.
     let (input, log) = unsafe { (std::fs::File::from_raw_fd(0), std::fs::File::from_raw_fd(1)) };
-    scrub_stream(vault, input, log);
+    // SAFETY: the daemon put the list there for this process alone (`procs::spawn`).
+    let cards = cards.then(|| unsafe { std::fs::File::from_raw_fd(CARDS_FD) });
+    scrub_stream(vault, cards, input, log);
     std::process::ExitCode::SUCCESS
 }
 
@@ -2086,7 +2108,8 @@ programs = ["gh"]
             let out = std::fs::File::create(&log).unwrap();
             let vault = vault.clone();
             let input = std::fs::File::from(std::os::fd::OwnedFd::from(rx));
-            let filter = std::thread::spawn(move || scrub_stream(&vault, input, out));
+            let cards = std::fs::File::open(dir.join("cards")).ok();
+            let filter = std::thread::spawn(move || scrub_stream(&vault, cards, input, out));
             for part in writes {
                 tx.write_all(part).unwrap();
                 std::thread::sleep(pause);
@@ -2114,6 +2137,19 @@ programs = ["gh"]
         // A prompt that ends like the start of a value is not held for ever.
         let clean = run(&[b"so real-", b"ly\n"], Duration::from_millis(600));
         assert_eq!(clean, "so real-ly\n");
+        // A card number in use, which no file of the vault's holds: read from the daemon's
+        // list, again at each chunk, so a card issued while the command runs is covered.
+        let clean = run(&[b"n=5555555555554444\n"], Duration::ZERO);
+        assert_eq!(clean, "n=5555555555554444\n", "no list, nothing to find");
+        std::fs::write(dir.join("cards"), "7\t5555555555554444\n").unwrap();
+        let clean = run(
+            &[
+                b"n=55555555",
+                b"55554444 or 5555 5555 5555 4444\nkey=real-bound-1\n",
+            ],
+            Duration::ZERO,
+        );
+        assert_eq!(clean, "n=[card:#7] or [card:#7]\nkey=[vault:BOUND]\n");
         // A vault that cannot be read: nothing of the output is written.
         std::fs::write(&vault, "[[token]\nbroken").unwrap();
         let clean = run(&[b"key=real-bound-1\n", b"more\n"], Duration::ZERO);
