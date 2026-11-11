@@ -20,7 +20,10 @@ there; `--from-image` or `--from-source` picks one, `--no-init` stops before the
 arguments after `--` go to `zephyr init`. It checks Docker answers as you and warns when Docker's
 disk has under 20 GB free. It installs no Docker or Rust (it names their install pages), never
 runs `sudo`, `curl` or `wget`, and writes nothing but the one binary. On a machine that already
-has zephyr (the container, or `~/.zephyr-daemon`), it refuses: `zephyr upgrade` is the way there.
+has zephyr (the container, `~/.zephyr-daemon`, `~/.zephyr` or a `~/.local/bin/zephyr`), it refuses:
+`zephyr upgrade` is the way there. With `ZEPHYR_REPO` set, a CLI built from source upgrades from that
+repository; one copied from the image upgrades from the repository the image was built for, so
+keep `ZEPHYR_REPO` set (install.sh says so) unless that image was built with `ZEPHYR_BUILD_REPO`.
 
 Or by hand, either of:
 

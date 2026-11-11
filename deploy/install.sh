@@ -19,6 +19,8 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+# Arguments for `zephyr init` with no init to give them to would be dropped.
+[ -n "$init" ] || [ $# -eq 0 ] || usage
 
 repo=${ZEPHYR_REPO:-ghcr.io/yansigit/zephyr}
 container=${ZEPHYR_CONTAINER:-zephyr}
@@ -30,8 +32,10 @@ step "checking this machine"
 [ "$(id -u)" -ne 0 ] || die "run this as your own user, not root: the CLI and zephyr's files live in your home"
 docker version >/dev/null 2>&1 || die "docker does not answer for $(id -un). Install Docker (https://docs.docker.com/engine/install/)
   and let this user run it, as your own user, no sudo: https://docs.docker.com/engine/install/linux-postinstall/"
-# A new CLI followed by init would upgrade a live container, so an existing install is left alone.
-if docker inspect --type container "$container" >/dev/null 2>&1 || [ -e "$HOME/.zephyr-daemon" ]; then
+# A new CLI followed by init would upgrade a live container, so an existing install is left alone:
+# the container, either data dir (also after `zephyr down`), or a CLI this would replace.
+if docker inspect --type container "$container" >/dev/null 2>&1 ||
+  [ -e "$HOME/.zephyr-daemon" ] || [ -e "$HOME/.zephyr" ] || [ -e "$bin/zephyr" ] || [ -L "$bin/zephyr" ]; then
   die "zephyr is installed here; upgrade with zephyr upgrade"
 fi
 if root=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null) &&
@@ -70,22 +74,41 @@ pull() {
   return 1
 }
 
-# The image's own CLI, through a temp file beside the target so the `mv` is atomic.
+# The image's own CLI, through a temp file beside the target so the `mv` is atomic. It must say
+# what the image's `zephyr --version` says, as `zephyr upgrade` checks the CLI it fetches.
 from_image() {
+  local want got
+  want=$(docker run --rm --entrypoint zephyr "$repo:latest" --version | head -n 1) ||
+    die "could not run zephyr --version in $repo:latest"
   mkdir -p "$bin"
   tmp=$(mktemp "$bin/.zephyr-install.XXXXXX")
   trap 'rm -f "$tmp"' EXIT
   docker run --rm --entrypoint cat "$repo:latest" /usr/local/bin/zephyr >"$tmp" ||
     die "could not copy the CLI out of $repo:latest"
   chmod 755 "$tmp"
-  "$tmp" --version >/dev/null || die "the CLI from $repo:latest does not run on this machine"
-  mv "$tmp" "$bin/zephyr"
+  got=$("$tmp" --version | head -n 1) || die "the CLI from $repo:latest does not run on this machine"
+  if [ -z "$want" ] || [ "$got" != "$want" ]; then
+    die "the CLI copied out of $repo:latest says '$got', not '$want' as the image does"
+  fi
+  # -n: never over a CLI that appeared since the check above.
+  mv -n "$tmp" "$bin/zephyr" || true
+  [ ! -e "$tmp" ] || die "$bin/zephyr appeared meanwhile; not replacing it"
   installed=$bin/zephyr
+  # That CLI upgrades from the repository its image was built for (ZEPHYR_BUILD_REPO), else the
+  # default: another repository has to stay named for `zephyr upgrade`.
+  [ -z "${ZEPHYR_REPO:-}" ] ||
+    echo "note: the CLI came from $repo; unless that image was built with ZEPHYR_BUILD_REPO=$repo," \
+      "keep ZEPHYR_REPO=$repo set (in your shell's rc file) for zephyr upgrade" >&2
 }
 
 from_source() {
   step "building the CLI"
-  (cd "$(dirname "$0")/.." && cargo install --locked --path crates/zephyr)
+  # Built to upgrade from the repository it was installed for, when that is not the default.
+  if [ -n "${ZEPHYR_REPO:-}" ]; then
+    (cd "$(dirname "$0")/.." && ZEPHYR_BUILD_REPO=$repo cargo install --locked --path crates/zephyr)
+  else
+    (cd "$(dirname "$0")/.." && cargo install --locked --path crates/zephyr)
+  fi
   installed=${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin/zephyr
 }
 

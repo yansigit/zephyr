@@ -115,6 +115,7 @@ const CARGO: &str = r#"#!/bin/bash
 case "$1" in
   --version) echo "cargo 1.95.0 (abc 2026-01-01)" ;;
   install) mkdir -p "$HOME/.cargo/bin"
+    echo "ZEPHYR_BUILD_REPO=${ZEPHYR_BUILD_REPO-unset}" >> "$SHIM_DIR/cargo-env.log"
     printf '#!/bin/bash\necho "$@" >> "%s/exec.log"\n' "$SHIM_DIR" > "$HOME/.cargo/bin/zephyr"
     chmod 755 "$HOME/.cargo/bin/zephyr" ;;
 esac
@@ -3710,10 +3711,23 @@ fn local_bin(env: &Env) -> Vec<String> {
 /// goes on where zephyr already is, even when only its files are left after `zephyr down`.
 #[test]
 fn install_refuses_an_existing_install() {
-    let env = Env::new("install-refuses");
-    for vars in [&[][..], &[("SHIM_NO_CONTAINER", "1")]] {
-        if !vars.is_empty() {
-            std::fs::create_dir_all(env.daemon()).unwrap();
+    let none = [("SHIM_NO_CONTAINER", "1")];
+    // The container; then each thing an install leaves, alone.
+    for (name, left) in [
+        ("container", ""),
+        ("daemon", ".zephyr-daemon"),
+        ("home", ".zephyr"),
+        ("cli", ".local/bin/zephyr"),
+    ] {
+        let env = Env::new(&format!("install-refuses-{name}"));
+        let vars: &[(&str, &str)] = if left.is_empty() { &[] } else { &none };
+        match left {
+            "" => {}
+            ".local/bin/zephyr" => {
+                std::fs::create_dir_all(env.home.join(".local/bin")).unwrap();
+                std::fs::write(env.home.join(left), "mine").unwrap();
+            }
+            _ => std::fs::create_dir_all(env.home.join(left)).unwrap(),
         }
         let out = env.install(&[], vars);
         assert_eq!(out.status.code(), Some(1), "{out:?}");
@@ -3728,14 +3742,18 @@ fn install_refuses_an_existing_install() {
         });
         assert!(wrote.is_none(), "{wrote:?}");
         fetches_nothing(&calls);
-        assert!(local_bin(&env).is_empty(), "{:?}", local_bin(&env));
+        match left {
+            ".local/bin/zephyr" => assert_eq!(read(&env.home.join(left)), "mine"),
+            _ => assert!(local_bin(&env).is_empty(), "{:?}", local_bin(&env)),
+        }
     }
 }
 
 #[test]
 fn install_from_the_image_writes_the_cli_and_runs_init() {
     let image = "ghcr.io/yansigit/zephyr:latest";
-    let none = [("SHIM_NO_CONTAINER", "1")];
+    // The image's `zephyr --version`, which the copied CLI (the shim's: `zephyr <tag>`) must say.
+    let none = [("SHIM_NO_CONTAINER", "1"), ("SHIM_LATEST", "latest")];
     let env = Env::new("install-image");
     let out = env.install(&["--from-image", "--", "--non-interactive"], &none);
     assert!(out.status.success(), "{out:?}");
@@ -3800,6 +3818,76 @@ fn install_logs_in_only_at_ghcr_when_the_pull_fails() {
     assert!(login.is_none(), "{login:?}");
     fetches_nothing(&calls);
     assert!(local_bin(&env).is_empty(), "{:?}", local_bin(&env));
+}
+
+/// The CLI copied out must be the image's own: the same `zephyr --version` (as `fetch_cli` checks).
+#[test]
+fn install_refuses_a_copied_cli_that_is_not_the_images() {
+    let env = Env::new("install-version");
+    let vars = [("SHIM_NO_CONTAINER", "1"), ("SHIM_LATEST", "9.9.9")];
+    let out = env.install(&["--from-image", "--no-init"], &vars);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("zephyr 9.9.9"), "{said}");
+    find(
+        &env.calls(),
+        &["docker", "run", "--rm", "--entrypoint", "zephyr"],
+    );
+    assert!(local_bin(&env).is_empty(), "{:?}", local_bin(&env));
+}
+
+/// Arguments for `zephyr init` with `--no-init` would be dropped: a usage error instead.
+#[test]
+fn install_refuses_init_arguments_with_no_init() {
+    let env = Env::new("install-no-init-args");
+    let args = ["--no-init", "--", "--non-interactive"];
+    let out = env.install(&args, &[("SHIM_NO_CONTAINER", "1")]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("usage:"));
+    let calls = env.calls();
+    let went = calls
+        .iter()
+        .find(|c| c[0] == "cargo" || c.starts_with(&s(&["docker", "pull"])));
+    assert!(went.is_none(), "{went:?}");
+}
+
+/// Installed from another repository: from source the CLI is built to upgrade from it; from the
+/// image, whose CLI upgrades from where that image was built for, install.sh says to keep
+/// ZEPHYR_REPO set.
+#[test]
+fn install_from_another_repo_says_how_upgrade_finds_it() {
+    let repo = "registry.example.com/me/zephyr";
+    let env = Env::new("install-repo-source");
+    let vars = [("SHIM_NO_CONTAINER", "1"), ("ZEPHYR_REPO", repo)];
+    let out = env.install(&["--from-source", "--no-init"], &vars);
+    assert!(out.status.success(), "{out:?}");
+    let baked = read(&env.dir.join("cargo-env.log"));
+    assert_eq!(baked, format!("ZEPHYR_BUILD_REPO={repo}\n"));
+
+    let env = Env::new("install-repo-image");
+    let vars = [
+        ("SHIM_NO_CONTAINER", "1"),
+        ("SHIM_LATEST", "latest"),
+        ("ZEPHYR_REPO", repo),
+    ];
+    let out = env.install(&["--from-image", "--no-init"], &vars);
+    assert!(out.status.success(), "{out:?}");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains(&format!("keep ZEPHYR_REPO={repo} set")),
+        "{said}"
+    );
+
+    // The default repository needs neither.
+    let env = Env::new("install-repo-default");
+    let out = env.install(
+        &["--from-source", "--no-init"],
+        &[("SHIM_NO_CONTAINER", "1")],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let baked = read(&env.dir.join("cargo-env.log"));
+    assert_eq!(baked, "ZEPHYR_BUILD_REPO=unset\n");
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("keep ZEPHYR_REPO"));
 }
 
 #[test]
