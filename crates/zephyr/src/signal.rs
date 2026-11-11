@@ -252,8 +252,11 @@ pub struct Signal {
     names: Mutex<HashMap<String, String>>,
     /// The chunks of each reply signal-cli sent: Signal has no nonce to drop a duplicate.
     delivered: Arc<crate::channel::Delivered>,
-    /// ACIs whose changed safety number the owner was told of in this daemon run.
+    /// ACIs whose changed safety number the owners were told of in this daemon run, or are
+    /// being told of now: claimed before the write, so two failed sends tell once.
     told: Mutex<HashSet<String>>,
+    /// For an ACI whose notice reached only some owners: who, so a retry tells only the rest.
+    reached: Mutex<HashMap<String, HashSet<(String, String)>>>,
     /// The typing refresher per recipient.
     typing: Mutex<HashMap<String, tokio::task::AbortHandle>>,
 }
@@ -275,6 +278,7 @@ impl Signal {
             names: Mutex::default(),
             delivered: Arc::default(),
             told: Mutex::default(),
+            reached: Mutex::default(),
             typing: Mutex::default(),
         })
     }
@@ -439,29 +443,56 @@ impl Signal {
     /// It counts as told only once the notice is stored, so a failed write is tried again at the
     /// next failed send; the write is a blocking task's, off the send.
     async fn changed_identity(&self, aci: &str) {
-        if self.told.lock().unwrap().contains(aci) {
+        // Claimed before the write: a second failed send meanwhile tells nobody again.
+        if !self.told.lock().unwrap().insert(aci.to_string()) {
             return;
         }
         let Some(cfg) = self.live.get().map(|rx| rx.borrow().clone()) else {
+            self.told.lock().unwrap().remove(aci);
             return;
         };
         let text = format!(
             "[zephyr] the Signal safety number of {aci} changed; compare it, then run zephyr channel signal trust {aci}"
         );
+        let mut reached = (self.reached.lock().unwrap().get(aci).cloned()).unwrap_or_default();
         let who = aci.to_string();
         let told = tokio::task::spawn_blocking(move || {
             let store = crate::store::Store::open(&cfg.db_path())?;
-            crate::router::notify_owners(&cfg, &store, &text, Some(("signal", &who)))
+            let mut all = true;
+            for target in crate::router::owner_targets(&cfg, Some(("signal", &who))) {
+                if reached.contains(&target) {
+                    continue;
+                }
+                match store.notify(&target.0, &target.1, &text) {
+                    Ok(()) => drop(reached.insert(target)),
+                    Err(e) => {
+                        eprintln!("zephyr: signal: telling {} on {}: {e}", target.1, target.0);
+                        all = false;
+                    }
+                }
+            }
+            anyhow::Ok((reached, all))
         })
         .await;
         match told {
-            Ok(Ok(())) => {
-                self.told.lock().unwrap().insert(aci.to_string());
+            // Every owner told: the claim stays, for this daemon run.
+            Ok(Ok((_, true))) => drop(self.reached.lock().unwrap().remove(aci)),
+            // Some: they are recorded, and the next failed send tells only the rest.
+            Ok(Ok((reached, false))) => {
+                self.reached
+                    .lock()
+                    .unwrap()
+                    .insert(aci.to_string(), reached);
+                self.told.lock().unwrap().remove(aci);
             }
             Ok(Err(e)) => {
-                eprintln!("zephyr: signal: telling the owner of {aci}'s safety number: {e:#}")
+                eprintln!("zephyr: signal: telling the owner of {aci}'s safety number: {e:#}");
+                self.told.lock().unwrap().remove(aci);
             }
-            Err(e) => eprintln!("zephyr: signal: telling the owner of {aci}'s safety number: {e}"),
+            Err(e) => {
+                eprintln!("zephyr: signal: telling the owner of {aci}'s safety number: {e}");
+                self.told.lock().unwrap().remove(aci);
+            }
         }
     }
 }
@@ -864,6 +895,51 @@ mod tests {
             0o700,
             "made private, the agent cannot plant files there"
         );
+    }
+
+    /// A Signal adapter on `home` whose owners are `owners` on chat, its live config handed over.
+    fn told_adapter(home: &Path, owners: &str) -> (Signal, crate::config::Config) {
+        let cfg: crate::config::Config = toml::from_str(&format!(
+            "rpi = '/r'\nhome = {home:?}\n[signal]\naccount = '{ACCOUNT}'\n[owners]\nchat = {owners}\n"
+        ))
+        .unwrap();
+        let signal = Signal::new(&cfg).unwrap();
+        signal.live(tokio::sync::watch::channel(Arc::new(cfg.clone())).1);
+        (signal, cfg)
+    }
+
+    #[tokio::test]
+    async fn two_failed_sends_at_once_tell_the_owner_once() {
+        let home = crate::test_dir("signal-told-race");
+        let (signal, cfg) = told_adapter(&home, "['owner']");
+        tokio::join!(
+            signal.changed_identity(OWNER),
+            signal.changed_identity(OWNER)
+        );
+        let store = crate::store::Store::open(&cfg.db_path()).unwrap();
+        assert_eq!(store.pending_outbox().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn after_a_partial_failure_only_the_owners_not_told_are_told() {
+        let home = crate::test_dir("signal-told-partial");
+        let (signal, cfg) = told_adapter(&home, "['owner', 'o2']");
+        let store = crate::store::Store::open(&cfg.db_path()).unwrap();
+        let db = rusqlite::Connection::open(cfg.db_path()).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER no_o2 BEFORE INSERT ON outbox WHEN NEW.recipient = 'o2'
+             BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        )
+        .unwrap();
+        signal.changed_identity(OWNER).await;
+        db.execute_batch("DROP TRIGGER no_o2;").unwrap();
+        signal.changed_identity(OWNER).await;
+        signal.changed_identity(OWNER).await;
+        let mut to: Vec<String> = (store.pending_outbox().unwrap().into_iter())
+            .map(|r| r.recipient)
+            .collect();
+        to.sort();
+        assert_eq!(to, ["o2", "owner"], "each owner once");
     }
 
     #[tokio::test]

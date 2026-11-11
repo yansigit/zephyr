@@ -5405,6 +5405,18 @@ pub fn notify_owners(
     text: &str,
     except: Option<(&str, &str)>,
 ) -> rusqlite::Result<()> {
+    let mut failed = Ok(());
+    for (channel, id) in owner_targets(cfg, except) {
+        let told = store.notify(&channel, &id, text);
+        if failed.is_ok() {
+            failed = told;
+        }
+    }
+    failed
+}
+
+/// Who `notify_owners` writes to: `(channel, owner id)`, `except` left out.
+pub fn owner_targets(cfg: &Config, except: Option<(&str, &str)>) -> Vec<(String, String)> {
     let on = [
         ("chat", true),
         ("discord", cfg.discord.is_some()),
@@ -5412,18 +5424,15 @@ pub fn notify_owners(
         ("telegram", cfg.telegram.is_some()),
         ("signal", cfg.signal.is_some()),
     ];
-    let mut failed = Ok(());
+    let mut all = Vec::new();
     for (channel, _) in on.into_iter().filter(|(_, set)| *set) {
         for id in cfg.owners.get(channel).into_iter().flatten() {
             if except != Some((channel, id.as_str())) {
-                let told = store.notify(channel, id, text);
-                if failed.is_ok() {
-                    failed = told;
-                }
+                all.push((channel.to_string(), id.clone()));
             }
         }
     }
-    failed
+    all
 }
 
 fn log(r: anyhow::Result<()>) {
