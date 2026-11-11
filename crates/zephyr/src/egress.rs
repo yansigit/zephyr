@@ -1667,8 +1667,8 @@ fn broker_reach(state: &Path, trust: &[&str]) -> Vec<(String, Check)> {
     checks
 }
 
-/// Fails when a file can be made in `dir`, or one of its files (a level down too) opened to
-/// write, or `dir` is not there.
+/// Fails when a file can be made anywhere in the tree under `dir`, or any file in it opened to
+/// write, or `dir` is not there. Links are not followed.
 fn unwritable(dir: &Path) -> Check {
     if !dir.is_dir() {
         return Check::Fail("it is not there".into());
@@ -1680,15 +1680,39 @@ fn unwritable(dir: &Path) -> Check {
         made
     };
     let opens = |p: &Path| std::fs::OpenOptions::new().append(true).open(p).is_ok();
-    let list = |d: &Path| std::fs::read_dir(d).into_iter().flatten().flatten();
-    let below = list(dir).any(|e| match e.path().is_dir() {
-        true => makes(&e.path()) || list(&e.path()).any(|f| opens(&f.path())),
-        false => opens(&e.path()),
-    });
-    match makes(dir) || below {
-        false => Check::Ok,
-        true => Check::Fail("a file could be written there".into()),
+    let mut folders = vec![dir.to_path_buf()];
+    while let Some(d) = folders.pop() {
+        if makes(&d) {
+            return Check::Fail(format!("a file could be made in {}", d.display()));
+        }
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let path = e.path();
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.is_dir() => folders.push(path),
+                Ok(m) if m.is_file() && opens(&path) => {
+                    return Check::Fail(format!("{} could be written", path.display()))
+                }
+                _ => {}
+            }
+        }
     }
+    Check::Ok
+}
+
+/// `zephyr __unwritable DIR..`, run as the agent by `doctor` whatever the network (DESIGN
+/// §4.22, §4.23): one `ok|fail` line per folder the agent must not change. Fails when any can be.
+pub fn unwritable_check(dirs: &[String]) -> std::process::ExitCode {
+    let mut code = std::process::ExitCode::SUCCESS;
+    for dir in dirs {
+        match unwritable(Path::new(dir)) {
+            Check::Ok => println!("ok the agent cannot write {dir}"),
+            Check::Warn(why) | Check::Fail(why) => {
+                println!("fail the agent cannot write {dir}: {why}");
+                code = std::process::ExitCode::FAILURE;
+            }
+        }
+    }
+    code
 }
 
 /// `zephyr __netcheck [OWN_IP:ATTACH_PORT]`: what the agent's uid can reach, one
@@ -1740,13 +1764,6 @@ pub fn netcheck(args: &[String]) -> std::process::ExitCode {
             public.as_str(),
         ];
         checks.extend(broker_reach(Path::new(state), &trust));
-    }
-    // The image's catalog and starter skills (DESIGN §4.22, §4.23): root's, never the agent's.
-    for dir in args.iter().skip(3) {
-        checks.push((
-            format!("the agent cannot write {dir}"),
-            unwritable(Path::new(dir)),
-        ));
     }
     let mut code = std::process::ExitCode::SUCCESS;
     for (what, check) in checks {
@@ -1919,6 +1936,22 @@ mod tests {
             matches!(unwritable(&dir), Check::Fail(_)),
             "a folder a level down"
         );
+        // The whole tree (review of #53, 6): a file or folder deeper down counts too.
+        std::fs::create_dir_all(dir.join("report/assets/fonts")).unwrap();
+        std::fs::write(dir.join("report/assets/fonts/a.ttf"), "x").unwrap();
+        mode(&dir.join("report/assets/fonts"), 0o555).unwrap();
+        mode(&dir.join("report/assets"), 0o555).unwrap();
+        mode(&dir.join("report"), 0o555).unwrap();
+        let deep = unwritable(&dir);
+        assert!(matches!(deep, Check::Fail(_)), "a file three levels down");
+        mode(&dir.join("report/assets/fonts/a.ttf"), 0o444).unwrap();
+        assert!(matches!(unwritable(&dir), Check::Ok));
+        mode(&dir.join("report/assets/fonts"), 0o755).unwrap();
+        let deep = unwritable(&dir);
+        assert!(matches!(deep, Check::Fail(_)), "a folder three levels down");
+        for d in ["report/assets/fonts", "report/assets", "report"] {
+            mode(&dir.join(d), 0o755).unwrap();
+        }
         mode(&dir, 0o755).unwrap();
         assert!(matches!(unwritable(&dir.join("gone")), Check::Fail(_)));
     }

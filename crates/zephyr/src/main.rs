@@ -70,6 +70,10 @@ async fn zephyr_main() -> ExitCode {
     if cmd == "__netcheck" {
         return zephyr::egress::netcheck(&args.collect::<Vec<_>>());
     }
+    // Run as the agent: what of the image's own folders its uid could change (DESIGN §4.22).
+    if cmd == "__unwritable" {
+        return zephyr::egress::unwritable_check(&args.collect::<Vec<_>>());
+    }
     // A command's output on its way to its log (DESIGN §4.13): the vault's path is its argument.
     if cmd == "__scrublog" {
         return match args.next() {
@@ -544,6 +548,7 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     // SAFETY: getuid has no arguments and cannot fail.
     let binaries_ok = unsafe { libc::getuid() } != 0 || roots_binaries(cfg);
     let floor_ok = network_floor(cfg).await;
+    let image_ok = image_folders();
     let broker_ok = token_broker(cfg);
 
     // A throwaway home so doctor never touches the live `main` session.
@@ -595,8 +600,14 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     }
 
     // Names and presence only: a secret's value is never printed.
-    let mut ok =
-        version_ok && split_ok && wrapper_ok && binaries_ok && floor_ok && broker_ok && commands_ok;
+    let mut ok = version_ok
+        && split_ok
+        && wrapper_ok
+        && binaries_ok
+        && floor_ok
+        && image_ok
+        && broker_ok
+        && commands_ok;
     // While the daemon is up, its gate socket is there: without it every send is refused
     // (approvals spec §4.9).
     if tokio::net::UnixStream::connect(cfg.socket_path())
@@ -814,6 +825,36 @@ fn token_broker(cfg: &Config) -> bool {
 /// The network floor (DESIGN §4.20), proved by probing as the agent (`zephyr __netcheck`), and
 /// that nothing of root's listens where the agent's uid is let through. Under host networking,
 /// one warning.
+/// The image's catalog and starter skills are root's (DESIGN §4.22, §4.23): proved by trying,
+/// as the agent, to write anywhere in them, under the floor or host networking alike. Only where
+/// the agent has a uid of its own (the container).
+fn image_folders() -> bool {
+    if zephyr::agent::ids().is_none() {
+        return true;
+    }
+    let mut probe = std::process::Command::new("/usr/local/bin/zephyr");
+    probe.args([
+        "__unwritable",
+        zephyr::catalog::DIR,
+        zephyr::drafts::STARTER,
+    ]);
+    match zephyr::agent::cmd(&mut probe).output() {
+        Ok(out) => {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                match line.split_once(' ') {
+                    Some(("ok", what)) => println!("ok   {what}"),
+                    _ => println!("FAIL {}", line.trim_start_matches("fail ")),
+                }
+            }
+            out.status.success()
+        }
+        Err(e) => check(
+            &format!("probing the image's folders as the agent: {e}"),
+            false,
+        ),
+    }
+}
+
 async fn network_floor(cfg: &Config) -> bool {
     if !zephyr::egress::bridge() {
         println!("warn network floor off (host networking): the agent can reach the host's loopback and private ranges");
@@ -829,8 +870,6 @@ async fn network_floor(cfg: &Config) -> bool {
     // And that the token broker's keys and trust are out of its reach (DESIGN §4.21).
     probe.arg(cfg.state_dir());
     probe.arg(zephyr::drafts::public_dir(cfg));
-    // And that the image's catalog and starter skills are root's (DESIGN §4.22, §4.23).
-    probe.args([zephyr::catalog::DIR, zephyr::drafts::STARTER]);
     // Each check has its own limit and they add up to 45 s; a probe stuck past that is a failure.
     let mut probe = tokio::process::Command::from({
         zephyr::agent::cmd(&mut probe);
