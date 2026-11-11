@@ -8145,6 +8145,17 @@ async fn a_manual_card_is_approved_entered_filled_on_its_origin_and_forgotten() 
     })
     .await;
     assert_eq!(fills(&home).len(), 3, "nothing more was typed");
+    // Until the owner says it is deleted, they are reminded once a day.
+    let reminders = || {
+        let all = gw.replies().into_iter();
+        all.filter(|r| r.contains("zephyr forgot its number"))
+            .count()
+    };
+    assert_eq!(reminders(), 1);
+    db.execute("UPDATE cards SET told_at = 1", []).unwrap();
+    wait(|| reminders() == 2).await;
+    ticks(&home, 3).await;
+    assert_eq!(reminders(), 2, "once a day, not once a tick");
     gw.say("c11", "owner", "/card done 1").await;
     reply_where(&gw, "chat", |r| r == "[zephyr] card #1 is closed").await;
     assert_eq!(card_status(&home, 1), "closed");
@@ -8436,5 +8447,40 @@ async fn stop_and_a_start_close_open_cards_and_a_failed_close_is_told_once() {
         "{told:?}"
     );
     assert!(fills(&home).is_empty());
+    gw.shutdown().await;
+}
+
+/// A charge the card should not have taken is told at once, and a charge with no acceptor id
+/// says so.
+#[tokio::test]
+async fn a_charge_over_the_cap_is_told_at_once() {
+    use zephyr::cards::{CardState, Charge, Fake};
+    let (home, cfg) = card_home("card-over", "fake", "auto 100");
+    let script = cfg.clone();
+    let gw = start(cfg);
+    gw.say("o1", "owner", &card_ask("10")).await;
+    wait(|| card_status(&home, 1) == "open").await;
+    Fake::script(&script, |s| {
+        s.state = CardState::Used(vec![Charge {
+            minor: 5000,
+            currency: "USD".into(),
+            ..Charge::default()
+        }])
+    });
+    let over = reply_where(&gw, "chat", |r| r.contains("took what you did not approve")).await;
+    assert_eq!(
+        over,
+        "[zephyr] card #1 took what you did not approve (up to 10.00 CAD, once): charged 50.00 \
+         USD; no merchant id from the issuer; the issuer should have declined it"
+    );
+    let charged = reply_where(&gw, "chat", |r| {
+        r.starts_with("[zephyr] card #1 was charged")
+    })
+    .await;
+    assert_eq!(
+        charged,
+        "[zephyr] card #1 was charged 50.00 USD; no merchant id from the issuer; the card is closed"
+    );
+    assert_eq!(card_status(&home, 1), "used");
     gw.shutdown().await;
 }
