@@ -869,10 +869,14 @@ pub(crate) mod tests {
             cfg.voice_dir.join("hang.pid"),
             cfg.voice_dir.join("setsid.pid"),
         );
-        for _ in 0..400 {
-            if hung.exists() && left.exists() {
-                break;
-            }
+        // Until both fakes are asleep, however long a loaded machine (and the voice's one turn,
+        // which other tests' notes may hold) takes: the run's own limit ends it if they never are.
+        let written = |p: &Path| std::fs::read_to_string(p).is_ok_and(|s| !s.is_empty());
+        while !(written(&hung) && written(&left)) {
+            assert!(
+                !run.is_finished(),
+                "the run ended before its fakes were asleep"
+            );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         run.abort();
