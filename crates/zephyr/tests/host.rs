@@ -1859,6 +1859,68 @@ fn config_set_while_stopped_edits_the_file_as_before() {
         .any(|c| c.contains(&"set".to_string()) && c.contains(&"zephyr".to_string())));
 }
 
+/// A connector's rows (`mcp.NAME.hosts`, `.secrets`, `.enabled`) live in its `[[mcp]]` table:
+/// with the container stopped the host edits that table, checked as the daemon would.
+#[test]
+fn config_set_while_stopped_reaches_a_connectors_table() {
+    let env = Env::new("config-stopped-mcp");
+    env.init(&["--no-start"]);
+    env.ok(&["mcp", "add", "mail", "--", "mail-server"]);
+    env.ok(&[
+        "mcp",
+        "add",
+        "docs",
+        "--url",
+        "https://docs.example.com/mcp",
+    ]);
+    let stopped = [("SHIM_STATE", "exited")];
+    let set = |key: &str, value: &str| env.zephyr_env(&["config", "set", key, value], &stopped);
+    for (key, value) in [
+        ("mcp.mail.hosts", "API.mail.test, mail.test:8443"),
+        ("mcp.mail.secrets", "plain"),
+        ("mcp.docs.secrets", "surrogate"),
+        ("mcp.docs.enabled", "off"),
+    ] {
+        let out = set(key, value);
+        assert!(out.status.success(), "{key}: {out:?}");
+        assert!(
+            stdout(&out).contains("applies when zephyr starts"),
+            "{out:?}"
+        );
+    }
+    let config = env.config();
+    let mail = config
+        .split("[[mcp]]")
+        .find(|t| t.contains("\"mail\""))
+        .unwrap();
+    assert!(
+        mail.contains("hosts = \"API.mail.test, mail.test:8443\""),
+        "{config}"
+    );
+    assert!(mail.contains("secrets = \"plain\""), "{config}");
+    let docs = config
+        .split("[[mcp]]")
+        .find(|t| t.contains("\"docs\""))
+        .unwrap();
+    assert!(
+        docs.contains("secrets = \"surrogate\"") && docs.contains("enabled = false"),
+        "{config}"
+    );
+    assert_eq!(
+        env.ok(&["config", "get", "mcp.mail.secrets"]).trim(),
+        "plain"
+    );
+    // What the daemon would refuse is refused here, and nothing is written.
+    for (key, value) in [
+        ("mcp.mail.hosts", "*.mail.test"),
+        ("mcp.mail.secrets", "raw"),
+        ("mcp.nope.hosts", "x.test"),
+    ] {
+        assert!(!set(key, value).status.success(), "{key} = {value}");
+    }
+    assert_eq!(env.config(), config);
+}
+
 #[test]
 fn config_get_and_set_check_the_daemon_schema() {
     let env = Env::new("config");

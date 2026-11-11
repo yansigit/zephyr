@@ -1452,14 +1452,25 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                 ["get", key] => {
                     println!(
                         "{}",
-                        conf::get(&doc, key).with_context(|| format!("{key} is not set"))?
+                        // A connector's rows are read from its `[[mcp]]` table, by name.
+                        crate::settings::read(&doc, key)
+                            .with_context(|| format!("{key} is not set"))?
                     );
                 }
                 ["set", key, value] => {
                     if crate::settings::find(key).is_none() {
                         eprintln!("warn: {key} is not a known setting; saved without checking");
                     }
-                    conf::set(&mut doc, key, value)?;
+                    // A connector's rows (`mcp.NAME.hosts`, `.secrets`, `.enabled`, a tool's
+                    // class) are in its `[[mcp]]` table, which only the registry finds by name.
+                    match crate::settings::find(key).filter(|_| key.starts_with("mcp.")) {
+                        Some(s) => {
+                            let parsed = crate::settings::parse(s, value)
+                                .map_err(|e| anyhow::anyhow!("{}", e.replace(s.key, key)))?;
+                            crate::settings::write(&mut doc, key, Some(&parsed))?;
+                        }
+                        None => conf::set(&mut doc, key, value)?,
+                    }
                     // Refuse what the daemon would refuse (unknown keys, a bad time zone).
                     toml::from_str::<crate::config::Config>(&doc.to_string())
                         .map_err(anyhow::Error::from)
