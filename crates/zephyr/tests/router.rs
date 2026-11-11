@@ -2435,6 +2435,27 @@ async fn pairing_makes_the_sender_an_owner() {
 }
 
 #[tokio::test]
+async fn a_claim_taken_in_while_draining_is_still_a_claim() {
+    let (home, mut gw) = paired_gateway("pair-drain");
+    let code = pair_code(&gw, "p1").await;
+    // A run going, so the drain (shutdown or re-exec, one path) waits for it to settle and
+    // takes in what arrived meanwhile.
+    std::fs::write(home.join("slow"), "2").unwrap();
+    gw.say("p2", "owner", "keep busy").await;
+    wait(|| !log(&home, "prompt").is_empty()).await;
+    let _ = gw.stop.take().unwrap().send(());
+    gw.say_on("telegram", "55-1", "55", &format!("/pair {code}"))
+        .await;
+    gw.task.await.unwrap().unwrap();
+    let store = Store::open(&home.join("state.db")).unwrap();
+    let texts: Vec<String> = (store.inbox_with_status("dropped").unwrap().into_iter())
+        .map(|r| r.text)
+        .collect();
+    assert_eq!(texts, ["/pair"], "the code never reaches state.db");
+    assert_eq!(telegram_owners(&home), ["55"]);
+}
+
+#[tokio::test]
 async fn a_pairing_code_works_once_and_expires() {
     let (home, gw) = paired_gateway("pair-once");
     let code = pair_code(&gw, "p1").await;

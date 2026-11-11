@@ -710,15 +710,8 @@ impl<'a> Router<'a> {
                     self.spawn().await;
                 }
                 Some(m) = rx.recv() => {
-                    // A pairing claim is taken before the owner check would drop it; the
-                    // adapter knows the name the sender goes by, for the notice.
-                    if let Some(code) = crate::pairing::claim_on(&m.channel, &m.text) {
-                        let name = (channels.iter().find(|c| c.name() == m.channel))
-                            .and_then(|c| c.known_as(&m.sender));
-                        self.claim(m, &code, name).await;
-                    } else {
-                        self.inbound(m, false).await;
-                    }
+                    let name = known(channels, &m);
+                    self.inbound(m, false, name).await;
                 }
                 Some(req) = self.attaches.recv() => self.attach(req).await,
                 Some((session, note)) = next_gate_note(&mut self.gate_notes) => {
@@ -1463,7 +1456,7 @@ impl<'a> Router<'a> {
                 });
                 let _ = tx.send((history, self.tap.subscribe()));
             }
-            AttachRequest::FollowUp(m) => self.inbound(m, true).await,
+            AttachRequest::FollowUp(m) => self.inbound(m, true, None).await,
             AttachRequest::Dequeue { channel, reply } => {
                 let _ = reply.send(self.dequeue(channel).unwrap_or_else(|e| {
                     eprintln!("zephyr: dequeue failed: {e}");
@@ -1990,9 +1983,14 @@ impl<'a> Router<'a> {
     }
 
     /// `after`: a follow-up, held until the run settles rather than steered into it.
-    async fn inbound(&mut self, m: Inbound, after: bool) {
+    /// `name`: how the sender goes by on a pairing channel (`known`), for a claim's notice.
+    async fn inbound(&mut self, m: Inbound, after: bool, name: Option<String>) {
         if m.text.trim().is_empty() {
             return; // attachment-only messages are not handled in v1
+        }
+        // A pairing claim, before the owner check would drop it, on every intake path.
+        if let Some(code) = crate::pairing::claim_on(&m.channel, &m.text) {
+            return self.claim(m, &code, name).await;
         }
         // Decided before the write: a crash in between must not leave a stranger's row `new`.
         let owner = self.cfg.is_owner(&m.channel, &m.sender);
@@ -4877,7 +4875,7 @@ impl<'a> Router<'a> {
                 log(self.store.notify_last_owner(&alert).map_err(Into::into));
             }
         }
-        self.take_in(rx).await;
+        self.take_in(channels, rx).await;
         self.flush(channels).await;
         if let Some(child) = self.child.take() {
             child.stop().await;
@@ -4886,13 +4884,14 @@ impl<'a> Router<'a> {
         // which ends the gateway.
         rx.close();
         self.attaches.close();
-        self.take_in(rx).await;
+        self.take_in(channels, rx).await;
     }
 
-    /// Writes the waiting messages' rows (and answers commands) while draining.
-    async fn take_in(&mut self, rx: &mut mpsc::Receiver<Inbound>) {
+    /// Writes the waiting messages' rows (and answers commands, takes claims) while draining.
+    async fn take_in<C: Channel>(&mut self, channels: &[C], rx: &mut mpsc::Receiver<Inbound>) {
         while let Ok(m) = rx.try_recv() {
-            self.inbound(m, false).await;
+            let name = known(channels, &m);
+            self.inbound(m, false, name).await;
         }
         while let Ok(req) = self.attaches.try_recv() {
             self.attach(req).await;
@@ -5319,6 +5318,14 @@ fn unspoof(text: &str) -> String {
     lines.collect::<Vec<_>>().join("\n")
 }
 
+/// The name `m`'s sender goes by on its channel, when `m` is a pairing claim: only its notice
+/// shows it.
+fn known<C: Channel>(channels: &[C], m: &Inbound) -> Option<String> {
+    crate::pairing::claim_on(&m.channel, &m.text)?;
+    let channel = channels.iter().find(|c| c.name() == m.channel)?;
+    channel.known_as(&m.sender)
+}
+
 /// Edits `owners.<channel>` in `doc`, made an empty list first when absent.
 fn owner_list(
     doc: &mut toml_edit::DocumentMut,
@@ -5575,7 +5582,7 @@ mod tests {
             sender: "owner".into(),
             text: format!("/ok {id}"),
         };
-        r.inbound(m, false).await;
+        r.inbound(m, false, None).await;
         let sent = r.store.pending_outbox().unwrap();
         sent.last().unwrap().text.clone()
     }
