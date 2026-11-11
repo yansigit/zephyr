@@ -222,6 +222,14 @@ Found while fixing, then fixed: `an_owner_is_answered_in_chunks_with_files` fail
 7. `changed_identity` raced and re-told on a partial failure: the ACI is claimed before the write, released when nobody was reached, and a partial write records who was (`two_failed_sends_at_once_tell_the_owner_once`, `after_a_partial_failure_only_the_owners_not_told_are_told`).
 9. `zephyr pair`'s 30 s deadline is computed after the up-to-60 s wait for signal-cli. No test: it would need the real 60 s wait.
 
+## Third review fixes (PR #49)
+
+1. A row was answered when `inbound` returned, so a slow command timed its batch out, and an unstored row was answered as done: each row is answered right after its insert (or a deliberate leave-out), with an outcome; "not stored" (an insert error, a claim's insert error, a panic) keeps Telegram's offset, and the batch comes again (`a_row_whose_insert_failed_comes_again_once_the_database_recovers`, `a_slow_command_does_not_time_its_batch_out`; the test channel now forwards `acks`, which it did not, so the earlier slow-batch case had passed vacuously).
+2. and 3. The hold names its setup by pid and kernel start time (`procs::start_ticks`), is written aside and renamed, and carries a lease setup refreshes every 30 s (90 s, else ignored); setup's code prompt times out at 5 min; `Signal::run` checks it before every start; a Signal send during a hold answers `channel::Paused`, which the router keeps pending whatever the window (`a_hold_stops_signal_cli_until_it_is_lifted_and_a_stale_one_is_ignored`, `a_daemon_starting_during_a_hold_starts_no_signal_cli`, `a_send_during_a_hold_is_paused_not_failed`, `a_reply_queued_while_its_channel_is_paused_is_sent_after_it`).
+4. and 7. A send has `SEND_CAP` (15 min, 429 waits included); an error after the router stopped waiting is the next retry's answer, so the row fails normally; a reply left part-sent keeps its chat's turn (`a_send_stuck_on_rate_limits_fails_at_its_cap`, `a_reply_that_failed_partway_goes_on_before_the_next_to_its_chat`).
+5. Claims also as `/pair@bot CODE`, `/pairCODE` and, from a stranger while a code is out, the code alone; while a code is out a stranger's text there is stored as `[message from someone not paired]` (`every_way_of_sending_a_code_pairs_and_none_reaches_state_db`).
+6. `rpi auth refresh` runs in a task of its own, its result taken in the router's `select!`; with no answer from main's child yet, the agent dir's OAuth credentials stand in (`a_hanging_refresh_during_a_run_does_not_hold_its_events`, `a_daemon_busy_from_its_start_still_refreshes_a_due_credential`).
+
 ## Owner checks (not verifiable here)
 
 - A real Telegram round trip: `zephyr channel add telegram` with the owner's bot token, `/pair`, a message, a photo, a voice note saved as a file, the bot added to a group leaves.
