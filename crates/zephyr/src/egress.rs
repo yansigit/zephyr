@@ -1667,6 +1667,30 @@ fn broker_reach(state: &Path, trust: &[&str]) -> Vec<(String, Check)> {
     checks
 }
 
+/// Fails when a file can be made in `dir`, or one of its files (a level down too) opened to
+/// write, or `dir` is not there.
+fn unwritable(dir: &Path) -> Check {
+    if !dir.is_dir() {
+        return Check::Fail("it is not there".into());
+    }
+    let makes = |d: &Path| {
+        let probe = d.join(format!(".zephyr-probe-{}", std::process::id()));
+        let made = std::fs::File::create(&probe).is_ok();
+        let _ = std::fs::remove_file(&probe);
+        made
+    };
+    let opens = |p: &Path| std::fs::OpenOptions::new().append(true).open(p).is_ok();
+    let list = |d: &Path| std::fs::read_dir(d).into_iter().flatten().flatten();
+    let below = list(dir).any(|e| match e.path().is_dir() {
+        true => makes(&e.path()) || list(&e.path()).any(|f| opens(&f.path())),
+        false => opens(&e.path()),
+    });
+    match makes(dir) || below {
+        false => Check::Ok,
+        true => Check::Fail("a file could be written there".into()),
+    }
+}
+
 /// `zephyr __netcheck [OWN_IP:ATTACH_PORT]`: what the agent's uid can reach, one
 /// `ok|fail|warn <what>` line per check. Run as the agent: by the daemon at start with no
 /// argument (the direct connection alone), and by `doctor` with the daemon's address, which adds
@@ -1716,6 +1740,13 @@ pub fn netcheck(args: &[String]) -> std::process::ExitCode {
             public.as_str(),
         ];
         checks.extend(broker_reach(Path::new(state), &trust));
+    }
+    // The image's catalog and starter skills (DESIGN §4.22, §4.23): root's, never the agent's.
+    for dir in args.iter().skip(3) {
+        checks.push((
+            format!("the agent cannot write {dir}"),
+            unwritable(Path::new(dir)),
+        ));
     }
     let mut code = std::process::ExitCode::SUCCESS;
     for (what, check) in checks {
@@ -1861,6 +1892,36 @@ pub async fn verify() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DESIGN §4.22, §4.23: doctor's check that the image's catalog and skills are not the
+    /// agent's, run here as the folders' owner (no root needed).
+    #[test]
+    fn unwritable_tells_a_folder_the_prober_can_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+        let dir = crate::test_dir("unwritable");
+        std::fs::create_dir_all(dir.join("report")).unwrap();
+        std::fs::write(dir.join("report/SKILL.md"), "x").unwrap();
+        std::fs::write(dir.join("github.toml"), "x").unwrap();
+        assert!(matches!(unwritable(&dir), Check::Fail(_)));
+        mode(&dir.join("report/SKILL.md"), 0o444).unwrap();
+        mode(&dir.join("github.toml"), 0o444).unwrap();
+        mode(&dir.join("report"), 0o555).unwrap();
+        mode(&dir, 0o555).unwrap();
+        assert!(matches!(unwritable(&dir), Check::Ok));
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
+            "no probe left behind"
+        );
+        mode(&dir.join("report"), 0o755).unwrap();
+        assert!(
+            matches!(unwritable(&dir), Check::Fail(_)),
+            "a folder a level down"
+        );
+        mode(&dir, 0o755).unwrap();
+        assert!(matches!(unwritable(&dir.join("gone")), Check::Fail(_)));
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()

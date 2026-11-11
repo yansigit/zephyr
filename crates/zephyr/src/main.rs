@@ -757,6 +757,10 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
             );
         }
     }
+    // Warnings: an added catalog connector is never updated by itself (DESIGN §4.22).
+    for line in zephyr::catalog::newer(cfg) {
+        println!("warn {line}");
+    }
     // A warning, not a failure: providers come from the image (DESIGN §4.4).
     let ext_dir = zephyr::auth_keeper::agent_dir(cfg).join("extensions");
     let installed = {
@@ -825,6 +829,8 @@ async fn network_floor(cfg: &Config) -> bool {
     // And that the token broker's keys and trust are out of its reach (DESIGN §4.21).
     probe.arg(cfg.state_dir());
     probe.arg(zephyr::drafts::public_dir(cfg));
+    // And that the image's catalog and starter skills are root's (DESIGN §4.22, §4.23).
+    probe.args([zephyr::catalog::DIR, zephyr::drafts::STARTER]);
     // Each check has its own limit and they add up to 45 s; a probe stuck past that is a failure.
     let mut probe = tokio::process::Command::from({
         zephyr::agent::cmd(&mut probe);
