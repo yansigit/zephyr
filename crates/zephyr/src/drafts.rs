@@ -2138,7 +2138,10 @@ mod tests {
                     for flag in [
                         "--proxy-server=127.0.0.1:9",
                         "--host-resolver-rules=MAP * ~NOTFOUND",
-                        "--blink-settings=scriptEnabled=false",
+                        // Chromium's headless print needs its own script, so a page CSP, not
+                        // `--blink-settings=scriptEnabled=false`, keeps the page's off.
+                        "http-equiv=\"Content-Security-Policy\"",
+                        "default-src 'none'; img-src file: data:",
                     ] {
                         assert!(code.contains(flag), "{name}/{path}: no {flag}");
                     }

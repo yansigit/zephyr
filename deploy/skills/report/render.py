@@ -5,7 +5,7 @@ and this folder's style.css, then Chromium prints it. With --slides, each part b
 that are exactly `---` is one 16:9 page.
 
 The Markdown is not trusted (it may hold text from a web page): raw HTML in it is escaped, never
-passed through, and Chromium prints with JavaScript off and no network, so a `<script>` does not
+passed through, and the page runs no script and Chromium has no network, so a `<script>` does not
 run and a remote image is not fetched. Local images still print.
 """
 
@@ -48,8 +48,15 @@ def page(source, slides):
         style += "\n@page { size: 13.333in 7.5in; margin: 0; }\n"
     # Relative image paths resolve against the markdown file's folder.
     base = source.parent.resolve().as_uri() + "/"
+    # No script runs and nothing is fetched but local files: the page's own policy, since
+    # Chromium's headless print needs scripting on (`--blink-settings=scriptEnabled=false`
+    # makes it write no PDF).
+    policy = (
+        "default-src 'none'; img-src file: data:; style-src 'unsafe-inline'; font-src file: data:"
+    )
     return (
-        f'<!doctype html><html><head><meta charset="utf-8"><base href="{base}">'
+        f'<!doctype html><html><head><meta charset="utf-8">'
+        f'<meta http-equiv="Content-Security-Policy" content="{policy}"><base href="{base}">'
         f"<title>{title}</title><style>{style}</style></head>"
         f'<body class="{kind}">{body}</body></html>'
     )
@@ -79,7 +86,6 @@ def main(argv):
                 "--proxy-bypass-list=<-loopback>",
                 "--host-resolver-rules=MAP * ~NOTFOUND",
                 "--disable-background-networking",
-                "--blink-settings=scriptEnabled=false",
                 f"--print-to-pdf={out}",
                 doc.as_uri(),
             ],
