@@ -33,10 +33,22 @@ pub const USAGE: &str = "usage: zephyr <command>   (zephyr --version: this CLI's
   alert setup TOPIC [--server URL] | check | test | off
   web setup [--yes] | enrol [NAME]   (the web app behind tailscale serve, and a passkey for a device)
   uninstall [--keep-data] [--yes]
-env: ZEPHYR_CONTAINER (default zephyr), ZEPHYR_IMAGE, ZEPHYR_SRC (for --build); data in ~/.zephyr";
+env: ZEPHYR_CONTAINER (default zephyr), ZEPHYR_IMAGE, ZEPHYR_REPO (default ghcr.io/yansigit/zephyr),
+  ZEPHYR_SRC (for --build); data in ~/.zephyr";
 
-/// The published image, tagged with the version (and `latest`, the newest release).
-const REPO: &str = "ghcr.io/yansigit/zephyr:";
+/// The published image's repository; images are `<repo>:<version>` (and `latest`, the newest
+/// release).
+pub const DEFAULT_REPO: &str = "ghcr.io/yansigit/zephyr";
+
+/// The image repository: `ZEPHYR_REPO` from the environment, else as it was when this CLI was
+/// built (so a CLI copied out of an image upgrades from where it came), else `DEFAULT_REPO`.
+/// Empty counts as unset: an undefined Docker `ARG` still reaches the build as "".
+fn repo() -> String {
+    let set = |v: Option<String>| v.filter(|v| !v.is_empty());
+    set(std::env::var("ZEPHYR_REPO").ok())
+        .or_else(|| set(option_env!("ZEPHYR_REPO").map(String::from)))
+        .unwrap_or_else(|| DEFAULT_REPO.into())
+}
 
 /// The image built from it with host.toml's apt `packages` (`zephyr packages`), never pushed.
 const LOCAL: &str = "zephyr-local:";
@@ -126,7 +138,7 @@ fn running_version(h: &Host) -> Option<String> {
     let local = || image.strip_prefix(LOCAL)?.split('-').next();
     Some(
         image
-            .strip_prefix(REPO)
+            .strip_prefix(&format!("{}:", repo()))
             .or_else(local)
             .unwrap_or(image)
             .to_string(),
@@ -149,14 +161,12 @@ impl Host {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         Host {
             container: env("ZEPHYR_CONTAINER").unwrap_or_else(|| "zephyr".into()),
-            image: env("ZEPHYR_IMAGE")
-                .unwrap_or_else(|| format!("{REPO}{}", env!("CARGO_PKG_VERSION"))),
+            image: env("ZEPHYR_IMAGE").unwrap_or_else(|| format!("{}:{ME}", repo())),
             data: Data {
                 dir: home().join(".zephyr"),
                 daemon: home().join(".zephyr-daemon"),
                 container: env("ZEPHYR_CONTAINER").unwrap_or_else(|| "zephyr".into()),
-                image: env("ZEPHYR_IMAGE")
-                    .unwrap_or_else(|| format!("{REPO}{}", env!("CARGO_PKG_VERSION"))),
+                image: env("ZEPHYR_IMAGE").unwrap_or_else(|| format!("{}:{ME}", repo())),
             },
             interactive: std::io::stdin().is_terminal(),
         }
@@ -821,7 +831,7 @@ impl Host {
             println!("already on {target}");
             return Ok(());
         }
-        self.image = format!("{REPO}{target}");
+        self.image = format!("{}:{target}", repo());
         self.data.image = self.image.clone();
         // A release is its published image, never a local build of this tree under its tag.
         if !quiet(docker(&["image", "inspect", &self.image])) && !pull(&self.image) {
@@ -961,9 +971,12 @@ impl Host {
 
 /// The newest release's version, as `latest` itself reports it.
 fn latest() -> anyhow::Result<String> {
-    let image = format!("{REPO}latest");
+    let image = format!("{}:latest", repo());
     if !pull(&image) {
-        bail!("could not pull {image}: `docker login ghcr.io`, or name the version (zephyr upgrade X.Y.Z)");
+        bail!(
+            "could not pull {image}: `docker login {}`, or name the version (zephyr upgrade X.Y.Z)",
+            registry(&image)
+        );
     }
     let out = output(&mut docker(&[
         "run",
@@ -1561,7 +1574,9 @@ fn local_image(base: &str, packages: &[String]) -> Option<String> {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let version = base.strip_prefix(REPO).unwrap_or("custom");
+    let version = base
+        .strip_prefix(&format!("{}:", repo()))
+        .unwrap_or("custom");
     Some(format!("{LOCAL}{version}-{hash}"))
 }
 
@@ -1615,7 +1630,9 @@ mod tests {
             assert!(!package_name(bad), "{bad}");
         }
         let list = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let base = format!("{REPO}0.4.0");
+        assert_eq!(DEFAULT_REPO, "ghcr.io/yansigit/zephyr");
+        assert!(USAGE.contains(&format!("ZEPHYR_REPO (default {DEFAULT_REPO})")));
+        let base = format!("{DEFAULT_REPO}:0.4.0");
         assert_eq!(local_image(&base, &[]), None);
         let tag = local_image(&base, &list(&["jq", "ffmpeg"])).unwrap();
         // Pinned: sha256("ghcr.io/yansigit/zephyr:0.4.0\nffmpeg\njq"), so it holds across builds.

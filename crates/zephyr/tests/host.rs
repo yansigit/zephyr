@@ -2349,6 +2349,94 @@ fn upgrade_replaces_the_cli_from_the_newer_image_first() {
     assert!(!env.zephyr(&["upgrade", "v1.2"]).status.success());
 }
 
+/// With nothing set, the CLI runs this owner's published release, as it always has.
+#[test]
+fn default_image_is_the_owners_release() {
+    let env = Env::new("default-image");
+    let projects = env.projects.display().to_string();
+    let args = ["init", "--non-interactive", "--projects", &projects];
+    let out = env.zephyr_env(&args, &[("ZEPHYR_IMAGE", "")]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let image = format!("ghcr.io/yansigit/zephyr:{}", env!("CARGO_PKG_VERSION"));
+    let calls = env.calls();
+    find(&calls, &["docker", "image", "inspect", &image]);
+    assert_eq!(find(&calls, RUN).last(), Some(&image));
+}
+
+#[test]
+fn zephyr_repo_moves_the_image_and_keeps_the_gh_token_at_ghcr() {
+    let env = Env::new("zephyr-repo");
+    let cli = env.cli_copy();
+    let me = env!("CARGO_PKG_VERSION");
+    let repo = "registry.example.com/me/zephyr";
+    let vars = [
+        ("ZEPHYR_IMAGE", ""),
+        ("ZEPHYR_REPO", repo),
+        ("SHIM_LATEST", "99.0.0"),
+        ("SHIM_VERSION", me),
+    ];
+    let out = env.run_cli(&cli, &["upgrade"], &vars);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = env.calls();
+    find(&calls, &["docker", "pull", &format!("{repo}:latest")]);
+    let cat = ["docker", "run", "--rm", "--entrypoint", "cat"];
+    assert_eq!(find(&calls, &cat)[5], format!("{repo}:99.0.0"));
+
+    // Another registry is never handed the gh token: the owner logs in to it.
+    let _ = std::fs::remove_file(env.dir.join("env.log"));
+    let failing = [vars[0], vars[1], ("SHIM_PULL_FAIL", "1")];
+    let out = env.zephyr_env(&["upgrade"], &failing);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!("could not pull {repo}:latest")),
+        "{err}"
+    );
+    assert!(err.contains("docker login registry.example.com"), "{err}");
+    let calls = env.calls();
+    assert_eq!(at(&calls, &["docker", "login"], ""), None, "{calls:#?}");
+    assert_eq!(at(&calls, &["gh", "api", "user"], ""), None, "{calls:#?}");
+    let env_log = std::fs::read_to_string(env.dir.join("env.log")).unwrap_or_default();
+    assert!(!env_log.contains("GH_TOKEN"), "{env_log}");
+
+    // Empty is unset: the default repository.
+    let out = env.zephyr_env(
+        &["upgrade"],
+        &[vars[0], ("ZEPHYR_REPO", ""), ("SHIM_PULL_FAIL", "1")],
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("could not pull ghcr.io/yansigit/zephyr:latest"),
+        "{err}"
+    );
+}
+
+/// image.yml publishes to this repository's own package, and tells the image's CLI so.
+#[test]
+fn the_image_workflow_tags_the_repository_it_runs_in() {
+    let yml = read(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../.github/workflows/image.yml"
+    )));
+    assert!(yml.contains(r#"echo "image=ghcr.io/${GITHUB_REPOSITORY,,}""#));
+    assert!(yml.contains("ZEPHYR_REPO=${{ steps.v.outputs.image }}"));
+    assert!(yml.contains("${{ steps.v.outputs.image }}:${{ steps.v.outputs.version }}"));
+    let tags = yml.lines().filter(|l| l.contains("ghcr.io/yansigit"));
+    assert!(
+        tags.clone().all(|l| l.trim_start().starts_with('#')),
+        "{:?}",
+        tags.collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn upgrade_waits_backs_up_and_goes_back_only_with_a_backup() {
     let env = Env::new("upgrade-db");

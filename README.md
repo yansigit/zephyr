@@ -867,7 +867,14 @@ auth token` goes in as the BuildKit secret `gh_token`, which is never stored in 
 provider sources are pinned to commit SHAs by the build args (`RPI_PACKAGE_REF`, `PLUGINS_REF`);
 local checkouts can stand in for them with `--build-context rpi-package=<dir> --build-context
 provider-plugins=<dir>` (see the Dockerfile).
-Pushing a `v*` tag publishes `ghcr.io/yansigit/zephyr:<version>` (`.github/workflows/image.yml`).
+Pushing a `v*` tag publishes `ghcr.io/yansigit/zephyr:<version>` (`.github/workflows/image.yml`,
+which tags `ghcr.io/<the repository it runs in>`, so a fork publishes to its own).
+
+The CLI runs and upgrades from `ghcr.io/yansigit/zephyr` unless `ZEPHYR_REPO` names another
+repository: in the environment for one shell, or at build time (`ZEPHYR_REPO=… cargo install …`,
+or `--build-arg ZEPHYR_REPO=…` for the image's own CLI), which the CLI keeps. `ZEPHYR_IMAGE`, one
+exact image, wins over both. Your `gh` token only ever goes to ghcr.io; for another registry,
+`docker login` to it yourself.
 
 ## Releasing
 

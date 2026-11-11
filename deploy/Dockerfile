@@ -65,6 +65,9 @@ COPY --from=provider-plugins-git /src /
 
 # zephyr, zephyr-policy, zephyr-cursor, librpi_providers.so and librpi_mcp_adapter.so.
 FROM toolchain AS rust
+# The repository the image is published to, baked into its CLI (`zephyr upgrade` pulls from it);
+# unset or empty, the CLI's own default.
+ARG ZEPHYR_REPO
 COPY Cargo.toml Cargo.lock /src/zephyr/
 COPY crates /src/zephyr/crates
 COPY --from=rpi-package / /src/rpi-package

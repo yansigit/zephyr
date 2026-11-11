@@ -1,5 +1,6 @@
-# Publishes ghcr.io/yansigit/zephyr:<version> and :latest for each v* tag; `zephyr init` and
-# `zephyr upgrade` pull it. A manual run (`gh workflow run image.yml --ref <branch>`) builds :dev
+# Publishes ghcr.io/<this repository>:<version> and :latest for each v* tag (here
+# ghcr.io/yansigit/zephyr; a fork publishes to its own); `zephyr init` and `zephyr upgrade` pull it.
+# The name also goes in as build arg ZEPHYR_REPO, so the image's CLI upgrades from where it came. A manual run (`gh workflow run image.yml --ref <branch>`) builds :dev
 # without pushing anything.
 # Secret PROVIDER_REPOS_TOKEN: a fine-grained token with contents:read on yansigit/rpi-package and
 # yansigit/rpi-provider-plugins, passed to the build as the gh_token secret. It is only needed while
@@ -32,6 +33,7 @@ jobs:
         run: |
           case $GITHUB_REF in refs/tags/v*) v=${GITHUB_REF_NAME#v} ;; *) v=dev ;; esac
           echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
       - if: vars.ZEPHYR_RUNNER == ''
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - if: vars.ZEPHYR_RUNNER != ''
@@ -54,6 +56,8 @@ jobs:
           file: deploy/Dockerfile
           load: true
           tags: zephyr-smoke:ci
+          build-args: |
+            ZEPHYR_REPO=${{ steps.v.outputs.image }}
           secrets: |
             gh_token=${{ secrets.PROVIDER_REPOS_TOKEN }}
           cache-from: type=gha
@@ -79,8 +83,10 @@ jobs:
           push: ${{ startsWith(github.ref, 'refs/tags/v') }}
           # :latest only from a tag push, so a manual run on an old tag can't move it back.
           tags: |
-            ghcr.io/yansigit/zephyr:${{ steps.v.outputs.version }}
-            ${{ github.event_name == 'push' && 'ghcr.io/yansigit/zephyr:latest' || '' }}
+            ${{ steps.v.outputs.image }}:${{ steps.v.outputs.version }}
+            ${{ github.event_name == 'push' && format('{0}:latest', steps.v.outputs.image) || '' }}
+          build-args: |
+            ZEPHYR_REPO=${{ steps.v.outputs.image }}
           secrets: |
             gh_token=${{ secrets.PROVIDER_REPOS_TOKEN }}
           # Hosted runners only: the fallback's remote BuildKit runs outside the job, without an Actions cache token.
