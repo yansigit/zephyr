@@ -420,6 +420,12 @@ Growth: **+835 MB** (+15.5%) for voice, against the spec's estimate of about 520
 - Deviation: no Korean fixture is committed (no clean CC0 clip was found), so the ignored test's Korean half runs only when `tests/fixtures/voice/ko.ogg` is put there.
 - Deviation: noVNC 1.7.0 does not work whole under the unchanged CSP (`img-src 'self'` blocks its `data:` images), so `app.js` drops the encodings that need them.
 
+**After the review** (`/code-review high` of `0e3eb88..a8ff333`, 2026-11-11): its ten findings were each confirmed and fixed, one commit each with its test, none skipped; the `- Review fix:` lines are under the tasks that own the code. `cargo test`: 1223 passed, 0 failed, 20 ignored; fmt and clippy clean. Image `zephyr-dev:c2-aba0773` (6,226,331,293 bytes), in `zephyr-test-c2` again (removed afterwards): both ignored real-binary tests pass inside it and leave no decoder running, `doctor`'s voice and desktop lines are `ok`, and the takeover, the unreachable x11vnc, the waiting wrappers and the hand back behave as above.
+- Deviation: finding 5 (a caption carrying a transcript into a job or task) took neither shape the review offered. A row that holds a transcript is never read as a command or a decision: the whole row goes to the agent, tainted. A command typed as a voice note's caption, `/stop` and `/pause` among them, is therefore not run.
+- Deviation: finding 6 overrides spec §4.4, which accepted the decoders on the host's network under `network = "host"`: without the floor nothing is decoded, transcribed or spoken, the note reads `[transcript skipped: needs the network floor]`, and `status` and `doctor` say voice is off.
+- Deviation: finding 1 is a deny, not a longer wait: a click the owner approves (or whose delay ends) while they hold the desktop is refused with the desktop's text and recorded `failed`, `not run: the owner had the desktop`. It is tested at the gate and in the wrapper, not through a whole-router `/ok`.
+- Deviation: finding 4's check covers every attachment of a message whose row is stored, not only audio.
+
 **Not verified:**
 - The Desktop screen in a real browser: noVNC drawing the screen, the pointer, the phone keyboard field (Hangul, Backspace on Android), and a console free of CSP errors. Only the daemon side and the RFB banner were driven. README's manual check on iOS Safari and Android Chrome stands before release.
 - A voice note through a real Discord or iMessage message, and the spoken reply arriving as a voice message there.
