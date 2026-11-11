@@ -152,6 +152,16 @@ fn web_asks_the_daemon_for_a_code_and_says_when_it_cannot() {
 }
 
 #[test]
+fn pair_names_its_channel_and_needs_a_daemon() {
+    let (_home, cfg) = setup("pair", "");
+    let out = zephyr(&cfg, &["pair", "whatsapp"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("usage: zephyr pair telegram|signal"), "{err}");
+    assert_eq!(zephyr(&cfg, &["pair", "telegram"]).status.code(), Some(3));
+}
+
+#[test]
 fn pause_and_resume_work_with_a_daemon_and_without_one() {
     let (home, cfg) = setup("pause", "");
     // The test runs as the owner: the chat socket sees this uid as the sender.

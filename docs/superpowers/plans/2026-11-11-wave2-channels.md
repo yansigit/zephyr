@@ -45,6 +45,8 @@
 10. **The link QR** comes from `qrencode -t ansiutf8`, apt in the image (no crate).
 11. **`channel remove signal`** runs `unregister` (best effort; it also unlinks a linked device), then deletes `D`.
 12. **The channel's `reconnecting` state** stays the snapshot's existing shortcut (adapters report no state); a restarting signal-cli is logged.
+13. **Pairing replies the spec leaves open:** while pairing is closed `/pair` answers `[zephyr] pairing is closed until HH:MM`; the lockout notice goes to every owner channel (`notify_owners`, not the last owner: a command-only row never becomes that); `/unpair` answers `[zephyr] 55 is no longer an owner on telegram` or `[zephyr] 55 is not an owner on telegram`; pair and unpair are `settings_log` rows on `owners.<channel>` (actors `pairing`, `owner`).
+14. **`zephyr pair KIND`** (container) asks again for 30 s while the daemon answers `not set up` or its socket is there but takes nothing: `channel add`'s reload may still be re-execing the daemon onto the new channel.
 
 ## Seams left for C2
 

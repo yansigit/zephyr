@@ -16,7 +16,7 @@ use zephyr::store::Store;
 /// The rpi minor this build speaks (DESIGN §3).
 const RPI_PIN: &str = "rpi 0.21.";
 
-const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|resume|reload|skill|web>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
+const USAGE: &str = "usage: zephyr <run|supervise|status|doctor|chat|tui|pause|resume|reload|skill|web|pair>  (config: $ZEPHYR_CONFIG or ~/agent/zephyr.toml)";
 
 fn main() -> ExitCode {
     // `agent-browser` on the agent's PATH is this binary (approvals spec §4.4): the wrapper runs
@@ -97,6 +97,7 @@ async fn zephyr_main() -> ExitCode {
             ("set", Ok(cfg)) => set(&cfg, &args.collect::<Vec<_>>()).await,
             ("skill", Ok(cfg)) => skill(&cfg, &args.collect::<Vec<_>>()).await,
             ("web", Ok(cfg)) => web(&cfg, &args.collect::<Vec<_>>()).await,
+            ("pair", Ok(cfg)) => pair(&cfg, &args.collect::<Vec<_>>()).await,
             _ => {
                 eprintln!("{USAGE}");
                 return ExitCode::from(2);
@@ -367,6 +368,38 @@ async fn web(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
     anyhow::ensure!(
         reply.contains("https://"),
         "the web app did not answer with its address"
+    );
+    Ok(())
+}
+
+/// `zephyr pair telegram|signal`: a pairing code from the daemon, over the chat socket (a strong
+/// channel), as `zephyr channel add` asks at its end. Its reload may still be re-execing the
+/// daemon onto the new channel, so a `not set up` or a missing socket is asked again for 30 s.
+async fn pair(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
+    let [kind] = args else {
+        anyhow::bail!("usage: zephyr pair telegram|signal");
+    };
+    anyhow::ensure!(
+        zephyr::pairing::CHANNELS.contains(&kind.as_str()),
+        "usage: zephyr pair telegram|signal"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let reply = loop {
+        let reply = ask(cfg, &format!("/pair {kind}")).await?;
+        let early = std::time::Instant::now() < deadline;
+        match reply {
+            Some(r) if early && r.contains("is not set up") => {}
+            Some(r) => break r,
+            // The socket is there but takes nothing: a re-exec in progress.
+            None if early && cfg.socket_path().exists() => {}
+            None => return Err(NotRunning.into()),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+    println!("{reply}");
+    anyhow::ensure!(
+        reply.starts_with("[zephyr] send /pair "),
+        "the daemon gave no pairing code"
     );
     Ok(())
 }

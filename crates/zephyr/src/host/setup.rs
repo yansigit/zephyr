@@ -187,7 +187,8 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
         conf::order_accounts(&mut doc, &ordered)?;
         h.data.save(&doc)?;
     }
-    for kind in ["discord", "imessage"] {
+    let mut paired = vec![];
+    for kind in CHANNELS {
         let present = doc.get(kind).is_some();
         let prompt = if present {
             format!("Change the {kind} channel?")
@@ -200,6 +201,7 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
             .interact()?
         {
             channel_add(h, kind)?;
+            paired.extend(PAIRED.iter().filter(|k| **k == kind));
         }
     }
     init_approvals(h, preset)?;
@@ -218,7 +220,24 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
             }
         }
     }
-    h.doctor(false)
+    h.doctor(false)?;
+    for kind in paired {
+        pair(h, kind)?;
+    }
+    Ok(())
+}
+
+/// The channels `channel add` sets up, in the order `init` offers them.
+const CHANNELS: [&str; 4] = ["discord", "imessage", "telegram", "signal"];
+/// Those whose owner is learned by a pairing code rather than typed in (DESIGN §4.3).
+const PAIRED: [&str; 2] = ["telegram", "signal"];
+const CHANNEL_USAGE: &str =
+    "usage: zephyr channel add|remove discord|imessage|telegram|signal | list | signal trust ACI";
+
+/// Asks the daemon for a pairing code for `kind` and prints how to use it: `zephyr pair` in
+/// the container, over the chat socket, a strong channel.
+fn pair(h: &Host, kind: &str) -> anyhow::Result<()> {
+    run(&mut h.exec(&[], &[], &["zephyr", "pair", kind]))
 }
 
 /// Init's web app step (DESIGN §4.8): offered, default no. What web setup did about restarting
@@ -689,24 +708,34 @@ pub fn model(h: &Host, mut a: Args) -> anyhow::Result<()> {
 
 pub fn channel(h: &Host, a: Args) -> anyhow::Result<()> {
     match &a.rest()?[..] {
-        [add, kind] if add == "add" && (kind == "discord" || kind == "imessage") => {
+        [add, kind] if add == "add" && CHANNELS.contains(&kind.as_str()) => {
             let before = h.published().unwrap_or_default();
             channel_add(h, kind)?;
             h.apply_published(&before)?;
-            run(&mut h.exec(&[], &[], &["zephyr", "doctor"]))
+            // doctor's verdict is printed; a channel still connecting is no reason to stop.
+            let _ = run(&mut h.exec(&[], &[], &["zephyr", "doctor"]));
+            match PAIRED.contains(&kind.as_str()) {
+                true => pair(h, kind),
+                false => Ok(()),
+            }
         }
-        [rm, kind] if rm == "remove" && (kind == "discord" || kind == "imessage") => {
+        [rm, kind] if rm == "remove" && CHANNELS.contains(&kind.as_str()) => {
             channel_remove(h, kind)
         }
         [list] if list == "list" => channel_list(h),
-        _ => bail!("usage: zephyr channel add|remove discord|imessage | list"),
+        // The daemon's signal-cli holds the account, so the trust goes through it (DESIGN §4.3).
+        [signal, trust, aci] if signal == "signal" && trust == "trust" => {
+            h.need_running()?;
+            run(&mut h.exec(&[], &[], &["zephyr", "signal-setup", "trust", aci]))
+        }
+        _ => bail!("{CHANNEL_USAGE}"),
     }
 }
 
 /// `chat`, then each configured channel, with its owners.
 fn channel_list(h: &Host) -> anyhow::Result<()> {
     let doc = h.data.load()?;
-    for kind in ["chat", "discord", "imessage"] {
+    for kind in ["chat"].into_iter().chain(CHANNELS) {
         if kind == "chat" || doc.get(kind).is_some() {
             let owners = conf::get(&doc, &format!("owners.{kind}")).unwrap_or_default();
             println!("{kind:<9}owners: {owners}");
@@ -725,16 +754,31 @@ fn channel_remove(h: &Host, kind: &str) -> anyhow::Result<()> {
     // Config first: a daemon reloading between the writes must not see a secret gone while its
     // channel is still configured.
     h.data.save(&doc)?;
-    let secrets: &[&str] = if kind == "discord" {
-        &["ZEPHYR_DISCORD_TOKEN"]
-    } else {
-        &["ZEPHYR_BB_PASSWORD", "ZEPHYR_BB_SECRET"]
+    let secrets: &[&str] = match kind {
+        "discord" => &["ZEPHYR_DISCORD_TOKEN"],
+        "imessage" => &["ZEPHYR_BB_PASSWORD", "ZEPHYR_BB_SECRET"],
+        "telegram" => &["ZEPHYR_TELEGRAM_TOKEN"],
+        _ => &[],
     };
     for key in secrets {
         h.data.unset_secret(key)?;
     }
     println!("removed {kind}");
-    h.apply_published(&before)
+    h.apply_published(&before)?;
+    if kind == "signal" {
+        // After the reload: signal-cli waits for the daemon's child to let the account go.
+        if !h.running() {
+            println!(
+                "the Signal account's keys stay in {}/signal until you run `zephyr up` and then \
+                 `docker exec {} zephyr signal-setup remove`",
+                h.data.daemon.display(),
+                h.container
+            );
+            return Ok(());
+        }
+        run(&mut h.exec(&[], &[], &["zephyr", "signal-setup", "remove"]))?;
+    }
+    Ok(())
 }
 
 /// `zephyr skill add DIR | list | rm NAME`, carried out by the container's `zephyr skill`
@@ -1223,7 +1267,16 @@ fn channel_add(h: &Host, kind: &str) -> anyhow::Result<()> {
         let items: Vec<String> = v.split(',').map(|s| format!("{:?}", s.trim())).collect();
         format!("[{}]", items.join(", "))
     };
-    let sets = if kind == "discord" {
+    let sets = if kind == "telegram" {
+        println!(
+            "Make a bot of zephyr's own with @BotFather in Telegram (/newbot), then send it \
+             /setjoingroups and choose Disable, so no one can add it to a group."
+        );
+        hidden("Telegram bot token (hidden)", "ZEPHYR_TELEGRAM_TOKEN")?;
+        vec![("telegram.token_env", "ZEPHYR_TELEGRAM_TOKEN".to_string())]
+    } else if kind == "signal" {
+        signal_add(h, &ask)?
+    } else if kind == "discord" {
         let owner = ask(
             "Your Discord user id (Developer Mode, Copy User ID)",
             "owners.discord",
@@ -1297,6 +1350,56 @@ fn imessage_forward(h: &Host) -> anyhow::Result<()> {
         println!("{e:#}");
     }
     Ok(())
+}
+
+/// `channel add signal`: registers or links zephyr's own number in the container, where root's
+/// signal-cli keeps its keys (`zephyr signal-setup`), and returns the config to write.
+fn signal_add(
+    h: &Host,
+    ask: &dyn Fn(&str, &str) -> anyhow::Result<String>,
+) -> anyhow::Result<Vec<(&'static str, String)>> {
+    h.need_running()?;
+    if !super::quiet(h.exec(&[], &[], &["test", "-d", "/opt/zephyr/signal"])) {
+        bail!("signal: not in this image (built with SIGNAL=0)");
+    }
+    println!(
+        "Zephyr needs a Signal number of its own: a second SIM or eSIM, or a VoIP or landline \
+         number. Never your own Signal account: a device linked to it receives every \
+         conversation you have, and its keys speak as you to all of your contacts."
+    );
+    let ways = [
+        "register a number zephyr will own (recommended)",
+        "link to an account on a spare phone",
+    ];
+    let link = Select::new()
+        .with_prompt("Signal")
+        .items(ways)
+        .default(0)
+        .interact()?
+        == 1;
+    let number = ask(
+        "Zephyr's Signal number, with its country code (+82…)",
+        "signal.account",
+    )?;
+    let number = number.trim().to_string();
+    if !number.starts_with('+') || !number[1..].bytes().all(|b| b.is_ascii_digit()) {
+        bail!("{number}: want the number as +<country code><number>, digits only");
+    }
+    let mut argv = vec!["zephyr", "signal-setup"];
+    if link {
+        argv.push("link");
+    } else {
+        argv.extend(["register", number.as_str()]);
+        if Confirm::new()
+            .with_prompt("Verify by a voice call instead of SMS (a VoIP or landline number)?")
+            .default(false)
+            .interact()?
+        {
+            argv.push("--voice");
+        }
+    }
+    run(&mut h.exec(&["-it"], &[], &argv))?;
+    Ok(vec![("signal.account", format!("{number:?}"))])
 }
 
 const TOKEN_PREFIX: &[u8] = b"sk-ant-oat01-";

@@ -142,7 +142,8 @@ wrong](#when-something-goes-wrong) and `zephyr uninstall [--keep-data]`.
 | `zephyr login <provider> [--account NAME]` | Sign in an account, then make a small test call (`--no-verify` skips it) |
 | `zephyr accounts [list \| order NAME.. \| remove NAME]` | The failover pool |
 | `zephyr model [--account NAME] [PROVIDER/MODEL]` | An account's model (or the default without accounts); with no model, pick from `rpi --list-models` |
-| `zephyr channel add\|remove discord\|imessage \| list` | Channel settings (secrets are asked for hidden); `remove` drops the channel, its owners and secrets, `list` shows them. Discord shows typing while the agent works, and a progress note after 20 s (`discord.progress`, `discord.progress_after_secs`) |
+| `zephyr channel add\|remove discord\|imessage\|telegram\|signal \| list` | Channel settings (secrets are asked for hidden); `remove` drops the channel, its owners and secrets, `list` shows them. Discord and Telegram show typing while the agent works, and a progress note after 20 s (`discord.progress`, `discord.progress_after_secs`, the same keys under `[telegram]`). `add telegram` asks for the bot token from @BotFather and `add signal` registers or links zephyr's own number in the container; both then ask the daemon for a `/pair` code and print it, which you send from your own Telegram or Signal account. `remove signal` also unregisters the number and deletes its keys |
+| `zephyr channel signal trust ACI` | After an owner's Signal safety number changed (a new phone) and you compared it: signal-cli sends to them again |
 | `zephyr web setup [--yes]` / `web enrol [NAME]` | Put the [web app](#web-app) behind `tailscale serve` and add a first device; later, a one-time code for another device |
 | `zephyr skill add DIR \| list \| rm NAME` | Skills the agent may use (see [Skills and connectors](#skills-and-connectors)); one you add is approved at once |
 | `zephyr mcp add NAME (--url URL [--header K=V].. \| -- CMD ARGS..) [--secret NAME].. [--host HOST].. [--plain] \| list \| rm NAME` | Connectors (MCP servers); each `--secret` is asked for hidden and fills in `${NAME}`; `--host` names where a secret is sent, `--plain` hands the connector the real one |
@@ -980,7 +981,7 @@ backup made by the version you start, or start a newer one.
 **A token leaked.** Rotate it where it was issued, then:
 - the attach token: `sudo rm ~/.zephyr-daemon/tui.token`, then `zephyr doctor --fix` writes a new one
   and `zephyr restart` applies it;
-- Discord or BlueBubbles: `zephyr channel add discord|imessage` asks for the new secret;
+- Discord, BlueBubbles or Telegram: `zephyr channel add discord|imessage|telegram` asks for the new secret;
 - a provider account: `zephyr login <provider> --account NAME`;
 - a vault entry: `zephyr vault edit NAME` (grants are kept);
 - a connector's secret: edit `secrets.env` through `zephyr config` or `sudo`, then `zephyr reload`.
