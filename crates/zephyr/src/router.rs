@@ -244,6 +244,8 @@ fn retry_window(channel: &str) -> i64 {
         "discord" => 5 * 60,
         // tempGuid dedupes only while a send is in flight, and a timed-out send may duplicate. Accept at-least-once.
         "imessage" => 5 * 60,
+        // No nonce: the adapter remembers the pieces it sent, for as long as this.
+        "telegram" => 5 * 60,
         _ => 60 * 60,
     }
 }

@@ -229,6 +229,12 @@ async fn run(mut cfg: Config, from_file: &[String]) -> anyhow::Result<()> {
             imessage,
         )?));
     }
+    if let Some(telegram) = &cfg.telegram {
+        channels.push(AnyChannel::Telegram(zephyr::telegram::Telegram::new(
+            telegram,
+            &cfg.telegram_api,
+        )?));
+    }
     let shutdown = async {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("SIGTERM handler");
@@ -599,6 +605,19 @@ async fn doctor(cfg: &Config) -> anyhow::Result<()> {
     if let Some(d) = &cfg.discord {
         let label = format!("env {} is set (discord token)", d.token_env);
         ok &= check(&label, env_set(&d.token_env));
+    }
+    if let Some(t) = &cfg.telegram {
+        let label = format!("env {} is set (telegram token)", t.token_env);
+        ok &= check(&label, env_set(&t.token_env));
+        let me = async {
+            zephyr::telegram::Telegram::new(t, &cfg.telegram_api)?
+                .me()
+                .await
+        };
+        ok &= match me.await {
+            Ok(name) => check(&format!("telegram bot {name} answers getMe"), true),
+            Err(e) => check(&format!("telegram getMe: {e:#}"), false),
+        };
     }
     if let Some(im) = &cfg.imessage {
         let label = format!("env {} is set (imessage password)", im.password_env);

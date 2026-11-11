@@ -1,7 +1,7 @@
 # Zephyr
 
 An always-on personal agent gateway over upstream `rpi --mode rpc`, running in one Docker container.
-It talks to you through its own terminal UI (or the stock rpi TUI), a line chat, Discord and iMessage. See [DESIGN.md](DESIGN.md).
+It talks to you through its own terminal UI (or the stock rpi TUI), a line chat, Discord, iMessage, Telegram and Signal. See [DESIGN.md](DESIGN.md).
 
 ## Quick start
 
@@ -257,7 +257,7 @@ Changes apply by themselves; nothing needs `zephyr restart`. The commands above,
 | Budget, owners, time zone, `[auth]`, `[tasks]`, the pool order | at once |
 | The model, on the same provider | at once, or after the reply in progress (rpi's `set_model`) |
 | A model on another provider, the active account, extensions, connectors (`[[mcp]]`), subagents (`[[subagent]]`), a re-login | the agent restarts after the reply in progress; the conversation carries on |
-| Discord, iMessage, `[attach]`, `[web]`, `[agent]`, a secret | the daemon restarts itself in place once idle; waiting messages are kept |
+| Discord, iMessage, Telegram, Signal, `[attach]`, `[web]`, `[agent]`, a secret | the daemon restarts itself in place once idle; waiting messages are kept |
 | The attach port, the iMessage webhook's port | `zephyr config set` and `zephyr channel` start the container again to publish it; after a hand edit you are told, a minute later, to run `zephyr up` |
 
 A file that does not load is not applied, and the daemon keeps its current settings.
@@ -271,7 +271,7 @@ goes back by itself and you are told. The agent can read all of them. What it ma
 |---|---|
 | `tasks.parallel`, `mcp.NAME.enabled` (a connector off), `settings.strong_channels` (remove a channel), the `budget.*` limits, the `approvals.*` modes and preset, `approvals.strong_only` (add `money`), `mcp.NAME.classes.TOOL` (put a tool in a class) | make it stricter at once (lower, off, fewer channels, a limit where there was none, a stricter mode or preset); you are told and `/set KEY OLD` puts it back. Its `/set` takes one word, so it can tighten approvals to `ask` but not to `delay 10` |
 | `model`, `thinking`, `tasks.model`, `timezone`, `auth.*`, `approvals.currency`, `network.allow`, subagents, rules, removing a private fact or allowing it a target, and any change of the above that loosens | propose it: a card shows `KEY old → new` (or the exact `/subagent` or `/rule` text, up to 1500 characters), and `/ok N` applies it, `/no N` drops it |
-| `owners`, `[discord]`, `[imessage]`, `[attach]`, `[web]`, `[agent]`, `extensions`, `policy_plugin`, `rpi`, `home`, `state`, the `[[account]]` pool | nothing; edit `zephyr.toml` |
+| `owners`, `[discord]`, `[imessage]`, `[telegram]`, `[signal]`, `[attach]`, `[web]`, `[agent]`, `extensions`, `policy_plugin`, `rpi`, `home`, `state`, the `[[account]]` pool | nothing; edit `zephyr.toml` |
 
 The agent may also save a new private fact at once (it only makes the check stricter); you are told
 its name, and `/facts rm NAME` removes it.
@@ -606,14 +606,39 @@ Home Screen app and on Android Chrome (a real browser is not part of the tests):
 notification, swipe one away on Android (it is denied), and `/web rm` from another channel
 signs the phone out. The browser's console must show no Content-Security-Policy errors.
 
+## Telegram
+
+Zephyr can be a Telegram bot that talks to you in a private chat. Make a bot of zephyr's own with
+@BotFather (`/newbot`), and send it `/setjoingroups` → Disable, so nobody can add it to a group (if
+one does, it leaves at once). Then `zephyr channel add telegram` asks for the token (hidden, into
+`secrets.env`), writes the table and prints a pairing code: send `/pair CODE` to the bot from your
+own Telegram account within 10 minutes, and you are its owner. A code is good once; ask for another
+with `/pair telegram` in `zephyr chat` or `zephyr attach`. Every owner channel is told who paired,
+and `/unpair telegram ID` takes it back. Anyone else who messages the bot gets no answer, and their
+files are never fetched.
+
+```toml
+[telegram]
+token_env = "ZEPHYR_TELEGRAM_TOKEN"   # the variable in secrets.env that holds the bot token
+# progress = true                     # as [discord]: typing, and a progress note after 20 s
+# progress_after_secs = 20
+
+[owners]
+telegram = ["123456789"]              # Telegram user ids, written by /pair; never a name
+```
+
+`zephyr doctor` checks that the bot answers. Replies are plain text: Markdown shows as typed. A
+message you edit or delete after sending is not seen; send it again. One bot token serves one
+zephyr: a second one polling the same bot (a side container) waits until the first stops.
+
 ## Sending the agent files
 
-Images and files you send on Discord or iMessage are saved for the agent in `~/.zephyr/inbox/`
-(`/zephyr/inbox/` in the container), and your message tells it each file's path; it opens images
-with `read`. A message with only a photo works. Up to 10 files a message, 25 MB each: anything
-beyond is listed but not downloaded. Only owners' files are downloaded. iPhone photos arrive as
-JPEG (BlueBubbles converts HEIC). A voice note is saved as a file; nothing transcribes it. Files
-are deleted after 30 days.
+Images and files you send on Discord, iMessage or Telegram are saved for the agent in
+`~/.zephyr/inbox/` (`/zephyr/inbox/` in the container), and your message tells it each file's path;
+it opens images with `read`. A message with only a photo works. Up to 10 files a message, 25 MB
+each (20 MB on Telegram, its limit for bots): anything beyond is listed but not downloaded. Only
+owners' files are downloaded. iPhone photos arrive as JPEG (BlueBubbles converts HEIC). A voice
+note is saved as a file; nothing transcribes it. Files are deleted after 30 days.
 
 ## Limits
 

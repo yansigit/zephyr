@@ -97,6 +97,7 @@ pub enum AnyChannel {
     Chat(crate::chat::ChatChannel),
     Discord(crate::discord::Discord),
     IMessage(crate::imessage::IMessage),
+    Telegram(crate::telegram::Telegram),
 }
 
 impl Channel for AnyChannel {
@@ -105,6 +106,7 @@ impl Channel for AnyChannel {
             Self::Chat(c) => c.name(),
             Self::Discord(c) => c.name(),
             Self::IMessage(c) => c.name(),
+            Self::Telegram(c) => c.name(),
         }
     }
     async fn run(&self, tx: tokio::sync::mpsc::Sender<Inbound>) -> anyhow::Result<()> {
@@ -112,6 +114,7 @@ impl Channel for AnyChannel {
             Self::Chat(c) => c.run(tx).await,
             Self::Discord(c) => c.run(tx).await,
             Self::IMessage(c) => c.run(tx).await,
+            Self::Telegram(c) => c.run(tx).await,
         }
     }
     async fn send(&self, msg: &Outbound) -> anyhow::Result<()> {
@@ -119,6 +122,7 @@ impl Channel for AnyChannel {
             Self::Chat(c) => c.send(msg).await,
             Self::Discord(c) => c.send(msg).await,
             Self::IMessage(c) => c.send(msg).await,
+            Self::Telegram(c) => c.send(msg).await,
         }
     }
     async fn activity(&self, to: &str, a: &Activity) -> anyhow::Result<()> {
@@ -126,6 +130,7 @@ impl Channel for AnyChannel {
             Self::Chat(c) => c.activity(to, a).await,
             Self::Discord(c) => c.activity(to, a).await,
             Self::IMessage(c) => c.activity(to, a).await,
+            Self::Telegram(c) => c.activity(to, a).await,
         }
     }
     fn live(&self, cfg: tokio::sync::watch::Receiver<std::sync::Arc<crate::config::Config>>) {
@@ -133,6 +138,15 @@ impl Channel for AnyChannel {
             Self::Chat(c) => c.live(cfg),
             Self::Discord(c) => c.live(cfg),
             Self::IMessage(c) => c.live(cfg),
+            Self::Telegram(c) => c.live(cfg),
+        }
+    }
+    fn known_as(&self, sender: &str) -> Option<String> {
+        match self {
+            Self::Chat(c) => c.known_as(sender),
+            Self::Discord(c) => c.known_as(sender),
+            Self::IMessage(c) => c.known_as(sender),
+            Self::Telegram(c) => c.known_as(sender),
         }
     }
 }
