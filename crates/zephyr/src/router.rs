@@ -1558,21 +1558,23 @@ impl<'a> Router<'a> {
                     None => Err(format!("no setting {key}; /settings lists them")),
                 });
             }
-            AttachRequest::WebNotice(text) => {
-                // An attached owner is shown the row by the flush, with every other client
-                // (a web row waits for a socket); anyone else gets a row, and the clients see
-                // it now.
-                let last = self.store.last_owner().ok().flatten();
-                if !last
-                    .as_ref()
-                    .is_some_and(|(c, _)| crate::attach::attached(c))
-                {
-                    self.show(&text, None, None);
-                }
-                if let Some((channel, to)) = last {
-                    log(self.store.notify(&channel, &to, &text).map_err(Into::into));
-                }
-            }
+            AttachRequest::WebNotice(text) => self.notice(&text),
+        }
+    }
+
+    /// A notice of the daemon's own for every attached client and the owner last answered. An
+    /// attached owner is shown the row by the flush, with every other client (a web row waits
+    /// for a socket); anyone else gets a row, and the clients see it now.
+    fn notice(&mut self, text: &str) {
+        let last = self.store.last_owner().ok().flatten();
+        if !last
+            .as_ref()
+            .is_some_and(|(c, _)| crate::attach::attached(c))
+        {
+            self.show(text, None, None);
+        }
+        if let Some((channel, to)) = last {
+            log(self.store.notify(&channel, &to, text).map_err(Into::into));
         }
     }
 
@@ -5147,7 +5149,16 @@ impl<'a> Router<'a> {
                 self.steer_note(note).await;
             }
             Event::Took(_) => {}
-            Event::Gave { since, until } => {
+            Event::Gave {
+                since,
+                until,
+                restart,
+            } => {
+                if restart {
+                    self.notice(
+                        "[zephyr] the desktop went back to the agent when zephyr restarted",
+                    );
+                }
                 let note = format!(
                     "[zephyr] the owner used the desktop from {} to {}. The page may have \
                      changed: take a fresh snapshot before acting.",

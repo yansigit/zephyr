@@ -3144,6 +3144,37 @@ async fn main_is_told_at_take_and_at_hand_back_and_stays_clean() {
     gw.shutdown().await;
 }
 
+/// A restart or a re-exec ends a takeover: the owner and main are told, never left guessing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restart_during_a_takeover_tells_the_owner_and_main() {
+    let home = new_home("desk-restart");
+    let gw = start_in(&home, free_port(), "", |_| {});
+    gw.up().await;
+    gw.say("chat", "one").await;
+    gw.sent("chat", |t| t.contains("echo: ")).await;
+    let flag = gw.held_flag();
+    gw.shutdown().await;
+    // The daemon went down while the owner held the desktop: the flag is still there.
+    std::fs::write(&flag, "50400\n").unwrap();
+    let gw = start_in(&home, free_port(), "", |_| {});
+    gw.sent("chat", |t| {
+        t == "[zephyr] the desktop went back to the agent when zephyr restarted"
+    })
+    .await;
+    assert!(!flag.exists());
+    gw.say("chat", "two").await;
+    gw.sent("chat", |t| t.contains("echo: ")).await;
+    let notes = gw.rpi_log("queue_message");
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    let note = notes[0]["message"].as_str().unwrap();
+    assert!(
+        note.starts_with("[zephyr] the owner used the desktop from ")
+            && note.ends_with(". The page may have changed: take a fresh snapshot before acting."),
+        "{note}"
+    );
+    gw.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fill_during_a_takeover_is_refused() {
     let (gw, phone, mut ws, _) = with_desktop("desk-fill", |_| {}).await;

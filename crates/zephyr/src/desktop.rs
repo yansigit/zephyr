@@ -188,10 +188,12 @@ pub struct Control {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Took(Held),
-    /// Handed back, by the owner or by itself: held from `since` to `until`.
+    /// Handed back, by the owner or by itself: held from `since` to `until`. `restart`: the
+    /// daemon started and found the flag of a takeover that a restart or a crash ended.
     Gave {
         since: i64,
         until: i64,
+        restart: bool,
     },
 }
 
@@ -205,8 +207,9 @@ impl Drop for Fill {
 }
 
 impl Control {
-    /// Nobody holds the desktop at a start: a flag a crash left is removed. The wrappers that
-    /// waited on the old daemon's socket have already exited 1.
+    /// Nobody holds the desktop at a start: a flag a crash, a restart or a re-exec left is
+    /// removed, and that takeover is over, which the first event says (its start is the flag's).
+    /// The wrappers that waited on the old daemon's socket have already exited 1.
     pub fn new(cfg: &Config) -> Arc<Control> {
         let (events, taken) = mpsc::unbounded_channel();
         let control = Control {
@@ -216,6 +219,14 @@ impl Control {
             events,
             taken: Mutex::new(Some(taken)),
         };
+        if let Ok(left) = std::fs::read_to_string(control.flag()) {
+            let until = crate::now();
+            let _ = control.events.send(Event::Gave {
+                since: left.trim().parse().unwrap_or(until),
+                until,
+                restart: true,
+            });
+        }
         let _ = std::fs::remove_file(control.flag());
         Arc::new(control)
     }
@@ -285,6 +296,7 @@ impl Control {
         let _ = self.events.send(Event::Gave {
             since: held.since,
             until: now,
+            restart: false,
         });
         Some((held.since, now))
     }
@@ -482,12 +494,14 @@ mod tests {
                 Event::Took(held(100, [1; 32])),
                 Event::Gave {
                     since: 100,
-                    until: 160
+                    until: 160,
+                    restart: false
                 },
                 Event::Took(held(170, [2; 32])),
                 Event::Gave {
                     since: 170,
-                    until: 180
+                    until: 180,
+                    restart: false
                 },
             ]
         );
@@ -502,6 +516,21 @@ mod tests {
         // The daemon crashed and starts again.
         let again = Control::new(&cfg);
         assert!(again.held().is_none() && !flag(&cfg).exists());
+        // That takeover is over, and whoever listens is told since when it ran.
+        let told = again.events().try_recv();
+        assert!(
+            matches!(
+                told,
+                Ok(Event::Gave {
+                    since: 100,
+                    restart: true,
+                    ..
+                })
+            ),
+            "{told:?}"
+        );
+        // A clean start says nothing.
+        assert!(Control::new(&cfg).events().try_recv().is_err());
         let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&cfg));
     }
 

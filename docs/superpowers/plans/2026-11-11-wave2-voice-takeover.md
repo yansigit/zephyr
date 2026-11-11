@@ -311,6 +311,7 @@ Every constraint in the wave index and in `2026-11-10-wave1.md` applies (commit 
 - Deviation: the idle and cap tests are named `an_idle_takeover_gives_the_desktop_back` and `a_takeover_ends_at_its_cap`, and their arithmetic is `vnc::the_desktop_goes_back_after_no_input_the_cap_or_a_closed_socket`. Added: `without_a_desktop_there_is_nothing_to_take`, the cross-signature checks in `take_over_needs_a_passkey_signature_and_give_does_not`, the TUI's `-32601` in `tests/attach.rs`, and `desktop::doctor_names_what_the_takeover_lacks`.
 - Deviation: `procs.rs` needed no change: x11vnc is the daemon's own child, which `strays` already spares; its test has a row for it. doctor's `desktop` line is a warning, like the block it is in, so an image without the `xdotool` link (before C2-9) does not fail doctor.
 - Deviation: README gets only the doctor line here; "Take over the desktop" comes with the screen in C2-8.
+- Review fix: a start that finds `desktop-held` no longer ends that takeover silently: `Control::new` queues a hand back from the flag's start time (`Event::Gave`, `restart`), the owner is told `[zephyr] the desktop went back to the agent when zephyr restarted`, and main's note waits for its next prompt.
 
 ### Task C2-8: The Desktop screen and noVNC in the app
 
