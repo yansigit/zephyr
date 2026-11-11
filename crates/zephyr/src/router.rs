@@ -736,7 +736,10 @@ impl<'a> Router<'a> {
                     self.procs.yield_all();
                     log(self.dispatch_new().await)
                 }
-                _ = tokio::time::sleep_until(self.auth_at), if (self.child.is_some() || !self.cfg.accounts.is_empty()) && self.cfg.auth.enabled => {
+                // Never during a run: the check waits on the child and on a refresh's
+                // subprocess, which would hold every event of the run (its typing and progress
+                // note too), and a refreshed token binds only at an idle restart anyway.
+                _ = tokio::time::sleep_until(self.auth_at), if !self.busy && (self.child.is_some() || !self.cfg.accounts.is_empty()) && self.cfg.auth.enabled => {
                     self.auth_check().await
                 }
                 ev = next_event(&mut self.child) => match self.tapped(ev).await {
