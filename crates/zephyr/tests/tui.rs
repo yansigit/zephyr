@@ -391,6 +391,7 @@ async fn serve(listener: TcpListener, scene: &'static str, sent: mpsc::Unbounded
                     "zephyr.vault_put" => json!({"entries": [{
                         "kind": req["params"]["kind"], "name": req["params"]["name"],
                         "granted": false, "programs": [],
+                        "hosts": req["params"]["hosts"],
                     }]}),
                     "zephyr.turns" => json!({"turns": [
                         {"channel": "tui", "text": "what's in ~/Projects/zephyr/deploy?"},
@@ -1055,8 +1056,12 @@ async fn saving_a_vault_entry_shows_its_card_without_the_value() {
     screen.keys(&["=/vault add token GH_TOKEN", "Enter"]);
     screen.wait_for("value").await;
     screen.keys(&["=hunter2", "Enter"]);
+    // Where it is sent is the form's last field (DESIGN §4.21).
+    screen.wait_for("hosts").await;
+    screen.keys(&["=api.github.com", "Enter"]);
     let card = screen.wait_for("saved the token GH_TOKEN").await;
     assert!(card.contains("each program needs your OK once"), "{card}");
+    assert!(card.contains("sent only to api.github.com"), "{card}");
     assert!(
         card.contains("the agent was told it can use it now"),
         "{card}"

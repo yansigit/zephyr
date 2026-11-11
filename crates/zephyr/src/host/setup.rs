@@ -943,8 +943,9 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
     h.apply()
 }
 
-/// `zephyr vault list | add login NAME --site URL [--user U] [--totp] | add token NAME |
-/// edit NAME [--site URL] [--user U] [--totp] | rm NAME | revoke NAME [PROGRAM]`: `vault.toml`,
+/// `zephyr vault list | add login NAME --site URL [--user U] [--totp] | add token NAME
+/// [--host HOST].. | edit NAME [--site URL] [--user U] [--totp] [--host HOST].. | rm NAME |
+/// revoke NAME [PROGRAM]`: `vault.toml`,
 /// one of the daemon's files (DESIGN §4.15), which the daemon reads on every use. Values are
 /// asked at hidden prompts, or read one per line from stdin when it is not a terminal; never
 /// taken as arguments. Grants are only the owner's `/ok` or `/vault grant` in a chat. A save here
@@ -954,10 +955,13 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let site = a.value("--site")?;
     let user = a.value("--user")?;
     let totp = a.flag("--totp");
+    // The hosts a token is sent to (DESIGN §4.21): the owner's own surface, so they are taken
+    // here as `/vault bind` takes them.
+    let mut hosts = a.values("--host")?;
     let rest = a.rest()?;
     let usage = "usage: zephyr vault list | add login NAME --site URL [--user U] [--totp] | \
-                 add token NAME | edit NAME [--site URL] [--user U] [--totp] | rm NAME | \
-                 revoke NAME [PROGRAM]";
+                 add token NAME [--host HOST].. | edit NAME [--site URL] [--user U] [--totp] \
+                 [--host HOST].. | rm NAME | revoke NAME [PROGRAM]";
     let text = match h.data.read(crate::vault::FILE) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         r => r?,
@@ -1001,13 +1005,39 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
         }
         ["add", "token", name] => {
             let value = secret(name)?;
+            if hosts.is_empty() && h.interactive {
+                let asked: String = dialoguer::Input::new()
+                    .with_prompt(format!(
+                        "hosts {name} is sent to, e.g. api.github.com github.com (empty: bind it later)"
+                    ))
+                    .allow_empty(true)
+                    .interact_text()?;
+                hosts = asked
+                    .split([' ', ','])
+                    .filter(|h| !h.is_empty())
+                    .map(String::from)
+                    .collect();
+            }
             vault.put(Entry {
                 kind: Kind::Token,
                 name: name.into(),
                 value,
+                hosts,
                 ..Entry::default()
             })?;
-            format!("saved the token {name}; the agent asks you before each new program uses it")
+            let sent = match vault
+                .get(name)
+                .map(|e| e.hosts)
+                .unwrap_or_default()
+                .as_slice()
+            {
+                [] => format!("it is bound to no host yet: /vault bind {name} HOST.. in a chat"),
+                bound => {
+                    let bound: Vec<&str> = bound.iter().map(|h| crate::vault::shown(h)).collect();
+                    format!("it is sent only to {}", bound.join(", "))
+                }
+            };
+            format!("saved the token {name}; {sent}; the agent asks you before each new program uses it")
         }
         ["edit", name] => {
             let mut e = vault
@@ -1024,7 +1054,11 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
                         false => String::new(),
                     };
                 }
-                Kind::Token => e.value = secret("new value, empty keeps it")?,
+                Kind::Token => {
+                    e.value = secret("new value, empty keeps it")?;
+                    // None given keeps the ones saved.
+                    e.hosts = hosts;
+                }
             }
             vault.put(e)?;
             format!("saved {name}")

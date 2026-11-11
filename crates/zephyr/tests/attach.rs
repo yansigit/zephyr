@@ -943,6 +943,27 @@ async fn zephyr_vault_methods_save_list_and_remove_without_echoing_a_value() {
     let refused = c.call("zephyr.vault_put", odd).await;
     assert!(!refused.to_string().contains(PASSWORD), "{refused}");
 
+    // A token's hosts are taken from the owner's form (DESIGN §4.21), normalized; `url` and
+    // `raw` are `/vault`'s alone, and a wildcard saves nothing.
+    let token = json!({"kind": "token", "name": "API_KEY", "value": PASSWORD,
+                       "hosts": ["API.example.com"], "url": true, "raw": true});
+    let put = c.call("zephyr.vault_put", token).await;
+    let entries = put["result"]["entries"].as_array().expect("entries");
+    let saved = entries
+        .iter()
+        .find(|e| e["name"] == "API_KEY")
+        .expect("saved");
+    assert_eq!(saved["hosts"], json!(["api.example.com:443"]), "{put}");
+    assert_eq!(
+        (&saved["url"], &saved["raw"]),
+        (&json!(false), &json!(false))
+    );
+    let wild = json!({"kind": "token", "name": "WILD", "value": PASSWORD,
+                      "hosts": ["*.example.com"]});
+    let refused = c.call("zephyr.vault_put", wild).await;
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    c.call("zephyr.vault_rm", json!({"name": "API_KEY"})).await;
+
     let gone = c.call("zephyr.vault_rm", json!({"name": "github"})).await;
     assert_eq!(gone["result"]["entries"], json!([]), "{gone}");
     let again = c.call("zephyr.vault_rm", json!({"name": "github"})).await;

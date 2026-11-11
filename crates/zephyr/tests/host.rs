@@ -3144,6 +3144,51 @@ fn vault_add_list_and_rm_reach_roots_file_and_never_put_a_value_in_argv() {
         assert!(!output.contains(value), "{value} printed");
     }
 
+    // A token's hosts are taken where the owner saves it (DESIGN §4.21), normalized; a wildcard
+    // saves nothing; a new value keeps them.
+    let add = [
+        "vault",
+        "add",
+        "token",
+        "API_KEY",
+        "--host",
+        "API.example.com",
+    ];
+    let out = env.zephyr_input(
+        &[&add[..], &["--host", "example.com:8443"]].concat(),
+        "k-123456\n",
+    );
+    let said = stdout(&out);
+    assert!(
+        said.contains("it is sent only to api.example.com, example.com:8443"),
+        "{said}"
+    );
+    let saved = std::fs::read_to_string(files.join("vault.toml")).unwrap();
+    assert!(
+        saved.contains("hosts = [\"api.example.com:443\", \"example.com:8443\"]"),
+        "{saved}"
+    );
+    let wild = ["vault", "add", "token", "WILD", "--host", "*.example.com"];
+    assert!(!env.zephyr_input(&wild, "k-123456\n").status.success());
+    assert!(!std::fs::read_to_string(files.join("vault.toml"))
+        .unwrap()
+        .contains("WILD"));
+    assert!(env
+        .zephyr_input(&["vault", "edit", "API_KEY"], "k-rotated\n")
+        .status
+        .success());
+    let saved = std::fs::read_to_string(files.join("vault.toml")).unwrap();
+    assert!(
+        saved.contains("k-rotated") && saved.contains("example.com:8443"),
+        "{saved}"
+    );
+    let list = env.ok(&["vault", "list"]);
+    assert!(list.contains("token API_KEY: not allowed for any program yet; sent only to api.example.com, example.com:8443"), "{list}");
+    assert!(
+        list.contains("token GH_TOKEN: not allowed for any program yet; bound to no host yet"),
+        "{list}"
+    );
+
     // A value never goes in an argument, and a bad one names only the problem.
     assert!(!env
         .zephyr(&["vault", "add", "token", "GH_TOKEN", TOKEN])

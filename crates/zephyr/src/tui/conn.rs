@@ -98,9 +98,22 @@ pub struct VaultEntry {
     pub totp: bool,
     pub granted: bool,
     pub programs: Vec<String>,
+    /// The `host:port`s a token is sent to (DESIGN §4.21), and whether it is handed out raw.
+    pub hosts: Vec<String>,
+    pub raw: bool,
 }
 
 impl VaultEntry {
+    /// Where a token goes, in a few words.
+    pub fn sent(&self) -> String {
+        let hosts: Vec<&str> = self.hosts.iter().map(|h| crate::vault::shown(h)).collect();
+        match (self.raw, hosts.is_empty()) {
+            (true, _) => "handed out as its real value (raw)".into(),
+            (false, true) => format!("bound to no host yet: /vault bind {} HOST..", self.name),
+            (false, false) => format!("sent only to {}", hosts.join(", ")),
+        }
+    }
+
     /// The card shown once the owner saves this entry: what was saved and what it may do, never
     /// a value. `updated`: the name was already in the vault, so the agent was not told.
     pub fn saved(&self, updated: bool) -> String {
@@ -123,6 +136,7 @@ impl VaultEntry {
                 [] => "use   each program needs your OK once".into(),
                 p => format!("use   allowed for {}", p.join(", ")),
             });
+            rows.push(format!("host  {}", self.sent()));
         }
         if !updated {
             rows.push("the agent was told it can use it now".into());
@@ -1376,7 +1390,19 @@ mod tests {
         };
         assert_eq!(
             token.saved(true),
-            "updated the token GH_TOKEN\nuse   allowed for gh"
+            "updated the token GH_TOKEN\nuse   allowed for gh\n\
+             host  bound to no host yet: /vault bind GH_TOKEN HOST.."
         );
+        let bound = VaultEntry {
+            hosts: vec!["api.github.com:443".into(), "x.test:8443".into()],
+            ..token.clone()
+        };
+        assert!(bound
+            .saved(true)
+            .ends_with("\nhost  sent only to api.github.com, x.test:8443"));
+        let raw = VaultEntry { raw: true, ..bound };
+        assert!(raw
+            .saved(true)
+            .ends_with("\nhost  handed out as its real value (raw)"));
     }
 }
