@@ -824,8 +824,13 @@ What it protects against: credentials stay out of chats, transcripts and the mod
 normal use; a login is filled only on its own site; and each new use needs your OK. What it does
 not: an agent set on misusing a login, or a token you marked `raw`, can still read it (a filled
 field read back, its own command's log under `.procs/`, a program that prints its environment to
-a file). A bound token it cannot read; it can still use it on the hosts you bound, and a host
-that sends back what it was sent (an echo or debug endpoint) shows it the token in the reply. So
+a file; what a command prints is scrubbed from its log, what it writes to a file of its own is
+not). A bound token it cannot read: if the host sends the token back (an echo or debug endpoint,
+an error page), zephyr turns it into the stand-in again before the agent's program sees the
+reply, and what a command prints reaches its log already scrubbed. What is left: a host that
+sends the token back in another form (base64, escaped) or in a websocket message is not caught;
+a bound host that compresses its replies even when asked not to cannot be used (the request
+fails, nothing leaks); and the agent can still *use* a bound token on the hosts you bound. So
 bind a token only to the API it is for, and grant it only to programs you trust with it.
 
 **Mail.** There is no mail channel, but the agent can read and send mail with `himalaya`. Save the

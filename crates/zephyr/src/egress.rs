@@ -908,6 +908,12 @@ impl Decrypted {
             Ok(used) => used,
             Err(refused) => return self.conn.refuse_token(&cfg, &self.dest, &refused),
         };
+        // The reply is read for the values bound here (below), so it must come as it is.
+        let identity = HeaderValue::from_static("identity");
+        parts
+            .headers
+            .insert(hyper::header::ACCEPT_ENCODING, identity);
+        let no_body = parts.method == Method::HEAD;
         for name in &used {
             let dest = format!("{name} -> {}", self.dest);
             self.conn.record(&cfg, "swap", &dest, Outcome::Allowed);
@@ -926,7 +932,10 @@ impl Decrypted {
             let why = "the server did not answer".to_string();
             return self.refuse(&cfg, StatusCode::BAD_GATEWAY, why);
         };
-        crate::broker::unswap(reply.headers_mut(), &map, &used);
+        // A host that sends back what it was sent (an echo, an error page that prints the
+        // request) must not hand the agent the token: every value bound here goes back to its
+        // stand-in, in the reply's headers and in its body.
+        crate::broker::unswap(reply.headers_mut(), &map, &self.dest);
         if reply.status() == StatusCode::SWITCHING_PROTOCOLS {
             // A websocket: the handshake was swapped like any request; the frames are not read.
             if let Some(client) = upgrade {
@@ -941,12 +950,98 @@ impl Decrypted {
             }
             return reply.map(|_| body(""));
         }
+        // A body that cannot be read as it is, is not passed on unread.
+        if encoded(reply.headers()) {
+            let why = format!("{} sent a reply zephyr cannot read (compressed)", self.name);
+            return self.refuse(&cfg, StatusCode::BAD_GATEWAY, why);
+        }
         let idle = |body| Idle {
             body,
             wait: floor.idle,
             timer: Box::pin(tokio::time::sleep(floor.idle)),
         };
-        reply.map(|body| idle(body).boxed_unsync())
+        let replacer = map.unswapper(&self.dest);
+        let bodiless = matches!(
+            reply.status(),
+            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+        );
+        if no_body || bodiless || replacer.is_empty() {
+            return reply.map(|body| idle(body).boxed_unsync());
+        }
+        // A stand-in is not as long as its value, so the length is no longer known ahead.
+        reply.headers_mut().remove(hyper::header::CONTENT_LENGTH);
+        reply.map(|body| {
+            let body = Unswapped {
+                body: idle(body),
+                replacer,
+                trailers: None,
+                done: false,
+            };
+            body.boxed_unsync()
+        })
+    }
+}
+
+/// Whether a reply's body is anything but the bytes the server meant: a `Content-Encoding`
+/// other than `identity`, or a `Transfer-Encoding` beyond `chunked` (which hyper has undone).
+fn encoded(headers: &hyper::HeaderMap) -> bool {
+    let other = |name, plain: &str| {
+        let values = headers.get_all(name).iter();
+        let mut codings = values.flat_map(|v| v.to_str().unwrap_or("?").split(','));
+        codings.any(|c| !c.trim().is_empty() && !c.trim().eq_ignore_ascii_case(plain))
+    };
+    other(hyper::header::CONTENT_ENCODING, "identity")
+        || other(hyper::header::TRANSFER_ENCODING, "chunked")
+}
+
+/// A decrypted host's reply body with each real value bound there turned back into its
+/// stand-in, as it streams: a value cut across two frames is held until it is whole.
+struct Unswapped {
+    body: Idle,
+    replacer: crate::broker::Replacer,
+    /// Trailers, waiting for the data held back before them.
+    trailers: Option<hyper::body::Frame<Bytes>>,
+    done: bool,
+}
+
+impl hyper::body::Body for Unswapped {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+        use hyper::body::Frame;
+        let this = &mut *self;
+        loop {
+            if let Some(trailers) = this.trailers.take() {
+                return Poll::Ready(Some(Ok(trailers)));
+            }
+            if this.done {
+                return Poll::Ready(None);
+            }
+            let out = match std::task::ready!(Pin::new(&mut this.body).poll_frame(cx)) {
+                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                Some(Ok(frame)) => match frame.into_data() {
+                    Ok(data) => this.replacer.push(&data),
+                    Err(trailers) => {
+                        let out = this.replacer.finish();
+                        let mut trailers = trailers.into_trailers().unwrap_or_default();
+                        (trailers.values_mut()).for_each(|v| this.replacer.header(v));
+                        this.trailers = Some(Frame::trailers(trailers));
+                        out
+                    }
+                },
+                None => {
+                    this.done = true;
+                    this.replacer.finish()
+                }
+            };
+            if !out.is_empty() {
+                return Poll::Ready(Some(Ok(Frame::data(Bytes::from(out)))));
+            }
+        }
     }
 }
 
@@ -2779,6 +2874,42 @@ table inet zephyr {
                     s.write_all(b"0\r\n\r\n").await.ok()?;
                     continue;
                 }
+                // What the request's `x-key` header held, sent back: cut in two chunks in the
+                // middle of it, the second only once `go` is notified.
+                let sent = head.lines().find_map(|l| l.strip_prefix("x-key: "));
+                let sent = sent.unwrap_or_default().to_string();
+                if path.starts_with("/echo-chunked") {
+                    let start = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n";
+                    s.write_all(start.as_bytes()).await.ok()?;
+                    let (one, two) = sent.split_at(sent.len() / 2);
+                    for (i, part) in [format!("you sent {one}"), format!("{two} ok")]
+                        .iter()
+                        .enumerate()
+                    {
+                        let chunk = format!("{:x}\r\n{part}\r\n", part.len());
+                        s.write_all(chunk.as_bytes()).await.ok()?;
+                        s.flush().await.ok()?;
+                        if i == 0 {
+                            go.notified().await;
+                        }
+                    }
+                    s.write_all(b"0\r\n\r\n").await.ok()?;
+                    continue;
+                }
+                if path.starts_with("/echo-length") || path.starts_with("/gzip") {
+                    let coding = match path.starts_with("/gzip") {
+                        true => "content-encoding: gzip\r\n",
+                        false => "",
+                    };
+                    let text = format!("key={sent}");
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nx-echo: {sent}\r\n{coding}content-length: {}\r\n\r\n{text}",
+                        text.len()
+                    );
+                    s.write_all(reply.as_bytes()).await.ok()?;
+                    s.flush().await.ok()?;
+                    continue;
+                }
                 if path.starts_with("/ws") {
                     let switch = "HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\n\
                                   upgrade: websocket\r\n\r\n";
@@ -2947,13 +3078,45 @@ table inet zephyr {
             head
         }
 
+        /// A chunked body to its end, without the framing.
+        async fn chunked<S: AsyncRead + Unpin>(s: &mut S) -> String {
+            let mut text = String::new();
+            loop {
+                let size = read_until(s, "\r\n").await;
+                let size = usize::from_str_radix(size.trim(), 16).expect("a chunk size");
+                let mut chunk = vec![0u8; size + 2];
+                s.read_exact(&mut chunk).await.unwrap();
+                text.push_str(&String::from_utf8_lossy(&chunk[..size]));
+                if size == 0 {
+                    return text;
+                }
+            }
+        }
+
         /// `GET target` for the bound server with `headers`, and the reply's head.
         async fn get(s: &mut Stream, net: &Net, target: &str, headers: &str) -> String {
+            let (head, _) = get_body(s, net, target, headers).await;
+            head
+        }
+
+        /// As `get`, with the reply's body. A decrypted host's reply comes chunked: its length
+        /// is not known once values in it may be turned back into stand-ins.
+        async fn get_body(
+            s: &mut Stream,
+            net: &Net,
+            target: &str,
+            headers: &str,
+        ) -> (String, String) {
             let request = format!(
                 "GET {target} HTTP/1.1\r\nHost: {}\r\n{headers}\r\n",
                 net.dest
             );
-            ask(s, &request).await
+            let head = ask(s, &request).await;
+            let body = match head.to_lowercase().contains("transfer-encoding: chunked") {
+                true => chunked(s).await,
+                false => String::new(),
+            };
+            (head, body)
         }
 
         #[tokio::test]
@@ -3076,9 +3239,11 @@ table inet zephyr {
             assert!(!String::from_utf8_lossy(&got).contains("second"));
             let reply = ask(&mut tls, "6\r\nsecond\r\n0\r\n\r\n").await;
             assert!(reply.starts_with("HTTP/1.1 200 "), "{reply}");
+            assert_eq!(chunked(&mut tls).await, "ok");
             assert!(net.head().await.contains(&format!("x-key: {A}\r\n")));
             // Each event reaches the client while the server still waits to send the next.
-            let reply = get(&mut tls, &net, "/events", "").await;
+            let events = format!("GET /events HTTP/1.1\r\nHost: {dest}\r\n\r\n");
+            let reply = ask(&mut tls, &events).await;
             assert!(reply.contains("text/event-stream"), "{reply}");
             read_until(&mut tls, "data: 1\n\n").await;
             net.up.go.notify_one();
@@ -3121,6 +3286,84 @@ table inet zephyr {
                 .await
                 .unwrap();
             assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+        }
+
+        /// A bound host that sends back what it was sent must not hand the agent the token:
+        /// in the reply the agent's program reads, every value bound to that host is its
+        /// stand-in again, in a header, in a body with a length, and in a chunked body that
+        /// cuts the value in two. A reply that cannot be read is not passed on.
+        #[tokio::test]
+        async fn an_echo_from_a_bound_host_shows_the_stand_in_never_the_token() {
+            let mut net = Net::start("broker-echo", "", true).await;
+            let dest = net.dest.clone();
+            let s = net.vault(&[
+                ("A", A, &[dest.as_str()], false),
+                ("B", B, &[dest.as_str()], false),
+            ]);
+            let mut tls = net.bound().await;
+            let key = format!("X-Key: {}\r\nAccept-Encoding: gzip, br\r\n", s[0]);
+
+            // A body with a length, and a header.
+            let (head, body) = get_body(&mut tls, &net, "/echo-length", &key).await;
+            let sent = net.head().await;
+            assert!(sent.contains(&format!("x-key: {A}\r\n")), "{sent}");
+            // The server is asked for the bytes as they are, whatever the client offered.
+            assert!(sent.contains("accept-encoding: identity\r\n"), "{sent}");
+            assert!(!sent.contains("gzip"), "{sent}");
+            assert!(head.contains(&format!("x-echo: {}\r\n", s[0])), "{head}");
+            assert_eq!(body, format!("key={}", s[0]));
+            // Its length changed with it, so the old one is gone.
+            assert!(!head.to_lowercase().contains("content-length"), "{head}");
+            assert!(!head.contains(A) && !body.contains(A));
+
+            // Chunked, the value cut in two: the first half does not come ahead of the rest.
+            let request = format!("GET /echo-chunked HTTP/1.1\r\nHost: {dest}\r\n{key}\r\n");
+            let head = ask(&mut tls, &request).await;
+            assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+            let early = read_until(&mut tls, "you sent \r\n").await;
+            let mut more = [0u8; 64];
+            let waited = tokio::time::timeout(Duration::from_millis(300), tls.read(&mut more));
+            assert!(waited.await.is_err(), "half a token was passed on");
+            net.up.go.notify_one();
+            let rest = read_until(&mut tls, "0\r\n\r\n").await;
+            let all = format!("{early}{rest}");
+            assert!(all.contains(&s[0]) && all.contains(" ok"), "{all}");
+            assert!(
+                !all.contains(A) && !all.contains(&A[..A.len() / 2]),
+                "{all}"
+            );
+            net.head().await;
+
+            // The other token bound here comes back as its stand-in too, though this request
+            // did not carry it: the server may have it from an earlier one.
+            let (_, body) = get_body(
+                &mut tls,
+                &net,
+                "/echo-length",
+                &format!("X-Key: was {B}\r\n"),
+            )
+            .await;
+            assert_eq!(body, format!("key=was {}", s[1]));
+            net.head().await;
+
+            // Compressed all the same: refused, with a row, and none of it passed on.
+            let (head, body) = get_body(&mut tls, &net, "/gzip", &key).await;
+            let want =
+                "HTTP/1.1 502 zephyr: bound.test sent a reply zephyr cannot read (compressed)\r\n";
+            assert!(head.starts_with(want), "{head}");
+            assert!(!head.contains(A) && !body.contains(A), "{head}{body}");
+            let refused = "refused: bound.test sent a reply zephyr cannot read (compressed)";
+            let row = ("swap".to_string(), dest.clone(), refused.to_string());
+            let deadline = tokio::time::Instant::now() + WAIT;
+            while !net.rows().contains(&row) {
+                assert!(tokio::time::Instant::now() < deadline, "{:?}", net.rows());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let printed = format!("{:?}", net.rows());
+            assert!(
+                !printed.contains(A) && !printed.contains("zsur_"),
+                "{printed}"
+            );
         }
 
         /// Makes `owner-1` on `discord` the owner last answered, so a notice has someone to go to.

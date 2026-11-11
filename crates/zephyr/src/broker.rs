@@ -506,26 +506,110 @@ pub fn swap(
     Ok(used)
 }
 
-/// Turns each real value of `used` in a reply's headers back into its surrogate, so a
-/// `Location` or `Link` that repeats the request's URL does not hand the token over.
-pub fn unswap(headers: &mut HeaderMap, map: &Map, used: &[String]) {
-    let secrets: Vec<&Secret> = (map.by.values())
-        .filter(|s| used.contains(&s.name) && !s.value.is_empty())
-        .collect();
-    for value in headers.values_mut() {
-        let Ok(text) = std::str::from_utf8(value.as_bytes()) else {
-            continue;
-        };
-        let mut new = text.to_string();
-        for s in &secrets {
-            new = new.replace(&s.value, &s.surrogate);
-        }
-        if new != text {
-            if let Ok(new) = HeaderValue::from_str(&new) {
+/// Replaces byte strings in a stream, a chunk at a time: a string split across two chunks is
+/// still found, because the end of what has come is held back for as long as it could be the
+/// start of one. Used for a decrypted host's replies (a real value back to its surrogate) and
+/// for a command's log (a vault value to `[vault:NAME]`).
+/// shortcut: every string is tried at every byte; build an automaton if a log's size ever shows.
+pub struct Replacer {
+    /// `(from, to)`, the longest `from` first.
+    pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    held: Vec<u8>,
+}
+
+impl Replacer {
+    pub fn new(mut pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Replacer {
+        pairs.retain(|(from, _)| !from.is_empty());
+        pairs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+        let held = Vec::new();
+        Replacer { pairs, held }
+    }
+
+    /// Whether there is nothing to look for.
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// Whether bytes are held back, waiting for what comes next.
+    pub fn holds(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// The next chunk: what can be passed on now.
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.held.extend_from_slice(chunk);
+        self.run(false)
+    }
+
+    /// One header value, whole.
+    pub fn header(&mut self, value: &mut HeaderValue) {
+        let mut new = self.push(value.as_bytes());
+        new.extend(self.finish());
+        if new != value.as_bytes() {
+            // What replaces a value here is plain ASCII, so it still makes a header.
+            if let Ok(new) = HeaderValue::from_bytes(&new) {
                 *value = new;
             }
         }
     }
+
+    /// The end of the stream, or a pause in it: what was held back, as it is.
+    pub fn finish(&mut self) -> Vec<u8> {
+        self.run(true)
+    }
+
+    fn run(&mut self, end: bool) -> Vec<u8> {
+        let buf = std::mem::take(&mut self.held);
+        let mut out = Vec::with_capacity(buf.len());
+        let mut at = 0;
+        while at < buf.len() {
+            let rest = &buf[at..];
+            // It may be the start of a value, or of a longer one than it already is: wait.
+            let longer =
+                |(from, _): &(Vec<u8>, Vec<u8>)| from.len() > rest.len() && from.starts_with(rest);
+            if !end && self.pairs.iter().any(longer) {
+                self.held = rest.to_vec();
+                break;
+            }
+            match self.pairs.iter().find(|(from, _)| rest.starts_with(from)) {
+                Some((from, to)) => {
+                    out.extend_from_slice(to);
+                    at += from.len();
+                }
+                None => {
+                    out.push(buf[at]);
+                    at += 1;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// A value shorter than this is not looked for in a reply: it would turn up everywhere
+/// (`vault::scrub` draws the same line).
+const MIN_UNSWAP: usize = 4;
+
+impl Map {
+    /// What turns the real values bound to `host` back into their surrogates in a reply from
+    /// it: every secret the proxy would put into a request there, used by this request or not.
+    pub fn unswapper(&self, host: &str) -> Replacer {
+        let here = |s: &&Secret| s.value.len() >= MIN_UNSWAP && s.hosts.iter().any(|h| h == host);
+        let pair = |s: &Secret| {
+            (
+                s.value.clone().into_bytes(),
+                s.surrogate.clone().into_bytes(),
+            )
+        };
+        Replacer::new(self.by.values().filter(here).map(pair).collect())
+    }
+}
+
+/// Turns each real value bound to `host` in a reply's headers back into its surrogate, so a
+/// `Location` or `Link` that repeats the request's URL does not hand the token over.
+pub fn unswap(headers: &mut HeaderMap, map: &Map, host: &str) {
+    let mut replacer = map.unswapper(host);
+    headers.values_mut().for_each(|v| replacer.header(v));
 }
 
 /// For a request that is never swapped (plain `http://`, a host name): any surrogate in
@@ -983,10 +1067,13 @@ mod tests {
                 ("x-other", A_VALUE),
             ],
         );
-        unswap(&mut h, &map, &["B".into()]);
+        unswap(&mut h, &map, "b.test:8443");
         assert_eq!(h["location"], format!("https://b.test/bot{}/x", sur("B")));
-        // Only what this request carried.
+        // Only what is bound to this host: A is not sent here, so it did not come from here.
         assert_eq!(h["x-other"], A_VALUE);
+        // On a host both are bound to, both go back, whichever the request carried.
+        unswap(&mut h, &map, "a.test:443");
+        assert_eq!(h["x-other"], sur("A"));
     }
 
     #[test]
@@ -1227,5 +1314,66 @@ mod tests {
             assert!(said.contains(line), "{line} not in:\n{said}");
         }
         assert!(!said.contains("real-docs-token"), "{said}");
+    }
+
+    #[test]
+    fn a_replacer_finds_a_value_however_the_stream_is_cut() {
+        let pairs = || {
+            vec![
+                (b"real-token".to_vec(), b"zsur_x".to_vec()),
+                (b"real".to_vec(), b"R".to_vec()),
+                (Vec::new(), b"never".to_vec()),
+            ]
+        };
+        let text = b"a real-token, real-tok, real, re and real-token";
+        let want = b"a zsur_x, R-tok, R, re and zsur_x".to_vec();
+        // Cut in two at every place, and fed a byte at a time.
+        for cut in 0..=text.len() {
+            let mut r = Replacer::new(pairs());
+            let mut out = r.push(&text[..cut]);
+            out.extend(r.push(&text[cut..]));
+            out.extend(r.finish());
+            assert_eq!(out, want, "cut at {cut}");
+        }
+        let mut r = Replacer::new(pairs());
+        let mut out: Vec<u8> = text.iter().flat_map(|b| r.push(&[*b])).collect();
+        out.extend(r.finish());
+        assert_eq!(out, want);
+        // Nothing is held back that could not be the start of a value.
+        let mut r = Replacer::new(pairs());
+        assert_eq!(r.push(b"done\n"), b"done\n");
+        assert!(!r.holds());
+        assert_eq!(r.push(b"so re"), b"so ");
+        assert!(r.holds());
+        // A pause: what was held goes out as it is.
+        assert_eq!(r.finish(), b"re");
+        assert!(Replacer::new(vec![(Vec::new(), Vec::new())]).is_empty());
+    }
+
+    #[test]
+    fn a_reply_gets_back_only_the_values_bound_to_its_host() {
+        let map = map();
+        let both = format!("{A_VALUE} {B_VALUE} unbound-value-1 raw-value-12345");
+        let run = |host: &str| {
+            let mut r = map.unswapper(host);
+            let mut out = r.push(both.as_bytes());
+            out.extend(r.finish());
+            String::from_utf8(out).unwrap()
+        };
+        let (a, b) = (sur("A"), sur("B"));
+        assert_eq!(
+            run("a.test:443"),
+            format!("{a} {b} unbound-value-1 raw-value-12345")
+        );
+        assert_eq!(
+            run("b.test:8443"),
+            format!("{A_VALUE} {b} unbound-value-1 raw-value-12345")
+        );
+        assert_eq!(run("other.test:443"), both);
+        // A value too short to tell from ordinary text is left alone.
+        let short =
+            Vault::parse("[[token]]\nname = \"S\"\nvalue = \"abc\"\nhosts = [\"a.test:443\"]\n");
+        let map = Map::build(&config(""), &short.unwrap(), &[], &KEY);
+        assert!(map.unswapper("a.test:443").is_empty());
     }
 }
