@@ -11,6 +11,7 @@ pub mod broker;
 pub mod browser_gate;
 pub mod btw;
 pub mod ca;
+pub mod catalog;
 pub mod channel;
 pub mod chat;
 pub mod checkpoint;

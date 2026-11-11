@@ -137,6 +137,10 @@ pub struct Config {
     /// tests set a fake.
     #[serde(skip, default = "agent_browser")]
     pub agent_browser: PathBuf,
+    /// The connector catalog (DESIGN §4.22): the image's `/opt/zephyr/connectors`. Not
+    /// configurable; tests point it at their own folder.
+    #[serde(skip, default = "catalog_dir")]
+    pub catalog_dir: PathBuf,
     /// This binary, which a command's output goes through on its way to the log so that no
     /// vault value lands there (`zephyr __scrublog`, DESIGN §4.13). `None` writes the log
     /// directly; the daemon sets it at start, and tests of other things leave it out.
@@ -260,6 +264,10 @@ fn desktop_gone() -> std::time::Duration {
 
 fn floor() -> bool {
     crate::egress::bridge()
+}
+
+fn catalog_dir() -> PathBuf {
+    PathBuf::from(crate::catalog::DIR)
 }
 
 fn agent_browser() -> PathBuf {
@@ -581,6 +589,7 @@ impl Config {
         self.path = running.path.clone();
         self.projects = running.projects.clone();
         self.agent_browser = running.agent_browser.clone();
+        self.catalog_dir = running.catalog_dir.clone();
         self.scrubber = running.scrubber.clone();
         self.floor = running.floor;
         self.push_hosts = running.push_hosts.clone();
