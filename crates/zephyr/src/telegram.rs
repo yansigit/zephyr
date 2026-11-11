@@ -28,8 +28,6 @@ const TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// `sendChatAction` lasts 5 s.
 const TYPING_EVERY: Duration = Duration::from_secs(4);
-/// As long as the router retries a reply (`router::retry_window`).
-const RETRY_WINDOW: Duration = Duration::from_secs(5 * 60);
 const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const MAX_NAMES: usize = 1000;
 
@@ -139,9 +137,8 @@ pub struct Telegram {
     progress_after: Option<Duration>,
     /// Keyed by chat id. A tokio mutex: `send` waits for an in-flight progress post, so it deletes it.
     runs: tokio::sync::Mutex<HashMap<i64, Run>>,
-    /// How many pieces of each reply (by `client_id`) Telegram took, and since when: a retry
-    /// starts after them. Telegram has no nonce to drop a duplicate.
-    delivered: Mutex<HashMap<String, (Instant, usize)>>,
+    /// The pieces of each reply Telegram took: it has no nonce to drop a duplicate.
+    delivered: Arc<crate::channel::Delivered>,
     /// How each sender last named themselves, for the pairing notice only (`known_as`).
     names: Mutex<HashMap<String, String>>,
     /// Owners and home, for saving the files an owner sends (`inbox`).
@@ -317,20 +314,6 @@ impl Telegram {
         names.insert(sender.to_string(), name);
     }
 
-    /// How many pieces of `client_id` were delivered; entries older than the retry window go.
-    fn delivered(&self, client_id: &str) -> usize {
-        let mut sent = self.delivered.lock().unwrap_or_else(|e| e.into_inner());
-        sent.retain(|_, (at, _)| at.elapsed() < RETRY_WINDOW);
-        sent.get(client_id).map_or(0, |e| e.1)
-    }
-
-    fn mark(&self, client_id: &str, n: usize) {
-        let mut sent = self.delivered.lock().unwrap_or_else(|e| e.into_inner());
-        sent.entry(client_id.to_string())
-            .or_insert((Instant::now(), 0))
-            .1 = n;
-    }
-
     /// Ends `chat`'s run: stops typing and deletes the progress note.
     async fn finish(&self, chat: i64) {
         let Some(mut run) = self.runs.lock().await.remove(&chat) else {
@@ -366,8 +349,12 @@ impl Channel for Telegram {
             .parse()
             .context("recipient is not a Telegram user id")?;
         let parts = chunks(&msg.text, MAX_TEXT);
-        let done = self.delivered(&msg.client_id);
-        let file = match msg.attachment.as_ref().filter(|_| done <= parts.len()) {
+        let sending = self.delivered.begin("telegram", &msg.client_id)?;
+        let file = match msg
+            .attachment
+            .as_ref()
+            .filter(|_| sending.before <= parts.len())
+        {
             Some(path) => {
                 let name = path
                     .file_name()
@@ -381,19 +368,22 @@ impl Channel for Telegram {
         };
         // The progress note goes before the reply, so it never sits below it.
         self.finish(chat).await;
-        for (i, text) in parts.iter().enumerate().skip(done) {
-            let body = json!({"chat_id": chat, "text": text});
-            self.api.json("sendMessage", body).await?;
-            self.mark(&msg.client_id, i + 1);
-        }
-        if let Some((name, bytes)) = file {
-            // A seam for spoken replies: `voice.ogg` shows as a voice note.
-            let (method, field) = match name.as_str() {
-                "voice.ogg" => ("sendVoice", "voice"),
-                _ => ("sendDocument", "document"),
-            };
-            self.api
-                .call(method, |r| {
+        // In a task of its own: the router stops waiting after its timeout, but a piece
+        // Telegram took then is recorded, so no retry sends it again (`channel::Delivered`).
+        let api = self.api.clone();
+        let send = async move {
+            for (i, text) in parts.iter().enumerate().skip(sending.before) {
+                let body = json!({"chat_id": chat, "text": text});
+                api.json("sendMessage", body).await?;
+                sending.sent(i + 1);
+            }
+            if let Some((name, bytes)) = file {
+                // A seam for spoken replies: `voice.ogg` shows as a voice note.
+                let (method, field) = match name.as_str() {
+                    "voice.ogg" => ("sendVoice", "voice"),
+                    _ => ("sendDocument", "document"),
+                };
+                api.call(method, |r| {
                     let part =
                         reqwest::multipart::Part::bytes(bytes.clone()).file_name(name.clone());
                     let form = reqwest::multipart::Form::new()
@@ -402,9 +392,11 @@ impl Channel for Telegram {
                     r.multipart(form)
                 })
                 .await?;
-            self.mark(&msg.client_id, parts.len() + 1);
-        }
-        Ok(())
+                sending.sent(parts.len() + 1);
+            }
+            anyhow::Ok(())
+        };
+        tokio::spawn(send).await?
     }
 
     fn live(&self, cfg: tokio::sync::watch::Receiver<Arc<crate::config::Config>>) {
@@ -761,19 +753,6 @@ mod tests {
             tg.remember(&i.to_string(), "x".into());
         }
         assert!(tg.names.lock().unwrap().len() <= MAX_NAMES);
-    }
-
-    #[test]
-    fn delivered_pieces_are_remembered_per_reply() {
-        let tg = adapter();
-        assert_eq!(tg.delivered("c1"), 0);
-        tg.mark("c1", 1);
-        tg.mark("c1", 2);
-        assert_eq!((tg.delivered("c1"), tg.delivered("c2")), (2, 0));
-        if let Some(old) = Instant::now().checked_sub(RETRY_WINDOW) {
-            tg.delivered.lock().unwrap().get_mut("c1").unwrap().0 = old;
-            assert_eq!(tg.delivered("c1"), 0, "forgotten after the retry window");
-        }
     }
 
     #[test]

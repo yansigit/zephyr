@@ -344,6 +344,50 @@ async fn pairing_works_by_source_uuid() {
 }
 
 #[tokio::test]
+async fn a_send_the_router_stopped_waiting_for_never_sends_a_piece_twice() {
+    let home = dir("cutoff");
+    let cfg = config(&home, None, &[OWNER]);
+    let d = zephyr::signal::data_dir(&cfg);
+    let signal = Arc::new(Signal::new(&cfg).unwrap());
+    let (tx, _rx) = mpsc::channel(16);
+    let run = {
+        let signal = signal.clone();
+        tokio::spawn(async move { signal.run(tx).await })
+    };
+    wait(|| std::fs::read_to_string(d.join(".ok")).is_ok_and(|a| a == ACCOUNT)).await;
+    std::fs::write(d.join("slow_send"), "0.6").unwrap();
+    let msg = Outbound {
+        channel: "signal".into(),
+        recipient: OWNER.into(),
+        client_id: "z1".into(),
+        text: "y".repeat(3000),
+        attachment: None,
+        reply_to: None,
+    };
+    // The router gives up on a send after its timeout (10 s; 300 ms here) and drops it, while
+    // signal-cli, which already has the request, sends it.
+    let cut = tokio::time::timeout(Duration::from_millis(300), signal.send(&msg)).await;
+    assert!(cut.is_err(), "the send was still going");
+    assert!(signal.send(&msg).await.is_err(), "a retry while it goes");
+    let mut retried = false;
+    for _ in 0..100 {
+        if signal.send(&msg).await.is_ok() {
+            retried = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(retried, "the retry went through once the send was done");
+    let sends = std::fs::read_to_string(d.join("log.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains("\"method\": \"send\""))
+        .count();
+    assert_eq!(sends, 2, "each of the two pieces once");
+    run.abort();
+}
+
+#[tokio::test]
 async fn sync_messages_and_our_own_are_ignored() {
     let home = dir("sync");
     // Even with our own ACI an owner, as when linked to the owner's own account.

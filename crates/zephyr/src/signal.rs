@@ -39,8 +39,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const TYPING_EVERY: Duration = Duration::from_secs(10);
 /// How often `D/.trust` (dropped by `zephyr signal-setup trust`) is looked for.
 const TRUST_EVERY: Duration = Duration::from_secs(2);
-/// Chunks a reply already delivered are skipped on a retry this long (the router's retry window).
-const DELIVERED_FOR: Duration = Duration::from_secs(5 * 60);
 /// Names remembered for `known_as`.
 const NAMES: usize = 256;
 /// Root's PATH for signal-cli: nothing the agent can write.
@@ -231,8 +229,8 @@ pub struct Signal {
     live: crate::inbox::Live,
     /// `named` per sender, for `known_as`.
     names: Mutex<HashMap<String, String>>,
-    /// Per client id, how many chunks went out, and when the last one did.
-    delivered: Mutex<HashMap<String, (usize, Instant)>>,
+    /// The chunks of each reply signal-cli sent: Signal has no nonce to drop a duplicate.
+    delivered: Arc<crate::channel::Delivered>,
     /// ACIs whose changed safety number the owner was told of in this daemon run.
     told: Mutex<HashSet<String>>,
     /// The typing refresher per recipient.
@@ -254,7 +252,7 @@ impl Signal {
             rpc: Arc::default(),
             live: Default::default(),
             names: Mutex::default(),
-            delivered: Mutex::default(),
+            delivered: Arc::default(),
             told: Mutex::default(),
             typing: Mutex::default(),
         })
@@ -417,8 +415,10 @@ impl Signal {
     }
 
     /// A send to `aci` failed on a changed identity key: the owner is told once per daemon run.
-    fn changed_identity(&self, aci: &str) {
-        if !self.told.lock().unwrap().insert(aci.to_string()) {
+    /// It counts as told only once the notice is stored, so a failed write is tried again at the
+    /// next failed send; the write is a blocking task's, off the send.
+    async fn changed_identity(&self, aci: &str) {
+        if self.told.lock().unwrap().contains(aci) {
             return;
         }
         let Some(cfg) = self.live.get().map(|rx| rx.borrow().clone()) else {
@@ -427,11 +427,20 @@ impl Signal {
         let text = format!(
             "[zephyr] the Signal safety number of {aci} changed; compare it, then run zephyr channel signal trust {aci}"
         );
-        let told = crate::store::Store::open(&cfg.db_path()).and_then(|store| {
-            crate::router::notify_owners(&cfg, &store, &text, Some(("signal", aci)))
-        });
-        if let Err(e) = told {
-            eprintln!("zephyr: signal: telling the owner of {aci}'s safety number: {e:#}");
+        let who = aci.to_string();
+        let told = tokio::task::spawn_blocking(move || {
+            let store = crate::store::Store::open(&cfg.db_path())?;
+            crate::router::notify_owners(&cfg, &store, &text, Some(("signal", &who)))
+        })
+        .await;
+        match told {
+            Ok(Ok(())) => {
+                self.told.lock().unwrap().insert(aci.to_string());
+            }
+            Ok(Err(e)) => {
+                eprintln!("zephyr: signal: telling the owner of {aci}'s safety number: {e:#}")
+            }
+            Err(e) => eprintln!("zephyr: signal: telling the owner of {aci}'s safety number: {e}"),
         }
     }
 }
@@ -471,27 +480,37 @@ impl Channel for Signal {
             parts.push(String::new());
         }
         let last = parts.len().saturating_sub(1);
-        let done = {
-            let mut delivered = self.delivered.lock().unwrap();
-            delivered.retain(|_, (_, at)| at.elapsed() < DELIVERED_FOR);
-            delivered.get(&msg.client_id).map_or(0, |d| d.0)
-        };
-        for (i, text) in parts.into_iter().enumerate().skip(done) {
-            let mut params = json!({"recipient": [msg.recipient], "message": text});
-            if let (true, Some(file)) = (i == last, &msg.attachment) {
-                // Root's copy (`<state>/files/<id>/<name>`), which signal-cli reads as root.
-                params["attachments"] = json!([file]);
-            }
-            let r = self.rpc.call("send", params).await?;
-            let results = r["results"].as_array().cloned().unwrap_or_default();
-            anyhow::ensure!(!results.is_empty(), "signal-cli send gave no result");
-            for kind in results.iter().map(|r| r["type"].as_str().unwrap_or("?")) {
-                if kind == "IDENTITY_FAILURE" {
-                    self.changed_identity(&msg.recipient);
+        let sending = self.delivered.begin("signal", &msg.client_id)?;
+        // In a task of its own: the router stops waiting after its timeout, but signal-cli sends
+        // what it was handed (up to its 60 s), and that is recorded, so no retry sends it again.
+        let (rpc, to, file) = (
+            self.rpc.clone(),
+            msg.recipient.clone(),
+            msg.attachment.clone(),
+        );
+        let send = async move {
+            for (i, text) in parts.into_iter().enumerate().skip(sending.before) {
+                let mut params = json!({"recipient": [to], "message": text});
+                if let (true, Some(file)) = (i == last, &file) {
+                    // Root's copy (`<state>/files/<id>/<name>`), which signal-cli reads as root.
+                    params["attachments"] = json!([file]);
                 }
-                anyhow::ensure!(kind == "SUCCESS", "signal send failed: {kind}");
+                let r = rpc.call("send", params).await?;
+                let results = r["results"].as_array().cloned().unwrap_or_default();
+                anyhow::ensure!(!results.is_empty(), "signal-cli send gave no result");
+                for kind in results.iter().map(|r| r["type"].as_str().unwrap_or("?")) {
+                    if kind == "IDENTITY_FAILURE" {
+                        return Ok(false);
+                    }
+                    anyhow::ensure!(kind == "SUCCESS", "signal send failed: {kind}");
+                }
+                sending.sent(i + 1);
             }
-            (self.delivered.lock().unwrap()).insert(msg.client_id.clone(), (i + 1, Instant::now()));
+            Ok(true)
+        };
+        if !tokio::spawn(send).await?? {
+            self.changed_identity(&msg.recipient).await;
+            anyhow::bail!("signal send failed: IDENTITY_FAILURE");
         }
         Ok(())
     }
@@ -774,6 +793,34 @@ mod tests {
 
     const ACCOUNT: &str = "+15550001111";
     const OWNER: &str = "7f3c0000-aaaa-4bbb-8ccc-dddddddddddd";
+
+    #[tokio::test]
+    async fn a_safety_number_counts_as_told_only_once_the_notice_is_stored() {
+        let home = crate::test_dir("signal-told");
+        let cfg: crate::config::Config = toml::from_str(&format!(
+            "rpi = '/r'\nhome = {home:?}\n[signal]\naccount = '{ACCOUNT}'\n[owners]\nchat = ['owner']\n"
+        ))
+        .unwrap();
+        let signal = Signal::new(&cfg).unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(Arc::new(cfg.clone()));
+        signal.live(rx);
+        // state.db cannot be opened: nothing is stored, so nothing counts as told.
+        std::fs::create_dir_all(cfg.db_path()).unwrap();
+        signal.changed_identity(OWNER).await;
+        assert!(!signal.told.lock().unwrap().contains(OWNER));
+        std::fs::remove_dir(cfg.db_path()).unwrap();
+        signal.changed_identity(OWNER).await;
+        signal.changed_identity(OWNER).await;
+        assert!(signal.told.lock().unwrap().contains(OWNER));
+        let store = crate::store::Store::open(&cfg.db_path()).unwrap();
+        let told = store.pending_outbox().unwrap();
+        assert_eq!(told.len(), 1, "once");
+        assert!(
+            told[0].text.contains("safety number of 7f3c"),
+            "{}",
+            told[0].text
+        );
+    }
 
     #[tokio::test]
     async fn the_captcha_and_the_code_never_go_on_signal_clis_command_line() {

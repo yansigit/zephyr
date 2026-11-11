@@ -31,6 +31,8 @@ struct Bot {
     /// `file_id` → (`file_path`, bytes).
     files: HashMap<String, (String, Vec<u8>)>,
     next_msg: i64,
+    /// How long each call to a method waits before it is answered (it is already recorded).
+    slow: HashMap<String, Duration>,
 }
 
 type Stub = Arc<Mutex<Bot>>;
@@ -130,12 +132,15 @@ async fn serve(state: &Stub, req: Request<Incoming>) -> (u16, Vec<u8>) {
     } else {
         serde_json::from_slice(&raw).unwrap_or(Value::Null)
     };
-    let answer = {
+    let (answer, slow) = {
         let mut bot = state.lock().unwrap();
         bot.calls
             .push((method.into(), body.clone(), Instant::now()));
-        bot.answer(method, &body)
+        (bot.answer(method, &body), bot.slow.get(method).copied())
     };
+    if let Some(slow) = slow {
+        tokio::time::sleep(slow).await;
+    }
     let (status, body) = match answer {
         Some(a) => a,
         // An empty long poll: wait a little, as Telegram holds it, so the loop does not spin.
@@ -607,6 +612,44 @@ async fn a_retry_resends_only_the_failed_chunk() {
     assert_eq!(sent[1], sent[2], "the second chunk again");
     assert_ne!(sent[0], sent[1]);
     assert!(format!("{}{}", sent[0], sent[1]).starts_with("echo: [telegram #1] yyy"));
+}
+
+#[tokio::test]
+async fn a_send_the_router_stopped_waiting_for_never_sends_a_piece_twice() {
+    let home = home("cutoff");
+    let (api, bot) = stub().await;
+    bot.lock()
+        .unwrap()
+        .slow
+        .insert("sendMessage".into(), Duration::from_millis(600));
+    let tg = adapter(&config(&home, &api, "progress = false"));
+    let msg = Outbound {
+        channel: "telegram".into(),
+        recipient: "55".into(),
+        client_id: "z1".into(),
+        text: "y".repeat(5000),
+        attachment: None,
+        reply_to: None,
+    };
+    // The router gives up on a send after its timeout (10 s; 300 ms here) and drops it.
+    let cut = tokio::time::timeout(Duration::from_millis(300), tg.send(&msg)).await;
+    assert!(cut.is_err(), "the send was still going");
+    // A retry while it still goes sends nothing of its own.
+    assert!(tg.send(&msg).await.is_err());
+    let mut retried = false;
+    for _ in 0..100 {
+        if tg.send(&msg).await.is_ok() {
+            retried = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(retried, "the retry went through once the send was done");
+    assert_eq!(
+        calls(&bot, "sendMessage").len(),
+        2,
+        "each of the two pieces once"
+    );
 }
 
 #[tokio::test]

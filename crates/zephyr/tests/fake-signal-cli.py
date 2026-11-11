@@ -10,7 +10,8 @@ it sent before: the read offset is kept in feed.offset). Answers: `listAccounts`
 [{"number": ACCOUNT}]; `send` {"timestamp", "results": [one per recipient]}, each of type
 "SUCCESS", or "IDENTITY_FAILURE" while an `untrusted` file exists in D; `sendTyping` and `trust` {};
 in multi-account mode (no -a), `register` and `verify` {} when they name an "account"; anything else
-a JSON-RPC error -32601. An `exit` file in D makes it exit 0 (the file removed).
+a JSON-RPC error -32601. An `exit` file in D makes it exit 0 (the file removed). A `slow_send`
+file holds the seconds each `send` waits before it is answered (it is logged at once).
 """
 
 import json
@@ -43,6 +44,8 @@ def answer(req):
     if method == "listAccounts":
         return {"result": [{"number": account}]}
     if method == "send":
+        if os.path.exists(path("slow_send")):
+            time.sleep(float(open(path("slow_send")).read() or 1))
         kind = "IDENTITY_FAILURE" if os.path.exists(path("untrusted")) else "SUCCESS"
         results = [
             {"recipientAddress": {"uuid": r, "number": None}, "type": kind}

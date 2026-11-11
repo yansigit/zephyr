@@ -238,8 +238,9 @@ fn markdown(session: &str, messages: &[Value]) -> String {
     out
 }
 
-/// How long a reply may be retried: only as long as the platform still dedupes the client id.
-fn retry_window(channel: &str) -> i64 {
+/// How long a reply may be retried: only as long as the platform still dedupes the client id
+/// (or, without one, the adapter remembers what it delivered: `channel::Delivered`).
+pub fn retry_window(channel: &str) -> i64 {
     match channel {
         "discord" => 5 * 60,
         // tempGuid dedupes only while a send is in flight, and a timed-out send may duplicate. Accept at-least-once.
@@ -5356,7 +5357,8 @@ fn owner_list(
 
 /// Writes `text` to every owner on `chat` and on each channel whose table is set, except
 /// `except` (`(channel, id)`): what every owner channel is told (a new pairing, a changed Signal
-/// safety number). Attached clients are the router's to show.
+/// safety number). Attached clients are the router's to show. One failed write does not stop
+/// the rest; the first error is returned.
 pub fn notify_owners(
     cfg: &Config,
     store: &Store,
@@ -5370,14 +5372,18 @@ pub fn notify_owners(
         ("telegram", cfg.telegram.is_some()),
         ("signal", cfg.signal.is_some()),
     ];
+    let mut failed = Ok(());
     for (channel, _) in on.into_iter().filter(|(_, set)| *set) {
         for id in cfg.owners.get(channel).into_iter().flatten() {
             if except != Some((channel, id.as_str())) {
-                store.notify(channel, id, text)?;
+                let told = store.notify(channel, id, text);
+                if failed.is_ok() {
+                    failed = told;
+                }
             }
         }
     }
-    Ok(())
+    failed
 }
 
 fn log(r: anyhow::Result<()>) {
