@@ -69,6 +69,12 @@ fn daemon(cfg: &Path, home: &Path) -> Daemon {
     Daemon(child)
 }
 
+/// Whether `text` says `{prefix}{age}s ago{suffix}`, or a second or two older: the age was set
+/// a moment before `status` ran, and a second may have ticked over meanwhile.
+fn aged(text: &str, prefix: &str, age: u64, suffix: &str) -> bool {
+    (age..=age + 2).any(|a| text.contains(&format!("{prefix}{a}s ago{suffix}")))
+}
+
 fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
@@ -220,8 +226,7 @@ fn status_fails_without_a_daemon_or_with_a_stale_heartbeat() {
     assert!(out.status.success(), "{out:?}");
     let text = stdout(&out);
     assert!(
-        text.contains("\ndaemon: running\nheartbeat: 0s ago\n")
-            || text.contains("\ndaemon: running\nheartbeat: 1s ago\n"),
+        aged(&text, "\ndaemon: running\nheartbeat: ", 0, "\n"),
         "{text}"
     );
 
@@ -233,7 +238,7 @@ fn status_fails_without_a_daemon_or_with_a_stale_heartbeat() {
     let out = zephyr(&cfg, &["status"]);
     unsafe { libc::kill(pid, libc::SIGCONT) };
     assert!(!out.status.success(), "{out:?}");
-    assert!(stdout(&out).contains("heartbeat: 400s ago"), "{out:?}");
+    assert!(aged(&stdout(&out), "heartbeat: ", 400, ""), "{out:?}");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("hung"),
         "{out:?}"
@@ -272,13 +277,9 @@ fn status_shows_the_main_child_the_waiting_message_and_the_replies() {
     ] {
         assert!(text.contains(line), "{line}\n{text}");
     }
-    // The ages were set a moment before `status` ran, so a second may have ticked over meanwhile.
-    let aged = |prefix: &str, age: u64, suffix: &str| {
-        (age..=age + 2).any(|a| text.contains(&format!("{prefix}{a}s ago{suffix}")))
-    };
-    assert!(aged("oldest new message: ", 100, ""), "{text}");
+    assert!(aged(&text, "oldest new message: ", 100, ""), "{text}");
     assert!(
-        aged("replies: 2 pending (oldest ", 50, "), 1 failed"),
+        aged(&text, "replies: 2 pending (oldest ", 50, "), 1 failed"),
         "{text}"
     );
 }
