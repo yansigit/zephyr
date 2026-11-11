@@ -247,7 +247,9 @@ fn sweep() {
         std::fs::read(format!("/proc/{pid}/environ"))
             .is_ok_and(|env| env.split(|b| *b == 0).any(|v| v == mark.as_bytes()))
     };
-    let left = |pid: i32, uid: u32| match root() {
+    // By uid only in the floored container, whose pid namespace holds nothing else of nobody's:
+    // never a root daemon on a host, where uid 65534 runs other people's services.
+    let left = |pid: i32, uid: u32| match root() && crate::egress::bridge() {
         true => uid == NOBODY,
         false => uid == me && pid != std::process::id() as i32 && marked(pid),
     };
