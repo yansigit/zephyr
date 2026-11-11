@@ -661,7 +661,8 @@ pub(crate) mod tests {
         let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/voice");
         for file in ["bin/ffmpeg", "bin/whisper-cli", "py/bin/python"] {
             std::fs::create_dir_all(dir.join(file).parent().unwrap()).unwrap();
-            std::fs::copy(from.join(file), dir.join(file)).unwrap();
+            let fake = std::fs::read_to_string(from.join(file)).unwrap();
+            crate::test_exe(&dir.join(file), &fake);
         }
         std::fs::create_dir_all(dir.join("voices")).unwrap();
         std::fs::write(dir.join(VOICE_EN), "").unwrap();
