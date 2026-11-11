@@ -2512,6 +2512,26 @@ async fn wrong_codes_close_pairing_and_get_no_reply() {
 }
 
 #[tokio::test]
+async fn a_near_miss_pair_text_is_stored_cut() {
+    let (home, gw) = paired_gateway("pair-near-miss");
+    let code = pair_code(&gw, "p1").await;
+    // A code missing its last character, and one with a word after it: neither is a claim's
+    // shape, and neither may reach state.db as typed.
+    let short = &code[..code.len() - 1];
+    gw.say_on("telegram", "99-1", "99", &format!("/pair {short}"))
+        .await;
+    gw.say_on("telegram", "99-2", "99", &format!("/PAIR {code} please"))
+        .await;
+    let store = Store::open(&home.join("state.db")).unwrap();
+    wait(|| store.inbox_with_status("dropped").unwrap().len() == 2).await;
+    let texts: Vec<String> = (store.inbox_with_status("dropped").unwrap().into_iter())
+        .map(|r| r.text)
+        .collect();
+    assert_eq!(texts, ["/pair", "/pair"]);
+    gw.shutdown().await;
+}
+
+#[tokio::test]
 async fn wrong_codes_with_no_code_out_close_nothing() {
     let (home, gw) = paired_gateway("pair-none-out");
     for i in 0..6 {

@@ -54,6 +54,13 @@ pub fn issuers(cfg: &crate::config::Config) -> Vec<&str> {
         .collect()
 }
 
+/// What a pairing channel's `/pair …` text is stored as: `/pair`, whatever follows it, so a code
+/// typed a little wrong never reaches state.db either. `None` keeps the text as it is.
+pub fn stored(channel: &str, text: &str) -> Option<String> {
+    let first = text.split_whitespace().next()?;
+    (CHANNELS.contains(&channel) && first.eq_ignore_ascii_case("/pair")).then(|| "/pair".into())
+}
+
 /// The code a message on `channel` claims with, when it is a pairing channel's.
 pub fn claim_on(channel: &str, text: &str) -> Option<String> {
     CHANNELS.contains(&channel).then(|| claimed(text)).flatten()
@@ -101,6 +108,18 @@ mod tests {
         let code = claimed(&format!("/pair {shown}")).unwrap();
         assert!(matches(&row, &code, 1000 + LIFE - 1));
         assert!(!matches(&row, &code, 1000 + LIFE));
+    }
+
+    #[test]
+    fn a_pair_text_is_stored_cut_on_a_pairing_channel_only() {
+        assert_eq!(
+            stored("telegram", "/pair ABCDE-FGHJ").as_deref(),
+            Some("/pair")
+        );
+        assert_eq!(stored("signal", " /PAIR x y").as_deref(), Some("/pair"));
+        assert_eq!(stored("telegram", "/pairing is fun"), None);
+        assert_eq!(stored("chat", "/pair telegram"), None);
+        assert_eq!(stored("telegram", "hello"), None);
     }
 
     #[test]

@@ -2005,7 +2005,14 @@ impl<'a> Router<'a> {
         // Decided before the write: a crash in between must not leave a stranger's row `new`.
         let owner = self.cfg.is_owner(&m.channel, &m.sender);
         let status = if owner { "new" } else { "dropped" };
-        let id = match self.store.insert_inbox_as(&m, status) {
+        // A `/pair …` on Telegram or Signal is stored as `/pair`: a near miss holds most of a
+        // code. The command itself still reads what was sent.
+        let cut =
+            crate::pairing::stored(&m.channel, &m.text).map(|text| Inbound { text, ..m.clone() });
+        let id = match self
+            .store
+            .insert_inbox_as(cut.as_ref().unwrap_or(&m), status)
+        {
             Ok(Some(id)) => id,
             Ok(None) => return, // duplicate platform id
             Err(e) => return eprintln!("zephyr: inbox write failed: {e}"),
