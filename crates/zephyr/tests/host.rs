@@ -320,6 +320,11 @@ impl Drop for Env {
     }
 }
 
+/// Owned strings, to compare with a recorded call.
+fn s(words: &[&str]) -> Vec<String> {
+    words.iter().map(|w| w.to_string()).collect()
+}
+
 fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
@@ -837,6 +842,59 @@ fn up_build_passes_the_gh_token_as_a_secret_only() {
         !calls.iter().any(|c| c[1] == "build"),
         "pull succeeded, so no build"
     );
+}
+
+/// This user's GitHub token goes only to ghcr.io: any other registry an image names (or Docker
+/// Hub, which `user/zephyr` is) would be handed it by `docker login`.
+#[test]
+fn pull_logs_in_with_the_gh_token_only_at_ghcr() {
+    let env = Env::new("pull-registry");
+    env.init(&["--no-start"]);
+    let failing = [
+        ("SHIM_IMAGE_MISSING", "1"),
+        ("SHIM_PULL_FAIL", "1"),
+        ("SHIM_BUILD_FAIL", "1"),
+    ];
+    let logins = |calls: &[Vec<String>]| {
+        calls
+            .iter()
+            .filter(|c| {
+                c.starts_with(&s(&["docker", "login"])) || c.starts_with(&s(&["gh", "api", "user"]))
+            })
+            .count()
+    };
+    for image in [
+        "registry.example.com/me/zephyr:1",
+        "user/zephyr:1",
+        "ghcr.io.evil.com/x:1",
+        "localhost:5000/z:1",
+    ] {
+        let mut vars = failing.to_vec();
+        vars.push(("ZEPHYR_IMAGE", image));
+        let out = env.zephyr_env(&["up"], &vars);
+        assert!(!out.status.success(), "{image}");
+        let calls = env.calls();
+        find(&calls, &["docker", "pull", image]);
+        assert_eq!(logins(&calls), 0, "{image}: {calls:#?}");
+        assert!(
+            stdout(&out).contains(&format!("{image} is not on ghcr.io: docker login")),
+            "{}",
+            stdout(&out)
+        );
+    }
+    let image = "ghcr.io/someone/zephyr:1";
+    let mut vars = failing.to_vec();
+    vars.push(("ZEPHYR_IMAGE", image));
+    env.zephyr_env(&["up"], &vars);
+    let calls = env.calls();
+    let login = find(&calls, &["docker", "login", "ghcr.io"]);
+    assert!(has_pair(login, "-u", "tester"), "{login:?}");
+    assert!(login.contains(&"--password-stdin".to_string()), "{login:?}");
+    let pulls = calls
+        .iter()
+        .filter(|c| c.starts_with(&s(&["docker", "pull", image])));
+    assert_eq!(pulls.count(), 2, "pulled again after the login: {calls:#?}");
+    assert!(!format!("{calls:?}").contains(GH_TOKEN));
 }
 
 #[test]

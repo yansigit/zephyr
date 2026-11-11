@@ -1131,23 +1131,39 @@ fn run(cmd: &mut Command) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `docker pull`, logging in to the image's registry with `gh` and trying again when it fails.
+/// `docker pull`; for a ghcr.io image, logging in with `gh` and trying again when it fails.
 fn pull(image: &str) -> bool {
     // Docker draws its own progress; the image is several GB the first time.
     println!("pulling {image}");
     if shown(docker(&["pull", image])) {
         return true;
     }
+    // The gh token is this user's GitHub credential: no other registry may be handed it.
+    if !image.starts_with("ghcr.io/") {
+        println!(
+            "{image} is not on ghcr.io: docker login {} first, if it needs a login",
+            registry(image)
+        );
+        return false;
+    }
     if let (Some(token), Some(user)) = (
         gh(&["auth", "token"]),
         gh(&["api", "user", "--jq", ".login"]),
     ) {
-        let registry = image.split('/').next().unwrap_or("ghcr.io");
-        println!("logging in to {registry} as {user} (gh) and pulling again");
-        let mut login = docker(&["login", registry, "-u", &user, "--password-stdin"]);
+        println!("logging in to ghcr.io as {user} (gh) and pulling again");
+        let mut login = docker(&["login", "ghcr.io", "-u", &user, "--password-stdin"]);
         return feed(&mut login, &token).is_ok() && shown(docker(&["pull", image]));
     }
     false
+}
+
+/// The registry an image reference names, as docker reads it: the first part when it looks like
+/// a host (a `.` or `:`, or `localhost`), else Docker Hub.
+fn registry(image: &str) -> &str {
+    match image.split_once('/') {
+        Some((first, _)) if first.contains(['.', ':']) || first == "localhost" => first,
+        _ => "docker.io",
+    }
 }
 
 /// True when the command succeeds; its output goes to the terminal (docker's progress bars).
@@ -1610,6 +1626,20 @@ mod tests {
         );
         let other = local_image("zephyr:dev", &list(&["ffmpeg", "jq"])).unwrap();
         assert!(other.starts_with("zephyr-local:custom-") && other != tag);
+    }
+
+    #[test]
+    fn registries_are_read_as_docker_reads_them() {
+        for (image, want) in [
+            ("ghcr.io/a/b:1", "ghcr.io"),
+            ("registry.example.com/me/z:1", "registry.example.com"),
+            ("localhost:5000/z", "localhost:5000"),
+            ("localhost/z", "localhost"),
+            ("user/zephyr", "docker.io"),
+            ("zephyr-lanetest", "docker.io"),
+        ] {
+            assert_eq!(registry(image), want, "{image}");
+        }
     }
 
     #[test]
