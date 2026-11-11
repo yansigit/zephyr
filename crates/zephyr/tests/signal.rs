@@ -387,19 +387,48 @@ async fn a_send_the_router_stopped_waiting_for_never_sends_a_piece_twice() {
     run.abort();
 }
 
+/// This process's kernel start time (field 22 of `/proc/self/stat`), as a hold names its setup.
+fn my_ticks() -> String {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    let after = &stat[stat.rfind(')').unwrap() + 1..];
+    after.split_whitespace().nth(19).unwrap().to_string()
+}
+
+/// A hold as `zephyr signal-setup` writes it, for this process.
+fn hold(d: &Path) {
+    std::fs::write(
+        d.join(".hold"),
+        format!("{} {}", std::process::id(), my_ticks()),
+    )
+    .unwrap();
+}
+
 #[tokio::test]
-async fn a_hold_stops_signal_cli_until_it_is_lifted_and_a_dead_one_is_ignored() {
+async fn a_hold_stops_signal_cli_until_it_is_lifted_and_a_stale_one_is_ignored() {
     let home = dir("hold");
     let gw = start(config(&home, None, &[OWNER]));
     gw.up().await;
     let starts = || gw.log("start").len();
-    // A dead setup's hold (its pid is gone) holds nothing.
-    std::fs::write(gw.d.join(".hold"), "999999999").unwrap();
+    let still_up = || std::fs::read_to_string(gw.d.join(".ok")).is_ok_and(|a| a == ACCOUNT);
+    // A stale hold: this pid, but another process's start time (the pid was reused).
+    std::fs::write(gw.d.join(".hold"), format!("{} 1", std::process::id())).unwrap();
     tokio::time::sleep(Duration::from_millis(2500)).await;
-    assert!(std::fs::read_to_string(gw.d.join(".ok")).is_ok_and(|a| a == ACCOUNT));
-    assert_eq!(starts(), 1);
-    // A live one (this process's): signal-cli stops and lets the account go, and stays down.
-    std::fs::write(gw.d.join(".hold"), std::process::id().to_string()).unwrap();
+    assert!(still_up() && starts() == 1, "a stale hold holds nothing");
+    // An expired lease: a setup that stopped refreshing it.
+    hold(&gw.d);
+    let old = std::time::SystemTime::now() - Duration::from_secs(120);
+    let file = std::fs::File::options()
+        .write(true)
+        .open(gw.d.join(".hold"))
+        .unwrap();
+    file.set_modified(old).unwrap();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(
+        still_up() && starts() == 1,
+        "an expired lease holds nothing"
+    );
+    // A live one: signal-cli stops and lets the account go, and stays down.
+    hold(&gw.d);
     wait(|| !gw.d.join(".ok").exists()).await;
     tokio::time::sleep(Duration::from_millis(6000)).await; // past its 5 s restart backoff
     assert_eq!(starts(), 1, "not started again while held");
@@ -407,6 +436,54 @@ async fn a_hold_stops_signal_cli_until_it_is_lifted_and_a_dead_one_is_ignored() 
     gw.up().await;
     assert_eq!(starts(), 2);
     gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_daemon_starting_during_a_hold_starts_no_signal_cli() {
+    let home = dir("hold-start");
+    let cfg = config(&home, None, &[OWNER]);
+    let d = zephyr::signal::data_dir(&cfg);
+    std::fs::create_dir_all(&d).unwrap();
+    hold(&d); // as after a re-exec while setup registers
+    let gw = start(cfg);
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    assert!(gw.log("start").is_empty(), "no signal-cli while held");
+    std::fs::remove_file(d.join(".hold")).unwrap();
+    gw.up().await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_send_during_a_hold_is_paused_not_failed() {
+    let home = dir("hold-send");
+    let cfg = config(&home, None, &[OWNER]);
+    let d = zephyr::signal::data_dir(&cfg);
+    let signal = Arc::new(Signal::new(&cfg).unwrap());
+    let (tx, _rx) = mpsc::channel(16);
+    let run = {
+        let signal = signal.clone();
+        tokio::spawn(async move { signal.run(tx).await })
+    };
+    wait(|| d.join(".ok").exists()).await;
+    hold(&d);
+    wait(|| !d.join(".ok").exists()).await;
+    let msg = Outbound {
+        channel: "signal".into(),
+        recipient: OWNER.into(),
+        client_id: "z1".into(),
+        text: "later".into(),
+        attachment: None,
+        reply_to: None,
+    };
+    let paused = signal.send(&msg).await.unwrap_err();
+    assert!(
+        paused.downcast_ref::<zephyr::channel::Paused>().is_some(),
+        "{paused:#}"
+    );
+    std::fs::remove_file(d.join(".hold")).unwrap();
+    wait(|| d.join(".ok").exists()).await;
+    signal.send(&msg).await.unwrap();
+    run.abort();
 }
 
 #[tokio::test]

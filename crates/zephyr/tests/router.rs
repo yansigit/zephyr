@@ -44,6 +44,14 @@ impl Channel for TestChannel {
         {
             return Err(zephyr::channel::StillGoing.into());
         }
+        // A `paused-<name>` file: the channel's account is held (Signal's setup), and sends wait.
+        if self
+            .db
+            .with_file_name(format!("paused-{}", self.name))
+            .exists()
+        {
+            return Err(zephyr::channel::Paused.into());
+        }
         // A `stall-<name>` file in the home makes this channel's sends hang, like a stuck client.
         if self
             .db
@@ -2556,6 +2564,32 @@ async fn a_send_still_going_past_the_window_is_neither_failed_nor_its_file_disca
     // The send ends: its true result is recorded.
     std::fs::remove_file(home.join("going-chat")).unwrap();
     wait(|| row().is_some_and(|(s, _)| s == "sent")).await;
+    gw.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_reply_queued_while_its_channel_is_paused_is_sent_after_it() {
+    let home = home("paused");
+    let mut cfg = config(&home);
+    cfg.tick = Duration::from_millis(200);
+    std::fs::write(home.join("paused-chat"), "").unwrap();
+    let gw = start(cfg);
+    gw.say("m1", "owner", "hello").await;
+    let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
+    let status = || -> Option<String> {
+        db.query_row(
+            "SELECT status FROM outbox WHERE inbox_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .ok()
+    };
+    wait(|| status().is_some()).await;
+    db.execute("UPDATE outbox SET created_at = 0", []).unwrap(); // past every window
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(status().as_deref(), Some("pending"));
+    std::fs::remove_file(home.join("paused-chat")).unwrap();
+    wait(|| status().as_deref() == Some("sent")).await;
     gw.shutdown().await;
 }
 

@@ -56,6 +56,11 @@ const OK_FILE: &str = ".ok";
 /// Written by `zephyr signal-setup` while it registers or links, holding its pid: the daemon's
 /// signal-cli stops and lets the account go meanwhile.
 const HOLD_FILE: &str = ".hold";
+/// A hold not refreshed for this long is a setup that is gone or stuck: it holds nothing.
+const HOLD_LEASE: Duration = Duration::from_secs(90);
+const HOLD_REFRESH: Duration = Duration::from_secs(30);
+/// How long setup waits for the SMS or call code.
+const CODE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// The most a setup step's signal-cli may take; `link` waits for a scan, so it gets 10 min.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(120);
 const LINK_TIMEOUT: Duration = Duration::from_secs(600);
@@ -513,6 +518,13 @@ impl Channel for Signal {
     async fn run(&self, tx: mpsc::Sender<Inbound>) -> anyhow::Result<()> {
         let mut backoff = BACKOFF_MIN;
         loop {
+            // Before every start, the first after a daemon start or re-exec too.
+            while held(&self.dir) {
+                tokio::select! {
+                    _ = tokio::time::sleep(TRUST_EVERY) => {},
+                    _ = tx.closed() => return Ok(()),
+                }
+            }
             let began = Instant::now();
             tokio::select! {
                 r = self.child(&tx) => if let Err(e) = r {
@@ -529,17 +541,15 @@ impl Channel for Signal {
             );
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(BACKOFF_MAX);
-            while held(&self.dir) {
-                tokio::select! {
-                    _ = tokio::time::sleep(TRUST_EVERY) => {},
-                    _ = tx.closed() => return Ok(()),
-                }
-            }
         }
     }
 
     async fn send(&self, msg: &Outbound) -> anyhow::Result<()> {
         anyhow::ensure!(is_aci(&msg.recipient), "recipient is not a Signal ACI");
+        // Setup holds the account: the reply waits for it, as long as its lease runs.
+        if held(&self.dir) {
+            return Err(crate::channel::Paused.into());
+        }
         let mut parts = chunks(&msg.text, MAX_TEXT);
         if parts.is_empty() && msg.attachment.is_some() {
             parts.push(String::new());
@@ -719,40 +729,82 @@ async fn setup_run(
 /// Ctrl-C) holds nothing and is removed, so it can never keep Signal down.
 fn held(dir: &Path) -> bool {
     let file = dir.join(HOLD_FILE);
-    let Ok(pid) = std::fs::read_to_string(&file) else {
+    let Ok(line) = std::fs::read_to_string(&file) else {
         return false;
     };
-    let live =
-        (pid.trim().parse::<u32>().ok()).is_some_and(|p| Path::new(&format!("/proc/{p}")).exists());
-    if !live {
+    // The setup that wrote it, by pid and kernel start time (a reused pid is another process),
+    // and a lease it refreshes: a hung setup holds nothing either.
+    let mut words = line.split_whitespace().map(str::parse::<i64>);
+    let alive = match (words.next(), words.next()) {
+        (Some(Ok(pid)), Some(Ok(ticks))) => {
+            i32::try_from(pid).ok().and_then(crate::procs::start_ticks) == Some(ticks)
+        }
+        _ => false,
+    };
+    let fresh = (std::fs::metadata(&file).and_then(|m| m.modified()))
+        .is_ok_and(|at| at.elapsed().is_ok_and(|age| age < HOLD_LEASE));
+    if !(alive && fresh) {
         let _ = std::fs::remove_file(&file);
     }
-    live
+    alive && fresh
 }
 
-/// Setup's hold on the account, from taking it until it is dropped.
-struct Hold(PathBuf);
+/// Setup's hold on the account, from taking it until it is dropped: its lease is refreshed
+/// every `HOLD_REFRESH` meanwhile.
+struct Hold(PathBuf, tokio::task::AbortHandle);
 
 impl Hold {
     fn take(dir: &Path) -> anyhow::Result<Self> {
-        let file = dir.join(HOLD_FILE);
+        let me = std::process::id();
+        let ticks = crate::procs::start_ticks(me as i32).context("this process's start time")?;
+        let (file, part) = (dir.join(HOLD_FILE), dir.join(".hold.part"));
+        // Written aside and renamed: the adapter never reads half a hold.
         std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(&file)
+            .open(&part)
             .and_then(|mut f| {
-                std::io::Write::write_all(&mut f, std::process::id().to_string().as_bytes())
+                std::io::Write::write_all(&mut f, format!("{me} {ticks}").as_bytes())
             })?;
-        Ok(Self(file))
+        std::fs::rename(&part, &file)?;
+        let lease = file.clone();
+        let refresh = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(HOLD_REFRESH).await;
+                let touched = std::fs::File::options()
+                    .write(true)
+                    .open(&lease)
+                    .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+                if let Err(e) = touched {
+                    eprintln!("zephyr: refreshing the hold on the Signal account: {e}");
+                }
+            }
+        });
+        Ok(Self(file, refresh.abort_handle()))
     }
 }
 
 impl Drop for Hold {
     fn drop(&mut self) {
+        self.1.abort();
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// A prompt of setup's, answered within `limit`: a setup left at a prompt must not hold the
+/// account for good.
+async fn ask(limit: Duration, prompt: String) -> anyhow::Result<String> {
+    let asked = tokio::task::spawn_blocking(move || {
+        dialoguer::Input::<String>::new()
+            .with_prompt(prompt)
+            .interact_text()
+    });
+    let answer = tokio::time::timeout(limit, asked)
+        .await
+        .map_err(|_| anyhow::anyhow!("no answer within {} min", limit.as_secs() / 60))???;
+    Ok(answer)
 }
 
 /// Waits until the daemon's signal-cli let the account go (`.ok` gone), for at most 30 s.
@@ -812,9 +864,7 @@ pub async fn setup(cfg: &crate::config::Config, args: &[String]) -> anyhow::Resu
             let asked = json!({"captcha": captcha.trim(), "voice": voice});
             rpc.call("register", number, asked).await?;
             let how = if voice { "call" } else { "SMS" };
-            let code: String = dialoguer::Input::new()
-                .with_prompt(format!("the code from Signal's {how}"))
-                .interact_text()?;
+            let code = ask(CODE_TIMEOUT, format!("the code from Signal's {how}")).await?;
             let code = json!({"verificationCode": code.trim()});
             rpc.call("verify", number, code).await?;
             drop(rpc);

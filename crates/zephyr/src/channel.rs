@@ -191,6 +191,19 @@ impl std::fmt::Display for StillGoing {
 
 impl std::error::Error for StillGoing {}
 
+/// The channel's account is held for a while (Signal's setup re-registering): the reply waits,
+/// pending, as long as the hold's lease runs, whatever its window.
+#[derive(Debug)]
+pub struct Paused;
+
+impl std::fmt::Display for Paused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the channel is paused while its account is set up")
+    }
+}
+
+impl std::error::Error for Paused {}
+
 /// How long `detach` waits for its task before it answers `StillGoing`; well inside the
 /// router's own send timeout, so the router never cuts one off itself.
 const DETACH_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
