@@ -1461,9 +1461,8 @@ pub(crate) fn moved(site: &str, now: Option<&str>, done: &[&str]) -> Option<Stri
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Typed {
     Ok,
-    /// The page was not on the site when the value was about to be typed: its origin then
-    /// (a card: nothing was typed), or its address (a login, [`fill_login`]: the value may
-    /// have reached it).
+    /// The page was not on the site when the value was about to be typed: its origin then.
+    /// Nothing was typed.
     Moved(String),
     /// No field in the page's own document matches the selector: it is not there, or it is
     /// inside a frame, which is never typed into (a frame is another site's document).
@@ -1550,22 +1549,25 @@ pub(crate) async fn type_into(cfg: &Config, site: &str, selector: &str, value: &
 }
 
 /// Types a login's `value` into `selector` with agent-browser's own `fill`, which takes its
-/// refs (`@e2`), Playwright selectors and fields in a shadow root, as [`type_into`] does: on
-/// standard input, `[["get","url"],["fill",SELECTOR,VALUE]]`. The address read right before
-/// the fill, in the same batch, is the origin check; off the site it is `Moved`, its address.
+/// refs (`@e2`), Playwright selectors and fields in a shadow root. The page's address is read
+/// first, alone, and nothing is typed unless it is on `site` (`Moved`, its origin, otherwise);
+/// then, on standard input, `[["frame","main"],["fill",SELECTOR,VALUE]]`: back to the main
+/// frame first, so a frame the agent selected (another site's, embedded) never gets it. A page
+/// that moves between the two is the check-then-fill moment a login fill always had; the
+/// caller reads the address again after.
 async fn fill_login(cfg: &Config, site: &str, selector: &str, value: &str) -> Typed {
-    let steps = match batch(cfg, &(("get", "url"), ("fill", selector, value)), value).await {
+    match page_now(cfg).await {
+        Some(url) if same_origin(site, &url) => {}
+        url => {
+            let on = url.as_deref().and_then(origin);
+            return Typed::Moved(on.map_or("an unknown page".into(), |o| o.ascii_serialization()));
+        }
+    }
+    let steps = match batch(cfg, &(("frame", "main"), ("fill", selector, value)), value).await {
         Ok(steps) => steps,
         Err(e) => return Typed::Failed(e),
     };
-    let url = match said(&steps, 0) {
-        Ok(r) => r["url"].as_str().unwrap_or_default(),
-        Err(e) => return Typed::Failed(e.into()),
-    };
-    if !same_origin(site, url) {
-        return Typed::Moved(url.into());
-    }
-    match said(&steps, 1) {
+    match said(&steps, 0).and_then(|_| said(&steps, 1)) {
         Ok(_) => Typed::Ok,
         Err(e) => Typed::Failed(e.into()),
     }
@@ -1608,9 +1610,9 @@ pub(crate) fn not_typed(typed: &Typed, label: &str) -> Option<String> {
 }
 
 /// Types the login's fields into the page open in agent-browser, once the page is on its site.
-/// Each value is typed by agent-browser's own `fill` right after the page's address is read,
-/// in one batch (`fill_login`); the address is read again after each field, so a page that
-/// moves away gets no further field.
+/// Each value is typed by agent-browser's own `fill` in the main frame, once the page's address
+/// is read on the site (`fill_login`); the address is read again after each field, so a page
+/// that moves away gets no further field.
 async fn fill(cfg: &Config, login: &Entry, selectors: [Option<String>; 3]) -> String {
     let fields = match fields(login, &selectors, crate::now() as u64) {
         Ok(f) => f,
@@ -1640,10 +1642,6 @@ async fn fill(cfg: &Config, login: &Entry, selectors: [Option<String>; 3]) -> St
     for (label, sel, value) in &fields {
         // On standard input, never an argument: any uid can read a process's arguments.
         let typed = fill_login(cfg, &login.site, sel, value).await;
-        if let Typed::Moved(now) = &typed {
-            done.push(label);
-            return moved(&login.site, Some(now), &done).unwrap_or_default();
-        }
         if let Some(e) = not_typed(&typed, label) {
             let done = match done.is_empty() {
                 true => String::new(),

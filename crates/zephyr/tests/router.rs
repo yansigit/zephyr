@@ -7309,11 +7309,12 @@ async fn a_pass_is_steered_into_the_task_that_asked_while_it_runs() {
 /// `ab-<what>.txt` (without); anything else prints `done: <argv>`. A `batch` reads its commands
 /// (a JSON array) from standard input into `ab-stdin.log`, one batch a line, and answers as
 /// 0.41 does for `[["frame","main"],["eval",SCRIPT]]`: the script's result is `ok`, or what
-/// `ab-fill.txt` holds (`missing`, `moved:<origin>`). For `[["get","url"],["fill",SEL,VALUE]]`
-/// (the vault's login) it answers the address from `ab-batch-url.txt`, else `ab-url.txt`, and
-/// the fill fails with `ab-fill-error.txt`'s text when there is one. With `ab-slow` it first
-/// sleeps that many seconds; with `ab-move-after` the page's address becomes that file's once
-/// it has answered.
+/// `ab-fill.txt` holds (`missing`, `moved:<origin>`). A batch with a `fill` (the vault's login)
+/// types into the frame selected then: `main` once it holds `["frame","main"]`, else the frame
+/// `ab-frame` names; each fill is a line `<frame> <page address> <batch>` in `ab-filled.log`, and
+/// it fails with `ab-fill-error.txt`'s text when there is one. With `ab-slow` it first sleeps
+/// that many seconds; with `ab-move-after` the page's address becomes that file's once a batch
+/// has answered, and with `ab-move-after-url` once a plain `get url` has.
 const FAKE_BROWSER: &str = r#"#!/bin/sh
 d=$(dirname "$0")
 printf '%s\n' "$*" >> "$d/ab-argv.log"
@@ -7326,11 +7327,14 @@ case " $* " in
   *" batch "*)
     in=$(cat); printf '%s\n' "$in" >> "$d/ab-stdin.log"
     [ -f "$d/ab-slow" ] && sleep "$(cat "$d/ab-slow")"
-    case "$in" in '[["get","url"],["fill",'*)
-      u=$(cat "$d/ab-url.txt"); [ -f "$d/ab-batch-url.txt" ] && u=$(cat "$d/ab-batch-url.txt")
+    case "$in" in *'["fill",'*)
+      fr=main; [ -f "$d/ab-frame" ] && fr=$(cat "$d/ab-frame")
+      case "$in" in '[["frame","main"]'*) fr=main; rm -f "$d/ab-frame" ;; esac
+      printf '%s %s %s\n' "$fr" "$(cat "$d/ab-url.txt")" "$in" >> "$d/ab-filled.log"
       f='{"error":null,"index":1,"result":{"filled":true},"success":true}'
       [ -f "$d/ab-fill-error.txt" ] && f="{\"error\":\"$(cat "$d/ab-fill-error.txt")\",\"index\":1,\"result\":null,\"success\":false}"
-      printf '[{"error":null,"index":0,"result":{"url":"%s"},"success":true},%s]\n' "$u" "$f"
+      [ -f "$d/ab-move-after" ] && cp "$d/ab-move-after" "$d/ab-url.txt"
+      printf '[{"error":null,"index":0,"result":{"frame":"main"},"success":true},%s]\n' "$f"
       exit 0 ;;
     esac
     r=ok; [ -f "$d/ab-fill.txt" ] && r=$(cat "$d/ab-fill.txt")
@@ -7341,6 +7345,9 @@ case " $* " in
 esac
 [ -f "$d/ab-$f.$ext" ] || { echo "no $f" >&2; exit 1; }
 cat "$d/ab-$f.$ext"
+if [ "$f" = url ] && [ -f "$d/ab-move-after-url" ]; then
+  cp "$d/ab-move-after-url" "$d/ab-url.txt"; rm -f "$d/ab-move-after-url"
+fi
 "#;
 
 /// A home whose `bin/agent-browser` is the wrapper (zephyr itself, by that name), with the fake
@@ -7384,16 +7391,15 @@ fn typed(home: &Path) -> Vec<String> {
     batches
         .map(|line| {
             let batch: Value = serde_json::from_str(line).expect("a JSON batch");
-            if batch[0] == serde_json::json!(["get", "url"]) {
-                assert_eq!(batch[1][0], "fill", "{batch}");
-                let (sel, value) = (batch[1][1].as_str(), batch[1][2].as_str());
-                return format!("fill {} {}", sel.unwrap(), value.unwrap());
-            }
             assert_eq!(
                 batch[0],
                 serde_json::json!(["frame", "main"]),
                 "the main frame first"
             );
+            if batch[1][0] == "fill" {
+                let (sel, value) = (batch[1][1].as_str(), batch[1][2].as_str());
+                return format!("fill {} {}", sel.unwrap(), value.unwrap());
+            }
             let script = batch[1][1].as_str().expect("an eval script").to_string();
             let literal = |name: &str| -> String {
                 let start = format!("const {name} = ");
@@ -7588,10 +7594,10 @@ async fn a_logins_ref_and_shadow_selectors_go_to_the_browsers_own_fill() {
             "fill css=login-form >> internal:shadow=input#pw hunter2-secret"
         ]
     );
-    // agent-browser's own `fill`, right after the address: not a script's `querySelector`.
+    // agent-browser's own `fill`, in the main frame: not a script's `querySelector`.
     let stdin = std::fs::read_to_string(home.join("ab-stdin.log")).unwrap();
     assert!(
-        stdin.starts_with(r#"[["get","url"],["fill","@e2","aiden"]]"#),
+        stdin.starts_with(r#"[["frame","main"],["fill","@e2","aiden"]]"#),
         "{stdin}"
     );
     let argv = browser_argv(&home);
@@ -7604,17 +7610,21 @@ async fn a_logins_ref_and_shadow_selectors_go_to_the_browsers_own_fill() {
     gw.shutdown().await;
 }
 
-/// The address read in the same batch, right before the fill, is off the site: the value may
-/// have reached that page, and the fill stops there.
+/// The page leaves the site between the fill's first look and a field's own check: nothing is
+/// typed to the other origin. A page that leaves after a field is reported as moved.
 #[tokio::test]
-async fn a_login_page_that_left_the_site_at_the_fill_is_reported_as_moved() {
+async fn a_login_is_never_typed_into_a_page_that_left_the_site() {
     let (home, cfg) = browser_home("vault-fill-moved", "https://github.com/login");
     let vault = VAULT.replace(
         "password = \"hunter2-secret\"\n",
         "password = \"hunter2-secret\"\ngranted = true\n",
     );
     std::fs::write(home.join("vault.toml"), vault).unwrap();
-    std::fs::write(home.join("ab-batch-url.txt"), "https://evil.example/phish").unwrap();
+    std::fs::write(
+        home.join("ab-move-after-url"),
+        "https://evil.example/phish\n",
+    )
+    .unwrap();
     let gw = start(cfg);
     let fill =
         r##"[call vault {"action": "fill", "name": "github", "user": "#u", "password": "#pw"}]"##;
@@ -7622,13 +7632,49 @@ async fn a_login_page_that_left_the_site_at_the_fill_is_reported_as_moved() {
     let reply = reply_where(&gw, "chat", |r| r.contains("\nvault: ")).await;
     assert!(
         reply.contains(
+            "\nvault: but not the username: the page was on https://evil.example when the \
+             username was to be typed"
+        ),
+        "{reply}"
+    );
+    let filled = std::fs::read_to_string(home.join("ab-filled.log")).unwrap_or_default();
+    assert!(!filled.contains("evil.example"), "{filled}");
+    assert!(typed(&home).is_empty());
+    // Back on the site, the page leaves after the username: the password is not sent.
+    std::fs::write(home.join("ab-url.txt"), "https://github.com/login\n").unwrap();
+    std::fs::write(home.join("ab-move-after"), "https://evil.example/phish\n").unwrap();
+    gw.say("m2", "owner", &format!("{fill} again")).await;
+    let reply = reply_where(&gw, "chat", |r| r.contains("\nvault: stopped")).await;
+    assert!(
+        reply.contains(
             "\nvault: stopped: after the username was typed the page was on \
              https://evil.example, not https://github.com"
         ),
         "{reply}"
     );
-    // The password was never sent.
     assert_eq!(typed(&home), ["fill #u aiden"]);
+    gw.shutdown().await;
+}
+
+/// A frame the agent selected (another site's, embedded) never gets the login: the fill goes
+/// back to the page's main frame first.
+#[tokio::test]
+async fn a_login_goes_to_the_main_frame_whatever_frame_was_selected() {
+    let (home, cfg) = browser_home("vault-fill-frame", "https://github.com/login");
+    let vault = VAULT.replace(
+        "password = \"hunter2-secret\"\n",
+        "password = \"hunter2-secret\"\ngranted = true\n",
+    );
+    std::fs::write(home.join("vault.toml"), vault).unwrap();
+    std::fs::write(home.join("ab-frame"), "https://evil.example").unwrap();
+    let gw = start(cfg);
+    let fill =
+        r##"[call vault {"action": "fill", "name": "github", "user": "#u", "password": "#pw"}]"##;
+    gw.say("m1", "owner", fill).await;
+    reply_where(&gw, "chat", |r| r.contains("\nvault: filled")).await;
+    let filled = std::fs::read_to_string(home.join("ab-filled.log")).unwrap();
+    assert_eq!(filled.lines().count(), 2, "{filled}");
+    assert!(filled.lines().all(|l| l.starts_with("main ")), "{filled}");
     gw.shutdown().await;
 }
 
@@ -8083,7 +8129,7 @@ fn set_page(home: &Path, url: &str) {
 fn fills(home: &Path) -> Vec<String> {
     let log = std::fs::read_to_string(home.join("ab-stdin.log")).unwrap_or_default();
     // A card is always typed by the script, which refuses frames: never by agent-browser's fill.
-    assert!(!log.contains(r#"[["get","url"],["fill","#), "{log}");
+    assert!(!log.contains(r#"["fill","#), "{log}");
     typed(home)
 }
 
