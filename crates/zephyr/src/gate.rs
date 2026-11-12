@@ -685,7 +685,11 @@ impl Call {
             _ => return None,
         };
         let (class, targets, summary) = match &gated {
-            Some(g) => (class_key(g.class), g.targets.clone(), g.summary.clone()),
+            Some(g) => (
+                approvals::class_name(g.class),
+                g.targets.clone(),
+                g.summary.clone(),
+            ),
             None => (OUTBOUND, targets, summary),
         };
         // C3: only main's `exec` takes vault tokens; what else names some (a request on the
@@ -737,7 +741,7 @@ impl Call {
                 replay: policy::Replay::Pass,
             }),
             kind: ActionKind::Card,
-            class: class_key(Class::Money).into(),
+            class: approvals::class_name(Class::Money).into(),
             text: format!("{}\n{}", ask.merchant, ask.reason),
             targets: vec![ask.origin],
             summary,
@@ -764,7 +768,7 @@ impl Call {
                 replay: policy::Replay::Run,
             }),
             kind: ActionKind::Call,
-            class: class_key(Class::Messages).into(),
+            class: approvals::class_name(Class::Messages).into(),
             text: format!("{}\n{}", ask.purpose, ask.business.unwrap_or_default()),
             targets: vec![target],
             summary,
@@ -821,7 +825,7 @@ impl Call {
                 replay: policy::Replay::Wait,
             }),
             kind: ActionKind::Wait,
-            class: class.map_or(OUTBOUND, class_key).into(),
+            class: class.map_or(OUTBOUND, approvals::class_name).into(),
             text,
             targets: vec![origin],
             summary,
@@ -1017,7 +1021,7 @@ pub fn due_check(cfg: &Config, store: &Store, a: &Action) -> Option<String> {
         Err(_) => return Some("the gate could not read its records".into()),
     };
     let mode = mode_of(&e, g.class);
-    stricter.then(|| format!("approvals.{} is now {mode}", class_key(g.class)))
+    stricter.then(|| format!("approvals.{} is now {mode}", approvals::class_name(g.class)))
 }
 
 /// The call a held action was made from, as the gate saw it: main's or a task's command, the
@@ -1077,12 +1081,11 @@ fn connector_class(cfg: &Config, server: &str, tool: &str) -> Option<Option<Clas
         .mcp
         .iter()
         .find(|m| m.name.eq_ignore_ascii_case(server))?;
-    Some(match mcp.classes.get(tool)?.trim() {
-        "messages" => Some(Class::Messages),
-        "posts" => Some(Class::Posts),
-        "money" => Some(Class::Money),
-        "none" => None,
-        _ => {
+    let class = mcp.classes.get(tool)?.trim();
+    Some(match class_of(class) {
+        Some(c) => Some(c),
+        None if class == "none" => None,
+        None => {
             let e = approvals::effective(cfg);
             let all = [Class::Messages, Class::Posts, Class::Money];
             all.into_iter().reduce(|a, b| {
@@ -1123,10 +1126,6 @@ pub fn lifetime_secs(a: &Action) -> i64 {
         ActionKind::Wait | ActionKind::Card => 60 * i64::from(WAIT_MINUTES),
         _ => 86_400,
     }
-}
-
-fn class_key(class: Class) -> &'static str {
-    approvals::class_name(class)
 }
 
 fn class_of(key: &str) -> Option<Class> {
@@ -1202,11 +1201,15 @@ fn fact_note(names: &[String]) -> String {
 /// Whether `amount` is known, in `currency` and at most `cap` cents. R21: an amount in another
 /// currency, one naming no currency, or none at all counts as over the cap. R36: the amount
 /// counts rounded up to the cent, so 50.004 is over a cap of 50 (the float error of `x * 100`,
-/// such as 0.1 being 10.000000000000002 cents, is rounded away first).
+/// such as 0.1 being 10.000000000000002 cents, is rounded away first: `approvals::minor_of`).
 fn within(amount: Option<&Amount>, cap: u64, currency: &str) -> bool {
     amount.is_some_and(|a| {
-        let cents = ((a.value * 100.0 * 1e6).round() / 1e6).ceil();
-        a.currency == currency && cents.is_finite() && cents >= 0.0 && cents <= cap as f64
+        // The cap is in cents whatever the currency: the amount's cents, as USD counts them.
+        let cents = approvals::minor_of(a.value, "USD");
+        a.currency == currency
+            && a.value.is_finite()
+            && a.value >= 0.0
+            && u64::try_from(cents).is_ok_and(|c| c <= cap)
     })
 }
 
@@ -1412,7 +1415,7 @@ impl Gate<'_> {
     }
 
     fn by_mode(&self, e: &Effective, g: &Gated) -> rusqlite::Result<Plan> {
-        let class = class_key(g.class);
+        let class = approvals::class_name(g.class);
         // An issuer that asks the owner itself is the approval of its cards: zephyr's own
         // checks ran (the cap, the origin, the facts), and the window follows.
         if self.call.kind == ActionKind::Card
