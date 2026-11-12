@@ -43,15 +43,21 @@ struct Gateway {
 }
 
 /// A port for a gateway's attach listener, below the kernel's ephemeral range (32768 up), so a
-/// `bind(0)` elsewhere cannot take it before the router binds it. Each test process has its own
-/// block of 30, by pid.
+/// `bind(0)` elsewhere cannot take it before the router binds it. A process never hands a port out
+/// twice (a second gateway could get it while the first has yet to bind it), and each process
+/// starts at a random one: nextest runs every test in a process of its own, at the same time.
 fn free_port() -> u16 {
-    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-    // A block per test process, wider than this file's tests: a port handed out twice could go
-    // to a second gateway while the first has yet to bind it.
-    let block = 20_000 + (std::process::id() % 400) as u16 * 100;
+    use std::hash::{BuildHasher, Hasher};
+    static START: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        let r = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        (r % 12_000) as u32
+    });
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     loop {
-        let port = block + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100;
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let port = 20_000 + ((*START + n) % 12_000) as u16;
         if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return port;
         }

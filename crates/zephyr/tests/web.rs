@@ -46,13 +46,20 @@ struct Gateway {
     task: tokio::task::JoinHandle<anyhow::Result<zephyr::router::Exit>>,
 }
 
-/// A port below the kernel's ephemeral range, from this test process's own block of 100 (see
-/// tests/attach.rs `free_port`).
+/// A port below the kernel's ephemeral range, never handed out twice by a process, from a random
+/// start per process (see tests/attach.rs `free_port`).
 fn free_port() -> u16 {
-    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-    let block = 20_000 + (std::process::id() % 100) as u16 * 100;
+    use std::hash::{BuildHasher, Hasher};
+    static START: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        let r = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        (r % 12_000) as u32
+    });
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     loop {
-        let port = block + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100;
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let port = 20_000 + ((*START + n) % 12_000) as u16;
         if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return port;
         }
