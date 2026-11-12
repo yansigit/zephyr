@@ -159,12 +159,13 @@ async fn start(
         format!(
             "[[service]]\nname = \"calls\"\nprovider = \"telnyx\"\nkey = \"{KEY}\"\n\
              account = \"1494404757140276705\"\nfrom = \"+14165550100\"\n\
-             public_key = \"{public_key}\"\napi = \"http://127.0.0.1:{api_port}/v2\"\n"
+             public_key = \"{public_key}\"\n"
         ),
     )
     .unwrap();
     std::fs::write(home.join("call_script"), lines).unwrap();
     let mut cfg = config(&home, port, "");
+    cfg.calls_api = format!("http://127.0.0.1:{api_port}/v2");
     std::fs::write(cfg.voice_dir.join("says"), says).unwrap();
     tweak(&mut cfg);
     let (say, feed) = mpsc::channel(16);
@@ -970,7 +971,9 @@ async fn a_restart_mid_call_hangs_up_and_never_redials() {
         .unwrap()
         .parse()
         .unwrap();
-    let cfg = config(&home, port, "");
+    let mut cfg = config(&home, port, "");
+    let api_port = std::fs::read_to_string(telnyx.dir.join("port")).unwrap();
+    cfg.calls_api = format!("http://127.0.0.1:{api_port}/v2");
     let (say, feed) = mpsc::channel(16);
     let sent = Sent::default();
     let (stop, stopped) = oneshot::channel::<()>();

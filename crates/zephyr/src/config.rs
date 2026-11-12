@@ -133,6 +133,9 @@ pub struct Config {
     /// tests' process is not a container, and sets it.
     #[serde(skip)]
     pub calls_off_floor: bool,
+    /// Telnyx's API base. Not configurable; tests point it at a stand-in on this machine.
+    #[serde(skip, default = "calls_api")]
+    pub calls_api: String,
     /// How long a dialled call may go unanswered: Telnyx rings for 30 s. Not configurable; tests
     /// shorten it.
     #[serde(skip, default = "calls_ring")]
@@ -225,6 +228,10 @@ fn link_api() -> String {
 
 fn link_auth() -> String {
     crate::cards_link::AUTH.into()
+}
+
+fn calls_api() -> String {
+    crate::calls::telnyx::API.into()
 }
 
 fn calls_ring() -> std::time::Duration {
@@ -763,6 +770,7 @@ impl Config {
         self.link_api = running.link_api.clone();
         self.link_auth = running.link_auth.clone();
         self.calls_off_floor = running.calls_off_floor;
+        self.calls_api = running.calls_api.clone();
         self.calls_ring = running.calls_ring;
         self.calls_silence = running.calls_silence;
         self.calls_now = running.calls_now;

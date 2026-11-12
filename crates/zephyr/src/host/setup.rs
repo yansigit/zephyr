@@ -1115,7 +1115,6 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let account = a.value("--account")?;
     let from = a.value("--from")?;
     let public_key = a.value("--public-key")?;
-    let api = a.value("--api")?;
     let rest = a.rest()?;
     let usage = "usage: zephyr vault list | add login NAME --site URL [--user U] [--totp] | \
                  add token NAME [--host HOST].. [--header HEADER].. | edit NAME [--site URL] \
@@ -1217,7 +1216,6 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
                 account: account.unwrap_or_default(),
                 from: from.unwrap_or_default(),
                 public_key: public_key.unwrap_or_default(),
-                api: api.unwrap_or_default(),
             })?;
             let provider = vault.service(name).map(|s| s.provider).unwrap_or_default();
             format!("saved the {name} service ({provider}); only zephyr's own client reads it")

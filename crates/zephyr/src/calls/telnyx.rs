@@ -55,7 +55,7 @@ use std::time::Duration;
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 /// Telnyx's own API.
-const API: &str = "https://api.telnyx.com/v2";
+pub const API: &str = "https://api.telnyx.com/v2";
 /// The vault's `[[service]]` this reads.
 pub const SERVICE: &str = "calls";
 /// How long the other side's phone rings before Telnyx gives up (its default).
@@ -116,6 +116,8 @@ pub struct Dial {
 #[derive(Clone)]
 pub struct Telnyx {
     vault: PathBuf,
+    /// The API's base address, `Config::calls_api`: Telnyx's own but in tests.
+    api: String,
     http: reqwest::Client,
     /// The account's public key as the vault had it when the file was last changed: a request
     /// on the public listener is checked without reading the vault again.
@@ -143,6 +145,7 @@ impl Telnyx {
         let http = reqwest::Client::builder().timeout(HTTP_WAIT).build();
         Telnyx {
             vault: crate::vault::path(cfg),
+            api: cfg.calls_api.clone(),
             // The builder fails only when the TLS backend cannot start, as `Client::new` would.
             http: http.unwrap_or_default(),
             public_key: Default::default(),
@@ -155,11 +158,38 @@ impl Telnyx {
         telnyx.service().map(|_| telnyx)
     }
 
+    /// The calls service, checked as the owner's save was (`Service::usable`), with its key
+    /// wiped: the ids a request needs, never the secret.
     fn service(&self) -> Result<Service, String> {
+        let mut s = self.read()?;
+        crate::vault::wipe_str(&mut s.key);
+        s.key.clear();
+        Ok(s)
+    }
+
+    /// The calls service as the vault has it now, key and all; [`Key`] and [`Telnyx::service`]
+    /// take it apart at once.
+    fn read(&self) -> Result<Service, String> {
         let vault = crate::vault::Vault::load(&self.vault).map_err(|_| NOT_SET_UP)?;
-        let s = vault.service(SERVICE).ok_or(NOT_SET_UP)?;
-        // The same check the owner's save went through (`Service::usable`).
-        s.usable().map(|()| s).map_err(|_| NOT_SET_UP.into())
+        let mut s = vault.service(SERVICE).ok_or(NOT_SET_UP)?;
+        if s.usable().is_err() {
+            crate::vault::wipe_str(&mut s.key);
+            return Err(NOT_SET_UP.into());
+        }
+        Ok(s)
+    }
+
+    /// What Telnyx's error text is shown with: every vault value, the key among them, read
+    /// for this one use and wiped after.
+    fn scrubbed(&self, text: &str) -> String {
+        let mut secrets = crate::vault::Vault::load(&self.vault)
+            .map(|v| v.secrets())
+            .unwrap_or_default();
+        let shown = crate::settings::one_line(&crate::vault::scrub(text, &secrets), 200);
+        secrets
+            .iter_mut()
+            .for_each(|(_, v)| crate::vault::wipe_str(v));
+        shown
     }
 
     /// The key Telnyx signs with, read from the vault only when the file changed since the
@@ -184,24 +214,28 @@ impl Telnyx {
         self.service().ok().map(|s| s.from)
     }
 
-    /// One Call Control request. An error is Telnyx's own words, cut, with the key scrubbed
-    /// out of whatever it echoed.
+    /// One Call Control request. The key is read from the vault for it and wiped once it is
+    /// sent. An error is Telnyx's own words, cut, with every vault value scrubbed out of
+    /// whatever it echoed.
     async fn post(&self, path: &[&str], body: Value) -> Result<Value, String> {
-        let s = self.service()?;
-        let base = if s.api.is_empty() { API } else { &s.api };
-        let mut url = url::Url::parse(base).map_err(|_| "the provider's address is not a URL")?;
+        let not_url = "the provider's address is not a URL";
+        let mut url = url::Url::parse(&self.api).map_err(|_| not_url)?;
+        // https, but for a test's stand-in on this machine: the key goes nowhere else.
+        let local = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+        if url.scheme() != "https" && !(url.scheme() == "http" && local) {
+            return Err("not run: Telnyx's address must be https".into());
+        }
         // A call id is Telnyx's text: as a path segment it cannot add one.
-        (url.path_segments_mut())
-            .map_err(|_| "the provider's address is not a URL")?
-            .extend(path);
-        let scrub = |text: String| {
-            let secrets = [(SERVICE.to_string(), s.key.clone())];
-            crate::settings::one_line(&crate::vault::scrub(&text, &secrets), 200)
-        };
-        let sent = self.http.post(url).bearer_auth(&s.key).json(&body).send();
-        let res = sent
-            .await
-            .map_err(|e| scrub(format!("Telnyx could not be reached: {}", e.without_url())))?;
+        (url.path_segments_mut()).map_err(|_| not_url)?.extend(path);
+        let key = Key(std::mem::take(&mut self.read()?.key));
+        // shortcut: reqwest copies the key into the request's header, which is dropped with the
+        // request but not wiped; a wiping header needs a client of our own.
+        let sent = self.http.post(url).bearer_auth(&key.0).json(&body).send();
+        let res = sent.await;
+        drop(key);
+        let res = res.map_err(|e| {
+            self.scrubbed(&format!("Telnyx could not be reached: {}", e.without_url()))
+        })?;
         let status = res.status();
         let answer: Value = res.json().await.unwrap_or_default();
         if !status.is_success() {
@@ -209,12 +243,18 @@ impl Telnyx {
             let detail = (detail["detail"].as_str())
                 .or(detail["title"].as_str())
                 .unwrap_or_default();
-            return Err(scrub(format!(
-                "Telnyx answered {}: {detail}",
-                status.as_u16()
-            )));
+            return Err(self.scrubbed(&format!("Telnyx answered {}: {detail}", status.as_u16())));
         }
         Ok(answer)
+    }
+}
+
+/// The API key for one request, wiped when it is dropped.
+struct Key(String);
+
+impl Drop for Key {
+    fn drop(&mut self) {
+        crate::vault::wipe_str(&mut self.0);
     }
 }
 
@@ -520,9 +560,10 @@ pub(crate) mod tests {
 
     const KEY: &str = "KEY0123456789telnyx";
 
-    /// A config whose vault has a `calls` service on `api`, signed for by `public_key`.
+    /// A config whose vault has a `calls` service signed for by `public_key`, with the API at
+    /// `api`.
     pub fn with_service(name: &str, api: &str, public_key: &str) -> Config {
-        let cfg = crate::calls::tests::config(name, "");
+        let mut cfg = crate::calls::tests::config(name, "");
         let mut vault = crate::vault::Vault::parse("").unwrap();
         let service = Service {
             name: SERVICE.into(),
@@ -531,10 +572,10 @@ pub(crate) mod tests {
             account: "1494404757140276705".into(),
             from: "+14165550100".into(),
             public_key: public_key.into(),
-            api: api.into(),
         };
         vault.put_service(service).unwrap();
         std::fs::write(crate::vault::path(&cfg), vault.to_string()).unwrap();
+        cfg.calls_api = api.into();
         cfg
     }
 
@@ -603,6 +644,24 @@ pub(crate) mod tests {
         assert_eq!(telnyx.hangup("x").await.unwrap_err(), NOT_SET_UP);
         assert!(Telnyx::load(&cfg).is_err());
         assert!(!format!("{:?}", Telnyx::load(&cfg).err()).contains(KEY));
+    }
+
+    /// The API base is the config's, never the vault's, and is https but for a test's
+    /// stand-in on this machine: the key goes to nothing else.
+    #[tokio::test]
+    async fn the_api_base_is_https_or_a_local_stand_in() {
+        let plain = crate::calls::tests::config("telnyx-https-default", "");
+        assert_eq!(plain.calls_api, API, "Telnyx's own when nothing sets it");
+        let mut cfg = with_service("telnyx-https", "", crate::vault::tests::TEST_PUBLIC_KEY);
+        cfg.calls_api = "http://api.telnyx.com/v2".into();
+        let err = Telnyx::load(&cfg).unwrap().hangup("x").await.unwrap_err();
+        assert_eq!(err, "not run: Telnyx's address must be https");
+        // The vault's old `api` key is read by nothing.
+        let path = crate::vault::path(&cfg);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{text}api = \"http://127.0.0.1:9/v2\"\n")).unwrap();
+        cfg.calls_api = API.into();
+        assert_eq!(Telnyx::new(&cfg).api, API);
     }
 
     /// With Telnyx's own speech the dial asks for no stream, and speaking and transcribing

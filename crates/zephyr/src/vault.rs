@@ -213,8 +213,6 @@ pub struct Service {
     /// The key the provider signs its webhooks and media connections with (Telnyx: the
     /// account's ed25519 public key, base64).
     pub public_key: String,
-    /// The API's base address; empty is the provider's own. A test's stand-in sets it.
-    pub api: String,
 }
 
 /// The services a vault may hold, one of each.
@@ -241,13 +239,7 @@ impl Service {
         if self.provider.is_empty() || !login_name(&self.provider) {
             bail!("service {}: the provider is a lowercase name", self.name);
         }
-        let values = [
-            &self.key,
-            &self.account,
-            &self.from,
-            &self.public_key,
-            &self.api,
-        ];
+        let values = [&self.key, &self.account, &self.from, &self.public_key];
         if !values.iter().all(|v| plain(v)) {
             bail!("service {}: its values take no spaces", self.name);
         }
@@ -450,7 +442,6 @@ impl Vault {
                 account: s(t, "account"),
                 from: s(t, "from"),
                 public_key: s(t, "public_key"),
-                api: s(t, "api"),
             })
             .collect()
     }
@@ -472,7 +463,6 @@ impl Vault {
                 (&mut new.account, &old.account),
                 (&mut new.from, &old.from),
                 (&mut new.public_key, &old.public_key),
-                (&mut new.api, &old.api),
             ] {
                 if field.is_empty() {
                     field.clone_from(saved);
@@ -493,11 +483,7 @@ impl Vault {
         set(&mut t, "provider", &new.provider);
         set(&mut t, "key", &new.key);
         set(&mut t, "account", &new.account);
-        for (key, value) in [
-            ("from", &new.from),
-            ("public_key", &new.public_key),
-            ("api", &new.api),
-        ] {
+        for (key, value) in [("from", &new.from), ("public_key", &new.public_key)] {
             if !value.is_empty() {
                 set(&mut t, key, value);
             }
@@ -1831,7 +1817,6 @@ programs = ["gh"]
             account: "1494".into(),
             from: "+14165550100".into(),
             public_key: TEST_PUBLIC_KEY.into(),
-            api: String::new(),
         };
         v.put_service(service.clone()).unwrap();
         // A call needs each of Telnyx's ids.
@@ -1895,7 +1880,6 @@ programs = ["gh"]
             account: "1494".into(),
             from: "+14165550100".into(),
             public_key: TEST_PUBLIC_KEY.into(),
-            api: String::new(),
         };
         let refused = |s: Service| {
             let said = Vault::parse("").unwrap().put_service(s).unwrap_err();
