@@ -3,6 +3,8 @@
 //! own `RPI_CODING_AGENT_DIR`, reports what it printed, and records the account in `zephyr.toml`
 //! once `rpi auth check --json` says the credential is stored. Nothing here restarts the daemon.
 
+mod common;
+use common::reap_logins_at_exit;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -59,6 +61,7 @@ fn prune() {
 /// A fresh home with a `zephyr.toml` that already holds `extra`, loaded as the gateway would.
 fn setup(name: &str, extra: &str) -> (Config, PathBuf) {
     prune();
+    reap_logins_at_exit();
     let root = std::env::temp_dir().join(format!(
         "zephyr-login-{name}-{}-{}",
         std::process::id(),
@@ -365,6 +368,62 @@ async fn a_key_login_records_the_account_and_never_reports_the_key() {
             file.display()
         );
     }
+}
+
+/// Not a test of its own: `a_login_left_running_dies_with_its_test_process` runs it in a process
+/// of its own, where it starts an OAuth sign-in and ends without cancelling it, as a test that
+/// panics midway does. It writes the login's account dir to `$ZEPHYR_LEFT_LOGIN`.
+#[tokio::test]
+#[ignore]
+async fn leave_a_login_running() {
+    let Some(out) = std::env::var_os("ZEPHYR_LEFT_LOGIN") else {
+        return;
+    };
+    let (cfg, home) = setup("left", "");
+    std::fs::write(home.join("login_url"), "").unwrap();
+    let start = zephyr::auth::start(&cfg, "antigravity", None, Some("antigravity/m".into()))
+        .await
+        .unwrap();
+    let dir = cfg.home.join("accounts").join(&start.account);
+    let rpi = cfg.rpi.display().to_string();
+    wait_for(
+        || {
+            login_processes(&dir)
+                .iter()
+                .any(|p| cmdline_of(*p).contains(&rpi))
+        },
+        "the login's rpi child to run",
+    )
+    .await;
+    std::fs::write(out, dir.display().to_string()).unwrap();
+}
+
+#[tokio::test]
+async fn a_login_left_running_dies_with_its_test_process() {
+    let out = std::env::temp_dir().join(format!(
+        "zephyr-login-left-{}-{}",
+        std::process::id(),
+        zephyr::unix_millis()
+    ));
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "leave_a_login_running",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("ZEPHYR_LEFT_LOGIN", &out)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let dir = PathBuf::from(std::fs::read_to_string(&out).expect("the helper's account dir"));
+    let _ = std::fs::remove_file(&out);
+    // The test process is gone: its `script` and the rpi under it went with it.
+    wait_for(
+        || login_processes(&dir).iter().all(|p| dead(*p)),
+        "the left login's processes to die",
+    )
+    .await;
 }
 
 #[tokio::test]

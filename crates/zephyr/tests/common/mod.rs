@@ -84,3 +84,20 @@ pub fn test_exe(path: &Path, text: &str) {
         path.display()
     );
 }
+
+/// Cancels, as the test process exits, every login it started and left running (a test that
+/// panicked, or ended mid-sign-in). A login lives in a static registry, which nothing drops, so
+/// its `script` and the rpi in its pty would outlive the process. Killing `script` hangs up the
+/// pty, which ends the rpi under it. Called by each test that starts a login.
+pub fn reap_logins_at_exit() {
+    extern "C" fn reap() {
+        for id in zephyr::auth::logins() {
+            zephyr::auth::cancel(&id);
+        }
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: registers a plain function to run at exit.
+    ONCE.call_once(|| unsafe {
+        libc::atexit(reap);
+    });
+}

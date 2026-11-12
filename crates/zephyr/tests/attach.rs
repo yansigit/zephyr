@@ -50,6 +50,7 @@ fn start(name: &str) -> Gateway {
 
 /// `extra` is appended to the config, after `[attach]`.
 fn start_with(name: &str, extra: &str) -> Gateway {
+    common::reap_logins_at_exit();
     let home = std::env::temp_dir().join(format!(
         "zephyr-attach-{name}-{}-{}",
         std::process::id(),
