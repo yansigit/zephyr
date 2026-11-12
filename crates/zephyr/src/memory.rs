@@ -23,6 +23,8 @@ pub const GOAL_USAGE: &str = "usage: /goal add <text> | /goal done N | /goal rm 
 const PERSONA_USAGE: &str = "usage: /persona set <text> | /persona clear | /persona";
 /// Subject prefix of every commit this module makes. `/memory undo` looks for it.
 const PREFIX: &str = "memory: ";
+/// Subject tag of a `/forget` commit, which `/memory undo` reverts even when it touched only notes.
+const FORGET: &str = " forget";
 /// The longest diff a notice carries.
 const DIFF_CHARS: usize = 1500;
 
@@ -82,7 +84,7 @@ pub fn prepare(home: &Path, state: &Path, agent_dir: &Path) -> anyhow::Result<St
         // Local to this repo only: never the account's global identity.
         git(&dir, &["config", "user.name", "Zephyr"])?;
         git(&dir, &["config", "user.email", "zephyr@localhost"])?;
-        commit_locked(home)?;
+        commit_locked(home, "")?;
         read_working(home)?
     };
     if !approved_dir(state).exists() {
@@ -417,7 +419,7 @@ pub fn commit_checked(
     };
     let sha = {
         let _fs = crate::agent::fs();
-        commit_locked(home)?
+        commit_locked(home, "")?
     };
     let working = {
         let _fs = crate::agent::fs();
@@ -742,15 +744,18 @@ fn mark_shown(state: &Path, working: &Files) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// Commits whatever changed; the new commit's sha, `None` when nothing had.
-fn commit_locked(home: &Path) -> anyhow::Result<Option<String>> {
+/// Commits whatever changed, `memory: <time><tag>`; the new commit's sha, `None` when nothing had.
+fn commit_locked(home: &Path, tag: &str) -> anyhow::Result<Option<String>> {
     let dir = dir(home);
     if git(&dir, &["status", "--porcelain"])?.is_empty() {
         return Ok(None);
     }
     git(&dir, &["add", "-A"])?;
     let when = crate::pool::iso(crate::now());
-    git(&dir, &["commit", "-q", "-m", &format!("{PREFIX}{when}")])?;
+    git(
+        &dir,
+        &["commit", "-q", "-m", &format!("{PREFIX}{when}{tag}")],
+    )?;
     git(&dir, &["rev-parse", "HEAD"]).map(Some)
 }
 
@@ -1046,8 +1051,13 @@ fn undo(home: &Path, state: &Path) -> anyhow::Result<String> {
     if read_working(home)? != approved {
         let reverted = match head {
             Some(h) => {
+                // Only the commits that changed the approved files: a job's notes stay. (A
+                // /forget is refused while a change waits, so none is in the range.)
                 let range = format!("{}..HEAD", h.trim());
-                let ok = git(&dir, &["revert", "--no-edit", &range]).is_ok();
+                let shas = git(&dir, &["rev-list", &range, "--", USER, MEMORY])?;
+                let mut args = vec!["revert", "--no-edit"];
+                args.extend(shas.lines());
+                let ok = git(&dir, &args).is_ok();
                 if !ok {
                     let _ = git(&dir, &["revert", "--abort"]); // leave the tree as it was
                 }
@@ -1137,7 +1147,7 @@ pub fn forget_lines(home: &Path, state: &Path, text: &str) -> Result<Forgot, Str
     let _guard = lock();
     let approved = read_approved(state).map_err(failed)?;
     let fs = crate::agent::fs();
-    commit_locked(home).map_err(failed)?;
+    commit_locked(home, "").map_err(failed)?;
     if read_working(home).map_err(failed)? != approved {
         return Err(waiting_first("/forget"));
     }
@@ -1187,7 +1197,7 @@ pub fn forget_lines(home: &Path, state: &Path, text: &str) -> Result<Forgot, Str
             sha: None,
         });
     }
-    let sha = commit_locked(home).map_err(failed)?;
+    let sha = commit_locked(home, FORGET).map_err(failed)?;
     let working = read_working(home).map_err(failed)?;
     drop(fs);
     approve(home, state, &working).map_err(failed)?;
@@ -1220,7 +1230,7 @@ pub fn squash_history(home: &Path, state: &Path) -> Result<String, String> {
     let approved = read_approved(state).map_err(failed)?;
     let fs = crate::agent::fs();
     let dir = dir(home);
-    commit_locked(home).map_err(failed)?;
+    commit_locked(home, "").map_err(failed)?;
     if read_working(home).map_err(failed)? != approved {
         return Err(waiting_first("/memory squash yes"));
     }
@@ -1269,17 +1279,22 @@ fn revert_newest(home: &Path) -> anyhow::Result<String> {
     let dir = dir(home);
     // Newest first. Each revert cancels the next memory commit below it, so repeated undos walk back.
     let log = git(&dir, &["log", "--format=%H %s"])?;
+    // A commit of the approved files, or a /forget: a job's notes-only commit is not undone.
+    let approved = git(&dir, &["log", "--format=%H", "--", USER, MEMORY])?;
+    let approved: std::collections::HashSet<&str> = approved.lines().collect();
     let mut owed = 0;
     let Some(sha) = log.lines().find_map(|line| {
         let (sha, subject) = line.split_once(' ')?;
+        let undoable =
+            subject.starts_with(PREFIX) && (approved.contains(sha) || subject.ends_with(FORGET));
         if subject.starts_with("Revert \"memory: ") {
             owed += 1;
             None
-        } else if subject.starts_with(PREFIX) && owed > 0 {
+        } else if undoable && owed > 0 {
             owed -= 1;
             None
         } else {
-            subject.starts_with(PREFIX).then_some(sha)
+            undoable.then_some(sha)
         }
     }) else {
         bail!("no memory commit to undo");
@@ -1514,6 +1529,42 @@ mod tests {
             !agents(&home).lines().any(|l| l == "one"),
             "an undo of a kept change is approved"
         );
+    }
+
+    #[test]
+    fn undo_leaves_a_jobs_notes_alone() {
+        let home = home();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
+        std::fs::write(dir(&home).join(MEMORY), "one\n").unwrap();
+        settle(&home);
+        say(&home, "/memory ok");
+        std::fs::write(dir(&home).join(MEMORY), "two\n").unwrap();
+        settle(&home);
+        // A job's note, committed after the change that waits.
+        std::fs::write(dir(&home).join("notes/a.md"), "a job's note\n").unwrap();
+        settle(&home);
+
+        let reply = say(&home, "/memory undo");
+        assert!(reply.contains("dropped"), "got {reply}");
+        let read = |name: &str| std::fs::read_to_string(dir(&home).join(name)).ok();
+        assert_eq!(read(MEMORY).as_deref(), Some("one\n"));
+        assert_eq!(read("notes/a.md").as_deref(), Some("a job's note\n"));
+
+        // An undo of a kept change skips the newer notes-only commit too.
+        std::fs::write(dir(&home).join("notes/b.md"), "another\n").unwrap();
+        settle(&home);
+        let reply = say(&home, "/memory undo");
+        assert!(reply.starts_with("[zephyr] undid "), "got {reply}");
+        assert_eq!(read(MEMORY).as_deref(), Some("# MEMORY.md\n"));
+        assert_eq!(read("notes/b.md").as_deref(), Some("another\n"));
+
+        // A /forget that only touched notes is still the owner's to undo.
+        forget_lines(&home, &state(&home), "another").unwrap();
+        assert_eq!(read("notes/b.md").as_deref(), Some(""));
+        let reply = say(&home, "/memory undo");
+        assert!(reply.starts_with("[zephyr] undid "), "got {reply}");
+        assert_eq!(read("notes/b.md").as_deref(), Some("another\n"));
+        assert_eq!(read(MEMORY).as_deref(), Some("# MEMORY.md\n"));
     }
 
     #[test]
