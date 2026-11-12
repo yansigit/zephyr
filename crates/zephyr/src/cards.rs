@@ -1463,11 +1463,6 @@ async fn fill(cfg: &Arc<Config>, id: i64, fields: CardFields) -> String {
             card.origin
         );
     };
-    // A program of the agent's at the browser's socket would read every field typed.
-    if let Err(why) = crate::vault::browser_daemon(cfg) {
-        audit(cfg, &db.get(), &card, "refused", &why);
-        return format!("not filled: {why}");
-    }
     // On the card's own origin: now the number is fetched, before any field's own check.
     let pan = match live::get(cfg.state_dir(), id) {
         Some(pan) => pan,

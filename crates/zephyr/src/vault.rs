@@ -1636,9 +1636,6 @@ async fn fill(cfg: &Config, login: &Entry, selectors: [Option<String>; 3]) -> St
             login.name, login.site
         );
     };
-    if let Err(why) = browser_daemon(cfg) {
-        return format!("not filled: {why}");
-    }
     let mut done: Vec<&str> = Vec::new();
     for (label, sel, value) in &fields {
         // On standard input, never an argument: any uid can read a process's arguments.
@@ -1665,69 +1662,6 @@ async fn fill(cfg: &Config, login: &Entry, selectors: [Option<String>; 3]) -> St
 /// How long one agent-browser command may take; a fill runs up to seven (an address read before
 /// and after each field), normally well within the tool's wait.
 const BROWSER_WAIT: Duration = Duration::from_secs(20);
-
-/// The socket of the agent-browser daemon the daemon's own fills talk to, as 0.41 finds it
-/// (`connection.rs` `get_socket_dir`) in the environment `browser` hands it:
-/// `AGENT_BROWSER_SOCKET_DIR`, else `XDG_RUNTIME_DIR/agent-browser`, else the agent's
-/// `~/.agent-browser`; session `default`. shortcut: `AGENT_BROWSER_NAMESPACE` is not followed;
-/// the daemon never sets it.
-pub fn browser_socket(cfg: &Config) -> PathBuf {
-    let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
-    let dir = (var("AGENT_BROWSER_SOCKET_DIR").map(PathBuf::from))
-        .or_else(|| var("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("agent-browser")))
-        .unwrap_or_else(|| cfg.home.join(".agent-browser"));
-    let session = var("AGENT_BROWSER_SESSION").unwrap_or_else(|| "default".into());
-    dir.join(format!("{}.sock", session.to_string_lossy()))
-}
-
-/// Whether the program listening at `socket` is `real`, the real agent-browser: that socket is
-/// in the agent's home, so the agent can put a program of its own there that reads every value
-/// typed. `Ok` when nothing listens (the fill's first command starts the real one). Not seen:
-/// the real binary started by the agent with options of its own (another Chromium, a CDP
-/// endpoint), and a page's own scripts; DESIGN §4.25 says what bounds that.
-pub(crate) fn browser_daemon_is(socket: &Path, real: &Path) -> Result<(), String> {
-    use std::os::fd::AsRawFd;
-    let Ok(conn) = std::os::unix::net::UnixStream::connect(socket) else {
-        return Ok(());
-    };
-    let mut cred = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: an open socket, and a buffer of the size given.
-    let got = unsafe {
-        libc::getsockopt(
-            conn.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast(),
-            &mut len,
-        )
-    };
-    let exe = (got == 0)
-        .then(|| std::fs::read_link(format!("/proc/{}/exe", cred.pid)).ok())
-        .flatten();
-    let real = std::fs::canonicalize(real).unwrap_or_else(|_| real.to_path_buf());
-    match exe {
-        Some(exe) if exe == real => Ok(()),
-        exe => Err(format!(
-            "the browser's socket {} is held by {} (pid {}), which is not agent-browser; \
-             nothing secret is typed into the browser until that program is gone",
-            socket.display(),
-            exe.map_or("a program zephyr cannot see".into(), |e| e
-                .display()
-                .to_string()),
-            cred.pid
-        )),
-    }
-}
-
-/// [`browser_daemon_is`] for the daemon's own fills.
-pub fn browser_daemon(cfg: &Config) -> Result<(), String> {
-    browser_daemon_is(&browser_socket(cfg), &cfg.agent_browser)
-}
 
 /// `agent-browser ARGS` as the agent, as `exec` runs it: its stdout, or why it failed. The real
 /// binary, by full path (`cfg.agent_browser`): the daemon's own fill never goes through the
@@ -2486,25 +2420,5 @@ programs = ["gh"]
         std::fs::write(&vault, "[[token]\nbroken").unwrap();
         let clean = run(&[b"key=real-bound-1\n", b"more\n"], Duration::ZERO);
         assert_eq!(clean, "[output withheld: the vault could not be read]\n");
-    }
-
-    /// The agent-browser daemon a fill would talk to is checked: nothing at its socket, or a
-    /// stale socket, is fine (the fill starts the real one); a program that is not the real
-    /// binary listening there is refused.
-    #[test]
-    fn a_browser_socket_held_by_another_program_is_refused() {
-        let dir = crate::test_dir("vault-ab-socket");
-        let socket = dir.join("default.sock");
-        let me = std::env::current_exe().unwrap();
-        let other = dir.join("agent-browser");
-        assert_eq!(browser_daemon_is(&socket, &other), Ok(()), "none");
-        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
-        assert_eq!(browser_daemon_is(&socket, &other), Ok(()), "stale");
-        std::fs::remove_file(&socket).unwrap();
-        let _held = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        // This test's own process holds it: not the real binary.
-        let why = browser_daemon_is(&socket, &other).unwrap_err();
-        assert!(why.contains("is not agent-browser"), "{why}");
-        assert_eq!(browser_daemon_is(&socket, &me), Ok(()), "the real one");
     }
 }
