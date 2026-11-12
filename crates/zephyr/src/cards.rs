@@ -400,6 +400,8 @@ pub struct FakeScript {
     /// How long `close` takes to answer.
     pub close_delay: std::time::Duration,
     pub fail_close: bool,
+    /// What `state` says once a close went: a charge that comes in late.
+    pub state_after_close: Option<CardState>,
     pub asks_owner: bool,
 }
 
@@ -419,6 +421,7 @@ impl Default for FakeScript {
             issue_delay: std::time::Duration::ZERO,
             close_delay: std::time::Duration::ZERO,
             fail_close: false,
+            state_after_close: None,
             asks_owner: false,
         }
     }
@@ -499,7 +502,12 @@ impl Issuer for Fake {
         tokio::time::sleep(delay).await;
         Self::with(&self.state, |s| match s.fail_close {
             true => Err(ProviderError("the issuer did not answer".into())),
-            false => Ok(()),
+            false => {
+                if let Some(state) = s.state_after_close.take() {
+                    s.state = state;
+                }
+                Ok(())
+            }
         })
     }
 }
@@ -1612,6 +1620,8 @@ enum Word {
     Closed(String, Result<(), String>),
     /// The answer to the close that follows a charge, with the charge as the owner reads it.
     UsedClosed(String, Result<(), String>),
+    /// What the issuer says of a card it took a close of (`why`) and that may have been charged.
+    Settled(String, Result<CardState, String>),
 }
 
 static WORDS: Mutex<Vec<(PathBuf, Card, Word)>> = Mutex::new(Vec::new());
@@ -1664,7 +1674,14 @@ pub fn ask_close(cfg: &Arc<Config>, store: &Store, card: Card, why: &str) {
 
 /// Records how a close of `card` went at its issuer. One the issuer refused leaves the card
 /// `closing`: each later tick tries again, and the owner is told once.
-fn closed(cfg: &Config, store: &Store, card: &Card, why: &str, said: Result<(), String>, now: i64) {
+fn closed(
+    cfg: &Arc<Config>,
+    store: &Store,
+    card: &Card,
+    why: &str,
+    said: Result<(), String>,
+    now: i64,
+) {
     // Whatever the issuer said: the number is never filled again.
     live::forget(cfg.state_dir(), card.id, now);
     // Asked before the issuer had made the card, so with nothing there to close: if the issue
@@ -1687,6 +1704,35 @@ fn closed(cfg: &Config, store: &Store, card: &Card, why: &str, said: Result<(), 
         }
         return;
     }
+    // Its Pay click may have gone: the issuer is asked once more what it was charged, so a
+    // charge that comes in late is recorded, and counted, before the card ends closed.
+    let fresh = store.card(card.id).ok().flatten();
+    if let Some(fresh) = fresh.filter(|c| c.status == "closing" && chargeable(cfg, c)) {
+        let (cfg, why) = (cfg.clone(), why.to_string());
+        tokio::spawn(async move {
+            let state = match issuer(&cfg) {
+                Ok(issuer) => issuer.state(&fresh).await.map_err(|e| e.0),
+                Err(e) => Err(e),
+            };
+            say(&cfg, fresh, Word::Settled(why, state));
+        });
+        return;
+    }
+    closed_now(cfg, store, card, why, now);
+}
+
+/// Whether closing `card` may still see a charge: an issuer that reports them, on a card that
+/// was open or past its Pay click when its close was asked.
+fn chargeable(cfg: &Config, card: &Card) -> bool {
+    let from = card.closing_from.as_deref();
+    card.provider_ref.is_some()
+        && caps(cfg).is_some_and(|c| c.charges)
+        && matches!(from, Some("open" | "charging"))
+}
+
+/// The close of `card` is taken: it is closed (or `unknown`, a hand-made one), and the owner
+/// and the agent are told.
+fn closed_now(cfg: &Config, store: &Store, card: &Card, why: &str, now: i64) {
     // A hand-made card is the owner's to delete: until they say so, it is not known closed.
     let to = match card.provider == "manual" && card.last4.is_some() {
         true => "unknown",
@@ -1803,6 +1849,10 @@ pub fn tick(cfg: &Arc<Config>, store: &Store, now: i64) {
             Word::State(state) => stated(cfg, store, card, state, now),
             Word::Closed(why, said) => closed(cfg, store, &card, &why, said, now),
             Word::UsedClosed(what, said) => used_closed(cfg, store, &card, &what, said),
+            Word::Settled(why, state) => match state {
+                Ok(CardState::Used(charges)) => used(cfg, store, card, &charges, now),
+                _ => closed_now(cfg, store, &card, &why, now),
+            },
         }
     }
     for card in store.cards_in(&["unknown"]).unwrap_or_default() {
@@ -1813,10 +1863,12 @@ pub fn tick(cfg: &Arc<Config>, store: &Store, now: i64) {
     }
     let mut asks: Vec<(Card, Option<&'static str>)> = Vec::new();
     for card in store.cards_in(&UNSETTLED).unwrap_or_default() {
-        // A close the issuer refused is asked again.
+        // A close the issuer refused is asked again; a card that may have been charged is
+        // asked about first, so a charge is not missed ([`stated`] closes it again).
         if card.status == "closing" {
             if card.provider_ref.is_some() && poll_due(cfg, card.id) {
-                asks.push((card, Some(RETRY)));
+                let state = chargeable(cfg, &card);
+                asks.push((card, (!state).then_some(RETRY)));
             }
             continue;
         }
@@ -1883,6 +1935,15 @@ fn stated(
             }
         }
         Ok(CardState::Used(charges)) => used(cfg, store, card, &charges, now),
+        // A closing card the issuer has not closed: its close is asked again.
+        Ok(CardState::Open | CardState::Waiting) | Err(_) if card.status == "closing" => {
+            let mut card = card;
+            let cfg = cfg.clone();
+            tokio::spawn(async move {
+                let said = close_at_issuer(&cfg, &mut card).await;
+                say(&cfg, card, Word::Closed(RETRY.into(), said));
+            });
+        }
         Ok(CardState::Closed) => {
             live::forget(cfg.state_dir(), card.id, now);
             if store
@@ -1892,6 +1953,10 @@ fn stated(
                 audit(cfg, store, &card, "close", "closed at the issuer");
                 let text = "the issuer closed it; it cannot be filled";
                 note(store, &card, "closed", text);
+                if card.status == "closing" {
+                    let text = format!("[zephyr] card #{} is closed at the issuer now", card.id);
+                    tell(store, &card, &text);
+                }
             }
         }
         Ok(CardState::Failed(why)) => {

@@ -473,13 +473,15 @@ pub struct Card {
     pub payment: Option<i64>,
     /// The page a fill of its number went through on: the one page whose Pay click it covers.
     pub filled: Option<String>,
+    /// Its status when its close was asked (`Store::card_closing`).
+    pub closing_from: Option<String>,
 }
 
 const CARD_COLS: &str =
     "id, proposal, provider, provider_ref, last4, origin, merchant, cap_minor, \
                          currency, uses, kind, status, channel, sender, session, created_at, \
                          expires_at, closed_at, charged_minor, charged_currency, merchant_id, \
-                         descriptor, mcc, approval_url, told_at, payment, filled";
+                         descriptor, mcc, approval_url, told_at, payment, filled, closing_from";
 
 fn card_row(r: &rusqlite::Row) -> rusqlite::Result<Card> {
     Ok(Card {
@@ -510,6 +512,7 @@ fn card_row(r: &rusqlite::Row) -> rusqlite::Result<Card> {
         told_at: r.get(24)?,
         payment: r.get(25)?,
         filled: r.get(26)?,
+        closing_from: r.get(27)?,
     })
 }
 
@@ -1152,7 +1155,8 @@ impl Store {
                     expires_at INTEGER NOT NULL, closed_at INTEGER,
                     charged_minor INTEGER, charged_currency TEXT, merchant_id TEXT,
                     descriptor TEXT, mcc TEXT, approval_url TEXT, told_at INTEGER,
-                    filled TEXT); -- the page a fill of its number went through on
+                    filled TEXT, -- the page a fill of its number went through on
+                    closing_from TEXT); -- its status when its close was asked
                  PRAGMA user_version = 20;",
             )?;
             // An install from before the payment window is told of it once (`Router`'s tick).
@@ -2092,7 +2096,8 @@ impl Store {
     /// over or closing already.
     pub fn card_closing(&self, id: i64, now: i64) -> rusqlite::Result<bool> {
         let n = self.db.execute(
-            "UPDATE cards SET status = 'closing', expires_at = min(expires_at, ?2)
+            "UPDATE cards SET closing_from = status, status = 'closing',
+                    expires_at = min(expires_at, ?2)
              WHERE id = ?1 AND status IN ('waiting', 'open', 'charging')",
             params![id, now],
         )?;

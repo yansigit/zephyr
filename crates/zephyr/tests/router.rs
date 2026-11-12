@@ -9290,3 +9290,68 @@ async fn a_close_right_after_the_issue_recorded_the_card_is_carried_out() {
     );
     gw.shutdown().await;
 }
+
+/// A card whose Pay click went, filled and clicked under `/ok`: the gateway, the issuer's
+/// script and the card's home.
+async fn charging_card(name: &str) -> (PathBuf, Config, Gateway) {
+    let (home, cfg) = card_home(name, "fake", "");
+    let script = cfg.clone();
+    let gw = start(cfg);
+    gw.say("g1", "owner", &card_ask("42.50")).await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    gw.say("g2", "owner", "/ok 1").await;
+    reply_where(&gw, "chat", |r| r.contains("[card #1 issued")).await;
+    gw.say("g3", "owner", CARD_FILL).await;
+    reply_where(&gw, "chat", |r| r.contains("\ncard: filled")).await;
+    pay_page(&home, "CA$42.50");
+    gw.say("g4", "owner", &click_send(&home)).await;
+    wait(|| card_status(&home, 1) == "charging").await;
+    (home, script, gw)
+}
+
+fn cad(minor: i64) -> zephyr::cards::Charge {
+    zephyr::cards::Charge {
+        minor,
+        currency: "CAD".into(),
+        ..Default::default()
+    }
+}
+
+/// A charge the issuer reports only after the close of a card whose Pay click went is still
+/// recorded, and the window counts it, before the card would end closed.
+#[tokio::test]
+async fn a_charge_that_comes_after_the_close_is_recorded() {
+    use zephyr::cards::{CardState, Fake};
+    let (home, script, gw) = charging_card("card-late-charge").await;
+    Fake::script(&script, |s| {
+        s.state_after_close = Some(CardState::Used(vec![cad(4300)]))
+    });
+    gw.say("g5", "owner", "/stop").await;
+    reply_where(&gw, "chat", |r| {
+        r.starts_with("[zephyr] card #1 was charged 43.00 CAD")
+    })
+    .await;
+    assert_eq!(card_status(&home, 1), "used");
+    let store = Store::open(&home.join("state.db")).unwrap();
+    assert_eq!(store.payments_since(0, "CAD").unwrap(), (1, 4300, false));
+    gw.shutdown().await;
+}
+
+/// While the issuer refuses the close of a card whose Pay click went, the card is still asked
+/// about, so its charge is recorded.
+#[tokio::test]
+async fn a_closing_card_is_still_asked_about_its_charge() {
+    use zephyr::cards::{CardState, Fake};
+    let (home, script, gw) = charging_card("card-closing-charge").await;
+    Fake::script(&script, |s| s.fail_close = true);
+    gw.say("g5", "owner", "/stop").await;
+    reply_where(&gw, "chat", |r| r.contains("could not be closed")).await;
+    assert_eq!(card_status(&home, 1), "closing");
+    Fake::script(&script, |s| s.state = CardState::Used(vec![cad(4250)]));
+    wait(|| card_status(&home, 1) == "used").await;
+    reply_where(&gw, "chat", |r| {
+        r.starts_with("[zephyr] card #1 was charged 42.50 CAD")
+    })
+    .await;
+    gw.shutdown().await;
+}
