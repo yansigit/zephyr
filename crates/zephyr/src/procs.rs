@@ -952,7 +952,10 @@ mod tests {
         script: &str,
         skew: i64,
     ) -> (Proc, std::process::Child) {
-        let p = store.add_proc(script, "chat", "o").unwrap().unwrap();
+        let p = store
+            .add_proc_for(script, "chat", "o", None)
+            .unwrap()
+            .unwrap();
         let log = log_path(cfg, p.id);
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         let file = std::fs::File::create(&log).unwrap();
@@ -1186,7 +1189,7 @@ mod tests {
     async fn an_orphan_left_by_a_crash_is_adopted_and_its_recorded_exit_reported() {
         let (cfg, mut store) = setup("procs-orphan");
         let p = store
-            .add_proc("sleep 1; echo orphan", "chat", "o")
+            .add_proc_for("sleep 1; echo orphan", "chat", "o", None)
             .unwrap()
             .unwrap();
         let log = log_path(&cfg, p.id);
@@ -1236,7 +1239,10 @@ mod tests {
     #[test]
     fn a_command_that_ended_while_no_daemon_watched_is_reported_from_its_record() {
         let (cfg, mut store) = setup("procs-gone");
-        let p = store.add_proc("make", "chat", "o").unwrap().unwrap();
+        let p = store
+            .add_proc_for("make", "chat", "o", None)
+            .unwrap()
+            .unwrap();
         let log = log_path(&cfg, p.id);
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         std::fs::write(&log, "built\n").unwrap();

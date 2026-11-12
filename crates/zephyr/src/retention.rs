@@ -327,7 +327,14 @@ mod tests {
             Some(1)
         );
         store.set_task_session(1, "task-1").unwrap();
-        assert_eq!(store.add_proc("ls", "chat", "o").unwrap().unwrap().id, 1);
+        assert_eq!(
+            store
+                .add_proc_for("ls", "chat", "o", None)
+                .unwrap()
+                .unwrap()
+                .id,
+            1
+        );
 
         let s = home.join("sessions/--zephyr--");
         for d in [&s, &home.join(".procs"), &home.join("tasks")] {

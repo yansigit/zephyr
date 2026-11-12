@@ -411,7 +411,7 @@ async fn restart_with_dispatched_rows_resends_only_what_the_session_lacks() {
             })
             .unwrap()
             .unwrap();
-        store.mark_dispatched(row_id).unwrap();
+        store.mark_dispatched_as(row_id, "prompt").unwrap();
         seeded.push(InboxRow {
             id: row_id,
             channel: "chat".into(),
@@ -1465,7 +1465,7 @@ async fn a_run_cut_off_by_a_restart_taints_its_conversation() {
         })
         .unwrap()
         .unwrap();
-    store.mark_dispatched(id).unwrap();
+    store.mark_dispatched_as(id, "prompt").unwrap();
     assert_eq!(store.session_origin("main").unwrap(), SessionOrigin::Clean);
     drop(store);
     let gw = start(cfg);

@@ -1328,17 +1328,9 @@ impl Store {
         Ok(())
     }
 
-    /// Marks the row dispatched and counts the attempt, before the child sees it.
-    pub fn mark_dispatched(&self, id: i64) -> rusqlite::Result<()> {
-        self.db.execute(
-            "UPDATE inbox SET status = 'dispatched', tries = tries + 1 WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(())
-    }
-
-    /// As `mark_dispatched`, recording how the row went to the child: `prompt`, `steer` or
-    /// `continue` (DESIGN §4.1). Kept so a restart can rebuild what a run's steers were.
+    /// Marks the row dispatched and counts the attempt, before the child sees it, recording how
+    /// it went: `prompt`, `steer` or `continue` (DESIGN §4.1). Kept so a restart can rebuild what
+    /// a run's steers were.
     pub fn mark_dispatched_as(&self, id: i64, sent_as: &str) -> rusqlite::Result<()> {
         self.db.execute(
             "UPDATE inbox SET status = 'dispatched', tries = tries + 1, sent_as = ?2 WHERE id = ?1",
@@ -3353,17 +3345,8 @@ impl Store {
         tx.commit()
     }
 
-    /// Records a started `exec`. `None` when [`MAX_RUNNING_PROCS`] are running already.
-    pub fn add_proc(
-        &self,
-        command: &str,
-        channel: &str,
-        recipient: &str,
-    ) -> rusqlite::Result<Option<Proc>> {
-        self.add_proc_for(command, channel, recipient, None)
-    }
-
-    /// As `add_proc`, for the command of held action `action` the owner approved.
+    /// Records a started `exec`, with the held action `action` the owner approved, if it is one.
+    /// `None` when [`MAX_RUNNING_PROCS`] are running already.
     pub fn add_proc_for(
         &self,
         command: &str,
@@ -4210,9 +4193,18 @@ mod tests {
         let dir = crate::test_dir("store-procs");
         let mut store = Store::open(&dir.join("state.db")).unwrap();
         let procs: Vec<Proc> = (0..MAX_RUNNING_PROCS)
-            .map(|_| store.add_proc("sleep 9", "chat", "o").unwrap().unwrap())
+            .map(|_| {
+                store
+                    .add_proc_for("sleep 9", "chat", "o", None)
+                    .unwrap()
+                    .unwrap()
+            })
             .collect();
-        assert_eq!(store.add_proc("ls", "chat", "o").unwrap(), None, "capped");
+        assert_eq!(
+            store.add_proc_for("ls", "chat", "o", None).unwrap(),
+            None,
+            "capped"
+        );
         // Ended in its turn: the model had the output, so main gets no report.
         store
             .finish_proc(&procs[0], "exited", Some(0), None, 5)
@@ -4940,7 +4932,7 @@ mod tests {
             assert_eq!(task.model.as_deref(), Some("p/m"));
             assert_eq!(task.subagent.as_deref(), Some("explorer"));
             assert_eq!(task.preamble.as_deref(), Some("You explore."));
-            assert_eq!(store.add_proc("ls", "chat", "o").unwrap().unwrap().id, 1);
+            assert_eq!(store.add_proc_for("ls", "chat", "o", None).unwrap().unwrap().id, 1);
             // The v9 and v10 columns, there whichever version the db came from.
             store
                 .db
@@ -5104,7 +5096,10 @@ mod tests {
     fn writers_since_sees_running_and_recently_started_work() {
         let mut store = Store::open(&crate::test_dir("store-writers").join("state.db")).unwrap();
         assert!(!store.writers_since(0).unwrap());
-        let p = store.add_proc("ls", "chat", "o").unwrap().unwrap();
+        let p = store
+            .add_proc_for("ls", "chat", "o", None)
+            .unwrap()
+            .unwrap();
         store
             .db
             .execute("UPDATE procs SET created_at = 100", [])
@@ -5580,7 +5575,9 @@ mod tests {
             .db
             .execute("UPDATE tasks SET created_at = 60", [])
             .unwrap();
-        store.add_proc("cargo build", "chat", "1000").unwrap();
+        store
+            .add_proc_for("cargo build", "chat", "1000", None)
+            .unwrap();
         store
             .db
             .execute("UPDATE procs SET created_at = 70", [])
@@ -5842,7 +5839,10 @@ mod tests {
             store.finish_task(&t, "completed", "done", now).unwrap();
         }
         for command in ["true", "false"] {
-            let p = store.add_proc(command, "chat", "1000").unwrap().unwrap();
+            let p = store
+                .add_proc_for(command, "chat", "1000", None)
+                .unwrap()
+                .unwrap();
             store
                 .finish_proc(&p, "exited", Some(0), Some(("finished", "out")), now)
                 .unwrap();
@@ -5868,7 +5868,10 @@ mod tests {
         let t = store.start_next_task(now).unwrap().unwrap();
         store.finish_task(&t, "completed", "done", now).unwrap();
         assert_eq!(inbox_count(&store, "task-3", "third goal"), 1);
-        let p = store.add_proc("echo new", "chat", "1000").unwrap().unwrap();
+        let p = store
+            .add_proc_for("echo new", "chat", "1000", None)
+            .unwrap()
+            .unwrap();
         assert_eq!(p.id, 3);
         store
             .finish_proc(&p, "exited", Some(0), Some(("finished", "out")), now)
@@ -5893,7 +5896,7 @@ mod tests {
         }
         store.start_next_task(now).unwrap().unwrap();
         for _ in 0..2 {
-            store.add_proc("sleep 9", "chat", "1000").unwrap();
+            store.add_proc_for("sleep 9", "chat", "1000", None).unwrap();
         }
         store
             .db

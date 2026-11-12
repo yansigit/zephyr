@@ -6233,7 +6233,7 @@ mod tests {
             derived: None,
         };
         let id = r.store.insert_inbox(&m).unwrap().unwrap();
-        r.store.mark_dispatched(id).unwrap();
+        r.store.mark_dispatched_as(id, "prompt").unwrap();
         // The main session's id cannot be read.
         rusqlite::Connection::open(cfg.db_path())
             .unwrap()
