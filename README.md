@@ -432,8 +432,9 @@ a delayed one (`sending at 14:05 unless /cancel 7`) before it goes, and `/held` 
 - **Private facts** (`zephyr facts`, `/facts`, the settings panel): a call that holds one waits for
   you (`hold`; the card names the fact, never its value), goes and tells you (`warn`), or is not
   checked (`off`); `/approvals facts MODE` sets which. A fact allowed for a recipient (`zephyr facts
-  allow phone mum@example.com`) goes to that recipient without a check, but not when the same
-  command also sends data somewhere else (a `curl` beside the mail).
+  allow phone mum@example.com`) goes to that recipient without a check, but only when the
+  command does nothing but that send: anything else beside the mail (a `curl`, a script, even an
+  `echo`) is checked as if it went somewhere unknown.
 
 What it does not stop: an agent set on getting around it, which can run a copy of the real browser,
 send from a Python script or reach a mail API with `curl`. It stops a confused or misled agent

