@@ -272,7 +272,7 @@ fn init_web(h: &Host) -> anyhow::Result<super::web::Restart> {
 /// Writes `preset` as `/approvals PRESET` does (D11, `approvals::preset_edits`): the preset, and
 /// every hand-set class looser than it cleared, so a re-run of `init --preset manual` never
 /// leaves a looser class behind.
-fn write_preset(
+pub(super) fn write_preset(
     doc: &mut toml_edit::DocumentMut,
     preset: crate::approvals::Preset,
 ) -> anyhow::Result<()> {

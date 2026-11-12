@@ -2060,6 +2060,39 @@ fn config_set_while_stopped_edits_the_file_as_before() {
         .any(|c| c.contains(&"set".to_string()) && c.contains(&"zephyr".to_string())));
 }
 
+/// With the container stopped, a registered key is read by its kind as `/set` reads it, and a
+/// preset drops the hand-set classes looser than it, as `/approvals` does.
+#[test]
+fn config_set_while_stopped_reads_a_registered_key_by_its_kind() {
+    let env = Env::new("config-stopped-kinds");
+    env.init(&["--no-start", "--preset", "full"]);
+    let stopped = [("SHIM_STATE", "exited")];
+    let set = |key: &str, value: &str| {
+        let out = env.zephyr_env(&["config", "set", key, value], &stopped);
+        assert!(out.status.success(), "{key} = {value}: {out:?}");
+    };
+    set("approvals.messages", "auto");
+    set("approvals.posts", "ask");
+    set("approvals.preset", "manual");
+    set("review.at", "07:30");
+    set("approvals.strong_only", "loosen,money");
+    set("budget.daily_tokens", "7000");
+    set("budget.daily_tokens", "none");
+    let config = env.config();
+    assert!(config.contains("preset = \"manual\""), "{config}");
+    assert!(
+        !config.contains("messages ="),
+        "looser than manual: {config}"
+    );
+    assert!(config.contains("posts = \"ask\""), "as strict: {config}");
+    assert!(config.contains("at = \"07:30\""), "{config}");
+    assert!(
+        config.contains("strong_only = [\"loosen\", \"money\"]"),
+        "{config}"
+    );
+    assert!(!config.contains("daily_tokens"), "{config}");
+}
+
 /// A connector's rows (`mcp.NAME.hosts`, `.secrets`, `.enabled`) live in its `[[mcp]]` table:
 /// with the container stopped the host edits that table, checked as the daemon would.
 #[test]
