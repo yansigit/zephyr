@@ -4475,6 +4475,43 @@ fn every_copy_in_the_dockerfile_is_in_the_build_context() {
     assert!(checked >= 4, "{checked}");
 }
 
+/// Every image the build pulls (the frontend, each `FROM` and `COPY --from` that is not a stage)
+/// is pinned by digest, and no stage keeps a cache mount a later build would read.
+#[test]
+fn every_image_the_dockerfile_pulls_is_pinned_by_digest() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dockerfile = std::fs::read_to_string(root.join("deploy/Dockerfile")).unwrap();
+    assert!(!dockerfile.contains("--mount=type=cache"), "{dockerfile}");
+    let mut stages = vec!["scratch".to_string()];
+    let mut pinned = 0;
+    for line in dockerfile.lines() {
+        let image = if let Some(s) = line.strip_prefix("# syntax=") {
+            s
+        } else if let Some(rest) = line.strip_prefix("FROM ") {
+            let mut words = rest.split_whitespace();
+            let image = words.next().unwrap();
+            if let (Some("AS"), Some(name)) = (words.next(), words.next()) {
+                stages.push(name.to_string());
+            }
+            image
+        } else if let Some(at) = line.find("--from=") {
+            line[at + 7..].split_whitespace().next().unwrap()
+        } else {
+            continue;
+        };
+        if stages.iter().any(|s| s == image) || image.contains("${") {
+            continue;
+        }
+        let digest = image.split_once("@sha256:").map(|(_, d)| d);
+        assert!(
+            digest.is_some_and(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit())),
+            "{line}"
+        );
+        pinned += 1;
+    }
+    assert!(pinned >= 5, "{pinned}");
+}
+
 /// Both wrappers on the agent's PATH (`agent-browser`, and `xdotool` for a desktop takeover) are
 /// links to this binary in root's gate bin; the real ones stay out of that folder.
 #[test]

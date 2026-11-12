@@ -1322,6 +1322,11 @@ args, so build by hand to change that, then point `ZEPHYR_IMAGE` at the tag:
 docker build -t zephyr-local:ko --build-arg KO_VOICE=1 -f deploy/Dockerfile .
 ```
 
+The base images (`rust`, `node`, `ubuntu`, uv and the Dockerfile frontend) are pinned by digest,
+which `deploy/bump-rpi.sh` does not move: to take a tag's security fixes, read its multi-arch digest
+with `docker buildx imagetools inspect ubuntu:24.04 --format '{{json .Manifest.Digest}}'` and
+replace it in `deploy/Dockerfile`.
+
 Pushing a `v*` tag publishes `ghcr.io/yansigit/zephyr:<version>` (`.github/workflows/image.yml`,
 which tags `ghcr.io/<the repository it runs in>`, so a fork publishes to its own).
 
