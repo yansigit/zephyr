@@ -1123,11 +1123,15 @@ zephyr config set cards.provider manual                 # or link
   published documents and has not yet been run with a real account.
 - **The number never reaches the agent.** Wherever the number, its code or its expiry would show
   in a command's output, its log or a reply, it reads `[card:#7]`. zephyr types the card into
-  the page itself, only into fields of the approved address's own page (not a frame from
-  another site, so an embedded payment form cannot be filled), and closes the card if the page
-  moves away while it types. Until an hour after the card closed, the agent's browser refuses to
-  read that page back (a field's value, the HTML, a script, a screenshot), and a `snapshot` of
-  the page it typed into is refused until the page moves on. `/card` lists your
+  the page itself, only into fields of the approved address's own page, or of a card frame
+  that Stripe (`js.stripe.com` and its `*.js.stripe.com` frames) or Braintree
+  (`assets.braintreegateway.com`) puts directly in that page. It checks the frame where it
+  types: the frame's own origin, that its parent is the page, and that the page is on the
+  approved address. No other frame is filled (an Adyen or Shopify checkout's card fields are
+  not, for now), and the card closes if the page moves away while it types. Until an hour after
+  the card closed, the agent's browser refuses to read that page or that frame's origin back (a
+  field's value, the HTML, a script, a screenshot), and a `snapshot` of the page it typed into
+  is refused until the page moves on. `/card` lists your
   cards; `/card close 7` (or `/card done 7`) closes one early, at the issuer too. `/stop` and
   `/pause` close every open card and stop a fill in hand.
 - **One purchase per card.** The card lets one Pay click through, on the page zephyr filled it
