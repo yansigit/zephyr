@@ -975,7 +975,7 @@ async fn list_models(cfg: &Config, provider: &str, dir: &Path) -> Vec<String> {
 /// `zephyr.toml`, so a token typed where the name goes is refused rather than recorded and printed
 /// by `zephyr status`. The message never repeats what was given: the value is very likely a
 /// pasted credential, and the error goes on to a chat notice and an attach reply.
-fn check_account(name: &str) -> anyhow::Result<()> {
+pub(crate) fn check_account(name: &str) -> anyhow::Result<()> {
     let mut chars = name.chars();
     let first = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit());
     let rest = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');

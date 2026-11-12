@@ -45,6 +45,11 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
     {
         bail!("--network must be bridge or host");
     }
+    // As the daemon's `/login` names an account, before any file is written.
+    for spec in &account_flags {
+        let name = spec.split_once('=').map_or(spec.as_str(), |(n, _)| n);
+        crate::auth::check_account(name).with_context(|| format!("--account {spec}"))?;
+    }
 
     if !no_start && !super::quiet(super::docker(&["version"])) {
         bail!("docker is not reachable: install Docker and make sure `docker version` works");
@@ -113,6 +118,7 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
     if let Some(p) = preset.filter(|_| non_interactive) {
         write_preset(&mut doc, p)?;
     }
+    valid(&doc)?;
     h.data.save(&doc)?;
 
     if non_interactive {
@@ -267,6 +273,13 @@ fn init_web(h: &Host) -> anyhow::Result<super::web::Restart> {
         println!("web app: {e:#}");
     }
     Ok(restart)
+}
+
+/// Refuses a `zephyr.toml` the daemon would not start with, before it is saved.
+fn valid(doc: &toml_edit::DocumentMut) -> anyhow::Result<()> {
+    let cfg: crate::config::Config = toml::from_str(&doc.to_string())?;
+    cfg.validate()
+        .context("zephyr.toml would not load; nothing saved")
 }
 
 /// Writes `preset` as `/approvals PRESET` does (D11, `approvals::preset_edits`): the preset, and
@@ -444,8 +457,10 @@ fn login(
     h.need_running()?;
     let doc = h.data.load()?;
     let name = account.unwrap_or_else(|| next_name(&doc, provider));
-    if name.is_empty() || name.contains(['/', '.']) {
-        bail!("account name {name:?}: no '/' or '.'");
+    // As the daemon's `/login`, before a dir is made or anything signed in; an account already
+    // in the file signs in again under its name.
+    if !conf::accounts(&doc).iter().any(|(n, _)| *n == name) {
+        crate::auth::check_account(&name)?;
     }
     let dir = h.data.account(&name);
     std::fs::create_dir_all(&dir)?;
@@ -535,6 +550,7 @@ fn login(
     // Read again: the sign-in and the picker take minutes, and the daemon may have edited it since.
     let mut doc = h.data.load()?;
     conf::upsert_account(&mut doc, &name, &model);
+    valid(&doc)?;
     h.data.save(&doc)?;
     println!("account {name}: {model}");
     if verify {

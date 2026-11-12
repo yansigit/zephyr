@@ -1893,6 +1893,44 @@ fn login_feeds_secrets_on_stdin_and_records_the_account() {
         .success());
 }
 
+/// An account name the daemon would refuse is refused before anything is signed in or written.
+#[test]
+fn login_and_init_refuse_a_bad_account_name_and_write_nothing() {
+    let env = Env::new("login-bad-name");
+    env.init(&["--no-start"]);
+    let before = env.config();
+    env.calls();
+    let out = env.zephyr_env(
+        &[
+            "login",
+            "claude-code",
+            "--account",
+            "work@home",
+            "--model",
+            "claude-code/claude-sonnet-5",
+        ],
+        &[("CLAUDE_CODE_OAUTH_TOKEN", CLAUDE_TOKEN)],
+    );
+    assert!(!out.status.success(), "{out:?}");
+    assert!(!env.data().join("accounts/work@home").exists());
+    assert!(!env
+        .calls()
+        .iter()
+        .any(|c| c.contains(&"script".to_string())));
+    let projects = env.projects.display().to_string();
+    let out = env.zephyr(&[
+        "init",
+        "--non-interactive",
+        "--no-start",
+        "--projects",
+        &projects,
+        "--account",
+        "work@home=claude-code/claude-sonnet-5",
+    ]);
+    assert!(!out.status.success(), "{out:?}");
+    assert_eq!(env.config(), before);
+}
+
 #[test]
 fn accounts_model_and_config_edit_the_toml() {
     let env = Env::new("edit");
