@@ -72,7 +72,7 @@ if [ -n "$version" ]; then
   done
   [ -n "$run" ] || die "no image workflow run started for $tag"
   gh run watch "$run" --exit-status >/dev/null || die "the image workflow failed: gh run view $run --log-failed
-  if GitHub's runners are out of minutes: gh variable set ZEPHYR_RUNNER --body zephyr-local && gh run rerun $run
+  if GitHub refused it for minutes: gh run rerun $run (the whole run plans again and builds on zephyr-local)
   once the image is published, finish by hand: cargo install --locked --path crates/zephyr && zephyr upgrade"
 fi
 

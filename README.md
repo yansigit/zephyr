@@ -1326,7 +1326,7 @@ deploy/release.sh --cli   # only the host CLI changed: reinstall it, publish not
 ```
 
 Every PR runs fmt, clippy (`-D warnings`, Rust 1.95 as the image) and the tests, and `cargo deny check
-advisories bans` (`.github/workflows/ci.yml`). The script stops at the first problem. It runs fmt,
+advisories bans` (`.github/workflows/ci.yml`, see [CI](#ci)). The script stops at the first problem. It runs fmt,
 clippy and the tests, then the real-rpi suite (`ZEPHYR_REAL_RPI=1 cargo test -- --ignored`, which
 fails rather than skips when the pinned binary is missing) when the binary is on this machine
 (`RPI_BIN=<path>` points it at another copy; the default is the pinned path), sets the version in
@@ -1350,15 +1350,47 @@ projects folder are masked from the agent at each `up` (not inside `.git` or `no
 with a comma cannot be masked and is named in a warning).
 
 The image workflow smoke-tests the built image (zephyr, rpi, the policy plugin and every extension)
-before it pushes, and tags `:<version>` and `:latest` and runs on GitHub-hosted runners. When the
-Actions minutes run out, start the fallback runner on this machine once with
-`deploy/runner/start.sh up`, then `gh variable set ZEPHYR_RUNNER --body zephyr-local` and
-`gh run rerun <id>`; `gh variable delete ZEPHYR_RUNNER` switches back, and
-`deploy/runner/start.sh down` removes it. The runners register with `yansigit/zephyr`, or with
-`ZEPHYR_GH_REPO=<owner/repo>` for a fork. The runner and its rootless BuildKit sit on their own
-Docker network with no Docker socket, no access to the host's files and no route to its
-localhost; services the host serves on all interfaces (SSH, ComfyUI, ...) are still reachable.
-`gh workflow run image.yml --ref <branch>` builds a test image (`:dev`) without pushing it.
+before it pushes, and tags `:<version>` and `:latest`. It runs on GitHub-hosted runners, or on
+this machine's runner (below, building on its rootless BuildKit, without the smoke test) when
+`ZEPHYR_CI=local` or GitHub refused a hosted job in the last 6 hours. If the image run itself is
+refused for minutes, `gh run rerun <id>` (the whole run, not `--failed`) plans again and builds
+here. `gh workflow run image.yml --ref <branch>` builds a test image (`:dev`) without pushing it.
+
+### CI
+
+CI runs on GitHub's runners and on the owner's own, label `zephyr-local`, at once, and gets by
+with either. `.github/ci.sh` holds the placement and the checks; the jobs are:
+
+- `plan` decides where everything goes, from repo variable `ZEPHYR_CI`:
+  - unset or `both`: test shard 3/3 on GitHub-hosted, lint, deny and shards 1/3 and 2/3 here. If
+    GitHub refused a hosted job (spending limit or quota) in any run of the last 6 hours, all of
+    it goes here; the first run after that tries hosted again, so the monthly reset is picked up.
+  - `local`: everything here (`gh variable set ZEPHYR_CI --body local`).
+  - `hosted`: everything on GitHub, for when this machine is down. `plan` needs a runner too, so
+    in the other modes a run waits (up to a day) while no `zephyr-local` runner is online.
+- `lint` (shellcheck, fmt, clippy), `deny` (`cargo deny check advisories bans`) and `test K/3`,
+  each shard a `cargo nextest run --partition hash:K/3` (`.config/nextest.toml` profile `ci`), so
+  a new test lands in a shard by itself. A test that passes only on its one retry is listed as
+  flaky in the job summary; one that hangs is killed after 3 minutes.
+- `rescue` runs here, after them, each check GitHub did not start (failed with no runner and no
+  step; the job's annotation says why). A check that started and failed is never rescued.
+- `ci-ok` passes when every check passed on its own runner or through `rescue`. It is the one
+  check to gate merges on (`gh pr checks <n>`). A rescued run still shows the refused job's red X.
+
+`rpi-bump.yml` runs here unless `ZEPHYR_CI=hosted`; `image.yml` as above.
+
+The runners come from `deploy/runner/start.sh up [N]` (default 2), from the image
+`deploy/runner/Dockerfile` builds: GitHub's runner image with Rust 1.95, nextest, cargo-deny, gh,
+tmux, python3, node and shellcheck. Each gets `ZEPHYR_RUNNER_CPUS` (default 8) CPUs and
+`ZEPHYR_RUNNER_MEMORY` (default 16g), and keeps checkouts and its cargo target dir on its own
+volume `zephyr-runner-<i>-work`, so builds stay incremental (a target dir over 60 GB starts afresh).
+Run `up` again after changing the Dockerfile or the limits: each runner whose image or limits
+differ is replaced once idle, one at a time, and registers again under its name.
+`deploy/runner/start.sh down` unregisters and removes them, keeping the volumes. The runners
+register with `yansigit/zephyr`, or with `ZEPHYR_GH_REPO=<owner/repo>` for a fork. They and the
+rootless BuildKit sit on their own Docker network with no Docker socket, no access to the host's
+files and no route to its localhost; services the host serves on all interfaces (SSH, ComfyUI,
+...) are still reachable.
 
 ### Keeping rpi current
 

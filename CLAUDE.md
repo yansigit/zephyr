@@ -28,7 +28,8 @@ ZEPHYR_CONTAINER=zephyr-test cargo test -p zephyr --test net_floor -- --ignored
 deploy/install.sh [--from-image|--from-source] [--no-init]   # install the CLI on a fresh machine, then zephyr init
 cargo install --path crates/zephyr && zephyr up --build   # build deploy/Dockerfile and run it locally
 deploy/release.sh 0.2.1 | --cli                           # release from a clean main (README "Releasing")
-deploy/runner/start.sh up|down                            # self-hosted fallback runner (README "Releasing")
+deploy/runner/start.sh up [N]|down                        # the owner's zephyr-local CI runners (README "CI")
+cargo nextest run --workspace --profile ci --partition hash:1/3   # one CI test shard, as .github/ci.sh runs it
 deploy/bump-rpi.sh [0.22.0]                               # move every rpi pin; .github/workflows/rpi-bump.yml runs it daily
 ```
 
@@ -309,8 +310,13 @@ mirrors `gateway_kind` and the gate's protocol: change them in the same commit a
 rpi's frame shapes matter, update fake-rpi.py to match the real binary. `Config::tick` (the
 router's 5 s housekeeping tick) is a hidden field like `stall_limit`; tests that wait on it set
 200 ms. Wait on events, not fixed sleeps, and don't assume the order of replies a slow machine can
-reorder (a task's report may be steered into main's running turn). CI (`.github/workflows/ci.yml`)
-runs fmt, clippy and the tests on Rust 1.95 and `cargo deny check advisories bans`;
+reorder (a task's report may be steered into main's running turn). CI (`.github/workflows/ci.yml`,
+README "CI") runs fmt, clippy and shellcheck, `cargo deny check advisories bans` and the tests on
+Rust 1.95, the tests as 3 `cargo nextest` hash shards (each test in its own process, so no test may
+rely on another's process-wide state, such as a port counter), split between the owner's runner
+(`zephyr-local`) and GitHub's by `.github/ci.sh plan` and repo variable `ZEPHYR_CI`
+(`both`|`local`|`hosted`); `rescue` reruns on `zephyr-local` what GitHub refused to start, and
+`ci-ok` is the one check to gate merges on;
 `ZEPHYR_REAL_RPI=1` makes the ignored real-rpi tests fail instead of skip when the binary is missing.
 `tests/cards_link.rs` runs the Link issuer against a stub of Link's API; its ignored
 `a_real_link_card_for_one_dollar` is the owner's spike (`ZEPHYR_LINK_LIVE=1`, after `zephyr card link`).
