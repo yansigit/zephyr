@@ -29,6 +29,8 @@ jobs:
       rescue: ${{ steps.plan.outputs.rescue }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - id: plan
         run: .github/ci.sh plan
         env:
@@ -44,6 +46,8 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       # zephyr-local's image (deploy/runner/Dockerfile) has all of this; GitHub's runners get it here.
       # The toolchain the image builds with (deploy/Dockerfile's rust:1.95), so a newer clippy's lints
       # land with a deliberate bump, not on an unrelated PR.
@@ -72,6 +76,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - run: .github/ci.sh rescue
         env:
           GH_TOKEN: ${{ github.token }}

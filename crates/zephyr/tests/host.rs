@@ -3699,6 +3699,68 @@ fn the_image_workflow_smoke_tests_every_extension() {
     }
 }
 
+/// A crate's build script must never read a GitHub token: GH_TOKEN is set only in a step's own
+/// `env` (never a job's or the workflow's), a step that sets it runs no cargo (nor `ci.sh run`, nor
+/// bump-rpi.sh's `cargo update`), `ci.sh rescue` runs its checks without it, and no checkout keeps
+/// its token in `.git/config`.
+#[test]
+fn no_step_that_runs_cargo_holds_a_github_token() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let code = |l: &&str| !l.trim().is_empty() && !l.trim_start().starts_with('#');
+    let mut tokens = 0;
+    for entry in std::fs::read_dir(root.join(".github/workflows")).unwrap() {
+        let path = entry.unwrap().path();
+        let text = read(&path);
+        let lines: Vec<&str> = text.lines().filter(code).collect();
+        // The lines of the block that starts at `at`: it and everything indented deeper.
+        let block = |at: usize| {
+            let end = (at + 1..lines.len()).find(|&j| indent(lines[j]) <= indent(lines[at]));
+            lines[at..end.unwrap_or(lines.len())].join("\n")
+        };
+        let parent = |at: usize| {
+            (0..at)
+                .rev()
+                .find(|&j| indent(lines[j]) < indent(lines[at]))
+        };
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("- uses: actions/checkout@") {
+                assert!(
+                    block(i).contains("persist-credentials: false"),
+                    "{path:?}: {}",
+                    block(i)
+                );
+            }
+            if !line.trim_start().starts_with("GH_TOKEN:") {
+                continue;
+            }
+            tokens += 1;
+            let env = parent(i).unwrap();
+            let step = match lines[env].trim() {
+                "- env:" => Some(env),
+                "env:" => parent(env).filter(|&s| lines[s].trim_start().starts_with("- ")),
+                other => panic!("{path:?}: GH_TOKEN under {other}"),
+            }
+            .unwrap_or_else(|| panic!("{path:?}: GH_TOKEN outside a step: {line}"));
+            let step = block(step);
+            let words: Vec<&str> = step
+                .split(|c: char| c.is_whitespace() || c == ';')
+                .collect();
+            let ci_run = words.windows(2).any(|w| w == [".github/ci.sh", "run"]);
+            let cargo = ["cargo", "deploy/bump-rpi.sh"]
+                .iter()
+                .any(|c| words.contains(c));
+            assert!(!ci_run && !cargo, "{path:?}:\n{step}");
+        }
+    }
+    assert!(tokens >= 6, "{tokens}");
+    let ci = read(&root.join(".github/ci.sh"));
+    assert!(
+        ci.contains("( unset GH_TOKEN; check \"${name% (*}\" )"),
+        "{ci}"
+    );
+}
+
 #[test]
 fn upgrade_waits_backs_up_and_goes_back_only_with_a_backup() {
     let env = Env::new("upgrade-db");

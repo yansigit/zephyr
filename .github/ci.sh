@@ -126,7 +126,8 @@ rescue() {
   while IFS=$'\t' read -r -u 3 id name; do
     summary "rescue: GitHub did not start '$name' ($(api "repos/$GITHUB_REPOSITORY/check-runs/$id/annotations" \
       --jq '[.[].message] | join(" ")' 2>/dev/null || echo "no annotation")); running it here"
-    check "${name% (*}"
+    # The checks build and run code from the branch: they never see the token.
+    ( unset GH_TOKEN; check "${name% (*}" )
   done 3<<<"$refused"
 }
 
