@@ -439,8 +439,15 @@ fn diff(kind: Kind, name: &str, old: Option<&Content>, new: &Content, max: usize
 }
 
 /// The lines that differ, as `- old` / `+ new` (memory.rs does the same for its two files).
-fn line_diff(a: &str, b: &str) -> String {
+pub(crate) fn line_diff(a: &str, b: &str) -> String {
     let (a, b): (Vec<&str>, Vec<&str>) = (a.lines().collect(), b.lines().collect());
+    // The lines both start and end with are no part of it: only the middle goes in the table.
+    let start = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let end = (a[start..].iter().rev())
+        .zip(b[start..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let (a, b) = (&a[start..a.len() - end], &b[start..b.len() - end]);
     let mut out = String::new();
     // shortcut: past a million line pairs, show both sides whole instead of a quadratic table.
     if a.len() * b.len() > 1_000_000 {

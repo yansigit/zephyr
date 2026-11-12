@@ -767,29 +767,10 @@ fn diff(old: &Files, new: &Files) -> String {
             continue;
         }
         out.push_str(&format!("{name}\n"));
-        let (a, b): (Vec<&str>, Vec<&str>) = (a.lines().collect(), b.lines().collect());
-        // Longest common subsequence, over lines; memory files are small.
-        let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
-        for i in (0..a.len()).rev() {
-            for j in (0..b.len()).rev() {
-                lcs[i][j] = if a[i] == b[j] {
-                    lcs[i + 1][j + 1] + 1
-                } else {
-                    lcs[i + 1][j].max(lcs[i][j + 1])
-                };
-            }
-        }
-        let (mut i, mut j) = (0, 0);
-        while i < a.len() || j < b.len() {
-            if i < a.len() && j < b.len() && a[i] == b[j] {
-                (i, j) = (i + 1, j + 1);
-            } else if j < b.len() && (i == a.len() || lcs[i][j + 1] >= lcs[i + 1][j]) {
-                out.push_str(&format!("+ {}\n", b[j]));
-                j += 1;
-            } else {
-                out.push_str(&format!("- {}\n", a[i]));
-                i += 1;
-            }
+        let lines = crate::drafts::line_diff(a, b);
+        if !lines.is_empty() {
+            out.push_str(&lines);
+            out.push('\n');
         }
     }
     if out.chars().count() > DIFF_CHARS {
@@ -1529,6 +1510,23 @@ mod tests {
             !agents(&home).lines().any(|l| l == "one"),
             "an undo of a kept change is approved"
         );
+    }
+
+    #[test]
+    fn a_long_file_is_diffed_without_a_quadratic_table() {
+        let lines = |tag: &str| (0..3000).map(|i| format!("{tag}{i}\n")).collect::<String>();
+        let old: Files = [String::new(), lines("a")];
+        // One line changed in 3,000: only that line, found past the common start and end.
+        let mut one = lines("a");
+        one = one.replace("a1500\n", "changed\n");
+        assert_eq!(
+            diff(&old, &[String::new(), one]),
+            "MEMORY.md\n+ changed\n- a1500"
+        );
+        // Every line changed: past the cap, both sides whole (cut for the notice).
+        let all = diff(&old, &[String::new(), lines("b")]);
+        assert!(all.starts_with("MEMORY.md\n- a0\n- a1\n"), "{all}");
+        assert!(all.ends_with("(cut; /memory diff shows it all)"), "{all}");
     }
 
     #[test]
