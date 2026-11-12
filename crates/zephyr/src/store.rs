@@ -12,6 +12,9 @@ pub const MAX_OPEN_TASKS: i64 = 64;
 /// `exec` commands running at once (DESIGN §4.13); a start past this is refused.
 pub const MAX_RUNNING_PROCS: i64 = 8;
 
+/// Meta key: the UTC day the owner `/resume`d a budget pause; no charge pauses again that day.
+const BUDGET_RESUMED: &str = "budget.resumed";
+
 /// An inbox row the router still has to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboxRow {
@@ -1496,6 +1499,14 @@ impl Store {
             .optional()
     }
 
+    /// The owner's `/resume` of a budget pause: it holds for the rest of that UTC day.
+    pub fn resume_budget(&self) -> rusqlite::Result<()> {
+        if (self.pause_reason()?).is_some_and(|r| r.starts_with("budget:")) {
+            self.set_meta(BUDGET_RESUMED, Some(&self.today()?))?;
+        }
+        Ok(())
+    }
+
     /// `user` after `/pause`, `budget:<day>` after a budget trip. Either way the pause ends with `/resume`.
     /// A budget pause ends at the next UTC day (SQLite's `date('now')` is UTC).
     pub fn pause_reason(&self) -> rusqlite::Result<Option<String>> {
@@ -1633,9 +1644,10 @@ impl Store {
         Ok(())
     }
 
-    /// Adds a session's new usage to today's spend. Returns true when this charge crossed
-    /// a budget limit, and pauses the gateway for the rest of the UTC day. Shared by `main`
-    /// settles and job runs; the caller sends `BUDGET_NOTICE`.
+    /// Adds a session's new usage to today's spend. Returns true when today's spend is at a
+    /// budget limit (crossed now, or a limit lowered under it) and pauses the gateway for the
+    /// rest of the UTC day, unless the owner's `/resume` overrode it today (meta
+    /// `budget.resumed`). Shared by `main` settles and job runs; the caller sends `BUDGET_NOTICE`.
     pub fn charge(
         &self,
         budget: Option<&crate::config::Budget>,
@@ -1646,10 +1658,10 @@ impl Store {
         let Some(budget) = budget else {
             return Ok(false);
         };
-        // Only the charge that crosses a limit pauses; after `/resume` the override holds for the day.
-        let crossed = budget.exceeded(total_tokens, total_cost)
-            && !budget.exceeded(total_tokens - tokens, total_cost - cost);
-        if !crossed || self.pause_reason()?.is_some() {
+        if !budget.exceeded(total_tokens, total_cost)
+            || self.pause_reason()?.is_some()
+            || self.meta(BUDGET_RESUMED)?.as_deref() == Some(day.as_str())
+        {
             return Ok(false);
         }
         self.set_paused(Some(&format!("budget:{day}")))?;
@@ -4095,6 +4107,32 @@ mod tests {
         );
         store.set_paused(None).unwrap();
         assert_eq!(store.pause_reason().unwrap(), None);
+    }
+
+    #[test]
+    fn a_limit_lowered_below_the_days_spend_pauses_at_the_next_charge() {
+        let dir = crate::test_dir("store-budget-lowered");
+        let store = Store::open(&dir.join("state.db")).unwrap();
+        let wide: crate::config::Budget = toml::from_str("daily_cost_usd = 10").unwrap();
+        assert!(!store.charge(Some(&wide), (0, 6.0)).unwrap());
+        // The owner lowers the limit to under what today has spent: the next charge pauses.
+        let low: crate::config::Budget = toml::from_str("daily_cost_usd = 3").unwrap();
+        assert!(store.charge(Some(&low), (0, 0.5)).unwrap());
+        let day = store.today().unwrap();
+        let paused = format!("budget:{day}");
+        assert_eq!(store.pause_reason().unwrap(), Some(paused.clone()));
+        // `/resume` overrides it for the day.
+        store.resume_budget().unwrap();
+        store.set_paused(None).unwrap();
+        assert_eq!(store.meta("budget.resumed").unwrap(), Some(day));
+        assert!(!store.charge(Some(&low), (0, 0.5)).unwrap());
+        assert_eq!(store.pause_reason().unwrap(), None);
+        // A resume of another day holds no longer.
+        store
+            .set_meta("budget.resumed", Some("2000-01-01"))
+            .unwrap();
+        assert!(store.charge(Some(&low), (0, 0.5)).unwrap());
+        assert_eq!(store.pause_reason().unwrap(), Some(paused));
     }
 
     #[test]

@@ -2332,6 +2332,7 @@ impl<'a> Router<'a> {
                     crate::actions::resume(&self.cfg, &self.store, crate::now());
                     self.due_held = false;
                 }
+                log(self.store.resume_budget().map_err(Into::into));
                 log(self.store.set_paused(None).map_err(Into::into));
                 return "[zephyr] resumed".into();
             }
