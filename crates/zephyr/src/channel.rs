@@ -160,7 +160,7 @@ pub fn chunks(text: &str, max: usize) -> Vec<String> {
     out
 }
 
-/// What a channel with no client nonce (Telegram, Signal) delivered of each reply, so a retry
+/// What a channel with no lasting client nonce (Telegram, Signal, iMessage) delivered of each reply, so a retry
 /// starts after it. The router stops waiting on a send after its timeout, but the platform may
 /// still take what was asked: so a send runs in a task of its own (`detach`; `Sending` moves into
 /// it) and records each piece the platform took. While it goes, a retry of that reply answers

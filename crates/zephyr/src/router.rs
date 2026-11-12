@@ -263,7 +263,7 @@ fn markdown(session: &str, messages: &[Value]) -> String {
 pub fn retry_window(channel: &str) -> i64 {
     match channel {
         "discord" => 5 * 60,
-        // tempGuid dedupes only while a send is in flight, and a timed-out send may duplicate. Accept at-least-once.
+        // tempGuid dedupes only while a send is in flight: the adapter remembers the pieces it sent.
         "imessage" => 5 * 60,
         // No nonce: the adapter remembers the pieces it sent, for as long as this.
         "telegram" => 5 * 60,
