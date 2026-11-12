@@ -1308,6 +1308,12 @@ fn git_cmd(dir: &Path, args: &[&str]) -> Command {
             "core.hooksPath=/dev/null",
             "-c",
             "core.fsmonitor=false",
+            // An automatic gc stays in the call, under its timeout and the memory lock, never
+            // daemonized out of the process group the timeout kills.
+            "-c",
+            "gc.autoDetach=false",
+            "-c",
+            "maintenance.autoDetach=false",
         ])
         .arg("-C")
         .arg(dir)
@@ -1563,6 +1569,19 @@ mod tests {
         assert!(reply.starts_with("[zephyr] undid "), "got {reply}");
         assert_eq!(read("notes/b.md").as_deref(), Some("another\n"));
         assert_eq!(read(MEMORY).as_deref(), Some("# MEMORY.md\n"));
+    }
+
+    #[test]
+    fn git_never_detaches_a_gc_whatever_the_repo_says() {
+        let home = home();
+        prepare(&home, &state(&home), &home.join("agent")).unwrap();
+        for key in ["gc.autoDetach", "maintenance.autoDetach"] {
+            git(&dir(&home), &["config", key, "true"]).unwrap();
+            assert_eq!(
+                git(&dir(&home), &["config", "--get", key]).unwrap(),
+                "false"
+            );
+        }
     }
 
     #[test]
