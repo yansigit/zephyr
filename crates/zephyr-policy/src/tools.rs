@@ -332,9 +332,10 @@ pub const TOOLS: [(&str, &str, &str, ToolExecuteFn); 10] = [
         "vault",
         "The owner's saved credentials, used by name so you never see or type a value. `list` \
          shows the saved logins (name, site, username) and tokens (name, the programs they are \
-         allowed for). `fill` types a login into the page open in agent-browser: give CSS \
-         selectors for any of `user`, `password` and `totp` (a one-time code made now); it fills \
-         only when the page is on the login's own site. The first fill of a login needs the \
+         allowed for). `fill` types a login into the page open in agent-browser: give a \
+         selector for any of `user`, `password` and `totp` (a one-time code made now), a CSS \
+         selector or a ref from agent-browser's snapshot (`@e2`); it fills only when the page is \
+         on the login's own site. The first fill of a login needs the \
          owner's OK: then you are told so; tell the owner and end your turn. Tokens are used \
          through `exec` with `secrets`: the command gets a stand-in, which zephyr swaps for the \
          real token only in HTTPS requests to the hosts the owner bound it to (`list` shows \
@@ -344,7 +345,7 @@ pub const TOOLS: [(&str, &str, &str, ToolExecuteFn); 10] = [
          `name` (logins: lowercase like github; tokens: an env var name like GH_TOKEN), its \
          `kind`, the `site` for a login, and `why`: the owner is asked to save it, and you get a \
          message when they do. Never ask the owner to paste a password or token into the chat.",
-        r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","request","fill","bind"]},"name":{"type":"string"},"hosts":{"type":"array","items":{"type":"string"},"description":"For bind: the exact host names the token is sent to, e.g. api.github.com"},"kind":{"type":"string","enum":["login","token"]},"site":{"type":"string","description":"For request of a login: the site's address, e.g. https://github.com"},"why":{"type":"string"},"user":{"type":"string","description":"For fill: CSS selector of the username field"},"password":{"type":"string","description":"For fill: CSS selector of the password field"},"totp":{"type":"string","description":"For fill: CSS selector of the one-time code field"}},"required":["action"]}"#,
+        r#"{"type":"object","properties":{"action":{"type":"string","enum":["list","request","fill","bind"]},"name":{"type":"string"},"hosts":{"type":"array","items":{"type":"string"},"description":"For bind: the exact host names the token is sent to, e.g. api.github.com"},"kind":{"type":"string","enum":["login","token"]},"site":{"type":"string","description":"For request of a login: the site's address, e.g. https://github.com"},"why":{"type":"string"},"user":{"type":"string","description":"For fill: CSS selector or @e ref of the username field"},"password":{"type":"string","description":"For fill: CSS selector or @e ref of the password field"},"totp":{"type":"string","description":"For fill: CSS selector or @e ref of the one-time code field"}},"required":["action"]}"#,
         vault_execute,
     ),
     (
@@ -356,10 +357,11 @@ pub const TOOLS: [(&str, &str, &str, ToolExecuteFn); 10] = [
          waiting: tell the owner and end your turn; a message comes when the card can be \
          filled. Then `fill` it with its `id` and CSS selectors for the `number`, the `cvc`, \
          and either `expiry` (one MM/YY field) or `month` and `year`, and `name` if the form \
-         asks: zephyr types it into the page open in agent-browser, only on the site it was \
-         approved for. For a field in Stripe's or Braintree's card frame in that page, give \
-         its selector inside the frame (e.g. `input[name=cardnumber]`). You never see the \
-         number and must not try to read it back. `list` shows your cards.",
+         asks: plain CSS selectors only, not `@e` refs. zephyr types it into the page open in \
+         agent-browser, only on the site it was approved for. For a field in Stripe's or \
+         Braintree's card frame in that page, give its selector inside the frame (e.g. \
+         `input[name=cardnumber]`); a field in any other frame is never filled. You never see \
+         the number and must not try to read it back. `list` shows your cards.",
         r#"{"type":"object","properties":{"action":{"type":"string","enum":["request","fill","list"]},"site":{"type":"string","description":"For request: the checkout page's https address"},"merchant":{"type":"string"},"amount":{"type":"string","description":"For request: the total, e.g. 42.50"},"currency":{"type":"string","description":"For request, optional: ISO 4217, e.g. CAD"},"reason":{"type":"string"},"id":{"type":"integer","description":"For fill: the card's number"},"number":{"type":"string","description":"For fill: CSS selector of the card number field"},"expiry":{"type":"string","description":"For fill: CSS selector of a single MM/YY field"},"month":{"type":"string"},"year":{"type":"string"},"cvc":{"type":"string"},"name":{"type":"string"}},"required":["action"]}"#,
         card_execute,
     ),
@@ -500,7 +502,7 @@ pub fn vault_action(params: &Value) -> Result<VaultAction, String> {
         "fill" => {
             let (user, password, totp) = (word("user"), word("password"), word("totp"));
             if user.is_none() && password.is_none() && totp.is_none() {
-                return Err("give the CSS selector of at least one of user, password, totp".into());
+                return Err("give the selector of at least one of user, password, totp".into());
             }
             Ok(VaultAction::Fill {
                 name: name()?,
