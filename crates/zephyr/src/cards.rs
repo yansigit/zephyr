@@ -1305,21 +1305,13 @@ pub fn command(
             // An issuer's card is closed at the issuer, and the owner hears how that went:
             // marking it closed here alone would leave it open there.
             Ok(card) if card.provider != "manual" => match card.status.as_str() {
-                // Closed in the provider's app, as the owner was told to when the issuer
-                // refused zephyr's close: it is tried no more.
-                "closing" => match store.move_card(card.id, &["closing"], "closed", now) {
-                    Ok(_) => {
-                        audit(
-                            cfg,
-                            store,
-                            &card,
-                            "close",
-                            "the owner closed it at the issuer",
-                        );
-                        format!("[zephyr] card #{} is closed", card.id)
-                    }
-                    Err(e) => format!("[zephyr] closing the card failed: {e}"),
-                },
+                // Its close is asked already and tried until the issuer takes it: the owner
+                // hears when it does (`closed`).
+                "closing" => format!(
+                    "[zephyr] card #{}'s close is still being confirmed at the issuer; you are \
+                     told when it is",
+                    card.id
+                ),
                 s if LIVE.contains(&s) => {
                     let id = card.id;
                     ask_close(cfg, store, card, "the owner said it is done");

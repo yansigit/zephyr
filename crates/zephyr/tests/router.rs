@@ -9197,3 +9197,32 @@ async fn a_card_counts_in_the_window_at_its_cap_whatever_the_page_says() {
     assert_eq!(counted(), (1, 4300, false));
     gw.shutdown().await;
 }
+
+/// `/card done` on an issuer's card whose close the issuer has not taken yet does not call it
+/// closed: it stays `closing`, tried again, and the owner is told when the issuer takes it.
+#[tokio::test]
+async fn done_on_a_closing_issuers_card_waits_for_the_issuer() {
+    use zephyr::cards::Fake;
+    let (home, cfg) = card_home("card-done-closing", "fake", "auto 100");
+    let script = cfg.clone();
+    let gw = start(cfg);
+    gw.say("d1", "owner", &card_ask("10")).await;
+    wait(|| card_status(&home, 1) == "open").await;
+    Fake::script(&script, |s| s.fail_close = true);
+    gw.say("d2", "owner", "/stop").await;
+    reply_where(&gw, "chat", |r| r.contains("could not be closed")).await;
+    gw.say("d3", "owner", "/card done 1").await;
+    let said = reply_where(&gw, "chat", |r| r.contains("still being confirmed")).await;
+    assert_eq!(
+        said,
+        "[zephyr] card #1's close is still being confirmed at the issuer; you are told when it is"
+    );
+    assert_eq!(card_status(&home, 1), "closing");
+    Fake::script(&script, |s| s.fail_close = false);
+    reply_where(&gw, "chat", |r| {
+        r == "[zephyr] card #1 is closed at the issuer now"
+    })
+    .await;
+    assert_eq!(card_status(&home, 1), "closed");
+    gw.shutdown().await;
+}
