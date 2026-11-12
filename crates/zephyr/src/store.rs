@@ -2020,7 +2020,7 @@ impl Store {
                 _ if count + 1 > effects => Paid::Over,
                 // A card charged an amount the window cannot count: not known to be within.
                 (Some(_), _) if self.unknown_charge_since(since)? => Paid::Over,
-                (Some(limit), Some(minor)) if sum + minor > limit => Paid::Over,
+                (Some(limit), Some(minor)) if sum.saturating_add(minor) > limit => Paid::Over,
                 (Some(_), None) => Paid::Unread,
                 _ => Paid::Recorded(0),
             };

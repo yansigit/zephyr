@@ -448,6 +448,10 @@ pub fn gated(
                         let v = field(k)?;
                         v.as_f64().or_else(|| v.as_str()?.trim().parse().ok())
                     })?;
+                    // A total is never negative nor infinite: such a value reads as no amount.
+                    if !value.is_finite() || value < 0.0 {
+                        return None;
+                    }
                     let currency = field("currency")
                         .and_then(Value::as_str)
                         .unwrap_or_default()

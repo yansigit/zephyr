@@ -463,7 +463,9 @@ pub fn window_over(
         return Ok(Window::Over(window_text(cfg)));
     }
     Ok(match (w.amount_minor, this) {
-        (Some(limit), Some(this)) if sum + this > limit => Window::Over(window_text(cfg)),
+        (Some(limit), Some(this)) if sum.saturating_add(this) > limit => {
+            Window::Over(window_text(cfg))
+        }
         (Some(_), None) => Window::Unread,
         _ => Window::Within,
     })
@@ -5659,6 +5661,43 @@ mod tests {
         }
         let id = held(&decide(&h.cfg, &h.store, &card_of("10"), owner(), now + 9));
         assert!(h.store.action_strong(id).unwrap());
+    }
+
+    /// A connector's amount is a total only when it is finite and not negative: -1000 does
+    /// not lower the window's sum, and 1e300 does not overflow it.
+    #[test]
+    fn a_negative_or_huge_amount_neither_lowers_nor_overflows_the_window() {
+        let h = home(
+            "gate-window-signs",
+            "[approvals]\ncurrency = 'CAD'\nmoney = 'auto'\n[approvals.window]\namount = 100\n",
+        );
+        let now = crate::now();
+        let pay = |amount: Value, run: &str| {
+            let arguments = json!({"amount": amount, "currency": "CAD"});
+            decide(
+                &h.cfg,
+                &h.store,
+                &mcp("shop", "checkout", arguments, run),
+                owner(),
+                now,
+            )
+        };
+        // Read as no amount: held for an ordinary /ok, and nothing counted.
+        let id = held(&pay(json!(-1000), "signs:1"));
+        assert!(!h.store.action_strong(id).unwrap());
+        assert_eq!(h.store.payments_since(now - 600, "CAD").unwrap().1, 0);
+        // 60 within the window's 100, then 60 more is over it: nothing lowered the sum.
+        assert_eq!(pay(json!(60), "signs:2"), Verdict::Allow);
+        assert!(h
+            .store
+            .action_strong(held(&pay(json!(60), "signs:3")))
+            .unwrap());
+        // A sum past i64 is over the window, not wrapped round to within it.
+        assert!(h
+            .store
+            .action_strong(held(&pay(json!(1e300), "signs:4")))
+            .unwrap());
+        assert_eq!(h.store.payments_since(now - 600, "CAD").unwrap().1, 6000);
     }
 
     /// A payment in the window whose amount is unknown (a card charged in another currency)
