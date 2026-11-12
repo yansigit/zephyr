@@ -177,7 +177,7 @@ mod tests {
             }
         };
         let card = json!({"number": "4111 1111 1111 1111", "expiry": "06/29", "cvc": "123"});
-        let line = json!({"id": "chat-card-1", "text": "/card put 7 new", "card": card});
+        let line = json!({"id": "chat-card-1", "text": "/card put 7 single-use", "card": card});
         client
             .write_all(format!("{line}\n").as_bytes())
             .await
@@ -185,7 +185,7 @@ mod tests {
         let m = rx.recv().await.unwrap();
         assert_eq!(
             (m.platform_msg_id.as_str(), m.text.as_str()),
-            ("chat-card-1", "/card put 7 new")
+            ("chat-card-1", "/card put 7 single-use")
         );
         assert!(!format!("{m:?}").contains("4111"));
         assert_eq!(

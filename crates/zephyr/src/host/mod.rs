@@ -27,7 +27,7 @@ pub const USAGE: &str = "usage: zephyr <command>   (zephyr --version: this CLI's
   subagent list | add NAME [--model P/M] [--prompt TEXT] | edit NAME [--model P/M|default] [--prompt TEXT] | rm NAME
   vault list | add login NAME --site URL [--user U] [--totp] | add token NAME [--host HOST].. | edit NAME [--host HOST].. | rm NAME | revoke NAME [PROGRAM]
   facts list | add NAME --kind text|digits|email | rm NAME | allow NAME TARGET | disallow NAME TARGET
-  card [list] | put N [new|prepaid|other] | done N | close N | link   (virtual cards; put asks for the number, hidden)
+  card [list] | put N single-use|prepaid BALANCE | done N | close N | link   (virtual cards; put asks for the number, hidden)
   config get KEY | set KEY VALUE   (a known setting goes through the daemon while it runs)
   chat | attach [--stock] | shell [bash|zsh] | pause | resume | reload
   doctor [--fix]

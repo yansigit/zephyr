@@ -95,7 +95,8 @@ pub fn doctor(cfg: &Config) -> Vec<String> {
         }
         "manual" => lines.push(
             "ok   cards: manual, no key needed: you make each card and enter it with zephyr \
-             card put N"
+             card put N; zephyr takes only a single-use card or a prepaid one with at most its \
+             cap on it, since the agent could read a number back from its browser"
                 .into(),
         ),
         other => lines.push(format!("ok   cards: {other}")),
@@ -342,8 +343,9 @@ impl Issuer for AnyIssuer {
     }
 }
 
-/// A card the owner makes in their own card app and types in on the host (`zephyr card put`).
-/// There is no issuer to ask: the cap is the balance behind the card, and zephyr sees no charge.
+/// A card the owner makes in their own card app and types in on the host (`zephyr card put`):
+/// single-use, or prepaid with at most the cap on it, so its own limit bounds it. There is no
+/// issuer to ask, and zephyr sees no charge.
 pub struct Manual {
     state: PathBuf,
 }
@@ -1055,10 +1057,13 @@ pub async fn issue(
         ),
         _ => (
             format!(
-                "[zephyr] card #{id}: make a card for this purchase: a new digital card with \
-                 about {cap} behind it, or a prepaid virtual card loaded with {cap}; never your \
-                 main card. Then enter it on the host: zephyr card put {id}. It is filled only \
-                 on {}, and forgotten {mins} min after you enter it; delete it after the charge",
+                "[zephyr] card #{id}: make a card for this purchase: a single-use card (a \
+                 one-time card, such as Wise's), or a prepaid card with at most {cap} on it; \
+                 zephyr takes no other, since the agent could read a number back from its \
+                 browser and only the card's own limit bounds it. Then enter it on the host: \
+                 zephyr card put {id} single-use, or zephyr card put {id} prepaid AMOUNT. It is \
+                 filled only on {}, and forgotten {mins} min after you enter it; delete it \
+                 after the charge",
                 card.origin
             ),
             format!("card #{id} is waiting for the owner to make it; {WAIT_FOR_IT}"),
@@ -1210,11 +1215,39 @@ fn list(cfg: &Config, store: &Store) -> String {
     }
 }
 
-/// What a hand-made card is, as the owner says when entering it.
-pub const KINDS: [&str; 3] = ["new", "prepaid", "other"];
+/// What a hand-made card may be, as the owner says when entering it: one whose own limit bounds
+/// what a leaked number can spend (DESIGN §4.25). `prepaid` comes with its balance.
+pub const KINDS: [&str; 2] = ["single-use", "prepaid"];
+
+/// Why a hand-made card that is not bounded is refused, for card `card`.
+fn unbounded(card: &Card) -> String {
+    format!(
+        "[zephyr] a card you make must be single-use (a one-time card, such as Wise's) or \
+         prepaid with at most {} on it: zephyr card put {id} single-use, or zephyr card put \
+         {id} prepaid AMOUNT. A number typed into the agent's browser can be read back by the \
+         agent, so only the card's own limit bounds what it can spend",
+        crate::approvals::money(card.cap_minor, &card.currency),
+        id = card.id
+    )
+}
+
+/// Whether `kind` (the words after `put N`) is a bounded card for `card`: `single-use`, or
+/// `prepaid` with a balance in the card's currency at most its cap.
+fn bounded(card: &Card, kind: &[&str]) -> bool {
+    match kind {
+        ["single-use"] => true,
+        ["prepaid", balance] => balance
+            .parse::<f64>()
+            .ok()
+            .filter(|b| b.is_finite() && *b > 0.0)
+            .is_some_and(|b| crate::approvals::minor_of(b, &card.currency) <= card.cap_minor),
+        _ => false,
+    }
+}
 
 /// The owner's `/card` on `channel` (`strong` or not), from chat line `msg_id`: `list`,
-/// `put N [KIND]` (the number comes from memory, `entered`), `done N`, `close N`. `None` for
+/// `put N single-use|prepaid BALANCE` (the number comes from memory, `entered`), `done N`,
+/// `close N`. `None` for
 /// what is not a card command.
 pub fn command(
     cfg: &Arc<Config>,
@@ -1240,7 +1273,6 @@ pub fn command(
         ["put", n, ref kind @ ..] => {
             // Taken first: a number that came with a refused line is dropped, never kept.
             let pan = entered(msg_id);
-            let kind = kind.first().copied().unwrap_or("other");
             let card = match found(n) {
                 Ok(card) => card,
                 Err(e) => return Some(e),
@@ -1249,9 +1281,10 @@ pub fn command(
                 let strong = cfg.settings.strong_channels.join(" or ");
                 return Some(format!("[zephyr] entering a card needs {strong}"));
             }
-            if !KINDS.contains(&kind) {
-                return Some(format!("[zephyr] a card is {}", KINDS.join(", ")));
+            if !bounded(&card, kind) {
+                return Some(unbounded(&card));
             }
+            let kind = kind[0];
             if card.provider != "manual" || card.status != "waiting" {
                 return Some(format!(
                     "[zephyr] card #{} is not waiting for a number ({})",
@@ -1346,11 +1379,10 @@ fn put(cfg: &Config, store: &Store, mut card: Card, pan: Pan, kind: &str, now: i
     live::put(cfg.state_dir(), card.id, pan);
     audit(cfg, store, &card, "reveal", "entered by the owner");
     note(store, &card, "issued", &ready(cfg, &card));
-    // What the owner said it is decides what bounds a leaked number.
+    // What the owner said it is is what bounds a number the agent could read back.
     let bound = match kind {
-        "new" => "its cap is the balance behind it",
-        "prepaid" => "its cap is what you loaded",
-        _ => "zephyr cannot tell what bounds it: keep the balance behind it low",
+        "single-use" => "it pays once",
+        _ => "what is on it is what it can spend",
     };
     format!(
         "[zephyr] card #{} (…{}) is ready: filled only on {}, forgotten at {}; {bound}",
@@ -2165,7 +2197,9 @@ mod tests {
         assert_eq!(
             doctor(&manual),
             [
-                "ok   cards: manual, no key needed: you make each card and enter it with zephyr card put N",
+                "ok   cards: manual, no key needed: you make each card and enter it with zephyr \
+                 card put N; zephyr takes only a single-use card or a prepaid one with at most \
+                 its cap on it, since the agent could read a number back from its browser",
                 "ok   cards: up to 100.00 CAD each, open 15 min",
             ]
         );

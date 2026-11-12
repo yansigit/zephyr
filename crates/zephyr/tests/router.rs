@@ -8191,8 +8191,13 @@ async fn a_manual_card_is_approved_entered_filled_on_its_origin_and_forgotten() 
     // The number comes with a chat line, in memory; a strong channel only, and never as text.
     let pan = || zephyr::cards::Pan::parse("4242 4242 4242 4242", "06/29", "123").unwrap();
     zephyr::cards::enter("card-manual-d2", pan());
-    gw.say_on("discord", "card-manual-d2", "downer", "/card put 1 new")
-        .await;
+    gw.say_on(
+        "discord",
+        "card-manual-d2",
+        "downer",
+        "/card put 1 single-use",
+    )
+    .await;
     let refused = reply_where(&gw, "discord", |r| r.contains("entering a card")).await;
     assert_eq!(
         refused,
@@ -8202,11 +8207,49 @@ async fn a_manual_card_is_approved_entered_filled_on_its_origin_and_forgotten() 
         zephyr::cards::entered("card-manual-d2").is_none(),
         "dropped, not kept"
     );
-    gw.say("c5", "owner", "/card put 1 new").await;
+    gw.say("c5", "owner", "/card put 1 single-use").await;
     reply_where(&gw, "chat", |r| r.contains("never typed into a chat")).await;
     assert_eq!(card_status(&home, 1), "waiting");
+    // Only a bounded card is taken: single use, or prepaid with at most the cap on it.
+    for (i, (id, kind)) in [
+        ("card-manual-c5a", "new"),
+        ("card-manual-c5b", ""),
+        ("card-manual-c5c", "prepaid"),
+        ("card-manual-c5d", "prepaid 42.51"),
+        ("card-manual-c5e", "single-use 10"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        zephyr::cards::enter(id, pan());
+        gw.say(id, "owner", format!("/card put 1 {kind}").trim_end())
+            .await;
+        let refused = || {
+            let all = gw.replies().into_iter();
+            all.filter(|r| r.contains("must be single-use")).count()
+        };
+        wait(|| refused() == i + 1).await;
+        assert_eq!(card_status(&home, 1), "waiting", "{kind}");
+        assert!(
+            zephyr::cards::entered(id).is_none(),
+            "its number is dropped"
+        );
+    }
+    let told = gw.replies();
+    let told = told
+        .iter()
+        .find(|r| r.contains("must be single-use"))
+        .unwrap();
+    assert_eq!(
+        told.as_str(),
+        "[zephyr] a card you make must be single-use (a one-time card, such as Wise's) or \
+         prepaid with at most 42.50 CAD on it: zephyr card put 1 single-use, or zephyr card put \
+         1 prepaid AMOUNT. A number typed into the agent's browser can be read back by the \
+         agent, so only the card's own limit bounds what it can spend"
+    );
     zephyr::cards::enter("card-manual-c6", pan());
-    gw.say("card-manual-c6", "owner", "/card put 1 new").await;
+    gw.say("card-manual-c6", "owner", "/card put 1 prepaid 42.50")
+        .await;
     let ready = reply_where(&gw, "chat", |r| r.contains("is ready")).await;
     assert!(
         ready.starts_with(
@@ -8216,7 +8259,7 @@ async fn a_manual_card_is_approved_entered_filled_on_its_origin_and_forgotten() 
     );
     assert_eq!(
         inbox_text(&home, "card-manual-c6").as_deref(),
-        Some("/card put 1 new")
+        Some("/card put 1 prepaid 42.50")
     );
     // The agent is told, as a note of zephyr's.
     reply_where(&gw, "chat", |r| {

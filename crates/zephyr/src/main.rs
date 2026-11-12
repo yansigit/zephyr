@@ -410,20 +410,21 @@ async fn web(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `zephyr card [list] | put N [new|prepaid|other] | done N | close N | link`, run by the
+/// `zephyr card [list] | put N single-use|prepaid BALANCE | done N | close N | link`, run by the
 /// host's `zephyr card` (DESIGN §4.25). `put` asks for the number, the expiry and the code
 /// (hidden on a terminal, else three lines on stdin), checks them here, and hands them to the
 /// daemon on the chat socket, a strong channel: they stay in its memory and reach no file.
 async fn card(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
     use std::io::IsTerminal;
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let usage = "usage: zephyr card [list] | put N [new|prepaid|other] | done N | close N | link";
+    let usage =
+        "usage: zephyr card [list] | put N single-use|prepaid BALANCE | done N | close N | link";
     let (text, card) = match args[..] {
         [] | ["list"] => ("/card".to_string(), None),
         ["done", n] => (format!("/card done {n}"), None),
         ["close", n] => (format!("/card close {n}"), None),
         ["link"] => return zephyr::cards_link::login(cfg).await,
-        ["put", n, ref kind @ ..] if kind.len() <= 1 => {
+        ["put", n, ref kind @ ..] if kind.len() <= 2 => {
             let terminal = std::io::stdin().is_terminal();
             let mut lines = std::io::stdin().lines();
             let mut field = |prompt: &str| -> anyhow::Result<String> {
@@ -436,18 +437,25 @@ async fn card(cfg: &Config, args: &[String]) -> anyhow::Result<()> {
             let number = field("card number")?;
             let expiry = field("expiry, MM/YY")?;
             let cvc = field("security code")?;
-            let kind = match (kind.first(), terminal) {
-                (Some(kind), _) => kind.to_string(),
-                (None, false) => "other".into(),
-                (None, true) => {
+            // The daemon checks the words against the card's cap.
+            let kind = match (kind.is_empty(), terminal) {
+                (false, _) => kind.join(" "),
+                (true, false) => anyhow::bail!("{usage}"),
+                (true, true) => {
                     let items = [
-                        "a new card made for this purchase",
-                        "a prepaid card loaded to the amount",
-                        "something else",
+                        "a single-use card (a one-time card, such as Wise's)",
+                        "a prepaid card with at most the amount on it",
                     ];
-                    let prompt = "What is this card? Never enter your main card";
+                    let prompt = "What is this card? zephyr takes no other";
                     let picked = dialoguer::Select::new().with_prompt(prompt).items(items);
-                    zephyr::cards::KINDS[picked.default(0).interact()?].to_string()
+                    match zephyr::cards::KINDS[picked.default(0).interact()?] {
+                        "prepaid" => {
+                            let input = dialoguer::Input::<String>::new();
+                            let balance = input.with_prompt("what is on it").interact_text()?;
+                            format!("prepaid {}", balance.trim())
+                        }
+                        kind => kind.to_string(),
+                    }
                 }
             };
             zephyr::cards::Pan::parse(&number, &expiry, &cvc).map_err(anyhow::Error::msg)?;

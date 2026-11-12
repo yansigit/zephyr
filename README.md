@@ -1045,10 +1045,13 @@ zephyr config set cards.provider manual                 # or link
   ```
 
 - **`manual`**: after your `/ok` (from the TUI, the host or the web app's passkey), make a
-  card for this purchase in your own card app: a new digital card with about that much behind
-  it, or a prepaid card loaded to the amount. Never your main card: zephyr cannot limit a card
-  it did not issue, so the balance behind it is the cap. Enter it on the host with
-  `zephyr card put 7`, which asks for the number, the expiry and the code without showing them.
+  card for this purchase in your own card app, and only a bounded one: a single-use card (a
+  one-time card, such as Wise's), or a prepaid card with at most the approved amount on it.
+  zephyr refuses any other card, your main card above all: it cannot limit a card it did not
+  issue, and the agent could read the number back from its browser, so the card's own limit is
+  what bounds it. Enter it on the host with `zephyr card put 7 single-use` or
+  `zephyr card put 7 prepaid 42.50`, which asks for the number, the expiry and the code without
+  showing them.
   The number stays in zephyr's memory, is typed only into a page on the approved address, and
   is forgotten after `cards.minutes` (15). zephyr sees no charge on such a card: check your card
   app, delete the card there, then `/card done 7` (it reminds you once a day until you do).
