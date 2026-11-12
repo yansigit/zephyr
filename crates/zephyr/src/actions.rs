@@ -329,6 +329,14 @@ fn not_run(cfg: &Config, store: &Store, a: &Action, by: By, why: &str) -> String
     // R70: why can carry the agent's words (a program's name), so it is scrubbed too.
     let why = crate::facts::scrubbed(cfg, why.to_string());
     finish(store, a, "failed", &why);
+    // Nothing started, so nothing was paid: the window no longer counts what its `/ok` did.
+    let paid = store.payment_of(a.id);
+    if let Err(e) = paid.and_then(|row| row.map_or(Ok(()), |row| store.unpay(row))) {
+        eprintln!(
+            "zephyr: taking #{}'s payment out of the window failed: {e}",
+            a.id
+        );
+    }
     let (n, s) = (a.id, summary(cfg, a));
     let (agent, owner) = match by {
         By::Owner { .. } => (

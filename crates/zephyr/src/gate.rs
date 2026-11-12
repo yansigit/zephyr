@@ -5700,6 +5700,39 @@ mod tests {
         assert_eq!(h.store.payments_since(now - 600, "CAD").unwrap().1, 6000);
     }
 
+    /// A payment the window counted at its `/ok` that then did not start (its browser wait
+    /// gone) is no payment: the window's count is as it was.
+    #[test]
+    fn an_ok_whose_browser_is_gone_leaves_the_window_count() {
+        let h = home(
+            "gate-window-gone",
+            "[approvals]\ncurrency = 'CAD'\nmoney = 'ask'\n",
+        );
+        let cfg = Arc::new(h.cfg.clone());
+        let (procs, waits) = (
+            crate::procs::Procs::default(),
+            crate::actions::Waits::default(),
+        );
+        let steers = crate::scheduler::Steers::default();
+        let ctx = crate::actions::Ctx {
+            cfg: &cfg,
+            store: &h.store,
+            procs: &procs,
+            waits: &waits,
+            steers: &steers,
+            calls: &crate::calls::live::Calls::idle(),
+        };
+        let now = crate::now();
+        let pay = click("Pay now", "https://shop.example", "main:1");
+        let Verdict::Wait { id } = decide(&h.cfg, &h.store, &pay, owner(), now) else {
+            panic!("a payment waits")
+        };
+        let by = crate::actions::By::Owner { channel: "tui" };
+        let said = crate::actions::approve(&ctx, id, false, by, now).unwrap();
+        assert!(said.contains("the browser is no longer waiting"), "{said}");
+        assert_eq!(h.store.payments_since(now - 600, "CAD").unwrap().0, 0);
+    }
+
     /// A payment in the window whose amount is unknown (a card charged in another currency)
     /// leaves the window's sum unknown: with an amount limit, the next payment is held strong
     /// until it leaves the window.

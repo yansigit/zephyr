@@ -2038,6 +2038,13 @@ impl Store {
         decided
     }
 
+    /// Takes payment row `id` out of the window: what it counted never started.
+    pub fn unpay(&self, id: i64) -> rusqlite::Result<()> {
+        self.db
+            .execute("DELETE FROM payments WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     /// Puts an action `/ok` took back to waiting for the owner: its payment did not fit the
     /// window after all. Returns whether it was this call that put it back.
     pub fn untake_action(&self, id: i64) -> rusqlite::Result<bool> {
