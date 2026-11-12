@@ -9,7 +9,8 @@ cd "$(dirname "$0")/.."
 
 LOCAL=zephyr-local
 HOSTED=ubuntu-latest
-# The checks ci.yml runs; the hosted runner takes the last test shard when it is available.
+# The checks ci.yml runs; the hosted runner takes the last test shard when it is available, on a push
+# to main or the nightly run (a pull request runs wholly on zephyr-local).
 SHARDS=3
 # How far back a hosted job refused for quota sends everything to zephyr-local; the first run after
 # it tries hosted again, so a month's reset (or a raised limit) is picked up by itself.
@@ -47,7 +48,13 @@ plan() {
     both)
       # An API error must not stop CI: it just means trying hosted.
       run=$(recent_refusal) || { echo "ci: could not read recent runs; trying hosted" >&2; run=; }
-      if [ -n "$run" ]; then
+      if [ "${GITHUB_EVENT_NAME:-}" = pull_request ]; then
+        # A PR is pushed many times in review: it costs no hosted minutes. GitHub's clean 2-CPU
+        # runner takes its shard on pushes to main and the nightly run, so its environment is
+        # still tested before a release, and so is the path ZEPHYR_CI=hosted falls back on.
+        hosted=$LOCAL
+        why="a pull request: everything on $LOCAL (GitHub's shard runs on main and nightly)"
+      elif [ -n "$run" ]; then
         hosted=$LOCAL
         why="GitHub refused a hosted job within $WINDOW (run $run): everything on $LOCAL"
       else

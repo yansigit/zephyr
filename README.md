@@ -1362,7 +1362,10 @@ CI runs on GitHub's runners and on the owner's own, label `zephyr-local`, at onc
 with either. `.github/ci.sh` holds the placement and the checks; the jobs are:
 
 - `plan` decides where everything goes, from repo variable `ZEPHYR_CI`:
-  - unset or `both`: test shard 3/3 on GitHub-hosted, lint, deny and shards 1/3 and 2/3 here. If
+  - unset or `both`: a pull request runs everything here, costing no hosted minutes however often
+    it is pushed. A push to main and the nightly run (09:17 UTC, or `gh workflow run ci.yml`) put
+    test shard 3/3 on GitHub-hosted, a clean 2-CPU machine, and lint, deny and shards 1/3 and 2/3
+    here, so GitHub's environment, and the `hosted` path below, are tested before a release. If
     GitHub refused a hosted job (spending limit or quota) in any run of the last 6 hours, all of
     it goes here; the first run after that tries hosted again, so the monthly reset is picked up.
   - `local`: everything here (`gh variable set ZEPHYR_CI --body local`).

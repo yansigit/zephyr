@@ -2,13 +2,18 @@
 # owner's runner (zephyr-local, deploy/runner/start.sh) and GitHub's; `ci-ok` is the one check to gate
 # merges on (README "CI"). .github/ci.sh holds the placement and the checks.
 # Variable ZEPHYR_CI: unset or `both` runs the last test shard on GitHub-hosted and the rest on
-# zephyr-local, `local` runs everything there, `hosted` everything on GitHub (the server is down).
+# zephyr-local for a push to main and the nightly run, and everything on zephyr-local for a pull
+# request; `local` runs everything there, `hosted` everything on GitHub (the server is down).
 # The ignored tests need the pinned rpi binary: deploy/release.sh runs them.
 name: ci
 on:
   pull_request:
   push:
     branches: [main]
+  # Nightly on main, so GitHub's runner tests the code even on days nothing is merged.
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
 permissions:
   contents: read
   actions: read

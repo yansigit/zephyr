@@ -315,7 +315,8 @@ README "CI") runs fmt, clippy and shellcheck, `cargo deny check advisories bans`
 Rust 1.95, the tests as 3 `cargo nextest` hash shards (each test in its own process, so no test may
 rely on another's process-wide state, such as a port counter), split between the owner's runner
 (`zephyr-local`) and GitHub's by `.github/ci.sh plan` and repo variable `ZEPHYR_CI`
-(`both`|`local`|`hosted`); `rescue` reruns on `zephyr-local` what GitHub refused to start, and
+(`both`|`local`|`hosted`; under `both` a pull request runs wholly on `zephyr-local`, and a push to
+main or the nightly run puts one shard on GitHub's); `rescue` reruns on `zephyr-local` what GitHub refused to start, and
 `ci-ok` is the one check to gate merges on;
 `ZEPHYR_REAL_RPI=1` makes the ignored real-rpi tests fail instead of skip when the binary is missing.
 `tests/cards_link.rs` runs the Link issuer against a stub of Link's API; its ignored
