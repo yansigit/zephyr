@@ -1106,6 +1106,22 @@ pub fn asks_new(e: &Effective, class: &str) -> bool {
     class_of(class).is_some_and(|c| mode_of(e, c) == Mode::AskNew)
 }
 
+/// Whether `/ok N once` differs from `/ok N` for `a`: its class asks only about new targets.
+/// Never for a phone call, whose number is never remembered. The card's footer and the
+/// attached clients' list both read it.
+pub fn offers_once(e: &Effective, a: &Action) -> bool {
+    asks_new(e, &a.class) && a.kind != ActionKind::Call
+}
+
+/// How long `a` waits for the owner: 10 min for a browser click or a card (the page and the
+/// checkout do not wait longer), a day for anything else. The store's expiry matches it.
+pub fn lifetime_secs(a: &Action) -> i64 {
+    match a.kind {
+        ActionKind::Wait | ActionKind::Card => 60 * i64::from(WAIT_MINUTES),
+        _ => 86_400,
+    }
+}
+
 fn class_key(class: Class) -> &'static str {
     approvals::class_name(class)
 }
@@ -2724,21 +2740,16 @@ fn footer(a: &Action, cfg: &Config, class: Option<Class>, countdown: bool, stron
     // `once` approves without remembering the targets, which only `ask-new` does: elsewhere it
     // is `ok` (`/ok N once` is still taken), so the card offers it only there.
     // Nor for a phone call, whose number is never remembered.
-    let once = match asks_new(&approvals::effective(cfg), &a.class) && a.kind != ActionKind::Call {
+    let once = match offers_once(&approvals::effective(cfg), a) {
         true => format!(" · /ok {id} once"),
         false => String::new(),
     };
-    // What is left of the 24 h (10 min for a browser wait), rounded up.
-    let now = crate::now();
-    let left = match a.kind {
-        ActionKind::Wait | ActionKind::Card => {
-            let s = (a.created_at + 60 * i64::from(WAIT_MINUTES) - now).max(60);
-            format!("{} min", (s + 59) / 60)
-        }
-        _ => {
-            let s = (a.created_at + 86_400 - now).max(3600);
-            format!("{} h", (s + 3599) / 3600)
-        }
+    // What is left of the 24 h (10 min for a browser wait or a card), rounded up.
+    let life = lifetime_secs(a);
+    let left = a.created_at + life - crate::now();
+    let left = match life < 3600 {
+        true => format!("{} min", (left.max(60) + 59) / 60),
+        false => format!("{} h", (left.max(3600) + 3599) / 3600),
     };
     let mut line = format!("/ok {id}{once} · /no {id}");
     if countdown {

@@ -500,9 +500,9 @@ pub fn tick(ctx: &Ctx, now: i64, held: bool) {
             for a in expired {
                 audit(ctx.cfg, store, &a, "expired");
                 ctx.waits.answer(a.id, false);
-                let within = match a.kind {
-                    ActionKind::Wait | ActionKind::Card => "10 min",
-                    _ => "a day",
+                let within = match crate::gate::lifetime_secs(&a) < 3600 {
+                    true => "10 min",
+                    false => "a day",
                 };
                 let text = format!(
                     "the owner did not answer #{} ({}) within {within}, so it was not run; ask \

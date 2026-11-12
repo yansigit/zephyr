@@ -1476,7 +1476,10 @@ impl<'a> Router<'a> {
                     .unwrap_or_default()
                     .to_string(),
             };
-            let quick = matches!(class, Some("messages" | "posts")) && p["strong"] == false;
+            // As the push's button checks it (`web::push`): never a phone call or a card.
+            let quick = matches!(p["kind"].as_str(), Some("run" | "pass" | "wait"))
+                && matches!(class, Some("messages" | "posts"))
+                && p["strong"] == false;
             let card = crate::web::push::card(id, &body, quick);
             crate::web::push::spawn(self.cfg_tx.borrow().clone(), card, "high", 86_400);
         }
@@ -1830,17 +1833,16 @@ impl<'a> Router<'a> {
             .then(|| self.store.action(p.id).ok().flatten())
             .flatten();
         if let Some(a) = action {
-            // A browser action waits 10 minutes, not a day (spec §4.6).
-            if a.kind == crate::store::ActionKind::Wait {
-                let wait = 60 * i64::from(crate::gate::WAIT_MINUTES);
-                v["expires_in_secs"] = json!((a.created_at + wait - now).max(0));
-            }
+            // A browser action or a card waits 10 minutes, not a day (spec §4.6), as its card's
+            // footer says.
+            let life = crate::gate::lifetime_secs(&a);
+            v["expires_in_secs"] = json!((a.created_at + life - now).max(0));
             v["card"] = json!(crate::gate::card(&a, &self.cfg, &self.store));
             v["signed"] = json!(crate::gate::signed_card(&a, &self.cfg, &self.store));
             // R70: the summary as the private facts are now.
             v["summary"] = json!(crate::facts::scrubbed(&self.cfg, a.summary.clone()));
             v["strong"] = json!(a.class == "money" && *money_strong);
-            v["once"] = json!(crate::gate::asks_new(e, &a.class));
+            v["once"] = json!(crate::gate::offers_once(e, &a));
             v["class"] = json!(a.class);
         }
         // A command's or a setting's card is the stored command, and so is what is signed:
