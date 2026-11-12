@@ -350,6 +350,8 @@ fn projects() -> Option<PathBuf> {
 /// Sent once, when a budget limit is crossed.
 pub const BUDGET_NOTICE: &str =
     "[zephyr] daily budget reached: paused until the next UTC day or /resume";
+/// The tick lifted a budget pause: a limit was raised (or removed) over today's spend.
+pub const BUDGET_LIFTED: &str = "[zephyr] daily budget raised over today's spend: resumed";
 
 /// `[budget]`: the daily limits are counted per UTC day; crossing one pauses the gateway until
 /// the next UTC day or `/resume`. The run limits stop one run (DESIGN §4.4).

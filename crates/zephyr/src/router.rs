@@ -1,7 +1,7 @@
 //! Inbound → inbox → `main` child → outbox → channel, with crash recovery (DESIGN §4.2).
 
 use crate::channel::{Activity, Channel, Inbound, Outbound};
-use crate::config::{Account, Config, BUDGET_NOTICE};
+use crate::config::{Account, Config, BUDGET_LIFTED, BUDGET_NOTICE};
 use crate::rpc::{message_text, Child, MAIN_SESSION};
 use crate::settings::{Actor, Apply, Outcome, Setting};
 use crate::store::{InboxRow, SessionOrigin, Store};
@@ -331,6 +331,11 @@ pub async fn run<C: Channel>(
     // After the adoption, so an approved action whose command is still running stays running;
     // a delay that came due while down waits for the owner (approvals spec §4.9).
     crate::actions::restore(&router.cfg, &router.store, crate::now());
+    // Over the budget and running: the owner resumed under the rule before this one (DESIGN §4.4).
+    log(router
+        .store
+        .budget_at_start(router.cfg.budget.as_ref())
+        .map_err(Into::into));
     // A card's number was in the memory of the daemon before this one: what is still open is
     // closed at its issuer, never filled again (DESIGN §4.25).
     crate::cards::close_all(
@@ -847,6 +852,11 @@ impl<'a> Router<'a> {
                     crate::cards::tick(&self.cfg, &self.store, crate::now());
                     // Delays that came due, and held actions nobody answered (approvals §4.6).
                     self.tick_actions();
+                    // A limit raised over today's spend ends its pause, as midnight does: after
+                    // the actions' look, so a delay due meanwhile is asked again, never sent.
+                    if self.store.lift_budget(self.cfg.budget.as_ref()).unwrap_or(false) {
+                        log(self.store.notify_last_owner(BUDGET_LIFTED).map_err(Into::into));
+                    }
                     // A budget pause ends at UTC midnight with nothing else to wake the router;
                     // a run in progress reconciles at its settle, a new child when it starts.
                     let ended = std::mem::replace(&mut was_paused, paused(&self.store));
@@ -2332,7 +2342,10 @@ impl<'a> Router<'a> {
                     crate::actions::resume(&self.cfg, &self.store, crate::now());
                     self.due_held = false;
                 }
-                log(self.store.resume_budget().map_err(Into::into));
+                log(self
+                    .store
+                    .resume_budget(self.cfg.budget.as_ref())
+                    .map_err(Into::into));
                 log(self.store.set_paused(None).map_err(Into::into));
                 return "[zephyr] resumed".into();
             }
