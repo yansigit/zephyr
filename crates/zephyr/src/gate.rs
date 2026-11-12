@@ -1212,13 +1212,17 @@ fn within(amount: Option<&Amount>, cap: u64, currency: &str) -> bool {
 
 /// A notice for the owner on `origin`, else on the channel last answered.
 fn tell(store: &Store, origin: &(String, String), text: &str) {
+    if let Err(e) = told(store, origin, text) {
+        eprintln!("zephyr: telling the owner about a held action failed: {e}");
+    }
+}
+
+/// [`tell`], its failure the caller's.
+fn told(store: &Store, origin: &(String, String), text: &str) -> rusqlite::Result<()> {
     let (channel, to) = origin;
-    let told = match channel.is_empty() {
+    match channel.is_empty() {
         true => store.notify_last_owner(text),
         false => store.notify(channel, to, text),
-    };
-    if let Err(e) = told {
-        eprintln!("zephyr: telling the owner about a held action failed: {e}");
     }
 }
 
@@ -1505,38 +1509,38 @@ impl Gate<'_> {
             },
             due_at,
         };
-        let id = self.store.hold_action(&new)?;
-        // A payment held while the window is crossed needs a strong channel to approve.
-        if let Some(g) = call.gated.as_ref().filter(|g| g.class == Class::Money) {
-            let over = window_over(self.cfg, self.store, g.amount.as_ref(), self.now)?;
-            if matches!(over, Window::Over(_)) {
-                self.store.set_strong(id)?;
+        // The hold and its card land together: never waiting with the owner never told.
+        let (id, action) = self.store.atomically(|store| {
+            let id = store.hold_action(&new)?;
+            // A payment held while the window is crossed needs a strong channel to approve.
+            if let Some(g) = call.gated.as_ref().filter(|g| g.class == Class::Money) {
+                let over = window_over(self.cfg, store, g.amount.as_ref(), self.now)?;
+                if matches!(over, Window::Over(_)) {
+                    store.set_strong(id)?;
+                }
             }
-        }
-        let action = Action {
-            id,
-            kind: new.kind,
-            class: new.class,
-            targets: new.targets,
-            summary: new.summary,
-            reason: new.reason,
-            payload: new.payload,
-            secrets: new.secrets,
-            origin: new.origin,
-            status: if due_at.is_some() {
-                "scheduled"
-            } else {
-                "pending"
-            }
-            .into(),
-            due_at,
-            created_at: self.now,
-        };
-        tell(
-            self.store,
-            self.origin,
-            &card(&action, self.cfg, self.store),
-        );
+            let action = Action {
+                id,
+                kind: new.kind,
+                class: new.class,
+                targets: new.targets,
+                summary: new.summary,
+                reason: new.reason,
+                payload: new.payload,
+                secrets: new.secrets,
+                origin: new.origin,
+                status: if due_at.is_some() {
+                    "scheduled"
+                } else {
+                    "pending"
+                }
+                .into(),
+                due_at,
+                created_at: self.now,
+            };
+            told(store, self.origin, &card(&action, self.cfg, store))?;
+            Ok((id, action))
+        })?;
         self.audit(outcome);
         let text = match due_at {
             Some(at) => delayed_text(id, &action.summary, minutes_until(at, self.now)),
@@ -3640,6 +3644,20 @@ mod tests {
 
     const PHONE: &str = "[[fact]]\nname = \"phone\"\nkind = \"digits\"\n\
                          value = \"5550102345\"\nallow = [\"carol@example.com\"]\n";
+
+    /// A hold lands with its card: a card that cannot be written holds nothing, and the call
+    /// is refused, so nothing waits for an owner who was never asked.
+    #[test]
+    fn a_hold_whose_card_cannot_be_written_is_refused() {
+        let h = home("gate-hold-told", "[approvals]\nmessages = 'ask'\n");
+        let block = "CREATE TRIGGER no_outbox BEFORE INSERT ON outbox \
+                     BEGIN SELECT RAISE(ABORT, 'no outbox'); END";
+        h.store.db_for_test().execute_batch(block).unwrap();
+        let send = exec(MAIL, "main:5");
+        let v = decide(&h.cfg, &h.store, &send, owner(), crate::now());
+        assert!(matches!(v, Verdict::Deny(_)), "{v:?}");
+        assert!(h.store.held_actions().unwrap().is_empty());
+    }
 
     /// A fact allowed to go to the mail's recipient is not allowed to go beside it: a stage of
     /// the same command that sends data elsewhere is a recipient the gate cannot read.
