@@ -30,7 +30,7 @@ jobs:
     outputs:
       runner: ${{ steps.plan.outputs.local }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - id: plan
@@ -46,7 +46,7 @@ jobs:
     # one that runs cargo, and never in .git/config: a crate's build script must not read it
     # (tests/host.rs no_step_that_runs_cargo_holds_a_github_token).
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - id: bump

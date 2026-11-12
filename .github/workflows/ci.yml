@@ -28,7 +28,7 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       rescue: ${{ steps.plan.outputs.rescue }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - id: plan
@@ -45,7 +45,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # zephyr-local's image (deploy/runner/Dockerfile) has all of this; GitHub's runners get it here.
@@ -75,7 +75,7 @@ jobs:
     runs-on: zephyr-local
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: .github/ci.sh rescue

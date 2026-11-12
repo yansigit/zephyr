@@ -3724,7 +3724,12 @@ fn no_step_that_runs_cargo_holds_a_github_token() {
                 .find(|&j| indent(lines[j]) < indent(lines[at]))
         };
         for (i, line) in lines.iter().enumerate() {
-            if line.trim_start().starts_with("- uses: actions/checkout@") {
+            if let Some(at) = line.trim_start().strip_prefix("- uses: actions/checkout@") {
+                let sha = at.split_whitespace().next().unwrap();
+                assert!(
+                    sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{path:?}: checkout pinned by tag: {line}"
+                );
                 assert!(
                     block(i).contains("persist-credentials: false"),
                     "{path:?}: {}",
