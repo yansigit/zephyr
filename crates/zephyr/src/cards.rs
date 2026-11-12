@@ -964,8 +964,9 @@ pub fn refuses_currency(cfg: &Config, currency: &str) -> Option<String> {
 
 /// Issues a card the gate let through (`Checked` is its proof): records it, asks the provider,
 /// and tells the owner what to do next. `Ok` is what the agent is told, `Err` why no card was
-/// issued, and then the payment the window counted for it is taken out again. Nothing is
-/// retried by itself.
+/// issued. The payment the window counted for it is taken out again only when the issuer
+/// made no card (no reference came back): one it made may still be charged until it is
+/// closed there. Nothing is retried by itself.
 pub async fn issue(
     cfg: &Config,
     checked: Checked,
@@ -975,8 +976,9 @@ pub async fn issue(
     reason: Option<&str>,
 ) -> Result<String, String> {
     let payment = checked.payment();
-    let done = issue_card(cfg, checked, ask, asker, proposal, reason).await;
-    if let (Err(_), Some(row)) = (&done, payment) {
+    let mut made = false;
+    let done = issue_card(cfg, checked, ask, asker, proposal, reason, &mut made).await;
+    if let (Err(_), Some(row), false) = (&done, payment, made) {
         if let Err(e) = open_store(cfg).and_then(|s| s.unpay(row).map_err(|e| e.to_string())) {
             eprintln!("zephyr: taking a card's payment out of the window failed: {e}");
         }
@@ -991,6 +993,7 @@ async fn issue_card(
     asker: &Asker,
     proposal: Option<i64>,
     reason: Option<&str>,
+    made: &mut bool,
 ) -> Result<String, String> {
     let issuer = issuer(cfg)?;
     let caps = issuer.can();
@@ -1039,6 +1042,7 @@ async fn issue_card(
             return Err(format!("card #{id} was not issued: {why}"));
         }
     };
+    *made = true;
     card.provider_ref = Some(issued.provider_ref);
     card.approval_url = issued.approval_url;
     let landed = db.get().card_issued(
@@ -1055,12 +1059,18 @@ async fn issue_card(
             .flatten()
             .is_some_and(|c| c.status == "waiting")
     };
-    if !landed.map_err(failed)? || !waiting() {
-        // Its close was asked while the issuer was answering (a `/stop`): what the issuer made
-        // is closed there now, and the card is `closing` until the issuer takes that, tried
-        // again on the tick. The owner is never told to approve it.
+    if let Err(e) = &landed {
+        eprintln!("zephyr: recording card #{id}'s reference failed: {e}");
+    }
+    if !landed.unwrap_or(false) || !waiting() {
+        // Its close was asked while the issuer was answering (a `/stop`), or its reference
+        // could not be recorded: what the issuer made is closed there now, and the card is
+        // `closing` until the issuer takes that, tried again on the tick. The owner is never
+        // told to approve it.
         let reference = card.provider_ref.as_deref().unwrap_or_default();
-        db.get().card_reclose(id, reference, now).map_err(failed)?;
+        if let Err(e) = db.get().card_reclose(id, reference, now) {
+            eprintln!("zephyr: recording card #{id}'s close failed: {e}");
+        }
         let _ = poll_due(cfg, id);
         let said = close_at_issuer(cfg, &mut card).await;
         say(cfg, card, Word::Closed(LANDED.into(), said));
@@ -2531,6 +2541,48 @@ mod tests {
         let why = issue(&cfg, checked, &ask, &asker, None, None).await;
         assert!(why.unwrap_err().contains("was not issued"));
         assert_eq!(store.payments_since(now - 600, "CAD").unwrap().0, 0);
+    }
+
+    /// A card the issuer made but zephyr could not record is closed at the issuer, and its
+    /// payment stays counted: until that close lands it could still be charged.
+    #[tokio::test]
+    async fn a_card_made_but_not_recorded_is_closed_and_stays_counted() {
+        let dir = crate::test_dir("cards-issue-unrecorded");
+        let text = format!(
+            "rpi = '/r'\nhome = {dir:?}\n[approvals]\ncurrency = 'CAD'\nmoney = 'auto 100'\n\
+             [cards]\nprovider = 'fake'\n"
+        );
+        let mut cfg: Config = toml::from_str(&text).unwrap();
+        cfg.cards_fake = true;
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let req = crate::gate::Request {
+            session: "main".into(),
+            call_id: Some("c1".into()),
+            tool: "card".into(),
+            args: serde_json::json!({"action": "request", "site": "https://shop.example/pay",
+                "merchant": "Shop", "amount": "10", "currency": "CAD"}),
+            browser: None,
+            run: "main:1".into(),
+            reason: None,
+        };
+        let owner = ("chat".to_string(), "o".to_string());
+        let now = crate::now();
+        let (checked, ask) = crate::gate::decide_card(&cfg, &store, &req, owner, now).unwrap();
+        let block = "CREATE TRIGGER no_ref BEFORE UPDATE OF provider_ref ON cards \
+                     BEGIN SELECT RAISE(ABORT, 'no ref'); END";
+        store.db_for_test().execute_batch(block).unwrap();
+        let asker = Asker {
+            channel: "chat".into(),
+            sender: "o".into(),
+            session: "main".into(),
+        };
+        assert!(issue(&cfg, checked, &ask, &asker, None, None)
+            .await
+            .is_err());
+        assert_eq!(store.payments_since(now - 600, "CAD").unwrap().0, 1);
+        let log = Fake::script(&cfg, |s| s.log.clone());
+        assert!(log.iter().any(|l| l.starts_with("close ")), "{log:?}");
     }
 
     /// A close asked with a copy read before the issue landed closes what the issuer made: the
