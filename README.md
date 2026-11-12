@@ -1025,6 +1025,11 @@ At a checkout the agent can ask for a virtual card instead of using a card of yo
 §4.25). It is off until you pick a provider. Set your currency first: the cap and the limits
 count in it.
 
+What keeps a card safe is its own limit, not secrecy. A number typed into the agent's browser
+can be read back by an agent that turns hostile or is fooled by a page, and no scrubbing stops
+that. So every card is single use or holds at most the amount you approved, and the payment
+window caps all money; hiding the number from the agent is a second line, not the first.
+
 ```sh
 zephyr config set approvals.currency CAD
 zephyr config set approvals.strong_only loosen,money    # needed for manual
