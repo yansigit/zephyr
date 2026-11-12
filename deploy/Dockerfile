@@ -246,6 +246,9 @@ FROM signal-${SIGNAL} AS signal-out
 # Vulkan and SPIR-V headers stay in this stage. ggml and libstdc++ are linked in: it needs
 # libvulkan1 and libgomp1 (in the final image) and runs on the CPU with no GPU. GGML_NATIVE=OFF
 # builds for AVX2-class x86 (or plain armv8), not for the build host's CPU.
+# whisper-server too, which a phone call with calls.speech = local keeps loaded (DESIGN §4.26). It
+# is patched to bind its --host as a unix socket path (its bundled cpp-httplib 0.20 has AF_UNIX),
+# so it can never listen on a TCP port; the grep fails the build if the patch stops applying.
 FROM ubuntu:24.04 AS voice-whisper
 ARG WHISPER_VERSION WHISPER_SHA256
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl build-essential \
@@ -254,11 +257,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
        "https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v$WHISPER_VERSION.tar.gz" \
     && echo "$WHISPER_SHA256  /tmp/whisper.tar.gz" | sha256sum -c - \
     && mkdir /src && tar -xzf /tmp/whisper.tar.gz -C /src --strip-components 1 \
+    && sed -i 's|^    if (!svr->bind_to_port(|    svr->set_address_family(AF_UNIX);\n&|' \
+       /src/examples/server/server.cpp \
+    && grep -q '^    svr->set_address_family(AF_UNIX);$' /src/examples/server/server.cpp \
     && cmake -S /src -B /build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF \
        -DGGML_VULKAN=ON -DGGML_CCACHE=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_SDL2=OFF \
        -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
-    && cmake --build /build -j"$(nproc)" --target whisper-cli \
-    && install -D -m 755 -s /build/bin/whisper-cli /out/bin/whisper-cli
+    && cmake --build /build -j"$(nproc)" --target whisper-cli whisper-server \
+    && install -D -m 755 -s /build/bin/whisper-cli /out/bin/whisper-cli \
+    && install -D -m 755 -s /build/bin/whisper-server /out/bin/whisper-server
 
 # ffmpeg, static, with only what voice notes in and out need (and μ-law out, for a phone call's speech): the channels' audio containers and
 # codecs, raw s16le in (Piper's PCM), and Opus, AAC and 16-bit WAV out.

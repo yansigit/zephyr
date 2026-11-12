@@ -8,7 +8,12 @@ pub fn fakes(home: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let dir = home.join("voice");
     let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/voice");
-    for file in ["bin/ffmpeg", "bin/whisper-cli", "py/bin/python"] {
+    for file in [
+        "bin/ffmpeg",
+        "bin/whisper-cli",
+        "bin/whisper-server",
+        "py/bin/python",
+    ] {
         std::fs::create_dir_all(dir.join(file).parent().unwrap()).unwrap();
         std::fs::copy(from.join(file), dir.join(file)).unwrap();
     }
@@ -27,6 +32,22 @@ pub fn ran(home: &Path, prog: &str) -> Vec<serde_json::Value> {
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .filter(|v| v["prog"] == prog)
         .collect()
+}
+
+/// Waits until the process whose pid the fake wrote to `file` (`whisper-server.pid`,
+/// `piper.pid`) is gone: killed, though it may be a zombie its new parent has yet to reap.
+#[allow(dead_code)]
+pub async fn gone(home: &Path, file: &str) {
+    let pid = std::fs::read_to_string(home.join("voice").join(file)).unwrap();
+    let stat = || std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()));
+    let gone = || stat().map_or(true, |s| s.contains(") Z ") || s.contains(") X "));
+    for _ in 0..400 {
+        if gone() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("{file}: the process is still there: {:?}", stat());
 }
 
 /// The hash the fakes log for `bytes`.

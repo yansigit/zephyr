@@ -1,28 +1,35 @@
 #!/usr/bin/python3
-"""Stand-ins for the image's ffmpeg, whisper-cli and Piper's python (DESIGN §4.3, voice.rs).
+"""Stand-ins for the image's ffmpeg, whisper-cli, whisper-server and Piper's python (DESIGN §4.3,
+§4.26, voice.rs).
 
-One script under three names (`bin/whisper-cli` and `py/bin/python` are links to it). Each run
-appends one JSON line to `log` in the voice folder, found from the script's own path since the
-environment is cleared: {"prog", "uid", "argv", "sha256", "env", "start", "end"}, the hash being
-of the input (the file an argument names, or stdin for Piper). Marker files in the voice folder:
+One script under four names (`bin/whisper-cli`, `bin/whisper-server` and `py/bin/python` are
+links to it). Each run appends one JSON line to `log` in the voice folder, found from the script's
+own path since the environment is cleared: {"prog", "pid", "uid", "argv", "sha256", "env",
+"start", "end"}, the hash being of the input (the file an argument names, or stdin for Piper). The
+warm ones a phone call keeps, whisper-server and Piper's line mode (`python -I -c ...`), log one
+line for each utterance or line they answer, all with the one pid, and write that pid to
+`whisper-server.pid` or `piper.pid` as they start. Marker files in the voice folder:
 
   say         what whisper hears (default `hello from the fake`)
   says        what whisper hears run by run: each run takes the file's first line (a phone call's
               utterances); once it is empty, `say` again
   lang        the language whisper detects with `-l auto` (default `en`)
   secs        how long the decoded audio is (default 2), cut at ffmpeg's `-t`
-  hang        whisper writes its pid to `hang.pid` and sleeps until it is killed
+  hang        whisper (or whisper-server, at a request) writes its pid to `hang.pid` and sleeps
+              until it is killed
   fork        whisper leaves a child behind, asleep, its pid in `fork.pid`
   setsid      the same in a session of its own, out of the process group; `setsid.pid`
   slow        whisper takes 0.3 s, so two runs would overlap if they could
-  piper_fail  Piper exits 1
+  piper_fail  Piper exits 1; the warm one at its next line
 
 Keep the argv this reads and the lines it prints in step with voice.rs (`whisper_args`,
-`detected`, `piper_args`, `decode_args`, `encode_args`).
+`detected`, `piper_args`, `decode_args`, `encode_args`, `server_args`, `PIPER_LINES`, `ask_ear`).
 """
 import hashlib
 import json
 import os
+import socket
+import struct
 import sys
 import time
 
@@ -41,13 +48,24 @@ def marker(name, default=None):
         return default
 
 
+def heard():
+    """What whisper hears in one run or request: a call's next line of `says`, else `say`."""
+    says = (marker("says") or "").split("\n")
+    if says == [""]:
+        return marker("say", "hello from the fake")
+    with open(os.path.join(root, "says"), "w") as f:
+        f.write("\n".join(says[1:]))
+    return says[0]
+
+
 def after(flag):
     return argv[argv.index(flag) + 1]
 
 
 def done(data):
     line = json.dumps({
-        "prog": prog, "uid": os.getuid(), "argv": argv, "env": sorted(os.environ),
+        "prog": prog, "pid": os.getpid(), "uid": os.getuid(), "argv": argv,
+        "env": sorted(os.environ),
         "sha256": hashlib.sha256(data).hexdigest(), "start": start, "end": time.time(),
     })
     fd = os.open(os.path.join(root, "log"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o666)
@@ -101,15 +119,51 @@ elif prog == "whisper-cli":
     if after("-l") == "auto":
         print("whisper_full_with_state: auto-detected language: %s (p = 0.97)" % marker("lang", "en"),
               file=sys.stderr)
-    says = (marker("says") or "").split("\n")
-    if says != [""]:
-        # A phone call's utterances: each run hears the file's next line.
-        with open(os.path.join(root, "says"), "w") as f:
-            f.write("\n".join(says[1:]))
-        print(" " + says[0])
-    else:
-        print(" " + marker("say", "hello from the fake"))
+    print(" " + heard())
     done(data)
+elif prog == "whisper-server":
+    # Up only once its socket is, as the real one is after loading its model.
+    server = socket.socket(socket.AF_UNIX)
+    server.bind(after("--host"))
+    server.listen(4)
+    with open(os.path.join(root, "whisper-server.pid"), "w") as f:
+        f.write(str(os.getpid()))
+    while True:
+        conn, _ = server.accept()
+        start = time.time()
+        request = b""
+        while b"\r\n\r\n" not in request:
+            request += conn.recv(65536)
+        head, body = request.split(b"\r\n\r\n", 1)
+        length = int(head.lower().split(b"content-length: ")[1].split(b"\r\n")[0])
+        while len(body) < length:
+            body += conn.recv(65536)
+        if marker("hang") is not None:
+            with open(os.path.join(root, "hang.pid"), "w") as f:
+                f.write(str(os.getpid()))
+            time.sleep(600)
+        # The multipart's `file` part: the WAV whisper is given.
+        boundary = body.split(b"\r\n", 1)[0]
+        part = body.split(b'name="file"', 1)[1].split(b"\r\n\r\n", 1)[1]
+        data = part.split(b"\r\n" + boundary, 1)[0]
+        text = (" " + heard() + "\n").encode()
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+                     b"Content-Length: %d\r\nConnection: close\r\n\r\n" % len(text) + text)
+        conn.close()
+        done(data)
+elif prog == "python" and "-c" in argv:
+    # Piper kept loaded for a call: a JSON string a line in, each one's PCM out after its length.
+    with open(os.path.join(root, "piper.pid"), "w") as f:
+        f.write(str(os.getpid()))
+    for line in sys.stdin:
+        start = time.time()
+        data = json.loads(line).encode()
+        if marker("piper_fail") is not None:
+            sys.exit(1)
+        pcm = b"pcm:" + data
+        sys.stdout.buffer.write(struct.pack("<I", len(pcm)) + pcm)
+        sys.stdout.buffer.flush()
+        done(data)
 elif prog == "python":
     data = sys.stdin.buffer.read()
     if marker("piper_fail") is not None:

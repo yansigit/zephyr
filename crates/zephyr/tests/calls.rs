@@ -379,7 +379,122 @@ async fn a_call_runs_from_the_ask_to_the_report() {
         .collect();
     assert_eq!(audit[..2], ["dialed", "answered"]);
     assert!(audit[2].starts_with("ended after 0:"), "{audit:?}");
+    // One whisper-server and one Piper for the whole call (DESIGN §4.26), gone with it.
+    let (server, piper) = (
+        voice_fakes::ran(&gw.home, "whisper-server"),
+        voice_fakes::ran(&gw.home, "python"),
+    );
+    assert!(
+        !server.is_empty() && piper.len() >= 3,
+        "{server:?} {piper:?}"
+    );
+    assert!(
+        server.iter().all(|s| s["pid"] == server[0]["pid"]),
+        "{server:?}"
+    );
+    assert!(
+        piper.iter().all(|p| p["pid"] == piper[0]["pid"]),
+        "{piper:?}"
+    );
+    assert!(voice_fakes::ran(&gw.home, "whisper-cli").is_empty());
+    voice_fakes::gone(&gw.home, "whisper-server.pid").await;
+    voice_fakes::gone(&gw.home, "piper.pid").await;
     gw.shutdown().await;
+}
+
+/// A local call's turn time with the image's own whisper-server, Piper and ffmpeg (DESIGN
+/// §4.26), for a side container of the image: `ZEPHYR_VOICE_DIR=/opt/zephyr/voice` and
+/// `--ignored`. The other party's sentences are the image's Piper as μ-law, played in real time
+/// with a second of silence after; the call's agent is the stand-in, which answers at once.
+/// Prints, for each turn, the end of their speech to its transcript (the endpointer's 0.7 s of
+/// silence included) and the transcript to the reply's first audio on the line.
+#[tokio::test]
+#[ignore]
+async fn a_local_turn_with_the_real_voice() {
+    let Ok(real) = std::env::var("ZEPHYR_VOICE_DIR") else {
+        return eprintln!("skipped: ZEPHYR_VOICE_DIR is not set");
+    };
+    let them = [
+        "Seven is full tonight, but we have a table at seven thirty.",
+        "Can I have a name for the booking?",
+        "Great, we will see you at seven thirty.",
+    ];
+    let lines = "Hello, I would like a table for two at seven tonight.\n\
+                 Seven thirty is fine, thank you.\nIt is for Aiden Yoon.\nThank you, goodbye.";
+    let voice: PathBuf = real.into();
+    let theirs = voice.clone();
+    let (gw, telnyx) = start("real", "", lines, "", |cfg| cfg.voice_dir = theirs).await;
+    let gen = gw.home.join("gen");
+    std::fs::create_dir_all(&gen).unwrap();
+    let mut cfg = config(&gen, 0, "");
+    cfg.voice_dir = voice;
+    let mut script = "stream\nanswer\nwait 4\n".to_string();
+    for (i, text) in them.iter().enumerate() {
+        let mut ulaw = zephyr::voice::say_call(&cfg, text, "en").await.unwrap();
+        ulaw.extend([0xff; 8000]);
+        let file = telnyx.dir.join(format!("them{i}.ulaw"));
+        std::fs::write(&file, ulaw).unwrap();
+        script += &format!("play {}\nwait 4\n", file.display());
+    }
+    std::fs::write(telnyx.dir.join("script"), script).unwrap();
+    gw.ask_and_approve().await;
+    let now = || {
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+        at.unwrap().as_secs_f64()
+    };
+    let store = gw.store();
+    // The reply's first audio goes on the line as its `agent` line is written (`spoken`).
+    let replies: Vec<&str> = lines.lines().skip(1).collect();
+    let (mut texts, mut audio) = (Vec::new(), Vec::new());
+    for _ in 0..12000 {
+        let rows = store.call_lines(1).unwrap();
+        let said = |who: &str| -> Vec<String> {
+            let rows = rows.iter().filter(|l| l.1 == who);
+            rows.map(|l| l.2.clone()).collect()
+        };
+        let (heard, agent) = (said("them"), said("agent"));
+        if heard.len() > texts.len() {
+            texts.push((now(), heard[texts.len()].clone()));
+        }
+        if audio.len() < texts.len() && agent.iter().any(|a| a == replies[audio.len()]) {
+            audio.push(now());
+        }
+        if audio.len() == them.len() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let played: Vec<f64> = (telnyx.lines("steps.jsonl").into_iter())
+        .filter(|s| s["step"] == "play")
+        .map(|s| s["at"].as_f64().unwrap() - 1.0)
+        .collect();
+    for (i, ((text_at, text), audio_at)) in texts.iter().zip(&audio).enumerate() {
+        let end = played[i];
+        println!(
+            "turn {}: {text:?}: speech end to text {:.2} s, text to first audio {:.2} s, \
+             turn {:.2} s",
+            i + 1,
+            text_at - end,
+            audio_at - text_at,
+            audio_at - end
+        );
+    }
+    assert_eq!(audio.len(), them.len(), "{texts:?}");
+    gw.shutdown().await;
+}
+
+/// The call's future dropped (the daemon's task aborted mid-call): its warm whisper and Piper
+/// go with it.
+#[tokio::test]
+async fn a_dropped_call_leaves_no_voice_running() {
+    let (gw, telnyx) = start("dropped", "stream\nanswer\n", "Hello.", "", |_| {}).await;
+    gw.ask_and_approve().await;
+    wait(|| telnyx.heard().contains("ulaw:pcm:Hello.")).await;
+    let home = gw.home.clone();
+    assert!(home.join("voice/whisper-server.pid").exists());
+    gw.task.abort();
+    voice_fakes::gone(&home, "whisper-server.pid").await;
+    voice_fakes::gone(&home, "piper.pid").await;
 }
 
 #[tokio::test]
@@ -521,6 +636,8 @@ async fn hangup_ends_the_call_at_once() {
         .into_iter()
         .find(|r| r["path"] == "/v2/calls/fake-1/actions/hangup");
     assert_eq!(hangup.unwrap()["auth"], format!("Bearer {KEY}"));
+    voice_fakes::gone(&gw.home, "whisper-server.pid").await;
+    voice_fakes::gone(&gw.home, "piper.pid").await;
     gw.shutdown().await;
 }
 

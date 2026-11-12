@@ -582,6 +582,17 @@ struct Live<'a> {
     /// The end of what the agent has said so far (`TAIL`).
     said: String,
     tainted: bool,
+    /// With the daemon's own speech, the call's warm whisper and Piper.
+    voice: Option<Arc<crate::voice::Call>>,
+    /// The tasks that speak and hear for the call, which hold `voice` too.
+    voice_tasks: [tokio::task::JoinHandle<()>; 2],
+}
+
+/// However the call's future ends, also dropped mid-call, its voice goes with it.
+impl Drop for Live<'_> {
+    fn drop(&mut self) {
+        self.hush();
+    }
 }
 
 impl<'a> Live<'a> {
@@ -591,29 +602,31 @@ impl<'a> Live<'a> {
         // Piper and whisper each run in a task of their own, one line at a time, so the call's
         // own loop is never waiting on them when a hang-up comes.
         let provider = cfg.calls().speech != "local";
-        let (voice_cfg, lang, tx) = (cfg.clone(), s.ask.language.clone(), s.tx.clone());
+        // The call's own whisper and Piper, kept loaded for it (`voice::Call`).
+        let voice = (!provider).then(|| Arc::new(crate::voice::Call::new(&cfg, &s.ask.language)));
+        let (ours, lang, tx) = (voice.clone(), s.ask.language.clone(), s.tx.clone());
         let (telnyx, registry, id) = (Telnyx::new(&cfg), calls.clone(), s.id);
-        tokio::spawn(async move {
+        let mouth_task = tokio::spawn(async move {
             while let Some(say) = lines.recv().await {
-                let audio = match (provider, registry.provider_ref(id)) {
-                    (false, _) => crate::voice::say_call(&voice_cfg, &say.text, &lang).await,
+                let audio = match (&ours, registry.provider_ref(id)) {
+                    (Some(voice), _) => voice.say(&say.text).await,
                     // Telnyx speaks it, after what it was given before: only text goes out.
-                    (true, Some(call)) => {
+                    (None, Some(call)) => {
                         let asked = telnyx.speak(&call, &say.text, &lang).await;
                         asked.ok().map(|()| Vec::new())
                     }
-                    (true, None) => None,
+                    (None, None) => None,
                 };
                 if tx.send(Event::Spoken(say, audio)).is_err() {
                     break;
                 }
             }
         });
-        let (voice_cfg, lang, tx) = (cfg.clone(), s.ask.language.clone(), s.tx.clone());
-        tokio::spawn(async move {
+        let (ours, tx) = (voice.clone(), s.tx.clone());
+        let ear_task = tokio::spawn(async move {
             while let Some(pcm) = utterances.recv().await {
-                let heard = crate::voice::hear_call(&voice_cfg, &pcm, &lang).await;
-                if tx.send(Event::Heard(heard)).is_err() {
+                let Some(voice) = &ours else { continue };
+                if tx.send(Event::Heard(voice.hear(&pcm).await)).is_err() {
                     break;
                 }
             }
@@ -659,7 +672,16 @@ impl<'a> Live<'a> {
             ending: None,
             said: String::new(),
             tainted: false,
+            voice,
+            voice_tasks: [mouth_task, ear_task],
         }
+    }
+
+    /// The call's voice goes: its two tasks are aborted, and with the last hold on it the warm
+    /// pair is killed (`voice::Call`'s drop).
+    fn hush(&mut self) {
+        self.voice_tasks.iter().for_each(|t| t.abort());
+        self.voice = None;
     }
 
     fn session(&self) -> String {
@@ -766,6 +788,10 @@ impl<'a> Live<'a> {
         // The agent first: nobody is rung for a call that could not speak.
         if let Err(why) = self.spawn().await {
             return ("failed", why);
+        }
+        // whisper and Piper load while the call rings.
+        if let Some(voice) = &self.voice {
+            voice.warm().await;
         }
         let Some(base) = self.cfg.calls().media_url else {
             return ("failed", "calls.media_url is not set".into());
@@ -1217,6 +1243,7 @@ impl<'a> Live<'a> {
     /// ADAD rule 4(h) gives 10 s after theirs), the call and its action are closed, the owner
     /// and main are told, and the child goes.
     async fn finish(&mut self, (status, by): End) {
+        self.hush();
         let hung = match &self.provider_ref {
             Some(call) => self.telnyx.hangup(call).await,
             None => Ok(()),
