@@ -4,7 +4,8 @@
 //! reaped by PID 1, and the new daemon adopts them (`procs::Procs::adopt`). SIGTERM and SIGINT
 //! are passed to the daemon, and then nothing is restarted, so `docker stop` stays a clean stop.
 //! A daemon that hangs instead of crashing stops rewriting `<state>/heartbeat` (each router tick):
-//! once it is `stale`, its process group is killed and it is started again, as after a crash.
+//! once its line has not changed for `stale` (monotonic time, so a clock jump is no hang), its
+//! process group is killed and it is started again, as after a crash.
 
 use std::collections::VecDeque;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -50,6 +51,25 @@ pub fn heartbeat_age(path: &Path) -> Option<u64> {
     let text = std::fs::read_to_string(path).ok()?;
     let at: i64 = text.split_whitespace().next()?.parse().ok()?;
     Some((crate::now() - at).max(0) as u64)
+}
+
+/// How long the heartbeat's line has stayed the same, on the monotonic clock: a wall clock that
+/// jumps never makes a beating daemon look hung, nor a hung one look alive. `None` while the
+/// file is missing or unreadable.
+#[derive(Default)]
+struct Beat(Option<(String, Instant)>);
+
+impl Beat {
+    fn unchanged(&mut self, line: Option<String>, now: Instant) -> Option<Duration> {
+        let line = line?;
+        match &self.0 {
+            Some((seen, since)) if *seen == line => Some(now - *since),
+            _ => {
+                self.0 = Some((line, now));
+                Some(Duration::ZERO)
+            }
+        }
+    }
 }
 
 impl Default for Policy {
@@ -150,6 +170,7 @@ pub async fn run(
         let started = Instant::now();
         let (mut stopping, mut killed) = (false, false);
         let mut check = tokio::time::interval(policy.check);
+        let mut beat = Beat::default();
         let status = loop {
             tokio::select! {
                 s = child.wait() => break s,
@@ -161,14 +182,15 @@ pub async fn run(
                     }
                 }
                 _ = check.tick(), if policy.heartbeat.is_some() && !stopping && !killed => {
-                    let age = policy.heartbeat.as_deref().and_then(heartbeat_age);
-                    let Some(age) = age.filter(|a| *a >= policy.stale.as_secs()) else {
+                    let line = policy.heartbeat.as_deref().and_then(|p| std::fs::read_to_string(p).ok());
+                    let Some(age) = beat.unchanged(line, Instant::now()).filter(|a| *a >= policy.stale) else {
                         continue;
                     };
                     if started.elapsed() < policy.grace {
                         continue;
                     }
-                    eprintln!("zephyr: the daemon's heartbeat is {age}s old: it hangs; killing it");
+                    let age = age.as_secs();
+                    eprintln!("zephyr: the daemon's heartbeat has not changed in {age}s: it hangs; killing it");
                     if let Some(pid) = child.id() {
                         // SAFETY: plain syscalls to our own child's group, or to it alone when
                         // it leads none.
@@ -356,6 +378,23 @@ mod tests {
             .expect("waited out the backoff");
         assert_eq!(code, 0, "asked to stop with nothing running");
         assert_eq!(n.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_heartbeat_is_stale_only_when_its_content_stops_changing() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut beat = Beat::default();
+        assert_eq!(beat.unchanged(None, at(0)), None, "no file yet");
+        // A wall time years back (the clock jumped) whose line still changes each tick.
+        for s in [0, 200, 400, 600] {
+            let line = Some(format!("1000 1 {s}\n"));
+            assert_eq!(beat.unchanged(line, at(s)), Some(Duration::ZERO));
+        }
+        // A line that no longer changes is a hang, whatever time it holds.
+        let line = || Some("1731400000 1 0\n".to_string());
+        beat.unchanged(line(), at(700));
+        assert_eq!(beat.unchanged(line(), at(1000)), Some(STALE));
     }
 
     #[tokio::test]
