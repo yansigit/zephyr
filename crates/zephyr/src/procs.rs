@@ -325,18 +325,30 @@ const LOG_CAP: u64 = 50 * 1024 * 1024;
 /// its parent (after a crash) still learns it. All are arguments, never spliced into the script.
 /// The outer `bash` stays the process-group leader and keeps the command's exit code.
 /// When the output goes through the daemon's scrubber (`spawn`), `$3` is its pid: the wrapper
-/// closes its own output and waits, at most a second, for the scrubber to have written the
-/// last of it, so whoever reads the log once the command has ended reads all of it.
+/// closes its own output and waits for the scrubber to have written the last of it and ended
+/// (a zombie, after a re-exec, has ended), so whoever reads the log once the command has ended
+/// reads all of it.
 /// The output goes through `head`, so the log stays within `$2` bytes (`LOG_CAP`): what is past
 /// it is counted and dropped, and the command keeps running. Unbuffered (`stdbuf`), so the log
 /// shows output as it comes. A process substitution, not a pipe: a server the command leaves in
-/// the background may hold its output open, and the wrapper waits at most a second for it.
+/// the background may hold its output open, so `head` and the scrubber never reach its end.
+/// The wrapper looks in `/proc` for such a process, one with the pipe open for writing, and
+/// with one (or a pipe it cannot name) waits at most a second for them (`m=50`); with none,
+/// the writers reach the end however slow they are on a loaded machine, and it waits for them
+/// up to 10 seconds (`m=500`).
+/// shortcut: beside a server holding the output, a writer more than a second behind loses the
+/// tail of the report (`process log` still has it); count the bytes through if that matters.
 const WRAPPER: &str = concat!(
     r#"exec 3> >(stdbuf -o0 head -c "$(($2 - 200))"; n=$(wc -c); [ "$n" -gt 0 ] && "#,
     r#"printf '\n[zephyr: the log stops here; %s more bytes of output were dropped]\n' "$n"); "#,
-    r#"o=$!; bash -c "$0" >&3 2>&3 3>&-; s=$?; exec 3>&-; "#,
-    r#"for _ in {1..50}; do kill -0 "$o" 2>/dev/null || break; sleep 0.02; done; "#,
-    r#"exec >&- 2>&-; [ -n "$3" ] && for _ in {1..50}; do [ -d "/proc/$3" ] || break; sleep 0.02; done; "#,
+    r#"o=$! p=$(readlink /proc/$$/fd/3); bash -c "$0" >&3 2>&3 3>&-; s=$?; exec 3>&-; "#,
+    r#"m=500; [ -n "$p" ] || m=50; for f in $(find /proc/[0-9]*/fd -lname "pipe:\[${p//[^0-9]/}\]" 2>/dev/null); do "#,
+    r#"{ read -r _; read -r _ v; } < "${f/\/fd\//\/fdinfo\/}" && (( 0$v & 3 )) && m=50; "#,
+    r#"done 2>/dev/null; "#,
+    r#"for ((i = 0; i < m; i++)); do kill -0 "$o" 2>/dev/null || break; sleep 0.02; done; "#,
+    r#"exec >&- 2>&-; [ -n "$3" ] && for ((i = 0; i < m; i++)); do "#,
+    r#"read -r q < "/proc/$3/stat" || break; q=${q##*) }; [ "${q%% *}" = Z ] && break; "#,
+    r#"sleep 0.02; done 2>/dev/null; "#,
     r#"echo "$s" > "$1.tmp" && mv -f "$1.tmp" "$1"; exit "$s""#,
 );
 
@@ -356,9 +368,8 @@ fn recorded_exit(log: &Path) -> Option<i32> {
 /// The output reaches the log through `zephyr __scrublog` (`cfg.scrubber`), run as the daemon
 /// in a group of its own: the log is the agent's to read, so no vault value may land in it
 /// (`vault::scrub_stream`). It is a process, not a task of the daemon's, so a command outlives
-/// a re-exec or a crash of the daemon with its output still going somewhere.
-/// shortcut: a scrubber that ends after a re-exec stays a zombie until the daemon exits, and
-/// the wrapper then waits its full second; reap it in `adopt` if commands often span one.
+/// a re-exec or a crash of the daemon with its output still going somewhere. One that ends
+/// after a re-exec stays a zombie until the daemon exits; the wrapper does not wait on it.
 fn spawn(
     cfg: &Config,
     command: &str,
@@ -1107,6 +1118,68 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("3.log")).unwrap(), "up\n");
         // SAFETY: a plain syscall on the group this test just made.
         unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    }
+
+    #[test]
+    fn the_exit_is_recorded_only_once_a_slow_log_writer_has_written_the_output() {
+        let dir = crate::test_dir("procs-slow-writer");
+        // A `head` that starts late, as on a loaded machine: past the second the wrapper gives
+        // a writer that something left in the background may hold open forever.
+        let shim = dir.join("bin");
+        std::fs::create_dir_all(&shim).unwrap();
+        let stdbuf = shim.join("stdbuf");
+        std::fs::write(
+            &stdbuf,
+            "#!/bin/bash\nsleep 2; exec /usr/bin/stdbuf \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stdbuf, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let path = format!("{}:{}", shim.display(), std::env::var("PATH").unwrap());
+        let log = dir.join("1.log");
+        let status = std::process::Command::new("bash")
+            .args(["-c", WRAPPER, "echo late"])
+            .arg(log.with_extension("exit"))
+            .arg(LOG_CAP.to_string())
+            .env("PATH", &path)
+            .stdout(std::fs::File::create(&log).unwrap())
+            .process_group(0)
+            .status()
+            .unwrap();
+        assert_eq!((status.code(), recorded_exit(&log)), (Some(0), Some(0)));
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "late\n");
+        // A scrubber that writes late, and is left a zombie as after a re-exec: the wrapper
+        // waits for its output, and not for its parent to reap it.
+        let log = dir.join("2.log");
+        let (rx, tx) = std::io::pipe().unwrap();
+        let mut scrubber = std::process::Command::new("bash")
+            .args(["-c", "sleep 2; exec cat"])
+            .stdin(rx)
+            .stdout(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        let mut wrapper = std::process::Command::new("bash");
+        wrapper
+            .args(["-c", WRAPPER, "echo scrubbed"])
+            .arg(log.with_extension("exit"))
+            .arg(LOG_CAP.to_string())
+            .arg(scrubber.id().to_string())
+            .stdout(tx.try_clone().unwrap())
+            .stderr(tx)
+            .process_group(0);
+        let mut child = wrapper.spawn().unwrap();
+        // Our copies of the pipe go, as `spawn` drops the daemon's.
+        drop(wrapper);
+        let status = child.wait().unwrap();
+        assert_eq!((status.code(), recorded_exit(&log)), (Some(0), Some(0)));
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "scrubbed\n");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        scrubber.wait().unwrap();
     }
 
     #[tokio::test]
