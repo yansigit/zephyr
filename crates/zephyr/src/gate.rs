@@ -438,10 +438,13 @@ pub fn window_over(
     let w = approvals::window(cfg);
     let currency = approvals::currency(cfg);
     let (count, sum, _) = store.payments_since(now - w.seconds, &currency)?;
+    let unknown = store.unknown_charge_since(now - w.seconds)?;
     let this = amount
         .filter(|a| a.currency == currency)
         .map(|a| approvals::minor_of(a.value, &currency));
-    if count + 1 > w.effects {
+    // A payment in the window of an unknown amount (a card charged in another currency): the
+    // sum is not known to be within, so it is over until that payment leaves the window.
+    if count + 1 > w.effects || (unknown && w.amount_minor.is_some()) {
         return Ok(Window::Over(window_text(cfg)));
     }
     Ok(match (w.amount_minor, this) {
@@ -5332,6 +5335,22 @@ mod tests {
         }
         let id = held(&decide(&h.cfg, &h.store, &card_of("10"), owner(), now + 9));
         assert!(h.store.action_strong(id).unwrap());
+    }
+
+    /// A payment in the window whose amount is unknown (a card charged in another currency)
+    /// leaves the window's sum unknown: with an amount limit, the next payment is held strong
+    /// until it leaves the window.
+    #[test]
+    fn an_unknown_amount_in_the_window_makes_the_next_payment_strong() {
+        let h = home("gate-window-unknown", AUTO_100);
+        let now = crate::now();
+        h.store
+            .add_payment(now - 1, None, "CAD", "charge", None)
+            .unwrap();
+        let id = held(&decide(&h.cfg, &h.store, &card_of("10"), owner(), now));
+        assert!(h.store.action_strong(id).unwrap());
+        // Once it is out of the window, a payment within the cap goes again.
+        assert!(decide_card(&h.cfg, &h.store, &card_of("10"), owner(), now + 601).is_ok());
     }
 
     /// Only what the window knows to be over is strong: a total that was not read, or is in

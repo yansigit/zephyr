@@ -1915,8 +1915,11 @@ fn used(cfg: &Arc<Config>, store: &Store, card: Card, charges: &[Charge], now: i
     if !charge.unwrap_or(false) {
         return;
     }
-    // The window counts what the issuer took, when that is more than the cap.
-    log(store.card_paid(card.id, first.minor, &first.currency));
+    // The window counts what the issuer took in all, when that is more than the cap; in another
+    // currency it cannot be counted, and the window holds the next payment as over.
+    let same = charges.iter().all(|c| c.currency == card.currency);
+    let total = same.then(|| charges.iter().map(|c| c.minor).sum());
+    log(store.card_paid(card.id, total));
     let what = charged(first);
     audit(cfg, store, &card, "charge", &what);
     let over = first.minor > card.cap_minor || first.currency != card.currency;

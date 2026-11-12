@@ -8790,6 +8790,9 @@ async fn a_charge_over_the_cap_is_told_at_once() {
         "[zephyr] card #1 was charged 50.00 USD; no merchant id from the issuer; the card is closed"
     );
     assert_eq!(card_status(&home, 1), "used");
+    // A charge in another currency leaves the window's row an unknown amount.
+    let store = Store::open(&home.join("state.db")).unwrap();
+    assert_eq!(store.payments_since(0, "CAD").unwrap(), (1, 0, true));
     gw.shutdown().await;
 }
 
@@ -9185,16 +9188,17 @@ async fn a_card_counts_in_the_window_at_its_cap_whatever_the_page_says() {
         store.payments_since(0, "CAD").unwrap()
     };
     assert_eq!(counted(), (1, 4250, false), "the card's cap");
-    // The issuer says it took more: the window counts that.
+    // The issuer says it took more, in two charges: the window counts their sum.
+    let charge = |minor| Charge {
+        minor,
+        currency: "CAD".into(),
+        ..Charge::default()
+    };
     Fake::script(&script, |s| {
-        s.state = CardState::Used(vec![Charge {
-            minor: 4300,
-            currency: "CAD".into(),
-            ..Charge::default()
-        }])
+        s.state = CardState::Used(vec![charge(2500), charge(2000)])
     });
     wait(|| card_status(&home, 1) == "used").await;
-    assert_eq!(counted(), (1, 4300, false));
+    assert_eq!(counted(), (1, 4500, false));
     gw.shutdown().await;
 }
 

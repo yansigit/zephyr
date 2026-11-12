@@ -1850,6 +1850,8 @@ impl Store {
             let (count, sum, _) = self.payments_since(since, currency)?;
             let found = match (limit, minor) {
                 _ if count + 1 > effects => Paid::Over,
+                // A card charged an amount the window cannot count: not known to be within.
+                (Some(_), _) if self.unknown_charge_since(since)? => Paid::Over,
                 (Some(limit), Some(minor)) if sum + minor > limit => Paid::Over,
                 (Some(_), None) => Paid::Unread,
                 _ => Paid::Recorded(0),
@@ -1889,6 +1891,17 @@ impl Store {
              FROM payments WHERE at > ?1",
             params![since, currency],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+    }
+
+    /// Whether a card was charged after `since` an amount the window cannot count (in another
+    /// currency, [`Store::card_paid`]).
+    pub fn unknown_charge_since(&self, since: i64) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM payments
+                           WHERE at > ?1 AND source = 'charge' AND minor IS NULL)",
+            params![since],
+            |r| r.get(0),
         )
     }
 
@@ -1947,14 +1960,16 @@ impl Store {
         Ok(n == 1)
     }
 
-    /// The issuer charged card `id` `minor` in `currency`: its payment row is raised to that
-    /// when it is more, never lowered below what was approved.
-    pub fn card_paid(&self, id: i64, minor: i64, currency: &str) -> rusqlite::Result<()> {
+    /// The issuer charged card `id` `total` in all, in its currency: its payment row is raised
+    /// to that when it is more, never lowered below what was approved. `None` (a charge in
+    /// another currency) leaves the row an unknown amount, its source `charge`, which the window
+    /// counts as over.
+    pub fn card_paid(&self, id: i64, total: Option<i64>) -> rusqlite::Result<()> {
         self.db.execute(
-            "UPDATE payments SET minor = ?2
-             WHERE id = (SELECT payment FROM cards WHERE id = ?1) AND currency = ?3
-               AND minor < ?2",
-            params![id, minor, currency],
+            "UPDATE payments SET minor = CASE WHEN ?2 IS NULL THEN NULL ELSE max(minor, ?2) END,
+                    source = CASE WHEN ?2 IS NULL THEN 'charge' ELSE source END
+             WHERE id = (SELECT payment FROM cards WHERE id = ?1) AND minor IS NOT NULL",
+            params![id, total],
         )?;
         Ok(())
     }
