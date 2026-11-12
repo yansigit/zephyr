@@ -7,8 +7,9 @@
 # Secret PROVIDER_REPOS_TOKEN: a fine-grained token with contents:read on yansigit/rpi-package and
 # yansigit/rpi-provider-plugins, passed to the build as the gh_token secret. It is only needed while
 # one of them is private; the build works without it when both are public.
-# Variable ZEPHYR_RUNNER: unset runs on GitHub-hosted ubuntu-24.04; `zephyr-local` runs on the
-# fallback runner from deploy/runner/start.sh, which builds on its zephyr-buildkitd (README "Releasing").
+# Where it runs follows variable ZEPHYR_CI as ci.yml does (.github/ci.sh plan, README "CI"): on
+# GitHub-hosted, unless that is `local` or GitHub refused a hosted job in the last hours; then on
+# zephyr-local (deploy/runner/start.sh), which builds on its zephyr-buildkitd without the smoke test.
 name: image
 on:
   push:
@@ -24,9 +25,23 @@ on:
 permissions:
   contents: read
   packages: write
+  actions: read
 jobs:
+  plan:
+    runs-on: ${{ vars.ZEPHYR_CI == 'hosted' && 'ubuntu-latest' || 'zephyr-local' }}
+    timeout-minutes: 5
+    outputs:
+      runner: ${{ steps.plan.outputs.hosted }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - id: plan
+        run: .github/ci.sh plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZEPHYR_CI: ${{ vars.ZEPHYR_CI }}
   image:
-    runs-on: ${{ vars.ZEPHYR_RUNNER || 'ubuntu-24.04' }}
+    needs: plan
+    runs-on: ${{ needs.plan.outputs.runner }}
     # A hung build fails after an hour instead of burning GitHub's 6-hour limit in minutes.
     timeout-minutes: 60
     env:
@@ -34,7 +49,7 @@ jobs:
     steps:
       # GitHub's runners have ~14 GB free, too little for this image's build; their preinstalled
       # SDKs free ~30 GB more. df shows the room in the log either way.
-      - if: vars.ZEPHYR_RUNNER == ''
+      - if: runner.environment == 'github-hosted'
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
@@ -46,9 +61,9 @@ jobs:
           if [ "$MINIMAL" = true ]; then v=dev-minimal; fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-      - if: vars.ZEPHYR_RUNNER == ''
+      - if: runner.environment == 'github-hosted'
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - if: vars.ZEPHYR_RUNNER != ''
+      - if: runner.environment == 'self-hosted'
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
           driver: remote
@@ -61,7 +76,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       # Smoke test, hosted runners only: the fallback has no Docker daemon to load or run the image.
-      - if: vars.ZEPHYR_RUNNER == ''
+      - if: runner.environment == 'github-hosted'
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -78,7 +93,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       # The paths are the image's extensions (EXTENSIONS in crates/zephyr/src/host/conf.rs) and the policy plugin.
-      - if: vars.ZEPHYR_RUNNER == '' && env.MINIMAL != 'true'
+      - if: runner.environment == 'github-hosted' && env.MINIMAL != 'true'
         run: |
           docker run --rm zephyr-smoke:ci sh -c '
             set -e
@@ -92,7 +107,7 @@ jobs:
             test -f /opt/zephyr/ext/rpi-claude-agent/librpi_claude_agent.so
           '
       # The minimal image: what stays, and none of what the two provider sources bring.
-      - if: vars.ZEPHYR_RUNNER == '' && env.MINIMAL == 'true'
+      - if: runner.environment == 'github-hosted' && env.MINIMAL == 'true'
         run: |
           docker run --rm zephyr-smoke:ci sh -c '
             set -e
@@ -122,5 +137,5 @@ jobs:
           secrets: |
             gh_token=${{ secrets.PROVIDER_REPOS_TOKEN }}
           # Hosted runners only: the fallback's remote BuildKit runs outside the job, without an Actions cache token.
-          cache-from: ${{ vars.ZEPHYR_RUNNER == '' && 'type=gha' || '' }}
-          cache-to: ${{ vars.ZEPHYR_RUNNER == '' && 'type=gha,mode=max' || '' }}
+          cache-from: ${{ runner.environment == 'github-hosted' && 'type=gha' || '' }}
+          cache-to: ${{ runner.environment == 'github-hosted' && 'type=gha,mode=max' || '' }}

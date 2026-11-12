@@ -1,5 +1,9 @@
-# fmt, clippy and the tests on every PR and push to main, as deploy/release.sh runs them. The ignored
-# tests need the pinned rpi binary, which this runner does not have: deploy/release.sh runs them.
+# fmt, clippy, shellcheck, cargo deny and the tests on every PR and push to main, split between the
+# owner's runner (zephyr-local, deploy/runner/start.sh) and GitHub's; `ci-ok` is the one check to gate
+# merges on (README "CI"). .github/ci.sh holds the placement and the checks.
+# Variable ZEPHYR_CI: unset or `both` runs the last test shard on GitHub-hosted and the rest on
+# zephyr-local, `local` runs everything there, `hosted` everything on GitHub (the server is down).
+# The ignored tests need the pinned rpi binary: deploy/release.sh runs them.
 name: ci
 on:
   pull_request:
@@ -7,29 +11,75 @@ on:
     branches: [main]
 permissions:
   contents: read
+  actions: read
+  checks: read
+env:
+  CARGO_TERM_COLOR: never
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+  plan:
+    runs-on: ${{ vars.ZEPHYR_CI == 'hosted' && 'ubuntu-latest' || 'zephyr-local' }}
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      rescue: ${{ steps.plan.outputs.rescue }}
     steps:
       - uses: actions/checkout@v4
-      # shellcheck comes with GitHub's ubuntu runners.
-      - run: shellcheck deploy/install.sh
+      - id: plan
+        run: .github/ci.sh plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZEPHYR_CI: ${{ vars.ZEPHYR_CI }}
+  check:
+    needs: plan
+    name: ${{ matrix.check }} (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      # zephyr-local's image (deploy/runner/Dockerfile) has all of this; GitHub's runners get it here.
       # The toolchain the image builds with (deploy/Dockerfile's rust:1.95), so a newer clippy's lints
       # land with a deliberate bump, not on an unrelated PR.
-      - uses: dtolnay/rust-toolchain@1.95
+      - if: runner.environment == 'github-hosted'
+        uses: dtolnay/rust-toolchain@1.95
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      # tests/tui.rs drives tmux and skips without it; script and python3 come with the runner.
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
-      - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --workspace
-  deny:
-    runs-on: ubuntu-latest
+      - if: runner.environment == 'github-hosted' && matrix.check != 'deny'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.check == 'lint' && 'lint' || 'test' }}
+      - if: runner.environment == 'github-hosted'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.146,cargo-deny@0.20.2
+      # tests/tui.rs drives tmux and skips without it; script, python3 and node come with the runner.
+      - if: runner.environment == 'github-hosted' && startsWith(matrix.check, 'test')
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
+      - run: .github/ci.sh run "${{ matrix.check }}"
+  # A hosted job GitHub would not start (spending limit or quota) runs here instead; one that ran and
+  # failed is never rescued.
+  rescue:
+    needs: [plan, check]
+    if: always() && needs.plan.outputs.rescue == 'true' && needs.check.result == 'failure'
+    runs-on: zephyr-local
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories bans
+      - run: .github/ci.sh rescue
+        env:
+          GH_TOKEN: ${{ github.token }}
+  ci-ok:
+    needs: [plan, check, rescue]
+    if: always()
+    runs-on: ${{ vars.ZEPHYR_CI == 'hosted' && 'ubuntu-latest' || 'zephyr-local' }}
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "plan: $PLAN, checks: $CHECK, rescue: $RESCUE"
+          [ "$PLAN" = success ] && { [ "$CHECK" = success ] || [ "$RESCUE" = success ]; }
+        env:
+          PLAN: ${{ needs.plan.result }}
+          CHECK: ${{ needs.check.result }}
+          RESCUE: ${{ needs.rescue.result }}
