@@ -4346,7 +4346,7 @@ fn the_dockerfile_skips_a_provider_source_only_for_an_empty_arg() {
         rest[..rest[1..].find("\nFROM ").map_or(rest.len(), |i| i + 1)].to_string()
     };
     for (name, arg, file) in [
-        ("rust", "RPI_PACKAGE_REPO", "/src/rpi-package/Cargo.toml"),
+        ("rpi-ext", "RPI_PACKAGE_REPO", "/src/rpi-package/Cargo.toml"),
         (
             "plugins",
             "PLUGINS_REPO",

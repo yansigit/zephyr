@@ -102,23 +102,27 @@ RUN --mount=type=secret,id=gh_token fetch "$PLUGINS_REPO" "$PLUGINS_REF"
 FROM scratch AS provider-plugins
 COPY --from=provider-plugins-git /src /
 
-# zephyr, zephyr-policy, zephyr-cursor, and from rpi-package librpi_providers.so and
-# librpi_mcp_adapter.so, unless RPI_PACKAGE_REPO is empty. Set, a tree that lacks them fails here.
+# zephyr, zephyr-policy and zephyr-cursor. No cache mounts here or below: a shared BuildKit keeps
+# them across builds, so one branch's build could leave crate sources that a release then compiles.
 FROM toolchain AS rust
-ARG RPI_PACKAGE_REPO
 # The repository the image is published to, baked into its CLI (`zephyr upgrade` pulls from it);
 # unset or empty, the CLI's own default.
 ARG ZEPHYR_BUILD_REPO
 COPY Cargo.toml Cargo.lock /src/zephyr/
 COPY crates /src/zephyr/crates
-COPY --from=rpi-package / /src/rpi-package
-# sharing=locked: the rust and plugins stages run at once and would unpack the same crate into this cache together.
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    cd /src/zephyr && cargo build --release --locked -p zephyr -p zephyr-policy -p zephyr-cursor \
+RUN cd /src/zephyr && cargo build --release --locked -p zephyr -p zephyr-policy -p zephyr-cursor \
     && mkdir -p /out/bin /out/lib /out/ext \
     && cp /src/zephyr/target/release/zephyr /out/bin/ \
     && cp /src/zephyr/target/release/libzephyr_policy.so /out/lib/ \
-    && cp /src/zephyr/target/release/libzephyr_cursor.so /out/ext/ \
+    && cp /src/zephyr/target/release/libzephyr_cursor.so /out/ext/
+
+# librpi_providers.so and librpi_mcp_adapter.so from rpi-package, in a stage of their own so a
+# change to this repo does not rebuild them. Left out only when RPI_PACKAGE_REPO is empty; set, a
+# tree that lacks them fails here.
+FROM toolchain AS rpi-ext
+ARG RPI_PACKAGE_REPO
+COPY --from=rpi-package / /src/rpi-package
+RUN mkdir -p /out/ext \
     && if [ -n "$RPI_PACKAGE_REPO" ]; then \
          cd /src/rpi-package && cargo build --release --locked -p rpi-providers -p rpi-mcp-adapter \
          && cp /src/rpi-package/target/release/librpi_providers.so /out/ext/ \
@@ -133,8 +137,7 @@ FROM toolchain AS plugins
 ARG PLUGINS_REPO
 COPY --from=provider-plugins / /src/plugins
 WORKDIR /src/plugins
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked --mount=type=cache,target=/root/.npm \
-    if [ -n "$PLUGINS_REPO" ]; then \
+RUN if [ -n "$PLUGINS_REPO" ]; then \
       packages/rpi-claude-agent/scripts/stage.sh /out/ext/rpi-claude-agent; \
     else mkdir -p /out/ext; fi
 
@@ -353,6 +356,7 @@ COPY --from=rpi /usr/local/bin/rpi /usr/local/bin/rpi
 COPY --from=rust /out/bin/zephyr /usr/local/bin/zephyr
 COPY --from=rust /out/lib/libzephyr_policy.so /usr/local/lib/libzephyr_policy.so
 COPY --from=rust /out/ext/ /opt/zephyr/ext/
+COPY --from=rpi-ext /out/ext/ /opt/zephyr/ext/
 COPY --from=plugins /out/ext/ /opt/zephyr/ext/
 COPY --from=browser /out/browser/ /opt/zephyr/browser/
 # The real agent-browser, out of the agent's PATH: `agent-browser` there is zephyr's approvals
