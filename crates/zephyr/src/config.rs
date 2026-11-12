@@ -830,6 +830,10 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        // Also refuses `inf` and `nan`, which the auth check's Duration would panic on.
+        if !(1.0..=60.0).contains(&self.auth.refresh_minutes) {
+            anyhow::bail!("[auth] refresh_minutes must be 1 to 60");
+        }
         let mut seen = std::collections::HashSet::new();
         for a in &self.accounts {
             let safe = !a.name.is_empty()
@@ -1357,6 +1361,14 @@ prompt = "Build it."
         assert!(!cfg.auth.enabled);
         assert_eq!(cfg.auth.refresh_minutes, 3.0);
         assert!(toml::from_str::<Config>(&format!("{base}[auth]\ntypo = 1\n")).is_err());
+        // The check interval becomes a Duration: one it cannot hold would panic at each start.
+        for bad in ["inf", "1e300", "nan", "0.5", "61"] {
+            let cfg: Config =
+                toml::from_str(&format!("{base}[auth]\nrefresh_minutes = {bad}\n")).unwrap();
+            assert!(cfg.validate().is_err(), "{bad}");
+        }
+        let cfg: Config = toml::from_str(&format!("{base}[auth]\nrefresh_minutes = 60\n")).unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]
