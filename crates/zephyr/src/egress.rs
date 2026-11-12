@@ -439,12 +439,14 @@ impl Audit {
                     "swap" => format!("swap {dest}"),
                     _ => dest.split(" -> ").next().unwrap_or(dest).to_string(),
                 };
-                let new = match self.seen.len() < SEEN_AN_HOUR {
-                    true => self.seen.insert(key),
-                    false => !self.seen.contains(&key),
-                };
+                let new = !self.seen.contains(&key);
                 self.allowed += usize::from(new);
-                (new && self.allowed <= ROWS_A_MINUTE).then(|| "allowed".to_string())
+                let written = new && self.allowed <= ROWS_A_MINUTE;
+                // Seen only once its row is written, so one the cap cut is named next time.
+                if written && self.seen.len() < SEEN_AN_HOUR {
+                    self.seen.insert(key);
+                }
+                written.then(|| "allowed".to_string())
             }
             Outcome::Refused(reason) => {
                 self.refused += 1;
@@ -2615,6 +2617,28 @@ mod tests {
             );
         }
         assert!(a.seen.len() <= SEEN_AN_HOUR);
+    }
+
+    /// A destination the minute's cap left unwritten is not taken as seen: after 60 decoys,
+    /// the one that matters is still named when it comes again.
+    #[test]
+    fn a_destination_cut_by_the_cap_is_named_later() {
+        let mut a = Audit::default();
+        let mut note = |now, host: &str| {
+            let dest = format!("{host}:443 -> 1.1.1.1");
+            a.note(now, "connect", &dest, Outcome::Allowed)
+        };
+        for i in 0..60 {
+            assert_eq!(note(60, &format!("decoy{i}.example")).len(), 1);
+        }
+        assert!(note(60, "exfil.example").is_empty());
+        let rows = note(120, "exfil.example");
+        let named = (
+            "connect".into(),
+            "exfil.example:443 -> 1.1.1.1".into(),
+            "allowed".into(),
+        );
+        assert!(rows.contains(&named), "{rows:?}");
     }
 
     #[tokio::test]
