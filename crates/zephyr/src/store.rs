@@ -4972,6 +4972,14 @@ mod tests {
             assert_eq!(store.card(card).unwrap().unwrap().status, "waiting");
             store.add_payment(100, Some(4250), "CAD", "card", None).unwrap();
             assert_eq!(store.payments_since(0, "CAD").unwrap(), (1, 4250, false));
+            // v21: a phone call and its transcript.
+            (store.call_start(9, "telnyx", "+14165550123", "book", "en", "chat", "owner")).unwrap();
+            store.call_line(9, "them", "Hello.", None).unwrap();
+            store.call_line(9, "held", "[a fact]", Some("card")).unwrap();
+            let lines = store.call_lines(9).unwrap();
+            let said: Vec<_> = lines.iter().map(|(_, w, t)| (w.as_str(), t.as_str())).collect();
+            assert_eq!(said, [("them", "Hello."), ("held", "[a fact]")]);
+            assert_eq!(store.call_status(9).unwrap().unwrap().0, "dialing");
             let now: i64 = store
                 .db
                 .pragma_query_value(None, "user_version", |r| r.get(0))
