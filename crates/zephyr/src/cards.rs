@@ -2496,8 +2496,6 @@ mod tests {
         );
     }
 
-    /// A close asked with a copy read before the issue landed closes what the issuer made: the
-    /// reference is read from the record, not from the copy.
     /// A card the issuer did not issue is no payment: the window's count is as it was.
     #[tokio::test]
     async fn a_card_that_was_not_issued_leaves_the_window_count() {
@@ -2535,6 +2533,8 @@ mod tests {
         assert_eq!(store.payments_since(now - 600, "CAD").unwrap().0, 0);
     }
 
+    /// A close asked with a copy read before the issue landed closes what the issuer made: the
+    /// reference is read from the record, not from the copy.
     #[tokio::test]
     async fn a_close_with_a_stale_copy_closes_the_card_the_issue_made() {
         let dir = crate::test_dir("cards-stale-close");
