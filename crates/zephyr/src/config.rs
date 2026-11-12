@@ -117,6 +117,16 @@ pub struct Config {
     /// `[browser]`: the agent's browser pacing (DESIGN §4.24). Absent unless the owner set a key:
     /// `Config::pace_ms` reads the default.
     pub browser: Option<Browser>,
+    /// `[cards]`: virtual cards (DESIGN §4.25). Absent, or with no provider: off.
+    pub cards: Option<Cards>,
+    /// Lets `[cards] provider = "fake"` name the scripted test issuer. Not configurable.
+    #[serde(skip)]
+    pub cards_fake: bool,
+    /// Link's API and sign-in base URLs. Not configurable; tests point them at a stub.
+    #[serde(skip, default = "link_api")]
+    pub link_api: String,
+    #[serde(skip, default = "link_auth")]
+    pub link_auth: String,
     /// The image's voice folder (`voice::DIR`): ffmpeg, whisper-cli, Piper, models and voices.
     /// Not configurable; tests point it at small fakes.
     #[serde(skip, default = "voice_dir")]
@@ -188,6 +198,14 @@ pub struct Config {
     /// end, before it kills them (DESIGN §4.11). Not configurable; tests shorten it.
     #[serde(skip, default = "desktop_drain")]
     pub desktop_drain: std::time::Duration,
+}
+
+fn link_api() -> String {
+    crate::cards_link::API.into()
+}
+
+fn link_auth() -> String {
+    crate::cards_link::AUTH.into()
 }
 
 fn telegram_api() -> String {
@@ -471,6 +489,33 @@ pub struct Approvals {
     pub facts: Option<String>,
     /// What only a strong channel may approve: `loosen`, `money`. Absent is `["loosen"]`.
     pub strong_only: Option<Vec<String>>,
+    /// `[approvals.window]`: the limit over all payments (`approvals::window`).
+    pub window: Option<Window>,
+}
+
+/// `[approvals.window]` (DESIGN §4.25): past `effects` payments or `amount` (in
+/// `approvals.currency`) in `seconds`, a payment waits for a strong channel whatever the mode.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Window {
+    /// 1 to 100; absent is 5.
+    pub effects: Option<u32>,
+    /// Absent is the `auto N` cap when there is one, else no amount limit.
+    pub amount: Option<f64>,
+    /// 60 to 86 400; absent is 600.
+    pub seconds: Option<u32>,
+}
+
+/// `[cards]` (DESIGN §4.25).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cards {
+    /// `manual` or `link`; absent is off.
+    pub provider: Option<String>,
+    /// The most one card may be for, in `approvals.currency`; absent is 100.
+    pub max: Option<f64>,
+    /// How long an issued card stays open, 1 to 60; absent is 15.
+    pub minutes: Option<u32>,
 }
 
 /// `[agent]`.
@@ -632,6 +677,9 @@ impl Config {
         self.voice_dir = running.voice_dir.clone();
         self.voice_wait = running.voice_wait;
         self.voice_off_floor = running.voice_off_floor;
+        self.cards_fake = running.cards_fake;
+        self.link_api = running.link_api.clone();
+        self.link_auth = running.link_auth.clone();
     }
 
     /// Account names become directory names, so each must be a plain, unique path segment.
@@ -728,6 +776,29 @@ impl Config {
             anyhow::bail!(
                 "[voice] languages must be whisper's language codes, e.g. [\"ko\", \"en\"]"
             );
+        }
+        if let Some(c) = &self.cards {
+            let known = match c.provider.as_deref() {
+                None | Some("manual" | "link") => true,
+                Some("fake") => self.cards_fake,
+                Some(_) => false,
+            };
+            if !known {
+                anyhow::bail!("[cards] provider must be manual or link");
+            }
+            if c.max.is_some_and(|m| !(m > 0.0 && m <= 1.0e6)) {
+                anyhow::bail!("[cards] max must be more than 0, at most 1000000");
+            }
+            if c.minutes.is_some_and(|m| !(1..=60).contains(&m)) {
+                anyhow::bail!("[cards] minutes must be 1 to 60");
+            }
+            // A hand-made card has no issuer that asks the owner: its /ok is the strong step.
+            let strong = crate::approvals::strong_only(self)
+                .iter()
+                .any(|s| s == "money");
+            if c.provider.as_deref() == Some("manual") && !strong {
+                anyhow::bail!("[cards] needs approvals.strong_only to include money");
+            }
         }
         if !(1..=32).contains(&self.parallel_tasks()) {
             anyhow::bail!("[tasks] parallel must be 1 to 32");
@@ -872,6 +943,37 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cards_with_manual_needs_money_in_strong_only() {
+        let cfg = |extra: &str| -> Config {
+            toml::from_str(&format!("rpi = '/r'\nhome = '/h'\n{extra}")).unwrap()
+        };
+        let manual = cfg("[cards]\nprovider = 'manual'\n");
+        let e = manual.validate().unwrap_err().to_string();
+        assert_eq!(e, "[cards] needs approvals.strong_only to include money");
+        let strong = "[approvals]\nstrong_only = ['loosen', 'money']\n";
+        assert!(cfg(&format!("[cards]\nprovider = 'manual'\n{strong}"))
+            .validate()
+            .is_ok());
+        // Link asks the owner itself, so its approval is the strong step.
+        assert!(cfg("[cards]\nprovider = 'link'\n").validate().is_ok());
+        for bad in [
+            "provider = 'stripe'",
+            "provider = 'fake'",
+            "max = 0",
+            "minutes = 0",
+            "minutes = 61",
+        ] {
+            let c = cfg(&format!("[cards]\n{bad}\n"));
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        let mut fake = cfg("[cards]\nprovider = 'fake'\n");
+        fake.cards_fake = true;
+        assert!(fake.validate().is_ok(), "the tests' issuer");
+        assert_eq!(crate::cards::max_minor(&cfg("")), 10_000);
+        assert_eq!(crate::cards::minutes(&cfg("[cards]\nminutes = 5\n")), 5);
+    }
 
     #[test]
     fn parses_and_checks_owners() {

@@ -1019,6 +1019,75 @@ message.send.backend.auth.cmd = "printenv MAIL_PASSWORD"
 The first `himalaya` command run with `secrets: ["MAIL_PASSWORD"]` asks you to allow
 `MAIL_PASSWORD` for `himalaya`.
 
+## Virtual cards
+
+At a checkout the agent can ask for a virtual card instead of using a card of yours (DESIGN
+§4.25). It is off until you pick a provider. Set your currency first: the cap and the limits
+count in it.
+
+What keeps a card safe is its own limit, not secrecy. A number typed into the agent's browser
+can be read back by an agent that turns hostile or is fooled by a page, and no scrubbing stops
+that. So every card is single use or holds at most the amount you approved, and the payment
+window caps all money; hiding the number from the agent is a second line, not the first.
+
+```sh
+zephyr config set approvals.currency CAD
+zephyr config set approvals.strong_only loosen,money    # needed for manual
+zephyr config set cards.provider manual                 # or link
+```
+
+- **What you approve.** The card names what it pays by its address, the thing zephyr checks
+  when it fills the card, and shows the agent's name for the shop on a line of its own:
+
+  ```
+  [zephyr] approve #7: payment (virtual card)
+  pays: https://www.amazon.ca · the number is filled only there
+  card: one you make for this purchase · up to 42.50 CAD · forgotten 15 min after you enter it
+  merchant (the agent's words): "Amazon.ca"
+  the agent says: "the 2 kg bag of rice from your list"
+  window: 1 of 5 payments in the last 10 min
+  /ok 7 · /no 7 · expires in 10 min · this one needs tui or chat or passkey
+  ```
+
+- **`manual`**: after your `/ok` (from the TUI, the host or the web app's passkey), make a
+  card for this purchase in your own card app, and only a bounded one: a single-use card (a
+  one-time card, such as Wise's), or a prepaid card with at most the approved amount on it.
+  zephyr refuses any other card, your main card above all: it cannot limit a card it did not
+  issue, and the agent could read the number back from its browser, so the card's own limit is
+  what bounds it. Enter it on the host with `zephyr card put 7 single-use` or
+  `zephyr card put 7 prepaid 42.50`, which asks for the number, the expiry and the code without
+  showing them.
+  The number stays in zephyr's memory, is typed only into a page on the approved address, and
+  is forgotten after `cards.minutes` (15). zephyr sees no charge on such a card: check your card
+  app, delete the card there, then `/card done 7` (it reminds you once a day until you do).
+- **`link`** (Stripe's Link Agent Wallet): `zephyr vault add service cards --provider link
+  --account CLIENT_ID`, then `zephyr card link` to sign in. Each card is then a request you
+  approve in Link with your fingerprint or passkey: zephyr checks it first (the cap, the address,
+  the payment window) and sends you Link's approval link, with no `/ok` of its own. The card is
+  single use and closed when Link reports the charge. This provider is built from Link's
+  published documents and has not yet been run with a real account.
+- **The number never reaches the agent.** Wherever the number, its code or its expiry would show
+  in a command's output, its log or a reply, it reads `[card:#7]`. zephyr types the card into
+  the page itself, only into fields of the approved address's own page (not a frame from
+  another site, so an embedded payment form cannot be filled), and closes the card if the page
+  moves away while it types. Until an hour after the card closed, the agent's browser refuses to
+  read that page back (a field's value, the HTML, a script, a screenshot), and a `snapshot` of
+  the page it typed into is refused until the page moves on. `/card` lists your
+  cards; `/card close 7` (or `/card done 7`) closes one early, at the issuer too. `/stop` and
+  `/pause` close every open card and stop a fill in hand.
+- **One purchase per card.** The card lets one Pay click through, on the page zephyr filled it
+  in, for a total the page shows within the cap. A Pay click with no fill before it is asked
+  about like any payment. A second click there is asked about like any payment.
+- **Limits** (`/settings`): `cards.max` (100) is the most one card may be for. The **payment
+  window** covers every payment, not only cards: past `approvals.window.effects` payments (5)
+  or `approvals.window.amount` (your `auto N` cap, when you set one) in
+  `approvals.window.seconds` (600), the next payment waits for a strong channel whatever your
+  approval mode, so a purchase split into several small ones is caught. A payment whose amount
+  zephyr could not read is not counted against the amount: it waits for an ordinary `/ok`, as
+  before. An install from before this version is told of the window once.
+- A checkout that writes its total with a bare `$` is read as US dollars. With cards in another
+  dollar, its Pay click is then asked about again rather than let through on the card.
+
 ## The agent's network
 
 The container runs on a Docker network of its own, and the agent has no direct route out of it. Its

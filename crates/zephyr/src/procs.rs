@@ -377,14 +377,36 @@ fn spawn(
         match &cfg.scrubber {
             Some(exe) => {
                 let (rx, tx) = std::io::pipe()?;
-                let mut scrubber = std::process::Command::new(exe)
+                let mut scrubber = std::process::Command::new(exe);
+                scrubber
                     .arg("__scrublog")
                     .arg(crate::vault::path(cfg))
                     .stdin(rx)
                     .stdout(file)
                     .stderr(std::process::Stdio::null())
-                    .process_group(0)
-                    .spawn()?;
+                    .process_group(0);
+                // The card numbers in use, which are in no file (DESIGN §4.25): the daemon's
+                // list is close-on-exec, and only this child gets a copy of the descriptor.
+                if let Some(list) = crate::cards::live::shared() {
+                    use std::os::unix::process::CommandExt;
+                    scrubber.arg("cards");
+                    // SAFETY: only `dup2` and `fcntl`, both async-signal-safe, on descriptors
+                    // of this process, between the fork and the exec.
+                    unsafe {
+                        scrubber.pre_exec(move || {
+                            let to = crate::vault::CARDS_FD;
+                            if list != to && libc::dup2(list, to) < 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            // `dup2` onto itself changes nothing: the copy must survive.
+                            match libc::fcntl(to, libc::F_SETFD, 0) {
+                                0 => Ok(()),
+                                _ => Err(std::io::Error::last_os_error()),
+                            }
+                        });
+                    }
+                }
+                let mut scrubber = scrubber.spawn()?;
                 let pid = scrubber.id().to_string();
                 // It ends when the command and all it left running have closed their output.
                 std::thread::spawn(move || scrubber.wait());

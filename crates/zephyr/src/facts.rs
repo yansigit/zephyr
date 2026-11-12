@@ -388,12 +388,25 @@ pub fn found<'a>(facts: &'a [Fact], text: &str, target: Option<&str>) -> Vec<&'a
 /// `text` with each fact found in it replaced by `[fact:NAME]`, for audit rows and notices. A
 /// fact overlapping another one's span is covered with it: no part of either is left.
 pub fn scrub(facts: &[Fact], text: &str) -> String {
+    let label = |name: &str| format!("[fact:{name}]");
+    let withheld = |name: &str| format!("[withheld: it holds the private fact {name}]");
+    scrub_as(facts, text, &label, &withheld)
+}
+
+/// [`scrub`] with each value's replacement written by `label`, and by `withheld` when it is
+/// found where it cannot be placed: how a live card number is hidden too (`cards::scrub`).
+pub(crate) fn scrub_as(
+    facts: &[Fact],
+    text: &str,
+    label: &dyn Fn(&str) -> String,
+    withheld: &dyn Fn(&str) -> String,
+) -> String {
     let mut marks: Vec<(usize, usize, &str)> = Vec::new();
     for f in facts {
         let at = spans(f, text);
         // D6: found where it cannot be placed: none of the text is shown.
         if at.is_empty() && whole(f, text) {
-            return format!("[withheld: it holds the private fact {}]", f.name);
+            return withheld(&f.name);
         }
         marks.extend(at.into_iter().map(|(a, b)| (a, b, f.name.as_str())));
     }
@@ -406,7 +419,7 @@ pub fn scrub(facts: &[Fact], text: &str) -> String {
             continue;
         }
         out.push_str(&text[at..a]);
-        out.push_str(&format!("[fact:{name}]"));
+        out.push_str(&label(name));
         at = b;
     }
     out.push_str(&text[at..]);

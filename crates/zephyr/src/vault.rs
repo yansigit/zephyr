@@ -196,6 +196,63 @@ impl Entry {
     }
 }
 
+/// A provider's credentials (DESIGN §4.25): a `[[service]]` table. Never a token: it has no
+/// programs, no hosts and no surrogate, and only the daemon's own client reads it. `Debug`
+/// shows the key's length.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Service {
+    /// What it is for: one of [`SERVICES`].
+    pub name: String,
+    pub provider: String,
+    /// The API secret; empty when the provider has none (Link's tokens are its own file).
+    pub key: String,
+    /// A provider's own id: a Link client id, a telephony connection id.
+    pub account: String,
+}
+
+/// The services a vault may hold, one of each.
+pub const SERVICES: [&str; 2] = ["cards", "calls"];
+
+impl std::fmt::Debug for Service {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Service")
+            .field("name", &self.name)
+            .field("provider", &self.provider)
+            .field("key", &self.key.len())
+            .field("account", &self.account)
+            .finish()
+    }
+}
+
+impl Service {
+    fn check(&self) -> anyhow::Result<()> {
+        if !SERVICES.contains(&self.name.as_str()) {
+            bail!("a service is named {}", SERVICES.join(" or "));
+        }
+        let plain = |s: &str| s.chars().all(|c| c.is_ascii_graphic());
+        if self.provider.is_empty() || !login_name(&self.provider) {
+            bail!("service {}: the provider is a lowercase name", self.name);
+        }
+        if !plain(&self.key) || !plain(&self.account) {
+            bail!(
+                "service {}: the key and the account take no spaces",
+                self.name
+            );
+        }
+        Ok(())
+    }
+
+    /// One line for `/vault` and `zephyr vault list`: never the key.
+    pub fn line(&self) -> String {
+        let key = if self.key.is_empty() {
+            "no key"
+        } else {
+            "a key is saved"
+        };
+        format!("service {}: {}; {key}", self.name, self.provider)
+    }
+}
+
 /// A binding as the owner reads it: without the port every HTTPS host has.
 pub fn shown(host_port: &str) -> &str {
     host_port.strip_suffix(":443").unwrap_or(host_port)
@@ -267,7 +324,7 @@ impl Vault {
                 + 1;
             anyhow::anyhow!("vault.toml is not valid TOML (line {line})")
         })?;
-        for key in ["login", "token"] {
+        for key in ["login", "token", "service"] {
             if doc
                 .get(key)
                 .is_some_and(|i| i.as_array_of_tables().is_none())
@@ -281,6 +338,13 @@ impl Vault {
             e.check().context("vault.toml")?;
             if !seen.insert(e.name.clone()) {
                 bail!("vault.toml has two entries named {}", e.name);
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for s in v.services() {
+            s.check().context("vault.toml")?;
+            if !seen.insert(s.name.clone()) {
+                bail!("vault.toml has two services named {}", s.name);
             }
         }
         Ok(v)
@@ -309,6 +373,60 @@ impl Vault {
                     .map(move |t| read(kind, t))
             })
             .collect()
+    }
+
+    /// The providers' credentials, `[[service]]`.
+    pub fn services(&self) -> Vec<Service> {
+        let tables = self.doc.get("service").and_then(Item::as_array_of_tables);
+        let s = |t: &Table, k: &str| t.get(k).and_then(Item::as_str).unwrap_or("").to_string();
+        (tables.into_iter().flat_map(|a| a.iter()))
+            .map(|t| Service {
+                name: s(t, "name"),
+                provider: s(t, "provider"),
+                key: s(t, "key"),
+                account: s(t, "account"),
+            })
+            .collect()
+    }
+
+    pub fn service(&self, name: &str) -> Option<Service> {
+        self.services().into_iter().find(|s| s.name == name)
+    }
+
+    /// Adds or replaces the service of that name; an empty key keeps the one saved for the
+    /// same provider. Returns whether it is new.
+    pub fn put_service(&mut self, mut new: Service) -> anyhow::Result<bool> {
+        let old = self.service(&new.name);
+        if let Some(old) = old.as_ref().filter(|o| o.provider == new.provider) {
+            if new.key.is_empty() {
+                new.key.clone_from(&old.key);
+            }
+        }
+        new.check()?;
+        let list = self
+            .doc
+            .entry("service")
+            .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
+            .as_array_of_tables_mut()
+            .context("vault.toml")?;
+        list.retain(|t| t.get("name").and_then(Item::as_str) != Some(new.name.as_str()));
+        let mut t = Table::new();
+        set(&mut t, "name", &new.name);
+        set(&mut t, "provider", &new.provider);
+        set(&mut t, "key", &new.key);
+        set(&mut t, "account", &new.account);
+        list.push(t);
+        Ok(old.is_none())
+    }
+
+    pub fn remove_service(&mut self, name: &str) -> bool {
+        let Some(list) = (self.doc.get_mut("service")).and_then(Item::as_array_of_tables_mut)
+        else {
+            return false;
+        };
+        let before = list.len();
+        list.retain(|t| t.get("name").and_then(Item::as_str) != Some(name));
+        list.len() < before
     }
 
     pub fn get(&self, name: &str) -> Option<Entry> {
@@ -612,12 +730,14 @@ impl Vault {
                 Kind::Login => (e.name, e.password),
                 Kind::Token => (e.name, e.value),
             })
+            .chain(self.services().into_iter().map(|s| (s.name, s.key)))
             .collect()
     }
 
     /// Names, kinds, sites, usernames and grants; never a value.
     pub fn list(&self) -> String {
-        let lines: Vec<String> = self.entries().iter().map(Entry::line).collect();
+        let mut lines: Vec<String> = self.entries().iter().map(Entry::line).collect();
+        lines.extend(self.services().iter().map(Service::line));
         if lines.is_empty() {
             return "[zephyr] the vault is empty".into();
         }
@@ -739,7 +859,8 @@ pub fn scrub(text: &str, secrets: &[(String, String)]) -> String {
         }
     }
     let all: Vec<String> = forms.into_iter().map(|(_, v)| v).collect();
-    crate::auth::redact(&out, &all)
+    // And the numbers of the cards in use, which no file holds (DESIGN §4.25).
+    crate::cards::scrub(&crate::auth::redact(&out, &all))
 }
 
 /// Every text a value shows up as, with its entry's name: itself and its base64 forms.
@@ -757,8 +878,14 @@ fn forms(secrets: &[(String, String)]) -> Vec<(&str, String)> {
 /// the log the agent can read holds none. A value cut across two reads is still found; after a
 /// quarter of a second with nothing more, what was held back as the possible start of one goes
 /// out as it is. The vault is read again when its file changes, and while it cannot be read the
-/// output is withheld, as `scrubbed` withholds it.
-fn scrub_stream(vault: &Path, mut input: std::fs::File, mut log: impl std::io::Write) {
+/// output is withheld, as `scrubbed` withholds it. `cards` is the daemon's list of the card
+/// numbers in use (`cards::live::shared`), read again at each chunk: they become `[card:#N]`.
+fn scrub_stream(
+    vault: &Path,
+    cards: Option<std::fs::File>,
+    mut input: std::fs::File,
+    mut log: impl std::io::Write,
+) {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     const PAUSE_MS: i32 = 250;
@@ -772,10 +899,16 @@ fn scrub_stream(vault: &Path, mut input: std::fs::File, mut log: impl std::io::W
     };
     // `None`: the vault could not be read.
     let mut replacer: Option<crate::broker::Replacer> = None;
+    // A card's code and expiry are replaced only where they stand alone, which needs the
+    // byte on either side: done on whole lines, after the replacer.
+    let mut lines = Lines::default();
+    // The cards' list as last read whole: one being rewritten is read again at the next
+    // chunk, and the list in hand is kept meanwhile, never an empty one.
+    let mut list = String::new();
     let (mut seen, mut withheld) = (None, false);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        if replacer.as_ref().is_some_and(|r| r.holds()) {
+        if replacer.as_ref().is_some_and(|r| r.holds()) || lines.holds() {
             let mut wait = libc::pollfd {
                 fd: input.as_raw_fd(),
                 events: libc::POLLIN,
@@ -783,7 +916,9 @@ fn scrub_stream(vault: &Path, mut input: std::fs::File, mut log: impl std::io::W
             };
             // SAFETY: one pollfd of ours, for the length given.
             if unsafe { libc::poll(&mut wait, 1, PAUSE_MS) } == 0 {
-                put(replacer.as_mut().map(|r| r.finish()).unwrap_or_default());
+                let held = replacer.as_mut().map(|r| r.finish()).unwrap_or_default();
+                put(lines.push(held));
+                put(lines.finish());
                 continue;
             }
         }
@@ -793,21 +928,29 @@ fn scrub_stream(vault: &Path, mut input: std::fs::File, mut log: impl std::io::W
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
-        let now = Some(stamp());
+        if let Some(now) = cards.as_ref().and_then(crate::cards::read_shared) {
+            list = now;
+        }
+        let now = Some((stamp(), list.clone()));
         if now != seen {
-            put(replacer.as_mut().map(|r| r.finish()).unwrap_or_default());
+            let held = replacer.as_mut().map(|r| r.finish()).unwrap_or_default();
+            put(lines.push(held));
+            put(lines.finish());
             replacer = Vault::load(vault).ok().map(|v| {
                 let pair = |(name, form): (&str, String)| {
                     (form.into_bytes(), format!("[vault:{name}]").into_bytes())
                 };
-                crate::broker::Replacer::new(forms(&v.secrets()).into_iter().map(pair).collect())
+                let mut pairs: Vec<_> = forms(&v.secrets()).into_iter().map(pair).collect();
+                pairs.extend(crate::cards::stream_pairs(&list));
+                crate::broker::Replacer::new(pairs)
             });
+            lines.tokens = crate::cards::stream_tokens(&list);
             seen = now;
         }
         match &mut replacer {
             Some(r) => {
                 withheld = false;
-                put(r.push(&buf[..n]));
+                put(lines.push(r.push(&buf[..n])));
             }
             None if !withheld => {
                 withheld = true;
@@ -816,19 +959,64 @@ fn scrub_stream(vault: &Path, mut input: std::fs::File, mut log: impl std::io::W
             None => {}
         }
     }
-    put(replacer.as_mut().map(|r| r.finish()).unwrap_or_default());
+    let held = replacer.as_mut().map(|r| r.finish()).unwrap_or_default();
+    put(lines.push(held));
+    put(lines.finish());
 }
 
-/// `zephyr __scrublog VAULT`: `scrub_stream` from stdin to stdout. The daemon starts it, as
-/// itself, between a command and its log (`procs::spawn`); it ends when the command, and all
-/// it left running, have closed their output.
-pub fn scrub_log(vault: &Path) -> std::process::ExitCode {
+/// The second pass of a command's log: a card's code and expiry, replaced where no digit
+/// stands beside them (`cards::scrub_tokens`). It works on whole lines, holding back what
+/// follows the last newline, so a token is never judged with half of its neighbours.
+/// shortcut: what is held back goes out after the 250 ms pause as it is then, so a code cut
+/// across that pause is judged in two halves; buffer by time if a slow printer ever shows one.
+#[derive(Default)]
+struct Lines {
+    tokens: Vec<(Vec<u8>, Vec<u8>)>,
+    held: Vec<u8>,
+}
+
+impl Lines {
+    fn holds(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// The whole lines `bytes` completes, scrubbed.
+    fn push(&mut self, bytes: Vec<u8>) -> Vec<u8> {
+        if self.tokens.is_empty() && self.held.is_empty() {
+            return bytes;
+        }
+        self.held.extend(bytes);
+        let Some(end) = self.held.iter().rposition(|b| *b == b'\n') else {
+            return Vec::new();
+        };
+        let rest = self.held.split_off(end + 1);
+        let whole = std::mem::replace(&mut self.held, rest);
+        crate::cards::scrub_tokens(&whole, &self.tokens)
+    }
+
+    /// What was held back, scrubbed as it is.
+    fn finish(&mut self) -> Vec<u8> {
+        let held = std::mem::take(&mut self.held);
+        crate::cards::scrub_tokens(&held, &self.tokens)
+    }
+}
+
+/// The descriptor a scrubber finds the daemon's card numbers on, when it is given `cards`.
+pub const CARDS_FD: i32 = 3;
+
+/// `zephyr __scrublog VAULT [cards]`: `scrub_stream` from stdin to stdout. The daemon starts
+/// it, as itself, between a command and its log (`procs::spawn`); it ends when the command,
+/// and all it left running, have closed their output. With `cards`, descriptor 3 is the
+/// daemon's list of card numbers.
+pub fn scrub_log(vault: &Path, cards: bool) -> std::process::ExitCode {
     use std::os::fd::FromRawFd;
     // It holds the vault's values, as the daemon does.
     crate::agent::undumpable();
     // SAFETY: this process's own stdin and stdout, used by nothing else here.
     let (input, log) = unsafe { (std::fs::File::from_raw_fd(0), std::fs::File::from_raw_fd(1)) };
-    scrub_stream(vault, input, log);
+    // SAFETY: the daemon put the list there for this process alone (`procs::spawn`).
+    let cards = cards.then(|| unsafe { std::fs::File::from_raw_fd(CARDS_FD) });
+    scrub_stream(vault, cards, input, log);
     std::process::ExitCode::SUCCESS
 }
 
@@ -1243,19 +1431,19 @@ fn fields(
 }
 
 /// The first http(s) address in agent-browser's `get url` output.
-fn page_address(out: &str) -> Option<&str> {
+pub(crate) fn page_address(out: &str) -> Option<&str> {
     out.split_whitespace().find(|w| origin(w).is_some())
 }
 
 /// Where the browser's page is now, as `get url` says: `None` when that fails or is no http(s) page.
-async fn page_now(cfg: &Config) -> Option<String> {
+pub(crate) async fn page_now(cfg: &Config) -> Option<String> {
     let out = browser(cfg, &["get", "url"]).await.ok()?;
     page_address(&out).map(String::from)
 }
 
 /// Why a fill stops after typing `done` because the page left `site` (`now`), or `None` while the
 /// page is still on it.
-fn moved(site: &str, now: Option<&str>, done: &[&str]) -> Option<String> {
+pub(crate) fn moved(site: &str, now: Option<&str>, done: &[&str]) -> Option<String> {
     if now.is_some_and(|p| same_origin(site, p)) {
         return None;
     }
@@ -1269,10 +1457,162 @@ fn moved(site: &str, now: Option<&str>, done: &[&str]) -> Option<String> {
     ))
 }
 
+/// What typing one secret into the page came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Typed {
+    Ok,
+    /// The page was not on the site when the value was about to be typed: its origin then.
+    /// Nothing was typed.
+    Moved(String),
+    /// No field in the page's own document matches the selector: it is not there, or it is
+    /// inside a frame, which is never typed into (a frame is another site's document).
+    Missing,
+    /// What the selector names takes no text.
+    NotField,
+    Failed(String),
+}
+
+/// The page script that types one value (DESIGN §4.15, §4.25). It runs in the page's top
+/// document, checks that document's origin itself, and only then sets the field: the check
+/// and the typing are one step of the page, with no navigation between them. A field in a
+/// frame is not in the top document, so it is never found.
+fn type_script(origin: &str, selector: &str, value: &str) -> String {
+    let json = |s: &str| serde_json::Value::String(s.to_string()).to_string();
+    format!(
+        "(() => {{\nconst want = {};\nconst sel = {};\nconst value = {};\n{TYPE_BODY}\n}})()",
+        json(origin),
+        json(selector),
+        json(value)
+    )
+}
+
+const TYPE_BODY: &str = r#"if (window.top !== window) return "frame";
+if (location.origin !== want) return "moved:" + location.origin;
+let el = null;
+try { el = document.querySelector(sel); } catch (e) { return "missing"; }
+if (!el) return "missing";
+const proto = el instanceof HTMLInputElement ? HTMLInputElement.prototype
+  : el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype
+  : el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : null;
+if (!proto) return "notfield";
+el.focus();
+Object.getOwnPropertyDescriptor(proto, "value").set.call(el, value);
+el.dispatchEvent(new Event("input", { bubbles: true }));
+el.dispatchEvent(new Event("change", { bubbles: true }));
+return location.origin === want ? "ok" : "moved:" + location.origin;"#;
+
+/// Overwrites a secret's bytes before its buffer is freed: a copy the daemon made to hand a
+/// value on is not left in freed memory.
+pub(crate) fn wipe(bytes: &mut [u8]) {
+    for b in bytes.iter_mut() {
+        // SAFETY: a valid, exclusive reference to one byte; the volatile write is not elided.
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// [`wipe`] for a string: zero bytes are valid UTF-8.
+pub(crate) fn wipe_str(s: &mut str) {
+    // SAFETY: every byte becomes 0, which is valid UTF-8.
+    wipe(unsafe { s.as_bytes_mut() });
+}
+
+/// Types `value` into the field `selector` of the page open in agent-browser, if that page's
+/// top document is on `site`'s origin (`Typed`).
+///
+/// The value never is an argument of any process: `/proc/<pid>/cmdline` is readable by every
+/// uid, the agent's included. It goes to agent-browser 0.41 on the standard input of its
+/// `batch` command (a JSON array of commands), which first goes back to the main frame and
+/// then runs [`type_script`]; `--omit-command` keeps the commands out of what it prints.
+pub(crate) async fn type_into(cfg: &Config, site: &str, selector: &str, value: &str) -> Typed {
+    let Some(want) = origin(site).map(|o| o.ascii_serialization()) else {
+        return Typed::Failed("the site is no http(s) address".into());
+    };
+    let mut script = type_script(&want, selector, value);
+    let steps = batch(cfg, &(("frame", "main"), ("eval", &script)), value).await;
+    wipe_str(&mut script);
+    let steps = match steps {
+        Ok(steps) => steps,
+        Err(e) => return Typed::Failed(e),
+    };
+    let typed = said(&steps, 0).and_then(|_| said(&steps, 1));
+    match typed.map(|r| r["result"].as_str().unwrap_or_default().to_string()) {
+        Ok(r) if r == "ok" => Typed::Ok,
+        Ok(r) if r == "missing" || r == "frame" => Typed::Missing,
+        Ok(r) if r == "notfield" => Typed::NotField,
+        Ok(r) => match r.strip_prefix("moved:") {
+            Some(on) => Typed::Moved(on.chars().take(200).collect()),
+            None => Typed::Failed("agent-browser gave no answer".into()),
+        },
+        Err(e) => Typed::Failed(e.into()),
+    }
+}
+
+/// Types a login's `value` into `selector` with agent-browser's own `fill`, which takes its
+/// refs (`@e2`), Playwright selectors and fields in a shadow root. The page's address is read
+/// first, alone, and nothing is typed unless it is on `site` (`Moved`, its origin, otherwise);
+/// then, on standard input, `[["frame","main"],["fill",SELECTOR,VALUE]]`: back to the main
+/// frame first, so a frame the agent selected (another site's, embedded) never gets it. A page
+/// that moves between the two is the check-then-fill moment a login fill always had; the
+/// caller reads the address again after.
+async fn fill_login(cfg: &Config, site: &str, selector: &str, value: &str) -> Typed {
+    match page_now(cfg).await {
+        Some(url) if same_origin(site, &url) => {}
+        url => {
+            let on = url.as_deref().and_then(origin);
+            return Typed::Moved(on.map_or("an unknown page".into(), |o| o.ascii_serialization()));
+        }
+    }
+    let steps = match batch(cfg, &(("frame", "main"), ("fill", selector, value)), value).await {
+        Ok(steps) => steps,
+        Err(e) => return Typed::Failed(e),
+    };
+    match said(&steps, 0).and_then(|_| said(&steps, 1)) {
+        Ok(_) => Typed::Ok,
+        Err(e) => Typed::Failed(e.into()),
+    }
+}
+
+/// Runs `commands` (which hold `value`) as one agent-browser 0.41 `batch` on its standard
+/// input, stopping at a failed step (`--bail`); `--omit-command` keeps the commands out of
+/// what it prints. Its steps' answers, or why it did not run, the value replaced.
+async fn batch(cfg: &Config, commands: &impl Serialize, value: &str) -> Result<Vec<Value>, String> {
+    let mut input = serde_json::to_vec(commands).map_err(|e| e.to_string())?;
+    let args = ["batch", "--json", "--omit-command", "--bail"];
+    let out = browser_with(cfg, &args, Some(&input)).await;
+    wipe(&mut input);
+    let out = out.map_err(|e| e.replace(value, "[the value]"))?;
+    Ok(serde_json::from_str(out.trim()).unwrap_or_default())
+}
+
+/// Step `i`'s result. A failed step's error is the browser's or the page's to word, so the
+/// agent is told only that it failed.
+fn said(steps: &[Value], i: usize) -> Result<&Value, &'static str> {
+    let step = steps.get(i).ok_or("agent-browser gave no answer")?;
+    match step["success"].as_bool() {
+        Some(true) => Ok(&step["result"]),
+        _ => Err("the page refused the value"),
+    }
+}
+
+/// Why a field was not typed, for the agent: `None` when it was.
+pub(crate) fn not_typed(typed: &Typed, label: &str) -> Option<String> {
+    Some(match typed {
+        Typed::Ok => return None,
+        Typed::Moved(on) => format!("the page was on {on} when the {label} was to be typed"),
+        Typed::Missing => format!(
+            "no field for the {label} matches that selector in the page's own document; a \
+             field inside a frame (an embedded form from another site) is never filled"
+        ),
+        Typed::NotField => format!("what the selector for the {label} names takes no text"),
+        Typed::Failed(e) => e.clone(),
+    })
+}
+
 /// Types the login's fields into the page open in agent-browser, once the page is on its site.
-/// The address is read again after each field, so a page that moves away gets no further field.
-/// shortcut: agent-browser has no fill-if-origin, so a redirect in the moment before a fill still
-/// gets that one value; then the agent is told, and submits nothing.
+/// Each value is typed by agent-browser's own `fill` in the main frame, once the page's address
+/// is read on the site (`fill_login`); the address is read again after each field, so a page
+/// that moves away gets no further field.
 async fn fill(cfg: &Config, login: &Entry, selectors: [Option<String>; 3]) -> String {
     let fields = match fields(login, &selectors, crate::now() as u64) {
         Ok(f) => f,
@@ -1300,7 +1640,9 @@ async fn fill(cfg: &Config, login: &Entry, selectors: [Option<String>; 3]) -> St
     };
     let mut done: Vec<&str> = Vec::new();
     for (label, sel, value) in &fields {
-        if let Err(e) = browser(cfg, &["fill", sel, value]).await {
+        // On standard input, never an argument: any uid can read a process's arguments.
+        let typed = fill_login(cfg, &login.site, sel, value).await;
+        if let Some(e) = not_typed(&typed, label) {
             let done = match done.is_empty() {
                 true => String::new(),
                 false => format!("filled the {}, ", done.join(" and ")),
@@ -1322,15 +1664,35 @@ const BROWSER_WAIT: Duration = Duration::from_secs(20);
 /// `agent-browser ARGS` as the agent, as `exec` runs it: its stdout, or why it failed. The real
 /// binary, by full path (`cfg.agent_browser`): the daemon's own fill never goes through the
 /// approvals gate's wrapper that `agent-browser` on the agent's PATH is (approvals spec §4.4).
-async fn browser(cfg: &Config, args: &[&str]) -> Result<String, String> {
+pub(crate) async fn browser(cfg: &Config, args: &[&str]) -> Result<String, String> {
+    browser_with(cfg, args, None).await
+}
+
+/// [`browser`], with `input` written to the command's standard input: how a secret reaches
+/// agent-browser without being an argument.
+async fn browser_with(cfg: &Config, args: &[&str], input: Option<&[u8]>) -> Result<String, String> {
+    use tokio::io::AsyncWriteExt;
     let mut cmd = tokio::process::Command::new(&cfg.agent_browser);
     cmd.args(args)
         .current_dir(&cfg.home)
         .env("HOME", &cfg.home)
-        .stdin(std::process::Stdio::null())
+        .stdin(match input {
+            Some(_) => std::process::Stdio::piped(),
+            None => std::process::Stdio::null(),
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     crate::procs::for_agent(cmd.as_std_mut());
-    let out = tokio::time::timeout(BROWSER_WAIT, cmd.output())
+    let run = async {
+        let mut child = cmd.spawn()?;
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            stdin.write_all(input).await?;
+            stdin.shutdown().await?;
+        }
+        child.wait_with_output().await
+    };
+    let out = tokio::time::timeout(BROWSER_WAIT, run)
         .await
         .map_err(|_| {
             format!(
@@ -1401,6 +1763,87 @@ programs = ["gh"]
         let broken = Vault::parse("[[token]]\nname = \"A\"\nvalue = \"s3cret\" x\n");
         let said = format!("{:#}", broken.err().unwrap());
         assert_eq!(said, "vault.toml is not valid TOML (line 3)");
+    }
+
+    const SERVICE: &str = "[[service]]\nname = \"cards\"\nprovider = \"link\"\n\
+                           key = \"sk_servicekey42\"\naccount = \"lwlpk_x\"\n";
+
+    #[test]
+    fn a_service_is_listed_by_name_and_provider_only() {
+        let v = Vault::parse(SERVICE).unwrap();
+        let s = v.service("cards").unwrap();
+        assert_eq!(
+            (s.provider.as_str(), s.account.as_str()),
+            ("link", "lwlpk_x")
+        );
+        assert_eq!(
+            v.list(),
+            "[zephyr] vault:\nservice cards: link; a key is saved"
+        );
+        assert!(!format!("{s:?}{}", v.list()).contains("sk_servicekey42"));
+        // Its key is scrubbed like any vault value.
+        assert_eq!(
+            scrub("x sk_servicekey42 y", &v.secrets()),
+            "x [vault:cards] y"
+        );
+        for bad in [
+            "[[service]]\nname = \"other\"\nprovider = \"link\"\n",
+            "[[service]]\nname = \"cards\"\n",
+            &format!("{SERVICE}{SERVICE}"),
+            "[service]\nname = \"cards\"\n",
+        ] {
+            assert!(Vault::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_service_is_never_a_token() {
+        let mut v = Vault::parse(SERVICE).unwrap();
+        assert!(
+            v.get("cards").is_none(),
+            "not an entry the agent's tools see"
+        );
+        assert!(v.grant(Kind::Token, "cards", &["curl"]).is_err());
+        assert!(v.bind("cards", &["api.link.com"]).is_err());
+        let dir = crate::test_dir("vault-service");
+        let path = dir.join("vault.toml");
+        std::fs::write(&path, SERVICE).unwrap();
+        // A chat can neither add nor change one: `/vault` has no word for it.
+        let said = command(&path, "add service cards", true, true);
+        assert!(said.is_err(), "{said:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SERVICE);
+        // A new key for the same provider replaces it; an empty one keeps it.
+        let again = Service {
+            name: "cards".into(),
+            provider: "link".into(),
+            ..Service::default()
+        };
+        assert!(!v.put_service(again).unwrap());
+        assert_eq!(v.service("cards").unwrap().key, "sk_servicekey42");
+        assert!(v.remove_service("cards") && v.service("cards").is_none());
+    }
+
+    #[test]
+    fn the_typing_script_checks_the_origin_and_the_frame_before_it_types() {
+        let script = type_script("https://shop.example", "#n\"; alert(1); \"", "4242 \"x\"");
+        // The selector and the value are JSON literals: neither can end the statement.
+        assert!(
+            script.contains(r##"const sel = "#n\"; alert(1); \"";"##),
+            "{script}"
+        );
+        assert!(
+            script.contains(r##"const value = "4242 \"x\"";"##),
+            "{script}"
+        );
+        let (frame, origin, set) = (
+            script.find("window.top !== window").unwrap(),
+            script.find("location.origin !== want").unwrap(),
+            script.find(".set.call(el, value)").unwrap(),
+        );
+        assert!(frame < origin && origin < set, "checked before it is typed");
+        let mut secret = String::from("4242424242424242");
+        wipe_str(&mut secret);
+        assert_eq!(secret, "\0".repeat(16));
     }
 
     #[test]
@@ -1907,7 +2350,8 @@ programs = ["gh"]
             let out = std::fs::File::create(&log).unwrap();
             let vault = vault.clone();
             let input = std::fs::File::from(std::os::fd::OwnedFd::from(rx));
-            let filter = std::thread::spawn(move || scrub_stream(&vault, input, out));
+            let cards = std::fs::File::open(dir.join("cards")).ok();
+            let filter = std::thread::spawn(move || scrub_stream(&vault, cards, input, out));
             for part in writes {
                 tx.write_all(part).unwrap();
                 std::thread::sleep(pause);
@@ -1935,6 +2379,41 @@ programs = ["gh"]
         // A prompt that ends like the start of a value is not held for ever.
         let clean = run(&[b"so real-", b"ly\n"], Duration::from_millis(600));
         assert_eq!(clean, "so real-ly\n");
+        // A card number in use, which no file of the vault's holds: read from the daemon's
+        // list, again at each chunk, so a card issued while the command runs is covered.
+        let clean = run(&[b"n=5555555555554444\n"], Duration::ZERO);
+        assert_eq!(clean, "n=5555555555554444\n", "no list, nothing to find");
+        let list = crate::cards::shared_bytes("7\t5555555555554444\t987\t11\t2030\n");
+        std::fs::write(dir.join("cards"), &list).unwrap();
+        let clean = run(
+            &[
+                b"n=55555555",
+                b"55554444 or 5555 5555 5555 4444\nkey=real-bound-1\n",
+            ],
+            Duration::ZERO,
+        );
+        assert_eq!(clean, "n=[card:#7] or [card:#7]\nkey=[vault:BOUND]\n");
+        // Its code and its expiry too, where they stand alone, cut across reads or not.
+        let clean = run(
+            &[
+                b"exp 11/3",
+                b"0 cvc 98",
+                b"7 port 9870 on 2011/30\nlast 987",
+            ],
+            Duration::ZERO,
+        );
+        assert_eq!(
+            clean,
+            "exp [card:#7] cvc [card:#7] port 9870 on 2011/30\nlast [card:#7]"
+        );
+        // A list that is being rewritten (its sequence odd) is not read as an empty one: the
+        // scrubber has none yet here, so it reads again at the next chunk.
+        let mut torn = list.clone();
+        torn[0] = 3;
+        std::fs::write(dir.join("cards"), &torn).unwrap();
+        let clean = run(&[b"n=5555555555554444\n"], Duration::ZERO);
+        assert_eq!(clean, "n=5555555555554444\n", "no list was ever read whole");
+        std::fs::write(dir.join("cards"), &list).unwrap();
         // A vault that cannot be read: nothing of the output is written.
         std::fs::write(&vault, "[[token]\nbroken").unwrap();
         let clean = run(&[b"key=real-bound-1\n", b"more\n"], Duration::ZERO);

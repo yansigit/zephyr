@@ -113,12 +113,15 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
     if let By::Owner { channel } = by {
         let strong = &ctx.cfg.settings.strong_channels;
         let money_strong = approvals::strong_only(ctx.cfg).iter().any(|s| s == "money");
-        if a.class == "money" && money_strong && !strong.iter().any(|c| c == channel) {
+        let is_strong = strong.iter().any(|c| c == channel);
+        if a.class == "money" && money_strong && !is_strong {
             return Err(format!(
                 "[zephyr] approving a payment needs {}",
                 strong.join(" or ")
             ));
         }
+        // The payment window, whatever `strong_only` says (DESIGN §4.25).
+        crate::gate::window_check(ctx.cfg, store, &a, is_strong, now)?;
     }
     // Before it is taken, so a full process table leaves the approval waiting (R44).
     if a.kind == ActionKind::Run && !store.proc_slot_free().map_err(failed)? {
@@ -140,11 +143,27 @@ pub fn approve(ctx: &Ctx, id: i64, once: bool, by: By, now: i64) -> Result<Strin
         (_, true) => "once",
         _ => "approved",
     };
+    // What the window counts: every payment the owner approved or that came due, recorded
+    // with the count that binds. One that no longer fits waits again, for a strong channel.
+    let (source, strong) = match by {
+        By::Owner { channel } => {
+            let strong = ctx
+                .cfg
+                .settings
+                .strong_channels
+                .iter()
+                .any(|c| c == channel);
+            ("ok", strong)
+        }
+        By::Delay => ("due", false),
+    };
+    crate::gate::paid(ctx.cfg, store, &a, source, strong, now)?;
     audit(ctx.cfg, store, &a, decision);
     let started = match a.kind {
         ActionKind::Run => run(ctx, &a),
         ActionKind::Pass => pass(ctx, &a, by, now),
         ActionKind::Wait => wait(ctx, &a),
+        ActionKind::Card => card(ctx, &a),
     };
     let (n, s) = (a.id, summary(ctx.cfg, &a));
     Ok(match (started, by) {
@@ -258,6 +277,19 @@ fn pass(ctx: &Ctx, a: &Action, by: By, now: i64) -> Result<String, String> {
     Ok("the agent may make exactly that call once in the next 30 min".into())
 }
 
+/// A card request (DESIGN §4.25): read again as the settings are now, then issued off the
+/// router's loop; the owner is told what to do next, and the agent when the card can be filled.
+fn card(ctx: &Ctx, a: &Action) -> Result<String, String> {
+    let (checked, ask) = crate::gate::approved_card(ctx.cfg, ctx.store, a)?;
+    if crate::cards::caps(ctx.cfg).is_none() {
+        return Err(crate::cards::NOT_SET_UP
+            .trim_start_matches("not run: ")
+            .into());
+    }
+    crate::cards::issue_approved(ctx.cfg, checked, ask, a);
+    Ok("issuing the card; what to do next follows".into())
+}
+
 /// A browser action: the wrapper waiting on it goes on, if it still waits. It stays `running`
 /// until the wrapper says whether it ran, once it read the page again (I4): the gate socket
 /// records how it ended then (M2).
@@ -305,6 +337,7 @@ fn audit(cfg: &Config, store: &Store, a: &Action, outcome: &str) {
         ActionKind::Run => "exec",
         ActionKind::Pass => "mcp_call",
         ActionKind::Wait => "browser",
+        ActionKind::Card => "card",
     };
     let args = format!("#{} {}", a.id, summary(cfg, a));
     if let Err(e) = store.audit(&a.origin.session, tool, &args, outcome) {
@@ -444,7 +477,7 @@ pub fn tick(ctx: &Ctx, now: i64, held: bool) {
                 audit(ctx.cfg, store, &a, "expired");
                 ctx.waits.answer(a.id, false);
                 let within = match a.kind {
-                    ActionKind::Wait => "10 min",
+                    ActionKind::Wait | ActionKind::Card => "10 min",
                     _ => "a day",
                 };
                 let text = format!(
@@ -504,6 +537,8 @@ fn due_now(ctx: &Ctx, a: &Action, now: i64) {
     }
     match approve(ctx, a.id, false, By::Delay, now) {
         Ok(text) => tell(store, a, &text),
+        // One that no longer fits the payment window waits for the owner again, who is told.
+        Err(why) if store.action_strong(a.id).unwrap_or(false) => tell(store, a, &why),
         Err(why) => eprintln!("zephyr: delayed #{} did not go: {why}", a.id),
     }
 }

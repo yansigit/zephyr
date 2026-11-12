@@ -4,7 +4,7 @@ use crate::channel::Inbound;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 
 /// Queued and running tasks allowed at once (DESIGN §4.12); a start past this is refused.
 pub const MAX_OPEN_TASKS: i64 = 64;
@@ -380,6 +380,8 @@ pub enum ActionKind {
     Run,
     Pass,
     Wait,
+    /// A virtual card (DESIGN §4.25): `/ok` issues it.
+    Card,
 }
 
 impl ActionKind {
@@ -388,6 +390,7 @@ impl ActionKind {
             Self::Run => "run",
             Self::Pass => "pass",
             Self::Wait => "wait",
+            Self::Card => "card",
         }
     }
 
@@ -396,9 +399,121 @@ impl ActionKind {
             "run" => Some(Self::Run),
             "pass" => Some(Self::Pass),
             "wait" => Some(Self::Wait),
+            "card" => Some(Self::Card),
             _ => None,
         }
     }
+}
+
+/// What [`Store::pay_within`] did with a payment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Paid {
+    /// It is in the window, as this `payments` row.
+    Recorded(i64),
+    /// It would pass the count, or the known sum.
+    Over,
+    /// There is an amount limit and it has no amount in the currency.
+    Unread,
+}
+
+/// A card to record (DESIGN §4.25): what it is bound to and who asked. `proposal` is the held
+/// action it came from, `None` for one the mode let through.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NewCard {
+    pub proposal: Option<i64>,
+    /// The `payments` row the gate wrote when it let the card go.
+    pub payment: Option<i64>,
+    pub provider: String,
+    pub origin: String,
+    pub merchant: String,
+    pub cap_minor: i64,
+    pub currency: String,
+    /// What the issuer binds, in the owner's words: `single use`.
+    pub uses: String,
+    pub channel: String,
+    pub sender: String,
+    pub session: String,
+    pub expires_at: i64,
+}
+
+/// A card as stored: never its number or code. `status` is `waiting` (for the owner to make
+/// it, or to approve it at the issuer), `open`, `charging` (its Pay click went), `closing` (a
+/// close was asked and the issuer has not confirmed it), `used`, `closed`, `failed` or
+/// `unknown`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Card {
+    pub id: i64,
+    pub proposal: Option<i64>,
+    pub provider: String,
+    pub provider_ref: Option<String>,
+    pub last4: Option<String>,
+    pub origin: String,
+    pub merchant: String,
+    pub cap_minor: i64,
+    pub currency: String,
+    pub uses: String,
+    /// What the owner said a hand-made card is.
+    pub kind: Option<String>,
+    pub status: String,
+    pub channel: String,
+    pub sender: String,
+    pub session: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub closed_at: Option<i64>,
+    pub charged_minor: Option<i64>,
+    pub charged_currency: Option<String>,
+    pub merchant_id: Option<String>,
+    pub descriptor: Option<String>,
+    pub mcc: Option<String>,
+    pub approval_url: Option<String>,
+    /// When the owner was last told about it (a reminder, a failed close).
+    pub told_at: Option<i64>,
+    /// The `payments` row the window counts for it.
+    pub payment: Option<i64>,
+    /// The page a fill of its number went through on: the one page whose Pay click it covers.
+    pub filled: Option<String>,
+    /// Its status when its close was asked (`Store::card_closing`).
+    pub closing_from: Option<String>,
+}
+
+const CARD_COLS: &str =
+    "id, proposal, provider, provider_ref, last4, origin, merchant, cap_minor, \
+                         currency, uses, kind, status, channel, sender, session, created_at, \
+                         expires_at, closed_at, charged_minor, charged_currency, merchant_id, \
+                         descriptor, mcc, approval_url, told_at, payment, filled, closing_from";
+
+fn card_row(r: &rusqlite::Row) -> rusqlite::Result<Card> {
+    Ok(Card {
+        id: r.get(0)?,
+        proposal: r.get(1)?,
+        provider: r.get(2)?,
+        provider_ref: r.get(3)?,
+        last4: r.get(4)?,
+        origin: r.get(5)?,
+        merchant: r.get(6)?,
+        cap_minor: r.get(7)?,
+        currency: r.get(8)?,
+        uses: r.get(9)?,
+        kind: r.get(10)?,
+        status: r.get(11)?,
+        channel: r.get(12)?,
+        sender: r.get(13)?,
+        session: r.get(14)?,
+        created_at: r.get(15)?,
+        expires_at: r.get(16)?,
+        closed_at: r.get(17)?,
+        charged_minor: r.get(18)?,
+        charged_currency: r.get(19)?,
+        merchant_id: r.get(20)?,
+        descriptor: r.get(21)?,
+        mcc: r.get(22)?,
+        approval_url: r.get(23)?,
+        told_at: r.get(24)?,
+        payment: r.get(25)?,
+        filled: r.get(26)?,
+        closing_from: r.get(27)?,
+    })
 }
 
 /// Who asked for a held action. `run` is the session id for tasks and jobs (`task-7`), and
@@ -1021,6 +1136,36 @@ impl Store {
                 "ALTER TABLE inbox ADD COLUMN derived TEXT;
                  PRAGMA user_version = 19;",
             )?;
+        }
+        if version < 20 {
+            // Virtual cards and the payments the window counts (DESIGN §4.25). `spend` is the
+            // model budget's, so money effects are `payments`. No card number or code, ever.
+            db.execute_batch(
+                "CREATE TABLE payments(id INTEGER PRIMARY KEY, at INTEGER NOT NULL,
+                    minor INTEGER, -- NULL: the amount was not read
+                    currency TEXT NOT NULL, source TEXT NOT NULL, proposal INTEGER);
+                 CREATE TABLE cards(id INTEGER PRIMARY KEY, proposal INTEGER,
+                    payment INTEGER, -- its row in payments: the cap, or a charge over it
+                    provider TEXT NOT NULL, provider_ref TEXT, last4 TEXT,
+                    origin TEXT NOT NULL, merchant TEXT NOT NULL,
+                    cap_minor INTEGER NOT NULL, currency TEXT NOT NULL, uses TEXT NOT NULL,
+                    kind TEXT, status TEXT NOT NULL,
+                    channel TEXT NOT NULL, sender TEXT NOT NULL, session TEXT NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                    expires_at INTEGER NOT NULL, closed_at INTEGER,
+                    charged_minor INTEGER, charged_currency TEXT, merchant_id TEXT,
+                    descriptor TEXT, mcc TEXT, approval_url TEXT, told_at INTEGER,
+                    filled TEXT, -- the page a fill of its number went through on
+                    closing_from TEXT); -- its status when its close was asked
+                 PRAGMA user_version = 20;",
+            )?;
+            // An install from before the payment window is told of it once (`Router`'s tick).
+            if version > 0 {
+                db.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES ('window.notice', '1')",
+                    [],
+                )?;
+            }
         }
         // A database made by a build that has the token broker (DESIGN §4.21): its remote
         // connectors were never published with a real secret by default, so there is nothing
@@ -1669,6 +1814,366 @@ impl Store {
             .optional()
     }
 
+    /// One money effect that went or was approved (DESIGN §4.25), written as it is let go:
+    /// what the payment window counts. `minor` is `None` for an amount that was not read.
+    pub fn add_payment(
+        &self,
+        at: i64,
+        minor: Option<i64>,
+        currency: &str,
+        source: &str,
+        proposal: Option<i64>,
+    ) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO payments(at, minor, currency, source, proposal) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![at, minor, currency, source, proposal],
+        )?;
+        Ok(())
+    }
+
+    /// Records one payment if the window has room for it, the look and the row in one
+    /// `BEGIN IMMEDIATE` transaction, so two connections deciding at once are taken one after
+    /// the other (DESIGN §4.25). The window is `effects` payments and, when there is a
+    /// `limit`, that sum of the amounts known in `currency`, after `since`. `force` records it
+    /// whatever the window says (the owner's `/ok` on a strong channel).
+    #[allow(clippy::too_many_arguments)]
+    pub fn pay_within(
+        &self,
+        since: i64,
+        effects: u32,
+        limit: Option<i64>,
+        at: i64,
+        minor: Option<i64>,
+        currency: &str,
+        source: &str,
+        proposal: Option<i64>,
+        force: bool,
+    ) -> rusqlite::Result<Paid> {
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let decided = (|| {
+            let (count, sum, _) = self.payments_since(since, currency)?;
+            let found = match (limit, minor) {
+                _ if count + 1 > effects => Paid::Over,
+                // A card charged an amount the window cannot count: not known to be within.
+                (Some(_), _) if self.unknown_charge_since(since)? => Paid::Over,
+                (Some(limit), Some(minor)) if sum + minor > limit => Paid::Over,
+                (Some(_), None) => Paid::Unread,
+                _ => Paid::Recorded(0),
+            };
+            if !force && !matches!(found, Paid::Recorded(_)) {
+                return Ok(found);
+            }
+            self.add_payment(at, minor, currency, source, proposal)?;
+            Ok(Paid::Recorded(self.db.last_insert_rowid()))
+        })();
+        let end = match &decided {
+            Ok(Paid::Recorded(_)) => "COMMIT",
+            _ => "ROLLBACK",
+        };
+        self.db.execute_batch(end)?;
+        decided
+    }
+
+    /// Puts an action `/ok` took back to waiting for the owner: its payment did not fit the
+    /// window after all. Returns whether it was this call that put it back.
+    pub fn untake_action(&self, id: i64) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
+            "UPDATE proposals SET status = 'pending', approved = 0, settled_at = NULL, due_at = NULL
+             WHERE id = ?1 AND kind != 'command' AND status = 'running'",
+            params![id],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// The payments after `since`: how many, the sum of those in `currency` (minor units), and
+    /// whether any has no amount or another currency (which counts as over any amount).
+    pub fn payments_since(&self, since: i64, currency: &str) -> rusqlite::Result<(u32, i64, bool)> {
+        self.db.query_row(
+            "SELECT count(*),
+                    coalesce(sum(CASE WHEN currency = ?2 THEN minor END), 0),
+                    coalesce(max(minor IS NULL OR currency != ?2), 0)
+             FROM payments WHERE at > ?1",
+            params![since, currency],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+    }
+
+    /// Whether a card was charged after `since` an amount the window cannot count (in another
+    /// currency, [`Store::card_paid`]).
+    pub fn unknown_charge_since(&self, since: i64) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM payments
+                           WHERE at > ?1 AND source = 'charge' AND minor IS NULL)",
+            params![since],
+            |r| r.get(0),
+        )
+    }
+
+    /// Marks held action `id` as one only a strong channel may approve (the payment window).
+    pub fn set_strong(&self, id: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE proposals SET strong = 1 WHERE id = ?1 AND kind != 'command'",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether held action `id` needs a strong channel whatever `strong_only` says.
+    pub fn action_strong(&self, id: i64) -> rusqlite::Result<bool> {
+        let strong = self.db.query_row(
+            "SELECT strong FROM proposals WHERE id = ?1 AND kind != 'command'",
+            params![id],
+            |r| r.get::<_, bool>(0),
+        );
+        Ok(strong.optional()?.unwrap_or(false))
+    }
+
+    /// Records a card, `waiting`. Returns its number.
+    pub fn add_card(&self, c: &NewCard) -> rusqlite::Result<i64> {
+        self.db.execute(
+            "INSERT INTO cards(proposal, provider, origin, merchant, cap_minor, currency, uses,
+                               status, channel, sender, session, expires_at, payment)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'waiting', ?8, ?9, ?10, ?11, ?12)",
+            params![
+                c.proposal,
+                c.provider,
+                c.origin,
+                c.merchant,
+                c.cap_minor,
+                c.currency,
+                c.uses,
+                c.channel,
+                c.sender,
+                c.session,
+                c.expires_at,
+                c.payment
+            ],
+        )?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    /// The one Pay click an open card covers (DESIGN §4.25): the card goes from `open` to
+    /// `charging` in one statement, so of two clicks only one is the card's. Its payment row
+    /// stays at the card's cap, the amount the owner approved, whatever the page said was
+    /// paid. `false` when the card was not open any more.
+    pub fn use_card(&self, id: i64) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
+            "UPDATE cards SET status = 'charging' WHERE id = ?1 AND status = 'open'",
+            params![id],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// The issuer charged card `id` `total` in all, in its currency: its payment row is raised
+    /// to that when it is more, never lowered below what was approved. `None` (a charge in
+    /// another currency) leaves the row an unknown amount, its source `charge`, which the window
+    /// counts as over.
+    pub fn card_paid(&self, id: i64, total: Option<i64>) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE payments SET minor = CASE WHEN ?2 IS NULL THEN NULL ELSE max(minor, ?2) END,
+                    source = CASE WHEN ?2 IS NULL THEN 'charge' ELSE source END
+             WHERE id = (SELECT payment FROM cards WHERE id = ?1) AND minor IS NOT NULL",
+            params![id, total],
+        )?;
+        Ok(())
+    }
+
+    /// The `payments` row written when the owner approved action `proposal`.
+    pub fn payment_of(&self, proposal: i64) -> rusqlite::Result<Option<i64>> {
+        self.db.query_row(
+            "SELECT max(id) FROM payments WHERE proposal = ?1",
+            params![proposal],
+            |r| r.get(0),
+        )
+    }
+
+    pub fn card(&self, id: i64) -> rusqlite::Result<Option<Card>> {
+        let sql = format!("SELECT {CARD_COLS} FROM cards WHERE id = ?1");
+        self.db.query_row(&sql, params![id], card_row).optional()
+    }
+
+    /// The cards in any of `statuses`, oldest first.
+    pub fn cards_in(&self, statuses: &[&str]) -> rusqlite::Result<Vec<Card>> {
+        let list = serde_json::to_string(statuses).unwrap_or_default();
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT {CARD_COLS} FROM cards
+             WHERE status IN (SELECT value FROM json_each(?1)) ORDER BY id"
+        ))?;
+        let rows = stmt.query_map(params![list], card_row)?;
+        rows.collect()
+    }
+
+    /// The newest `limit` cards, newest first.
+    pub fn cards_recent(&self, limit: u32) -> rusqlite::Result<Vec<Card>> {
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT {CARD_COLS} FROM cards ORDER BY id DESC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map(params![limit], card_row)?;
+        rows.collect()
+    }
+
+    // A card's row is never written back whole: each change names the columns it sets and the
+    // status it expects, so a close, a `/stop` or an expiry that happened while an issuer was
+    // being asked is never undone by a row read before.
+
+    /// The issuer made the card: its reference there and where the owner approves it. Only a
+    /// card still `waiting`: `false` when it was closed meanwhile.
+    pub fn card_issued(
+        &self,
+        id: i64,
+        provider_ref: &str,
+        approval_url: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
+            "UPDATE cards SET provider_ref = ?2, approval_url = ?3
+             WHERE id = ?1 AND status = 'waiting'",
+            params![id, provider_ref, approval_url],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// A `waiting` card opens until `expires_at`, with its last four digits and what the owner
+    /// said it is when they are known. Only one still in its time at `now`: a close puts a card
+    /// past its time first, so a card whose close was asked is never opened, nor its time
+    /// extended, whatever an answer read before the close says. `false` when it did not open.
+    pub fn open_card(
+        &self,
+        id: i64,
+        last4: Option<&str>,
+        kind: Option<&str>,
+        expires_at: i64,
+        now: i64,
+    ) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
+            "UPDATE cards SET status = 'open', expires_at = ?4,
+                    last4 = coalesce(?2, last4), kind = coalesce(?3, kind)
+             WHERE id = ?1 AND status = 'waiting' AND expires_at > ?5",
+            params![id, last4, kind, expires_at, now],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// A fill of open card `id` went through on `page`: the page whose Pay click it covers.
+    pub fn card_filled(&self, id: i64, page: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE cards SET filled = ?2 WHERE id = ?1 AND status = 'open'",
+            params![id, page],
+        )?;
+        Ok(())
+    }
+
+    /// The last four digits of a card whose number was just fetched.
+    pub fn card_last4(&self, id: i64, last4: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE cards SET last4 = ?2 WHERE id = ?1",
+            params![id, last4],
+        )?;
+        Ok(())
+    }
+
+    /// The owner was told about card `id` at `at`.
+    pub fn card_told(&self, id: i64, at: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE cards SET told_at = ?2 WHERE id = ?1",
+            params![id, at],
+        )?;
+        Ok(())
+    }
+
+    /// Marks card `id` as told at `at` if the owner was never told about it: `true` for the
+    /// one call that gets to tell.
+    pub fn card_told_once(&self, id: i64, at: i64) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
+            "UPDATE cards SET told_at = ?2 WHERE id = ?1 AND told_at IS NULL",
+            params![id, at],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// A close of card `id` was asked (`/stop`, `/pause`, a start, `/card close`, its expiry):
+    /// from this statement on it is `closing` and past its time, so it covers no Pay click and
+    /// is neither filled nor opened, whatever the issuer takes to answer. `false` when it was
+    /// over or closing already.
+    pub fn card_closing(&self, id: i64, now: i64) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
+            "UPDATE cards SET closing_from = status, status = 'closing',
+                    expires_at = min(expires_at, ?2)
+             WHERE id = ?1 AND status IN ('waiting', 'open', 'charging')",
+            params![id, now],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// The issuer made card `id` after its close was asked: its reference there is kept and
+    /// the card is `closing` (again, when the close was recorded with nothing there to close),
+    /// so it is closed at the issuer and tried until it is.
+    pub fn card_reclose(&self, id: i64, provider_ref: &str, now: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE cards SET provider_ref = ?2, status = 'closing',
+                    expires_at = min(expires_at, ?3)
+             WHERE id = ?1 AND status IN ('waiting', 'open', 'charging', 'closing', 'closed')",
+            params![id, provider_ref, now],
+        )?;
+        Ok(())
+    }
+
+    /// The issuer's first charge on a card that is not settled: it is `used`, with who charged
+    /// it. `false` when it was over already, so a charge is recorded and told once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn card_charged(
+        &self,
+        id: i64,
+        minor: i64,
+        currency: &str,
+        merchant_id: Option<&str>,
+        descriptor: Option<&str>,
+        mcc: Option<&str>,
+        now: i64,
+    ) -> rusqlite::Result<bool> {
+        let n = self.db.execute(
+            "UPDATE cards SET status = 'used', closed_at = ?7, charged_minor = ?2,
+                    charged_currency = ?3, merchant_id = ?4, descriptor = ?5, mcc = ?6
+             WHERE id = ?1 AND status IN ('waiting', 'open', 'charging', 'closing')",
+            params![id, minor, currency, merchant_id, descriptor, mcc, now],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Moves card `id` from one of `from` to `to` in one statement, so of two closes only one
+    /// tells. Returns whether this call moved it.
+    pub fn move_card(&self, id: i64, from: &[&str], to: &str, now: i64) -> rusqlite::Result<bool> {
+        let list = serde_json::to_string(from).unwrap_or_default();
+        let closed = matches!(to, "closed" | "used" | "failed" | "unknown").then_some(now);
+        let n = self.db.execute(
+            "UPDATE cards SET status = ?2, closed_at = coalesce(?3, closed_at)
+             WHERE id = ?1 AND status IN (SELECT value FROM json_each(?4))",
+            params![id, to, closed, list],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Main's note about card `id`, once per `word` (inbox row `action-card-<id>-<word>`, so
+    /// the router wakes main for it as for a held action's note): `[card #N
+    /// WORD; zephyr's note, not the owner's words] TEXT`, on the channel of the run that asked.
+    pub fn card_note(&self, id: i64, word: &str, text: &str) -> rusqlite::Result<bool> {
+        let Some(c) = self.card(id)? else {
+            return Ok(false);
+        };
+        let to = match c.channel.is_empty() {
+            false => Some((c.channel, c.sender)),
+            true => last_owner_in(&self.db)?,
+        };
+        let Some((channel, sender)) = to else {
+            return Ok(false);
+        };
+        let text = format!("[card #{id} {word}; zephyr's note, not the owner's words] {text}");
+        let n = self.db.execute(
+            "INSERT OR IGNORE INTO inbox(channel, platform_msg_id, sender, text) VALUES (?1, ?2, ?3, ?4)",
+            params![channel, format!("action-card-{id}-{word}"), sender, text],
+        )?;
+        Ok(n == 1)
+    }
+
     /// Holds an action for the owner: `pending`, or `scheduled` when it has a `due_at`. The
     /// `command` column carries the summary, so the waiting list reads it like any proposal.
     pub fn hold_action(&self, a: &NewAction) -> rusqlite::Result<i64> {
@@ -1897,13 +2402,14 @@ impl Store {
         )
     }
 
-    /// Expires `pending` and `scheduled` actions older than 24 h and pending browser waits older than 10 min.
+    /// Expires `pending` and `scheduled` actions older than 24 h, and pending browser waits and
+    /// card requests older than 10 min (a checkout does not wait longer).
     pub fn expire_actions(&self, now: i64) -> rusqlite::Result<Vec<Action>> {
         let mut stmt = self.db.prepare(&format!(
             "UPDATE proposals SET status = 'expired', settled_at = ?1
              WHERE kind != 'command' AND status IN ('pending', 'scheduled')
                AND (created_at <= ?1 - 86400
-                    OR (status = 'pending' AND kind = 'wait' AND created_at <= ?1 - 600))
+                    OR (status = 'pending' AND kind IN ('wait', 'card') AND created_at <= ?1 - 600))
              RETURNING {ACTION_COLS}"
         ))?;
         let rows = stmt.query_map(params![now], action_row)?;
@@ -2200,7 +2706,17 @@ impl Store {
         let commits = self
             .db
             .execute("DELETE FROM memory_commits WHERE at < ?1", params![before])?;
-        Ok(emptied + sent + audit + changes + passes + actions + runs + tasks + procs + commits)
+        // The highest card id stays, as above: `card-<id>-…` inbox rows are once per id.
+        let cards = self.db.execute(
+            "DELETE FROM cards WHERE status NOT IN ('waiting', 'open', 'charging', 'closing')
+               AND coalesce(closed_at, created_at) < ?1 AND id < (SELECT max(id) FROM cards)",
+            params![before],
+        )?;
+        let payments = self
+            .db
+            .execute("DELETE FROM payments WHERE at < ?1", params![before])?;
+        let kept = emptied + sent + audit + changes + passes + actions + runs + tasks + procs;
+        Ok(kept + commits + cards + payments)
     }
 
     /// Marks a conversation clean (a `/new`); one that already has a row keeps it.
@@ -3790,6 +4306,100 @@ mod tests {
         }
     }
 
+    fn new_card() -> NewCard {
+        NewCard {
+            provider: "manual".into(),
+            origin: "https://www.amazon.ca".into(),
+            merchant: "Amazon.ca".into(),
+            cap_minor: 4250,
+            currency: "CAD".into(),
+            uses: "single use".into(),
+            channel: "chat".into(),
+            sender: "owner".into(),
+            session: "main".into(),
+            expires_at: 900,
+            ..NewCard::default()
+        }
+    }
+
+    #[test]
+    fn payments_are_counted_in_their_window() {
+        let store = Store::open(&crate::test_dir("store-payments").join("state.db")).unwrap();
+        store
+            .add_payment(100, Some(9900), "CAD", "auto", None)
+            .unwrap(); // before the window
+        store
+            .add_payment(500, Some(1000), "CAD", "auto", None)
+            .unwrap();
+        store
+            .add_payment(600, Some(500), "CAD", "ok", Some(3))
+            .unwrap();
+        assert_eq!(store.payments_since(400, "CAD").unwrap(), (2, 1500, false));
+        store.add_payment(700, None, "CAD", "ok", None).unwrap();
+        assert_eq!(store.payments_since(400, "CAD").unwrap(), (3, 1500, true));
+        // Another currency is not summed and counts as unread.
+        assert_eq!(store.payments_since(650, "USD").unwrap(), (1, 0, true));
+        assert_eq!(store.payments_since(700, "CAD").unwrap(), (0, 0, false));
+    }
+
+    #[test]
+    fn a_card_action_keeps_its_strong_mark() {
+        let store = Store::open(&crate::test_dir("store-card-strong").join("state.db")).unwrap();
+        let mut new = new_action("r", None);
+        new.kind = ActionKind::Card;
+        let id = store.hold_action(&new).unwrap();
+        assert!(!store.action_strong(id).unwrap());
+        store.set_strong(id).unwrap();
+        assert!(store.action_strong(id).unwrap());
+        assert_eq!(store.action(id).unwrap().unwrap().kind, ActionKind::Card);
+    }
+
+    #[test]
+    fn a_card_moves_once_and_notes_once() {
+        let store = Store::open(&crate::test_dir("store-card-move").join("state.db")).unwrap();
+        let id = store.add_card(&new_card()).unwrap();
+        assert!(store
+            .move_card(id, &["waiting", "open"], "closed", 50)
+            .unwrap());
+        assert!(!store
+            .move_card(id, &["waiting", "open"], "closed", 60)
+            .unwrap());
+        let c = store.card(id).unwrap().unwrap();
+        assert_eq!((c.status.as_str(), c.closed_at), ("closed", Some(50)));
+        assert!(store.card_note(id, "closed", "expired unused").unwrap());
+        assert!(!store.card_note(id, "closed", "again").unwrap());
+        let row = &store.inbox_with_status("new").unwrap()[0];
+        assert_eq!(
+            row.text,
+            "[card #1 closed; zephyr's note, not the owner's words] expired unused"
+        );
+        assert_eq!(store.cards_in(&["closed"]).unwrap().len(), 1);
+        assert!(store.cards_in(&["open", "waiting"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn prune_drops_old_cards_and_payments() {
+        let store = Store::open(&crate::test_dir("store-prune-cards").join("state.db")).unwrap();
+        let old = store.add_card(&new_card()).unwrap();
+        store.move_card(old, &["waiting"], "closed", 10).unwrap();
+        let open = store.add_card(&new_card()).unwrap();
+        let last = store.add_card(&new_card()).unwrap();
+        store.move_card(last, &["waiting"], "closed", 10).unwrap();
+        store
+            .db
+            .execute("UPDATE cards SET created_at = 5", [])
+            .unwrap();
+        store.add_payment(10, Some(1), "CAD", "auto", None).unwrap();
+        store
+            .add_payment(1000, Some(1), "CAD", "auto", None)
+            .unwrap();
+        store.prune(100).unwrap();
+        assert!(store.card(old).unwrap().is_none());
+        assert!(store.card(open).unwrap().is_some(), "an open card stays");
+        assert!(store.card(last).unwrap().is_some(), "the highest id stays");
+        assert_eq!(store.payments_since(0, "CAD").unwrap().0, 1);
+    }
+
     #[test]
     fn one_id_space_for_commands_and_actions() {
         let store = Store::open(&crate::test_dir("store-ids").join("state.db")).unwrap();
@@ -4070,6 +4680,7 @@ mod tests {
     fn older_databases_migrate_in_order_and_keep_their_rows() {
         // Each case undoes the steps after `version`, as a db made by that build would look:
         // v14's first, while the tables its indexes are on still exist.
+        const V20: &str = "DROP TABLE cards; DROP TABLE payments;";
         const V19: &str = "ALTER TABLE inbox DROP COLUMN derived;";
         const V18: &str = "DROP TABLE web_push; DROP TABLE web_sessions; DROP TABLE web_passkeys;";
         const V17: &str = "DROP TABLE session_origin; DROP TABLE memory_commits; ALTER TABLE jobs DROP COLUMN builtin; ALTER TABLE inbox DROP COLUMN owner;";
@@ -4098,6 +4709,7 @@ mod tests {
             (16, ""),
             (17, ""),
             (18, ""),
+            (19, ""),
         ] {
             let dir = crate::test_dir(&format!("store-v{version}"));
             let path = dir.join("state.db");
@@ -4108,8 +4720,9 @@ mod tests {
             let v16 = if version < 16 { V16 } else { "" };
             let v17 = if version < 17 { V17 } else { "" };
             let v18 = if version < 18 { V18 } else { "" };
+            let v19 = if version < 19 { V19 } else { "" };
             db.execute_batch(&format!(
-                "{V19} {v18} {v17} {v16} {v15} {v14} {undo} PRAGMA user_version = {version};"
+                "{V20} {v19} {v18} {v17} {v16} {v15} {v14} {undo} PRAGMA user_version = {version};"
             ))
             .unwrap();
             drop(db);
@@ -4201,6 +4814,11 @@ mod tests {
             let derived = |id| store.inbox_row(id).unwrap().unwrap().derived;
             assert_eq!(derived(v).as_deref(), Some("voice"));
             assert_eq!(derived(1), None, "a row from before v19");
+            // v20: cards and the payments the window counts.
+            let card = store.add_card(&new_card()).unwrap();
+            assert_eq!(store.card(card).unwrap().unwrap().status, "waiting");
+            store.add_payment(100, Some(4250), "CAD", "card", None).unwrap();
+            assert_eq!(store.payments_since(0, "CAD").unwrap(), (1, 4250, false));
             let now: i64 = store
                 .db
                 .pragma_query_value(None, "user_version", |r| r.get(0))

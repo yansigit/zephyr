@@ -52,7 +52,7 @@ both wait for the daemon; anything else is refused at once
 run settles "aborted" with no reply. A `task` call waits for its answer the same way (reply line
 `task: <answer>`); one the plugin would refuse (an action other than start with a goal, list, or
 stop with an id) gets "tool error: bad task call" at once. `exec` and `process` calls wait the same
-way (up to 30 s for `exec`, whose answer comes when its command ends or yields), and so do `vault`
+way (up to 30 s for `exec`, whose answer comes when its command ends or yields), and so do `card`, `vault`
 calls; an `exec` with an empty command gets "tool error: `command` is empty" at once.
 `queue_message` with `deliverAs: "steer"` is held (answering `queue: "steer"`) and delivered, as rpi
 does, after the running tool's result: `turn_start`, the user message's `message_start`/
@@ -583,10 +583,10 @@ def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
     elif name == "exec" and not str(args.get("command", "")).strip():
         result["isError"] = True
         result["content"] = [{"type": "text", "text": "tool error: `command` is empty"}]
-    elif os.path.exists(os.path.join(home, "tool_fail")) and name not in ("gateway", "task", "exec", "process", "vault"):
+    elif os.path.exists(os.path.join(home, "tool_fail")) and name not in ("gateway", "task", "exec", "process", "vault", "card"):
         result["isError"] = True
         result["content"] = [{"type": "text", "text": "tool error: " + open(os.path.join(home, "tool_fail")).read()}]
-    elif name in ("gateway", "task", "exec", "process", "vault"):
+    elif name in ("gateway", "task", "exec", "process", "vault", "card"):
         answer = os.path.join(os.environ.get("ZEPHYR_GATEWAY_DIR", ""), cid)
         text = "the gateway did not answer"
         # An exec answers when its command ends or yields, so it may take a while.
@@ -736,7 +736,7 @@ for line in iter(next_line, None):
             text = run_tool(s, name, args, "c%d-%d" % (os.getpid(), calls))
             if text is None:
                 break
-            if name in ("gateway", "task", "exec", "process", "vault"):
+            if name in ("gateway", "task", "exec", "process", "vault", "card"):
                 answers.append("\n%s: %s" % (name, text))
             elif name == "mcp_call":
                 answers.append("\nmcp: %s" % text)

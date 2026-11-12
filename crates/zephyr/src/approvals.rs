@@ -470,6 +470,13 @@ pub fn value(cfg: &Config, part: &str) -> Option<String> {
         "facts" => e.facts.name().into(),
         "currency" => currency(cfg),
         "strong_only" => strong_only(cfg).join(", "),
+        "window.effects" => window(cfg).effects.to_string(),
+        // A plain number, as `/set` takes it.
+        "window.amount" => {
+            let scale = 10f64.powi(exponent(&currency(cfg)) as i32);
+            (window(cfg).amount_minor? as f64 / scale).to_string()
+        }
+        "window.seconds" => window(cfg).seconds.to_string(),
         _ => return None,
     })
 }
@@ -485,6 +492,58 @@ pub fn cleared(cfg: &Config, part: &str) -> Option<String> {
 pub fn currency(cfg: &Config) -> String {
     (cfg.approvals.as_ref().and_then(|a| a.currency.as_deref()))
         .map_or_else(|| "USD".into(), |c| c.trim().to_ascii_uppercase())
+}
+
+/// The payment window in effect (DESIGN §4.25): `amount_minor` in `approvals.currency`'s minor
+/// unit, `None` for no amount limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowNow {
+    pub effects: u32,
+    pub amount_minor: Option<i64>,
+    pub seconds: i64,
+}
+
+/// `[approvals.window]` with its defaults: 5 payments, the `auto N` cap as the amount when
+/// there is one, 600 s.
+pub fn window(cfg: &Config) -> WindowNow {
+    let w = (cfg.approvals.as_ref().and_then(|a| a.window.clone())).unwrap_or_default();
+    let currency = currency(cfg);
+    let cap = match effective(cfg).money {
+        // The cap counts in cents whatever the currency (`gate::within`).
+        Mode::AutoCap(cents) => Some(minor_of(cents as f64 / 100.0, &currency)),
+        _ => None,
+    };
+    WindowNow {
+        effects: w.effects.unwrap_or(5),
+        amount_minor: w.amount.map(|a| minor_of(a, &currency)).or(cap),
+        seconds: i64::from(w.seconds.unwrap_or(600)),
+    }
+}
+
+/// How many decimal places `currency`'s minor unit has (ISO 4217): 0 for the yen and the won,
+/// 3 for the dinars, else 2.
+pub fn exponent(currency: &str) -> u32 {
+    match currency.to_ascii_uppercase().as_str() {
+        "JPY" | "KRW" | "VND" | "CLP" | "ISK" | "HUF" | "XOF" | "XAF" | "PYG" | "UGX" => 0,
+        "BHD" | "KWD" | "OMR" | "JOD" | "TND" => 3,
+        _ => 2,
+    }
+}
+
+/// `value` in `currency`'s minor unit, rounded up (as a cap counts it, `gate::within`).
+pub fn minor_of(value: f64, currency: &str) -> i64 {
+    let scale = 10f64.powi(exponent(currency) as i32);
+    ((value * scale * 1e6).round() / 1e6).ceil() as i64
+}
+
+/// `42.50 CAD`, `500 JPY`: `minor` written in `currency`.
+pub fn money(minor: i64, currency: &str) -> String {
+    let e = exponent(currency) as usize;
+    let scale = 10i64.pow(e as u32);
+    match e {
+        0 => format!("{minor} {currency}"),
+        _ => format!("{}.{:0e$} {currency}", minor / scale, minor % scale),
+    }
 }
 
 /// What only a strong channel may approve (spec §4.7): `approvals.strong_only`, else `loosen`.
@@ -526,6 +585,17 @@ pub fn check(a: &Approvals) -> anyhow::Result<()> {
     if let Some(c) = &a.currency {
         currency_code(c).map_err(problem)?;
     }
+    if let Some(w) = &a.window {
+        if w.effects.is_some_and(|n| !(1..=100).contains(&n)) {
+            return Err(problem("window.effects must be 1 to 100".into()));
+        }
+        if w.seconds.is_some_and(|n| !(60..=86_400).contains(&n)) {
+            return Err(problem("window.seconds must be 60 to 86400".into()));
+        }
+        if w.amount.is_some_and(|a| !(a > 0.0 && a <= 1.0e9)) {
+            return Err(problem("window.amount must be more than 0".into()));
+        }
+    }
     for name in a.strong_only.iter().flatten() {
         if !STRONG_ONLY.contains(&name.as_str()) {
             return Err(problem(format!(
@@ -540,6 +610,53 @@ pub fn check(a: &Approvals) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_defaults_follow_the_auto_cap() {
+        let cfg = |extra: &str| -> Config {
+            toml::from_str(&format!("rpi = '/r'\nhome = '/h'\n{extra}")).unwrap()
+        };
+        let none = WindowNow {
+            effects: 5,
+            amount_minor: None,
+            seconds: 600,
+        };
+        assert_eq!(window(&cfg("")), none);
+        let capped = cfg("[approvals]\nmoney = 'auto 200'\ncurrency = 'CAD'\n");
+        assert_eq!(window(&capped).amount_minor, Some(20_000));
+        let set = cfg(
+            "[approvals]\nmoney = 'auto 200'\n[approvals.window]\neffects = 2\namount = 50.5\n\
+             seconds = 60\n",
+        );
+        let w = WindowNow {
+            effects: 2,
+            amount_minor: Some(5050),
+            seconds: 60,
+        };
+        assert_eq!(window(&set), w);
+        assert_eq!(value(&set, "window.amount").as_deref(), Some("50.5"));
+        assert_eq!(value(&cfg(""), "window.amount"), None);
+        for bad in ["effects = 0", "effects = 101", "seconds = 59", "amount = 0"] {
+            let c = cfg(&format!("[approvals.window]\n{bad}\n"));
+            assert!(c.validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn minor_units_follow_the_currency() {
+        assert_eq!(minor_of(42.5, "CAD"), 4250);
+        assert_eq!(minor_of(0.1, "USD"), 10);
+        assert_eq!(
+            minor_of(50.004, "USD"),
+            5001,
+            "rounded up, as a cap counts it"
+        );
+        assert_eq!(minor_of(500.0, "JPY"), 500);
+        assert_eq!(minor_of(1.5, "KWD"), 1500);
+        assert_eq!(money(4250, "CAD"), "42.50 CAD");
+        assert_eq!(money(5, "CAD"), "0.05 CAD");
+        assert_eq!(money(500, "JPY"), "500 JPY");
+    }
     use FactsMode::{Hold, Off, Warn};
     use Mode::*;
 

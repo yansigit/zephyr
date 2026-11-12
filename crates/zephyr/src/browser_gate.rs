@@ -519,6 +519,13 @@ fn decide(args: &[String], env: &Env) -> (Next, Place) {
         Ok(()) => go(env, None),
         Err(text) => (Next::Refuse(text), None),
     };
+    // A card's number is in this page's fields (DESIGN §4.25): the page is not read back.
+    let (reads, snap) = (reads_back(&argv.rest), snapshots(&argv.rest));
+    if reads || snap {
+        if let Some(text) = card_filled(env, &page, reads, snap) {
+            return (Next::Refuse(text), None);
+        }
+    }
     match &act {
         Act::Pass => {
             // `back`, `forward` and `reload` read the page's address only for its pace: only
@@ -966,6 +973,84 @@ fn what(rest: &[String]) -> Act {
         _ => Act::Pass,
     }
 }
+
+/// Whether `rest` reads the page's contents back to the agent: a field's value, the page's
+/// HTML, a script's answer, a picture or a recording of it, the clipboard, the browser's own
+/// debugging port. `snapshot`, `get text` and `get url` are not: a checkout needs them, and
+/// what main reads of them is scrubbed (`snapshot` is refused only on the page a card was just
+/// typed into, [`card_filled`]).
+fn reads_back(rest: &[String]) -> bool {
+    let Some((cmd, args)) = rest.split_first() else {
+        return false;
+    };
+    let sub = args.first().map(String::as_str);
+    match cmd.as_str() {
+        "eval" | "screenshot" | "pdf" | "record" | "clipboard" | "stream" | "inspect"
+        | "connect" | "console" => true,
+        "get" => matches!(sub, Some("value" | "html" | "attr" | "cdp-url")),
+        "diff" => sub == Some("screenshot"),
+        "batch" => args.iter().any(|c| {
+            let words = shell_words_split(c);
+            reads_back(&words) || reads_back(&split(&words).rest)
+        }),
+        _ => false,
+    }
+}
+
+/// Whether `rest` is a `snapshot`, or a `batch` holding one: it prints the fields' values.
+fn snapshots(rest: &[String]) -> bool {
+    match rest.split_first() {
+        Some((cmd, _)) if cmd == "snapshot" => true,
+        Some((cmd, args)) if cmd == "batch" => args.iter().any(|c| {
+            let words = shell_words_split(c);
+            snapshots(&words) || snapshots(&split(&words).rest)
+        }),
+        _ => false,
+    }
+}
+
+/// Why the page may not be read back now (`reads`) or snapshotted (`snap`). Root's
+/// `cards-filled`, beside the gate socket and written by `cards::live`, lists a line per card
+/// whose number zephyr still keeps: the origin it was typed into and the page, tab separated.
+/// A read-back is refused on that origin; a `snapshot` on that page (its `#…` aside) until it
+/// moves on. No file is no card; one that cannot be read refuses.
+fn card_filled(env: &Env, page: &Page, reads: bool, snap: bool) -> Option<String> {
+    let flag = public(env).join(crate::cards::FILLED_FILE);
+    let listed = match std::fs::read_to_string(&flag) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(CARD_UNREAD.into()),
+        Ok(listed) => listed,
+    };
+    if listed.trim().is_empty() {
+        return None;
+    }
+    let url = page.url();
+    let Some(origin) = crate::vault::origin(&url).map(|o| o.ascii_serialization()) else {
+        return Some(CARD_UNREAD.into());
+    };
+    let bare = |u: &str| u.split('#').next().unwrap_or_default().trim().to_string();
+    let lines = || {
+        listed
+            .lines()
+            .map(|l| l.split_once('\t').unwrap_or((l, "")))
+    };
+    if reads && lines().any(|(o, _)| o.trim() == origin) {
+        return Some(format!(
+            "not run: a virtual card is filled on {origin}; reading that page back (a field's \
+             value, its HTML, a script, a picture of it) is refused until zephyr has forgotten \
+             the card's number. Clicking, `snapshot` and `get text` still work."
+        ));
+    }
+    (snap && lines().any(|(_, p)| !p.is_empty() && bare(p) == bare(&url))).then(|| {
+        "not run: a virtual card was just typed into this page, and `snapshot` would print \
+         its fields; it runs again once the page moves on. Click Pay with the refs you had \
+         before the fill."
+            .to_string()
+    })
+}
+
+const CARD_UNREAD: &str = "not run: zephyr could not tell whether a virtual card is filled on \
+                           this page, so the page is not read back; try again";
 
 /// Typing `typed`: with a line break where Enter would go (`enter_in`), a key press there, which
 /// 0.41 sends as a real Enter for each `\n` or `\r` (`type_text_into_active_context`), however
@@ -2935,6 +3020,86 @@ cat "$d/$f.json"
     fn a_paced_sleep_after_an_allow_leaves_the_report_in_time() {
         let worst = PACE_ASK + PACE_AFTER_WAIT + REREADS * FACT_WAIT;
         assert!(worst < gate::REPORT_WAIT, "{worst:?}");
+    }
+
+    /// DESIGN §4.25: while zephyr keeps the number of a card it typed into a page, the
+    /// commands that read that page back are refused; what a checkout needs still runs.
+    #[test]
+    fn reading_a_page_back_is_refused_while_a_card_is_filled_on_it() {
+        let t = T::new("bg-card");
+        t.page(MAIL, COMPOSE, "");
+        let flag = t.dir.join(crate::cards::FILLED_FILE);
+        let reads: [&[&str]; 9] = [
+            &["get", "value", "@e1"],
+            &["get", "html", "body"],
+            &["get", "attr", "value", "@e1"],
+            &["eval", "document.querySelector('input').value"],
+            &["screenshot", "/tmp/page.png"],
+            &["pdf", "/tmp/page.pdf"],
+            &["--session", "work", "eval", "1"],
+            &["batch", "snapshot -i", "get value @e1"],
+            &["clipboard", "read"],
+        ];
+        // No card anywhere: nothing is asked and everything runs.
+        for args in reads {
+            assert_eq!(t.run(args), Next::Exec, "{args:?}");
+        }
+        std::fs::write(&flag, "https://other.example\nhttps://mail.example.com\n").unwrap();
+        for args in reads {
+            match t.run(args) {
+                Next::Refuse(text) => assert!(
+                    text.starts_with(
+                        "not run: a virtual card is filled on https://mail.example.com;"
+                    ),
+                    "{args:?}: {text}"
+                ),
+                Next::Exec => panic!("{args:?} ran"),
+            }
+        }
+        for args in [
+            &["snapshot", "-i"][..],
+            &["get", "url"],
+            &["get", "text", "@e1"],
+            &["scroll", "down", "200"],
+            &["hover", "@e3"],
+        ] {
+            assert_eq!(t.run(args), Next::Exec, "{args:?}");
+        }
+        // A card filled on another site refuses nothing here.
+        std::fs::write(&flag, "https://other.example\n").unwrap();
+        assert_eq!(t.run(&["eval", "1"]), Next::Exec);
+        // A flag that cannot be read is no leave to read the page.
+        std::fs::remove_file(&flag).unwrap();
+        std::fs::create_dir(&flag).unwrap();
+        assert!(matches!(t.run(&["eval", "1"]), Next::Refuse(_)));
+    }
+
+    /// DESIGN §4.25: right after a fill, `snapshot` (which prints the fields' values) is
+    /// refused on the page the card was typed into, until the page moves on; on its other
+    /// pages, and for a flag that names no page, it runs.
+    #[test]
+    fn a_snapshot_of_the_page_a_card_was_just_typed_into_is_refused() {
+        let t = T::new("bg-card-snap");
+        t.page(MAIL, COMPOSE, "");
+        let flag = t.dir.join(crate::cards::FILLED_FILE);
+        let line = format!("https://mail.example.com\t{MAIL}\n");
+        std::fs::write(&flag, &line).unwrap();
+        for args in [&["snapshot", "-i"][..], &["batch", "snapshot -i"]] {
+            match t.run(args) {
+                Next::Refuse(text) => assert!(
+                    text.starts_with("not run: a virtual card was just typed into this page"),
+                    "{args:?}: {text}"
+                ),
+                Next::Exec => panic!("{args:?} ran"),
+            }
+        }
+        // Its fragment is the same page.
+        t.page(&format!("{MAIL}#pay"), COMPOSE, "");
+        assert!(matches!(t.run(&["snapshot"]), Next::Refuse(_)));
+        // The page moved on: a snapshot runs, and the origin's read-backs are still refused.
+        t.page("https://mail.example.com/done", COMPOSE, "");
+        assert_eq!(t.run(&["snapshot", "-i"]), Next::Exec);
+        assert!(matches!(t.run(&["eval", "1"]), Next::Refuse(_)));
     }
 
     #[test]

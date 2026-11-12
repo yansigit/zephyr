@@ -27,6 +27,7 @@ pub const USAGE: &str = "usage: zephyr <command>   (zephyr --version: this CLI's
   subagent list | add NAME [--model P/M] [--prompt TEXT] | edit NAME [--model P/M|default] [--prompt TEXT] | rm NAME
   vault list | add login NAME --site URL [--user U] [--totp] | add token NAME [--host HOST].. | edit NAME [--host HOST].. | rm NAME | revoke NAME [PROGRAM]
   facts list | add NAME --kind text|digits|email | rm NAME | allow NAME TARGET | disallow NAME TARGET
+  card [list] | put N single-use|prepaid BALANCE | done N | close N | link   (virtual cards; put asks for the number, hidden)
   config get KEY | set KEY VALUE   (a known setting goes through the daemon while it runs)
   chat | attach [--stock] | shell [bash|zsh] | pause | resume | reload
   doctor [--fix]
@@ -69,7 +70,7 @@ const ME: &str = env!("CARGO_PKG_VERSION");
 /// does not know.
 const ROLLED_BACK: [&str; 3] = ["zephyr.toml", "vault.toml", "host.toml"];
 
-const COMMANDS: [&str; 28] = [
+const COMMANDS: [&str; 29] = [
     "init",
     "up",
     "down",
@@ -98,6 +99,7 @@ const COMMANDS: [&str; 28] = [
     "subagent",
     "alert",
     "web",
+    "card",
 ];
 
 /// The image sets ZEPHYR_IN_CONTAINER. ZEPHYR_CONFIG (set in the image and by tests) also points
@@ -1414,6 +1416,16 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                 _ => &[],
             };
             run(&mut h.exec(flags, &[], &["zephyr", cmd]))
+        }
+        // In the container, on a terminal when there is one: `put` asks for the number hidden,
+        // and `link` shows a code and waits.
+        "card" => {
+            let rest = a.rest()?;
+            h.need_running()?;
+            let flags: &[&str] = if h.interactive { &["-it"] } else { &["-i"] };
+            let mut argv = vec!["zephyr", "card"];
+            argv.extend(rest.iter().map(String::as_str));
+            run(&mut h.exec(flags, &[], &argv))
         }
         "attach" => {
             let stock = a.flag("--stock");

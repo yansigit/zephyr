@@ -1110,11 +1110,13 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let mut hosts = a.values("--host")?;
     // And the request headers it is swapped in besides Authorization.
     let headers = a.values("--header")?;
+    let provider = a.value("--provider")?;
+    let account = a.value("--account")?;
     let rest = a.rest()?;
     let usage = "usage: zephyr vault list | add login NAME --site URL [--user U] [--totp] | \
                  add token NAME [--host HOST].. [--header HEADER].. | edit NAME [--site URL] \
                  [--user U] [--totp] [--host HOST].. [--header HEADER].. | rm NAME | \
-                 revoke NAME [PROGRAM]";
+                 revoke NAME [PROGRAM] | add service cards --provider NAME [--account ID]";
     let text = match h.data.read(crate::vault::FILE) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         r => r?,
@@ -1132,10 +1134,14 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let said = match args[..] {
         [] | ["list"] => {
             let entries = vault.entries();
-            if entries.is_empty() {
+            if entries.is_empty() && vault.services().is_empty() {
                 println!("the vault is empty");
             }
             entries.iter().for_each(|e| println!("{}", e.line()));
+            vault
+                .services()
+                .iter()
+                .for_each(|s| println!("{}", s.line()));
             return Ok(());
         }
         ["add", "login", name] => {
@@ -1193,6 +1199,19 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
             };
             format!("saved the token {name}; {sent}; the agent asks you before each new program uses it")
         }
+        // A provider's key (DESIGN §4.25): taken only here, never in a chat.
+        ["add", "service", name] => {
+            let provider =
+                provider.with_context(|| format!("add service needs --provider\n{usage}"))?;
+            let key = secret(&format!("{provider} API key, empty for none or to keep it"))?;
+            vault.put_service(crate::vault::Service {
+                name: name.into(),
+                provider: provider.clone(),
+                key,
+                account: account.unwrap_or_default(),
+            })?;
+            format!("saved the {name} service ({provider}); only zephyr's own client reads it")
+        }
         ["edit", name] => {
             let mut e = vault
                 .get(name)
@@ -1218,7 +1237,7 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
             vault.put(e)?;
             format!("saved {name}")
         }
-        ["rm", name] => match vault.remove(name) {
+        ["rm", name] => match vault.remove(name) || vault.remove_service(name) {
             true => format!("removed {name}"),
             false => bail!("no entry named {name} in the vault"),
         },
