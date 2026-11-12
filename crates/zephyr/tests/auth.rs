@@ -2,6 +2,8 @@
 //! `$RPI_CODING_AGENT_DIR/auth.json` is the credential store, and `rpi auth refresh` (run as a
 //! subprocess by the keeper) rewrites it.
 
+mod common;
+use common::wait;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -104,16 +106,6 @@ impl Gateway {
     }
 }
 
-async fn wait(mut done: impl FnMut() -> bool) {
-    for _ in 0..400 {
-        if done() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("timed out");
-}
-
 /// The fake's pid: changes each time a child starts.
 fn pid(home: &Path) -> Option<String> {
     std::fs::read_to_string(home.join("pid")).ok()
@@ -140,7 +132,7 @@ fn of_type(home: &Path, kind: &str) -> Vec<Value> {
 /// by then, and over the run's events one that was due has had its turn.
 async fn round_trip(gw: &Gateway) {
     gw.say("probe", "hi").await;
-    wait(|| {
+    wait(20, || {
         let commands = log(&gw.home);
         let prompt = commands.iter().position(|c| c["type"] == "prompt");
         prompt.is_some_and(|at| commands[at..].iter().any(|c| c["type"] == "get_messages"))
@@ -165,9 +157,9 @@ fn expiring_in(secs: i64) -> Value {
 #[tokio::test]
 async fn expiring_oauth_is_refreshed_then_the_child_restarts() {
     let gw = start("refresh", Some(expiring_in(300)), "");
-    wait(|| pid(&gw.home).is_some()).await;
+    wait(20, || pid(&gw.home).is_some()).await;
     let first = pid(&gw.home);
-    wait(|| pid(&gw.home) != first).await;
+    wait(20, || pid(&gw.home) != first).await;
 
     let refreshed = refreshes(&gw.home);
     assert_eq!(refreshed.len(), 1, "one refresh, no retries");
@@ -194,11 +186,11 @@ async fn expiring_oauth_is_refreshed_then_the_child_restarts() {
 #[tokio::test]
 async fn an_auth_check_due_during_a_run_waits_for_its_settle() {
     let gw = start("idle-check", None, "[auth]\nrefresh_minutes = 0.02\n");
-    wait(|| pid(&gw.home).is_some()).await;
+    wait(20, || pid(&gw.home).is_some()).await;
     std::fs::write(gw.home.join("slow"), "3").unwrap();
     gw.say("m1", "hello").await;
-    wait(|| !of_type(&gw.home, "prompt").is_empty()).await;
-    wait(|| !of_type(&gw.home, "get_messages").is_empty()).await; // the settle's reconcile
+    wait(20, || !of_type(&gw.home, "prompt").is_empty()).await;
+    wait(20, || !of_type(&gw.home, "get_messages").is_empty()).await; // the settle's reconcile
     let checks = || -> Vec<Value> {
         std::fs::read_to_string(gw.home.join("arrived.jsonl"))
             .unwrap_or_default()
@@ -208,7 +200,7 @@ async fn an_auth_check_due_during_a_run_waits_for_its_settle() {
             .collect()
     };
     let before = checks().len();
-    wait(|| checks().len() > before).await; // the checks carry on after it
+    wait(20, || checks().len() > before).await; // the checks carry on after it
     let mid_run: Vec<Value> = checks()
         .into_iter()
         .filter(|c| c["running"] == true)
@@ -231,16 +223,16 @@ async fn refresh_while_busy_restarts_only_after_the_settle() {
         "[auth]\nrefresh_minutes = 0.02\n",
     );
     std::fs::write(gw.home.join("slow"), "4").unwrap(); // each prompt takes 4s
-    wait(|| pid(&gw.home).is_some()).await;
-    wait(|| !of_type(&gw.home, "get_auth_status").is_empty()).await; // an idle check first
+    wait(20, || pid(&gw.home).is_some()).await;
+    wait(20, || !of_type(&gw.home, "get_auth_status").is_empty()).await; // an idle check first
     let first = pid(&gw.home);
 
     gw.say("m1", "hello").await;
-    wait(|| !of_type(&gw.home, "prompt").is_empty()).await;
+    wait(20, || !of_type(&gw.home, "prompt").is_empty()).await;
     // Expires inside the window: the check due during the run (every 1.2s) refreshes after it.
     std::fs::write(gw.agent.join("auth.json"), expiring_in(60).to_string()).unwrap();
-    wait(|| !refreshes(&gw.home).is_empty()).await;
-    wait(|| pid(&gw.home) != first).await;
+    wait(20, || !refreshes(&gw.home).is_empty()).await;
+    wait(20, || pid(&gw.home) != first).await;
 
     let commands: Vec<String> = log(&gw.home)
         .iter()
@@ -271,7 +263,7 @@ async fn no_oauth_credentials_means_no_refresh_and_no_restart() {
         Some(json!({"openai": {"type": "api_key", "key": "sk-test"}})),
         "",
     );
-    wait(|| !of_type(&gw.home, "get_auth_status").is_empty()).await;
+    wait(20, || !of_type(&gw.home, "get_auth_status").is_empty()).await;
     let first = pid(&gw.home);
     round_trip(&gw).await;
     assert!(refreshes(&gw.home).is_empty());
@@ -282,7 +274,7 @@ async fn no_oauth_credentials_means_no_refresh_and_no_restart() {
 #[tokio::test]
 async fn an_absent_auth_file_means_no_refresh() {
     let gw = start("nofile", None, "");
-    wait(|| !of_type(&gw.home, "get_auth_status").is_empty()).await;
+    wait(20, || !of_type(&gw.home, "get_auth_status").is_empty()).await;
     assert!(refreshes(&gw.home).is_empty());
     gw.shutdown().await;
 }
@@ -290,7 +282,7 @@ async fn an_absent_auth_file_means_no_refresh() {
 #[tokio::test]
 async fn a_credential_with_time_left_is_left_alone() {
     let gw = start("fresh", Some(expiring_in(7200)), "");
-    wait(|| !of_type(&gw.home, "get_auth_status").is_empty()).await;
+    wait(20, || !of_type(&gw.home, "get_auth_status").is_empty()).await;
     let first = pid(&gw.home);
     round_trip(&gw).await;
     assert!(refreshes(&gw.home).is_empty());
@@ -302,7 +294,7 @@ async fn a_credential_with_time_left_is_left_alone() {
 async fn a_failed_refresh_leaves_the_child_running() {
     let gw = start("failing", Some(expiring_in(60)), "");
     std::fs::write(gw.home.join("oauth_fail"), "").unwrap();
-    wait(|| !refreshes(&gw.home).is_empty()).await;
+    wait(20, || !refreshes(&gw.home).is_empty()).await;
     let first = pid(&gw.home);
     round_trip(&gw).await;
     assert_eq!(refreshes(&gw.home).len(), 1);
@@ -318,7 +310,7 @@ async fn disabled_means_the_child_is_never_asked() {
         Some(expiring_in(60)),
         "[auth]\nenabled = false\n",
     );
-    wait(|| pid(&gw.home).is_some()).await;
+    wait(20, || pid(&gw.home).is_some()).await;
     round_trip(&gw).await;
     assert!(of_type(&gw.home, "get_auth_status").is_empty());
     assert!(refreshes(&gw.home).is_empty());
@@ -334,20 +326,20 @@ async fn a_hanging_refresh_during_a_run_does_not_hold_its_events() {
         Some(expiring_in(3600)),
         "[auth]\nrefresh_minutes = 0.02\n",
     );
-    wait(|| !of_type(&gw.home, "get_auth_status").is_empty()).await; // providers known
+    wait(20, || !of_type(&gw.home, "get_auth_status").is_empty()).await; // providers known
     std::fs::write(gw.home.join("slow"), "3").unwrap();
     std::fs::write(gw.home.join("refresh_hang"), "").unwrap();
     gw.say("m1", "hello").await;
-    wait(|| !of_type(&gw.home, "prompt").is_empty()).await;
+    wait(20, || !of_type(&gw.home, "prompt").is_empty()).await;
     std::fs::write(gw.agent.join("auth.json"), expiring_in(60).to_string()).unwrap();
-    wait(|| gw.home.join("refresh_pid").exists()).await; // it hangs, mid-run
+    wait(20, || gw.home.join("refresh_pid").exists()).await; // it hangs, mid-run
     let since = std::time::Instant::now();
     let settled = || {
         let commands = log(&gw.home);
         let prompt = commands.iter().position(|c| c["type"] == "prompt");
         prompt.is_some_and(|at| commands[at..].iter().any(|c| c["type"] == "get_messages"))
     };
-    wait(&settled).await;
+    wait(20, &settled).await;
     assert!(
         since.elapsed() < Duration::from_secs(8),
         "the settle waited on the refresh"
@@ -383,7 +375,7 @@ async fn a_daemon_busy_from_its_start_still_refreshes_a_due_credential() {
         .insert_inbox_as(&m, "new")
         .unwrap();
     let gw = run(cfg, home.clone(), agent);
-    wait(|| !refreshes(&home).is_empty()).await;
+    wait(20, || !refreshes(&home).is_empty()).await;
     let commands: Vec<String> = log(&home)
         .iter()
         .map(|c| c["type"].as_str().unwrap().to_string())
@@ -405,15 +397,15 @@ async fn a_pool_account_is_refreshed_while_main_is_busy() {
     let accounts = "[auth]\nrefresh_minutes = 0.02\n[[account]]\nname = 'a'\nmodel = 'anthropic/m'\n[[account]]\nname = 'b'\nmodel = 'openai-codex/m'\n";
     let (cfg, home, agent) = setup("pool-busy", None, accounts);
     let gw = run(cfg, home.clone(), agent);
-    wait(|| pid(&home).is_some()).await;
+    wait(20, || pid(&home).is_some()).await;
     std::fs::write(home.join("slow"), "4").unwrap();
     gw.say("m1", "hello").await;
-    wait(|| !of_type(&home, "prompt").is_empty()).await;
+    wait(20, || !of_type(&home, "prompt").is_empty()).await;
     let dir = home.join("accounts/b");
     std::fs::create_dir_all(&dir).unwrap();
     let soon = json!({"openai-codex": {"type": "oauth", "access": "old", "refresh": "r", "expires": now() + 60}});
     std::fs::write(dir.join("auth.json"), soon.to_string()).unwrap();
-    wait(|| !refreshes(&home).is_empty()).await;
+    wait(20, || !refreshes(&home).is_empty()).await;
     let commands: Vec<String> = log(&home)
         .iter()
         .map(|c| c["type"].as_str().unwrap().to_string())
@@ -440,7 +432,7 @@ async fn every_pooled_account_is_refreshed_with_its_own_dir() {
         std::fs::write(dir.join("auth.json"), soon(provider).to_string()).unwrap();
     }
     let gw = run(cfg, home.clone(), agent);
-    wait(|| refreshes(&home).len() >= 2).await;
+    wait(20, || refreshes(&home).len() >= 2).await;
     let mut providers: Vec<_> = refreshes(&home)
         .iter()
         .map(|r| r["provider"].as_str().unwrap().to_string())

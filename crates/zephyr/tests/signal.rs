@@ -1,6 +1,8 @@
 //! The Signal adapter (DESIGN §4.3) against tests/fake-signal-cli.py, on the router with fake-rpi
 //! and a test `chat` channel.
 
+mod common;
+use common::wait;
 use serde_json::{json, Value};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -179,7 +181,10 @@ impl Gw {
     }
     /// The child is up and its account named (`.ok`, which doctor reads).
     async fn up(&self) {
-        wait(|| std::fs::read_to_string(self.d.join(".ok")).is_ok_and(|a| a == ACCOUNT)).await;
+        wait(20, || {
+            std::fs::read_to_string(self.d.join(".ok")).is_ok_and(|a| a == ACCOUNT)
+        })
+        .await;
     }
     fn prompts(&self) -> Vec<String> {
         std::fs::read_to_string(self.home.join("log.jsonl"))
@@ -203,16 +208,6 @@ impl Gw {
         let _ = self.stop.take().unwrap().send(());
         self.task.await.unwrap().unwrap();
     }
-}
-
-async fn wait(mut done: impl FnMut() -> bool) {
-    for _ in 0..400 {
-        if done() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("timed out");
 }
 
 /// A direct message from `from`, as signal-cli 0.14.10 writes it.
@@ -252,14 +247,14 @@ async fn a_stranger_gets_nothing() {
         "s1.png",
         b"png!",
     ));
-    wait(|| gw.inbox("dropped") == 1).await;
+    wait(20, || gw.inbox("dropped") == 1).await;
     assert!(
         !gw.d.join("attachments/s1.png").exists(),
         "signal-cli's copy is deleted"
     );
     // The owner's message after it is answered, so the stranger's was taken first.
     gw.feed(message(OWNER, 1001, "hi"));
-    wait(|| !gw.to("send", OWNER).is_empty()).await;
+    wait(20, || !gw.to("send", OWNER).is_empty()).await;
     assert!(gw.to("send", STRANGER).is_empty());
     assert!(gw.to("sendTyping", STRANGER).is_empty());
     assert!(!home.join("inbox").exists());
@@ -282,7 +277,7 @@ async fn an_owner_is_answered_and_their_file_copied() {
         "o1.png",
         b"png!",
     ));
-    wait(|| !gw.to("send", OWNER).is_empty()).await;
+    wait(20, || !gw.to("send", OWNER).is_empty()).await;
     let saved = home.join(format!("inbox/signal-{OWNER}-1700000000123-1.png"));
     let sent = &gw.to("send", OWNER)[0];
     assert_eq!(
@@ -296,7 +291,10 @@ async fn an_owner_is_answered_and_their_file_copied() {
     assert!(!gw.d.join("attachments/o1.png").exists());
     let typing = gw.to("sendTyping", OWNER);
     assert!(typing.first().is_some_and(|t| t.get("stop").is_none()));
-    wait(|| gw.to("sendTyping", OWNER).iter().any(|t| t["stop"] == true)).await;
+    wait(20, || {
+        gw.to("sendTyping", OWNER).iter().any(|t| t["stop"] == true)
+    })
+    .await;
     gw.shutdown().await;
 }
 
@@ -326,12 +324,12 @@ async fn pairing_works_by_source_uuid() {
     gw.up().await;
     gw.feed(message(STRANGER, 3000, "/pair AAAAA-AAAAA"));
     gw.feed(message(STRANGER, 3001, &format!("/pair {code}")));
-    wait(|| !gw.to("send", STRANGER).is_empty()).await;
+    wait(20, || !gw.to("send", STRANGER).is_empty()).await;
     let told = format!(
         "[zephyr] Signal user {STRANGER} (\"Aiden\", +15559990000) is now an owner; \
          /unpair signal {STRANGER} removes them"
     );
-    wait(|| gw.chat.lock().unwrap().contains(&told)).await;
+    wait(20, || gw.chat.lock().unwrap().contains(&told)).await;
     let sent = gw.to("send", STRANGER);
     gw.shutdown().await;
     assert_eq!(sent.len(), 1, "the wrong code got no answer: {sent:?}");
@@ -357,7 +355,10 @@ async fn a_send_the_router_stopped_waiting_for_never_sends_a_piece_twice() {
         let signal = signal.clone();
         tokio::spawn(async move { signal.run(tx).await })
     };
-    wait(|| std::fs::read_to_string(d.join(".ok")).is_ok_and(|a| a == ACCOUNT)).await;
+    wait(20, || {
+        std::fs::read_to_string(d.join(".ok")).is_ok_and(|a| a == ACCOUNT)
+    })
+    .await;
     std::fs::write(d.join("slow_send"), "0.6").unwrap();
     let msg = Outbound {
         channel: "signal".into(),
@@ -432,7 +433,7 @@ async fn a_hold_stops_signal_cli_until_it_is_lifted_and_a_stale_one_is_ignored()
     );
     // A live one: signal-cli stops and lets the account go, and stays down.
     hold(&gw.d);
-    wait(|| !gw.d.join(".ok").exists()).await;
+    wait(20, || !gw.d.join(".ok").exists()).await;
     tokio::time::sleep(Duration::from_millis(6000)).await; // past its 5 s restart backoff
     assert_eq!(starts(), 1, "not started again while held");
     std::fs::remove_file(gw.d.join(".hold")).unwrap();
@@ -457,7 +458,7 @@ async fn a_hold_still_takes_what_signal_cli_handed_over() {
     let mut note = with_file(&gw, OWNER, 1700000000456, "", "v1.aac", b"aac-bytes");
     note["dataMessage"]["attachments"][0]["contentType"] = json!("audio/aac");
     gw.feed(note);
-    wait(|| home.join("voice/hang.pid").exists()).await;
+    wait(20, || home.join("voice/hang.pid").exists()).await;
     gw.feed(message(OWNER, 1700000000999, "after the note"));
     let fed = || {
         std::fs::metadata(gw.d.join("feed.jsonl"))
@@ -465,7 +466,10 @@ async fn a_hold_still_takes_what_signal_cli_handed_over() {
             .len()
             .to_string()
     };
-    wait(|| std::fs::read_to_string(gw.d.join("feed.offset")).is_ok_and(|o| o == fed())).await;
+    wait(20, || {
+        std::fs::read_to_string(gw.d.join("feed.offset")).is_ok_and(|o| o == fed())
+    })
+    .await;
     hold(&gw.d);
     let rows = || {
         let counts = Store::open(&home.join("state.db"))
@@ -477,7 +481,7 @@ async fn a_hold_still_takes_what_signal_cli_handed_over() {
             .map(|c| c.2)
             .sum::<i64>()
     };
-    wait(|| rows() == 2).await;
+    wait(20, || rows() == 2).await;
     assert_eq!(gw.log("start").len(), 1, "held, so not started again");
     gw.shutdown().await;
 }
@@ -497,7 +501,7 @@ async fn a_failed_write_still_takes_what_signal_cli_handed_over() {
     let mut note = with_file(&gw, OWNER, 1700000000456, "", "v1.aac", b"aac-bytes");
     note["dataMessage"]["attachments"][0]["contentType"] = json!("audio/aac");
     gw.feed(note);
-    wait(|| home.join("voice/hang.pid").exists()).await;
+    wait(20, || home.join("voice/hang.pid").exists()).await;
     gw.feed(message(OWNER, 1700000000999, "after the note"));
     let fed = || {
         std::fs::metadata(gw.d.join("feed.jsonl"))
@@ -505,9 +509,12 @@ async fn a_failed_write_still_takes_what_signal_cli_handed_over() {
             .len()
             .to_string()
     };
-    wait(|| std::fs::read_to_string(gw.d.join("feed.offset")).is_ok_and(|o| o == fed())).await;
+    wait(20, || {
+        std::fs::read_to_string(gw.d.join("feed.offset")).is_ok_and(|o| o == fed())
+    })
+    .await;
     std::fs::write(gw.d.join("close_stdin"), "").unwrap();
-    wait(|| !gw.log("stdin_closed").is_empty()).await;
+    wait(20, || !gw.log("stdin_closed").is_empty()).await;
     // A request to write: the trust of a new safety number.
     std::fs::write(gw.d.join(".trust"), OWNER).unwrap();
     let rows = || {
@@ -520,7 +527,7 @@ async fn a_failed_write_still_takes_what_signal_cli_handed_over() {
             .map(|c| c.2)
             .sum::<i64>()
     };
-    wait(|| rows() == 2).await;
+    wait(20, || rows() == 2).await;
     gw.shutdown().await;
 }
 
@@ -541,7 +548,7 @@ async fn a_hold_ends_even_when_signal_clis_output_stays_open() {
         .unwrap();
     hold(&d);
     // The 10 s drain, then the group's kill: `.ok` goes once the child is over.
-    wait(|| !d.join(".ok").exists()).await;
+    wait(20, || !d.join(".ok").exists()).await;
     let gone = || {
         let stat = std::fs::read_to_string(format!("/proc/{sleeper}/stat")).unwrap_or_default();
         stat.is_empty()
@@ -549,7 +556,7 @@ async fn a_hold_ends_even_when_signal_clis_output_stays_open() {
                 .trim_start()
                 .starts_with('Z')
     };
-    wait(gone).await;
+    wait(20, gone).await;
     std::fs::remove_file(d.join("stdout_child")).unwrap();
     std::fs::remove_file(d.join(".hold")).unwrap();
     gw.shutdown().await;
@@ -582,7 +589,7 @@ async fn a_reply_stops_typing_before_it_is_sent() {
         let signal = signal.clone();
         tokio::spawn(async move { signal.run(tx).await })
     };
-    wait(|| d.join(".ok").exists()).await;
+    wait(20, || d.join(".ok").exists()).await;
     let requests = || -> Vec<Value> {
         let log = std::fs::read_to_string(d.join("log.jsonl")).unwrap_or_default();
         (log.lines())
@@ -593,7 +600,7 @@ async fn a_reply_stops_typing_before_it_is_sent() {
             .collect()
     };
     signal.activity(OWNER, &Activity::Start).await.unwrap();
-    wait(|| !requests().is_empty()).await;
+    wait(20, || !requests().is_empty()).await;
     let msg = Outbound {
         channel: "signal".into(),
         recipient: OWNER.into(),
@@ -638,9 +645,9 @@ async fn a_send_during_a_hold_is_paused_not_failed() {
         let signal = signal.clone();
         tokio::spawn(async move { signal.run(tx).await })
     };
-    wait(|| d.join(".ok").exists()).await;
+    wait(20, || d.join(".ok").exists()).await;
     hold(&d);
-    wait(|| !d.join(".ok").exists()).await;
+    wait(20, || !d.join(".ok").exists()).await;
     let msg = Outbound {
         channel: "signal".into(),
         recipient: OWNER.into(),
@@ -655,7 +662,7 @@ async fn a_send_during_a_hold_is_paused_not_failed() {
         "{paused:#}"
     );
     std::fs::remove_file(d.join(".hold")).unwrap();
-    wait(|| d.join(".ok").exists()).await;
+    wait(20, || d.join(".ok").exists()).await;
     signal.send(&msg).await.unwrap();
     run.abort();
 }
@@ -724,7 +731,7 @@ async fn sync_messages_and_our_own_are_ignored() {
         gw.feed(m);
     }
     gw.feed(message(OWNER, 8, "real"));
-    wait(|| !gw.to("send", OWNER).is_empty()).await;
+    wait(20, || !gw.to("send", OWNER).is_empty()).await;
     assert_eq!(gw.prompts(), ["[signal #1] real"]);
     assert_eq!(gw.inbox("dropped"), 0);
     gw.shutdown().await;
@@ -743,7 +750,7 @@ async fn group_messages_are_ignored() {
     v2["dataMessage"]["groupV2"] = json!({"id": "def="});
     gw.feed(v2);
     gw.feed(message(OWNER, 3, "direct"));
-    wait(|| !gw.to("send", OWNER).is_empty()).await;
+    wait(20, || !gw.to("send", OWNER).is_empty()).await;
     assert_eq!(gw.prompts(), ["[signal #1] direct"]);
     gw.shutdown().await;
 }
@@ -754,12 +761,12 @@ async fn the_child_restarts_after_an_exit() {
     let gw = start(config(&home, None, &[OWNER]));
     gw.up().await;
     std::fs::write(gw.d.join("exit"), "").unwrap();
-    wait(|| !gw.d.join(".ok").exists()).await;
+    wait(20, || !gw.d.join(".ok").exists()).await;
     // Backed off 5 s, then started again.
-    wait(|| gw.log("start").len() == 2).await;
+    wait(20, || gw.log("start").len() == 2).await;
     gw.up().await;
     gw.feed(message(OWNER, 1, "still there?"));
-    wait(|| !gw.to("send", OWNER).is_empty()).await;
+    wait(20, || !gw.to("send", OWNER).is_empty()).await;
     gw.shutdown().await;
 }
 
@@ -771,13 +778,13 @@ async fn a_changed_safety_number_is_told_once() {
     std::fs::write(gw.d.join("untrusted"), "").unwrap();
     gw.feed(message(OWNER, 1, "new phone"));
     // The reply fails and the router keeps trying it.
-    wait(|| gw.to("send", OWNER).len() >= 3).await;
+    wait(20, || gw.to("send", OWNER).len() >= 3).await;
     let notice = format!(
         "[zephyr] the Signal safety number of {OWNER} changed; compare it, then run zephyr channel signal trust {OWNER}"
     );
     assert_eq!(*gw.chat.lock().unwrap(), [notice]);
     std::fs::write(gw.d.join(".trust"), OWNER).unwrap();
-    wait(|| !gw.requests("trust").is_empty()).await;
+    wait(20, || !gw.requests("trust").is_empty()).await;
     assert!(!gw.d.join(".trust").exists());
     assert_eq!(
         gw.requests("trust"),
@@ -785,7 +792,7 @@ async fn a_changed_safety_number_is_told_once() {
     );
     std::fs::remove_file(gw.d.join("untrusted")).unwrap();
     let store = Store::open(&home.join("state.db")).unwrap();
-    wait(|| {
+    wait(20, || {
         (store.counts().unwrap().iter()).any(|(t, s, n)| t == "outbox" && s == "sent" && *n >= 2)
     })
     .await;
@@ -855,7 +862,7 @@ async fn a_voice_note_is_heard_and_answered_aloud() {
         let sends = gw.to("send", OWNER);
         sends.iter().any(|s| s["attachments"].is_array())
     };
-    wait(|| spoken(&gw)).await;
+    wait(20, || spoken(&gw)).await;
 
     // Heard from signal-cli's own download, which is then removed.
     let decoded = voice_fakes::ran(&home, "ffmpeg");
