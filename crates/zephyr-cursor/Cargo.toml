@@ -18,7 +18,6 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
-futures-util.workspace = true
 base64 = "0.22"
 async-trait = "0.1"
 # Transport: Cursor's agent endpoint is Connect-over-HTTP/2 with a request body that streams while
