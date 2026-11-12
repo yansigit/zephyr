@@ -1116,11 +1116,7 @@ fn plain(line: &str) -> String {
     if clean.len() <= MAX_LINE {
         return clean.to_string();
     }
-    let mut cut = MAX_LINE;
-    while !clean.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}…", &clean[..cut])
+    format!("{}…", &clean[..clean.floor_char_boundary(MAX_LINE)])
 }
 
 /// A line of child output with every known secret, and every long run of one, taken out. Both the

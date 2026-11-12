@@ -1058,10 +1058,7 @@ impl<'a> Live<'a> {
             }
         }
         let all = format!("{} {sentence}", self.said);
-        let from = all.len().saturating_sub(TAIL);
-        let from = (from..=all.len())
-            .find(|i| all.is_char_boundary(*i))
-            .unwrap_or(0);
+        let from = all.ceil_char_boundary(all.len().saturating_sub(TAIL));
         self.said = all[from..].to_string();
         self.say("agent", sentence, false);
     }
@@ -1260,10 +1257,7 @@ impl<'a> Live<'a> {
             .collect();
         let mut transcript = transcript.join("\n");
         if transcript.len() > MAX_REPORT {
-            let cut = (0..=MAX_REPORT)
-                .rev()
-                .find(|i| transcript.is_char_boundary(*i));
-            transcript.truncate(cut.unwrap_or(0));
+            transcript.truncate(transcript.floor_char_boundary(MAX_REPORT));
             transcript.push_str("\n[cut]");
         }
         if transcript.is_empty() {

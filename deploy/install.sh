@@ -47,8 +47,8 @@ fi
 # The workspace's rust-version, and BuildKit, whose secrets `zephyr up --build` uses.
 source_checks() {
   if ! [[ $(cargo --version 2>/dev/null) =~ ^cargo\ ([0-9]+)\.([0-9]+) ]] ||
-    ! ((BASH_REMATCH[1] > 1 || (BASH_REMATCH[1] == 1 && BASH_REMATCH[2] >= 89))); then
-    die "--from-source needs cargo 1.89 or newer: https://rustup.rs"
+    ! ((BASH_REMATCH[1] > 1 || (BASH_REMATCH[1] == 1 && BASH_REMATCH[2] >= 91))); then
+    die "--from-source needs cargo 1.91 or newer: https://rustup.rs"
   fi
   docker buildx version >/dev/null 2>&1 ||
     die "--from-source needs docker buildx (zephyr up --build uses it): https://docs.docker.com/build/install-buildx/"
