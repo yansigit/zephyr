@@ -219,7 +219,10 @@ mod tests {
             attachment: None,
             reply_to: None,
         };
-        let sent = tokio::time::timeout(std::time::Duration::from_secs(5), chat.send(&msg)).await;
+        // Only a guard against a send that never returns: building and serialising the 4 MiB
+        // line alone takes 0.3 s in a debug build, and seconds on a loaded machine, before
+        // `WRITE_TIMEOUT` starts.
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(60), chat.send(&msg)).await;
         assert!(sent.expect("send returned").is_err(), "nothing was read");
         assert!(
             chat.conns.lock().await.is_empty(),
