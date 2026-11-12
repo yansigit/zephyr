@@ -234,6 +234,23 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   nowhere, and runs as the agent), and `watchdog` gives the desktop back after 10 min idle, 60 min
   or 60 s after the socket closed (hidden `Config::desktop_*`). `Router::desktop_changed` steers
   the take and hand-back notes into main, which do not taint.
+- `calls/` (DESIGN §4.26): phone calls. `mod.rs` is pure: `check` (Canadian local numbers only,
+  toll-free only with `calls.toll_free`, the CRTC's hours in the recipient's zones, `en`/`fr`/`ko`,
+  no emergency or healthcare call (`fold` first), the owner's contact details), the daemon's `opening`/`closing` lines, `said` (a reply's
+  sentences, `[press 1]`, `[hang up]`) and the energy `Endpointer`. `telnyx.rs` is the one
+  `Telephony`: Call Control from the daemon's own client (the key read per request from
+  `vault.toml`'s `[[service]]`, never in a child's env or `mcp.json`) and `verify` (ed25519 over
+  `timestamp|stream_url` or `timestamp|body`, 300 s, each signature once); what Telnyx's docs
+  leave open is marked `ASSUMPTION(live)`. `live.rs` is the listener (`calls.port`: only
+  `/calls/<token>` and `/calls/events`, only under the floor) and one task per call: the
+  `--no-tools` child `call-<id>`, the opening line at `call.answered`, speech by `calls.speech`
+  (`provider`, the default: Telnyx's `transcription_start` and `speak`, text only; `local`:
+  whisper in and Piper out through `voice::hear_call`/`say_call` over the media socket), each
+  sentence checked with `facts::found` as it will be spoken (`voice::speakable` first), the cap
+  absolute, the call's session file removed at its end, `call_lines`, and the report row `call-<id>` with `derived = 'call'`. The `call` tool is
+  main's alone and always held (`gate::Call::phone`, `ActionKind::Call`, schema v21); `/ok` starts
+  it through `actions::Ctx::calls`. `tests/fake-telnyx.py` is Telnyx and the funnel: keep its
+  frames and signatures in step with `telnyx.rs`.
 - `inbox.rs`: files the owner sends on Discord, iMessage, Telegram or Signal (DESIGN §4.3). The adapter saves them as
   the agent into `<home>/inbox/` before the row goes to the router and appends a
   `[attached image: <path> ...]` line per file to its text; owners come from the router's live

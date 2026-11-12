@@ -559,7 +559,7 @@ fn file(req: &Request<Incoming>, path: &str) -> Res {
 }
 
 /// What answers a WebSocket handshake (`Sec-WebSocket-Accept`); `None` when it is not one.
-fn accept_key(h: &HeaderMap) -> Option<HeaderValue> {
+pub(crate) fn accept_key(h: &HeaderMap) -> Option<HeaderValue> {
     let asks = |name: header::HeaderName, want: &str| {
         (h.get(name).and_then(|v| v.to_str().ok())).is_some_and(|v| {
             v.split(',')

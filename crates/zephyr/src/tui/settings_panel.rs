@@ -74,7 +74,7 @@ pub struct Proposal {
     pub id: i64,
     /// What `/ok` runs, in the daemon's words: for a held action, the whole card the chat got.
     pub card: String,
-    /// `setting` | `command`, or a held action's `run` | `pass` | `wait`.
+    /// `setting` | `command`, or a held action's `run` | `pass` | `wait` | `card` | `call`.
     pub kind: String,
     pub key: Option<String>,
     pub age_secs: i64,
@@ -98,7 +98,10 @@ pub struct Proposal {
 impl Proposal {
     /// A held message, post or payment, not a command or a setting.
     fn action(&self) -> bool {
-        matches!(self.kind.as_str(), "run" | "pass" | "wait")
+        matches!(
+            self.kind.as_str(),
+            "run" | "pass" | "wait" | "card" | "call"
+        )
     }
 
     /// An action waiting out its delay: `c` cancels it before it goes.
@@ -115,14 +118,19 @@ impl Proposal {
     /// Whether `1` sends `once`. A message or a post always does, whatever the list says: its
     /// class may have moved to ask-new since, and `ok` would then remember its recipients
     /// against the owner's choice. Only a payment or another call, where once never differs,
-    /// is approved as `o` approves it, so its audit row reads `approved`.
+    /// is approved as `o` approves it, so its audit row reads `approved`. So is a phone
+    /// call: its number is never remembered.
     fn sends_once(&self) -> bool {
-        let remembers = matches!(self.class.as_deref(), Some("messages" | "posts"));
+        let remembers =
+            matches!(self.class.as_deref(), Some("messages" | "posts")) && self.kind != "call";
         self.offers_once() || remembers
     }
 
     /// What a held action is, with its article: `a message`, `a payment`.
     fn what(&self) -> (&'static str, &'static str) {
+        if self.kind == "call" {
+            return ("a", "call");
+        }
         match self.class.as_deref() {
             Some("messages") => ("a", "message"),
             Some("posts") => ("a", "post"),
@@ -1962,6 +1970,25 @@ fn decisions(pr: &Proposal) -> Vec<(&'static str, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A card and a call are held actions like the rest; a call is named one and never sent as
+    /// `once`, whose remembering it does not have.
+    #[test]
+    fn a_card_and_a_call_are_actions_and_a_call_is_named_one() {
+        let held = |kind: &str, class: &str| Proposal {
+            kind: kind.into(),
+            class: Some(class.into()),
+            ..Proposal::default()
+        };
+        let card = held("card", "money");
+        assert!(card.action() && !card.offers_once() && !card.sends_once());
+        assert_eq!(card.what(), ("a", "payment"));
+        let call = held("call", "messages");
+        assert!(call.action() && !call.offers_once() && !call.sends_once());
+        assert_eq!(call.what(), ("a", "call"));
+        // A message sends once whatever the list said.
+        assert!(held("run", "messages").sends_once());
+    }
 
     #[test]
     fn wrap_breaks_at_spaces_and_cuts_only_what_cannot_fit() {

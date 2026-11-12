@@ -273,6 +273,21 @@ fn decide_paid(
             return (Verdict::Deny(why), None);
         }
     }
+    // A phone call that may not be placed is refused before anything is held (DESIGN §4.26):
+    // the number, the hours where it rings, the language, the owner's contact details.
+    if req.tool == "call" {
+        if let Err(why) = crate::calls::check(cfg, &req.args, cfg.calls_clock()) {
+            let scrub = Scrub::load(cfg);
+            audit_row(
+                store,
+                &req.session,
+                &req.tool,
+                &scrub.json(&req.args),
+                "denied",
+            );
+            return (Verdict::Deny(why), None);
+        }
+    }
     // A browser action's summary quotes the page's button, scrubbed before it is cut (D9).
     let early = req.browser.is_some().then(|| Scrub::load(cfg));
     let Some(call) = Call::of(cfg, req, early.as_ref()) else {
@@ -639,6 +654,9 @@ impl Call {
         if req.tool == "card" {
             return Call::card(cfg, req);
         }
+        if req.tool == "call" {
+            return Call::phone(cfg, req);
+        }
         let classes = |server: &str, tool: &str| connector_class(cfg, server, tool);
         let gated = policy::gated(&req.tool, &req.args, &classes);
         let (kind, text, targets, summary) = match req.tool.as_str() {
@@ -720,6 +738,33 @@ impl Call {
             class: class_key(Class::Money).into(),
             text: format!("{}\n{}", ask.merchant, ask.reason),
             targets: vec![ask.origin],
+            summary,
+            payload: req.args.to_string(),
+            secrets: Vec::new(),
+            audit: req.args.clone(),
+            unread: false,
+        })
+    }
+
+    /// A phone call (DESIGN §4.26): a message to one number, in the daemon's words. The facts
+    /// are looked for in what the agent wrote, the purpose and the business. `None` for a call
+    /// that may not be placed, which `decide` has refused already.
+    fn phone(cfg: &Config, req: &Request) -> Option<Call> {
+        let ask = crate::calls::check(cfg, &req.args, cfg.calls_clock()).ok()?;
+        let target = ask.number.target();
+        let summary = format!("phone call to {}", ask.number.shown());
+        Some(Call {
+            gated: Some(Gated {
+                class: Class::Messages,
+                targets: vec![target.clone()],
+                summary: summary.clone(),
+                amount: None,
+                replay: policy::Replay::Run,
+            }),
+            kind: ActionKind::Call,
+            class: class_key(Class::Messages).into(),
+            text: format!("{}\n{}", ask.purpose, ask.business.unwrap_or_default()),
+            targets: vec![target],
             summary,
             payload: req.args.to_string(),
             secrets: Vec::new(),
@@ -982,6 +1027,7 @@ fn stored_request(a: &Action) -> Option<Request> {
         }
         ActionKind::Pass => ("mcp_call", payload?, None),
         ActionKind::Card => ("card", payload?, None),
+        ActionKind::Call => ("call", payload?, None),
         ActionKind::Wait => {
             let payload = payload?;
             let b: Browser = serde_json::from_value(payload.get("browser")?.clone()).ok()?;
@@ -1058,6 +1104,22 @@ fn mode_of(e: &Effective, class: Class) -> Mode {
 /// where `/ok N once` differs from `/ok N`: it approves without remembering the targets.
 pub fn asks_new(e: &Effective, class: &str) -> bool {
     class_of(class).is_some_and(|c| mode_of(e, c) == Mode::AskNew)
+}
+
+/// Whether `/ok N once` differs from `/ok N` for `a`: its class asks only about new targets.
+/// Never for a phone call, whose number is never remembered. The card's footer and the
+/// attached clients' list both read it.
+pub fn offers_once(e: &Effective, a: &Action) -> bool {
+    asks_new(e, &a.class) && a.kind != ActionKind::Call
+}
+
+/// How long `a` waits for the owner: 10 min for a browser click or a card (the page and the
+/// checkout do not wait longer), a day for anything else. The store's expiry matches it.
+pub fn lifetime_secs(a: &Action) -> i64 {
+    match a.kind {
+        ActionKind::Wait | ActionKind::Card => 60 * i64::from(WAIT_MINUTES),
+        _ => 86_400,
+    }
 }
 
 fn class_key(class: Class) -> &'static str {
@@ -1236,6 +1298,9 @@ impl Gate<'_> {
             (Found::Unreadable, _) => Plan::Hold("fact-hold"),
             (Found::Names(_), _) if e.facts == FactsMode::Hold => Plan::Hold("fact-hold"),
             _ if call.unread => Plan::Hold("held"),
+            // What will be said is not known yet, so no mode, known target or grant covers a
+            // phone call: each one waits for the owner.
+            _ if call.kind == ActionKind::Call => Plan::Hold("held"),
             (_, None) => Plan::Allow(None),
             (_, Some(g)) => self.mode(&e, g)?,
         };
@@ -2257,6 +2322,7 @@ fn render(a: &Action, cfg: &Config, store: &Store, countdown: bool) -> String {
         ActionKind::Pass => pass_lines(a, class, &targets, &scrub),
         ActionKind::Wait => wait_lines(class, &targets, browser.as_ref(), &scrub),
         ActionKind::Card => card_lines(cfg, a, &scrub),
+        ActionKind::Call => call_lines(cfg, a, &scrub),
     });
     if e.facts != FactsMode::Off {
         match &scrub.facts {
@@ -2371,6 +2437,63 @@ fn window_usage(cfg: &Config, store: &Store, a: &Action) -> Option<String> {
     ))
 }
 
+/// A phone call's lines (DESIGN §4.26). The number, the province and the opening line are the
+/// daemon's, read again from the stored arguments; what the agent wrote is labelled as its
+/// own, quoted, scrubbed and cut.
+fn call_lines(cfg: &Config, a: &Action, scrub: &Scrub) -> Vec<String> {
+    let args: Value = serde_json::from_str(&a.payload).unwrap_or_default();
+    let field = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default();
+    let Ok(n) = crate::calls::number(field("number")) else {
+        return vec!["to: a number zephyr can no longer read; /ok will not place it".into()];
+    };
+    let quote = |text: &str| quoted_cut(&scrub.text(text), LINE_CHARS);
+    let (language, named) = match field("language") {
+        "ko" => ("ko", "Korean"),
+        "fr" => ("fr", "French"),
+        _ => ("en", "English"),
+    };
+    let ask = crate::calls::Ask {
+        number: n.clone(),
+        purpose: String::new(),
+        business: None,
+        language: language.into(),
+        kind: field("kind").into(),
+    };
+    let mut lines = vec![
+        format!(
+            "to: {} ({}, line type unknown) · up to {} min · in {}",
+            n.shown(),
+            n.province,
+            cfg.calls().max_minutes,
+            named
+        ),
+        format!(
+            "the call opens: \"{}\"",
+            quoted_cut(&crate::calls::opening(cfg, &ask, false), BODY_CHARS)
+        ),
+    ];
+    if !field("business").trim().is_empty() {
+        lines.push(format!(
+            "business (the agent's words): \"{}\"",
+            quote(field("business"))
+        ));
+    }
+    lines.push(format!(
+        "purpose (the agent's words): \"{}\"",
+        quote(field("purpose"))
+    ));
+    lines.push(
+        "not to an emergency line or a healthcare facility (CRTC ADAD rule 4(a)): your /ok \
+         confirms it"
+            .into(),
+    );
+    lines.push(format!(
+        "private facts are never said on it, unless you allow one: /facts allow NAME {}",
+        n.target()
+    ));
+    lines
+}
+
 /// Every gated stage's summary and every `outbound` label of `command`, once each (C1).
 fn all_it_sends(cfg: &Config, command: &str) -> String {
     let classes = |server: &str, tool: &str| connector_class(cfg, server, tool);
@@ -2387,6 +2510,9 @@ fn all_it_sends(cfg: &Config, command: &str) -> String {
 
 /// The card's first line after the id: `message (email)`, `payment (browser)`.
 fn what(class: Option<Class>, kind: ActionKind, browser: Option<&Browser>) -> String {
+    if kind == ActionKind::Call {
+        return "phone call".into();
+    }
     let noun = match class {
         Some(Class::Messages) => "message",
         Some(Class::Posts) => "post",
@@ -2405,6 +2531,7 @@ fn what(class: Option<Class>, kind: ActionKind, browser: Option<&Browser>) -> St
                 ActionKind::Wait if unread => "a click the gate could not read (browser)",
                 ActionKind::Wait => "click in the browser",
                 ActionKind::Card => "virtual card",
+                ActionKind::Call => "phone call",
             }
             .into();
         }
@@ -2416,6 +2543,7 @@ fn what(class: Option<Class>, kind: ActionKind, browser: Option<&Browser>) -> St
         (ActionKind::Pass, _) => "connector",
         (ActionKind::Wait, _) => "browser",
         (ActionKind::Card, _) => "virtual card",
+        (ActionKind::Call, _) => "phone",
     };
     format!("{noun} ({medium})")
 }
@@ -2430,6 +2558,11 @@ fn checked_text(a: &Action) -> String {
             Err(_) => a.payload.clone(),
         },
         ActionKind::Wait => browser_of(&a.payload).map_or_else(String::new, |b| b.typed.join("\n")),
+        ActionKind::Call => {
+            let args: Value = serde_json::from_str(&a.payload).unwrap_or_default();
+            let field = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default();
+            format!("{}\n{}", field("purpose"), field("business"))
+        }
     }
 }
 
@@ -2606,21 +2739,17 @@ fn footer(a: &Action, cfg: &Config, class: Option<Class>, countdown: bool, stron
     }
     // `once` approves without remembering the targets, which only `ask-new` does: elsewhere it
     // is `ok` (`/ok N once` is still taken), so the card offers it only there.
-    let once = match asks_new(&approvals::effective(cfg), &a.class) {
+    // Nor for a phone call, whose number is never remembered.
+    let once = match offers_once(&approvals::effective(cfg), a) {
         true => format!(" · /ok {id} once"),
         false => String::new(),
     };
-    // What is left of the 24 h (10 min for a browser wait), rounded up.
-    let now = crate::now();
-    let left = match a.kind {
-        ActionKind::Wait | ActionKind::Card => {
-            let s = (a.created_at + 60 * i64::from(WAIT_MINUTES) - now).max(60);
-            format!("{} min", (s + 59) / 60)
-        }
-        _ => {
-            let s = (a.created_at + 86_400 - now).max(3600);
-            format!("{} h", (s + 3599) / 3600)
-        }
+    // What is left of the 24 h (10 min for a browser wait or a card), rounded up.
+    let life = lifetime_secs(a);
+    let left = a.created_at + life - crate::now();
+    let left = match life < 3600 {
+        true => format!("{} min", (left.max(60) + 59) / 60),
+        false => format!("{} h", (left.max(3600) + 3599) / 3600),
     };
     let mut line = format!("/ok {id}{once} · /no {id}");
     if countdown {
@@ -2630,6 +2759,9 @@ fn footer(a: &Action, cfg: &Config, class: Option<Class>, countdown: bool, stron
     if (class == Some(Class::Money) && money_strong) || strong {
         let strong = cfg.settings.strong_channels.join(" or ");
         line += &format!(" · this one needs {strong}");
+    }
+    if a.kind == ActionKind::Call {
+        line += &format!(" · {}", crate::calls::HOURS);
     }
     line
 }
@@ -2880,6 +3012,144 @@ mod tests {
     fn action(store: &Store, id: i64) -> Action {
         let all = store.held_actions().unwrap();
         all.into_iter().find(|a| a.id == id).unwrap()
+    }
+
+    const CALLS: &str = "[calls]\nprovider = 'telnyx'\ncaller_name = 'Aiden Yoon'\n\
+                         contact_phone = '416-555-0199'\ncontact_email = 'aiden@example.com'\n";
+
+    /// A home where a call may be asked for: the settings, an English voice, a Tuesday noon.
+    fn phone_home(name: &str, extra: &str) -> Home {
+        let mut h = home(name, &format!("{CALLS}{extra}"));
+        h.cfg.voice_dir = h.dir.join("voice");
+        std::fs::create_dir_all(h.cfg.voice_dir.join("voices")).unwrap();
+        std::fs::write(h.cfg.voice_dir.join("voices/en_US-lessac-medium.onnx"), "").unwrap();
+        h.cfg.calls_now = Some(crate::calls::tests::noon());
+        h
+    }
+
+    fn phone(number: &str, purpose: &str) -> Request {
+        Request {
+            session: "main".into(),
+            call_id: Some("call-1".into()),
+            tool: "call".into(),
+            args: json!({ "number": number, "purpose": purpose, "business": "Pai Northern Thai", "kind": "booking" }),
+            browser: None,
+            run: "main:1".into(),
+            reason: Some(REASON.into()),
+        }
+    }
+
+    #[test]
+    fn a_call_is_held_whatever_the_mode() {
+        for approvals in [
+            "",
+            "[approvals]\nmessages = 'auto'\n",
+            "[approvals]\nmessages = 'delay 5'\n",
+            "[approvals]\nmessages = 'ask-new'\n",
+            "[approvals]\npreset = 'off'\n",
+        ] {
+            let h = phone_home("gate-call", approvals);
+            // Known already, as an approved mail's recipient would be: it changes nothing.
+            (h.store)
+                .remember_targets("messages", &["tel:+14165550123".into()])
+                .unwrap();
+            let req = phone("416-555-0123", "book a table for two at 19:00 on Friday");
+            let v = decide(&h.cfg, &h.store, &req, owner(), crate::now());
+            let Verdict::Hold { id, text } = v else {
+                panic!("{approvals}: {v:?}")
+            };
+            assert_eq!(
+                text,
+                format!(
+                    "held for the owner as #{id} (phone call to +1 416-555-0123); don't retry \
+                     it; carry on or end your turn"
+                )
+            );
+            let a = action(&h.store, id);
+            assert_eq!(
+                (a.kind, a.class.as_str(), a.status.as_str(), a.due_at),
+                (ActionKind::Call, "messages", "pending", None),
+                "{approvals}"
+            );
+            assert_eq!(a.targets, ["tel:+14165550123"]);
+            let card = &notices(&h.store)[0];
+            assert_eq!(
+                card,
+                &format!(
+                    "[zephyr] approve #{id}: phone call\n\
+                     to: +1 416-555-0123 (Ontario, line type unknown) · up to 5 min · in English\n\
+                     the call opens: \"Hello, this is an AI assistant calling on behalf of Aiden \
+                     Yoon to make a booking. This call is passed to Aiden Yoon as text. You can \
+                     reach Aiden Yoon at 416-555-0199 or aiden@example.com.\"\n\
+                     business (the agent's words): \"Pai Northern Thai\"\n\
+                     purpose (the agent's words): \"book a table for two at 19:00 on Friday\"\n\
+                     not to an emergency line or a healthcare facility (CRTC ADAD rule 4(a)): \
+                     your /ok confirms it\n\
+                     private facts are never said on it, unless you allow one: /facts allow NAME \
+                     tel:+14165550123\n\
+                     the agent says: \"{REASON}\"\n\
+                     /ok {id} · /no {id} · expires in 24 h · calls only 9:00–21:30 weekdays, \
+                     10:00–18:00 weekends their time"
+                ),
+                "{approvals}"
+            );
+            assert_eq!(outcomes(&h.store), ["held"]);
+        }
+    }
+
+    #[test]
+    fn a_refused_call_holds_nothing() {
+        let mut h = phone_home("gate-call-refused", "");
+        for (number, purpose, why) in [
+            ("911", "report a fire", "emergency or short code"),
+            ("+1 212 555 0123", "book a table", "not Canadian"),
+            ("+1 900 555 0123", "ask a question", "premium-rate"),
+            (
+                "416-555-0123",
+                "ask the clinic for my results",
+                "healthcare",
+            ),
+        ] {
+            let v = decide(
+                &h.cfg,
+                &h.store,
+                &phone(number, purpose),
+                owner(),
+                crate::now(),
+            );
+            let Verdict::Deny(text) = v else {
+                panic!("{number}: {v:?}")
+            };
+            assert!(
+                text.starts_with("not run: ") && text.contains(why),
+                "{text}"
+            );
+        }
+        // Out of hours where it rings: 21:45 on a Tuesday in Toronto.
+        h.cfg.calls_now = Some(crate::calls::tests::toronto("2026-11-10", "21:45"));
+        let late = decide(
+            &h.cfg,
+            &h.store,
+            &phone("416-555-0123", "book"),
+            owner(),
+            crate::now(),
+        );
+        assert!(matches!(late, Verdict::Deny(t) if t.contains("not after 21:30 their time")));
+        assert!(h.store.held_actions().unwrap().is_empty());
+        assert!(notices(&h.store).is_empty(), "no card for a refused call");
+        assert!(outcomes(&h.store).iter().all(|o| o == "denied"));
+        // A fact in what the agent wrote is named on the card, never shown.
+        h.cfg.calls_now = Some(crate::calls::tests::noon());
+        std::fs::write(
+            crate::facts::path(&h.cfg),
+            "[[fact]]\nname = \"card\"\nkind = \"digits\"\nvalue = \"4111111111111111\"\n",
+        )
+        .unwrap();
+        let req = phone("416-555-0123", "pay the deposit with 4111 1111 1111 1111");
+        let id = held(&decide(&h.cfg, &h.store, &req, owner(), crate::now()));
+        let card = notices(&h.store).pop().unwrap();
+        assert!(card.contains("contains your private fact card"), "{card}");
+        assert!(!card.contains("4111") && !action(&h.store, id).summary.contains("4111"));
     }
 
     #[test]
@@ -3194,6 +3464,7 @@ mod tests {
             procs: &procs,
             waits: &waits,
             steers: &steers,
+            calls: &crate::calls::live::Calls::idle(),
         };
         let now = crate::now();
         let send = |run: &str| {
@@ -4538,6 +4809,22 @@ mod tests {
     fn mail_request(session: &str) -> Value {
         json!({"v": 1, "session": session, "call_id": "c1", "tool": "bash",
                "args": {"command": mail_to("a@x.org", "hi")}})
+    }
+
+    /// Only main's `call` tool, answered in the router, asks for a phone call: a task, a job or
+    /// a script that writes the request to the socket itself gets nothing held.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_over_the_gate_socket_is_refused() {
+        let h = phone_home("gate-call-socket", "");
+        let (socket, _waits) = serving(&h).await;
+        let req = json!({
+            "v": 1, "session": "task-1", "call_id": "c1", "tool": "call",
+            "args": {"number": "416-555-0123", "purpose": "book a table"},
+        });
+        let answer = ask(&socket, &req).await.unwrap();
+        assert_eq!(answer["verdict"], "deny", "{answer}");
+        assert!(h.store.held_actions().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(crate::drafts::public_dir(&h.cfg));
     }
 
     #[tokio::test(flavor = "multi_thread")]

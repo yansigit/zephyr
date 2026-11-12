@@ -3615,6 +3615,87 @@ fn vault_add_list_and_rm_reach_roots_file_and_never_put_a_value_in_argv() {
         assert!(!output.contains(value), "{value} printed");
     }
 
+    // A provider's key for the daemon's own use (DESIGN §4.26): from the prompt, never argv.
+    const API_KEY: &str = "KEY0123456789telnyx";
+    let service = [
+        "vault",
+        "add",
+        "service",
+        "calls",
+        "--provider",
+        "telnyx",
+        "--account",
+        "1494404757140276705",
+        "--from",
+        "+14165550100",
+        "--public-key",
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    ];
+    let out = env.zephyr_input(&service, &format!("{API_KEY}\n"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let saved = std::fs::read_to_string(files.join("vault.toml")).unwrap();
+    assert!(saved.contains("[[service]]") && saved.contains(API_KEY));
+    let list = env.ok(&["vault", "list"]);
+    assert!(
+        list.contains("service calls: telnyx; a key is saved"),
+        "{list}"
+    );
+    let output = std::fs::read_to_string(env.dir.join("output.log")).unwrap();
+    assert!(!format!("{:?}", env.calls()).contains(API_KEY) && !output.contains(API_KEY));
+    assert!(!env
+        .zephyr_input(&["vault", "add", "service", "cards"], "k\n")
+        .status
+        .success());
+    // Rotating the key alone: no other flag, and the saved ids stay.
+    let rotated = "KEYrotated9876543210";
+    let out = env.zephyr_input(
+        &["vault", "add", "service", "calls"],
+        &format!("{rotated}\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let saved = std::fs::read_to_string(files.join("vault.toml")).unwrap();
+    assert!(
+        saved.contains(rotated) && !saved.contains(API_KEY),
+        "{saved}"
+    );
+    assert!(saved.contains("+14165550100") && saved.contains("1494404757140276705"));
+    // `rm` says what it removed, and never leaves a provider key behind while saying so. A
+    // login of the same name, from a hand-edited file, goes first; the service stays until it
+    // is named.
+    let both = format!(
+        "[[login]]\nname = \"calls\"\nsite = \"https://example.com\"\nusername = \"u\"\n\
+         password = \"p\"\n\n{saved}"
+    );
+    std::fs::write(files.join("vault.toml"), both).unwrap();
+    assert_eq!(
+        env.ok(&["vault", "rm", "calls"]).trim(),
+        "removed the login calls; the service calls is still saved: zephyr vault rm service \
+         calls removes it"
+    );
+    assert!(std::fs::read_to_string(files.join("vault.toml"))
+        .unwrap()
+        .contains(rotated));
+    assert_eq!(
+        env.ok(&["vault", "rm", "service", "calls"]).trim(),
+        "removed the service calls and its provider key"
+    );
+    assert!(!std::fs::read_to_string(files.join("vault.toml"))
+        .unwrap()
+        .contains(rotated));
+    assert!(!env
+        .zephyr(&["vault", "rm", "service", "calls"])
+        .status
+        .success());
+    assert!(!env.zephyr(&["vault", "rm", "calls"]).status.success());
+
     // A token's hosts are taken where the owner saves it (DESIGN §4.21), normalized; a wildcard
     // saves nothing; a new value keeps them.
     let add = [

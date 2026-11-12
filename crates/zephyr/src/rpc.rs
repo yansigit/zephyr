@@ -525,6 +525,11 @@ impl Child {
             cmd.args(["--exclude-tools", "bash"])
                 .env(zephyr_policy::tools::EXEC_ENV, "1");
         }
+        // A phone call's agent only speaks (DESIGN §4.26): no tool at all, and its standing
+        // instruction on top of AGENTS.md.
+        if session_id.is_some_and(zephyr_policy::tools::call_session) {
+            cmd.args(["--no-tools", "--append-system-prompt", crate::calls::PROMPT]);
+        }
         if let Some(model) = model {
             cmd.args(["--model", model]);
         }

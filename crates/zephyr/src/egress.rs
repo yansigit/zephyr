@@ -75,6 +75,10 @@ const LISTENERS: &[Listener] = &[
     }),
     // The web app (DESIGN §4.3.3): `tailscale serve` on the host forwards to this one.
     ("web.port", |c| c.web.as_ref().map(|w| w.port)),
+    // Telnyx's media connection and webhooks (DESIGN §4.26): the one listener the owner fronts
+    // with `tailscale funnel`, since Telnyx connects from the internet. It answers two paths,
+    // each only when Telnyx signed the request (`calls::live`).
+    ("calls.port", |c| c.calls().port),
 ];
 
 /// `[web] port` when the table names only its host.
@@ -2567,6 +2571,11 @@ mod tests {
         );
         let bare: Config = toml::from_str("rpi = '/r'\nhome = '/h'\n").unwrap();
         assert_eq!(published(&bare), []);
+        let calls: Config =
+            toml::from_str("rpi = '/r'\nhome = '/h'\n[calls]\nport = 7794\n").unwrap();
+        assert_eq!(published(&calls), [("calls.port", 7794)]);
+        let from = |key: &str| (key == "calls.port").then(|| "7794".to_string());
+        assert_eq!(published_from(from), [("calls.port", 7794)]);
     }
 
     #[test]

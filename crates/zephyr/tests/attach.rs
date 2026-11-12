@@ -1486,11 +1486,21 @@ async fn decide_applies_a_strong_proposal_that_a_weak_channel_cannot() {
 
 /// A connector call held for the owner, as the gate stores one (fixed, fake data).
 fn held_pass(store: &Store, class: &str, to: &str, due_at: Option<i64>) -> i64 {
-    use zephyr::store::{ActionKind, NewAction, Origin};
+    held_as(store, zephyr::store::ActionKind::Pass, class, to, due_at)
+}
+
+fn held_as(
+    store: &Store,
+    kind: zephyr::store::ActionKind,
+    class: &str,
+    to: &str,
+    due_at: Option<i64>,
+) -> i64 {
+    use zephyr::store::{NewAction, Origin};
     let args = json!({"server": "mail", "tool": "send", "arguments": {"to": to}});
     store
         .hold_action(&NewAction {
-            kind: ActionKind::Pass,
+            kind,
             class: class.into(),
             targets: vec![to.into()],
             summary: format!("mail/send to {to}"),
@@ -1571,6 +1581,47 @@ async fn proposals_carry_a_held_actions_card_and_once_skips_remembering() {
         "{ok}"
     );
     assert!(store.all_known("messages", &["a@x.org".into()]).unwrap());
+    gw.shutdown().await;
+}
+
+/// A held phone call never offers `once` (no number is remembered), as its card's footer
+/// says; a held card counts down its 10 minutes, as the footer and the expiry do.
+#[tokio::test]
+async fn proposals_give_a_call_no_once_and_a_card_its_ten_minutes() {
+    use zephyr::store::ActionKind;
+    let gw = start_with(
+        "held-call-card",
+        "[approvals]\npreset = \"semi\"\nstrong_only = [\"loosen\", \"money\"]\n",
+    );
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    let store = Store::open(&gw.home.join("state.db")).unwrap();
+    let message = held_pass(&store, "messages", "a@x.org", None);
+    let call = held_as(
+        &store,
+        ActionKind::Call,
+        "messages",
+        "tel:+14165550123",
+        None,
+    );
+    let card = held_as(
+        &store,
+        ActionKind::Card,
+        "money",
+        "https://shop.example.com",
+        None,
+    );
+    let got = c.call("zephyr.proposals", json!({})).await;
+    let list = got["result"]["proposals"].as_array().unwrap();
+    let find = |id: i64| list.iter().find(|p| p["id"] == id).unwrap();
+    assert_eq!(find(message)["once"], true, "{got}");
+    assert_eq!(find(call)["once"], false, "{got}");
+    let left = find(card)["expires_in_secs"].as_i64().unwrap();
+    assert!((1..=600).contains(&left), "{got}");
+    assert!(
+        find(call)["expires_in_secs"].as_i64().unwrap() > 80_000,
+        "{got}"
+    );
     gw.shutdown().await;
 }
 

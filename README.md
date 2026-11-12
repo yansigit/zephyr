@@ -157,6 +157,7 @@ wrong](#when-something-goes-wrong) and `zephyr uninstall [--keep-data]`.
 | `/set KEY VALUE [for DURATION]` | From any channel: change a setting, e.g. `/set tasks.parallel 4` or `/set budget.daily_cost_usd 10 for 1d` (`zephyr set KEY VALUE` does the same inside the container) |
 | `/approvals [manual\|semi\|full\|on\|off] [for D]`, `/approvals messages\|posts\|money\|facts MODE [for D]`, `/approvals forget N` | From any channel: what waits for you before the agent sends a message, posts or pays (see [Approvals and presets](#approvals-and-presets)). Alone it shows the modes in effect, `preset semi (modified) · messages ask-new · posts delay 5 · money ask · facts hold`; `off` is `full`, `on` is `manual`. Loosening is accepted only from a strong channel (`zephyr attach` or the chat socket, by default). `forget N` makes zephyr forget remembered recipient #N (`/activity grants` lists them), so under `ask-new` the next send to it waits for you again |
 | `/held` | The messages, posts and payments waiting for you or for their delay, newest first |
+| `/hangup [N]` | End the phone call in progress, at once |
 | `/activity [today\|6h\|7d] [KIND]` | Zephyr's own record of what ran, what left the machine, what waited and what was refused, newest first (the last 24 h unless a time is given, up to 90 d; at most 30 lines). KIND narrows it: `out`, `gate`, `refused`, `setting`, `proposal`, `job`, `task`, `process`, or `tool` for every tool call, which the bare list leaves out. `/activity grants` lists what still goes without asking (remembered recipients, time limits, turned-on jobs), each with the command that takes it back. Read from zephyr's tables, never written by the agent, and scrubbed of vault and fact values as it is read |
 | `/web` | The [web app](#web-app): its address, passkeys, sessions and push devices |
 | `/web enrol [NAME]` | From the terminal chat or `zephyr attach` only: a one-time code (10 minutes) that adds a passkey for a phone or laptop |
@@ -723,6 +724,54 @@ reads it as two lines under your caption, if you typed one:
   that read your audio get no network there. With `network = "host"` notes are saved but not
   transcribed, nothing is spoken, and `zephyr status` says so.
 - An image built with `--build-arg VOICE=0` has no voice: notes are saved as files only.
+
+## Phone calls
+
+The agent can ask zephyr to phone a Canadian business for you (book a table, ask a question). You
+approve every call; zephyr places it, tells the other party an AI is calling for you, and sends you
+what is said as it is said.
+
+- **Every call waits for you**, whatever your approvals preset. The card shows the number and its
+  province, the line the call opens with, and the agent's stated purpose; `/ok N` places it and
+  `/no N` drops it. Outside the calling hours where the number is (9:00 to 21:30 on weekdays,
+  10:00 to 18:00 on weekends, their time) `/ok` answers when it can go and the call keeps waiting.
+- **Only Canadian local and toll-free numbers.** Never an emergency or short code (911, 811, 988),
+  a 900 number, a US or Caribbean number, or anything the agent says is a hospital, clinic or
+  pharmacy: make those calls yourself. Toll-free numbers are refused too (they are shared with
+  the US and many are crisis or health lines) unless you turn them on yourself:
+  `/set calls.toll_free true` in the TUI or `zephyr chat`. Calls are in English, French or Korean.
+- **During the call** you get the transcript on the channel you asked on, a few lines at a time:
+  `[call #9 0:42] them: "Seven is full, we have seven thirty" · agent: "Seven thirty, please."`.
+  `/hangup` (or `/hangup 9`) ends it at once from any channel; so do `/stop` and `/pause`. A call
+  also ends by itself after `calls.max_minutes` (5 by default), after 20 seconds of silence, and
+  when the other side hangs up.
+- **Private facts are not said.** A sentence holding one of your private facts is replaced by
+  "That is something I can't share on this call", and you are told which fact. To let one be said
+  to a number: `/facts allow NAME tel:+14165550123`.
+- **Speech is Telnyx's by default** (`calls.speech = provider`): it transcribes the other party
+  and speaks zephyr's lines, quickly, and so hears the call. Every line still passes through
+  zephyr as text first. `/set calls.speech local` keeps speech on this machine (whisper and
+  Piper: English, Korean with `KO_VOICE=1`, no French), at several seconds a turn.
+- **Nothing is recorded.** zephyr keeps no audio and never asks Telnyx to record; only the text is
+  kept, for `calls.keep_days` (30). What the other party said is treated like a file someone sent
+  you: the agent reads it as data, and a memory change after a call waits for `/memory ok`.
+
+Setting it up, once:
+
+1. A [Telnyx](https://telnyx.com) account, a Canadian number on it, and a Voice API (Call
+   Control) application. In Telnyx's portal, forward the number's incoming calls to your own
+   phone, so the caller id the business sees reaches you.
+2. On the host: `zephyr vault add service calls --provider telnyx --account CONNECTION_ID --from
+   +1NUMBER --public-key KEY` (the application's connection id, your number, and the account's
+   public key from the portal's API keys page; the API key is asked for at a hidden prompt).
+   To change one of them later, give only that flag; `zephyr vault add service calls` with none
+   changes the key alone.
+3. Telnyx connects to zephyr from the internet, so one port must be reachable: `zephyr config set
+   calls.port 7794`, front it on the host with `sudo tailscale funnel --bg 7794` (or your own
+   HTTPS front), and `zephyr config set calls.media_url wss://YOUR-HOST.ts.net`. That port answers only Telnyx's signed requests.
+4. `/set calls.provider telnyx`, `/set calls.caller_name Your Name`, `/set calls.contact_phone
+   416-555-0199` and `/set calls.contact_email you@example.com` (or `calls.contact_address`):
+   every business hears them in the opening line. `zephyr doctor` lists what is still missing.
 
 ## Signal
 

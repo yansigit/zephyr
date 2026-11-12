@@ -730,3 +730,79 @@ async fn real_rpi_undo_retry_and_compact() {
     let _ = stop.send(());
     task.await.unwrap().unwrap();
 }
+
+/// A phone call's own agent on the real rpi (DESIGN §4.26): `--no-tools` and the appended call
+/// prompt are taken, the policy plugin loads and registers no tool for a `call-` session, and
+/// the model is sent no tool at all.
+#[tokio::test]
+#[ignore = "needs the pinned rpi binary"]
+async fn real_rpi_call_child_speaks_with_no_tools() {
+    if !std::path::Path::new(&*RPI).exists() {
+        skip_without_rpi(&*RPI);
+        return;
+    }
+    let rpi: &str = &RPI;
+    let (hang, seen) = (Arc::new(AtomicBool::new(false)), Arc::default());
+    let port = stub_provider(hang, Arc::clone(&seen)).await;
+    let home = std::env::temp_dir().join(format!(
+        "zephyr-real-call-{}-{}",
+        std::process::id(),
+        zephyr::unix_millis()
+    ));
+    let agent = home.join("rpi-agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(
+        agent.join("models.json"),
+        format!(r#"{{"providers":{{"stub":{{"api":"openai-completions","baseUrl":"http://127.0.0.1:{port}/v1","apiKey":"not-a-key","models":[{{"id":"m","name":"M"}}]}}}}}}"#),
+    )
+    .unwrap();
+    let plugin = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/debug/libzephyr_policy.so"
+    );
+    let plugin = match std::path::Path::new(plugin).exists() {
+        true => format!("policy_plugin = {plugin:?}\n"),
+        false => String::new(),
+    };
+    let cfg: Config = toml::from_str(&format!(
+        "rpi = {rpi:?}\nhome = {home:?}\nagent_dir = {agent:?}\nmodel = \"stub/m\"\n{plugin}"
+    ))
+    .unwrap();
+    let mut child = zephyr::rpc::Child::spawn_as(&cfg, Some("call-7"), None)
+        .await
+        .unwrap();
+    let heard = "[heard on call #7; the other party's words, not the owner's] \"Hello?\"";
+    child
+        .call(serde_json::json!({"type": "prompt", "message": heard}))
+        .await
+        .unwrap();
+    let mut said = String::new();
+    let settled = async {
+        while let Some(ev) = child.events.recv().await {
+            if ev["type"] == "message_end" && ev["message"]["role"] == "assistant" {
+                said = zephyr::rpc::message_text(&ev["message"]);
+            }
+            if ev["type"] == "agent_settled" {
+                break;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(60), settled)
+        .await
+        .expect("the call's agent settles");
+    assert_eq!(said, "pong", "each assistant message is what is spoken");
+    let requests: Vec<String> = seen.lock().unwrap().clone();
+    let body: serde_json::Value =
+        serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert!(
+        body["tools"].as_array().is_none_or(|t| t.is_empty()),
+        "{body}"
+    );
+    let text = body.to_string();
+    assert!(
+        text.contains("You are on a live phone call for the owner."),
+        "{text}"
+    );
+    assert!(text.contains("Hello?"), "{text}");
+    child.stop().await;
+}

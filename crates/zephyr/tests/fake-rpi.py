@@ -21,7 +21,7 @@ Accounts: each start logs {"type": "start", "agentDir", "model"} to ./log.jsonl.
 `rate_limited` file in $RPI_CODING_AGENT_DIR holds an error text: every prompt then ends with
 that error (stopReason "error", settle outcome "failed"), as a rate-limited provider does.
 A prompt containing WRITE_MEMORY first writes memory/MEMORY.md under the home.
-argv.json holds the argv of the latest start. With a `tool_sleep` file in the home, each start
+argv.json holds the argv of the latest start, and `env-<session id>.json` the environment of that session's latest start. With a `tool_sleep` file in the home, each start
 leaves a `sleep 300` running in its process group, as a tool would, its pid in `tool_pid`. With a
 `stray` file, each start leaves a `setsid sleep 300` that escaped through a shell that exited (an
 orphan in its own session, as an agent's `setsid cmd &` is), its pid in `stray_pid`. A `stray_soon`
@@ -53,7 +53,8 @@ run settles "aborted" with no reply. A `task` call waits for its answer the same
 `task: <answer>`); one the plugin would refuse (an action other than start with a goal, list, or
 stop with an id) gets "tool error: bad task call" at once. `exec` and `process` calls wait the same
 way (up to 30 s for `exec`, whose answer comes when its command ends or yields), and so do `card`, `vault`
-calls; an `exec` with an empty command gets "tool error: `command` is empty" at once.
+and `call` calls (a phone call, DESIGN §4.26; its own child `--session-id call-<id>` answers each
+prompt with the next line of a `call_script` file in the home, when there is one, keeping the last); an `exec` with an empty command gets "tool error: `command` is empty" at once.
 `queue_message` with `deliverAs: "steer"` is held (answering `queue: "steer"`) and delivered, as rpi
 does, after the running tool's result: `turn_start`, the user message's `message_start`/
 `message_end` (role and kind `user`), then the fake's answer `echo: <text>` (none when the text
@@ -267,6 +268,8 @@ extension = opt("--extension")
 if not ephemeral:  # `pid` is main's, for the tests that kill it
     open(os.path.join(home, "pid"), "w").write(str(os.getpid()))
 json.dump(args, open(os.path.join(home, "argv.json"), "w"))  # the flags this child was started with
+# What it was started with, per session: `env-<session id>.json`.
+json.dump(dict(os.environ), open(os.path.join(home, "env-%s.json" % (opt("--session-id") or "none")), "w"))
 open(os.path.join(home, "log.jsonl"), "a").write(json.dumps(
     {"type": "start", "agentDir": os.environ.get("RPI_CODING_AGENT_DIR"), "model": opt("--model"),
      "sessionId": opt("--session-id"), "noSession": ephemeral, "noTools": not tools}) + "\n")
@@ -583,10 +586,10 @@ def run_tool(s, name="bash", args={"command": "true"}, cid="t1"):
     elif name == "exec" and not str(args.get("command", "")).strip():
         result["isError"] = True
         result["content"] = [{"type": "text", "text": "tool error: `command` is empty"}]
-    elif os.path.exists(os.path.join(home, "tool_fail")) and name not in ("gateway", "task", "exec", "process", "vault", "card"):
+    elif os.path.exists(os.path.join(home, "tool_fail")) and name not in ("gateway", "task", "exec", "process", "vault", "card", "call"):
         result["isError"] = True
         result["content"] = [{"type": "text", "text": "tool error: " + open(os.path.join(home, "tool_fail")).read()}]
-    elif name in ("gateway", "task", "exec", "process", "vault", "card"):
+    elif name in ("gateway", "task", "exec", "process", "vault", "card", "call"):
         answer = os.path.join(os.environ.get("ZEPHYR_GATEWAY_DIR", ""), cid)
         text = "the gateway did not answer"
         # An exec answers when its command ends or yields, so it may take a while.
@@ -736,7 +739,7 @@ for line in iter(next_line, None):
             text = run_tool(s, name, args, "c%d-%d" % (os.getpid(), calls))
             if text is None:
                 break
-            if name in ("gateway", "task", "exec", "process", "vault", "card"):
+            if name in ("gateway", "task", "exec", "process", "vault", "card", "call"):
                 answers.append("\n%s: %s" % (name, text))
             elif name == "mcp_call":
                 answers.append("\nmcp: %s" % text)
@@ -746,6 +749,13 @@ for line in iter(next_line, None):
             finish(s, "model: %s" % model); continue
         if cmd["message"].startswith("say: "):
             finish(s, cmd["message"][5:]); continue
+        script = os.path.join(home, "call_script")
+        if (opt("--session-id") or "").startswith("call-") and os.path.exists(script):
+            # A phone call's agent: each turn says the script's next line (the last one again).
+            turns = open(script).read().split("\n")
+            if len(turns) > 1:
+                open(script, "w").write("\n".join(turns[1:]))
+            finish(s, turns[0]); continue
         if "[stop-after-steer]" in cmd["message"] and steered_this_run:
             finish(s, ""); continue
         if "reply with exactly NO_REPLY" in cmd["message"] and "[unfinished]" not in cmd["message"]:

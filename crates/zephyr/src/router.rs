@@ -343,6 +343,8 @@ pub async fn run<C: Channel>(
         c.acks(router.acks.clone());
     }
     let waits = router.waits.clone();
+    let calls = router.calls.clone();
+    let call_starts = router.call_starts.take().expect("taken once, here");
     let runs = futures_util::future::try_join_all(channels.iter().map(|c| c.run(tx.clone())));
     tokio::select! {
         r = runs => r.map(|_| Exit::Shutdown),
@@ -353,6 +355,8 @@ pub async fn run<C: Channel>(
         r = crate::attach::serve(cfg, handles.clone()) => r.map(|()| Exit::Shutdown),
         r = crate::web::serve(cfg, handles, hub) => r.map(|()| Exit::Shutdown),
         r = crate::scheduler::run(cfg_rx.clone(), &jobs) => r.map(|()| Exit::Shutdown),
+        // Telnyx's listener and the calls in progress (DESIGN §4.26).
+        r = crate::calls::live::run(cfg_rx.clone(), &jobs, calls, call_starts) => r.map(|()| Exit::Shutdown),
         r = crate::tasks::run(cfg_rx, &jobs) => r.map(|()| Exit::Shutdown),
         r = show_activity(channels, activity_rx, cfg.tick) => r.map(|()| Exit::Shutdown),
         r = router.main(rx, channels, shutdown) => r,
@@ -546,6 +550,9 @@ struct Router<'a> {
     procs: crate::procs::Procs,
     /// Browser actions waiting in place for the owner's answer (approvals spec §4.4).
     waits: crate::actions::Waits,
+    /// The phone calls in progress (DESIGN §4.26), and the starts `calls::live::run` takes.
+    calls: crate::calls::live::Calls,
+    call_starts: Option<mpsc::UnboundedReceiver<crate::calls::live::Start>>,
     /// Who holds the desktop: the owner's takeover, or the vault's fill (DESIGN §4.11).
     desktop: Arc<crate::desktop::Control>,
     /// `desktop`'s takes and hand backs, each once and in order.
@@ -670,6 +677,7 @@ impl<'a> Router<'a> {
     ) -> anyhow::Result<Self> {
         let shared = cfg_tx.borrow().clone();
         let desktop = crate::desktop::Control::new(cfg);
+        let (calls, call_starts) = crate::calls::live::Calls::new();
         Ok(Router {
             cfg: shared,
             edits: edits(cfg),
@@ -725,6 +733,8 @@ impl<'a> Router<'a> {
             stopping: false,
             procs: Default::default(),
             waits: Default::default(),
+            calls,
+            call_starts: Some(call_starts),
             desktop_events: desktop.events(),
             desktop_note: None,
             desktop,
@@ -848,7 +858,9 @@ impl<'a> Router<'a> {
             self.flush(channels).await;
             self.publish();
             // Tasks are not waited for: they resume after the re-exec (DESIGN §4.12).
-            let background = self.jobs.running.load(Ordering::SeqCst);
+            // Nor under a phone call: its line would go dead mid-sentence (DESIGN §4.26).
+            let background =
+                self.jobs.running.load(Ordering::SeqCst) || !self.calls.live().is_empty();
             if self.reexec && !self.busy && self.btw.is_none() && !background {
                 eprintln!("zephyr: restarting itself to apply the new settings");
                 exit = Exit::Reexec;
@@ -962,6 +974,13 @@ impl<'a> Router<'a> {
                     crate::cards::agent(&self.cfg, &self.store, id, action, req, to, &self.desktop);
                 }
             }
+            if let Some((id, args)) = crate::procs::call(ev, "call") {
+                // Main only, like the vault; a call the plugin refused waits for nothing.
+                if zephyr_policy::tools::call_action(args).is_ok() {
+                    let text = self.phone(id, args);
+                    crate::tools::answer_gateway(&self.cfg, id, &text);
+                }
+            }
             if let Some((id, args)) = crate::procs::call(ev, "process") {
                 if let Ok(action) = zephyr_policy::tools::process_action(args) {
                     let text = self.procs.reply(&self.cfg, &self.store, action);
@@ -1036,6 +1055,33 @@ impl<'a> Router<'a> {
         }
     }
 
+    /// Main's `call` call `id` (DESIGN §4.26): the gate refuses it or holds it for the owner,
+    /// and sends the card. What the agent is told either way.
+    fn phone(&self, id: &str, args: &Value) -> String {
+        use crate::gate::Verdict;
+        let Some(to) = self.origin() else {
+            return "no owner; not run".into();
+        };
+        let session = self.child.as_ref().and_then(|c| c.session.clone());
+        let since = self.snap.borrow().run.since_unix_ms.unwrap_or_default();
+        let req = crate::gate::Request {
+            session: session.unwrap_or_default(),
+            call_id: Some(id.into()),
+            tool: "call".into(),
+            args: args.clone(),
+            browser: None,
+            run: format!("main:{since}"),
+            reason: Some(self.last_say.clone()).filter(|r| !r.trim().is_empty()),
+        };
+        match crate::gate::decide(&self.cfg, &self.store, &req, to, crate::now()) {
+            Verdict::Hold { text, .. } | Verdict::Deny(text) => text,
+            // A phone call is never let through, and never waits in place.
+            Verdict::Allow | Verdict::Wait { .. } => {
+                "not run: every call waits for the owner".into()
+            }
+        }
+    }
+
     /// What the held actions' lifecycle needs from the router (`crate::actions`).
     fn actions(&self) -> crate::actions::Ctx<'_> {
         crate::actions::Ctx {
@@ -1044,6 +1090,7 @@ impl<'a> Router<'a> {
             procs: &self.procs,
             waits: &self.waits,
             steers: &self.jobs.steers,
+            calls: &self.calls,
         }
     }
 
@@ -1429,7 +1476,10 @@ impl<'a> Router<'a> {
                     .unwrap_or_default()
                     .to_string(),
             };
-            let quick = matches!(class, Some("messages" | "posts")) && p["strong"] == false;
+            // As the push's button checks it (`web::push`): never a phone call or a card.
+            let quick = matches!(p["kind"].as_str(), Some("run" | "pass" | "wait"))
+                && matches!(class, Some("messages" | "posts"))
+                && p["strong"] == false;
             let card = crate::web::push::card(id, &body, quick);
             crate::web::push::spawn(self.cfg_tx.borrow().clone(), card, "high", 86_400);
         }
@@ -1783,17 +1833,16 @@ impl<'a> Router<'a> {
             .then(|| self.store.action(p.id).ok().flatten())
             .flatten();
         if let Some(a) = action {
-            // A browser action waits 10 minutes, not a day (spec §4.6).
-            if a.kind == crate::store::ActionKind::Wait {
-                let wait = 60 * i64::from(crate::gate::WAIT_MINUTES);
-                v["expires_in_secs"] = json!((a.created_at + wait - now).max(0));
-            }
+            // A browser action or a card waits 10 minutes, not a day (spec §4.6), as its card's
+            // footer says.
+            let life = crate::gate::lifetime_secs(&a);
+            v["expires_in_secs"] = json!((a.created_at + life - now).max(0));
             v["card"] = json!(crate::gate::card(&a, &self.cfg, &self.store));
             v["signed"] = json!(crate::gate::signed_card(&a, &self.cfg, &self.store));
             // R70: the summary as the private facts are now.
             v["summary"] = json!(crate::facts::scrubbed(&self.cfg, a.summary.clone()));
             v["strong"] = json!(a.class == "money" && *money_strong);
-            v["once"] = json!(crate::gate::asks_new(e, &a.class));
+            v["once"] = json!(crate::gate::offers_once(e, &a));
             v["class"] = json!(a.class);
         }
         // A command's or a setting's card is the stored command, and so is what is signed:
@@ -2274,6 +2323,7 @@ impl<'a> Router<'a> {
                 }
                 self.procs.stop_all();
                 crate::cards::close_all(&self.cfg, &self.store, "the gateway was paused");
+                self.calls.hangup_all("the owner (/pause)");
                 "[zephyr] paused: messages wait in the inbox until /resume"
             }
             "/resume" => {
@@ -2295,6 +2345,8 @@ impl<'a> Router<'a> {
                 crate::actions::stop(&self.cfg, &self.store, &self.waits);
                 // Every card still open is closed at its issuer (DESIGN §4.25).
                 crate::cards::close_all(&self.cfg, &self.store, "the owner's /stop");
+                // A call in progress is hung up at once.
+                self.calls.hangup_all("the owner (/stop)");
                 "[zephyr] stopped"
             }
         };
@@ -2798,6 +2850,8 @@ impl<'a> Router<'a> {
             ("/unpair", arg) => self.unpair(arg).await,
             // Held messages, posts and payments (approvals spec §4.6).
             ("/held", "") => crate::actions::held(&self.cfg, &self.store),
+            // Ends a phone call (DESIGN §4.26). It only tightens, so any owner channel may.
+            ("/hangup", n) => self.calls.hangup(n),
             // The daemon's own record (DESIGN §4.19), answered outside the queue.
             ("/activity", arg) => crate::activity::chat(&self.cfg, &self.store, arg, crate::now()),
             ("/cancel", n) => {
@@ -5178,6 +5232,9 @@ impl<'a> Router<'a> {
     async fn drain<C: Channel>(&mut self, channels: &[C], rx: &mut mpsc::Receiver<Inbound>) {
         self.stopping = true;
         let deadline = Instant::now() + Duration::from_secs(20);
+        // A call in progress is closed, not dropped: its closing line, then the hang-up at
+        // the provider, while the turn below settles.
+        self.calls.stop_all();
         while self.busy {
             match tokio::time::timeout_at(deadline, next_event(&mut self.child)).await {
                 // As in `main`, so the run's spend and outbound list are booked.
@@ -5188,6 +5245,8 @@ impl<'a> Router<'a> {
                 _ => break, // child gone or out of time: recovery picks it up next start
             }
         }
+        let left = deadline.saturating_duration_since(Instant::now());
+        self.calls.drained(left.max(Duration::from_secs(5))).await;
         if self.busy {
             // Cut off: book what the run did so far.
             let main = crate::rpc::Tally::main(&self.cfg.home);
@@ -5567,6 +5626,7 @@ fn daemon_row(platform_id: &str) -> String {
         Some(("task", n)) => format!("took in task #{n}'s report"),
         Some(("proc", n)) => format!("took in process #{n}'s report"),
         Some(("action", n)) => format!("took in action #{n}'s result"),
+        Some(("call", n)) => format!("took in phone call #{n}'s transcript"),
         _ => "took in a message zephyr wrote".into(),
     }
 }

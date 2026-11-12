@@ -196,7 +196,7 @@ impl Entry {
     }
 }
 
-/// A provider's credentials (DESIGN §4.25): a `[[service]]` table. Never a token: it has no
+/// A provider's credentials (DESIGN §4.25, §4.26): a `[[service]]` table. Never a token: it has no
 /// programs, no hosts and no surrogate, and only the daemon's own client reads it. `Debug`
 /// shows the key's length.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -206,8 +206,13 @@ pub struct Service {
     pub provider: String,
     /// The API secret; empty when the provider has none (Link's tokens are its own file).
     pub key: String,
-    /// A provider's own id: a Link client id, a telephony connection id.
+    /// A provider's own id: a Link client id, a Telnyx Call Control connection.
     pub account: String,
+    /// The caller id the provider assigned, `+1…` (calls).
+    pub from: String,
+    /// The key the provider signs its webhooks and media connections with (Telnyx: the
+    /// account's ed25519 public key, base64).
+    pub public_key: String,
 }
 
 /// The services a vault may hold, one of each.
@@ -220,7 +225,8 @@ impl std::fmt::Debug for Service {
             .field("provider", &self.provider)
             .field("key", &self.key.len())
             .field("account", &self.account)
-            .finish()
+            .field("from", &self.from)
+            .finish_non_exhaustive()
     }
 }
 
@@ -233,13 +239,62 @@ impl Service {
         if self.provider.is_empty() || !login_name(&self.provider) {
             bail!("service {}: the provider is a lowercase name", self.name);
         }
-        if !plain(&self.key) || !plain(&self.account) {
-            bail!(
-                "service {}: the key and the account take no spaces",
-                self.name
-            );
+        let values = [&self.key, &self.account, &self.from, &self.public_key];
+        if !values.iter().all(|v| plain(v)) {
+            bail!("service {}: its values take no spaces", self.name);
         }
         Ok(())
+    }
+
+    /// What the service's provider needs, checked where the owner saves it and again where
+    /// the daemon's client reads it, so neither takes what the other would not (DESIGN §4.25,
+    /// §4.26). Each refusal says why.
+    pub fn usable(&self) -> Result<(), String> {
+        let name = self.name.as_str();
+        let provider = match name {
+            "cards" => "link",
+            "calls" => "telnyx",
+            _ => return Err(format!("a service is named {}", SERVICES.join(" or "))),
+        };
+        if self.provider != provider {
+            return Err(format!("the {name} service's provider is {provider}"));
+        }
+        if name == "cards" {
+            return match self.from.is_empty() && self.public_key.is_empty() {
+                true => Ok(()),
+                false => {
+                    Err("service cards: --from and --public-key are the calls service's".into())
+                }
+            };
+        }
+        if self.key.is_empty() || self.account.is_empty() {
+            return Err(
+                "service calls: Telnyx needs its API key and --account (the Call \
+                        Control connection id)"
+                    .into(),
+            );
+        }
+        let e164 = self.from.strip_prefix('+').is_some_and(|d| {
+            (2..=15).contains(&d.len())
+                && !d.starts_with('0')
+                && d.bytes().all(|b| b.is_ascii_digit())
+        });
+        if !e164 {
+            return Err(
+                "service calls: --from is + and the number's digits (E.164), e.g. \
+                        +14165550100"
+                    .into(),
+            );
+        }
+        use base64::Engine;
+        match base64::engine::general_purpose::STANDARD.decode(&self.public_key) {
+            Err(_) => Err("service calls: --public-key is not base64; copy it from Telnyx's portal".into()),
+            Ok(k) if k.len() != 32 => Err(format!(
+                "service calls: --public-key is {} bytes; Telnyx's ed25519 public key is 32, in base64",
+                k.len()
+            )),
+            Ok(_) => Ok(()),
+        }
     }
 
     /// One line for `/vault` and `zephyr vault list`: never the key.
@@ -385,6 +440,8 @@ impl Vault {
                 provider: s(t, "provider"),
                 key: s(t, "key"),
                 account: s(t, "account"),
+                from: s(t, "from"),
+                public_key: s(t, "public_key"),
             })
             .collect()
     }
@@ -393,16 +450,27 @@ impl Vault {
         self.services().into_iter().find(|s| s.name == name)
     }
 
-    /// Adds or replaces the service of that name; an empty key keeps the one saved for the
-    /// same provider. Returns whether it is new.
+    /// Adds or replaces the service of that name. A field left empty keeps the one saved for
+    /// the same provider (an empty provider is the saved one's), so the owner can change one
+    /// field, the key alone among them. Returns whether it is new.
     pub fn put_service(&mut self, mut new: Service) -> anyhow::Result<bool> {
         let old = self.service(&new.name);
-        if let Some(old) = old.as_ref().filter(|o| o.provider == new.provider) {
-            if new.key.is_empty() {
-                new.key.clone_from(&old.key);
+        let same = |o: &&Service| new.provider.is_empty() || o.provider == new.provider;
+        if let Some(old) = old.as_ref().filter(same) {
+            for (field, saved) in [
+                (&mut new.provider, &old.provider),
+                (&mut new.key, &old.key),
+                (&mut new.account, &old.account),
+                (&mut new.from, &old.from),
+                (&mut new.public_key, &old.public_key),
+            ] {
+                if field.is_empty() {
+                    field.clone_from(saved);
+                }
             }
         }
         new.check()?;
+        new.usable().map_err(anyhow::Error::msg)?;
         let list = self
             .doc
             .entry("service")
@@ -415,6 +483,11 @@ impl Vault {
         set(&mut t, "provider", &new.provider);
         set(&mut t, "key", &new.key);
         set(&mut t, "account", &new.account);
+        for (key, value) in [("from", &new.from), ("public_key", &new.public_key)] {
+            if !value.is_empty() {
+                set(&mut t, key, value);
+            }
+        }
         list.push(t);
         Ok(old.is_none())
     }
@@ -445,6 +518,10 @@ impl Vault {
     /// one saved. Grants are never set here, only kept: a login's survives while its site stays
     /// the same, a token's always. Returns whether the entry is new.
     pub fn put(&mut self, mut new: Entry) -> anyhow::Result<bool> {
+        // One name, one thing: `rm` and `/vault` never have to guess (DESIGN §4.25).
+        if SERVICES.contains(&new.name.as_str()) {
+            bail!("{} is a service's name; pick another", new.name);
+        }
         let old = self.get(&new.name);
         match &old {
             Some(old) if old.kind != new.kind => {
@@ -1714,7 +1791,7 @@ async fn browser_with(cfg: &Config, args: &[&str], input: Option<&[u8]>) -> Resu
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const SAMPLE: &str = r#"# my logins
@@ -1731,6 +1808,184 @@ name = "GH_TOKEN"
 value = "ghp_secret123"
 programs = ["gh"]
 "#;
+
+    #[test]
+    fn a_calls_service_keeps_telnyx_ids_and_is_never_a_token() {
+        const KEY: &str = "KEY0123456789telnyx";
+        let mut v = Vault::parse(SAMPLE).unwrap();
+        assert_eq!(v.service("calls"), None);
+        let service = Service {
+            name: "calls".into(),
+            provider: "telnyx".into(),
+            key: KEY.into(),
+            account: "1494".into(),
+            from: "+14165550100".into(),
+            public_key: TEST_PUBLIC_KEY.into(),
+        };
+        v.put_service(service.clone()).unwrap();
+        // A call needs each of Telnyx's ids.
+        for bad in [
+            Service {
+                provider: "link".into(),
+                ..service.clone()
+            },
+            Service {
+                public_key: "cHVi".into(),
+                ..service.clone()
+            },
+            Service {
+                name: "other".into(),
+                ..service.clone()
+            },
+        ] {
+            assert!(v.clone_for_test().put_service(bad).is_err());
+        }
+        let v = Vault::parse(&v.to_string()).unwrap();
+        assert_eq!(v.service("calls"), Some(service.clone()));
+        // Not an entry: nothing grants it or hands it to a command, and its line has no key.
+        assert_eq!(v.entries().len(), 2);
+        assert_eq!(v.get("calls"), None);
+        assert!(v.list().contains("service calls: telnyx; a key is saved"));
+        assert!(!v.list().contains(KEY));
+        let mut granted = v.clone_for_test();
+        assert!(granted.grant(Kind::Token, "calls", &["curl"]).is_err());
+        assert!(granted.bind("calls", &["api.telnyx.com"]).is_err());
+        // Its key is scrubbed wherever a vault value is, and never printed.
+        assert_eq!(
+            scrub(&format!("401 for {KEY}"), &v.secrets()),
+            "401 for [vault:calls]"
+        );
+        assert!(!format!("{service:?}").contains(KEY));
+        // An empty key keeps the one saved; the comments of the file stay.
+        let mut again = v.clone_for_test();
+        let other = Service {
+            key: String::new(),
+            from: "+16045550100".into(),
+            ..service
+        };
+        again.put_service(other).unwrap();
+        let saved = again.service("calls").unwrap();
+        assert_eq!(
+            (saved.key.as_str(), saved.from.as_str()),
+            (KEY, "+16045550100")
+        );
+        assert!(again.to_string().contains("# my logins"));
+        assert_eq!(again.to_string().matches("[[service]]").count(), 1);
+    }
+
+    /// A calls service is saved only as Telnyx's client reads it, each refusal with its reason;
+    /// a change merges onto the saved one; each service takes only its provider's fields.
+    #[test]
+    fn a_service_is_checked_merged_and_kept_to_its_provider() {
+        let calls = Service {
+            name: "calls".into(),
+            provider: "telnyx".into(),
+            key: "KEY0123456789telnyx".into(),
+            account: "1494".into(),
+            from: "+14165550100".into(),
+            public_key: TEST_PUBLIC_KEY.into(),
+        };
+        let refused = |s: Service| {
+            let said = Vault::parse("").unwrap().put_service(s).unwrap_err();
+            format!("{said:#}")
+        };
+        let mut s = calls.clone();
+        s.from = "4165550100".into();
+        assert_eq!(
+            refused(s),
+            "service calls: --from is + and the number's digits (E.164), e.g. +14165550100"
+        );
+        let mut s = calls.clone();
+        s.public_key = "cHVi".into();
+        assert_eq!(
+            refused(s),
+            "service calls: --public-key is 3 bytes; Telnyx's ed25519 public key is 32, in base64"
+        );
+        let mut s = calls.clone();
+        s.public_key = "not-base64!".into();
+        assert_eq!(
+            refused(s),
+            "service calls: --public-key is not base64; copy it from Telnyx's portal"
+        );
+        let mut s = calls.clone();
+        s.provider = "link".into();
+        assert_eq!(refused(s), "the calls service's provider is telnyx");
+        let cards = Service {
+            name: "cards".into(),
+            provider: "link".into(),
+            account: "lwlpk_x".into(),
+            ..Service::default()
+        };
+        let mut s = cards.clone();
+        s.provider = "telnyx".into();
+        assert_eq!(refused(s), "the cards service's provider is link");
+        let mut s = cards.clone();
+        s.from = "+14165550100".into();
+        assert_eq!(
+            refused(s),
+            "service cards: --from and --public-key are the calls service's"
+        );
+
+        // Rotating only the key: every other field stays as saved.
+        let mut v = Vault::parse("").unwrap();
+        v.put_service(calls.clone()).unwrap();
+        v.put_service(cards).unwrap();
+        let rotate = Service {
+            name: "calls".into(),
+            key: "KEYrotated9876543210".into(),
+            ..Service::default()
+        };
+        v.put_service(rotate).unwrap();
+        let saved = Vault::parse(&v.to_string())
+            .unwrap()
+            .service("calls")
+            .unwrap();
+        let mut want = calls.clone();
+        want.key = "KEYrotated9876543210".into();
+        assert_eq!(saved, want);
+        // A new number alone keeps the key.
+        let from = Service {
+            name: "calls".into(),
+            from: "+16045550100".into(),
+            ..Service::default()
+        };
+        v.put_service(from).unwrap();
+        let saved = v.service("calls").unwrap();
+        assert_eq!(
+            (
+                saved.key.as_str(),
+                saved.from.as_str(),
+                saved.provider.as_str()
+            ),
+            ("KEYrotated9876543210", "+16045550100", "telnyx")
+        );
+        assert_eq!(v.service("cards").unwrap().account, "lwlpk_x");
+    }
+
+    /// A login or a token never takes a service's name, so `rm` and `/vault` mean one thing.
+    #[test]
+    fn an_entry_never_takes_a_services_name() {
+        let mut v = Vault::parse("").unwrap();
+        for name in SERVICES {
+            let login = Entry {
+                kind: Kind::Login,
+                name: name.into(),
+                site: "https://example.com".into(),
+                username: "u".into(),
+                password: "p".into(),
+                ..Entry::default()
+            };
+            let said = format!("{:#}", v.put(login).unwrap_err());
+            assert_eq!(said, format!("{name} is a service's name; pick another"));
+        }
+        assert!(v.entries().is_empty());
+    }
+
+    impl Vault {
+        fn clone_for_test(&self) -> Vault {
+            Vault::parse(&self.to_string()).unwrap()
+        }
+    }
 
     #[test]
     fn parses_checks_and_lists_without_values() {
@@ -1764,6 +2019,9 @@ programs = ["gh"]
         let said = format!("{:#}", broken.err().unwrap());
         assert_eq!(said, "vault.toml is not valid TOML (line 3)");
     }
+
+    /// 32 bytes in base64, the shape of Telnyx's ed25519 public key.
+    pub(crate) const TEST_PUBLIC_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 
     const SERVICE: &str = "[[service]]\nname = \"cards\"\nprovider = \"link\"\n\
                            key = \"sk_servicekey42\"\naccount = \"lwlpk_x\"\n";

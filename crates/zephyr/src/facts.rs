@@ -202,7 +202,7 @@ fn decoded(text: &str) -> Option<Vec<Piece>> {
 /// Whether `c` shows nothing and so cannot keep a value from being one (R40): a control that is
 /// not whitespace, a zero-width or direction mark (U+061C too), or a byte-order mark. A line break and a tab
 /// are spacing, not invisible.
-fn invisible(c: char) -> bool {
+pub(crate) fn invisible(c: char) -> bool {
     (c.is_control() && !c.is_whitespace())
         || matches!(
             c,

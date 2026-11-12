@@ -1110,13 +1110,18 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let mut hosts = a.values("--host")?;
     // And the request headers it is swapped in besides Authorization.
     let headers = a.values("--header")?;
+    // A provider's own ids (DESIGN §4.25, §4.26); its key comes from the prompt like any secret.
     let provider = a.value("--provider")?;
     let account = a.value("--account")?;
+    let from = a.value("--from")?;
+    let public_key = a.value("--public-key")?;
     let rest = a.rest()?;
     let usage = "usage: zephyr vault list | add login NAME --site URL [--user U] [--totp] | \
                  add token NAME [--host HOST].. [--header HEADER].. | edit NAME [--site URL] \
-                 [--user U] [--totp] [--host HOST].. [--header HEADER].. | rm NAME | \
-                 revoke NAME [PROGRAM] | add service cards --provider NAME [--account ID]";
+                 [--user U] [--totp] [--host HOST].. [--header HEADER].. | rm NAME | rm service NAME | \
+                 revoke NAME [PROGRAM] | add service cards --provider NAME [--account ID] | \
+                 add service calls --provider telnyx --account CONNECTION_ID --from +1NUMBER \
+                 --public-key KEY";
     let text = match h.data.read(crate::vault::FILE) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         r => r?,
@@ -1201,15 +1206,18 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
         }
         // A provider's key (DESIGN §4.25): taken only here, never in a chat.
         ["add", "service", name] => {
-            let provider =
-                provider.with_context(|| format!("add service needs --provider\n{usage}"))?;
-            let key = secret(&format!("{provider} API key, empty for none or to keep it"))?;
+            // Given fields go onto the saved service, so `add service calls` alone rotates the key.
+            let provider = provider.unwrap_or_default();
+            let key = secret(&format!("{name} API key, empty for none or to keep it"))?;
             vault.put_service(crate::vault::Service {
                 name: name.into(),
-                provider: provider.clone(),
+                provider,
                 key,
                 account: account.unwrap_or_default(),
+                from: from.unwrap_or_default(),
+                public_key: public_key.unwrap_or_default(),
             })?;
+            let provider = vault.service(name).map(|s| s.provider).unwrap_or_default();
             format!("saved the {name} service ({provider}); only zephyr's own client reads it")
         }
         ["edit", name] => {
@@ -1237,10 +1245,35 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
             vault.put(e)?;
             format!("saved {name}")
         }
-        ["rm", name] => match vault.remove(name) || vault.remove_service(name) {
-            true => format!("removed {name}"),
-            false => bail!("no entry named {name} in the vault"),
+        ["rm", "service", name] => match vault.remove_service(name) {
+            true => format!("removed the service {name} and its provider key"),
+            false => bail!("no service named {name} in the vault"),
         },
+        // Says what went; a service of the same name stays until it is named, so no provider
+        // key is left behind under a "removed".
+        ["rm", name] => {
+            let entry = vault.get(name).map(|e| match e.kind {
+                crate::vault::Kind::Login => "login",
+                crate::vault::Kind::Token => "token",
+            });
+            match (entry, vault.service(name).is_some()) {
+                (Some(kind), service) => {
+                    vault.remove(name);
+                    match service {
+                        true => format!(
+                            "removed the {kind} {name}; the service {name} is still saved: \
+                             zephyr vault rm service {name} removes it"
+                        ),
+                        false => format!("removed the {kind} {name}"),
+                    }
+                }
+                (None, true) => {
+                    vault.remove_service(name);
+                    format!("removed the service {name} and its provider key")
+                }
+                (None, false) => bail!("no entry named {name} in the vault"),
+            }
+        }
         ["revoke", name] => vault.revoke(name, None)?,
         ["revoke", name, program] => vault.revoke(name, Some(program))?,
         _ => bail!("{usage}"),

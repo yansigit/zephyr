@@ -56,6 +56,11 @@ const MAX_OUT: u64 = 64 * 1024 * 1024;
 const WAV_HEADER: u64 = 44;
 const WAV_BYTES_PER_SEC: u64 = 32000;
 const MODEL: &str = "models/ggml-small-q5_1.bin";
+/// The smaller model a phone call's utterances are transcribed with, when the image has it
+/// (`CALL_STT=1`): a turn of a call cannot wait for the small one. Measured on this project's
+/// machine for a 3 s sentence, a process a run: small 3.8 s, base 1.1 s, with the same words
+/// in English and Korean (DESIGN §4.26).
+const CALL_MODEL: &str = "models/ggml-base-q5_1.bin";
 const VAD_MODEL: &str = "models/ggml-silero-v5.1.2.bin";
 
 /// What came of one voice note.
@@ -89,6 +94,16 @@ pub fn floored(cfg: &Config) -> bool {
 /// Whether this image has voice (built with `VOICE=1`).
 pub fn present(cfg: &Config) -> bool {
     cfg.voice_dir.join("bin/whisper-cli").exists()
+}
+
+/// Whether the image has the Piper voice a call in `lang` is spoken with (`en`, `ko`).
+pub fn call_voice(cfg: &Config, lang: &str) -> bool {
+    let voice = match lang {
+        "en" => VOICE_EN,
+        "ko" => VOICE_KO,
+        _ => return false,
+    };
+    cfg.voice_dir.join(voice).exists()
 }
 
 /// `5:00`.
@@ -142,11 +157,11 @@ fn decode_args(secs: u64) -> Vec<String> {
 /// As measured with 1.9.5: no `-np`, which would also drop the detected-language line, and with
 /// `-nt` the text is all that goes to stdout either way (nothing at all when the VAD finds no
 /// speech).
-fn whisper_args(dir: &Path, lang: &str) -> Vec<String> {
+fn whisper_args(dir: &Path, model: &str, lang: &str) -> Vec<String> {
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
     let threads = (cores / 2).clamp(1, 8).to_string();
     let path = |p: &str| dir.join(p).to_string_lossy().into_owned();
-    let (model, vad) = (path(MODEL), path(VAD_MODEL));
+    let (model, vad) = (path(model), path(VAD_MODEL));
     // shortcut: CPU only; the GPU needs a shader cache folder for nobody
     // (__GL_SHADER_DISK_CACHE_PATH), then drop -ng
     [
@@ -427,8 +442,13 @@ async fn hear(cfg: &Config, audio: &[u8], secs: &mut u64) -> Result<Heard, Stop>
 
 /// One whisper run of `wav` as `lang`.
 async fn whisper(cfg: &Config, wav: &Mem, lang: &str) -> Result<Out, Stop> {
+    whisper_with(cfg, wav, MODEL, lang).await
+}
+
+/// One whisper run of `wav` as `lang`, with `model`.
+async fn whisper_with(cfg: &Config, wav: &Mem, model: &str, lang: &str) -> Result<Out, Stop> {
     let prog = cfg.voice_dir.join("bin/whisper-cli");
-    let args = whisper_args(&cfg.voice_dir, lang);
+    let args = whisper_args(&cfg.voice_dir, model, lang);
     let out = run(&prog, &args, &[(wav, 3)], Stdio::null(), cfg.voice_wait).await?;
     match out.ok {
         true => Ok(out),
@@ -573,6 +593,131 @@ pub async fn speak(cfg: &Config, text: &str, channel: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// One utterance of a phone call (DESIGN §4.26) as whisper reads it: 8 kHz samples doubled to
+/// the 16 kHz mono WAV it takes, each new sample halfway between its neighbours.
+fn call_wav(pcm: &[i16]) -> Vec<u8> {
+    let bytes = (pcm.len() * 4) as u32;
+    let mut wav = Vec::with_capacity(WAV_HEADER as usize + bytes as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + bytes).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    // PCM, one channel, 16 kHz, 32000 bytes a second, 2 bytes a frame, 16 bits.
+    for field in [
+        16u32,
+        0x0001_0001,
+        16000,
+        WAV_BYTES_PER_SEC as u32,
+        0x0010_0002,
+    ] {
+        wav.extend_from_slice(&field.to_le_bytes());
+    }
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&bytes.to_le_bytes());
+    for (i, s) in pcm.iter().enumerate() {
+        let next = pcm.get(i + 1).unwrap_or(s);
+        let between = ((i32::from(*s) + i32::from(*next)) / 2) as i16;
+        wav.extend_from_slice(&s.to_le_bytes());
+        wav.extend_from_slice(&between.to_le_bytes());
+    }
+    wav
+}
+
+/// What the other party said in one utterance of a phone call, 8 kHz samples the daemon cut
+/// from the provider's audio itself. As a voice note's: whisper as `nobody`, on a sealed memfd,
+/// one run at a time. `lang` is the call's language, so nothing is detected.
+pub async fn hear_call(cfg: &Config, pcm: &[i16], lang: &str) -> Heard {
+    if !floored(cfg) {
+        return Heard::NoFloor;
+    }
+    let _turn = Turn::take().await;
+    let heard = async {
+        let wav = mem(Mem::sealed(&call_wav(pcm)))?;
+        let out = whisper_with(cfg, &wav, call_model(cfg), lang).await?;
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    match heard.await {
+        Ok(text) if text.is_empty() || text == "[BLANK_AUDIO]" => Heard::Silence,
+        Ok(text) => Heard::Said {
+            lang: lang.into(),
+            text: clean(&text),
+        },
+        Err(Stop::Failed) => Heard::Failed,
+        Err(Stop::TimedOut) => Heard::TimedOut,
+    }
+}
+
+/// The model a call's utterances are transcribed with: the smaller one when the image has it.
+pub fn call_model(cfg: &Config) -> &'static str {
+    match cfg.voice_dir.join(CALL_MODEL).exists() {
+        true => CALL_MODEL,
+        false => MODEL,
+    }
+}
+
+/// ffmpeg's argv to turn Piper's PCM on fd 3 into what a phone line carries: G.711 μ-law at
+/// 8 kHz, raw, on stdout.
+fn call_args() -> Vec<String> {
+    let args = "-hide_banner -nostdin -loglevel error -f s16le -ar";
+    (args.split(' '))
+        .chain([PIPER_RATE, "-ac", "1", "-i", "/proc/self/fd/3"])
+        .chain([
+            "-ar",
+            "8000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_mulaw",
+            "-f",
+            "mulaw",
+            "pipe:1",
+        ])
+        .map(String::from)
+        .collect()
+}
+
+/// One line of a phone call spoken in `lang` (`en`, `ko`), as μ-law at 8 kHz, or `None`: no
+/// voice for the language in this image, nothing speakable in `text`, or Piper or ffmpeg
+/// failed. Both run as the decoders do.
+pub async fn say_call(cfg: &Config, text: &str, lang: &str) -> Option<Vec<u8>> {
+    if !floored(cfg) || !call_voice(cfg, lang) {
+        return None;
+    }
+    let text = speakable(text)?;
+    let dir = &cfg.voice_dir;
+    let voice = dir.join(if lang == "ko" { VOICE_KO } else { VOICE_EN });
+    let _turn = Turn::take().await;
+    let made = async {
+        let said = mem(Mem::sealed(text.as_bytes()))?;
+        let stdin = Stdio::from(mem(said.0.try_clone())?);
+        let python = dir.join("py/bin/python");
+        let piper = run(&python, &piper_args(&voice), &[], stdin, SPEAK_LIMIT).await?;
+        if !piper.ok || piper.stdout.is_empty() {
+            return Err(Stop::Failed);
+        }
+        let pcm = mem(Mem::sealed(&piper.stdout))?;
+        let ffmpeg = dir.join("bin/ffmpeg");
+        let out = run(
+            &ffmpeg,
+            &call_args(),
+            &[(&pcm, 3)],
+            Stdio::null(),
+            SPEAK_LIMIT,
+        )
+        .await?;
+        match out.ok {
+            true => Ok(out.stdout),
+            false => Err(Stop::Failed),
+        }
+    };
+    match made.await {
+        Ok(audio) if !audio.is_empty() => Some(audio),
+        _ => {
+            eprintln!("zephyr: voice: a line of a call could not be spoken");
+            None
+        }
+    }
+}
+
 /// The uid a decoder gets: `/usr/bin/id -u`, run as they are. For `doctor` and the in-image
 /// test.
 pub async fn uid() -> Option<u32> {
@@ -694,6 +839,92 @@ pub(crate) mod tests {
         let path = cfg.voice_dir.join(name);
         std::fs::write(&path, text).unwrap();
         path
+    }
+
+    #[tokio::test]
+    async fn a_call_is_heard_from_8_khz_samples_as_nobody() {
+        let cfg = fakes("voice-call-hear", "");
+        mark(&cfg, "say", "Seven is full, we have seven thirty");
+        let pcm: Vec<i16> = (0..8000)
+            .map(|i| if i / 20 % 2 == 0 { 9000 } else { -9000 })
+            .collect();
+        let heard = hear_call(&cfg, &pcm, "en").await;
+        assert_eq!(heard, said("en", "Seven is full, we have seven thirty"));
+        // One whisper run, no ffmpeg: on the WAV the daemon made, in the call's language.
+        assert!(log(&cfg, "ffmpeg").is_empty());
+        let runs = log(&cfg, "whisper-cli");
+        assert_eq!(runs.len(), 1);
+        let wav = call_wav(&pcm);
+        assert_eq!(runs[0]["sha256"], sha256(&wav));
+        assert_eq!(
+            (&wav[..4], &wav[36..40], wav.len()),
+            (&b"RIFF"[..], &b"data"[..], 44 + 32000)
+        );
+        assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 16000);
+        let argv: Vec<&str> = (runs[0]["argv"].as_array().unwrap().iter())
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        let lang = argv.iter().position(|a| *a == "-l").unwrap();
+        assert_eq!(argv[lang + 1], "en");
+        let model = argv.iter().position(|a| *a == "-m").unwrap();
+        assert!(
+            argv[model + 1].ends_with("models/ggml-small-q5_1.bin"),
+            "{argv:?}"
+        );
+        // With the smaller model in the image, a call's utterances go to it; a voice note's
+        // still go to the small one.
+        std::fs::create_dir_all(cfg.voice_dir.join("models")).unwrap();
+        std::fs::write(cfg.voice_dir.join(CALL_MODEL), "").unwrap();
+        assert_eq!(call_model(&cfg), CALL_MODEL);
+        hear_call(&cfg, &pcm, "en").await;
+        let last = log(&cfg, "whisper-cli").pop().unwrap();
+        assert!(
+            last["argv"]
+                .to_string()
+                .contains("models/ggml-base-q5_1.bin"),
+            "{last}"
+        );
+        transcribe(&cfg, b"a voice note").await;
+        let last = log(&cfg, "whisper-cli").pop().unwrap();
+        assert!(
+            last["argv"]
+                .to_string()
+                .contains("models/ggml-small-q5_1.bin"),
+            "{last}"
+        );
+        // Each utterance takes the next line of what the other party says.
+        mark(&cfg, "says", "first\nsecond\n");
+        assert_eq!(hear_call(&cfg, &pcm, "en").await, said("en", "first"));
+        assert_eq!(hear_call(&cfg, &pcm, "en").await, said("en", "second"));
+        mark(&cfg, "say", "");
+        std::fs::remove_file(cfg.voice_dir.join("says")).unwrap();
+        assert_eq!(hear_call(&cfg, &pcm, "en").await, Heard::Silence);
+    }
+
+    #[tokio::test]
+    async fn a_call_line_is_spoken_as_mu_law() {
+        let cfg = fakes("voice-call-say", "");
+        let audio = say_call(&cfg, "Seven thirty, **please**.", "en")
+            .await
+            .unwrap();
+        // The stand-ins pass the text through: Piper's `pcm:`, then ffmpeg's `ulaw:`.
+        assert_eq!(audio, b"ulaw:pcm:Seven thirty, please.");
+        let ffmpeg = &log(&cfg, "ffmpeg")[0];
+        let argv = ffmpeg["argv"].to_string();
+        for part in [
+            "\"-f\",\"mulaw\"",
+            "\"-ar\",\"8000\"",
+            "\"-ar\",\"22050\"",
+            "pcm_mulaw",
+        ] {
+            assert!(argv.contains(part), "{part} in {argv}");
+        }
+        // No voice for the language: nothing is said, and nothing runs.
+        assert_eq!(say_call(&cfg, "안녕하세요.", "ko").await, None);
+        assert_eq!(say_call(&cfg, "Bonjour.", "fr").await, None);
+        assert_eq!(log(&cfg, "python").len(), 1);
+        mark(&cfg, "piper_fail", "");
+        assert_eq!(say_call(&cfg, "Hello.", "en").await, None);
     }
 
     fn said(lang: &str, text: &str) -> Heard {
