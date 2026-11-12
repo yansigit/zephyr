@@ -441,6 +441,61 @@ async fn a_hold_stops_signal_cli_until_it_is_lifted_and_a_stale_one_is_ignored()
     gw.shutdown().await;
 }
 
+/// A hold lets signal-cli go, but the envelopes it handed over are still taken: Signal's
+/// server gave them to it once and will not again.
+#[tokio::test]
+async fn a_hold_still_takes_what_signal_cli_handed_over() {
+    let home = dir("hold-drain");
+    let mut cfg = config(&home, None, &[OWNER]);
+    cfg.voice_dir = voice_fakes::fakes(&home);
+    cfg.voice_off_floor = true;
+    // The note's transcription holds the taker up past the hold, then gives up.
+    std::fs::write(cfg.voice_dir.join("hang"), "").unwrap();
+    cfg.voice_wait = Duration::from_secs(6);
+    let gw = start(cfg);
+    gw.up().await;
+    let mut note = with_file(&gw, OWNER, 1700000000456, "", "v1.aac", b"aac-bytes");
+    note["dataMessage"]["attachments"][0]["contentType"] = json!("audio/aac");
+    gw.feed(note);
+    wait(|| home.join("voice/hang.pid").exists()).await;
+    gw.feed(message(OWNER, 1700000000999, "after the note"));
+    let fed = || {
+        std::fs::metadata(gw.d.join("feed.jsonl"))
+            .unwrap()
+            .len()
+            .to_string()
+    };
+    wait(|| std::fs::read_to_string(gw.d.join("feed.offset")).is_ok_and(|o| o == fed())).await;
+    hold(&gw.d);
+    let rows = || {
+        let counts = Store::open(&home.join("state.db"))
+            .unwrap()
+            .counts()
+            .unwrap();
+        (counts.iter())
+            .filter(|(t, _, _)| t == "inbox")
+            .map(|c| c.2)
+            .sum::<i64>()
+    };
+    wait(|| rows() == 2).await;
+    assert_eq!(gw.log("start").len(), 1, "held, so not started again");
+    gw.shutdown().await;
+}
+
+/// Files signal-cli saved for envelopes that were never taken (a crash) go at the next start.
+#[tokio::test]
+async fn a_start_empties_signal_clis_attachments() {
+    let home = dir("attachments");
+    let cfg = config(&home, None, &[OWNER]);
+    let stray = zephyr::signal::data_dir(&cfg).join("attachments/left-over.png");
+    std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    std::fs::write(&stray, b"png").unwrap();
+    let gw = start(cfg);
+    gw.up().await;
+    assert!(!stray.exists());
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_daemon_starting_during_a_hold_starts_no_signal_cli() {
     let home = dir("hold-start");

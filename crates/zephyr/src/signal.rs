@@ -296,6 +296,13 @@ impl Signal {
     async fn child(&self, tx: &mpsc::Sender<Inbound>) -> anyhow::Result<()> {
         private_dir(&self.dir)?;
         let _ = std::fs::remove_file(self.dir.join(OK_FILE));
+        // Files of envelopes never taken (a crash): `take` deletes the rest as it goes.
+        for file in std::fs::read_dir(self.dir.join("attachments"))
+            .into_iter()
+            .flatten()
+        {
+            let _ = file.map(|f| std::fs::remove_file(f.path()));
+        }
         let own = self.own_aci();
         let mut child = command(&self.cli, &self.dir)
             .args(["-a", &self.account, "jsonRpc"])
@@ -345,12 +352,16 @@ impl Signal {
                 self.trust().await;
             }
         };
+        let taken = async { tokio::join!(reader, taker) };
+        tokio::pin!(taken);
         tokio::select! {
-            (r, ()) = async { tokio::join!(reader, taker) } => r?,
+            (r, ()) = &mut taken => r?,
             r = writer => r?,
             () = side => {
                 eprintln!("zephyr: signal-cli stops while zephyr signal-setup holds the account");
                 let _ = child.start_kill();
+                // What it handed over is still taken: Signal's server will not give it again.
+                taken.await.0?;
             }
         }
         let status = child.wait().await?;
