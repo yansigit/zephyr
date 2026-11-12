@@ -9226,3 +9226,27 @@ async fn done_on_a_closing_issuers_card_waits_for_the_issuer() {
     assert_eq!(card_status(&home, 1), "closed");
     gw.shutdown().await;
 }
+
+/// A fill that typed no number (only the expiry and the code here) does not make the page the
+/// card's: its Pay click is asked about like any payment.
+#[tokio::test]
+async fn a_fill_with_no_number_covers_no_pay_click() {
+    let (home, cfg) = card_home("card-fill-no-number", "fake", "");
+    let gw = start(cfg);
+    gw.say("e1", "owner", &card_ask("42.50")).await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
+    gw.say("e2", "owner", "/ok 1").await;
+    reply_where(&gw, "chat", |r| r.contains("[card #1 issued")).await;
+    let fill = r##"[call card {"action": "fill", "id": 1, "expiry": "#e", "cvc": "#c"}]"##;
+    gw.say("e3", "owner", fill).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains("\ncard: filled the expiry and code")
+    })
+    .await;
+    pay_page(&home, "CA$42.50");
+    gw.say("e4", "owner", &click_send(&home)).await;
+    reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #2:")).await;
+    assert!(clicks(&home).is_empty());
+    assert_eq!(card_status(&home, 1), "open");
+    gw.shutdown().await;
+}

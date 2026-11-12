@@ -1548,8 +1548,11 @@ async fn fill(cfg: &Arc<Config>, id: i64, fields: CardFields) -> String {
             }
         }
     }
-    // The page it went through on is the one whose Pay click the card covers.
-    log(db.get().card_filled(id, &last));
+    // The page it went through on is the one whose Pay click the card covers, once the number
+    // itself is in it: an expiry or a name alone pays nothing.
+    if done.contains(&"number") {
+        log(db.get().card_filled(id, &last));
+    }
     audit(cfg, &db.get(), &card, "fill", "ok");
     format!(
         "filled the {} of card #{id} (…{}) on {page}",
