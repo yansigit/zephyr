@@ -4,11 +4,11 @@ use crate::channel::{chunks, Activity, Channel, Inbound, Outbound};
 use anyhow::Context as _;
 use serde::Deserialize;
 use serenity::async_trait;
-use serenity::builder::{CreateAttachment, CreateMessage, EditMessage};
+use serenity::builder::{CreateAttachment, CreateMessage, EditMessage, GetMessages};
 use serenity::client::{Client, Context, EventHandler};
 use serenity::http::{Http, Typing};
 use serenity::model::channel::{Message, Nonce};
-use serenity::model::gateway::GatewayIntents;
+use serenity::model::gateway::{GatewayIntents, Ready};
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -224,6 +224,48 @@ struct Handler {
 }
 
 impl Handler {
+    /// Feeds the owners' DMs newer than the newest stored row: what came while the gateway was
+    /// away, which a fresh session never replays (DESIGN §4.3). Nothing before the first row;
+    /// the inbox's dedupe drops what was seen. Holds `order`, so new messages queue behind.
+    async fn backfill(&self, http: &Http) {
+        let Some(after) = crate::inbox::newest(&self.live, "discord").await else {
+            return;
+        };
+        let owners = self.live.get().map(|rx| {
+            let cfg = rx.borrow();
+            cfg.owners.get("discord").cloned().unwrap_or_default()
+        });
+        let _order = self.order.lock().await;
+        for owner in owners.unwrap_or_default() {
+            let Ok(user) = owner.parse::<u64>() else {
+                continue;
+            };
+            if let Err(e) = self.backfill_dm(http, UserId::new(user), after).await {
+                eprintln!("zephyr: discord backfill of {user}'s DMs failed: {e}");
+            }
+        }
+    }
+
+    async fn backfill_dm(&self, http: &Http, user: UserId, after: u64) -> anyhow::Result<()> {
+        const PAGE: u8 = 100;
+        let dm = user.create_dm_channel(http).await?;
+        let mut after = MessageId::new(after);
+        loop {
+            let ask = GetMessages::new().after(after).limit(PAGE);
+            let mut page = dm.id.messages(http, ask).await?;
+            page.sort_by_key(|m| m.id);
+            for msg in &page {
+                if let Some(inbound) = self.inbound(msg).await {
+                    self.tx.send(inbound).await?;
+                }
+            }
+            match page.last() {
+                Some(m) if page.len() == PAGE as usize => after = m.id,
+                _ => return Ok(()),
+            }
+        }
+    }
+
     /// The row for `msg`, its attachments saved (an owner's only) and listed in its text.
     async fn inbound(&self, msg: &Message) -> Option<Inbound> {
         let mut inbound = to_inbound(
@@ -247,6 +289,11 @@ impl Handler {
 
 #[async_trait]
 impl EventHandler for Handler {
+    /// Each new gateway session; a resumed one replays what it missed itself.
+    async fn ready(&self, ctx: Context, _: Ready) {
+        self.backfill(&ctx.http).await;
+    }
+
     async fn message(&self, _ctx: Context, msg: Message) {
         let _order = self.order.lock().await;
         if let Some(inbound) = self.inbound(&msg).await {
@@ -550,6 +597,112 @@ mod tests {
         assert_eq!(std::fs::read(&png).unwrap(), b"png!");
         assert!(seen.recv().await.unwrap().contains("/screenshot.png?ex="));
         assert!(seen.try_recv().is_err(), "the pdf is over 25 MB");
+    }
+
+    /// Discord's REST API on a loopback port, for `Http`'s proxy: the owner's DM is channel
+    /// 77 and its messages are `msgs` (ids and texts), newest first as Discord gives them.
+    /// Reports each request's `METHOD path?query`.
+    async fn rest_stub(msgs: Vec<(u64, &'static str)>) -> (Http, mpsc::UnboundedReceiver<String>) {
+        use http_body_util::Full;
+        use hyper::body::{Bytes, Incoming};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen, rx) = mpsc::unbounded_channel();
+        let msg = |(id, text): &(u64, &str)| {
+            let mut m: serde_json::Value = serde_json::from_str(DM_FILES).unwrap();
+            m["id"] = id.to_string().into();
+            m["channel_id"] = "77".into();
+            m["content"] = (*text).into();
+            m["attachments"] = serde_json::json!([]);
+            m
+        };
+        let page = serde_json::Value::from(msgs.iter().map(msg).collect::<Vec<_>>()).to_string();
+        let owner = msg(&(1, ""))["author"].clone();
+        let dm = serde_json::json!({"id": "77", "type": 1, "recipients": [owner]}).to_string();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (seen, page, dm) = (seen.clone(), page.clone(), dm.clone());
+                let svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                    let _ = seen.send(format!("{} {}", req.method(), req.uri()));
+                    let body = if req.uri().path().ends_with("/messages") {
+                        page.clone()
+                    } else {
+                        dm.clone()
+                    };
+                    async move {
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from(body)))
+                                .unwrap(),
+                        )
+                    }
+                });
+                tokio::spawn(
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), svc),
+                );
+            }
+        });
+        let http = serenity::http::HttpBuilder::new("Bot test")
+            .proxy(format!("http://{addr}"))
+            .ratelimiter_disabled(true)
+            .build();
+        (http, rx)
+    }
+
+    fn backfill_handler(live: crate::inbox::Live) -> (Handler, mpsc::Receiver<Inbound>) {
+        let (tx, rx) = mpsc::channel(8);
+        let h = Handler {
+            tx,
+            live,
+            files: reqwest::Client::new(),
+            order: Mutex::default(),
+        };
+        (h, rx)
+    }
+
+    #[tokio::test]
+    async fn ready_feeds_the_owners_dms_newer_than_the_newest_stored_row_oldest_first() {
+        let home = crate::test_dir("discord-backfill");
+        let live = crate::inbox::tests::live(&home, "discord = ['2000']");
+        let db = live.get().unwrap().borrow().db_path();
+        let store = crate::store::Store::open(&db).unwrap();
+        // 100 is the newest though "99" sorts after it as text.
+        for id in [100, 99] {
+            store
+                .insert_inbox(&to_inbound(true, false, id, 2000, "seen", false).unwrap())
+                .unwrap();
+        }
+        let (http, mut seen) = rest_stub(vec![(103, "second"), (101, "first")]).await;
+        let (h, mut rx) = backfill_handler(live);
+        h.backfill(&http).await;
+        assert_eq!(seen.try_recv().unwrap(), "POST /api/v10/users/@me/channels");
+        assert_eq!(
+            seen.try_recv().unwrap(),
+            "GET /api/v10/channels/77/messages?&limit=100&after=100"
+        );
+        let got: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|m| (m.platform_msg_id, m.text))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("101".to_string(), "first".to_string()),
+                ("103".to_string(), "second".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_fetches_nothing_before_the_first_stored_row() {
+        let home = crate::test_dir("discord-backfill-none");
+        let live = crate::inbox::tests::live(&home, "discord = ['2000']");
+        let (http, mut seen) = rest_stub(vec![(101, "first")]).await;
+        let (h, mut rx) = backfill_handler(live);
+        h.backfill(&http).await;
+        assert!(seen.try_recv().is_err(), "no request");
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

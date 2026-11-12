@@ -58,19 +58,40 @@ pub fn owner(live: &Live, inbound: &Inbound) -> bool {
 /// `Store::open`, which may migrate and takes write locks. A database that is not there yet or
 /// cannot be read says "not stored".
 pub async fn stored(live: &Live, inbound: &Inbound) -> bool {
-    use rusqlite::{Connection, OpenFlags, OptionalExtension};
-    let Some(db) = live.get().map(|rx| rx.borrow().db_path()) else {
-        return false;
-    };
+    use rusqlite::OptionalExtension;
     let key = [inbound.channel.clone(), inbound.platform_msg_id.clone()];
-    let ask = move || -> rusqlite::Result<bool> {
+    let sql = "SELECT 1 FROM inbox WHERE channel = ?1 AND platform_msg_id = ?2";
+    let row = ask(live, move |db| {
+        db.query_row(sql, key, |_| Ok(())).optional()
+    });
+    matches!(row.await, Some(Some(())))
+}
+
+/// The newest of `channel`'s rows by its numeric platform id (Discord's snowflakes), read as
+/// `stored` reads; `None` with no row.
+pub async fn newest(live: &Live, channel: &str) -> Option<u64> {
+    let channel = channel.to_string();
+    let sql = "SELECT MAX(CAST(platform_msg_id AS INTEGER)) FROM inbox WHERE channel = ?1";
+    let max = ask(live, move |db| {
+        db.query_row(sql, [channel], |r| r.get::<_, Option<i64>>(0))
+    });
+    max.await.flatten().and_then(|n| u64::try_from(n).ok())
+}
+
+/// `f` on a read-only connection to the live config's database, off the async threads; `None`
+/// before the config is handed over, or when it cannot be read.
+async fn ask<T: Send + 'static>(
+    live: &Live,
+    f: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T> + Send + 'static,
+) -> Option<T> {
+    use rusqlite::{Connection, OpenFlags};
+    let db = live.get().map(|rx| rx.borrow().db_path())?;
+    let ask = move || -> rusqlite::Result<T> {
         let db = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         db.busy_timeout(Duration::from_secs(2))?;
-        let sql = "SELECT 1 FROM inbox WHERE channel = ?1 AND platform_msg_id = ?2";
-        let row = db.query_row(sql, key, |_| Ok(())).optional()?;
-        Ok(row.is_some())
+        f(&db)
     };
-    matches!(tokio::task::spawn_blocking(ask).await, Ok(Ok(true)))
+    tokio::task::spawn_blocking(ask).await.ok()?.ok()
 }
 
 /// Appends a line per file to `inbound.text`, saving each file first when the sender is an owner.
