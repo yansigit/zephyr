@@ -2375,6 +2375,12 @@ impl<'a> Router<'a> {
         if self.stopping || self.child.is_none() || self.store.pause_reason()?.is_some() {
             return Ok(());
         }
+        // A restart asked for mid-run (`/new`, a refresh, a rule) comes before the next prompt,
+        // or that prompt opens a run on the old child; the new child's reconcile sends it.
+        if self.restart && !self.busy {
+            self.restart_if_idle().await;
+            return Ok(());
+        }
         for row in self.store.inbox_with_status("new")? {
             if self.busy && self.store.is_follow_up(row.id)? {
                 continue;

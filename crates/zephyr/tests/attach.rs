@@ -1079,6 +1079,45 @@ async fn a_follow_up_waits_for_the_settle_and_then_runs() {
     gw.shutdown().await;
 }
 
+/// A follow-up waiting when `/new` was asked mid-run is the new conversation's first message:
+/// the settle restarts the child before it dispatches the follow-up.
+#[tokio::test]
+async fn a_follow_up_after_new_mid_run_goes_to_the_new_conversation() {
+    let gw = start("followup-new");
+    let mut c = Client::connect(gw.port).await;
+    c.call("authenticate", json!({"token": TOKEN})).await;
+    std::fs::write(gw.home.join("tool_wait"), "").unwrap();
+    gw.say("m1", "[tool] first").await;
+    wait(|| prompts(&gw).len() == 1).await;
+    let later = json!({"type": "prompt", "content": "later", "followUp": true});
+    assert_eq!(c.send(later).await["result"]["status"], "sent");
+    gw.say("m2", "/new").await;
+    wait(|| gw.count("outbox", "sent") == 1).await; // /new answered: after the current reply
+    std::fs::remove_file(gw.home.join("tool_wait")).unwrap();
+    wait(|| prompts(&gw).len() == 2).await;
+    // The session each prompt went to: that of the main child started last before it.
+    let log = std::fs::read_to_string(gw.home.join("log.jsonl")).unwrap();
+    let mut session = String::new();
+    let mut went = vec![];
+    for line in log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    {
+        match line["type"].as_str() {
+            Some("start") => {
+                if let Some(id) = line["sessionId"].as_str().filter(|s| s.starts_with("main")) {
+                    session = id.to_string();
+                }
+            }
+            Some("prompt") => went.push(session.clone()),
+            _ => {}
+        }
+    }
+    assert_eq!(went[0], "main");
+    assert!(went[1].starts_with("main-"), "{went:?}");
+    gw.shutdown().await;
+}
+
 /// Alt+Up: `zephyr.dequeue` takes back the attached client's messages rpi has not been sent,
 /// oldest first; another channel's, and ones already sent, stay.
 #[tokio::test]
