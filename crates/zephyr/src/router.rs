@@ -4897,7 +4897,7 @@ impl<'a> Router<'a> {
 
     /// Refreshes near-expiry OAuth credentials, then restarts the child once it is idle.
     async fn auth_check(&mut self) {
-        let every = Duration::from_secs_f64((self.cfg.auth.refresh_minutes * 60.0).max(1.0));
+        let every = crate::auth_keeper::check_every(self.cfg.auth.refresh_minutes);
         self.auth_at = Instant::now() + every;
         if self.refreshing.is_some() {
             return; // one at a time: a rotating refresh token must not race itself
