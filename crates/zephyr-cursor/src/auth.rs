@@ -240,7 +240,7 @@ fn client() -> anyhow::Result<reqwest::Client> {
 }
 
 /// Attribution: `ullage-api.rs` (`is_secure_or_loopback`).
-fn is_secure_or_loopback(url: &reqwest::Url) -> bool {
+pub(crate) fn is_secure_or_loopback(url: &reqwest::Url) -> bool {
     let secure = url.scheme() == "https" && url.host().is_some();
     let loopback = url.scheme() == "http"
         && url.host_str().is_some_and(|host| {
