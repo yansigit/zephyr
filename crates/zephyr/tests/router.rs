@@ -370,6 +370,33 @@ async fn child_killed_mid_run_resumes_without_loss_or_duplicate() {
     gw.shutdown().await;
 }
 
+/// Review of PR #63, 5: a restart asked for mid-run (a rule) is done by the child's crash: the
+/// respawned child starts on the current session and rules, so nothing restarts it again.
+#[tokio::test]
+async fn a_crash_does_the_restart_a_run_was_waiting_for() {
+    let home = home("crash-restart");
+    std::fs::write(home.join("hang"), "").unwrap();
+    let gw = start(config(&home));
+    gw.say("m1", "owner", "long job").await;
+    wait(|| !home.join("hang").exists()).await; // the child is now mid-run
+    gw.say("m2", "owner", "/rule be brief").await;
+    gw.wait_replies(1).await;
+    let pid = std::fs::read_to_string(home.join("pid")).unwrap();
+    std::process::Command::new("kill")
+        .args(["-9", &pid])
+        .status()
+        .unwrap();
+    gw.wait_reply("resumed: [chat #1] long job").await;
+    gw.say("m3", "owner", "next").await;
+    gw.wait_reply("echo: [chat #3] next").await;
+    assert_eq!(
+        log(&home, "start").len(),
+        2,
+        "the first child and the respawn"
+    );
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn gateway_killed_mid_run_resumes_after_restart() {
     let home = home("kill-gateway");

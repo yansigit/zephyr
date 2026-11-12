@@ -2057,6 +2057,9 @@ impl<'a> Router<'a> {
                     eprintln!("zephyr: on account {} ({})", a.name, a.model);
                 }
                 self.child = Some(child);
+                // A fresh child starts on the current session, credentials and rules: a restart
+                // asked for before it (then a crash) is done.
+                self.restart = false;
                 self.account = account;
                 self.pending_model = None;
                 self.auth_stamp = self.auth_mtime();
