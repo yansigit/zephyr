@@ -1015,14 +1015,23 @@ pub async fn issue(
         card.provider_ref.as_deref().unwrap_or_default(),
         card.approval_url.as_deref(),
     );
-    if !landed.map_err(failed)? {
+    // Still waiting once recorded: a close asked right after the record was made (it then saw
+    // the reference, `close_at_issuer`) is one too.
+    let waiting = || {
+        db.get()
+            .card(id)
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.status == "waiting")
+    };
+    if !landed.map_err(failed)? || !waiting() {
         // Its close was asked while the issuer was answering (a `/stop`): what the issuer made
         // is closed there now, and the card is `closing` until the issuer takes that, tried
         // again on the tick. The owner is never told to approve it.
         let reference = card.provider_ref.as_deref().unwrap_or_default();
         db.get().card_reclose(id, reference, now).map_err(failed)?;
         let _ = poll_due(cfg, id);
-        let said = close_at_issuer(cfg, &card).await;
+        let said = close_at_issuer(cfg, &mut card).await;
         say(cfg, card, Word::Closed(LANDED.into(), said));
         return Err(format!("card #{id} was not issued: {LANDED}"));
     }
@@ -1612,7 +1621,16 @@ fn say(cfg: &Config, card: Card, word: Word) {
     words.push((cfg.state_dir().to_path_buf(), card, word));
 }
 
-async fn close_at_issuer(cfg: &Config, card: &Card) -> Result<(), String> {
+/// Closes `card` at its issuer. Its reference there is the record's, read now: a copy read
+/// before the issue landed has none, and `card` gets the record's, so its word says what was
+/// closed.
+async fn close_at_issuer(cfg: &Config, card: &mut Card) -> Result<(), String> {
+    if card.provider_ref.is_none() {
+        let record = open_store(cfg)
+            .ok()
+            .and_then(|s| s.card(card.id).ok().flatten());
+        card.provider_ref = record.and_then(|c| c.provider_ref);
+    }
     // The issuer has not made it yet (its issue is still being answered): there is nothing
     // there to close. The close is kept in the card's status, and the issue closes what it
     // makes when it lands (`issue`).
@@ -1637,8 +1655,9 @@ pub fn ask_close(cfg: &Arc<Config>, store: &Store, card: Card, why: &str) {
     // This close is in hand: the tick's retry waits its turn.
     let _ = poll_due(cfg, card.id);
     let (cfg, why) = (cfg.clone(), why.to_string());
+    let mut card = card;
     tokio::spawn(async move {
-        let said = close_at_issuer(&cfg, &card).await;
+        let said = close_at_issuer(&cfg, &mut card).await;
         say(&cfg, card, Word::Closed(why, said));
     });
 }
@@ -1825,9 +1844,9 @@ pub fn tick(cfg: &Arc<Config>, store: &Store, now: i64) {
     }
     let cfg = cfg.clone();
     tokio::spawn(async move {
-        for (card, close) in asks {
+        for (mut card, close) in asks {
             let word = match close {
-                Some(why) => Word::Closed(why.into(), close_at_issuer(&cfg, &card).await),
+                Some(why) => Word::Closed(why.into(), close_at_issuer(&cfg, &mut card).await),
                 None => Word::State(match issuer(&cfg) {
                     Ok(issuer) => issuer.state(&card).await.map_err(|e| e.0),
                     Err(e) => Err(e),
@@ -1934,9 +1953,9 @@ fn used(cfg: &Arc<Config>, store: &Store, card: Card, charges: &[Charge], now: i
         );
         tell(store, &card, &text);
     }
-    let cfg = cfg.clone();
+    let (cfg, mut card) = (cfg.clone(), card);
     tokio::spawn(async move {
-        let said = close_at_issuer(&cfg, &card).await;
+        let said = close_at_issuer(&cfg, &mut card).await;
         say(&cfg, card, Word::UsedClosed(what, said));
     });
 }
@@ -2281,5 +2300,30 @@ mod tests {
             notes.iter().all(|n| !n.text.contains("issued")),
             "the agent is told nothing"
         );
+    }
+
+    /// A close asked with a copy read before the issue landed closes what the issuer made: the
+    /// reference is read from the record, not from the copy.
+    #[tokio::test]
+    async fn a_close_with_a_stale_copy_closes_the_card_the_issue_made() {
+        let dir = crate::test_dir("cards-stale-close");
+        let text = format!("rpi = '/r'\nhome = {dir:?}\n[cards]\nprovider = 'fake'\n");
+        let mut cfg: Config = toml::from_str(&text).unwrap();
+        cfg.cards_fake = true;
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let new = NewCard {
+            provider: "fake".into(),
+            origin: "https://shop.example".into(),
+            currency: "CAD".into(),
+            cap_minor: 1000,
+            expires_at: crate::now() + 900,
+            ..NewCard::default()
+        };
+        let id = store.add_card(&new).unwrap();
+        let mut stale = store.card(id).unwrap().unwrap();
+        assert!(store.card_issued(id, "fake-1", None).unwrap());
+        assert_eq!(close_at_issuer(&cfg, &mut stale).await, Ok(()));
+        let log = Fake::script(&cfg, |s| s.log.clone());
+        assert_eq!(log, [format!("close {id}")]);
     }
 }

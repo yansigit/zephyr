@@ -9254,3 +9254,39 @@ async fn a_fill_with_no_number_covers_no_pay_click() {
     assert_eq!(card_status(&home, 1), "open");
     gw.shutdown().await;
 }
+
+/// A close lands in the moment between the issue recording the card and telling the owner
+/// (here a trigger closes it as its reference is written): the card is closed at the issuer,
+/// and the owner is never told to approve it.
+#[tokio::test]
+async fn a_close_right_after_the_issue_recorded_the_card_is_carried_out() {
+    use zephyr::cards::Fake;
+    let (home, cfg) = card_home("card-close-at-landing", "fake", "auto 100");
+    let script = cfg.clone();
+    Fake::script(&script, |s| s.asks_owner = true);
+    drop(Store::open(&home.join("state.db")).unwrap());
+    rusqlite::Connection::open(home.join("state.db"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER close_at_landing AFTER UPDATE OF provider_ref ON cards
+             WHEN OLD.provider_ref IS NULL
+             BEGIN UPDATE cards SET status = 'closing' WHERE id = NEW.id; END;",
+        )
+        .unwrap();
+    let gw = start(cfg);
+    gw.say("l1", "owner", &card_ask("42.50")).await;
+    reply_where(&gw, "chat", |r| {
+        r.contains(
+            "\ncard: not run: card #1 was not issued: it was closed while it was being issued",
+        )
+    })
+    .await;
+    wait(|| Fake::script(&script, |s| s.log.contains(&"close 1".to_string()))).await;
+    wait(|| card_status(&home, 1) == "closed").await;
+    let said = gw.replies();
+    assert!(
+        !said.iter().any(|r| r.contains("approve it in Link")),
+        "{said:?}"
+    );
+    gw.shutdown().await;
+}
