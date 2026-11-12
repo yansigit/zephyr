@@ -276,10 +276,22 @@ open(os.path.join(home, "log.jsonl"), "a").write(json.dumps(
 if os.path.exists(os.path.join(home, "tool_sleep")):  # a tool left running in the child's group
     import subprocess
     open(os.path.join(home, "tool_pid"), "w").write(str(subprocess.Popen(["sleep", "300"]).pid))
+def until_sleep(pidfile):
+    """Waits (up to 5 s) for the stray in pidfile to be `sleep`: until it execs, it is still the
+    `sh` that forked it, and a busy machine lets the daemon see it by that name."""
+    pid = open(os.path.join(home, pidfile)).read().strip()
+    for _ in range(500):
+        try:
+            if open("/proc/%s/comm" % pid).read().strip() == "sleep":
+                return
+        except OSError:
+            return
+        time.sleep(0.01)
 if os.path.exists(os.path.join(home, "stray")):  # a process that escaped the child's group
     import subprocess
     subprocess.run(["sh", "-c", "setsid sleep 300 </dev/null >/dev/null 2>&1 & echo $! > stray_pid"],
                    cwd=home, check=True)
+    until_sleep("stray_pid")
 if os.path.isdir(os.environ.get("RPI_CODING_AGENT_DIR") or ""):  # which account started, for tests whose home is temporary
     open(os.path.join(os.environ["RPI_CODING_AGENT_DIR"], "starts.log"), "a").write("%s\n" % opt("--model"))
 
@@ -462,6 +474,7 @@ def quick(cmd, s):
             os.remove(soon)
             subprocess.run(["sh", "-c", "setsid sleep %s </dev/null >/dev/null 2>&1 & echo $! > stray_soon_pid" % secs],
                            cwd=home, check=True)
+            until_sleep("stray_soon_pid")
         respond(cmd, {"messages": s["messages"], "total": len(s["messages"]), "pendingResume": s["pending"]})
     elif kind == "get_commands":
         names = ["zephyr-policy"] if extension and os.path.exists(extension) else []
