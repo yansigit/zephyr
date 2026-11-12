@@ -1342,12 +1342,13 @@ deploy/release.sh --cli   # only the host CLI changed: reinstall it, publish not
 ```
 
 Every PR runs fmt, clippy (`-D warnings`, Rust 1.95 as the image) and the tests, and `cargo deny check
-advisories bans` (`.github/workflows/ci.yml`, see [CI](#ci)). The script stops at the first problem. It runs fmt,
-clippy and the tests, then the real-rpi suite (`ZEPHYR_REAL_RPI=1 cargo test -- --ignored`, which
-fails rather than skips when the pinned binary is missing) when the binary is on this machine
-(`RPI_BIN=<path>` points it at another copy; the default is the pinned path), sets the version in
-`Cargo.toml` (the CLI pulls `ghcr.io/yansigit/zephyr:<version>`), commits and tags `v<version>`,
-pushes, and waits for the image workflow. Then it installs the CLI into `~/.cargo/bin` (from the
+advisories bans` (`.github/workflows/ci.yml`, see [CI](#ci)). The script stops at the first problem,
+and first at a version that is not above `Cargo.toml`'s. It runs fmt, clippy and the tests, then
+the real-rpi suite (`ZEPHYR_REAL_RPI=1 cargo test -- --ignored`) against the pinned binary, fetched
+when it is missing; with no binary it stops (`RPI_BIN=<path>` points it at another copy; the default
+is the pinned path). Then it sets the version in `Cargo.toml` (the CLI pulls
+`ghcr.io/yansigit/zephyr:<version>`), commits and tags `v<version>`, pushes both at once (`git push
+--atomic`: the commit and the tag land together or not at all), and waits for the image workflow. Then it installs the CLI into `~/.cargo/bin` (from the
 clean tree, so nothing uncommitted ships) and runs `zephyr upgrade <version>`.
 
 `zephyr upgrade` waits until nothing is in flight: a message the agent is answering, a job run, a

@@ -4405,6 +4405,44 @@ fn release_and_runner_scripts_keep_their_defaults() {
     assert!(read(&deploy.join("bump-rpi.sh")).contains("rpi-$old/bin/rpi"));
 }
 
+/// release.sh refuses a version that is not above Cargo.toml's before it tests anything, and pushes
+/// the release commit and its tag together or not at all.
+#[test]
+fn release_only_moves_forward_and_pushes_atomically() {
+    let release = read(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/release.sh"
+    )));
+    let newer = release
+        .lines()
+        .find(|l| l.starts_with("newer() {"))
+        .expect("release.sh defines newer()");
+    for (version, current, ok) in [
+        ("0.2.1", "0.2.0", true),
+        ("0.10.0", "0.9.9", true),
+        ("1.0.0", "0.99.0", true),
+        ("0.2.0", "0.2.0", false),
+        ("0.1.9", "0.2.0", false),
+        ("0.9.0", "0.10.0", false),
+    ] {
+        let status = Command::new("bash")
+            .arg("-c")
+            .arg(format!("{newer}\nnewer {version} {current}"))
+            .status()
+            .unwrap();
+        assert_eq!(status.success(), ok, "{version} over {current}");
+    }
+    let check = "newer \"$version\" \"$current\" || die";
+    assert!(
+        release.find(check).unwrap() < release.find("\nstep \"testing\"\n").unwrap(),
+        "{release}"
+    );
+    assert!(
+        release.contains("\n  git push --atomic -q origin main \"$tag\"\n"),
+        "{release}"
+    );
+}
+
 /// Every file the image copies from the build context is let back in by `.dockerignore`
 /// (`*`, then `!PATH` per allowed path): one left out fails `docker build` at that COPY.
 #[test]

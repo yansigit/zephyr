@@ -90,7 +90,7 @@ check() {
   fi
   case $what in
     lint)
-      shellcheck deploy/install.sh deploy/runner/start.sh .github/ci.sh
+      shellcheck deploy/install.sh deploy/runner/start.sh deploy/release.sh deploy/bump-rpi.sh .github/ci.sh
       cargo fmt --all --check
       cargo clippy --all-targets -- -D warnings ;;
     deny) cargo deny check advisories bans ;;
