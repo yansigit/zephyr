@@ -496,6 +496,49 @@ async fn a_start_empties_signal_clis_attachments() {
     gw.shutdown().await;
 }
 
+/// A reply ends the typing it answers, before it goes, as on the other channels: the router's
+/// own `Stop` may come after it.
+#[tokio::test]
+async fn a_reply_stops_typing_before_it_is_sent() {
+    let home = dir("typing");
+    let cfg = config(&home, None, &[OWNER]);
+    let d = zephyr::signal::data_dir(&cfg);
+    let signal = Arc::new(Signal::new(&cfg).unwrap());
+    let (tx, _rx) = mpsc::channel(16);
+    let run = {
+        let signal = signal.clone();
+        tokio::spawn(async move { signal.run(tx).await })
+    };
+    wait(|| d.join(".ok").exists()).await;
+    let requests = || -> Vec<Value> {
+        let log = std::fs::read_to_string(d.join("log.jsonl")).unwrap_or_default();
+        (log.lines())
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|v| v["type"] == "request")
+            .map(|v| v["request"].clone())
+            .filter(|r| r["method"] == "sendTyping" || r["method"] == "send")
+            .collect()
+    };
+    signal.activity(OWNER, &Activity::Start).await.unwrap();
+    wait(|| !requests().is_empty()).await;
+    let msg = Outbound {
+        channel: "signal".into(),
+        recipient: OWNER.into(),
+        client_id: "z1".into(),
+        text: "done".into(),
+        attachment: None,
+        reply_to: None,
+    };
+    signal.send(&msg).await.unwrap();
+    let methods = requests();
+    let send = methods.iter().position(|r| r["method"] == "send").unwrap();
+    assert!(
+        methods[..send].iter().any(|r| r["params"]["stop"] == true),
+        "{methods:#?}"
+    );
+    run.abort();
+}
+
 #[tokio::test]
 async fn a_daemon_starting_during_a_hold_starts_no_signal_cli() {
     let home = dir("hold-start");

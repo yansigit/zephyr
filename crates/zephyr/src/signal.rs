@@ -103,6 +103,11 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
+/// `sendTyping`'s params that clear `to`'s indicator.
+fn typing_off(to: &str) -> Value {
+    json!({"recipient": [to], "stop": true})
+}
+
 /// A Signal ACI: a UUID, `8-4-4-4-12` hex digits.
 pub fn is_aci(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
@@ -267,7 +272,7 @@ pub struct Signal {
     /// For an ACI whose notice reached only some owners: who, so a retry tells only the rest.
     reached: Mutex<HashMap<String, HashSet<(String, String)>>>,
     /// The typing refresher per recipient.
-    typing: Mutex<HashMap<String, tokio::task::AbortHandle>>,
+    typing: crate::channel::Typing,
 }
 
 impl Signal {
@@ -288,7 +293,7 @@ impl Signal {
             delivered: Arc::default(),
             told: Mutex::default(),
             reached: Mutex::default(),
-            typing: Mutex::default(),
+            typing: Default::default(),
         })
     }
 
@@ -414,11 +419,7 @@ impl Signal {
         if let Some((mut row, files)) = row {
             if let Some(name) = named(&env) {
                 let mut names = self.names.lock().unwrap();
-                // shortcut: forgets every name when full, enough for a pairing notice; an LRU if names matter more.
-                if names.len() >= NAMES && !names.contains_key(&row.sender) {
-                    names.clear();
-                }
-                names.insert(row.sender.clone(), name);
+                crate::channel::remember(&mut names, NAMES, &row.sender, name);
             }
             let files = files.iter().map(|a| {
                 let id = a["id"].as_str().unwrap_or_default();
@@ -567,6 +568,12 @@ impl Channel for Signal {
             parts.push(String::new());
         }
         let last = parts.len().saturating_sub(1);
+        // The indicator clears before the reply, so it never outlasts it; briefly waited for,
+        // well inside the router's send timeout.
+        if self.typing.stop(&msg.recipient) {
+            let off = self.rpc.call("sendTyping", typing_off(&msg.recipient));
+            let _ = tokio::time::timeout(Duration::from_secs(2), off).await;
+        }
         let mut sending = (self.delivered).begin("signal", &msg.recipient, &msg.client_id)?;
         sending.total = parts.len();
         // In a task of its own: the router stops waiting after its timeout, but signal-cli sends
@@ -610,12 +617,8 @@ impl Channel for Signal {
         }
         match a {
             Activity::Start => {
-                let mut typing = self.typing.lock().unwrap();
-                if typing.contains_key(to) {
-                    return Ok(());
-                }
                 let (rpc, recipient) = (self.rpc.clone(), json!([to]));
-                let task = tokio::spawn(async move {
+                self.typing.start(to, async move {
                     loop {
                         let _ = rpc
                             .call("sendTyping", json!({"recipient": recipient}))
@@ -623,18 +626,13 @@ impl Channel for Signal {
                         tokio::time::sleep(TYPING_EVERY).await;
                     }
                 });
-                typing.insert(to.to_string(), task.abort_handle());
             }
             Activity::Progress { .. } => {}
-            Activity::Stop => {
-                let Some(task) = self.typing.lock().unwrap().remove(to) else {
-                    return Ok(());
-                };
-                task.abort();
-                let params = json!({"recipient": [to], "stop": true});
-                let rpc = self.rpc.clone();
+            Activity::Stop if self.typing.stop(to) => {
+                let (rpc, params) = (self.rpc.clone(), typing_off(to));
                 tokio::spawn(async move { rpc.call("sendTyping", params).await });
             }
+            Activity::Stop => {}
         }
         Ok(())
     }

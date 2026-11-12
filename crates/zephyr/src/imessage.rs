@@ -11,16 +11,14 @@ use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio::task::AbortHandle;
 
 /// Chat style 43 is a group chat (BlueBubbles `Chat.isGroup`). v1 ignores them, as Discord guilds are ignored.
 const GROUP_STYLE: i64 = 43;
@@ -79,7 +77,7 @@ pub struct IMessage {
     http: reqwest::Client,
     typing: bool,
     /// The refresh task for each recipient whose indicator is on. Clones share it, so any clone can stop it.
-    typing_tasks: Arc<Mutex<HashMap<String, AbortHandle>>>,
+    typing_tasks: crate::channel::Typing,
     /// Set by the first typing error of the run, so later ones are not logged.
     typing_warned: Arc<AtomicBool>,
     typing_refresh: Duration,
@@ -375,12 +373,8 @@ impl IMessage {
 
     /// Starts the refresh for `to`, unless one is running already.
     fn keep_refreshing(&self, to: &str) {
-        let mut tasks = self.typing_tasks.lock().unwrap_or_else(|e| e.into_inner());
-        if tasks.contains_key(to) {
-            return;
-        }
         let (me, chat) = (self.clone(), to.to_string());
-        let task = tokio::spawn(async move {
+        self.typing_tasks.start(to, async move {
             loop {
                 if let Err(e) = me.typing_request(Method::POST, &chat).await {
                     me.typing_error(e);
@@ -388,25 +382,16 @@ impl IMessage {
                 tokio::time::sleep(me.typing_refresh).await;
             }
         });
-        tasks.insert(to.to_string(), task.abort_handle());
     }
 
     /// Ends the refresh for `to` and clears its indicator. Nothing is sent if none was on.
     async fn stop_typing(&self, to: &str) -> anyhow::Result<()> {
-        let Some(task) = self.take_refresh(to) else {
+        if !self.typing_tasks.stop(to) {
             return Ok(());
-        };
-        task.abort();
+        }
         self.typing_request(Method::DELETE, to)
             .await
             .map_err(|e| self.typing_error(e))
-    }
-
-    fn take_refresh(&self, to: &str) -> Option<AbortHandle> {
-        self.typing_tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(to)
     }
 
     async fn typing_request(&self, method: Method, to: &str) -> anyhow::Result<()> {

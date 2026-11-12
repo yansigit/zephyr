@@ -131,6 +131,38 @@ impl Drop for Answer {
     }
 }
 
+/// The typing refresher per recipient (iMessage, Signal, Telegram): one task each, until its
+/// `stop`. Clones share it.
+#[derive(Clone, Default)]
+pub struct Typing(
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>>,
+);
+
+impl Typing {
+    /// Runs `refresh` for `to`, unless one runs already.
+    pub fn start(&self, to: &str, refresh: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !all.contains_key(to) {
+            all.insert(to.to_string(), tokio::spawn(refresh).abort_handle());
+        }
+    }
+
+    /// Ends `to`'s refresher; whether one ran.
+    pub fn stop(&self, to: &str) -> bool {
+        let task = self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(to);
+        task.map(|t| t.abort()).is_some()
+    }
+}
+
+/// `map[k] = v`, in a map of at most `cap` entries. shortcut: forgets every entry when full,
+/// enough for a pairing notice, which reads the name it just stored; an LRU if names matter more.
+pub fn remember<V>(map: &mut std::collections::HashMap<String, V>, cap: usize, k: &str, v: V) {
+    if map.len() >= cap && !map.contains_key(k) {
+        map.clear();
+    }
+    map.insert(k.to_string(), v);
+}
+
 /// Splits `text` into pieces of at most `max` UTF-16 units, breaking after newlines where possible.
 /// UTF-16 is counted because it is never smaller than the code-point count, so a piece that fits
 /// here fits whichever way a platform counts (Discord, Telegram, Signal). shortcut: a line longer than `max` is hard-split by char.
