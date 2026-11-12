@@ -3629,7 +3629,7 @@ fn vault_add_list_and_rm_reach_roots_file_and_never_put_a_value_in_argv() {
         "--from",
         "+14165550100",
         "--public-key",
-        "cHVibGlj",
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
     ];
     let out = env.zephyr_input(&service, &format!("{API_KEY}\n"));
     assert!(
@@ -3650,6 +3650,23 @@ fn vault_add_list_and_rm_reach_roots_file_and_never_put_a_value_in_argv() {
         .zephyr_input(&["vault", "add", "service", "cards"], "k\n")
         .status
         .success());
+    // Rotating the key alone: no other flag, and the saved ids stay.
+    let rotated = "KEYrotated9876543210";
+    let out = env.zephyr_input(
+        &["vault", "add", "service", "calls"],
+        &format!("{rotated}\n"),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let saved = std::fs::read_to_string(files.join("vault.toml")).unwrap();
+    assert!(
+        saved.contains(rotated) && !saved.contains(API_KEY),
+        "{saved}"
+    );
+    assert!(saved.contains("+14165550100") && saved.contains("1494404757140276705"));
 
     // A token's hosts are taken where the owner saves it (DESIGN §4.21), normalized; a wildcard
     // saves nothing; a new value keeps them.

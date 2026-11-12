@@ -158,12 +158,8 @@ impl Telnyx {
     fn service(&self) -> Result<Service, String> {
         let vault = crate::vault::Vault::load(&self.vault).map_err(|_| NOT_SET_UP)?;
         let s = vault.service(SERVICE).ok_or(NOT_SET_UP)?;
-        let whole = s.provider == "telnyx"
-            && !s.key.is_empty()
-            && !s.account.is_empty()
-            && s.from.starts_with('+')
-            && !s.public_key.is_empty();
-        whole.then_some(s).ok_or_else(|| NOT_SET_UP.into())
+        // The same check the owner's save went through (`Service::usable`).
+        s.usable().map(|()| s).map_err(|_| NOT_SET_UP.into())
     }
 
     /// The key Telnyx signs with, read from the vault only when the file changed since the
@@ -549,7 +545,7 @@ pub(crate) mod tests {
             r#"{"data":{"call_control_id":"v3:abc","is_alive":false}}"#,
         )
         .await;
-        let cfg = with_service("telnyx-dial", &api, "cHVi");
+        let cfg = with_service("telnyx-dial", &api, crate::vault::tests::TEST_PUBLIC_KEY);
         let telnyx = Telnyx::load(&cfg).unwrap();
         let dial = Dial {
             to: "+14165550123".into(),
@@ -589,7 +585,7 @@ pub(crate) mod tests {
             r#"{"errors":[{"code":"10009","title":"Authentication failed","detail":"The key KEY0123456789telnyx is not valid"}]}"#,
         )
         .await;
-        let cfg = with_service("telnyx-error", &api, "cHVi");
+        let cfg = with_service("telnyx-error", &api, crate::vault::tests::TEST_PUBLIC_KEY);
         let telnyx = Telnyx::load(&cfg).unwrap();
         let err = telnyx.hangup("v3:a/../b").await.unwrap_err();
         assert_eq!(
@@ -617,7 +613,11 @@ pub(crate) mod tests {
             serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
         };
         let (api, served) = stub(200, r#"{"data":{"call_control_id":"v3:abc"}}"#).await;
-        let cfg = with_service("telnyx-speech-dial", &api, "cHVi");
+        let cfg = with_service(
+            "telnyx-speech-dial",
+            &api,
+            crate::vault::tests::TEST_PUBLIC_KEY,
+        );
         let dial = Dial {
             to: "+15145550123".into(),
             stream_url: None,
@@ -634,7 +634,11 @@ pub(crate) mod tests {
         );
 
         let (api, served) = stub(200, r#"{"data":{"result":"ok"}}"#).await;
-        let cfg = with_service("telnyx-speech-speak", &api, "cHVi");
+        let cfg = with_service(
+            "telnyx-speech-speak",
+            &api,
+            crate::vault::tests::TEST_PUBLIC_KEY,
+        );
         let telnyx = Telnyx::load(&cfg).unwrap();
         telnyx.speak("v3:abc", "Bonjour.", "fr").await.unwrap();
         let request = served.await.unwrap();
@@ -648,7 +652,11 @@ pub(crate) mod tests {
         assert_eq!(voice("ko"), ("AWS.Polly.Seoyeon-Neural", "ko-KR"));
 
         let (api, served) = stub(200, r#"{"data":{"result":"ok"}}"#).await;
-        let cfg = with_service("telnyx-speech-hear", &api, "cHVi");
+        let cfg = with_service(
+            "telnyx-speech-hear",
+            &api,
+            crate::vault::tests::TEST_PUBLIC_KEY,
+        );
         let telnyx = Telnyx::load(&cfg).unwrap();
         telnyx.transcribe("v3:abc", "ko").await.unwrap();
         let request = served.await.unwrap();

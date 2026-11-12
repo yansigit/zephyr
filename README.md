@@ -764,6 +764,8 @@ Setting it up, once:
 2. On the host: `zephyr vault add service calls --provider telnyx --account CONNECTION_ID --from
    +1NUMBER --public-key KEY` (the application's connection id, your number, and the account's
    public key from the portal's API keys page; the API key is asked for at a hidden prompt).
+   To change one of them later, give only that flag; `zephyr vault add service calls` with none
+   changes the key alone.
 3. Telnyx connects to zephyr from the internet, so one port must be reachable: `zephyr config set
    calls.port 7794`, front it on the host with `sudo tailscale funnel --bg 7794` (or your own
    HTTPS front), and `zephyr config set calls.media_url wss://YOUR-HOST.ts.net`. That port answers only Telnyx's signed requests.

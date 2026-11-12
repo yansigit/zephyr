@@ -1207,18 +1207,19 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
         }
         // A provider's key (DESIGN §4.25): taken only here, never in a chat.
         ["add", "service", name] => {
-            let provider =
-                provider.with_context(|| format!("add service needs --provider\n{usage}"))?;
-            let key = secret(&format!("{provider} API key, empty for none or to keep it"))?;
+            // Given fields go onto the saved service, so `add service calls` alone rotates the key.
+            let provider = provider.unwrap_or_default();
+            let key = secret(&format!("{name} API key, empty for none or to keep it"))?;
             vault.put_service(crate::vault::Service {
                 name: name.into(),
-                provider: provider.clone(),
+                provider,
                 key,
                 account: account.unwrap_or_default(),
                 from: from.unwrap_or_default(),
                 public_key: public_key.unwrap_or_default(),
                 api: api.unwrap_or_default(),
             })?;
+            let provider = vault.service(name).map(|s| s.provider).unwrap_or_default();
             format!("saved the {name} service ({provider}); only zephyr's own client reads it")
         }
         ["edit", name] => {

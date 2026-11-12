@@ -965,7 +965,11 @@ pub(crate) mod tests {
             );
         }
         // Set up: every line is ok, and none holds the key.
-        let mut cfg = telnyx::tests::with_service("calls-doctor-ok", "", "cHVi");
+        let mut cfg = telnyx::tests::with_service(
+            "calls-doctor-ok",
+            "",
+            crate::vault::tests::TEST_PUBLIC_KEY,
+        );
         cfg.calls = cfg.calls.clone().map(|mut c| {
             (c.port, c.media_url) = (Some(7794), Some("wss://box.example.ts.net".into()));
             c
