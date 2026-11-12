@@ -2110,7 +2110,7 @@ fn used(cfg: &Arc<Config>, store: &Store, card: Card, charges: &[Charge], now: i
     // The window counts what the issuer took in all, when that is more than the cap; in another
     // currency it cannot be counted, and the window holds the next payment as over.
     let same = charges.iter().all(|c| c.currency == card.currency);
-    let total = same.then(|| charges.iter().map(|c| c.minor).sum());
+    let total = same.then(|| (charges.iter()).fold(0i64, |sum, c| sum.saturating_add(c.minor)));
     let over = first.minor > card.cap_minor || first.currency != card.currency;
     let text = (over || charges.len() > 1).then(|| {
         let all: Vec<String> = charges.iter().map(charged).collect();

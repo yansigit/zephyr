@@ -62,6 +62,14 @@ fn override_text(day: &str, limits: &[String]) -> String {
 /// The `memory_commits` origin of a `/forget` commit (DESIGN §4.6).
 pub const FORGET_ORIGIN: &str = "you (/forget)";
 
+/// The largest amount a payment row holds, in minor units (10 billion in a two-decimal
+/// currency): a larger one is just huge, and many of them still sum within an `i64`.
+pub const MAX_MINOR: i64 = 1_000_000_000_000;
+
+fn huge(minor: i64) -> i64 {
+    minor.clamp(0, MAX_MINOR)
+}
+
 /// An inbox row the router still has to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboxRow {
@@ -1979,7 +1987,8 @@ impl Store {
     }
 
     /// One money effect that went or was approved (DESIGN §4.25), written as it is let go:
-    /// what the payment window counts. `minor` is `None` for an amount that was not read.
+    /// what the payment window counts. `minor` is `None` for an amount that was not read, and
+    /// held to at most [`MAX_MINOR`].
     pub fn add_payment(
         &self,
         at: i64,
@@ -1990,7 +1999,7 @@ impl Store {
     ) -> rusqlite::Result<()> {
         self.db.execute(
             "INSERT INTO payments(at, minor, currency, source, proposal) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![at, minor, currency, source, proposal],
+            params![at, minor.map(huge), currency, source, proposal],
         )?;
         Ok(())
     }
@@ -2039,10 +2048,17 @@ impl Store {
     }
 
     /// Takes payment row `id` out of the window: what it counted never started.
+    /// The card it was for lets go of it too, so a later payment that gets the same id (SQLite
+    /// reuses the highest) is never taken for that card's.
     pub fn unpay(&self, id: i64) -> rusqlite::Result<()> {
-        self.db
-            .execute("DELETE FROM payments WHERE id = ?1", params![id])?;
-        Ok(())
+        self.atomically(|store| {
+            let card = "UPDATE cards SET payment = NULL WHERE payment = ?1";
+            store.db.execute(card, params![id])?;
+            store
+                .db
+                .execute("DELETE FROM payments WHERE id = ?1", params![id])?;
+            Ok(())
+        })
     }
 
     /// Puts an action `/ok` took back to waiting for the owner: its payment did not fit the
@@ -2061,7 +2077,7 @@ impl Store {
     pub fn payments_since(&self, since: i64, currency: &str) -> rusqlite::Result<(u32, i64, bool)> {
         self.db.query_row(
             "SELECT count(*),
-                    coalesce(sum(CASE WHEN currency = ?2 THEN minor END), 0),
+                    CAST(total(CASE WHEN currency = ?2 THEN minor END) AS INTEGER),
                     coalesce(max(minor IS NULL OR currency != ?2), 0)
              FROM payments WHERE at > ?1",
             params![since, currency],
@@ -2144,7 +2160,7 @@ impl Store {
             "UPDATE payments SET minor = CASE WHEN ?2 IS NULL THEN NULL ELSE max(minor, ?2) END,
                     source = CASE WHEN ?2 IS NULL THEN 'charge' ELSE source END
              WHERE id = (SELECT payment FROM cards WHERE id = ?1) AND minor IS NOT NULL",
-            params![id, total],
+            params![id, total.map(huge)],
         )?;
         Ok(())
     }
@@ -4198,6 +4214,39 @@ mod tests {
             derived: None,
             sent_at: None,
         }
+    }
+
+    /// A card's payment row taken out is no longer the card's: a new payment that gets the same
+    /// id (SQLite reuses the highest) is never changed by that card's charge.
+    #[test]
+    fn an_unpaid_row_is_no_longer_its_cards() {
+        let dir = crate::test_dir("store-unpay-reuse");
+        let store = Store::open(&dir.join("state.db")).unwrap();
+        store
+            .add_payment(1, Some(1000), "CAD", "auto", None)
+            .unwrap();
+        let row = store.db.last_insert_rowid();
+        let card = NewCard {
+            payment: Some(row),
+            provider: "fake".into(),
+            origin: "https://shop.example".into(),
+            currency: "CAD".into(),
+            cap_minor: 1000,
+            expires_at: crate::now() + 900,
+            ..NewCard::default()
+        };
+        let id = store.add_card(&card).unwrap();
+        store.unpay(row).unwrap();
+        store
+            .add_payment(2, Some(500), "CAD", "auto", None)
+            .unwrap();
+        assert_eq!(store.db.last_insert_rowid(), row, "SQLite reused the id");
+        store.card_paid(id, Some(9000)).unwrap();
+        let minor = |id: i64| -> i64 {
+            let sql = "SELECT minor FROM payments WHERE id = ?1";
+            store.db.query_row(sql, params![id], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(minor(row), 500, "the new payment is not the old card's");
     }
 
     #[test]

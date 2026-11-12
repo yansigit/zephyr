@@ -5810,6 +5810,24 @@ mod tests {
         assert_eq!(h.store.payments_since(now - 600, "CAD").unwrap().0, 0);
     }
 
+    /// Payments of amounts no sum can hold (a 1e300 one the owner let go) leave the window
+    /// readable: the next payment is decided, held as over it, never refused for an error.
+    #[test]
+    fn a_huge_payment_in_the_window_leaves_decisions_readable() {
+        let h = home("gate-window-huge", AUTO_100);
+        let now = crate::now();
+        let huge = approvals::minor_of(1e300, "CAD");
+        h.store
+            .add_payment(now - 2, Some(huge), "CAD", "ok", None)
+            .unwrap();
+        h.store
+            .add_payment(now - 1, Some(huge), "CAD", "ok", None)
+            .unwrap();
+        assert!(h.store.payments_since(now - 600, "CAD").is_ok());
+        let id = held(&decide(&h.cfg, &h.store, &card_of("10"), owner(), now));
+        assert!(h.store.action_strong(id).unwrap());
+    }
+
     /// A payment in the window whose amount is unknown (a card charged in another currency)
     /// leaves the window's sum unknown: with an amount limit, the next payment is held strong
     /// until it leaves the window.
