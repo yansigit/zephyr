@@ -865,6 +865,51 @@ async fn the_listener_takes_only_telnyx() {
     gw.shutdown().await;
 }
 
+/// A webhook whose body never comes holds its connection only for the body deadline: 16 of
+/// them, every slot the listener has, are answered 408 and the call then goes through.
+#[tokio::test]
+async fn stalled_bodies_do_not_block_the_call() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // The other party's side waits past the deadline, then streams and answers.
+    let (gw, telnyx) = start(
+        "stalled",
+        "wait 12\nstream\nanswer\nexpect Hello.\nhangup\n",
+        "Hello.",
+        "",
+        |_| {},
+    )
+    .await;
+    let addr = std::fs::read_to_string(telnyx.dir.join("connect")).unwrap();
+    let mut stalled = Vec::new();
+    for _ in 0..16 {
+        let mut conn = loop {
+            // Once the router has the listener up.
+            match tokio::net::TcpStream::connect(&addr).await {
+                Ok(conn) => break conn,
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        };
+        let head = "POST /calls/events HTTP/1.1\r\nHost: calls.test\r\n\
+                    telnyx-timestamp: 1\r\ntelnyx-signature-ed25519: x\r\n\
+                    Content-Length: 100\r\n\r\n{\"data\":";
+        conn.write_all(head.as_bytes()).await.unwrap();
+        stalled.push(tokio::spawn(async move {
+            let mut got = String::new();
+            let read = conn.read_to_string(&mut got);
+            let _ = tokio::time::timeout(Duration::from_secs(30), read).await;
+            got.lines().next().unwrap_or_default().to_string()
+        }));
+    }
+    gw.ask_and_approve().await;
+    for conn in stalled {
+        assert_eq!(conn.await.unwrap(), "HTTP/1.1 408 Request Timeout");
+    }
+    let ended = gw.ended().await;
+    assert!(ended.ends_with("by the other party"), "{ended}");
+    assert!(telnyx.heard().starts_with(OPENING));
+    gw.shutdown().await;
+}
+
 /// The status line of a plain GET to the calls listener.
 async fn http_get(addr: &str, path: &str) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

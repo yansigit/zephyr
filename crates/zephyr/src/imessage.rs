@@ -6,12 +6,10 @@
 
 use crate::channel::{Activity, Channel, Inbound, Outbound};
 use anyhow::Context as _;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -30,8 +28,6 @@ const GROUP_STYLE: i64 = 43;
 const MAX_BODY: usize = 64 * 1024;
 /// Webhook connections served at once; one more is closed as it arrives.
 const MAX_CONNS: usize = 32;
-/// How long a webhook connection has to send its request head.
-const HEAD_WAIT: Duration = Duration::from_secs(10);
 /// The most one BlueBubbles request may take (a backfill, a file either way); a whole send has
 /// `channel::SEND_CAP`.
 const REQUEST_WAIT: Duration = Duration::from_secs(120);
@@ -254,10 +250,11 @@ async fn webhook(req: Request<Incoming>, queue: Queue, secret: String) -> Respon
     if !given.is_some_and(|g| bool::from(g.as_bytes().ct_eq(secret.as_bytes()))) {
         return status(StatusCode::UNAUTHORIZED);
     }
-    let Ok(body) = Limited::new(req.into_body(), MAX_BODY).collect().await else {
-        return status(StatusCode::BAD_REQUEST);
+    let body = match crate::web::body(req, MAX_BODY).await {
+        Ok(body) => body,
+        Err(code) => return status(code),
     };
-    match to_inbound(&body.to_bytes()) {
+    match to_inbound(&body) {
         Ok(Some(row)) => {
             // A closed queue means run() is returning. BlueBubbles does not retry a webhook.
             let sent = queue.send(row).is_ok();
@@ -293,34 +290,12 @@ async fn serve(listener: TcpListener, tx: mpsc::Sender<Inbound>, this: IMessage)
             }
         }
     });
-    // Anything that reaches the port can connect (the agent too, under host networking): a cap,
-    // so idle sockets cannot use up the daemon's file descriptors, and `HEAD_WAIT` for the head.
-    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
-    loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            // shortcut: a persistent accept error (e.g. out of fds) retries every 100 ms with no backoff.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        };
-        let Ok(slot) = slots.clone().try_acquire_owned() else {
-            continue; // dropped, so closed at once
-        };
+    let svc = service_fn(move |req| {
         let (queue, secret) = (queue.clone(), secret.clone());
-        tokio::spawn(async move {
-            let svc = service_fn(move |req| {
-                let (queue, secret) = (queue.clone(), secret.clone());
-                async move { Ok::<_, Infallible>(webhook(req, queue, secret).await) }
-            });
-            // One request per connection, so the head deadline bounds an idle one too.
-            let _ = http1::Builder::new()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(HEAD_WAIT)
-                .keep_alive(false)
-                .serve_connection(TokioIo::new(stream), svc)
-                .await;
-            drop(slot);
-        });
-    }
+        async move { Ok::<_, Infallible>(webhook(req, queue, secret).await) }
+    });
+    // One request per connection.
+    crate::web::listen(listener, MAX_CONNS, false, svc).await
 }
 
 fn redact(text: &str, password: &str) -> String {
@@ -628,6 +603,9 @@ impl IMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
+    use hyper::server::conn::http1;
+    use hyper_util::rt::TokioIo;
 
     const NEW: &str = include_str!("../tests/fixtures/bluebubbles/new-message.json");
     const FROM_ME: &str = include_str!("../tests/fixtures/bluebubbles/from-me.json");
