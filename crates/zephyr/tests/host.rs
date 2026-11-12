@@ -3667,6 +3667,34 @@ fn vault_add_list_and_rm_reach_roots_file_and_never_put_a_value_in_argv() {
         "{saved}"
     );
     assert!(saved.contains("+14165550100") && saved.contains("1494404757140276705"));
+    // `rm` says what it removed, and never leaves a provider key behind while saying so. A
+    // login of the same name, from a hand-edited file, goes first; the service stays until it
+    // is named.
+    let both = format!(
+        "[[login]]\nname = \"calls\"\nsite = \"https://example.com\"\nusername = \"u\"\n\
+         password = \"p\"\n\n{saved}"
+    );
+    std::fs::write(files.join("vault.toml"), both).unwrap();
+    assert_eq!(
+        env.ok(&["vault", "rm", "calls"]).trim(),
+        "removed the login calls; the service calls is still saved: zephyr vault rm service \
+         calls removes it"
+    );
+    assert!(std::fs::read_to_string(files.join("vault.toml"))
+        .unwrap()
+        .contains(rotated));
+    assert_eq!(
+        env.ok(&["vault", "rm", "service", "calls"]).trim(),
+        "removed the service calls and its provider key"
+    );
+    assert!(!std::fs::read_to_string(files.join("vault.toml"))
+        .unwrap()
+        .contains(rotated));
+    assert!(!env
+        .zephyr(&["vault", "rm", "service", "calls"])
+        .status
+        .success());
+    assert!(!env.zephyr(&["vault", "rm", "calls"]).status.success());
 
     // A token's hosts are taken where the owner saves it (DESIGN §4.21), normalized; a wildcard
     // saves nothing; a new value keeps them.

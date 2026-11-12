@@ -518,6 +518,10 @@ impl Vault {
     /// one saved. Grants are never set here, only kept: a login's survives while its site stays
     /// the same, a token's always. Returns whether the entry is new.
     pub fn put(&mut self, mut new: Entry) -> anyhow::Result<bool> {
+        // One name, one thing: `rm` and `/vault` never have to guess (DESIGN §4.25).
+        if SERVICES.contains(&new.name.as_str()) {
+            bail!("{} is a service's name; pick another", new.name);
+        }
         let old = self.get(&new.name);
         match &old {
             Some(old) if old.kind != new.kind => {
@@ -1956,6 +1960,25 @@ programs = ["gh"]
             ("KEYrotated9876543210", "+16045550100", "telnyx")
         );
         assert_eq!(v.service("cards").unwrap().account, "lwlpk_x");
+    }
+
+    /// A login or a token never takes a service's name, so `rm` and `/vault` mean one thing.
+    #[test]
+    fn an_entry_never_takes_a_services_name() {
+        let mut v = Vault::parse("").unwrap();
+        for name in SERVICES {
+            let login = Entry {
+                kind: Kind::Login,
+                name: name.into(),
+                site: "https://example.com".into(),
+                username: "u".into(),
+                password: "p".into(),
+                ..Entry::default()
+            };
+            let said = format!("{:#}", v.put(login).unwrap_err());
+            assert_eq!(said, format!("{name} is a service's name; pick another"));
+        }
+        assert!(v.entries().is_empty());
     }
 
     impl Vault {

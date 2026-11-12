@@ -1118,7 +1118,7 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let rest = a.rest()?;
     let usage = "usage: zephyr vault list | add login NAME --site URL [--user U] [--totp] | \
                  add token NAME [--host HOST].. [--header HEADER].. | edit NAME [--site URL] \
-                 [--user U] [--totp] [--host HOST].. [--header HEADER].. | rm NAME | \
+                 [--user U] [--totp] [--host HOST].. [--header HEADER].. | rm NAME | rm service NAME | \
                  revoke NAME [PROGRAM] | add service cards --provider NAME [--account ID] | \
                  add service calls --provider telnyx --account CONNECTION_ID --from +1NUMBER \
                  --public-key KEY";
@@ -1245,10 +1245,35 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
             vault.put(e)?;
             format!("saved {name}")
         }
-        ["rm", name] => match vault.remove(name) || vault.remove_service(name) {
-            true => format!("removed {name}"),
-            false => bail!("no entry named {name} in the vault"),
+        ["rm", "service", name] => match vault.remove_service(name) {
+            true => format!("removed the service {name} and its provider key"),
+            false => bail!("no service named {name} in the vault"),
         },
+        // Says what went; a service of the same name stays until it is named, so no provider
+        // key is left behind under a "removed".
+        ["rm", name] => {
+            let entry = vault.get(name).map(|e| match e.kind {
+                crate::vault::Kind::Login => "login",
+                crate::vault::Kind::Token => "token",
+            });
+            match (entry, vault.service(name).is_some()) {
+                (Some(kind), service) => {
+                    vault.remove(name);
+                    match service {
+                        true => format!(
+                            "removed the {kind} {name}; the service {name} is still saved: \
+                             zephyr vault rm service {name} removes it"
+                        ),
+                        false => format!("removed the {kind} {name}"),
+                    }
+                }
+                (None, true) => {
+                    vault.remove_service(name);
+                    format!("removed the service {name} and its provider key")
+                }
+                (None, false) => bail!("no entry named {name} in the vault"),
+            }
+        }
         ["revoke", name] => vault.revoke(name, None)?,
         ["revoke", name, program] => vault.revoke(name, Some(program))?,
         _ => bail!("{usage}"),
