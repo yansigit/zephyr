@@ -245,6 +245,42 @@ fn status_fails_without_a_daemon_or_with_a_stale_heartbeat() {
     );
 }
 
+/// Review of PR #63, 6: a clock that jumped makes a beating daemon's heartbeat look old; it is
+/// hung only when the line does not change over a tick, as `supervise` judges it.
+#[test]
+fn status_calls_an_old_heartbeat_that_still_changes_healthy() {
+    let (home, cfg) = setup("status-clock", "");
+    let running = daemon(&cfg, &home);
+    let beat = home.join("heartbeat");
+    let start = Instant::now();
+    while !beat.exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "no heartbeat");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Frozen, so only this writes it: a wall time 400 s back, a line that changes.
+    let pid = running.0.id() as i32;
+    // SAFETY: plain syscalls to our own child.
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (beat, done) = (beat.clone(), done.clone());
+        std::thread::spawn(move || {
+            for n in 0.. {
+                if done.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                std::fs::write(&beat, format!("{} 1 {n}\n", zephyr::now() - 400)).unwrap();
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        })
+    };
+    let out = zephyr(&cfg, &["status"]);
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    writer.join().unwrap();
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    assert!(out.status.success(), "{out:?}");
+}
+
 #[test]
 fn status_shows_the_main_child_the_waiting_message_and_the_replies() {
     let (home, cfg) = setup("status-ops", "");

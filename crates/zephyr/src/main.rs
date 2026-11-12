@@ -572,7 +572,13 @@ async fn status(cfg: &Config) -> anyhow::Result<()> {
         anyhow::bail!("the daemon is not running");
     }
     if beat.is_none_or(|s| s >= STALE.as_secs()) {
-        anyhow::bail!("the daemon is hung: no heartbeat for {}s", STALE.as_secs());
+        // Its time may be old only because the clock jumped: hung when the line, as `supervise`
+        // judges it, does not change over a tick either.
+        tokio::time::sleep(cfg.tick + Duration::from_secs(1)).await;
+        let again = std::fs::read_to_string(cfg.state_dir().join(HEARTBEAT)).unwrap_or_default();
+        if file.is_empty() || again == file {
+            anyhow::bail!("the daemon is hung: no heartbeat for {}s", STALE.as_secs());
+        }
     }
     Ok(())
 }
