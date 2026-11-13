@@ -438,8 +438,14 @@ while time.time() < deadline:
         if i >= 0:
             at = i + len(prompt)
             time.sleep(0.2)
+            # The daemon's edit while the owner types: PTY_TEXT appended to PTY_APPEND, once.
+            if os.environ.get("PTY_APPEND"):
+                with open(os.environ.pop("PTY_APPEND"), "a") as f:
+                    f.write(os.environ["PTY_TEXT"])
             os.write(fd, keys.encode())
             steps.pop(0)
+if time.time() >= deadline:
+    os.kill(pid, 9)  # hung: fail the test, never wait on it
 _, status = os.waitpid(pid, 0)
 print(seen)
 print("LEFT", len(steps))
@@ -893,6 +899,61 @@ fn init_again_with_a_preset_drops_looser_hand_set_classes() {
     );
     assert!(!config.contains("money ="), "looser than manual: {config}");
     assert!(config.contains("posts = \"ask\""), "as strict: {config}");
+}
+
+/// The daemon may write zephyr.toml or vault.toml while the owner types a secret: what it
+/// wrote meanwhile is kept, not undone by a copy read before the prompt.
+#[test]
+fn an_edit_made_while_a_secret_is_typed_survives() {
+    let env = Env::new("prompt-edit");
+    env.init(&["--no-start"]);
+    let toml = env.daemon().join("zephyr.toml").display().to_string();
+    let (code, out) = env.on_a_driven_tty_env(
+        &[
+            "mcp",
+            "add",
+            "mail",
+            "--secret",
+            "MAIL_KEY",
+            "--",
+            "mail-server",
+        ],
+        &[("MAIL_KEY (hidden)", "s3cret\r")],
+        &[
+            ("PTY_APPEND", &toml),
+            ("PTY_TEXT", "\n[tasks]\nparallel = 3\n"),
+        ],
+    );
+    assert_eq!(code, 0, "{out}");
+    let config = env.config();
+    assert!(config.contains("parallel = 3"), "{config}");
+    assert!(config.contains("\"mail-server\""), "{config}");
+
+    let vault = env.daemon().join("vault.toml").display().to_string();
+    let (code, out) = env.on_a_driven_tty_env(
+        &[
+            "vault",
+            "add",
+            "login",
+            "github",
+            "--site",
+            "https://github.com",
+        ],
+        &[("password for github (hidden)", "hunter22\r")],
+        &[
+            ("PTY_APPEND", &vault),
+            (
+                "PTY_TEXT",
+                "[[token]]\nname = \"GH_TOKEN\"\nvalue = \"ghp_x\"\n",
+            ),
+        ],
+    );
+    assert_eq!(code, 0, "{out}");
+    let list = env.ok(&["vault", "list"]);
+    assert!(
+        list.contains("token GH_TOKEN") && list.contains("login github"),
+        "{list}"
+    );
 }
 
 /// D4: adding a connector again (a new URL or command) keeps the classes the owner gave its

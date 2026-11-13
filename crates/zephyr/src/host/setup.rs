@@ -1058,30 +1058,14 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
     if !secrets.is_empty() && !h.interactive {
         bail!("--secret asks for the value: run it in a terminal");
     }
-    for key in &secrets {
-        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            bail!("--secret {key:?}: use a variable name (letters, digits, '_')");
-        }
-        let value = Password::new()
-            .with_prompt(format!("{key} (hidden)"))
-            .interact()?;
-        h.data.set_secret(key, value.trim())?;
+    if let Some(key) = (secrets.iter())
+        .find(|k| k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    {
+        bail!("--secret {key:?}: use a variable name (letters, digits, '_')");
     }
-    for s in &wanted {
-        println!("{}: {}", s.name, s.help);
-        if !h.interactive {
-            let name = catalog.as_deref().unwrap_or_default();
-            println!(
-                "set it in a terminal with: zephyr mcp add {name} --secret {}",
-                s.name
-            );
-            continue;
-        }
-        let value = Password::new()
-            .with_prompt(format!("{} (hidden)", s.name))
-            .interact()?;
-        h.data.set_secret(&s.name, value.trim())?;
-    }
+    // Saved before the values are asked: the daemon may edit zephyr.toml while the owner types,
+    // which a save after the prompt would undo. Until they are set the connector is left out, as
+    // one added without a terminal is.
     h.data.save(&doc)?;
     // Which connectors came from the catalog, for doctor's note (DESIGN §4.22): the daemon's
     // file, never zephyr.toml.
@@ -1101,6 +1085,27 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
                 eprintln!("warn {e:#}: zephyr doctor may not say when a newer catalog entry ships");
             }
         }
+    }
+    for key in &secrets {
+        let value = Password::new()
+            .with_prompt(format!("{key} (hidden)"))
+            .interact()?;
+        h.data.set_secret(key, value.trim())?;
+    }
+    for s in &wanted {
+        println!("{}: {}", s.name, s.help);
+        if !h.interactive {
+            let name = catalog.as_deref().unwrap_or_default();
+            println!(
+                "set it in a terminal with: zephyr mcp add {name} --secret {}",
+                s.name
+            );
+            continue;
+        }
+        let value = Password::new()
+            .with_prompt(format!("{} (hidden)", s.name))
+            .interact()?;
+        h.data.set_secret(&s.name, value.trim())?;
     }
     match &catalog {
         Some(name) => println!("saved the catalog connector {name}"),
@@ -1138,18 +1143,28 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
                  revoke NAME [PROGRAM] | add service cards --provider NAME [--account ID] | \
                  add service calls --provider telnyx --account CONNECTION_ID --from +1NUMBER \
                  --public-key KEY";
-    let text = match h.data.read(crate::vault::FILE) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        r => r?,
+    // Read again after a prompt: the daemon writes this file too (a grant, a bind), and what it
+    // wrote while the owner typed must not be undone.
+    let read = || -> anyhow::Result<Vault> {
+        let text = match h.data.read(crate::vault::FILE) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            r => r?,
+        };
+        Vault::parse(&text)
     };
-    let mut vault = Vault::parse(&text)?;
-    let mut lines = std::io::stdin().lines();
-    let mut secret = |prompt: &str| -> anyhow::Result<String> {
+    let mut vault = read()?;
+    // A line at a time: a `lines()` kept across the prompt would hold stdin's lock, which the
+    // terminal prompt then waits on forever.
+    let secret = |prompt: &str| -> anyhow::Result<String> {
         if h.interactive {
             let p = Password::new().with_prompt(format!("{prompt} (hidden)"));
             return Ok(p.allow_empty_password(true).interact()?);
         }
-        Ok(lines.next().transpose()?.unwrap_or_default())
+        Ok(std::io::stdin()
+            .lines()
+            .next()
+            .transpose()?
+            .unwrap_or_default())
     };
     let args: Vec<&str> = rest.iter().map(String::as_str).collect();
     let said = match args[..] {
@@ -1172,6 +1187,7 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
                 true => secret("TOTP seed (BASE32)")?,
                 false => String::new(),
             };
+            vault = read()?;
             vault.put(Entry {
                 kind: Kind::Login,
                 name: name.into(),
@@ -1198,6 +1214,7 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
                     .map(String::from)
                     .collect();
             }
+            vault = read()?;
             vault.put(Entry {
                 kind: Kind::Token,
                 name: name.into(),
@@ -1225,6 +1242,7 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
             // Given fields go onto the saved service, so `add service calls` alone rotates the key.
             let provider = provider.unwrap_or_default();
             let key = secret(&format!("{name} API key, empty for none or to keep it"))?;
+            vault = read()?;
             vault.put_service(crate::vault::Service {
                 name: name.into(),
                 provider,
@@ -1237,22 +1255,32 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
             format!("saved the {name} service ({provider}); only zephyr's own client reads it")
         }
         ["edit", name] => {
-            let mut e = vault
-                .get(name)
-                .with_context(|| format!("no entry named {name} in the vault"))?;
+            let missing = || format!("no entry named {name} in the vault");
+            let kind = vault.get(name).with_context(missing)?.kind;
             // An empty answer keeps what is saved.
-            match e.kind {
+            let (value, seed) = match kind {
+                Kind::Login => (
+                    secret("new password, empty keeps it")?,
+                    match totp {
+                        true => secret("new TOTP seed, empty keeps it")?,
+                        false => String::new(),
+                    },
+                ),
+                Kind::Token => (secret("new value, empty keeps it")?, String::new()),
+            };
+            vault = read()?;
+            let mut e = (vault.get(name))
+                .filter(|e| e.kind == kind)
+                .with_context(missing)?;
+            match kind {
                 Kind::Login => {
                     e.site = site.unwrap_or(e.site);
                     e.username = user.unwrap_or(e.username);
-                    e.password = secret("new password, empty keeps it")?;
-                    e.totp = match totp {
-                        true => secret("new TOTP seed, empty keeps it")?,
-                        false => String::new(),
-                    };
+                    e.password = value;
+                    e.totp = seed;
                 }
                 Kind::Token => {
-                    e.value = secret("new value, empty keeps it")?;
+                    e.value = value;
                     // None given keeps the ones saved.
                     e.hosts = hosts;
                     e.headers = headers;
