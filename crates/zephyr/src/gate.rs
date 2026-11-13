@@ -1218,13 +1218,12 @@ fn within(amount: Option<&Amount>, cap: u64, currency: &str) -> bool {
 }
 
 /// A notice for the owner on `origin`, else on the channel last answered.
+/// One that cannot be written now is owed to a later tick (`Store::owe_notice`).
 fn tell(store: &Store, origin: &(String, String), text: &str) {
-    if let Err(e) = told(store, origin, text) {
-        eprintln!("zephyr: telling the owner about a held action failed: {e}");
-    }
+    store.owe_notice(&origin.0, &origin.1, text);
 }
 
-/// [`tell`], its failure the caller's.
+/// [`tell`], its failure the caller's: a hold and its card land together.
 fn told(store: &Store, origin: &(String, String), text: &str) -> rusqlite::Result<()> {
     let (channel, to) = origin;
     match channel.is_empty() {
@@ -3713,6 +3712,37 @@ mod tests {
                 "{other}"
             );
         }
+    }
+
+    /// The gate's own notices (a fact sent under `warn`) are owed, not dropped, when they cannot
+    /// be written: a later tick writes them.
+    #[test]
+    fn a_warning_that_cannot_be_written_is_owed() {
+        let h = home(
+            "gate-warn-owed",
+            "[approvals]\npreset = 'full'\nfacts = 'warn'\n",
+        );
+        std::fs::write(crate::facts::path(&h.cfg), PHONE).unwrap();
+        let block = "CREATE TRIGGER no_outbox BEFORE INSERT ON outbox \
+                     BEGIN SELECT RAISE(ABORT, 'no outbox'); END";
+        h.store.db_for_test().execute_batch(block).unwrap();
+        let send = exec(
+            &mail_to("alice@example.com", "Call +1 (555) 010-2345."),
+            "main:5",
+        );
+        assert_eq!(
+            decide(&h.cfg, &h.store, &send, owner(), crate::now()),
+            Verdict::Allow
+        );
+        h.store
+            .db_for_test()
+            .execute_batch("DROP TRIGGER no_outbox")
+            .unwrap();
+        h.store.retry_owed();
+        assert_eq!(
+            notices(&h.store),
+            ["[zephyr] the agent sent your private fact phone to alice@example.com"]
+        );
     }
 
     /// Under `warn`, a fact found only because the command also goes somewhere unread names
