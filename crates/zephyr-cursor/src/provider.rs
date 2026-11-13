@@ -85,7 +85,7 @@ impl Turn {
         let token = auth::token(key).await?;
         let conversation_id = conversation_id(self.session_id.as_deref());
         let config = transport::SessionConfig {
-            url: wire::endpoint(),
+            url: wire::endpoint()?,
             token,
             conversation_id: conversation_id.clone(),
             request_id: uuid::Uuid::new_v4().to_string(),

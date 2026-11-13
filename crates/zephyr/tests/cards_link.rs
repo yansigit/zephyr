@@ -1,12 +1,14 @@
 //! The Link issuer against a stub of `api.link.com` and `login.link.com` (DESIGN §4.25), and
 //! the ignored live test the owner runs with their own Link account.
 
+mod common;
+use common::home;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::{Request, Response};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use zephyr::cards::{CardSpec, CardState, Issuer};
 use zephyr::cards_link::Link;
@@ -134,16 +136,6 @@ async fn stub() -> (String, Stub) {
         }
     });
     (format!("http://{addr}"), fake)
-}
-
-fn home(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "zephyr-link-{name}-{}-{}",
-        std::process::id(),
-        zephyr::unix_millis()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 const SERVICE: &str = "[[service]]\nname = \"cards\"\nprovider = \"link\"\nkey = \"\"\n\

@@ -115,10 +115,7 @@ fn cut(cfg: &Config, id: i64, output: &str) -> String {
     if output.len() <= MAX_REPORT {
         return output.to_string();
     }
-    let end = (0..=MAX_REPORT)
-        .rev()
-        .find(|&i| output.is_char_boundary(i))
-        .unwrap_or(0);
+    let end = output.floor_char_boundary(MAX_REPORT);
     let name = format!("tasks/{id}.md");
     let saved = {
         let _fs = crate::agent::fs();

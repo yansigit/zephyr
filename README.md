@@ -15,7 +15,7 @@ deploy/install.sh                    # installs the CLI, then runs zephyr init
 
 It copies the CLI out of `ghcr.io/yansigit/zephyr:latest` into `~/.local/bin/zephyr` (Linux
 x86_64; a failed pull logs in to ghcr.io with your `gh` token), or builds it with
-`cargo install --locked --path crates/zephyr` when the pull fails and `cargo` (1.89 or newer) is
+`cargo install --locked --path crates/zephyr` when the pull fails and `cargo` (1.91 or newer) is
 there; `--from-image` or `--from-source` picks one, `--no-init` stops before the wizard, and
 arguments after `--` go to `zephyr init`. It checks Docker answers as you and warns when Docker's
 disk has under 20 GB free. It installs no Docker or Rust (it names their install pages), never

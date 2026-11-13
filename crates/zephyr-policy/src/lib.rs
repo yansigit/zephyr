@@ -292,11 +292,7 @@ fn truncate(mut text: String, limit: usize) -> (String, bool) {
     if text.len() <= limit {
         return (text, false);
     }
-    let mut end = limit;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
+    text.truncate(text.floor_char_boundary(limit));
     (text, true)
 }
 

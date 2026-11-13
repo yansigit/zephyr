@@ -318,10 +318,10 @@ const END_STREAM_FLAG: u8 = 0x02;
 const ERROR_BODY_LIMIT: usize = 512;
 
 /// Where to connect and what to ask for, split out of [`SessionConfig::url`].
-struct Target {
-    tls: bool,
+pub(crate) struct Target {
+    pub(crate) tls: bool,
     /// Bare host, without brackets or port: used for DNS, TLS SNI and `:authority`.
-    host: String,
+    pub(crate) host: String,
     port: u16,
     /// `host[:port]` exactly as the URL spelled it; the caller's port, if any, is kept.
     authority: String,
@@ -329,7 +329,7 @@ struct Target {
 }
 
 impl Target {
-    fn parse(url: &str) -> anyhow::Result<Target> {
+    pub(crate) fn parse(url: &str) -> anyhow::Result<Target> {
         let (scheme, rest) = url
             .split_once("://")
             .with_context(|| format!("agent URL {url:?} has no scheme"))?;

@@ -59,6 +59,9 @@ fn override_text(day: &str, limits: &[String]) -> String {
         .join(" ")
 }
 
+/// The `memory_commits` origin of a `/forget` commit (DESIGN §4.6).
+pub const FORGET_ORIGIN: &str = "you (/forget)";
+
 /// An inbox row the router still has to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboxRow {
@@ -3098,6 +3101,16 @@ impl Store {
                 auto: r.get(3)?,
             })
         })?;
+        rows.collect()
+    }
+
+    /// The memory commits `/forget` made (origin `FORGET_ORIGIN`), which `/memory undo` takes back even when they touched
+    /// only notes.
+    pub fn forget_commits(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT sha FROM memory_commits WHERE origin = ?1")?;
+        let rows = stmt.query_map([FORGET_ORIGIN], |r| r.get(0))?;
         rows.collect()
     }
 

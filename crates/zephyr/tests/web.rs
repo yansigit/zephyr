@@ -2,6 +2,8 @@
 //! child (tests/fake-rpi.py). Requests carry what `tailscale serve` and a browser on the app's
 //! own origin would send.
 
+mod common;
+use common::{free_port, test_exe};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -44,26 +46,6 @@ struct Gateway {
     sent: tokio::sync::Mutex<mpsc::UnboundedReceiver<Outbound>>,
     stop: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<anyhow::Result<zephyr::router::Exit>>,
-}
-
-/// A port below the kernel's ephemeral range, never handed out twice by a process, from a random
-/// start per process (see tests/attach.rs `free_port`).
-fn free_port() -> u16 {
-    use std::hash::{BuildHasher, Hasher};
-    static START: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
-        let r = std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish();
-        (r % 12_000) as u32
-    });
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    loop {
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let port = 20_000 + ((*START + n) % 12_000) as u16;
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
 }
 
 fn new_home(name: &str) -> PathBuf {
@@ -2657,11 +2639,9 @@ async fn with_desktop(
     name: &str,
     tweak: impl FnOnce(&mut Config),
 ) -> (Gateway, Authenticator, Ws, String) {
-    use std::os::unix::fs::PermissionsExt;
     let home = new_home(name);
     let fake = home.join("x11vnc");
-    std::fs::write(&fake, X11VNC).unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    test_exe(&fake, X11VNC);
     let extra = "[approvals]\npreset = \"manual\"\n";
     let gw = start_in(&home, free_port(), extra, |cfg| {
         cfg.desktop = Some(":99".into());

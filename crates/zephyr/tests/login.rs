@@ -3,6 +3,8 @@
 //! own `RPI_CODING_AGENT_DIR`, reports what it printed, and records the account in `zephyr.toml`
 //! once `rpi auth check --json` says the credential is stored. Nothing here restarts the daemon.
 
+mod common;
+use common::{reap_logins_at_exit, wait};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -59,6 +61,7 @@ fn prune() {
 /// A fresh home with a `zephyr.toml` that already holds `extra`, loaded as the gateway would.
 fn setup(name: &str, extra: &str) -> (Config, PathBuf) {
     prune();
+    reap_logins_at_exit();
     let root = std::env::temp_dir().join(format!(
         "zephyr-login-{name}-{}-{}",
         std::process::id(),
@@ -96,17 +99,6 @@ async fn until(id: &str, mut done: impl FnMut(&Value) -> bool) -> Value {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("login {id} never settled: {:?}", zephyr::auth::poll(id));
-}
-
-/// Polls a condition on the filesystem for up to 20 s, then fails with `what`.
-async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
-    for _ in 0..400 {
-        if cond() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("timed out waiting for {what}");
 }
 
 /// The `start` lines `fake-rpi.py` logged for the children it ran on `dir`.
@@ -367,6 +359,77 @@ async fn a_key_login_records_the_account_and_never_reports_the_key() {
     }
 }
 
+/// Not a test of its own: `left_login` runs it in a process of its own, where it starts an OAuth
+/// sign-in and leaves it running, as a test that panics midway does. It writes the login's account
+/// dir to `$ZEPHYR_LEFT_LOGIN`, then ends, or with `$ZEPHYR_LEFT_LOGIN_HANG` waits to be killed.
+#[tokio::test]
+#[ignore]
+async fn leave_a_login_running() {
+    let Some(out) = std::env::var_os("ZEPHYR_LEFT_LOGIN") else {
+        return;
+    };
+    let (cfg, home) = setup("left", "");
+    std::fs::write(home.join("login_url"), "").unwrap();
+    let start = zephyr::auth::start(&cfg, "antigravity", None, Some("antigravity/m".into()))
+        .await
+        .unwrap();
+    let dir = cfg.home.join("accounts").join(&start.account);
+    let rpi = cfg.rpi.display().to_string();
+    // Waits for the login's rpi child to run.
+    wait(20, || {
+        login_processes(&dir)
+            .iter()
+            .any(|p| cmdline_of(*p).contains(&rpi))
+    })
+    .await;
+    let part = PathBuf::from(&out).with_extension("part");
+    std::fs::write(&part, dir.display().to_string()).unwrap();
+    std::fs::rename(&part, &out).unwrap();
+    if std::env::var_os("ZEPHYR_LEFT_LOGIN_HANG").is_some() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Runs `leave_a_login_running` in a process of its own, killed with SIGKILL once its login runs
+/// when `kill` (as nextest kills a test past its time), and checks that the login's `script` and
+/// the rpi under it died with that process.
+async fn left_login(kill: bool) {
+    let out = std::env::temp_dir().join(format!(
+        "zephyr-login-left-{kill}-{}-{}",
+        std::process::id(),
+        zephyr::unix_millis()
+    ));
+    let mut helper = std::process::Command::new(std::env::current_exe().unwrap());
+    helper
+        .args(["leave_a_login_running", "--exact", "--ignored"])
+        .env("ZEPHYR_LEFT_LOGIN", &out)
+        .stdout(std::process::Stdio::null());
+    if kill {
+        helper.env("ZEPHYR_LEFT_LOGIN_HANG", "1");
+    }
+    let mut helper = helper.spawn().unwrap();
+    // Waits for the helper's login to run.
+    wait(20, || out.exists()).await;
+    if kill {
+        helper.kill().unwrap();
+    }
+    assert_eq!(helper.wait().unwrap().success(), !kill);
+    let dir = PathBuf::from(std::fs::read_to_string(&out).unwrap());
+    let _ = std::fs::remove_file(&out);
+    // Waits for the left login's processes to die.
+    wait(20, || login_processes(&dir).iter().all(|p| dead(*p))).await;
+}
+
+#[tokio::test]
+async fn a_login_left_running_dies_with_its_test_process() {
+    left_login(false).await;
+}
+
+#[tokio::test]
+async fn a_login_dies_with_a_killed_test_process() {
+    left_login(true).await;
+}
+
 #[tokio::test]
 async fn a_login_that_finished_is_not_cancelled_by_a_late_cancel() {
     // The window is real: `pump` records the account and reports `done`, and a cancel that lands
@@ -508,14 +571,12 @@ async fn cancelling_a_waiting_login_kills_its_child_and_records_nothing() {
     // The prompt is out: the rpi child is up, with the `script` wrapper over it.
     until(&start.login_id, |l| l["phase"] == "need_input").await;
     let rpi = cfg.rpi.display().to_string();
-    wait_for(
-        || {
-            login_processes(&dir)
-                .iter()
-                .any(|p| cmdline_of(*p).contains(&rpi))
-        },
-        "the login's rpi child to run",
-    )
+    // Waits for the login's rpi child to run.
+    wait(20, || {
+        login_processes(&dir)
+            .iter()
+            .any(|p| cmdline_of(*p).contains(&rpi))
+    })
     .await;
     let children = login_processes(&dir);
     assert!(
@@ -526,17 +587,11 @@ async fn cancelling_a_waiting_login_kills_its_child_and_records_nothing() {
     );
 
     assert!(zephyr::auth::cancel(&start.login_id));
-    wait_for(
-        || login_processes(&dir).is_empty(),
-        "the cancelled login's processes to be gone",
-    )
-    .await;
+    // Waits for the cancelled login's processes to be gone.
+    wait(20, || login_processes(&dir).is_empty()).await;
     // An exiting process leaves the list (its environ goes) a moment before it is a zombie.
-    wait_for(
-        || children.iter().all(|p| dead(*p)),
-        "the cancelled login's processes to die",
-    )
-    .await;
+    // Waits for the cancelled login's processes to die.
+    wait(20, || children.iter().all(|p| dead(*p))).await;
     // The child died before rpi stored anything, and nothing was recorded.
     assert!(!dir.join("auth.json").exists());
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -557,11 +612,8 @@ async fn a_login_restarts_the_child_only_for_a_re_sign_in_of_the_running_account
     let a = cfg.account_dir(&cfg.accounts[0]);
     let gw = Gateway::start(&cfg);
     // The pool's child comes up on the only account.
-    wait_for(
-        || starts(&home, &a).len() == 1,
-        "the child to start on account a",
-    )
-    .await;
+    // Waits for the child to start on account a.
+    wait(20, || starts(&home, &a).len() == 1).await;
     let first = pid(&home);
 
     // A chat cannot type a key: `/login` for a key provider is refused and the login stopped, so
@@ -611,11 +663,8 @@ async fn a_login_restarts_the_child_only_for_a_re_sign_in_of_the_running_account
     // It becomes active on an explicit `/model`, and only then.
     gw.say("/model opencode-go/alpha", n + 1).await;
     gw.replies(n + 1).await;
-    wait_for(
-        || !starts(&home, &b).is_empty(),
-        "the child to start on opencode-go-1",
-    )
-    .await;
+    // Waits for the child to start on opencode-go-1.
+    wait(20, || !starts(&home, &b).is_empty()).await;
     assert_ne!(pid(&home), first);
     assert_eq!(starts(&home, &b)[0]["sessionId"], "main");
 
@@ -632,11 +681,8 @@ async fn a_login_restarts_the_child_only_for_a_re_sign_in_of_the_running_account
     until(&again.login_id, |l| l["phase"] == "need_input").await;
     assert!(zephyr::auth::input(&again.login_id, KEY));
     until(&again.login_id, |l| l["phase"] == "done").await;
-    wait_for(
-        || starts(&home, &b).len() >= 2,
-        "the re-login to restart the child",
-    )
-    .await;
+    // Waits for the re-login to restart the child.
+    wait(20, || starts(&home, &b).len() >= 2).await;
     let restarts = starts(&home, &b);
     assert_eq!(restarts[1]["sessionId"], "main");
     assert_eq!(restarts[1]["model"], "opencode-go/alpha");
@@ -1009,11 +1055,8 @@ async fn a_failed_login_leaves_no_account_directory() {
         "{failed}"
     );
     // `fail` reports the phase and then drops the directory: both, and no row either way.
-    wait_for(
-        || !dir.exists(),
-        "the failed sign-in's account directory to go",
-    )
-    .await;
+    // Waits for the failed sign-in's account directory to go.
+    wait(20, || !dir.exists()).await;
     assert!(!toml_at(&cfg).contains("[[account]]"), "{}", toml_at(&cfg));
 
     // The same when rpi did store a credential and the sign-in fails after that: the directory it
@@ -1037,7 +1080,8 @@ async fn a_failed_login_leaves_no_account_directory() {
             .contains("lists no antigravity model"),
         "{failed}"
     );
-    wait_for(|| !dir.exists(), "the stored-then-failed directory to go").await;
+    // Waits for the stored-then-failed directory to go.
+    wait(20, || !dir.exists()).await;
     assert!(!toml_at(&cfg).contains("[[account]]"), "{}", toml_at(&cfg));
 }
 
@@ -1081,7 +1125,8 @@ async fn two_logins_at_once_do_not_share_an_account_name() {
     for start in [&a, &b] {
         assert!(zephyr::auth::cancel(&start.login_id), "{}", start.account);
         let dir = cfg.home.join("accounts").join(&start.account);
-        wait_for(|| !dir.exists(), "the cancelled sign-in's directory to go").await;
+        // Waits for the cancelled sign-in's directory to go.
+        wait(20, || !dir.exists()).await;
     }
 }
 

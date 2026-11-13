@@ -854,10 +854,23 @@ fn args_object(entries: Vec<(String, Value)>) -> Value {
 }
 
 /// Endpoint for `Run`; `CURSOR_AGENT_URL` overrides it (tests point this at a local server).
-pub fn endpoint() -> String {
-    std::env::var("CURSOR_AGENT_URL").unwrap_or_else(|_| {
-        "https://agentn.global.api5.cursor.sh/agent.v1.AgentService/Run".to_string()
-    })
+pub fn endpoint() -> anyhow::Result<String> {
+    agent_url(std::env::var("CURSOR_AGENT_URL").ok())
+}
+
+/// The agent URL, refusing one that would put the bearer token on the wire in clear: plain http
+/// only to a loopback address (the test server), as `auth::base` does. Read with the transport's
+/// own parser, so the host checked is the host connected to.
+fn agent_url(over: Option<String>) -> anyhow::Result<String> {
+    let Some(raw) = over else {
+        return Ok("https://agentn.global.api5.cursor.sh/agent.v1.AgentService/Run".into());
+    };
+    let target = crate::transport::Target::parse(&raw)
+        .map_err(|_| anyhow::anyhow!("CURSOR_AGENT_URL is not a valid URL"))?;
+    if !target.tls && !crate::auth::loopback_host(&target.host) {
+        anyhow::bail!("CURSOR_AGENT_URL must be https or a loopback address");
+    }
+    Ok(raw)
 }
 
 /// `[flag][len:u32 be][payload]`. The flag is `0` for the request (uncompressed) and `1` (gzip) or
@@ -921,5 +934,28 @@ mod tests {
             assert_eq!(raw_call_id(&safe), raw);
         }
         assert_eq!(safe_call_id("tool_1-a"), "tool_1-a");
+    }
+
+    #[test]
+    fn the_agent_url_is_https_or_loopback() {
+        assert!(agent_url(None).unwrap().starts_with("https://"));
+        for ok in [
+            "https://agent.example/Run",
+            "http://127.0.0.1:9/Run",
+            "http://[::1]:9/Run",
+            "http://localhost:9/Run",
+        ] {
+            assert_eq!(agent_url(Some(ok.into())).unwrap(), ok);
+        }
+        for bad in [
+            "http://agent.example/Run",
+            "http://10.0.0.1/Run",
+            // The URL parser reads these hosts as 127.0.0.1; the transport would not.
+            "http://127.0.0.1\\@evil.example/Run",
+            "http://127.0.0.1#@evil.example/Run",
+            "not a url",
+        ] {
+            assert!(agent_url(Some(bad.into())).is_err(), "{bad}");
+        }
     }
 }

@@ -71,7 +71,7 @@ fn rpi_runs_a_tool_through_the_cursor_provider() {
         runtime.block_on(async {
             let started = cursor_service::start(script).await.expect("fake service");
             ready.send(started).expect("hand the service to the test");
-            futures_util::future::pending::<()>().await;
+            std::future::pending::<()>().await;
         });
     });
     let service = service.recv().expect("the fake service did not start");

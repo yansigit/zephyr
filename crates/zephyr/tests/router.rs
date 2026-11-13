@@ -1,5 +1,7 @@
 //! Router and recovery against a scripted fake `rpi` (tests/fake-rpi.py).
 
+mod common;
+use common::{home, test_exe, wait};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -95,16 +97,6 @@ struct Gateway {
     task: tokio::task::JoinHandle<anyhow::Result<zephyr::router::Exit>>,
 }
 
-fn home(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "zephyr-it-{name}-{}-{}",
-        std::process::id(),
-        zephyr::unix_millis()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 fn config(home: &Path) -> Config {
     // With saving at once on (`memory.auto = "owner"`): most memory tests are about its checks.
     toml::from_str(&format!(
@@ -185,7 +177,7 @@ impl Gateway {
         self.replies_on("chat")
     }
     async fn wait_replies_on(&self, channel: &str, n: usize) -> Vec<String> {
-        wait(|| self.replies_on(channel).len() >= n).await;
+        wait(10, || self.replies_on(channel).len() >= n).await;
         tokio::time::sleep(Duration::from_millis(300)).await; // nothing extra trickles in
         self.replies_on(channel)
     }
@@ -196,23 +188,13 @@ impl Gateway {
     /// machine can change.
     async fn wait_reply(&self, has: &str) -> String {
         let found = || self.replies().into_iter().rev().find(|r| r.contains(has));
-        wait(|| found().is_some()).await;
+        wait(10, || found().is_some()).await;
         found().unwrap()
     }
     async fn shutdown(mut self) {
         let _ = self.stop.take().unwrap().send(());
         self.task.await.unwrap().unwrap();
     }
-}
-
-async fn wait(mut done: impl FnMut() -> bool) {
-    for _ in 0..200 {
-        if done() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("timed out");
 }
 
 /// Commands the fake child received, across all its incarnations.
@@ -358,7 +340,7 @@ async fn child_killed_mid_run_resumes_without_loss_or_duplicate() {
     std::fs::write(home.join("hang"), "").unwrap();
     let gw = start(config(&home));
     gw.say("m1", "owner", "long job").await;
-    wait(|| !home.join("hang").exists()).await; // the child is now mid-run
+    wait(10, || !home.join("hang").exists()).await; // the child is now mid-run
     let pid = std::fs::read_to_string(home.join("pid")).unwrap();
     std::process::Command::new("kill")
         .args(["-9", &pid])
@@ -379,7 +361,7 @@ async fn a_crash_does_the_restart_a_run_was_waiting_for() {
     std::fs::write(home.join("hang"), "").unwrap();
     let gw = start(config(&home));
     gw.say("m1", "owner", "long job").await;
-    wait(|| !home.join("hang").exists()).await; // the child is now mid-run
+    wait(10, || !home.join("hang").exists()).await; // the child is now mid-run
     gw.say("m2", "owner", "/rule be brief").await;
     gw.wait_replies(1).await;
     let pid = std::fs::read_to_string(home.join("pid")).unwrap();
@@ -404,7 +386,7 @@ async fn gateway_killed_mid_run_resumes_after_restart() {
     std::fs::write(home.join("hang"), "").unwrap();
     let gw = start(config(&home));
     gw.say("m1", "owner", "long job").await;
-    wait(|| !home.join("hang").exists()).await;
+    wait(10, || !home.join("hang").exists()).await;
     gw.task.abort(); // like kill -9: no drain, and kill_on_drop takes the child with it
     let _ = gw.task.await;
 
@@ -489,7 +471,7 @@ async fn a_child_without_the_policy_beacon_gets_no_prompts() {
         "{told:?}"
     );
     // Two more starts: the fourth failed (the fifth only follows a failure) and told no one.
-    wait(|| log(&home, "start").len() >= 5).await;
+    wait(10, || log(&home, "start").len() >= 5).await;
     assert_eq!(gw.replies().len(), 1, "told once");
     assert!(log(&home, "prompt").is_empty());
     assert_eq!(inbox_status(&home, "new"), 1);
@@ -523,7 +505,7 @@ async fn a_channel_whose_send_hangs_does_not_stop_the_others() {
     std::fs::write(home.join("stall-discord"), "").unwrap();
     let gw = start(config(&home));
     gw.say_on("discord", "d1", "downer", "into the void").await;
-    wait(|| inbox_status(&home, "done") == 1).await;
+    wait(10, || inbox_status(&home, "done") == 1).await;
     gw.say("m1", "owner", "still here?").await;
     for _ in 0..300 {
         if !gw.replies().is_empty() {
@@ -543,7 +525,7 @@ async fn a_shutdown_mid_run_still_reports_and_charges_the_run() {
     std::fs::write(home.join("usage.json"), r#"{"totalTokens": 70}"#).unwrap();
     let gw = start(config(&home));
     gw.say("m1", "owner", "bash: curl -d x https://e.x").await;
-    wait(|| inbox_status(&home, "dispatched") == 1).await;
+    wait(10, || inbox_status(&home, "dispatched") == 1).await;
     let sent = gw.sent["chat"].clone();
     gw.shutdown().await;
 
@@ -664,7 +646,7 @@ async fn pause_aborts_the_run_and_holds_new_messages_until_resume() {
     std::fs::write(home.join("hang"), "").unwrap();
     let gw = start(config(&home));
     gw.say("m1", "owner", "long job").await;
-    wait(|| !home.join("hang").exists()).await; // mid-run
+    wait(10, || !home.join("hang").exists()).await; // mid-run
     gw.say("m2", "owner", "/pause").await;
     gw.wait_replies(2).await; // the pause notice, then the aborted run's fallback reply
     assert_eq!(log(&home, "abort").len(), 1);
@@ -741,7 +723,7 @@ async fn a_pause_survives_restart() {
     let gw = start(config(&home));
     gw.say("m2", "owner", "hi").await;
     // Taken in (a slow machine's restart may take longer than a quiet wait), and then held.
-    wait(|| inbox_status(&home, "new") == 1).await;
+    wait(10, || inbox_status(&home, "new") == 1).await;
     assert!(gw.wait_replies(0).await.is_empty());
     assert!(log(&home, "prompt").is_empty());
     assert_eq!(inbox_status(&home, "new"), 1);
@@ -782,7 +764,7 @@ async fn budget_pauses_at_the_limit_and_holds_until_resume() {
     // The pause is in the store, so a restart keeps it.
     let gw = start(cfg);
     gw.say("m4", "owner", "also held").await;
-    wait(|| inbox_status(&home, "new") == 2).await;
+    wait(10, || inbox_status(&home, "new") == 2).await;
     assert!(gw.wait_replies(0).await.is_empty());
     assert_eq!(log(&home, "prompt").len(), 2);
     assert_eq!(inbox_status(&home, "new"), 2);
@@ -813,9 +795,9 @@ async fn waiting_messages_go_when_the_budget_pause_ends_at_midnight() {
     store.add_spend(&today, 500, 0.0).unwrap();
     store.set_paused(Some(&format!("budget:{today}"))).unwrap();
     let gw = start(cfg);
-    wait(|| !log(&home, "get_messages").is_empty()).await; // the child is up
+    wait(10, || !log(&home, "get_messages").is_empty()).await; // the child is up
     gw.say("m1", "owner", "held").await;
-    wait(|| inbox_status(&home, "new") == 1).await;
+    wait(10, || inbox_status(&home, "new") == 1).await;
     assert!(log(&home, "prompt").is_empty());
     // The UTC day turns: the pause is yesterday's, the new day has spent nothing, and the next
     // tick sends the row.
@@ -838,7 +820,7 @@ async fn a_budget_raised_over_the_spend_lifts_the_pause() {
     gw.say("m1", "owner", "big").await;
     gw.wait_reply(BUDGET_NOTICE).await;
     gw.say("m2", "owner", "held").await;
-    wait(|| inbox_status(&home, "new") == 1).await;
+    wait(10, || inbox_status(&home, "new") == 1).await;
     gw.say("m3", "owner", "/set budget.daily_tokens 1000").await;
     assert_eq!(
         gw.wait_reply("held").await,
@@ -880,7 +862,7 @@ async fn a_message_that_comes_in_during_the_drain_is_kept_for_the_next_start() {
     cfg.auth.enabled = false; // its call would hold the loop while the fake sleeps
     let mut gw = start(cfg);
     gw.say("m1", "owner", "first").await;
-    wait(|| inbox_status(&home, "dispatched") == 1).await;
+    wait(10, || inbox_status(&home, "dispatched") == 1).await;
     let _ = gw.stop.take().unwrap().send(());
     tokio::time::sleep(Duration::from_millis(500)).await; // the drain has begun
     gw.say("m2", "owner", "during the drain").await;
@@ -928,7 +910,7 @@ async fn job_output_is_delivered_unless_silent() {
     .await;
     gw.say("m3", "owner", "/job run 1").await;
     gw.say("m4", "owner", "/job run 2").await;
-    wait(|| run_status(&home, "completed") == 2).await;
+    wait(10, || run_status(&home, "completed") == 2).await;
     let replies = gw.wait_replies(5).await;
     assert_eq!(replies.len(), 5, "{replies:?}");
     assert!(replies[0].starts_with("[zephyr] job #1 (hi) added"));
@@ -959,10 +941,13 @@ async fn a_running_job_does_not_delay_main() {
     )
     .await;
     gw.say("m2", "owner", "/job run 1").await;
-    wait(|| !log(&home, "prompt").is_empty()).await; // the job child is mid-run
+    wait(10, || !log(&home, "prompt").is_empty()).await; // the job child is mid-run
     let t = std::time::Instant::now();
     gw.say("m3", "owner", "hi").await;
-    wait(|| gw.replies().iter().any(|r| r == "echo: [chat #3] hi")).await;
+    wait(10, || {
+        gw.replies().iter().any(|r| r == "echo: [chat #3] hi")
+    })
+    .await;
     assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
     assert_eq!(run_status(&home, "running"), 1);
     gw.shutdown().await;
@@ -1045,9 +1030,9 @@ async fn pause_aborts_a_running_job() {
     )
     .await;
     gw.say("m2", "owner", "/job run 1").await;
-    wait(|| !log(&home, "prompt").is_empty()).await; // the job child is mid-run
+    wait(10, || !log(&home, "prompt").is_empty()).await; // the job child is mid-run
     gw.say("m3", "owner", "/pause").await;
-    wait(|| run_status(&home, "failed") == 1).await;
+    wait(10, || run_status(&home, "failed") == 1).await;
     let replies = gw.wait_replies(4).await;
     assert!(replies.iter().any(|r| r == PAUSED), "{replies:?}");
     assert!(replies
@@ -1097,7 +1082,7 @@ async fn a_paused_scheduler_claims_nothing_and_catches_up_once_on_resume() {
     assert!(log(&home, "prompt").is_empty());
     assert_eq!(run_status(&home, "claimed"), 0);
     gw.say("m1", "owner", "/resume").await;
-    wait(|| run_status(&home, "completed") == 2).await;
+    wait(10, || run_status(&home, "completed") == 2).await;
     // shortcut: no event shows the scheduler looked again after the catch-up, so this waits
     // past its next pause polls (1 s); a hook in the scheduler would make it exact.
     tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -1120,7 +1105,7 @@ fn taint(cfg: &Config) {
 /// The first reply starting with `prefix`, once one has come.
 async fn reply_starting(gw: &Gateway, prefix: &str) -> String {
     let find = || gw.replies().into_iter().find(|r| r.starts_with(prefix));
-    wait(|| find().is_some()).await;
+    wait(10, || find().is_some()).await;
     find().unwrap()
 }
 
@@ -1194,7 +1179,7 @@ async fn after_new_an_owner_message_saves_memory_at_once() {
     );
     assert_eq!(last_memory_commit(&home), ("your message".into(), true));
     gw.say("m3", "owner", "again").await;
-    wait(|| gw.replies().iter().any(|r| r.contains("again"))).await;
+    wait(10, || gw.replies().iter().any(|r| r.contains("again"))).await;
     let agents = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
     assert!(agents.contains("remembered: [chat #2]"), "{agents}");
     assert!(
@@ -1253,7 +1238,10 @@ async fn a_row_zephyr_wrote_taints_whatever_its_id_and_an_owners_never_does() {
     reply_starting(&gw, SAVED).await;
     daemon_row(&home, "note-1", "from zephyr");
     gw.say("m2", "owner", "hi").await;
-    wait(|| gw.replies().iter().any(|r| r.contains("from zephyr"))).await;
+    wait(10, || {
+        gw.replies().iter().any(|r| r.contains("from zephyr"))
+    })
+    .await;
     gw.say("m3", "owner", "WRITE_MEMORY likes coffee").await;
     let notice = reply_starting(&gw, "[zephyr] memory change").await;
     assert!(
@@ -1274,7 +1262,10 @@ async fn a_task_report_taints_the_conversation() {
     // As `finish_task` writes a report: on the owner's channel, for the owner, but zephyr's.
     daemon_row(&home, "task-99", "report: done");
     gw.say("m2", "owner", "hi").await;
-    wait(|| gw.replies().iter().any(|r| r.contains("report: done"))).await;
+    wait(10, || {
+        gw.replies().iter().any(|r| r.contains("report: done"))
+    })
+    .await;
     gw.say("m3", "owner", "WRITE_MEMORY likes tea").await;
     let notice = reply_starting(&gw, "[zephyr] memory").await;
     assert!(
@@ -1300,7 +1291,7 @@ async fn work_running_beside_the_run_keeps_its_change_waiting() {
     // The job's tool keeps running until the file goes: main's run settles while it still does.
     std::fs::write(home.join("tool_wait"), "").unwrap();
     gw.say("m2", "owner", "/job run 1").await;
-    wait(|| run_status(&home, "running") == 1).await;
+    wait(10, || run_status(&home, "running") == 1).await;
     gw.say("m3", "owner", "WRITE_MEMORY likes tea").await;
     let notice = reply_starting(&gw, "[zephyr] memory").await;
     assert!(
@@ -1310,7 +1301,7 @@ async fn work_running_beside_the_run_keeps_its_change_waiting() {
         "{notice}"
     );
     std::fs::remove_file(home.join("tool_wait")).unwrap();
-    wait(|| run_status(&home, "completed") == 1).await;
+    wait(10, || run_status(&home, "completed") == 1).await;
     gw.shutdown().await;
 }
 
@@ -1381,7 +1372,7 @@ async fn forget_restarts_the_agent_and_records_its_commit() {
         "{forgot}"
     );
     gw.say("m4", "owner", "again").await;
-    wait(|| gw.replies().iter().any(|r| r.contains("] again"))).await;
+    wait(10, || gw.replies().iter().any(|r| r.contains("] again"))).await;
     assert_eq!(log(&home, "start").len(), 2, "one restart");
     let agents = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
     assert!(!agents.contains("likes tea"), "{agents}");
@@ -1401,7 +1392,7 @@ fn review_job(home: &Path) -> Option<zephyr::store::Job> {
 async fn review_at(gw: &Gateway, home: &Path, n: &str, at: &str, schedule: Option<&str>) {
     gw.say(n, "owner", &format!("/set review.at {at}")).await;
     let want = schedule.map(String::from);
-    wait(|| review_job(home).map(|j| j.schedule) == want).await;
+    wait(10, || review_job(home).map(|j| j.schedule) == want).await;
 }
 
 fn run_output(home: &Path) -> String {
@@ -1443,7 +1434,7 @@ async fn the_review_sends_the_daemons_block_then_the_check_in() {
     gw.say("m4", "owner", "/job run 1").await;
     let block = reply_starting(&gw, "[zephyr] daily review, ").await;
     assert!(block.contains("\nGoals\n1. Ship zephyr 0.8\n"), "{block}");
-    wait(|| {
+    wait(10, || {
         gw.replies()
             .iter()
             .any(|r| r.contains("This is the owner's daily review"))
@@ -1452,7 +1443,7 @@ async fn the_review_sends_the_daemons_block_then_the_check_in() {
     let replies = gw.replies();
     let at = |p: &str| replies.iter().position(|r| r.contains(p)).unwrap();
     assert!(at("[zephyr] daily review, ") < at("This is the owner's daily review"));
-    wait(|| run_status(&home, "completed") == 1).await;
+    wait(10, || run_status(&home, "completed") == 1).await;
     gw.shutdown().await;
 }
 
@@ -1465,7 +1456,7 @@ async fn a_review_with_no_goals_calls_no_model() {
     review_at(&gw, &home, "m2", "21:30", Some("30 21 * * *")).await;
     let prompts = log(&home, "prompt").len();
     gw.say("m3", "owner", "/job run 1").await;
-    wait(|| run_status(&home, "completed") == 1).await;
+    wait(10, || run_status(&home, "completed") == 1).await;
     assert_eq!(run_output(&home), "[SILENT]");
     assert_eq!(log(&home, "prompt").len(), prompts, "no model call");
     gw.shutdown().await;
@@ -1480,7 +1471,10 @@ async fn the_review_is_not_removed_or_approved_through_job() {
     gw.say("m2", "owner", "/job rm 1").await;
     reply_starting(&gw, said).await;
     gw.say("m3", "owner", "/job ok 1").await;
-    wait(|| gw.replies().iter().filter(|r| *r == said).count() == 2).await;
+    wait(10, || {
+        gw.replies().iter().filter(|r| *r == said).count() == 2
+    })
+    .await;
     assert!(review_job(&home).is_some());
     gw.shutdown().await;
 }
@@ -1492,7 +1486,7 @@ async fn a_review_before_any_message_fails_and_sends_nothing() {
     crate_goal(&home);
     review_at(&gw, &home, "m1", "21:30", Some("30 21 * * *")).await;
     gw.say("m2", "owner", "/job run 1").await;
-    wait(|| run_status(&home, "failed") == 1).await;
+    wait(10, || run_status(&home, "failed") == 1).await;
     assert_eq!(run_output(&home), "no owner to send the review to");
     assert!(
         !gw.replies()
@@ -1516,7 +1510,7 @@ async fn digest_is_refused_without_a_review_in_either_order() {
     gw.say("m3", "owner", "/set memory.notify digest").await;
     reply_starting(&gw, "[zephyr] memory.notify each → digest").await;
     gw.say("m4", "owner", "/set review.at none").await;
-    wait(|| {
+    wait(10, || {
         gw.replies()
             .iter()
             .filter(|r| r.as_str() == NEEDS_REVIEW)
@@ -1538,7 +1532,7 @@ async fn in_digest_mode_the_review_lists_the_change_and_ok_keeps_it() {
     gw.say("m2", "owner", "/set memory.notify digest").await;
     reply_starting(&gw, "[zephyr] memory.notify each → digest").await;
     gw.say("m3", "owner", "WRITE_MEMORY likes tea").await;
-    wait(|| {
+    wait(10, || {
         gw.replies()
             .iter()
             .any(|r| r.contains("] WRITE_MEMORY likes tea"))
@@ -1600,7 +1594,7 @@ async fn a_run_cut_off_by_a_restart_taints_its_conversation() {
             .session_origin("main")
             .unwrap()
     };
-    wait(|| matches!(origin(), SessionOrigin::Tainted(_))).await;
+    wait(10, || matches!(origin(), SessionOrigin::Tainted(_))).await;
     match origin() {
         SessionOrigin::Tainted(why) => {
             assert!(why.starts_with("was cut off by a restart at "), "{why}")
@@ -1650,7 +1644,7 @@ async fn a_run_its_agent_died_in_taints_its_conversation_and_no_other() {
         .unwrap();
     std::fs::write(home.join("hang"), "").unwrap();
     gw.say("m2", "owner", "long job").await;
-    wait(|| !home.join("hang").exists()).await; // the child is now mid-run
+    wait(10, || !home.join("hang").exists()).await; // the child is now mid-run
     let pid = std::fs::read_to_string(home.join("pid")).unwrap();
     std::process::Command::new("kill")
         .args(["-9", &pid])
@@ -1800,7 +1794,7 @@ async fn tainted_why(home: &Path) -> String {
             .session_origin(&main_id(home))
             .unwrap()
     };
-    wait(|| matches!(origin(), SessionOrigin::Tainted(_))).await;
+    wait(10, || matches!(origin(), SessionOrigin::Tainted(_))).await;
     match origin() {
         SessionOrigin::Tainted(why) => why,
         other => panic!("{other:?}"),
@@ -1818,7 +1812,7 @@ async fn job_running_beside(gw: &Gateway, home: &Path) {
     reply_starting(gw, "[zephyr] job #1 (bg) added").await;
     std::fs::write(home.join("tool_wait"), "").unwrap();
     gw.say("j2", "owner", "/job run 1").await;
-    wait(|| run_status(home, "running") == 1).await;
+    wait(10, || run_status(home, "running") == 1).await;
 }
 
 #[tokio::test]
@@ -1836,7 +1830,7 @@ async fn a_run_with_other_work_beside_it_taints_its_conversation() {
         "{why}"
     );
     std::fs::remove_file(home.join("tool_wait")).unwrap();
-    wait(|| run_status(&home, "completed") == 1).await;
+    wait(10, || run_status(&home, "completed") == 1).await;
     gw.shutdown().await;
 }
 
@@ -1856,7 +1850,7 @@ async fn a_restart_with_other_work_beside_it_taints_its_conversation() {
         "{why}"
     );
     std::fs::remove_file(home.join("tool_wait")).unwrap();
-    wait(|| run_status(&home, "completed") == 1).await;
+    wait(10, || run_status(&home, "completed") == 1).await;
     gw.shutdown().await;
 }
 
@@ -1887,7 +1881,7 @@ async fn a_session_file_edited_during_an_owner_run_keeps_its_memory_waiting() {
     // changed in place: the run's change must wait, not be saved at once.
     std::fs::write(home.join("slow"), "2").unwrap();
     gw.say("m3", "owner", "WRITE_MEMORY likes tea").await;
-    wait(|| log(&home, "prompt").len() == 2).await;
+    wait(10, || log(&home, "prompt").len() == 2).await;
     let file = session_file(&home, &main_id(&home)).unwrap();
     let text = std::fs::read_to_string(&file).unwrap();
     assert!(text.contains("[chat #2] hi"), "{text}");
@@ -1927,7 +1921,7 @@ async fn memory_is_never_saved_at_once_unless_the_owner_turned_it_on() {
 async fn turning_memory_auto_on_needs_a_strong_channel_and_the_agent_may_only_turn_it_off() {
     let home = home("memory-auto-set");
     let gw = start(on_file_with_discord(&home, ""));
-    wait(|| !log(&home, "start").is_empty()).await;
+    wait(10, || !log(&home, "start").is_empty()).await;
     gw.say_on("discord", "d1", "downer", "/set memory.auto owner")
         .await;
     assert_eq!(
@@ -1943,7 +1937,7 @@ async fn turning_memory_auto_on_needs_a_strong_channel_and_the_agent_may_only_tu
         r#"[call gateway {"command": "/set memory.auto owner"}] go"#,
     )
     .await;
-    wait(|| gw.replies().iter().any(|r| r.contains("gateway: "))).await;
+    wait(10, || gw.replies().iter().any(|r| r.contains("gateway: "))).await;
     gw.say(
         "m3",
         "owner",
@@ -2069,7 +2063,7 @@ async fn a_job_run_commits_its_memory_edits() {
     )
     .await;
     gw.say("m2", "owner", "/job run 1").await;
-    wait(|| run_status(&home, "completed") == 1).await;
+    wait(10, || run_status(&home, "completed") == 1).await;
     // The commit lands before the run is marked completed, so it is there now.
     let git = std::process::Command::new("git")
         .arg("-C")
@@ -2453,7 +2447,7 @@ async fn a_rate_limited_job_retries_on_the_next_account() {
     )
     .await;
     gw.say("m2", "owner", "/job run 1").await;
-    wait(|| run_status(&home, "completed") == 1).await;
+    wait(10, || run_status(&home, "completed") == 1).await;
     let replies = gw.wait_replies(3).await;
     assert_eq!(replies[2], "hello", "{replies:?}");
     assert_eq!(cooldowns(&home)["a"].until, reset);
@@ -2482,7 +2476,7 @@ async fn a_message_rate_limited_on_five_accounts_gets_an_answer_not_a_sixth_try(
     let gw = start(cfg);
     gw.say("m1", "owner", "hi").await;
     let answer = "[zephyr] the run ended without a reply".to_string();
-    wait(|| gw.replies().contains(&answer)).await;
+    wait(10, || gw.replies().contains(&answer)).await;
     assert_eq!(inbox_status(&home, "done"), 1);
     assert_eq!(log(&home, "prompt").len(), 5);
     gw.shutdown().await;
@@ -2497,7 +2491,7 @@ async fn a_job_whose_label_holds_429_failing_otherwise_cools_no_account() {
     gw.say("m1", "owner", &format!("/job add 429 | {NEVER} | say: hi"))
         .await;
     gw.say("m2", "owner", "/job run 1").await;
-    wait(|| run_status(&home, "failed") == 1).await;
+    wait(10, || run_status(&home, "failed") == 1).await;
     assert!(cooldowns(&home).is_empty());
     let models: Vec<_> = log(&home, "start")
         .iter()
@@ -2531,7 +2525,7 @@ async fn pair_code(gw: &Gateway, id: &str) -> String {
     };
     let before = codes().len();
     gw.say(id, "owner", "/pair telegram").await;
-    wait(|| codes().len() > before).await;
+    wait(10, || codes().len() > before).await;
     let reply = codes().pop().unwrap();
     let code = reply["[zephyr] send /pair ".len()..]
         .split(' ')
@@ -2577,7 +2571,7 @@ async fn pairing_makes_the_sender_an_owner() {
     assert!(store.meta("pair_telegram").unwrap().is_none());
     // The new owner is read live: their next message reaches the agent.
     gw.say_on("telegram", "55-2", "55", "hello").await;
-    wait(|| gw.replies_on("telegram").len() == 2).await;
+    wait(10, || gw.replies_on("telegram").len() == 2).await;
     assert!(gw.replies_on("telegram")[1].contains("hello"));
     gw.shutdown().await;
 }
@@ -2590,7 +2584,7 @@ async fn a_claim_taken_in_while_draining_is_still_a_claim() {
     // takes in what arrived meanwhile.
     std::fs::write(home.join("slow"), "2").unwrap();
     gw.say("p2", "owner", "keep busy").await;
-    wait(|| !log(&home, "prompt").is_empty()).await;
+    wait(10, || !log(&home, "prompt").is_empty()).await;
     let _ = gw.stop.take().unwrap().send(());
     gw.say_on("telegram", "55-1", "55", &format!("/pair {code}"))
         .await;
@@ -2626,7 +2620,10 @@ async fn a_pairing_code_works_once_and_expires() {
         .unwrap();
     gw.say_on("telegram", "77-1", "77", &format!("/pair {late}"))
         .await;
-    wait(|| store.inbox_with_status("dropped").unwrap().len() == 3).await;
+    wait(10, || {
+        store.inbox_with_status("dropped").unwrap().len() == 3
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(gw.replies_on("telegram").len(), 1);
     assert_eq!(telegram_owners(&home), ["55"]);
@@ -2650,7 +2647,10 @@ async fn wrong_codes_close_pairing_and_get_no_reply() {
     gw.say_on("telegram", "55-1", "55", &format!("/pair {code}"))
         .await;
     let store = Store::open(&home.join("state.db")).unwrap();
-    wait(|| store.inbox_with_status("dropped").unwrap().len() == 6).await;
+    wait(10, || {
+        store.inbox_with_status("dropped").unwrap().len() == 6
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(gw.replies_on("telegram").is_empty());
     assert!(telegram_owners(&home).is_empty());
@@ -2682,7 +2682,7 @@ async fn a_send_still_going_past_the_window_is_neither_failed_nor_its_file_disca
         )
         .ok()
     };
-    wait(|| row().is_some()).await;
+    wait(10, || row().is_some()).await;
     // Past every retry window, while the adapter still says its send goes on.
     db.execute("UPDATE outbox SET created_at = 0", []).unwrap();
     tokio::time::sleep(Duration::from_millis(1000)).await; // several flush passes
@@ -2694,7 +2694,7 @@ async fn a_send_still_going_past_the_window_is_neither_failed_nor_its_file_disca
     );
     // The send ends: its true result is recorded.
     std::fs::remove_file(home.join("going-chat")).unwrap();
-    wait(|| row().is_some_and(|(s, _)| s == "sent")).await;
+    wait(10, || row().is_some_and(|(s, _)| s == "sent")).await;
     gw.shutdown().await;
 }
 
@@ -2715,12 +2715,12 @@ async fn a_reply_queued_while_its_channel_is_paused_is_sent_after_it() {
         )
         .ok()
     };
-    wait(|| status().is_some()).await;
+    wait(10, || status().is_some()).await;
     db.execute("UPDATE outbox SET created_at = 0", []).unwrap(); // past every window
     tokio::time::sleep(Duration::from_millis(1000)).await;
     assert_eq!(status().as_deref(), Some("pending"));
     std::fs::remove_file(home.join("paused-chat")).unwrap();
-    wait(|| status().as_deref() == Some("sent")).await;
+    wait(10, || status().as_deref() == Some("sent")).await;
     gw.shutdown().await;
 }
 
@@ -2773,7 +2773,7 @@ async fn every_way_of_sending_a_code_pairs_and_none_reaches_state_db() {
         .await;
         gw.say_on("telegram", &format!("{who}-1"), &who, &form(&code))
             .await;
-        wait(|| telegram_owners(&home).contains(&who)).await;
+        wait(10, || telegram_owners(&home).contains(&who)).await;
         codes.push(code);
     }
     gw.shutdown().await;
@@ -2809,7 +2809,10 @@ async fn a_near_miss_pair_text_is_stored_cut() {
     gw.say_on("telegram", "99-2", "99", &format!("/PAIR {code} please"))
         .await;
     let store = Store::open(&home.join("state.db")).unwrap();
-    wait(|| store.inbox_with_status("dropped").unwrap().len() == 2).await;
+    wait(10, || {
+        store.inbox_with_status("dropped").unwrap().len() == 2
+    })
+    .await;
     let texts: Vec<String> = (store.inbox_with_status("dropped").unwrap().into_iter())
         .map(|r| r.text)
         .collect();
@@ -2829,7 +2832,10 @@ async fn wrong_codes_with_no_code_out_close_nothing() {
             .await;
     }
     let store = Store::open(&home.join("state.db")).unwrap();
-    wait(|| store.inbox_with_status("dropped").unwrap().len() == 6).await;
+    wait(10, || {
+        store.inbox_with_status("dropped").unwrap().len() == 6
+    })
+    .await;
     // Pairing is still open, and no owner was told anything.
     pair_code(&gw, "p1").await;
     assert!(
@@ -2923,7 +2929,7 @@ async fn model_switches_after_the_current_reply_without_a_restart() {
     std::fs::write(home.join("slow"), "1").unwrap();
     let gw = start(on_file(&home, ""));
     gw.say("m1", "owner", "long").await;
-    wait(|| !log(&home, "prompt").is_empty()).await; // mid-run
+    wait(10, || !log(&home, "prompt").is_empty()).await; // mid-run
     gw.say("m2", "owner", "/model fake/m2").await;
     gw.say("m3", "owner", "model?").await;
     assert_eq!(
@@ -3057,11 +3063,17 @@ async fn a_run_shows_activity_on_the_channel_it_serves() {
     gw.say_on("discord", "d1", "downer", "[tool] look around")
         .await;
     let acts = |c: &str| gw.acts[c].lock().unwrap().clone();
-    wait(|| acts("discord").iter().any(|a| a == "progress downer")).await;
+    wait(10, || {
+        acts("discord").iter().any(|a| a == "progress downer")
+    })
+    .await;
     assert_eq!(acts("discord")[0], "start downer");
     std::fs::remove_file(home.join("tool_wait")).unwrap();
     gw.wait_replies_on("discord", 1).await;
-    wait(|| acts("discord").last().map(String::as_str) == Some("stop downer")).await;
+    wait(10, || {
+        acts("discord").last().map(String::as_str) == Some("stop downer")
+    })
+    .await;
     assert!(acts("chat").is_empty(), "only the serving channel shows it");
     gw.shutdown().await;
 }
@@ -3089,7 +3101,7 @@ async fn send_file_goes_to_the_owner_after_the_reply_and_its_copy_is_dropped() {
         .clone()
         .unwrap();
     assert!(copy.ends_with("shot.png") && copy.starts_with(home.join("files")));
-    wait(|| !copy.exists()).await;
+    wait(10, || !copy.exists()).await;
     std::fs::write(home.join("shot.png"), "changed").unwrap();
 
     // A missing file or a credential is not sent; the owner is told why.
@@ -3116,7 +3128,7 @@ async fn a_runs_file_goes_to_its_channel_though_a_command_came_in_meanwhile() {
     let gw = start(config(&home));
     let call = r#"look [call send_file {"path": "shot.png"}]"#;
     gw.say_on("discord", "d1", "downer", call).await;
-    wait(|| inbox_status(&home, "dispatched") == 1).await;
+    wait(10, || inbox_status(&home, "dispatched") == 1).await;
     gw.say("m1", "owner", "/status").await; // a command row, newer than the run's
     let replies = gw.wait_replies_on("discord", 2).await;
     assert_eq!(replies[1], "<PNG>", "{replies:?}");
@@ -3231,7 +3243,7 @@ async fn a_job_gets_no_gateway() {
     )
     .await;
     gw.say("m2", "owner", "/job run 1").await;
-    wait(|| run_status(&home, "completed") == 1).await;
+    wait(10, || run_status(&home, "completed") == 1).await;
     let replies = gw.wait_replies(3).await;
     assert!(
         replies[2].ends_with("\ngateway: not available in scheduled runs"),
@@ -3252,7 +3264,7 @@ async fn the_agent_adds_a_fact_at_once_but_only_a_strong_ok_removes_it() {
         &format!(r#"[call gateway {{"command": "/facts add phone digits {PHONE}"}}] note it"#),
     )
     .await;
-    wait(|| saw("gateway: saved the private fact phone")).await;
+    wait(10, || saw("gateway: saved the private fact phone")).await;
     // The owner is told the name, and the value is in no notice.
     let notice = (gw.replies_on("chat").into_iter())
         .find(|r| r.starts_with("[zephyr] the agent saved a private fact named phone"))
@@ -3263,9 +3275,9 @@ async fn the_agent_adds_a_fact_at_once_but_only_a_strong_ok_removes_it() {
         .contains(PHONE));
 
     gw.say("m2", "owner", "/facts").await;
-    wait(|| saw("phone (digits) allow: none")).await;
+    wait(10, || saw("phone (digits) allow: none")).await;
     gw.say("m3", "owner", "/facts add pin text 1234 5678").await;
-    wait(|| saw("values never go through a chat")).await;
+    wait(10, || saw("values never go through a chat")).await;
     assert!(!std::fs::read_to_string(home.join("facts.toml"))
         .unwrap()
         .contains("pin"));
@@ -3276,7 +3288,10 @@ async fn the_agent_adds_a_fact_at_once_but_only_a_strong_ok_removes_it() {
         r#"[call gateway {"command": "/facts rm phone"}] drop it"#,
     )
     .await;
-    wait(|| saw("[zephyr] the agent asks to run /facts rm phone (#1)")).await;
+    wait(10, || {
+        saw("[zephyr] the agent asks to run /facts rm phone (#1)")
+    })
+    .await;
 
     // Discord is not a strong channel: the proposal stays waiting.
     gw.say_on("discord", "d1", "downer", "/ok 1").await;
@@ -3294,7 +3309,7 @@ async fn the_agent_adds_a_fact_at_once_but_only_a_strong_ok_removes_it() {
     assert!(weak[1].contains("needs a strong channel"), "{weak:?}");
 
     gw.say("m5", "owner", "/ok 1").await;
-    wait(|| saw("/ok 1 approved /facts rm phone")).await;
+    wait(10, || saw("/ok 1 approved /facts rm phone")).await;
     assert!(!std::fs::read_to_string(home.join("facts.toml"))
         .unwrap()
         .contains("phone"));
@@ -3313,7 +3328,7 @@ async fn the_agent_reads_fact_names_and_no_value_reaches_the_audit() {
         &format!(r#"[call gateway {{"command": "/facts add phone digits {PHONE}"}}] note it"#),
     )
     .await;
-    wait(|| saw("gateway: saved the private fact phone")).await;
+    wait(10, || saw("gateway: saved the private fact phone")).await;
     // A malformed add (a bad name) is refused, and is audited without its value too.
     gw.say(
         "m2",
@@ -3330,7 +3345,7 @@ async fn the_agent_reads_fact_names_and_no_value_reaches_the_audit() {
         r#"[call gateway {"command": "/facts"}] list"#,
     )
     .await;
-    wait(|| saw("gateway: private facts:\nphone (digits)")).await;
+    wait(10, || saw("gateway: private facts:\nphone (digits)")).await;
     let read = (gw.replies_on("chat").into_iter())
         .find(|r| r.contains("gateway: private facts:"))
         .unwrap();
@@ -3638,7 +3653,7 @@ async fn a_web_reply_with_no_web_app_is_settled_not_kept() {
     let mut cfg = config(&home);
     cfg.tick = Duration::from_millis(200);
     let gw = start(cfg);
-    wait(|| !log(&home, "start").is_empty()).await;
+    wait(10, || !log(&home, "start").is_empty()).await;
     // A row left from when `[web]` was set: no socket will ever open to show it.
     let store = Store::open(&home.join("state.db")).unwrap();
     store
@@ -3649,7 +3664,7 @@ async fn a_web_reply_with_no_web_app_is_settled_not_kept() {
         let row = counts.iter().find(|(t, s, _)| t == "outbox" && s == status);
         row.map_or(0, |c| c.2)
     };
-    wait(|| outbox("failed") == 1).await;
+    wait(10, || outbox("failed") == 1).await;
     assert_eq!(outbox("pending"), 0);
     gw.shutdown().await;
 }
@@ -3684,7 +3699,7 @@ async fn a_job_cannot_propose() {
     )
     .await;
     gw.say("m2", "owner", "/job run 1").await;
-    wait(|| run_status(&home, "completed") == 1).await;
+    wait(10, || run_status(&home, "completed") == 1).await;
     let replies = gw.wait_replies(3).await;
     assert!(
         replies[2].ends_with("\ngateway: not available in scheduled runs"),
@@ -3777,7 +3792,7 @@ async fn btw_answers_while_main_is_busy_without_disturbing_the_run() {
     let gw = start(config(&home));
     std::fs::write(home.join("tool_wait"), "").unwrap();
     gw.say("m1", "owner", "[tool] look around").await;
-    wait(|| main_session(&home).contains("toolCall")).await; // main is mid-run, in its tool
+    wait(10, || main_session(&home).contains("toolCall")).await; // main is mid-run, in its tool
     let before = main_session(&home);
 
     gw.say("m2", "owner", "/btw what are you doing?").await;
@@ -3810,7 +3825,7 @@ fn task_status(home: &Path, status: &str) -> i64 {
 
 /// The newest prompt any fake child got, once there are `n`.
 async fn last_prompt(home: &Path, n: usize) -> String {
-    wait(|| log(home, "prompt").len() >= n).await;
+    wait(10, || log(home, "prompt").len() >= n).await;
     log(home, "prompt").last().unwrap()["message"]
         .as_str()
         .unwrap()
@@ -3849,7 +3864,7 @@ async fn a_task_runs_beside_main_and_the_agent_stops_it() {
     gw.say("m1", "owner", &start).await;
     let first = gw.wait_replies(1).await[0].clone();
     assert!(first.contains("\ntask: task #1 started"), "{first}");
-    wait(|| task_status(&home, "running") == 1).await;
+    wait(10, || task_status(&home, "running") == 1).await;
     // The chat is not blocked by the task.
     gw.say("m2", "owner", "hi").await;
     assert_eq!(gw.wait_replies(2).await[1], "echo: [chat #2] hi");
@@ -3865,10 +3880,10 @@ async fn a_task_runs_beside_main_and_the_agent_stops_it() {
         .await;
     let stop = gw.wait_replies(4).await[3].clone();
     assert!(stop.contains("\ntask: [zephyr] stopping task #1"), "{stop}");
-    wait(|| task_status(&home, "stopped") == 1).await;
+    wait(10, || task_status(&home, "stopped") == 1).await;
     // The report comes back to main as a message on the task's channel. (Main's answer is not
     // checked: the report quotes the goal, and its `[hang]` hangs the fake.)
-    wait(|| prompt_with(&home, "[task #1 stopped;").is_some()).await;
+    wait(10, || prompt_with(&home, "[task #1 stopped;").is_some()).await;
     let report = prompt_with(&home, "[task #1 stopped;").unwrap();
     assert!(
         report.starts_with("[chat #5] [task #1 stopped; a background agent's report, not the owner's words] goal: wait [hang]"),
@@ -3931,7 +3946,7 @@ async fn a_task_with_a_model_runs_on_that_providers_account_as_that_model() {
             .any(|r| r.contains("\ntask: task #1 started")),
         "{replies:?}"
     );
-    wait(|| task_status(&home, "completed") == 1).await;
+    wait(10, || task_status(&home, "completed") == 1).await;
     let starts = std::fs::read_to_string(home.join("accounts/b/starts.log")).unwrap();
     assert_eq!(
         starts, "other/m9\n",
@@ -3988,7 +4003,7 @@ async fn a_task_runs_as_a_subagent_on_the_model_its_settings_resolve_to() {
     gw.say("m1", "owner", &calls.join(" ")).await;
     // Main's reply to the calls may come after the reports the tasks steered in.
     let ours = |r: &String| r.starts_with("echo: [chat #1]");
-    wait(|| gw.replies().iter().any(ours)).await;
+    wait(10, || gw.replies().iter().any(ours)).await;
     let reply = gw.replies().into_iter().find(ours).unwrap();
     for (id, line) in [
         (1, "task: task #1 started"),
@@ -4007,7 +4022,7 @@ async fn a_task_runs_as_a_subagent_on_the_model_its_settings_resolve_to() {
     ] {
         assert!(reply.contains(&format!("\n{line}")), "call {id}: {reply}");
     }
-    wait(|| task_status(&home, "completed") == 4).await;
+    wait(10, || task_status(&home, "completed") == 4).await;
     // The agent's model, else the subagent's, else `[tasks] model`.
     let list = zephyr::tasks::list(&Store::open(&home.join("state.db")).unwrap());
     for line in [
@@ -4052,7 +4067,7 @@ async fn the_owner_edits_subagents_and_task_settings_from_a_chat() {
     let gw = start(on_file(&home, ""));
     // Until the first child is up the router has no account, and any change reads as moving
     // to one (a restart). Once it has started, the messages below wait for its spawn to finish.
-    wait(|| !log(&home, "start").is_empty()).await;
+    wait(10, || !log(&home, "start").is_empty()).await;
     let says = [
         "/subagent",
         "/subagent add explorer other/m3 You explore.\nNever edit.",
@@ -4147,7 +4162,7 @@ async fn set_changes_a_registered_value_and_logs_who() {
     let home = home("set-value");
     let gw = start(on_file(&home, ""));
     // Before the first child is up any reload reads as a move to an account (a restart).
-    wait(|| !log(&home, "start").is_empty()).await;
+    wait(10, || !log(&home, "start").is_empty()).await;
     gw.say("m1", "owner", "/set tasks.parallel 3").await;
     gw.say("m2", "owner", "/set nope 1").await;
     gw.say("m3", "owner", "/set tasks.parallel 40").await;
@@ -4179,7 +4194,7 @@ async fn a_strong_loosening_is_refused_from_discord_and_accepted_from_chat() {
         &home,
         "[budget]\ndaily_cost_usd = 5.0",
     ));
-    wait(|| !log(&home, "start").is_empty()).await;
+    wait(10, || !log(&home, "start").is_empty()).await;
     let refused = "[zephyr] loosening budget.daily_cost_usd needs tui or chat or passkey";
     gw.say_on("discord", "d1", "downer", "/set budget.daily_cost_usd 8")
         .await;
@@ -4220,7 +4235,7 @@ async fn a_strong_loosening_is_refused_from_discord_and_accepted_from_chat() {
 async fn approvals_full_from_discord_is_refused_and_from_chat_applies() {
     let home = home("approvals-preset");
     let gw = start(on_file_with_discord(&home, ""));
-    wait(|| !log(&home, "start").is_empty()).await;
+    wait(10, || !log(&home, "start").is_empty()).await;
     gw.say_on("discord", "d1", "downer", "/approvals").await;
     assert_eq!(
         gw.wait_replies_on("discord", 1).await,
@@ -4301,9 +4316,9 @@ async fn a_timed_preset_goes_back_to_the_whole_set() {
     cfg.tick = Duration::from_millis(200);
     cfg.min_until = Duration::from_secs(1);
     let gw = start(cfg);
-    wait(|| !log(&home, "start").is_empty()).await;
+    wait(10, || !log(&home, "start").is_empty()).await;
     gw.say("m1", "owner", "/approvals full for 1s").await;
-    wait(|| !gw.replies().is_empty()).await;
+    wait(10, || !gw.replies().is_empty()).await;
     let timed = gw.replies().remove(0);
     // The hand-set `facts = "off"`, looser than full's warn, was dropped: the modes after the
     // change read the preset's `facts warn`. Read from the reply, not the file, which the revert
@@ -4317,7 +4332,7 @@ async fn a_timed_preset_goes_back_to_the_whole_set() {
         "{timed}"
     );
     let file = || Config::load(&home.join("zephyr.toml")).unwrap();
-    wait(|| gw.replies().len() == 2).await;
+    wait(10, || gw.replies().len() == 2).await;
     assert_eq!(
         gw.replies()[1],
         "[zephyr] approvals.preset went back to semi (the 1s you set ended)"
@@ -4384,7 +4399,7 @@ async fn a_tool_moves_into_a_class_at_once_and_out_of_one_only_with_approval() {
     let home = home("approvals-classes");
     let mcp = "[[mcp]]\nname = \"mail\"\ncommand = \"m\"";
     let gw = start(on_file_with_discord(&home, mcp));
-    wait(|| !log(&home, "start").is_empty()).await;
+    wait(10, || !log(&home, "start").is_empty()).await;
     gw.say(
         "m1",
         "owner",
@@ -4431,7 +4446,7 @@ async fn a_preset_ends_the_time_limits_of_the_classes_it_clears() {
     let home = home("approvals-r31");
     let approvals = "[approvals]\npreset = \"semi\"\nmessages = \"delay 10\"";
     let gw = start(on_file_with_discord(&home, approvals));
-    wait(|| !log(&home, "start").is_empty()).await;
+    wait(10, || !log(&home, "start").is_empty()).await;
     let store = Store::open(&home.join("state.db")).unwrap();
     let revert = |key: &str| store.revert(key).unwrap().map(|r| r.value);
     gw.say("m1", "owner", "/approvals messages auto for 2h")
@@ -4476,14 +4491,14 @@ async fn a_timed_change_reverts_on_the_tick() {
     cfg.tick = Duration::from_millis(200);
     cfg.min_until = Duration::from_secs(1);
     let gw = start(cfg);
-    wait(|| !log(&home, "start").is_empty()).await;
+    wait(10, || !log(&home, "start").is_empty()).await;
     gw.say("m1", "owner", "/set tasks.parallel 3 for 1s").await;
     let first = gw.wait_replies(1).await.remove(0);
     assert!(
         first.starts_with("[zephyr] tasks.parallel 2 → 3 until "),
         "{first}"
     );
-    wait(|| gw.replies().len() == 2).await;
+    wait(10, || gw.replies().len() == 2).await;
     assert_eq!(
         gw.replies()[1],
         "[zephyr] tasks.parallel went back to 2 (the 1s you set ended)"
@@ -4499,7 +4514,7 @@ async fn a_timed_change_reverts_on_the_tick() {
 async fn settings_lists_a_section_with_values_and_sources() {
     let home = home("settings-list");
     let gw = start(on_file(&home, ""));
-    wait(|| !log(&home, "start").is_empty()).await;
+    wait(10, || !log(&home, "start").is_empty()).await;
     gw.say("m1", "owner", "/settings Background tasks").await;
     gw.say("m2", "owner", "/set tasks.parallel 3").await;
     gw.say("m3", "owner", "/settings tasks.parallel").await;
@@ -4523,7 +4538,7 @@ async fn settings_lists_a_section_with_values_and_sources() {
 async fn a_change_whose_reload_fails_is_logged_as_failed_and_not_timed() {
     let home = home("set-reload-fails");
     let gw = start(on_file(&home, ""));
-    wait(|| !log(&home, "start").is_empty()).await;
+    wait(10, || !log(&home, "start").is_empty()).await;
     std::fs::write(home.join("model_refuse"), "").unwrap();
     gw.say("m1", "owner", "/set model fake/m2 for 1h").await;
     let reply = gw.wait_replies(1).await.remove(0);
@@ -4552,7 +4567,7 @@ async fn a_change_whose_reload_fails_is_logged_as_failed_and_not_timed() {
 async fn a_stale_proposal_is_refused() {
     let home = home("set-stale");
     let gw = start(on_file(&home, ""));
-    wait(|| !log(&home, "start").is_empty()).await;
+    wait(10, || !log(&home, "start").is_empty()).await;
     let store = Store::open(&home.join("state.db")).unwrap();
     // The owner was shown `tasks.parallel` at 3; it is unset (2) now.
     let cmd = "/set tasks.parallel 4";
@@ -4588,15 +4603,18 @@ async fn two_tasks_run_at_once_and_owner_stop_ends_them_all() {
     gw.say("m1", "owner", &format!("{call} {call} {call}"))
         .await;
     gw.wait_replies(1).await;
-    wait(|| task_status(&home, "running") == 2 && task_status(&home, "queued") == 1).await;
+    wait(10, || {
+        task_status(&home, "running") == 2 && task_status(&home, "queued") == 1
+    })
+    .await;
     gw.say("m2", "owner", "/task list").await;
     let list = gw.wait_replies(2).await[1].clone();
     assert!(list.contains("#3 queued"), "{list}");
     gw.say("m3", "owner", "/stop").await;
     assert_eq!(gw.wait_replies(3).await[2], "[zephyr] stopped");
-    wait(|| task_status(&home, "stopped") == 3).await;
+    wait(10, || task_status(&home, "stopped") == 3).await;
     // The two that ran report back; the queued one never started, so it has nothing to say.
-    wait(|| inbox_reports(&home) == 2).await;
+    wait(10, || inbox_reports(&home) == 2).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(inbox_reports(&home), 2);
     gw.say("m4", "owner", "/task stop 9").await;
@@ -4616,10 +4634,13 @@ async fn tasks_parallel_sets_how_many_run_at_once() {
     let call = format!(r#"[call task {{"action": "start", "goal": "{HANGING_GOAL}"}}]"#);
     gw.say("m1", "owner", &vec![call; 17].join(" ")).await;
     gw.wait_replies(1).await;
-    wait(|| task_status(&home, "running") == 16 && task_status(&home, "queued") == 1).await;
+    wait(10, || {
+        task_status(&home, "running") == 16 && task_status(&home, "queued") == 1
+    })
+    .await;
     gw.say("m2", "owner", "/stop").await;
     assert_eq!(gw.wait_replies(2).await[1], "[zephyr] stopped");
-    wait(|| task_status(&home, "stopped") == 17).await;
+    wait(10, || task_status(&home, "stopped") == 17).await;
     gw.shutdown().await;
 }
 
@@ -4630,11 +4651,11 @@ async fn a_task_cut_between_steps_carries_on_with_the_resume_note() {
     let start_call = format!(r#"[call task {{"action": "start", "goal": "{HANGING_GOAL}"}}]"#);
     gw.say("m1", "owner", &start_call).await;
     gw.wait_replies(1).await;
-    wait(|| task_prompts(&home) == 1).await;
+    wait(10, || task_prompts(&home) == 1).await;
     gw.shutdown().await;
     // Nothing for rpi to resume: its session ends at the prompt. The task is told to go on.
     let gw = start(config(&home));
-    wait(|| task_status(&home, "completed") == 1).await;
+    wait(10, || task_status(&home, "completed") == 1).await;
     assert!(log(&home, "resume_pending").is_empty());
     let prompts = log(&home, "prompt");
     assert!(
@@ -4643,7 +4664,7 @@ async fn a_task_cut_between_steps_carries_on_with_the_resume_note() {
             .any(|p| p["message"] == zephyr::scheduler::RESUME_NOTE),
         "{prompts:?}"
     );
-    wait(|| inbox_reports(&home) == 1).await;
+    wait(10, || inbox_reports(&home) == 1).await;
     let store = Store::open(&home.join("state.db")).unwrap();
     let report = ["new", "dispatched", "done"]
         .iter()
@@ -4688,9 +4709,9 @@ async fn pause_aborts_a_running_task() {
     let call = format!(r#"[call task {{"action": "start", "goal": "{HANGING_GOAL}"}}]"#);
     gw.say("m1", "owner", &call).await;
     gw.wait_replies(1).await;
-    wait(|| task_status(&home, "running") == 1).await;
+    wait(10, || task_status(&home, "running") == 1).await;
     gw.say("m2", "owner", "/pause").await;
-    wait(|| task_status(&home, "failed") == 1).await;
+    wait(10, || task_status(&home, "failed") == 1).await;
     let report = last_prompt(&home, 1).await;
     let rows = Store::open(&home.join("state.db"))
         .unwrap()
@@ -4711,9 +4732,9 @@ async fn a_message_sent_mid_tool_is_steered_in_and_answered_before_the_run_ends(
     let gw = start(config(&home));
     std::fs::write(home.join("tool_wait"), "").unwrap();
     gw.say("m1", "owner", "[tool] look around").await;
-    wait(|| main_session(&home).contains("toolCall")).await; // main is mid-run, in its tool
+    wait(10, || main_session(&home).contains("toolCall")).await; // main is mid-run, in its tool
     gw.say("m2", "owner", "what are you doing?").await;
-    wait(|| !log(&home, "queue_message").is_empty()).await;
+    wait(10, || !log(&home, "queue_message").is_empty()).await;
     assert_eq!(log(&home, "queue_message")[0]["deliverAs"], "steer");
     std::fs::remove_file(home.join("tool_wait")).unwrap();
     // m2 was answered inside the run, so its reply goes out before the run's own. It went in
@@ -4749,12 +4770,15 @@ async fn the_one_text_after_a_steer_goes_out_once() {
     let gw = start(config(&home));
     std::fs::write(home.join("tool_wait"), "").unwrap();
     gw.say("m1", "owner", "[tool] look around").await;
-    wait(|| main_session(&home).contains("toolCall")).await;
+    wait(10, || main_session(&home).contains("toolCall")).await;
     // `[quiet]`: the fake writes nothing for it, so the run's final text is the only answer.
     gw.say("m2", "owner", "[quiet] thanks").await;
-    wait(|| !log(&home, "queue_message").is_empty()).await;
+    wait(10, || !log(&home, "queue_message").is_empty()).await;
     std::fs::remove_file(home.join("tool_wait")).unwrap();
-    wait(|| inbox_status(&home, "done") == 2 && log(&home, "prompt").len() == 2).await;
+    wait(10, || {
+        inbox_status(&home, "done") == 2 && log(&home, "prompt").len() == 2
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     // The run's own row cannot tell "one text for both" from "answered the steer and stopped",
     // so it goes once more as a continuation; a model that had finished answers NO_REPLY,
@@ -4780,9 +4804,9 @@ async fn a_run_that_stops_at_a_steered_answer_carries_on_with_its_own_request() 
         "[stop-after-steer] [unfinished] [tool] research",
     )
     .await;
-    wait(|| main_session(&home).contains("toolCall")).await;
+    wait(10, || main_session(&home).contains("toolCall")).await;
     gw.say("m2", "owner", "what is 3+5?").await;
-    wait(|| !log(&home, "queue_message").is_empty()).await;
+    wait(10, || !log(&home, "queue_message").is_empty()).await;
     std::fs::remove_file(home.join("tool_wait")).unwrap();
     let replies = gw.wait_replies(2).await;
     assert!(
@@ -4811,7 +4835,7 @@ async fn a_steer_racing_the_end_of_a_run_is_taken_back_and_sent_again() {
     cfg.auth.enabled = false;
     let gw = start(cfg);
     gw.say("m1", "owner", "first").await;
-    wait(|| !log(&home, "prompt").is_empty()).await;
+    wait(10, || !log(&home, "prompt").is_empty()).await;
     gw.say("m2", "owner", "second").await;
     assert_eq!(
         gw.wait_replies(2).await,
@@ -4867,7 +4891,7 @@ async fn an_owner_message_moves_a_running_command_to_the_background() {
     let gw = start(config(&home));
     let call = r#"[call exec {"command": "sleep 2; echo done"}] go"#;
     gw.say("m1", "owner", call).await;
-    wait(|| proc_status(&home, "running") == 1).await;
+    wait(10, || proc_status(&home, "running") == 1).await;
     gw.say("m2", "owner", "hi").await;
     let replies = gw.wait_replies(2).await;
     let has = |r: &[String], s: &str| r.iter().any(|x| x.contains(s));
@@ -4914,9 +4938,9 @@ async fn background_commands_report_when_stopped_by_the_agent_or_the_owner() {
         r#"[call process {"action": "stop", "id": 1}]"#,
     )
     .await;
-    wait(|| proc_status(&home, "stopped") == 1).await;
+    wait(10, || proc_status(&home, "stopped") == 1).await;
     gw.say("m4", "owner", "/stop").await;
-    wait(|| proc_status(&home, "stopped") == 2).await;
+    wait(10, || proc_status(&home, "stopped") == 2).await;
     // The process answer, /stop's, and one report per stopped command (order varies).
     let replies = gw.wait_replies(6).await;
     let count = |s: &str| replies.iter().filter(|r| r.contains(s)).count();
@@ -4964,12 +4988,12 @@ async fn a_crash_after_a_steered_answer_still_gives_the_run_its_own_reply() {
     let gw = start(config(&home));
     gw.say("m1", "owner", "[pend-after-steer] [tool] look around")
         .await;
-    wait(|| main_session(&home).contains("toolCall")).await;
+    wait(10, || main_session(&home).contains("toolCall")).await;
     gw.say("m2", "owner", "what are you doing?").await;
-    wait(|| !log(&home, "queue_message").is_empty()).await;
+    wait(10, || !log(&home, "queue_message").is_empty()).await;
     std::fs::remove_file(home.join("tool_wait")).unwrap();
     // m2 is answered mid-run; then the gateway dies before the run settles.
-    wait(|| gw.replies().len() == 1).await;
+    wait(10, || gw.replies().len() == 1).await;
     assert!(gw.replies()[0].starts_with("echo: [chat #2] what are you doing?"));
     gw.task.abort(); // like kill -9
     let _ = gw.task.await;
@@ -5035,12 +5059,12 @@ async fn a_task_a_restart_cut_resumes_in_its_session() {
     let call = format!(r#"[call task {{"action": "start", "goal": "{goal}"}}]"#);
     gw.say("m1", "owner", &call).await;
     gw.wait_replies(1).await;
-    wait(|| task_prompts(&home) == 1).await;
+    wait(10, || task_prompts(&home) == 1).await;
     gw.task.abort(); // like kill -9: the task's child goes with it, its row stays `running`
     let _ = gw.task.await;
 
     let gw = start(config(&home));
-    wait(|| task_status(&home, "completed") == 1).await;
+    wait(10, || task_status(&home, "completed") == 1).await;
     assert_eq!(log(&home, "resume_pending").len(), 1);
     assert_eq!(task_prompts(&home), 1, "resumed, not started again");
     let note = log(&home, "queue_message");
@@ -5055,9 +5079,9 @@ async fn a_task_a_restart_cut_resumes_in_its_session() {
         .unwrap()[0]
         .clone();
     assert_eq!((task.resumes, task.session.as_deref()), (1, Some("task-1")));
-    wait(|| inbox_reports(&home) == 1).await;
+    wait(10, || inbox_reports(&home) == 1).await;
     // Main's prompt for the report, not just the newest prompt so far (under load it comes later).
-    wait(|| prompt_with(&home, "[task #1 finished;").is_some()).await;
+    wait(10, || prompt_with(&home, "[task #1 finished;").is_some()).await;
     let report = prompt_with(&home, "[task #1 finished;").unwrap();
     assert!(
         report.contains("> resumed: You are a background task"),
@@ -5089,8 +5113,8 @@ async fn a_task_that_finished_before_the_restart_reports_without_running_again()
         ],
     );
     let gw = start(cfg);
-    wait(|| task_status(&home, "completed") == 1).await;
-    wait(|| prompt_with(&home, "[task #1 finished;").is_some()).await;
+    wait(10, || task_status(&home, "completed") == 1).await;
+    wait(10, || prompt_with(&home, "[task #1 finished;").is_some()).await;
     let report = prompt_with(&home, "[task #1 finished;").unwrap();
     assert!(report.ends_with("> there are 3 files"), "{report}");
     assert_eq!(task_prompts(&home), 0, "no model call for the task");
@@ -5106,8 +5130,8 @@ async fn a_task_that_stalls_is_aborted() {
     let gw = start(cfg);
     let call = format!(r#"[call task {{"action": "start", "goal": "{HANGING_GOAL}"}}]"#);
     gw.say("m1", "owner", &call).await;
-    wait(|| task_status(&home, "failed") == 1).await;
-    wait(|| prompt_with(&home, "[task #1 failed;").is_some()).await;
+    wait(10, || task_status(&home, "failed") == 1).await;
+    wait(10, || prompt_with(&home, "[task #1 failed;").is_some()).await;
     let report = prompt_with(&home, "[task #1 failed;").unwrap();
     assert!(
         report.contains("> [zephyr] task #1 failed: stalled: no progress for 1s"),
@@ -5184,9 +5208,12 @@ async fn a_stopped_task_reports_what_it_had_got_to() {
     let call = format!(r#"[call task {{"action": "start", "goal": "{goal}"}}]"#);
     gw.say("m1", "owner", &call).await;
     gw.wait_replies(1).await;
-    wait(|| task_status(&home, "running") == 1).await;
+    wait(10, || task_status(&home, "running") == 1).await;
     gw.say("m2", "owner", "/task stop 1").await;
-    wait(|| task_status(&home, "stopped") == 1 && inbox_reports(&home) == 1).await;
+    wait(10, || {
+        task_status(&home, "stopped") == 1 && inbox_reports(&home) == 1
+    })
+    .await;
     let store = Store::open(&home.join("state.db")).unwrap();
     let report = ["new", "dispatched", "done"]
         .iter()
@@ -5210,13 +5237,13 @@ async fn a_resume_note_the_run_never_reached_does_not_open_the_next_run() {
     std::fs::write(home.join("hang"), "").unwrap();
     let gw = start(config(&home));
     gw.say("m1", "owner", "long job").await;
-    wait(|| !home.join("hang").exists()).await;
+    wait(10, || !home.join("hang").exists()).await;
     gw.task.abort(); // like kill -9
     let _ = gw.task.await;
     // The fake's resume settles before any step, so the note steered after it is never reached.
     let gw = start(config(&home));
     assert_eq!(gw.wait_replies(1).await, ["resumed: [chat #1] long job"]);
-    wait(|| !log(&home, "clear_queue").is_empty()).await; // taken back at the settle
+    wait(10, || !log(&home, "clear_queue").is_empty()).await; // taken back at the settle
     gw.say("m2", "owner", "next").await;
     assert_eq!(gw.wait_replies(2).await[1], "echo: [chat #2] next");
     assert!(
@@ -5232,15 +5259,15 @@ async fn a_steer_the_resumed_run_never_reached_is_sent_again_once() {
     std::fs::write(home.join("hang"), "").unwrap();
     let gw = start(config(&home));
     gw.say("m1", "owner", "long job").await;
-    wait(|| !home.join("hang").exists()).await;
+    wait(10, || !home.join("hang").exists()).await;
     gw.task.abort();
     let _ = gw.task.await;
     // The resumed run stays open: the note and then the owner's steer are both held.
     std::fs::write(home.join("resume_wait"), "").unwrap();
     let gw = start(config(&home));
-    wait(|| log(&home, "queue_message").len() == 1).await;
+    wait(10, || log(&home, "queue_message").len() == 1).await;
     gw.say("m2", "owner", "next").await;
-    wait(|| log(&home, "queue_message").len() == 2).await;
+    wait(10, || log(&home, "queue_message").len() == 2).await;
     std::fs::remove_file(home.join("resume_wait")).unwrap();
     // Neither was delivered: the queue is cleared and the steer goes again, as a prompt.
     assert_eq!(
@@ -5266,7 +5293,7 @@ async fn every_tool_call_of_main_and_of_a_job_is_audited_in_the_store() {
     let job = r#"/job add j | 0 0 1 1 * | [call read {"path": "j.txt"}] done"#;
     gw.say("m2", "owner", job).await;
     gw.say("m3", "owner", "/job run 1").await;
-    wait(|| run_status(&home, "completed") == 1).await;
+    wait(10, || run_status(&home, "completed") == 1).await;
     let rows = Store::open(&home.join("state.db"))
         .unwrap()
         .audit_rows()
@@ -5366,9 +5393,9 @@ async fn undo_takes_the_last_exchange_and_its_steers_out_of_the_context() {
     // The second run has a steered message in it: both rows are undone together.
     std::fs::write(home.join("tool_wait"), "").unwrap();
     gw.say("m2", "owner", "[tool] look around").await;
-    wait(|| main_session(&home).contains("toolCall")).await;
+    wait(10, || main_session(&home).contains("toolCall")).await;
     gw.say("m3", "owner", "what are you doing?").await;
-    wait(|| !log(&home, "queue_message").is_empty()).await;
+    wait(10, || !log(&home, "queue_message").is_empty()).await;
     std::fs::remove_file(home.join("tool_wait")).unwrap();
     gw.wait_replies(3).await;
 
@@ -5659,7 +5686,7 @@ async fn undo_retry_and_compact_wait_for_the_run() {
     std::fs::write(home.join("hang"), "").unwrap();
     let gw = start(config(&home));
     gw.say("m1", "owner", "long job").await;
-    wait(|| !home.join("hang").exists()).await;
+    wait(10, || !home.join("hang").exists()).await;
     for (id, command) in [("m2", "/undo"), ("m3", "/retry"), ("m4", "/compact")] {
         gw.say(id, "owner", command).await;
     }
@@ -5683,7 +5710,7 @@ async fn a_rollback_waits_until_nothing_runs_then_restores_the_projects() {
     std::fs::write(home.join("hang"), "").unwrap();
     let gw = start(cfg);
     gw.say("m1", "owner", "long job").await;
-    wait(|| !home.join("hang").exists()).await; // mid-run, with its checkpoint taken
+    wait(10, || !home.join("hang").exists()).await; // mid-run, with its checkpoint taken
     std::fs::write(app.join("a.txt"), "the run's edit").unwrap();
 
     gw.say("m2", "owner", "/rollback").await;
@@ -5905,7 +5932,7 @@ async fn ticks(home: &Path, n: usize) {
     };
     for _ in 0..n {
         let last = written();
-        wait(|| written() != last).await;
+        wait(10, || written() != last).await;
     }
 }
 
@@ -6073,7 +6100,7 @@ async fn set_browser_pace_writes_the_table_and_nothing_else_does() {
     let home = home("pace-set");
     let path = home.join("zephyr.toml");
     let gw = start(on_file(&home, ""));
-    wait(|| !log(&home, "start").is_empty()).await;
+    wait(10, || !log(&home, "start").is_empty()).await;
     gw.say("m1", "owner", "/set tasks.parallel 3").await;
     assert_eq!(gw.wait_replies(1).await, ["[zephyr] tasks.parallel 2 → 3"]);
     let before = std::fs::read_to_string(&path).unwrap();
@@ -6658,7 +6685,7 @@ async fn to_main(home: &Path, id: i64) -> String {
             .iter()
             .any(|c| c["message"].as_str().is_some_and(|m| m.contains(&header)))
     };
-    wait(|| sent("prompt") || sent("queue_message")).await;
+    wait(10, || sent("prompt") || sent("queue_message")).await;
     inbox_text(home, &format!("action-{id}")).expect("the row")
 }
 
@@ -6975,7 +7002,7 @@ async fn a_payment_ok_from_discord_is_refused_when_money_is_strong_only() {
     let home = home("gate-money-strong");
     let strong = "[approvals]\nstrong_only = [\"loosen\", \"money\"]";
     let gw = start(on_file_with_discord(&home, strong));
-    wait(|| !log(&home, "start").is_empty()).await;
+    wait(10, || !log(&home, "start").is_empty()).await;
     // A connector payment held from a run on discord, as the gate stores one.
     let payload = r#"{"server":"shop","tool":"pay","arguments":{"amount":5,"currency":"USD"}}"#;
     let store = Store::open(&home.join("state.db")).unwrap();
@@ -7062,7 +7089,7 @@ async fn no_drops_a_held_action_and_stop_kills_an_approved_one() {
         .await;
     reply_where(&gw, "chat", |r| r.contains("held for the owner as #3")).await;
     gw.say("m5", "owner", "/ok 2").await;
-    wait(|| proc_status(&home, "running") == 1).await;
+    wait(10, || proc_status(&home, "running") == 1).await;
     gw.say("m6", "owner", "/stop").await;
     let report = to_main(&home, 2).await;
     assert!(
@@ -7109,7 +7136,7 @@ async fn a_delay_due_while_paused_is_asked_again() {
     // A tick while it is paused.
     let beat = home.join("heartbeat");
     let _ = std::fs::remove_file(&beat);
-    wait(|| beat.exists()).await;
+    wait(10, || beat.exists()).await;
     budget_pause(&home, false);
     let card = reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
     assert!(card.ends_with("/ok 1 · /no 1 · expires in 24 h"), "{card}");
@@ -7168,7 +7195,7 @@ async fn a_full_process_table_keeps_the_approval_waiting() {
     .await;
     assert_eq!(action_status(&home, 1), "pending");
     gw.say("m3", "owner", "/process stop 1").await;
-    wait(|| proc_status(&home, "running") == 7).await;
+    wait(10, || proc_status(&home, "running") == 7).await;
     gw.say("m4", "owner", "/ok 1").await;
     assert!(to_main(&home, 1).await.starts_with("[action #1 done;"));
     assert_eq!(
@@ -7270,8 +7297,8 @@ async fn a_tasks_send_is_held_through_the_socket_and_runs_on_ok() {
     // The plugin refused the call; the task was told why, in its own session.
     let held = "held for the owner as #1 (email to a@x.org); don't retry it; carry on or end \
                 your turn";
-    wait(|| told_in(&home, "task-1", held)).await;
-    wait(|| task_status(&home, "completed") == 1).await;
+    wait(10, || told_in(&home, "task-1", held)).await;
+    wait(10, || task_status(&home, "completed") == 1).await;
     // Steered once: before the plugin was answered, not again at the call's end (R51).
     let steers = log(&home, "queue_message");
     assert_eq!(
@@ -7339,7 +7366,7 @@ async fn a_connector_pass_is_used_once() {
     // The plugin shows the model no reason: the daemon put the held note in main's run before
     // the plugin was answered, so the step after the refused call reads it (R51), once.
     let held = "held for the owner as #1 (mail/send); don't retry it; carry on or end your turn";
-    wait(|| told_in(&home, "main", held)).await;
+    wait(10, || told_in(&home, "main", held)).await;
     let messages = session_messages(&home, "main");
     let refused = messages
         .iter()
@@ -7386,7 +7413,7 @@ async fn a_connector_pass_is_used_once() {
             .map(|(_, _, _, o)| o)
             .collect::<Vec<_>>()
     };
-    wait(|| outcomes().len() >= 6).await;
+    wait(10, || outcomes().len() >= 6).await;
     assert_eq!(
         outcomes(),
         ["held", "error", "approved", "pass", "held", "error"]
@@ -7408,13 +7435,13 @@ async fn a_pass_is_steered_into_the_task_that_asked_while_it_runs() {
     let start_task = r#"[call task {"action": "start", "goal": "mail a", "subagent": "asker"}]"#;
     gw.say("m1", "owner", start_task).await;
     reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
-    wait(|| task_status(&home, "running") == 1).await;
+    wait(10, || task_status(&home, "running") == 1).await;
     gw.say("m2", "owner", "/ok 1").await;
     reply_where(&gw, "chat", |r| r.contains("approved #1")).await;
     let note = "[action #1 approved; zephyr's note, not the owner's words] the owner approved \
                 #1 (mail/send): make exactly that connector call again within 30 min and it \
                 goes through, once";
-    wait(|| {
+    wait(10, || {
         log(&home, "queue_message")
             .iter()
             .any(|c| c["message"] == note && c["deliverAs"] == "steer")
@@ -7422,8 +7449,8 @@ async fn a_pass_is_steered_into_the_task_that_asked_while_it_runs() {
     .await;
     std::fs::remove_file(home.join("tool_wait")).unwrap();
     // Delivered into the task's run, so main is not handed it as well.
-    wait(|| told_in(&home, "task-1", note)).await;
-    wait(|| task_status(&home, "completed") == 1).await;
+    wait(10, || told_in(&home, "task-1", note)).await;
+    wait(10, || task_status(&home, "completed") == 1).await;
     assert!(inbox_text(&home, "action-1").is_none());
     gw.shutdown().await;
 }
@@ -7479,14 +7506,12 @@ fi
 /// A home whose `bin/agent-browser` is the wrapper (zephyr itself, by that name), with the fake
 /// as the real agent-browser, open on `url`: a compose page with a Send button, `@e3`.
 fn browser_home(name: &str, url: &str) -> (PathBuf, Config) {
-    use std::os::unix::fs::PermissionsExt;
     let home = home(name);
     std::fs::create_dir_all(home.join("bin")).unwrap();
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_zephyr"), home.join("bin/agent-browser"))
         .unwrap();
     let real = home.join("real-agent-browser");
-    std::fs::write(&real, FAKE_BROWSER).unwrap();
-    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+    test_exe(&real, FAKE_BROWSER);
     let ok = |data: Value| serde_json::json!({"success": true, "data": data}).to_string();
     std::fs::write(
         home.join("ab-url.json"),
@@ -7598,7 +7623,7 @@ async fn a_browser_send_waits_until_ok_and_then_clicks() {
     assert!(reply.contains("exited 0"), "{reply}");
     assert_eq!(clicks(&home), ["click @e3"]);
     // Recorded done once the wrapper said it runs (M2).
-    wait(|| action_status(&home, 1) == "done").await;
+    wait(10, || action_status(&home, 1) == "done").await;
     gw.shutdown().await;
 }
 
@@ -7628,7 +7653,7 @@ async fn an_approved_click_on_a_page_that_changed_is_recorded_as_not_run() {
     .await;
     assert!(reply.contains("exited 1"), "{reply}");
     assert!(clicks(&home).is_empty(), "{:?}", browser_argv(&home));
-    wait(|| action_status(&home, 1) != "running").await;
+    wait(10, || action_status(&home, 1) != "running").await;
     assert_eq!(action_status(&home, 1), "failed");
     // ... and the owner, told at `/ok` that the browser goes on, is told it did not (round 3).
     let told = reply_where(&gw, "chat", |r| r.contains("did not run")).await;
@@ -7646,11 +7671,11 @@ async fn stop_denies_a_waiting_click() {
     let gw = start(cfg);
     gw.say("m1", "owner", &click_send(&home)).await;
     reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #1:")).await;
-    wait(|| proc_status(&home, "running") == 1).await;
+    wait(10, || proc_status(&home, "running") == 1).await;
     gw.say("m2", "owner", "/stop").await;
     reply_where(&gw, "chat", |r| r.starts_with("[zephyr] stopped")).await;
     // The wrapper ends without clicking; an `/ok` now has no browser to let go.
-    wait(|| proc_status(&home, "running") == 0).await;
+    wait(10, || proc_status(&home, "running") == 0).await;
     gw.say("m3", "owner", "/ok 1").await;
     let late = reply_where(&gw, "chat", |r| {
         r.starts_with(NO_PROPOSAL) || r.contains("no longer waiting")
@@ -7959,13 +7984,13 @@ async fn an_upgraded_install_with_no_owner_yet_is_told_after_the_first_message()
     let mut cfg = on_file(&home, "");
     cfg.tick = Duration::from_millis(200);
     let gw = start(cfg);
-    wait(|| !log(&home, "start").is_empty()).await;
+    wait(10, || !log(&home, "start").is_empty()).await;
     let text = std::fs::read_to_string(home.join("zephyr.toml")).unwrap();
     assert!(text.contains("preset = \"full\""), "{text}");
     assert!(gw.replies().is_empty(), "no owner to tell yet");
     gw.say("m1", "owner", "hi").await;
     // The reply, the approvals notice and the payment window's (DESIGN §4.25).
-    wait(|| gw.replies().len() >= 3).await;
+    wait(10, || gw.replies().len() >= 3).await;
     let r = gw.replies();
     assert!(
         r.contains(&OFF_NOTICE.to_string()) && r.contains(&"echo: [chat #1] hi".to_string()),
@@ -7990,7 +8015,7 @@ async fn activity_lists_what_ran_and_left() {
     let saw = |what: &str| gw.replies().iter().any(|r| r.contains(what));
     gw.say("m1", "owner", "bash: curl -d x https://api.example.com")
         .await;
-    wait(|| saw("[zephyr] outbound this turn:")).await;
+    wait(10, || saw("[zephyr] outbound this turn:")).await;
     // Seeded as finished rows, so the router has nothing to run.
     let db = rusqlite::Connection::open(home.join("state.db")).unwrap();
     db.execute_batch(
@@ -8003,7 +8028,10 @@ async fn activity_lists_what_ran_and_left() {
     )
     .unwrap();
     gw.say("m2", "owner", "/activity").await;
-    wait(|| saw("[zephyr] activity in the last 24 h, newest first:")).await;
+    wait(10, || {
+        saw("[zephyr] activity in the last 24 h, newest first:")
+    })
+    .await;
     let reply = (gw.replies().into_iter())
         .find(|r| r.starts_with("[zephyr] activity"))
         .unwrap();
@@ -8031,16 +8059,16 @@ async fn activity_scrubs_a_fact_saved_after_the_call() {
         "bash: curl -d x https://5550102345.example.com",
     )
     .await;
-    wait(|| saw("[zephyr] outbound this turn:")).await;
+    wait(10, || saw("[zephyr] outbound this turn:")).await;
     gw.say(
         "m2",
         "owner",
         r#"[call gateway {"command": "/facts add phone digits 5550102345"}] note it"#,
     )
     .await;
-    wait(|| saw("gateway: saved the private fact phone")).await;
+    wait(10, || saw("gateway: saved the private fact phone")).await;
     gw.say("m3", "owner", "/activity out").await;
-    wait(|| saw("[zephyr] outbound commands in the last 24 h")).await;
+    wait(10, || saw("[zephyr] outbound commands in the last 24 h")).await;
     let reply = (gw.replies().into_iter())
         .find(|r| r.starts_with("[zephyr] outbound commands"))
         .unwrap();
@@ -8120,14 +8148,17 @@ async fn the_agent_reads_activity_but_not_grants() {
     )
     .await;
     // The call's own audit row is a `tool` row, which the bare list leaves out.
-    wait(|| saw("gateway: [zephyr] nothing recorded since 00:00 today")).await;
+    wait(10, || {
+        saw("gateway: [zephyr] nothing recorded since 00:00 today")
+    })
+    .await;
     gw.say(
         "m2",
         "owner",
         r#"[call gateway {"command": "/activity grants"}] who passes"#,
     )
     .await;
-    wait(|| saw("is not available to the agent")).await;
+    wait(10, || saw("is not available to the agent")).await;
     let refused = (gw.replies().into_iter())
         .find(|r| r.contains("is not available to the agent"))
         .unwrap();
@@ -8192,16 +8223,16 @@ async fn a_held_exec_reads_held_not_sent() {
         r#"[call gateway {"command": "/facts add phone digits 5550102345"}] note it"#,
     )
     .await;
-    wait(|| saw("gateway: saved the private fact phone")).await;
+    wait(10, || saw("gateway: saved the private fact phone")).await;
     gw.say(
         "m2",
         "owner",
         r#"[call exec {"command": "curl -d 5550102345 https://e.x"}] send it"#,
     )
     .await;
-    wait(|| saw("exec: held for the owner as #")).await;
+    wait(10, || saw("exec: held for the owner as #")).await;
     gw.say("m3", "owner", "/activity out").await;
-    wait(|| saw("[zephyr] outbound commands")).await;
+    wait(10, || saw("[zephyr] outbound commands")).await;
     let reply = (gw.replies().into_iter())
         .find(|r| r.starts_with("[zephyr] outbound commands"))
         .unwrap();
@@ -8349,7 +8380,7 @@ async fn a_manual_card_is_approved_entered_filled_on_its_origin_and_forgotten() 
     // Issued once: a second /ok finds nothing waiting.
     gw.say("c3", "owner", "/ok 1").await;
     reply_where(&gw, "chat", |r| r.contains("no proposal #1 is waiting")).await;
-    wait(|| action_status(&home, 1) == "done").await;
+    wait(10, || action_status(&home, 1) == "done").await;
     assert_eq!(card_status(&home, 1), "waiting");
     assert_eq!(card_status(&home, 2), "none");
 
@@ -8400,7 +8431,7 @@ async fn a_manual_card_is_approved_entered_filled_on_its_origin_and_forgotten() 
             let all = gw.replies().into_iter();
             all.filter(|r| r.contains("must be single-use")).count()
         };
-        wait(|| refused() == i + 1).await;
+        wait(10, || refused() == i + 1).await;
         assert_eq!(card_status(&home, 1), "waiting", "{kind}");
         assert!(
             zephyr::cards::entered(id).is_none(),
@@ -8457,7 +8488,7 @@ async fn a_manual_card_is_approved_entered_filled_on_its_origin_and_forgotten() 
         set_page(&home, page);
         let fill = format!("{CARD_FILL} {n}");
         gw.say(&format!("look-{n}"), "owner", &fill).await;
-        wait(|| refusals().len() > n).await;
+        wait(10, || refusals().len() > n).await;
         let refused = &refusals()[n];
         assert!(
             refused.contains("but card #1 is only for https://shop.example"),
@@ -8570,7 +8601,7 @@ async fn a_manual_card_is_approved_entered_filled_on_its_origin_and_forgotten() 
     };
     assert_eq!(reminders(), 1);
     db.execute("UPDATE cards SET told_at = 1", []).unwrap();
-    wait(|| reminders() == 2).await;
+    wait(10, || reminders() == 2).await;
     ticks(&home, 3).await;
     assert_eq!(reminders(), 2, "once a day, not once a tick");
     gw.say("c11", "owner", "/card done 1").await;
@@ -8652,7 +8683,7 @@ async fn an_issued_card_passes_its_pay_click_and_closes_at_its_charge() {
         all.filter(|r| r.contains("click @e3\"}]\nexec:")).count()
     };
     gw.say("f3", "owner", &click_send(&home)).await;
-    wait(|| clicks(&home).len() == 1 && turns() == 1).await;
+    wait(10, || clicks(&home).len() == 1 && turns() == 1).await;
     assert_eq!(audit_outcomes(&home, "browser"), ["card"]);
     // That click used the card: a second one on the same page is asked about like any payment.
     assert_eq!(card_status(&home, 1), "charging");
@@ -8664,7 +8695,7 @@ async fn an_issued_card_passes_its_pay_click_and_closes_at_its_charge() {
     );
     gw.say("f3c", "owner", "/no 2").await;
     reply_where(&gw, "chat", |r| r.contains("[process #2 exited")).await;
-    wait(|| turns() == 2).await;
+    wait(10, || turns() == 2).await;
     assert_eq!(clicks(&home).len(), 1);
     // Over the cap it is held like any payment.
     pay_page(&home, "CA$50.00");
@@ -8676,7 +8707,7 @@ async fn an_issued_card_passes_its_pay_click_and_closes_at_its_charge() {
     );
     gw.say("f5", "owner", "/no 3").await;
     reply_where(&gw, "chat", |r| r.contains("[process #3 exited")).await;
-    wait(|| turns() == 3).await;
+    wait(10, || turns() == 3).await;
     assert_eq!(clicks(&home).len(), 1);
 
     // The issuer reports the charge: the card closes, and the payee is named by its id.
@@ -8709,7 +8740,7 @@ async fn an_issued_card_passes_its_pay_click_and_closes_at_its_charge() {
     reply_where(&gw, "chat", |r| r.starts_with("[zephyr] approve #4:")).await;
     gw.say("f6n", "owner", "/no 4").await;
     reply_where(&gw, "chat", |r| r.contains("[process #4 exited")).await;
-    wait(|| turns() == 4).await;
+    wait(10, || turns() == 4).await;
     gw.say("f7", "owner", CARD_FILL).await;
     reply_where(&gw, "chat", |r| {
         r.contains("\ncard: not filled: card #1 is used")
@@ -8844,7 +8875,7 @@ async fn stop_and_a_start_close_open_cards_and_a_failed_close_is_told_once() {
         issued.starts_with("[zephyr] card #2 is issued: single use, up to 42.50 CAD"),
         "{issued}"
     );
-    wait(|| card_status(&home, 2) == "open").await;
+    wait(10, || card_status(&home, 2) == "open").await;
     Fake::script(&script, |s| s.fail_close = true);
     gw.say("s2", "owner", "/stop").await;
     let failed = reply_where(&gw, "chat", |r| r.contains("could not be closed")).await;
@@ -8854,7 +8885,7 @@ async fn stop_and_a_start_close_open_cards_and_a_failed_close_is_told_once() {
          it in the provider's app"
     );
     // Tried again on later ticks, told once, and never filled meanwhile.
-    wait(|| {
+    wait(10, || {
         Fake::script(&script, |s| {
             s.log.iter().filter(|l| *l == "close 2").count() >= 3
         })
@@ -8871,7 +8902,7 @@ async fn stop_and_a_start_close_open_cards_and_a_failed_close_is_told_once() {
     })
     .await;
     Fake::script(&script, |s| s.fail_close = false);
-    wait(|| card_status(&home, 2) == "closed").await;
+    wait(10, || card_status(&home, 2) == "closed").await;
     let told = gw.replies();
     assert_eq!(
         told.iter()
@@ -8893,7 +8924,7 @@ async fn a_charge_over_the_cap_is_told_at_once() {
     let script = cfg.clone();
     let gw = start(cfg);
     gw.say("o1", "owner", &card_ask("10")).await;
-    wait(|| card_status(&home, 1) == "open").await;
+    wait(10, || card_status(&home, 1) == "open").await;
     Fake::script(&script, |s| {
         s.state = CardState::Used(vec![Charge {
             minor: 5000,
@@ -8985,15 +9016,15 @@ async fn a_stop_during_a_slow_issue_leaves_the_card_closed() {
     let gw = start(cfg);
     gw.say("i1", "owner", &card_ask("42.50")).await;
     let log = || Fake::script(&script, |s| s.log.clone());
-    wait(|| log().iter().any(|l| l.starts_with("issue 1 "))).await;
+    wait(10, || log().iter().any(|l| l.starts_with("issue 1 "))).await;
     assert_eq!(card_status(&home, 1), "waiting");
     gw.say("i2", "owner", "/stop").await;
     reply_where(&gw, "chat", |r| r.starts_with("[zephyr] stopped")).await;
-    wait(|| card_status(&home, 1) == "closed").await;
+    wait(10, || card_status(&home, 1) == "closed").await;
     // The issue answers after that: the card it made is closed at the issuer, by the issue
     // itself (before, there was nothing at the issuer to close).
     assert!(!log().contains(&"close 1".to_string()), "{:?}", log());
-    wait(|| log().contains(&"close 1".to_string())).await;
+    wait(10, || log().contains(&"close 1".to_string())).await;
     ticks(&home, 12).await;
     assert_eq!(card_status(&home, 1), "closed", "{:?}", log());
     let said = gw.replies();
@@ -9020,7 +9051,7 @@ async fn a_frame_or_a_page_that_moved_gets_no_number_and_a_move_closes_the_card(
     let gw = start(cfg);
     let said = |has: &'static str| reply_where(&gw, "chat", move |r| r.contains(has));
     gw.say("v1", "owner", &card_ask("10")).await;
-    wait(|| card_status(&home, 1) == "open").await;
+    wait(10, || card_status(&home, 1) == "open").await;
     said("[card #1 issued").await;
     // The page's own document has no such field: it is in an injected frame.
     std::fs::write(home.join("ab-fill.txt"), "missing").unwrap();
@@ -9044,13 +9075,13 @@ async fn a_frame_or_a_page_that_moved_gets_no_number_and_a_move_closes_the_card(
         ),
         "{moved}"
     );
-    wait(|| card_status(&home, 1) == "closed").await;
+    wait(10, || card_status(&home, 1) == "closed").await;
     said("[card #1 closed").await;
 
     // A second card: the page leaves right after the number was typed. No further field.
     std::fs::remove_file(home.join("ab-fill.txt")).unwrap();
     gw.say("v4", "owner", &card_ask("11")).await;
-    wait(|| card_status(&home, 2) == "open").await;
+    wait(10, || card_status(&home, 2) == "open").await;
     said("[card #2 issued").await;
     let before = fills(&home).len();
     std::fs::write(home.join("ab-move-after"), "https://evil.example/thanks\n").unwrap();
@@ -9069,7 +9100,7 @@ async fn a_frame_or_a_page_that_moved_gets_no_number_and_a_move_closes_the_card(
         before + 1,
         "the expiry and the code were not typed"
     );
-    wait(|| card_status(&home, 2) == "closed").await;
+    wait(10, || card_status(&home, 2) == "closed").await;
     gw.shutdown().await;
 }
 
@@ -9080,15 +9111,15 @@ async fn a_stop_during_a_fill_types_no_further_field() {
     let (home, cfg) = card_home("card-fill-stop", "fake", "auto 100");
     let gw = start(cfg);
     gw.say("x1", "owner", &card_ask("10")).await;
-    wait(|| card_status(&home, 1) == "open").await;
+    wait(10, || card_status(&home, 1) == "open").await;
     reply_where(&gw, "chat", |r| r.contains("[card #1 issued")).await;
     // Each field takes the browser two seconds.
     std::fs::write(home.join("ab-slow"), "2").unwrap();
     gw.say("x2", "owner", CARD_FILL).await;
-    wait(|| fills(&home).len() == 1).await;
+    wait(10, || fills(&home).len() == 1).await;
     gw.say("x3", "owner", "/stop").await;
     reply_where(&gw, "chat", |r| r.starts_with("[zephyr] stopped")).await;
-    wait(|| card_status(&home, 1) == "closed").await;
+    wait(10, || card_status(&home, 1) == "closed").await;
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(
         fills(&home),
@@ -9112,7 +9143,7 @@ async fn done_closes_an_issuers_card_at_the_issuer() {
         })
     };
     gw.say("n1", "owner", &card_ask("10")).await;
-    wait(|| card_status(&home, 1) == "open").await;
+    wait(10, || card_status(&home, 1) == "open").await;
     gw.say("n2", "owner", "/card done 1").await;
     let asked = reply_where(&gw, "chat", |r| {
         r.contains("card #1") && r.contains("issuer;")
@@ -9131,7 +9162,7 @@ async fn done_closes_an_issuers_card_at_the_issuer() {
     assert_eq!(card_status(&home, 1), "closed");
     // One the issuer will not close is not called closed.
     gw.say("n3", "owner", &card_ask("11")).await;
-    wait(|| card_status(&home, 2) == "open").await;
+    wait(10, || card_status(&home, 2) == "open").await;
     Fake::script(&script, |s| s.fail_close = true);
     gw.say("n4", "owner", "/card done 2").await;
     let failed = reply_where(&gw, "chat", |r| r.contains("card #2 could not be closed")).await;
@@ -9150,7 +9181,7 @@ async fn a_card_fill_never_waits_for_a_pace_slot() {
     cfg.browser = Some(toml::from_str("pace_ms = 60000").unwrap());
     let gw = start(cfg);
     gw.say("p1", "owner", &card_ask("10")).await;
-    wait(|| card_status(&home, 1) == "open").await;
+    wait(10, || card_status(&home, 1) == "open").await;
     reply_where(&gw, "chat", |r| r.contains("[card #1 issued")).await;
     // A navigation takes the site's slot: its next paced action is a minute or more away.
     let wrapper = home.join("bin/agent-browser");
@@ -9238,13 +9269,13 @@ async fn a_close_asked_before_the_issue_landed_is_carried_out_when_it_lands() {
     gw.say("k1", "owner", &card_ask("42.50")).await;
     let log = || Fake::script(&script, |s| s.log.clone());
     let closes = || log().iter().filter(|l| *l == "close 1").count();
-    wait(|| log().iter().any(|l| l.starts_with("issue 1 "))).await;
+    wait(10, || log().iter().any(|l| l.starts_with("issue 1 "))).await;
     gw.say("k2", "owner", "/stop").await;
     reply_where(&gw, "chat", |r| r.starts_with("[zephyr] stopped")).await;
     assert_eq!(closes(), 0, "nothing at the issuer to close yet");
     // The issue lands: closed there at once. The issuer refuses, so it is tried again, and
     // the card is not called closed meanwhile.
-    wait(|| closes() >= 2).await;
+    wait(10, || closes() >= 2).await;
     assert_eq!(card_status(&home, 1), "closing");
     let told = reply_where(&gw, "chat", |r| r.contains("could not be closed")).await;
     assert!(
@@ -9252,7 +9283,7 @@ async fn a_close_asked_before_the_issue_landed_is_carried_out_when_it_lands() {
         "{told}"
     );
     Fake::script(&script, |s| s.fail_close = false);
-    wait(|| card_status(&home, 1) == "closed").await;
+    wait(10, || card_status(&home, 1) == "closed").await;
     reply_where(&gw, "chat", |r| {
         r == "[zephyr] card #1 is closed at the issuer now"
     })
@@ -9308,7 +9339,7 @@ async fn a_card_counts_in_the_window_at_its_cap_whatever_the_page_says() {
     reply_where(&gw, "chat", |r| r.contains("\ncard: filled")).await;
     pay_page(&home, "CA$0.01");
     gw.say("w4", "owner", &click_send(&home)).await;
-    wait(|| clicks(&home).len() == 1).await;
+    wait(10, || clicks(&home).len() == 1).await;
     assert_eq!(card_status(&home, 1), "charging");
     let counted = || {
         let store = Store::open(&home.join("state.db")).unwrap();
@@ -9324,7 +9355,7 @@ async fn a_card_counts_in_the_window_at_its_cap_whatever_the_page_says() {
     Fake::script(&script, |s| {
         s.state = CardState::Used(vec![charge(2500), charge(2000)])
     });
-    wait(|| card_status(&home, 1) == "used").await;
+    wait(10, || card_status(&home, 1) == "used").await;
     assert_eq!(counted(), (1, 4500, false));
     gw.shutdown().await;
 }
@@ -9338,7 +9369,7 @@ async fn done_on_a_closing_issuers_card_waits_for_the_issuer() {
     let script = cfg.clone();
     let gw = start(cfg);
     gw.say("d1", "owner", &card_ask("10")).await;
-    wait(|| card_status(&home, 1) == "open").await;
+    wait(10, || card_status(&home, 1) == "open").await;
     Fake::script(&script, |s| s.fail_close = true);
     gw.say("d2", "owner", "/stop").await;
     reply_where(&gw, "chat", |r| r.contains("could not be closed")).await;
@@ -9408,8 +9439,11 @@ async fn a_close_right_after_the_issue_recorded_the_card_is_carried_out() {
         )
     })
     .await;
-    wait(|| Fake::script(&script, |s| s.log.contains(&"close 1".to_string()))).await;
-    wait(|| card_status(&home, 1) == "closed").await;
+    wait(10, || {
+        Fake::script(&script, |s| s.log.contains(&"close 1".to_string()))
+    })
+    .await;
+    wait(10, || card_status(&home, 1) == "closed").await;
     let said = gw.replies();
     assert!(
         !said.iter().any(|r| r.contains("approve it in Link")),
@@ -9432,7 +9466,7 @@ async fn charging_card(name: &str) -> (PathBuf, Config, Gateway) {
     reply_where(&gw, "chat", |r| r.contains("\ncard: filled")).await;
     pay_page(&home, "CA$42.50");
     gw.say("g4", "owner", &click_send(&home)).await;
-    wait(|| card_status(&home, 1) == "charging").await;
+    wait(10, || card_status(&home, 1) == "charging").await;
     (home, script, gw)
 }
 
@@ -9475,7 +9509,7 @@ async fn a_closing_card_is_still_asked_about_its_charge() {
     reply_where(&gw, "chat", |r| r.contains("could not be closed")).await;
     assert_eq!(card_status(&home, 1), "closing");
     Fake::script(&script, |s| s.state = CardState::Used(vec![cad(4250)]));
-    wait(|| card_status(&home, 1) == "used").await;
+    wait(10, || card_status(&home, 1) == "used").await;
     reply_where(&gw, "chat", |r| {
         r.starts_with("[zephyr] card #1 was charged 42.50 CAD")
     })

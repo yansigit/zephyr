@@ -1,6 +1,8 @@
 //! `rpi --connect` attach (src/attach.rs), spoken frame by frame as the stock 0.21.2
 //! client does, against the scripted fake child (tests/fake-rpi.py).
 
+mod common;
+use common::{free_port, wait};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
@@ -42,34 +44,13 @@ struct Gateway {
     task: tokio::task::JoinHandle<anyhow::Result<zephyr::router::Exit>>,
 }
 
-/// A port for a gateway's attach listener, below the kernel's ephemeral range (32768 up), so a
-/// `bind(0)` elsewhere cannot take it before the router binds it. A process never hands a port out
-/// twice (a second gateway could get it while the first has yet to bind it), and each process
-/// starts at a random one: nextest runs every test in a process of its own, at the same time.
-fn free_port() -> u16 {
-    use std::hash::{BuildHasher, Hasher};
-    static START: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
-        let r = std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish();
-        (r % 12_000) as u32
-    });
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    loop {
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let port = 20_000 + ((*START + n) % 12_000) as u16;
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-}
-
 fn start(name: &str) -> Gateway {
     start_with(name, "")
 }
 
 /// `extra` is appended to the config, after `[attach]`.
 fn start_with(name: &str, extra: &str) -> Gateway {
+    common::reap_logins_at_exit();
     let home = std::env::temp_dir().join(format!(
         "zephyr-attach-{name}-{}-{}",
         std::process::id(),
@@ -244,21 +225,11 @@ fn text(ev: &Value) -> String {
         .into()
 }
 
-async fn wait(mut done: impl FnMut() -> bool) {
-    for _ in 0..200 {
-        if done() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("timed out");
-}
-
 #[tokio::test]
 async fn history_replays_then_live_events_stream() {
     let gw = start("history");
     gw.say("m1", "earlier").await;
-    wait(|| gw.count("outbox", "sent") == 1).await;
+    wait(10, || gw.count("outbox", "sent") == 1).await;
 
     let mut c = Client::attach(gw.port).await;
     assert_eq!(c.event().await["type"], "ready");
@@ -287,7 +258,10 @@ async fn history_replays_then_live_events_stream() {
     assert_eq!(sent["result"]["status"], "sent", "{sent}");
     let end = c.event_of("message_end").await;
     assert_eq!(text(&end), "echo: [tui #2] hi");
-    wait(|| gw.count("inbox", "done") == 2 && gw.count("outbox", "sent") == 2).await;
+    wait(10, || {
+        gw.count("inbox", "done") == 2 && gw.count("outbox", "sent") == 2
+    })
+    .await;
     let prompts = gw.log("prompt");
     assert_eq!(prompts.last().unwrap()["message"], "[tui #2] hi");
 
@@ -315,7 +289,7 @@ async fn history_replays_then_live_events_stream() {
     let refused = c.event_of("response").await;
     assert_eq!(refused["status"], "error", "{refused}");
     c.send(json!({"type": "abort", "id": 4})).await;
-    wait(|| gw.log("abort").len() == 1).await;
+    wait(10, || gw.log("abort").len() == 1).await;
     gw.shutdown().await;
 }
 
@@ -429,13 +403,13 @@ async fn detaching_never_stops_the_run() {
     let mut c = Client::attach(gw.port).await;
     c.send(json!({"type": "prompt", "content": "long job", "id": 1}))
         .await;
-    wait(|| !gw.log("prompt").is_empty()).await;
+    wait(10, || !gw.log("prompt").is_empty()).await;
     let pid = std::fs::read_to_string(gw.home.join("pid")).unwrap();
     let stopped = c.call("stop_session", json!({"sessionId": "main"})).await;
     assert!(stopped.get("result").is_some(), "{stopped}");
     drop(c);
 
-    wait(|| gw.count("inbox", "done") == 1).await;
+    wait(10, || gw.count("inbox", "done") == 1).await;
     assert!(gw.log("abort").is_empty() && gw.log("stop").is_empty());
     assert_eq!(std::fs::read_to_string(gw.home.join("pid")).unwrap(), pid);
     // A second client attaches to the same session and sees the finished turn.
@@ -455,7 +429,7 @@ const POOL: &str = "[[account]]\nname = \"a\"\nmodel = \"fake/m1\"\n";
 async fn stock_get_state_reports_the_live_account_model() {
     let gw = start_with("state", POOL);
     gw.say("m1", "earlier").await;
-    wait(|| gw.count("outbox", "sent") == 1).await; // the child is up and read its state
+    wait(10, || gw.count("outbox", "sent") == 1).await; // the child is up and read its state
     let mut c = Client::attach(gw.port).await;
     c.send(json!({"type": "get_state", "id": 1})).await;
     let state = c.event_of("response").await;
@@ -472,7 +446,7 @@ async fn zephyr_hello_returns_the_snapshot() {
     assert_eq!(early["error"]["code"], -32001, "{early}");
     c.call("authenticate", json!({"token": TOKEN})).await;
     gw.say("m1", "earlier").await;
-    wait(|| gw.count("outbox", "sent") == 1).await;
+    wait(10, || gw.count("outbox", "sent") == 1).await;
     let snap = c.call("zephyr.hello", json!({})).await["result"].clone();
     assert_eq!(
         snap,
@@ -513,7 +487,7 @@ async fn zephyr_hello_returns_the_snapshot() {
     gw.say("j1", "/job add later | 2999-01-01T00:00:00Z | hi")
         .await;
     gw.say("j2", "/job add sooner | 0 8 * * * | hi").await;
-    wait(|| gw.count("outbox", "sent") == 3).await;
+    wait(10, || gw.count("outbox", "sent") == 3).await;
     let snap = c.call("zephyr.hello", json!({})).await["result"].clone();
     let jobs = snap["jobs"].as_array().unwrap();
     let names: Vec<_> = jobs.iter().map(|j| j["name"].as_str().unwrap()).collect();
@@ -525,7 +499,7 @@ async fn zephyr_hello_returns_the_snapshot() {
     // A paused gateway holds new rows in the queue, previewed without the tag.
     gw.say("m2", "/pause").await;
     gw.say("m3", &"long ".repeat(20)).await;
-    wait(|| gw.count("inbox", "new") == 1).await;
+    wait(10, || gw.count("inbox", "new") == 1).await;
     let snap = c.call("zephyr.hello", json!({})).await["result"].clone();
     assert_eq!(snap["paused"], "user");
     let queue = snap["queue"].as_array().unwrap();
@@ -729,9 +703,9 @@ async fn each_user_turn_is_shown_once_even_when_sent_again() {
     c.call("authenticate", json!({"token": TOKEN})).await;
     c.call("zephyr.subscribe", json!({})).await;
     gw.say("m1", "[hang] first").await;
-    wait(|| gw.log("prompt").len() == 1).await;
+    wait(10, || gw.log("prompt").len() == 1).await;
     gw.say("m2", "second").await;
-    wait(|| gw.log("queue_message").len() == 1).await;
+    wait(10, || gw.log("queue_message").len() == 1).await;
     gw.say("m3", "/stop").await;
     let mut turns = Vec::new();
     loop {
@@ -756,7 +730,7 @@ async fn each_user_turn_is_shown_once_even_when_sent_again() {
 async fn zephyr_subscribe_replays_raw_history_and_streams_status_and_replies() {
     let gw = start("zsub");
     gw.say("m1", "[tool] earlier").await;
-    wait(|| gw.count("outbox", "sent") == 1).await;
+    wait(10, || gw.count("outbox", "sent") == 1).await;
 
     let mut c = Client::connect(gw.port).await;
     c.call("authenticate", json!({"token": TOKEN})).await;
@@ -818,7 +792,7 @@ async fn zephyr_subscribe_replays_raw_history_and_streams_status_and_replies() {
     }
 
     // The agent's reply is not repeated; a command's reply is.
-    wait(|| gw.count("outbox", "sent") == 2).await;
+    wait(10, || gw.count("outbox", "sent") == 2).await;
     c.send(json!({"type": "prompt", "content": "/status", "id": 2}))
         .await;
     let reply = c.event_of("zephyr_reply").await;
@@ -873,7 +847,7 @@ async fn stock_rpi_connect_attaches_chats_and_detaches() {
     }
     let gw = start("stock");
     gw.say("m1", "earlier").await;
-    wait(|| gw.count("outbox", "sent") == 1).await;
+    wait(10, || gw.count("outbox", "sent") == 1).await;
     let pid = std::fs::read_to_string(gw.home.join("pid")).unwrap();
     let agent_dir = gw.home.join("rpi-agent");
     std::fs::create_dir_all(&agent_dir).unwrap();
@@ -900,7 +874,7 @@ async fn stock_rpi_connect_attaches_chats_and_detaches() {
     assert_eq!(prompts.last().unwrap()["message"], "[tui #2] hello stock");
     assert!(gw.log("abort").is_empty() && gw.log("stop").is_empty());
     assert_eq!(std::fs::read_to_string(gw.home.join("pid")).unwrap(), pid);
-    wait(|| gw.count("inbox", "done") == 2).await;
+    wait(10, || gw.count("inbox", "done") == 2).await;
     gw.shutdown().await;
 }
 
@@ -928,7 +902,7 @@ async fn zephyr_vault_methods_save_list_and_remove_without_echoing_a_value() {
     let saved = std::fs::read_to_string(gw.home.join("vault.toml")).unwrap();
     assert!(saved.contains(PASSWORD));
     // The agent hears of the new entry, by name only.
-    wait(|| {
+    wait(10, || {
         gw.log("prompt").iter().any(|p| {
             p["message"].as_str().is_some_and(|m| {
                 m.ends_with("the owner saved the login github in the vault; you can use it now")
@@ -1056,11 +1030,11 @@ async fn a_follow_up_waits_for_the_settle_and_then_runs() {
     c.call("authenticate", json!({"token": TOKEN})).await;
     std::fs::write(gw.home.join("tool_wait"), "").unwrap();
     gw.say("m1", "[tool] first").await;
-    wait(|| prompts(&gw).len() == 1).await;
+    wait(10, || prompts(&gw).len() == 1).await;
     let later = json!({"type": "prompt", "content": "later", "followUp": true});
     assert_eq!(c.send(later).await["result"]["status"], "sent");
     c.send(json!({"type": "prompt", "content": "now"})).await;
-    wait(|| gw.log("queue_message").len() == 1).await;
+    wait(10, || gw.log("queue_message").len() == 1).await;
     let steer = &gw.log("queue_message")[0];
     let steered = steer["message"].as_str().unwrap();
     // The two travel to the router on separate channels, so either may get the lower inbox id.
@@ -1070,7 +1044,7 @@ async fn a_follow_up_waits_for_the_settle_and_then_runs() {
     );
     assert_eq!(gw.count("inbox", "new"), 1, "the follow-up waits");
     std::fs::remove_file(gw.home.join("tool_wait")).unwrap();
-    wait(|| prompts(&gw).len() == 2).await;
+    wait(10, || prompts(&gw).len() == 2).await;
     let second = &prompts(&gw)[1];
     assert!(
         second.starts_with("[tui #") && second.ends_with("] later"),
@@ -1089,13 +1063,13 @@ async fn a_follow_up_after_new_mid_run_goes_to_the_new_conversation() {
     c.call("authenticate", json!({"token": TOKEN})).await;
     std::fs::write(gw.home.join("tool_wait"), "").unwrap();
     gw.say("m1", "[tool] first").await;
-    wait(|| prompts(&gw).len() == 1).await;
+    wait(10, || prompts(&gw).len() == 1).await;
     let later = json!({"type": "prompt", "content": "later", "followUp": true});
     assert_eq!(c.send(later).await["result"]["status"], "sent");
     gw.say("m2", "/new").await;
-    wait(|| gw.count("outbox", "sent") == 1).await; // /new answered: after the current reply
+    wait(10, || gw.count("outbox", "sent") == 1).await; // /new answered: after the current reply
     std::fs::remove_file(gw.home.join("tool_wait")).unwrap();
-    wait(|| prompts(&gw).len() == 2).await;
+    wait(10, || prompts(&gw).len() == 2).await;
     // The session each prompt went to: that of the main child started last before it.
     let log = std::fs::read_to_string(gw.home.join("log.jsonl")).unwrap();
     let mut session = String::new();
@@ -1128,14 +1102,14 @@ async fn dequeue_withdraws_only_the_waiting_tui_messages() {
     c.call("authenticate", json!({"token": TOKEN})).await;
     c.send(json!({"type": "prompt", "content": "answered"}))
         .await;
-    wait(|| gw.count("outbox", "sent") == 1).await;
+    wait(10, || gw.count("outbox", "sent") == 1).await;
     gw.say("m1", "/pause").await;
-    wait(|| gw.count("outbox", "sent") == 2).await;
+    wait(10, || gw.count("outbox", "sent") == 2).await;
     c.send(json!({"type": "prompt", "content": "one"})).await;
     let two = json!({"type": "prompt", "content": "two", "followUp": true});
     c.send(two).await;
     gw.say("m2", "from chat").await;
-    wait(|| gw.count("inbox", "new") == 3).await;
+    wait(10, || gw.count("inbox", "new") == 3).await;
     let got = c.call("zephyr.dequeue", json!({})).await;
     assert_eq!(got["result"]["texts"], json!(["one", "two"]), "{got}");
     assert_eq!(gw.count("inbox", "withdrawn"), 2);
@@ -1143,7 +1117,7 @@ async fn dequeue_withdraws_only_the_waiting_tui_messages() {
     let again = c.call("zephyr.dequeue", json!({})).await;
     assert_eq!(again["result"]["texts"], json!([]), "{again}");
     gw.say("m3", "/resume").await;
-    wait(|| prompts(&gw).len() == 2).await;
+    wait(10, || prompts(&gw).len() == 2).await;
     assert_eq!(prompts(&gw)[1], "[chat #5] from chat");
     gw.shutdown().await;
 }
@@ -1156,26 +1130,26 @@ async fn thinking_next_cycles_the_level_and_survives_a_child_restart() {
     let mut c = Client::connect(gw.port).await;
     c.call("authenticate", json!({"token": TOKEN})).await;
     gw.say("m1", "hi").await;
-    wait(|| gw.count("outbox", "sent") == 1).await;
+    wait(10, || gw.count("outbox", "sent") == 1).await;
     let snap = c.call("zephyr.hello", json!({})).await["result"].clone();
     assert_eq!(snap["thinking"], "medium");
     assert_eq!(snap["context_window"], 200000);
     gw.say("m2", "/thinking next").await;
-    wait(|| gw.count("outbox", "sent") == 2).await;
+    wait(10, || gw.count("outbox", "sent") == 2).await;
     assert_eq!(gw.log("set_thinking_level")[0]["level"], "high");
     let snap = c.call("zephyr.hello", json!({})).await["result"].clone();
     assert_eq!(snap["thinking"], "high");
     gw.say("m3", "/thinking next").await;
-    wait(|| gw.count("outbox", "sent") == 3).await;
+    wait(10, || gw.count("outbox", "sent") == 3).await;
     let set = gw.log("set_thinking_level");
     assert_eq!(set[1]["level"], "off", "wraps around");
     gw.say("m4", "/thinking turbo").await;
-    wait(|| gw.count("outbox", "sent") == 4).await;
+    wait(10, || gw.count("outbox", "sent") == 4).await;
     let set = gw.log("set_thinking_level");
     assert_eq!(set.len(), 2, "an unknown level is not sent");
     // A rule restarts the child, which starts at rpi's default.
     gw.say("m5", "/rule be brief").await;
-    wait(|| gw.log("set_thinking_level").len() == 3).await;
+    wait(10, || gw.log("set_thinking_level").len() == 3).await;
     assert_eq!(gw.log("set_thinking_level")[2]["level"], "off");
     gw.shutdown().await;
 }
@@ -1190,7 +1164,7 @@ async fn zephyr_sessions_and_turns_list_the_conversations_and_what_undo_counts()
     gw.say("m1", "one").await;
     gw.say("m2", "two").await;
     gw.say("m3", "/rename trip").await;
-    wait(|| gw.count("outbox", "sent") == 3).await;
+    wait(10, || gw.count("outbox", "sent") == 3).await;
 
     let sessions = c.call("zephyr.sessions", json!({})).await["result"]["sessions"].clone();
     assert_eq!(sessions.as_array().unwrap().len(), 1, "{sessions}");
@@ -1323,7 +1297,10 @@ async fn goals_lists_open_and_recently_done_goals() {
     gw.say("m2", "/goal add Ship zephyr 0.8").await;
     gw.say("m3", "/goal done 1").await;
     let goals = gw.home.join("GOALS.md");
-    wait(|| std::fs::read_to_string(&goals).is_ok_and(|g| g == "Ship zephyr 0.8\n")).await;
+    wait(10, || {
+        std::fs::read_to_string(&goals).is_ok_and(|g| g == "Ship zephyr 0.8\n")
+    })
+    .await;
     let got = c.call("zephyr.goals", json!({})).await;
     assert_eq!(
         got,
@@ -1494,7 +1471,7 @@ async fn decide_applies_a_strong_proposal_that_a_weak_channel_cannot() {
         )
         .unwrap();
     gw.say("m1", &format!("/ok {n}")).await;
-    wait(|| gw.count("outbox", "sent") == 1).await;
+    wait(10, || gw.count("outbox", "sent") == 1).await;
     let file = std::fs::read_to_string(gw.home.join("zephyr.toml")).unwrap();
     assert!(
         file.contains("run_turns = 5") && !file.contains("run_turns = 10"),

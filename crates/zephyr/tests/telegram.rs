@@ -1,11 +1,13 @@
 //! The Telegram adapter against a stub Bot API, with the router on fake-rpi (tests/fake-rpi.py).
 
+mod common;
+use common::{home, wait};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::{Request, Response};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -264,16 +266,6 @@ impl Gateway {
     }
 }
 
-fn home(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "zephyr-tg-{name}-{}-{}",
-        std::process::id(),
-        zephyr::unix_millis()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 /// Owners: `owner` on chat, `55` on telegram. `extra` goes into `[telegram]`.
 fn config(home: &Path, api: &str, extra: &str) -> Config {
     std::env::set_var(ENV, TOKEN);
@@ -323,16 +315,6 @@ fn start_tuned(cfg: Config, tune: impl FnOnce(&mut Telegram)) -> Gateway {
         stop: Some(stop),
         task,
     }
-}
-
-async fn wait(mut done: impl FnMut() -> bool) {
-    for _ in 0..300 {
-        if done() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("timed out");
 }
 
 fn rows(home: &Path, status: &str) -> Vec<zephyr::store::InboxRow> {
@@ -391,10 +373,10 @@ async fn a_stranger_gets_nothing() {
         ],
     );
     let gw = start(config(&home, &api, ""));
-    wait(|| rows(&home, "dropped").len() == 3).await;
+    wait(15, || rows(&home, "dropped").len() == 3).await;
     // An owner's message after them: once it is answered, the strangers' rows were long handled.
     push(&bot, [text(4, 55, 4, "hi")]);
-    wait(|| !said(&bot, 55).is_empty()).await;
+    wait(15, || !said(&bot, 55).is_empty()).await;
     gw.shutdown().await;
     let dropped = rows(&home, "dropped");
     assert!(
@@ -445,7 +427,7 @@ async fn an_owner_is_answered_in_chunks_with_files() {
         )],
     );
     let gw = start(config(&home, &api, "progress_after_secs = 0"));
-    wait(|| !calls(&bot, "sendDocument").is_empty()).await;
+    wait(15, || !calls(&bot, "sendDocument").is_empty()).await;
     gw.shutdown().await;
 
     assert_eq!(calls(&bot, "getFile"), vec![json!({"file_id": "big"})]);
@@ -526,7 +508,7 @@ async fn a_group_is_left_and_never_a_row() {
         ],
     );
     let gw = start(config(&home, &api, ""));
-    wait(|| !said(&bot, 55).is_empty()).await;
+    wait(15, || !said(&bot, 55).is_empty()).await;
     gw.shutdown().await;
     let left: Vec<Value> = calls(&bot, "leaveChat")
         .iter()
@@ -550,7 +532,7 @@ async fn start_alone_is_not_a_row() {
         ],
     );
     let gw = start(config(&home, &api, ""));
-    wait(|| !said(&bot, 55).is_empty()).await;
+    wait(15, || !said(&bot, 55).is_empty()).await;
     gw.shutdown().await;
     assert_eq!(inbox_total(&home), 1);
     assert!(said(&bot, 55)[0].starts_with("echo: [telegram #1] hi"));
@@ -581,7 +563,7 @@ async fn a_name_is_never_an_identity() {
         ],
     );
     let gw = start(config(&home, &api, ""));
-    wait(|| said(&bot, 55).len() >= 2).await;
+    wait(15, || said(&bot, 55).len() >= 2).await;
     assert_eq!(gw.tg.known_as("999").as_deref(), Some(r#""55", @55"#));
     assert_eq!(gw.tg.known_as("55").as_deref(), Some(r#""Aiden", @aiden"#));
     gw.shutdown().await;
@@ -608,9 +590,9 @@ async fn a_retry_resends_only_the_failed_chunk() {
     );
     push(&bot, [text(1, 55, 1, &"y".repeat(5000))]);
     let gw = start(config(&home, &api, "progress = false"));
-    wait(|| calls(&bot, "sendMessage").len() >= 3).await;
+    wait(15, || calls(&bot, "sendMessage").len() >= 3).await;
     // Nothing more comes: the reply is sent.
-    wait(|| {
+    wait(15, || {
         Store::open(&home.join("state.db"))
             .unwrap()
             .counts()
@@ -800,7 +782,7 @@ async fn a_conflict_backs_off() {
     );
     push(&bot, [text(1, 55, 1, "after the conflict")]);
     let gw = start(config(&home, &api, ""));
-    wait(|| !said(&bot, 55).is_empty()).await;
+    wait(15, || !said(&bot, 55).is_empty()).await;
     gw.shutdown().await;
     let polls: Vec<Instant> = bot
         .lock()
@@ -893,7 +875,7 @@ async fn an_update_is_confirmed_only_once_the_router_took_its_row() {
     };
     assert!(offsets(&bot).iter().all(|o| *o == 0), "{:?}", offsets(&bot));
     acks.done(&row.channel, &row.platform_msg_id, true);
-    wait(|| offsets(&bot).contains(&11)).await;
+    wait(15, || offsets(&bot).contains(&11)).await;
     run.abort();
 }
 
@@ -905,8 +887,11 @@ async fn a_row_the_router_ignores_moves_the_offset_on() {
     // that must still be answered.
     push(&bot, [text(10, 55, 1, "   "), text(11, 55, 2, "hi")]);
     let gw = start(config(&home, &api, ""));
-    wait(|| said(&bot, 55).iter().any(|t| t.contains("hi"))).await;
-    wait(|| calls(&bot, "getUpdates").iter().any(|b| b["offset"] == 12)).await;
+    wait(15, || said(&bot, 55).iter().any(|t| t.contains("hi"))).await;
+    wait(15, || {
+        calls(&bot, "getUpdates").iter().any(|b| b["offset"] == 12)
+    })
+    .await;
     gw.shutdown().await;
 }
 
@@ -925,15 +910,18 @@ async fn a_row_whose_insert_failed_comes_again_once_the_database_recovers() {
     push(&bot, [text(10, 55, 1, "boom")]);
     let gw = start(cfg);
     // Not stored: the batch is not confirmed, and Telegram gives it again.
-    wait(|| {
+    wait(15, || {
         let polls = calls(&bot, "getUpdates");
         polls.iter().filter(|b| b["offset"] == 0).count() >= 3
     })
     .await;
     assert!(!calls(&bot, "getUpdates").iter().any(|b| b["offset"] == 11));
     db.execute_batch("DROP TRIGGER boom;").unwrap();
-    wait(|| said(&bot, 55).iter().any(|t| t.contains("boom"))).await;
-    wait(|| calls(&bot, "getUpdates").iter().any(|b| b["offset"] == 11)).await;
+    wait(15, || said(&bot, 55).iter().any(|t| t.contains("boom"))).await;
+    wait(15, || {
+        calls(&bot, "getUpdates").iter().any(|b| b["offset"] == 11)
+    })
+    .await;
     gw.shutdown().await;
 }
 
@@ -948,7 +936,10 @@ async fn a_slow_command_does_not_time_its_batch_out() {
     let gw = start_tuned(config(&home, &api, ""), |tg| {
         tg.answered_within = Duration::from_millis(500)
     });
-    wait(|| calls(&bot, "getUpdates").iter().any(|b| b["offset"] == 11)).await;
+    wait(15, || {
+        calls(&bot, "getUpdates").iter().any(|b| b["offset"] == 11)
+    })
+    .await;
     assert!(
         home.join("list_wait").exists(),
         "confirmed while the command ran"
@@ -963,8 +954,11 @@ async fn offsets_are_confirmed_on_the_next_call() {
     let (api, bot) = stub().await;
     push(&bot, [text(10, 55, 1, "one")]);
     let gw = start(config(&home, &api, ""));
-    wait(|| said(&bot, 55).len() == 1).await;
-    wait(|| calls(&bot, "getUpdates").iter().any(|b| b["offset"] == 11)).await;
+    wait(15, || said(&bot, 55).len() == 1).await;
+    wait(15, || {
+        calls(&bot, "getUpdates").iter().any(|b| b["offset"] == 11)
+    })
+    .await;
     gw.shutdown().await;
     let first = calls(&bot, "getUpdates");
     assert_eq!(first[0]["offset"], 0);
@@ -978,8 +972,11 @@ async fn offsets_are_confirmed_on_the_next_call() {
     // A crash before the confirming call: Telegram gives the batch again, with what came since.
     push(&bot, [text(10, 55, 1, "one"), text(11, 55, 2, "two")]);
     let gw = start(config(&home, &api, ""));
-    wait(|| said(&bot, 55).len() == 2).await;
-    wait(|| calls(&bot, "getUpdates").iter().any(|b| b["offset"] == 12)).await;
+    wait(15, || said(&bot, 55).len() == 2).await;
+    wait(15, || {
+        calls(&bot, "getUpdates").iter().any(|b| b["offset"] == 12)
+    })
+    .await;
     gw.shutdown().await;
     let again = &calls(&bot, "getUpdates")[seen..];
     assert_eq!(again[0]["offset"], 0);
@@ -1030,7 +1027,7 @@ async fn pairing_over_telegram_names_the_user() {
         ],
     );
     let gw = start(cfg);
-    wait(|| !said(&bot, 77).is_empty()).await;
+    wait(15, || !said(&bot, 77).is_empty()).await;
     gw.shutdown().await;
     assert_eq!(
         said(&bot, 77),
@@ -1069,10 +1066,10 @@ async fn a_redelivered_message_asks_for_no_file_again() {
         "mime_type": "audio/ogg", "file_size": 9}});
     push(&bot, [message(1, 55, 7, voice.clone())]);
     let gw = start(config(&home, &api, ""));
-    wait(|| said(&bot, 55).len() == 1).await;
+    wait(15, || said(&bot, 55).len() == 1).await;
     // The same message under a new update, then one more to know the first was passed by.
     push(&bot, [message(2, 55, 7, voice), text(3, 55, 8, "after")]);
-    wait(|| said(&bot, 55).len() == 2).await;
+    wait(15, || said(&bot, 55).len() == 2).await;
     gw.shutdown().await;
     assert_eq!(calls(&bot, "getFile").len(), 1);
     assert_eq!(calls(&bot, "file").len(), 1);
@@ -1097,7 +1094,7 @@ async fn a_voice_note_is_heard_and_answered_aloud() {
     cfg.voice_dir = voice_fakes::fakes(&home);
     cfg.voice_off_floor = true;
     let gw = start(cfg);
-    wait(|| !calls(&bot, "sendVoice").is_empty()).await;
+    wait(15, || !calls(&bot, "sendVoice").is_empty()).await;
     gw.shutdown().await;
 
     // Heard from what the Bot API served, once.

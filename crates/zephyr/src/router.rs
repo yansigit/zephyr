@@ -1310,8 +1310,14 @@ impl<'a> Router<'a> {
             ),
             "/job list" => crate::scheduler::list(&self.store)
                 .unwrap_or_else(|e| format!("[zephyr] listing jobs failed: {e}")),
-            memory => crate::memory::command(&self.cfg.home, self.cfg.state_dir(), memory, true)
-                .unwrap_or_default(),
+            memory => crate::memory::command(
+                &self.cfg.home,
+                self.cfg.state_dir(),
+                memory,
+                true,
+                Some(&self.store),
+            )
+            .unwrap_or_default(),
         })
     }
 
@@ -2002,7 +2008,9 @@ impl<'a> Router<'a> {
         // own approving verbs when it is typed there instead (`tools::NEEDS_PASSKEY`).
         let may_approve = m.channel != crate::attach::WEB;
         let (home, state) = (&self.cfg.home, self.cfg.state_dir());
-        if let Some(reply) = crate::memory::command(home, state, text, may_approve) {
+        if let Some(reply) =
+            crate::memory::command(home, state, text, may_approve, Some(&self.store))
+        {
             return Some(reply);
         }
         if let Some(reply) = crate::scheduler::command(&mut self.store, &self.cfg, m, may_approve) {
@@ -4563,7 +4571,9 @@ impl<'a> Router<'a> {
         match crate::memory::forget(&self.cfg.home, self.cfg.state_dir(), text).await {
             Ok(forgot) => {
                 if let Some(sha) = &forgot.sha {
-                    let recorded = self.store.record_memory_commit(sha, "you (/forget)", true);
+                    let recorded =
+                        self.store
+                            .record_memory_commit(sha, crate::store::FORGET_ORIGIN, true);
                     log(recorded.map_err(Into::into));
                     self.restart = true;
                     self.restart_if_idle().await;

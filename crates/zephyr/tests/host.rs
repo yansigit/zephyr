@@ -1,5 +1,7 @@
 //! Host commands against a fake `docker` (and `gh`) on PATH: the real Docker is never called.
 
+mod common;
+use common::test_exe;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -164,9 +166,7 @@ impl Env {
             ("sudo", REFUSED),
             ("wget", REFUSED),
         ] {
-            std::fs::write(bin.join(name), body).unwrap();
-            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
-                .unwrap();
+            test_exe(&bin.join(name), body);
         }
         Env {
             dir,

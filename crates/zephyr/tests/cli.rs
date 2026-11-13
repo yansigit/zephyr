@@ -1,5 +1,7 @@
 //! The `zephyr` binary against the scripted fake child (tests/fake-rpi.py).
 
+mod common;
+use common::test_exe;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1216,12 +1218,10 @@ fn xdotool_is_the_wrapper_and_does_not_run_while_the_desktop_is_held() {
     let wrapper = dir.join("xdotool");
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_zephyr"), &wrapper).unwrap();
     let real = dir.join("real-xdotool");
-    std::fs::write(
+    test_exe(
         &real,
         "#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/xdotool.log\"\necho ran\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let public = dir.join("public");
     std::fs::create_dir_all(&public).unwrap();
     let run = || {
@@ -1273,12 +1273,10 @@ fn browser_wrapper(dir: &Path) -> (PathBuf, PathBuf) {
     let wrapper = dir.join("agent-browser");
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_zephyr"), &wrapper).unwrap();
     let real = dir.join("real-agent-browser");
-    std::fs::write(
+    test_exe(
         &real,
         "#!/bin/sh\nprintf '%s %s\\n' \"$(date +%s%N)\" \"$*\" >> \"$(dirname \"$0\")/ab.log\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     (wrapper, real)
 }
 

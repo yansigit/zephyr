@@ -3,6 +3,8 @@
 //! the voice stand-ins (tests/fixtures/voice) pass text through, so what reaches the line can
 //! be read back from what the fake Telnyx heard.
 
+mod common;
+use common::{free_port, prompts, wait};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -94,11 +96,6 @@ fn toronto(date: &str, time: &str) -> i64 {
     at.timestamp().as_second()
 }
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
-
 fn config(home: &Path, port: u16, extra: &str) -> Config {
     let path = home.join("zephyr.toml");
     std::fs::write(
@@ -151,7 +148,10 @@ async fn start(
         .spawn()
         .unwrap();
     let telnyx = Telnyx { dir, process };
-    wait(|| telnyx.dir.join("port").exists() && telnyx.dir.join("public_key").exists()).await;
+    wait(120, || {
+        telnyx.dir.join("port").exists() && telnyx.dir.join("public_key").exists()
+    })
+    .await;
     let api_port = std::fs::read_to_string(telnyx.dir.join("port")).unwrap();
     let public_key = std::fs::read_to_string(telnyx.dir.join("public_key")).unwrap();
     std::fs::write(
@@ -190,16 +190,6 @@ async fn start(
         task,
     };
     (gw, telnyx)
-}
-
-async fn wait(mut done: impl FnMut() -> bool) {
-    for _ in 0..2400 {
-        if done() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("timed out");
 }
 
 const ASK: &str = r#"[call call {"number": "416-555-0123", "purpose": "book a table for two at seven", "business": "Pai Northern Thai", "kind": "booking"}] please"#;
@@ -267,17 +257,6 @@ impl Gateway {
         let _ = self.stop.send(());
         self.task.await.unwrap().unwrap();
     }
-}
-
-/// What the fake children were sent as prompts and steers.
-fn prompts(home: &Path) -> Vec<String> {
-    std::fs::read_to_string(home.join("log.jsonl"))
-        .unwrap_or_default()
-        .lines()
-        .map(|l| serde_json::from_str::<Value>(l).unwrap())
-        .filter(|v| v["type"] == "prompt" || v["type"] == "queue_message")
-        .map(|v| v["message"].as_str().unwrap_or_default().to_string())
-        .collect()
 }
 
 #[tokio::test]
@@ -351,7 +330,7 @@ async fn a_call_runs_from_the_ask_to_the_report() {
     assert!(said.iter().any(|p| p == heard_line), "{said:#?}");
 
     // Main gets the transcript as a derived row that is not the owner's, and is tainted by it.
-    wait(|| {
+    wait(120, || {
         prompts(&gw.home)
             .iter()
             .any(|p| p.contains("[call #1 to +1 416-555-0123 ended after"))
@@ -484,7 +463,7 @@ async fn what_they_say_is_never_a_command_and_taints() {
     gw.typed("m2", r#"[call gateway {"command": "/pause"}] go"#)
         .await;
     gw.ended().await;
-    wait(|| {
+    wait(120, || {
         let done = gw.store().inbox_with_status("done").unwrap();
         done.iter().any(|r| r.platform_id == "call-1")
     })
@@ -526,7 +505,7 @@ async fn hangup_ends_the_call_at_once() {
     // The other party never hangs up, and the agent never ends it.
     let (gw, telnyx) = start("hangup", "stream\nanswer\n", "Hello.", "", |_| {}).await;
     gw.ask_and_approve().await;
-    wait(|| telnyx.heard().contains("ulaw:pcm:Hello.")).await;
+    wait(120, || telnyx.heard().contains("ulaw:pcm:Hello.")).await;
     assert!(!telnyx.hung_up());
     gw.typed("h1", "/hangup 7").await;
     gw.reply_with("[zephyr] no such call is in progress").await;
@@ -568,7 +547,7 @@ async fn a_hangup_before_the_dial_dials_nobody() {
 async fn a_shutdown_closes_the_call_first() {
     let (gw, telnyx) = start("shutdown", "stream\nanswer\n", "Hello.", "", |_| {}).await;
     gw.ask_and_approve().await;
-    wait(|| telnyx.heard().contains("ulaw:pcm:Hello.")).await;
+    wait(120, || telnyx.heard().contains("ulaw:pcm:Hello.")).await;
     let home = gw.home.clone();
     gw.shutdown().await;
     assert!(telnyx.hung_up(), "{:?}", telnyx.events());
@@ -708,7 +687,7 @@ async fn a_call_with_telnyx_speech_passes_only_text() {
             .filter(|name| name.contains("_call-1"))
             .collect()
     };
-    wait(|| left().is_empty()).await;
+    wait(120, || left().is_empty()).await;
     gw.shutdown().await;
 }
 
@@ -716,7 +695,7 @@ async fn a_call_with_telnyx_speech_passes_only_text() {
 async fn stop_ends_every_call() {
     let (gw, telnyx) = start("stop", "stream\nanswer\n", "Hello.", "", |_| {}).await;
     gw.ask_and_approve().await;
-    wait(|| telnyx.heard().contains("ulaw:pcm:Hello.")).await;
+    wait(120, || telnyx.heard().contains("ulaw:pcm:Hello.")).await;
     gw.typed("s1", "/stop").await;
     let ended = gw.ended().await;
     assert!(ended.ends_with("by the owner (/stop)"), "{ended}");
@@ -809,7 +788,7 @@ async fn nobody_answering_ends_the_call() {
     assert_eq!(telnyx.heard(), "", "nothing is said to a phone that rings");
     let store = gw.store();
     assert_eq!(store.action(1).unwrap().unwrap().status, "failed");
-    wait(|| {
+    wait(120, || {
         prompts(&gw.home)
             .iter()
             .any(|p| p.contains("[call #1 to +1 416-555-0123 failed: nobody answered"))
@@ -946,7 +925,10 @@ async fn the_api_key_stays_with_the_daemon() {
         ),
         "{failed}"
     );
-    wait(|| prompts(&gw.home).iter().any(|p| p.contains("[call #1 to"))).await;
+    wait(120, || {
+        prompts(&gw.home).iter().any(|p| p.contains("[call #1 to"))
+    })
+    .await;
     // Every file the agent can read, and everything zephyr stored or sent: no byte of the key.
     let mut searched = 0;
     // The home, and what root publishes for the agent beside it (`mcp.json`, AGENTS.md).
@@ -1000,7 +982,7 @@ async fn the_api_key_stays_with_the_daemon() {
 async fn a_restart_mid_call_hangs_up_and_never_redials() {
     let (gw, telnyx) = start("restart", "stream\nanswer\n", "Hello.", "", |_| {}).await;
     gw.ask_and_approve().await;
-    wait(|| telnyx.heard().contains("ulaw:pcm:Hello.")).await;
+    wait(120, || telnyx.heard().contains("ulaw:pcm:Hello.")).await;
     // The daemon goes away mid-call, as a crash takes it: its task is dropped, not drained.
     let Gateway { home, task, .. } = gw;
     task.abort();

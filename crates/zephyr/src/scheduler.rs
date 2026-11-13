@@ -524,11 +524,7 @@ async fn last_words(child: &mut Child) -> Option<String> {
         .filter(|m| m["kind"] == "assistant")
         .map(message_text)
         .find(|t| !t.trim().is_empty())?;
-    let end = (0..=LAST_WORDS.min(text.len()))
-        .rev()
-        .find(|&i| text.is_char_boundary(i))
-        .unwrap_or(0);
-    Some(text[..end].to_string())
+    Some(text[..text.floor_char_boundary(LAST_WORDS)].to_string())
 }
 
 /// Adds a side run's usage (a job's, a `/btw`'s) to today's spend and `account`'s. Returns true
@@ -652,10 +648,7 @@ pub(crate) fn audit(store: &Store, cfg: &Config, session: &str, ev: &serde_json:
         _ => return,
     };
     let write = |tool: &str, args: &str| {
-        let end = (0..=AUDIT_ARGS.min(args.len()))
-            .rev()
-            .find(|&i| args.is_char_boundary(i))
-            .unwrap_or(0);
+        let end = args.floor_char_boundary(AUDIT_ARGS);
         match store.audit(session, tool, &args[..end], outcome) {
             Ok(id) => Some(id),
             Err(e) => {
