@@ -4532,6 +4532,31 @@ async fn a_preset_ends_the_time_limits_of_the_classes_it_clears() {
     gw.shutdown().await;
 }
 
+/// A time limit mistyped (`2hr`) is refused, not taken as part of the value; a last `for`
+/// followed by a word is the value's own.
+#[tokio::test]
+async fn a_mistyped_time_limit_is_refused_and_a_for_word_is_the_value() {
+    let home = home("set-for-word");
+    let gw = start(on_file(&home, ""));
+    wait(10, || !log(&home, "start").is_empty()).await;
+    gw.say("m1", "owner", "/approvals manual for 2hr").await;
+    gw.say("m2", "owner", "/set tasks.parallel 3 for 2hrs")
+        .await;
+    gw.say("m3", "owner", "/set calls.caller_name calling for Aiden")
+        .await;
+    let r = gw.wait_replies(3).await;
+    assert_eq!(r[0], "[zephyr] a time limit is 30s to 30d, not 2hr");
+    assert_eq!(r[1], "[zephyr] a time limit is 30s to 30d, not 2hrs");
+    assert!(
+        r[2].starts_with("[zephyr] calls.caller_name none → calling for Aiden"),
+        "{r:?}"
+    );
+    let cfg = Config::load(&home.join("zephyr.toml")).unwrap();
+    assert_eq!(cfg.parallel_tasks(), 2);
+    assert!(cfg.approvals.is_none(), "nothing set");
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_timed_change_reverts_on_the_tick() {
     let home = home("set-timed");

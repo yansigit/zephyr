@@ -1035,17 +1035,18 @@ pub(crate) fn duration(raw: &str) -> Result<Duration, String> {
 
 const MAX_UNTIL: Duration = Duration::from_secs(30 * 86_400);
 
-/// A time limit (`for 2h`): `min` (30 s unless a test lowers it) to 30 days.
+/// A time limit (`for 2h`): `min` (30 s unless a test lowers it) to 30 days. Anything else,
+/// a mistyped one (`2hrs`) too, is refused with the same words.
 pub fn parse_until(raw: &str, min: Duration) -> Result<Duration, String> {
-    let d = duration(raw)?;
-    if d < min || d > MAX_UNTIL {
-        return Err(format!(
-            "a time limit is {}s to 30d, not {}",
-            min.as_secs(),
-            raw.trim()
-        ));
-    }
-    Ok(d)
+    (duration(raw).ok())
+        .filter(|d| *d >= min && *d <= MAX_UNTIL)
+        .ok_or_else(|| {
+            format!(
+                "a time limit is {}s to 30d, not {}",
+                min.as_secs(),
+                raw.trim()
+            )
+        })
 }
 
 /// What a value is, for comparing two of them.
@@ -1423,8 +1424,16 @@ pub fn set_args(arg: &str) -> Option<(&str, &str, Option<&str>)> {
     let (key, rest) = arg.trim().split_once(char::is_whitespace)?;
     let rest = rest.trim();
     let (value, until) = match rest.rsplit_once(" for ") {
-        // `calling for Aiden` is a value: only a duration after the last `for` is a time limit.
-        Some((v, d)) if !v.trim().is_empty() && duration(d).is_ok() => (v.trim(), Some(d.trim())),
+        // `calling for Aiden` is a value: a time limit is one word after the last `for` that is
+        // a duration or starts with a digit (`2hrs`, mistyped, which `parse_until` refuses).
+        Some((v, d))
+            if !v.trim().is_empty()
+                && (duration(d).is_ok()
+                    || (d.trim().starts_with(|c: char| c.is_ascii_digit())
+                        && !d.trim().contains(char::is_whitespace))) =>
+        {
+            (v.trim(), Some(d.trim()))
+        }
         _ => (rest, None),
     };
     (!value.is_empty()).then_some((key, value, until))
@@ -2291,6 +2300,15 @@ mod tests {
         assert_eq!(
             set_args("calls.caller_name calling for Aiden"),
             Some(("calls.caller_name", "calling for Aiden", None))
+        );
+        // One that starts with a digit is a time limit mistyped, which `parse_until` refuses.
+        assert_eq!(
+            set_args("tasks.parallel 3 for 2hrs"),
+            Some(("tasks.parallel", "3", Some("2hrs")))
+        );
+        assert_eq!(
+            parse_until("2hrs", Duration::from_secs(30)).unwrap_err(),
+            "a time limit is 30s to 30d, not 2hrs"
         );
         assert_eq!(set_args("timezone"), None);
         assert_eq!(set_args(""), None);
