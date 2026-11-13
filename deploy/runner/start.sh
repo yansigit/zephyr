@@ -7,11 +7,16 @@
 #                                   Dockerfile or the limits
 #   deploy/runner/start.sh down     stop the slots and unregister them; the BuildKit cache stays
 #   deploy/runner/start.sh serve I  what unit zephyr-runner@I runs: one runner for one job
+#   deploy/runner/start.sh warm     what timer zephyr-ci-warm runs: build main's latest commit into
+#                                   the cache volume the runners read
 # Ephemeral: each container registers with --ephemeral, takes one job and exits, and is removed
-# (--rm); systemd then starts a fresh one from the image. No volume, no home, no ~/.cargo, no work
-# tree or target dir outlives a job, so nothing one job's code leaves behind reaches the next. A new
-# image or new limits apply from each slot's next job. Each runner gets ZEPHYR_RUNNER_CPUS (default
-# 8) CPUs and ZEPHYR_RUNNER_MEMORY (default 16g), no capabilities and no-new-privileges.
+# (--rm); systemd then starts a fresh one from the image. No home, no ~/.cargo, no work tree or
+# target dir outlives a job, so nothing one job's code leaves behind reaches the next. A new image
+# or new limits apply from each slot's next job. Each runner gets ZEPHYR_RUNNER_CPUS (default 12)
+# CPUs and ZEPHYR_RUNNER_MEMORY (default 24g), no capabilities and no-new-privileges.
+# The one volume a runner has is zephyr-ci-cache, read only: main's last build, which a job copies
+# in to start warm. Only `warm` writes it, from the host, never a job: it fetches main's commit with
+# the owner's gh and builds it in a throwaway container, so no branch's code ever lands in it.
 # Everything sits on the zephyr-ci bridge network, never the host's: jobs get no Docker socket, no bind
 # mounts and no route to 127.0.0.1, so the live `zephyr` container (--network host) is out of reach.
 # zephyr-buildkitd answers only a client with the certificate this script makes (mTLS), which
@@ -26,8 +31,14 @@ cd "$(dirname "$0")"
 
 # The repository the runners register with; a fork names its own.
 repo=${ZEPHYR_GH_REPO:-yansigit/zephyr}
-cpus=${ZEPHYR_RUNNER_CPUS:-8}
-memory=${ZEPHYR_RUNNER_MEMORY:-16g}
+cpus=${ZEPHYR_RUNNER_CPUS:-12}
+memory=${ZEPHYR_RUNNER_MEMORY:-24g}
+# Main's last build, which the runners mount read only (ci.sh seed) and `warm` alone writes.
+ci_cache=zephyr-ci-cache
+# What `warm` builds with: with two runners at 12, it leaves a few of the machine's 28 cores to the
+# live container even while all three run.
+warm_cpus=${ZEPHYR_WARM_CPUS:-6}
+warm_memory=${ZEPHYR_WARM_MEMORY:-12g}
 net=zephyr-ci
 builder=zephyr-buildkitd
 cache=zephyr-buildkit-cache
@@ -40,7 +51,7 @@ tls=$config/buildkit
 # The copy of this script the units run, so they do not depend on the checkout `up` ran from.
 self=${XDG_DATA_HOME:-$HOME/.local/share}/zephyr-runner/start.sh
 # How runners and the builder are started; a container started otherwise is replaced (once idle).
-kind=ephemeral-2
+kind=ephemeral-3
 builder_kind=mtls-1
 
 die() { echo "runner: $*" >&2; exit 1; }
@@ -82,7 +93,7 @@ serve() {
   # Idle until config.sh writes .runner, then serve one job from /home/runner.
   docker run -d --rm --name "$name" --network "$net" --label "zephyr.runner=$kind" \
     --cpus "$cpus" --memory "$memory" --cap-drop ALL --cap-add SETUID --cap-add SETGID \
-    --security-opt no-new-privileges --user root -e HOME=/home/runner "$runner_image" \
+    --security-opt no-new-privileges --user root -e HOME=/home/runner -v "$ci_cache:/cache:ro" "$runner_image" \
     sh -c 'rm -f /.dockerenv; exec setpriv --reuid=runner --regid=runner --init-groups bash -c "until [ -f .runner ]; do sleep 2; done; exec ./run.sh"' \
     >/dev/null || failed "the runner container did not start"
   # --replace takes over the registration the last job's runner left under this name.
@@ -109,6 +120,91 @@ RestartSec=10
 
 [Install]
 WantedBy=default.target
+EOF
+}
+
+# Builds main's latest commit, when it moved, into zephyr-ci-cache: the dependencies of what
+# ci.yml's lint and test compile, at the paths a runner's job uses (a job rebuilds the workspace's
+# own crates every time). The commit is heads/main's, read here with the owner's gh, and its source
+# main's tarball for that commit: a branch's code never runs here. It builds in a throwaway
+# container from the runner image, started as the runners are (no capability but the switch to
+# the runner user, no-new-privileges), from the cache it replaces, into a folder renamed into place
+# when done; then /cache/current points at it in one rename, and the build before is kept for a job
+# still copying it.
+warm() {
+  local sha state=${XDG_STATE_HOME:-$HOME/.local/state}/zephyr-runner/warm.sha
+  sha=$(gh api "repos/$repo/git/ref/heads/main" --jq .object.sha) || die "could not read main's commit"
+  [[ $sha =~ ^[0-9a-f]{40}$ ]] || die "not a commit: $sha"
+  if [ "$(cat "$state" 2>/dev/null)" = "$sha" ]; then echo "the cache holds main ($sha)"; return; fi
+  warm_tmp=$(mktemp -d)
+  trap 'rm -rf "$warm_tmp"' EXIT
+  gh api "repos/$repo/tarball/$sha" > "$warm_tmp/main.tar.gz" || die "could not fetch main's $sha"
+  chmod 755 "$warm_tmp" && chmod 644 "$warm_tmp/main.tar.gz"
+  step "building main $sha into $ci_cache"
+  docker volume create "$ci_cache" >/dev/null
+  # As root only to remove /.dockerenv and give /cache to the runner user, then that user for good.
+  # shellcheck disable=SC2016 # expanded in the container
+  docker run --rm --name zephyr-ci-warm --network "$net" --cpus "$warm_cpus" --memory "$warm_memory" \
+    --label zephyr.runner=warm --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add CHOWN \
+    --security-opt no-new-privileges --user root -e HOME=/home/runner -e "SHA=$sha" \
+    -v "$ci_cache:/cache" -v "$warm_tmp:/in:ro" "$runner_image" sh -c '
+      rm -f /.dockerenv
+      [ "$(stat -c %U /cache)" = runner ] || chown -R runner:runner /cache
+      exec setpriv --reuid=runner --regid=runner --init-groups bash -c "$1"' sh '
+      set -euo pipefail
+      if [ "$(cat /cache/current/sha 2>/dev/null)" = "$SHA" ]; then exit 0; fi
+      src=/home/runner/_work/zephyr/zephyr
+      mkdir -p "$src"
+      tar -xzf /in/main.tar.gz --strip-components 1 -C "$src"
+      if [ -f /cache/current/sha ]; then
+        cp -a /cache/current/target/. "$CARGO_TARGET_DIR/"
+        cp -a /cache/current/registry/. "$CARGO_HOME/registry/"
+      fi
+      cd "$src"
+      # Newer than anything copied: the tarball carries the commit time.
+      find . -type f -exec touch -c {} +
+      cargo nextest run --workspace --profile ci --no-run
+      cargo clippy --all-targets -- -D warnings || echo "clippy failed on main; its build is kept"
+      new=/cache/build-$SHA.tmp.$$
+      rm -rf "$new" && mkdir -p "$new/registry"
+      cp -a "$CARGO_TARGET_DIR" "$new/target"
+      cp -a "$CARGO_HOME/registry/cache" "$CARGO_HOME/registry/index" "$new/registry/"
+      echo "$SHA" > "$new/sha"
+      chmod -R a+rX "$new"
+      rm -rf "/cache/build-$SHA" && mv -T "$new" "/cache/build-$SHA"
+      old=$(readlink /cache/current || true)
+      ln -sfn "build-$SHA" /cache/current.new && mv -T /cache/current.new /cache/current
+      for d in /cache/build-*; do
+        case ${d#/cache/} in "build-$SHA" | "$old") ;; *) rm -rf "$d" ;; esac
+      done' || die "main $sha did not build; the cache keeps what it had"
+  mkdir -p "$(dirname "$state")"
+  echo "$sha" > "$state"
+  echo "the cache holds main ($sha)"
+}
+
+warm_units() {
+  cat > "$units/zephyr-ci-warm.service" <<EOF
+[Unit]
+Description=build main's latest commit into zephyr-ci-cache for the zephyr-local runners (deploy/runner/start.sh)
+
+[Service]
+Type=oneshot
+TimeoutStartSec=60min
+Environment="PATH=$PATH" "ZEPHYR_GH_REPO=$repo" "ZEPHYR_WARM_CPUS=$warm_cpus" "ZEPHYR_WARM_MEMORY=$warm_memory"
+EnvironmentFile=-$config/env
+ExecStart=$self warm
+ExecStopPost=-$(command -v docker) rm -f zephyr-ci-warm
+EOF
+  cat > "$units/zephyr-ci-warm.timer" <<EOF
+[Unit]
+Description=check every 10 minutes whether main moved, and build it for the CI cache
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
 EOF
 }
 
@@ -178,11 +274,14 @@ up() {
   [ "$(docker inspect -f '{{.State.Running}}' "$builder")" = true ] ||
     { docker logs --tail 20 "$builder" >&2; die "$builder is not running (user namespaces blocked? see the header); not falling back to --privileged"; }
 
-  step "installing systemd user unit zephyr-runner@.service"
+  step "installing systemd user units zephyr-runner@.service and zephyr-ci-warm.timer"
   install -D -m 755 start.sh "$self"
   mkdir -p "$units"
   unit > "$units/zephyr-runner@.service"
+  warm_units
   systemctl --user daemon-reload
+  docker volume create "$ci_cache" >/dev/null
+  systemctl --user enable --now zephyr-ci-warm.timer
   for i in $(seq "$n"); do
     name=zephyr-runner-$i
     step "$name"
@@ -218,6 +317,7 @@ EOF
 
 down() {
   local unit name id
+  systemctl --user disable --now zephyr-ci-warm.timer >/dev/null 2>&1 || true
   for unit in $(systemctl --user list-units --all --plain --no-legend 'zephyr-runner@*' | awk '{print $1}'); do
     step "stopping $unit"
     systemctl --user disable --now "$unit" >/dev/null 2>&1
@@ -231,10 +331,10 @@ down() {
   step "removing $builder and $net"
   docker rm -f "$builder" >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
-  echo "done. The BuildKit cache and certificates stay; delete them with: docker volume rm $cache; rm -r $tls"
+  echo "done. The caches and certificates stay; delete them with: docker volume rm $cache $ci_cache; rm -r $tls"
 }
 
-usage="usage: deploy/runner/start.sh up [N] | down | serve I"
+usage="usage: deploy/runner/start.sh up [N] | down | serve I | warm"
 case "${1:-}" in
   up)
     n=${2:-2}
@@ -244,5 +344,6 @@ case "${1:-}" in
   serve)
     if [ $# -ne 2 ] || ! [[ $2 =~ ^[1-9][0-9]*$ ]]; then die "$usage"; fi
     serve "$2" ;;
+  warm) [ $# -eq 1 ] || die "$usage"; warm ;;
   *) die "$usage" ;;
 esac

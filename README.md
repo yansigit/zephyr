@@ -1384,19 +1384,29 @@ CI runs on GitHub's runners and on the owner's own, label `zephyr-local`, at onc
 with either. `.github/ci.sh` holds the placement and the checks; the jobs are:
 
 - `plan` decides where everything goes, from repo variable `ZEPHYR_CI`:
-  - unset or `both`: a pull request runs everything here, costing no hosted minutes however often
-    it is pushed. A push to main and the nightly run (09:17 UTC, or `gh workflow run ci.yml`) put
-    test shard 3/3 on GitHub-hosted, a clean 2-CPU machine, and lint, deny and shards 1/3 and 2/3
-    here, so GitHub's environment, and the `hosted` path below, are tested before a release. If
-    GitHub refused a hosted job (spending limit or quota) in any run of the last 6 hours, all of
-    it goes here; the first run after that tries hosted again, so the monthly reset is picked up.
+  - unset or `both`: everything here, costing no hosted minutes however often a PR is pushed,
+    but for the nightly run (09:17 UTC), whose `test` runs on GitHub-hosted, a clean 2-CPU
+    machine, so GitHub's environment, and the `hosted` path below, are still tested daily. If
+    GitHub refused a hosted job (spending limit or quota) in any run of the last 6 hours, that
+    goes here too; the first run after that tries hosted again, so the monthly reset is picked up.
   - `local`: everything here (`gh variable set ZEPHYR_CI --body local`).
   - `hosted`: everything on GitHub, for when this machine is down. `plan` needs a runner too, so
     in the other modes a run waits (up to a day) while no `zephyr-local` runner is online.
-- `lint` (shellcheck, fmt, clippy), `deny` (`cargo deny check advisories bans`) and `test K/3`,
-  each shard a `cargo nextest run --partition hash:K/3` (`.config/nextest.toml` profile `ci`), so
-  a new test lands in a shard by itself. A test that passes only on its one retry is listed as
-  flaky in the job summary; one that hangs is killed after 3 minutes.
+- `plan` also says when no checks are needed, and `ci-ok` then passes saying why: every file a PR
+  changed (against its base) or a push changed (against the commit before it, every commit it
+  brought), both sides of a rename counted, is Markdown outside `.github/`, `crates/` (which
+  embeds files) and `deploy/` (whose `SKILL.md` files ship in the image); no test reads
+  `README.md`, `DESIGN.md` or `CLAUDE.md`. Or the push to main is the merge of a PR whose head has
+  the same tree (the PR was rebased onto main) and passed: a successful `ci.yml` run of that pull
+  request, whose own `ci-ok` check-run, made by GitHub Actions in that run's check suite, passed (a
+  check-run of the same name from another workflow or app counts for nothing). A force push, a new
+  branch, or anything the API does not answer runs everything, and so do the nightly and manual
+  runs. A PR's newer push cancels its older run; a push to main and the nightly run are never
+  cancelled, and a cancelled run posts no failed `ci-ok`.
+- Two checks, each compiling once, side by side on the two runners: `lint` (shellcheck, fmt,
+  `cargo deny check advisories bans`, clippy) and `test`, the whole suite in one `cargo nextest
+  run` (`.config/nextest.toml` profile `ci`). A test that passes only on its one retry is listed
+  as flaky in the job summary; one that hangs is killed after 3 minutes.
 - `rescue` runs here, after them, each check GitHub did not start (failed with no runner and no
   step; the job's annotation says why). A check that started and failed is never rescued. Its
   token only asks the Actions API which checks those are; the step that runs them has none.
@@ -1407,13 +1417,32 @@ with either. `.github/ci.sh` holds the placement and the checks; the jobs are:
 
 The runners come from `deploy/runner/start.sh up [N]` (default 2), from the image
 `deploy/runner/Dockerfile` builds: GitHub's runner image with Rust 1.95, nextest, cargo-deny, gh,
-tmux, python3, node and shellcheck. Each gets `ZEPHYR_RUNNER_CPUS` (default 8) CPUs and
-`ZEPHYR_RUNNER_MEMORY` (default 16g). They are ephemeral: a runner registers with `--ephemeral`,
-takes one job, and its container is removed when it exits; systemd user unit `zephyr-runner@<i>`
-(which `up` installs, running a copy of the script in `~/.local/share/zephyr-runner/`) starts a
-fresh one from the image. No volume is mounted, so the checkout, the cargo registry and target dir,
-the home and anything a job's code wrote there go with its container, and the next job cannot run
-what an earlier one left behind. The cost is a cold build in every job. A job runs as the runner
+tmux, python3, node and shellcheck. Each gets `ZEPHYR_RUNNER_CPUS` (default 12) CPUs and
+`ZEPHYR_RUNNER_MEMORY` (default 24g), and `warm` below 6 CPUs and 12g (`ZEPHYR_WARM_CPUS`,
+`ZEPHYR_WARM_MEMORY`): 30 at most, on a machine of 28, with all three busy at once, which is rare
+and only slows them down. They are ephemeral: a runner registers with `--ephemeral`, takes one job, and its
+container is removed when it exits; systemd user unit `zephyr-runner@<i>` (which `up` installs,
+running a copy of the script in `~/.local/share/zephyr-runner/`) starts a fresh one from the image.
+The checkout, the cargo registry and target dir, the home and anything a job's code wrote there go
+with its container, and the next job cannot run what an earlier one left behind.
+
+A job still starts warm. Systemd timer `zephyr-ci-warm` (`start.sh warm`, every 10 minutes) reads
+`heads/main` with the owner's `gh`; if it moved, it fetches that commit's tarball and, in a
+throwaway container from the runner image, started as a runner is (the runner user, no
+capabilities, no-new-privileges), builds what `lint` and `test` compile into Docker volume
+`zephyr-ci-cache`, in a folder of its own renamed into place when done; then `/cache/current`
+points at it in one rename (the build before is kept for a job still copying it). Every runner
+mounts that volume read only; a job copies main's build into its own target dir (about 10 s for
+12 GB) and touches its checkout, so every file of the branch is newer than anything copied. The
+dependencies then come from the copy; the workspace's own crates are rebuilt every time,
+incrementally from main's build (34 s to compile what both checks need, against 219 s cold;
+without incremental compilation the copy is 8 GB but that takes 104 s). Why PR code can never
+write it: the writer is outside Actions, on the host, and builds only main's commit; a runner's
+mount is read only, whatever label a PR's workflow file picks; and no workflow names the volume.
+A PR can read main's build, which it could build itself. What this trusts, as the releases do, is
+that only the owner's own merges reach main: this free private repo has no branch protection, so a
+workflow a PR from this repo starts can ask for `contents: write`, and a PR that edits `.github/`
+needs a person to read it before it is merged. A job runs as the runner
 user with no capabilities, no-new-privileges and no sudo. Run `up` again after changing the
 Dockerfile or the limits: each slot's next job uses them, and a runner started otherwise (or one
 from before ephemeral runners, with its `zephyr-runner-<i>-work` volume) is unregistered once

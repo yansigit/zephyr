@@ -29,7 +29,7 @@ deploy/install.sh [--from-image|--from-source] [--no-init]   # install the CLI o
 cargo install --path crates/zephyr && zephyr up --build   # build deploy/Dockerfile and run it locally
 deploy/release.sh 0.2.1 | --cli                           # release from a clean main (README "Releasing")
 deploy/runner/start.sh up [N]|down                        # the owner's zephyr-local CI runners (README "CI")
-cargo nextest run --workspace --profile ci --partition hash:1/3   # one CI test shard, as .github/ci.sh runs it
+cargo nextest run --workspace --profile ci   # CI's test job, as .github/ci.sh runs it
 deploy/bump-rpi.sh [0.22.0]                               # move every rpi pin; .github/workflows/rpi-bump.yml runs it daily
 ```
 
@@ -319,13 +319,16 @@ rpi's frame shapes matter, update fake-rpi.py to match the real binary. `Config:
 router's 5 s housekeeping tick) is a hidden field like `stall_limit`; tests that wait on it set
 200 ms. Wait on events, not fixed sleeps, and don't assume the order of replies a slow machine can
 reorder (a task's report may be steered into main's running turn). CI (`.github/workflows/ci.yml`,
-README "CI") runs fmt, clippy and shellcheck, `cargo deny check advisories bans` and the tests on
-Rust 1.95, the tests as 3 `cargo nextest` hash shards (each test in its own process, so no test may
-rely on another's process-wide state, such as a port counter), split between the owner's runner
-(`zephyr-local`) and GitHub's by `.github/ci.sh plan` and repo variable `ZEPHYR_CI`
-(`both`|`local`|`hosted`; under `both` a pull request runs wholly on `zephyr-local`, and a push to
-main or the nightly run puts one shard on GitHub's); `rescue` reruns on `zephyr-local` what GitHub refused to start, and
-`ci-ok` is the one check to gate merges on;
+README "CI") runs two checks on Rust 1.95, each compiling once: `lint` (shellcheck, fmt, `cargo
+deny check advisories bans`, clippy) and `test`, the whole suite in one `cargo nextest` run (each
+test in its own process, so no test may rely on another's process-wide state, such as a port
+counter). `.github/ci.sh plan` places them by repo variable `ZEPHYR_CI` (`both`|`local`|`hosted`;
+under `both` everything runs on the owner's `zephyr-local` runners but the nightly run's `test`,
+on GitHub's); `ci.sh skip` runs none for Markdown outside `.github/`, `crates/` and `deploy/`, or
+for main's merge of a PR whose head passed `ci-ok` on the same tree. A job on `zephyr-local` copies
+main's last build from the read-only volume `zephyr-ci-cache`, which only `deploy/runner/start.sh
+warm` on the host writes, from main's commit. `rescue` reruns on `zephyr-local` what GitHub
+refused to start, and `ci-ok` is the one check to gate merges on;
 `ZEPHYR_REAL_RPI=1` makes the ignored real-rpi tests fail instead of skip when the binary is missing.
 `tests/cards_link.rs` runs the Link issuer against a stub of Link's API; its ignored
 `a_real_link_card_for_one_dollar` is the owner's spike (`ZEPHYR_LINK_LIVE=1`, after `zephyr card link`).
