@@ -13,6 +13,7 @@ pub mod btw;
 pub mod ca;
 pub mod calls;
 pub mod cards;
+pub mod cards_frame;
 pub mod cards_link;
 pub mod catalog;
 pub mod channel;

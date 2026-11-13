@@ -133,7 +133,11 @@ shells into the container. In the container it runs the daemon (`run`) and the c
   daemon in a chat line's `card` field (`chat::take_card` → `cards::enter`), never an inbox row.
   `cards::fill` types it only on the card's origin, through `vault::type_into`: the value goes
   to agent-browser on stdin (`batch`), never argv, in a script that checks the top document's
-  origin itself; a page that moved closes the card, a field in a frame is never filled. While
+  origin itself; a page that moved closes the card. A field the top document lacks is looked
+  for in a Stripe or Braintree card frame directly in it (`cards_frame.rs`: the daemon's own
+  DevTools session from `get cdp-url`, the compiled-in `listed` origins, `judge`, and a typing
+  script in an isolated world that checks the frame's origin, its parent and
+  `ancestorOrigins` in the same evaluation); any other frame is never filled. While
   a number is kept, the wrapper refuses read-backs of that origin (`cards-filled`,
   `browser_gate::reads_back`). An open card covers exactly one Pay click (`Gate::card_for`,
   `Store::use_card`: `open` → `charging`). `cards::tick` runs on the router's store; issuers

@@ -357,8 +357,9 @@ pub const TOOLS: [(&str, &str, &str, ToolExecuteFn); 10] = [
          filled. Then `fill` it with its `id` and CSS selectors for the `number`, the `cvc`, \
          and either `expiry` (one MM/YY field) or `month` and `year`, and `name` if the form \
          asks: zephyr types it into the page open in agent-browser, only on the site it was \
-         approved for. You never see the number and must not try to read it back. `list` \
-         shows your cards.",
+         approved for. For a field in Stripe's or Braintree's card frame in that page, give \
+         its selector inside the frame (e.g. `input[name=cardnumber]`). You never see the \
+         number and must not try to read it back. `list` shows your cards.",
         r#"{"type":"object","properties":{"action":{"type":"string","enum":["request","fill","list"]},"site":{"type":"string","description":"For request: the checkout page's https address"},"merchant":{"type":"string"},"amount":{"type":"string","description":"For request: the total, e.g. 42.50"},"currency":{"type":"string","description":"For request, optional: ISO 4217, e.g. CAD"},"reason":{"type":"string"},"id":{"type":"integer","description":"For fill: the card's number"},"number":{"type":"string","description":"For fill: CSS selector of the card number field"},"expiry":{"type":"string","description":"For fill: CSS selector of a single MM/YY field"},"month":{"type":"string"},"year":{"type":"string"},"cvc":{"type":"string"},"name":{"type":"string"}},"required":["action"]}"#,
         card_execute,
     ),

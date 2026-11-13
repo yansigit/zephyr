@@ -1536,7 +1536,7 @@ pub(crate) fn moved(site: &str, now: Option<&str>, done: &[&str]) -> Option<Stri
 
 /// What typing one secret into the page came to.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Typed {
+pub enum Typed {
     Ok,
     /// The page was not on the site when the value was about to be typed: its origin then.
     /// Nothing was typed.
@@ -1556,7 +1556,8 @@ pub(crate) enum Typed {
 fn type_script(origin: &str, selector: &str, value: &str) -> String {
     let json = |s: &str| serde_json::Value::String(s.to_string()).to_string();
     format!(
-        "(() => {{\nconst want = {};\nconst sel = {};\nconst value = {};\n{TYPE_BODY}\n}})()",
+        "(() => {{\nconst want = {};\nconst sel = {};\nconst value = {};\n{TYPE_BODY}\n\
+         {SET_FIELD}\nreturn location.origin === want ? \"ok\" : \"moved:\" + location.origin;\n}})()",
         json(origin),
         json(selector),
         json(value)
@@ -1564,8 +1565,12 @@ fn type_script(origin: &str, selector: &str, value: &str) -> String {
 }
 
 const TYPE_BODY: &str = r#"if (window.top !== window) return "frame";
-if (location.origin !== want) return "moved:" + location.origin;
-let el = null;
+if (location.origin !== want) return "moved:" + location.origin;"#;
+
+/// Sets `value` into the field `sel` of this document as typing would (the element's own
+/// setter, then `input` and `change`), or returns `missing` or `notfield`. Shared with the
+/// payment frames' script (`cards_frame`), each with its own checks before it.
+pub(crate) const SET_FIELD: &str = r#"let el = null;
 try { el = document.querySelector(sel); } catch (e) { return "missing"; }
 if (!el) return "missing";
 const proto = el instanceof HTMLInputElement ? HTMLInputElement.prototype
@@ -1575,8 +1580,7 @@ if (!proto) return "notfield";
 el.focus();
 Object.getOwnPropertyDescriptor(proto, "value").set.call(el, value);
 el.dispatchEvent(new Event("input", { bubbles: true }));
-el.dispatchEvent(new Event("change", { bubbles: true }));
-return location.origin === want ? "ok" : "moved:" + location.origin;"#;
+el.dispatchEvent(new Event("change", { bubbles: true }));"#;
 
 /// Overwrites a secret's bytes before its buffer is freed: a copy the daemon made to hand a
 /// value on is not left in freed memory.
