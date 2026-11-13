@@ -81,14 +81,8 @@ plan() {
 
 check() {
   local what=$1 log
-  # Tests leave their homes in the temp dir; the runner empties RUNNER_TEMP before each job, where
-  # a persistent runner's /tmp would grow without end.
+  # Tests leave their homes in the temp dir; the runner empties RUNNER_TEMP before each job.
   export TMPDIR=${RUNNER_TEMP:-${TMPDIR:-/tmp}}
-  if [ "${RUNNER_ENVIRONMENT:-}" = self-hosted ] && [ -d "${CARGO_TARGET_DIR:-}" ] &&
-    [ "$(du -s --block-size=1G "$CARGO_TARGET_DIR" | cut -f1)" -gt 60 ]; then
-    echo "ci: $CARGO_TARGET_DIR is over 60 GB; starting it afresh"
-    rm -rf "$CARGO_TARGET_DIR"
-  fi
   case $what in
     lint)
       shellcheck deploy/install.sh deploy/runner/start.sh deploy/release.sh deploy/bump-rpi.sh .github/ci.sh

@@ -4555,6 +4555,26 @@ fn release_and_runner_scripts_keep_their_defaults() {
     assert!(read(&deploy.join("bump-rpi.sh")).contains("rpi-$old/bin/rpi"));
 }
 
+/// zephyr-local's runners are ephemeral: each registers for one job, its container is removed when
+/// it exits, and no volume carries a home, a work tree or a target dir to the next job.
+#[test]
+fn the_local_runners_take_one_job_each() {
+    let runner = read(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/runner/start.sh"
+    )));
+    let register = (runner.lines())
+        .find(|l| l.contains("./config.sh --url"))
+        .expect("start.sh registers its runners");
+    let register = &runner[runner.find(register).unwrap()..];
+    let register = &register[..register.find(">/dev/null").unwrap()];
+    assert!(register.contains("--ephemeral"), "{register}");
+    let run = &runner[runner.find("docker run -d --rm --name \"$name\"").unwrap()..];
+    let run = &run[..run.find(">/dev/null").unwrap()];
+    assert!(!run.contains(" -v ") && !run.contains("--restart"), "{run}");
+    assert!(runner.contains("Restart=always"), "{runner}");
+}
+
 /// release.sh refuses a version that is not above Cargo.toml's before it tests anything, and pushes
 /// the release commit and its tag together or not at all.
 #[test]

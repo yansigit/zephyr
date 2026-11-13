@@ -1408,12 +1408,18 @@ with either. `.github/ci.sh` holds the placement and the checks; the jobs are:
 The runners come from `deploy/runner/start.sh up [N]` (default 2), from the image
 `deploy/runner/Dockerfile` builds: GitHub's runner image with Rust 1.95, nextest, cargo-deny, gh,
 tmux, python3, node and shellcheck. Each gets `ZEPHYR_RUNNER_CPUS` (default 8) CPUs and
-`ZEPHYR_RUNNER_MEMORY` (default 16g), and keeps checkouts and its cargo target dir on its own
-volume `zephyr-runner-<i>-work`, so builds stay incremental (a target dir over 60 GB starts afresh).
-Run `up` again after changing the Dockerfile or the limits: each runner whose image or limits
-differ is replaced once idle, one at a time, and registers again under its name.
-`deploy/runner/start.sh down` unregisters and removes them, keeping the volumes. The runners
-register with `yansigit/zephyr`, or with `ZEPHYR_GH_REPO=<owner/repo>` for a fork. They and the
+`ZEPHYR_RUNNER_MEMORY` (default 16g). They are ephemeral: a runner registers with `--ephemeral`,
+takes one job, and its container is removed when it exits; systemd user unit `zephyr-runner@<i>`
+(which `up` installs, running a copy of the script in `~/.local/share/zephyr-runner/`) starts a
+fresh one from the image. No volume is mounted, so the checkout, the cargo registry and target dir,
+the home and anything a job's code wrote there go with its container, and the next job cannot run
+what an earlier one left behind. The cost is a cold build in every job. Run `up` again after
+changing the Dockerfile or the limits: each slot's next job uses them. A runner from before this
+(with its `zephyr-runner-<i>-work` volume) is unregistered once idle, never mid-job, and replaced,
+and its volume removed. `deploy/runner/start.sh down` stops the units and unregisters the runners.
+On zephyr-local's BuildKit a release (a `v*` tag) builds with no cache, so a branch's build cannot
+reach it. The runners register with `yansigit/zephyr`, or with `ZEPHYR_GH_REPO=<owner/repo>` for a
+fork. They and the
 rootless BuildKit sit on their own Docker network with no Docker socket, no access to the host's
 files and no route to its localhost; services the host serves on all interfaces (SSH, ComfyUI,
 ...) are still reachable.

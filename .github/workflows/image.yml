@@ -66,20 +66,30 @@ jobs:
           if [ "$MINIMAL" = true ]; then v=dev-minimal; fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      # The registry login and buildx's builder record live in a folder of this job's own, removed
+      # at its end, never in the runner's home.
+      - run: echo "DOCKER_CONFIG=$(mktemp -d)" >> "$GITHUB_ENV"
       - if: runner.environment == 'github-hosted'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          # The last step removes $DOCKER_CONFIG, which holds the builder's record, before the
+          # actions' own cleanup would run; and the runner is thrown away.
+          cleanup: false
       - if: runner.environment == 'self-hosted'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver: remote
           endpoint: tcp://zephyr-buildkitd:1234
+          cleanup: false
       # No daemon needed: when `docker login` can't reach one, the CLI logs in client-side and still
-      # writes ~/.docker/config.json, which buildx hands to the remote BuildKit for the push.
+      # writes $DOCKER_CONFIG/config.json, which buildx hands to the remote BuildKit for the push.
       - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+          # The login is in $DOCKER_CONFIG, which the last step removes.
+          logout: false
       # Smoke test, hosted runners only: the fallback has no Docker daemon to load or run the image.
       - if: runner.environment == 'github-hosted'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -144,3 +154,8 @@ jobs:
           # Hosted runners only: the fallback's remote BuildKit runs outside the job, without an Actions cache token.
           cache-from: ${{ runner.environment == 'github-hosted' && 'type=gha' || '' }}
           cache-to: ${{ runner.environment == 'github-hosted' && 'type=gha,mode=max' || '' }}
+          # A release built on zephyr-local's BuildKit uses none of its cache, which a branch's build
+          # may have written.
+          no-cache: ${{ runner.environment == 'self-hosted' && startsWith(github.ref, 'refs/tags/v') }}
+      - if: always()
+        run: rm -rf "$DOCKER_CONFIG"
