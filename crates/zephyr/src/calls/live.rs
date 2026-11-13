@@ -1168,7 +1168,9 @@ impl<'a> Live<'a> {
             Some(socket) => {
                 let sent = tokio::time::timeout(SEND_WAIT, socket.send(Message::Text(frame))).await;
                 if !matches!(sent, Ok(Ok(()))) {
-                    // The next read finds it closed, which is their hang-up.
+                    // The line is gone, which is their hang-up. The socket goes too, so the
+                    // rest of the line does not wait out a send each before the loop hears it.
+                    self.socket = None;
                     let _ = self.tx.send(Event::TheirHangup);
                 }
             }

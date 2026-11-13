@@ -336,6 +336,78 @@ mod tests {
         );
     }
 
+    /// The write tools of the pinned servers that the verb rule misses, read from
+    /// github-mcp-server 2.1.0's tool snapshots and notion-mcp-server 2.6.1's OpenAPI file.
+    #[test]
+    fn the_pinned_servers_write_tools_wait_for_the_owner() {
+        let github = [
+            "push_files",
+            "create_or_update_file",
+            "delete_file",
+            "create_branch",
+            "update_pull_request_branch",
+            "assign_copilot_to_issue",
+            "assign_copilot_to_issue_with_intent",
+            "request_copilot_review",
+            "submit_pending_pull_request_review",
+            "request_pull_request_reviewers",
+            "update_pull_request_body",
+            "update_pull_request_title",
+            "update_pull_request_state",
+            "update_pull_request_draft_state",
+            "resolve_review_thread",
+            "unresolve_review_thread",
+            "update_issue_body",
+            "update_issue_title",
+            "update_issue_state",
+            "update_issue_labels",
+            "update_issue_assignees",
+            "update_issue_milestone",
+            "update_issue_type",
+            "set_issue_fields",
+            "add_sub_issue",
+            "remove_sub_issue",
+            "reprioritize_sub_issue",
+            "issue_dependency_write",
+            "label_write",
+            "actions_run_trigger",
+            "create_repository_ruleset",
+            "custom_properties_write",
+            "projects_write",
+            "hide_pull_request_review",
+            "unhide_pull_request_review",
+            "issue_artifact_write",
+        ];
+        let notion = [
+            "API-patch-page",
+            "API-patch-block-children",
+            "API-update-a-block",
+            "API-delete-a-block",
+            "API-update-page-markdown",
+            "API-move-page",
+            "API-create-a-data-source",
+            "API-update-a-data-source",
+        ];
+        for (server, tools) in [("github", &github[..]), ("notion", &notion[..])] {
+            let cfg = config_with(read(&shipped(), server).unwrap().to_mcp(None).unwrap());
+            for tool in tools {
+                assert_eq!(
+                    crate::approvals::verb_class(server, tool),
+                    "none",
+                    "{server}/{tool}: the rule misses it, so the preset is what holds it"
+                );
+                let call = serde_json::json!({"server": server, "tool": tool, "arguments": {}});
+                let class = |s: &str, t: &str| crate::gate::connector_class(&cfg, s, t);
+                let gated = zephyr_policy::policy::gated("mcp_call", &call, &class);
+                assert_eq!(
+                    gated.map(|g| g.class),
+                    Some(zephyr_policy::policy::Class::Posts),
+                    "{server}/{tool}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn an_unknown_key_and_a_secrets_key_are_refused() {
         let ok = "about = \"x\"\n[server]\nurl = \"https://x.test/mcp\"\n";

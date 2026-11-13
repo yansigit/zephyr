@@ -852,7 +852,8 @@ async fn stock_rpi_connect_attaches_chats_and_detaches() {
     let agent_dir = gw.home.join("rpi-agent");
     std::fs::create_dir_all(&agent_dir).unwrap();
 
-    let status = tokio::process::Command::new("python3")
+    // The script gives up within about 40 s; a hang past that fails the test, never the suite.
+    let drive = tokio::process::Command::new("python3")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/drive-connect.py"
@@ -865,8 +866,11 @@ async fn stock_rpi_connect_attaches_chats_and_detaches() {
         .args(["hello stock", "echo: [tui #2] hello stock"])
         .env("RPI_CODING_AGENT_DIR", &agent_dir)
         .env("HOME", &gw.home)
-        .status()
+        .kill_on_drop(true)
+        .status();
+    let status = tokio::time::timeout(Duration::from_secs(60), drive)
         .await
+        .expect("drive-connect.py ended within 60 s")
         .unwrap();
     assert!(status.success(), "the reply never showed in the client");
 

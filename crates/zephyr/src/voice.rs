@@ -720,17 +720,9 @@ fn call_wav(pcm: &[i16]) -> Vec<u8> {
 }
 
 /// What the other party said in one utterance of a phone call, 8 kHz samples the daemon cut
-/// from the provider's audio itself. As a voice note's: whisper as `nobody`, on a sealed memfd,
-/// one run at a time. `lang` is the call's language, so nothing is detected.
-pub async fn hear_call(cfg: &Config, pcm: &[i16], lang: &str) -> Heard {
-    if !floored(cfg) {
-        return Heard::NoFloor;
-    }
-    let _turn = Turn::take(Who::Note).await;
-    hear_once(cfg, pcm, lang, Who::Note).await
-}
-
-/// `hear_call` in the turn the caller holds: one whisper-cli run.
+/// from the provider's audio itself, in the turn the caller holds: one whisper-cli run on a
+/// sealed memfd. `lang` is the call's language, so nothing is detected. [`Call::hear`] runs it
+/// when its warm whisper-server is gone.
 async fn hear_once(cfg: &Config, pcm: &[i16], lang: &str, who: Who) -> Heard {
     let heard = async {
         let wav = mem(Mem::sealed(&call_wav(pcm)))?;
@@ -782,24 +774,13 @@ fn call_args() -> Vec<String> {
         .collect()
 }
 
-/// One line of a phone call spoken in `lang` (`en`, `ko`), as μ-law at 8 kHz, or `None`: no
-/// voice for the language in this image, nothing speakable in `text`, or Piper or ffmpeg
-/// failed. Both run as the decoders do.
-pub async fn say_call(cfg: &Config, text: &str, lang: &str) -> Option<Vec<u8>> {
-    if !floored(cfg) || !call_voice(cfg, lang) {
-        return None;
-    }
-    let text = speakable(text)?;
-    let _turn = Turn::take(Who::Note).await;
-    say_once(cfg, &text, lang, Who::Note).await
-}
-
 fn call_voice_path(cfg: &Config, lang: &str) -> std::path::PathBuf {
     cfg.voice_dir
         .join(if lang == "ko" { VOICE_KO } else { VOICE_EN })
 }
 
-/// `say_call` of speakable `text` in the turn the caller holds: one Piper run, then `mulaw`.
+/// One line of a phone call, speakable `text` in `lang`, as μ-law at 8 kHz, in the turn the
+/// caller holds: one Piper run, then `mulaw`. [`Call::say`] runs it when its warm Piper is gone.
 async fn say_once(cfg: &Config, text: &str, lang: &str, who: Who) -> Option<Vec<u8>> {
     let made = async {
         let said = mem(Mem::sealed(text.as_bytes()))?;
@@ -1069,7 +1050,8 @@ impl Call {
         }
     }
 
-    /// What the other party said in one utterance, as `hear_call` has it.
+    /// What the other party said in one utterance (`hear_once`), from the warm whisper-server
+    /// while it lasts.
     pub async fn hear(&self, pcm: &[i16]) -> Heard {
         if !floored(&self.cfg) {
             return Heard::NoFloor;
@@ -1145,7 +1127,9 @@ impl Call {
         }
     }
 
-    /// One line of the call spoken, as `say_call` has it.
+    /// One line of the call spoken in its language as μ-law at 8 kHz (`say_once`), by the warm
+    /// Piper while it lasts, or `None`: no voice for the language in this image, nothing
+    /// speakable in `text`, or Piper or ffmpeg failed.
     pub async fn say(&self, text: &str) -> Option<Vec<u8>> {
         if !floored(&self.cfg) || !call_voice(&self.cfg, &self.lang) {
             return None;
@@ -1343,11 +1327,13 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_call_is_heard_from_8_khz_samples_as_nobody() {
         let cfg = fakes("voice-call-hear", "");
+        // As `Call::hear` runs it: in the call uid's turn, which no other call's sweep cuts.
+        let _turn = Turn::take(Who::Call).await;
         mark(&cfg, "say", "Seven is full, we have seven thirty");
         let pcm: Vec<i16> = (0..8000)
             .map(|i| if i / 20 % 2 == 0 { 9000 } else { -9000 })
             .collect();
-        let heard = hear_call(&cfg, &pcm, "en").await;
+        let heard = hear_once(&cfg, &pcm, "en", Who::Call).await;
         assert_eq!(heard, said("en", "Seven is full, we have seven thirty"));
         // One whisper run, no ffmpeg: on the WAV the daemon made, in the call's language.
         assert!(log(&cfg, "ffmpeg").is_empty());
@@ -1375,7 +1361,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(cfg.voice_dir.join("models")).unwrap();
         std::fs::write(cfg.voice_dir.join(CALL_MODEL), "").unwrap();
         assert_eq!(call_model(&cfg), CALL_MODEL);
-        hear_call(&cfg, &pcm, "en").await;
+        hear_once(&cfg, &pcm, "en", Who::Call).await;
         let last = log(&cfg, "whisper-cli").pop().unwrap();
         assert!(
             last["argv"]
@@ -1393,20 +1379,26 @@ pub(crate) mod tests {
         );
         // Each utterance takes the next line of what the other party says.
         mark(&cfg, "says", "first\nsecond\n");
-        assert_eq!(hear_call(&cfg, &pcm, "en").await, said("en", "first"));
-        assert_eq!(hear_call(&cfg, &pcm, "en").await, said("en", "second"));
+        assert_eq!(
+            hear_once(&cfg, &pcm, "en", Who::Call).await,
+            said("en", "first")
+        );
+        assert_eq!(
+            hear_once(&cfg, &pcm, "en", Who::Call).await,
+            said("en", "second")
+        );
         mark(&cfg, "say", "");
         std::fs::remove_file(cfg.voice_dir.join("says")).unwrap();
-        assert_eq!(hear_call(&cfg, &pcm, "en").await, Heard::Silence);
+        assert_eq!(hear_once(&cfg, &pcm, "en", Who::Call).await, Heard::Silence);
     }
 
     #[tokio::test]
     async fn a_call_line_is_spoken_as_mu_law() {
         let cfg = fakes("voice-call-say", "");
-        let audio = say_call(&cfg, "Seven thirty, **please**.", "en")
-            .await
-            .unwrap();
-        // The stand-ins pass the text through: Piper's `pcm:`, then ffmpeg's `ulaw:`.
+        let call = Call::new(&cfg, "en");
+        let audio = call.say("Seven thirty, **please**.").await.unwrap();
+        // Only what is spoken goes to Piper; the stand-ins pass it through: Piper's `pcm:`,
+        // then ffmpeg's `ulaw:`.
         assert_eq!(audio, b"ulaw:pcm:Seven thirty, please.");
         let ffmpeg = &log(&cfg, "ffmpeg")[0];
         let argv = ffmpeg["argv"].to_string();
@@ -1419,11 +1411,12 @@ pub(crate) mod tests {
             assert!(argv.contains(part), "{part} in {argv}");
         }
         // No voice for the language: nothing is said, and nothing runs.
-        assert_eq!(say_call(&cfg, "안녕하세요.", "ko").await, None);
-        assert_eq!(say_call(&cfg, "Bonjour.", "fr").await, None);
+        assert_eq!(Call::new(&cfg, "ko").say("안녕하세요.").await, None);
+        assert_eq!(Call::new(&cfg, "fr").say("Bonjour.").await, None);
         assert_eq!(log(&cfg, "python").len(), 1);
+        // Piper fails, warm and then once: nothing is said.
         mark(&cfg, "piper_fail", "");
-        assert_eq!(say_call(&cfg, "Hello.", "en").await, None);
+        assert_eq!(call.say("Hello.").await, None);
     }
 
     /// One second of an 8 kHz square wave: an utterance as the call's endpointer cuts it.

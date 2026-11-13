@@ -105,14 +105,26 @@ impl Session {
         let target = Target::parse(&config.url)?;
         let heartbeat = heartbeat_interval();
 
-        let tcp = timeout(
+        // Under the network floor the agent's processes reach nothing but the proxy (§4.20).
+        let proxy = proxy_for(&target, |k| std::env::var(k).ok())?;
+        let (host, port) = proxy
+            .as_ref()
+            .map_or((target.host.as_str(), target.port), |p| {
+                (p.host.as_str(), p.port)
+            });
+        let mut tcp = timeout(
             CONNECT_TIMEOUT,
-            tokio::net::TcpStream::connect((target.host.as_str(), target.port)),
+            tokio::net::TcpStream::connect((host, port)),
         )
         .await
-        .with_context(|| format!("timed out connecting to {}:{}", target.host, target.port))?
-        .with_context(|| format!("failed to connect to {}:{}", target.host, target.port))?;
+        .with_context(|| format!("timed out connecting to {host}:{port}"))?
+        .with_context(|| format!("failed to connect to {host}:{port}"))?;
         tcp.set_nodelay(true).ok();
+        if proxy.is_some() {
+            timeout(CONNECT_TIMEOUT, tunnel(&mut tcp, &target))
+                .await
+                .context("timed out waiting for the proxy's CONNECT answer")??;
+        }
 
         // TLS and plaintext h2 differ only in the byte stream `handshake` runs on; the spawned
         // connection task owns whichever one we got.
@@ -419,6 +431,93 @@ fn header_value(raw: &str, name: &str) -> anyhow::Result<HeaderValue> {
     HeaderValue::from_str(raw).with_context(|| format!("{name} is not a valid HTTP header value"))
 }
 
+/// The most of a proxy's answer to `CONNECT` that is read.
+const PROXY_HEAD_LIMIT: usize = 8 * 1024;
+
+/// The proxy the environment names for `target` (`https_proxy`/`HTTPS_PROXY` for https,
+/// `http_proxy`/`HTTP_PROXY` for http), unless `no_proxy`/`NO_PROXY` names its host or a
+/// domain it is in.
+// shortcut: no proxy credentials, https:// proxies, ports or CIDRs in NO_PROXY; zephyr's own
+// proxy needs none of them.
+fn proxy_for(
+    target: &Target,
+    env: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<Option<Target>> {
+    let var = |names: [&str; 2]| {
+        names
+            .into_iter()
+            .find_map(|n| env(n).filter(|v| !v.trim().is_empty()))
+    };
+    let names = if target.tls {
+        ["https_proxy", "HTTPS_PROXY"]
+    } else {
+        ["http_proxy", "HTTP_PROXY"]
+    };
+    let Some(url) = var(names) else {
+        return Ok(None);
+    };
+    let host = target.host.to_ascii_lowercase();
+    let bypass = var(["no_proxy", "NO_PROXY"])
+        .unwrap_or_default()
+        .split(',')
+        .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+        .any(|e| e == "*" || (!e.is_empty() && (host == e || host.ends_with(&format!(".{e}")))));
+    if bypass {
+        return Ok(None);
+    }
+    let url = url.trim();
+    // The variable's value is never echoed: it may carry a password, and an `@` anywhere in
+    // it (a password with a `/` puts it past the authority) is refused before it is parsed.
+    if url.contains('@') {
+        bail!("the proxy variable is not an http://host:port URL");
+    }
+    let url = if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("http://{url}")
+    };
+    match Target::parse(&url) {
+        Ok(proxy) if !proxy.tls => Ok(Some(proxy)),
+        _ => bail!("the proxy variable is not an http://host:port URL"),
+    }
+}
+
+/// Asks the proxy for a tunnel to `target` and reads its answer up to the blank line, a byte at
+/// a time so nothing the server sends after it is taken from the stream TLS or h2 reads next.
+/// Any 2xx on an `HTTP/1.x` status line opens it.
+async fn tunnel(tcp: &mut tokio::net::TcpStream, target: &Target) -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let authority = if target.host.contains(':') {
+        format!("[{}]:{}", target.host, target.port)
+    } else {
+        format!("{}:{}", target.host, target.port)
+    };
+    tcp.write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
+        .await
+        .context("failed to write to the proxy")?;
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() >= PROXY_HEAD_LIMIT {
+            bail!("the proxy's answer to CONNECT is over {PROXY_HEAD_LIMIT} bytes");
+        }
+        let byte = tcp
+            .read_u8()
+            .await
+            .context("the proxy closed before answering CONNECT")?;
+        head.push(byte);
+    }
+    let head = String::from_utf8_lossy(&head);
+    let line = head.lines().next().unwrap_or_default();
+    let mut words = line.split_whitespace();
+    let version = words.next().unwrap_or_default();
+    let code = words.next().unwrap_or_default();
+    let ok = code.len() == 3 && code.starts_with('2') && code.bytes().all(|b| b.is_ascii_digit());
+    if !version.starts_with("HTTP/1.") || !ok {
+        bail!("the proxy refused CONNECT {authority}: {line}");
+    }
+    Ok(())
+}
+
 /// webpki roots + `h2` ALPN, matching what the `cursor-agent` CLI presents.
 // Adapted from 1jehuang/jcode (MIT), agent_transport.rs
 fn tls_config() -> Arc<tokio_rustls::rustls::ClientConfig> {
@@ -551,6 +650,84 @@ mod tests {
         let shown = format!("{config:?}");
         assert!(!shown.contains("secret-token-value"), "{shown}");
         assert!(shown.contains("redacted"), "{shown}");
+    }
+
+    #[test]
+    fn the_proxy_is_the_one_for_the_scheme_unless_no_proxy_names_the_host() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                vars.iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let at = |url: &str, vars| {
+            let target = Target::parse(url).unwrap();
+            proxy_for(&target, env(vars))
+                .unwrap()
+                .map(|p| format!("{}:{}", p.host, p.port))
+        };
+        let floor: &[(&str, &str)] = &[
+            ("HTTPS_PROXY", "http://127.0.0.1:7792"),
+            ("NO_PROXY", "localhost,127.0.0.1,::1"),
+        ];
+        let cursor = "https://agentn.global.api5.cursor.sh/agent.v1.AgentService/Run";
+        assert_eq!(at(cursor, floor).as_deref(), Some("127.0.0.1:7792"));
+        assert_eq!(at("https://127.0.0.1:9/x", floor), None);
+        assert_eq!(at("https://[::1]:9/x", floor), None);
+        assert_eq!(at("http://agent.example/x", floor), None, "no http_proxy");
+        assert_eq!(at(cursor, &[]), None);
+        let skip: &[(&str, &str)] = &[("https_proxy", "127.0.0.1:1"), ("no_proxy", ".cursor.sh")];
+        assert_eq!(at(cursor, skip), None);
+        assert_eq!(
+            at("https://notcursor.sh/x", skip).as_deref(),
+            Some("127.0.0.1:1")
+        );
+        let secret: &[(&str, &str)] = &[("HTTPS_PROXY", "http://u:hunter2@proxy:8080")];
+        let e = proxy_for(&Target::parse(cursor).unwrap(), env(secret))
+            .err()
+            .expect("a proxy URL with credentials is refused");
+        assert!(!e.to_string().contains("hunter2"), "{e}");
+        // A password with a `/` in it puts the `@` past the authority: still refused.
+        let slashed: &[(&str, &str)] = &[("HTTPS_PROXY", "http://u:hun/ter2@proxy:8080")];
+        let e = proxy_for(&Target::parse(cursor).unwrap(), env(slashed))
+            .err()
+            .expect("a proxy URL with an @ anywhere is refused");
+        assert!(!e.to_string().contains("hun"), "{e}");
+    }
+
+    /// The proxy's answer: any 2xx on an `HTTP/1.x` status line opens the tunnel.
+    #[tokio::test]
+    async fn the_tunnel_opens_on_a_2xx_status_line_only() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let target = Target::parse("https://agent.example/Run").unwrap();
+        for (answer, opens) in [
+            ("HTTP/1.1 200 Connection established\r\n\r\n", true),
+            ("HTTP/1.0 200 OK\r\n\r\n", true),
+            ("HTTP/1.1 204 No Content\r\n\r\n", true),
+            ("HTTP/1.1 403 Forbidden\r\n\r\n", false),
+            ("XTTP/1.1 200 OK\r\n\r\n", false),
+            ("200 200\r\n\r\n", false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let proxy = tokio::spawn(async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    head.push(s.read_u8().await.unwrap());
+                }
+                s.write_all(answer.as_bytes()).await.unwrap();
+                head
+            });
+            let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            assert_eq!(tunnel(&mut tcp, &target).await.is_ok(), opens, "{answer:?}");
+            let head = String::from_utf8(proxy.await.unwrap()).unwrap();
+            assert_eq!(
+                head,
+                "CONNECT agent.example:443 HTTP/1.1\r\nHost: agent.example:443\r\n\r\n"
+            );
+        }
     }
 
     #[test]

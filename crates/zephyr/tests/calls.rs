@@ -441,8 +441,9 @@ async fn a_local_turn_with_the_real_voice() {
     let mut cfg = config(&gen, 0, "");
     cfg.voice_dir = voice;
     let mut script = "stream\nanswer\nwait 4\n".to_string();
+    let mouth = zephyr::voice::Call::new(&cfg, "en");
     for (i, text) in them.iter().enumerate() {
-        let mut ulaw = zephyr::voice::say_call(&cfg, text, "en").await.unwrap();
+        let mut ulaw = mouth.say(text).await.unwrap();
         ulaw.extend([0xff; 8000]);
         let file = telnyx.dir.join(format!("them{i}.ulaw"));
         std::fs::write(&file, ulaw).unwrap();
@@ -656,6 +657,45 @@ async fn a_private_fact_is_never_spoken() {
     gw.shutdown().await;
 }
 
+/// A fact said in words is the fact: the line that spells it out is held like the digits.
+#[tokio::test]
+async fn a_private_fact_in_words_is_never_spoken() {
+    let (gw, telnyx) = start(
+        "fact-words",
+        "answer\nexpect a table for two\nsaid Sure, what number?\nexpect Thanks.\nhangup\n",
+        "Hi, I'd like a table for two. My number is four one six, five five five, oh one four two.\nThanks.",
+        "",
+        |cfg| {
+            cfg.calls = cfg.calls.clone().map(|mut c| {
+                c.speech = "provider".into();
+                c
+            });
+            std::fs::write(
+                cfg.home.join("facts.toml"),
+                "[[fact]]\nname = \"phone\"\nkind = \"digits\"\nvalue = \"4165550142\"\n",
+            )
+            .unwrap();
+        },
+    )
+    .await;
+    gw.ask_and_approve().await;
+    gw.reply_with("held the owner's private fact phone and was not said")
+        .await;
+    gw.ended().await;
+    let api = telnyx.api();
+    let said: Vec<&str> = (api.iter())
+        .filter(|r| r["path"] == "/v2/calls/fake-1/actions/speak")
+        .map(|r| r["body"]["payload"].as_str().unwrap())
+        .collect();
+    assert!(said.contains(&"Hi, I'd like a table for two."), "{said:?}");
+    assert!(
+        said.contains(&"That is something I can't share on this call."),
+        "{said:?}"
+    );
+    assert!(!said.iter().any(|s| s.contains("one four two")), "{said:?}");
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn what_they_say_is_never_a_command_and_taints() {
     let (gw, telnyx) = start(
@@ -736,6 +776,35 @@ async fn hangup_ends_the_call_at_once() {
     assert!(
         !voice_fakes::running(&gw.home, "piper.pid"),
         "piper outlived the call's end"
+    );
+    gw.shutdown().await;
+}
+
+/// Telnyx stops reading the media socket mid-line: the first send that cannot go drops the
+/// socket, so the rest of the line does not wait out a send each and the call ends at once.
+#[tokio::test]
+async fn a_media_socket_that_stops_reading_ends_the_call() {
+    let (gw, _telnyx) = start("deaf", "stream\ndeaf\nanswer\n", "Hello.", "", |cfg| {
+        // The opening line is far more audio than the socket's buffers hold.
+        std::fs::write(cfg.voice_dir.join("piper_pad"), "8000000").unwrap();
+    })
+    .await;
+    gw.ask_and_approve().await;
+    let store = gw.store();
+    wait(120, || {
+        let lines = store.call_lines(1).unwrap();
+        lines
+            .iter()
+            .any(|l| l.2.starts_with("Hello, this is an AI assistant"))
+    })
+    .await;
+    let opened = std::time::Instant::now();
+    gw.typed("h", "/hangup").await;
+    let ended = gw.ended().await;
+    assert!(
+        opened.elapsed() < Duration::from_secs(45),
+        "{ended} after {:?}",
+        opened.elapsed()
     );
     gw.shutdown().await;
 }
