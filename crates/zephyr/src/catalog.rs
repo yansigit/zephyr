@@ -337,7 +337,7 @@ mod tests {
     }
 
     /// The write tools of the pinned servers that the verb rule misses, read from
-    /// github-mcp-server 2.1.0's tool snapshots.
+    /// github-mcp-server 2.1.0's tool snapshots and notion-mcp-server 2.6.1's OpenAPI file.
     #[test]
     fn the_pinned_servers_write_tools_wait_for_the_owner() {
         let github = [
@@ -375,7 +375,17 @@ mod tests {
             "custom_properties_write",
             "projects_write",
         ];
-        for (server, tools) in [("github", &github[..])] {
+        let notion = [
+            "API-patch-page",
+            "API-patch-block-children",
+            "API-update-a-block",
+            "API-delete-a-block",
+            "API-update-page-markdown",
+            "API-move-page",
+            "API-create-a-data-source",
+            "API-update-a-data-source",
+        ];
+        for (server, tools) in [("github", &github[..]), ("notion", &notion[..])] {
             let cfg = config_with(read(&shipped(), server).unwrap().to_mcp(None).unwrap());
             for tool in tools {
                 assert_eq!(

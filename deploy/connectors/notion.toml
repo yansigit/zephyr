@@ -10,7 +10,16 @@ args = ["-y", "@notionhq/notion-mcp-server@2.6.1"]
 env = { NOTION_TOKEN = "${NOTION_TOKEN}" }
 hosts = "api.notion.com"
 
-# Tool names are API-<operationId>, so a search reads as a post to the verb rule.
-# API-post-page and API-create-a-comment stay posts by the rule.
+# Tool names are API-<operationId>, so a search reads as a post to the verb rule. API-post-page
+# and API-create-a-comment stay posts by the rule; every other write in 2.6.1's
+# notion-openapi.json edits, moves or deletes what may be shared, so it is a post too.
 [server.classes]
 API-post-search = "none"
+API-patch-page = "posts"
+API-patch-block-children = "posts"
+API-update-a-block = "posts"
+API-delete-a-block = "posts"
+API-update-page-markdown = "posts"
+API-move-page = "posts"
+API-create-a-data-source = "posts"
+API-update-a-data-source = "posts"
