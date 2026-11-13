@@ -95,7 +95,8 @@ yourself: your `gh` token only ever goes to ghcr.io.
 3. *Discord*: create an application in the Discord Developer Portal, add a bot, and copy its
    token (init asks for it at a hidden prompt). Invite the bot to a server you are in, so you can
    send it direct messages; it reads DMs only. Your user id comes from Developer Mode, then Copy
-   User ID. DMs you send while zephyr is down are picked up when it is back (as on iMessage),
+   User ID. DMs you send while zephyr is down are picked up when it is back (as on iMessage:
+   the last day, at most 200; `[discord] lookback_hours` and `backfill_limit`),
    except that an `/ok`, `/no`, `/stop`, `/pause` or `/vault grant` sent over 10 minutes before
    is not carried out: zephyr says it skipped it.
 4. *iMessage*: a Mac running the BlueBubbles server, on your tailnet. Init asks for the webhook

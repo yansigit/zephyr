@@ -58,11 +58,11 @@ pub struct Config {
     pub typing: bool,
 }
 
-fn default_lookback_hours() -> u64 {
+pub(crate) fn default_lookback_hours() -> u64 {
     24
 }
 
-fn default_backfill_limit() -> u32 {
+pub(crate) fn default_backfill_limit() -> u32 {
     200
 }
 
