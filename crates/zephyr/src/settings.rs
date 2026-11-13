@@ -1355,9 +1355,8 @@ pub fn set_args(arg: &str) -> Option<(&str, &str, Option<&str>)> {
     let (key, rest) = arg.trim().split_once(char::is_whitespace)?;
     let rest = rest.trim();
     let (value, until) = match rest.rsplit_once(" for ") {
-        Some((v, d)) if !v.trim().is_empty() && !d.trim().contains(char::is_whitespace) => {
-            (v.trim(), Some(d.trim()))
-        }
+        // `calling for Aiden` is a value: only a duration after the last `for` is a time limit.
+        Some((v, d)) if !v.trim().is_empty() && duration(d).is_ok() => (v.trim(), Some(d.trim())),
         _ => (rest, None),
     };
     (!value.is_empty()).then_some((key, value, until))
@@ -2219,6 +2218,11 @@ mod tests {
         assert_eq!(
             set_args("settings.strong_channels tui, chat"),
             Some(("settings.strong_channels", "tui, chat", None))
+        );
+        // A `for` not followed by a duration is the value's own word.
+        assert_eq!(
+            set_args("calls.caller_name calling for Aiden"),
+            Some(("calls.caller_name", "calling for Aiden", None))
         );
         assert_eq!(set_args("timezone"), None);
         assert_eq!(set_args(""), None);
