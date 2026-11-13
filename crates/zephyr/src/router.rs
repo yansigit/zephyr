@@ -3542,13 +3542,14 @@ impl<'a> Router<'a> {
             Apply::Toml => {
                 let model =
                     matches!(s.kind, Kind::Model | Kind::Optional(Kind::Model)) && value.is_some();
-                let write = |doc: &mut toml_edit::DocumentMut| reg::write(doc, key, value.as_ref());
+                let write = |doc: &mut toml_edit::DocumentMut| {
+                    reg::edit_doc(doc, key, raw, &reg::Edit::default()).map(drop)
+                };
                 self.edit_config(model.then_some(raw), write).await
             }
             // The preset and the hand-set values it drops (or a timed one's whole set put back)
             // are one update, worked out from the file as it is under the writer's lock.
             Apply::Preset => {
-                let preset = value.as_ref().map(reg::text);
                 // R31: as any later owner change of a key does, an owner's preset ends the time
                 // limit of each class it changes or clears, so that limit's revert can never
                 // loosen what the preset chose. The agent's never does (R12); the preset's own
@@ -3559,27 +3560,15 @@ impl<'a> Router<'a> {
                         .collect(),
                     _ => Vec::new(),
                 };
+                let edit = reg::Edit {
+                    restore: restore.is_some(),
+                    limits: &limits,
+                    ..reg::Edit::default()
+                };
                 let write = |doc: &mut toml_edit::DocumentMut| {
-                    let now: Config = toml::from_str(&doc.to_string())?;
-                    let edits = match (restore, preset.as_deref()) {
-                        (Some(snapshot), _) => crate::approvals::restore_edits(&now, snapshot)
-                            .map_err(|e| anyhow::anyhow!(e))?,
-                        (None, Some(p)) => {
-                            let p =
-                                crate::approvals::Preset::parse(p).map_err(anyhow::Error::msg)?;
-                            crate::approvals::preset_edits(&now, p)
-                        }
-                        (None, None) => anyhow::bail!("no preset to set"),
-                    };
-                    let ends: Vec<(String, Option<String>)> = (limits.into_iter())
-                        .filter(|(k, _)| edits.iter().any(|(e, _)| e == k))
-                        .collect();
-                    // A timed preset saves such a class as what its limit would have put back.
-                    before = Some(crate::approvals::snapshot_with(&now, &ends));
-                    ended = ends.into_iter().map(|(k, _)| k).collect();
-                    for (key, v) in edits {
-                        reg::write(doc, &key, v.map(toml_edit::Value::from).as_ref())?;
-                    }
+                    // A timed preset saves an ended class as what its limit would have put back.
+                    let done = reg::edit_doc(doc, key, raw, &edit)?;
+                    (before, ended) = (done.before, done.ended);
                     Ok(())
                 };
                 self.edit_config(None, write).await
@@ -3645,7 +3634,8 @@ impl<'a> Router<'a> {
                 (Apply::Preset, _) => before,
                 _ => old.clone(),
             };
-            self.time_limit(key, actor, until, back, channel);
+            let set_to = reg::shown(new.as_deref()).to_string();
+            self.time_limit(key, actor, until, back, set_to, channel);
         }
         if let Actor::Agent { .. } = actor {
             self.tell_owner(&reg::tightened(key, o, n, reason));
@@ -3666,6 +3656,7 @@ impl<'a> Router<'a> {
         actor: Actor<'_>,
         until: Option<Duration>,
         back: Option<String>,
+        set_to: String,
         channel: Option<&str>,
     ) {
         // A revert that cannot be read counts as pending: the agent then leaves it alone.
@@ -3681,6 +3672,7 @@ impl<'a> Router<'a> {
                     at: since + d.as_secs() as i64,
                     since,
                     channel: channel.map(Into::into),
+                    set_to: Some(set_to),
                 })
             }
         };
@@ -4001,6 +3993,20 @@ impl<'a> Router<'a> {
         for r in due {
             let span = crate::settings::span(Duration::from_secs((r.at - r.since).max(0) as u64));
             let (key, raw) = (r.key.as_str(), r.value.as_deref().unwrap_or("none"));
+            // Changed since (`zephyr config set` with the daemon down, a hand edit, a preset
+            // over a timed class): putting it back would undo that, so it stays.
+            let now = self.shown(key);
+            let now = crate::settings::shown(now.as_deref());
+            if r.set_to.as_deref().is_some_and(|set| set != now) {
+                log(self.store.drop_revert(key).map_err(Into::into));
+                eprintln!("zephyr: the time limit on {key} was superseded; it stays {now}");
+                let text = format!(
+                    "[zephyr] {key} stays {now}: it was changed after the {span} you set, so it \
+                     does not go back"
+                );
+                self.tell_setter(r.channel.as_deref(), &text);
+                continue;
+            }
             let text = match self
                 .set_setting(key, raw, Actor::Internal, None, None)
                 .await
@@ -4020,12 +4026,17 @@ impl<'a> Router<'a> {
                     )
                 }
             };
-            let told = match r.channel.and_then(|channel| self.owner_on(&channel)) {
-                Some((channel, owner)) => self.store.notify(&channel, &owner, &text),
-                None => self.store.notify_last_owner(&text),
-            };
-            log(told.map_err(Into::into));
+            self.tell_setter(r.channel.as_deref(), &text);
         }
+    }
+
+    /// Tells the owner on the channel a time limit was set from, else whoever spoke last.
+    fn tell_setter(&self, channel: Option<&str>, text: &str) {
+        let told = match channel.and_then(|channel| self.owner_on(channel)) {
+            Some((channel, owner)) => self.store.notify(&channel, &owner, text),
+            None => self.store.notify_last_owner(text),
+        };
+        log(told.map_err(Into::into));
     }
 
     /// `/pair telegram|signal` (DESIGN §4.3): a new one-time code, only to a strong channel
@@ -4773,9 +4784,13 @@ impl<'a> Router<'a> {
             return Err("no zephyr.toml to change".into());
         };
         let active = self.account.as_ref().map(|a| a.name.clone());
+        let edit = crate::settings::Edit {
+            active: active.as_deref(),
+            ..Default::default()
+        };
         for _ in 0..3 {
             let derived = crate::host::conf::load(&path).and_then(|mut doc| {
-                crate::reload::set_model(&mut doc, active.as_deref(), model)?;
+                crate::settings::edit_doc(&mut doc, "model", model, &edit)?;
                 Ok(model_account(&doc, model))
             });
             let name = derived.map_err(|e| format!("model not changed: {e:#}"))?;
@@ -4790,7 +4805,7 @@ impl<'a> Router<'a> {
             // re-derives, and a pool that moved under the check leaves the file untouched.
             let mut moved = false;
             let saved = crate::host::conf::update(&path, |doc| {
-                crate::reload::set_model(doc, active.as_deref(), model)?;
+                crate::settings::edit_doc(doc, "model", model, &edit)?;
                 if model_account(doc, model) != name {
                     moved = true;
                     anyhow::bail!("the account pool changed while rpi listed the model");

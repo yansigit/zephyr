@@ -45,6 +45,31 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
     {
         bail!("--network must be bridge or host");
     }
+    // What it is given is checked before any file is written. A new account is named as the
+    // daemon's `/login` names one; an error never repeats the value, which may be a pasted token.
+    let known: Vec<String> = (h.data.load().ok().iter())
+        .flat_map(|doc| conf::accounts(doc).into_iter().map(|(n, _)| n))
+        .collect();
+    let mut accounts = Vec::new();
+    for spec in &account_flags {
+        let (name, model) = (spec.split_once('='))
+            .filter(|(n, m)| !n.is_empty() && zephyr_policy::tools::model_shape(m))
+            .context("--account: want NAME=PROVIDER/MODEL")?;
+        if !known.iter().any(|n| n == name) {
+            crate::auth::check_account(name).context("--account")?;
+        }
+        known_provider(provider_of(model)).context("--account")?;
+        accounts.push((name, model));
+    }
+    for p in &providers {
+        known_provider(p)?;
+    }
+    if let Some(m) = &model {
+        if !zephyr_policy::tools::model_shape(m) {
+            bail!("--model: want PROVIDER/MODEL");
+        }
+        known_provider(provider_of(m)).context("--model")?;
+    }
 
     if !no_start && !super::quiet(super::docker(&["version"])) {
         bail!("docker is not reachable: install Docker and make sure `docker version` works");
@@ -79,16 +104,10 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
 
     let mut doc = h.data.load()?;
     h.data.add_image_extensions(&mut doc)?;
-    for spec in &account_flags {
-        let (name, model) = spec
-            .split_once('=')
-            .filter(|(n, m)| !n.is_empty() && m.contains('/'))
-            .with_context(|| format!("--account {spec}: want NAME=PROVIDER/MODEL"))?;
-        known_provider(provider_of(model))?;
+    for (name, model) in accounts {
         conf::upsert_account(&mut doc, name, model);
     }
     for p in &providers {
-        known_provider(p)?;
         if conf::accounts(&doc)
             .iter()
             .any(|(_, m)| provider_of(m) == p)
@@ -113,6 +132,7 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
     if let Some(p) = preset.filter(|_| non_interactive) {
         write_preset(&mut doc, p)?;
     }
+    valid(&doc)?;
     h.data.save(&doc)?;
 
     if non_interactive {
@@ -184,6 +204,8 @@ pub fn init(h: &Host, mut a: Args) -> anyhow::Result<()> {
             .items(&names)
             .interact()?;
         let ordered: Vec<String> = order.into_iter().map(|i| names[i].clone()).collect();
+        // Read again: the daemon may have written it while the owner chose.
+        doc = h.data.load()?;
         conf::order_accounts(&mut doc, &ordered)?;
         h.data.save(&doc)?;
     }
@@ -269,30 +291,31 @@ fn init_web(h: &Host) -> anyhow::Result<super::web::Restart> {
     Ok(restart)
 }
 
-/// Writes `preset` as `/approvals PRESET` does (D11, `approvals::preset_edits`): the preset, and
+/// Refuses a `zephyr.toml` the daemon would not start with, before it is saved.
+fn valid(doc: &toml_edit::DocumentMut) -> anyhow::Result<()> {
+    let cfg: crate::config::Config = toml::from_str(&doc.to_string())?;
+    cfg.validate()
+        .context("zephyr.toml would not load; nothing saved")
+}
+
+/// Writes `preset` as `/approvals PRESET` does (D11, `settings::edit_doc`): the preset, and
 /// every hand-set class looser than it cleared, so a re-run of `init --preset manual` never
 /// leaves a looser class behind.
 fn write_preset(
     doc: &mut toml_edit::DocumentMut,
     preset: crate::approvals::Preset,
 ) -> anyhow::Result<()> {
-    let cfg: crate::config::Config =
-        toml::from_str(&doc.to_string()).context("reading zephyr.toml")?;
-    for (key, value) in crate::approvals::preset_edits(&cfg, preset) {
-        let value = value.map(toml_edit::Value::from);
-        crate::settings::write(doc, &key, value.as_ref())?;
-    }
-    Ok(())
+    let edit = crate::settings::Edit::default();
+    crate::settings::edit_doc(doc, "approvals.preset", preset.name(), &edit).map(drop)
 }
 
 /// The preset to start in (approvals spec §4.10), then the private facts. A config that already
 /// has an `[approvals]` table (a re-run of `init`) keeps it unless `--preset` says otherwise.
 fn init_approvals(h: &Host, preset: Option<crate::approvals::Preset>) -> anyhow::Result<()> {
     use crate::approvals::Preset;
-    let mut doc = h.data.load()?;
     let chosen = match preset {
         Some(p) => Some(p),
-        None if doc.get("approvals").is_some() => None,
+        None if h.data.load()?.get("approvals").is_some() => None,
         None => {
             let presets = [Preset::Manual, Preset::Semi, Preset::Full];
             let items: Vec<String> = (presets.iter())
@@ -307,6 +330,8 @@ fn init_approvals(h: &Host, preset: Option<crate::approvals::Preset>) -> anyhow:
         }
     };
     if let Some(p) = chosen {
+        // Read after the prompt: the daemon may have written it while the owner chose.
+        let mut doc = h.data.load()?;
         write_preset(&mut doc, p)?;
         h.data.save(&doc)?;
     }
@@ -441,11 +466,18 @@ fn login(
     verify: bool,
 ) -> anyhow::Result<()> {
     known_provider(provider)?;
+    // Before a folder is made or a sign-in started.
+    let shaped = |m: &String| zephyr_policy::tools::model_shape(m) && provider_of(m) == provider;
+    if !model.iter().all(shaped) {
+        bail!("--model: want {provider}/MODEL");
+    }
     h.need_running()?;
     let doc = h.data.load()?;
     let name = account.unwrap_or_else(|| next_name(&doc, provider));
-    if name.is_empty() || name.contains(['/', '.']) {
-        bail!("account name {name:?}: no '/' or '.'");
+    // As the daemon's `/login`, before a dir is made or anything signed in; an account already
+    // in the file signs in again under its name.
+    if !conf::accounts(&doc).iter().any(|(n, _)| *n == name) {
+        crate::auth::check_account(&name)?;
     }
     let dir = h.data.account(&name);
     std::fs::create_dir_all(&dir)?;
@@ -535,6 +567,7 @@ fn login(
     // Read again: the sign-in and the picker take minutes, and the daemon may have edited it since.
     let mut doc = h.data.load()?;
     conf::upsert_account(&mut doc, &name, &model);
+    valid(&doc)?;
     h.data.save(&doc)?;
     println!("account {name}: {model}");
     if verify {
@@ -902,15 +935,11 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
     let rest = a.rest()?;
     // Whether this writes a connector's table by hand (not `add NAME --secret K` alone).
     let by_hand = url.is_some() || !command.is_empty();
-    // The catalog entry's secrets secrets.env lacks, asked for (or named) once it is saved.
-    let mut wanted: Vec<crate::catalog::Secret> = Vec::new();
-    let mut doc = h.data.load()?;
     let parse = |doc: &toml_edit::DocumentMut| -> anyhow::Result<Config> {
         let cfg: Config = toml::from_str(&doc.to_string())?;
         cfg.validate()?;
         Ok(cfg)
     };
-    let was = parse(&doc).ok();
     let usage = "usage: zephyr mcp add NAME (--url URL [--header K=V].. | -- CMD ARGS..) [--secret NAME].. [--host HOST].. [--plain] | add --catalog NAME [--url URL] [--host HOST].. [--plain] | catalog | list | rm NAME";
     // The image's copy of an entry, read as root by full path (`valid_name` first: it becomes a path).
     let entry_text = |name: &str| -> anyhow::Result<String> {
@@ -937,119 +966,134 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        [add] if add == "add" && catalog.is_some() => {
-            let name = catalog.as_deref().unwrap_or_default();
-            h.need_running()?;
-            let entry = crate::catalog::parse(name, &entry_text(name)?)?;
-            let old = parse(&doc)
-                .ok()
-                .and_then(|c| c.mcp.into_iter().find(|m| m.name == name));
-            // Only this add's `--plain`: an old table's is no consent for this one (DESIGN §4.22).
-            if let Some(why) = entry.plain_needed(url.as_deref()).filter(|_| !plain) {
-                bail!("{why}: add --plain to hand it the real key, which the agent can then read");
-            }
-            let m =
-                crate::catalog::merged(entry.to_mcp(url.as_deref())?, old.as_ref(), &hosts, plain);
-            if let Some(note) = crate::catalog::lost_plain(old.as_ref(), &m) {
-                println!("{name}: {note}");
-            }
-            conf::upsert_mcp(&mut doc, &m)?;
-            let set = crate::dotenv::parse(&h.data.read("secrets.env").unwrap_or_default());
-            let lacks = |s: &crate::catalog::Secret| !set.iter().any(|(k, _)| *k == s.name);
-            wanted = (entry.secrets.into_iter())
-                .filter(|s| lacks(s) && !secrets.contains(&s.name))
-                .collect();
-        }
         [list] if list == "list" => {
-            for m in parse(&doc)?.mcp {
+            for m in parse(&h.data.load()?)?.mcp {
                 println!("{}: {}", m.name, m.url.or(m.command).unwrap_or_default());
             }
             return Ok(());
         }
-        [rm, name] if rm == "rm" => {
-            if !conf::remove_mcp(&mut doc, name) {
-                bail!("no connector named {name}");
-            }
-        }
-        [add, name] if add == "add" => {
-            let headers = headers
-                .iter()
-                .map(|h| {
-                    h.split_once('=')
-                        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-                        .with_context(|| format!("--header {h}: write it as K=V"))
-                })
-                .collect::<anyhow::Result<_>>()?;
-            // D4: added again, a connector keeps the classes the owner gave its tools.
-            let existing = || {
-                let cfg = parse(&doc).ok();
-                cfg.and_then(|c| c.mcp.into_iter().find(|m| m.name == *name))
-            };
-            let classes = || existing().map(|m| m.classes).unwrap_or_default();
-            // And where its secrets go, unless this call says.
-            let old = existing().unwrap_or_default();
-            let mut m = match (url, command.split_first()) {
-                (Some(_), Some(_)) => bail!("give --url or a command after --, not both"),
-                (Some(url), None) => Mcp {
-                    name: name.clone(),
-                    url: Some(url),
-                    headers,
-                    classes: classes(),
-                    ..Mcp::default()
-                },
-                (None, Some((cmd, args))) if headers.is_empty() => Mcp {
-                    name: name.clone(),
-                    command: Some(cmd.clone()),
-                    args: args.to_vec(),
-                    classes: classes(),
-                    ..Mcp::default()
-                },
-                (None, Some(_)) => bail!("--header goes with --url"),
-                (None, None) => parse(&doc)?
-                    .mcp
-                    .into_iter()
-                    .find(|m| m.name == *name)
-                    .with_context(|| format!("no connector named {name}\n{usage}"))?,
-            };
-            m.hosts = match hosts.is_empty() {
-                true => old.hosts,
-                false => hosts.join(", "),
-            };
-            m.secrets = match plain {
-                true => Some("plain".into()),
-                false => old.secrets,
-            };
-            // A remote connector can only hold its real secret (rpi's own client cannot use a
-            // stand-in, DESIGN §4.21), which the agent can then read: said here, not implied.
-            if crate::broker::undecided(&m) {
-                bail!(
-                    "a remote connector's secret is handed to it as it is, where the agent can \
-                     read it (rpi's own client cannot use a stand-in): add --plain to accept that"
-                );
-            }
-            conf::upsert_mcp(&mut doc, &m)?;
-        }
-        _ => bail!("{usage}"),
+        _ => {}
     }
-    let now = parse(&doc)?;
-    // As `/set`: this may not make one secret a connector's own and another's stand-in.
-    // With no config that read before, the new one alone must hold none.
-    let made = match &was {
-        Some(was) => crate::broker::creates_pair(was, &now),
-        None => crate::broker::shared_notice(&now).map_or(Ok(()), Err),
+    let entry = match (&catalog, &rest[..]) {
+        (Some(name), [add]) if add == "add" => {
+            h.need_running()?;
+            Some(crate::catalog::parse(name, &entry_text(name)?)?)
+        }
+        _ => None,
     };
-    made.map_err(anyhow::Error::msg)?;
+    let headers: std::collections::BTreeMap<String, String> = (headers.iter())
+        .map(|h| {
+            h.split_once('=')
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                .with_context(|| format!("--header {h}: write it as K=V"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    // The change to zephyr.toml, made on the file as it is, and again on a fresh read after the
+    // prompts. Returns a note to print.
+    let edit = |doc: &mut toml_edit::DocumentMut| -> anyhow::Result<Option<String>> {
+        let was = parse(doc).ok();
+        let mut note = None;
+        match (&entry, &rest[..]) {
+            (Some(entry), _) => {
+                let name = catalog.as_deref().unwrap_or_default();
+                let old = (was.as_ref()).and_then(|c| c.mcp.iter().find(|m| m.name == name));
+                // Only this add's `--plain`: an old table's is no consent for this one (DESIGN §4.22).
+                if let Some(why) = entry.plain_needed(url.as_deref()).filter(|_| !plain) {
+                    bail!(
+                        "{why}: add --plain to hand it the real key, which the agent can then read"
+                    );
+                }
+                let m = crate::catalog::merged(entry.to_mcp(url.as_deref())?, old, &hosts, plain);
+                note = crate::catalog::lost_plain(old, &m).map(|n| format!("{name}: {n}"));
+                conf::upsert_mcp(doc, &m)?;
+            }
+            (None, [rm, name]) if rm == "rm" => {
+                if !conf::remove_mcp(doc, name) {
+                    bail!("no connector named {name}");
+                }
+            }
+            (None, [add, name]) if add == "add" => {
+                // D4: added again, a connector keeps the classes the owner gave its tools.
+                let existing = (was.as_ref()).and_then(|c| c.mcp.iter().find(|m| m.name == *name));
+                let classes = existing.map(|m| m.classes.clone()).unwrap_or_default();
+                // And where its secrets go, unless this call says.
+                let old = existing.cloned().unwrap_or_default();
+                let mut m = match (&url, command.split_first()) {
+                    (Some(_), Some(_)) => bail!("give --url or a command after --, not both"),
+                    (Some(url), None) => Mcp {
+                        name: name.clone(),
+                        url: Some(url.clone()),
+                        headers: headers.clone(),
+                        classes,
+                        ..Mcp::default()
+                    },
+                    (None, Some((cmd, args))) if headers.is_empty() => Mcp {
+                        name: name.clone(),
+                        command: Some(cmd.clone()),
+                        args: args.to_vec(),
+                        classes,
+                        ..Mcp::default()
+                    },
+                    (None, Some(_)) => bail!("--header goes with --url"),
+                    (None, None) => parse(doc)?
+                        .mcp
+                        .into_iter()
+                        .find(|m| m.name == *name)
+                        .with_context(|| format!("no connector named {name}\n{usage}"))?,
+                };
+                m.hosts = match hosts.is_empty() {
+                    true => old.hosts,
+                    false => hosts.join(", "),
+                };
+                m.secrets = match plain {
+                    true => Some("plain".into()),
+                    false => old.secrets,
+                };
+                // A remote connector can only hold its real secret (rpi's own client cannot use a
+                // stand-in, DESIGN §4.21), which the agent can then read: said here, not implied.
+                if crate::broker::undecided(&m) {
+                    bail!(
+                        "a remote connector's secret is handed to it as it is, where the agent can \
+                         read it (rpi's own client cannot use a stand-in): add --plain to accept that"
+                    );
+                }
+                conf::upsert_mcp(doc, &m)?;
+            }
+            _ => bail!("{usage}"),
+        }
+        let now = parse(doc)?;
+        // As `/set`: this may not make one secret a connector's own and another's stand-in.
+        // With no config that read before, the new one alone must hold none.
+        let made = match &was {
+            Some(was) => crate::broker::creates_pair(was, &now),
+            None => crate::broker::shared_notice(&now).map_or(Ok(()), Err),
+        };
+        made.map_err(anyhow::Error::msg)?;
+        Ok(note)
+    };
+    let mut doc = h.data.load()?;
+    let mut note = edit(&mut doc)?;
     if !secrets.is_empty() && !h.interactive {
         bail!("--secret asks for the value: run it in a terminal");
     }
+    if let Some(key) = (secrets.iter())
+        .find(|k| k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    {
+        bail!("--secret {key:?}: use a variable name (letters, digits, '_')");
+    }
+    // The catalog entry's secrets secrets.env lacks, asked for (or named).
+    let set = crate::dotenv::parse(&h.data.read("secrets.env").unwrap_or_default());
+    let wanted: Vec<&crate::catalog::Secret> = (entry.iter().flat_map(|e| &e.secrets))
+        .filter(|s| !set.iter().any(|(k, _)| *k == s.name) && !secrets.contains(&s.name))
+        .collect();
+    // Every value is asked before anything is written, so Ctrl-C at any prompt leaves every
+    // file as it was.
+    let mut values: Vec<(&str, String)> = Vec::new();
     for key in &secrets {
-        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            bail!("--secret {key:?}: use a variable name (letters, digits, '_')");
-        }
         let value = Password::new()
             .with_prompt(format!("{key} (hidden)"))
             .interact()?;
-        h.data.set_secret(key, value.trim())?;
+        values.push((key, value));
     }
     for s in &wanted {
         println!("{}: {}", s.name, s.help);
@@ -1064,7 +1108,20 @@ pub fn mcp(h: &Host, mut a: Args) -> anyhow::Result<()> {
         let value = Password::new()
             .with_prompt(format!("{} (hidden)", s.name))
             .interact()?;
-        h.data.set_secret(&s.name, value.trim())?;
+        values.push((&s.name, value));
+    }
+    // The secrets first, so the daemon never loads the connector before them; then zephyr.toml
+    // read again, edited and saved with no prompt between, so what the daemon wrote while the
+    // owner typed is kept.
+    for (key, value) in &values {
+        h.data.set_secret(key, value.trim())?;
+    }
+    if !values.is_empty() {
+        doc = h.data.load()?;
+        note = edit(&mut doc)?;
+    }
+    if let Some(note) = note {
+        println!("{note}");
     }
     h.data.save(&doc)?;
     // Which connectors came from the catalog, for doctor's note (DESIGN §4.22): the daemon's
@@ -1122,18 +1179,28 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
                  revoke NAME [PROGRAM] | add service cards --provider NAME [--account ID] | \
                  add service calls --provider telnyx --account CONNECTION_ID --from +1NUMBER \
                  --public-key KEY";
-    let text = match h.data.read(crate::vault::FILE) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        r => r?,
+    // Read again after a prompt: the daemon writes this file too (a grant, a bind), and what it
+    // wrote while the owner typed must not be undone.
+    let read = || -> anyhow::Result<Vault> {
+        let text = match h.data.read(crate::vault::FILE) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            r => r?,
+        };
+        Vault::parse(&text)
     };
-    let mut vault = Vault::parse(&text)?;
-    let mut lines = std::io::stdin().lines();
-    let mut secret = |prompt: &str| -> anyhow::Result<String> {
+    let mut vault = read()?;
+    // A line at a time: a `lines()` kept across the prompt would hold stdin's lock, which the
+    // terminal prompt then waits on forever.
+    let secret = |prompt: &str| -> anyhow::Result<String> {
         if h.interactive {
             let p = Password::new().with_prompt(format!("{prompt} (hidden)"));
             return Ok(p.allow_empty_password(true).interact()?);
         }
-        Ok(lines.next().transpose()?.unwrap_or_default())
+        Ok(std::io::stdin()
+            .lines()
+            .next()
+            .transpose()?
+            .unwrap_or_default())
     };
     let args: Vec<&str> = rest.iter().map(String::as_str).collect();
     let said = match args[..] {
@@ -1156,6 +1223,7 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
                 true => secret("TOTP seed (BASE32)")?,
                 false => String::new(),
             };
+            vault = read()?;
             vault.put(Entry {
                 kind: Kind::Login,
                 name: name.into(),
@@ -1182,6 +1250,7 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
                     .map(String::from)
                     .collect();
             }
+            vault = read()?;
             vault.put(Entry {
                 kind: Kind::Token,
                 name: name.into(),
@@ -1209,6 +1278,7 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
             // Given fields go onto the saved service, so `add service calls` alone rotates the key.
             let provider = provider.unwrap_or_default();
             let key = secret(&format!("{name} API key, empty for none or to keep it"))?;
+            vault = read()?;
             vault.put_service(crate::vault::Service {
                 name: name.into(),
                 provider,
@@ -1221,22 +1291,32 @@ pub fn vault(h: &Host, mut a: Args) -> anyhow::Result<()> {
             format!("saved the {name} service ({provider}); only zephyr's own client reads it")
         }
         ["edit", name] => {
-            let mut e = vault
-                .get(name)
-                .with_context(|| format!("no entry named {name} in the vault"))?;
+            let missing = || format!("no entry named {name} in the vault");
+            let kind = vault.get(name).with_context(missing)?.kind;
             // An empty answer keeps what is saved.
-            match e.kind {
+            let (value, seed) = match kind {
+                Kind::Login => (
+                    secret("new password, empty keeps it")?,
+                    match totp {
+                        true => secret("new TOTP seed, empty keeps it")?,
+                        false => String::new(),
+                    },
+                ),
+                Kind::Token => (secret("new value, empty keeps it")?, String::new()),
+            };
+            vault = read()?;
+            let mut e = (vault.get(name))
+                .filter(|e| e.kind == kind)
+                .with_context(missing)?;
+            match kind {
                 Kind::Login => {
                     e.site = site.unwrap_or(e.site);
                     e.username = user.unwrap_or(e.username);
-                    e.password = secret("new password, empty keeps it")?;
-                    e.totp = match totp {
-                        true => secret("new TOTP seed, empty keeps it")?,
-                        false => String::new(),
-                    };
+                    e.password = value;
+                    e.totp = seed;
                 }
                 Kind::Token => {
-                    e.value = secret("new value, empty keeps it")?;
+                    e.value = value;
                     // None given keeps the ones saved.
                     e.hosts = hosts;
                     e.headers = headers;

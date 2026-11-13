@@ -1474,13 +1474,12 @@ pub fn main(cmd: &str, args: Vec<String>) -> anyhow::Result<()> {
                         eprintln!("warn: {key} is not a known setting; saved without checking");
                     }
                     let was = toml::from_str::<crate::config::Config>(&doc.to_string()).ok();
-                    // A connector's rows (`mcp.NAME.hosts`, `.secrets`, `.enabled`, a tool's
-                    // class) are in its `[[mcp]]` table, which only the registry finds by name.
-                    match crate::settings::find(key).filter(|_| key.starts_with("mcp.")) {
-                        Some(s) => {
-                            let parsed = crate::settings::parse(s, value)
-                                .map_err(|e| anyhow::anyhow!("{}", e.replace(s.key, key)))?;
-                            crate::settings::write(&mut doc, key, Some(&parsed))?;
+                    // A registered key gets the daemon's own edit (`settings::edit_doc`); a time
+                    // limit it set and this changes is not put back (`Router::revert_due`).
+                    match crate::settings::find(key) {
+                        Some(_) => {
+                            let edit = crate::settings::Edit::default();
+                            crate::settings::edit_doc(&mut doc, key, value, &edit)?;
                         }
                         None => conf::set(&mut doc, key, value)?,
                     }

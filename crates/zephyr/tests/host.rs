@@ -438,8 +438,15 @@ while time.time() < deadline:
         if i >= 0:
             at = i + len(prompt)
             time.sleep(0.2)
+            # The daemon's edits while the owner answers this prompt (`pty_edits`).
+            for p, path, text in json.loads(os.environ.get("PTY_EDITS", "[]")):
+                if p == prompt:
+                    with open(path, "a") as f:
+                        f.write(text)
             os.write(fd, keys.encode())
             steps.pop(0)
+if time.time() >= deadline:
+    os.kill(pid, 9)  # hung: fail the test, never wait on it
 _, status = os.waitpid(pid, 0)
 print(seen)
 print("LEFT", len(steps))
@@ -652,6 +659,53 @@ fn init_again_on_a_configured_install_changes_nothing() {
     assert_eq!(count(&["docker", "restart"]), 1, "{calls:#?}");
     // The `up` init always starts with, and none after it.
     assert_eq!(count(RUN), 1, "{calls:#?}");
+}
+
+/// Interactive init reads zephyr.toml again after the failover order and the approvals
+/// prompts: what the daemon wrote while the owner chose is kept.
+#[test]
+fn init_keeps_what_the_daemon_wrote_during_its_prompts() {
+    let env = Env::new("init-prompt-edits");
+    configure_an_install(&env);
+    let toml = env.daemon().join("zephyr.toml");
+    let text = env
+        .config()
+        .replace("\n[approvals]\npreset = \"semi\"\n", "\n");
+    std::fs::write(&toml, text).unwrap();
+    let edits = pty_edits(&[
+        ("Failover order", &toml, "\n[tasks]\nparallel = 3\n"),
+        (
+            "Approvals: how much",
+            &toml,
+            "\n[budget]\ndaily_tokens = 1234\n",
+        ),
+    ]);
+    let (_, shown) = env.on_a_driven_tty_env(
+        &["init"],
+        &[
+            ("Projects folder", "\n"),
+            ("Providers", "\n"),
+            ("Add another", "\n"),
+            ("Add another", "\n"),
+            ("Failover order", "\n"),
+            ("Change the discord channel?", "\n"),
+            ("Change the imessage channel?", "\n"),
+            ("Set up telegram?", "\n"),
+            ("Set up signal?", "\n"),
+            ("Approvals: how much", "\n"),
+            ("Add private facts", "\n"),
+            ("Change the web app?", "\n"),
+        ],
+        &[("PTY_EDITS", &edits)],
+    );
+    assert!(
+        shown.contains("LEFT 0"),
+        "every prompt was answered: {shown}"
+    );
+    let config = env.config();
+    assert!(config.contains("parallel = 3"), "{config}");
+    assert!(config.contains("daily_tokens = 1234"), "{config}");
+    assert!(config.contains("preset = \"manual\""), "{config}");
 }
 
 /// A port init added (the iMessage webhook) is published by making the container again: a
@@ -893,6 +947,97 @@ fn init_again_with_a_preset_drops_looser_hand_set_classes() {
     );
     assert!(!config.contains("money ="), "looser than manual: {config}");
     assert!(config.contains("posts = \"ask\""), "as strict: {config}");
+}
+
+/// `mcp add` with a secret asked at a prompt.
+const MCP_ADD: [&str; 7] = [
+    "mcp",
+    "add",
+    "mail",
+    "--secret",
+    "MAIL_KEY",
+    "--",
+    "mail-server",
+];
+
+/// `PTY_EDITS` for `on_a_driven_tty_env`: at each prompt, `text` appended to `path`.
+fn pty_edits(edits: &[(&str, &Path, &str)]) -> String {
+    let edits: Vec<(&str, String, &str)> = (edits.iter())
+        .map(|(p, path, text)| (*p, path.display().to_string(), *text))
+        .collect();
+    serde_json::to_string(&edits).unwrap()
+}
+
+/// Ctrl-C at a secret's prompt leaves every file as it was: nothing is written until every
+/// answer is in.
+#[test]
+fn a_cancelled_secret_prompt_saves_nothing() {
+    let env = Env::new("prompt-cancel");
+    env.init(&["--no-start"]);
+    let read = |name: &str| std::fs::read_to_string(env.daemon().join(name)).ok();
+    let before = (read("zephyr.toml"), read("secrets.env"));
+    let (code, out) = env.on_a_driven_tty(&MCP_ADD, &[("MAIL_KEY (hidden)", "\x03")]);
+    assert_ne!(code, 0, "{out}");
+    assert_eq!((read("zephyr.toml"), read("secrets.env")), before, "{out}");
+}
+
+/// The secret is saved before the connector that uses it: the daemon never reloads a
+/// zephyr.toml naming a secret secrets.env does not hold yet, or a new command with an old value.
+#[test]
+fn mcp_add_saves_the_secret_before_the_connector() {
+    let env = Env::new("prompt-order");
+    env.init(&["--no-start"]);
+    env.split();
+    env.calls();
+    let (code, out) = env.on_a_driven_tty(&MCP_ADD, &[("MAIL_KEY (hidden)", "s3cret\r")]);
+    env.unsplit();
+    assert_eq!(code, 0, "{out}");
+    let puts: Vec<String> = (env.calls().into_iter())
+        .filter(|c| c.contains(&"__file".to_string()) && c.contains(&"put".to_string()))
+        .map(|c| c.last().unwrap().clone())
+        .collect();
+    assert_eq!(puts, ["secrets.env", "zephyr.toml"], "{out}");
+}
+
+/// The daemon may write zephyr.toml or vault.toml while the owner types a secret: what it
+/// wrote meanwhile is kept, not undone by a copy read before the prompt.
+#[test]
+fn an_edit_made_while_a_secret_is_typed_survives() {
+    let env = Env::new("prompt-edit");
+    env.init(&["--no-start"]);
+    let toml = env.daemon().join("zephyr.toml");
+    let edits = pty_edits(&[("MAIL_KEY (hidden)", &toml, "\n[tasks]\nparallel = 3\n")]);
+    let (code, out) = env.on_a_driven_tty_env(
+        &MCP_ADD,
+        &[("MAIL_KEY (hidden)", "s3cret\r")],
+        &[("PTY_EDITS", &edits)],
+    );
+    assert_eq!(code, 0, "{out}");
+    let config = env.config();
+    assert!(config.contains("parallel = 3"), "{config}");
+    assert!(config.contains("\"mail-server\""), "{config}");
+
+    let vault = env.daemon().join("vault.toml");
+    let token = "[[token]]\nname = \"GH_TOKEN\"\nvalue = \"ghp_x\"\n";
+    let edits = pty_edits(&[("password for github (hidden)", &vault, token)]);
+    let (code, out) = env.on_a_driven_tty_env(
+        &[
+            "vault",
+            "add",
+            "login",
+            "github",
+            "--site",
+            "https://github.com",
+        ],
+        &[("password for github (hidden)", "hunter22\r")],
+        &[("PTY_EDITS", &edits)],
+    );
+    assert_eq!(code, 0, "{out}");
+    let list = env.ok(&["vault", "list"]);
+    assert!(
+        list.contains("token GH_TOKEN") && list.contains("login github"),
+        "{list}"
+    );
 }
 
 /// D4: adding a connector again (a new URL or command) keeps the classes the owner gave its
@@ -1893,6 +2038,107 @@ fn login_feeds_secrets_on_stdin_and_records_the_account() {
         .success());
 }
 
+/// What `init` and `login` are given is checked before anything is written or signed in: a
+/// model not PROVIDER/MODEL, a provider zephyr does not know. An account already in the file
+/// keeps its name, and an error never repeats a pasted value.
+#[test]
+fn init_and_login_check_what_they_are_given_first() {
+    let env = Env::new("check-first");
+    env.init(&["--no-start"]);
+    env.calls();
+    let out = env.zephyr(&["login", "anthropic", "--model", "sonnet"]);
+    assert!(!out.status.success(), "{out:?}");
+    let accounts = std::fs::read_dir(env.data().join("accounts")).map_or(0, |d| d.count());
+    assert_eq!(accounts, 0, "no account folder");
+    assert!(
+        !env.calls().iter().any(|c| c.contains(&"auth".to_string())),
+        "no sign-in"
+    );
+
+    let host = || std::fs::read_to_string(env.daemon().join("host.toml")).unwrap();
+    let before = (host(), env.config());
+    let projects = env.dir.join("elsewhere");
+    std::fs::create_dir_all(&projects).unwrap();
+    let projects = projects.display().to_string();
+    let init = |account: &str| {
+        env.zephyr(&[
+            "init",
+            "--non-interactive",
+            "--no-start",
+            "--projects",
+            &projects,
+            "--network",
+            "host",
+            "--account",
+            account,
+        ])
+    };
+    for account in [
+        "a=nomodel",
+        "a=nope/model",
+        CLAUDE_TOKEN,
+        &format!("{CLAUDE_TOKEN}=claude-code/claude-sonnet-5"),
+    ] {
+        let out = init(account);
+        assert!(!out.status.success(), "{account}: {out:?}");
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(!said.contains(CLAUDE_TOKEN), "{said}");
+        assert_eq!((host(), env.config()), before, "{account}: nothing written");
+    }
+
+    // A name from before the daemon's rule (as `/login` names one today) is still that account's.
+    let text = env.config().replace(
+        "[owners]",
+        "[[account]]\nname = \"claude_max.2\"\nmodel = \"claude-code/claude-sonnet-5\"\n\n[owners]",
+    );
+    std::fs::write(env.daemon().join("zephyr.toml"), text).unwrap();
+    let out = init("claude_max.2=claude-code/claude-opus-5");
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        env.config().contains("claude-code/claude-opus-5"),
+        "{}",
+        env.config()
+    );
+}
+
+/// An account name the daemon would refuse is refused before anything is signed in or written.
+#[test]
+fn login_and_init_refuse_a_bad_account_name_and_write_nothing() {
+    let env = Env::new("login-bad-name");
+    env.init(&["--no-start"]);
+    let before = env.config();
+    env.calls();
+    let out = env.zephyr_env(
+        &[
+            "login",
+            "claude-code",
+            "--account",
+            "work@home",
+            "--model",
+            "claude-code/claude-sonnet-5",
+        ],
+        &[("CLAUDE_CODE_OAUTH_TOKEN", CLAUDE_TOKEN)],
+    );
+    assert!(!out.status.success(), "{out:?}");
+    assert!(!env.data().join("accounts/work@home").exists());
+    assert!(!env
+        .calls()
+        .iter()
+        .any(|c| c.contains(&"script".to_string())));
+    let projects = env.projects.display().to_string();
+    let out = env.zephyr(&[
+        "init",
+        "--non-interactive",
+        "--no-start",
+        "--projects",
+        &projects,
+        "--account",
+        "work@home=claude-code/claude-sonnet-5",
+    ]);
+    assert!(!out.status.success(), "{out:?}");
+    assert_eq!(env.config(), before);
+}
+
 #[test]
 fn accounts_model_and_config_edit_the_toml() {
     let env = Env::new("edit");
@@ -2058,6 +2304,73 @@ fn config_set_while_stopped_edits_the_file_as_before() {
         .calls()
         .iter()
         .any(|c| c.contains(&"set".to_string()) && c.contains(&"zephyr".to_string())));
+}
+
+/// With the container stopped, a registered key is read by its kind as `/set` reads it, and a
+/// preset drops the hand-set classes looser than it, as `/approvals` does.
+#[test]
+fn config_set_while_stopped_reads_a_registered_key_by_its_kind() {
+    let env = Env::new("config-stopped-kinds");
+    env.init(&["--no-start", "--preset", "full"]);
+    let stopped = [("SHIM_STATE", "exited")];
+    let set = |key: &str, value: &str| {
+        let out = env.zephyr_env(&["config", "set", key, value], &stopped);
+        assert!(out.status.success(), "{key} = {value}: {out:?}");
+    };
+    set("approvals.messages", "auto");
+    set("approvals.posts", "ask");
+    set("approvals.preset", "manual");
+    set("review.at", "07:30");
+    set("approvals.strong_only", "loosen,money");
+    set("budget.daily_tokens", "7000");
+    set("budget.daily_tokens", "none");
+    let config = env.config();
+    assert!(config.contains("preset = \"manual\""), "{config}");
+    assert!(
+        !config.contains("messages ="),
+        "looser than manual: {config}"
+    );
+    assert!(config.contains("posts = \"ask\""), "as strict: {config}");
+    assert!(config.contains("at = \"07:30\""), "{config}");
+    assert!(
+        config.contains("strong_only = [\"loosen\", \"money\"]"),
+        "{config}"
+    );
+    assert!(!config.contains("daily_tokens"), "{config}");
+}
+
+/// With the container stopped, `config set model` edits what `/model` edits: the model of the
+/// account on that provider, moved first, never a top-level `model` the pool ignores.
+#[test]
+fn config_set_model_while_stopped_moves_the_accounts_model() {
+    let env = Env::new("config-stopped-model");
+    env.init(&[
+        "--no-start",
+        "--account",
+        "claude-a=anthropic/claude-sonnet-5",
+        "--account",
+        "codex-a=openai-codex/gpt-5.5",
+    ]);
+    let out = env.zephyr_env(
+        &["config", "set", "model", "openai-codex/gpt-5.4"],
+        &[("SHIM_STATE", "exited")],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let cfg: toml::Value = toml::from_str(&env.config()).unwrap();
+    let accounts: Vec<(&str, &str)> = cfg["account"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| (a["name"].as_str().unwrap(), a["model"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        accounts,
+        [
+            ("codex-a", "openai-codex/gpt-5.4"),
+            ("claude-a", "anthropic/claude-sonnet-5")
+        ]
+    );
+    assert!(cfg.get("model").is_none(), "{cfg}");
 }
 
 /// A connector's rows (`mcp.NAME.hosts`, `.secrets`, `.enabled`) live in its `[[mcp]]` table:
