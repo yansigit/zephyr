@@ -1330,12 +1330,12 @@ fn git_cmd(dir: &Path, args: &[&str]) -> Command {
             "core.hooksPath=/dev/null",
             "-c",
             "core.fsmonitor=false",
-            // An automatic gc stays in the call, under its timeout and the memory lock, never
-            // daemonized out of the process group the timeout kills.
+            // No automatic gc or maintenance: one could detach out of the process group the
+            // timeout kills, or run past `GIT_TIMEOUT` in the call. `/memory squash` runs its own.
             "-c",
-            "gc.autoDetach=false",
+            "gc.auto=0",
             "-c",
-            "maintenance.autoDetach=false",
+            "maintenance.auto=false",
         ])
         .arg("-C")
         .arg(dir)
@@ -1594,16 +1594,17 @@ mod tests {
     }
 
     #[test]
-    fn git_never_detaches_a_gc_whatever_the_repo_says() {
+    fn a_commit_never_runs_an_automatic_gc_whatever_the_repo_says() {
         let home = home();
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
-        for key in ["gc.autoDetach", "maintenance.autoDetach"] {
-            git(&dir(&home), &["config", key, "true"]).unwrap();
-            assert_eq!(
-                git(&dir(&home), &["config", "--get", key]).unwrap(),
-                "false"
-            );
+        git(&dir(&home), &["config", "gc.auto", "1"]).unwrap();
+        // Enough loose objects that a gc would surely start.
+        for i in 0..3000 {
+            std::fs::write(dir(&home).join(format!("notes/{i}.md")), format!("{i}\n")).unwrap();
         }
+        settle(&home);
+        let objects = git(&dir(&home), &["count-objects", "-v"]).unwrap();
+        assert!(objects.lines().any(|l| l == "packs: 0"), "{objects}");
     }
 
     #[test]
