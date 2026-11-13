@@ -1032,7 +1032,7 @@ that the agent's tools are set up to trust (`zephyr doctor` lists the hosts and 
 program that brings its own roots or pins certificates fails there at once, and nothing leaks.
 For such a program mark the token `raw`, or bind it to a host that program does not use. If one
 that used to work fails after a long uptime, restart with `zephyr up`: the CA is renewed only
-when the container starts. Never bind a token to a model provider's host: the agent's own
+when the container starts, and zephyr tells you once a day in its last 30 days. Never bind a token to a model provider's host: the agent's own
 connection to the provider would stop.
 
 Names: a login is lowercase (`github`, `my-bank`), a token is an environment variable name

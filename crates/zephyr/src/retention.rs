@@ -15,6 +15,26 @@ pub const AGE: Duration = Duration::from_secs(30 * 24 * 3600);
 /// How old a settled row of state.db must be before it goes.
 const DB_AGE: Duration = Duration::from_secs(90 * 24 * 3600);
 
+/// The `meta` key holding when the owner was last told the CA is near its end.
+const CA_TOLD: &str = "ca_told_at";
+
+/// Under the floor, while the token broker's CA has under 30 days left (DESIGN §4.21): it is
+/// renewed only at a container start, so the owner is told to run `zephyr up`, at most once a
+/// day. Returns whether it told.
+pub fn ca_notice(cfg: &Config, store: &Store, now: i64) -> rusqlite::Result<bool> {
+    let Ok(days) = crate::ca::days_left(cfg.state_dir(), now) else {
+        return Ok(false);
+    };
+    let told = store.meta(CA_TOLD)?.and_then(|t| t.parse::<i64>().ok());
+    if !crate::broker::on(cfg) || days >= 30 || told.is_some_and(|t| now - t < 86_400) {
+        return Ok(false);
+    }
+    let text = format!("[zephyr] the token broker's CA has {days} days left: run zephyr up");
+    store.notify_last_owner(&text)?;
+    store.set_meta(CA_TOLD, Some(&now.to_string()))?;
+    Ok(true)
+}
+
 /// One sweep, as the agent (whose files these are). Returns how many files went.
 pub fn sweep(cfg: &Config, store: &Store, age: Duration) -> rusqlite::Result<usize> {
     let open = store.tasks(0)?; // queued or running, a resume included
@@ -44,6 +64,9 @@ pub fn sweep(cfg: &Config, store: &Store, age: Duration) -> rusqlite::Result<usi
         Ok(false) => {}
         Ok(true) => eprintln!("zephyr: backed up state.db and the config files"),
         Err(e) => eprintln!("zephyr: backing up state.db failed: {e:#}"),
+    }
+    if let Err(e) = ca_notice(cfg, store, crate::now()) {
+        eprintln!("zephyr: telling the owner of the CA's end failed: {e}");
     }
     match sweep_copies(cfg, store) {
         Ok(0) => {}
@@ -501,6 +524,50 @@ mod tests {
         let before = std::fs::metadata(&db).unwrap().modified().unwrap();
         assert!(!backup(&cfg, &store).unwrap());
         assert_eq!(std::fs::metadata(&db).unwrap().modified().unwrap(), before);
+    }
+
+    /// The broker's CA is renewed only at a container start: under 30 days left, the owner is
+    /// told to run `zephyr up`, at most once a day.
+    #[test]
+    fn a_ca_near_its_end_is_told_to_the_owner_once_a_day() {
+        let home = crate::test_dir("retention-ca");
+        let mut cfg: Config = toml::from_str(&format!("rpi = '/r'\nhome = {home:?}\n")).unwrap();
+        cfg.floor = true;
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let said = crate::channel::Inbound {
+            channel: "discord".into(),
+            platform_msg_id: "m1".into(),
+            sender: "owner-1".into(),
+            text: "hi".into(),
+            derived: None,
+            sent_at: None,
+        };
+        store.insert_inbox(&said).unwrap();
+        let row = store.inbox_with_status("new").unwrap().remove(0);
+        store.mark_dispatched_as(row.id, "prompt").unwrap();
+        let told = || {
+            let rows = store.pending_outbox().unwrap();
+            (rows.iter())
+                .filter(|r| r.text.contains("the token broker's CA has"))
+                .map(|r| r.text.clone())
+                .collect::<Vec<_>>()
+        };
+        let made = crate::now();
+        // No CA (host networking, or before supervise made one): nothing to say.
+        assert!(!ca_notice(&cfg, &store, made).unwrap());
+        crate::ca::ensure(cfg.state_dir(), made).unwrap();
+        let left = crate::ca::days_left(cfg.state_dir(), made).unwrap();
+        assert!(!ca_notice(&cfg, &store, made).unwrap(), "a year left");
+        let late = made + (left - 20) * 86_400;
+        assert!(ca_notice(&cfg, &store, late).unwrap());
+        assert_eq!(
+            told(),
+            ["[zephyr] the token broker's CA has 20 days left: run zephyr up"]
+        );
+        assert!(!ca_notice(&cfg, &store, late + 3600).unwrap(), "once a day");
+        assert!(ca_notice(&cfg, &store, late + 86_400).unwrap());
+        assert_eq!(told().len(), 2);
     }
 
     #[test]
