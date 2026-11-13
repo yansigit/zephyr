@@ -140,9 +140,18 @@ return JSON.stringify({{
 /// A buffer that holds a card value: allocated once at its full size, so it never moves (and
 /// leaves no copy behind), and wiped when dropped, so a fill whose future is dropped wipes it
 /// too.
-struct Secret(String);
+pub(crate) struct Secret(String);
 
 impl Secret {
+    /// Takes `value` as it is (no copy is made), to be wiped when dropped.
+    pub(crate) fn new(value: String) -> Secret {
+        Secret(value)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
     fn with_capacity(n: usize) -> Secret {
         Secret(String::with_capacity(n))
     }
@@ -402,89 +411,119 @@ fn active_tab(listing: &str, site: &str) -> Result<String, String> {
 }
 
 impl Frames {
-    /// Connects to the agent's Chromium and attaches to each frame on a listed origin whose
-    /// parent is the tab agent-browser is on, a page on `site`. A frame that cannot be attached
-    /// is left out. Only a prefilter: a target's address may be one it is leaving, so each
-    /// frame's own answer is what [`Frames::find`] decides on.
+    /// Connects to the agent's Chromium and finds the frames of the tab agent-browser is on
+    /// ([`Frames::discover`]).
     pub async fn open(cfg: &Config, site: &str) -> Result<Frames, String> {
         bounded(async {
-            let looked = |e: String| format!("the page's frames could not be looked into: {e}");
-            let tab = crate::vault::browser(cfg, &["tab", "list", "--json"])
-                .await
-                .map_err(looked)?;
-            let tab = active_tab(&tab, site)?;
             let url = crate::vault::browser(cfg, &["get", "cdp-url"])
                 .await
-                .map_err(looked)?;
-            let mut cdp = Cdp::connect(url.trim()).await?;
-            let targets = cdp.call("Target.getTargets", json!({}), None).await?;
-            let all = targets["targetInfos"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let on = |t: &Value| crate::vault::origin(t["url"].as_str().unwrap_or_default());
-            let page = all.iter().any(|t| {
-                t["type"] == "page"
-                    && t["targetId"] == tab.as_str()
-                    && on(t).is_some_and(|o| o.ascii_serialization() == site)
-            });
-            if !page {
-                return Err(format!("the tab agent-browser is on is not on {site}"));
-            }
-            let ids: Vec<String> = (all.iter())
-                .filter(|t| t["type"] == "iframe" && t["parentFrameId"] == tab.as_str())
-                .filter(|t| on(t).is_some_and(|o| listed(&o.ascii_serialization())))
-                .filter_map(|t| t["targetId"].as_str().map(String::from))
-                .collect();
-            let mut frames = Vec::new();
-            for id in ids {
-                let attach = json!({"targetId": id, "flatten": true});
-                let Ok(attached) = cdp.call("Target.attachToTarget", attach, None).await else {
-                    continue;
-                };
-                let session = attached["sessionId"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
-                // An isolated world: the frame's own scripts cannot have changed what this one
-                // reads (its prototypes, `Array.from`).
-                let world = json!({"frameId": id, "worldName": "zephyr-card"});
-                let Ok(world) = cdp
-                    .call("Page.createIsolatedWorld", world, Some(&session))
-                    .await
-                else {
-                    continue;
-                };
-                if let Some(world) = world["executionContextId"].as_i64() {
-                    frames.push(Frame { session, world });
-                }
-            }
-            Ok(Frames {
-                cdp,
+                .map_err(|e| format!("the page's frames could not be looked into: {e}"))?;
+            let mut frames = Frames {
+                cdp: Cdp::connect(url.trim()).await?,
                 site: site.to_string(),
-                frames,
-            })
+                frames: Vec::new(),
+            };
+            frames.discover(cfg).await?;
+            Ok(frames)
         })
         .await
     }
 
+    /// Attaches, on this session, to each frame on a listed origin whose parent is the tab
+    /// agent-browser is on, a page on the card's site, in place of the frames found before
+    /// (those are let go). A frame that cannot be attached is left out. Only a prefilter: a
+    /// target's address may be one it is leaving, so each frame's own answer is what
+    /// [`Frames::find`] decides on.
+    async fn discover(&mut self, cfg: &Config) -> Result<(), String> {
+        let site = self.site.clone();
+        for old in std::mem::take(&mut self.frames) {
+            let detach = json!({"sessionId": old.session});
+            let _ = self.cdp.call("Target.detachFromTarget", detach, None).await;
+        }
+        let tab = crate::vault::browser(cfg, &["tab", "list", "--json"])
+            .await
+            .map_err(|e| format!("the page's frames could not be looked into: {e}"))?;
+        let tab = active_tab(&tab, &site)?;
+        let targets = self.cdp.call("Target.getTargets", json!({}), None).await?;
+        let all = targets["targetInfos"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let on = |t: &Value| crate::vault::origin(t["url"].as_str().unwrap_or_default());
+        let page = all.iter().any(|t| {
+            t["type"] == "page"
+                && t["targetId"] == tab.as_str()
+                && on(t).is_some_and(|o| o.ascii_serialization() == site)
+        });
+        if !page {
+            return Err(format!("the tab agent-browser is on is not on {site}"));
+        }
+        let ids: Vec<String> = (all.iter())
+            .filter(|t| t["type"] == "iframe" && t["parentFrameId"] == tab.as_str())
+            .filter(|t| on(t).is_some_and(|o| listed(&o.ascii_serialization())))
+            .filter_map(|t| t["targetId"].as_str().map(String::from))
+            .collect();
+        for id in ids {
+            let attach = json!({"targetId": id, "flatten": true});
+            let Ok(attached) = self.cdp.call("Target.attachToTarget", attach, None).await else {
+                continue;
+            };
+            let session = attached["sessionId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            // An isolated world: the frame's own scripts cannot have changed what this one
+            // reads (its prototypes, `Array.from`).
+            let world = json!({"frameId": id, "worldName": "zephyr-card"});
+            let made = self
+                .cdp
+                .call("Page.createIsolatedWorld", world, Some(&session));
+            let Ok(world) = made.await else {
+                continue;
+            };
+            if let Some(world) = world["executionContextId"].as_i64() {
+                self.frames.push(Frame { session, world });
+            }
+        }
+        Ok(())
+    }
+
+    /// Asks every frame about `selector`: the frames whose document holds it, and whether any
+    /// could not be asked.
+    async fn look(&mut self, probe: &str) -> (Vec<(usize, Facts)>, bool) {
+        let (mut holding, mut failed) = (Vec::new(), false);
+        for (i, frame) in self.frames.iter().enumerate() {
+            let said = self.cdp.eval(&frame.session, frame.world, probe).await;
+            let Some(facts) = said
+                .ok()
+                .and_then(|s| serde_json::from_str::<Facts>(&s).ok())
+            else {
+                failed = true;
+                continue;
+            };
+            if facts.field != "missing" {
+                holding.push((i, facts));
+            }
+        }
+        (holding, failed)
+    }
+
     /// The one frame whose own document holds `selector`, and its origin: `Ok(None)` when no
-    /// frame does. A frame that cannot be asked is passed over; two that hold it, or one that
+    /// frame does. When none holds it, or a frame could not be asked, the tab's frames are
+    /// found again (a processor may mount a field's frame late, or remount one) and asked once
+    /// more. A frame that still cannot be asked is passed over; two that hold it, or one that
     /// fails [`judge`] (another origin, a nested one, a top elsewhere), refuse the field.
-    pub async fn find(&mut self, selector: &str) -> Result<Option<(usize, String)>, String> {
+    pub async fn find(
+        &mut self,
+        cfg: &Config,
+        selector: &str,
+    ) -> Result<Option<(usize, String)>, String> {
         let probe = probe_script(selector);
         bounded(async {
-            let mut holding: Vec<(usize, Facts)> = Vec::new();
-            for (i, frame) in self.frames.iter().enumerate() {
-                let Ok(said) = self.cdp.eval(&frame.session, frame.world, &probe).await else {
-                    continue;
-                };
-                let Ok(facts) = serde_json::from_str::<Facts>(&said) else {
-                    continue;
-                };
-                if facts.field != "missing" {
-                    holding.push((i, facts));
-                }
+            let (mut holding, failed) = self.look(&probe).await;
+            if holding.is_empty() || failed {
+                self.discover(cfg).await?;
+                holding = self.look(&probe).await.0;
             }
             if holding.len() > 1 {
                 return Err("that selector matches a field in more than one payment frame".into());

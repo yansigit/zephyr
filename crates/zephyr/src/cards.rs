@@ -1542,22 +1542,24 @@ async fn fill(cfg: &Arc<Config>, id: i64, fields: CardFields) -> String {
     let mut last = page.clone();
     for (label, sel) in selectors {
         let Some(sel) = sel else { continue };
-        let Some(mut value) = value(label) else {
+        // Wiped when dropped, so a fill stopped mid-field leaves no copy either.
+        let Some(value) = value(label).map(crate::cards_frame::Secret::new) else {
             return format!("not filled: card #{id} has no {label}; leave `{label}` out");
         };
-        let mut typed = crate::vault::type_into(cfg, &card.origin, sel, &value).await;
+        let mut typed = crate::vault::type_into(cfg, &card.origin, sel, value.as_str()).await;
         let framed = typed == Typed::Missing;
         if framed {
             // Not in the page's own document: a payment processor's frame directly in it.
-            typed = in_frame(cfg, &mut frames, &card.origin, sel, &value, &mut inside).await;
+            let value = value.as_str();
+            typed = in_frame(cfg, &mut frames, &card.origin, sel, value, &mut inside).await;
         }
-        crate::vault::wipe_str(&mut value);
+        drop(value);
         if let Typed::Moved(on) = &typed {
             return moved(&done, on);
         }
-        // A frame that is gone may be one whose checkout left: then the card closes, as when
-        // the page's own document moves.
-        if framed && matches!(typed, Typed::Failed(_)) {
+        // A field no frame took (gone, refused, not found) may be one whose checkout left:
+        // then the card closes, as when the page's own document moves.
+        if framed && typed != Typed::Ok {
             let now = crate::vault::page_now(cfg).await;
             if !now.as_ref().is_some_and(on_site) {
                 let on = (now.as_deref())
@@ -1636,7 +1638,7 @@ async fn in_frame(
     let Some(frames) = frames.as_mut() else {
         return Typed::Missing;
     };
-    match frames.find(selector).await {
+    match frames.find(cfg, selector).await {
         Ok(None) => Typed::Missing,
         Err(why) => Typed::Failed(format!("not typed: {why}")),
         Ok(Some((at, origin))) => {
