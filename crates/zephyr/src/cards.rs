@@ -1377,6 +1377,7 @@ pub fn command(
                 let from = ["waiting", "open", "charging", "closing", "unknown"];
                 match store.move_card(card.id, &from, "closed", now) {
                     Ok(true) => {
+                        fills::stop(cfg.state_dir(), card.id);
                         live::forget(cfg.state_dir(), card.id, now);
                         audit(cfg, store, &card, "close", "the owner deleted it");
                         format!("[zephyr] card #{} is closed", card.id)
@@ -2870,6 +2871,20 @@ mod tests {
         };
         let id = store.add_card(&new).unwrap();
         (cfg, store, id)
+    }
+
+    /// `/card done N` on a hand-made card closes it as every other close does: a fill in hand
+    /// stops before it types the rest of the fields.
+    #[tokio::test]
+    async fn done_on_a_hand_made_card_stops_its_fill() {
+        let (cfg, store, id) = manual_card("cards-done-fill");
+        let stop = fills::start(cfg.state_dir(), id);
+        let said = command(&cfg, &store, &format!("/card done {id}"), "", true);
+        assert_eq!(said, Some(format!("[zephyr] card #{id} is closed")));
+        let wait = std::time::Duration::from_millis(200);
+        let stopped = tokio::time::timeout(wait, stop.notified()).await;
+        fills::end(cfg.state_dir(), id, &stop);
+        assert!(stopped.is_ok(), "the fill in hand was not stopped");
     }
 
     /// At a start no number is kept and every card was just closed: the flag a daemon before
