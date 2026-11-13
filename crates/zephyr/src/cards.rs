@@ -1060,7 +1060,7 @@ async fn issue_card(
         if let Err(e) = db.get().card_reclose(id, reference, now) {
             eprintln!("zephyr: recording card #{id}'s close failed: {e}");
         }
-        let _ = poll_due(cfg, id);
+        poll_now(cfg, id);
         let said = close_at_issuer(cfg, &mut card).await;
         say(cfg, card, Word::Closed(LANDED.into(), said));
         return Err(format!("card #{id} was not issued: {LANDED}"));
@@ -1759,7 +1759,7 @@ pub fn ask_close(cfg: &Arc<Config>, store: &Store, card: Card, why: &str) {
     fills::stop(cfg.state_dir(), card.id);
     live::forget(cfg.state_dir(), card.id, now);
     // This close is in hand: the tick's retry waits its turn.
-    let _ = poll_due(cfg, card.id);
+    poll_now(cfg, card.id);
     let (cfg, why) = (cfg.clone(), why.to_string());
     let mut card = card;
     tokio::spawn(async move {
@@ -1804,6 +1804,7 @@ fn closed(
     // charge that comes in late is recorded, and counted, before the card ends closed.
     let fresh = store.card(card.id).ok().flatten();
     if let Some(fresh) = fresh.filter(|c| c.status == "closing" && chargeable(cfg, c)) {
+        poll_now(cfg, card.id);
         let (cfg, why) = (cfg.clone(), why.to_string());
         tokio::spawn(async move {
             let state = match issuer(&cfg) {
@@ -1913,6 +1914,18 @@ fn poll_due(cfg: &Config, id: i64) -> bool {
     }
 }
 
+/// Notes that card `id` is polled now, whatever its last poll: a close or an ask in hand puts
+/// the tick's next one a full interval off, so it never asks for a second close meanwhile.
+fn poll_now(cfg: &Config, id: i64) {
+    let mut all = POLLED.lock().unwrap_or_else(|e| e.into_inner());
+    let state = cfg.state_dir();
+    let now = std::time::Instant::now();
+    match all.iter_mut().find(|(s, c, _)| s == state && *c == id) {
+        Some((_, _, at)) => *at = now,
+        None => all.push((state.to_path_buf(), id, now)),
+    }
+}
+
 /// The statuses of a card that is not over: it may still be filled, charged or closed.
 const LIVE: [&str; 3] = ["waiting", "open", "charging"];
 /// Those, and `closing`: a close was asked and the issuer has not confirmed it yet.
@@ -1975,7 +1988,7 @@ pub fn tick(cfg: &Arc<Config>, store: &Store, now: i64) {
             log(store.card_closing(card.id, now));
             fills::stop(cfg.state_dir(), card.id);
             live::forget(cfg.state_dir(), card.id, now);
-            let _ = poll_due(cfg, card.id);
+            poll_now(cfg, card.id);
             // Only an issuer that reports charges can say a card went unused.
             let why = match caps(cfg).is_some_and(|c| c.charges) {
                 true => "expired unused",
@@ -2033,9 +2046,14 @@ fn stated(
             }
         }
         Ok(CardState::Used(charges)) => used(cfg, store, card, &charges, now),
-        // A closing card the issuer has not closed: its close is asked again.
+        // A closing card the issuer has not closed: its close is asked again, only while the
+        // record still says `closing` (the copy may be older than a close that landed).
         Ok(CardState::Open | CardState::Waiting) | Err(_) if card.status == "closing" => {
-            let mut card = card;
+            let fresh = store.card(card.id).ok().flatten();
+            let Some(mut card) = fresh.filter(|c| c.status == "closing") else {
+                return;
+            };
+            poll_now(cfg, card.id);
             let cfg = cfg.clone();
             tokio::spawn(async move {
                 let said = close_at_issuer(&cfg, &mut card).await;
@@ -2605,6 +2623,50 @@ mod tests {
             "{:?}",
             out.last()
         );
+    }
+
+    /// A close asked just before the card's poll comes due is the one close at the issuer: the
+    /// tick that follows while it is in hand does not ask for another.
+    #[tokio::test]
+    async fn a_close_just_before_the_poll_is_the_only_close() {
+        let dir = crate::test_dir("cards-close-poll");
+        let text = format!("rpi = '/r'\nhome = {dir:?}\n[cards]\nprovider = 'fake'\n");
+        let mut cfg: Config = toml::from_str(&text).unwrap();
+        cfg.cards_fake = true;
+        cfg.tick = std::time::Duration::from_millis(100);
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        let cfg = Arc::new(cfg);
+        let store = Store::open(&cfg.db_path()).unwrap();
+        let new = NewCard {
+            provider: "fake".into(),
+            origin: "https://shop.example".into(),
+            currency: "CAD".into(),
+            cap_minor: 1000,
+            expires_at: crate::now() + 900,
+            ..NewCard::default()
+        };
+        let id = store.add_card(&new).unwrap();
+        assert!(store.card_issued(id, "fake-1", None).unwrap());
+        Fake::script(&cfg, |s| {
+            s.close_delay = std::time::Duration::from_millis(800)
+        });
+        // Polled now; the next poll is due in 600 ms.
+        assert!(poll_due(&cfg, id));
+        tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+        ask_close(
+            &cfg,
+            &store,
+            store.card(id).unwrap().unwrap(),
+            "the owner said it is done",
+        );
+        // Past when the poll would have been due, with the close still at the issuer.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tick(&cfg, &store, crate::now());
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let closes = Fake::script(&cfg, |s| {
+            s.log.iter().filter(|l| l.starts_with("close")).count()
+        });
+        assert_eq!(closes, 1);
     }
 
     /// A close asked with a copy read before the issue landed closes what the issuer made: the
