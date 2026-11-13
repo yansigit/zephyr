@@ -33,11 +33,13 @@ RUN set -e; cd /tmp \
 # The base image leaves the home world-writable; a test checks that no folder above its temp dir
 # (RUNNER_TEMP, under it) is, as on GitHub's runners.
 RUN chmod 755 /home/runner
+# No sudo for jobs: the base image's runner is in group sudo with no password. start.sh also runs
+# the container with no-new-privileges, under which sudo cannot work at all.
+RUN gpasswd -d runner sudo
 USER runner
-# The target dir sits outside the checkout (actions/checkout cleans that) on the runner's work
-# volume, so builds stay incremental across jobs and container rebuilds.
+# Each container serves one job and is removed (start.sh): the target dir, the cargo registry and
+# everything else a job writes go with it.
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH CARGO_TARGET_DIR=/home/runner/_work/_target
-# _work made here, so a new volume mounted on it is the runner's.
 RUN mkdir -p /home/runner/_work && rustup component add rustfmt clippy && cargo nextest --version \
     && cargo deny --version && gh --version && shellcheck --version && tmux -V && node --version

@@ -1322,6 +1322,11 @@ args, so build by hand to change that, then point `ZEPHYR_IMAGE` at the tag:
 docker build -t zephyr-local:ko --build-arg KO_VOICE=1 -f deploy/Dockerfile .
 ```
 
+The base images (`rust`, `node`, `ubuntu`, uv and the Dockerfile frontend) are pinned by digest,
+which `deploy/bump-rpi.sh` does not move: to take a tag's security fixes, read its multi-arch digest
+with `docker buildx imagetools inspect ubuntu:24.04 --format '{{json .Manifest.Digest}}'` and
+replace it in `deploy/Dockerfile`.
+
 Pushing a `v*` tag publishes `ghcr.io/yansigit/zephyr:<version>` (`.github/workflows/image.yml`,
 which tags `ghcr.io/<the repository it runs in>`, so a fork publishes to its own).
 
@@ -1342,12 +1347,13 @@ deploy/release.sh --cli   # only the host CLI changed: reinstall it, publish not
 ```
 
 Every PR runs fmt, clippy (`-D warnings`, Rust 1.95 as the image) and the tests, and `cargo deny check
-advisories bans` (`.github/workflows/ci.yml`, see [CI](#ci)). The script stops at the first problem. It runs fmt,
-clippy and the tests, then the real-rpi suite (`ZEPHYR_REAL_RPI=1 cargo test -- --ignored`, which
-fails rather than skips when the pinned binary is missing) when the binary is on this machine
-(`RPI_BIN=<path>` points it at another copy; the default is the pinned path), sets the version in
-`Cargo.toml` (the CLI pulls `ghcr.io/yansigit/zephyr:<version>`), commits and tags `v<version>`,
-pushes, and waits for the image workflow. Then it installs the CLI into `~/.cargo/bin` (from the
+advisories bans` (`.github/workflows/ci.yml`, see [CI](#ci)). The script stops at the first problem,
+and first at a version that is not above `Cargo.toml`'s. It runs fmt, clippy and the tests, then
+the real-rpi suite (`ZEPHYR_REAL_RPI=1 cargo test -- --ignored`) against the pinned binary, fetched
+when it is missing; with no binary it stops (`RPI_BIN=<path>` points it at another copy; the default
+is the pinned path). Then it sets the version in `Cargo.toml` (the CLI pulls
+`ghcr.io/yansigit/zephyr:<version>`), commits and tags `v<version>`, pushes both at once (`git push
+--atomic`: the commit and the tag land together or not at all), and waits for the image workflow. Then it installs the CLI into `~/.cargo/bin` (from the
 clean tree, so nothing uncommitted ships) and runs `zephyr upgrade <version>`.
 
 `zephyr upgrade` waits until nothing is in flight: a message the agent is answering, a job run, a
@@ -1370,7 +1376,7 @@ before it pushes, and tags `:<version>` and `:latest`. It runs on GitHub-hosted 
 this machine's runner (below, building on its rootless BuildKit, without the smoke test) when
 `ZEPHYR_CI=local` or GitHub refused a hosted job in the last 6 hours. If the image run itself is
 refused for minutes, `gh run rerun <id>` (the whole run, not `--failed`) plans again and builds
-here. `gh workflow run image.yml --ref <branch>` builds a test image (`:dev`) without pushing it.
+here. `gh workflow run image.yml --ref <branch>` builds a test image (`:dev`) without pushing it; `-f local=true` builds it here.
 
 ### CI
 
@@ -1392,24 +1398,41 @@ with either. `.github/ci.sh` holds the placement and the checks; the jobs are:
   a new test lands in a shard by itself. A test that passes only on its one retry is listed as
   flaky in the job summary; one that hangs is killed after 3 minutes.
 - `rescue` runs here, after them, each check GitHub did not start (failed with no runner and no
-  step; the job's annotation says why). A check that started and failed is never rescued.
+  step; the job's annotation says why). A check that started and failed is never rescued. Its
+  token only asks the Actions API which checks those are; the step that runs them has none.
 - `ci-ok` passes when every check passed on its own runner or through `rescue`. It is the one
   check to gate merges on (`gh pr checks <n>`). A rescued run still shows the refused job's red X.
 
-`rpi-bump.yml` runs here unless `ZEPHYR_CI=hosted`; `image.yml` as above.
+`rpi-bump.yml` asks here whether a bump is due, and builds, tests and pushes on GitHub-hosted runners only (below); `image.yml` as above.
 
 The runners come from `deploy/runner/start.sh up [N]` (default 2), from the image
 `deploy/runner/Dockerfile` builds: GitHub's runner image with Rust 1.95, nextest, cargo-deny, gh,
 tmux, python3, node and shellcheck. Each gets `ZEPHYR_RUNNER_CPUS` (default 8) CPUs and
-`ZEPHYR_RUNNER_MEMORY` (default 16g), and keeps checkouts and its cargo target dir on its own
-volume `zephyr-runner-<i>-work`, so builds stay incremental (a target dir over 60 GB starts afresh).
-Run `up` again after changing the Dockerfile or the limits: each runner whose image or limits
-differ is replaced once idle, one at a time, and registers again under its name.
-`deploy/runner/start.sh down` unregisters and removes them, keeping the volumes. The runners
-register with `yansigit/zephyr`, or with `ZEPHYR_GH_REPO=<owner/repo>` for a fork. They and the
-rootless BuildKit sit on their own Docker network with no Docker socket, no access to the host's
-files and no route to its localhost; services the host serves on all interfaces (SSH, ComfyUI,
-...) are still reachable.
+`ZEPHYR_RUNNER_MEMORY` (default 16g). They are ephemeral: a runner registers with `--ephemeral`,
+takes one job, and its container is removed when it exits; systemd user unit `zephyr-runner@<i>`
+(which `up` installs, running a copy of the script in `~/.local/share/zephyr-runner/`) starts a
+fresh one from the image. No volume is mounted, so the checkout, the cargo registry and target dir,
+the home and anything a job's code wrote there go with its container, and the next job cannot run
+what an earlier one left behind. The cost is a cold build in every job. A job runs as the runner
+user with no capabilities, no-new-privileges and no sudo. Run `up` again after changing the
+Dockerfile or the limits: each slot's next job uses them, and a runner started otherwise (or one
+from before ephemeral runners, with its `zephyr-runner-<i>-work` volume) is unregistered once
+idle, never mid-job, and replaced. `deploy/runner/start.sh down` stops the units and unregisters
+the runners. `up` turns on linger (or says the command), so the units outlive a logout. The units
+reach GitHub with `gh`'s own login (`~/.config/gh/hosts.yml`); if `gh` keeps it in a keyring a
+user service cannot reach, put `GH_TOKEN=<token>` in `~/.config/zephyr-runner/env` (mode 0600). A
+failed login or registration retries after 20 s, doubling up to 10 min.
+
+The rootless BuildKit (`zephyr-buildkitd`) answers only a client with the certificate `up` makes
+(mTLS; the CA and keys in `~/.config/zephyr-runner/buildkit/`, 0700) and stores as repo secrets
+`BUILDKIT_CA`, `BUILDKIT_CERT` and `BUILDKIT_KEY`, which `image.yml` alone reads. A test job on
+the same network can reach the daemon but not use it. Each build step runs in its own process
+namespace (BuildKit's sandbox). A release (a `v*` tag) built here uses no cache at all, so what a
+branch's image build left in the cache never reaches a release. The runners register with
+`yansigit/zephyr`, or with `ZEPHYR_GH_REPO=<owner/repo>` for a fork. They and the rootless BuildKit
+sit on their own Docker network with no Docker socket, no access to the host's files and no route
+to its localhost; services the host serves on all interfaces (SSH, ComfyUI, ...) are still
+reachable.
 
 ### Keeping rpi current
 
@@ -1420,7 +1443,21 @@ own `.sha256` files and checked against the tarballs, `RPI_PIN`, the `=` Cargo p
 `Cargo.lock`, fake-rpi's `--version`, the real-rpi test path). The workflow runs fmt, clippy, the
 tests and the real-rpi suite against the new binary (`RPI_BIN`), opens a PR `rpi-bump/v<version>`,
 and merges it when all of that passed; when anything failed the PR stays open with the run linked,
-and later runs leave it alone. It never releases: tag as above to ship an image with the new rpi.
+and later runs leave it alone: a first job, with a read token and no repository code, sees the open
+PR and stops before anything is built. The bump and the tests (which run the new rpi binary and the
+new crates' build scripts) hold no token, and run on a GitHub-hosted runner inside a throwaway
+container (`.github/sandbox.sh`: the image's Ubuntu and Rust by digest, the checkout mounted, its
+`.git` read only), so nothing they start sees the runner's processes, whose environment holds the
+Actions runtime token, or outlives them. A last job on a fresh GitHub-hosted runner, never this
+machine, takes their diff to a fresh checkout of main (`.github/bump-check.py`): a first look at
+its bytes (only the files `bump-rpi.sh` edits, no control or non-ASCII character on a changed
+line), then `git apply`, then a check of what git actually wrote. Each of those files must be
+exactly what `bump-rpi.sh`'s edits make of its version on main, moving the pinned rpi to the
+gate's newer version with the sha256s the release itself publishes, fetched again; in `Cargo.lock`
+no crate but the `rpi-*` ones moved, and new ones only from crates.io. Only then does it push, and
+open and merge the PR. A bump that needs another crate moved fails that check and waits for a
+person. When GitHub will not start that job,
+the bump waits for the next day's run. It never releases: tag as above to ship an image with the new rpi.
 The repo needs "Allow GitHub Actions to create and approve pull requests" (Settings > Actions >
 General). If `main` requires status checks, set secret `RPI_BUMP_TOKEN` (fine-grained, contents and
 pull-requests write on this repo) so `ci` runs on the PR, and allow auto-merge: the merge then waits

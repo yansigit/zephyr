@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 # Zephyr in one container (DESIGN §4.4), built from pinned sources: `zephyr up --build` runs
 #   docker build -t <image> -f deploy/Dockerfile --secret id=gh_token,env=GH_TOKEN .
 # The gh_token secret (from `gh auth token`) is only needed while a source repo is private; it is
@@ -20,13 +20,15 @@ ARG RPI_PACKAGE_REF=11e8ac183cf582144b8562ea19ec6f2620553cc3 # feat/providers-op
 ARG PLUGINS_REPO=https://github.com/yansigit/rpi-provider-plugins.git
 ARG PLUGINS_REF=9e8abac4ace5bc02cda5d6586b59eed12252cade # main as of 2026-10-31: claude-agent on Claude Code's own prompt and sessions
 # The agent's browsers (DESIGN §4.11). fingerprint-chromium ships no arm64 build; Playwright's
-# Chromium stands in there.
+# Chromium stands in there: the Chrome for Testing build Playwright 1.64.1 installs (its
+# browsers.json), from Playwright's CDN.
 ARG FPC_VERSION=150.0.7871.186
 ARG FPC_SHA256_AMD64=48eff860053efd9ad498d51370f0a1f59f983df39c02a72ad2a8682cdead4055
 ARG AGENT_BROWSER_VERSION=0.41.0
 ARG AGENT_BROWSER_SHA256_AMD64=399c7e9f06bd29aa933fdf25c0bd958eea06927fc0ce6f536ba6347aabd64628
 ARG AGENT_BROWSER_SHA256_ARM64=e196e9cabe6cb1b01bd5912973628361b9f40a332683a12426abad007f0d3589
-ARG PLAYWRIGHT_VERSION=1.64.1
+ARG PLAYWRIGHT_CHROMIUM_VERSION=156.0.8078.4
+ARG PLAYWRIGHT_CHROMIUM_SHA256_ARM64=910a12fff6170202195f72ef3d353801c7063d301ab80b1f51b77d791fda60ce
 # The agent's command-line tools (DESIGN §4.11): gh, and himalaya for mail (static musl builds).
 ARG GH_VERSION=2.103.3
 ARG GH_SHA256_AMD64=4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
@@ -70,10 +72,15 @@ ARG EN_VOICE_JSON_SHA256=efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da18
 ARG KO_VOICE_SHA256=624fd774e26895f24bebae1bd9a3379e3394baeade4b584924f83e414096e2c9
 ARG KO_VOICE_JSON_SHA256=153b5619d0580f824a59108d83ca19434de410eb8e4fe80325b58684fdc8a1df
 
+# The base images, pinned by the digest of each tag's multi-arch index (README "Building the
+# image" says how to move them). Every Ubuntu stage builds FROM ubuntu-24.04.
+FROM node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS node-24
+FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5 AS ubuntu-24.04
+
 # Rust plus node 24 (the plugin stage scripts use both). Bookworm's glibc (2.36) is older than
 # the final image's (2.39), so what is built here runs there.
-FROM rust:1.95-bookworm AS toolchain
-COPY --from=node:24-bookworm-slim /usr/local/ /usr/local/
+FROM rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS toolchain
+COPY --from=node-24 /usr/local/ /usr/local/
 
 # Fetches REPO at REF (a branch, tag or commit) into /src; an empty REPO leaves /src empty.
 FROM toolchain AS fetch
@@ -102,23 +109,27 @@ RUN --mount=type=secret,id=gh_token fetch "$PLUGINS_REPO" "$PLUGINS_REF"
 FROM scratch AS provider-plugins
 COPY --from=provider-plugins-git /src /
 
-# zephyr, zephyr-policy, zephyr-cursor, and from rpi-package librpi_providers.so and
-# librpi_mcp_adapter.so, unless RPI_PACKAGE_REPO is empty. Set, a tree that lacks them fails here.
+# zephyr, zephyr-policy and zephyr-cursor. No cache mounts here or below: a shared BuildKit keeps
+# them across builds, so one branch's build could leave crate sources that a release then compiles.
 FROM toolchain AS rust
-ARG RPI_PACKAGE_REPO
 # The repository the image is published to, baked into its CLI (`zephyr upgrade` pulls from it);
 # unset or empty, the CLI's own default.
 ARG ZEPHYR_BUILD_REPO
 COPY Cargo.toml Cargo.lock /src/zephyr/
 COPY crates /src/zephyr/crates
-COPY --from=rpi-package / /src/rpi-package
-# sharing=locked: the rust and plugins stages run at once and would unpack the same crate into this cache together.
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    cd /src/zephyr && cargo build --release --locked -p zephyr -p zephyr-policy -p zephyr-cursor \
+RUN cd /src/zephyr && cargo build --release --locked -p zephyr -p zephyr-policy -p zephyr-cursor \
     && mkdir -p /out/bin /out/lib /out/ext \
     && cp /src/zephyr/target/release/zephyr /out/bin/ \
     && cp /src/zephyr/target/release/libzephyr_policy.so /out/lib/ \
-    && cp /src/zephyr/target/release/libzephyr_cursor.so /out/ext/ \
+    && cp /src/zephyr/target/release/libzephyr_cursor.so /out/ext/
+
+# librpi_providers.so and librpi_mcp_adapter.so from rpi-package, in a stage of their own so a
+# change to this repo does not rebuild them. Left out only when RPI_PACKAGE_REPO is empty; set, a
+# tree that lacks them fails here.
+FROM toolchain AS rpi-ext
+ARG RPI_PACKAGE_REPO
+COPY --from=rpi-package / /src/rpi-package
+RUN mkdir -p /out/ext \
     && if [ -n "$RPI_PACKAGE_REPO" ]; then \
          cd /src/rpi-package && cargo build --release --locked -p rpi-providers -p rpi-mcp-adapter \
          && cp /src/rpi-package/target/release/librpi_providers.so /out/ext/ \
@@ -133,13 +144,12 @@ FROM toolchain AS plugins
 ARG PLUGINS_REPO
 COPY --from=provider-plugins / /src/plugins
 WORKDIR /src/plugins
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked --mount=type=cache,target=/root/.npm \
-    if [ -n "$PLUGINS_REPO" ]; then \
+RUN if [ -n "$PLUGINS_REPO" ]; then \
       packages/rpi-claude-agent/scripts/stage.sh /out/ext/rpi-claude-agent; \
     else mkdir -p /out/ext; fi
 
 # The pinned upstream rpi release, checked against its published sha256.
-FROM ubuntu:24.04 AS rpi
+FROM ubuntu-24.04 AS rpi
 ARG RPI_VERSION RPI_SHA256_AMD64 RPI_SHA256_ARM64 TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && case "$TARGETARCH" in arm64) t=aarch64 s=$RPI_SHA256_ARM64 ;; *) t=x86_64 s=$RPI_SHA256_AMD64 ;; esac \
@@ -149,7 +159,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && tar -xzf "/tmp/$f" --no-same-owner -C /usr/local/bin ./rpi
 
 # gh, himalaya and github-mcp-server from their pinned releases, checked against their sha256s.
-FROM ubuntu:24.04 AS tools
+FROM ubuntu-24.04 AS tools
 ARG GH_VERSION GH_SHA256_AMD64 GH_SHA256_ARM64 HIMALAYA_VERSION HIMALAYA_SHA256_AMD64 \
     HIMALAYA_SHA256_ARM64 GITHUB_MCP_VERSION GITHUB_MCP_SHA256_AMD64 GITHUB_MCP_SHA256_ARM64 TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
@@ -172,12 +182,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 # The default browser and agent-browser, which drives it, both checked against pinned sha256s.
 FROM toolchain AS browser
 ARG TARGETARCH FPC_VERSION FPC_SHA256_AMD64 AGENT_BROWSER_VERSION AGENT_BROWSER_SHA256_AMD64 \
-    AGENT_BROWSER_SHA256_ARM64 PLAYWRIGHT_VERSION
+    AGENT_BROWSER_SHA256_ARM64 PLAYWRIGHT_CHROMIUM_VERSION PLAYWRIGHT_CHROMIUM_SHA256_ARM64
 RUN set -eu; mkdir -p /out/browser /out/bin; \
     case "$TARGETARCH" in \
     arm64) a=arm64 s=$AGENT_BROWSER_SHA256_ARM64; \
-           PLAYWRIGHT_BROWSERS_PATH=/tmp/pw npx -y "playwright@$PLAYWRIGHT_VERSION" install chromium; \
-           cp -a /tmp/pw/chromium-*/chrome-linux*/. /out/browser/ ;; \
+           curl -fsSLo /tmp/chrome.zip \
+             "https://cdn.playwright.dev/builds/cft/$PLAYWRIGHT_CHROMIUM_VERSION/linux-arm64/chrome-linux-arm64.zip"; \
+           echo "$PLAYWRIGHT_CHROMIUM_SHA256_ARM64  /tmp/chrome.zip" | sha256sum -c -; \
+           unzip -q /tmp/chrome.zip -d /tmp/pw; cp -a /tmp/pw/chrome-linux-arm64/. /out/browser/ ;; \
     *) a=x64 s=$AGENT_BROWSER_SHA256_AMD64; \
        f="ungoogled-chromium-$FPC_VERSION-1-x86_64_linux.tar.xz"; \
        curl -fsSLo "/tmp/$f" "https://github.com/adryfish/fingerprint-chromium/releases/download/$FPC_VERSION/$f"; \
@@ -193,7 +205,7 @@ RUN set -eu; mkdir -p /out/browser /out/bin; \
 # image's python3, plus uv for the rest. Camoufox, the fallback browser, spoofs Linux only
 # (`os="linux"`, which matches the real GPU), so its macOS- and Windows-only font groups go.
 # Firefox writes a fontconfig file into its cache dir on each launch, hence the 1777 dir.
-FROM ubuntu:24.04 AS python
+FROM ubuntu-24.04 AS python
 COPY --from=ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 /uv /usr/local/bin/uv
 COPY deploy/python/pyproject.toml deploy/python/uv.lock /src/python/
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates python3 \
@@ -214,7 +226,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 # resolve as modules. The JVM build, not the GraalVM native one (408 MB, and its link and register
 # broke). libsignal's native library in its jars is x86_64 only, so arm64 builds nothing, as
 # SIGNAL=0 does: no /opt/zephyr/signal turns the channel off.
-FROM ubuntu:24.04 AS signal-1
+FROM ubuntu-24.04 AS signal-1
 ARG SIGNAL_CLI_VERSION SIGNAL_CLI_SHA256 TEMURIN_VERSION TEMURIN_SHA256_AMD64 TARGETARCH
 RUN set -eu; mkdir /out; \
     case "$TARGETARCH" in arm64) exit 0 ;; esac; \
@@ -249,7 +261,7 @@ FROM signal-${SIGNAL} AS signal-out
 # whisper-server too, which a phone call with calls.speech = local keeps loaded (DESIGN §4.26). It
 # is patched to bind its --host as a unix socket path (its bundled cpp-httplib 0.20 has AF_UNIX),
 # so it can never listen on a TCP port; the grep fails the build if the patch stops applying.
-FROM ubuntu:24.04 AS voice-whisper
+FROM ubuntu-24.04 AS voice-whisper
 ARG WHISPER_VERSION WHISPER_SHA256
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl build-essential \
       cmake glslc libvulkan-dev spirv-headers \
@@ -269,7 +281,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 # ffmpeg, static, with only what voice notes in and out need (and μ-law out, for a phone call's speech): the channels' audio containers and
 # codecs, raw s16le in (Piper's PCM), and Opus, AAC and 16-bit WAV out.
-FROM ubuntu:24.04 AS voice-ffmpeg
+FROM ubuntu-24.04 AS voice-ffmpeg
 ARG FFMPEG_VERSION FFMPEG_SHA256
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
       build-essential nasm pkg-config libopus-dev \
@@ -289,7 +301,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 # Piper: deploy/voice's locked packages in a venv on the final image's python3, its bytecode
 # compiled here since nobody, who runs it, cannot write __pycache__.
-FROM ubuntu:24.04 AS voice-py
+FROM ubuntu-24.04 AS voice-py
 COPY --from=ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 /uv /usr/local/bin/uv
 COPY deploy/voice/pyproject.toml deploy/voice/uv.lock /src/voice/
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates python3 \
@@ -299,7 +311,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && chmod -R go-w /opt/zephyr/voice/py
 
 # whisper's model, Silero VAD and Piper's voices, each checked against its pinned sha256.
-FROM ubuntu:24.04 AS voice-models
+FROM ubuntu-24.04 AS voice-models
 ARG KO_VOICE CALL_STT WHISPER_BASE_SHA256 WHISPER_MODELS_REV WHISPER_SMALL_SHA256 VAD_REV VAD_SHA256 PIPER_VOICES_REV \
     EN_VOICE_SHA256 EN_VOICE_JSON_SHA256 KO_VOICE_SHA256 KO_VOICE_JSON_SHA256
 RUN set -eu; apt-get update && apt-get install -y --no-install-recommends ca-certificates curl; \
@@ -333,7 +345,7 @@ FROM scratch AS voice-0
 WORKDIR /opt/zephyr
 FROM voice-${VOICE} AS voice-out
 
-FROM ubuntu:24.04
+FROM ubuntu-24.04
 # Chromium's and Firefox's libraries, Vulkan/EGL for the GPU, the agent's desktop and its
 # everyday command-line tools (§4.11).
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -346,13 +358,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       xvfb openbox xdotool x11-utils imagemagick x11vnc nftables libnss3-tools qrencode \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd
-COPY --from=node:24-bookworm-slim /usr/local/bin/node /usr/local/bin/node
-COPY --from=node:24-bookworm-slim /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+COPY --from=node-24 /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-24 /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 COPY --from=tools /usr/local/bin/gh /usr/local/bin/himalaya /usr/local/bin/github-mcp-server /usr/local/bin/
 COPY --from=rpi /usr/local/bin/rpi /usr/local/bin/rpi
 COPY --from=rust /out/bin/zephyr /usr/local/bin/zephyr
 COPY --from=rust /out/lib/libzephyr_policy.so /usr/local/lib/libzephyr_policy.so
 COPY --from=rust /out/ext/ /opt/zephyr/ext/
+COPY --from=rpi-ext /out/ext/ /opt/zephyr/ext/
 COPY --from=plugins /out/ext/ /opt/zephyr/ext/
 COPY --from=browser /out/browser/ /opt/zephyr/browser/
 # The real agent-browser, out of the agent's PATH: `agent-browser` there is zephyr's approvals

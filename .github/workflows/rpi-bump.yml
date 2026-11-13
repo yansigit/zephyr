@@ -7,8 +7,16 @@
 # requests". If main requires status checks, a PR opened with GITHUB_TOKEN starts no ci run, so set
 # secret RPI_BUMP_TOKEN (a fine-grained token with contents and pull-requests write on this repo) to
 # have ci run on the PR, and the merge then waits for it (`--auto`, with auto-merge allowed).
-# Where it runs follows variable ZEPHYR_CI as ci.yml does (.github/ci.sh plan, README "CI"): on
-# zephyr-local, unless that is `hosted`.
+# The token that can push never shares a machine with the code the bump brings (the new rpi binary,
+# the new crates' build scripts):
+# - `gate` picks the version and stops here when an open PR for it already waits for a person;
+# - `build` bumps and tests with no token, in a throwaway container, and hands on its diff;
+# - `push`, on a fresh GitHub-hosted runner, checks that diff against its own checkout and the
+#   release's own sha256s (.github/bump-check.py), applies it, pushes, opens the PR and merges. It
+#   never runs cargo or anything the build made.
+# `gate` follows variable ZEPHYR_CI as ci.yml does (README "CI"): on zephyr-local, unless that is
+# `hosted`. `build` (for its Docker) and `push` are hosted only: when GitHub will not start them
+# (quota, spending limit) they fail and the bump waits for the next day's run.
 name: rpi-bump
 on:
   schedule:
@@ -19,89 +27,172 @@ on:
         description: "rpi version (default: the latest)"
         required: false
 permissions:
-  contents: write
-  pull-requests: write
-  actions: read
+  contents: read
 concurrency: rpi-bump
 jobs:
-  plan:
+  # A read token and gh, nothing from the repository: the version to move to, and whether a PR for
+  # it is already open (then the day's build and tests would be for nothing).
+  gate:
     runs-on: ${{ vars.ZEPHYR_CI == 'hosted' && 'ubuntu-latest' || 'zephyr-local' }}
     timeout-minutes: 5
+    permissions:
+      pull-requests: read
     outputs:
-      runner: ${{ steps.plan.outputs.local }}
+      version: ${{ steps.gate.outputs.version }}
+      go: ${{ steps.gate.outputs.go }}
     steps:
-      - uses: actions/checkout@v4
-      - id: plan
-        run: .github/ci.sh plan
+      - id: gate
         env:
           GH_TOKEN: ${{ github.token }}
-          ZEPHYR_CI: ${{ vars.ZEPHYR_CI }}
-  bump:
-    needs: plan
-    runs-on: ${{ needs.plan.outputs.runner }}
-    timeout-minutes: 90
-    env:
-      GH_TOKEN: ${{ secrets.RPI_BUMP_TOKEN || github.token }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.RPI_BUMP_TOKEN || github.token }}
-      - id: bump
-        run: deploy/bump-rpi.sh "$VERSION"
-        env:
           VERSION: ${{ inputs.version }}
-          RPI_BUMP_DIR: ${{ runner.temp }}/rpi
-      # An open PR for this version that already failed stays as it is until a person acts on it.
-      - id: pr
+        run: |
+          v=${VERSION:-$(curl -fsS -A zephyr-rpi-bump https://crates.io/api/v1/crates/rpi-tui | jq -r .crate.max_stable_version)}
+          [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a release version: $v" >&2; exit 1; }
+          open=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "rpi-bump/v$v" --state open --json number --jq length)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "go=$([ "$open" = 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          [ "$open" = 0 ] || echo "an open PR for rpi $v waits for a person; nothing to do"
+  # No token in any step, and everything that runs the bump's code (bump-rpi.sh runs the new rpi
+  # binary and `cargo update`; the tests run the new crates' build scripts) runs in a throwaway
+  # container (.github/sandbox.sh), where it cannot see the runner's processes, whose environment
+  # holds the Actions runtime token (which can write the cache main's jobs restore), nor outlive its
+  # step. GitHub-hosted, for its Docker daemon: zephyr-local's runners have none. No toolchain or
+  # cache action runs here. What it hands on is its diff, which `push` checks before using it.
+  build:
+    needs: gate
+    if: needs.gate.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tested: ${{ steps.test.outcome }}
+    steps:
+      # A bump is made from main only, whatever ref the run was started on.
+      - run: '[ "$GITHUB_REF" = refs/heads/main ] || { echo "rpi-bump runs on main only, not $GITHUB_REF" >&2; exit 1; }'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      # The sandbox's image and a copy of its script, made before anything untrusted runs.
+      - run: |
+          .github/sandbox.sh image
+          cp .github/sandbox.sh "$RUNNER_TEMP/sandbox.sh"
+      - id: bump
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          mkdir -p target
+          SANDBOX_ENV="VERSION RPI_BUMP_DIR=/src/target/rpi GITHUB_OUTPUT=/src/target/bump.out" \
+            "$RUNNER_TEMP/sandbox.sh" run deploy/bump-rpi.sh "$VERSION"
+          # Only the version, in its shape, from what the sandbox wrote.
+          v=$(sed -n 's/^version=\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p' target/bump.out 2>/dev/null | head -1)
+          [ -z "$v" ] || echo "version=$v" >> "$GITHUB_OUTPUT"
+      # Taken before the tests. The sandbox saw .git read only, so no config of its own shapes
+      # this; whatever the bump wrote into the files, `push` refuses unless it is the pin move.
+      - if: steps.bump.outputs.version != ''
+        run: |
+          GIT_CONFIG_NOSYSTEM=1 HOME=$(mktemp -d) git -c core.quotePath=true diff --no-ext-diff \
+            --no-textconv --src-prefix=a/ --dst-prefix=b/ --no-color > "$RUNNER_TEMP/bump.patch"
+      - if: steps.bump.outputs.version != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rpi-bump
+          path: ${{ runner.temp }}/bump.patch
+          if-no-files-found: error
+          retention-days: 7
+          # "Re-run all jobs" uploads it again.
+          overwrite: true
+      - id: test
         if: steps.bump.outputs.version != ''
         run: |
-          branch=rpi-bump/v${{ steps.bump.outputs.version }}
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
-          echo "open=$(gh pr list --head "$branch" --state open --json number --jq length)" >> "$GITHUB_OUTPUT"
-      - if: runner.environment == 'github-hosted' && steps.bump.outputs.version != '' && steps.pr.outputs.open == '0'
-        uses: dtolnay/rust-toolchain@1.95
+          SANDBOX_ENV="ZEPHYR_REAL_RPI=1 RPI_BIN=/src/target/rpi/rpi" "$RUNNER_TEMP/sandbox.sh" run sh -c '
+            cargo fmt --all --check
+            cargo clippy --all-targets -- -D warnings
+            cargo test --workspace
+            cargo test --workspace -- --ignored'
+  # The one job with a token that can push: a fresh GitHub-hosted runner, never zephyr-local, and
+  # nothing rescues it onto zephyr-local. GH_TOKEN is only on the steps that talk to GitHub
+  # (tests/host.rs no_step_that_runs_cargo_holds_a_github_token).
+  push:
+    needs: [gate, build]
+    if: always() && needs.build.outputs.version != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    # V is the gate's, which no code from the bump has touched; the build must report the same.
+    # OLD comes from this job's own checkout. TESTED cannot be checked: a build that lies about it
+    # can only get a bump that fails its tests merged, never other code, since only what is
+    # checked below to be the pin move is pushed.
+    env:
+      V: ${{ needs.gate.outputs.version }}
+      BUILT: ${{ needs.build.outputs.version }}
+      TESTED: ${{ needs.build.outputs.tested }}
+    steps:
+      - run: '[ "$GITHUB_REF" = refs/heads/main ] || { echo "rpi-bump runs on main only, not $GITHUB_REF" >&2; exit 1; }'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: rustfmt, clippy
-      - if: runner.environment == 'github-hosted' && steps.bump.outputs.version != '' && steps.pr.outputs.open == '0'
-        uses: Swatinem/rust-cache@v2
-      - if: runner.environment == 'github-hosted' && steps.bump.outputs.version != '' && steps.pr.outputs.open == '0'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
-      - id: test
-        if: steps.bump.outputs.version != '' && steps.pr.outputs.open == '0'
-        env:
-          RPI_BIN: ${{ steps.bump.outputs.rpi }}
-          ZEPHYR_REAL_RPI: "1"
-          # The runner empties its temp dir before each job; zephyr-local's /tmp would only grow.
-          TMPDIR: ${{ runner.temp }}
-        run: |
-          cargo fmt --all --check
-          cargo clippy --all-targets -- -D warnings
-          cargo test --workspace
-          cargo test --workspace -- --ignored
+          ref: main
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rpi-bump
+          path: ${{ runner.temp }}/bump
+      # The checker runs from a copy outside the tree, so applying the patch cannot change it.
+      - run: |
+          [ "$BUILT" = "$V" ] || { echo "the build moved to $BUILT, not the gate's $V" >&2; exit 1; }
+          old=$(sed -n 's/^ARG RPI_VERSION=//p' deploy/Dockerfile)
+          [[ $V =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a release version: $V" >&2; exit 1; }
+          if [ "$V" = "$old" ] || [ "$(printf '%s\n%s\n' "$old" "$V" | sort -V | tail -1)" != "$V" ]; then
+            echo "$V is not above $old" >&2
+            exit 1
+          fi
+          sha() {
+            curl -fsSL "https://github.com/bigfish1913/pi-rust/releases/download/v$V/rpi-v$V-$1-unknown-linux-gnu.tar.gz.sha256" |
+              awk '{print $1}'
+          }
+          { echo "OLD=$old"; echo "AMD64=$(sha x86_64)"; echo "ARM64=$(sha aarch64)"; } >> "$GITHUB_ENV"
+          cp .github/bump-check.py "$RUNNER_TEMP/bump-check.py"
+      # The first gate on the patch's bytes, then git applies it, then what git wrote must be the
+      # pin move of this checkout's files and nothing else (.github/bump-check.py).
+      - run: python3 -I "$RUNNER_TEMP/bump-check.py" patch "$RUNNER_TEMP/bump/bump.patch"
+      - run: |
+          export GIT_CONFIG_NOSYSTEM=1 HOME
+          HOME=$(mktemp -d)
+          git -c core.quotePath=true apply --check "$RUNNER_TEMP/bump/bump.patch"
+          git -c core.quotePath=true apply "$RUNNER_TEMP/bump/bump.patch"
+      - run: python3 -I "$RUNNER_TEMP/bump-check.py" verify "$OLD" "$V" "$AMD64" "$ARM64"
       - id: push
-        if: always() && steps.bump.outputs.version != '' && steps.pr.outputs.open == '0'
+        env:
+          GH_TOKEN: ${{ secrets.RPI_BUMP_TOKEN || github.token }}
         run: |
-          v=${{ steps.bump.outputs.version }} old=${{ steps.bump.outputs.old }}
-          branch=${{ steps.pr.outputs.branch }}
+          branch=rpi-bump/v$V
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
-          git commit -qam "chore(rpi): move the rpi pins from $old to $v"
-          git push -f origin "$branch"
+          git commit -qam "chore(rpi): move the rpi pins from $OLD to $V"
+          # The token from the env, as the checkout kept none.
+          git push -f "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" "$branch"
           run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          if [ "${{ steps.test.outcome }}" = success ]; then
-            result="fmt, clippy, the tests and the ignored tests against rpi $v passed ([run]($run))."
+          if [ "$TESTED" = success ]; then
+            result="fmt, clippy, the tests and the ignored tests against rpi $V passed ([run]($run))."
           else
-            result="**Not merged**: the checks against rpi $v failed ([run]($run)). Fix them on this branch."
+            result="**Not merged**: the checks against rpi $V failed ([run]($run)). Fix them on this branch."
           fi
-          gh pr create --base main --head "$branch" --title "chore(rpi): move the rpi pins from $old to $v" --body "$(printf '%s\n\n%s\n\n%s' \
-            "Moves every rpi pin (Dockerfile version and sha256s, RPI_PIN, the Cargo pins, fake-rpi's version, the real-rpi test path) from $old to $v with deploy/bump-rpi.sh." \
+          gh pr create --base main --head "$branch" --title "chore(rpi): move the rpi pins from $OLD to $V" --body "$(printf '%s\n\n%s\n\n%s' \
+            "Moves every rpi pin (Dockerfile version and sha256s, RPI_PIN, the Cargo pins, fake-rpi's version, the real-rpi test path) from $OLD to $V with deploy/bump-rpi.sh." \
             "$result" \
-            "Release notes: https://github.com/bigfish1913/pi-rust/releases/tag/v$v")"
-      - if: steps.test.outcome == 'success' && steps.push.outcome == 'success'
+            "Release notes: https://github.com/bigfish1913/pi-rust/releases/tag/v$V")"
+      - if: env.TESTED == 'success' && steps.push.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.RPI_BUMP_TOKEN || github.token }}
+          AUTO: ${{ secrets.RPI_BUMP_TOKEN != '' }}
         run: |
-          branch=${{ steps.pr.outputs.branch }}
-          if [ -n "${{ secrets.RPI_BUMP_TOKEN }}" ]; then
+          branch=rpi-bump/v$V
+          if [ "$AUTO" = true ]; then
             gh pr merge "$branch" --squash --delete-branch --auto
           else
             gh pr merge "$branch" --squash --delete-branch

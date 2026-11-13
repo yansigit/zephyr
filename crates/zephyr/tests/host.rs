@@ -3699,6 +3699,448 @@ fn the_image_workflow_smoke_tests_every_extension() {
     }
 }
 
+/// A crate's build script must never read a GitHub token: GH_TOKEN is set only in a step's own
+/// `env` (never a job's or the workflow's), a step that sets it runs no cargo (nor `ci.sh run` or
+/// `ci.sh rescue`, which run the checks, nor bump-rpi.sh's `cargo update`), `ci.sh rescue` refuses
+/// to start with one in its environment, and no checkout keeps its token in `.git/config`.
+#[test]
+fn no_step_that_runs_cargo_holds_a_github_token() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let code = |l: &&str| !l.trim().is_empty() && !l.trim_start().starts_with('#');
+    let mut tokens = 0;
+    for entry in std::fs::read_dir(root.join(".github/workflows")).unwrap() {
+        let path = entry.unwrap().path();
+        let text = read(&path);
+        let lines: Vec<&str> = text.lines().filter(code).collect();
+        // The lines of the block that starts at `at`: it and everything indented deeper.
+        let block = |at: usize| {
+            let end = (at + 1..lines.len()).find(|&j| indent(lines[j]) <= indent(lines[at]));
+            lines[at..end.unwrap_or(lines.len())].join("\n")
+        };
+        let parent = |at: usize| {
+            (0..at)
+                .rev()
+                .find(|&j| indent(lines[j]) < indent(lines[at]))
+        };
+        for (i, line) in lines.iter().enumerate() {
+            // Every action by commit SHA, with the version it is as a comment.
+            let uses = line.trim_start().trim_start_matches("- ");
+            if let Some(action) = uses.strip_prefix("uses: ") {
+                let (_, rest) = action.split_once('@').unwrap();
+                let sha = rest.split_whitespace().next().unwrap();
+                assert!(
+                    sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{path:?}: an action pinned by tag: {line}"
+                );
+                assert!(
+                    rest[40..].starts_with(" # "),
+                    "{path:?}: no version comment: {line}"
+                );
+            }
+            if line.trim_start().starts_with("- uses: actions/checkout@") {
+                assert!(
+                    block(i).contains("persist-credentials: false"),
+                    "{path:?}: {}",
+                    block(i)
+                );
+            }
+            if !line.trim_start().starts_with("GH_TOKEN:") {
+                continue;
+            }
+            tokens += 1;
+            let env = parent(i).unwrap();
+            let step = match lines[env].trim() {
+                "- env:" => Some(env),
+                "env:" => parent(env).filter(|&s| lines[s].trim_start().starts_with("- ")),
+                other => panic!("{path:?}: GH_TOKEN under {other}"),
+            }
+            .unwrap_or_else(|| panic!("{path:?}: GH_TOKEN outside a step: {line}"));
+            let step = block(step);
+            let words: Vec<&str> = step
+                .split(|c: char| c.is_whitespace() || c == ';')
+                .collect();
+            let ci_run = (words.windows(2))
+                .any(|w| w == [".github/ci.sh", "run"] || w == [".github/ci.sh", "rescue"]);
+            let cargo = ["cargo", "deploy/bump-rpi.sh"]
+                .iter()
+                .any(|c| words.contains(c));
+            assert!(!ci_run && !cargo, "{path:?}:\n{step}");
+        }
+        if path.ends_with("rpi-bump.yml") {
+            // The bump's build and tests hold no token at all; the one job that can push runs no
+            // cargo, only on a fresh hosted runner, and checks the build's patch before applying it.
+            let job = |name: &str| block(lines.iter().position(|l| *l == name).unwrap());
+            let build = job("  build:");
+            assert!(build.contains("cargo test"), "{build}");
+            assert!(
+                !build.contains("GH_TOKEN") && !build.contains("token"),
+                "{build}"
+            );
+            // Its cargo and the bump run only in the sandbox (a throwaway container, from a copy
+            // of the script made first), on a hosted runner for its Docker, with no cache action.
+            assert!(build.contains("\n    runs-on: ubuntu-latest\n"), "{build}");
+            let sandboxed = "\"$RUNNER_TEMP/sandbox.sh\" run ";
+            // With what the sandbox runs taken out (the bump, and the tests' quoted script),
+            // nothing in the job names cargo or the bump.
+            let mut outside = build.replace(&format!("{sandboxed}deploy/bump-rpi.sh "), "");
+            let tests = format!("{sandboxed}sh -c '");
+            let at = outside.find(&tests).expect("the tests run in the sandbox");
+            let end = at + tests.len() + outside[at + tests.len()..].find('\'').unwrap();
+            outside.replace_range(at..=end, "");
+            let words: Vec<&str> =
+                (outside.split(|c: char| c.is_whitespace() || c == ';')).collect();
+            for never in [
+                "cargo",
+                "deploy/bump-rpi.sh",
+                "rust-cache",
+                "rust-toolchain",
+            ] {
+                assert!(
+                    !words.iter().any(|w| w.contains(never)),
+                    "{never} outside the sandbox:\n{outside}"
+                );
+            }
+            let copy = build
+                .find("cp .github/sandbox.sh \"$RUNNER_TEMP/sandbox.sh\"")
+                .unwrap();
+            assert!(copy < build.find(sandboxed).unwrap(), "{build}");
+            let sandbox = read(&root.join(".github/sandbox.sh"));
+            assert!(
+                sandbox.contains("docker run --rm -v \"$PWD:/src\" -v \"$PWD/.git:/src/.git:ro\"")
+            );
+            let push = job("  push:");
+            let words: Vec<&str> = push
+                .split(|c: char| c.is_whitespace() || c == ';')
+                .collect();
+            assert!(!words.contains(&"cargo"), "{push}");
+            assert!(push.contains("\n    runs-on: ubuntu-latest\n"), "{push}");
+            assert!(!push.contains("zephyr-local"), "{push}");
+            // The checker from a copy outside the tree: the first gate, then git applies the
+            // patch, then what git wrote is checked, all before anything is pushed.
+            let at = |what: &str| push.find(what).unwrap_or_else(|| panic!("{what}: {push}"));
+            let order = [
+                "cp .github/bump-check.py \"$RUNNER_TEMP/bump-check.py\"",
+                "\"$RUNNER_TEMP/bump-check.py\" patch ",
+                "git -c core.quotePath=true apply --check ",
+                "git -c core.quotePath=true apply \"$RUNNER_TEMP",
+                "\"$RUNNER_TEMP/bump-check.py\" verify ",
+                "git push ",
+            ];
+            assert!(order.windows(2).all(|w| at(w[0]) < at(w[1])), "{push}");
+            // V is the gate's, and both jobs refuse any ref but main and check main out.
+            assert!(
+                push.contains("V: ${{ needs.gate.outputs.version }}"),
+                "{push}"
+            );
+            for job in [&build, &push] {
+                assert!(
+                    job.contains("[ \"$GITHUB_REF\" = refs/heads/main ] ||"),
+                    "{job}"
+                );
+                assert!(job.contains("ref: main\n"), "{job}");
+            }
+            // The job before them reads, with gh alone: no checkout, no repository code, no cargo.
+            let gate = job("  gate:");
+            assert!(gate.contains("pull-requests: read"), "{gate}");
+            for never in ["write", "actions/checkout", "cargo", ".github/", "deploy/"] {
+                assert!(!gate.contains(never), "{never}: {gate}");
+            }
+        }
+    }
+    assert!(tokens >= 6, "{tokens}");
+    let ci = read(&root.join(".github/ci.sh"));
+    // Not an `unset` in a subshell: the parent's /proc/<pid>/environ would still hold the token.
+    assert!(!ci.contains("unset GH_TOKEN"), "{ci}");
+    let refuse = "[ -z \"${GH_TOKEN:-}${GITHUB_TOKEN:-}\" ] || die";
+    let rescue = &ci[ci.find("\nrescue() {").unwrap()..];
+    assert!(
+        rescue.find(refuse).unwrap() < rescue.find("check \"$what\"").unwrap(),
+        "{ci}"
+    );
+    // ...and the step that runs it has no token, which the loop above checks for every workflow.
+    let ci_yml = read(&root.join(".github/workflows/ci.yml"));
+    assert!(
+        ci_yml.contains("run: .github/ci.sh rescue-plan"),
+        "{ci_yml}"
+    );
+}
+
+/// rpi-bump's push job applies the build's patch with `git apply`, then checks what git wrote:
+/// only the pin move. A real bump (tests/fixtures/rpi-bump.patch from bump-rpi.sh, and the
+/// Cargo.lock it was made on, their versions swapped for 9.8.7 and 9.9.0 so a later bump does not
+/// rewrite them) passes; each smuggled change is refused, by the first gate or by what was written.
+#[test]
+fn the_bump_check_passes_only_a_pin_move() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixtures = root.join("crates/zephyr/tests/fixtures");
+    let good = read(&fixtures.join("rpi-bump.patch"));
+    let lock = read(&fixtures.join("rpi-bump.Cargo.lock"));
+    let tmp = std::env::temp_dir().join(format!("zephyr-bump-check-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (repo, home) = (tmp.join("repo"), tmp.join("home"));
+    std::fs::create_dir_all(&home).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    // The repository the patch was made in, as far as the patch shows it: each file's hunks'
+    // old lines at their line numbers, filler between them (it never mentions the pin), and the
+    // whole Cargo.lock.
+    std::fs::create_dir_all(&repo).unwrap();
+    for section in good.split("diff --git a/").skip(1) {
+        let path = &section[..section.find(' ').unwrap()];
+        let file = repo.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        if path == "Cargo.lock" {
+            std::fs::write(&file, &lock).unwrap();
+            continue;
+        }
+        let mut lines: Vec<String> = Vec::new();
+        for hunk in section.split("\n@@ -").skip(1) {
+            let start: usize = hunk[..hunk.find([',', ' ']).unwrap()].parse().unwrap();
+            while lines.len() + 1 < start {
+                lines.push(format!("filler {}", lines.len() + 1));
+            }
+            for line in hunk.lines().skip(1) {
+                if let Some(old) = line.strip_prefix([' ', '-']) {
+                    lines.push(old.to_string());
+                }
+            }
+        }
+        lines.push("filler at the end".into());
+        std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+        if section
+            .lines()
+            .nth(1)
+            .is_some_and(|l| l.ends_with(" 100755"))
+        {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+
+    let sha = |arch: &str| {
+        let line = format!("+ARG RPI_SHA256_{arch}=");
+        let at = good.find(&line).unwrap() + line.len();
+        good[at..at + 64].to_string()
+    };
+    let (amd64, arm64) = (sha("AMD64"), sha("ARM64"));
+    let checker = root.join(".github/bump-check.py");
+    let python = |args: &[&str]| {
+        let out = Command::new("python3")
+            .arg("-I")
+            .arg(&checker)
+            .args(args)
+            .current_dir(&repo)
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    // Where a patch is refused: "gate", "apply" or "verify"; "" when it passes all three.
+    let try_patch = |name: &str, patch: &str, versions: [&str; 4]| -> (&'static str, String) {
+        git(&["checkout", "-q", "--", "."]);
+        git(&["clean", "-qfdx"]);
+        let file = tmp.join(format!("{name}.patch"));
+        std::fs::write(&file, patch).unwrap();
+        let file = file.to_str().unwrap();
+        let (ok, err) = python(&["patch", file]);
+        if !ok {
+            return ("gate", err);
+        }
+        let applied = Command::new("git")
+            .args(["-c", "core.quotePath=true", "apply", file])
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        if !applied.status.success() {
+            return (
+                "apply",
+                String::from_utf8_lossy(&applied.stderr).to_string(),
+            );
+        }
+        let (ok, err) = python(&[["verify"].as_slice(), versions.as_slice()].concat());
+        if !ok {
+            return ("verify", err);
+        }
+        ("", err)
+    };
+    let pins = ["9.8.7", "9.9.0", &amd64, &arm64];
+    assert_eq!(try_patch("good", &good, pins), ("", String::new()));
+
+    let pin = "+const RPI_PIN: &str = \"rpi 9.9.\";\n";
+    let fake = "+    print(\"rpi 9.9.0\"); sys.exit(0)\n";
+    assert!(good.contains(pin) && good.contains(fake));
+    // A hunk spliced into Cargo.lock's section before the first one that starts after `line`.
+    let section = good.find("diff --git a/Cargo.lock").unwrap();
+    let start = |i: usize| -> usize {
+        let header = &good[i + 4..];
+        header[..header.find([',', ' ']).unwrap()].parse().unwrap()
+    };
+    let end = section + good[section..].find("\ndiff --git").unwrap() + 1;
+    let lock_hunk = |line: usize, hunk: &str| {
+        let next = (good[section..end].match_indices("\n@@ -"))
+            .map(|(i, _)| section + i + 1)
+            .find(|&i| start(i) > line)
+            .unwrap_or(end);
+        format!("{}{hunk}{}", &good[..next], &good[next..])
+    };
+    let lines: Vec<&str> = lock.lines().collect();
+    let serde = lines.iter().position(|l| *l == "name = \"serde\"").unwrap();
+    let (version, source, checksum) = (lines[serde + 1], lines[serde + 2], lines[serde + 3]);
+    assert!(version.starts_with("version = ") && checksum.starts_with("checksum = "));
+    let moved_serde = lock_hunk(
+        serde + 2,
+        &format!(
+            "@@ -{at},5 +{at},5 @@\n name = \"serde\"\n-{version}\n+version = \"1.0.999\"\n {source}\n-{checksum}\n+checksum = \"{}\"\n {}\n",
+            "0".repeat(64),
+            lines[serde + 4],
+            at = serde + 1
+        ),
+    );
+    // The reviewer's: a hunk whose header names the wrong place, which git applies where its
+    // context is, here a second checksum in serde's entry.
+    let misplaced = lock_hunk(
+        serde + 2,
+        &format!(
+            "@@ -2008,2 +1275,3 @@\n name = \"serde\"\n+checksum = \"{}\"\n {version}\n",
+            "0".repeat(64)
+        ),
+    );
+    // A second serde, from git, after the last package.
+    let n = lines.len();
+    let duplicate = lock_hunk(
+        n,
+        &format!(
+            "@@ -{},3 +{},8 @@\n {}\n {}\n {}\n+\n+[[package]]\n+name = \"serde\"\n+{version}\n+source = \"git+https://example.com/serde#0\"\n",
+            n - 2,
+            n - 2,
+            lines[n - 3],
+            lines[n - 2],
+            lines[n - 1]
+        ),
+    );
+    // A second serde beside main's, from crates.io with a checksum: still one version too many.
+    let second_serde = lock_hunk(
+        n,
+        &format!(
+            "@@ -{},3 +{},9 @@\n {}\n {}\n {}\n+\n+[[package]]\n+name = \"serde\"\n+version = \"1.0.999\"\n+{source}\n+checksum = \"{}\"\n",
+            n - 2,
+            n - 2,
+            lines[n - 3],
+            lines[n - 2],
+            lines[n - 1],
+            "0".repeat(64)
+        ),
+    );
+    // An rpi crate moved, but not to the new version.
+    let lock_pin = "+version = \"9.9.0\"\n";
+    assert!(good[section..end].contains(lock_pin));
+    let rpi_elsewhere = format!(
+        "{}{}",
+        &good[..section],
+        good[section..].replacen(lock_pin, "+version = \"9.9.1\"\n", 1)
+    );
+    // The reviewer's: a `\ No newline` after a line of release.sh's hunk joins it to the next
+    // (lines 40 and 41), which here hides the fetch's `v=` in a comment.
+    let comment = "  # The pin moves with each rpi-bump merge: fetch the Dockerfile's release, checked as it checks it.";
+    assert!(
+        good.contains(&format!("\n {comment}\n   v=$(sed")),
+        "the fixture's release.sh hunk moved"
+    );
+    let joined = good.replacen(
+        &format!("\n {comment}\n"),
+        &format!("\n-{comment}\n+{comment}\n\\ No newline at end of file\n"),
+        1,
+    );
+    let cr_main = pin.replace(";\n", ";\r fn planted() { std::process::exit(7) }\n");
+    let cr_fake = fake.replace("(0)\n", "(0)\r__import__('os').system('id')\n");
+    let other_file = format!(
+        "{good}diff --git a/.github/ci.sh b/.github/ci.sh\nindex 1111111..2222222 100755\n--- a/.github/ci.sh\n+++ b/.github/ci.sh\n@@ -1 +1 @@\n-a\n+b\n"
+    );
+    let cases = [
+        // Refused by what git wrote, after the first gate let them through.
+        ("joined-lines", joined, "verify"),
+        ("misplaced-lock-hunk", misplaced, "verify"),
+        ("duplicate-git-serde", duplicate, "verify"),
+        ("second-serde", second_serde, "verify"),
+        ("rpi-not-at-new", rpi_elsewhere, "verify"),
+        ("moved-serde", moved_serde, "verify"),
+        (
+            "git-source",
+            good.replacen(
+                "+source = \"registry+https://github.com/rust-lang/crates.io-index\"",
+                "+source = \"git+https://example.com/rpi-tui#0\"",
+                1,
+            ),
+            "verify",
+        ),
+        (
+            "other-version",
+            good.replacen(pin, "+const RPI_PIN: &str = \"rpi 9.7.\";\n", 1),
+            "verify",
+        ),
+        // Refused by the first gate.
+        ("cr-main", good.replacen(pin, &cr_main, 1), "gate"),
+        ("cr-fake-rpi", good.replacen(fake, &cr_fake, 1), "gate"),
+        (
+            "non-ascii",
+            good.replacen(pin, &pin.replace("9.9.", "9.9.\u{202e}"), 1),
+            "gate",
+        ),
+        ("other-file", other_file, "gate"),
+        (
+            "new-file",
+            good.replacen(
+                "diff --git a/deploy/release.sh b/deploy/release.sh\n",
+                "diff --git a/deploy/release.sh b/deploy/release.sh\nnew file mode 100755\n",
+                1,
+            ),
+            "gate",
+        ),
+    ];
+    for (name, patch, stage) in &cases {
+        assert_ne!(patch, &good, "{name}");
+        let (at, err) = try_patch(name, patch, pins);
+        assert_eq!(at, *stage, "{name}: {err}");
+        assert!(err.starts_with("bump-check: "), "{name}: {err}");
+    }
+    let refusal = |name: &str| {
+        let (_, patch, _) = cases.iter().find(|c| c.0 == name).unwrap();
+        try_patch(name, patch, pins).1
+    };
+    let err = refusal("moved-serde");
+    assert!(
+        err.contains("serde 1.0.") && err.contains("waits for a person"),
+        "{err}"
+    );
+    let err = refusal("second-serde");
+    assert!(err.contains("serde is there 2 times"), "{err}");
+    let err = refusal("rpi-not-at-new");
+    assert!(err.contains("is at 9.9.1, not 9.9.0"), "{err}");
+    // The release's own sha256s, which the push job fetches, must be the ones written.
+    let (at, err) = try_patch("good", &good, ["9.8.7", "9.9.0", &"1".repeat(64), &arm64]);
+    assert_eq!(at, "verify", "{err}");
+    let (at, _) = try_patch("good", &good, ["9.8.7", "9.9.0; x", &amd64, &arm64]);
+    assert_eq!(at, "verify");
+    std::fs::remove_dir_all(&tmp).unwrap();
+}
+
 #[test]
 fn upgrade_waits_backs_up_and_goes_back_only_with_a_backup() {
     let env = Env::new("upgrade-db");
@@ -4284,7 +4726,7 @@ fn the_dockerfile_skips_a_provider_source_only_for_an_empty_arg() {
         rest[..rest[1..].find("\nFROM ").map_or(rest.len(), |i| i + 1)].to_string()
     };
     for (name, arg, file) in [
-        ("rust", "RPI_PACKAGE_REPO", "/src/rpi-package/Cargo.toml"),
+        ("rpi-ext", "RPI_PACKAGE_REPO", "/src/rpi-package/Cargo.toml"),
         (
             "plugins",
             "PLUGINS_REPO",
@@ -4343,6 +4785,108 @@ fn release_and_runner_scripts_keep_their_defaults() {
     assert!(read(&deploy.join("bump-rpi.sh")).contains("rpi-$old/bin/rpi"));
 }
 
+/// zephyr-local's runners are ephemeral: each registers for one job, its container is removed when
+/// it exits, and no volume carries a home, a work tree or a target dir to the next job.
+#[test]
+fn the_local_runners_take_one_job_each() {
+    let runner = read(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/runner/start.sh"
+    )));
+    let register = (runner.lines())
+        .find(|l| l.contains("./config.sh --url"))
+        .expect("start.sh registers its runners");
+    let register = &runner[runner.find(register).unwrap()..];
+    let register = &register[..register.find(">/dev/null").unwrap()];
+    assert!(register.contains("--ephemeral"), "{register}");
+    let run = &runner[runner.find("docker run -d --rm --name \"$name\"").unwrap()..];
+    let run = &run[..run.find(">/dev/null").unwrap()];
+    assert!(!run.contains(" -v ") && !run.contains("--restart"), "{run}");
+    assert!(runner.contains("Restart=always"), "{runner}");
+    // No capability but the one switch to the runner user, no-new-privileges, no sudo.
+    for want in [
+        "--cap-drop ALL --cap-add SETUID --cap-add SETGID",
+        "--security-opt no-new-privileges",
+        "exec setpriv --reuid=runner",
+    ] {
+        assert!(run.contains(want), "{want}: {run}");
+    }
+    assert!(!runner.contains("sudo rm"), "{runner}");
+    // A failed login stops before a container is made, and backs off.
+    let token = runner
+        .find("t=$(token registration-token) || failed")
+        .unwrap();
+    assert!(token < runner.find("docker run -d --rm --name \"$name\"").unwrap());
+}
+
+/// zephyr-buildkitd answers only image.yml: its client certificate is a repo secret no other
+/// workflow names, and the daemon starts with TLS and its process sandbox.
+#[test]
+fn only_the_image_workflow_can_use_the_local_builder() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for entry in std::fs::read_dir(root.join(".github/workflows")).unwrap() {
+        let path = entry.unwrap().path();
+        let yml = read(&path);
+        let image = path.ends_with("image.yml");
+        assert_eq!(yml.contains("secrets.BUILDKIT_"), image, "{path:?}");
+    }
+    let image = read(&root.join(".github/workflows/image.yml"));
+    for want in ["cacert=", "cert=", "key=", "servername=zephyr-buildkitd"] {
+        assert!(image.contains(want), "{want}");
+    }
+    // A release uses no Actions cache, which other runs can write, anywhere.
+    let gha: Vec<&str> = image.lines().filter(|l| l.contains("type=gha")).collect();
+    assert_eq!(gha.len(), 4, "{gha:?}");
+    for line in gha {
+        assert!(
+            line.contains("!startsWith(github.ref, 'refs/tags/v')"),
+            "{line}"
+        );
+    }
+    let runner = read(&root.join("deploy/runner/start.sh"));
+    assert!(runner
+        .contains("--tlscacert /certs/ca.pem --tlscert /certs/cert.pem --tlskey /certs/key.pem"));
+    assert!(!runner.contains("--oci-worker-no-process-sandbox"));
+}
+
+/// release.sh refuses a version that is not above Cargo.toml's before it tests anything, and pushes
+/// the release commit and its tag together or not at all.
+#[test]
+fn release_only_moves_forward_and_pushes_atomically() {
+    let release = read(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/release.sh"
+    )));
+    let newer = release
+        .lines()
+        .find(|l| l.starts_with("newer() {"))
+        .expect("release.sh defines newer()");
+    for (version, current, ok) in [
+        ("0.2.1", "0.2.0", true),
+        ("0.10.0", "0.9.9", true),
+        ("1.0.0", "0.99.0", true),
+        ("0.2.0", "0.2.0", false),
+        ("0.1.9", "0.2.0", false),
+        ("0.9.0", "0.10.0", false),
+    ] {
+        let status = Command::new("bash")
+            .arg("-c")
+            .arg(format!("{newer}\nnewer {version} {current}"))
+            .status()
+            .unwrap();
+        assert_eq!(status.success(), ok, "{version} over {current}");
+    }
+    let check = "newer \"$version\" \"$current\" || die";
+    assert!(
+        release.find(check).unwrap() < release.find("\nstep \"testing\"\n").unwrap(),
+        "{release}"
+    );
+    assert!(
+        release.contains("\n  git push --atomic -q origin main \"$tag\"\n"),
+        "{release}"
+    );
+}
+
 /// Every file the image copies from the build context is let back in by `.dockerignore`
 /// (`*`, then `!PATH` per allowed path): one left out fails `docker build` at that COPY.
 #[test]
@@ -4373,6 +4917,43 @@ fn every_copy_in_the_dockerfile_is_in_the_build_context() {
         }
     }
     assert!(checked >= 4, "{checked}");
+}
+
+/// Every image the build pulls (the frontend, each `FROM` and `COPY --from` that is not a stage)
+/// is pinned by digest, and no stage keeps a cache mount a later build would read.
+#[test]
+fn every_image_the_dockerfile_pulls_is_pinned_by_digest() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dockerfile = std::fs::read_to_string(root.join("deploy/Dockerfile")).unwrap();
+    assert!(!dockerfile.contains("--mount=type=cache"), "{dockerfile}");
+    let mut stages = vec!["scratch".to_string()];
+    let mut pinned = 0;
+    for line in dockerfile.lines() {
+        let image = if let Some(s) = line.strip_prefix("# syntax=") {
+            s
+        } else if let Some(rest) = line.strip_prefix("FROM ") {
+            let mut words = rest.split_whitespace();
+            let image = words.next().unwrap();
+            if let (Some("AS"), Some(name)) = (words.next(), words.next()) {
+                stages.push(name.to_string());
+            }
+            image
+        } else if let Some(at) = line.find("--from=") {
+            line[at + 7..].split_whitespace().next().unwrap()
+        } else {
+            continue;
+        };
+        if stages.iter().any(|s| s == image) || image.contains("${") {
+            continue;
+        }
+        let digest = image.split_once("@sha256:").map(|(_, d)| d);
+        assert!(
+            digest.is_some_and(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit())),
+            "{line}"
+        );
+        pinned += 1;
+    }
+    assert!(pinned >= 5, "{pinned}");
 }
 
 /// Both wrappers on the agent's PATH (`agent-browser`, and `xdotool` for a desktop takeover) are
