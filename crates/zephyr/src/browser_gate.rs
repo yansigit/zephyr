@@ -2284,10 +2284,12 @@ const CODES: &[&str] = &[
     "BRL", "MXN", "SEK", "NOK", "DKK", "PLN", "CZK", "TRY", "ZAR", "TWD", "THB",
 ];
 
-/// The currency written right before (`$`, `US$`, `€`, `EUR`) or right after (`원`, `€`, `EUR`)
-/// a number; empty when none is, or when the sign names more than one (`¥`).
+/// The currency written right before (`US$`, `€`, `EUR`) or right after (`원`, `€`, `EUR`)
+/// a number; empty when none is, or when the sign names more than one (`¥`). A bare `$` with no
+/// code after the number is `$`: which dollar it is, the gate reads from `approvals.currency`.
 fn currency(before: &str, after: &str) -> String {
     const SIGNS: &[(&str, &str)] = &[
+        ("CDN$", "CAD"),
         ("US$", "USD"),
         ("CA$", "CAD"),
         ("AU$", "AUD"),
@@ -2298,7 +2300,7 @@ fn currency(before: &str, after: &str) -> String {
         ("A$", "AUD"),
         ("S$", "SGD"),
         ("R$", "BRL"),
-        ("$", "USD"),
+        ("$", "$"),
         ("€", "EUR"),
         ("£", "GBP"),
         ("₩", "KRW"),
@@ -2307,15 +2309,19 @@ fn currency(before: &str, after: &str) -> String {
         ("￥", ""),
     ];
     let (before, after) = (before.to_uppercase(), after.to_uppercase());
-    if let Some((_, code)) = SIGNS.iter().find(|(s, _)| before.ends_with(s)) {
-        return code.to_string();
-    }
     let word = |w: Option<&str>| {
         let w = w
             .unwrap_or_default()
             .trim_matches(|c: char| !c.is_alphanumeric());
         CODES.contains(&w).then(|| w.to_string())
     };
+    if let Some((_, code)) = SIGNS.iter().find(|(s, _)| before.ends_with(s)) {
+        // `$45.00 CAD`: the code says which dollar.
+        return match *code {
+            "$" => word(after.split_whitespace().next()).unwrap_or_else(|| "$".into()),
+            code => code.to_string(),
+        };
+    }
     if let Some(code) = word(before.split_whitespace().next_back()) {
         return code;
     }
@@ -3903,7 +3909,7 @@ cat "$d/$f.json"
             b["title"], "Checkout",
             "a payment: its title and total are read"
         );
-        assert_eq!(b["amount"], json!({"value": 54.2, "currency": "USD"}));
+        assert_eq!(b["amount"], json!({"value": 54.2, "currency": "$"}));
         answer(&mut conn, json!({"verdict": "allow"}));
         assert_eq!(waiting.join().unwrap(), Next::Exec);
         // A line break typed there does the same: the field found by its selector, or by name.
@@ -4333,9 +4339,9 @@ console.log(JSON.stringify(out));
             })
         };
         for (tree, want) in [
-            ("- StaticText \"Order total: $54.20\"", amount(54.2, "USD")),
-            ("- cell \"Subtotal\"\n- cell \"$50.00\"\n- cell \"Total\"\n- cell \"$54.20\"", amount(54.2, "USD")),
-            ("- StaticText \"Total savings: $5\"\n- StaticText \"Order total\"\n- StaticText \"$1,054.20\"", amount(1054.2, "USD")),
+            ("- StaticText \"Order total: $54.20\"", amount(54.2, "$")),
+            ("- cell \"Subtotal\"\n- cell \"$50.00\"\n- cell \"Total\"\n- cell \"$54.20\"", amount(54.2, "$")),
+            ("- StaticText \"Total savings: $5\"\n- StaticText \"Order total\"\n- StaticText \"$1,054.20\"", amount(1054.2, "$")),
             ("- StaticText \"Amount due\"\n- StaticText \"54,20 €\"", amount(54.2, "EUR")),
             ("- StaticText \"Grand total EUR 1.234,50\"", amount(1234.5, "EUR")),
             ("- StaticText \"총 결제금액\"\n- StaticText \"54,200원\"", amount(54200.0, "KRW")),
@@ -4343,6 +4349,12 @@ console.log(JSON.stringify(out));
             ("- StaticText \"Total: 3 items\"", amount(3.0, "")),
             ("- StaticText \"Total\"\n- StaticText \"¥5,000\"", amount(5000.0, "")),
             ("- StaticText \"Total\"\n- StaticText \"CA$20\"", amount(20.0, "CAD")),
+            // Canada's other ways to write its dollar; a bare `$` is the gate's to read
+            // (`approvals.currency`), unless a code follows the number.
+            ("- StaticText \"Total: CDN$ 45.00\"", amount(45.0, "CAD")),
+            ("- StaticText \"Total: C$45.00\"", amount(45.0, "CAD")),
+            ("- StaticText \"Total: $45.00 CAD\"", amount(45.0, "CAD")),
+            ("- StaticText \"Total: $45.00 USD\"", amount(45.0, "USD")),
             ("- StaticText \"Total $10\"\n- StaticText \"Total €20\"", None),
             // I5: a space, a no-break space, a narrow or thin one, or an apostrophe groups
             // thousands, before exactly three digits.
@@ -4352,7 +4364,7 @@ console.log(JSON.stringify(out));
             ("- StaticText \"Total\"\n- StaticText \"12\u{2009}345\u{2009}678 ₩\"", amount(12_345_678.0, "KRW")),
             ("- StaticText \"Total CHF 1'234.50\"", amount(1234.5, "CHF")),
             ("- StaticText \"Total CHF 1’234.50\"", amount(1234.5, "CHF")),
-            ("- StaticText \"Total\"\n- StaticText \"$ 1 054.20\"", amount(1054.2, "USD")),
+            ("- StaticText \"Total\"\n- StaticText \"$ 1 054.20\"", amount(1054.2, "$")),
             // A total that cannot be read one way only is no total: over any cap.
             ("- StaticText \"Total 1 23,50 €\"", None),
             ("- StaticText \"Total 12 3456 €\"", None),

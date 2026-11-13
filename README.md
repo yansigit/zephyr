@@ -1150,8 +1150,10 @@ zephyr config set cards.provider manual                 # or link
   approval mode, so a purchase split into several small ones is caught. A payment whose amount
   zephyr could not read is not counted against the amount: it waits for an ordinary `/ok`, as
   before. An install from before this version is told of the window once.
-- A checkout that writes its total with a bare `$` is read as US dollars. With cards in another
-  dollar, its Pay click is then asked about again rather than let through on the card.
+- A checkout that writes its total with a bare `$` is read in your `approvals.currency` when that
+  is a dollar (CAD, USD, AUD and the like); `CDN$`, `CA$` and `C$` are Canadian dollars, and
+  `$45 USD` is US dollars. Under a currency that is not a dollar, a bare `$` total counts as
+  unread, so its Pay click is asked about rather than let through on the card.
 
 ## The agent's network
 
