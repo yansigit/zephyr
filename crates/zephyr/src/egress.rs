@@ -123,21 +123,22 @@ pub fn unpublished(cfg: &Config, made_with: Option<&str>) -> Vec<&'static str> {
 /// IPv4 blocks that are not the public internet, from the IANA IPv4 Special-Purpose Address
 /// Registry and the multicast and reserved blocks.
 const V4_SPECIAL: &[([u8; 4], u32)] = &[
-    ([0, 0, 0, 0], 8),       // "This network", RFC 791
-    ([10, 0, 0, 0], 8),      // Private-Use, RFC 1918
-    ([100, 64, 0, 0], 10),   // Shared Address Space (CGNAT, tailnets), RFC 6598
-    ([127, 0, 0, 0], 8),     // Loopback, RFC 1122
-    ([169, 254, 0, 0], 16),  // Link Local (cloud metadata), RFC 3927
-    ([172, 16, 0, 0], 12),   // Private-Use, RFC 1918
-    ([192, 0, 0, 0], 24),    // IETF Protocol Assignments, RFC 6890
-    ([192, 0, 2, 0], 24),    // Documentation (TEST-NET-1), RFC 5737
-    ([192, 88, 99, 0], 24),  // 6to4 Relay Anycast, deprecated, RFC 7526
-    ([192, 168, 0, 0], 16),  // Private-Use, RFC 1918
-    ([198, 18, 0, 0], 15),   // Benchmarking, RFC 2544
-    ([198, 51, 100, 0], 24), // Documentation (TEST-NET-2), RFC 5737
-    ([203, 0, 113, 0], 24),  // Documentation (TEST-NET-3), RFC 5737
-    ([224, 0, 0, 0], 4),     // Multicast, RFC 5771
-    ([240, 0, 0, 0], 4),     // Reserved, RFC 1112, and Limited Broadcast, RFC 919
+    ([0, 0, 0, 0], 8),        // "This network", RFC 791
+    ([10, 0, 0, 0], 8),       // Private-Use, RFC 1918
+    ([100, 64, 0, 0], 10),    // Shared Address Space (CGNAT, tailnets), RFC 6598
+    ([127, 0, 0, 0], 8),      // Loopback, RFC 1122
+    ([169, 254, 0, 0], 16),   // Link Local (cloud metadata), RFC 3927
+    ([168, 63, 129, 16], 32), // Azure WireServer, the VM host: public-range, not the internet
+    ([172, 16, 0, 0], 12),    // Private-Use, RFC 1918
+    ([192, 0, 0, 0], 24),     // IETF Protocol Assignments, RFC 6890
+    ([192, 0, 2, 0], 24),     // Documentation (TEST-NET-1), RFC 5737
+    ([192, 88, 99, 0], 24),   // 6to4 Relay Anycast, deprecated, RFC 7526
+    ([192, 168, 0, 0], 16),   // Private-Use, RFC 1918
+    ([198, 18, 0, 0], 15),    // Benchmarking, RFC 2544
+    ([198, 51, 100, 0], 24),  // Documentation (TEST-NET-2), RFC 5737
+    ([203, 0, 113, 0], 24),   // Documentation (TEST-NET-3), RFC 5737
+    ([224, 0, 0, 0], 4),      // Multicast, RFC 5771
+    ([240, 0, 0, 0], 4),      // Reserved, RFC 1112, and Limited Broadcast, RFC 919
 ];
 
 /// The only IPv6 block with public addresses: Global Unicast, RFC 4291.
@@ -2046,6 +2047,7 @@ mod tests {
             "10.1.2.3",
             "100.100.100.100",
             "169.254.169.254",
+            "168.63.129.16",
             "172.17.0.1",
             "192.168.1.1",
             "192.0.0.170",

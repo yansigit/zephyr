@@ -1158,10 +1158,10 @@ zephyr config set cards.provider manual                 # or link
 The container runs on a Docker network of its own, and the agent has no direct route out of it. Its
 programs reach the internet only through a proxy in the daemon (`HTTP_PROXY` and friends are set
 for them): any public address on ports 80 and 443, and nothing else. Your machine's localhost, your
-LAN, your tailnet, cloud metadata addresses and every other port (SSH, SMTP, IMAP, databases) are
-refused at once, and the agent gets no DNS of its own. `git`, `curl`, `pip`, `npm`, `gh` and the
-browsers work as before; `ssh` and mail clients fail until you allow their destination, and `ping`
-never works.
+LAN, your tailnet, cloud metadata addresses (Azure's WireServer too) and every other port (SSH,
+SMTP, IMAP, databases) are refused at once, and the agent gets no DNS of its own. `git`, `curl`,
+`pip`, `npm`, `gh` and the browsers work as before; `ssh` and mail clients fail until you allow
+their destination, and `ping` never works.
 
 - **Allowing more.** `/set network.allow HOST:PORT, HOST:PORT` lists exact destinations beyond
   that, e.g. `imap.gmail.com:993, github.com:22, homeassistant.lan:8123` (see
