@@ -921,6 +921,11 @@ fn what(rest: &[String]) -> Act {
                 .find(|a| !matches!(a.as_str(), "--new-tab" | "--human"));
             sel.map_or(Act::Pass, |s| Act::Click(Target::Selector(s.clone())))
         }
+        // 0.41 clicks the element for these: `check` (twice, when it stays unchecked) and
+        // `download <sel> <path>` (`handle_download`).
+        "check" | "download" => args
+            .first()
+            .map_or(Act::Pass, |s| Act::Click(Target::Selector(s.clone()))),
         // A key going up can send too (a page's own handler); keydown and keyup send the key
         // as named (0.41), press reads `\n` and chords as Enter.
         "press" | "key" | "keydown" | "keyup" => match args.first().and_then(|k| key_of(k)) {
@@ -1177,7 +1182,7 @@ fn find(args: &[String]) -> Act {
         )
     };
     match action {
-        "click" => Act::Click(target),
+        "click" | "check" => Act::Click(target),
         "fill" => typing("fill", fill, None),
         _ => Act::Pass,
     }
@@ -2818,6 +2823,10 @@ cat "$d/$f.json"
             &["dblclick", "#x"],
             &["tap", "@e2"],
             &["find", "role", "button", "click", "--name", "Go"],
+            // 0.41 clicks for these too (`interaction::check`, `handle_download`).
+            &["check", "@e7"],
+            &["download", "@e7", "/tmp/x"],
+            &["find", "text", "Pay", "check"],
             &["press", "Enter"],
             &["key", "Space"],
             &["type", "@e1", "hi\n"],
