@@ -481,7 +481,7 @@ There are no per-call prompts, except for messages, posts and payments, which wa
    This replaced an earlier dedicated Linux account: ACLs over 2.2M files were slow to apply and, on eCryptfs, unreliable to remove.
 2. **Policy plugin `gw-policy`** (cdylib, published `rpi-plugin-sdk`, loaded with `--extension`). Its `ToolCall` veto blocks, for `bash` and for main's `exec` alike (§4.13):
    - destructive patterns, as in Hermes's hardline list: `rm -rf /`, `mkfs`, `dd of=/dev/`, fork bombs, `curl | sh`
-   - a command in which an `env` is followed anywhere by an option that turns on its split string (`-S`, a cluster such as `-iS`, `--split-string` or any abbreviation, with or without `=`): that string becomes a command line no reader here parses as bash does, so it is refused outright, even where the `-S` is the next program's own flag (`env curl -S …`)
+   - a command in which an `env` turns on its split string with one of its own options (`-S`, a cluster such as `-iS`, `--split-string` or any abbreviation, with or without `=`): that string becomes a command line no reader here parses as bash does, so it is refused outright. Only env's own options count, read as its `+` getopt reads them (`policy::env_splits`): the scan stops at `--` and at the first word that is no option, past the separate argument of `-u`, `-C`, `-P` or `-a` ending a cluster and of `--unset`, `--chdir` or `--argv0` without `=`, so `env curl -sS …` and `env | sort -S 1G` are the other program's `-S`
    - writes outside the granted roots
    - `git push --force`
    - package installs outside the workspace venv/node dirs
