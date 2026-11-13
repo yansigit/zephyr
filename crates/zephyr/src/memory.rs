@@ -783,7 +783,13 @@ fn diff(old: &Files, new: &Files) -> String {
 /// The owner's `/memory` commands, `/rules` and `/rule`'s usage. `None` for any other text,
 /// `/rule TEXT` and `/rule rm N` included: those are settings, changed through the router's
 /// `set_setting`, which calls `rule`.
-pub fn command(home: &Path, state: &Path, text: &str, may_approve: bool) -> Option<String> {
+pub fn command(
+    home: &Path,
+    state: &Path,
+    text: &str,
+    may_approve: bool,
+    store: Option<&crate::store::Store>,
+) -> Option<String> {
     let text = text.trim();
     let (cmd, arg) = text.split_once(' ').unwrap_or((text, ""));
     let arg = arg.trim();
@@ -824,7 +830,7 @@ pub fn command(home: &Path, state: &Path, text: &str, may_approve: bool) -> Opti
         }
         ("/memory", "diff") => waiting(home, state).map(|d| d.unwrap_or("nothing waiting".into())),
         ("/memory", "ok") => keep(home, state),
-        ("/memory", "undo") => undo(home, state),
+        ("/memory", "undo") => undo(home, state, store),
         ("/memory", "squash") => Ok(SQUASH_ASK.into()),
         ("/memory", _) => Ok("usage: /memory log | diff | ok | undo | squash".into()),
         ("/rules", "") => read_rules(state).map(|rules| {
@@ -1021,7 +1027,7 @@ fn keep(home: &Path, state: &Path) -> anyhow::Result<String> {
 /// `/memory undo`: drops the change waiting, if any, by reverting each commit since the last
 /// approval (so a later undo walks past them); otherwise reverts the newest memory commit and
 /// approves the result, since the owner chose it.
-fn undo(home: &Path, state: &Path) -> anyhow::Result<String> {
+fn undo(home: &Path, state: &Path, store: Option<&crate::store::Store>) -> anyhow::Result<String> {
     let approved = read_approved(state)?;
     let head = std::fs::read_to_string(approved_dir(state).join(".head")).ok();
     let fs = crate::agent::fs();
@@ -1030,37 +1036,47 @@ fn undo(home: &Path, state: &Path) -> anyhow::Result<String> {
         bail!("there are uncommitted changes; try again after the run settles");
     }
     if read_working(home)? != approved {
-        let reverted = match head {
-            Some(h) => {
-                // Only the commits that changed the approved files: a job's notes stay. (A
-                // /forget is refused while a change waits, so none is in the range.)
-                let range = format!("{}..HEAD", h.trim());
-                let shas = git(&dir, &["rev-list", &range, "--", USER, MEMORY])?;
-                let mut args = vec!["revert", "--no-edit"];
-                args.extend(shas.lines());
-                let ok = git(&dir, &args).is_ok();
-                if !ok {
-                    let _ = git(&dir, &["revert", "--abort"]); // leave the tree as it was
+        // Only the commits that changed the approved files: a job's notes stay. (A /forget is
+        // refused while a change waits, so none is in the range.) `None`: `.head` is missing or
+        // names a commit git no longer has.
+        let shas = head.and_then(|h| {
+            let range = format!("{}..HEAD", h.trim());
+            git(&dir, &["rev-list", &range, "--", USER, MEMORY]).ok()
+        });
+        let reverted = shas.as_deref().is_some_and(|shas| {
+            let before = git(&dir, &["rev-parse", "HEAD"]);
+            let mut args = vec!["revert", "--no-edit"];
+            args.extend(shas.lines());
+            let ok = git(&dir, &args).is_ok();
+            if !ok {
+                // Leave the tree as it was, never a half-undo under the write-back below.
+                let _ = git(&dir, &["revert", "--abort"]);
+                if let Ok(before) = &before {
+                    let _ = git(&dir, &["reset", "-q", "--hard", before]);
                 }
-                ok
             }
-            None => false,
-        };
-        // History that does not lead back (an older layout, or a rewritten repo): write it back.
+            ok
+        });
+        // History that does not lead back (an older layout, a rewritten repo, a revert that
+        // conflicts): write it back.
         if !reverted || read_working(home)? != approved {
             for (name, text) in [USER, MEMORY].iter().zip(&approved) {
                 std::fs::write(dir.join(name), text)?;
             }
             if !git(&dir, &["status", "--porcelain"])?.is_empty() {
-                git(
-                    &dir,
-                    &["commit", "-qam", "zephyr: put back the approved memory"],
-                )?;
+                // Each commit this drops is named as a revert names it, so no later undo
+                // takes it back again (`reverted`).
+                let mut message = "zephyr: put back the approved memory\n".to_string();
+                for sha in shas.iter().filter(|_| !reverted).flat_map(|s| s.lines()) {
+                    message.push_str(&format!("\nThis reverts commit {sha}."));
+                }
+                git(&dir, &["commit", "-qam", &message])?;
             }
         }
         return Ok("[zephyr] dropped the memory change that was waiting".into());
     }
-    let reply = revert_newest(home)?;
+    let forgets = store.map_or(Ok(Vec::new()), |s| s.forget_commits())?;
+    let reply = revert_newest(home, &forgets)?;
     let working = read_working(home)?;
     drop(fs);
     approve(home, state, &working)?;
@@ -1255,28 +1271,34 @@ pub fn squash_history(home: &Path, state: &Path) -> Result<String, String> {
     })
 }
 
-/// `git revert`s the newest memory commit that has not been undone yet.
-fn revert_newest(home: &Path) -> anyhow::Result<String> {
+/// Every commit some commit message names with `This reverts commit <sha>`: git's reverts, and
+/// `undo`'s write-back of a change it could not revert. Those are undone already.
+fn reverted(dir: &Path) -> anyhow::Result<std::collections::HashSet<String>> {
+    let messages = git(dir, &["log", "--format=%B"])?;
+    Ok(messages
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("This reverts commit "))
+        .map(|sha| sha.trim_end_matches('.').to_string())
+        .collect())
+}
+
+/// `git revert`s the newest memory commit that has not been undone yet: one of the approved
+/// files, or a /forget (by its tag, or for one made before the tag by its `memory_commits` row
+/// among `forgets`). A job's notes-only commit is never undone.
+fn revert_newest(home: &Path, forgets: &[String]) -> anyhow::Result<String> {
     let dir = dir(home);
-    // Newest first. Each revert cancels the next memory commit below it, so repeated undos walk back.
     let log = git(&dir, &["log", "--format=%H %s"])?;
-    // A commit of the approved files, or a /forget: a job's notes-only commit is not undone.
     let approved = git(&dir, &["log", "--format=%H", "--", USER, MEMORY])?;
     let approved: std::collections::HashSet<&str> = approved.lines().collect();
-    let mut owed = 0;
+    let undone = reverted(&dir)?;
+    // Newest first, so repeated undos walk back.
     let Some(sha) = log.lines().find_map(|line| {
         let (sha, subject) = line.split_once(' ')?;
-        let undoable =
-            subject.starts_with(PREFIX) && (approved.contains(sha) || subject.ends_with(FORGET));
-        if subject.starts_with("Revert \"memory: ") {
-            owed += 1;
-            None
-        } else if undoable && owed > 0 {
-            owed -= 1;
-            None
-        } else {
-            undoable.then_some(sha)
-        }
+        let undoable = subject.starts_with(PREFIX)
+            && (approved.contains(sha)
+                || subject.ends_with(FORGET)
+                || forgets.iter().any(|f| f == sha));
+        (undoable && !undone.contains(sha)).then_some(sha)
     }) else {
         bail!("no memory commit to undo");
     };
@@ -1386,7 +1408,7 @@ mod tests {
     }
 
     fn say(home: &Path, text: &str) -> String {
-        command(home, &state(home), text, true).unwrap()
+        command(home, &state(home), text, true, None).unwrap()
     }
 
     /// A task's commit, as a run's settle makes it: the owner's notice, if any.
@@ -1585,6 +1607,113 @@ mod tests {
     }
 
     #[test]
+    fn undo_pairs_each_revert_with_the_commit_it_names() {
+        let home = home();
+        let st = state(&home);
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        let d = dir(&home);
+        std::fs::write(d.join(USER), "# USER.md\nname: Aiden\n").unwrap();
+        settle(&home);
+        let c0 = head(&home);
+        std::fs::write(d.join(MEMORY), "# MEMORY.md\nlikes tea\n").unwrap();
+        settle(&home);
+        let c1 = head(&home);
+        std::fs::write(d.join("notes/n.md"), "a note\n").unwrap();
+        settle(&home);
+        let n1 = head(&home);
+        // History an older undo left: R(C1), R(N1), N1, C1, C0, newest first.
+        git(&d, &["revert", "--no-edit", &n1]).unwrap();
+        git(&d, &["revert", "--no-edit", &c1]).unwrap();
+        approve(&home, &st, &read_working(&home).unwrap()).unwrap();
+
+        let reply = say(&home, "/memory undo");
+        assert!(
+            reply.starts_with(&format!("[zephyr] undid {}", &c0[..7])),
+            "{reply}"
+        );
+        let user = std::fs::read_to_string(d.join(USER)).unwrap();
+        assert!(!user.contains("Aiden"), "{user}");
+    }
+
+    #[test]
+    fn undo_takes_back_a_forget_made_before_its_tag() {
+        let home = home();
+        let st = state(&home);
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        let note = dir(&home).join("notes/a.md");
+        std::fs::write(&note, "tea at 3\n").unwrap();
+        settle(&home);
+        // A notes-only /forget as zephyr made it before the tag: known by its row alone.
+        std::fs::write(&note, "").unwrap();
+        let sha = commit_locked(&home, "").unwrap().unwrap();
+        approve(&home, &st, &read_working(&home).unwrap()).unwrap();
+        let store = crate::store::Store::open(&st.join("state.db")).unwrap();
+        store
+            .record_memory_commit(&sha, crate::store::FORGET_ORIGIN, true)
+            .unwrap();
+
+        let reply = command(&home, &st, "/memory undo", true, Some(&store)).unwrap();
+        assert!(
+            reply.starts_with(&format!("[zephyr] undid {}", &sha[..7])),
+            "{reply}"
+        );
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "tea at 3\n");
+    }
+
+    #[test]
+    fn undo_drops_a_waiting_change_when_the_approved_head_is_gone() {
+        let home = home();
+        let st = state(&home);
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        std::fs::write(dir(&home).join(MEMORY), "one\n").unwrap();
+        settle(&home);
+        say(&home, "/memory ok");
+        std::fs::write(dir(&home).join(MEMORY), "two\n").unwrap();
+        settle(&home);
+        // A commit git no longer has (a squash elsewhere, a rewritten repo).
+        let gone = "0123456789abcdef0123456789abcdef01234567\n";
+        std::fs::write(approved_dir(&st).join(".head"), gone).unwrap();
+
+        let reply = say(&home, "/memory undo");
+        assert!(reply.contains("dropped"), "got {reply}");
+        assert_eq!(
+            std::fs::read_to_string(dir(&home).join(MEMORY)).unwrap(),
+            "one\n"
+        );
+    }
+
+    #[test]
+    fn a_conflicted_undo_records_the_commits_it_dropped() {
+        let home = home();
+        let st = state(&home);
+        prepare(&home, &st, &home.join("agent")).unwrap();
+        let d = dir(&home);
+        std::fs::write(d.join(USER), "# USER.md\nname: Aiden\n").unwrap();
+        settle(&home);
+        say(&home, "/memory ok");
+        let c0 = head(&home);
+        // C1 changes memory and a note at once; a job's commit then changes that note.
+        std::fs::write(d.join(MEMORY), "# MEMORY.md\nlikes tea\n").unwrap();
+        std::fs::write(d.join("notes/x.md"), "a\n").unwrap();
+        settle(&home);
+        std::fs::write(d.join("notes/x.md"), "b\n").unwrap();
+        settle(&home);
+
+        // Reverting C1 conflicts on the note: the approved files are written back instead.
+        let reply = say(&home, "/memory undo");
+        assert!(reply.contains("dropped"), "got {reply}");
+        let read = |name: &str| std::fs::read_to_string(d.join(name)).unwrap();
+        assert_eq!(read(MEMORY), "# MEMORY.md\n");
+        assert_eq!(read("notes/x.md"), "b\n");
+        // C1 counts as undone: the next undo takes back C0, not C1 again.
+        let reply = say(&home, "/memory undo");
+        assert!(
+            reply.starts_with(&format!("[zephyr] undid {}", &c0[..7])),
+            "{reply}"
+        );
+    }
+
+    #[test]
     fn undo_refuses_to_run_over_uncommitted_edits() {
         let home = home();
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
@@ -1660,7 +1789,7 @@ mod tests {
         // The first start approves what is there.
         prepare(&home, &state(&home), &home.join("agent")).unwrap();
         let st = state(&home);
-        assert!(command(&home, &st, "/rule never email bob", true).is_none());
+        assert!(command(&home, &st, "/rule never email bob", true, None).is_none());
         assert_eq!(
             rule(&st, "never email bob").unwrap(),
             "[zephyr] rule 1 set; it applies from the next message"
@@ -1737,13 +1866,13 @@ mod tests {
     fn other_text_is_not_a_memory_command() {
         let home = home();
         let state = state(&home);
-        assert!(command(&home, &state, "hello /memory log", true).is_none());
-        assert!(command(&home, &state, "/memoryx", true).is_none());
-        assert!(command(&home, &state, "/ruler", true).is_none());
-        assert!(command(&home, &state, "/memory", true)
+        assert!(command(&home, &state, "hello /memory log", true, None).is_none());
+        assert!(command(&home, &state, "/memoryx", true, None).is_none());
+        assert!(command(&home, &state, "/ruler", true, None).is_none());
+        assert!(command(&home, &state, "/memory", true, None)
             .unwrap()
             .starts_with("usage"));
-        assert!(command(&home, &state, "/rule", true)
+        assert!(command(&home, &state, "/rule", true, None)
             .unwrap()
             .starts_with("usage"));
     }
@@ -1922,9 +2051,9 @@ mod tests {
         );
         assert_eq!(say(&home, "/goal"), GOAL_USAGE);
         assert_eq!(say(&home, "/goal ship it"), GOAL_USAGE);
-        assert!(command(&home, &st, "/goal add Ship it", true).is_none());
-        assert!(command(&home, &st, "/goal done 1", true).is_none());
-        assert!(command(&home, &st, "/goal rm 1", true).is_none());
+        assert!(command(&home, &st, "/goal add Ship it", true, None).is_none());
+        assert!(command(&home, &st, "/goal done 1", true, None).is_none());
+        assert!(command(&home, &st, "/goal rm 1", true, None).is_none());
         goal(&st, "add Ship it").unwrap();
         goal(&st, "add Rest").unwrap();
         assert_eq!(say(&home, "/goals"), "1. Ship it\n2. Rest");
@@ -1932,16 +2061,16 @@ mod tests {
             say(&home, "/persona"),
             "no persona; set one with /persona set <text>"
         );
-        assert!(command(&home, &st, "/persona set Warm.", true).is_none());
-        assert!(command(&home, &st, "/persona clear", true).is_none());
+        assert!(command(&home, &st, "/persona set Warm.", true, None).is_none());
+        assert!(command(&home, &st, "/persona clear", true, None).is_none());
         assert_eq!(
             say(&home, "/persona warm"),
             "usage: /persona set <text> | /persona clear | /persona"
         );
         persona(&st, "set Warm.\nBrief.").unwrap();
         assert_eq!(say(&home, "/persona"), "Warm.\nBrief.");
-        assert!(command(&home, &st, "/goalx", true).is_none());
-        assert!(command(&home, &st, "/personas", true).is_none());
+        assert!(command(&home, &st, "/goalx", true, None).is_none());
+        assert!(command(&home, &st, "/personas", true, None).is_none());
     }
 
     #[test]
@@ -2175,7 +2304,7 @@ mod tests {
             say(&home, "/memory squash"),
             "[zephyr] /memory squash yes drops the memory's git history, keeping the files as they are now; /memory undo cannot go back past it."
         );
-        assert!(command(&home, &st, "/memory squash yes", true).is_none());
+        assert!(command(&home, &st, "/memory squash yes", true, None).is_none());
         assert_eq!(
             say(&home, "/memory x"),
             "usage: /memory log | diff | ok | undo | squash"
