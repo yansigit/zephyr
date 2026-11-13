@@ -438,7 +438,8 @@ a delayed one (`sending at 14:05 unless /cancel 7`) before it goes, and `/held` 
 
 What it does not stop: an agent set on getting around it, which can run a copy of the real browser,
 send from a Python script or reach a mail API with `curl`. It stops a confused or misled agent
-using its usual tools; general network traffic is not limited.
+using its usual tools; general network traffic is not limited. A fact's allowed recipient is the
+same: the agent can point `himalaya` elsewhere through its own config file.
 
 ## What you are told
 

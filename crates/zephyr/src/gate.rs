@@ -739,6 +739,7 @@ impl Call {
                     currency: ask.currency.clone(),
                 }),
                 replay: policy::Replay::Pass,
+                only_sends: false,
             }),
             kind: ActionKind::Card,
             class: approvals::class_name(Class::Money).into(),
@@ -766,6 +767,7 @@ impl Call {
                 summary: summary.clone(),
                 amount: None,
                 replay: policy::Replay::Run,
+                only_sends: false,
             }),
             kind: ActionKind::Call,
             class: approvals::class_name(Class::Messages).into(),
@@ -823,6 +825,7 @@ impl Call {
                 // The page's labelled total, which a money cap compares (A5's carry-over).
                 amount: b.amount.as_ref().and_then(PageAmount::amount),
                 replay: policy::Replay::Wait,
+                only_sends: false,
             }),
             kind: ActionKind::Wait,
             class: class.map_or(OUTBOUND, approvals::class_name).into(),
@@ -966,7 +969,7 @@ pub fn due_check(cfg: &Config, store: &Store, a: &Action) -> Option<String> {
             let names = names_in(
                 f,
                 &call.text,
-                &recipients(call.kind, &call.targets, &call.text),
+                &recipients(call.kind, &call.targets, beside(&call)),
             );
             if !names.is_empty() {
                 return Some(format!("it {}", fact_note(&names)));
@@ -1180,20 +1183,20 @@ fn names_in(facts: &[Fact], text: &str, recipients: &[String]) -> Vec<String> {
 /// call's first target is its `server/tool`, the medium, not a recipient. A command that is not
 /// only sends with their recipients read (`policy::only_sends`: a `curl` beside the mail, or
 /// even an `echo`) may send its data to someone the gate cannot read.
-fn recipients(kind: ActionKind, targets: &[String], text: &str) -> Vec<String> {
+fn recipients(kind: ActionKind, targets: &[String], beside: bool) -> Vec<String> {
     let mut to = match kind {
         ActionKind::Pass => targets.get(1..).unwrap_or_default().to_vec(),
         _ => targets.to_vec(),
     };
-    if beside(kind, text) && !to.iter().any(|t| t == UNKNOWN) {
+    if beside && !to.iter().any(|t| t == UNKNOWN) {
         to.push(UNKNOWN.into());
     }
     to
 }
 
 /// Whether a command runs anything beside its gated sends, which may take its data elsewhere.
-fn beside(kind: ActionKind, text: &str) -> bool {
-    kind == ActionKind::Run && !policy::only_sends(text)
+fn beside(call: &Call) -> bool {
+    call.kind == ActionKind::Run && !call.gated.as_ref().is_some_and(|g| g.only_sends)
 }
 
 /// `contains your private fact phone`, or `facts a, b`.
@@ -1299,7 +1302,7 @@ impl Gate<'_> {
             (_, Ok(f)) => match names_in(
                 f,
                 &call.text,
-                &recipients(call.kind, &call.targets, &call.text),
+                &recipients(call.kind, &call.targets, beside(call)),
             ) {
                 names if names.is_empty() => Found::Nothing,
                 names => Found::Names(names),
@@ -1352,7 +1355,7 @@ impl Gate<'_> {
                         [] => self.shown(&call.summary),
                         all => {
                             let mut all: Vec<String> = all.iter().map(|t| self.shown(t)).collect();
-                            if beside(call.kind, &call.text) {
+                            if beside(call) {
                                 all.push("an unknown destination".into());
                             }
                             all.join(", ")
@@ -2356,7 +2359,8 @@ fn render(a: &Action, cfg: &Config, store: &Store, countdown: bool) -> String {
             Err(_) => lines.push(UNREADABLE.into()),
             Ok(f) => {
                 let text = checked_text(a);
-                let names = names_in(f, &text, &recipients(a.kind, &a.targets, &text));
+                let beside = a.kind == ActionKind::Run && !policy::only_sends(&text);
+                let names = names_in(f, &text, &recipients(a.kind, &a.targets, beside));
                 if !names.is_empty() {
                     lines.push(fact_note(&names));
                 }
@@ -3710,6 +3714,26 @@ mod tests {
             assert!(
                 action(&h.store, id).summary.contains("private fact phone"),
                 "{other}"
+            );
+        }
+        // The mail itself, sent some other way than plain `himalaya`: its config, and so where
+        // it goes, may be another's.
+        let prefixed = ["HIMALAYA_CONFIG=/tmp/c ", "./", "env -S ", "timeout 5 "];
+        for (i, prefix) in prefixed.iter().enumerate() {
+            let cmd = format!("{prefix}{mail}");
+            let v = decide(
+                &h.cfg,
+                &h.store,
+                &exec(&cmd, &format!("prefix:{i}")),
+                owner(),
+                now,
+            );
+            let Verdict::Hold { id, .. } = v else {
+                panic!("{prefix}: {v:?}")
+            };
+            assert!(
+                action(&h.store, id).summary.contains("private fact phone"),
+                "{prefix}"
             );
         }
     }

